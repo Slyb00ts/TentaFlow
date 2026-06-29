@@ -174,6 +174,44 @@ pub struct DbClusterMember {
     pub interface_ip: String,
     pub interface_speed_mbps: i64,
     pub interface_type: String,
+    /// Comma-separated RoCE devices for distributed deploy (`NCCL_IB_HCA`).
+    pub rdma_devices: String,
+    /// Primary RDMA IPv4 the distributed deploy binds to.
+    pub rdma_ip: String,
+    /// QSFP socket netdev carrying `rdma_ip` (NCCL_SOCKET_IFNAME bootstrap).
+    pub rdma_socket_ifname: String,
+    /// RoCEv2 IPv4 GID index for `NCCL_IB_GID_INDEX` (default 3).
+    pub rdma_gid_index: i64,
+}
+
+/// Distributed (multi-node tensor-parallel) deployment of ONE model split across
+/// a cluster (D3). Source of truth so a running cluster-service survives restart
+/// and can be listed / stopped (head + all workers) / redeployed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbClusterDeployment {
+    pub deployment_cluster_id: String,
+    pub cluster_id: String,
+    pub engine_id: String,
+    pub model: String,
+    pub served_model_name: String,
+    pub tp_size: i64,
+    pub head_node_id: String,
+    pub port: i64,
+    pub endpoint_url: Option<String>,
+    /// "deploying" | "running" | "failed" | "stopped".
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One head/worker member of a `DbClusterDeployment`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbClusterDeploymentMember {
+    pub deployment_cluster_id: String,
+    pub node_id: String,
+    /// "head" | "worker".
+    pub role: String,
+    pub container_name: String,
 }
 
 /// Definicja flow (przeplyw przetwarzania)

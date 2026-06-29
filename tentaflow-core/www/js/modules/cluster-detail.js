@@ -21,6 +21,7 @@ import '/js/components/tf-chip.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-toggle.js';
 import '/js/components/tf-input.js';
+import '/js/components/tf-spinner.js';
 
 let currentClusterId = null;
 let clusterData = null;
@@ -30,6 +31,14 @@ let refreshInterval = null;
 let probeUnsub = null;
 let probeResults = [];
 let probeInProgress = false;
+let probeAssignments = [];
+let probeBottleneckMbps = null;
+let probeAssignmentStatus = null;
+let rdmaInProgress = false;
+let rdmaResult = null;
+let deployInProgress = false;
+let deployResult = null;
+let activeDeployment = null;
 
 const ClusterDetailScreen = {
   title: 'Cluster',
@@ -39,6 +48,12 @@ const ClusterDetailScreen = {
     clusterData = null;
     probeResults = [];
     probeInProgress = false;
+    probeAssignments = [];
+    probeBottleneckMbps = null;
+    probeAssignmentStatus = null;
+    deployInProgress = false;
+    deployResult = null;
+    activeDeployment = null;
 
     const content = document.getElementById('main');
     if (!content) return;
@@ -63,6 +78,12 @@ const ClusterDetailScreen = {
     clusterData = null;
     probeResults = [];
     probeInProgress = false;
+    probeAssignments = [];
+    probeBottleneckMbps = null;
+    probeAssignmentStatus = null;
+    deployInProgress = false;
+    deployResult = null;
+    activeDeployment = null;
   },
 };
 
@@ -144,7 +165,10 @@ function renderDetail() {
   const status = clusterStatus(members);
   const statusChip = renderStatusChip(status);
 
-  const hasDetail = content.querySelector('.cluster-detail');
+  // Wykrywamy REALNA strukture (#cd-body), nie sam wrapper .cluster-detail —
+  // skeleton tez ma .cluster-detail, wiec porownanie po klasie pomijaloby budowe
+  // wlasciwego layoutu i strona zostawala pusta.
+  const hasDetail = content.querySelector('#cd-body');
   if (!hasDetail) {
     content.innerHTML = `
       <div class="cluster-detail">
@@ -173,6 +197,8 @@ function renderDetail() {
     actionsEl.innerHTML = `
       <tf-button variant="secondary" size="sm" icon="edit" id="btn-edit-cluster">${escapeHtml(I18n.t('common.edit'))}</tf-button>
       <tf-button variant="secondary" size="sm" icon="share" id="btn-run-tests" ${probeInProgress ? 'disabled' : ''}>${escapeHtml(probeInProgress ? I18n.t('cluster_detail.testing') : I18n.t('cluster_detail.run_tests'))}</tf-button>
+      <tf-button variant="secondary" size="sm" icon="bolt" id="btn-config-rdma" ${rdmaInProgress ? 'disabled' : ''}>${escapeHtml(rdmaInProgress ? I18n.t('cluster_detail.rdma_configuring') : I18n.t('cluster_detail.config_rdma'))}</tf-button>
+      <tf-button variant="primary" size="sm" icon="rocket" id="btn-deploy-model" ${deployInProgress ? 'disabled' : ''}>${escapeHtml(deployInProgress ? I18n.t('cluster_detail.deploying') : I18n.t('cluster_detail.deploy_model'))}</tf-button>
       <tf-button variant="danger" size="sm" icon="trash" id="btn-delete-cluster">${escapeHtml(I18n.t('common.delete'))}</tf-button>
     `;
   }
@@ -186,6 +212,9 @@ function renderDetail() {
         <div class="cluster-detail-col-summary">${renderSummaryColumn(c, members)}</div>
       </div>
       ${renderConnectionMatrix(members)}
+      ${renderProbeAssignments(members)}
+      ${renderRdmaConfig(members)}
+      ${renderDeploySection(members)}
       ${renderRouting(c)}
       ${renderSharedModels(members)}
     `);
@@ -245,6 +274,24 @@ function bindBodyClicks(root) {
       return;
     }
 
+    const rdmaBtn = e.target.closest('#btn-config-rdma');
+    if (rdmaBtn && !rdmaInProgress) {
+      await configureClusterRdma();
+      return;
+    }
+
+    const deployBtn = e.target.closest('#btn-deploy-model');
+    if (deployBtn && !deployInProgress) {
+      await openDeployModal();
+      return;
+    }
+
+    const stopBtn = e.target.closest('#btn-deploy-stop');
+    if (stopBtn) {
+      await stopClusterDeploy();
+      return;
+    }
+
     const saveRouting = e.target.closest('#btn-save-routing');
     if (saveRouting) {
       await saveRoutingSettings();
@@ -264,7 +311,7 @@ function renderNodesColumn(members) {
 
 function renderNodeMini(member) {
   const live = member.live;
-  const online = isOnline(live);
+  const online = memberOnline(member);
   const status = online ? 'online' : 'offline';
 
   const cpuPct = live ? pctOr(live.cpu_usage ?? live.cpu_usage_percent) : null;
@@ -276,8 +323,15 @@ function renderNodeMini(member) {
   const vramTotal = gpus.reduce((s, g) => s + (g.vram_total_mb || 0), 0);
   const vramPct = vramTotal > 0 ? Math.round((vramUsed / vramTotal) * 100) : null;
 
-  const linkClass = connectionClass(member.interface_type, member.interface_speed_mbps);
-  const linkLabel = connectionLabel(member.interface_type, member.interface_speed_mbps);
+  const asg = findAssignment(member.node_id);
+  // Po probe znamy wybrany interfejs — pokazujemy go zamiast surowych metadanych.
+  const linkType = asg ? asg.interface_type : member.interface_type;
+  const linkSpeed = asg ? asg.interface_speed_mbps : member.interface_speed_mbps;
+  const linkClass = connectionClass(linkType, linkSpeed);
+  const linkLabel = connectionLabel(linkType, linkSpeed);
+  const asgDetail = asg
+    ? `${asg.interface_name || ''}${asg.interface_ip ? ` ${asg.interface_ip}` : ''}`.trim()
+    : '';
 
   return `
     <div class="cluster-detail-node ${online ? '' : 'offline'}">
@@ -293,7 +347,7 @@ function renderNodeMini(member) {
         ${renderMiniBar('RAM', ram)}
         ${renderMiniBar('VRAM', vramPct)}
       </div>
-      ${linkLabel ? `<div class="cdn-link"><span class="link-chip ${linkClass}">${escapeHtml(linkLabel)}</span></div>` : ''}
+      ${linkLabel ? `<div class="cdn-link"><span class="link-chip ${linkClass}">${asg ? '✓ ' : ''}${escapeHtml(linkLabel)}${asgDetail ? ` · ${escapeHtml(asgDetail)}` : ''}</span></div>` : ''}
     </div>
   `;
 }
@@ -342,7 +396,7 @@ function renderDiagram(members) {
   }
 
   const dots = points.map((p, i) => {
-    const online = isOnline(p.member.live);
+    const online = memberOnline(p.member);
     return `
       <g class="cd-node ${online ? '' : 'offline'}" transform="translate(${p.x}, ${p.y})">
         <circle r="18" class="cd-node-circle"/>
@@ -398,7 +452,7 @@ function resolveLineStyle(probe, memberA, memberB) {
 
 function renderSummaryColumn(cluster, members) {
   const n = members.length;
-  const onlineCnt = members.filter(m => isOnline(m.live)).length;
+  const onlineCnt = members.filter(m => memberOnline(m)).length;
   const totalCpu = members.reduce((s, m) => s + (m.live?.cpu_count || 0), 0);
   const totalRam = members.reduce((s, m) => s + (m.live?.ram_total_mb || 0), 0);
   const totalVram = members.reduce((s, m) => {
@@ -469,6 +523,43 @@ function renderConnectionMatrix(members) {
   `;
 }
 
+// Sekcja "wybrane interfejsy" — pokazuje ktory NIC wygral per node + bottleneck
+// klastra. Renderuje sie dopiero po otrzymaniu danych End z probe.
+function renderProbeAssignments(members) {
+  if (probeAssignments.length === 0 && probeBottleneckMbps == null) return '';
+
+  const byNode = new Map(probeAssignments.map(a => [a.node_id, a]));
+  const rows = members.map(m => {
+    const a = byNode.get(m.node_id);
+    if (!a) {
+      return `<div class="cluster-summary-row"><span class="k">${escapeHtml(m.hostname)}</span><span class="v">—</span></div>`;
+    }
+    const cls = connectionClass(a.interface_type, a.interface_speed_mbps);
+    const lbl = connectionLabel(a.interface_type, a.interface_speed_mbps) || a.interface_type || '—';
+    const detail = `${a.interface_name || ''}${a.interface_ip ? ` (${a.interface_ip})` : ''}`.trim();
+    return `
+      <div class="cluster-summary-row">
+        <span class="k">${escapeHtml(m.hostname)}</span>
+        <span class="v"><span class="link-chip ${cls}">${escapeHtml(lbl)}</span>${detail ? ` <code>${escapeHtml(detail)}</code>` : ''}</span>
+      </div>
+    `;
+  }).join('');
+
+  const bottleneck = probeBottleneckMbps != null
+    ? `<div class="cluster-summary-row"><span class="k">${escapeHtml(I18n.t('clusters.bottleneck'))}</span><span class="v">${escapeHtml(formatBandwidth(probeBottleneckMbps))}</span></div>`
+    : '';
+
+  return `
+    <div class="cluster-matrix-section">
+      <div class="cluster-matrix-title">${escapeHtml(I18n.t('cluster_detail.selected_interfaces'))}</div>
+      <div class="cluster-summary-card">
+        ${rows}
+        ${bottleneck}
+      </div>
+    </div>
+  `;
+}
+
 async function startClusterProbe() {
   if (!clusterData) return;
   const members = resolveMembers(clusterData);
@@ -479,6 +570,9 @@ async function startClusterProbe() {
 
   probeInProgress = true;
   probeResults = [];
+  probeAssignments = [];
+  probeBottleneckMbps = null;
+  probeAssignmentStatus = null;
   renderDetail();
 
   const nodeIds = members.map(m => m.node_id);
@@ -504,9 +598,24 @@ async function startClusterProbe() {
             renderDetail();
           }
         },
-        onEnd: () => {
+        onEnd: (end) => {
           probeInProgress = false;
           probeUnsub = null;
+          // Pola End sa NOWE — starsze serwery (lub niezaktualizowany dekoder)
+          // ich nie wysylaja, wiec czytamy defensywnie i pomijamy gdy brak.
+          if (end && typeof end === 'object') {
+            const bn = end.bottleneckMbps ?? end.bottleneck_mbps;
+            probeBottleneckMbps = (bn != null) ? bn : null;
+            probeAssignmentStatus = end.assignmentStatus ?? end.assignment_status ?? null;
+            const asg = end.assignments;
+            probeAssignments = Array.isArray(asg) ? asg.map(a => ({
+              node_id: a.nodeId ?? a.node_id ?? '',
+              interface_name: a.interfaceName ?? a.interface_name ?? '',
+              interface_ip: a.interfaceIp ?? a.interface_ip ?? '',
+              interface_speed_mbps: a.interfaceSpeedMbps ?? a.interface_speed_mbps ?? 0,
+              interface_type: a.interfaceType ?? a.interface_type ?? '',
+            })) : [];
+          }
           renderDetail();
           toast(I18n.t('cluster_detail.tests_done'), 'success');
         },
@@ -522,6 +631,407 @@ async function startClusterProbe() {
     probeInProgress = false;
     toast(err.message || I18n.t('common.error'), 'error');
     renderDetail();
+  }
+}
+
+// ---- RDMA auto-config ----------------------------------------------------
+
+// Prompts for the sudo password (needed by the per-node NetworkConfig mesh
+// command) and triggers cluster RDMA auto-config: detect each member's RoCE
+// "twins", bring up the unconfigured one (IP on a dedicated subnet + MTU 9000),
+// and persist the RoCE device list for distributed deploy. Everything runs in
+// the program — no manual ip/netplan.
+async function configureClusterRdma() {
+  if (!clusterData) return;
+  const members = resolveMembers(clusterData);
+  if (members.length < 2) {
+    toast(I18n.t('clusters.select_min_nodes'), 'warning');
+    return;
+  }
+
+  const sudoPassword = await promptSudoPassword();
+  if (sudoPassword == null) return; // cancelled
+
+  rdmaInProgress = true;
+  rdmaResult = null;
+  renderDetail();
+
+  try {
+    const resp = await ApiBinary.action(
+      'clusterRdmaConfigureRequest',
+      { clusterId: currentClusterId, sudoPassword },
+      { timeoutMs: 120000 },
+    );
+    rdmaResult = resp;
+    rdmaInProgress = false;
+    renderDetail();
+    if (resp.ok) {
+      toast(I18n.t('cluster_detail.rdma_done'), 'success');
+    } else {
+      toast(I18n.t('cluster_detail.rdma_partial'), 'warning');
+    }
+  } catch (err) {
+    rdmaInProgress = false;
+    toast(err.message || I18n.t('common.error'), 'error');
+    renderDetail();
+  }
+}
+
+// Modal sudo prompt built from tf-* primitives. Resolves to the entered string
+// on confirm, or null on cancel.
+async function promptSudoPassword() {
+  const { TfWindow } = await import('/js/components/tf-window.js');
+  await import('/js/components/tf-input.js');
+
+  const body = document.createElement('div');
+  body.innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:8px;min-width:320px;">
+      <div>${escapeHtml(I18n.t('cluster_detail.rdma_sudo_hint'))}</div>
+      <tf-input id="rdma-sudo-input" type="password" autofocus
+        placeholder="${escapeAttr(I18n.t('cluster_detail.rdma_sudo_placeholder'))}"></tf-input>
+    </div>
+  `;
+
+  const result = await TfWindow.open({
+    title: I18n.t('cluster_detail.config_rdma'),
+    icon: 'bolt',
+    modal: true,
+    width: 420,
+    body,
+    footer: `
+      <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+      <tf-button variant="primary" data-action="confirm">${escapeHtml(I18n.t('cluster_detail.config_rdma'))}</tf-button>
+    `,
+  });
+
+  if (result.action !== 'confirm') return null;
+  const input = body.querySelector('#rdma-sudo-input');
+  const value = input ? String(input.value || '') : '';
+  return value.length > 0 ? value : null;
+}
+
+function renderRdmaConfig(members) {
+  // Prefer the just-run action result; fall back to persisted member columns so
+  // the section survives a page refresh.
+  const fromMembers = members
+    .map(m => ({
+      hostname: m.hostname,
+      rdmaDevices: m.rdmaDevices ?? m.rdma_devices ?? '',
+      rdmaIp: m.rdmaIp ?? m.rdma_ip ?? '',
+      rdmaSocketIfname: m.rdmaSocketIfname ?? m.rdma_socket_ifname ?? '',
+    }))
+    .filter(m => m.rdmaDevices || m.rdmaIp);
+
+  const hasResult = rdmaResult && Array.isArray(rdmaResult.members) && rdmaResult.members.length > 0;
+  if (!hasResult && fromMembers.length === 0) return '';
+
+  let rows;
+  if (hasResult) {
+    rows = rdmaResult.members.map(m => {
+      if (m.error) {
+        return `<tr><th>${escapeHtml(m.hostname || m.nodeId)}</th>
+          <td colspan="3"><tf-chip status="error">${escapeHtml(m.error)}</tf-chip></td></tr>`;
+      }
+      const ifaces = (m.interfaces || []).map(i => {
+        const status = i.action === 'failed' ? 'error'
+          : i.action === 'unchanged' ? 'neutral' : 'success';
+        return `<div class="rdma-iface">
+          <tf-chip status="${status}">${escapeHtml(i.role)}</tf-chip>
+          <code>${escapeHtml(i.netdev)}</code>
+          <span class="rdma-roce">${escapeHtml(i.roceDevice)}</span>
+          <span class="rdma-ip">${escapeHtml(i.ipv4 || '—')}</span>
+          <span class="rdma-mtu">MTU ${escapeHtml(String(i.mtu || ''))}</span>
+          <span class="rdma-action">${escapeHtml(i.action)}</span>
+        </div>`;
+      }).join('');
+      return `<tr><th>${escapeHtml(m.hostname || m.nodeId)}</th><td colspan="3">${ifaces}</td></tr>`;
+    }).join('');
+  } else {
+    rows = fromMembers.map(m => `
+      <tr>
+        <th>${escapeHtml(m.hostname)}</th>
+        <td><code>${escapeHtml(m.rdmaSocketIfname || '—')}</code></td>
+        <td><span class="rdma-ip">${escapeHtml(m.rdmaIp || '—')}</span></td>
+        <td><span class="rdma-roce">${escapeHtml(m.rdmaDevices || '—')}</span></td>
+      </tr>
+    `).join('');
+  }
+
+  return `
+    <div class="cluster-rdma-section">
+      <div class="cluster-rdma-title">${escapeHtml(I18n.t('cluster_detail.rdma_title'))}</div>
+      <table class="cluster-rdma-table"><tbody>${rows}</tbody></table>
+    </div>
+  `;
+}
+
+// ---- Distributed deploy (vLLM tensor-parallel across the cluster) --------
+
+// True when every member already has a RoCE IP from D1 (Configure RDMA). The
+// distributed deploy needs the high-speed twin up, so we hint the user when it
+// is not configured yet.
+function clusterRdmaConfigured(members) {
+  return members.length > 0 && members.every(m => String(m.rdma_ip || '').length > 0);
+}
+
+// Heuristic default engine: GB10 / Spark nodes ship the aarch64 image. We cannot
+// read the arch from the member here, so we default to the Spark image and let
+// the user switch to plain "vllm" for x86 clusters.
+function defaultEngineId() {
+  return 'vllm-spark';
+}
+
+function renderDeploySection(members) {
+  const tpSize = members.length; // gpus_per_node default 1 → tp = members
+  const rdmaOk = clusterRdmaConfigured(members);
+  const hint = rdmaOk
+    ? ''
+    : `<div class="cluster-deploy-hint">${escapeHtml(I18n.t('cluster_detail.deploy_rdma_hint'))}</div>`;
+
+  let statusBlock = '';
+  if (deployInProgress) {
+    statusBlock = `
+      <div class="cluster-deploy-progress">
+        <tf-spinner size="sm"></tf-spinner>
+        <span>${escapeHtml(I18n.t('cluster_detail.deploy_in_progress'))}</span>
+      </div>`;
+  } else if (activeDeployment) {
+    statusBlock = renderActiveDeployment(activeDeployment);
+  } else if (deployResult) {
+    statusBlock = renderDeployResult(deployResult);
+  }
+
+  return `
+    <div class="cluster-deploy-section">
+      <div class="cluster-matrix-title">${escapeHtml(I18n.t('cluster_detail.deploy_title'))}</div>
+      <div class="cluster-deploy-meta">
+        <span>${escapeHtml(I18n.t('cluster_detail.deploy_tp_size'))}: <strong>${tpSize}</strong></span>
+        <span class="cluster-deploy-meta-dim">${escapeHtml(I18n.t('cluster_detail.deploy_tp_formula'))}</span>
+      </div>
+      ${hint}
+      ${statusBlock}
+    </div>
+  `;
+}
+
+function renderActiveDeployment(dep) {
+  const memberRows = (dep.members || []).map(m => renderDeployMemberRow(m)).join('');
+  const endpoint = dep.endpointUrl
+    ? `<div class="cluster-deploy-endpoint"><span class="k">${escapeHtml(I18n.t('cluster_detail.deploy_endpoint'))}</span><code>${escapeHtml(dep.endpointUrl)}</code></div>`
+    : '';
+  return `
+    <div class="cluster-deploy-active">
+      <div class="cluster-deploy-active-head">
+        <tf-chip status="${dep.ok ? 'online' : 'warning'}" dot>${escapeHtml(dep.ok ? I18n.t('cluster_detail.deploy_active') : I18n.t('cluster_detail.deploy_degraded'))}</tf-chip>
+        <span class="cluster-deploy-id"><code>${escapeHtml(dep.deploymentClusterId || '')}</code></span>
+        <tf-button variant="danger" size="sm" icon="stop" id="btn-deploy-stop">${escapeHtml(I18n.t('cluster_detail.deploy_stop'))}</tf-button>
+      </div>
+      ${endpoint}
+      <table class="cluster-rdma-table"><tbody>${memberRows}</tbody></table>
+      ${dep.message ? `<div class="cluster-deploy-message">${escapeHtml(dep.message)}</div>` : ''}
+    </div>
+  `;
+}
+
+function renderDeployResult(res) {
+  const memberRows = (res.members || []).map(m => renderDeployMemberRow(m)).join('');
+  return `
+    <div class="cluster-deploy-result">
+      <div class="cluster-deploy-active-head">
+        <tf-chip status="${res.ok ? 'online' : 'error'}" dot>${escapeHtml(res.ok ? I18n.t('cluster_detail.deploy_ok') : I18n.t('cluster_detail.deploy_failed'))}</tf-chip>
+      </div>
+      <table class="cluster-rdma-table"><tbody>${memberRows}</tbody></table>
+      ${res.message ? `<div class="cluster-deploy-message">${escapeHtml(res.message)}</div>` : ''}
+    </div>
+  `;
+}
+
+function renderDeployMemberRow(m) {
+  const detail = m.error
+    ? `<tf-chip status="error">${escapeHtml(m.error)}</tf-chip>`
+    : `<tf-chip status="success">${escapeHtml(I18n.t('cluster_detail.deploy_member_ok'))}</tf-chip>${m.deployId ? ` <code>${escapeHtml(m.deployId)}</code>` : ''}`;
+  return `<tr>
+    <th>${escapeHtml(m.hostname || m.nodeId)}</th>
+    <td><tf-chip status="neutral">${escapeHtml(m.role)}</tf-chip></td>
+    <td>${detail}</td>
+  </tr>`;
+}
+
+// Modal collecting the deploy parameters; submits a ClusterDeployRequest. The
+// tp_size preview updates live as the user changes gpus_per_node.
+async function openDeployModal() {
+  if (!clusterData) return;
+  const members = resolveMembers(clusterData);
+  if (members.length < 2) {
+    toast(I18n.t('clusters.select_min_nodes'), 'warning');
+    return;
+  }
+
+  const { TfWindow } = await import('/js/components/tf-window.js');
+  await import('/js/components/tf-input.js');
+  await import('/js/components/tf-select.js');
+
+  const body = document.createElement('div');
+  body.innerHTML = `
+    <div class="cluster-deploy-form" style="display:flex;flex-direction:column;gap:12px;min-width:420px;">
+      <div class="form-group">
+        <label>${escapeHtml(I18n.t('cluster_detail.deploy_engine'))}</label>
+        <tf-select id="dep-engine" value="${escapeAttr(defaultEngineId())}">
+          <option value="vllm-spark"${defaultEngineId() === 'vllm-spark' ? ' selected' : ''}>vLLM (Spark / aarch64)</option>
+          <option value="vllm">vLLM (x86 / CUDA)</option>
+        </tf-select>
+      </div>
+      <div class="form-group">
+        <label>${escapeHtml(I18n.t('cluster_detail.deploy_model_repo'))}</label>
+        <tf-input id="dep-repo" placeholder="${escapeAttr(I18n.t('cluster_detail.deploy_model_repo_hint'))}"></tf-input>
+      </div>
+      <div class="form-group">
+        <label>${escapeHtml(I18n.t('cluster_detail.deploy_served_name'))}</label>
+        <tf-input id="dep-served" placeholder="${escapeAttr(I18n.t('cluster_detail.deploy_served_name_hint'))}"></tf-input>
+      </div>
+      <div class="form-group">
+        <label>${escapeHtml(I18n.t('cluster_detail.deploy_gpus_per_node'))}</label>
+        <tf-input id="dep-gpus" type="number" min="1" max="8" value="1"></tf-input>
+        <div class="cluster-deploy-tp-preview">${escapeHtml(I18n.t('cluster_detail.deploy_tp_size'))}: <strong id="dep-tp">${members.length}</strong> <span class="cluster-deploy-meta-dim">(${members.length} × <span id="dep-gpus-echo">1</span>)</span></div>
+      </div>
+      <div class="form-group">
+        <label>${escapeHtml(I18n.t('cluster_detail.deploy_gpu_mem'))}</label>
+        <tf-input id="dep-gpumem" type="number" min="0.1" max="1.0" step="0.05" value="0.6"></tf-input>
+      </div>
+      <div class="form-group">
+        <label>${escapeHtml(I18n.t('cluster_detail.deploy_max_len'))}</label>
+        <tf-input id="dep-maxlen" type="number" min="512" step="512" value="8192"></tf-input>
+      </div>
+      <div class="form-group">
+        <label>${escapeHtml(I18n.t('cluster_detail.deploy_port'))}</label>
+        <tf-input id="dep-port" type="number" min="1" max="65535" value="8100"></tf-input>
+      </div>
+    </div>
+  `;
+
+  // Live tp_size preview.
+  const memberCount = members.length;
+  const gpusInput = body.querySelector('#dep-gpus');
+  const tpEl = body.querySelector('#dep-tp');
+  const echoEl = body.querySelector('#dep-gpus-echo');
+  const updateTp = () => {
+    const g = Math.max(1, parseInt(gpusInput?.value, 10) || 1);
+    if (tpEl) tpEl.textContent = String(memberCount * g);
+    if (echoEl) echoEl.textContent = String(g);
+  };
+  if (gpusInput) {
+    gpusInput.addEventListener('input', updateTp);
+    gpusInput.addEventListener('change', updateTp);
+  }
+
+  const result = await TfWindow.open({
+    title: I18n.t('cluster_detail.deploy_title'),
+    icon: 'rocket',
+    modal: true,
+    width: 520,
+    body,
+    footer: `
+      <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+      <tf-button variant="primary" data-action="confirm">${escapeHtml(I18n.t('cluster_detail.deploy_submit'))}</tf-button>
+    `,
+  });
+
+  if (result.action !== 'confirm') return;
+
+  const repo = String(body.querySelector('#dep-repo')?.value || '').trim();
+  if (!repo) {
+    toast(I18n.t('cluster_detail.deploy_need_repo'), 'warning');
+    return;
+  }
+  const served = String(body.querySelector('#dep-served')?.value || '').trim();
+  const gpusPerNode = Math.max(1, parseInt(body.querySelector('#dep-gpus')?.value, 10) || 1);
+  const gpuMem = parseFloat(body.querySelector('#dep-gpumem')?.value) || 0.6;
+  const maxLen = parseInt(body.querySelector('#dep-maxlen')?.value, 10) || 8192;
+  const port = parseInt(body.querySelector('#dep-port')?.value, 10) || 8100;
+  const engineId = body.querySelector('#dep-engine')?.value || defaultEngineId();
+
+  await runClusterDeploy({
+    engineId,
+    modelRepo: repo,
+    servedModelName: served || null,
+    gpusPerNode,
+    gpuMemoryUtilization: gpuMem,
+    maxModelLen: maxLen,
+    port,
+  });
+}
+
+async function runClusterDeploy(opts) {
+  deployInProgress = true;
+  deployResult = null;
+  renderDetail();
+
+  const readyTimeoutSecs = 600;
+  try {
+    const resp = await ApiBinary.action(
+      'clusterDeployRequest',
+      {
+        clusterId: currentClusterId,
+        engineId: opts.engineId,
+        modelRepo: opts.modelRepo,
+        servedModelName: opts.servedModelName,
+        gpusPerNode: opts.gpusPerNode,
+        gpuMemoryUtilization: opts.gpuMemoryUtilization,
+        maxModelLen: opts.maxModelLen,
+        port: opts.port,
+        readyTimeoutSecs,
+      },
+      { timeoutMs: readyTimeoutSecs * 1000 + 30000 },
+    );
+    deployInProgress = false;
+    deployResult = resp;
+    if (resp.ok && resp.deploymentClusterId) {
+      activeDeployment = resp;
+      toast(I18n.t('cluster_detail.deploy_ok'), 'success');
+    } else {
+      activeDeployment = null;
+      const msg = String(resp.message || '');
+      // The backend rejects a deploy when RDMA isn't configured yet.
+      if (/rdma/i.test(msg)) {
+        toast(I18n.t('cluster_detail.deploy_rdma_required'), 'error');
+      } else {
+        toast(msg || I18n.t('cluster_detail.deploy_failed'), 'error');
+      }
+    }
+    renderDetail();
+  } catch (err) {
+    deployInProgress = false;
+    deployResult = null;
+    toast(err.message || I18n.t('common.error'), 'error');
+    renderDetail();
+  }
+}
+
+async function stopClusterDeploy() {
+  if (!activeDeployment || !activeDeployment.deploymentClusterId) return;
+  const { TfWindow } = await import('/js/components/tf-window.js');
+  const ok = await TfWindow.confirm({
+    title: I18n.t('cluster_detail.deploy_stop_title'),
+    message: I18n.t('cluster_detail.deploy_stop_confirm'),
+    confirmLabel: I18n.t('cluster_detail.deploy_stop'),
+    cancelLabel: I18n.t('common.cancel'),
+    danger: true,
+  });
+  if (!ok) return;
+
+  const deploymentClusterId = activeDeployment.deploymentClusterId;
+  try {
+    const resp = await ApiBinary.action(
+      'clusterDeployStopRequest',
+      { clusterId: currentClusterId, deploymentClusterId },
+      { timeoutMs: 120000 },
+    );
+    activeDeployment = null;
+    deployResult = resp;
+    renderDetail();
+    toast(resp.ok ? I18n.t('cluster_detail.deploy_stopped') : (resp.message || I18n.t('cluster_detail.deploy_stop_partial')), resp.ok ? 'success' : 'warning');
+  } catch (err) {
+    toast(err.message || I18n.t('common.error'), 'error');
   }
 }
 
@@ -630,8 +1140,12 @@ function resolveMembers(cluster) {
       node_id: nodeId,
       role: m.role || 'worker',
       hostname: (live && live.hostname) || m.hostname || m.node_name || nodeId,
+      status: m.status || m.member_status || '',
       interface_type: m.interfaceType || m.interface_type || '',
       interface_speed_mbps: m.interfaceSpeedMbps || m.interface_speed_mbps || 0,
+      rdma_ip: m.rdmaIp || m.rdma_ip || '',
+      rdma_devices: m.rdmaDevices || m.rdma_devices || '',
+      rdma_socket_ifname: m.rdmaSocketIfname || m.rdma_socket_ifname || '',
       live,
     };
   });
@@ -639,10 +1153,28 @@ function resolveMembers(cluster) {
 
 function clusterStatus(members) {
   if (members.length === 0) return 'offline';
-  const onlineCnt = members.filter(m => isOnline(m.live)).length;
+  const onlineCnt = members.filter(m => memberOnline(m)).length;
   if (onlineCnt === 0) return 'offline';
   if (onlineCnt < members.length) return 'degraded';
   return 'healthy';
+}
+
+// Online liczone z dwoch zrodel: status czlonka z backendu (peer_store) ORAZ
+// swiezy stan polaczenia z mesh node list (nodesById -> member.live).
+function memberOnline(m) {
+  if (!m) return false;
+  if (String(m.status || '').toLowerCase() === 'online') return true;
+  return isOnline(m.live);
+}
+
+function findAssignment(nodeId) {
+  if (!nodeId || probeAssignments.length === 0) return null;
+  return probeAssignments.find(a => a.node_id === nodeId) || null;
+}
+
+function formatBandwidth(mbps) {
+  if (mbps == null) return '—';
+  return mbps >= 1000 ? `${(mbps / 1000).toFixed(1)} Gbps` : `${mbps} Mbps`;
 }
 
 function isOnline(node) {

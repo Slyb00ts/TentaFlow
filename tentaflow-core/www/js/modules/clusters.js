@@ -143,7 +143,7 @@ function renderList() {
 function renderClusterCard(cluster) {
   const clusterId = cluster.id || cluster.cluster_id;
   const members = resolveMembers(cluster);
-  const memberCount = members.length;
+  const memberCount = memberCountOf(cluster);
   const status = clusterStatus(cluster);
   const statusClass = status === 'offline' ? 'offline' : (status === 'degraded' ? 'degraded' : 'healthy');
 
@@ -167,7 +167,7 @@ function renderClusterCard(cluster) {
 
   const linkChips = renderConnectionChips(members);
 
-  const footerMeta = renderFooterMeta(cluster, agg);
+  const footerMeta = renderFooterMeta(cluster, agg, memberCount);
 
   return `
     <div class="cluster-card ${statusClass}" data-cluster-detail="${escapeAttr(clusterId)}">
@@ -204,23 +204,39 @@ function renderClusterCard(cluster) {
 function resolveMembers(cluster) {
   const raw = cluster.members || cluster.nodes || [];
   return raw.map(m => {
-    const nodeId = m.node_id || m.id;
+    // ClusterMember dekoduje sie do camelCase (nodeId/interfaceType/...); akceptujemy
+    // tez snake_case dla zgodnosci z ewentualnymi starszymi ksztaltami.
+    const nodeId = m.nodeId || m.node_id || m.id;
     const live = nodesById.get(nodeId);
     return {
       node_id: nodeId,
       role: m.role || 'worker',
       hostname: (live && live.hostname) || m.hostname || m.node_name || nodeId,
-      interface_type: m.interface_type || '',
-      interface_speed_mbps: m.interface_speed_mbps || 0,
+      status: m.status || '',
+      interface_type: m.interfaceType || m.interface_type || '',
+      interface_speed_mbps: m.interfaceSpeedMbps || m.interface_speed_mbps || 0,
       live,
     };
   });
 }
 
+function memberCountOf(cluster) {
+  const members = resolveMembers(cluster);
+  if (members.length > 0) return members.length;
+  return cluster.membersCount ?? cluster.members_count ?? 0;
+}
+
 function clusterStatus(cluster) {
   const members = resolveMembers(cluster);
-  if (members.length === 0) return 'offline';
-  const onlineCnt = members.filter(m => isOnline(m.live)).length;
+  if (members.length === 0) {
+    // Brak members[] (np. dekoder nie wysyla listy) — degraduj na podstawie licznikow.
+    const total = cluster.membersCount ?? cluster.members_count ?? 0;
+    const online = cluster.membersOnline ?? cluster.members_online ?? 0;
+    if (total === 0 || online === 0) return 'offline';
+    if (online < total) return 'degraded';
+    return 'healthy';
+  }
+  const onlineCnt = members.filter(m => memberOnline(m)).length;
   if (onlineCnt === 0) return 'offline';
   if (onlineCnt < members.length) return 'degraded';
   return 'healthy';
@@ -228,6 +244,13 @@ function clusterStatus(cluster) {
 
 function isOnline(node) {
   return isOnlineHelper(node);
+}
+
+// Online z dwoch zrodel: status czlonka z backendu ORAZ swiezy stan z mesh node list.
+function memberOnline(m) {
+  if (!m) return false;
+  if (String(m.status || '').toLowerCase() === 'online') return true;
+  return isOnline(m.live);
 }
 
 function renderStatusChip(status) {
@@ -308,7 +331,7 @@ function renderRing(label, val, unit, sub, pct) {
 // ---- Node / connection chips ---------------------------------------------
 
 function renderNodeChip(member) {
-  const online = isOnline(member.live);
+  const online = memberOnline(member);
   const status = online ? 'online' : 'offline';
   return `<tf-chip status="${status}" dot>${escapeHtml(member.hostname)}</tf-chip>`;
 }
@@ -360,13 +383,16 @@ function renderConnectionChips(members) {
 
 // ---- Footer ---------------------------------------------------------------
 
-function renderFooterMeta(cluster, agg) {
+function renderFooterMeta(cluster, agg, memberCount) {
   const reqMin = cluster.requests_per_min != null ? `${cluster.requests_per_min} req/min` : '';
   const models = cluster.shared_models_count != null
     ? `${cluster.shared_models_count} ${I18n.t(cluster.shared_models_count === 1 ? 'clusters.model_one' : 'clusters.model_many')}`
     : '';
   const failover = cluster.failover_target_name ? `→ ${cluster.failover_target_name}` : '';
-  const nodesLabel = `${agg.nodeCount} ${I18n.t(agg.nodeCount === 1 ? 'clusters.count_one_node' : 'clusters.count_many_nodes')}`;
+  // Licznik nodow z liczby czlonkow klastra, nie z liczby nodow ze swiezymi metrykami
+  // (live moze byc niedostepne, a klaster nadal ma czlonkow).
+  const count = memberCount != null ? memberCount : agg.nodeCount;
+  const nodesLabel = `${count} ${I18n.t(count === 1 ? 'clusters.count_one_node' : 'clusters.count_many_nodes')}`;
 
   const parts = [nodesLabel];
   if (reqMin) parts.push(reqMin);

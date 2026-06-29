@@ -574,9 +574,219 @@ inventory::submit! {
 // Wysyla "started" → seria "probing_pair"/"result" → "complete" + End z agregatami.
 // =============================================================================
 
+/// Maska advertowana przez peera nie zawsze jest poprawnym IPv4 (czasem pusta).
+/// Gdy nie da sie jej sparsowac, zakladamy /24 — realna osiagalnosc jest i tak
+/// potwierdzana udanym connectem podczas probe.
+fn netmask_or_24(advertised: &str) -> String {
+    if advertised.parse::<std::net::Ipv4Addr>().is_ok() {
+        advertised.to_string()
+    } else {
+        "255.255.255.0".to_string()
+    }
+}
+
+/// Buduje liste interfejsow noda dla orkiestracji probe z advertowanych sieci.
+/// Bierze tylko karty UP z adresem IPv4 — tylko po nich da sie probowac.
+fn node_interfaces_from_networks(
+    node_id: &str,
+    nets: &[crate::mesh::peer_store::PeerNetworkInfo],
+) -> Vec<crate::mesh::cluster_probe::NodeInterface> {
+    nets.iter()
+        .filter(|n| n.link_up && !n.ipv4_address.is_empty())
+        .map(|n| crate::mesh::cluster_probe::NodeInterface {
+            node_id: node_id.to_string(),
+            name: n.name.clone(),
+            ip: n.ipv4_address.clone(),
+            netmask: netmask_or_24(&n.ipv4_netmask),
+            speed_mbps: n.speed_mbps.unwrap_or(0),
+            rdma_available: n.rdma_available,
+        })
+        .collect()
+}
+
+/// Uruchamia jeden pomiar przepustowosci miedzy konkretna para interfejsow.
+/// `server` nasluchuje (bind do swojej karty), `client` laczy sie do IP servera
+/// bindujac do swojej karty. Nody zdalne sterowane sa przez mesh command;
+/// lokalny node wola silnik probe wprost (bez wysylania komendy do samego siebie).
+/// Zwraca `(bandwidth_mbps, latency_us, rdma)` przy sukcesie.
+async fn run_interface_probe(
+    qm: &Option<Arc<crate::mesh::iroh_manager::IrohMeshManager>>,
+    local_id: &str,
+    server: &crate::mesh::cluster_probe::NodeInterface,
+    client: &crate::mesh::cluster_probe::NodeInterface,
+    nonce: &[u8; 32],
+    num_streams: u8,
+    duration_ms: u32,
+) -> Option<(f64, u64, bool)> {
+    use tentaflow_protocol::mesh::{MeshCommandResponsePayload, MeshCommandType};
+
+    const CMD_TIMEOUT_SECS: u64 = 45;
+
+    // 1. Strona serwera — startuje listener, zwraca przydzielony port TCP.
+    let (tcp_port, rdma_port) = if server.node_id == local_id {
+        match crate::mesh::bandwidth_probe::start_probe_server(
+            &server.ip,
+            nonce,
+            num_streams,
+            duration_ms,
+        )
+        .await
+        {
+            Ok((port, handle)) => {
+                tokio::spawn(async move {
+                    let _ = handle.await;
+                });
+                (port, 0u16)
+            }
+            Err(e) => {
+                tracing::warn!("local probe server na {} nie wstal: {}", server.ip, e);
+                return None;
+            }
+        }
+    } else {
+        let qm = qm.as_ref()?;
+        let cmd = MeshCommandType::BandwidthProbe {
+            target_ip: server.ip.clone(),
+            target_port: 0,
+            rdma_port: 0,
+            bind_interface: server.name.clone(),
+            duration_ms,
+            mode: "server".into(),
+            nonce: nonce.to_vec(),
+            num_streams,
+        };
+        match qm
+            .send_command_and_wait(&server.node_id, cmd, CMD_TIMEOUT_SECS)
+            .await
+        {
+            Ok(resp) if resp.ok => match resp.payload {
+                MeshCommandResponsePayload::BandwidthProbeServerStarted {
+                    tcp_port,
+                    rdma_port,
+                } => (tcp_port, rdma_port),
+                _ => {
+                    tracing::warn!("probe server: nieoczekiwany payload");
+                    return None;
+                }
+            },
+            Ok(resp) => {
+                tracing::warn!("probe server blad: {:?}", resp.error);
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!("probe server send nieudany: {}", e);
+                return None;
+            }
+        }
+    };
+
+    // 2. Strona klienta — laczy sie do servera, mierzy i zwraca metryki.
+    // `start_probe_client` zwraca Ok nawet gdy ZADEN data-stream sie nie polaczyl
+    // (np. brak trasy do `server.ip` mimo wspolnego /24): bandwidth=0,
+    // streams_completed=0. Taki "sukces" to faktyczny brak osiagalnosci — odrzucamy
+    // go juz tutaj (None), zeby falszywy wynik nie wygral pary ani nie liczyl sie
+    // jako reachable.
+    let client_result: Option<(f64, u64, bool)> = if client.node_id == local_id {
+        match crate::mesh::bandwidth_probe::start_probe_client(
+            &server.ip,
+            tcp_port,
+            &client.name,
+            nonce,
+            num_streams,
+            duration_ms,
+        )
+        .await
+        {
+            Ok(r) if r.streams_completed > 0 && r.bandwidth_mbps > 0.0 => {
+                Some((r.bandwidth_mbps, r.latency_us, false))
+            }
+            Ok(r) => {
+                tracing::warn!(
+                    "probe {} → {} bez przeplywu (streams={}, mbps={})",
+                    client.name,
+                    server.ip,
+                    r.streams_completed,
+                    r.bandwidth_mbps
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!("local probe client do {} nieudany: {}", server.ip, e);
+                None
+            }
+        }
+    } else {
+        match qm.as_ref() {
+            Some(qm) => {
+                let cmd = MeshCommandType::BandwidthProbe {
+                    target_ip: server.ip.clone(),
+                    target_port: tcp_port,
+                    rdma_port,
+                    bind_interface: client.name.clone(),
+                    duration_ms,
+                    mode: "client".into(),
+                    nonce: nonce.to_vec(),
+                    num_streams,
+                };
+                match qm
+                    .send_command_and_wait(&client.node_id, cmd, CMD_TIMEOUT_SECS)
+                    .await
+                {
+                    Ok(resp) if resp.ok => match resp.payload {
+                        MeshCommandResponsePayload::BandwidthProbeClientResult {
+                            bandwidth_mbps,
+                            latency_us,
+                            rdma,
+                            streams_completed,
+                            ..
+                        } if streams_completed > 0 && bandwidth_mbps > 0.0 => {
+                            Some((bandwidth_mbps, latency_us, rdma))
+                        }
+                        MeshCommandResponsePayload::BandwidthProbeClientResult {
+                            bandwidth_mbps,
+                            streams_completed,
+                            ..
+                        } => {
+                            tracing::warn!(
+                                "probe {} → {} bez przeplywu (streams={}, mbps={})",
+                                client.name,
+                                server.ip,
+                                streams_completed,
+                                bandwidth_mbps
+                            );
+                            None
+                        }
+                        _ => {
+                            tracing::warn!("probe client: nieoczekiwany payload");
+                            None
+                        }
+                    },
+                    Ok(resp) => {
+                        tracing::warn!("probe client blad: {:?}", resp.error);
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!("probe client send nieudany: {}", e);
+                        None
+                    }
+                }
+            }
+            None => None,
+        }
+    };
+
+    // Gdy klient padl, zdalny serwer probe i tak sam zwalnia listener po wlasnym
+    // SERVER_TIMEOUT (~30s) — `BandwidthProbeCancel` w executorze jest no-opem,
+    // wiec swiadomie go nie wysylamy, by nie generowac bezuzytecznego round-tripu.
+    client_result
+}
+
 fn cluster_probe_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscription>) {
+    use crate::db::repository;
+    use crate::mesh::cluster_probe;
     use tentaflow_protocol::{
-        ClusterProbeStreamChunk, ClusterProbeStreamEnd, ClusterProbeStreamRequest,
+        ClusterProbeAssignment, ClusterProbeStreamChunk, ClusterProbeStreamEnd,
+        ClusterProbeStreamRequest,
     };
 
     tokio::spawn(async move {
@@ -590,6 +800,9 @@ fn cluster_probe_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<
                             total_pairs: 0,
                             successful: 0,
                             failed: 0,
+                            bottleneck_mbps: None,
+                            assignment_status: None,
+                            assignments: Vec::new(),
                         },
                     )),
                 );
@@ -619,6 +832,9 @@ fn cluster_probe_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<
                         total_pairs: 0,
                         successful: 0,
                         failed: 0,
+                        bottleneck_mbps: None,
+                        assignment_status: None,
+                        assignments: Vec::new(),
                     },
                 )),
             );
@@ -647,18 +863,47 @@ fn cluster_probe_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<
         let qm = ctx.state.quic_mesh.clone();
         let local_id = ctx.state.local_node_id.to_string();
 
+        const NUM_STREAMS: u8 = 4;
+        const DURATION_MS: u32 = 2000;
+
+        // Zbuduj liste interfejsow per node (rownolegla do payload.node_ids).
+        // Lokalny node czyta swoje karty wprost; zdalne z peer_store (advertowane
+        // przez heartbeat). Netmaska nie zawsze jest w advertise → /24 heurystyka.
+        let node_ifaces: Vec<Vec<cluster_probe::NodeInterface>> = payload
+            .node_ids
+            .iter()
+            .map(|nid| {
+                let nets = if *nid == local_id {
+                    crate::mesh::node_info_collector::collect_fast_metrics().networks
+                } else {
+                    ctx.state
+                        .mesh_peer_store
+                        .get(nid)
+                        .map(|p| p.networks)
+                        .unwrap_or_default()
+                };
+                node_interfaces_from_networks(nid, &nets)
+            })
+            .collect();
+
+        // Pary interfejsow w tym samym subnecie, pogrupowane per para nodow i
+        // posortowane od najszybszego (wg sysfs speed). Probujemy WSZYSTKIE
+        // kandydatury per para, zeby zmierzyc np. szybki ConnectX 10.10.10 obok
+        // wolniejszego LAN-u 192.168.x i wybrac realnie najszybszy link.
+        let reachable = cluster_probe::filter_reachable_pairs(&node_ifaces);
+        let ranked = cluster_probe::rank_pairs_by_speed(&reachable);
+
+        let mut all_results: Vec<cluster_probe::PairProbeResult> = Vec::new();
         let mut total_pairs: u32 = 0;
         let mut successful: u32 = 0;
         let mut failed: u32 = 0;
 
-        // Iteruj po wszystkich uporzadkowanych parach (i, j) i = a, j = b.
         for i in 0..payload.node_ids.len() {
             for j in (i + 1)..payload.node_ids.len() {
                 let a = payload.node_ids[i].clone();
                 let b = payload.node_ids[j].clone();
                 total_pairs += 1;
 
-                // probing_pair event.
                 if push_chunk(
                     &sub,
                     MessageBody::ClusterProbeStreamChunkBody(ClusterProbeStreamChunk {
@@ -677,36 +922,95 @@ fn cluster_probe_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<
                     return;
                 }
 
-                // Probe — uzyj QUIC RTT z iroh manager jako proxy dla latency
-                // i odswiezonej peer info dla speed/interface_type.
-                let (success, latency_ms, bandwidth_mbps, interface_type) = match &qm {
-                    Some(qm) => {
-                        let a_local = a == local_id;
-                        let b_local = b == local_id;
-                        let other = if a_local { b.clone() } else { a.clone() };
-                        let connected = a_local || b_local || qm.is_connected(&other).await;
-                        if !connected {
-                            (false, None, None, None)
-                        } else {
-                            let rtt_us = qm.get_peer_rtt_us(&other).await.unwrap_or(0);
-                            let lat_ms = ((rtt_us as f64) / 1000.0).round() as u32;
-                            let peer = ctx.state.mesh_peer_store.get(&other);
-                            let iface = peer.as_ref().and_then(|_p| {
-                                // Peer_store nie trzyma typu interfejsu — wrocimy
-                                // ethernet jako rozsadny default dla connected peer.
-                                Some("ethernet".to_string())
-                            });
-                            (true, Some(lat_ms), None, iface)
-                        }
-                    }
-                    None => (false, None, None, None),
-                };
-
-                if success {
-                    successful += 1;
+                let key = if a < b {
+                    (a.clone(), b.clone())
                 } else {
-                    failed += 1;
+                    (b.clone(), a.clone())
+                };
+                let candidates = ranked.get(&key).cloned().unwrap_or_default();
+
+                // Zmierz kazda kandydujaca pare interfejsow, zachowaj najlepsza.
+                // Do puli wynikow trafiaja TYLKO realnie osiagalne pomiary —
+                // `run_interface_probe` zwraca None dla no-op (zero strumieni /
+                // zero przeplywu), wiec falszywe "sukcesy" nigdy nie wygraja pary.
+                let mut best: Option<cluster_probe::PairProbeResult> = None;
+                for (x, y) in &candidates {
+                    let nonce: [u8; 32] = rand::random();
+                    let Some((bw, lat_us, rdma)) = run_interface_probe(
+                        &qm,
+                        &local_id,
+                        x,
+                        y,
+                        &nonce,
+                        NUM_STREAMS,
+                        DURATION_MS,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+
+                    // Zmapuj interfejsy x/y na strony a/b po node_id.
+                    let (interface_a, interface_b) = if x.node_id == a {
+                        (x.name.clone(), y.name.clone())
+                    } else {
+                        (y.name.clone(), x.name.clone())
+                    };
+
+                    let result = cluster_probe::PairProbeResult {
+                        node_a: a.clone(),
+                        node_b: b.clone(),
+                        interface_a,
+                        interface_b,
+                        bandwidth_mbps: bw,
+                        latency_us: lat_us,
+                        reachable: true,
+                        rdma,
+                    };
+                    all_results.push(result.clone());
+
+                    match &best {
+                        Some(p) if p.bandwidth_mbps >= result.bandwidth_mbps => {}
+                        _ => best = Some(result),
+                    }
                 }
+
+                // Result chunk z wygrywajacym interfejsem. Gdy para nie ma ZADNEGO
+                // osiagalnego linku (brak kandydatow w tym samym subnecie ALBO
+                // wszystkie probe padly), wpisz jawny nieosiagalny wynik do puli —
+                // inaczej `optimal_assignment` nie wie o tej parze i raportuje
+                // "optimal" mimo dziury w topologii.
+                let (success, latency_ms, bandwidth_mbps, interface_type, message) = match &best {
+                    Some(bp) => {
+                        successful += 1;
+                        let lat_ms = ((bp.latency_us as f64) / 1000.0).round() as u32;
+                        let kind = if bp.rdma { "rdma" } else { "ethernet" };
+                        (
+                            true,
+                            Some(lat_ms),
+                            Some(bp.bandwidth_mbps.round() as u32),
+                            Some(bp.interface_a.clone()),
+                            Some(format!(
+                                "{} ↔ {} ({})",
+                                bp.interface_a, bp.interface_b, kind
+                            )),
+                        )
+                    }
+                    None => {
+                        failed += 1;
+                        all_results.push(cluster_probe::PairProbeResult {
+                            node_a: a.clone(),
+                            node_b: b.clone(),
+                            interface_a: String::new(),
+                            interface_b: String::new(),
+                            bandwidth_mbps: 0.0,
+                            latency_us: 0,
+                            reachable: false,
+                            rdma: false,
+                        });
+                        (false, None, None, None, None)
+                    }
+                };
 
                 if push_chunk(
                     &sub,
@@ -718,7 +1022,7 @@ fn cluster_probe_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<
                         latency_ms,
                         bandwidth_mbps,
                         interface_type,
-                        message: None,
+                        message,
                     }),
                 )
                 .is_err()
@@ -728,7 +1032,65 @@ fn cluster_probe_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<
             }
         }
 
-        // Complete chunk + End z agregatami.
+        // Optymalne przypisanie: per para najszybszy link + per-node wybrany NIC.
+        let detection = cluster_probe::optimal_assignment(&all_results);
+
+        // Cluster_id: z requestu (gdy frontend go poda) albo wyprowadzony z DB po
+        // zbiorze czlonkow rownym node_ids. Bez niego nie persistujemy interfejsu.
+        let cluster_id = payload.cluster_id.clone().or_else(|| {
+            repository::find_cluster_by_member_set(&ctx.state.db, &payload.node_ids)
+                .ok()
+                .flatten()
+        });
+
+        let find_iface = |node_id: &str, name: &str| {
+            node_ifaces
+                .iter()
+                .flatten()
+                .find(|nif| nif.node_id == node_id && nif.name == name)
+        };
+
+        let mut assignments: Vec<ClusterProbeAssignment> = Vec::new();
+        for (node_id, na) in &detection.per_node {
+            let (ip, speed, itype) = match find_iface(node_id, &na.interface) {
+                Some(nif) => (
+                    nif.ip.clone(),
+                    nif.speed_mbps as u32,
+                    if nif.rdma_available { "rdma" } else { "ethernet" }.to_string(),
+                ),
+                None => (String::new(), 0u32, "ethernet".to_string()),
+            };
+
+            if let Some(cid) = &cluster_id {
+                if let Err(e) = repository::update_cluster_member_interface(
+                    &ctx.state.db,
+                    cid,
+                    node_id,
+                    &na.interface,
+                    &ip,
+                    speed as i64,
+                    &itype,
+                ) {
+                    tracing::warn!("persist cluster member iface ({}): {}", node_id, e);
+                }
+            }
+
+            assignments.push(ClusterProbeAssignment {
+                node_id: node_id.clone(),
+                interface_name: na.interface.clone(),
+                interface_ip: ip,
+                interface_speed_mbps: speed,
+                interface_type: itype,
+            });
+        }
+
+        let bottleneck_mbps = if detection.bottleneck_mbps > 0.0 {
+            Some(detection.bottleneck_mbps.round() as u32)
+        } else {
+            None
+        };
+
+        // Complete chunk + End z agregatami i wybranym przypisaniem.
         let _ = push_chunk(
             &sub,
             MessageBody::ClusterProbeStreamChunkBody(ClusterProbeStreamChunk {
@@ -737,9 +1099,14 @@ fn cluster_probe_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<
                 target_node: None,
                 success: None,
                 latency_ms: None,
-                bandwidth_mbps: None,
-                interface_type: None,
-                message: None,
+                bandwidth_mbps: bottleneck_mbps,
+                interface_type: Some(detection.message.clone()),
+                message: Some(format!(
+                    "{} pairs, {} ok, bottleneck {} Mbps",
+                    total_pairs,
+                    successful,
+                    bottleneck_mbps.unwrap_or(0)
+                )),
             }),
         );
 
@@ -750,6 +1117,9 @@ fn cluster_probe_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<
                     total_pairs,
                     successful,
                     failed,
+                    bottleneck_mbps,
+                    assignment_status: Some(detection.message),
+                    assignments,
                 },
             )),
         );

@@ -18,6 +18,13 @@ torch==2.11.0
 torchvision==0.26.0
 torchaudio==2.11.0
 
+# Ray — wymagany do multi-node tensor-parallel (head+worker,
+# --distributed-executor-backend ray). 2.55.1 ma kola aarch64 + x86_64,
+# kompatybilny z vllm 0.23 / torch 2.11. Native host ma juz systemowy
+# rdma-core, wiec w bundlu wystarczy sam Ray (NCCL uzyje systemowego
+# libibverbs do RoCE).
+ray==2.55.1
+
 # vLLM deps (pobierane z https://github.com/vllm-project/vllm/blob/main/requirements-cuda.txt)
 # Sidecar python_venv pobiera je wprost z requirements-cuda.txt HEAD;
 # ten plik tylko aktualizuje kilka najciezszych wheels do wstepnego cache.

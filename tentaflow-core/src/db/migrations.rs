@@ -527,7 +527,104 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cameras_depth_fov_v",
             MigrationStep::Rust(cameras_add_depth_fov_v_column),
         ),
+        (
+            98,
+            "cluster_members_rdma_columns",
+            MigrationStep::Rust(cluster_members_add_rdma_columns),
+        ),
+        (
+            99,
+            "cluster_deployments_tables",
+            MigrationStep::Rust(create_cluster_deployments_tables),
+        ),
+        (
+            100,
+            "cluster_members_rdma_gid_index",
+            MigrationStep::Rust(cluster_members_add_gid_index),
+        ),
     ]
+}
+
+/// Per-member RoCEv2 GID index for `NCCL_IB_GID_INDEX` (D3). Default 3 — the
+/// verified RoCEv2-IPv4 GID on the ConnectX-7 twins of the DGX Spark; carried
+/// per member so a future RoCE probe can persist a detected value without a
+/// code change (no hardcode in the deploy path). Idempotent (column probe).
+fn cluster_members_add_gid_index(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "cluster_members", "rdma_gid_index")? {
+        conn.execute_batch(
+            "ALTER TABLE cluster_members ADD COLUMN rdma_gid_index INTEGER NOT NULL DEFAULT 3;",
+        )?;
+    }
+    Ok(())
+}
+
+/// Distributed deploy persistence (D3) — one row per multi-node tensor-parallel
+/// deployment (`cluster_deployments`) plus its head/worker membership
+/// (`cluster_deployment_members`). Survives restart so a running cluster-service
+/// can be listed, stopped (head + all workers) and redeployed. Idempotent
+/// (`CREATE TABLE IF NOT EXISTS`).
+fn create_cluster_deployments_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS cluster_deployments (
+            deployment_cluster_id TEXT PRIMARY KEY,
+            cluster_id            TEXT NOT NULL,
+            engine_id             TEXT NOT NULL,
+            model                 TEXT NOT NULL,
+            served_model_name     TEXT NOT NULL DEFAULT '',
+            tp_size               INTEGER NOT NULL,
+            head_node_id          TEXT NOT NULL,
+            port                  INTEGER NOT NULL,
+            endpoint_url          TEXT,
+            status                TEXT NOT NULL DEFAULT 'deploying',
+            created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at            TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS cluster_deployment_members (
+            deployment_cluster_id TEXT NOT NULL,
+            node_id               TEXT NOT NULL,
+            role                  TEXT NOT NULL,
+            container_name        TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (deployment_cluster_id, node_id),
+            FOREIGN KEY (deployment_cluster_id)
+                REFERENCES cluster_deployments(deployment_cluster_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_cluster_deployments_cluster
+            ON cluster_deployments(cluster_id);",
+    )?;
+    Ok(())
+}
+
+/// Cluster RDMA auto-config (D1) — persist per-member the RoCE devices to use
+/// for distributed deploy (`NCCL_IB_HCA`, BOTH QSFP twins), the QSFP socket
+/// netdev and the primary RDMA IP. The downstream distributed-deploy step (D3)
+/// reads these to build the correct NCCL environment without re-probing.
+/// Idempotent (PRAGMA table_info probe per column).
+fn cluster_members_add_rdma_columns(conn: &Connection) -> Result<()> {
+    let mut existing = std::collections::HashSet::new();
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(cluster_members)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            existing.insert(name);
+        }
+    }
+    if !existing.contains("rdma_devices") {
+        conn.execute_batch(
+            "ALTER TABLE cluster_members ADD COLUMN rdma_devices TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    if !existing.contains("rdma_ip") {
+        conn.execute_batch(
+            "ALTER TABLE cluster_members ADD COLUMN rdma_ip TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    if !existing.contains("rdma_socket_ifname") {
+        conn.execute_batch(
+            "ALTER TABLE cluster_members ADD COLUMN rdma_socket_ifname TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    Ok(())
 }
 
 /// Adds camera extrinsic-calibration columns for depth mapping: `depth_camera_pitch_deg`

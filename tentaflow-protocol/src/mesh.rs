@@ -341,6 +341,11 @@ pub enum MeshCommandType {
         gateway: Option<String>,
         dhcp: bool,
         sudo_password: String,
+        /// Docelowe MTU karty (np. 9000 dla RoCE/jumbo frames). `None` zostawia
+        /// MTU bez zmian. `#[serde(default)]` utrzymuje wire-compat ze starszymi
+        /// nodami, ktore nie znaja tego pola.
+        #[serde(default)]
+        mtu: Option<u32>,
     },
     /// Probe przepustowosci sieci miedzy nodami (TCP multi-stream lub RDMA)
     BandwidthProbe {
@@ -511,6 +516,119 @@ pub enum MeshCommandType {
     RobotControl {
         request_cbor: Vec<u8>,
     },
+    /// Enumeracja RoCE/RDMA interfejsow na nodzie (cluster-create network
+    /// auto-config). Odbiorca czyta swoje `/sys/class/net/*/device/infiniband`
+    /// i zwraca `RoceInterfaceList` z mapowaniem netdev->roce-device, IP, MTU,
+    /// stanem linku i slotem PCI. Bezstanowa. Appended at END (ciborium index rule).
+    RoceProbe,
+    /// Distributed (multi-node tensor-parallel) deploy of ONE slice of a model on
+    /// THIS node. The coordinator computes head/worker roles from cluster_members
+    /// + ich D1 RoCE config i wysyla jeden `spec` na czlonka (kazdy z WLASNYM
+    /// rdma_ip/devices/socket). Head serwuje endpoint OpenAI, workery dolaczaja do
+    /// klastra Ray jako headless. Odbiorca uruchamia kontener z komenda
+    /// `ray start ... && vllm serve ...` + NCCL env + flagami RDMA i zwraca
+    /// `ServiceDeployDistributedResult`. Appended at END (ciborium index rule).
+    ServiceDeployDistributed { spec: DistributedDeploySpec },
+    /// Teardown jednego distributed-deploymentu na TYM nodzie (head lub worker).
+    /// Odbiorca zatrzymuje+usuwa kontener i wiersz serwisu nalezacy do
+    /// `deployment_cluster_id`. Czysci sesje Ray (kazdy nieudany vllm brudzi
+    /// sesje), wiec redeploy startuje na czysto. Appended at END.
+    ServiceStopDistributed { deployment_cluster_id: String },
+    /// Sonduje REALNA gotowosc head-a distributed-deploymentu NA TYM nodzie:
+    /// czy GCS Ray nasluchuje (`ray_port`), ilu nodow widzi klaster Ray
+    /// (`ray status` w kontenerze head-a — weryfikacja dolaczenia workerow,
+    /// P2-1) i czy endpoint OpenAI (`serve_port` `/v1/models`) zwraca 200.
+    /// Koordynator odpytuje to z bounded timeoutem zamiast ufac samemu
+    /// zaplanowaniu deployu (P1-1). Appended at END.
+    DistributedReadiness {
+        deployment_cluster_id: String,
+        ray_port: u16,
+        serve_port: u16,
+        /// Oczekiwana liczba nodow Ray (= liczba czlonkow klastra).
+        expected_nodes: u32,
+    },
+}
+
+/// Per-node spec distributed-deployu policzony przez koordynatora z
+/// `cluster_members` + per-node konfiguracji RoCE z D1 (`rdma_devices` = OBA
+/// twins, `rdma_ip`, `rdma_socket_ifname`). Kazdy czlonek dostaje wlasny z jego
+/// rola i adresacja. To jest tez kontrakt, ktorego potrzebuje frontend D4 do
+/// zbudowania `ClusterDeployRequest` (koordynator wyprowadza z niego te spec-y).
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct DistributedDeploySpec {
+    /// UUID grupujacy head + workery jednego deploymentu (teardown po nim).
+    pub deployment_cluster_id: String,
+    /// Cluster, z ktorego policzono czlonkow/role.
+    pub cluster_id: String,
+    /// Silnik (vllm/vllm-spark) — wybiera obraz i dialekt komendy.
+    pub engine_id: String,
+    /// "head" | "worker".
+    pub role: String,
+    /// Repo/preset modelu serwowanego przez head (workery laduja ten sam plik
+    /// lokalnie — model jest juz obecny na kazdym nodzie w tym chunku).
+    pub model: String,
+    /// Nazwa modelu w routingu (`--served-model-name`).
+    pub served_model_name: String,
+    /// Tensor-parallel = laczna liczba GPU we wszystkich czlonkach.
+    pub tp_size: u32,
+    /// Liczba GPU na TYM nodzie (`ray start --num-gpus`).
+    pub num_gpus: u32,
+    /// Port endpointu OpenAI head-a (`vllm serve --port`). Ignorowany dla workera.
+    pub port: u16,
+    /// `--gpu-memory-utilization`.
+    pub gpu_memory_utilization: f32,
+    /// `--max-model-len`.
+    pub max_model_len: u32,
+    /// IP RDMA head-a (`ray start --head --node-ip-address` na head;
+    /// `ray start --address=<ray_head_ip>:<ray_port>` na workerze).
+    pub ray_head_ip: String,
+    /// Port GCS Ray (zwykle 6379).
+    pub ray_port: u16,
+    /// IP RDMA TEGO noda (`--node-ip-address`, `VLLM_HOST_IP`).
+    pub rdma_ip: String,
+    /// Lista urzadzen RoCE TEGO noda (OBA twins) → `NCCL_IB_HCA`.
+    pub rdma_devices: String,
+    /// Netdev QSFP TEGO noda → `NCCL_SOCKET_IFNAME`/`GLOO_SOCKET_IFNAME`.
+    pub socket_ifname: String,
+    /// Index GID RoCEv2 IPv4 tego noda → `NCCL_IB_GID_INDEX`. Persystowany
+    /// per-czlonek (D1); nie hardkodowany. Domyslnie 3 (zweryfikowana wartosc
+    /// RoCEv2 IPv4 na ConnectX-7 DGX Spark).
+    pub gid_index: u32,
+    /// Dodatkowy config usera (vllm_args, gpu_select_mode, gpu_ids) jako JSON.
+    pub config_json: String,
+}
+
+/// Pojedynczy RoCE/RDMA interfejs noda — wynik `RoceProbe`. Niesie zarowno
+/// nazwe netdev (do `ip`/netplan), jak i nazwe urzadzenia RoCE (do `NCCL_IB_HCA`),
+/// bo na DGX Spark jeden port QSFP = dwa netdevy + dwa urzadzenia RoCE ("twins")
+/// dzielace jeden link PCIe.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct RoceInterfaceInfo {
+    /// Nazwa netdev (np. `enP2p1s0f0np0`).
+    pub netdev: String,
+    /// Nazwa urzadzenia RoCE/IB (np. `roceP2p1s0f0`) — do `NCCL_IB_HCA`.
+    pub roce_device: String,
+    /// Pierwszy adres IPv4 netdev (None gdy karta UP bez adresu — "twin").
+    pub ipv4: Option<String>,
+    /// Maska sieciowa w notacji dotted, gdy IP jest ustawiony.
+    pub netmask: Option<String>,
+    /// Pozostale adresy IPv4 (sekundarne) tego netdev. Interconnect klastra moze
+    /// byc adresem sekundarnym — bez tego dopasowanie primary by go pominelo.
+    #[serde(default)]
+    pub ipv4_aliases: Vec<String>,
+    /// Aktualne MTU karty.
+    pub mtu: u32,
+    /// Czy link jest UP (carrier).
+    pub link_up: bool,
+    /// Predkosc linku w Mbps (0 gdy nieznana).
+    pub speed_mbps: u64,
+    /// Sciezka slotu PCI (realpath device symlink) — referencyjna.
+    pub pci_slot: String,
+    /// Klucz grupowania "twins" jednego fizycznego portu QSFP, wyliczony NA
+    /// nodzie z najpewniejszego sygnalu: `phys_switch_id` (te same porty ASIC
+    /// ConnectX), a gdy go brak — rodzic sciezki PCI. Pusty gdy nieznany.
+    #[serde(default)]
+    pub group_key: String,
 }
 
 // =============================================================================
@@ -624,6 +742,22 @@ pub enum MeshCommandResponsePayload {
     RobotControlResult {
         result_cbor: Vec<u8>,
     },
+    /// Wynik `RoceProbe` — lista RoCE/RDMA interfejsow noda. Appended at END.
+    RoceInterfaceList(Vec<RoceInterfaceInfo>),
+    /// Wynik `ServiceDeployDistributed` — slug deployu (do streamu logow na
+    /// odbiorcy), nazwa kontenera i endpoint (Some tylko dla head). Appended at END.
+    ServiceDeployDistributedResult {
+        deploy_id: String,
+        container_name: String,
+        endpoint_url: Option<String>,
+    },
+    /// Wynik `DistributedReadiness` — realny stan gotowosci head-a. Appended at END.
+    DistributedReadinessResult {
+        ray_gcs_up: bool,
+        ray_nodes: u32,
+        serve_ready: bool,
+        error: Option<String>,
+    },
 }
 
 impl std::fmt::Debug for MeshCommandType {
@@ -668,6 +802,7 @@ impl std::fmt::Debug for MeshCommandType {
                 gateway,
                 dhcp,
                 sudo_password: _,
+                mtu,
             } => f
                 .debug_struct("NetworkConfig")
                 .field("interface", interface)
@@ -676,6 +811,7 @@ impl std::fmt::Debug for MeshCommandType {
                 .field("gateway", gateway)
                 .field("dhcp", dhcp)
                 .field("sudo_password", &"***")
+                .field("mtu", mtu)
                 .finish(),
             Self::BandwidthProbe {
                 target_ip, mode, ..
@@ -814,6 +950,32 @@ impl std::fmt::Debug for MeshCommandType {
             Self::RobotControl { request_cbor } => f
                 .debug_struct("RobotControl")
                 .field("request_len", &request_cbor.len())
+                .finish(),
+            Self::RoceProbe => write!(f, "RoceProbe"),
+            Self::ServiceDeployDistributed { spec } => f
+                .debug_struct("ServiceDeployDistributed")
+                .field("cluster", &spec.deployment_cluster_id)
+                .field("engine", &spec.engine_id)
+                .field("role", &spec.role)
+                .field("tp_size", &spec.tp_size)
+                .finish(),
+            Self::ServiceStopDistributed {
+                deployment_cluster_id,
+            } => f
+                .debug_struct("ServiceStopDistributed")
+                .field("deployment_cluster_id", deployment_cluster_id)
+                .finish(),
+            Self::DistributedReadiness {
+                deployment_cluster_id,
+                ray_port,
+                serve_port,
+                expected_nodes,
+            } => f
+                .debug_struct("DistributedReadiness")
+                .field("deployment_cluster_id", deployment_cluster_id)
+                .field("ray_port", ray_port)
+                .field("serve_port", serve_port)
+                .field("expected_nodes", expected_nodes)
                 .finish(),
         }
     }

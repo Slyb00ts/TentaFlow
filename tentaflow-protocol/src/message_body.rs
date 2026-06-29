@@ -3643,6 +3643,10 @@ pub struct ClusterInfo {
     pub failover_target: Option<String>,
     pub health_check_interval_ms: u32,
     pub timeout_ms: u32,
+    /// Full member list (node + interface info). Populated for both list and
+    /// detail responses so the UI can render members without a second request.
+    #[serde(default)]
+    pub members: Vec<ClusterMember>,
 }
 
 /// Single member of a cluster (node + interface info).
@@ -3658,6 +3662,18 @@ pub struct ClusterMember {
     pub interface_speed_mbps: Option<u32>,
     /// Unix epoch seconds when member joined the cluster.
     pub joined_at: i64,
+    /// Comma-separated RoCE device list for distributed deploy (`NCCL_IB_HCA`),
+    /// e.g. "rocep1s0f0,roceP2p1s0f0" — BOTH twins of the QSFP port. Empty until
+    /// the cluster RDMA auto-config has run on this member.
+    #[serde(default)]
+    pub rdma_devices: Option<String>,
+    /// Primary RDMA IPv4 the distributed deploy binds to (QSFP socket ifname IP).
+    #[serde(default)]
+    pub rdma_ip: Option<String>,
+    /// Netdev name of the QSFP socket interface carrying `rdma_ip` (the
+    /// `NCCL_SOCKET_IFNAME`/`GLOO_SOCKET_IFNAME` bootstrap interface).
+    #[serde(default)]
+    pub rdma_socket_ifname: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -3748,6 +3764,11 @@ pub struct ClusterRemoveMemberResponse {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterProbeStreamRequest {
     pub node_ids: Vec<String>,
+    /// Cluster the probe belongs to. When present the handler persists the
+    /// winning interface per member; when absent it is derived from the cluster
+    /// whose member set equals `node_ids`.
+    #[serde(default)]
+    pub cluster_id: Option<String>,
 }
 
 /// Single probe event. `event_type` is one of "started" | "probing_pair" |
@@ -3764,11 +3785,177 @@ pub struct ClusterProbeStreamChunk {
     pub message: Option<String>,
 }
 
+/// Per-node interface chosen by the optimal-assignment algorithm. Streamed in
+/// `ClusterProbeStreamEnd` so the UI can show the selected NIC per member.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ClusterProbeAssignment {
+    pub node_id: String,
+    pub interface_name: String,
+    pub interface_ip: String,
+    pub interface_speed_mbps: u32,
+    pub interface_type: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct ClusterProbeStreamEnd {
     pub total_pairs: u32,
     pub successful: u32,
     pub failed: u32,
+    /// Slowest selected link across all pairs (Mbps) — the cluster bottleneck.
+    #[serde(default)]
+    pub bottleneck_mbps: Option<u32>,
+    /// "optimal" | "partial" | "no_connections" from the assignment algorithm.
+    #[serde(default)]
+    pub assignment_status: Option<String>,
+    /// Chosen interface per node.
+    #[serde(default)]
+    pub assignments: Vec<ClusterProbeAssignment>,
+}
+
+// =============================================================================
+// Cluster RDMA auto-config — detect RoCE twins, assign IPs + MTU over mesh
+// =============================================================================
+
+/// Admin action triggered from cluster-detail: detect each member's RoCE "twin"
+/// interfaces and bring up the unconfigured ones (assign IP on a dedicated RDMA
+/// subnet + set MTU) so distributed deploy gets full RDMA bandwidth. The
+/// `sudo_password` is needed by the per-node `NetworkConfig` mesh command and is
+/// carried only for the duration of the request (never persisted).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ClusterRdmaConfigureRequest {
+    pub cluster_id: String,
+    pub sudo_password: String,
+    /// Target MTU for the RoCE interfaces (default 9000 jumbo frames when None).
+    #[serde(default)]
+    pub mtu: Option<u32>,
+}
+
+/// One RoCE interface acted on (or inspected) during cluster RDMA auto-config.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ClusterRdmaInterface {
+    pub netdev: String,
+    pub roce_device: String,
+    /// IPv4 the interface ended up with (assigned or pre-existing).
+    pub ipv4: Option<String>,
+    pub mtu: u32,
+    /// "primary" (already carried the cluster interconnect IP) | "secondary"
+    /// (the previously-unconfigured twin we brought up).
+    pub role: String,
+    /// "assigned" (we set IP+MTU) | "mtu_only" (IP kept, MTU set) | "unchanged"
+    /// (already correct) | "failed".
+    pub action: String,
+}
+
+/// Per-member outcome of the cluster RDMA auto-config.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ClusterRdmaMemberStatus {
+    pub node_id: String,
+    pub hostname: String,
+    /// "online" | "offline".
+    pub status: String,
+    pub interfaces: Vec<ClusterRdmaInterface>,
+    /// Non-empty when this member could not be configured (offline, no RoCE,
+    /// missing primary IP, mesh command failure).
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ClusterRdmaConfigureResponse {
+    pub ok: bool,
+    pub message: Option<String>,
+    pub members: Vec<ClusterRdmaMemberStatus>,
+}
+
+// =============================================================================
+// Cluster distributed deploy — ONE model split across N members (vLLM TP=N)
+// orchestrated over the mesh using each member's D1 RoCE config.
+// =============================================================================
+
+/// Frontend (D4) → coordinator: deploy one model split across the WHOLE cluster
+/// with vLLM tensor-parallel (TP = total GPUs). The coordinator computes
+/// head/worker roles from `cluster_members` + ich D1 RoCE config (`rdma_devices`,
+/// `rdma_ip`, `rdma_socket_ifname`) and sends a per-node `ServiceDeployDistributed`
+/// over the mesh. This chunk is the DOCKER path (deploy_method=docker); the model
+/// is assumed already present on every member.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct ClusterDeployRequest {
+    pub cluster_id: String,
+    /// Engine id selecting the image + command dialect ("vllm" | "vllm-spark").
+    pub engine_id: String,
+    /// Custom HF repo to serve (wins over `model_preset_id`).
+    #[serde(default)]
+    pub model_repo: Option<String>,
+    /// Preset id (manifest `model_presets`) when no custom repo is given.
+    #[serde(default)]
+    pub model_preset_id: Option<String>,
+    /// Routing alias (`--served-model-name`); defaults to the model id.
+    #[serde(default)]
+    pub served_model_name: Option<String>,
+    /// `--gpu-memory-utilization` (default 0.90 when None).
+    #[serde(default)]
+    pub gpu_memory_utilization: Option<f32>,
+    /// `--max-model-len` (default 8192 when None).
+    #[serde(default)]
+    pub max_model_len: Option<u32>,
+    /// Head OpenAI port (default 8100 when None).
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// GPUs per member (homogeneous cluster); default 1 (one GB10 per Spark).
+    /// `tp_size` = members * gpus_per_node.
+    #[serde(default)]
+    pub gpus_per_node: Option<u32>,
+    /// Extra user config (vllm_args, gpu_select_mode, gpu_ids) as JSON, forwarded
+    /// verbatim into each member's deploy.
+    #[serde(default)]
+    pub config_json: Option<String>,
+    /// Bounded wait for the head Ray GCS to come up before joining workers
+    /// (default 60 s).
+    #[serde(default)]
+    pub gcs_timeout_secs: Option<u32>,
+    /// Bounded wait for the full cluster to serve `/v1/models` after the workers
+    /// joined (default 600 s — a 31B model can take a few minutes to load).
+    #[serde(default)]
+    pub ready_timeout_secs: Option<u32>,
+}
+
+/// Per-member outcome of a cluster distributed deploy.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ClusterDeployMemberStatus {
+    pub node_id: String,
+    pub hostname: String,
+    /// "head" | "worker".
+    pub role: String,
+    pub ok: bool,
+    /// Deploy slug on that member (log streaming key) when the launch started.
+    pub deploy_id: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ClusterDeployResponse {
+    pub ok: bool,
+    /// UUID grouping head + workers; pass it to `ClusterDeployStopRequest`.
+    pub deployment_cluster_id: String,
+    /// node_id of the member that runs the OpenAI endpoint.
+    pub head_node_id: String,
+    /// Informational head endpoint (`http://<head>:<port>/v1`).
+    pub endpoint_url: Option<String>,
+    pub members: Vec<ClusterDeployMemberStatus>,
+    pub message: Option<String>,
+}
+
+/// Tear down a running cluster distributed deployment (head + all workers).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ClusterDeployStopRequest {
+    pub cluster_id: String,
+    pub deployment_cluster_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ClusterDeployStopResponse {
+    pub ok: bool,
+    pub members: Vec<ClusterDeployMemberStatus>,
+    pub message: Option<String>,
 }
 
 // =============================================================================
@@ -6387,6 +6574,8 @@ pub enum MessageBody {
     ClusterProbeStreamRequestBody(ClusterProbeStreamRequest),
     ClusterProbeStreamChunkBody(ClusterProbeStreamChunk),
     ClusterProbeStreamEndBody(ClusterProbeStreamEnd),
+    ClusterRdmaConfigureRequestBody(ClusterRdmaConfigureRequest),
+    ClusterRdmaConfigureResponseBody(ClusterRdmaConfigureResponse),
 
     // ---- Mesh peers (R-LIST + W-ACTION) ----
     MeshPeersListRequest,
@@ -6918,6 +7107,15 @@ pub enum MessageBody {
     // więc nasz dopisek bierze NOWY najwyższy indeks i nie rusza istniejących.
     // JEDEN wariant na całą rodzinę (request+response w `AddonDocumentPayload`).
     AddonDocumentBody(AddonDocumentPayload),
+
+    // ----- Cluster distributed deploy (D3) -----
+    // Dopisane na KOŃCU enuma (ciborium koduje warianty po indeksie liczbowym),
+    // żeby nie ruszać indeksów istniejących wariantów. Deploy jednego modelu
+    // rozłożonego na N węzłów klastra (vLLM TP=N) sterowany z GUI (D4).
+    ClusterDeployRequestBody(ClusterDeployRequest),
+    ClusterDeployResponseBody(ClusterDeployResponse),
+    ClusterDeployStopRequestBody(ClusterDeployStopRequest),
+    ClusterDeployStopResponseBody(ClusterDeployStopResponse),
 }
 
 // =============================================================================

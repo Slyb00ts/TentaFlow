@@ -23,9 +23,14 @@ ARG TORCH_VERSION
 ARG TORCHVISION_VERSION
 ARG TORCHAUDIO_VERSION
 ARG VLLM_VERSION
+# rdma-core/libibverbs: bez nich NCCL nie otworzy libibverbs.so i przy
+# multi-node tensor-parallel (Ray) spadnie z RoCE/ConnectX na wolny TCP. Te
+# pakiety daja userspace IB verbs, ktorych wbudowany transport IB w NCCL uzywa
+# do high-speed interconnectu miedzy nodami clustra.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-pip python3-venv python3-dev curl ca-certificates \
       gcc g++ \
+      libibverbs1 librdmacm1 ibverbs-providers rdma-core \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m venv /opt/vllm-venv
@@ -38,6 +43,11 @@ RUN pip install --no-cache-dir \
       --extra-index-url ${TORCH_INDEX} \
       torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} \
     && pip install --no-cache-dir vllm==${VLLM_VERSION}
+
+# Ray w TYM SAMYM venv co vllm — wymagany do multi-node tensor-parallel
+# (head+worker, --distributed-executor-backend ray). 2.55.1 ma kola aarch64 +
+# x86_64 i jest kompatybilny z vllm 0.23 / torch 2.11.
+RUN pip install --no-cache-dir ray==2.55.1
 
 # llm-compressor — self-quantyzacja zrodel HF do NVFP4 (presety Bielik). hf CLI
 # do pobierania zrodel safetensors. hf_transfer = szybsze rownolegle pobieranie.

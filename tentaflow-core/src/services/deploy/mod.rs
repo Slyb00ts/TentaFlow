@@ -6,6 +6,7 @@
 //                deployments. If it fails, ROLLBACK is invoked to undo prepare.
 
 pub mod binary;
+pub mod distributed;
 pub mod docker;
 pub mod embedded;
 pub mod external;
@@ -1043,7 +1044,16 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
         // supervisor.first_tick → auto_start_pinned respawnuje serwis. Na mobile
         // domyslnie UNPINNED (lazy load + memory guard) — patrz default_pinned().
         // Odpinanie/przypinanie zostaje pod kontrola usera (przycisk pin w GUI).
-        pinned: default_pinned(),
+        //
+        // Distributed (multi-node TP) serwisy zostaja UNPINNED: pojedynczy respawn
+        // head-a przez supervisora zrestartowalby `ray start --head` bez
+        // ponownego dolaczenia workerow (martwa sesja Ray) — redeployem steruje
+        // koordynator klastra, nie supervisor.
+        pinned: if prepared.config_json.contains("\"_distributed\"") {
+            false
+        } else {
+            default_pinned()
+        },
         paused: false,
         runtime_pid: prepared.runtime.pid,
         runtime_port: prepared.runtime.port,
