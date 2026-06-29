@@ -1349,6 +1349,7 @@ fn progress_bar(value: f64, max: f64) -> Component {
         show_label: false,
         label: None,
         size: ProgressSize::Md,
+        orientation: None,
     }.into_component(next_id()).expect("ProgressBar")
 }
 
@@ -6120,6 +6121,7 @@ fn build_add_camera_modal() -> Component {
         dismissible: true,
         prevent_scroll: true,
         closable: true,
+        icon: None,
     }.into_component(next_id()).expect("Modal");
     modal.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Dismiss,
