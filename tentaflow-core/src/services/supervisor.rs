@@ -169,11 +169,22 @@ impl From<anyhow::Error> for SupervisorError {
 
 // ----- Restart bookkeeping --------------------------------------------------
 
+/// Consecutive failed health probes tolerated before the supervisor treats an
+/// engine as down and respawns it. A single slow request used to be enough: an
+/// engine whose `/health` stalled for one probe (e.g. a multi-second inference
+/// briefly occupying its event loop, or any transient blip) was killed and
+/// respawned MID-REQUEST. Requiring several consecutive failures rides out those
+/// blips; a genuinely dead engine still fails every probe and is respawned after
+/// `threshold * health_check_interval`.
+const HEALTH_FAILURE_THRESHOLD: u32 = 3;
+
 #[derive(Debug, Clone)]
 struct RestartState {
     attempts: u32,
     next_backoff: Duration,
     last_attempt: Option<Instant>,
+    /// Failed probes since the last `Ok`. Reset by `clear_restart_state` on Ok.
+    consecutive_failures: u32,
 }
 
 impl RestartState {
@@ -182,6 +193,7 @@ impl RestartState {
             attempts: 0,
             next_backoff: initial_backoff,
             last_attempt: None,
+            consecutive_failures: 0,
         }
     }
 
@@ -1222,6 +1234,14 @@ impl Supervisor {
                 let state = states
                     .entry(svc.id)
                     .or_insert_with(|| RestartState::new(self.initial_backoff));
+
+                // Ride out transient blips: only a run of consecutive failed
+                // probes counts as "down". A busy engine that missed one probe
+                // recovers on the next tick (which clears this via `Ok`).
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                if state.consecutive_failures < HEALTH_FAILURE_THRESHOLD {
+                    return;
+                }
 
                 if state.attempts >= self.max_restart_attempts {
                     let msg = format!("permanent failure after {} attempts", state.attempts);
