@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Statystyki · Użytkownicy i grupy (M2)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  /* ---- lokalne drobiazgi tej strony ---- */
+  .filterbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .filterbar .ml-auto { margin-left: auto; }
+  .filterbar .select { width: auto; min-width: 170px; }
+  .mesh-banner {
+    display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--text-2);
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 7px 11px; margin-bottom: 16px;
+  }
+  .mesh-banner .icon { width: 13px; height: 13px; color: var(--accent-2); }
+  .mesh-banner b { color: var(--text); font-weight: 700; }
+
+  /* identyfikacja usera w tabeli */
+  .u-cell { display: flex; align-items: center; gap: 10px; }
+  .u-cell .avatar {
+    width: 28px; height: 28px; border-radius: 50%; background: var(--gradient-accent);
+    display: flex; align-items: center; justify-content: center; font-weight: 700; color: white;
+    font-size: 11px; flex-shrink: 0;
+  }
+  .u-cell .u-name { font-weight: 700; font-size: 12.5px; }
+  .u-cell .u-grp { font-size: 10.5px; color: var(--text-3); margin-top: 1px; }
+
+  /* liczby w tabelach */
+  .num { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+  th.num, td.num { text-align: right; }
+  .tf-table td.num { font-size: 12px; }
+
+  /* mini pasek wykorzystania (quota / udział) */
+  .bar { display: flex; align-items: center; gap: 8px; min-width: 132px; }
+  .bar-track { flex: 1; height: 7px; border-radius: 4px; background: var(--bg-3); overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 4px; background: var(--gradient-accent); }
+  .bar-fill.warn { background: linear-gradient(135deg, #f59e0b 0%, #fbbf24 100%); }
+  .bar-pct { font-size: 11px; font-variant-numeric: tabular-nums; color: var(--text-2); width: 34px; text-align: right; }
+
+  .tf-table tfoot td {
+    padding: 10px 14px; font-size: 12px; font-weight: 800; color: var(--text);
+    background: var(--bg-3); border-top: 1px solid var(--border-hover);
+    font-variant-numeric: tabular-nums;
+  }
+  .tf-table tr.sel { background: var(--accent-glow); }
+  .tf-table tr.sel:hover { background: var(--accent-glow); }
+
+  /* drill-down KPI mini */
+  .mini-kpis { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .mini-kpi { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 13px; }
+  .mini-kpi .l { font-size: 10px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-3); font-weight: 700; }
+  .mini-kpi .v { font-size: 21px; font-weight: 800; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .mini-kpi .v .small { font-size: 12px; color: var(--text-2); font-weight: 600; }
+  .mini-kpi .s { font-size: 11px; color: var(--text-2); margin-top: 3px; font-variant-numeric: tabular-nums; }
+
+  .dd-grid { display: grid; grid-template-columns: 0.85fr 1.15fr; gap: 16px; align-items: start; }
+  .trend-wrap { margin-top: 14px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 13px; }
+  .trend-wrap .t-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .trend-wrap .t-head .t-l { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-3); font-weight: 700; }
+  .trend-wrap .t-head .t-r { font-size: 11px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+
+  .nested { border-color: var(--border); }
+  .nested thead th { background: var(--bg); }
+  .nested tbody td { padding: 9px 13px; }
+
+  .group-note {
+    display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--text-2);
+    margin-top: 12px; padding: 8px 11px; background: var(--bg-3); border-radius: var(--radius-sm);
+  }
+  .group-note .icon { width: 13px; height: 13px; color: var(--accent-2); }
+  .group-note code { font-family: ui-monospace, monospace; font-size: 11px; color: var(--accent-2); }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-coins" viewBox="0 0 24 24"><ellipse cx="9" cy="6" rx="6" ry="3"/><path d="M3 6v6c0 1.66 2.69 3 6 3s6-1.34 6-3V6"/><path d="M3 12v6c0 1.66 2.69 3 6 3 1.3 0 2.5-.2 3.5-.57"/><circle cx="17" cy="15" r="4"/></symbol>
+  <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 21a9 9 0 1 1 9-9"/><line x1="12" y1="12" x2="16" y2="9"/><circle cx="12" cy="12" r="1.5"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+  <symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-export" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M2</span>
+    <h2>Użytkownicy i grupy</h2>
+    <div class="desc">Rozliczanie userów: tokeny prompt/completion, zapytania, audio, obrazy, koszt zł i quota. Grupy jako rollup. Drill-down jednego usera per-model.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Start</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Analityka</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-activity"/></svg>Statystyki</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Analityka modeli</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-coins"/></svg>Rozliczenia</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy i grupy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr · Admin</div><div class="role">Euvic · org</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Statystyki</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none" stroke="currentColor"/></svg></span>
+          <span class="crumb current">Użytkownicy</span>
+        </div>
+
+        <div class="filterbar">
+          <div class="segmented">
+            <button>Godzina</button>
+            <button>Dzień</button>
+            <button class="active">Miesiąc</button>
+          </div>
+          <select class="select" aria-label="Model">
+            <option>Wszystkie modele</option>
+            <option>Qwen3.6-27B</option>
+            <option>gpt-oss-120b</option>
+            <option>gpt-oss-20b</option>
+            <option>Qwen3.6-4B</option>
+            <option>parakeet-0.6b</option>
+            <option>bge-m3</option>
+          </select>
+          <select class="select" aria-label="Grupa">
+            <option>Wszystkie grupy</option>
+            <option>Zarząd</option>
+            <option>Dev</option>
+            <option>Sprzedaż</option>
+            <option>Automaty</option>
+          </select>
+          <div class="search-box ml-auto">
+            <svg class="icon"><use href="#i-search"/></svg>
+            <input type="text" placeholder="Szukaj usera…">
+          </div>
+          <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-export"/></svg>Eksport CSV</button>
+        </div>
+
+        <div class="mesh-banner">
+          <svg class="icon"><use href="#i-server"/></svg>
+          Dane zagregowane z <b>4 nodów</b> mesh (rig24 · rig25 · mac-studio · phone-piotr) • czerwiec 2026 • ostatnia synch <b>12 s</b> temu
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab active"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy<span class="count">6</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-list"/></svg>Grupy<span class="count">4</span></button>
+        </div>
+
+        <!-- ============ ZAKŁADKA UŻYTKOWNICY ============ -->
+        <table class="tf-table">
+          <thead>
+            <tr>
+              <th>Użytkownik</th>
+              <th class="num">Prompt tok</th>
+              <th class="num">Completion tok</th>
+              <th class="num">Total tok</th>
+              <th class="num">Zapytania</th>
+              <th class="num">Audio (s)</th>
+              <th class="num">Obrazy</th>
+              <th class="num">Koszt (zł)</th>
+              <th>Quota wykorzystanie</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr class="sel">
+              <td>
+                <div class="u-cell"><div class="avatar">AN</div>
+                  <div><div class="u-name">anna</div><div class="u-grp"><span class="chip accent">Dev</span></div></div>
+                </div>
+              </td>
+              <td class="num">13 200 000</td>
+              <td class="num">8 200 000</td>
+              <td class="num">21 400 000</td>
+              <td class="num">3 120</td>
+              <td class="num">2 140</td>
+              <td class="num">312</td>
+              <td class="num">178,40</td>
+              <td><div class="bar"><div class="bar-track"><div class="bar-fill" style="width:71%"></div></div><span class="bar-pct">71%</span></div></td>
+            </tr>
+            <tr>
+              <td>
+                <div class="u-cell"><div class="avatar">BM</div>
+                  <div><div class="u-name">bot-meeting</div><div class="u-grp"><span class="chip">Automaty</span></div></div>
+                </div>
+              </td>
+              <td class="num">15 100 000</td>
+              <td class="num">3 800 000</td>
+              <td class="num">18 900 000</td>
+              <td class="num">2 960</td>
+              <td class="num">184 200</td>
+              <td class="num">0</td>
+              <td class="num">96,80</td>
+              <td><div class="bar"><div class="bar-track"><div class="bar-fill" style="width:47%"></div></div><span class="bar-pct">47%</span></div></td>
+            </tr>
+            <tr>
+              <td>
+                <div class="u-cell"><div class="avatar">MA</div>
+                  <div><div class="u-name">marek</div><div class="u-grp"><span class="chip accent">Dev</span></div></div>
+                </div>
+              </td>
+              <td class="num">10 300 000</td>
+              <td class="num">6 500 000</td>
+              <td class="num">16 800 000</td>
+              <td class="num">2 480</td>
+              <td class="num">1 360</td>
+              <td class="num">148</td>
+              <td class="num">139,20</td>
+              <td><div class="bar"><div class="bar-track"><div class="bar-fill" style="width:56%"></div></div><span class="bar-pct">56%</span></div></td>
+            </tr>
+            <tr>
+              <td>
+                <div class="u-cell"><div class="avatar">PI</div>
+                  <div><div class="u-name">piotr</div><div class="u-grp"><span class="chip warning">Zarząd</span></div></div>
+                </div>
+              </td>
+              <td class="num">7 800 000</td>
+              <td class="num">4 800 000</td>
+              <td class="num">12 600 000</td>
+              <td class="num">1 840</td>
+              <td class="num">4 820</td>
+              <td class="num">186</td>
+              <td class="num">142,60</td>
+              <td><div class="bar"><div class="bar-track"><div class="bar-fill" style="width:42%"></div></div><span class="bar-pct">42%</span></div></td>
+            </tr>
+            <tr>
+              <td>
+                <div class="u-cell"><div class="avatar">KA</div>
+                  <div><div class="u-name">kasia</div><div class="u-grp"><span class="chip info">Sprzedaż</span></div></div>
+                </div>
+              </td>
+              <td class="num">5 000 000</td>
+              <td class="num">3 100 000</td>
+              <td class="num">8 100 000</td>
+              <td class="num">1 190</td>
+              <td class="num">980</td>
+              <td class="num">64</td>
+              <td class="num">61,20</td>
+              <td><div class="bar"><div class="bar-track"><div class="bar-fill" style="width:27%"></div></div><span class="bar-pct">27%</span></div></td>
+            </tr>
+            <tr>
+              <td>
+                <div class="u-cell"><div class="avatar">TO</div>
+                  <div><div class="u-name">tomek</div><div class="u-grp"><span class="chip info">Sprzedaż</span></div></div>
+                </div>
+              </td>
+              <td class="num">3 900 000</td>
+              <td class="num">2 500 000</td>
+              <td class="num">6 400 000</td>
+              <td class="num">950</td>
+              <td class="num">410</td>
+              <td class="num">22</td>
+              <td class="num">47,90</td>
+              <td><div class="bar"><div class="bar-track"><div class="bar-fill" style="width:21%"></div></div><span class="bar-pct">21%</span></div></td>
+            </tr>
+          </tbody>
+          <tfoot>
+            <tr>
+              <td>Razem · 6 userów</td>
+              <td class="num">55 300 000</td>
+              <td class="num">28 900 000</td>
+              <td class="num">84 200 000</td>
+              <td class="num">12 540</td>
+              <td class="num">193 910</td>
+              <td class="num">732</td>
+              <td class="num">666,10</td>
+              <td></td>
+            </tr>
+          </tfoot>
+        </table>
+
+        <!-- ============ DRILL-DOWN: anna ============ -->
+        <div class="section-card" style="margin-top:16px">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon" style="color:var(--accent-2)"><use href="#i-users"/></svg>Drill-down użytkownika · <span style="color:var(--accent-2)">anna</span> <span class="chip accent">Dev</span></div>
+            <span class="hint">czerwiec 2026 · mesh-wide</span>
+          </div>
+
+          <div class="dd-grid">
+            <!-- lewa: mini-KPI -->
+            <div class="mini-kpis">
+              <div class="mini-kpi">
+                <div class="l">Total tokenów</div>
+                <div class="v">21,4 <span class="small">M</span></div>
+                <div class="s">prompt 13,2M · compl 8,2M</div>
+              </div>
+              <div class="mini-kpi">
+                <div class="l">Koszt</div>
+                <div class="v">178,40 <span class="small">zł</span></div>
+                <div class="s">26,8% kosztu org</div>
+              </div>
+              <div class="mini-kpi">
+                <div class="l">Śr. TTFT</div>
+                <div class="v">298 <span class="small">ms</span></div>
+                <div class="s">p90 760 · p99 1 940 ms</div>
+              </div>
+              <div class="mini-kpi">
+                <div class="l">Zapytania</div>
+                <div class="v">3 120</div>
+                <div class="s">decode p50 61 tok/s · err 0,7%</div>
+              </div>
+            </div>
+
+            <!-- prawa: breakdown per-model + trend -->
+            <div>
+              <table class="tf-table nested">
+                <thead>
+                  <tr>
+                    <th>Model</th>
+                    <th class="num">Tokeny</th>
+                    <th class="num">Zapytania</th>
+                    <th class="num">Koszt (zł)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr><td><svg class="icon" style="width:13px;height:13px;color:var(--accent-2);vertical-align:-2px"><use href="#i-cpu"/></svg> Qwen3.6-27B</td><td class="num">12 800 000</td><td class="num">1 760</td><td class="num">96,40</td></tr>
+                  <tr><td><svg class="icon" style="width:13px;height:13px;color:var(--accent-2);vertical-align:-2px"><use href="#i-cpu"/></svg> gpt-oss-120b</td><td class="num">5 200 000</td><td class="num">680</td><td class="num">58,20</td></tr>
+                  <tr><td><svg class="icon" style="width:13px;height:13px;color:var(--accent-2);vertical-align:-2px"><use href="#i-cpu"/></svg> gpt-oss-20b</td><td class="num">2 600 000</td><td class="num">540</td><td class="num">15,60</td></tr>
+                  <tr><td><svg class="icon" style="width:13px;height:13px;color:var(--accent-2);vertical-align:-2px"><use href="#i-zap"/></svg> bge-m3 <span class="chip" style="font-size:9.5px">embed</span></td><td class="num">800 000</td><td class="num">140</td><td class="num">8,20</td></tr>
+                </tbody>
+                <tfoot>
+                  <tr><td>Razem</td><td class="num">21 400 000</td><td class="num">3 120</td><td class="num">178,40</td></tr>
+                </tfoot>
+              </table>
+
+              <div class="trend-wrap">
+                <div class="t-head">
+                  <span class="t-l"><svg class="icon" style="width:12px;height:12px;color:var(--accent-2);vertical-align:-2px"><use href="#i-trend"/></svg> Trend dzienny · tokeny</span>
+                  <span class="t-r">szczyt 1,12M · 18 cze</span>
+                </div>
+                <svg viewBox="0 0 560 90" width="100%" height="90" preserveAspectRatio="none" aria-label="Dzienny trend tokenów anny">
+                  <defs>
+                    <linearGradient id="trendFill" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stop-color="#6366f1" stop-opacity="0.35"/>
+                      <stop offset="100%" stop-color="#6366f1" stop-opacity="0"/>
+                    </linearGradient>
+                  </defs>
+                  <polyline fill="url(#trendFill)" stroke="none"
+                    points="0,72 0,58 19,62 38,50 57,55 76,44 95,48 114,38 133,46 152,33 171,40 190,28 209,35 228,22 247,30 266,18 285,26 304,14 323,24 342,30 361,20 380,28 399,22 418,34 437,26 456,38 475,30 494,42 513,34 532,46 551,40 560,44 560,90 0,90"/>
+                  <polyline fill="none" stroke="#a78bfa" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"
+                    points="0,58 19,62 38,50 57,55 76,44 95,48 114,38 133,46 152,33 171,40 190,28 209,35 228,22 247,30 266,18 285,26 304,14 323,24 342,30 361,20 380,28 399,22 418,34 437,26 456,38 475,30 494,42 513,34 532,46 551,40"/>
+                </svg>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ============ ZAKŁADKA GRUPY (widok rollup) ============ -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon" style="color:var(--accent-2)"><use href="#i-list"/></svg>Widok grup · rollup</div>
+            <span class="hint">zakładka „Grupy"</span>
+          </div>
+
+          <table class="tf-table nested">
+            <thead>
+              <tr>
+                <th>Grupa</th>
+                <th class="num">Userów</th>
+                <th class="num">Total tok</th>
+                <th class="num">Zapytania</th>
+                <th class="num">Koszt (zł)</th>
+                <th>Udział</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="chip accent">Dev</span> <span class="text-3 text-xs">anna · marek</span></td>
+                <td class="num">2</td>
+                <td class="num">38 200 000</td>
+                <td class="num">5 600</td>
+                <td class="num">317,60</td>
+                <td><div class="bar"><div class="bar-track"><div class="bar-fill" style="width:45.4%"></div></div><span class="bar-pct">45,4%</span></div></td>
+              </tr>
+              <tr>
+                <td><span class="chip">Automaty</span> <span class="text-3 text-xs">bot-meeting</span></td>
+                <td class="num">1</td>
+                <td class="num">18 900 000</td>
+                <td class="num">2 960</td>
+                <td class="num">96,80</td>
+                <td><div class="bar"><div class="bar-track"><div class="bar-fill" style="width:22.4%"></div></div><span class="bar-pct">22,4%</span></div></td>
+              </tr>
+              <tr>
+                <td><span class="chip info">Sprzedaż</span> <span class="text-3 text-xs">kasia · tomek</span></td>
+                <td class="num">2</td>
+                <td class="num">14 500 000</td>
+                <td class="num">2 140</td>
+                <td class="num">109,10</td>
+                <td><div class="bar"><div class="bar-track"><div class="bar-fill" style="width:17.2%"></div></div><span class="bar-pct">17,2%</span></div></td>
+              </tr>
+              <tr>
+                <td><span class="chip warning">Zarząd</span> <span class="text-3 text-xs">piotr</span></td>
+                <td class="num">1</td>
+                <td class="num">12 600 000</td>
+                <td class="num">1 840</td>
+                <td class="num">142,60</td>
+                <td><div class="bar"><div class="bar-track"><div class="bar-fill" style="width:15.0%"></div></div><span class="bar-pct">15,0%</span></div></td>
+              </tr>
+            </tbody>
+            <tfoot>
+              <tr>
+                <td>Razem · 4 grupy</td>
+                <td class="num">6</td>
+                <td class="num">84 200 000</td>
+                <td class="num">12 540</td>
+                <td class="num">666,10</td>
+                <td><div class="bar"><div class="bar-track"><div class="bar-fill" style="width:100%"></div></div><span class="bar-pct">100%</span></div></td>
+              </tr>
+            </tfoot>
+          </table>
+
+          <div class="group-note">
+            <svg class="icon"><use href="#i-list"/></svg>
+            Grupa = rollup userów po <code>join user→group</code> przy odczycie. Metryki nie są duplikowane per-grupa — sumują się z wierszy userów, więc zmiana przynależności od razu przelicza udziały.
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

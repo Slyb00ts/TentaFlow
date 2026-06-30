@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Statystyki · Rozliczenia i koszty (M6)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .toolbar { display: flex; align-items: center; gap: 10px; margin: 16px 0 18px; flex-wrap: wrap; }
+  .toolbar .ml-auto { margin-left: auto; }
+  .toolbar .input, .toolbar .select { width: auto; }
+  .date-range { display: flex; align-items: center; gap: 7px; color: var(--text-3); font-size: 12px; }
+  .num-cell { font-variant-numeric: tabular-nums; text-align: right; }
+  .tf-table th.r, .tf-table td.r { text-align: right; }
+  .grp-chip { font-size: 10px; padding: 1px 7px; }
+  .row-sum td { font-weight: 800; border-top: 1px solid var(--border-hover); background: var(--bg-3); }
+  /* paski wypełnienia */
+  .bar { position: relative; height: 8px; border-radius: 5px; background: var(--bg-3); overflow: hidden; min-width: 90px; }
+  .bar > span { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px; background: var(--gradient-accent); }
+  .share-row { display: grid; grid-template-columns: 130px 1fr 56px; align-items: center; gap: 12px; margin-bottom: 11px; font-size: 12.5px; }
+  .share-row:last-child { margin-bottom: 0; }
+  .share-row .lbl { display: flex; align-items: center; gap: 7px; color: var(--text-2); }
+  .share-row .pct { text-align: right; font-variant-numeric: tabular-nums; font-weight: 700; }
+  .share-row .bar { height: 12px; }
+  .price-in { width: 96px; text-align: right; }
+  .note { font-size: 11.5px; color: var(--text-3); margin-top: 12px; display: flex; align-items: center; gap: 7px; }
+  .note .icon { width: 13px; height: 13px; color: var(--accent-2); }
+  .hw-note { margin-top: 16px; }
+  .mesh-banner {
+    display: flex; align-items: center; gap: 9px; font-size: 11.5px; color: var(--text-3);
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 9px 14px; margin-bottom: 16px;
+  }
+  .mesh-banner .icon { width: 14px; height: 14px; color: var(--accent-2); }
+  .mesh-banner b { color: var(--text-2); font-weight: 700; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-coins" viewBox="0 0 24 24"><ellipse cx="9" cy="6" rx="7" ry="3"/><path d="M2 6v6c0 1.66 3.13 3 7 3s7-1.34 7-3V6"/><path d="M2 12v6c0 1.66 3.13 3 7 3 1.5 0 2.9-.2 4-.55"/><ellipse cx="17" cy="15" rx="5" ry="2.5"/><path d="M12 15v3c0 1.4 2.24 2.5 5 2.5s5-1.1 5-2.5v-3"/></symbol>
+  <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 21a9 9 0 1 1 9-9"/><line x1="12" y1="12" x2="16" y2="8"/><circle cx="12" cy="12" r="1.5"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+  <symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+  <symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M6</span>
+    <h2>Rozliczenia i koszty</h2>
+    <div class="desc">Tokeny przeliczone na złotówki wg cennika per-model. Rozliczanie userów, grup i sprzętu (GPU-godziny, amortyzacja). Eksport CSV/PDF, edytowalny cennik replikowany po mesh.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Start</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Analityka</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-activity"/></svg>Statystyki</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Modele</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-server"/></svg>Nody i serwisy</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">Admin · Euvic</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Statystyki</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Rozliczenia</span>
+        </div>
+
+        <div class="toolbar">
+          <div class="segmented">
+            <button class="active"><svg class="icon"><use href="#i-users"/></svg>Wg użytkowników</button>
+            <button><svg class="icon"><use href="#i-list"/></svg>Wg grup</button>
+            <button><svg class="icon"><use href="#i-server"/></svg>Wg sprzętu</button>
+          </div>
+          <span class="date-range">
+            <input class="input" type="date" value="2026-06-01">
+            <span>—</span>
+            <input class="input" type="date" value="2026-06-30">
+          </span>
+          <select class="select"><option>Czerwiec 2026</option><option>Maj 2026</option><option>Ten kwartał</option><option>Zakres własny…</option></select>
+          <span class="ml-auto"></span>
+          <button class="btn"><svg class="icon"><use href="#i-download"/></svg>Eksport CSV</button>
+          <button class="btn btn-primary"><svg class="icon"><use href="#i-download"/></svg>Eksport PDF</button>
+        </div>
+
+        <div class="mesh-banner">
+          <svg class="icon"><use href="#i-activity"/></svg>
+          <span>Dane zagregowane z <b>4 nodów</b> mesh (rig24, rig25, mac-studio, phone-piotr) • rollup godzinowy <b>model_metrics_rollup</b> • ostatnia synch <b>12 s</b> temu.</span>
+        </div>
+
+        <div class="kpi-grid">
+          <div class="kpi"><div class="label"><svg class="icon"><use href="#i-coins"/></svg>Koszt całkowity</div><div class="value">621 <span class="small">zł</span></div><div class="delta up">+8.4% vs maj</div></div>
+          <div class="kpi"><div class="label"><svg class="icon"><use href="#i-zap"/></svg>Tokeny rozliczone</div><div class="value">84.2 <span class="small">M tok</span></div><div class="delta">12 540 zapytań</div></div>
+          <div class="kpi"><div class="label"><svg class="icon"><use href="#i-server"/></svg>GPU-godziny</div><div class="value">142.0 <span class="small">GPU-h</span></div><div class="delta">4 nody · prefill+decode</div></div>
+          <div class="kpi"><div class="label"><svg class="icon"><use href="#i-gauge"/></svg>Śr. koszt / 1k tok</div><div class="value">0.0074 <span class="small">zł</span></div><div class="delta">wsad prompt+completion</div></div>
+        </div>
+
+        <div class="section-card">
+          <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-users"/></svg>Wg użytkowników</div><span class="hint">Czerwiec 2026 · cała sieć mesh</span></div>
+          <table class="tf-table">
+            <thead>
+              <tr>
+                <th>Podmiot</th>
+                <th class="r">Total tok</th>
+                <th class="r">GPU-h</th>
+                <th class="r">Koszt zł</th>
+                <th class="r">Udział %</th>
+                <th>&nbsp;</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>piotr <span class="chip accent grp-chip">Zarząd</span></td>
+                <td class="num-cell mono">11.4M</td><td class="num-cell mono">18.2</td><td class="num-cell mono">88</td>
+                <td class="num-cell mono">13.5%</td>
+                <td><div class="bar"><span style="width:13.5%"></span></div></td>
+              </tr>
+              <tr>
+                <td>anna <span class="chip info grp-chip">Dev</span></td>
+                <td class="num-cell mono">22.6M</td><td class="num-cell mono">38.4</td><td class="num-cell mono">165</td>
+                <td class="num-cell mono">26.8%</td>
+                <td><div class="bar"><span style="width:26.8%"></span></div></td>
+              </tr>
+              <tr>
+                <td>marek <span class="chip info grp-chip">Dev</span></td>
+                <td class="num-cell mono">18.1M</td><td class="num-cell mono">30.6</td><td class="num-cell mono">132</td>
+                <td class="num-cell mono">21.5%</td>
+                <td><div class="bar"><span style="width:21.5%"></span></div></td>
+              </tr>
+              <tr>
+                <td>kasia <span class="chip success grp-chip">Sprzedaż</span></td>
+                <td class="num-cell mono">9.8M</td><td class="num-cell mono">16.1</td><td class="num-cell mono">71</td>
+                <td class="num-cell mono">11.6%</td>
+                <td><div class="bar"><span style="width:11.6%"></span></div></td>
+              </tr>
+              <tr>
+                <td>tomek <span class="chip success grp-chip">Sprzedaż</span></td>
+                <td class="num-cell mono">7.2M</td><td class="num-cell mono">11.8</td><td class="num-cell mono">53</td>
+                <td class="num-cell mono">8.6%</td>
+                <td><div class="bar"><span style="width:8.6%"></span></div></td>
+              </tr>
+              <tr>
+                <td>bot-meeting <span class="chip warning grp-chip">Automaty</span></td>
+                <td class="num-cell mono">15.1M</td><td class="num-cell mono">26.9</td><td class="num-cell mono">112</td>
+                <td class="num-cell mono">18.0%</td>
+                <td><div class="bar"><span style="width:18.0%"></span></div></td>
+              </tr>
+              <tr class="row-sum">
+                <td>SUMA · 6 userów</td>
+                <td class="num-cell mono">84.2M</td><td class="num-cell mono">142.0</td><td class="num-cell mono">621</td>
+                <td class="num-cell mono">100%</td>
+                <td><div class="bar"><span style="width:100%"></span></div></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="grid-2" style="margin-top:16px">
+          <div class="section-card">
+            <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-trend"/></svg>Udział kosztów</div><span class="hint">621 zł · czerwiec 2026</span></div>
+            <div class="share-row"><span class="lbl">anna <span class="chip info grp-chip">Dev</span></span><div class="bar"><span style="width:26.8%"></span></div><span class="pct">26.8%</span></div>
+            <div class="share-row"><span class="lbl">marek <span class="chip info grp-chip">Dev</span></span><div class="bar"><span style="width:21.5%"></span></div><span class="pct">21.5%</span></div>
+            <div class="share-row"><span class="lbl">bot-meeting <span class="chip warning grp-chip">Auto</span></span><div class="bar"><span style="width:18.0%"></span></div><span class="pct">18.0%</span></div>
+            <div class="share-row"><span class="lbl">piotr <span class="chip accent grp-chip">Zarząd</span></span><div class="bar"><span style="width:13.5%"></span></div><span class="pct">13.5%</span></div>
+            <div class="share-row"><span class="lbl">kasia <span class="chip success grp-chip">Sprzedaż</span></span><div class="bar"><span style="width:11.6%"></span></div><span class="pct">11.6%</span></div>
+            <div class="share-row"><span class="lbl">tomek <span class="chip success grp-chip">Sprzedaż</span></span><div class="bar"><span style="width:8.6%"></span></div><span class="pct">8.6%</span></div>
+          </div>
+
+          <div class="section-card">
+            <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-coins"/></svg>Cennik modeli</div><span class="hint">zł / 1k tok</span></div>
+            <table class="tf-table">
+              <thead>
+                <tr><th>Model</th><th class="r">Cena prompt</th><th class="r">Cena completion</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Qwen3.6-27B</td>
+                  <td class="r"><input class="input mono price-in" value="0.0040"></td>
+                  <td class="r"><input class="input mono price-in" value="0.0120"></td>
+                </tr>
+                <tr>
+                  <td>gpt-oss-120b</td>
+                  <td class="r"><input class="input mono price-in" value="0.0080"></td>
+                  <td class="r"><input class="input mono price-in" value="0.0240"></td>
+                </tr>
+                <tr>
+                  <td>gpt-oss-20b</td>
+                  <td class="r"><input class="input mono price-in" value="0.0020"></td>
+                  <td class="r"><input class="input mono price-in" value="0.0060"></td>
+                </tr>
+                <tr>
+                  <td>Qwen3.6-4B</td>
+                  <td class="r"><input class="input mono price-in" value="0.0008"></td>
+                  <td class="r"><input class="input mono price-in" value="0.0024"></td>
+                </tr>
+              </tbody>
+            </table>
+            <div style="display:flex;align-items:center;gap:10px;margin-top:14px">
+              <button class="btn btn-primary"><svg class="icon"><use href="#i-save"/></svg>Zapisz cennik</button>
+              <span class="note" style="margin:0"><svg class="icon"><use href="#i-activity"/></svg>Cennik replikowany po mesh (LWW), jak <code>token_quota</code>.</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="section-card hw-note">
+          <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-server"/></svg>Wg sprzętu — amortyzacja nodów</div><span class="hint">tryb „Wg sprzętu": koszt liczony z GPU-godzin, nie z cennika tokenów</span></div>
+          <table class="tf-table">
+            <thead>
+              <tr><th>Node</th><th class="r">GPU-h</th><th class="r">Produkcja tok</th><th class="r">Koszt amortyzacji zł</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>rig24 <span class="chip accent grp-chip">DGX Spark GB10</span></td><td class="num-cell mono">58.4</td><td class="num-cell mono">34.2M</td><td class="num-cell mono">248</td></tr>
+              <tr><td>rig25 <span class="chip accent grp-chip">DGX Spark GB10</span></td><td class="num-cell mono">49.1</td><td class="num-cell mono">27.6M</td><td class="num-cell mono">206</td></tr>
+              <tr><td>mac-studio <span class="chip info grp-chip">M3 Ultra</span></td><td class="num-cell mono">28.3</td><td class="num-cell mono">18.9M</td><td class="num-cell mono">134</td></tr>
+              <tr><td>phone-piotr <span class="chip success grp-chip">mobilny</span></td><td class="num-cell mono">6.2</td><td class="num-cell mono">3.5M</td><td class="num-cell mono">33</td></tr>
+              <tr class="row-sum"><td>SUMA · 4 nody</td><td class="num-cell mono">142.0</td><td class="num-cell mono">84.2M</td><td class="num-cell mono">621</td></tr>
+            </tbody>
+          </table>
+          <div class="note">
+            <svg class="icon"><use href="#i-server"/></svg>
+            W trybie „Wg sprzętu" 621 zł rozkłada się wg GPU-godzin: dwa GB10 (rig24+rig25) biorą ~73% kosztu jako główny silnik vLLM TP, mac-studio dokłada MLX/llama.cpp, a phone-piotr to lokalny Qwen3.6-4B (znikomy udział). Koszt amortyzacji = GPU-h × stawka sprzętowa, niezależnie od cennika tokenów.
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

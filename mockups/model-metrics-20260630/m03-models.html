@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Statystyki · Modele (M3)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .num-cell { font-variant-numeric: tabular-nums; text-align: right; }
+  .tf-table th.num-cell { text-align: right; }
+  .filters { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 4px 0 14px; }
+  .filters .fl { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); margin-right: 2px; }
+  .mesh-note {
+    display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-3);
+    background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 8px 12px; margin-bottom: 16px;
+  }
+  .mesh-note .icon { width: 14px; height: 14px; color: var(--accent-2); }
+  .mesh-note b { color: var(--text-2); font-weight: 700; }
+  .model-name { display: flex; align-items: center; gap: 8px; }
+  .model-name .nm { font-weight: 700; }
+  .muted { color: var(--text-3); }
+  .audio-cell { font-size: 11.5px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+
+  .cmp-card .cmp-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .cmp-card .cmp-node { font-weight: 700; font-size: 14px; }
+  .cmp-card .cmp-sub { font-size: 11.5px; color: var(--text-3); margin-bottom: 14px; }
+  .mini-kpi { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 16px; }
+  .mini-kpi .mk { background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 9px 11px; }
+  .mini-kpi .mk .l { font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-3); }
+  .mini-kpi .mk .v { font-size: 19px; font-weight: 800; margin-top: 3px; font-variant-numeric: tabular-nums; }
+  .mini-kpi .mk .v .u { font-size: 11px; font-weight: 600; color: var(--text-2); }
+
+  .pbar { margin-bottom: 12px; }
+  .pbar:last-child { margin-bottom: 0; }
+  .pbar .pl { display: flex; justify-content: space-between; font-size: 11.5px; margin-bottom: 5px; }
+  .pbar .pl .lbl { color: var(--text-3); }
+  .pbar .pl .val { font-weight: 700; font-variant-numeric: tabular-nums; }
+  .pbar .track { height: 8px; border-radius: 5px; background: var(--bg-3); overflow: hidden; border: 1px solid var(--border); }
+  .pbar .fill { height: 100%; border-radius: 5px; background: var(--gradient-accent); }
+  .pbar .fill.slow { background: linear-gradient(90deg, var(--warning), #f59e0b); }
+  .best-tag { font-size: 10px; font-weight: 700; color: var(--success); }
+  .alias-note { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-coins" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.66 3.58 3 8 3s8-1.34 8-3V6"/><path d="M4 12v6c0 1.66 3.58 3 8 3s8-1.34 8-3v-6"/></symbol>
+  <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 14a2 2 0 1 0 0-4 2 2 0 0 0 0 4z"/><path d="m13.4 12.6 4.2-4.2"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><line x1="6" y1="7" x2="6.01" y2="7"/><line x1="6" y1="17" x2="6.01" y2="17"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+  <symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M3</span>
+    <h2>Modele</h2>
+    <div class="desc">Produkcja i wydajność per-model w całej sieci mesh — total tokenów, percentyle TTFT i decode tok/s, błędy, koszt. Plus porównanie tego samego modelu na różnych nodach i backendach.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-trend"/></svg>Statystyki</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-activity"/></svg>Przegląd</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy i grupy</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-cpu"/></svg>Modele</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-server"/></svg>Nody i serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-list"/></svg>Zapytania</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-coins"/></svg>Rozliczenia</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-audit"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr · Admin</div><div class="role">Zarząd · Euvic</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Statystyki</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Modele</span>
+        </div>
+
+        <div class="filters">
+          <span class="fl">Okres</span>
+          <div class="segmented">
+            <button>Godzina</button>
+            <button>Dzień</button>
+            <button class="active">Miesiąc</button>
+          </div>
+          <span class="fl" style="margin-left:6px">Node</span>
+          <select class="select">
+            <option>Wszystkie nody (4)</option>
+            <option>rig24 · DGX Spark GB10</option>
+            <option>rig25 · DGX Spark GB10</option>
+            <option>mac-studio · M3 Ultra</option>
+            <option>phone-piotr · mobilny</option>
+          </select>
+          <span class="fl" style="margin-left:6px">Modalność</span>
+          <button class="filter-chip active">Tekst</button>
+          <button class="filter-chip">Audio</button>
+          <button class="filter-chip">Embedding</button>
+        </div>
+
+        <div class="mesh-note">
+          <svg class="icon"><use href="#i-server"/></svg>
+          Dane zagregowane z <b>4 nodów mesh</b> · <code>model_metrics_rollup</code> godzinowy, replikowany jak <code>token_usage_daily</code> · ostatnia synchronizacja <b>18 s</b> temu.
+        </div>
+
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-cpu"/></svg>Produkcja i wydajność per-model</div>
+            <div class="hint">czerwiec 2026 · percentyle z silnika / odpowiedzi serwisu, nie z wall-clocku Core</div>
+          </div>
+          <table class="tf-table">
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th class="num-cell">Total tok</th>
+                <th class="num-cell">Zapytania</th>
+                <th class="num-cell">Prefill tok/s</th>
+                <th class="num-cell">Decode p50</th>
+                <th class="num-cell">Decode p90</th>
+                <th class="num-cell">TTFT p50</th>
+                <th class="num-cell">TTFT p99</th>
+                <th class="num-cell">Błędy %</th>
+                <th class="num-cell">Koszt zł</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><div class="model-name"><span class="nm">Qwen3.6-27B</span><span class="chip accent">vLLM</span></div></td>
+                <td class="num-cell">41 800 000</td>
+                <td class="num-cell">6 860</td>
+                <td class="num-cell">2 150</td>
+                <td class="num-cell">62</td>
+                <td class="num-cell">78</td>
+                <td class="num-cell">280</td>
+                <td class="num-cell">1 850</td>
+                <td class="num-cell">0,6</td>
+                <td class="num-cell">368</td>
+              </tr>
+              <tr>
+                <td><div class="model-name"><span class="nm">gpt-oss-120b</span><span class="chip accent">vLLM</span></div></td>
+                <td class="num-cell">18 400 000</td>
+                <td class="num-cell">1 540</td>
+                <td class="num-cell">980</td>
+                <td class="num-cell">34</td>
+                <td class="num-cell">41</td>
+                <td class="num-cell">540</td>
+                <td class="num-cell">2 600</td>
+                <td class="num-cell">1,2</td>
+                <td class="num-cell">323</td>
+              </tr>
+              <tr>
+                <td><div class="model-name"><span class="nm">gpt-oss-20b</span><span class="chip info">llama.cpp</span></div></td>
+                <td class="num-cell">9 600 000</td>
+                <td class="num-cell">2 180</td>
+                <td class="num-cell">1 420</td>
+                <td class="num-cell">48</td>
+                <td class="num-cell">60</td>
+                <td class="num-cell">360</td>
+                <td class="num-cell">1 950</td>
+                <td class="num-cell">0,8</td>
+                <td class="num-cell">42</td>
+              </tr>
+              <tr>
+                <td><div class="model-name"><span class="nm">Qwen3.6-4B</span><span class="chip info">llama.cpp</span></div></td>
+                <td class="num-cell">6 200 000</td>
+                <td class="num-cell">1 640</td>
+                <td class="num-cell">3 200</td>
+                <td class="num-cell">95</td>
+                <td class="num-cell">120</td>
+                <td class="num-cell">190</td>
+                <td class="num-cell">980</td>
+                <td class="num-cell">1,4</td>
+                <td class="num-cell">11</td>
+              </tr>
+              <tr>
+                <td><div class="model-name"><span class="nm">parakeet-0.6b</span><span class="chip warning">STT</span></div></td>
+                <td class="audio-cell">14 200 s audio</td>
+                <td class="num-cell">320</td>
+                <td class="num-cell"><span class="muted">—</span></td>
+                <td class="num-cell"><span class="muted">—</span></td>
+                <td class="num-cell"><span class="muted">—</span></td>
+                <td class="num-cell">120</td>
+                <td class="num-cell">640</td>
+                <td class="num-cell">0,3</td>
+                <td class="num-cell">6</td>
+              </tr>
+              <tr>
+                <td><div class="model-name"><span class="nm">bge-m3</span><span class="chip success">embeddings</span></div></td>
+                <td class="num-cell">8 200 000</td>
+                <td class="num-cell">12 400</td>
+                <td class="num-cell">9 500</td>
+                <td class="num-cell"><span class="muted">—</span></td>
+                <td class="num-cell"><span class="muted">—</span></td>
+                <td class="num-cell">24</td>
+                <td class="num-cell">110</td>
+                <td class="num-cell">0,2</td>
+                <td class="num-cell">4</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section-card" style="margin-top:16px">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-gauge"/></svg>Porównanie: Qwen3.6-27B na różnych nodach / backendach</div>
+            <div class="hint">jeden alias modelu · 3 deploymenty · routing po wydajności</div>
+          </div>
+          <div class="alias-note" style="margin-bottom:14px">
+            Alias <code>Qwen3.6-27B</code> (6 860 zapytań w tabeli wyżej) jest rozłożony na 3 niezależne deploymenty.
+            Mesh kieruje ruch do najszybszego wolnego serwisu; mac-studio MLX jest wolniejszy, ale zapewnia ciągłość gdy oba DGX-y są wysycone.
+          </div>
+
+          <div class="grid-3">
+            <!-- rig24 vLLM -->
+            <div class="section-card cmp-card" style="background:var(--bg-3)">
+              <div class="cmp-head">
+                <span class="cmp-node">rig24</span>
+                <span class="chip accent">vLLM · TP</span>
+                <span class="best-tag" style="margin-left:auto">⚡ najszybszy</span>
+              </div>
+              <div class="cmp-sub">DGX Spark GB10 · tensor-parallel</div>
+              <div class="mini-kpi">
+                <div class="mk"><div class="l">Decode p50</div><div class="v">68 <span class="u">tok/s</span></div></div>
+                <div class="mk"><div class="l">TTFT p50</div><div class="v">240 <span class="u">ms</span></div></div>
+                <div class="mk"><div class="l">Zapytania</div><div class="v">3 180</div></div>
+                <div class="mk"><div class="l">Błędy</div><div class="v">0,5 <span class="u">%</span></div></div>
+              </div>
+              <div class="pbar">
+                <div class="pl"><span class="lbl">Decode tok/s (vs najlepszy)</span><span class="val">68 · 100%</span></div>
+                <div class="track"><div class="fill" style="width:100%"></div></div>
+              </div>
+              <div class="pbar">
+                <div class="pl"><span class="lbl">TTFT (krótszy = lepszy)</span><span class="val">240 ms</span></div>
+                <div class="track"><div class="fill" style="width:100%"></div></div>
+              </div>
+            </div>
+
+            <!-- rig25 vLLM -->
+            <div class="section-card cmp-card" style="background:var(--bg-3)">
+              <div class="cmp-head">
+                <span class="cmp-node">rig25</span>
+                <span class="chip accent">vLLM · TP</span>
+              </div>
+              <div class="cmp-sub">DGX Spark GB10 · drugi twin (RoCE)</div>
+              <div class="mini-kpi">
+                <div class="mk"><div class="l">Decode p50</div><div class="v">64 <span class="u">tok/s</span></div></div>
+                <div class="mk"><div class="l">TTFT p50</div><div class="v">260 <span class="u">ms</span></div></div>
+                <div class="mk"><div class="l">Zapytania</div><div class="v">2 540</div></div>
+                <div class="mk"><div class="l">Błędy</div><div class="v">0,7 <span class="u">%</span></div></div>
+              </div>
+              <div class="pbar">
+                <div class="pl"><span class="lbl">Decode tok/s (vs najlepszy)</span><span class="val">64 · 94%</span></div>
+                <div class="track"><div class="fill" style="width:94%"></div></div>
+              </div>
+              <div class="pbar">
+                <div class="pl"><span class="lbl">TTFT (krótszy = lepszy)</span><span class="val">260 ms</span></div>
+                <div class="track"><div class="fill" style="width:92%"></div></div>
+              </div>
+            </div>
+
+            <!-- mac-studio MLX -->
+            <div class="section-card cmp-card" style="background:var(--bg-3)">
+              <div class="cmp-head">
+                <span class="cmp-node">mac-studio</span>
+                <span class="chip info">MLX · Q4</span>
+              </div>
+              <div class="cmp-sub">M3 Ultra · wolniej, ale ciągłość</div>
+              <div class="mini-kpi">
+                <div class="mk"><div class="l">Decode p50</div><div class="v">31 <span class="u">tok/s</span></div></div>
+                <div class="mk"><div class="l">TTFT p50</div><div class="v">520 <span class="u">ms</span></div></div>
+                <div class="mk"><div class="l">Zapytania</div><div class="v">1 140</div></div>
+                <div class="mk"><div class="l">Błędy</div><div class="v">0,9 <span class="u">%</span></div></div>
+              </div>
+              <div class="pbar">
+                <div class="pl"><span class="lbl">Decode tok/s (vs najlepszy)</span><span class="val">31 · 46%</span></div>
+                <div class="track"><div class="fill slow" style="width:46%"></div></div>
+              </div>
+              <div class="pbar">
+                <div class="pl"><span class="lbl">TTFT (krótszy = lepszy)</span><span class="val">520 ms</span></div>
+                <div class="track"><div class="fill slow" style="width:46%"></div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

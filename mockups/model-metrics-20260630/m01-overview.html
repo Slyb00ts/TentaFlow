@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Model Metrics · Przegląd globalny (M1)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .filterbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .filterbar .select { width: auto; min-width: 150px; }
+  .filterbar .fl { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3); font-weight: 700; }
+  .filterbar .spacer { flex: 1; }
+
+  .mesh-banner {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 11px 16px; margin-bottom: 16px;
+  }
+  .mesh-banner .nuta { font-size: 12px; color: var(--text-2); display: flex; align-items: center; gap: 8px; }
+  .mesh-banner .nuta .icon { width: 14px; height: 14px; color: var(--accent-2); }
+  .mesh-banner .nodes { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+
+  .kpi-grid.k4 { grid-template-columns: repeat(4, 1fr); }
+  .kpi .value { font-variant-numeric: tabular-nums; }
+
+  .chart-card { margin-bottom: 16px; }
+  .chart-legend { display: flex; gap: 16px; align-items: center; font-size: 11.5px; color: var(--text-2); }
+  .chart-legend .lg { display: inline-flex; align-items: center; gap: 6px; }
+  .chart-legend .sw { width: 11px; height: 11px; border-radius: 3px; }
+  .chart-svg { width: 100%; height: 220px; display: block; }
+  .chart-svg text { fill: var(--text-3); font-size: 9px; font-family: 'Manrope', sans-serif; }
+  .chart-svg .gridline { stroke: var(--border); stroke-width: 1; }
+
+  .num-r { text-align: right; font-variant-numeric: tabular-nums; }
+  .grid-3 .tbl-title {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--accent-2); font-weight: 700; margin-bottom: 10px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .grid-3 .tbl-title .icon { width: 14px; height: 14px; }
+  .share-bar { position: relative; height: 4px; border-radius: 2px; background: var(--bg-3); margin-top: 5px; overflow: hidden; }
+  .share-bar > span { position: absolute; inset: 0 auto 0 0; border-radius: 2px; background: var(--gradient-accent); }
+  .ent { display: flex; flex-direction: column; gap: 1px; }
+  .ent .nm { font-weight: 600; }
+  .ent .sub { font-size: 10.5px; color: var(--text-3); }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-coins" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.66 3.58 3 8 3s8-1.34 8-3V6"/><path d="M4 12v6c0 1.66 3.58 3 8 3s8-1.34 8-3v-6"/></symbol>
+  <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 14a2 2 0 1 0 2-2"/><path d="m13.4 12.6 3.6-3.6"/><path d="M3.2 17a9 9 0 1 1 17.6 0"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+  <symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+  <symbol id="i-sync" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M1</span>
+    <h2>Przegląd globalny</h2>
+    <div class="desc">Mesh-wide rollup użycia i wydajności modeli — godzinowy <span class="mono">model_metrics_rollup</span>, single-writer-per-row, replikowany po sieci. Każdy node sumuje całość lokalnie.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Analityka modeli</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-trend"/></svg>Statystyki</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Userzy i grupy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-server"/></svg>Modele</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-list"/></svg>Zapytania</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-coins"/></svg>Rozliczenia</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr · Admin</div><div class="role">Euvic · Zarząd</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Analityka modeli</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Statystyki</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb current">Przegląd</span>
+        </div>
+
+        <div class="filterbar">
+          <span class="fl">Okres</span>
+          <div class="segmented">
+            <button>Godzina</button>
+            <button>Dzień</button>
+            <button class="active">Miesiąc</button>
+          </div>
+          <span class="fl">Node</span>
+          <select class="select">
+            <option>Wszystkie nody (4)</option>
+            <option>rig24</option>
+            <option>rig25</option>
+            <option>mac-studio</option>
+            <option>phone-piotr</option>
+          </select>
+          <span class="fl">Model</span>
+          <select class="select">
+            <option>Wszystkie modele</option>
+            <option>Qwen3.6-27B</option>
+            <option>gpt-oss-120b</option>
+            <option>gpt-oss-20b</option>
+            <option>Qwen3.6-4B</option>
+            <option>parakeet-0.6b</option>
+            <option>bge-m3</option>
+          </select>
+          <span class="spacer"></span>
+          <span class="filter-chip">Zarząd</span>
+          <span class="filter-chip active">Dev</span>
+          <span class="filter-chip">Sprzedaż</span>
+          <span class="filter-chip">Automaty</span>
+        </div>
+
+        <div class="section-card mesh-banner">
+          <div class="nuta">
+            <svg class="icon"><use href="#i-sync"/></svg>
+            Dane zagregowane z <strong>4 nodów mesh</strong> • ostatnia synchronizacja <strong>6 s temu</strong>
+          </div>
+          <div class="nodes">
+            <span class="status-pill ok">rig24</span>
+            <span class="status-pill ok">rig25</span>
+            <span class="status-pill ok">mac-studio</span>
+            <span class="status-pill warn">phone-piotr</span>
+          </div>
+        </div>
+
+        <div class="kpi-grid k4">
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-coins"/></svg>Total tokenów</div>
+            <div class="value">84.2 <span class="small">M</span></div>
+            <div class="delta up"><svg class="icon"><use href="#i-trend"/></svg>+18.4% vs maj</div>
+          </div>
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-activity"/></svg>Zapytania</div>
+            <div class="value">12 540</div>
+            <div class="delta up"><svg class="icon"><use href="#i-trend"/></svg>+11.2% vs maj</div>
+          </div>
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-gauge"/></svg>TTFT p50</div>
+            <div class="value">310 <span class="small">ms</span></div>
+            <div class="delta">p90 820 · p99 2 100 ms</div>
+          </div>
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-zap"/></svg>Decode p50</div>
+            <div class="value">58 <span class="small">tok/s</span></div>
+            <div class="delta up"><svg class="icon"><use href="#i-trend"/></svg>p90 41 · p99 22</div>
+          </div>
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-zap"/></svg>Prefill</div>
+            <div class="value">1 240 <span class="small">tok/s</span></div>
+            <div class="delta up"><svg class="icon"><use href="#i-trend"/></svg>+6.1% vs maj</div>
+          </div>
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-alert"/></svg>Błędy</div>
+            <div class="value">0.9 <span class="small">%</span></div>
+            <div class="delta down"><svg class="icon"><use href="#i-trend"/></svg>113 z 12 540</div>
+          </div>
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-coins"/></svg>Koszt</div>
+            <div class="value">621 <span class="small">zł</span></div>
+            <div class="delta up"><svg class="icon"><use href="#i-trend"/></svg>+14.0% vs maj</div>
+          </div>
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-server"/></svg>Aktywne nody</div>
+            <div class="value">4 <span class="small">/ 4</span></div>
+            <div class="delta">phone-piotr mobilny</div>
+          </div>
+        </div>
+
+        <div class="section-card chart-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon" style="color:var(--accent-2)"><use href="#i-trend"/></svg>Tokeny w czasie — czerwiec 2026 (dziennie)</div>
+            <div class="chart-legend">
+              <span class="lg"><span class="sw" style="background:var(--accent-1)"></span>prompt</span>
+              <span class="lg"><span class="sw" style="background:var(--accent-2)"></span>completion</span>
+            </div>
+          </div>
+          <svg class="chart-svg" viewBox="0 0 960 220" preserveAspectRatio="none">
+            <!-- linie siatki + etykiety osi Y (mln tokenów, max ~3.6M/dzień) -->
+            <g>
+              <line class="gridline" x1="34" y1="10"  x2="954" y2="10"/>
+              <line class="gridline" x1="34" y1="55"  x2="954" y2="55"/>
+              <line class="gridline" x1="34" y1="100" x2="954" y2="100"/>
+              <line class="gridline" x1="34" y1="145" x2="954" y2="145"/>
+              <line class="gridline" x1="34" y1="190" x2="954" y2="190"/>
+              <text x="30" y="13"  text-anchor="end">4M</text>
+              <text x="30" y="58"  text-anchor="end">3M</text>
+              <text x="30" y="103" text-anchor="end">2M</text>
+              <text x="30" y="148" text-anchor="end">1M</text>
+              <text x="30" y="193" text-anchor="end">0</text>
+            </g>
+            <!-- 30 słupków: prompt (dół, accent-1) + completion (góra, accent-2). baseline y=190, max wys.=180 -->
+            <g>
+              <!-- d1 -->  <rect x="38"  y="148" width="22" height="42" fill="#6366f1"/><rect x="38"  y="118" width="22" height="30" fill="#a78bfa"/>
+              <!-- d2 -->  <rect x="68"  y="142" width="22" height="48" fill="#6366f1"/><rect x="68"  y="108" width="22" height="34" fill="#a78bfa"/>
+              <!-- d3 -->  <rect x="98"  y="158" width="22" height="32" fill="#6366f1"/><rect x="98"  y="135" width="22" height="23" fill="#a78bfa"/>
+              <!-- d4 -->  <rect x="128" y="160" width="22" height="30" fill="#6366f1"/><rect x="128" y="138" width="22" height="22" fill="#a78bfa"/>
+              <!-- d5 -->  <rect x="158" y="130" width="22" height="60" fill="#6366f1"/><rect x="158" y="96"  width="22" height="34" fill="#a78bfa"/>
+              <!-- d6 -->  <rect x="188" y="120" width="22" height="70" fill="#6366f1"/><rect x="188" y="82"  width="22" height="38" fill="#a78bfa"/>
+              <!-- d7 -->  <rect x="218" y="126" width="22" height="64" fill="#6366f1"/><rect x="218" y="90"  width="22" height="36" fill="#a78bfa"/>
+              <!-- d8 -->  <rect x="248" y="112" width="22" height="78" fill="#6366f1"/><rect x="248" y="74"  width="22" height="38" fill="#a78bfa"/>
+              <!-- d9 -->  <rect x="278" y="118" width="22" height="72" fill="#6366f1"/><rect x="278" y="80"  width="22" height="38" fill="#a78bfa"/>
+              <!-- d10 --> <rect x="308" y="100" width="22" height="90" fill="#6366f1"/><rect x="308" y="60"  width="22" height="40" fill="#a78bfa"/>
+              <!-- d11 --> <rect x="338" y="108" width="22" height="82" fill="#6366f1"/><rect x="338" y="70"  width="22" height="38" fill="#a78bfa"/>
+              <!-- d12 --> <rect x="368" y="152" width="22" height="38" fill="#6366f1"/><rect x="368" y="128" width="22" height="24" fill="#a78bfa"/>
+              <!-- d13 --> <rect x="398" y="156" width="22" height="34" fill="#6366f1"/><rect x="398" y="134" width="22" height="22" fill="#a78bfa"/>
+              <!-- d14 --> <rect x="428" y="96"  width="22" height="94" fill="#6366f1"/><rect x="428" y="56"  width="22" height="40" fill="#a78bfa"/>
+              <!-- d15 --> <rect x="458" y="88"  width="22" height="102" fill="#6366f1"/><rect x="458" y="46" width="22" height="42" fill="#a78bfa"/>
+              <!-- d16 --> <rect x="488" y="92"  width="22" height="98" fill="#6366f1"/><rect x="488" y="50"  width="22" height="42" fill="#a78bfa"/>
+              <!-- d17 --> <rect x="518" y="78"  width="22" height="112" fill="#6366f1"/><rect x="518" y="34" width="22" height="44" fill="#a78bfa"/>
+              <!-- d18 --> <rect x="548" y="84"  width="22" height="106" fill="#6366f1"/><rect x="548" y="42" width="22" height="42" fill="#a78bfa"/>
+              <!-- d19 --> <rect x="578" y="150" width="22" height="40" fill="#6366f1"/><rect x="578" y="126" width="22" height="24" fill="#a78bfa"/>
+              <!-- d20 --> <rect x="608" y="154" width="22" height="36" fill="#6366f1"/><rect x="608" y="131" width="22" height="23" fill="#a78bfa"/>
+              <!-- d21 --> <rect x="638" y="90"  width="22" height="100" fill="#6366f1"/><rect x="638" y="48" width="22" height="42" fill="#a78bfa"/>
+              <!-- d22 --> <rect x="668" y="82"  width="22" height="108" fill="#6366f1"/><rect x="668" y="40" width="22" height="42" fill="#a78bfa"/>
+              <!-- d23 --> <rect x="698" y="74"  width="22" height="116" fill="#6366f1"/><rect x="698" y="30" width="22" height="44" fill="#a78bfa"/>
+              <!-- d24 --> <rect x="728" y="86"  width="22" height="104" fill="#6366f1"/><rect x="728" y="44" width="22" height="42" fill="#a78bfa"/>
+              <!-- d25 --> <rect x="758" y="94"  width="22" height="96" fill="#6366f1"/><rect x="758" y="54" width="22" height="40" fill="#a78bfa"/>
+              <!-- d26 --> <rect x="788" y="146" width="22" height="44" fill="#6366f1"/><rect x="788" y="122" width="22" height="24" fill="#a78bfa"/>
+              <!-- d27 --> <rect x="818" y="150" width="22" height="40" fill="#6366f1"/><rect x="818" y="127" width="22" height="23" fill="#a78bfa"/>
+              <!-- d28 --> <rect x="848" y="100" width="22" height="90" fill="#6366f1"/><rect x="848" y="62" width="22" height="38" fill="#a78bfa"/>
+              <!-- d29 --> <rect x="878" y="92"  width="22" height="98" fill="#6366f1"/><rect x="878" y="52" width="22" height="40" fill="#a78bfa"/>
+              <!-- d30 --> <rect x="908" y="104" width="22" height="86" fill="#6366f1"/><rect x="908" y="66" width="22" height="38" fill="#a78bfa"/>
+            </g>
+            <g>
+              <text x="49"  y="204" text-anchor="middle">01</text>
+              <text x="199" y="204" text-anchor="middle">06</text>
+              <text x="349" y="204" text-anchor="middle">11</text>
+              <text x="499" y="204" text-anchor="middle">16</text>
+              <text x="649" y="204" text-anchor="middle">21</text>
+              <text x="799" y="204" text-anchor="middle">26</text>
+              <text x="919" y="204" text-anchor="middle">30</text>
+            </g>
+          </svg>
+        </div>
+
+        <div class="grid-3">
+          <div class="section-card">
+            <div class="tbl-title"><svg class="icon"><use href="#i-server"/></svg>Top modele</div>
+            <table class="tf-table">
+              <thead><tr><th>Model</th><th class="num-r">Total tok</th><th class="num-r">Udział</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><div class="ent"><span class="nm">Qwen3.6-27B</span><span class="sub">vLLM · MLX</span></div></td>
+                  <td class="num-r mono">41.3M</td>
+                  <td class="num-r"><span class="mono">49%</span><div class="share-bar"><span style="width:49%"></span></div></td>
+                </tr>
+                <tr>
+                  <td><div class="ent"><span class="nm">gpt-oss-120b</span><span class="sub">vLLM · rig24</span></div></td>
+                  <td class="num-r mono">23.5M</td>
+                  <td class="num-r"><span class="mono">28%</span><div class="share-bar"><span style="width:28%"></span></div></td>
+                </tr>
+                <tr>
+                  <td><div class="ent"><span class="nm">gpt-oss-20b</span><span class="sub">llama.cpp · mac</span></div></td>
+                  <td class="num-r mono">13.1M</td>
+                  <td class="num-r"><span class="mono">16%</span><div class="share-bar"><span style="width:16%"></span></div></td>
+                </tr>
+                <tr>
+                  <td><div class="ent"><span class="nm">Qwen3.6-4B</span><span class="sub">llama.cpp · phone</span></div></td>
+                  <td class="num-r mono">6.3M</td>
+                  <td class="num-r"><span class="mono">7%</span><div class="share-bar"><span style="width:7%"></span></div></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="section-card">
+            <div class="tbl-title"><svg class="icon"><use href="#i-users"/></svg>Top użytkownicy</div>
+            <table class="tf-table">
+              <thead><tr><th>User</th><th class="num-r">Total tok</th><th class="num-r">Koszt</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><div class="ent"><span class="nm">piotr</span><span class="sub">Zarząd · admin</span></div></td>
+                  <td class="num-r mono">28.7M</td>
+                  <td class="num-r mono">214 zł</td>
+                </tr>
+                <tr>
+                  <td><div class="ent"><span class="nm">anna</span><span class="sub">Dev</span></div></td>
+                  <td class="num-r mono">19.4M</td>
+                  <td class="num-r mono">142 zł</td>
+                </tr>
+                <tr>
+                  <td><div class="ent"><span class="nm">bot-meeting</span><span class="sub">Automaty</span></div></td>
+                  <td class="num-r mono">17.9M</td>
+                  <td class="num-r mono">128 zł</td>
+                </tr>
+                <tr>
+                  <td><div class="ent"><span class="nm">marek</span><span class="sub">Dev</span></div></td>
+                  <td class="num-r mono">11.2M</td>
+                  <td class="num-r mono">81 zł</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="section-card">
+            <div class="tbl-title"><svg class="icon"><use href="#i-cpu"/></svg>Top nody</div>
+            <table class="tf-table">
+              <thead><tr><th>Node</th><th class="num-r">Produkcja tok</th><th class="num-r">GPU-h</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><div class="ent"><span class="nm">rig24</span><span class="sub">DGX Spark GB10</span></div></td>
+                  <td class="num-r mono">38.6M</td>
+                  <td class="num-r mono">142 h</td>
+                </tr>
+                <tr>
+                  <td><div class="ent"><span class="nm">rig25</span><span class="sub">DGX Spark GB10</span></div></td>
+                  <td class="num-r mono">27.4M</td>
+                  <td class="num-r mono">118 h</td>
+                </tr>
+                <tr>
+                  <td><div class="ent"><span class="nm">mac-studio</span><span class="sub">M3 Ultra</span></div></td>
+                  <td class="num-r mono">11.9M</td>
+                  <td class="num-r mono">63 h</td>
+                </tr>
+                <tr>
+                  <td><div class="ent"><span class="nm">phone-piotr</span><span class="sub">mobilny</span></div></td>
+                  <td class="num-r mono">6.3M</td>
+                  <td class="num-r mono">9 h</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>
