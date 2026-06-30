@@ -206,36 +206,68 @@ pub fn build_member_config_json(spec: &DistributedDeploySpec) -> Result<String, 
 // ze porty head-a sa wolne PRZED startem (host networking nie chroni portow).
 // =============================================================================
 
-/// Usuwa kontenery distributed z INNEGO `deployment_cluster_id` na TYM nodzie
-/// (stary Ray po nieudanej probie trzyma GPU/porty). Kontenery z BIEZACYM id
-/// zostawia (idempotentny retry). Best-effort.
+/// Master port TCPStore torch.distributed dla TP — vLLM/PyTorch otwiera go na
+/// KAZDYM czlonku do rendezvous tensor-parallel. Leftover proces (stary, ubity
+/// nie do konca kontener host-net) trzyma ten port i `vllm serve` cicho pada na
+/// `EADDRINUSE`, wiec preflight MUSI go zweryfikowac jako wolny.
 #[cfg(feature = "docker")]
-async fn remove_stale_distributed_containers(keep_deployment_id: &str) {
+const TORCH_DIST_PORT: u16 = 8001;
+
+/// Usuwa WSZYSTKIE kontenery z etykieta distributed na TYM nodzie — kazdego starego
+/// deploymentu, BIEZACY id wlacznie. Z `--network host` ich procesy trzymaja porty
+/// (`8001` torch.distributed + serve), wiec idempotentny retry tego samego id tez
+/// musi je najpierw usunac, inaczej nowy serve dostanie `EADDRINUSE`. `rm -f`
+/// zwalnia porty (TCP_LISTEN→CLOSED). Best-effort.
+///
+/// DLACZEGO remove-all (nie tylko biezacy id): `TORCH_DIST_PORT` (8001) jest STALY
+/// i wspoldzielony przez wszystkie distributed deploye, wiec fizycznie tylko JEDEN
+/// distributed deploy moze dzialac na nodzie naraz (dwa kolidowalyby na 8001). Kazdy
+/// istniejacy kontener distributed MUSI wiec zostac usuniety przed nowym deployem.
+/// Usuniecie kontenera nalezacego do INNEGO deployment_cluster_id nie jest ciche —
+/// logujemy `warn!`, bo to zatrzymanie obcego, rownoleglego deploymentu (ktorego
+/// rekord w DB pozostaje wtedy `running`/stale; sprzatniecie stanu DB tego obcego
+/// deploymentu wymagaloby przekazania `db` do preflight — follow-up).
+#[cfg(feature = "docker")]
+async fn remove_all_distributed_containers(current_deployment_cluster_id: &str) {
     let Ok(out) = tokio::process::Command::new("docker")
         .args([
             "ps",
-            "-a",
+            "-aq",
             "--filter",
             &format!("label={}", super::docker::DISTRIBUTED_LABEL),
-            "--format",
-            "{{.ID}} {{.Label \"tentaflow.deployment_cluster_id\"}}",
         ])
         .output()
         .await
     else {
         return;
     };
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let mut it = line.split_whitespace();
-        let (Some(id), label) = (it.next(), it.next().unwrap_or("")) else {
-            continue;
-        };
-        if label != keep_deployment_id {
-            let _ = tokio::process::Command::new("docker")
-                .args(["rm", "-f", id])
-                .output()
-                .await;
+    for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+        let other_id = tokio::process::Command::new("docker")
+            .args([
+                "inspect",
+                id,
+                "--format",
+                &format!(
+                    "{{{{index .Config.Labels \"{}\"}}}}",
+                    super::docker::DISTRIBUTED_LABEL
+                ),
+            ])
+            .output()
+            .await
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if !other_id.is_empty() && other_id != current_deployment_cluster_id {
+            tracing::warn!(
+                removed_deployment = %other_id,
+                current = %current_deployment_cluster_id,
+                "preflight: removing container from a DIFFERENT distributed deployment — only one distributed deploy can run per node (shared torch.distributed port 8001)"
+            );
         }
+        let _ = tokio::process::Command::new("docker")
+            .args(["rm", "-f", id])
+            .output()
+            .await;
     }
 }
 
@@ -258,20 +290,31 @@ async fn host_port_free(port: u16) -> bool {
 /// trzyma obcy proces (nie nasz stale Ray). Idempotentny.
 #[cfg(feature = "docker")]
 pub async fn preflight_member(spec: &DistributedDeploySpec) -> Result<(), String> {
-    remove_stale_distributed_containers(&spec.deployment_cluster_id).await;
-    if spec.role == "head" {
-        if !host_port_free(spec.port).await {
-            return Err(format!(
-                "port serve {} zajety na hoscie (obcy proces?) — zwolnij go lub wybierz inny",
-                spec.port
-            ));
-        }
-        if !host_port_free(spec.ray_port).await {
-            return Err(format!(
-                "port GCS Ray {} zajety na hoscie (obcy proces?) — zwolnij go",
-                spec.ray_port
-            ));
-        }
+    // Hard cleanup: drop EVERY distributed-label container on this node (any prior
+    // deployment, this id included) so host-network ports are released BEFORE the
+    // free-checks below — a leftover process is exactly what makes serve EADDRINUSE.
+    remove_all_distributed_containers(&spec.deployment_cluster_id).await;
+
+    // torch.distributed master port + serve port must be free on every member —
+    // a leftover process on either silently breaks `vllm serve` (EADDRINUSE on the
+    // TCPStore master, no visible error in detached exec). `host_port_free` retries.
+    if !host_port_free(TORCH_DIST_PORT).await {
+        return Err(format!(
+            "port {} zajety przed deployem (leftover proces torch.distributed)",
+            TORCH_DIST_PORT
+        ));
+    }
+    if !host_port_free(spec.port).await {
+        return Err(format!(
+            "port serve {} zajety przed deployem (leftover proces)",
+            spec.port
+        ));
+    }
+    if spec.role == "head" && !host_port_free(spec.ray_port).await {
+        return Err(format!(
+            "port GCS Ray {} zajety na hoscie (obcy proces?) — zwolnij go",
+            spec.ray_port
+        ));
     }
     Ok(())
 }
@@ -364,9 +407,17 @@ async fn head_container_id(deployment_cluster_id: &str) -> Option<String> {
         .map(String::from)
 }
 
+/// Sciezka pliku logu `vllm serve` W KONTENERZE head-a. Detached `docker exec -d`
+/// nie ma stdout do odebrania, wiec serve loguje do pliku, ktory pozniej czytamy
+/// przez `serve_log_tail` — bez tego ciche padniecie serve jest niewidoczne.
+#[cfg(feature = "docker")]
+const SERVE_LOG_PATH: &str = "/tmp/vllm-serve.log";
+
 /// Odpala `vllm serve` NA HEADZIE przez `docker exec -d` (detached) DOPIERO gdy
 /// klaster Ray jest kompletny. Env dziedziczone z kontenera (NCCL/RoCE/HF). Blad
-/// gdy kontener head-a nie istnieje albo exec sie nie powiodl.
+/// gdy kontener head-a nie istnieje albo exec sie nie powiodl. stdout+stderr serve
+/// idzie do `SERVE_LOG_PATH` w kontenerze (detached exec gubi strumienie) — dzieki
+/// temu `serve_log_tail` pokaze REALNY powod, gdy serve cicho padnie.
 #[cfg(feature = "docker")]
 pub async fn exec_serve_on_head(
     deployment_cluster_id: &str,
@@ -375,8 +426,11 @@ pub async fn exec_serve_on_head(
     let cid = head_container_id(deployment_cluster_id)
         .await
         .ok_or_else(|| "kontener head-a nie istnieje (vllm serve)".to_string())?;
+    // `serve_cmd` is already a shell command string; wrap it in a group with the
+    // log redirect so the detached process captures stdout+stderr to a file.
+    let logged = format!("{{ {serve_cmd} ; }} > {SERVE_LOG_PATH} 2>&1");
     let out = tokio::process::Command::new("docker")
-        .args(["exec", "-d", &cid, "bash", "-c", serve_cmd])
+        .args(["exec", "-d", &cid, "bash", "-c", &logged])
         .output()
         .await
         .map_err(|e| format!("docker exec (vllm serve) nieudany: {e}"))?;
@@ -396,6 +450,40 @@ pub async fn exec_serve_on_head(
     _serve_cmd: &str,
 ) -> Result<(), String> {
     Err("docker feature disabled".to_string())
+}
+
+/// Ostatnie `lines` linii logu `vllm serve` z kontenera head-a (po etykiecie
+/// deploymentu). None gdy nie ma head-a NA TYM nodzie albo nie da sie odczytac
+/// logu. Uzywane do wciagniecia realnego bledu serve do komunikatu o timeoucie.
+#[cfg(feature = "docker")]
+pub async fn serve_log_tail(deployment_cluster_id: &str, lines: usize) -> Option<String> {
+    let cid = head_container_id(deployment_cluster_id).await?;
+    let out = tokio::process::Command::new("docker")
+        .args([
+            "exec",
+            &cid,
+            "tail",
+            "-n",
+            &lines.to_string(),
+            SERVE_LOG_PATH,
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+#[cfg(not(feature = "docker"))]
+pub async fn serve_log_tail(_deployment_cluster_id: &str, _lines: usize) -> Option<String> {
+    None
 }
 
 /// Czy JAKIKOLWIEK kontener deploymentu (po etykiecie) dziala na tym nodzie.

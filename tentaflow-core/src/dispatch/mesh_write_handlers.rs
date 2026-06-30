@@ -24,7 +24,7 @@ use tentaflow_protocol::{
     MeshTrustRetrustResponse, MeshTrustRevokeRequest, MeshTrustRevokeResponse, MessageBody,
     ProtocolError, ProtocolErrorCode,
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 use tentaflow_protocol::mesh::{MeshCommandResponsePayload, MeshCommandType};
 
@@ -1304,6 +1304,7 @@ pub async fn cluster_deploy(
 
     let mut statuses: Vec<ClusterDeployMemberStatus> = Vec::new();
 
+    info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P1: start head (Ray GCS)");
     // 1. Head FIRST: start Ray GCS + `vllm serve` (vLLM BLOCKS until workers join).
     let head_status = deploy_distributed_member(
         ctx,
@@ -1327,6 +1328,7 @@ pub async fn cluster_deploy(
     }
     statuses.push(head_status);
 
+    info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P2: wait head container build");
     // 2a. BUILD phase: wait for the head CONTAINER to be up (image build +
     //     container start) on its OWN generous budget — a slow first build
     //     extends THIS phase, NOT the short Ray-GCS budget below (P2-fix).
@@ -1343,6 +1345,7 @@ pub async fn cluster_deploy(
         .await);
     }
 
+    info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P3: wait head Ray GCS");
     // 2b. Wait for the head Ray GCS to come up so workers can join (short budget).
     if let Err(e) = poll_node_readiness(
         ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
@@ -1357,6 +1360,7 @@ pub async fn cluster_deploy(
         .await);
     }
 
+    info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P4: start workers (join Ray)");
     // 3. Start workers (join the Ray head). Each worker is gated on its OWN
     //    container coming up (build budget) before we move on.
     for (idx, spec) in &specs {
@@ -1410,6 +1414,7 @@ pub async fn cluster_deploy(
         .await);
     }
 
+    info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P5: start vllm serve on head");
     // 5. Cluster is complete → launch `vllm serve` ON THE HEAD via docker exec
     //    (detached). vLLM now finds the full TP GPU set immediately.
     let serve_cmd = match crate::services::deploy::distributed::build_serve_command(&head_spec) {
@@ -1433,6 +1438,7 @@ pub async fn cluster_deploy(
         .await);
     }
 
+    info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P6: wait serve ready (/v1/models)");
     // 6. FINAL readiness: head `/v1/models` 200 — vLLM loaded the model across the
     //    TP cluster and serves. Bounded by `ready_timeout` (P1-1).
     if let Err(e) = poll_node_readiness(
@@ -1441,9 +1447,24 @@ pub async fn cluster_deploy(
     )
     .await
     {
+        // Pull the REAL serve failure from the head's serve log so finalize +
+        // GUI show why vLLM never came up (only when the head is local — a
+        // remote head's log lives on that node and isn't reachable here).
+        let reason = if head_node_id == local_id {
+            match crate::services::deploy::distributed::serve_log_tail(&deployment_cluster_id, 40)
+                .await
+            {
+                Some(tail) => format!(
+                    "klaster nie zaczął serwować w czasie: {e}\n--- vllm serve log ---\n{tail}"
+                ),
+                None => format!("klaster nie zaczął serwować w czasie: {e}"),
+            }
+        } else {
+            format!("klaster nie zaczął serwować w czasie: {e}")
+        };
         return Ok(finalize_distributed_failure(
             ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
-            &persisted_members, statuses, format!("klaster nie zaczął serwować w czasie: {e}"),
+            &persisted_members, statuses, reason,
         )
         .await);
     }
