@@ -538,6 +538,9 @@ struct DistributedRuntime {
     /// Port OpenAI head-a (head nasluchuje; worker headless — port tylko do nazwy
     /// kontenera, bez bindu, bo i tak na innym nodzie).
     port: u16,
+    /// Port mastera torch.distributed (TCPStore) → `VLLM_PORT`. Przydzielony z tej
+    /// samej puli co serve, rozny od `port`, zeby vLLM nie kolidowal z domyslnym 8000.
+    dist_port: u16,
     deployment_cluster_id: String,
 }
 
@@ -546,6 +549,7 @@ fn parse_distributed(user_config: &serde_json::Value) -> Option<DistributedRunti
     let d = user_config.get(DISTRIBUTED_CONFIG_KEY)?;
     let role = d.get("role").and_then(|v| v.as_str())?.to_string();
     let port = d.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    let dist_port = d.get("dist_port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
     let deployment_cluster_id = d
         .get("deployment_cluster_id")
         .and_then(|v| v.as_str())
@@ -554,6 +558,7 @@ fn parse_distributed(user_config: &serde_json::Value) -> Option<DistributedRunti
     Some(DistributedRuntime {
         role,
         port,
+        dist_port,
         deployment_cluster_id,
     })
 }
@@ -1319,7 +1324,23 @@ impl DeployStrategy for DockerDeploy {
             env.insert(k, v);
         }
         env.insert("PORT".into(), internal_port.to_string());
-        env.insert("VLLM_PORT".into(), internal_port.to_string());
+        // Distributed: VLLM_PORT is the torch.distributed TCPStore master port and
+        // MUST differ from the serve API port — the manifest default (8000) is never
+        // allocated, so without this every member's vLLM would land on 8000 and
+        // collide (EADDRINUSE). Single-node keeps the manifest default. A distributed
+        // deploy with dist_port==0 means allocation never reached this node — refuse
+        // rather than silently falling back to 8000 (regression of the collision bug).
+        let vllm_port = if let Some(d) = &distributed {
+            if d.dist_port == 0 {
+                return Err(DeployError::PortAlloc(
+                    "distributed deploy: dist_port not allocated (0) — refusing to fall back to default 8000".into(),
+                ));
+            }
+            d.dist_port
+        } else {
+            internal_port
+        };
+        env.insert("VLLM_PORT".into(), vllm_port.to_string());
         if let Some(model) = super::resolve_model_repo(&self.manifest, &self.user_config) {
             env.insert("MODEL".into(), model);
         }

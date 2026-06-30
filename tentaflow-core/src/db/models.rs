@@ -197,6 +197,9 @@ pub struct DbClusterDeployment {
     pub tp_size: i64,
     pub head_node_id: String,
     pub port: i64,
+    /// torch.distributed TCPStore master port (`VLLM_PORT`), leased from the same
+    /// `PortAllocator` as `port`. Persisted so a clean stop can release the lease.
+    pub dist_port: i64,
     pub endpoint_url: Option<String>,
     /// "deploying" | "running" | "failed" | "stopped".
     pub status: String,

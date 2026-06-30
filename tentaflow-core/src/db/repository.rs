@@ -3663,7 +3663,7 @@ pub fn list_cluster_members(pool: &DbPool, cluster_id: &str) -> Result<Vec<DbClu
 
 // --- Cluster distributed deployments (D3) ---
 
-const CLUSTER_DEPLOYMENT_COLS: &str = "deployment_cluster_id, cluster_id, engine_id, model, served_model_name, tp_size, head_node_id, port, endpoint_url, status, created_at, updated_at";
+const CLUSTER_DEPLOYMENT_COLS: &str = "deployment_cluster_id, cluster_id, engine_id, model, served_model_name, tp_size, head_node_id, port, endpoint_url, status, created_at, updated_at, dist_port";
 
 fn row_to_cluster_deployment(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbClusterDeployment> {
     Ok(DbClusterDeployment {
@@ -3679,6 +3679,7 @@ fn row_to_cluster_deployment(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbClus
         status: row.get(9)?,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
+        dist_port: row.get(12)?,
     })
 }
 
@@ -3694,13 +3695,13 @@ pub fn upsert_cluster_deployment(
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
     tx.execute(
-        "INSERT INTO cluster_deployments (deployment_cluster_id, cluster_id, engine_id, model, served_model_name, tp_size, head_node_id, port, endpoint_url, status) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+        "INSERT INTO cluster_deployments (deployment_cluster_id, cluster_id, engine_id, model, served_model_name, tp_size, head_node_id, port, endpoint_url, status, dist_port) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
          ON CONFLICT(deployment_cluster_id) DO UPDATE SET \
             cluster_id=excluded.cluster_id, engine_id=excluded.engine_id, model=excluded.model, \
             served_model_name=excluded.served_model_name, tp_size=excluded.tp_size, \
             head_node_id=excluded.head_node_id, port=excluded.port, endpoint_url=excluded.endpoint_url, \
-            status=excluded.status, updated_at=datetime('now')",
+            status=excluded.status, dist_port=excluded.dist_port, updated_at=datetime('now')",
         rusqlite::params![
             deployment.deployment_cluster_id,
             deployment.cluster_id,
@@ -3712,6 +3713,7 @@ pub fn upsert_cluster_deployment(
             deployment.port,
             deployment.endpoint_url,
             deployment.status,
+            deployment.dist_port,
         ],
     )?;
     tx.execute(

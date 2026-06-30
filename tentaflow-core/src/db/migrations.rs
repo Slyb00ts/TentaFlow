@@ -542,7 +542,26 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cluster_members_rdma_gid_index",
             MigrationStep::Rust(cluster_members_add_gid_index),
         ),
+        (
+            101,
+            "cluster_deployments_dist_port",
+            MigrationStep::Rust(cluster_deployments_add_dist_port),
+        ),
     ]
+}
+
+/// Persist the torch.distributed TCPStore master port (`VLLM_PORT`) leased from
+/// the coordinator's `PortAllocator` alongside the serve port, so a clean stop
+/// can release BOTH leases (serve `port` was already persisted; `dist_port` was
+/// not, leaking that lease on every successful teardown). Idempotent (column
+/// probe). Default 0 = legacy row predating allocation; stop skips releasing 0.
+fn cluster_deployments_add_dist_port(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "cluster_deployments", "dist_port")? {
+        conn.execute_batch(
+            "ALTER TABLE cluster_deployments ADD COLUMN dist_port INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
 }
 
 /// Per-member RoCEv2 GID index for `NCCL_IB_GID_INDEX` (D3). Default 3 — the

@@ -1063,6 +1063,7 @@ fn build_member_spec(
     tp_size: u32,
     gpus_per_node: u32,
     port: u16,
+    dist_port: u16,
     gpu_mem: f32,
     max_model_len: u32,
     ray_head_ip: &str,
@@ -1091,6 +1092,7 @@ fn build_member_spec(
         tp_size,
         num_gpus: gpus_per_node,
         port,
+        dist_port,
         gpu_memory_utilization: gpu_mem,
         max_model_len,
         ray_head_ip: ray_head_ip.to_string(),
@@ -1213,7 +1215,29 @@ pub async fn cluster_deploy(
 
     let gpus_per_node = gpus_per_node.unwrap_or(1).max(1);
     let tp_size = members.len() as u32 * gpus_per_node;
-    let serve_port = port.unwrap_or(8100);
+
+    // Two ports from the SAME PortAllocator a normal service deploy uses: serve API
+    // (`vllm serve --port`, honours the wizard's preferred `port`) and the
+    // torch.distributed TCPStore master (`VLLM_PORT` on every member). Both are
+    // leased so a concurrent local deploy can't reuse them; released on failure.
+    // Distinct by construction — `acquire()` runs after `acquire_or_specific` leased
+    // the serve port, so it never hands the same one back.
+    let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
+        ProtocolError::new(ProtocolErrorCode::Internal, "port allocator niedostepny")
+    })?;
+    let serve_port = port_allocator
+        .acquire_or_specific(*port)
+        .map_err(|e| ProtocolError::new(ProtocolErrorCode::Internal, format!("alokacja portu serve: {e}")))?;
+    let dist_port = match port_allocator.acquire() {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = port_allocator.release(serve_port);
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::Internal,
+                format!("alokacja portu torch.distributed: {e}"),
+            ));
+        }
+    };
     let gpu_mem = gpu_memory_utilization.unwrap_or(0.90);
     let max_len = max_model_len.unwrap_or(8192);
     let ray_port: u16 = 6379;
@@ -1228,7 +1252,17 @@ pub async fn cluster_deploy(
     let expected_nodes = members.len() as u32;
 
     let local_id = ctx.state.local_node_id.to_string();
-    let qm = require_quic_mesh(ctx)?;
+    // From here until the deployment is persisted (status deploying) every early
+    // return must hand both leases back — `finalize_distributed_failure` only runs
+    // AFTER persist, so these pre-persist exits would otherwise leak serve+dist.
+    let qm = match require_quic_mesh(ctx) {
+        Ok(qm) => qm,
+        Err(e) => {
+            let _ = port_allocator.release(serve_port);
+            let _ = port_allocator.release(dist_port);
+            return Err(e);
+        }
+    };
 
     // Head = local node when it is a member (so the OpenAI endpoint sits on this
     // node), otherwise the first member. ray_head_ip = head's RDMA IP.
@@ -1258,6 +1292,7 @@ pub async fn cluster_deploy(
                 tp_size,
                 gpus_per_node,
                 serve_port,
+                dist_port,
                 gpu_mem,
                 max_len,
                 &ray_head_ip,
@@ -1286,6 +1321,7 @@ pub async fn cluster_deploy(
         tp_size: tp_size as i64,
         head_node_id: head_node_id.clone(),
         port: serve_port as i64,
+        dist_port: dist_port as i64,
         endpoint_url: endpoint_url.clone(),
         status: "deploying".to_string(),
         created_at: String::new(),
@@ -1296,6 +1332,8 @@ pub async fn cluster_deploy(
         &deployment,
         &persisted_members,
     ) {
+        let _ = port_allocator.release(serve_port);
+        let _ = port_allocator.release(dist_port);
         return Err(ProtocolError::new(
             ProtocolErrorCode::Internal,
             format!("persist deployment: {e}"),
@@ -1321,7 +1359,7 @@ pub async fn cluster_deploy(
         );
         statuses.push(head_status);
         return Ok(finalize_distributed_failure(
-            ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
+            ctx, &qm, &local_id, &deployment_cluster_id, serve_port, dist_port, &head_node_id, endpoint_url,
             &persisted_members, statuses, reason,
         )
         .await);
@@ -1339,7 +1377,7 @@ pub async fn cluster_deploy(
     .await
     {
         return Ok(finalize_distributed_failure(
-            ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
+            ctx, &qm, &local_id, &deployment_cluster_id, serve_port, dist_port, &head_node_id, endpoint_url,
             &persisted_members, statuses, format!("kontener head nie wstał (build): {e}"),
         )
         .await);
@@ -1354,7 +1392,7 @@ pub async fn cluster_deploy(
     .await
     {
         return Ok(finalize_distributed_failure(
-            ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
+            ctx, &qm, &local_id, &deployment_cluster_id, serve_port, dist_port, &head_node_id, endpoint_url,
             &persisted_members, statuses, format!("Ray GCS head nie wstał: {e}"),
         )
         .await);
@@ -1375,7 +1413,7 @@ pub async fn cluster_deploy(
         statuses.push(status);
         if !ok {
             return Ok(finalize_distributed_failure(
-                ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
+                ctx, &qm, &local_id, &deployment_cluster_id, serve_port, dist_port, &head_node_id, endpoint_url,
                 &persisted_members, statuses, format!("worker {} nie wystartował", node_id),
             )
             .await);
@@ -1388,7 +1426,7 @@ pub async fn cluster_deploy(
         .await
         {
             return Ok(finalize_distributed_failure(
-                ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
+                ctx, &qm, &local_id, &deployment_cluster_id, serve_port, dist_port, &head_node_id, endpoint_url,
                 &persisted_members, statuses,
                 format!("kontener worker {} nie wstał (build): {e}", node_id),
             )
@@ -1407,7 +1445,7 @@ pub async fn cluster_deploy(
     .await
     {
         return Ok(finalize_distributed_failure(
-            ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
+            ctx, &qm, &local_id, &deployment_cluster_id, serve_port, dist_port, &head_node_id, endpoint_url,
             &persisted_members, statuses,
             format!("workery nie dołączyły do klastra Ray w czasie: {e}"),
         )
@@ -1421,7 +1459,7 @@ pub async fn cluster_deploy(
         Ok(c) => c,
         Err(e) => {
             return Ok(finalize_distributed_failure(
-                ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
+                ctx, &qm, &local_id, &deployment_cluster_id, serve_port, dist_port, &head_node_id, endpoint_url,
                 &persisted_members, statuses, format!("budowa komendy vllm serve: {e}"),
             )
             .await);
@@ -1432,7 +1470,7 @@ pub async fn cluster_deploy(
             .await
     {
         return Ok(finalize_distributed_failure(
-            ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
+            ctx, &qm, &local_id, &deployment_cluster_id, serve_port, dist_port, &head_node_id, endpoint_url,
             &persisted_members, statuses, format!("start vllm serve na headzie: {e}"),
         )
         .await);
@@ -1463,7 +1501,7 @@ pub async fn cluster_deploy(
             format!("klaster nie zaczął serwować w czasie: {e}")
         };
         return Ok(finalize_distributed_failure(
-            ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
+            ctx, &qm, &local_id, &deployment_cluster_id, serve_port, dist_port, &head_node_id, endpoint_url,
             &persisted_members, statuses, reason,
         )
         .await);
@@ -1667,12 +1705,20 @@ async fn finalize_distributed_failure(
     qm: &Arc<IrohMeshManager>,
     local_id: &str,
     deployment_cluster_id: &str,
+    serve_port: u16,
+    dist_port: u16,
     head_node_id: &str,
     endpoint_url: Option<String>,
     members: &[crate::db::models::DbClusterDeploymentMember],
     statuses: Vec<ClusterDeployMemberStatus>,
     reason: String,
 ) -> MessageBody {
+    // Release the two coordinator-leased ports (serve + torch.distributed) so a
+    // failed deploy does not leak them out of the allocator's lease set.
+    if let Some(ports) = ctx.state.port_allocator.clone() {
+        let _ = ports.release(serve_port);
+        let _ = ports.release(dist_port);
+    }
     let teardown_errors =
         teardown_distributed_members(ctx, qm, local_id, deployment_cluster_id, members).await;
     let message = if teardown_errors.is_empty() {
@@ -1850,6 +1896,14 @@ pub async fn cluster_deploy_stop(
     // failure keep it (status failed) so the admin can retry STOP — never leave
     // a possibly-orphaned Ray container untracked.
     if all_ok {
+        // Release the two coordinator-leased ports (serve `dep.port` + torch.distributed
+        // `dep.dist_port`) back to THIS node's allocator — the leases were taken here at
+        // deploy time, never on the workers, and `deploy::stop` deliberately never frees
+        // them. dist_port==0 marks a legacy row predating allocation; nothing to free.
+        let _ = port_allocator.release(dep.port as u16);
+        if dep.dist_port > 0 {
+            let _ = port_allocator.release(dep.dist_port as u16);
+        }
         if let Err(e) =
             crate::db::repository::delete_cluster_deployment(&ctx.state.db, deployment_cluster_id)
         {

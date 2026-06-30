@@ -583,6 +583,11 @@ pub struct DistributedDeploySpec {
     pub num_gpus: u32,
     /// Port endpointu OpenAI head-a (`vllm serve --port`). Ignorowany dla workera.
     pub port: u16,
+    /// Port mastera torch.distributed (TCPStore) dla tensor-parallel — `VLLM_PORT`
+    /// na KAZDYM czlonku. MUSI byc rozny od `port` (serve API) i przydzielony z tej
+    /// samej puli `PortAllocator` co serve, zeby nie kolidowac z domyslnym 8000.
+    #[serde(default)]
+    pub dist_port: u16,
     /// `--gpu-memory-utilization`.
     pub gpu_memory_utilization: f32,
     /// `--max-model-len`.

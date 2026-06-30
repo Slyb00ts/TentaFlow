@@ -190,6 +190,7 @@ pub fn build_member_config_json(spec: &DistributedDeploySpec) -> Result<String, 
         json!({
             "role": spec.role,
             "port": spec.port,
+            "dist_port": spec.dist_port,
             "deployment_cluster_id": spec.deployment_cluster_id,
             "cluster_id": spec.cluster_id,
             "num_gpus": spec.num_gpus,
@@ -206,22 +207,14 @@ pub fn build_member_config_json(spec: &DistributedDeploySpec) -> Result<String, 
 // ze porty head-a sa wolne PRZED startem (host networking nie chroni portow).
 // =============================================================================
 
-/// Master port TCPStore torch.distributed dla TP — vLLM/PyTorch otwiera go na
-/// KAZDYM czlonku do rendezvous tensor-parallel. Leftover proces (stary, ubity
-/// nie do konca kontener host-net) trzyma ten port i `vllm serve` cicho pada na
-/// `EADDRINUSE`, wiec preflight MUSI go zweryfikowac jako wolny.
-#[cfg(feature = "docker")]
-const TORCH_DIST_PORT: u16 = 8001;
-
 /// Usuwa WSZYSTKIE kontenery z etykieta distributed na TYM nodzie — kazdego starego
 /// deploymentu, BIEZACY id wlacznie. Z `--network host` ich procesy trzymaja porty
-/// (`8001` torch.distributed + serve), wiec idempotentny retry tego samego id tez
+/// (torch.distributed master + serve), wiec idempotentny retry tego samego id tez
 /// musi je najpierw usunac, inaczej nowy serve dostanie `EADDRINUSE`. `rm -f`
 /// zwalnia porty (TCP_LISTEN→CLOSED). Best-effort.
 ///
-/// DLACZEGO remove-all (nie tylko biezacy id): `TORCH_DIST_PORT` (8001) jest STALY
-/// i wspoldzielony przez wszystkie distributed deploye, wiec fizycznie tylko JEDEN
-/// distributed deploy moze dzialac na nodzie naraz (dwa kolidowalyby na 8001). Kazdy
+/// DLACZEGO remove-all (nie tylko biezacy id): node ma jeden zestaw GPU, wiec
+/// fizycznie tylko JEDEN distributed deploy moze na nim dzialac naraz. Kazdy
 /// istniejacy kontener distributed MUSI wiec zostac usuniety przed nowym deployem.
 /// Usuniecie kontenera nalezacego do INNEGO deployment_cluster_id nie jest ciche —
 /// logujemy `warn!`, bo to zatrzymanie obcego, rownoleglego deploymentu (ktorego
@@ -261,7 +254,7 @@ async fn remove_all_distributed_containers(current_deployment_cluster_id: &str) 
             tracing::warn!(
                 removed_deployment = %other_id,
                 current = %current_deployment_cluster_id,
-                "preflight: removing container from a DIFFERENT distributed deployment — only one distributed deploy can run per node (shared torch.distributed port 8001)"
+                "preflight: removing container from a DIFFERENT distributed deployment — only one distributed deploy can run per node (single GPU set)"
             );
         }
         let _ = tokio::process::Command::new("docker")
@@ -295,13 +288,14 @@ pub async fn preflight_member(spec: &DistributedDeploySpec) -> Result<(), String
     // free-checks below — a leftover process is exactly what makes serve EADDRINUSE.
     remove_all_distributed_containers(&spec.deployment_cluster_id).await;
 
-    // torch.distributed master port + serve port must be free on every member —
-    // a leftover process on either silently breaks `vllm serve` (EADDRINUSE on the
-    // TCPStore master, no visible error in detached exec). `host_port_free` retries.
-    if !host_port_free(TORCH_DIST_PORT).await {
+    // torch.distributed master port (allocated `spec.dist_port`) + serve port must
+    // be free on every member — a leftover process on either silently breaks
+    // `vllm serve` (EADDRINUSE on the TCPStore master, no visible error in detached
+    // exec). `host_port_free` retries.
+    if !host_port_free(spec.dist_port).await {
         return Err(format!(
             "port {} zajety przed deployem (leftover proces torch.distributed)",
-            TORCH_DIST_PORT
+            spec.dist_port
         ));
     }
     if !host_port_free(spec.port).await {
@@ -710,6 +704,7 @@ mod tests {
             tp_size: 2,
             num_gpus: 1,
             port: 8100,
+            dist_port: 8101,
             gpu_memory_utilization: 0.9,
             max_model_len: 8192,
             ray_head_ip: "10.10.10.24".into(),
