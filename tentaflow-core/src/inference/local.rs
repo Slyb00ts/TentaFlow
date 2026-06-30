@@ -447,10 +447,18 @@ impl LocalInferenceHandler {
             // user-facing czas do pierwszego tokena.
             let engine_prefill_tps = token.prefill_tps;
             let engine_completion_tps = token.completion_tps;
+            let engine_ttft_ms = token.ttft_ms;
             let perf = usage.as_ref().map(|u| {
-                let ttft_ms = first_token_at
-                    .map(|t| t.duration_since(start).as_millis() as u32)
-                    .unwrap_or(0);
+                // TTFT z silnika (granica faz slotu) jest dokładniejszy niż zegar
+                // ścienny tego mostu, który łapie bufor kanału i kolejkę schedulera;
+                // wall-clock zostaje tylko gdy silnik nie zmierzył (np. MLX → 0).
+                let ttft_ms = if engine_ttft_ms > 0 {
+                    engine_ttft_ms
+                } else {
+                    first_token_at
+                        .map(|t| t.duration_since(start).as_millis() as u32)
+                        .unwrap_or(0)
+                };
                 let now = Instant::now();
                 let decode_secs = first_token_at
                     .map(|t| now.duration_since(t).as_secs_f32())
@@ -470,10 +478,14 @@ impl LocalInferenceHandler {
                 } else {
                     0.0
                 };
+                // total_ms: pełny czas od startu strumienia do tego (ostatniego
+                // przed usage) tokena. `now` zmierzony powyżej domyka okno.
+                let total_ms = now.duration_since(start).as_millis() as u32;
                 GenPerf {
                     ttft_ms,
                     prefill_tps,
                     decode_tps,
+                    total_ms,
                 }
             });
             let chunk = ChatCompletionChunk {

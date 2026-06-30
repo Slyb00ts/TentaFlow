@@ -48,11 +48,15 @@ fn sh_quote(s: &str) -> String {
     out
 }
 
-/// Komenda startowa silnika dla danej roli (idzie jako `ENGINE_LAUNCH_CMD`,
-/// odpalana przez `exec sh -c "$ENGINE_LAUNCH_CMD"`). KAZDA interpolowana wartosc
-/// pochodzaca od usera lub konfiguracji jest shell-quote'owana; argi `vllm_args`
-/// sa tokenizowane (shlex) i kwotowane po tokenie. Liczby (port/tp/util) pochodza
-/// z typowanych pol — bezpieczne.
+/// Komenda STARTU KONTENERA dla danej roli (idzie jako entrypoint `bash -c`).
+/// KAZDA interpolowana wartosc jest shell-quote'owana.
+///
+/// WAZNE (ordering): head startuje TYLKO GCS Ray, po czym `sleep infinity` trzyma
+/// kontener przy zyciu. `vllm serve` NIE jest tu w lancuchu `&&` — gdyby byl,
+/// ruszylby od razu i ZABLOKOWAL czekajac na N GPU w klastrze Ray, ale worker
+/// dolacza dopiero pozniej → vLLM timeoutuje i head pada. Zamiast tego koordynator
+/// odpala `vllm serve` przez `docker exec` DOPIERO gdy `ray status` pokaze pelny
+/// klaster (patrz `build_serve_command`). Worker = ray join + `--block`.
 fn build_launch_command(spec: &DistributedDeploySpec) -> Result<String, String> {
     let ray_addr = format!("{}:{}", spec.ray_head_ip, spec.ray_port);
     if spec.role == "worker" {
@@ -64,11 +68,23 @@ fn build_launch_command(spec: &DistributedDeploySpec) -> Result<String, String> 
         ));
     }
 
-    // Head: GCS Ray + `vllm serve` (TP=N, backend ray). vLLM BLOKUJE az klaster
-    // Ray ma N GPU (workery dolaczaja zaraz po), wiec sekwencja head-pierwszy
-    // jest bezpieczna.
+    // Head: tylko GCS Ray, potem `sleep infinity` (kontener zyje, `docker exec`
+    // pozniej odpali vllm serve gdy klaster bedzie kompletny).
+    Ok(format!(
+        "cd /root && ray start --head --node-ip-address={ip} --port={ray_port} --num-gpus={gpus} --disable-usage-stats && sleep infinity",
+        ip = sh_quote(&spec.ray_head_ip),
+        ray_port = spec.ray_port,
+        gpus = spec.num_gpus,
+    ))
+}
+
+/// Komenda `vllm serve` (TP=N, backend ray) odpalana NA HEADZIE przez
+/// `docker exec` DOPIERO gdy klaster Ray ma juz wszystkie GPU. Env (NCCL/RoCE,
+/// VLLM_HOST_IP, HF_HUB_CACHE/OFFLINE) dziedziczone z konfiguracji kontenera.
+/// Shell-quoting jak w `build_launch_command`. Tylko dla roli head.
+pub fn build_serve_command(spec: &DistributedDeploySpec) -> Result<String, String> {
     let mut serve = format!(
-        "vllm serve {model} \
+        "cd /root && vllm serve {model} \
          --tensor-parallel-size {tp} \
          --distributed-executor-backend ray \
          --host 0.0.0.0 \
@@ -86,20 +102,11 @@ fn build_launch_command(spec: &DistributedDeploySpec) -> Result<String, String> 
     if spec.engine_id == "vllm-spark" {
         serve.push_str(" --enforce-eager --no-enable-flashinfer-autotune");
     }
-    // Dodatkowe argi usera: tokenizujemy (shlex respektuje cudzyslowy usera) i
-    // kwotujemy KAZDY token osobno — argument z `;`/`$()`/spacja nie rozbije
-    // komendy.
     for tok in user_vllm_arg_tokens(spec)? {
         serve.push(' ');
         serve.push_str(&sh_quote(&tok));
     }
-    Ok(format!(
-        "cd /root && ray start --head --node-ip-address={ip} --port={ray_port} --num-gpus={gpus} --disable-usage-stats && {serve}",
-        ip = sh_quote(&spec.ray_head_ip),
-        ray_port = spec.ray_port,
-        gpus = spec.num_gpus,
-        serve = serve,
-    ))
+    Ok(serve)
 }
 
 /// Tokeny `vllm_args` z `config_json` usera (puste gdy brak). Niezbalansowane
@@ -278,9 +285,12 @@ pub async fn preflight_member(_spec: &DistributedDeploySpec) -> Result<(), Strin
 // Readiness (P1-1 / P2-1) — realny pomiar gotowosci head-a.
 // =============================================================================
 
-/// Stan gotowosci head-a distributed-deploymentu.
+/// Stan gotowosci czlonka distributed-deploymentu NA TYM nodzie.
 #[derive(Debug, Clone)]
 pub struct ReadinessStatus {
+    /// Kontener deploymentu na tym nodzie dziala (obraz zbudowany + kontener
+    /// wstal) — gate fazy BUILDU przed odliczaniem GCS/serve.
+    pub container_running: bool,
     /// GCS Ray nasluchuje (workery moga dolaczyc).
     pub ray_gcs_up: bool,
     /// Ilu nodow widzi klaster Ray (head + workery; weryfikacja dolaczenia).
@@ -290,18 +300,22 @@ pub struct ReadinessStatus {
     pub error: Option<String>,
 }
 
-/// Sonduje gotowosc head-a NA TYM nodzie: GCS Ray (TCP), czlonkostwo (`ray
-/// status` w kontenerze head-a) i endpoint OpenAI. Bezstanowa.
+/// Sonduje gotowosc czlonka NA TYM nodzie: czy kontener dziala (faza build),
+/// GCS Ray (TCP), czlonkostwo (`ray status` w kontenerze head-a) i endpoint
+/// OpenAI. Bezstanowa. GCS/serve maja sens tylko dla head-a; container_running
+/// dla kazdego noda.
 #[cfg(feature = "docker")]
 pub async fn probe_readiness(
     deployment_cluster_id: &str,
     ray_port: u16,
     serve_port: u16,
 ) -> ReadinessStatus {
+    let container_running = distributed_container_running(deployment_cluster_id).await;
     let ray_gcs_up = tcp_reachable("127.0.0.1", ray_port).await;
     let serve_ready = http_models_ok(serve_port).await;
     let ray_nodes = ray_active_node_count(deployment_cluster_id).await;
     ReadinessStatus {
+        container_running,
         ray_gcs_up,
         ray_nodes,
         serve_ready,
@@ -316,11 +330,97 @@ pub async fn probe_readiness(
     _serve_port: u16,
 ) -> ReadinessStatus {
     ReadinessStatus {
+        container_running: false,
         ray_gcs_up: false,
         ray_nodes: 0,
         serve_ready: false,
         error: Some("docker feature disabled".to_string()),
     }
+}
+
+/// Id kontenera HEAD-a (po etykiecie deploymentu + roli) NA TYM nodzie. None gdy
+/// brak (np. ten nod nie jest headem albo kontener nie wstal).
+#[cfg(feature = "docker")]
+async fn head_container_id(deployment_cluster_id: &str) -> Option<String> {
+    let out = tokio::process::Command::new("docker")
+        .args([
+            "ps",
+            "--filter",
+            &format!(
+                "label={}={}",
+                super::docker::DISTRIBUTED_LABEL,
+                deployment_cluster_id
+            ),
+            "--filter",
+            "label=tentaflow.distributed_role=head",
+            "-q",
+        ])
+        .output()
+        .await
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .map(String::from)
+}
+
+/// Odpala `vllm serve` NA HEADZIE przez `docker exec -d` (detached) DOPIERO gdy
+/// klaster Ray jest kompletny. Env dziedziczone z kontenera (NCCL/RoCE/HF). Blad
+/// gdy kontener head-a nie istnieje albo exec sie nie powiodl.
+#[cfg(feature = "docker")]
+pub async fn exec_serve_on_head(
+    deployment_cluster_id: &str,
+    serve_cmd: &str,
+) -> Result<(), String> {
+    let cid = head_container_id(deployment_cluster_id)
+        .await
+        .ok_or_else(|| "kontener head-a nie istnieje (vllm serve)".to_string())?;
+    let out = tokio::process::Command::new("docker")
+        .args(["exec", "-d", &cid, "bash", "-c", serve_cmd])
+        .output()
+        .await
+        .map_err(|e| format!("docker exec (vllm serve) nieudany: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "docker exec (vllm serve) blad: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(not(feature = "docker"))]
+pub async fn exec_serve_on_head(
+    _deployment_cluster_id: &str,
+    _serve_cmd: &str,
+) -> Result<(), String> {
+    Err("docker feature disabled".to_string())
+}
+
+/// Czy JAKIKOLWIEK kontener deploymentu (po etykiecie) dziala na tym nodzie.
+/// Dla head = kontener head-a, dla worker-noda = kontener workera. Gate buildu.
+#[cfg(feature = "docker")]
+async fn distributed_container_running(deployment_cluster_id: &str) -> bool {
+    let Ok(out) = tokio::process::Command::new("docker")
+        .args([
+            "ps",
+            "--filter",
+            &format!(
+                "label={}={}",
+                super::docker::DISTRIBUTED_LABEL,
+                deployment_cluster_id
+            ),
+            "--filter",
+            "status=running",
+            "-q",
+        ])
+        .output()
+        .await
+    else {
+        return false;
+    };
+    !String::from_utf8_lossy(&out.stdout).trim().is_empty()
 }
 
 #[cfg(feature = "docker")]
@@ -454,6 +554,12 @@ pub async fn stop_distributed(
                         .await;
                     match rm {
                         Ok(o) if o.status.success() => {}
+                        // Idempotent: a container already gone between `ps` and
+                        // `rm` (or removed by a prior teardown) is NOT a failure.
+                        Ok(o)
+                            if String::from_utf8_lossy(&o.stderr)
+                                .to_lowercase()
+                                .contains("no such container") => {}
                         Ok(o) => errors.push(format!(
                             "docker rm {} nieudany: {}",
                             id,
@@ -529,13 +635,23 @@ mod tests {
     }
 
     #[test]
-    fn head_command_has_ray_head_and_vllm_serve() {
+    fn head_launch_is_ray_head_only_then_sleep() {
+        // Head container command = ray head + sleep (NO vllm serve — that runs
+        // later via docker exec once the cluster is complete).
         let cmd = build_launch_command(&spec("head")).unwrap();
         assert!(cmd.contains("ray start --head --node-ip-address='10.10.10.24' --port=6379"));
-        assert!(cmd.contains("vllm serve 'LilaRest/gemma-4-31B-it-NVFP4-turbo'"));
+        assert!(cmd.trim_end().ends_with("sleep infinity"));
+        assert!(!cmd.contains("vllm serve"));
+    }
+
+    #[test]
+    fn head_serve_command_has_tp_and_ray_backend() {
+        let cmd = build_serve_command(&spec("head")).unwrap();
+        assert!(cmd.starts_with("cd /root && vllm serve 'LilaRest/gemma-4-31B-it-NVFP4-turbo'"));
         assert!(cmd.contains("--tensor-parallel-size 2"));
         assert!(cmd.contains("--distributed-executor-backend ray"));
         assert!(cmd.contains("--enforce-eager"));
+        assert!(!cmd.contains("ray start"));
     }
 
     #[test]
@@ -551,7 +667,7 @@ mod tests {
     fn shell_metachars_in_model_are_neutralized() {
         let mut s = spec("head");
         s.model = "evil'; rm -rf / #".into();
-        let cmd = build_launch_command(&s).unwrap();
+        let cmd = build_serve_command(&s).unwrap();
         // Single-quote escaping: the embedded quote becomes `'\''`, so the
         // dangerous payload cannot break out into a new shell token.
         assert!(cmd.contains("vllm serve 'evil'\\''; rm -rf / #'"));
@@ -562,7 +678,7 @@ mod tests {
     fn vllm_args_tokens_are_quoted() {
         let mut s = spec("head");
         s.config_json = r#"{"vllm_args":"--swap-space 8 --foo $(touch /pwned)"}"#.into();
-        let cmd = build_launch_command(&s).unwrap();
+        let cmd = build_serve_command(&s).unwrap();
         assert!(cmd.contains("'--swap-space'"));
         assert!(cmd.contains("'$(touch /pwned)'")); // quoted → inert
         assert!(!cmd.contains("&& touch"));
@@ -572,7 +688,7 @@ mod tests {
     fn unbalanced_vllm_args_rejected() {
         let mut s = spec("head");
         s.config_json = r#"{"vllm_args":"--foo 'unbalanced"}"#.into();
-        assert!(build_launch_command(&s).is_err());
+        assert!(build_serve_command(&s).is_err());
     }
 
     #[test]

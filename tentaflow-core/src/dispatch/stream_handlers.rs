@@ -49,6 +49,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                     ttft_ms: 0,
                     prefill_tps: 0.0,
                     decode_tps: 0.0,
+                    total_ms: 0,
                 })),
             );
             return;
@@ -143,6 +144,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                         ttft_ms: 0,
                         prefill_tps: 0.0,
                         decode_tps: 0.0,
+                        total_ms: 0,
                     })),
                 );
                 return;
@@ -266,6 +268,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                 ttft_ms: perf.ttft_ms,
                 prefill_tps: perf.prefill_tps,
                 decode_tps: perf.decode_tps,
+                total_ms: perf.total_ms,
             })),
         )
         .await;

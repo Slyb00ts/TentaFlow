@@ -19,6 +19,7 @@ use tempfile::TempDir;
 fn make_engine(id: &str, category: Category) -> Engine {
     Engine {
         id: id.to_string(),
+        backend: None,
         category,
         name: format!("Engine {id}"),
         description_pl: "opis".to_string(),

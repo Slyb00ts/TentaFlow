@@ -503,11 +503,15 @@ impl ModelRuntimeExecutor {
                     request.stream_options = Some(crate::api::openai::types::StreamOptions {
                         include_usage: true,
                     });
+                    // Zegar dispatchu sprzed wysłania HTTP — TTFT/total liczone od
+                    // realnego startu (wysłanie requestu + odbiór nagłówków), nie od
+                    // spawnu wrappera, który następuje już po `await`.
+                    let dispatch_at = std::time::Instant::now();
                     let stream = client
                         .chat_completion_stream(request)
                         .await
                         .map_err(|e| ExecutorError::Internal(e.to_string()))?;
-                    Ok(Box::pin(ExternalPerfStream::new(stream)))
+                    Ok(Box::pin(ExternalPerfStream::new(stream, dispatch_at)))
                 }
                 BackendHandle::Quic(handle) => {
                     let quic_client = handle.get_client().await.ok_or_else(|| {
@@ -542,6 +546,9 @@ impl ModelRuntimeExecutor {
                         metadata: None,
                         session_id: None,
                     };
+                    // Zegar dispatchu sprzed wysłania QUIC — TTFT/total od realnego
+                    // startu requestu, nie od spawnu wrappera po `await`.
+                    let dispatch_at = std::time::Instant::now();
                     let quic_stream = quic_client
                         .send_request_stream(model_request)
                         .await
@@ -689,7 +696,7 @@ impl ModelRuntimeExecutor {
                             }
                         }
                     });
-                    Ok(Box::pin(ExternalPerfStream::new(Box::pin(stream))))
+                    Ok(Box::pin(ExternalPerfStream::new(Box::pin(stream), dispatch_at)))
                 }
             },
             ResolvedExecutionTarget::MeshForward {
@@ -3621,80 +3628,164 @@ pub(crate) fn flow_outcome_to_stt_response(
 /// stream'a) lub brak `final_metrics` zwraca `None` — chunk wtedy bez `usage`,
 /// klient z `include_usage=true` widzi brak (warn'em wpisany w
 /// `apply_include_usage_split`).
-/// Wall-clockowy pomiar perf dla strumieni z ZEWNĘTRZNYCH serwisów (Docker
-/// vLLM/sglang, natywny python-bundle przez HTTP, QUIC sidecar). Silniki
-/// embedded raportują perf zmierzony wewnątrz silnika; serwis zewnętrzny nie
-/// ujawnia swojego wewnętrznego czasu prefill, więc jedynym uczciwym sygnałem
-/// jest zegar ścienny w naszym proxy: czas od dispatchu, moment pierwszego
-/// chunku z treścią i liczba tokenów z finalnego usage. Perf doklejany jest do
-/// FINALNEGO chunku (tego, który niesie usage), żeby przeszedł istniejącą
-/// ścieżką (LlmStreamChunk.perf → FlowExecutionOutcome.perf → ChatStreamEnd).
+/// Pomiar perf dla strumieni z ZEWNĘTRZNYCH serwisów (Docker vLLM/sglang,
+/// natywny python-bundle przez HTTP, QUIC sidecar). Silniki embedded raportują
+/// perf zmierzony wewnątrz silnika; serwis zewnętrzny nie ujawnia swojego
+/// wewnętrznego czasu prefill, więc liczymy UCZCIWE wartości obserwowane po
+/// stronie klienta:
+///   - TTFT = zegar ścienny od dispatchu do PIERWSZEGO tokena z treścią. Dla
+///     zdalnego serwisu to realna latencja (zawiera sieć + kolejkę serwera) — nie
+///     zmyślamy wewnętrznego czasu prefill.
+///   - decode tok/s = REALNE `completion_tokens` (z usage) / okno pierwszy→ostatni
+///     token treści.
+///   - prefill tok/s = REALNE `prompt_tokens` (z usage) / TTFT — uczciwe
+///     przybliżenie przepustowości prefill: tokeny promptu przetworzone w oknie do
+///     pierwszego tokena.
+/// Gdy backend NIE zwraca realnych liczników w usage, NIE fabrykujemy ich z
+/// długości tekstu — pomijamy tok/s (0.0 → UI pokazuje brak zamiast bzdury).
+/// Perf doklejany jest do FINALNEGO chunku (tego, który niesie usage), żeby
+/// przeszedł istniejącą ścieżką (LlmStreamChunk.perf → FlowExecutionOutcome.perf
+/// → ChatStreamEnd).
 struct ExternalPerfStream {
-    inner: ExecutorChunkStream,
-    start: std::time::Instant,
-    first_token_at: Option<std::time::Instant>,
-    content_chunks: u32,
+    rx: tokio::sync::mpsc::Receiver<CoreResult<ChatCompletionChunk>>,
 }
 
 impl ExternalPerfStream {
-    fn new(inner: ExecutorChunkStream) -> Self {
-        Self {
-            inner,
-            start: std::time::Instant::now(),
-            first_token_at: None,
-            content_chunks: 0,
-        }
+    /// `start` to znacznik DISPATCHU (sprzed wysłania requestu HTTP/QUIC), nie
+    /// moment spawnu tego wrappera — inaczej TTFT/total gubiłyby czas wysłania
+    /// nagłówków i odbioru odpowiedzi serwera. Klient mierzy realną latencję.
+    fn new(mut inner: ExecutorChunkStream, start: std::time::Instant) -> Self {
+        // Bounded (wysoki cap): normalne odpowiedzi mieszczą się bez tarcia, a
+        // patologiczny zawieszony konsument dostaje backpressure zamiast OOM przy
+        // długiej generacji. Eager-drain dalej stempluje czasy przy przybyciu.
+        let (tx, rx) = tokio::sync::mpsc::channel(8192);
+        // Eager drain: czytamy SSE z serwisu tak szybko jak przychodzi i
+        // stemplujemy czasy TU (przybycie z vLLM), a nie przy poll konsumenta.
+        // Bez tego leniwy strumień + backpressure TCP od przeglądarki rozciąga
+        // okno dekodowania do tempa konsumpcji i decode tok/s spada ~4x poniżej
+        // realnego tempa silnika. Timestampy domknięte w tasku drenującym są
+        // niezależne od konsumenta, więc decode_tps odzwierciedla tempo generacji.
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut first_token_at: Option<std::time::Instant> = None;
+            let mut last_token_at: Option<std::time::Instant> = None;
+            loop {
+                tokio::select! {
+                    // Anti-hang: gdy konsument porzuci `rx`, kończymy nawet jeśli
+                    // upstream (vLLM) stalluje — zwalniamy strumień HTTP/QUIC, nie
+                    // wisimy w nieskończoność na `inner.next()`.
+                    _ = tx.closed() => break,
+                    item = inner.next() => {
+                        match item {
+                            Some(Ok(mut chunk)) => {
+                                // Reasoning tokens ARE decode work (GPU/energy), so
+                                // reasoning models (ds4, deepseek) that stream
+                                // `reasoning_content` before any visible `content` must
+                                // still mark TTFT / count as output — otherwise
+                                // first_token_at never fires and decode_tps degenerates
+                                // to 0 for an entire chain-of-thought.
+                                let has_content = chunk.choices.iter().any(|c| {
+                                    c.delta.content.as_deref().is_some_and(|s| !s.is_empty())
+                                        || c.delta
+                                            .reasoning_content
+                                            .as_deref()
+                                            .is_some_and(|s| !s.is_empty())
+                                });
+                                if has_content {
+                                    let now = std::time::Instant::now();
+                                    if first_token_at.is_none() {
+                                        first_token_at = Some(now);
+                                    }
+                                    // Okno dekodowania domykamy na OSTATNIM tokenie treści,
+                                    // nie na chunku usage (który dla vLLM/sglang przychodzi
+                                    // za treścią).
+                                    last_token_at = Some(now);
+                                }
+                                // Finalny chunk to ten, który niesie usage (vLLM/sglang
+                                // usage-tail albo QUIC Done z final_metrics) — wtedy
+                                // doklejamy perf.
+                                if chunk.usage.is_some() && chunk.perf.is_none() {
+                                    chunk.perf = Some(build_external_perf(
+                                        start,
+                                        first_token_at,
+                                        last_token_at,
+                                        chunk.usage.as_ref(),
+                                    ));
+                                }
+                                if tx.send(Ok(chunk)).await.is_err() {
+                                    // Konsument odpadł → kończymy drenowanie (anti-hang).
+                                    break;
+                                }
+                            }
+                            Some(Err(e)) => {
+                                let _ = tx.send(Err(e)).await;
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+        });
+        Self { rx }
     }
+}
 
-    /// Buduje GenPerf z zegara ściennego. `prefill_tps` to ESTYMATA: nie znamy
-    /// wewnętrznego czasu prefill serwisu zewnętrznego, więc od TTFT odejmujemy
-    /// jeden krok dekodowania (`1/decode_tps`) jako przybliżenie czasu samego
-    /// prefill. Gdy się nie da — coarse fallback `prompt_tokens / ttft_secs`.
-    fn build_perf(
-        &self,
-        end: std::time::Instant,
-        usage: Option<&crate::api::openai::types::Usage>,
-    ) -> crate::api::openai::types::GenPerf {
-        let first_token_at = self.first_token_at.unwrap_or(end);
-        let ttft_secs = first_token_at.duration_since(self.start).as_secs_f32();
-        let ttft_ms = (ttft_secs * 1000.0).round() as u32;
+/// Buduje GenPerf z realnych liczników usage + zegara ściennego klienta.
+/// Każda metryka jest albo realna/uczciwie przybliżona, albo pominięta (0.0)
+/// gdy brak danych — żadnych fabrykowanych estymat. Timestampy są stemplowane
+/// w tasku drenującym (przybycie chunku z serwisu), więc decode tok/s mierzy
+/// tempo generacji vLLM, nie tempo konsumpcji przeglądarki.
+fn build_external_perf(
+    start: std::time::Instant,
+    first_token_at: Option<std::time::Instant>,
+    last_token_at: Option<std::time::Instant>,
+    usage: Option<&crate::api::openai::types::Usage>,
+) -> crate::api::openai::types::GenPerf {
+    // TTFT: czas od dispatchu do pierwszego tokena treści. Realna,
+    // klient-obserwowana latencja (sieć + kolejka + prefill serwera).
+    let ttft_ms = first_token_at
+        .map(|t| t.duration_since(start).as_millis() as u32)
+        .unwrap_or(0);
 
-        let prompt_tokens = usage.map(|u| u.prompt_tokens).unwrap_or(0);
-        let completion_tokens = usage
-            .map(|u| u.completion_tokens)
-            .filter(|&c| c > 0)
-            .unwrap_or(self.content_chunks);
+    // Tylko REALNE liczniki z usage. Brak usage → 0 (pomijamy tok/s), nie
+    // zgadujemy z liczby chunków/długości tekstu.
+    let prompt_tokens = usage.map(|u| u.prompt_tokens).unwrap_or(0);
+    let completion_tokens = usage.map(|u| u.completion_tokens).unwrap_or(0);
 
-        let decode_secs = end.duration_since(first_token_at).as_secs_f32();
-        let decode_tps = if completion_tokens > 1 && decode_secs > 0.0 {
-            (completion_tokens - 1) as f32 / decode_secs
-        } else {
-            0.0
-        };
-
-        let prefill_tps = if prompt_tokens == 0 {
-            0.0
-        } else if decode_tps > 0.0 {
-            let one_decode_step = 1.0 / decode_tps;
-            let prefill_secs = ttft_secs - one_decode_step;
-            if prefill_secs > 0.0 {
-                prompt_tokens as f32 / prefill_secs
-            } else if ttft_secs > 0.0 {
-                prompt_tokens as f32 / ttft_secs
+    // decode tok/s = (completion_tokens-1) / okno (pierwszy→ostatni token).
+    // Dla N tokenów jest N-1 interwałów między pierwszym a ostatnim, zgodnie z
+    // kontraktem GenPerf i local.rs (przy 1 tokenie decode_tps=0 — brak okna).
+    let decode_tps = match (first_token_at, last_token_at) {
+        (Some(first), Some(last)) if completion_tokens > 0 => {
+            let secs = last.duration_since(first).as_secs_f32();
+            if secs > 0.0 {
+                completion_tokens.saturating_sub(1) as f32 / secs
             } else {
                 0.0
             }
-        } else if ttft_secs > 0.0 {
-            prompt_tokens as f32 / ttft_secs
-        } else {
-            0.0
-        };
-
-        crate::api::openai::types::GenPerf {
-            ttft_ms,
-            prefill_tps,
-            decode_tps,
         }
+        _ => 0.0,
+    };
+
+    // prefill tok/s = realne prompt_tokens / TTFT (uczciwe przybliżenie).
+    let ttft_secs = (ttft_ms as f32) / 1000.0;
+    let prefill_tps = if prompt_tokens > 0 && ttft_secs > 0.0 {
+        prompt_tokens as f32 / ttft_secs
+    } else {
+        0.0
+    };
+
+    // total_ms: pełny czas od dispatchu do ostatniego tokena treści.
+    let total_ms = last_token_at
+        .map(|t| t.duration_since(start).as_millis() as u32)
+        .unwrap_or(0);
+
+    crate::api::openai::types::GenPerf {
+        ttft_ms,
+        prefill_tps,
+        decode_tps,
+        total_ms,
     }
 }
 
@@ -3705,37 +3796,7 @@ impl Stream for ExternalPerfStream {
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        use std::task::Poll;
-        match self.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(mut chunk))) => {
-                // Reasoning tokens ARE decode work (GPU/energy), so reasoning
-                // models (ds4, deepseek) that stream `reasoning_content` before
-                // any visible `content` must still mark TTFT / count as output —
-                // otherwise first_token_at never fires and decode_tps degenerates
-                // to 0 for an entire chain-of-thought.
-                let has_content = chunk.choices.iter().any(|c| {
-                    c.delta.content.as_deref().is_some_and(|s| !s.is_empty())
-                        || c.delta
-                            .reasoning_content
-                            .as_deref()
-                            .is_some_and(|s| !s.is_empty())
-                });
-                if has_content {
-                    if self.first_token_at.is_none() {
-                        self.first_token_at = Some(std::time::Instant::now());
-                    }
-                    self.content_chunks = self.content_chunks.saturating_add(1);
-                }
-                // Finalny chunk to ten, który niesie usage (vLLM/sglang usage-tail
-                // albo QUIC Done z final_metrics) — wtedy doklejamy perf.
-                if chunk.usage.is_some() && chunk.perf.is_none() {
-                    let perf = self.build_perf(std::time::Instant::now(), chunk.usage.as_ref());
-                    chunk.perf = Some(perf);
-                }
-                Poll::Ready(Some(Ok(chunk)))
-            }
-            other => other,
-        }
+        self.rx.poll_recv(cx)
     }
 }
 
@@ -3879,6 +3940,100 @@ mod tests {
         // Kolejny aliasowy fallback inkrementuje dalej (do 2).
         note_fallback(alias, true, 3, "http");
         assert_eq!(alias_fallback_count(alias), 2);
+    }
+
+    /// Test regresyjny odsprzęgania pomiaru decode tok/s od tempa konsumpcji.
+    /// `ExternalPerfStream` stempluje first/last token w momencie PRZYBYCIA chunku
+    /// z serwisu (eager-drain task), więc decode_tps odzwierciedla tempo generacji
+    /// silnika, NIE tempo z jakim leniwy konsument (przeglądarka renderująca
+    /// markdown) odczytuje strumień. Symulujemy serwis emitujący ~200 tok/s i
+    /// konsumenta odczytującego ~40 tok/s — decode_tps MUSI być bliskie tempu
+    /// emisji. Gdyby okno dekodowania szło w tempie poll konsumenta (stary, zły
+    /// kod), decode_tps wyszłoby ~40. Multi-thread runtime jest KLUCZOWY: bez
+    /// równoległości eager-drain task nie biegłby naprawdę obok wolnego konsumenta.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn external_perf_decouples_decode_tps_from_slow_consumer() {
+        use crate::api::openai::types::{ChunkChoice, Delta, Usage};
+        use futures::StreamExt;
+        use std::time::{Duration, Instant};
+
+        fn content_chunk(text: &str) -> ChatCompletionChunk {
+            ChatCompletionChunk {
+                id: "test".into(),
+                object: "chat.completion.chunk".into(),
+                created: 0,
+                model: "test-model".into(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: Delta {
+                        role: None,
+                        content: Some(text.into()),
+                        reasoning_content: None,
+                        tool_calls: None,
+                    },
+                    finish_reason: None,
+                    logprobs: None,
+                }],
+                system_fingerprint: None,
+                audio: None,
+                detected_intent: None,
+                detected_tools: None,
+                transcribed_text: None,
+                speaker_id: None,
+                speaker_name: None,
+                usage: None,
+                perf: None,
+            }
+        }
+
+        // Serwis emituje 100 chunków treści po ~5ms (≈200 tok/s), potem chunk
+        // usage (bez treści, completion_tokens=100), na końcu bez perf.
+        let inner = async_stream::stream! {
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                yield Ok(content_chunk("x"));
+            }
+            let mut tail = content_chunk("");
+            tail.choices[0].delta.content = None;
+            tail.usage = Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 100,
+                total_tokens: 110,
+            });
+            yield Ok(tail);
+        };
+        let inner: ExecutorChunkStream = Box::pin(inner);
+
+        let mut stream = ExternalPerfStream::new(inner, Instant::now());
+
+        // Wolny konsument: 25ms na token (≈40 tok/s) — gdyby pomiar szedł w jego
+        // tempie, decode_tps spadłoby ~5x poniżej realnego tempa silnika.
+        let mut captured_perf = None;
+        while let Some(item) = stream.next().await {
+            let chunk = item.expect("chunk powinien być Ok");
+            if chunk.perf.is_some() {
+                captured_perf = chunk.perf;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let perf = captured_perf.expect("finalny chunk z usage musi nieść perf");
+        eprintln!(
+            "external_perf: decode_tps={:.1} ttft_ms={} total_ms={}",
+            perf.decode_tps, perf.ttft_ms, perf.total_ms
+        );
+
+        // decode_tps odzwierciedla tempo emisji (~200/s), nie konsumpcji (~40/s).
+        // Próg 120 z zapasem na jitter timerów; gdyby okno szło w tempie
+        // konsumenta, wyszłoby ~40 i asercja by padła.
+        assert!(
+            perf.decode_tps > 120.0,
+            "decode_tps={} powinno odzwierciedlac tempo emisji ~200/s, nie konsumpcji ~40/s",
+            perf.decode_tps
+        );
+        // Sanity: pełne okno i TTFT są dodatnie.
+        assert!(perf.total_ms > 0, "total_ms powinno być dodatnie");
+        assert!(perf.ttft_ms > 0, "ttft_ms powinno być dodatnie");
     }
 
     // R3b.1: `dispatch_embeddings_blocking` per-target tests. Branches without

@@ -620,6 +620,26 @@ mod backend {
             .map_err(|e| DeployError::Docker(format!("ping: {}", e)))
     }
 
+    /// Picks the FIRST locally-present base image tag from `candidates`. Used by
+    /// the distributed vllm-spark thin-image build: the cienki obraz FROMs the
+    /// already-built from-source base. Returns a clear error when NONE exist — we
+    /// must never silently trigger a 20-40 min from-source rebuild.
+    pub(super) async fn resolve_existing_base_image(
+        docker: &Docker,
+        candidates: &[String],
+    ) -> DeployResult<String> {
+        for tag in candidates {
+            if image_exists(docker, tag).await? {
+                return Ok(tag.clone());
+            }
+        }
+        Err(DeployError::Docker(format!(
+            "bazowy obraz vLLM-Spark nie istnieje na tym nodzie (szukano: {}). \
+             Zbuduj go najpierw (deploy single-node vllm-spark), zanim uruchomisz deploy rozproszony.",
+            candidates.join(", ")
+        )))
+    }
+
     /// Returns true when a tagged image is already present locally.
     pub(super) async fn image_exists(docker: &Docker, tag: &str) -> DeployResult<bool> {
         match docker.inspect_image(tag).await {
@@ -831,6 +851,13 @@ mod backend {
     pub(super) struct DistributedDockerOpts {
         pub shm_size_bytes: i64,
         pub working_dir: String,
+        /// Pelna komenda powloki (`cd /root && ray start ... && vllm serve ...`).
+        /// NADPISUJE entrypoint obrazu (`bash -c <cmd>`) zamiast polegac na tym, ze
+        /// bazowy entrypoint.sh uszanuje `ENGINE_LAUNCH_CMD` — baza na nodzie moze
+        /// byc STARSZA (bez tej obslugi) i wtedy odpalala domyslny single-node
+        /// `vllm serve` (TP=1), gubiac komende ray+TP. Override jest niezalezny od
+        /// wersji bazy.
+        pub entrypoint_cmd: String,
     }
 
     /// Creates and starts a container. Returns container id.
@@ -934,13 +961,31 @@ mod backend {
             }]);
             host_config.shm_size = Some(opts.shm_size_bytes);
         }
+        // Distributed: BYPASS the base entrypoint — run the ray+vllm command
+        // directly as `bash -c <cmd>`. `cmd`/`engine_args` are ignored (the full
+        // command, incl. TP size + ray, is baked into `entrypoint_cmd`).
+        let (entrypoint, final_cmd) = match &distributed {
+            Some(o) => (
+                Some(vec![
+                    "bash".to_string(),
+                    "-c".to_string(),
+                    o.entrypoint_cmd.clone(),
+                ]),
+                None,
+            ),
+            None => (
+                None,
+                if cmd.is_empty() {
+                    None
+                } else {
+                    Some(cmd.to_vec())
+                },
+            ),
+        };
         let body = ContainerCreateBody {
             image: Some(image.into()),
-            cmd: if cmd.is_empty() {
-                None
-            } else {
-                Some(cmd.to_vec())
-            },
+            entrypoint,
+            cmd: final_cmd,
             env: if env_vec.is_empty() {
                 None
             } else {
@@ -1028,6 +1073,11 @@ impl DeployStrategy for DockerDeploy {
 
         let docker = backend::connect().await?;
         backend::ping(&docker).await?;
+
+        // Distributed (multi-node TP) — wiedza potrzebna juz przy wyborze obrazu:
+        // distributed vllm-spark idzie na CIENKI obraz (ray/rdma na gotowej bazie
+        // from-source), zeby nie odpalac 20-40 min rebuildu przy kazdym deployu.
+        let distributed = parse_distributed(&self.user_config);
 
         // Walidacja: podkatalog silnika musi istniec (czytelny blad gdy context_path zly).
         let context_dir = crate::paths::containers_root().join(context_path);
@@ -1155,6 +1205,38 @@ impl DeployStrategy for DockerDeploy {
             Some(build_args)
         };
 
+        // Distributed vllm-spark: zamiast 20-40 min rebuildu vLLM ZE ZRODEL na
+        // kazdym deployu, budujemy CIENKA warstwe (ray + rdma-core) na JUZ
+        // ZBUDOWANEJ bazie from-source `tentaflow/vllm-spark:<ver>`. Cienki obraz
+        // `tentaflow/vllm-spark-ray:<ver>` powstaje w ~1-2 min (potem z cache).
+        // Baza MUSI istniec na nodzie — jej brak to czytelny blad (NIE cichy
+        // rebuild from-source). Inne silniki (np. `vllm` z PyPI) maja ray we
+        // wlasnym, szybkim Dockerfile i ida normalna sciezka.
+        let (image_tag, dockerfile_rel, build_args) =
+            if distributed.is_some() && self.manifest.engine.id == "vllm-spark" {
+                let base = backend::resolve_existing_base_image(
+                    &docker,
+                    &[
+                        // Tag z normalnego deployu bazy (ten sam co `image_tag` tutaj),
+                        image_tag.clone(),
+                        // Plaski tag (manualnie zbudowana baza / spike).
+                        format!("tentaflow/vllm-spark:{}", self.manifest.engine.version),
+                    ],
+                )
+                .await?;
+                let thin_tag =
+                    format!("tentaflow/vllm-spark-ray:{}", self.manifest.engine.version);
+                let mut ba: HashMap<String, String> = HashMap::new();
+                ba.insert("BASE_IMAGE".to_string(), base);
+                (
+                    thin_tag,
+                    "tentaflow-containers/llm/docker/vllm-spark-ray/Dockerfile".to_string(),
+                    Some(ba),
+                )
+            } else {
+                (image_tag, dockerfile_rel, build_args)
+            };
+
         // Build only when missing — repeated deploys reuse the cached image.
         if !backend::image_exists(&docker, &image_tag).await? {
             if let Some(s) = &self.log_sink {
@@ -1182,7 +1264,7 @@ impl DeployStrategy for DockerDeploy {
         // runs the OpenAI endpoint on `spec.port`; worker is headless (Embedded
         // transport, no model rows, no HTTP probe) — `port` is reused only to name
         // the container deterministically (different node, no collision).
-        let distributed = parse_distributed(&self.user_config);
+        // `distributed` rozpoznane wczesniej (przy wyborze obrazu).
         let is_worker = distributed
             .as_ref()
             .map(|d| d.role == "worker")
@@ -1497,10 +1579,31 @@ impl DeployStrategy for DockerDeploy {
         }
 
         // Recipe shm-size: 16 GiB (default 64 MB → NCCL "No space left on device").
-        let distributed_opts = distributed.as_ref().map(|_| backend::DistributedDockerOpts {
-            shm_size_bytes: 16 * 1024 * 1024 * 1024,
-            working_dir: "/root".to_string(),
-        });
+        // The ray+vllm command (set as `launch_command_override` by the distributed
+        // config builder) becomes the container ENTRYPOINT — independent of the
+        // base image's entrypoint version.
+        let distributed_opts = match &distributed {
+            Some(_) => {
+                let cmd = self
+                    .user_config
+                    .get("launch_command_override")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        DeployError::Manifest(
+                            "distributed deploy bez launch_command_override (komenda ray+vllm)"
+                                .to_string(),
+                        )
+                    })?;
+                Some(backend::DistributedDockerOpts {
+                    shm_size_bytes: 16 * 1024 * 1024 * 1024,
+                    working_dir: "/root".to_string(),
+                    entrypoint_cmd: cmd.to_string(),
+                })
+            }
+            None => None,
+        };
         let id = backend::run(
             &docker,
             &image_tag,
@@ -1804,6 +1907,7 @@ mod tests {
         ServiceManifest {
             engine: Engine {
                 id: id.into(),
+                backend: None,
                 category: Category::Llm,
                 name: id.into(),
                 description_pl: "".into(),

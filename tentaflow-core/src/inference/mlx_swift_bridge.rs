@@ -263,6 +263,8 @@ extern "C" fn rust_token_callback(
         error: None,
         prefill_tps,
         completion_tps,
+        // MLX nie eksponuje granicy faz dla TTFT — konsument liczy wall-clock.
+        ttft_ms: 0,
     });
 }
 
@@ -538,6 +540,7 @@ impl InferenceEngine for MlxSwiftEngine {
                     completion_tokens: 0,
                     prefill_tps: 0.0,
                     completion_tps: 0.0,
+                    ttft_ms: 0,
                 });
             }
 

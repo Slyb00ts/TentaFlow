@@ -547,6 +547,14 @@ pub enum MeshCommandType {
         /// Oczekiwana liczba nodow Ray (= liczba czlonkow klastra).
         expected_nodes: u32,
     },
+    /// Odpala `vllm serve` NA HEADZIE (przez `docker exec` w kontenerze head-a)
+    /// DOPIERO gdy klaster Ray jest kompletny (wszystkie GPU dolaczyly). Rozdziela
+    /// start GCS Ray od `vllm serve`, zeby vLLM nie czekal na nieobecne jeszcze
+    /// GPU i nie timeoutowal. Odpowiedz: Empty. Appended at END.
+    DistributedStartServe {
+        deployment_cluster_id: String,
+        serve_cmd: String,
+    },
 }
 
 /// Per-node spec distributed-deployu policzony przez koordynatora z
@@ -753,6 +761,9 @@ pub enum MeshCommandResponsePayload {
     },
     /// Wynik `DistributedReadiness` — realny stan gotowosci head-a. Appended at END.
     DistributedReadinessResult {
+        /// Czy kontener deploymentu NA TYM nodzie dziala (obraz zbudowany +
+        /// kontener wstal) — gate fazy buildu PRZED odliczaniem GCS/serve.
+        container_running: bool,
         ray_gcs_up: bool,
         ray_nodes: u32,
         serve_ready: bool,
@@ -976,6 +987,13 @@ impl std::fmt::Debug for MeshCommandType {
                 .field("ray_port", ray_port)
                 .field("serve_port", serve_port)
                 .field("expected_nodes", expected_nodes)
+                .finish(),
+            Self::DistributedStartServe {
+                deployment_cluster_id,
+                serve_cmd: _,
+            } => f
+                .debug_struct("DistributedStartServe")
+                .field("deployment_cluster_id", deployment_cluster_id)
                 .finish(),
         }
     }

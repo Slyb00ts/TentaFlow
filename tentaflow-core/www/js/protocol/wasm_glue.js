@@ -1985,9 +1985,10 @@ export function encodeClusterDeleteRequest(cluster_id) {
  * @param {string | null} [config_json]
  * @param {number | null} [gcs_timeout_secs]
  * @param {number | null} [ready_timeout_secs]
+ * @param {number | null} [build_timeout_secs]
  * @returns {Uint8Array}
  */
-export function encodeClusterDeployRequest(cluster_id, engine_id, model_repo, model_preset_id, served_model_name, gpu_memory_utilization, max_model_len, port, gpus_per_node, config_json, gcs_timeout_secs, ready_timeout_secs) {
+export function encodeClusterDeployRequest(cluster_id, engine_id, model_repo, model_preset_id, served_model_name, gpu_memory_utilization, max_model_len, port, gpus_per_node, config_json, gcs_timeout_secs, ready_timeout_secs, build_timeout_secs) {
     const ptr0 = passStringToWasm0(cluster_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(engine_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -2000,7 +2001,7 @@ export function encodeClusterDeployRequest(cluster_id, engine_id, model_repo, mo
     var len4 = WASM_VECTOR_LEN;
     var ptr5 = isLikeNone(config_json) ? 0 : passStringToWasm0(config_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len5 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeClusterDeployRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, isLikeNone(gpu_memory_utilization) ? Number.MAX_SAFE_INTEGER : Math.fround(gpu_memory_utilization), isLikeNone(max_model_len) ? Number.MAX_SAFE_INTEGER : (max_model_len) >>> 0, isLikeNone(port) ? 0xFFFFFF : port, isLikeNone(gpus_per_node) ? Number.MAX_SAFE_INTEGER : (gpus_per_node) >>> 0, ptr5, len5, isLikeNone(gcs_timeout_secs) ? Number.MAX_SAFE_INTEGER : (gcs_timeout_secs) >>> 0, isLikeNone(ready_timeout_secs) ? Number.MAX_SAFE_INTEGER : (ready_timeout_secs) >>> 0);
+    const ret = wasm.encodeClusterDeployRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, isLikeNone(gpu_memory_utilization) ? Number.MAX_SAFE_INTEGER : Math.fround(gpu_memory_utilization), isLikeNone(max_model_len) ? Number.MAX_SAFE_INTEGER : (max_model_len) >>> 0, isLikeNone(port) ? 0xFFFFFF : port, isLikeNone(gpus_per_node) ? Number.MAX_SAFE_INTEGER : (gpus_per_node) >>> 0, ptr5, len5, isLikeNone(gcs_timeout_secs) ? Number.MAX_SAFE_INTEGER : (gcs_timeout_secs) >>> 0, isLikeNone(ready_timeout_secs) ? Number.MAX_SAFE_INTEGER : (ready_timeout_secs) >>> 0, isLikeNone(build_timeout_secs) ? Number.MAX_SAFE_INTEGER : (build_timeout_secs) >>> 0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }

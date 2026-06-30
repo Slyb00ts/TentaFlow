@@ -3209,6 +3209,7 @@
     "perf_decode": "tok/s",
     "perf_ttft": "TTFT",
     "perf_prefill": "prefill",
+    "perf_total": "total",
     "copied": "Copied",
     "copy_failed": "Copy failed",
     "coming_soon": "Coming soon",

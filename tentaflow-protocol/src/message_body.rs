@@ -689,6 +689,8 @@ pub struct ChatStreamEnd {
     pub prefill_tps: f32,
     #[serde(default)]
     pub decode_tps: f32,
+    #[serde(default)]
+    pub total_ms: u32,
 }
 
 // =============================================================================
@@ -3911,6 +3913,11 @@ pub struct ClusterDeployRequest {
     /// verbatim into each member's deploy.
     #[serde(default)]
     pub config_json: Option<String>,
+    /// Bounded wait for the member CONTAINER to come up (image build + container
+    /// start) BEFORE the Ray-GCS/serve clocks start — a slow first image build
+    /// extends THIS phase, not the GCS phase (default 600 s).
+    #[serde(default)]
+    pub build_timeout_secs: Option<u32>,
     /// Bounded wait for the head Ray GCS to come up before joining workers
     /// (default 60 s).
     #[serde(default)]
@@ -7422,6 +7429,7 @@ mod tests {
             ttft_ms: 50,
             prefill_tps: 120.0,
             decode_tps: 45.5,
+            total_ms: 1670,
         });
         assert_eq!(round_trip(end.clone()), end);
     }

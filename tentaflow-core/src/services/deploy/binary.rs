@@ -373,6 +373,7 @@ mod tests {
         ServiceManifest {
             engine: Engine {
                 id: id.into(),
+                backend: None,
                 category: Category::Llm,
                 name: id.into(),
                 description_pl: "".into(),

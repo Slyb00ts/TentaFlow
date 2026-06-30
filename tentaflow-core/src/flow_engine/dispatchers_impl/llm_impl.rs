@@ -676,6 +676,7 @@ fn chat_chunk_to_llm_chunk(chunk: ChatCompletionChunk) -> LlmStreamChunk {
             ttft_ms: p.ttft_ms,
             prefill_tps: p.prefill_tps,
             decode_tps: p.decode_tps,
+            total_ms: p.total_ms,
         }),
         finish_reason,
         error: None,

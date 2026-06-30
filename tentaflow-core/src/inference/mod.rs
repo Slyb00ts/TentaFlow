@@ -185,6 +185,10 @@ pub struct StreamToken {
     /// generacji). 0.0 = silnik nie podał pomiaru (konsument wraca do wall-clock).
     pub prefill_tps: f32,
     pub completion_tps: f32,
+    /// Czas do pierwszego tokena (ms) zmierzony WEWNĄTRZ silnika po granicach faz
+    /// slotu, nie zegarem ściennym konsumenta. Ustawiany wyłącznie na tokenie
+    /// finalnym; 0 = silnik nie podał pomiaru (konsument wraca do wall-clock).
+    pub ttft_ms: u32,
 }
 
 /// Parametry embeddingów

@@ -619,6 +619,9 @@ pub fn encode_cluster_deploy_request(
     config_json: Option<String>,
     gcs_timeout_secs: Option<u32>,
     ready_timeout_secs: Option<u32>,
+    // Appended last so existing positional JS calls stay valid (undefined → None
+    // → backend default 600 s build budget).
+    build_timeout_secs: Option<u32>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ClusterDeployRequestBody(ClusterDeployRequest {
         cluster_id,
@@ -631,6 +634,7 @@ pub fn encode_cluster_deploy_request(
         port,
         gpus_per_node,
         config_json,
+        build_timeout_secs,
         gcs_timeout_secs,
         ready_timeout_secs,
     }))
@@ -4510,6 +4514,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "prefill_tps", (end.prefill_tps as f64).into());
             set(&obj, "decodeTps", (end.decode_tps as f64).into());
             set(&obj, "decode_tps", (end.decode_tps as f64).into());
+            set(&obj, "totalMs", (end.total_ms as f64).into());
+            set(&obj, "total_ms", (end.total_ms as f64).into());
         }
         MessageBody::FlowInvokeRequestBody(_) => {
             // Serwer nie odsyła requestu do klienta; arm dla wyczerpalności.

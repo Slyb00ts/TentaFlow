@@ -411,11 +411,26 @@ impl MeshCommandExecutor {
                 )
                 .await;
                 CommandResponse::ok(MeshCommandResponsePayload::DistributedReadinessResult {
+                    container_running: st.container_running,
                     ray_gcs_up: st.ray_gcs_up,
                     ray_nodes: st.ray_nodes,
                     serve_ready: st.serve_ready,
                     error: st.error,
                 })
+            }
+            MeshCommandType::DistributedStartServe {
+                deployment_cluster_id,
+                serve_cmd,
+            } => {
+                match crate::services::deploy::distributed::exec_serve_on_head(
+                    &deployment_cluster_id,
+                    &serve_cmd,
+                )
+                .await
+                {
+                    Ok(()) => CommandResponse::ok(MeshCommandResponsePayload::Empty),
+                    Err(e) => CommandResponse::fail(e),
+                }
             }
             MeshCommandType::ServiceUpdateRemote {
                 service_id,

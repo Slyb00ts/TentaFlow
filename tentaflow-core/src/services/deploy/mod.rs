@@ -1814,6 +1814,7 @@ mod apply_parameters_deploy_tests {
     fn make_engine(id: &str) -> Engine {
         Engine {
             id: id.into(),
+            backend: None,
             category: Category::Llm,
             name: id.into(),
             description_pl: String::new(),
@@ -2096,6 +2097,7 @@ mod hf_token_gate_tests {
     ) -> Engine {
         Engine {
             id: "test".into(),
+            backend: None,
             category,
             name: "test".into(),
             description_pl: String::new(),
@@ -2747,6 +2749,7 @@ mod tests {
         ServiceManifest {
             engine: Engine {
                 id: id.to_string(),
+                backend: None,
                 category: Category::Llm,
                 name: id.to_string(),
                 description_pl: "".into(),

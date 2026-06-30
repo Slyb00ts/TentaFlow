@@ -684,6 +684,7 @@ mod tests {
         let manifest = ServiceManifest {
             engine: Engine {
                 id: "no-bundle".into(),
+                backend: None,
                 category: Category::Llm,
                 name: "no-bundle".into(),
                 description_pl: "".into(),

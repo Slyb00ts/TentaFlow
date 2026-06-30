@@ -1127,6 +1127,7 @@ pub async fn cluster_deploy(
         port,
         gpus_per_node,
         config_json,
+        build_timeout_secs,
         gcs_timeout_secs,
         ready_timeout_secs,
     } = payload;
@@ -1172,9 +1173,9 @@ pub async fn cluster_deploy(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| model.clone());
 
-    // P1-4: reject a second deploy on a cluster that already has an active one —
-    // a node has one GPU set, so two TP deployments would collide on GPU + host
-    // ports. Stop the existing one first.
+    // P1-4: reject a second deploy only when a LIVE deployment (deploying/running)
+    // exists — a node has one GPU set, so two TP deployments would collide on GPU
+    // + host ports. A `failed` deployment does NOT block (cleared below).
     if let Some(existing) = crate::db::repository::active_cluster_deployment(&ctx.state.db, cluster_id)
         .map_err(|e| ProtocolError::new(ProtocolErrorCode::Internal, e.to_string()))?
     {
@@ -1184,6 +1185,32 @@ pub async fn cluster_deploy(
         )));
     }
 
+    // Auto-clear stale FAILED deployments of this cluster so a redeploy is not
+    // blocked by leftovers (idempotent best-effort teardown + delete record).
+    let local_id_pre = ctx.state.local_node_id.to_string();
+    let qm_pre = require_quic_mesh(ctx)?;
+    if let Ok(failed) = crate::db::repository::failed_cluster_deployments(&ctx.state.db, cluster_id) {
+        for f in failed {
+            let fmembers = crate::db::repository::list_cluster_deployment_members(
+                &ctx.state.db,
+                &f.deployment_cluster_id,
+            )
+            .unwrap_or_default();
+            let _ = teardown_distributed_members(
+                ctx,
+                &qm_pre,
+                &local_id_pre,
+                &f.deployment_cluster_id,
+                &fmembers,
+            )
+            .await;
+            let _ = crate::db::repository::delete_cluster_deployment(
+                &ctx.state.db,
+                &f.deployment_cluster_id,
+            );
+        }
+    }
+
     let gpus_per_node = gpus_per_node.unwrap_or(1).max(1);
     let tp_size = members.len() as u32 * gpus_per_node;
     let serve_port = port.unwrap_or(8100);
@@ -1191,6 +1218,10 @@ pub async fn cluster_deploy(
     let max_len = max_model_len.unwrap_or(8192);
     let ray_port: u16 = 6379;
     let user_cfg = config_json.clone().unwrap_or_else(|| "{}".to_string());
+    // Build phase (image build + container start) has its OWN generous budget so
+    // a slow first image build does NOT eat the short Ray-GCS budget.
+    let build_timeout =
+        std::time::Duration::from_secs(build_timeout_secs.unwrap_or(600).max(30) as u64);
     let gcs_timeout = std::time::Duration::from_secs(gcs_timeout_secs.unwrap_or(60).max(5) as u64);
     let ready_timeout =
         std::time::Duration::from_secs(ready_timeout_secs.unwrap_or(600).max(30) as u64);
@@ -1296,8 +1327,24 @@ pub async fn cluster_deploy(
     }
     statuses.push(head_status);
 
-    // 2. Wait for the head Ray GCS to come up so workers can join (bounded).
-    if let Err(e) = poll_head_readiness(
+    // 2a. BUILD phase: wait for the head CONTAINER to be up (image build +
+    //     container start) on its OWN generous budget — a slow first build
+    //     extends THIS phase, NOT the short Ray-GCS budget below (P2-fix).
+    if let Err(e) = poll_node_readiness(
+        ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
+        expected_nodes, ReadyPhase::ContainerUp, build_timeout,
+    )
+    .await
+    {
+        return Ok(finalize_distributed_failure(
+            ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
+            &persisted_members, statuses, format!("kontener head nie wstał (build): {e}"),
+        )
+        .await);
+    }
+
+    // 2b. Wait for the head Ray GCS to come up so workers can join (short budget).
+    if let Err(e) = poll_node_readiness(
         ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
         expected_nodes, ReadyPhase::GcsUp, gcs_timeout,
     )
@@ -1310,7 +1357,8 @@ pub async fn cluster_deploy(
         .await);
     }
 
-    // 3. Start workers (join the Ray head).
+    // 3. Start workers (join the Ray head). Each worker is gated on its OWN
+    //    container coming up (build budget) before we move on.
     for (idx, spec) in &specs {
         if *idx == head_idx {
             continue;
@@ -1328,12 +1376,66 @@ pub async fn cluster_deploy(
             )
             .await);
         }
+        // Worker container-up gate (build budget) before declaring it started.
+        if let Err(e) = poll_node_readiness(
+            ctx, &qm, &node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
+            expected_nodes, ReadyPhase::ContainerUp, build_timeout,
+        )
+        .await
+        {
+            return Ok(finalize_distributed_failure(
+                ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
+                &persisted_members, statuses,
+                format!("kontener worker {} nie wstał (build): {e}", node_id),
+            )
+            .await);
+        }
     }
 
-    // 4. FINAL readiness: head `/v1/models` 200 — proves the whole TP cluster
-    //    (all workers joined; a missing worker keeps vLLM from ever becoming
-    //    ready). Bounded by `ready_timeout` (P1-1/P2-1).
-    if let Err(e) = poll_head_readiness(
+    // 4. Wait for the Ray cluster to actually have every node joined (head sees
+    //    `expected_nodes` in `ray status`). ONLY THEN does `vllm serve` get a
+    //    complete GPU set — starting it earlier would make it block + time out
+    //    waiting for the 2nd GPU and the head would exit (the ordering bug).
+    if let Err(e) = poll_node_readiness(
+        ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
+        expected_nodes, ReadyPhase::ClusterReady, gcs_timeout,
+    )
+    .await
+    {
+        return Ok(finalize_distributed_failure(
+            ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
+            &persisted_members, statuses,
+            format!("workery nie dołączyły do klastra Ray w czasie: {e}"),
+        )
+        .await);
+    }
+
+    // 5. Cluster is complete → launch `vllm serve` ON THE HEAD via docker exec
+    //    (detached). vLLM now finds the full TP GPU set immediately.
+    let serve_cmd = match crate::services::deploy::distributed::build_serve_command(&head_spec) {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(finalize_distributed_failure(
+                ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
+                &persisted_members, statuses, format!("budowa komendy vllm serve: {e}"),
+            )
+            .await);
+        }
+    };
+    if let Err(e) =
+        start_serve_on_head(ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, &serve_cmd)
+            .await
+    {
+        return Ok(finalize_distributed_failure(
+            ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
+            &persisted_members, statuses, format!("start vllm serve na headzie: {e}"),
+        )
+        .await);
+    }
+
+    // 6. FINAL readiness: head `/v1/models` 200 — vLLM loaded the model across the
+    //    TP cluster and serves. Bounded by `ready_timeout` (P1-1).
+    if let Err(e) = poll_node_readiness(
         ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
         expected_nodes, ReadyPhase::ServeReady, ready_timeout,
     )
@@ -1396,21 +1498,57 @@ fn hostname_for(ctx: &HandlerContext, node_id: &str) -> String {
 /// Faza gotowosci sondowana przez koordynatora.
 #[derive(Clone, Copy, PartialEq)]
 enum ReadyPhase {
+    /// Kontener czlonka wstal (obraz zbudowany + start) — gate fazy buildu.
+    ContainerUp,
     /// GCS Ray nasluchuje (workery moga dolaczyc).
     GcsUp,
-    /// Endpoint OpenAI serwuje (caly TP-cluster gotowy).
+    /// Klaster Ray ma wszystkie nody (head widzi `expected_nodes` w `ray status`)
+    /// — dopiero teraz `vllm serve` ma komplet GPU.
+    ClusterReady,
+    /// Endpoint OpenAI serwuje (model zaladowany na calym TP-cluster).
     ServeReady,
 }
 
-/// Sonduje head (lokalnie albo `DistributedReadiness` przez mesh) do osiagniecia
-/// `phase` albo wyczerpania `timeout`. Zwraca Err z czytelnym komunikatem przy
-/// timeoucie (z ostatnim widzianym stanem). To jest REALNY gate gotowosci —
-/// `ClusterDeployResponse.ok` zalezy od niego, nie od samego zaplanowania (P1-1).
-#[allow(clippy::too_many_arguments)]
-async fn poll_head_readiness(
+/// Odpala `vllm serve` na headzie (local → `exec_serve_on_head`; remote →
+/// `DistributedStartServe` przez mesh). Detached — vLLM laduje model w tle, a
+/// gotowosc potwierdza pozniejszy `ServeReady`.
+async fn start_serve_on_head(
     ctx: &HandlerContext,
     qm: &Arc<IrohMeshManager>,
     head_node_id: &str,
+    local_id: &str,
+    deployment_cluster_id: &str,
+    serve_cmd: &str,
+) -> Result<(), String> {
+    if head_node_id == local_id {
+        return crate::services::deploy::distributed::exec_serve_on_head(
+            deployment_cluster_id,
+            serve_cmd,
+        )
+        .await;
+    }
+    let cmd = MeshCommandType::DistributedStartServe {
+        deployment_cluster_id: deployment_cluster_id.to_string(),
+        serve_cmd: serve_cmd.to_string(),
+    };
+    match qm.send_command_and_wait(head_node_id, cmd, 30).await {
+        Ok(resp) if resp.ok => Ok(()),
+        Ok(resp) => Err(resp.error.unwrap_or_else(|| "start serve nieudany".to_string())),
+        Err(e) => Err(format!("mesh send (start serve) nieudany: {e}")),
+    }
+}
+
+/// Sonduje `target_node` (lokalnie albo `DistributedReadiness` przez mesh) do
+/// osiagniecia `phase` albo wyczerpania `timeout`. Zwraca Err z czytelnym
+/// komunikatem przy timeoucie (z ostatnim widzianym stanem). To jest REALNY gate
+/// gotowosci — `ClusterDeployResponse.ok` zalezy od niego, nie od samego
+/// zaplanowania (P1-1). `ContainerUp` ma sens dla kazdego noda; `GcsUp`/
+/// `ServeReady` tylko dla head-a.
+#[allow(clippy::too_many_arguments)]
+async fn poll_node_readiness(
+    ctx: &HandlerContext,
+    qm: &Arc<IrohMeshManager>,
+    target_node: &str,
     local_id: &str,
     deployment_cluster_id: &str,
     ray_port: u16,
@@ -1422,10 +1560,10 @@ async fn poll_head_readiness(
     let start = std::time::Instant::now();
     let mut last = String::from("brak odpowiedzi");
     while start.elapsed() < timeout {
-        let (gcs_up, ray_nodes, serve_ready) = probe_head_once(
+        let (container_running, gcs_up, ray_nodes, serve_ready) = probe_node_once(
             ctx,
             qm,
-            head_node_id,
+            target_node,
             local_id,
             deployment_cluster_id,
             ray_port,
@@ -1434,44 +1572,48 @@ async fn poll_head_readiness(
         )
         .await;
         let done = match phase {
+            ReadyPhase::ContainerUp => container_running,
             ReadyPhase::GcsUp => gcs_up,
-            // Serve readiness is authoritative: vLLM only answers /v1/models when
-            // all TP GPUs (workers) joined. ray_nodes is logged for diagnostics.
+            // Full Ray cluster: head's `ray status` shows every node joined, so
+            // `vllm serve` will find the complete TP GPU set.
+            ReadyPhase::ClusterReady => ray_nodes >= expected_nodes,
+            // Serve readiness is authoritative: /v1/models answers only after vLLM
+            // loaded the model across the TP cluster.
             ReadyPhase::ServeReady => serve_ready,
         };
         if done {
             return Ok(());
         }
         last = format!(
-            "gcs_up={} ray_nodes={}/{} serve_ready={}",
-            gcs_up, ray_nodes, expected_nodes, serve_ready
+            "container={} gcs_up={} ray_nodes={}/{} serve_ready={}",
+            container_running, gcs_up, ray_nodes, expected_nodes, serve_ready
         );
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
     Err(format!("timeout po {}s ({})", timeout.as_secs(), last))
 }
 
-/// Jednorazowy odczyt gotowosci head-a (local → bezposrednio; remote → mesh).
+/// Jednorazowy odczyt gotowosci noda (local → bezposrednio; remote → mesh).
 /// Transient blad mesh → traktowany jak "jeszcze niegotowy" (polling kontynuuje).
 #[allow(clippy::too_many_arguments)]
-async fn probe_head_once(
+async fn probe_node_once(
     ctx: &HandlerContext,
     qm: &Arc<IrohMeshManager>,
-    head_node_id: &str,
+    target_node: &str,
     local_id: &str,
     deployment_cluster_id: &str,
     ray_port: u16,
     serve_port: u16,
     expected_nodes: u32,
-) -> (bool, u32, bool) {
-    if head_node_id == local_id {
+) -> (bool, bool, u32, bool) {
+    if target_node == local_id {
         let s = crate::services::deploy::distributed::probe_readiness(
             deployment_cluster_id,
             ray_port,
             serve_port,
         )
         .await;
-        return (s.ray_gcs_up, s.ray_nodes, s.serve_ready);
+        return (s.container_running, s.ray_gcs_up, s.ray_nodes, s.serve_ready);
     }
     let cmd = MeshCommandType::DistributedReadiness {
         deployment_cluster_id: deployment_cluster_id.to_string(),
@@ -1479,17 +1621,18 @@ async fn probe_head_once(
         serve_port,
         expected_nodes,
     };
-    match qm.send_command_and_wait(head_node_id, cmd, 15).await {
+    match qm.send_command_and_wait(target_node, cmd, 15).await {
         Ok(resp) if resp.ok => match resp.payload {
             MeshCommandResponsePayload::DistributedReadinessResult {
+                container_running,
                 ray_gcs_up,
                 ray_nodes,
                 serve_ready,
                 ..
-            } => (ray_gcs_up, ray_nodes, serve_ready),
-            _ => (false, 0, false),
+            } => (container_running, ray_gcs_up, ray_nodes, serve_ready),
+            _ => (false, false, 0, false),
         },
-        _ => (false, 0, false),
+        _ => (false, false, 0, false),
     }
 }
 

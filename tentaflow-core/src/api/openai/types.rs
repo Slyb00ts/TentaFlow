@@ -455,6 +455,8 @@ pub struct GenPerf {
     pub prefill_tps: f32,
     /// Predkosc dekodowania: (completion_tokens-1) / (end - first_token).
     pub decode_tps: f32,
+    /// Calkowity czas odpowiedzi w ms (dispatch -> ostatni token).
+    pub total_ms: u32,
 }
 
 /// Streaming options (Etap 3a). Dziś jedyne pole to `include_usage` —

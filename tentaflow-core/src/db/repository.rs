@@ -3786,22 +3786,41 @@ pub fn delete_cluster_deployment(pool: &DbPool, deployment_cluster_id: &str) -> 
     Ok(())
 }
 
-/// First non-stopped distributed deployment of a cluster (`deploying`/`running`/
-/// `failed`). Used to reject a second deploy on the same cluster — a node has one
-/// GPU set, so two TP deployments would collide on GPU + host ports.
+/// First LIVE distributed deployment of a cluster (`deploying`/`running`). Used
+/// to reject a second deploy on the same cluster — a node has one GPU set, so two
+/// TP deployments would collide on GPU + host ports. A `failed` deployment is NOT
+/// live (it gets auto-cleared on redeploy), so it does not block.
 pub fn active_cluster_deployment(
     pool: &DbPool,
     cluster_id: &str,
 ) -> Result<Option<DbClusterDeployment>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM cluster_deployments WHERE cluster_id = ?1 AND status != 'stopped' ORDER BY created_at LIMIT 1",
+        "SELECT {} FROM cluster_deployments WHERE cluster_id = ?1 AND status IN ('deploying','running') ORDER BY created_at LIMIT 1",
         CLUSTER_DEPLOYMENT_COLS
     ))?;
     let res = stmt
         .query_row(rusqlite::params![cluster_id], row_to_cluster_deployment)
         .optional()?;
     Ok(res)
+}
+
+/// All `failed` distributed deployments of a cluster — cleared (best-effort
+/// teardown + delete) before a fresh deploy so a stale failed record never blocks
+/// a redeploy.
+pub fn failed_cluster_deployments(
+    pool: &DbPool,
+    cluster_id: &str,
+) -> Result<Vec<DbClusterDeployment>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM cluster_deployments WHERE cluster_id = ?1 AND status = 'failed' ORDER BY created_at",
+        CLUSTER_DEPLOYMENT_COLS
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![cluster_id], row_to_cluster_deployment)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Czlonkowie wszystkich klastrow — uzywane do budowy snapshotu konfiguracji
