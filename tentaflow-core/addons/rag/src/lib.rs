@@ -2115,6 +2115,21 @@ fn normalize_entity_name(name: &str) -> String {
         .to_lowercase()
 }
 
+/// Grounding constraint ekstrakcji: odrzuca encje i relacje, ktorych (znormalizowana)
+/// nazwa NIE wystepuje w tekscie zrodlowym chunku. To praktyczny odpowiednik grammar-
+/// constraint na backendzie MLX (ktory nie ma GBNF): sparrotowany przyklad z promptu i
+/// halucynacje wypadaja, bo ich nie ma w tekscie; realne encje sa w nim doslownie.
+/// Predykat relacji (`relation`) NIE jest gruntowany — moze byc sparafrazowany. Haystack
+/// i id encji normalizowane tak samo (`normalize_entity_name`: lowercase + scalone spacje).
+fn ground_extraction(extraction: &mut ChunkExtraction, chunk_text: &str) {
+    let hay = normalize_entity_name(chunk_text);
+    let grounded = |id: &str| -> bool { !id.is_empty() && hay.contains(id) };
+    extraction.entities.retain(|e| grounded(&e.id));
+    extraction
+        .relations
+        .retain(|r| grounded(&r.head_id) && grounded(&r.tail_id));
+}
+
 /// Wycina tresc chat-completion lub bierze caly tekst, a nastepnie probuje
 /// wyciagnac obiekt JSON {entities, relations} TOLERUJAC proze wokol (LLM czesto
 /// owija JSON w komentarz albo ```json). Zwraca przyciety wg capow wynik. Smieci
@@ -4366,7 +4381,11 @@ fn extract_chunk_graph(
     truncated: &mut bool,
 ) -> Result<(usize, usize), String> {
     let raw = call_extraction_llm(chunk_text)?;
-    let extraction = parse_extraction_response(&raw);
+    let mut extraction = parse_extraction_response(&raw);
+    // Grounding: encja/relacja MUSI wystepowac w tekscie zrodlowym chunku. Male modele
+    // (bielik-7B) parrotuja przyklad z promptu zamiast ekstrahowac — sparrotowane wartosci
+    // nie wystepuja w chunku, wiec wypadaja; realne encje sa doslownie w tekscie.
+    ground_extraction(&mut extraction, chunk_text);
     // Capy per-chunk / pominiete za-dlugie relacje sygnalizowane przez parser (bug 5/6).
     if extraction.truncated {
         *truncated = true;
