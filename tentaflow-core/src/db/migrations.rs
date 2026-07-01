@@ -562,7 +562,23 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "model_metrics_permissions",
             MigrationStep::Rust(model_metrics_add_permissions),
         ),
+        (
+            105,
+            "ensure_token_permissions",
+            MigrationStep::Rust(ensure_token_permissions),
+        ),
     ]
+}
+
+// v105 — backfill `tokens.*` grants. v87 (`token_metrics_add_permissions`) was added
+// after some databases had already migrated past version 87, so it never ran there and
+// admins ended up without `tokens.read` (PolicyDenied on the token usage screen). Re-run
+// the same grants at a fresh version; `roles_add_permissions` is idempotent, so fresh
+// installs (which already got v87) are a no-op.
+fn ensure_token_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(conn, &["org_admin", "dpo"], &["tokens.read", "tokens.write"])?;
+    roles_add_permissions(conn, &["org_operator", "org_viewer"], &["tokens.read"])?;
+    Ok(())
 }
 
 // v104 — RBAC dla metryk modeli. Admin/DPO dostają odczyt i zapis cennika,
