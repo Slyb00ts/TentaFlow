@@ -1001,6 +1001,10 @@ function renderDetail(host, p, focus = {}) {
       renderRecogAnnotateTab(panel, p);
       return;
     }
+    if (label === 'Dane' && slug === 'distillation') {
+      renderDistillDataTab(panel, p);
+      return;
+    }
     if (label === 'Dane') {
       renderDataTab(panel, projectId(p));
       return;
@@ -2012,6 +2016,176 @@ function methodLabel(id) {
 
 function objectiveLabel(id) {
   return (FT_OBJECTIVES.find((o) => o.id === id) || {}).name || String(id).toUpperCase();
+}
+
+// =============================================================================
+// Zakładka „Dane" (destylacja) — generowanie datasetu par (question, answer).
+// Źródło pytań: generacja modelem z celu usera ALBO import istniejącego datasetu.
+// Wybrany TEACHER generuje odpowiedzi. Backend: MlStudioDistillGenerate + polling.
+// =============================================================================
+async function renderDistillDataTab(panel, p) {
+  const pid = projectId(p);
+  panel.innerHTML = `<div class="ml-studio-loading">Ładowanie…</div>`;
+
+  let models = [];
+  let datasets = [];
+  try {
+    const [ml, dss] = await Promise.all([
+      ApiBinary.list('modelListRequest', { arrayKey: 'models' }).catch(() => []),
+      ApiBinary.list('mlStudioDatasetsListRequest', { projectId: pid, arrayKey: 'datasets' }).catch(() => []),
+    ]);
+    // Modele generacyjne (kategoria 'llm') — teacher i model generujący pytania
+    // odpowiadają na prompt. Datalist to PODPOWIEDZI; pole przyjmuje też dowolny
+    // alias/model spoza listy (np. zewnętrzny endpoint).
+    const catOf = (m) => String(m.category || m.service_type || '').toLowerCase();
+    models = (Array.isArray(ml) ? ml : []).filter((m) => catOf(m) === 'llm');
+    datasets = Array.isArray(dss) ? dss : [];
+  } catch (e) {
+    /* best effort — pola przyjmują dowolny alias/model */
+  }
+
+  const modelNames = [...new Set(models.map((m) => m.name || m.id).filter(Boolean))];
+  const modelOptions = modelNames.map((n) => `<option value="${escapeAttr(n)}"></option>`).join('');
+  const datasetOptions = datasets
+    .map((d) => `<option value="${escapeAttr(d.datasetId || d.dataset_id || d.id || '')}">${escapeHtml(d.name || '')}</option>`)
+    .join('');
+
+  panel.innerHTML = `
+    <div class="ml-studio-distill-data">
+      <h3>Generowanie datasetu destylacji</h3>
+      <p class="ml-studio-hint">Zbierz PYTANIA (wygeneruj modelem z celu albo zaimportuj z datasetu), a wybrany TEACHER wygeneruje ODPOWIEDZI. Wynik: pary (pytanie, odpowiedź) do treningu ucznia.</p>
+
+      <label class="ml-studio-field-label">Źródło pytań</label>
+      <div class="ml-studio-source-toggle" style="display:flex;gap:8px;margin-bottom:8px;">
+        <tf-button id="ml-distill-src-generate" variant="primary" size="sm">Generuj modelem</tf-button>
+        <tf-button id="ml-distill-src-import" variant="ghost" size="sm">Import z datasetu</tf-button>
+      </div>
+
+      <div id="ml-distill-generate-box">
+        <label class="ml-studio-field-label">Cel / co wygenerować (prompt dla modelu)</label>
+        <tf-textarea id="ml-distill-prompt" rows="3" placeholder="np. Wygeneruj pytania o ekstrakcję encji i relacji z polskiego tekstu prawnego"></tf-textarea>
+        <div style="display:flex;gap:12px;">
+          <div style="flex:2;"><label class="ml-studio-field-label">Model generujący pytania</label>
+            <input list="ml-distill-models" id="ml-distill-qmodel" class="ml-studio-model-input" style="width:100%;box-sizing:border-box;display:block;padding:8px;margin:2px 0 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text);" placeholder="alias/model (puste = teacher)"></div>
+          <div style="flex:1;"><label class="ml-studio-field-label">Ile pytań</label>
+            <tf-input id="ml-distill-num" type="number" value="10"></tf-input></div>
+        </div>
+      </div>
+
+      <div id="ml-distill-import-box" hidden>
+        <label class="ml-studio-field-label">Dataset źródłowy (pytania)</label>
+        <select id="ml-distill-srcds" class="ml-studio-model-input" style="width:100%;box-sizing:border-box;display:block;padding:8px;margin:2px 0 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text);">${datasetOptions || '<option value="">— brak datasetów —</option>'}</select>
+        <label class="ml-studio-field-label">Pole/kolumna z pytaniem</label>
+        <tf-input id="ml-distill-field" placeholder="question / prompt (puste = auto)"></tf-input>
+      </div>
+
+      <hr style="margin:14px 0;border:none;border-top:1px solid var(--border);">
+      <label class="ml-studio-field-label">Teacher — model generujący ODPOWIEDZI (etykiety treningowe)</label>
+      <input list="ml-distill-models" id="ml-distill-teacher" class="ml-studio-model-input" style="width:100%;box-sizing:border-box;display:block;padding:8px;margin:2px 0 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text);" placeholder="np. gpt-5-5 albo dowolny alias/model tentaflow">
+      <datalist id="ml-distill-models">${modelOptions}</datalist>
+
+      <label class="ml-studio-field-label">Instrukcja dla teachera (opcjonalna)</label>
+      <tf-textarea id="ml-distill-instr" rows="2" placeholder="np. Wyodrębnij encje i relacje w formacie E|nazwa|typ / R|head|rel|tail"></tf-textarea>
+      <div style="display:flex;gap:12px;">
+        <div style="flex:1;"><label class="ml-studio-field-label">Temperatura</label><tf-input id="ml-distill-temp" type="number" value="0.2"></tf-input></div>
+        <div style="flex:1;"><label class="ml-studio-field-label">Max tokenów</label><tf-input id="ml-distill-maxtok" type="number" value="768"></tf-input></div>
+      </div>
+
+      <label class="ml-studio-field-label">Nazwa datasetu</label>
+      <tf-input id="ml-distill-name" value="destylacja-${Date.now()}"></tf-input>
+
+      <div class="ml-studio-actions" style="margin-top:12px;">
+        <tf-button id="ml-distill-go" variant="primary">Generuj dataset</tf-button>
+      </div>
+      <div id="ml-distill-progress" style="margin-top:14px;" hidden></div>
+    </div>`;
+
+  let source = 'generate';
+  const setSource = (s) => {
+    source = s;
+    byId('ml-distill-generate-box').hidden = s !== 'generate';
+    byId('ml-distill-import-box').hidden = s !== 'import';
+    byId('ml-distill-src-generate')?.setAttribute('variant', s === 'generate' ? 'primary' : 'ghost');
+    byId('ml-distill-src-import')?.setAttribute('variant', s === 'import' ? 'primary' : 'ghost');
+  };
+  byId('ml-distill-src-generate')?.addEventListener('click', () => setSource('generate'));
+  byId('ml-distill-src-import')?.addEventListener('click', () => setSource('import'));
+
+  byId('ml-distill-go')?.addEventListener('click', async () => {
+    const teacher = String(byId('ml-distill-teacher')?.value || '').trim();
+    if (!teacher) {
+      toast('Podaj model teacher', 'error');
+      return;
+    }
+    const payload = {
+      projectId: pid,
+      datasetName: String(byId('ml-distill-name')?.value || '').trim() || `destylacja-${Date.now()}`,
+      questionSource: source,
+      teacherModel: teacher,
+      answerInstruction: String(byId('ml-distill-instr')?.value || '').trim() || undefined,
+      temperature: Math.max(0, Math.min(2, Number(byId('ml-distill-temp')?.value ?? 0.2) || 0)),
+      maxTokens: Math.max(16, Math.min(8192, Number(byId('ml-distill-maxtok')?.value || 768) | 0)),
+    };
+    if (source === 'generate') {
+      payload.generatePrompt = String(byId('ml-distill-prompt')?.value || '').trim();
+      payload.questionModel = String(byId('ml-distill-qmodel')?.value || '').trim() || undefined;
+      payload.numQuestions = Math.max(1, Math.min(500, Number(byId('ml-distill-num')?.value || 10) | 0));
+      if (!payload.generatePrompt) {
+        toast('Podaj cel/prompt', 'error');
+        return;
+      }
+    } else {
+      payload.sourceDatasetId = String(byId('ml-distill-srcds')?.value || '');
+      payload.questionField = String(byId('ml-distill-field')?.value || '').trim() || undefined;
+      if (!payload.sourceDatasetId) {
+        toast('Wybierz dataset źródłowy', 'error');
+        return;
+      }
+    }
+    byId('ml-distill-go')?.setAttribute('disabled', 'true');
+    try {
+      const resp = await ApiBinary.one('mlStudioDistillGenerateRequest', payload);
+      pollDistill(resp.datasetId || resp.dataset_id);
+    } catch (e) {
+      toast(`Błąd startu: ${e.message}`, 'error');
+      byId('ml-distill-go')?.removeAttribute('disabled');
+    }
+  });
+
+  function pollDistill(datasetId) {
+    const box = byId('ml-distill-progress');
+    if (!box) return;
+    box.hidden = false;
+    const tick = async () => {
+      let st;
+      try {
+        st = await ApiBinary.one('mlStudioDistillGenerateStatusRequest', { datasetId });
+      } catch (e) {
+        box.innerHTML = `<span class="ml-studio-err">Błąd pollingu: ${escapeHtml(e.message)}</span>`;
+        return;
+      }
+      const done = st.done || 0;
+      const total = st.total || 0;
+      const pct = total ? Math.round((done / total) * 100) : 0;
+      const samples = Array.isArray(st.samples) ? st.samples : [];
+      box.innerHTML = `
+        <div>Status: <strong>${escapeHtml(st.status || '')}</strong> ${total ? `(${done}/${total}, ${pct}%)` : ''}</div>
+        ${st.error ? `<div class="ml-studio-err">${escapeHtml(st.error)}</div>` : ''}
+        <div class="ml-studio-progress-bar" style="height:8px;background:var(--surface-2);border-radius:4px;overflow:hidden;margin:6px 0;"><div style="width:${pct}%;height:100%;background:var(--accent);"></div></div>
+        ${samples.length ? `<div class="ml-studio-distill-samples">${samples.map((s) => `<div class="qa" style="border:1px solid var(--border);border-radius:6px;padding:8px;margin:6px 0;"><div style="font-weight:600;">${escapeHtml(s.question || '')}</div><div style="opacity:0.85;margin-top:4px;white-space:pre-wrap;">${escapeHtml(s.answer || '')}</div></div>`).join('')}</div>` : ''}`;
+      if (st.status === 'completed') {
+        toast('Dataset gotowy — zakładka Trening', 'success');
+        byId('ml-distill-go')?.removeAttribute('disabled');
+        return;
+      }
+      if (st.status === 'failed' || st.status === 'unknown') {
+        byId('ml-distill-go')?.removeAttribute('disabled');
+        return;
+      }
+      setTimeout(tick, 2000);
+    };
+    tick();
+  }
 }
 
 // =============================================================================

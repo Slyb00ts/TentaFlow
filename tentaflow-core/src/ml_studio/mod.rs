@@ -9,6 +9,7 @@ pub mod autolabel_recog_dataset;
 pub mod build_recog_dataset;
 pub mod coco_annotate;
 pub mod db;
+pub mod distill;
 pub mod export_llm;
 pub mod infer;
 pub mod live_view;

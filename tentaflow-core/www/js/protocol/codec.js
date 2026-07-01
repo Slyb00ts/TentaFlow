@@ -3093,6 +3093,54 @@ export const encode = {
   },
 
   /**
+   * MessageBody::MlStudioBody(DistillGenerateRequest) — start generowania
+   * datasetu destylacji. payload: { projectId, datasetName, questionSource
+   * ('import'|'generate'), sourceDatasetId?, questionField?, generatePrompt?,
+   * questionModel?, numQuestions?, teacherModel, answerInstruction?,
+   * temperature?, maxTokens? }.
+   */
+  mlStudioDistillGenerateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioDistillGenerateRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.datasetName ?? payload.dataset_name ?? ''),
+      String(payload.questionSource ?? payload.question_source ?? 'generate'),
+      (payload.sourceDatasetId ?? payload.source_dataset_id) || undefined,
+      (payload.questionField ?? payload.question_field) || undefined,
+      (payload.generatePrompt ?? payload.generate_prompt) || undefined,
+      (payload.questionModel ?? payload.question_model) || undefined,
+      (payload.numQuestions ?? payload.num_questions ?? 0) >>> 0,
+      String(payload.teacherModel ?? payload.teacher_model ?? ''),
+      (payload.answerInstruction ?? payload.answer_instruction) || undefined,
+      Number(payload.temperature ?? 0),
+      (payload.maxTokens ?? payload.max_tokens ?? 0) >>> 0,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(DistillGenerateStatusRequest) — polling postępu
+   * generowania datasetu destylacji. payload: { datasetId }.
+   */
+  mlStudioDistillGenerateStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioDistillGenerateStatusRequest(
+      String(payload.datasetId ?? payload.dataset_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
    * MessageBody::MlStudioBody(FtTrainStatusRequest) — polling postępu
    * fine-tuningu LLM. Zwraca status + krzywą straty (lossCurve) do wykresu.
    * payload: { runId }.

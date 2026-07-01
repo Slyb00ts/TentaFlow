@@ -2210,6 +2210,67 @@ pub fn encode_ml_studio_ft_train_start_request(
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeMlStudioDistillGenerateRequest)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_ml_studio_distill_generate_request(
+    project_id: String,
+    dataset_name: String,
+    question_source: String,
+    source_dataset_id: Option<String>,
+    question_field: Option<String>,
+    generate_prompt: Option<String>,
+    question_model: Option<String>,
+    num_questions: u32,
+    teacher_model: String,
+    answer_instruction: Option<String>,
+    temperature: f64,
+    max_tokens: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::DistillGenerateRequest(
+            tentaflow_protocol::MlStudioDistillGenerateRequest {
+                project_id,
+                dataset_name,
+                question_source,
+                source_dataset_id: source_dataset_id.filter(|s| !s.is_empty()),
+                question_field: question_field.filter(|s| !s.is_empty()),
+                generate_prompt: generate_prompt.filter(|s| !s.is_empty()),
+                question_model: question_model.filter(|s| !s.is_empty()),
+                num_questions: if num_questions == 0 {
+                    None
+                } else {
+                    Some(num_questions)
+                },
+                teacher_model,
+                answer_instruction: answer_instruction.filter(|s| !s.is_empty()),
+                temperature: if temperature > 0.0 {
+                    Some(temperature as f32)
+                } else {
+                    None
+                },
+                max_tokens: if max_tokens == 0 {
+                    None
+                } else {
+                    Some(max_tokens)
+                },
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioDistillGenerateStatusRequest)]
+pub fn encode_ml_studio_distill_generate_status_request(
+    dataset_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::DistillGenerateStatusRequest(
+            tentaflow_protocol::MlStudioDistillGenerateStatusRequest { dataset_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioFtTrainStatusRequest)]
 pub fn encode_ml_studio_ft_train_status_request(run_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
@@ -9758,6 +9819,37 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "runId", resp.run_id.clone().into());
             set(obj, "run_id", resp.run_id.into());
             set(obj, "status", resp.status.into());
+        }
+        tentaflow_protocol::MlStudioPayload::DistillGenerateRequest(_) => {
+            set(obj, "variant", "MlStudioDistillGenerateRequest".into());
+        }
+        tentaflow_protocol::MlStudioPayload::DistillGenerateResponse(resp) => {
+            set(obj, "variant", "MlStudioDistillGenerateResponse".into());
+            set(obj, "datasetId", resp.dataset_id.clone().into());
+            set(obj, "dataset_id", resp.dataset_id.into());
+            set(obj, "status", resp.status.into());
+        }
+        tentaflow_protocol::MlStudioPayload::DistillGenerateStatusRequest(req) => {
+            set(obj, "variant", "MlStudioDistillGenerateStatusRequest".into());
+            set(obj, "datasetId", req.dataset_id.clone().into());
+            set(obj, "dataset_id", req.dataset_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::DistillGenerateStatusResponse(resp) => {
+            set(obj, "variant", "MlStudioDistillGenerateStatusResponse".into());
+            set(obj, "status", resp.status.into());
+            set(obj, "total", (resp.total as f64).into());
+            set(obj, "done", (resp.done as f64).into());
+            if let Some(err) = resp.error {
+                set(obj, "error", err.into());
+            }
+            let arr = js_sys::Array::new();
+            for pair in &resp.samples {
+                let o = js_sys::Object::new();
+                set(&o, "question", pair.question.clone().into());
+                set(&o, "answer", pair.answer.clone().into());
+                arr.push(&JsValue::from(o));
+            }
+            set(obj, "samples", arr.into());
         }
         tentaflow_protocol::MlStudioPayload::FtTrainStatusRequest(req) => {
             set(obj, "variant", "MlStudioFtTrainStatusRequest".into());

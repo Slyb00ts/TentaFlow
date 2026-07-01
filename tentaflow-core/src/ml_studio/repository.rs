@@ -394,6 +394,26 @@ pub fn create_dataset(
     .map_err(Into::into)
 }
 
+/// Nadpisuje dane datasetu (raw_data + row_count) po zakonczeniu generacji
+/// destylacji i oznacza profil jako completed. Autoryzacja: dataset powstal przez
+/// `create_dataset` (require_member), wiec update po dataset_id jest bezpieczny.
+pub fn update_dataset_data(
+    _user_id: &str,
+    dataset_id: &str,
+    row_count: u64,
+    raw_data: &[u8],
+) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
+    conn.execute(
+        "UPDATE datasets SET row_count = ?1, raw_data = ?2, \
+             profile_json = json_set(COALESCE(NULLIF(profile_json, ''), '{}'), '$.distill_status', 'completed') \
+         WHERE dataset_id = ?3",
+        params![row_count as i64, raw_data, dataset_id],
+    )?;
+    Ok(())
+}
+
 /// Lists datasets of a project, newest first. Authorization by membership.
 pub fn list_datasets(user_id: &str, project_id: &str) -> Result<Vec<Dataset>> {
     let pool = super::db::pool()?;

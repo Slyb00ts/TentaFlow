@@ -2001,6 +2001,82 @@ pub async fn ml_studio_ft_train_start(
     }
 }
 
+#[handler(variant = "MlStudioDistillGenerateRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub async fn ml_studio_distill_generate(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::DistillGenerateRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioDistillGenerateRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    repository::get_project(&org.user_id, &payload.project_id).map_err(db_err)?;
+    require_project_editor(&org.user_id, &payload.project_id)?;
+
+    if payload.teacher_model.trim().is_empty() {
+        return Err(ProtocolError::bad_request("teacher_model jest wymagany"));
+    }
+
+    let dataset_id = crate::ml_studio::distill::spawn_distill_generation(
+        ctx.state.router.clone(),
+        org.user_id.clone(),
+        payload.clone(),
+    )
+    .map_err(|e| ProtocolError::internal(e.to_string()))?;
+
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::DistillGenerateResponse(
+            tentaflow_protocol::MlStudioDistillGenerateResponse {
+                dataset_id,
+                status: "generating".to_string(),
+            },
+        ),
+    ))
+}
+
+#[handler(variant = "MlStudioDistillGenerateStatusRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub async fn ml_studio_distill_generate_status(
+    req: &MessageBody,
+    _ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::DistillGenerateStatusRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioDistillGenerateStatusRequest",
+            ))
+        }
+    };
+    let resp = match crate::ml_studio::distill::distill_status(&payload.dataset_id) {
+        Some(p) => tentaflow_protocol::MlStudioDistillGenerateStatusResponse {
+            status: p.status,
+            total: p.total,
+            done: p.done,
+            error: p.error,
+            samples: p.samples,
+        },
+        None => tentaflow_protocol::MlStudioDistillGenerateStatusResponse {
+            status: "unknown".to_string(),
+            total: 0,
+            done: 0,
+            error: None,
+            samples: Vec::new(),
+        },
+    };
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::DistillGenerateStatusResponse(resp),
+    ))
+}
+
 #[handler(variant = "MlStudioFtTrainStatusRequest", since = (1, 0))]
 #[policy(PowerUser)]
 #[observed]

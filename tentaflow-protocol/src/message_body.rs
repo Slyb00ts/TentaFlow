@@ -2178,6 +2178,75 @@ pub struct MlStudioServiceModelsListResponse {
     pub models_json: String,
 }
 
+// ---------------------------------------------------------------------------
+// Destylacja — generowanie datasetu par (question, answer). Zrodlo pytan:
+// import wgranego datasetu ALBO generacja modelem z promptu usera; teacher
+// (dowolny wybrany model) generuje odpowiedzi referencyjne. Wynik -> dataset.
+// ---------------------------------------------------------------------------
+
+/// Start generowania datasetu destylacji. Job w tle: zbiera pytania, odpytuje
+/// teachera po odpowiedzi, zapisuje pary do nowego datasetu (kind="distill_qa").
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDistillGenerateRequest {
+    pub project_id: String,
+    pub dataset_name: String,
+    /// Zrodlo pytan: "import" (kolumna z istniejacego datasetu) lub "generate"
+    /// (model generuje pytania z `generate_prompt`).
+    pub question_source: String,
+    /// "import": id wgranego datasetu + nazwa pola/kolumny z pytaniami.
+    #[serde(default)]
+    pub source_dataset_id: Option<String>,
+    #[serde(default)]
+    pub question_field: Option<String>,
+    /// "generate": prompt usera (co wygenerowac), model generujacy pytania, ile pytan.
+    #[serde(default)]
+    pub generate_prompt: Option<String>,
+    #[serde(default)]
+    pub question_model: Option<String>,
+    #[serde(default)]
+    pub num_questions: Option<u32>,
+    /// Teacher — model generujacy ODPOWIEDZI (alias/model wybrany w GUI; dowolny
+    /// tentaflow lub external). Odpowiedzi to etykiety treningowe ucznia.
+    pub teacher_model: String,
+    /// Instrukcja dla teachera (jak ma odpowiadac); doklejana przed pytaniem.
+    #[serde(default)]
+    pub answer_instruction: Option<String>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDistillGenerateResponse {
+    pub dataset_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDistillGenerateStatusRequest {
+    pub dataset_id: String,
+}
+
+/// Podglad wygenerowanej pary (question, answer).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDistillQaPair {
+    pub question: String,
+    pub answer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDistillGenerateStatusResponse {
+    /// pending | generating_questions | answering | completed | failed
+    pub status: String,
+    pub total: u32,
+    pub done: u32,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Kilka pierwszych par do podgladu w UI.
+    pub samples: Vec<MlStudioDistillQaPair>,
+}
+
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum MlStudioPayload {
     ProjectsListRequest(MlStudioProjectsListRequest),
@@ -2230,6 +2299,10 @@ pub enum MlStudioPayload {
     FtExportStatusResponse(MlStudioFtExportStatusResponse),
     FtDeployRequest(MlStudioFtDeployRequest),
     FtDeployResponse(MlStudioFtDeployResponse),
+    DistillGenerateRequest(MlStudioDistillGenerateRequest),
+    DistillGenerateResponse(MlStudioDistillGenerateResponse),
+    DistillGenerateStatusRequest(MlStudioDistillGenerateStatusRequest),
+    DistillGenerateStatusResponse(MlStudioDistillGenerateStatusResponse),
     RecogTrainStartRequest(MlStudioRecogTrainStartRequest),
     RecogTrainStartResponse(MlStudioRecogTrainStartResponse),
     RecogTrainStatusRequest(MlStudioRecogTrainStatusRequest),
