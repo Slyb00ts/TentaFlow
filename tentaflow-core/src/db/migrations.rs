@@ -547,8 +547,112 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cluster_deployments_dist_port",
             MigrationStep::Rust(cluster_deployments_add_dist_port),
         ),
+        (
+            102,
+            "model_metrics_rollup_table",
+            MigrationStep::Sql(MODEL_METRICS_ROLLUP_SCHEMA),
+        ),
+        (
+            103,
+            "model_pricing_table",
+            MigrationStep::Sql(MODEL_PRICING_SCHEMA),
+        ),
     ]
 }
+
+// v102 — mesh-wide hourly rollup of model performance and usage metrics. Like
+// `token_usage_daily` it is single-writer-per-row (the owning node accumulates
+// only its own `id` rows; a mesh-wide figure is the SUM across all node rows) yet
+// replicates so any node can render fleet metrics. `id` is a deterministic hash of
+// all dimensions + node_id so the same logical bucket minted on different nodes
+// never collides. Latency/throughput distributions are captured as fixed-edge
+// histograms with a per-histogram `sample_count` so a bucket sum of 0 (no samples)
+// is distinguishable from a genuine measured 0. `histogram_version` lets a future
+// edge change re-key rows instead of silently mixing incompatible bucketings.
+const MODEL_METRICS_ROLLUP_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS model_metrics_rollup (
+    id                     TEXT PRIMARY KEY,
+    node_id                TEXT NOT NULL,
+    org_id                 TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    user_id                TEXT NOT NULL,
+    model_id               TEXT NOT NULL,
+    service_key            TEXT NOT NULL,
+    backend                TEXT NOT NULL,
+    modality               TEXT NOT NULL,
+    hour_bucket            TEXT NOT NULL,
+    histogram_version      INTEGER NOT NULL DEFAULT 1,
+    request_count          INTEGER NOT NULL DEFAULT 0,
+    success_count          INTEGER NOT NULL DEFAULT 0,
+    error_count            INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens          INTEGER NOT NULL DEFAULT 0,
+    completion_tokens      INTEGER NOT NULL DEFAULT 0,
+    total_tokens           INTEGER NOT NULL DEFAULT 0,
+    embedding_tokens       INTEGER NOT NULL DEFAULT 0,
+    audio_ms               INTEGER NOT NULL DEFAULT 0,
+    images                 INTEGER NOT NULL DEFAULT 0,
+    prefill_secs_sum       REAL NOT NULL DEFAULT 0,
+    decode_secs_sum        REAL NOT NULL DEFAULT 0,
+    e2e_latency_ms_sum     INTEGER NOT NULL DEFAULT 0,
+    queue_ms_sum           INTEGER NOT NULL DEFAULT 0,
+    ttft_b0                INTEGER NOT NULL DEFAULT 0,
+    ttft_b1                INTEGER NOT NULL DEFAULT 0,
+    ttft_b2                INTEGER NOT NULL DEFAULT 0,
+    ttft_b3                INTEGER NOT NULL DEFAULT 0,
+    ttft_b4                INTEGER NOT NULL DEFAULT 0,
+    ttft_b5                INTEGER NOT NULL DEFAULT 0,
+    ttft_b6                INTEGER NOT NULL DEFAULT 0,
+    ttft_b7                INTEGER NOT NULL DEFAULT 0,
+    ttft_b8                INTEGER NOT NULL DEFAULT 0,
+    ttft_b9                INTEGER NOT NULL DEFAULT 0,
+    ttft_sample_count      INTEGER NOT NULL DEFAULT 0,
+    decode_tps_b0          INTEGER NOT NULL DEFAULT 0,
+    decode_tps_b1          INTEGER NOT NULL DEFAULT 0,
+    decode_tps_b2          INTEGER NOT NULL DEFAULT 0,
+    decode_tps_b3          INTEGER NOT NULL DEFAULT 0,
+    decode_tps_b4          INTEGER NOT NULL DEFAULT 0,
+    decode_tps_b5          INTEGER NOT NULL DEFAULT 0,
+    decode_tps_b6          INTEGER NOT NULL DEFAULT 0,
+    decode_tps_b7          INTEGER NOT NULL DEFAULT 0,
+    decode_tps_sample_count INTEGER NOT NULL DEFAULT 0,
+    e2e_b0                 INTEGER NOT NULL DEFAULT 0,
+    e2e_b1                 INTEGER NOT NULL DEFAULT 0,
+    e2e_b2                 INTEGER NOT NULL DEFAULT 0,
+    e2e_b3                 INTEGER NOT NULL DEFAULT 0,
+    e2e_b4                 INTEGER NOT NULL DEFAULT 0,
+    e2e_b5                 INTEGER NOT NULL DEFAULT 0,
+    e2e_b6                 INTEGER NOT NULL DEFAULT 0,
+    e2e_b7                 INTEGER NOT NULL DEFAULT 0,
+    e2e_b8                 INTEGER NOT NULL DEFAULT 0,
+    e2e_b9                 INTEGER NOT NULL DEFAULT 0,
+    e2e_sample_count       INTEGER NOT NULL DEFAULT 0,
+    updated_at             TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_model_metrics_model ON model_metrics_rollup(org_id, model_id, hour_bucket);
+CREATE INDEX IF NOT EXISTS idx_model_metrics_user ON model_metrics_rollup(org_id, user_id, hour_bucket);
+CREATE INDEX IF NOT EXISTS idx_model_metrics_node ON model_metrics_rollup(node_id);
+CREATE INDEX IF NOT EXISTS idx_model_metrics_updated ON model_metrics_rollup(updated_at);
+"#;
+
+// v103 — per-model pricing, admin edited and LWW replicated (like `token_quota`).
+// The primary key is a deterministic synthetic `id` (hash of org_id+model_id) so
+// the same logical row minted on different nodes never collides and, crucially,
+// two organizations pricing the same `model_id` stay isolated. `updated_at` is the
+// node-local watermark and is NOT synced; the HLC on the sync operation drives
+// last-writer-wins, so a stale concurrent edit never clobbers a newer one.
+const MODEL_PRICING_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS model_pricing (
+    id                 TEXT PRIMARY KEY,
+    org_id             TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    model_id           TEXT NOT NULL,
+    prompt_per_1k      REAL NOT NULL DEFAULT 0,
+    completion_per_1k  REAL NOT NULL DEFAULT 0,
+    audio_per_min      REAL NOT NULL DEFAULT 0,
+    image_each         REAL NOT NULL DEFAULT 0,
+    updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(org_id, model_id)
+);
+CREATE INDEX IF NOT EXISTS idx_model_pricing_org ON model_pricing(org_id);
+"#;
 
 /// Persist the torch.distributed TCPStore master port (`VLLM_PORT`) leased from
 /// the coordinator's `PortAllocator` alongside the serve port, so a clean stop

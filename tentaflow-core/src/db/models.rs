@@ -741,6 +741,130 @@ pub struct TokenLeaseUpsert<'a> {
     pub expires_at: &'a str,
 }
 
+/// Godzinowy rollup metryk modelu (model_metrics_rollup) - wiersz tabeli.
+/// Single-writer-per-row: kazdy wezel akumuluje wylacznie swoje wiersze `id`,
+/// a wartosc mesh-wide to SUMA po wierszach wszystkich wezlow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbModelMetricsRollup {
+    pub id: String,
+    pub node_id: String,
+    pub org_id: String,
+    pub user_id: String,
+    pub model_id: String,
+    pub service_key: String,
+    pub backend: String,
+    pub modality: String,
+    pub hour_bucket: String,
+    pub histogram_version: i64,
+    pub request_count: i64,
+    pub success_count: i64,
+    pub error_count: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    pub embedding_tokens: i64,
+    pub audio_ms: i64,
+    pub images: i64,
+    pub prefill_secs_sum: f64,
+    pub decode_secs_sum: f64,
+    pub e2e_latency_ms_sum: i64,
+    pub queue_ms_sum: i64,
+    pub ttft_buckets: [i64; 10],
+    pub ttft_sample_count: i64,
+    pub decode_tps_buckets: [i64; 8],
+    pub decode_tps_sample_count: i64,
+    pub e2e_buckets: [i64; 10],
+    pub e2e_sample_count: i64,
+    pub updated_at: String,
+}
+
+/// Cennik per-model (model_pricing) - wiersz tabeli. Edytowany przez admina,
+/// replikowany LWW (jak token_quota).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbModelPricing {
+    pub model_id: String,
+    pub org_id: String,
+    pub prompt_per_1k: f64,
+    pub completion_per_1k: f64,
+    pub audio_per_min: f64,
+    pub image_each: f64,
+    pub updated_at: String,
+}
+
+/// Wymiary (klucz logiczny) jednego kubelka rollupu metryk modelu. `service_key`
+/// jest STABILNY (engine/deployment/nazwa), nie surowy `service_id`, zeby restart
+/// serwisu nie fragmentowal metryk. `hour_bucket` to RFC3339 przyciety do godziny.
+#[derive(Debug, Clone)]
+pub struct ModelMetricsDims<'a> {
+    pub node_id: &'a str,
+    pub org_id: &'a str,
+    pub user_id: &'a str,
+    pub model_id: &'a str,
+    pub service_key: &'a str,
+    pub backend: &'a str,
+    pub modality: &'a str,
+    pub hour_bucket: &'a str,
+    pub histogram_version: i64,
+}
+
+/// Liczniki zadan dodawane do rollupu przy jednym `bump`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelMetricsCounters {
+    pub request_count: i64,
+    pub success_count: i64,
+    pub error_count: i64,
+}
+
+/// Sumy tokenow/modalnosci dodawane do rollupu przy jednym `bump`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelMetricsTokens {
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    pub embedding_tokens: i64,
+    pub audio_ms: i64,
+    pub images: i64,
+}
+
+/// Sumy czasow dodawane do rollupu przy jednym `bump`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelMetricsTimes {
+    pub prefill_secs: f64,
+    pub decode_secs: f64,
+    pub e2e_latency_ms: i64,
+    pub queue_ms: i64,
+}
+
+/// Opcjonalne pomiary wydajnosci dla histogramow. `None` = brak pomiaru → `bump`
+/// NIE dotyka danego histogramu (odroznia brak-pomiaru od zmierzonego 0).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelMetricsPerfSamples {
+    pub ttft_ms: Option<i64>,
+    pub decode_tps: Option<f64>,
+    pub e2e_ms: Option<i64>,
+}
+
+/// Filtr listy rollupu metryk (dla agregacji GUI w Chunku 3). Puste pola = brak
+/// ograniczenia; `hour_from`/`hour_to` to inkluzywne granice `hour_bucket`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelMetricsFilter<'a> {
+    pub model_id: Option<&'a str>,
+    pub user_id: Option<&'a str>,
+    pub hour_from: Option<&'a str>,
+    pub hour_to: Option<&'a str>,
+}
+
+/// Parametry zapisu (upsert) cennika modelu.
+#[derive(Debug, Clone, Copy)]
+pub struct NewModelPricing<'a> {
+    pub model_id: &'a str,
+    pub org_id: &'a str,
+    pub prompt_per_1k: f64,
+    pub completion_per_1k: f64,
+    pub audio_per_min: f64,
+    pub image_each: f64,
+}
+
 /// Parametry aktualizacji wzorca fast path
 #[derive(Debug, Clone)]
 pub struct UpdateFastPathPattern<'a> {

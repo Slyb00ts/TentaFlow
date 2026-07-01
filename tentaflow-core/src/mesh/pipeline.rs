@@ -440,6 +440,12 @@ pub async fn start_mesh_pipeline(
                         config.token_metrics.flush_secs,
                         background_shutdown.clone(),
                     );
+                    spawn_model_metrics_flusher(
+                        pool.clone(),
+                        local_node_id.clone(),
+                        config.token_metrics.flush_secs,
+                        background_shutdown.clone(),
+                    );
                     spawn_token_lease_coordinator(
                         quic_mesh.clone(),
                         mesh_security.clone(),
@@ -3594,6 +3600,41 @@ fn spawn_token_usage_flusher(
                             watermark = new_watermark;
                         }
                         Err(e) => warn!("token-usage flusher: flush nieudany: {}", e),
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Flusher capture'ow rollupu metryk modelu. Bliznaczy do
+/// `spawn_token_usage_flusher`: co `flush_secs` przepisuje swieze wiersze
+/// `model_metrics_rollup` (po watermarku) do Sync Ledger. Kazdy wezel flushuje
+/// WLASNE wiersze, wiec task biegnie wszedzie. Watermark trzymany w pamieci —
+/// po restarcie startuje od pustego (flush jest idempotentny po stronie ledgera).
+fn spawn_model_metrics_flusher(
+    pool: crate::db::DbPool,
+    self_node_id: String,
+    flush_secs: u64,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut watermark = String::new();
+        let mut interval = tokio::time::interval(Duration::from_secs(flush_secs.max(1)));
+        interval.tick().await; // pierwszy tick natychmiast — pomin
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    debug!("model-metrics flusher: shutdown");
+                    return;
+                }
+                _ = interval.tick() => {
+                    match crate::db::repository::flush_model_metrics_captures(&pool, &self_node_id, &watermark) {
+                        Ok(new_watermark) => {
+                            debug!(watermark = %new_watermark, "model-metrics flusher: flush ok");
+                            watermark = new_watermark;
+                        }
+                        Err(e) => warn!("model-metrics flusher: flush nieudany: {}", e),
                     }
                 }
             }

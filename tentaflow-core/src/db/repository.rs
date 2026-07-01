@@ -4031,6 +4031,12 @@ fn field_optional_i64(value: Option<i64>) -> crate::sync::ledger::FieldValue {
         .unwrap_or(crate::sync::ledger::FieldValue::Null)
 }
 
+/// Encode a real (f64) as `FieldValue::Decimal` — an exact decimal string — so the
+/// wire carries the full precision instead of a lossy integer cast.
+fn field_f64(value: f64) -> crate::sync::ledger::FieldValue {
+    crate::sync::ledger::FieldValue::Decimal(value.to_string())
+}
+
 fn sync_resource_acl_core_id(
     org_id: &str,
     addon_id: &str,
@@ -5981,6 +5987,72 @@ pub fn reseed_core_state_from_current_rows(
                             &coordinator_node_id,
                             &expires_at,
                         ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::ModelMetricsRollup => {
+                let mut stmt =
+                    tx.prepare(&format!("SELECT {MODEL_METRICS_COLS} FROM model_metrics_rollup"))?;
+                let rows = stmt
+                    .query_map([], row_to_model_metrics_rollup)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for row in rows {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &row.org_id,
+                        row.id.clone(),
+                        Update,
+                        model_metrics_changed_fields(&row),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::ModelPricing => {
+                let mut stmt = tx.prepare(
+                    "SELECT id, model_id, org_id, prompt_per_1k, completion_per_1k, audio_per_min, \
+                            image_each FROM model_pricing",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, f64>(3)?,
+                            r.get::<_, f64>(4)?,
+                            r.get::<_, f64>(5)?,
+                            r.get::<_, f64>(6)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (
+                    id,
+                    model_id,
+                    org_id,
+                    prompt_per_1k,
+                    completion_per_1k,
+                    audio_per_min,
+                    image_each,
+                ) in rows
+                {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &org_id,
+                        id.clone(),
+                        Insert,
+                        model_pricing_changed_fields(&crate::db::models::NewModelPricing {
+                            model_id: &model_id,
+                            org_id: &org_id,
+                            prompt_per_1k,
+                            completion_per_1k,
+                            audio_per_min,
+                            image_each,
+                        }),
                         None,
                     )?;
                     emitted += 1;
@@ -9942,6 +10014,480 @@ pub fn usage_summary(
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+// --- Model metrics rollup ---
+
+// Histogram edges INCLUDE a leading 0 and a trailing ∞ sentinel. The bucket index
+// is the count of edges strictly less than the value, which for a non-negative
+// value yields exactly `edges.len()` buckets (0..=edges.len()-1):
+//   TTFT [ms]:   [0, 50, 100, 200, 400, 800, 1600, 3200, 6400, ∞]     → 10 buckets
+//   decode_tps:  [0, 10, 20, 40, 80, 160, 320, ∞]                     → 8 buckets
+//   e2e [ms]:    [0, 100, 250, 500, 1000, 2000, 4000, 8000, 16000, ∞] → 10 buckets
+const TTFT_MS_EDGES: [i64; 10] = [0, 50, 100, 200, 400, 800, 1600, 3200, 6400, i64::MAX];
+const DECODE_TPS_EDGES: [f64; 8] = [0.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0, f64::INFINITY];
+const E2E_MS_EDGES: [i64; 10] = [0, 100, 250, 500, 1000, 2000, 4000, 8000, 16000, i64::MAX];
+
+/// Bucket index for a value against ascending histogram edges: the number of
+/// edges strictly less than `value`. Edges must be ascending and include the
+/// leading 0 plus a trailing ∞ sentinel, so a non-negative value maps into
+/// `0..=edges.len()-1` (the ∞ sentinel is never counted).
+pub fn histogram_bucket_index<T: PartialOrd + Copy>(edges: &[T], value: T) -> usize {
+    edges.iter().filter(|&&edge| edge < value).count()
+}
+
+const MODEL_METRICS_COLS: &str = "id, node_id, org_id, user_id, model_id, service_key, backend, \
+    modality, hour_bucket, histogram_version, request_count, success_count, error_count, \
+    prompt_tokens, completion_tokens, total_tokens, embedding_tokens, audio_ms, images, \
+    prefill_secs_sum, decode_secs_sum, e2e_latency_ms_sum, queue_ms_sum, \
+    ttft_b0, ttft_b1, ttft_b2, ttft_b3, ttft_b4, ttft_b5, ttft_b6, ttft_b7, ttft_b8, ttft_b9, \
+    ttft_sample_count, \
+    decode_tps_b0, decode_tps_b1, decode_tps_b2, decode_tps_b3, decode_tps_b4, decode_tps_b5, \
+    decode_tps_b6, decode_tps_b7, decode_tps_sample_count, \
+    e2e_b0, e2e_b1, e2e_b2, e2e_b3, e2e_b4, e2e_b5, e2e_b6, e2e_b7, e2e_b8, e2e_b9, \
+    e2e_sample_count, updated_at";
+
+fn row_to_model_metrics_rollup(
+    r: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::db::models::DbModelMetricsRollup> {
+    Ok(crate::db::models::DbModelMetricsRollup {
+        id: r.get(0)?,
+        node_id: r.get(1)?,
+        org_id: r.get(2)?,
+        user_id: r.get(3)?,
+        model_id: r.get(4)?,
+        service_key: r.get(5)?,
+        backend: r.get(6)?,
+        modality: r.get(7)?,
+        hour_bucket: r.get(8)?,
+        histogram_version: r.get(9)?,
+        request_count: r.get(10)?,
+        success_count: r.get(11)?,
+        error_count: r.get(12)?,
+        prompt_tokens: r.get(13)?,
+        completion_tokens: r.get(14)?,
+        total_tokens: r.get(15)?,
+        embedding_tokens: r.get(16)?,
+        audio_ms: r.get(17)?,
+        images: r.get(18)?,
+        prefill_secs_sum: r.get(19)?,
+        decode_secs_sum: r.get(20)?,
+        e2e_latency_ms_sum: r.get(21)?,
+        queue_ms_sum: r.get(22)?,
+        ttft_buckets: [
+            r.get(23)?,
+            r.get(24)?,
+            r.get(25)?,
+            r.get(26)?,
+            r.get(27)?,
+            r.get(28)?,
+            r.get(29)?,
+            r.get(30)?,
+            r.get(31)?,
+            r.get(32)?,
+        ],
+        ttft_sample_count: r.get(33)?,
+        decode_tps_buckets: [
+            r.get(34)?,
+            r.get(35)?,
+            r.get(36)?,
+            r.get(37)?,
+            r.get(38)?,
+            r.get(39)?,
+            r.get(40)?,
+            r.get(41)?,
+        ],
+        decode_tps_sample_count: r.get(42)?,
+        e2e_buckets: [
+            r.get(43)?,
+            r.get(44)?,
+            r.get(45)?,
+            r.get(46)?,
+            r.get(47)?,
+            r.get(48)?,
+            r.get(49)?,
+            r.get(50)?,
+            r.get(51)?,
+            r.get(52)?,
+        ],
+        e2e_sample_count: r.get(53)?,
+        updated_at: r.get(54)?,
+    })
+}
+
+/// Deterministic rollup id: SHA-256 over all dimensions + node_id (length-prefixed
+/// so no field boundary can be forged) + `histogram_version`. The same logical
+/// bucket minted on different nodes therefore keeps a distinct `id` per node
+/// (single-writer-per-row), while a bucketing change re-keys rows instead of
+/// mixing incompatible histograms.
+fn model_metrics_id(dims: &crate::db::models::ModelMetricsDims<'_>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for field in [
+        dims.node_id,
+        dims.org_id,
+        dims.user_id,
+        dims.model_id,
+        dims.service_key,
+        dims.backend,
+        dims.modality,
+        dims.hour_bucket,
+    ] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    hasher.update(dims.histogram_version.to_le_bytes());
+    format!("mmr:{}", hex::encode(hasher.finalize()))
+}
+
+/// Replicated fields of a `model_metrics_rollup` row (everything but the
+/// node-local `updated_at` watermark). Mirrors `token_usage_changed_fields`.
+pub fn model_metrics_changed_fields(
+    row: &crate::db::models::DbModelMetricsRollup,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    use crate::sync::ledger::FieldValue;
+    let mut fields = BTreeMap::new();
+    fields.insert("node_id".to_string(), field_string(&row.node_id));
+    fields.insert("org_id".to_string(), field_string(&row.org_id));
+    fields.insert("user_id".to_string(), field_string(&row.user_id));
+    fields.insert("model_id".to_string(), field_string(&row.model_id));
+    fields.insert("service_key".to_string(), field_string(&row.service_key));
+    fields.insert("backend".to_string(), field_string(&row.backend));
+    fields.insert("modality".to_string(), field_string(&row.modality));
+    fields.insert("hour_bucket".to_string(), field_string(&row.hour_bucket));
+    fields.insert(
+        "histogram_version".to_string(),
+        FieldValue::I64(row.histogram_version),
+    );
+    fields.insert("request_count".to_string(), FieldValue::I64(row.request_count));
+    fields.insert("success_count".to_string(), FieldValue::I64(row.success_count));
+    fields.insert("error_count".to_string(), FieldValue::I64(row.error_count));
+    fields.insert("prompt_tokens".to_string(), FieldValue::I64(row.prompt_tokens));
+    fields.insert(
+        "completion_tokens".to_string(),
+        FieldValue::I64(row.completion_tokens),
+    );
+    fields.insert("total_tokens".to_string(), FieldValue::I64(row.total_tokens));
+    fields.insert(
+        "embedding_tokens".to_string(),
+        FieldValue::I64(row.embedding_tokens),
+    );
+    fields.insert("audio_ms".to_string(), FieldValue::I64(row.audio_ms));
+    fields.insert("images".to_string(), FieldValue::I64(row.images));
+    fields.insert(
+        "prefill_secs_sum".to_string(),
+        field_f64(row.prefill_secs_sum),
+    );
+    fields.insert("decode_secs_sum".to_string(), field_f64(row.decode_secs_sum));
+    fields.insert(
+        "e2e_latency_ms_sum".to_string(),
+        FieldValue::I64(row.e2e_latency_ms_sum),
+    );
+    fields.insert("queue_ms_sum".to_string(), FieldValue::I64(row.queue_ms_sum));
+    for (i, value) in row.ttft_buckets.iter().enumerate() {
+        fields.insert(format!("ttft_b{i}"), FieldValue::I64(*value));
+    }
+    fields.insert(
+        "ttft_sample_count".to_string(),
+        FieldValue::I64(row.ttft_sample_count),
+    );
+    for (i, value) in row.decode_tps_buckets.iter().enumerate() {
+        fields.insert(format!("decode_tps_b{i}"), FieldValue::I64(*value));
+    }
+    fields.insert(
+        "decode_tps_sample_count".to_string(),
+        FieldValue::I64(row.decode_tps_sample_count),
+    );
+    for (i, value) in row.e2e_buckets.iter().enumerate() {
+        fields.insert(format!("e2e_b{i}"), FieldValue::I64(*value));
+    }
+    fields.insert(
+        "e2e_sample_count".to_string(),
+        FieldValue::I64(row.e2e_sample_count),
+    );
+    fields
+}
+
+/// Local UPSERT of one model-metrics bucket. Hot path — NO capture (the flusher
+/// emits captures batched, exactly like `bump_token_usage`). Accumulates counters,
+/// tokens and time sums and increments the matching histogram bucket + its
+/// `sample_count` ONLY for measured samples (a `None` perf value leaves that
+/// histogram untouched, so a bucket sum of 0 means "no samples", not "measured 0").
+pub fn bump_model_metrics_rollup(
+    pool: &DbPool,
+    dims: &crate::db::models::ModelMetricsDims<'_>,
+    counters: &crate::db::models::ModelMetricsCounters,
+    tokens: &crate::db::models::ModelMetricsTokens,
+    times: &crate::db::models::ModelMetricsTimes,
+    perf: &crate::db::models::ModelMetricsPerfSamples,
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let id = model_metrics_id(dims);
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO model_metrics_rollup \
+         (id, node_id, org_id, user_id, model_id, service_key, backend, modality, hour_bucket, \
+          histogram_version, request_count, success_count, error_count, \
+          prompt_tokens, completion_tokens, total_tokens, embedding_tokens, audio_ms, images, \
+          prefill_secs_sum, decode_secs_sum, e2e_latency_ms_sum, queue_ms_sum, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
+          ?19, ?20, ?21, ?22, ?23, strftime('%Y-%m-%d %H:%M:%f','now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+         request_count = request_count + excluded.request_count, \
+         success_count = success_count + excluded.success_count, \
+         error_count = error_count + excluded.error_count, \
+         prompt_tokens = prompt_tokens + excluded.prompt_tokens, \
+         completion_tokens = completion_tokens + excluded.completion_tokens, \
+         total_tokens = total_tokens + excluded.total_tokens, \
+         embedding_tokens = embedding_tokens + excluded.embedding_tokens, \
+         audio_ms = audio_ms + excluded.audio_ms, \
+         images = images + excluded.images, \
+         prefill_secs_sum = prefill_secs_sum + excluded.prefill_secs_sum, \
+         decode_secs_sum = decode_secs_sum + excluded.decode_secs_sum, \
+         e2e_latency_ms_sum = e2e_latency_ms_sum + excluded.e2e_latency_ms_sum, \
+         queue_ms_sum = queue_ms_sum + excluded.queue_ms_sum, \
+         histogram_version = excluded.histogram_version, \
+         updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
+        rusqlite::params![
+            id,
+            dims.node_id,
+            dims.org_id,
+            dims.user_id,
+            dims.model_id,
+            dims.service_key,
+            dims.backend,
+            dims.modality,
+            dims.hour_bucket,
+            dims.histogram_version,
+            counters.request_count,
+            counters.success_count,
+            counters.error_count,
+            tokens.prompt_tokens,
+            tokens.completion_tokens,
+            tokens.total_tokens,
+            tokens.embedding_tokens,
+            tokens.audio_ms,
+            tokens.images,
+            times.prefill_secs,
+            times.decode_secs,
+            times.e2e_latency_ms,
+            times.queue_ms,
+        ],
+    )?;
+    if let Some(ttft) = perf.ttft_ms {
+        bump_histogram_bucket(&tx, &id, "ttft", histogram_bucket_index(&TTFT_MS_EDGES, ttft))?;
+    }
+    if let Some(tps) = perf.decode_tps {
+        bump_histogram_bucket(
+            &tx,
+            &id,
+            "decode_tps",
+            histogram_bucket_index(&DECODE_TPS_EDGES, tps),
+        )?;
+    }
+    if let Some(e2e) = perf.e2e_ms {
+        bump_histogram_bucket(&tx, &id, "e2e", histogram_bucket_index(&E2E_MS_EDGES, e2e))?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Increment one histogram bucket and its `sample_count`. `prefix` is a fixed
+/// literal and `idx` is bounded by the edge arrays, so the formatted column names
+/// are injection-safe.
+fn bump_histogram_bucket(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    prefix: &str,
+    idx: usize,
+) -> Result<()> {
+    let bucket_col = format!("{prefix}_b{idx}");
+    let sample_col = format!("{prefix}_sample_count");
+    tx.execute(
+        &format!(
+            "UPDATE model_metrics_rollup SET {bucket_col} = {bucket_col} + 1, \
+             {sample_col} = {sample_col} + 1 WHERE id = ?1"
+        ),
+        rusqlite::params![id],
+    )?;
+    Ok(())
+}
+
+/// Emit captures for THIS node's own rollup rows changed after `since_watermark`.
+/// The `node_id = self` filter is essential: replicas of other nodes' rows (received
+/// via sync) get a node-local `updated_at` at materialization time, so without it a
+/// node would re-publish foreign rows. All rows in one transaction. Returns the
+/// highest `updated_at` seen (or echoes `since_watermark` when empty). Mirrors
+/// `flush_token_usage_captures`.
+pub fn flush_model_metrics_captures(
+    pool: &DbPool,
+    self_node_id: &str,
+    since_watermark: &str,
+) -> Result<String> {
+    let mut conn = acquire(pool)?;
+    let rows: Vec<crate::db::models::DbModelMetricsRollup> = {
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {MODEL_METRICS_COLS} FROM model_metrics_rollup \
+             WHERE node_id = ?2 AND updated_at > ?1 ORDER BY updated_at"
+        ))?;
+        let collected = stmt
+            .query_map(
+                rusqlite::params![since_watermark, self_node_id],
+                row_to_model_metrics_rollup,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        collected
+    };
+
+    if rows.is_empty() {
+        return Ok(since_watermark.to_string());
+    }
+
+    let mut max_watermark = since_watermark.to_string();
+    let tx = conn.transaction()?;
+    for row in &rows {
+        record_core_capture_for_org_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::ModelMetricsRollup,
+            &row.org_id,
+            row.id.clone(),
+            crate::sync::runtime::SqlWriteAction::Update,
+            model_metrics_changed_fields(row),
+            None,
+        )?;
+        if row.updated_at > max_watermark {
+            max_watermark = row.updated_at.clone();
+        }
+    }
+    tx.commit()?;
+    Ok(max_watermark)
+}
+
+/// Rollup rows for an org, filtered for GUI aggregation (Chunk 3). Aggregation
+/// (per model/user/hour) is done by the caller over these rows.
+pub fn list_model_metrics_rollup(
+    pool: &DbPool,
+    org_id: &str,
+    filter: &crate::db::models::ModelMetricsFilter<'_>,
+) -> Result<Vec<crate::db::models::DbModelMetricsRollup>> {
+    let conn = acquire(pool)?;
+    let mut sql = format!("SELECT {MODEL_METRICS_COLS} FROM model_metrics_rollup WHERE org_id = ?1");
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(org_id.to_string())];
+    if let Some(model_id) = filter.model_id {
+        params.push(Box::new(model_id.to_string()));
+        sql.push_str(&format!(" AND model_id = ?{}", params.len()));
+    }
+    if let Some(user_id) = filter.user_id {
+        params.push(Box::new(user_id.to_string()));
+        sql.push_str(&format!(" AND user_id = ?{}", params.len()));
+    }
+    if let Some(hour_from) = filter.hour_from {
+        params.push(Box::new(hour_from.to_string()));
+        sql.push_str(&format!(" AND hour_bucket >= ?{}", params.len()));
+    }
+    if let Some(hour_to) = filter.hour_to {
+        params.push(Box::new(hour_to.to_string()));
+        sql.push_str(&format!(" AND hour_bucket <= ?{}", params.len()));
+    }
+    sql.push_str(" ORDER BY hour_bucket DESC");
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt
+        .query_map(param_refs.as_slice(), row_to_model_metrics_rollup)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Deterministic synthetic id for a pricing row, keyed per org+model so two
+/// organizations pricing the same `model_id` never collide (mirrors
+/// `token_quota_id`).
+fn model_pricing_id(org_id: &str, model_id: &str) -> String {
+    format!("pricing:{org_id}:{model_id}")
+}
+
+/// Replicated fields of a `model_pricing` row (everything but node-local
+/// `updated_at`). Mirrors `token_quota_changed_fields`.
+pub fn model_pricing_changed_fields(
+    params: &crate::db::models::NewModelPricing<'_>,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(params.org_id));
+    fields.insert("model_id".to_string(), field_string(params.model_id));
+    fields.insert("prompt_per_1k".to_string(), field_f64(params.prompt_per_1k));
+    fields.insert(
+        "completion_per_1k".to_string(),
+        field_f64(params.completion_per_1k),
+    );
+    fields.insert("audio_per_min".to_string(), field_f64(params.audio_per_min));
+    fields.insert("image_each".to_string(), field_f64(params.image_each));
+    fields
+}
+
+/// Upsert per-model pricing and record the sync capture (LWW), mirroring
+/// `create_token_quota`.
+pub fn upsert_model_pricing(
+    pool: &DbPool,
+    params: &crate::db::models::NewModelPricing<'_>,
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let id = model_pricing_id(params.org_id, params.model_id);
+    tx.execute(
+        "INSERT INTO model_pricing \
+         (id, org_id, model_id, prompt_per_1k, completion_per_1k, audio_per_min, image_each, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%Y-%m-%d %H:%M:%f','now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+         org_id = excluded.org_id, model_id = excluded.model_id, prompt_per_1k = excluded.prompt_per_1k, \
+         completion_per_1k = excluded.completion_per_1k, audio_per_min = excluded.audio_per_min, \
+         image_each = excluded.image_each, updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
+        rusqlite::params![
+            id,
+            params.org_id,
+            params.model_id,
+            params.prompt_per_1k,
+            params.completion_per_1k,
+            params.audio_per_min,
+            params.image_each,
+        ],
+    )?;
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::ModelPricing,
+        params.org_id,
+        id,
+        crate::sync::runtime::SqlWriteAction::Insert,
+        model_pricing_changed_fields(params),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Fetch pricing for one org's model, if present.
+pub fn get_model_pricing(
+    pool: &DbPool,
+    org_id: &str,
+    model_id: &str,
+) -> Result<Option<crate::db::models::DbModelPricing>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT model_id, org_id, prompt_per_1k, completion_per_1k, audio_per_min, image_each, \
+         updated_at FROM model_pricing WHERE org_id = ?1 AND model_id = ?2",
+    )?;
+    let row = stmt
+        .query_row(rusqlite::params![org_id, model_id], |r| {
+            Ok(crate::db::models::DbModelPricing {
+                model_id: r.get(0)?,
+                org_id: r.get(1)?,
+                prompt_per_1k: r.get(2)?,
+                completion_per_1k: r.get(3)?,
+                audio_per_min: r.get(4)?,
+                image_each: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        })
+        .optional()?;
+    Ok(row)
 }
 
 // --- Fast Path Patterns ---
@@ -24134,5 +24680,227 @@ mod token_metrics_tests {
         let by_model = usage_summary(&pool, DEFAULT_ORG_ID, "daily", "2026-06-21", "model").unwrap();
         let m1 = by_model.iter().find(|r| r.key == "m1").unwrap();
         assert_eq!(m1.total_tokens, 140);
+    }
+
+    fn metrics_dims() -> crate::db::models::ModelMetricsDims<'static> {
+        crate::db::models::ModelMetricsDims {
+            node_id: "A",
+            org_id: DEFAULT_ORG_ID,
+            user_id: "u1",
+            model_id: "m1",
+            service_key: "llamacpp/deploy-1/qwen",
+            backend: "cuda",
+            modality: "chat",
+            hour_bucket: "2026-06-21T10:00:00Z",
+            histogram_version: 1,
+        }
+    }
+
+    #[test]
+    fn histogram_bucket_index_maps_edges() {
+        // TTFT edges [0,50,100,200,400,800,1600,3200,6400,∞] → 10 buckets 0..=9.
+        assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 0), 0);
+        assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 1), 1);
+        assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 50), 1);
+        assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 51), 2);
+        assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 6400), 9);
+        assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 999_999), 9);
+        // decode_tps edges [0,10,...,320,∞] → 8 buckets 0..=7.
+        assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 0.0), 0);
+        assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 5.0), 1);
+        assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 320.0), 7);
+        assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 5000.0), 7);
+        // e2e edges → 10 buckets 0..=9.
+        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 0), 0);
+        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 250), 3);
+        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 16000), 9);
+    }
+
+    #[test]
+    fn bump_does_not_touch_buckets_when_perf_none() {
+        let pool = fresh_db();
+        let dims = metrics_dims();
+        let counters = crate::db::models::ModelMetricsCounters {
+            request_count: 1,
+            success_count: 1,
+            error_count: 0,
+        };
+        let tokens = crate::db::models::ModelMetricsTokens {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            ..Default::default()
+        };
+        let times = crate::db::models::ModelMetricsTimes::default();
+        // perf all None → histograms and sample counts must stay 0.
+        bump_model_metrics_rollup(
+            &pool,
+            &dims,
+            &counters,
+            &tokens,
+            &times,
+            &crate::db::models::ModelMetricsPerfSamples::default(),
+        )
+        .unwrap();
+
+        let rows =
+            list_model_metrics_rollup(&pool, DEFAULT_ORG_ID, &Default::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.request_count, 1);
+        assert_eq!(row.total_tokens, 15);
+        assert_eq!(row.ttft_sample_count, 0);
+        assert_eq!(row.decode_tps_sample_count, 0);
+        assert_eq!(row.e2e_sample_count, 0);
+        assert!(row.ttft_buckets.iter().all(|&b| b == 0));
+        assert!(row.decode_tps_buckets.iter().all(|&b| b == 0));
+        assert!(row.e2e_buckets.iter().all(|&b| b == 0));
+
+        // Second bump WITH a measured ttft → exactly one bucket + sample_count move.
+        bump_model_metrics_rollup(
+            &pool,
+            &dims,
+            &counters,
+            &tokens,
+            &times,
+            &crate::db::models::ModelMetricsPerfSamples {
+                ttft_ms: Some(51),
+                decode_tps: None,
+                e2e_ms: None,
+            },
+        )
+        .unwrap();
+        let row = &list_model_metrics_rollup(&pool, DEFAULT_ORG_ID, &Default::default()).unwrap()[0];
+        assert_eq!(row.request_count, 2);
+        assert_eq!(row.ttft_sample_count, 1);
+        assert_eq!(row.ttft_buckets[2], 1); // 51 → bucket 2
+        assert_eq!(row.ttft_buckets.iter().sum::<i64>(), 1);
+        assert_eq!(row.decode_tps_sample_count, 0);
+        assert_eq!(row.e2e_sample_count, 0);
+    }
+
+    #[test]
+    fn model_metrics_flusher_captures_only_own_node_rows() {
+        let pool = fresh_db();
+        let counters = crate::db::models::ModelMetricsCounters {
+            request_count: 1,
+            success_count: 1,
+            error_count: 0,
+        };
+        let tokens = crate::db::models::ModelMetricsTokens::default();
+        let times = crate::db::models::ModelMetricsTimes::default();
+        let perf = crate::db::models::ModelMetricsPerfSamples::default();
+        let mut dims_a = metrics_dims();
+        dims_a.node_id = "A";
+        let mut dims_b = metrics_dims();
+        dims_b.node_id = "B";
+        bump_model_metrics_rollup(&pool, &dims_a, &counters, &tokens, &times, &perf).unwrap();
+        bump_model_metrics_rollup(&pool, &dims_b, &counters, &tokens, &times, &perf).unwrap();
+        // Unknown node owns no rows → watermark unchanged.
+        assert_eq!(
+            flush_model_metrics_captures(&pool, "ZZZ", "").unwrap(),
+            "".to_string()
+        );
+        // Node A owns a row → watermark advances past "".
+        assert_ne!(flush_model_metrics_captures(&pool, "A", "").unwrap(), "");
+    }
+
+    #[test]
+    fn model_pricing_upsert_and_get_roundtrip() {
+        let pool = fresh_db();
+        upsert_model_pricing(
+            &pool,
+            &crate::db::models::NewModelPricing {
+                model_id: "m1",
+                org_id: DEFAULT_ORG_ID,
+                prompt_per_1k: 0.5,
+                completion_per_1k: 1.5,
+                audio_per_min: 0.1,
+                image_each: 0.04,
+            },
+        )
+        .unwrap();
+        let pricing = get_model_pricing(&pool, DEFAULT_ORG_ID, "m1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pricing.completion_per_1k, 1.5);
+        // Upsert again (LWW replace) with new value.
+        upsert_model_pricing(
+            &pool,
+            &crate::db::models::NewModelPricing {
+                model_id: "m1",
+                org_id: DEFAULT_ORG_ID,
+                prompt_per_1k: 0.9,
+                completion_per_1k: 2.0,
+                audio_per_min: 0.1,
+                image_each: 0.04,
+            },
+        )
+        .unwrap();
+        let pricing = get_model_pricing(&pool, DEFAULT_ORG_ID, "m1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pricing.prompt_per_1k, 0.9);
+        assert_eq!(pricing.completion_per_1k, 2.0);
+    }
+
+    #[test]
+    fn model_pricing_two_orgs_same_model_do_not_collide() {
+        let pool = fresh_db();
+        {
+            let conn = acquire(&pool).unwrap();
+            conn.execute(
+                "INSERT INTO organizations (org_id, name, slug, created_at) \
+                 VALUES ('org2', 'Org Two', 'org-two', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+        // Same model_id priced differently in two organizations.
+        upsert_model_pricing(
+            &pool,
+            &crate::db::models::NewModelPricing {
+                model_id: "gpt",
+                org_id: DEFAULT_ORG_ID,
+                prompt_per_1k: 1.0,
+                completion_per_1k: 2.0,
+                audio_per_min: 0.0,
+                image_each: 0.0,
+            },
+        )
+        .unwrap();
+        upsert_model_pricing(
+            &pool,
+            &crate::db::models::NewModelPricing {
+                model_id: "gpt",
+                org_id: "org2",
+                prompt_per_1k: 9.0,
+                completion_per_1k: 8.0,
+                audio_per_min: 0.0,
+                image_each: 0.0,
+            },
+        )
+        .unwrap();
+
+        // Each org keeps its own price; no cross-org clobber.
+        let default_org = get_model_pricing(&pool, DEFAULT_ORG_ID, "gpt")
+            .unwrap()
+            .unwrap();
+        let org2 = get_model_pricing(&pool, "org2", "gpt").unwrap().unwrap();
+        assert_eq!(default_org.prompt_per_1k, 1.0);
+        assert_eq!(default_org.completion_per_1k, 2.0);
+        assert_eq!(org2.prompt_per_1k, 9.0);
+        assert_eq!(org2.completion_per_1k, 8.0);
+
+        // Both rows physically coexist (distinct synthetic ids).
+        let count: i64 = acquire(&pool)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM model_pricing WHERE model_id = 'gpt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
     }
 }

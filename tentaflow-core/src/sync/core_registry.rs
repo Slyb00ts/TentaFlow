@@ -43,6 +43,8 @@ pub enum CoreSyncResourceKind {
     TokenUsageDaily,
     TokenQuota,
     TokenLease,
+    ModelMetricsRollup,
+    ModelPricing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,6 +430,28 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         retention: CoreSyncRetention::Durable,
         partition_suffix: "tokens",
     },
+    // Model performance/usage metrics. `model_metrics_rollup` is
+    // single-writer-per-row (each node accumulates only its own `id` rows; the
+    // mesh-wide figure is the SUM across all node rows) but replicates so any node
+    // can render fleet metrics; `model_pricing` is admin edited (LWW).
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::ModelMetricsRollup,
+        table_name: "model_metrics_rollup",
+        resource_type: "core.model_metrics_rollup",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "metrics",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::ModelPricing,
+        table_name: "model_pricing",
+        resource_type: "core.model_pricing",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "metrics",
+    },
 ];
 
 pub fn descriptor_for_kind(kind: CoreSyncResourceKind) -> &'static CoreSyncDescriptor {
@@ -521,6 +545,26 @@ mod tests {
         }
         // The legacy `users` table is no longer a sync resource.
         assert!(!is_core_sync_table("users"));
+    }
+
+    #[test]
+    fn registry_contains_model_metrics_tables() {
+        // Both metrics tables ARE core sync resources (mesh-wide replication):
+        // rollup is single-writer-per-row, pricing is LWW.
+        assert_eq!(
+            descriptor_for_table("model_metrics_rollup")
+                .map(|descriptor| descriptor.resource_type),
+            Some("core.model_metrics_rollup")
+        );
+        assert_eq!(
+            descriptor_for_table("model_pricing").map(|descriptor| descriptor.resource_type),
+            Some("core.model_pricing")
+        );
+        let rollup = descriptor_for_kind(CoreSyncResourceKind::ModelMetricsRollup);
+        assert_eq!(
+            rollup.partition_id("org-default", None).unwrap().as_str(),
+            "core/org/org-default/metrics"
+        );
     }
 
     #[test]
