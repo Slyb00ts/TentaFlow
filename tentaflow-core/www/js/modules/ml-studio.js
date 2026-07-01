@@ -1937,13 +1937,16 @@ function taskLabel(task) {
 // model dostępny w serwisie od pobieranego z HuggingFace (chip pochodzenia w f00).
 const FT_BASE_MODELS = [
   {
-    id: 'Qwen/Qwen3.5-0.8B',
-    name: 'Qwen3.5-0.8B',
-    sub: 'Mały, szybki — zalecany start dla większości fine-tuningów',
-    params: '0.8 B',
+    // Qwen2.5 (arch qwen2) działa z pinowanym transformers==4.46.3 i jest bez bramki.
+    // Qwen3.5 (qwen3_5) wymagałby nowszego transformers (łańcuch trl/peft) — świadomie
+    // rekomendujemy model, który trenuje się out-of-box na obecnym backendzie.
+    id: 'Qwen/Qwen2.5-0.5B-Instruct',
+    name: 'Qwen2.5-0.5B',
+    sub: 'Mały, szybki, bez bramki — zalecany start (działa out-of-box)',
+    params: '0.5 B',
     context: '32k',
     license: 'Apache-2.0',
-    source: 'serwis',
+    source: 'hf',
     recommended: true,
   },
   {
@@ -2008,7 +2011,40 @@ function defaultFtConfig() {
   };
 }
 
+// Konfiguracja fine-tuningu persystuje w localStorage per projekt — bez tego
+// „Zapisz konfigurację" ginęło po reloadzie (config był tylko w RAM). Merge z
+// defaultami toleruje starsze zapisy bez nowych pól.
+const FT_CONFIG_LS_PREFIX = 'ml-studio-ft-config:';
+
+function persistFtConfig(pid) {
+  try {
+    if (ftConfig[pid]) localStorage.setItem(FT_CONFIG_LS_PREFIX + pid, JSON.stringify(ftConfig[pid]));
+  } catch (_) {
+    // localStorage niedostępny (tryb prywatny) — config zostaje w pamięci sesji.
+  }
+}
+
+// Ładuje zapisany config z localStorage do pamięci (bez defaultów). Zwraca true,
+// gdy istniał zapis — Trening używa tego, by odróżnić „nigdy nie konfigurowano"
+// (pusty stan) od „skonfigurowano wcześniej" (hydratacja po reloadzie).
+function hydrateFtConfig(pid) {
+  if (ftConfig[pid]) return true;
+  try {
+    const raw = localStorage.getItem(FT_CONFIG_LS_PREFIX + pid);
+    if (raw) {
+      ftConfig[pid] = { ...defaultFtConfig(), ...JSON.parse(raw) };
+      return true;
+    }
+  } catch (_) {
+    // uszkodzony/niedostępny wpis — traktuj jak brak konfiguracji
+  }
+  return false;
+}
+
 function getFtConfig(pid) {
+  if (!ftConfig[pid]) {
+    hydrateFtConfig(pid);
+  }
   if (!ftConfig[pid]) ftConfig[pid] = defaultFtConfig();
   return ftConfig[pid];
 }
@@ -2230,7 +2266,7 @@ function renderFtModelTab(panel, p) {
       <div class="ml-studio-train-engine-body">
         <div class="ml-studio-train-engine-title">Własny z HuggingFace</div>
         <p class="ml-studio-train-engine-text">Wskaż dowolne repo HF zdolne do generacji LLM.</p>
-        <tf-input id="ml-studio-ft-custom-repo" placeholder="np. Qwen/Qwen3.5-0.8B-Instruct"
+        <tf-input id="ml-studio-ft-custom-repo" placeholder="np. Qwen/Qwen2.5-0.5B-Instruct"
                   value="${escapeAttr(cfg.customRepo || '')}"></tf-input>
         <div class="ml-studio-ft-origin-row">${ftSourceChip('hf')}<span class="ml-studio-ft-cap">capability sprawdzany po podaniu repo</span></div>
       </div>
@@ -2407,6 +2443,7 @@ function renderFtModelTab(panel, p) {
       toast('Podaj repo HuggingFace dla modelu „Własny".', 'error');
       return;
     }
+    persistFtConfig(pid);
     toast('Zapisano konfigurację fine-tuningu.', 'success');
   });
 
@@ -2453,7 +2490,10 @@ function renderFtTrainContent(panel, p, pid, datasets, { selectTab }) {
     panel.appendChild(empty);
     return;
   }
-  // Brak konfiguracji → kierujemy do zakładki Model bazowy.
+  // Brak konfiguracji → kierujemy do zakładki Model bazowy. Najpierw próba
+  // hydratacji zapisanego configu (localStorage) — po reloadzie/nowej sesji
+  // wcześniej zapisana konfiguracja wraca zamiast pustego stanu.
+  hydrateFtConfig(pid);
   if (!ftConfig[pid]) {
     panel.innerHTML = '';
     const empty = document.createElement('tf-empty-state');
