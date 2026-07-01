@@ -896,7 +896,7 @@ async function openDeployModal() {
       </div>
       <div class="form-group">
         <label>${escapeHtml(I18n.t('cluster_detail.deploy_gpu_mem'))}</label>
-        <tf-input id="dep-gpumem" type="number" min="0.1" max="1.0" step="0.05" value="0.6"></tf-input>
+        <tf-input id="dep-gpumem" type="number" min="0.1" max="1.0" step="0.05" value="0.5"></tf-input>
       </div>
       <div class="form-group">
         <label>${escapeHtml(I18n.t('cluster_detail.deploy_max_len'))}</label>
@@ -955,7 +955,7 @@ async function openDeployModal() {
   }
   const served = String(body.querySelector('#dep-served')?.value || '').trim();
   const gpusPerNode = Math.max(1, parseInt(body.querySelector('#dep-gpus')?.value, 10) || 1);
-  const gpuMem = parseFloat(body.querySelector('#dep-gpumem')?.value) || 0.6;
+  const gpuMem = parseFloat(body.querySelector('#dep-gpumem')?.value) || 0.5;
   const maxLen = parseInt(body.querySelector('#dep-maxlen')?.value, 10) || 8192;
   const port = parseInt(body.querySelector('#dep-port')?.value, 10) || 8100;
   const engineId = body.querySelector('#dep-engine')?.value || defaultEngineId();
