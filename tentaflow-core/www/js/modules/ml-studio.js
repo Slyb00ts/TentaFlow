@@ -1966,7 +1966,7 @@ const FT_BASE_MODELS = [
 
 // Parametryzacja (oś 2) — karty z badge szacowanej VRAM. Wartości jak w f01.
 const FT_METHODS = [
-  { id: 'qlora', name: 'QLoRA', desc: '4-bit baza + adaptery LoRA. Najniższa VRAM.', vram: '~8 GB', tone: 'low', lora: true },
+  { id: 'qlora', name: 'QLoRA', desc: '4-bit baza + adaptery LoRA. Najniższa VRAM. Wymaga GPU CUDA (Linux/Windows) — na Apple/CPU degraduje do LoRA.', vram: '~8 GB', tone: 'low', lora: true },
   { id: 'lora', name: 'LoRA', desc: 'Baza 16-bit + adaptery. Lepsza jakość niż QLoRA.', vram: '~16 GB', tone: 'mid', lora: true },
   { id: 'dora', name: 'DoRA', desc: 'LoRA z dekompozycją wagi — wyższa wierność.', vram: '~18 GB', tone: 'high', lora: true },
   { id: 'full', name: 'Full', desc: 'Pełny fine-tune wszystkich wag. Najlepsza jakość.', vram: '~24 GB', tone: 'max', lora: false },
