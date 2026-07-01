@@ -209,14 +209,19 @@ export async function openDeployWizard(engineId, opts = {}) {
   }
 
   if (selection.isCluster) {
-    // The advanced VRAM calculator runs against a single representative member's
-    // GPUs; the real tensor-parallel size (members × gpusPerNode) is computed by
-    // the backend at deploy time. Pick the first member that the mesh reports
-    // with GPUs so the calculator has an inventory to read.
+    // Cluster deploy is tensor-parallel: the model is sharded across EVERY GPU
+    // of EVERY member (TP = members × gpusPerNode). Pick a representative member
+    // that the mesh reports with GPUs so the calculator can read a per-GPU VRAM
+    // and derive gpusPerNode from real hardware — TP must be known already in the
+    // Advanced step, which runs before cluster-config.
     selection.clusterMembers = await fetchClusterMembers(selection.clusterId);
     const memberIds = selection.clusterMembers.map((m) => m.node_id).filter(Boolean);
     const withGpu = memberIds.find((id) => nodeGpus(id).length > 0);
     selection.nodeId = withGpu || memberIds[0] || selection.nodeId;
+    // gpusPerNode can never exceed a node's physical GPU count. DGX Spark exposes
+    // 1 GPU/node → gpusPerNode=1, TP=members. This makes TP deterministic from
+    // cluster hardware and available to the Advanced VRAM calculator.
+    selection.gpusPerNode = Math.max(1, nodeGpus(selection.nodeId).length);
     // Unified GB10 memory OOM-kills at 0.9; 0.5 is the safe cluster default.
     selection.advanced.gpu_memory_utilization = 0.5;
   }
@@ -818,15 +823,57 @@ function getAdvancedGpus() {
   return allGpus; // 'all'
 }
 
+// Full tensor-parallel device list for a cluster deploy. TP shards the model
+// across every GPU of every member (members × gpusPerNode), so the VRAM
+// calculator must see ALL devices — not one node's GPUs. Each member contributes
+// `gpusPerNode` devices carrying that node's per-GPU VRAM; members whose GPU
+// inventory has not yet propagated over the mesh reuse the representative node's
+// per-GPU VRAM (identical Spark hardware). Single-node deploy falls back to the
+// unchanged single-node path.
+function getClusterAdvancedGpus() {
+  if (!selection.isCluster) return getAdvancedGpus();
+  const perNode = Math.max(1, Number(selection.gpusPerNode) || 1);
+  const members = selection.clusterMembers || [];
+  const gpuMemGb = (g) =>
+    g ? Math.round(((g.vram_total_mb || g.memory_mb || 0) / 1024) * 10) / 10 : 0;
+  const repGpus = nodeGpus(selection.nodeId);
+  const fallbackMem = gpuMemGb(repGpus[0]);
+  const fallbackName = (repGpus[0] && repGpus[0].name) || 'GPU';
+  const out = [];
+  let idx = 0;
+  for (const m of members) {
+    if (!m || !m.node_id) continue;
+    const gpus = nodeGpus(m.node_id);
+    for (let i = 0; i < perNode; i += 1) {
+      const g = gpus[i] || gpus[0] || null;
+      out.push({
+        index: idx,
+        name: (g && g.name) || fallbackName,
+        memory_gb: gpuMemGb(g) || fallbackMem,
+      });
+      idx += 1;
+    }
+  }
+  return out.filter((g) => g.memory_gb > 0);
+}
+
 async function fetchVllmRecommendation(overrides = {}) {
   const model = getAdvancedModelName();
-  const gpus = getAdvancedGpus();
+  const gpus = selection.isCluster ? getClusterAdvancedGpus() : getAdvancedGpus();
   if (!model || gpus.length === 0) return null;
   const body = {
     model,
     gpus,
     ...overrides,
   };
+  // Cluster deploy is tensor-parallel across the whole cluster. The backend
+  // computes weights-per-GPU as model/TP, so lock TP = members × gpusPerNode
+  // (the full device count sent above). This mirrors the deploy-time TP exactly,
+  // so the VRAM budget the user sees is the real distributed budget.
+  if (selection.isCluster) {
+    body.tensor_parallel = clusterTpSize();
+    body.lock_tensor_parallel = true;
+  }
   // Jawne pole `engine` mowi backendowi ktorym modelem fizycznym liczyc VRAM.
   // Bez niego GGUF wykrywa sie po nazwie pliku, ale jawne pole jest pewne i
   // dziala tez dla nie-GGUF modeli llama.cpp. MLX czyta config.json (NIE GGUF),
@@ -1014,11 +1061,19 @@ function renderStepAdvanced() {
     return renderMlxAdvanced();
   }
   const model = getAdvancedModelName() || '?';
-  const gpus = getAdvancedGpus();
+  const gpus = selection.isCluster ? getClusterAdvancedGpus() : getAdvancedGpus();
   const totalVramGb = gpus.reduce((acc, g) => acc + g.memory_gb, 0);
-  const gpuLabel = gpus.length > 0
-    ? `${gpus.length} × ${gpus[0].name} · ${totalVramGb.toFixed(1)} GB VRAM`
-    : '—';
+  // Cluster: make it explicit this is a distributed tensor-parallel budget
+  // (N GPU across M nodes), not a single "1 × Spark · 119 GB" node.
+  const members = selection.clusterMembers.length || 0;
+  const perNode = Math.max(1, Number(selection.gpusPerNode) || 1);
+  const gpuLabel = selection.isCluster
+    ? (gpus.length > 0
+      ? `Distributed tensor-parallel: ${gpus.length} GPU (${members} × ${perNode} GPU/node) · ${totalVramGb.toFixed(1)} GB · TP=${gpus.length}`
+      : '—')
+    : (gpus.length > 0
+      ? `${gpus.length} × ${gpus[0].name} · ${totalVramGb.toFixed(1)} GB VRAM`
+      : '—');
 
   const adv = selection.advanced;
   const rec = advancedRecommendation;
@@ -1043,7 +1098,9 @@ function renderStepAdvanced() {
         <div class="adv-summary-cell">
           <div class="adv-cell-label">${escapeHtml(tk('summary_gpu'))}</div>
           <div class="adv-cell-value">${escapeHtml(gpuLabel)}</div>
-          <div class="adv-cell-sub">${gpus.map((g) => `GPU ${g.index}`).join(' · ') || '—'}</div>
+          <div class="adv-cell-sub">${escapeHtml(selection.isCluster
+            ? (selection.clusterMembers.map((m) => nodeDisplayName(m.node_id)).filter(Boolean).join(' · ') || '—')
+            : (gpus.map((g) => `GPU ${g.index}`).join(' · ') || '—'))}</div>
         </div>
       </div>
     </div>
@@ -1947,7 +2004,11 @@ function clusterTpSize() {
 
 function renderStepClusterConfig() {
   const members = selection.clusterMembers.length || 0;
-  const gpus = Math.max(1, Number(selection.gpusPerNode) || 1);
+  // gpusPerNode is bounded by the representative node's physical GPU count.
+  // Spark = 1 GPU/node → the field locks to 1; multi-GPU nodes let the user pick.
+  const maxGpusPerNode = Math.max(1, nodeGpus(selection.nodeId).length);
+  const gpus = Math.min(maxGpusPerNode, Math.max(1, Number(selection.gpusPerNode) || 1));
+  const gpusLocked = maxGpusPerNode <= 1;
   const p = selection.pricing;
 
   let modelSummary = '';
@@ -1965,7 +2026,8 @@ function renderStepClusterConfig() {
     ${modelSummary ? `<div class="form-group"><label>${escapeHtml(I18n.t('wizard.modelLabel'))}</label>${modelSummary}</div>` : ''}
 
     <div class="form-group">
-      <tf-input type="number" id="edw-cluster-gpus" min="1" max="8"
+      <tf-input type="number" id="edw-cluster-gpus" min="1" max="${maxGpusPerNode}"
+        ${gpusLocked ? 'disabled' : ''}
         label="${escapeAttr(tCluster('gpus_per_node'))}"
         value="${escapeAttr(String(gpus))}"></tf-input>
       <div class="cluster-deploy-tp-preview" style="margin-top:6px;">
@@ -2003,14 +2065,19 @@ function renderStepClusterConfig() {
 function bindStepClusterConfigInputs() {
   const gpusInput = document.getElementById('edw-cluster-gpus');
   if (gpusInput) {
+    const maxGpusPerNode = Math.max(1, nodeGpus(selection.nodeId).length);
     const onGpus = (e) => {
       const raw = e.detail?.value ?? gpusInput.value;
-      const v = Math.max(1, Math.min(8, parseInt(raw, 10) || 1));
+      const v = Math.max(1, Math.min(maxGpusPerNode, parseInt(raw, 10) || 1));
       selection.gpusPerNode = v;
       const tpEl = document.getElementById('edw-cluster-tp');
       const echoEl = document.getElementById('edw-cluster-gpus-echo');
       if (tpEl) tpEl.textContent = String(clusterTpSize());
       if (echoEl) echoEl.textContent = String(v);
+      // TP world size changed → the Advanced VRAM budget (weights = model/TP) is
+      // now stale. Invalidate it so the calculator re-fetches with the new TP
+      // when the user steps back into Advanced.
+      advancedRecommendation = null;
     };
     gpusInput.addEventListener('input', onGpus);
     gpusInput.addEventListener('change', onGpus);
