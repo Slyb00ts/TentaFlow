@@ -2032,7 +2032,12 @@ function hydrateFtConfig(pid) {
   try {
     const raw = localStorage.getItem(FT_CONFIG_LS_PREFIX + pid);
     if (raw) {
-      ftConfig[pid] = { ...defaultFtConfig(), ...JSON.parse(raw) };
+      const saved = JSON.parse(raw);
+      const def = defaultFtConfig();
+      const savedHp = saved && typeof saved.hyperparams === 'object' && saved.hyperparams;
+      // Deep-merge `hyperparams`: częściowy/stary zapis (albo null) nie może wyzerować
+      // nowych pól — inaczej summary/payload dostają undefined, a null crashuje zakładkę.
+      ftConfig[pid] = { ...def, ...saved, hyperparams: { ...def.hyperparams, ...(savedHp || {}) } };
       return true;
     }
   } catch (_) {
