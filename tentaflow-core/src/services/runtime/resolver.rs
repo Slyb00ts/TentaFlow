@@ -122,6 +122,12 @@ impl AliasResolver {
             local_node_id: Arc::new(move || local_node_id.clone()),
         }
     }
+
+    /// Biezacy id lokalnego wezla (writer dla metryk modeli). Reuse tego samego
+    /// providera co resolver, zeby metryki i routing zawsze widzialy ten sam id.
+    pub fn local_node_id(&self) -> String {
+        (self.local_node_id)()
+    }
 }
 
 /// Helper dla `Router::new` (R1.5e). Zwraca closure ktora przy kazdym wywolaniu

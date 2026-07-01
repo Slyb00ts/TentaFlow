@@ -278,6 +278,151 @@ impl ModelRuntimeExecutor {
         Ok(())
     }
 
+    /// Wspolne wymiary tozsamosci (writer + tenant + user) dla metryk modelu.
+    /// `node_id` to ZAWSZE lokalny wezel (single-writer per row — kazdy wezel
+    /// zapisuje wlasne wiersze). `org`/`user` z `ctx`, z sentinelami jak reszta
+    /// hot-path telemetrii (`org-default` / `__system__`).
+    fn metric_identity(&self, ctx: &ExecutionContext) -> (String, String, String) {
+        let node_id = self.resolver.local_node_id();
+        let org_id = ctx
+            .org_id
+            .as_deref()
+            .unwrap_or(crate::services::org::DEFAULT_ORG_ID)
+            .to_string();
+        let user_id = ctx
+            .user
+            .as_ref()
+            .map(|u| u.user_id.clone())
+            .unwrap_or_else(|| crate::db::repository::TOKEN_USAGE_SYSTEM_USER.to_string());
+        (node_id, org_id, user_id)
+    }
+
+    /// Metryki jednego OBSLUZONEGO LOKALNIE requestu (sukces). MeshForward i Flow
+    /// sa POMIJANE: MeshForward realnie wykonuje zdalny wezel (jego executor
+    /// zapisuje metryke pod swoim `node_id` — brak double-count na koordynatorze),
+    /// a Flow ma wlasne wpiecie z bogatszym `perf` z `FlowExecutionOutcome`.
+    fn record_served_metrics(
+        &self,
+        target: &ResolvedExecutionTarget,
+        ctx: &ExecutionContext,
+        modality: &str,
+        usage: Option<&crate::api::openai::types::Usage>,
+        perf: Option<&crate::api::openai::types::GenPerf>,
+        e2e_ms: Option<u32>,
+    ) {
+        let Some(db) = self.db.as_ref() else {
+            return;
+        };
+        if matches!(
+            target,
+            ResolvedExecutionTarget::MeshForward { .. } | ResolvedExecutionTarget::Flow { .. }
+        ) {
+            return;
+        }
+        let (node_id, org_id, user_id) = self.metric_identity(ctx);
+        let backend = target.telemetry_tag();
+        let model_id = target.requested_model();
+        let service_key = format!("{backend}/{model_id}");
+        let is_embedding = modality == "embedding";
+        let prompt_tokens = usage.map(|u| u.prompt_tokens as i64).unwrap_or(0);
+        let completion_tokens = usage.map(|u| u.completion_tokens as i64).unwrap_or(0);
+        let total_tokens = usage.map(|u| u.total_tokens as i64).unwrap_or(0);
+        let e2e_latency_ms = e2e_ms
+            .map(|v| v as i64)
+            .or_else(|| perf.map(|p| p.total_ms as i64))
+            .unwrap_or(0);
+        bump_model_metric_row(
+            db,
+            &ModelMetricInput {
+                node_id: &node_id,
+                org_id: &org_id,
+                user_id: &user_id,
+                model_id,
+                service_key: &service_key,
+                backend,
+                modality,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                embedding_tokens: if is_embedding { total_tokens } else { 0 },
+                e2e_latency_ms,
+                ttft_sample: perf.and_then(|p| (p.ttft_ms > 0).then_some(p.ttft_ms as i64)),
+                decode_tps_sample: perf
+                    .and_then(|p| (p.decode_tps > 0.0).then_some(p.decode_tps as f64)),
+                e2e_sample: (e2e_latency_ms > 0).then_some(e2e_latency_ms),
+                is_error: false,
+            },
+        );
+    }
+
+    /// Metryki zakonczonego-bledem requestu. Wolane RAZ, gdy `execute_*` zwraca
+    /// `Err` po wyczerpaniu wszystkich kandydatow (nie per-proba retry). `backend`
+    /// to tag ostatniego probowanego kandydata; brak tokenow/perf.
+    fn record_error_metrics(
+        &self,
+        ctx: &ExecutionContext,
+        model_id: &str,
+        backend: &str,
+        modality: &str,
+    ) {
+        let Some(db) = self.db.as_ref() else {
+            return;
+        };
+        let (node_id, org_id, user_id) = self.metric_identity(ctx);
+        let service_key = format!("{backend}/{model_id}");
+        bump_model_metric_row(
+            db,
+            &ModelMetricInput {
+                node_id: &node_id,
+                org_id: &org_id,
+                user_id: &user_id,
+                model_id,
+                service_key: &service_key,
+                backend,
+                modality,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                embedding_tokens: 0,
+                e2e_latency_ms: 0,
+                ttft_sample: None,
+                decode_tps_sample: None,
+                e2e_sample: None,
+                is_error: true,
+            },
+        );
+    }
+
+    /// Buduje lekki recorder metryk dla streamu (Local Http/Quic). Wymiary
+    /// klonowane do `String`, bo `ExternalPerfStream` drenuje w osobnym tasku bez
+    /// dostepu do `target`/`ctx`. `None` gdy brak db albo target nie jest lokalny.
+    fn stream_recorder(
+        &self,
+        target: &ResolvedExecutionTarget,
+        ctx: &ExecutionContext,
+    ) -> Option<StreamMetricsRecorder> {
+        let db = self.db.as_ref()?.clone();
+        if matches!(
+            target,
+            ResolvedExecutionTarget::MeshForward { .. } | ResolvedExecutionTarget::Flow { .. }
+        ) {
+            return None;
+        }
+        let (node_id, org_id, user_id) = self.metric_identity(ctx);
+        let backend = target.telemetry_tag();
+        let model_id = target.requested_model().to_string();
+        let service_key = format!("{backend}/{model_id}");
+        Some(StreamMetricsRecorder {
+            db,
+            node_id,
+            org_id,
+            user_id,
+            model_id,
+            service_key,
+            backend: backend.to_string(),
+        })
+    }
+
     /// Non-streaming chat completion. Resolves the requested model into a
     /// candidate list, ranks per alias strategy, and tries candidates in
     /// order. First success wins; aggregate failure surfaces the last
@@ -294,6 +439,8 @@ impl ModelRuntimeExecutor {
         request: ChatCompletionRequest,
         ctx: &mut ExecutionContext,
     ) -> Result<ChatCompletionResponse, ExecutorError> {
+        // Znacznik e2e (dispatch -> odpowiedz) dla metryk modelu.
+        let dispatch_at = std::time::Instant::now();
         let outcome = {
             let snapshot = self.catalog.snapshot();
             let req = self.build_chat_resolve_request(&request);
@@ -326,6 +473,15 @@ impl ModelRuntimeExecutor {
                         attempts,
                         target.telemetry_tag(),
                     );
+                    let e2e_ms = dispatch_at.elapsed().as_millis() as u32;
+                    self.record_served_metrics(
+                        &target,
+                        ctx,
+                        "chat",
+                        response.usage.as_ref(),
+                        None,
+                        Some(e2e_ms),
+                    );
                     return Ok(response);
                 }
                 Err(e) if e.aborts_fallback_chain() => {
@@ -357,6 +513,16 @@ impl ModelRuntimeExecutor {
             return Err(ExecutorError::TransportPendingCutover(kind));
         }
 
+        // Request zakonczony bledem po wyczerpaniu wszystkich kandydatow — jeden
+        // wpis error na koordynatorze (nie per-proba). Dla MeshForward NIE
+        // zapisujemy error: jesli zdalny wezel dostal request, sam zapisal swoj
+        // wiersz error pod swoim node_id (analogicznie do pomijania success dla
+        // MeshForward). Jesli zdalny byl NIEOSIAGALNY (request nigdy nie dotarl),
+        // error nie zostanie policzony nigdzie — akceptujemy to jako mniejsze zlo
+        // niz inflacja error-rate podwojnym liczeniem.
+        if last_kind != "mesh_forward" {
+            self.record_error_metrics(ctx, &request.model, last_kind, "chat");
+        }
         Err(ExecutorError::AllCandidatesFailed {
             target_kind: last_kind,
             attempts,
@@ -507,11 +673,16 @@ impl ModelRuntimeExecutor {
                     // realnego startu (wysłanie requestu + odbiór nagłówków), nie od
                     // spawnu wrappera, który następuje już po `await`.
                     let dispatch_at = std::time::Instant::now();
+                    let recorder = self.stream_recorder(target, ctx);
                     let stream = client
                         .chat_completion_stream(request)
                         .await
                         .map_err(|e| ExecutorError::Internal(e.to_string()))?;
-                    Ok(Box::pin(ExternalPerfStream::new(stream, dispatch_at)))
+                    Ok(Box::pin(ExternalPerfStream::new(
+                        stream,
+                        dispatch_at,
+                        recorder,
+                    )))
                 }
                 BackendHandle::Quic(handle) => {
                     let quic_client = handle.get_client().await.ok_or_else(|| {
@@ -549,6 +720,7 @@ impl ModelRuntimeExecutor {
                     // Zegar dispatchu sprzed wysłania QUIC — TTFT/total od realnego
                     // startu requestu, nie od spawnu wrappera po `await`.
                     let dispatch_at = std::time::Instant::now();
+                    let recorder = self.stream_recorder(target, ctx);
                     let quic_stream = quic_client
                         .send_request_stream(model_request)
                         .await
@@ -696,7 +868,11 @@ impl ModelRuntimeExecutor {
                             }
                         }
                     });
-                    Ok(Box::pin(ExternalPerfStream::new(Box::pin(stream), dispatch_at)))
+                    Ok(Box::pin(ExternalPerfStream::new(
+                        Box::pin(stream),
+                        dispatch_at,
+                        recorder,
+                    )))
                 }
             },
             ResolvedExecutionTarget::MeshForward {
@@ -1105,6 +1281,10 @@ impl ModelRuntimeExecutor {
                 let outcome =
                     dispatch_result.map_err(|e| ExecutorError::Internal(e.to_string()))?;
 
+                // No flow-level metric row here: the flow's internal LLM node
+                // calls back into `ModelRuntimeExecutor::execute_chat`, which
+                // records the real per-model row with identical tokens+perf.
+                // Recording a `flow_engine` row too would double-count tokens.
                 Ok(crate::routing::chat::flow_outcome_to_chat_response(
                     outcome,
                     &request.model,
@@ -1294,6 +1474,7 @@ impl ModelRuntimeExecutor {
         request: EmbeddingRequest,
         ctx: &mut ExecutionContext,
     ) -> Result<EmbeddingResponse, ExecutorError> {
+        let dispatch_at = std::time::Instant::now();
         let outcome = {
             let snapshot = self.catalog.snapshot();
             // OpenAI `/v1/embeddings` is text-in / vector-out. Constrain the
@@ -1335,6 +1516,20 @@ impl ModelRuntimeExecutor {
                         attempts,
                         target.telemetry_tag(),
                     );
+                    let e2e_ms = dispatch_at.elapsed().as_millis() as u32;
+                    let usage = crate::api::openai::types::Usage {
+                        prompt_tokens: response.usage.prompt_tokens,
+                        completion_tokens: 0,
+                        total_tokens: response.usage.total_tokens,
+                    };
+                    self.record_served_metrics(
+                        &target,
+                        ctx,
+                        "embedding",
+                        Some(&usage),
+                        None,
+                        Some(e2e_ms),
+                    );
                     return Ok(response);
                 }
                 Err(e) if e.aborts_fallback_chain() => return Err(e),
@@ -1356,6 +1551,12 @@ impl ModelRuntimeExecutor {
             return Err(ExecutorError::TransportPendingCutover(kind));
         }
 
+        // MeshForward error jest zapisywany przez zdalny wezel pod jego node_id
+        // (jesli request dotarl); koordynator go pomija, zeby nie liczyc dwa razy.
+        // Zdalny nieosiagalny → error niepoliczony nigdzie (mniejsze zlo).
+        if last_kind != "mesh_forward" {
+            self.record_error_metrics(ctx, &request.model, last_kind, "embedding");
+        }
         Err(ExecutorError::AllCandidatesFailed {
             target_kind: last_kind,
             attempts,
@@ -1614,6 +1815,10 @@ impl ModelRuntimeExecutor {
                     EmbeddingInput::Single(_) => 1,
                     EmbeddingInput::Multiple(texts) => texts.len(),
                 };
+                // No flow-level metric row: the flow's internal embeddings node
+                // calls back into `ModelRuntimeExecutor::execute_embeddings`,
+                // which records the real per-model row with identical
+                // tokens+perf. A `flow_engine` row would double-count.
                 flow_outcome_to_embedding_response(outcome, &request, expected_count)
             }
         }
@@ -2343,6 +2548,8 @@ impl ModelRuntimeExecutor {
     /// returns and reuse the request format as the wire-side hint.
     ///
     /// **ACL is the caller's responsibility.**
+    // TODO Chunk 2b: TTS/STT metrics need usage/duration plumbing (audio_ms,
+    // char count) before they can feed `model_metrics_rollup`.
     pub async fn execute_tts(
         &self,
         request: TTSRequest,
@@ -2709,6 +2916,8 @@ impl ModelRuntimeExecutor {
     /// `SttBackend(error)` zeby user zobaczyl klarowny blad.
     /// Gdy `model` jest pusty / brak kandydatow → fallback do default
     /// local whisper (zachowuje pre-existing UX dla single-engine node'u).
+    // TODO Chunk 2b: TTS/STT metrics need usage/duration plumbing (audio_ms,
+    // transcript tokens) before they can feed `model_metrics_rollup`.
     pub async fn execute_stt(
         &self,
         request: TranscriptionRequest,
@@ -3654,7 +3863,11 @@ impl ExternalPerfStream {
     /// `start` to znacznik DISPATCHU (sprzed wysłania requestu HTTP/QUIC), nie
     /// moment spawnu tego wrappera — inaczej TTFT/total gubiłyby czas wysłania
     /// nagłówków i odbioru odpowiedzi serwera. Klient mierzy realną latencję.
-    fn new(mut inner: ExecutorChunkStream, start: std::time::Instant) -> Self {
+    fn new(
+        mut inner: ExecutorChunkStream,
+        start: std::time::Instant,
+        recorder: Option<StreamMetricsRecorder>,
+    ) -> Self {
         // Bounded (wysoki cap): normalne odpowiedzi mieszczą się bez tarcia, a
         // patologiczny zawieszony konsument dostaje backpressure zamiast OOM przy
         // długiej generacji. Eager-drain dalej stempluje czasy przy przybyciu.
@@ -3669,6 +3882,9 @@ impl ExternalPerfStream {
             use futures::StreamExt;
             let mut first_token_at: Option<std::time::Instant> = None;
             let mut last_token_at: Option<std::time::Instant> = None;
+            // Exact-once: metryka (success ALBO error) zapisywana DOKLADNIE RAZ na
+            // strumien, nawet gdy backend wysle >1 chunk z usage.
+            let mut recorded = false;
             loop {
                 tokio::select! {
                     // Anti-hang: gdy konsument porzuci `rx`, kończymy nawet jeśli
@@ -3711,6 +3927,19 @@ impl ExternalPerfStream {
                                         last_token_at,
                                         chunk.usage.as_ref(),
                                     ));
+                                    // Finalny chunk niesie usage + swiezo doklejony
+                                    // perf — jedyny punkt streamu gdzie oba wspolistnieja,
+                                    // wiec tu (raz) stemplujemy metryke modelu.
+                                    if !recorded {
+                                        if let Some(rec) = &recorder {
+                                            if let (Some(u), Some(p)) =
+                                                (chunk.usage.as_ref(), chunk.perf.as_ref())
+                                            {
+                                                rec.record(u, p);
+                                                recorded = true;
+                                            }
+                                        }
+                                    }
                                 }
                                 if tx.send(Ok(chunk)).await.is_err() {
                                     // Konsument odpadł → kończymy drenowanie (anti-hang).
@@ -3724,6 +3953,15 @@ impl ExternalPerfStream {
                             None => break,
                         }
                     }
+                }
+            }
+            // Strumien skonczyl sie bez finalnego chunku usage (upstream error,
+            // EOF bez usage-tail, albo drop konsumenta przez `tx.closed()`) —
+            // zapisz wiersz BLEDU raz, zeby error-rate lapal porzucone/blednie
+            // zakonczone strumienie. Guard `recorded` gwarantuje exact-once.
+            if !recorded {
+                if let Some(rec) = &recorder {
+                    rec.record_error();
                 }
             }
         });
@@ -3861,6 +4099,166 @@ fn served_by(target: &ResolvedExecutionTarget) -> Option<String> {
     }
 }
 
+/// Wersja rozkladu kubelkow histogramow (musi zgadzac sie z `bump_histogram_bucket`
+/// w repository.rs). Bump z ta sama wersja laczy sie w ten sam wiersz rollupu.
+const MODEL_METRICS_HISTOGRAM_VERSION: i64 = 1;
+
+/// Znormalizowane wejscie jednego zapisu metryk modelu. Grupuje wymiary +
+/// liczniki w jeden argument, zeby `bump_model_metric_row` nie mial dziesiatek
+/// parametrow (clippy `too_many_arguments`). Wszystkie pola sa juz policzone
+/// przez callera — ta warstwa tylko mapuje na struktury repozytorium.
+struct ModelMetricInput<'a> {
+    node_id: &'a str,
+    org_id: &'a str,
+    user_id: &'a str,
+    model_id: &'a str,
+    service_key: &'a str,
+    backend: &'a str,
+    modality: &'a str,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    total_tokens: i64,
+    embedding_tokens: i64,
+    e2e_latency_ms: i64,
+    /// Proba do histogramu TTFT — `Some` tylko dla realnego pomiaru (>0).
+    ttft_sample: Option<i64>,
+    /// Proba do histogramu decode tok/s — `Some` tylko dla realnego pomiaru (>0).
+    decode_tps_sample: Option<f64>,
+    /// Proba do histogramu e2e — `Some` tylko dla realnego pomiaru (>0).
+    e2e_sample: Option<i64>,
+    is_error: bool,
+}
+
+/// Jeden punkt zapisu do `model_metrics_rollup`. Metryki nie moga wywrocic
+/// requestu — blad zapisu jest tylko logowany (`warn`). `hour_bucket` liczony
+/// tutaj (RFC3339 przyciety do godziny), zeby kazdy caller mial identyczny format.
+fn bump_model_metric_row(db: &crate::db::DbPool, input: &ModelMetricInput<'_>) {
+    let hour_bucket = chrono::Utc::now().format("%Y-%m-%dT%H:00:00Z").to_string();
+    let dims = crate::db::models::ModelMetricsDims {
+        node_id: input.node_id,
+        org_id: input.org_id,
+        user_id: input.user_id,
+        model_id: input.model_id,
+        service_key: input.service_key,
+        backend: input.backend,
+        modality: input.modality,
+        hour_bucket: &hour_bucket,
+        histogram_version: MODEL_METRICS_HISTOGRAM_VERSION,
+    };
+    let counters = crate::db::models::ModelMetricsCounters {
+        request_count: 1,
+        success_count: if input.is_error { 0 } else { 1 },
+        error_count: if input.is_error { 1 } else { 0 },
+    };
+    let tokens = crate::db::models::ModelMetricsTokens {
+        prompt_tokens: input.prompt_tokens,
+        completion_tokens: input.completion_tokens,
+        total_tokens: input.total_tokens,
+        embedding_tokens: input.embedding_tokens,
+        audio_ms: 0,
+        images: 0,
+    };
+    let times = crate::db::models::ModelMetricsTimes {
+        // prefill/decode sumy czasow swiadomie pominiete: GenPerf niesie tok/s,
+        // nie sekundy, a przeliczanie ich na czas byloby zgadywaniem. Histogramy
+        // ttft/decode_tps niosa realny obraz wydajnosci. queue_ms brak pomiaru.
+        prefill_secs: 0.0,
+        decode_secs: 0.0,
+        e2e_latency_ms: input.e2e_latency_ms,
+        queue_ms: 0,
+    };
+    let perf = crate::db::models::ModelMetricsPerfSamples {
+        ttft_ms: input.ttft_sample,
+        decode_tps: input.decode_tps_sample,
+        e2e_ms: input.e2e_sample,
+    };
+    if let Err(e) = crate::db::repository::bump_model_metrics_rollup(
+        db, &dims, &counters, &tokens, &times, &perf,
+    ) {
+        tracing::warn!(
+            model_id = input.model_id,
+            error = %e,
+            "model metrics rollup bump failed (metrics dropped, request unaffected)"
+        );
+    }
+}
+
+/// Lekki uchwyt do zapisu metryk ze strumienia. `ExternalPerfStream` drenuje
+/// chunki w osobnym tasku (bez `ctx`/`target`), wiec wymiary klonujemy do prostych
+/// `String` przy budowie streamu i stemplujemy metryke na finalnym chunku (tym,
+/// ktory niesie `usage` + doklejony `perf`). Modalnosc zawsze `chat` — to jedyna
+/// sciezka streamujaca przez ten wrapper.
+#[derive(Clone)]
+struct StreamMetricsRecorder {
+    db: crate::db::DbPool,
+    node_id: String,
+    org_id: String,
+    user_id: String,
+    model_id: String,
+    service_key: String,
+    backend: String,
+}
+
+impl StreamMetricsRecorder {
+    fn record(
+        &self,
+        usage: &crate::api::openai::types::Usage,
+        perf: &crate::api::openai::types::GenPerf,
+    ) {
+        let e2e_ms = perf.total_ms as i64;
+        bump_model_metric_row(
+            &self.db,
+            &ModelMetricInput {
+                node_id: &self.node_id,
+                org_id: &self.org_id,
+                user_id: &self.user_id,
+                model_id: &self.model_id,
+                service_key: &self.service_key,
+                backend: &self.backend,
+                modality: "chat",
+                prompt_tokens: usage.prompt_tokens as i64,
+                completion_tokens: usage.completion_tokens as i64,
+                total_tokens: usage.total_tokens as i64,
+                embedding_tokens: 0,
+                e2e_latency_ms: e2e_ms,
+                ttft_sample: (perf.ttft_ms > 0).then_some(perf.ttft_ms as i64),
+                decode_tps_sample: (perf.decode_tps > 0.0).then_some(perf.decode_tps as f64),
+                e2e_sample: (e2e_ms > 0).then_some(e2e_ms),
+                is_error: false,
+            },
+        );
+    }
+
+    /// Wiersz BLEDU dla strumienia, ktory zakonczyl sie bez finalnego chunku
+    /// usage: upstream error, EOF bez usage-tail, albo drop konsumenta
+    /// (`tx.closed()`). Bez tokenow/perf — liczy sie wylacznie do error-rate.
+    /// Rozroznienie "drop konsumenta" vs "blad backendu" jest tu niepewne, wiec
+    /// oba traktujemy jako error (lepsze niz gubienie porzuconych strumieni).
+    fn record_error(&self) {
+        bump_model_metric_row(
+            &self.db,
+            &ModelMetricInput {
+                node_id: &self.node_id,
+                org_id: &self.org_id,
+                user_id: &self.user_id,
+                model_id: &self.model_id,
+                service_key: &self.service_key,
+                backend: &self.backend,
+                modality: "chat",
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                embedding_tokens: 0,
+                e2e_latency_ms: 0,
+                ttft_sample: None,
+                decode_tps_sample: None,
+                e2e_sample: None,
+                is_error: true,
+            },
+        );
+    }
+}
+
 /// HF repo dla embedded TTS na podstawie `engine_id` + `model_name` (preset id
 /// z katalogu). Mapowanie preset→repo zyje w manifescie silnika; gdy go nie ma,
 /// `model_name` traktujemy jako bezposrednie repo (single-voice deploy).
@@ -3882,6 +4280,130 @@ fn resolve_embedded_tts_repo(engine_id: &str, model_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Chunk 2: `bump_model_metric_row` mapuje `ModelMetricInput` na wiersz
+    /// `model_metrics_rollup` — sprawdzamy wymiary (model/backend/service_key),
+    /// liczniki (sukces vs `is_error`), `embedding_tokens` dla modalnosci
+    /// embedding oraz bramkowanie histogramow (perf `None` → zero probek).
+    #[test]
+    fn bump_model_metric_row_maps_dims_counters_and_perf() {
+        let pool = crate::db::init(std::path::Path::new(":memory:")).expect("init test db");
+
+        // Sukces chat, brak perf → request+success policzone, histogramy nietkniete.
+        bump_model_metric_row(
+            &pool,
+            &ModelMetricInput {
+                node_id: "node-A",
+                org_id: crate::services::org::DEFAULT_ORG_ID,
+                user_id: "u1",
+                model_id: "qwen-chat",
+                service_key: "http/qwen-chat",
+                backend: "http",
+                modality: "chat",
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                embedding_tokens: 0,
+                e2e_latency_ms: 120,
+                ttft_sample: None,
+                decode_tps_sample: None,
+                e2e_sample: Some(120),
+                is_error: false,
+            },
+        );
+
+        let rows = crate::db::repository::list_model_metrics_rollup(
+            &pool,
+            crate::services::org::DEFAULT_ORG_ID,
+            &Default::default(),
+        )
+        .expect("list rollup");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.node_id, "node-A");
+        assert_eq!(row.model_id, "qwen-chat");
+        assert_eq!(row.backend, "http");
+        assert_eq!(row.service_key, "http/qwen-chat");
+        assert_eq!(row.modality, "chat");
+        assert_eq!(row.request_count, 1);
+        assert_eq!(row.success_count, 1);
+        assert_eq!(row.error_count, 0);
+        assert_eq!(row.total_tokens, 15);
+        assert_eq!(row.embedding_tokens, 0);
+        // perf None → brak probki w histogramach, ale e2e_sample Some → jeden e2e.
+        assert_eq!(row.ttft_sample_count, 0);
+        assert_eq!(row.decode_tps_sample_count, 0);
+        assert_eq!(row.e2e_sample_count, 1);
+
+        // Blad w tym samym kubelku wymiarow → error_count rosnie, success nie.
+        bump_model_metric_row(
+            &pool,
+            &ModelMetricInput {
+                node_id: "node-A",
+                org_id: crate::services::org::DEFAULT_ORG_ID,
+                user_id: "u1",
+                model_id: "qwen-chat",
+                service_key: "http/qwen-chat",
+                backend: "http",
+                modality: "chat",
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                embedding_tokens: 0,
+                e2e_latency_ms: 0,
+                ttft_sample: None,
+                decode_tps_sample: None,
+                e2e_sample: None,
+                is_error: true,
+            },
+        );
+        let row = &crate::db::repository::list_model_metrics_rollup(
+            &pool,
+            crate::services::org::DEFAULT_ORG_ID,
+            &Default::default(),
+        )
+        .expect("list rollup")[0];
+        assert_eq!(row.request_count, 2);
+        assert_eq!(row.success_count, 1);
+        assert_eq!(row.error_count, 1);
+
+        // Embedding: `embedding_tokens` == total_tokens dla modalnosci embedding
+        // (osobny kubelek — inny modality/model → nowy wiersz).
+        bump_model_metric_row(
+            &pool,
+            &ModelMetricInput {
+                node_id: "node-A",
+                org_id: crate::services::org::DEFAULT_ORG_ID,
+                user_id: "u1",
+                model_id: "bge-embed",
+                service_key: "embedded/bge-embed",
+                backend: "embedded",
+                modality: "embedding",
+                prompt_tokens: 8,
+                completion_tokens: 0,
+                total_tokens: 8,
+                embedding_tokens: 8,
+                e2e_latency_ms: 5,
+                ttft_sample: None,
+                decode_tps_sample: None,
+                e2e_sample: Some(5),
+                is_error: false,
+            },
+        );
+        let rows = crate::db::repository::list_model_metrics_rollup(
+            &pool,
+            crate::services::org::DEFAULT_ORG_ID,
+            &Default::default(),
+        )
+        .expect("list rollup");
+        let emb = rows
+            .iter()
+            .find(|r| r.model_id == "bge-embed")
+            .expect("embedding row present");
+        assert_eq!(emb.modality, "embedding");
+        assert_eq!(emb.embedding_tokens, 8);
+        assert_eq!(emb.total_tokens, 8);
+    }
 
     /// `aborts_fallback_chain` flags only the variants that no fallback
     /// candidate can fix. Everything else lets the executor try the
@@ -4004,7 +4526,7 @@ mod tests {
         };
         let inner: ExecutorChunkStream = Box::pin(inner);
 
-        let mut stream = ExternalPerfStream::new(inner, Instant::now());
+        let mut stream = ExternalPerfStream::new(inner, Instant::now(), None);
 
         // Wolny konsument: 25ms na token (≈40 tok/s) — gdyby pomiar szedł w jego
         // tempie, decode_tps spadłoby ~5x poniżej realnego tempa silnika.
