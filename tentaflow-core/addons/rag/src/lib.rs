@@ -646,6 +646,45 @@ fn handle_ingest_document(params: &Value) -> Value {
 /// rownolegle wywolania z puli instancji. Zwraca `processed` (0/1) + `remaining`
 /// (ile jeszcze w kolejce), zeby driver/UI wiedzialy czy jest co robic.
 fn handle_ingest_drain(_params: &Value) -> Value {
+    // Reclaim osieroconych 'running' PRZED batchem: job przerwany resetem/crashem
+    // mid-ingest (przed mark_ingested/fail_job) wraca do 'queued', zeby sie dokonczyl
+    // zamiast wisiec na zawsze. Bez tego reset TentaFlow gubi dokument w locie.
+    reclaim_stale_running_jobs();
+
+    // Batch-drain: jedno wywolanie (scheduled worker co ~30s) mieli CALA zaleglosc az
+    // do opróznienia kolejki albo capa DRAIN_CAP. Bez petli byloby 1 dok / interwal
+    // (masowy upload trwalby kwadranse). Cap ogranicza wall-time; scheduler i tak
+    // przetnie po max_runtime, a niedokonczony 'running' odzyska reclaim nastepnym razem.
+    const DRAIN_CAP: usize = 100;
+    let mut processed = 0usize;
+    let mut last_doc = String::new();
+    while processed < DRAIN_CAP {
+        match drain_one_queued() {
+            DrainStep::Processed(doc) => {
+                processed += 1;
+                last_doc = doc;
+            }
+            // Empty = kolejka pusta; Contended = joba wzial inny drainer (skip, nie dubluj).
+            DrainStep::Empty | DrainStep::Contended => break,
+            DrainStep::Error(msg) => return err(&msg),
+        }
+    }
+    json!({"ok": true, "data": {"processed": processed, "document_id": last_doc, "remaining": queued_count()}})
+}
+
+/// Wynik pojedynczego kroku drainu.
+enum DrainStep {
+    Processed(String),
+    Empty,
+    Contended,
+    Error(String),
+}
+
+/// Przetwarza JEDEN kolejny job 'queued' (atomowy claim queued->running -> pipeline ->
+/// mark_ingested/fail_job). Wydzielone z `handle_ingest_drain`, zeby drain mielil batch
+/// w petli. Atomowy claim zapobiega dwukrotnemu przetworzeniu tego samego joba przez
+/// rownolegle wywolania z puli instancji.
+fn drain_one_queued() -> DrainStep {
     let row = match sql_query_one(
         "SELECT j.id, j.document_id, d.collection_id, d.doc_id_blob, d.mime \
          FROM ingest_jobs j JOIN documents d ON d.id = j.document_id \
@@ -653,8 +692,8 @@ fn handle_ingest_drain(_params: &Value) -> Value {
         &[],
     ) {
         Ok(Some(r)) => r,
-        Ok(None) => return json!({"ok": true, "data": {"processed": 0, "remaining": 0}}),
-        Err(e) => return err(&format!("Blad odczytu kolejki ingestu: {e}")),
+        Ok(None) => return DrainStep::Empty,
+        Err(e) => return DrainStep::Error(format!("Blad odczytu kolejki ingestu: {e}")),
     };
     let job_id = row.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
     let document_id = row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -662,18 +701,17 @@ fn handle_ingest_drain(_params: &Value) -> Value {
     let doc_id_blob = row.get(3).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let mime = row.get(4).and_then(|v| v.as_str()).unwrap_or("").to_string();
     if job_id.is_empty() || document_id.is_empty() {
-        return err("Kolejka ingestu: niespojny wiersz joba");
+        return DrainStep::Error("Kolejka ingestu: niespojny wiersz joba".to_string());
     }
 
-    // Atomowy claim: przejdz dalej TYLKO jesli to my przelaczylismy queued->running.
     let claimed = sql_exec(
         "UPDATE ingest_jobs SET status='running', updated_at=? WHERE id=? AND status='queued'",
         &[SqlValue::I64(now_unix()), SqlValue::String(job_id.clone())],
     );
     match claimed {
         Ok(r) if r.rows_affected == 1 => {}
-        Ok(_) => return json!({"ok": true, "data": {"processed": 0, "remaining": queued_count()}}),
-        Err(e) => return err(&format!("Claim joba nieudany: {e}")),
+        Ok(_) => return DrainStep::Contended,
+        Err(e) => return DrainStep::Error(format!("Claim joba nieudany: {e}")),
     }
 
     match run_ingest_pipeline(&collection_id, &document_id, &job_id, &doc_id_blob, &mime) {
@@ -687,7 +725,55 @@ fn handle_ingest_drain(_params: &Value) -> Value {
         }
         Err(msg) => fail_job(&document_id, &job_id, &msg),
     }
-    json!({"ok": true, "data": {"processed": 1, "document_id": document_id, "remaining": queued_count()}})
+    DrainStep::Processed(document_id)
+}
+
+/// Reclaim osieroconych jobow 'running': job przelaczony na 'running', ktory od
+/// `STALE_RUNNING_SECS` nie postapil (`updated_at`), zostal przerwany resetem/crashem
+/// przed `mark_ingested`/`fail_job`. Sprzatamy jego czesciowe artefakty
+/// (`cleanup_document_artifacts` — inaczej re-ingest zostawia osierocone wektory) i
+/// wracamy do 'queued', wiec kolejny drain dokonczy ingest idempotentnie. Bezpieczne:
+/// drain jest jednobiezny (scheduled job `concurrency=skip`) a pipeline synchroniczny
+/// (~dziesiatki s/doc), wiec 'running' starszy niz prog jest na pewno osierocony, nie
+/// aktualnie mielony. Cap partii chroni przed dlugim skanem przy wielu sierotach.
+fn reclaim_stale_running_jobs() {
+    // > scheduler max_runtime auto-joba drainu (1800s), zeby NIE odzyskac joba
+    // ktory legalnie trwa (duzy PDF: setki stron -> tysiace chunkow do embeddingu).
+    // Dopiero job "wiszacy" dluzej niz jakikolwiek run moglby trwac = osierocony.
+    const STALE_RUNNING_SECS: i64 = 2400; // 40 min > max_runtime 1800s
+    let cutoff = now_unix() - STALE_RUNNING_SECS;
+    let rows = match sql_query(
+        "SELECT id, document_id FROM ingest_jobs \
+         WHERE status = 'running' AND updated_at < ? LIMIT 50",
+        &[SqlValue::I64(cutoff)],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn(&format!("rag: reclaim odczyt osieroconych jobow nieudany: {e}"));
+            return;
+        }
+    };
+    for row in rows {
+        let job_id = row.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let document_id = row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if job_id.is_empty() || document_id.is_empty() {
+            continue;
+        }
+        if let Err(e) = cleanup_document_artifacts(&document_id) {
+            log::warn(&format!(
+                "rag: reclaim cleanup artefaktow '{document_id}' nieudany (re-queue mimo to): {e}"
+            ));
+        }
+        match sql_exec(
+            "UPDATE ingest_jobs SET status='queued', updated_at=? WHERE id=? AND status='running'",
+            &[SqlValue::I64(now_unix()), SqlValue::String(job_id.clone())],
+        ) {
+            Ok(_) => log::info(&format!(
+                "rag: reclaim osieroconego joba '{job_id}' (dok '{document_id}') -> queued"
+            )),
+            Err(e) => log::warn(&format!("rag: reclaim re-queue joba '{job_id}' nieudany: {e}")),
+        }
+    }
 }
 
 /// Liczba jobow czekajacych w kolejce (status 'queued').

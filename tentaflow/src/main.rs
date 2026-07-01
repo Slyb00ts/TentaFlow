@@ -253,6 +253,14 @@ async fn run_server(args: Args) -> Result<()> {
         Err(e) => error!("Sync Ledger nie zarejestrował zaufanych nodów mesh: {}", e),
         _ => {}
     }
+    // Auto-harmonogram drainu ingestu dla addonów z toolem `ingest_drain` (np. RAG):
+    // bez tego kolejka ingestu stoi bez ręcznego joba, a reset TentaFlow nie wznawia
+    // przetwarzania. Idempotentne — odtwarza harmonogram po każdym restarcie.
+    match tentaflow_core::scheduler::ensure_addon_ingest_drain_schedules(&db) {
+        Ok(n) if n > 0 => info!("Scheduler zapewnił {} auto-jobów drainu ingestu", n),
+        Err(e) => error!("Scheduler nie zapewnił auto-jobów drainu ingestu: {}", e),
+        _ => {}
+    }
 
     // Restore persisted robot geo anchors into the SLAM scene manager so robots keep
     // their real-world georeference across restarts.
