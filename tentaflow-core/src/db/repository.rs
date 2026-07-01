@@ -19548,6 +19548,28 @@ pub mod deployments {
         })
     }
 
+    /// Tworzy wiersz `deployments` (status `deploying`) dla deployu, ktory nie
+    /// przechodzi przez `services_repo` (np. cluster deploy). Dzieki temu
+    /// `deploymentStatusRequest` + log_bus (`append_log_line`/`set_status`/
+    /// `mark_finished`) maja na czym pracowac. `target_service_id` zostaje NULL —
+    /// cluster deploy nie ma pojedynczego wiersza `services`.
+    pub fn create(
+        pool: &DbPool,
+        deploy_id: &str,
+        engine_id: &str,
+        deploy_method: &str,
+        node_id: &str,
+        config_json: &str,
+    ) -> Result<()> {
+        let conn = pool.write().unwrap();
+        conn.execute(
+            "INSERT INTO deployments (deploy_id, engine_id, deploy_method, node_id, status, config_json)
+             VALUES (?1, ?2, ?3, ?4, 'deploying', ?5)",
+            params![deploy_id, engine_id, deploy_method, node_id, config_json],
+        )?;
+        Ok(())
+    }
+
     pub fn set_status(
         pool: &DbPool,
         deploy_id: &str,

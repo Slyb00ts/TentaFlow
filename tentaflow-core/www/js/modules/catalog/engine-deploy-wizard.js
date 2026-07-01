@@ -3143,7 +3143,19 @@ async function startClusterDeploy() {
     );
     if (resp && resp.ok) {
       toast(I18n.t('cluster_detail.deploy_ok'), 'success');
+      // Deploy klastra leci teraz w tle — zamknij wizard i pokaż ten sam live
+      // progress modal co node deploy. Subskrybuje deploymentLogStreamRequest
+      // keyed by deployment_cluster_id (fazy P0-P6 + serve log).
       close();
+      const depId = resp.deploymentClusterId || '';
+      if (depId) {
+        const mod = await import('/js/modules/catalog/deploy-progress-modal.js');
+        mod.openDeployProgressModal({
+          deployId: depId,
+          engineId: eng.id,
+          deployMethod: 'cluster',
+        });
+      }
     } else {
       const msg = String(resp?.message || '');
       toast(/rdma/i.test(msg) ? I18n.t('cluster_detail.deploy_rdma_required') : (msg || I18n.t('cluster_detail.deploy_failed')), 'error');
