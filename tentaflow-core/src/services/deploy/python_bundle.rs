@@ -698,6 +698,7 @@ mod tests {
                 gpu_supported: None,
                 default_port: 0,
                 dgx_spark: None,
+                cluster_capable: None,
                 api: ApiKind::OpenaiCompatible,
                 version: "0".into(),
                 service_surfaces: None,

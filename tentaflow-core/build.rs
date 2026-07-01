@@ -907,6 +907,10 @@ mod services_manifest_build {
         /// Tri-state DGX Spark gate. Mirror of runtime `Engine.dgx_spark`.
         #[serde(default)]
         pub dgx_spark: Option<bool>,
+        /// Mirror of runtime `Engine.cluster_capable` — carried through so the
+        /// GUI deploy wizard can offer the engine for cluster targets.
+        #[serde(default)]
+        pub cluster_capable: Option<bool>,
         pub default_port: u16,
         pub api: ApiKind,
         pub version: String,

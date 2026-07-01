@@ -7,10 +7,20 @@ publish = false
 [dependencies]
 burn = { version = "0.21", features = ["wgpu", "ndarray"] }
 burn-store = "0.21"
+burn-onnx = "0.21"
 image = "0.25"
 
-[build-dependencies]
-burn-onnx = "0.21"
+[[bin]]
+name = "burn-spike"
+path = "src/main.rs"
+
+[[bin]]
+name = "onnx2bpk"
+path = "src/onnx2bpk.rs"
+
+[[bin]]
+name = "roundtrip-rfdetr"
+path = "src/roundtrip_rfdetr.rs"
 
 [features]
 default = []

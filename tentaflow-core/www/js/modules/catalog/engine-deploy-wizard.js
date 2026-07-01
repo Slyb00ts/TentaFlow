@@ -42,18 +42,30 @@ let selection = {
   gpuIds: [],             // e.g. ['0','2'] when gpuSelectMode === 'specific'
 };
 
+// Callback fired once when the wizard closes (used by the cluster page to
+// refresh its detail view after a cluster deploy). Set from opts.onClose.
+let onCloseCallback = null;
+
 // Cache per-node GPU lists to avoid re-querying when switching back and forth.
 const gpuListByNode = new Map();
 
 // Ordered step ids with optional skip predicate. Runtime order derived at
 // navigation time by filtering out steps whose skip() returns true.
 const STEPS = [
-  { id: 'method' },
+  { id: 'method', skip: shouldSkipMethodStep },
   { id: 'model', skip: shouldSkipModelStep },
   { id: 'gpu', skip: shouldSkipGpuStep },
   { id: 'advanced', skip: shouldSkipAdvancedStep },
-  { id: 'runtime' },
+  { id: 'cluster-config', skip: shouldSkipClusterConfigStep },
+  { id: 'runtime', skip: shouldSkipRuntimeStep },
 ];
+
+// Cluster deploy runs across the whole cluster, so there is no single deploy
+// method, GPU picker or per-container runtime — those steps are node-only. The
+// cluster-config step is the mirror image (cluster-only).
+function shouldSkipMethodStep() { return selection.isCluster; }
+function shouldSkipRuntimeStep() { return selection.isCluster; }
+function shouldSkipClusterConfigStep() { return !selection.isCluster; }
 
 // Cache ostatniego wyniku /api/deploy/vllm/recommend (key: model+gpu_ids hash).
 // Pozwala przeliczyc VRAM lokalnie przy zmianie suwaka bez ponownego HF fetch.
@@ -75,6 +87,7 @@ let prevAtLimit = false;
 /// `nodeId` (preselekcja z MeshDetail) i `hostOs` (z katalogu).
 export async function openDeployWizard(engineId, opts = {}) {
   currentStep = 1;
+  onCloseCallback = null;
   modelSourceMode = 'preset';
   hfResults = [];
   hfSearchQuery = '';
@@ -92,6 +105,15 @@ export async function openDeployWizard(engineId, opts = {}) {
     containerName: null,
     gpuSelectMode: 'all',
     gpuIds: [],
+    // Cluster (multi-node tensor-parallel) deploy. When `isCluster`, the wizard
+    // skips method/gpu/runtime, keeps model+advanced and adds a cluster-config
+    // step; startDeploy sends `clusterDeployRequest` instead of the node path.
+    isCluster: opts.isCluster === true,
+    clusterId: opts.clusterId || null,
+    clusterMembers: [],
+    gpusPerNode: 1,
+    servedModelName: '',
+    pricing: { promptPer1k: null, completionPer1k: null, audioPerMin: null, imageEach: null },
     // External cloud provider credentials (deploy.external.requires_api_key).
     // Stored encrypted server-side; base_url/api_version only used by
     // openai-compatible/azure-openai engines that need an endpoint override.
@@ -185,6 +207,20 @@ export async function openDeployWizard(engineId, opts = {}) {
     renderShell(`<div class="form-hint">${escapeHtml(I18n.t('wizard.noNodesAvailable'))}</div>`);
     return;
   }
+
+  if (selection.isCluster) {
+    // The advanced VRAM calculator runs against a single representative member's
+    // GPUs; the real tensor-parallel size (members × gpusPerNode) is computed by
+    // the backend at deploy time. Pick the first member that the mesh reports
+    // with GPUs so the calculator has an inventory to read.
+    selection.clusterMembers = await fetchClusterMembers(selection.clusterId);
+    const memberIds = selection.clusterMembers.map((m) => m.node_id).filter(Boolean);
+    const withGpu = memberIds.find((id) => nodeGpus(id).length > 0);
+    selection.nodeId = withGpu || memberIds[0] || selection.nodeId;
+    // Unified GB10 memory OOM-kills at 0.9; 0.5 is the safe cluster default.
+    selection.advanced.gpu_memory_utilization = 0.5;
+  }
+
   if (!selection.nodeId) {
     const local = nodes.find((n) => n?.is_local === true) || nodes[0];
     selection.nodeId = local ? (local.node_id || local.id) : null;
@@ -198,7 +234,7 @@ export async function openDeployWizard(engineId, opts = {}) {
   }
 
   const eng = engineEntry.engine || {};
-  selection.port = eng.default_port || 8080;
+  selection.port = selection.isCluster ? 8100 : (eng.default_port || 8080);
   selection.containerName = `tentaflow-${(eng.id || 'svc').toLowerCase()}-${randomSuffix()}`;
 
   const presets = Manifest.modelPresets(engineEntry);
@@ -214,6 +250,10 @@ export async function openDeployWizard(engineId, opts = {}) {
   } else {
     modelSourceMode = 'hf';
   }
+
+  // Armed only after the (loading/error) renderShell cycles are done, so the
+  // internal close() they perform never fires this user-close refresh.
+  onCloseCallback = typeof opts.onClose === 'function' ? opts.onClose : null;
 
   refreshModal();
 }
@@ -256,6 +296,9 @@ export function close() {
   }
   const backdrop = document.getElementById('engine-deploy-wizard-backdrop');
   if (backdrop) backdrop.remove();
+  const cb = onCloseCallback;
+  onCloseCallback = null;
+  if (cb) { try { cb(); } catch (_) { /* refresh best-effort */ } }
 }
 
 // ---- Data -----------------------------------------------------------------
@@ -274,6 +317,23 @@ async function fetchNodes() {
     console.warn('[wizard] fetchNodes:', err);
   }
   return [];
+}
+
+/// Cluster members for a cluster deploy — normalized to `{ node_id, hostname }`.
+/// Mirrors cluster-detail's resolveMembers (camelCase binary + snake_case legacy).
+async function fetchClusterMembers(clusterId) {
+  if (!clusterId) return [];
+  try {
+    const detail = await ApiBinary.one('clusterDetailRequest', { clusterId });
+    const raw = (detail && (detail.members || detail.cluster?.members)) || [];
+    return raw.map((m) => ({
+      node_id: m.nodeId || m.node_id || m.id,
+      hostname: m.hostname || m.node_name || m.nodeId || m.node_id || '',
+    })).filter((m) => m.node_id);
+  } catch (err) {
+    console.warn('[wizard] fetchClusterMembers:', err);
+    return [];
+  }
 }
 
 function defaultUaOs() {
@@ -390,6 +450,7 @@ function renderStepBody() {
     case 'model':    return renderStepModel();
     case 'gpu':      return renderStepGpu();
     case 'advanced': return renderStepAdvanced();
+    case 'cluster-config': return renderStepClusterConfig();
     case 'runtime':  return renderStepRuntime();
     default: return '';
   }
@@ -1872,6 +1933,118 @@ function bindAdvancedHandlers() {
   }
 }
 
+// ---- Step: cluster-config (multi-node tensor-parallel) --------------------
+
+function tCluster(k, params) { return I18n.t(`wizard.cluster.${k}`, params); }
+
+// Members × gpusPerNode = tensor-parallel world size. Members come from the
+// cluster detail fetched in openDeployWizard; gpusPerNode is user-set here.
+function clusterTpSize() {
+  const members = selection.clusterMembers.length || 0;
+  const g = Math.max(1, Number(selection.gpusPerNode) || 1);
+  return members * g;
+}
+
+function renderStepClusterConfig() {
+  const members = selection.clusterMembers.length || 0;
+  const gpus = Math.max(1, Number(selection.gpusPerNode) || 1);
+  const p = selection.pricing;
+
+  let modelSummary = '';
+  if (selection.modelRepo) {
+    modelSummary = `<div><code>${escapeHtml(selection.modelRepo)}</code> <span class="form-hint inline">(HuggingFace)</span></div>`;
+  } else if (selection.modelPresetId) {
+    const preset = Manifest.modelPresets(engineEntry).find((pr) => pr?.id === selection.modelPresetId);
+    if (preset) modelSummary = `<div><strong>${escapeHtml(preset.display_name || preset.id)}</strong>${preset.repo ? ` <span class="form-hint inline">${escapeHtml(preset.repo)}</span>` : ''}</div>`;
+  }
+
+  return `
+    <h4 class="wizard-step-title">${escapeHtml(tCluster('title'))}</h4>
+    <p class="form-hint" style="margin-bottom:14px;">${escapeHtml(tCluster('subtitle', { n: members }))}</p>
+
+    ${modelSummary ? `<div class="form-group"><label>${escapeHtml(I18n.t('wizard.modelLabel'))}</label>${modelSummary}</div>` : ''}
+
+    <div class="form-group">
+      <tf-input type="number" id="edw-cluster-gpus" min="1" max="8"
+        label="${escapeAttr(tCluster('gpus_per_node'))}"
+        value="${escapeAttr(String(gpus))}"></tf-input>
+      <div class="cluster-deploy-tp-preview" style="margin-top:6px;">
+        ${escapeHtml(tCluster('tp_label'))}: <strong id="edw-cluster-tp">${clusterTpSize()}</strong>
+        <span class="form-hint inline">(${members} × <span id="edw-cluster-gpus-echo">${gpus}</span>)</span>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <tf-input type="text" id="edw-cluster-served"
+        label="${escapeAttr(tCluster('served_name'))}"
+        placeholder="${escapeAttr(tCluster('served_name_hint'))}"
+        value="${escapeAttr(selection.servedModelName || '')}"></tf-input>
+    </div>
+
+    <div class="form-group">
+      <tf-input type="number" id="edw-cluster-port" min="1" max="65535"
+        label="${escapeAttr(tCluster('port'))}"
+        value="${escapeAttr(String(selection.port || 8100))}"></tf-input>
+    </div>
+
+    <div class="form-group">
+      <label>${escapeHtml(tCluster('pricing_title'))}</label>
+      <div class="form-hint" style="margin-bottom:6px;">${escapeHtml(tCluster('pricing_hint'))}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+        <tf-input id="edw-cluster-price-prompt" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_prompt'))}" value="${escapeAttr(p.promptPer1k == null ? '' : String(p.promptPer1k))}"></tf-input>
+        <tf-input id="edw-cluster-price-completion" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_completion'))}" value="${escapeAttr(p.completionPer1k == null ? '' : String(p.completionPer1k))}"></tf-input>
+        <tf-input id="edw-cluster-price-audio" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_audio'))}" value="${escapeAttr(p.audioPerMin == null ? '' : String(p.audioPerMin))}"></tf-input>
+        <tf-input id="edw-cluster-price-image" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_image'))}" value="${escapeAttr(p.imageEach == null ? '' : String(p.imageEach))}"></tf-input>
+      </div>
+    </div>
+  `;
+}
+
+function bindStepClusterConfigInputs() {
+  const gpusInput = document.getElementById('edw-cluster-gpus');
+  if (gpusInput) {
+    const onGpus = (e) => {
+      const raw = e.detail?.value ?? gpusInput.value;
+      const v = Math.max(1, Math.min(8, parseInt(raw, 10) || 1));
+      selection.gpusPerNode = v;
+      const tpEl = document.getElementById('edw-cluster-tp');
+      const echoEl = document.getElementById('edw-cluster-gpus-echo');
+      if (tpEl) tpEl.textContent = String(clusterTpSize());
+      if (echoEl) echoEl.textContent = String(v);
+    };
+    gpusInput.addEventListener('input', onGpus);
+    gpusInput.addEventListener('change', onGpus);
+  }
+
+  const servedInput = document.getElementById('edw-cluster-served');
+  if (servedInput) {
+    servedInput.addEventListener('input', (e) => {
+      selection.servedModelName = String(e.detail?.value ?? servedInput.value).trim();
+    });
+  }
+
+  const portInput = document.getElementById('edw-cluster-port');
+  if (portInput) {
+    portInput.addEventListener('input', (e) => {
+      const v = parseInt(e.detail?.value ?? portInput.value, 10);
+      selection.port = Number.isFinite(v) ? v : 8100;
+    });
+  }
+
+  const priceBind = (id, key) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('input', (e) => {
+      const raw = String(e.detail?.value ?? el.value ?? '').trim();
+      selection.pricing[key] = raw === '' ? null : Number(raw);
+    });
+  };
+  priceBind('edw-cluster-price-prompt', 'promptPer1k');
+  priceBind('edw-cluster-price-completion', 'completionPer1k');
+  priceBind('edw-cluster-price-audio', 'audioPerMin');
+  priceBind('edw-cluster-price-image', 'imageEach');
+}
+
 // ---- Step 3: runtime ------------------------------------------------------
 
 function renderStepRuntime() {
@@ -2099,6 +2272,9 @@ function shouldSkipModelStep() {
 // engine manifest may opt out via `engine.gpu_supported === false`; by default
 // (field absent) we assume the engine can use GPUs if the node has any.
 function shouldSkipGpuStep() {
+  // Cluster deploy allocates GPUs on every member (all GPUs per node), so the
+  // per-node GPU picker does not apply.
+  if (selection.isCluster) return true;
   // Cloud API providers run remotely — there is no local GPU to allocate.
   if (externalCredsConfig().requiresApiKey) return true;
   const gpus = nodeGpus(selection.nodeId);
@@ -2267,6 +2443,7 @@ function bindStepInputs() {
     case 'model':    bindStepModelInputs(); break;
     case 'gpu':      bindStepGpuInputs(); break;
     case 'advanced': bindAdvancedHandlers(); break;
+    case 'cluster-config': bindStepClusterConfigInputs(); break;
     case 'runtime':  bindStepRuntimeInputs(); break;
   }
 }
@@ -2642,6 +2819,11 @@ function updateHfGgufFiles() {
 // ---- Deploy ---------------------------------------------------------------
 
 async function startDeploy() {
+  if (selection.isCluster) {
+    await startClusterDeploy();
+    return;
+  }
+
   const btn = document.getElementById('edw-deploy');
 
   // External cloud providers: subscription needs a completed OAuth login; API
@@ -2835,6 +3017,71 @@ async function startDeploy() {
       engineId: eng.id,
       deployMethod: selection.deployMethod,
     });
+  } catch (err) {
+    toast(I18n.t('wizard.deployFailed').replace('{error}', err.message || err), 'error');
+    if (btn) btn.removeAttribute('disabled');
+  }
+}
+
+// Cluster deploy: one blocking `clusterDeployRequest` (tensor-parallel across
+// every member). max_model_len + gpu_memory_utilization come from the shared
+// Advanced step (no duplicate controls); the backend computes the real TP size
+// from members × gpusPerNode. On completion the wizard closes and its onClose
+// callback refreshes the cluster page.
+async function startClusterDeploy() {
+  const btn = document.getElementById('edw-deploy');
+  const eng = engineEntry.engine || {};
+
+  const modelRepo = getAdvancedModelName();
+  if (!modelRepo) {
+    toast(I18n.t('wizard.selectModel'), 'error');
+    return;
+  }
+
+  const p = selection.pricing;
+  if ([p.promptPer1k, p.completionPer1k, p.audioPerMin, p.imageEach].some(
+    (v) => v != null && (!Number.isFinite(v) || v < 0),
+  )) {
+    toast(I18n.t('wizard.cluster.pricing_invalid'), 'error');
+    return;
+  }
+
+  const adv = selection.advanced;
+  const rec = advancedRecommendation && !advancedRecommendation.error ? advancedRecommendation : null;
+  const maxModelLen = adv.max_model_len || (rec && rec.recommended && rec.recommended.max_model_len) || 8192;
+  const gpuMem = adv.gpu_memory_utilization ?? 0.5;
+
+  if (btn) btn.setAttribute('disabled', '');
+  const readyTimeoutSecs = 600;
+  try {
+    const resp = await ApiBinary.action(
+      'clusterDeployRequest',
+      {
+        clusterId: selection.clusterId,
+        engineId: eng.id,
+        modelRepo,
+        modelPresetId: selection.modelPresetId || null,
+        servedModelName: (selection.servedModelName && selection.servedModelName.trim()) || null,
+        gpusPerNode: Math.max(1, Number(selection.gpusPerNode) || 1),
+        gpuMemoryUtilization: gpuMem,
+        maxModelLen,
+        port: selection.port || 8100,
+        readyTimeoutSecs,
+        promptPer1k: p.promptPer1k ?? null,
+        completionPer1k: p.completionPer1k ?? null,
+        audioPerMin: p.audioPerMin ?? null,
+        imageEach: p.imageEach ?? null,
+      },
+      { timeoutMs: readyTimeoutSecs * 1000 + 30000 },
+    );
+    if (resp && resp.ok) {
+      toast(I18n.t('cluster_detail.deploy_ok'), 'success');
+      close();
+    } else {
+      const msg = String(resp?.message || '');
+      toast(/rdma/i.test(msg) ? I18n.t('cluster_detail.deploy_rdma_required') : (msg || I18n.t('cluster_detail.deploy_failed')), 'error');
+      if (btn) btn.removeAttribute('disabled');
+    }
   } catch (err) {
     toast(I18n.t('wizard.deployFailed').replace('{error}', err.message || err), 'error');
     if (btn) btn.removeAttribute('disabled');

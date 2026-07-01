@@ -65,12 +65,14 @@ fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
             gpu_supported: None,
             // dgx_spark: brak ograniczen Spark dla testowego silnika
             dgx_spark: None,
+            cluster_capable: None,
             default_port: 0,
             api: ApiKind::OpenaiCompatible,
             version: "0.0.1".into(),
             service_surfaces: None,
             input_modalities: None,
             output_modalities: None,
+            backend: None,
         },
         deploy: DeploySection {
             docker: None,

@@ -3681,7 +3681,19 @@
     "gpu_mode_specific_desc": "Choose which GPUs to allocate for this deployment.",
     "gpu_mode_none_title": "CPU only",
     "gpu_mode_none_desc": "Deployment will not touch GPUs — inference runs on CPU.",
-    "gpu_list_hint": "Available GPUs ({n})"
+    "gpu_list_hint": "Available GPUs ({n})",
+    "cluster": {
+      "title": "Cluster configuration",
+      "subtitle": "Tensor-parallel across {n} cluster nodes",
+      "gpus_per_node": "GPUs per node",
+      "tp_label": "Tensor-parallel size (TP)",
+      "served_name": "Served model name (optional)",
+      "served_name_hint": "e.g. my-model — empty = default from repo",
+      "port": "Port",
+      "pricing_title": "Pricing (optional)",
+      "pricing_hint": "Rates for usage billing. Empty fields are skipped.",
+      "pricing_invalid": "Invalid pricing — values must be >= 0."
+    }
   },
   "category": {
     "llm": "Language Models (LLM)",

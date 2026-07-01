@@ -107,8 +107,18 @@ function dgxSparkOk(service, host) {
   return true;
 }
 
+/// Silnik obsluguje multi-node tensor-parallel deploy na klaster. Czyta flage
+/// `engine.cluster_capable` z manifestu (te sama sciezke co inne flagi engine).
+export function isClusterCapable(service) {
+  return service?.engine?.cluster_capable === true;
+}
+
 export function isEngineCompatible(service, hostOs, host) {
-  if (!service || !hostOs) return false;
+  if (!service) return false;
+  // Cluster target ma os=null (heterogeniczne wezly) — nie filtrujemy po OS,
+  // pokazujemy wylacznie silniki cluster-capable (multi-node tensor-parallel).
+  if (host?.kind === 'cluster') return isClusterCapable(service);
+  if (!hostOs) return false;
   const os = String(hostOs).toLowerCase();
   const sec = deploySections(service);
   if (!dgxSparkOk(service, host)) return false;

@@ -20,6 +20,9 @@ version = "0.23.0"
 # crashuja w FP8 / Mamba / NVFP4 kernelach. Spark dostaje osobny silnik
 # `vllm-spark` ktory buduje vllm 0.23.0 ze zrodel z TORCH_CUDA_ARCH_LIST=12.1a.
 dgx_spark = false
+# Multi-node tensor-parallel deploy supported — the unified deploy wizard offers
+# this engine when the deploy target is a cluster.
+cluster_capable = true
 
 [deploy.docker]
 context_path = "llm/docker/vllm"

@@ -20,6 +20,9 @@ api = "openai-compatible"
 version = "0.23.0"
 # Silnik widoczny TYLKO na Sparku — manifest-store filtruje po polu engine.dgx_spark.
 dgx_spark = true
+# Multi-node tensor-parallel deploy supported — the unified deploy wizard offers
+# this engine when the deploy target is a cluster.
+cluster_capable = true
 
 [deploy.docker]
 context_path = "llm/docker/vllm-spark"

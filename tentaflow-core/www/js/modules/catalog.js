@@ -40,9 +40,13 @@ const CatalogScreen = {
   render() {
     return `<div class="catalog-shell" id="catalog-root"></div>`;
   },
-  async mount() {
+  async mount(params) {
     await Manifest.init();
     await loadTargets();
+    // Prescoped target (np. "Wdróż model" ze strony klastra) — otwiera katalog
+    // od razu na wybranym targecie, z pominięciem target pickera. "Zmień" nadal
+    // działa, bo loadTargets zawsze wypełnia nodes/clusters.
+    if (params && params.target) target = params.target;
     renderRoot();
   },
   unmount() {
@@ -471,7 +475,12 @@ function bindCards(host) {
     const presetId = btn?.dataset.presetId || card?.dataset.presetId || null;
     if (!engineId || !target) return;
     if (target.kind === 'cluster') {
-      toast(I18n.t('catalog.cluster_not_supported'), 'warning');
+      const service = Manifest.byId(engineId);
+      if (!Manifest.isClusterCapable(service)) {
+        toast(I18n.t('catalog.cluster_not_supported'), 'warning');
+        return;
+      }
+      openDeployWizard(engineId, { isCluster: true, clusterId: target.id, presetId });
       return;
     }
     openDeployWizard(engineId, { nodeId: target.id, hostOs: target.os, presetId });

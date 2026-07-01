@@ -774,13 +774,6 @@ function clusterRdmaConfigured(members) {
   return members.length > 0 && members.every(m => String(m.rdma_ip || '').length > 0);
 }
 
-// Heuristic default engine: GB10 / Spark nodes ship the aarch64 image. We cannot
-// read the arch from the member here, so we default to the Spark image and let
-// the user switch to plain "vllm" for x86 clusters.
-function defaultEngineId() {
-  return 'vllm-spark';
-}
-
 function renderDeploySection(members) {
   const tpSize = members.length; // gpus_per_node default 1 → tp = members
   const rdmaOk = clusterRdmaConfigured(members);
@@ -857,8 +850,10 @@ function renderDeployMemberRow(m) {
   </tr>`;
 }
 
-// Modal collecting the deploy parameters; submits a ClusterDeployRequest. The
-// tp_size preview updates live as the user changes gpus_per_node.
+// Opens the service catalog prescoped to this cluster — identical flow to
+// "Dodaj serwis → cluster": the catalog shows only cluster-capable engines and,
+// on engine pick, launches the deploy wizard in cluster mode. Both entry points
+// share one engine-selection UI, so nothing is hardcoded to a single engine.
 async function openDeployModal() {
   if (!clusterData) return;
   const members = resolveMembers(clusterData);
@@ -866,180 +861,22 @@ async function openDeployModal() {
     toast(I18n.t('clusters.select_min_nodes'), 'warning');
     return;
   }
-
-  const { TfWindow } = await import('/js/components/tf-window.js');
-  await import('/js/components/tf-input.js');
-  await import('/js/components/tf-select.js');
-
-  const body = document.createElement('div');
-  body.innerHTML = `
-    <div class="cluster-deploy-form" style="display:flex;flex-direction:column;gap:12px;min-width:420px;">
-      <div class="form-group">
-        <label>${escapeHtml(I18n.t('cluster_detail.deploy_engine'))}</label>
-        <tf-select id="dep-engine" value="${escapeAttr(defaultEngineId())}">
-          <option value="vllm-spark"${defaultEngineId() === 'vllm-spark' ? ' selected' : ''}>vLLM (Spark / aarch64)</option>
-          <option value="vllm">vLLM (x86 / CUDA)</option>
-        </tf-select>
-      </div>
-      <div class="form-group">
-        <label>${escapeHtml(I18n.t('cluster_detail.deploy_model_repo'))}</label>
-        <tf-input id="dep-repo" placeholder="${escapeAttr(I18n.t('cluster_detail.deploy_model_repo_hint'))}"></tf-input>
-      </div>
-      <div class="form-group">
-        <label>${escapeHtml(I18n.t('cluster_detail.deploy_served_name'))}</label>
-        <tf-input id="dep-served" placeholder="${escapeAttr(I18n.t('cluster_detail.deploy_served_name_hint'))}"></tf-input>
-      </div>
-      <div class="form-group">
-        <label>${escapeHtml(I18n.t('cluster_detail.deploy_gpus_per_node'))}</label>
-        <tf-input id="dep-gpus" type="number" min="1" max="8" value="1"></tf-input>
-        <div class="cluster-deploy-tp-preview">${escapeHtml(I18n.t('cluster_detail.deploy_tp_size'))}: <strong id="dep-tp">${members.length}</strong> <span class="cluster-deploy-meta-dim">(${members.length} × <span id="dep-gpus-echo">1</span>)</span></div>
-      </div>
-      <div class="form-group">
-        <label>${escapeHtml(I18n.t('cluster_detail.deploy_gpu_mem'))}</label>
-        <tf-input id="dep-gpumem" type="number" min="0.1" max="1.0" step="0.05" value="0.5"></tf-input>
-      </div>
-      <div class="form-group">
-        <label>${escapeHtml(I18n.t('cluster_detail.deploy_max_len'))}</label>
-        <tf-input id="dep-maxlen" type="number" min="512" step="512" value="8192"></tf-input>
-      </div>
-      <div class="form-group">
-        <label>${escapeHtml(I18n.t('cluster_detail.deploy_port'))}</label>
-        <tf-input id="dep-port" type="number" min="1" max="65535" value="8100"></tf-input>
-      </div>
-      <div class="form-group">
-        <label>${escapeHtml(I18n.t('cluster_detail.deploy_pricing_title'))}</label>
-        <div class="form-hint" style="margin-bottom:6px;">${escapeHtml(I18n.t('cluster_detail.deploy_pricing_hint'))}</div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-          <tf-input id="dep-price-prompt" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_prompt'))}"></tf-input>
-          <tf-input id="dep-price-completion" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_completion'))}"></tf-input>
-          <tf-input id="dep-price-audio" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_audio'))}"></tf-input>
-          <tf-input id="dep-price-image" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_image'))}"></tf-input>
-        </div>
-      </div>
-    </div>
-  `;
-
-  // Live tp_size preview.
-  const memberCount = members.length;
-  const gpusInput = body.querySelector('#dep-gpus');
-  const tpEl = body.querySelector('#dep-tp');
-  const echoEl = body.querySelector('#dep-gpus-echo');
-  const updateTp = () => {
-    const g = Math.max(1, parseInt(gpusInput?.value, 10) || 1);
-    if (tpEl) tpEl.textContent = String(memberCount * g);
-    if (echoEl) echoEl.textContent = String(g);
-  };
-  if (gpusInput) {
-    gpusInput.addEventListener('input', updateTp);
-    gpusInput.addEventListener('change', updateTp);
-  }
-
-  const result = await TfWindow.open({
-    title: I18n.t('cluster_detail.deploy_title'),
-    icon: 'rocket',
-    modal: true,
-    width: 520,
-    body,
-    footer: `
-      <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
-      <tf-button variant="primary" data-action="confirm">${escapeHtml(I18n.t('cluster_detail.deploy_submit'))}</tf-button>
-    `,
+  // Capture before cleanup() nulls currentClusterId. cluster-detail is opened via
+  // .show() (not Router), so its 5s interval won't be torn down by navigate() —
+  // clean it up explicitly here.
+  const clusterId = currentClusterId;
+  const label = clusterData.name || clusterId;
+  ClusterDetailScreen.cleanup();
+  const { Router } = await import('/js/router.js');
+  Router.navigate('catalog', {
+    target: {
+      kind: 'cluster',
+      id: clusterId,
+      label,
+      os: null,
+      gpuNames: [],
+    },
   });
-
-  if (result.action !== 'confirm') return;
-
-  const repo = String(body.querySelector('#dep-repo')?.value || '').trim();
-  if (!repo) {
-    toast(I18n.t('cluster_detail.deploy_need_repo'), 'warning');
-    return;
-  }
-  const served = String(body.querySelector('#dep-served')?.value || '').trim();
-  const gpusPerNode = Math.max(1, parseInt(body.querySelector('#dep-gpus')?.value, 10) || 1);
-  const gpuMem = parseFloat(body.querySelector('#dep-gpumem')?.value) || 0.5;
-  const maxLen = parseInt(body.querySelector('#dep-maxlen')?.value, 10) || 8192;
-  const port = parseInt(body.querySelector('#dep-port')?.value, 10) || 8100;
-  const engineId = body.querySelector('#dep-engine')?.value || defaultEngineId();
-
-  // Optional pricing captured at deploy time. Empty inputs stay null (backend
-  // skips them); negative values are rejected client-side before submit.
-  const priceOf = (sel) => {
-    const raw = String(body.querySelector(sel)?.value ?? '').trim();
-    if (raw === '') return null;
-    const n = Number(raw);
-    return Number.isFinite(n) && n >= 0 ? n : NaN;
-  };
-  const promptPer1k = priceOf('#dep-price-prompt');
-  const completionPer1k = priceOf('#dep-price-completion');
-  const audioPerMin = priceOf('#dep-price-audio');
-  const imageEach = priceOf('#dep-price-image');
-  if ([promptPer1k, completionPer1k, audioPerMin, imageEach].some((v) => Number.isNaN(v))) {
-    toast(I18n.t('cluster_detail.deploy_pricing_invalid'), 'warning');
-    return;
-  }
-
-  await runClusterDeploy({
-    engineId,
-    modelRepo: repo,
-    servedModelName: served || null,
-    gpusPerNode,
-    gpuMemoryUtilization: gpuMem,
-    maxModelLen: maxLen,
-    port,
-    promptPer1k,
-    completionPer1k,
-    audioPerMin,
-    imageEach,
-  });
-}
-
-async function runClusterDeploy(opts) {
-  deployInProgress = true;
-  deployResult = null;
-  renderDetail();
-
-  const readyTimeoutSecs = 600;
-  try {
-    const resp = await ApiBinary.action(
-      'clusterDeployRequest',
-      {
-        clusterId: currentClusterId,
-        engineId: opts.engineId,
-        modelRepo: opts.modelRepo,
-        servedModelName: opts.servedModelName,
-        gpusPerNode: opts.gpusPerNode,
-        gpuMemoryUtilization: opts.gpuMemoryUtilization,
-        maxModelLen: opts.maxModelLen,
-        port: opts.port,
-        readyTimeoutSecs,
-        promptPer1k: opts.promptPer1k ?? null,
-        completionPer1k: opts.completionPer1k ?? null,
-        audioPerMin: opts.audioPerMin ?? null,
-        imageEach: opts.imageEach ?? null,
-      },
-      { timeoutMs: readyTimeoutSecs * 1000 + 30000 },
-    );
-    deployInProgress = false;
-    deployResult = resp;
-    if (resp.ok && resp.deploymentClusterId) {
-      activeDeployment = resp;
-      toast(I18n.t('cluster_detail.deploy_ok'), 'success');
-    } else {
-      activeDeployment = null;
-      const msg = String(resp.message || '');
-      // The backend rejects a deploy when RDMA isn't configured yet.
-      if (/rdma/i.test(msg)) {
-        toast(I18n.t('cluster_detail.deploy_rdma_required'), 'error');
-      } else {
-        toast(msg || I18n.t('cluster_detail.deploy_failed'), 'error');
-      }
-    }
-    renderDetail();
-  } catch (err) {
-    deployInProgress = false;
-    deployResult = null;
-    toast(err.message || I18n.t('common.error'), 'error');
-    renderDetail();
-  }
 }
 
 async function stopClusterDeploy() {

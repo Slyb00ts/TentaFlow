@@ -4335,6 +4335,7 @@ function renderRecogTrainTab(panel, p, { selectTab }) {
       <section class="ml-studio-data-card">
         <div class="ml-studio-data-head">${sprite('tune')} Hiperparametry</div>
         <div class="ml-studio-ft-hp-grid">${hpInputs}</div>
+        <p class="ml-studio-ft-hp-hint">Rozdzielczość zostanie zaokrąglona do wielokrotności 32 (nano/small/medium) lub 56 (base/large — backbone DINOv2).</p>
       </section>`;
   }
 

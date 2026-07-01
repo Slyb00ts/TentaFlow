@@ -56,6 +56,10 @@ pub struct Engine {
     /// `None`        — no constraint.
     #[serde(default)]
     pub dgx_spark: Option<bool>,
+    /// `Some(true)` when the engine supports multi-node tensor-parallel deploy
+    /// across a cluster. The unified deploy wizard offers it as a cluster target.
+    #[serde(default)]
+    pub cluster_capable: Option<bool>,
     pub default_port: u16,
     pub api: ApiKind,
     pub version: String,

@@ -1167,6 +1167,16 @@ pub async fn cluster_deploy(
         .cloned()
         .ok_or_else(|| ProtocolError::not_found(format!("engine '{}' nie istnieje", engine_id)))?;
 
+    // Cluster/distributed deploy runs only vLLM/Ray tensor-parallel — reject any
+    // engine that does not opt into it, so an admin/API cannot start a distributed
+    // deploy for a single-node engine (which would silently launch `vllm serve`).
+    if manifest.engine.cluster_capable != Some(true) {
+        return Err(ProtocolError::bad_request(format!(
+            "engine '{}' nie wspiera cluster/distributed deploy",
+            engine_id
+        )));
+    }
+
     // Resolve the model repo (custom repo wins; else preset lookup).
     let model_sel = serde_json::json!({
         "model_repo": model_repo,

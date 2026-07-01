@@ -3817,7 +3817,19 @@
     "gpu_mode_specific_desc": "Sam wskaż które karty GPU mają być zaalokowane dla tego deployu.",
     "gpu_mode_none_title": "Tylko CPU",
     "gpu_mode_none_desc": "Deployment nie dotknie GPU — cała inferencja na procesorze.",
-    "gpu_list_hint": "Dostępne GPU ({n})"
+    "gpu_list_hint": "Dostępne GPU ({n})",
+    "cluster": {
+      "title": "Konfiguracja klastra",
+      "subtitle": "Tensor-parallel na {n} węzłach klastra",
+      "gpus_per_node": "GPU na węzeł",
+      "tp_label": "Rozmiar tensor-parallel (TP)",
+      "served_name": "Nazwa serwowanego modelu (opcjonalnie)",
+      "served_name_hint": "np. moj-model — puste = domyślna z repo",
+      "port": "Port",
+      "pricing_title": "Cennik (opcjonalnie)",
+      "pricing_hint": "Stawki do rozliczeń zużycia. Puste pola pomijane.",
+      "pricing_invalid": "Nieprawidłowy cennik — wartości muszą być >= 0."
+    }
   },
   "category": {
     "llm": "Modele językowe (LLM)",
