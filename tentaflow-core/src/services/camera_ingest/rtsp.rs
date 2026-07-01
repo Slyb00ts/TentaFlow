@@ -18,6 +18,7 @@ use std::time::Duration;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
+use gstreamer_video as gst_video;
 use rand::RngExt;
 use regex::Regex;
 use std::sync::OnceLock;
@@ -1002,6 +1003,29 @@ fn attach_mp4_branch(
     for el in [&queue_b, &depay, &parse, &mux, &sink] {
         el.sync_state_with_parent()
             .map_err(|e| format!("sync_state branch B element: {e}"))?;
+    }
+
+    // Wymuś natychmiastową klatkę kluczową w GÓRĘ pipeline'u. Nowy widz podpina
+    // się do już działającego strumienia — bez tego `mp4mux`/`h264parse` czeka
+    // na najbliższy naturalny keyframe (IDR) kamery zanim wyemituje init
+    // segment (ftyp+moov+IDR), co daje ~2 s czarnego ekranu w podglądzie MSE.
+    // Zdarzenie force-key-unit puszczone upstream na `tee` propaguje się do
+    // źródła RTP (rtspsrc) — dla RTSP tłumaczone na RTCP PLI/żądanie IDR;
+    // wiele kamer (w tym UniFi) oraz nasz symulator MediaMTX reagują od razu,
+    // skracając czas do pierwszej klatki. `all_headers=true` wymusza dołączenie
+    // SPS/PPS przy nowym keyframie, dzięki czemu init segment jest kompletny.
+    let force_key_unit = gst_video::UpstreamForceKeyUnitEvent::builder()
+        .all_headers(true)
+        .build();
+    if !tee.send_event(force_key_unit) {
+        // Nie każde źródło honoruje force-key-unit — to best-effort. Jeśli tee
+        // nie połknęło zdarzenia, spróbuj na całym pipeline (trafi do sink pada
+        // propagującego upstream). Brak reakcji nie jest błędem: strumień i tak
+        // ruszy przy najbliższym naturalnym IDR.
+        let fallback = gst_video::UpstreamForceKeyUnitEvent::builder()
+            .all_headers(true)
+            .build();
+        let _ = pipeline.send_event(fallback);
     }
 
     Ok(Mp4BranchState {

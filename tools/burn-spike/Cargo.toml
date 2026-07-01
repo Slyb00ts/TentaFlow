@@ -19,8 +19,20 @@ name = "onnx2bpk"
 path = "src/onnx2bpk.rs"
 
 [[bin]]
+name = "onnx2gen"
+path = "src/onnx2gen.rs"
+
+[[bin]]
 name = "roundtrip-rfdetr"
 path = "src/roundtrip_rfdetr.rs"
+
+[[bin]]
+name = "roundtrip-stan"
+path = "src/roundtrip_stan.rs"
+
+[[bin]]
+name = "gpu-forward"
+path = "src/gpu_forward.rs"
 
 [features]
 default = []

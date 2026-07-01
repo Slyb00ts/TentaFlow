@@ -16,9 +16,10 @@ import gc
 import json
 import os
 import threading
+import time
 import traceback
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -51,6 +52,18 @@ _EXPORTS_LOCK = threading.Lock()
 _EXPORT_SLOT = threading.Semaphore(1)
 
 
+def _gpu_mem_mb() -> float:
+    """Zarezerwowana pamięć GPU procesu w MB (0.0 gdy brak CUDA)."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return torch.cuda.memory_reserved() / 1e6
+    except Exception:  # noqa: BLE001
+        pass
+    return 0.0
+
+
 @dataclass
 class JobState:
     job_id: str
@@ -62,8 +75,15 @@ class JobState:
     map5095: Optional[float] = None
     error: Optional[str] = None
     artifact_path: Optional[str] = None
+    # Etap joba do podglądu na żywo (przygotowanie → trening → ewaluacja → eksport).
+    stage: str = "przygotowanie"
+    # Znacznik startu joba (monotoniczny) do liczenia elapsed_s/eta_s.
+    start_time: float = field(default_factory=time.monotonic)
 
     def snapshot(self) -> dict[str, Any]:
+        elapsed = time.monotonic() - self.start_time
+        # ETA szacujemy liniowo z tempa ukończonych epok; przed epoką 0 brak podstawy.
+        eta = (elapsed / self.epoch * (self.total_epochs - self.epoch)) if self.epoch > 0 else None
         return {
             "job_id": self.job_id,
             "status": self.status,
@@ -74,6 +94,10 @@ class JobState:
             "map50_95": self.map5095,
             "error": self.error,
             "artifact_path": self.artifact_path,
+            "gpu_mem_mb": _gpu_mem_mb(),
+            "elapsed_s": elapsed,
+            "eta_s": eta,
+            "stage": self.stage,
         }
 
 
@@ -242,6 +266,7 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
                     train_loss=m.get("train_loss"),
                     map50=m.get("map50"),
                     map50_95=m.get("map50_95"),
+                    stage="trening",
                 )
 
     poller = threading.Thread(target=poll_metrics, daemon=True)
@@ -267,6 +292,7 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
             log_per_class_metrics=True,
         )
         stop_poll.set()
+        _update(job_id, stage="ewaluacja")
         # Po treningu domykamy metryki finalnym odczytem (test mAP).
         m = _read_metrics(metrics_csv)
         best = os.path.join(output_dir, "checkpoint_best_ema.pth")

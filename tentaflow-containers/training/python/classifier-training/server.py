@@ -20,9 +20,10 @@ import os
 import re
 import shutil
 import threading
+import time
 import traceback
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -77,6 +78,18 @@ _TRAIN_SLOT = threading.Semaphore(1)
 _EXPORT_SLOT = threading.Semaphore(1)
 
 
+def _gpu_mem_mb() -> float:
+    """Zarezerwowana pamięć GPU procesu w MB (0.0 gdy brak CUDA)."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return torch.cuda.memory_reserved() / 1e6
+    except Exception:  # noqa: BLE001
+        pass
+    return 0.0
+
+
 @dataclass
 class JobState:
     job_id: str
@@ -88,8 +101,15 @@ class JobState:
     val_macro_f1: Optional[float] = None
     error: Optional[str] = None
     artifact_path: Optional[str] = None
+    # Etap joba do podglądu na żywo (przygotowanie → budowa cropów → trening → ewaluacja → eksport).
+    stage: str = "przygotowanie"
+    # Znacznik startu joba (monotoniczny) do liczenia elapsed_s/eta_s.
+    start_time: float = field(default_factory=time.monotonic)
 
     def snapshot(self) -> dict[str, Any]:
+        elapsed = time.monotonic() - self.start_time
+        # ETA szacujemy liniowo z tempa ukończonych epok; przed epoką 0 brak podstawy.
+        eta = (elapsed / self.epoch * (self.total_epochs - self.epoch)) if self.epoch > 0 else None
         return {
             "job_id": self.job_id,
             "status": self.status,
@@ -100,6 +120,10 @@ class JobState:
             "val_macro_f1": self.val_macro_f1,
             "error": self.error,
             "artifact_path": self.artifact_path,
+            "gpu_mem_mb": _gpu_mem_mb(),
+            "elapsed_s": elapsed,
+            "eta_s": eta,
+            "stage": self.stage,
         }
 
 
@@ -451,6 +475,7 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
         os.makedirs(output_dir, exist_ok=True)
         hp = req.hyperparams
 
+        _update(job_id, stage="budowa cropów")
         stats = _collect_crops(req, job_id)
         data_root = stats["data_root"]
         with open(os.path.join(output_dir, "crop_stats.json"), "w", encoding="utf-8") as f:
@@ -515,6 +540,7 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
         best_f1 = -1.0
         best_ckpt = os.path.join(output_dir, "checkpoint_best.pth")
         for epoch in range(1, hp.epochs + 1):
+            _update(job_id, stage="trening")
             model.train()
             running = 0.0
             seen = 0
@@ -531,6 +557,7 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
             train_loss = running / seen if seen else 0.0
 
             # Walidacja: macierz pomyłek → accuracy + macro-F1.
+            _update(job_id, stage="ewaluacja")
             confusion = [[0] * num_classes for _ in range(num_classes)]
             if len(valid_ds) > 0:
                 model.eval()

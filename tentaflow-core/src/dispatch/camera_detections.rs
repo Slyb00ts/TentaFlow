@@ -312,6 +312,7 @@ mod tests {
         let mut rx = detection_bus::subscribe(cam);
         detection_bus::publish_detections(
             cam,
+            0,
             vec![Detection {
                 klasa: "termometr".into(),
                 bbox: [0.1, 0.1, 0.2, 0.2],
@@ -334,6 +335,7 @@ mod tests {
         for _ in 0..200 {
             detection_bus::publish_detections(
                 cam,
+                0,
                 vec![Detection {
                     klasa: "nalepka_9".into(),
                     bbox: [0.0, 0.0, 0.1, 0.1],

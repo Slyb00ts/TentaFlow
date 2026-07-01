@@ -2,15 +2,16 @@
 // File: vision/classifier_stan.rs — placard-state classifier (Burn)
 // =============================================================================
 //
-// Multi-label condition classifier for ADR placards/labels (MobileNetV4).
+// Single-label condition classifier for ADR placards/labels (MobileNetV4).
 // Architecture vendored as `burn_stan` (build-time ONNX→Burn codegen); weights
-// load at runtime from `model_stan.bpk`. Turns a detector crop into state tags
-// (e.g. ["uszkodzona", "wyblakla"]).
+// load at runtime from `model_stan.bpk`. Turns a detector crop into ONE state
+// tag (np. "uszkodzona").
 //
 // Preprocessing mirrors the training transform: RGB crop → SxS bilinear stretch
-// → /255 → per-channel ImageNet normalize → NCHW f32 [1,3,S,S]. Postprocessing
-// is per-class sigmoid with a per-class threshold (`progi`): a class is emitted
-// when `prob[i] > progi[i]`, so the result is multi-label and may be empty.
+// → /255 → per-channel ImageNet normalize → NCHW f32 [1,3,S,S]. Model jest
+// softmaxowym klasyfikatorem single-label (4 klasy) — postprocessing bierze
+// argmax po logitach (równoważny argmaxowi po softmaxie), więc wynik to zawsze
+// dokładnie jedna etykieta o najwyższym prawdopodobieństwie.
 
 #![cfg(feature = "inference-vision-gpu")]
 
@@ -25,13 +26,16 @@ use crate::vision::burn_backend::{self, VisionBackend, VisionDevice};
 use crate::vision::burn_stan::Model;
 
 /// `stan-classes.json` shape — the deploy-time config next to the model.
+/// `progi` jest ignorowane dla modelu softmax (single-label), więc opcjonalne.
 #[derive(Debug, Deserialize)]
 struct ClassesFile {
     classes: Vec<String>,
     img_size: u32,
     mean: [f32; 3],
     std: [f32; 3],
-    progi: Vec<f32>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    progi: Option<Vec<f32>>,
     #[allow(dead_code)]
     activation: String,
 }
@@ -44,7 +48,6 @@ pub struct StateClassifier {
     mean: [f32; 3],
     std: [f32; 3],
     img_size: u32,
-    progi: Vec<f32>,
 }
 
 impl StateClassifier {
@@ -61,13 +64,6 @@ impl StateClassifier {
             .with_context(|| format!("parse {}", classes_path.display()))?;
         if parsed.classes.is_empty() {
             bail!("stan-classes.json has no classes");
-        }
-        if parsed.progi.len() != parsed.classes.len() {
-            bail!(
-                "stan-classes.json: progi len {} != classes len {}",
-                parsed.progi.len(),
-                parsed.classes.len()
-            );
         }
         if parsed.img_size == 0 {
             bail!("stan-classes.json: img_size must be > 0");
@@ -96,12 +92,13 @@ impl StateClassifier {
             mean: parsed.mean,
             std: parsed.std,
             img_size: parsed.img_size,
-            progi: parsed.progi,
         })
     }
 
     /// Runs one crop through the classifier. `crop_rgb` is tightly packed RGB24
-    /// of size `cw*ch*3`. Returns the matched state tags (multi-label).
+    /// of size `cw*ch*3`. Zwraca dokładnie jedną etykietę stanu (klasa o
+    /// najwyższym logicie = najwyższym prawdopodobieństwie softmax) w wektorze,
+    /// żeby zachować kształt `Detection.stan: Vec<String>`.
     pub fn classify(&mut self, crop_rgb: &[u8], cw: u32, ch: u32) -> Result<Vec<String>> {
         let s = self.img_size as usize;
         let resized = crate::vision::resize::resize_rgb(crop_rgb, cw, ch, self.img_size, self.img_size)
@@ -132,17 +129,17 @@ impl StateClassifier {
             bail!("logits len {} < class count {}", logits.len(), num_classes);
         }
 
-        let mut stany = Vec::new();
-        for (i, name) in self.classes.iter().enumerate() {
-            if sigmoid(logits[i]) > self.progi[i] {
-                stany.push(name.clone());
+        // Single-label softmax: argmax po logitach jest równoważny argmaxowi po
+        // softmaxie (softmax jest monotoniczny), więc wybieramy klasę o najwyższym
+        // logicie bez liczenia pełnej normalizacji.
+        let mut best_idx = 0usize;
+        let mut best_logit = f32::NEG_INFINITY;
+        for (idx, &l) in logits.iter().take(num_classes).enumerate() {
+            if l > best_logit {
+                best_logit = l;
+                best_idx = idx;
             }
         }
-        Ok(stany)
+        Ok(vec![self.classes[best_idx].clone()])
     }
-}
-
-#[inline]
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
 }

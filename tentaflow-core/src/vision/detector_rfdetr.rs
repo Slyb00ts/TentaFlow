@@ -72,7 +72,8 @@ impl RfDetrDetector {
         }
         let device = burn_backend::device();
         let mut model = Model::<VisionBackend>::new(&device);
-        let mut store = BurnpackStore::from_file(&weights_path);
+        let mut store = BurnpackStore::from_file(&weights_path)
+            .with_from_adapter(burn_backend::BoolNativeToU32Adapter);
         model
             .load_from(&mut store)
             .map_err(|e| anyhow!("load RF-DETR weights {}: {e}", weights_path.display()))?;
@@ -97,20 +98,40 @@ impl RfDetrDetector {
         Ok(self.detect_batch(&[(rgb, w, h)])?.into_iter().next().unwrap_or_default())
     }
 
-    /// Stacks N camera frames into one `[N,3,560,560]` batch and runs a single
-    /// forward — one GPU launch amortized across the fleet.
+    /// Przetwarza N klatek kamer — KAŻDĄ osobno przy batch=1 (`[1,3,560,560]`)
+    /// w pętli, zbierając wyniki do `Vec<Vec<Detection>>` (kolejność zachowana).
+    ///
+    /// Dlaczego per-klatka, a nie jeden stackowany forward `[N,3,560,560]`:
+    /// eksportowany ONNX został uproszczony z ZAFIKSOWANYM wejściem batch=1, więc
+    /// stałe grafu (embedding pozycyjny / reshape'y) zakładają wymiar batch=1.
+    /// Przy N>1 kształty się rozjeżdżają (np. `Add [1,3201,384] vs [1,1601,384]`)
+    /// i forward panikuje. Pętla forwardów batch=1 jest bezpiecznym, poprawnym
+    /// wariantem dla inferencji wielokamerowej.
+    ///
+    /// TODO: prawdziwy dynamic-batch (jeden GPU launch na całą flotę) wymaga
+    /// re-eksportu modelu z dynamicznym wymiarem batch — osobna optymalizacja
+    /// pod skalę (DGX / ~1500 kamer), niezależna od tej ścieżki.
     pub fn detect_batch(&mut self, frames: &[(&[u8], u32, u32)]) -> Result<Vec<Vec<Detection>>> {
         if frames.is_empty() {
             return Ok(Vec::new());
         }
         let n = frames.len();
-        let res = RESOLUTION as usize;
-        let mut data = vec![0f32; n * 3 * res * res];
-        for (bi, &(rgb, w, h)) in frames.iter().enumerate() {
-            fill_frame(&mut data, bi, rgb, w, h)?;
+        let mut results = Vec::with_capacity(n);
+        for &(rgb, w, h) in frames.iter() {
+            results.push(self.detect_one(rgb, w, h)?);
         }
+        Ok(results)
+    }
+
+    /// Pojedynczy forward przy batch=1: preprocessing → `[1,3,560,560]` → model
+    /// → postprocessing DETR. Wspólna ścieżka dla `detect` (N=1) i każdej iteracji
+    /// `detect_batch`, więc wynik jest bit-identyczny niezależnie od liczby kamer.
+    fn detect_one(&mut self, rgb: &[u8], w: u32, h: u32) -> Result<Vec<Detection>> {
+        let res = RESOLUTION as usize;
+        let mut data = vec![0f32; 3 * res * res];
+        fill_frame(&mut data, 0, rgb, w, h)?;
         let input =
-            Tensor::<VisionBackend, 4>::from_data(TensorData::new(data, [n, 3, res, res]), &self.device);
+            Tensor::<VisionBackend, 4>::from_data(TensorData::new(data, [1, 3, res, res]), &self.device);
 
         let (o0, o1) =
             crate::vision::burn_backend::guarded_forward("rfdetr", || self.model.forward(input))?;
@@ -137,19 +158,13 @@ impl RfDetrDetector {
             );
         }
 
-        let mut results = Vec::with_capacity(n);
-        for bi in 0..n {
-            let dets_off = bi * queries * 4;
-            let labels_off = bi * queries * label_dim;
-            results.push(self.postprocess_image(
-                &dets_v[dets_off..dets_off + queries * 4],
-                &labels_v[labels_off..labels_off + queries * label_dim],
-                queries,
-                label_dim,
-                num_classes,
-            ));
-        }
-        Ok(results)
+        Ok(self.postprocess_image(
+            &dets_v[..queries * 4],
+            &labels_v[..queries * label_dim],
+            queries,
+            label_dim,
+            num_classes,
+        ))
     }
 
     /// Per-image DETR postprocess: per-query sigmoid + argmax over the real

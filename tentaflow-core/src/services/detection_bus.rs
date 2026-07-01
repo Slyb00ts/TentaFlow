@@ -119,16 +119,17 @@ pub fn subscribe(camera_id: &str) -> broadcast::Receiver<DetectionsMessage> {
 
 /// Czysty punkt wpiecia dla zrodla detekcji. Realna inferencja
 /// (RF-DETR + OCR + stan) bedzie wolac dokladnie te funkcje tym samym
-/// `Detection` -> JSON kontraktem co stub. Znacznik czasu jest nadawany tutaj
-/// (unix epoch ms), wiec zrodlo nie musi go liczyc.
+/// `Detection` -> JSON kontraktem co stub.
+///
+/// `ts_ms` to czas PRZECHWYCENIA klatki (unix epoch ms, wall-clock), NIE czas
+/// publikacji. Overlay w przegladarce kotwiczy `video.currentTime` (odtwarzanie
+/// w czasie rzeczywistym) do tego znacznika, wiec musi on odpowiadac klatce na
+/// ktorej wykonano detekcje — inaczej pudelka lądują na spóźnionej klatce
+/// (opóźnienie dekod+inferencja+publish).
 ///
 /// Gdy nikt nie subskrybuje danej kamery, wiadomosc jest po cichu pomijana
 /// (brak odbiorcow broadcast) — to zamierzone, nie blokuje producenta.
-pub fn publish_detections(camera_id: &str, items: Vec<Detection>) {
-    let ts_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+pub fn publish_detections(camera_id: &str, ts_ms: u64, items: Vec<Detection>) {
     let msg = DetectionsMessage::new(camera_id.to_string(), ts_ms, items);
     // `send` zwraca Err tylko gdy nie ma zadnych odbiorcow — ignorujemy.
     let _ = detection_bus().sender(camera_id).send(msg);
@@ -205,7 +206,13 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                 });
             }
 
-            publish_detections(&camera_id, items);
+            // Stub nie ma realnej klatki, wiec brak naturalnego czasu
+            // przechwycenia — uzywamy biezacego czasu wall-clock lokalnie.
+            let ts_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            publish_detections(&camera_id, ts_ms, items);
         }
     })
 }
@@ -283,6 +290,7 @@ mod tests {
         let mut rx = subscribe(cam);
         publish_detections(
             cam,
+            0,
             vec![Detection {
                 klasa: "termometr".to_string(),
                 bbox: [0.1, 0.1, 0.2, 0.2],
@@ -302,6 +310,7 @@ mod tests {
         // Brak subskrybenta — publish nie panikuje i nie blokuje producenta.
         publish_detections(
             "detbus-test-cam-ghost",
+            0,
             vec![Detection {
                 klasa: "nalepka_9".to_string(),
                 bbox: [0.0, 0.0, 0.1, 0.1],

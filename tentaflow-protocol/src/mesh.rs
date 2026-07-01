@@ -555,6 +555,34 @@ pub enum MeshCommandType {
         deployment_cluster_id: String,
         serve_cmd: String,
     },
+    /// P0 cluster deploy: upewnij sie, ze model `model_repo` jest kompletny w cache
+    /// HF NA TYM nodzie (zwykle head). Jesli brak — odbiorca pobiera go kontenerem
+    /// silnika `engine_id` (`snapshot_download`) z WLASNYM `HF_TOKEN` z secure
+    /// setting (token NIGDY nie leci przez mesh). Odpowiedz: `EnsureModelResult`.
+    /// `deployment_cluster_id` dowiazuje komende do aktywnego cluster-deployu —
+    /// odbiorca autoryzuje ja wzgledem wspoldzielonego klastra (patrz executor).
+    /// Appended at END (ciborium index rule).
+    EnsureModelLocal {
+        deployment_cluster_id: String,
+        model_repo: String,
+        engine_id: String,
+    },
+    /// P0 cluster deploy: czy model `model_repo` jest juz kompletny w cache HF NA
+    /// TYM nodzie (worker sprawdza przed transferem z head-a). Odpowiedz:
+    /// `ModelPresentResult { present }`. Appended at END.
+    ModelPresentLocal {
+        deployment_cluster_id: String,
+        model_repo: String,
+    },
+    /// P0 cluster deploy: spakuj snapshot modelu `model_repo` z LOKALNEGO cache HF
+    /// tego noda (source/head) i wypchnij go strumieniem ALPN_ARTIFACT do
+    /// `target_node_id`, ktory zapisze go do swojego cache HF. Odpowiedz:
+    /// `MlArtifactPushResult`. Appended at END.
+    PushModelToPeer {
+        deployment_cluster_id: String,
+        model_repo: String,
+        target_node_id: String,
+    },
 }
 
 /// Per-node spec distributed-deployu policzony przez koordynatora z
@@ -773,6 +801,16 @@ pub enum MeshCommandResponsePayload {
         ray_nodes: u32,
         serve_ready: bool,
         error: Option<String>,
+    },
+    /// P0 cluster deploy: wynik `EnsureModelLocal` — sciezka snapshotu modelu w
+    /// cache HF NA odbiorcy (pusta gdy `error`). Appended at END.
+    EnsureModelResult {
+        snapshot_dir: String,
+        error: Option<String>,
+    },
+    /// P0 cluster deploy: wynik `ModelPresentLocal`. Appended at END.
+    ModelPresentResult {
+        present: bool,
     },
 }
 
@@ -999,6 +1037,34 @@ impl std::fmt::Debug for MeshCommandType {
             } => f
                 .debug_struct("DistributedStartServe")
                 .field("deployment_cluster_id", deployment_cluster_id)
+                .finish(),
+            Self::EnsureModelLocal {
+                deployment_cluster_id,
+                model_repo,
+                engine_id,
+            } => f
+                .debug_struct("EnsureModelLocal")
+                .field("deployment_cluster_id", deployment_cluster_id)
+                .field("model_repo", model_repo)
+                .field("engine_id", engine_id)
+                .finish(),
+            Self::ModelPresentLocal {
+                deployment_cluster_id,
+                model_repo,
+            } => f
+                .debug_struct("ModelPresentLocal")
+                .field("deployment_cluster_id", deployment_cluster_id)
+                .field("model_repo", model_repo)
+                .finish(),
+            Self::PushModelToPeer {
+                deployment_cluster_id,
+                model_repo,
+                target_node_id,
+            } => f
+                .debug_struct("PushModelToPeer")
+                .field("deployment_cluster_id", deployment_cluster_id)
+                .field("model_repo", model_repo)
+                .field("target_node_id", target_node_id)
                 .finish(),
         }
     }

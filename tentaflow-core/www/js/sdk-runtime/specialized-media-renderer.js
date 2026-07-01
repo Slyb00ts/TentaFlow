@@ -148,6 +148,13 @@ function renderVideoStream(component, ctx) {
 export const LIVE_CAMERA_TILE_TAG = 0x0605;
 const LCT_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6]);
 
+// Aktualny timestamp HH:MM:SS do nakladki dolnej (mono).
+function nowHms() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 function renderLiveCameraTile(component, ctx) {
   assertOnlyKnownFields(component.fields, LCT_FIELD_KEYS, 'LiveCameraTile');
 
@@ -172,26 +179,58 @@ function renderLiveCameraTile(component, ctx) {
   wrapper.classList.add('tf-live-camera');
   if (aspectRatio != null) wrapper.style.aspectRatio = aspectRatio;
 
-  const video = document.createElement('video');
-  video.classList.add('tf-live-camera__video');
-  video.autoplay = true;
-  video.muted = true;
-  video.playsInline = true;
+  // Zywy strumien subskrypcji (camera:<id>) idzie przez tf-video-stream (MSE nad
+  // binarnym streamSubscribeRequest) — dokladnie jak w renderVideoStream — i
+  // dostaje binarna nakladke detekcji (canvas). Wypelnia caly kafelek. Surowy
+  // URL (media plik) zostaje na prostej sciezce <video src>, bez subskrypcji.
+  if (isSubscribeStreamId(resolveBindRef(streamIdBind, ctx.store))) {
+    const tile = document.createElement('tf-video-stream');
+    tile.classList.add('tf-live-camera__stream');
+    tile.style.display = 'block';
+    tile.style.width = '100%';
+    tile.style.height = '100%';
+    tile.style.setProperty('--tf-video-stream-height', '100%');
+    const applyId = () => {
+      const v = resolveBindRef(streamIdBind, ctx.store);
+      if (typeof v === 'string' && v.length > 0) tile.setAttribute('stream-id', v);
+      else tile.removeAttribute('stream-id');
+    };
+    applyId();
+    ctx.registerCleanup(subscribeBindRef(streamIdBind, ctx.store, applyId));
+    wrapper.appendChild(tile);
+    attachLiveDetections(wrapper, tile, () => resolveBindRef(streamIdBind, ctx.store), ctx);
+  } else {
+    const video = document.createElement('video');
+    video.classList.add('tf-live-camera__video');
+    video.autoplay = true;
+    video.muted = true;
+    video.playsInline = true;
 
-  const applySrc = () => {
-    const src = resolveBindRef(streamIdBind, ctx.store);
-    if (src == null || typeof src !== 'string') { video.removeAttribute('src'); return; }
-    if (/^javascript:/i.test(src.trim())) { video.removeAttribute('src'); return; }
-    video.src = src;
-  };
-  applySrc();
-  ctx.registerCleanup(subscribeBindRef(streamIdBind, ctx.store, applySrc));
-  wrapper.appendChild(video);
+    const applySrc = () => {
+      const src = resolveBindRef(streamIdBind, ctx.store);
+      if (src == null || typeof src !== 'string') { video.removeAttribute('src'); return; }
+      if (/^javascript:/i.test(src.trim())) { video.removeAttribute('src'); return; }
+      video.src = src;
+    };
+    applySrc();
+    ctx.registerCleanup(subscribeBindRef(streamIdBind, ctx.store, applySrc));
+    wrapper.appendChild(video);
+  }
 
   if (showOverlay) {
+    // Nakladki-etykiety leza w kontenerze (light DOM) NAD canvasem detekcji
+    // (canvas ma z-index 20). Sa male i w rogach, wiec nie zaslaniaja bboxow.
+
+    // Nakladka gorna: nazwa kamery (z ikona) po lewej, status po prawej.
     const overlay = document.createElement('div');
     overlay.classList.add('tf-live-camera__overlay');
 
+    const title = document.createElement('span');
+    title.classList.add('tf-live-camera__title');
+    const icon = document.createElement('span');
+    icon.classList.add('tf-live-camera__icon');
+    icon.setAttribute('aria-hidden', 'true');
+    title.appendChild(icon);
     const labelEl = document.createElement('span');
     labelEl.classList.add('tf-live-camera__label');
     const applyLabel = () => {
@@ -200,7 +239,8 @@ function renderLiveCameraTile(component, ctx) {
     };
     applyLabel();
     ctx.registerCleanup(subscribeBindRef(labelBind, ctx.store, applyLabel));
-    overlay.appendChild(labelEl);
+    title.appendChild(labelEl);
+    overlay.appendChild(title);
 
     const statusEl = document.createElement('span');
     statusEl.classList.add('tf-live-camera__status');
@@ -213,6 +253,11 @@ function renderLiveCameraTile(component, ctx) {
     applyStatus();
     ctx.registerCleanup(subscribeBindRef(statusBind, ctx.store, applyStatus));
     overlay.appendChild(statusEl);
+    wrapper.appendChild(overlay);
+
+    // Nakladka dolna: fps (opcjonalnie) po lewej, biezacy timestamp (mono) po prawej.
+    const bottom = document.createElement('div');
+    bottom.classList.add('tf-live-camera__overlay-bottom');
 
     if (fpsBind != null) {
       const fpsEl = document.createElement('span');
@@ -223,10 +268,18 @@ function renderLiveCameraTile(component, ctx) {
       };
       applyFps();
       ctx.registerCleanup(subscribeBindRef(fpsBind, ctx.store, applyFps));
-      overlay.appendChild(fpsEl);
+      bottom.appendChild(fpsEl);
     }
 
-    wrapper.appendChild(overlay);
+    const timeEl = document.createElement('span');
+    timeEl.classList.add('tf-live-camera__time');
+    timeEl.textContent = nowHms();
+    if (typeof window !== 'undefined' && typeof window.setInterval === 'function') {
+      const timer = window.setInterval(() => { timeEl.textContent = nowHms(); }, 1000);
+      ctx.registerCleanup(() => window.clearInterval(timer));
+    }
+    bottom.appendChild(timeEl);
+    wrapper.appendChild(bottom);
   }
 
   if (showFullscreen) {

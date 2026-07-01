@@ -157,6 +157,294 @@ fn nccl_env(spec: &DistributedDeploySpec) -> Map<String, Value> {
     m
 }
 
+// =============================================================================
+// P0 "ensure model" — head pobiera model do cache HF (jesli brak), potem
+// koordynator przesyla snapshot na workery przez mesh (patrz `mesh_artifact`).
+// Layout cache = ten sam, ktory serwuje `vllm serve`: `HF_HUB_CACHE=/data/models`
+// (CONTAINER_MODELS_PATH) montowany z `models_root()` → snapshot lezy pod
+// `models_root()/models--ORG--NAME/snapshots/HASH/` (BEZ podkatalogu `hub/`).
+// =============================================================================
+
+use std::path::{Path, PathBuf};
+
+/// Nazwa katalogu cache HF dla repo (`org/name` → `models--org--name`).
+pub fn model_dir_name(model_repo: &str) -> String {
+    format!("models--{}", model_repo.replace('/', "--"))
+}
+
+/// Czy segment repo (`org` lub `name`) jest bezpieczny: niepusty, bez `..`, tylko
+/// `[A-Za-z0-9._-]`.
+fn repo_segment_is_safe(seg: &str) -> bool {
+    !seg.is_empty()
+        && !seg.contains("..")
+        && seg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Czy `model_repo` ma bezpieczna postac HF repo id — DOKLADNIE `org/name` (jeden
+/// slash, oba segmenty niepuste i tylko `[A-Za-z0-9._-]`). Chroni komende pobierania
+/// (interpolacja do `python -c`) i sciezki cache przed path-traversal/injection —
+/// zaden leading/trailing/multiple slash nie przechodzi.
+fn model_repo_is_safe(model_repo: &str) -> bool {
+    let mut parts = model_repo.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(org), Some(name), None) => repo_segment_is_safe(org) && repo_segment_is_safe(name),
+        _ => false,
+    }
+}
+
+/// Czy `engine_id` jest bezpieczny do interpolacji w prefiks obrazu
+/// `tentaflow/{engine_id}` (peer steruje nim przy `EnsureModelLocal`). Allowlist
+/// `[a-z0-9-]`, niepusty — zaden separator sciezki/powloki nie przejdzie.
+fn engine_id_is_safe(engine_id: &str) -> bool {
+    !engine_id.is_empty()
+        && engine_id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Czy snapshot w `dir` jest kompletny do serwowania: ma `config.json` i choc
+/// jeden plik `*.safetensors` (symlinki do blobow sa podazane przez `is_file`).
+fn snapshot_complete(dir: &Path) -> bool {
+    if !dir.join("config.json").is_file() {
+        return false;
+    }
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok()).any(|e| {
+                e.path()
+                    .extension()
+                    .map(|x| x == "safetensors")
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Sciezka KOMPLETNEGO snapshotu `model_repo` w lokalnym cache HF, albo `None`
+/// gdy brak/niekompletny. Rozwiazuje rewizje przez `refs/main`, a jak brak — bierze
+/// najnowszy katalog `snapshots/*`.
+pub fn model_snapshot_dir(model_repo: &str) -> Option<PathBuf> {
+    if !model_repo_is_safe(model_repo) {
+        return None;
+    }
+    let base = crate::paths::models_root().join(model_dir_name(model_repo));
+    let snapshots = base.join("snapshots");
+    if !snapshots.is_dir() {
+        return None;
+    }
+    // Preferuj rewizje wskazana przez `refs/main`; inaczej najnowszy snapshot.
+    let by_ref = std::fs::read_to_string(base.join("refs").join("main"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|h| snapshots.join(h))
+        .filter(|p| p.is_dir());
+    let candidate = match by_ref {
+        Some(p) => p,
+        None => std::fs::read_dir(&snapshots)
+            .ok()?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_dir())
+            .max_by_key(|p| {
+                std::fs::metadata(p)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH)
+            })?,
+    };
+    snapshot_complete(&candidate).then_some(candidate)
+}
+
+/// Upewnia sie, ze `model_repo` jest w lokalnym cache HF; jesli nie — pobiera go
+/// kontenerem silnika (`snapshot_download`) i zwraca sciezke snapshotu. `hf_token`
+/// (gated repo) rozwiazany LOKALNIE u wolajacego (nie leci przez mesh). Docelowy
+/// layout jest identyczny z tym, ktory serwuje `vllm serve` (HF_HUB_CACHE).
+pub async fn ensure_model_downloaded_local(
+    model_repo: &str,
+    engine_id: &str,
+    hf_token: Option<&str>,
+) -> Result<PathBuf, String> {
+    if !model_repo_is_safe(model_repo) {
+        return Err(format!("niepoprawne repo modelu: {model_repo}"));
+    }
+    if !engine_id_is_safe(engine_id) {
+        return Err(format!("niepoprawny engine_id: {engine_id}"));
+    }
+    if let Some(dir) = model_snapshot_dir(model_repo) {
+        tracing::info!(model = %model_repo, dir = %dir.display(), "P0: model juz w cache — pomijam pobieranie");
+        return Ok(dir);
+    }
+    #[cfg(feature = "docker")]
+    {
+        download_model_via_container(model_repo, engine_id, hf_token).await?;
+        model_snapshot_dir(model_repo).ok_or_else(|| {
+            format!("model {model_repo} pobrany, ale snapshot niekompletny (brak config.json/*.safetensors)")
+        })
+    }
+    #[cfg(not(feature = "docker"))]
+    {
+        let _ = (engine_id, hf_token);
+        Err("tentaflow-core zbudowany bez feature `docker` — nie moge pobrac modelu".to_string())
+    }
+}
+
+/// Pierwszy lokalny obraz Docker silnika (`tentaflow/<engine_id>...`), zdatny do
+/// uruchomienia `python -c snapshot_download`. Cluster deploy vllm-spark buduje
+/// `tentaflow/vllm-spark:<ver>` i cienki `tentaflow/vllm-spark-ray:<ver>` — oba
+/// maja `huggingface_hub`, wiec dowolny pasujacy tag wystarczy.
+#[cfg(feature = "docker")]
+async fn resolve_download_image(engine_id: &str) -> Option<String> {
+    let out = tokio::process::Command::new("docker")
+        .args(["images", "--format", "{{.Repository}}:{{.Tag}}"])
+        .output()
+        .await
+        .ok()?;
+    let prefix = format!("tentaflow/{engine_id}");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with(&prefix) && !l.ends_with(":<none>"))
+        .map(String::from)
+}
+
+/// Pobiera `model_repo` do zamontowanego cache HF przez `python -c snapshot_download`
+/// w kontenerze silnika. `HF_HUB_CACHE`/`HF_HOME` = CONTAINER_MODELS_PATH (ten sam
+/// mount i layout co serwowanie), `offline=0`, opcjonalny `HF_TOKEN`. Postep + tail
+/// stderr logowane; niezerowy exit → blad z ogonem stderr.
+#[cfg(feature = "docker")]
+async fn download_model_via_container(
+    model_repo: &str,
+    engine_id: &str,
+    hf_token: Option<&str>,
+) -> Result<(), String> {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::AsyncRead;
+
+    let image = resolve_download_image(engine_id).await.ok_or_else(|| {
+        format!(
+            "brak lokalnego obrazu 'tentaflow/{engine_id}...' do pobrania modelu — \
+             zbuduj najpierw obraz silnika (deploy single-node)"
+        )
+    })?;
+    let models_host = crate::paths::models_root();
+    std::fs::create_dir_all(&models_host)
+        .map_err(|e| format!("mkdir models_root: {e}"))?;
+    let mount = format!(
+        "{}:{}",
+        models_host.display(),
+        crate::paths::CONTAINER_MODELS_PATH
+    );
+    // `model_repo` jest ograniczony do [A-Za-z0-9._/-] przez `model_repo_is_safe`,
+    // wiec nie moze wyrwac sie z literalu Pythona; caly `-c` idzie jako jeden argv
+    // (bez powloki).
+    let py = format!("from huggingface_hub import snapshot_download; snapshot_download('{model_repo}')");
+
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        "-v".into(),
+        mount,
+        "-e".into(),
+        format!("HF_HOME={}", crate::paths::CONTAINER_MODELS_PATH),
+        "-e".into(),
+        format!("HF_HUB_CACHE={}", crate::paths::CONTAINER_MODELS_PATH),
+        "-e".into(),
+        "HF_HUB_OFFLINE=0".into(),
+    ];
+    if let Some(tok) = hf_token.map(str::trim).filter(|s| !s.is_empty()) {
+        args.push("-e".into());
+        args.push(format!("HF_TOKEN={tok}"));
+    }
+    args.push("--entrypoint".into());
+    args.push("python".into());
+    args.push(image.clone());
+    args.push("-c".into());
+    args.push(py);
+
+    tracing::info!(model = %model_repo, image = %image, "P0: pobieram model do cache HF (snapshot_download)");
+    let mut child = tokio::process::Command::new("docker")
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("docker run (pobieranie modelu) nieudany: {e}"))?;
+
+    let tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let mut drains = Vec::new();
+    // stdout i stderr maja rozne typy (ChildStdout / ChildStderr), wiec ujednolicamy
+    // je do wspolnego trait-objectu AsyncRead, by trzymac w jednej tablicy.
+    let pipes: Vec<(Option<Box<dyn AsyncRead + Unpin + Send>>, bool)> = vec![
+        (
+            child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn AsyncRead + Unpin + Send>),
+            false,
+        ),
+        (
+            child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn AsyncRead + Unpin + Send>),
+            true,
+        ),
+    ];
+    for (pipe, is_err) in pipes {
+        let Some(pipe) = pipe else { continue };
+        let tail = tail.clone();
+        let repo = model_repo.to_string();
+        drains.push(tokio::spawn(async move {
+            let mut lines = BufReader::new(pipe).lines();
+            while let Ok(Some(l)) = lines.next_line().await {
+                let l = l.trim().to_string();
+                if l.is_empty() {
+                    continue;
+                }
+                tracing::info!(model = %repo, "hf download: {l}");
+                if is_err {
+                    if let Ok(mut t) = tail.lock() {
+                        t.push_back(l);
+                        while t.len() > 40 {
+                            t.pop_front();
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    // Heartbeat: duze wagi ida dlugo (tqdm pisze `\r` bez nowej linii), wiec bez
+    // tego log milczalby minutami.
+    let status = loop {
+        tokio::select! {
+            s = child.wait() => break s.map_err(|e| format!("docker run (pobieranie modelu): {e}"))?,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                tracing::info!(model = %model_repo, "hf download: nadal trwa...");
+            }
+        }
+    };
+    for d in drains {
+        let _ = d.await;
+    }
+    if status.success() {
+        tracing::info!(model = %model_repo, "P0: pobieranie modelu zakonczone");
+        Ok(())
+    } else {
+        let tail_txt = tail
+            .lock()
+            .ok()
+            .map(|t| t.iter().cloned().collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default();
+        Err(format!(
+            "pobieranie modelu {model_repo} nieudane (exit {:?})\n--- stderr ---\n{tail_txt}",
+            status.code()
+        ))
+    }
+}
+
 /// Buduje `user_config` (JSON) sterujacy istniejacym potokiem `deploy()` na
 /// docelowym czlonku. Klucze: `_distributed` (host-net + RDMA flagi),
 /// `launch_command_override` (ray + vllm verbatim), `engine_env` (NCCL/RoCE),

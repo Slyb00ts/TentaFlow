@@ -72,6 +72,8 @@ pub fn spawn_recog_training(
             tracing::warn!(run_id = %run_id, error = %err, "RF-DETR training failed");
             let _ = repository::update_training_run_status(&run_id, "failed");
         }
+        // Sprzątamy wpis live-view niezależnie od wyniku (job już nie żyje).
+        crate::ml_studio::live_view::clear_local_job(&run_id);
     });
 }
 
@@ -192,6 +194,8 @@ async fn run_training_against_dir(
         let url = format!("{}/train", base);
         tokio::task::spawn_blocking(move || post_train(&url, train_body)).await??
     };
+    // Rejestracja do live-view: handlery mogą teraz odpytać serwis o postęp.
+    crate::ml_studio::live_view::register_local_job(run_id, &base, &job_id);
 
     let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
     let status_url = format!("{}/status/{}", base, job_id);

@@ -1,4 +1,4 @@
-// Generated from ONNX "/home/critix/repos/rust/TentaFlow/.runtime/models/vision/model_stan.onnx" by burn-onnx
+// Generated from ONNX ".runtime/cache/ml-training-artifacts/classifier/stan-deploy/model.onnx" by burn-onnx
 use burn::prelude::*;
 use burn::nn::Linear;
 use burn::nn::LinearConfig;
@@ -70,10 +70,7 @@ extern crate std;
 
 impl<B: Backend> Default for Model<B> {
     fn default() -> Self {
-        Self::from_file(
-            "model_stan.bpk",
-            &Default::default(),
-        )
+        Self::from_file("/tmp/onnx2gen-1707457-model/model.bpk", &Default::default())
     }
 }
 
@@ -422,7 +419,7 @@ impl<B: Backend> Model<B> {
             .with_groups(1)
             .with_bias(true)
             .init(device);
-        let linear1 = LinearConfig::new(1280, 5)
+        let linear1 = LinearConfig::new(1280, 4)
             .with_bias(true)
             .with_layout(LinearLayout::Col)
             .init(device);

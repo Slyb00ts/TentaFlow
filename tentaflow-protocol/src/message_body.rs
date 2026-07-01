@@ -1241,6 +1241,49 @@ pub struct MlStudioTrainingRunsListResponse {
     pub runs: Vec<MlStudioTrainingRunSummary>,
 }
 
+/// Statystyki GPU odczytane z `nvidia-smi` (pierwsza karta). Gdy `nvidia-smi`
+/// niedostępny — wszystkie pola zerowe, `name` puste (bez błędu handlera).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct GpuStats {
+    pub name: String,
+    pub mem_used_mb: i32,
+    pub mem_total_mb: i32,
+    pub util_pct: i32,
+}
+
+/// Jeden aktywny (running/pending) job treningowy do panelu jobów ML Studio.
+/// Łączy dane runu z bazy (run_id/project/kind/variant/status) z polami live-view
+/// z serwisu treningowego (epoch/total_epochs/eta_s/elapsed_s/gpu_mem_mb/stage).
+/// Pola live-view są tolerancyjne: gdy serwis ich nie zwraca → 0/"".
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct TrainingJobInfo {
+    pub run_id: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub kind: String,
+    pub variant: String,
+    pub status: String,
+    pub epoch: i32,
+    pub total_epochs: i32,
+    pub eta_s: f32,
+    pub elapsed_s: f32,
+    pub gpu_mem_mb: f32,
+    pub stage: String,
+    pub started_at: String,
+}
+
+/// Żądanie przeglądu wszystkich aktywnych jobów treningowych widocznych dla
+/// użytkownika (projekty, których jest członkiem). Bez parametrów.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioJobsOverviewRequest {}
+
+/// Odpowiedź panelu jobów: lista aktywnych jobów + zbiorcze statystyki GPU węzła.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioJobsOverviewResponse {
+    pub jobs: Vec<TrainingJobInfo>,
+    pub gpu: GpuStats,
+}
+
 /// One model row for the project overview tab. Mirrors the `models` table;
 /// `metrics_json` carries the serialized metric snapshot for the model card.
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -1889,6 +1932,17 @@ pub struct MlStudioRecogTrainStatusResponse {
     pub sync_bytes_sent: u64,
     pub sync_bytes_total: u64,
     pub sync_rate_bps: u64,
+    /// Pola live-view z serwisu treningowego (`/status`). Serde default = wsteczna
+    /// kompatybilność ze starszymi nadawcami. `eta_s`/`elapsed_s` w sekundach,
+    /// `gpu_mem_mb` w MB, `stage` = etap serwisu (np. "warmup"|"train"|"eval").
+    #[serde(default)]
+    pub eta_s: f32,
+    #[serde(default)]
+    pub elapsed_s: f32,
+    #[serde(default)]
+    pub gpu_mem_mb: f32,
+    #[serde(default)]
+    pub stage: String,
 }
 
 /// Hiperparametry treningu klasyfikatora atrybutu na wycinkach (timm). Kontrakt
@@ -1962,6 +2016,17 @@ pub struct MlStudioGenericTrainStatusResponse {
     pub sync_bytes_sent: u64,
     pub sync_bytes_total: u64,
     pub sync_rate_bps: u64,
+    /// Pola live-view z serwisu treningowego (`/status`). Serde default = wsteczna
+    /// kompatybilność ze starszymi nadawcami. `eta_s`/`elapsed_s` w sekundach,
+    /// `gpu_mem_mb` w MB, `stage` = etap serwisu (np. "warmup"|"train"|"eval").
+    #[serde(default)]
+    pub eta_s: f32,
+    #[serde(default)]
+    pub elapsed_s: f32,
+    #[serde(default)]
+    pub gpu_mem_mb: f32,
+    #[serde(default)]
+    pub stage: String,
 }
 
 /// Żądanie eksportu wytrenowanego modelu FT do GGUF. Eksport (merge adaptera +
@@ -2149,6 +2214,8 @@ pub enum MlStudioPayload {
     ProjectResourcesResponse(MlStudioProjectResourcesResponse),
     TrainingRunsListRequest(MlStudioTrainingRunsListRequest),
     TrainingRunsListResponse(MlStudioTrainingRunsListResponse),
+    JobsOverviewRequest(MlStudioJobsOverviewRequest),
+    JobsOverviewResponse(MlStudioJobsOverviewResponse),
     ModelsListRequest(MlStudioModelsListRequest),
     ModelsListResponse(MlStudioModelsListResponse),
     ProjectGrantsListRequest(MlStudioProjectGrantsListRequest),
@@ -7413,6 +7480,10 @@ mod tests {
                 sync_bytes_sent: 1_024,
                 sync_bytes_total: 4_096,
                 sync_rate_bps: 512,
+                eta_s: 0.0,
+                elapsed_s: 0.0,
+                gpu_mem_mb: 0.0,
+                stage: String::new(),
             },
         ));
         assert_eq!(round_trip(body.clone()), body);
@@ -7432,6 +7503,10 @@ mod tests {
                 sync_bytes_sent: 0,
                 sync_bytes_total: 0,
                 sync_rate_bps: 0,
+                eta_s: 0.0,
+                elapsed_s: 0.0,
+                gpu_mem_mb: 0.0,
+                stage: String::new(),
             },
         ));
         assert_eq!(round_trip(body.clone()), body);

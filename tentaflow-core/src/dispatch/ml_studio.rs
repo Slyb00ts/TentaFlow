@@ -1663,6 +1663,73 @@ pub fn ml_studio_training_runs_list(
     )))
 }
 
+#[handler(variant = "MlStudioJobsOverviewRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub async fn ml_studio_jobs_overview(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::MlStudioBody(MlStudioPayload::JobsOverviewRequest(_)) => {}
+        _ => return Err(ProtocolError::bad_request("expected MlStudioJobsOverviewRequest")),
+    };
+    let org = require_org(ctx)?;
+    let rows = repository::list_active_runs_for_user(&org.user_id).map_err(db_err)?;
+
+    let mut jobs = Vec::with_capacity(rows.len());
+    for r in rows {
+        // kind/variant z config_json runu (tolerancyjnie — brak = "").
+        let cfg = serde_json::from_str::<serde_json::Value>(&r.config_json).ok();
+        let kind = cfg
+            .as_ref()
+            .and_then(|c| c.get("kind")?.as_str().map(String::from))
+            .unwrap_or_default();
+        let variant = cfg
+            .as_ref()
+            .and_then(|c| c.get("variant")?.as_str().map(String::from))
+            .unwrap_or_default();
+
+        // Live-view z serwisu treningowego (tylko lokalne joby mają wpis; brak =
+        // defaulty). total_epochs bierzemy z serwisu, a gdy 0 — z config_json.
+        let lv = crate::ml_studio::live_view::fetch_local_live_view(&r.run_id).await;
+        let total_epochs = if lv.total_epochs > 0 {
+            lv.total_epochs
+        } else {
+            generic_total_epochs(&r.config_json)
+        };
+
+        jobs.push(tentaflow_protocol::TrainingJobInfo {
+            run_id: r.run_id,
+            project_id: r.project_id,
+            project_name: r.project_name,
+            kind,
+            variant,
+            status: r.status,
+            epoch: lv.epoch,
+            total_epochs,
+            eta_s: lv.eta_s,
+            elapsed_s: lv.elapsed_s,
+            gpu_mem_mb: lv.gpu_mem_mb,
+            stage: lv.stage,
+            started_at: r.started_at.unwrap_or_default(),
+        });
+    }
+
+    let gpu = tokio::task::spawn_blocking(crate::ml_studio::live_view::gpu_stats)
+        .await
+        .unwrap_or_else(|_| tentaflow_protocol::GpuStats {
+            name: String::new(),
+            mem_used_mb: 0,
+            mem_total_mb: 0,
+            util_pct: 0,
+        });
+
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::JobsOverviewResponse(
+        tentaflow_protocol::MlStudioJobsOverviewResponse { jobs, gpu },
+    )))
+}
+
 #[handler(variant = "MlStudioModelsListRequest", since = (1, 0))]
 #[policy(PowerUser)]
 #[observed]
@@ -2367,6 +2434,10 @@ pub async fn ml_studio_recog_train_status(
                         sync_bytes_sent: sp.bytes_sent,
                         sync_bytes_total: sp.bytes_total,
                         sync_rate_bps: 0,
+                        eta_s: 0.0,
+                        elapsed_s: 0.0,
+                        gpu_mem_mb: 0.0,
+                        stage: String::new(),
                     },
                 )));
             }
@@ -2395,6 +2466,10 @@ pub async fn ml_studio_recog_train_status(
                         sync_bytes_sent: sp.bytes_sent,
                         sync_bytes_total: sp.bytes_total,
                         sync_rate_bps: sp.rate_bps,
+                        eta_s: 0.0,
+                        elapsed_s: 0.0,
+                        gpu_mem_mb: 0.0,
+                        stage: String::new(),
                     },
                 )));
             }
@@ -2467,6 +2542,9 @@ pub async fn ml_studio_recog_train_status(
     let train_loss = last.and_then(|p| p.train_loss);
     let map50 = last.and_then(|p| p.map50);
 
+    // Live-view z serwisu (tylko lokalny job ma wpis; zdalny/sprzątnięty = default).
+    let lv = crate::ml_studio::live_view::fetch_local_live_view(&payload.run_id).await;
+
     Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogTrainStatusResponse(
         tentaflow_protocol::MlStudioRecogTrainStatusResponse {
             run_id: payload.run_id.clone(),
@@ -2484,6 +2562,10 @@ pub async fn ml_studio_recog_train_status(
             sync_bytes_sent: 0,
             sync_bytes_total: 0,
             sync_rate_bps: 0,
+            eta_s: lv.eta_s,
+            elapsed_s: lv.elapsed_s,
+            gpu_mem_mb: lv.gpu_mem_mb,
+            stage: lv.stage,
         },
     )))
 }
@@ -2701,6 +2783,10 @@ pub async fn ml_studio_generic_train_status(
                         sync_bytes_sent: sp.bytes_sent,
                         sync_bytes_total: sp.bytes_total,
                         sync_rate_bps: 0,
+                        eta_s: 0.0,
+                        elapsed_s: 0.0,
+                        gpu_mem_mb: 0.0,
+                        stage: String::new(),
                     },
                 )));
             }
@@ -2724,6 +2810,10 @@ pub async fn ml_studio_generic_train_status(
                         sync_bytes_sent: sp.bytes_sent,
                         sync_bytes_total: sp.bytes_total,
                         sync_rate_bps: sp.rate_bps,
+                        eta_s: 0.0,
+                        elapsed_s: 0.0,
+                        gpu_mem_mb: 0.0,
+                        stage: String::new(),
                     },
                 )));
             }
@@ -2794,6 +2884,9 @@ pub async fn ml_studio_generic_train_status(
         .filter(|_| run.status == "failed")
         .unwrap_or_default();
 
+    // Live-view z serwisu (tylko lokalny job ma wpis; zdalny/sprzątnięty = default).
+    let lv = crate::ml_studio::live_view::fetch_local_live_view(&payload.run_id).await;
+
     Ok(MessageBody::MlStudioBody(MlStudioPayload::GenericTrainStatusResponse(
         tentaflow_protocol::MlStudioGenericTrainStatusResponse {
             run_id: payload.run_id.clone(),
@@ -2806,6 +2899,10 @@ pub async fn ml_studio_generic_train_status(
             sync_bytes_sent: 0,
             sync_bytes_total: 0,
             sync_rate_bps: 0,
+            eta_s: lv.eta_s,
+            elapsed_s: lv.elapsed_s,
+            gpu_mem_mb: lv.gpu_mem_mb,
+            stage: lv.stage,
         },
     )))
 }

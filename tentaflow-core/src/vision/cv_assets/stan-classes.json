@@ -3,10 +3,9 @@
     "czysta",
     "brudna",
     "uszkodzona",
-    "wyblakla",
     "nieczytelna"
   ],
-  "img_size": 160,
+  "img_size": 224,
   "mean": [
     0.485,
     0.456,
@@ -17,12 +16,5 @@
     0.224,
     0.225
   ],
-  "progi": [
-    0.4900000000000001,
-    0.5500000000000002,
-    0.45,
-    0.45,
-    0.35
-  ],
-  "activation": "sigmoid"
+  "activation": "softmax"
 }

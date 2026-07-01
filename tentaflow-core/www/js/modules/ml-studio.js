@@ -72,6 +72,18 @@ function stopFtExportPolling() {
   }
 }
 
+// Interwał auto-odświeżania panelu jobów ML Studio (widok „Joby"). Czyszczony
+// przy opuszczeniu widoku (unmount) oraz przy ponownym wejściu, żeby nie było
+// dwóch równoległych timerów odpytujących mlStudioJobsOverviewRequest.
+let jobsPollTimer = null;
+
+function stopJobsPolling() {
+  if (jobsPollTimer !== null) {
+    clearInterval(jobsPollTimer);
+    jobsPollTimer = null;
+  }
+}
+
 // Human label + sprite per project role. Owner is rendered as an accent badge,
 // the rest as info badges / chips (matches p02 legend).
 const ROLE_LABEL = {
@@ -159,6 +171,9 @@ const MlStudioScreen = {
     if (params && params.admin === 'resources') {
       return `<div id="ml-studio-resources" class="ml-studio-resources"></div>`;
     }
+    if (params && params.jobs) {
+      return `<div id="ml-studio-jobs-view" class="ml-studio-jobs-view"></div>`;
+    }
     if (params && params.projectId && params.share) {
       return `<div id="ml-studio-share" class="ml-studio-share"></div>`;
     }
@@ -176,6 +191,7 @@ const MlStudioScreen = {
         </div>
         <div class="actions" id="ml-studio-actions">
           <tf-button variant="ghost" icon="refresh" id="ml-studio-refresh">Odśwież</tf-button>
+          <tf-button variant="outline" icon="cpu" id="ml-studio-jobs">Joby</tf-button>
           <tf-button variant="primary" icon="plus" id="ml-studio-new">Nowy projekt</tf-button>
         </div>
       </div>
@@ -191,12 +207,16 @@ const MlStudioScreen = {
       await showResourcesAdmin();
       return;
     }
+    if (params && params.jobs) {
+      await showJobsOverview();
+      return;
+    }
     if (params && params.projectId && params.share) {
       await showShare(params.projectId);
       return;
     }
     if (params && params.projectId) {
-      await showDetail(params.projectId);
+      await showDetail(params.projectId, { runId: params.runId, kind: params.kind });
       return;
     }
     if (params && params.create) {
@@ -205,6 +225,7 @@ const MlStudioScreen = {
     }
     byId('ml-studio-refresh')?.addEventListener('click', loadAll);
     byId('ml-studio-new')?.addEventListener('click', () => Router.navigate('ml-studio', { create: '1' }));
+    byId('ml-studio-jobs')?.addEventListener('click', () => Router.navigate('ml-studio', { jobs: '1' }));
 
     const filters = byId('ml-studio-filters');
     filters?.addEventListener('change', (e) => {
@@ -221,6 +242,7 @@ const MlStudioScreen = {
     // falling back to the raw slug when entered directly via the router.
     stopFtPolling();
     stopFtExportPolling();
+    stopJobsPolling();
     projects = [];
     activeTypeFilter = 'all';
     detailProjectId = null;
@@ -809,7 +831,7 @@ function formatFileSize(bytes) {
   return `${formatNumber(n)} B`;
 }
 
-async function showDetail(projectId) {
+async function showDetail(projectId, focus = {}) {
   detailProjectId = projectId;
   const host = byId('ml-studio-detail');
   if (!host) return;
@@ -822,7 +844,7 @@ async function showDetail(projectId) {
       ensureCurrentUser(),
     ]);
     const p = resp.project || {};
-    renderDetail(host, p);
+    renderDetail(host, p, focus);
   } catch (err) {
     host.innerHTML = '';
     const empty = document.createElement('tf-empty-state');
@@ -839,8 +861,14 @@ async function showDetail(projectId) {
   }
 }
 
-function renderDetail(host, p) {
+function renderDetail(host, p, focus = {}) {
   const slug = p.projectType ?? p.project_type ?? '';
+  // Wejście „w szczegóły joba" z panelu Joby: przekazany runId ma otworzyć
+  // zakładkę Trening i wznowić dla niego widok LIVE (zamiast formularza startu).
+  // Konsumowane jednorazowo — kolejne ręczne wejścia w Trening pokażą już setup.
+  const focusRunId = focus && focus.runId ? String(focus.runId) : '';
+  const focusKind = focus && focus.kind ? String(focus.kind) : '';
+  let pendingFocusRunId = focusRunId;
   // "Przegląd" jest zawsze pierwszą zakładką (stan projektu na jednym ekranie),
   // a "Zasoby" zawsze ostatnią (§11.3 — zasoby mesh przydzielone projektowi).
   // Żaden wpis TYPE_TABS nie zawiera "Przegląd", więc bez duplikatów.
@@ -956,7 +984,13 @@ function renderDetail(host, p) {
       return;
     }
     if (label === 'Trening' && slug === 'recognition') {
-      renderRecogTrainTab(panel, p, { selectTab });
+      const opts = { selectTab };
+      if (pendingFocusRunId) {
+        opts.focusRunId = pendingFocusRunId;
+        opts.focusKind = focusKind;
+        pendingFocusRunId = '';
+      }
+      renderRecogTrainTab(panel, p, opts);
       return;
     }
     if (label === 'Dane' && slug === 'recognition') {
@@ -1004,7 +1038,11 @@ function renderDetail(host, p) {
   tabsEl?.addEventListener('change', (e) => {
     renderPanel(e.detail?.value);
   });
-  renderPanel('ml-tab-0');
+  // Domyślnie „Przegląd"; przy wejściu w szczegóły joba — od razu „Trening"
+  // (wznowienie widoku LIVE dla przekazanego runId).
+  const initialTab = (focusRunId && tabs.indexOf('Trening') >= 0) ? 'Trening' : 'Przegląd';
+  if (initialTab !== 'Przegląd') selectTab(initialTab);
+  else renderPanel('ml-tab-0');
 }
 
 // =============================================================================
@@ -4237,7 +4275,7 @@ const TRAIN_TARGET_LABELS = {
 // Zakładka "Trening" dla recognition: wybór CELU (detekcja / klasyfikator / OCR)
 // wyprowadzonego ze schematu projektu, potem wybór datasetu + wariantu +
 // hiperparametry + start treningu. Po starcie przechodzi w widok LIVE.
-function renderRecogTrainTab(panel, p, { selectTab }) {
+function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind = '' } = {}) {
   const pid = projectId(p);
   const cfg = getRecogCfg(pid);
   // Cele wyprowadzone ze schematu; wypełniane asynchronicznie. Do czasu wczytania
@@ -4273,6 +4311,21 @@ function renderRecogTrainTab(panel, p, { selectTab }) {
       <div id="ml-studio-recog-live"></div>
     </div>
   `;
+
+  // Wznowienie widoku LIVE dla joba wybranego w panelu „Joby": chowamy formularz
+  // startu i od razu podłączamy polling. Klasyfikator raportuje przez generyczny
+  // status (macro-F1), detekcja przez status detekcji (mAP@50).
+  if (focusRunId) {
+    const setup = byId('ml-studio-recog-setup');
+    if (setup) setup.hidden = true;
+    const isClassifier = String(focusKind || '').toLowerCase().includes('klas')
+      || String(focusKind || '').toLowerCase() === 'classifier';
+    const liveOpts = isClassifier
+      ? { selectTab, metricLabel: 'macro-F1', statusRequest: 'mlStudioGenericTrainStatusRequest' }
+      : { selectTab };
+    startRecogLive(byId('ml-studio-recog-live'), focusRunId, liveOpts);
+    return;
+  }
 
   // Segmented control celu: detekcja zawsze aktywna, klasyfikator aktywny gdy
   // schemat ma nadający się atrybut, OCR na razie disabled (faza 2).
@@ -4410,8 +4463,11 @@ function renderRecogTrainTab(panel, p, { selectTab }) {
     const syncSourceAndLabels = () => {
       current = attrs.find((t) => t.attribute === cfg.attribute) || attrs[0];
       const srcSel = byId('ml-studio-train-source-class');
-      const srcOpts = (current.sourceClasses || []).map((c) => ({ value: c, label: c }));
-      if (!srcOpts.some((o) => o.value === cfg.sourceClass)) cfg.sourceClass = srcOpts.length ? srcOpts[0].value : '';
+      // Opcja "Wszystkie klasy" (wartość "") na górze i domyślnie wybrana — serwis
+      // traktuje pusty sourceClass jako dowolną kategorię i trenuje na cropach ze
+      // wszystkich klas mających dany atrybut.
+      const srcOpts = [{ value: '', label: 'Wszystkie klasy' }, ...(current.sourceClasses || []).map((c) => ({ value: c, label: c }))];
+      if (!srcOpts.some((o) => o.value === cfg.sourceClass)) cfg.sourceClass = '';
       if (srcSel?.setOptions) srcSel.setOptions(srcOpts, cfg.sourceClass);
       else if (srcSel) srcSel.innerHTML = srcOpts.map((o) => `<option value="${escapeAttr(o.value)}"${o.value === cfg.sourceClass ? ' selected' : ''}>${escapeHtml(o.label)}</option>`).join('');
       renderClfLabels(current);
@@ -4564,7 +4620,6 @@ function renderRecogTrainTab(panel, p, { selectTab }) {
       if (cfg.target === 'classifier') {
         const target = clfTargets().find((t) => t.attribute === cfg.attribute);
         if (!target) throw new Error('Wybierz atrybut do klasyfikacji.');
-        if (!cfg.sourceClass) throw new Error('Wybierz klasę źródłową cropów.');
         const resp = await ApiBinary.one('mlStudioClassifierTrainStartRequest', {
           projectId: pid,
           datasetId: cfg.datasetId,
@@ -4651,6 +4706,58 @@ function fmtRate(bps) {
   return r > 0 ? `${fmtBytes(r)}/s` : '—';
 }
 
+// Czas trwania w sekundach → mm:ss (poniżej godziny) lub hh:mm:ss (powyżej).
+// Używane do „czasu trwania" (elapsed_s) w widoku LIVE.
+function fmtDuration(seconds) {
+  const s = Math.max(0, Math.floor(Number(seconds) || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${pad(m)}:${pad(sec)}`;
+}
+
+// Szacowany czas do końca w sekundach → przyjazny opis („~12 min", „~45 s",
+// „~1 h 5 min"). Zwraca '—' dla braku/wartości niedodatnich.
+function fmtEta(seconds) {
+  const s = Number(seconds);
+  if (!Number.isFinite(s) || s <= 0) return '—';
+  if (s < 90) return `~${Math.round(s)} s`;
+  const totalMin = Math.round(s / 60);
+  if (totalMin < 60) return `~${totalMin} min`;
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return m > 0 ? `~${h} h ${m} min` : `~${h} h`;
+}
+
+// Pamięć GPU w MB → gigabajty z polskim przecinkiem („6,9 GB"). Poniżej 1 GB
+// pokazuje pełne MB, żeby drobne joby nie wyświetlały „0,0 GB".
+function fmtGb(mb) {
+  const m = Number(mb);
+  if (!Number.isFinite(m) || m <= 0) return '—';
+  if (m < 1024) return `${Math.round(m)} MB`;
+  return `${(m / 1024).toLocaleString('pl-PL', { minimumFractionDigits: 1, maximumFractionDigits: 1 })} GB`;
+}
+
+// Etykiety etapów treningu (pole `stage` z backendu). Nieznany slug pokazujemy
+// dosłownie, żeby nie ukrywać realnego stanu przekazanego przez Core.
+const STAGE_LABEL = {
+  init: 'inicjalizacja',
+  loading: 'wczytywanie danych',
+  warmup: 'rozgrzewka',
+  training: 'trening',
+  validating: 'walidacja',
+  saving: 'zapis modelu',
+  exporting: 'eksport',
+  finalizing: 'finalizacja',
+};
+
+function stageLabel(stage) {
+  const s = String(stage || '').toLowerCase();
+  if (!s) return '';
+  return STAGE_LABEL[s] || stage;
+}
+
 function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', statusRequest = 'mlStudioRecogTrainStatusRequest' } = {}) {
   if (!host) return;
   stopFtPolling();
@@ -4666,6 +4773,7 @@ function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', status
       <div class="ml-studio-ft-progress">
         <div class="ml-studio-ft-progress-meta" id="ml-studio-recog-meta">epoka 0</div>
         <tf-progress-bar id="ml-studio-recog-bar" value="0" tone="accent"></tf-progress-bar>
+        <div class="ml-studio-live-info" id="ml-studio-recog-info" hidden></div>
       </div>
       <div class="ml-studio-ft-kpi-grid" id="ml-studio-recog-kpi"></div>
       <div class="ml-studio-ft-chart-wrap">
@@ -4681,6 +4789,13 @@ function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', status
       <div class="ml-studio-ft-done" id="ml-studio-recog-done" hidden></div>
     </section>
   `;
+
+  // Stan do samodzielnego liczenia ETA, gdy backend nie poda `eta_s`: mierzymy
+  // realny czas między zmianami epoki (delta czasu / delta epok) i wygładzamy,
+  // po czym mnożymy przez liczbę pozostałych epok. `liveStartedAt` służy jako
+  // zapasowe źródło „czasu trwania", gdy brak `elapsed_s`.
+  const liveStartedAt = Date.now();
+  const etaTracker = { lastEpoch: -1, lastTime: 0, secPerEpoch: 0 };
 
   const renderStatus = (st) => {
     const status = String(st.status || 'running');
@@ -4754,6 +4869,48 @@ function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', status
       if (bar) bar.setAttribute('value', String(pct));
     } else if (meta) {
       meta.innerHTML = `<tf-spinner size="sm"></tf-spinner> trwa — epoka ${epoch}`;
+    }
+
+    // Nowe pola statusu (backend doda; toleruj brak): etap, czas trwania, ETA i
+    // pamięć GPU joba. ETA bierzemy z `eta_s`, a gdy go nie ma — liczymy sami z
+    // tempa zmian epoki mierzonego między pollami.
+    const stage = stageLabel(st.stage);
+    const elapsedS = Number(st.elapsedS ?? st.elapsed_s);
+    const gpuMemMb = Number(st.gpuMemMb ?? st.gpu_mem_mb);
+    let etaS = Number(st.etaS ?? st.eta_s);
+    if (epoch !== etaTracker.lastEpoch) {
+      const now = Date.now();
+      if (etaTracker.lastEpoch >= 0 && epoch > etaTracker.lastEpoch) {
+        const perEpoch = ((now - etaTracker.lastTime) / 1000) / (epoch - etaTracker.lastEpoch);
+        etaTracker.secPerEpoch = etaTracker.secPerEpoch > 0
+          ? etaTracker.secPerEpoch * 0.6 + perEpoch * 0.4
+          : perEpoch;
+      }
+      etaTracker.lastEpoch = epoch;
+      etaTracker.lastTime = now;
+    }
+    if ((!Number.isFinite(etaS) || etaS <= 0) && etaTracker.secPerEpoch > 0 && total > 0) {
+      etaS = etaTracker.secPerEpoch * Math.max(0, total - epoch);
+    }
+    const elapsedShown = Number.isFinite(elapsedS) && elapsedS > 0
+      ? elapsedS
+      : Math.floor((Date.now() - liveStartedAt) / 1000);
+    const info = byId('ml-studio-recog-info');
+    if (info) {
+      const items = [];
+      if (stage) items.push({ ico: 'zap', lbl: 'etap', val: stage });
+      if (total > 0) items.push({ ico: 'clock', lbl: 'epoka', val: `${epoch} / ${total}` });
+      items.push({ ico: 'clock', lbl: 'czas', val: fmtDuration(elapsedShown) });
+      items.push({ ico: 'clock', lbl: 'ETA', val: fmtEta(etaS) });
+      if (Number.isFinite(gpuMemMb) && gpuMemMb > 0) {
+        items.push({ ico: 'cpu', lbl: 'VRAM', val: fmtGb(gpuMemMb) });
+      }
+      info.hidden = false;
+      info.innerHTML = items.map((it) => `
+        <span class="ml-studio-live-info-item">${sprite(it.ico)}
+          <span class="ml-studio-live-info-lbl">${escapeHtml(it.lbl)}</span>
+          <span class="ml-studio-live-info-val">${escapeHtml(it.val)}</span>
+        </span>`).join('');
     }
     const kpi = byId('ml-studio-recog-kpi');
     if (kpi) {
@@ -4845,6 +5002,176 @@ function renderRecogChart(curve) {
       ${mapPath ? `<path class="line eval" d="${mapPath}"/>` : ''}
     </svg>
   `;
+}
+
+// =============================================================================
+// Widok "Joby" — przegląd uruchomionych treningów w całym ML Studio.
+// Woła mlStudioJobsOverviewRequest → { jobs:[...], gpu:{...} }, renderuje nagłówek
+// GPU (VRAM + util) i tabelę jobów, auto-odświeżanie co ~3,5 s. Klik w job otwiera
+// projekt i wznawia jego widok LIVE (Router → showDetail z runId).
+// =============================================================================
+
+// Etykieta typu joba (pole `kind`): tolerujemy warianty PL/EN z backendu.
+function jobKindLabel(kind) {
+  const k = String(kind || '').toLowerCase();
+  if (k.includes('klas') || k === 'classifier') return 'klasyfikator';
+  if (k.includes('detek') || k === 'detection') return 'detekcja';
+  return kind || '—';
+}
+
+async function showJobsOverview() {
+  const host = byId('ml-studio-jobs-view');
+  if (!host) return;
+  stopJobsPolling();
+
+  host.innerHTML = `
+    <div class="ml-studio-detail-top">
+      <tf-button variant="ghost" icon="chevron-left" id="ml-studio-jobs-back">Projekty</tf-button>
+    </div>
+    <div class="page-header">
+      <div>
+        <h1>${sprite('cpu')} Joby</h1>
+        <div class="sub">Uruchomione treningi w ML Studio — obciążenie GPU i postęp na żywo</div>
+      </div>
+      <div class="actions">
+        <tf-button variant="ghost" icon="refresh" id="ml-studio-jobs-refresh">Odśwież</tf-button>
+      </div>
+    </div>
+    <div id="ml-studio-jobs-gpu" class="ml-studio-jobs-gpu"></div>
+    <div id="ml-studio-jobs-list" class="ml-studio-jobs-list">
+      <div class="ml-studio-loading"><tf-spinner></tf-spinner></div>
+    </div>
+  `;
+
+  byId('ml-studio-jobs-back')?.addEventListener('click', () => {
+    stopJobsPolling();
+    Router.navigate('ml-studio');
+  });
+
+  const renderGpu = (gpu) => {
+    const box = byId('ml-studio-jobs-gpu');
+    if (!box) return;
+    if (!gpu || !(gpu.name || gpu.memTotalMb || gpu.mem_total_mb)) {
+      box.innerHTML = '';
+      return;
+    }
+    const name = gpu.name || 'GPU';
+    const used = Number(gpu.memUsedMb ?? gpu.mem_used_mb ?? 0);
+    const totalMem = Number(gpu.memTotalMb ?? gpu.mem_total_mb ?? 0);
+    const util = Number(gpu.utilPct ?? gpu.util_pct ?? 0);
+    const memPct = totalMem > 0 ? Math.max(0, Math.min(100, Math.round((used / totalMem) * 100))) : 0;
+    box.innerHTML = `
+      <section class="ml-studio-gpu-card">
+        <div class="ml-studio-gpu-head">${sprite('cpu')} <span class="ml-studio-gpu-name">${escapeHtml(name)}</span>
+          <tf-badge tone="accent" value="util ${Number.isFinite(util) ? Math.round(util) : 0}%"></tf-badge>
+        </div>
+        <div class="ml-studio-gpu-metric">
+          <div class="ml-studio-gpu-metric-row">
+            <span class="ml-studio-gpu-metric-lbl">VRAM</span>
+            <span class="ml-studio-gpu-metric-val">${fmtGb(used)} / ${fmtGb(totalMem)}</span>
+          </div>
+          <tf-progress-bar value="${memPct}" tone="accent"></tf-progress-bar>
+        </div>
+        <div class="ml-studio-gpu-metric">
+          <div class="ml-studio-gpu-metric-row">
+            <span class="ml-studio-gpu-metric-lbl">Wykorzystanie</span>
+            <span class="ml-studio-gpu-metric-val">${Number.isFinite(util) ? Math.round(util) : 0}%</span>
+          </div>
+          <tf-progress-bar value="${Number.isFinite(util) ? Math.max(0, Math.min(100, Math.round(util))) : 0}" tone="success"></tf-progress-bar>
+        </div>
+      </section>
+    `;
+  };
+
+  const renderJobs = (jobs) => {
+    const listBox = byId('ml-studio-jobs-list');
+    if (!listBox) return;
+    if (!jobs.length) {
+      listBox.innerHTML = '';
+      const empty = document.createElement('tf-empty-state');
+      empty.setAttribute('icon', 'cpu');
+      empty.setAttribute('title', 'Brak uruchomionych jobów');
+      empty.setAttribute('message', 'Gdy uruchomisz trening w dowolnym projekcie, pojawi się tu jego postęp na żywo.');
+      listBox.appendChild(empty);
+      return;
+    }
+
+    listBox.innerHTML = '';
+    const table = document.createElement('tf-table');
+    table.setAttribute('variant', 'lined');
+    table.innerHTML = `
+      <tf-column key="project" label="Projekt" renderer="html"></tf-column>
+      <tf-column key="kind" label="Typ"></tf-column>
+      <tf-column key="variant" label="Wariant"></tf-column>
+      <tf-column key="status" label="Status" renderer="html"></tf-column>
+      <tf-column key="progress" label="Postęp" renderer="html"></tf-column>
+      <tf-column key="eta" label="ETA"></tf-column>
+      <tf-column key="vram" label="VRAM"></tf-column>
+    `;
+    table.rows = jobs.map((j) => {
+      const runId = String(j.runId ?? j.run_id ?? '');
+      const pid = String(j.projectId ?? j.project_id ?? '');
+      const kind = j.kind ?? '';
+      const epoch = Number(j.epoch ?? 0);
+      const total = Number(j.totalEpochs ?? j.total_epochs ?? 0);
+      const etaS = Number(j.etaS ?? j.eta_s);
+      const gpuMemMb = Number(j.gpuMemMb ?? j.gpu_mem_mb);
+      const b = runBadge(j.status);
+      const stage = stageLabel(j.stage);
+      const pct = total > 0 ? Math.max(0, Math.min(100, Math.round((epoch / total) * 100))) : 0;
+      const progressHtml = total > 0
+        ? `<div class="ml-studio-job-progress"><tf-progress-bar value="${pct}" tone="accent"></tf-progress-bar>
+             <span class="ml-studio-job-progress-txt">${epoch} / ${total} · ${pct}%</span></div>`
+        : `<span class="ml-studio-job-progress-txt">${stage || '—'}</span>`;
+      return {
+        runId,
+        projectId: pid,
+        kind: jobKindLabel(kind),
+        project: `<div class="ml-studio-job-project"><span class="ml-studio-job-name">${escapeHtml(j.projectName ?? j.project_name ?? '(projekt)')}</span>${stage ? `<span class="ml-studio-job-stage">${escapeHtml(stage)}</span>` : ''}</div>`,
+        variant: escapeHtml(String(j.variant ?? '—')) || '—',
+        status: `<tf-badge tone="${b.tone}" value="${escapeAttr(b.label)}"></tf-badge>`,
+        progress: progressHtml,
+        eta: fmtEta(etaS),
+        vram: fmtGb(gpuMemMb),
+      };
+    });
+    table.addEventListener('row-click', (e) => {
+      const row = e.detail?.row;
+      if (!row || !row.projectId) return;
+      stopJobsPolling();
+      Router.navigate('ml-studio', { projectId: row.projectId, runId: row.runId, kind: row.kind });
+    });
+    listBox.appendChild(table);
+  };
+
+  const poll = async () => {
+    try {
+      const resp = await ApiBinary.one('mlStudioJobsOverviewRequest', {});
+      const jobs = Array.isArray(resp.jobs) ? resp.jobs : [];
+      renderGpu(resp.gpu || null);
+      renderJobs(jobs);
+    } catch (err) {
+      stopJobsPolling();
+      const listBox = byId('ml-studio-jobs-list');
+      if (listBox) {
+        listBox.innerHTML = '';
+        const empty = document.createElement('tf-empty-state');
+        empty.setAttribute('icon', 'alert');
+        empty.setAttribute('title', 'Nie udało się wczytać jobów');
+        empty.setAttribute('message', err.message || 'Błąd protokołu ML Studio.');
+        const retry = document.createElement('tf-button');
+        retry.setAttribute('variant', 'primary');
+        retry.textContent = 'Spróbuj ponownie';
+        retry.addEventListener('click', () => showJobsOverview());
+        empty.appendChild(retry);
+        listBox.appendChild(empty);
+      }
+    }
+  };
+
+  byId('ml-studio-jobs-refresh')?.addEventListener('click', poll);
+  await poll();
+  jobsPollTimer = setInterval(poll, 3500);
 }
 
 // =============================================================================

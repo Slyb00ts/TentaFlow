@@ -652,6 +652,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MlStudioPayload::TrainingRunsListResponse(_) => {
                 "MlStudioTrainingRunsListResponse"
             }
+            tentaflow_protocol::MlStudioPayload::JobsOverviewRequest(_) => {
+                "MlStudioJobsOverviewRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::JobsOverviewResponse(_) => {
+                "MlStudioJobsOverviewResponse"
+            }
             tentaflow_protocol::MlStudioPayload::ModelsListRequest(_) => {
                 "MlStudioModelsListRequest"
             }

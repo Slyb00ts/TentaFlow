@@ -142,11 +142,15 @@ pub(crate) async fn get_ocr() -> Option<std::sync::Arc<Mutex<PlateOcr>>> {
         .clone()
 }
 
-/// True for detection classes whose condition we classify (placards/labels and
-/// the environmental/temperature marks). License plates (`tablica_*`) are
-/// skipped here — they go to OCR later.
+/// True for detection classes whose condition we classify (placards/labels,
+/// the environmental/temperature marks). Tablice ADR i rejestracyjne też
+/// oceniamy stanem (np. czytelność/uszkodzenie), więc kwalifikują się tutaj.
 fn wants_state(klasa: &str) -> bool {
-    klasa.starts_with("nalepka") || klasa == "znak_srodowiskowy" || klasa == "termometr"
+    klasa.starts_with("nalepka")
+        || klasa == "znak_srodowiskowy"
+        || klasa == "termometr"
+        || klasa == "tablica_adr"
+        || klasa == "tablica_rejestracyjna"
 }
 
 /// Extracts an RGB24 rectangle from a tightly packed RGB frame (stride = w*3).
@@ -327,13 +331,16 @@ async fn engine_loop() {
         // picked next tick (drop-nothing, just deferred).
         let batch_ids: Vec<String> = due.iter().take(MAX_BATCH).cloned().collect();
 
-        // Pull the latest frame for each batched camera (async snapshot).
-        let mut frames: Vec<(String, std::sync::Arc<[u8]>, u32, u32)> = Vec::new();
+        // Pull the latest frame for each batched camera (async snapshot). Czas
+        // przechwycenia klatki (`captured_ms`, unix epoch ms) niesiemy razem z
+        // ramka az do publish, zeby overlay kotwiczyl detekcje na wlasciwej
+        // klatce, a nie na czasie publikacji (opóźnionym o dekod+inferencje).
+        let mut frames: Vec<(String, std::sync::Arc<[u8]>, u32, u32, u64)> = Vec::new();
         for id in &batch_ids {
-            if let Some((rgb, w, h, _captured_ms)) =
+            if let Some((rgb, w, h, captured_ms)) =
                 crate::addon::host_functions::camera::latest_frame_global(id).await
             {
-                frames.push((id.clone(), rgb, w, h));
+                frames.push((id.clone(), rgb, w, h, captured_ms));
             }
         }
 
@@ -350,25 +357,36 @@ async fn engine_loop() {
             continue;
         }
 
-        // HOT PATH: one batched detector run only (no OCR/classify here). EVERY
-        // frame — empty or not — flows through the single cold FIFO so overlay
-        // clears stay ordered with enriched frames (no stale-frame resurrection).
-        // Empty events drop the frame buffer so they cost no memory.
+        // HOT PATH: one batched detector run only (no OCR/classify here). Wynik
+        // rozdzielamy na dwie fazy: FAZA 1 publikuje surowe boxy natychmiast (tu,
+        // w hot loop), FAZA 2 oddaje NIEPUSTE ramki do cold FIFO na wzbogacenie
+        // (stan + OCR). Dzieki temu overlay dostaje boxy zsynchronizowane z wideo,
+        // a nie spoznione o czas OCR/klasyfikacji.
         let detector = detector.clone();
         let detected =
             crate::vision::burn_backend::run_blocking(move || detect_only(detector, frames)).await;
         match detected {
             Ok(per_cam) => {
-                for (id, frame, w, h, dets) in per_cam {
+                for (id, frame, w, h, captured_ms, dets) in per_cam {
+                    // FAZA 1 (hot, natychmiast): publikuj surowe detekcje detektora
+                    // (klasa + bbox + score, bez `stan`/`tekst`) od razu, jeszcze
+                    // przed wzbogaceniem. Overlay kotwiczy je po `captured_ms`, wiec
+                    // boxy lądują na wlasciwej klatce z opoznieniem samego dekodu +
+                    // inferencji (~200 ms), a nie +OCR (~1 s). Pusty zestaw tez
+                    // publikujemy — czysci overlay bez czekania na cold path.
+                    detection_bus::publish_detections(&id, captured_ms, dets.clone());
+
+                    // Pusty zestaw nie wymaga wzbogacenia: FAZA 1 juz wyczyscila
+                    // overlay, wiec nie oddajemy go do cold path (zero pamieci, zero
+                    // podwojnej publikacji pustego zestawu).
+                    if dets.is_empty() {
+                        continue;
+                    }
                     let sig = detection_sig(&dets);
-                    // Empty events drop the frame buffer (no enrichment needed).
-                    let frame = if dets.is_empty() {
-                        Arc::<[u8]>::from(Vec::new())
-                    } else {
-                        frame
-                    };
                     let bytes = frame.len();
-                    // Coalesce / rate-limit / byte-budget gate (reserves the slot).
+                    // FAZA 2 (cold): wzbogacenie pod dotychczasowym budzetem /
+                    // backpressure. Coalesce / rate-limit / byte-budget gate
+                    // (rezerwuje slot).
                     if admit_cold(&id, sig, bytes).is_none() {
                         continue;
                     }
@@ -377,6 +395,7 @@ async fn engine_loop() {
                         frame,
                         w,
                         h,
+                        captured_ms,
                         detections: dets,
                     };
                     match cold.try_send(ev) {
@@ -407,14 +426,17 @@ async fn engine_loop() {
 const COLD_QUEUE_CAP: usize = 32;
 
 /// One detection frame handed from the hot detector to the cold enrichment path.
-/// Empty-detection events carry an empty `frame` (no enrichment needed) so they
-/// cost no memory; they still flow through the same FIFO so overlay clears stay
-/// ordered relative to enriched frames (no stale-frame resurrection).
+/// Cold path niesie WYLACZNIE niepuste ramki (FAZA 2 — wzbogacenie): puste
+/// zestawy publikuje juz FAZA 1 w hot loopie (czyszczenie overlay), wiec nigdy
+/// tu nie trafiaja i nie zajmuja pamieci ani slotu.
 struct DetectionEvent {
     camera_id: String,
     frame: Arc<[u8]>,
     w: u32,
     h: u32,
+    /// Czas przechwycenia klatki (unix epoch ms) — propagowany do publish jako
+    /// `ts_ms`, zeby overlay kotwiczyl detekcje na wlasciwej klatce.
+    captured_ms: u64,
     detections: Vec<crate::services::detection_bus::Detection>,
 }
 
@@ -588,8 +610,10 @@ impl Drop for ColdSlot {
     }
 }
 
-/// Cold path: enriches each detection frame (state classify + plate OCR on crops)
-/// off the hot detector loop, then publishes. Owns the classifier/OCR runners.
+/// Cold path (FAZA 2): enriches each detection frame (state classify + plate OCR
+/// on crops) off the hot detector loop, then publishes the enriched set for the
+/// SAME `captured_ms` co FAZA 1 — overlay podmienia surowe boxy na wzbogacone
+/// etykiety (stan/OCR) dla tej samej klatki. Owns the classifier/OCR runners.
 async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
     let classifier = get_classifier().await;
     let ocr = get_ocr().await;
@@ -600,6 +624,7 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
             frame,
             w,
             h,
+            captured_ms,
             detections,
         } = ev;
         let bytes = frame.len();
@@ -612,10 +637,9 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
         };
         // If the camera has an assigned analysis Flow, run it (it owns the
         // OCR/classify/verdict/alert logic); otherwise fall back to the default
-        // hardcoded enrichment. Empty-detection events carry a dropped (0-byte)
-        // frame and have nothing to enrich/decide, so they skip the flow and
-        // fall through to publish an empty set (clearing the overlay) — running
-        // the flow on a dropped frame would only fail the vision nodes.
+        // hardcoded enrichment. Cold path niesie tylko niepuste ramki (puste
+        // obsluzyla FAZA 1), ale guard zostaje defensywnie — pusta ramka nie ma
+        // czego wzbogacac, a flow na niej tylko zawiodlby wezly wizyjne.
         if !detections.is_empty() {
             if let (Some(flow_id), Some(disp)) = (
                 camera_flow_id(&camera_id),
@@ -629,7 +653,8 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
                 // budget bounds the fleet — so detaching stays bounded.
                 tokio::spawn(async move {
                     let _slot = slot;
-                    run_camera_flow(disp, flow_id, camera_id, frame, w, h, detections).await;
+                    run_camera_flow(disp, flow_id, camera_id, frame, w, h, captured_ms, detections)
+                        .await;
                 });
                 continue;
             }
@@ -640,11 +665,13 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
         let res = crate::vision::burn_backend::run_blocking(move || {
             let mut dets = detections;
             enrich_detections(&classifier, &ocr, &frame, w, h, &mut dets);
-            (camera_id, dets)
+            (camera_id, captured_ms, dets)
         })
         .await;
         match res {
-            Ok((id, dets)) => detection_bus::publish_detections(&id, dets),
+            Ok((id, captured_ms, dets)) => {
+                detection_bus::publish_detections(&id, captured_ms, dets)
+            }
             Err(e) => warn!("[vision_analysis] enrich task panicked: {e}"),
         }
     }
@@ -706,6 +733,7 @@ async fn run_camera_flow(
     frame: Arc<[u8]>,
     w: u32,
     h: u32,
+    captured_ms: u64,
     detections: Vec<Detection>,
 ) {
     use crate::flow_engine::dispatcher::FlowRequestMeta;
@@ -763,7 +791,7 @@ async fn run_camera_flow(
                 "[vision_analysis] flow {flow_id} ran for {camera_id}: {} detections, verdict={verdict}",
                 detections.len()
             );
-            publish_flow_detections(&camera_id, detections, outcome);
+            publish_flow_detections(&camera_id, captured_ms, detections, outcome);
         }
         Err(e) => warn!("[vision_analysis] flow {flow_id} dispatch failed: {e}"),
     }
@@ -780,6 +808,7 @@ async fn run_camera_flow(
 /// we publish the original detector boxes so the overlay still shows them.
 fn publish_flow_detections(
     camera_id: &str,
+    captured_ms: u64,
     original: Vec<Detection>,
     outcome: crate::flow_engine::envelope::FlowExecutionOutcome,
 ) {
@@ -795,18 +824,27 @@ fn publish_flow_detections(
         },
         None => None,
     };
-    detection_bus::publish_detections(camera_id, enriched.unwrap_or(original));
+    detection_bus::publish_detections(camera_id, captured_ms, enriched.unwrap_or(original));
 }
 
 /// HOT, blocking: one `detect_batch` across the frames. Returns the raw boxes per
 /// frame plus the frame buffer, for the cold path to enrich. No OCR/classify here.
 fn detect_only(
     detector: Arc<Mutex<RfDetrDetector>>,
-    frames: Vec<(String, Arc<[u8]>, u32, u32)>,
-) -> Vec<(String, Arc<[u8]>, u32, u32, Vec<crate::services::detection_bus::Detection>)> {
+    frames: Vec<(String, Arc<[u8]>, u32, u32, u64)>,
+) -> Vec<(
+    String,
+    Arc<[u8]>,
+    u32,
+    u32,
+    u64,
+    Vec<crate::services::detection_bus::Detection>,
+)> {
     let batch = {
-        let refs: Vec<(&[u8], u32, u32)> =
-            frames.iter().map(|(_, rgb, w, h)| (&rgb[..], *w, *h)).collect();
+        let refs: Vec<(&[u8], u32, u32)> = frames
+            .iter()
+            .map(|(_, rgb, w, h, _)| (&rgb[..], *w, *h))
+            .collect();
         let mut guard = detector.lock().unwrap_or_else(|e| e.into_inner());
         match guard.detect_batch(&refs) {
             Ok(b) => b,
@@ -819,7 +857,7 @@ fn detect_only(
     frames
         .into_iter()
         .zip(batch.into_iter())
-        .map(|((id, rgb, w, h), items)| (id, rgb, w, h, items))
+        .map(|((id, rgb, w, h, captured_ms), items)| (id, rgb, w, h, captured_ms, items))
         .collect()
 }
 

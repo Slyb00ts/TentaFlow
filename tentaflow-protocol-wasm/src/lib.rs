@@ -2113,6 +2113,16 @@ pub fn encode_ml_studio_training_runs_list_request(
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeMlStudioJobsOverviewRequest)]
+pub fn encode_ml_studio_jobs_overview_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::JobsOverviewRequest(
+            tentaflow_protocol::MlStudioJobsOverviewRequest {},
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioModelsListRequest)]
 pub fn encode_ml_studio_models_list_request(project_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
@@ -9275,6 +9285,46 @@ fn ml_studio_grant_to_js(g: &tentaflow_protocol::MlStudioResourceGrant) -> js_sy
     item
 }
 
+/// Mapuje statystyki GPU na obiekt JS (camelCase + snake_case).
+fn ml_studio_gpu_stats_to_js(g: &tentaflow_protocol::GpuStats) -> js_sys::Object {
+    let item = js_sys::Object::new();
+    set(&item, "name", g.name.clone().into());
+    set(&item, "memUsedMb", (g.mem_used_mb as f64).into());
+    set(&item, "mem_used_mb", (g.mem_used_mb as f64).into());
+    set(&item, "memTotalMb", (g.mem_total_mb as f64).into());
+    set(&item, "mem_total_mb", (g.mem_total_mb as f64).into());
+    set(&item, "utilPct", (g.util_pct as f64).into());
+    set(&item, "util_pct", (g.util_pct as f64).into());
+    item
+}
+
+/// Mapuje jeden aktywny job treningowy (panel jobów) na obiekt JS.
+fn ml_studio_job_info_to_js(j: &tentaflow_protocol::TrainingJobInfo) -> js_sys::Object {
+    let item = js_sys::Object::new();
+    set(&item, "runId", j.run_id.clone().into());
+    set(&item, "run_id", j.run_id.clone().into());
+    set(&item, "projectId", j.project_id.clone().into());
+    set(&item, "project_id", j.project_id.clone().into());
+    set(&item, "projectName", j.project_name.clone().into());
+    set(&item, "project_name", j.project_name.clone().into());
+    set(&item, "kind", j.kind.clone().into());
+    set(&item, "variant", j.variant.clone().into());
+    set(&item, "status", j.status.clone().into());
+    set(&item, "epoch", (j.epoch as f64).into());
+    set(&item, "totalEpochs", (j.total_epochs as f64).into());
+    set(&item, "total_epochs", (j.total_epochs as f64).into());
+    set(&item, "etaS", (j.eta_s as f64).into());
+    set(&item, "eta_s", (j.eta_s as f64).into());
+    set(&item, "elapsedS", (j.elapsed_s as f64).into());
+    set(&item, "elapsed_s", (j.elapsed_s as f64).into());
+    set(&item, "gpuMemMb", (j.gpu_mem_mb as f64).into());
+    set(&item, "gpu_mem_mb", (j.gpu_mem_mb as f64).into());
+    set(&item, "stage", j.stage.clone().into());
+    set(&item, "startedAt", j.started_at.clone().into());
+    set(&item, "started_at", j.started_at.clone().into());
+    item
+}
+
 fn ml_studio_training_run_to_js(
     r: &tentaflow_protocol::MlStudioTrainingRunSummary,
 ) -> js_sys::Object {
@@ -9652,6 +9702,18 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             }
             set(obj, "runs", arr.into());
         }
+        tentaflow_protocol::MlStudioPayload::JobsOverviewRequest(_req) => {
+            set(obj, "variant", "MlStudioJobsOverviewRequest".into());
+        }
+        tentaflow_protocol::MlStudioPayload::JobsOverviewResponse(resp) => {
+            set(obj, "variant", "MlStudioJobsOverviewResponse".into());
+            let arr = js_sys::Array::new();
+            for j in &resp.jobs {
+                arr.push(&ml_studio_job_info_to_js(j));
+            }
+            set(obj, "jobs", arr.into());
+            set(obj, "gpu", ml_studio_gpu_stats_to_js(&resp.gpu).into());
+        }
         tentaflow_protocol::MlStudioPayload::ModelsListRequest(req) => {
             set(obj, "variant", "MlStudioModelsListRequest".into());
             set(obj, "projectId", req.project_id.clone().into());
@@ -9869,6 +9931,13 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "sync_bytes_total", (resp.sync_bytes_total as f64).into());
             set(obj, "syncRateBps", (resp.sync_rate_bps as f64).into());
             set(obj, "sync_rate_bps", (resp.sync_rate_bps as f64).into());
+            set(obj, "etaS", (resp.eta_s as f64).into());
+            set(obj, "eta_s", (resp.eta_s as f64).into());
+            set(obj, "elapsedS", (resp.elapsed_s as f64).into());
+            set(obj, "elapsed_s", (resp.elapsed_s as f64).into());
+            set(obj, "gpuMemMb", (resp.gpu_mem_mb as f64).into());
+            set(obj, "gpu_mem_mb", (resp.gpu_mem_mb as f64).into());
+            set(obj, "stage", resp.stage.into());
         }
         tentaflow_protocol::MlStudioPayload::ClassifierTrainStartRequest(req) => {
             set(obj, "variant", "MlStudioClassifierTrainStartRequest".into());
@@ -9918,6 +9987,13 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "sync_bytes_total", (resp.sync_bytes_total as f64).into());
             set(obj, "syncRateBps", (resp.sync_rate_bps as f64).into());
             set(obj, "sync_rate_bps", (resp.sync_rate_bps as f64).into());
+            set(obj, "etaS", (resp.eta_s as f64).into());
+            set(obj, "eta_s", (resp.eta_s as f64).into());
+            set(obj, "elapsedS", (resp.elapsed_s as f64).into());
+            set(obj, "elapsed_s", (resp.elapsed_s as f64).into());
+            set(obj, "gpuMemMb", (resp.gpu_mem_mb as f64).into());
+            set(obj, "gpu_mem_mb", (resp.gpu_mem_mb as f64).into());
+            set(obj, "stage", resp.stage.into());
         }
         tentaflow_protocol::MlStudioPayload::RecogDatasetRegisterRequest(req) => {
             set(obj, "variant", "MlStudioRecogDatasetRegisterRequest".into());

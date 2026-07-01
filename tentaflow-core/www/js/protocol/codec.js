@@ -3192,6 +3192,18 @@ export const encode = {
     );
   },
 
+  /** MessageBody::MlStudioBody(JobsOverviewRequest) (puste ciało). */
+  mlStudioJobsOverviewRequest(correlationId, _payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioJobsOverviewRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /**
    * MessageBody::MlStudioBody(GenericTrainStatusRequest) — polling postępu
    * treningu generycznego (klasyfikator atrybutu i inne tory nie-detekcyjne).

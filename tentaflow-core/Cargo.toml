@@ -54,7 +54,7 @@ test-support = []
 # inputs. Optional because GStreamer pulls a large dynamic-library surface
 # (gst-plugins-base, -good, -bad). Default builds stay slim; enable
 # `--features camera` for Router/Desktop where camera ingest is needed.
-camera = ["dep:gstreamer", "dep:gstreamer-app"]
+camera = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 # Jedna flaga GPU per backend wlacza lokalne LLM. Konkretny backend GPU
 # wynika z natywnych bibliotek zbudowanych przez scripts/native-libs/build-all.sh.
 gpu-cuda = ["inference-llamacpp"]
@@ -275,6 +275,7 @@ pdfium-render = { version = "0.9.2", default-features = false, features = ["pdfi
 # ecosystem alignment.
 gstreamer = { version = "0.25.2", optional = true }
 gstreamer-app = { version = "0.25.2", optional = true }
+gstreamer-video = { version = "0.25.2", optional = true }
 
 # Inference — llama.cpp (optional)
 tentaflow-wrappers = { path = "../tentaflow-wrappers", optional = true }

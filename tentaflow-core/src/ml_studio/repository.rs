@@ -658,6 +658,46 @@ pub struct TrainingRunRow {
     pub finished_at: Option<String>,
 }
 
+/// Jeden AKTYWNY (running/pending) run wraz z nazwą projektu — do panelu jobów.
+/// Nazwa projektu pochodzi z JOIN `projects`, widoczność zawężona do projektów,
+/// których pytający jest aktywnym członkiem.
+pub struct ActiveRunRow {
+    pub run_id: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub status: String,
+    pub config_json: String,
+    pub started_at: Option<String>,
+}
+
+/// Lista wszystkich aktywnych jobów (running/pending) widocznych dla `user_id`
+/// (członkostwo aktywne w projekcie). Najnowsze wg `started_at` pierwsze.
+pub fn list_active_runs_for_user(user_id: &str) -> Result<Vec<ActiveRunRow>> {
+    let pool = super::db::pool()?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT t.run_id, t.project_id, p.name, t.status, t.config_json, t.started_at \
+         FROM training_runs t \
+         JOIN projects p ON p.project_id = t.project_id \
+         JOIN project_members pm ON pm.project_id = t.project_id \
+         WHERE pm.user_id = ?1 AND pm.status = 'active' \
+           AND t.status IN ('running', 'pending', 'syncing') \
+         ORDER BY t.started_at DESC, t.run_id",
+    )?;
+    let rows = stmt.query_map(params![user_id], |row| {
+        Ok(ActiveRunRow {
+            run_id: row.get(0)?,
+            project_id: row.get(1)?,
+            project_name: row.get(2)?,
+            status: row.get(3)?,
+            config_json: row.get(4)?,
+            started_at: row.get(5)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 /// Pobiera pojedynczy run razem z `project_id` (potrzebnym do autoryzacji).
 pub fn get_training_run(run_id: &str) -> Result<Option<TrainingRunRow>> {
     let pool = super::db::pool()?;

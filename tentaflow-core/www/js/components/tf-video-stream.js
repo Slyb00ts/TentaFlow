@@ -18,11 +18,6 @@ const DEFAULT_HEIGHT_PX = 320;
 // resubscribe z mala przerwa zeby UI nie migalo bez powodu.
 const LAG_RESUBSCRIBE_DELAY_MS = 1000;
 
-// Maksymalny zakres bufora w sekundach. Powyzej tej wartosci trimujemy
-// stary fragment przez SourceBuffer.remove() zeby uniknac QuotaExceededError
-// na dlugo zyjacych tile'ach.
-const KEEP_WINDOW_SECS = 30;
-
 class TfVideoStream extends HTMLElement {
   static get observedAttributes() {
     return ['stream-id', 'label', 'height-px'];
@@ -51,6 +46,12 @@ class TfVideoStream extends HTMLElement {
   connectedCallback() {
     this._disposed = false;
     if (!this._video) this._build();
+    // Po realnym detach (_stopSubscription) listener dblclick zostaje zdjety —
+    // przy ponownym podlaczeniu (bez _build) wpinamy go z powrotem.
+    if (!this._onDblClick) {
+      this._onDblClick = () => this._toggleFullscreen();
+      this.addEventListener('dblclick', this._onDblClick);
+    }
     this._applyAttributes();
     // The SDK reconciler can rip this element out of the DOM and re-insert it in
     // the same tick (disconnect→connect churn). If a deferred stop is pending
@@ -110,6 +111,12 @@ class TfVideoStream extends HTMLElement {
     this._video.playsInline = true;
     this._video.setAttribute('playsinline', '');
 
+    // Podwojny klik -> fullscreen tej kamery. Fullscreen bierzemy na kontenerze
+    // kafelka (rodzic hosta), zeby nakladka detekcji <canvas> — dolaczana jako
+    // rodzenstwo w tym samym kontenerze — pozostala widoczna na pelnym ekranie.
+    this._onDblClick = () => this._toggleFullscreen();
+    this.addEventListener('dblclick', this._onDblClick);
+
     this._labelEl = document.createElement('div');
     this._labelEl.className = 'label';
     this._labelEl.hidden = true;
@@ -134,6 +141,23 @@ class TfVideoStream extends HTMLElement {
     const height =
       Number.isFinite(heightRaw) && heightRaw > 0 ? Math.floor(heightRaw) : DEFAULT_HEIGHT_PX;
     this.style.setProperty('--tf-video-stream-height', `${height}px`);
+  }
+
+  // Przelacza fullscreen dla kafelka kamery. Wchodzimy na kontenerze kafelka
+  // (rodzic hosta) — obejmuje on <video> i nakladke detekcji. Ponowny dblclick
+  // (lub Esc obslugiwany natywnie przez przegladarke) wychodzi z fullscreena.
+  _toggleFullscreen() {
+    const container = this.parentElement || this;
+    const active = document.fullscreenElement;
+    if (active && (active === container || active === this || active.contains(this))) {
+      if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+      return;
+    }
+    if (typeof container.requestFullscreen === 'function') {
+      container.requestFullscreen().catch((e) => {
+        console.warn('[tf-video-stream] fullscreen failed:', e?.message ?? e);
+      });
+    }
   }
 
   _setStatus(text) {
@@ -358,21 +382,35 @@ class TfVideoStream extends HTMLElement {
     // never starves between fragments. With a clean continuous server timeline
     // (h264timestamper + param-only AUs dropped) a small cushion suffices.
     const TARGET_LATENCY_SECS = 0.1;
-    // Upper bound on drift before snapping back to TARGET. Without this, every
-    // brief decoder stall left the playhead permanently further behind (latency
-    // grew and never recovered, since the only correction fired at KEEP_WINDOW).
-    const MAX_LATENCY_SECS = 0.16;
+    // Twarda granica dryfu — powyzej NIE czekamy, tylko przeskakujemy na
+    // live-edge (bufor odjechal za daleko po dluzszym stallu / karcie w tle).
+    const HARD_SNAP_SECS = 0.5;
+    // Histereza lekkiego przyspieszenia (catch-up bez skokow): wlaczamy
+    // playbackRate>1 gdy playhead za daleko za live-edge, wracamy do 1.0 po
+    // dogonieniu. Zakres < HARD_SNAP zeby najpierw probowac plynnie.
+    const CATCHUP_ON_SECS = 0.25;
+    const CATCHUP_OFF_SECS = 0.15;
+    const CATCHUP_RATE = 1.05;
     // Only build the initial cushion before first play: wait until enough is
     // buffered so playback starts with room ahead rather than at the edge.
     if (v.paused && end - start < TARGET_LATENCY_SECS && v.currentTime <= start) {
       return;
     }
-    if (v.currentTime < start || end - v.currentTime > MAX_LATENCY_SECS) {
+    const behind = end - v.currentTime;
+    if (v.currentTime < start || behind > HARD_SNAP_SECS) {
+      // Przeskok na live-edge — bez czekania na plynne nadgonienie.
       try {
         v.currentTime = Math.max(start, end - TARGET_LATENCY_SECS);
       } catch (e) {
         // Not seekable yet — retry on the next updateend.
       }
+      if (v.playbackRate !== 1.0) v.playbackRate = 1.0;
+    } else if (behind > CATCHUP_ON_SECS) {
+      // Lekkie przyspieszenie, zeby plynnie dogonic live-edge bez skoku.
+      if (v.playbackRate !== CATCHUP_RATE) v.playbackRate = CATCHUP_RATE;
+    } else if (behind <= CATCHUP_OFF_SECS && v.playbackRate !== 1.0) {
+      // Dogonione — powrot do normalnej predkosci.
+      v.playbackRate = 1.0;
     }
     if (v.paused) {
       const pr = v.play();
@@ -394,9 +432,13 @@ class TfVideoStream extends HTMLElement {
     }
     if (ranges.length === 0) return;
     const start = ranges.start(0);
-    const end = ranges.end(ranges.length - 1);
-    if (end - start <= KEEP_WINDOW_SECS) return;
-    const removeUntil = end - KEEP_WINDOW_SECS;
+    // Trzymamy tylko ~2 s historii przed playheadem — bufor nie rosnie, a
+    // pamiec MSE zostaje mala na dlugo zyjacych kafelkach. Przycinamy regularnie
+    // (na kazdym updateend), a nie dopiero przy 30 s okna.
+    const v = this._video;
+    const ct = v ? v.currentTime : 0;
+    const removeUntil = ct - 2;
+    if (!(removeUntil > start + 0.1)) return;
     try {
       this._sourceBuffer.remove(start, removeUntil);
     } catch (e) {
@@ -498,6 +540,15 @@ class TfVideoStream extends HTMLElement {
     }
     this._resetMediaPipeline();
     this._activeStreamId = null;
+    // Cleanup listenera fullscreena i wyjscie z fullscreena gdy kafelek znika.
+    if (this._onDblClick) {
+      this.removeEventListener('dblclick', this._onDblClick);
+      this._onDblClick = null;
+    }
+    const active = document.fullscreenElement;
+    if (active && (active === this || active.contains(this)) && document.exitFullscreen) {
+      document.exitFullscreen().catch(() => {});
+    }
   }
 }
 

@@ -38,6 +38,15 @@ use crate::mesh::security::MeshSecurity;
 // Helpery
 // =============================================================================
 
+/// Ceiling na komendę bulk-transferu modelu przez mesh (`PushModelToPeer`). NIE
+/// jest to realny mechanizm zakończenia — właściwym watchdogiem jest STALL
+/// strumienia po stronie odbiorcy (`mesh_artifact::ARTIFACT_STALL_SECS`, 30 s bez
+/// NOWYCH bajtów → błąd), który kończy transfer niezależnie od całkowitego czasu.
+/// Aktywny transfer wielkiego modelu (setki GB przez wolne łącze) może trwać
+/// godzinami i NIE może być urwany twardym total-time; ten limit to tylko bardzo
+/// wysoka bariera bezpieczeństwa przeciw komendzie, która nigdy nie odpowiada.
+const MODEL_TRANSFER_CMD_TIMEOUT_SECS: u64 = 24 * 3600;
+
 fn require_quic_mesh(ctx: &HandlerContext) -> Result<Arc<IrohMeshManager>, ProtocolError> {
     ctx.state
         .quic_mesh
@@ -895,6 +904,140 @@ pub async fn cluster_rdma_configure(
 
 /// Deployuje JEDNEGO czlonka (lokalnie przez `spawn_deploy_pipeline` albo zdalnie
 /// przez `ServiceDeployDistributed`). Zwraca status czlonka do odpowiedzi.
+/// P0: gwarantuje, ze model jest w cache HF na headzie (pobiera z HF jesli brak)
+/// i na KAZDYM workerze (transfer snapshotu z head-a przez mesh). Dzieki temu
+/// `vllm serve` (offline=1) znajduje wagi wszedzie bez recznego pre-cache. Source
+/// transferu to zawsze head; gdy head == local, koordynator pcha bezposrednio,
+/// inaczej zleca headowi `PushModelToPeer`. Token HF rozwiazywany LOKALNIE na
+/// nodzie pobierajacym (nigdy nie leci przez mesh).
+async fn ensure_cluster_model(
+    ctx: &HandlerContext,
+    qm: &Arc<IrohMeshManager>,
+    local_id: &str,
+    deployment_cluster_id: &str,
+    head_node_id: &str,
+    members: &[crate::db::models::DbClusterMember],
+    model_repo: &str,
+    engine_id: &str,
+) -> Result<(), String> {
+    // 1. Head MUSI miec model w cache — pobierz jesli brak.
+    if head_node_id == local_id {
+        let hf_token = crate::db::repository::get_setting_secure(
+            &ctx.state.db,
+            "hf_token",
+            &ctx.state.settings_cipher,
+        )
+        .ok()
+        .flatten()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+        crate::services::deploy::distributed::ensure_model_downloaded_local(
+            model_repo,
+            engine_id,
+            hf_token.as_deref(),
+        )
+        .await
+        .map_err(|e| format!("head: pobranie modelu: {e}"))?;
+    } else {
+        let cmd = MeshCommandType::EnsureModelLocal {
+            deployment_cluster_id: deployment_cluster_id.to_string(),
+            model_repo: model_repo.to_string(),
+            engine_id: engine_id.to_string(),
+        };
+        match qm.send_command_and_wait(head_node_id, cmd, 7200).await {
+            Ok(resp) if resp.ok => {
+                if let MeshCommandResponsePayload::EnsureModelResult { error: Some(e), .. } =
+                    resp.payload
+                {
+                    return Err(format!("head: pobranie modelu: {e}"));
+                }
+            }
+            Ok(resp) => {
+                return Err(format!(
+                    "head: pobranie modelu: {}",
+                    resp.error.unwrap_or_default()
+                ))
+            }
+            Err(e) => return Err(format!("head: EnsureModelLocal mesh: {e}")),
+        }
+    }
+
+    // 2. Kazdy worker: brak modelu → transfer z head-a.
+    for m in members {
+        if m.node_id == head_node_id {
+            continue;
+        }
+        let present = if m.node_id == local_id {
+            crate::services::deploy::distributed::model_snapshot_dir(model_repo).is_some()
+        } else {
+            let cmd = MeshCommandType::ModelPresentLocal {
+                deployment_cluster_id: deployment_cluster_id.to_string(),
+                model_repo: model_repo.to_string(),
+            };
+            match qm.send_command_and_wait(&m.node_id, cmd, 30).await {
+                Ok(resp) if resp.ok => matches!(
+                    resp.payload,
+                    MeshCommandResponsePayload::ModelPresentResult { present: true }
+                ),
+                _ => false,
+            }
+        };
+        if present {
+            info!(node = %m.node_id, model = %model_repo, "P0: worker ma juz model — pomijam transfer");
+            continue;
+        }
+        info!(node = %m.node_id, model = %model_repo, "P0: transfer modelu na worker");
+        if head_node_id == local_id {
+            let snap = crate::services::deploy::distributed::model_snapshot_dir(model_repo)
+                .ok_or_else(|| "model zniknal z cache head-a przed transferem".to_string())?;
+            let hash = snap
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let key = format!("{}::{}", model_repo, m.node_id);
+            let res = crate::ml_studio::mesh_artifact::push_hf_model_to(
+                qm,
+                &m.node_id,
+                model_repo,
+                &snap.to_string_lossy(),
+                &hash,
+                Some(&key),
+            )
+            .await;
+            crate::ml_studio::mesh_artifact::clear_artifact_progress(&key);
+            res.map_err(|e| format!("transfer modelu na {}: {e}", m.node_id))?;
+        } else {
+            let cmd = MeshCommandType::PushModelToPeer {
+                deployment_cluster_id: deployment_cluster_id.to_string(),
+                model_repo: model_repo.to_string(),
+                target_node_id: m.node_id.clone(),
+            };
+            match qm
+                .send_command_and_wait(head_node_id, cmd, MODEL_TRANSFER_CMD_TIMEOUT_SECS)
+                .await
+            {
+                Ok(resp) if resp.ok => {
+                    if let MeshCommandResponsePayload::MlArtifactPushResult { error: Some(e), .. } =
+                        resp.payload
+                    {
+                        return Err(format!("transfer modelu na {}: {e}", m.node_id));
+                    }
+                }
+                Ok(resp) => {
+                    return Err(format!(
+                        "transfer modelu na {}: {}",
+                        m.node_id,
+                        resp.error.unwrap_or_default()
+                    ))
+                }
+                Err(e) => return Err(format!("PushModelToPeer mesh: {e}")),
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn deploy_distributed_member(
     ctx: &HandlerContext,
     qm: &Arc<IrohMeshManager>,
@@ -1362,6 +1505,17 @@ pub async fn cluster_deploy(
     }
 
     let mut statuses: Vec<ClusterDeployMemberStatus> = Vec::new();
+
+    info!(deployment_cluster_id=%deployment_cluster_id, "cluster deploy P0: ensure model on head + transfer to workers");
+    if let Err(e) =
+        ensure_cluster_model(ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, &members, &model, engine_id).await
+    {
+        return Ok(finalize_distributed_failure(
+            ctx, &qm, &local_id, &deployment_cluster_id, serve_port, dist_port, &head_node_id, endpoint_url,
+            &persisted_members, statuses, format!("P0 zapewnienie modelu w cache klastra: {e}"),
+        )
+        .await);
+    }
 
     info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P1: start head (Ray GCS)");
     // 1. Head FIRST: start Ray GCS + `vllm serve` (vLLM BLOCKS until workers join).

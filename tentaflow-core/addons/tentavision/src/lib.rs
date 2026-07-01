@@ -4410,77 +4410,71 @@ fn shared_cameras() -> Vec<SharedCamera> {
 /// core enforces the grant when serving frames.
 fn shared_camera_tile(c: &SharedCamera) -> Component {
     let online = c.status == "online";
-    let (status_label, status_tone) = if online {
-        ("online", "success")
+    let status_label = if online {
+        "online"
     } else if c.status == "offline" {
-        ("offline", "critical")
+        "offline"
     } else {
-        (c.status.as_str(), "warning")
+        c.status.as_str()
     };
-    let header = stack_h_gap("sm", vec![
-        chip_with_icon(&c.display_name, "neutral", "video"),
-        chip_toned(status_label, status_tone),
-        chip_toned(&alloc::format!("udostępniona · {}", c.owner_addon_id), "info"),
-    ]);
-
-    let body = if online {
-        live_video_tile(&c.camera_id)
+    if online {
+        // Wideo wypelnia caly kafelek; nazwa + status + udostepnienie sa nalozone
+        // na obraz przez renderer LiveCameraTile — bez osobnego rzedu badge.
+        let label = alloc::format!("{} · {}", c.display_name, c.owner_addon_id);
+        live_video_tile(&c.camera_id, &label, status_label)
     } else {
-        empty_state(
+        card(None, vec![empty_state(
             &c.display_name,
             Some("Offline — brak podglądu"),
             Some("alert"),
-        )
-    };
-    card(None, vec![header, body])
+        )])
+    }
 }
 
 fn live_camera_tile(c: &db::CameraRow) -> Component {
     let online = c.status == "online";
-    let (status_label, status_tone) = if online {
-        ("online", "success")
+    let status_label = if online {
+        "online"
     } else if c.status == "offline" {
-        ("offline", "critical")
+        "offline"
     } else {
-        (c.status.as_str(), "warning")
+        c.status.as_str()
     };
-    let header = stack_h_gap("sm", vec![
-        chip_with_icon(&c.name, "neutral", "video"),
-        chip_toned(status_label, status_tone),
-    ]);
-
-    let body = if online {
-        live_video_tile(&c.id)
+    if online {
+        // Wideo wypelnia caly kafelek; nazwa kamery + status sa nalozone na obraz
+        // przez renderer LiveCameraTile (nakladki NAD wideo), nie osobnym rzedem
+        // badge nad mniejszym boxem wideo.
+        live_video_tile(&c.id, &c.name, status_label)
     } else {
-        empty_state(
+        card(None, vec![empty_state(
             &c.name,
             Some("Offline — brak podglądu"),
             Some("alert"),
-        )
-    };
-    card(None, vec![header, body])
+        )])
+    }
 }
 
-/// Builds the SDK `VideoStream` component bound to the live `camera:<id>` stream.
-/// The `camera:` prefix is the only subscribe scheme the core wires today
-/// (dispatch/stream.rs CAMERA_PREFIX); the dashboard renderer maps it to
-/// `<tf-video-stream>` (MSE over `streamSubscribeRequest`) and attaches the
-/// binary detection overlay. The id is a literal (one camera per tile, not a
-/// reactive store path).
-fn live_video_tile(camera_id: &str) -> Component {
-    use tentaflow_sdk_spec::protocol::ui::specialized::media::VideoStream;
-    VideoStream {
+/// Builds the SDK `LiveCameraTile` (0x0605) bound to the live `camera:<id>`
+/// stream. The `camera:` prefix is the only subscribe scheme the core wires
+/// today (dispatch/stream.rs CAMERA_PREFIX); the dashboard renderer maps it to
+/// `<tf-video-stream>` (MSE over `streamSubscribeRequest`), attaches the binary
+/// detection overlay, and — being the specialised camera tile — draws the
+/// name/status/timestamp overlays NAD wideo (jak mockup .video-tile). Wideo
+/// wypelnia caly kafelek, etykiety sa nalozone przez renderer, a nie osobnym
+/// rzedem badge nad obrazem. Dwuklik->fullscreen obsluguje tf-video-stream.
+fn live_video_tile(camera_id: &str, name: &str, status: &str) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::specialized::media::LiveCameraTile;
+    LiveCameraTile {
         stream_id: BindRef::Literal(Value::Text(alloc::format!("camera:{}", camera_id))),
-        width_px: None,
+        camera_label: BindRef::Literal(Value::Text(name.into())),
+        status: BindRef::Literal(Value::Text(status.into())),
+        fps: None,
+        show_overlay: true,
+        show_fullscreen_button: false,
         aspect_ratio: AspectRatio::R16To9,
-        controls: VideoControls::None,
-        autoplay: true,
-        muted: true,
-        object_fit: ImageFit::Contain,
-        poster_ref: None,
     }
     .into_component(next_id())
-    .expect("VideoStream")
+    .expect("LiveCameraTile")
 }
 
 fn build_live_content() -> Component {
