@@ -740,7 +740,7 @@ async function showCreateWizard() {
     const ftNote = FT_TYPES.has(state.type)
       ? `<div class="ml-studio-wiz-summary-note">${sprite('info')} ${
           state.type === 'distillation'
-            ? 'Nauczyciela (generuje odpowiedzi) wybierzesz w zakładce „Dane”, a model bazowy studenta w zakładce „Trening”.'
+            ? 'Model bazowy studenta wybierzesz w zakładce „Model bazowy”, a nauczyciela (generuje odpowiedzi) w zakładce „Dane”.'
             : 'Model bazowy wybierzesz już w projekcie — w zakładce „Model bazowy”.'
         }</div>`
       : '';

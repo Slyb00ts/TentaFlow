@@ -581,8 +581,8 @@ def _run_dpo(req: TrainRequest, job_id: str) -> str:
 def _to_messages(record: dict[str, Any]) -> dict[str, Any]:
     """Mapuje rekord {prompt,response} na format konwersacyjny `messages`
     wymagany przez DataCollatorForChatML (GKD). Brak response → sama tura usera."""
-    prompt = record.get("prompt") or record.get("text") or ""
-    response = record.get("response") or record.get("completion") or ""
+    prompt = record.get("prompt") or record.get("question") or record.get("text") or ""
+    response = record.get("response") or record.get("answer") or record.get("completion") or ""
     messages = [{"role": "user", "content": prompt}]
     if response:
         messages.append({"role": "assistant", "content": response})
