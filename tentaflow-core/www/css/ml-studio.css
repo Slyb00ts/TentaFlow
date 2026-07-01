@@ -2082,6 +2082,47 @@
   line-height: 1.5;
 }
 
+/* Segmented control celu treningu (detekcja / klasyfikator / OCR). Reużywa
+   tokenów kart wariantu (.ml-studio-ft-axis-card) dla spójnego wyglądu. */
+.ml-studio-target-seg {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2, var(--surface-1));
+}
+
+.ml-studio-target-seg-btn {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-weight: 700;
+  padding: 6px 14px;
+  border-radius: calc(var(--radius) - 2px);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.ml-studio-target-seg-btn:hover:not([disabled]) {
+  border-color: var(--accent-1);
+  color: var(--text-1);
+}
+
+.ml-studio-target-seg-btn.selected {
+  background: var(--surface-1);
+  border-color: var(--accent-1);
+  box-shadow: 0 0 0 1px var(--accent-1);
+  color: var(--text-1);
+}
+
+.ml-studio-target-seg-btn[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .ml-studio-ft-method-card {
   flex-direction: column;
 }

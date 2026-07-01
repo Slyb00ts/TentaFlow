@@ -37,6 +37,7 @@ pub mod meeting_live_broadcast;
 pub mod mesh_write_handlers;
 pub mod metrics;
 pub mod ml_studio;
+pub mod model_metrics;
 pub mod recorder;
 pub mod resume_token;
 pub mod robots;
@@ -698,6 +699,18 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             }
             tentaflow_protocol::MlStudioPayload::RecogTrainStatusResponse(_) => {
                 "MlStudioRecogTrainStatusResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ClassifierTrainStartRequest(_) => {
+                "MlStudioClassifierTrainStartRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ClassifierTrainStartResponse(_) => {
+                "MlStudioClassifierTrainStartResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::GenericTrainStatusRequest(_) => {
+                "MlStudioGenericTrainStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::GenericTrainStatusResponse(_) => {
+                "MlStudioGenericTrainStatusResponse"
             }
             tentaflow_protocol::MlStudioPayload::RecogDatasetRegisterRequest(_) => {
                 "MlStudioRecogDatasetRegisterRequest"
@@ -1422,6 +1435,26 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             }
             tentaflow_protocol::TokenUsagePayload::CoordinatorStatusResponse { .. } => {
                 "TokenCoordinatorStatusResponse"
+            }
+        },
+        MessageBody::ModelMetricsBody(p) => match p {
+            tentaflow_protocol::ModelMetricsPayload::SummaryRequest { .. } => {
+                "ModelMetricsSummaryRequest"
+            }
+            tentaflow_protocol::ModelMetricsPayload::SummaryResponse { .. } => {
+                "ModelMetricsSummaryResponse"
+            }
+            tentaflow_protocol::ModelMetricsPayload::NodeServiceRequest { .. } => {
+                "ModelMetricsNodeServiceRequest"
+            }
+            tentaflow_protocol::ModelMetricsPayload::NodeServiceResponse { .. } => {
+                "ModelMetricsNodeServiceResponse"
+            }
+            tentaflow_protocol::ModelMetricsPayload::PricingGet => "ModelMetricsPricingGet",
+            tentaflow_protocol::ModelMetricsPayload::PricingList { .. } => "ModelMetricsPricingList",
+            tentaflow_protocol::ModelMetricsPayload::PricingSet { .. } => "ModelMetricsPricingSet",
+            tentaflow_protocol::ModelMetricsPayload::PricingSetResult { .. } => {
+                "ModelMetricsPricingSetResult"
             }
         },
     }

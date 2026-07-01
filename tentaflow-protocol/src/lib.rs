@@ -22,6 +22,7 @@ pub mod envelope;
 pub mod legal;
 pub mod mesh;
 pub mod message_body;
+pub mod model_metrics;
 pub mod pii;
 pub mod profiling;
 pub mod stream;
@@ -463,6 +464,12 @@ pub use message_body::{
     MlStudioRecogTrainStartResponse,
     MlStudioRecogTrainStatusRequest,
     MlStudioRecogTrainStatusResponse,
+    MlStudioClassifierHyperparams,
+    MlStudioClassifierTrainStartRequest,
+    MlStudioClassifierTrainStartResponse,
+    MlStudioGenericTrainStatusRequest,
+    MlStudioGenericTrainStatusResponse,
+    GenericMetricPoint,
     MlStudioSchemaGetRequest,
     MlStudioSchemaGetResponse,
     MlStudioSchemaSaveRequest,
@@ -706,6 +713,10 @@ pub use profiling::{
 pub use stream::{
     StreamCloseRequest, StreamClosedPayload, StreamFramePayload, StreamPayload,
     StreamSubscribeRequest, StreamSubscribeResponse,
+};
+pub use model_metrics::{
+    ModelMetricsFilterWire, ModelMetricsPayload, ModelMetricsRowWire, ModelNodeServiceRowWire,
+    ModelPricingWire,
 };
 pub use token_usage::{
     TokenLeaseWire, TokenQuotaUpsertWire, TokenQuotaWire, TokenUsagePayload, TokenUsageSummaryWire,

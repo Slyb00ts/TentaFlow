@@ -1871,6 +1871,79 @@ pub struct MlStudioRecogTrainStatusResponse {
     pub sync_rate_bps: u64,
 }
 
+/// Hiperparametry treningu klasyfikatora atrybutu na wycinkach (timm). Kontrakt
+/// jest sztywny (inne zespoły piszą pod te same nazwy/typy), stąd `i32`/`f32`.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioClassifierHyperparams {
+    pub epochs: i32,
+    pub batch_size: i32,
+    pub learning_rate: f32,
+    pub image_size: i32,
+    pub freeze_backbone: bool,
+}
+
+/// Start treningu KLASYFIKATORA ATRYBUTU na wycinkach (np. atrybut "stan" o
+/// wartościach czysta/brudna). Cropy z obrazów źródłowych buduje SERWIS Python
+/// (`classifier-training`); Core przekazuje tylko dataset + specyfikację atrybutu.
+/// Biegnie ASYNCHRONICZNIE (zob. `train_classifier.rs`); UI pyta o postęp przez
+/// `MlStudioGenericTrainStatusRequest`. `variant` = mobilenetv4|efficientnet_b0|
+/// resnet50. `source_class` = nazwa kategorii COCO definiującej atrybut ("" =
+/// wszystkie klasy). `values` = etykiety atrybutu (kolejność = indeks etykiety).
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioClassifierTrainStartRequest {
+    pub project_id: String,
+    pub dataset_id: String,
+    pub attribute: String,
+    pub source_class: String,
+    pub variant: String,
+    pub values: Vec<String>,
+    pub hyperparams: MlStudioClassifierHyperparams,
+    /// Węzeł docelowy treningu: "" = trening lokalny; inny node_id → trening na
+    /// zdalnym węźle (Node B) przez komendę mesh, status proxowany z powrotem.
+    #[serde(default)]
+    pub target_node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioClassifierTrainStartResponse {
+    pub run_id: String,
+    pub status: String,
+}
+
+/// Generyczne żądanie statusu treningu (klasyfikator i inne torry nie-detekcyjne).
+/// Detekcja RF-DETR nadal używa własnego `MlStudioRecogTrainStatusRequest`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioGenericTrainStatusRequest {
+    pub run_id: String,
+}
+
+/// Punkt generycznej krzywej treningu: (epoka, nazwa metryki, wartość). Pozwala
+/// serwować dowolny zestaw metryk (np. train_loss, val_acc, val_macro_f1) bez
+/// sztywnej struktury per-tor.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct GenericMetricPoint {
+    pub epoch: i32,
+    pub metric_name: String,
+    pub value: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioGenericTrainStatusResponse {
+    pub run_id: String,
+    pub status: String,
+    pub epoch: i32,
+    pub total_epochs: i32,
+    pub curve: Vec<GenericMetricPoint>,
+    pub error: String,
+    /// Faza transferu datasetu przez mesh (trening zdalny): "zipping" | "syncing"
+    /// | "starting"; None gdy lokalnie lub gdy transfer zakończony i trening leci
+    /// na węźle B. Analogiczne do `MlStudioRecogTrainStatusResponse`.
+    pub sync_phase: Option<String>,
+    pub sync_bytes_sent: u64,
+    pub sync_bytes_total: u64,
+    pub sync_rate_bps: u64,
+}
+
 /// Żądanie eksportu wytrenowanego modelu FT do GGUF. Eksport (merge adaptera +
 /// konwersja) trwa, więc biegnie ASYNCHRONICZNIE w tle Core (zob.
 /// `export_llm.rs`); odpowiedź wraca natychmiast, a UI odpytuje przez
@@ -2074,6 +2147,10 @@ pub enum MlStudioPayload {
     RecogTrainStartResponse(MlStudioRecogTrainStartResponse),
     RecogTrainStatusRequest(MlStudioRecogTrainStatusRequest),
     RecogTrainStatusResponse(MlStudioRecogTrainStatusResponse),
+    ClassifierTrainStartRequest(MlStudioClassifierTrainStartRequest),
+    ClassifierTrainStartResponse(MlStudioClassifierTrainStartResponse),
+    GenericTrainStatusRequest(MlStudioGenericTrainStatusRequest),
+    GenericTrainStatusResponse(MlStudioGenericTrainStatusResponse),
     RecogDatasetRegisterRequest(MlStudioRecogDatasetRegisterRequest),
     RecogDatasetRegisterResponse(MlStudioRecogDatasetRegisterResponse),
     RecogStageMediaRequest(MlStudioRecogStageMediaRequest),
@@ -7126,6 +7203,12 @@ pub enum MessageBody {
     ClusterDeployResponseBody(ClusterDeployResponse),
     ClusterDeployStopRequestBody(ClusterDeployStopRequest),
     ClusterDeployStopResponseBody(ClusterDeployStopResponse),
+
+    // ----- Model metrics (histogram rollup read + per-model pricing) -----
+    // Dopisane na KOŃCU enuma (ciborium koduje warianty po indeksie liczbowym),
+    // żeby nie ruszać indeksów istniejących wariantów. JEDEN wariant na całą
+    // rodzinę (summary + node×service + pricing) w `ModelMetricsPayload`.
+    ModelMetricsBody(crate::model_metrics::ModelMetricsPayload),
 }
 
 // =============================================================================
@@ -7218,6 +7301,108 @@ mod tests {
             server_version: 2,
             accepted: true,
         };
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn ml_studio_classifier_train_start_request_round_trip() {
+        let body = MessageBody::MlStudioBody(MlStudioPayload::ClassifierTrainStartRequest(
+            MlStudioClassifierTrainStartRequest {
+                project_id: "proj-1".to_string(),
+                dataset_id: "ds-7".to_string(),
+                attribute: "stan".to_string(),
+                source_class: "tablica".to_string(),
+                variant: "efficientnet_b0".to_string(),
+                values: vec![
+                    "czysta".to_string(),
+                    "brudna".to_string(),
+                    "uszkodzona".to_string(),
+                    "nieczytelna".to_string(),
+                ],
+                hyperparams: MlStudioClassifierHyperparams {
+                    epochs: 30,
+                    batch_size: 32,
+                    learning_rate: 1e-3,
+                    image_size: 224,
+                    freeze_backbone: true,
+                },
+                target_node_id: "node-B".to_string(),
+            },
+        ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn ml_studio_classifier_train_start_request_default_target_node() {
+        // `target_node_id` ma #[serde(default)] — CBOR bez tego pola musi się
+        // zdekodować do pustego stringa (trening lokalny).
+        let req = MlStudioClassifierTrainStartRequest {
+            project_id: "p".to_string(),
+            dataset_id: "d".to_string(),
+            attribute: "stan".to_string(),
+            source_class: String::new(),
+            variant: "resnet50".to_string(),
+            values: vec!["a".to_string(), "b".to_string()],
+            hyperparams: MlStudioClassifierHyperparams {
+                epochs: 1,
+                batch_size: 8,
+                learning_rate: 0.01,
+                image_size: 128,
+                freeze_backbone: false,
+            },
+            target_node_id: String::new(),
+        };
+        let body =
+            MessageBody::MlStudioBody(MlStudioPayload::ClassifierTrainStartRequest(req.clone()));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn ml_studio_generic_train_status_response_round_trip() {
+        let body = MessageBody::MlStudioBody(MlStudioPayload::GenericTrainStatusResponse(
+            MlStudioGenericTrainStatusResponse {
+                run_id: "run-42".to_string(),
+                status: "running".to_string(),
+                epoch: 3,
+                total_epochs: 30,
+                curve: vec![
+                    GenericMetricPoint {
+                        epoch: 1,
+                        metric_name: "train/loss".to_string(),
+                        value: 1.25,
+                    },
+                    GenericMetricPoint {
+                        epoch: 1,
+                        metric_name: "val/macro_f1".to_string(),
+                        value: 0.5,
+                    },
+                ],
+                error: String::new(),
+                sync_phase: Some("syncing".to_string()),
+                sync_bytes_sent: 1_024,
+                sync_bytes_total: 4_096,
+                sync_rate_bps: 512,
+            },
+        ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn ml_studio_generic_train_status_response_none_sync_phase() {
+        let body = MessageBody::MlStudioBody(MlStudioPayload::GenericTrainStatusResponse(
+            MlStudioGenericTrainStatusResponse {
+                run_id: "r".to_string(),
+                status: "succeeded".to_string(),
+                epoch: 30,
+                total_epochs: 30,
+                curve: vec![],
+                error: String::new(),
+                sync_phase: None,
+                sync_bytes_sent: 0,
+                sync_bytes_total: 0,
+                sync_rate_bps: 0,
+            },
+        ));
         assert_eq!(round_trip(body.clone()), body);
     }
 

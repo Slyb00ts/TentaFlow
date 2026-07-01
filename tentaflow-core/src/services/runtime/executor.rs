@@ -4099,9 +4099,7 @@ fn served_by(target: &ResolvedExecutionTarget) -> Option<String> {
     }
 }
 
-/// Wersja rozkladu kubelkow histogramow (musi zgadzac sie z `bump_histogram_bucket`
-/// w repository.rs). Bump z ta sama wersja laczy sie w ten sam wiersz rollupu.
-const MODEL_METRICS_HISTOGRAM_VERSION: i64 = 1;
+use crate::db::repository::MODEL_METRICS_HISTOGRAM_VERSION;
 
 /// Znormalizowane wejscie jednego zapisu metryk modelu. Grupuje wymiary +
 /// liczniki w jeden argument, zeby `bump_model_metric_row` nie mial dziesiatek

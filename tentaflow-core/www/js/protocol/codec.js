@@ -3083,6 +3083,59 @@ export const encode = {
   },
 
   /**
+   * MessageBody::MlStudioBody(ClassifierTrainStartRequest) — startuje
+   * ASYNCHRONICZNY trening KLASYFIKATORA ATRYBUTU na wycinkach (np. atrybut
+   * "stan" o wartościach czysta/brudna). Cropy buduje serwis Python. Odpowiedź
+   * natychmiast z runId; postęp odpytuj przez mlStudioGenericTrainStatusRequest.
+   * payload: { projectId, datasetId, attribute, sourceClass, variant, values,
+   * hyperparams:{epochs,batchSize,learningRate,imageSize,freezeBackbone},
+   * targetNodeId }.
+   */
+  mlStudioClassifierTrainStartRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const hp = payload.hyperparams ?? {};
+    const values = (payload.values ?? []).map((v) => String(v));
+    const body = _wasm.encodeMlStudioClassifierTrainStartRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.datasetId ?? payload.dataset_id ?? ''),
+      String(payload.attribute ?? ''),
+      String(payload.sourceClass ?? payload.source_class ?? ''),
+      String(payload.variant ?? 'mobilenetv4'),
+      values,
+      (hp.epochs ?? 20) | 0,
+      (hp.batchSize ?? hp.batch_size ?? 32) | 0,
+      Number(hp.learningRate ?? hp.learning_rate ?? 1e-3),
+      (hp.imageSize ?? hp.image_size ?? 224) | 0,
+      Boolean(hp.freezeBackbone ?? hp.freeze_backbone ?? false),
+      String(payload.targetNodeId ?? payload.target_node_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(GenericTrainStatusRequest) — polling postępu
+   * treningu generycznego (klasyfikator atrybutu i inne tory nie-detekcyjne).
+   * Zwraca status + krzywą [{epoch, metricName, value}]. payload: { runId }.
+   */
+  mlStudioGenericTrainStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioGenericTrainStatusRequest(
+      String(payload.runId ?? payload.run_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
    * MessageBody::MlStudioBody(RecogDetectRequest) — detekcja na obrazie
    * wytrenowanym modelem recognition. payload: { modelId, threshold, imageB64 }.
    * Zwraca detectionsJson (lista detekcji) + width/height.

@@ -1736,6 +1736,74 @@ pub fn encode_token_coordinator_status_request() -> Result<Vec<u8>, JsError> {
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeModelMetricsSummaryRequest)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_model_metrics_summary_request(
+    period: String,
+    period_key: String,
+    group_by: String,
+    filter_model: Option<String>,
+    filter_node: Option<String>,
+    filter_service: Option<String>,
+    filter_backend: Option<String>,
+    filter_modality: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ModelMetricsBody(
+        tentaflow_protocol::ModelMetricsPayload::SummaryRequest {
+            period,
+            period_key,
+            group_by,
+            filter: tentaflow_protocol::ModelMetricsFilterWire {
+                model: filter_model,
+                node: filter_node,
+                service: filter_service,
+                backend: filter_backend,
+                modality: filter_modality,
+            },
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeModelMetricsNodeServiceRequest)]
+pub fn encode_model_metrics_node_service_request(
+    period: String,
+    period_key: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ModelMetricsBody(
+        tentaflow_protocol::ModelMetricsPayload::NodeServiceRequest { period, period_key },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeModelMetricsPricingGet)]
+pub fn encode_model_metrics_pricing_get() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ModelMetricsBody(
+        tentaflow_protocol::ModelMetricsPayload::PricingGet,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeModelMetricsPricingSet)]
+pub fn encode_model_metrics_pricing_set(
+    model_id: String,
+    prompt_per_1k: f64,
+    completion_per_1k: f64,
+    audio_per_min: f64,
+    image_each: f64,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ModelMetricsBody(
+        tentaflow_protocol::ModelMetricsPayload::PricingSet {
+            model_id,
+            prompt_per_1k,
+            completion_per_1k,
+            audio_per_min,
+            image_each,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioProjectsListRequest)]
 pub fn encode_ml_studio_projects_list_request() -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
@@ -2230,6 +2298,55 @@ pub fn encode_ml_studio_recog_train_status_request(run_id: String) -> Result<Vec
     encode_body_inner(&MessageBody::MlStudioBody(
         tentaflow_protocol::MlStudioPayload::RecogTrainStatusRequest(
             tentaflow_protocol::MlStudioRecogTrainStatusRequest { run_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioClassifierTrainStartRequest)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_ml_studio_classifier_train_start_request(
+    project_id: String,
+    dataset_id: String,
+    attribute: String,
+    source_class: String,
+    variant: String,
+    values: Vec<String>,
+    epochs: i32,
+    batch_size: i32,
+    learning_rate: f32,
+    image_size: i32,
+    freeze_backbone: bool,
+    target_node_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ClassifierTrainStartRequest(
+            tentaflow_protocol::MlStudioClassifierTrainStartRequest {
+                project_id,
+                dataset_id,
+                attribute,
+                source_class,
+                variant,
+                values,
+                hyperparams: tentaflow_protocol::MlStudioClassifierHyperparams {
+                    epochs,
+                    batch_size,
+                    learning_rate,
+                    image_size,
+                    freeze_backbone,
+                },
+                target_node_id,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioGenericTrainStatusRequest)]
+pub fn encode_ml_studio_generic_train_status_request(run_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::GenericTrainStatusRequest(
+            tentaflow_protocol::MlStudioGenericTrainStatusRequest { run_id },
         ),
     ))
     .map_err(|e| JsError::new(&e))
@@ -3914,6 +4031,158 @@ fn access_transition_to_js(t: &tentaflow_protocol::AccessTransition) -> JsValue 
     o.into()
 }
 
+/// Buduje jeden wiersz summary (JS object) z `ModelMetricsRowWire`. Wspoldzielony
+/// przez `rows` i `grandTotal`, zeby oba mialy identyczny ksztalt (klucze
+/// camelCase + snake_case, percentyle number|null).
+fn model_metrics_summary_row_to_js(
+    r: &tentaflow_protocol::ModelMetricsRowWire,
+) -> js_sys::Object {
+    let item = js_sys::Object::new();
+    set(&item, "key", r.key.clone().into());
+    set(&item, "promptTokens", (r.prompt_tokens as f64).into());
+    set(&item, "prompt_tokens", (r.prompt_tokens as f64).into());
+    set(&item, "completionTokens", (r.completion_tokens as f64).into());
+    set(&item, "completion_tokens", (r.completion_tokens as f64).into());
+    set(&item, "totalTokens", (r.total_tokens as f64).into());
+    set(&item, "total_tokens", (r.total_tokens as f64).into());
+    set(&item, "embeddingTokens", (r.embedding_tokens as f64).into());
+    set(&item, "embedding_tokens", (r.embedding_tokens as f64).into());
+    set(&item, "audioMs", (r.audio_ms as f64).into());
+    set(&item, "audio_ms", (r.audio_ms as f64).into());
+    set(&item, "images", (r.images as f64).into());
+    set(&item, "requestCount", (r.request_count as f64).into());
+    set(&item, "request_count", (r.request_count as f64).into());
+    set(&item, "successCount", (r.success_count as f64).into());
+    set(&item, "success_count", (r.success_count as f64).into());
+    set(&item, "errorCount", (r.error_count as f64).into());
+    set(&item, "error_count", (r.error_count as f64).into());
+    set(&item, "cost", r.cost.into());
+    set(&item, "missingPricing", r.missing_pricing.into());
+    set(&item, "missing_pricing", r.missing_pricing.into());
+    set(&item, "errorRate", r.error_rate.into());
+    set(&item, "error_rate", r.error_rate.into());
+    set(&item, "ttftP50", opt_f64_to_js(r.ttft_p50));
+    set(&item, "ttft_p50", opt_f64_to_js(r.ttft_p50));
+    set(&item, "ttftP90", opt_f64_to_js(r.ttft_p90));
+    set(&item, "ttft_p90", opt_f64_to_js(r.ttft_p90));
+    set(&item, "ttftP99", opt_f64_to_js(r.ttft_p99));
+    set(&item, "ttft_p99", opt_f64_to_js(r.ttft_p99));
+    set(&item, "decodeP50", opt_f64_to_js(r.decode_p50));
+    set(&item, "decode_p50", opt_f64_to_js(r.decode_p50));
+    set(&item, "decodeP90", opt_f64_to_js(r.decode_p90));
+    set(&item, "decode_p90", opt_f64_to_js(r.decode_p90));
+    set(&item, "decodeP99", opt_f64_to_js(r.decode_p99));
+    set(&item, "decode_p99", opt_f64_to_js(r.decode_p99));
+    set(&item, "e2eP50", opt_f64_to_js(r.e2e_p50));
+    set(&item, "e2e_p50", opt_f64_to_js(r.e2e_p50));
+    set(&item, "e2eP90", opt_f64_to_js(r.e2e_p90));
+    set(&item, "e2e_p90", opt_f64_to_js(r.e2e_p90));
+    set(&item, "e2eP99", opt_f64_to_js(r.e2e_p99));
+    set(&item, "e2e_p99", opt_f64_to_js(r.e2e_p99));
+    item
+}
+
+/// Decode helper for `MessageBody::ModelMetricsBody`. Response variants become
+/// per-row JS objects; percentyle jako number|null (brak próbek = null). Klucze
+/// emitowane w camelCase i snake_case, jak w torze token_usage.
+fn decode_model_metrics_payload(
+    obj: &js_sys::Object,
+    payload: tentaflow_protocol::ModelMetricsPayload,
+) {
+    use tentaflow_protocol::ModelMetricsPayload as MP;
+    match payload {
+        MP::SummaryRequest { .. } => set(obj, "variant", "ModelMetricsSummaryRequest".into()),
+        MP::NodeServiceRequest { .. } => {
+            set(obj, "variant", "ModelMetricsNodeServiceRequest".into())
+        }
+        MP::PricingGet => set(obj, "variant", "ModelMetricsPricingGet".into()),
+        MP::PricingSet { .. } => set(obj, "variant", "ModelMetricsPricingSet".into()),
+        MP::SummaryResponse { rows, grand_total } => {
+            set(obj, "variant", "ModelMetricsSummaryResponse".into());
+            let arr = js_sys::Array::new();
+            for r in &rows {
+                arr.push(&model_metrics_summary_row_to_js(r));
+            }
+            set(obj, "rows", arr.into());
+            match grand_total {
+                Some(r) => set(obj, "grandTotal", model_metrics_summary_row_to_js(&r).into()),
+                None => set(obj, "grandTotal", JsValue::NULL),
+            }
+        }
+        MP::NodeServiceResponse { rows } => {
+            set(obj, "variant", "ModelMetricsNodeServiceResponse".into());
+            let arr = js_sys::Array::new();
+            for r in rows {
+                let item = js_sys::Object::new();
+                set(&item, "nodeId", r.node_id.clone().into());
+                set(&item, "node_id", r.node_id.into());
+                set(&item, "serviceKey", r.service_key.clone().into());
+                set(&item, "service_key", r.service_key.into());
+                set(&item, "backend", r.backend.into());
+                set(&item, "modelId", r.model_id.clone().into());
+                set(&item, "model_id", r.model_id.into());
+                set(&item, "promptTokens", (r.prompt_tokens as f64).into());
+                set(&item, "prompt_tokens", (r.prompt_tokens as f64).into());
+                set(&item, "completionTokens", (r.completion_tokens as f64).into());
+                set(&item, "completion_tokens", (r.completion_tokens as f64).into());
+                set(&item, "totalTokens", (r.total_tokens as f64).into());
+                set(&item, "total_tokens", (r.total_tokens as f64).into());
+                set(&item, "requestCount", (r.request_count as f64).into());
+                set(&item, "request_count", (r.request_count as f64).into());
+                set(&item, "successCount", (r.success_count as f64).into());
+                set(&item, "success_count", (r.success_count as f64).into());
+                set(&item, "errorCount", (r.error_count as f64).into());
+                set(&item, "error_count", (r.error_count as f64).into());
+                set(&item, "errorRate", r.error_rate.into());
+                set(&item, "error_rate", r.error_rate.into());
+                set(&item, "ttftP50", opt_f64_to_js(r.ttft_p50));
+                set(&item, "ttft_p50", opt_f64_to_js(r.ttft_p50));
+                set(&item, "ttftP90", opt_f64_to_js(r.ttft_p90));
+                set(&item, "ttft_p90", opt_f64_to_js(r.ttft_p90));
+                set(&item, "ttftP99", opt_f64_to_js(r.ttft_p99));
+                set(&item, "ttft_p99", opt_f64_to_js(r.ttft_p99));
+                set(&item, "decodeP50", opt_f64_to_js(r.decode_p50));
+                set(&item, "decode_p50", opt_f64_to_js(r.decode_p50));
+                set(&item, "decodeP90", opt_f64_to_js(r.decode_p90));
+                set(&item, "decode_p90", opt_f64_to_js(r.decode_p90));
+                set(&item, "decodeP99", opt_f64_to_js(r.decode_p99));
+                set(&item, "decode_p99", opt_f64_to_js(r.decode_p99));
+                arr.push(&item);
+            }
+            set(obj, "rows", arr.into());
+        }
+        MP::PricingList { rows } => {
+            set(obj, "variant", "ModelMetricsPricingList".into());
+            let arr = js_sys::Array::new();
+            for r in rows {
+                let item = js_sys::Object::new();
+                set(&item, "modelId", r.model_id.clone().into());
+                set(&item, "model_id", r.model_id.into());
+                set(&item, "promptPer1k", r.prompt_per_1k.into());
+                set(&item, "prompt_per_1k", r.prompt_per_1k.into());
+                set(&item, "completionPer1k", r.completion_per_1k.into());
+                set(&item, "completion_per_1k", r.completion_per_1k.into());
+                set(&item, "audioPerMin", r.audio_per_min.into());
+                set(&item, "audio_per_min", r.audio_per_min.into());
+                set(&item, "imageEach", r.image_each.into());
+                set(&item, "image_each", r.image_each.into());
+                set(&item, "updatedAt", r.updated_at.clone().into());
+                set(&item, "updated_at", r.updated_at.into());
+                arr.push(&item);
+            }
+            set(obj, "rows", arr.into());
+        }
+        MP::PricingSetResult { ok, error } => {
+            set(obj, "variant", "ModelMetricsPricingSetResult".into());
+            set(obj, "ok", ok.into());
+            match error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+        }
+    }
+}
+
 /// Decode helper for `MessageBody::ServiceBody` (Krok N2). Splits the inner
 /// `ServicePayload` enum into per-variant JS objects with snake_case fields
 /// matching the Rust struct names. Both camelCase and snake_case keys are
@@ -5578,6 +5847,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "leases", arr.into());
             }
         },
+        MessageBody::ModelMetricsBody(payload) => decode_model_metrics_payload(&obj, payload),
         MessageBody::SkillsBody(payload) => match payload {
             tentaflow_protocol::SkillsPayload::ListRequest(req) => {
                 set(&obj, "variant", "SkillsListRequest".into());
@@ -9590,6 +9860,55 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "syncRateBps", (resp.sync_rate_bps as f64).into());
             set(obj, "sync_rate_bps", (resp.sync_rate_bps as f64).into());
         }
+        tentaflow_protocol::MlStudioPayload::ClassifierTrainStartRequest(req) => {
+            set(obj, "variant", "MlStudioClassifierTrainStartRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+            set(obj, "datasetId", req.dataset_id.clone().into());
+            set(obj, "dataset_id", req.dataset_id.into());
+            set(obj, "attribute", req.attribute.into());
+            set(obj, "sourceClass", req.source_class.clone().into());
+            set(obj, "source_class", req.source_class.into());
+            set(obj, "variant_name", req.variant.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ClassifierTrainStartResponse(resp) => {
+            set(obj, "variant", "MlStudioClassifierTrainStartResponse".into());
+            set(obj, "runId", resp.run_id.clone().into());
+            set(obj, "run_id", resp.run_id.into());
+            set(obj, "status", resp.status.into());
+        }
+        tentaflow_protocol::MlStudioPayload::GenericTrainStatusRequest(req) => {
+            set(obj, "variant", "MlStudioGenericTrainStatusRequest".into());
+            set(obj, "runId", req.run_id.clone().into());
+            set(obj, "run_id", req.run_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::GenericTrainStatusResponse(resp) => {
+            set(obj, "variant", "MlStudioGenericTrainStatusResponse".into());
+            set(obj, "runId", resp.run_id.clone().into());
+            set(obj, "run_id", resp.run_id.into());
+            set(obj, "status", resp.status.into());
+            set(obj, "epoch", (resp.epoch as f64).into());
+            set(obj, "totalEpochs", (resp.total_epochs as f64).into());
+            set(obj, "total_epochs", (resp.total_epochs as f64).into());
+            set(obj, "curve", ml_studio_generic_curve_to_js(&resp.curve).into());
+            set(obj, "error", resp.error.into());
+            match resp.sync_phase {
+                Some(p) => {
+                    set(obj, "syncPhase", p.clone().into());
+                    set(obj, "sync_phase", p.into());
+                }
+                None => {
+                    set(obj, "syncPhase", JsValue::NULL);
+                    set(obj, "sync_phase", JsValue::NULL);
+                }
+            }
+            set(obj, "syncBytesSent", (resp.sync_bytes_sent as f64).into());
+            set(obj, "sync_bytes_sent", (resp.sync_bytes_sent as f64).into());
+            set(obj, "syncBytesTotal", (resp.sync_bytes_total as f64).into());
+            set(obj, "sync_bytes_total", (resp.sync_bytes_total as f64).into());
+            set(obj, "syncRateBps", (resp.sync_rate_bps as f64).into());
+            set(obj, "sync_rate_bps", (resp.sync_rate_bps as f64).into());
+        }
         tentaflow_protocol::MlStudioPayload::RecogDatasetRegisterRequest(req) => {
             set(obj, "variant", "MlStudioRecogDatasetRegisterRequest".into());
             set(obj, "projectId", req.project_id.clone().into());
@@ -9861,6 +10180,23 @@ fn ml_studio_recog_curve_to_js(
         set(&item, "trainLoss", opt_f64_to_js(p.train_loss));
         set(&item, "train_loss", opt_f64_to_js(p.train_loss));
         set(&item, "map50", opt_f64_to_js(p.map50));
+        arr.push(&item);
+    }
+    arr
+}
+
+/// Mapuje generyczną krzywą treningu (punkty {epoch, metric_name, value}) na
+/// tablicę JS. Używana przez status klasyfikatora atrybutu i inne tory generyczne.
+fn ml_studio_generic_curve_to_js(
+    points: &[tentaflow_protocol::GenericMetricPoint],
+) -> js_sys::Array {
+    let arr = js_sys::Array::new();
+    for p in points {
+        let item = js_sys::Object::new();
+        set(&item, "epoch", (p.epoch as f64).into());
+        set(&item, "metricName", p.metric_name.clone().into());
+        set(&item, "metric_name", p.metric_name.clone().into());
+        set(&item, "value", (p.value as f64).into());
         arr.push(&item);
     }
     arr

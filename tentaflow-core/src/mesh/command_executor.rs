@@ -659,6 +659,8 @@ impl MeshCommandExecutor {
             .unwrap_or_default();
         let res = if kind == "llm" {
             crate::ml_studio::train_llm::mesh_train_start_llm(&run_id, &spec_json).await
+        } else if kind == "classifier" {
+            crate::ml_studio::train_classifier::mesh_train_start_classifier(&run_id, &spec_json).await
         } else {
             crate::ml_studio::train_recognition::mesh_train_start(&run_id, &spec_json).await
         };
@@ -673,6 +675,8 @@ impl MeshCommandExecutor {
         // inaczej recognition. Jeden run_id istnieje tylko w jednym z rejestrów.
         let res = if crate::ml_studio::train_llm::is_llm_mesh_job(&run_id) {
             crate::ml_studio::train_llm::mesh_train_status_llm(&run_id).await
+        } else if crate::ml_studio::train_classifier::is_classifier_mesh_job(&run_id) {
+            crate::ml_studio::train_classifier::mesh_train_status_classifier(&run_id).await
         } else {
             crate::ml_studio::train_recognition::mesh_train_status(&run_id).await
         };

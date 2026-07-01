@@ -16,6 +16,7 @@ pub mod models;
 pub mod profile;
 pub mod repository;
 pub mod train_autogluon;
+pub mod train_classifier;
 pub mod train_llm;
 pub mod train_recognition;
 pub mod train_tabular;

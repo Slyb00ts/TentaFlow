@@ -2488,6 +2488,404 @@ pub async fn ml_studio_recog_train_status(
     )))
 }
 
+#[handler(variant = "MlStudioClassifierTrainStartRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub async fn ml_studio_classifier_train_start(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::ClassifierTrainStartRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioClassifierTrainStartRequest")),
+    };
+    let org = require_org(ctx)?;
+    repository::get_project(&org.user_id, &payload.project_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
+    require_project_editor(&org.user_id, &payload.project_id)?;
+
+    if !matches!(
+        payload.variant.as_str(),
+        "mobilenetv4" | "efficientnet_b0" | "resnet50"
+    ) {
+        return Err(ProtocolError::bad_request(
+            "variant must be mobilenetv4|efficientnet_b0|resnet50",
+        ));
+    }
+    if payload.attribute.trim().is_empty() {
+        return Err(ProtocolError::bad_request("attribute nie może być puste"));
+    }
+    if payload.values.len() < 2 {
+        return Err(ProtocolError::bad_request(
+            "klasyfikator wymaga co najmniej 2 wartości atrybutu",
+        ));
+    }
+    // Treść atrybutu i wartości trafia po stronie serwisu do metadanych/ścieżek —
+    // whitelist znaków, bez pustych i `.`/`..`/separatorów ścieżek (path traversal).
+    let is_valid_ml_name = |s: &str| -> bool {
+        let t = s.trim();
+        if t.is_empty() || t == "." || t == ".." {
+            return false;
+        }
+        let n = s.chars().count();
+        n >= 1
+            && n <= 64
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | ' '))
+    };
+    if !is_valid_ml_name(&payload.attribute) {
+        return Err(ProtocolError::bad_request(
+            "attribute zawiera niedozwolone znaki (dozwolone: [A-Za-z0-9_.- ], 1-64 znaki)",
+        ));
+    }
+    for value in &payload.values {
+        if !is_valid_ml_name(value) {
+            return Err(ProtocolError::bad_request(
+                "wartość atrybutu zawiera niedozwolone znaki (dozwolone: [A-Za-z0-9_.- ], 1-64 znaki)",
+            ));
+        }
+    }
+
+    // Mesh-distributed: węzeł docelowy. Pusty/local → trening lokalny.
+    let local_node = ctx.state.local_node_id.to_string();
+    let target_node = {
+        let t = payload.target_node_id.trim();
+        if t.is_empty() || t == local_node {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    };
+
+    let hp = &payload.hyperparams;
+    let config_json = serde_json::json!({
+        "kind": "classifier",
+        "attribute": payload.attribute,
+        "source_class": payload.source_class,
+        "variant": payload.variant,
+        "values": payload.values,
+        "dataset_id": payload.dataset_id,
+        "node_id": target_node.clone().unwrap_or_else(|| local_node.clone()),
+        "hyperparams": {
+            "epochs": hp.epochs,
+            "batch_size": hp.batch_size,
+            "learning_rate": hp.learning_rate,
+            "image_size": hp.image_size,
+            "freeze_backbone": hp.freeze_backbone,
+        },
+    })
+    .to_string();
+
+    let run_id = repository::create_training_run(&payload.project_id, &config_json).map_err(db_err)?;
+
+    let target_was_remote = target_node.is_some();
+    match target_node {
+        None => {
+            // Trening LOKALNY — task w tle.
+            crate::ml_studio::train_classifier::spawn_classifier_training(
+                run_id.clone(),
+                payload.project_id.clone(),
+                org.user_id.clone(),
+                payload.dataset_id.clone(),
+                payload.attribute.clone(),
+                payload.source_class.clone(),
+                payload.variant.clone(),
+                payload.values.clone(),
+                payload.hyperparams.clone(),
+            );
+        }
+        Some(target) => {
+            // Trening ZDALNY (Node B): dataset COCO → mesh (content-addr po hashu),
+            // po zmaterializowaniu start treningu klasyfikatora na B (kind="classifier").
+            let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
+                .map_err(db_err)?
+                .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+            if dataset.kind != "coco_path" {
+                let _ = repository::update_training_run_status(&run_id, "failed");
+                return Err(ProtocolError::bad_request(
+                    "trening zdalny wymaga datasetu COCO przez ścieżkę (coco_path) widoczną na węźle B",
+                ));
+            }
+            let raw = repository::get_dataset_raw(&org.user_id, &payload.dataset_id).map_err(db_err)?;
+            let dataset_dir = String::from_utf8_lossy(&raw).trim().to_string();
+            let dataset_hash = crate::ml_studio::train_recognition::coco_content_hash(
+                std::path::Path::new(&dataset_dir),
+            )
+            .map_err(|e| ProtocolError::bad_request(format!("hash datasetu: {}", e)))?;
+            let spec_json = serde_json::json!({
+                "kind": "classifier",
+                "dataset_dir": format!("mesh:{}", dataset_hash),
+                "dataset_hash": dataset_hash,
+                "attribute": payload.attribute,
+                "source_class": payload.source_class,
+                "values": payload.values,
+                "variant": payload.variant,
+                "output_dir": format!("classifier/{}/{}", payload.project_id, run_id),
+                "hyperparams": {
+                    "epochs": hp.epochs,
+                    "batch_size": hp.batch_size,
+                    "learning_rate": hp.learning_rate,
+                    "image_size": hp.image_size,
+                    "freeze_backbone": hp.freeze_backbone,
+                },
+            })
+            .to_string();
+
+            let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
+                ProtocolError::internal("mesh transport not available on this node")
+            })?;
+            let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
+                let _ = repository::update_training_run_status(&run_id, "failed");
+                ProtocolError::internal("mesh security niedostępny — nie można zweryfikować zaufania peera")
+            })?;
+            if !security.is_trusted(&target) {
+                let _ = repository::update_training_run_status(&run_id, "failed");
+                return Err(ProtocolError::bad_request(format!("peer {} is not trusted", target)));
+            }
+
+            let _ = repository::update_training_run_status(&run_id, "syncing");
+            crate::ml_studio::train_recognition::spawn_mesh_dataset_push_and_train(
+                iroh,
+                target,
+                run_id.clone(),
+                dataset_dir,
+                dataset_hash,
+                spec_json,
+            );
+        }
+    }
+
+    let start_status = if target_was_remote { "syncing" } else { "running" };
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::ClassifierTrainStartResponse(
+        tentaflow_protocol::MlStudioClassifierTrainStartResponse {
+            run_id,
+            status: start_status.to_string(),
+        },
+    )))
+}
+
+#[handler(variant = "MlStudioGenericTrainStatusRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub async fn ml_studio_generic_train_status(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::GenericTrainStatusRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioGenericTrainStatusRequest")),
+    };
+    let org = require_org(ctx)?;
+    let mut run = repository::get_training_run(&payload.run_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "run not found"))?;
+    require_project_member(&org.user_id, &run.project_id)?;
+
+    // Faza transferu datasetu przez mesh (trening zdalny, przed startem na B):
+    // zwróć postęp B/s zamiast odpytywać B. Współdzielony rejestr postępu z recog.
+    if let Some(sp) = crate::ml_studio::train_recognition::recog_sync_progress(&payload.run_id) {
+        match sp.phase.as_str() {
+            "error" => {
+                let _ = repository::update_training_run_status(&payload.run_id, "failed");
+                crate::ml_studio::train_recognition::clear_recog_sync(&payload.run_id);
+                return Ok(MessageBody::MlStudioBody(MlStudioPayload::GenericTrainStatusResponse(
+                    tentaflow_protocol::MlStudioGenericTrainStatusResponse {
+                        run_id: payload.run_id.clone(),
+                        status: "failed".to_string(),
+                        epoch: 0,
+                        total_epochs: generic_total_epochs(&run.config_json),
+                        curve: Vec::new(),
+                        error: sp.error.clone().unwrap_or_default(),
+                        sync_phase: Some("error".to_string()),
+                        sync_bytes_sent: sp.bytes_sent,
+                        sync_bytes_total: sp.bytes_total,
+                        sync_rate_bps: 0,
+                    },
+                )));
+            }
+            "training" => {
+                if run.status != "running" {
+                    let _ = repository::update_training_run_status(&payload.run_id, "running");
+                    run.status = "running".to_string();
+                }
+                crate::ml_studio::train_recognition::clear_recog_sync(&payload.run_id);
+            }
+            _ => {
+                return Ok(MessageBody::MlStudioBody(MlStudioPayload::GenericTrainStatusResponse(
+                    tentaflow_protocol::MlStudioGenericTrainStatusResponse {
+                        run_id: payload.run_id.clone(),
+                        status: "syncing".to_string(),
+                        epoch: 0,
+                        total_epochs: generic_total_epochs(&run.config_json),
+                        curve: Vec::new(),
+                        error: String::new(),
+                        sync_phase: Some(sp.phase.clone()),
+                        sync_bytes_sent: sp.bytes_sent,
+                        sync_bytes_total: sp.bytes_total,
+                        sync_rate_bps: sp.rate_bps,
+                    },
+                )));
+            }
+        }
+    }
+
+    // Run ZDALNY (node_id != local i wciąż running): odpytaj Node B przez mesh,
+    // zapisz metryki w bazie A, domknij run po stronie A po sukcesie/błędzie.
+    let local_node = ctx.state.local_node_id.to_string();
+    let run_node = serde_json::from_str::<serde_json::Value>(&run.config_json)
+        .ok()
+        .and_then(|c| c.get("node_id")?.as_str().map(String::from));
+    if let Some(node) = run_node.filter(|n| *n != local_node) {
+        if run.status == "running" {
+            if let Some(iroh) = ctx.state.quic_mesh.clone() {
+                let cmd = tentaflow_protocol::mesh::MeshCommandType::MlTrainStatus {
+                    run_id: payload.run_id.clone(),
+                };
+                let mut ok = false;
+                if let Ok(resp) = iroh.send_command_and_wait(&node, cmd, 30).await {
+                    if resp.ok {
+                        if let tentaflow_protocol::mesh::MeshCommandResponsePayload::MlTrainStatusResult {
+                            status_json,
+                        } = resp.payload
+                        {
+                            sync_remote_classifier_status(&payload.run_id, &run, &status_json);
+                            if let Ok(Some(updated)) = repository::get_training_run(&payload.run_id) {
+                                run = updated;
+                            }
+                            ok = true;
+                        }
+                    }
+                }
+                if !ok
+                    && crate::ml_studio::train_recognition::note_remote_poll(&payload.run_id, false)
+                {
+                    let _ = repository::set_training_run_error(
+                        &payload.run_id,
+                        "węzeł treningowy nieosiągalny — trening przerwany",
+                    );
+                    let _ = repository::update_training_run_status(&payload.run_id, "failed");
+                    if let Ok(Some(updated)) = repository::get_training_run(&payload.run_id) {
+                        run = updated;
+                    }
+                } else if ok {
+                    crate::ml_studio::train_recognition::note_remote_poll(&payload.run_id, true);
+                }
+            }
+        }
+    }
+
+    let curve_raw = repository::generic_curve_for_run(&payload.run_id).map_err(db_err)?;
+    let curve: Vec<tentaflow_protocol::GenericMetricPoint> = curve_raw
+        .iter()
+        .map(|(epoch, name, value)| tentaflow_protocol::GenericMetricPoint {
+            epoch: (*epoch).max(0) as i32,
+            metric_name: name.clone(),
+            value: *value as f32,
+        })
+        .collect();
+
+    let epoch = curve_raw.iter().map(|(e, _, _)| *e).max().unwrap_or(0).max(0) as i32;
+    let total_epochs = generic_total_epochs(&run.config_json);
+    // Błąd treningu (np. z węzła B) zapisany w config_json.$.error — zwróć go do UI.
+    let run_error = serde_json::from_str::<serde_json::Value>(&run.config_json)
+        .ok()
+        .and_then(|c| c.get("error")?.as_str().map(String::from))
+        .filter(|_| run.status == "failed")
+        .unwrap_or_default();
+
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::GenericTrainStatusResponse(
+        tentaflow_protocol::MlStudioGenericTrainStatusResponse {
+            run_id: payload.run_id.clone(),
+            status: run.status,
+            epoch,
+            total_epochs,
+            curve,
+            error: run_error,
+            sync_phase: None,
+            sync_bytes_sent: 0,
+            sync_bytes_total: 0,
+            sync_rate_bps: 0,
+        },
+    )))
+}
+
+/// Synchronizuje status zdalnego runu klasyfikatora (z Node B) do bazy A: zapisuje
+/// metryki per epoka i po sukcesie rejestruje model (framework="classifier-timm").
+fn sync_remote_classifier_status(
+    run_id: &str,
+    run: &repository::TrainingRunRow,
+    status_json: &str,
+) {
+    let st: serde_json::Value = match serde_json::from_str(status_json) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let status = st.get("status").and_then(|v| v.as_str()).unwrap_or("running");
+    let epoch = st.get("epoch").and_then(|v| v.as_i64()).unwrap_or(0);
+    let train_loss = st.get("train_loss").and_then(|v| v.as_f64());
+    let val_acc = st.get("val_acc").and_then(|v| v.as_f64());
+    let val_macro_f1 = st.get("val_macro_f1").and_then(|v| v.as_f64());
+    if let Some(v) = train_loss {
+        let _ = repository::record_training_metric(run_id, epoch, "train_loss", v);
+    }
+    if let Some(v) = val_acc {
+        let _ = repository::record_training_metric(run_id, epoch, "val_acc", v);
+    }
+    if let Some(v) = val_macro_f1 {
+        let _ = repository::record_training_metric(run_id, epoch, "val_macro_f1", v);
+    }
+
+    match status {
+        "succeeded" => {
+            let cfg: serde_json::Value =
+                serde_json::from_str(&run.config_json).unwrap_or(serde_json::json!({}));
+            let attribute = cfg.get("attribute").and_then(|v| v.as_str()).unwrap_or("");
+            let source_class = cfg.get("source_class").and_then(|v| v.as_str()).unwrap_or("");
+            let variant = cfg.get("variant").and_then(|v| v.as_str()).unwrap_or("mobilenetv4");
+            let values = cfg.get("values").cloned().unwrap_or(serde_json::json!([]));
+            let metrics_json = serde_json::json!({
+                "task": "classifier",
+                "attribute": attribute,
+                "source_class": source_class,
+                "values": values,
+                "val_acc": val_acc,
+                "val_macro_f1": val_macro_f1,
+                "onnx_path": st.get("onnx_path").and_then(|v| v.as_str()).unwrap_or(""),
+                "checkpoint_path": st.get("checkpoint_path").and_then(|v| v.as_str()).unwrap_or(""),
+            })
+            .to_string();
+            let model_name = format!("classifier-{}-{}", attribute, variant);
+            if let Ok(model_id) = repository::insert_model(
+                &run.project_id,
+                &model_name,
+                "classifier-timm",
+                variant,
+                &metrics_json,
+            ) {
+                let _ = repository::set_training_run_model(run_id, &model_id);
+            }
+            let _ = repository::update_training_run_status(run_id, "succeeded");
+        }
+        "failed" => {
+            if let Some(err) = st.get("error").and_then(|v| v.as_str()).filter(|e| !e.is_empty()) {
+                let _ = repository::set_training_run_error(run_id, err);
+            }
+            let _ = repository::update_training_run_status(run_id, "failed");
+        }
+        _ => {}
+    }
+}
+
+/// Odczytuje `hyperparams.epochs` z `config_json` runu (total dla paska postępu
+/// generycznego statusu). 0 gdy nieznane.
+fn generic_total_epochs(config_json: &str) -> i32 {
+    serde_json::from_str::<serde_json::Value>(config_json)
+        .ok()
+        .and_then(|v| v.get("hyperparams")?.get("epochs")?.as_i64())
+        .unwrap_or(0) as i32
+}
+
 /// Wspólny resolver: dataset recognition (coco_path) → katalog na dysku + check
 /// członkostwa w projekcie. Zwraca (dataset_dir, ()).
 fn resolve_recog_dataset_dir(

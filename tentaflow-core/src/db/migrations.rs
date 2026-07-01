@@ -557,7 +557,25 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "model_pricing_table",
             MigrationStep::Sql(MODEL_PRICING_SCHEMA),
         ),
+        (
+            104,
+            "model_metrics_permissions",
+            MigrationStep::Rust(model_metrics_add_permissions),
+        ),
     ]
+}
+
+// v104 — RBAC dla metryk modeli. Admin/DPO dostają odczyt i zapis cennika,
+// operator oraz viewer tylko odczyt. Idempotentne przez `roles_add_permissions`
+// (wzorzec jak `token_metrics_add_permissions`).
+fn model_metrics_add_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(
+        conn,
+        &["org_admin", "dpo"],
+        &["metrics.read", "metrics.write"],
+    )?;
+    roles_add_permissions(conn, &["org_operator", "org_viewer"], &["metrics.read"])?;
+    Ok(())
 }
 
 // v102 — mesh-wide hourly rollup of model performance and usage metrics. Like

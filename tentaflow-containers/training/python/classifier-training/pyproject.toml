@@ -1,0 +1,30 @@
+# =============================================================================
+# Plik: pyproject.toml
+# Opis: Definicja środowiska `uv` dla natywnego serwera treningowego klasyfikatora
+#       obrazu (timm). torch z CUDA 13.0 z indeksu PyTorch (wsparcie Blackwell/B300).
+# =============================================================================
+
+[project]
+name = "tentaflow-classifier-training"
+version = "1.0.0"
+description = "TentaFlow image classifier training server (timm)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch==2.12.1",
+    "torchvision==0.27.1",
+    "timm==1.0.19",
+    "pillow>=10.0.0",
+    "onnx>=1.20.0,<2.0",
+    "onnxruntime>=1.20.0",
+    "fastapi==0.115.5",
+    "uvicorn[standard]==0.32.1",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

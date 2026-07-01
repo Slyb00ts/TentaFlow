@@ -10024,9 +10024,15 @@ pub fn usage_summary(
 //   TTFT [ms]:   [0, 50, 100, 200, 400, 800, 1600, 3200, 6400, ∞]     → 10 buckets
 //   decode_tps:  [0, 10, 20, 40, 80, 160, 320, ∞]                     → 8 buckets
 //   e2e [ms]:    [0, 100, 250, 500, 1000, 2000, 4000, 8000, 16000, ∞] → 10 buckets
-const TTFT_MS_EDGES: [i64; 10] = [0, 50, 100, 200, 400, 800, 1600, 3200, 6400, i64::MAX];
-const DECODE_TPS_EDGES: [f64; 8] = [0.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0, f64::INFINITY];
-const E2E_MS_EDGES: [i64; 10] = [0, 100, 250, 500, 1000, 2000, 4000, 8000, 16000, i64::MAX];
+pub const TTFT_MS_EDGES: [i64; 10] = [0, 50, 100, 200, 400, 800, 1600, 3200, 6400, i64::MAX];
+pub const DECODE_TPS_EDGES: [f64; 8] = [0.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0, f64::INFINITY];
+pub const E2E_MS_EDGES: [i64; 10] = [0, 100, 250, 500, 1000, 2000, 4000, 8000, 16000, i64::MAX];
+
+/// Wersja rozkladu kubelkow histogramow. Bump z ta sama wersja laczy sie w ten
+/// sam wiersz rollupu; agregacja percentyli sumuje kubelki TYLKO z wierszy o tej
+/// wersji (inne krawedzie = niesumowalny rozklad). Zmiana krawedzi TTFT/decode/e2e
+/// wymaga podbicia tej stalej.
+pub const MODEL_METRICS_HISTOGRAM_VERSION: i64 = 1;
 
 /// Bucket index for a value against ascending histogram edges: the number of
 /// edges strictly less than `value`. Edges must be ascending and include the
@@ -10488,6 +10494,32 @@ pub fn get_model_pricing(
         })
         .optional()?;
     Ok(row)
+}
+
+/// Wszystkie wiersze cennika dla organizacji (do listy w GUI).
+pub fn list_model_pricing(
+    pool: &DbPool,
+    org_id: &str,
+) -> Result<Vec<crate::db::models::DbModelPricing>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT model_id, org_id, prompt_per_1k, completion_per_1k, audio_per_min, image_each, \
+         updated_at FROM model_pricing WHERE org_id = ?1 ORDER BY model_id",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![org_id], |r| {
+            Ok(crate::db::models::DbModelPricing {
+                model_id: r.get(0)?,
+                org_id: r.get(1)?,
+                prompt_per_1k: r.get(2)?,
+                completion_per_1k: r.get(3)?,
+                audio_per_min: r.get(4)?,
+                image_each: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 // --- Fast Path Patterns ---
@@ -11273,6 +11305,21 @@ pub fn get_user_groups(pool: &DbPool, user_id: &str) -> Result<Vec<UserGroup>> {
                 created_at: row.get(3)?,
             })
         })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Mapa przynależności `user_id -> nazwa grupy` dla agregacji metryk po grupach.
+/// Użytkownik w wielu grupach pojawia się w wielu parach; użytkownik bez grupy
+/// nie występuje w wyniku (caller decyduje o placeholderze).
+pub fn list_group_memberships(pool: &DbPool) -> Result<Vec<(String, String)>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT gm.user_id, g.name \
+         FROM group_members gm JOIN user_groups g ON g.id = gm.group_id",
+    )?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }

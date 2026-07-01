@@ -2591,11 +2591,39 @@ const RECOG_HP = [
   { key: 'resolution', label: 'rozdzielczość', def: 576, step: '32', min: 224 },
 ];
 
+// Warianty backbone'u klasyfikatora atrybutu (timm). Kolejność = od najlżejszego
+// do najlepszej jakości; opisy trzymają się konwencji kart RF-DETR.
+const CLF_VARIANTS = [
+  { id: 'mobilenetv4', name: 'MobileNetV4', desc: 'Lekki — najszybszy, najmniejszy model.' },
+  { id: 'efficientnet_b0', name: 'EfficientNet-B0', desc: 'Kompromis szybkość/jakość.' },
+  { id: 'resnet50', name: 'ResNet-50', desc: 'Najlepsza jakość, większy koszt.' },
+];
+
+// Hiperparametry klasyfikatora (osobny zestaw niż detekcja). freezeBackbone jest
+// przełącznikiem bool i trzymany jest poza tą listą (renderowany jako tf-toggle).
+const CLF_HP = [
+  { key: 'epochs', label: 'epoki', def: 40, step: '1', min: 1 },
+  { key: 'batchSize', label: 'batch size', def: 32, step: '1', min: 1 },
+  { key: 'learningRate', label: 'learning rate', def: 0.0003, step: '0.0001', min: 0 },
+  { key: 'imageSize', label: 'rozmiar obrazu', def: 224, step: '32', min: 96 },
+];
+
 const recogCfg = {};
+function defaultClfHyperparams() {
+  const hp = {};
+  for (const h of CLF_HP) hp[h.key] = h.def;
+  hp.freezeBackbone = false;
+  return hp;
+}
 function defaultRecogCfg() {
   const hyperparams = {};
   for (const h of RECOG_HP) hyperparams[h.key] = h.def;
-  return { datasetId: '', variant: 'base', targetNodeId: '', earlyStopping: true, hyperparams };
+  return {
+    datasetId: '', target: 'detection', variant: 'base',
+    attribute: '', sourceClass: '', clfVariant: 'mobilenetv4',
+    clfHyperparams: defaultClfHyperparams(),
+    targetNodeId: '', earlyStopping: true, hyperparams,
+  };
 }
 function getRecogCfg(pid) {
   if (!recogCfg[pid]) recogCfg[pid] = defaultRecogCfg();
@@ -3530,6 +3558,45 @@ const RECOG_ATTR_TYPES = [
   { id: 'classifier', label: 'Klasyfikator', icon: 'model', desc: 'osobny model' },
 ];
 
+// Wyprowadza z schematu projektu listę CELÓW treningu — w jednym projekcie może
+// powstać wiele modeli. Zawsze zwraca detekcję, a dodatkowo po jednym celu na
+// każdy atrybut nadający się do osobnego modelu:
+//   - klasyfikator: atrybut typu `list` lub `classifier` o ≥2 wartościach,
+//   - OCR: atrybut typu `ocr` (faza 2 — w UI element może być disabled).
+// Atrybut o tej samej nazwie może wystąpić w wielu klasach — agregujemy jego
+// klasy źródłowe (cropy trenujemy z ramek tych klas) i sumę wartości.
+// `cocoCategories` (opcjonalne) zawęża klasy źródłowe do realnie istniejących
+// kategorii datasetu; gdy puste — bierzemy wszystkie klasy schematu.
+function deriveTrainTargets(schema, cocoCategories) {
+  const targets = [{ task: 'detection' }];
+  const classes = (schema && Array.isArray(schema.classes)) ? schema.classes : [];
+  const cocoNames = Array.isArray(cocoCategories)
+    ? new Set(cocoCategories.map((c) => (typeof c === 'string' ? c : c && c.name)).filter(Boolean))
+    : null;
+  const byAttr = new Map();
+  for (const c of classes) {
+    const attrs = Array.isArray(c.attributes) ? c.attributes : [];
+    for (const a of attrs) {
+      if (!a || !a.name || !a.type) continue;
+      let entry = byAttr.get(a.name);
+      if (!entry) { entry = { name: a.name, type: a.type, values: [], sourceClasses: new Set() }; byAttr.set(a.name, entry); }
+      if (!cocoNames || cocoNames.has(c.name)) entry.sourceClasses.add(c.name);
+      const vals = a.type === 'list' ? (a.list?.values || [])
+        : a.type === 'classifier' ? (a.classifier?.values || []) : [];
+      for (const v of vals) if (!entry.values.includes(v)) entry.values.push(v);
+    }
+  }
+  for (const entry of byAttr.values()) {
+    const sourceClasses = [...entry.sourceClasses];
+    if ((entry.type === 'list' || entry.type === 'classifier') && entry.values.length >= 2) {
+      targets.push({ task: 'classifier', attribute: entry.name, sourceClasses, values: entry.values });
+    } else if (entry.type === 'ocr') {
+      targets.push({ task: 'ocr', attribute: entry.name, sourceClasses });
+    }
+  }
+  return targets;
+}
+
 // Kształt ramki klasy → ikona (segmented control + ikona przy wierszu klasy).
 const RECOG_SHAPES = [
   { id: 'box', label: 'Box', icon: 'grid-2x2' },
@@ -4160,34 +4227,37 @@ function renderRecogSchemaTab(panel, p, { selectTab }) {
   })();
 }
 
-// Zakładka "Trening" dla recognition: wybór datasetu + wariantu + hiperparametry
-// + start treningu. Po starcie przechodzi w widok LIVE (startRecogLive).
+// Etykiety celu treningu w segmented control (kolejność jak w deriveTrainTargets).
+const TRAIN_TARGET_LABELS = {
+  detection: 'Detekcja',
+  classifier: 'Klasyfikator',
+  ocr: 'OCR',
+};
+
+// Zakładka "Trening" dla recognition: wybór CELU (detekcja / klasyfikator / OCR)
+// wyprowadzonego ze schematu projektu, potem wybór datasetu + wariantu +
+// hiperparametry + start treningu. Po starcie przechodzi w widok LIVE.
 function renderRecogTrainTab(panel, p, { selectTab }) {
   const pid = projectId(p);
   const cfg = getRecogCfg(pid);
-  const variantCards = RECOG_VARIANTS.map((v) => `
-    <button type="button" class="ml-studio-ft-axis-card${cfg.variant === v.id ? ' selected' : ''}"
-            data-variant="${escapeAttr(v.id)}" aria-pressed="${cfg.variant === v.id}">
-      <div class="ml-studio-ft-axis-name">${escapeHtml(v.name)}</div>
-      <p class="ml-studio-ft-axis-desc">${escapeHtml(v.desc)}</p>
-    </button>`).join('');
-  const hpInputs = RECOG_HP.map((h) => `
-    <div class="ml-studio-ft-hp-field">
-      <tf-input type="number" label="${escapeAttr(h.label)}" id="ml-studio-recog-hp-${escapeAttr(h.key)}"
-                value="${escapeAttr(String(cfg.hyperparams[h.key]))}" min="${escapeAttr(String(h.min))}" step="${escapeAttr(h.step)}"></tf-input>
-    </div>`).join('');
+  // Cele wyprowadzone ze schematu; wypełniane asynchronicznie. Do czasu wczytania
+  // dostępna jest tylko detekcja (zawsze obecna).
+  let trainTargets = [{ task: 'detection' }];
+  let datasetList = [];
 
   panel.innerHTML = `
     <div class="ml-studio-ft">
       <div id="ml-studio-recog-setup">
         <section class="ml-studio-data-card">
+          <div class="ml-studio-data-head">${sprite('model')} Cel treningu
+            <span class="ml-studio-data-hint">wybierz co trenujesz — w jednym projekcie może powstać wiele modeli</span>
+          </div>
+          <div class="ml-studio-target-seg" id="ml-studio-train-target" role="tablist"></div>
+        </section>
+        <section class="ml-studio-data-card">
           <div class="ml-studio-data-head">${sprite('database')} Zbiór treningowy (COCO)</div>
           <tf-select id="ml-studio-recog-dataset" label="Dataset" placeholder="wybierz zarejestrowany dataset COCO"></tf-select>
           <div id="ml-studio-recog-classes" class="ml-studio-data-origin-text" style="margin-top:8px"></div>
-        </section>
-        <section class="ml-studio-data-card">
-          <div class="ml-studio-data-head">${sprite('image')} Wariant modelu RF-DETR</div>
-          <div class="ml-studio-ft-axis-grid" id="ml-studio-recog-variants">${variantCards}</div>
         </section>
         <section class="ml-studio-data-card">
           <div class="ml-studio-data-head">${sprite('services')} Węzeł treningu (mesh)
@@ -4195,10 +4265,7 @@ function renderRecogTrainTab(panel, p, { selectTab }) {
           </div>
           <tf-select id="ml-studio-recog-node" label="Węzeł"></tf-select>
         </section>
-        <section class="ml-studio-data-card">
-          <div class="ml-studio-data-head">${sprite('tune')} Hiperparametry</div>
-          <div class="ml-studio-ft-hp-grid">${hpInputs}</div>
-        </section>
+        <div id="ml-studio-train-form"></div>
         <div class="ml-studio-ft-actions">
           <tf-button variant="primary" icon="play" id="ml-studio-recog-run">Uruchom trening</tf-button>
         </div>
@@ -4207,11 +4274,211 @@ function renderRecogTrainTab(panel, p, { selectTab }) {
     </div>
   `;
 
+  // Segmented control celu: detekcja zawsze aktywna, klasyfikator aktywny gdy
+  // schemat ma nadający się atrybut, OCR na razie disabled (faza 2).
+  function renderTargetSeg() {
+    const host = byId('ml-studio-train-target');
+    if (!host) return;
+    const hasClassifier = trainTargets.some((t) => t.task === 'classifier');
+    const avail = { detection: true, classifier: hasClassifier, ocr: false };
+    host.innerHTML = ['detection', 'classifier', 'ocr'].map((task) => {
+      const on = cfg.target === task;
+      const dis = !avail[task];
+      const suffix = task === 'ocr' ? ' (wkrótce)' : '';
+      return `<button type="button" role="tab" data-target="${task}"
+        class="ml-studio-target-seg-btn${on ? ' selected' : ''}"
+        aria-selected="${on}"${dis ? ' disabled' : ''}>${escapeHtml(TRAIN_TARGET_LABELS[task])}${suffix}</button>`;
+    }).join('');
+    host.querySelectorAll('.ml-studio-target-seg-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        if (btn.hasAttribute('disabled')) return;
+        const task = btn.getAttribute('data-target');
+        if (task === cfg.target) return;
+        cfg.target = task;
+        renderTargetSeg();
+        renderTargetForm();
+      });
+    });
+  }
+
+  // Dynamiczny formularz zależny od celu. detection → dotychczasowe karty RF-DETR;
+  // classifier → atrybut + klasa źródłowa + podgląd etykiet + warianty timm + HP.
+  function renderTargetForm() {
+    const host = byId('ml-studio-train-form');
+    if (!host) return;
+    if (cfg.target === 'classifier') {
+      host.innerHTML = classifierFormHtml();
+      bindClassifierForm();
+    } else {
+      host.innerHTML = detectionFormHtml();
+      bindDetectionForm();
+    }
+  }
+
+  function detectionFormHtml() {
+    const variantCards = RECOG_VARIANTS.map((v) => `
+      <button type="button" class="ml-studio-ft-axis-card${cfg.variant === v.id ? ' selected' : ''}"
+              data-variant="${escapeAttr(v.id)}" aria-pressed="${cfg.variant === v.id}">
+        <div class="ml-studio-ft-axis-name">${escapeHtml(v.name)}</div>
+        <p class="ml-studio-ft-axis-desc">${escapeHtml(v.desc)}</p>
+      </button>`).join('');
+    const hpInputs = RECOG_HP.map((h) => `
+      <div class="ml-studio-ft-hp-field">
+        <tf-input type="number" label="${escapeAttr(h.label)}" id="ml-studio-recog-hp-${escapeAttr(h.key)}"
+                  value="${escapeAttr(String(cfg.hyperparams[h.key]))}" min="${escapeAttr(String(h.min))}" step="${escapeAttr(h.step)}"></tf-input>
+      </div>`).join('');
+    return `
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('image')} Wariant modelu RF-DETR</div>
+        <div class="ml-studio-ft-axis-grid" id="ml-studio-recog-variants">${variantCards}</div>
+      </section>
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('tune')} Hiperparametry</div>
+        <div class="ml-studio-ft-hp-grid">${hpInputs}</div>
+      </section>`;
+  }
+
+  function bindDetectionForm() {
+    byId('ml-studio-recog-variants')?.querySelectorAll('.ml-studio-ft-axis-card').forEach((card) => {
+      card.addEventListener('click', () => {
+        cfg.variant = card.getAttribute('data-variant');
+        panel.querySelectorAll('#ml-studio-recog-variants .ml-studio-ft-axis-card').forEach((c) => {
+          const on = c === card;
+          c.classList.toggle('selected', on);
+          c.setAttribute('aria-pressed', String(on));
+        });
+      });
+    });
+    for (const h of RECOG_HP) {
+      byId('ml-studio-recog-hp-' + h.key)?.addEventListener('input', (e) => {
+        const v = Number(e.target.value);
+        if (Number.isFinite(v)) cfg.hyperparams[h.key] = v;
+      });
+    }
+  }
+
+  function classifierFormHtml() {
+    const variantCards = CLF_VARIANTS.map((v) => `
+      <button type="button" class="ml-studio-ft-axis-card${cfg.clfVariant === v.id ? ' selected' : ''}"
+              data-variant="${escapeAttr(v.id)}" aria-pressed="${cfg.clfVariant === v.id}">
+        <div class="ml-studio-ft-axis-name">${escapeHtml(v.name)}</div>
+        <p class="ml-studio-ft-axis-desc">${escapeHtml(v.desc)}</p>
+      </button>`).join('');
+    const hpInputs = CLF_HP.map((h) => `
+      <div class="ml-studio-ft-hp-field">
+        <tf-input type="number" label="${escapeAttr(h.label)}" id="ml-studio-clf-hp-${escapeAttr(h.key)}"
+                  value="${escapeAttr(String(cfg.clfHyperparams[h.key]))}" min="${escapeAttr(String(h.min))}" step="${escapeAttr(h.step)}"></tf-input>
+      </div>`).join('');
+    return `
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('model')} Atrybut do klasyfikacji</div>
+        <tf-select id="ml-studio-train-attr" label="Atrybut"></tf-select>
+        <tf-select id="ml-studio-train-source-class" label="Klasa źródłowa cropów" style="margin-top:8px"></tf-select>
+        <div id="ml-studio-train-labels" class="ml-studio-data-origin-text" style="margin-top:8px"></div>
+      </section>
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('image')} Wariant klasyfikatora</div>
+        <div class="ml-studio-ft-axis-grid" id="ml-studio-clf-variants">${variantCards}</div>
+      </section>
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('tune')} Hiperparametry</div>
+        <div class="ml-studio-ft-hp-grid">${hpInputs}</div>
+        <div class="ml-studio-schema-toggle-row" style="margin-top:10px">
+          <tf-toggle id="ml-studio-clf-freeze"${cfg.clfHyperparams.freezeBackbone ? ' checked' : ''}></tf-toggle>
+          <span><strong>Zamroź backbone</strong> — trenuje tylko głowicę klasyfikatora (szybciej, mniej danych)</span>
+        </div>
+      </section>`;
+  }
+
+  function clfTargets() {
+    return trainTargets.filter((t) => t.task === 'classifier');
+  }
+
+  function bindClassifierForm() {
+    const attrs = clfTargets();
+    if (!attrs.length) return;
+    // Utrzymaj wybór atrybutu w granicach dostępnych celów.
+    let current = attrs.find((t) => t.attribute === cfg.attribute) || attrs[0];
+    cfg.attribute = current.attribute;
+
+    const attrSel = byId('ml-studio-train-attr');
+    const attrOpts = attrs.map((t) => ({ value: t.attribute, label: t.attribute }));
+    if (attrSel?.setOptions) attrSel.setOptions(attrOpts, cfg.attribute);
+    else if (attrSel) attrSel.innerHTML = attrOpts.map((o) => `<option value="${escapeAttr(o.value)}"${o.value === cfg.attribute ? ' selected' : ''}>${escapeHtml(o.label)}</option>`).join('');
+
+    const syncSourceAndLabels = () => {
+      current = attrs.find((t) => t.attribute === cfg.attribute) || attrs[0];
+      const srcSel = byId('ml-studio-train-source-class');
+      const srcOpts = (current.sourceClasses || []).map((c) => ({ value: c, label: c }));
+      if (!srcOpts.some((o) => o.value === cfg.sourceClass)) cfg.sourceClass = srcOpts.length ? srcOpts[0].value : '';
+      if (srcSel?.setOptions) srcSel.setOptions(srcOpts, cfg.sourceClass);
+      else if (srcSel) srcSel.innerHTML = srcOpts.map((o) => `<option value="${escapeAttr(o.value)}"${o.value === cfg.sourceClass ? ' selected' : ''}>${escapeHtml(o.label)}</option>`).join('');
+      renderClfLabels(current);
+    };
+
+    attrSel?.addEventListener('change', (e) => {
+      cfg.attribute = e.detail?.value || attrSel.value || '';
+      syncSourceAndLabels();
+    });
+    byId('ml-studio-train-source-class')?.addEventListener('change', (e) => {
+      cfg.sourceClass = e.detail?.value || byId('ml-studio-train-source-class').value || '';
+    });
+    syncSourceAndLabels();
+
+    byId('ml-studio-clf-variants')?.querySelectorAll('.ml-studio-ft-axis-card').forEach((card) => {
+      card.addEventListener('click', () => {
+        cfg.clfVariant = card.getAttribute('data-variant');
+        panel.querySelectorAll('#ml-studio-clf-variants .ml-studio-ft-axis-card').forEach((c) => {
+          const on = c === card;
+          c.classList.toggle('selected', on);
+          c.setAttribute('aria-pressed', String(on));
+        });
+      });
+    });
+    for (const h of CLF_HP) {
+      byId('ml-studio-clf-hp-' + h.key)?.addEventListener('input', (e) => {
+        const v = Number(e.target.value);
+        if (Number.isFinite(v)) cfg.clfHyperparams[h.key] = v;
+      });
+    }
+    byId('ml-studio-clf-freeze')?.addEventListener('change', (e) => {
+      cfg.clfHyperparams.freezeBackbone = !!e.detail?.checked;
+    });
+  }
+
+  // Podgląd etykiet klasyfikatora: liczba klas + wartości; jeśli profil datasetu
+  // zawiera liczności per wartość — dokładamy je w nawiasie.
+  function renderClfLabels(target) {
+    const box = byId('ml-studio-train-labels');
+    if (!box || !target) return;
+    const values = target.values || [];
+    const counts = attrCountsFromProfile(cfg.datasetId, target.attribute);
+    const parts = values.map((v) => {
+      const n = counts ? counts[v] : null;
+      return n != null ? `${escapeHtml(v)} (${n})` : escapeHtml(v);
+    });
+    box.innerHTML = values.length
+      ? `${sprite('info')} ${values.length} klas: ${parts.join(' / ')}`
+      : '';
+  }
+
+  // Liczności wartości atrybutu z profilu datasetu (gdy backend je udostępnia w
+  // profileJson jako attributes[nazwa] = { wartość: liczba }). Brak → null.
+  function attrCountsFromProfile(dsId, attribute) {
+    const d = datasetList.find((x) => (x.datasetId ?? x.dataset_id) === dsId);
+    if (!d) return null;
+    let prof = d.profileJson ?? d.profile_json;
+    try { prof = typeof prof === 'string' ? JSON.parse(prof) : prof; } catch (_) { return null; }
+    const c = prof && prof.attributes && prof.attributes[attribute];
+    return c && typeof c === 'object' ? c : null;
+  }
+
   // Lista datasetów COCO do selecta.
   (async () => {
     try {
       const resp = await ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid });
       const list = (resp.datasets || []).filter((d) => (d.kind || '') === 'coco_path' || (d.kind || '') === 'coco');
+      datasetList = list;
       const sel = byId('ml-studio-recog-dataset');
       if (sel) {
         sel.innerHTML = list.map((d) => `<option value="${escapeAttr(d.datasetId ?? d.dataset_id)}">${escapeHtml(d.name)} (${d.rowCount ?? d.row_count ?? 0} obr.)</option>`).join('');
@@ -4224,6 +4491,7 @@ function renderRecogTrainTab(panel, p, { selectTab }) {
       sel?.addEventListener('change', (e) => {
         cfg.datasetId = e.detail?.value || sel.value;
         showRecogClasses(list, cfg.datasetId);
+        if (cfg.target === 'classifier') renderClfLabels(clfTargets().find((t) => t.attribute === cfg.attribute));
       });
     } catch (_) { /* brak datasetów — select pusty */ }
   })();
@@ -4258,47 +4526,83 @@ function renderRecogTrainTab(panel, p, { selectTab }) {
     nodeSel.addEventListener('change', (e) => { cfg.targetNodeId = e.detail?.value || nodeSel.value || ''; });
   })();
 
-  byId('ml-studio-recog-variants')?.querySelectorAll('.ml-studio-ft-axis-card').forEach((card) => {
-    card.addEventListener('click', () => {
-      cfg.variant = card.getAttribute('data-variant');
-      panel.querySelectorAll('#ml-studio-recog-variants .ml-studio-ft-axis-card').forEach((c) => {
-        const on = c === card;
-        c.classList.toggle('selected', on);
-        c.setAttribute('aria-pressed', String(on));
-      });
-    });
-  });
-  for (const h of RECOG_HP) {
-    byId('ml-studio-recog-hp-' + h.key)?.addEventListener('input', (e) => {
-      const v = Number(e.target.value);
-      if (Number.isFinite(v)) cfg.hyperparams[h.key] = v;
-    });
-  }
+  // Wyprowadź cele ze schematu projektu + kategorii COCO datasetu.
+  (async () => {
+    let schema = {};
+    let cocoCategories = [];
+    try {
+      const resp = await ApiBinary.one('mlStudioSchemaGetRequest', { projectId: pid });
+      schema = JSON.parse(resp.schemaJson ?? resp.schema_json ?? '{}');
+    } catch (_) { schema = {}; }
+    try {
+      const dsResp = await ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid });
+      const first = (dsResp.datasets || []).find((d) => (d.kind || '') === 'coco_path');
+      if (first) {
+        const imgResp = await ApiBinary.one('mlStudioRecogImagesListRequest', { datasetId: first.datasetId ?? first.dataset_id });
+        cocoCategories = JSON.parse(imgResp.categoriesJson ?? imgResp.categories_json ?? '[]');
+      }
+    } catch (_) { cocoCategories = []; }
+    trainTargets = deriveTrainTargets(schema, cocoCategories);
+    // Jeśli zapamiętany cel nie ma już pokrycia, wróć do detekcji.
+    if (cfg.target === 'classifier' && !trainTargets.some((t) => t.task === 'classifier')) cfg.target = 'detection';
+    renderTargetSeg();
+    renderTargetForm();
+  })();
+
+  // Wstępny render (do wczytania schematu — tylko detekcja).
+  renderTargetSeg();
+  renderTargetForm();
 
   byId('ml-studio-recog-run')?.addEventListener('click', async () => {
     if (!cfg.datasetId) { toast('Wybierz zarejestrowany dataset COCO.', 'error'); return; }
     const btn = byId('ml-studio-recog-run');
     btn?.setAttribute('disabled', '');
     try {
-      const resp = await ApiBinary.one('mlStudioRecogTrainStartRequest', {
-        projectId: pid,
-        datasetId: cfg.datasetId,
-        variant: cfg.variant,
-        targetNodeId: cfg.targetNodeId || '',
-        hyperparams: {
-          epochs: cfg.hyperparams.epochs,
-          batchSize: cfg.hyperparams.batchSize,
-          gradAccum: cfg.hyperparams.gradAccum,
-          learningRate: cfg.hyperparams.learningRate,
-          resolution: cfg.hyperparams.resolution,
-          earlyStopping: cfg.earlyStopping,
-        },
-      });
-      const runId = resp.runId ?? resp.run_id;
+      let runId;
+      let liveOpts = { selectTab };
+      if (cfg.target === 'classifier') {
+        const target = clfTargets().find((t) => t.attribute === cfg.attribute);
+        if (!target) throw new Error('Wybierz atrybut do klasyfikacji.');
+        if (!cfg.sourceClass) throw new Error('Wybierz klasę źródłową cropów.');
+        const resp = await ApiBinary.one('mlStudioClassifierTrainStartRequest', {
+          projectId: pid,
+          datasetId: cfg.datasetId,
+          attribute: cfg.attribute,
+          sourceClass: cfg.sourceClass,
+          variant: cfg.clfVariant,
+          values: target.values || [],
+          hyperparams: {
+            epochs: cfg.clfHyperparams.epochs,
+            batchSize: cfg.clfHyperparams.batchSize,
+            learningRate: cfg.clfHyperparams.learningRate,
+            imageSize: cfg.clfHyperparams.imageSize,
+            freezeBackbone: cfg.clfHyperparams.freezeBackbone,
+          },
+          targetNodeId: cfg.targetNodeId || '',
+        });
+        runId = resp.runId ?? resp.run_id;
+        liveOpts = { selectTab, metricLabel: 'macro-F1', statusRequest: 'mlStudioGenericTrainStatusRequest' };
+      } else {
+        const resp = await ApiBinary.one('mlStudioRecogTrainStartRequest', {
+          projectId: pid,
+          datasetId: cfg.datasetId,
+          variant: cfg.variant,
+          targetNodeId: cfg.targetNodeId || '',
+          hyperparams: {
+            epochs: cfg.hyperparams.epochs,
+            batchSize: cfg.hyperparams.batchSize,
+            gradAccum: cfg.hyperparams.gradAccum,
+            learningRate: cfg.hyperparams.learningRate,
+            resolution: cfg.hyperparams.resolution,
+            earlyStopping: cfg.earlyStopping,
+          },
+        });
+        runId = resp.runId ?? resp.run_id;
+      }
       if (!runId) throw new Error('Backend nie zwrócił runId.');
       const setup = byId('ml-studio-recog-setup');
       if (setup) setup.hidden = true;
-      startRecogLive(byId('ml-studio-recog-live'), runId, { selectTab });
+      startRecogLive(byId('ml-studio-recog-live'), runId, liveOpts);
     } catch (err) {
       btn?.removeAttribute('disabled');
       toast(`Start treningu: ${err.message}`, 'error');
@@ -4346,12 +4650,16 @@ function fmtRate(bps) {
   return r > 0 ? `${fmtBytes(r)}/s` : '—';
 }
 
-function startRecogLive(host, runId, { selectTab }) {
+function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', statusRequest = 'mlStudioRecogTrainStatusRequest' } = {}) {
   if (!host) return;
   stopFtPolling();
+  // Klasyfikator raportuje przez generyczny status (curve:[{epoch,metricName,value}])
+  // i inną metrykę główną (macro-F1); detekcja zostaje przy mAP@50 + train loss.
+  const isGeneric = statusRequest !== 'mlStudioRecogTrainStatusRequest';
+  const headTitle = isGeneric ? 'Trening klasyfikatora na żywo' : 'Trening detekcji na żywo';
   host.innerHTML = `
     <section class="ml-studio-data-card ml-studio-ft-live">
-      <div class="ml-studio-data-head">${sprite('cpu')} Trening detekcji na żywo
+      <div class="ml-studio-data-head">${sprite('cpu')} ${escapeHtml(headTitle)}
         <span class="ml-studio-ft-status" id="ml-studio-recog-badge"><tf-badge tone="warning" value="trening trwa"></tf-badge></span>
       </div>
       <div class="ml-studio-ft-progress">
@@ -4361,10 +4669,10 @@ function startRecogLive(host, runId, { selectTab }) {
       <div class="ml-studio-ft-kpi-grid" id="ml-studio-recog-kpi"></div>
       <div class="ml-studio-ft-chart-wrap">
         <div class="ml-studio-ft-chart-head">
-          <span class="ml-studio-ft-chart-title">Krzywa: train loss + mAP@50</span>
+          <span class="ml-studio-ft-chart-title">Krzywa: train loss + ${escapeHtml(metricLabel)}</span>
           <span class="ml-studio-ft-chart-legend">
             <span class="lg"><span class="sw train"></span>train loss</span>
-            <span class="lg"><span class="sw eval"></span>mAP@50</span>
+            <span class="lg"><span class="sw eval"></span>${escapeHtml(metricLabel)}</span>
           </span>
         </div>
         <div id="ml-studio-recog-chart"></div>
@@ -4410,9 +4718,33 @@ function startRecogLive(host, runId, { selectTab }) {
     }
     const epoch = Number(st.epoch ?? 0);
     const total = Number(st.totalEpochs ?? st.total_epochs ?? 0);
-    const loss = st.trainLoss ?? st.train_loss;
-    const map50 = st.map50;
-    const curve = Array.isArray(st.curve) ? st.curve : [];
+    // Znormalizuj krzywą do wspólnego kształtu {epoch, loss, metric}. Detekcja ma
+    // pola per-punkt (trainLoss/map50); generyczny status ma [{epoch,metricName,value}]
+    // — punkty z metricName zawierającym „loss" idą na oś strat, reszta na metrykę.
+    const rawCurve = Array.isArray(st.curve) ? st.curve : [];
+    let curve;
+    let loss;
+    let metricVal;
+    if (isGeneric) {
+      const byEpoch = new Map();
+      for (const c of rawCurve) {
+        const e = Number(c.epoch ?? 0);
+        if (!byEpoch.has(e)) byEpoch.set(e, { epoch: e, trainLoss: undefined, map50: undefined });
+        const slot = byEpoch.get(e);
+        const name = String(c.metricName ?? c.metric_name ?? '').toLowerCase();
+        const val = Number(c.value);
+        if (name.includes('loss')) slot.trainLoss = val;
+        else slot.map50 = val;
+      }
+      curve = [...byEpoch.values()].sort((a, b) => a.epoch - b.epoch);
+      const last = curve[curve.length - 1];
+      loss = last?.trainLoss;
+      metricVal = last?.map50;
+    } else {
+      curve = rawCurve;
+      loss = st.trainLoss ?? st.train_loss;
+      metricVal = st.map50;
+    }
     const meta = byId('ml-studio-recog-meta');
     const bar = byId('ml-studio-recog-bar');
     if (total > 0) {
@@ -4426,7 +4758,7 @@ function startRecogLive(host, runId, { selectTab }) {
     if (kpi) {
       kpi.innerHTML = `
         <div class="ml-studio-ft-kpi"><div class="lbl">train loss</div><div class="val">${loss != null ? Number(loss).toFixed(4) : '—'}</div></div>
-        <div class="ml-studio-ft-kpi"><div class="lbl">mAP@50</div><div class="val">${map50 != null ? Number(map50).toFixed(4) : '—'}</div></div>
+        <div class="ml-studio-ft-kpi"><div class="lbl">${escapeHtml(metricLabel)}</div><div class="val">${metricVal != null ? Number(metricVal).toFixed(4) : '—'}</div></div>
         <div class="ml-studio-ft-kpi"><div class="lbl">epoka</div><div class="val">${epoch}${total > 0 ? ' / ' + total : ''}</div></div>
       `;
     }
@@ -4447,7 +4779,7 @@ function startRecogLive(host, runId, { selectTab }) {
           <tf-button variant="outline" icon="layers" id="ml-studio-recog-goto-models">Przejdź do Modele</tf-button>`;
         byId('ml-studio-recog-goto-models')?.addEventListener('click', () => selectTab && selectTab('Modele'));
       }
-      toast('Trening detekcji zakończony.', 'success');
+      toast(isGeneric ? 'Trening klasyfikatora zakończony.' : 'Trening detekcji zakończony.', 'success');
     } else if (status === 'failed') {
       stopFtPolling();
       toast(`Trening nieudany: ${st.error || 'nieznany błąd'}`, 'error');
@@ -4458,7 +4790,7 @@ function startRecogLive(host, runId, { selectTab }) {
 
   const poll = async () => {
     try {
-      const st = await ApiBinary.one('mlStudioRecogTrainStatusRequest', { runId });
+      const st = await ApiBinary.one(statusRequest, { runId });
       renderStatus(st);
     } catch (err) {
       stopFtPolling();
@@ -4539,6 +4871,18 @@ function modelMetricsSummary(metricsJson) {
   return parts.join(' · ');
 }
 
+// Etykieta silnika modelu (kolumna „Silnik" w tabeli Modele). Nieznany silnik
+// pokazujemy surowo, żeby nie ukrywać nowych typów backendu.
+const FRAMEWORK_LABELS = {
+  rfdetr: 'Detekcja RF-DETR',
+  'classifier-timm': 'Klasyfikator atrybutu',
+  'ocr-paddle': 'OCR',
+};
+function frameworkLabel(fw) {
+  const f = String(fw ?? '');
+  return FRAMEWORK_LABELS[f] || (f || '—');
+}
+
 function renderModelsTab(panel, p) {
   const pid = projectId(p);
   panel.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
@@ -4589,9 +4933,10 @@ function renderModelsTab(panel, p) {
           deployed = Boolean(mj.inference_model_name);
           exported = mj.export_status === 'succeeded' && Boolean(mj.gguf_path);
         } catch (_) { deployed = false; exported = false; }
+        const framework = String(m.framework ?? '');
         return {
           model: modelName,
-          framework: String(m.framework ?? '—') || '—',
+          framework: frameworkLabel(framework),
           baseModel: baseModel || '—',
           status: `<tf-badge tone="${b.tone}" value="${escapeAttr(b.label)}"></tf-badge>`,
           metrics: metrics || '—',
@@ -4600,9 +4945,10 @@ function renderModelsTab(panel, p) {
           _modelId: modelId,
           _modelName: modelName,
           // Model detekcji (RF-DETR) → akcja „Wykryj"; model FT (adapter, niepuste
-          // baseModel) → „Eksportuj GGUF"; wdrożony FT → też „Zapytaj".
-          _isRecog: String(m.framework ?? '') === 'rfdetr',
-          _canExport: Boolean(modelId && baseModel.trim().length > 0 && String(m.framework ?? '') !== 'rfdetr'),
+          // baseModel) → „Eksportuj GGUF"; klasyfikator timm → eksport ONNX;
+          // wdrożony FT → też „Zapytaj".
+          _isRecog: framework === 'rfdetr',
+          _canExport: Boolean(modelId && framework !== 'rfdetr' && (baseModel.trim().length > 0 || framework === 'classifier-timm')),
           _canChat: Boolean(modelId && deployed),
           _canDeploy: Boolean(modelId && exported && !deployed && String(m.framework ?? '') !== 'rfdetr'),
         };

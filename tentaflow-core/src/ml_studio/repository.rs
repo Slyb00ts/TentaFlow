@@ -758,6 +758,30 @@ pub fn recog_curve_for_run(run_id: &str) -> Result<Vec<(i64, Option<f64>, Option
     Ok(curve)
 }
 
+/// Generyczna krzywa treningu: wszystkie metryki runu jako
+/// `(step, metric_key, metric_value)` posortowane rosnąco po kroku. Używane przez
+/// status klasyfikatora atrybutu (metryki train_loss/val_acc/val_macro_f1) i inne
+/// tory generyczne, gdzie zestaw metryk nie jest sztywno ustalony.
+pub fn generic_curve_for_run(run_id: &str) -> Result<Vec<(i64, String, f64)>> {
+    let pool = super::db::pool()?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT step, metric_key, metric_value FROM metrics_history \
+         WHERE run_id = ?1 ORDER BY step ASC, id ASC",
+    )?;
+    let rows = stmt.query_map(params![run_id], |row| {
+        let step: i64 = row.get(0)?;
+        let key: String = row.get(1)?;
+        let value: f64 = row.get(2)?;
+        Ok((step, key, value))
+    })?;
+    let mut out: Vec<(i64, String, f64)> = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 /// Returns the number of registered models for a project.
 pub fn count_models_per_project(project_id: &str) -> Result<u32> {
     let pool = super::db::pool()?;
