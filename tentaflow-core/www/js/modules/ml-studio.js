@@ -1454,7 +1454,9 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
       return typeIcon(slug);
     };
     const shortcutDesc = (label) => {
-      if (label === 'Dane') return 'import i profil danych';
+      if (label === 'Dane') {
+        return slug === 'distillation' ? 'generowanie par Q→A (teacher) / import' : 'import i profil danych';
+      }
       if (label === 'Schemat') return 'klasy i atrybuty';
       if (label === 'Anotacje') return 'studio anotacji';
       if (label === 'Zasoby') return 'GPU/nody mesh projektu';
