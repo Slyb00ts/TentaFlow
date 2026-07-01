@@ -1242,7 +1242,14 @@ pub async fn cluster_deploy(
             ));
         }
     };
-    let gpu_mem = gpu_memory_utilization.unwrap_or(0.90);
+    // Na unified memory (GB10/Spark) 119GB jest dzielone CPU+GPU, wiec 0.9 kaze vLLM
+    // alokowac ~107GB i OOM-killuje rank0 przy TP init. Bezpieczny default 0.5; user
+    // moze nadpisac w wizardzie jesli wie ile ma naglowka.
+    let gpu_mem = gpu_memory_utilization.unwrap_or(if engine_id == "vllm-spark" {
+        0.5
+    } else {
+        0.90
+    });
     let max_len = max_model_len.unwrap_or(8192);
     let ray_port: u16 = 6379;
     let user_cfg = config_json.clone().unwrap_or_else(|| "{}".to_string());

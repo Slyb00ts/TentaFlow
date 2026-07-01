@@ -140,6 +140,15 @@ fn nccl_env(spec: &DistributedDeploySpec) -> Map<String, Value> {
     m.insert("NCCL_IB_DISABLE".into(), json!("0"));
     m.insert("NCCL_IB_GID_INDEX".into(), json!(spec.gid_index.to_string()));
     m.insert("VLLM_HOST_IP".into(), json!(spec.rdma_ip));
+    // Native PyTorch sampler zamiast FlashInfer: FlashInfer robi wolny kernel JIT (ninja)
+    // na GB10 (sm_121a, brak prebuiltu), co blokuje faze profiling w TP init.
+    m.insert("VLLM_USE_FLASHINFER_SAMPLER".into(), json!("0"));
+    // Persist fp4_gemm autotune (leci wielokrotnie przy starcie) w bind-montowanym cache.
+    let autotune_cache = format!("{}/fi-at", crate::paths::CONTAINER_VLLM_CACHE_PATH);
+    m.insert(
+        "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR".into(),
+        json!(autotune_cache),
+    );
     m.insert(
         "HF_HUB_CACHE".into(),
         json!(crate::paths::CONTAINER_MODELS_PATH),
