@@ -2185,6 +2185,82 @@ pub fn resolve_local_v1_base_url(
 ///
 /// Autoryzacja modelu (`v1_authorize` / `#[policy]`) MUSI być sprawdzona przez
 /// wywołującego przed wejściem tu.
+/// Embedded MLX reranker (jina-rerank-mlx) — liczy score'y IN-PROCESS przez
+/// MLXBridge zamiast forwardu HTTP (spójnie z embedded embeddings/vision). Zwraca
+/// `None` gdy serwis rerank NIE jest embedded (caller idzie ścieżką HTTP).
+#[cfg(feature = "inference-mlx")]
+async fn try_embedded_rerank(
+    router: &Router,
+    model: &str,
+    query: &str,
+    documents: &[String],
+    top_n: Option<u32>,
+    return_documents: bool,
+    user_ctx: Option<crate::auth::acl::UserContext>,
+    context_label: &str,
+) -> Option<std::result::Result<tentaflow_protocol::RerankResult, String>> {
+    let executor = router.executor()?;
+    let mut ctx = crate::services::runtime::context::ExecutionContext::new(user_ctx);
+    let target = executor
+        .resolve_proxy_target(
+            model,
+            crate::services::catalog::ServiceSurface::Rerank,
+            &[crate::services::catalog::InputModality::Text],
+            &mut ctx,
+        )
+        .ok()?;
+    // Tylko embedded local handle idzie in-process; reszta (HTTP/mesh/flow) -> None.
+    match &target {
+        crate::services::runtime::target::ResolvedExecutionTarget::Local {
+            handle: crate::services::handles_cache::BackendHandle::Embedded { .. },
+            ..
+        } => {}
+        _ => return None,
+    }
+    // Model rerankera zaladowany przez embedded deploy (load_embedder_model).
+    let scores = match crate::inference::mlx_swift_bridge::rerank(query, documents).await {
+        Ok(s) => s,
+        Err(e) => return Some(Err(format!("{}: embedded MLX rerank: {}", context_label, e))),
+    };
+    let mut ranked: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let n = top_n
+        .map(|n| n as usize)
+        .unwrap_or(ranked.len())
+        .min(ranked.len());
+    let results = ranked
+        .into_iter()
+        .take(n)
+        .map(|(idx, score)| tentaflow_protocol::RerankResultItem {
+            index: idx,
+            relevance_score: score,
+            document: if return_documents {
+                documents.get(idx).cloned()
+            } else {
+                None
+            },
+        })
+        .collect();
+    Some(Ok(tentaflow_protocol::RerankResult {
+        results,
+        model: model.to_string(),
+    }))
+}
+
+#[cfg(not(feature = "inference-mlx"))]
+async fn try_embedded_rerank(
+    _router: &Router,
+    _model: &str,
+    _query: &str,
+    _documents: &[String],
+    _top_n: Option<u32>,
+    _return_documents: bool,
+    _user_ctx: Option<crate::auth::acl::UserContext>,
+    _context_label: &str,
+) -> Option<std::result::Result<tentaflow_protocol::RerankResult, String>> {
+    None
+}
+
 pub async fn rerank_forward(
     router: &Router,
     model: &str,
@@ -2195,6 +2271,22 @@ pub async fn rerank_forward(
     user_ctx: Option<crate::auth::acl::UserContext>,
     context_label: &str,
 ) -> std::result::Result<tentaflow_protocol::RerankResult, String> {
+    // Embedded MLX reranker liczy in-process; brak (None) -> forward HTTP nizej.
+    if let Some(result) = try_embedded_rerank(
+        router,
+        model,
+        query,
+        documents,
+        top_n,
+        return_documents,
+        user_ctx.clone(),
+        context_label,
+    )
+    .await
+    {
+        return result;
+    }
+
     let base = resolve_local_v1_base_url(
         router,
         model,

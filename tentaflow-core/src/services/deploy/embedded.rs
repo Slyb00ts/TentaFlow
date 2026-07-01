@@ -368,10 +368,15 @@ impl EmbeddedDeploy {
     /// stronie Swift), wiec jina-embed-mlx i bielik-mlx zyja jednoczesnie.
     /// Tylko backend MLX (Apple); CUDA/CPU embeddingi ida przez gguf/vllm.
     async fn prepare_embedded_embeddings(&self) -> DeployResult<()> {
-        if self.manifest.engine.category != Category::Embeddings {
-            return Ok(());
-        }
-        if self.manifest.engine.id != "jina-embed-mlx" {
+        // jina-embed-mlx (embeddings) i jina-rerank-mlx (reranker) to oba modele
+        // Qwen3 ladowane in-process TA SAMA sciezka (EmbedderModelFactory ->
+        // load_embedder_model). Reranker reuzywa zaladowany model przez rerank().
+        let engine_id = self.manifest.engine.id.as_str();
+        let handled = (self.manifest.engine.category == Category::Embeddings
+            && engine_id == "jina-embed-mlx")
+            || (self.manifest.engine.category == Category::Reranker
+                && engine_id == "jina-rerank-mlx");
+        if !handled {
             return Ok(());
         }
 

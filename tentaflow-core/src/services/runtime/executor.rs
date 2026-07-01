@@ -1924,9 +1924,7 @@ impl ModelRuntimeExecutor {
 
         match target {
             ResolvedExecutionTarget::Local { handle, .. } => match handle {
-                BackendHandle::Embedded { .. } => Err(ExecutorError::Internal(
-                    "embedded backend does not support reranking".into(),
-                )),
+                BackendHandle::Embedded { .. } => embedded_rerank(&request).await,
                 BackendHandle::Http(client) => client
                     .rerank_request(request)
                     .await
@@ -3334,6 +3332,40 @@ fn rerank_model_request(request: &RerankRequest) -> tentaflow_protocol::ModelReq
         metadata: None,
         session_id: None,
     }
+}
+
+/// Embedded MLX reranker (jina-reranker-v3): liczy score'y in-process przez
+/// MLXBridge, zwraca posortowane malejąco (`top_n` honorowane). Poza feature
+/// `inference-mlx` embedded rerankera nie ma — błąd, żeby fallback chain szedł dalej.
+#[cfg(feature = "inference-mlx")]
+async fn embedded_rerank(request: &RerankRequest) -> Result<RerankResponse, ExecutorError> {
+    let scores = crate::inference::mlx_swift_bridge::rerank(&request.query, &request.documents)
+        .await
+        .map_err(|e| ExecutorError::Internal(format!("embedded MLX rerank: {e}")))?;
+    let mut results: Vec<RerankResultEntry> = scores
+        .into_iter()
+        .enumerate()
+        .map(|(index, relevance_score)| RerankResultEntry {
+            index,
+            relevance_score,
+        })
+        .collect();
+    results.sort_by(|a, b| {
+        b.relevance_score
+            .partial_cmp(&a.relevance_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if let Some(n) = request.top_n {
+        results.truncate(n as usize);
+    }
+    Ok(RerankResponse { results })
+}
+
+#[cfg(not(feature = "inference-mlx"))]
+async fn embedded_rerank(_request: &RerankRequest) -> Result<RerankResponse, ExecutorError> {
+    Err(ExecutorError::Internal(
+        "embedded backend does not support reranking".into(),
+    ))
 }
 
 /// Mapuje `ModelResult` (QUIC/mesh) na `RerankResponse`. Wynik z silnika niesie

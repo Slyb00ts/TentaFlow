@@ -321,11 +321,11 @@ impl AliasResolver {
     /// instances of the same model produce multiple candidates — strategy
     /// ranking decides which one wins per request.
     ///
-    /// Embedded in-process silniki (llama.cpp/MLX/sherpa) NIE mają rerankera —
-    /// dla `surface=Rerank` pomijamy ich lokalne handle już na poziomie
-    /// resolvera, żeby nie trafiały do failover chain jako kandydat, który
-    /// dispatcher i tak odrzuci jako `Internal`. Mesh/HTTP/QUIC kandydaci
-    /// (zewnętrzny cross-encoder, np. vLLM `--task score`) przechodzą bez zmian.
+    /// Embedded MLX reranker (jina-reranker-v3) obsługuje `surface=Rerank`
+    /// in-process przez MLXBridge, więc embedded handle rerankera JEST poprawnym
+    /// kandydatem Local{Embedded} — dispatch (rerank_forward / executor) kieruje
+    /// go do `mlx_swift_bridge::rerank`. Mesh/HTTP/QUIC (zewnętrzny cross-encoder)
+    /// bez zmian.
     fn emit_service_model(
         &self,
         surface: ServiceSurface,
@@ -346,11 +346,6 @@ impl AliasResolver {
                 && inst.node_id == local_id;
             if is_local {
                 if let Some(handle) = self.handles.get(&inst.node_id, inst.service_id) {
-                    if surface == ServiceSurface::Rerank
-                        && matches!(handle, crate::services::handles_cache::BackendHandle::Embedded { .. })
-                    {
-                        continue;
-                    }
                     out.push(ResolvedExecutionTarget::Local {
                         model_name: model_name.to_string(),
                         service_id: inst.service_id,
@@ -613,14 +608,11 @@ mod tests {
         }
     }
 
-    /// RAG C2 (bug 3): embedded in-process silnik NIE ma rerankera, więc nawet
-    /// gdy wpis katalogu deklaruje `Rerank`, resolver NIE może go wystawić jako
-    /// kandydata Local{Embedded} — inaczej dispatcher dopiero na dispatchu
-    /// failowałby `embedded does not support reranking` i logował jako porażkę
-    /// kandydata. Embedded-only `Rerank` → brak kandydata (`NoLiveInstance`,
-    /// bo capability pasuje, ale żaden non-embedded handle nie żyje).
+    /// Embedded MLX reranker (jina-reranker-v3) obsługuje `Rerank` in-process,
+    /// więc embedded handle JEST poprawnym kandydatem Local{Embedded} dla
+    /// `surface=Rerank` — dispatch kieruje go do `mlx_swift_bridge::rerank`.
     #[test]
-    fn embedded_is_not_a_rerank_candidate() {
+    fn embedded_is_a_rerank_candidate() {
         let entry = service_entry_with_service_id(
             "cross-encoder",
             "local",
@@ -631,12 +623,18 @@ mod tests {
         let resolver = resolver_with_embedded("local", 9, "cross-encoder");
         let mut ctx = ExecutionContext::new(None);
 
-        let err = resolver
+        let outcome = resolver
             .resolve(&rerank_request("cross-encoder"), &snap, &mut ctx)
-            .expect_err("embedded must not be a rerank candidate");
+            .expect("embedded MLX reranker must be a valid rerank candidate");
         assert!(
-            matches!(err, ResolveError::NoLiveInstance(_)),
-            "expected NoLiveInstance (embedded filtered, no live rerank handle), got {err:?}"
+            matches!(
+                outcome,
+                ResolvedExecutionTarget::Local {
+                    handle: crate::services::handles_cache::BackendHandle::Embedded { .. },
+                    ..
+                }
+            ),
+            "expected Local{{Embedded}} rerank candidate, got {outcome:?}"
         );
     }
 

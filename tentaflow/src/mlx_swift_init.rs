@@ -32,6 +32,9 @@ type ModelInfoFn = unsafe extern "C" fn(*mut c_void) -> *mut c_char;
 type GetContextFn = unsafe extern "C" fn() -> *mut c_void;
 type EmbedFn = unsafe extern "C" fn(*const c_char, *mut i32, *mut c_void) -> *mut f32;
 type LoadEmbedderFn = unsafe extern "C" fn(*const c_char, *mut c_void) -> i32;
+// (query, docs_json, out_len, context) -> *mut f32 (score per dokument).
+type RerankFn =
+    unsafe extern "C" fn(*const c_char, *const c_char, *mut i32, *mut c_void) -> *mut f32;
 
 unsafe extern "C" {
     fn tentaflow_register_mlx_swift(
@@ -43,6 +46,7 @@ unsafe extern "C" {
     );
     fn tentaflow_register_mlx_swift_embed(embed_fn: EmbedFn);
     fn tentaflow_register_mlx_swift_load_embedder(load_fn: LoadEmbedderFn);
+    fn tentaflow_register_mlx_swift_rerank(rerank_fn: RerankFn);
 }
 
 fn locate_dylib() -> Option<PathBuf> {
@@ -120,6 +124,13 @@ pub fn init() -> Result<()> {
         Err(_) => {
             warn!("[mlx-swift] Brak symbolu MLXBridge_loadEmbedder — load embeddera MLX niedostepny")
         }
+    }
+
+    // Reranker MLX (embedded jina-reranker-v3) — osobny symbol; starsze dyliby
+    // go nie maja, wiec brak logujemy jako warn i jedziemy dalej.
+    match unsafe { lib.get::<RerankFn>(b"MLXBridge_rerank\0") } {
+        Ok(rerank_fn) => unsafe { tentaflow_register_mlx_swift_rerank(*rerank_fn) },
+        Err(_) => warn!("[mlx-swift] Brak symbolu MLXBridge_rerank — reranker MLX niedostepny"),
     }
 
     info!("[mlx-swift] Bridge zarejestrowany — MLX inferencja idzie przez mlx-swift");
