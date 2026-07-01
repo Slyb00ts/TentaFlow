@@ -2145,6 +2145,27 @@ fn parse_extraction_response(raw: &str) -> ChunkExtraction {
 /// Tolerancyjny: pomija linie nie pasujace do schematu, akceptuje prefiksy
 /// E/ENCJA/ENTITY i R/RELACJA/RELATION (case-insensitive), znosi bullet/spacje wokol
 /// separatora '|'. Zwraca `None` gdy zadna linia nie pasuje (caller probuje fallback JSON).
+/// Wartosci z SZABLONU/PRZYKLADU promptu ekstrakcji, ktore male modele kwantyzowane
+/// (bielik-7B) potrafia skopiowac doslownie do wyjscia. Poniewaz artefakt szablonu
+/// pojawia sie w KAZDYM chunku, przekracza prog denoisingu i awansuje jako falszywy
+/// fakt — dlatego twardo je odrzucamy na wejsciu parsera. Deskryptory formatu
+/// (`nazwa_head`…) NIGDY nie sa realnymi encjami; wartosci przykladu maja prefiks
+/// `EXAMPLE_SENTINEL`, ktorego realny tekst prawny nie zawiera.
+const EXTRACTION_PLACEHOLDERS: &[&str] = &[
+    "nazwa_encji",
+    "typ_encji",
+    "nazwa_head",
+    "nazwa_tail",
+    "relacja",
+];
+const EXAMPLE_SENTINEL: &str = "PRZYKLAD_";
+
+fn is_extraction_placeholder(s: &str) -> bool {
+    let t = s.trim();
+    let low = t.to_lowercase();
+    EXTRACTION_PLACEHOLDERS.iter().any(|p| low == *p) || t.contains(EXAMPLE_SENTINEL)
+}
+
 fn parse_extraction_lines(content: &str) -> Option<Value> {
     let mut entities: Vec<Value> = Vec::new();
     let mut relations: Vec<Value> = Vec::new();
@@ -2161,6 +2182,10 @@ fn parse_extraction_lines(content: &str) -> Option<Value> {
         let rest: Vec<&str> = parts.collect();
         if tag == "E" || tag == "ENCJA" || tag == "ENTITY" {
             if let Some(name) = rest.first().copied().filter(|s| !s.is_empty()) {
+                // Odrzuc skopiowany deskryptor formatu / wartosc przykladu.
+                if is_extraction_placeholder(name) {
+                    continue;
+                }
                 let typ = rest
                     .get(1)
                     .copied()
@@ -2170,6 +2195,13 @@ fn parse_extraction_lines(content: &str) -> Option<Value> {
             }
         } else if tag == "R" || tag == "RELACJA" || tag == "RELATION" {
             if rest.len() >= 3 && !rest[0].is_empty() && !rest[1].is_empty() && !rest[2].is_empty() {
+                // Odrzuc relacje z placeholderem w head/relacji/tail.
+                if is_extraction_placeholder(rest[0])
+                    || is_extraction_placeholder(rest[1])
+                    || is_extraction_placeholder(rest[2])
+                {
+                    continue;
+                }
                 relations.push(json!({ "head": rest[0], "relation": rest[1], "tail": rest[2] }));
             }
         }
@@ -2311,12 +2343,12 @@ fn call_extraction_llm(chunk_text: &str) -> Result<String, String> {
          R|nazwa_head|relacja|nazwa_tail\n\
          Bez JSON, bez markdown, bez komentarzy, bez numeracji. Nazwy head i tail kazdej \
          relacji (R) musza doslownie odpowiadac nazwie jakiejs encji (E).\n\n\
-         Przyklad formatu (NIE kopiuj wartosci):\n\
-         E|Dyrektywa 2018/2001|akt prawny\n\
-         E|biometan|substancja\n\
-         R|Dyrektywa 2018/2001|reguluje|biometan\n\n\
-         Powyzej to TYLKO przyklad formatu — NIE kopiuj jego wartosci. Wypisz \
-         RZECZYWISTE encje i relacje z ponizszego tekstu.\n\n\
+         Przyklad formatu (NIE kopiuj tych wartosci — to atrapy z prefiksem PRZYKLAD_):\n\
+         E|PRZYKLAD_Ustawa|akt prawny\n\
+         E|PRZYKLAD_Pojecie|pojecie\n\
+         R|PRZYKLAD_Ustawa|reguluje|PRZYKLAD_Pojecie\n\n\
+         Powyzej to TYLKO atrapa formatu — NIGDY nie wypisuj wartosci z prefiksem \
+         PRZYKLAD_. Wypisz RZECZYWISTE encje i relacje z ponizszego tekstu.\n\n\
          TEKST DO ANALIZY:\n{chunk_text}"
     );
     let model = "rag-llm";
@@ -2381,15 +2413,17 @@ fn denoising_threshold() -> u64 {
     parse_denoising_threshold(raw.as_deref())
 }
 
-/// Parsuje flage `graph_enabled` z surowego stanu KV. Tylko "1"/"true" (po trim,
-/// case-insensitive) => true; brak wpisu, pusta lub inna wartosc => false. DOMYSLNIE
-/// OFF — wlasciciel chce, by addon dzialal jak zwykly RAG wektorowy az do swiadomego
-/// zalaczenia grafu. Czysta funkcja: testowalna bez hosta.
+/// Parsuje flage `graph_enabled` z surowego stanu KV. "0"/"false" => OFF; brak wpisu
+/// (nowa instancja) LUB "1"/"true" => ON. DOMYSLNIE ON — graf wiedzy (MemGraphRAG) jest
+/// integralna czescia RAG, wiec nowa instancja buduje go od razu; wlasciciel moze go
+/// swiadomie wylaczyc przelacznikiem (zapisuje "0"). Czysta funkcja: testowalna bez hosta.
 fn parse_graph_enabled(raw: Option<&[u8]>) -> bool {
-    raw.and_then(|b| std::str::from_utf8(b).ok())
-        .map(|s| s.trim())
-        .map(|s| s.eq_ignore_ascii_case("1") || s.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    match raw.and_then(|b| std::str::from_utf8(b).ok()).map(|s| s.trim()) {
+        // Jawne wylaczenie przelacznikiem.
+        Some(s) if s.eq_ignore_ascii_case("0") || s.eq_ignore_ascii_case("false") => false,
+        // Brak wpisu (nowa instancja) lub jawne "1"/"true" => graf aktywny.
+        _ => true,
+    }
 }
 
 /// JEDYNE zrodlo prawdy o tym, czy warstwa grafu (MemGraphRAG) jest aktywna dla tej
@@ -7740,17 +7774,19 @@ mod tests {
     #[test]
     fn parse_graph_enabled_defaults_off_and_overrides() {
         // DOMYSLNIE OFF: brak wpisu / pusty / smieci / "0" / "false" -> false (czysty RAG).
-        assert!(!parse_graph_enabled(None), "brak wpisu => off");
-        assert!(!parse_graph_enabled(Some(b"")), "pusty => off");
-        assert!(!parse_graph_enabled(Some(b"abc")), "smieci => off");
-        assert!(!parse_graph_enabled(Some(b"0")), "0 => off");
-        assert!(!parse_graph_enabled(Some(b"false")), "false => off");
-        assert!(!parse_graph_enabled(Some(b"2")), "inna liczba => off");
-        // Wlaczenie: "1"/"true" (case-insensitive, z otaczajacymi spacjami) -> true.
+        // DOMYSLNIE ON: brak wpisu (nowa instancja) => graf aktywny.
+        assert!(parse_graph_enabled(None), "brak wpisu => on (domyslnie)");
+        assert!(parse_graph_enabled(Some(b"")), "pusty => on (domyslnie)");
+        assert!(parse_graph_enabled(Some(b"abc")), "smieci => on (domyslnie)");
+        assert!(parse_graph_enabled(Some(b"2")), "inna liczba => on (domyslnie)");
         assert!(parse_graph_enabled(Some(b"1")), "1 => on");
         assert!(parse_graph_enabled(Some(b"true")), "true => on");
         assert!(parse_graph_enabled(Some(b"TRUE")), "TRUE => on");
         assert!(parse_graph_enabled(Some(b"  1  ")), "spacje wokol 1 => on");
+        // Jawne wylaczenie przelacznikiem: "0"/"false".
+        assert!(!parse_graph_enabled(Some(b"0")), "0 => off");
+        assert!(!parse_graph_enabled(Some(b"false")), "false => off");
+        assert!(!parse_graph_enabled(Some(b"  false  ")), "spacje wokol false => off");
     }
 
     #[test]
