@@ -2608,6 +2608,76 @@ export const encode = {
     );
   },
 
+  /** MessageBody::ModelMetricsBody(SummaryRequest) — mesh-wide rollup agregacji. */
+  modelMetricsSummaryRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const nz = (v) => {
+      const s = v == null ? '' : String(v);
+      return s === '' ? undefined : s;
+    };
+    const body = _wasm.encodeModelMetricsSummaryRequest(
+      String(payload.period ?? 'daily'),
+      String(payload.periodKey ?? payload.period_key ?? ''),
+      String(payload.groupBy ?? payload.group_by ?? 'user'),
+      nz(payload.filterModel ?? payload.filter_model ?? payload.model),
+      nz(payload.filterNode ?? payload.filter_node ?? payload.node),
+      nz(payload.filterService ?? payload.filter_service ?? payload.service),
+      nz(payload.filterBackend ?? payload.filter_backend ?? payload.backend),
+      nz(payload.filterModality ?? payload.filter_modality ?? payload.modality),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelMetricsBody(NodeServiceRequest) — przekrój węzeł×serwis. */
+  modelMetricsNodeServiceRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelMetricsNodeServiceRequest(
+      String(payload.period ?? 'daily'),
+      String(payload.periodKey ?? payload.period_key ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelMetricsBody(PricingGet) — odczyt cennika per-model. */
+  modelMetricsPricingGet(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelMetricsPricingGet();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelMetricsBody(PricingSet) — zapis cennika jednego modelu. */
+  modelMetricsPricingSet(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelMetricsPricingSet(
+      String(payload.modelId ?? payload.model_id ?? ''),
+      Number(payload.promptPer1k ?? payload.prompt_per_1k ?? 0),
+      Number(payload.completionPer1k ?? payload.completion_per_1k ?? 0),
+      Number(payload.audioPerMin ?? payload.audio_per_min ?? 0),
+      Number(payload.imageEach ?? payload.image_each ?? 0),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MessageBody::MlStudioBody(ProjectsListRequest) — ML Studio projects list. */
   mlStudioProjectsListRequest(correlationId, sequence = 1) {
     assertReady();
