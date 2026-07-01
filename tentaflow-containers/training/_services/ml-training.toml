@@ -24,7 +24,9 @@ platforms = ["linux"]
 transport = "direct-http"
 
 [deploy.native]
-platforms = ["linux"]
+# macOS: torch trenuje na MPS (Metal) / CPU — LoRA/QLoRA małego ucznia działa
+# lokalnie na Apple Silicon (wolniej niż CUDA, ale bez zewnętrznego rigu).
+platforms = ["linux", "macos"]
 runtime = "python-bundle"
 bundle_path = "training/python/ml-training"
 
