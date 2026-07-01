@@ -116,7 +116,10 @@ const TYPE_TABS = {
   ft_llm: ['Model bazowy', 'Dane', 'Trening', 'Ewaluacja', 'Modele'],
   ft_vision_audio: ['Model bazowy', 'Dane', 'Trening', 'Ewaluacja', 'Modele'],
   tabular_anomaly: ['Dane', 'Trenuj', 'Cechy', 'Anomalie', 'Modele'],
-  distillation: ['Nauczyciel', 'Uczeń', 'Dane', 'Trening', 'Modele'],
+  // Flow destylacji: Model bazowy (student + metoda LoRA) -> Dane (teacher generuje
+  // pary Q→A) -> Trening (student uczy sie na tych parach) -> Modele. Teacher
+  // wybierany w Dane; osobne zakladki Nauczyciel/Uczen byly zbedne (renderowaly pustke).
+  distillation: ['Model bazowy', 'Dane', 'Trening', 'Modele'],
 };
 
 function sprite(id) {
@@ -735,7 +738,11 @@ async function showCreateWizard() {
       ? `plik „${escapeHtml(state.file.name)}” (${formatFileSize(state.file.size)}) zostanie wgrany i sprofilowany po utworzeniu projektu`
       : 'dane dodasz później w zakładce Dane';
     const ftNote = FT_TYPES.has(state.type)
-      ? `<div class="ml-studio-wiz-summary-note">${sprite('info')} Model bazowy${state.type === 'distillation' ? ' / nauczyciela' : ''} wybierzesz już w projekcie — w zakładce „${state.type === 'distillation' ? 'Nauczyciel' : 'Model bazowy'}”.</div>`
+      ? `<div class="ml-studio-wiz-summary-note">${sprite('info')} ${
+          state.type === 'distillation'
+            ? 'Nauczyciela (generuje odpowiedzi) wybierzesz w zakładce „Dane”, a model bazowy studenta w zakładce „Trening”.'
+            : 'Model bazowy wybierzesz już w projekcie — w zakładce „Model bazowy”.'
+        }</div>`
       : '';
     bodyEl.innerHTML = `
       <div class="ml-studio-wiz-summary">
@@ -975,7 +982,7 @@ function renderDetail(host, p, focus = {}) {
       renderOverviewTab(panel, p, { tabs, selectTab });
       return;
     }
-    if (label === 'Model bazowy' && slug === 'ft_llm') {
+    if (label === 'Model bazowy' && (slug === 'ft_llm' || slug === 'distillation')) {
       renderFtModelTab(panel, p);
       return;
     }
@@ -1009,7 +1016,7 @@ function renderDetail(host, p, focus = {}) {
       renderDataTab(panel, projectId(p));
       return;
     }
-    if (label === 'Trening' && slug === 'ft_llm') {
+    if (label === 'Trening' && (slug === 'ft_llm' || slug === 'distillation')) {
       renderFtTrainTab(panel, p, { selectTab });
       return;
     }
