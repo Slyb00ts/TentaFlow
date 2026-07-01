@@ -10469,6 +10469,55 @@ pub fn upsert_model_pricing(
     Ok(())
 }
 
+/// Upsert pricing while MERGING with any existing row: a `None` field keeps the
+/// current stored value (or `0.0` when no row exists yet), so a partial edit that
+/// sets only e.g. `prompt_per_1k` never zeroes the other prices. Returns `false`
+/// without touching the DB when every field is `None` (nothing to persist — avoids
+/// creating an all-zero row that would hide `missing_pricing` in metrics).
+///
+/// Read-modify-write: for admin-edited pricing the tiny race between the read and
+/// the upsert is acceptable (single admin editing one model's prices).
+pub fn upsert_model_pricing_merge(
+    pool: &DbPool,
+    org_id: &str,
+    model_id: &str,
+    prompt_per_1k: Option<f64>,
+    completion_per_1k: Option<f64>,
+    audio_per_min: Option<f64>,
+    image_each: Option<f64>,
+) -> Result<bool> {
+    if prompt_per_1k.is_none()
+        && completion_per_1k.is_none()
+        && audio_per_min.is_none()
+        && image_each.is_none()
+    {
+        return Ok(false);
+    }
+    let existing = get_model_pricing(pool, org_id, model_id)?;
+    let (ep, ec, ea, ei) = existing
+        .map(|r| {
+            (
+                r.prompt_per_1k,
+                r.completion_per_1k,
+                r.audio_per_min,
+                r.image_each,
+            )
+        })
+        .unwrap_or((0.0, 0.0, 0.0, 0.0));
+    upsert_model_pricing(
+        pool,
+        &crate::db::models::NewModelPricing {
+            model_id,
+            org_id,
+            prompt_per_1k: prompt_per_1k.unwrap_or(ep),
+            completion_per_1k: completion_per_1k.unwrap_or(ec),
+            audio_per_min: audio_per_min.unwrap_or(ea),
+            image_each: image_each.unwrap_or(ei),
+        },
+    )?;
+    Ok(true)
+}
+
 /// Fetch pricing for one org's model, if present.
 pub fn get_model_pricing(
     pool: &DbPool,

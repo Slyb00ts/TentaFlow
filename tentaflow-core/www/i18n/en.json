@@ -366,7 +366,9 @@
     "models_added": "Model selection saved.",
     "load_failed": "Failed to load models: {error}",
     "save_failed": "Failed to save selection: {error}",
-    "loading_models": "Loading models…"
+    "loading_models": "Loading models…",
+    "pricing_hint": "Per-model pricing — for billing in Metrics (optional).",
+    "pricing_invalid": "Prices must be numbers >= 0."
   },
   "common": {
     "save": "Save",
@@ -3100,7 +3102,10 @@
     "deploy_stop_title": "Stop deployment?",
     "deploy_stop_confirm": "This stops the head and all workers of this distributed deployment.",
     "deploy_stopped": "Deployment stopped",
-    "deploy_stop_partial": "Deployment stopped with warnings"
+    "deploy_stop_partial": "Deployment stopped with warnings",
+    "deploy_pricing_title": "Pricing (PLN / 1k tokens)",
+    "deploy_pricing_hint": "For billing in Metrics (optional).",
+    "deploy_pricing_invalid": "Prices must be numbers >= 0."
   },
   "cluster_wizard": {
     "step1_label": "Basic info and routing",

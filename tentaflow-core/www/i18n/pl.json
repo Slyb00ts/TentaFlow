@@ -366,7 +366,9 @@
     "models_added": "Zapisano wybór modeli.",
     "load_failed": "Nie udało się pobrać modeli: {error}",
     "save_failed": "Nie udało się zapisać wyboru: {error}",
-    "loading_models": "Ładowanie modeli…"
+    "loading_models": "Ładowanie modeli…",
+    "pricing_hint": "Cennik per model — do rozliczeń w Metrykach (opcjonalne).",
+    "pricing_invalid": "Ceny muszą być liczbami >= 0."
   },
   "common": {
     "save": "Zapisz",
@@ -3236,7 +3238,10 @@
     "deploy_stop_title": "Zatrzymać wdrożenie?",
     "deploy_stop_confirm": "Zatrzyma to head i wszystkich workerów tego rozproszonego wdrożenia.",
     "deploy_stopped": "Wdrożenie zatrzymane",
-    "deploy_stop_partial": "Wdrożenie zatrzymane z ostrzeżeniami"
+    "deploy_stop_partial": "Wdrożenie zatrzymane z ostrzeżeniami",
+    "deploy_pricing_title": "Cennik (zł/1k tokenów)",
+    "deploy_pricing_hint": "Do rozliczeń w Metrykach (opcjonalne).",
+    "deploy_pricing_invalid": "Ceny muszą być liczbami >= 0."
   },
   "cluster_wizard": {
     "step1_label": "Podstawowe dane i routing",

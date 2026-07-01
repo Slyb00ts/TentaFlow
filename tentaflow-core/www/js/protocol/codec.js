@@ -636,6 +636,11 @@ export const encode = {
       payload.configJson ?? null,
       payload.gcsTimeoutSecs ?? null,
       payload.readyTimeoutSecs ?? null,
+      payload.buildTimeoutSecs ?? null,
+      payload.promptPer1k ?? null,
+      payload.completionPer1k ?? null,
+      payload.audioPerMin ?? null,
+      payload.imageEach ?? null,
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),

@@ -10127,6 +10127,66 @@ pub async fn service_model_selection(
         }
     }
 
+    // Optional per-model pricing for the selected external models → persist to
+    // `model_pricing`. Entries for non-selected models are ignored; bad values
+    // (NaN / Inf / negative) are warned and skipped WITHOUT failing selection.
+    if !payload.pricing.is_empty() {
+        match ctx.org_context.as_ref().map(|o| o.org_id.clone()) {
+            Some(org_id) => {
+                let selected_ids: std::collections::HashSet<&str> = payload
+                    .selected_model_ids
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                for entry in &payload.pricing {
+                    if !selected_ids.contains(entry.model_id.as_str()) {
+                        continue;
+                    }
+                    // Skip entries that supply nothing — never create an all-zero
+                    // row that would mask `missing_pricing` in metrics.
+                    if entry.prompt_per_1k.is_none()
+                        && entry.completion_per_1k.is_none()
+                        && entry.audio_per_min.is_none()
+                        && entry.image_each.is_none()
+                    {
+                        continue;
+                    }
+                    let valid = |v: Option<f64>| v.map(|x| x.is_finite() && x >= 0.0).unwrap_or(true);
+                    if !(valid(entry.prompt_per_1k)
+                        && valid(entry.completion_per_1k)
+                        && valid(entry.audio_per_min)
+                        && valid(entry.image_each))
+                    {
+                        tracing::warn!(
+                            model_id = %entry.model_id,
+                            "service model selection: invalid pricing (non-finite or negative) — skipped"
+                        );
+                        continue;
+                    }
+                    // Merge: unset fields keep the existing stored price.
+                    if let Err(e) = crate::db::repository::upsert_model_pricing_merge(
+                        &ctx.state.db,
+                        &org_id,
+                        &entry.model_id,
+                        entry.prompt_per_1k,
+                        entry.completion_per_1k,
+                        entry.audio_per_min,
+                        entry.image_each,
+                    ) {
+                        tracing::warn!(
+                            model_id = %entry.model_id,
+                            error = %e,
+                            "service model selection: pricing upsert failed"
+                        );
+                    }
+                }
+            }
+            None => {
+                tracing::warn!("service model selection: no org context — pricing skipped");
+            }
+        }
+    }
+
     audit(
         ctx,
         require_user_id(ctx)

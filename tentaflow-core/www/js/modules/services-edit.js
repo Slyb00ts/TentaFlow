@@ -210,18 +210,51 @@ async function openExternalModelPicker(svc, opts = {}) {
         return;
       }
       statusEl.style.display = 'none';
+      // Catalog entries carry no pricing fields, so pull any stored pricing for
+      // this org and prefill the inputs for models that already have prices.
+      const pricingByModel = new Map();
+      try {
+        const pr = await ApiBinary.one('modelMetricsPricingGet');
+        (Array.isArray(pr?.rows) ? pr.rows : []).forEach((r) => {
+          if (r && r.modelId) pricingByModel.set(r.modelId, r);
+        });
+      } catch (_) {
+        // Pricing prefill is best-effort; empty means "no change" on save.
+      }
       listEl.innerHTML = models.map((m) => {
         const id = m.id || m.model_name || '';
         const ctxLen = m.contextLength || m.context_length;
         const ctxTxt = ctxLen ? ` · ${ctxLen}` : '';
         const name = m.displayName || m.display_name || id;
+        // Prefill from stored pricing (keyed by model id); empty stays empty.
+        const stored = pricingByModel.get(id);
+        const pv = (field) => {
+          const v = stored ? stored[field] : undefined;
+          return v === undefined || v === null ? '' : String(v);
+        };
+        const priceCell = (field, label, value) => `
+          <tf-input class="external-price-in" type="number" min="0" step="0.0001"
+            data-price-model="${escapeAttr(id)}" data-price-field="${escapeAttr(field)}"
+            label="${escapeAttr(label)}" value="${escapeAttr(value)}"></tf-input>`;
         return `
-          <label class="external-model-row" style="display:flex;align-items:center;gap:10px;padding:6px 0;">
-            <tf-checkbox ${m.selected ? 'checked' : ''} data-model-id="${escapeHtml(id)}"></tf-checkbox>
-            <span style="flex:1">${escapeHtml(name)}${escapeHtml(ctxTxt)}</span>
-            <tf-chip>${escapeHtml(m.modality || 'chat')}</tf-chip>
-          </label>`;
+          <div class="external-model-row" data-model-row style="display:flex;flex-direction:column;gap:6px;padding:8px 0;border-bottom:1px solid var(--border-subtle,#2a2a2a);">
+            <label style="display:flex;align-items:center;gap:10px;">
+              <tf-checkbox ${m.selected ? 'checked' : ''} data-model-id="${escapeAttr(id)}"></tf-checkbox>
+              <span style="flex:1">${escapeHtml(name)}${escapeHtml(ctxTxt)}</span>
+              <tf-chip>${escapeHtml(m.modality || 'chat')}</tf-chip>
+            </label>
+            <div class="external-model-pricing" style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;">
+              ${priceCell('promptPer1k', I18n.t('model_metrics.col_price_prompt'), pv('promptPer1k'))}
+              ${priceCell('completionPer1k', I18n.t('model_metrics.col_price_completion'), pv('completionPer1k'))}
+              ${priceCell('audioPerMin', I18n.t('model_metrics.col_price_audio'), pv('audioPerMin'))}
+              ${priceCell('imageEach', I18n.t('model_metrics.col_price_image'), pv('imageEach'))}
+            </div>
+          </div>`;
       }).join('');
+      const pricingHint = document.createElement('p');
+      pricingHint.className = 'form-hint';
+      pricingHint.textContent = I18n.t('external.pricing_hint');
+      listEl.prepend(pricingHint);
     } catch (e) {
       statusEl.style.display = '';
       statusEl.textContent = I18n.t('external.load_failed', { error: e.message || String(e) });
@@ -236,11 +269,37 @@ async function openExternalModelPicker(svc, opts = {}) {
       .filter((c) => c.checked)
       .map((c) => c.getAttribute('data-model-id'))
       .filter(Boolean);
+
+    // Per-model pricing: one entry per model where the user typed any of the
+    // four fields. Empty fields stay null (None); negatives abort the save.
+    const idSet = new Set(ids);
+    const pricingByModel = new Map();
+    let pricingInvalid = false;
+    listEl.querySelectorAll('tf-input[data-price-model]').forEach((el) => {
+      const modelId = el.getAttribute('data-price-model');
+      if (!idSet.has(modelId)) return;
+      const raw = String(el.value ?? '').trim();
+      if (raw === '') return;
+      const n = Number(raw);
+      if (!Number.isFinite(n) || n < 0) { pricingInvalid = true; return; }
+      const entry = pricingByModel.get(modelId) || { modelId };
+      entry[el.getAttribute('data-price-field')] = n;
+      pricingByModel.set(modelId, entry);
+    });
+    if (pricingInvalid) {
+      statusEl.style.display = '';
+      statusEl.textContent = I18n.t('external.pricing_invalid');
+      saveBtn.removeAttribute('disabled');
+      return;
+    }
+    const pricing = Array.from(pricingByModel.values());
+
     try {
       const res = await ApiBinary.action('serviceModelSelectionRequest', {
         serviceId: svc.id,
         nodeId,
         selectedModelIds: ids,
+        pricing,
       });
       if (res && res.success === false) {
         statusEl.style.display = '';

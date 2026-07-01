@@ -622,6 +622,12 @@ pub fn encode_cluster_deploy_request(
     // Appended last so existing positional JS calls stay valid (undefined → None
     // → backend default 600 s build budget).
     build_timeout_secs: Option<u32>,
+    // Optional per-model pricing captured at deploy time (persisted for the
+    // served model). Appended last so older positional JS calls stay valid.
+    prompt_per_1k: Option<f64>,
+    completion_per_1k: Option<f64>,
+    audio_per_min: Option<f64>,
+    image_each: Option<f64>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ClusterDeployRequestBody(ClusterDeployRequest {
         cluster_id,
@@ -637,6 +643,10 @@ pub fn encode_cluster_deploy_request(
         build_timeout_secs,
         gcs_timeout_secs,
         ready_timeout_secs,
+        prompt_per_1k,
+        completion_per_1k,
+        audio_per_min,
+        image_each,
     }))
     .map_err(|e| JsError::new(&e))
 }

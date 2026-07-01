@@ -509,6 +509,7 @@ pub use message_body::{
     ModelConsumerRevokeRequest,
     ModelDetail,
     ModelInstallRequest,
+    ModelPricingInput,
     ModelSummary,
     ModelVisibilityEntry,
     ModelVisibilityListResponse,

@@ -1132,6 +1132,10 @@ pub async fn cluster_deploy(
         build_timeout_secs,
         gcs_timeout_secs,
         ready_timeout_secs,
+        prompt_per_1k,
+        completion_per_1k,
+        audio_per_min,
+        image_each,
     } = payload;
 
     if crate::db::repository::get_cluster(&ctx.state.db, cluster_id)
@@ -1517,6 +1521,44 @@ pub async fn cluster_deploy(
         &deployment_cluster_id,
         "running",
     );
+
+    // Optional pricing captured at deploy time → persist for the served model.
+    // Only upsert when the admin supplied at least one value; bad values (NaN /
+    // Inf / negative) are warned and skipped WITHOUT failing the deploy.
+    if prompt_per_1k.is_some()
+        || completion_per_1k.is_some()
+        || audio_per_min.is_some()
+        || image_each.is_some()
+    {
+        match ctx.org_context.as_ref().map(|o| o.org_id.clone()) {
+            Some(org_id) => {
+                let valid = |v: Option<f64>| v.map(|x| x.is_finite() && x >= 0.0).unwrap_or(true);
+                if valid(*prompt_per_1k)
+                    && valid(*completion_per_1k)
+                    && valid(*audio_per_min)
+                    && valid(*image_each)
+                {
+                    // Merge: unset fields keep the existing stored price.
+                    if let Err(e) = crate::db::repository::upsert_model_pricing_merge(
+                        &ctx.state.db,
+                        &org_id,
+                        &served,
+                        *prompt_per_1k,
+                        *completion_per_1k,
+                        *audio_per_min,
+                        *image_each,
+                    ) {
+                        warn!(model_id = %served, error = %e, "cluster deploy: pricing upsert failed");
+                    }
+                } else {
+                    warn!(model_id = %served, "cluster deploy: invalid pricing (non-finite or negative) — skipped");
+                }
+            }
+            None => {
+                warn!(model_id = %served, "cluster deploy: no org context — pricing skipped");
+            }
+        }
+    }
 
     let _ = crate::db::repository::log_audit(
         &ctx.state.db,

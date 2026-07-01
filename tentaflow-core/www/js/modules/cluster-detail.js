@@ -906,6 +906,16 @@ async function openDeployModal() {
         <label>${escapeHtml(I18n.t('cluster_detail.deploy_port'))}</label>
         <tf-input id="dep-port" type="number" min="1" max="65535" value="8100"></tf-input>
       </div>
+      <div class="form-group">
+        <label>${escapeHtml(I18n.t('cluster_detail.deploy_pricing_title'))}</label>
+        <div class="form-hint" style="margin-bottom:6px;">${escapeHtml(I18n.t('cluster_detail.deploy_pricing_hint'))}</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+          <tf-input id="dep-price-prompt" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_prompt'))}"></tf-input>
+          <tf-input id="dep-price-completion" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_completion'))}"></tf-input>
+          <tf-input id="dep-price-audio" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_audio'))}"></tf-input>
+          <tf-input id="dep-price-image" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_image'))}"></tf-input>
+        </div>
+      </div>
     </div>
   `;
 
@@ -950,6 +960,23 @@ async function openDeployModal() {
   const port = parseInt(body.querySelector('#dep-port')?.value, 10) || 8100;
   const engineId = body.querySelector('#dep-engine')?.value || defaultEngineId();
 
+  // Optional pricing captured at deploy time. Empty inputs stay null (backend
+  // skips them); negative values are rejected client-side before submit.
+  const priceOf = (sel) => {
+    const raw = String(body.querySelector(sel)?.value ?? '').trim();
+    if (raw === '') return null;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : NaN;
+  };
+  const promptPer1k = priceOf('#dep-price-prompt');
+  const completionPer1k = priceOf('#dep-price-completion');
+  const audioPerMin = priceOf('#dep-price-audio');
+  const imageEach = priceOf('#dep-price-image');
+  if ([promptPer1k, completionPer1k, audioPerMin, imageEach].some((v) => Number.isNaN(v))) {
+    toast(I18n.t('cluster_detail.deploy_pricing_invalid'), 'warning');
+    return;
+  }
+
   await runClusterDeploy({
     engineId,
     modelRepo: repo,
@@ -958,6 +985,10 @@ async function openDeployModal() {
     gpuMemoryUtilization: gpuMem,
     maxModelLen: maxLen,
     port,
+    promptPer1k,
+    completionPer1k,
+    audioPerMin,
+    imageEach,
   });
 }
 
@@ -980,6 +1011,10 @@ async function runClusterDeploy(opts) {
         maxModelLen: opts.maxModelLen,
         port: opts.port,
         readyTimeoutSecs,
+        promptPer1k: opts.promptPer1k ?? null,
+        completionPer1k: opts.completionPer1k ?? null,
+        audioPerMin: opts.audioPerMin ?? null,
+        imageEach: opts.imageEach ?? null,
       },
       { timeoutMs: readyTimeoutSecs * 1000 + 30000 },
     );

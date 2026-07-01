@@ -386,11 +386,31 @@ pub struct ServiceModelCatalogResponse {
 
 /// Request: persist the admin's model selection for a service — model_registry
 /// is upserted to exactly this set (rows inserted/removed to match).
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServiceModelSelectionRequest {
     pub service_id: i64,
     pub node_id: Option<String>,
     pub selected_model_ids: Vec<String>,
+    /// Optional per-model pricing for the selected external models. Each entry
+    /// is matched to a selected model by `model_id`; entries for models not in
+    /// `selected_model_ids` are ignored by the handler.
+    #[serde(default)]
+    pub pricing: Vec<ModelPricingInput>,
+}
+
+/// Per-model pricing supplied when selecting external models. `model_id` MUST
+/// equal the selected model id so metrics (`requested_model()`) line up.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct ModelPricingInput {
+    pub model_id: String,
+    #[serde(default)]
+    pub prompt_per_1k: Option<f64>,
+    #[serde(default)]
+    pub completion_per_1k: Option<f64>,
+    #[serde(default)]
+    pub audio_per_min: Option<f64>,
+    #[serde(default)]
+    pub image_each: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -4003,6 +4023,17 @@ pub struct ClusterDeployRequest {
     /// joined (default 600 s — a 31B model can take a few minutes to load).
     #[serde(default)]
     pub ready_timeout_secs: Option<u32>,
+    /// Optional per-model pricing captured at deploy time (persisted to
+    /// `model_pricing` for the served model). All four are independent; any
+    /// non-None value triggers an upsert, unset values default to 0.0.
+    #[serde(default)]
+    pub prompt_per_1k: Option<f64>,
+    #[serde(default)]
+    pub completion_per_1k: Option<f64>,
+    #[serde(default)]
+    pub audio_per_min: Option<f64>,
+    #[serde(default)]
+    pub image_each: Option<f64>,
 }
 
 /// Per-member outcome of a cluster distributed deploy.
