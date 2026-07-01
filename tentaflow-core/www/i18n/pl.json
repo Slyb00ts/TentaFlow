@@ -570,6 +570,8 @@
     "alias_drag_handle": "Przeciągnij lub użyj strzałek góra/dół, aby zmienić kolejność",
     "alias_fallback_remove": "Usuń z fallback chain",
     "alias_primary_target_pos": "P",
+    "alias_unbind": "Odepnij model",
+    "alias_unbound_hint": "Alias zostanie odpięty i stanie się nieaktywny.",
     "alias_meta_owner": "Właściciel",
     "alias_meta_id": "ID",
     "alias_save": "Zapisz zmiany",

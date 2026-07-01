@@ -18,10 +18,12 @@ pub fn list_aliases(pool: &DbPool) -> Result<Vec<DbModelAlias>> {
     db::repository::list_model_aliases(pool)
 }
 
-/// Creates an alias. Rejects when `alias` or `target_model` is empty after
-/// trimming, when the alias name would collide with a published flow or
-/// another existing alias, or when `target_model` / any fallback is itself
-/// an active alias (no alias-of-alias chains).
+/// Creates an alias. Rejects when `alias` is empty after trimming or when the
+/// alias name would collide with a published flow or another existing alias.
+/// A blank `target_model` is allowed and creates the alias *unbound*
+/// (`is_active = 0`): it exists in the catalog but the router skips it until an
+/// admin binds a model. When `target_model` is non-blank the chain guard rejects
+/// a target/fallback that is itself an active alias (no alias-of-alias chains).
 ///
 /// Chain check + insert run under a single SQLite transaction inside
 /// `create_model_alias_with_chain_check`, so two concurrent admin writes
@@ -33,8 +35,8 @@ pub fn create_alias(
     strategy: Option<&str>,
     fallback_targets: Option<&str>,
 ) -> Result<i64> {
-    if alias.trim().is_empty() || target_model.trim().is_empty() {
-        anyhow::bail!("alias and target_model must be non-empty");
+    if alias.trim().is_empty() {
+        anyhow::bail!("alias must be non-empty");
     }
     crate::services::catalog::guards::check_alias_collision(pool, alias, None)?;
     db::repository::create_model_alias_with_chain_check(
@@ -50,6 +52,11 @@ pub fn create_alias(
 /// exist so the caller can map it to a 404-style response. Re-validates the
 /// chosen name against the catalog (published flows, other aliases) so that
 /// renaming an alias cannot smuggle in a collision.
+///
+/// Clearing `target_model` (blank after trimming) unbinds the alias: the row is
+/// forced to `is_active = 0` regardless of the requested flag, so an operator
+/// who empties the target parks the alias instead of leaving a dangling active
+/// binding. The alias name itself must stay non-empty.
 pub fn update_alias(
     pool: &DbPool,
     id: i64,
@@ -62,16 +69,18 @@ pub fn update_alias(
     if db::repository::get_model_alias(pool, id)?.is_none() {
         return Ok(false);
     }
-    if alias.trim().is_empty() || target_model.trim().is_empty() {
-        anyhow::bail!("alias and target_model must be non-empty");
+    if alias.trim().is_empty() {
+        anyhow::bail!("alias must be non-empty");
     }
+    // Unbound alias cannot route, so it is always parked.
+    let effective_active = is_active && !target_model.trim().is_empty();
     crate::services::catalog::guards::check_alias_collision(pool, alias, Some(id))?;
     db::repository::update_model_alias_with_chain_check(
         pool,
         id,
         alias,
         target_model,
-        is_active,
+        effective_active,
         fallback_targets,
         strategy,
     )?;
@@ -233,6 +242,45 @@ mod tests {
         assert!(
             msg.contains("primary-alias"),
             "error must name target, got: {msg}"
+        );
+    }
+
+    /// Unbound create: a blank `target_model` is allowed and lands the alias
+    /// parked (`is_active = 0`) so the router skips it until an admin binds a
+    /// model. Only the alias *name* is mandatory.
+    #[test]
+    fn create_alias_with_blank_target_is_unbound() {
+        let db = fresh_db();
+        let id = create_alias(&db, "rag-embeddings", "", None, None)
+            .expect("blank target must create an unbound alias, not error");
+
+        let row = db::repository::get_model_alias(&db, id)
+            .expect("lookup")
+            .expect("row exists");
+        assert!(!row.is_active, "unbound alias must be inactive");
+
+        // A blank alias name is still rejected.
+        let err = create_alias(&db, "   ", "some-model", None, None)
+            .expect_err("blank alias name must be rejected");
+        assert!(format!("{err}").contains("alias"));
+    }
+
+    /// Clearing the target on an existing bound alias unbinds it: the row flips
+    /// to `is_active = 0` even though the request asked for active.
+    #[test]
+    fn update_alias_clearing_target_unbinds() {
+        let db = fresh_db();
+        let id = create_alias(&db, "rag-llm", "some-model", None, None)
+            .expect("bound alias should be created");
+        let row = db::repository::get_model_alias(&db, id).unwrap().unwrap();
+        assert!(row.is_active, "freshly bound alias must be active");
+
+        update_alias(&db, id, "rag-llm", "", true, None, None)
+            .expect("clearing target must succeed");
+        let row = db::repository::get_model_alias(&db, id).unwrap().unwrap();
+        assert!(
+            !row.is_active,
+            "alias with cleared target must be parked, got active"
         );
     }
 }

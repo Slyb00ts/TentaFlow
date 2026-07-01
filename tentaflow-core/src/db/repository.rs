@@ -2869,9 +2869,12 @@ pub fn create_model_alias_with_chain_check(
             alias
         );
     }
+    // Blank target = unbound alias: store it parked so the router skips it until
+    // an admin binds a model. A bound target inserts active.
+    let active = !target_model.trim().is_empty();
     tx.execute(
-        "INSERT INTO model_aliases (alias, target_model, fallback_targets, strategy) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![alias, target_model, fallback_targets, strategy.unwrap_or("first_available")],
+        "INSERT INTO model_aliases (alias, target_model, is_active, fallback_targets, strategy) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![alias, target_model, active, fallback_targets, strategy.unwrap_or("first_available")],
     )?;
     let id = tx.last_insert_rowid();
     tx.commit()?;
@@ -3180,19 +3183,25 @@ pub fn create_or_reactivate_model_alias_within_tx(
         }
     }
 
+    // Unbound aliases (blank effective target) stay parked: a manifest with an
+    // empty `suggested_default` registers the alias but leaves the admin to bind
+    // a model before the router will resolve it. `target_for_check` is the stored
+    // target on reactivation and the manifest default on first create, so an
+    // admin who cleared the binding keeps the alias parked across reinstalls.
+    let active = !target_for_check.trim().is_empty();
     let alias_id: i64;
     let change_type: &str;
     if let Some(id) = action_id {
         tx.execute(
-            "UPDATE model_aliases SET is_active = 1 WHERE id = ?1",
-            rusqlite::params![id],
+            "UPDATE model_aliases SET is_active = ?2 WHERE id = ?1",
+            rusqlite::params![id, active],
         )?;
         alias_id = id;
         change_type = "activate";
     } else {
         tx.execute(
-            "INSERT INTO model_aliases (alias, target_model, is_active, strategy) VALUES (?1, ?2, 1, ?3)",
-            rusqlite::params![alias, default_target_model, strategy],
+            "INSERT INTO model_aliases (alias, target_model, is_active, strategy) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![alias, default_target_model, active, strategy],
         )?;
         alias_id = tx.last_insert_rowid();
         change_type = "create";
@@ -3220,7 +3229,7 @@ pub fn create_or_reactivate_model_alias_within_tx(
     let after_snapshot = serde_json::json!({
         "alias": alias,
         "target_model": default_target_model,
-        "is_active": true,
+        "is_active": active,
         "owner_type": owner_type,
         "owner_id": stored_owner_id,
     })

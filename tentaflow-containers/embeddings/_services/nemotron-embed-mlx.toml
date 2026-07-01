@@ -23,7 +23,7 @@ output_modalities = ["embedding"]
 [deploy.native]
 platforms = ["macos", "ios"]
 runtime = "embedded"
-feature_flag = "inference-mlx-embeddings"
+feature_flag = "inference-mlx"
 
 # Brak presetu mlx-community dla tego modelu — laduje zrodlo NVIDIA, runtime
 # (mlx-embeddings) konwertuje wagi do MLX przy pierwszym zaladowaniu.

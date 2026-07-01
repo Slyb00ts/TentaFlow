@@ -290,6 +290,7 @@ pub extern "C" fn on_request(
         "delete_collection" => handle_delete_collection(&params),
         "ask" => handle_ask(&params),
         "ingest_document" => handle_ingest_document(&params),
+        "ingest_drain" => handle_ingest_drain(&params),
         "list_documents" => handle_list_documents(&params),
         "delete_document" => handle_delete_document(&params),
         "ingest_status" => handle_ingest_status(&params),
@@ -571,15 +572,43 @@ fn handle_ingest_document(params: &Value) -> Value {
         Err(e) => return err(&format!("Blad weryfikacji kolekcji: {e}")),
     }
 
+    // Dedup po tresci: sha256 wgranego bloba pobieramy z metadanych store'a
+    // (document_list — bez czytania bajtow). Jesli identyczny content juz jest w
+    // TEJ kolekcji (nie-failed), pomijamy: re-upload tego samego pliku nie tworzy
+    // duplikatu dokumentu/chunkow/wektorow. Host i tak trzyma jeden blob per sha256.
+    let content_hash = tentaflow_addon_sdk::document_list()
+        .ok()
+        .and_then(|docs| {
+            docs.into_iter()
+                .find(|d| d.doc_id == doc_id_blob)
+                .map(|d| d.sha256)
+        })
+        .unwrap_or_default();
+    if !content_hash.is_empty() {
+        if let Ok(Some(existing)) = sql_query_one(
+            "SELECT id FROM documents WHERE collection_id = ? AND content_hash = ? AND status != 'failed' LIMIT 1",
+            &[
+                SqlValue::String(collection_id.to_string()),
+                SqlValue::String(content_hash.clone()),
+            ],
+        ) {
+            let dup_id = existing.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
+            return json!({
+                "ok": true,
+                "data": {"document_id": dup_id, "status": "duplicate", "content_hash": content_hash}
+            });
+        }
+    }
+
     let document_id = new_id("doc");
     let job_id = new_id("job");
     let now = now_unix();
 
     // Wpis dokumentu (status pending) + job (queued) atomowo.
-    let insert_doc = "INSERT INTO documents (id, collection_id, doc_id_blob, filename, mime, status, page_count, created_at) \
-                      VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)";
+    let insert_doc = "INSERT INTO documents (id, collection_id, doc_id_blob, filename, mime, status, page_count, created_at, content_hash) \
+                      VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)";
     let insert_job = "INSERT INTO ingest_jobs (id, document_id, status, progress, created_at, updated_at) \
-                      VALUES (?, ?, 'running', 0, ?, ?)";
+                      VALUES (?, ?, 'queued', 0, ?, ?)";
     if let Err(e) = sql_transaction(&[
         (insert_doc, &[
             SqlValue::String(document_id.clone()),
@@ -588,6 +617,7 @@ fn handle_ingest_document(params: &Value) -> Value {
             SqlValue::String(filename.to_string()),
             SqlValue::String(mime.to_string()),
             SqlValue::I64(now),
+            SqlValue::String(content_hash.clone()),
         ]),
         (insert_job, &[
             SqlValue::String(job_id.clone()),
@@ -599,46 +629,74 @@ fn handle_ingest_document(params: &Value) -> Value {
         return err(&format!("Blad inicjalizacji ingestu: {e}"));
     }
 
-    // Wykonaj pipeline; przy bledzie zapisz go do joba i dokumentu.
-    match run_ingest_pipeline(collection_id, &document_id, &job_id, doc_id_blob, mime) {
-        Ok(chunk_count) => {
-            // Status nie moze klamac: jesli nie da sie oznaczyc dokumentu/joba jako
-            // ukonczony, to realny blad — wyczysc artefakty i zglos failed zamiast
-            // udawac sukces przy niespojnym statusie.
-            if let Err(e) = mark_ingested(&document_id, &job_id) {
-                // Sciezka bledu: czyscimy artefakty best-effort. Ewentualny blad cleanupu
-                // tylko logujemy (juz raportujemy 'failed') — nie nadpisujemy pierwotnej
-                // przyczyny, ale partial graf jest wychwytywany przez status failed.
-                if let Err(ce) = cleanup_document_artifacts(&document_id) {
-                    log::warn(&format!("rag: cleanup po nieudanym mark_ingested dokumentu '{document_id}' nieudany: {ce}"));
-                }
-                let msg = format!("Ingest zakonczony, ale zapis statusu sie nie powiodl: {e}");
-                fail_job(&document_id, &job_id, &msg);
-                return json!({
-                    "ok": false,
-                    "error": msg,
-                    "data": {"document_id": document_id, "job_id": job_id, "status": "failed"}
-                });
-            }
-            json!({
-                "ok": true,
-                "data": {
-                    "document_id": document_id,
-                    "job_id": job_id,
-                    "chunks": chunk_count,
-                    "status": "ingested"
-                }
-            })
-        }
-        Err(msg) => {
-            fail_job(&document_id, &job_id, &msg);
-            json!({
-                "ok": false,
-                "error": msg,
-                "data": {"document_id": document_id, "job_id": job_id, "status": "failed"}
-            })
-        }
+    // Async: dokument wchodzi do KOLEJKI (status 'queued'), a ciezki pipeline
+    // (parse->chunk->embed, ~dziesiatki s) przetwarza w tle scheduled worker
+    // (`ingest_drain`). Dzieki temu upload_complete zwraca natychmiast i nie
+    // blokuje polaczenia — masowy upload wielu plikow nie czeka na ingest kazdego
+    // (wczesniej inline pipeline blokowal upload kolejnych plikow -> timeout/abort).
+    json!({
+        "ok": true,
+        "data": {"document_id": document_id, "job_id": job_id, "status": "queued"}
+    })
+}
+
+/// Worker kolejki ingestu — przetwarza JEDEN najstarszy job `queued`. Napedzany
+/// przez scheduled job core (interwal). Atomowy claim (`queued`->`running` z
+/// warunkiem statusu) zapobiega dwukrotnemu przetworzeniu tego samego joba przez
+/// rownolegle wywolania z puli instancji. Zwraca `processed` (0/1) + `remaining`
+/// (ile jeszcze w kolejce), zeby driver/UI wiedzialy czy jest co robic.
+fn handle_ingest_drain(_params: &Value) -> Value {
+    let row = match sql_query_one(
+        "SELECT j.id, j.document_id, d.collection_id, d.doc_id_blob, d.mime \
+         FROM ingest_jobs j JOIN documents d ON d.id = j.document_id \
+         WHERE j.status = 'queued' ORDER BY j.created_at ASC, j.id ASC LIMIT 1",
+        &[],
+    ) {
+        Ok(Some(r)) => r,
+        Ok(None) => return json!({"ok": true, "data": {"processed": 0, "remaining": 0}}),
+        Err(e) => return err(&format!("Blad odczytu kolejki ingestu: {e}")),
+    };
+    let job_id = row.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let document_id = row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let collection_id = row.get(2).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let doc_id_blob = row.get(3).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let mime = row.get(4).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if job_id.is_empty() || document_id.is_empty() {
+        return err("Kolejka ingestu: niespojny wiersz joba");
     }
+
+    // Atomowy claim: przejdz dalej TYLKO jesli to my przelaczylismy queued->running.
+    let claimed = sql_exec(
+        "UPDATE ingest_jobs SET status='running', updated_at=? WHERE id=? AND status='queued'",
+        &[SqlValue::I64(now_unix()), SqlValue::String(job_id.clone())],
+    );
+    match claimed {
+        Ok(r) if r.rows_affected == 1 => {}
+        Ok(_) => return json!({"ok": true, "data": {"processed": 0, "remaining": queued_count()}}),
+        Err(e) => return err(&format!("Claim joba nieudany: {e}")),
+    }
+
+    match run_ingest_pipeline(&collection_id, &document_id, &job_id, &doc_id_blob, &mime) {
+        Ok(_) => {
+            if let Err(e) = mark_ingested(&document_id, &job_id) {
+                if let Err(ce) = cleanup_document_artifacts(&document_id) {
+                    log::warn(&format!("rag: cleanup po nieudanym mark_ingested '{document_id}' nieudany: {ce}"));
+                }
+                fail_job(&document_id, &job_id, &format!("Zapis statusu po ingescie nieudany: {e}"));
+            }
+        }
+        Err(msg) => fail_job(&document_id, &job_id, &msg),
+    }
+    json!({"ok": true, "data": {"processed": 1, "document_id": document_id, "remaining": queued_count()}})
+}
+
+/// Liczba jobow czekajacych w kolejce (status 'queued').
+fn queued_count() -> i64 {
+    sql_query_one("SELECT COUNT(*) FROM ingest_jobs WHERE status = 'queued'", &[])
+        .ok()
+        .flatten()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
 }
 
 /// Pipeline ingestu jednego dokumentu zbudowany na flow-ingescie core

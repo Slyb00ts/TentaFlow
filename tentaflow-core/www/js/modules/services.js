@@ -532,6 +532,18 @@ function bindAliasInlineEditEvents(root) {
       patchAliasesTab();
     });
   });
+  // Primary clear → unbind the model from the alias (draft only; persisted on
+  // Save as targetModel:'' → backend sets is_active=0). Fallbacks are dropped
+  // on save, but we keep them in the draft so a re-pick before saving restores
+  // the chain.
+  root.querySelectorAll('[data-primary-clear]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      if (!aliasEditDraft) return;
+      aliasEditDraft.targetModel = '';
+      patchAliasesTab();
+    };
+  });
   // Fallback remove → splice by index, re-render.
   root.querySelectorAll('[data-fallback-remove]').forEach((b) => {
     b.onclick = (e) => {
@@ -611,19 +623,20 @@ function attachFallbackDrag(listEl) {
   });
 }
 
-// Inline save — pushes ModelAliasUpdateRequest with the draft state. Keeps
-// is_active and alias name unchanged (toggle handles is_active, rename is not
-// part of the inline edit by design — rename forces a re-create flow).
+// Inline save — pushes ModelAliasUpdateRequest with the draft state. Alias name
+// is unchanged (rename forces a re-create flow). is_active is normally left to
+// the toggle, except when the primary is cleared: unbinding forces is_active
+// off since an alias with no target can never route.
 async function saveAliasInline(id) {
   const alias = aliases.find((x) => String(x.id) === id);
   if (!alias || !aliasEditDraft || aliasEditDraft.id !== id) return;
   const errEl = document.querySelector(`[data-edit-error="${CSS.escape(String(id))}"]`);
   const target = aliasEditDraft.targetModel.trim();
-  if (!target) {
-    if (errEl) { errEl.textContent = I18n.t('services.alias_required'); errEl.hidden = false; }
-    return;
-  }
-  const fbJson = aliasEditDraft.fallbacks.length > 0
+  // Empty primary means "unbind": the alias is kept but marked inactive. A
+  // fallback chain without a primary is meaningless, so we drop it (null) —
+  // otherwise a re-bound alias would silently inherit orphaned fallbacks.
+  const unbind = !target;
+  const fbJson = (!unbind && aliasEditDraft.fallbacks.length > 0)
     ? JSON.stringify(aliasEditDraft.fallbacks)
     : null;
   try {
@@ -631,7 +644,7 @@ async function saveAliasInline(id) {
       id,
       alias: alias.alias,
       targetModel: target,
-      isActive: alias.is_active,
+      isActive: unbind ? false : alias.is_active,
       strategy: aliasEditDraft.strategy,
       fallbackTargets: fbJson,
     });
@@ -1271,6 +1284,9 @@ function renderAliasInlineEdit(a) {
         ? `<div class="form-error">${escapeHtml(I18n.t('services.alias_fallback_parse_failed'))}</div>`
         : ''}
       <div class="form-error" hidden data-edit-error="${escapeAttr(a.id)}"></div>
+      ${!aliasEditDraft.targetModel
+        ? `<div class="form-hint">${sprite('info')} ${escapeHtml(I18n.t('services.alias_unbound_hint'))}</div>`
+        : ''}
 
       <div class="edit-foot">
         <tf-button variant="ghost" size="sm" icon="x" data-alias-cancel="${escapeAttr(a.id)}">${escapeHtml(I18n.t('services.alias_cancel'))}</tf-button>
@@ -1285,17 +1301,25 @@ function renderAliasInlineEdit(a) {
 function renderFallbackItems(draft) {
   // Primary slot is the currently-selected target_model (read-only here — change
   // it via the "Primary target" select above). Indexed 1..N for the chain.
-  const primaryLabel = draft.targetModel
+  const hasPrimary = !!draft.targetModel;
+  const primaryLabel = hasPrimary
     ? draft.targetModel
     : `— ${I18n.t('services.alias_target_placeholder')} —`;
   const items = [];
+  // Unbind control is only meaningful when a primary is bound; with an empty
+  // primary the row already reads as "unbound", so we render an empty slot.
+  const unbindBtn = hasPrimary
+    ? `<tf-button variant="ghost" size="sm" icon="ban"
+                 data-primary-clear
+                 title="${escapeAttr(I18n.t('services.alias_unbind'))}"></tf-button>`
+    : '<span></span>';
   items.push(`
     <div class="svc-fallback-item primary" data-fallback-primary>
       <span class="pos">${escapeHtml(I18n.t('services.alias_primary_target_pos'))}</span>
       <span></span>
       <span></span>
       <span class="name">${escapeHtml(primaryLabel)}</span>
-      <span></span>
+      ${unbindBtn}
     </div>
   `);
   draft.fallbacks.forEach((name, idx) => {

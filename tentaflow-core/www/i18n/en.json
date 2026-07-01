@@ -544,6 +544,8 @@
     "alias_deleted": "Alias \"{name}\" deleted",
     "alias_delete_confirm": "Delete alias \"{name}\"?",
     "alias_target_placeholder": "select model",
+    "alias_unbind": "Unbind model",
+    "alias_unbound_hint": "The alias will be unbound and become inactive.",
     "alias_add_fallback": "add fallback",
     "alias_fallback_hint": "List of models/aliases routing will fall back to when primary target is unavailable. Priority left-to-right.",
     "strategy_round_robin": "Round robin (even distribution)",
