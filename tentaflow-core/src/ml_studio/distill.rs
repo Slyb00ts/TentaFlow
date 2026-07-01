@@ -149,8 +149,9 @@ async fn run_generation(
     Ok(())
 }
 
-/// Import: czyta raw_data zrodlowego datasetu (JSONL) i wyciaga pole `question_field`
-/// (domyslnie "question" albo "prompt") jako liste pytan.
+/// Import: wyciaga pytania ze zrodlowego datasetu. Obsluguje CSV/TSV/XLSX (kolumna
+/// `question_field` albo pierwsza pasujaca/pierwsza) ORAZ JSONL (pole `question_field`,
+/// fallback "question"->"prompt"). Format bierzemy z `dataset.kind` (nie zgadujemy).
 fn gather_questions_import(
     user_id: &str,
     req: &MlStudioDistillGenerateRequest,
@@ -160,8 +161,38 @@ fn gather_questions_import(
         .as_deref()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!("question_source=import wymaga source_dataset_id"))?;
+    let dataset = super::repository::get_dataset(user_id, src_id)?
+        .ok_or_else(|| anyhow::anyhow!("dataset zrodlowy niedostepny"))?;
     let raw = super::repository::get_dataset_raw(user_id, src_id)?;
     let field = req.question_field.as_deref().unwrap_or("");
+    let kind = dataset.kind.to_ascii_lowercase();
+
+    // Tabela (CSV/TSV/XLSX): wybierz kolumne z pytaniem.
+    if matches!(kind.as_str(), "csv" | "tsv" | "xlsx" | "xlsm" | "xls") {
+        let filename = format!("dataset.{kind}");
+        let (headers, rows) = crate::ml_studio::profile::parse_table(&raw, &filename)?;
+        let col = headers
+            .iter()
+            .position(|h| !field.is_empty() && h.eq_ignore_ascii_case(field))
+            .or_else(|| {
+                headers
+                    .iter()
+                    .position(|h| h.eq_ignore_ascii_case("question") || h.eq_ignore_ascii_case("prompt"))
+            })
+            .unwrap_or(0);
+        let mut out = Vec::new();
+        for row in rows {
+            if let Some(v) = row.get(col) {
+                let v = v.trim();
+                if !v.is_empty() {
+                    out.push(v.to_string());
+                }
+            }
+        }
+        return Ok(out);
+    }
+
+    // JSONL/JSON (lub nieznany kind — probujemy JSONL): obiekt per linia.
     let mut out = Vec::new();
     for line in raw.split(|&b| b == b'\n') {
         let line = line.trim_ascii();

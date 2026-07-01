@@ -2046,7 +2046,7 @@ pub async fn ml_studio_distill_generate(
 #[observed]
 pub async fn ml_studio_distill_generate_status(
     req: &MessageBody,
-    _ctx: &HandlerContext,
+    ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::DistillGenerateStatusRequest(p)) => p,
@@ -2056,6 +2056,16 @@ pub async fn ml_studio_distill_generate_status(
             ))
         }
     };
+    // Autoryzacja: postep widoczny TYLKO dla usera z dostepem do datasetu.
+    // get_dataset jest auth-scoped (None gdy user nie jest czlonkiem projektu) —
+    // bez tego dowolny user moglby pollowac status cudzego datasetu po id.
+    let org = require_org(ctx)?;
+    if repository::get_dataset(&org.user_id, &payload.dataset_id)
+        .map_err(db_err)?
+        .is_none()
+    {
+        return Err(ProtocolError::not_found("dataset not found"));
+    }
     let resp = match crate::ml_studio::distill::distill_status(&payload.dataset_id) {
         Some(p) => tentaflow_protocol::MlStudioDistillGenerateStatusResponse {
             status: p.status,

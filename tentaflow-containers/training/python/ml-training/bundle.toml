@@ -31,7 +31,8 @@ gpu_memory_gb = 8
 disk_gb = 30
 # Cross-platform: CUDA (Linux/Windows GPU) => QLoRA+LoRA; macOS (MPS) i CPU =>
 # LoRA fp32 (bez bitsandbytes/QLoRA). Device wybierany w runtime (server._pick_device).
-platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "macos-x86_64", "windows-x86_64"]
+# linux-aarch64 pominięty: indeks cu121 nie ma kół dla ARM Linux (tylko x86_64).
+platforms = ["linux-x86_64", "macos-aarch64", "macos-x86_64", "windows-x86_64"]
 
 # torch z kolami CUDA 12.1 (PyPI domyslnie serwuje wariant CPU). requirements.lock
 # pinuje torch BEZ lokalnego sufixu +cu121, zeby ten extra_index wybral wheel
