@@ -15,6 +15,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OpenFlags};
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tracing::info;
 
@@ -48,8 +49,10 @@ impl std::error::Error for DbError {}
 /// - `write()` bierze jedyne połączenie pisarza spod `Mutex` — zapisy serializują się
 ///   między sobą (nieuniknione w SQLite), ale NIE blokują odczytów.
 ///
-/// Bazy in-memory (testy) nie mają puli: każde `:memory:` to osobna pusta baza,
-/// więc `read()` spada wtedy na połączenie pisarza.
+/// Bazy in-memory (testy) też dostają pulę: `init()` używa nazwanej shared-cache
+/// bazy in-memory (`file:<name>?mode=memory&cache=shared`), więc pisarz i wszystkie
+/// połączenia puli widzą TĘ SAMĄ bazę. `from_connection()` (pojedyncze połączenie,
+/// bez puli) nadal spada na pisarza w `read()`.
 #[derive(Debug)]
 pub struct Db {
     writer: Mutex<Connection>,
@@ -146,12 +149,48 @@ fn init_read_connection(conn: &mut Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Monotoniczny licznik nadający unikalną nazwę każdej shared-cache bazie in-memory,
+/// żeby równoległe `init()` (testy) nie dzieliły przypadkiem jednej bazy.
+static MEMORY_DB_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Buduje opis połączenia dla podanej ścieżki. Dla `:memory:` (lub pustej ścieżki)
+/// zwraca URI nazwanej shared-cache bazy in-memory — wszystkie połączenia otwarte na
+/// tym URI (pisarz + pula odczytu) współdzielą TĘ SAMĄ bazę, o ile choć jedno
+/// połączenie żyje. Dla realnej ścieżki na dysku zwraca ją bez zmian (produkcja).
+///
+/// Zwraca `(target, is_memory)`: `target` przekazuje się do `Connection::open_with_flags`
+/// oraz `SqliteConnectionManager::file`, a `is_memory` decyduje o dodaniu
+/// `SQLITE_OPEN_URI` do flag otwarcia.
+fn connection_target(db_path: &Path) -> (String, bool) {
+    let is_memory = db_path.as_os_str().is_empty() || db_path == Path::new(":memory:");
+    if is_memory {
+        let seq = MEMORY_DB_SEQ.fetch_add(1, Ordering::Relaxed);
+        (
+            format!("file:tentaflow-mem-{seq}?mode=memory&cache=shared"),
+            true,
+        )
+    } else {
+        (db_path.to_string_lossy().into_owned(), false)
+    }
+}
+
 /// Inicjalizuje baze danych SQLite.
 /// Tworzy plik jesli nie istnieje, uruchamia migracje i seed.
 pub fn init(db_path: &Path) -> Result<DbPool> {
     info!("Inicjalizacja bazy danych: {:?}", db_path);
 
-    let conn = Connection::open(db_path)?;
+    let (target, is_memory) = connection_target(db_path);
+
+    // Pisarz otwiera bazę z flagą URI tylko dla in-memory (dysk nie potrzebuje URI).
+    // To połączenie żyje w `Db.writer` przez cały czas życia puli — dla shared-cache
+    // bazy in-memory utrzymuje ją przy życiu (zniknęłaby, gdyby ostatnie połączenie
+    // się zamknęło).
+    let writer_flags = if is_memory {
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_URI
+    } else {
+        OpenFlags::default()
+    };
+    let conn = Connection::open_with_flags(&target, writer_flags)?;
 
     // Pragmy wydajnosciowe SQLite. cache_size=-65536 (64MB) dla high-throughput
     // mesh_topology upsertow i per-request metryk. busy_timeout=5000 — pod mesh
@@ -215,8 +254,13 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
     // wystarcza na równoległość; `min_idle(1)` sprawia, że start otwiera tylko jedno, a
     // reszta powstaje leniwie na żądanie.
     let read_size = (num_cpus::get() as u32 * 2).clamp(4, 16);
-    let manager = SqliteConnectionManager::file(db_path)
-        .with_flags(OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let read_flags = if is_memory {
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI
+    } else {
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+    };
+    let manager = SqliteConnectionManager::file(&target)
+        .with_flags(read_flags)
         .with_init(init_read_connection);
     let read_pool = r2d2::Pool::builder()
         .max_size(read_size)
