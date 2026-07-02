@@ -3607,6 +3607,43 @@ pub fn ml_studio_ft_export_status(
     )))
 }
 
+/// Po zaakceptowanym deployu (`service_manifest_deploy` Ok) serwis inferencji
+/// ładuje się ASYNCHRONICZNIE, więc Ok nie znaczy „serwuje". Odpytujemy realny
+/// status serwisu (match po `engine_id` + `model_file` w config_json) przez krótkie
+/// okno, żeby `inference_status` odzwierciedlał prawdę zamiast optymistycznego
+/// „deployed". „deploying" gdy w oknie nie osiągnął stanu terminalnego — UI dopyta.
+async fn resolve_inference_deploy_status(
+    ctx: &HandlerContext,
+    engine_id: &str,
+    model_file: &str,
+) -> (String, Option<String>) {
+    use crate::services_repo::services::ServiceStatus;
+    for i in 0..8 {
+        if i > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        }
+        let row = ctx.state.db.read().ok().and_then(|conn| {
+            crate::services_repo::services::list_all(&conn)
+                .ok()
+                .and_then(|rows| {
+                    rows.into_iter()
+                        .find(|r| r.engine_id == engine_id && r.config_json.contains(model_file))
+                })
+        });
+        match row.map(|r| (r.status, r.health_last_err)) {
+            Some((ServiceStatus::Running, _)) => return ("deployed".to_string(), None),
+            Some((ServiceStatus::Failed, err)) | Some((ServiceStatus::Degraded, err)) => {
+                return (
+                    "failed".to_string(),
+                    Some(err.unwrap_or_else(|| "serwis inferencji nie wystartował".to_string())),
+                );
+            }
+            _ => {}
+        }
+    }
+    ("deploying".to_string(), None)
+}
+
 /// DEPLOY wytrenowanego modelu FT (lokalny GGUF po eksporcie) jako embedded
 /// serwisu inferencji llama.cpp. Domyka cykl FT: trenuj→eksportuj→DEPLOY→używaj.
 /// Reużywa istniejącego `service_manifest_deploy` (engine `llama-cpp`, `native`
@@ -3750,10 +3787,11 @@ pub async fn ml_studio_ft_deploy(
         )
         .await
         {
-            // Deploy lokalny jest synchroniczny — sukces = serwis już wystartował,
-            // więc status odpowiedzi „deployed" (spójny z `inference_status` w metrykach
-            // i z obsługą w UI, które dla „deployed" zamyka modal od razu, bez pollingu).
-            Ok(_) => ("deployed".to_string(), None),
+            // service_manifest_deploy Ok = deploy PRZYJĘTY; serwis ładuje się
+            // asynchronicznie (health), więc Ok != „serwuje". Sprawdzamy realny
+            // status serwisu, żeby inference_status nie kłamał „deployed" przy
+            // nieudanym starcie (brak backendu, OOM, zły GGUF).
+            Ok(_) => resolve_inference_deploy_status(ctx, engine_id, &deploy_path).await,
             Err(e) => ("failed".to_string(), Some(e.to_string())),
         };
         let mut merged = metrics.clone();
@@ -3761,9 +3799,9 @@ pub async fn ml_studio_ft_deploy(
             obj.insert("inference_model_name".to_string(), serde_json::json!(model_name));
             obj.insert(
                 "inference_status".to_string(),
-                serde_json::json!(if error.is_none() { "deployed" } else { "failed" }),
+                serde_json::json!(status),
             );
-            if error.is_none() {
+            if status == "deployed" {
                 obj.insert("inference_node".to_string(), serde_json::json!(deploy_node));
             }
         }
