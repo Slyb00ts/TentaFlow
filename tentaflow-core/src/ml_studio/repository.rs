@@ -414,6 +414,21 @@ pub fn update_dataset_data(
     Ok(())
 }
 
+/// Ustawia `distill_status` w profile_json (np. "failed" gdy generacja padnie).
+/// Bez tego nieudany dataset zostaje "pending" w bazie i blokada edycji trzyma go
+/// na zawsze (stan in-memory znika po restarcie). json_set zachowuje distill_meta.
+pub fn set_dataset_distill_status(dataset_id: &str, status: &str) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
+    conn.execute(
+        "UPDATE datasets SET \
+             profile_json = json_set(COALESCE(NULLIF(profile_json, ''), '{}'), '$.distill_status', ?1) \
+         WHERE dataset_id = ?2",
+        params![status, dataset_id],
+    )?;
+    Ok(())
+}
+
 /// Lists datasets of a project, newest first. Authorization by membership.
 pub fn list_datasets(user_id: &str, project_id: &str) -> Result<Vec<Dataset>> {
     let pool = super::db::pool()?;

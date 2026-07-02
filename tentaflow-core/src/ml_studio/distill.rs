@@ -97,6 +97,10 @@ pub fn spawn_distill_generation(
                 p.status = "failed".to_string();
                 p.error = Some(format!("{e:#}"));
             });
+            // Persystujemy status "failed" do profile_json — inaczej dataset zostaje
+            // "pending" w bazie i blokada edycji trzyma go na zawsze (mapa in-memory
+            // znika po restarcie). Dzięki temu nieudany dataset da się ręcznie naprawić.
+            let _ = super::repository::set_dataset_distill_status(&ds_id, "failed");
         }
     });
 
