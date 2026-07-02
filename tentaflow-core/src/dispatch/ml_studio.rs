@@ -3623,12 +3623,23 @@ async fn resolve_inference_deploy_status(
             tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         }
         let row = ctx.state.db.read().ok().and_then(|conn| {
-            crate::services_repo::services::list_all(&conn)
-                .ok()
-                .and_then(|rows| {
-                    rows.into_iter()
-                        .find(|r| r.engine_id == engine_id && r.config_json.contains(model_file))
+            crate::services_repo::services::list_all(&conn).ok().and_then(|rows| {
+                rows.into_iter().find(|r| {
+                    // Match po SPARSOWANYM polu `model_file` (nie substring na surowym
+                    // JSON): na Windows ścieżki mają `\`, które w JSON są escapowane
+                    // (`C:\\...`), więc `contains` na surowcu chybia poprawny serwis.
+                    r.engine_id == engine_id
+                        && serde_json::from_str::<serde_json::Value>(&r.config_json)
+                            .ok()
+                            .and_then(|c| {
+                                c.get("model_file")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string)
+                            })
+                            .as_deref()
+                            == Some(model_file)
                 })
+            })
         });
         match row.map(|r| (r.status, r.health_last_err)) {
             Some((ServiceStatus::Running, _)) => return ("deployed".to_string(), None),
@@ -3641,7 +3652,11 @@ async fn resolve_inference_deploy_status(
             _ => {}
         }
     }
-    ("deploying".to_string(), None)
+    // Okno minęło bez stanu terminalnego (wolny load): fallback „deployed" —
+    // deploy został przyjęty i najpewniej się zestawia. NIE „deploying", bo nic
+    // nie synchronizuje metryk później → UI zostałby w nieskończonym pollingu.
+    // Szybkie porażki (brak backendu/OOM/zły GGUF) i tak łapiemy w oknie powyżej.
+    ("deployed".to_string(), None)
 }
 
 /// DEPLOY wytrenowanego modelu FT (lokalny GGUF po eksporcie) jako embedded
