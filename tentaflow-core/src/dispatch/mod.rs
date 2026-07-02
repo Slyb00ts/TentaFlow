@@ -616,6 +616,18 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MlStudioPayload::DatasetProfileResponse(_) => {
                 "MlStudioDatasetProfileResponse"
             }
+            tentaflow_protocol::MlStudioPayload::DatasetRowsRequest(_) => {
+                "MlStudioDatasetRowsRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetRowsResponse(_) => {
+                "MlStudioDatasetRowsResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetRowsSaveRequest(_) => {
+                "MlStudioDatasetRowsSaveRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetRowsSaveResponse(_) => {
+                "MlStudioDatasetRowsSaveResponse"
+            }
             tentaflow_protocol::MlStudioPayload::TabularTrainRequest(_) => {
                 "MlStudioTabularTrainRequest"
             }

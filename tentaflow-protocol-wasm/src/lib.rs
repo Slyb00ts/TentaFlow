@@ -2277,6 +2277,35 @@ pub fn encode_ml_studio_distill_generate_status_request(
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeMlStudioDatasetRowsRequest)]
+pub fn encode_ml_studio_dataset_rows_request(
+    dataset_id: String,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::DatasetRowsRequest(
+            tentaflow_protocol::MlStudioDatasetRowsRequest {
+                dataset_id,
+                limit: if limit == 0 { None } else { Some(limit) },
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioDatasetRowsSaveRequest)]
+pub fn encode_ml_studio_dataset_rows_save_request(
+    dataset_id: String,
+    rows: Vec<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::DatasetRowsSaveRequest(
+            tentaflow_protocol::MlStudioDatasetRowsSaveRequest { dataset_id, rows },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioFtTrainStatusRequest)]
 pub fn encode_ml_studio_ft_train_status_request(run_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
@@ -9861,6 +9890,41 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
                 arr.push(&JsValue::from(o));
             }
             set(obj, "samples", arr.into());
+        }
+        tentaflow_protocol::MlStudioPayload::DatasetRowsRequest(req) => {
+            set(obj, "variant", "MlStudioDatasetRowsRequest".into());
+            set(obj, "datasetId", req.dataset_id.clone().into());
+            set(obj, "dataset_id", req.dataset_id.into());
+            set(obj, "limit", req.limit.unwrap_or(0).into());
+        }
+        tentaflow_protocol::MlStudioPayload::DatasetRowsSaveRequest(req) => {
+            set(obj, "variant", "MlStudioDatasetRowsSaveRequest".into());
+            set(obj, "datasetId", req.dataset_id.clone().into());
+            set(obj, "dataset_id", req.dataset_id.into());
+            let arr = js_sys::Array::new();
+            for r in req.rows {
+                arr.push(&JsValue::from(r));
+            }
+            set(obj, "rows", arr.into());
+        }
+        tentaflow_protocol::MlStudioPayload::DatasetRowsResponse(resp) => {
+            set(obj, "variant", "MlStudioDatasetRowsResponse".into());
+            set(obj, "datasetId", resp.dataset_id.clone().into());
+            set(obj, "dataset_id", resp.dataset_id.into());
+            set(obj, "kind", resp.kind.into());
+            set(obj, "total", resp.total.into());
+            let arr = js_sys::Array::new();
+            for r in resp.rows {
+                arr.push(&JsValue::from(r));
+            }
+            set(obj, "rows", arr.into());
+        }
+        tentaflow_protocol::MlStudioPayload::DatasetRowsSaveResponse(resp) => {
+            set(obj, "variant", "MlStudioDatasetRowsSaveResponse".into());
+            set(obj, "datasetId", resp.dataset_id.clone().into());
+            set(obj, "dataset_id", resp.dataset_id.into());
+            set(obj, "rowCount", resp.row_count.into());
+            set(obj, "row_count", resp.row_count.into());
         }
         tentaflow_protocol::MlStudioPayload::FtTrainStatusRequest(req) => {
             set(obj, "variant", "MlStudioFtTrainStatusRequest".into());

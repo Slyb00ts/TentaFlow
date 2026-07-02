@@ -1470,6 +1470,39 @@ pub struct MlStudioDatasetProfileResponse {
     pub profile: TableProfile,
 }
 
+/// Podglad/edycja zawartosci datasetu. Wiersze to surowe linie JSONL (generyczne —
+/// dziala dla {question,answer}, {prompt,chosen,rejected} i innych ksztaltow).
+/// GUI parsuje/buduje JSON per wiersz; zapis nadpisuje raw_data datasetu.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetRowsRequest {
+    pub dataset_id: String,
+    /// Limit wierszy (0 = wszystkie); GUI moze paginowac dla duzych datasetow.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetRowsResponse {
+    pub dataset_id: String,
+    pub kind: String,
+    pub total: u32,
+    /// Surowe linie JSONL (do `total` albo do limitu).
+    pub rows: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetRowsSaveRequest {
+    pub dataset_id: String,
+    /// Pelny zestaw wierszy (linie JSONL) — nadpisuje raw_data datasetu.
+    pub rows: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetRowsSaveResponse {
+    pub dataset_id: String,
+    pub row_count: u32,
+}
+
 /// One admin-managed mesh resource grant (§11.3). A record of an allocation of
 /// a node resource to a subject, not live usage. `subject_kind` ∈
 /// {user, group, project}; `resource_kind` ∈ {gpu, cpu, ram}. `resource_ref`
@@ -2285,6 +2318,10 @@ pub enum MlStudioPayload {
     DatasetsListResponse(MlStudioDatasetsListResponse),
     DatasetProfileRequest(MlStudioDatasetProfileRequest),
     DatasetProfileResponse(MlStudioDatasetProfileResponse),
+    DatasetRowsRequest(MlStudioDatasetRowsRequest),
+    DatasetRowsResponse(MlStudioDatasetRowsResponse),
+    DatasetRowsSaveRequest(MlStudioDatasetRowsSaveRequest),
+    DatasetRowsSaveResponse(MlStudioDatasetRowsSaveResponse),
     TabularTrainRequest(MlStudioTabularTrainRequest),
     TabularTrainResponse(MlStudioTabularTrainResponse),
     ResourceGrantCreateRequest(MlStudioResourceGrantCreateRequest),

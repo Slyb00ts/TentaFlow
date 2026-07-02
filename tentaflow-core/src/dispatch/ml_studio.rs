@@ -1331,6 +1331,98 @@ pub fn ml_studio_dataset_profile(
     )))
 }
 
+/// Zwraca WIERSZE datasetu (surowe linie JSONL) do podglądu/edycji w GUI. Generyczne
+/// — działa dla {question,answer}, {prompt,chosen,rejected} i innych kształtów.
+#[handler(variant = "MlStudioDatasetRowsRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_dataset_rows(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::DatasetRowsRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioDatasetRowsRequest")),
+    };
+    let org = require_org(ctx)?;
+    let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+    let raw = repository::get_dataset_raw(&org.user_id, &payload.dataset_id).map_err(db_err)?;
+    let text = String::from_utf8_lossy(&raw);
+    let all: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    let total = all.len() as u32;
+    let rows = match payload.limit {
+        Some(n) if n > 0 => all.into_iter().take(n as usize).collect(),
+        _ => all,
+    };
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::DatasetRowsResponse(
+        tentaflow_protocol::MlStudioDatasetRowsResponse {
+            dataset_id: payload.dataset_id.clone(),
+            kind: dataset.kind,
+            total,
+            rows,
+        },
+    )))
+}
+
+/// Nadpisuje zawartość datasetu ręcznie edytowanymi wierszami (JSONL). Waliduje, że
+/// każdy wiersz to poprawny obiekt JSON. Wymaga roli edytora projektu.
+#[handler(variant = "MlStudioDatasetRowsSaveRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_dataset_rows_save(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::DatasetRowsSaveRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioDatasetRowsSaveRequest")),
+    };
+    let org = require_org(ctx)?;
+    let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+    require_project_editor(&org.user_id, &dataset.project_id)?;
+
+    // Każdy wiersz musi być poprawnym obiektem JSON — raw_data trzymamy jako JSONL.
+    let mut clean: Vec<String> = Vec::with_capacity(payload.rows.len());
+    for (i, r) in payload.rows.iter().enumerate() {
+        let t = r.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(t).map_err(|e| {
+            ProtocolError::bad_request(format!("wiersz {} nie jest poprawnym JSON: {}", i + 1, e))
+        })?;
+        if !v.is_object() {
+            return Err(ProtocolError::bad_request(format!(
+                "wiersz {} nie jest obiektem JSON",
+                i + 1
+            )));
+        }
+        clean.push(t.to_string());
+    }
+    let row_count = clean.len() as u64;
+    let mut jsonl = clean.join("\n");
+    if !jsonl.is_empty() {
+        jsonl.push('\n');
+    }
+    repository::update_dataset_data(&org.user_id, &payload.dataset_id, row_count, jsonl.as_bytes())
+        .map_err(db_err)?;
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::DatasetRowsSaveResponse(
+        tentaflow_protocol::MlStudioDatasetRowsSaveResponse {
+            dataset_id: payload.dataset_id.clone(),
+            row_count: row_count as u32,
+        },
+    )))
+}
+
 #[handler(variant = "MlStudioTabularTrainRequest", since = (1, 0))]
 #[policy(PowerUser)]
 #[observed]

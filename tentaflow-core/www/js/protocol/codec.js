@@ -2906,6 +2906,43 @@ export const encode = {
   },
 
   /**
+   * MessageBody::MlStudioBody(DatasetRowsRequest) — pobranie WIERSZY datasetu
+   * (linie JSONL) do podglądu/edycji. payload: { datasetId, limit? }.
+   */
+  mlStudioDatasetRowsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioDatasetRowsRequest(
+      String(payload.datasetId ?? payload.dataset_id ?? ''),
+      (payload.limit ?? 0) >>> 0,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(DatasetRowsSaveRequest) — nadpisanie datasetu
+   * ręcznie edytowanymi wierszami. payload: { datasetId, rows: string[] (linie JSONL) }.
+   */
+  mlStudioDatasetRowsSaveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const rows = Array.isArray(payload.rows) ? payload.rows.map((r) => String(r)) : [];
+    const body = _wasm.encodeMlStudioDatasetRowsSaveRequest(
+      String(payload.datasetId ?? payload.dataset_id ?? ''),
+      rows,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
    * MessageBody::MlStudioBody(TabularTrainRequest) — train the tabular baseline
    * on a dataset's target column and get a ranked leaderboard back.
    * payload: { projectId, datasetId, targetColumn, task: 'classification'|'regression', engine?: 'rust'|'autogluon' }.

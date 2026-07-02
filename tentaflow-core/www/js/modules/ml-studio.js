@@ -2166,6 +2166,22 @@ async function renderDistillDataTab(panel, p) {
         <tf-button id="ml-distill-go" variant="primary">Generuj dataset</tf-button>
       </div>
       <div id="ml-distill-progress" style="margin-top:14px;" hidden></div>
+
+      <hr style="margin:20px 0;border:none;border-top:1px solid var(--border);">
+      <label class="ml-studio-field-label">Podgląd i ręczna edycja datasetu</label>
+      <p class="ml-studio-hint" style="margin:0 0 8px;">Wczytaj istniejący dataset, żeby zobaczyć wygenerowane pary i ręcznie dodać/poprawić/usunąć wiersze. Kolumny dobierają się do formatu (SFT/KD: pytanie·odpowiedź; DPO: prompt·lepsza·gorsza).</p>
+      <div style="display:flex;gap:8px;align-items:center;margin:2px 0 8px;">
+        <select id="ml-distill-edit-ds" class="ml-studio-model-input" style="flex:1;box-sizing:border-box;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text);">
+          <option value="">— wybierz dataset —</option>${datasetOptions}
+        </select>
+        <tf-button id="ml-distill-edit-load" variant="outline">Wczytaj</tf-button>
+      </div>
+      <div id="ml-distill-edit-rows"></div>
+      <div id="ml-distill-edit-actions" style="display:none;gap:8px;margin-top:10px;">
+        <tf-button id="ml-distill-edit-add" variant="ghost">+ Dodaj wiersz</tf-button>
+        <tf-button id="ml-distill-edit-save" variant="primary">Zapisz zmiany</tf-button>
+      </div>
+      <div id="ml-distill-edit-status" class="ml-studio-hint" style="margin-top:6px;"></div>
     </div>`;
 
   let source = 'generate';
@@ -2286,6 +2302,80 @@ async function renderDistillDataTab(panel, p) {
     };
     tick();
   }
+
+  // ---- Podgląd i ręczna edycja datasetu (wiersze JSONL) ----
+  const editRowsBox = byId('ml-distill-edit-rows');
+  const editActions = byId('ml-distill-edit-actions');
+  const editStatus = byId('ml-distill-edit-status');
+  let editCols = ['question', 'answer']; // wykrywane z danych; fallback SFT
+  let editDatasetId = '';
+
+  const rowFieldHtml = (col, val) =>
+    `<div style="flex:1;min-width:0;"><div class="ml-studio-hint" style="margin-bottom:2px;">${escapeHtml(col)}</div>` +
+    `<textarea data-col="${escapeAttr(col)}" rows="2" style="width:100%;box-sizing:border-box;padding:6px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text);">${escapeHtml(val)}</textarea></div>`;
+
+  const addRowEl = (obj) => {
+    const row = document.createElement('div');
+    row.className = 'ml-distill-edit-row';
+    row.style = 'display:flex;gap:8px;align-items:flex-start;margin:6px 0;padding:8px;border:1px solid var(--border);border-radius:6px;';
+    row.innerHTML = editCols.map((c) => rowFieldHtml(c, obj && obj[c] != null ? String(obj[c]) : '')).join('')
+      + '<button type="button" class="ml-distill-edit-del" title="Usuń wiersz" style="align-self:center;background:none;border:none;color:var(--danger,#c66);cursor:pointer;font-size:18px;">✕</button>';
+    row.querySelector('.ml-distill-edit-del')?.addEventListener('click', () => row.remove());
+    editRowsBox.appendChild(row);
+  };
+
+  const collectRows = () => {
+    const out = [];
+    editRowsBox.querySelectorAll('.ml-distill-edit-row').forEach((row) => {
+      const o = {};
+      let any = false;
+      row.querySelectorAll('textarea[data-col]').forEach((ta) => {
+        const v = ta.value.trim();
+        o[ta.getAttribute('data-col')] = v;
+        if (v) any = true;
+      });
+      if (any) out.push(JSON.stringify(o)); // pomijamy całkowicie puste wiersze
+    });
+    return out;
+  };
+
+  byId('ml-distill-edit-load')?.addEventListener('click', async () => {
+    const dsid = String(byId('ml-distill-edit-ds')?.value || '');
+    if (!dsid) { toast('Wybierz dataset', 'error'); return; }
+    editStatus.textContent = 'Wczytywanie…';
+    try {
+      const resp = await ApiBinary.one('mlStudioDatasetRowsRequest', { datasetId: dsid });
+      const raw = Array.isArray(resp.rows) ? resp.rows : [];
+      const parsed = raw.map((r) => { try { return JSON.parse(r); } catch (_) { return null; } })
+        .filter((o) => o && typeof o === 'object');
+      editCols = parsed.length ? Object.keys(parsed[0]) : ['question', 'answer'];
+      editDatasetId = dsid;
+      editRowsBox.innerHTML = '';
+      parsed.forEach((o) => addRowEl(o));
+      if (!parsed.length) addRowEl(null); // pusty dataset → jeden pusty wiersz do wypełnienia
+      editActions.style.display = 'flex';
+      const total = resp.total ?? parsed.length;
+      editStatus.textContent = `Wczytano ${parsed.length} z ${total} wierszy (kolumny: ${editCols.join(' · ')}).`;
+    } catch (e) {
+      editStatus.textContent = 'Błąd wczytywania: ' + (e.message || e);
+    }
+  });
+
+  byId('ml-distill-edit-add')?.addEventListener('click', () => addRowEl(null));
+
+  byId('ml-distill-edit-save')?.addEventListener('click', async () => {
+    if (!editDatasetId) { toast('Najpierw wczytaj dataset', 'error'); return; }
+    const rows = collectRows();
+    editStatus.textContent = 'Zapisywanie…';
+    try {
+      const resp = await ApiBinary.one('mlStudioDatasetRowsSaveRequest', { datasetId: editDatasetId, rows });
+      editStatus.textContent = `Zapisano ${resp.rowCount ?? resp.row_count ?? rows.length} wierszy.`;
+      toast('Dataset zapisany', 'success');
+    } catch (e) {
+      editStatus.textContent = 'Błąd zapisu: ' + (e.message || e);
+      toast('Błąd zapisu datasetu', 'error');
+    }
+  });
 }
 
 // =============================================================================
