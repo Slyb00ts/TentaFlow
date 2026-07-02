@@ -935,6 +935,7 @@ async fn ensure_cluster_model(
             model_repo,
             engine_id,
             hf_token.as_deref(),
+            deployment_cluster_id,
         )
         .await
         .map_err(|e| format!("head: pobranie modelu: {e}"))?;
@@ -1526,6 +1527,61 @@ pub async fn cluster_deploy(
         ));
     }
 
+    // Canoniczny wpis `services` dla CALEGO cluster-deployu — od razu widoczny na
+    // liscie serwisow jako `deploying` (spojnie z single-node deployem), potem
+    // sterowany do `running`/`failed` przez maszyne faz. Per-node wpisy czlonkow
+    // (head + workery) sa ukrywane w `service_list` (dedup po
+    // `deployment_cluster_id`/członkostwie), wiec user widzi JEDEN wpis. Wiersz
+    // jest inertny dla supervisora (pinned=false, External/ExternalHttp, zero
+    // modeli), a routing i tak idzie przez realny wpis head-a.
+    {
+        let placeholder = crate::services::deploy::build_placeholder_for_cluster(
+            engine_id,
+            &served,
+            endpoint_url.clone(),
+            &deployment_cluster_id,
+        );
+        // Placeholder jest kontraktem „widoczny od startu" — jego brak lamie
+        // liste serwisow. Traktujemy insert jak czesc transakcyjnego startu:
+        // porazka aportuje deploy (release portow + delete cluster + delete
+        // wiersza deployments), spojnie z bledem `deployments::create` powyzej.
+        let insert_result = match ctx.state.db.write() {
+            Ok(conn) => crate::services_repo::services::insert(&conn, &placeholder)
+                .map_err(|e| e.to_string()),
+            Err(_) => Err("db pool poisoned".to_string()),
+        };
+        match insert_result {
+            Ok(service_id) => {
+                if let Ok(Some(info)) = crate::services::snapshot_builder::build_one(
+                    &ctx.state.db,
+                    service_id,
+                    ctx.state.local_node_id.as_ref(),
+                ) {
+                    super::handlers::broadcast_service_change(
+                        ctx,
+                        tentaflow_protocol::ServiceChange::Added(info),
+                    );
+                }
+            }
+            Err(e) => {
+                let _ = port_allocator.release(serve_port);
+                let _ = port_allocator.release(dist_port);
+                let _ = crate::db::repository::delete_cluster_deployment(
+                    &ctx.state.db,
+                    &deployment_cluster_id,
+                );
+                let _ = crate::db::repository::deployments::delete(
+                    &ctx.state.db,
+                    &deployment_cluster_id,
+                );
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::Internal,
+                    format!("persist cluster placeholder service: {e}"),
+                ));
+            }
+        }
+    }
+
     // NIEBLOKUJACY zwrot: kanal log-busa MUSI istniec zanim frontend zdazy
     // zasubskrybowac `deploymentLogStreamRequest` (keyed by deployment_cluster_id),
     // wiec tworzymy go SYNCHRONICZNIE tu, przed spawnem taska faz.
@@ -1612,6 +1668,83 @@ async fn cdeploy_end(db: &crate::db::DbPool, tx: &ClusterLogTx, did: &str, start
 /// `log_bus::fail` (persystuje `[error]` do log_tail, oznacza wiersz `deployments`
 /// jako `failed`, emituje StreamEnd(error) i zamyka kanal).
 #[allow(clippy::too_many_arguments)]
+/// Aktualizuje status canonicznego placeholder-a cluster-deployu (wiersz
+/// `services` z `active_deploy_id == deployment_cluster_id`) i broadcastuje
+/// `ServiceChange::Updated`, zeby lista serwisow przeszla deploying→running/failed
+/// spojnie z single-node deployem. No-op gdy placeholder juz nie istnieje.
+fn update_cluster_placeholder_status(
+    ctx: &HandlerContext,
+    deployment_cluster_id: &str,
+    status: crate::services_repo::services::ServiceStatus,
+) {
+    let service_id = {
+        let conn = match ctx.state.db.read() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        match crate::services_repo::services::find_id_by_active_deploy_id(
+            &conn,
+            deployment_cluster_id,
+        ) {
+            Ok(Some(id)) => id,
+            _ => return,
+        }
+    };
+    {
+        let conn = match ctx.state.db.write() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if let Err(e) = crate::services_repo::services::update_status(&conn, service_id, status) {
+            warn!("cluster placeholder status update failed: {}", e);
+            return;
+        }
+    }
+    if let Ok(Some(info)) = crate::services::snapshot_builder::build_one(
+        &ctx.state.db,
+        service_id,
+        ctx.state.local_node_id.as_ref(),
+    ) {
+        super::handlers::broadcast_service_change(
+            ctx,
+            tentaflow_protocol::ServiceChange::Updated(info),
+        );
+    }
+}
+
+/// Usuwa canoniczny placeholder cluster-deployu i broadcastuje
+/// `ServiceChange::Removed` (wywolywane przy jawnym STOP klastra). No-op gdy
+/// placeholder juz nie istnieje.
+fn remove_cluster_placeholder(ctx: &HandlerContext, deployment_cluster_id: &str) {
+    let service_id = {
+        let conn = match ctx.state.db.read() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        match crate::services_repo::services::find_id_by_active_deploy_id(
+            &conn,
+            deployment_cluster_id,
+        ) {
+            Ok(Some(id)) => id,
+            _ => return,
+        }
+    };
+    {
+        let conn = match ctx.state.db.write() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if let Err(e) = crate::services_repo::services::delete(&conn, service_id) {
+            warn!("cluster placeholder delete failed: {}", e);
+            return;
+        }
+    }
+    super::handlers::broadcast_service_change(
+        ctx,
+        tentaflow_protocol::ServiceChange::Removed { service_id },
+    );
+}
+
 async fn cdeploy_fail(
     ctx: &HandlerContext,
     qm: &Arc<IrohMeshManager>,
@@ -1641,6 +1774,14 @@ async fn cdeploy_fail(
         reason.clone(),
     )
     .await;
+    // Placeholder zostaje na liscie jako `failed` (jak single-node deploy przy
+    // porazce) — user widzi ze deploy klastra sie nie udal. Realne wpisy
+    // czlonkow zostaly juz sprzatniete przez teardown w `finalize_distributed_failure`.
+    update_cluster_placeholder_status(
+        ctx,
+        deployment_cluster_id,
+        crate::services_repo::services::ServiceStatus::Failed,
+    );
     let msg = match resp {
         MessageBody::ClusterDeployResponseBody(r) => r.message.unwrap_or(reason),
         _ => reason,
@@ -2003,6 +2144,11 @@ async fn run_cluster_deploy_phases(
         &deployment_cluster_id,
         "running",
     );
+    update_cluster_placeholder_status(
+        ctx,
+        &deployment_cluster_id,
+        crate::services_repo::services::ServiceStatus::Running,
+    );
 
     if prompt_per_1k.is_some()
         || completion_per_1k.is_some()
@@ -2238,6 +2384,9 @@ async fn finalize_distributed_failure(
         let _ = ports.release(serve_port);
         let _ = ports.release(dist_port);
     }
+    // Ubij ewentualny kontener pobierania modelu (stall/kill mogl juz go usunac —
+    // best-effort, `--rm` czysci go po normalnym zakonczeniu).
+    crate::services::deploy::distributed::remove_download_container(deployment_cluster_id).await;
     let teardown_errors =
         teardown_distributed_members(ctx, qm, local_id, deployment_cluster_id, members).await;
     let message = if teardown_errors.is_empty() {
@@ -2428,11 +2577,17 @@ pub async fn cluster_deploy_stop(
         {
             warn!("delete_cluster_deployment nieudany: {}", e);
         }
+        remove_cluster_placeholder(ctx, deployment_cluster_id);
     } else {
         let _ = crate::db::repository::set_cluster_deployment_status(
             &ctx.state.db,
             deployment_cluster_id,
             "failed",
+        );
+        update_cluster_placeholder_status(
+            ctx,
+            deployment_cluster_id,
+            crate::services_repo::services::ServiceStatus::Failed,
         );
     }
 

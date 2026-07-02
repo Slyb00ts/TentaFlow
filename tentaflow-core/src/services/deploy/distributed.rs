@@ -264,6 +264,7 @@ pub async fn ensure_model_downloaded_local(
     model_repo: &str,
     engine_id: &str,
     hf_token: Option<&str>,
+    deployment_cluster_id: &str,
 ) -> Result<PathBuf, String> {
     if !model_repo_is_safe(model_repo) {
         return Err(format!("niepoprawne repo modelu: {model_repo}"));
@@ -277,16 +278,76 @@ pub async fn ensure_model_downloaded_local(
     }
     #[cfg(feature = "docker")]
     {
-        download_model_via_container(model_repo, engine_id, hf_token).await?;
+        download_model_via_container(model_repo, engine_id, hf_token, deployment_cluster_id).await?;
         model_snapshot_dir(model_repo).ok_or_else(|| {
             format!("model {model_repo} pobrany, ale snapshot niekompletny (brak config.json/*.safetensors)")
         })
     }
     #[cfg(not(feature = "docker"))]
     {
-        let _ = (engine_id, hf_token);
+        let _ = (engine_id, hf_token, deployment_cluster_id);
         Err("tentaflow-core zbudowany bez feature `docker` — nie moge pobrac modelu".to_string())
     }
+}
+
+/// Deterministyczna nazwa kontenera pobierania modelu dla danego deploymentu —
+/// pozwala ubic go po stall-timeout (`docker rm -f`) i posprzatac przy teardown.
+/// Sanityzacja do dozwolonych znakow nazwy kontenera Dockera (`[A-Za-z0-9_.-]`).
+pub fn download_container_name(deployment_cluster_id: &str) -> String {
+    let prefix: String = deployment_cluster_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .take(24)
+        .collect();
+    let prefix = if prefix.is_empty() {
+        "unknown".to_string()
+    } else {
+        prefix
+    };
+    format!("tf-model-dl-{prefix}")
+}
+
+/// Best-effort usuniecie kontenera pobierania modelu (stall-kill / teardown).
+/// Ignoruje bledy (kontener moze juz nie istniec — `--rm` sam go czysci po
+/// normalnym zakonczeniu).
+pub async fn remove_download_container(deployment_cluster_id: &str) {
+    #[cfg(feature = "docker")]
+    {
+        let name = download_container_name(deployment_cluster_id);
+        let _ = tokio::process::Command::new("docker")
+            .args(["rm", "-f", &name])
+            .output()
+            .await;
+    }
+    #[cfg(not(feature = "docker"))]
+    {
+        let _ = deployment_cluster_id;
+    }
+}
+
+/// Sumaryczny rozmiar plikow (bez podazania za symlinkami) w katalogu — mierzy
+/// POSTEP pobierania: bloby HF rosna w `models--org--name/blobs/*`.
+#[cfg(feature = "docker")]
+fn dir_size_bytes(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&p) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let ep = entry.path();
+            let Ok(md) = std::fs::symlink_metadata(&ep) else {
+                continue;
+            };
+            if md.is_dir() {
+                stack.push(ep);
+            } else if md.is_file() {
+                total += md.len();
+            }
+        }
+    }
+    total
 }
 
 /// Pierwszy lokalny obraz Docker silnika (`tentaflow/<engine_id>...`), zdatny do
@@ -317,11 +378,21 @@ async fn download_model_via_container(
     model_repo: &str,
     engine_id: &str,
     hf_token: Option<&str>,
+    deployment_cluster_id: &str,
 ) -> Result<(), String> {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::io::AsyncRead;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    // Brak POSTEPU (rozmiar cache nie rosnie i output nie przybywa) przez ten czas
+    // => pobieranie utknelo (np. gated model bez hf_token) — ubijamy kontener.
+    // Duzy model przez wolne lacze pobiera sie legalnie dlugo, wiec progiem jest
+    // BRAK POSTEPU, nie calkowity czas.
+    const STALL_SECS: u64 = 600;
+    // Bezpiecznik gornego limitu calkowitego czasu (postep to glowny mechanizm).
+    const MAX_SECS: u64 = 4 * 3600;
 
     let image = resolve_download_image(engine_id).await.ok_or_else(|| {
         format!(
@@ -332,6 +403,11 @@ async fn download_model_via_container(
     let models_host = crate::paths::models_root();
     std::fs::create_dir_all(&models_host)
         .map_err(|e| format!("mkdir models_root: {e}"))?;
+    let cache_dir = models_host.join(model_dir_name(model_repo));
+    let container_name = download_container_name(deployment_cluster_id);
+    // Usun ewentualny nieszczelny kontener po poprzednim nieudanym pobieraniu,
+    // inaczej `docker run --name` odmowi (konflikt nazwy).
+    remove_download_container(deployment_cluster_id).await;
     let mount = format!(
         "{}:{}",
         models_host.display(),
@@ -345,6 +421,8 @@ async fn download_model_via_container(
     let mut args: Vec<String> = vec![
         "run".into(),
         "--rm".into(),
+        "--name".into(),
+        container_name.clone(),
         "-v".into(),
         mount,
         "-e".into(),
@@ -373,6 +451,9 @@ async fn download_model_via_container(
         .map_err(|e| format!("docker run (pobieranie modelu) nieudany: {e}"))?;
 
     let tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+    // Licznik linii outputu — rosnie => kontener zyje i cos robi (drugi sygnal
+    // postepu obok rozmiaru cache).
+    let line_counter = Arc::new(AtomicU64::new(0));
     let mut drains = Vec::new();
     // stdout i stderr maja rozne typy (ChildStdout / ChildStderr), wiec ujednolicamy
     // je do wspolnego trait-objectu AsyncRead, by trzymac w jednej tablicy.
@@ -395,6 +476,7 @@ async fn download_model_via_container(
     for (pipe, is_err) in pipes {
         let Some(pipe) = pipe else { continue };
         let tail = tail.clone();
+        let line_counter = line_counter.clone();
         let repo = model_repo.to_string();
         drains.push(tokio::spawn(async move {
             let mut lines = BufReader::new(pipe).lines();
@@ -403,6 +485,7 @@ async fn download_model_via_container(
                 if l.is_empty() {
                     continue;
                 }
+                line_counter.fetch_add(1, Ordering::Relaxed);
                 tracing::info!(model = %repo, "hf download: {l}");
                 if is_err {
                     if let Ok(mut t) = tail.lock() {
@@ -416,13 +499,51 @@ async fn download_model_via_container(
         }));
     }
 
-    // Heartbeat: duze wagi ida dlugo (tqdm pisze `\r` bez nowej linii), wiec bez
-    // tego log milczalby minutami.
+    // Heartbeat + stall-watchdog: duze wagi ida dlugo (tqdm pisze `\r` bez nowej
+    // linii), wiec log milczalby minutami. Co 60s sprawdzamy POSTEP (rozmiar cache
+    // rosnie LUB output przybywa); brak postepu przez STALL_SECS => ubijamy kontener.
+    let started = std::time::Instant::now();
+    let mut last_progress = std::time::Instant::now();
+    let mut prev_lines = 0u64;
+    let mut prev_size = 0u64;
     let status = loop {
         tokio::select! {
             s = child.wait() => break s.map_err(|e| format!("docker run (pobieranie modelu): {e}"))?,
             _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                tracing::info!(model = %model_repo, "hf download: nadal trwa...");
+                let lines = line_counter.load(Ordering::Relaxed);
+                let size = dir_size_bytes(&cache_dir);
+                if lines > prev_lines || size > prev_size {
+                    last_progress = std::time::Instant::now();
+                    prev_lines = lines;
+                    prev_size = size;
+                    tracing::info!(model = %model_repo, cache_mb = size / 1_048_576, "hf download: postep...");
+                } else {
+                    let stalled = last_progress.elapsed().as_secs();
+                    tracing::warn!(model = %model_repo, stalled_s = stalled, "hf download: brak postepu");
+                    if stalled >= STALL_SECS {
+                        remove_download_container(deployment_cluster_id).await;
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        for d in drains {
+                            let _ = d.await;
+                        }
+                        return Err(format!(
+                            "pobieranie modelu {model_repo} utknelo (brak postepu przez {stalled}s) — \
+                             sprawdz hf_token / dostepnosc modelu"
+                        ));
+                    }
+                }
+                if started.elapsed().as_secs() >= MAX_SECS {
+                    remove_download_container(deployment_cluster_id).await;
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    for d in drains {
+                        let _ = d.await;
+                    }
+                    return Err(format!(
+                        "pobieranie modelu {model_repo} przekroczylo gorny limit czasu ({MAX_SECS}s)"
+                    ));
+                }
             }
         }
     };

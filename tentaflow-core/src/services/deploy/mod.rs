@@ -1191,6 +1191,49 @@ fn build_placeholder_service(
     }
 }
 
+/// Placeholder `services` row reprezentujacy CALY distributed (cluster TP)
+/// deploy jako POJEDYNCZY wpis na liscie serwisow — status `Deploying` od startu,
+/// potem `Running`/`Failed` sterowane wprost przez maszyne stanow deployu klastra
+/// (koordynator), a NIE przez supervisor.
+///
+/// Kluczowe wlasciwosci utrzymujace ten wiersz "inertnym" dla supervisora:
+///   * `pinned=false` — `auto_start_pinned` nigdy go nie respawnuje po `Failed`,
+///   * `transport=ExternalHttp` (`deploy_method=External`) — supervisor traktuje
+///     go jako serwis zewnetrzny: brak lokalnego procesu do spawnu, brak reguly
+///     "wymaga zarejestrowanego modelu", a nieudany health-probe sam sie leczy,
+///   * zero modeli — nie trafia do `unique_models`, wiec routing idzie WYLACZNIE
+///     przez realny per-node wpis head-a (ten placeholder jest tylko statusem).
+///
+/// `active_deploy_id` = `deployment_cluster_id` sluzy jako klucz dedup w
+/// `service_list`: per-node wpisy czlonkow (head + workery) sa ukrywane, a ten
+/// jeden placeholder zostaje jako spojny wpis deploying→running/failed.
+pub(crate) fn build_placeholder_for_cluster(
+    engine_id: &str,
+    served: &str,
+    endpoint_url: Option<String>,
+    deployment_cluster_id: &str,
+) -> NewService {
+    NewService {
+        engine_id: engine_id.to_string(),
+        category: "llm".to_string(),
+        display_name: format!("{served} (cluster TP)"),
+        deploy_method: DeployMethod::External,
+        transport: Transport::ExternalHttp,
+        status: ServiceStatus::Deploying,
+        pinned: false,
+        paused: false,
+        runtime_pid: None,
+        runtime_port: None,
+        sidecar_quic_port: None,
+        endpoint_url,
+        config_json: "{}".to_string(),
+        active_deploy_id: deployment_cluster_id.to_string(),
+        last_deploy_id: deployment_cluster_id.to_string(),
+        deployment_progress_pct: 0,
+        deployed_source_hash: String::new(),
+    }
+}
+
 fn placeholder_transport(method: DeployMethod) -> Transport {
     match method {
         DeployMethod::NativeEmbedded => Transport::Embedded,

@@ -3739,6 +3739,51 @@ pub fn upsert_cluster_deployment(
     Ok(())
 }
 
+/// Dedup input dla `service_list`: dla WSZYSTKICH zywych (deploying/running)
+/// distributed-deploymentow zwraca (a) zbior `deployment_cluster_id` (klucz
+/// canonicznego placeholder-a koordynatora, ktory `active_deploy_id` na nim
+/// nosi) oraz (b) zbior trojek `(node_id, engine_id, serve_port)` czlonkow —
+/// per-node wpisy serwisow czlonkow (head + workery) sa po tym kluczu UKRYWANE
+/// z listy, zeby user widzial jeden spojny wpis klastra zamiast N kontenerow.
+/// Port pochodzi z `cluster_deployments.port` (serve_port headu), pod ktorym
+/// KAZDY czlonek uruchamia swoj kontener (`container_name(engine, serve_port)`),
+/// wiec runtime_port kazdego wpisu-czlonka == serve_port. Dolaczenie portu do
+/// klucza sprawia, ze standalone-serwis tego samego enginu na wezle-czlonku
+/// (inny, unikalny port) NIE jest bledna ukrywany. Uzywa wspoldzielonego `conn`
+/// (service_list trzyma read-guard — brak osobnego `acquire`, brak ryzyka
+/// zaklinowania puli).
+#[allow(clippy::type_complexity)]
+pub fn cluster_service_dedup_keys(
+    conn: &rusqlite::Connection,
+) -> Result<(
+    std::collections::HashSet<String>,
+    std::collections::HashSet<(String, String, u16)>,
+)> {
+    let mut deployment_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut member_keys: std::collections::HashSet<(String, String, u16)> =
+        std::collections::HashSet::new();
+    let mut stmt = conn.prepare_cached(
+        "SELECT cd.deployment_cluster_id, cd.engine_id, cd.port, m.node_id \
+         FROM cluster_deployments cd \
+         JOIN cluster_deployment_members m ON m.deployment_cluster_id = cd.deployment_cluster_id \
+         WHERE cd.status IN ('deploying','running')",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (deployment_cluster_id, engine_id, serve_port, node_id) = row?;
+        deployment_ids.insert(deployment_cluster_id);
+        member_keys.insert((node_id, engine_id, serve_port as u16));
+    }
+    Ok((deployment_ids, member_keys))
+}
+
 pub fn set_cluster_deployment_status(
     pool: &DbPool,
     deployment_cluster_id: &str,
@@ -19567,6 +19612,15 @@ pub mod deployments {
              VALUES (?1, ?2, ?3, ?4, 'deploying', ?5)",
             params![deploy_id, engine_id, deploy_method, node_id, config_json],
         )?;
+        Ok(())
+    }
+
+    /// Kasuje wiersz `deployments` po `deploy_id`. Uzywane przy transakcyjnym
+    /// abordzie deployu klastra, gdy krok po `create` (np. insert placeholdera
+    /// `services`) zawiedzie — wiersz `deployments` nie moze osierociec.
+    pub fn delete(pool: &DbPool, deploy_id: &str) -> Result<()> {
+        let conn = pool.write().unwrap();
+        conn.execute("DELETE FROM deployments WHERE deploy_id = ?1", params![deploy_id])?;
         Ok(())
     }
 

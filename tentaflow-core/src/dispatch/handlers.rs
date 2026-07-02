@@ -9098,6 +9098,36 @@ pub fn service_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
     let rows = crate::services_repo::services::list_all(&conn).map_err(db_err)?;
     let local_node_id = ctx.state.local_node_id.as_ref();
 
+    // Cluster (distributed TP) dedup: hide every per-node member service entry
+    // (head + workers) and keep only the coordinator's canonical placeholder,
+    // so the list shows ONE coherent cluster entry (deploying→running/failed)
+    // instead of N container rows. `keep_service` applies to local AND remote.
+    let (cluster_deploy_ids, cluster_member_keys) =
+        crate::db::repository::cluster_service_dedup_keys(&conn).map_err(db_err)?;
+    let keep_service =
+        |node_id: &str, engine_id: &str, active_deploy_id: &str, runtime_port: Option<u16>| -> bool {
+            if cluster_deploy_ids.contains(active_deploy_id) {
+                return true; // canonical coordinator placeholder
+            }
+            match runtime_port {
+                // Precise match: a member row serves under the deployment's
+                // serve_port, so only that exact port on this node is hidden.
+                // A standalone service of the same engine keeps its own unique
+                // port and stays visible.
+                Some(port) => !cluster_member_keys.contains(&(
+                    node_id.to_string(),
+                    engine_id.to_string(),
+                    port,
+                )),
+                // Port not yet assigned (member still mid-deploy) — fall back to
+                // node+engine so the transient container row does not leak onto
+                // the list before it settles on serve_port.
+                None => !cluster_member_keys
+                    .iter()
+                    .any(|(n, e, _)| n == node_id && e == engine_id),
+            }
+        };
+
     // Local rows first.
     let mut services = Vec::with_capacity(rows.len());
     for svc in rows {
@@ -9110,6 +9140,14 @@ pub fn service_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             if !filter.is_empty() && svc.category != filter {
                 continue;
             }
+        }
+        if !keep_service(
+            local_node_id,
+            &svc.engine_id,
+            &svc.active_deploy_id,
+            svc.runtime_port,
+        ) {
+            continue;
         }
         services.push(build_service_info(&conn, svc, local_node_id)?);
     }
@@ -9129,6 +9167,14 @@ pub fn service_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
                 if !filter.is_empty() && svc.category != filter {
                     continue;
                 }
+            }
+            if !keep_service(
+                &svc.node_id,
+                &svc.engine_id,
+                &svc.active_deploy_id,
+                svc.runtime_port,
+            ) {
+                continue;
             }
             services.push(svc);
         }

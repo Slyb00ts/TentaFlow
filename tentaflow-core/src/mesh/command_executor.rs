@@ -684,6 +684,7 @@ impl MeshCommandExecutor {
             &model_repo,
             &engine_id,
             hf_token.as_deref(),
+            &deployment_cluster_id,
         )
         .await
         {
