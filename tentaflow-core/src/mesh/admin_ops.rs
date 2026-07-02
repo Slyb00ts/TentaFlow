@@ -967,8 +967,10 @@ pub fn revoke_trust(
             // can't route a command to it before the QUIC idle disconnect fires.
             crate::mesh::robot_dispatch::global().remove_node(&revoked_id);
             sec.clear_revoking(&revoked_id);
-            // Nie disconnectujemy — kaskadowe disconnect powodowaly failujace broadcasty.
-            // Connection umrze po QUIC idle timeout (60s).
+            // Disconnect DOPIERO po wyslaniu notyfikacji i unpair — inaczej race
+            // ubija dostarczenie TrustRevoked. Bez tego heartbeat peera trzymalby
+            // polaczenie QUIC otwarte w nieskonczonosc (revoked peer zajmuje slot).
+            qm.disconnect_peer(&revoked_id).await;
         });
     } else {
         security.mark_revoking(node_id);
