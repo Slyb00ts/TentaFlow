@@ -2313,6 +2313,7 @@ async function renderDistillDataTab(panel, p) {
   let editCols = ['question', 'answer']; // wykrywane z danych; fallback SFT
   let editDatasetId = '';
   let editTruncated = false; // true gdy załadowano tylko część dużego datasetu
+  let editPending = false; // true gdy dataset w trakcie generacji (distill_status=pending)
 
   const rowFieldHtml = (col, val) =>
     `<div style="flex:1;min-width:0;"><div class="ml-studio-hint" style="margin-bottom:2px;">${escapeHtml(col)}</div>` +
@@ -2389,17 +2390,19 @@ async function renderDistillDataTab(panel, p) {
       editActions.style.display = 'flex';
       renderMeta(resp.meta);
       const total = resp.total ?? parsed.length;
-      // Zapis nadpisuje CAŁY dataset; gdy załadowano tylko część, zapis usunąłby
-      // niezaładowane wiersze — więc go blokujemy i mówimy o tym wprost.
+      // Blokujemy zapis w dwóch przypadkach: (a) załadowano tylko część dużego
+      // datasetu (zapis nadpisałby resztę); (b) dataset w trakcie generacji
+      // (pending) — zapis oznaczyłby go jako completed i kolidował z tłem.
       editTruncated = total > parsed.length;
+      editPending = !!resp.pending;
       const saveBtn = byId('ml-distill-edit-save');
-      if (editTruncated) {
-        saveBtn?.setAttribute('disabled', 'true');
-        editStatus.textContent = `Wczytano ${parsed.length} z ${total} — dataset za duży na pełną edycję w GUI; ZAPIS WYŁĄCZONY (nadpisałby resztę).`;
-      } else {
-        saveBtn?.removeAttribute('disabled');
-        editStatus.textContent = `Wczytano ${parsed.length} wierszy (kolumny: ${editCols.join(' · ')}).`;
-      }
+      if (editTruncated || editPending) saveBtn?.setAttribute('disabled', 'true');
+      else saveBtn?.removeAttribute('disabled');
+      editStatus.textContent = editPending
+        ? 'Dataset w trakcie generacji — podgląd tylko; edycja/zapis po zakończeniu.'
+        : editTruncated
+          ? `Wczytano ${parsed.length} z ${total} — dataset za duży na pełną edycję w GUI; ZAPIS WYŁĄCZONY (nadpisałby resztę).`
+          : `Wczytano ${parsed.length} wierszy (kolumny: ${editCols.join(' · ')}).`;
     } catch (e) {
       editStatus.textContent = 'Błąd wczytywania: ' + (e.message || e);
     }
@@ -2410,6 +2413,7 @@ async function renderDistillDataTab(panel, p) {
   byId('ml-distill-edit-save')?.addEventListener('click', async () => {
     if (!editDatasetId) { toast('Najpierw wczytaj dataset', 'error'); return; }
     if (editTruncated) { toast('Zapis wyłączony — załadowano tylko część datasetu (nadpisałby resztę).', 'error'); return; }
+    if (editPending) { toast('Dataset w trakcie generacji — edycja możliwa po zakończeniu.', 'error'); return; }
     const rows = collectRows();
     editStatus.textContent = 'Zapisywanie…';
     try {

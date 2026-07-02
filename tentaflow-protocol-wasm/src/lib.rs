@@ -9923,6 +9923,7 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
                 "meta",
                 resp.meta.map(JsValue::from).unwrap_or(JsValue::NULL),
             );
+            set(obj, "pending", resp.pending.into());
         }
         tentaflow_protocol::MlStudioPayload::DatasetRowsSaveResponse(resp) => {
             set(obj, "variant", "MlStudioDatasetRowsSaveResponse".into());

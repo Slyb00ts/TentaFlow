@@ -1369,12 +1369,17 @@ pub fn ml_studio_dataset_rows(
         Some(n) if n > 0 => all.into_iter().take(n as usize).collect(),
         _ => all,
     };
-    // Pochodzenie: distill_meta z profile_json (czym/jak wygenerowano) — do GUI.
-    let meta = serde_json::from_str::<serde_json::Value>(&dataset.profile_json)
-        .ok()
+    // Pochodzenie (distill_meta) + status generacji (pending) z profile_json — do GUI.
+    let profile = serde_json::from_str::<serde_json::Value>(&dataset.profile_json).ok();
+    let meta = profile
+        .as_ref()
         .and_then(|p| p.get("distill_meta").cloned())
         .filter(|m| !m.is_null())
         .map(|m| m.to_string());
+    let pending = profile
+        .as_ref()
+        .and_then(|p| p.get("distill_status").and_then(|v| v.as_str()))
+        .map_or(false, |s| s == "pending");
     Ok(MessageBody::MlStudioBody(MlStudioPayload::DatasetRowsResponse(
         tentaflow_protocol::MlStudioDatasetRowsResponse {
             dataset_id: payload.dataset_id.clone(),
@@ -1382,6 +1387,7 @@ pub fn ml_studio_dataset_rows(
             total,
             rows,
             meta,
+            pending,
         },
     )))
 }
@@ -1404,6 +1410,19 @@ pub fn ml_studio_dataset_rows_save(
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
     require_project_editor(&org.user_id, &dataset.project_id)?;
+
+    // GUARD: dataset w trakcie generacji (distill_status=pending) NIE może być
+    // edytowany — zapis oznaczyłby pending jako completed i kolidował z tłem
+    // dopisującym wygenerowane pary. Edycja dopiero po zakończeniu generacji.
+    let is_pending = serde_json::from_str::<serde_json::Value>(&dataset.profile_json)
+        .ok()
+        .and_then(|p| p.get("distill_status").and_then(|v| v.as_str()).map(str::to_string))
+        .map_or(false, |s| s == "pending");
+    if is_pending {
+        return Err(ProtocolError::bad_request(
+            "dataset jest w trakcie generacji — edycja możliwa po zakończeniu",
+        ));
+    }
 
     // Każdy wiersz musi być poprawnym obiektem JSON — raw_data trzymamy jako JSONL.
     let mut clean: Vec<String> = Vec::with_capacity(payload.rows.len());

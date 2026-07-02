@@ -1492,6 +1492,9 @@ pub struct MlStudioDatasetRowsResponse {
     /// teacher, wariant, prompt, źródło pytań. None dla datasetów spoza destylacji.
     #[serde(default)]
     pub meta: Option<String>,
+    /// Dataset w trakcie generacji (distill_status=pending) — GUI blokuje edycję/zapis.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
