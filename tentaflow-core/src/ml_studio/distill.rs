@@ -112,20 +112,62 @@ async fn run_generation(
         p.total = questions.len() as u32;
     });
 
-    // 2. Teacher generuje odpowiedz na kazde pytanie.
+    // 2. Wariant decyduje o kształcie danych: sft/kd -> (question, answer);
+    //    dpo -> (prompt, chosen, rejected) — teacher daje chosen, słabszy model rejected.
+    let objective = req
+        .objective
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("sft")
+        .to_ascii_lowercase();
+    let is_dpo = objective == "dpo";
+
     let mut pairs: Vec<MlStudioDistillQaPair> = Vec::with_capacity(questions.len());
     for question in questions {
-        let prompt = match &req.answer_instruction {
+        // Odpowiedź teachera (SFT/KD = answer; DPO = chosen/lepsza).
+        let ans_prompt = match &req.answer_instruction {
             Some(instr) if !instr.trim().is_empty() => format!("{}\n\n{}", instr.trim(), question),
             _ => question.clone(),
         };
         let answer =
-            crate::ml_studio::infer::run_local_chat(router, &req.teacher_model, &prompt, max_tokens)
+            crate::ml_studio::infer::run_local_chat(router, &req.teacher_model, &ans_prompt, max_tokens)
                 .await
-                .map_err(|e| anyhow::anyhow!("teacher '{}': {e:#}", req.teacher_model))?;
+                .map_err(|e| anyhow::anyhow!("teacher '{}': {e:#}", req.teacher_model))?
+                .trim()
+                .to_string();
+
+        // DPO: ODRZUCONA (gorsza) odpowiedź ze słabszego modelu (fallback: teacher z
+        // instrukcją „odpowiedz gorzej"). Preferencja chosen>rejected uczy DPO.
+        let rejected = if is_dpo {
+            let rej_model = req
+                .rejected_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(req.teacher_model.as_str());
+            let rej_instr = req
+                .rejected_instruction
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(
+                    "Odpowiedz celowo SŁABO: krótko, ogólnikowo, bez szczegółów i \
+                     uzasadnienia. To ma być gorsza odpowiedź.",
+                );
+            let rej_prompt = format!("{}\n\n{}", rej_instr, question);
+            let r = crate::ml_studio::infer::run_local_chat(router, rej_model, &rej_prompt, max_tokens)
+                .await
+                .map_err(|e| anyhow::anyhow!("rejected model '{}': {e:#}", rej_model))?;
+            Some(r.trim().to_string())
+        } else {
+            None
+        };
+
         let pair = MlStudioDistillQaPair {
             question,
-            answer: answer.trim().to_string(),
+            answer,
+            rejected,
         };
         pairs.push(pair.clone());
         set_progress(dataset_id, |p| {
@@ -136,10 +178,19 @@ async fn run_generation(
         });
     }
 
-    // 3. Zapis par jako JSONL do raw_data datasetu.
+    // 3. Zapis JSONL: SFT/KD -> {question, answer}; DPO -> {prompt, chosen, rejected}
+    //    (kształt wymagany przez trener DPO — server.py sprawdza te trzy pola).
     let mut jsonl = String::new();
     for pair in &pairs {
-        let line = serde_json::json!({ "question": pair.question, "answer": pair.answer });
+        let line = if is_dpo {
+            serde_json::json!({
+                "prompt": pair.question,
+                "chosen": pair.answer,
+                "rejected": pair.rejected.clone().unwrap_or_default(),
+            })
+        } else {
+            serde_json::json!({ "question": pair.question, "answer": pair.answer })
+        };
         jsonl.push_str(&serde_json::to_string(&line)?);
         jsonl.push('\n');
     }

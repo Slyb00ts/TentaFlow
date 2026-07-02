@@ -3114,6 +3114,9 @@ export const encode = {
       (payload.answerInstruction ?? payload.answer_instruction) || undefined,
       Number(payload.temperature ?? 0),
       (payload.maxTokens ?? payload.max_tokens ?? 0) >>> 0,
+      (payload.objective) || undefined,
+      (payload.rejectedModel ?? payload.rejected_model) || undefined,
+      (payload.rejectedInstruction ?? payload.rejected_instruction) || undefined,
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),

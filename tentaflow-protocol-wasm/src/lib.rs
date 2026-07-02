@@ -2225,6 +2225,9 @@ pub fn encode_ml_studio_distill_generate_request(
     answer_instruction: Option<String>,
     temperature: f64,
     max_tokens: u32,
+    objective: Option<String>,
+    rejected_model: Option<String>,
+    rejected_instruction: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
         tentaflow_protocol::MlStudioPayload::DistillGenerateRequest(
@@ -2253,6 +2256,9 @@ pub fn encode_ml_studio_distill_generate_request(
                 } else {
                     Some(max_tokens)
                 },
+                objective: objective.filter(|s| !s.is_empty()),
+                rejected_model: rejected_model.filter(|s| !s.is_empty()),
+                rejected_instruction: rejected_instruction.filter(|s| !s.is_empty()),
             },
         ),
     ))
@@ -9847,6 +9853,11 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
                 let o = js_sys::Object::new();
                 set(&o, "question", pair.question.clone().into());
                 set(&o, "answer", pair.answer.clone().into());
+                set(
+                    &o,
+                    "rejected",
+                    pair.rejected.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+                );
                 arr.push(&JsValue::from(o));
             }
             set(obj, "samples", arr.into());

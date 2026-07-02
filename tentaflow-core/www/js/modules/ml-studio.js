@@ -2130,12 +2130,27 @@ async function renderDistillDataTab(panel, p) {
       </div>
 
       <hr style="margin:14px 0;border:none;border-top:1px solid var(--border);">
+      <label class="ml-studio-field-label">Wariant treningu (decyduje o kształcie danych)</label>
+      <div style="display:flex;gap:8px;margin:2px 0 6px;">
+        <tf-button id="ml-distill-obj-sft" variant="primary" size="small">SFT</tf-button>
+        <tf-button id="ml-distill-obj-kd" variant="ghost" size="small">KD</tf-button>
+        <tf-button id="ml-distill-obj-dpo" variant="ghost" size="small">DPO</tf-button>
+      </div>
+      <p class="ml-studio-hint" id="ml-distill-obj-hint" style="margin:0 0 10px;">SFT/KD: pary pytanie→odpowiedź (teacher). Wybierz ten sam wariant co w zakładce „Model bazowy".</p>
+
       <label class="ml-studio-field-label">Teacher — model generujący ODPOWIEDZI (etykiety treningowe)</label>
       <input list="ml-distill-models" id="ml-distill-teacher" class="ml-studio-model-input" style="width:100%;box-sizing:border-box;display:block;padding:8px;margin:2px 0 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text);" placeholder="np. gpt-5-5 albo dowolny alias/model tentaflow">
       <datalist id="ml-distill-models">${modelOptions}</datalist>
 
       <label class="ml-studio-field-label">Instrukcja dla teachera (opcjonalna)</label>
       <tf-textarea id="ml-distill-instr" rows="2" placeholder="np. Wyodrębnij encje i relacje w formacie E|nazwa|typ / R|head|rel|tail"></tf-textarea>
+
+      <div id="ml-distill-dpo-box" hidden>
+        <label class="ml-studio-field-label">Model ODRZUCAJĄCY — generuje GORSZĄ odpowiedź (DPO)</label>
+        <input list="ml-distill-models" id="ml-distill-rejmodel" class="ml-studio-model-input" style="width:100%;box-sizing:border-box;display:block;padding:8px;margin:2px 0 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text);" placeholder="słabszy/bazowy model (puste = teacher z instrukcją „gorzej")">
+        <label class="ml-studio-field-label">Instrukcja dla modelu odrzucającego (opcjonalna)</label>
+        <tf-textarea id="ml-distill-rejinstr" rows="2" placeholder="np. Odpowiedz krótko i ogólnikowo, pomiń szczegóły i uzasadnienie"></tf-textarea>
+      </div>
       <div style="display:flex;gap:12px;">
         <div style="flex:1;"><label class="ml-studio-field-label">Temperatura</label><tf-input id="ml-distill-temp" type="number" value="0.2"></tf-input></div>
         <div style="flex:1;"><label class="ml-studio-field-label">Max tokenów</label><tf-input id="ml-distill-maxtok" type="number" value="768"></tf-input></div>
@@ -2161,6 +2176,25 @@ async function renderDistillDataTab(panel, p) {
   byId('ml-distill-src-generate')?.addEventListener('click', () => setSource('generate'));
   byId('ml-distill-src-import')?.addEventListener('click', () => setSource('import'));
 
+  // Wariant treningu: SFT/KD -> pary Q&A; DPO -> trójki (prompt, chosen, rejected)
+  // z dodatkowym modelem odrzucającym. Dobierz TEN SAM wariant co w „Model bazowy".
+  let objective = 'sft';
+  const OBJ_HINTS = {
+    sft: 'SFT: pary pytanie→odpowiedź (teacher). Uczeń kopiuje odpowiedzi teachera.',
+    kd: 'KD: pary pytanie→odpowiedź (teacher). Destylacja rozkładu — wybierz teacher jako model-nauczyciela w treningu.',
+    dpo: 'DPO: trójki (prompt, lepsza, gorsza). Teacher daje lepszą odpowiedź, model odrzucający — gorszą; uczeń uczy się preferencji.',
+  };
+  const setObjective = (o) => {
+    objective = o;
+    byId('ml-distill-dpo-box').hidden = o !== 'dpo';
+    const hint = byId('ml-distill-obj-hint');
+    if (hint) hint.textContent = OBJ_HINTS[o] || '';
+    ['sft', 'kd', 'dpo'].forEach((k) =>
+      byId('ml-distill-obj-' + k)?.setAttribute('variant', k === o ? 'primary' : 'ghost'));
+  };
+  ['sft', 'kd', 'dpo'].forEach((k) =>
+    byId('ml-distill-obj-' + k)?.addEventListener('click', () => setObjective(k)));
+
   byId('ml-distill-go')?.addEventListener('click', async () => {
     const teacher = String(byId('ml-distill-teacher')?.value || '').trim();
     if (!teacher) {
@@ -2175,7 +2209,12 @@ async function renderDistillDataTab(panel, p) {
       answerInstruction: String(byId('ml-distill-instr')?.value || '').trim() || undefined,
       temperature: Math.max(0, Math.min(2, Number(byId('ml-distill-temp')?.value ?? 0.2) || 0)),
       maxTokens: Math.max(16, Math.min(8192, Number(byId('ml-distill-maxtok')?.value || 768) | 0)),
+      objective,
     };
+    if (objective === 'dpo') {
+      payload.rejectedModel = String(byId('ml-distill-rejmodel')?.value || '').trim() || undefined;
+      payload.rejectedInstruction = String(byId('ml-distill-rejinstr')?.value || '').trim() || undefined;
+    }
     if (source === 'generate') {
       payload.generatePrompt = String(byId('ml-distill-prompt')?.value || '').trim();
       payload.questionModel = String(byId('ml-distill-qmodel')?.value || '').trim() || undefined;
@@ -2222,7 +2261,7 @@ async function renderDistillDataTab(panel, p) {
         <div>Status: <strong>${escapeHtml(st.status || '')}</strong> ${total ? `(${done}/${total}, ${pct}%)` : ''}</div>
         ${st.error ? `<div class="ml-studio-err">${escapeHtml(st.error)}</div>` : ''}
         <div class="ml-studio-progress-bar" style="height:8px;background:var(--surface-2);border-radius:4px;overflow:hidden;margin:6px 0;"><div style="width:${pct}%;height:100%;background:var(--accent);"></div></div>
-        ${samples.length ? `<div class="ml-studio-distill-samples">${samples.map((s) => `<div class="qa" style="border:1px solid var(--border);border-radius:6px;padding:8px;margin:6px 0;"><div style="font-weight:600;">${escapeHtml(s.question || '')}</div><div style="opacity:0.85;margin-top:4px;white-space:pre-wrap;">${escapeHtml(s.answer || '')}</div></div>`).join('')}</div>` : ''}`;
+        ${samples.length ? `<div class="ml-studio-distill-samples">${samples.map((s) => `<div class="qa" style="border:1px solid var(--border);border-radius:6px;padding:8px;margin:6px 0;"><div style="font-weight:600;">${escapeHtml(s.question || '')}</div><div style="opacity:0.85;margin-top:4px;white-space:pre-wrap;">${s.rejected ? '✓ ' : ''}${escapeHtml(s.answer || '')}</div>${s.rejected ? `<div style="opacity:0.7;margin-top:4px;white-space:pre-wrap;color:var(--danger,#c66);">✗ ${escapeHtml(s.rejected)}</div>` : ''}</div>`).join('')}</div>` : ''}`;
       if (st.status === 'completed') {
         toast('Dataset gotowy — zakładka Trening', 'success');
         byId('ml-distill-go')?.removeAttribute('disabled');

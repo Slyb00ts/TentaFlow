@@ -2215,6 +2215,17 @@ pub struct MlStudioDistillGenerateRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Wariant treningu pod ktory generujemy dane: "sft"/"kd" -> pary
+    /// (question, answer); "dpo" -> trojki (prompt, chosen, rejected). Domyslnie sft.
+    #[serde(default)]
+    pub objective: Option<String>,
+    /// DPO: model generujacy ODRZUCONA (gorsza) odpowiedz — zwykle slabszy/bazowy
+    /// albo teacher z instrukcja "odpowiedz gorzej". Wymagany dla objective=dpo.
+    #[serde(default)]
+    pub rejected_model: Option<String>,
+    /// DPO: instrukcja dla modelu generujacego odrzucona odpowiedz.
+    #[serde(default)]
+    pub rejected_instruction: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -2228,11 +2239,14 @@ pub struct MlStudioDistillGenerateStatusRequest {
     pub dataset_id: String,
 }
 
-/// Podglad wygenerowanej pary (question, answer).
+/// Podglad wygenerowanej probki. SFT/KD: `question`+`answer`. DPO: `question`=prompt,
+/// `answer`=chosen (lepsza), `rejected`=Some(gorsza).
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MlStudioDistillQaPair {
     pub question: String,
     pub answer: String,
+    #[serde(default)]
+    pub rejected: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
