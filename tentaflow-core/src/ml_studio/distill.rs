@@ -155,7 +155,10 @@ async fn run_generation(
                     "Odpowiedz celowo SŁABO: krótko, ogólnikowo, bez szczegółów i \
                      uzasadnienia. To ma być gorsza odpowiedź.",
                 );
-            let rej_prompt = format!("{}\n\n{}", rej_instr, question);
+            // Odrzucona odpowiedź na TEN SAM prompt zadania (ans_prompt), tylko z
+            // meta-instrukcją „gorzej" — inaczej chosen/rejected/prompt byłyby
+            // niespójne (rejected bez answer_instruction, prompt bez instrukcji).
+            let rej_prompt = format!("{}\n\n{}", rej_instr, ans_prompt);
             let r = crate::ml_studio::infer::run_local_chat(router, rej_model, &rej_prompt, max_tokens)
                 .await
                 .map_err(|e| anyhow::anyhow!("rejected model '{}': {e:#}", rej_model))?;
@@ -164,8 +167,12 @@ async fn run_generation(
             None
         };
 
+        // DPO: zapisany prompt = ans_prompt (to, do czego pasują chosen i rejected).
+        // SFT/KD: surowe pytanie (odpowiedź to etykieta pytania; instrukcja to tylko
+        // scaffold generacji, uczeń uczy się zadania z samego pytania).
+        let record_prompt = if is_dpo { ans_prompt } else { question };
         let pair = MlStudioDistillQaPair {
-            question,
+            question: record_prompt,
             answer,
             rejected,
         };
