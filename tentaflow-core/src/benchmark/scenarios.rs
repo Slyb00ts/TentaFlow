@@ -1,6 +1,6 @@
 // ===== File: benchmark/scenarios.rs — the four benchmark scenarios: latency, throughput sweep, context sweep, sustained load =====
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,6 +11,16 @@ use super::prompt::synthetic_prompt;
 use super::types::{
     ContextConfig, LatencyConfig, RequestSample, SustainedConfig, TargetSpec, ThroughputConfig,
 };
+
+/// Process-global salt handed to `synthetic_prompt` so every single benchmark
+/// request (warmups included) gets a unique prompt. WHY: a repeated prompt lets
+/// the LLM server restore its prefill KV-cache checkpoint, which would make TTFT
+/// and prefill_tps report a cached prefill instead of the real one.
+static PROMPT_SALT: AtomicU64 = AtomicU64::new(0);
+
+fn next_salt() -> u64 {
+    PROMPT_SALT.fetch_add(1, Ordering::Relaxed)
+}
 
 /// One variant's raw outcome; the runner aggregates and persists it.
 pub struct VariantOutcome {
@@ -33,15 +43,16 @@ pub async fn run_latency(
     timeout: Duration,
     cancel: &AtomicBool,
 ) -> VariantOutcome {
-    let prompt = synthetic_prompt(prompt_tokens);
     let mut samples = Vec::with_capacity(cfg.repeats as usize);
     if !cancelled(cancel) {
+        let prompt = synthetic_prompt(prompt_tokens, next_salt());
         let _warmup = client.execute(target, &prompt, gen_tokens, timeout).await;
     }
     for _ in 0..cfg.repeats {
         if cancelled(cancel) {
             break;
         }
+        let prompt = synthetic_prompt(prompt_tokens, next_salt());
         samples.push(client.execute(target, &prompt, gen_tokens, timeout).await);
     }
     VariantOutcome {
@@ -62,7 +73,6 @@ pub async fn run_throughput(
     timeout: Duration,
     cancel: &Arc<AtomicBool>,
 ) -> Vec<VariantOutcome> {
-    let prompt = Arc::new(synthetic_prompt(prompt_tokens));
     let mut outcomes = Vec::with_capacity(cfg.levels.len());
     for &level in &cfg.levels {
         if cancelled(cancel) {
@@ -74,7 +84,6 @@ pub async fn run_throughput(
         for _ in 0..level {
             let client = client.clone();
             let target = target.clone();
-            let prompt = Arc::clone(&prompt);
             let cancel = Arc::clone(cancel);
             let per_worker = cfg.requests_per_worker.max(1);
             handles.push(tokio::spawn(async move {
@@ -83,6 +92,7 @@ pub async fn run_throughput(
                     if cancelled(&cancel) {
                         break;
                     }
+                    let prompt = synthetic_prompt(prompt_tokens, next_salt());
                     out.push(client.execute(&target, &prompt, gen_tokens, timeout).await);
                 }
                 out
@@ -131,13 +141,16 @@ pub async fn run_context(
         if cancelled(cancel) {
             break;
         }
-        let prompt = synthetic_prompt(prompt_len);
         let mut samples = Vec::with_capacity(cfg.repeats as usize);
-        let _warmup = client.execute(target, &prompt, gen_tokens, timeout).await;
+        let warmup_prompt = synthetic_prompt(prompt_len, next_salt());
+        let _warmup = client
+            .execute(target, &warmup_prompt, gen_tokens, timeout)
+            .await;
         for _ in 0..cfg.repeats {
             if cancelled(cancel) {
                 break;
             }
+            let prompt = synthetic_prompt(prompt_len, next_salt());
             samples.push(client.execute(target, &prompt, gen_tokens, timeout).await);
         }
         outcomes.push(VariantOutcome {
@@ -159,7 +172,6 @@ pub async fn run_sustained(
     timeout: Duration,
     cancel: &Arc<AtomicBool>,
 ) -> Vec<VariantOutcome> {
-    let prompt = Arc::new(synthetic_prompt(prompt_tokens));
     let concurrency = cfg.concurrency.max(1);
     let planned_secs = u64::from(cfg.minutes.max(1)) * 60;
     let run_start = Instant::now();
@@ -169,7 +181,6 @@ pub async fn run_sustained(
     for _ in 0..concurrency {
         let client = client.clone();
         let target = target.clone();
-        let prompt = Arc::clone(&prompt);
         let cancel = Arc::clone(cancel);
         handles.push(tokio::spawn(async move {
             let mut out: Vec<(u32, RequestSample)> = Vec::new();
@@ -184,9 +195,12 @@ pub async fn run_sustained(
                 let remaining = deadline.saturating_duration_since(now);
                 let req_timeout = timeout.min(remaining);
                 let minute = (now.duration_since(run_start).as_secs() / 60) as u32;
+                let prompt = synthetic_prompt(prompt_tokens, next_salt());
                 out.push((
                     minute,
-                    client.execute(&target, &prompt, gen_tokens, req_timeout).await,
+                    client
+                        .execute(&target, &prompt, gen_tokens, req_timeout)
+                        .await,
                 ));
             }
             out
