@@ -567,6 +567,16 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "ensure_token_permissions",
             MigrationStep::Rust(ensure_token_permissions),
         ),
+        (
+            106,
+            "cameras_vendor_check_mjpeg",
+            MigrationStep::Rust(cameras_vendor_check_add_mjpeg),
+        ),
+        (
+            107,
+            "benchmark_studio_tables",
+            MigrationStep::Sql(BENCHMARK_STUDIO_SCHEMA),
+        ),
     ]
 }
 
@@ -578,6 +588,57 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
 fn ensure_token_permissions(conn: &Connection) -> Result<()> {
     roles_add_permissions(conn, &["org_admin", "dpo"], &["tokens.read", "tokens.write"])?;
     roles_add_permissions(conn, &["org_operator", "org_viewer"], &["tokens.read"])?;
+    Ok(())
+}
+
+// v106 — dodaje vendor 'mjpeg' (kamery MJPEG po HTTP, multipart/x-mixed-replace)
+// do CHECK-a `cameras.vendor`. SQLite nie umie zmienić CHECK-a w miejscu, więc
+// tabela jest przebudowywana. W odróżnieniu od wcześniejszych rebuildów
+// (v48/v80 z zaszytym schematem) schemat bierzemy DYNAMICZNIE z sqlite_master —
+// po v80 kolejne migracje dokładały kolumny (analysis_*, depth_*) przez ALTER
+// TABLE, więc zaszyta lista kolumn groziłaby ich utratą. Podmieniamy wyłącznie
+// listę vendorów w CHECK-u, kopiujemy wiersze 1:1 (`INSERT ... SELECT *` —
+// identyczna kolejność kolumn po rebuildzie z tego samego SQL) i odtwarzamy
+// indeksy. Idempotentna: gdy CHECK zawiera już 'mjpeg', nic nie robi. Żadna
+// tabela nie ma FK na `cameras`, więc rebuild w transakcji runnera jest
+// bezpieczny bez żonglowania `PRAGMA foreign_keys`.
+fn cameras_vendor_check_add_mjpeg(conn: &Connection) -> Result<()> {
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cameras'",
+        [],
+        |row| row.get(0),
+    )?;
+    if sql.contains("'mjpeg'") {
+        return Ok(());
+    }
+    let old_list = "'fake_file', 'rtsp', 'onvif', 'local_camera', 'v4l2', 'webrtc'";
+    let new_list = "'fake_file', 'rtsp', 'onvif', 'local_camera', 'v4l2', 'webrtc', 'mjpeg'";
+    let patched = sql.replace(old_list, new_list);
+    if patched == sql {
+        anyhow::bail!(
+            "cameras_vendor_check_add_mjpeg: nie znaleziono oczekiwanej listy vendorów w CHECK — \
+             schemat tabeli cameras odbiega od v80"
+        );
+    }
+    // Pierwsze wystąpienie 'cameras' w SQL to nazwa tabeli (goła lub w
+    // cudzysłowie) — podmiana na 'cameras_new' daje poprawny CREATE w obu
+    // wariantach zapisu.
+    let create_new = patched.replacen("cameras", "cameras_new", 1);
+
+    conn.execute_batch("DROP TABLE IF EXISTS cameras_new;")?;
+    conn.execute_batch(&create_new)?;
+    conn.execute_batch(
+        r#"
+INSERT INTO cameras_new SELECT * FROM cameras;
+DROP TABLE cameras;
+ALTER TABLE cameras_new RENAME TO cameras;
+
+CREATE UNIQUE INDEX idx_cameras_camera_id_active ON cameras(camera_id) WHERE removed_at IS NULL;
+CREATE INDEX idx_cameras_owner ON cameras(owner_addon_id, removed_at);
+CREATE INDEX idx_cameras_status ON cameras(status, removed_at);
+CREATE INDEX idx_cameras_org_id ON cameras(org_id);
+"#,
+    )?;
     Ok(())
 }
 
@@ -686,6 +747,73 @@ CREATE TABLE IF NOT EXISTS model_pricing (
     UNIQUE(org_id, model_id)
 );
 CREATE INDEX IF NOT EXISTS idx_model_pricing_org ON model_pricing(org_id);
+"#;
+
+// v107 — Benchmark Studio: user-defined API benchmarks (llama-bench-style) for
+// mesh services and external LLM APIs. `benchmark_results.target_id` has NO FK
+// on purpose: targets may be edited/replaced between runs while historical
+// results must stay intact, hence the `target_label` snapshot on each row.
+// External API keys land in `api_key_enc` encrypted with the settings cipher.
+const BENCHMARK_STUDIO_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS benchmarks (
+    id           TEXT PRIMARY KEY,
+    org_id       TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    name         TEXT NOT NULL,
+    config_json  TEXT NOT NULL DEFAULT '{}',
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_benchmarks_org ON benchmarks(org_id);
+
+CREATE TABLE IF NOT EXISTS benchmark_targets (
+    id            TEXT PRIMARY KEY,
+    benchmark_id  TEXT NOT NULL REFERENCES benchmarks(id) ON DELETE CASCADE,
+    kind          TEXT NOT NULL CHECK (kind IN ('service','external')),
+    service_ref   TEXT,
+    api_type      TEXT NOT NULL DEFAULT 'openai' CHECK (api_type IN ('openai','anthropic')),
+    host          TEXT NOT NULL,
+    port          INTEGER NOT NULL DEFAULT 0,
+    api_key_enc   TEXT,
+    model         TEXT NOT NULL,
+    label         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_targets_benchmark ON benchmark_targets(benchmark_id);
+
+CREATE TABLE IF NOT EXISTS benchmark_runs (
+    id                TEXT PRIMARY KEY,
+    benchmark_id      TEXT NOT NULL REFERENCES benchmarks(id) ON DELETE CASCADE,
+    started_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at       TEXT,
+    status            TEXT NOT NULL DEFAULT 'running'
+                      CHECK (status IN ('running','success','failed','cancelled')),
+    error             TEXT,
+    engine_meta_json  TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_runs_benchmark ON benchmark_runs(benchmark_id, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS benchmark_results (
+    id                TEXT PRIMARY KEY,
+    run_id            TEXT NOT NULL REFERENCES benchmark_runs(id) ON DELETE CASCADE,
+    target_id         TEXT NOT NULL,
+    target_label      TEXT NOT NULL,
+    scenario          TEXT NOT NULL CHECK (scenario IN ('latency','throughput','context','sustained')),
+    variant_json      TEXT NOT NULL DEFAULT '{}',
+    ttft_ms_mean      REAL,
+    ttft_ms_sigma     REAL,
+    prefill_tps_mean  REAL,
+    prefill_tps_sigma REAL,
+    decode_tps_mean   REAL,
+    decode_tps_sigma  REAL,
+    total_ms_mean     REAL,
+    total_ms_sigma    REAL,
+    p50_ms            REAL,
+    p90_ms            REAL,
+    p99_ms            REAL,
+    requests          INTEGER NOT NULL DEFAULT 0,
+    errors            INTEGER NOT NULL DEFAULT 0,
+    samples_json      TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_results_run ON benchmark_results(run_id);
 "#;
 
 /// Persist the torch.distributed TCPStore master port (`VLLM_PORT`) leased from
