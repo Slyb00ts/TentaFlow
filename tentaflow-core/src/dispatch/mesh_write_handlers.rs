@@ -244,17 +244,14 @@ pub async fn mesh_trust_revoke(
         ctx.state.local_node_id.as_ref(),
     )?;
 
-    // Zamknij żywe połączenie QUIC do node'a PRZED usunięciem z rejestru. Inaczej,
-    // dla node'a ONLINE, jego heartbeaty (peer_store.mark_heartbeat auto-tworzy wpis
-    // w PeerRegistry PRZED bramką zaufania) odtworzyłyby świeżo usunięty wpis i node
-    // wróciłby na listę jako „discovered".
-    if let Some(qm) = ctx.state.quic_mesh.as_ref() {
-        qm.disconnect_peer(node_id).await;
-    }
     // Usuń node z rejestru peerów + peer_persisted, żeby ZNIKNĄŁ z listy. Bez tego
     // po „cofnij zaufanie" zostawał widoczny jako sparowany i nie dało się go usunąć
     // (revoke ruszał tylko trusted_nodes, nie PeerRegistry, z którego czyta lista).
     // Rekord w `revoked_nodes` (security) zostaje — blokuje ponowne zaufane połączenie.
+    // NIE zamykamy tu połączenia QUIC: `revoke_trust` wysyła najpierw MESH_MSG_TRUST_REVOKED
+    // po tym połączeniu, a zdalny node po jego odebraniu sam robi cleanup (`i_am_revoked`)
+    // i przestaje heartbeatować. Zamknięcie połączenia od razu ubiłoby tę notyfikację.
+    // Offline (główny przypadek): brak połączenia → remove czyści listę na trwałe.
     ctx.state.mesh_peer_store.remove(node_id);
 
     Ok(MessageBody::MeshTrustRevokeResponseBody(
