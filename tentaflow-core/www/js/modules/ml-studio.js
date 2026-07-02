@@ -2176,11 +2176,15 @@ async function renderDistillDataTab(panel, p) {
   byId('ml-distill-src-generate')?.addEventListener('click', () => setSource('generate'));
   byId('ml-distill-src-import')?.addEventListener('click', () => setSource('import'));
 
-  // Wariant treningu: SFT/KD -> pary Q&A; DPO -> trójki (prompt, chosen, rejected)
-  // z dodatkowym modelem odrzucającym. Domyślnie SYNCHRONIZUJEMY z konfiguracją
-  // z „Model bazowy" (ten sam cel treningu) — inaczej user wygenerowałby dane w
-  // formacie niezgodnym z wybraną metodą treningu i trening by padł.
-  let objective = String(getFtConfig(pid).objective || 'sft').toLowerCase();
+  // Wariant treningu: SFT/KD -> pary Q&A; DPO -> trójki (prompt, chosen, rejected).
+  // Synchronizujemy z ZAPISANĄ konfiguracją „Model bazowy" (spójny cel treningu),
+  // ale przez hydrateFtConfig — NIE getFtConfig, bo ten tworzy domyślny config i
+  // omijałby guard „Skonfiguruj fine-tuning" w Treningu. hydrateFtConfig ładuje
+  // tylko realny zapis z localStorage (albo nic → zostajemy na sft, bez mutacji).
+  let objective = 'sft';
+  if (hydrateFtConfig(pid) && ftConfig[pid] && ftConfig[pid].objective) {
+    objective = String(ftConfig[pid].objective).toLowerCase();
+  }
   if (!['sft', 'kd', 'dpo'].includes(objective)) objective = 'sft';
   const OBJ_HINTS = {
     sft: 'SFT: pary pytanie→odpowiedź (teacher). Uczeń kopiuje odpowiedzi teachera.',
