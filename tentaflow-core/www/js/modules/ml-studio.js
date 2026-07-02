@@ -1978,10 +1978,13 @@ const FT_METHODS = [
 ];
 
 // Cel treningu (oś 1).
+// W projekcie destylacji WSZYSTKIE trzy cele są destylacją (uczeń uczy się od
+// nauczyciela) — różnią się SYGNAŁEM: odpowiedzi (SFT) / preferencje (DPO) /
+// rozkład-logity (KD). To nie są alternatywy dla destylacji, tylko jej tryby.
 const FT_OBJECTIVES = [
-  { id: 'sft', name: 'SFT', desc: 'Supervised fine-tuning (pary wejście→wyjście).' },
-  { id: 'dpo', name: 'DPO', desc: 'Direct Preference Optimization (odpowiedź lepsza/gorsza).' },
-  { id: 'kd', name: 'KD', desc: 'Knowledge Distillation (student uczy się od nauczyciela).' },
+  { id: 'sft', name: 'SFT', desc: 'Na ODPOWIEDZIACH — uczeń imituje odpowiedzi nauczyciela (pary wejście→wyjście).' },
+  { id: 'dpo', name: 'DPO', desc: 'Na PREFERENCJACH — uczeń uczy się „lepsza>gorsza" (chosen/rejected od nauczyciela).' },
+  { id: 'kd', name: 'KD', desc: 'Na LOGITACH — uczeń dopasowuje rozkład nauczyciela (soft labels, GKD; nauczyciel obecny przy treningu).' },
 ];
 
 // Hiperparametry: domyślne + zakres dla tf-input type=number. lora=true → pole
@@ -2292,6 +2295,7 @@ async function renderDistillDataTab(panel, p) {
 function renderFtModelTab(panel, p) {
   const pid = projectId(p);
   const cfg = getFtConfig(pid);
+  const isDistill = (p.projectType ?? p.project_type ?? '') === 'distillation';
 
   const modelCards = FT_BASE_MODELS.map((m) => `
     <button type="button" class="ml-studio-train-engine-card ml-studio-ft-model-card${cfg.baseModel === m.id ? ' selected' : ''}"
@@ -2367,7 +2371,7 @@ function renderFtModelTab(panel, p) {
         <div class="ml-studio-data-head">${sprite('tune')} Metoda treningu
           <span class="ml-studio-data-hint">dwie osie: cel × parametryzacja</span>
         </div>
-        <div class="ml-studio-ft-axis-label">Oś 1 — Cel</div>
+        <div class="ml-studio-ft-axis-label">Oś 1 — Cel${isDistill ? ' <span class="ml-studio-data-hint">— wszystkie to tryby DESTYLACJI, różni je sygnał od nauczyciela (odpowiedzi / preferencje / logity)</span>' : ''}</div>
         <div class="ml-studio-ft-axis-grid" id="ml-studio-ft-objectives">${objectiveCards}</div>
         <div class="ml-studio-ft-teacher-field" id="ml-studio-ft-teacher-field"
              style="${cfg.objective === 'kd' ? '' : 'display:none'};margin:8px 0 4px">
