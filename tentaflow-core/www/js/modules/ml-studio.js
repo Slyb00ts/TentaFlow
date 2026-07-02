@@ -2085,7 +2085,11 @@ async function renderDistillDataTab(panel, p) {
   try {
     const [ml, dss] = await Promise.all([
       ApiBinary.list('modelListRequest', { arrayKey: 'models' }).catch(() => []),
-      ApiBinary.list('mlStudioDatasetsListRequest', { projectId: pid, arrayKey: 'datasets' }).catch(() => []),
+      // .one (nie .list) — .list nie forwarduje projectId do żądania, przez co
+      // padało „project not found" i selektory datasetów (import + edytor) były puste.
+      ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid })
+        .then((r) => (Array.isArray(r.datasets) ? r.datasets : []))
+        .catch(() => []),
     ]);
     // Modele generacyjne (kategoria 'llm') — teacher i model generujący pytania
     // odpowiadają na prompt. Datalist to PODPOWIEDZI; pole przyjmuje też dowolny
