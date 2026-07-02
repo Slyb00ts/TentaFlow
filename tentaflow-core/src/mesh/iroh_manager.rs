@@ -1474,17 +1474,47 @@ impl IrohMeshManager {
         Ok(())
     }
 
-    /// Build a signed UFP/2 envelope around `data` for a single peer and
-    /// dispatch it on a fresh uni-stream. Used by every send wrapper that
-    /// has been migrated off the legacy raw discriminator wire. The
-    /// destination peer's Ed25519 pubkey is derived from its iroh node id
-    /// (which IS the pubkey in iroh's identity model).
-    pub(crate) async fn send_ufp2_to_peer(
+    /// Jak `send_raw_envelope_to_peer`, ale po `finish()` czeka na potwierdzenie
+    /// odbioru strumienia przez peera (`SendStream::stopped` → `Ok(None)` gdy peer
+    /// zack'owal odbior danych po naszym FIN), z ograniczeniem `ack_timeout`.
+    /// Bez tej bariery `finish()` tylko lokalnie kolejkuje FIN, wiec nastepowy
+    /// `Connection::close` moze kazac zdalnej stronie porzucic jeszcze
+    /// niedostarczone dane (kontrakt quinn). Timeout, bo revokowany/wolny peer
+    /// moze nie zack'owac na czas — wtedy i tak wracamy (best-effort delivery).
+    async fn send_raw_envelope_to_peer_acked(
+        &self,
+        target_node_id: &str,
+        wire: &[u8],
+        ack_timeout: Duration,
+    ) -> Result<()> {
+        let connection = self
+            .connections
+            .get(target_node_id)
+            .ok_or_else(|| anyhow::anyhow!("brak polaczenia z {}", target_node_id))?
+            .connection
+            .clone();
+        let mut send = connection
+            .open_uni()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_uni: {e}"))?;
+        send.write_all(wire)
+            .await
+            .map_err(|e| anyhow::anyhow!("write ufp2 envelope: {e}"))?;
+        send.finish()
+            .map_err(|e| anyhow::anyhow!("finish ufp2 uni: {e}"))?;
+        let _ = tokio::time::timeout(ack_timeout, send.stopped()).await;
+        Ok(())
+    }
+
+    /// Buduje podpisana koperte UFP/2 wokol `data` dla jednego peera (walidacja
+    /// dyskryminatora + wyprowadzenie pubkeya z iroh node id). Wspoldzielona
+    /// przez `send_ufp2_to_peer` i wariant z ackiem.
+    fn build_ufp2_wire(
         &self,
         target_node_id: &str,
         legacy_discriminator: u8,
         data: &[u8],
-    ) -> Result<()> {
+    ) -> Result<Vec<u8>> {
         if !crate::mesh::ufp2::is_migrated_to_ufp2_discriminator(legacy_discriminator) {
             return Err(anyhow::anyhow!(
                 "send_ufp2_to_peer: discriminator 0x{:02X} is not on the UFP/2 unicast allowlist (bi-stream types FORWARD_REQ/FORWARD_STREAM_REQ use their own protocol)",
@@ -1499,7 +1529,7 @@ impl IrohMeshManager {
         })?;
         let source_pubkey = self.security.verifying_key_bytes();
         let epoch = self.current_policy_epoch();
-        let wire = crate::mesh::ufp2::build_signed_envelope_wire(
+        crate::mesh::ufp2::build_signed_envelope_wire(
             self.security.signing_key(),
             source_pubkey,
             dest_pubkey,
@@ -1507,8 +1537,37 @@ impl IrohMeshManager {
             data.to_vec(),
             epoch,
         )
-        .map_err(|e| anyhow::anyhow!("send_ufp2_to_peer: envelope build failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("send_ufp2_to_peer: envelope build failed: {e}"))
+    }
+
+    /// Build a signed UFP/2 envelope around `data` for a single peer and
+    /// dispatch it on a fresh uni-stream. Used by every send wrapper that
+    /// has been migrated off the legacy raw discriminator wire. The
+    /// destination peer's Ed25519 pubkey is derived from its iroh node id
+    /// (which IS the pubkey in iroh's identity model).
+    pub(crate) async fn send_ufp2_to_peer(
+        &self,
+        target_node_id: &str,
+        legacy_discriminator: u8,
+        data: &[u8],
+    ) -> Result<()> {
+        let wire = self.build_ufp2_wire(target_node_id, legacy_discriminator, data)?;
         self.send_raw_envelope_to_peer(target_node_id, &wire).await
+    }
+
+    /// Jak `send_ufp2_to_peer`, ale czeka na potwierdzenie odbioru przez peera
+    /// (do `ack_timeout`) przed powrotem. Uzywane gdy nadawca zaraz zamknie
+    /// polaczenie (revoke), zeby `Connection::close` nie porzucil notyfikacji.
+    pub(crate) async fn send_ufp2_to_peer_acked(
+        &self,
+        target_node_id: &str,
+        legacy_discriminator: u8,
+        data: &[u8],
+        ack_timeout: Duration,
+    ) -> Result<()> {
+        let wire = self.build_ufp2_wire(target_node_id, legacy_discriminator, data)?;
+        self.send_raw_envelope_to_peer_acked(target_node_id, &wire, ack_timeout)
+            .await
     }
 
     fn current_policy_epoch(&self) -> u32 {
