@@ -2190,9 +2190,9 @@ async function renderDistillDataTab(panel, p) {
   }
   if (!['sft', 'kd', 'dpo'].includes(objective)) objective = 'sft';
   const OBJ_HINTS = {
-    sft: 'SFT: pary pytanie→odpowiedź (teacher). Uczeń kopiuje odpowiedzi teachera.',
-    kd: 'KD: pary pytanie→odpowiedź (teacher). Destylacja rozkładu — wybierz teacher jako model-nauczyciela w treningu.',
-    dpo: 'DPO: trójki (prompt, lepsza, gorsza). Teacher daje lepszą odpowiedź, model odrzucający — gorszą; uczeń uczy się preferencji.',
+    sft: 'SFT — destylacja na ODPOWIEDZIACH: generujemy pary pytanie→odpowiedź (teacher). Uczeń imituje odpowiedzi.',
+    kd: 'KD — destylacja na LOGITACH: generujemy pary pytanie→odpowiedź; przy treningu teacher (wskaż go jako nauczyciela) dopasowuje rozkład.',
+    dpo: 'DPO — destylacja na PREFERENCJACH: generujemy trójki (prompt, lepsza, gorsza) — teacher lepszą, model odrzucający gorszą.',
   };
   const setObjective = (o) => {
     objective = o;
