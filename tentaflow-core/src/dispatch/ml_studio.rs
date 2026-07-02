@@ -1783,10 +1783,15 @@ fn reconcile_local_inference_status(
             if !node.is_empty() && node != local_node {
                 return m;
             }
-            // Brak żywego serwisu dla lokalnego deployu = serwis padł/usunięty → failed.
+            // Match po RZECZYWISTEJ ścieżce serwowanej (`inference_model_file` z
+            // deployu; fallback `gguf_path` dla starszych metryk). Bez tego deploy
+            // lokalny artefaktu przeniesionego ze zdalnego węzła (gguf_path=zdalna
+            // ścieżka) byłby błędnie oznaczany jako failed. Brak żywego serwisu =
+            // serwis padł/usunięty → failed.
             let real = obj
-                .get("gguf_path")
+                .get("inference_model_file")
                 .and_then(|v| v.as_str())
+                .or_else(|| obj.get("gguf_path").and_then(|v| v.as_str()))
                 .and_then(|g| live.get(g).copied())
                 .unwrap_or("failed");
             obj.insert("inference_status".to_string(), serde_json::json!(real));
@@ -3878,6 +3883,10 @@ pub async fn ml_studio_ft_deploy(
         let mut merged = metrics.clone();
         if let Some(obj) = merged.as_object_mut() {
             obj.insert("inference_model_name".to_string(), serde_json::json!(model_name));
+            // RZECZYWISTA ścieżka serwowana (po ew. transferze z węzła zdalnego) —
+            // rekoncyliacja matchuje serwis po niej, bo `gguf_path` może wskazywać
+            // oryginalną (zdalną) lokalizację artefaktu, nie plik faktycznie ładowany.
+            obj.insert("inference_model_file".to_string(), serde_json::json!(deploy_path));
             obj.insert(
                 "inference_status".to_string(),
                 serde_json::json!(status),
