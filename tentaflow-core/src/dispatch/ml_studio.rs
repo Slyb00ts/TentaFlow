@@ -1348,9 +1348,15 @@ pub fn ml_studio_dataset_rows(
     let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
-    // Pusty raw_data (dataset w trakcie generacji / nowo utworzony) NIE jest błędem —
-    // zwracamy 0 wierszy, ale nadal pochodzenie (meta), żeby GUI mogło je pokazać.
-    let raw = repository::get_dataset_raw(&org.user_id, &payload.dataset_id).unwrap_or_default();
+    // Dataset w trakcie generacji / nowo utworzony (row_count==0) nie ma jeszcze
+    // raw_data — to NIE błąd, zwracamy 0 wierszy + pochodzenie (meta). Ale realny
+    // błąd DB dla NIEPUSTEGO datasetu MUSI się wypropagować — inaczej GUI dostałoby
+    // fałszywie pusty wynik i późniejszy zapis nadpisałby prawdziwe dane pustką.
+    let raw = match repository::get_dataset_raw(&org.user_id, &payload.dataset_id) {
+        Ok(r) => r,
+        Err(_) if dataset.row_count == 0 => Vec::new(),
+        Err(e) => return Err(db_err(e)),
+    };
     let text = String::from_utf8_lossy(&raw);
     let all: Vec<String> = text
         .lines()
