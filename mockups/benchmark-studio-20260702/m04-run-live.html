@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Benchmark Studio · Run w toku (M4)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .run-head {
+    display: flex; align-items: center; gap: 14px; padding: 14px 18px;
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+    margin-bottom: 14px;
+  }
+  .run-head .r-name { font-size: 16px; font-weight: 800; }
+  .run-head .r-sub { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
+  .run-head .elapsed { font-size: 20px; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .prog-row { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+  .prog-row .progress { flex: 1; }
+  .prog-row .pct { font-weight: 800; font-variant-numeric: tabular-nums; }
+  .num-r { text-align: right; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+  <symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+  <symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M4</span>
+    <h2>Run w toku</h2>
+    <div class="desc">Podgląd na żywo: progress całości, macierz statusów target×test, live log i częściowa tabela wyników rosnąca w miarę kończenia testów.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Analityka</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-trend"/></svg>Statystyki modeli</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio<span class="badge">1</span></div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr · Admin</div><div class="role">Euvic · Zarząd</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Analityka</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Benchmark Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">LLM produkcyjne Q3</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb current">Run #14</span>
+        </div>
+
+        <div class="run-head">
+          <div style="flex:1;">
+            <div class="r-name">LLM produkcyjne Q3 · Run #14 <span class="chip accent" style="margin-left:8px;"><span class="dot"></span>running</span></div>
+            <div class="r-sub">Start 02.07.2026 09:14 · 3 targety × 4 testy · szacowane ≈ 35 min</div>
+          </div>
+          <div class="center">
+            <div class="elapsed">15:42</div>
+            <div class="text-3 text-xs">elapsed</div>
+          </div>
+          <button class="btn btn-danger"><svg class="icon"><use href="#i-stop"/></svg>Stop</button>
+        </div>
+
+        <div class="prog-row">
+          <span class="text-3 text-xs" style="text-transform:uppercase;letter-spacing:.06em;font-weight:700;">Postęp całości</span>
+          <div class="progress"><span style="width:45%"></span></div>
+          <span class="pct">45%</span>
+          <span class="text-3 text-sm">pozostało ≈ 19 min</span>
+        </div>
+
+        <div class="grid-2">
+          <div class="section-card">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon" style="color:var(--accent-2)"><use href="#i-flask"/></svg>Macierz target × test</div>
+              <div class="hint">✓ done · ▶ running · ⏳ pending</div>
+            </div>
+            <table class="run-matrix">
+              <thead>
+                <tr><th></th><th>Latencja</th><th>Równoległość</th><th>Kontekst</th><th>Stabilność</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td class="rowhead"><span class="serie-dot" style="background:var(--serie-gemma);display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;"></span>gemma-4-31b<span class="sub">spark-cluster TP=2 · vLLM</span></td>
+                  <td class="cell done">✓ done</td>
+                  <td class="cell running">▶ c=16</td>
+                  <td class="cell pending">⏳ pending</td>
+                  <td class="cell pending">⏳ pending</td>
+                </tr>
+                <tr>
+                  <td class="rowhead"><span style="background:var(--serie-qwen);display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;"></span>Qwen2.5-7B<span class="sub">rig24 · vLLM</span></td>
+                  <td class="cell done">✓ done</td>
+                  <td class="cell done">✓ done</td>
+                  <td class="cell running">▶ ctx 8192</td>
+                  <td class="cell pending">⏳ pending</td>
+                </tr>
+                <tr>
+                  <td class="rowhead"><span style="background:var(--serie-claude);display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;"></span>claude-sonnet<span class="sub">Anthropic API</span></td>
+                  <td class="cell done">✓ done</td>
+                  <td class="cell running">▶ c=4</td>
+                  <td class="cell pending">⏳ pending</td>
+                  <td class="cell pending">⏳ pending</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="section-card">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon" style="color:var(--accent-2)"><use href="#i-terminal"/></svg>Live log</div>
+              <div class="hint">ostatnie linie · pełny log w artefaktach runu</div>
+            </div>
+            <div class="live-log">
+              <div><span class="ts">09:27:14</span> <span class="ok">[gemma-4-31b]</span> test latencja: done — TTFT 420±18 ms, decode 24.1±0.4 t/s (5 powt.)</div>
+              <div><span class="ts">09:27:15</span> <span class="run">[gemma-4-31b]</span> test równoległość: start, poziomy [1, 4, 16, 64]</div>
+              <div><span class="ts">09:28:02</span> <span class="run">[gemma-4-31b]</span> [concurrency=1] 5/5 ok — decode 24.1 t/s</div>
+              <div><span class="ts">09:28:58</span> <span class="run">[gemma-4-31b]</span> [concurrency=4] 20/20 ok — decode 21.8 t/s/req, total 87 t/s</div>
+              <div><span class="ts">09:29:41</span> <span class="run">[Qwen2.5-7B]</span> [ctx=8192] req 2/3 TTFT=985ms decode=52.0 t/s</div>
+              <div><span class="ts">09:29:47</span> <span class="warn">[claude-sonnet]</span> [concurrency=4] req 11/20 HTTP 429, retry za 2 s</div>
+              <div><span class="ts">09:29:52</span> <span class="run">[gemma-4-31b]</span> [concurrency=16] req 42/64 TTFT=180ms decode=41.2 t/s</div>
+              <div><span class="ts">09:29:55</span> <span class="run">[gemma-4-31b]</span> [concurrency=16] req 48/64 TTFT=176ms decode=40.8 t/s</div>
+              <div><span class="ts">09:29:56</span> <span class="run">[claude-sonnet]</span> [concurrency=4] req 14/20 TTFT=812ms decode=59.4 t/s <span class="cursor"></span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon" style="color:var(--accent-2)"><use href="#i-list"/></svg>Wyniki częściowe</div>
+            <div class="hint">tabela rośnie w miarę kończenia testów · mean ± σ</div>
+          </div>
+          <table class="tf-table results-table">
+            <thead>
+              <tr><th>Model</th><th>Test</th><th>Parametry</th><th class="num-r">TTFT ms</th><th class="num-r">Prefill t/s</th><th class="num-r">Decode t/s</th><th class="num-r">Total ms</th><th class="num-r">Err %</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="serie-dot" style="background:var(--serie-gemma)"></span><strong>gemma-4-31b</strong></td>
+                <td>latencja</td><td class="mono">p512 g128 n5</td>
+                <td class="num-r mono">420 <span class="sigma">±18</span></td>
+                <td class="num-r mono">890</td>
+                <td class="num-r mono">24.1 <span class="sigma">±0.4</span></td>
+                <td class="num-r mono">5 720</td>
+                <td class="num-r mono">0.0</td>
+              </tr>
+              <tr>
+                <td><span class="serie-dot" style="background:var(--serie-qwen)"></span><strong>Qwen2.5-7B</strong></td>
+                <td>latencja</td><td class="mono">p512 g128 n5</td>
+                <td class="num-r mono">158 <span class="sigma">±9</span></td>
+                <td class="num-r mono">3 240</td>
+                <td class="num-r mono">57.6 <span class="sigma">±1.1</span></td>
+                <td class="num-r mono">2 380</td>
+                <td class="num-r mono">0.0</td>
+              </tr>
+              <tr>
+                <td><span class="serie-dot" style="background:var(--serie-claude)"></span><strong>claude-sonnet</strong></td>
+                <td>latencja</td><td class="mono">p512 g128 n5</td>
+                <td class="num-r mono">780 <span class="sigma">±140</span></td>
+                <td class="num-r mono">—</td>
+                <td class="num-r mono">61.8 <span class="sigma">±4.2</span></td>
+                <td class="num-r mono">2 850</td>
+                <td class="num-r mono">0.0</td>
+              </tr>
+              <tr>
+                <td><span class="serie-dot" style="background:var(--serie-qwen)"></span><strong>Qwen2.5-7B</strong></td>
+                <td>równoległość</td><td class="mono">c=1..64 p512 g128</td>
+                <td class="num-r mono">162–540</td>
+                <td class="num-r mono">3 180</td>
+                <td class="num-r mono">57.6 → 17.2 /req</td>
+                <td class="num-r mono">2 400–7 900</td>
+                <td class="num-r mono">0.0</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

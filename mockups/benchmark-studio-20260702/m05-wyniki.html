@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Benchmark Studio · Wyniki runu (M5)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .run-head {
+    display: flex; align-items: center; gap: 14px; padding: 14px 18px;
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+    margin-bottom: 16px;
+  }
+  .run-head .r-name { font-size: 16px; font-weight: 800; }
+  .run-head .r-sub { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
+  .num-r { text-align: right; font-variant-numeric: tabular-nums; }
+  .results-table .group-sep td { background: var(--bg-3); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--accent-2); font-weight: 800; padding: 6px 14px; }
+  .chart-h { height: 220px; }
+  .chart-h-sm { height: 190px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+  <symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+  <symbol id="i-compare" viewBox="0 0 24 24"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M5</span>
+    <h2>Wyniki runu</h2>
+    <div class="desc">Najważniejszy ekran: tabela à la llama-bench (mean ± σ z N powtórzeń, p50/p90/p99, err%) + wykresy: throughput, degradacja z kontekstem, latencje, stabilność.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Analityka</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-trend"/></svg>Statystyki modeli</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr · Admin</div><div class="role">Euvic · Zarząd</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Analityka</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Benchmark Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">LLM produkcyjne Q3</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb current">Run #14 · wyniki</span>
+        </div>
+
+        <div class="run-head">
+          <div style="flex:1;">
+            <div class="r-name">LLM produkcyjne Q3 · Run #14 <span class="chip success" style="margin-left:8px;"><span class="dot"></span>success</span></div>
+            <div class="r-sub">02.07.2026 09:14 → 09:48 · czas trwania 34 min · 3 targety × 4 testy · 428 zapytań testowych</div>
+          </div>
+          <div class="chart-legend">
+            <span class="lg"><span class="sw" style="background:var(--serie-gemma)"></span>gemma-4-31b (spark-cluster TP=2)</span>
+            <span class="lg"><span class="sw" style="background:var(--serie-qwen)"></span>Qwen2.5-7B (rig24, vLLM)</span>
+            <span class="lg"><span class="sw" style="background:var(--serie-claude)"></span>claude-sonnet (Anthropic API)</span>
+          </div>
+          <button class="btn btn-secondary"><svg class="icon"><use href="#i-download"/></svg>Eksport CSV</button>
+          <button class="btn btn-primary"><svg class="icon"><use href="#i-compare"/></svg>Porównaj z innym runem</button>
+        </div>
+
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon" style="color:var(--accent-2)"><use href="#i-list"/></svg>Tabela wyników</div>
+            <div class="hint">mean ± σ z N powtórzeń · ★ = najlepszy wynik w kolumnie w ramach testu · decode przy równoległości = per-request</div>
+          </div>
+          <table class="tf-table results-table">
+            <thead>
+              <tr><th>Model</th><th>Test</th><th>Parametry</th><th class="num-r">TTFT ms</th><th class="num-r">Prefill t/s</th><th class="num-r">Decode t/s</th><th class="num-r">p50 / p90 / p99 ms</th><th class="num-r">Err %</th></tr>
+            </thead>
+            <tbody>
+              <tr class="group-sep"><td colspan="8">Latencja pojedynczego zapytania · p512 g128 · n=5</td></tr>
+              <tr>
+                <td><span class="serie-dot" style="background:var(--serie-gemma)"></span><strong>gemma-4-31b</strong></td>
+                <td>latencja</td><td class="mono">c=1</td>
+                <td class="num-r mono">420 <span class="sigma">±18</span></td>
+                <td class="num-r mono">890</td>
+                <td class="num-r mono">24.1 <span class="sigma">±0.4</span></td>
+                <td class="num-r mono">5 720 / 5 840 / 5 920</td>
+                <td class="num-r mono">0.0</td>
+              </tr>
+              <tr>
+                <td><span class="serie-dot" style="background:var(--serie-qwen)"></span><strong>Qwen2.5-7B</strong></td>
+                <td>latencja</td><td class="mono">c=1</td>
+                <td class="num-r mono best">158 <span class="sigma">±9</span></td>
+                <td class="num-r mono best">3 240</td>
+                <td class="num-r mono">57.6 <span class="sigma">±1.1</span></td>
+                <td class="num-r mono best">2 380 / 2 440 / 2 510</td>
+                <td class="num-r mono">0.0</td>
+              </tr>
+              <tr>
+                <td><span class="serie-dot" style="background:var(--serie-claude)"></span><strong>claude-sonnet</strong></td>
+                <td>latencja</td><td class="mono">c=1</td>
+                <td class="num-r mono">780 <span class="sigma">±140</span></td>
+                <td class="num-r mono">—</td>
+                <td class="num-r mono best">61.8 <span class="sigma">±4.2</span></td>
+                <td class="num-r mono">2 850 / 3 220 / 3 610</td>
+                <td class="num-r mono">0.0</td>
+              </tr>
+
+              <tr class="group-sep"><td colspan="8">Przepustowość — równoległość c=16 · p512 g128 (pełny sweep na wykresie niżej)</td></tr>
+              <tr>
+                <td><span class="serie-dot" style="background:var(--serie-gemma)"></span><strong>gemma-4-31b</strong></td>
+                <td>równoległość</td><td class="mono">c=16 · total 227 t/s</td>
+                <td class="num-r mono">610 <span class="sigma">±45</span></td>
+                <td class="num-r mono">820</td>
+                <td class="num-r mono">14.2 <span class="sigma">±0.8</span></td>
+                <td class="num-r mono">9 450 / 9 900 / 10 400</td>
+                <td class="num-r mono">0.0</td>
+              </tr>
+              <tr>
+                <td><span class="serie-dot" style="background:var(--serie-qwen)"></span><strong>Qwen2.5-7B</strong></td>
+                <td>równoległość</td><td class="mono">c=16 · total 614 t/s</td>
+                <td class="num-r mono best">240 <span class="sigma">±21</span></td>
+                <td class="num-r mono best">2 950</td>
+                <td class="num-r mono">38.4 <span class="sigma">±1.6</span></td>
+                <td class="num-r mono best">3 560 / 3 720 / 3 980</td>
+                <td class="num-r mono">0.0</td>
+              </tr>
+              <tr>
+                <td><span class="serie-dot" style="background:var(--serie-claude)"></span><strong>claude-sonnet</strong></td>
+                <td>równoległość</td><td class="mono">c=16 · total 914 t/s</td>
+                <td class="num-r mono">940 <span class="sigma">±210</span></td>
+                <td class="num-r mono">—</td>
+                <td class="num-r mono best">57.1 <span class="sigma">±5.0</span></td>
+                <td class="num-r mono">3 050 / 3 900 / 5 200</td>
+                <td class="num-r mono">0.9</td>
+              </tr>
+
+              <tr class="group-sep"><td colspan="8">Sweep kontekstu — ctx=32 768 · g128 · n=3 (pozostałe długości na wykresie niżej)</td></tr>
+              <tr>
+                <td><span class="serie-dot" style="background:var(--serie-gemma)"></span><strong>gemma-4-31b</strong></td>
+                <td>kontekst</td><td class="mono">ctx=32768</td>
+                <td class="num-r mono">9 800 <span class="sigma">±420</span></td>
+                <td class="num-r mono">3 340</td>
+                <td class="num-r mono">16.9 <span class="sigma">±0.7</span></td>
+                <td class="num-r mono">17 400 / 17 900 / 18 300</td>
+                <td class="num-r mono">0.0</td>
+              </tr>
+              <tr>
+                <td><span class="serie-dot" style="background:var(--serie-qwen)"></span><strong>Qwen2.5-7B</strong></td>
+                <td>kontekst</td><td class="mono">ctx=32768</td>
+                <td class="num-r mono">3 900 <span class="sigma">±160</span></td>
+                <td class="num-r mono best">8 400</td>
+                <td class="num-r mono">43.6 <span class="sigma">±1.9</span></td>
+                <td class="num-r mono">6 850 / 7 100 / 7 400</td>
+                <td class="num-r mono">0.0</td>
+              </tr>
+              <tr>
+                <td><span class="serie-dot" style="background:var(--serie-claude)"></span><strong>claude-sonnet</strong></td>
+                <td>kontekst</td><td class="mono">ctx=32768</td>
+                <td class="num-r mono best">3 100 <span class="sigma">±480</span></td>
+                <td class="num-r mono">—</td>
+                <td class="num-r mono best">54.2 <span class="sigma">±3.8</span></td>
+                <td class="num-r mono best">5 470 / 6 300 / 7 100</td>
+                <td class="num-r mono">1.2</td>
+              </tr>
+
+              <tr class="group-sep"><td colspan="8">Stabilność (sustained load) · 10 min · c=8 · p512 g128</td></tr>
+              <tr>
+                <td><span class="serie-dot" style="background:var(--serie-gemma)"></span><strong>gemma-4-31b</strong></td>
+                <td>stabilność</td><td class="mono">10 min c=8</td>
+                <td class="num-r mono">660 <span class="sigma">±180</span></td>
+                <td class="num-r mono">790</td>
+                <td class="num-r mono">20.9 <span class="sigma">±4.6</span></td>
+                <td class="num-r mono">5 900 / 9 200 / 12 800</td>
+                <td class="num-r mono">0.4</td>
+              </tr>
+              <tr>
+                <td><span class="serie-dot" style="background:var(--serie-qwen)"></span><strong>Qwen2.5-7B</strong></td>
+                <td>stabilność</td><td class="mono">10 min c=8</td>
+                <td class="num-r mono best">210 <span class="sigma">±14</span></td>
+                <td class="num-r mono best">3 020</td>
+                <td class="num-r mono">44.9 <span class="sigma">±1.3</span></td>
+                <td class="num-r mono best">3 070 / 3 190 / 3 420</td>
+                <td class="num-r mono best">0.0</td>
+              </tr>
+              <tr>
+                <td><span class="serie-dot" style="background:var(--serie-claude)"></span><strong>claude-sonnet</strong></td>
+                <td>stabilność</td><td class="mono">10 min c=8</td>
+                <td class="num-r mono">830 <span class="sigma">±190</span></td>
+                <td class="num-r mono">—</td>
+                <td class="num-r mono best">59.6 <span class="sigma">±3.1</span></td>
+                <td class="num-r mono">2 940 / 3 400 / 4 800</td>
+                <td class="num-r mono">0.7</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="grid-2">
+          <div class="section-card">
+            <div class="section-card-head">
+              <div class="title">Decode t/s per request vs równoległość</div>
+              <div class="hint">p512 g128 · per-request (nie agregat)</div>
+            </div>
+            <svg class="chart-svg chart-h" viewBox="0 0 960 220" preserveAspectRatio="none">
+              <g>
+                <line class="gridline" x1="40" y1="10"  x2="950" y2="10"/>
+                <line class="gridline" x1="40" y1="55"  x2="950" y2="55"/>
+                <line class="gridline" x1="40" y1="100" x2="950" y2="100"/>
+                <line class="gridline" x1="40" y1="145" x2="950" y2="145"/>
+                <line class="gridline" x1="40" y1="190" x2="950" y2="190"/>
+                <text x="36" y="13"  text-anchor="end">70</text>
+                <text x="36" y="58"  text-anchor="end">52</text>
+                <text x="36" y="103" text-anchor="end">35</text>
+                <text x="36" y="148" text-anchor="end">17</text>
+                <text x="36" y="193" text-anchor="end">0</text>
+              </g>
+              <!-- c=1 -->
+              <g>
+                <rect x="72"  y="128" width="40" height="62"  fill="#6366f1"/>
+                <rect x="120" y="42"  width="40" height="148" fill="#a78bfa"/>
+                <rect x="168" y="31"  width="40" height="159" fill="#60a5fa"/>
+                <text x="140" y="204" text-anchor="middle">c = 1</text>
+              </g>
+              <!-- c=4 -->
+              <g>
+                <rect x="312" y="134" width="40" height="56"  fill="#6366f1"/>
+                <rect x="360" y="56"  width="40" height="134" fill="#a78bfa"/>
+                <rect x="408" y="35"  width="40" height="155" fill="#60a5fa"/>
+                <text x="380" y="204" text-anchor="middle">c = 4</text>
+              </g>
+              <!-- c=16 -->
+              <g>
+                <rect x="552" y="153" width="40" height="37"  fill="#6366f1"/>
+                <rect x="600" y="91"  width="40" height="99"  fill="#a78bfa"/>
+                <rect x="648" y="43"  width="40" height="147" fill="#60a5fa"/>
+                <text x="620" y="204" text-anchor="middle">c = 16</text>
+              </g>
+              <!-- c=64 -->
+              <g>
+                <rect x="792" y="175" width="40" height="15"  fill="#6366f1"/>
+                <rect x="840" y="146" width="40" height="44"  fill="#a78bfa"/>
+                <rect x="888" y="64"  width="40" height="126" fill="#60a5fa"/>
+                <text x="860" y="204" text-anchor="middle">c = 64</text>
+              </g>
+            </svg>
+            <div class="text-3 text-xs mt-sm">Throughput agregowany: gemma-4 <span class="mono">24 → 378 t/s</span> · Qwen2.5-7B <span class="mono">58 → 1 101 t/s</span> · claude-sonnet <span class="mono">62 → 914 t/s</span> (c=64, throttling 2.1% err)</div>
+          </div>
+
+          <div class="section-card">
+            <div class="section-card-head">
+              <div class="title">Degradacja decode t/s vs długość kontekstu</div>
+              <div class="hint">g128 · n=3 · oś X: prompt tokens</div>
+            </div>
+            <svg class="chart-svg chart-h" viewBox="0 0 960 220" preserveAspectRatio="none">
+              <g>
+                <line class="gridline" x1="40" y1="10"  x2="950" y2="10"/>
+                <line class="gridline" x1="40" y1="55"  x2="950" y2="55"/>
+                <line class="gridline" x1="40" y1="100" x2="950" y2="100"/>
+                <line class="gridline" x1="40" y1="145" x2="950" y2="145"/>
+                <line class="gridline" x1="40" y1="190" x2="950" y2="190"/>
+                <text x="36" y="13"  text-anchor="end">70</text>
+                <text x="36" y="58"  text-anchor="end">52</text>
+                <text x="36" y="103" text-anchor="end">35</text>
+                <text x="36" y="148" text-anchor="end">17</text>
+                <text x="36" y="193" text-anchor="end">0</text>
+              </g>
+              <polyline points="100,127 340,129 580,135 820,147" fill="none" stroke="#6366f1" stroke-width="2.5"/>
+              <polyline points="100,40 340,44 580,56 820,78" fill="none" stroke="#a78bfa" stroke-width="2.5"/>
+              <polyline points="100,29 340,33 580,39 820,51" fill="none" stroke="#60a5fa" stroke-width="2.5"/>
+              <g fill="#6366f1"><circle cx="100" cy="127" r="3.5"/><circle cx="340" cy="129" r="3.5"/><circle cx="580" cy="135" r="3.5"/><circle cx="820" cy="147" r="3.5"/></g>
+              <g fill="#a78bfa"><circle cx="100" cy="40" r="3.5"/><circle cx="340" cy="44" r="3.5"/><circle cx="580" cy="56" r="3.5"/><circle cx="820" cy="78" r="3.5"/></g>
+              <g fill="#60a5fa"><circle cx="100" cy="29" r="3.5"/><circle cx="340" cy="33" r="3.5"/><circle cx="580" cy="39" r="3.5"/><circle cx="820" cy="51" r="3.5"/></g>
+              <g>
+                <text x="100" y="207" text-anchor="middle">128</text>
+                <text x="340" y="207" text-anchor="middle">2 048</text>
+                <text x="580" y="207" text-anchor="middle">8 192</text>
+                <text x="820" y="207" text-anchor="middle">32 768</text>
+              </g>
+            </svg>
+            <div class="text-3 text-xs mt-sm">Spadek 128 → 32k: gemma-4 <span class="mono">−31%</span> (24.6 → 16.9) · Qwen2.5-7B <span class="mono">−25%</span> (58.4 → 43.6) · claude-sonnet <span class="mono">−13%</span> (62.5 → 54.2). TTFT gemma-4 @32k: <span class="mono">9.8 s</span>.</div>
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <div class="section-card">
+            <div class="section-card-head">
+              <div class="title">Latencja end-to-end p50 / p90 / p99</div>
+              <div class="hint">test latencji · c=1 · p512 g128</div>
+            </div>
+            <svg class="chart-svg chart-h-sm" viewBox="0 0 960 190" preserveAspectRatio="none">
+              <g>
+                <line class="gridline" x1="150" y1="6" x2="150" y2="168"/>
+                <line class="gridline" x1="416" y1="6" x2="416" y2="168"/>
+                <line class="gridline" x1="683" y1="6" x2="683" y2="168"/>
+                <line class="gridline" x1="950" y1="6" x2="950" y2="168"/>
+                <text x="150" y="182" text-anchor="middle">0</text>
+                <text x="416" y="182" text-anchor="middle">2 000 ms</text>
+                <text x="683" y="182" text-anchor="middle">4 000 ms</text>
+                <text x="950" y="182" text-anchor="middle">6 000 ms</text>
+              </g>
+              <!-- gemma -->
+              <text x="144" y="22" text-anchor="end">gemma-4 p50</text>
+              <rect x="150" y="14" width="762" height="11" fill="#6366f1"/>
+              <text x="144" y="40" text-anchor="end">p90</text>
+              <rect x="150" y="32" width="778" height="11" fill="#6366f1" opacity="0.65"/>
+              <text x="144" y="58" text-anchor="end">p99</text>
+              <rect x="150" y="50" width="789" height="11" fill="#6366f1" opacity="0.4"/>
+              <!-- qwen -->
+              <text x="144" y="80" text-anchor="end">Qwen2.5-7B p50</text>
+              <rect x="150" y="72" width="317" height="11" fill="#a78bfa"/>
+              <text x="144" y="98" text-anchor="end">p90</text>
+              <rect x="150" y="90" width="325" height="11" fill="#a78bfa" opacity="0.65"/>
+              <text x="144" y="116" text-anchor="end">p99</text>
+              <rect x="150" y="108" width="334" height="11" fill="#a78bfa" opacity="0.4"/>
+              <!-- claude -->
+              <text x="144" y="138" text-anchor="end">claude-sonnet p50</text>
+              <rect x="150" y="130" width="380" height="11" fill="#60a5fa"/>
+              <text x="144" y="156" text-anchor="end">p90</text>
+              <rect x="150" y="148" width="429" height="11" fill="#60a5fa" opacity="0.65"/>
+              <text x="144" y="174" text-anchor="end">p99</text>
+              <rect x="150" y="166" width="481" height="11" fill="#60a5fa" opacity="0.4"/>
+            </svg>
+          </div>
+
+          <div class="section-card">
+            <div class="section-card-head">
+              <div class="title">Stabilność — decode t/s w czasie (10 min, c=8)</div>
+              <div class="hint">średnia krocząca 30 s · per-request</div>
+            </div>
+            <svg class="chart-svg chart-h-sm" viewBox="0 0 960 190" preserveAspectRatio="none">
+              <g>
+                <line class="gridline" x1="40" y1="8"   x2="950" y2="8"/>
+                <line class="gridline" x1="40" y1="47"  x2="950" y2="47"/>
+                <line class="gridline" x1="40" y1="86"  x2="950" y2="86"/>
+                <line class="gridline" x1="40" y1="125" x2="950" y2="125"/>
+                <line class="gridline" x1="40" y1="164" x2="950" y2="164"/>
+                <text x="36" y="11"  text-anchor="end">70</text>
+                <text x="36" y="50"  text-anchor="end">52</text>
+                <text x="36" y="89"  text-anchor="end">35</text>
+                <text x="36" y="128" text-anchor="end">17</text>
+                <text x="36" y="167" text-anchor="end">0</text>
+              </g>
+              <!-- dip gemma-4 ~min 6-7 -->
+              <rect x="530" y="8" width="170" height="156" fill="rgba(239,68,68,0.07)"/>
+              <polyline fill="none" stroke="#6366f1" stroke-width="2" points="40,111 85,112 130,110 175,113 220,111 265,112 310,113 355,112 400,111 445,113 490,116 535,124 580,133 625,138 670,136 715,128 760,119 805,114 850,112 895,112 940,111"/>
+              <polyline fill="none" stroke="#a78bfa" stroke-width="2" points="40,64 130,63 220,65 310,64 400,63 490,65 580,64 670,63 760,65 850,64 940,63"/>
+              <polyline fill="none" stroke="#60a5fa" stroke-width="2" points="40,32 130,30 220,34 310,31 400,29 490,33 580,35 670,31 760,30 850,34 940,31"/>
+              <g>
+                <text x="40"  y="180">0 min</text>
+                <text x="495" y="180" text-anchor="middle">5 min</text>
+                <text x="940" y="180" text-anchor="end">10 min</text>
+              </g>
+              <text x="615" y="152" text-anchor="middle" style="fill:var(--danger);font-weight:700;">dip −40%</text>
+            </svg>
+            <div class="text-3 text-xs mt-sm"><span style="color:var(--warning);font-weight:700;">⚠ gemma-4-31b:</span> spadek do ~14 t/s w minutach 6–7 (kompakcja KV-cache / preempcja przy pełnym batchu), powrót do normy po ~90 s. Pozostałe targety stabilne.</div>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>
