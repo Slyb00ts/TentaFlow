@@ -617,22 +617,24 @@ impl MeshCommandExecutor {
     ) -> Result<String, String> {
         let all = crate::db::repository::list_all_cluster_members(&self.security.db)
             .map_err(|e| format!("odczyt czlonkow klastra: {e}"))?;
-        let my_clusters: std::collections::HashSet<&str> = all
+        // Koordynator (nadawca) moze orkiestrowac deploy z wezla SPOZA compute-clustra
+        // (trigger z dowolnego zaufanego admin-node) — jego node_id nie musi byc w
+        // `cluster_members`. Zaufanie nadawcy jest juz wymuszone przez warstwe mesh
+        // (komenda nie dotarlaby do execute od niesparowanego peera). Po stronie
+        // odbiorcy weryfikujemy to, co ma sens: TEN wezel jest czlonkiem klastra
+        // (operacje P0 na modelu dotycza tylko wezlow klastra). Zwracany cluster_id
+        // ogranicza cel `PushModelToPeer` do wspolczlonkow tego samego klastra.
+        let my_cluster = all
             .iter()
-            .filter(|m| m.node_id == self.local_node_id)
-            .map(|m| m.cluster_id.as_str())
-            .collect();
-        let shared = all
-            .iter()
-            .find(|m| m.node_id == from_node_id && my_clusters.contains(m.cluster_id.as_str()))
+            .find(|m| m.node_id == self.local_node_id)
             .map(|m| m.cluster_id.clone());
-        match shared {
+        match my_cluster {
             Some(cluster_id) => {
                 debug!(
                     from = %from_node_id,
                     deployment = %deployment_cluster_id,
                     cluster = %cluster_id,
-                    "autoryzacja komendy P0 cluster-deploy OK (wspolny klaster)"
+                    "autoryzacja komendy P0 cluster-deploy OK (odbiorca jest czlonkiem klastra)"
                 );
                 Ok(cluster_id)
             }
@@ -640,9 +642,9 @@ impl MeshCommandExecutor {
                 warn!(
                     from = %from_node_id,
                     deployment = %deployment_cluster_id,
-                    "odrzucono komende P0 cluster-deploy: brak wspolnego klastra z nadawca"
+                    "odrzucono komende P0 cluster-deploy: ten wezel nie jest czlonkiem zadnego klastra"
                 );
-                Err("unauthorized: no matching active cluster deployment".to_string())
+                Err("unauthorized: this node is not a cluster member".to_string())
             }
         }
     }
