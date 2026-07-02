@@ -4242,5 +4242,16 @@ fn set_export_status_running(metrics: &serde_json::Value) -> String {
     obj.insert("gguf_path".to_string(), serde_json::Value::Null);
     obj.insert("gguf_size_bytes".to_string(), serde_json::Value::Null);
     obj.insert("export_error".to_string(), serde_json::Value::Null);
+    // Nowy eksport unieważnia poprzedni deployment: stary serwis (jeśli żyje)
+    // serwuje NIEAKTUALNY artefakt. Czyścimy linkage inferencji, żeby rekoncyliacja
+    // nie raportowała starego deployu jako bieżącego ani nie kierowała tam chatu.
+    for key in [
+        "inference_status",
+        "inference_model_name",
+        "inference_model_file",
+        "inference_node",
+    ] {
+        obj.remove(key);
+    }
     root.to_string()
 }
