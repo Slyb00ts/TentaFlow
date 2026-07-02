@@ -1488,6 +1488,10 @@ pub struct MlStudioDatasetRowsResponse {
     pub total: u32,
     /// Surowe linie JSONL (do `total` albo do limitu).
     pub rows: Vec<String>,
+    /// Pochodzenie (JSON `distill_meta` z profile_json): czym/jak wygenerowano —
+    /// teacher, wariant, prompt, źródło pytań. None dla datasetów spoza destylacji.
+    #[serde(default)]
+    pub meta: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -2318,10 +2322,6 @@ pub enum MlStudioPayload {
     DatasetsListResponse(MlStudioDatasetsListResponse),
     DatasetProfileRequest(MlStudioDatasetProfileRequest),
     DatasetProfileResponse(MlStudioDatasetProfileResponse),
-    DatasetRowsRequest(MlStudioDatasetRowsRequest),
-    DatasetRowsResponse(MlStudioDatasetRowsResponse),
-    DatasetRowsSaveRequest(MlStudioDatasetRowsSaveRequest),
-    DatasetRowsSaveResponse(MlStudioDatasetRowsSaveResponse),
     TabularTrainRequest(MlStudioTabularTrainRequest),
     TabularTrainResponse(MlStudioTabularTrainResponse),
     ResourceGrantCreateRequest(MlStudioResourceGrantCreateRequest),
@@ -2398,6 +2398,12 @@ pub enum MlStudioPayload {
     LookupDictDeleteResponse(MlStudioLookupDictDeleteResponse),
     ServiceModelsListRequest(MlStudioServiceModelsListRequest),
     ServiceModelsListResponse(MlStudioServiceModelsListResponse),
+    // NOWE warianty ZAWSZE na końcu — ciborium serializuje indeks wariantu, więc
+    // wstawienie w środku przesunęłoby dyskryminatory i zepsuło wire compat.
+    DatasetRowsRequest(MlStudioDatasetRowsRequest),
+    DatasetRowsResponse(MlStudioDatasetRowsResponse),
+    DatasetRowsSaveRequest(MlStudioDatasetRowsSaveRequest),
+    DatasetRowsSaveResponse(MlStudioDatasetRowsSaveResponse),
 }
 
 // ----- Robots screen (UserSession) -----

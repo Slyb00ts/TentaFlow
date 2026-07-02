@@ -52,7 +52,21 @@ pub fn spawn_distill_generation(
     req: MlStudioDistillGenerateRequest,
 ) -> anyhow::Result<String> {
     // Pusty dataset od razu — UI ma id do pollingu; raw_data dopiszemy na koncu.
-    let profile = serde_json::json!({ "distill_status": "pending" }).to_string();
+    // POCHODZENIE (distill_meta): kto/czym/jak wygenerowal dane — inaczej po fakcie
+    // nie wiadomo, jaki teacher/wariant/prompt stworzyl dataset. Pokazywane w GUI.
+    let profile = serde_json::json!({
+        "distill_status": "pending",
+        "distill_meta": {
+            "objective": req.objective.as_deref().unwrap_or("sft"),
+            "teacher_model": req.teacher_model,
+            "question_source": req.question_source,
+            "question_model": req.question_model,
+            "generate_prompt": req.generate_prompt,
+            "rejected_model": req.rejected_model,
+            "answer_instruction": req.answer_instruction,
+        }
+    })
+    .to_string();
     let dataset = super::repository::create_dataset(
         &user_id,
         &req.project_id,

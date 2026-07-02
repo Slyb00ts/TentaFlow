@@ -1361,12 +1361,19 @@ pub fn ml_studio_dataset_rows(
         Some(n) if n > 0 => all.into_iter().take(n as usize).collect(),
         _ => all,
     };
+    // Pochodzenie: distill_meta z profile_json (czym/jak wygenerowano) — do GUI.
+    let meta = serde_json::from_str::<serde_json::Value>(&dataset.profile_json)
+        .ok()
+        .and_then(|p| p.get("distill_meta").cloned())
+        .filter(|m| !m.is_null())
+        .map(|m| m.to_string());
     Ok(MessageBody::MlStudioBody(MlStudioPayload::DatasetRowsResponse(
         tentaflow_protocol::MlStudioDatasetRowsResponse {
             dataset_id: payload.dataset_id.clone(),
             kind: dataset.kind,
             total,
             rows,
+            meta,
         },
     )))
 }

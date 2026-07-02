@@ -2175,11 +2175,10 @@ async function renderDistillDataTab(panel, p) {
       <label class="ml-studio-field-label">Podgląd i ręczna edycja datasetu</label>
       <p class="ml-studio-hint" style="margin:0 0 8px;">Wczytaj istniejący dataset, żeby zobaczyć wygenerowane pary i ręcznie dodać/poprawić/usunąć wiersze. Kolumny dobierają się do formatu (SFT/KD: pytanie·odpowiedź; DPO: prompt·lepsza·gorsza).</p>
       <div style="display:flex;gap:8px;align-items:center;margin:2px 0 8px;">
-        <select id="ml-distill-edit-ds" class="ml-studio-model-input" style="flex:1;box-sizing:border-box;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text);">
-          <option value="">— wybierz dataset —</option>${datasetOptions}
-        </select>
+        <tf-select id="ml-distill-edit-ds" style="flex:1;"></tf-select>
         <tf-button id="ml-distill-edit-load" variant="outline">Wczytaj</tf-button>
       </div>
+      <div id="ml-distill-edit-meta" class="ml-studio-hint" style="margin:0 0 8px;display:none;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);"></div>
       <div id="ml-distill-edit-rows"></div>
       <div id="ml-distill-edit-actions" style="display:none;gap:8px;margin-top:10px;">
         <tf-button id="ml-distill-edit-add" variant="ghost">+ Dodaj wiersz</tf-button>
@@ -2322,9 +2321,14 @@ async function renderDistillDataTab(panel, p) {
     const row = document.createElement('div');
     row.className = 'ml-distill-edit-row';
     row.style = 'display:flex;gap:8px;align-items:flex-start;margin:6px 0;padding:8px;border:1px solid var(--border);border-radius:6px;';
-    row.innerHTML = editCols.map((c) => rowFieldHtml(c, obj && obj[c] != null ? String(obj[c]) : '')).join('')
-      + '<button type="button" class="ml-distill-edit-del" title="Usuń wiersz" style="align-self:center;background:none;border:none;color:var(--danger,#c66);cursor:pointer;font-size:18px;">✕</button>';
-    row.querySelector('.ml-distill-edit-del')?.addEventListener('click', () => row.remove());
+    row.innerHTML = editCols.map((c) => rowFieldHtml(c, obj && obj[c] != null ? String(obj[c]) : '')).join('');
+    const del = document.createElement('tf-button');
+    del.setAttribute('variant', 'ghost');
+    del.setAttribute('icon', 'trash');
+    del.setAttribute('title', 'Usuń wiersz');
+    del.style.alignSelf = 'center';
+    del.addEventListener('click', () => row.remove());
+    row.appendChild(del);
     editRowsBox.appendChild(row);
   };
 
@@ -2343,23 +2347,48 @@ async function renderDistillDataTab(panel, p) {
     return out;
   };
 
+  const editMeta = byId('ml-distill-edit-meta');
+  const OBJ_LABEL = { sft: 'SFT (na odpowiedziach)', dpo: 'DPO (na preferencjach)', kd: 'KD (na logitach)' };
+  const renderMeta = (metaStr) => {
+    let m = null;
+    try { m = metaStr ? JSON.parse(metaStr) : null; } catch (_) { m = null; }
+    if (!m || typeof m !== 'object') { editMeta.style.display = 'none'; return; }
+    const parts = [];
+    if (m.objective) parts.push(`wariant: <strong>${escapeHtml(OBJ_LABEL[m.objective] || String(m.objective).toUpperCase())}</strong>`);
+    if (m.teacher_model) parts.push(`nauczyciel: <strong>${escapeHtml(m.teacher_model)}</strong>`);
+    if (m.question_source) parts.push(`źródło pytań: ${escapeHtml(m.question_source)}${m.question_model ? ` (model: ${escapeHtml(m.question_model)})` : ''}`);
+    if (m.rejected_model) parts.push(`model odrzucający: ${escapeHtml(m.rejected_model)}`);
+    if (m.generate_prompt) parts.push(`cel: „${escapeHtml(String(m.generate_prompt).slice(0, 140))}”`);
+    editMeta.innerHTML = parts.length ? `Pochodzenie — ${parts.join(' · ')}` : '';
+    editMeta.style.display = parts.length ? 'block' : 'none';
+  };
+
   byId('ml-distill-edit-load')?.addEventListener('click', async () => {
     const dsid = String(byId('ml-distill-edit-ds')?.value || '');
     if (!dsid) { toast('Wybierz dataset', 'error'); return; }
     editStatus.textContent = 'Wczytywanie…';
     try {
-      const resp = await ApiBinary.one('mlStudioDatasetRowsRequest', { datasetId: dsid });
+      // limit ogranicza rozmiar odpowiedzi WS i liczbę textarea (duże datasety nie
+      // zamrażają przeglądarki); przy większym total edytuje się partiami.
+      const LIMIT = 500;
+      const resp = await ApiBinary.one('mlStudioDatasetRowsRequest', { datasetId: dsid, limit: LIMIT });
       const raw = Array.isArray(resp.rows) ? resp.rows : [];
       const parsed = raw.map((r) => { try { return JSON.parse(r); } catch (_) { return null; } })
         .filter((o) => o && typeof o === 'object');
-      editCols = parsed.length ? Object.keys(parsed[0]) : ['question', 'answer'];
+      // UNIA kluczy ze WSZYSTKICH wierszy (nie tylko [0]) — inaczej pola obecne
+      // tylko w dalszych wierszach nie byłyby renderowane i przepadłyby przy zapisie.
+      const keySet = new Set();
+      parsed.forEach((o) => Object.keys(o).forEach((k) => keySet.add(k)));
+      editCols = keySet.size ? [...keySet] : ['question', 'answer'];
       editDatasetId = dsid;
       editRowsBox.innerHTML = '';
       parsed.forEach((o) => addRowEl(o));
       if (!parsed.length) addRowEl(null); // pusty dataset → jeden pusty wiersz do wypełnienia
       editActions.style.display = 'flex';
+      renderMeta(resp.meta);
       const total = resp.total ?? parsed.length;
-      editStatus.textContent = `Wczytano ${parsed.length} z ${total} wierszy (kolumny: ${editCols.join(' · ')}).`;
+      const trunc = total > parsed.length ? ` — pokazano ${parsed.length} z ${total} (duży dataset; edytuj partiami)` : '';
+      editStatus.textContent = `Wczytano ${parsed.length} wierszy (kolumny: ${editCols.join(' · ')})${trunc}.`;
     } catch (e) {
       editStatus.textContent = 'Błąd wczytywania: ' + (e.message || e);
     }
@@ -2380,6 +2409,17 @@ async function renderDistillDataTab(panel, p) {
       toast('Błąd zapisu datasetu', 'error');
     }
   });
+
+  // Populacja tf-select datasetów (tf-select przyjmuje opcje przez setOptions).
+  byId('ml-distill-edit-ds')?.setOptions?.(
+    [{ label: '— wybierz dataset —', value: '' }].concat(
+      datasets.map((d) => ({
+        label: d.name || '(bez nazwy)',
+        value: String(d.datasetId || d.dataset_id || d.id || ''),
+      })),
+    ),
+    '',
+  );
 }
 
 // =============================================================================

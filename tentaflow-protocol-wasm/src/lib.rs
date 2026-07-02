@@ -9918,6 +9918,11 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
                 arr.push(&JsValue::from(r));
             }
             set(obj, "rows", arr.into());
+            set(
+                obj,
+                "meta",
+                resp.meta.map(JsValue::from).unwrap_or(JsValue::NULL),
+            );
         }
         tentaflow_protocol::MlStudioPayload::DatasetRowsSaveResponse(resp) => {
             set(obj, "variant", "MlStudioDatasetRowsSaveResponse".into());
