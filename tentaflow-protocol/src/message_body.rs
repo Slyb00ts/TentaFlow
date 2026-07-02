@@ -7440,6 +7440,12 @@ pub enum MessageBody {
     // żeby nie ruszać indeksów istniejących wariantów. JEDEN wariant na całą
     // rodzinę (summary + node×service + pricing) w `ModelMetricsPayload`.
     ModelMetricsBody(crate::model_metrics::ModelMetricsPayload),
+
+    // ----- Benchmark Studio (definicje, targety, runy, wyniki, live progres) -----
+    // Dopisane na KOŃCU enuma (ciborium koduje warianty po indeksie liczbowym),
+    // żeby nie ruszać indeksów istniejących wariantów. JEDEN wariant na całą
+    // rodzinę (request+response+stream) w `BenchmarkPayload`.
+    BenchmarkBody(crate::benchmark::BenchmarkPayload),
 }
 
 // =============================================================================

@@ -26,6 +26,7 @@ pub type HandlerDispatchFn = for<'a> fn(&'a MessageBody, &'a HandlerContext) -> 
 pub mod addon_document_upload;
 pub mod addon_perm_broadcast;
 pub mod audit_broadcast;
+pub mod benchmark;
 #[cfg(feature = "camera")]
 pub mod camera_admin;
 #[cfg(feature = "camera")]
@@ -1486,6 +1487,55 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::ModelMetricsPayload::PricingSetResult { .. } => {
                 "ModelMetricsPricingSetResult"
             }
+        },
+        MessageBody::BenchmarkBody(p) => match p {
+            tentaflow_protocol::BenchmarkPayload::ListRequest => "BenchmarkListRequest",
+            tentaflow_protocol::BenchmarkPayload::ListResponse { .. } => "BenchmarkListResponse",
+            tentaflow_protocol::BenchmarkPayload::GetRequest { .. } => "BenchmarkGetRequest",
+            tentaflow_protocol::BenchmarkPayload::GetResponse { .. } => "BenchmarkGetResponse",
+            tentaflow_protocol::BenchmarkPayload::SaveRequest { .. } => "BenchmarkSaveRequest",
+            tentaflow_protocol::BenchmarkPayload::SaveResponse { .. } => "BenchmarkSaveResponse",
+            tentaflow_protocol::BenchmarkPayload::DeleteRequest { .. } => "BenchmarkDeleteRequest",
+            tentaflow_protocol::BenchmarkPayload::DeleteResult { .. } => "BenchmarkDeleteResult",
+            tentaflow_protocol::BenchmarkPayload::StartRunRequest { .. } => {
+                "BenchmarkStartRunRequest"
+            }
+            tentaflow_protocol::BenchmarkPayload::StartRunResponse { .. } => {
+                "BenchmarkStartRunResponse"
+            }
+            tentaflow_protocol::BenchmarkPayload::RunStatusRequest { .. } => {
+                "BenchmarkRunStatusRequest"
+            }
+            tentaflow_protocol::BenchmarkPayload::RunStatusResponse { .. } => {
+                "BenchmarkRunStatusResponse"
+            }
+            tentaflow_protocol::BenchmarkPayload::RunResultsRequest { .. } => {
+                "BenchmarkRunResultsRequest"
+            }
+            tentaflow_protocol::BenchmarkPayload::RunResultsResponse { .. } => {
+                "BenchmarkRunResultsResponse"
+            }
+            tentaflow_protocol::BenchmarkPayload::ListRunsRequest { .. } => {
+                "BenchmarkListRunsRequest"
+            }
+            tentaflow_protocol::BenchmarkPayload::ListRunsResponse { .. } => {
+                "BenchmarkListRunsResponse"
+            }
+            tentaflow_protocol::BenchmarkPayload::RecentRunsRequest => "BenchmarkRecentRunsRequest",
+            tentaflow_protocol::BenchmarkPayload::RecentRunsResponse { .. } => {
+                "BenchmarkRecentRunsResponse"
+            }
+            tentaflow_protocol::BenchmarkPayload::CancelRunRequest { .. } => {
+                "BenchmarkCancelRunRequest"
+            }
+            tentaflow_protocol::BenchmarkPayload::CancelRunResult { .. } => {
+                "BenchmarkCancelRunResult"
+            }
+            tentaflow_protocol::BenchmarkPayload::RunStreamRequest { .. } => {
+                "BenchmarkRunStreamRequest"
+            }
+            tentaflow_protocol::BenchmarkPayload::RunStreamChunk { .. } => "BenchmarkRunStreamChunk",
+            tentaflow_protocol::BenchmarkPayload::RunStreamEnd { .. } => "BenchmarkRunStreamEnd",
         },
     }
 }

@@ -577,7 +577,25 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "benchmark_studio_tables",
             MigrationStep::Sql(BENCHMARK_STUDIO_SCHEMA),
         ),
+        (
+            108,
+            "benchmark_permissions",
+            MigrationStep::Rust(benchmark_add_permissions),
+        ),
     ]
+}
+
+// v108 — RBAC dla Benchmark Studio. Admin/DPO dostają odczyt i zapis (edycja
+// definicji, start i anulowanie runów), operator oraz viewer tylko odczyt.
+// Idempotentne przez `roles_add_permissions` (wzorzec jak `model_metrics_add_permissions`).
+fn benchmark_add_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(
+        conn,
+        &["org_admin", "dpo"],
+        &["benchmark.read", "benchmark.write"],
+    )?;
+    roles_add_permissions(conn, &["org_operator", "org_viewer"], &["benchmark.read"])?;
+    Ok(())
 }
 
 // v105 — backfill `tokens.*` grants. v87 (`token_metrics_add_permissions`) was added

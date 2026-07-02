@@ -15,6 +15,7 @@
 //
 // ============================================================================
 
+pub mod benchmark;
 pub mod camera;
 pub mod cbor;
 pub mod compliance;
@@ -731,6 +732,10 @@ pub use stream::{
 pub use model_metrics::{
     ModelMetricsFilterWire, ModelMetricsPayload, ModelMetricsRowWire, ModelNodeServiceRowWire,
     ModelPricingWire,
+};
+pub use benchmark::{
+    BenchmarkPayload, BenchmarkSummaryWire, BenchmarkWire, ResultRowWire, RunSummaryWire,
+    TargetInputWire, TargetWire,
 };
 pub use token_usage::{
     TokenLeaseWire, TokenQuotaUpsertWire, TokenQuotaWire, TokenUsagePayload, TokenUsageSummaryWire,

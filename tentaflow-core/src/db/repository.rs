@@ -25367,6 +25367,27 @@ pub fn finish_benchmark_run(
     Ok(())
 }
 
+/// Single run lookup scoped to an org (via its parent benchmark). `None` when
+/// the run does not exist or belongs to another org.
+pub fn get_benchmark_run(
+    pool: &DbPool,
+    org_id: &str,
+    run_id: &str,
+) -> Result<Option<BenchmarkRunRecord>> {
+    let conn = acquire(pool)?;
+    conn.query_row(
+        "SELECT r.id, r.benchmark_id, r.started_at, r.finished_at, r.status, r.error,
+                r.engine_meta_json
+         FROM benchmark_runs r
+         JOIN benchmarks b ON b.id = r.benchmark_id
+         WHERE r.id = ?1 AND b.org_id = ?2",
+        rusqlite::params![run_id, org_id],
+        read_benchmark_run_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 pub fn insert_benchmark_result(pool: &DbPool, result: &BenchmarkResultRecord) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(

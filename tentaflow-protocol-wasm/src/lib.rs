@@ -1814,6 +1814,111 @@ pub fn encode_model_metrics_pricing_set(
     .map_err(|e| JsError::new(&e))
 }
 
+// ----- Benchmark Studio -----
+
+#[wasm_bindgen(js_name = encodeBenchmarkListRequest)]
+pub fn encode_benchmark_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::ListRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBenchmarkGetRequest)]
+pub fn encode_benchmark_get_request(id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::GetRequest { id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// `targets_json` to JSON-owa tablica obiektów TargetInputWire (id, kind,
+/// service_ref, api_type, host, port, api_key?, model, label). `api_key` obecny
+/// tylko gdy użytkownik wpisał nowy sekret — nie wraca w odczycie.
+#[wasm_bindgen(js_name = encodeBenchmarkSaveRequest)]
+pub fn encode_benchmark_save_request(
+    id: Option<String>,
+    name: String,
+    config_json: String,
+    targets_json: String,
+) -> Result<Vec<u8>, JsError> {
+    let targets: Vec<tentaflow_protocol::TargetInputWire> = serde_json::from_str(&targets_json)
+        .map_err(|e| JsError::new(&format!("invalid targets_json: {e}")))?;
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::SaveRequest {
+            id,
+            name,
+            config_json,
+            targets,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBenchmarkDeleteRequest)]
+pub fn encode_benchmark_delete_request(id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::DeleteRequest { id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBenchmarkStartRunRequest)]
+pub fn encode_benchmark_start_run_request(benchmark_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::StartRunRequest { benchmark_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBenchmarkRunStatusRequest)]
+pub fn encode_benchmark_run_status_request(run_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::RunStatusRequest { run_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBenchmarkRunResultsRequest)]
+pub fn encode_benchmark_run_results_request(run_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::RunResultsRequest { run_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBenchmarkListRunsRequest)]
+pub fn encode_benchmark_list_runs_request(benchmark_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::ListRunsRequest { benchmark_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBenchmarkRecentRunsRequest)]
+pub fn encode_benchmark_recent_runs_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::RecentRunsRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBenchmarkCancelRunRequest)]
+pub fn encode_benchmark_cancel_run_request(run_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::CancelRunRequest { run_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBenchmarkRunStreamRequest)]
+pub fn encode_benchmark_run_stream_request(run_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::RunStreamRequest { run_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioProjectsListRequest)]
 pub fn encode_ml_studio_projects_list_request() -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
@@ -4299,6 +4404,269 @@ fn decode_model_metrics_payload(
     }
 }
 
+fn benchmark_run_summary_to_js(r: &tentaflow_protocol::RunSummaryWire) -> JsValue {
+    let item = js_sys::Object::new();
+    set(&item, "id", r.id.clone().into());
+    set(&item, "benchmarkId", r.benchmark_id.clone().into());
+    set(&item, "benchmark_id", r.benchmark_id.clone().into());
+    match &r.benchmark_name {
+        Some(n) => {
+            set(&item, "benchmarkName", n.clone().into());
+            set(&item, "benchmark_name", n.clone().into());
+        }
+        None => {
+            set(&item, "benchmarkName", JsValue::NULL);
+            set(&item, "benchmark_name", JsValue::NULL);
+        }
+    }
+    set(&item, "startedAt", r.started_at.clone().into());
+    set(&item, "started_at", r.started_at.clone().into());
+    match &r.finished_at {
+        Some(f) => {
+            set(&item, "finishedAt", f.clone().into());
+            set(&item, "finished_at", f.clone().into());
+        }
+        None => {
+            set(&item, "finishedAt", JsValue::NULL);
+            set(&item, "finished_at", JsValue::NULL);
+        }
+    }
+    set(&item, "status", r.status.clone().into());
+    match &r.error {
+        Some(e) => set(&item, "error", e.clone().into()),
+        None => set(&item, "error", JsValue::NULL),
+    }
+    item.into()
+}
+
+fn benchmark_target_to_js(t: &tentaflow_protocol::TargetWire) -> JsValue {
+    let item = js_sys::Object::new();
+    set(&item, "id", t.id.clone().into());
+    set(&item, "kind", t.kind.clone().into());
+    match &t.service_ref {
+        Some(s) => {
+            set(&item, "serviceRef", s.clone().into());
+            set(&item, "service_ref", s.clone().into());
+        }
+        None => {
+            set(&item, "serviceRef", JsValue::NULL);
+            set(&item, "service_ref", JsValue::NULL);
+        }
+    }
+    set(&item, "apiType", t.api_type.clone().into());
+    set(&item, "api_type", t.api_type.clone().into());
+    set(&item, "host", t.host.clone().into());
+    set(&item, "port", (t.port as f64).into());
+    set(&item, "hasKey", t.has_key.into());
+    set(&item, "has_key", t.has_key.into());
+    set(&item, "model", t.model.clone().into());
+    set(&item, "label", t.label.clone().into());
+    item.into()
+}
+
+fn benchmark_result_row_to_js(r: &tentaflow_protocol::ResultRowWire) -> JsValue {
+    let item = js_sys::Object::new();
+    set(&item, "targetId", r.target_id.clone().into());
+    set(&item, "target_id", r.target_id.clone().into());
+    set(&item, "targetLabel", r.target_label.clone().into());
+    set(&item, "target_label", r.target_label.clone().into());
+    set(&item, "scenario", r.scenario.clone().into());
+    set(&item, "variantJson", r.variant_json.clone().into());
+    set(&item, "variant_json", r.variant_json.clone().into());
+    set(&item, "ttftMsMean", opt_f64_to_js(r.ttft_ms_mean));
+    set(&item, "ttft_ms_mean", opt_f64_to_js(r.ttft_ms_mean));
+    set(&item, "ttftMsSigma", opt_f64_to_js(r.ttft_ms_sigma));
+    set(&item, "ttft_ms_sigma", opt_f64_to_js(r.ttft_ms_sigma));
+    set(&item, "prefillTpsMean", opt_f64_to_js(r.prefill_tps_mean));
+    set(&item, "prefill_tps_mean", opt_f64_to_js(r.prefill_tps_mean));
+    set(&item, "prefillTpsSigma", opt_f64_to_js(r.prefill_tps_sigma));
+    set(&item, "prefill_tps_sigma", opt_f64_to_js(r.prefill_tps_sigma));
+    set(&item, "decodeTpsMean", opt_f64_to_js(r.decode_tps_mean));
+    set(&item, "decode_tps_mean", opt_f64_to_js(r.decode_tps_mean));
+    set(&item, "decodeTpsSigma", opt_f64_to_js(r.decode_tps_sigma));
+    set(&item, "decode_tps_sigma", opt_f64_to_js(r.decode_tps_sigma));
+    set(&item, "totalMsMean", opt_f64_to_js(r.total_ms_mean));
+    set(&item, "total_ms_mean", opt_f64_to_js(r.total_ms_mean));
+    set(&item, "totalMsSigma", opt_f64_to_js(r.total_ms_sigma));
+    set(&item, "total_ms_sigma", opt_f64_to_js(r.total_ms_sigma));
+    set(&item, "p50Ms", opt_f64_to_js(r.p50_ms));
+    set(&item, "p50_ms", opt_f64_to_js(r.p50_ms));
+    set(&item, "p90Ms", opt_f64_to_js(r.p90_ms));
+    set(&item, "p90_ms", opt_f64_to_js(r.p90_ms));
+    set(&item, "p99Ms", opt_f64_to_js(r.p99_ms));
+    set(&item, "p99_ms", opt_f64_to_js(r.p99_ms));
+    set(&item, "requests", (r.requests as f64).into());
+    set(&item, "errors", (r.errors as f64).into());
+    set(&item, "samplesJson", r.samples_json.clone().into());
+    set(&item, "samples_json", r.samples_json.clone().into());
+    item.into()
+}
+
+/// Decode helper for `MessageBody::BenchmarkBody`. Response i stream chunki
+/// stają się obiektami JS z kluczami camelCase i snake_case. Sekrety (api_key)
+/// nigdy nie występują — target niesie tylko `hasKey`.
+fn decode_benchmark_payload(obj: &js_sys::Object, payload: tentaflow_protocol::BenchmarkPayload) {
+    use tentaflow_protocol::BenchmarkPayload as BP;
+    match payload {
+        BP::ListRequest => set(obj, "variant", "BenchmarkListRequest".into()),
+        BP::GetRequest { .. } => set(obj, "variant", "BenchmarkGetRequest".into()),
+        BP::SaveRequest { .. } => set(obj, "variant", "BenchmarkSaveRequest".into()),
+        BP::DeleteRequest { .. } => set(obj, "variant", "BenchmarkDeleteRequest".into()),
+        BP::StartRunRequest { .. } => set(obj, "variant", "BenchmarkStartRunRequest".into()),
+        BP::RunStatusRequest { .. } => set(obj, "variant", "BenchmarkRunStatusRequest".into()),
+        BP::RunResultsRequest { .. } => set(obj, "variant", "BenchmarkRunResultsRequest".into()),
+        BP::ListRunsRequest { .. } => set(obj, "variant", "BenchmarkListRunsRequest".into()),
+        BP::RecentRunsRequest => set(obj, "variant", "BenchmarkRecentRunsRequest".into()),
+        BP::CancelRunRequest { .. } => set(obj, "variant", "BenchmarkCancelRunRequest".into()),
+        BP::RunStreamRequest { .. } => set(obj, "variant", "BenchmarkRunStreamRequest".into()),
+        BP::ListResponse { benchmarks } => {
+            set(obj, "variant", "BenchmarkListResponse".into());
+            let arr = js_sys::Array::new();
+            for b in &benchmarks {
+                let item = js_sys::Object::new();
+                set(&item, "id", b.id.clone().into());
+                set(&item, "name", b.name.clone().into());
+                set(&item, "targetCount", (b.target_count as f64).into());
+                set(&item, "target_count", (b.target_count as f64).into());
+                set(&item, "testCount", (b.test_count as f64).into());
+                set(&item, "test_count", (b.test_count as f64).into());
+                match &b.last_run {
+                    Some(r) => {
+                        set(&item, "lastRun", benchmark_run_summary_to_js(r));
+                        set(&item, "last_run", benchmark_run_summary_to_js(r));
+                    }
+                    None => {
+                        set(&item, "lastRun", JsValue::NULL);
+                        set(&item, "last_run", JsValue::NULL);
+                    }
+                }
+                arr.push(&item);
+            }
+            set(obj, "benchmarks", arr.into());
+        }
+        BP::GetResponse { benchmark } => {
+            set(obj, "variant", "BenchmarkGetResponse".into());
+            let item = js_sys::Object::new();
+            set(&item, "id", benchmark.id.clone().into());
+            set(&item, "name", benchmark.name.clone().into());
+            set(&item, "configJson", benchmark.config_json.clone().into());
+            set(&item, "config_json", benchmark.config_json.clone().into());
+            set(&item, "createdAt", benchmark.created_at.clone().into());
+            set(&item, "created_at", benchmark.created_at.clone().into());
+            set(&item, "updatedAt", benchmark.updated_at.clone().into());
+            set(&item, "updated_at", benchmark.updated_at.clone().into());
+            let targets = js_sys::Array::new();
+            for t in &benchmark.targets {
+                targets.push(&benchmark_target_to_js(t));
+            }
+            set(&item, "targets", targets.into());
+            set(obj, "benchmark", item.into());
+        }
+        BP::SaveResponse { id } => {
+            set(obj, "variant", "BenchmarkSaveResponse".into());
+            set(obj, "id", id.into());
+        }
+        BP::DeleteResult { ok } => {
+            set(obj, "variant", "BenchmarkDeleteResult".into());
+            set(obj, "ok", ok.into());
+        }
+        BP::StartRunResponse { run_id } => {
+            set(obj, "variant", "BenchmarkStartRunResponse".into());
+            set(obj, "runId", run_id.clone().into());
+            set(obj, "run_id", run_id.into());
+        }
+        BP::RunStatusResponse {
+            run_id,
+            status,
+            error,
+            started_at,
+            finished_at,
+        } => {
+            set(obj, "variant", "BenchmarkRunStatusResponse".into());
+            set(obj, "runId", run_id.clone().into());
+            set(obj, "run_id", run_id.into());
+            set(obj, "status", status.into());
+            match error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+            set(obj, "startedAt", started_at.clone().into());
+            set(obj, "started_at", started_at.into());
+            match finished_at {
+                Some(f) => {
+                    set(obj, "finishedAt", f.clone().into());
+                    set(obj, "finished_at", f.into());
+                }
+                None => {
+                    set(obj, "finishedAt", JsValue::NULL);
+                    set(obj, "finished_at", JsValue::NULL);
+                }
+            }
+        }
+        BP::RunResultsResponse { results } => {
+            set(obj, "variant", "BenchmarkRunResultsResponse".into());
+            let arr = js_sys::Array::new();
+            for r in &results {
+                arr.push(&benchmark_result_row_to_js(r));
+            }
+            set(obj, "results", arr.into());
+        }
+        BP::ListRunsResponse { runs } => {
+            set(obj, "variant", "BenchmarkListRunsResponse".into());
+            let arr = js_sys::Array::new();
+            for r in &runs {
+                arr.push(&benchmark_run_summary_to_js(r));
+            }
+            set(obj, "runs", arr.into());
+        }
+        BP::RecentRunsResponse { runs } => {
+            set(obj, "variant", "BenchmarkRecentRunsResponse".into());
+            let arr = js_sys::Array::new();
+            for r in &runs {
+                arr.push(&benchmark_run_summary_to_js(r));
+            }
+            set(obj, "runs", arr.into());
+        }
+        BP::CancelRunResult { ok } => {
+            set(obj, "variant", "BenchmarkCancelRunResult".into());
+            set(obj, "ok", ok.into());
+        }
+        BP::RunStreamChunk {
+            run_id,
+            kind,
+            phase,
+            line,
+            progress_pct,
+            ts_ms,
+        } => {
+            set(obj, "variant", "BenchmarkRunStreamChunk".into());
+            set(obj, "runId", run_id.clone().into());
+            set(obj, "run_id", run_id.into());
+            set(obj, "kind", kind.into());
+            set(obj, "phase", phase.into());
+            set(obj, "line", line.into());
+            set(obj, "progressPct", (progress_pct as f64).into());
+            set(obj, "progress_pct", (progress_pct as f64).into());
+            set(obj, "tsMs", (ts_ms as f64).into());
+            set(obj, "ts_ms", (ts_ms as f64).into());
+        }
+        BP::RunStreamEnd {
+            run_id,
+            status,
+            error,
+        } => {
+            set(obj, "variant", "BenchmarkRunStreamEnd".into());
+            set(obj, "runId", run_id.clone().into());
+            set(obj, "run_id", run_id.into());
+            set(obj, "status", status.into());
+            match error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+        }
+    }
+}
+
 /// Decode helper for `MessageBody::ServiceBody` (Krok N2). Splits the inner
 /// `ServicePayload` enum into per-variant JS objects with snake_case fields
 /// matching the Rust struct names. Both camelCase and snake_case keys are
@@ -5964,6 +6332,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             }
         },
         MessageBody::ModelMetricsBody(payload) => decode_model_metrics_payload(&obj, payload),
+        MessageBody::BenchmarkBody(payload) => decode_benchmark_payload(&obj, payload),
         MessageBody::SkillsBody(payload) => match payload {
             tentaflow_protocol::SkillsPayload::ListRequest(req) => {
                 set(&obj, "variant", "SkillsListRequest".into());
@@ -8425,6 +8794,14 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "camera_id", frame.camera_id.into());
                 set(&obj, "tsMs", (frame.ts_ms as f64).into());
                 set(&obj, "ts_ms", (frame.ts_ms as f64).into());
+                // PTS klatki w osi czasu mediów (ns) — wspólny zegar z init
+                // segmentem MSE, kotwiczy overlay na dokładnej klatce wideo.
+                set_optional_u64(&obj, "pts_ns", frame.pts_ns);
+                set_optional_u64(&obj, "ptsNs", frame.pts_ns);
+                // Całkowity czas obróbki klatki (ms): detekcja + OCR + stan.
+                // Klient renderuje jako badge opóźnienia.
+                set(&obj, "proc_ms", (frame.proc_ms as f64).into());
+                set(&obj, "procMs", (frame.proc_ms as f64).into());
                 let items = js_sys::Array::new();
                 for det in frame.items {
                     let item = js_sys::Object::new();
@@ -8444,6 +8821,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         Some(t) => set(&item, "tekst", t.into()),
                         None => set(&item, "tekst", JsValue::NULL),
                     }
+                    // Stabilne id trackingu oraz prędkość środka boksu
+                    // (jednostki znormalizowane/s) dla ekstrapolacji overlayu.
+                    set(&item, "track_id", (det.track_id as f64).into());
+                    set(&item, "vx", (det.vx as f64).into());
+                    set(&item, "vy", (det.vy as f64).into());
                     items.push(&item.into());
                 }
                 set(&obj, "items", items.into());
@@ -8553,6 +8935,10 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "mimeType", resp.mime_type.into());
                 set(&obj, "has_init_segment", resp.has_init_segment.into());
                 set(&obj, "hasInitSegment", resp.has_init_segment.into());
+                // Bazowy PTS osi czasu mediów — frontend odejmuje go od pts_ns
+                // detekcji, aby zakotwiczyć overlay na właściwej klatce wideo.
+                set_optional_u64(&obj, "base_pts_ns", resp.base_pts_ns);
+                set_optional_u64(&obj, "basePtsNs", resp.base_pts_ns);
             }
             tentaflow_protocol::StreamPayload::Frame(frame) => {
                 set(&obj, "variant", "StreamFrame".into());

@@ -2683,6 +2683,90 @@ export const encode = {
     );
   },
 
+  /** MessageBody::BenchmarkBody(ListRequest) — Benchmark Studio overview. */
+  benchmarkListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkListRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::BenchmarkBody(GetRequest) — full definition for the editor. payload: { id }. */
+  benchmarkGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkGetRequest(String(payload.id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::BenchmarkBody(SaveRequest). payload: { id?, name, configJson, targets:[] }. */
+  benchmarkSaveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const id = payload.id == null || payload.id === '' ? undefined : String(payload.id);
+    const targets = Array.isArray(payload.targets) ? payload.targets : [];
+    const body = _wasm.encodeBenchmarkSaveRequest(
+      id,
+      String(payload.name ?? ''),
+      String(payload.configJson ?? payload.config_json ?? '{}'),
+      JSON.stringify(targets),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::BenchmarkBody(DeleteRequest). payload: { id }. */
+  benchmarkDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkDeleteRequest(String(payload.id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::BenchmarkBody(StartRunRequest) — non-blocking, returns runId. payload: { benchmarkId }. */
+  benchmarkStartRunRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkStartRunRequest(String(payload.benchmarkId ?? payload.benchmark_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::BenchmarkBody(RunStatusRequest). payload: { runId }. */
+  benchmarkRunStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkRunStatusRequest(String(payload.runId ?? payload.run_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::BenchmarkBody(RunResultsRequest). payload: { runId }. */
+  benchmarkRunResultsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkRunResultsRequest(String(payload.runId ?? payload.run_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::BenchmarkBody(ListRunsRequest) — run history for one benchmark. payload: { benchmarkId }. */
+  benchmarkListRunsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkListRunsRequest(String(payload.benchmarkId ?? payload.benchmark_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::BenchmarkBody(RecentRunsRequest) — newest runs across all benchmarks. */
+  benchmarkRecentRunsRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkRecentRunsRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::BenchmarkBody(CancelRunRequest). payload: { runId }. */
+  benchmarkCancelRunRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkCancelRunRequest(String(payload.runId ?? payload.run_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Subscribe — live run progress. payload: { runId }. Chunks = BenchmarkRunStreamChunk. */
+  benchmarkRunStreamRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkRunStreamRequest(String(payload.runId ?? payload.run_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::MlStudioBody(ProjectsListRequest) — ML Studio projects list. */
   mlStudioProjectsListRequest(correlationId, sequence = 1) {
     assertReady();

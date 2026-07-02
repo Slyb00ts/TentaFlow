@@ -1452,6 +1452,109 @@ inventory::submit! {
 }
 
 // =============================================================================
+// BenchmarkRunStream — live progres runu Benchmark Studio.
+// =============================================================================
+// Front subskrybuje przez ApiBinary.subscribe('benchmarkRunStreamRequest',
+// { runId }). Reużywamy tę samą szynę (log_bus) co deployment: StartRun emituje
+// BusMessage::Line/End pod kluczem = run_id. Handler mapuje je na
+// BenchmarkBody(RunStreamChunk/RunStreamEnd). Brak replayu z DB — postęp jest
+// best-effort live; ostateczne wyniki front pobiera przez RunResults/RunStatus.
+
+fn benchmark_run_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscription>) {
+    use tentaflow_protocol::BenchmarkPayload;
+
+    let run_id = match req {
+        MessageBody::BenchmarkBody(BenchmarkPayload::RunStreamRequest { run_id }) => run_id,
+        _ => {
+            let _ = push_end(&sub, None);
+            return;
+        }
+    };
+
+    // Autoryzacja: subskrybent musi mieć benchmark.read w swojej org, a run musi
+    // należeć do tej org (IDOR guard — inaczej każdy zalogowany user znający run_id
+    // mógłby podglądać cudze logi/postęp).
+    let org_id = match ctx.org_context.as_ref() {
+        Some(org) if org.has("benchmark.read") => org.org_id.clone(),
+        _ => {
+            let _ = push_end(&sub, None);
+            return;
+        }
+    };
+    match crate::db::repository::get_benchmark_run(&ctx.state.db, &org_id, &run_id) {
+        Ok(Some(_)) => {}
+        _ => {
+            // Brak runu w tej org (nie istnieje lub należy do innej org) → odmowa.
+            let _ = push_end(&sub, None);
+            return;
+        }
+    }
+
+    tokio::spawn(async move {
+        let mut rx = match crate::deploy::log_bus::subscribe(&run_id) {
+            Some(r) => r,
+            None => {
+                // Kanał zamknięty — run już skończony (albo nie istnieje). Front
+                // rekoncyliuje stan przez RunStatus/RunResults.
+                let _ = push_end(&sub, None);
+                return;
+            }
+        };
+
+        use crate::deploy::log_bus::BusMessage;
+        loop {
+            match rx.recv().await {
+                Ok(BusMessage::Line(line)) => {
+                    let chunk = BenchmarkPayload::RunStreamChunk {
+                        run_id: line.deploy_id,
+                        kind: line.kind,
+                        phase: line.phase,
+                        line: line.line,
+                        progress_pct: line.progress_pct,
+                        ts_ms: line.ts_ms,
+                    };
+                    if push_chunk(&sub, MessageBody::BenchmarkBody(chunk)).is_err() {
+                        return;
+                    }
+                }
+                Ok(BusMessage::End {
+                    deploy_id,
+                    final_status,
+                    error_message,
+                    ..
+                }) => {
+                    let error = if error_message.is_empty() {
+                        None
+                    } else {
+                        Some(error_message)
+                    };
+                    let end = BenchmarkPayload::RunStreamEnd {
+                        run_id: deploy_id,
+                        status: final_status,
+                        error,
+                    };
+                    let _ = push_end(&sub, Some(MessageBody::BenchmarkBody(end)));
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    let _ = push_end(&sub, None);
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+    });
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "BenchmarkRunStreamRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: benchmark_run_stream_handler,
+    }
+}
+
+// =============================================================================
 // Testy
 // =============================================================================
 
