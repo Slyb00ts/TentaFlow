@@ -2177,8 +2177,11 @@ async function renderDistillDataTab(panel, p) {
   byId('ml-distill-src-import')?.addEventListener('click', () => setSource('import'));
 
   // Wariant treningu: SFT/KD -> pary Q&A; DPO -> trójki (prompt, chosen, rejected)
-  // z dodatkowym modelem odrzucającym. Dobierz TEN SAM wariant co w „Model bazowy".
-  let objective = 'sft';
+  // z dodatkowym modelem odrzucającym. Domyślnie SYNCHRONIZUJEMY z konfiguracją
+  // z „Model bazowy" (ten sam cel treningu) — inaczej user wygenerowałby dane w
+  // formacie niezgodnym z wybraną metodą treningu i trening by padł.
+  let objective = String(getFtConfig(pid).objective || 'sft').toLowerCase();
+  if (!['sft', 'kd', 'dpo'].includes(objective)) objective = 'sft';
   const OBJ_HINTS = {
     sft: 'SFT: pary pytanie→odpowiedź (teacher). Uczeń kopiuje odpowiedzi teachera.',
     kd: 'KD: pary pytanie→odpowiedź (teacher). Destylacja rozkładu — wybierz teacher jako model-nauczyciela w treningu.',
@@ -2194,6 +2197,7 @@ async function renderDistillDataTab(panel, p) {
   };
   ['sft', 'kd', 'dpo'].forEach((k) =>
     byId('ml-distill-obj-' + k)?.addEventListener('click', () => setObjective(k)));
+  setObjective(objective); // odzwierciedl stan początkowy (z Model bazowy) w UI
 
   byId('ml-distill-go')?.addEventListener('click', async () => {
     const teacher = String(byId('ml-distill-teacher')?.value || '').trim();
