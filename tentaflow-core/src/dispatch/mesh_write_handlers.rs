@@ -244,6 +244,12 @@ pub async fn mesh_trust_revoke(
         ctx.state.local_node_id.as_ref(),
     )?;
 
+    // Usuń node z rejestru peerów + peer_persisted, żeby ZNIKNĄŁ z listy. Bez tego
+    // po „cofnij zaufanie" zostawał widoczny jako sparowany i nie dało się go usunąć
+    // (revoke ruszał tylko trusted_nodes, nie PeerRegistry, z którego czyta lista).
+    // Rekord w `revoked_nodes` (security) zostaje — blokuje ponowne zaufane połączenie.
+    ctx.state.mesh_peer_store.remove(node_id);
+
     Ok(MessageBody::MeshTrustRevokeResponseBody(
         MeshTrustRevokeResponse { ok: true },
     ))
