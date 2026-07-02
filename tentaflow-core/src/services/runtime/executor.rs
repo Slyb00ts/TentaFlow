@@ -29,6 +29,9 @@ use crate::flow_engine::dispatcher::FlowDispatcher;
 use crate::services::catalog::{CatalogProvider, InputModality, OutputModality, ServiceSurface};
 use crate::services::handles_cache::BackendHandle;
 use crate::services::runtime::context::ExecutionContext;
+use crate::services::runtime::local_cv::{
+    CameraCvOpLocal, CameraCvRequest, CvFrameLocal, LocalCameraCvHandler,
+};
 use crate::services::runtime::resolver::{AliasResolver, ResolveError, ResolveRequest};
 use crate::services::runtime::strategy::{rank, StrategyState};
 use crate::services::runtime::target::ResolvedExecutionTarget;
@@ -2289,6 +2292,128 @@ impl ModelRuntimeExecutor {
         }
     }
 
+    /// FAZA 2 — typed-surface `CameraCv`: operacje CV na klatkach z kamer
+    /// (detekcja / klasyfikacja stanu / OCR) przez executor. Lustro
+    /// `execute_document_infer`: resoluje żądany model przez
+    /// `ServiceSurface::CameraCv` (input Image), rankuje kandydatów per
+    /// alias-strategy i próbuje każdego aż któryś zadziała. Local → wyłącznie
+    /// embedded (zero-copy do procesowych singletonów CV); MeshForward →
+    /// `ModelPayload::CameraCv` (klatki binarnie, serde_bytes).
+    pub async fn execute_camera_cv(
+        &self,
+        request: CameraCvRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<tentaflow_protocol::CameraCvResult, ExecutorError> {
+        let outcome = {
+            let snapshot = self.catalog.snapshot();
+            let req = ResolveRequest {
+                requested_model: &request.model,
+                required_surface: ServiceSurface::CameraCv,
+                required_input_modalities: &[InputModality::Image],
+                required_output_modalities: &[],
+            };
+            self.resolver.resolve(&req, &snapshot, ctx)?
+        };
+
+        let state = self.strategy_state_for(&request.model);
+        let ranked = rank(&outcome.candidates, outcome.strategy, &state);
+
+        let mut last_err: Option<String> = None;
+        let mut attempts = 0usize;
+        let mut last_kind: &'static str = "unknown";
+        let mut deferred_cutover: Option<&'static str> = None;
+
+        for target in ranked {
+            attempts += 1;
+            last_kind = target.telemetry_tag();
+            match self
+                .dispatch_camera_cv(&target, request.clone(), ctx)
+                .await
+            {
+                Ok(response) => {
+                    ctx.route_metadata.served_by_node = served_by(&target);
+                    ctx.route_metadata.served_model = Some(target.requested_model().to_string());
+                    ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
+                    ctx.route_metadata.fallbacks_tried = (attempts - 1) as u32;
+                    note_fallback(
+                        &request.model,
+                        outcome.requested_is_alias,
+                        attempts,
+                        target.telemetry_tag(),
+                    );
+                    return Ok(response);
+                }
+                Err(e) if e.aborts_fallback_chain() => return Err(e),
+                Err(ExecutorError::TransportPendingCutover(kind)) => {
+                    deferred_cutover.get_or_insert(kind);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target_kind = target.telemetry_tag(),
+                        error = %e,
+                        "camera cv dispatch failed; trying next candidate"
+                    );
+                    last_err = Some(e.to_string());
+                }
+            }
+        }
+
+        if let Some(kind) = deferred_cutover {
+            return Err(ExecutorError::TransportPendingCutover(kind));
+        }
+
+        Err(ExecutorError::AllCandidatesFailed {
+            target_kind: last_kind,
+            attempts,
+            last_error: last_err.unwrap_or_else(|| "no candidates after rank".into()),
+        })
+    }
+
+    /// Per-target camera-cv dispatch — lustro `dispatch_document_infer_blocking`.
+    /// Embedded idzie zero-copy do `LocalCameraCvHandler` (dispatch po
+    /// `engine_id`); HTTP/QUIC są architektonicznie zakazane (surowe piksele
+    /// nie idą przez REST — jedyne transporty to embedded i mesh); MeshForward
+    /// buduje `ModelPayload::CameraCv` (tu jedyne kopiowanie klatek + downscale
+    /// klatek Detect do krawędzi detektora).
+    async fn dispatch_camera_cv(
+        &self,
+        target: &ResolvedExecutionTarget,
+        mut request: CameraCvRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<tentaflow_protocol::CameraCvResult, ExecutorError> {
+        self.ensure_resident(target).await?;
+        if let ResolvedExecutionTarget::Local { model_name, .. } = target {
+            if request.model != *model_name {
+                request.model = model_name.clone();
+            }
+        }
+
+        match target {
+            ResolvedExecutionTarget::Local { handle, .. } => match handle {
+                BackendHandle::Embedded { engine_id, .. } => {
+                    LocalCameraCvHandler::execute(engine_id, request.op)
+                        .await
+                        .map_err(ExecutorError::Internal)
+                }
+                BackendHandle::Http(_) | BackendHandle::Quic(_) => Err(ExecutorError::Internal(
+                    "camera-cv wspiera wyłącznie transport embedded/mesh".into(),
+                )),
+            },
+            ResolvedExecutionTarget::MeshForward {
+                node_id,
+                model_name,
+                ..
+            } => {
+                let model_request = camera_cv_model_request(model_name, request.op)?;
+                let response = self.forward_via_mesh(node_id, model_request, ctx).await?;
+                camera_cv_result_from_model(response.result)
+            }
+            ResolvedExecutionTarget::Flow { .. } => Err(ExecutorError::Internal(
+                "camera-cv has no flow-target surface".into(),
+            )),
+        }
+    }
+
     /// RAG E1.4 — ścieżka PDF: rasteryzuje dokument na obrazy stron (pdfium,
     /// bezwarunkowo), parsuje każdą stronę przez `execute_documents` (ten sam
     /// resolve→rank→failover co dla pojedynczego obrazu) i scala wyniki
@@ -3429,6 +3554,98 @@ fn document_infer_result_to_response(
         ))),
         _ => Err(ExecutorError::Internal(
             "document infer returned unexpected result type".into(),
+        )),
+    }
+}
+
+/// FAZA 2 — krawędź wejścia detektora RF-DETR (stretch-resize 560×560). Klatki
+/// `Detect` większe niż ta krawędź są zmniejszane przed wysyłką przez mesh:
+/// detektor i tak przeskalowuje wejście, a batch 8 klatek 560×560 RGB24
+/// (~7.5 MB) mieści się w limicie ramki CBOR (16 MiB).
+const MESH_DETECT_EDGE: u32 = 560;
+
+/// FAZA 2 — kopiuje lokalną klatkę (`Arc`, zero-copy) do klatki drutu (`Vec`).
+fn camera_cv_frame_to_wire(frame: &CvFrameLocal) -> tentaflow_protocol::CvFrame {
+    tentaflow_protocol::CvFrame {
+        data: frame.data.to_vec(),
+        width: frame.width,
+        height: frame.height,
+        encoding: tentaflow_protocol::CvFrameEncoding::Rgb24,
+    }
+}
+
+/// FAZA 2 — klatka `Detect` na drut: większa niż [`MESH_DETECT_EDGE`] jest
+/// najpierw zmniejszana (bilinear) do 560×560, mniejsza leci bez zmian.
+fn camera_cv_detect_frame_to_wire(
+    frame: &CvFrameLocal,
+) -> Result<tentaflow_protocol::CvFrame, ExecutorError> {
+    if frame.width <= MESH_DETECT_EDGE && frame.height <= MESH_DETECT_EDGE {
+        return Ok(camera_cv_frame_to_wire(frame));
+    }
+    let data = crate::vision::resize::resize_rgb(
+        &frame.data,
+        frame.width,
+        frame.height,
+        MESH_DETECT_EDGE,
+        MESH_DETECT_EDGE,
+    )
+    .map_err(|e| ExecutorError::Internal(format!("camera-cv mesh resize: {}", e)))?;
+    Ok(tentaflow_protocol::CvFrame {
+        data,
+        width: MESH_DETECT_EDGE,
+        height: MESH_DETECT_EDGE,
+        encoding: tentaflow_protocol::CvFrameEncoding::Rgb24,
+    })
+}
+
+/// FAZA 2 — buduje `ModelRequest` (mesh) z lokalnej operacji CV. Tu następuje
+/// jedyne kopiowanie pikseli (`Arc` → `Vec`, serde_bytes → CBOR byte-string)
+/// oraz downscale klatek `Detect` do krawędzi detektora.
+fn camera_cv_model_request(
+    model: &str,
+    op: CameraCvOpLocal,
+) -> Result<tentaflow_protocol::ModelRequest, ExecutorError> {
+    use tentaflow_protocol::*;
+    let op = match op {
+        CameraCvOpLocal::Detect { frames } => CameraCvOp::Detect {
+            frames: frames
+                .iter()
+                .map(camera_cv_detect_frame_to_wire)
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+        CameraCvOpLocal::ClassifyState { crop } => CameraCvOp::ClassifyState {
+            crop: camera_cv_frame_to_wire(&crop),
+        },
+        CameraCvOpLocal::Ocr { crop, mode } => CameraCvOp::Ocr {
+            crop: camera_cv_frame_to_wire(&crop),
+            mode,
+        },
+    };
+    Ok(ModelRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        payload: ModelPayload::CameraCv(CameraCvPayload {
+            model: model.to_string(),
+            op,
+        }),
+        stream: false,
+        metadata: None,
+        session_id: None,
+    })
+}
+
+/// FAZA 2 — mapuje `ModelResult` (mesh) na wynik camera-cv.
+fn camera_cv_result_from_model(
+    result: tentaflow_protocol::ModelResult,
+) -> Result<tentaflow_protocol::CameraCvResult, ExecutorError> {
+    use tentaflow_protocol::ModelResult;
+    match result {
+        ModelResult::CameraCv(r) => Ok(r),
+        ModelResult::Error(err) => Err(ExecutorError::Internal(format!(
+            "camera cv error: {}",
+            err.message
+        ))),
+        _ => Err(ExecutorError::Internal(
+            "camera cv returned unexpected result type".into(),
         )),
     }
 }
@@ -4922,6 +5139,181 @@ mod tests {
             .await
             .expect_err("flow without dispatcher should be a typed error");
         assert!(matches!(err, ExecutorError::FlowDispatcherUnavailable));
+    }
+
+    // FAZA 2: per-target `dispatch_camera_cv` tests. Embedded dispatchuje po
+    // `engine_id` (nieznany silnik → Internal, chain idzie dalej); HTTP jest
+    // architektonicznie zakazany; MeshForward bez mesh managera → pending
+    // cutover; Flow → Internal (brak flow-target surface).
+
+    fn make_cv_frame(w: u32, h: u32) -> CvFrameLocal {
+        CvFrameLocal {
+            data: vec![0u8; (w * h * 3) as usize].into(),
+            width: w,
+            height: h,
+        }
+    }
+
+    fn make_camera_cv_request(model: &str) -> CameraCvRequest {
+        CameraCvRequest {
+            model: model.to_string(),
+            op: CameraCvOpLocal::ClassifyState {
+                crop: make_cv_frame(64, 64),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn camera_cv_embedded_unknown_engine_is_internal() {
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::Local {
+            service_id: 1,
+            model_name: "cv-m".into(),
+            handle: BackendHandle::Embedded {
+                model_name: "cv-m".into(),
+                node_id: "local".into(),
+                engine_id: "test-engine".into(),
+            },
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_camera_cv(&target, make_camera_cv_request("cv-m"), &mut ctx)
+            .await
+            .expect_err("unknown embedded engine must error");
+        // Internal (nie abort) → failover próbuje kolejnych kandydatów.
+        assert!(matches!(err, ExecutorError::Internal(_)));
+        assert!(!err.aborts_fallback_chain());
+    }
+
+    #[tokio::test]
+    async fn camera_cv_http_transport_is_rejected() {
+        let backend = crate::config::ServiceBackend {
+            connection: crate::config::ConnectionType::OpenAIApi {
+                url: "http://127.0.0.1:1".into(),
+                api_key: Some(String::new()),
+                api_key_env: None,
+                extra_headers: Vec::new(),
+                custom_endpoint: None,
+                request_format: None,
+                tts_config: None,
+            },
+            max_concurrent: 1,
+            timeout_ms: 1_000,
+            weight: 1,
+            model_name_override: None,
+            health_check_path: None,
+        };
+        let client = crate::services::backend::client::BackendClient::new(backend, None)
+            .expect("test backend client");
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::Local {
+            service_id: 1,
+            model_name: "cv-m".into(),
+            handle: BackendHandle::Http(Arc::new(client)),
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_camera_cv(&target, make_camera_cv_request("cv-m"), &mut ctx)
+            .await
+            .expect_err("camera-cv over HTTP must be rejected");
+        assert!(matches!(err, ExecutorError::Internal(_)));
+        assert!(err.to_string().contains("embedded/mesh"));
+    }
+
+    #[tokio::test]
+    async fn camera_cv_mesh_forward_without_mesh_returns_pending_cutover() {
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::MeshForward {
+            node_id: "peer".into(),
+            service_id: 1,
+            model_name: "cv-m".into(),
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_camera_cv(&target, make_camera_cv_request("cv-m"), &mut ctx)
+            .await
+            .expect_err("mesh_forward without mesh manager should be pending cutover");
+        assert!(matches!(
+            err,
+            ExecutorError::TransportPendingCutover("mesh_forward")
+        ));
+    }
+
+    #[tokio::test]
+    async fn camera_cv_flow_target_is_internal() {
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::Flow {
+            flow_id: "1".to_string(),
+            published_name: "cv-flow".into(),
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_camera_cv(&target, make_camera_cv_request("any"), &mut ctx)
+            .await
+            .expect_err("camera-cv has no flow-target surface");
+        assert!(matches!(err, ExecutorError::Internal(_)));
+    }
+
+    /// `execute_camera_cv` dla nieznanego modelu surface'uje błąd resolvera —
+    /// pusty katalog `dummy_executor` nie ma serwisu camera-cv.
+    #[tokio::test]
+    async fn execute_camera_cv_unknown_model_surfaces_resolve_error() {
+        let exec = dummy_executor();
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .execute_camera_cv(make_camera_cv_request("no-such-cv"), &mut ctx)
+            .await
+            .expect_err("unknown camera-cv model must error, not panic");
+        assert!(matches!(err, ExecutorError::Resolve(_)));
+    }
+
+    /// Payload mesh dla `Detect`: klatka większa niż 560×560 jest zmniejszana
+    /// do krawędzi detektora (limit ramki CBOR 16 MiB), mniejsza leci bez zmian.
+    /// Klatki na drucie są RGB24 (`data.len() == w*h*3`).
+    #[test]
+    fn camera_cv_model_request_resizes_detect_frames_for_mesh() {
+        let frames = vec![make_cv_frame(1280, 720), make_cv_frame(320, 240)];
+        let req = camera_cv_model_request("rfdetr-adr-base", CameraCvOpLocal::Detect { frames })
+            .expect("mesh payload builds");
+        let tentaflow_protocol::ModelPayload::CameraCv(p) = req.payload else {
+            panic!("expected CameraCv payload");
+        };
+        assert_eq!(p.model, "rfdetr-adr-base");
+        let tentaflow_protocol::CameraCvOp::Detect { frames } = p.op else {
+            panic!("expected Detect op");
+        };
+        assert_eq!(frames.len(), 2);
+        assert_eq!((frames[0].width, frames[0].height), (560, 560));
+        assert_eq!(frames[0].data.len(), 560 * 560 * 3);
+        assert!(matches!(
+            frames[0].encoding,
+            tentaflow_protocol::CvFrameEncoding::Rgb24
+        ));
+        assert_eq!((frames[1].width, frames[1].height), (320, 240));
+        assert_eq!(frames[1].data.len(), 320 * 240 * 3);
+    }
+
+    /// Payload mesh dla `Ocr`: crop NIE jest zmniejszany (downscale dotyczy
+    /// tylko klatek `Detect`), a tryb OCR jest zachowany.
+    #[test]
+    fn camera_cv_model_request_keeps_ocr_crop_and_mode() {
+        let req = camera_cv_model_request(
+            "plate-ocr-fast",
+            CameraCvOpLocal::Ocr {
+                crop: make_cv_frame(900, 300),
+                mode: tentaflow_protocol::CvOcrMode::Adr,
+            },
+        )
+        .expect("mesh payload builds");
+        let tentaflow_protocol::ModelPayload::CameraCv(p) = req.payload else {
+            panic!("expected CameraCv payload");
+        };
+        let tentaflow_protocol::CameraCvOp::Ocr { crop, mode } = p.op else {
+            panic!("expected Ocr op");
+        };
+        assert_eq!((crop.width, crop.height), (900, 300));
+        assert_eq!(crop.data.len(), 900 * 300 * 3);
+        assert!(matches!(mode, tentaflow_protocol::CvOcrMode::Adr));
     }
 
     /// RAG E1.4 — buduje `DocumentParseRequest` z realnym, minimalnym PDF

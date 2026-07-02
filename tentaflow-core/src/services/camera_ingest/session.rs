@@ -124,6 +124,8 @@ pub struct SnapshotData {
     pub height: u32,
     pub pixel_format: PixelFormat,
     pub timestamp_unix_ms: u64,
+    /// PTS klatki w osi mediów (nanosekundy) — propagowany z appsink do detekcji.
+    pub pts_ns: Option<u64>,
     pub data: Vec<u8>,
 }
 
@@ -188,7 +190,10 @@ pub fn spawn_session(config: CameraConfig) -> Result<CameraHandle> {
     let (cmd_tx, health_rx, join_handle) = match vendor.as_str() {
         "fake_file" => spawn_fakefile_inner(config)?,
         "local_camera" | "v4l2" => spawn_local_inner(config)?,
-        "rtsp" => {
+        // MJPEG (HTTP multipart) współdzieli z RTSP pętlę sesji
+        // (reconnect/backoff/health) — spawn_rtsp_session dobiera pipeline
+        // i walidację URL wg `vendor`.
+        "rtsp" | "mjpeg" => {
             use super::rtsp::{spawn_rtsp_session, ReconnectPolicy};
             spawn_rtsp_session(config, ReconnectPolicy::default())?
         }
@@ -511,6 +516,7 @@ async fn run_session(
                                     height: f.height,
                                     pixel_format: PixelFormat::Rgb24,
                                     timestamp_unix_ms: f.timestamp_unix_ms,
+                                    pts_ns: f.pts_ns,
                                     data: f.data.to_vec(),
                                 });
                             }

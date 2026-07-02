@@ -812,7 +812,11 @@ pub mod test_support {
             documents: Arc::new(StubDocuments),
             stt: Arc::new(StubStt),
             tts: Arc::new(StubTts),
-            vision: Arc::new(crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new()),
+            // Pusty slot executora — stub context testów idzie ścieżką fallback
+            // (bezpośrednie singletony) w VisionDispatcherImpl.
+            vision: Arc::new(crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new(
+                Arc::new(parking_lot::RwLock::new(None)),
+            )),
             prompts: Arc::new(StubPrompts),
             memory: Arc::new(StubMemory),
             history: Arc::new(StubHistory),

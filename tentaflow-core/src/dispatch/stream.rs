@@ -192,13 +192,17 @@ fn stream_subscribe_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
         };
 
         // 1) Subscribe ack — carries MIME + whether an init segment follows.
+        // `base_pts_ns` niesie offset osi mediów (Branch B) tej samej osi czasu
+        // co PTS detekcji — klient odejmuje go, by zakotwiczyc overlay na klatce.
         let has_init_segment = handle.init_segment.is_some();
+        let base_pts_ns = handle.base_pts_ns;
         if push_chunk_async(
             &sub,
             MessageBody::StreamBody(StreamPayload::SubscribeResponse(StreamSubscribeResponse {
                 stream_id: stream_id.clone(),
                 mime_type: handle.mime_type.clone(),
                 has_init_segment,
+                base_pts_ns,
             })),
         )
         .await

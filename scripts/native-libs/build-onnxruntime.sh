@@ -40,8 +40,27 @@ fi
 
 require_cmd curl tar
 VERSION="${ONNXRUNTIME_REF#v}"
+# linux-x86_64 (NVIDIA): domyslnie bierzemy wariant GPU. Paczka
+# onnxruntime-linux-x64-gpu-<ver>.tgz zawiera — obok libonnxruntime.so —
+# providery libonnxruntime_providers_{tensorrt,cuda,shared}.so, wiec crate `ort`
+# (load-dynamic, ORT_DYLIB_PATH -> ten libonnxruntime.so) moze zarejestrowac
+# TensorRT/CUDA EP. Bez tego systemowy /usr/lib/libonnxruntime.so ma zwykle tylko
+# CUDA (badz nic). Uwaga zgodnosc: oficjalne prebuilty GPU sa budowane pod CUDA 12 /
+# cuDNN 9 — na hoscie z CUDA 13 dziala CUDA EP (zgodnosc wsteczna sterownika), a
+# TensorRT EP wymaga TensorRT + cuDNN zgodnych z paczka; gdy runtime nie zaladuje
+# TRT, kod detektora robi graceful fallback na CUDA. Wymus CPU-only:
+# ONNXRUNTIME_GPU=0.
+# macos-arm64: paczka osx-arm64 ma wbudowany CoreML EP (Metal/ANE) — GPU wariant
+# nie istnieje/niepotrzebny.
+ONNXRUNTIME_GPU="${ONNXRUNTIME_GPU:-1}"
 case "$PLATFORM" in
-  linux-x86_64) ARCHIVE="onnxruntime-linux-x64-$VERSION.tgz" ;;
+  linux-x86_64)
+    if [ "$ONNXRUNTIME_GPU" = "1" ]; then
+      ARCHIVE="onnxruntime-linux-x64-gpu-$VERSION.tgz"
+    else
+      ARCHIVE="onnxruntime-linux-x64-$VERSION.tgz"
+    fi
+    ;;
   linux-aarch64) ARCHIVE="onnxruntime-linux-aarch64-$VERSION.tgz" ;;
   macos-arm64) ARCHIVE="onnxruntime-osx-arm64-$VERSION.tgz" ;;
   windows-x86_64) ARCHIVE="onnxruntime-win-x64-$VERSION.zip" ;;
@@ -79,4 +98,11 @@ rm -f "$NATIVE_ROOT/$PLATFORM/lib-dynamic"/libonnxruntime*.so* \
       "$NATIVE_ROOT/$PLATFORM/lib-dynamic"/onnxruntime.dll 2>/dev/null || true
 copy_matching "$UNPACK" "$NATIVE_ROOT/$PLATFORM/lib-dynamic" -name 'libonnxruntime*.so*' -o -name 'libonnxruntime*.dylib' -o -name 'onnxruntime.dll'
 
-append_manifest_library "$PLATFORM" "onnxruntime" "dynamic" "$ONNXRUNTIME_REF" "Domyślnie pobierany oficjalny runtime; ustaw ONNXRUNTIME_MODE=static aby budować ze źródeł."
+# Na linux-x86_64 GPU paczka dokłada providery TensorRT/CUDA (libonnxruntime_
+# providers_{tensorrt,cuda,shared}.so) — wzorzec kopiowania 'libonnxruntime*.so*'
+# powyżej łapie je razem z głównym libonnxruntime.so.
+ORT_NOTE="Domyślnie pobierany oficjalny runtime; ustaw ONNXRUNTIME_MODE=static aby budować ze źródeł."
+if [ "$PLATFORM" = "linux-x86_64" ] && [ "$ONNXRUNTIME_GPU" = "1" ]; then
+  ORT_NOTE="Wariant GPU (TensorRT+CUDA providers); ONNXRUNTIME_GPU=0 -> CPU-only."
+fi
+append_manifest_library "$PLATFORM" "onnxruntime" "dynamic" "$ONNXRUNTIME_REF" "$ORT_NOTE"

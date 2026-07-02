@@ -479,6 +479,11 @@ required-features = ["inference-vision-gpu"]
 name = "cv_bench"
 required-features = ["inference-vision-gpu"]
 
+# Harness FAZY 1 — probe inferencji RF-DETR przez `ort` (ONNX Runtime) z CUDA EP.
+[[example]]
+name = "ort_cuda_probe"
+required-features = ["inference-supertonic"]
+
 [[test]]
 name = "agent_run_inline_region_e2e"
 required-features = ["test-support"]

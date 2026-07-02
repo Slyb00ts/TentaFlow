@@ -9,6 +9,7 @@ pub mod alias_metrics;
 pub mod circuit_breaker;
 pub mod context;
 pub mod executor;
+pub mod local_cv;
 pub mod quic_handle;
 pub mod resolver;
 pub mod strategy;

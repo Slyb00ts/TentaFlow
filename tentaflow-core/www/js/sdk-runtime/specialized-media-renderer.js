@@ -52,6 +52,9 @@ function attachLiveDetections(wrapper, tile, readStreamId, ctx) {
         video: tile,
         cameraId,
         videoResolver: () => tile.shadowRoot?.querySelector('video') || null,
+        // Baza media-time (base_pts_ns) z init-segmentu MSE — tf-video-stream
+        // udostepnia ja przez getter, nakladka czyta co klatke (sledzi resubscribe).
+        mediaBasePtsProvider: () => tile.mediaBasePtsNs ?? null,
       });
     })
     .catch((e) => {
@@ -179,6 +182,12 @@ function renderLiveCameraTile(component, ctx) {
   wrapper.classList.add('tf-live-camera');
   if (aspectRatio != null) wrapper.style.aspectRatio = aspectRatio;
 
+  // Uchwyty dla badge'y naglowka: resolver realnego <video> (do pomiaru fps
+  // odtwarzanego wideo) oraz element-host nakladki detekcji (posiada __detOverlay,
+  // z ktorego badge ms czyta lastProcMs). Ustawiane w odpowiedniej galezi ponizej.
+  let resolveVideoEl = () => null;
+  let detOverlayHost = null;
+
   // Zywy strumien subskrypcji (camera:<id>) idzie przez tf-video-stream (MSE nad
   // binarnym streamSubscribeRequest) — dokladnie jak w renderVideoStream — i
   // dostaje binarna nakladke detekcji (canvas). Wypelnia caly kafelek. Surowy
@@ -199,6 +208,8 @@ function renderLiveCameraTile(component, ctx) {
     ctx.registerCleanup(subscribeBindRef(streamIdBind, ctx.store, applyId));
     wrapper.appendChild(tile);
     attachLiveDetections(wrapper, tile, () => resolveBindRef(streamIdBind, ctx.store), ctx);
+    resolveVideoEl = () => tile.shadowRoot?.querySelector('video') || null;
+    detOverlayHost = tile;
   } else {
     const video = document.createElement('video');
     video.classList.add('tf-live-camera__video');
@@ -215,6 +226,7 @@ function renderLiveCameraTile(component, ctx) {
     applySrc();
     ctx.registerCleanup(subscribeBindRef(streamIdBind, ctx.store, applySrc));
     wrapper.appendChild(video);
+    resolveVideoEl = () => video;
   }
 
   if (showOverlay) {
@@ -242,6 +254,121 @@ function renderLiveCameraTile(component, ctx) {
     title.appendChild(labelEl);
     overlay.appendChild(title);
 
+    // Grupa badge'y po prawej stronie naglowka. Kolejnosc od lewej: ms, fps,
+    // status (ONLINE) — badge metryk poprzedzaja istniejacy chip statusu.
+    const badges = document.createElement('div');
+    badges.classList.add('tf-live-camera__badges');
+
+    // Badge ms: calosciowy czas obrobki ramki (backend). Wartosc czytamy z
+    // nakladki detekcji (host.__detOverlay.lastProcMs); gdy brak — myslnik.
+    const procEl = document.createElement('span');
+    procEl.classList.add('tf-live-camera__proc');
+    const applyProc = () => {
+      const overlayObj = detOverlayHost && detOverlayHost.__detOverlay;
+      const ms = overlayObj ? overlayObj.lastProcMs : null;
+      procEl.textContent = (ms == null || !Number.isFinite(ms)) ? '—' : `${Math.round(ms)} ms`;
+    };
+    applyProc();
+    if (typeof window !== 'undefined' && typeof window.setInterval === 'function') {
+      const procTimer = window.setInterval(applyProc, 750);
+      ctx.registerCleanup(() => window.clearInterval(procTimer));
+    }
+    badges.appendChild(procEl);
+
+    // Badge fps: realny klatkaz odtwarzanego wideo. Pomiar WYGLADZONY srednia
+    // kroczaca z okna ~4s (liczymy przyrost KUMULATYWNEJ liczby klatek miedzy
+    // najstarsza a najnowsza probka w oknie), zamiast chwilowej delty z 1s —
+    // dzieki temu wartosc nie skacze 0<->40. Zrodlo klatek:
+    // getVideoPlaybackQuality().totalVideoFrames, a gdy API brak — kumulatywny
+    // licznik requestVideoFrameCallback. Gdy w oknie chwilowo brak nowych klatek,
+    // trzymamy ostatnia sensowna wartosc przez HOLD_MS (nie migamy zerem).
+    const vidFpsEl = document.createElement('span');
+    vidFpsEl.classList.add('tf-live-camera__vidfps');
+    vidFpsEl.textContent = '— fps';
+    {
+      // Dlugosc okna sredniej kroczacej i minimalny rozstaw probek, zanim
+      // pokazemy pierwszy pomiar. HOLD_MS: jak dlugo trzymac ostatnia wartosc
+      // gdy okno chwilowo daje 0 (krotka dziura w naplywie klatek).
+      const WIN_MS = 4000;
+      const MIN_SPAN_MS = 1200;
+      const HOLD_MS = 2500;
+      const SAMPLE_MS = 500;
+
+      // Probki { t, frames } — `frames` to KUMULATYWNA liczba klatek w chwili t.
+      let probki = [];
+      let ostatniaFps = null;
+      let ostatniaFpsAt = 0;
+      let rvfcCount = 0;
+      let rvfcHandle = null;
+      let rvfcVideo = null;
+
+      const pumpRvfc = (v) => {
+        if (typeof v.requestVideoFrameCallback !== 'function') return;
+        const cb = () => {
+          rvfcCount += 1;
+          rvfcHandle = v.requestVideoFrameCallback(cb);
+        };
+        rvfcVideo = v;
+        rvfcHandle = v.requestVideoFrameCallback(cb);
+      };
+
+      // Zwraca kumulatywna liczbe klatek odtworzonych przez element `v`.
+      const kumulatywneKlatki = (v) => {
+        if (typeof v.getVideoPlaybackQuality === 'function') {
+          const q = v.getVideoPlaybackQuality();
+          if (q && Number.isFinite(q.totalVideoFrames)) return q.totalVideoFrames;
+        }
+        // Fallback rVFC — uruchom pompe raz na wlasciwym elemencie video.
+        if (rvfcVideo !== v) {
+          if (rvfcVideo && rvfcHandle != null && typeof rvfcVideo.cancelVideoFrameCallback === 'function') {
+            rvfcVideo.cancelVideoFrameCallback(rvfcHandle);
+          }
+          rvfcCount = 0;
+          pumpRvfc(v);
+        }
+        return rvfcCount;
+      };
+
+      const sampleFps = () => {
+        const v = resolveVideoEl();
+        const now = performance.now();
+        if (!v) { probki = []; vidFpsEl.textContent = '— fps'; return; }
+        const frames = kumulatywneKlatki(v);
+        if (!Number.isFinite(frames)) { vidFpsEl.textContent = '— fps'; return; }
+
+        probki.push({ t: now, frames });
+        // Utrzymuj tylko probki z okna ~WIN_MS (zawsze min. 2 do policzenia delty).
+        while (probki.length > 2 && now - probki[0].t > WIN_MS) probki.shift();
+
+        const pierwsza = probki[0];
+        const span = now - pierwsza.t;
+        if (span < MIN_SPAN_MS) return; // za malo danych — trzymaj "— fps"
+
+        const df = frames - pierwsza.frames;
+        const fps = df > 0 ? Math.round(df / (span / 1000)) : 0;
+        if (fps > 0) {
+          vidFpsEl.textContent = `${fps} fps`;
+          ostatniaFps = fps;
+          ostatniaFpsAt = now;
+        } else if (ostatniaFps != null && now - ostatniaFpsAt < HOLD_MS) {
+          vidFpsEl.textContent = `${ostatniaFps} fps`;
+        } else {
+          vidFpsEl.textContent = '0 fps';
+        }
+      };
+
+      if (typeof window !== 'undefined' && typeof window.setInterval === 'function') {
+        const fpsTimer = window.setInterval(sampleFps, SAMPLE_MS);
+        ctx.registerCleanup(() => {
+          window.clearInterval(fpsTimer);
+          if (rvfcVideo && rvfcHandle != null && typeof rvfcVideo.cancelVideoFrameCallback === 'function') {
+            rvfcVideo.cancelVideoFrameCallback(rvfcHandle);
+          }
+        });
+      }
+    }
+    badges.appendChild(vidFpsEl);
+
     const statusEl = document.createElement('span');
     statusEl.classList.add('tf-live-camera__status');
     const applyStatus = () => {
@@ -252,7 +379,8 @@ function renderLiveCameraTile(component, ctx) {
     };
     applyStatus();
     ctx.registerCleanup(subscribeBindRef(statusBind, ctx.store, applyStatus));
-    overlay.appendChild(statusEl);
+    badges.appendChild(statusEl);
+    overlay.appendChild(badges);
     wrapper.appendChild(overlay);
 
     // Nakladka dolna: fps (opcjonalnie) po lewej, biezacy timestamp (mono) po prawej.

@@ -626,15 +626,17 @@ mod tests {
         let outcome = resolver
             .resolve(&rerank_request("cross-encoder"), &snap, &mut ctx)
             .expect("embedded MLX reranker must be a valid rerank candidate");
+        assert_eq!(outcome.candidates.len(), 1);
         assert!(
             matches!(
-                outcome,
+                outcome.candidates[0],
                 ResolvedExecutionTarget::Local {
                     handle: crate::services::handles_cache::BackendHandle::Embedded { .. },
                     ..
                 }
             ),
-            "expected Local{{Embedded}} rerank candidate, got {outcome:?}"
+            "expected Local{{Embedded}} rerank candidate, got {:?}",
+            outcome.candidates[0]
         );
     }
 

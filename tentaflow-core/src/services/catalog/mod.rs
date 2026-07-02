@@ -31,6 +31,11 @@ pub enum ServiceSurface {
     Agents,
     /// Monocular depth estimation (Depth Anything / MiDaS) — image in, depth map out.
     Depth,
+    /// Serwisy CV dla kamer (detekcja/klasyfikacja/OCR klatek) — surface
+    /// deklarowany WYŁĄCZNIE jawnie w TOML manifestu (`service_surfaces`),
+    /// nigdy wnioskowany z `engine.category` (kategoria `vision` obejmuje
+    /// też depth itp.).
+    CameraCv,
 }
 
 impl ServiceSurface {
@@ -85,6 +90,7 @@ impl ServiceSurface {
             Self::Documents => "documents",
             Self::Agents => "agents",
             Self::Depth => "depth",
+            Self::CameraCv => "camera_cv",
         }
     }
 
@@ -103,6 +109,7 @@ impl ServiceSurface {
             "documents" => Some(Self::Documents),
             "agents" => Some(Self::Agents),
             "depth" => Some(Self::Depth),
+            "camera_cv" => Some(Self::CameraCv),
             _ => None,
         }
     }
@@ -406,6 +413,19 @@ mod tests {
                 surface
             );
         }
+    }
+
+    /// `camera_cv` NIE ma mapowania z `engine.category` (kategoria `vision`
+    /// obejmuje też depth itp.) — surface trafia do katalogu wyłącznie z
+    /// jawnego `service_surfaces` w TOML, więc round-trip idzie tylko po wire.
+    #[test]
+    fn camera_cv_wire_round_trip_without_category_mapping() {
+        assert_eq!(ServiceSurface::CameraCv.as_wire_str(), "camera_cv");
+        assert_eq!(
+            ServiceSurface::from_wire_str("camera_cv"),
+            Some(ServiceSurface::CameraCv)
+        );
+        assert_eq!(ServiceSurface::from_manifest_category("vision"), None);
     }
 
     #[test]

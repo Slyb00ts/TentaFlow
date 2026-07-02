@@ -109,53 +109,38 @@ fn main() -> std::process::ExitCode {
 
     let mut ok = true;
 
-    // --- RF-DETR: [1,3,560,560] -> ([1,300,4], [1,300,18]) ---
-    match run_rfdetr(&rfdetr_bpk, &device) {
+    // --- RF-DETR fixed batch=8: [8,3,560,560] -> ([8,300,4], [8,300,18]) ---
+    // Architektura po regeneracji ma zapieczony batch=8 (constant-folding onnxsim
+    // z --overwrite-input-shape input:8,3,560,560). Sprawdzamy że pojedynczy
+    // forward całego batcha przechodzi bez panica (Bool mask, Add na kształtach)
+    // i zwraca statyczne kształty [8,300,4]+[8,300,18].
+    match run_rfdetr_batch8(&rfdetr_bpk, &device) {
         Ok((d0, d1)) => {
-            let shapes_ok = d0 == [1, 300, 4] && d1 == [1, 300, 18];
+            let shapes_ok = d0 == [8, 300, 4] && d1 == [8, 300, 18];
             println!(
-                "[gpu-forward] RF-DETR forward OK — wyjścia {:?} + {:?} {}",
+                "[gpu-forward] RF-DETR batch=8 forward OK — wyjścia {:?} + {:?} {}",
                 d0,
                 d1,
-                if shapes_ok { "(kształty OK)" } else { "(NIEOCZEKIWANE kształty)" }
+                if shapes_ok { "(kształty OK, brak panica Bool/Add)" } else { "(NIEOCZEKIWANE kształty)" }
             );
             ok &= shapes_ok;
         }
         Err(e) => {
-            eprintln!("[gpu-forward] RF-DETR BŁĄD/PANIC: {e}");
+            eprintln!("[gpu-forward] RF-DETR batch=8 BŁĄD/PANIC: {e}");
             ok = false;
         }
     }
 
-    // --- RF-DETR wielokamerowo: 2 klatki przez pętlę batch=1 (jak runtime) ---
-    // Odtwarza to, co robi `detector_rfdetr::detect_batch` po fixie: zamiast
-    // jednego forwardu `[2,3,560,560]` (który panikuje `Add` na modelu fixed-
-    // batch-1) — dwa osobne forwardy `[1,3,560,560]`. Potwierdza BRAK panica
-    // oraz kształty `[1,300,4]`+`[1,300,18]` dla KAŻDEJ klatki.
-    match run_rfdetr_two_frames(&rfdetr_bpk, &device) {
-        Ok(shapes) => {
-            let all_ok = shapes
-                .iter()
-                .all(|&(d0, d1)| d0 == [1, 300, 4] && d1 == [1, 300, 18]);
-            println!(
-                "[gpu-forward] RF-DETR 2 klatki (pętla batch=1) OK — {:?} {}",
-                shapes,
-                if all_ok { "(kształty OK, brak panica Add)" } else { "(NIEOCZEKIWANE kształty)" }
-            );
-            ok &= all_ok;
-        }
-        Err(e) => {
-            eprintln!("[gpu-forward] RF-DETR 2 klatki BŁĄD/PANIC: {e}");
-            ok = false;
-        }
-    }
-
-    // --- STAN: [1,3,224,224] -> [1,4] ---
+    // --- STAN fixed batch=8: [8,3,224,224] -> [8,4] ---
+    // Architektura po regeneracji ma zapieczony batch=8 (onnxsim
+    // --overwrite-input-shape input:8,3,224,224). Reshape używa `[-1,1280]`, więc
+    // sam graf jest batch-elastyczny, ale walidujemy pełny batch=8 zgodnie z tym,
+    // czego oczekuje `classify_batch` (padding slotów do 8).
     match run_stan(&stan_bpk, &device) {
         Ok(d) => {
-            let shape_ok = d == [1, 4];
+            let shape_ok = d == [8, 4];
             println!(
-                "[gpu-forward] STAN forward OK — wyjście {:?} {}",
+                "[gpu-forward] STAN batch=8 forward OK — wyjście {:?} {}",
                 d,
                 if shape_ok { "(kształt OK)" } else { "(NIEOCZEKIWANY kształt)" }
             );
@@ -176,9 +161,11 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// Ładuje RF-DETR z `.bpk` (z adapterem Bool) i robi forward na zerowym wejściu.
-/// Panic z backendu (np. `bool_from_data`) łapiemy, aby zwrócić czytelny błąd.
-fn run_rfdetr(
+/// Ładuje RF-DETR (fixed batch=8) z `.bpk` (z adapterem Bool) i wykonuje jeden
+/// forward na NIEZEROWYM wejściu `[8,3,560,560]` (ramp per-element, aby pobudzić
+/// realne ścieżki grafu, a nie same zera). Panic z backendu (np. `bool_from_data`
+/// przy masce, czy niezgodność kształtów `Add`) łapiemy i zwracamy jako błąd.
+fn run_rfdetr_batch8(
     path: &str,
     device: &Dev,
 ) -> Result<([usize; 3], [usize; 3]), String> {
@@ -193,7 +180,17 @@ fn run_rfdetr(
         model
             .load_from(&mut store)
             .map_err(|e| format!("load_from: {e}"))?;
-        let input = Tensor::<B, 4>::zeros([1, 3, 560, 560], device);
+
+        // Niezerowy ramp znormalizowany do ~[-2,2] na całym batchu [8,3,560,560].
+        let numel = 8 * 3 * 560 * 560;
+        let ramp: Vec<f32> = (0..numel)
+            .map(|i| (i % 255) as f32 / 255.0 * 4.0 - 2.0)
+            .collect();
+        let input = Tensor::<B, 4>::from_data(
+            burn::tensor::TensorData::new(ramp, [8, 3, 560, 560]),
+            device,
+        );
+
         let (o0, o1) = model.forward(input);
         let d0 = o0.dims();
         let d1 = o1.dims();
@@ -202,57 +199,11 @@ fn run_rfdetr(
         let _ = o1.to_data();
         Ok((d0, d1))
     }))
-    .map_err(|_| "panic w forward RF-DETR (patrz komunikat powyżej)".to_string())?
+    .map_err(|_| "panic w forward RF-DETR batch=8 (patrz komunikat powyżej)".to_string())?
 }
 
-/// Ładuje RF-DETR raz i wykonuje DWA osobne forwardy `[1,3,560,560]` (pętla
-/// batch=1) — replika ścieżki wielokamerowej runtime'u po fixie. Wejście jest
-/// NIEZEROWE (ramp + ones), aby uruchomić realne ścieżki grafu, nie tylko zera.
-/// Panic z backendu (np. shape `Add`) łapiemy i zwracamy jako błąd.
-fn run_rfdetr_two_frames(
-    path: &str,
-    device: &Dev,
-) -> Result<Vec<([usize; 3], [usize; 3])>, String> {
-    let path = std::path::PathBuf::from(path);
-    if !path.exists() {
-        return Err(format!("plik nie istnieje: {}", path.display()));
-    }
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut model = rfdetr::Model::<B>::new(device);
-        let mut store =
-            BurnpackStore::from_file(&path).with_from_adapter(BoolNativeToU32Adapter);
-        model
-            .load_from(&mut store)
-            .map_err(|e| format!("load_from: {e}"))?;
-
-        // Dwie różne, niezerowe klatki: ramp znormalizowany do ~[-2,2] oraz ones.
-        let numel = 3 * 560 * 560;
-        let ramp: Vec<f32> = (0..numel)
-            .map(|i| (i % 255) as f32 / 255.0 * 4.0 - 2.0)
-            .collect();
-        let frames = [
-            Tensor::<B, 4>::from_data(
-                burn::tensor::TensorData::new(ramp, [1, 3, 560, 560]),
-                device,
-            ),
-            Tensor::<B, 4>::ones([1, 3, 560, 560], device),
-        ];
-
-        let mut shapes = Vec::with_capacity(frames.len());
-        for input in frames {
-            let (o0, o1) = model.forward(input);
-            let d0 = o0.dims();
-            let d1 = o1.dims();
-            let _ = o0.to_data();
-            let _ = o1.to_data();
-            shapes.push((d0, d1));
-        }
-        Ok(shapes)
-    }))
-    .map_err(|_| "panic w forward RF-DETR 2 klatki (patrz komunikat powyżej)".to_string())?
-}
-
-/// Ładuje model STAN z `.bpk` i robi forward na zerowym wejściu.
+/// Ładuje model STAN (fixed batch=8) z `.bpk` i robi jeden forward na niezerowym
+/// wejściu `[8,3,224,224]` (ramp per-element, aby pobudzić realne ścieżki grafu).
 fn run_stan(
     path: &str,
     device: &Dev,
@@ -268,7 +219,14 @@ fn run_stan(
         model
             .load_from(&mut store)
             .map_err(|e| format!("load_from: {e}"))?;
-        let input = Tensor::<B, 4>::zeros([1, 3, 224, 224], device);
+        let numel = 8 * 3 * 224 * 224;
+        let ramp: Vec<f32> = (0..numel)
+            .map(|i| (i % 255) as f32 / 255.0 * 4.0 - 2.0)
+            .collect();
+        let input = Tensor::<B, 4>::from_data(
+            burn::tensor::TensorData::new(ramp, [8, 3, 224, 224]),
+            device,
+        );
         let out = model.forward(input);
         let d = out.dims();
         let _ = out.to_data();

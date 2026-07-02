@@ -30,6 +30,8 @@ pub struct LatestFrame {
     pub width: u32,
     pub height: u32,
     pub timestamp_unix_ms: u64,
+    /// PTS klatki w osi mediów (nanosekundy) — propagowany z appsink do detekcji.
+    pub pts_ns: Option<u64>,
     pub data: Arc<[u8]>,
 }
 
@@ -237,6 +239,7 @@ pub(crate) fn install_frame_callback(
                     width: width as u32,
                     height: height as u32,
                     timestamp_unix_ms: ts_ms,
+                    pts_ns,
                     data: shared.clone(),
                 });
                 counters_cb.increment(ts_ms / 1000);

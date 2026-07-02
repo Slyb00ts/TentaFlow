@@ -230,3 +230,6 @@ tests/e2e/package-lock.json
 # Reference checkouts for harness analysis (not part of the project)
 hermes-agent/
 thirparty/
+
+# Poufne nagrania klienta — NIE commitować (tylko lokalnie do testow rtsp-sim)
+/tools/rtsp-sim/clips/

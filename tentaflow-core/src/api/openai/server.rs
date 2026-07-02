@@ -1735,7 +1735,10 @@ async fn handle_passthrough(
     } = &target
     {
         if forward_path == "/v1/infer" {
-            return Ok(infer_embedded_vision(&parsed, model_name, engine_id).await);
+            return Ok(
+                infer_embedded_vision(&parsed, model_name, engine_id, router.executor.clone())
+                    .await,
+            );
         }
         return Ok(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1918,6 +1921,7 @@ async fn infer_embedded_vision(
     parsed: &serde_json::Value,
     model_name: &str,
     engine_id: &str,
+    runtime_slot: crate::flow_engine::dispatchers_impl::ModelRuntimeSlot,
 ) -> Response<OpenAIBody> {
     let url = match parsed
         .get("input")
@@ -1970,7 +1974,8 @@ async fn infer_embedded_vision(
     // `VisionDispatcher` (in-process runner / Burn PlateOcr), zwracając kontrakt
     // OCR NVIDIA z pojedynczą detekcją obejmującą cały kadr (jak paddle-ocr).
     if matches!(engine_id, "onnx-ocr" | "apple-ocr" | "plate-ocr") {
-        let dispatcher = crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new();
+        let dispatcher =
+            crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new(runtime_slot);
         let req = crate::flow_engine::dispatchers::VisionOcrRequest {
             rgb,
             width,

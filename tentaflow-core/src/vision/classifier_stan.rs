@@ -99,11 +99,18 @@ impl StateClassifier {
     /// of size `cw*ch*3`. Zwraca dokładnie jedną etykietę stanu (klasa o
     /// najwyższym logicie = najwyższym prawdopodobieństwie softmax) w wektorze,
     /// żeby zachować kształt `Detection.stan: Vec<String>`.
+    ///
+    /// Model jest wkompilowany na sztywno pod `[1,3,S,S]` — jeden crop = jeden
+    /// forward batch=1. Preprocessing: stretch-resize do S×S, /255, per-channel
+    /// ImageNet normalize → NCHW f32 `[1,3,S,S]`; postprocessing to argmax po
+    /// logitach (single-label softmax).
     pub fn classify(&mut self, crop_rgb: &[u8], cw: u32, ch: u32) -> Result<Vec<String>> {
         let s = self.img_size as usize;
+        let plane = s * s;
+        let num_classes = self.classes.len();
+
         let resized = crate::vision::resize::resize_rgb(crop_rgb, cw, ch, self.img_size, self.img_size)
             .map_err(|e| anyhow!("resize_rgb failed: {e}"))?;
-        let plane = s * s;
         let mut data = vec![0f32; 3 * plane];
         for y in 0..s {
             for x in 0..s {
@@ -114,32 +121,47 @@ impl StateClassifier {
                 }
             }
         }
-        let input =
-            Tensor::<VisionBackend, 4>::from_data(TensorData::new(data, [1, 3, s, s]), &self.device);
 
-        let out =
-            crate::vision::burn_backend::guarded_forward("state-classifier", || self.model.forward(input))?;
+        let input = Tensor::<VisionBackend, 4>::from_data(
+            TensorData::new(data, [1, 3, s, s]),
+            &self.device,
+        );
+
+        let out = crate::vision::burn_backend::guarded_forward("state-classifier", || {
+            self.model.forward(input)
+        })?;
+
+        // Kształt wyjścia musi być dokładnie [1, num_classes] — inaczej model/eksport
+        // nie pasuje do kontraktu. Walidujemy PRZED `to_vec` (jak detektor dims).
+        let dims = out.dims();
+        if dims != [1, num_classes] {
+            bail!(
+                "state classifier output dims {:?} != [1, {}]",
+                dims,
+                num_classes
+            );
+        }
+
         let logits: Vec<f32> = out
             .to_data()
             .to_vec()
             .map_err(|e| anyhow!("state logits to_vec: {e:?}"))?;
 
-        let num_classes = self.classes.len();
-        if logits.len() < num_classes {
-            bail!("logits len {} < class count {}", logits.len(), num_classes);
-        }
-
-        // Single-label softmax: argmax po logitach jest równoważny argmaxowi po
-        // softmaxie (softmax jest monotoniczny), więc wybieramy klasę o najwyższym
-        // logicie bez liczenia pełnej normalizacji.
-        let mut best_idx = 0usize;
-        let mut best_logit = f32::NEG_INFINITY;
-        for (idx, &l) in logits.iter().take(num_classes).enumerate() {
-            if l > best_logit {
-                best_logit = l;
-                best_idx = idx;
-            }
-        }
-        Ok(vec![self.classes[best_idx].clone()])
+        Ok(vec![self.classes[argmax(&logits)].clone()])
     }
+}
+
+/// Argmax po logitach (single-label softmax — argmax po logitach jest równoważny
+/// argmaxowi po softmaxie, bo softmax jest monotoniczny). Pusty wycinek → 0.
+#[inline]
+fn argmax(logits: &[f32]) -> usize {
+    let mut best_idx = 0usize;
+    let mut best_logit = f32::NEG_INFINITY;
+    for (idx, &l) in logits.iter().enumerate() {
+        if l > best_logit {
+            best_logit = l;
+            best_idx = idx;
+        }
+    }
+    best_idx
 }

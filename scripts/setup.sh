@@ -24,6 +24,14 @@ NC='\033[0m'
 INSTALL_CUDA=true
 INSTALL_VULKAN=true
 INSTALL_ROCM=true
+# TensorRT — akceleracja inferencji vision (RF-DETR przez crate `ort`, TensorRT EP).
+# Domyslnie wlaczone na NVIDIA; pomijane bez GPU NVIDIA i na macOS (tam CoreML).
+INSTALL_TENSORRT=true
+
+# OCR — Tesseract + langpack polski (pol) dla czytnika tablic ADR (2-liniowa
+# pomaranczowa plansza kemler/UN). To narzedzie CPU, wiec instalujemy je zawsze
+# (niezaleznie od GPU); wylaczenie przez --no-ocr.
+INSTALL_OCR=true
 
 # Wykryta dystrybucja
 DISTRO=""
@@ -55,6 +63,8 @@ Opcje:
   --no-cuda     Pomin NVIDIA CUDA toolkit
   --no-vulkan   Pomin Vulkan SDK
   --no-rocm     Pomin AMD ROCm (HIP runtime)
+  --no-tensorrt Pomin NVIDIA TensorRT (akceleracja vision przez ort TensorRT EP)
+  --no-ocr      Pomin Tesseract + langpack pol (OCR tablic ADR; narzedzie CPU)
   --minimal     Pomin WSZYSTKIE GPU backends (build CPU-only / per-backend variant)
   --cuda/--vulkan/--rocm/--all-gpu  (zachowane dla zgodnosci — wlaczaja dany backend)
   -h, --help    Pokaz te pomoc
@@ -79,11 +89,14 @@ for arg in "$@"; do
         --cuda)    INSTALL_CUDA=true ;;
         --vulkan)  INSTALL_VULKAN=true ;;
         --rocm)    INSTALL_ROCM=true ;;
-        --all-gpu) INSTALL_CUDA=true; INSTALL_VULKAN=true; INSTALL_ROCM=true ;;
+        --tensorrt) INSTALL_TENSORRT=true ;;
+        --all-gpu) INSTALL_CUDA=true; INSTALL_VULKAN=true; INSTALL_ROCM=true; INSTALL_TENSORRT=true ;;
         --no-cuda)   INSTALL_CUDA=false ;;
         --no-vulkan) INSTALL_VULKAN=false ;;
         --no-rocm)   INSTALL_ROCM=false ;;
-        --minimal|--cpu) INSTALL_CUDA=false; INSTALL_VULKAN=false; INSTALL_ROCM=false ;;
+        --no-tensorrt) INSTALL_TENSORRT=false ;;
+        --no-ocr)    INSTALL_OCR=false ;;
+        --minimal|--cpu) INSTALL_CUDA=false; INSTALL_VULKAN=false; INSTALL_ROCM=false; INSTALL_TENSORRT=false ;;
         --help|-h) usage; exit 0 ;;
         *)
             log_error "Nieznana opcja: $arg"
@@ -352,6 +365,11 @@ install_base() {
                 # iostat dla disk IO collector (/usr/bin/iostat).
                 sysstat
             )
+            # Tesseract + langpack pol dla OCR tablic ADR (czytnik kemler/UN).
+            if [[ "$INSTALL_OCR" == true ]]; then
+                pkgs+=(tesseract tesseract-data-pol)
+                INSTALLED+=("tesseract" "tesseract-data-pol")
+            fi
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged pacman -S --needed --noconfirm "${pkgs[@]}"
 
@@ -399,6 +417,11 @@ install_base() {
                 libclang-dev
                 patchelf
             )
+            # Tesseract + langpack pol dla OCR tablic ADR (czytnik kemler/UN).
+            if [[ "$INSTALL_OCR" == true ]]; then
+                pkgs+=(tesseract-ocr tesseract-ocr-pol)
+                INSTALLED+=("tesseract-ocr" "tesseract-ocr-pol")
+            fi
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged apt-get install -y "${pkgs[@]}"
             INSTALLED+=("build-essential" "cmake" "clang" "lld" "git" "git-lfs" "openjdk-17-jdk" "unzip" "libglib2.0-dev" "libgstreamer1.0-dev" "libgstreamer-plugins-base1.0-dev" "libvulkan1" "sqlite3-dev" "perf" "sysstat" "libclang-dev" "patchelf")
@@ -442,6 +465,11 @@ install_base() {
                 perf
                 sysstat
             )
+            # Tesseract + langpack pol dla OCR tablic ADR (czytnik kemler/UN).
+            if [[ "$INSTALL_OCR" == true ]]; then
+                pkgs+=(tesseract tesseract-langpack-pol)
+                INSTALLED+=("tesseract" "tesseract-langpack-pol")
+            fi
             log_info "Instalacja: ${pkgs[*]}"
             # --skip-unavailable: nie przerywaj calej transakcji gdy jeden pakiet
             # zniknal w danej wersji Fedory (np. java-17 na F44) — reszta wchodzi.
@@ -1348,6 +1376,85 @@ install_cuda() {
     esac
 }
 
+# --- NVIDIA TensorRT (akceleracja inferencji vision) ---
+#
+# Detektor RF-DETR (crate `ort`, load-dynamic) rejestruje TensorRT EP jako
+# najwyzszy priorytet, z graceful fallbackiem na CUDA gdy TRT niedostepny. Runtime
+# ONNX z providerem TensorRT pobiera build-all.sh do native-libs/ (paczka GPU), ale
+# sam provider potrzebuje BIBLIOTEK TensorRT (libnvinfer*) w systemie — instalujemy
+# je tutaj. Tylko NVIDIA (nie-macOS); brak pakietu nie przerywa setupu (fallback na
+# CUDA i tak zadziala).
+install_tensorrt() {
+    log_section "NVIDIA TensorRT (vision inference — ort TensorRT EP)"
+
+    if [[ "$DISTRO" == "macos" ]]; then
+        log_info "macOS — TensorRT nie dotyczy (vision idzie przez CoreML EP). Pomijam."
+        return
+    fi
+
+    # Detekcja GPU NVIDIA (jak w install_cuda) — bez NVIDIA nie ma sensu ciagnac TRT.
+    local has_nv_gpu=""
+    if command -v lspci &>/dev/null && lspci 2>/dev/null | grep -qiE 'nvidia'; then
+        has_nv_gpu=1
+    fi
+    if command -v nvidia-smi &>/dev/null && nvidia-smi -L 2>/dev/null | grep -qiE 'gpu'; then
+        has_nv_gpu=1
+    fi
+    if [[ -z "$has_nv_gpu" ]] && command -v lspci &>/dev/null; then
+        log_info "Nie wykryto GPU NVIDIA — pomijam instalacje TensorRT."
+        return
+    fi
+
+    case "$DISTRO" in
+        arch)
+            # Arch (rolling) ma pakiet `tensorrt` w extra; cuDNN jest jego zaleznoscia
+            # runtime (provider TensorRT laduje libcudnn). --needed pomija juz obecne.
+            log_info "Instalacja tensorrt + cudnn z pacman..."
+            if run_privileged pacman -S --needed --noconfirm tensorrt cudnn; then
+                INSTALLED+=("tensorrt" "cudnn")
+                log_ok "TensorRT zainstalowany"
+            else
+                log_warn "Nie udalo sie zainstalowac tensorrt/cudnn (pacman). Vision zejdzie na CUDA EP."
+            fi
+            ;;
+        debian)
+            # TensorRT z repo NVIDIA CUDA (to samo network-repo co install_cuda —
+            # cuda-keyring dodaje je raz). Meta-pakiet `tensorrt` ciagnie libnvinfer*
+            # + cuDNN. Gdy repo nie dodano (np. --no-cuda), instalacja sie nie powiedzie
+            # — ostrzegamy zamiast failowac.
+            if ! command -v curl &>/dev/null; then
+                run_privileged apt-get install -y curl ca-certificates || true
+            fi
+            log_info "Instalacja tensorrt z repo NVIDIA (apt)..."
+            run_privileged apt-get update || true
+            if run_privileged apt-get install -y tensorrt; then
+                INSTALLED+=("tensorrt")
+                log_ok "TensorRT zainstalowany"
+            elif run_privileged apt-get install -y libnvinfer-dev libnvinfer-plugin-dev; then
+                INSTALLED+=("libnvinfer-dev")
+                log_ok "TensorRT (libnvinfer) zainstalowany"
+            else
+                log_warn "Nie udalo sie zainstalowac TensorRT z apt (brak repo NVIDIA?)."
+                log_warn "  Dodaj repo CUDA (install_cuda) albo pobierz recznie: https://developer.nvidia.com/tensorrt"
+                log_warn "  Vision zejdzie na CUDA EP (graceful fallback)."
+            fi
+            ;;
+        fedora)
+            # Fedora/RHEL: TensorRT z repo NVIDIA CUDA (cuda-<ver>.repo). Bez recznie
+            # dodanego repo pakiet nie bedzie widoczny — probujemy i ostrzegamy.
+            log_info "Probuje zainstalowac libnvinfer (TensorRT) z dnf..."
+            if run_privileged dnf install -y libnvinfer libnvinfer-plugin 2>/dev/null; then
+                INSTALLED+=("libnvinfer")
+                log_ok "TensorRT (libnvinfer) zainstalowany"
+            else
+                log_warn "Nie udalo sie zainstalowac TensorRT z dnf (brak repo NVIDIA?)."
+                log_warn "  Dodaj repo NVIDIA CUDA i uruchom ponownie, albo: https://developer.nvidia.com/tensorrt"
+                log_warn "  Vision zejdzie na CUDA EP (graceful fallback)."
+            fi
+            ;;
+    esac
+}
+
 # --- Vulkan SDK ---
 
 install_vulkan() {
@@ -1936,6 +2043,13 @@ main() {
 
     if [[ "$INSTALL_CUDA" == true ]]; then
         install_cuda
+    fi
+
+    # TensorRT po CUDA — na Debian/Fedora korzysta z repo NVIDIA dodanego przez
+    # install_cuda. Domyslnie wlaczone (rozszerza sciezke CUDA o szybszy EP);
+    # --no-tensorrt/--minimal pomija. Sam install_tensorrt i tak wymaga GPU NVIDIA.
+    if [[ "$INSTALL_TENSORRT" == true ]]; then
+        install_tensorrt
     fi
 
     if [[ "$INSTALL_VULKAN" == true ]]; then

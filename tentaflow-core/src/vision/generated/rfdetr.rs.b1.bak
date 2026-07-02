@@ -1,4 +1,4 @@
-// Generated from ONNX "/home/critix/repos/rust/TentaFlow/.runtime/cache/ml-training-artifacts/recog/base-deploy/rfdetr-base-b8.onnx" by burn-onnx
+// Generated from ONNX "/tmp/claude-1000/-mnt-abyss-Files-Dokumenty-Praca-Euvic-Tematy-Acme-PoC-AI/8ac0e073-68ff-4807-b1e6-520512a7b517/scratchpad/rfdetr-base-simp.onnx" by burn-onnx
 use burn::prelude::*;
 use burn::nn::LayerNorm;
 use burn::nn::LayerNormConfig;
@@ -58,10 +58,10 @@ impl<B: Backend> Submodule1<B> {
             move |device, _require_grad| Tensor::<
                 B,
                 3,
-            >::zeros([8, 1, 384], (device, burn::tensor::DType::F32)),
+            >::zeros([1, 1, 384], (device, burn::tensor::DType::F32)),
             device.clone(),
             false,
-            [8, 1, 384].into(),
+            [1, 1, 384].into(),
         );
         let constant58: burn::module::Param<Tensor<B, 3>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
@@ -255,7 +255,7 @@ impl<B: Backend> Submodule1<B> {
         input: Tensor<B, 4>,
     ) -> (Tensor<B, 3>, Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>) {
         let conv2d1_out1 = self.conv2d1.forward(input);
-        let reshape1_out1 = conv2d1_out1.reshape([8, 384, -1]);
+        let reshape1_out1 = conv2d1_out1.reshape([1, 384, -1]);
         let transpose1_out1 = reshape1_out1.permute([0, 2, 1]);
         let constant326_out1 = self.constant326.val();
         let concat1_out1 = burn::tensor::Tensor::cat(
@@ -266,9 +266,9 @@ impl<B: Backend> Submodule1<B> {
         let add1_out1 = concat1_out1.add(constant58_out1);
         let slice1_out1 = add1_out1.clone().slice(s![.., 0..1, ..]);
         let slice2_out1 = add1_out1.slice(s![.., 1.., ..]);
-        let reshape2_out1 = slice2_out1.reshape([32, 10, 4, 10, -1]);
+        let reshape2_out1 = slice2_out1.reshape([4, 10, 4, 10, -1]);
         let transpose2_out1 = reshape2_out1.permute([0, 2, 1, 3, 4]);
-        let reshape3_out1 = transpose2_out1.reshape([128, 100, -1]);
+        let reshape3_out1 = transpose2_out1.reshape([16, 100, -1]);
         let tile1_out1 = slice1_out1.repeat(&[16, 1, 1]);
         let concat2_out1 = burn::tensor::Tensor::cat(
             [tile1_out1, reshape3_out1].into(),
@@ -291,14 +291,14 @@ impl<B: Backend> Submodule1<B> {
         let add3_out1 = (constant64_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split1_out2);
-        let reshape4_out1 = add3_out1.reshape([128, -1, 6, 64]);
+        let reshape4_out1 = add3_out1.reshape([16, 101, 6, 64]);
         let constant65_out1 = self.constant65.val();
         let add4_out1 = (constant65_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split1_out3);
-        let reshape5_out1 = add4_out1.reshape([128, -1, 6, 64]);
+        let reshape5_out1 = add4_out1.reshape([16, 101, 6, 64]);
         let transpose3_out1 = reshape5_out1.permute([0, 2, 1, 3]);
-        let reshape6_out1 = add2_out1.reshape([128, -1, 6, 64]);
+        let reshape6_out1 = add2_out1.reshape([16, 101, 6, 64]);
         let transpose4_out1 = reshape6_out1.permute([0, 2, 1, 3]);
         let transpose5_out1 = reshape4_out1.permute([0, 2, 3, 1]);
         let matmul2_k_corrected = transpose5_out1.permute([0, 1, 3, 2]);
@@ -321,7 +321,7 @@ impl<B: Backend> Submodule1<B> {
             (matmul3_out1,)
         };
         let transpose6_out1 = matmul3_out1.permute([0, 2, 1, 3]);
-        let reshape7_out1 = transpose6_out1.reshape([128, 101, 384]);
+        let reshape7_out1 = transpose6_out1.reshape([16, 101, 384]);
         let linear2_out1 = self.linear2.forward(reshape7_out1);
         let constant67_out1 = self.constant67.val();
         let mul3_out1 = linear2_out1
@@ -368,14 +368,14 @@ impl<B: Backend> Submodule1<B> {
         let add9_out1 = (constant76_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split2_out2);
-        let reshape8_out1 = add9_out1.reshape([128, -1, 6, 64]);
+        let reshape8_out1 = add9_out1.reshape([16, 101, 6, 64]);
         let constant77_out1 = self.constant77.val();
         let add10_out1 = (constant77_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split2_out3);
-        let reshape9_out1 = add10_out1.reshape([128, -1, 6, 64]);
+        let reshape9_out1 = add10_out1.reshape([16, 101, 6, 64]);
         let transpose7_out1 = reshape9_out1.permute([0, 2, 1, 3]);
-        let reshape10_out1 = add8_out1.reshape([128, -1, 6, 64]);
+        let reshape10_out1 = add8_out1.reshape([16, 101, 6, 64]);
         let transpose8_out1 = reshape10_out1.permute([0, 2, 1, 3]);
         let transpose9_out1 = reshape8_out1.permute([0, 2, 3, 1]);
         let matmul8_k_corrected = transpose9_out1.permute([0, 1, 3, 2]);
@@ -398,7 +398,7 @@ impl<B: Backend> Submodule1<B> {
             (matmul9_out1,)
         };
         let transpose10_out1 = matmul9_out1.permute([0, 2, 1, 3]);
-        let reshape11_out1 = transpose10_out1.reshape([128, 101, 384]);
+        let reshape11_out1 = transpose10_out1.reshape([16, 101, 384]);
         let linear6_out1 = self.linear6.forward(reshape11_out1);
         let constant79_out1 = self.constant79.val();
         let mul9_out1 = linear6_out1
@@ -618,7 +618,7 @@ impl<B: Backend> Submodule2<B> {
         let mul12_out1 = linear8_out1
             .mul((constant84_out1).unsqueeze_dims(&[0isize, 1isize]));
         let add13_out1 = mul12_out1.add(add11_out1);
-        let reshape12_out1 = add13_out1.clone().reshape([8, -1, 384]);
+        let reshape12_out1 = add13_out1.clone().reshape([1, 1616, 384]);
         let layernormalization5_out1 = {
             let dtype = reshape12_out1.dtype();
             self.layernormalization5
@@ -636,14 +636,14 @@ impl<B: Backend> Submodule2<B> {
         let add15_out1 = (constant88_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split3_out2);
-        let reshape13_out1 = add15_out1.reshape([8, 1616, 6, 64]);
+        let reshape13_out1 = add15_out1.reshape([1, 1616, 6, 64]);
         let constant89_out1 = self.constant89.val();
         let add16_out1 = (constant89_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split3_out3);
-        let reshape14_out1 = add16_out1.reshape([8, 1616, 6, 64]);
+        let reshape14_out1 = add16_out1.reshape([1, 1616, 6, 64]);
         let transpose11_out1 = reshape14_out1.permute([0, 2, 1, 3]);
-        let reshape15_out1 = add14_out1.reshape([8, 1616, 6, 64]);
+        let reshape15_out1 = add14_out1.reshape([1, 1616, 6, 64]);
         let transpose12_out1 = reshape15_out1.permute([0, 2, 1, 3]);
         let transpose13_out1 = reshape13_out1.permute([0, 2, 3, 1]);
         let matmul14_k_corrected = transpose13_out1.permute([0, 1, 3, 2]);
@@ -666,9 +666,9 @@ impl<B: Backend> Submodule2<B> {
             (matmul15_out1,)
         };
         let transpose14_out1 = matmul15_out1.permute([0, 2, 1, 3]);
-        let reshape16_out1 = transpose14_out1.reshape([8, 1616, 384]);
+        let reshape16_out1 = transpose14_out1.reshape([1, 1616, 384]);
         let linear10_out1 = self.linear10.forward(reshape16_out1);
-        let reshape17_out1 = linear10_out1.reshape([128, 101, 384]);
+        let reshape17_out1 = linear10_out1.reshape([16, 101, 384]);
         let constant91_out1 = self.constant91.val();
         let mul15_out1 = reshape17_out1
             .mul((constant91_out1).unsqueeze_dims(&[0isize, 1isize]));
@@ -711,14 +711,14 @@ impl<B: Backend> Submodule2<B> {
         let add21_out1 = (constant100_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split4_out2);
-        let reshape18_out1 = add21_out1.reshape([128, -1, 6, 64]);
+        let reshape18_out1 = add21_out1.reshape([16, 101, 6, 64]);
         let constant101_out1 = self.constant101.val();
         let add22_out1 = (constant101_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split4_out3);
-        let reshape19_out1 = add22_out1.reshape([128, -1, 6, 64]);
+        let reshape19_out1 = add22_out1.reshape([16, 101, 6, 64]);
         let transpose15_out1 = reshape19_out1.permute([0, 2, 1, 3]);
-        let reshape20_out1 = add20_out1.reshape([128, -1, 6, 64]);
+        let reshape20_out1 = add20_out1.reshape([16, 101, 6, 64]);
         let transpose16_out1 = reshape20_out1.permute([0, 2, 1, 3]);
         let transpose17_out1 = reshape18_out1.permute([0, 2, 3, 1]);
         let matmul20_k_corrected = transpose17_out1.permute([0, 1, 3, 2]);
@@ -741,7 +741,7 @@ impl<B: Backend> Submodule2<B> {
             (matmul21_out1,)
         };
         let transpose18_out1 = matmul21_out1.permute([0, 2, 1, 3]);
-        let reshape21_out1 = transpose18_out1.reshape([128, 101, 384]);
+        let reshape21_out1 = transpose18_out1.reshape([16, 101, 384]);
         let linear14_out1 = self.linear14.forward(reshape21_out1);
         let constant103_out1 = self.constant103.val();
         let mul21_out1 = linear14_out1
@@ -963,14 +963,14 @@ impl<B: Backend> Submodule3<B> {
         let add27_out1 = (constant112_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split5_out2);
-        let reshape22_out1 = add27_out1.reshape([128, -1, 6, 64]);
+        let reshape22_out1 = add27_out1.reshape([16, 101, 6, 64]);
         let constant113_out1 = self.constant113.val();
         let add28_out1 = (constant113_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split5_out3);
-        let reshape23_out1 = add28_out1.reshape([128, -1, 6, 64]);
+        let reshape23_out1 = add28_out1.reshape([16, 101, 6, 64]);
         let transpose19_out1 = reshape23_out1.permute([0, 2, 1, 3]);
-        let reshape24_out1 = add26_out1.reshape([128, -1, 6, 64]);
+        let reshape24_out1 = add26_out1.reshape([16, 101, 6, 64]);
         let transpose20_out1 = reshape24_out1.permute([0, 2, 1, 3]);
         let transpose21_out1 = reshape22_out1.permute([0, 2, 3, 1]);
         let matmul26_k_corrected = transpose21_out1.permute([0, 1, 3, 2]);
@@ -993,7 +993,7 @@ impl<B: Backend> Submodule3<B> {
             (matmul27_out1,)
         };
         let transpose22_out1 = matmul27_out1.permute([0, 2, 1, 3]);
-        let reshape25_out1 = transpose22_out1.reshape([128, 101, 384]);
+        let reshape25_out1 = transpose22_out1.reshape([16, 101, 384]);
         let linear18_out1 = self.linear18.forward(reshape25_out1);
         let constant115_out1 = self.constant115.val();
         let mul27_out1 = linear18_out1
@@ -1020,7 +1020,7 @@ impl<B: Backend> Submodule3<B> {
         let mul30_out1 = linear20_out1
             .mul((constant120_out1).unsqueeze_dims(&[0isize, 1isize]));
         let add31_out1 = mul30_out1.add(add29_out1);
-        let reshape26_out1 = add31_out1.clone().reshape([8, -1, 384]);
+        let reshape26_out1 = add31_out1.clone().reshape([1, 1616, 384]);
         let layernormalization11_out1 = {
             let dtype = reshape26_out1.dtype();
             self.layernormalization11
@@ -1038,14 +1038,14 @@ impl<B: Backend> Submodule3<B> {
         let add33_out1 = (constant124_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split6_out2);
-        let reshape27_out1 = add33_out1.reshape([8, 1616, 6, 64]);
+        let reshape27_out1 = add33_out1.reshape([1, 1616, 6, 64]);
         let constant125_out1 = self.constant125.val();
         let add34_out1 = (constant125_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split6_out3);
-        let reshape28_out1 = add34_out1.reshape([8, 1616, 6, 64]);
+        let reshape28_out1 = add34_out1.reshape([1, 1616, 6, 64]);
         let transpose23_out1 = reshape28_out1.permute([0, 2, 1, 3]);
-        let reshape29_out1 = add32_out1.reshape([8, 1616, 6, 64]);
+        let reshape29_out1 = add32_out1.reshape([1, 1616, 6, 64]);
         let transpose24_out1 = reshape29_out1.permute([0, 2, 1, 3]);
         let transpose25_out1 = reshape27_out1.permute([0, 2, 3, 1]);
         let matmul32_k_corrected = transpose25_out1.permute([0, 1, 3, 2]);
@@ -1578,9 +1578,9 @@ impl<B: Backend> Submodule4<B> {
         constant312_out1: Tensor<B, 1>,
         add13_out1: Tensor<B, 3>,
     ) -> Tensor<B, 4> {
-        let reshape30_out1 = transpose26_out1.reshape([8, 1616, 384]);
+        let reshape30_out1 = transpose26_out1.reshape([1, 1616, 384]);
         let linear22_out1 = self.linear22.forward(reshape30_out1);
-        let reshape31_out1 = linear22_out1.reshape([128, 101, 384]);
+        let reshape31_out1 = linear22_out1.reshape([16, 101, 384]);
         let constant127_out1 = self.constant127.val();
         let mul33_out1 = reshape31_out1
             .mul((constant127_out1).unsqueeze_dims(&[0isize, 1isize]));
@@ -1623,14 +1623,14 @@ impl<B: Backend> Submodule4<B> {
         let add39_out1 = (constant136_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split7_out2);
-        let reshape32_out1 = add39_out1.reshape([128, -1, 6, 64]);
+        let reshape32_out1 = add39_out1.reshape([16, 101, 6, 64]);
         let constant137_out1 = self.constant137.val();
         let add40_out1 = (constant137_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split7_out3);
-        let reshape33_out1 = add40_out1.reshape([128, -1, 6, 64]);
+        let reshape33_out1 = add40_out1.reshape([16, 101, 6, 64]);
         let transpose27_out1 = reshape33_out1.permute([0, 2, 1, 3]);
-        let reshape34_out1 = add38_out1.reshape([128, -1, 6, 64]);
+        let reshape34_out1 = add38_out1.reshape([16, 101, 6, 64]);
         let transpose28_out1 = reshape34_out1.permute([0, 2, 1, 3]);
         let transpose29_out1 = reshape32_out1.permute([0, 2, 3, 1]);
         let matmul38_k_corrected = transpose29_out1.permute([0, 1, 3, 2]);
@@ -1653,7 +1653,7 @@ impl<B: Backend> Submodule4<B> {
             (matmul39_out1,)
         };
         let transpose30_out1 = matmul39_out1.permute([0, 2, 1, 3]);
-        let reshape35_out1 = transpose30_out1.reshape([128, 101, 384]);
+        let reshape35_out1 = transpose30_out1.reshape([16, 101, 384]);
         let linear26_out1 = self.linear26.forward(reshape35_out1);
         let constant139_out1 = self.constant139.val();
         let mul39_out1 = linear26_out1
@@ -1697,14 +1697,14 @@ impl<B: Backend> Submodule4<B> {
         let add45_out1 = (constant148_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split8_out2);
-        let reshape36_out1 = add45_out1.reshape([128, -1, 6, 64]);
+        let reshape36_out1 = add45_out1.reshape([16, 101, 6, 64]);
         let constant149_out1 = self.constant149.val();
         let add46_out1 = (constant149_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split8_out3);
-        let reshape37_out1 = add46_out1.reshape([128, -1, 6, 64]);
+        let reshape37_out1 = add46_out1.reshape([16, 101, 6, 64]);
         let transpose31_out1 = reshape37_out1.permute([0, 2, 1, 3]);
-        let reshape38_out1 = add44_out1.reshape([128, -1, 6, 64]);
+        let reshape38_out1 = add44_out1.reshape([16, 101, 6, 64]);
         let transpose32_out1 = reshape38_out1.permute([0, 2, 1, 3]);
         let transpose33_out1 = reshape36_out1.permute([0, 2, 3, 1]);
         let matmul44_k_corrected = transpose33_out1.permute([0, 1, 3, 2]);
@@ -1727,7 +1727,7 @@ impl<B: Backend> Submodule4<B> {
             (matmul45_out1,)
         };
         let transpose34_out1 = matmul45_out1.permute([0, 2, 1, 3]);
-        let reshape39_out1 = transpose34_out1.reshape([128, 101, 384]);
+        let reshape39_out1 = transpose34_out1.reshape([16, 101, 384]);
         let linear30_out1 = self.linear30.forward(reshape39_out1);
         let constant151_out1 = self.constant151.val();
         let mul45_out1 = linear30_out1
@@ -1754,7 +1754,7 @@ impl<B: Backend> Submodule4<B> {
         let mul48_out1 = linear32_out1
             .mul((constant156_out1).unsqueeze_dims(&[0isize, 1isize]));
         let add49_out1 = mul48_out1.add(add47_out1);
-        let reshape40_out1 = add49_out1.clone().reshape([8, -1, 384]);
+        let reshape40_out1 = add49_out1.clone().reshape([1, 1616, 384]);
         let layernormalization17_out1 = {
             let dtype = reshape40_out1.dtype();
             self.layernormalization17
@@ -1772,14 +1772,14 @@ impl<B: Backend> Submodule4<B> {
         let add51_out1 = (constant160_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split9_out2);
-        let reshape41_out1 = add51_out1.reshape([8, 1616, 6, 64]);
+        let reshape41_out1 = add51_out1.reshape([1, 1616, 6, 64]);
         let constant161_out1 = self.constant161.val();
         let add52_out1 = (constant161_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split9_out3);
-        let reshape42_out1 = add52_out1.reshape([8, 1616, 6, 64]);
+        let reshape42_out1 = add52_out1.reshape([1, 1616, 6, 64]);
         let transpose35_out1 = reshape42_out1.permute([0, 2, 1, 3]);
-        let reshape43_out1 = add50_out1.reshape([8, 1616, 6, 64]);
+        let reshape43_out1 = add50_out1.reshape([1, 1616, 6, 64]);
         let transpose36_out1 = reshape43_out1.permute([0, 2, 1, 3]);
         let transpose37_out1 = reshape41_out1.permute([0, 2, 3, 1]);
         let matmul50_k_corrected = transpose37_out1.permute([0, 1, 3, 2]);
@@ -1802,9 +1802,9 @@ impl<B: Backend> Submodule4<B> {
             (matmul51_out1,)
         };
         let transpose38_out1 = matmul51_out1.permute([0, 2, 1, 3]);
-        let reshape44_out1 = transpose38_out1.reshape([8, 1616, 384]);
+        let reshape44_out1 = transpose38_out1.reshape([1, 1616, 384]);
         let linear34_out1 = self.linear34.forward(reshape44_out1);
-        let reshape45_out1 = linear34_out1.reshape([128, 101, 384]);
+        let reshape45_out1 = linear34_out1.reshape([16, 101, 384]);
         let constant163_out1 = self.constant163.val();
         let mul51_out1 = reshape45_out1
             .mul((constant163_out1).unsqueeze_dims(&[0isize, 1isize]));
@@ -1849,14 +1849,14 @@ impl<B: Backend> Submodule4<B> {
         let add57_out1 = (constant172_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split10_out2);
-        let reshape46_out1 = add57_out1.reshape([128, -1, 6, 64]);
+        let reshape46_out1 = add57_out1.reshape([16, 101, 6, 64]);
         let constant173_out1 = self.constant173.val();
         let add58_out1 = (constant173_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split10_out3);
-        let reshape47_out1 = add58_out1.reshape([128, -1, 6, 64]);
+        let reshape47_out1 = add58_out1.reshape([16, 101, 6, 64]);
         let transpose39_out1 = reshape47_out1.permute([0, 2, 1, 3]);
-        let reshape48_out1 = add56_out1.reshape([128, -1, 6, 64]);
+        let reshape48_out1 = add56_out1.reshape([16, 101, 6, 64]);
         let transpose40_out1 = reshape48_out1.permute([0, 2, 1, 3]);
         let transpose41_out1 = reshape46_out1.permute([0, 2, 3, 1]);
         let matmul56_k_corrected = transpose41_out1.permute([0, 1, 3, 2]);
@@ -1879,7 +1879,7 @@ impl<B: Backend> Submodule4<B> {
             (matmul57_out1,)
         };
         let transpose42_out1 = matmul57_out1.permute([0, 2, 1, 3]);
-        let reshape49_out1 = transpose42_out1.reshape([128, 101, 384]);
+        let reshape49_out1 = transpose42_out1.reshape([16, 101, 384]);
         let linear38_out1 = self.linear38.forward(reshape49_out1);
         let constant175_out1 = self.constant175.val();
         let mul57_out1 = linear38_out1
@@ -1925,14 +1925,14 @@ impl<B: Backend> Submodule4<B> {
         let add63_out1 = (constant184_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split11_out2);
-        let reshape50_out1 = add63_out1.reshape([128, -1, 6, 64]);
+        let reshape50_out1 = add63_out1.reshape([16, 101, 6, 64]);
         let constant185_out1 = self.constant185.val();
         let add64_out1 = (constant185_out1)
             .unsqueeze_dims(&[0isize, 1isize])
             .add(split11_out3);
-        let reshape51_out1 = add64_out1.reshape([128, -1, 6, 64]);
+        let reshape51_out1 = add64_out1.reshape([16, 101, 6, 64]);
         let transpose43_out1 = reshape51_out1.permute([0, 2, 1, 3]);
-        let reshape52_out1 = add62_out1.reshape([128, -1, 6, 64]);
+        let reshape52_out1 = add62_out1.reshape([16, 101, 6, 64]);
         let transpose44_out1 = reshape52_out1.permute([0, 2, 1, 3]);
         let transpose45_out1 = reshape50_out1.permute([0, 2, 3, 1]);
         let matmul62_k_corrected = transpose45_out1.permute([0, 1, 3, 2]);
@@ -1955,7 +1955,7 @@ impl<B: Backend> Submodule4<B> {
             (matmul63_out1,)
         };
         let transpose46_out1 = matmul63_out1.permute([0, 2, 1, 3]);
-        let reshape53_out1 = transpose46_out1.reshape([128, 101, 384]);
+        let reshape53_out1 = transpose46_out1.reshape([16, 101, 384]);
         let linear42_out1 = self.linear42.forward(reshape53_out1);
         let constant187_out1 = self.constant187.val();
         let mul63_out1 = linear42_out1
@@ -1989,9 +1989,9 @@ impl<B: Backend> Submodule4<B> {
                 .cast(dtype)
         };
         let slice3_out1 = layernormalization23_out1.slice(s![.., 1.., ..]);
-        let reshape54_out1 = slice3_out1.reshape([32, 4, 10, 10, 384]);
+        let reshape54_out1 = slice3_out1.reshape([-1, 4, 10, 10, 384]);
         let transpose47_out1 = reshape54_out1.permute([0, 2, 1, 3, 4]);
-        let reshape55_out1 = transpose47_out1.reshape([8, 40, 40, -1]);
+        let reshape55_out1 = transpose47_out1.reshape([1, 40, 40, -1]);
         let transpose48_out1 = reshape55_out1.permute([0, 3, 1, 2]);
         let layernormalization24_out1 = {
             let dtype = add31_out1.dtype();
@@ -2000,9 +2000,9 @@ impl<B: Backend> Submodule4<B> {
                 .cast(dtype)
         };
         let slice4_out1 = layernormalization24_out1.slice(s![.., 1.., ..]);
-        let reshape56_out1 = slice4_out1.reshape([32, 4, 10, 10, 384]);
+        let reshape56_out1 = slice4_out1.reshape([-1, 4, 10, 10, 384]);
         let transpose49_out1 = reshape56_out1.permute([0, 2, 1, 3, 4]);
-        let reshape57_out1 = transpose49_out1.reshape([8, 40, 40, -1]);
+        let reshape57_out1 = transpose49_out1.reshape([1, 40, 40, -1]);
         let transpose50_out1 = reshape57_out1.permute([0, 3, 1, 2]);
         let layernormalization25_out1 = {
             let dtype = add49_out1.dtype();
@@ -2011,9 +2011,9 @@ impl<B: Backend> Submodule4<B> {
                 .cast(dtype)
         };
         let slice5_out1 = layernormalization25_out1.slice(s![.., 1.., ..]);
-        let reshape58_out1 = slice5_out1.reshape([32, 4, 10, 10, 384]);
+        let reshape58_out1 = slice5_out1.reshape([-1, 4, 10, 10, 384]);
         let transpose51_out1 = reshape58_out1.permute([0, 2, 1, 3, 4]);
-        let reshape59_out1 = transpose51_out1.reshape([8, 40, 40, -1]);
+        let reshape59_out1 = transpose51_out1.reshape([1, 40, 40, -1]);
         let transpose52_out1 = reshape59_out1.permute([0, 3, 1, 2]);
         let layernormalization26_out1 = {
             let dtype = add67_out1.dtype();
@@ -2022,9 +2022,9 @@ impl<B: Backend> Submodule4<B> {
                 .cast(dtype)
         };
         let slice6_out1 = layernormalization26_out1.slice(s![.., 1.., ..]);
-        let reshape60_out1 = slice6_out1.reshape([32, 4, 10, 10, 384]);
+        let reshape60_out1 = slice6_out1.reshape([-1, 4, 10, 10, 384]);
         let transpose53_out1 = reshape60_out1.permute([0, 2, 1, 3, 4]);
-        let reshape61_out1 = transpose53_out1.reshape([8, 40, 40, -1]);
+        let reshape61_out1 = transpose53_out1.reshape([1, 40, 40, -1]);
         let transpose54_out1 = reshape61_out1.permute([0, 3, 1, 2]);
         let concat3_out1 = burn::tensor::Tensor::cat(
             [transpose48_out1, transpose50_out1, transpose52_out1, transpose54_out1]
@@ -2053,15 +2053,15 @@ pub struct Submodule5<B: Backend> {
     conv2d9: Conv2d<B>,
     layernormalization34: LayerNorm<B>,
     layernormalization35: LayerNorm<B>,
-    constant355: burn::module::Param<Tensor<B, 3, Bool>>,
+    constant352: burn::module::Param<Tensor<B, 3, Bool>>,
     linear45: Linear<B>,
     layernormalization36: LayerNorm<B>,
     linear46: Linear<B>,
     linear47: Linear<B>,
     linear48: Linear<B>,
     linear49: Linear<B>,
-    constant356: burn::module::Param<Tensor<B, 3>>,
-    constant357: burn::module::Param<Tensor<B, 3>>,
+    constant353: burn::module::Param<Tensor<B, 3>>,
+    constant354: burn::module::Param<Tensor<B, 3>>,
     phantom: core::marker::PhantomData<B>,
     #[module(skip)]
     device: B::Device,
@@ -2161,19 +2161,19 @@ impl<B: Backend> Submodule5<B> {
             .with_epsilon(0.0000009999999974752427f64)
             .with_bias(true)
             .init(device);
-        let constant355: burn::module::Param<Tensor<B, 3, Bool>> = burn::module::Param::uninitialized(
+        let constant352: burn::module::Param<Tensor<B, 3, Bool>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
             move |device, _require_grad| Tensor::<
                 B,
                 3,
                 Bool,
             >::empty(
-                [8, 1600, 1],
-                (device, burn::tensor::DType::Bool(burn::tensor::BoolStore::Native)),
+                [1, 1600, 1],
+                (device, burn::tensor::DType::Bool(burn::tensor::BoolStore::U32)),
             ),
             device.clone(),
             false,
-            [8, 1600, 1].into(),
+            [1, 1600, 1].into(),
         );
         let linear45 = LinearConfig::new(256, 256).with_bias(true).init(device);
         let layernormalization36 = LayerNormConfig::new(256)
@@ -2184,25 +2184,25 @@ impl<B: Backend> Submodule5<B> {
         let linear47 = LinearConfig::new(256, 256).with_bias(true).init(device);
         let linear48 = LinearConfig::new(256, 256).with_bias(true).init(device);
         let linear49 = LinearConfig::new(256, 4).with_bias(true).init(device);
-        let constant356: burn::module::Param<Tensor<B, 3>> = burn::module::Param::uninitialized(
+        let constant353: burn::module::Param<Tensor<B, 3>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
             move |device, _require_grad| Tensor::<
                 B,
                 3,
-            >::zeros([8, 1600, 2], (device, burn::tensor::DType::F32)),
+            >::zeros([1, 1600, 2], (device, burn::tensor::DType::F32)),
             device.clone(),
             false,
-            [8, 1600, 2].into(),
+            [1, 1600, 2].into(),
         );
-        let constant357: burn::module::Param<Tensor<B, 3>> = burn::module::Param::uninitialized(
+        let constant354: burn::module::Param<Tensor<B, 3>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
             move |device, _require_grad| Tensor::<
                 B,
                 3,
-            >::zeros([8, 1600, 2], (device, burn::tensor::DType::F32)),
+            >::zeros([1, 1600, 2], (device, burn::tensor::DType::F32)),
             device.clone(),
             false,
-            [8, 1600, 2].into(),
+            [1, 1600, 2].into(),
         );
         Self {
             conv2d2,
@@ -2222,15 +2222,15 @@ impl<B: Backend> Submodule5<B> {
             conv2d9,
             layernormalization34,
             layernormalization35,
-            constant355,
+            constant352,
             linear45,
             layernormalization36,
             linear46,
             linear47,
             linear48,
             linear49,
-            constant356,
-            constant357,
+            constant353,
+            constant354,
             phantom: core::marker::PhantomData,
             device: device.clone(),
         }
@@ -2339,13 +2339,13 @@ impl<B: Backend> Submodule5<B> {
                 .cast(dtype)
         };
         let transpose72_out1 = layernormalization35_out1.permute([0, 3, 1, 2]);
-        let reshape62_out1 = transpose72_out1.reshape([8, 256, -1]);
+        let reshape62_out1 = transpose72_out1.reshape([1, 256, -1]);
         let transpose73_out1 = reshape62_out1.permute([0, 2, 1]);
         let constant315_out1 = 0f32;
-        let constant355_out1 = self.constant355.val();
+        let constant352_out1 = self.constant352.val();
         let where1_out1 = transpose73_out1
             .clone()
-            .mask_fill(constant355_out1, constant315_out1);
+            .mask_fill(constant352_out1, constant315_out1);
         let linear45_out1 = self.linear45.forward(where1_out1);
         let layernormalization36_out1 = {
             let dtype = linear45_out1.dtype();
@@ -2360,13 +2360,13 @@ impl<B: Backend> Submodule5<B> {
         let relu2_out1 = burn::tensor::activation::relu(linear48_out1);
         let linear49_out1 = self.linear49.forward(relu2_out1);
         let slice7_out1 = linear49_out1.clone().slice(s![.., .., 0..2]);
-        let constant356_out1 = self.constant356.val();
-        let mul75_out1 = slice7_out1.mul(constant356_out1.clone());
-        let constant357_out1 = self.constant357.val();
-        let add68_out1 = mul75_out1.add(constant357_out1);
+        let constant353_out1 = self.constant353.val();
+        let mul75_out1 = slice7_out1.mul(constant353_out1.clone());
+        let constant354_out1 = self.constant354.val();
+        let add68_out1 = mul75_out1.add(constant354_out1);
         let slice8_out1 = linear49_out1.slice(s![.., .., 2..]);
         let exp1_out1 = slice8_out1.exp();
-        let mul76_out1 = exp1_out1.mul(constant356_out1);
+        let mul76_out1 = exp1_out1.mul(constant353_out1);
         let concat5_out1 = burn::tensor::Tensor::cat([add68_out1, mul76_out1].into(), 2);
         let reducemax1_out1 = {
             linear46_out1.max_dim(2usize).squeeze_dims::<2usize>(&[2])
@@ -2381,13 +2381,13 @@ impl<B: Backend> Submodule5<B> {
 }
 #[derive(Module, Debug)]
 pub struct Submodule6<B: Backend> {
-    constant359: burn::module::Param<Tensor<B, 3>>,
-    constant360: burn::module::Param<Tensor<B, 3>>,
+    constant356: burn::module::Param<Tensor<B, 3>>,
+    constant357: burn::module::Param<Tensor<B, 3>>,
     constant318: burn::module::Param<Tensor<B, 1>>,
     constant319: burn::module::Param<Tensor<B, 1>>,
     linear50: Linear<B>,
     linear51: Linear<B>,
-    constant358: burn::module::Param<Tensor<B, 3>>,
+    constant355: burn::module::Param<Tensor<B, 3>>,
     phantom: core::marker::PhantomData<B>,
     #[module(skip)]
     device: B::Device,
@@ -2395,25 +2395,25 @@ pub struct Submodule6<B: Backend> {
 impl<B: Backend> Submodule6<B> {
     #[allow(unused_variables)]
     pub fn new(device: &B::Device) -> Self {
-        let constant359: burn::module::Param<Tensor<B, 3>> = burn::module::Param::uninitialized(
+        let constant356: burn::module::Param<Tensor<B, 3>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
             move |device, _require_grad| Tensor::<
                 B,
                 3,
-            >::zeros([8, 300, 2], (device, burn::tensor::DType::F32)),
+            >::zeros([1, 300, 2], (device, burn::tensor::DType::F32)),
             device.clone(),
             false,
-            [8, 300, 2].into(),
+            [1, 300, 2].into(),
         );
-        let constant360: burn::module::Param<Tensor<B, 3>> = burn::module::Param::uninitialized(
+        let constant357: burn::module::Param<Tensor<B, 3>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
             move |device, _require_grad| Tensor::<
                 B,
                 3,
-            >::zeros([8, 300, 2], (device, burn::tensor::DType::F32)),
+            >::zeros([1, 300, 2], (device, burn::tensor::DType::F32)),
             device.clone(),
             false,
-            [8, 300, 2].into(),
+            [1, 300, 2].into(),
         );
         let constant318: burn::module::Param<Tensor<B, 1>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
@@ -2440,24 +2440,24 @@ impl<B: Backend> Submodule6<B> {
         );
         let linear50 = LinearConfig::new(512, 256).with_bias(true).init(device);
         let linear51 = LinearConfig::new(256, 256).with_bias(true).init(device);
-        let constant358: burn::module::Param<Tensor<B, 3>> = burn::module::Param::uninitialized(
+        let constant355: burn::module::Param<Tensor<B, 3>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
             move |device, _require_grad| Tensor::<
                 B,
                 3,
-            >::zeros([8, 300, 256], (device, burn::tensor::DType::F32)),
+            >::zeros([1, 300, 256], (device, burn::tensor::DType::F32)),
             device.clone(),
             false,
-            [8, 300, 256].into(),
+            [1, 300, 256].into(),
         );
         Self {
-            constant359,
-            constant360,
+            constant356,
+            constant357,
             constant318,
             constant319,
             linear50,
             linear51,
-            constant358,
+            constant355,
             phantom: core::marker::PhantomData,
             device: device.clone(),
         }
@@ -2468,12 +2468,12 @@ impl<B: Backend> Submodule6<B> {
         gatherelements1_out1: Tensor<B, 3>,
     ) -> (Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 3>) {
         let slice9_out1 = gatherelements1_out1.clone().slice(s![.., .., 2..]);
-        let constant359_out1 = self.constant359.val();
-        let mul77_out1 = constant359_out1.mul(slice9_out1.clone());
+        let constant356_out1 = self.constant356.val();
+        let mul77_out1 = constant356_out1.mul(slice9_out1.clone());
         let slice10_out1 = gatherelements1_out1.slice(s![.., .., 0..2]);
         let add69_out1 = mul77_out1.add(slice10_out1);
-        let constant360_out1 = self.constant360.val();
-        let mul78_out1 = constant360_out1.mul(slice9_out1);
+        let constant357_out1 = self.constant357.val();
+        let mul78_out1 = constant357_out1.mul(slice9_out1);
         let concat6_out1 = burn::tensor::Tensor::cat([add69_out1, mul78_out1].into(), 2);
         let slice11_out1 = concat6_out1.clone().slice(s![.., .., 0..4]);
         let gather1_out1 = {
@@ -2506,7 +2506,7 @@ impl<B: Backend> Submodule6<B> {
             [unsqueeze4_out1, unsqueeze5_out1].into(),
             3,
         );
-        let reshape63_out1 = concat7_out1.reshape([8, 300, -1]);
+        let reshape63_out1 = concat7_out1.reshape([1, 300, -1]);
         let slice14_out1 = div13_out1.clone().slice(s![.., .., 0..; 2]);
         let sin2_out1 = slice14_out1.sin();
         let slice15_out1 = div13_out1.slice(s![.., .., 1..; 2]);
@@ -2517,7 +2517,7 @@ impl<B: Backend> Submodule6<B> {
             [unsqueeze6_out1, unsqueeze7_out1].into(),
             3,
         );
-        let reshape64_out1 = concat8_out1.reshape([8, 300, -1]);
+        let reshape64_out1 = concat8_out1.reshape([1, 300, -1]);
         let gather3_out1 = {
             let sliced = slice11_out1.clone().slice(s![.., .., 2]);
             sliced.squeeze_dim::<2usize>(2)
@@ -2537,7 +2537,7 @@ impl<B: Backend> Submodule6<B> {
             [unsqueeze9_out1, unsqueeze10_out1].into(),
             3,
         );
-        let reshape65_out1 = concat9_out1.reshape([8, 300, -1]);
+        let reshape65_out1 = concat9_out1.reshape([1, 300, -1]);
         let gather4_out1 = {
             let sliced = slice11_out1.clone().slice(s![.., .., 3]);
             sliced.squeeze_dim::<2usize>(2)
@@ -2556,7 +2556,7 @@ impl<B: Backend> Submodule6<B> {
             [unsqueeze12_out1, unsqueeze13_out1].into(),
             3,
         );
-        let reshape66_out1 = concat10_out1.reshape([8, 300, -1]);
+        let reshape66_out1 = concat10_out1.reshape([1, 300, -1]);
         let concat11_out1 = burn::tensor::Tensor::cat(
             [reshape64_out1, reshape63_out1, reshape65_out1, reshape66_out1].into(),
             2,
@@ -2564,15 +2564,15 @@ impl<B: Backend> Submodule6<B> {
         let linear50_out1 = self.linear50.forward(concat11_out1);
         let relu3_out1 = burn::tensor::activation::relu(linear50_out1);
         let linear51_out1 = self.linear51.forward(relu3_out1);
-        let constant358_out1 = self.constant358.val();
-        (constant358_out1, linear51_out1, slice11_out1, concat6_out1)
+        let constant355_out1 = self.constant355.val();
+        (constant355_out1, linear51_out1, slice11_out1, concat6_out1)
     }
 }
 #[derive(Module, Debug)]
 pub struct Submodule7<B: Backend> {
     linear52: Linear<B>,
     linear53: Linear<B>,
-    constant367: burn::module::Param<Tensor<B, 4>>,
+    constant366: burn::module::Param<Tensor<B, 4>>,
     linear54: Linear<B>,
     layernormalization37: LayerNorm<B>,
     linear55: Linear<B>,
@@ -2597,15 +2597,15 @@ impl<B: Backend> Submodule7<B> {
     pub fn new(device: &B::Device) -> Self {
         let linear52 = LinearConfig::new(256, 256).with_bias(true).init(device);
         let linear53 = LinearConfig::new(256, 256).with_bias(true).init(device);
-        let constant367: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
+        let constant366: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
             move |device, _require_grad| Tensor::<
                 B,
                 4,
-            >::zeros([8, 8, 300, 32], (device, burn::tensor::DType::F32)),
+            >::zeros([1, 8, 300, 32], (device, burn::tensor::DType::F32)),
             device.clone(),
             false,
-            [8, 8, 300, 32].into(),
+            [1, 8, 300, 32].into(),
         );
         let linear54 = LinearConfig::new(256, 256)
             .with_bias(true)
@@ -2652,7 +2652,7 @@ impl<B: Backend> Submodule7<B> {
         Self {
             linear52,
             linear53,
-            constant367,
+            constant366,
             linear54,
             layernormalization37,
             linear55,
@@ -2675,14 +2675,14 @@ impl<B: Backend> Submodule7<B> {
     #[allow(clippy::let_and_return, clippy::approx_constant)]
     pub fn forward(
         &self,
-        constant358_out1: Tensor<B, 3>,
+        constant355_out1: Tensor<B, 3>,
         linear51_out1: Tensor<B, 3>,
         transpose73_out1: Tensor<B, 3>,
         slice11_out1: Tensor<B, 3>,
         constant312_out1: Tensor<B, 1>,
         constant311_out1: Tensor<B, 1>,
     ) -> (Tensor<B, 3>, Tensor<B, 1>, Tensor<B, 6>, Tensor<B, 6>) {
-        let add70_out1 = constant358_out1.clone().add(linear51_out1.clone());
+        let add70_out1 = constant355_out1.clone().add(linear51_out1.clone());
         let transpose74_out1 = add70_out1.permute([1, 0, 2]);
         let linear52_out1 = self.linear52.forward(transpose74_out1.clone());
         let linear53_out1 = self.linear53.forward(transpose74_out1);
@@ -2692,11 +2692,11 @@ impl<B: Backend> Submodule7<B> {
         let transpose76_out1 = reshape68_out1.permute([1, 0, 2]);
         let reshape69_out1 = transpose75_out1.reshape([-1, 8, 300, 32]);
         let reshape70_out1 = transpose76_out1.reshape([-1, 8, 300, 32]);
-        let constant367_out1 = self.constant367.val();
+        let constant366_out1 = self.constant366.val();
         let (matmul77_out1,) = {
             let q = reshape69_out1;
             let k = reshape70_out1;
-            let v = constant367_out1;
+            let v = constant366_out1;
             let matmul77_out1 = burn::tensor::module::attention(
                 q,
                 k,
@@ -2716,7 +2716,7 @@ impl<B: Backend> Submodule7<B> {
         let linear54_out1 = self.linear54.forward(reshape71_out1);
         let reshape72_out1 = linear54_out1.reshape([300, -1, 256]);
         let transpose79_out1 = reshape72_out1.permute([1, 0, 2]);
-        let add71_out1 = constant358_out1.add(transpose79_out1);
+        let add71_out1 = constant355_out1.add(transpose79_out1);
         let layernormalization37_out1 = {
             let dtype = add71_out1.dtype();
             self.layernormalization37
@@ -2748,7 +2748,7 @@ impl<B: Backend> Submodule7<B> {
         let add73_out1 = slice20_out1.clone().add(mul86_out1);
         let softmax13_out1 = burn::tensor::activation::softmax(reshape74_out1, 3);
         let transpose80_out1 = linear55_out1.permute([0, 2, 1]);
-        let reshape75_out1 = transpose80_out1.reshape([8, 16, 16, 1600]);
+        let reshape75_out1 = transpose80_out1.reshape([1, 16, 16, 1600]);
         let slice22_out1 = reshape75_out1.slice(s![.., .., .., 0..1600]);
         let mul87_out1 = add73_out1
             .mul(
@@ -2760,7 +2760,7 @@ impl<B: Backend> Submodule7<B> {
                 (constant311_out1)
                     .unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize, 4isize]),
             );
-        let reshape76_out1 = slice22_out1.reshape([128, 16, 40, 40]);
+        let reshape76_out1 = slice22_out1.reshape([16, 16, 40, 40]);
         let gather5_out1 = {
             let sliced = sub1_out1.slice(s![.., .., .., 0, .., ..]);
             sliced.squeeze_dim::<5usize>(3)
@@ -2779,12 +2779,12 @@ impl<B: Backend> Submodule7<B> {
         let transpose82_out1 = softmax13_out1.permute([0, 2, 1, 3]);
         let reshape78_out1 = transpose82_out1.reshape([-1, 1, 300, 2]);
         let unsqueeze15_out1: Tensor<B, 5> = gridsample1_out1.unsqueeze_dims::<5>(&[-2]);
-        let reshape79_out1 = unsqueeze15_out1.reshape([128, 16, 300, -1]);
+        let reshape79_out1 = unsqueeze15_out1.reshape([16, 16, 300, -1]);
         let mul88_out1 = reshape79_out1.mul(reshape78_out1);
         let reducesum1_out1 = {
             mul88_out1.sum_dim(3usize).squeeze_dims::<3usize>(&[3])
         };
-        let reshape80_out1 = reducesum1_out1.reshape([8, 256, 300]);
+        let reshape80_out1 = reducesum1_out1.reshape([1, 256, 300]);
         let transpose83_out1 = reshape80_out1.permute([0, 2, 1]);
         let linear58_out1 = self.linear58.forward(transpose83_out1);
         let add74_out1 = layernormalization37_out1.add(linear58_out1);
@@ -3004,7 +3004,7 @@ impl<B: Backend> Submodule8<B> {
         let add79_out1 = slice20_out1.clone().add(mul92_out1);
         let softmax15_out1 = burn::tensor::activation::softmax(reshape90_out1, 3);
         let transpose92_out1 = linear65_out1.permute([0, 2, 1]);
-        let reshape91_out1 = transpose92_out1.reshape([8, 16, 16, 1600]);
+        let reshape91_out1 = transpose92_out1.reshape([1, 16, 16, 1600]);
         let slice23_out1 = reshape91_out1.slice(s![.., .., .., 0..1600]);
         let mul93_out1 = add79_out1
             .mul(
@@ -3016,7 +3016,7 @@ impl<B: Backend> Submodule8<B> {
                 (constant311_out1.clone())
                     .unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize, 4isize]),
             );
-        let reshape92_out1 = slice23_out1.reshape([128, 16, 40, 40]);
+        let reshape92_out1 = slice23_out1.reshape([16, 16, 40, 40]);
         let gather6_out1 = {
             let sliced = sub2_out1.slice(s![.., .., .., 0, .., ..]);
             sliced.squeeze_dim::<5usize>(3)
@@ -3035,12 +3035,12 @@ impl<B: Backend> Submodule8<B> {
         let transpose94_out1 = softmax15_out1.permute([0, 2, 1, 3]);
         let reshape94_out1 = transpose94_out1.reshape([-1, 1, 300, 2]);
         let unsqueeze16_out1: Tensor<B, 5> = gridsample2_out1.unsqueeze_dims::<5>(&[-2]);
-        let reshape95_out1 = unsqueeze16_out1.reshape([128, 16, 300, -1]);
+        let reshape95_out1 = unsqueeze16_out1.reshape([16, 16, 300, -1]);
         let mul94_out1 = reshape95_out1.mul(reshape94_out1);
         let reducesum2_out1 = {
             mul94_out1.sum_dim(3usize).squeeze_dims::<3usize>(&[3])
         };
-        let reshape96_out1 = reducesum2_out1.reshape([8, 256, 300]);
+        let reshape96_out1 = reducesum2_out1.reshape([1, 256, 300]);
         let transpose95_out1 = reshape96_out1.permute([0, 2, 1]);
         let linear68_out1 = self.linear68.forward(transpose95_out1);
         let add80_out1 = layernormalization40_out1.add(linear68_out1);
@@ -3125,7 +3125,7 @@ impl<B: Backend> Submodule8<B> {
         let add85_out1 = slice20_out1.add(mul98_out1);
         let softmax17_out1 = burn::tensor::activation::softmax(reshape106_out1, 3);
         let transpose104_out1 = linear75_out1.permute([0, 2, 1]);
-        let reshape107_out1 = transpose104_out1.reshape([8, 16, 16, 1600]);
+        let reshape107_out1 = transpose104_out1.reshape([1, 16, 16, 1600]);
         let slice24_out1 = reshape107_out1.slice(s![.., .., .., 0..1600]);
         let mul99_out1 = add85_out1
             .mul(
@@ -3137,7 +3137,7 @@ impl<B: Backend> Submodule8<B> {
                 (constant311_out1)
                     .unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize, 4isize]),
             );
-        let reshape108_out1 = slice24_out1.reshape([128, 16, 40, 40]);
+        let reshape108_out1 = slice24_out1.reshape([16, 16, 40, 40]);
         let gather7_out1 = {
             let sliced = sub3_out1.slice(s![.., .., .., 0, .., ..]);
             sliced.squeeze_dim::<5usize>(3)
@@ -3156,12 +3156,12 @@ impl<B: Backend> Submodule8<B> {
         let transpose106_out1 = softmax17_out1.permute([0, 2, 1, 3]);
         let reshape110_out1 = transpose106_out1.reshape([-1, 1, 300, 2]);
         let unsqueeze17_out1: Tensor<B, 5> = gridsample3_out1.unsqueeze_dims::<5>(&[-2]);
-        let reshape111_out1 = unsqueeze17_out1.reshape([128, 16, 300, -1]);
+        let reshape111_out1 = unsqueeze17_out1.reshape([16, 16, 300, -1]);
         let mul100_out1 = reshape111_out1.mul(reshape110_out1);
         let reducesum3_out1 = {
             mul100_out1.sum_dim(3usize).squeeze_dims::<3usize>(&[3])
         };
-        let reshape112_out1 = reducesum3_out1.reshape([8, 256, 300]);
+        let reshape112_out1 = reducesum3_out1.reshape([1, 256, 300]);
         let transpose107_out1 = reshape112_out1.permute([0, 2, 1]);
         let linear78_out1 = self.linear78.forward(transpose107_out1);
         let add86_out1 = layernormalization43_out1.add(linear78_out1);
@@ -3230,7 +3230,7 @@ extern crate std;
 impl<B: Backend> Default for Model<B> {
     fn default() -> Self {
         Self::from_file(
-            "/tmp/onnx2gen-2122917-rfdetr-base-b8/rfdetr-base-b8.bpk",
+            "/tmp/onnx2gen-1723799-rfdetr-base-simp/rfdetr-base-simp.bpk",
             &Default::default(),
         )
     }
@@ -3315,13 +3315,13 @@ impl<B: Backend> Model<B> {
         let (gatherelements1_out1, transpose73_out1) = self
             .submodule5
             .forward(concat3_out1);
-        let (constant358_out1, linear51_out1, slice11_out1, concat6_out1) = self
+        let (constant355_out1, linear51_out1, slice11_out1, concat6_out1) = self
             .submodule6
             .forward(gatherelements1_out1);
         let (add77_out1, constant321_out1, slice21_out1, slice20_out1) = self
             .submodule7
             .forward(
-                constant358_out1,
+                constant355_out1,
                 linear51_out1.clone(),
                 transpose73_out1.clone(),
                 slice11_out1,

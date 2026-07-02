@@ -139,6 +139,8 @@ pub(crate) fn to_wire(msg: DetectionsMessage) -> CameraDetectionsFrame {
     CameraDetectionsFrame {
         camera_id: msg.camera_id,
         ts_ms: msg.ts_ms,
+        pts_ns: msg.pts_ns,
+        proc_ms: msg.proc_ms,
         items: msg.items.into_iter().map(item_to_wire).collect(),
     }
 }
@@ -150,6 +152,9 @@ fn item_to_wire(d: Detection) -> DetectionItem {
         score: d.score,
         stan: d.stan,
         tekst: d.tekst,
+        track_id: d.track_id,
+        vx: d.vx,
+        vy: d.vy,
     }
 }
 
@@ -272,6 +277,8 @@ mod tests {
             msg_type: "detections",
             camera_id: "cam_550e8400-e29b-41d4-a716-446655440000".into(),
             ts_ms: 1_700_000_000_123,
+            pts_ns: Some(1_234_567_890),
+            proc_ms: 42,
             items: vec![
                 Detection {
                     klasa: "tablica_adr".into(),
@@ -279,6 +286,9 @@ mod tests {
                     score: 0.96,
                     stan: Vec::new(),
                     tekst: Some("30/1202".into()),
+                    track_id: 7,
+                    vx: 0.01,
+                    vy: -0.02,
                 },
                 Detection {
                     klasa: "nalepka_3".into(),
@@ -286,6 +296,9 @@ mod tests {
                     score: 0.94,
                     stan: vec!["uszkodzona".into()],
                     tekst: None,
+                    track_id: 0,
+                    vx: 0.,
+                    vy: 0.,
                 },
             ],
         };
@@ -313,12 +326,17 @@ mod tests {
         detection_bus::publish_detections(
             cam,
             0,
+            None,
+            0,
             vec![Detection {
                 klasa: "termometr".into(),
                 bbox: [0.1, 0.1, 0.2, 0.2],
                 score: 0.5,
                 stan: Vec::new(),
                 tekst: None,
+                track_id: 0,
+                vx: 0.,
+                vy: 0.,
             }],
         );
 
@@ -336,12 +354,17 @@ mod tests {
             detection_bus::publish_detections(
                 cam,
                 0,
+                None,
+                0,
                 vec![Detection {
                     klasa: "nalepka_9".into(),
                     bbox: [0.0, 0.0, 0.1, 0.1],
                     score: 0.9,
                     stan: Vec::new(),
                     tekst: None,
+                    track_id: 0,
+                    vx: 0.,
+                    vy: 0.,
                 }],
             );
         }

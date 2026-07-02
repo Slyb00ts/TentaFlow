@@ -220,6 +220,7 @@ export class BinaryWsClient {
     this.connected = false;
     this._stopHeartbeat();
     this._rejectAllPending(new Error(`transport closed: ${info?.reason ?? 'unknown'}`));
+    this._endAllSubscriptions('transport_closed');
     if (this._transportUnsub) this._transportUnsub();
     if (this._transportCloseUnsub) this._transportCloseUnsub();
     this.transport = null;
@@ -455,6 +456,36 @@ export class BinaryWsClient {
   _rejectAllPending(err) {
     for (const { reject } of this.pending.values()) reject(err);
     this.pending.clear();
+  }
+
+  /**
+   * Dostarcza wszystkim aktywnym subskrypcjom syntetyczny StreamEnd po padzie
+   * transportu. Serwer trzyma subskrypcje per-socket — po reconnect stare
+   * correlation_id sa martwe, wiec bez tego handlery streamow (wideo/detekcje)
+   * nigdy nie dostalyby konca strumienia i wisialyby zamrozone. Format frame'u
+   * zgodny z prawdziwym terminalem: envelope.isStreamEnd=true + body z `reason`
+   * (jak StreamClosedPayload z serwera).
+   */
+  _endAllSubscriptions(reason) {
+    if (this.subscribers.size === 0) return;
+    const entries = [...this.subscribers.entries()];
+    this.subscribers.clear();
+    for (const [correlationKey, handler] of entries) {
+      try {
+        handler({
+          envelope: {
+            correlationId: correlationKey,
+            isError: false,
+            isStreamChunk: false,
+            isStreamEnd: true,
+          },
+          body: { variant: 'StreamClosed', stream_id: '', reason },
+        });
+      } catch (err) {
+        console.error('[ws] subscriber end handler threw:', err);
+      }
+    }
+    console.warn(`[ws] zamknieto ${entries.length} subskrypcji (${reason})`);
   }
 
   _scheduleReconnect(reason) {

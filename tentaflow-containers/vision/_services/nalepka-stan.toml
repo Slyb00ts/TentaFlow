@@ -17,6 +17,8 @@ icon = "vision"
 default_port = 0
 api = "custom"
 version = "mnv4-2026"
+service_surfaces = ["camera_cv"]
+input_modalities = ["image"]
 
 [deploy.native]
 platforms = ["linux", "macos", "windows"]

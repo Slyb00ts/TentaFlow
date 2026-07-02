@@ -90,6 +90,7 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
     seed_prompts(&tx)?;
     seed_default_flows(&tx)?;
     seed_camera_analysis_flow(&tx)?;
+    seed_camera_cv_aliases(&tx)?;
     seed_harness_flows(&tx)?;
     seed_system_agents(&tx)?;
 
@@ -1131,6 +1132,43 @@ fn seed_camera_analysis_flow(conn: &Connection) -> Result<()> {
     )?;
     if inserted > 0 {
         info!("seed: utworzono domyslny flow analizy kamery '{}'", NAME);
+    }
+    Ok(())
+}
+
+/// Seeduje aliasy modeli CV dla kamer (`tentavision-*`). Cele to identyfikatory
+/// presetow z manifestow `tentaflow-containers/vision/_services/*.toml`
+/// (`models_from_manifest` reklamuje w katalogu `model_preset.id`, bo silniki
+/// sa embedded native, nie cloud external). Flow analizy kamery (patrz
+/// `CAMERA_ANALYSIS_FLOW_JSON`) i executor kamer adresuja modele wylacznie
+/// przez te aliasy, wiec podmiana modelu to edycja aliasu, nie flow.
+/// Idempotentne: `alias` ma UNIQUE, INSERT OR IGNORE nie nadpisuje edycji
+/// uzytkownika. `fallback_targets` to JSON-owa lista (konwencja repository).
+fn seed_camera_cv_aliases(conn: &Connection) -> Result<()> {
+    // (alias, preset docelowy, fallbacki JSON)
+    let aliases: &[(&str, &str, Option<&str>)] = &[
+        ("tentavision-detect", "rfdetr-adr-base", None),
+        ("tentavision-stan", "nalepka-stan-mnv4", None),
+        // OCR: preset tablic rejestracyjnych, z fallbackiem na ogolne OCR
+        // (PP-OCRv5 na Linux/Windows, Apple Vision na macOS).
+        (
+            "tentavision-ocr",
+            "plate-ocr-fast",
+            Some(r#"["ppocrv5-mobile-onnx","apple-vision-ocr"]"#),
+        ),
+        // Uzywany przez wezel `vision_classify` w seedowanym flow analizy
+        // kamery — spojny z domyslnym klasyfikatorem stanu nalepek.
+        ("tentavision-action", "nalepka-stan-mnv4", None),
+    ];
+    let mut stmt = conn.prepare(
+        "INSERT OR IGNORE INTO model_aliases (alias, target_model, fallback_targets) \
+         VALUES (?1, ?2, ?3)",
+    )?;
+    for (alias, target, fallbacks) in aliases {
+        let inserted = stmt.execute(rusqlite::params![alias, target, fallbacks])?;
+        if inserted > 0 {
+            info!("seed: utworzono alias CV '{}' -> '{}'", alias, target);
+        }
     }
     Ok(())
 }

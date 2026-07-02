@@ -25,10 +25,16 @@ use tracing::{debug, info, warn};
 
 use crate::services::detection_bus::Detection;
 
+use super::tracker;
 use crate::services::detection_bus;
 use crate::vision::classifier_stan::StateClassifier;
-use crate::vision::detector_rfdetr::RfDetrDetector;
+use crate::vision::detector_rfdetr::{RfDetrDetector, MODEL_BATCH};
 use crate::vision::ocr_plate::PlateOcr;
+use crate::flow_engine::dispatchers_impl::ModelRuntimeSlot;
+use crate::services::runtime::context::ExecutionContext as RuntimeContext;
+use crate::services::runtime::executor::ModelRuntimeExecutor;
+use crate::services::runtime::local_cv::{CameraCvOpLocal, CameraCvRequest, CvFrameLocal};
+use tentaflow_protocol::{CameraCvResult, CvDetection, CvOcrMode};
 
 /// Floor interval for `analysis_fps = 0` (unlimited). ~30 fps native cadence —
 /// a hard floor so the loop never busy-spins waiting on frames; inference on CPU
@@ -70,7 +76,7 @@ fn detector() -> &'static OnceCell<Option<std::sync::Arc<Mutex<RfDetrDetector>>>
     &DETECTOR
 }
 
-async fn get_detector() -> Option<std::sync::Arc<Mutex<RfDetrDetector>>> {
+pub(crate) async fn get_detector() -> Option<std::sync::Arc<Mutex<RfDetrDetector>>> {
     detector()
         .get_or_init(|| async {
             // Loading touches the filesystem + builds an ONNX session; keep it
@@ -142,6 +148,49 @@ pub(crate) async fn get_ocr() -> Option<std::sync::Arc<Mutex<PlateOcr>>> {
         .clone()
 }
 
+/// Aliasy katalogowe operacji CV wykonywanych przez executor (seed
+/// `seed_camera_cv_aliases` gwarantuje ich istnienie w katalogu).
+const CV_DETECT_ALIAS: &str = "tentavision-detect";
+const CV_CLASSIFY_ALIAS: &str = "tentavision-stan";
+const CV_OCR_ALIAS: &str = "tentavision-ocr";
+
+/// Slot executora runtime współdzielony z routerem (`Router.executor`).
+/// Ustawiany raz przez `set_runtime_slot` przy inicjalizacji routera; sam slot
+/// jest `RwLock<Option<..>>`, więc executor może pojawić się później — pętla
+/// czyta go świeżo przy każdym użyciu i spada na ścieżkę bezpośrednią, gdy
+/// jest pusty (bootstrap/testy — zero regresji).
+fn runtime_slot_cell() -> &'static OnceLock<ModelRuntimeSlot> {
+    static S: OnceLock<ModelRuntimeSlot> = OnceLock::new();
+    &S
+}
+
+/// Wpina slot executora routera do silnika analizy. Idempotentne — pierwszy
+/// zapis wygrywa (router tworzy jeden slot na proces).
+pub fn set_runtime_slot(slot: ModelRuntimeSlot) {
+    let _ = runtime_slot_cell().set(slot);
+}
+
+/// Aktualny executor runtime albo `None` (slot niewpięty / jeszcze pusty).
+fn runtime_executor() -> Option<Arc<ModelRuntimeExecutor>> {
+    runtime_slot_cell().get().and_then(|s| s.read().as_ref().cloned())
+}
+
+/// Ostrzeżenie o fallbacku z executora na ścieżkę bezpośrednią, ograniczone do
+/// jednego wpisu na ~30 s — błąd executora może dotyczyć każdej klatki, więc
+/// bez limitu log byłby zalany przy 10 fps × N kamer.
+fn warn_executor_fallback(stage: &str, err: &str) {
+    const WARN_EVERY: Duration = Duration::from_secs(30);
+    static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    let last = LAST.get_or_init(|| Mutex::new(None));
+    let mut guard = last.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.map(|t| t.elapsed() >= WARN_EVERY).unwrap_or(true) {
+        *guard = Some(Instant::now());
+        warn!(
+            "[vision_analysis] executor {stage} nieudany, fallback na ścieżkę bezpośrednią: {err}"
+        );
+    }
+}
+
 /// True for detection classes whose condition we classify (placards/labels,
 /// the environmental/temperature marks). Tablice ADR i rejestracyjne też
 /// oceniamy stanem (np. czytelność/uszkodzenie), więc kwalifikują się tutaj.
@@ -166,9 +215,14 @@ fn crop_rgb(frame: &[u8], frame_w: u32, x0: u32, y0: u32, cw: u32, ch: u32) -> V
     out
 }
 
-/// Max cameras stacked into a single detector `Session::run`. One GPU launch is
-/// amortized across the batch — the fleet throughput lever.
-const MAX_BATCH: usize = 16;
+/// Okno flush time-batchingu: co ~8 ms robimy flush z tym, co aktualnie jest w
+/// `pending`, NIEZALEŻNIE od tego ile się nazbierało — batch NIE musi być pełny.
+/// Wcześniejszy flush (bez czekania na okno) następuje tylko, gdy `pending`
+/// osiągnie pełny chunk `MODEL_BATCH`. Krótkie okno trzyma latencję nisko przy
+/// MAŁEJ liczbie kamer: klatka nie czeka na dopełnienie batcha, lecz wychodzi
+/// do forwardu w ciągu ~8 ms (flush z tym, co jest; reszta chunku dopełniana
+/// paddingiem w `detect_batch`).
+const MAX_BATCH_WAIT: Duration = Duration::from_millis(8);
 
 /// Longest idle nap when no camera is due. The loop normally runs back-to-back
 /// (continuous batching); this only caps how stale the "nothing due" wait can be
@@ -228,6 +282,9 @@ pub fn ensure_analysis(camera_id: &str) {
 /// so the ONNX sessions and frame-pull loop stop before GStreamer tears down.
 pub fn drain() {
     cameras().lock().unwrap().clear();
+    // Drain czysci wszystkie kamery naraz — wyczysc rowniez caly stan trackera,
+    // by po restarcie analizy nie zostal martwy stan (tracki, licznik id).
+    tracker::clear();
     if let Some(handle) = engine_handle().lock().unwrap().take() {
         handle.abort();
     }
@@ -242,6 +299,10 @@ pub fn drain() {
     // those cameras after a restart.
     cold_state().lock().unwrap().clear();
     cold_bytes().store(0, AtomicOrdering::Relaxed);
+    // Cache wzbogacania trzyma stan/OCR per (camera_id, track_id) — po drainie
+    // tracki znikaja (tracker::clear resetuje licznik id), wiec stare wpisy
+    // musza zniknac, by nie przypisac stanu do przypadkiem powtorzonego id.
+    enrich_cache().lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 /// Spawns the single engine task if it is not already running.
@@ -253,9 +314,13 @@ fn start_engine_once() {
 }
 
 /// The one process-wide analysis engine: collects cameras whose per-FPS
-/// deadline elapsed, batches up to [`MAX_BATCH`] latest frames into a single
-/// detector run, then per camera classifies state + reads plates on crops and
-/// publishes. Cross-camera batching is what scales to thousands of cameras.
+/// deadline elapsed, akumuluje ich NOWE klatki w buforze `pending` i flushuje
+/// je do detektora chunkami po [`MODEL_BATCH`], gdy bufor się wypełni ALBO gdy
+/// najstarsza klatka czeka dłużej niż [`MAX_BATCH_WAIT`]. Then per camera
+/// classifies state + reads plates on crops and publishes. Time-batching sprawia,
+/// że nawet POJEDYNCZA szybka kamera wypełnia batch własnymi klatkami (zamiast
+/// płacić za 7 slotów paddingu na tick), a przy wielu kamerach flush jest
+/// cross-camera i natychmiastowy.
 async fn engine_loop() {
     let detector = match get_detector().await {
         Some(d) => d,
@@ -263,7 +328,21 @@ async fn engine_loop() {
     };
     let cold = ensure_cold_started();
     let mut last_metrics = Instant::now();
-    info!("[vision_analysis] cross-camera inference engine started (max_batch={MAX_BATCH})");
+    info!(
+        "[vision_analysis] cross-camera inference engine started (model_batch={MODEL_BATCH}, max_batch_wait={}ms)",
+        MAX_BATCH_WAIT.as_millis()
+    );
+
+    // Bufor akumulacyjny time-batchingu: NOWE klatki due-kamer zbierane między
+    // flushami. Krotki jak dotychczasowe `frames`. FIFO — flush bierze najstarsze.
+    let mut pending: Vec<(String, std::sync::Arc<[u8]>, u32, u32, u64, Option<u64>)> = Vec::new();
+    // Instant dołożenia NAJSTARSZEJ klatki obecnie w `pending` — baza dla okna
+    // `MAX_BATCH_WAIT`. `None`, gdy bufor jest pusty.
+    let mut pending_since: Option<Instant> = None;
+    // Ostatnio dołożona tożsamość klatki per kamera (`captured_ms`, `pts_ns`),
+    // by NIE dublować tej samej klatki, gdy kamera nie wyprodukowała nowej między
+    // tickami (latest_frame_global zwróci wtedy tę samą klatkę).
+    let mut last_added: HashMap<String, (u64, Option<u64>)> = HashMap::new();
 
     // Continuous (adaptive) batching: after each batch we loop IMMEDIATELY and
     // form the next one from whatever became due while the previous inference ran,
@@ -309,14 +388,6 @@ async fn engine_loop() {
                 }
             }
         }
-        if due.is_empty() {
-            let wait = earliest_next
-                .map(|t| t.saturating_duration_since(now))
-                .unwrap_or(IDLE_POLL_MAX)
-                .clamp(IDLE_POLL_MIN, IDLE_POLL_MAX);
-            tokio::time::sleep(wait).await;
-            continue;
-        }
         // Re-read changed FPS values outside the lock.
         for id in &recheck {
             let fps = resolve_analysis_fps(id);
@@ -327,54 +398,151 @@ async fn engine_loop() {
             }
         }
 
-        // Take this cycle's batch; cameras beyond MAX_BATCH stay overdue and are
-        // picked next tick (drop-nothing, just deferred).
-        let batch_ids: Vec<String> = due.iter().take(MAX_BATCH).cloned().collect();
-
-        // Pull the latest frame for each batched camera (async snapshot). Czas
-        // przechwycenia klatki (`captured_ms`, unix epoch ms) niesiemy razem z
-        // ramka az do publish, zeby overlay kotwiczyl detekcje na wlasciwej
-        // klatce, a nie na czasie publikacji (opóźnionym o dekod+inferencje).
-        let mut frames: Vec<(String, std::sync::Arc<[u8]>, u32, u32, u64)> = Vec::new();
-        for id in &batch_ids {
-            if let Some((rgb, w, h, captured_ms)) =
+        // Dołóż do `pending` NOWE klatki wszystkich due-kamer (async snapshot).
+        // Czas przechwycenia klatki (`captured_ms`, unix epoch ms) + `pts_ns`
+        // niesiemy razem z ramka az do publish, zeby overlay kotwiczyl detekcje
+        // na wlasciwej klatce, a nie na czasie publikacji (opóźnionym o
+        // dekod+inferencje). Continuous batching: żadna kamera nie blokuje innych,
+        // każda due-kamera dokłada swoją bieżącą klatkę do wspólnego bufora.
+        for id in &due {
+            if let Some((rgb, w, h, captured_ms, pts_ns)) =
                 crate::addon::host_functions::camera::latest_frame_global(id).await
             {
-                frames.push((id.clone(), rgb, w, h, captured_ms));
+                let ident = (captured_ms, pts_ns);
+                // Pomiń, gdy to ta sama klatka co ostatnio dołożona z tej kamery
+                // (kamera nie wyprodukowała nowej między tickami) — zero duplikatów.
+                let is_new = last_added.get(id).map(|prev| *prev != ident).unwrap_or(true);
+                // Inteligentne pomijanie per-kamera: jeśli ta kamera MA JUŻ swoją
+                // (jeszcze nieprzetworzoną) klatkę w `pending`, NIE dokładamy drugiej.
+                // Kamera „w locie"/zakolejkowana nie koleguje kolejnych klatek —
+                // gwarantuje to max 1 klatkę/kamerę w batchu i chroni przed
+                // przetwarzaniem zaległej, nieaktualnej klatki jednej kamery kosztem
+                // innych. Odrzucamy (nie nadpisujemy, nie dokładamy drugiej).
+                let already_queued = pending.iter().any(|(cid, ..)| cid == id);
+                if is_new && !already_queued {
+                    if pending.is_empty() {
+                        pending_since = Some(Instant::now());
+                    }
+                    pending.push((id.clone(), rgb, w, h, captured_ms, pts_ns));
+                    last_added.insert(id.clone(), ident);
+                }
             }
         }
 
-        // Reschedule every batched camera by its own FPS interval.
+        // Reschedule every due camera by its own FPS interval.
         {
             let mut reg = cameras().lock().unwrap();
-            for id in &batch_ids {
+            for id in &due {
                 if let Some(slot) = reg.get_mut(id) {
                     slot.next_due = now + interval_for_fps(slot.fps);
                 }
             }
         }
-        if frames.is_empty() {
+
+        // Warunek flush: pełny chunk MODEL_BATCH (cross-camera przy wielu kamerach
+        // albo nazbierane klatki jednej kamery), ALBO upłynęło okno MAX_BATCH_WAIT
+        // od najstarszej klatki w pending (bound latencji przy małej liczbie kamer).
+        let now_flush = Instant::now();
+        let flush = pending.len() >= MODEL_BATCH
+            || pending_since
+                .map(|t| now_flush.duration_since(t) >= MAX_BATCH_WAIT)
+                .unwrap_or(false);
+        if !flush || pending.is_empty() {
+            // Nic do policzenia w tym ticku: śpij do najbliższego z (a) deadline
+            // najwcześniejszej jeszcze-niedue kamery, (b) deadline flushu pending
+            // (`pending_since + MAX_BATCH_WAIT`). Clamp [IDLE_POLL_MIN=1ms,
+            // IDLE_POLL_MAX] trzyma pętlę responsywną — nie busy-spinuje, a dolny
+            // clamp 1ms < 8ms, więc okno flushu MAX_BATCH_WAIT nie jest przesypiane.
+            let mut wait = earliest_next
+                .map(|t| t.saturating_duration_since(now_flush))
+                .unwrap_or(IDLE_POLL_MAX);
+            if let Some(t) = pending_since {
+                wait = wait.min((t + MAX_BATCH_WAIT).saturating_duration_since(now_flush));
+            }
+            tokio::time::sleep(wait.clamp(IDLE_POLL_MIN, IDLE_POLL_MAX)).await;
             continue;
         }
+
+        // Weź do MODEL_BATCH najstarszych klatek (FIFO). `detect_batch` sam dopada
+        // resztę do 8 zerowym paddingiem (i odrzuca jego wyniki). Nadmiar (przy
+        // wielu kamerach > MODEL_BATCH) zostaje w pending na kolejny, natychmiastowy
+        // flush pełnego chunku. Po drenażu przelicz bazę okna dla reszty bufora.
+        let take = pending.len().min(MODEL_BATCH);
+        let frames: Vec<(String, std::sync::Arc<[u8]>, u32, u32, u64, Option<u64>)> =
+            pending.drain(..take).collect();
+        pending_since = if pending.is_empty() {
+            None
+        } else {
+            Some(Instant::now())
+        };
 
         // HOT PATH: one batched detector run only (no OCR/classify here). Wynik
         // rozdzielamy na dwie fazy: FAZA 1 publikuje surowe boxy natychmiast (tu,
         // w hot loop), FAZA 2 oddaje NIEPUSTE ramki do cold FIFO na wzbogacenie
         // (stan + OCR). Dzieki temu overlay dostaje boxy zsynchronizowane z wideo,
         // a nie spoznione o czas OCR/klasyfikacji.
-        let detector = detector.clone();
-        let detected =
-            crate::vision::burn_backend::run_blocking(move || detect_only(detector, frames)).await;
+        // Gdy slot runtime jest wpięty, detekcja idzie przez
+        // `executor.execute_camera_cv` (resolve aliasu + failover/mesh); pusty
+        // slot albo błąd executora = fallback na bezpośrednią ścieżkę singletonu
+        // (zero regresji przy bootstrapie).
+        // Serializacja forwardów: `.await` blokuje pętlę aż bieżący forward się
+        // zakończy (obie ścieżki kończą na `run_blocking` — jeden wątek
+        // inferencji). Dopiero potem pętla zbierze i flushnie następny batch —
+        // więc w danej chwili trwa DOKŁADNIE jeden forward. Świadomie nie
+        // odpalamy równoległych forwardów: współbieżny dostęp do backendu GPU
+        // powoduje korupcję (patrz walidacja wgpu).
+        let detected: Result<Vec<DetectedFrame>, String> = match runtime_executor() {
+            Some(executor) => match detect_via_executor(&executor, &frames).await {
+                Ok(per_cam) => Ok(per_cam),
+                Err(e) => {
+                    warn_executor_fallback("detect", &e);
+                    let detector = detector.clone();
+                    crate::vision::burn_backend::run_blocking(move || {
+                        detect_only(detector, frames)
+                    })
+                    .await
+                    .map_err(|e| format!("detect task panicked: {e}"))
+                }
+            },
+            None => {
+                let detector = detector.clone();
+                crate::vision::burn_backend::run_blocking(move || detect_only(detector, frames))
+                    .await
+                    .map_err(|e| format!("detect task panicked: {e}"))
+            }
+        };
         match detected {
             Ok(per_cam) => {
-                for (id, frame, w, h, captured_ms, dets) in per_cam {
+                for (id, frame, w, h, captured_ms, pts_ns, detect_ms, mut dets) in per_cam {
+                    // Tracker IOU: nadaje stabilne `track_id` + prędkość (vx,vy) KAŻDEJ
+                    // detekcji przed publikacja, tak by FAZA 1 (clone) i FAZA 2 niosly
+                    // juz spojne identyfikatory sledzenia. Prędkość liczona z pts_ns.
+                    tracker::update(&id, &mut dets, pts_ns);
+                    // Cache wzbogacania (per track_id): stan tablicy/nalepki i OCR
+                    // NIE zmieniaja sie klatka-po-klatce, a tracki maja stabilne id.
+                    // Dla kazdej detekcji ze swiezym wpisem w cache przypisujemy
+                    // `stan`/`tekst` OD RAZU w hot path — dzieki temu boxy FAZY 1
+                    // niosa stan natychmiast (bez czekania na cold path) i utrzymuja
+                    // go miedzy klatkami. Wzbogaca to faza 2 raz na track (patrz
+                    // `enrich_detections`), tu tylko reuzywamy gotowy wynik.
+                    for det in dets.iter_mut() {
+                        if det.track_id > 0 {
+                            if let Some(c) = enrich_cache_fresh(&id, det.track_id) {
+                                det.stan = c.stan;
+                                det.tekst = c.tekst;
+                            }
+                        }
+                    }
                     // FAZA 1 (hot, natychmiast): publikuj surowe detekcje detektora
                     // (klasa + bbox + score, bez `stan`/`tekst`) od razu, jeszcze
                     // przed wzbogaceniem. Overlay kotwiczy je po `captured_ms`, wiec
                     // boxy lądują na wlasciwej klatce z opoznieniem samego dekodu +
                     // inferencji (~200 ms), a nie +OCR (~1 s). Pusty zestaw tez
                     // publikujemy — czysci overlay bez czekania na cold path.
-                    detection_bus::publish_detections(&id, captured_ms, dets.clone());
+                    // FAZA 1 zna tylko `detect_ms` (sam forward detektora) — pelny
+                    // `proc_ms` (detekcja+OCR+stan) publikuje dopiero FAZA 2 po
+                    // wzbogaceniu, nadpisujac ta ramke dla tego samego captured_ms.
+                    detection_bus::publish_detections(&id, captured_ms, pts_ns, detect_ms, dets.clone());
 
                     // Pusty zestaw nie wymaga wzbogacenia: FAZA 1 juz wyczyscila
                     // overlay, wiec nie oddajemy go do cold path (zero pamieci, zero
@@ -396,6 +564,8 @@ async fn engine_loop() {
                         w,
                         h,
                         captured_ms,
+                        pts_ns,
+                        detect_ms,
                         detections: dets,
                     };
                     match cold.try_send(ev) {
@@ -414,8 +584,100 @@ async fn engine_loop() {
                     }
                 }
             }
-            Err(e) => warn!("[vision_analysis] detect task panicked: {e}"),
+            Err(e) => warn!("[vision_analysis] {e}"),
         }
+    }
+}
+
+/// Klatka oczekująca w buforze hot path:
+/// (camera_id, RGB, szerokość, wysokość, captured_ms, pts_ns).
+type PendingFrame = (String, Arc<[u8]>, u32, u32, u64, Option<u64>);
+
+/// Wynik detekcji jednej klatki: pola [`PendingFrame`] + (detect_ms, detekcje).
+type DetectedFrame = (
+    String,
+    Arc<[u8]>,
+    u32,
+    u32,
+    u64,
+    Option<u64>,
+    u32,
+    Vec<Detection>,
+);
+
+/// HOT przez executor: jedna operacja `Detect` na całym batchu przez
+/// `execute_camera_cv` (alias katalogowy → resolve → local/mesh z failover).
+/// Klatki idą zero-copy (klon `Arc`), więc `frames` zostają u callera na
+/// wypadek fallbacku. Zwraca wyniki w tym samym kształcie co `detect_only`;
+/// kontrakt surface'u gwarantuje `per_frame[i]` ↔ `frames[i]`. `detect_ms`
+/// liczony identycznie jak w `detect_only`: łączny czas wywołania / liczba
+/// klatek batcha (przybliżenie dla badge "proc_ms").
+async fn detect_via_executor(
+    executor: &Arc<ModelRuntimeExecutor>,
+    frames: &[PendingFrame],
+) -> Result<Vec<DetectedFrame>, String> {
+    let detect_start = Instant::now();
+    let cv_frames: Vec<CvFrameLocal> = frames
+        .iter()
+        .map(|(_, rgb, w, h, _, _)| CvFrameLocal {
+            data: rgb.clone(),
+            width: *w,
+            height: *h,
+        })
+        .collect();
+    let request = CameraCvRequest {
+        model: CV_DETECT_ALIAS.to_string(),
+        op: CameraCvOpLocal::Detect { frames: cv_frames },
+    };
+    // Wywolanie systemowe (silnik kamer) — brak tozsamosci uzytkownika,
+    // swiezy kontekst per wywolanie (jak w vision_impl).
+    let mut ctx = RuntimeContext::new(None);
+    let per_frame = match executor.execute_camera_cv(request, &mut ctx).await {
+        Ok(CameraCvResult::Detections { per_frame }) => per_frame,
+        Ok(_) => return Err("detect: nieoczekiwany wariant wyniku camera-cv".into()),
+        Err(e) => return Err(format!("detect: {e}")),
+    };
+    if per_frame.len() != frames.len() {
+        return Err(format!(
+            "detect: {} wyników per_frame na {} klatek batcha (kontrakt złamany)",
+            per_frame.len(),
+            frames.len()
+        ));
+    }
+    let n = frames.len().max(1) as u32;
+    let detect_ms = (detect_start.elapsed().as_millis() as u32) / n;
+    Ok(frames
+        .iter()
+        .cloned()
+        .zip(per_frame)
+        .map(|((id, rgb, w, h, captured_ms, pts_ns), dets)| {
+            (
+                id,
+                rgb,
+                w,
+                h,
+                captured_ms,
+                pts_ns,
+                detect_ms,
+                dets.into_iter().map(detection_from_cv).collect(),
+            )
+        })
+        .collect())
+}
+
+/// Mapuje detekcję surface'u CameraCv na typ magistrali detekcji. Pola
+/// wzbogacenia/śledzenia startują puste — nadaje je tracker (track_id, vx, vy)
+/// i cold path (stan, tekst), dokładnie jak dla wyniku `detect_batch`.
+fn detection_from_cv(d: CvDetection) -> Detection {
+    Detection {
+        klasa: d.klasa,
+        bbox: d.bbox,
+        score: d.score,
+        stan: Vec::new(),
+        tekst: None,
+        track_id: 0,
+        vx: 0.0,
+        vy: 0.0,
     }
 }
 
@@ -437,6 +699,12 @@ struct DetectionEvent {
     /// Czas przechwycenia klatki (unix epoch ms) — propagowany do publish jako
     /// `ts_ms`, zeby overlay kotwiczyl detekcje na wlasciwej klatce.
     captured_ms: u64,
+    /// PTS klatki w osi mediów (nanosekundy) — propagowany do publish jako
+    /// `pts_ns`, wspolna oś czasu z init-segmentem MSE (`mux_base_pts_ns`).
+    pts_ns: Option<u64>,
+    /// Czas forwardu detektora (ms) zmierzony w FAZIE 1 (hot). Niesiony do FAZY 2,
+    /// gdzie sumuje sie z `enrich_ms` w pelny `proc_ms` (detekcja+OCR+stan).
+    detect_ms: u32,
     detections: Vec<crate::services::detection_bus::Detection>,
 }
 
@@ -625,6 +893,8 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
             w,
             h,
             captured_ms,
+            pts_ns,
+            detect_ms,
             detections,
         } = ev;
         let bytes = frame.len();
@@ -653,27 +923,28 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
                 // budget bounds the fleet — so detaching stays bounded.
                 tokio::spawn(async move {
                     let _slot = slot;
-                    run_camera_flow(disp, flow_id, camera_id, frame, w, h, captured_ms, detections)
-                        .await;
+                    run_camera_flow(
+                        disp, flow_id, camera_id, frame, w, h, captured_ms, pts_ns, detect_ms,
+                        detections,
+                    )
+                    .await;
                 });
                 continue;
             }
         }
         let _slot = slot;
-        let classifier = classifier.clone();
-        let ocr = ocr.clone();
-        let res = crate::vision::burn_backend::run_blocking(move || {
-            let mut dets = detections;
-            enrich_detections(&classifier, &ocr, &frame, w, h, &mut dets);
-            (camera_id, captured_ms, dets)
-        })
-        .await;
-        match res {
-            Ok((id, captured_ms, dets)) => {
-                detection_bus::publish_detections(&id, captured_ms, dets)
-            }
-            Err(e) => warn!("[vision_analysis] enrich task panicked: {e}"),
-        }
+        // Petla wzbogacania jest async: executor sam robi `run_blocking` per
+        // forward (serializacja GPU zachowana), a sciezka fallback owija swoje
+        // forwardy w `run_blocking` wewnatrz `classify_crop`/`ocr_crop`.
+        let mut dets = detections;
+        // Czas wzbogacenia tej klatki: pelna petla classify+OCR. Dla trafien
+        // cache (pominiety realny forward) bedzie maly — klatka faktycznie tania.
+        let enrich_start = Instant::now();
+        enrich_detections(&classifier, &ocr, &camera_id, &frame, w, h, &mut dets).await;
+        let enrich_ms = enrich_start.elapsed().as_millis() as u32;
+        // proc_ms = calosc obrobki klatki: detekcja (FAZA 1) + OCR/stan (FAZA 2).
+        let proc_ms = detect_ms + enrich_ms;
+        detection_bus::publish_detections(&camera_id, captured_ms, pts_ns, proc_ms, dets);
     }
 }
 
@@ -734,10 +1005,16 @@ async fn run_camera_flow(
     w: u32,
     h: u32,
     captured_ms: u64,
+    pts_ns: Option<u64>,
+    detect_ms: u32,
     detections: Vec<Detection>,
 ) {
     use crate::flow_engine::dispatcher::FlowRequestMeta;
     use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
+
+    // Czas wykonania flow to koszt wzbogacenia tej klatki (odpowiednik enrich_ms
+    // sciezki wbudowanej); proc_ms = detekcja (FAZA 1) + flow (FAZA 2).
+    let enrich_start = Instant::now();
 
     let dets_json = match serde_json::to_value(&detections) {
         Ok(v) => v,
@@ -791,7 +1068,8 @@ async fn run_camera_flow(
                 "[vision_analysis] flow {flow_id} ran for {camera_id}: {} detections, verdict={verdict}",
                 detections.len()
             );
-            publish_flow_detections(&camera_id, captured_ms, detections, outcome);
+            let proc_ms = detect_ms + enrich_start.elapsed().as_millis() as u32;
+            publish_flow_detections(&camera_id, captured_ms, pts_ns, proc_ms, detections, outcome);
         }
         Err(e) => warn!("[vision_analysis] flow {flow_id} dispatch failed: {e}"),
     }
@@ -809,6 +1087,8 @@ async fn run_camera_flow(
 fn publish_flow_detections(
     camera_id: &str,
     captured_ms: u64,
+    pts_ns: Option<u64>,
+    proc_ms: u32,
     original: Vec<Detection>,
     outcome: crate::flow_engine::envelope::FlowExecutionOutcome,
 ) {
@@ -824,26 +1104,39 @@ fn publish_flow_detections(
         },
         None => None,
     };
-    detection_bus::publish_detections(camera_id, captured_ms, enriched.unwrap_or(original));
+    detection_bus::publish_detections(
+        camera_id,
+        captured_ms,
+        pts_ns,
+        proc_ms,
+        enriched.unwrap_or(original),
+    );
 }
 
 /// HOT, blocking: one `detect_batch` across the frames. Returns the raw boxes per
 /// frame plus the frame buffer, for the cold path to enrich. No OCR/classify here.
 fn detect_only(
     detector: Arc<Mutex<RfDetrDetector>>,
-    frames: Vec<(String, Arc<[u8]>, u32, u32, u64)>,
+    frames: Vec<(String, Arc<[u8]>, u32, u32, u64, Option<u64>)>,
 ) -> Vec<(
     String,
     Arc<[u8]>,
     u32,
     u32,
     u64,
+    Option<u64>,
+    u32,
     Vec<crate::services::detection_bus::Detection>,
 )> {
+    // Czas forwardu detektora dla CALEGO batcha. Model liczy wszystkie klatki
+    // jednym przebiegiem (padding do MODEL_BATCH), wiec nie da sie rozdzielic
+    // kosztu per klatka — dzielimy laczny czas rowno miedzy klatki batcha. To
+    // przyblizenie wystarcza dla badge "proc_ms" (rzad wielkosci, nie profiling).
+    let detect_start = Instant::now();
     let batch = {
         let refs: Vec<(&[u8], u32, u32)> = frames
             .iter()
-            .map(|(_, rgb, w, h, _)| (&rgb[..], *w, *h))
+            .map(|(_, rgb, w, h, _, _)| (&rgb[..], *w, *h))
             .collect();
         let mut guard = detector.lock().unwrap_or_else(|e| e.into_inner());
         match guard.detect_batch(&refs) {
@@ -854,27 +1147,128 @@ fn detect_only(
             }
         }
     };
+    debug_assert_eq!(
+        frames.len(),
+        batch.len(),
+        "detect_batch musi zwrócić tyle wyników ile klatek wejściowych"
+    );
+    let n = frames.len().max(1) as u32;
+    let detect_ms = (detect_start.elapsed().as_millis() as u32) / n;
     frames
         .into_iter()
         .zip(batch.into_iter())
-        .map(|((id, rgb, w, h, captured_ms), items)| (id, rgb, w, h, captured_ms, items))
+        .map(|((id, rgb, w, h, captured_ms, pts_ns), items)| {
+            (id, rgb, w, h, captured_ms, pts_ns, detect_ms, items)
+        })
         .collect()
 }
 
-/// COLD, blocking: per-detection state classify (labels) + plate OCR, mutating
-/// `items` in place. Runs off the hot detector loop so its latency never paces
-/// detection throughput. Missing runners (`None`) skip that stage, never crash.
-fn enrich_detections(
+/// Okno swiezosci wpisu w cache wzbogacania. Stan tablicy/nalepki i odczyt OCR
+/// sa stabilne w czasie zycia tracku, wiec przez ~3 s reuzywamy raz policzony
+/// wynik zamiast liczyc go per klatka. Po uplywie tego okna track jest wzbogacany
+/// ponownie (odswiezenie), co lapie realne zmiany (np. tablica zmienila stan).
+const ENRICH_TTL: Duration = Duration::from_secs(3);
+
+/// Wiek, po ktorym wpis cache jest usuwany przy ewikcji — wyrazniej dluzszy niz
+/// `ENRICH_TTL`, by track, ktory chwilowo zniknal i wrocil, wciaz mial swoj stan.
+const ENRICH_CACHE_EVICT_AGE: Duration = Duration::from_secs(10);
+
+/// Co ile zapisow do cache uruchamiamy ewikcje przestarzalych wpisow. Ewikcja
+/// licznikowa (analogicznie do leak-fixu trackera) trzyma mape ograniczona bez
+/// osobnego watku — martwe tracki znikaja przy okazji kolejnych zapisow.
+const ENRICH_EVICT_EVERY: usize = 256;
+
+/// Wynik wzbogacenia jednego tracku: stan (etykiety klasyfikatora) + odczyt OCR,
+/// wraz z chwila policzenia (`at`) do oceny swiezosci wzgledem `ENRICH_TTL`.
+#[derive(Clone)]
+struct CachedEnrich {
+    stan: Vec<String>,
+    tekst: Option<String>,
+    at: Instant,
+}
+
+/// Proces-wide cache wzbogacania kluczowany po (camera_id, track_id). Wzor jak
+/// `tracker_state()` / `cold_state()`. Pozwala wzbogacic kazdy track RAZ i
+/// reuzywac wynik zamiast wolac klasyfikator/OCR per klatka (~10x mniej forwardow).
+fn enrich_cache() -> &'static Mutex<HashMap<(String, u32), CachedEnrich>> {
+    static C: OnceLock<Mutex<HashMap<(String, u32), CachedEnrich>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Zwraca swiezy (`at.elapsed() < ENRICH_TTL`) wpis cache dla tracku albo `None`
+/// (brak wpisu lub przeterminowany). Klon jest tani — `stan` to zwykle 0-2 stringi.
+fn enrich_cache_fresh(camera_id: &str, track_id: u32) -> Option<CachedEnrich> {
+    let cache = enrich_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .get(&(camera_id.to_string(), track_id))
+        .filter(|c| c.at.elapsed() < ENRICH_TTL)
+        .cloned()
+}
+
+/// Zapisuje wynik wzbogacenia tracku do cache i co `ENRICH_EVICT_EVERY` zapisow
+/// usuwa wpisy starsze niz `ENRICH_CACHE_EVICT_AGE` (ewikcja licznikowa), by mapa
+/// nie rosla po znikajacych trackach.
+fn enrich_cache_put(camera_id: &str, track_id: u32, stan: Vec<String>, tekst: Option<String>) {
+    static PUT_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let mut cache = enrich_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.insert(
+        (camera_id.to_string(), track_id),
+        CachedEnrich {
+            stan,
+            tekst,
+            at: Instant::now(),
+        },
+    );
+    if PUT_COUNT.fetch_add(1, AtomicOrdering::Relaxed) % ENRICH_EVICT_EVERY == 0 {
+        cache.retain(|_, c| c.at.elapsed() < ENRICH_CACHE_EVICT_AGE);
+    }
+}
+
+/// COLD: state classify (labels) + plate OCR, mutating `items` in place.
+/// Szeregowy tor: dla każdej detekcji po kolei — jeśli `wants_state`, jeden forward
+/// klasyfikatora stanu batch=1 (`classify`); jeśli to tablica rejestracyjna, OCR.
+/// Gdy slot runtime jest wpięty, każdy forward idzie przez
+/// `executor.execute_camera_cv` (aliasy `tentavision-stan`/`tentavision-ocr`);
+/// pusty slot albo błąd executora = fallback na bezpośrednią ścieżkę singletonów.
+/// Oba forwardy Burn muszą iść jednym wątkiem — backend celowo serializuje inferencję
+/// (`infer_executor`), bo równoległa alokacja cubecl/wgpu korumpuje/OOM-uje wspólny
+/// device: obie ścieżki (handler executora i fallback) owijają forward w
+/// `run_blocking`, więc serializacja jest zachowana. Model stanu jest fixed batch=1,
+/// więc batchowanie było SZKODLIWE (padding do 8 slotów wolniejszy niż serial dla
+/// typowych 3-6 cropów) — stąd prosty tor szeregowy.
+/// Runs off the hot detector loop so its latency never paces detection throughput.
+/// Missing runners (`None`) skip that stage, never crash. Cold path — żaden błąd/panic
+/// nie może wyjść: locki odtruwamy (`into_inner`), błędy logujemy.
+async fn enrich_detections(
     classifier: &Option<Arc<Mutex<StateClassifier>>>,
     ocr: &Option<Arc<Mutex<PlateOcr>>>,
+    camera_id: &str,
     rgb: &[u8],
     w: u32,
     h: u32,
     items: &mut [crate::services::detection_bus::Detection],
 ) {
+    // Executor czytany raz per klatka (nie per crop) — slot to tani RwLock read,
+    // ale spojnosc sciezki w obrebie jednej klatki jest cenniejsza.
+    let executor = runtime_executor();
+    let fw = w as f32;
+    let fh = h as f32;
+
     for det in items.iter_mut() {
-        let fw = w as f32;
-        let fh = h as f32;
+        // Cache per track_id: jesli track ma juz SWIEZY wpis (< ENRICH_TTL),
+        // reuzywamy gotowy stan/tekst i POMIJAMY realny forward klasyfikatora/OCR.
+        // Wzbogacamy wiec tylko NOWE tracki albo co ENRICH_TTL (odswiezenie) —
+        // to zbija liczbe forwardow ~10x (raz per track zamiast per klatka), przez
+        // co cold path przestaje sie dlawic. Detekcje z track_id=0 (brak trackingu)
+        // wzbogacamy zawsze, bez cache (nie ma stabilnego klucza).
+        if det.track_id > 0 {
+            if let Some(c) = enrich_cache_fresh(camera_id, det.track_id) {
+                det.stan = c.stan;
+                det.tekst = c.tekst;
+                continue;
+            }
+        }
+
         let x0 = (det.bbox[0] * fw).round().clamp(0.0, fw) as u32;
         let y0 = (det.bbox[1] * fh).round().clamp(0.0, fh) as u32;
         let cw = (det.bbox[2] * fw).round().max(0.0) as u32;
@@ -884,24 +1278,186 @@ fn enrich_detections(
         if cw < 8 || ch < 8 {
             continue;
         }
+
+        // Czy ta detekcja w ogole podlega wzbogaceniu — jesli tak, jej wynik
+        // (nawet pusty) zapisujemy do cache, by kolejne klatki tego tracku
+        // reuzywaly go bez ponownego forwardu.
+        let enrichable = wants_state(&det.klasa)
+            || det.klasa == "tablica_rejestracyjna"
+            || det.klasa == "tablica_adr";
+
         if wants_state(&det.klasa) {
-            if let Some(classifier) = classifier.as_ref() {
-                let crop = crop_rgb(rgb, w, x0, y0, cw, ch);
-                match classifier.lock().unwrap_or_else(|e| e.into_inner()).classify(&crop, cw, ch) {
-                    Ok(stany) => det.stan = stany,
-                    Err(e) => warn!("[vision_analysis] classify failed for {}: {e:#}", det.klasa),
+            let crop: Arc<[u8]> = Arc::from(crop_rgb(rgb, w, x0, y0, cw, ch));
+            if let Some(stan) =
+                classify_crop(executor.as_ref(), classifier, crop, cw, ch, &det.klasa).await
+            {
+                det.stan = stan;
+            }
+        }
+
+        // OCR czyta zarowno tablice rejestracyjne, jak i tablice ADR (numer typu
+        // "<kemler>/<UN>") — ten sam model PlateOcr, ale INNA sciezka: rejestracyjna to
+        // jedna linia (`read` + walidacja PL), ADR to 2 rzedy cyfr (`read_adr`,
+        // split na kemler/UN). Bbox detektora czesto UCINA prawa czesc tablicy,
+        // wiec crop pod OCR poszerzamy o padding (~15% szer. / ~10% wys. z kazdej
+        // strony, zaklamrowany do granic klatki), zeby zlapac ucieta czesc.
+        if det.klasa == "tablica_rejestracyjna" || det.klasa == "tablica_adr" {
+            let pad_x = (cw as f32 * 0.15).round() as u32;
+            let pad_y = (ch as f32 * 0.10).round() as u32;
+            let px0 = x0.saturating_sub(pad_x);
+            let py0 = y0.saturating_sub(pad_y);
+            let pright = (x0 + cw + pad_x).min(w);
+            let pbottom = (y0 + ch + pad_y).min(h);
+            let pcw = pright.saturating_sub(px0);
+            let pch = pbottom.saturating_sub(py0);
+            if pcw >= 8 && pch >= 8 {
+                let crop: Arc<[u8]> = Arc::from(crop_rgb(rgb, w, px0, py0, pcw, pch));
+                let mode = if det.klasa == "tablica_adr" {
+                    CvOcrMode::Adr
+                } else {
+                    CvOcrMode::Plate
+                };
+                if let Some(plate) =
+                    ocr_crop(executor.as_ref(), ocr, crop, pcw, pch, mode, &det.klasa).await
+                {
+                    det.tekst = Some(plate);
                 }
             }
         }
-        if det.klasa == "tablica_rejestracyjna" {
-            if let Some(ocr) = ocr.as_ref() {
-                let crop = crop_rgb(rgb, w, x0, y0, cw, ch);
-                match ocr.lock().unwrap_or_else(|e| e.into_inner()).read(&crop, cw, ch) {
-                    Ok(Some(plate)) => det.tekst = Some(plate),
-                    Ok(None) => {}
-                    Err(e) => warn!("[vision_analysis] OCR failed for {}: {e:#}", det.klasa),
-                }
-            }
+
+        // Zapisz swiezo policzony wynik pod (camera_id, track_id), aby hot path
+        // (FAZA 1) i kolejne klatki tego tracku przypisaly stan bez forwardu.
+        if det.track_id > 0 && enrichable {
+            enrich_cache_put(camera_id, det.track_id, det.stan.clone(), det.tekst.clone());
         }
+    }
+}
+
+/// COLD: klasyfikacja stanu jednego cropu — najpierw executor (alias
+/// `tentavision-stan`), przy pustym slocie albo błędzie fallback na bezpośredni
+/// forward singletonu przez `run_blocking`. `None` = brak wyniku (etap
+/// pominięty, dotychczasowy `stan` detekcji zostaje) — nigdy błąd na zewnątrz.
+async fn classify_crop(
+    executor: Option<&Arc<ModelRuntimeExecutor>>,
+    classifier: &Option<Arc<Mutex<StateClassifier>>>,
+    crop: Arc<[u8]>,
+    cw: u32,
+    ch: u32,
+    klasa: &str,
+) -> Option<Vec<String>> {
+    if let Some(executor) = executor {
+        let request = CameraCvRequest {
+            model: CV_CLASSIFY_ALIAS.to_string(),
+            op: CameraCvOpLocal::ClassifyState {
+                crop: CvFrameLocal {
+                    data: crop.clone(),
+                    width: cw,
+                    height: ch,
+                },
+            },
+        };
+        let mut ctx = RuntimeContext::new(None);
+        match executor.execute_camera_cv(request, &mut ctx).await {
+            Ok(CameraCvResult::Labels { stan }) => return Some(stan),
+            Ok(_) => warn_executor_fallback("classify", "nieoczekiwany wariant wyniku camera-cv"),
+            Err(e) => warn_executor_fallback("classify", &format!("{e}")),
+        }
+    }
+    let classifier = classifier.as_ref()?.clone();
+    let res = crate::vision::burn_backend::run_blocking(move || {
+        let mut guard = classifier.lock().unwrap_or_else(|e| e.into_inner());
+        guard.classify(&crop, cw, ch)
+    })
+    .await;
+    match res {
+        Ok(Ok(stan)) => Some(stan),
+        Ok(Err(e)) => {
+            warn!("[vision_analysis] classify failed for {klasa}: {e:#}");
+            None
+        }
+        Err(e) => {
+            warn!("[vision_analysis] classify task panicked: {e}");
+            None
+        }
+    }
+}
+
+/// COLD: OCR jednego cropu — najpierw executor (alias `tentavision-ocr`, tryb
+/// `Adr` dla tablicy ADR / `Plate` dla rejestracyjnej), przy pustym slocie albo
+/// błędzie fallback na bezpośredni forward singletonu przez `run_blocking`.
+/// `None` = nic nie rozpoznano LUB etap pominięty — nigdy błąd na zewnątrz.
+async fn ocr_crop(
+    executor: Option<&Arc<ModelRuntimeExecutor>>,
+    ocr: &Option<Arc<Mutex<PlateOcr>>>,
+    crop: Arc<[u8]>,
+    cw: u32,
+    ch: u32,
+    mode: CvOcrMode,
+    klasa: &str,
+) -> Option<String> {
+    if let Some(executor) = executor {
+        let request = CameraCvRequest {
+            model: CV_OCR_ALIAS.to_string(),
+            op: CameraCvOpLocal::Ocr {
+                crop: CvFrameLocal {
+                    data: crop.clone(),
+                    width: cw,
+                    height: ch,
+                },
+                mode: mode.clone(),
+            },
+        };
+        let mut ctx = RuntimeContext::new(None);
+        match executor.execute_camera_cv(request, &mut ctx).await {
+            // Sukces executora z `tekst = None` znaczy "nic nie rozpoznano" —
+            // to wynik, nie błąd: NIE spadamy wtedy na fallback.
+            Ok(CameraCvResult::Text { tekst }) => return tekst,
+            Ok(_) => warn_executor_fallback("ocr", "nieoczekiwany wariant wyniku camera-cv"),
+            Err(e) => warn_executor_fallback("ocr", &format!("{e}")),
+        }
+    }
+    let ocr = ocr.as_ref()?.clone();
+    let res = crate::vision::burn_backend::run_blocking(move || {
+        let mut guard = ocr.lock().unwrap_or_else(|e| e.into_inner());
+        match mode {
+            CvOcrMode::Adr => guard.read_adr(&crop, cw, ch),
+            CvOcrMode::Plate | CvOcrMode::Generic => guard.read(&crop, cw, ch),
+        }
+    })
+    .await;
+    match res {
+        Ok(Ok(tekst)) => tekst,
+        Ok(Err(e)) => {
+            warn!("[vision_analysis] OCR failed for {klasa}: {e:#}");
+            None
+        }
+        Err(e) => {
+            warn!("[vision_analysis] OCR task panicked: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mapowanie CvDetection→Detection: pola detektora przechodzą 1:1, pola
+    /// wzbogacenia/śledzenia startują puste (nadaje je tracker i cold path).
+    #[test]
+    fn detection_from_cv_mapuje_pola_i_zeruje_wzbogacenie() {
+        let d = detection_from_cv(CvDetection {
+            klasa: "tablica_adr".into(),
+            bbox: [0.1, 0.2, 0.3, 0.4],
+            score: 0.9,
+        });
+        assert_eq!(d.klasa, "tablica_adr");
+        assert_eq!(d.bbox, [0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(d.score, 0.9);
+        assert!(d.stan.is_empty());
+        assert!(d.tekst.is_none());
+        assert_eq!(d.track_id, 0);
+        assert_eq!(d.vx, 0.0);
+        assert_eq!(d.vy, 0.0);
     }
 }

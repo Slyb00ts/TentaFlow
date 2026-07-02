@@ -145,6 +145,15 @@ pub struct DetectionItem {
     pub stan: Vec<String>,
     /// OCR read or `None` (serialized as `null`).
     pub tekst: Option<String>,
+    /// Stable tracking id from the IOU tracker. 0 = unassigned.
+    #[serde(default)]
+    pub track_id: u32,
+    /// Box-center velocity, normalized units/s (X axis). 0 when no time base.
+    #[serde(default)]
+    pub vx: f32,
+    /// Box-center velocity, normalized units/s (Y axis).
+    #[serde(default)]
+    pub vy: f32,
 }
 
 /// One streamed detection frame (server→client chunk). Carries the normalized
@@ -156,6 +165,15 @@ pub struct DetectionItem {
 pub struct CameraDetectionsFrame {
     pub camera_id: String,
     pub ts_ms: u64,
+    /// Frame PTS in the media timeline (nanoseconds) — shared clock with the MSE
+    /// init segment (`mux_base_pts_ns`) so the client anchors the overlay to the
+    /// exact video frame instead of wall-clock. `None` for wall-clock-only sources.
+    #[serde(default)]
+    pub pts_ns: Option<u64>,
+    /// Total per-frame processing time in ms (detection + OCR + state classify).
+    /// The client renders this as a latency badge; `0` when unknown.
+    #[serde(default)]
+    pub proc_ms: u32,
     pub items: Vec<DetectionItem>,
 }
 
@@ -351,6 +369,8 @@ mod tests {
         let v = CameraAdminPayload::DetectionsFrame(CameraDetectionsFrame {
             camera_id: "cam_550e8400-e29b-41d4-a716-446655440000".into(),
             ts_ms: 1_700_000_000_123,
+            pts_ns: Some(1_234_567_890),
+            proc_ms: 42,
             items: vec![
                 DetectionItem {
                     klasa: "tablica_adr".into(),
@@ -358,6 +378,9 @@ mod tests {
                     score: 0.96,
                     stan: Vec::new(),
                     tekst: Some("30/1202".into()),
+                    track_id: 7,
+                    vx: 0.01,
+                    vy: -0.02,
                 },
                 DetectionItem {
                     klasa: "nalepka_3".into(),
@@ -365,6 +388,9 @@ mod tests {
                     score: 0.94,
                     stan: vec!["uszkodzona".into()],
                     tekst: None,
+                    track_id: 0,
+                    vx: 0.,
+                    vy: 0.,
                 },
             ],
         });
@@ -378,12 +404,17 @@ mod tests {
             CameraDetectionsFrame {
                 camera_id: "cam_550e8400-e29b-41d4-a716-446655440000".into(),
                 ts_ms: 42,
+                pts_ns: None,
+                proc_ms: 0,
                 items: vec![DetectionItem {
                     klasa: "termometr".into(),
                     bbox: [0.0, 0.0, 0.1, 0.1],
                     score: 0.5,
                     stan: Vec::new(),
                     tekst: None,
+                    track_id: 0,
+                    vx: 0.,
+                    vy: 0.,
                 }],
             },
         ));

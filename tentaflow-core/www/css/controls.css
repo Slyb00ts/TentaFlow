@@ -8288,6 +8288,28 @@ tf-skeleton {
   padding: 2px 7px; border-radius: 4px; font-size: 10px; font-weight: 700;
   background: rgba(255,255,255,.12); color: #fff;
 }
+
+/* Grupa badge'y naglowka po prawej: ms, fps (kliencki), status. */
+.tf-live-camera__badges {
+  display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto;
+}
+
+/* Badge ms (czas obrobki backendu) — chip jak status, tlo fioletowo-szare. */
+.tf-live-camera__proc {
+  display: inline-flex; align-items: center;
+  padding: 2px 7px; border-radius: 4px;
+  font-weight: 700; font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  background: rgba(139,92,246,.85); color: #fff;
+}
+/* Badge fps (kliencki klatkaz wideo) — chip jak status, tlo niebieskie. */
+.tf-live-camera__vidfps {
+  display: inline-flex; align-items: center;
+  padding: 2px 7px; border-radius: 4px;
+  font-weight: 700; font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  background: rgba(59,130,246,.85); color: #fff;
+}
 .tf-live-camera__time {
   margin-left: auto; font-size: 10.5px; letter-spacing: .02em;
   font-family: var(--tf-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);

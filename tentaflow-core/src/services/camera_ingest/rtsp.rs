@@ -72,13 +72,15 @@ pub fn redact_rtsp_url(url: &str) -> String {
     url.to_string()
 }
 
-/// Redact any RTSP credentials embedded inside a free-form string (e.g. a
-/// GStreamer error message that quoted the original location). Anchored on
-/// `rtsp://` or `rtsps://` followed by anything up to `@`.
+/// Redact any RTSP/HTTP credentials embedded inside a free-form string (e.g.
+/// a GStreamer error message that quoted the original location). Anchored on
+/// `rtsp://`, `rtsps://`, `http://` or `https://` followed by anything up to
+/// `@` — HTTP(S) covers the MJPEG connector's souphttpsrc location.
 pub fn redact_url_in_text(text: &str) -> String {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re =
-        RE.get_or_init(|| Regex::new(r"(rtsps?)://[^@\s/]+@").expect("redact regex must compile"));
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(rtsps?|https?)://[^@\s/]+@").expect("redact regex must compile")
+    });
     re.replace_all(text, "$1://***:***@").into_owned()
 }
 
@@ -382,23 +384,45 @@ fn build_rtp_front() -> Result<(gst::Element, gst::Element, gst::Element)> {
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("tee: {e}")))?;
 
-    // Branch A queue — decouples RTP fan-out from decode latency so a slow
-    // appsink consumer cannot block the mux branch (and vice versa).
+    // Kolejka gałęzi A — odcina fan-out RTP od latencji dekodu. NIE-leaky:
+    // bufory to surowe pakiety RTP (przed depay), więc zrzucenie któregoś
+    // wycina fragment elementary stream i psuje access-unity aż do
+    // najbliższego IDR (artefakty/przeskoki). Gubienie klatek odbywa się
+    // dopiero ZA dekoderem (patrz `build_raw_leaky_queue`), gdzie bufor to
+    // pełna, zdekodowana klatka.
     let queue_a = gst::ElementFactory::make("queue")
         .property("name", "queue_branch_a")
-        .property("max-size-buffers", 30u32)
+        .property("max-size-buffers", 100u32)
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("queue_a: {e}")))?;
-    // `leaky` is a GFlags enum (GstQueueLeaky), not a raw uint. "downstream" =
-    // drop the oldest buffer when the queue fills up.
-    queue_a.set_property_from_str("leaky", "downstream");
     Ok((rtp_filter, tee, queue_a))
 }
 
+/// Buduje kolejkę leaky=downstream na surowe klatki wideo — jedyne bezpieczne
+/// miejsce gubienia przy spiętrzeniu (ZA dekoderem: drop zdekodowanej klatki
+/// nie psuje referencji strumienia, w przeciwieństwie do dropu pakietów RTP
+/// czy access-unitów przed dekoderem). Limit wyłącznie w buforach — surowa
+/// klatka 1080p RGB to ~6 MB, więc domyślny limit bajtowy kolejki (10 MB)
+/// zadziałałby już po 1 klatce; zerujemy limity bajtów i czasu.
+pub(super) fn build_raw_leaky_queue(name: &str) -> Result<gst::Element> {
+    let queue = gst::ElementFactory::make("queue")
+        .property("name", name)
+        .property("max-size-buffers", 5u32)
+        .property("max-size-bytes", 0u32)
+        .property("max-size-time", 0u64)
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("{name}: {e}")))?;
+    // `leaky` to enum GstQueueLeaky (nie surowy uint). "downstream" =
+    // po zapełnieniu zrzuca najstarszy bufor.
+    queue.set_property_from_str("leaky", "downstream");
+    Ok(queue)
+}
+
 /// Buduje appsink z kontraktem ingestu (RGB24, max-buffers=1, drop=true) i
-/// instaluje callback ramki. Wspólny dla obu wariantów — kontrakt downstream
-/// (FrameStorage / StreamingBus / fMP4) jest niezależny od ścieżki dekodowania.
-fn build_appsink(
+/// instaluje callback ramki. Wspólny dla obu wariantów RTSP oraz dla
+/// konektora MJPEG — kontrakt downstream (FrameStorage / StreamingBus / fMP4)
+/// jest niezależny od źródła i ścieżki dekodowania.
+pub(super) fn build_appsink(
     camera_id: String,
     mailbox: Arc<FrameMailbox>,
     counters: Arc<FrameCounters>,
@@ -506,6 +530,11 @@ fn build_rtsp_pipeline_cpu(
     );
     let (rtp_filter, tee, queue_a) = build_rtp_front()?;
 
+    // Kolejka leaky ZA dekoderem — jedyne miejsce gubienia klatek przy
+    // spiętrzeniu (drop zdekodowanej klatki jest bezpieczny, patrz
+    // `build_raw_leaky_queue`).
+    let queue_dec = build_raw_leaky_queue("queue_decoded_a")?;
+
     let convert = gst::ElementFactory::make("videoconvert")
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("videoconvert: {e}")))?;
@@ -527,6 +556,7 @@ fn build_rtsp_pipeline_cpu(
             &tee,
             &queue_a,
             &decodebin,
+            &queue_dec,
             &convert,
             &capsfilter,
             &appsink,
@@ -536,8 +566,8 @@ fn build_rtsp_pipeline_cpu(
     // Static segments:
     //   rtp_filter → tee (capsfilter pins RTP video before fan-out)
     //   tee.src_0 → queue_a → decodebin (request pad, Branch A always-on)
-    //   convert → capsfilter → appsink (after decode)
-    // rtspsrc → rtp_filter is dynamic (pad-added below) and decodebin → convert
+    //   queue_dec → convert → capsfilter → appsink (after decode)
+    // rtspsrc → rtp_filter is dynamic (pad-added below) and decodebin → queue_dec
     // is dynamic (decoder src pad appears after autoplug).
     gst::Element::link(&rtp_filter, &tee)
         .map_err(|e| CameraIngestError::PipelineBuild(format!("rtp_filter → tee: {e}")))?;
@@ -552,17 +582,17 @@ fn build_rtsp_pipeline_cpu(
         .map_err(|e| CameraIngestError::PipelineBuild(format!("tee → queue_a: {e:?}")))?;
     gst::Element::link(&queue_a, &decodebin)
         .map_err(|e| CameraIngestError::PipelineBuild(format!("queue_a → decodebin: {e}")))?;
-    gst::Element::link_many([&convert, &capsfilter, &appsink])
+    gst::Element::link_many([&queue_dec, &convert, &capsfilter, &appsink])
         .map_err(|e| CameraIngestError::PipelineBuild(format!("link_many tail: {e}")))?;
 
     // decodebin's video output pad appears dynamically once the codec is
-    // identified. Wire it into videoconvert when caps say video/x-raw.
-    let convert_weak = convert.downgrade();
+    // identified. Wire it into queue_dec when caps say video/x-raw.
+    let queue_dec_weak = queue_dec.downgrade();
     decodebin.connect_pad_added(move |_dec, src_pad| {
-        let Some(convert) = convert_weak.upgrade() else {
+        let Some(queue_dec) = queue_dec_weak.upgrade() else {
             return;
         };
-        let Some(sink_pad) = convert.static_pad("sink") else {
+        let Some(sink_pad) = queue_dec.static_pad("sink") else {
             return;
         };
         if sink_pad.is_linked() {
@@ -582,7 +612,7 @@ fn build_rtsp_pipeline_cpu(
             return;
         }
         if let Err(e) = src_pad.link(&sink_pad) {
-            tracing::warn!("rtsp: decodebin → videoconvert link failed: {e:?}");
+            tracing::warn!("rtsp: decodebin → queue_dec link failed: {e:?}");
         } else {
             tracing::info!("rtsp: decodebin video pad linked (codec auto-detected)");
         }
@@ -600,6 +630,7 @@ fn build_rtsp_pipeline_cpu(
 ///   rtspsrc → rtp_filter → tee → queue_a → rtphXdepay → hXparse →
 ///     nvhXdec (klatka w `video/x-raw(memory:CUDAMemory),NV12`) →
 ///     cudaconvert (NV12→RGBA na GPU) → cudadownload (CUDAMemory→host) →
+///     queue (leaky, gubienie całych klatek przy spiętrzeniu) →
 ///     videoconvert (siatka bezpieczeństwa do RGB) → capsfilter RGB → appsink
 ///
 /// `nvhXdec`/`rtphXdepay`/`hXparse` dobierane są w runtime wg kodeka strumienia
@@ -635,6 +666,10 @@ fn build_rtsp_pipeline_gpu_resident(
     let cudadownload = gst::ElementFactory::make("cudadownload")
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("cudadownload: {e}")))?;
+    // Kolejka leaky ZA dekoderem (po zejściu klatki do pamięci hosta) —
+    // jedyne bezpieczne miejsce gubienia przy spiętrzeniu, patrz
+    // `build_raw_leaky_queue`.
+    let queue_dec = build_raw_leaky_queue("queue_decoded_a")?;
     let convert = gst::ElementFactory::make("videoconvert")
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("videoconvert: {e}")))?;
@@ -655,6 +690,7 @@ fn build_rtsp_pipeline_gpu_resident(
             &queue_a,
             &cudaconvert,
             &cudadownload,
+            &queue_dec,
             &convert,
             &capsfilter,
             &appsink,
@@ -663,7 +699,8 @@ fn build_rtsp_pipeline_gpu_resident(
 
     // Statyczne segmenty znane przed negocjacją:
     //   rtp_filter → tee → queue_a (front RTP)
-    //   cudaconvert → cudadownload → videoconvert → capsfilter → appsink (ogon)
+    //   cudaconvert → cudadownload → queue_dec → videoconvert → capsfilter →
+    //   appsink (ogon)
     // Środek (depay → parse → nvhXdec) dobudowujemy dynamicznie po poznaniu
     // kodeka i wpinamy między queue_a a cudaconvert.
     gst::Element::link(&rtp_filter, &tee)
@@ -677,8 +714,15 @@ fn build_rtsp_pipeline_gpu_resident(
     tee_src_a
         .link(&queue_a_sink)
         .map_err(|e| CameraIngestError::PipelineBuild(format!("tee → queue_a: {e:?}")))?;
-    gst::Element::link_many([&cudaconvert, &cudadownload, &convert, &capsfilter, &appsink])
-        .map_err(|e| CameraIngestError::PipelineBuild(format!("link_many gpu tail: {e}")))?;
+    gst::Element::link_many([
+        &cudaconvert,
+        &cudadownload,
+        &queue_dec,
+        &convert,
+        &capsfilter,
+        &appsink,
+    ])
+    .map_err(|e| CameraIngestError::PipelineBuild(format!("link_many gpu tail: {e}")))?;
 
     // Dobudowa dekodera NVDEC po negocjacji RTP. queue_a ma stałe caps
     // `application/x-rtp` (rtp_filter wymusza video), ale `encoding-name`
@@ -838,6 +882,7 @@ fn install_frame_callback(
                     width: width as u32,
                     height: height as u32,
                     timestamp_unix_ms: ts_ms,
+                    pts_ns,
                     data: shared.clone(),
                 });
                 counters_cb.increment_public(ts_ms / 1000);
@@ -906,6 +951,31 @@ pub(super) fn wire_mp4_appsink(
     Ok(())
 }
 
+/// Pad-probe na src-padzie h264parse (bufory wchodzace do mp4mux): PIERWSZY
+/// bufor z ustawionym PTS ustala `mux_base_pts_ns` w publisherze i probe sam
+/// sie odpina. To ta sama oś czasu (media-timeline) co PTS appsink Branch A,
+/// bo Branch A i B dziela `tee` przed dekodem/muxem — klient odejmuje te baze
+/// od PTS detekcji, kotwiczac overlay na wlasciwej klatce MSE. Wspólne dla
+/// gałęzi B RTSP i MJPEG.
+pub(super) fn install_mux_base_pts_probe(parse: &gst::Element, publisher: &Arc<Mp4StreamPublisher>) {
+    if let Some(parse_src) = parse.static_pad("src") {
+        let pub_weak = std::sync::Arc::downgrade(publisher);
+        parse_src.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+            let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_ref() else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let Some(pts) = buffer.pts() else {
+                // Bufor bez PTS — czekamy na kolejny, nie odpinamy jeszcze probe.
+                return gst::PadProbeReturn::Ok;
+            };
+            if let Some(pub_arc) = pub_weak.upgrade() {
+                pub_arc.set_base_pts_ns(pts.nseconds());
+            }
+            gst::PadProbeReturn::Remove
+        });
+    }
+}
+
 /// Build and link Branch B (RTP → rtph264depay → h264parse → mp4mux → appsink)
 /// onto the running pipeline. Returns the branch state for later teardown,
 /// or `None` if the RTP caps say the stream is not H.264 (HEVC, MJPEG, …).
@@ -943,12 +1013,15 @@ fn attach_mp4_branch(
         ));
     }
 
+    // Kolejka gałęzi B — NIE-leaky: bufory to surowe pakiety RTP, a mux fMP4
+    // wymaga kompletnego elementary stream (drop pakietu = uszkodzone AU =
+    // artefakty w MSE). Gdy klient nie nadąża, przepełnienie obsługuje
+    // broadcast/subscriber_lagged wyżej (po stronie publishera), nie gstreamer.
     let queue_b = gst::ElementFactory::make("queue")
         .property("name", "queue_branch_b")
-        .property("max-size-buffers", 60u32)
+        .property("max-size-buffers", 120u32)
         .build()
         .map_err(|e| format!("queue_b build: {e}"))?;
-    queue_b.set_property_from_str("leaky", "downstream");
     let depay = gst::ElementFactory::make("rtph264depay")
         .build()
         .map_err(|e| format!("rtph264depay build: {e}"))?;
@@ -997,6 +1070,15 @@ fn attach_mp4_branch(
         .map_err(|e| format!("link branch B: {e}"))?;
 
     wire_mp4_appsink(&sink, publisher)?;
+
+    // Rebuild pipeline'u (reconnect) resetuje oś PTS mediów wraz z nowym
+    // init-segmentem. Ten sam publisher moze przezyc reconnect, wiec kasujemy
+    // stara baze — inaczej `set_base_pts_ns` (ustawia tylko gdy pusto) zostawilby
+    // baze z poprzedniej osi i overlay rozjechalby sie po reconnectcie. Po
+    // skasowaniu pierwszy bufor tej Branch B ustali baze spojna z init-segmentem.
+    publisher.reset_base_pts_ns();
+
+    install_mux_base_pts_probe(&parse, publisher);
 
     // Bring every new element up to the pipeline's current state so the
     // mux branch starts producing without needing a full pipeline restart.
@@ -1052,6 +1134,29 @@ pub(super) fn detach_mp4_branch(pipeline: &gst::Pipeline, tee: &gst::Element, st
     tee.release_request_pad(&state.tee_src_pad);
 }
 
+/// Zamyka strumień fMP4 aktywnej gałęzi B przy rozbiórce pipeline'u (reconnect,
+/// restart, stop). Protokół WS niesie `base_pts_ns` WYŁĄCZNIE w
+/// `StreamSubscribeResponse`, więc po rebuildzie pipeline'u nie da się dostarczyć
+/// świeżej bazy PTS już podłączonym subskrybentom — zamiast tego zamykamy ich
+/// strumień (`mark_unsupported` → odbiorcy broadcastu widzą `Closed`, warstwa WS
+/// wysyła `Closed(reason=source_unregistered)`), a frontend robi resubscribe:
+/// nowy attach gałęzi B da świeży init segment i świeżą bazę PTS w nowym
+/// `SubscribeResponse`. Bez tego klient wisiałby na wiecznie pustym strumieniu,
+/// a detekcje byłyby odrzucane przez starą bazę PTS.
+fn close_mp4_stream_on_teardown(
+    cam_id: &str,
+    publisher: &Option<std::sync::Weak<Mp4StreamPublisher>>,
+) {
+    if let Some(pub_) = publisher.as_ref().and_then(|w| w.upgrade()) {
+        tracing::info!(
+            camera_id = %cam_id,
+            "rtsp: pipeline rozebrany — zamykam strumień fMP4 gałęzi B; subskrybenci \
+             wykonają resubscribe i dostaną świeży init segment + bazę PTS"
+        );
+        pub_.mark_unsupported();
+    }
+}
+
 /// Entry point invoked by `spawn_session` for `vendor='rtsp'`. Drives the
 /// reconnect loop, owns the active pipeline, and translates control messages
 /// and bus events into health updates. Exits cleanly on
@@ -1067,16 +1172,30 @@ pub async fn run_rtsp_session(
     let cam_id = config.camera_id.clone();
     let timeout_secs = 10u32;
 
+    // Sesja obsługuje dwa vendory: `rtsp` (rtspsrc + dekod) i `mjpeg`
+    // (souphttpsrc + multipartdemux + jpegdec). Pętla reconnect/health jest
+    // wspólna; różni się tylko builder pipeline'u i attach gałęzi B.
+    let is_mjpeg = config.vendor == "mjpeg";
+
     // Ścieżka ingestu bieżącej próby. Start wg `resolve_ingest_path`:
     // preferuje GPU-resident NVIDIA (dekod + konwersja kolorów na GPU), gdy
     // sprzęt i elementy CUDA są obecne; inaczej CPU (decodebin). Po nieudanej
     // negocjacji GPU-resident (pipeline pada zanim wejdzie Online) schodzimy na
-    // CPU i zostajemy tam do końca życia sesji — „musi działać".
-    let mut ingest_path = resolve_ingest_path(&config);
+    // CPU i zostajemy tam do końca życia sesji — „musi działać". MJPEG dekoduje
+    // zawsze na CPU (jpegdec) — ścieżki GPU/HW go nie dotyczą.
+    let mut ingest_path = if is_mjpeg {
+        IngestPath::Cpu
+    } else {
+        resolve_ingest_path(&config)
+    };
     // Czy w wariancie CPU pozwolić decodebinowi autoplugować dekoder sprzętowy
     // (best-effort). Nieużywane dla ścieżki GPU-resident. Po nieudanej
     // negocjacji HW w wariancie CPU schodzimy na dekodowanie programowe.
-    let mut use_hw_decode = resolve_use_hw_decode(&config);
+    let mut use_hw_decode = if is_mjpeg {
+        false
+    } else {
+        resolve_use_hw_decode(&config)
+    };
     tracing::info!(
         camera_id = %cam_id,
         path = ingest_path.label(),
@@ -1109,9 +1228,16 @@ pub async fn run_rtsp_session(
     'outer: loop {
         // Resolve credentials at every (re)build so an in-flight
         // `camera_credentials_rotate_v1` takes effect on the next reconnect
-        // without us holding a stale plaintext across iterations.
-        let final_url = match resolve_pipeline_url(&config) {
-            Ok(u) => u,
+        // without us holding a stale plaintext across iterations. RTSP nakłada
+        // `user:pass` na URL (rtspsrc); MJPEG zostawia URL bez zmian i podaje
+        // parę poświadczeń do souphttpsrc (`user-id`/`user-pw`).
+        let resolved = if is_mjpeg {
+            super::mjpeg::resolve_http_credentials(&config).map(|c| (config.url.clone(), c))
+        } else {
+            resolve_pipeline_url(&config).map(|u| (u, None))
+        };
+        let (final_url, http_creds) = match resolved {
+            Ok(v) => v,
             Err(e) => {
                 let reason = redact_url_in_text(&format!("creds: {e}"));
                 publish(
@@ -1133,15 +1259,27 @@ pub async fn run_rtsp_session(
             path = ingest_path.label(),
             "rtsp: building pipeline"
         );
-        let handles = match build_rtsp_pipeline(
-            cam_id.clone(),
-            &final_url,
-            timeout_secs,
-            ingest_path,
-            use_hw_decode,
-            mailbox.clone(),
-            counters.clone(),
-        ) {
+        let build_result = if is_mjpeg {
+            super::mjpeg::build_mjpeg_pipeline(
+                cam_id.clone(),
+                &final_url,
+                http_creds.as_ref(),
+                timeout_secs,
+                mailbox.clone(),
+                counters.clone(),
+            )
+        } else {
+            build_rtsp_pipeline(
+                cam_id.clone(),
+                &final_url,
+                timeout_secs,
+                ingest_path,
+                use_hw_decode,
+                mailbox.clone(),
+                counters.clone(),
+            )
+        };
+        let handles = match build_result {
             Ok(h) => h,
             Err(e) => {
                 let reason = redact_url_in_text(&format!("build failed: {e}"));
@@ -1175,10 +1313,16 @@ pub async fn run_rtsp_session(
         let pipeline = &handles.pipeline;
         let tee = handles.tee.clone();
         // Branch B mux state — `Some` whenever a consumer is subscribed.
-        // The session re-establishes Branch B on every pipeline rebuild
-        // (i.e. after reconnect) because element state machines do not
-        // survive across `set_state(Null)`.
+        // Gałąź B NIE przeżywa rebuildu pipeline'u: przy rozbiórce zamykamy
+        // strumień publishera (`close_mp4_stream_on_teardown`), subskrybenci
+        // dostają `Closed(source_unregistered)` i robią resubscribe — świeży
+        // attach na nowym pipeline daje nowy init segment i nową bazę PTS.
         let mut branch_b: Option<Mp4BranchState> = None;
+        // Słaba referencja do publishera aktualnie wpiętej gałęzi B. Służy do:
+        // (a) zamknięcia strumienia przy rozbiórce pipeline'u, (b) ignorowania
+        // przeterminowanych `DetachMp4Branch` od STARYCH publisherów (komenda
+        // nie niesie tożsamości nadawcy), które inaczej zrywałyby świeżą gałąź.
+        let mut branch_b_publisher: Option<std::sync::Weak<Mp4StreamPublisher>> = None;
 
         tracing::info!(camera_id = %cam_id, "rtsp: setting pipeline state -> Playing");
         if let Err(e) = pipeline.set_state(gst::State::Playing) {
@@ -1278,6 +1422,7 @@ pub async fn run_rtsp_session(
                                 fps_window.back().copied(),
                             );
                             let _ = pipeline.set_state(gst::State::Null);
+                            close_mp4_stream_on_teardown(&cam_id, &branch_b_publisher);
                             publish(&health_tx, &cam_id, CameraStatus::Offline, None, &counters, None);
                             streaming_bus().close_camera(&cam_id, "stopped").await;
                             return;
@@ -1309,6 +1454,7 @@ pub async fn run_rtsp_session(
                                         height: f.height,
                                         pixel_format: PixelFormat::Rgb24,
                                         timestamp_unix_ms: f.timestamp_unix_ms,
+                                        pts_ns: f.pts_ns,
                                         data: f.data.to_vec(),
                                     });
                                 }
@@ -1337,13 +1483,21 @@ pub async fn run_rtsp_session(
                                 );
                                 publisher.mark_unsupported();
                             } else {
-                                match attach_mp4_branch(pipeline, &tee, &publisher) {
+                                // MJPEG transkoduje JPEG → H.264 (x264enc);
+                                // RTSP przepakowuje H.264 z RTP bez rekompresji.
+                                let attach_result = if is_mjpeg {
+                                    super::mjpeg::attach_mp4_branch_mjpeg(pipeline, &tee, &publisher)
+                                } else {
+                                    attach_mp4_branch(pipeline, &tee, &publisher)
+                                };
+                                match attach_result {
                                     Ok(state) => {
                                         tracing::info!(
                                             camera_id = %cam_id,
                                             "rtsp: branch B attached (fMP4 mux)"
                                         );
                                         branch_b = Some(state);
+                                        branch_b_publisher = Some(std::sync::Arc::downgrade(&publisher));
                                     }
                                     Err(reason) => {
                                         tracing::warn!(
@@ -1357,8 +1511,23 @@ pub async fn run_rtsp_session(
                             }
                         }
                         Some(SessionCommand::DetachMp4Branch) => {
-                            if let Some(state) = branch_b.take() {
+                            // Komenda nie niesie tożsamości nadawcy. Gdy publisher
+                            // aktualnie wpiętej gałęzi wciąż żyje (hub/subskrybenci
+                            // trzymają Arc), detach pochodzi od STAREGO publishera
+                            // (np. Drop po zamknięciu strumienia przy reconnectcie)
+                            // — ignorujemy go, żeby nie zrywać świeżej gałęzi.
+                            let current_alive = branch_b_publisher
+                                .as_ref()
+                                .is_some_and(|w| w.upgrade().is_some());
+                            if current_alive {
+                                tracing::debug!(
+                                    camera_id = %cam_id,
+                                    "rtsp: ignoruję przeterminowany DetachMp4Branch — \
+                                     aktualny publisher gałęzi B wciąż żyje"
+                                );
+                            } else if let Some(state) = branch_b.take() {
                                 detach_mp4_branch(pipeline, &tee, state);
+                                branch_b_publisher = None;
                                 tracing::info!(
                                     camera_id = %cam_id,
                                     "rtsp: branch B detached"
@@ -1448,6 +1617,10 @@ pub async fn run_rtsp_session(
         // failure). On a restart we skip backoff entirely and reset the
         // attempt counter so the new credentials are tried immediately.
         let _ = pipeline.set_state(gst::State::Null);
+        // Gałąź B umiera razem z pipeline'em — zamknij strumień publishera,
+        // żeby subskrybenci WS dostali `Closed(source_unregistered)` i zrobili
+        // resubscribe zamiast wisieć na pustym strumieniu ze starą bazą PTS.
+        close_mp4_stream_on_teardown(&cam_id, &branch_b_publisher);
         if restart_requested {
             tracing::info!(camera_id = %cam_id, "rtsp session restart requested; rebuilding pipeline");
             streaming_bus().close_camera(&cam_id, "restart").await;
@@ -1663,9 +1836,10 @@ async fn drain_until_stop(
     }
 }
 
-/// Spawn the RTSP session task. Used by `session::spawn_session` when
-/// `vendor == "rtsp"`. Returns the channels the supervisor stores in the
-/// `CameraHandle`.
+/// Spawn the RTSP/MJPEG session task. Used by `session::spawn_session` when
+/// `vendor == "rtsp"` or `vendor == "mjpeg"` (oba vendory współdzielą pętlę
+/// sesji `run_rtsp_session`; różni się builder pipeline'u). Returns the
+/// channels the supervisor stores in the `CameraHandle`.
 pub fn spawn_rtsp_session(
     config: CameraConfig,
     policy: ReconnectPolicy,
@@ -1674,7 +1848,11 @@ pub fn spawn_rtsp_session(
     watch::Receiver<CameraHealth>,
     tokio::task::JoinHandle<()>,
 )> {
-    validate_rtsp_url(&config.url)?;
+    if config.vendor == "mjpeg" {
+        super::mjpeg::validate_mjpeg_url(&config.url)?;
+    } else {
+        validate_rtsp_url(&config.url)?;
+    }
     if !(1..=60).contains(&config.target_fps) {
         return Err(CameraIngestError::InvalidConfig(format!(
             "target_fps must be 1..=60, got {}",
@@ -1764,6 +1942,47 @@ mod tests {
         // 50ms ±200% would otherwise dip into negatives; floor kicks in.
         let out = compute_backoff_with_jitter(base, 2.0, &mut rng);
         assert!(out >= Duration::from_millis(100));
+    }
+
+    /// Rozbiórka pipeline'u z aktywną gałęzią B musi zamknąć strumień
+    /// publishera: odbiorcy broadcastu widzą `Closed` (→ warstwa WS wysyła
+    /// `Closed(source_unregistered)` i frontend robi resubscribe), a hub
+    /// widzi źródło jako terminalne (`chunk_broadcaster() == None`), więc
+    /// kolejny subscribe zbuduje świeżego publishera z nową bazą PTS.
+    #[tokio::test]
+    async fn test_teardown_closes_active_mp4_stream() {
+        use crate::services::stream_hub::BinaryStreamSource;
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+        let publisher = Arc::new(Mp4StreamPublisher::new("cam_teardown".into(), cmd_tx));
+        let mut rx = publisher
+            .chunk_broadcaster()
+            .expect("broadcaster live")
+            .subscribe();
+        let weak = Some(Arc::downgrade(&publisher));
+
+        close_mp4_stream_on_teardown("cam_teardown", &weak);
+
+        assert!(
+            rx.recv().await.is_err(),
+            "subskrybent musi zobaczyć Closed po rozbiórce pipeline'u"
+        );
+        assert!(
+            publisher.chunk_broadcaster().is_none(),
+            "hub musi widzieć źródło jako terminalne, by kolejny subscribe zbudował nowego publishera"
+        );
+    }
+
+    /// Brak aktywnej gałęzi B (None) i martwy publisher (Weak bez silnych
+    /// referencji) — rozbiórka jest no-opem i nie może panikować.
+    #[test]
+    fn test_teardown_noop_without_active_publisher() {
+        close_mp4_stream_on_teardown("cam_none", &None);
+
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+        let publisher = Arc::new(Mp4StreamPublisher::new("cam_dead".into(), cmd_tx));
+        let weak = Some(Arc::downgrade(&publisher));
+        drop(publisher);
+        close_mp4_stream_on_teardown("cam_dead", &weak);
     }
 
     #[test]

@@ -26,6 +26,10 @@ pub struct SubscriptionHandle {
     pub stream_id: String,
     pub mime_type: String,
     pub init_segment: Option<Bytes>,
+    /// Bazowy PTS osi mediów (ns) zrodla fMP4 — przekazywany klientowi razem z
+    /// init-segmentem, by odjac offset osi mediów od PTS detekcji. `None` dla
+    /// zrodel bez wspolnej osi czasu z detekcjami.
+    pub base_pts_ns: Option<u64>,
     pub receiver: broadcast::Receiver<Bytes>,
     // Held purely for the `Drop` side effect: decrements the hub's
     // per-source subscriber counter and removes the source when it hits 0.
@@ -50,6 +54,7 @@ impl SubscriptionHandle {
         stream_id: String,
         mime_type: String,
         init_segment: Option<Bytes>,
+        base_pts_ns: Option<u64>,
         receiver: broadcast::Receiver<Bytes>,
         token: SubscriberToken,
     ) -> Self {
@@ -57,6 +62,7 @@ impl SubscriptionHandle {
             stream_id,
             mime_type,
             init_segment,
+            base_pts_ns,
             receiver,
             _token: token,
         }

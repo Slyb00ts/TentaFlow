@@ -54,7 +54,8 @@
     "prompts_user": "Invites",
     "profile": "Profil",
     "my_accounts": "Mes comptes",
-    "settings_user": "Paramètres"
+    "settings_user": "Paramètres",
+    "benchmark_studio": "Benchmark Studio"
   },
   "agents": {
     "title": "Agents",
@@ -1303,6 +1304,8 @@
     "dynamic_empty": "— no available {source} {category} —",
     "dynamic_stale": "{value} (unavailable)",
     "harness_default_hint": "Empty → built-in default",
+    "vision_alias_label": "CV service (alias)",
+    "vision_alias_hint": "CV service from the registry (surface camera_cv). Empty → default alias {default}.",
     "loop_region_section": "Loop region config",
     "harness": {
       "skills_template": "Skills index template",

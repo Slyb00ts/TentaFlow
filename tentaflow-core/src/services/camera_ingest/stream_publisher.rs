@@ -81,6 +81,11 @@ pub struct Mp4StreamPublisher {
     pending_init: Mutex<Vec<u8>>,
     media_buf: Mutex<Vec<u8>>,
     first_chunk_seen: AtomicBool,
+    /// PTS (media-timeline, ns) PIERWSZEGO buforu wchodzacego do mp4mux w Branch
+    /// B. Bo Branch A i B dziela ten sam `tee` przed dekodem/muxem, jest to ta
+    /// sama oś czasu co PTS detekcji — klient dodaje ja do init-segmentu MSE, by
+    /// odjac offset osi mediów i zakotwiczyc overlay na wlasciwej klatce.
+    base_pts_ns: Mutex<Option<u64>>,
 }
 
 impl std::fmt::Debug for Mp4StreamPublisher {
@@ -120,9 +125,30 @@ impl Mp4StreamPublisher {
             chunks_tx: Mutex::new(Some(chunks_tx)),
             first_chunk_seen: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
+            base_pts_ns: Mutex::new(None),
             cmd_tx,
         }
     }
+
+    /// Zapisuje bazowy PTS (media-timeline, ns) osi mediów Branch B. Wolane raz,
+    /// z pad-probe na pierwszym buforze mux/h264parse. Kolejne wywolania sa
+    /// ignorowane — baza jest ustalana tylko przez pierwszy bufor.
+    pub fn set_base_pts_ns(&self, pts_ns: u64) {
+        let mut guard = self.base_pts_ns.lock();
+        if guard.is_none() {
+            *guard = Some(pts_ns);
+        }
+    }
+
+    /// Kasuje bazowy PTS. Wolane przy odpieciu/rebuildzie Branch B: po reconnect
+    /// oś PTS mediów resetuje sie wraz z nowym init-segmentem, wiec stara baza
+    /// jest juz nieaktualna. Bez tego overlay rozjezdza sie po reconnectcie, bo
+    /// `set_base_pts_ns` ustawia baze tylko gdy jest pusta. Po skasowaniu pierwszy
+    /// bufor NOWEJ Branch B ustali baze spojna z nowym init-segmentem.
+    pub fn reset_base_pts_ns(&self) {
+        *self.base_pts_ns.lock() = None;
+    }
+
 
     /// Push bytes from the `mp4mux` appsink. The muxer flushes raw fMP4
     /// boxes in arbitrary chunks — a single `GstBuffer` may contain a partial
@@ -283,6 +309,12 @@ impl BinaryStreamSource for Mp4StreamPublisher {
 
     fn chunk_broadcaster(&self) -> Option<broadcast::Sender<Bytes>> {
         self.chunks_tx.lock().clone()
+    }
+
+    /// Bazowy PTS osi mediów Branch B (ns) albo `None`, gdy pierwszy bufor jeszcze
+    /// nie przeszedl przez pad-probe. Klient MSE dolacza to do init-segmentu.
+    fn base_pts_ns(&self) -> Option<u64> {
+        *self.base_pts_ns.lock()
     }
 }
 

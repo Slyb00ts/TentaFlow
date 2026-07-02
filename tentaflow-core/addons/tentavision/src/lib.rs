@@ -1965,29 +1965,30 @@ impl SearchState {
     }
 }
 
-/// The four camera source types the backend supports. Drives every per-step
+/// The five camera source types the backend supports. Drives every per-step
 /// branch of the add-camera wizard. `vendor()` maps each type to the stable
 /// TentaFlow vendor string the `camera_add` host function expects.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SourceType { Onvif, Rtsp, Usb, File }
+enum SourceType { Onvif, Rtsp, Mjpeg, Usb, File }
 
 impl SourceType {
     fn from_str(s: &str) -> Option<Self> {
         match s {
             "onvif" => Some(Self::Onvif),
             "rtsp" => Some(Self::Rtsp),
+            "mjpeg" => Some(Self::Mjpeg),
             "usb" => Some(Self::Usb),
             "file" => Some(Self::File),
             _ => None,
         }
     }
     fn as_str(self) -> &'static str {
-        match self { Self::Onvif => "onvif", Self::Rtsp => "rtsp", Self::Usb => "usb", Self::File => "file" }
+        match self { Self::Onvif => "onvif", Self::Rtsp => "rtsp", Self::Mjpeg => "mjpeg", Self::Usb => "usb", Self::File => "file" }
     }
     fn vendor(self) -> &'static str {
         // USB enumeration reports `v4l2` on Linux; the local-device list carries
         // the authoritative vendor, but the manual-path fallback uses this.
-        match self { Self::Onvif => "onvif", Self::Rtsp => "rtsp", Self::Usb => "v4l2", Self::File => "fake_file" }
+        match self { Self::Onvif => "onvif", Self::Rtsp => "rtsp", Self::Mjpeg => "mjpeg", Self::Usb => "v4l2", Self::File => "fake_file" }
     }
 }
 
@@ -2011,6 +2012,7 @@ struct DiscoverState {
     // Per-type manual entry fields.
     onvif_url: String,
     rtsp_url: String,
+    mjpeg_url: String,
     file_path: String,
     cred_user: String,
     cred_pass: String,
@@ -2036,7 +2038,7 @@ impl DiscoverState {
             source_type: None,
             scanning: false, cameras: Vec::new(), selected_index: None,
             usb_devices: Vec::new(), usb_loaded: false, usb_device_path: String::new(),
-            onvif_url: String::new(), rtsp_url: String::new(), file_path: String::new(),
+            onvif_url: String::new(), rtsp_url: String::new(), mjpeg_url: String::new(), file_path: String::new(),
             cred_user: String::new(), cred_pass: String::new(),
             test_result: None, testing: false,
             name: String::new(), retention: String::new(), fps: String::new(),
@@ -2078,6 +2080,17 @@ impl DiscoverState {
                     return Err("Adres RTSP musi zaczynać się od rtsp:// lub rtsps://.");
                 }
                 Ok(("rtsp".to_string(), url.to_string(), None))
+            }
+            Some(SourceType::Mjpeg) => {
+                let url = self.mjpeg_url.trim();
+                if url.is_empty() {
+                    return Err("Podaj adres strumienia MJPEG (HTTP).");
+                }
+                let lower = url.to_ascii_lowercase();
+                if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+                    return Err("Adres MJPEG musi zaczynać się od http:// lub https://.");
+                }
+                Ok(("mjpeg".to_string(), url.to_string(), None))
             }
             Some(SourceType::Usb) => {
                 let path = self.usb_device_path.trim();
@@ -2827,6 +2840,7 @@ fn handle_wizard_source_select(params: &JsonValue) -> JsonValue {
             s.discover.usb_device_path.clear();
             s.discover.onvif_url.clear();
             s.discover.rtsp_url.clear();
+            s.discover.mjpeg_url.clear();
             s.discover.file_path.clear();
             s.discover.test_result = None;
         }
@@ -2838,7 +2852,7 @@ fn handle_wizard_source_select(params: &JsonValue) -> JsonValue {
     if changed {
         // Mirror the per-type field reset into the bound store keys so any
         // previously typed value disappears from the inputs as well.
-        for key in ["onvif_url", "rtsp_url", "usb_device_path", "file_path"] {
+        for key in ["onvif_url", "rtsp_url", "mjpeg_url", "usb_device_path", "file_path"] {
             pairs.push((key.into(), Value::Text(String::new())));
         }
         pairs.extend(wizard_test_pairs(&DiscoverState::new()));
@@ -2861,6 +2875,7 @@ fn handle_wizard_field_change(params: &JsonValue) -> JsonValue {
         match field {
             "onvif_url" => s.discover.onvif_url = value,
             "rtsp_url" => s.discover.rtsp_url = value,
+            "mjpeg_url" => s.discover.mjpeg_url = value,
             "usb_device_path" => s.discover.usb_device_path = value,
             "file_path" => s.discover.file_path = value,
             "cred_user" => s.discover.cred_user = value,
@@ -3070,11 +3085,14 @@ fn handle_camera_add_submit(_params: &JsonValue) -> JsonValue {
     }
 }
 
-/// Per-row probe target: ONVIF cameras probe their device-service URL, everything
+/// Per-row probe target: ONVIF cameras probe their device-service URL, MJPEG
+/// rows (vendor persisted in `detectors`) probe their HTTP URL, everything
 /// else probes the RTSP(S) URL. Returns (vendor, url) for `camera_test_connection`.
 fn camera_row_probe_target(c: &db::CameraRow) -> (String, String) {
     if !c.onvif_url.trim().is_empty() {
         ("onvif".to_string(), c.onvif_url.clone())
+    } else if c.detectors == "mjpeg" {
+        ("mjpeg".to_string(), c.rtsp_url.clone())
     } else {
         ("rtsp".to_string(), c.rtsp_url.clone())
     }
@@ -4905,7 +4923,7 @@ fn wizard_step_pairs(step: u8) -> Vec<(String, Value)> {
     ]
 }
 
-/// Visibility pairs for the four per-type config blocks of step 2. Exactly one
+/// Visibility pairs for the five per-type config blocks of step 2. Exactly one
 /// is `true` for the chosen source; switching type is a `StatePatch` that flips
 /// these, revealing the matching config without rebuilding the body.
 fn wizard_source_pairs(src: Option<SourceType>) -> Vec<(String, Value)> {
@@ -4914,6 +4932,7 @@ fn wizard_source_pairs(src: Option<SourceType>) -> Vec<(String, Value)> {
         ("wiz_src".into(), Value::Text(s.into())),
         ("wiz_is_onvif".into(), Value::Bool(src == Some(SourceType::Onvif))),
         ("wiz_is_rtsp".into(), Value::Bool(src == Some(SourceType::Rtsp))),
+        ("wiz_is_mjpeg".into(), Value::Bool(src == Some(SourceType::Mjpeg))),
         ("wiz_is_usb".into(), Value::Bool(src == Some(SourceType::Usb))),
         ("wiz_is_file".into(), Value::Bool(src == Some(SourceType::File))),
     ]
@@ -4986,6 +5005,7 @@ fn wizard_full_overlay() -> Vec<StateEntry> {
     let fields = with_state(|s| [
         ("onvif_url", s.discover.onvif_url.clone()),
         ("rtsp_url", s.discover.rtsp_url.clone()),
+        ("mjpeg_url", s.discover.mjpeg_url.clone()),
         ("usb_device_path", s.discover.usb_device_path.clone()),
         ("file_path", s.discover.file_path.clone()),
         ("cred_user", s.discover.cred_user.clone()),
@@ -5119,6 +5139,14 @@ fn build_wizard_step_source_type() -> Component {
             disabled: false,
         },
         RadioCardOption {
+            value: SelectValue::Text(SourceType::Mjpeg.as_str().into()),
+            icon: icon_named(parse_icon_name("video")),
+            title: lit("MJPEG (HTTP)"),
+            description: Some(lit("Strumień multipart MJPEG po http:// lub https:// (np. Axis video.cgi).")),
+            badge: None,
+            disabled: false,
+        },
+        RadioCardOption {
             value: SelectValue::Text(SourceType::Usb.as_str().into()),
             icon: icon_named(parse_icon_name("cameras")),
             title: lit("Kamera lokalna / USB"),
@@ -5161,13 +5189,14 @@ fn build_wizard_step_source_type() -> Component {
     ])
 }
 
-/// Step 2 — all four per-type config blocks present at once, each wrapped in a
+/// Step 2 — all five per-type config blocks present at once, each wrapped in a
 /// `with_visible` container bound to its `wiz_is_X` flag. Switching source type
 /// is a `StatePatch` that flips exactly one flag visible.
 fn build_wizard_step_config() -> Component {
     stack_v(vec![
         with_visible(build_config_onvif(), "wiz_is_onvif"),
         with_visible(build_config_rtsp(), "wiz_is_rtsp"),
+        with_visible(build_config_mjpeg(), "wiz_is_mjpeg"),
         with_visible(build_config_usb(), "wiz_is_usb"),
         with_visible(build_config_file(), "wiz_is_file"),
     ])
@@ -5258,6 +5287,20 @@ fn build_config_rtsp() -> Component {
     let pass_input = wizard_input("Hasło (opcjonalnie)", "", "cred_pass", true);
     stack_v(vec![
         text("Podaj adres strumienia RTSP/RTSPS. Poświadczenia są opcjonalne."),
+        url_input,
+        grid(2, vec![user_input, pass_input]),
+    ])
+}
+
+/// Blok konfiguracji MJPEG (HTTP). Adres strumienia multipart (np. Axis
+/// `/axis-cgi/mjpg/video.cgi`) + opcjonalne poświadczenia — host przekazuje je
+/// do souphttpsrc (`user-id`/`user-pw`), nie do URL-a.
+fn build_config_mjpeg() -> Component {
+    let url_input = wizard_input("URL strumienia MJPEG", "http://10.0.0.5/axis-cgi/mjpg/video.cgi", "mjpeg_url", false);
+    let user_input = wizard_input("Użytkownik (opcjonalnie)", "", "cred_user", false);
+    let pass_input = wizard_input("Hasło (opcjonalnie)", "", "cred_pass", true);
+    stack_v(vec![
+        text("Podaj adres strumienia MJPEG (multipart) po HTTP/HTTPS. Poświadczenia są opcjonalne."),
         url_input,
         grid(2, vec![user_input, pass_input]),
     ])

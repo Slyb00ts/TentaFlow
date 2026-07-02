@@ -197,7 +197,7 @@ async fn central_worker() {
             // pose from THAT time — not "latest". The camera (WebRTC decode) lags the
             // light pose telemetry, so using the latest pose smears the cloud by the
             // camera latency × angular velocity whenever the robot turns.
-            let Some((rgb, w, h, captured_ms)) =
+            let Some((rgb, w, h, captured_ms, _pts_ns)) =
                 crate::addon::host_functions::camera::latest_frame_global(cam).await
             else {
                 continue; // no frame yet

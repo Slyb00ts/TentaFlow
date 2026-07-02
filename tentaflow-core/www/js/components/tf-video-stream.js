@@ -14,9 +14,10 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 // Domyslna wysokosc tile'a w px gdy atrybut nie ustawiony.
 const DEFAULT_HEIGHT_PX = 320;
 
-// Po `subscriber_lagged` server konczy strumien — natychmiast probojemy
-// resubscribe z mala przerwa zeby UI nie migalo bez powodu.
-const LAG_RESUBSCRIBE_DELAY_MS = 1000;
+// Backoff kolejnych prob resubscribe po zerwaniu strumienia (lag / pad
+// transportu / zamkniecie zrodla). Pierwsza proba szybko (UI nie miga bez
+// powodu), kolejne coraz rzadziej; ostatnia wartosc powtarzana az do sukcesu.
+const RESUBSCRIBE_BACKOFF_MS = [1000, 2000, 5000];
 
 class TfVideoStream extends HTMLElement {
   static get observedAttributes() {
@@ -37,10 +38,26 @@ class TfVideoStream extends HTMLElement {
     this._subscriptionUnsub = null;
     this._activeStreamId = null;
     this._resubscribeTimer = null;
+    // Licznik prob resubscribe (indeks do RESUBSCRIBE_BACKOFF_MS) — zerowany
+    // po udanym SubscribeResponse. Unsub listenera lifecycle WS ('open') —
+    // pozwala wznowic subskrypcje natychmiast po powrocie transportu zamiast
+    // czekac na kolejny tick backoffu.
+    this._resubscribeAttempt = 0;
+    this._lifecycleUnsub = null;
     this._disposed = false;
     // CorrelationId aktywnej subskrypcji — potrzebny zeby wyslac
     // StreamCloseRequest na tym samym id co oryginalny SubscribeRequest.
     this._activeCorrelationId = null;
+    // Baza media-timeline (ns) z StreamSubscribeResponse — offset, ktory nakladka
+    // detekcji odejmuje od `pts_ns` ramek, by kotwiczyc overlay na klatce wideo.
+    // null gdy strumien nie ma wspolnej osi z detekcjami (LiDAR/audio/relay).
+    this._basePtsNs = null;
+  }
+
+  // Udostepnia baze media-time (ns) dla nakladki detekcji. Nakladka czyta ten
+  // getter przez `mediaBasePtsProvider` co klatke — sledzi zmiane przy resubscribe.
+  get mediaBasePtsNs() {
+    return this._basePtsNs;
   }
 
   connectedCallback() {
@@ -181,6 +198,7 @@ class TfVideoStream extends HTMLElement {
       return;
     }
     this._activeStreamId = streamId;
+    this._basePtsNs = null;
     this._setStatus('Łączenie ze strumieniem…');
 
     const mediaSource = new MediaSource();
@@ -239,6 +257,10 @@ class TfVideoStream extends HTMLElement {
       .catch((err) => {
         console.warn('[tf-video-stream] subscribe failed:', err?.message ?? err);
         this._setStatus('Nie udało się otworzyć strumienia.');
+        // Subskrypcja nie doszla do skutku (np. WS w trakcie reconnectu) —
+        // sprzatnij pipeline i probuj ponownie z backoffem, az sie uda.
+        this._resetMediaPipeline();
+        this._scheduleResubscribe();
       });
   }
 
@@ -246,7 +268,11 @@ class TfVideoStream extends HTMLElement {
     if (this._disposed) return;
     if (!body || typeof body !== 'object') return;
     if (body.variant === 'StreamSubscribeResponse') {
+      this._resubscribeAttempt = 0;
       this._mime = String(body.mime_type ?? body.mimeType ?? '');
+      const base = body.base_pts_ns ?? body.basePtsNs;
+      this._basePtsNs = base == null ? null : (typeof base === 'bigint' ? Number(base) : Number(base));
+      if (!Number.isFinite(this._basePtsNs)) this._basePtsNs = null;
       this._tryCreateSourceBuffer();
       return;
     }
@@ -265,14 +291,20 @@ class TfVideoStream extends HTMLElement {
   _onSubscriptionEnd(body) {
     if (this._disposed) return;
     const reason = String(body?.reason ?? '');
-    if (reason === 'subscriber_lagged') {
-      console.warn('[tf-video-stream] subscriber lagged, resubscribing');
+    // Zerwania wymagajace pelnego restartu pipeline'u + resubscribe:
+    //   subscriber_lagged   — serwer ubil subskrypcje (klient nie nadazal),
+    //   transport_closed    — syntetyczny koniec po padzie WS (po reconnect
+    //                          serwer nie zna starych subskrypcji per-socket),
+    //   source_unregistered — zrodlo zniklo (np. restart kamery); po powrocie
+    //                          kafelek ma sam wrocic do zycia.
+    if (
+      reason === 'subscriber_lagged' ||
+      reason === 'transport_closed' ||
+      reason === 'source_unregistered'
+    ) {
+      console.warn(`[tf-video-stream] strumien zerwany (${reason}), resubscribe`);
       this._resetMediaPipeline();
       this._scheduleResubscribe();
-      return;
-    }
-    if (reason === 'source_unregistered') {
-      this._setStatus('Strumień zakończony.');
       return;
     }
     if (reason === 'client_request' || reason === '') {
@@ -467,6 +499,7 @@ class TfVideoStream extends HTMLElement {
     this._appending = false;
     this._sourceBuffer = null;
     this._mime = null;
+    this._basePtsNs = null;
     this._mediaSourceReady = false;
     if (this._mediaSource) {
       try {
@@ -502,11 +535,31 @@ class TfVideoStream extends HTMLElement {
     if (this._disposed) return;
     if (this._resubscribeTimer != null) return;
     this._setStatus('Łączenie ponownie…');
+    const delay =
+      RESUBSCRIBE_BACKOFF_MS[Math.min(this._resubscribeAttempt, RESUBSCRIBE_BACKOFF_MS.length - 1)];
+    this._resubscribeAttempt += 1;
     this._resubscribeTimer = setTimeout(() => {
       this._resubscribeTimer = null;
       if (this._disposed || !this.isConnected) return;
       this._startSubscription();
-    }, LAG_RESUBSCRIBE_DELAY_MS);
+    }, delay);
+    // Gdy WS lezy, nie czekaj slepo na tick backoffu — jednorazowy listener
+    // lifecycle 'open' wznawia subskrypcje od razu po powrocie transportu.
+    if (!ApiBinary.isConnected() && !this._lifecycleUnsub) {
+      this._lifecycleUnsub = ApiBinary.onLifecycle((ev) => {
+        if (ev.type !== 'open') return;
+        if (this._lifecycleUnsub) {
+          this._lifecycleUnsub();
+          this._lifecycleUnsub = null;
+        }
+        if (this._disposed || !this.isConnected) return;
+        if (this._resubscribeTimer != null) {
+          clearTimeout(this._resubscribeTimer);
+          this._resubscribeTimer = null;
+        }
+        this._startSubscription();
+      });
+    }
   }
 
   _stopSubscription(_reason) {
@@ -518,6 +571,11 @@ class TfVideoStream extends HTMLElement {
       clearTimeout(this._resubscribeTimer);
       this._resubscribeTimer = null;
     }
+    if (this._lifecycleUnsub) {
+      this._lifecycleUnsub();
+      this._lifecycleUnsub = null;
+    }
+    this._resubscribeAttempt = 0;
     // ApiBinary.subscribe usuwa server-side state przez StreamEnd; bezposrednio
     // zamykajac listener prosto unsubscribe'ujemy. Serwer wykryje rozlaczony
     // socket lub klient moze opcjonalnie wyslac StreamCloseRequest — robimy

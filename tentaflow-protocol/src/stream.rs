@@ -64,6 +64,12 @@ pub struct StreamSubscribeResponse {
     pub mime_type: String,
     /// `true` when the next `Frame` will carry `is_init = true`.
     pub has_init_segment: bool,
+    /// Base PTS of the media timeline (nanoseconds) for fMP4 camera streams —
+    /// the offset the client subtracts from each detection's `pts_ns` to anchor
+    /// the overlay on the exact video frame. `None` for streams with no shared
+    /// clock with detections (LiDAR, audio, relay).
+    #[serde(default)]
+    pub base_pts_ns: Option<u64>,
 }
 
 #[derive(
@@ -125,6 +131,7 @@ mod tests {
             stream_id: "camera:xyz".into(),
             mime_type: "video/mp4; codecs=\"avc1.64001f\"".into(),
             has_init_segment: true,
+            base_pts_ns: Some(1_234_567_890),
         });
         assert_eq!(round_trip!(StreamPayload, v.clone()), v);
     }

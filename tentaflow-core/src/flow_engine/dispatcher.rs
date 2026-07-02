@@ -343,8 +343,8 @@ impl FlowDispatcher {
         let tts: Arc<dyn TtsDispatcher> =
             Arc::new(TtsDispatcherImpl::new(runtime_slot.clone(), ctx_blobs.clone()));
         let stt: Arc<dyn SttDispatcher> =
-            Arc::new(SttDispatcherImpl::new(runtime_slot, ctx_blobs.clone()));
-        let vision: Arc<dyn VisionDispatcher> = Arc::new(VisionDispatcherImpl::new());
+            Arc::new(SttDispatcherImpl::new(runtime_slot.clone(), ctx_blobs.clone()));
+        let vision: Arc<dyn VisionDispatcher> = Arc::new(VisionDispatcherImpl::new(runtime_slot));
 
         // RAG E1.0 — współdzielony proces-szeroki rejestr przestrzeni wektorowych.
         // Te same backendy co host functions addona (jeden katalog w procesie),
@@ -1265,7 +1265,11 @@ mod tests {
             documents: Arc::new(StubDocuments),
             stt: Arc::new(StubStt),
             tts: Arc::new(StubTts),
-            vision: Arc::new(crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new()),
+            // Pusty slot executora — stub factory testów idzie ścieżką fallback
+            // (bezpośrednie singletony) w VisionDispatcherImpl.
+            vision: Arc::new(crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new(
+                Arc::new(parking_lot::RwLock::new(None)),
+            )),
             prompts: Arc::new(StubPrompts),
             memory: Arc::new(StubMemory),
             history: Arc::new(StubHistory),

@@ -65,6 +65,24 @@ const LOOP_REGION_FIELDS = [
   { key: 'loop_final_pass', kind: 'bool' },
 ];
 
+// Wezly wizyjne (FAZA 6, CV przez executor) nie maja params_schema w
+// flow_node_templates — pole `alias` renderujemy tutaj jako SELECT zasilany
+// katalogiem serwisow (surface `camera_cv`). Backend czyta `node.config["alias"]`;
+// pusta wartosc oznacza "uzyj domyslnego aliasu" (defaultAlias, vision_impl.rs).
+const VISION_ALIAS_FIELDS = {
+  vision_classify: { key: 'alias', defaultAlias: 'tentavision-action' },
+  vision_ocr: { key: 'alias', defaultAlias: 'tentavision-ocr' },
+};
+
+// Seedowane aliasy CV (seed_camera_cv_aliases) — fallback dropdowna gdy
+// katalog jest chwilowo niedostepny albo pusty.
+const CV_SEED_ALIASES = [
+  'tentavision-detect',
+  'tentavision-stan',
+  'tentavision-ocr',
+  'tentavision-action',
+];
+
 // Cache dla dynamic_enum dropdown opcji. Klucz `<source>:<category>`. Wartosc
 // to Promise<Array<{value,label}>> — pojedynczy fetch na cala sesje GUI.
 // Inwalidacja po przeladowaniu strony (Ctrl+Shift+R) — zmiana modeli/aliasow
@@ -112,6 +130,32 @@ async function loadDynamicEnumOptions(source, category) {
         });
       }
       return opts;
+    }
+    if (source === 'cv_services') {
+      // Zunifikowany katalog (serwisy + aliasy + flow) zawezony klientowo do
+      // surface `camera_cv` — ten sam endpoint co zakladka Models w Services.
+      const entries = await ApiBinary.list('catalogListRequest', { arrayKey: 'entries' }).catch(() => []);
+      const cv = (Array.isArray(entries) ? entries : []).filter((e) => {
+        const surfaces = e?.serviceSurfaces || e?.service_surfaces || [];
+        return Array.isArray(surfaces) && surfaces.includes('camera_cv');
+      });
+      // Aliasy najpierw (z celem po strzalce, jak przy modelach), potem
+      // bezposrednie wpisy serwisow/flow.
+      const aliasOpts = [];
+      const directOpts = [];
+      for (const e of cv) {
+        if (!e?.id) continue;
+        const kindWrapper = e.kind || {};
+        if (kindWrapper.kind === 'alias') {
+          const target = kindWrapper.target || '';
+          aliasOpts.push({ value: e.id, label: target ? `↪ ${e.id} → ${target}` : e.id });
+        } else {
+          directOpts.push({ value: e.id, label: e.id });
+        }
+      }
+      const opts = [...aliasOpts, ...directOpts];
+      if (opts.length) return opts;
+      return CV_SEED_ALIASES.map((a) => ({ value: a, label: a }));
     }
     if (source === 'prompts') {
       const list = await ApiBinary.list('promptListRequest', { arrayKey: 'prompts' }).catch(() => []);
@@ -358,6 +402,18 @@ export class FlowConfig {
       html += this._renderHarnessField(f, n.config?.[f.key]);
     }
 
+    // Wezly wizyjne: wybor serwisu CV (aliasu) z katalogu zamiast recznego
+    // wpisywania. Renderowane tylko gdy schema nie pokrywa juz tego klucza.
+    const visionField = VISION_ALIAS_FIELDS[n.type];
+    if (visionField && !keys.includes(visionField.key)) {
+      html += this._renderField(visionField.key, {
+        type: 'string',
+        title: I18n.t('flows_config.vision_alias_label'),
+        description: I18n.t('flows_config.vision_alias_hint', { default: visionField.defaultAlias }),
+        dynamic_enum: { source: 'cv_services' },
+      }, n.config?.[visionField.key], false);
+    }
+
     // Region-level loop config belongs to the region-ENTRY node only (target of
     // the region's loop_back edge), independent of node_type. The role is read
     // from the live graph so it tracks edits without a schema marker.
@@ -369,7 +425,7 @@ export class FlowConfig {
       }
     }
 
-    if (keys.length === 0 && harness.length === 0 && !isRegionEntry) {
+    if (keys.length === 0 && harness.length === 0 && !visionField && !isRegionEntry) {
       html += `<div class="fb-field-hint">${escapeHtml(I18n.t('flows_config.no_params_hint'))}</div>`;
     }
 

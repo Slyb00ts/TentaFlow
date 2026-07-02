@@ -73,11 +73,11 @@ const PERM_CAMERAS_SNAPSHOT: &str = "cameras.snapshot";
 /// RTSP URI from the device-service URL and persists the derivation
 /// (`onvif_url` + `onvif_profile_token`) so a later credentials rotation
 /// can re-resolve without re-running discovery.
-const ADDABLE_VENDORS: &[&str] = &["fake_file", "rtsp", "onvif", "local_camera", "v4l2"];
+const ADDABLE_VENDORS: &[&str] = &["fake_file", "rtsp", "onvif", "local_camera", "v4l2", "mjpeg"];
 
 /// Vendors `camera_test_connection_v1` knows how to probe. ONVIF is included
 /// — we probe its device-service HTTP endpoint as a reachability check.
-const TESTABLE_VENDORS: &[&str] = &["fake_file", "rtsp", "onvif", "local_camera", "v4l2"];
+const TESTABLE_VENDORS: &[&str] = &["fake_file", "rtsp", "onvif", "local_camera", "v4l2", "mjpeg"];
 
 fn vendor_addable(v: &str) -> bool {
     ADDABLE_VENDORS.iter().any(|s| *s == v)
@@ -561,7 +561,7 @@ pub fn camera_register_pushed_v1(
 #[cfg(feature = "camera")]
 pub async fn latest_frame_global(
     camera_id: &str,
-) -> Option<(std::sync::Arc<[u8]>, u32, u32, u64)> {
+) -> Option<(std::sync::Arc<[u8]>, u32, u32, u64, Option<u64>)> {
     let sup = SUPERVISOR.get()?;
     match sup.snapshot(camera_id).await {
         Ok(snap) => Some((
@@ -569,6 +569,7 @@ pub async fn latest_frame_global(
             snap.width,
             snap.height,
             snap.timestamp_unix_ms,
+            snap.pts_ns,
         )),
         Err(_) => None,
     }
@@ -852,6 +853,31 @@ async fn rtsp_test_connection(url: &str, timeout_secs: u64) -> Result<(), String
     } else {
         rtsp_options_exchange(tcp, &request_uri, dur).await
     }
+}
+
+/// Sonda osiągalności dla kamer MJPEG (HTTP multipart). Sprawdza samo
+/// połączenie TCP z hostem:portem URL-a (domyślnie 80/443) — bez żądania
+/// HTTP, żeby anonimowa sonda nie ruszała strumienia ani nie wymagała
+/// uwierzytelnienia. Poświadczenia z URL-a nie trafiają do komunikatów
+/// (`redact_url_in_text`).
+async fn mjpeg_test_connection(url: &str, timeout_secs: u64) -> Result<(), String> {
+    use crate::services::camera_ingest::rtsp::redact_url_in_text;
+    let parsed = url::Url::parse(url)
+        .map_err(|e| format!("invalid URL: {}", redact_url_in_text(&e.to_string())))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "missing host".to_string())?
+        .to_string();
+    let tls = parsed.scheme().eq_ignore_ascii_case("https");
+    let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
+    let redacted = redact_url_in_text(url);
+
+    let dur = Duration::from_secs(timeout_secs);
+    tokio::time::timeout(dur, tokio::net::TcpStream::connect((host.as_str(), port)))
+        .await
+        .map_err(|_| format!("connect timeout: {redacted}"))?
+        .map_err(|e| format!("tcp connect failed: {e}"))?;
+    Ok(())
 }
 
 /// Builds a rustls `TlsConnector` that accepts any server certificate. Used only
@@ -3335,6 +3361,25 @@ pub fn camera_test_connection_v1(
                 }
             }
         }
+        "mjpeg" => {
+            if let Err(e) = crate::services::camera_ingest::mjpeg::validate_mjpeg_url(&input.url) {
+                CameraTestConnectionOut {
+                    ok: false,
+                    message: e.to_string(),
+                }
+            } else {
+                match run_async(mjpeg_test_connection(&input.url, 5)) {
+                    Ok(()) => CameraTestConnectionOut {
+                        ok: true,
+                        message: "mjpeg endpoint reachable (tcp connect)".to_string(),
+                    },
+                    Err(msg) => CameraTestConnectionOut {
+                        ok: false,
+                        message: msg,
+                    },
+                }
+            }
+        }
         "onvif" => match run_async(onvif_test_connection(&input.url, 5)) {
             Ok(note) => CameraTestConnectionOut {
                 ok: true,
@@ -3494,8 +3539,9 @@ pub fn camera_credentials_rotate_v1(
     };
     // Only vendors that carry user-info credentials accept rotation. fake_file
     // is local filesystem playback (no auth); other unknown vendors are
-    // rejected explicitly to avoid storing dead blobs against them.
-    if row.vendor != "rtsp" && row.vendor != "onvif" {
+    // rejected explicitly to avoid storing dead blobs against them. mjpeg
+    // uses the same `user:pass` blob (fed to souphttpsrc user-id/user-pw).
+    if row.vendor != "rtsp" && row.vendor != "onvif" && row.vendor != "mjpeg" {
         audit(
             caller.data(),
             "camera.credentials_rotate",

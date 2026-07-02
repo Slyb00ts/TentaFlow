@@ -55,6 +55,14 @@ pub trait BinaryStreamSource: Send + Sync {
         false
     }
 
+    /// Bazowy PTS osi mediów (ns) dla strumieni fMP4 — offset, ktory klient MSE
+    /// odejmuje od PTS detekcji, by zakotwiczyc overlay na wlasciwej klatce wideo.
+    /// Default `None`: zrodla bez wspolnej osi czasu z detekcjami (LiDAR, audio,
+    /// relay) nie niosą tej wartosci.
+    fn base_pts_ns(&self) -> Option<u64> {
+        None
+    }
+
     /// Broadcast sender the source pushes media chunks into. The hub hands
     /// out fresh receivers via `Sender::subscribe()` on every subscribe call.
     ///

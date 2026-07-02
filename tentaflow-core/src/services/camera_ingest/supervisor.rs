@@ -164,6 +164,10 @@ impl CameraIngestSupervisor {
         // next subscribe call after remove cleanly returns `NotRegistered`
         // instead of racing against a half-dead session.
         StreamHub::global().unregister_factory(&format!("camera:{camera_id}"));
+        // Sprzataj stan trackera tej kamery, by nie zostal martwy stan po jej
+        // usunieciu (rejestr trackera jest procesowy, niezalezny od registry).
+        #[cfg(feature = "inference-vision-gpu")]
+        super::tracker::remove(camera_id);
         stop_and_join(handle, Duration::from_secs(10)).await;
         crate::services::streaming_bus()
             .close_camera(camera_id, "removed")
