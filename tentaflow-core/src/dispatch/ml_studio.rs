@@ -1730,6 +1730,72 @@ pub async fn ml_studio_jobs_overview(
     )))
 }
 
+/// Rekoncyliacja statusu inferencji przy ODCZYCIE. `inference_status` w metrykach
+/// to snapshot z chwili deployu, a serwis żyje asynchronicznie (późny fail przy
+/// wolnym loadzie, restart, usunięcie). Dla deployu LOKALNEGO nadpisujemy status
+/// ŻYWYM stanem serwisu (match po sparsowanym `gguf_path`), żeby UI nie kierował
+/// chatu do modelu, który nigdy nie wstał albo padł po deployu. Deploy ZDALNY
+/// (inny węzeł) zostawiamy ze snapshotem — jego serwis nie żyje w naszym rejestrze.
+fn reconcile_local_inference_status(
+    ctx: &HandlerContext,
+    models: Vec<ModelSummary>,
+) -> Vec<ModelSummary> {
+    use crate::services_repo::services::ServiceStatus;
+    let local_node = ctx.state.local_node_id.to_string();
+    let live: std::collections::HashMap<String, &'static str> = ctx
+        .state
+        .db
+        .read()
+        .ok()
+        .and_then(|conn| crate::services_repo::services::list_all(&conn).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.engine_id == "llama-cpp" || r.engine_id == "mlx")
+        .filter_map(|r| {
+            let mf = serde_json::from_str::<serde_json::Value>(&r.config_json)
+                .ok()?
+                .get("model_file")?
+                .as_str()?
+                .to_string();
+            let s = match r.status {
+                ServiceStatus::Running => "deployed",
+                ServiceStatus::Deploying | ServiceStatus::Starting => "deploying",
+                _ => "failed",
+            };
+            Some((mf, s))
+        })
+        .collect();
+
+    models
+        .into_iter()
+        .map(|mut m| {
+            let Ok(mut metrics) = serde_json::from_str::<serde_json::Value>(&m.metrics_json) else {
+                return m;
+            };
+            let Some(obj) = metrics.as_object_mut() else {
+                return m;
+            };
+            // Tylko modele KIEDYŚ deployowane (mają linkage) i LOKALNIE.
+            if !obj.contains_key("inference_model_name") {
+                return m;
+            }
+            let node = obj.get("inference_node").and_then(|v| v.as_str()).unwrap_or("");
+            if !node.is_empty() && node != local_node {
+                return m;
+            }
+            // Brak żywego serwisu dla lokalnego deployu = serwis padł/usunięty → failed.
+            let real = obj
+                .get("gguf_path")
+                .and_then(|v| v.as_str())
+                .and_then(|g| live.get(g).copied())
+                .unwrap_or("failed");
+            obj.insert("inference_status".to_string(), serde_json::json!(real));
+            m.metrics_json = metrics.to_string();
+            m
+        })
+        .collect()
+}
+
 #[handler(variant = "MlStudioModelsListRequest", since = (1, 0))]
 #[policy(PowerUser)]
 #[observed]
@@ -1743,8 +1809,8 @@ pub fn ml_studio_models_list(
     };
     let org = require_org(ctx)?;
     require_project_member(&org.user_id, &payload.project_id)?;
-    let models = repository::list_models(&payload.project_id)
-        .map_err(db_err)?
+    let models = repository::list_models(&payload.project_id).map_err(db_err)?;
+    let models = reconcile_local_inference_status(ctx, models)
         .into_iter()
         .map(to_model)
         .collect();
