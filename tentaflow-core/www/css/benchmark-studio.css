@@ -179,7 +179,8 @@
 .bench-root .test-card.on { border-color: rgba(99,102,241,0.5); }
 .bench-root .test-card.off { opacity: 0.6; }
 .bench-root .test-card .tc-head { display: flex; align-items: center; gap: 10px; }
-.bench-root .test-card .tc-name { font-weight: 700; font-size: 13.5px; }
+.bench-root .test-card .tc-name { font-weight: 700; font-size: 13.5px; display: inline-flex; align-items: center; gap: 7px; }
+.bench-root .test-card .tc-name .tc-icon { width: 15px; height: 15px; color: var(--accent); flex: none; }
 .bench-root .test-card .tc-hint { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
 .bench-root .test-card .tc-params {
   display: flex; gap: 14px; flex-wrap: wrap; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);
@@ -196,6 +197,8 @@
   border-radius: var(--radius); margin: 4px 0 16px; font-size: 12.5px;
 }
 .bench-root .summary-bar .big { font-size: 14px; font-weight: 800; }
+.bench-root .summary-bar .summary-icon { width: 17px; height: 17px; color: var(--accent); flex: none; }
+.bench-root .summary-bar .summary-note { margin-left: auto; font-size: 11.5px; color: var(--text-3); }
 
 /* ----- Stopka kreatora ----- */
 .bench-root .wizard-foot {

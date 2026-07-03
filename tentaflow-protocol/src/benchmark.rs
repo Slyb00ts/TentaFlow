@@ -31,6 +31,8 @@ pub struct BenchmarkSummaryWire {
     pub name: String,
     pub target_count: u32,
     pub test_count: u32,
+    /// Nazwy modeli targetów (do chipa na karcie listy); puste gdy brak targetów.
+    pub models: Vec<String>,
     pub last_run: Option<RunSummaryWire>,
 }
 
@@ -291,6 +293,26 @@ mod tests {
                 "a16e52756e53747265616d4368756e6ba66672756e5f6964627231646b696e64636c6f6765706861736560646c696e6561786c70726f67726573735f706374006574735f6d7300"
             ),
             "RunStreamChunk wire drift"
+        );
+
+        // ListResponse z jednym podsumowaniem — przybija pole `models` na wire.
+        let list = BenchmarkPayload::ListResponse {
+            benchmarks: vec![BenchmarkSummaryWire {
+                id: "b1".to_string(),
+                name: "n".to_string(),
+                target_count: 1,
+                test_count: 2,
+                models: vec!["m".to_string()],
+                last_run: None,
+            }],
+        };
+        let bytes = crate::cbor::encode(&list).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes(
+                "a16c4c697374526573706f6e7365a16a62656e63686d61726b7381a6626964626231646e616d65616e6c7461726765745f636f756e74016a746573745f636f756e7402666d6f64656c7381616d686c6173745f72756ef6"
+            ),
+            "ListResponse wire drift"
         );
     }
 

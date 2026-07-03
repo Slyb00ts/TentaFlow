@@ -140,6 +140,7 @@ fn item_to_wire(item: BenchmarkListItem) -> BenchmarkSummaryWire {
         name: item.record.name,
         target_count: item.target_count,
         test_count,
+        models: item.models,
         last_run,
     }
 }

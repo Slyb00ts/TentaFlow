@@ -25265,14 +25265,23 @@ pub fn list_benchmarks(pool: &DbPool, org_id: &str) -> Result<Vec<BenchmarkListI
          FROM benchmark_runs WHERE benchmark_id = ?1
          ORDER BY started_at DESC LIMIT 1",
     )?;
+    // Etykiety modeli targetów w kolejnosci dodania — chip na karcie listy.
+    let mut model_stmt = conn.prepare(
+        "SELECT COALESCE(NULLIF(model, ''), label) FROM benchmark_targets
+         WHERE benchmark_id = ?1 ORDER BY rowid",
+    )?;
     let mut items = Vec::with_capacity(rows.len());
     for (record, target_count) in rows {
         let last_run = run_stmt
             .query_row(rusqlite::params![record.id], read_benchmark_run_row)
             .optional()?;
+        let models: Vec<String> = model_stmt
+            .query_map(rusqlite::params![record.id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<_, _>>()?;
         items.push(BenchmarkListItem {
             record,
             target_count,
+            models,
             last_run,
         });
     }

@@ -344,5 +344,6 @@ pub struct BenchmarkResultRecord {
 pub struct BenchmarkListItem {
     pub record: BenchmarkRecord,
     pub target_count: u32,
+    pub models: Vec<String>,
     pub last_run: Option<BenchmarkRunRecord>,
 }

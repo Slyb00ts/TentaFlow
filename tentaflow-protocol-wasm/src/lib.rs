@@ -4530,6 +4530,11 @@ fn decode_benchmark_payload(obj: &js_sys::Object, payload: tentaflow_protocol::B
                 set(&item, "target_count", (b.target_count as f64).into());
                 set(&item, "testCount", (b.test_count as f64).into());
                 set(&item, "test_count", (b.test_count as f64).into());
+                let models = js_sys::Array::new();
+                for m in &b.models {
+                    models.push(&JsValue::from_str(m));
+                }
+                set(&item, "models", models.into());
                 match &b.last_run {
                     Some(r) => {
                         set(&item, "lastRun", benchmark_run_summary_to_js(r));

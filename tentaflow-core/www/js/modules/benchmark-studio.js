@@ -269,6 +269,7 @@ function benchmarkCardHtml(b) {
       <div class="b-meta">
         <span class="chip">${escapeHtml(T('targets_n', { n: b.targetCount }))}</span>
         <span class="chip">${escapeHtml(T('tests_n', { n: b.testCount }))}</span>
+        ${Array.isArray(b.models) && b.models.length ? `<span class="chip info">${escapeHtml(b.models.join(' · '))}</span>` : ''}
       </div>
       <div class="b-last">
         ${escapeHtml(lastLine)}
@@ -434,6 +435,7 @@ function renderWizardTargets() {
     <div class="section-card">
       <h3>${escapeHtml(T('benchmark'))}</h3>
       <label class="bench-subtitle" for="">${escapeHtml(T('name_label'))}</label>
+      <div class="section-sub">${escapeHtml(T('name_hint'))}</div>
       <tf-input id="bench-name" value="${escapeAttr(d.name)}" placeholder="${escapeAttr(T('name_ph'))}" style="max-width:440px;"></tf-input>
     </div>
     <div class="grid-2">
@@ -453,9 +455,15 @@ function renderWizardTargets() {
             <option value="openai">${escapeHtml(T('api_openai'))}</option>
             <option value="anthropic">${escapeHtml(T('api_anthropic'))}</option>
           </tf-select>
-          <div class="field-row" style="margin-top:10px;">
-            <tf-input id="ext-host" placeholder="${escapeAttr(T('host_ph'))}"></tf-input>
-            <tf-input id="ext-port" placeholder="443" style="max-width:110px;"></tf-input>
+          <div class="field-row" style="margin-top:10px; align-items:flex-end;">
+            <div style="flex:1;">
+              <label class="bench-subtitle">${escapeHtml(T('host_label'))}</label>
+              <tf-input id="ext-host" placeholder="${escapeAttr(T('host_ph'))}"></tf-input>
+            </div>
+            <div style="max-width:110px;">
+              <label class="bench-subtitle">${escapeHtml(T('port_label'))}</label>
+              <tf-input id="ext-port" placeholder="443"></tf-input>
+            </div>
           </div>
           <div style="margin-top:10px;">
             <label class="bench-subtitle">${escapeHtml(T('api_key_optional'))}</label>
@@ -597,7 +605,7 @@ function extCardHtml(t) {
     <div class="ext-card" data-ext-id="${escapeAttr(t.id)}">
       <div style="flex:1;">
         <div class="t-name">${escapeHtml(t.model || t.label)}</div>
-        <div class="t-sub">${escapeHtml(t.apiType)} · ${escapeHtml(t.host)}${t.port ? ':' + t.port : ''} · ${escapeHtml(T('key'))}: ${escapeHtml(keyNote)}</div>
+        <div class="t-sub">${escapeHtml(t.apiType)} · ${escapeHtml(t.host)}${(t.port && !t.host.includes('://')) ? ':' + t.port : ''} · ${escapeHtml(T('key'))}: ${escapeHtml(keyNote)}</div>
       </div>
       <span class="chip info">${escapeHtml(T('external'))}</span>
       <tf-button variant="ghost" size="sm" icon="trash" data-ext-remove="${escapeAttr(t.id)}"></tf-button>
@@ -612,7 +620,9 @@ function addExternalTarget() {
   const model = (byId('ext-model')?.value || '').trim();
   if (!host) { toast(T('host_required'), 'error'); return; }
   if (!model) { toast(T('model_required'), 'error'); return; }
-  const port = Number(portRaw) || (apiType === 'anthropic' ? 443 : (host.includes('://') ? 0 : 443));
+  // Host z pelnym schematem (http://…:port) niesie port w URL; backend base_url()
+  // bierze go verbatim, wiec osobne pole portu jest nadmiarowe → wymus 0.
+  const port = host.includes('://') ? 0 : (Number(portRaw) || 443);
   state.draft.targets.push({
     id: crypto.randomUUID(),
     kind: 'external',
@@ -666,12 +676,12 @@ function renderWizardTests() {
   root().innerHTML = `
     ${crumbsHtml(crumbs)}
     ${stepperHtml(2)}
-    ${testCardHtml('latency', 'gauge', !!cfg.latency, [
+    ${testCardHtml('latency', 'bolt', !!cfg.latency, [
       ['prompt_tokens', T('prompt_tokens'), cfg.prompt_tokens],
       ['gen_tokens', T('gen_tokens'), cfg.gen_tokens],
       ['latency_repeats', T('repeats'), cfg.latency?.repeats ?? 5],
     ], T('per_target_est', { n: 2 }))}
-    ${testCardHtml('throughput', 'layers', !!cfg.throughput, [
+    ${testCardHtml('throughput', 'bar-chart', !!cfg.throughput, [
       ['throughput_levels', T('concurrency_levels'), (cfg.throughput?.levels || [1, 4, 16, 64]).join(', '), 'wide'],
       ['throughput_rpw', T('requests_per_worker'), cfg.throughput?.requests_per_worker ?? 4],
     ], T('per_target_est', { n: 6 }))}
@@ -684,7 +694,9 @@ function renderWizardTests() {
       ['sustained_concurrency', T('concurrency'), cfg.sustained?.concurrency ?? 8],
     ], T('minutes_target', { n: cfg.sustained?.minutes ?? 10 }))}
     <div class="summary-bar">
+      <svg class="icon summary-icon"><use href="#i-clock-glance"/></svg>
       <span id="bench-summary"></span>
+      <span class="summary-note">${escapeHtml(T('estimate_note'))}</span>
     </div>
     <div class="wizard-foot">
       <tf-button variant="ghost" id="wiz-back">${escapeHtml(T('back_targets'))}</tf-button>
@@ -729,7 +741,7 @@ function testCardHtml(scenario, icon, on, params, estimate) {
       <div class="tc-head">
         <tf-toggle ${on ? 'checked' : ''}></tf-toggle>
         <div style="flex:1;">
-          <div class="tc-name">${escapeHtml(T(`scenario_${scenario}_name`))}</div>
+          <div class="tc-name"><svg class="icon tc-icon"><use href="#i-${escapeAttr(icon)}"/></svg>${escapeHtml(T(`scenario_${scenario}_name`))}</div>
           <div class="tc-hint">${escapeHtml(T(`scenario_${scenario}_hint`))}</div>
         </div>
         <span class="chip">${escapeHtml(estimate)}</span>
@@ -1212,7 +1224,7 @@ function renderResultsTable(host, rows, { partial }) {
       </tr>`;
     }).join('');
     return `
-      <div class="results-group-title">${escapeHtml(scenarioLabel(scn))}</div>
+      <div class="results-group-title">${escapeHtml(T(`scenario_${scn}_name`))}</div>
       <table class="tf-table results-table">
         <thead><tr>
           <th>${escapeHtml(T('col_model'))}</th><th>${escapeHtml(T('col_test'))}</th><th>${escapeHtml(T('col_params'))}</th>
