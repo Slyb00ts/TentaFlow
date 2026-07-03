@@ -74,6 +74,16 @@ test('static assets are cacheable via ETag with conditional 304', async ({ reque
   });
   expect(stale.status()).toBe(200);
   expect((await stale.body()).length).toBeGreaterThan(0);
+
+  // Weak validator (W/ prefix) and wildcard must also revalidate to 304.
+  const weak = await request.get(`${BASE}/js/app.js`, {
+    headers: { 'If-None-Match': `W/${etag}` },
+  });
+  expect(weak.status()).toBe(304);
+  const wildcard = await request.get(`${BASE}/js/app.js`, {
+    headers: { 'If-None-Match': '*' },
+  });
+  expect(wildcard.status()).toBe(304);
 });
 
 test('client-loaded asset hash equals the server hash (no false-positive banner)', async ({ page }) => {

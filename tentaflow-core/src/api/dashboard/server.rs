@@ -343,12 +343,14 @@ fn make_static_response_with_origin(
     let quoted = format!("\"{}\"", etag);
     if cacheable {
         if let Some(inm) = if_none_match {
-            // Klient echuje dokladna wartosc ETag (z cudzyslowami). Akceptujemy
-            // tez forme bez cudzyslowow i liste rozdzielona przecinkami.
-            let matches = inm
-                .split(',')
-                .map(|s| s.trim())
-                .any(|s| s == quoted || s.trim_matches('"') == etag);
+            // RFC 7232 §3.2: `*` pasuje do kazdej reprezentacji; inaczej lista
+            // etagow rozdzielona przecinkami, weak comparison (ignorujemy prefiks
+            // `W/` i cudzyslowy — nasze etagi sa silne, ale proxy moze oslabic).
+            let matches = inm.trim() == "*"
+                || inm.split(',').map(|s| s.trim()).any(|s| {
+                    let s = s.strip_prefix("W/").unwrap_or(s);
+                    s.trim_matches('"') == etag
+                });
             if matches {
                 let mut b = Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
