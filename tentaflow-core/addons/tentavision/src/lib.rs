@@ -26,7 +26,9 @@ use tentaflow_sdk_spec::{
 };
 use tentaflow_sdk_spec::protocol::control::CborMap;
 use tentaflow_sdk_spec::protocol::camera::{
-    CameraAddInput, CameraAddOutput, CameraDiscoverOut, CameraIdInput,
+    CameraAddInput, CameraAddOutput, CameraCvPipelineDeleteOut, CameraCvPipelineIdInput,
+    CameraCvPipelineOut, CameraCvPipelineSaveInput, CameraCvPipelineSaveOut,
+    CameraCvPipelineSummary, CameraCvPipelinesOut, CameraDiscoverOut, CameraIdInput,
     CameraRemoveOut, CameraTestConnectionInput, CameraTestConnectionOut,
     DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
     CAMERA_DEFAULT_ANALYSIS_FPS,
@@ -92,6 +94,19 @@ extern "C" {
     ) -> i32;
     fn camera_list_accessible_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_analysis_flows_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn camera_cv_pipelines_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn camera_cv_pipeline_get_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_cv_pipeline_save_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_cv_pipeline_delete_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
     fn camera_discover_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_local_devices_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_test_connection_v1(
@@ -330,8 +345,66 @@ fn host_camera_set_flow(
         profile: None,
         analysis_fps: None,
         analysis_flow_id: Some(flow_id.unwrap_or("").into()),
+        cv_pipeline_id: None,
     };
     call_cbor_in_out(&input, camera_update_v1)
+}
+
+/// Sets (or, with `None`, clears) a camera's CV pipeline via core. Empty string
+/// on the wire is the documented "clear" signal for `cv_pipeline_id` (camera
+/// falls back to the seed default pipeline).
+fn host_camera_set_cv_pipeline(
+    camera_id: &str,
+    pipeline_id: Option<&str>,
+) -> Result<tentaflow_sdk_spec::CameraInfoOut, AbiError> {
+    let input = tentaflow_sdk_spec::CameraUpdateInput {
+        camera_id: camera_id.into(),
+        display_name: None,
+        target_fps: None,
+        resolution_width: None,
+        resolution_height: None,
+        retention_class: None,
+        profile: None,
+        analysis_fps: None,
+        analysis_flow_id: None,
+        cv_pipeline_id: Some(pipeline_id.unwrap_or("").into()),
+    };
+    call_cbor_in_out(&input, camera_update_v1)
+}
+
+/// Lists every camera CV pipeline summary (id, name, default flag) for the
+/// per-camera pipeline picker and the pipeline manager list.
+fn host_cv_pipelines_list() -> Result<Vec<CameraCvPipelineSummary>, AbiError> {
+    let out: CameraCvPipelinesOut = call_cbor_out(camera_cv_pipelines_list_v1)?;
+    Ok(out.pipelines)
+}
+
+/// Fetches one pipeline with its full `{"stages":[...]}` JSON body.
+fn host_cv_pipeline_get(id: &str) -> Result<CameraCvPipelineOut, AbiError> {
+    let input = CameraCvPipelineIdInput { id: id.into() };
+    call_cbor_in_out(&input, camera_cv_pipeline_get_v1)
+}
+
+/// Creates (`id = None` → host mints a uuid) or updates a pipeline. Host-side
+/// validation failures come back inside the output (`error`), not as an ABI code.
+fn host_cv_pipeline_save(
+    id: Option<&str>,
+    name: &str,
+    pipeline_json: &str,
+) -> Result<CameraCvPipelineSaveOut, AbiError> {
+    let input = CameraCvPipelineSaveInput {
+        id: id.map(String::from),
+        name: name.into(),
+        pipeline_json: pipeline_json.into(),
+    };
+    call_cbor_in_out(&input, camera_cv_pipeline_save_v1)
+}
+
+/// Deletes a pipeline. Refusals (default pipeline / still assigned) come back
+/// inside the output (`deleted = false` + readable `error`).
+fn host_cv_pipeline_delete(id: &str) -> Result<CameraCvPipelineDeleteOut, AbiError> {
+    let input = CameraCvPipelineIdInput { id: id.into() };
+    call_cbor_in_out(&input, camera_cv_pipeline_delete_v1)
 }
 
 /// Reads a JSON response from a host function with the read-only
@@ -1546,6 +1619,9 @@ struct PanelState {
     camera_pending_remove: Option<String>,
     // Camera whose analysis-flow selector is open (its "Flow" row action).
     camera_flow_edit: Option<String>,
+    // Camera whose CV-pipeline selector is open (its "Pipeline" row action).
+    camera_pipeline_edit: Option<String>,
+    cv_pipelines: CvPipelinesState,
     error_message: Option<String>,
     success_message: Option<String>,
     discover: DiscoverState,
@@ -1559,6 +1635,80 @@ struct PanelState {
     evidence: EvidenceState,
     settings: SettingsState,
     onboarding: OnboardingState,
+}
+
+/// One CV-pipeline stage as edited in the pipeline editor. String fields carry
+/// the raw typed text (validation is host-side on save); `params` preserves any
+/// non-edited stage params (crop pads etc.) verbatim across an edit round-trip,
+/// with `ocr_mode` folded back into it on save.
+#[derive(Clone)]
+struct StageDraft {
+    stage_id: String,
+    /// "detect" | "classify" | "ocr" | "embed".
+    op: String,
+    /// Model alias (`model_aliases.alias`).
+    model: String,
+    /// Detect only: stage FPS; empty = the camera's `analysis_fps`.
+    fps: String,
+    /// Detect only: confidence threshold 0..1; empty = engine default.
+    threshold: String,
+    /// Crop stages: the source detect stage id.
+    parent: String,
+    /// Crop stages: comma-separated class patterns (trailing `*` = prefix).
+    classes: String,
+    /// OCR only: "plate" | "adr" | "generic".
+    ocr_mode: String,
+    enabled: bool,
+    params: serde_json::Map<String, JsonValue>,
+}
+
+impl StageDraft {
+    fn new_detect() -> Self {
+        Self {
+            stage_id: "detect".into(),
+            op: "detect".into(),
+            model: String::new(),
+            fps: String::new(),
+            threshold: String::new(),
+            parent: String::new(),
+            classes: String::new(),
+            ocr_mode: String::new(),
+            enabled: true,
+            params: serde_json::Map::new(),
+        }
+    }
+}
+
+/// View state for the CV-pipeline manager on the Cameras tab: the pipeline
+/// list, the pending-delete arming and the stage editor draft. Pipelines
+/// persist core-side (`camera_cv_pipelines`); nothing here survives a close.
+struct CvPipelinesState {
+    manager_visible: bool,
+    editor_visible: bool,
+    /// Pipeline id being edited; `None` = creating a new one (host mints id).
+    editing_id: Option<String>,
+    pending_remove: Option<String>,
+    name: String,
+    stages: Vec<StageDraft>,
+}
+
+impl CvPipelinesState {
+    const fn new() -> Self {
+        Self {
+            manager_visible: false,
+            editor_visible: false,
+            editing_id: None,
+            pending_remove: None,
+            name: String::new(),
+            stages: Vec::new(),
+        }
+    }
+    fn close_editor(&mut self) {
+        self.editor_visible = false;
+        self.editing_id = None;
+        self.name.clear();
+        self.stages.clear();
+    }
 }
 
 /// Ephemeral wizard progress. The OUTCOMES persist to the settings table /
@@ -2151,6 +2301,8 @@ impl PanelState {
             add_form_visible: false, wizard_step: 0, cameras_filter: String::new(),
             camera_pending_remove: None,
             camera_flow_edit: None,
+            camera_pipeline_edit: None,
+            cv_pipelines: CvPipelinesState::new(),
             error_message: None, success_message: None,
             discover: DiscoverState::new(), profiles: ProfilesState::new(),
             alarms: AlarmsState::new(), search: SearchState::new(),
@@ -2472,6 +2624,22 @@ fn render_panel(panel_id: &str) {
                 value: Value::Text(current),
             });
         }
+        // Same for the CV-pipeline selector (empty = the default pipeline).
+        if let Some(id) = with_state(|s| s.camera_pipeline_edit.clone()) {
+            let current = host_camera_get(&id)
+                .ok()
+                .and_then(|c| c.cv_pipeline_id)
+                .unwrap_or_default();
+            entries.push(StateEntry {
+                path: StatePath::new(vec![PathSegment::Key("camera_pipeline_select".into())]),
+                value: Value::Text(current),
+            });
+        }
+        // When the pipeline stage editor is open, seed its bound form keys so
+        // the inputs / selects / toggles mount with the backend draft values.
+        if with_state(|s| s.cv_pipelines.manager_visible && s.cv_pipelines.editor_visible) {
+            entries.extend(pipeline_editor_overlay());
+        }
         let overlay = if entries.is_empty() { None } else { Some(entries) };
         send_slot_content_with_overlay("content", content, overlay);
     } else if panel_id == "profiles" {
@@ -2650,6 +2818,24 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "camera-flow-edit" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("camera_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.camera_pending_remove = None; s.camera_flow_edit = if id.is_empty() { None } else { Some(id) }; }); render_panel("cameras"); json!({"ok":true}) }
         "camera-flow-cancel" => { with_state(|s| { s.camera_flow_edit = None; s.clear_messages(); }); render_panel("cameras"); json!({"ok":true}) }
         "camera-flow-change" => handle_camera_flow_change(params),
+        "camera-pipeline-edit" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("camera_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.camera_pending_remove = None; s.camera_flow_edit = None; s.camera_pipeline_edit = if id.is_empty() { None } else { Some(id) }; }); render_panel("cameras"); json!({"ok":true}) }
+        "camera-pipeline-cancel" => { with_state(|s| { s.camera_pipeline_edit = None; s.clear_messages(); }); render_panel("cameras"); json!({"ok":true}) }
+        "camera-pipeline-change" => handle_camera_pipeline_change(params),
+        "pipeline-manager-show" => { with_state(|s| { s.clear_messages(); s.cv_pipelines.manager_visible = true; s.cv_pipelines.pending_remove = None; }); render_panel("cameras"); json!({"ok":true}) }
+        "pipeline-manager-close" => { with_state(|s| { s.cv_pipelines.manager_visible = false; s.cv_pipelines.pending_remove = None; s.cv_pipelines.close_editor(); s.clear_messages(); }); render_panel("cameras"); json!({"ok":true}) }
+        "pipeline-new" => { with_state(|s| { s.clear_messages(); s.cv_pipelines.editor_visible = true; s.cv_pipelines.editing_id = None; s.cv_pipelines.pending_remove = None; s.cv_pipelines.name = "Nowy pipeline".to_string(); s.cv_pipelines.stages = vec![StageDraft::new_detect()]; }); render_panel("cameras"); json!({"ok":true}) }
+        "pipeline-edit" => handle_pipeline_edit(params),
+        "pipeline-duplicate" => handle_pipeline_duplicate(params),
+        "pipeline-row-remove" => { let id = params.get("pipeline_id").and_then(|x| x.as_str()).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.cv_pipelines.pending_remove = if id.is_empty() { None } else { Some(id) }; }); render_panel("cameras"); json!({"ok":true}) }
+        "pipeline-remove-cancel" => { with_state(|s| { s.cv_pipelines.pending_remove = None; s.clear_messages(); }); render_panel("cameras"); json!({"ok":true}) }
+        "pipeline-remove" => handle_pipeline_remove(params),
+        "pipeline-name-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); with_state(|s| s.cv_pipelines.name = v); json!({"ok":true}) }
+        "pipeline-stage-field-change" => handle_pipeline_stage_field_change(params),
+        "pipeline-stage-toggle" => handle_pipeline_stage_toggle(params),
+        "pipeline-stage-add" => handle_pipeline_stage_add(),
+        "pipeline-stage-remove" => { let index: Option<usize> = params.get("index").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()); if let Some(i) = index { with_state(|s| { if i < s.cv_pipelines.stages.len() { s.cv_pipelines.stages.remove(i); } }); } render_panel("cameras"); json!({"ok":true}) }
+        "pipeline-save" => handle_pipeline_save(),
+        "pipeline-editor-cancel" => { with_state(|s| { s.cv_pipelines.close_editor(); s.clear_messages(); }); render_panel("cameras"); json!({"ok":true}) }
         "discover-scan" => handle_discover_scan(),
         "discover-select" => handle_discover_select(params),
         "cameras-refresh" => handle_camera_refresh_status(),
@@ -3211,6 +3397,420 @@ fn handle_camera_flow_change(params: &JsonValue) -> JsonValue {
         }
         Err(e) => {
             with_state(|s| { s.error_message = Some(alloc::format!("Nie udało się przypisać flow: {}", abi_message(e))); });
+            render_panel("cameras");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
+    }
+}
+
+// =============================================================================
+// CV pipeline action handlers + draft <-> JSON converters
+// =============================================================================
+
+/// Parses one stage object of the stored pipeline JSON into an editable draft.
+/// `ocr_mode` is lifted out of `params` into its own field (the editor owns
+/// it); every other param (crop pads etc.) stays in `params` verbatim so an
+/// edit round-trip never drops values the editor does not surface.
+fn stage_draft_from_json(v: &JsonValue) -> StageDraft {
+    let text = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let mut params = v
+        .get("params")
+        .and_then(|p| p.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let ocr_mode = params
+        .remove("ocr_mode")
+        .and_then(|x| x.as_str().map(String::from))
+        .unwrap_or_default();
+    let input = v.get("input").cloned().unwrap_or(JsonValue::Null);
+    let kind = input.get("kind").and_then(|x| x.as_str()).unwrap_or("frame");
+    let (fps, parent, classes) = if kind == "frame" {
+        let fps = input
+            .get("fps")
+            .and_then(|x| x.as_u64())
+            .map(|n| alloc::format!("{}", n))
+            .unwrap_or_default();
+        (fps, String::new(), String::new())
+    } else {
+        let parent = input.get("stage_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let classes = input
+            .get("classes")
+            .and_then(|c| c.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        (String::new(), parent, classes)
+    };
+    let threshold = v
+        .get("threshold")
+        .and_then(|x| x.as_f64())
+        .map(|t| alloc::format!("{}", t))
+        .unwrap_or_default();
+    let op = {
+        let op = text("op");
+        if op.is_empty() { "detect".to_string() } else { op }
+    };
+    StageDraft {
+        stage_id: text("stage_id"),
+        op,
+        model: text("model"),
+        fps,
+        threshold,
+        parent,
+        classes,
+        ocr_mode,
+        enabled: v.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true),
+        params,
+    }
+}
+
+/// Parses a stored pipeline JSON body into editor drafts.
+fn pipeline_stages_from_json(pipeline_json: &str) -> Result<Vec<StageDraft>, String> {
+    let v: JsonValue = serde_json::from_str(pipeline_json)
+        .map_err(|e| alloc::format!("nieprawidłowy JSON pipeline'u: {}", e))?;
+    let stages = v
+        .get("stages")
+        .and_then(|s| s.as_array())
+        .ok_or_else(|| "pipeline nie zawiera listy etapów".to_string())?;
+    Ok(stages.iter().map(stage_draft_from_json).collect())
+}
+
+/// Serializes the editor drafts back into the pipeline JSON body. Only shape
+/// errors that would make the JSON unbuildable (empty ids, non-numeric fps /
+/// threshold) are caught here — the authoritative validation (stage refs,
+/// class patterns, alias existence) runs host-side on save.
+fn pipeline_json_from_draft(stages: &[StageDraft]) -> Result<String, String> {
+    let mut out: Vec<JsonValue> = Vec::new();
+    for st in stages {
+        let stage_id = st.stage_id.trim();
+        if stage_id.is_empty() {
+            return Err("każdy etap musi mieć ID".to_string());
+        }
+        let mut obj = serde_json::Map::new();
+        obj.insert("stage_id".into(), json!(stage_id));
+        obj.insert("enabled".into(), json!(st.enabled));
+        obj.insert("op".into(), json!(st.op));
+        obj.insert("model".into(), json!(st.model.trim()));
+        let input = if st.op == "detect" {
+            let mut m = serde_json::Map::new();
+            m.insert("kind".into(), json!("frame"));
+            if !st.fps.trim().is_empty() {
+                let fps: u32 = st.fps.trim().parse().map_err(|_| {
+                    alloc::format!("etap '{}': FPS musi być liczbą całkowitą", stage_id)
+                })?;
+                m.insert("fps".into(), json!(fps));
+            }
+            m
+        } else {
+            let mut m = serde_json::Map::new();
+            m.insert("kind".into(), json!("stage"));
+            m.insert("stage_id".into(), json!(st.parent.trim()));
+            let classes: Vec<String> = st
+                .classes
+                .split(',')
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect();
+            m.insert("classes".into(), json!(classes));
+            m
+        };
+        obj.insert("input".into(), JsonValue::Object(input));
+        if st.op == "detect" && !st.threshold.trim().is_empty() {
+            // Tolerate the Polish decimal comma in the threshold input.
+            let t: f64 = st.threshold.trim().replace(',', ".").parse().map_err(|_| {
+                alloc::format!("etap '{}': próg musi być liczbą 0–1", stage_id)
+            })?;
+            obj.insert("threshold".into(), json!(t));
+        }
+        let mut params = st.params.clone();
+        if st.op == "ocr" {
+            let mode = st.ocr_mode.trim();
+            params.insert(
+                "ocr_mode".into(),
+                json!(if mode.is_empty() { "generic" } else { mode }),
+            );
+        } else {
+            params.remove("ocr_mode");
+        }
+        if !params.is_empty() {
+            obj.insert("params".into(), JsonValue::Object(params));
+        }
+        match st.op.as_str() {
+            "classify" => { obj.insert("output".into(), json!("stan")); }
+            "ocr" => { obj.insert("output".into(), json!("tekst")); }
+            _ => {}
+        }
+        out.push(JsonValue::Object(obj));
+    }
+    serde_json::to_string(&json!({ "stages": out }))
+        .map_err(|e| alloc::format!("serializacja pipeline'u nie powiodła się: {}", e))
+}
+
+/// First detect stage id of the draft — the default parent for new crop stages.
+fn first_detect_stage_id(stages: &[StageDraft]) -> Option<String> {
+    stages.iter().find(|s| s.op == "detect").map(|s| s.stage_id.clone())
+}
+
+/// Commits the CV-pipeline pick for a camera. The Select sends `camera_id`
+/// (handler param) + `value` (pipeline id; empty = clear → default pipeline).
+/// Existence validation happens in the core `camera_update_v1` host fn.
+fn handle_camera_pipeline_change(params: &JsonValue) -> JsonValue {
+    let camera_id = params.get("camera_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    with_state(|s| s.clear_messages());
+    if camera_id.is_empty() {
+        with_state(|s| { s.error_message = Some("Brak kamery do przypisania pipeline'u.".to_string()); });
+        return json!({"ok":false,"error":"empty camera_id"});
+    }
+    let pipeline = if value.is_empty() { None } else { Some(value.as_str()) };
+    match host_camera_set_cv_pipeline(&camera_id, pipeline) {
+        Ok(_) => {
+            with_state(|s| {
+                s.camera_pipeline_edit = None;
+                s.success_message = Some(if pipeline.is_some() {
+                    "Przypisano pipeline analizy do kamery.".to_string()
+                } else {
+                    "Kamera wróciła do domyślnego pipeline'u analizy.".to_string()
+                });
+            });
+            render_panel("cameras");
+            json!({"ok":true})
+        }
+        Err(e) => {
+            with_state(|s| { s.error_message = Some(alloc::format!("Nie udało się przypisać pipeline'u: {}", abi_message(e))); });
+            render_panel("cameras");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
+    }
+}
+
+/// Opens the stage editor for an existing pipeline (fetched from core).
+fn handle_pipeline_edit(params: &JsonValue) -> JsonValue {
+    let id = params.get("pipeline_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    with_state(|s| s.clear_messages());
+    if id.is_empty() {
+        return json!({"ok":false,"error":"empty pipeline_id"});
+    }
+    match host_cv_pipeline_get(&id) {
+        Ok(p) => match pipeline_stages_from_json(&p.pipeline_json) {
+            Ok(stages) => {
+                with_state(|s| {
+                    s.cv_pipelines.editor_visible = true;
+                    s.cv_pipelines.editing_id = Some(p.id);
+                    s.cv_pipelines.name = p.name;
+                    s.cv_pipelines.stages = stages;
+                    s.cv_pipelines.pending_remove = None;
+                });
+                render_panel("cameras");
+                json!({"ok":true})
+            }
+            Err(e) => {
+                with_state(|s| { s.error_message = Some(alloc::format!("Nie udało się wczytać pipeline'u: {}", e)); });
+                render_panel("cameras");
+                json!({"ok":false,"error":e})
+            }
+        },
+        Err(e) => {
+            with_state(|s| { s.error_message = Some(alloc::format!("Nie udało się pobrać pipeline'u: {}", abi_message(e))); });
+            render_panel("cameras");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
+    }
+}
+
+/// Opens the stage editor with a copy of an existing pipeline (saved as a new
+/// row on Zapisz — `editing_id = None` makes the host mint a fresh id).
+fn handle_pipeline_duplicate(params: &JsonValue) -> JsonValue {
+    let id = params.get("pipeline_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    with_state(|s| s.clear_messages());
+    if id.is_empty() {
+        return json!({"ok":false,"error":"empty pipeline_id"});
+    }
+    match host_cv_pipeline_get(&id) {
+        Ok(p) => match pipeline_stages_from_json(&p.pipeline_json) {
+            Ok(stages) => {
+                with_state(|s| {
+                    s.cv_pipelines.editor_visible = true;
+                    s.cv_pipelines.editing_id = None;
+                    s.cv_pipelines.name = alloc::format!("{} (kopia)", p.name);
+                    s.cv_pipelines.stages = stages;
+                    s.cv_pipelines.pending_remove = None;
+                });
+                render_panel("cameras");
+                json!({"ok":true})
+            }
+            Err(e) => {
+                with_state(|s| { s.error_message = Some(alloc::format!("Nie udało się wczytać pipeline'u: {}", e)); });
+                render_panel("cameras");
+                json!({"ok":false,"error":e})
+            }
+        },
+        Err(e) => {
+            with_state(|s| { s.error_message = Some(alloc::format!("Nie udało się pobrać pipeline'u: {}", abi_message(e))); });
+            render_panel("cameras");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
+    }
+}
+
+/// Deletes a pipeline after the confirmation bar. Host refusals (default
+/// pipeline, still assigned to a camera) carry a readable message.
+fn handle_pipeline_remove(params: &JsonValue) -> JsonValue {
+    let id = params.get("pipeline_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    with_state(|s| s.clear_messages());
+    if id.is_empty() {
+        return json!({"ok":false,"error":"empty pipeline_id"});
+    }
+    match host_cv_pipeline_delete(&id) {
+        Ok(out) if out.deleted => {
+            with_state(|s| {
+                s.cv_pipelines.pending_remove = None;
+                s.success_message = Some("Pipeline usunięty.".to_string());
+            });
+            render_panel("cameras");
+            json!({"ok":true})
+        }
+        Ok(out) => {
+            let reason = out.error.unwrap_or_else(|| "odmowa".to_string());
+            with_state(|s| {
+                s.cv_pipelines.pending_remove = None;
+                s.error_message = Some(alloc::format!("Nie można usunąć pipeline'u: {}", reason));
+            });
+            render_panel("cameras");
+            json!({"ok":false,"error":reason})
+        }
+        Err(e) => {
+            with_state(|s| { s.error_message = Some(alloc::format!("Błąd usuwania pipeline'u: {}", abi_message(e))); });
+            render_panel("cameras");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
+    }
+}
+
+/// Mirrors a single stage-editor field into the backend draft on change. The
+/// value also lives in the store via the input's bind_path; the backend copy
+/// is authoritative for Zapisz. Structure-affecting fields re-send the panel
+/// (same per-keystroke commit + re-render pattern as the audit search box,
+/// whose bound key is re-seeded via the content overlay): `op` and `parent`
+/// switch which controls render, `stage_id` feeds the card title and the
+/// source-stage options of crop stages, `classes` feeds the chips preview.
+/// Plain numeric/model fields do not re-render.
+fn handle_pipeline_stage_field_change(params: &JsonValue) -> JsonValue {
+    let index: usize = match params.get("index").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()) {
+        Some(i) => i,
+        None => return json!({"ok":false,"error":"missing index"}),
+    };
+    let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let rerender = matches!(field.as_str(), "op" | "parent" | "stage_id" | "classes");
+    let applied = with_state(|s| {
+        let default_parent = first_detect_stage_id(&s.cv_pipelines.stages).unwrap_or_default();
+        let Some(st) = s.cv_pipelines.stages.get_mut(index) else { return false; };
+        match field.as_str() {
+            "stage_id" => st.stage_id = value.clone(),
+            "op" => {
+                st.op = value.clone();
+                if st.op != "detect" && st.parent.trim().is_empty() {
+                    // A crop stage needs a source; preselect the first detect
+                    // stage so the fresh select is not empty.
+                    st.parent = default_parent;
+                }
+            }
+            "model" => st.model = value.clone(),
+            "fps" => st.fps = value.clone(),
+            "threshold" => st.threshold = value.clone(),
+            "parent" => st.parent = value.clone(),
+            "classes" => st.classes = value.clone(),
+            "ocr_mode" => st.ocr_mode = value.clone(),
+            _ => return false,
+        }
+        true
+    });
+    if !applied {
+        return json!({"ok":false,"error":"unknown stage index or field"});
+    }
+    if rerender {
+        render_panel("cameras");
+    }
+    json!({"ok":true})
+}
+
+/// Flips a stage's enabled toggle in the backend draft.
+fn handle_pipeline_stage_toggle(params: &JsonValue) -> JsonValue {
+    let index: usize = match params.get("index").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()) {
+        Some(i) => i,
+        None => return json!({"ok":false,"error":"missing index"}),
+    };
+    let on = params.get("value").and_then(|v| v.as_bool())
+        .or_else(|| params.get("checked").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    with_state(|s| {
+        if let Some(st) = s.cv_pipelines.stages.get_mut(index) {
+            st.enabled = on;
+        }
+    });
+    json!({"ok":true})
+}
+
+/// Appends a new stage to the draft: the first stage defaults to a detect
+/// stage; later ones default to a classify stage hanging off the first detect.
+fn handle_pipeline_stage_add() -> JsonValue {
+    with_state(|s| {
+        let n = s.cv_pipelines.stages.len();
+        let detect = first_detect_stage_id(&s.cv_pipelines.stages);
+        let mut st = StageDraft::new_detect();
+        if let Some(parent) = detect {
+            st.op = "classify".into();
+            st.parent = parent;
+            st.stage_id = alloc::format!("etap_{}", n + 1);
+        }
+        s.cv_pipelines.stages.push(st);
+    });
+    render_panel("cameras");
+    json!({"ok":true})
+}
+
+/// Serializes the draft and saves it host-side. Host validation errors
+/// (structure, stage refs, unknown aliases) come back as a readable message
+/// shown in the panel; the editor stays open with the draft intact.
+fn handle_pipeline_save() -> JsonValue {
+    with_state(|s| s.clear_messages());
+    let (editing_id, name, json_result) = with_state(|s| (
+        s.cv_pipelines.editing_id.clone(),
+        s.cv_pipelines.name.trim().to_string(),
+        pipeline_json_from_draft(&s.cv_pipelines.stages),
+    ));
+    if name.is_empty() {
+        with_state(|s| { s.error_message = Some("Podaj nazwę pipeline'u.".to_string()); });
+        render_panel("cameras");
+        return json!({"ok":false,"error":"empty name"});
+    }
+    let pipeline_json = match json_result {
+        Ok(j) => j,
+        Err(e) => {
+            with_state(|s| { s.error_message = Some(alloc::format!("Nie można zapisać: {}", e)); });
+            render_panel("cameras");
+            return json!({"ok":false,"error":e});
+        }
+    };
+    match host_cv_pipeline_save(editing_id.as_deref(), &name, &pipeline_json) {
+        Ok(out) => match out.id {
+            Some(_) => {
+                with_state(|s| {
+                    s.cv_pipelines.close_editor();
+                    s.success_message = Some("Pipeline zapisany.".to_string());
+                });
+                render_panel("cameras");
+                json!({"ok":true})
+            }
+            None => {
+                let reason = out.error.unwrap_or_else(|| "walidacja odrzucona".to_string());
+                with_state(|s| { s.error_message = Some(alloc::format!("Pipeline odrzucony: {}", reason)); });
+                render_panel("cameras");
+                json!({"ok":false,"error":reason})
+            }
+        },
+        Err(e) => {
+            with_state(|s| { s.error_message = Some(alloc::format!("Błąd zapisu pipeline'u: {}", abi_message(e))); });
             render_panel("cameras");
             json!({"ok":false,"error":alloc::format!("{}",e)})
         }
@@ -4661,6 +5261,22 @@ fn build_cameras_content() -> Component {
         }
     }
 
+    // The CV-pipeline selector appears above the table for the camera whose
+    // "Pipeline analizy" row action was clicked.
+    if let Some(edit) = with_state(|s| s.camera_pipeline_edit.clone()) {
+        if cameras.iter().any(|c| c.id == edit) {
+            children.push(build_camera_pipeline_config(&edit, &cameras));
+        } else {
+            with_state(|s| s.camera_pipeline_edit = None);
+        }
+    }
+
+    // The pipeline manager (list + stage editor) renders as its own section
+    // once opened from the per-camera selector's "Edytuj pipeline'y" button.
+    if with_state(|s| s.cv_pipelines.manager_visible) {
+        children.push(build_pipeline_manager());
+    }
+
     if cameras.is_empty() {
         // No outer Outlined Card: the dashboard pushes its sections straight
         // into the stack, so wrapping these in card(None, ...) would draw a
@@ -4784,6 +5400,7 @@ fn build_cameras_table() -> Component {
     // injects the clicked camera_id into the action params (as `row_id` /
     // `camera_id`), so this opens the flow selector for that camera.
     let flow_action = button("Flow analizy", "camera-flow-edit", "ghost");
+    let pipeline_action = button("Pipeline analizy", "camera-pipeline-edit", "ghost");
     let remove_action = button("Usuń", "camera-row-select", "destructive");
 
     TableComp {
@@ -4800,7 +5417,7 @@ fn build_cameras_table() -> Component {
         sticky_columns: 0,
         pagination: None,
         empty_state: None,
-        row_actions: vec![flow_action, remove_action],
+        row_actions: vec![flow_action, pipeline_action, remove_action],
         bulk_actions: vec![],
         virtualize: false,
         row_expandable: false,
@@ -4895,6 +5512,424 @@ fn build_camera_flow_config(camera_id: &str, cameras: &[db::CameraRow]) -> Compo
         selector,
         button("Zamknij", "camera-flow-cancel", "ghost"),
     ])])
+}
+
+// =============================================================================
+// CV pipeline UI — per-camera selector + pipeline manager / stage editor
+// =============================================================================
+
+/// Picker label for one pipeline (the seed default is marked inline).
+fn pipeline_option_label(p: &CameraCvPipelineSummary) -> String {
+    if p.is_default {
+        alloc::format!("{} (domyślny)", p.name)
+    } else {
+        p.name.clone()
+    }
+}
+
+/// CV-pipeline selector for the selected camera. Mirrors the analysis-flow
+/// selector: the Select lists every pipeline (plus the "default" clear option)
+/// and commits the pick immediately via `camera-pipeline-change`; the current
+/// value is preselected by seeding the bound `camera_pipeline_select` store key
+/// in `render_panel` (read from core via `camera_get`).
+fn build_camera_pipeline_config(camera_id: &str, cameras: &[db::CameraRow]) -> Component {
+    let name = cameras
+        .iter()
+        .find(|c| c.id == camera_id)
+        .map(|c| c.name.as_str())
+        .unwrap_or(camera_id);
+
+    let mut options = vec![SelectOption {
+        value: SelectValue::Text(String::new()),
+        label: lit("— domyślny —"),
+        icon: None,
+        disabled: false,
+        group_id: None,
+        description: None,
+    }];
+    match host_cv_pipelines_list() {
+        Ok(pipelines) => {
+            for p in &pipelines {
+                options.push(SelectOption {
+                    value: SelectValue::Text(p.id.clone()),
+                    label: lit(&pipeline_option_label(p)),
+                    icon: None,
+                    disabled: false,
+                    group_id: None,
+                    description: None,
+                });
+            }
+        }
+        Err(e) => {
+            return card(None, vec![stack_v(vec![
+                text_styled(&alloc::format!("Pipeline analizy — {}", name), "body_strong"),
+                alert(
+                    &alloc::format!("Nie udało się pobrać listy pipeline'ów: {}", abi_message(e)),
+                    "critical",
+                ),
+                button("Zamknij", "camera-pipeline-cancel", "ghost"),
+            ])]);
+        }
+    }
+
+    let mut selector = select("Pipeline analizy", options, "camera_pipeline_select");
+    let mut params = CborMap::default();
+    params.0.push(("camera_id".into(), Value::Text(camera_id.into())));
+    selector.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "camera-pipeline-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+
+    card(None, vec![stack_v(vec![
+        text_styled(&alloc::format!("Pipeline analizy — {}", name), "body_strong"),
+        text("Pipeline określa etapy analizy CV (detekcja, klasyfikacja, OCR) uruchamiane na obrazie z tej kamery."),
+        selector,
+        stack_h(vec![
+            button("Edytuj pipeline'y", "pipeline-manager-show", "secondary"),
+            button("Zamknij", "camera-pipeline-cancel", "ghost"),
+        ]),
+    ])])
+}
+
+/// Text input for one stage-editor field: bound to `key` in the store and
+/// mirrored into the backend draft per keystroke via
+/// `pipeline-stage-field-change` (tagged with the stage index + field name).
+fn pipeline_stage_input(label: &str, placeholder: &str, key: &str, index: usize, field: &str) -> Component {
+    let mut comp = input(label, placeholder, key);
+    let mut params = CborMap::default();
+    params.0.push(("index".into(), Value::Text(alloc::format!("{}", index))));
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend {
+            action_id: "pipeline-stage-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// Select for one stage-editor field; commits the pick to the backend draft
+/// on change (same action + tagging as [`pipeline_stage_input`]).
+fn pipeline_stage_select(label: &str, options: Vec<SelectOption>, key: &str, index: usize, field: &str) -> Component {
+    let mut comp = select(label, options, key);
+    let mut params = CborMap::default();
+    params.0.push(("index".into(), Value::Text(alloc::format!("{}", index))));
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "pipeline-stage-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+fn plain_select_option(value: &str, label: &str) -> SelectOption {
+    SelectOption {
+        value: SelectValue::Text(value.into()),
+        label: lit(label),
+        icon: None,
+        disabled: false,
+        group_id: None,
+        description: None,
+    }
+}
+
+/// Model-alias options for the stage model picker: every usable (granted +
+/// active) alias, plus the stage's current value when it is outside the grant
+/// list so an imported pipeline still shows its real alias instead of a blank.
+fn stage_model_options(current: &str, aliases: &[AvailableAlias]) -> Vec<SelectOption> {
+    let mut options = vec![plain_select_option("", "— wybierz model —")];
+    let mut seen_current = current.trim().is_empty();
+    for a in aliases {
+        if !a.is_usable() || !a.active {
+            continue;
+        }
+        let label = match a.target_model.as_deref().filter(|t| !t.is_empty()) {
+            Some(target) => alloc::format!("{} → {}", a.alias_id, target),
+            None => a.alias_id.clone(),
+        };
+        if a.alias_id == current {
+            seen_current = true;
+        }
+        options.push(plain_select_option(&a.alias_id, &label));
+    }
+    if !seen_current {
+        options.push(plain_select_option(current, current));
+    }
+    options
+}
+
+/// One stage of the pipeline editor. Field visibility follows the op: detect
+/// exposes fps + threshold (input = frame), crop ops expose the source detect
+/// stage + class patterns, OCR additionally its mode.
+fn build_pipeline_stage_card(
+    index: usize,
+    st: &StageDraft,
+    aliases: &[AvailableAlias],
+    detect_ids: &[String],
+) -> Component {
+    let key = |suffix: &str| alloc::format!("cvp_s{}_{}", index, suffix);
+    let mut fields: Vec<Component> = Vec::new();
+
+    fields.push(pipeline_stage_input("ID etapu", "np. detect", &key("id"), index, "stage_id"));
+    fields.push(pipeline_stage_select(
+        "Operacja",
+        vec![
+            plain_select_option("detect", "Detekcja (detect)"),
+            plain_select_option("classify", "Klasyfikacja (classify)"),
+            plain_select_option("ocr", "OCR (ocr)"),
+            plain_select_option("embed", "Embedding (embed)"),
+        ],
+        &key("op"),
+        index,
+        "op",
+    ));
+    fields.push(pipeline_stage_select(
+        "Model (alias)",
+        stage_model_options(&st.model, aliases),
+        &key("model"),
+        index,
+        "model",
+    ));
+
+    if st.op == "detect" {
+        fields.push(pipeline_stage_input(
+            "FPS etapu (puste = FPS analizy kamery)",
+            "np. 15",
+            &key("fps"),
+            index,
+            "fps",
+        ));
+        fields.push(pipeline_stage_input(
+            "Próg detekcji 0–1 (puste = domyślny)",
+            "np. 0.5",
+            &key("threshold"),
+            index,
+            "threshold",
+        ));
+    } else {
+        let parent_options: Vec<SelectOption> = detect_ids
+            .iter()
+            .filter(|id| id.as_str() != st.stage_id)
+            .map(|id| plain_select_option(id, id))
+            .collect();
+        if parent_options.is_empty() {
+            fields.push(alert(
+                "Ten etap wymaga etapu detekcji (op=detect) jako źródła wycinków.",
+                "warning",
+            ));
+        } else {
+            fields.push(pipeline_stage_select(
+                "Etap źródłowy (detekcja)",
+                parent_options,
+                &key("parent"),
+                index,
+                "parent",
+            ));
+        }
+        fields.push(pipeline_stage_input(
+            "Klasy (wzorce po przecinku, końcowa * = prefiks)",
+            "np. nalepka*, tablica_rejestracyjna",
+            &key("classes"),
+            index,
+            "classes",
+        ));
+        let class_chips: Vec<Component> = st
+            .classes
+            .split(',')
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(|c| chip(c, "neutral"))
+            .collect();
+        if !class_chips.is_empty() {
+            fields.push(stack_h(class_chips));
+        }
+        if st.op == "ocr" {
+            fields.push(pipeline_stage_select(
+                "Tryb OCR",
+                vec![
+                    plain_select_option("plate", "Tablica rejestracyjna (plate)"),
+                    plain_select_option("adr", "Tablica ADR (adr)"),
+                    plain_select_option("generic", "Ogólny tekst (generic)"),
+                ],
+                &key("ocr_mode"),
+                index,
+                "ocr_mode",
+            ));
+        }
+    }
+
+    let mut enabled_toggle = toggle("Etap włączony", &key("enabled"));
+    let mut toggle_params = CborMap::default();
+    toggle_params.0.push(("index".into(), Value::Text(alloc::format!("{}", index))));
+    enabled_toggle.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Change,
+        Handler::Backend {
+            action_id: "pipeline-stage-toggle".into(),
+            params: toggle_params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    let mut remove_params = CborMap::default();
+    remove_params.0.push(("index".into(), Value::Text(alloc::format!("{}", index))));
+    fields.push(stack_h(vec![
+        enabled_toggle,
+        button_with_params("Usuń etap", "pipeline-stage-remove", "destructive", remove_params),
+    ]));
+
+    card(
+        Some(&alloc::format!("Etap {} — {}", index + 1, if st.stage_id.trim().is_empty() { "(bez ID)" } else { st.stage_id.trim() })),
+        vec![stack_v(fields)],
+    )
+}
+
+/// The stage editor for the pipeline being created / edited.
+fn build_pipeline_editor() -> Component {
+    let (editing_id, stages) = with_state(|s| (
+        s.cv_pipelines.editing_id.clone(),
+        s.cv_pipelines.stages.clone(),
+    ));
+    let aliases = alias_list_available().unwrap_or_default();
+    let detect_ids: Vec<String> = stages
+        .iter()
+        .filter(|s| s.op == "detect")
+        .map(|s| s.stage_id.clone())
+        .collect();
+
+    let mut children: Vec<Component> = Vec::new();
+
+    let mut name_input = input("Nazwa pipeline'u", "np. Analiza rampy nr 2", "cvp_name");
+    name_input.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend {
+            action_id: "pipeline-name-change".into(),
+            params: CborMap::default(),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    children.push(name_input);
+
+    for (i, st) in stages.iter().enumerate() {
+        children.push(build_pipeline_stage_card(i, st, &aliases, &detect_ids));
+    }
+
+    children.push(stack_h(vec![
+        button("Dodaj etap", "pipeline-stage-add", "secondary"),
+    ]));
+    children.push(divider());
+    children.push(stack_h(vec![
+        button("Zapisz", "pipeline-save", "primary"),
+        button("Anuluj", "pipeline-editor-cancel", "ghost"),
+    ]));
+
+    let title = if editing_id.is_some() {
+        "Edycja pipeline'u analizy CV"
+    } else {
+        "Nowy pipeline analizy CV"
+    };
+    card(Some(title), vec![stack_v(children)])
+}
+
+/// The pipeline manager: list of pipelines (default badge, edit / duplicate /
+/// delete) or, when a draft is open, the stage editor.
+fn build_pipeline_manager() -> Component {
+    if with_state(|s| s.cv_pipelines.editor_visible) {
+        return build_pipeline_editor();
+    }
+
+    let pipelines = match host_cv_pipelines_list() {
+        Ok(p) => p,
+        Err(e) => {
+            return card(Some("Pipeline'y analizy CV"), vec![stack_v(vec![
+                alert(
+                    &alloc::format!("Nie udało się pobrać pipeline'ów: {}", abi_message(e)),
+                    "critical",
+                ),
+                button("Zamknij", "pipeline-manager-close", "ghost"),
+            ])]);
+        }
+    };
+
+    let pending_remove = with_state(|s| s.cv_pipelines.pending_remove.clone());
+    let mut children: Vec<Component> = Vec::new();
+    if pipelines.is_empty() {
+        children.push(text("Brak pipeline'ów — utwórz pierwszy."));
+    }
+    for p in &pipelines {
+        let mut params = CborMap::default();
+        params.0.push(("pipeline_id".into(), Value::Text(p.id.clone())));
+        let mut row: Vec<Component> = vec![text_styled(&p.name, "body_strong")];
+        if p.is_default {
+            row.push(badge("domyślny", "info"));
+        }
+        row.push(button_with_params("Edytuj", "pipeline-edit", "secondary", params.clone()));
+        row.push(button_with_params("Duplikuj", "pipeline-duplicate", "ghost", params.clone()));
+        if !p.is_default {
+            row.push(button_with_params("Usuń", "pipeline-row-remove", "destructive", params.clone()));
+        }
+        children.push(stack_h(row));
+        if pending_remove.as_deref() == Some(p.id.as_str()) {
+            children.push(stack_h(vec![
+                text_styled(&alloc::format!("Usunąć pipeline \"{}\"?", p.name), "body_strong"),
+                button_with_params("Usuń", "pipeline-remove", "destructive", params),
+                button("Anuluj", "pipeline-remove-cancel", "ghost"),
+            ]));
+        }
+    }
+    children.push(divider());
+    children.push(stack_h(vec![
+        button("Nowy pipeline", "pipeline-new", "primary"),
+        button("Zamknij", "pipeline-manager-close", "ghost"),
+    ]));
+
+    card(Some("Pipeline'y analizy CV"), vec![stack_v(children)])
+}
+
+/// Store-key seed for the pipeline editor's bound inputs / selects / toggles,
+/// sent with the cameras content overlay so every control mounts showing the
+/// authoritative backend draft.
+fn pipeline_editor_overlay() -> Vec<StateEntry> {
+    let (name, stages) = with_state(|s| (
+        s.cv_pipelines.name.clone(),
+        s.cv_pipelines.stages.clone(),
+    ));
+    let mut pairs: Vec<(String, Value)> = vec![("cvp_name".into(), Value::Text(name))];
+    for (i, st) in stages.iter().enumerate() {
+        let key = |suffix: &str| alloc::format!("cvp_s{}_{}", i, suffix);
+        pairs.push((key("id"), Value::Text(st.stage_id.clone())));
+        pairs.push((key("op"), Value::Text(st.op.clone())));
+        pairs.push((key("model"), Value::Text(st.model.clone())));
+        pairs.push((key("fps"), Value::Text(st.fps.clone())));
+        pairs.push((key("threshold"), Value::Text(st.threshold.clone())));
+        pairs.push((key("parent"), Value::Text(st.parent.clone())));
+        pairs.push((key("classes"), Value::Text(st.classes.clone())));
+        pairs.push((
+            key("ocr_mode"),
+            Value::Text(if st.ocr_mode.trim().is_empty() { "generic".to_string() } else { st.ocr_mode.clone() }),
+        ));
+        pairs.push((key("enabled"), Value::Bool(st.enabled)));
+    }
+    pairs
+        .into_iter()
+        .map(|(key, value)| StateEntry {
+            path: StatePath::new(vec![PathSegment::Key(key)]),
+            value,
+        })
+        .collect()
 }
 
 /// Total number of wizard steps. The wizard is 0-indexed internally.

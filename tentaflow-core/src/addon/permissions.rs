@@ -160,6 +160,14 @@ impl PermissionChecker {
         PermissionResult::NotConfigured
     }
 
+    /// True gdy `user_id` jest w grupie "admins" — ta sama lista, ktorej
+    /// `check` uzywa do admin bypass. Pozwala host functions jawnie bramkowac
+    /// operacje admin-only (np. edycje wspoldzielonych zasobow org), zamiast
+    /// polegac wylacznie na per-user grantach uprawnienia.
+    pub fn is_admin(&self, user_id: &str) -> bool {
+        self.admin_cache.load().iter().any(|a| a == user_id)
+    }
+
     /// Zaladuj WSZYSTKIE uprawnienia z DB do cache.
     /// Wywolywane przy starcie i co 5 minut w tle.
     pub fn refresh_all(&self) {

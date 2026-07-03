@@ -2158,20 +2158,28 @@ fn apply_camera_cv_pipeline(
             // converge into a constraint violation.
             let is_default = id == crate::db::seed::CAMERA_CV_PIPELINE_ID
                 && field_bool_or(operation, "is_default", false)?;
+            // Pre-org-scope senders omit org_id — default them into the
+            // single default org, matching the v110 column default.
+            let org_id = field_string_or(
+                operation,
+                "org_id",
+                crate::services::org::DEFAULT_ORG_ID,
+            )?;
             tx.execute(
                 "INSERT INTO camera_cv_pipelines \
-                 (id, name, pipeline_json, is_default, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, CAST(strftime('%s','now') AS INTEGER), \
+                 (id, name, pipeline_json, is_default, org_id, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, CAST(strftime('%s','now') AS INTEGER), \
                  CAST(strftime('%s','now') AS INTEGER)) \
                  ON CONFLICT(id) DO UPDATE SET \
                  name = excluded.name, pipeline_json = excluded.pipeline_json, \
-                 is_default = excluded.is_default, \
+                 is_default = excluded.is_default, org_id = excluded.org_id, \
                  updated_at = CAST(strftime('%s','now') AS INTEGER)",
                 rusqlite::params![
                     id,
                     field_string(operation, "name")?,
                     pipeline_json,
                     is_default,
+                    org_id,
                 ],
             )
             .map_err(sql_error)

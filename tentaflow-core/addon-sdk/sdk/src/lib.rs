@@ -460,6 +460,19 @@ extern "C" {
     ) -> i32;
     fn camera_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_analysis_flows_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn camera_cv_pipelines_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn camera_cv_pipeline_get_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_cv_pipeline_save_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_cv_pipeline_delete_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
     fn camera_get_v1(
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
@@ -2343,6 +2356,8 @@ pub struct CameraInfo {
     pub profile: String,
     /// Per-camera analysis Flow id (None/empty = none assigned).
     pub analysis_flow_id: Option<String>,
+    /// Per-camera CV pipeline id (None/empty = the default pipeline).
+    pub cv_pipeline_id: Option<String>,
 }
 
 impl From<tentaflow_sdk_spec::CameraInfoOut> for CameraInfo {
@@ -2362,6 +2377,7 @@ impl From<tentaflow_sdk_spec::CameraInfoOut> for CameraInfo {
             retention_class: o.retention_class,
             profile: o.profile,
             analysis_flow_id: o.analysis_flow_id,
+            cv_pipeline_id: o.cv_pipeline_id,
         }
     }
 }
@@ -2382,6 +2398,10 @@ pub struct CameraUpdateSpec {
     /// Per-camera analysis Flow id. `None` keeps current; `Some("")` clears it;
     /// `Some(id)` assigns (host validates the flow exists and is active).
     pub analysis_flow_id: Option<String>,
+    /// Per-camera CV pipeline id. Same tri-state as `analysis_flow_id`:
+    /// `None` keeps current, `Some("")` clears (back to the default pipeline),
+    /// `Some(id)` assigns (host validates the pipeline exists).
+    pub cv_pipeline_id: Option<String>,
 }
 
 /// One assignable camera-analysis flow (id + display name) from
@@ -2390,6 +2410,45 @@ pub struct CameraUpdateSpec {
 pub struct CameraAnalysisFlow {
     pub id: String,
     pub name: String,
+}
+
+/// One camera CV pipeline summary from [`camera_cv_pipelines_list`], for the
+/// per-camera pipeline picker and the pipeline manager list.
+#[derive(Debug, Clone)]
+pub struct CameraCvPipelineSummary {
+    pub id: String,
+    pub name: String,
+    /// Seed-owned default pipeline — cannot be deleted; cameras without an
+    /// explicit assignment resolve to it.
+    pub is_default: bool,
+    pub updated_at: i64,
+}
+
+/// One full pipeline (JSON body included) from [`camera_cv_pipeline_get`].
+#[derive(Debug, Clone)]
+pub struct CameraCvPipeline {
+    pub id: String,
+    pub name: String,
+    /// `{"stages":[...]}` per the core `cv_pipeline::CvPipeline` schema.
+    pub pipeline_json: String,
+}
+
+/// Outcome of [`camera_cv_pipeline_save`]. A host-side validation failure
+/// (structure or unknown model alias) is NOT an ABI error — it comes back as
+/// `id = None` + a human-readable `error` for the UI to display verbatim.
+#[derive(Debug, Clone)]
+pub struct CameraCvPipelineSaveResult {
+    pub id: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Outcome of [`camera_cv_pipeline_delete`]. A refused delete (default
+/// pipeline, still referenced by a camera) comes back as `deleted = false`
+/// + a human-readable `error`.
+#[derive(Debug, Clone)]
+pub struct CameraCvPipelineDeleteResult {
+    pub deleted: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2537,6 +2596,73 @@ pub fn camera_analysis_flows() -> Result<Vec<CameraAnalysisFlow>, AbiError> {
         .collect())
 }
 
+/// Lists every camera CV pipeline (summaries only — the JSON body is fetched
+/// per-pipeline via [`camera_cv_pipeline_get`]). Read-only; needs `cameras.read`.
+pub fn camera_cv_pipelines_list() -> Result<Vec<CameraCvPipelineSummary>, AbiError> {
+    let bytes = call_host_no_input(camera_cv_pipelines_list_v1)?;
+    let resp: tentaflow_sdk_spec::CameraCvPipelinesOut = decode_cbor(&bytes)?;
+    Ok(resp
+        .pipelines
+        .into_iter()
+        .map(|p| CameraCvPipelineSummary {
+            id: p.id,
+            name: p.name,
+            is_default: p.is_default,
+            updated_at: p.updated_at,
+        })
+        .collect())
+}
+
+/// Fetches one pipeline with its full JSON body. Needs `cameras.read`.
+pub fn camera_cv_pipeline_get(id: &str) -> Result<CameraCvPipeline, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::CameraCvPipelineIdInput {
+        id: id.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(camera_cv_pipeline_get_v1, &payload)?;
+    let out: tentaflow_sdk_spec::CameraCvPipelineOut = decode_cbor(&bytes)?;
+    Ok(CameraCvPipeline {
+        id: out.id,
+        name: out.name,
+        pipeline_json: out.pipeline_json,
+    })
+}
+
+/// Creates (`id = None` → host mints a fresh uuid) or updates a pipeline.
+/// The host validates structure + model-alias existence; a rejected pipeline
+/// returns `Ok` with the readable error in the result. Needs `cameras.write`.
+pub fn camera_cv_pipeline_save(
+    id: Option<&str>,
+    name: &str,
+    pipeline_json: &str,
+) -> Result<CameraCvPipelineSaveResult, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::CameraCvPipelineSaveInput {
+        id: id.map(|s| s.to_string()),
+        name: name.to_string(),
+        pipeline_json: pipeline_json.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(camera_cv_pipeline_save_v1, &payload)?;
+    let out: tentaflow_sdk_spec::CameraCvPipelineSaveOut = decode_cbor(&bytes)?;
+    Ok(CameraCvPipelineSaveResult {
+        id: out.id,
+        error: out.error,
+    })
+}
+
+/// Deletes a pipeline. Refusals (default pipeline, still assigned to a
+/// camera) return `Ok` with `deleted = false` + the readable reason.
+/// Needs `cameras.write`.
+pub fn camera_cv_pipeline_delete(id: &str) -> Result<CameraCvPipelineDeleteResult, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::CameraCvPipelineIdInput {
+        id: id.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(camera_cv_pipeline_delete_v1, &payload)?;
+    let out: tentaflow_sdk_spec::CameraCvPipelineDeleteOut = decode_cbor(&bytes)?;
+    Ok(CameraCvPipelineDeleteResult {
+        deleted: out.deleted,
+        error: out.error,
+    })
+}
+
 /// Pobiera pojedynczy `CameraInfo`. Zwraca `NotFound` gdy kamera nie istnieje
 /// lub nalezy do innego addona (kanalu bocznego nie ma — nie da sie wnioskowac
 /// o istnieniu cudzych camera_id).
@@ -2561,6 +2687,7 @@ pub fn camera_update(spec: &CameraUpdateSpec) -> Result<CameraInfo, AbiError> {
         retention_class: spec.retention_class.clone(),
         profile: spec.profile.clone(),
         analysis_flow_id: spec.analysis_flow_id.clone(),
+        cv_pipeline_id: spec.cv_pipeline_id.clone(),
     })?;
     let bytes = call_sql_with_one_input(camera_update_v1, &payload)?;
     let out: tentaflow_sdk_spec::CameraInfoOut = decode_cbor(&bytes)?;
@@ -2719,6 +2846,7 @@ pub fn camera_discover() -> Result<Vec<CameraInfo>, AbiError> {
             retention_class: String::new(),
             profile: String::new(),
             analysis_flow_id: None,
+            cv_pipeline_id: None,
         })
         .collect())
 }

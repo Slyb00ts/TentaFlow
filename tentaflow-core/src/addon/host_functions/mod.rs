@@ -440,6 +440,34 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
         linker
             .func_wrap(
                 "tentaflow",
+                "camera_cv_pipelines_list_v1",
+                camera::camera_cv_pipelines_list_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_cv_pipelines_list_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_cv_pipeline_get_v1",
+                camera::camera_cv_pipeline_get_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_cv_pipeline_get_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_cv_pipeline_save_v1",
+                camera::camera_cv_pipeline_save_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_cv_pipeline_save_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_cv_pipeline_delete_v1",
+                camera::camera_cv_pipeline_delete_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_cv_pipeline_delete_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
                 "camera_list_accessible_v1",
                 camera::camera_list_accessible_v1,
             )

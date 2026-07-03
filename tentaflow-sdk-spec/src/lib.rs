@@ -22,7 +22,10 @@ pub mod protocol;
 pub use protocol::{
     camera::{
         CameraAddInput, CameraAddOutput, CameraAnalysisFlowOut, CameraAnalysisFlowsOut,
-        CameraCredentialsRotateInput, CameraCredentialsRotateOut, CameraDiscoverOut,
+        CameraCredentialsRotateInput, CameraCredentialsRotateOut,
+        CameraCvPipelineDeleteOut, CameraCvPipelineIdInput, CameraCvPipelineOut,
+        CameraCvPipelineSaveInput, CameraCvPipelineSaveOut, CameraCvPipelineSummary,
+        CameraCvPipelinesOut, CameraDiscoverOut,
         CameraGrantInfo, CameraGrantInput, CameraGrantListInput, CameraGrantListOut, CameraGrantOut,
         CameraHealthOut, CameraIdInput, CameraInfoOut, CameraListOut, CameraRemoveOut,
         CameraRevokeInput, CameraSnapshotOut, CameraTestConnectionInput, CameraTestConnectionOut,

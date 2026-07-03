@@ -587,7 +587,32 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "camera_cv_pipelines",
             MigrationStep::Rust(create_camera_cv_pipelines),
         ),
+        (
+            110,
+            "camera_cv_pipelines_org_scope",
+            MigrationStep::Rust(camera_cv_pipelines_add_org_scope),
+        ),
     ]
+}
+
+/// v110 — org scoping for camera CV pipelines. Adds `org_id` (defaulting
+/// existing rows to the single default org, same convention as other
+/// org-scoped tables) and replaces the global "one default pipeline" unique
+/// index with a per-org one, so every org resolves its own `is_default=1`
+/// row. Idempotent (column probe + IF NOT EXISTS).
+fn camera_cv_pipelines_add_org_scope(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "camera_cv_pipelines", "org_id")? {
+        conn.execute_batch(
+            "ALTER TABLE camera_cv_pipelines \
+             ADD COLUMN org_id TEXT NOT NULL DEFAULT 'org-default';",
+        )?;
+    }
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_camera_cv_pipelines_default;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_cv_pipelines_default_org
+            ON camera_cv_pipelines(org_id) WHERE is_default = 1;",
+    )?;
+    Ok(())
 }
 
 /// v109 — configurable camera CV pipelines. `camera_cv_pipelines` stores the

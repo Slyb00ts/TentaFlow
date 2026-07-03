@@ -1187,17 +1187,26 @@ pub(crate) const CAMERA_CV_PIPELINE_ID: &str = "00000000-0000-4000-8000-00000000
 /// validate it via `cv_pipeline::validate`.
 const CAMERA_CV_PIPELINE_JSON: &str = r#"{"stages":[{"stage_id":"detect","op":"detect","model":"tentavision-detect","input":{"kind":"frame"},"threshold":0.5},{"stage_id":"stan","op":"classify","model":"tentavision-stan","input":{"kind":"stage","stage_id":"detect","classes":["nalepka*","znak_srodowiskowy","termometr","tablica_adr","tablica_rejestracyjna"]},"output":"stan"},{"stage_id":"ocr_plate","op":"ocr","model":"tentavision-ocr","input":{"kind":"stage","stage_id":"detect","classes":["tablica_rejestracyjna"]},"params":{"ocr_mode":"plate","crop_pad_x":0.15,"crop_pad_y":0.1},"output":"tekst"},{"stage_id":"ocr_adr","op":"ocr","model":"tentavision-ocr","input":{"kind":"stage","stage_id":"detect","classes":["tablica_adr"]},"params":{"ocr_mode":"adr","crop_pad_x":0.15,"crop_pad_y":0.1},"output":"tekst"}]}"#;
 
-/// Seeds the default camera CV pipeline (`is_default=1`). Idempotent by the
-/// fixed `id` — INSERT only when the row does not exist, so admin edits are
-/// never overwritten (same pattern as `seed_camera_analysis_flow`).
+/// Seeds the default camera CV pipeline (`is_default=1`) into the default
+/// org — the same single-org convention every other seed follows (all
+/// `org_memberships` land in `org-default`). Idempotent by the fixed `id` —
+/// INSERT only when the row does not exist, so admin edits are never
+/// overwritten (same pattern as `seed_camera_analysis_flow`).
 fn seed_camera_cv_pipeline(conn: &Connection) -> Result<()> {
     const NAME: &str = "Analiza domyślna (ADR)";
     let now = chrono::Utc::now().timestamp();
     let inserted = conn.execute(
-        "INSERT INTO camera_cv_pipelines (id, name, pipeline_json, is_default, created_at, updated_at) \
-         SELECT ?1, ?2, ?3, 1, ?4, ?4 \
+        "INSERT INTO camera_cv_pipelines \
+         (id, name, pipeline_json, is_default, org_id, created_at, updated_at) \
+         SELECT ?1, ?2, ?3, 1, ?4, ?5, ?5 \
          WHERE NOT EXISTS (SELECT 1 FROM camera_cv_pipelines WHERE id = ?1)",
-        rusqlite::params![CAMERA_CV_PIPELINE_ID, NAME, CAMERA_CV_PIPELINE_JSON, now],
+        rusqlite::params![
+            CAMERA_CV_PIPELINE_ID,
+            NAME,
+            CAMERA_CV_PIPELINE_JSON,
+            crate::services::org::DEFAULT_ORG_ID,
+            now
+        ],
     )?;
     if inserted > 0 {
         info!("seed: created default camera CV pipeline '{}'", NAME);
