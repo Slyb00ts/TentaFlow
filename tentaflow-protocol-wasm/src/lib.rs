@@ -9723,8 +9723,12 @@ fn ml_studio_detail_to_js(d: &tentaflow_protocol::MlStudioProjectDetail) -> js_s
     set(&item, "owner_user_id", d.owner_user_id.clone().into());
     set(&item, "orgId", d.org_id.clone().into());
     set(&item, "org_id", d.org_id.clone().into());
+    set(&item, "datasetCount", d.dataset_count.into());
+    set(&item, "dataset_count", d.dataset_count.into());
     set(&item, "modelCount", d.model_count.into());
     set(&item, "model_count", d.model_count.into());
+    set(&item, "trainingCount", d.training_count.into());
+    set(&item, "training_count", d.training_count.into());
     set(&item, "createdAt", d.created_at.clone().into());
     set(&item, "created_at", d.created_at.clone().into());
     set(&item, "updatedAt", d.updated_at.clone().into());

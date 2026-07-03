@@ -1149,7 +1149,9 @@ pub struct MlStudioProjectDetail {
     pub status: String,
     pub owner_user_id: String,
     pub org_id: String,
+    pub dataset_count: u32,
     pub model_count: u32,
+    pub training_count: u32,
     /// Role of the requesting user in this project (`owner`/`editor`/`viewer`).
     pub role: String,
     /// Convenience flag for the UI: the requesting user owns this project.
