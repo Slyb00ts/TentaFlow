@@ -39,15 +39,29 @@ fn disk_mime(path: &str) -> &'static str {
 }
 
 /// Reads `<dir>/<rel>` from disk for the TENTAFLOW_WWW_DIR dev path. `None` if the
-/// file is absent (caller falls back to the embedded copy).
-fn serve_from_disk(dir: &str, rel: &str) -> Option<(u16, &'static str, Vec<u8>)> {
+/// file is absent (caller falls back to the embedded copy). ETag = per-file
+/// SHA-256 (16 hex) liczony w locie — dev sciezka tez wspiera warunkowe GET.
+fn serve_from_disk(dir: &str, rel: &str) -> Option<(u16, &'static str, Vec<u8>, String)> {
     let full = std::path::Path::new(dir).join(rel);
-    std::fs::read(&full).ok().map(|bytes| (200u16, disk_mime(rel), bytes))
+    std::fs::read(&full).ok().map(|bytes| {
+        let etag = disk_etag(&bytes);
+        (200u16, disk_mime(rel), bytes, etag)
+    })
 }
 
-/// Zwraca (status, content_type, body_bytes) dla podanej sciezki HTTP.
-/// Pliki sa wbudowane w binarie — zero zaleznosci od systemu plikow.
-pub fn serve(path: &str) -> (u16, &'static str, Vec<u8>) {
+/// SHA-256 (16 hex) dla sciezki dyskowej (dev). Embedded pliki maja etag
+/// wyliczony w build.rs, wiec runtime hashuje tylko przy TENTAFLOW_WWW_DIR.
+fn disk_etag(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().take(8).map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Zwraca (status, content_type, body_bytes, etag) dla podanej sciezki HTTP.
+/// Pliki sa wbudowane w binarie — zero zaleznosci od systemu plikow. `etag`
+/// jest pusty dla odpowiedzi bez cache (403/404).
+pub fn serve(path: &str) -> (u16, &'static str, Vec<u8>, String) {
     // Normalizuj sciezke — domyslnie index.html
     let clean_path = match path {
         "/" | "" => "index.html",
@@ -59,7 +73,7 @@ pub fn serve(path: &str) -> (u16, &'static str, Vec<u8>) {
 
     // Zabezpiecz przed path traversal (surowy i zdekodowany)
     if clean_path.contains("..") || decoded.contains("..") || decoded.contains('\0') {
-        return (403, "text/plain", b"Forbidden".to_vec());
+        return (403, "text/plain", b"Forbidden".to_vec(), String::new());
     }
 
     // Dev affordance: when TENTAFLOW_WWW_DIR points at a www/ source tree, serve files
@@ -73,8 +87,8 @@ pub fn serve(path: &str) -> (u16, &'static str, Vec<u8>) {
         }
     }
 
-    if let Some((content_type, data)) = wwwroot_lookup(clean_path) {
-        return (200, content_type, data.to_vec());
+    if let Some((content_type, data, etag)) = wwwroot_lookup(clean_path) {
+        return (200, content_type, data.to_vec(), etag.to_string());
     }
 
     // SPA fallback tylko dla sciezek-routes (bez rozszerzenia lub .html).
@@ -88,12 +102,12 @@ pub fn serve(path: &str) -> (u16, &'static str, Vec<u8>) {
         .unwrap_or(false);
 
     if is_asset {
-        return (404, "text/plain", b"Not Found".to_vec());
+        return (404, "text/plain", b"Not Found".to_vec(), String::new());
     }
 
-    if let Some((content_type, data)) = wwwroot_lookup("index.html") {
-        (200, content_type, data.to_vec())
+    if let Some((content_type, data, etag)) = wwwroot_lookup("index.html") {
+        (200, content_type, data.to_vec(), etag.to_string())
     } else {
-        (404, "text/plain", b"Not Found".to_vec())
+        (404, "text/plain", b"Not Found".to_vec(), String::new())
     }
 }

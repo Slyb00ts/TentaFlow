@@ -325,20 +325,55 @@ fn make_static_response_with_origin(
     content_type: &str,
     body: Vec<u8>,
     origin: Option<&str>,
+    etag: &str,
+    if_none_match: Option<&str>,
 ) -> Response<DashboardBody> {
+    // Tylko sw.js + jego importScripts (sw-version.js) sa no-store — to one
+    // napedzaja wykrywanie update'u SW i musza byc zawsze swieze. Reszta (w tym
+    // wasm glue /js/protocol/) idzie przez ETag+rewalidacje: gdy tresc niezmieniona
+    // browser dostaje 304 (bez ponownego pobrania MB), a zmiana wasm daje nowy
+    // ETag i swieze bajty — schema-handshake i tak jest siatka bezpieczenstwa.
+    let no_store = path == "/sw.js" || path == "/js/generated/sw-version.js";
+
+    // Warunkowy GET: dla zasobow z etagiem (poza no-store) ustawiamy ETag +
+    // Cache-Control:no-cache. Browser rewaliduje kazdy load (If-None-Match);
+    // gdy tresc niezmieniona -> 304 bez body. Caching dziala ZAWSZE, niezaleznie
+    // od service workera i zaufania do certa.
+    let cacheable = status == 200 && !no_store && !etag.is_empty();
+    let quoted = format!("\"{}\"", etag);
+    if cacheable {
+        if let Some(inm) = if_none_match {
+            // Klient echuje dokladna wartosc ETag (z cudzyslowami). Akceptujemy
+            // tez forme bez cudzyslowow i liste rozdzielona przecinkami.
+            let matches = inm
+                .split(',')
+                .map(|s| s.trim())
+                .any(|s| s == quoted || s.trim_matches('"') == etag);
+            if matches {
+                let mut b = Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header("ETag", &quoted)
+                    .header("Cache-Control", "no-cache");
+                if let Some(o) = origin {
+                    b = b.header("Access-Control-Allow-Origin", o);
+                }
+                return b.body(Either::Left(Full::new(Bytes::new()))).unwrap();
+            }
+        }
+    }
+
     let mut builder = Response::builder()
         .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
         .header("Content-Type", content_type);
 
-    // sw.js + jego importScripts (sw-version.js) i wasm glue MUSZA byc swieze,
-    // inaczej browser nie wykryje zmiany build-hasha / schematu protokolu.
-    if path == "/sw.js"
-        || path == "/js/generated/sw-version.js"
-        || path.starts_with("/js/protocol/")
-    {
+    if no_store {
         builder = builder
             .header("Cache-Control", "no-store")
             .header("Pragma", "no-cache");
+    } else if cacheable {
+        builder = builder
+            .header("ETag", &quoted)
+            .header("Cache-Control", "no-cache");
     }
 
     if let Some(o) = origin {
@@ -1558,13 +1593,19 @@ pub async fn handle_request(
 
     // Pliki statyczne - sciezki poza /api/
     if method == Method::GET && !path.starts_with("/api/") {
-        let (status, content_type, body) = static_files::serve(&path);
+        let if_none_match = req
+            .headers()
+            .get("if-none-match")
+            .and_then(|v| v.to_str().ok());
+        let (status, content_type, body, etag) = static_files::serve(&path);
         return Ok(make_static_response_with_origin(
             &path,
             status,
             content_type,
             body,
             cors_origin.as_deref(),
+            &etag,
+            if_none_match,
         ));
     }
 

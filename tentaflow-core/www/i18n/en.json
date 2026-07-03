@@ -4196,6 +4196,8 @@
     "desc": "The server was updated. Reload to load the latest version.",
     "title_required": "Update required",
     "desc_required": "The frontend is out of sync with the server. Reload to continue.",
+    "cmp": "Update ready to install",
+    "cmp_required": "Communication protocol change",
     "reload": "Reload",
     "later": "Later"
   },

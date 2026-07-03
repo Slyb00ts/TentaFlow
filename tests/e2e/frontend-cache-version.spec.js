@@ -1,9 +1,10 @@
 // =============================================================================
 // File: tests/e2e/frontend-cache-version.spec.js
 // Description: E2E for the frontend asset-caching + build-hash version handshake.
-//   Verifies the generated asset manifest / sw-version, cache headers, that the
-//   client-loaded hash matches the server, that a matching build shows NO false
-//   "new version" banner, and that a signalled update shows a dismissible banner.
+//   Verifies the generated asset manifest / sw-version, cache headers, ETag/304
+//   revalidation, that the client-loaded hash matches the server, that a matching
+//   build shows NO false "new version" modal, and that a signalled update shows a
+//   dismissible modal.
 // =============================================================================
 
 const { test, expect } = require('@playwright/test');
@@ -52,6 +53,29 @@ test('sw.js is served with no-store', async ({ request }) => {
   expect(sw.headers()['cache-control']).toContain('no-store');
 });
 
+test('static assets are cacheable via ETag with conditional 304', async ({ request }) => {
+  // App.js is a normal asset -> must carry an ETag + revalidate directive.
+  const first = await request.get(`${BASE}/js/app.js`);
+  expect(first.ok()).toBeTruthy();
+  const etag = first.headers()['etag'];
+  expect(etag).toBeTruthy();
+  expect(first.headers()['cache-control']).toContain('no-cache');
+
+  // Conditional GET with the same ETag -> 304 Not Modified, empty body.
+  const second = await request.get(`${BASE}/js/app.js`, {
+    headers: { 'If-None-Match': etag },
+  });
+  expect(second.status()).toBe(304);
+  expect((await second.body()).length).toBe(0);
+
+  // A stale/mismatched ETag -> full 200 with body.
+  const stale = await request.get(`${BASE}/js/app.js`, {
+    headers: { 'If-None-Match': '"deadbeefdeadbeef"' },
+  });
+  expect(stale.status()).toBe(200);
+  expect((await stale.body()).length).toBeGreaterThan(0);
+});
+
 test('client-loaded asset hash equals the server hash (no false-positive banner)', async ({ page }) => {
   await loginAsAdmin(page, { port: PORT });
 
@@ -70,7 +94,7 @@ test('client-loaded asset hash equals the server hash (no false-positive banner)
   expect(clientHash).toBe(served);
 
   // Same build on both sides => the update banner must NOT be visible.
-  const banner = page.locator('.update-banner.visible');
+  const banner = page.locator('.update-overlay.visible');
   await expect(banner).toHaveCount(0);
 });
 
@@ -83,10 +107,10 @@ test('signalled update shows a dismissible banner with per-hash dedup', async ({
       detail: { required: false, current: 'aaaaaaaaaaaaaaaa', server: 'bbbbbbbbbbbbbbbb' },
     }));
   });
-  const banner = page.locator('.update-banner');
+  const banner = page.locator('.update-overlay');
   await expect(banner).toHaveClass(/visible/);
   // Locale-tolerant (test env may be pl or en).
-  await expect(banner.locator('.update-banner-title'))
+  await expect(banner.locator('.update-overlay-heading'))
     .toHaveText(/Nowa wersja aplikacji|New app version/);
 
   // Dismiss ("Później") hides it.
@@ -115,6 +139,6 @@ test('signalled update shows a dismissible banner with per-hash dedup', async ({
       detail: { required: true, server: 'dddddddddddddddd' },
     }));
   });
-  await expect(banner.locator('.update-banner-title'))
+  await expect(banner.locator('.update-overlay-heading'))
     .toHaveText(/Wymagana aktualizacja|Update required/);
 });

@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mockup — Nowa wersja aplikacji</title>
+<style>
+  /* Tokeny motywu TentaFlow (zgodne z css/*.css) */
+  :root {
+    --tf-bg: #05061a;
+    --tf-bg-2: #0a0e22;
+    --tf-bg-card: #141836;
+    --tf-bg-input: #0b0e22;
+    --tf-border: #1f2548;
+    --tf-text: #f5f6ff;
+    --tf-text-2: #c1c5e0;
+    --tf-text-3: #6a7196;
+    --tf-danger: #ef4444;
+    --tf-info: #60a5fa;
+    --tf-success: #22c55e;
+    --tf-warning: #f59e0b;
+    --tf-radius: 10px;
+    --tf-radius-lg: 14px;
+    --tf-shadow-lg: 0 24px 64px rgba(0, 0, 0, 0.7), 0 8px 24px rgba(99, 102, 241, 0.15);
+    --accent: var(--tf-info);
+    --accent-rgb: 96, 165, 250;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--tf-bg);
+    color: var(--tf-text);
+    overflow: hidden;
+  }
+
+  /* ---- Tlo aplikacji (rozmyte, jak app-blurred) ---- */
+  .app-mock {
+    position: absolute;
+    inset: 0;
+    padding: 28px;
+    filter: blur(6px) saturate(0.7);
+    opacity: 0.55;
+    transition: filter 0.4s ease;
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    gap: 22px;
+  }
+  .app-mock .side {
+    background: var(--tf-bg-card);
+    border: 1px solid var(--tf-border);
+    border-radius: var(--tf-radius-lg);
+  }
+  .app-mock .main { display: grid; gap: 18px; grid-template-rows: 60px 1fr 1fr; }
+  .app-mock .tile {
+    background: var(--tf-bg-card);
+    border: 1px solid var(--tf-border);
+    border-radius: var(--tf-radius-lg);
+  }
+
+  /* ---- Overlay ---- */
+  .overlay {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    z-index: 50;
+    background: rgba(5, 8, 24, 0.55);
+    backdrop-filter: blur(2px);
+  }
+
+  .card {
+    width: 100%;
+    max-width: 480px;
+    background: var(--tf-bg-card);
+    border: 1px solid var(--tf-border);
+    border-radius: var(--tf-radius-lg);
+    box-shadow: var(--tf-shadow-lg);
+    overflow: hidden;
+    animation: cardIn 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+  @keyframes cardIn {
+    from { opacity: 0; transform: translateY(22px) scale(0.95); }
+    to   { opacity: 1; transform: none; }
+  }
+
+  /* Header */
+  .head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 18px;
+    background: var(--tf-bg-2);
+    border-bottom: 1px solid var(--tf-border);
+  }
+  .head .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--accent);
+    animation: dotPulse 1.8s ease-in-out infinite;
+  }
+  @keyframes dotPulse {
+    0%   { box-shadow: 0 0 0 0 rgba(var(--accent-rgb), 0.55); }
+    60%  { box-shadow: 0 0 0 9px rgba(var(--accent-rgb), 0); }
+    100% { box-shadow: 0 0 0 0 rgba(var(--accent-rgb), 0); }
+  }
+  .head h3 { margin: 0; font-size: 15px; font-weight: 700; flex: 1; }
+  .head .ver {
+    font-family: 'JetBrains Mono', 'Menlo', monospace;
+    font-size: 11px; color: var(--tf-text-3);
+    padding: 3px 8px; border: 1px solid var(--tf-border);
+    border-radius: 999px; background: var(--tf-bg-input);
+  }
+
+  /* Body */
+  .body { padding: 30px 26px 20px; text-align: center; }
+
+  .icon {
+    width: 72px; height: 72px; margin: 0 auto 20px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(var(--accent-rgb), 0.09);
+    border: 1px solid rgba(var(--accent-rgb), 0.28);
+    color: var(--accent);
+    position: relative;
+  }
+  .icon::before {
+    content: ''; position: absolute; inset: -6px; border-radius: 50%;
+    border: 2px solid var(--accent); opacity: 0.4;
+    animation: ringPulse 2.4s ease-out infinite;
+  }
+  @keyframes ringPulse {
+    0%   { transform: scale(0.9); opacity: 0.45; }
+    70%  { transform: scale(1.3); opacity: 0; }
+    100% { transform: scale(1.3); opacity: 0; }
+  }
+  .icon svg {
+    width: 32px; height: 32px;
+    stroke: currentColor; fill: none; stroke-width: 2;
+    stroke-linecap: round; stroke-linejoin: round;
+  }
+  /* Delikatna animacja strzalki download */
+  .icon svg .arrow { animation: bob 1.9s ease-in-out infinite; transform-origin: center; }
+  @keyframes bob {
+    0%, 100% { transform: translateY(-1px); }
+    50%      { transform: translateY(2px); }
+  }
+
+  .heading { font-size: 19px; font-weight: 800; margin-bottom: 8px; }
+  .desc {
+    color: var(--tf-text-2); font-size: 13px; line-height: 1.6;
+    margin: 0 auto 22px; max-width: 380px;
+  }
+
+  /* Wiersz z wersjami (jak conn-retry) */
+  .vercmp {
+    display: flex; align-items: center; gap: 14px;
+    padding: 14px 16px;
+    background: var(--tf-bg-input);
+    border: 1px solid var(--tf-border);
+    border-radius: var(--tf-radius);
+    margin-bottom: 16px; text-align: left;
+  }
+  .vercmp .spin {
+    position: relative; width: 44px; height: 44px; flex-shrink: 0;
+  }
+  .vercmp .spin svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+  .vercmp .spin circle { fill: none; stroke-width: 3; }
+  .vercmp .spin .track { stroke: var(--tf-border); }
+  .vercmp .spin .fill {
+    stroke: var(--accent); stroke-linecap: round;
+    stroke-dasharray: 126; stroke-dashoffset: 40;
+    animation: spin 1.1s linear infinite;
+    transform-origin: center;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .vercmp .spin .check {
+    position: absolute; inset: 0; display: none;
+    align-items: center; justify-content: center; color: var(--tf-success);
+  }
+  .vercmp .info { flex: 1; min-width: 0; }
+  .vercmp .info .l1 { font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+  .vercmp .info .l2 {
+    font-size: 12px; color: var(--tf-text-3);
+    font-family: 'JetBrains Mono', 'Menlo', monospace;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .vercmp .info .l2 .old { color: var(--tf-text-3); text-decoration: line-through; opacity: 0.7; }
+  .vercmp .info .l2 .arrow2 { color: var(--accent); }
+  .vercmp .info .l2 .new { color: var(--tf-text-2); }
+
+  /* Pasek postepu (pojawia sie po kliknieciu Odswiez) */
+  .progress {
+    height: 4px; border-radius: 999px; background: var(--tf-bg-input);
+    overflow: hidden; margin: 4px 0 16px; display: none;
+  }
+  .progress > i {
+    display: block; height: 100%; width: 0%;
+    background: linear-gradient(90deg, var(--accent), #a78bfa);
+    transition: width 0.9s ease;
+  }
+
+  /* Footer */
+  .foot {
+    display: flex; justify-content: flex-end; gap: 10px;
+    padding: 14px 18px; background: var(--tf-bg-2);
+    border-top: 1px solid var(--tf-border);
+  }
+  .btn {
+    display: inline-flex; align-items: center; gap: 7px;
+    font: inherit; font-size: 13px; font-weight: 600;
+    padding: 9px 16px; border-radius: var(--tf-radius);
+    border: 1px solid transparent; cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, transform 0.05s;
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn svg { width: 15px; height: 15px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .btn.ghost { background: transparent; color: var(--tf-text-2); border-color: var(--tf-border); }
+  .btn.ghost:hover { background: var(--tf-bg-input); color: var(--tf-text); }
+  .btn.primary {
+    color: #06122b; position: relative; overflow: hidden;
+    background: linear-gradient(180deg, #7cb6ff, var(--accent));
+    box-shadow: 0 4px 14px rgba(var(--accent-rgb), 0.35);
+  }
+  .btn.primary:hover { filter: brightness(1.06); }
+  /* Shimmer na primary */
+  .btn.primary::after {
+    content: ''; position: absolute; top: 0; left: -60%; width: 40%; height: 100%;
+    background: linear-gradient(100deg, transparent, rgba(255,255,255,0.45), transparent);
+    transform: skewX(-18deg);
+    animation: shimmer 3.2s ease-in-out infinite;
+  }
+  @keyframes shimmer {
+    0%, 60% { left: -60%; }
+    100%    { left: 130%; }
+  }
+
+  /* ---- Wariant "wymagana aktualizacja" (amber) ---- */
+  .card.required { --accent: var(--tf-warning); --accent-rgb: 245, 158, 11; }
+  .card.required .btn.primary { color: #2a1a00; background: linear-gradient(180deg, #ffce6b, var(--tf-warning)); }
+
+  /* ---- Panel przelaczania stanow (poza mockupem) ---- */
+  .controls {
+    position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+    z-index: 80; display: flex; gap: 8px; align-items: center;
+    padding: 8px 12px; background: rgba(20, 24, 54, 0.9);
+    border: 1px solid var(--tf-border); border-radius: 999px;
+    box-shadow: var(--tf-shadow-lg); backdrop-filter: blur(6px);
+    font-size: 12px; color: var(--tf-text-3);
+  }
+  .controls button {
+    font: inherit; font-weight: 600; color: var(--tf-text-2);
+    background: var(--tf-bg-input); border: 1px solid var(--tf-border);
+    border-radius: 999px; padding: 6px 12px; cursor: pointer;
+  }
+  .controls button.active { color: var(--tf-text); border-color: var(--accent); }
+</style>
+</head>
+<body>
+
+  <!-- Tlo aplikacji (rozmyte) -->
+  <div class="app-mock">
+    <div class="side"></div>
+    <div class="main">
+      <div class="tile"></div>
+      <div class="tile"></div>
+      <div class="tile"></div>
+    </div>
+  </div>
+
+  <!-- Overlay z oknem nowej wersji -->
+  <div class="overlay">
+    <div class="card" id="card">
+      <div class="head">
+        <span class="dot"></span>
+        <h3 id="title">Nowa wersja aplikacji</h3>
+        <span class="ver">TentaFlow</span>
+      </div>
+
+      <div class="body">
+        <div class="icon">
+          <svg viewBox="0 0 24 24">
+            <g class="arrow">
+              <line x1="12" y1="3" x2="12" y2="15"></line>
+              <polyline points="7 10 12 15 17 10"></polyline>
+            </g>
+            <path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"></path>
+          </svg>
+        </div>
+
+        <div class="heading" id="heading">Nowa wersja aplikacji</div>
+        <div class="desc" id="desc">
+          Serwer został zaktualizowany. Odśwież, aby załadować najnowszą wersję
+          interfejsu — nowe funkcje i poprawki są już gotowe do pobrania.
+        </div>
+
+        <div class="vercmp">
+          <div class="spin">
+            <svg viewBox="0 0 50 50"><circle class="track" cx="25" cy="25" r="20"/><circle class="fill" cx="25" cy="25" r="20"/></svg>
+            <div class="check" id="check">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+            </div>
+          </div>
+          <div class="info">
+            <div class="l1" id="cmpTitle">Aktualizacja gotowa do instalacji</div>
+            <div class="l2">
+              <span class="old">a1b2c3d4</span>
+              <span class="arrow2">→</span>
+              <span class="new">e5f6a7b8</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="progress" id="progress"><i id="progressBar"></i></div>
+      </div>
+
+      <div class="foot">
+        <button class="btn ghost" id="laterBtn">Później</button>
+        <button class="btn primary" id="reloadBtn">
+          <svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg>
+          Odśwież
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Przelacznik stanow (tylko mockup) -->
+  <div class="controls">
+    <span>Podgląd:</span>
+    <button id="stSoft" class="active">Nowa wersja</button>
+    <button id="stReq">Wymagana</button>
+    <button id="stReplay">↻ Animacja</button>
+  </div>
+
+<script>
+  const card = document.getElementById('card');
+  const title = document.getElementById('title');
+  const heading = document.getElementById('heading');
+  const desc = document.getElementById('desc');
+  const cmpTitle = document.getElementById('cmpTitle');
+  const laterBtn = document.getElementById('laterBtn');
+  const reloadBtn = document.getElementById('reloadBtn');
+  const progress = document.getElementById('progress');
+  const progressBar = document.getElementById('progressBar');
+  const check = document.getElementById('check');
+  const stSoft = document.getElementById('stSoft');
+  const stReq = document.getElementById('stReq');
+  const stReplay = document.getElementById('stReplay');
+
+  const COPY = {
+    soft: {
+      title: 'Nowa wersja aplikacji',
+      heading: 'Nowa wersja aplikacji',
+      desc: 'Serwer został zaktualizowany. Odśwież, aby załadować najnowszą wersję interfejsu — nowe funkcje i poprawki są już gotowe do pobrania.',
+      cmp: 'Aktualizacja gotowa do instalacji',
+      later: 'Później',
+    },
+    required: {
+      title: 'Wymagana aktualizacja',
+      heading: 'Wymagana aktualizacja',
+      desc: 'Interfejs jest niezgodny z serwerem po jego aktualizacji. Odśwież, aby kontynuować pracę — bez tego część funkcji może nie działać poprawnie.',
+      cmp: 'Zmiana protokołu komunikacji',
+      later: 'Zignoruj',
+    },
+  };
+
+  function setState(kind) {
+    const c = COPY[kind];
+    card.classList.toggle('required', kind === 'required');
+    title.textContent = c.title;
+    heading.textContent = c.heading;
+    desc.textContent = c.desc;
+    cmpTitle.textContent = c.cmp;
+    laterBtn.textContent = c.later;
+    stSoft.classList.toggle('active', kind === 'soft');
+    stReq.classList.toggle('active', kind === 'required');
+    replay();
+  }
+
+  function replay() {
+    // Restart animacji wejscia karty.
+    card.style.animation = 'none';
+    // eslint-disable-next-line no-unused-expressions
+    card.offsetHeight;
+    card.style.animation = '';
+    progress.style.display = 'none';
+    progressBar.style.width = '0%';
+    check.style.display = 'none';
+  }
+
+  reloadBtn.addEventListener('click', () => {
+    // Symulacja hard-reloadu: kasowanie cache + pobieranie swiezego frontu.
+    cmpTitle.textContent = 'Czyszczę cache i pobieram świeży front…';
+    progress.style.display = 'block';
+    requestAnimationFrame(() => { progressBar.style.width = '100%'; });
+    setTimeout(() => {
+      check.style.display = 'flex';
+      cmpTitle.textContent = 'Gotowe — przeładowanie…';
+    }, 950);
+  });
+
+  laterBtn.addEventListener('click', () => {
+    card.style.transition = 'opacity 0.25s ease, transform 0.25s ease';
+    card.style.opacity = '0';
+    card.style.transform = 'translateY(10px) scale(0.98)';
+    setTimeout(() => { card.style.opacity = ''; card.style.transform = ''; card.style.transition = ''; replay(); }, 900);
+  });
+
+  stSoft.addEventListener('click', () => setState('soft'));
+  stReq.addEventListener('click', () => setState('required'));
+  stReplay.addEventListener('click', replay);
+</script>
+</body>
+</html>

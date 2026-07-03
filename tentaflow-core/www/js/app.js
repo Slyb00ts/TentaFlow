@@ -19,7 +19,7 @@ import { I18n, SUPPORTED_LANGS } from '/js/i18n.js';
 import '/js/components/index.js';
 import '/js/lib/block-zoom.js';
 import * as ConnectionOverlay from '/js/modules/connection-overlay.js';
-import * as UpdateBanner from '/js/modules/update-banner.js';
+import * as UpdateOverlay from '/js/modules/update-overlay.js';
 import * as SystemEvents from '/js/modules/system-events.js';
 import { initTransport } from '/js/protocol/api-binary-shim.js';
 
@@ -199,7 +199,7 @@ async function bootstrap() {
   // Overlay init przed otwarciem WS — zeby wszystkie lifecycle events byly
   // przechwycone od pierwszej chwili.
   ConnectionOverlay.init();
-  UpdateBanner.init();
+  UpdateOverlay.init();
 
   // Otworz WS natychmiast (anonymous jesli brak JWT). Serwer akceptuje i
   // pozwala tylko na authLogin + schema + heartbeat przed zalogowaniem.

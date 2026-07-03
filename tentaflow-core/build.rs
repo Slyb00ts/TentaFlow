@@ -576,11 +576,12 @@ fn escape_path(path: &Path) -> String {
 /// dla kazdego pliku. Rejestruje rerun-if-changed na kazdym pliku zeby cargo
 /// automatycznie rekompilowalo po zmianie jakiegokolwiek zasobu www.
 fn generate_wwwroot_embed(out_dir: &Path) {
+    use sha2::{Digest, Sha256};
     let wwwroot = Path::new("www");
     if !wwwroot.exists() {
         // Brak www — generuj pusta funkcje lookup
         let code =
-            "fn wwwroot_lookup(_path: &str) -> Option<(&'static str, &'static [u8])> { None }\n";
+            "fn wwwroot_lookup(_path: &str) -> Option<(&'static str, &'static [u8], &'static str)> { None }\n";
         std::fs::write(out_dir.join("wwwroot_embed.rs"), code).unwrap();
         return;
     }
@@ -610,15 +611,23 @@ fn generate_wwwroot_embed(out_dir: &Path) {
 
     code.push_str("\n");
 
-    // Generuj funkcje lookup
-    code.push_str("fn wwwroot_lookup(path: &str) -> Option<(&'static str, &'static [u8])> {\n");
+    // Generuj funkcje lookup — trzeci element to ETag (per-plik SHA-256, 16 hex).
+    // Serwer uzywa go do warunkowych GET (If-None-Match -> 304), wiec caching w
+    // przegladarce dziala ZAWSZE, niezaleznie od service workera/certa.
+    code.push_str(
+        "fn wwwroot_lookup(path: &str) -> Option<(&'static str, &'static [u8], &'static str)> {\n",
+    );
     code.push_str("    match path {\n");
 
-    for (i, (rel_path, _)) in files.iter().enumerate() {
+    for (i, (rel_path, abs_path)) in files.iter().enumerate() {
         let mime = guess_mime(rel_path);
+        let bytes = std::fs::read(abs_path).unwrap_or_default();
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        let etag: String = h.finalize().iter().take(8).map(|b| format!("{:02x}", b)).collect();
         code.push_str(&format!(
-            "        \"{}\" => Some((\"{}\", WWWROOT_FILE_{})),\n",
-            rel_path, mime, i
+            "        \"{}\" => Some((\"{}\", WWWROOT_FILE_{}, \"{}\")),\n",
+            rel_path, mime, i, etag
         ));
     }
 
