@@ -11,7 +11,7 @@ use crate::config::ProtocolConfig;
 use crate::db::DbPool;
 use crate::error::{CoreError, Result};
 use crate::routing::router::Router;
-use crate::services::catalog::{CatalogEntryKind, CatalogSnapshot};
+use crate::services::catalog::{CatalogEntry, CatalogEntryKind, CatalogSnapshot};
 
 use futures::TryStreamExt;
 use http_body_util::{BodyExt, StreamBody};
@@ -145,14 +145,18 @@ pub fn authorize_model(
         None => return AuthDecision::ModelNotInCatalog,
     };
 
-    let rt = resource_type_for_kind(&entry.kind);
-    if !crate::auth::acl::check_v1_access(db, rt, &entry.id, principal) {
+    if !entry_access_allowed(db, entry, principal) {
         return AuthDecision::Denied;
     }
 
-    // For aliases the principal must also be allowed on the resolved target
-    // (and on any declared fallback) — otherwise an alias would let a caller
-    // reach a model/flow whose own ACL denies them.
+    // For aliases the principal must also be allowed on every target it could
+    // actually resolve to — otherwise an alias would let a caller reach a
+    // model/flow whose own ACL denies them. A target that is NOT advertised
+    // (its owning node is offline) is unreachable right now, so the resolver
+    // cannot pick it and there is nothing to authorize — we skip it instead of
+    // denying the whole alias. Denying here defeated the entire point of a
+    // fallback chain: the primary going offline (exactly when the fallback
+    // matters) would 404 the alias.
     if let CatalogEntryKind::Alias {
         target,
         fallback_targets,
@@ -160,20 +164,34 @@ pub fn authorize_model(
     } = &entry.kind
     {
         for resolved in std::iter::once(target).chain(fallback_targets.iter()) {
-            let target_entry = match snapshot.advertised_entries().find(|e| &e.id == resolved) {
-                Some(e) => e,
-                // A target missing from the catalog cannot be authorized — be
-                // conservative and deny rather than silently skip it.
-                None => return AuthDecision::Denied,
+            let Some(target_entry) = snapshot.advertised_entries().find(|e| &e.id == resolved)
+            else {
+                continue; // offline / unadvertised → not reachable, nothing to authorize
             };
-            let target_rt = resource_type_for_kind(&target_entry.kind);
-            if !crate::auth::acl::check_v1_access(db, target_rt, &target_entry.id, principal) {
+            if !entry_access_allowed(db, target_entry, principal) {
                 return AuthDecision::Denied;
             }
         }
     }
 
     AuthDecision::Allow
+}
+
+/// Whether `principal` may reach this catalog entry. For a published flow we
+/// accept a grant on EITHER its published model name (`entry.id`, what the
+/// catalog/`/v1` advertises) OR its underlying flow id — the dashboard's
+/// access-key wizard grants by flow id, so a grant made in the GUI must
+/// authorize the same flow when called by its published name.
+fn entry_access_allowed(db: &DbPool, entry: &CatalogEntry, principal: &Principal) -> bool {
+    match &entry.kind {
+        CatalogEntryKind::Flow { flow_id, .. } => {
+            crate::auth::acl::check_v1_access(db, "flow", &entry.id, principal)
+                || crate::auth::acl::check_v1_access(db, "flow", flow_id, principal)
+        }
+        other => {
+            crate::auth::acl::check_v1_access(db, resource_type_for_kind(other), &entry.id, principal)
+        }
+    }
 }
 
 /// Central /v1 gate. Called at the top of every handler that accepts a `model`

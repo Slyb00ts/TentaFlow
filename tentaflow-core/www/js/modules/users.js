@@ -82,7 +82,7 @@ function renderListScreen(root) {
   const isUsers = activeTab === 'users';
   const active = users.filter((u) => u.isActive).length;
   const inactive = users.length - active;
-  const admin = users.filter((u) => u.role === 'admin').length;
+  const admin = users.filter((u) => effectiveRole(u) === 'admin').length;
   const subtitle = isUsers
     ? `${I18n.t('users.count_users', { n: users.length })} · ${I18n.t('users.sub_active', { n: active })} · ${I18n.t('users.sub_inactive', { n: inactive })} · ${I18n.t('users.sub_admin', { n: admin })}`
     : I18n.t('users.count_groups', { n: groups.length });
@@ -151,7 +151,7 @@ function filteredUsers() {
   return users.filter((u) => {
     if (filter === 'active' && !u.isActive) return false;
     if (filter === 'inactive' && u.isActive) return false;
-    if (filter === 'admin' && u.role !== 'admin') return false;
+    if (filter === 'admin' && effectiveRole(u) !== 'admin') return false;
     if (filter === 'sso' && !u.ssoProvider) return false;
     if (!q) return true;
     const hay = `${u.username} ${u.displayName || ''} ${u.email || ''}`.toLowerCase();
@@ -202,9 +202,24 @@ function initials(u) {
     .split(/\s+/).map((p) => p[0]).filter(Boolean).slice(0, 2).join('').toUpperCase();
 }
 
-function formatRelative(epochSeconds) {
-  if (!epochSeconds) return '—';
-  const diff = Math.floor(Date.now() / 1000) - Number(epochSeconds);
+// Effective role for display: is_admin is authoritative (a seeded admin can
+// have role='user' in the row while is_admin=1 — same rule as auth_me).
+function effectiveRole(u) {
+  return u && u.isAdmin ? 'admin' : (u && u.role) || 'user';
+}
+
+function formatRelative(value) {
+  if (!value) return '—';
+  // Accept both epoch seconds and ISO/SQL date strings — the backend sends a
+  // timestamp string, so Number(value) would be NaN and render "NaN … temu".
+  let epochSeconds = Number(value);
+  if (!Number.isFinite(epochSeconds)) {
+    const parsed = Date.parse(String(value).replace(' ', 'T'));
+    if (!Number.isFinite(parsed)) return '—';
+    epochSeconds = Math.floor(parsed / 1000);
+  }
+  const diff = Math.floor(Date.now() / 1000) - epochSeconds;
+  if (!Number.isFinite(diff)) return '—';
   if (diff < 60) return I18n.t('users.time_now');
   if (diff < 3600) return I18n.t('users.time_min', { n: Math.floor(diff / 60) });
   if (diff < 86400) return I18n.t('users.time_hour', { n: Math.floor(diff / 3600) });
@@ -214,8 +229,9 @@ function formatRelative(epochSeconds) {
 }
 
 function renderUserRow(u) {
-  const roleLabel = { admin: I18n.t('users.role_admin'), power_user: I18n.t('users.role_power'), user: I18n.t('users.role_user') }[u.role] || 'User';
-  const roleClass = u.role === 'admin' ? 'role-admin' : u.role === 'power_user' ? 'role-power' : 'role-user';
+  const _role = effectiveRole(u);
+  const roleLabel = { admin: I18n.t('users.role_admin'), power_user: I18n.t('users.role_power'), user: I18n.t('users.role_user') }[_role] || 'User';
+  const roleClass = _role === 'admin' ? 'role-admin' : _role === 'power_user' ? 'role-power' : 'role-user';
   const statusPill = u.isActive
     ? `<span class="status-pill ok">${escapeHtml(I18n.t('users.status_active'))}</span>`
     : `<span class="status-pill off">${escapeHtml(I18n.t('users.status_inactive'))}</span>`;
@@ -893,8 +909,9 @@ async function loadGroupMembers(groupId, host) {
 }
 
 function renderMemberRow(u) {
-  const roleLabel = { admin: I18n.t('users.role_admin'), power_user: I18n.t('users.role_power'), user: I18n.t('users.role_user') }[u.role] || 'User';
-  const roleClass = u.role === 'admin' ? 'role-admin' : u.role === 'power_user' ? 'role-power' : 'role-user';
+  const _role = effectiveRole(u);
+  const roleLabel = { admin: I18n.t('users.role_admin'), power_user: I18n.t('users.role_power'), user: I18n.t('users.role_user') }[_role] || 'User';
+  const roleClass = _role === 'admin' ? 'role-admin' : _role === 'power_user' ? 'role-power' : 'role-user';
   const sourcePill = u.ssoProvider
     ? `<span class="status-pill sso">SSO · ${escapeHtml(u.ssoProvider)}</span>`
     : `<span class="status-pill local">Local</span>`;

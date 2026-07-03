@@ -102,7 +102,17 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             tools: None,
             tool_choice: None,
             n: None,
-            memory_options: None,
+            // The dashboard conversation id IS the flow session id — thread it
+            // so `conversation_history` / `memory` nodes in the selected flow
+            // have a session key (without it Agent-style flows hard-fail with
+            // "no session_id"). memory_options is the only carrier the flow
+            // builder reads (build_initial_envelope_inner).
+            memory_options: stream_req.session_id.clone().map(|sid| {
+                crate::api::openai::types::MemoryOptions {
+                    session_id: Some(sid),
+                    ..Default::default()
+                }
+            }),
             audio_input: None,
         };
 
@@ -1742,6 +1752,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             flow_id: None,
+            session_id: None,
         });
         let ctx = HandlerContext {
             session: SessionAuth::UserSession {

@@ -1095,6 +1095,7 @@ pub fn flow_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
             updated_at_epoch: parse_ts(&f.updated_at),
             enabled: f.status == "active",
             is_default: f.is_default,
+            published_model_name: f.published_model_name,
         })
         .collect();
     Ok(MessageBody::FlowListResponse { flows: summaries })

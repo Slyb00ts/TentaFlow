@@ -10,6 +10,22 @@ const screens = new Map();
 let currentId = null;
 let currentScreen = null;
 
+// Dismiss overlay elements that live outside #main (wizards/dialogs appended to
+// <body>). They otherwise survive a view switch and cover the next screen.
+function closeStrayOverlays() {
+  const main = document.getElementById('main');
+  const overlays = document.querySelectorAll('tf-window, tf-modal, .tf-modal-backdrop');
+  overlays.forEach((el) => {
+    if (main && main.contains(el)) return; // in-view overlays are the screen's own
+    try {
+      if (typeof el.close === 'function') el.close(true);
+      else el.remove();
+    } catch (_) {
+      el.remove();
+    }
+  });
+}
+
 export const Router = {
   register(id, screen) {
     screens.set(id, screen);
@@ -21,6 +37,11 @@ export const Router = {
       console.warn(`[router] unknown view: ${id}`);
       return;
     }
+
+    // Zamknij osierocone overlaye (tf-window/tf-modal wizardy dopinane do
+    // <body>, poza #main) — inaczej modal „przecieka" na kolejny widok i blokuje
+    // klikanie. Robimy to per-nawigacja, centralnie, zamiast w każdym module.
+    closeStrayOverlays();
 
     // Odpiecie poprzedniego — wspieramy oba style (`unmount` lub `cleanup`),
     // bo niektore widoki drill-down (np. mesh-detail) trzymaja interval'y i

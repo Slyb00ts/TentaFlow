@@ -52,6 +52,12 @@ let searchFilter = '';
 // audio. engineCache wypelniany raz przy mount() z ApiBinary modelListRequest.
 let faceHandle = null;
 let engineCache = { stt: [], tts: [] };
+// First chat-capable model id from the registry. Sent as `modelId` so a flow
+// whose llm node has NO pinned model (seeded "Default Chat" / "Agent Run")
+// resolves via envelope.meta['model']; flows WITH a pinned model ignore it
+// (the llm adapter prefers node config over meta). Empty when no chat model
+// exists — the flow then surfaces the honest "no model" error.
+let defaultChatModel = '';
 // Lista flow usera — tryb audio odpala wybrany flow po ID (z jego blokami).
 let flowCache = [];
 let escKeyHandler = null;
@@ -859,7 +865,10 @@ function sendMessageInternal(text, opts = {}) {
   // Głosowe wypowiedzi idą osobno przez sendVoiceUtterance (FlowInvoke).
   ApiBinary.subscribe(
     'chatStreamRequest',
-    { modelId: '', userMessage: text, flowId },
+    // conv.id is the flow session id — lets conversation_history / memory nodes
+    // in the selected flow key off the conversation (Agent flows require it).
+    // defaultChatModel only fills flows whose llm node has no pinned model.
+    { modelId: defaultChatModel, userMessage: text, flowId, sessionId: conv.id },
     {
       onChunk: (body) => {
         if (body.variant === 'ChatStreamChunk') {
@@ -1423,9 +1432,12 @@ const ChatScreen = {
 
       engineCache.stt = list.filter((m) => catOf(m) === 'stt');
       engineCache.tts = list.filter((m) => catOf(m) === 'tts');
+      const chatModel = list.find((m) => catOf(m) === 'chat' || catOf(m) === 'llm');
+      defaultChatModel = chatModel ? String(chatModel.id || chatModel.name || '') : '';
     } catch {
       engineCache.stt = [];
       engineCache.tts = [];
+      defaultChatModel = '';
     }
 
     // Lista flow do pickera trybu audio (user wybiera swój flow z blokami).

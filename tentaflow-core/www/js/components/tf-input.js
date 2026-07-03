@@ -256,7 +256,12 @@ class TfInput extends HTMLElement {
     this._errorEl.style.display = error ? '' : 'none';
   }
 
-  _onInput() {
+  _onInput(e) {
+    // Stop the inner <input>'s native "input" from bubbling past the host —
+    // otherwise consumers listening on the host see two "input" events (the
+    // native one has no detail, so handlers doing `e.detail.value` throw or
+    // `e.detail?.value ?? ''` clobbers state).
+    e?.stopPropagation();
     this.setAttribute('value', this._input.value);
     this.dispatchEvent(new CustomEvent('input', {
       bubbles: true,
@@ -264,7 +269,8 @@ class TfInput extends HTMLElement {
     }));
   }
 
-  _onChange() {
+  _onChange(e) {
+    e?.stopPropagation();
     this.dispatchEvent(new CustomEvent('change', {
       bubbles: true,
       detail: { value: this._input.value },
