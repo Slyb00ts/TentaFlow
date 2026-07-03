@@ -642,6 +642,92 @@ fn check_signed_url_rate_limit(
     }
 }
 
+/// Bearer token for the `/models/*` endpoints, extracted before the request
+/// is dropped (the streaming body handler must not hold `req`).
+fn models_bearer_token(headers: &hyper::HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Resolved `/models/*` credential: parsed signed query OR an active API-key
+/// uid (owned — the caller borrows it into `BundleAuth`).
+enum ModelsAuth {
+    Signed(crate::api::frames::FrameQuery),
+    ApiKey(String),
+}
+
+/// Shared auth resolution for both `/models/*` endpoints. A Bearer header
+/// wins over query params; without one the signed query is parsed as before.
+/// Bearer failures are audited here (they never reach a handler) and mapped
+/// to /v1-style JSON errors; a valid key is additionally run through the same
+/// per-key token bucket as `/v1`.
+fn resolve_models_auth(
+    db: &DbPool,
+    settings_cipher: &crate::crypto::SettingsCipher,
+    bearer_token: Option<String>,
+    query_string: &str,
+    audit_ref: &str,
+    ctx: crate::api::model_bundle::RequestContext<'_>,
+) -> std::result::Result<ModelsAuth, Response<DashboardBody>> {
+    use crate::api::model_bundle::{audit_api_key_rejected, resolve_bearer_api_key, BearerAuthResult};
+    let json_error = |status: StatusCode, body: &'static str| {
+        Response::builder()
+            .status(status)
+            .header("Content-Type", "application/json")
+            .body(Either::Left(Full::new(Bytes::from_static(body.as_bytes()))))
+            .unwrap()
+    };
+    let Some(token) = bearer_token else {
+        return match crate::api::frames::parse_query(query_string) {
+            Ok(q) => Ok(ModelsAuth::Signed(q)),
+            Err(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                Err(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap())
+            }
+        };
+    };
+    match resolve_bearer_api_key(db, settings_cipher, &token) {
+        BearerAuthResult::Ok(key) => {
+            if let Some(retry) =
+                crate::api::rate_limit::per_key_rate_limiter().check(&key.uid, key.rate_limit_rps)
+            {
+                let retry_secs = retry.ceil().max(1.0) as u64;
+                return Err(Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("Content-Type", "application/json")
+                    .header("Retry-After", retry_secs.to_string())
+                    .body(Either::Left(Full::new(Bytes::from_static(
+                        b"{\"error\":\"rate_limit_exceeded\"}",
+                    ))))
+                    .unwrap());
+            }
+            Ok(ModelsAuth::ApiKey(key.uid))
+        }
+        BearerAuthResult::Invalid => {
+            audit_api_key_rejected(db, audit_ref, ctx, "invalid_api_key");
+            Err(json_error(
+                StatusCode::UNAUTHORIZED,
+                "{\"error\":\"invalid_api_key\"}",
+            ))
+        }
+        BearerAuthResult::Unavailable => {
+            audit_api_key_rejected(db, audit_ref, ctx, "api_key_verification_unavailable");
+            Err(json_error(
+                StatusCode::UNAUTHORIZED,
+                "{\"error\":\"api_key_verification_unavailable\"}",
+            ))
+        }
+    }
+}
+
 /// Wyciaga Bearer token z naglowka Authorization
 fn extract_bearer_token(req: &Request<Incoming>) -> Option<&str> {
     req.headers()
@@ -1463,15 +1549,16 @@ pub async fn handle_request(
         }
     }
 
-    // GET /models/manifest/<bundle_ref>?token=&exp=&ref= — HMAC-signed vision
-    // model-bundle manifest for instance-to-instance distribution. Same
-    // HMAC-only auth shape as /recordings; per-file download URLs inside the
-    // manifest are minted with the presented token's remaining lifetime.
+    // GET /models/manifest/<bundle_ref> — vision model-bundle manifest for
+    // instance-to-instance distribution. Auth: signed query (?token=&exp=&ref=,
+    // same shape as /recordings) OR `Authorization: Bearer <api-key>` with an
+    // explicit ('model_bundle', <bundle_ref>) allow scope. Per-file URLs inside
+    // the manifest mirror the auth mode (signed vs token-less + Bearer).
     if method == Method::GET
         && path.starts_with("/models/manifest/")
         && path.len() > "/models/manifest/".len()
     {
-        use crate::api::model_bundle::{handle_manifest, ManifestOutcome, RequestContext};
+        use crate::api::model_bundle::{handle_manifest, BundleAuth, ManifestOutcome, RequestContext};
         if let Err(resp) = reject_unauth_get_body(req.headers()) {
             return Ok(resp);
         }
@@ -1480,25 +1567,34 @@ pub async fn handle_request(
         {
             return Ok(resp);
         }
+        let bearer_token = models_bearer_token(req.headers());
         drop(req);
         let bundle_ref = path.strip_prefix("/models/manifest/").unwrap_or("");
-        let q = match crate::api::frames::parse_query(&query_string) {
-            Ok(q) => q,
-            Err(why) => {
-                let body = format!("{{\"error\":\"{}\"}}", why);
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .header("Content-Type", "application/json")
-                    .body(Either::Left(Full::new(Bytes::from(body))))
-                    .unwrap());
-            }
-        };
-        let issuer = crate::services::model_bundle_url_issuer();
         let ctx = RequestContext {
             source_ip: Some(client_ip.as_str()),
             user_agent: user_agent.as_deref(),
         };
-        let outcome = handle_manifest(bundle_ref, &q, issuer, &db, ctx).await;
+        let (query_storage, key_storage);
+        let auth = match resolve_models_auth(
+            &db,
+            &settings_cipher,
+            bearer_token,
+            &query_string,
+            bundle_ref,
+            ctx,
+        ) {
+            Ok(ModelsAuth::Signed(q)) => {
+                query_storage = q;
+                BundleAuth::Signed(&query_storage)
+            }
+            Ok(ModelsAuth::ApiKey(uid)) => {
+                key_storage = uid;
+                BundleAuth::ApiKey { key_uid: &key_storage }
+            }
+            Err(resp) => return Ok(resp),
+        };
+        let issuer = crate::services::model_bundle_url_issuer();
+        let outcome = handle_manifest(bundle_ref, &auth, issuer, &db, ctx).await;
         let status = outcome.http_status();
         return match outcome {
             ManifestOutcome::Ok { body } => Ok(apply_signed_url_security_headers(
@@ -1517,6 +1613,7 @@ pub async fn handle_request(
                     .unwrap())
             }
             ManifestOutcome::Denied(_)
+            | ManifestOutcome::Forbidden(_)
             | ManifestOutcome::NotFound
             | ManifestOutcome::InternalError(_) => Ok(Response::builder()
                 .status(status)
@@ -1528,12 +1625,15 @@ pub async fn handle_request(
         };
     }
 
-    // GET /models/file/<bundle_ref>/<name>?token=&exp=&ref= — per-file signed
-    // download derived from a manifest token. Bodies stream in chunks (weights
-    // reach ~126 MB) through the same StreamBody slot SSE uses.
+    // GET /models/file/<bundle_ref>/<name> — per-file download. Signed query
+    // derived from a manifest token OR the same Bearer API key that fetched
+    // the manifest. Bodies stream in chunks (weights reach ~126 MB) through
+    // the same StreamBody slot SSE uses.
     if method == Method::GET && path.starts_with("/models/file/") && path.len() > "/models/file/".len()
     {
-        use crate::api::model_bundle::{file_stream, handle_file, FileOutcome, RequestContext};
+        use crate::api::model_bundle::{
+            file_stream, handle_file, BundleAuth, FileOutcome, RequestContext,
+        };
         if let Err(resp) = reject_unauth_get_body(req.headers()) {
             return Ok(resp);
         }
@@ -1542,6 +1642,7 @@ pub async fn handle_request(
         {
             return Ok(resp);
         }
+        let bearer_token = models_bearer_token(req.headers());
         drop(req);
         let rest = path.strip_prefix("/models/file/").unwrap_or("");
         let Some((bundle_ref, name)) = rest.split_once('/').filter(|(b, n)| !b.is_empty() && !n.is_empty())
@@ -1554,23 +1655,32 @@ pub async fn handle_request(
                 ))))
                 .unwrap());
         };
-        let q = match crate::api::frames::parse_query(&query_string) {
-            Ok(q) => q,
-            Err(why) => {
-                let body = format!("{{\"error\":\"{}\"}}", why);
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .header("Content-Type", "application/json")
-                    .body(Either::Left(Full::new(Bytes::from(body))))
-                    .unwrap());
-            }
-        };
-        let issuer = crate::services::model_bundle_url_issuer();
         let ctx = RequestContext {
             source_ip: Some(client_ip.as_str()),
             user_agent: user_agent.as_deref(),
         };
-        let outcome = handle_file(bundle_ref, name, &q, issuer, &db, ctx).await;
+        let audit_ref = format!("{}/{}", bundle_ref, name);
+        let (query_storage, key_storage);
+        let auth = match resolve_models_auth(
+            &db,
+            &settings_cipher,
+            bearer_token,
+            &query_string,
+            &audit_ref,
+            ctx,
+        ) {
+            Ok(ModelsAuth::Signed(q)) => {
+                query_storage = q;
+                BundleAuth::Signed(&query_storage)
+            }
+            Ok(ModelsAuth::ApiKey(uid)) => {
+                key_storage = uid;
+                BundleAuth::ApiKey { key_uid: &key_storage }
+            }
+            Err(resp) => return Ok(resp),
+        };
+        let issuer = crate::services::model_bundle_url_issuer();
+        let outcome = handle_file(bundle_ref, name, &auth, issuer, &db, ctx).await;
         let status = outcome.http_status();
         return match outcome {
             FileOutcome::Ok { file, size } => {
@@ -1595,6 +1705,7 @@ pub async fn handle_request(
                     .unwrap())
             }
             FileOutcome::Denied(_)
+            | FileOutcome::Forbidden(_)
             | FileOutcome::NotFound
             | FileOutcome::PathTraversal
             | FileOutcome::IoError => Ok(Response::builder()

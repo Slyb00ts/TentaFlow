@@ -14,6 +14,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import * as Manifest from '/js/modules/catalog/manifest-store.js';
 import { deployIcon, render as renderIcon } from '/js/modules/catalog/catalog-icons.js';
+import { isCameraCvEngineId } from '/js/modules/catalog/camera-cv-bundles.js';
 
 let currentStep = 1;
 let engineEntry = null;
@@ -29,6 +30,11 @@ let hfGgufFiles = [];
 let hfGgufFilesRepo = '';
 let hfGgufFilesLoading = false;
 let hfGgufFilesError = '';
+
+// Custom-bundle (unpaired instance) manifest preview state.
+let customBundlePreview = null;
+let customBundlePreviewLoading = false;
+let customBundlePreviewError = '';
 
 let selection = {
   nodeId: null,
@@ -95,6 +101,9 @@ export async function openDeployWizard(engineId, opts = {}) {
   hfGgufFilesRepo = '';
   hfGgufFilesLoading = false;
   hfGgufFilesError = '';
+  customBundlePreview = null;
+  customBundlePreviewLoading = false;
+  customBundlePreviewError = '';
   selection = {
     nodeId: opts.nodeId || null,
     deployMethod: null,
@@ -120,6 +129,11 @@ export async function openDeployWizard(engineId, opts = {}) {
     apiKey: '',
     baseUrl: '',
     apiVersion: '',
+    // Custom bundle source (camera-CV engines): manifest URL of another
+    // TentaFlow instance's /models/manifest/<bundle> endpoint + the API key
+    // (model_bundle scope) authenticating the pull between UNPAIRED instances.
+    visionBundleUrl: '',
+    visionBundleApiKey: '',
     // 'api' = pay-per-token API key; 'subscription' = OAuth/ChatGPT-or-Google
     // subscription token (OpenAI Codex / Gemini Code Assist). Only OpenAI+Gemini.
     externalAuthMode: 'api',
@@ -253,7 +267,7 @@ export async function openDeployWizard(engineId, opts = {}) {
       applySpeculatorPreset(rec);
     }
   } else {
-    modelSourceMode = 'hf';
+    modelSourceMode = isCameraCvEngine() ? 'custom' : 'hf';
   }
 
   // Armed only after the (loading/error) renderShell cycles are done, so the
@@ -605,23 +619,167 @@ function renderStepMethod() {
 function renderStepModel() {
   const presets = Manifest.modelPresets(engineEntry);
   const hasPresets = presets.length > 0;
+  // Camera-CV bundle engines pull fixed weights, not HF repos — their second
+  // source is "Custom": another TentaFlow instance's /models manifest + API key.
+  const cameraCv = isCameraCvEngine();
 
   let tabs = `<tf-tabs variant="underline" id="edw-model-tabs" value="${escapeAttr(modelSourceMode)}">`;
   if (hasPresets) {
     tabs += `<tf-tab id="preset">${escapeHtml(I18n.t('wizard.fromPreset'))}</tf-tab>`;
   }
-  tabs += `<tf-tab id="hf">${escapeHtml(I18n.t('wizard.searchHuggingface'))}</tf-tab>`;
+  if (cameraCv) {
+    tabs += `<tf-tab id="custom">${escapeHtml(I18n.t('wizard.customBundle'))}</tf-tab>`;
+  } else {
+    tabs += `<tf-tab id="hf">${escapeHtml(I18n.t('wizard.searchHuggingface'))}</tf-tab>`;
+  }
   tabs += '</tf-tabs>';
 
-  const content = modelSourceMode === 'preset' && hasPresets
-    ? renderPresetSelector(presets)
-    : renderHfSearch();
+  let content;
+  if (modelSourceMode === 'preset' && hasPresets) {
+    content = renderPresetSelector(presets);
+  } else if (cameraCv) {
+    content = renderCustomBundleSource();
+  } else {
+    content = renderHfSearch();
+  }
 
   return `
     <h4 class="wizard-step-title">${escapeHtml(I18n.t('wizard.selectModel'))}</h4>
     ${tabs}
     <div class="wizard-tab-content">${content}</div>
   `;
+}
+
+/// "Custom" bundle source for camera-CV engines: manifest URL of the serving
+/// TentaFlow instance + API key. A signed manifest URL (with ?token=) needs no
+/// key; a plain manifest URL is authenticated with the Bearer key created on
+/// the serving instance ("Dostęp i klucze API" → model_bundle scope).
+function renderCustomBundleSource() {
+  return `
+    <div class="form-group">
+      <tf-input type="text" id="edw-bundle-url"
+        label="${escapeAttr(I18n.t('wizard.customBundleUrl'))}"
+        placeholder="https://other-instance:8090/models/manifest/vision-all"
+        value="${escapeAttr(selection.visionBundleUrl)}" autocomplete="off"
+        hint="${escapeAttr(I18n.t('wizard.customBundleUrlHint'))}"></tf-input>
+    </div>
+    <div class="form-group">
+      <tf-input type="password" id="edw-bundle-api-key"
+        label="${escapeAttr(I18n.t('wizard.customBundleApiKey'))}"
+        placeholder="sk-..."
+        value="${escapeAttr(selection.visionBundleApiKey)}" autocomplete="off"
+        hint="${escapeAttr(I18n.t('wizard.customBundleApiKeyHint'))}"></tf-input>
+    </div>
+    <div class="form-group">
+      <tf-button id="edw-bundle-preview" variant="ghost" icon="search">${escapeHtml(I18n.t('wizard.customBundlePreview') || 'Sprawdź manifest')}</tf-button>
+    </div>
+    <div id="edw-bundle-preview-result"></div>
+  `;
+}
+
+/// Render the fetched-manifest preview: file list + (for a single-model
+/// registry bundle) the importable model and an "Importuj do rejestru" action.
+function renderBundlePreview(container) {
+  if (!customBundlePreview) { container.innerHTML = ''; return; }
+  if (customBundlePreviewLoading) {
+    container.innerHTML = `<p class="form-hint">${escapeHtml(I18n.t('common.loading'))}</p>`;
+    return;
+  }
+  if (customBundlePreviewError) {
+    container.innerHTML = `<p class="form-hint error">${escapeHtml(customBundlePreviewError)}</p>`;
+    return;
+  }
+  const m = customBundlePreview.model;
+  const files = Array.isArray(customBundlePreview.files) ? customBundlePreview.files : [];
+  const filesHtml = files.map((f) => `
+    <div class="model-item">
+      <div class="model-item-main">
+        <div class="model-item-name mono">${escapeHtml(f.name)}</div>
+        <div class="model-item-info">${escapeHtml(String(f.sha256 || '').slice(0, 12))} · ${escapeHtml(formatBytes(Number(f.size) || 0))}</div>
+      </div>
+    </div>`).join('');
+  let importHtml = '';
+  if (m && m.modelName) {
+    const classes = Array.isArray(m.classes) ? m.classes.length : 0;
+    importHtml = `
+      <div class="model-item selected">
+        <div class="model-item-main">
+          <div class="model-item-name">${escapeHtml(m.modelName)}</div>
+          <div class="model-item-info">${escapeHtml(m.op || '')} · ${classes} ${escapeHtml(I18n.t('wizard.customBundleClasses') || 'klas')}</div>
+        </div>
+      </div>
+      <div class="form-group" style="margin-top:12px;">
+        <tf-input type="text" id="edw-bundle-alias"
+          label="${escapeAttr(I18n.t('wizard.customBundleAlias') || 'Alias (opcjonalnie)')}"
+          value="${escapeAttr(selection.visionImportAlias || '')}" autocomplete="off"></tf-input>
+      </div>
+      <div class="form-group">
+        <tf-button id="edw-bundle-import" variant="primary" icon="download">${escapeHtml(I18n.t('wizard.customBundleImport') || 'Importuj do rejestru')}</tf-button>
+      </div>`;
+  } else {
+    importHtml = `<p class="form-hint">${escapeHtml(I18n.t('wizard.customBundleFixedHint') || 'To bundle silnika (nie pojedynczy model rejestru) — zostanie pobrany przy wdrożeniu tego silnika.')}</p>`;
+  }
+  container.innerHTML = `
+    <div class="wizard-tab-content">
+      <div class="model-list">${filesHtml}</div>
+      ${importHtml}
+    </div>`;
+  const importBtn = container.querySelector('#edw-bundle-import');
+  if (importBtn) importBtn.addEventListener('click', importCustomModel);
+  const aliasInput = container.querySelector('#edw-bundle-alias');
+  if (aliasInput) {
+    aliasInput.addEventListener('input', (e) => {
+      selection.visionImportAlias = String(e.detail?.value ?? aliasInput.value).trim();
+    });
+  }
+}
+
+/// Fetch the remote manifest through Core (server-side, Bearer key). Populates
+/// the preview state and re-renders only the result container.
+async function previewCustomManifest() {
+  const url = String(selection.visionBundleUrl || '').trim();
+  const key = String(selection.visionBundleApiKey || '').trim();
+  if (!url) { toast(I18n.t('wizard.customBundleUrlInvalid') || 'Podaj URL manifestu', 'error'); return; }
+  customBundlePreview = null;
+  customBundlePreviewError = '';
+  customBundlePreviewLoading = true;
+  const box = document.getElementById('edw-bundle-preview-result');
+  if (box) renderBundlePreview(box);
+  try {
+    const resp = await ApiBinary.action('visionImportFetchManifestRequest', {
+      manifestUrl: url,
+      apiKey: key,
+    });
+    if (resp && resp.error) throw new Error(resp.error);
+    customBundlePreview = resp || { files: [], model: null };
+  } catch (e) {
+    customBundlePreviewError = e.message || String(e);
+  } finally {
+    customBundlePreviewLoading = false;
+    const b = document.getElementById('edw-bundle-preview-result');
+    if (b) renderBundlePreview(b);
+  }
+}
+
+/// Import the previewed single-model registry bundle into the local registry.
+async function importCustomModel() {
+  const m = customBundlePreview && customBundlePreview.model;
+  if (!m || !m.modelName) return;
+  const btn = document.getElementById('edw-bundle-import');
+  if (btn) btn.setAttribute('disabled', '');
+  try {
+    const resp = await ApiBinary.action('visionImportModelRequest', {
+      manifestUrl: String(selection.visionBundleUrl || '').trim(),
+      apiKey: String(selection.visionBundleApiKey || '').trim(),
+      modelName: m.modelName,
+      alias: selection.visionImportAlias || null,
+    }, { timeoutMs: 10 * 60 * 1000 });
+    if (!resp || !resp.ok) throw new Error((resp && resp.error) || 'import odrzucony');
+    toast(`${I18n.t('wizard.customBundleImported') || 'Model zaimportowany'}: ${resp.importedModelName || m.modelName}`, 'success');
+  } catch (e) {
+    if (btn) btn.removeAttribute('disabled');
+    toast(`${I18n.t('wizard.customBundleImportFailed') || 'Import nieudany'}: ${e.message || e}`, 'error');
+  }
 }
 
 function renderPresetSelector(presets) {
@@ -746,6 +904,10 @@ function isLlamaCppEngine() {
 
 function isMlxEngine() {
   return engineId() === 'mlx';
+}
+
+function isCameraCvEngine() {
+  return isCameraCvEngineId(engineId());
 }
 
 // vLLM-rodzina = silniki ktore akceptuja safetensors override kwantyzacji wag
@@ -2565,6 +2727,23 @@ function bindStepModelInputs() {
     });
   });
 
+  const bundleUrl = document.getElementById('edw-bundle-url');
+  if (bundleUrl) {
+    bundleUrl.addEventListener('input', (e) => {
+      selection.visionBundleUrl = String(e.detail?.value ?? bundleUrl.value).trim();
+    });
+  }
+  const bundleKey = document.getElementById('edw-bundle-api-key');
+  if (bundleKey) {
+    bundleKey.addEventListener('input', (e) => {
+      selection.visionBundleApiKey = String(e.detail?.value ?? bundleKey.value).trim();
+    });
+  }
+  const bundlePreview = document.getElementById('edw-bundle-preview');
+  if (bundlePreview) bundlePreview.addEventListener('click', previewCustomManifest);
+  const previewBox = document.getElementById('edw-bundle-preview-result');
+  if (previewBox) renderBundlePreview(previewBox);
+
   const search = document.getElementById('edw-hf-search');
   if (search) {
     search.addEventListener('input', (e) => {
@@ -2782,6 +2961,13 @@ function canAdvance() {
       }
       return true;
     case 'model':
+      if (isCameraCvEngine() && modelSourceMode === 'custom') {
+        if (!selection.visionBundleUrl.includes('/models/manifest/')) {
+          toast(I18n.t('wizard.customBundleUrlInvalid'), 'error');
+          return false;
+        }
+        return true;
+      }
       if (!selection.modelPresetId && !selection.modelRepo) {
         toast(I18n.t('wizard.selectModel'), 'error');
         return false;
@@ -3052,6 +3238,13 @@ async function startDeploy() {
     // (never persisted in clear). `base_url`/`api_version` override the
     // manifest endpoint for generic openai-compatible / Azure engines.
     api_key: (creds.requiresApiKey && !creds.subscription) ? selection.apiKey.trim() : undefined,
+    // Custom camera-CV bundle source (model step "Custom" tab): manifest URL
+    // of another TentaFlow instance + Bearer key. The key is encrypted
+    // server-side like `api_key` before it lands in config_json.
+    vision_bundle_url: (isCameraCvEngine() && modelSourceMode === 'custom' && selection.visionBundleUrl)
+      ? selection.visionBundleUrl : undefined,
+    vision_bundle_api_key: (isCameraCvEngine() && modelSourceMode === 'custom' && selection.visionBundleApiKey)
+      ? selection.visionBundleApiKey : undefined,
     // Subscription: the node swaps this flow id for the captured OAuth tokens.
     oauth_flow_id: (creds.requiresApiKey && creds.subscription) ? selection.oauthFlowId : undefined,
     base_url: (creds.showBaseUrl && selection.baseUrl) ? selection.baseUrl : undefined,

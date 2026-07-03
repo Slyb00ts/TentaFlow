@@ -405,13 +405,22 @@ pub fn api_key_list_request(
 /// one of the supported ACL kinds and `resource_id` must be non-empty, so neither
 /// creation seeding nor scope set/clear can persist a garbage or empty-id rule.
 fn validate_scope_resource(resource_type: &str, resource_id: &str) -> Result<(), ProtocolError> {
-    if !matches!(resource_type, "model" | "flow" | "alias") {
+    if !matches!(resource_type, "model" | "flow" | "alias" | "model_bundle") {
         return Err(ProtocolError::bad_request(
-            "resource_type must be 'model', 'flow' or 'alias'",
+            "resource_type must be 'model', 'flow', 'alias' or 'model_bundle'",
         ));
     }
     if resource_id.is_empty() {
         return Err(ProtocolError::bad_request("resource_id is empty"));
+    }
+    // model_bundle scopes gate the /models/* endpoints — only refs the bundle
+    // endpoints can actually serve are storable.
+    if resource_type == "model_bundle"
+        && !crate::api::model_bundle::validate_bundle_ref(resource_id)
+    {
+        return Err(ProtocolError::bad_request(
+            "resource_id is not a shareable model bundle",
+        ));
     }
     Ok(())
 }

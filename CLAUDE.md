@@ -64,6 +64,13 @@ WebTransport `/wt/api` + WebSocket `/ws/api` fallback, binary `MessageBody` (CBO
 - `POST /core/frame/pickup` — Service-to-Core (yolo/whisper inference). HMAC `X-Pickup-Token`
   (one-shot, 30 s TTL). Production REQUIRES mTLS client-cert pinning.
 - `GET /recordings/<ref>` / `GET /frames/<ref>` — signed-URL downloads (HMAC, TTL-bounded).
+- `GET /models/manifest/<bundle>` / `GET /models/file/<bundle>/<name>` — vision model-bundle
+  sharing between instances. Auth: signed URL OR `Authorization: Bearer <api-key>` with an
+  explicit `('model_bundle', <bundle_ref>)` allow scope (default-DENY, general keys only) —
+  works between UNPAIRED instances. API-key manifests return token-less file urls; the client
+  repeats the Bearer header. Pull side: deploy wizard "Custom" tab → config `vision_bundle_url`
+  + `vision_bundle_api_key` (encrypted like `api_key`), fallback settings
+  `vision_bundle_base_url` + `vision_bundle_api_key`.
 
 Security (both tiers): HMAC SHA-256 (constant-time via `subtle`), audit log per outcome,
 per-IP + global rate limit (429 + `Retry-After`), path-traversal containment, security

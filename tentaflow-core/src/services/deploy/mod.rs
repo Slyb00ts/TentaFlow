@@ -264,6 +264,17 @@ pub(crate) fn strip_hf_token(user_config: &serde_json::Value) -> serde_json::Val
 /// Config key holding a cloud external provider's API key (OpenAI, Anthropic, …).
 pub const API_KEY_CONFIG_KEY: &str = "api_key";
 
+/// Config key: manifest URL of another TentaFlow instance's `/models/manifest/…`
+/// endpoint (deploy wizard "Custom" bundle source). Per-deploy override that
+/// wins over the `vision_bundle_base_url` setting.
+pub const VISION_BUNDLE_URL_CONFIG_KEY: &str = "vision_bundle_url";
+
+/// Config key: API key authenticating the custom bundle manifest pull against
+/// an UNPAIRED instance. Encrypted at rest like `api_key` (see
+/// `encrypt_api_key_in_config`); the settings-level fallback is the secure
+/// setting of the same name.
+pub const VISION_BUNDLE_API_KEY_CONFIG_KEY: &str = "vision_bundle_api_key";
+
 /// Returns a copy of `user_config` with a plaintext `api_key` encrypted in place
 /// (`enc:…`). Unlike `hf_token` (which is stripped and resolved per-node from a
 /// secure setting), an external provider's key has no global setting to fall
@@ -277,19 +288,58 @@ pub fn encrypt_api_key_in_config(
 ) -> serde_json::Value {
     let mut out = user_config.clone();
     if let Some(map) = out.as_object_mut() {
-        if let Some(serde_json::Value::String(key)) = map.get(API_KEY_CONFIG_KEY) {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() && !trimmed.starts_with("enc:") {
-                if let Ok(encrypted) = settings_cipher.encrypt(trimmed) {
-                    map.insert(
-                        API_KEY_CONFIG_KEY.to_string(),
-                        serde_json::Value::String(encrypted),
-                    );
+        for config_key in [API_KEY_CONFIG_KEY, VISION_BUNDLE_API_KEY_CONFIG_KEY] {
+            if let Some(serde_json::Value::String(key)) = map.get(config_key) {
+                let trimmed = key.trim();
+                if !trimmed.is_empty() && !trimmed.starts_with("enc:") {
+                    if let Ok(encrypted) = settings_cipher.encrypt(trimmed) {
+                        map.insert(
+                            config_key.to_string(),
+                            serde_json::Value::String(encrypted),
+                        );
+                    }
                 }
             }
         }
     }
     out
+}
+
+/// Resolves the vision-bundle pull API key for an embedded camera-CV deploy:
+/// the per-deploy config value (decrypting the persisted `enc:` form with this
+/// node's cipher) wins over the org-wide secure setting
+/// `vision_bundle_api_key`. Returns `None` when neither is set — the pull then
+/// relies on a signed manifest URL or a public release dir.
+pub(crate) fn resolve_vision_bundle_api_key(
+    db: &DbPool,
+    settings_cipher: &crate::crypto::SettingsCipher,
+    user_config: &serde_json::Value,
+) -> Option<String> {
+    let from_config = user_config
+        .get(VISION_BUNDLE_API_KEY_CONFIG_KEY)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|raw| {
+            if raw.starts_with("enc:") {
+                settings_cipher.decrypt(raw).ok()
+            } else {
+                Some(raw.to_string())
+            }
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    from_config.or_else(|| {
+        crate::db::repository::get_setting_secure(
+            db,
+            VISION_BUNDLE_API_KEY_CONFIG_KEY,
+            settings_cipher,
+        )
+        .ok()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    })
 }
 
 pub fn create_deploy_job(
@@ -459,6 +509,7 @@ pub async fn deploy(
         DeployMethod::NativeEmbedded => Box::new(embedded::EmbeddedDeploy::new(
             manifest.clone(),
             user_config.clone(),
+            resolve_vision_bundle_api_key(db, settings_cipher, user_config),
             sink.clone(),
         )),
         DeployMethod::NativeBinary => Box::new(binary::BinaryDeploy::new(
@@ -631,7 +682,14 @@ pub async fn respawn(
 
     let mut strategy: Box<dyn DeployStrategy> = match deploy_method {
         DeployMethod::NativeEmbedded => {
-            Box::new(embedded::EmbeddedDeploy::new(manifest, user_config, None))
+            let vision_bundle_api_key =
+                resolve_vision_bundle_api_key(db, settings_cipher, &user_config);
+            Box::new(embedded::EmbeddedDeploy::new(
+                manifest,
+                user_config,
+                vision_bundle_api_key,
+                None,
+            ))
         }
         DeployMethod::NativeBinary => Box::new(binary::BinaryDeploy::new_with_port(
             manifest,

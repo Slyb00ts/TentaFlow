@@ -2746,6 +2746,42 @@ pub fn encode_ml_studio_vision_models_list_request() -> Result<Vec<u8>, JsError>
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeVisionImportFetchManifestRequest)]
+pub fn encode_vision_import_fetch_manifest_request(
+    manifest_url: String,
+    api_key: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::VisionImportBody(
+        tentaflow_protocol::VisionImportPayload::FetchManifestRequest(
+            tentaflow_protocol::VisionImportFetchManifestRequest {
+                manifest_url,
+                api_key,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeVisionImportModelRequest)]
+pub fn encode_vision_import_model_request(
+    manifest_url: String,
+    api_key: String,
+    model_name: String,
+    alias: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::VisionImportBody(
+        tentaflow_protocol::VisionImportPayload::ImportRequest(
+            tentaflow_protocol::VisionImportModelRequest {
+                manifest_url,
+                api_key,
+                model_name,
+                alias,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioVisionModelDeleteRequest)]
 pub fn encode_ml_studio_vision_model_delete_request(
     model_name: String,
@@ -6382,6 +6418,86 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         },
         MessageBody::ModelMetricsBody(payload) => decode_model_metrics_payload(&obj, payload),
         MessageBody::BenchmarkBody(payload) => decode_benchmark_payload(&obj, payload),
+        MessageBody::VisionImportBody(payload) => match payload {
+            tentaflow_protocol::VisionImportPayload::FetchManifestRequest(req) => {
+                set(&obj, "variant", "VisionImportFetchManifestRequest".into());
+                set(&obj, "manifestUrl", req.manifest_url.clone().into());
+                set(&obj, "manifest_url", req.manifest_url.into());
+                set(&obj, "apiKey", req.api_key.clone().into());
+                set(&obj, "api_key", req.api_key.into());
+            }
+            tentaflow_protocol::VisionImportPayload::FetchManifestResponse(resp) => {
+                set(&obj, "variant", "VisionImportFetchManifestResponse".into());
+                set(&obj, "bundle", resp.bundle.into());
+                let files = js_sys::Array::new();
+                for f in &resp.files {
+                    let e = js_sys::Object::new();
+                    set(&e, "name", f.name.clone().into());
+                    set(&e, "size", (f.size as f64).into());
+                    set(&e, "sha256", f.sha256.clone().into());
+                    files.push(&e);
+                }
+                set(&obj, "files", files.into());
+                match resp.model {
+                    Some(m) => {
+                        let mo = js_sys::Object::new();
+                        set(&mo, "modelName", m.model_name.clone().into());
+                        set(&mo, "model_name", m.model_name.into());
+                        set(&mo, "op", m.op.into());
+                        set(&mo, "fileName", m.file_name.clone().into());
+                        set(&mo, "file_name", m.file_name.into());
+                        let classes = js_sys::Array::new();
+                        for c in &m.classes {
+                            classes.push(&JsValue::from_str(c));
+                        }
+                        set(&mo, "classes", classes.into());
+                        set(&mo, "outputContract", m.output_contract.clone().into());
+                        set(&mo, "output_contract", m.output_contract.into());
+                        match m.default_threshold {
+                            Some(t) => set(&mo, "defaultThreshold", t.into()),
+                            None => set(&mo, "defaultThreshold", JsValue::NULL),
+                        }
+                        set(&obj, "model", mo.into());
+                    }
+                    None => set(&obj, "model", JsValue::NULL),
+                }
+                match resp.error {
+                    Some(e) => set(&obj, "error", e.into()),
+                    None => set(&obj, "error", JsValue::NULL),
+                }
+            }
+            tentaflow_protocol::VisionImportPayload::ImportRequest(req) => {
+                set(&obj, "variant", "VisionImportModelRequest".into());
+                set(&obj, "manifestUrl", req.manifest_url.clone().into());
+                set(&obj, "manifest_url", req.manifest_url.into());
+                set(&obj, "apiKey", req.api_key.clone().into());
+                set(&obj, "api_key", req.api_key.into());
+                set(&obj, "modelName", req.model_name.clone().into());
+                set(&obj, "model_name", req.model_name.into());
+                match req.alias {
+                    Some(a) => set(&obj, "alias", a.into()),
+                    None => set(&obj, "alias", JsValue::NULL),
+                }
+            }
+            tentaflow_protocol::VisionImportPayload::ImportResponse(resp) => {
+                set(&obj, "variant", "VisionImportModelResponse".into());
+                set(&obj, "ok", resp.ok.into());
+                match resp.imported_model_name {
+                    Some(n) => {
+                        set(&obj, "importedModelName", n.clone().into());
+                        set(&obj, "imported_model_name", n.into());
+                    }
+                    None => {
+                        set(&obj, "importedModelName", JsValue::NULL);
+                        set(&obj, "imported_model_name", JsValue::NULL);
+                    }
+                }
+                match resp.error {
+                    Some(e) => set(&obj, "error", e.into()),
+                    None => set(&obj, "error", JsValue::NULL),
+                }
+            }
+        },
         MessageBody::SkillsBody(payload) => match payload {
             tentaflow_protocol::SkillsPayload::ListRequest(req) => {
                 set(&obj, "variant", "SkillsListRequest".into());

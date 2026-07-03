@@ -170,6 +170,7 @@ const ENCRYPTED_SETTING_KEYS: &[&str] = &[
     "node_x25519_private_key",
     "ngc_api_key",
     "hf_token",
+    "vision_bundle_api_key",
 ];
 
 /// Okresla sciezke do master key — priorytet: custom_dir, document_dir (iOS sandbox), home_dir, data_dir

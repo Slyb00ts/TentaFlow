@@ -38,12 +38,17 @@ pub struct EmbeddedDeploy {
     user_config: serde_json::Value,
     log_sink: Option<LogSink>,
     registered_vision_keys: Vec<String>,
+    /// Decrypted Bearer key for a custom camera-CV bundle pull (deploy config
+    /// `vision_bundle_api_key` or the secure setting of the same name),
+    /// resolved by the deploy dispatcher — never read from `config_json` here.
+    vision_bundle_api_key: Option<String>,
 }
 
 impl EmbeddedDeploy {
     pub fn new(
         manifest: ServiceManifest,
         user_config: serde_json::Value,
+        vision_bundle_api_key: Option<String>,
         log_sink: Option<LogSink>,
     ) -> Self {
         Self {
@@ -51,6 +56,7 @@ impl EmbeddedDeploy {
             user_config,
             log_sink,
             registered_vision_keys: Vec::new(),
+            vision_bundle_api_key,
         }
     }
 
@@ -79,19 +85,30 @@ impl EmbeddedDeploy {
         // engine, not tract `LoadedEngine`s. Deploy only fetches the bundle into
         // `vision_models_dir()`; the runner loads itself on first camera tick.
         if crate::vision::camera_cv_models::is_camera_cv_engine(&engine_id) {
-            // Admin-configured pull override (Settings key `vision_bundle_base_url`).
-            // Accepts either a plain release-dir base URL (files at `<base>/<name>`)
-            // or a TentaFlow signed manifest URL containing `/models/manifest/`
-            // (files pulled via per-file signed URLs + sha256 verify). When set,
-            // it wins over the manifest `[[model_preset]] repo`.
-            let override_url = crate::db::global_pool()
-                .and_then(|pool| {
-                    crate::db::repository::get_setting(&pool, "vision_bundle_base_url")
-                        .ok()
-                        .flatten()
-                })
+            // Pull-source resolution, most specific first:
+            //   1. per-deploy config `vision_bundle_url` (wizard "Custom" tab),
+            //   2. Settings key `vision_bundle_base_url`,
+            //   3. manifest `[[model_preset]] repo`.
+            // Each accepts either a plain release-dir base URL (files at
+            // `<base>/<name>`) or a TentaFlow manifest URL containing
+            // `/models/manifest/` (files pulled via per-file urls + sha256
+            // verify, optionally authenticated with the resolved Bearer key).
+            let config_url = self
+                .user_config
+                .get(crate::services::deploy::VISION_BUNDLE_URL_CONFIG_KEY)
+                .and_then(|v| v.as_str())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
+            let override_url = config_url.or_else(|| {
+                crate::db::global_pool()
+                    .and_then(|pool| {
+                        crate::db::repository::get_setting(&pool, "vision_bundle_base_url")
+                            .ok()
+                            .flatten()
+                    })
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            });
             let base_url = override_url.unwrap_or_else(|| {
                 self.manifest
                     .model_presets
@@ -103,6 +120,7 @@ impl EmbeddedDeploy {
             crate::vision::camera_cv_models::ensure_bundle(
                 &engine_id,
                 &base_url,
+                self.vision_bundle_api_key.as_deref(),
                 self.log_sink.as_ref(),
             )
             .await
@@ -1094,7 +1112,7 @@ mod tests {
             NativeRuntime::Binary,
             vec![TargetOs::Linux, TargetOs::Macos, TargetOs::Windows],
         );
-        let mut s = EmbeddedDeploy::new(m, serde_json::json!({}), None);
+        let mut s = EmbeddedDeploy::new(m, serde_json::json!({}), None, None);
         let err = s.prepare().await.unwrap_err();
         assert!(matches!(err, DeployError::Manifest(_)));
     }
@@ -1110,7 +1128,7 @@ mod tests {
             vec![TargetOs::Linux, TargetOs::Macos]
         };
         let m = manifest("emb-foreign", NativeRuntime::Embedded, host_excl);
-        let mut s = EmbeddedDeploy::new(m, serde_json::json!({}), None);
+        let mut s = EmbeddedDeploy::new(m, serde_json::json!({}), None, None);
         let err = s.prepare().await.unwrap_err();
         assert!(matches!(err, DeployError::Manifest(_)));
     }
@@ -1124,7 +1142,7 @@ mod tests {
             NativeRuntime::Embedded,
             vec![TargetOs::Linux, TargetOs::Macos, TargetOs::Windows],
         );
-        let mut s = EmbeddedDeploy::new(m, serde_json::json!({}), None);
+        let mut s = EmbeddedDeploy::new(m, serde_json::json!({}), None, None);
         let prepared = s.prepare().await.unwrap();
         assert_eq!(prepared.transport, Transport::Embedded);
         assert_eq!(prepared.models.len(), 1);

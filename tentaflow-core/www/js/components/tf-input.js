@@ -10,7 +10,7 @@
 
 class TfInput extends HTMLElement {
   static get observedAttributes() {
-    return ['label', 'placeholder', 'value', 'hint', 'error', 'type', 'icon', 'trailing-icon', 'prefix', 'suffix', 'disabled', 'autocomplete', 'autofocus', 'required', 'name', 'autocapitalize', 'autocorrect', 'spellcheck', 'inputmode', 'minlength', 'maxlength', 'pattern', 'multiline', 'rows', 'min', 'max', 'step'];
+    return ['label', 'placeholder', 'value', 'hint', 'error', 'type', 'icon', 'trailing-icon', 'prefix', 'suffix', 'disabled', 'readonly', 'autocomplete', 'autofocus', 'required', 'name', 'autocapitalize', 'autocorrect', 'spellcheck', 'inputmode', 'minlength', 'maxlength', 'pattern', 'multiline', 'rows', 'min', 'max', 'step'];
   }
 
   constructor() {
@@ -186,6 +186,8 @@ class TfInput extends HTMLElement {
     if (document.activeElement !== this._input) this._input.value = value;
     if (this._input.tagName !== 'TEXTAREA') this._input.type = type;
     this._input.disabled = disabled;
+    // readonly keeps the value selectable/copyable (unlike disabled).
+    this._input.readOnly = this.hasAttribute('readonly');
     if (this._input.tagName === 'TEXTAREA') {
       this._input.rows = Number(this.getAttribute('rows') || 4);
     }

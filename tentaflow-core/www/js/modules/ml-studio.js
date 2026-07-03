@@ -5849,10 +5849,12 @@ function renderVisionRegistrySection(panel, p) {
   card.innerHTML = `
     <div class="ml-studio-section-card-head">
       <div class="title">${sprite('eye')} Modele wizyjne <span class="ml-studio-section-sub">— rejestr modeli kamer (onnx-cv, cała organizacja)</span></div>
+      <tf-button size="sm" variant="ghost" icon="share" data-vision-share>Udostępnij</tf-button>
     </div>
     <div data-vision-registry-body></div>
   `;
   panel.appendChild(card);
+  card.querySelector('[data-vision-share]')?.addEventListener('click', openVisionShareModal);
   const body = card.querySelector('[data-vision-registry-body]');
 
   ApiBinary.one('mlStudioVisionModelsListRequest', {})
@@ -5887,6 +5889,15 @@ function renderVisionRegistrySection(panel, p) {
       }));
       table.rowActions = (row) => {
         if (!row) return null;
+        const wrap = document.createElement('div');
+        wrap.style.display = 'flex';
+        wrap.style.gap = '6px';
+        const share = document.createElement('tf-button');
+        share.setAttribute('size', 'sm');
+        share.setAttribute('variant', 'ghost');
+        share.setAttribute('icon', 'share');
+        share.textContent = 'Udostępnij';
+        share.addEventListener('click', () => openVisionShareModal(row._modelName));
         const del = document.createElement('tf-button');
         del.setAttribute('size', 'sm');
         del.setAttribute('variant', 'danger');
@@ -5903,13 +5914,55 @@ function renderVisionRegistrySection(panel, p) {
             toast(`Usuwanie modelu: ${err.message}`, 'error');
           }
         });
-        return del;
+        wrap.appendChild(share);
+        wrap.appendChild(del);
+        return wrap;
       };
       body.appendChild(table);
     })
     .catch((err) => {
       body.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} Rejestr modeli wizyjnych: ${escapeHtml(err.message || String(err))}</div>`;
     });
+}
+
+// Udostępnianie modeli wizyjnych innej instancji TentaFlow (bez parowania):
+// pokazuje gotowy do wklejenia URL manifestu /models/manifest/<ref>. `bundleRef`
+// to nazwa modelu z rejestru (pojedynczy model) albo `vision-all` (całość gdy
+// wywołane z przycisku sekcji). Druga instancja wkleja URL w kreatorze deployu
+// (zakładka „Własny") razem z kluczem API utworzonym TUTAJ (Dostęp i klucze API
+// → zakres model_bundle na ten sam ref).
+function openVisionShareModal(bundleRef = 'vision-all') {
+  const ref = String(bundleRef || 'vision-all');
+  const manifestUrl = `${window.location.origin}/models/manifest/${ref}`;
+  const single = ref !== 'vision-all';
+  const modal = document.createElement('tf-modal');
+  modal.setAttribute('variant', 'modal');
+  modal.setAttribute('title', single ? `Udostępnij model „${ref}"` : 'Udostępnij modele wizyjne');
+  modal.setAttribute('size', 'md');
+  modal.innerHTML = `
+    <div slot="body">
+      <p class="ml-studio-export-intro">${single
+        ? `Inna instancja TentaFlow może zaimportować ten pojedynczy model (bez parowania mesh). Wklej poniższy URL manifestu w kreatorze deployu drugiej instancji (krok „Model" → zakładka „Własny") razem z kluczem API utworzonym na TEJ instancji.`
+        : `Inna instancja TentaFlow może pobrać stąd bundle modeli wizyjnych bez parowania mesh. Wklej poniższy URL manifestu w kreatorze deployu drugiej instancji (krok „Model" → zakładka „Własny") razem z kluczem API utworzonym na TEJ instancji.`}</p>
+      <div class="form-group">
+        <tf-input id="ml-studio-vision-share-url" label="URL manifestu (gotowy do wklejenia)" value="${escapeAttr(manifestUrl)}" readonly></tf-input>
+      </div>
+      <p class="ml-studio-share-hint">${sprite('info')} Dostęp wymaga klucza API typu „Ogólny" z zakresem <code>model_bundle</code> (<code>${escapeHtml(ref)}</code>) — utwórz go w „Dostęp i klucze API". Klucz jest przesyłany jako nagłówek <code>Authorization: Bearer</code> i każdy dostęp trafia do audytu.</p>
+    </div>
+    <div slot="footer">
+      <tf-button variant="ghost" data-vision-share-close>Zamknij</tf-button>
+      <tf-button variant="primary" icon="copy" id="ml-studio-vision-share-copy">Kopiuj URL</tf-button>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  modal.setAttribute('open', '');
+  const close = () => { try { modal.remove(); } catch (_) {} };
+  modal.querySelector('[data-vision-share-close]')?.addEventListener('click', close);
+  modal.addEventListener('close', close);
+  modal.querySelector('#ml-studio-vision-share-copy')?.addEventListener('click', () => {
+    navigator.clipboard?.writeText(manifestUrl);
+    toast('URL manifestu skopiowany', 'success');
+  });
 }
 
 // Publikacja wytrenowanego modelu do rejestru vision_models. Dla RF-DETR bez

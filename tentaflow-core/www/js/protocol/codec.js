@@ -3540,6 +3540,33 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** VisionImportBody(FetchManifestRequest) — Core pobiera zdalny manifest
+   * modeli przez klucz API (deploy wizard "Własny"). payload: { manifestUrl,
+   * apiKey }. Zwraca { bundle, files, model, error }. */
+  visionImportFetchManifestRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeVisionImportFetchManifestRequest(
+      String(payload.manifestUrl ?? payload.manifest_url ?? ''),
+      String(payload.apiKey ?? payload.api_key ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** VisionImportBody(ImportRequest) — Core importuje pojedynczy model rejestru
+   * ze zdalnej instancji do lokalnego rejestru vision_models. payload:
+   * { manifestUrl, apiKey, modelName, alias? }. Zwraca { ok, importedModelName, error }. */
+  visionImportModelRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const alias = payload.alias;
+    const body = _wasm.encodeVisionImportModelRequest(
+      String(payload.manifestUrl ?? payload.manifest_url ?? ''),
+      String(payload.apiKey ?? payload.api_key ?? ''),
+      String(payload.modelName ?? payload.model_name ?? ''),
+      alias === null || alias === undefined || alias === '' ? undefined : String(alias),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MlStudioBody(VisionModelDeleteRequest) — usuwa model z rejestru vision.
    * payload: { modelName }. Zwraca { ok, error }. */
   mlStudioVisionModelDeleteRequest(correlationId, payload = {}, sequence = 1) {

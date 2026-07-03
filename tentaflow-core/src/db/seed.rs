@@ -76,6 +76,11 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
         // a plain base URL serves `<base>/<name>`; a TentaFlow signed manifest
         // URL (contains `/models/manifest/`) pulls via per-file signed URLs.
         ("vision_bundle_base_url", ""),
+        // Bearer key sent with a token-less `vision_bundle_base_url` manifest
+        // pull (API-key sharing between unpaired instances). Encrypted at rest
+        // (ENCRYPTED_SETTING_KEYS); per-deploy config `vision_bundle_api_key`
+        // from the wizard "Custom" tab wins over this setting.
+        ("vision_bundle_api_key", ""),
     ];
 
     {

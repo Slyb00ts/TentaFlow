@@ -52,6 +52,7 @@ pub mod system_event_broadcast;
 pub mod token_usage;
 pub mod ui_cbor_broadcast;
 pub mod ui_channel;
+pub mod vision_import;
 
 pub use state::AppState;
 
@@ -1551,6 +1552,18 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             }
             tentaflow_protocol::BenchmarkPayload::RunStreamChunk { .. } => "BenchmarkRunStreamChunk",
             tentaflow_protocol::BenchmarkPayload::RunStreamEnd { .. } => "BenchmarkRunStreamEnd",
+        },
+        MessageBody::VisionImportBody(p) => match p {
+            tentaflow_protocol::VisionImportPayload::FetchManifestRequest(_) => {
+                "VisionImportFetchManifestRequest"
+            }
+            tentaflow_protocol::VisionImportPayload::FetchManifestResponse(_) => {
+                "VisionImportFetchManifestResponse"
+            }
+            tentaflow_protocol::VisionImportPayload::ImportRequest(_) => "VisionImportModelRequest",
+            tentaflow_protocol::VisionImportPayload::ImportResponse(_) => {
+                "VisionImportModelResponse"
+            }
         },
     }
 }

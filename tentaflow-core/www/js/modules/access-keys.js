@@ -14,6 +14,7 @@
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
+import { modelBundleScopeResources } from '/js/modules/catalog/camera-cv-bundles.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-window.js';
@@ -31,7 +32,7 @@ let highlightKeyUid = null;
 let keys = [];
 let groups = [];
 let users = [];
-let resources = { model: [], flow: [], alias: [] };
+let resources = { model: [], flow: [], alias: [], model_bundle: [] };
 
 const NEXT_MODE = { allow: 'deny', deny: 'inherit', inherit: 'allow' };
 
@@ -56,7 +57,7 @@ const AccessKeysScreen = {
     keys = [];
     groups = [];
     users = [];
-    resources = { model: [], flow: [], alias: [] };
+    resources = { model: [], flow: [], alias: [], model_bundle: [] };
   },
 };
 export default AccessKeysScreen;
@@ -110,20 +111,29 @@ async function loadKeys() {
 }
 
 async function loadSubjectsAndResources() {
-  const [g, u, models, flows, aliases] = await Promise.all([
+  const [g, u, models, flows, aliases, visionModels] = await Promise.all([
     ApiBinary.action('iamListGroupsRequest').then((r) => r?.groups ?? []).catch(() => []),
     ApiBinary.action('iamListUsersRequest').then((r) => r?.users ?? []).catch(() => []),
     ApiBinary.list('modelListRequest').catch(() => []),
     ApiBinary.list('flowListRequest').catch(() => []),
     ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' }).catch(() => []),
+    ApiBinary.one('mlStudioVisionModelsListRequest', {}).then((r) => r?.models ?? []).catch(() => []),
   ]);
   groups = Array.isArray(g) ? g : [];
   users = Array.isArray(u) ? u : [];
   if (keys.length === 0) await loadKeys();
+  // model_bundle = fixed camera-CV bundles + published vision-registry models
+  // — the same refs the /models endpoints can serve.
+  const bundleStatic = modelBundleScopeResources(t);
+  const bundleRegistry = (Array.isArray(visionModels) ? visionModels : [])
+    .map((m) => String(m.modelName ?? m.model_name ?? ''))
+    .filter((name) => name && !bundleStatic.some((b) => b.id === name))
+    .map((name) => ({ id: name, name }));
   resources = {
     model: (models || []).map((m) => ({ id: String(m.id || m.name || ''), name: String(m.name || m.id || '') })),
     flow: (flows || []).map((f) => ({ id: String(f.id || f.name || ''), name: String(f.name || f.id || '') })),
     alias: (aliases || []).map((a) => ({ id: String(a.alias || a.id || ''), name: String(a.alias || a.id || '') })),
+    model_bundle: [...bundleStatic, ...bundleRegistry],
   };
 }
 
@@ -132,6 +142,7 @@ function allResourceColumns() {
     ...resources.model.map((r) => ({ ...r, type: 'model' })),
     ...resources.flow.map((r) => ({ ...r, type: 'flow' })),
     ...resources.alias.map((r) => ({ ...r, type: 'alias' })),
+    ...resources.model_bundle.map((r) => ({ ...r, type: 'model_bundle' })),
   ];
 }
 
@@ -464,6 +475,7 @@ function matrixHead(firstLabel) {
     { label: t('access_keys.models', 'Modele'), icon: 'model', items: resources.model.map((r) => ({ ...r, type: 'model' })) },
     { label: 'Flow', icon: 'flow', items: resources.flow.map((r) => ({ ...r, type: 'flow' })) },
     { label: t('access_keys.aliases', 'Aliasy'), icon: 'link', items: resources.alias.map((r) => ({ ...r, type: 'alias' })) },
+    { label: t('access_keys.model_bundles', 'Bundle modeli'), icon: 'eye', items: resources.model_bundle.map((r) => ({ ...r, type: 'model_bundle' })) },
   ].filter((g) => g.items.length > 0);
   const top = groups.map((g) => `<th class="grp" colspan="${g.items.length}"><svg class="icon"><use href="#i-${g.icon}"/></svg> ${escapeHtml(g.label)}</th>`).join('');
   const names = groups.flatMap((g) => g.items).map((c) => `<th class="func" title="${escapeAttr(c.type + ':' + c.id)}">${escapeHtml(c.name)}</th>`).join('');
@@ -556,6 +568,7 @@ async function renderByResourceTab(body) {
         <div class="subtab ${resourceView === 'model' ? 'active' : ''}" data-rv="model">${escapeHtml(t('access_keys.models', 'Modele'))}</div>
         <div class="subtab ${resourceView === 'flow' ? 'active' : ''}" data-rv="flow">Flow</div>
         <div class="subtab ${resourceView === 'alias' ? 'active' : ''}" data-rv="alias">${escapeHtml(t('access_keys.aliases', 'Aliasy'))}</div>
+        <div class="subtab ${resourceView === 'model_bundle' ? 'active' : ''}" data-rv="model_bundle">${escapeHtml(t('access_keys.model_bundles', 'Bundle modeli'))}</div>
       </div>
       <div class="ak-form-row"><label>${escapeHtml(t('access_keys.resource', 'Zasób'))}</label><tf-select id="ak-resource"><option value="">—</option>${opts}</tf-select></div>
       <div id="ak-rmatrix"></div>

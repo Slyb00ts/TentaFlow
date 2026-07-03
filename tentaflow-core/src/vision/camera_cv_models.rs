@@ -220,10 +220,15 @@ fn progress_for_sink(sink: LogSink, label: String) -> ProgressFn {
 /// `<base>/<name>`) or — when the admin set `vision_bundle_base_url` — a
 /// TentaFlow manifest URL containing `/models/manifest/`, in which case the
 /// files are pulled through per-file signed URLs with sha256 verification.
-/// Idempotent — files already present on disk are left untouched.
+/// `api_key` (manifest mode only) authenticates against an UNPAIRED serving
+/// instance: it is sent as `Authorization: Bearer` on the manifest GET and on
+/// every per-file GET (the serving node returns token-less file urls for
+/// API-key manifests). Idempotent — files already present on disk are left
+/// untouched.
 pub async fn ensure_bundle(
     engine_id: &str,
     base_url: &str,
+    api_key: Option<&str>,
     log_sink: Option<&LogSink>,
 ) -> Result<()> {
     let bundle = bundle(engine_id)
@@ -264,7 +269,8 @@ pub async fn ensure_bundle(
         if required.is_empty() {
             return Ok(());
         }
-        return download_from_bundle_manifest(engine_id, base_url, &required, log_sink).await;
+        return download_from_bundle_manifest(engine_id, base_url, api_key, &required, log_sink)
+            .await;
     }
 
     if missing.is_empty() {
@@ -340,11 +346,18 @@ fn redact_query_strings(msg: &str) -> String {
 async fn download_from_bundle_manifest(
     engine_id: &str,
     manifest_url: &str,
+    api_key: Option<&str>,
     needed: &[&'static str],
     log_sink: Option<&LogSink>,
 ) -> Result<()> {
     let base = reqwest::Url::parse(manifest_url)
         .map_err(|e| anyhow!("vision_bundle_base_url is not a valid URL: {}", e))?;
+
+    // Bearer key for unpaired-instance pulls. It only ever accompanies
+    // requests to the manifest origin — `resolve_manifest_file_url` pins every
+    // file url to that exact scheme/host/port, so the key cannot leak to a
+    // third-party host via a hostile manifest.
+    let bearer = api_key.map(str::trim).filter(|k| !k.is_empty());
 
     // Policy::none — the manifest is a signed same-origin contract; following
     // a redirect would let a compromised serving node bounce the pull to an
@@ -363,8 +376,12 @@ async fn download_from_bundle_manifest(
     }
     // reqwest error Display embeds the request URL (incl. the token in the
     // query string) — redact before surfacing to deploy logs.
-    let response = client
-        .get(base.clone())
+    let mut manifest_request = client.get(base.clone());
+    if let Some(key) = bearer {
+        manifest_request =
+            manifest_request.header(reqwest::header::AUTHORIZATION, format!("Bearer {}", key));
+    }
+    let response = manifest_request
         .send()
         .await
         .map_err(|e| anyhow!("GET bundle manifest: {}", redact_query_strings(&e.to_string())))?;
@@ -451,7 +468,7 @@ async fn download_from_bundle_manifest(
         let progress: Option<ProgressFn> = log_sink
             .cloned()
             .map(|sink| progress_for_sink(sink, name.to_string()));
-        download_signed_file(&client, file_url, &dest, name, progress).await?;
+        download_signed_file(&client, file_url, bearer, &dest, name, progress).await?;
 
         let actual_sha = crate::api::model_bundle::sha256_file_hex(&dest)
             .await
@@ -508,14 +525,18 @@ fn resolve_manifest_file_url(
 async fn download_signed_file(
     client: &reqwest::Client,
     url: reqwest::Url,
+    bearer: Option<&str>,
     dest: &Path,
     label: &str,
     progress: Option<ProgressFn>,
 ) -> Result<()> {
     use std::io::Write;
 
-    let response = client
-        .get(url)
+    let mut request = client.get(url);
+    if let Some(key) = bearer {
+        request = request.header(reqwest::header::AUTHORIZATION, format!("Bearer {}", key));
+    }
+    let response = request
         .send()
         .await
         .map_err(|e| anyhow!("GET {}: {}", label, redact_query_strings(&e.to_string())))?;
@@ -571,6 +592,219 @@ async fn download_signed_file(
         cb(downloaded, downloaded, label);
     }
     Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Custom import (unpaired instance → remote /models/manifest with API key)
+// -----------------------------------------------------------------------------
+
+/// No-redirect, timeout-bounded HTTP client shared by every model-bundle pull.
+/// `Policy::none` is mandatory: a compromised serving node must not be able to
+/// bounce the pull (with its Bearer key) to an arbitrary destination.
+fn bundle_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(600))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .user_agent(concat!("tentaflow/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| anyhow!("build HTTP client: {}", e))
+}
+
+/// GET a remote `/models/manifest/<ref>` with an API key and return the parsed
+/// JSON. Server-side only (the browser never fetches an arbitrary instance):
+/// no-redirect client, body-size cap, query-string redaction on errors. The
+/// key travels ONLY to the manifest origin. `api_key` empty → no auth header
+/// (lets a signed-URL manifest also be previewed).
+pub async fn fetch_custom_manifest_json(
+    manifest_url: &str,
+    api_key: &str,
+) -> Result<serde_json::Value> {
+    if !manifest_url.contains("/models/manifest/") {
+        return Err(anyhow!(
+            "URL musi wskazywać na /models/manifest/<ref> innej instancji TentaFlow"
+        ));
+    }
+    let base = reqwest::Url::parse(manifest_url)
+        .map_err(|e| anyhow!("nieprawidłowy URL manifestu: {}", e))?;
+    if base.scheme() != "https" {
+        return Err(anyhow!("URL manifestu musi używać https"));
+    }
+    let bearer = api_key.trim();
+    let client = bundle_http_client()?;
+    let mut request = client.get(base.clone());
+    if !bearer.is_empty() {
+        request = request.header(reqwest::header::AUTHORIZATION, format!("Bearer {}", bearer));
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| anyhow!("GET manifestu: {}", redact_query_strings(&e.to_string())))?;
+    if response.status().is_redirection() {
+        return Err(anyhow!(
+            "manifest odpowiedział przekierowaniem ({}) — przekierowania nie są śledzone",
+            response.status()
+        ));
+    }
+    let response = response
+        .error_for_status()
+        .map_err(|e| anyhow!("błąd HTTP manifestu: {}", redact_query_strings(&e.to_string())))?;
+    if response.content_length().unwrap_or(0) > MANIFEST_BODY_LIMIT {
+        return Err(anyhow!("manifest większy niż {} bajtów", MANIFEST_BODY_LIMIT));
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| anyhow!("odczyt manifestu: {}", redact_query_strings(&e.to_string())))?;
+    if body.len() as u64 > MANIFEST_BODY_LIMIT {
+        return Err(anyhow!("manifest większy niż {} bajtów", MANIFEST_BODY_LIMIT));
+    }
+    serde_json::from_slice(&body).map_err(|e| anyhow!("parsowanie JSON manifestu: {}", e))
+}
+
+/// Registry metadata + sha-verified on-disk files after a successful custom
+/// import — everything the caller needs to insert the `vision_models` row.
+pub struct CustomImport {
+    pub model_name: String,
+    pub op: String,
+    pub file_name: String,
+    pub classes_json: String,
+    pub preprocess_json: String,
+    pub output_contract: String,
+    pub default_threshold: Option<f64>,
+    /// Files written into `vision_models_dir()` — the caller removes them if
+    /// the registry insert is refused (so a failed import leaves no orphans).
+    pub written_files: Vec<PathBuf>,
+}
+
+/// Import ONE registry model from a remote instance: re-fetch the manifest with
+/// the key, require its single-model `model` metadata, download every listed
+/// file (Bearer per file, origin-pinned), verify sha256, and return the row
+/// metadata. Files land in `vision_models_dir()`; the caller registers the row
+/// and, on refusal, deletes `written_files`.
+pub async fn import_custom_model(
+    manifest_url: &str,
+    api_key: &str,
+    model_name: &str,
+    log_sink: Option<&LogSink>,
+) -> Result<CustomImport> {
+    let base = reqwest::Url::parse(manifest_url)
+        .map_err(|e| anyhow!("nieprawidłowy URL manifestu: {}", e))?;
+    let manifest = fetch_custom_manifest_json(manifest_url, api_key).await?;
+
+    let model = manifest
+        .get("model")
+        .and_then(|m| m.as_object())
+        .ok_or_else(|| {
+            anyhow!("manifest nie opisuje pojedynczego modelu rejestru (brak pola 'model')")
+        })?;
+    let remote_name = model
+        .get("model_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if remote_name != model_name {
+        return Err(anyhow!(
+            "manifest opisuje model '{}', a zażądano '{}'",
+            remote_name,
+            model_name
+        ));
+    }
+    let field = |key: &str| -> Result<String> {
+        model
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("metadane modelu bez pola '{}'", key))
+    };
+    let op = field("op")?;
+    let file_name = field("file_name")?;
+    let classes_json = field("classes_json")?;
+    let preprocess_json = field("preprocess_json")?;
+    let output_contract = field("output_contract")?;
+    let default_threshold = model.get("default_threshold").and_then(|v| v.as_f64());
+
+    let entries = manifest
+        .get("files")
+        .and_then(|f| f.as_array())
+        .ok_or_else(|| anyhow!("manifest bez tablicy 'files'"))?;
+
+    let bearer = api_key.trim();
+    let bearer_opt = (!bearer.is_empty()).then_some(bearer);
+    let client = bundle_http_client()?;
+    let dir = vision_models_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| anyhow!("create {}: {}", dir.display(), e))?;
+
+    let mut written_files: Vec<PathBuf> = Vec::new();
+    let cleanup = |files: &[PathBuf]| {
+        for f in files {
+            let _ = std::fs::remove_file(f);
+        }
+    };
+
+    for entry in entries {
+        let name = entry.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+        if name.is_empty() {
+            cleanup(&written_files);
+            return Err(anyhow!("wpis manifestu bez nazwy pliku"));
+        }
+        let expected_sha = entry
+            .get("sha256")
+            .and_then(|h| h.as_str())
+            .map(str::to_ascii_lowercase)
+            .filter(|h| h.len() == 64)
+            .ok_or_else(|| {
+                cleanup(&written_files);
+                anyhow!("wpis '{}' bez poprawnego sha256", name)
+            })?;
+        let rel_url = entry.get("url").and_then(|u| u.as_str()).ok_or_else(|| {
+            cleanup(&written_files);
+            anyhow!("wpis '{}' bez url", name)
+        })?;
+        let file_url = resolve_manifest_file_url(&base, rel_url).map_err(|why| {
+            cleanup(&written_files);
+            anyhow!("wpis '{}': {}", name, why)
+        })?;
+        let dest = dir.join(name);
+        if let Some(s) = log_sink {
+            s.phase("downloading-vision", &format!("Pobieram {}", name));
+        }
+        let progress: Option<ProgressFn> = log_sink
+            .cloned()
+            .map(|sink| progress_for_sink(sink, name.to_string()));
+        if let Err(e) =
+            download_signed_file(&client, file_url, bearer_opt, &dest, name, progress).await
+        {
+            cleanup(&written_files);
+            return Err(e);
+        }
+        written_files.push(dest.clone());
+        let actual_sha = crate::api::model_bundle::sha256_file_hex(&dest)
+            .await
+            .map_err(|e| anyhow!("hash {}: {}", dest.display(), e))?;
+        if actual_sha != expected_sha {
+            cleanup(&written_files);
+            return Err(anyhow!(
+                "sha256 niezgodny dla '{}' (oczekiwano {}, jest {}) — import przerwany",
+                name,
+                expected_sha,
+                actual_sha
+            ));
+        }
+        if let Some(s) = log_sink {
+            s.info(&format!("vision: {} pobrany (sha256 zweryfikowany)", name));
+        }
+    }
+
+    Ok(CustomImport {
+        model_name: model_name.to_string(),
+        op,
+        file_name,
+        classes_json,
+        preprocess_json,
+        output_contract,
+        default_threshold,
+        written_files,
+    })
 }
 
 #[cfg(test)]

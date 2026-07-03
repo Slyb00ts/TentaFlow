@@ -146,7 +146,11 @@ mod serde_array64 {
 // `serde_bytes` (CBOR byte string) — a wire-format change for EVERY frame. A stale
 // peer would pass the version check yet misdecode every body, so the handshake must
 // reject mixed old/new.
-pub const SCHEMA_VERSION: u16 = 18;
+// v19: added `MessageBody::VisionImportBody(VisionImportPayload)` (custom
+// vision-model import over HTTPS + API key). Appended at the enum's end so no
+// existing CBOR tag shifts, but a stale peer cannot decode the new variant —
+// handshake bump per the convention above.
+pub const SCHEMA_VERSION: u16 = 19;
 
 // =============================================================================
 // Message kind discriminants

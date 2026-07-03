@@ -1968,6 +1968,79 @@ pub struct MlStudioVisionModelDeleteResponse {
     pub error: Option<String>,
 }
 
+// ----- Custom vision-model import (unpaired instance → HTTPS + API key) -----
+
+/// One file entry from a remote `/models/manifest/<ref>` response, surfaced to
+/// the deploy wizard's "Custom" tab so the admin sees what will be pulled.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct VisionImportManifestFile {
+    pub name: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+/// Registry model metadata carried by a single-model remote manifest — enough
+/// for the wizard to preview the model before importing it.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct VisionImportManifestModel {
+    pub model_name: String,
+    pub op: String,
+    pub file_name: String,
+    pub classes: Vec<String>,
+    pub output_contract: String,
+    pub default_threshold: Option<f64>,
+}
+
+/// Fetch a remote model-bundle manifest through the Core (server-side, no-
+/// redirect, query-redacting HTTP client) using an API key. `manifest_url` is
+/// the admin-pasted `https://<host>/models/manifest/<ref>` URL; `api_key` is
+/// sent as `Authorization: Bearer` and never persisted by this request.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct VisionImportFetchManifestRequest {
+    pub manifest_url: String,
+    pub api_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct VisionImportFetchManifestResponse {
+    pub bundle: String,
+    pub files: Vec<VisionImportManifestFile>,
+    /// Present only for a single-model registry bundle (importable). A fixed
+    /// engine bundle (`vision-all`, camera-CV) has no registry row → `None`.
+    pub model: Option<VisionImportManifestModel>,
+    pub error: Option<String>,
+}
+
+/// Import a single registry model from a remote instance: Core re-fetches the
+/// manifest with the key, downloads the ONNX (+ sidecars), verifies sha256,
+/// places files in `vision_models_dir()` and registers a `vision_models` row
+/// (`source='imported'`). `alias` optionally creates/retargets a model alias.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct VisionImportModelRequest {
+    pub manifest_url: String,
+    pub api_key: String,
+    /// The registry model name (== the single-model bundle_ref) to import.
+    pub model_name: String,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct VisionImportModelResponse {
+    pub ok: bool,
+    pub imported_model_name: Option<String>,
+    pub error: Option<String>,
+}
+
+/// One variant carrying the whole custom-import family (fetch + import). New
+/// variants ALWAYS appended at the END — ciborium encodes by index.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub enum VisionImportPayload {
+    FetchManifestRequest(VisionImportFetchManifestRequest),
+    FetchManifestResponse(VisionImportFetchManifestResponse),
+    ImportRequest(VisionImportModelRequest),
+    ImportResponse(VisionImportModelResponse),
+}
+
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct MlStudioRecogHyperparams {
     pub epochs: u32,
@@ -7511,6 +7584,13 @@ pub enum MessageBody {
     // żeby nie ruszać indeksów istniejących wariantów. JEDEN wariant na całą
     // rodzinę (request+response+stream) w `BenchmarkPayload`.
     BenchmarkBody(crate::benchmark::BenchmarkPayload),
+
+    // ----- Custom vision-model import (deploy wizard "Własny" tab) -----
+    // Dopisane na KOŃCU enuma (ciborium koduje warianty po indeksie liczbowym).
+    // JEDEN wariant na całą rodzinę (fetch-manifest + import) w
+    // `VisionImportPayload` — Core pobiera zdalny manifest przez klucz API i
+    // importuje pojedynczy model wizyjny do lokalnego rejestru.
+    VisionImportBody(VisionImportPayload),
 }
 
 // =============================================================================
