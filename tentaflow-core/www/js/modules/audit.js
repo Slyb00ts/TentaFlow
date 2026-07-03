@@ -57,7 +57,7 @@ const AuditScreen = {
       </div>
 
       <div class="card" style="padding: 14px; margin-bottom: 14px;">
-        <div class="audit-filters" style="display: grid; grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr auto; gap: 10px; align-items: center;">
+        <div class="audit-filters">
           <tf-searchbox id="audit-f-search" placeholder="${escapeAttr(I18n.t('audit.filter_search'))}" debounce="300"></tf-searchbox>
           <tf-select id="audit-f-severity" value="">
             <option value="">${escapeHtml(I18n.t('audit.severity'))}</option>
@@ -75,7 +75,7 @@ const AuditScreen = {
       </div>
 
       <div class="card" style="padding: 0; overflow: hidden;">
-        <div class="audit-row" style="background: var(--bg-2); color: var(--text-3); font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; font-size: 10px;">
+        <div class="audit-row audit-head" style="background: var(--bg-2); color: var(--text-3); font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; font-size: 10px;">
           <span>${escapeHtml(I18n.t('audit.timestamp'))}</span>
           <span>${escapeHtml(I18n.t('audit.severity'))}</span>
           <span>${escapeHtml(I18n.t('audit.event'))}</span>

@@ -1779,6 +1779,14 @@ input, textarea, select {
 }
 
 /* Audit log styling */
+.audit-filters {
+  display: grid; grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr auto;
+  gap: 10px; align-items: center;
+}
+@media (max-width: 720px) {
+  .audit-filters { grid-template-columns: 1fr 1fr; }
+  .audit-filters > tf-searchbox { grid-column: 1 / -1; }
+}
 .audit-row {
   display: grid; grid-template-columns: 140px 80px 1fr 140px 80px;
   gap: 12px; padding: 10px 14px; font-size: 12px; align-items: center;
@@ -1787,6 +1795,24 @@ input, textarea, select {
 .audit-row:last-child { border-bottom: none; }
 .audit-row:hover { background: var(--bg-card-hover); }
 .audit-row .ts { color: var(--text-3); font-family: 'SF Mono', monospace; font-size: 11px; }
+
+/* Mobile: sztywna siatka 5 kolumn (~440px) nie mieści się — reflow na kartę.
+   Timestamp + severity w jednym rzędzie, event/actor/details pełną szerokością. */
+@media (max-width: 720px) {
+  .audit-head { display: none; }
+  .audit-row {
+    grid-template-columns: 1fr auto;
+    gap: 4px 10px;
+    padding: 10px 12px;
+    align-items: start;
+  }
+  .audit-row > span:nth-child(3),
+  .audit-row > span:nth-child(4),
+  .audit-row > span:nth-child(5) { grid-column: 1 / -1; }
+  .audit-row > span:nth-child(2) { justify-self: end; }
+  .audit-row > span:nth-child(3) { font-weight: 600; word-break: break-word; }
+  .audit-row > span:nth-child(4) { color: var(--text-2); word-break: break-word; }
+}
 .audit-sev { font-size: 10px; padding: 2px 8px; border-radius: 10px; font-weight: 600; text-align: center; }
 .audit-sev.info { background: rgba(96,165,250,0.15); color: var(--info); }
 .audit-sev.warn { background: rgba(245,158,11,0.15); color: var(--warning); }
