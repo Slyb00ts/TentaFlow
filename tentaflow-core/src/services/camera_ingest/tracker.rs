@@ -82,26 +82,43 @@ struct Track {
     misses: u32,
 }
 
-/// Stan trackera jednej kamery.
+/// Stan trackera jednego klucza (kamera lub para kamera+etap). Identyfikatory
+/// trackow NIE sa alokowane tutaj — pochodza ze wspolnego licznika kamery
+/// (`camera_counters`), by dwa etapy `detect` tej samej kamery nigdy nie
+/// wydaly tego samego track_id (downstream konsumuje (camera_id, track_id)).
 struct CameraTracker {
-    next_id: u32,
     tracks: Vec<Track>,
 }
 
 impl CameraTracker {
     fn new() -> Self {
-        Self {
-            // Zaczynamy od 1 — 0 rezerwujemy jako "brak przypisania" w `Detection`.
-            next_id: 1,
-            tracks: Vec::new(),
-        }
+        Self { tracks: Vec::new() }
     }
 }
 
-/// Rejestr trackerow per camera_id. Proces-wide singleton (wzor jak `cold_state`).
+/// Rejestr trackerow per klucz (`camera_id` lub `key(camera, stage)`).
+/// Proces-wide singleton (wzor jak `cold_state`).
 fn tracker_state() -> &'static Mutex<HashMap<String, CameraTracker>> {
     static S: OnceLock<Mutex<HashMap<String, CameraTracker>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Wspolny licznik track_id per KAMERA, dzielony przez wszystkie jej trackery
+/// etapow — gwarantuje unikalnosc id w obrebie kamery niezaleznie od liczby
+/// etapow `detect`. Startuje od 1 (0 = "brak przypisania" w `Detection`) i
+/// rosnie monotonicznie przez cala sesje kamery (patrz komentarz w `update`).
+fn camera_counters() -> &'static Mutex<HashMap<String, u32>> {
+    static C: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Przydziela kolejny track_id ze wspolnego licznika kamery.
+fn alloc_track_id(camera_id: &str) -> u32 {
+    let mut counters = camera_counters().lock().unwrap_or_else(|e| e.into_inner());
+    let ctr = counters.entry(camera_id.to_string()).or_insert(1);
+    let id = *ctr;
+    *ctr = ctr.wrapping_add(1);
+    id
 }
 
 /// Srodek boxa [x, y, w, h] → (cx, cy).
@@ -158,6 +175,9 @@ fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
 /// dopasowania dostaja nowy identyfikator; tracki bez dopasowania rosna licznik
 /// `misses` i sa usuwane po `MAX_MISSES`.
 pub fn update(camera_id: &str, dets: &mut [Detection], pts_ns: Option<u64>) {
+    // Klucz moze byc zlozony (`key(camera, stage)`) — track_id alokujemy ze
+    // wspolnego licznika WLASCICIELA (kamery), nie per klucz etapu.
+    let owner = camera_id.split(KEY_SEP).next().unwrap_or(camera_id);
     let mut state = tracker_state().lock().unwrap_or_else(|e| e.into_inner());
     let cam = state
         .entry(camera_id.to_string())
@@ -281,9 +301,8 @@ pub fn update(camera_id: &str, dets: &mut [Detection], pts_ns: Option<u64>) {
                 det.vy = trk.vy;
             }
             None => {
-                // Niedopasowana detekcja → nowy track.
-                let id = cam.next_id;
-                cam.next_id = cam.next_id.wrapping_add(1);
+                // Niedopasowana detekcja → nowy track z licznika kamery.
+                let id = alloc_track_id(owner);
                 cam.tracks.push(Track {
                     id,
                     klasa: det.klasa.clone(),
@@ -310,21 +329,38 @@ pub fn update(camera_id: &str, dets: &mut [Detection], pts_ns: Option<u64>) {
     }
     cam.tracks.retain(|t| t.misses <= MAX_MISSES);
 
-    // Wpisu kamery NIE usuwamy przy pustym `tracks`. Reset licznika `next_id` (start
-    // od 1) przy odtworzeniu wpisu powodowal REUZYCIE track_id po pustym kadrze miedzy
-    // pojazdami (czeste na bramie ADR). Cache wzbogacania klucza po (camera_id,
-    // track_id) przypisywalby wtedy NOWEMU obiektowi stan/rejestracje POPRZEDNIEGO.
-    // Zostawiamy wpis `CameraTracker` (z zachowanym `next_id`) — `track_id` rosnie
-    // monotonicznie przez cala sesje kamery. Pusty wpis to jeden maly rekord per
-    // kamera (ograniczony liczba kamer), usuwany dopiero przy realnym teardownie:
+    // Licznika kamery (`camera_counters`) NIE resetujemy przy pustym `tracks`.
+    // Reset (start od 1) przy odtworzeniu powodowal REUZYCIE track_id po pustym
+    // kadrze miedzy pojazdami (czeste na bramie ADR). Cache wzbogacania klucza
+    // po (camera_id, ..., track_id) przypisywalby wtedy NOWEMU obiektowi
+    // stan/rejestracje POPRZEDNIEGO. `track_id` rosnie monotonicznie przez cala
+    // sesje kamery; licznik znika dopiero przy realnym teardownie:
     // `remove(camera_id)` oraz `clear()`.
 }
 
-/// Usuwa stan trackera pojedynczej kamery. Wolane przy usuwaniu kamery, by nie
+/// Separator klucza zlozonego (kamera, etap detekcji). Bajt kontrolny nie
+/// wystepuje w identyfikatorach kamer ani `stage_id` ([a-z0-9_-]), wiec klucz
+/// jest jednoznaczny.
+const KEY_SEP: char = '\u{1}';
+
+/// Klucz trackera dla pary (kamera, etap detekcji pipeline'u). Kazdy etap
+/// `detect` sledzi obiekty niezaleznie — identyfikatory track_id sa stabilne
+/// w obrebie (kamera, etap), nie miedzy etapami.
+pub fn key(camera_id: &str, stage_id: &str) -> String {
+    format!("{camera_id}{KEY_SEP}{stage_id}")
+}
+
+/// Usuwa stan trackera pojedynczej kamery — wszystkie jej etapy (klucze
+/// zlozone `key(camera, stage)`). Wolane przy usuwaniu kamery, by nie
 /// zostawiac martwego stanu (tracki, licznik id) w procesowym rejestrze.
 pub fn remove(camera_id: &str) {
     let mut state = tracker_state().lock().unwrap_or_else(|e| e.into_inner());
-    state.remove(camera_id);
+    let prefix = format!("{camera_id}{KEY_SEP}");
+    state.retain(|k, _| k != camera_id && !k.starts_with(&prefix));
+    camera_counters()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(camera_id);
 }
 
 /// Czysci stan trackera wszystkich kamer. Wolane przy globalnym drainie warstwy
@@ -332,6 +368,10 @@ pub fn remove(camera_id: &str) {
 pub fn clear() {
     let mut state = tracker_state().lock().unwrap_or_else(|e| e.into_inner());
     state.clear();
+    camera_counters()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 #[cfg(test)]
@@ -472,6 +512,27 @@ mod tests {
             id_b > id_a,
             "track_id musi rosnac monotonicznie po pustym kadrze: id_a={id_a}, id_b={id_b}"
         );
+    }
+
+    #[test]
+    fn track_id_unikalny_miedzy_etapami_jednej_kamery() {
+        // Dwa etapy `detect` tej samej kamery (osobne trackery per klucz) MUSZĄ
+        // wydawac rozne track_id — downstream konsumuje (camera_id, track_id).
+        let cam = "trk-test-stages";
+        let mut a = vec![det([0.10, 0.10, 0.20, 0.20]), det([0.50, 0.50, 0.20, 0.20])];
+        let mut b = vec![det([0.10, 0.10, 0.20, 0.20])];
+        update(&key(cam, "detect_a"), &mut a, Some(0));
+        update(&key(cam, "detect_b"), &mut b, Some(0));
+        let mut ids: Vec<u32> = a.iter().chain(b.iter()).map(|d| d.track_id).collect();
+        assert!(ids.iter().all(|&id| id > 0));
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "track_id nie moze sie powtorzyc miedzy etapami");
+        // `remove(camera)` sprzata trackery etapow ORAZ licznik kamery.
+        remove(cam);
+        let mut c = vec![det([0.10, 0.10, 0.20, 0.20])];
+        update(&key(cam, "detect_a"), &mut c, Some(0));
+        assert_eq!(c[0].track_id, 1, "po remove licznik kamery startuje od 1");
     }
 
     #[test]

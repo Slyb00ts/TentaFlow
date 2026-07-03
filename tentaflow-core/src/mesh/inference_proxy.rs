@@ -468,11 +468,12 @@ fn build_camera_cv_request(
     use tentaflow_protocol::CameraCvOp;
 
     let op = match &payload.op {
-        CameraCvOp::Detect { frames } => CameraCvOpLocal::Detect {
+        CameraCvOp::Detect { frames, threshold } => CameraCvOpLocal::Detect {
             frames: frames
                 .iter()
                 .map(decode_cv_frame)
                 .collect::<std::result::Result<Vec<_>, _>>()?,
+            threshold: *threshold,
         },
         CameraCvOp::ClassifyState { crop } => CameraCvOpLocal::ClassifyState {
             crop: decode_cv_frame(crop)?,
@@ -1104,13 +1105,15 @@ mod tests {
                     height: 2,
                     encoding: CvFrameEncoding::Rgb24,
                 }],
+                threshold: Some(0.6),
             },
         };
 
         let req = build_camera_cv_request(&payload).expect("Rgb24 powinno przejsc");
         assert_eq!(req.model, "rfdetr-adr");
         match req.op {
-            crate::services::runtime::local_cv::CameraCvOpLocal::Detect { frames } => {
+            crate::services::runtime::local_cv::CameraCvOpLocal::Detect { frames, threshold } => {
+                assert_eq!(threshold, Some(0.6));
                 assert_eq!(frames.len(), 1);
                 assert_eq!(&frames[0].data[..], data.as_slice());
                 assert_eq!(frames[0].width, 2);

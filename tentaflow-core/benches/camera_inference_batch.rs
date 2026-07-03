@@ -32,7 +32,7 @@ fn bench_batch(c: &mut Criterion) {
         let frames: Vec<(&[u8], u32, u32)> = (0..n).map(|_| (frame.as_slice(), w, h)).collect();
         group.throughput(Throughput::Elements(n as u64));
         group.bench_function(format!("batch_{n}"), |b| {
-            b.iter(|| detector.detect_batch(&frames).expect("detect_batch"));
+            b.iter(|| detector.detect_batch(&frames, None).expect("detect_batch"));
         });
     }
     group.finish();

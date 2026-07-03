@@ -152,7 +152,7 @@ impl RfDetrDetector {
     /// gets bit-identical results to the batched fleet path.
     pub fn detect(&mut self, rgb: &[u8], w: u32, h: u32) -> Result<Vec<Detection>> {
         Ok(self
-            .detect_batch(&[(rgb, w, h)])?
+            .detect_batch(&[(rgb, w, h)], None)?
             .into_iter()
             .next()
             .unwrap_or_default())
@@ -167,7 +167,11 @@ impl RfDetrDetector {
     /// samą funkcją co ścieżka Burn — współrzędne są identyczne. Kolejność wyników
     /// == kolejność `frames`, długość wektora == `frames.len()`.
     #[cfg(feature = "inference-supertonic")]
-    pub fn detect_batch(&mut self, frames: &[(&[u8], u32, u32)]) -> Result<Vec<Vec<Detection>>> {
+    pub fn detect_batch(
+        &mut self,
+        frames: &[(&[u8], u32, u32)],
+        threshold: Option<f32>,
+    ) -> Result<Vec<Vec<Detection>>> {
         if frames.is_empty() {
             return Ok(Vec::new());
         }
@@ -257,6 +261,7 @@ impl RfDetrDetector {
                 queries,
                 label_dim,
                 num_classes,
+                threshold,
             ));
         }
         Ok(results)
@@ -271,7 +276,11 @@ impl RfDetrDetector {
     /// postprocessujemy ani nie zwracamy. Kolejność wyników = kolejność `frames`,
     /// a długość wektora wynikowego == `frames.len()`.
     #[cfg(not(feature = "inference-supertonic"))]
-    pub fn detect_batch(&mut self, frames: &[(&[u8], u32, u32)]) -> Result<Vec<Vec<Detection>>> {
+    pub fn detect_batch(
+        &mut self,
+        frames: &[(&[u8], u32, u32)],
+        threshold: Option<f32>,
+    ) -> Result<Vec<Vec<Detection>>> {
         if frames.is_empty() {
             return Ok(Vec::new());
         }
@@ -367,6 +376,7 @@ impl RfDetrDetector {
                     queries,
                     label_dim,
                     num_classes,
+                    threshold,
                 ));
             }
         }
@@ -376,7 +386,8 @@ impl RfDetrDetector {
 
     /// Per-image DETR postprocess: per-query sigmoid + argmax over the real
     /// classes (index `num_classes` is the background slot), threshold, and
-    /// cxcywh→xywh-normalized box. No NMS.
+    /// cxcywh→xywh-normalized box. No NMS. `threshold = None` uses
+    /// [`SCORE_THRESHOLD`] (the historical default).
     fn postprocess_image(
         &self,
         dets: &[f32],
@@ -384,7 +395,9 @@ impl RfDetrDetector {
         queries: usize,
         label_dim: usize,
         num_classes: usize,
+        threshold: Option<f32>,
     ) -> Vec<Detection> {
+        let score_threshold = threshold.unwrap_or(SCORE_THRESHOLD);
         let mut items = Vec::new();
         for q in 0..queries {
             let logits = &labels[q * label_dim..q * label_dim + label_dim];
@@ -397,7 +410,7 @@ impl RfDetrDetector {
                 }
             }
             let score = sigmoid(best_logit);
-            if score <= SCORE_THRESHOLD {
+            if score <= score_threshold {
                 continue;
             }
             let base = q * 4;

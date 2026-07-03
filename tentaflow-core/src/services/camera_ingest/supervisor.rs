@@ -169,6 +169,11 @@ impl CameraIngestSupervisor {
         // usunieciu (rejestr trackera jest procesowy, niezalezny od registry).
         #[cfg(feature = "inference-vision-gpu")]
         super::tracker::remove(camera_id);
+        // Razem z trackerem sprzataj cache wzbogacania kamery — licznik track_id
+        // startuje po re-dodaniu od 1, wiec stare wpisy (camera, stage, track)
+        // przypisalyby nowym trackom stan/tekst poprzedniej sesji.
+        #[cfg(feature = "inference-vision-gpu")]
+        super::vision_analysis::forget_camera(camera_id);
         stop_and_join(handle, Duration::from_secs(10)).await;
         crate::services::streaming_bus()
             .close_camera(camera_id, "removed")

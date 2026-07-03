@@ -319,6 +319,104 @@ pub fn validate(p: &CvPipeline) -> Result<(), CvPipelineError> {
     Ok(())
 }
 
+/// Enabled hot stages: `input.kind = frame` (the validator guarantees these
+/// are `op = detect`). The engine schedules one cadence per frame stage.
+pub fn frame_stages(p: &CvPipeline) -> impl Iterator<Item = &CvStage> {
+    p.stages
+        .iter()
+        .filter(|s| s.enabled && matches!(s.input, CvStageInput::Frame { .. }))
+}
+
+/// Enabled cold stages: `input.kind = stage` (per-crop classify/ocr/embed).
+pub fn cold_stages(p: &CvPipeline) -> impl Iterator<Item = &CvStage> {
+    p.stages
+        .iter()
+        .filter(|s| s.enabled && matches!(s.input, CvStageInput::Stage { .. }))
+}
+
+/// Effective analysis FPS of a frame stage: the stage's own `fps` when set,
+/// otherwise the camera-level `analysis_fps` (the pre-pipeline pacing).
+pub fn stage_fps(stage: &CvStage, camera_fps: u32) -> u32 {
+    match stage.input {
+        CvStageInput::Frame { fps: Some(fps) } => fps,
+        _ => camera_fps,
+    }
+}
+
+/// Position of a stage in the pipeline — merge order of per-stage results
+/// (stable regardless of batch completion order). Unknown id sorts last.
+pub fn stage_index(p: &CvPipeline, stage_id: &str) -> usize {
+    p.stages
+        .iter()
+        .position(|s| s.stage_id == stage_id)
+        .unwrap_or(usize::MAX)
+}
+
+/// Crop padding of a cold stage as fractions of the detection box. Defaults
+/// mirror the pre-pipeline hardcoded behavior: OCR padded 15%/10% (detector
+/// boxes often clip the right edge of plates), classify/embed on the tight box.
+pub fn crop_pads(stage: &CvStage) -> (f32, f32) {
+    let default = match stage.op {
+        CvOp::Ocr => (0.15, 0.10),
+        _ => (0.0, 0.0),
+    };
+    let read = |name: &str, fallback: f32| {
+        stage
+            .params
+            .get(name)
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+            .unwrap_or(fallback)
+    };
+    (read("crop_pad_x", default.0), read("crop_pad_y", default.1))
+}
+
+/// OCR mode of an `op = ocr` stage (`params.ocr_mode`, validated to
+/// plate|adr|generic at save time). Absent = generic text reading.
+pub fn ocr_mode(stage: &CvStage) -> &str {
+    stage
+        .params
+        .get("ocr_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("generic")
+}
+
+/// Continuous-batching flush decision. `keys` are the batch-group keys of the
+/// pending items in arrival (FIFO) order — a batch NEVER mixes keys (one model
+/// alias + threshold per forward). Returns the pending indices to flush:
+/// - the first key (by arrival of its `max_batch`-th item) that filled a whole
+///   batch, or
+/// - when the oldest item exceeded the wait window (`window_elapsed`), the
+///   oldest item's key group (up to `max_batch`).
+/// With a single key this reduces exactly to the pre-pipeline behavior
+/// (flush on full batch or on window, oldest first).
+pub fn select_flush_batch<K: PartialEq>(
+    keys: &[K],
+    max_batch: usize,
+    window_elapsed: bool,
+) -> Option<Vec<usize>> {
+    if keys.is_empty() || max_batch == 0 {
+        return None;
+    }
+    let mut groups: Vec<(&K, Vec<usize>)> = Vec::new();
+    for (i, key) in keys.iter().enumerate() {
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, idxs)) => {
+                idxs.push(i);
+                if idxs.len() >= max_batch {
+                    return Some(std::mem::take(idxs));
+                }
+            }
+            None => groups.push((key, vec![i])),
+        }
+    }
+    if window_elapsed {
+        // Groups preserve arrival order, so groups[0] is the oldest item's key.
+        return groups.into_iter().next().map(|(_, idxs)| idxs);
+    }
+    None
+}
+
 /// Save-time check that every referenced model alias exists in
 /// `model_aliases`. Kept out of [`validate`] so the structural validator stays
 /// DB-free.
@@ -455,6 +553,83 @@ mod tests {
             validate(&p),
             Err(CvPipelineError::InvalidClassPattern { .. })
         ));
+    }
+
+    #[test]
+    fn frame_and_cold_stage_selection_honors_enabled() {
+        let mut p = parse(default_pipeline_json());
+        assert_eq!(
+            frame_stages(&p).map(|s| s.stage_id.as_str()).collect::<Vec<_>>(),
+            vec!["detect"]
+        );
+        assert_eq!(
+            cold_stages(&p).map(|s| s.stage_id.as_str()).collect::<Vec<_>>(),
+            vec!["stan", "ocr_plate", "ocr_adr"]
+        );
+        p.stages[0].enabled = false;
+        p.stages[2].enabled = false;
+        assert_eq!(frame_stages(&p).count(), 0);
+        assert_eq!(
+            cold_stages(&p).map(|s| s.stage_id.as_str()).collect::<Vec<_>>(),
+            vec!["stan", "ocr_adr"]
+        );
+    }
+
+    #[test]
+    fn stage_fps_prefers_stage_value_over_camera_fallback() {
+        let mut p = parse(default_pipeline_json());
+        assert_eq!(stage_fps(&p.stages[0], 10), 10);
+        p.stages[0].input = CvStageInput::Frame { fps: Some(2) };
+        assert_eq!(stage_fps(&p.stages[0], 10), 2);
+    }
+
+    #[test]
+    fn crop_pads_default_per_op_and_params_override() {
+        let p = parse(default_pipeline_json());
+        // Classify without params: tight box, like the pre-pipeline code.
+        assert_eq!(crop_pads(&p.stages[1]), (0.0, 0.0));
+        // OCR stages carry explicit 0.15/0.10 in the seed.
+        assert_eq!(crop_pads(&p.stages[2]), (0.15, 0.10));
+        // OCR without params falls back to the historical padding.
+        let mut ocr = p.stages[2].clone();
+        ocr.params = serde_json::Map::new();
+        assert_eq!(crop_pads(&ocr), (0.15, 0.10));
+        assert_eq!(ocr_mode(&ocr), "generic");
+        assert_eq!(ocr_mode(&p.stages[2]), "plate");
+        assert_eq!(ocr_mode(&p.stages[3]), "adr");
+    }
+
+    #[test]
+    fn select_flush_batch_full_group_wins_and_never_mixes_keys() {
+        // Single key: full batch flushes the oldest max_batch items — the
+        // pre-pipeline drain(..take) behavior.
+        let keys = vec!["a"; 10];
+        assert_eq!(
+            select_flush_batch(&keys, 8, false),
+            Some((0..8).collect::<Vec<_>>())
+        );
+        // Mixed keys: only the group that filled a batch is selected, and
+        // the batch holds one key exclusively.
+        let keys = vec!["a", "b", "a", "b", "a", "b"];
+        assert_eq!(select_flush_batch(&keys, 3, false), Some(vec![0, 2, 4]));
+        // No full group and window not elapsed: no flush.
+        assert_eq!(select_flush_batch(&keys, 4, false), None);
+    }
+
+    #[test]
+    fn select_flush_batch_window_flushes_oldest_key_group() {
+        let keys = vec!["b", "a", "b"];
+        // Oldest item's key is "b" — its whole group flushes, "a" stays.
+        assert_eq!(select_flush_batch(&keys, 8, true), Some(vec![0, 2]));
+        assert_eq!(select_flush_batch::<&str>(&[], 8, true), None);
+    }
+
+    #[test]
+    fn stage_index_orders_merge_by_pipeline_position() {
+        let p = parse(default_pipeline_json());
+        assert_eq!(stage_index(&p, "detect"), 0);
+        assert_eq!(stage_index(&p, "ocr_adr"), 3);
+        assert_eq!(stage_index(&p, "missing"), usize::MAX);
     }
 
     #[test]

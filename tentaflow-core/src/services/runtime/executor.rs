@@ -3607,11 +3607,12 @@ fn camera_cv_model_request(
 ) -> Result<tentaflow_protocol::ModelRequest, ExecutorError> {
     use tentaflow_protocol::*;
     let op = match op {
-        CameraCvOpLocal::Detect { frames } => CameraCvOp::Detect {
+        CameraCvOpLocal::Detect { frames, threshold } => CameraCvOp::Detect {
             frames: frames
                 .iter()
                 .map(camera_cv_detect_frame_to_wire)
                 .collect::<Result<Vec<_>, _>>()?,
+            threshold,
         },
         CameraCvOpLocal::ClassifyState { crop } => CameraCvOp::ClassifyState {
             crop: camera_cv_frame_to_wire(&crop),
@@ -5273,15 +5274,22 @@ mod tests {
     #[test]
     fn camera_cv_model_request_resizes_detect_frames_for_mesh() {
         let frames = vec![make_cv_frame(1280, 720), make_cv_frame(320, 240)];
-        let req = camera_cv_model_request("rfdetr-adr-base", CameraCvOpLocal::Detect { frames })
-            .expect("mesh payload builds");
+        let req = camera_cv_model_request(
+            "rfdetr-adr-base",
+            CameraCvOpLocal::Detect {
+                frames,
+                threshold: Some(0.4),
+            },
+        )
+        .expect("mesh payload builds");
         let tentaflow_protocol::ModelPayload::CameraCv(p) = req.payload else {
             panic!("expected CameraCv payload");
         };
         assert_eq!(p.model, "rfdetr-adr-base");
-        let tentaflow_protocol::CameraCvOp::Detect { frames } = p.op else {
+        let tentaflow_protocol::CameraCvOp::Detect { frames, threshold } = p.op else {
             panic!("expected Detect op");
         };
+        assert_eq!(threshold, Some(0.4));
         assert_eq!(frames.len(), 2);
         assert_eq!((frames[0].width, frames[0].height), (560, 560));
         assert_eq!(frames[0].data.len(), 560 * 560 * 3);

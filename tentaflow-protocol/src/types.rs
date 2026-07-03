@@ -624,7 +624,14 @@ pub struct CameraCvPayload {
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub enum CameraCvOp {
     /// Detekcja obiektów na batchu klatek (≤8 klatek na request).
-    Detect { frames: Vec<CvFrame> },
+    /// `threshold` nadpisuje próg score detektora; `None` = domyślny próg
+    /// modelu. `#[serde(default)]` trzyma dekodowanie starych ramek CBOR
+    /// (bez pola), a `skip_serializing_if` — enkodowanie dla starych peerów.
+    Detect {
+        frames: Vec<CvFrame>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        threshold: Option<f32>,
+    },
 
     /// Klasyfikacja stanu na wyciętym fragmencie klatki (crop).
     ClassifyState { crop: CvFrame },
@@ -3874,6 +3881,7 @@ mod camera_cv_tests {
                             encoding: CvFrameEncoding::Rgb24,
                         },
                     ],
+                    threshold: Some(0.35),
                 },
             }),
             stream: false,
@@ -3889,7 +3897,8 @@ mod camera_cv_tests {
             ModelPayload::CameraCv(p) => {
                 assert_eq!(p.model, "rf-detr-nano");
                 match p.op {
-                    CameraCvOp::Detect { frames } => {
+                    CameraCvOp::Detect { frames, threshold } => {
+                        assert_eq!(threshold, Some(0.35));
                         assert_eq!(frames.len(), 2);
                         assert_eq!(frames[0].data.len(), frame_a.len());
                         assert_eq!(frames[0].data, frame_a);
@@ -3906,6 +3915,48 @@ mod camera_cv_tests {
                 }
             }
             _ => panic!("expected CameraCv variant"),
+        }
+    }
+
+    // Ramka `Detect` bez pola `threshold` (stary peer / skip_serializing_if)
+    // dekoduje się do `threshold: None` — kontrakt zgodności wstecznej.
+    #[test]
+    fn cbor_detect_without_threshold_decodes_to_none() {
+        let op = CameraCvOp::Detect {
+            frames: Vec::new(),
+            threshold: None,
+        };
+        let bytes = crate::cbor::encode(&op).expect("encode");
+        let decoded: CameraCvOp = crate::cbor::decode(&bytes).expect("decode");
+        match decoded {
+            CameraCvOp::Detect { frames, threshold } => {
+                assert!(frames.is_empty());
+                assert_eq!(threshold, None);
+            }
+            _ => panic!("expected Detect"),
+        }
+    }
+
+    // Literalna ramka CBOR w STARYM formacie drutu (sprzed pola `threshold`):
+    // {"Detect": {"frames": []}} zakodowane recznie bajt po bajcie, wiec test
+    // nie jest samoodnosny (nie uzywa dzisiejszego enkodera). Stary peer
+    // wysylajacy Detect bez `threshold` musi dekodowac sie do `None`.
+    #[test]
+    fn cbor_legacy_detect_frame_without_threshold_field_decodes() {
+        let legacy: &[u8] = &[
+            0xa1, // map(1)
+            0x66, b'D', b'e', b't', b'e', b'c', b't', // text(6) "Detect"
+            0xa1, // map(1)
+            0x66, b'f', b'r', b'a', b'm', b'e', b's', // text(6) "frames"
+            0x80, // array(0)
+        ];
+        let decoded: CameraCvOp = crate::cbor::decode(legacy).expect("legacy frame decodes");
+        match decoded {
+            CameraCvOp::Detect { frames, threshold } => {
+                assert!(frames.is_empty());
+                assert_eq!(threshold, None);
+            }
+            _ => panic!("expected Detect"),
         }
     }
 

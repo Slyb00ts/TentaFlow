@@ -23,8 +23,12 @@ pub struct CameraCvRequest {
 /// tylko z klatkami zero-copy zamiast `Vec<u8>`.
 #[derive(Debug, Clone)]
 pub enum CameraCvOpLocal {
-    /// Detekcja obiektów na batchu klatek.
-    Detect { frames: Vec<CvFrameLocal> },
+    /// Detekcja obiektów na batchu klatek. `threshold` nadpisuje próg score
+    /// detektora (`None` = domyślny próg modelu).
+    Detect {
+        frames: Vec<CvFrameLocal>,
+        threshold: Option<f32>,
+    },
 
     /// Klasyfikacja stanu na wyciętym fragmencie klatki (crop).
     ClassifyState { crop: CvFrameLocal },
@@ -52,7 +56,9 @@ impl LocalCameraCvHandler {
     pub async fn execute(engine_id: &str, op: CameraCvOpLocal) -> Result<CameraCvResult, String> {
         match engine_id {
             "rfdetr-adr" => match op {
-                CameraCvOpLocal::Detect { frames } => detect_local(frames).await,
+                CameraCvOpLocal::Detect { frames, threshold } => {
+                    detect_local(frames, threshold).await
+                }
                 _ => Err("silnik 'rfdetr-adr' obsługuje wyłącznie operację Detect".into()),
             },
             "nalepka-stan" => match op {
@@ -83,7 +89,10 @@ impl LocalCameraCvHandler {
 /// idzie przez `burn_backend::run_blocking` — pojedynczy wątek inferencji
 /// gwarantuje jeden forward GPU naraz (równoległe forwardy = korupcja stanu).
 #[cfg(feature = "inference-vision-gpu")]
-async fn detect_local(frames: Vec<CvFrameLocal>) -> Result<CameraCvResult, String> {
+async fn detect_local(
+    frames: Vec<CvFrameLocal>,
+    threshold: Option<f32>,
+) -> Result<CameraCvResult, String> {
     use tentaflow_protocol::CvDetection;
 
     let detector = crate::services::camera_ingest::vision_analysis::get_detector()
@@ -96,7 +105,7 @@ async fn detect_local(frames: Vec<CvFrameLocal>) -> Result<CameraCvResult, Strin
             .collect();
         let mut guard = detector.lock().unwrap_or_else(|e| e.into_inner());
         guard
-            .detect_batch(&refs)
+            .detect_batch(&refs, threshold)
             .map_err(|e| format!("detect_batch: {e:#}"))
     })
     .await
@@ -158,7 +167,10 @@ async fn ocr_local(crop: CvFrameLocal, mode: CvOcrMode) -> Result<CameraCvResult
 }
 
 #[cfg(not(feature = "inference-vision-gpu"))]
-async fn detect_local(_frames: Vec<CvFrameLocal>) -> Result<CameraCvResult, String> {
+async fn detect_local(
+    _frames: Vec<CvFrameLocal>,
+    _threshold: Option<f32>,
+) -> Result<CameraCvResult, String> {
     Err("camera-cv: detekcja wymaga feature 'inference-vision-gpu'".into())
 }
 
