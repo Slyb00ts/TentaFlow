@@ -72,6 +72,30 @@ speculator_method = "draft_model"
 speculator_num_tokens = 3
 featured = true
 
+# Gemma 4 NVFP4 + tools + self-speculative draft (google/*-it-assistant).
+# Prekonfigurowane turnkey bloczki: NVFP4 -> kv-cache fp8 (auto), gemma4
+# tool-call parser + chat template i --max-model-len auto wymusza Core dla
+# rodziny gemma-4 nvfp4 (deploy/recommend), speculative draft z tego bloku.
+[[model_preset]]
+id = "gemma-4-31b-it-nvfp4"
+display_name = "Gemma 4 31B IT (NVFP4 + tools + draft)"
+repo = "nvidia/Gemma-4-31B-IT-NVFP4"
+quantization = "nvfp4"
+speculator_repo = "google/gemma-4-31B-it-assistant"
+speculator_method = "draft_model"
+speculator_num_tokens = 4
+featured = true
+
+[[model_preset]]
+id = "gemma-4-12b-it-nvfp4"
+display_name = "Gemma 4 12B IT (NVFP4 + tools + draft)"
+repo = "RedHatAI/gemma-4-12B-it-NVFP4"
+quantization = "nvfp4"
+speculator_repo = "google/gemma-4-12B-it-assistant"
+speculator_method = "draft_model"
+speculator_num_tokens = 4
+featured = true
+
 [[model_preset]]
 id = "nemotron-3-super-120b-a12b"
 display_name = "Nemotron 3 Super 120B A12B"

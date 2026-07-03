@@ -60,6 +60,21 @@ COPY tentaflow-containers/llm/docker/_shared/quantize_nvfp4.py /app/quantize_nvf
 COPY tentaflow-containers/llm/docker/_shared/prepare-vllm-model.sh /app/prepare-vllm-model.sh
 RUN chmod +x /app/entrypoint.sh /app/prepare-vllm-model.sh
 
+# WORKDIR /app tak, aby relatywna sciezka `--chat-template
+# examples/tool_chat_template_*.jinja` (jak w recipes.vllm.ai) rozwiazywala sie
+# do /app/examples. Pip-install vLLM nie niesie katalogu `examples/`, wiec
+# tool-calling chat template gemma-4 pobieramy z GitHuba przy budowie obrazu.
+WORKDIR /app
+# Best-effort (|| true): jesli tag danej wersji jeszcze nie ma pliku, spadamy na
+# main; gdy oba zawioda, budowa silnika NIE pada — tylko deploy gemma-4 z tool
+# chat template zglosi brak pliku. Inne modele dzialaja bez zmian.
+RUN mkdir -p /app/examples && \
+    ( curl -fsSL "https://raw.githubusercontent.com/vllm-project/vllm/v${VLLM_VERSION}/examples/tool_chat_template_gemma4.jinja" \
+        -o /app/examples/tool_chat_template_gemma4.jinja \
+      || curl -fsSL "https://raw.githubusercontent.com/vllm-project/vllm/main/examples/tool_chat_template_gemma4.jinja" \
+        -o /app/examples/tool_chat_template_gemma4.jinja \
+      || echo "[build] gemma4 tool chat template unavailable — gemma-4 tool-calling deploy will need it supplied manually" )
+
 HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${VLLM_PORT:-8000}/health" || exit 1
 
