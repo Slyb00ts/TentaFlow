@@ -81,37 +81,54 @@ function hide() {
   if (el) el.classList.remove('visible');
 }
 
-/** Pelny hard-reload: usun service worker + cache, potem przeladuj z sieci. */
+/** Pelny hard-reload: usun NASZ service worker + cache, potem przeladuj z sieci.
+ *  Filtrujemy po scriptURL (/sw.js) i prefiksie 'tentaflow-', zeby nie ruszac
+ *  ewentualnych innych SW/cache na tym samym originie. */
 async function hardReload() {
   try {
     if ('serviceWorker' in navigator) {
       const regs = await navigator.serviceWorker.getRegistrations();
-      await Promise.all(regs.map((r) => r.unregister()));
+      await Promise.all(
+        regs
+          .filter((r) => {
+            const url = r.active?.scriptURL || r.installing?.scriptURL || r.waiting?.scriptURL || '';
+            return url.endsWith('/sw.js');
+          })
+          .map((r) => r.unregister()),
+      );
     }
     if (window.caches) {
       const keys = await caches.keys();
-      await Promise.all(keys.map((k) => caches.delete(k)));
+      await Promise.all(
+        keys.filter((k) => k.startsWith('tentaflow-')).map((k) => caches.delete(k)),
+      );
     }
   } catch { /* ignore — reload i tak pobierze swiezy front */ }
   window.location.reload();
 }
 
-/** init() — podpina sie do ApiBinary lifecycle (event 'update-available'). */
+/** Wspolny handler — zrodlo sygnalu (handshake WS albo DOM event) nie ma znaczenia. */
+function handleUpdate(info) {
+  currentServerHash = info?.server ?? null;
+  // Twardy mismatch pokazujemy zawsze; miekki pomijamy jesli user go odrzucil
+  // dla tego samego hasha serwera.
+  if (!info?.required && currentServerHash && currentServerHash === dismissedHash) {
+    return;
+  }
+  show(info);
+}
+
+/** init() — podpina sie do ApiBinary lifecycle ('update-available') oraz do DOM
+ *  eventu 'tf:update-available' (druga, niezalezna od WS sciezka sygnalu). */
 export function init() {
   if (mounted) return;
   mounted = true;
   build();
 
   ApiBinary.onLifecycle((ev) => {
-    if (ev.type !== 'update-available') return;
-    currentServerHash = ev.info?.server ?? null;
-    // Twardy mismatch pokazujemy zawsze; miekki pomijamy jesli user go odrzucil
-    // dla tego samego hasha serwera.
-    if (!ev.info?.required && currentServerHash && currentServerHash === dismissedHash) {
-      return;
-    }
-    show(ev.info);
+    if (ev.type === 'update-available') handleUpdate(ev.info);
   });
+  window.addEventListener('tf:update-available', (ev) => handleUpdate(ev.detail));
 }
 
 /** Destroy — do testow / HMR. */

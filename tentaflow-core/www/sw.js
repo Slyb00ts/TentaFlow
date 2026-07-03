@@ -38,18 +38,23 @@ self.addEventListener('install', (event) => {
         if (resp.ok) await cache.put(url, resp);
       } catch { /* ignore */ }
     }));
-    await self.skipWaiting();
+    // NIE robimy skipWaiting/clients.claim — nowy SW czeka i przejmuje kontrole
+    // dopiero po przeladowaniu strony. Bez tego dzialajaca STARA strona moglaby
+    // dostac z nowego cache swiezo lazy-loadowane chunki JS/CSS => mieszane
+    // wersje frontu w jednej sesji. Reload (banner "nowa wersja" albo hardReload)
+    // jest jedynym punktem swapu, wiec front jest zawsze spojny.
   })());
 });
 
 self.addEventListener('activate', (event) => {
   event.waitUntil((async () => {
     const names = await caches.keys();
-    // Skasuj kazdy cache poza aktualnym build-hashem.
+    // Skasuj stare cache TentaFlow (tylko nasze, nie cudze na tym originie).
     await Promise.all(
-      names.filter((n) => n !== CACHE_VERSION).map((n) => caches.delete(n)),
+      names
+        .filter((n) => n.startsWith('tentaflow-') && n !== CACHE_VERSION)
+        .map((n) => caches.delete(n)),
     );
-    await self.clients.claim();
   })());
 });
 

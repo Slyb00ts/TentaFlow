@@ -330,7 +330,12 @@ fn make_static_response_with_origin(
         .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
         .header("Content-Type", content_type);
 
-    if path == "/sw.js" || path.starts_with("/js/protocol/") {
+    // sw.js + jego importScripts (sw-version.js) i wasm glue MUSZA byc swieze,
+    // inaczej browser nie wykryje zmiany build-hasha / schematu protokolu.
+    if path == "/sw.js"
+        || path == "/js/generated/sw-version.js"
+        || path.starts_with("/js/protocol/")
+    {
         builder = builder
             .header("Cache-Control", "no-store")
             .header("Pragma", "no-cache");

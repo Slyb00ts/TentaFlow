@@ -1985,7 +1985,10 @@ fn write_generated(out_dir: &Path, json: &str) {
 }
 
 fn write_js_module(path: &Path, json_pretty: &str) {
-    let now = chrono_now_iso();
+    // Bez wall-clock timestampu — tresc musi byc DETERMINISTYCZNA, bo wchodzi do
+    // ASSET_BUILD_HASH (build.rs generate_asset_manifest). Zmienny timestamp
+    // powodowalby nowy hash przy KAZDYM buildzie backendu i falszywy komunikat
+    // "nowa wersja" mimo braku zmian frontu.
     let content = format!(
         "// =============================================================================\n\
          // Plik: services-manifest.js\n\
@@ -1994,9 +1997,8 @@ fn write_js_module(path: &Path, json_pretty: &str) {
          // =============================================================================\n\
          \n\
          export const SCHEMA_VERSION = 2;\n\
-         export const GENERATED_AT = \"{}\";\n\
          export const SERVICES = {};\n",
-        now, json_pretty
+        json_pretty
     );
     if let Err(e) = std::fs::write(path, content) {
         println!(

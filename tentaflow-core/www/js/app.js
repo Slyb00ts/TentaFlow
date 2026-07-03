@@ -232,7 +232,10 @@ async function bootstrap() {
   // optymalizacja; wykrywanie nieaktualnego frontu i tak dziala przez handshake
   // WS niezaleznie od SW). Na zaufanym certcie/localhost SW sie zarejestruje.
   if ('serviceWorker' in navigator && window.isSecureContext) {
-    navigator.serviceWorker.register('/sw.js').catch((e) => {
+    // updateViaCache:'none' — sw.js ORAZ jego importScripts (sw-version.js) sa
+    // przy sprawdzaniu update'u pobierane z sieci, nie z HTTP cache, wiec zmiana
+    // build-hasha jest zawsze wykryta.
+    navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' }).catch((e) => {
       console.debug('[app] SW register failed:', e?.message);
     });
   }
