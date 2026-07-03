@@ -4,7 +4,7 @@
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
-import { byId, escapeHtml, toast } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import '/js/components/tf-input.js';
 
@@ -97,9 +97,9 @@ async function loadTts(host) {
           <th></th>
         </tr></thead>
         <tbody>${rules.map((r) => `<tr>
-          <td><code>${escapeHtml(r.pattern)}</code></td>
-          <td>${escapeHtml(r.voiceId)}</td>
-          <td>${r.priority}</td>
+          <td data-label="${escapeAttr(I18n.t('rules.col_pattern'))}"><code>${escapeHtml(r.pattern)}</code></td>
+          <td data-label="${escapeAttr(I18n.t('rules.col_replacement'))}">${escapeHtml(r.voiceId)}</td>
+          <td data-label="${escapeAttr(I18n.t('rules.col_priority'))}">${r.priority}</td>
           <td style="text-align:right; white-space:nowrap;">
             <tf-button variant="secondary" size="sm" icon="play" data-play="${escapeHtml(r.voiceId)}" title="${escapeHtml(I18n.t('rules.play_title'))}"></tf-button>
             <tf-button variant="danger" size="sm" icon="trash" data-rm="${escapeHtml(r.id)}" title="${escapeHtml(I18n.t('rules.delete_title'))}"></tf-button>
@@ -150,9 +150,9 @@ async function loadPii(host) {
           <th>${escapeHtml(I18n.t('rules.col_action'))}</th>
         </tr></thead>
         <tbody>${rules.map((r) => `<tr>
-          <td><tf-chip status="accent">${escapeHtml(r.kind)}</tf-chip></td>
-          <td><code>${escapeHtml(r.regex)}</code></td>
-          <td>${escapeHtml(r.action)}</td>
+          <td data-label="${escapeAttr(I18n.t('rules.col_category'))}"><tf-chip status="accent">${escapeHtml(r.kind)}</tf-chip></td>
+          <td data-label="${escapeAttr(I18n.t('rules.col_regex'))}"><code>${escapeHtml(r.regex)}</code></td>
+          <td data-label="${escapeAttr(I18n.t('rules.col_action'))}">${escapeHtml(r.action)}</td>
         </tr>`).join('')}</tbody>
       </table>`;
 }
@@ -168,9 +168,9 @@ async function loadFastPath(host) {
           <th>${escapeHtml(I18n.t('rules.col_priority'))}</th>
         </tr></thead>
         <tbody>${patterns.map((p) => `<tr>
-          <td><code>${escapeHtml(p.pattern)}</code></td>
-          <td><pre style="margin: 0; max-width: 400px; overflow-x: auto;">${escapeHtml(p.response)}</pre></td>
-          <td>${p.priority}</td>
+          <td data-label="${escapeAttr(I18n.t('rules.col_pattern'))}"><code>${escapeHtml(p.pattern)}</code></td>
+          <td data-label="${escapeAttr(I18n.t('rules.col_response'))}"><pre style="margin: 0; max-width: 400px; overflow-x: auto;">${escapeHtml(p.response)}</pre></td>
+          <td data-label="${escapeAttr(I18n.t('rules.col_priority'))}">${p.priority}</td>
         </tr>`).join('')}</tbody>
       </table>`;
 }
