@@ -19,10 +19,12 @@
 // The download base comes from the manifest (mesh-propagated), so pointing the
 // install at a different release server is a manifest edit, not a code change.
 
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 
+use crate::api::model_bundle::validate_file_name;
 use crate::paths::vision_models_dir;
 use crate::services::deploy::LogSink;
 use crate::services::model_download::{download_with_progress, ProgressFn};
@@ -311,6 +313,163 @@ pub async fn ensure_bundle(
 /// hundred entries, so anything past this is a misdirected URL, not a bundle.
 const MANIFEST_BODY_LIMIT: u64 = 4 * 1024 * 1024;
 
+/// Cumulative hard ceiling across every file pulled in one bundle/import. Real
+/// bundles are a handful of files topping out near ~126 MB each; 2 GiB is far
+/// past any legitimate deploy and bounds a hostile manifest declaring giant
+/// (or size-less) files from filling the disk.
+const TOTAL_IMPORT_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Setting key: when truthy, model-bundle pulls may reach loopback/private/
+/// link-local hosts. Absent/false → deny (the safe default).
+const ALLOW_PRIVATE_HOSTS_SETTING: &str = "vision_bundle_allow_private_hosts";
+
+/// Whether the admin opted into pulling from private/LAN hosts. Deploy-time
+/// only, read from the global settings row.
+fn allow_private_bundle_hosts() -> bool {
+    crate::db::global_pool()
+        .and_then(|pool| {
+            crate::db::repository::get_setting(&pool, ALLOW_PRIVATE_HOSTS_SETTING)
+                .ok()
+                .flatten()
+        })
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
+/// Resolve `base`'s host to socket addresses and reject non-public IPs unless
+/// the admin opted in. Returns the vetted addresses so the HTTP client can be
+/// PINNED to them, closing the DNS-rebind window between this check and connect.
+///
+/// Trust model: this is an admin/PowerUser deploy-time feature with an
+/// explicitly pasted URL — the admin chose the host. We still default-deny
+/// loopback/private/link-local so a hostile manifest host (or a rebinding DNS
+/// record) cannot steer the Bearer key at an internal service without an
+/// explicit `vision_bundle_allow_private_hosts` opt-in (e.g. intra-LAN
+/// instance-to-instance pulls). Reuses the web-research SSRF IP classifier.
+fn vet_bundle_host(base: &reqwest::Url) -> Result<Vec<SocketAddr>> {
+    let host = base
+        .host_str()
+        .ok_or_else(|| anyhow!("bundle URL has no host"))?;
+    let port = base
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("bundle URL has no port"))?;
+    let addrs: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| anyhow!("resolve bundle host: {}", e))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(anyhow!("bundle host resolved to no addresses"));
+    }
+    if !allow_private_bundle_hosts()
+        && addrs
+            .iter()
+            .any(|a| !crate::web_research::security::is_public_ip(a.ip()))
+    {
+        return Err(anyhow!(
+            "bundle host resolves to a private/loopback address; set \
+             '{}' = true to allow intra-LAN instance pulls",
+            ALLOW_PRIVATE_HOSTS_SETTING
+        ));
+    }
+    Ok(addrs)
+}
+
+/// Resolve the on-disk destination for a manifest entry `name` and assert it
+/// stays directly inside `vision_models_dir()`. `validate_file_name` already
+/// rejects separators and `..`, so `name` cannot traverse — this canonicalizes
+/// the parent and compares it to the models dir anyway, matching the
+/// O_NOFOLLOW/containment posture of the `/models/file` endpoint (defense in
+/// depth against a future allowlist gap).
+fn contained_model_dest(dir: &Path, name: &str) -> Result<PathBuf> {
+    let dest = dir.join(name);
+    let parent = dest
+        .parent()
+        .ok_or_else(|| anyhow!("destination '{}' has no parent", name))?;
+    let canon_parent = std::fs::canonicalize(parent)
+        .map_err(|e| anyhow!("canonicalize destination parent for '{}': {}", name, e))?;
+    let canon_dir = std::fs::canonicalize(dir)
+        .map_err(|e| anyhow!("canonicalize vision models dir: {}", e))?;
+    if canon_parent != canon_dir {
+        return Err(anyhow!(
+            "destination '{}' escapes the vision models directory",
+            name
+        ));
+    }
+    Ok(dest)
+}
+
+/// Per-file byte ceiling enforced during a streaming download. The declared
+/// manifest `size` (when > 0) is the primary gate; a size-less entry falls back
+/// to the remaining cumulative budget. Either way the file may not push the
+/// running import total past `TOTAL_IMPORT_LIMIT`.
+fn per_file_ceiling(declared_size: u64, cumulative: u64) -> std::result::Result<u64, String> {
+    let remaining = TOTAL_IMPORT_LIMIT.checked_sub(cumulative).ok_or_else(|| {
+        format!(
+            "cumulative import exceeded {} bytes",
+            TOTAL_IMPORT_LIMIT
+        )
+    })?;
+    if remaining == 0 {
+        return Err(format!(
+            "cumulative import reached {} bytes",
+            TOTAL_IMPORT_LIMIT
+        ));
+    }
+    if declared_size > remaining {
+        return Err(format!(
+            "declared size {} would exceed the {} byte import ceiling",
+            declared_size, TOTAL_IMPORT_LIMIT
+        ));
+    }
+    Ok(if declared_size > 0 {
+        declared_size
+    } else {
+        remaining
+    })
+}
+
+/// Read a manifest response body with a hard cap. Content-Length MUST be
+/// present and within the cap, and the body is streamed with a running counter
+/// so a lying (or absent-then-huge) body is aborted before it is buffered.
+async fn read_capped_manifest_body(response: reqwest::Response) -> Result<Vec<u8>> {
+    match response.content_length() {
+        Some(len) if len <= MANIFEST_BODY_LIMIT => {}
+        Some(_) => {
+            return Err(anyhow!(
+                "bundle manifest larger than {} bytes",
+                MANIFEST_BODY_LIMIT
+            ))
+        }
+        None => {
+            return Err(anyhow!(
+                "bundle manifest has no Content-Length — refusing to buffer an unbounded body"
+            ))
+        }
+    }
+    use futures::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = chunk_res.map_err(|e| {
+            anyhow!(
+                "read bundle manifest body: {}",
+                redact_query_strings(&e.to_string())
+            )
+        })?;
+        if body.len() as u64 + chunk.len() as u64 > MANIFEST_BODY_LIMIT {
+            return Err(anyhow!(
+                "bundle manifest exceeded {} bytes mid-stream",
+                MANIFEST_BODY_LIMIT
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Drop `?<query>` fragments from an error message so signed-URL tokens never
 /// land in deploy logs. Everything from a `?` to the next whitespace/quote is
 /// replaced with `?<redacted>`.
@@ -359,17 +518,12 @@ async fn download_from_bundle_manifest(
     // third-party host via a hostile manifest.
     let bearer = api_key.map(str::trim).filter(|k| !k.is_empty());
 
-    // Policy::none — the manifest is a signed same-origin contract; following
-    // a redirect would let a compromised serving node bounce the pull to an
-    // arbitrary (possibly internal) destination. Matches the addon
+    // Policy::none + DNS-pinned to the vetted host: the manifest is a signed
+    // same-origin contract; following a redirect or a rebound DNS record would
+    // let a compromised serving node bounce the pull (with its Bearer key) to
+    // an arbitrary (possibly internal) destination. Matches the addon
     // `http.request` posture.
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(600))
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .user_agent(concat!("tentaflow/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| anyhow!("build HTTP client: {}", e))?;
+    let client = bundle_http_client(&base)?;
 
     if let Some(s) = log_sink {
         s.phase("downloading-vision", "Fetching model bundle manifest");
@@ -397,18 +551,7 @@ async fn download_from_bundle_manifest(
             redact_query_strings(&e.to_string())
         )
     })?;
-    if response.content_length().unwrap_or(0) > MANIFEST_BODY_LIMIT {
-        return Err(anyhow!("bundle manifest larger than {} bytes", MANIFEST_BODY_LIMIT));
-    }
-    let body = response.bytes().await.map_err(|e| {
-        anyhow!(
-            "read bundle manifest body: {}",
-            redact_query_strings(&e.to_string())
-        )
-    })?;
-    if body.len() as u64 > MANIFEST_BODY_LIMIT {
-        return Err(anyhow!("bundle manifest larger than {} bytes", MANIFEST_BODY_LIMIT));
-    }
+    let body = read_capped_manifest_body(response).await?;
     let manifest: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| anyhow!("parse bundle manifest JSON: {}", e))?;
     let entries = manifest
@@ -417,6 +560,7 @@ async fn download_from_bundle_manifest(
         .ok_or_else(|| anyhow!("bundle manifest has no 'files' array"))?;
 
     let dir = vision_models_dir();
+    let mut cumulative: u64 = 0;
     for name in needed {
         let entry = entries
             .iter()
@@ -439,10 +583,13 @@ async fn download_from_bundle_manifest(
             .map(str::to_ascii_lowercase)
             .filter(|h| h.len() == 64)
             .ok_or_else(|| anyhow!("manifest entry '{}' has no valid sha256", name))?;
+        let declared_size = entry.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
         let file_url = resolve_manifest_file_url(&base, rel_url)
             .map_err(|why| anyhow!("manifest entry '{}': {}", name, why))?;
+        let max_bytes = per_file_ceiling(declared_size, cumulative)
+            .map_err(|why| anyhow!("manifest entry '{}': {}", name, why))?;
 
-        let dest = dir.join(name);
+        let dest = contained_model_dest(&dir, name)?;
         // Verify files already on disk against the manifest hash — a stale or
         // corrupted local copy is deleted and re-downloaded.
         if file_ok(&dest) {
@@ -468,7 +615,10 @@ async fn download_from_bundle_manifest(
         let progress: Option<ProgressFn> = log_sink
             .cloned()
             .map(|sink| progress_for_sink(sink, name.to_string()));
-        download_signed_file(&client, file_url, bearer, &dest, name, progress).await?;
+        let written =
+            download_signed_file(&client, file_url, bearer, &dest, name, max_bytes, progress)
+                .await?;
+        cumulative += written;
 
         let actual_sha = crate::api::model_bundle::sha256_file_hex(&dest)
             .await
@@ -522,14 +672,19 @@ fn resolve_manifest_file_url(
 /// `error_for_status` treats it as success) and error messages must have the
 /// token-bearing query string redacted. Writes to `<dest>.partial` and
 /// renames atomically, mirroring the shared downloader.
+///
+/// `max_bytes` is a hard streaming ceiling: if the body pushes past it the
+/// partial file is deleted and the download fails, so a hostile server cannot
+/// stream an unbounded body. Returns the number of bytes written.
 async fn download_signed_file(
     client: &reqwest::Client,
     url: reqwest::Url,
     bearer: Option<&str>,
     dest: &Path,
     label: &str,
+    max_bytes: u64,
     progress: Option<ProgressFn>,
-) -> Result<()> {
+) -> Result<u64> {
     use std::io::Write;
 
     let mut request = client.get(url);
@@ -555,6 +710,14 @@ async fn download_signed_file(
         )
     })?;
 
+    // A lying Content-Length past the ceiling is rejected before writing a byte.
+    if response.content_length().unwrap_or(0) > max_bytes {
+        return Err(anyhow!(
+            "download {} exceeds the {} byte ceiling (Content-Length)",
+            label,
+            max_bytes
+        ));
+    }
     let total = response.content_length().unwrap_or(0);
     let partial = dest.with_extension(format!(
         "{}.partial",
@@ -572,9 +735,18 @@ async fn download_signed_file(
     while let Some(chunk_res) = stream.next().await {
         let chunk = chunk_res
             .map_err(|e| anyhow!("stream {}: {}", label, redact_query_strings(&e.to_string())))?;
+        downloaded += chunk.len() as u64;
+        if downloaded > max_bytes {
+            drop(file);
+            let _ = std::fs::remove_file(&partial);
+            return Err(anyhow!(
+                "download {} exceeded the {} byte ceiling mid-stream — partial deleted",
+                label,
+                max_bytes
+            ));
+        }
         file.write_all(&chunk)
             .map_err(|e| anyhow!("write {}: {}", partial.display(), e))?;
-        downloaded += chunk.len() as u64;
         if downloaded - last_progress_bytes >= PROGRESS_INTERVAL_BYTES {
             if let Some(ref cb) = progress {
                 cb(downloaded, total, label);
@@ -591,22 +763,29 @@ async fn download_signed_file(
     if let Some(ref cb) = progress {
         cb(downloaded, downloaded, label);
     }
-    Ok(())
+    Ok(downloaded)
 }
 
 // -----------------------------------------------------------------------------
 // Custom import (unpaired instance → remote /models/manifest with API key)
 // -----------------------------------------------------------------------------
 
-/// No-redirect, timeout-bounded HTTP client shared by every model-bundle pull.
-/// `Policy::none` is mandatory: a compromised serving node must not be able to
-/// bounce the pull (with its Bearer key) to an arbitrary destination.
-fn bundle_http_client() -> Result<reqwest::Client> {
+/// No-redirect, timeout-bounded HTTP client shared by every model-bundle pull,
+/// DNS-pinned to `base`'s vetted host addresses. `Policy::none` is mandatory: a
+/// compromised serving node must not be able to bounce the pull (with its
+/// Bearer key) to an arbitrary destination. Pinning the resolved address closes
+/// the DNS-rebind window between the SSRF check and connect.
+fn bundle_http_client(base: &reqwest::Url) -> Result<reqwest::Client> {
+    let host = base
+        .host_str()
+        .ok_or_else(|| anyhow!("bundle URL has no host"))?;
+    let addrs = vet_bundle_host(base)?;
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(600))
         .connect_timeout(std::time::Duration::from_secs(30))
         .user_agent(concat!("tentaflow/", env!("CARGO_PKG_VERSION")))
+        .resolve_to_addrs(host, &addrs)
         .build()
         .map_err(|e| anyhow!("build HTTP client: {}", e))
 }
@@ -631,7 +810,7 @@ pub async fn fetch_custom_manifest_json(
         return Err(anyhow!("URL manifestu musi używać https"));
     }
     let bearer = api_key.trim();
-    let client = bundle_http_client()?;
+    let client = bundle_http_client(&base)?;
     let mut request = client.get(base.clone());
     if !bearer.is_empty() {
         request = request.header(reqwest::header::AUTHORIZATION, format!("Bearer {}", bearer));
@@ -649,16 +828,7 @@ pub async fn fetch_custom_manifest_json(
     let response = response
         .error_for_status()
         .map_err(|e| anyhow!("błąd HTTP manifestu: {}", redact_query_strings(&e.to_string())))?;
-    if response.content_length().unwrap_or(0) > MANIFEST_BODY_LIMIT {
-        return Err(anyhow!("manifest większy niż {} bajtów", MANIFEST_BODY_LIMIT));
-    }
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| anyhow!("odczyt manifestu: {}", redact_query_strings(&e.to_string())))?;
-    if body.len() as u64 > MANIFEST_BODY_LIMIT {
-        return Err(anyhow!("manifest większy niż {} bajtów", MANIFEST_BODY_LIMIT));
-    }
+    let body = read_capped_manifest_body(response).await?;
     serde_json::from_slice(&body).map_err(|e| anyhow!("parsowanie JSON manifestu: {}", e))
 }
 
@@ -723,6 +893,26 @@ pub async fn import_custom_model(
     let output_contract = field("output_contract")?;
     let default_threshold = model.get("default_threshold").and_then(|v| v.as_f64());
 
+    // The `files[].name` fields come from an UNTRUSTED remote manifest and are
+    // written to disk BEFORE the registry validates `file_name`, and a hostile
+    // server can match any sha256 — so containment must not lean on the hash.
+    // Gate every entry against the shared server-side allowlist AND the exact
+    // expected set: the model's own `file_name` plus its one allowed ONNX
+    // external-data sidecar (`<file_name>.data`, mirroring the `/models/file`
+    // resolver). Anything else is refused before a byte is downloaded.
+    if !validate_file_name(&file_name) {
+        return Err(anyhow!(
+            "metadane modelu: nazwa pliku '{}' odrzucona przez allowlistę",
+            file_name
+        ));
+    }
+    let sidecar = format!("{}.data", file_name);
+    let expected_names: Vec<&str> = if validate_file_name(&sidecar) {
+        vec![file_name.as_str(), sidecar.as_str()]
+    } else {
+        vec![file_name.as_str()]
+    };
+
     let entries = manifest
         .get("files")
         .and_then(|f| f.as_array())
@@ -730,7 +920,7 @@ pub async fn import_custom_model(
 
     let bearer = api_key.trim();
     let bearer_opt = (!bearer.is_empty()).then_some(bearer);
-    let client = bundle_http_client()?;
+    let client = bundle_http_client(&base)?;
     let dir = vision_models_dir();
     std::fs::create_dir_all(&dir).map_err(|e| anyhow!("create {}: {}", dir.display(), e))?;
 
@@ -741,11 +931,26 @@ pub async fn import_custom_model(
         }
     };
 
+    let mut cumulative: u64 = 0;
     for entry in entries {
         let name = entry.get("name").and_then(|n| n.as_str()).unwrap_or_default();
         if name.is_empty() {
             cleanup(&written_files);
             return Err(anyhow!("wpis manifestu bez nazwy pliku"));
+        }
+        // Fail-closed containment: allowlist first, then the exact expected set.
+        if !validate_file_name(name) {
+            cleanup(&written_files);
+            return Err(anyhow!("nazwa pliku '{}' odrzucona przez allowlistę", name));
+        }
+        if !expected_names.iter().any(|n| *n == name) {
+            cleanup(&written_files);
+            return Err(anyhow!(
+                "wpis '{}' nie należy do modelu '{}' (dozwolone: {:?})",
+                name,
+                model_name,
+                expected_names
+            ));
         }
         let expected_sha = entry
             .get("sha256")
@@ -756,6 +961,7 @@ pub async fn import_custom_model(
                 cleanup(&written_files);
                 anyhow!("wpis '{}' bez poprawnego sha256", name)
             })?;
+        let declared_size = entry.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
         let rel_url = entry.get("url").and_then(|u| u.as_str()).ok_or_else(|| {
             cleanup(&written_files);
             anyhow!("wpis '{}' bez url", name)
@@ -764,18 +970,34 @@ pub async fn import_custom_model(
             cleanup(&written_files);
             anyhow!("wpis '{}': {}", name, why)
         })?;
-        let dest = dir.join(name);
+        let max_bytes = match per_file_ceiling(declared_size, cumulative) {
+            Ok(v) => v,
+            Err(why) => {
+                cleanup(&written_files);
+                return Err(anyhow!("wpis '{}': {}", name, why));
+            }
+        };
+        let dest = match contained_model_dest(&dir, name) {
+            Ok(d) => d,
+            Err(e) => {
+                cleanup(&written_files);
+                return Err(e);
+            }
+        };
         if let Some(s) = log_sink {
             s.phase("downloading-vision", &format!("Pobieram {}", name));
         }
         let progress: Option<ProgressFn> = log_sink
             .cloned()
             .map(|sink| progress_for_sink(sink, name.to_string()));
-        if let Err(e) =
-            download_signed_file(&client, file_url, bearer_opt, &dest, name, progress).await
+        match download_signed_file(&client, file_url, bearer_opt, &dest, name, max_bytes, progress)
+            .await
         {
-            cleanup(&written_files);
-            return Err(e);
+            Ok(written) => cumulative += written,
+            Err(e) => {
+                cleanup(&written_files);
+                return Err(e);
+            }
         }
         written_files.push(dest.clone());
         let actual_sha = crate::api::model_bundle::sha256_file_hex(&dest)
@@ -852,5 +1074,62 @@ mod tests {
     fn redact_query_strings_handles_url_at_end() {
         let out = redact_query_strings("GET https://h/x?token=SECRET");
         assert_eq!(out, "GET https://h/x?<redacted>");
+    }
+
+    #[test]
+    fn manifest_entry_name_allowlist_rejects_traversal() {
+        // The import loop gates every UNTRUSTED remote manifest entry name
+        // through this shared allowlist BEFORE any download, so a `../x`
+        // traversal entry never reaches the filesystem.
+        assert!(!validate_file_name("../x"));
+        assert!(!validate_file_name("../../etc/passwd"));
+        assert!(!validate_file_name("sub/dir.onnx"));
+        assert!(!validate_file_name(".hidden.onnx"));
+        assert!(validate_file_name("model.onnx"));
+        assert!(validate_file_name("model.onnx.data"));
+    }
+
+    #[test]
+    fn contained_model_dest_rejects_traversal() {
+        let tmp = std::env::temp_dir().join(format!("tf-cv-contain-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // A plain allowlisted name resolves inside the dir.
+        let dest = contained_model_dest(&tmp, "model.onnx").expect("plain name contained");
+        assert_eq!(dest.file_name().and_then(|s| s.to_str()), Some("model.onnx"));
+        // A traversal name escapes the dir and is rejected.
+        assert!(contained_model_dest(&tmp, "../evil.onnx").is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn vet_bundle_host_rejects_private_ip_literals() {
+        // IP literals resolve without touching real DNS; the default (no global
+        // pool → opt-out false) must reject loopback/private targets.
+        for host in ["127.0.0.1", "10.1.2.3", "192.168.0.5", "169.254.169.254"] {
+            let url =
+                reqwest::Url::parse(&format!("https://{host}:8090/models/manifest/x")).unwrap();
+            assert!(
+                vet_bundle_host(&url).is_err(),
+                "private host {host} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn vet_bundle_host_accepts_public_ip_literal() {
+        let url = reqwest::Url::parse("https://93.184.216.34:443/models/manifest/x").unwrap();
+        assert!(vet_bundle_host(&url).is_ok());
+    }
+
+    #[test]
+    fn per_file_ceiling_enforces_declared_and_total() {
+        // Declared size is the ceiling when present.
+        assert_eq!(per_file_ceiling(100, 0).unwrap(), 100);
+        // A size-less entry falls back to the remaining budget.
+        assert_eq!(per_file_ceiling(0, 0).unwrap(), TOTAL_IMPORT_LIMIT);
+        // Declared size past the remaining budget is rejected.
+        assert!(per_file_ceiling(TOTAL_IMPORT_LIMIT + 1, 0).is_err());
+        // A full cumulative budget rejects the next file.
+        assert!(per_file_ceiling(1, TOTAL_IMPORT_LIMIT).is_err());
     }
 }

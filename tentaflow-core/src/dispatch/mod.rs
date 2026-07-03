@@ -324,6 +324,18 @@ fn is_sensitive_variant(body: &MessageBody) -> bool {
     ) {
         return true;
     }
+    // VisionImportBody fetch/import requests carry a plaintext `api_key` used to
+    // pull a model bundle from an unpaired instance. With `TENTAFLOW_TRACE_WSS=1`
+    // an attacker reading trace logs could lift the key.
+    if matches!(
+        body,
+        MessageBody::VisionImportBody(
+            tentaflow_protocol::VisionImportPayload::FetchManifestRequest(_)
+                | tentaflow_protocol::VisionImportPayload::ImportRequest(_)
+        )
+    ) {
+        return true;
+    }
     // LegalAdminBody:GenerateResponse carries a fully-formed signed download
     // URL whose query string includes a live HMAC token. With
     // `TENTAFLOW_TRACE_WSS=1` an attacker reading trace logs could lift the
