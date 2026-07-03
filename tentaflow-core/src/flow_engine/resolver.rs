@@ -29,6 +29,22 @@ pub fn resolve_flow(
     service_type: &str,
     request_modality: &str,
 ) -> Result<Option<DbFlow>> {
+    // Highest priority: the model name IS a flow's published name (flow-as-model).
+    // A client requesting a published flow by its exact name must run THAT flow,
+    // not fall through to a `flow_model_bindings` pattern or the default flow.
+    // Without this a published flow was only reachable via the default-for-
+    // service-type flow's llm node, which then tried to resolve the flow name as
+    // a model (→ unimplemented Flow-target stream, `flow_stream` cutover).
+    if let Some(flow) = repository::get_flow_by_published_model_name(pool, model_name)? {
+        debug!(
+            model = model_name,
+            flow_id = flow.id,
+            flow_name = %flow.name,
+            "Resolved flow via published_model_name (flow-as-model)"
+        );
+        return Ok(Some(flow));
+    }
+
     if let Some(flow) = repository::get_flow_for_model(pool, model_name)? {
         debug!(
             model = model_name,

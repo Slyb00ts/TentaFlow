@@ -211,6 +211,20 @@ async fn run_server(args: Args) -> Result<()> {
         config.token_metrics.enabled,
     );
 
+    // AI audit persistence: async by default (writes off the request hot path,
+    // ~2 ms/request saved + no SQLite-writer-mutex serialisation under load).
+    // Opt into synchronous (compliance-strict: prompt persisted BEFORE dispatch,
+    // survives a crash) with `TENTAFLOW_AI_AUDIT_SYNC=1`.
+    let audit_sync = std::env::var("TENTAFLOW_AI_AUDIT_SYNC")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    tentaflow_core::compliance::audit_worker::set_audit_async(!audit_sync);
+    tentaflow_core::compliance::audit_worker::init_audit_worker();
+    info!(
+        "AI audit mode: {}",
+        if audit_sync { "sync" } else { "async" }
+    );
+
     // Inicjalizacja bazy danych
     info!("Inicjalizacja bazy danych: {:?}", db_path);
     let db = db::init(&db_path).map_err(|e| {

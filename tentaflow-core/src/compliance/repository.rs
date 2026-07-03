@@ -416,7 +416,11 @@ pub fn resolve_retention_policy(
     Ok(policy)
 }
 
-pub fn start_ai_event(conn: &Connection, event: &NewAiEvent<'_>) -> Result<String> {
+pub fn start_ai_event(
+    conn: &Connection,
+    event_id: &str,
+    event: &NewAiEvent<'_>,
+) -> Result<()> {
     let retention =
         resolve_retention_policy(conn, event.org_id, RetentionScopeKind::AiAudit, None)?;
     if let Some(legal_basis_id) = event.legal_basis_id {
@@ -436,7 +440,6 @@ pub fn start_ai_event(conn: &Connection, event: &NewAiEvent<'_>) -> Result<Strin
             ));
         }
     }
-    let event_id = Uuid::new_v4().to_string();
     let started_at = now_utc();
     let affected = conn.execute(
         "INSERT INTO compliance_ai_events \
@@ -471,7 +474,7 @@ pub fn start_ai_event(conn: &Connection, event: &NewAiEvent<'_>) -> Result<Strin
             "compliance_ai_events insert affected {affected} rows"
         ));
     }
-    Ok(event_id)
+    Ok(())
 }
 
 pub fn get_ai_event(conn: &Connection, event_id: &str) -> Result<Option<ComplianceAiEvent>> {
@@ -835,8 +838,10 @@ mod tests {
     #[test]
     fn ai_event_zapisuje_payloady_i_hash() {
         let conn = db();
-        let event_id = start_ai_event(
+        let event_id = Uuid::new_v4().to_string();
+        start_ai_event(
             &conn,
+            &event_id,
             &NewAiEvent {
                 org_id: crate::services::org::DEFAULT_ORG_ID,
                 user_id: None,
