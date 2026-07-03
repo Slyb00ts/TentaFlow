@@ -1323,6 +1323,11 @@ impl DeployStrategy for DockerDeploy {
         for (k, v) in param_app.env {
             env.insert(k, v);
         }
+        // DGX Spark: Marlin NVFP4 GEMM (CUTLASS fp4 pada na sm_121). No-op dla
+        // nie-fp4, wiec bezwarunkowo dla vllm-spark. Single-node docker.
+        for (k, v) in super::spark_engine_env(&self.manifest.engine.id) {
+            env.insert(k, v);
+        }
         env.insert("PORT".into(), internal_port.to_string());
         // Distributed: VLLM_PORT is the torch.distributed TCPStore master port and
         // MUST differ from the serve API port — the manifest default (8000) is never
@@ -1447,16 +1452,11 @@ impl DeployStrategy for DockerDeploy {
                     s.info(&format!("[docker] gpu_memory_utilization={:.2}", ratio));
                 }
             }
-            if self.manifest.engine.id == "vllm-spark" {
-                // Spark wymaga wylaczenia flashinfer autotune; dedup last-wins
-                // skasuje ewentualny `--enable-...` z user args.
-                engine_args.push("--no-enable-flashinfer-autotune".to_string());
-                // GB10 ma pamiec ZUNIFIKOWANA (GPU == RAM). torch.compile + CUDA
-                // graphs alokuja pamiec POZA budzetem `--gpu-memory-utilization`,
-                // wiec 0.6 puchnie do ~100% calego poola. `--enforce-eager`
-                // wylacza compile/cudagraphs → vLLM trzyma sie budzetu.
-                engine_args.push("--enforce-eager".to_string());
-            }
+            // DGX Spark (sm_121a): eager + no-flashinfer-autotune. GB10 ma pamiec
+            // ZUNIFIKOWANA — compile/CUDA-graphs alokuja poza budzetem
+            // `--gpu-memory-utilization` i puchna do ~100% poola; eager tego unika.
+            // Jedno zrodlo prawdy z native/cluster (super::spark_engine_args).
+            engine_args.extend(super::spark_engine_args(&self.manifest.engine.id));
         }
         // Dedup last-wins (extra/user args wygrywaja nad bundle/manifest base).
         // entrypoint.sh dorzuca tylko AUTO_PARALLEL gdy brak TP/PP w tych argach.

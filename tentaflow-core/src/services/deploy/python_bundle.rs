@@ -304,6 +304,13 @@ impl DeployStrategy for PythonBundleDeploy {
             extra_args.extend(ct);
         }
 
+        // DGX Spark (vllm-spark, sm_121a): eager + Marlin dla NVFP4. Bezwarunkowo
+        // dla tego silnika (env marlin no-op dla nie-fp4). Single-node native.
+        extra_args.extend(super::spark_engine_args(&engine_id));
+        for (k, v) in super::spark_engine_env(&engine_id) {
+            env.insert(k, v);
+        }
+
         // gpu_memory_utilization jest pojeciem specyficznym dla vllm. Inne
         // python-bundle silniki (qwen-asr, parakeet, xtts itd.) odpalaja przez
         // uvicorn / wlasny entrypoint ktore nie znaja `--gpu-memory-utilization`,

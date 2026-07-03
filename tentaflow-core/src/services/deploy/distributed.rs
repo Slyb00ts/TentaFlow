@@ -99,8 +99,11 @@ pub fn build_serve_command(spec: &DistributedDeploySpec) -> Result<String, Strin
         util = spec.gpu_memory_utilization,
         maxlen = spec.max_model_len,
     );
-    if spec.engine_id == "vllm-spark" {
-        serve.push_str(" --enforce-eager --no-enable-flashinfer-autotune");
+    // DGX Spark: eager + no-flashinfer-autotune (sm_121). Jedno zrodlo prawdy z
+    // single-node (super::spark_engine_args) — cluster nie-Spark nic nie dostaje.
+    for a in super::spark_engine_args(&spec.engine_id) {
+        serve.push(' ');
+        serve.push_str(&a);
     }
     for tok in user_vllm_arg_tokens(spec)? {
         serve.push(' ');
@@ -600,6 +603,11 @@ pub fn build_member_config_json(spec: &DistributedDeploySpec) -> Result<String, 
         .unwrap_or_default();
     for (k, v) in nccl_env(spec) {
         env.insert(k, v);
+    }
+    // DGX Spark: Marlin NVFP4 GEMM na kazdym czlonku klastra (head + workery).
+    // No-op dla nie-fp4; cluster nie-Spark (engine != vllm-spark) nic nie dostaje.
+    for (k, v) in super::spark_engine_env(&spec.engine_id) {
+        env.insert(k, Value::String(v));
     }
     cfg.insert("engine_env".into(), Value::Object(env));
 

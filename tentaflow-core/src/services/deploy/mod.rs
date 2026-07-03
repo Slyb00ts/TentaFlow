@@ -1656,6 +1656,38 @@ pub(crate) fn apply_engine_env(user_config: &serde_json::Value, env: &mut HashMa
 /// the AMD/ROCm equivalents). Without this the engine grabs card 0 / all cards
 /// regardless of the wizard's GPU selection. Runs AFTER `apply_engine_env`, so an
 /// explicit `engine_env.CUDA_VISIBLE_DEVICES` wins — we only fill the gap.
+/// Argi CLI wymagane dla KAZDEGO deployu `vllm-spark` (GB10, sm_121a). Sm_121
+/// nie ma instrukcji `tcgen05`, wiec torch.compile + CUDA-graph capture bywa
+/// niestabilne, a autotune FlashInfer sie sypie. `--enforce-eager` jest escape-
+/// hatchem (dziala wolniej, ale stabilnie) i oszczedza 13-20 GB na unified memory
+/// Sparka. Puste dla innych silnikow — cluster nie-Spark ich NIE dostaje.
+/// Jedno zrodlo prawdy dla single (docker/native) i cluster (distributed).
+pub(crate) fn spark_engine_args(engine_id: &str) -> Vec<String> {
+    if engine_id == "vllm-spark" {
+        vec![
+            "--enforce-eager".to_string(),
+            "--no-enable-flashinfer-autotune".to_string(),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Env wymagane dla `vllm-spark`: natywny CUTLASS fp4 generuje na sm_121 PTX
+/// ktory pada (brak tcgen05), wiec NVFP4 musi isc przez Marlin (dequant fp4→fp16).
+/// Te zmienne sa NO-OP dla modeli nie-fp4 (konsultowane tylko na sciezce nvfp4),
+/// wiec ustawiamy je bezwarunkowo dla kazdego Sparka — bez plumbingu kwantyzacji.
+pub(crate) fn spark_engine_env(engine_id: &str) -> Vec<(String, String)> {
+    if engine_id == "vllm-spark" {
+        vec![
+            ("VLLM_NVFP4_GEMM_BACKEND".to_string(), "marlin".to_string()),
+            ("VLLM_USE_FLASHINFER_MOE_FP4".to_string(), "0".to_string()),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
 pub(crate) fn apply_gpu_selection_env(
     user_config: &serde_json::Value,
     env: &mut HashMap<String, String>,
