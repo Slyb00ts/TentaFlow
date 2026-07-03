@@ -4191,6 +4191,14 @@
     "log_manual_retry": "Manual reconnect — trying now",
     "log_restored": "Connection restored"
   },
+  "update": {
+    "title": "New app version",
+    "desc": "The server was updated. Reload to load the latest version.",
+    "title_required": "Update required",
+    "desc_required": "The frontend is out of sync with the server. Reload to continue.",
+    "reload": "Reload",
+    "later": "Later"
+  },
   "system_events": {
     "service_connected": "Service {name} ({type}) back online",
     "service_disconnected": "Service {name} ({type}) disconnected",

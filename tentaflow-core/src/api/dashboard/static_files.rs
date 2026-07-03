@@ -9,6 +9,12 @@
 // Nazwa pliku pozostala historyczna po usunieciu wwwroot/.
 include!(concat!(env!("OUT_DIR"), "/wwwroot_embed.rs"));
 
+// Wygenerowany przez build.rs — zbiorczy SHA-256 calego frontu. Serwer wysyla go
+// w MetaSchemaVersionAck; front porownuje z wlasnym (zbakowanym w
+// asset-manifest.js) i przy roznicy proponuje reload (nieaktualny front po
+// aktualizacji backendu/addonu).
+include!(concat!(env!("OUT_DIR"), "/asset_build_hash.rs"));
+
 /// Content-type from a file extension, for the disk dev path (the embedded map
 /// carries its own types).
 fn disk_mime(path: &str) -> &'static str {

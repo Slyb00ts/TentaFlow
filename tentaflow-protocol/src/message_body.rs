@@ -6837,9 +6837,14 @@ pub enum MessageBody {
         client_version: u16,
     },
     /// Serwer -> klient: potwierdzenie (accepted=false => disconnect).
+    /// `asset_build_hash` to zbiorczy SHA-256 frontu serwera — front porownuje
+    /// z wlasnym przy KAZDYM (re)connect i przy roznicy proponuje reload
+    /// (nieaktualny front po aktualizacji backendu/addonu). Rozne od
+    /// `server_version`: hash lapie zmiany JS/CSS/panelu bez zmiany protokolu.
     MetaSchemaVersionAck {
         server_version: u16,
         accepted: bool,
+        asset_build_hash: String,
     },
     /// Dwukierunkowy keepalive (WSS ping substitute, liczy RTT).
     MetaHeartbeat {
@@ -7555,6 +7560,7 @@ mod tests {
         let body = MessageBody::MetaSchemaVersionAck {
             server_version: 2,
             accepted: true,
+            asset_build_hash: "abc123def456".to_string(),
         };
         assert_eq!(round_trip(body.clone()), body);
     }

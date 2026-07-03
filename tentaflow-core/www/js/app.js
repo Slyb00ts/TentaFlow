@@ -19,6 +19,7 @@ import { I18n, SUPPORTED_LANGS } from '/js/i18n.js';
 import '/js/components/index.js';
 import '/js/lib/block-zoom.js';
 import * as ConnectionOverlay from '/js/modules/connection-overlay.js';
+import * as UpdateBanner from '/js/modules/update-banner.js';
 import * as SystemEvents from '/js/modules/system-events.js';
 import { initTransport } from '/js/protocol/api-binary-shim.js';
 
@@ -198,6 +199,7 @@ async function bootstrap() {
   // Overlay init przed otwarciem WS — zeby wszystkie lifecycle events byly
   // przechwycone od pierwszej chwili.
   ConnectionOverlay.init();
+  UpdateBanner.init();
 
   // Otworz WS natychmiast (anonymous jesli brak JWT). Serwer akceptuje i
   // pozwala tylko na authLogin + schema + heartbeat przed zalogowaniem.
@@ -224,14 +226,12 @@ async function bootstrap() {
   // auto-submitem. Sesja uzytkownika musi byc zalogowana.
   handlePairDeepLink();
 
-  // Service Worker registration — offline cache shell + install prompt.
-  // Chrome odrzuca SW na self-signed HTTPS z SSL cert error. TentaFlow
-  // defaultowo generuje self-signed, wiec rejestrujemy tylko na zaufanych
-  // originach: localhost (zawsze secure) albo gdy cert jest zaufany w OS
-  // (wykrywamy heurystycznie przez brak 'file:' + localhost hostname).
-  const host = window.location.hostname;
-  const isLocalhost = host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
-  if ('serviceWorker' in navigator && window.location.protocol === 'https:' && isLocalhost) {
+  // Service Worker registration — precache calego frontu + offline shell.
+  // Wymaga secure context (https albo localhost). Chrome odrzuca SW na
+  // self-signed HTTPS z cert error — to jest zlapane w .catch (SW to tylko
+  // optymalizacja; wykrywanie nieaktualnego frontu i tak dziala przez handshake
+  // WS niezaleznie od SW). Na zaufanym certcie/localhost SW sie zarejestruje.
+  if ('serviceWorker' in navigator && window.isSecureContext) {
     navigator.serviceWorker.register('/sw.js').catch((e) => {
       console.debug('[app] SW register failed:', e?.message);
     });

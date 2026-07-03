@@ -5023,10 +5023,12 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::MetaSchemaVersionAck {
             server_version,
             accepted,
+            asset_build_hash,
         } => {
             set(&obj, "variant", "MetaSchemaVersionAck".into());
             set(&obj, "serverVersion", (server_version as u32).into());
             set(&obj, "accepted", accepted.into());
+            set(&obj, "assetBuildHash", asset_build_hash.as_str().into());
         }
         MessageBody::MetaHeartbeat { sent_at_epoch } => {
             set(&obj, "variant", "MetaHeartbeat".into());

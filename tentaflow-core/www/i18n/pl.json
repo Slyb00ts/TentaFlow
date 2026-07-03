@@ -4327,6 +4327,14 @@
     "log_manual_retry": "Ręczny reconnect — próba teraz",
     "log_restored": "Połączenie przywrócone"
   },
+  "update": {
+    "title": "Nowa wersja aplikacji",
+    "desc": "Serwer został zaktualizowany. Odśwież, aby załadować najnowszą wersję.",
+    "title_required": "Wymagana aktualizacja",
+    "desc_required": "Front jest niezgodny z serwerem. Odśwież, aby kontynuować.",
+    "reload": "Odśwież",
+    "later": "Później"
+  },
   "system_events": {
     "service_connected": "Serwis {name} ({type}) ponownie aktywny",
     "service_disconnected": "Serwis {name} ({type}) odłączony",

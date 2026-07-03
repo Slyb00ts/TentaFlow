@@ -146,7 +146,10 @@ mod serde_array64 {
 // `serde_bytes` (CBOR byte string) — a wire-format change for EVERY frame. A stale
 // peer would pass the version check yet misdecode every body, so the handshake must
 // reject mixed old/new.
-pub const SCHEMA_VERSION: u16 = 18;
+// v19: `MetaSchemaVersionAck` gained `asset_build_hash: String` (server front SHA-256)
+// so the client can detect a stale dashboard on every (re)connect and offer a reload.
+// The Ack wire shape changed, so old/new must not mix.
+pub const SCHEMA_VERSION: u16 = 19;
 
 // =============================================================================
 // Message kind discriminants
