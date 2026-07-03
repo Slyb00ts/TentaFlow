@@ -2595,6 +2595,7 @@
     "gpu_list_hint": "Verfügbare GPUs ({n})"
   },
   "category": {
+    "engines": "Engines",
     "llm": "Sprachmodelle (LLM)",
     "stt": "Spracherkennung (STT)",
     "tts": "Sprachsynthese (TTS)",

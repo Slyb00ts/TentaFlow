@@ -3837,6 +3837,7 @@
     }
   },
   "category": {
+    "engines": "Silniki",
     "llm": "Modele językowe (LLM)",
     "stt": "Rozpoznawanie mowy (STT)",
     "tts": "Synteza mowy (TTS)",

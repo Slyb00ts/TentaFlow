@@ -3701,6 +3701,7 @@
     }
   },
   "category": {
+    "engines": "Engines",
     "llm": "Language Models (LLM)",
     "stt": "Speech to Text (STT)",
     "tts": "Text to Speech (TTS)",
