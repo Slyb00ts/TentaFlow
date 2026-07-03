@@ -294,6 +294,16 @@ impl DeployStrategy for PythonBundleDeploy {
             extra_args.extend(spec_args);
         }
 
+        // Chat template gemma-4 (tool-calling) — absolutna sciezka do
+        // zbundlowanego szablonu; recepta vLLM podawala repo-relative
+        // `examples/...`, ktorego pip-owy vLLM nie ma. `.exists()` guard w
+        // helperze chroni deploy przed crashem gdy pliku brak.
+        if let Some(ct) = super::resolve_model_repo(&self.manifest, &self.user_config)
+            .and_then(|repo| super::vllm_native_chat_template_arg(&repo))
+        {
+            extra_args.extend(ct);
+        }
+
         // gpu_memory_utilization jest pojeciem specyficznym dla vllm. Inne
         // python-bundle silniki (qwen-asr, parakeet, xtts itd.) odpalaja przez
         // uvicorn / wlasny entrypoint ktore nie znaja `--gpu-memory-utilization`,

@@ -5020,14 +5020,18 @@ pub async fn deploy_vllm_recommend(
             if model_lc.contains("gemma-4")
                 && (quant_lc.contains("nvfp4") || quant_lc.contains("fp4"))
             {
+                // NIE wymuszamy `--chat-template examples/tool_chat_template_gemma4.jinja`:
+                // pip-owy vLLM (docker i native python-bundle) nie niesie katalogu
+                // `examples/`, wiec vLLM padal z "chat template ... doesn't exist".
+                // Tool-calling gemma-4 dziala z szablonem wbudowanym w tokenizer;
+                // parser + auto-tool-choice wystarczaja. Kto chce override szablonu,
+                // podaje absolutna sciezke recznie w extra-args.
                 let mut toks: Vec<String> = base.split_whitespace().map(String::from).collect();
                 toks.push("--max-model-len".into());
                 toks.push("auto".into());
                 toks.push("--enable-auto-tool-choice".into());
                 toks.push("--tool-call-parser".into());
                 toks.push("gemma4".into());
-                toks.push("--chat-template".into());
-                toks.push("examples/tool_chat_template_gemma4.jinja".into());
                 toks = crate::deploy::python_venv::dedup_cli_args_last_wins(toks);
                 base = toks.join(" ");
             }

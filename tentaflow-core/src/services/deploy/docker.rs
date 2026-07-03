@@ -1414,6 +1414,17 @@ impl DeployStrategy for DockerDeploy {
         {
             engine_args.extend(spec_args);
         }
+        // Chat template gemma-4 (tool-calling): sciezka W KONTENERZE — Dockerfile
+        // COPY-uje zbundlowany szablon do /app/chat_templates. Recepta vLLM
+        // podawala repo-relative `examples/...`, ktorego pip-owy vLLM nie ma.
+        if super::resolve_model_repo(&self.manifest, &self.user_config)
+            .map(|r| r.to_lowercase().contains("gemma-4"))
+            .unwrap_or(false)
+        {
+            engine_args.push("--chat-template".to_string());
+            engine_args
+                .push("/app/chat_templates/tool_chat_template_gemma4.jinja".to_string());
+        }
         if self.manifest.engine.is_cuda_vllm() {
             let is_pooling = matches!(
                 self.manifest.engine.category,

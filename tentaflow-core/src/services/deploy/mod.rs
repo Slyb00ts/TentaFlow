@@ -1786,6 +1786,27 @@ pub(crate) fn vllm_native_speculative_arg(
     Some(vec!["--speculative-config".to_string(), json])
 }
 
+/// `--chat-template <abs>` dla rodziny gemma-4 (native python-bundle). Pip-owy
+/// vLLM nie niesie katalogu `examples/`, wiec `--chat-template
+/// examples/tool_chat_template_gemma4.jinja` z recepty vLLM padal ("path-like,
+/// but doesn't exist"). Wskazujemy zbundlowany w repo szablon ABSOLUTNA sciezka.
+/// GUARD `.exists()`: brak pliku => brak flagi => deploy nie pada (tool-calling
+/// zdegraduje do szablonu wbudowanego zamiast crashu).
+pub(crate) fn vllm_native_chat_template_arg(model_repo: &str) -> Option<Vec<String>> {
+    if !model_repo.to_lowercase().contains("gemma-4") {
+        return None;
+    }
+    let path = crate::paths::containers_root()
+        .join("llm/docker/_shared/chat_templates/tool_chat_template_gemma4.jinja");
+    if !path.exists() {
+        return None;
+    }
+    Some(vec![
+        "--chat-template".to_string(),
+        path.to_string_lossy().into_owned(),
+    ])
+}
+
 /// Builds the canonical base URL we persist as `services.endpoint_url` for
 /// HTTP transports. `BackendClient` (in `services/backend/client.rs`) appends
 /// `/chat/completions`, `/embeddings`, `/audio/{transcriptions,speech}` to
