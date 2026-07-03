@@ -1616,6 +1616,15 @@ fn vllm_spec_method(method: &str) -> Option<&'static str> {
         "ngram" => Some("ngram"),
         "mtp" => Some("mtp"),
         "draft" | "draft_model" => Some("draft"),
+        // Metody z osobnym modelem/glowa draftujaca, ktore vLLM identyfikuje po
+        // polu `method` w --speculative-config: DSpark (DeepSeek V4, +57-85%),
+        // DFlash/PFlash, Eagle/Eagle3, Medusa. Wszystkie niosa `speculator_repo`.
+        "dspark" => Some("dspark"),
+        "dflash" => Some("dflash"),
+        "pflash" => Some("pflash"),
+        "eagle" => Some("eagle"),
+        "eagle3" => Some("eagle3"),
+        "medusa" => Some("medusa"),
         _ => None,
     }
 }
@@ -1810,7 +1819,13 @@ pub(crate) fn vllm_native_speculative_arg(
             let repo = preset.speculator_repo.as_ref()?;
             format!("{{\"model\":\"{repo}\",\"num_speculative_tokens\":{ntok}}}")
         }
-        _ => return None,
+        // DSpark / DFlash / PFlash / Eagle(3) / Medusa: method + model draftujacy.
+        other => {
+            let repo = preset.speculator_repo.as_ref()?;
+            format!(
+                "{{\"method\":\"{other}\",\"model\":\"{repo}\",\"num_speculative_tokens\":{ntok}}}"
+            )
+        }
     };
     // Flaga i JSON jako DWA osobne elementy argv. JSON nigdy nie przechodzi
     // przez shlex/xargs, wiec wewnetrzne cudzyslowy zostaja nietkniete i
