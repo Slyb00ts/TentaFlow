@@ -14,7 +14,13 @@ let currentScreen = null;
 // <body>). They otherwise survive a view switch and cover the next screen.
 function closeStrayOverlays() {
   const main = document.getElementById('main');
-  const overlays = document.querySelectorAll('tf-window, tf-modal, .tf-modal-backdrop');
+  // Include BOTH backdrop kinds. A tf-window opened via TfWindow.open() appends
+  // a separate `.tf-window-backdrop` div to <body>; closing the window doesn't
+  // always take the backdrop with it, and a leaked full-screen backdrop then
+  // silently eats every click on the next view. Remove backdrops directly.
+  const overlays = document.querySelectorAll(
+    'tf-window, tf-modal, .tf-modal-backdrop, .tf-window-backdrop',
+  );
   overlays.forEach((el) => {
     if (main && main.contains(el)) return; // in-view overlays are the screen's own
     try {
