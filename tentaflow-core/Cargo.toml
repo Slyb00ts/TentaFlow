@@ -475,6 +475,12 @@ name = "camera_inference_batch"
 harness = false
 required-features = ["inference-vision-gpu"]
 
+# FP32-CPU vs FP16-TensorRT detector latency (ort). Skips without model/GPU.
+[[bench]]
+name = "onnx_cv_trt"
+harness = false
+required-features = ["inference-supertonic"]
+
 [[example]]
 name = "cv_bench"
 required-features = ["inference-vision-gpu"]

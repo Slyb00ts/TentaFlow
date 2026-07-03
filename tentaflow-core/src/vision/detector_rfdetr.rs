@@ -96,8 +96,23 @@ impl RfDetrDetector {
                 bail!("RF-DETR ONNX missing: {}", onnx_path.display());
             }
             crate::vision::ort_common::ensure_ort_dylib();
-            let session =
-                crate::vision::ort_common::build_ort_session(&onnx_path, &dir.join("trt-cache"))?;
+            // Fixed 560x560 but VARIABLE batch (per-tick camera count): pin one
+            // TRT engine over 1..=MODEL_BATCH so the first inference of each new
+            // batch size does not trigger a per-shape engine rebuild.
+            let trt_profile = crate::vision::ort_common::TrtShapeProfile {
+                input_name: INPUT_NAME.to_string(),
+                min_batch: 1,
+                opt_batch: MODEL_BATCH,
+                max_batch: MODEL_BATCH,
+                channels: 3,
+                height: RESOLUTION,
+                width: RESOLUTION,
+            };
+            let session = crate::vision::ort_common::build_ort_session(
+                &onnx_path,
+                &dir.join("trt-cache"),
+                Some(&trt_profile),
+            )?;
             info!(
                 "[rfdetr] loaded {} ({} classes, backend ort TensorRT→CUDA→CPU)",
                 onnx_path.display(),

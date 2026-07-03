@@ -246,7 +246,37 @@ fn get_or_load(row: &VisionModelRow) -> Result<Arc<CachedModel>> {
     let trt_cache = paths::vision_models_dir()
         .join("trt-cache")
         .join(&row.model_name);
-    let session = crate::vision::ort_common::build_ort_session_from_memory(&bytes, &trt_cache)?;
+    // TRT shape profile pins one engine over the batch range this runner
+    // actually drives: detect batches frames per run, classify is always a
+    // single crop. The input name must come from the graph itself (registry
+    // models name inputs arbitrarily); when it cannot be read we build without
+    // a profile (lazy per-batch-size engines — today's behavior).
+    let trt_profile = crate::vision::ort_common::onnx_first_input_name(&bytes).map(|input_name| {
+        let (opt_batch, max_batch) = match contract {
+            Contract::Rfdetr => (8, 8),
+            Contract::Softmax => (1, 1),
+        };
+        crate::vision::ort_common::TrtShapeProfile {
+            input_name,
+            min_batch: 1,
+            opt_batch,
+            max_batch,
+            channels: 3,
+            height: pre.resolution,
+            width: pre.resolution,
+        }
+    });
+    if trt_profile.is_none() {
+        tracing::warn!(
+            "[onnx-cv] '{}': could not read the first ONNX input name — building without a TensorRT shape profile",
+            row.model_name
+        );
+    }
+    let session = crate::vision::ort_common::build_ort_session_from_memory(
+        &bytes,
+        &trt_cache,
+        trt_profile.as_ref(),
+    )?;
     drop(bytes);
     info!(
         "[onnx-cv] loaded '{}' ({} classes, contract {:?}, {}px)",
