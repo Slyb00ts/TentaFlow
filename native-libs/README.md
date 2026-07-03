@@ -64,6 +64,34 @@ wymusić:
 WHISPER_CPP_BACKENDS=cuda,vulkan,rocm,cpu ./scripts/native-libs/build-all.sh --only whisper-cpp
 ```
 
+## ONNX Runtime GPU (CUDA / TensorRT, NVIDIA B300)
+
+`build-onnxruntime.sh` provisions the runtime dlopened by the `ort` crate
+(load-dynamic): `lib-dynamic/libonnxruntime.so.<ver>` plus the
+`libonnxruntime_providers_{shared,cuda,tensorrt}.so` execution providers. On
+`linux-x86_64` it downloads the official GPU release and verifies a pinned
+SHA-256. The CUDA line is auto-detected from the driver
+(`ONNXRUNTIME_CUDA=auto|12|13`): CUDA 13-capable drivers get the `gpu_cuda13`
+artifact, which is required for SM_103 (B300, Blackwell Ultra).
+
+```bash
+./scripts/native-libs/build-all.sh --only onnxruntime           # prebuilt (default)
+./scripts/native-libs/build-onnxruntime.sh linux-x86_64 --from-source  # native SM_103 cubins
+```
+
+Runtime host requirements for the `gpu_cuda13` variant (not bundled):
+
+- NVIDIA driver R580+ (CUDA 13 compatible),
+- cuDNN 9 for the CUDA EP,
+- TensorRT >= 10.13 for the TensorRT EP — the provider dlopens
+  `libnvinfer.so.10` / `libnvonnxparser.so.10` at runtime; without them the
+  detector falls back to the CUDA EP gracefully.
+
+Prebuilt CUDA 13 binaries ship PTX, so kernels JIT-compile on SM_103 (slower
+first session load). `--from-source` builds native cubins
+(`ONNXRUNTIME_CUDA_ARCHS=103` by default) with `CUDA_HOME` + `TENSORRT_HOME`
+pointing at a CUDA 13.x toolkit and TensorRT >= 10.13.
+
 Ciężkie pliki `.a`, `.so`, `.dylib`, `.dll`, `.lib`, `.framework` i `.bundle`
 w `native-libs/` są odblokowane w `.gitignore`, żeby maintainer mógł zbudować
 je raz na właściwej maszynie i dodać do repo. Cache źródeł i katalogi buildów
