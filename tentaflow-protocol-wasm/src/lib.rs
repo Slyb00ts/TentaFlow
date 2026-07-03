@@ -4753,6 +4753,8 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
                 set(&item, "updated_at", s.updated_at.into());
                 set(&item, "updateAvailable", s.update_available.into());
                 set(&item, "update_available", s.update_available.into());
+                set(&item, "gpuSelection", s.gpu_selection.clone().into());
+                set(&item, "gpu_selection", s.gpu_selection.into());
 
                 let models = js_sys::Array::new();
                 for m in s.models {

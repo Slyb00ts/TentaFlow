@@ -473,6 +473,8 @@
     "col_actions": "Akcje",
     "col_transport": "Transport",
     "col_models": "Modele",
+    "col_gpu": "Karty GPU",
+    "gpu_all": "wszystkie",
     "col_restart": "Restarty",
     "col_category": "Kategoria",
     "col_display_name": "Serwis",

@@ -473,6 +473,8 @@
     "col_actions": "Actions",
     "col_transport": "Transport",
     "col_models": "Models",
+    "col_gpu": "GPUs",
+    "gpu_all": "all",
     "col_restart": "Restarts",
     "col_category": "Category",
     "col_display_name": "Service",

@@ -848,6 +848,7 @@ mod snapshot_helpers_tests {
                 created_at: "2026-01-01 00:00:00".into(),
                 updated_at: "2026-01-01 00:00:00".into(),
                 request_time_parameters: Default::default(),
+            gpu_selection: String::new(),
             }],
         );
         mgr.set_mesh_services_registry(registry);
@@ -917,6 +918,7 @@ mod snapshot_helpers_tests {
                 created_at: "2026-01-01 00:00:00".into(),
                 updated_at: "2026-01-01 00:00:00".into(),
                 request_time_parameters: Default::default(),
+            gpu_selection: String::new(),
             }],
         );
         let h = shared_cache

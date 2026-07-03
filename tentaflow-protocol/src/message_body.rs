@@ -136,6 +136,12 @@ pub struct ServiceInfo {
     /// propagowane do BackendClient przez handles_cache. Puste mapy gdy
     /// service nie ma konfigurowalnych parametrow.
     pub request_time_parameters: RequestTimeParameters,
+    /// Karty GPU, na ktorych dziala serwis (z deploy configu `gpu_select_mode` +
+    /// `gpu_ids`): `"all"` = wszystkie widoczne, `"0,1"` = konkretne indeksy,
+    /// `"CPU"` = bez GPU, `""` = nieznane/nie dotyczy. `#[serde(default)]` dla
+    /// kompatybilnosci ze starszymi peerami mesh.
+    #[serde(default)]
+    pub gpu_selection: String,
 }
 
 /// Wartosci parametrow konsumowane przy kazdym requestcie do silnika.
