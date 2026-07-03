@@ -32,6 +32,37 @@ fn cancelled(cancel: &AtomicBool) -> bool {
     cancel.load(Ordering::Relaxed)
 }
 
+/// Czeka na workery, ale ABORTUJE je gdy tylko `cancel` sie zapali — inaczej
+/// wiszacy in-flight request (np. c=64 przy nasyconym GPU) trzyma Stop przez
+/// caly `request_timeout` (do 120 s * per_worker). Watcher-task pollowa cancel co
+/// 150 ms i ubija wszystkie handle, wiec Stop jest responsywny nawet w srodku
+/// requestu. Zwraca surowe `Result` per worker — kazdy scenariusz sam decyduje
+/// co zrobic z aborted (JoinError::is_cancelled) vs realnym panic.
+async fn join_workers_cancellable<T: Send + 'static>(
+    handles: Vec<tokio::task::JoinHandle<T>>,
+    cancel: &Arc<AtomicBool>,
+) -> Vec<Result<T, tokio::task::JoinError>> {
+    let aborts: Vec<tokio::task::AbortHandle> =
+        handles.iter().map(|h| h.abort_handle()).collect();
+    let watcher = {
+        let cancel = Arc::clone(cancel);
+        tokio::spawn(async move {
+            while !cancelled(&cancel) {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            for a in &aborts {
+                a.abort();
+            }
+        })
+    };
+    let mut out = Vec::with_capacity(handles.len());
+    for handle in handles {
+        out.push(handle.await);
+    }
+    watcher.abort();
+    out
+}
+
 /// Single-request latency: one uncounted warmup, then N sequential repeats.
 /// Sequential on purpose — this scenario measures uncontended latency.
 pub async fn run_latency(
@@ -99,9 +130,11 @@ pub async fn run_throughput(
             }));
         }
         let mut samples = Vec::new();
-        for handle in handles {
-            match handle.await {
+        for r in join_workers_cancellable(handles, cancel).await {
+            match r {
                 Ok(worker_samples) => samples.extend(worker_samples),
+                // Aborted przez Stop — pomijamy (nie liczymy jako blad).
+                Err(e) if e.is_cancelled() => {}
                 Err(e) => samples.push(RequestSample::failed(0.0, format!("worker join: {e}"))),
             }
         }
@@ -208,13 +241,15 @@ pub async fn run_sustained(
     }
 
     let mut per_minute: std::collections::BTreeMap<u32, Vec<RequestSample>> = Default::default();
-    for handle in handles {
-        match handle.await {
+    for r in join_workers_cancellable(handles, cancel).await {
+        match r {
             Ok(tagged) => {
                 for (minute, sample) in tagged {
                     per_minute.entry(minute).or_default().push(sample);
                 }
             }
+            // Aborted przez Stop — pomijamy.
+            Err(e) if e.is_cancelled() => {}
             Err(e) => {
                 per_minute
                     .entry(0)
