@@ -14,14 +14,15 @@ use tentaflow_protocol::mesh::{HmacKeyEntry, HmacKeysSyncPayload};
 
 use crate::services::mesh_keys::{mesh_key_pool, short_key_id, KeyScope, PeerKeyState};
 use crate::services::{
-    frame_url_issuer, legal_url_issuer, pickup_token_issuer, recording_url_issuer,
+    frame_url_issuer, legal_url_issuer, model_bundle_url_issuer, pickup_token_issuer,
+    recording_url_issuer,
 };
 
 /// Build the advertise payload from the live local issuer state. Called every
 /// time we want to push our keys to a peer — initial advertise on
 /// `PeerConnected`, and re-advertise after a local key rotation.
 pub fn build_local_advertise(local_node_id: &str) -> HmacKeysSyncPayload {
-    let mut entries = Vec::with_capacity(4);
+    let mut entries = Vec::with_capacity(5);
     {
         let (cur, prev, prev_exp) = pickup_token_issuer().snapshot_for_mesh();
         entries.push(make_entry(KeyScope::PickupToken, cur, prev, prev_exp));
@@ -37,6 +38,10 @@ pub fn build_local_advertise(local_node_id: &str) -> HmacKeysSyncPayload {
     {
         let (cur, prev, prev_exp) = legal_url_issuer().snapshot_for_mesh();
         entries.push(make_entry(KeyScope::LegalUrl, cur, prev, prev_exp));
+    }
+    {
+        let (cur, prev, prev_exp) = model_bundle_url_issuer().snapshot_for_mesh();
+        entries.push(make_entry(KeyScope::ModelBundleUrl, cur, prev, prev_exp));
     }
     HmacKeysSyncPayload {
         from_node_id: local_node_id.to_string(),

@@ -61,18 +61,45 @@ impl EmbeddedDeploy {
 
         let engine_id = self.manifest.engine.id.clone();
 
+        // Generic dynamic-model engine (`onnx-cv`): there is nothing to fetch
+        // or load at deploy time — models live in the `vision_models` registry
+        // and `vision::onnx_cv` builds ort sessions lazily on first use. The
+        // service row itself is normally materialized by
+        // `services::onnx_cv_service::reconcile`; this branch keeps a manual
+        // deploy / boot respawn a harmless no-op.
+        if engine_id == "onnx-cv" {
+            if let Some(s) = &self.log_sink {
+                s.info("[vision] onnx-cv ready (registry models load lazily)");
+            }
+            return Ok(());
+        }
+
         // Camera-CV pipeline models (RF-DETR detector / state classifier / plate
         // OCR) are ort-based singletons loaded lazily by the always-on analysis
         // engine, not tract `LoadedEngine`s. Deploy only fetches the bundle into
         // `vision_models_dir()`; the runner loads itself on first camera tick.
         if crate::vision::camera_cv_models::is_camera_cv_engine(&engine_id) {
-            let base_url = self
-                .manifest
-                .model_presets
-                .iter()
-                .map(|p| p.repo.clone())
-                .find(|r| r.starts_with("http"))
-                .unwrap_or_default();
+            // Admin-configured pull override (Settings key `vision_bundle_base_url`).
+            // Accepts either a plain release-dir base URL (files at `<base>/<name>`)
+            // or a TentaFlow signed manifest URL containing `/models/manifest/`
+            // (files pulled via per-file signed URLs + sha256 verify). When set,
+            // it wins over the manifest `[[model_preset]] repo`.
+            let override_url = crate::db::global_pool()
+                .and_then(|pool| {
+                    crate::db::repository::get_setting(&pool, "vision_bundle_base_url")
+                        .ok()
+                        .flatten()
+                })
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let base_url = override_url.unwrap_or_else(|| {
+                self.manifest
+                    .model_presets
+                    .iter()
+                    .map(|p| p.repo.clone())
+                    .find(|r| r.starts_with("http"))
+                    .unwrap_or_default()
+            });
             crate::vision::camera_cv_models::ensure_bundle(
                 &engine_id,
                 &base_url,

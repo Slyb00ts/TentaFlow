@@ -1911,6 +1911,63 @@ pub struct MlStudioRecogSaveAnnotationsResponse {
     pub error: Option<String>,
 }
 
+// ----- Vision model registry (dynamic camera-CV ONNX models) -----
+
+/// Publishes a trained ML Studio model into the core `vision_models`
+/// registry: locates/exports the ONNX, copies it into the vision models dir,
+/// hashes it and inserts the registry row so camera pipelines can reference
+/// it (directly or through an optional alias) without recompiling.
+/// `op`: "detect" (RF-DETR) or "classify" (softmax classifier); it must match
+/// the model's framework. `threshold` becomes the registry default score
+/// threshold for detect models. `alias` (optional) creates/updates a
+/// `model_aliases` row pointing at the new model name.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioVisionModelPublishRequest {
+    pub model_id: String,
+    pub model_name: String,
+    pub op: String,
+    pub threshold: Option<f64>,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioVisionModelPublishResponse {
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// One `vision_models` registry row as shown in the dashboard list.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioVisionModelInfo {
+    pub model_name: String,
+    pub op: String,
+    pub file_name: String,
+    pub sha256: String,
+    pub classes: Vec<String>,
+    pub source: String,
+    pub default_threshold: Option<f64>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioVisionModelsListRequest {}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioVisionModelsListResponse {
+    pub models: Vec<MlStudioVisionModelInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioVisionModelDeleteRequest {
+    pub model_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioVisionModelDeleteResponse {
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct MlStudioRecogHyperparams {
     pub epochs: u32,
@@ -2409,6 +2466,12 @@ pub enum MlStudioPayload {
     DatasetRowsResponse(MlStudioDatasetRowsResponse),
     DatasetRowsSaveRequest(MlStudioDatasetRowsSaveRequest),
     DatasetRowsSaveResponse(MlStudioDatasetRowsSaveResponse),
+    VisionModelPublishRequest(MlStudioVisionModelPublishRequest),
+    VisionModelPublishResponse(MlStudioVisionModelPublishResponse),
+    VisionModelsListRequest(MlStudioVisionModelsListRequest),
+    VisionModelsListResponse(MlStudioVisionModelsListResponse),
+    VisionModelDeleteRequest(MlStudioVisionModelDeleteRequest),
+    VisionModelDeleteResponse(MlStudioVisionModelDeleteResponse),
 }
 
 // ----- Robots screen (UserSession) -----

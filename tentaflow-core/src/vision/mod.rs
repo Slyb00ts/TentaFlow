@@ -16,8 +16,16 @@
 
 pub mod camera_cv_models;
 pub mod nms;
+// Generyczny runner ONNX dla dynamicznych modeli z rejestru `vision_models`
+// (silnik `onnx-cv`) + wspoldzielona warstwa ort i postprocess RF-DETR.
+#[cfg(feature = "inference-supertonic")]
+pub mod onnx_cv;
+#[cfg(feature = "inference-supertonic")]
+pub mod ort_common;
 pub mod preprocessing;
 pub mod resize;
+#[cfg(any(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+pub mod rfdetr_post;
 
 // Vendored Burn models (build-time ONNX→Burn codegen; regenerate via
 // tools/burn-spike when the architecture changes). Each is its own module

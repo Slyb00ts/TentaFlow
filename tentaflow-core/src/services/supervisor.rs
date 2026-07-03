@@ -380,6 +380,20 @@ impl Supervisor {
             tracing::warn!("supervisor: reload_embedded_on_boot failed: {}", e);
         }
 
+        // Materialize the auto-managed `onnx-cv` service row from the
+        // `vision_models` registry (dynamic camera-CV models). Idempotent;
+        // the reconcile handlers keep it fresh after boot.
+        {
+            let db = self.db.clone();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || crate::services::onnx_cv_service::reconcile(&db))
+                    .await
+                    .map_err(|e| SupervisorError::Database(format!("join: {e}")))?
+            {
+                tracing::warn!("supervisor: onnx-cv reconcile failed: {e:#}");
+            }
+        }
+
         if let Err(e) = self.auto_start_pinned().await {
             tracing::warn!("supervisor: auto_start_pinned failed: {}", e);
         }
@@ -614,6 +628,25 @@ impl Supervisor {
             // `stop_all_supervised` is tearing down (would orphan on exit).
             if self.shutdown.load(Ordering::Relaxed) {
                 return;
+            }
+
+            // Keep the auto-managed `onnx-cv` service row in sync with the
+            // `vision_models` registry every tick — this is how rows applied by
+            // MESH SYNC become advertised without a reboot (the materializer
+            // cannot reach the service layer; the tick republished snapshot +
+            // registry callback rebuilds the catalog right below). Idempotent
+            // and write-free when nothing changed.
+            {
+                let db = self.db.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::services::onnx_cv_service::reconcile(&db)
+                })
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!("supervisor: onnx-cv reconcile failed: {e:#}"),
+                    Err(e) => tracing::warn!("supervisor: onnx-cv reconcile join: {e}"),
+                }
             }
 
             let services = match self.read_supervised().await {

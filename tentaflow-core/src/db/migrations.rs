@@ -592,7 +592,42 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "camera_cv_pipelines_org_scope",
             MigrationStep::Rust(camera_cv_pipelines_add_org_scope),
         ),
+        (
+            111,
+            "vision_models_registry",
+            MigrationStep::Rust(create_vision_models),
+        ),
     ]
+}
+
+/// v111 — vision model registry for the configurable camera-CV pipeline.
+/// Rows describe dynamic ONNX models (trained in ML Studio or imported) that
+/// the generic `onnx-cv` embedded engine serves without recompiling. Bundled
+/// fixed engines (rfdetr-adr / nalepka-stan / plate-ocr / onnx-ocr / apple-ocr)
+/// are NOT seeded here — they keep resolving through their fixed engine ids.
+/// The CHECK admits op='embed' so a future op does not need a schema change,
+/// but registration rejects it until `CameraCvOp` grows an Embed variant.
+/// Idempotent (IF NOT EXISTS).
+fn create_vision_models(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS vision_models (
+            model_name TEXT PRIMARY KEY,
+            op TEXT NOT NULL CHECK(op IN ('detect','classify','ocr','embed')),
+            file_name TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            classes_json TEXT NOT NULL DEFAULT '[]',
+            preprocess_json TEXT NOT NULL DEFAULT '{}',
+            output_contract TEXT NOT NULL CHECK(output_contract IN ('rfdetr','softmax')),
+            source TEXT NOT NULL CHECK(source IN ('bundled','trained','imported')),
+            default_threshold REAL,
+            org_id TEXT NOT NULL DEFAULT 'org-default',
+            project_id TEXT,
+            source_model_id TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );",
+    )?;
+    Ok(())
 }
 
 /// v110 — org scoping for camera CV pipelines. Adds `org_id` (defaulting

@@ -44,6 +44,7 @@ pub mod lidar_relay;
 pub mod lifecycle;
 pub mod mesh_keys;
 pub mod mesh_registry;
+pub mod onnx_cv_service;
 pub mod org;
 pub mod pickup_tokens;
 pub mod policy;
@@ -85,6 +86,7 @@ static PICKUP_TOKEN_ISSUER: OnceLock<Arc<pickup_tokens::PickupTokenIssuer>> = On
 static FRAME_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
 static RECORDING_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
 static LEGAL_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
+static MODEL_BUNDLE_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
 static VECTOR_NAMESPACE_MANAGER: OnceLock<Arc<vector::NamespaceManager>> = OnceLock::new();
 #[cfg(feature = "graph")]
 static GRAPH_MANAGER: OnceLock<Arc<graph::GraphManager>> = OnceLock::new();
@@ -249,6 +251,34 @@ pub fn legal_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
                         iss.rotate_in_memory(*new);
                     }
                     trigger_mesh_broadcast_on_rotate(signed_urls::UrlScope::LegalUrl.key_name());
+                },
+            );
+        }
+        issuer
+    })
+}
+
+/// Process-wide signing key for `/models/manifest` + `/models/file` bundle
+/// URLs (camera-CV model distribution between TentaFlow instances). Same
+/// disk-backed rotation contract as the other signed-URL issuers.
+pub fn model_bundle_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
+    MODEL_BUNDLE_URL_ISSUER.get_or_init(|| {
+        let issuer = Arc::new(signed_urls::SignedUrlIssuer::new(
+            signed_urls::UrlScope::ModelBundle,
+        ));
+        if let Ok(path) = key_storage::key_path(signed_urls::UrlScope::ModelBundle.key_name()) {
+            let weak = Arc::downgrade(&issuer);
+            key_storage::watcher::spawn_key_watcher(
+                signed_urls::UrlScope::ModelBundle.key_name(),
+                path,
+                KEY_WATCHER_POLL,
+                move |_old, new| {
+                    if let Some(iss) = weak.upgrade() {
+                        iss.rotate_in_memory(*new);
+                    }
+                    trigger_mesh_broadcast_on_rotate(
+                        signed_urls::UrlScope::ModelBundle.key_name(),
+                    );
                 },
             );
         }

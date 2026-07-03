@@ -72,6 +72,10 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
         ("speaker_voice_samples_required", "3"),
         ("speaker_enrollment_min_confidence", "0.7"),
         ("oauth_redirect_base_url", "https://localhost:8090"),
+        // Vision model-bundle pull override: empty = use manifest preset repo;
+        // a plain base URL serves `<base>/<name>`; a TentaFlow signed manifest
+        // URL (contains `/models/manifest/`) pulls via per-file signed URLs.
+        ("vision_bundle_base_url", ""),
     ];
 
     {

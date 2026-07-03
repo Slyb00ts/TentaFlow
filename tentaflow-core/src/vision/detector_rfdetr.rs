@@ -26,8 +26,6 @@ use burn::tensor::{Tensor, TensorData};
 use burn_store::{BurnpackStore, ModuleSnapshot};
 use serde::Deserialize;
 use tracing::info;
-#[cfg(feature = "inference-supertonic")]
-use tracing::warn;
 
 use crate::paths;
 use crate::services::detection_bus::Detection;
@@ -43,11 +41,6 @@ const RESOLUTION: u32 = 560;
 #[cfg(feature = "inference-supertonic")]
 const INPUT_NAME: &str = "input";
 
-/// Domyślna ścieżka biblioteki ONNX Runtime dla dlopen (`ort` z `load-dynamic`),
-/// gdy `ORT_DYLIB_PATH` nie jest ustawione w środowisku.
-#[cfg(feature = "inference-supertonic")]
-const DEFAULT_ORT_DYLIB: &str = "/usr/lib/libonnxruntime.so.1.24.4";
-
 /// Rozmiar batcha wkompilowany na stałe w wyeksportowany graf RF-DETR.
 /// Model przyjmuje WYŁĄCZNIE wejście `[MODEL_BATCH,3,560,560]` — mniejszy lub
 /// większy batch panikuje na stałych kształtach grafu. Klatki chunkujemy po
@@ -57,9 +50,6 @@ pub const MODEL_BATCH: usize = 8;
 /// Per-channel ImageNet normalization (matches the training transform).
 const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const STD: [f32; 3] = [0.229, 0.224, 0.225];
-
-/// Minimum sigmoid confidence to surface a detection.
-const SCORE_THRESHOLD: f32 = 0.5;
 
 /// `rfdetr-classes.json` shape: `{ "classes": [...], "resolution": 560 }`.
 #[derive(Debug, Deserialize)]
@@ -105,8 +95,9 @@ impl RfDetrDetector {
             if !onnx_path.exists() {
                 bail!("RF-DETR ONNX missing: {}", onnx_path.display());
             }
-            ensure_ort_dylib();
-            let session = build_ort_session(&onnx_path)?;
+            crate::vision::ort_common::ensure_ort_dylib();
+            let session =
+                crate::vision::ort_common::build_ort_session(&onnx_path, &dir.join("trt-cache"))?;
             info!(
                 "[rfdetr] loaded {} ({} classes, backend ort TensorRT→CUDA→CPU)",
                 onnx_path.display(),
@@ -255,12 +246,12 @@ impl RfDetrDetector {
         for bi in 0..n {
             let (dets_slice, labels_slice) =
                 slot_slices(&dets_owned, &labels_owned, bi, queries, label_dim);
-            results.push(self.postprocess_image(
+            results.push(crate::vision::rfdetr_post::postprocess_image(
                 dets_slice,
                 labels_slice,
                 queries,
                 label_dim,
-                num_classes,
+                &self.classes,
                 threshold,
             ));
         }
@@ -370,70 +361,18 @@ impl RfDetrDetector {
             for bi in 0..chunk_len {
                 let (dets_slice, labels_slice) =
                     slot_slices(&dets_v, &labels_v, bi, queries, label_dim);
-                results.push(self.postprocess_image(
+                results.push(crate::vision::rfdetr_post::postprocess_image(
                     dets_slice,
                     labels_slice,
                     queries,
                     label_dim,
-                    num_classes,
+                    &self.classes,
                     threshold,
                 ));
             }
         }
 
         Ok(results)
-    }
-
-    /// Per-image DETR postprocess: per-query sigmoid + argmax over the real
-    /// classes (index `num_classes` is the background slot), threshold, and
-    /// cxcywh→xywh-normalized box. No NMS. `threshold = None` uses
-    /// [`SCORE_THRESHOLD`] (the historical default).
-    fn postprocess_image(
-        &self,
-        dets: &[f32],
-        labels: &[f32],
-        queries: usize,
-        label_dim: usize,
-        num_classes: usize,
-        threshold: Option<f32>,
-    ) -> Vec<Detection> {
-        let score_threshold = threshold.unwrap_or(SCORE_THRESHOLD);
-        let mut items = Vec::new();
-        for q in 0..queries {
-            let logits = &labels[q * label_dim..q * label_dim + label_dim];
-            let mut best_idx = 0usize;
-            let mut best_logit = f32::NEG_INFINITY;
-            for (idx, &l) in logits.iter().take(num_classes).enumerate() {
-                if l > best_logit {
-                    best_logit = l;
-                    best_idx = idx;
-                }
-            }
-            let score = sigmoid(best_logit);
-            if score <= score_threshold {
-                continue;
-            }
-            let base = q * 4;
-            let cx = dets[base];
-            let cy = dets[base + 1];
-            let bw = dets[base + 2];
-            let bh = dets[base + 3];
-            let x1 = (cx - bw / 2.0).clamp(0.0, 1.0);
-            let y1 = (cy - bh / 2.0).clamp(0.0, 1.0);
-            let x2 = (cx + bw / 2.0).clamp(0.0, 1.0);
-            let y2 = (cy + bh / 2.0).clamp(0.0, 1.0);
-            items.push(Detection {
-                klasa: self.classes[best_idx].clone(),
-                bbox: [x1, y1, x2 - x1, y2 - y1],
-                score,
-                stan: Vec::new(),
-                tekst: None,
-                track_id: 0,
-                vx: 0.,
-                vy: 0.,
-            });
-        }
-        items
     }
 }
 
@@ -457,172 +396,6 @@ fn slot_slices<'a>(
     )
 }
 
-/// Ustawia `ORT_DYLIB_PATH` na wykrytą ścieżkę, jeśli nie ma jej w środowisku —
-/// `ort` z `load-dynamic` dlopuje onnxruntime spod tej zmiennej przy pierwszym
-/// użyciu. Preferujemy runtime z drzewa `native-libs/` (zawiera provider TensorRT
-/// + CUDA), a dopiero gdy go brak — systemowy [`DEFAULT_ORT_DYLIB`] (który ma
-/// zwykle tylko CUDA). Edycja 2021: `set_var` jest bezpieczne.
-#[cfg(feature = "inference-supertonic")]
-fn ensure_ort_dylib() {
-    if std::env::var_os("ORT_DYLIB_PATH").is_some() {
-        return;
-    }
-    let path = locate_ort_dylib().unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_ORT_DYLIB));
-    std::env::set_var("ORT_DYLIB_PATH", &path);
-}
-
-/// Szuka `libonnxruntime.{so*,dylib}` w drzewie `native-libs/<platform>/lib-dynamic/`
-/// (build-all.sh provisionuje tam runtime GPU z TensorRT). Lustrzana logika do
-/// `services::document::rasterize::locate_pdfium_library`, ale zawężona do runtime
-/// ONNX. Zwraca pierwszy trafiony plik albo `None` (wtedy caller bierze systemowy).
-#[cfg(feature = "inference-supertonic")]
-fn locate_ort_dylib() -> Option<std::path::PathBuf> {
-    use std::path::PathBuf;
-
-    let (platform, lib_glob): (&str, &[&str]) = if cfg!(target_os = "macos") {
-        (
-            if cfg!(target_arch = "aarch64") { "macos-arm64" } else { "macos-x86_64" },
-            &["libonnxruntime.dylib"],
-        )
-    } else if cfg!(target_os = "linux") {
-        (
-            if cfg!(target_arch = "aarch64") { "linux-aarch64" } else { "linux-x86_64" },
-            // Prebuilty rozpakowują wersjonowany soname (np. .so.1.26.0) obok
-            // dowiązania .so — bierzemy oba warianty, wersjonowany jako pierwszy.
-            &["libonnxruntime.so", "libonnxruntime.so.*"],
-        )
-    } else {
-        return None;
-    };
-
-    // Wspinamy się w górę od CARGO_MANIFEST_DIR / cwd / katalogu binarki aż do
-    // katalogu zawierającego `native-libs/`.
-    let mut starts: Vec<PathBuf> = Vec::new();
-    if let Some(manifest) = option_env!("CARGO_MANIFEST_DIR") {
-        starts.push(PathBuf::from(manifest));
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        starts.push(cwd);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            starts.push(parent.to_path_buf());
-        }
-    }
-
-    for start in starts {
-        let mut cur: Option<&std::path::Path> = Some(start.as_path());
-        while let Some(dir) = cur {
-            let lib_dir = dir.join("native-libs").join(platform).join("lib-dynamic");
-            if lib_dir.is_dir() {
-                if let Some(found) = pick_ort_dylib(&lib_dir, lib_glob) {
-                    return Some(found);
-                }
-            }
-            cur = dir.parent();
-        }
-    }
-    None
-}
-
-/// Wybiera najlepszy plik runtime ONNX z katalogu `lib-dynamic`. Dla wersjonowanego
-/// soname (`libonnxruntime.so.*`) preferuje najświeższą wersję (sort malejący po
-/// nazwie), by uniknąć niedeterminizmu gdy leży kilka wariantów.
-#[cfg(feature = "inference-supertonic")]
-fn pick_ort_dylib(lib_dir: &std::path::Path, lib_glob: &[&str]) -> Option<std::path::PathBuf> {
-    for pattern in lib_glob {
-        if let Some(suffix) = pattern.strip_suffix('*') {
-            // Wzorzec wersjonowany: dopasuj prefiks, wybierz najświeższy.
-            let entries = std::fs::read_dir(lib_dir).ok()?;
-            let mut matches: Vec<std::path::PathBuf> = entries
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with(suffix) && n != suffix)
-                })
-                .collect();
-            matches.sort();
-            if let Some(latest) = matches.pop() {
-                return Some(latest);
-            }
-        } else {
-            let candidate = lib_dir.join(pattern);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
-/// Buduje sesję `ort` z modelu ONNX, rejestrując łańcuch execution providerów w
-/// kolejności priorytetu z MIĘKKĄ rejestracją (bez `error_on_failure`): jeśli dany
-/// EP jest niedostępny w załadowanym runtime, `ort` loguje ostrzeżenie i przechodzi
-/// do następnego (patrz `ort::ep::apply_execution_providers`). ONNX Runtime sam
-/// przydziela węzły grafu do najwyżej-priorytetowego zarejestrowanego EP, więc gdy
-/// TensorRT jest obecny — użyje go, a inaczej płynnie zejdzie na CUDA (lub CPU).
-///
-/// Kolejność: TensorRT (engine-cache + FP16) → CUDA → [macOS] CoreML → CPU.
-#[cfg(feature = "inference-supertonic")]
-fn build_ort_session(model_path: &std::path::Path) -> Result<ort::session::Session> {
-    use ort::ep::{ExecutionProvider, ExecutionProviderDispatch};
-    use ort::session::Session;
-
-    let mut eps: Vec<ExecutionProviderDispatch> = Vec::new();
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        // TensorRT — najwyższy priorytet. Engine-cache trzyma zserializowane plany
-        // silników na dysku (pierwszy forward po zmianie modelu/GPU buduje je od
-        // nowa i jest wolny; kolejne wczytują z cache). FP16 dla przepustowości.
-        let trt_cache = paths::vision_models_dir().join("trt-cache");
-        if let Err(e) = std::fs::create_dir_all(&trt_cache) {
-            warn!("[rfdetr] ort: nie udało się utworzyć cache TensorRT {}: {e}", trt_cache.display());
-        }
-        eps.push(
-            ort::ep::TensorRT::default()
-                .with_engine_cache(true)
-                .with_engine_cache_path(trt_cache.to_string_lossy().to_string())
-                .with_timing_cache(true)
-                .with_fp16(true)
-                .build(),
-        );
-        // CUDA — dotychczasowa, działająca ścieżka; teraz MIĘKKO (bez
-        // error_on_failure), bo poprzedza ją TensorRT.
-        eps.push(ort::ep::CUDA::default().build());
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // CoreML (Metal/ANE) — akceleracja na Apple Silicon.
-        eps.push(ort::ep::CoreML::default().build());
-    }
-    // CPU — zawsze ostatni fallback.
-    eps.push(ort::ep::CPU::default().build());
-
-    // Introspekcja: logujemy które akceleratory widzi załadowany runtime (ort nie
-    // raportuje per-węzeł finalnego EP, ale ONNX Runtime bierze najwyżej-priorytetowy
-    // z dostępnych, więc to jednoznacznie wskazuje realnie użytą ścieżkę).
-    #[cfg(not(target_os = "macos"))]
-    {
-        let trt = ort::ep::TensorRT::default().is_available().unwrap_or(false);
-        let cuda = ort::ep::CUDA::default().is_available().unwrap_or(false);
-        info!("[rfdetr] ort: dostępne EP w runtime — TensorRT={trt}, CUDA={cuda} (priorytet: TensorRT>CUDA>CPU)");
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let coreml = ort::ep::CoreML::default().is_available().unwrap_or(false);
-        info!("[rfdetr] ort: dostępne EP w runtime — CoreML={coreml} (priorytet: CoreML>CPU)");
-    }
-
-    Session::builder()
-        .map_err(|e| anyhow!("ort Session::builder: {e}"))?
-        .with_execution_providers(eps)
-        .map_err(|e| anyhow!("ort with_execution_providers: {e}"))?
-        .commit_from_file(model_path)
-        .map_err(|e| anyhow!("ort commit_from_file {}: {e}", model_path.display()))
-}
-
 /// Writes one RGB24 frame into batch slot `bi` of a flat NCHW buffer:
 /// stretch-resize to 560×560, /255, per-channel ImageNet normalize.
 fn fill_frame(data: &mut [f32], bi: usize, rgb: &[u8], w: u32, h: u32) -> Result<()> {
@@ -641,11 +414,6 @@ fn fill_frame(data: &mut [f32], bi: usize, rgb: &[u8], w: u32, h: u32) -> Result
         }
     }
     Ok(())
-}
-
-#[inline]
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
 }
 
 #[cfg(test)]

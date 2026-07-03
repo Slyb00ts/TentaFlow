@@ -19,7 +19,7 @@
 // The download base comes from the manifest (mesh-propagated), so pointing the
 // install at a different release server is a manifest edit, not a code change.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 
@@ -110,6 +110,13 @@ const BUNDLES: &[CvBundle] = &[
 /// vision deploy path route these away from the tract `LoadedEngine` registry.
 pub fn is_camera_cv_engine(engine_id: &str) -> bool {
     BUNDLES.iter().any(|b| b.engine_id == engine_id)
+}
+
+/// File names (weights + sidecars) belonging to a bundle. Used by the
+/// `/models/manifest` + `/models/file` endpoints to scope what a named-bundle
+/// token may serve.
+pub fn bundle_file_names(engine_id: &str) -> Option<Vec<&'static str>> {
+    bundle(engine_id).map(|b| b.files.iter().map(|f| f.name).collect())
 }
 
 /// PP-OCRv5 (onnx-ocr) bundle: `(nazwa, wymagany, opcjonalny_absolutny_url)`.
@@ -208,9 +215,12 @@ fn progress_for_sink(sink: LogSink, label: String) -> ProgressFn {
 }
 
 /// Materializes the camera-CV bundle for `engine_id` into `vision_models_dir()`:
-/// downloads the weights from `<base_url>/<file>` and writes the embedded config
-/// sidecars. `base_url` is the manifest `[[model_preset]] repo` (a release-dir
-/// URL). Idempotent — files already present on disk are left untouched.
+/// downloads the weights and writes the embedded config sidecars. `base_url`
+/// is either the manifest `[[model_preset]] repo` (a release-dir URL serving
+/// `<base>/<name>`) or — when the admin set `vision_bundle_base_url` — a
+/// TentaFlow manifest URL containing `/models/manifest/`, in which case the
+/// files are pulled through per-file signed URLs with sha256 verification.
+/// Idempotent — files already present on disk are left untouched.
 pub async fn ensure_bundle(
     engine_id: &str,
     base_url: &str,
@@ -223,6 +233,7 @@ pub async fn ensure_bundle(
     std::fs::create_dir_all(&dir)
         .map_err(|e| anyhow!("create {}: {}", dir.display(), e))?;
 
+    let mut missing: Vec<&'static str> = Vec::new();
     for f in bundle.files {
         let dest = dir.join(f.name);
 
@@ -234,38 +245,378 @@ pub async fn ensure_bundle(
             continue;
         }
 
-        if !f.remote {
-            continue;
+        if f.remote && !file_ok(&dest) {
+            missing.push(f.name);
         }
+    }
 
-        if file_ok(&dest) {
-            continue;
+    if base_url.contains("/models/manifest/") {
+        // Manifest mode carries per-file sha256 hashes, so EVERY required
+        // file is verified against the manifest — already-present files with
+        // a mismatched hash are deleted and re-downloaded. Deploy-time only,
+        // so the extra hashing cost is acceptable.
+        let required: Vec<&'static str> = bundle
+            .files
+            .iter()
+            .filter(|f| f.remote)
+            .map(|f| f.name)
+            .collect();
+        if required.is_empty() {
+            return Ok(());
         }
+        return download_from_bundle_manifest(engine_id, base_url, &required, log_sink).await;
+    }
 
-        let base = base_url.trim_end_matches('/');
-        if base.is_empty() {
-            return Err(anyhow!(
-                "camera-CV '{}': no release URL configured (manifest model_preset.repo is empty)",
-                engine_id
-            ));
-        }
-        let url = format!("{}/{}", base, f.name);
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let base = base_url.trim_end_matches('/');
+    if base.is_empty() {
+        return Err(anyhow!(
+            "camera-CV '{}': no release URL configured (manifest model_preset.repo is empty)",
+            engine_id
+        ));
+    }
+    for name in missing {
+        let dest = dir.join(name);
+        let url = format!("{}/{}", base, name);
 
         if let Some(s) = log_sink {
-            s.phase("downloading-vision", &format!("Pobieram {}", f.name));
+            s.phase("downloading-vision", &format!("Pobieram {}", name));
         }
         let progress: Option<ProgressFn> = log_sink
             .cloned()
-            .map(|sink| progress_for_sink(sink, f.name.to_string()));
+            .map(|sink| progress_for_sink(sink, name.to_string()));
 
-        download_with_progress(&url, &dest, f.name, progress)
+        download_with_progress(&url, &dest, name, progress)
             .await
-            .map_err(|e| anyhow!("download {} from {}: {}", f.name, url, e))?;
+            .map_err(|e| anyhow!("download {} from {}: {}", name, url, e))?;
 
         if let Some(s) = log_sink {
-            s.info(&format!("vision: {} pobrany", f.name));
+            s.info(&format!("vision: {} pobrany", name));
         }
     }
 
     Ok(())
+}
+
+/// Ceiling for the manifest JSON body — the manifest lists at most a few
+/// hundred entries, so anything past this is a misdirected URL, not a bundle.
+const MANIFEST_BODY_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// Drop `?<query>` fragments from an error message so signed-URL tokens never
+/// land in deploy logs. Everything from a `?` to the next whitespace/quote is
+/// replaced with `?<redacted>`.
+fn redact_query_strings(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut skipping = false;
+    for c in msg.chars() {
+        if skipping {
+            if c.is_whitespace() || c == '"' || c == '\'' || c == ')' {
+                skipping = false;
+                out.push(c);
+            }
+            continue;
+        }
+        if c == '?' {
+            out.push_str("?<redacted>");
+            skipping = true;
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Pull the missing bundle files through another TentaFlow instance's
+/// `/models/manifest/<ref>?token=...` endpoint: fetch the manifest JSON, then
+/// download each needed file from its per-file signed URL and verify the
+/// manifest sha256 (delete + fail on mismatch).
+///
+/// TLS posture matches `download_with_progress` (default reqwest trust roots,
+/// no insecure bypass) — the serving instance must present a certificate the
+/// pulling node trusts.
+async fn download_from_bundle_manifest(
+    engine_id: &str,
+    manifest_url: &str,
+    needed: &[&'static str],
+    log_sink: Option<&LogSink>,
+) -> Result<()> {
+    let base = reqwest::Url::parse(manifest_url)
+        .map_err(|e| anyhow!("vision_bundle_base_url is not a valid URL: {}", e))?;
+
+    // Policy::none — the manifest is a signed same-origin contract; following
+    // a redirect would let a compromised serving node bounce the pull to an
+    // arbitrary (possibly internal) destination. Matches the addon
+    // `http.request` posture.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(600))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .user_agent(concat!("tentaflow/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| anyhow!("build HTTP client: {}", e))?;
+
+    if let Some(s) = log_sink {
+        s.phase("downloading-vision", "Fetching model bundle manifest");
+    }
+    // reqwest error Display embeds the request URL (incl. the token in the
+    // query string) — redact before surfacing to deploy logs.
+    let response = client
+        .get(base.clone())
+        .send()
+        .await
+        .map_err(|e| anyhow!("GET bundle manifest: {}", redact_query_strings(&e.to_string())))?;
+    if response.status().is_redirection() {
+        return Err(anyhow!(
+            "bundle manifest responded with a redirect ({}) — redirects are not followed",
+            response.status()
+        ));
+    }
+    let response = response.error_for_status().map_err(|e| {
+        anyhow!(
+            "bundle manifest HTTP error: {}",
+            redact_query_strings(&e.to_string())
+        )
+    })?;
+    if response.content_length().unwrap_or(0) > MANIFEST_BODY_LIMIT {
+        return Err(anyhow!("bundle manifest larger than {} bytes", MANIFEST_BODY_LIMIT));
+    }
+    let body = response.bytes().await.map_err(|e| {
+        anyhow!(
+            "read bundle manifest body: {}",
+            redact_query_strings(&e.to_string())
+        )
+    })?;
+    if body.len() as u64 > MANIFEST_BODY_LIMIT {
+        return Err(anyhow!("bundle manifest larger than {} bytes", MANIFEST_BODY_LIMIT));
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| anyhow!("parse bundle manifest JSON: {}", e))?;
+    let entries = manifest
+        .get("files")
+        .and_then(|f| f.as_array())
+        .ok_or_else(|| anyhow!("bundle manifest has no 'files' array"))?;
+
+    let dir = vision_models_dir();
+    for name in needed {
+        let entry = entries
+            .iter()
+            .find(|e| e.get("name").and_then(|n| n.as_str()) == Some(*name))
+            .ok_or_else(|| {
+                anyhow!(
+                    "camera-CV '{}': file '{}' missing from the remote bundle manifest \
+                     (the serving node has not deployed it)",
+                    engine_id,
+                    name
+                )
+            })?;
+        let rel_url = entry
+            .get("url")
+            .and_then(|u| u.as_str())
+            .ok_or_else(|| anyhow!("manifest entry '{}' has no url", name))?;
+        let expected_sha = entry
+            .get("sha256")
+            .and_then(|h| h.as_str())
+            .map(str::to_ascii_lowercase)
+            .filter(|h| h.len() == 64)
+            .ok_or_else(|| anyhow!("manifest entry '{}' has no valid sha256", name))?;
+        let file_url = resolve_manifest_file_url(&base, rel_url)
+            .map_err(|why| anyhow!("manifest entry '{}': {}", name, why))?;
+
+        let dest = dir.join(name);
+        // Verify files already on disk against the manifest hash — a stale or
+        // corrupted local copy is deleted and re-downloaded.
+        if file_ok(&dest) {
+            let actual_sha = crate::api::model_bundle::sha256_file_hex(&dest)
+                .await
+                .map_err(|e| anyhow!("hash {}: {}", dest.display(), e))?;
+            if actual_sha == expected_sha {
+                continue;
+            }
+            if let Some(s) = log_sink {
+                s.info(&format!(
+                    "vision: {} on disk mismatches the bundle manifest — re-downloading",
+                    name
+                ));
+            }
+            std::fs::remove_file(&dest)
+                .map_err(|e| anyhow!("remove stale {}: {}", dest.display(), e))?;
+        }
+
+        if let Some(s) = log_sink {
+            s.phase("downloading-vision", &format!("Pobieram {}", name));
+        }
+        let progress: Option<ProgressFn> = log_sink
+            .cloned()
+            .map(|sink| progress_for_sink(sink, name.to_string()));
+        download_signed_file(&client, file_url, &dest, name, progress).await?;
+
+        let actual_sha = crate::api::model_bundle::sha256_file_hex(&dest)
+            .await
+            .map_err(|e| anyhow!("hash {}: {}", dest.display(), e))?;
+        if actual_sha != expected_sha {
+            let _ = std::fs::remove_file(&dest);
+            return Err(anyhow!(
+                "camera-CV '{}': sha256 mismatch for '{}' (expected {}, got {}) — \
+                 file deleted, deploy aborted",
+                engine_id,
+                name,
+                expected_sha,
+                actual_sha
+            ));
+        }
+        if let Some(s) = log_sink {
+            s.info(&format!("vision: {} pobrany (sha256 zweryfikowany)", name));
+        }
+    }
+
+    Ok(())
+}
+
+/// SSRF guard for manifest file entries: the url MUST be an origin-relative
+/// path under `/models/file/` (absolute and scheme-relative urls in a
+/// compromised manifest must not steer the pull elsewhere), and the joined
+/// result must stay on the manifest URL's exact scheme/host/port.
+fn resolve_manifest_file_url(
+    base: &reqwest::Url,
+    rel_url: &str,
+) -> std::result::Result<reqwest::Url, String> {
+    if !rel_url.starts_with("/models/file/") {
+        return Err("url is not an origin-relative /models/file/ path".to_string());
+    }
+    let file_url = base
+        .join(rel_url)
+        .map_err(|e| format!("resolve file url: {}", e))?;
+    if file_url.scheme() != base.scheme()
+        || file_url.host_str() != base.host_str()
+        || file_url.port_or_known_default() != base.port_or_known_default()
+    {
+        return Err("url resolves off the manifest origin — rejected".to_string());
+    }
+    Ok(file_url)
+}
+
+/// Streaming download of one signed per-file URL. A dedicated path instead of
+/// `model_download::download_with_progress` because this endpoint's trust
+/// posture differs: redirects must NOT be followed (the shared no-redirect
+/// `client` enforces it; a 3xx status is rejected explicitly since
+/// `error_for_status` treats it as success) and error messages must have the
+/// token-bearing query string redacted. Writes to `<dest>.partial` and
+/// renames atomically, mirroring the shared downloader.
+async fn download_signed_file(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    dest: &Path,
+    label: &str,
+    progress: Option<ProgressFn>,
+) -> Result<()> {
+    use std::io::Write;
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| anyhow!("GET {}: {}", label, redact_query_strings(&e.to_string())))?;
+    if response.status().is_redirection() {
+        return Err(anyhow!(
+            "download {} responded with a redirect ({}) — redirects are not followed",
+            label,
+            response.status()
+        ));
+    }
+    let response = response.error_for_status().map_err(|e| {
+        anyhow!(
+            "download {} HTTP error: {}",
+            label,
+            redact_query_strings(&e.to_string())
+        )
+    })?;
+
+    let total = response.content_length().unwrap_or(0);
+    let partial = dest.with_extension(format!(
+        "{}.partial",
+        dest.extension().and_then(|s| s.to_str()).unwrap_or("tmp")
+    ));
+    let mut file = std::fs::File::create(&partial)
+        .map_err(|e| anyhow!("create {}: {}", partial.display(), e))?;
+
+    let mut downloaded: u64 = 0;
+    let mut last_progress_bytes: u64 = 0;
+    const PROGRESS_INTERVAL_BYTES: u64 = 256 * 1024;
+
+    let mut stream = response.bytes_stream();
+    use futures::StreamExt;
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = chunk_res
+            .map_err(|e| anyhow!("stream {}: {}", label, redact_query_strings(&e.to_string())))?;
+        file.write_all(&chunk)
+            .map_err(|e| anyhow!("write {}: {}", partial.display(), e))?;
+        downloaded += chunk.len() as u64;
+        if downloaded - last_progress_bytes >= PROGRESS_INTERVAL_BYTES {
+            if let Some(ref cb) = progress {
+                cb(downloaded, total, label);
+            }
+            last_progress_bytes = downloaded;
+        }
+    }
+    file.flush()
+        .map_err(|e| anyhow!("flush {}: {}", partial.display(), e))?;
+    drop(file);
+
+    std::fs::rename(&partial, dest)
+        .map_err(|e| anyhow!("rename {} -> {}: {}", partial.display(), dest.display(), e))?;
+    if let Some(ref cb) = progress {
+        cb(downloaded, downloaded, label);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> reqwest::Url {
+        reqwest::Url::parse("https://node-a.example:8090/models/manifest/vision-all?token=SECRET")
+            .unwrap()
+    }
+
+    #[test]
+    fn manifest_file_url_accepts_origin_relative_models_file_path() {
+        let url = resolve_manifest_file_url(
+            &base(),
+            "/models/file/vision-all/rfdetr-base.bpk?token=T&exp=1&ref=vision-all%2Frfdetr-base.bpk",
+        )
+        .expect("valid entry url");
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("node-a.example"));
+        assert_eq!(url.port_or_known_default(), Some(8090));
+        assert!(url.path().starts_with("/models/file/vision-all/"));
+    }
+
+    #[test]
+    fn manifest_file_url_rejects_absolute_and_scheme_relative() {
+        assert!(resolve_manifest_file_url(&base(), "https://internal/steal").is_err());
+        assert!(resolve_manifest_file_url(&base(), "//internal/steal").is_err());
+        assert!(resolve_manifest_file_url(&base(), "http://node-a.example:8090/models/file/x/y")
+            .is_err());
+        assert!(resolve_manifest_file_url(&base(), "relative/path").is_err());
+        assert!(resolve_manifest_file_url(&base(), "/frames/somewhere").is_err());
+    }
+
+    #[test]
+    fn redact_query_strings_strips_tokens() {
+        let msg = "HTTP error from https://h:8090/models/file/a/b.bpk?token=SECRET&exp=1 (status)";
+        let out = redact_query_strings(msg);
+        assert!(!out.contains("SECRET"));
+        assert!(out.contains("/models/file/a/b.bpk?<redacted>"));
+        assert!(out.ends_with("(status)"));
+    }
+
+    #[test]
+    fn redact_query_strings_handles_url_at_end() {
+        let out = redact_query_strings("GET https://h/x?token=SECRET");
+        assert_eq!(out, "GET https://h/x?<redacted>");
+    }
 }

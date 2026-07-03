@@ -1131,6 +1131,96 @@ pub async fn run_detect(
     Ok((detections.to_string(), width, height))
 }
 
+/// Exports a trained RF-DETR checkpoint to ONNX through the local
+/// rfdetr-training service (POST /export → poll /export_status). Returns the
+/// service-local absolute `onnx_path`; the export also writes `classes.json`
+/// (`{classes, resolution}`) next to it. Both files are readable from Core
+/// because the training service is resolved on THIS node.
+pub async fn run_export(
+    checkpoint_path: String,
+    class_names: Vec<String>,
+    variant: String,
+    resolution: u32,
+    output_dir: String,
+) -> anyhow::Result<String> {
+    const EXPORT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+    const EXPORT_POLL: Duration = Duration::from_secs(3);
+
+    let endpoint = resolve_endpoint()?;
+    let base = endpoint.trim_end_matches('/').to_string();
+    let body = json!({
+        "checkpoint_path": checkpoint_path,
+        "class_names": class_names,
+        "variant": variant,
+        "resolution": resolution,
+        "output_dir": output_dir,
+    });
+    let start_url = format!("{base}/export");
+    let export_id: String = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        let http = http_agent();
+        let mut resp = http
+            .post(&start_url)
+            .send_json(&body)
+            .map_err(|e| anyhow::anyhow!("POST {} failed: {}", start_url, e))?;
+        let value: serde_json::Value = resp
+            .body_mut()
+            .read_json()
+            .map_err(|e| anyhow::anyhow!("decode /export response: {}", e))?;
+        value
+            .get("export_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("/export response without export_id"))
+    })
+    .await??;
+
+    let deadline = tokio::time::Instant::now() + EXPORT_TIMEOUT;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            // The training service exposes no export-cancel endpoint (only
+            // /train, /status, /export, /export_status, /detect) — the worker
+            // thread finishes on its own and releases its export slot; the
+            // caller cleans partial local output under the publish export dir.
+            anyhow::bail!(
+                "ONNX export timed out after {}s",
+                EXPORT_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(EXPORT_POLL).await;
+        let status_url = format!("{base}/export_status/{export_id}");
+        let value: serde_json::Value =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+                let http = http_agent();
+                let mut resp = http
+                    .get(&status_url)
+                    .call()
+                    .map_err(|e| anyhow::anyhow!("GET {} failed: {}", status_url, e))?;
+                resp.body_mut()
+                    .read_json()
+                    .map_err(|e| anyhow::anyhow!("decode /export_status response: {}", e))
+            })
+            .await??;
+        match value.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+            "running" => continue,
+            "succeeded" => {
+                return value
+                    .get("onnx_path")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow::anyhow!("export succeeded without onnx_path"));
+            }
+            "failed" => {
+                let msg = value
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("rfdetr-training export failed");
+                anyhow::bail!("ONNX export failed: {msg}");
+            }
+            other => anyhow::bail!("rfdetr-training unknown export status '{other}'"),
+        }
+    }
+}
+
 fn resolve_endpoint() -> anyhow::Result<String> {
     let pool = crate::db::global_pool()
         .ok_or_else(|| anyhow::anyhow!("core service registry unavailable"))?;

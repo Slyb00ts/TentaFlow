@@ -41,6 +41,7 @@ use super::fakefile::{FrameCounters, FrameMailbox};
 use super::rtsp::{
     build_appsink, build_raw_leaky_queue, install_branch_input_base_pts_probe,
     transcoder_key_int_max, wire_mp4_appsink, Mp4BranchState, RtspPipelineHandles,
+    detach_mp4_branch,
 };
 use super::session::CameraConfig;
 use super::stream_publisher::Mp4StreamPublisher;
@@ -339,15 +340,9 @@ pub(super) fn attach_mp4_branch_mjpeg(
         .add_many(&element_refs)
         .map_err(|e| format!("add_many branch B: {e}"))?;
 
-    let tee_src_pad = tee
-        .request_pad_simple("src_%u")
-        .ok_or_else(|| "tee src_%u request for branch B failed".to_string())?;
     let queue_b_sink = queue_b
         .static_pad("sink")
         .ok_or_else(|| "queue_b sink pad missing".to_string())?;
-    tee_src_pad
-        .link(&queue_b_sink)
-        .map_err(|e| format!("tee → queue_b: {e:?}"))?;
     gst::Element::link_many(&element_refs)
         .map_err(|e| format!("link branch B: {e}"))?;
 
@@ -364,6 +359,33 @@ pub(super) fn attach_mp4_branch_mjpeg(
     for el in &element_refs {
         el.sync_state_with_parent()
             .map_err(|e| format!("sync_state branch B element: {e}"))?;
+    }
+
+    // Pad tee linkujemy DOPIERO po aktywacji całej gałęzi. Push tee w okno
+    // między linkiem a aktywacją queue_b zwraca FLUSHING, a tee trwale
+    // oznacza taki pad jako usunięty i nigdy więcej do niego nie pcha —
+    // gałąź wygląda na wpiętą, ale mux nie dostaje ani bajta i init segment
+    // nigdy nie powstaje.
+    // Gałąź jest już AKTYWNA w pipeline — przy błędzie tego kroku trzeba ją
+    // rozebrać (Null + remove), inaczej kolejny attach wywali się na kolizji
+    // stałych nazw elementów, a osierocone elementy dalej mieliłyby dane.
+    let Some(tee_src_pad) = tee.request_pad_simple("src_%u") else {
+        for el in &element_refs {
+            let _ = el.set_state(gst::State::Null);
+        }
+        let _ = pipeline.remove_many(&element_refs);
+        return Err("tee src_%u request for branch B failed".to_string());
+    };
+    if let Err(e) = tee_src_pad.link(&queue_b_sink) {
+        detach_mp4_branch(
+            pipeline,
+            tee,
+            Mp4BranchState {
+                tee_src_pad,
+                elements,
+            },
+        );
+        return Err(format!("tee → queue_b: {e:?}"));
     }
 
     Ok(Mp4BranchState {

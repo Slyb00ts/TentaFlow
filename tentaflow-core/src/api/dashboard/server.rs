@@ -1463,6 +1463,150 @@ pub async fn handle_request(
         }
     }
 
+    // GET /models/manifest/<bundle_ref>?token=&exp=&ref= — HMAC-signed vision
+    // model-bundle manifest for instance-to-instance distribution. Same
+    // HMAC-only auth shape as /recordings; per-file download URLs inside the
+    // manifest are minted with the presented token's remaining lifetime.
+    if method == Method::GET
+        && path.starts_with("/models/manifest/")
+        && path.len() > "/models/manifest/".len()
+    {
+        use crate::api::model_bundle::{handle_manifest, ManifestOutcome, RequestContext};
+        if let Err(resp) = reject_unauth_get_body(req.headers()) {
+            return Ok(resp);
+        }
+        if let Err(resp) =
+            check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/models")
+        {
+            return Ok(resp);
+        }
+        drop(req);
+        let bundle_ref = path.strip_prefix("/models/manifest/").unwrap_or("");
+        let q = match crate::api::frames::parse_query(&query_string) {
+            Ok(q) => q,
+            Err(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+        };
+        let issuer = crate::services::model_bundle_url_issuer();
+        let ctx = RequestContext {
+            source_ip: Some(client_ip.as_str()),
+            user_agent: user_agent.as_deref(),
+        };
+        let outcome = handle_manifest(bundle_ref, &q, issuer, &db, ctx).await;
+        let status = outcome.http_status();
+        return match outcome {
+            ManifestOutcome::Ok { body } => Ok(apply_signed_url_security_headers(
+                Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json"),
+            )
+            .body(Either::Left(Full::new(Bytes::from(body))))
+            .unwrap()),
+            ManifestOutcome::BadRequest(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                Ok(Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap())
+            }
+            ManifestOutcome::Denied(_)
+            | ManifestOutcome::NotFound
+            | ManifestOutcome::InternalError(_) => Ok(Response::builder()
+                .status(status)
+                .header("Content-Type", "application/json")
+                .body(Either::Left(Full::new(Bytes::from_static(
+                    b"{\"error\":\"model_bundle_denied\"}",
+                ))))
+                .unwrap()),
+        };
+    }
+
+    // GET /models/file/<bundle_ref>/<name>?token=&exp=&ref= — per-file signed
+    // download derived from a manifest token. Bodies stream in chunks (weights
+    // reach ~126 MB) through the same StreamBody slot SSE uses.
+    if method == Method::GET && path.starts_with("/models/file/") && path.len() > "/models/file/".len()
+    {
+        use crate::api::model_bundle::{file_stream, handle_file, FileOutcome, RequestContext};
+        if let Err(resp) = reject_unauth_get_body(req.headers()) {
+            return Ok(resp);
+        }
+        if let Err(resp) =
+            check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/models")
+        {
+            return Ok(resp);
+        }
+        drop(req);
+        let rest = path.strip_prefix("/models/file/").unwrap_or("");
+        let Some((bundle_ref, name)) = rest.split_once('/').filter(|(b, n)| !b.is_empty() && !n.is_empty())
+        else {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/json")
+                .body(Either::Left(Full::new(Bytes::from_static(
+                    b"{\"error\":\"invalid_path\"}",
+                ))))
+                .unwrap());
+        };
+        let q = match crate::api::frames::parse_query(&query_string) {
+            Ok(q) => q,
+            Err(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+        };
+        let issuer = crate::services::model_bundle_url_issuer();
+        let ctx = RequestContext {
+            source_ip: Some(client_ip.as_str()),
+            user_agent: user_agent.as_deref(),
+        };
+        let outcome = handle_file(bundle_ref, name, &q, issuer, &db, ctx).await;
+        let status = outcome.http_status();
+        return match outcome {
+            FileOutcome::Ok { file, size } => {
+                // Handle was opened + fstat'ed during authorization (O_NOFOLLOW)
+                // — stream that same handle, never re-open by path.
+                let stream: SseStream = Box::pin(file_stream(file));
+                Ok(apply_signed_url_security_headers(
+                    Response::builder()
+                        .status(status)
+                        .header("Content-Type", "application/octet-stream")
+                        .header("Content-Length", size.to_string()),
+                )
+                .body(Either::Right(StreamBody::new(stream)))
+                .unwrap())
+            }
+            FileOutcome::BadRequest(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                Ok(Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap())
+            }
+            FileOutcome::Denied(_)
+            | FileOutcome::NotFound
+            | FileOutcome::PathTraversal
+            | FileOutcome::IoError => Ok(Response::builder()
+                .status(status)
+                .header("Content-Type", "application/json")
+                .body(Either::Left(Full::new(Bytes::from_static(
+                    b"{\"error\":\"model_bundle_denied\"}",
+                ))))
+                .unwrap()),
+        };
+    }
+
     // GET /legal/<doc_id>?token=&exp=&org=&nonce= — HMAC-signed download of a
     // RODO/GDPR PDF artifact. HMAC-only auth, same shape as `/recordings`
     // plus `org` + `nonce` extra fields (the legal binding is per-tenant +

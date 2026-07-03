@@ -2391,7 +2391,11 @@ impl ModelRuntimeExecutor {
         match target {
             ResolvedExecutionTarget::Local { handle, .. } => match handle {
                 BackendHandle::Embedded { engine_id, .. } => {
-                    LocalCameraCvHandler::execute(engine_id, request.op)
+                    // `request.model` carries the RESOLVED model name (set from
+                    // the Local target above) — the dynamic `onnx-cv` engine
+                    // needs it to pick the registry row; fixed engines ignore it.
+                    let CameraCvRequest { model, op } = request;
+                    LocalCameraCvHandler::execute(engine_id, &model, op)
                         .await
                         .map_err(ExecutorError::Internal)
                 }

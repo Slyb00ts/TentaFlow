@@ -4360,6 +4360,519 @@ pub async fn ml_studio_ft_chat(
     )))
 }
 
+// ----- Vision model registry (publish / list / delete) -----
+
+/// Sidecar `classes.json` written next to the exported ONNX by both training
+/// services: `{classes, resolution}` (rfdetr) or `{classes, image_size}`
+/// (classifier). The class ORDER here is the export-time index order the ONNX
+/// head was built with, so it is authoritative for the registry row.
+#[derive(serde::Deserialize)]
+struct OnnxSidecar {
+    classes: Vec<String>,
+    #[serde(default)]
+    resolution: Option<u32>,
+    #[serde(default)]
+    image_size: Option<u32>,
+}
+
+/// Canonicalizes `candidate` (resolving every symlink component) and requires
+/// containment under the canonicalized ML artifacts root — the only place
+/// training checkpoints/exports legitimately live (`ARTIFACTS_ROOT` handed to
+/// the training services is exactly `paths::ml_artifacts_dir()`). A symlink
+/// that points outside the root fails the containment check after resolution,
+/// so `metrics_json`-supplied and training-service-returned paths cannot make
+/// publish read arbitrary files.
+fn contained_artifact_file(candidate: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let root = crate::paths::ml_artifacts_dir()
+        .canonicalize()
+        .map_err(|e| format!("katalog artefaktów ML niedostępny: {e}"))?;
+    let canon = candidate
+        .canonicalize()
+        .map_err(|e| format!("ścieżka {} nieosiągalna: {e}", candidate.display()))?;
+    if !canon.starts_with(&root) {
+        return Err(format!(
+            "ścieżka {} wykracza poza katalog artefaktów ML",
+            candidate.display()
+        ));
+    }
+    if !canon.is_file() {
+        return Err(format!("{} nie jest plikiem", canon.display()));
+    }
+    Ok(canon)
+}
+
+/// Locates (or produces) the exported ONNX for a trained model and returns
+/// `(onnx_path, sidecar)`, both canonicalized and contained under the ML
+/// artifacts root. RF-DETR models without a persisted `onnx_path` trigger the
+/// real export on the rfdetr-training service (async /export + poll);
+/// classifiers use the synchronous /export of classifier-training. The
+/// resulting path is persisted back into the model metrics so a re-publish
+/// skips the export.
+async fn locate_or_export_onnx(
+    model: &crate::ml_studio::repository::ModelRow,
+    metrics: &serde_json::Value,
+) -> Result<(std::path::PathBuf, OnnxSidecar), String> {
+    let existing = metrics
+        .get("onnx_path")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
+        .map(|p| contained_artifact_file(&p))
+        .transpose()?;
+
+    let onnx_path = if let Some(path) = existing {
+        path
+    } else {
+        let checkpoint = metrics
+            .get("checkpoint_path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "model bez checkpoint_path — trening nie zapisał artefaktu".to_string()
+            })?
+            .to_string();
+        let output_dir = format!("exports/vision-publish/{}", model.model_id);
+        let exported = match model.framework.as_str() {
+            "rfdetr" => {
+                let class_names: Vec<String> = metrics
+                    .get("class_names")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if class_names.is_empty() {
+                    return Err("model bez class_names".to_string());
+                }
+                let variant = metrics
+                    .get("variant")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("base")
+                    .to_string();
+                let resolution = metrics
+                    .get("resolution")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+                    .unwrap_or(560);
+                crate::ml_studio::train_recognition::run_export(
+                    checkpoint,
+                    class_names,
+                    variant,
+                    resolution,
+                    output_dir,
+                )
+                .await
+                .map_err(|e| {
+                    cleanup_publish_export_dir(&model.model_id);
+                    format!("eksport ONNX: {e:#}")
+                })?
+            }
+            "classifier-timm" => {
+                let values: Vec<String> = metrics
+                    .get("values")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if values.len() < 2 {
+                    return Err("model klasyfikatora bez listy klas (values)".to_string());
+                }
+                crate::ml_studio::train_classifier::run_export(
+                    checkpoint,
+                    model.base_model.clone(),
+                    values,
+                    output_dir,
+                )
+                .await
+                .map_err(|e| {
+                    cleanup_publish_export_dir(&model.model_id);
+                    format!("eksport ONNX: {e:#}")
+                })?
+            }
+            other => {
+                return Err(format!(
+                    "framework '{other}' nie jest publikowalny do rejestru vision"
+                ))
+            }
+        };
+        // Containment covers the training-service-returned path exactly like
+        // the metrics-supplied one (both roots are ARTIFACTS_ROOT).
+        let path = contained_artifact_file(std::path::Path::new(&exported)).inspect_err(|_| {
+            // A failed/absent export may have left partial local output —
+            // remove the publish export dir so retries start clean.
+            cleanup_publish_export_dir(&model.model_id);
+        })?;
+        // Persist the export result so re-publish reuses it.
+        let mut updated = metrics.clone();
+        if let Some(obj) = updated.as_object_mut() {
+            obj.insert(
+                "onnx_path".to_string(),
+                serde_json::json!(path.to_string_lossy()),
+            );
+            let _ = repository::update_model_metrics(&model.model_id, &updated.to_string());
+        }
+        path
+    };
+
+    let sidecar_candidate = onnx_path
+        .parent()
+        .map(|d| d.join("classes.json"))
+        .ok_or_else(|| format!("{} nie ma katalogu nadrzędnego", onnx_path.display()))?;
+    let sidecar_path = contained_artifact_file(&sidecar_candidate).map_err(|e| {
+        format!("brak classes.json obok {} — wyeksportuj model ponownie ({e})", onnx_path.display())
+    })?;
+    let sidecar: OnnxSidecar = std::fs::read(&sidecar_path)
+        .map_err(|e| format!("odczyt {}: {e}", sidecar_path.display()))
+        .and_then(|bytes| {
+            serde_json::from_slice(&bytes)
+                .map_err(|e| format!("parse {}: {e}", sidecar_path.display()))
+        })?;
+    if sidecar.classes.is_empty() {
+        return Err(format!("{} nie zawiera klas", sidecar_path.display()));
+    }
+    Ok((onnx_path, sidecar))
+}
+
+/// Best-effort removal of the local publish-export directory
+/// (`ARTIFACTS_ROOT/exports/vision-publish/<model_id>`) after a failed or
+/// timed-out export, so partial output does not accumulate. The training
+/// services expose NO export-cancel endpoint (rfdetr-training: /train,
+/// /status, /export, /export_status, /detect only) — an abandoned export
+/// worker finishes on its own and releases its slot; we can only clean the
+/// artifacts it may have produced.
+fn cleanup_publish_export_dir(model_id: &str) {
+    let dir = crate::paths::ml_artifacts_dir()
+        .join("exports")
+        .join("vision-publish")
+        .join(model_id);
+    if dir.is_dir() {
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!("vision publish: cleanup {}: {e}", dir.display());
+        }
+    }
+}
+
+/// Stages the exported ONNX into `vision_models_dir()` as a temp file and
+/// returns `(sha256, temp_path)`. The caller promotes the temp to the final
+/// registry file name with `rename` ONLY after the DB transaction commits,
+/// and removes the temp on every failure path (blocking I/O — call via
+/// spawn_blocking).
+fn stage_into_vision_dir(
+    src: &std::path::Path,
+    file_name: &str,
+) -> anyhow::Result<(String, std::path::PathBuf)> {
+    use sha2::{Digest, Sha256};
+    let dir = crate::paths::vision_models_dir();
+    std::fs::create_dir_all(&dir)?;
+    let bytes = std::fs::read(src)?;
+    let digest = Sha256::digest(&bytes);
+    let sha256: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let temp = dir.join(format!(
+        ".staging-{}-{}",
+        std::process::id(),
+        file_name
+    ));
+    std::fs::write(&temp, &bytes)?;
+    Ok((sha256, temp))
+}
+
+#[handler(variant = "MlStudioVisionModelPublishRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub async fn ml_studio_vision_model_publish(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::VisionModelPublishRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioVisionModelPublishRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    let model = repository::get_model(&payload.model_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "model not found"))?;
+    require_project_member(&org.user_id, &model.project_id)?;
+
+    let respond = |ok: bool, error: Option<String>| {
+        Ok(MessageBody::MlStudioBody(
+            MlStudioPayload::VisionModelPublishResponse(
+                tentaflow_protocol::MlStudioVisionModelPublishResponse { ok, error },
+            ),
+        ))
+    };
+
+    // The registry name becomes the on-disk file name — validate it with the
+    // repository rule BEFORE any export/filesystem work so `../x` never
+    // reaches a `Path::join`.
+    if let Err(e) = crate::db::repository::validate_vision_model_name(&payload.model_name) {
+        return respond(false, Some(e));
+    }
+
+    let metrics: serde_json::Value = serde_json::from_str(&model.metrics_json)
+        .map_err(|e| ProtocolError::internal(format!("stored metrics corrupt: {}", e)))?;
+
+    // The ONNX artifact lives on the node that trained the model — model files
+    // never sync, so publish must run there (the registry ROW then replicates
+    // and other nodes reach inference through the mesh camera_cv forward).
+    let local_node = ctx.state.local_node_id.to_string();
+    if let Some(node) = metrics
+        .get("node_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != local_node)
+    {
+        return respond(
+            false,
+            Some(format!(
+                "artefakty modelu żyją na węźle '{node}' — uruchom publikację na tym węźle"
+            )),
+        );
+    }
+
+    let (expected_op, contract) = match model.framework.as_str() {
+        "rfdetr" => ("detect", "rfdetr"),
+        "classifier-timm" => ("classify", "softmax"),
+        other => {
+            return respond(
+                false,
+                Some(format!(
+                    "framework '{other}' nie jest publikowalny do rejestru vision"
+                )),
+            )
+        }
+    };
+    if payload.op != expected_op {
+        return respond(
+            false,
+            Some(format!(
+                "model '{}' publikuje się jako op '{}', nie '{}'",
+                model.name, expected_op, payload.op
+            )),
+        );
+    }
+
+    let (onnx_path, sidecar) = match locate_or_export_onnx(&model, &metrics).await {
+        Ok(v) => v,
+        Err(e) => return respond(false, Some(e)),
+    };
+
+    let resolution = match (expected_op, sidecar.resolution, sidecar.image_size) {
+        ("detect", Some(r), _) => r,
+        ("classify", _, Some(s)) => s,
+        _ => {
+            return respond(
+                false,
+                Some("classes.json obok ONNX nie zawiera rozdzielczości wejścia".to_string()),
+            )
+        }
+    };
+    // Both training pipelines normalize with the ImageNet transform; encode it
+    // explicitly so the runner never has to guess.
+    let preprocess_json = serde_json::json!({
+        "resolution": resolution,
+        "mean": [0.485, 0.456, 0.406],
+        "std": [0.229, 0.224, 0.225],
+        "layout": "nchw",
+    })
+    .to_string();
+
+    // Stage the ONNX as a temp file first; the final registry file name only
+    // appears after the DB transaction (row + optional alias) commits, so a
+    // failed registration never leaves a half-published file behind.
+    let file_name = format!("{}.onnx", payload.model_name);
+    let (sha256, temp_path) = {
+        let src = onnx_path.clone();
+        let file_name = file_name.clone();
+        match tokio::task::spawn_blocking(move || stage_into_vision_dir(&src, &file_name))
+            .await
+            .map_err(|e| ProtocolError::internal(format!("copy task: {e}")))?
+        {
+            Ok(v) => v,
+            Err(e) => return respond(false, Some(format!("kopiowanie ONNX: {e:#}"))),
+        }
+    };
+
+    let alias = payload
+        .alias
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let row = crate::db::repository::VisionModelRow {
+        model_name: payload.model_name.clone(),
+        op: expected_op.to_string(),
+        file_name: file_name.clone(),
+        sha256,
+        classes_json: serde_json::to_string(&sidecar.classes)
+            .unwrap_or_else(|_| "[]".to_string()),
+        preprocess_json,
+        output_contract: contract.to_string(),
+        source: "trained".to_string(),
+        default_threshold: payload.threshold,
+        org_id: org.org_id.clone(),
+        project_id: Some(model.project_id.clone()),
+        source_model_id: Some(model.model_id.clone()),
+        created_at: 0,
+        updated_at: 0,
+    };
+    // Registry row and alias mutate in ONE transaction (see
+    // `register_vision_model`) — a concurrent delete cannot interleave between
+    // them and leave the alias pointing at a deleted model.
+    if let Err(e) = crate::db::repository::register_vision_model(&ctx.state.db, &row, alias) {
+        let _ = std::fs::remove_file(&temp_path);
+        return respond(false, Some(e.to_string()));
+    }
+    let final_path = crate::paths::vision_models_dir().join(&file_name);
+    if let Err(e) = std::fs::rename(&temp_path, &final_path) {
+        // The row is committed but the file is not in place; the onnx-cv
+        // reconciler skips file-less rows, so nothing broken is advertised.
+        let _ = std::fs::remove_file(&temp_path);
+        return respond(
+            false,
+            Some(format!("promocja pliku ONNX nieudana: {e}")),
+        );
+    }
+
+    if alias.is_some() {
+        // Alias committed with the row — refresh the router cache/catalog and
+        // broadcast the alias snapshot to the mesh.
+        crate::services::models::broadcast_alias_mutation(
+            &ctx.state.db,
+            &ctx.state.router,
+            &ctx.state.quic_mesh,
+        );
+    }
+
+    crate::services::onnx_cv_service::reconcile_and_announce(&ctx.state);
+    respond(true, None)
+}
+
+#[handler(variant = "MlStudioVisionModelsListRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_vision_models_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::MlStudioBody(MlStudioPayload::VisionModelsListRequest(_)) => {}
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioVisionModelsListRequest",
+            ))
+        }
+    }
+    let org = require_org(ctx)?;
+    let models = crate::db::repository::list_vision_models(&ctx.state.db, Some(&org.org_id))
+        .map_err(|e| ProtocolError::internal(format!("vision models list: {e:#}")))?
+        .into_iter()
+        .map(|r| tentaflow_protocol::MlStudioVisionModelInfo {
+            classes: serde_json::from_str(&r.classes_json).unwrap_or_default(),
+            model_name: r.model_name,
+            op: r.op,
+            file_name: r.file_name,
+            sha256: r.sha256,
+            source: r.source,
+            default_threshold: r.default_threshold,
+            created_at: r.created_at,
+        })
+        .collect();
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::VisionModelsListResponse(
+            tentaflow_protocol::MlStudioVisionModelsListResponse { models },
+        ),
+    ))
+}
+
+#[handler(variant = "MlStudioVisionModelDeleteRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_vision_model_delete(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::VisionModelDeleteRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioVisionModelDeleteRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    let respond = |ok: bool, error: Option<String>| {
+        Ok(MessageBody::MlStudioBody(
+            MlStudioPayload::VisionModelDeleteResponse(
+                tentaflow_protocol::MlStudioVisionModelDeleteResponse { ok, error },
+            ),
+        ))
+    };
+    // Provenance-based authorization (mirror of publish): a row published from
+    // an ML Studio project may be deleted by that project's members; rows
+    // without provenance (imported/synced) fall back to admin-only.
+    let existing = crate::db::repository::get_vision_model(&ctx.state.db, &payload.model_name)
+        .map_err(|e| ProtocolError::internal(format!("vision model read: {e:#}")))?
+        .filter(|r| r.org_id == org.org_id);
+    let Some(existing) = existing else {
+        return respond(
+            false,
+            Some(format!("vision model not found: {}", payload.model_name)),
+        );
+    };
+    match existing.project_id.as_deref() {
+        Some(project_id) => require_project_member(&org.user_id, project_id)?,
+        None => {
+            let pool = crate::db::global_pool()
+                .ok_or_else(|| ProtocolError::internal("core user directory unavailable"))?;
+            let is_admin = crate::db::repository::get_user_role(&pool, &org.user_id)
+                .map_err(db_err)?
+                .map(|(_, is_admin)| is_admin)
+                .unwrap_or(false);
+            if !is_admin {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::PolicyDenied,
+                    "modele bez powiązanego projektu może usuwać tylko administrator",
+                ));
+            }
+        }
+    }
+    let deleted = match crate::db::repository::delete_vision_model(
+        &ctx.state.db,
+        &payload.model_name,
+        Some(&org.org_id),
+    ) {
+        Ok(row) => row,
+        Err(e) => return respond(false, Some(e.to_string())),
+    };
+    // Remove the local ONNX only when no other registry row shares the file
+    // (e.g. the same export published under two names).
+    let still_referenced = crate::db::repository::list_vision_models_all(&ctx.state.db)
+        .map(|rows| rows.iter().any(|r| r.file_name == deleted.file_name))
+        .unwrap_or(true);
+    if !still_referenced {
+        let path = crate::paths::vision_models_dir().join(&deleted.file_name);
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("vision model delete: remove {}: {e}", path.display());
+            }
+        }
+        let trt_cache = crate::paths::vision_models_dir()
+            .join("trt-cache")
+            .join(&deleted.model_name);
+        let _ = std::fs::remove_dir_all(trt_cache);
+    }
+    crate::services::onnx_cv_service::reconcile_and_announce(&ctx.state);
+    respond(true, None)
+}
+
 /// Wmergowuje `export_status="running"` w istniejące metryki modelu, zerując
 /// pola wyniku poprzedniego eksportu (ponowny eksport zaczyna od czysta).
 fn set_export_status_running(metrics: &serde_json::Value) -> String {

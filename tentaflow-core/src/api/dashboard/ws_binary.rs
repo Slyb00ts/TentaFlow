@@ -7,7 +7,7 @@
 //       Pelny dispatch tablicy variantow dokonczy sie po #27 (proc-macro + inventory).
 // =============================================================================
 
-use futures::{stream::SplitSink, SinkExt, StreamExt};
+use futures::{stream::SplitSink, FutureExt, SinkExt, StreamExt};
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -47,10 +47,11 @@ const MEDIA_QUEUE_CAPACITY: usize = 64;
 /// czekajacych na kanale control.
 const SINK_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Interwal serwerowego WS Ping (kanalem control). Klient (przegladarka)
-/// odpowiada Pongiem na poziomie protokolu, co zasila read-idle-timeout —
-/// martwe polaczenie (zamknieta karta, zerwana siec) wykrywamy w ~30 s
-/// zamiast czekac na spozniony blad odczytu TLS (~90-150 s).
+/// Interwal serwerowego WS Ping (pisany przez writer-task wprost do sinka,
+/// z pominieciem kolejek). Klient (przegladarka) odpowiada Pongiem na
+/// poziomie protokolu, co zasila read-idle-timeout — martwe polaczenie
+/// (zamknieta karta, zerwana siec) wykrywamy w ~30 s zamiast czekac na
+/// spozniony blad odczytu TLS (~90-150 s).
 const KEEPALIVE_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Read-idle-timeout: jesli od peera nie przyszla ZADNA ramka (w tym Pong na
@@ -276,29 +277,6 @@ pub async fn handle_ws_connection<S>(
     ));
 
     debug!("binary-WS: nowe polaczenie");
-
-    // Serwerowy keepalive: cykliczny WS Ping kanalem control (priorytet przed
-    // media, wiec wychodzi tez pod obciazeniem). Task konczy sie, gdy writer
-    // polaczenia padnie (send zwraca Err po dropie odbiornika kanalu).
-    {
-        let tx_ping = control_tx.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(KEEPALIVE_PING_INTERVAL);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tick.tick().await;
-                if tx_ping
-                    .send(ControlFrame::Raw(Message::Ping(
-                        tokio_tungstenite::tungstenite::Bytes::new(),
-                    )))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-    }
 
     // Spawnuj task ktory pushuje audit eventy jako unsolicited frames.
     {
@@ -913,9 +891,15 @@ async fn connection_writer<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    // Serwerowy keepalive: WS Ping pisany wprost do sinka co interwal,
+    // bezwarunkowo — klient czysto odbierajacy generuje ruch przychodzacy
+    // (resetujacy read-idle-timeout serwera) wylacznie Pongiem na nasz Ping.
+    let mut ping_tick = tokio::time::interval(KEEPALIVE_PING_INTERVAL);
+    ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     'outer: loop {
         // Najpierw oprozniamy control bez czekania — odpowiedzi sync i Pong
-        // zawsze wyprzedzaja chunki media.
+        // zawsze wyprzedzaja chunki media, a pilne ramki (Close, terminal
+        // error) nie moga czekac na zapis Pinga.
         loop {
             match control_rx.try_recv() {
                 Ok(frame) => {
@@ -926,6 +910,19 @@ async fn connection_writer<S>(
                 Err(mpsc::error::TryRecvError::Empty)
                 | Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
+        }
+        // Tick sprawdzany bez czekania w kazdej iteracji (juz PO drenazu
+        // control), zeby Ping wychodzil takze pod ciaglym ruchem media
+        // (petla nie dociera wtedy do selecta na dole).
+        if ping_tick.tick().now_or_never().is_some()
+            && send_with_timeout(
+                &mut sink,
+                Message::Ping(tokio_tungstenite::tungstenite::Bytes::new()),
+            )
+            .await
+            .is_err()
+        {
+            break;
         }
         if let Some(item) = media.pop() {
             if let Some(bytes) = encode_envelope(item.frame, next_seq(&seq)) {
@@ -959,6 +956,17 @@ async fn connection_writer<S>(
                 None => break,
             },
             _ = media.notify.notified() => {}
+            _ = ping_tick.tick() => {
+                if send_with_timeout(
+                    &mut sink,
+                    Message::Ping(tokio_tungstenite::tungstenite::Bytes::new()),
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
         }
     }
     media.close();

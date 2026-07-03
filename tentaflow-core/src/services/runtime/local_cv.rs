@@ -47,13 +47,19 @@ pub struct CvFrameLocal {
 }
 
 /// Lokalny handler surface `CameraCv`: mapuje `engine_id` embedded backendu na
-/// procesowy singleton modelu i wykonuje operację. Błędy jako `String` —
-/// executor mapuje je na `ExecutorError::Internal`, żeby pętla failover mogła
-/// próbować kolejnych kandydatów.
+/// procesowy singleton modelu i wykonuje operację. `model_name` to ROZWIĄZANA
+/// nazwa modelu z katalogu (po aliasach) — silniki o stałych modelach ją
+/// ignorują, a `onnx-cv` wybiera nią wiersz rejestru `vision_models`. Błędy
+/// jako `String` — executor mapuje je na `ExecutorError::Internal`, żeby pętla
+/// failover mogła próbować kolejnych kandydatów.
 pub struct LocalCameraCvHandler;
 
 impl LocalCameraCvHandler {
-    pub async fn execute(engine_id: &str, op: CameraCvOpLocal) -> Result<CameraCvResult, String> {
+    pub async fn execute(
+        engine_id: &str,
+        model_name: &str,
+        op: CameraCvOpLocal,
+    ) -> Result<CameraCvResult, String> {
         match engine_id {
             "rfdetr-adr" => match op {
                 CameraCvOpLocal::Detect { frames, threshold } => {
@@ -79,9 +85,32 @@ impl LocalCameraCvHandler {
                     engine_id
                 )),
             },
+            // Generyczny runner dynamicznych modeli ONNX z rejestru
+            // `vision_models` — wiersz wybierany po rozwiązanej nazwie modelu.
+            "onnx-cv" => onnx_cv_local(model_name, op).await,
             other => Err(format!("nieznany silnik camera-cv: '{}'", other)),
         }
     }
+}
+
+/// Dispatch do `vision::onnx_cv`: pobiera wiersz rejestru po nazwie modelu
+/// (nazwy są globalnie unikalne — PK tabeli) i wykonuje operację zgodną z
+/// zarejestrowanym kontraktem.
+#[cfg(feature = "inference-supertonic")]
+async fn onnx_cv_local(model_name: &str, op: CameraCvOpLocal) -> Result<CameraCvResult, String> {
+    let pool = crate::db::global_pool()
+        .ok_or_else(|| "onnx-cv: baza danych niedostępna".to_string())?;
+    let row = crate::db::repository::get_vision_model(&pool, model_name)
+        .map_err(|e| format!("onnx-cv: odczyt rejestru: {e:#}"))?
+        .ok_or_else(|| {
+            format!("onnx-cv: model '{model_name}' nie istnieje w rejestrze vision_models")
+        })?;
+    crate::vision::onnx_cv::execute(row, op).await
+}
+
+#[cfg(not(feature = "inference-supertonic"))]
+async fn onnx_cv_local(_model_name: &str, _op: CameraCvOpLocal) -> Result<CameraCvResult, String> {
+    Err("onnx-cv wymaga feature 'inference-supertonic' (ONNX Runtime)".into())
 }
 
 /// Detekcja RF-DETR na batchu klatek. Używa TEGO SAMEGO procesowego singletonu

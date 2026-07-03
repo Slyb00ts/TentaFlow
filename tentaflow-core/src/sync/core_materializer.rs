@@ -47,6 +47,7 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::ModelMetricsRollup
             | CoreSyncResourceKind::ModelPricing
             | CoreSyncResourceKind::CameraCvPipeline
+            | CoreSyncResourceKind::VisionModel
     )
 }
 
@@ -149,6 +150,7 @@ pub fn apply_core_operation(
         }
         CoreSyncResourceKind::ModelPricing => apply_model_pricing(&tx, operation)?,
         CoreSyncResourceKind::CameraCvPipeline => apply_camera_cv_pipeline(&tx, operation)?,
+        CoreSyncResourceKind::VisionModel => apply_vision_model(&tx, operation)?,
     };
 
     if lww_tracked {
@@ -2219,6 +2221,114 @@ fn apply_camera_cv_pipeline(
             tx.execute(
                 "DELETE FROM camera_cv_pipelines WHERE id = ?1",
                 rusqlite::params![id],
+            )
+            .map_err(sql_error)
+        }
+    }
+}
+
+/// Apply a replicated `vision_models` row. Only the row METADATA replicates —
+/// the ONNX file stays on the node that published it, and the local `onnx-cv`
+/// service reconciler skips rows whose file is absent, so a metadata-only node
+/// never advertises a model it cannot serve. Structural validation reuses the
+/// exact checks local registration enforces (bad op/contract, path-traversing
+/// file_name, malformed JSON) so a hostile peer cannot land a poisoned row.
+fn apply_vision_model(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let model_name = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            let op = field_string(operation, "op")?;
+            let file_name = field_string(operation, "file_name")?;
+            let sha256 = field_string(operation, "sha256")?;
+            let classes_json = field_string_or(operation, "classes_json", "[]")?;
+            let preprocess_json = field_string_or(operation, "preprocess_json", "{}")?;
+            let output_contract = field_string(operation, "output_contract")?;
+            let source = field_string(operation, "source")?;
+            let default_threshold = match operation.body.changed_fields.get("default_threshold") {
+                Some(FieldValue::Decimal(v)) => v.parse::<f64>().ok(),
+                Some(FieldValue::I64(v)) => Some(*v as f64),
+                Some(FieldValue::U64(v)) => Some(*v as f64),
+                _ => None,
+            };
+            let org_id =
+                field_string_or(operation, "org_id", crate::services::org::DEFAULT_ORG_ID)?;
+            let project_id = field_optional_string(operation, "project_id")?;
+            let source_model_id = field_optional_string(operation, "source_model_id")?;
+            if let Err(err) = crate::db::repository::validate_vision_model_fields(
+                model_name,
+                &op,
+                &file_name,
+                &sha256,
+                &classes_json,
+                &preprocess_json,
+                &output_contract,
+                &source,
+            ) {
+                tracing::warn!(
+                    "core sync: skipping invalid vision model '{}' from node '{}': {}",
+                    model_name,
+                    operation.body.actor_node_id,
+                    err
+                );
+                return Ok(0);
+            }
+            // Org-guarded upsert (mirror of the local `register_vision_model`):
+            // `model_name` is the PK, so a replicated row from ANOTHER org must
+            // not overwrite an existing row — 0 changed rows means a cross-org
+            // name collision, which we log and skip instead of hijacking.
+            let changed = tx
+                .execute(
+                    "INSERT INTO vision_models \
+                     (model_name, op, file_name, sha256, classes_json, preprocess_json, \
+                      output_contract, source, default_threshold, org_id, project_id, \
+                      source_model_id, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
+                     CAST(strftime('%s','now') AS INTEGER), CAST(strftime('%s','now') AS INTEGER)) \
+                     ON CONFLICT(model_name) DO UPDATE SET \
+                     op = excluded.op, file_name = excluded.file_name, sha256 = excluded.sha256, \
+                     classes_json = excluded.classes_json, \
+                     preprocess_json = excluded.preprocess_json, \
+                     output_contract = excluded.output_contract, source = excluded.source, \
+                     default_threshold = excluded.default_threshold, \
+                     project_id = excluded.project_id, \
+                     source_model_id = excluded.source_model_id, \
+                     updated_at = CAST(strftime('%s','now') AS INTEGER) \
+                     WHERE vision_models.org_id = excluded.org_id",
+                    rusqlite::params![
+                        model_name,
+                        op,
+                        file_name,
+                        sha256,
+                        classes_json,
+                        preprocess_json,
+                        output_contract,
+                        source,
+                        default_threshold,
+                        org_id,
+                        project_id,
+                        source_model_id,
+                    ],
+                )
+                .map_err(sql_error)?;
+            if changed == 0 {
+                tracing::warn!(
+                    "core sync: vision model '{}' from node '{}' collides with another org's \
+                     row — skipped",
+                    model_name,
+                    operation.body.actor_node_id
+                );
+            }
+            Ok(changed)
+        }
+        ActionType::Delete => {
+            let org_id =
+                field_string_or(operation, "org_id", crate::services::org::DEFAULT_ORG_ID)?;
+            tx.execute(
+                "DELETE FROM vision_models WHERE model_name = ?1 AND org_id = ?2",
+                rusqlite::params![model_name, org_id],
             )
             .map_err(sql_error)
         }

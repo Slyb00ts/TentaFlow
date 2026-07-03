@@ -2714,6 +2714,50 @@ pub fn encode_ml_studio_service_models_list_request(
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeMlStudioVisionModelPublishRequest)]
+pub fn encode_ml_studio_vision_model_publish_request(
+    model_id: String,
+    model_name: String,
+    op: String,
+    threshold: Option<f64>,
+    alias: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::VisionModelPublishRequest(
+            tentaflow_protocol::MlStudioVisionModelPublishRequest {
+                model_id,
+                model_name,
+                op,
+                threshold,
+                alias,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioVisionModelsListRequest)]
+pub fn encode_ml_studio_vision_models_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::VisionModelsListRequest(
+            tentaflow_protocol::MlStudioVisionModelsListRequest {},
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioVisionModelDeleteRequest)]
+pub fn encode_ml_studio_vision_model_delete_request(
+    model_name: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::VisionModelDeleteRequest(
+            tentaflow_protocol::MlStudioVisionModelDeleteRequest { model_name },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioRecogDatasetRegisterRequest)]
 pub fn encode_ml_studio_recog_dataset_register_request(
     project_id: String,
@@ -10819,6 +10863,73 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "variant", "MlStudioServiceModelsListResponse".into());
             set(obj, "modelsJson", resp.models_json.clone().into());
             set(obj, "models_json", resp.models_json.into());
+        }
+        tentaflow_protocol::MlStudioPayload::VisionModelPublishRequest(req) => {
+            set(obj, "variant", "MlStudioVisionModelPublishRequest".into());
+            set(obj, "modelId", req.model_id.clone().into());
+            set(obj, "model_id", req.model_id.into());
+            set(obj, "modelName", req.model_name.clone().into());
+            set(obj, "model_name", req.model_name.into());
+            set(obj, "op", req.op.into());
+            match req.threshold {
+                Some(t) => set(obj, "threshold", t.into()),
+                None => set(obj, "threshold", JsValue::NULL),
+            }
+            match req.alias {
+                Some(a) => set(obj, "alias", a.into()),
+                None => set(obj, "alias", JsValue::NULL),
+            }
+        }
+        tentaflow_protocol::MlStudioPayload::VisionModelPublishResponse(resp) => {
+            set(obj, "variant", "MlStudioVisionModelPublishResponse".into());
+            set(obj, "ok", resp.ok.into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+        }
+        tentaflow_protocol::MlStudioPayload::VisionModelsListRequest(_) => {
+            set(obj, "variant", "MlStudioVisionModelsListRequest".into());
+        }
+        tentaflow_protocol::MlStudioPayload::VisionModelsListResponse(resp) => {
+            set(obj, "variant", "MlStudioVisionModelsListResponse".into());
+            let arr = js_sys::Array::new();
+            for m in &resp.models {
+                let entry = js_sys::Object::new();
+                set(&entry, "modelName", m.model_name.clone().into());
+                set(&entry, "model_name", m.model_name.clone().into());
+                set(&entry, "op", m.op.clone().into());
+                set(&entry, "fileName", m.file_name.clone().into());
+                set(&entry, "file_name", m.file_name.clone().into());
+                set(&entry, "sha256", m.sha256.clone().into());
+                let classes = js_sys::Array::new();
+                for c in &m.classes {
+                    classes.push(&JsValue::from_str(c));
+                }
+                set(&entry, "classes", classes.into());
+                set(&entry, "source", m.source.clone().into());
+                match m.default_threshold {
+                    Some(t) => set(&entry, "defaultThreshold", t.into()),
+                    None => set(&entry, "defaultThreshold", JsValue::NULL),
+                }
+                set(&entry, "createdAt", (m.created_at as f64).into());
+                set(&entry, "created_at", (m.created_at as f64).into());
+                arr.push(&entry);
+            }
+            set(obj, "models", arr.into());
+        }
+        tentaflow_protocol::MlStudioPayload::VisionModelDeleteRequest(req) => {
+            set(obj, "variant", "MlStudioVisionModelDeleteRequest".into());
+            set(obj, "modelName", req.model_name.clone().into());
+            set(obj, "model_name", req.model_name.into());
+        }
+        tentaflow_protocol::MlStudioPayload::VisionModelDeleteResponse(resp) => {
+            set(obj, "variant", "MlStudioVisionModelDeleteResponse".into());
+            set(obj, "ok", resp.ok.into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
         }
     }
 }

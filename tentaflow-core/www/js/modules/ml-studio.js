@@ -5720,6 +5720,10 @@ function renderModelsTab(panel, p) {
           // baseModel) → „Eksportuj GGUF"; klasyfikator timm → eksport ONNX;
           // wdrożony FT → też „Zapytaj".
           _isRecog: framework === 'rfdetr',
+          _framework: framework,
+          // Modele wizyjne (RF-DETR / klasyfikator timm) można opublikować do
+          // rejestru vision_models — pipeline'y kamer użyją ich bez rekompilacji.
+          _canPublishVision: Boolean(modelId && (framework === 'rfdetr' || framework === 'classifier-timm')),
           _canExport: Boolean(modelId && framework !== 'rfdetr' && (baseModel.trim().length > 0 || framework === 'classifier-timm')),
           _canChat: Boolean(modelId && deployed),
           _deploying: Boolean(modelId && deploying),
@@ -5730,14 +5734,43 @@ function renderModelsTab(panel, p) {
       // handlerem klika — działa w shadow DOM (delegacja z light DOM by nie złapała).
       table.rowActions = (row) => {
         if (!row) return null;
+        const publishBtn = () => {
+          const pub = document.createElement('tf-button');
+          pub.setAttribute('size', 'sm');
+          pub.setAttribute('variant', 'outline');
+          pub.setAttribute('icon', 'eye');
+          pub.textContent = 'Publikuj do kamer';
+          pub.addEventListener('click', () => openVisionPublishPanel(p, row, () => renderModelsTab(panel, p)));
+          return pub;
+        };
         if (row._isRecog) {
+          const wrap = document.createElement('div');
+          wrap.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap';
           const btn = document.createElement('tf-button');
           btn.setAttribute('size', 'sm');
           btn.setAttribute('variant', 'outline');
           btn.setAttribute('icon', 'image');
           btn.textContent = 'Wykryj na zdjęciu';
           btn.addEventListener('click', () => openRecogDetectPanel(p, row._modelId, row._modelName));
-          return btn;
+          wrap.appendChild(btn);
+          wrap.appendChild(publishBtn());
+          return wrap;
+        }
+        if (row._canPublishVision && !row._canChat && !row._canDeploy && !row._deploying && !row._canExport) {
+          return publishBtn();
+        }
+        if (row._canPublishVision && row._canExport && !row._canChat && !row._canDeploy && !row._deploying) {
+          const wrap = document.createElement('div');
+          wrap.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap';
+          wrap.appendChild(publishBtn());
+          const exp = document.createElement('tf-button');
+          exp.setAttribute('size', 'sm');
+          exp.setAttribute('variant', 'outline');
+          exp.setAttribute('icon', 'package');
+          exp.textContent = 'Eksportuj GGUF';
+          exp.addEventListener('click', () => openFtExportPanel(p, row._modelId, row._modelName));
+          wrap.appendChild(exp);
+          return wrap;
         }
         // Model FT: gdy wdrożony → przycisk „Zapytaj"; w przeciwnym razie eksport.
         if (row._canChat) {
@@ -5795,6 +5828,7 @@ function renderModelsTab(panel, p) {
       };
       const tableHost = byId('ml-studio-models-table');
       tableHost?.appendChild(table);
+      renderVisionRegistrySection(panel, p);
     })
     .catch((err) => {
       panel.innerHTML = '';
@@ -5804,6 +5838,146 @@ function renderModelsTab(panel, p) {
       empty.setAttribute('message', err.message || 'Błąd protokołu ML Studio.');
       panel.appendChild(empty);
     });
+}
+
+// Sekcja „Modele wizyjne" — rejestr vision_models (dynamiczne ONNX serwowane
+// przez silnik onnx-cv w pipeline'ach kamer). Rejestr jest wspólny dla całej
+// organizacji; publikacja z tabeli modeli powyżej dodaje tu wiersz.
+function renderVisionRegistrySection(panel, p) {
+  const card = document.createElement('div');
+  card.className = 'ml-studio-section-card';
+  card.innerHTML = `
+    <div class="ml-studio-section-card-head">
+      <div class="title">${sprite('eye')} Modele wizyjne <span class="ml-studio-section-sub">— rejestr modeli kamer (onnx-cv, cała organizacja)</span></div>
+    </div>
+    <div data-vision-registry-body></div>
+  `;
+  panel.appendChild(card);
+  const body = card.querySelector('[data-vision-registry-body]');
+
+  ApiBinary.one('mlStudioVisionModelsListRequest', {})
+    .then((resp) => {
+      const models = Array.isArray(resp.models) ? resp.models : [];
+      if (!models.length) {
+        const empty = document.createElement('tf-empty-state');
+        empty.setAttribute('icon', 'eye');
+        empty.setAttribute('title', 'Brak modeli wizyjnych');
+        empty.setAttribute('message', 'Opublikuj wytrenowany model detekcji lub klasyfikacji, aby pipeline\'y kamer mogły go używać.');
+        body.appendChild(empty);
+        return;
+      }
+      const table = document.createElement('tf-table');
+      table.setAttribute('variant', 'lined');
+      table.innerHTML = `
+        <tf-column key="name" label="Nazwa"></tf-column>
+        <tf-column key="op" label="Operacja"></tf-column>
+        <tf-column key="source" label="Źródło"></tf-column>
+        <tf-column key="classes" label="Klasy"></tf-column>
+        <tf-column key="sha" label="SHA-256"></tf-column>
+        <tf-column key="createdAt" label="Dodany"></tf-column>
+      `;
+      table.rows = models.map((m) => ({
+        name: String(m.modelName ?? m.model_name ?? ''),
+        op: String(m.op ?? '') === 'detect' ? 'detekcja' : 'klasyfikacja',
+        source: String(m.source ?? ''),
+        classes: String((m.classes || []).length),
+        sha: String(m.sha256 ?? '').slice(0, 12),
+        createdAt: formatRelative(m.createdAt ?? m.created_at),
+        _modelName: String(m.modelName ?? m.model_name ?? ''),
+      }));
+      table.rowActions = (row) => {
+        if (!row) return null;
+        const del = document.createElement('tf-button');
+        del.setAttribute('size', 'sm');
+        del.setAttribute('variant', 'danger');
+        del.setAttribute('icon', 'trash');
+        del.textContent = 'Usuń';
+        del.addEventListener('click', async () => {
+          if (!window.confirm(`Usunąć model wizyjny „${row._modelName}" z rejestru?`)) return;
+          try {
+            const resp = await ApiBinary.one('mlStudioVisionModelDeleteRequest', { modelName: row._modelName });
+            if (!resp.ok) throw new Error(resp.error || 'usunięcie odrzucone');
+            toast(`Model „${row._modelName}" usunięty z rejestru`, 'success');
+            renderModelsTab(panel, p);
+          } catch (err) {
+            toast(`Usuwanie modelu: ${err.message}`, 'error');
+          }
+        });
+        return del;
+      };
+      body.appendChild(table);
+    })
+    .catch((err) => {
+      body.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} Rejestr modeli wizyjnych: ${escapeHtml(err.message || String(err))}</div>`;
+    });
+}
+
+// Publikacja wytrenowanego modelu do rejestru vision_models. Dla RF-DETR bez
+// wyeksportowanego ONNX Core sam uruchamia eksport na serwisie treningowym —
+// to może potrwać kilka minut, więc modal pokazuje stan i nie polega na kliku.
+function openVisionPublishPanel(p, row, onDone) {
+  const modelId = row._modelId;
+  if (!modelId) return;
+  const op = row._framework === 'rfdetr' ? 'detect' : 'classify';
+  const suggested = String(row._modelName || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9-_]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  const modal = document.createElement('tf-modal');
+  modal.setAttribute('variant', 'modal');
+  modal.setAttribute('title', `Publikuj do kamer — ${row._modelName}`);
+  modal.setAttribute('size', 'md');
+  modal.innerHTML = `
+    <div slot="body">
+      <p class="ml-studio-export-intro">Model trafi do rejestru modeli wizyjnych (silnik onnx-cv). Pipeline'y kamer wskazują go przez alias lub bezpośrednio po nazwie — bez rekompilacji. Jeśli ONNX nie był jeszcze wyeksportowany, eksport uruchomi się automatycznie (RF-DETR: kilka minut).</p>
+      <tf-input id="ml-studio-vision-name" label="Nazwa w rejestrze (a-z, 0-9, -, _)" value="${escapeAttr(suggested)}"></tf-input>
+      <tf-select id="ml-studio-vision-op" label="Operacja" value="${op}" disabled>
+        <option value="${op}">${op === 'detect' ? 'detekcja (RF-DETR)' : 'klasyfikacja (softmax)'}</option>
+      </tf-select>
+      ${op === 'detect' ? '<tf-input type="number" id="ml-studio-vision-threshold" label="Domyślny próg pewności" value="0.5" min="0" max="1" step="0.05"></tf-input>' : ''}
+      <tf-input id="ml-studio-vision-alias" label="Alias (opcjonalnie, np. tentavision-detect)"></tf-input>
+      <div id="ml-studio-vision-publish-status" style="margin-top:10px"></div>
+    </div>
+    <div slot="footer">
+      <tf-button variant="ghost" data-vision-close>Anuluj</tf-button>
+      <tf-button variant="primary" icon="eye" id="ml-studio-vision-go">Publikuj</tf-button>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  modal.setAttribute('open', '');
+  const close = () => { try { modal.remove(); } catch (_) {} };
+  modal.querySelector('[data-vision-close]')?.addEventListener('click', close);
+  modal.addEventListener('close', close);
+
+  const go = modal.querySelector('#ml-studio-vision-go');
+  go?.addEventListener('click', async () => {
+    const status = modal.querySelector('#ml-studio-vision-publish-status');
+    const modelName = String(modal.querySelector('#ml-studio-vision-name')?.value || '').trim();
+    if (!/^[a-z0-9-_]+$/.test(modelName)) {
+      if (status) status.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} Nazwa musi pasować do [a-z0-9-_]+.</div>`;
+      return;
+    }
+    const thresholdRaw = modal.querySelector('#ml-studio-vision-threshold')?.value;
+    const alias = String(modal.querySelector('#ml-studio-vision-alias')?.value || '').trim();
+    go.setAttribute('disabled', '');
+    if (status) status.innerHTML = '<tf-spinner></tf-spinner> publikacja (eksport ONNX może potrwać kilka minut)…';
+    try {
+      const resp = await ApiBinary.action('mlStudioVisionModelPublishRequest', {
+        modelId,
+        modelName,
+        op,
+        threshold: op === 'detect' && thresholdRaw !== undefined && thresholdRaw !== '' ? Number(thresholdRaw) : null,
+        alias: alias || null,
+      }, { timeoutMs: 20 * 60 * 1000 });
+      if (!resp.ok) throw new Error(resp.error || 'publikacja odrzucona');
+      toast(`Model „${modelName}" opublikowany do rejestru kamer`, 'success');
+      close();
+      if (typeof onDone === 'function') onDone();
+    } catch (err) {
+      go.removeAttribute('disabled');
+      if (status) status.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} Publikacja nieudana: ${escapeHtml(err.message || String(err))}</div>`;
+    }
+  });
 }
 
 // Detekcja na zdjęciu modelem RF-DETR (R4). Modal: upload małego obrazu +

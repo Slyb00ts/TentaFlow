@@ -2848,21 +2848,36 @@ pub fn create_model_alias_with_chain_check(
     fallback_targets: Option<&str>,
     strategy: Option<&str>,
 ) -> Result<i64> {
-    let candidates = collect_chain_candidates(target_model, fallback_targets)?;
     let conn = acquire(pool)?;
     let tx = conn.unchecked_transaction()?;
+    let id = create_model_alias_with_chain_check_tx(&tx, alias, target_model, fallback_targets, strategy)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Tx-level body of [`create_model_alias_with_chain_check`] — shared with
+/// writers that must mutate an alias atomically WITH another row (vision
+/// model publish registers the model and its alias in one transaction).
+pub(crate) fn create_model_alias_with_chain_check_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias: &str,
+    target_model: &str,
+    fallback_targets: Option<&str>,
+    strategy: Option<&str>,
+) -> Result<i64> {
+    let candidates = collect_chain_candidates(target_model, fallback_targets)?;
     for name in &candidates {
         if name.is_empty() {
             continue;
         }
-        if alias_is_active_within_tx(&tx, name, None)? {
+        if alias_is_active_within_tx(tx, name, None)? {
             anyhow::bail!(
                 "'{}' is itself an active alias; aliases of aliases are not supported",
                 name
             );
         }
     }
-    if alias_is_inbound_target_within_tx(&tx, alias, None)? {
+    if alias_is_inbound_target_within_tx(tx, alias, None)? {
         anyhow::bail!(
             "alias '{}' is already used as a target/fallback by another active alias; \
              registering it would create a chain",
@@ -2876,14 +2891,38 @@ pub fn create_model_alias_with_chain_check(
         "INSERT INTO model_aliases (alias, target_model, is_active, fallback_targets, strategy) VALUES (?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![alias, target_model, active, fallback_targets, strategy.unwrap_or("first_available")],
     )?;
-    let id = tx.last_insert_rowid();
-    tx.commit()?;
-    Ok(id)
+    Ok(tx.last_insert_rowid())
 }
 
 /// Atomic update — same rationale as the create variant.
 pub fn update_model_alias_with_chain_check(
     pool: &DbPool,
+    id: i64,
+    alias: &str,
+    target_model: &str,
+    is_active: bool,
+    fallback_targets: Option<&str>,
+    strategy: Option<&str>,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    update_model_alias_with_chain_check_tx(
+        &tx,
+        id,
+        alias,
+        target_model,
+        is_active,
+        fallback_targets,
+        strategy,
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Tx-level body of [`update_model_alias_with_chain_check`] — see the create
+/// variant for why writers may need to compose this into a larger transaction.
+pub(crate) fn update_model_alias_with_chain_check_tx(
+    tx: &rusqlite::Transaction<'_>,
     id: i64,
     alias: &str,
     target_model: &str,
@@ -2898,20 +2937,18 @@ pub fn update_model_alias_with_chain_check(
     } else {
         Vec::new()
     };
-    let conn = acquire(pool)?;
-    let tx = conn.unchecked_transaction()?;
     for name in &candidates {
         if name.is_empty() {
             continue;
         }
-        if alias_is_active_within_tx(&tx, name, Some(id))? {
+        if alias_is_active_within_tx(tx, name, Some(id))? {
             anyhow::bail!(
                 "'{}' is itself an active alias; aliases of aliases are not supported",
                 name
             );
         }
     }
-    if is_active && alias_is_inbound_target_within_tx(&tx, alias, Some(id))? {
+    if is_active && alias_is_inbound_target_within_tx(tx, alias, Some(id))? {
         anyhow::bail!(
             "alias '{}' is already used as a target/fallback by another active alias; \
              activating this row would create a chain",
@@ -2922,7 +2959,6 @@ pub fn update_model_alias_with_chain_check(
         "UPDATE model_aliases SET alias = ?2, target_model = ?3, is_active = ?4, fallback_targets = ?5, strategy = ?6 WHERE id = ?1",
         rusqlite::params![id, alias, target_model, is_active, fallback_targets, strategy.unwrap_or("first_available")],
     )?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -6159,6 +6195,26 @@ pub fn reseed_core_state_from_current_rows(
                             is_default,
                             &org_id,
                         ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::VisionModel => {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT {VISION_MODEL_COLS} FROM vision_models"
+                ))?;
+                let rows = stmt
+                    .query_map([], map_vision_model_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for row in rows {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &row.org_id,
+                        row.model_name.clone(),
+                        Insert,
+                        vision_model_changed_fields(&row),
                         None,
                     )?;
                     emitted += 1;
@@ -22108,6 +22164,460 @@ pub fn delete_camera_cv_pipeline(
     Ok(())
 }
 
+// --- Vision model registry (dynamic camera-CV ONNX models) ---
+
+/// One `vision_models` row: a dynamic ONNX model (trained in ML Studio or
+/// imported) served by the generic `onnx-cv` embedded engine. Bundled fixed
+/// engines never appear here — they resolve through their fixed engine ids.
+#[derive(Debug, Clone)]
+pub struct VisionModelRow {
+    pub model_name: String,
+    pub op: String,
+    pub file_name: String,
+    pub sha256: String,
+    pub classes_json: String,
+    pub preprocess_json: String,
+    pub output_contract: String,
+    pub source: String,
+    pub default_threshold: Option<f64>,
+    pub org_id: String,
+    /// Provenance: ML Studio project the model was published from. `None` for
+    /// imported/synced rows — delete then falls back to admin-only.
+    pub project_id: Option<String>,
+    /// Provenance: ML Studio `models.model_id` the ONNX was exported from.
+    pub source_model_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+fn map_vision_model_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<VisionModelRow> {
+    Ok(VisionModelRow {
+        model_name: r.get(0)?,
+        op: r.get(1)?,
+        file_name: r.get(2)?,
+        sha256: r.get(3)?,
+        classes_json: r.get(4)?,
+        preprocess_json: r.get(5)?,
+        output_contract: r.get(6)?,
+        source: r.get(7)?,
+        default_threshold: r.get(8)?,
+        org_id: r.get(9)?,
+        project_id: r.get(10)?,
+        source_model_id: r.get(11)?,
+        created_at: r.get(12)?,
+        updated_at: r.get(13)?,
+    })
+}
+
+const VISION_MODEL_COLS: &str = "model_name, op, file_name, sha256, classes_json, \
+     preprocess_json, output_contract, source, default_threshold, org_id, \
+     project_id, source_model_id, created_at, updated_at";
+
+/// Registry model-name rule shared by the repository validator AND the ML
+/// Studio publish handler — the handler must validate BEFORE any filesystem
+/// work because the name becomes the on-disk file name.
+pub(crate) fn validate_vision_model_name(model_name: &str) -> std::result::Result<(), String> {
+    if model_name.is_empty() || model_name.len() > 128 {
+        return Err("model_name must be 1..=128 characters".into());
+    }
+    if !model_name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    {
+        return Err(format!("model_name '{model_name}' must match [a-z0-9-_]+"));
+    }
+    Ok(())
+}
+
+/// Structural validation shared by local registration and the sync
+/// materializer, so a hostile/buggy peer cannot land a row the runner would
+/// choke on (or a file name that escapes `vision_models_dir()`).
+///
+/// Registry v1 supports `detect`+`rfdetr` and `classify`+`softmax` only. The
+/// OCR contracts (plate/ppocr) stay on the fixed engines; `embed` is admitted
+/// by the table CHECK (future-proofing) but rejected here because
+/// `CameraCvOp` has no Embed variant yet.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_vision_model_fields(
+    model_name: &str,
+    op: &str,
+    file_name: &str,
+    sha256: &str,
+    classes_json: &str,
+    preprocess_json: &str,
+    output_contract: &str,
+    source: &str,
+) -> std::result::Result<(), String> {
+    validate_vision_model_name(model_name)?;
+    match (op, output_contract) {
+        ("detect", "rfdetr") | ("classify", "softmax") => {}
+        ("embed", _) => {
+            return Err("op 'embed' is not supported by camera pipelines yet".into());
+        }
+        ("ocr", _) => {
+            return Err(
+                "op 'ocr' stays on the fixed OCR engines (plate-ocr/onnx-ocr/apple-ocr)".into(),
+            );
+        }
+        (o, c) => {
+            return Err(format!(
+                "unsupported op/contract combination '{o}'/'{c}' \
+                 (supported: detect/rfdetr, classify/softmax)"
+            ));
+        }
+    }
+    if file_name.is_empty()
+        || file_name.contains('/')
+        || file_name.contains('\\')
+        || file_name.contains("..")
+        || file_name.starts_with('.')
+    {
+        return Err(format!(
+            "file_name '{file_name}' must be a plain file name without path separators"
+        ));
+    }
+    if !std::path::Path::new(file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("onnx"))
+    {
+        return Err(format!("file_name '{file_name}' must end in .onnx"));
+    }
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("sha256 must be 64 hex characters".into());
+    }
+    // Size caps: these blobs replicate mesh-wide and are parsed on every
+    // session load — bound them so a hostile peer cannot bloat the table.
+    if classes_json.len() > 64 * 1024 {
+        return Err("classes_json exceeds 64 KiB".into());
+    }
+    let classes: serde_json::Value =
+        serde_json::from_str(classes_json).map_err(|e| format!("classes_json invalid: {e}"))?;
+    let classes = classes
+        .as_array()
+        .ok_or_else(|| "classes_json must be a JSON array".to_string())?;
+    if classes.is_empty() {
+        return Err("classes_json must list at least one class".into());
+    }
+    if classes.len() > 512 {
+        return Err(format!(
+            "classes_json lists {} classes (max 512)",
+            classes.len()
+        ));
+    }
+    for class in classes {
+        let name = class
+            .as_str()
+            .ok_or_else(|| "classes_json entries must be strings".to_string())?;
+        if name.is_empty() || name.len() > 128 {
+            return Err("class names must be 1..=128 characters".into());
+        }
+    }
+    if preprocess_json.len() > 4 * 1024 {
+        return Err("preprocess_json exceeds 4 KiB".into());
+    }
+    let preprocess: serde_json::Value = serde_json::from_str(preprocess_json)
+        .map_err(|e| format!("preprocess_json invalid: {e}"))?;
+    let preprocess_obj = preprocess
+        .as_object()
+        .ok_or_else(|| "preprocess_json must be a JSON object".to_string())?;
+    let resolution = preprocess_obj
+        .get("resolution")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "preprocess_json requires an integer 'resolution'".to_string())?;
+    if !(32..=4096).contains(&resolution) {
+        return Err(format!(
+            "preprocess resolution {resolution} out of range (32..=4096)"
+        ));
+    }
+    if let Some(layout) = preprocess_obj.get("layout") {
+        if !layout
+            .as_str()
+            .is_some_and(|l| l.eq_ignore_ascii_case("nchw"))
+        {
+            return Err("preprocess layout must be 'nchw'".into());
+        }
+    }
+    if !matches!(source, "bundled" | "trained" | "imported") {
+        return Err(format!("unknown source '{source}'"));
+    }
+    Ok(())
+}
+
+/// Replicated field set for a `vision_models` row. Timestamps are node-local.
+fn vision_model_changed_fields(
+    row: &VisionModelRow,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    use crate::sync::ledger::FieldValue;
+    let mut fields = BTreeMap::new();
+    fields.insert("op".to_string(), field_string(&row.op));
+    fields.insert("file_name".to_string(), field_string(&row.file_name));
+    fields.insert("sha256".to_string(), field_string(&row.sha256));
+    fields.insert("classes_json".to_string(), field_string(&row.classes_json));
+    fields.insert(
+        "preprocess_json".to_string(),
+        field_string(&row.preprocess_json),
+    );
+    fields.insert(
+        "output_contract".to_string(),
+        field_string(&row.output_contract),
+    );
+    fields.insert("source".to_string(), field_string(&row.source));
+    fields.insert(
+        "default_threshold".to_string(),
+        match row.default_threshold {
+            Some(v) => FieldValue::Decimal(v.to_string()),
+            None => FieldValue::Null,
+        },
+    );
+    fields.insert("org_id".to_string(), field_string(&row.org_id));
+    fields.insert(
+        "project_id".to_string(),
+        field_optional_string(row.project_id.as_deref()),
+    );
+    fields.insert(
+        "source_model_id".to_string(),
+        field_optional_string(row.source_model_id.as_deref()),
+    );
+    fields
+}
+
+/// Lists every vision model regardless of org — used by the `onnx-cv`
+/// service reconciler, which advertises catalog entries for all servable
+/// models on this node (catalog model names are org-agnostic).
+pub fn list_vision_models_all(pool: &DbPool) -> Result<Vec<VisionModelRow>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {VISION_MODEL_COLS} FROM vision_models ORDER BY model_name ASC"
+    ))?;
+    let rows = stmt
+        .query_map([], map_vision_model_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Lists the caller org's vision models ordered by name.
+pub fn list_vision_models(pool: &DbPool, org_id: Option<&str>) -> Result<Vec<VisionModelRow>> {
+    let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {VISION_MODEL_COLS} FROM vision_models WHERE org_id = ?1 ORDER BY model_name ASC"
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![resolved_org], map_vision_model_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Fetches one vision model by its globally-unique name, regardless of org.
+/// The execution path (camera engine → `onnx-cv` local handler) runs in
+/// system context and resolves purely by catalog model name, so it must not
+/// be org-filtered; org scoping applies to the admin CRUD surface only.
+pub fn get_vision_model(pool: &DbPool, model_name: &str) -> Result<Option<VisionModelRow>> {
+    let conn = acquire(pool)?;
+    let row = conn
+        .query_row(
+            &format!("SELECT {VISION_MODEL_COLS} FROM vision_models WHERE model_name = ?1"),
+            rusqlite::params![model_name],
+            map_vision_model_row,
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Upserts a vision model row after structural validation. Org-guarded like
+/// `save_camera_cv_pipeline`: a name collision with another org's row changes
+/// nothing and is refused. Captures the write for mesh sync (metadata only —
+/// the ONNX file itself never syncs).
+///
+/// `alias` (optional) is created/retargeted at the new model IN THE SAME
+/// transaction — a concurrent `delete_vision_model` therefore either sees
+/// both the row and the alias (delete refused) or neither, never an alias
+/// pointing at a deleted model. An existing alias keeps its strategy and
+/// fallback list; only the primary target moves.
+pub fn register_vision_model(
+    pool: &DbPool,
+    row: &VisionModelRow,
+    alias: Option<&str>,
+) -> std::result::Result<(), CvPipelineWriteError> {
+    validate_vision_model_fields(
+        &row.model_name,
+        &row.op,
+        &row.file_name,
+        &row.sha256,
+        &row.classes_json,
+        &row.preprocess_json,
+        &row.output_contract,
+        &row.source,
+    )
+    .map_err(CvPipelineWriteError::Refused)?;
+    let mut conn = acquire(pool).map_err(CvPipelineWriteError::Db)?;
+    let tx = conn.transaction()?;
+    let now = chrono::Utc::now().timestamp();
+    let changed = tx.execute(
+        "INSERT INTO vision_models \
+         (model_name, op, file_name, sha256, classes_json, preprocess_json, \
+          output_contract, source, default_threshold, org_id, project_id, \
+          source_model_id, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13) \
+         ON CONFLICT(model_name) DO UPDATE SET \
+         op = excluded.op, file_name = excluded.file_name, sha256 = excluded.sha256, \
+         classes_json = excluded.classes_json, preprocess_json = excluded.preprocess_json, \
+         output_contract = excluded.output_contract, source = excluded.source, \
+         default_threshold = excluded.default_threshold, \
+         project_id = excluded.project_id, source_model_id = excluded.source_model_id, \
+         updated_at = excluded.updated_at \
+         WHERE vision_models.org_id = excluded.org_id",
+        rusqlite::params![
+            row.model_name,
+            row.op,
+            row.file_name,
+            row.sha256,
+            row.classes_json,
+            row.preprocess_json,
+            row.output_contract,
+            row.source,
+            row.default_threshold,
+            row.org_id,
+            row.project_id,
+            row.source_model_id,
+            now,
+        ],
+    )?;
+    if changed == 0 {
+        return Err(CvPipelineWriteError::Refused(format!(
+            "vision model name already used by another org: {}",
+            row.model_name
+        )));
+    }
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::VisionModel,
+        &row.org_id,
+        row.model_name.clone(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        vision_model_changed_fields(row),
+        None,
+    )
+    .map_err(CvPipelineWriteError::Db)?;
+
+    if let Some(alias) = alias.map(str::trim).filter(|s| !s.is_empty()) {
+        let existing: Option<(i64, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT id, strategy, fallback_targets FROM model_aliases WHERE alias = ?1",
+                rusqlite::params![alias],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        match existing {
+            Some((id, strategy, fallback_targets)) => {
+                update_model_alias_with_chain_check_tx(
+                    &tx,
+                    id,
+                    alias,
+                    &row.model_name,
+                    true,
+                    fallback_targets.as_deref(),
+                    strategy.as_deref(),
+                )
+                .map_err(|e| CvPipelineWriteError::Refused(format!("alias update: {e:#}")))?;
+            }
+            None => {
+                // Same collision rule as `check_alias_collision`, evaluated in
+                // THIS transaction: an alias may not shadow a published flow.
+                let flow_owner: Option<String> = tx
+                    .query_row(
+                        "SELECT id FROM flows WHERE published_model_name = ?1 LIMIT 1",
+                        rusqlite::params![alias],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if flow_owner.is_some() {
+                    return Err(CvPipelineWriteError::Refused(format!(
+                        "alias '{alias}' collides with a published flow name"
+                    )));
+                }
+                create_model_alias_with_chain_check_tx(&tx, alias, &row.model_name, None, None)
+                    .map_err(|e| CvPipelineWriteError::Refused(format!("alias create: {e:#}")))?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Deletes a vision model of the caller org. Refused while any model alias
+/// still targets it (primary target or fallback), so pipelines referencing
+/// the alias never silently lose their backing model. Returns the deleted
+/// row so the caller can remove the ONNX file from disk.
+pub fn delete_vision_model(
+    pool: &DbPool,
+    model_name: &str,
+    org_id: Option<&str>,
+) -> std::result::Result<VisionModelRow, CvPipelineWriteError> {
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let mut conn = acquire(pool).map_err(CvPipelineWriteError::Db)?;
+    let tx = conn.transaction()?;
+    let row = tx
+        .query_row(
+            &format!(
+                "SELECT {VISION_MODEL_COLS} FROM vision_models \
+                 WHERE model_name = ?1 AND org_id = ?2"
+            ),
+            rusqlite::params![model_name, resolved_org],
+            map_vision_model_row,
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Err(CvPipelineWriteError::Refused(format!(
+            "vision model not found: {model_name}"
+        )));
+    };
+    // Aliases store the primary in `target_model` and fallbacks as a JSON
+    // array string; a JSON-quoted LIKE match covers the fallback list without
+    // parsing every row.
+    let referencing: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT alias FROM model_aliases \
+             WHERE target_model = ?1 \
+                OR (fallback_targets IS NOT NULL AND fallback_targets LIKE ?2)",
+        )?;
+        let quoted = format!("%\"{}\"%", model_name);
+        let rows = stmt
+            .query_map(rusqlite::params![model_name, quoted], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    if !referencing.is_empty() {
+        return Err(CvPipelineWriteError::Refused(format!(
+            "vision model is targeted by alias(es): {}",
+            referencing.join(", ")
+        )));
+    }
+    tx.execute(
+        "DELETE FROM vision_models WHERE model_name = ?1 AND org_id = ?2",
+        rusqlite::params![model_name, resolved_org],
+    )?;
+    let mut fields = BTreeMap::new();
+    fields.insert("model_name".to_string(), field_string(model_name));
+    // The materializer scopes the replicated delete by org — carry it.
+    fields.insert("org_id".to_string(), field_string(resolved_org));
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::VisionModel,
+        resolved_org,
+        model_name.to_string(),
+        crate::sync::runtime::SqlWriteAction::Delete,
+        fields,
+        None,
+    )
+    .map_err(CvPipelineWriteError::Db)?;
+    tx.commit()?;
+    Ok(row)
+}
+
 /// Per-camera CV pipeline id. `None` (NULL or empty) = the camera uses the
 /// default pipeline (see [`resolve_camera_cv_pipeline`]).
 pub fn camera_cv_pipeline_id(pool: &DbPool, camera_id: &str) -> Result<Option<String>> {
@@ -25846,4 +26356,232 @@ pub fn list_recent_benchmark_runs(
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod vision_model_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn fresh_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("cannot build test DB")
+    }
+
+    fn valid_row(name: &str) -> VisionModelRow {
+        VisionModelRow {
+            model_name: name.to_string(),
+            op: "detect".to_string(),
+            file_name: format!("{name}.onnx"),
+            sha256: "a".repeat(64),
+            classes_json: r#"["tablica-adr","rejestracja"]"#.to_string(),
+            preprocess_json: r#"{"resolution":560}"#.to_string(),
+            output_contract: "rfdetr".to_string(),
+            source: "trained".to_string(),
+            default_threshold: Some(0.4),
+            org_id: crate::services::org::DEFAULT_ORG_ID.to_string(),
+            project_id: Some("proj-1".to_string()),
+            source_model_id: Some("mlmodel-1".to_string()),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn validate(row: &VisionModelRow) -> std::result::Result<(), String> {
+        validate_vision_model_fields(
+            &row.model_name,
+            &row.op,
+            &row.file_name,
+            &row.sha256,
+            &row.classes_json,
+            &row.preprocess_json,
+            &row.output_contract,
+            &row.source,
+        )
+    }
+
+    #[test]
+    fn validation_accepts_supported_contracts() {
+        assert!(validate(&valid_row("adr-v2")).is_ok());
+        let mut cls = valid_row("stan-v1");
+        cls.op = "classify".to_string();
+        cls.output_contract = "softmax".to_string();
+        assert!(validate(&cls).is_ok());
+    }
+
+    /// v1 supports detect/rfdetr and classify/softmax only; ocr stays on the
+    /// fixed engines and embed has no CameraCvOp variant yet.
+    #[test]
+    fn validation_rejects_unsupported_ops_and_contracts() {
+        let mut row = valid_row("m1");
+        row.op = "ocr".to_string();
+        assert!(validate(&row).unwrap_err().contains("ocr"));
+        row.op = "embed".to_string();
+        assert!(validate(&row).unwrap_err().contains("embed"));
+        row.op = "detect".to_string();
+        row.output_contract = "softmax".to_string();
+        assert!(validate(&row).is_err());
+        row.op = "classify".to_string();
+        row.output_contract = "rfdetr".to_string();
+        assert!(validate(&row).is_err());
+    }
+
+    /// file_name is joined onto vision_models_dir() — path traversal and
+    /// separators must be refused before anything touches the filesystem.
+    #[test]
+    fn validation_rejects_traversing_file_names() {
+        for bad in [
+            "../evil.onnx",
+            "sub/dir.onnx",
+            "..\\evil.onnx",
+            ".hidden.onnx",
+            "model.bin",
+            "",
+        ] {
+            let mut row = valid_row("m1");
+            row.file_name = bad.to_string();
+            assert!(validate(&row).is_err(), "file_name '{bad}' must be refused");
+        }
+    }
+
+    #[test]
+    fn validation_rejects_bad_names_hashes_and_json() {
+        let mut row = valid_row("m1");
+        row.model_name = "Bad Name!".to_string();
+        assert!(validate(&row).is_err());
+        let mut row = valid_row("m1");
+        row.sha256 = "zz".to_string();
+        assert!(validate(&row).is_err());
+        let mut row = valid_row("m1");
+        row.classes_json = "[]".to_string();
+        assert!(validate(&row).is_err());
+        let mut row = valid_row("m1");
+        row.preprocess_json = "not-json".to_string();
+        assert!(validate(&row).is_err());
+        let mut row = valid_row("m1");
+        row.source = "downloaded".to_string();
+        assert!(validate(&row).is_err());
+    }
+
+    #[test]
+    fn register_get_delete_round_trip() {
+        let db = fresh_db();
+        let row = valid_row("adr-v2");
+        register_vision_model(&db, &row, None).expect("register");
+        let got = get_vision_model(&db, "adr-v2").unwrap().expect("row exists");
+        assert_eq!(got.op, "detect");
+        assert_eq!(got.default_threshold, Some(0.4));
+        // Upsert updates in place (new hash), no duplicate row.
+        let mut updated = row.clone();
+        updated.sha256 = "b".repeat(64);
+        register_vision_model(&db, &updated, None).expect("upsert");
+        let rows = list_vision_models(&db, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sha256, "b".repeat(64));
+
+        let deleted = delete_vision_model(&db, "adr-v2", None).expect("delete");
+        assert_eq!(deleted.file_name, "adr-v2.onnx");
+        assert!(get_vision_model(&db, "adr-v2").unwrap().is_none());
+    }
+
+    /// P2-2 bounds: oversized class lists / blobs and out-of-range preprocess
+    /// values must be refused by the repository validator (single source of
+    /// truth for local registration AND the sync materializer).
+    #[test]
+    fn validation_enforces_size_and_range_bounds() {
+        let mut row = valid_row("m1");
+        let many: Vec<String> = (0..513).map(|i| format!("c{i}")).collect();
+        row.classes_json = serde_json::to_string(&many).unwrap();
+        assert!(validate(&row).unwrap_err().contains("max 512"));
+
+        let mut row = valid_row("m1");
+        row.classes_json = format!("[\"{}\"]", "x".repeat(200));
+        assert!(validate(&row).unwrap_err().contains("class names"));
+
+        let mut row = valid_row("m1");
+        row.preprocess_json = format!("{{\"resolution\":560,\"pad\":\"{}\"}}", "y".repeat(5000));
+        assert!(validate(&row).unwrap_err().contains("4 KiB"));
+
+        let mut row = valid_row("m1");
+        row.preprocess_json = r#"{"resolution":16}"#.to_string();
+        assert!(validate(&row).unwrap_err().contains("out of range"));
+
+        let mut row = valid_row("m1");
+        row.preprocess_json = r#"{"resolution":8192}"#.to_string();
+        assert!(validate(&row).unwrap_err().contains("out of range"));
+
+        let mut row = valid_row("m1");
+        row.preprocess_json = r#"{"resolution":560,"layout":"nhwc"}"#.to_string();
+        assert!(validate(&row).unwrap_err().contains("nchw"));
+
+        let mut row = valid_row("m1");
+        row.preprocess_json = r#"{"mean":[0.5,0.5,0.5]}"#.to_string();
+        assert!(validate(&row).unwrap_err().contains("resolution"));
+    }
+
+    /// P1-3: the publish alias is written in the SAME transaction as the
+    /// registry row — after register-with-alias the alias exists, targets the
+    /// model and blocks its deletion; retarget preserves strategy/fallbacks.
+    #[test]
+    fn register_with_alias_is_atomic_and_blocks_delete() {
+        let db = fresh_db();
+        register_vision_model(&db, &valid_row("adr-v2"), Some("pub-alias"))
+            .expect("register with alias");
+        let alias = list_model_aliases(&db)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.alias == "pub-alias")
+            .expect("alias created");
+        assert_eq!(alias.target_model, "adr-v2");
+        assert!(alias.is_active);
+
+        let err = delete_vision_model(&db, "adr-v2", None).unwrap_err();
+        assert!(err.to_string().contains("pub-alias"), "{err}");
+
+        // Retarget: publish a second model under the same alias; strategy and
+        // fallback list of the existing alias row must survive.
+        let conn = acquire(&db).unwrap();
+        conn.execute(
+            "UPDATE model_aliases SET strategy = 'round_robin' WHERE alias = 'pub-alias'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        register_vision_model(&db, &valid_row("adr-v3"), Some("pub-alias"))
+            .expect("retarget alias");
+        let alias = list_model_aliases(&db)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.alias == "pub-alias")
+            .unwrap();
+        assert_eq!(alias.target_model, "adr-v3");
+        assert_eq!(alias.strategy.as_deref(), Some("round_robin"));
+        // The old model is deletable again, the new one is blocked.
+        delete_vision_model(&db, "adr-v2", None).expect("old model deletable");
+        assert!(delete_vision_model(&db, "adr-v3", None).is_err());
+    }
+
+    /// Deleting a model still targeted by an alias (primary or fallback) must
+    /// be refused so pipelines referencing the alias keep a backing model.
+    #[test]
+    fn delete_refused_while_alias_targets_model() {
+        let db = fresh_db();
+        register_vision_model(&db, &valid_row("adr-v2"), None).expect("register");
+        crate::services::models::create_alias(&db, "test-vision-alias", "adr-v2", None, None)
+            .expect("alias");
+        let err = delete_vision_model(&db, "adr-v2", None).unwrap_err();
+        assert!(err.to_string().contains("test-vision-alias"), "{err}");
+
+        // Fallback reference blocks too.
+        register_vision_model(&db, &valid_row("stanik"), None).expect("register 2");
+        crate::services::models::create_alias(
+            &db,
+            "alias-fb",
+            "adr-v2",
+            None,
+            Some(r#"["stanik"]"#),
+        )
+        .expect("alias with fallback");
+        let err = delete_vision_model(&db, "stanik", None).unwrap_err();
+        assert!(err.to_string().contains("alias-fb"), "{err}");
+    }
 }

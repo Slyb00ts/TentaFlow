@@ -357,6 +357,50 @@ pub async fn mesh_train_status_classifier(run_id: &str) -> anyhow::Result<String
     Ok(value.to_string())
 }
 
+/// Exports a trained classifier checkpoint to ONNX through the local
+/// classifier-training service (synchronous POST /export). Returns the
+/// service-local absolute `onnx_path`; `classes.json` (`{classes,
+/// image_size}`) lands next to it. The call gets its own 15-minute HTTP
+/// timeout (same cap as the RF-DETR export) — the module-wide 120 s
+/// `HTTP_TIMEOUT` is tuned for status polls and would abort a slow export.
+pub async fn run_export(
+    checkpoint_path: String,
+    variant: String,
+    values: Vec<String>,
+    output_dir: String,
+) -> anyhow::Result<String> {
+    const EXPORT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+    let endpoint = resolve_endpoint()?;
+    let url = format!("{}/export", endpoint.trim_end_matches('/'));
+    let body = json!({
+        "checkpoint_path": checkpoint_path,
+        "output_dir": output_dir,
+        "variant": variant,
+        "values": values,
+    });
+    let value: serde_json::Value =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+            let http: ureq::Agent = ureq::Agent::config_builder()
+                .timeout_global(Some(EXPORT_TIMEOUT))
+                .build()
+                .into();
+            let mut resp = http
+                .post(&url)
+                .send_json(&body)
+                .map_err(|e| anyhow::anyhow!("POST {} failed: {}", url, e))?;
+            resp.body_mut()
+                .read_json()
+                .map_err(|e| anyhow::anyhow!("decode /export response: {}", e))
+        })
+        .await??;
+    value
+        .get("onnx_path")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("/export response without onnx_path"))
+}
+
 fn resolve_endpoint() -> anyhow::Result<String> {
     let pool = crate::db::global_pool()
         .ok_or_else(|| anyhow::anyhow!("core service registry unavailable"))?;

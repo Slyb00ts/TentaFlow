@@ -3514,6 +3514,43 @@ export const encode = {
   },
 
   /**
+   * MlStudioBody(VisionModelPublishRequest) — publikuje wytrenowany model do
+   * rejestru vision_models (kamery). payload: { modelId, modelName, op,
+   * threshold?, alias? }. Zwraca { ok, error }.
+   */
+  mlStudioVisionModelPublishRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const threshold = payload.threshold;
+    const alias = payload.alias;
+    const body = _wasm.encodeMlStudioVisionModelPublishRequest(
+      String(payload.modelId ?? payload.model_id ?? ''),
+      String(payload.modelName ?? payload.model_name ?? ''),
+      String(payload.op ?? ''),
+      threshold === null || threshold === undefined || threshold === '' ? undefined : Number(threshold),
+      alias === null || alias === undefined || alias === '' ? undefined : String(alias),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MlStudioBody(VisionModelsListRequest) — lista rejestru modeli wizyjnych
+   * (dynamiczne ONNX dla pipeline'ów kamer). Zwraca { models: [...] }. */
+  mlStudioVisionModelsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioVisionModelsListRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MlStudioBody(VisionModelDeleteRequest) — usuwa model z rejestru vision.
+   * payload: { modelName }. Zwraca { ok, error }. */
+  mlStudioVisionModelDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioVisionModelDeleteRequest(
+      String(payload.modelName ?? payload.model_name ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
    * MessageBody::MlStudioBody(RecogDatasetRegisterRequest) — rejestruje dataset
    * COCO przez ŚCIEŻKĘ do katalogu na serwerze (duże zbiory obrazów ponad limit
    * ramki WS). payload: { projectId, name, path }.

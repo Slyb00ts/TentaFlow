@@ -46,6 +46,7 @@ pub enum CoreSyncResourceKind {
     ModelMetricsRollup,
     ModelPricing,
     CameraCvPipeline,
+    VisionModel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,6 +462,21 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         table_name: "camera_cv_pipelines",
         resource_type: "core.camera_cv_pipeline",
         primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "cameras",
+    },
+    // Vision model registry (dynamic camera-CV ONNX models). Row METADATA
+    // replicates fleet-wide (LWW, admin edited) so pipelines referencing a
+    // model alias validate on every node; the model FILE does not sync — a
+    // node without the ONNX serves nothing locally and inference reaches the
+    // owning node through the existing mesh camera_cv forward (alias
+    // resolution picks the node whose catalog advertises the model).
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VisionModel,
+        table_name: "vision_models",
+        resource_type: "core.vision_model",
+        primary_key_column: "model_name",
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "cameras",

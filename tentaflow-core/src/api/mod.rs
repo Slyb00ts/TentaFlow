@@ -16,6 +16,8 @@ pub mod recording;
 
 pub mod legal;
 
+pub mod model_bundle;
+
 pub mod dashboard;
 
 pub mod unified_server;
