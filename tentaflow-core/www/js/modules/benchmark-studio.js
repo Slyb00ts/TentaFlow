@@ -507,7 +507,7 @@ function renderWizardTargets() {
       sel.addEventListener('change', (e) => {
         const model = e.detail?.value || sel.value;
         const t = state.draft.targets.find((tt) => tt.kind === 'service' && tt.serviceRef === serviceRef);
-        if (t) { t.model = model; t.label = s.displayName || model; }
+        if (t) { t.model = model; t.label = model || s.displayName; }
       });
     }
     if (!cb) return;
@@ -590,7 +590,7 @@ function toggleMeshTarget(s, checked) {
       host: endpoint,
       port: 0,
       model,
-      label: s.displayName || model,
+      label: model || s.displayName,
       hasKey: false,
       apiKey: undefined,
     });
@@ -885,7 +885,7 @@ async function openRun(runId, benchmarkId, benchmarkName) {
   try {
     const resp = await ApiBinary.one('benchmarkGetRequest', { id: benchmarkId });
     const b = resp?.benchmark;
-    state.runTargets = (b?.targets || []).map((t) => ({ id: t.id, label: t.label || t.model, model: t.model }));
+    state.runTargets = (b?.targets || []).map((t) => ({ id: t.id, label: t.model || t.label, model: t.model }));
     const cfg = parseJson(b?.configJson, {});
     state.runScenarios = SCENARIO_ORDER.filter((s) => cfg[s]);
   } catch {
@@ -1051,12 +1051,28 @@ async function cancelRun() {
 }
 
 // Odswiez czesciowe/koncowe wyniki + macierz statusow.
+// Wiersze wynikow niosa `targetLabel` = displayName SERWISU, ktory jest nazwa
+// SILNIKA (np. "vLLM", "MLX"), a nie modelu. Podmieniamy etykiete na rzeczywisty
+// model targetu (to jego benchmarkujemy; silnik to tylko backend). Mapowanie po
+// `targetId` z targetow benchmarku/runu. Naprawia tez stare runy zapisane z
+// etykieta-silnikiem, bo model bierzemy ze zrodla targetu przy renderze.
+function withTargetModel(rows, targetsOrBench) {
+  const targets = Array.isArray(targetsOrBench) ? targetsOrBench : (targetsOrBench?.targets || []);
+  const modelById = new Map();
+  for (const t of targets) {
+    const m = t && t.model ? String(t.model).trim() : '';
+    if (m && t.id != null) modelById.set(t.id, m);
+  }
+  if (!modelById.size) return rows;
+  return rows.map((r) => (modelById.has(r.targetId) ? { ...r, targetLabel: modelById.get(r.targetId) } : r));
+}
+
 async function refreshRunResults() {
   if (state.view !== 'run') return;
   let rows = [];
   try {
     const resp = await ApiBinary.one('benchmarkRunResultsRequest', { runId: state.runId });
-    rows = Array.isArray(resp?.results) ? resp.results : [];
+    rows = withTargetModel(Array.isArray(resp?.results) ? resp.results : [], state.runTargets);
   } catch { return; }
   renderMatrix(rows);
   renderResultsTable(byId('run-results'), rows, { partial: true });
@@ -1105,11 +1121,14 @@ async function openResults(runId, benchmarkId, benchmarkName) {
   let rows = [];
   let status = null;
   try {
-    const [res, st] = await Promise.all([
+    const [res, st, benchResp] = await Promise.all([
       ApiBinary.one('benchmarkRunResultsRequest', { runId }),
       ApiBinary.one('benchmarkRunStatusRequest', { runId }).catch(() => null),
+      state.resultsBenchmarkId
+        ? ApiBinary.one('benchmarkGetRequest', { id: state.resultsBenchmarkId }).catch(() => null)
+        : Promise.resolve(null),
     ]);
-    rows = Array.isArray(res?.results) ? res.results : [];
+    rows = withTargetModel(Array.isArray(res?.results) ? res.results : [], benchResp?.benchmark);
     status = st;
   } catch (err) {
     root().innerHTML = `<div class="bench-empty">${escapeHtml(err.message || T('load_failed'))}</div>`;
