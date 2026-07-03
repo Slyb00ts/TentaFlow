@@ -99,7 +99,8 @@ const FlowBuilderScreen = {
   async mount() {
     const flowId = pendingFlowId;
     if (!flowId) {
-      toast(I18n.t('flows_builder.missing_id'), 'warning');
+      // No flow selected (e.g. the builder route was hit directly) — the flow
+      // list is the real entry point, so just go there. Not a warning.
       Router.navigate('flows');
       return;
     }

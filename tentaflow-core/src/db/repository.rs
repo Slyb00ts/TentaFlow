@@ -4069,6 +4069,25 @@ pub fn get_flow_id_by_published_model_name(
     Ok(id)
 }
 
+/// Resolve a flow by the exact `published_model_name` it is advertised under
+/// (a flow published as a model). Used by the flow resolver so a client that
+/// requests a flow's published name runs THAT flow directly, instead of
+/// falling through to the default-for-service-type flow. Only active flows.
+pub fn get_flow_by_published_model_name(
+    pool: &DbPool,
+    published_model_name: &str,
+) -> Result<Option<DbFlow>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM flows WHERE published_model_name = ?1 AND status = 'active' LIMIT 1",
+        FLOW_COLS
+    ))?;
+    let result = stmt
+        .query_row(rusqlite::params![published_model_name], row_to_flow)
+        .optional()?;
+    Ok(result)
+}
+
 fn field_string(value: &str) -> crate::sync::ledger::FieldValue {
     crate::sync::ledger::FieldValue::String(value.to_string())
 }

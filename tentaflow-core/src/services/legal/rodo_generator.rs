@@ -409,11 +409,14 @@ fn build_pdf_path(
     org_id: &str,
     now_ms: i64,
 ) -> Result<PathBuf, RodoGenerationError> {
-    // Defence-in-depth: reject any `org_id` that is not a valid UUIDv4. The
-    // `organizations` table already enforces a CHECK on this format, but a
-    // misconfigured / future migration must not be the only line of defence
-    // — we never want a malicious `org_id` to escape `legal_root`.
-    if !is_uuid_v4(org_id) {
+    // Defence-in-depth: reject any `org_id` that is not a safe slug. The real
+    // containment proof is the component walk + `starts_with` below; this is a
+    // cheap first gate that rejects anything with a path separator, `.`, or
+    // other funny business before we build a path from it. It intentionally
+    // accepts BOTH UUIDs and the seeded default org id (`org-default`) — the
+    // old UUIDv4-only check hard-failed every non-UUID org, so RODO generation
+    // was impossible on a default install.
+    if !is_safe_org_id(org_id) {
         return Err(RodoGenerationError::PathTraversal);
     }
 
@@ -445,12 +448,15 @@ fn build_pdf_path(
     Ok(candidate)
 }
 
-/// Strict UUIDv4 check: 36-char canonical form with v4 + RFC4122 variant.
-fn is_uuid_v4(s: &str) -> bool {
-    match uuid::Uuid::parse_str(s) {
-        Ok(u) => u.get_version_num() == 4 && s.len() == 36,
-        Err(_) => false,
-    }
+/// A safe org id for path building: non-empty, bounded, and made only of
+/// ASCII alphanumerics plus `-`/`_`. This rejects path separators (`/`, `\`),
+/// `.`/`..`, NUL and any other traversal vector, while accepting both UUID org
+/// ids and human slugs like `org-default`.
+fn is_safe_org_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 #[cfg(unix)]
@@ -758,11 +764,13 @@ mod tests {
             leaked
         );
 
-        // Bad org_id that is just non-UUID — also rejected, also no dir made
-        // inside the root itself.
-        let res2 = build_pdf_path(&root_path, "not-a-uuid", 1_700_000_000_000);
+        // An org_id with a separator/dot is unsafe and rejected up-front — no
+        // dir made inside the root either. (A plain non-UUID *slug* like
+        // `org-default` is now allowed — that is the default org and must be
+        // able to generate documents.)
+        let res2 = build_pdf_path(&root_path, "bad.slug/x", 1_700_000_000_000);
         assert!(matches!(res2, Err(RodoGenerationError::PathTraversal)));
-        let inside = root_path.join("not-a-uuid");
+        let inside = root_path.join("bad.slug");
         assert!(
             !inside.exists(),
             "rejected org subdir was still created: {:?}",
@@ -780,6 +788,24 @@ mod tests {
             entries.is_empty(),
             "legal_root should still be empty after rejected paths, got {:?}",
             entries
+        );
+    }
+
+    #[test]
+    fn default_org_slug_is_accepted() {
+        // Regression: the seeded default org id is `org-default` (not a UUID).
+        // It must build a path CONTAINED in the root, otherwise RODO document
+        // generation is impossible on a default install.
+        let sandbox = tempfile::tempdir().expect("sandbox tempdir");
+        let root_path = sandbox.path().join("legal-root");
+        let candidate = build_pdf_path(&root_path, "org-default", 1_700_000_000_000)
+            .expect("org-default must be a valid org id");
+        let root_canon = root_path.canonicalize().unwrap();
+        assert!(
+            candidate.starts_with(&root_canon),
+            "candidate {:?} escaped root {:?}",
+            candidate,
+            root_canon
         );
     }
 

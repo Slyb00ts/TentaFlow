@@ -117,7 +117,11 @@ class TfTextarea extends HTMLElement {
     this._textarea.style.height = `${this._textarea.scrollHeight}px`;
   }
 
-  _onInput() {
+  _onInput(e) {
+    // Stop the inner <textarea>'s native "input" from bubbling past the host —
+    // otherwise consumers listening on the host see two "input" events (the
+    // native one has no detail, so `e.detail?.value ?? ''` clobbers state).
+    e?.stopPropagation();
     this.setAttribute('value', this._textarea.value);
     this._autogrow();
     this.dispatchEvent(new CustomEvent('input', {
@@ -126,7 +130,8 @@ class TfTextarea extends HTMLElement {
     }));
   }
 
-  _onChange() {
+  _onChange(e) {
+    e?.stopPropagation();
     this.dispatchEvent(new CustomEvent('change', {
       bubbles: true,
       detail: { value: this._textarea.value },

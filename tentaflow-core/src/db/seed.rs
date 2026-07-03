@@ -144,8 +144,8 @@ fn seed_user_accounts(conn: &Connection) -> Result<()> {
     if user_count == 0 {
         let password_hash = crypto::hash_password("admin")?;
         conn.execute(
-            "INSERT INTO user_accounts (id, username, password_hash, display_name, is_admin, must_change_password) \
-             VALUES (?1, 'admin', ?2, 'Administrator', 1, 1)",
+            "INSERT INTO user_accounts (id, username, password_hash, display_name, is_admin, role, must_change_password) \
+             VALUES (?1, 'admin', ?2, 'Administrator', 1, 'admin', 1)",
             rusqlite::params![DEFAULT_ADMIN_ID, password_hash],
         )?;
         // Dodaj admina do grupy admins. Po migracji v53 identyfikatory grup i

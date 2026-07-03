@@ -719,6 +719,87 @@ impl Router {
             None
         };
 
+        // === DIRECT MODEL: raw model → backend stream bez flow ===
+        // A plain model name streams straight from the backend (no synthetic
+        // /default flow, no PII sentence-buffering → token-level TTFT). Only a
+        // Flow published as a model (or an alias resolving to one) takes the
+        // flow-engine path below. Explicit Synthetic / FlowId selectors (dashboard
+        // "Default Chat", picked flow) always go through the flow engine.
+        if matches!(flow_selector, ChatFlowSelector::Auto)
+            && !crate::routing::chat::model_resolves_to_flow(
+                &self.catalog_snapshot(),
+                &request.model,
+            )
+        {
+            let executor = match self.executor() {
+                Some(e) => e,
+                None => {
+                    if let Some(event) = compliance_event.as_ref() {
+                        let _ = event.finish_failed("runtime_executor_not_wired");
+                    }
+                    return Err(crate::error::CoreError::InternalError {
+                        message: "runtime executor not wired — direct model stream unavailable"
+                            .to_string(),
+                        source: None,
+                    }
+                    .into());
+                }
+            };
+            let include_usage = request
+                .stream_options
+                .as_ref()
+                .map(|so| so.include_usage)
+                .unwrap_or(false);
+            // Force a usage tail whenever token accounting must be audited even
+            // if the client did not ask; ComplianceAuditStream strips that
+            // content-free tail from client output when include_usage=false.
+            let need_usage = include_usage || compliance_event.is_some();
+            let mut direct_req = request.clone();
+            if need_usage {
+                direct_req.stream_options =
+                    Some(crate::api::openai::types::StreamOptions { include_usage: true });
+            }
+            let mut exec_ctx =
+                crate::services::runtime::context::ExecutionContext::new(user.clone());
+            match executor.stream_chat(direct_req, &mut exec_ctx).await {
+                Ok(stream) => {
+                    let filtered: Pin<
+                        Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>,
+                    > = if let Some(event) = compliance_event {
+                        Box::pin(ComplianceAuditStream::new(stream, event, include_usage))
+                    } else {
+                        stream
+                    };
+                    let metadata = crate::routing::RouteMetadata {
+                        served_by_node: exec_ctx
+                            .route_metadata
+                            .served_by_node
+                            .clone()
+                            .unwrap_or_else(|| stream_node_name.clone()),
+                        backend_type: "direct_stream".to_string(),
+                        strategy_used: "direct".to_string(),
+                        fallbacks_tried: exec_ctx.route_metadata.fallbacks_tried,
+                        hop_count: 0,
+                        latency_ms: Some(stream_start.elapsed().as_secs_f64() * 1000.0),
+                        usage: None,
+                        finish_reason: None,
+                    };
+                    return Ok(crate::routing::RouteResult {
+                        response: filtered,
+                        metadata,
+                    });
+                }
+                Err(e) => {
+                    if let Some(event) = compliance_event.as_ref() {
+                        let _ = event.finish_failed(&e.to_string());
+                    }
+                    return Err(
+                        crate::routing::chat::executor_error_to_core(e, &request.model).into(),
+                    );
+                }
+            }
+        }
+
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
             let blobs = dispatcher.blobs();

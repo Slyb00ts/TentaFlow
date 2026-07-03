@@ -4,6 +4,7 @@
 // =============================================================================
 
 pub mod ai_gateway;
+pub mod audit_worker;
 pub mod models;
 pub mod repository;
 

@@ -395,6 +395,7 @@ pub fn encode_chat_stream_request_simple(
     model_id: String,
     user_message: String,
     flow_id: Option<String>,
+    session_id: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ChatStreamRequestBody(ChatStreamRequest {
         model_id,
@@ -405,6 +406,7 @@ pub fn encode_chat_stream_request_simple(
         temperature: None,
         max_tokens: None,
         flow_id,
+        session_id,
     }))
     .map_err(|e| JsError::new(&e))
 }
@@ -5534,6 +5536,12 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&item, "createdAtEpoch", f.created_at_epoch.into());
                 set(&item, "updatedAtEpoch", f.updated_at_epoch.into());
                 set(&item, "enabled", f.enabled.into());
+                set(&item, "isDefault", f.is_default.into());
+                set(&item, "is_default", f.is_default.into());
+                if let Some(pmn) = f.published_model_name {
+                    set(&item, "publishedModelName", pmn.clone().into());
+                    set(&item, "published_model_name", pmn.into());
+                }
                 arr.push(&item.into());
             }
             set(&obj, "flows", arr.into());
