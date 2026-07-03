@@ -5692,12 +5692,19 @@ function renderModelsTab(panel, p) {
         // Stan z metryk: wdrożony (`inference_model_name`) oraz wyeksportowany
         // do GGUF (`export_status=succeeded` + `gguf_path`).
         let deployed = false;
+        let deploying = false;
         let exported = false;
         try {
           const mj = JSON.parse(m.metricsJson ?? m.metrics_json ?? '{}');
-          deployed = Boolean(mj.inference_model_name);
+          // „Zapytaj" tylko gdy serwis REALNIE serwuje model — status jest
+          // rekoncyliowany po żywym serwisie (patrz reconcile_local_inference_status).
+          // Sama obecność `inference_model_name` nie wystarcza: serwis mógł paść
+          // albo zostać usunięty (status → „failed") i czat by się wywalił.
+          const infStatus = String(mj.inference_status ?? '');
+          deployed = infStatus === 'deployed';
+          deploying = infStatus === 'deploying' || infStatus === 'transferring';
           exported = mj.export_status === 'succeeded' && Boolean(mj.gguf_path);
-        } catch (_) { deployed = false; exported = false; }
+        } catch (_) { deployed = false; deploying = false; exported = false; }
         const framework = String(m.framework ?? '');
         return {
           model: modelName,
@@ -5715,7 +5722,7 @@ function renderModelsTab(panel, p) {
           _isRecog: framework === 'rfdetr',
           _canExport: Boolean(modelId && framework !== 'rfdetr' && (baseModel.trim().length > 0 || framework === 'classifier-timm')),
           _canChat: Boolean(modelId && deployed),
-          _canDeploy: Boolean(modelId && exported && !deployed && String(m.framework ?? '') !== 'rfdetr'),
+          _canDeploy: Boolean(modelId && exported && !deployed && !deploying && String(m.framework ?? '') !== 'rfdetr'),
         };
       });
       // Per-wierszowy builder akcji tf-table: zwraca realny Element z własnym
