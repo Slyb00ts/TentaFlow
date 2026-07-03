@@ -178,31 +178,45 @@ fn camera_detections_subscribe_handler(
         }
     };
 
-    let camera_id = match authorize(&ctx, &camera_id) {
-        Ok(id) => id,
-        Err(err) => {
-            let _ = push_end(&sub, Some(MessageBody::Error(err)));
-            return;
-        }
-    };
-
-    // Production path: start the always-on RF-DETR analysis loop for this
-    // camera (idempotent — one task per camera regardless of subscribers).
-    // Real detections flow into `detection_bus` and out through this stream.
-    #[cfg(feature = "inference-vision-gpu")]
-    crate::services::camera_ingest::vision_analysis::ensure_analysis(&camera_id);
-
-    // Dev/test only, behind the env flag (default off): when no real detector
-    // publishes for this camera, spawn one synthetic source so the e2e suite
-    // sees overlay data without deployed models. The registry keeps it to one
-    // task per camera across re-subscribes. Production (flag off) only ever
-    // streams real inference.
-    if detection_stub_enabled() {
-        ensure_stub(&camera_id);
-    }
-
-    let mut rx = detection_bus::subscribe(&camera_id);
     tokio::spawn(async move {
+        // ACL siega do rusqlite (camera_exists_in_org, sync) — biegnie na puli
+        // blocking, zeby nie blokowac watkow tokio.
+        let auth_camera_id = camera_id.clone();
+        let camera_id = match tokio::task::spawn_blocking(move || authorize(&ctx, &auth_camera_id))
+            .await
+        {
+            Ok(Ok(id)) => id,
+            Ok(Err(err)) => {
+                let _ = push_end(&sub, Some(MessageBody::Error(err)));
+                return;
+            }
+            Err(e) => {
+                let _ = push_end(
+                    &sub,
+                    Some(MessageBody::Error(ProtocolError::internal(format!(
+                        "camera authorization task failed: {e}"
+                    )))),
+                );
+                return;
+            }
+        };
+
+        // Production path: start the always-on RF-DETR analysis loop for this
+        // camera (idempotent — one task per camera regardless of subscribers).
+        // Real detections flow into `detection_bus` and out through this stream.
+        #[cfg(feature = "inference-vision-gpu")]
+        crate::services::camera_ingest::vision_analysis::ensure_analysis(&camera_id);
+
+        // Dev/test only, behind the env flag (default off): when no real detector
+        // publishes for this camera, spawn one synthetic source so the e2e suite
+        // sees overlay data without deployed models. The registry keeps it to one
+        // task per camera across re-subscribes. Production (flag off) only ever
+        // streams real inference.
+        if detection_stub_enabled() {
+            ensure_stub(&camera_id);
+        }
+
+        let mut rx = detection_bus::subscribe(&camera_id);
         loop {
             match rx.recv().await {
                 Ok(msg) => {

@@ -89,12 +89,16 @@ function jestUszkodzona(det) {
 // chwilowe zrywy dostarczania WS (te przy ciasnym progu gasily caly overlay).
 const WYGASZ_PO_MS = 1500;
 
-// Ile NAJNOWSZYCH ramek trzymamy w buforze PTS-sync. Przy 25fps to ~3 s
-// historii — playhead MSE siedzi 100-300 ms (a przy zacieciach wiecej) za
-// live-edge, wiec bufor musi siegac wyraznie dalej w tyl niz to opoznienie,
-// inaczej ramka pasujaca do aktualnej klatki wideo jest juz wyrzucona i
-// overlay nie ma czego narysowac. Starsze ramki sa odrzucane (latest-wins).
-const BUFOR_MAX_RAMEK = 75;
+// Okno czasu bufora ramek (ms) liczone WSTECZ od NAJNOWSZEJ ramki (po tsMs).
+// Na WAN wideo potrafi byc kilka sekund za detekcjami — gdyby bufor trzymal
+// tylko ~3 s historii, wszystkie ramki bylyby "z przyszlosci" wzgledem
+// wyswietlanej klatki i overlay nie mialby czego narysowac. 20 s pokrywa
+// realne opoznienia lacza z zapasem; starsze ramki sa odrzucane.
+const BUFOR_OKNO_MS = 20000;
+
+// Twardy limit bezpieczenstwa liczby ramek w buforze — chroni pamiec, gdyby
+// backend slal ramki gesciej niz zakladane ~25fps (600 = ~24 s przy 25fps).
+const BUFOR_MAX_RAMEK = 600;
 
 // Maksymalne dopuszczalne WYPRZEDZENIE ramki detekcji wzgledem czasu wideo
 // (media-time ramki > target + epsilon => ramka jest z PRZYSZLOSCI wzgledem
@@ -411,6 +415,11 @@ class DetectionsOverlay {
   resizeCanvas() {
     const rect = this.hostEl.getBoundingClientRect();
     const parent = this.canvas.parentElement;
+    // Zapamietana pozycja hosta w viewporcie — draw() porownuje ja co klatke
+    // i przelicza offset, gdy host przesunal sie BEZ zmiany rozmiaru
+    // (ResizeObserver takiego ruchu nie zglasza).
+    this.lastHostLeft = rect.left;
+    this.lastHostTop = rect.top;
     // Pozycja canvasa wzgledem positioned-rodzica — host moze byc wsuniety
     // (padding/border rodzica), wiec liczymy offset, nie zakladamy (0,0).
     if (parent) {
@@ -558,9 +567,10 @@ class DetectionsOverlay {
     this.lastMessageAt = performance.now();
   }
 
-  // Wstawia ramke do bufora utrzymujac porzadek rosnacy po tsMs i limit
-  // BUFOR_MAX_RAMEK (latest-wins — najstarsze odrzucamy). Najczestsza sciezka
-  // (ramki przychodza chronologicznie) to push na koniec + ewentualny shift.
+  // Wstawia ramke do bufora utrzymujac porzadek rosnacy po tsMs. Ewikcja:
+  // ramki starsze niz BUFOR_OKNO_MS wzgledem NAJNOWSZEJ ramki (po tsMs) oraz
+  // twardy limit BUFOR_MAX_RAMEK sztuk (najstarsze odrzucamy). Najczestsza
+  // sciezka (ramki przychodza chronologicznie) to push na koniec + shift.
   //
   // FAZA 2 (wzbogacenie po stronie backendu) publikuje ten sam tsMs co FAZA 1
   // (surowe boxy). Zamiast duplikowac ramke AKTUALIZUJEMY istniejaca po tsMs, by
@@ -597,6 +607,8 @@ class DetectionsOverlay {
       while (i >= 0 && buf[i].tsMs > tsMs) i--;
       buf.splice(i + 1, 0, frame);
     }
+    const prog = buf[buf.length - 1].tsMs - BUFOR_OKNO_MS;
+    while (buf.length > 0 && buf[0].tsMs < prog) buf.shift();
     while (buf.length > BUFOR_MAX_RAMEK) buf.shift();
   }
 
@@ -785,26 +797,26 @@ class DetectionsOverlay {
     return v == null ? null : v;
   }
 
-  // Wybiera zestaw detekcji najblizszy czasowo do klatki pokazywanej przez
-  // <video>. Estymujemy per-klatka realny czas przechwycenia wyswietlanej klatki
-  // (targetCaptureWallMs) i wybieramy detekcje o tsMs najblizszym temu czasowi.
-  // Gdy brak playbacku/bufora — degradujemy HONESTNIE do najnowszej ramki.
+  // Wybiera zestaw detekcji dla klatki pokazywanej przez <video> w trybie
+  // wall-clock. Estymujemy per-klatka realny czas przechwycenia wyswietlanej
+  // klatki (targetCaptureWallMs) i bierzemy NAJNOWSZA ramke o tsMs <= cel +
+  // EPS_PRZOD_MS (zakaz ramek z przyszlosci) i wieku <= MAX_WIEK_RAMKI_MS
+  // (zakaz przestarzalych) — te same bramki co w trybie PTS. Zwraca null gdy
+  // brak playbacku/bufora albo zadna ramka nie pasuje.
   selectFrame() {
     const buf = this.frames;
     if (buf.length === 0) return null;
-    const latest = buf[buf.length - 1];
 
     const targetWallMs = this.targetCaptureWallMs();
-    if (targetWallMs == null) return latest;
+    if (targetWallMs == null) return null;
 
-    // Wybierz ramke o tsMs najblizszym targetWallMs.
-    let best = buf[0];
-    let bestDiff = Math.abs(best.tsMs - targetWallMs);
-    for (let i = 1; i < buf.length; i++) {
-      const d = Math.abs(buf[i].tsMs - targetWallMs);
-      if (d < bestDiff) { best = buf[i]; bestDiff = d; }
+    const eps = epsPrzodMs();
+    for (let i = buf.length - 1; i >= 0; i--) {
+      if (buf[i].tsMs > targetWallMs + eps) continue;
+      if (targetWallMs - buf[i].tsMs > MAX_WIEK_RAMKI_MS) return null;
+      return buf[i];
     }
-    return best;
+    return null;
   }
 
   // =============================================================================
@@ -864,7 +876,7 @@ class DetectionsOverlay {
 
   // Buduje liste detekcji do narysowania w BIEZACEJ klatce rAF.
   // Zwraca tablice { det, bbox, alpha }, gdzie:
-  //   * `det`   — metadane (klasa/score/stan/tekst) z NAJSWIEZSZEJ ramki tracku,
+  //   * `det`   — metadane (klasa/score/stan/tekst) z ramki wybranej dla obrazu,
   //   * `bbox`  — [x,y,w,h] znormalizowane, zinterpolowane/ekstrapolowane na `t`,
   //   * `alpha` — 0..1 (wygaszanie zgubionych trackow).
   //
@@ -892,9 +904,12 @@ class DetectionsOverlay {
 
     const buf = this.frames;
     if (buf.length === 0) return [];
-    const latest = buf[buf.length - 1];
 
-    const havePts = base != null && latest.ptsNs != null;
+    // Tryb PTS aktywny gdy znamy baze i JAKAKOLWIEK ramka bufora ma ptsNs —
+    // pojedyncza ramka bez PTS nie przelacza calego overlay na wall-clock
+    // (miganie miedzy dwiema osiami czasu). Ramki bez ptsNs sa po prostu
+    // pomijane przy dopasowaniu (frameCaptureMs zwraca dla nich null).
+    const havePts = base != null && buf.some((f) => f.ptsNs != null);
     if (!havePts) {
       // TRYB AWARYJNY (brak wspolnej osi PTS): wall-clock jak wczesniej.
       return this.itemsAsRender(this.selectFrame());
@@ -906,8 +921,9 @@ class DetectionsOverlay {
     const ct = v ? v.currentTime : NaN;
     const t = Number.isFinite(ct) && ct > 0 ? ct * 1000 : null;
     if (t == null) {
-      // Brak playbacku (readyState 0 / currentTime 0) — pokaz najnowsza ramke.
-      return this.itemsAsRender(latest);
+      // Brak playbacku (readyState 0 / currentTime 0) — nie rysuj nic;
+      // detekcje na zamrozonym/czarnym obrazie nie odpowiadaja klatce.
+      return [];
     }
 
     // Czy w buforze sa realne tracki (track_id > 0)?
@@ -933,15 +949,15 @@ class DetectionsOverlay {
 
   // Rdzen Fazy B: dla kazdego track_id znajduje ramke A (ostatnia z ptsMs <= t) i
   // B (pierwsza z ptsMs >= t), po czym lerpuje bbox (bracketing) albo ekstrapoluje
-  // po vx/vy gdy `t` wyprzedza najswiezsza detekcje. Metadane bierze z najswiezszej
-  // ramki tracku. Zgubione tracki wygasza po TRACK_FADE_MS.
+  // po vx/vy gdy `t` wyprzedza najswiezsza detekcje. Metadane bierze z ramki
+  // wybranej dla obrazu (A, a bez niej B). Zgubione tracki wygasza po TRACK_FADE_MS.
   interpolujTracki(buf, base, t) {
     // Progi czytane raz na klatke (tunowalne przez localStorage).
     const maxE = maxExtrapMs();
     const fadeMs = trackFadeMs();
     const eps = epsPrzodMs();
     const extrapKrawedz = extrapKrawedzMs();
-    // track_id -> { A:{it,ms}, Aprev:{it,ms}, B:{it,ms}, latest:{it,ms} }
+    // track_id -> { A:{it,ms}, Aprev:{it,ms}, B:{it,ms} }
     const tracks = new Map();
     for (const f of buf) {
       const c = this.frameCaptureMs(f, base);
@@ -951,7 +967,7 @@ class DetectionsOverlay {
         if (id <= 0) continue;
         if (!Array.isArray(it.bbox) || it.bbox.length < 4) continue;
         let e = tracks.get(id);
-        if (!e) { e = { A: null, Aprev: null, B: null, latest: null }; tracks.set(id, e); }
+        if (!e) { e = { A: null, Aprev: null, B: null }; tracks.set(id, e); }
         // Bracketing po WARTOSCI ptsMs (nie po kolejnosci iteracji — bufor jest
         // sortowany po tsMs, a PTS moga przyjsc out-of-order):
         //   A = ramka o maksymalnym ms <= t, Aprev = druga najnowsza <= t
@@ -961,15 +977,16 @@ class DetectionsOverlay {
           else if (c < e.A.ms && (e.Aprev == null || c > e.Aprev.ms)) e.Aprev = { it, ms: c };
         }
         if (c >= t && (e.B == null || c < e.B.ms)) e.B = { it, ms: c };
-        if (e.latest == null || c >= e.latest.ms) e.latest = { it, ms: c };
       }
     }
 
     const out = [];
     for (const e of tracks.values()) {
-      // Metadane z najswiezszej ramki tracku; gdy jej stan/OCR pusty (faza-1) —
-      // uzupelnij z cache ostatnim znanym niepustym stanem/tekstem.
-      const det = this.wzbogacDet(e.latest.it);
+      // Metadane z ramki wybranej dla obrazu (A, a bez niej B) — nie z
+      // najswiezszej, ktora moze wyprzedzac wyswietlana klatke (etykieta
+      // pokazywalaby stan/OCR zanim obraz go dogoni). Pusty stan/OCR (faza-1)
+      // uzupelniamy z cache ostatnim znanym niepustym stanem/tekstem.
+      const det = this.wzbogacDet((e.A ?? e.B).it);
       let bbox;
       let alpha = 1;
       // Lerp tylko przez ciagly odcinek detekcji (przerwa <= MAX_PRZERWA_LERP_MS)
@@ -1048,6 +1065,13 @@ class DetectionsOverlay {
   }
 
   draw() {
+    // Host mogl sie przesunac bez zmiany rozmiaru (np. przemeblowanie layoutu)
+    // — ResizeObserver tego nie widzi, wiec pozycje sprawdzamy per klatke.
+    const hrect = this.hostEl.getBoundingClientRect();
+    if (hrect.left !== this.lastHostLeft || hrect.top !== this.lastHostTop) {
+      this.resizeCanvas();
+    }
+
     const ctx = this.ctx;
     ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
 

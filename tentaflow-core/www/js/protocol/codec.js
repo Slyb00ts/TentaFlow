@@ -4833,11 +4833,14 @@ export const encode = {
   /** MessageBody::StreamBody(SubscribeRequest) — subskrypcja strumienia
    *  zarejestrowanego w StreamHub (Chunk B). Server odpowiada
    *  SubscribeResponse + sekwencja Frame chunkow + Closed na tym samym
-   *  correlation_id. Payload: { streamId }. */
+   *  correlation_id. Payload: { streamId, preview? } — preview=true wybiera
+   *  wariant podgladu 720p/~1,5 Mbit/s dla strumieni camera: (kafelki Live
+   *  view), domyslnie pelna jakosc. */
   streamSubscribeRequest(correlationId, payload, sequence = 1) {
     assertReady();
     const streamId = String(payload?.streamId ?? payload?.stream_id ?? '');
-    const body = _wasm.encodeStreamSubscribeRequest(streamId);
+    const preview = Boolean(payload?.preview ?? false);
+    const body = _wasm.encodeStreamSubscribeRequest(streamId, preview);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),

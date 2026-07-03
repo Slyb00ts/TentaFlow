@@ -86,6 +86,12 @@ pub struct Mp4StreamPublisher {
     /// sama oś czasu co PTS detekcji — klient dodaje ja do init-segmentu MSE, by
     /// odjac offset osi mediów i zakotwiczyc overlay na wlasciwej klatce.
     base_pts_ns: Mutex<Option<u64>>,
+    /// `true` = publisher wariantu PODGLĄDU (transkod 720p/~1,5 Mbit/s pod klucz
+    /// hubu `camera:<id>#preview`), `false` = pełna jakość (passthrough). Sesja
+    /// wybiera po tym budowniczego gałęzi B, a `Drop` kieruje detach do
+    /// właściwego slotu — full i preview to dwie niezależne gałęzie na tym
+    /// samym tee.
+    preview: bool,
 }
 
 impl std::fmt::Debug for Mp4StreamPublisher {
@@ -113,21 +119,32 @@ impl Mp4StreamPublisher {
     /// Construct a fresh publisher. The hub-facing `Arc` is created by the
     /// caller (`Arc::new(Mp4StreamPublisher::new(...))`) so the strong ref
     /// count is well-defined from the start.
-    pub fn new(camera_id: String, cmd_tx: mpsc::Sender<SessionCommand>) -> Self {
+    pub fn new(camera_id: String, cmd_tx: mpsc::Sender<SessionCommand>, preview: bool) -> Self {
         let (chunks_tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             parser_buf: Mutex::new(Vec::with_capacity(64 * 1024)),
             pending_init: Mutex::new(Vec::with_capacity(2048)),
             media_buf: Mutex::new(Vec::with_capacity(64 * 1024)),
-            stream_id: format!("camera:{}", camera_id),
+            stream_id: if preview {
+                format!("camera:{}#preview", camera_id)
+            } else {
+                format!("camera:{}", camera_id)
+            },
             init_segment: Mutex::new(None),
             init_ready: Notify::new(),
             chunks_tx: Mutex::new(Some(chunks_tx)),
             first_chunk_seen: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
             base_pts_ns: Mutex::new(None),
+            preview,
             cmd_tx,
         }
+    }
+
+    /// Czy to publisher wariantu podglądu (720p). Sesja wybiera po tym slot
+    /// gałęzi B i budowniczego pipeline'u.
+    pub fn is_preview(&self) -> bool {
+        self.preview
     }
 
     /// Zapisuje bazowy PTS (media-timeline, ns) osi mediów Branch B. Wolane raz,
@@ -330,7 +347,9 @@ impl Drop for Mp4StreamPublisher {
             stream_id = %self.stream_id,
             "fMP4 publisher dropped, posting DetachMp4Branch"
         );
-        let _ = self.cmd_tx.try_send(SessionCommand::DetachMp4Branch);
+        let _ = self.cmd_tx.try_send(SessionCommand::DetachMp4Branch {
+            preview: self.preview,
+        });
     }
 }
 
@@ -341,7 +360,7 @@ mod tests {
 
     fn make_publisher() -> (Arc<Mp4StreamPublisher>, mpsc::Receiver<SessionCommand>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
-        let pub_ = Arc::new(Mp4StreamPublisher::new("cam_test".into(), cmd_tx));
+        let pub_ = Arc::new(Mp4StreamPublisher::new("cam_test".into(), cmd_tx, false));
         (pub_, cmd_rx)
     }
 
@@ -461,7 +480,7 @@ mod tests {
         assert!(cmd_rx.try_recv().is_err());
         drop(pub_);
         let cmd = cmd_rx.recv().await.expect("detach command on drop");
-        assert!(matches!(cmd, SessionCommand::DetachMp4Branch));
+        assert!(matches!(cmd, SessionCommand::DetachMp4Branch { preview: false }));
     }
 
     #[tokio::test]

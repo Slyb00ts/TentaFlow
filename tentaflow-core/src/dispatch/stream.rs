@@ -62,6 +62,24 @@ fn stream_subs_per_user() -> &'static DashMap<String, Arc<AtomicUsize>> {
     STREAM_SUBS_PER_USER.get_or_init(DashMap::new)
 }
 
+/// Limit ROWNOCZESNYCH autoryzacji subscribe per user. Autoryzacja siega do
+/// DB na puli blocking, wiec lawina rownoleglych subscribe'ow jednego klienta
+/// nie moze wysycic puli blocking ani DB — nadmiarowe requesty czekaja na
+/// semaforze wewnatrz swoich taskow (petla odczytu WS nie jest blokowana).
+const MAX_CONCURRENT_SUBSCRIBE_AUTH: usize = 4;
+
+/// Per-user semafory autoryzacji subscribe.
+static SUBSCRIBE_AUTH_SEMS: OnceLock<DashMap<String, Arc<tokio::sync::Semaphore>>> =
+    OnceLock::new();
+
+fn subscribe_auth_semaphore(user_id: &str) -> Arc<tokio::sync::Semaphore> {
+    SUBSCRIBE_AUTH_SEMS
+        .get_or_init(DashMap::new)
+        .entry(user_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SUBSCRIBE_AUTH)))
+        .clone()
+}
+
 /// RAII guard owning one slot in the per-user counter. Increment happens at
 /// construction (failure -> Err); decrement happens in `Drop`.
 struct StreamSlotGuard {
@@ -118,50 +136,79 @@ fn stream_subscribe_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
     };
     // `stream_id` is the PUBLIC id the client sent (and the one we echo back in
     // every frame). `hub_key` is the INTERNAL StreamHub key we subscribe under:
-    // identical to `stream_id` for local cameras, but org/owner-scoped for
-    // remote relays so two tenants (or two owner nodes) can never collide or
+    // identical to `stream_id` for local cameras (plus the `#preview` suffix
+    // when the client asked for the 720p preview variant), but org/owner-scoped
+    // for remote relays so two tenants (or two owner nodes) can never collide or
     // reuse the same `camera:<id>` source. The client never sees `hub_key`.
     let stream_id = payload.stream_id;
-
-    // Per-stream-prefix permission gate. Camera streams require
-    // `camera.read`; any other prefix is rejected pending a dedicated
-    // permission wiring (no implicit allow — fail closed).
-    let hub_key = match enforce_subscribe_permission(&ctx, &stream_id) {
-        Ok(key) => key,
-        Err(err) => {
-            let _ = push_end(&sub, Some(MessageBody::Error(err)));
-            return;
-        }
-    };
-
-    // Per-user concurrency cap. Acquired before touching the hub so a
-    // rejected request never instantiates a hub source. The guard moves
-    // into the streaming task below and releases on task end / disconnect.
-    let user_id = match user_id_from_ctx(&ctx) {
-        Some(id) => id,
-        None => {
-            let _ = push_end(
-                &sub,
-                Some(MessageBody::Error(ProtocolError::new(
-                    ProtocolErrorCode::AuthRequired,
-                    "stream subscribe requires a user session",
-                ))),
-            );
-            return;
-        }
-    };
-    let slot_guard = match StreamSlotGuard::acquire(&user_id) {
-        Ok(g) => g,
-        Err(err) => {
-            let _ = push_end(&sub, Some(MessageBody::Error(err)));
-            return;
-        }
-    };
+    let preview = payload.preview;
 
     tokio::spawn(async move {
+        let user_id = match user_id_from_ctx(&ctx) {
+            Some(id) => id,
+            None => {
+                let _ = push_end_async(
+                    &sub,
+                    Some(MessageBody::Error(ProtocolError::new(
+                        ProtocolErrorCode::AuthRequired,
+                        "stream subscribe requires a user session",
+                    ))),
+                )
+                .await;
+                return;
+            }
+        };
+
+        // Per-stream-prefix permission gate. Camera streams require
+        // `camera.read`; any other prefix is rejected pending a dedicated
+        // permission wiring (no implicit allow — fail closed). Gate siega do
+        // rusqlite (sync), wiec biegnie na puli blocking, a nie na watku
+        // tokio; per-user semafor ogranicza liczbe ROWNOCZESNYCH autoryzacji,
+        // zeby lawina subscribe'ow jednego klienta nie wysycila puli blocking.
+        let auth_sem = subscribe_auth_semaphore(&user_id);
+        let auth_permit = match auth_sem.acquire_owned().await {
+            Ok(p) => p,
+            // Semafor nigdy nie jest zamykany — defensywnie konczymy task.
+            Err(_) => return,
+        };
+        let ctx_auth = ctx.clone();
+        let stream_id_auth = stream_id.clone();
+        let auth_result = tokio::task::spawn_blocking(move || {
+            enforce_subscribe_permission(&ctx_auth, &stream_id_auth, preview)
+        })
+        .await;
+        drop(auth_permit);
+        let hub_key = match auth_result {
+            Ok(Ok(key)) => key,
+            Ok(Err(err)) => {
+                let _ = push_end_async(&sub, Some(MessageBody::Error(err))).await;
+                return;
+            }
+            Err(e) => {
+                let _ = push_end_async(
+                    &sub,
+                    Some(MessageBody::Error(ProtocolError::new(
+                        ProtocolErrorCode::Internal,
+                        format!("stream authorization task failed: {}", e),
+                    ))),
+                )
+                .await;
+                return;
+            }
+        };
+
+        // Per-user concurrency cap. Acquired before touching the hub so a
+        // rejected request never instantiates a hub source. The guard lives
+        // in this task and releases on task end / disconnect.
         // Held for the lifetime of the streaming task — drop releases the
         // per-user slot back to the pool.
-        let _slot = slot_guard;
+        let _slot = match StreamSlotGuard::acquire(&user_id) {
+            Ok(g) => g,
+            Err(err) => {
+                let _ = push_end_async(&sub, Some(MessageBody::Error(err))).await;
+                return;
+            }
+        };
 
         let handle = match StreamHub::global().subscribe(&hub_key).await {
             Ok(h) => h,
@@ -733,11 +780,17 @@ fn enforce_scene_depth_subscribe(
 
 /// Authorize a subscribe and resolve the INTERNAL StreamHub key to subscribe
 /// under. For local cameras (and the no-camera build) this is the bare public
-/// `stream_id`; for a remote relay it is the org/owner-scoped key returned by
-/// `register_remote_camera_relay`. `lidar:` ids resolve via `enforce_lidar_subscribe`.
+/// `stream_id` — with the `#preview` suffix when `preview = true`, matching
+/// the second factory the camera supervisor registers (transkod 720p pod
+/// kafelki Live view). For a remote relay it is the org/owner-scoped key
+/// returned by `register_remote_camera_relay`; relays ignore `preview` and
+/// serve full quality (transkod podglądu żyje przy lokalnym pipeline kamery).
+/// `lidar:` / `scene:` ids also ignore `preview` and resolve via their
+/// dedicated enforce helpers.
 fn enforce_subscribe_permission(
     ctx: &HandlerContext,
     stream_id: &str,
+    preview: bool,
 ) -> Result<String, ProtocolError> {
     if let Some(rest) = stream_id.strip_prefix(LIDAR_PREFIX) {
         return enforce_lidar_subscribe(ctx, rest);
@@ -773,8 +826,15 @@ fn enforce_subscribe_permission(
                 &org.org_id,
             ) {
                 // Local camera in this org: the hub key is the bare public id
-                // (already org-checked via camera_exists_in_org).
-                Ok(true) => Ok(stream_id.to_string()),
+                // (already org-checked via camera_exists_in_org), plus the
+                // `#preview` suffix for the 720p preview variant — two
+                // subscribers with different variants land on two publishers
+                // (two Branch-B gałęzie na tym samym tee).
+                Ok(true) => Ok(if preview {
+                    format!("{stream_id}#preview")
+                } else {
+                    stream_id.to_string()
+                }),
                 // Not a local camera in this org. Before denying, check whether a
                 // trusted mesh node in THIS org owns it (a robot camera physically
                 // on another node). If so, lazily register a remote relay source
@@ -800,7 +860,11 @@ fn enforce_subscribe_permission(
             };
         }
         #[cfg(not(feature = "camera"))]
-        return Ok(stream_id.to_string());
+        return Ok(if preview {
+            format!("{stream_id}#preview")
+        } else {
+            stream_id.to_string()
+        });
     }
     Err(ProtocolError::new(
         ProtocolErrorCode::PolicyDenied,
@@ -926,6 +990,7 @@ mod tests {
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: stream_id.to_string(),
+                preview: false,
             }));
         let h = find_stream_handler("StreamSubscribeRequest").expect("registered");
         let ctx = ctx_with_camera_read(101);
@@ -983,6 +1048,7 @@ mod tests {
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: stream_id.to_string(),
+                preview: false,
             }));
         let mut ctx = ctx_with_camera_read(606);
         ctx.org_context = Some(test_org_context("lag-user", PERM_CAMERA_READ));
@@ -1035,6 +1101,7 @@ mod tests {
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: "camera:does-not-exist-xyz".to_string(),
+                preview: false,
             }));
         let h = find_stream_handler("StreamSubscribeRequest").unwrap();
         (h.handler_fn)(req, ctx_with_camera_read(202), sub);
@@ -1055,6 +1122,7 @@ mod tests {
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: "audio:doorbell".to_string(),
+                preview: false,
             }));
         let h = find_stream_handler("StreamSubscribeRequest").unwrap();
         (h.handler_fn)(req, ctx_with_camera_read(303), sub);
@@ -1078,6 +1146,7 @@ mod tests {
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: stream_id.to_string(),
+                preview: false,
             }));
         let mut ctx = ctx_with_camera_read(404);
         // Strip the permission to exercise the deny path.
@@ -1177,6 +1246,7 @@ mod tests {
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: format!("lidar:{}", robot_id),
+                preview: false,
             }));
         let mut ctx = ctx_with_camera_read(1101);
         ctx.org_context = Some(test_org_context("lidar-user", PERM_ROBOT_TELEMETRY));
@@ -1219,6 +1289,7 @@ mod tests {
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: format!("lidar:{}", robot_id),
+                preview: false,
             }));
         let mut ctx = ctx_with_camera_read(1102);
         // for_test() local_node_id = "test-node" ≠ the seeded owner → remote path.
@@ -1247,6 +1318,7 @@ mod tests {
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: format!("lidar:{}", robot_id),
+                preview: false,
             }));
         let mut ctx = ctx_with_camera_read(1103);
         // Org WITHOUT robot.telemetry (perm check precedes robot resolution).
@@ -1272,6 +1344,7 @@ mod tests {
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: "lidar:go2-never-advertised-xyz".to_string(),
+                preview: false,
             }));
         let mut ctx = ctx_with_camera_read(1104);
         ctx.org_context = Some(test_org_context("lidar-user", PERM_ROBOT_TELEMETRY));
@@ -1305,6 +1378,7 @@ mod tests {
             let req =
                 MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                     stream_id: stream_id.to_string(),
+                    preview: false,
                 }));
             let h = find_stream_handler("StreamSubscribeRequest").unwrap();
             (h.handler_fn)(req, ctx, sub);
@@ -1327,6 +1401,7 @@ mod tests {
         let req =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: stream_id.to_string(),
+                preview: false,
             }));
         let h = find_stream_handler("StreamSubscribeRequest").unwrap();
         (h.handler_fn)(req, ctx, sub);

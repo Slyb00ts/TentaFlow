@@ -14376,12 +14376,14 @@ pub fn encode_compliance_ai_events_list_request(
 /// MessageBody::StreamBody(SubscribeRequest) — subscribe this connection to a
 /// hub-registered stream. The server first answers with a SubscribeResponse
 /// (mime + has_init_segment), then pushes a sequence of Frame chunks on the
-/// same correlation id, terminating with a single Closed payload.
+/// same correlation id, terminating with a single Closed payload. `preview`
+/// wybiera wariant podglądu 720p/~1,5 Mbit/s dla strumieni `camera:` (kafelki
+/// Live view); `false` = pełna jakość źródła.
 #[wasm_bindgen(js_name = encodeStreamSubscribeRequest)]
-pub fn encode_stream_subscribe_request(stream_id: String) -> Result<Vec<u8>, JsError> {
+pub fn encode_stream_subscribe_request(stream_id: String, preview: bool) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::StreamBody(
         tentaflow_protocol::StreamPayload::SubscribeRequest(
-            tentaflow_protocol::StreamSubscribeRequest { stream_id },
+            tentaflow_protocol::StreamSubscribeRequest { stream_id, preview },
         ),
     ))
     .map_err(|e| JsError::new(&e))

@@ -56,14 +56,17 @@ fn interval_for_fps(fps: u32) -> Duration {
 }
 
 /// Reads the per-camera analysis FPS from the core DB, falling back to the
-/// default when no pool / row is available.
-fn resolve_analysis_fps(camera_id: &str) -> u32 {
-    match crate::db::global_pool() {
-        Some(pool) => {
-            crate::db::repository::camera_analysis_fps(&pool, camera_id).unwrap_or(DEFAULT_ANALYSIS_FPS)
-        }
+/// default when no pool / row is available. Zapytanie rusqlite jest
+/// synchroniczne, wiec biegnie na puli blocking, a nie na watku tokio.
+async fn resolve_analysis_fps(camera_id: &str) -> u32 {
+    let camera_id = camera_id.to_string();
+    tokio::task::spawn_blocking(move || match crate::db::global_pool() {
+        Some(pool) => crate::db::repository::camera_analysis_fps(&pool, &camera_id)
+            .unwrap_or(DEFAULT_ANALYSIS_FPS),
         None => DEFAULT_ANALYSIS_FPS,
-    }
+    })
+    .await
+    .unwrap_or(DEFAULT_ANALYSIS_FPS)
 }
 
 /// Process-wide RF-DETR detector, loaded on first use. `tokio::sync::OnceCell`
@@ -263,13 +266,16 @@ pub fn ensure_analysis(camera_id: &str) {
         let mut reg = cameras().lock().unwrap();
         if !reg.contains_key(camera_id) {
             let now = std::time::Instant::now();
-            let fps = resolve_analysis_fps(camera_id);
+            // Start z domyslnym FPS bez zapytania DB (funkcja jest sync i bywa
+            // wolana z watku tokio); `next_fps_check = now` kaze petli silnika
+            // odczytac realna wartosc z DB na puli blocking przy pierwszym ticku.
+            let fps = DEFAULT_ANALYSIS_FPS;
             reg.insert(
                 camera_id.to_string(),
                 CamSlot {
                     fps,
                     next_due: now,
-                    next_fps_check: now + FPS_RECHECK,
+                    next_fps_check: now,
                 },
             );
             info!("[vision_analysis] camera {camera_id} registered (analysis_fps={fps})");
@@ -390,7 +396,7 @@ async fn engine_loop() {
         }
         // Re-read changed FPS values outside the lock.
         for id in &recheck {
-            let fps = resolve_analysis_fps(id);
+            let fps = resolve_analysis_fps(id).await;
             let mut reg = cameras().lock().unwrap();
             if let Some(slot) = reg.get_mut(id) {
                 slot.fps = fps;
@@ -912,7 +918,7 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
         // czego wzbogacac, a flow na niej tylko zawiodlby wezly wizyjne.
         if !detections.is_empty() {
             if let (Some(flow_id), Some(disp)) = (
-                camera_flow_id(&camera_id),
+                camera_flow_id(&camera_id).await,
                 crate::flow_engine::dispatcher::global_flow_dispatcher(),
             ) {
                 // Detach: a flow can run up to its per-frame deadline, so awaiting
@@ -971,16 +977,23 @@ fn flow_id_cache() -> &'static Mutex<HashMap<String, FlowIdCacheEntry>> {
 }
 
 /// Returns the camera's assigned analysis flow id, or `None` to fall back to the
-/// built-in enrichment path. Cached with [`FLOW_ID_TTL`].
-fn camera_flow_id(camera_id: &str) -> Option<String> {
+/// built-in enrichment path. Cached with [`FLOW_ID_TTL`]. Odczyt DB (rusqlite,
+/// sync) przy chybieniu cache biegnie na puli blocking, nie na watku tokio.
+async fn camera_flow_id(camera_id: &str) -> Option<String> {
     if let Some(e) = flow_id_cache().lock().unwrap().get(camera_id) {
         if e.fetched.elapsed() < FLOW_ID_TTL {
             return e.flow_id.clone();
         }
     }
-    let flow_id = crate::db::global_pool()
-        .and_then(|pool| crate::db::repository::camera_analysis_flow_id(&pool, camera_id).ok())
-        .flatten();
+    let query_id = camera_id.to_string();
+    let flow_id = tokio::task::spawn_blocking(move || {
+        crate::db::global_pool()
+            .and_then(|pool| crate::db::repository::camera_analysis_flow_id(&pool, &query_id).ok())
+            .flatten()
+    })
+    .await
+    .ok()
+    .flatten();
     flow_id_cache().lock().unwrap().insert(
         camera_id.to_string(),
         FlowIdCacheEntry {

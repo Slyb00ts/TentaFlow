@@ -19,6 +19,13 @@ const DEFAULT_HEIGHT_PX = 320;
 // powodu), kolejne coraz rzadziej; ostatnia wartosc powtarzana az do sukcesu.
 const RESUBSCRIBE_BACKOFF_MS = [1000, 2000, 5000];
 
+// Watchdog "subskrybowano, ale zero danych": jesli po wyslaniu SubscribeRequest
+// przez ten czas nie przyjdzie ZADEN StreamFrame (nawet init segment), traktujemy
+// subskrypcje jak nieudana — pelny reset pipeline'u + retry z backoffem. Lapie
+// kazdy przypadek cichej smierci (np. SubscribeResponse bez danych, zawieszony
+// handler po stronie serwera).
+const NO_DATA_WATCHDOG_MS = 6000;
+
 class TfVideoStream extends HTMLElement {
   static get observedAttributes() {
     return ['stream-id', 'label', 'height-px'];
@@ -44,6 +51,9 @@ class TfVideoStream extends HTMLElement {
     // czekac na kolejny tick backoffu.
     this._resubscribeAttempt = 0;
     this._lifecycleUnsub = null;
+    // Timer watchdoga no-data: uzbrajany przy kazdym subscribe, rozbrajany
+    // pierwszym StreamFrame. Po NO_DATA_WATCHDOG_MS bez danych — reset + retry.
+    this._noDataWatchdog = null;
     this._disposed = false;
     // CorrelationId aktywnej subskrypcji — potrzebny zeby wyslac
     // StreamCloseRequest na tym samym id co oryginalny SubscribeRequest.
@@ -198,7 +208,9 @@ class TfVideoStream extends HTMLElement {
       return;
     }
     this._activeStreamId = streamId;
-    this._basePtsNs = null;
+    // `_basePtsNs` celowo NIE jest zerowane — poprzednia baza obowiazuje do
+    // nadejscia nowej z StreamSubscribeResponse, dzieki czemu nakladka detekcji
+    // nie traci osi media-time na czas rekonektu.
     this._setStatus('Łączenie ze strumieniem…');
 
     const mediaSource = new MediaSource();
@@ -228,9 +240,14 @@ class TfVideoStream extends HTMLElement {
     this._subscriptionUnsub = () => {
       pending.disposed = true;
     };
+    this._armNoDataWatchdog();
+    // Atrybut `preview` na elemencie wybiera wariant podgladu 720p/~1,5 Mbit/s
+    // (kafelki Live view) zamiast pelnej jakosci zrodla — oszczedza pasmo WAN
+    // i nie glodzi WebSocketu detekcji na tym samym laczu.
+    const preview = this.hasAttribute('preview');
     ApiBinary.subscribe(
       'streamSubscribeRequest',
-      { streamId },
+      { streamId, preview },
       {
         onChunk: (body) => this._onSubscriptionChunk(body),
         onEnd: (body) => this._onSubscriptionEnd(body),
@@ -277,6 +294,8 @@ class TfVideoStream extends HTMLElement {
       return;
     }
     if (body.variant === 'StreamFrame') {
+      // Dane plyna — subskrypcja zyje, watchdog no-data nie jest juz potrzebny.
+      this._clearNoDataWatchdog();
       const data = body.data;
       if (!(data instanceof Uint8Array) || data.byteLength === 0) return;
       // Kopia bytow — wasm pamiec moze byc reuse'owana po powrocie do
@@ -291,34 +310,61 @@ class TfVideoStream extends HTMLElement {
   _onSubscriptionEnd(body) {
     if (this._disposed) return;
     const reason = String(body?.reason ?? '');
-    // Zerwania wymagajace pelnego restartu pipeline'u + resubscribe:
+    if (reason === 'client_request') {
+      // Spowodowane wlasnym close() — bez komunikatu i bez wznawiania.
+      return;
+    }
+    // KAZDY inny koniec strumienia wymaga pelnego restartu pipeline'u +
+    // resubscribe z backoffem:
     //   subscriber_lagged   — serwer ubil subskrypcje (klient nie nadazal),
-    //   transport_closed    — syntetyczny koniec po padzie WS (po reconnect
-    //                          serwer nie zna starych subskrypcji per-socket),
-    //   source_unregistered — zrodlo zniklo (np. restart kamery); po powrocie
-    //                          kafelek ma sam wrocic do zycia.
-    if (
-      reason === 'subscriber_lagged' ||
-      reason === 'transport_closed' ||
-      reason === 'source_unregistered'
-    ) {
-      console.warn(`[tf-video-stream] strumien zerwany (${reason}), resubscribe`);
-      this._resetMediaPipeline();
-      this._scheduleResubscribe();
-      return;
-    }
-    if (reason === 'client_request' || reason === '') {
-      // Spowodowane wlasnym close() — bez komunikatu.
-      return;
-    }
-    this._setStatus(`Strumień zakończony: ${reason}`);
+    //   transport_closed    — syntetyczny koniec po padzie WS,
+    //   source_unregistered — zrodlo zniklo (np. restart kamery),
+    //   body Error (bez `reason`) — np. `stream_not_registered`, gdy resubscribe
+    //     trafil w moment ZANIM kamera wrocila po restarcie; ciche porzucenie tu
+    //     zostawialo kafelek martwy na zawsze mimo powrotu zrodla.
+    // Wlasne zamkniecia nigdy tu nie trafiaja — unsubscribe zdejmuje listener
+    // przed wyslaniem StreamCloseRequest, wiec pusty `reason` to zawsze serwer.
+    const detail =
+      body?.variant === 'Error'
+        ? `error: ${body?.message ?? body?.code ?? 'unknown'}`
+        : reason || 'brak powodu';
+    console.warn(`[tf-video-stream] strumien zerwany (${detail}), resubscribe`);
+    this._resetMediaPipeline();
+    this._scheduleResubscribe();
   }
 
   _onSubscriptionError(err) {
     if (this._disposed) return;
     const message = err?.message ?? String(err ?? '');
-    console.warn('[tf-video-stream] protocol error:', message);
-    this._setStatus('Błąd strumienia.');
+    console.warn('[tf-video-stream] protocol error:', message, '— resubscribe');
+    // Blad protokolu konczy strumien po stronie serwera (IS_ERROR|IS_STREAM_END)
+    // — bez restartu kafelek zostalby martwy. Reset + retry z backoffem.
+    this._resetMediaPipeline();
+    this._scheduleResubscribe();
+  }
+
+  // Uzbraja watchdog no-data: subscribe wyslany, ale przez NO_DATA_WATCHDOG_MS
+  // nie przyszedl zaden StreamFrame (nawet init segment) — traktuj jak porazke
+  // subskrypcji: pelny reset + retry z backoffem. Zabezpiecza kazda przyczyne
+  // cichej smierci (SubscribeResponse bez danych, zgubiony init, martwy stream).
+  _armNoDataWatchdog() {
+    this._clearNoDataWatchdog();
+    this._noDataWatchdog = setTimeout(() => {
+      this._noDataWatchdog = null;
+      if (this._disposed || !this.isConnected) return;
+      console.warn(
+        `[tf-video-stream] watchdog: brak danych ${NO_DATA_WATCHDOG_MS}ms po subscribe, resubscribe`,
+      );
+      this._resetMediaPipeline();
+      this._scheduleResubscribe();
+    }, NO_DATA_WATCHDOG_MS);
+  }
+
+  _clearNoDataWatchdog() {
+    if (this._noDataWatchdog != null) {
+      clearTimeout(this._noDataWatchdog);
+      this._noDataWatchdog = null;
+    }
   }
 
   _tryCreateSourceBuffer() {
@@ -413,15 +459,18 @@ class TfVideoStream extends HTMLElement {
     // ~3-4ms). It only needs to cover a couple of fMP4 fragments so the decoder
     // never starves between fragments. With a clean continuous server timeline
     // (h264timestamper + param-only AUs dropped) a small cushion suffices.
-    const TARGET_LATENCY_SECS = 0.1;
+    // Poduszka 0.5 s = 2-3 fragmenty fMP4 przy kadencji 200 ms — mniejsza
+    // wartosc glodzi dekoder miedzy fragmentami (waiting→append→playing).
+    const TARGET_LATENCY_SECS = 0.5;
     // Twarda granica dryfu — powyzej NIE czekamy, tylko przeskakujemy na
     // live-edge (bufor odjechal za daleko po dluzszym stallu / karcie w tle).
-    const HARD_SNAP_SECS = 0.5;
+    const HARD_SNAP_SECS = 1.5;
     // Histereza lekkiego przyspieszenia (catch-up bez skokow): wlaczamy
     // playbackRate>1 gdy playhead za daleko za live-edge, wracamy do 1.0 po
-    // dogonieniu. Zakres < HARD_SNAP zeby najpierw probowac plynnie.
-    const CATCHUP_ON_SECS = 0.25;
-    const CATCHUP_OFF_SECS = 0.15;
+    // dogonieniu. Oba progi WIEKSZE od poduszki (inaczej wieczny catch-up),
+    // zakres < HARD_SNAP zeby najpierw probowac plynnie.
+    const CATCHUP_ON_SECS = 0.9;
+    const CATCHUP_OFF_SECS = 0.6;
     const CATCHUP_RATE = 1.05;
     // Only build the initial cushion before first play: wait until enough is
     // buffered so playback starts with room ahead rather than at the edge.
@@ -464,17 +513,31 @@ class TfVideoStream extends HTMLElement {
     }
     if (ranges.length === 0) return;
     const start = ranges.start(0);
-    // Trzymamy tylko ~2 s historii przed playheadem — bufor nie rosnie, a
-    // pamiec MSE zostaje mala na dlugo zyjacych kafelkach. Przycinamy regularnie
+    // Trzymamy ~6 s historii przed playheadem. Per spec MSE (Coded Frame
+    // Removal) usuniecie keyframe'a kasuje tez wszystkie zalezne ramki az do
+    // nastepnego random access pointa — ciecie blizej playheadu przy dlugim
+    // GOP-ie (brak kolejnego keyframe'a w buforze) oproznialoby CALY bufor
+    // (stall + hard-snap co interwal keyframe). 6 s pokrywa GOP do ~4-5 s
+    // z marginesem; pamiec ~1 MB przy 720p@1.5Mbps. Przycinamy regularnie
     // (na kazdym updateend), a nie dopiero przy 30 s okna.
     const v = this._video;
     const ct = v ? v.currentTime : 0;
-    const removeUntil = ct - 2;
+    const removeUntil = ct - 6;
     if (!(removeUntil > start + 0.1)) return;
     try {
       this._sourceBuffer.remove(start, removeUntil);
     } catch (e) {
       console.warn('[tf-video-stream] remove(buffered) failed:', e?.message);
+      return;
+    }
+    // Bufor niepusty przed remove nie ma prawa stac sie pusty — jesli sie
+    // oproznil, ciecie zahaczylo o keyframe otwierajacy biezacy GOP.
+    try {
+      if (this._sourceBuffer.buffered.length === 0) {
+        console.warn('[tf-video-stream] trim emptied the buffer (GOP keyframe removed?)');
+      }
+    } catch (e) {
+      /* ignore */
     }
   }
 
@@ -495,11 +558,13 @@ class TfVideoStream extends HTMLElement {
   }
 
   _resetMediaPipeline() {
+    this._clearNoDataWatchdog();
     this._appendQueue.length = 0;
     this._appending = false;
     this._sourceBuffer = null;
     this._mime = null;
-    this._basePtsNs = null;
+    // `_basePtsNs` zostaje — nowa wartosc przyjdzie w StreamSubscribeResponse
+    // kolejnej subskrypcji; do tego czasu nakladka detekcji uzywa starej osi.
     this._mediaSourceReady = false;
     if (this._mediaSource) {
       try {

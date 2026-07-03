@@ -399,6 +399,16 @@ export class BinaryWsClient {
     const correlationKey = envelope.correlationId.toString();
 
     if (envelope.isError) {
+      // Blad subskrypcji streamu (serwer sle IS_ERROR|IS_STREAM_END, np.
+      // "stream subscribe failed") musi trafic do handlera subskrypcji —
+      // wczesniej wpadal do onProtocolError, a subskrybent (wideo/detekcje)
+      // nigdy nie dostawal zadnego callbacku i wisial martwy bez retry.
+      const sub = this.subscribers.get(correlationKey);
+      if (sub) {
+        this.subscribers.delete(correlationKey);
+        sub({ envelope, body });
+        return;
+      }
       const pending = this.pending.get(correlationKey);
       if (pending) {
         this.pending.delete(correlationKey);

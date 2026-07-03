@@ -199,6 +199,10 @@ function renderLiveCameraTile(component, ctx) {
     tile.style.width = '100%';
     tile.style.height = '100%';
     tile.style.setProperty('--tf-video-stream-height', '100%');
+    // Kafelek Live view jest maly (~600 px) — subskrybuj wariant podgladu
+    // 720p/~1,5 Mbit/s zamiast pelnego strumienia zrodla (1080p, 4-8 Mbit/s):
+    // 2+ kamery w pelnej jakosci saturuja lacze WAN i glodza WS detekcji.
+    tile.setAttribute('preview', '');
     const applyId = () => {
       const v = resolveBindRef(streamIdBind, ctx.store);
       if (typeof v === 'string' && v.length > 0) tile.setAttribute('stream-id', v);

@@ -25,8 +25,10 @@
 // Gałąź A używa DOKŁADNIE tego samego kontraktu appsink (RGB24, LatestFrame,
 // pts_ns) co RTSP — `rtsp::build_appsink` instaluje wspólny callback, więc
 // FrameStorage / StreamingBus / detekcje działają bez zmian. Gałąź B reużywa
-// `rtsp::wire_mp4_appsink` i probe bazy PTS muxa (`install_mux_base_pts_probe`),
-// więc kontrakt publishera fMP4 (init segment + fragmenty) jest identyczny.
+// `rtsp::wire_mp4_appsink` i probe bazy PTS na wejściu gałęzi
+// (`install_branch_input_base_pts_probe` — oba warianty transkodują przez
+// x264enc, który przesuwa timestampy), więc kontrakt publishera fMP4
+// (init segment + fragmenty) jest identyczny.
 
 use std::sync::Arc;
 
@@ -37,8 +39,8 @@ use super::credentials::credentials_cipher;
 use super::error::{CameraIngestError, Result};
 use super::fakefile::{FrameCounters, FrameMailbox};
 use super::rtsp::{
-    build_appsink, build_raw_leaky_queue, install_mux_base_pts_probe, wire_mp4_appsink,
-    Mp4BranchState, RtspPipelineHandles,
+    build_appsink, build_raw_leaky_queue, install_branch_input_base_pts_probe,
+    transcoder_key_int_max, wire_mp4_appsink, Mp4BranchState, RtspPipelineHandles,
 };
 use super::session::CameraConfig;
 use super::stream_publisher::Mp4StreamPublisher;
@@ -237,37 +239,67 @@ pub(super) fn build_mjpeg_pipeline(
 
 /// Dowiesza gałąź B (fMP4/MSE) do działającego pipeline'u MJPEG. Przeglądarka
 /// (MSE) wymaga H.264, więc transkodujemy: jpegdec → videoconvert → x264enc.
-/// Kontrakt publishera (init segment, fragmenty, baza PTS muxa) jest ten sam
-/// co w RTSP — reużywamy `wire_mp4_appsink` i `install_mux_base_pts_probe`.
+/// Kontrakt publishera (init segment, fragmenty, baza PTS) jest ten sam co w
+/// RTSP — reużywamy `wire_mp4_appsink`; bazę PTS zdejmuje
+/// `install_branch_input_base_pts_probe` na wejściu gałęzi (oś detekcji),
+/// bo x264enc przesuwa timestampy za sobą o stały offset.
 /// Gałąź jest budowana od zera przy każdym attachu, więc x264enc zaczyna od
 /// klatki kluczowej — init segment MSE jest kompletny bez force-key-unit.
+/// `preview = true` to wariant kafelków Live view: dokładamy videoscale do
+/// 1280x720 i obniżamy bitrate do 1,5 Mbit/s, żeby nie saturować łącza WAN;
+/// pełna jakość (`false`) transkoduje w natywnej rozdzielczości przy 4 Mbit/s.
+/// Oba warianty mogą wisieć na tee równocześnie (osobne sloty w sesji), stąd
+/// sufiks nazw elementów per wariant.
 pub(super) fn attach_mp4_branch_mjpeg(
     pipeline: &gst::Pipeline,
     tee: &gst::Element,
     publisher: &Arc<Mp4StreamPublisher>,
+    preview: bool,
+    source_fps: u32,
 ) -> std::result::Result<Mp4BranchState, String> {
+    let name_suffix = if preview { "_preview" } else { "" };
     // Kolejka gałęzi B — NIE-leaky przed dekoderem; gubienie przy spiętrzeniu
     // dopiero ZA jpegdec (queue_dec niżej), na pełnych zdekodowanych klatkach.
     // Drop klatki przed x264enc jest bezpieczny dla fMP4 — enkoder generuje
     // spójny strumień z tego, co dostanie.
     let queue_b = gst::ElementFactory::make("queue")
-        .property("name", "queue_branch_b")
+        .property("name", format!("queue_branch_b{name_suffix}"))
         .property("max-size-buffers", 30u32)
         .build()
         .map_err(|e| format!("queue_b build: {e}"))?;
     let jpegdec = gst::ElementFactory::make("jpegdec")
         .build()
         .map_err(|e| format!("jpegdec build: {e}"))?;
-    let queue_dec = build_raw_leaky_queue("queue_decoded_b").map_err(|e| e.to_string())?;
+    let queue_dec = build_raw_leaky_queue(&format!("queue_decoded_b{name_suffix}"))
+        .map_err(|e| e.to_string())?;
     let convert = gst::ElementFactory::make("videoconvert")
         .build()
         .map_err(|e| format!("videoconvert build: {e}"))?;
+    // Wariant podglądu skaluje do 720p przed enkoderem — kafelki są małe,
+    // pełna rozdzielczość marnowałaby pasmo i CPU enkodera.
+    let scaler = if preview {
+        let scale = gst::ElementFactory::make("videoscale")
+            .build()
+            .map_err(|e| format!("videoscale build: {e}"))?;
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("width", 1280i32)
+            .field("height", 720i32)
+            .build();
+        let filter = gst::ElementFactory::make("capsfilter")
+            .property("caps", &caps)
+            .build()
+            .map_err(|e| format!("preview capsfilter build: {e}"))?;
+        Some((scale, filter))
+    } else {
+        None
+    };
     // Transkoder CPU: zerolatency (bez opóźnienia B-ramek — podgląd live),
-    // veryfast (niski koszt CPU), 4 Mbit/s, keyframe co ≤50 ramek (~2 s przy
-    // 25 fps) — MSE potrzebuje regularnych punktów wejścia.
+    // veryfast (niski koszt CPU), 4 Mbit/s (pełna jakość) albo 1,5 Mbit/s
+    // (podgląd 720p), keyframe co ~2 s (skalowane do fps źródła) — MSE
+    // potrzebuje regularnych punktów wejścia.
     let enc = gst::ElementFactory::make("x264enc")
-        .property("bitrate", 4000u32)
-        .property("key-int-max", 50u32)
+        .property("bitrate", if preview { 1500u32 } else { 4000u32 })
+        .property("key-int-max", transcoder_key_int_max(source_fps))
         .build()
         .map_err(|e| format!("x264enc build: {e}"))?;
     enc.set_property_from_str("tune", "zerolatency");
@@ -285,7 +317,7 @@ pub(super) fn attach_mp4_branch_mjpeg(
         .build()
         .map_err(|e| format!("mp4mux build: {e}"))?;
     let sink = gst::ElementFactory::make("appsink")
-        .property("name", "sink_mp4")
+        .property("name", format!("sink_mp4{name_suffix}"))
         .property("emit-signals", false)
         .property("sync", false)
         .property("max-buffers", 8u32)
@@ -293,8 +325,18 @@ pub(super) fn attach_mp4_branch_mjpeg(
         .build()
         .map_err(|e| format!("appsink_b build: {e}"))?;
 
+    // Kolejność linkowania: convert → [videoscale → capsfilter 720p] → enc.
+    let mut elements: Vec<gst::Element> =
+        vec![queue_b.clone(), jpegdec.clone(), queue_dec.clone(), convert.clone()];
+    if let Some((scale, filter)) = &scaler {
+        elements.push(scale.clone());
+        elements.push(filter.clone());
+    }
+    elements.extend([enc.clone(), parse.clone(), mux.clone(), sink.clone()]);
+    let element_refs: Vec<&gst::Element> = elements.iter().collect();
+
     pipeline
-        .add_many([&queue_b, &jpegdec, &queue_dec, &convert, &enc, &parse, &mux, &sink])
+        .add_many(&element_refs)
         .map_err(|e| format!("add_many branch B: {e}"))?;
 
     let tee_src_pad = tee
@@ -306,24 +348,27 @@ pub(super) fn attach_mp4_branch_mjpeg(
     tee_src_pad
         .link(&queue_b_sink)
         .map_err(|e| format!("tee → queue_b: {e:?}"))?;
-    gst::Element::link_many([&queue_b, &jpegdec, &queue_dec, &convert, &enc, &parse, &mux, &sink])
+    gst::Element::link_many(&element_refs)
         .map_err(|e| format!("link branch B: {e}"))?;
 
     wire_mp4_appsink(&sink, publisher)?;
 
-    // Ta sama semantyka bazy PTS co w RTSP: reset po (re)buildzie gałęzi,
-    // pierwszy bufor wchodzący do muxa ustala bazę spójną z init segmentem.
+    // Ta sama semantyka resetu bazy PTS co w RTSP (rebuild gałęzi = nowa oś),
+    // ale probe stoi na WEJŚCIU gałęzi (src pad queue_b za tee, przed jpegdec):
+    // oba warianty MJPEG transkodują przez x264enc, który przesuwa timestampy
+    // o stały offset — baza zdjęta za enkoderem leżałaby w innej osi niż PTS
+    // detekcji (Branch A) i overlay w trybie PTS nie rysowałby boxów.
     publisher.reset_base_pts_ns();
-    install_mux_base_pts_probe(&parse, publisher);
+    install_branch_input_base_pts_probe(&queue_b, publisher);
 
-    for el in [&queue_b, &jpegdec, &queue_dec, &convert, &enc, &parse, &mux, &sink] {
+    for el in &element_refs {
         el.sync_state_with_parent()
             .map_err(|e| format!("sync_state branch B element: {e}"))?;
     }
 
     Ok(Mp4BranchState {
         tee_src_pad,
-        elements: vec![queue_b, jpegdec, queue_dec, convert, enc, parse, mux, sink],
+        elements,
     })
 }
 

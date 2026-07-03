@@ -951,28 +951,60 @@ pub(super) fn wire_mp4_appsink(
     Ok(())
 }
 
+/// Odstep klatek kluczowych (`key-int-max`) transkodera x264enc, skalowany do
+/// fps zrodla: keyframe co ~2 s, w granicach 10..=120 klatek. MSE potrzebuje
+/// regularnych punktow wejscia — stala wartosc w klatkach dawala przy kamerze
+/// 5 fps GOP 10 s i wolny odzysk po reconnect/resync.
+pub(super) fn transcoder_key_int_max(source_fps: u32) -> u32 {
+    (2 * source_fps.max(1)).clamp(10, 120)
+}
+
+/// Pad-probe ustalajacy baze PTS publishera: PIERWSZY bufor z ustawionym PTS
+/// na podanym padzie ustala `mux_base_pts_ns` i probe sam sie odpina.
+fn install_base_pts_probe(pad: gst::Pad, publisher: &Arc<Mp4StreamPublisher>) {
+    let pub_weak = std::sync::Arc::downgrade(publisher);
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+        let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_ref() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let Some(pts) = buffer.pts() else {
+            // Bufor bez PTS — czekamy na kolejny, nie odpinamy jeszcze probe.
+            return gst::PadProbeReturn::Ok;
+        };
+        if let Some(pub_arc) = pub_weak.upgrade() {
+            pub_arc.set_base_pts_ns(pts.nseconds());
+        }
+        gst::PadProbeReturn::Remove
+    });
+}
+
 /// Pad-probe na src-padzie h264parse (bufory wchodzace do mp4mux): PIERWSZY
 /// bufor z ustawionym PTS ustala `mux_base_pts_ns` w publisherze i probe sam
 /// sie odpina. To ta sama oś czasu (media-timeline) co PTS appsink Branch A,
 /// bo Branch A i B dziela `tee` przed dekodem/muxem — klient odejmuje te baze
-/// od PTS detekcji, kotwiczac overlay na wlasciwej klatce MSE. Wspólne dla
-/// gałęzi B RTSP i MJPEG.
+/// od PTS detekcji, kotwiczac overlay na wlasciwej klatce MSE. WYLACZNIE dla
+/// gałęzi passthrough (bez transkodu) — za x264enc PTS jest juz przesuniety.
 pub(super) fn install_mux_base_pts_probe(parse: &gst::Element, publisher: &Arc<Mp4StreamPublisher>) {
     if let Some(parse_src) = parse.static_pad("src") {
-        let pub_weak = std::sync::Arc::downgrade(publisher);
-        parse_src.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
-            let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_ref() else {
-                return gst::PadProbeReturn::Ok;
-            };
-            let Some(pts) = buffer.pts() else {
-                // Bufor bez PTS — czekamy na kolejny, nie odpinamy jeszcze probe.
-                return gst::PadProbeReturn::Ok;
-            };
-            if let Some(pub_arc) = pub_weak.upgrade() {
-                pub_arc.set_base_pts_ns(pts.nseconds());
-            }
-            gst::PadProbeReturn::Remove
-        });
+        install_base_pts_probe(parse_src, publisher);
+    }
+}
+
+/// Pad-probe na src-padzie pierwszej kolejki gałęzi B ZA tee (przed
+/// depay/dekodem/transkodem): PIERWSZY bufor z ustawionym PTS ustala
+/// `mux_base_pts_ns` i probe sam sie odpina. Dla gałęzi TRANSKODUJACYCH
+/// (preview RTSP, oba warianty MJPEG) baza musi byc zdjeta na WEJSCIU gałęzi:
+/// x264enc przesuwa timestampy o staly offset (ochrona przed ujemnym DTS),
+/// wiec baza zdjeta za enkoderem lezy w innej osi czasu niz PTS detekcji
+/// (Branch A) i klient w trybie PTS uznaje kazda detekcje za spozniona.
+/// PTS pierwszej klatki wchodzacej do gałęzi to oś detekcji, z dokladnoscia
+/// do opoznienia enkodera (1-2 klatki).
+pub(super) fn install_branch_input_base_pts_probe(
+    queue: &gst::Element,
+    publisher: &Arc<Mp4StreamPublisher>,
+) {
+    if let Some(queue_src) = queue.static_pad("src") {
+        install_base_pts_probe(queue_src, publisher);
     }
 }
 
@@ -1113,6 +1145,192 @@ fn attach_mp4_branch(
     Ok(Mp4BranchState {
         tee_src_pad,
         elements: vec![queue_b, depay, parse, mux, sink],
+    })
+}
+
+/// Dowiesza wariant PODGLĄDU gałęzi B: zamiast passthroughu pełnego strumienia
+/// źródła (1080p, ~4-8 Mbit/s) transkodujemy do 720p/~1,5 Mbit/s —
+///
+///   tee → queue_b → rtph264depay → h264parse → avdec_h264 →
+///     queue (leaky, gubienie całych klatek) → videoconvert → videoscale →
+///     video/x-raw,1280x720 → x264enc (zerolatency/veryfast/1500) →
+///     h264parse → mp4mux → appsink
+///
+/// Kafelki Live view są małe (~600 px), więc pełna jakość marnuje pasmo WAN
+/// i głodzi WebSocket detekcji na tym samym łączu. Kontrakt publishera (init
+/// segment, fragmenty, baza PTS) jest identyczny jak w gałęzi pełnej jakości
+/// — reużywamy `wire_mp4_appsink`; bazę PTS zdejmuje jednak
+/// `install_branch_input_base_pts_probe` na WEJŚCIU gałęzi (oś detekcji),
+/// bo x264enc przesuwa timestampy za sobą o stały offset.
+/// Dekoder jest osobny od Branch A (własny avdec za tee), więc podgląd nie
+/// zakłóca ścieżki detekcji. Ta sama bramka kodeka co passthrough: H.264.
+fn attach_mp4_branch_preview(
+    pipeline: &gst::Pipeline,
+    tee: &gst::Element,
+    publisher: &Arc<Mp4StreamPublisher>,
+    source_fps: u32,
+) -> std::result::Result<Mp4BranchState, String> {
+    // Bramka kodeka jak w `attach_mp4_branch`: depay jest przykręcony do
+    // H.264, inne kodeki (HEVC, MJPEG) odrzucamy zanim ruszy budowa gałęzi.
+    let tee_sink = tee
+        .static_pad("sink")
+        .ok_or_else(|| "tee has no sink pad".to_string())?;
+    let caps = tee_sink
+        .current_caps()
+        .ok_or_else(|| "tee caps not yet negotiated".to_string())?;
+    let s = caps
+        .structure(0)
+        .ok_or_else(|| "empty caps on tee sink".to_string())?;
+    let encoding_name: String = s
+        .get::<String>("encoding-name")
+        .map_err(|e| format!("rtp caps missing encoding-name: {e}"))?;
+    if !encoding_name.eq_ignore_ascii_case("H264") {
+        return Err(format!(
+            "mp4 preview streaming requires H.264 (rtp encoding={})",
+            encoding_name
+        ));
+    }
+
+    // Kolejka przed dekoderem — NIE-leaky: bufory to surowe pakiety RTP, drop
+    // psułby access-unity aż do najbliższego IDR. Gubienie przy spiętrzeniu
+    // dopiero ZA dekoderem (queue_dec niżej), na pełnych klatkach.
+    let queue_b = gst::ElementFactory::make("queue")
+        .property("name", "queue_branch_b_preview")
+        .property("max-size-buffers", 120u32)
+        .build()
+        .map_err(|e| format!("queue_b preview build: {e}"))?;
+    let depay = gst::ElementFactory::make("rtph264depay")
+        .build()
+        .map_err(|e| format!("rtph264depay build: {e}"))?;
+    let parse_in = gst::ElementFactory::make("h264parse")
+        .build()
+        .map_err(|e| format!("h264parse (dec) build: {e}"))?;
+    let dec = gst::ElementFactory::make("avdec_h264")
+        .build()
+        .map_err(|e| format!("avdec_h264 build: {e}"))?;
+    let queue_dec = build_raw_leaky_queue("queue_decoded_b_preview").map_err(|e| e.to_string())?;
+    let convert = gst::ElementFactory::make("videoconvert")
+        .build()
+        .map_err(|e| format!("videoconvert build: {e}"))?;
+    let scale = gst::ElementFactory::make("videoscale")
+        .build()
+        .map_err(|e| format!("videoscale build: {e}"))?;
+    let scale_caps = gst::Caps::builder("video/x-raw")
+        .field("width", 1280i32)
+        .field("height", 720i32)
+        .build();
+    let scale_filter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &scale_caps)
+        .build()
+        .map_err(|e| format!("preview capsfilter build: {e}"))?;
+    // Transkoder CPU podglądu: zerolatency (bez B-ramek — live), veryfast
+    // (niski koszt CPU), 1,5 Mbit/s, keyframe co ~2 s (skalowane do fps
+    // źródła) — MSE potrzebuje regularnych punktów wejścia. Te same parametry
+    // co transkoder MJPEG, tylko niższy bitrate pod kafelki Live view przez WAN.
+    let enc = gst::ElementFactory::make("x264enc")
+        .property("bitrate", 1500u32)
+        .property("key-int-max", transcoder_key_int_max(source_fps))
+        .build()
+        .map_err(|e| format!("x264enc build: {e}"))?;
+    enc.set_property_from_str("tune", "zerolatency");
+    enc.set_property_from_str("speed-preset", "veryfast");
+    // mp4mux wymaga AVC (NALU z prefiksem długości) — jak w gałęzi passthrough.
+    let parse_out = gst::ElementFactory::make("h264parse")
+        .property_from_str("config-interval", "-1")
+        .build()
+        .map_err(|e| format!("h264parse (mux) build: {e}"))?;
+    // Te same parametry fMP4 co passthrough: ftyp+moov na pierwszym fragmencie
+    // (init segment MSE), fragmenty moof+mdat co 200 ms.
+    let mux = gst::ElementFactory::make("mp4mux")
+        .property("fragment-duration", 200u32)
+        .property("streamable", true)
+        .build()
+        .map_err(|e| format!("mp4mux build: {e}"))?;
+    let sink = gst::ElementFactory::make("appsink")
+        .property("name", "sink_mp4_preview")
+        .property("emit-signals", false)
+        .property("sync", false)
+        .property("max-buffers", 8u32)
+        .property("drop", false)
+        .build()
+        .map_err(|e| format!("appsink_b preview build: {e}"))?;
+
+    let elements = [
+        &queue_b,
+        &depay,
+        &parse_in,
+        &dec,
+        &queue_dec,
+        &convert,
+        &scale,
+        &scale_filter,
+        &enc,
+        &parse_out,
+        &mux,
+        &sink,
+    ];
+    pipeline
+        .add_many(elements)
+        .map_err(|e| format!("add_many branch B preview: {e}"))?;
+
+    let tee_src_pad = tee
+        .request_pad_simple("src_%u")
+        .ok_or_else(|| "tee src_%u request for branch B preview failed".to_string())?;
+    let queue_b_sink = queue_b
+        .static_pad("sink")
+        .ok_or_else(|| "queue_b preview sink pad missing".to_string())?;
+    tee_src_pad
+        .link(&queue_b_sink)
+        .map_err(|e| format!("tee → queue_b preview: {e:?}"))?;
+    gst::Element::link_many(elements)
+        .map_err(|e| format!("link branch B preview: {e}"))?;
+
+    wire_mp4_appsink(&sink, publisher)?;
+
+    // Ta sama semantyka resetu bazy PTS co w gałęzi passthrough (rebuild =
+    // nowa oś), ale probe stoi na WEJŚCIU gałęzi (src pad queue_b za tee,
+    // przed depay/dekodem): x264enc przesuwa timestampy o stały offset, więc
+    // baza zdjęta za enkoderem leżałaby w innej osi niż PTS detekcji i klient
+    // w trybie PTS nie rysowałby boxów. PTS pierwszej klatki wchodzącej do
+    // gałęzi to oś detekcji (Branch A), spójna z media-time pierwszej próbki
+    // fragmentu z dokładnością do opóźnienia enkodera (1-2 klatki).
+    publisher.reset_base_pts_ns();
+    install_branch_input_base_pts_probe(&queue_b, publisher);
+
+    for el in elements {
+        el.sync_state_with_parent()
+            .map_err(|e| format!("sync_state branch B preview element: {e}"))?;
+    }
+
+    // Jak w gałęzi passthrough: nowy widz wpina się w działający strumień, a
+    // avdec potrzebuje IDR, by zacząć dekodować — bez force-key-unit podgląd
+    // czekałby na najbliższy naturalny keyframe kamery (~2 s czarnego ekranu).
+    let force_key_unit = gst_video::UpstreamForceKeyUnitEvent::builder()
+        .all_headers(true)
+        .build();
+    if !tee.send_event(force_key_unit) {
+        let fallback = gst_video::UpstreamForceKeyUnitEvent::builder()
+            .all_headers(true)
+            .build();
+        let _ = pipeline.send_event(fallback);
+    }
+
+    Ok(Mp4BranchState {
+        tee_src_pad,
+        elements: vec![
+            queue_b,
+            depay,
+            parse_in,
+            dec,
+            queue_dec,
+            convert,
+            scale,
+            scale_filter,
+            enc,
+            parse_out,
+            mux,
+            sink,
+        ],
     })
 }
 
@@ -1313,23 +1531,30 @@ pub async fn run_rtsp_session(
         let pipeline = &handles.pipeline;
         let tee = handles.tee.clone();
         // Branch B mux state — `Some` whenever a consumer is subscribed.
-        // Gałąź B NIE przeżywa rebuildu pipeline'u: przy rozbiórce zamykamy
-        // strumień publishera (`close_mp4_stream_on_teardown`), subskrybenci
-        // dostają `Closed(source_unregistered)` i robią resubscribe — świeży
-        // attach na nowym pipeline daje nowy init segment i nową bazę PTS.
-        let mut branch_b: Option<Mp4BranchState> = None;
-        // Słaba referencja do publishera aktualnie wpiętej gałęzi B. Służy do:
-        // (a) zamknięcia strumienia przy rozbiórce pipeline'u, (b) ignorowania
+        // Dwa niezależne sloty na tym samym tee: pełna jakość (passthrough,
+        // klucz hubu `camera:<id>`) i podgląd (transkod 720p, klucz
+        // `camera:<id>#preview`) — dwóch subskrybentów z różnymi wariantami to
+        // dwóch publisherów i dwie gałęzie. Gałąź B NIE przeżywa rebuildu
+        // pipeline'u: przy rozbiórce zamykamy strumień publishera
+        // (`close_mp4_stream_on_teardown`), subskrybenci dostają
+        // `Closed(source_unregistered)` i robią resubscribe — świeży attach na
+        // nowym pipeline daje nowy init segment i nową bazę PTS.
+        let mut branch_b_full: Option<Mp4BranchState> = None;
+        let mut branch_b_preview: Option<Mp4BranchState> = None;
+        // Słabe referencje do publisherów aktualnie wpiętych gałęzi B. Służą do:
+        // (a) zamknięcia strumieni przy rozbiórce pipeline'u, (b) ignorowania
         // przeterminowanych `DetachMp4Branch` od STARYCH publisherów (komenda
-        // nie niesie tożsamości nadawcy), które inaczej zrywałyby świeżą gałąź.
-        let mut branch_b_publisher: Option<std::sync::Weak<Mp4StreamPublisher>> = None;
+        // niesie tylko wariant, nie tożsamość nadawcy), które inaczej zrywałyby
+        // świeżą gałąź tego wariantu.
+        let mut branch_b_full_publisher: Option<std::sync::Weak<Mp4StreamPublisher>> = None;
+        let mut branch_b_preview_publisher: Option<std::sync::Weak<Mp4StreamPublisher>> = None;
 
         tracing::info!(camera_id = %cam_id, "rtsp: setting pipeline state -> Playing");
-        if let Err(e) = pipeline.set_state(gst::State::Playing) {
+        if let Err(e) = super::session::set_state_blocking(pipeline, gst::State::Playing).await {
             let raw_reason = format!("set_state(Playing) failed: {e}");
             let reason = redact_url_in_text(&raw_reason);
             tracing::error!(camera_id = %cam_id, reason = %reason, "rtsp: set_state Playing failed");
-            let _ = pipeline.set_state(gst::State::Null);
+            let _ = super::session::set_state_blocking(pipeline, gst::State::Null).await;
             // Ścieżka GPU-resident padła już przy przejściu do Playing —
             // natychmiast schodzimy na CPU (bez backoffu).
             if ingest_path == IngestPath::GpuResidentNvidia {
@@ -1421,8 +1646,9 @@ pub async fn run_rtsp_session(
                                 &counters,
                                 fps_window.back().copied(),
                             );
-                            let _ = pipeline.set_state(gst::State::Null);
-                            close_mp4_stream_on_teardown(&cam_id, &branch_b_publisher);
+                            let _ = super::session::set_state_blocking(pipeline, gst::State::Null).await;
+                            close_mp4_stream_on_teardown(&cam_id, &branch_b_full_publisher);
+                            close_mp4_stream_on_teardown(&cam_id, &branch_b_preview_publisher);
                             publish(&health_tx, &cam_id, CameraStatus::Offline, None, &counters, None);
                             streaming_bus().close_camera(&cam_id, "stopped").await;
                             return;
@@ -1472,21 +1698,30 @@ pub async fn run_rtsp_session(
                             let _ = reply.send(snap);
                         }
                         Some(SessionCommand::AttachMp4Branch(publisher)) => {
-                            if branch_b.is_some() {
+                            // Wariant publishera wybiera slot: pełna jakość i
+                            // podgląd to dwie niezależne gałęzie na tym samym tee.
+                            let preview = publisher.is_preview();
+                            let slot = if preview { &mut branch_b_preview } else { &mut branch_b_full };
+                            if slot.is_some() {
                                 // Already attached for a previous subscriber.
                                 // The hub guarantees only one publisher per
                                 // stream id at a time, so this is a stray
                                 // signal — fail the new publisher cleanly.
                                 tracing::debug!(
                                     camera_id = %cam_id,
+                                    preview,
                                     "rtsp: attach_mp4_branch ignored — branch already active"
                                 );
                                 publisher.mark_unsupported();
                             } else {
                                 // MJPEG transkoduje JPEG → H.264 (x264enc);
-                                // RTSP przepakowuje H.264 z RTP bez rekompresji.
+                                // RTSP w pełnej jakości przepakowuje H.264 z RTP
+                                // bez rekompresji, a w podglądzie transkoduje do
+                                // 720p/1,5 Mbit/s (kafelki Live view przez WAN).
                                 let attach_result = if is_mjpeg {
-                                    super::mjpeg::attach_mp4_branch_mjpeg(pipeline, &tee, &publisher)
+                                    super::mjpeg::attach_mp4_branch_mjpeg(pipeline, &tee, &publisher, preview, config.target_fps)
+                                } else if preview {
+                                    attach_mp4_branch_preview(pipeline, &tee, &publisher, config.target_fps)
                                 } else {
                                     attach_mp4_branch(pipeline, &tee, &publisher)
                                 };
@@ -1494,14 +1729,21 @@ pub async fn run_rtsp_session(
                                     Ok(state) => {
                                         tracing::info!(
                                             camera_id = %cam_id,
+                                            preview,
                                             "rtsp: branch B attached (fMP4 mux)"
                                         );
-                                        branch_b = Some(state);
-                                        branch_b_publisher = Some(std::sync::Arc::downgrade(&publisher));
+                                        *slot = Some(state);
+                                        let weak = Some(std::sync::Arc::downgrade(&publisher));
+                                        if preview {
+                                            branch_b_preview_publisher = weak;
+                                        } else {
+                                            branch_b_full_publisher = weak;
+                                        }
                                     }
                                     Err(reason) => {
                                         tracing::warn!(
                                             camera_id = %cam_id,
+                                            preview,
                                             reason = %reason,
                                             "rtsp: branch B attach refused"
                                         );
@@ -1510,26 +1752,34 @@ pub async fn run_rtsp_session(
                                 }
                             }
                         }
-                        Some(SessionCommand::DetachMp4Branch) => {
-                            // Komenda nie niesie tożsamości nadawcy. Gdy publisher
-                            // aktualnie wpiętej gałęzi wciąż żyje (hub/subskrybenci
-                            // trzymają Arc), detach pochodzi od STAREGO publishera
-                            // (np. Drop po zamknięciu strumienia przy reconnectcie)
-                            // — ignorujemy go, żeby nie zrywać świeżej gałęzi.
-                            let current_alive = branch_b_publisher
+                        Some(SessionCommand::DetachMp4Branch { preview }) => {
+                            // Komenda niesie tylko wariant, nie tożsamość nadawcy.
+                            // Gdy publisher aktualnie wpiętej gałęzi tego wariantu
+                            // wciąż żyje (hub/subskrybenci trzymają Arc), detach
+                            // pochodzi od STAREGO publishera (np. Drop po zamknięciu
+                            // strumienia przy reconnectcie) — ignorujemy go, żeby
+                            // nie zrywać świeżej gałęzi.
+                            let (slot, slot_publisher) = if preview {
+                                (&mut branch_b_preview, &mut branch_b_preview_publisher)
+                            } else {
+                                (&mut branch_b_full, &mut branch_b_full_publisher)
+                            };
+                            let current_alive = slot_publisher
                                 .as_ref()
                                 .is_some_and(|w| w.upgrade().is_some());
                             if current_alive {
                                 tracing::debug!(
                                     camera_id = %cam_id,
+                                    preview,
                                     "rtsp: ignoruję przeterminowany DetachMp4Branch — \
                                      aktualny publisher gałęzi B wciąż żyje"
                                 );
-                            } else if let Some(state) = branch_b.take() {
+                            } else if let Some(state) = slot.take() {
                                 detach_mp4_branch(pipeline, &tee, state);
-                                branch_b_publisher = None;
+                                *slot_publisher = None;
                                 tracing::info!(
                                     camera_id = %cam_id,
+                                    preview,
                                     "rtsp: branch B detached"
                                 );
                             }
@@ -1616,11 +1866,13 @@ pub async fn run_rtsp_session(
         // Pipeline tear-down (either operator-driven restart or pipeline
         // failure). On a restart we skip backoff entirely and reset the
         // attempt counter so the new credentials are tried immediately.
-        let _ = pipeline.set_state(gst::State::Null);
-        // Gałąź B umiera razem z pipeline'em — zamknij strumień publishera,
-        // żeby subskrybenci WS dostali `Closed(source_unregistered)` i zrobili
-        // resubscribe zamiast wisieć na pustym strumieniu ze starą bazą PTS.
-        close_mp4_stream_on_teardown(&cam_id, &branch_b_publisher);
+        let _ = super::session::set_state_blocking(pipeline, gst::State::Null).await;
+        // Gałęzie B (pełna jakość i podgląd) umierają razem z pipeline'em —
+        // zamknij strumienie publisherów, żeby subskrybenci WS dostali
+        // `Closed(source_unregistered)` i zrobili resubscribe zamiast wisieć
+        // na pustym strumieniu ze starą bazą PTS.
+        close_mp4_stream_on_teardown(&cam_id, &branch_b_full_publisher);
+        close_mp4_stream_on_teardown(&cam_id, &branch_b_preview_publisher);
         if restart_requested {
             tracing::info!(camera_id = %cam_id, "rtsp session restart requested; rebuilding pipeline");
             streaming_bus().close_camera(&cam_id, "restart").await;
@@ -1776,7 +2028,7 @@ async fn sleep_with_cancel(
                         // reconnect succeeds will trigger a fresh attach.
                         publisher.mark_unsupported();
                     }
-                    Some(SessionCommand::DetachMp4Branch) => {
+                    Some(SessionCommand::DetachMp4Branch { .. }) => {
                         // Branch already absent (no pipeline) — no-op.
                     }
                 }
@@ -1831,7 +2083,7 @@ async fn drain_until_stop(
             SessionCommand::AttachMp4Branch(publisher) => {
                 publisher.mark_unsupported();
             }
-            SessionCommand::DetachMp4Branch => {}
+            SessionCommand::DetachMp4Branch { .. } => {}
         }
     }
 }
@@ -1953,7 +2205,7 @@ mod tests {
     async fn test_teardown_closes_active_mp4_stream() {
         use crate::services::stream_hub::BinaryStreamSource;
         let (cmd_tx, _cmd_rx) = mpsc::channel(8);
-        let publisher = Arc::new(Mp4StreamPublisher::new("cam_teardown".into(), cmd_tx));
+        let publisher = Arc::new(Mp4StreamPublisher::new("cam_teardown".into(), cmd_tx, false));
         let mut rx = publisher
             .chunk_broadcaster()
             .expect("broadcaster live")
@@ -1979,7 +2231,7 @@ mod tests {
         close_mp4_stream_on_teardown("cam_none", &None);
 
         let (cmd_tx, _cmd_rx) = mpsc::channel(8);
-        let publisher = Arc::new(Mp4StreamPublisher::new("cam_dead".into(), cmd_tx));
+        let publisher = Arc::new(Mp4StreamPublisher::new("cam_dead".into(), cmd_tx, false));
         let weak = Some(Arc::downgrade(&publisher));
         drop(publisher);
         close_mp4_stream_on_teardown("cam_dead", &weak);

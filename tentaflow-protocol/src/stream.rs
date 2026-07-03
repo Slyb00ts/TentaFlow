@@ -53,6 +53,14 @@ pub enum StreamPayload {
 pub struct StreamSubscribeRequest {
     /// Hub-registered stream id, e.g. `camera:<uuid>` for the camera tier.
     pub stream_id: String,
+    /// `true` = wariant podglądu (transkod 720p/~1,5 Mbit/s) zamiast pełnej
+    /// jakości źródła — kafelki Live view są małe, więc pełny strumień 1080p
+    /// marnuje pasmo WAN i głodzi WebSocket detekcji na tym samym łączu.
+    /// `serde(default)` = `false` (pełna jakość), kompatybilne wstecz ze
+    /// starszymi klientami, które pola nie wysyłają. Wariant dotyczy tylko
+    /// strumieni `camera:`; pozostałe prefiksy go ignorują.
+    #[serde(default)]
+    pub preview: bool,
 }
 
 #[derive(
@@ -121,6 +129,7 @@ mod tests {
     fn subscribe_request_round_trip() {
         let v = StreamPayload::SubscribeRequest(StreamSubscribeRequest {
             stream_id: "camera:550e8400-e29b-41d4-a716-446655440000".into(),
+            preview: true,
         });
         assert_eq!(round_trip!(StreamPayload, v.clone()), v);
     }
@@ -168,6 +177,7 @@ mod tests {
         let body =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: "camera:abc".into(),
+                preview: false,
             }));
         let bytes = crate::cbor::encode(&body).expect("encode");
         let decoded = crate::cbor::decode::<MessageBody>(&bytes).expect("decode");
