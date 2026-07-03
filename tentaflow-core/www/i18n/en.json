@@ -4440,6 +4440,8 @@
     "run_results_short": "Run {id} · results",
     "results_subtitle": "{date} · {dur} · {targets} targets × {scenarios} tests · {requests} requests",
     "export_csv": "Export CSV",
+    "export_pdf": "Export PDF",
+    "pdf_popup_blocked": "Browser blocked the PDF window — allow pop-ups for this site.",
     "compare": "Compare",
     "results_table": "Results table",
     "results_table_hint": "mean ± σ over N repeats · ★ = best in column within a test · decode under concurrency = per-request",

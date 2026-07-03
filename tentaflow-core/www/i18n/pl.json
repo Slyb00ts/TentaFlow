@@ -4576,6 +4576,8 @@
     "run_results_short": "Run {id} · wyniki",
     "results_subtitle": "{date} · {dur} · {targets} targety × {scenarios} testy · {requests} zapytań",
     "export_csv": "Eksport CSV",
+    "export_pdf": "Eksport PDF",
+    "pdf_popup_blocked": "Przeglądarka zablokowała okno PDF — zezwól na pop-upy dla tej strony.",
     "compare": "Porównaj",
     "results_table": "Tabela wyników",
     "results_table_hint": "mean ± σ z N powtórzeń · ★ = najlepszy w kolumnie w ramach testu · decode przy równoległości = per-request",

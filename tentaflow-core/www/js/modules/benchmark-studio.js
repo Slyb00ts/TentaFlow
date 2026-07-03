@@ -1171,6 +1171,7 @@ function renderResults(rows, status) {
       </div>
       <div class="bench-actions">
         <tf-button variant="secondary" icon="download" id="res-csv">${escapeHtml(T('export_csv'))}</tf-button>
+        <tf-button variant="secondary" icon="file" id="res-pdf">${escapeHtml(T('export_pdf'))}</tf-button>
         <tf-button variant="primary" icon="refresh" id="res-compare">${escapeHtml(T('compare'))}</tf-button>
       </div>
     </div>
@@ -1205,6 +1206,7 @@ function renderResults(rows, status) {
   `;
   wireCrumbs(crumbs);
   byId('res-csv')?.addEventListener('click', () => exportResultsCsv(rows));
+  byId('res-pdf')?.addEventListener('click', () => exportResultsPdf(rows, status));
   byId('res-compare')?.addEventListener('click', () => goCompare(state.resultsBenchmarkId, state.resultsBenchmarkName, state.resultsRunId));
 
   renderResultsTable(byId('res-table'), rows, { partial: false });
@@ -1625,6 +1627,44 @@ function exportResultsCsv(rows) {
     r.requests ?? 0, r.errors ?? 0,
   ]);
   downloadCsv(`benchmark-${state.resultsRunId.slice(0, 8)}.csv`, header, data);
+}
+
+// PDF eksport: otwiera okno print z DOKLADNIE tymi samymi tabelami wynikow co na
+// stronie (renderResultsTable) + linkowany CSS appki (ten sam origin, wiec CSP
+// przepuszcza) + `print-color-adjust: exact`, zeby ciemny motyw i kolory
+// (best/★/errory) przetrwaly. User zapisuje jako PDF w dialogu drukowania.
+function exportResultsPdf(rows, status) {
+  if (!rows || !rows.length) { toast(T('no_results'), 'error'); return; }
+  const tmp = document.createElement('div');
+  renderResultsTable(tmp, rows, { partial: false });
+  const tablesHtml = tmp.innerHTML;
+  const title = `${state.resultsBenchmarkName || T('run')} · ${T('run_results_short', { id: state.resultsRunId.slice(0, 8) })}`;
+  const sub = resultsSubtitle(status, rows);
+  const win = window.open('', '_blank');
+  if (!win) { toast(T('pdf_popup_blocked'), 'error'); return; }
+  win.document.write(`<!doctype html><html lang="${escapeAttr(I18n.getLanguage())}"><head><meta charset="utf-8">
+<title>${escapeHtml(title)}</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/css/style.css">
+<link rel="stylesheet" href="/css/controls.css">
+<link rel="stylesheet" href="/css/benchmark-studio.css">
+<style>
+  @page { margin: 12mm; size: A4 landscape; }
+  html, body { background: var(--bg, #0b0e1a); color: var(--text, #e6e9f5);
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+    margin: 0; padding: 28px 32px; font-family: 'Manrope', system-ui, -apple-system, sans-serif; }
+  .pdf-h { font-size: 20px; font-weight: 800; letter-spacing: -0.01em; }
+  .pdf-sub { color: var(--text-3, #8a90a8); font-size: 12px; margin: 6px 0 22px; }
+  .results-table { width: 100%; }
+  .results-group-title { margin: 20px 0 8px; }
+  tr, .results-table { break-inside: avoid; }
+</style></head><body>
+<div class="pdf-h">${escapeHtml(title)}</div>
+<div class="pdf-sub">${escapeHtml(sub)}</div>
+${tablesHtml}
+<script>window.addEventListener('load',function(){setTimeout(function(){window.focus();window.print();},400);});<\/script>
+</body></html>`);
+  win.document.close();
 }
 
 function downloadCsv(filename, header, rows) {
