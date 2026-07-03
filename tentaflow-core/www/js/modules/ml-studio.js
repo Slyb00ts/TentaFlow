@@ -5722,6 +5722,7 @@ function renderModelsTab(panel, p) {
           _isRecog: framework === 'rfdetr',
           _canExport: Boolean(modelId && framework !== 'rfdetr' && (baseModel.trim().length > 0 || framework === 'classifier-timm')),
           _canChat: Boolean(modelId && deployed),
+          _deploying: Boolean(modelId && deploying),
           _canDeploy: Boolean(modelId && exported && !deployed && !deploying && String(m.framework ?? '') !== 'rfdetr'),
         };
       });
@@ -5772,6 +5773,16 @@ function renderModelsTab(panel, p) {
           dep.addEventListener('click', () => deployFtModel(row._modelId, row._modelName, () => renderModelsTab(panel, p), p));
           wrap.appendChild(dep);
           return wrap;
+        }
+        // Deploy w toku — nie oferuj równoległego eksportu/wdrożenia; pokaż stan.
+        if (row._deploying) {
+          const dep = document.createElement('tf-button');
+          dep.setAttribute('size', 'sm');
+          dep.setAttribute('variant', 'outline');
+          dep.setAttribute('icon', 'cpu');
+          dep.setAttribute('disabled', '');
+          dep.textContent = 'Wdrażanie…';
+          return dep;
         }
         if (!row._canExport) return null;
         const btn = document.createElement('tf-button');
