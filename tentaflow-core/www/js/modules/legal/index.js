@@ -70,8 +70,8 @@ const LegalScreen = {
       </div>
 
       <div class="card" style="padding: 14px; margin-bottom: 14px;">
-        <div style="display: grid; grid-template-columns: 1fr auto auto; gap: 10px; align-items: center;">
-          <tf-searchbox id="legal-f-search" placeholder="${escapeAttr('Filtruj po wariancie lub dacie...')}" debounce="200"></tf-searchbox>
+        <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center;">
+          <tf-searchbox id="legal-f-search" placeholder="${escapeAttr('Filtruj po wariancie lub dacie...')}" debounce="200" style="flex: 1 1 200px;"></tf-searchbox>
           <tf-toggle id="legal-f-revoked" ${includeRevoked ? 'checked' : ''}>Pokaz uniewaznione</tf-toggle>
           <tf-button variant="ghost" icon="refresh" id="legal-refresh">Odswiez</tf-button>
         </div>
