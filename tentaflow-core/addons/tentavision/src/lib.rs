@@ -2375,8 +2375,11 @@ pub extern "C" fn on_start() -> i32 {
     // Receive camera.alarm events emitted by the camera_alert flow node so an
     // alarm verdict from a camera's analysis flow lands in the alarms table.
     subscribe_event(CAMERA_ALARM_EVENT);
-    send_initial_shell();
-    render_panel("overview");
+    // The shell is NOT rendered here: on_start does not receive the
+    // host-assigned panel epoch, so a shell emitted now would carry the default
+    // epoch and be rejected on any session whose epoch advanced past 1. The
+    // host calls on_panel_open (with the authoritative epoch) on every open,
+    // including cold starts, so the shell is rendered there exactly once.
     0
 }
 

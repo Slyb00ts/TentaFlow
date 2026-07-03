@@ -186,6 +186,54 @@ fn handle_panel_open(
                             panel_open.addon_id
                         ))
                     })?;
+
+                // start_addon only runs on_start, which never receives the
+                // host-assigned panel epoch (so bundled UI addons no longer
+                // render there). on_panel_open is the single canonical render
+                // entry: deliver the authoritative epoch so the freshly started
+                // instance renders its PanelShell with the epoch this session
+                // granted. Without this a cold start on a session whose epoch
+                // already advanced past 1 (panel reopened, or the instance was
+                // restarted by an addon update) would leave the panel blank.
+                match addon_mgr.call_panel_open(
+                    &panel_open.addon_id,
+                    &panel_open.panel_id,
+                    epoch,
+                    user_id.clone(),
+                ) {
+                    Ok(has_export) => {
+                        // No on_panel_open export means the addon can only have
+                        // rendered during on_start; if it also registered no
+                        // shell, the panel would be blank — fail the open rather
+                        // than return success with nothing to paint.
+                        if !has_export {
+                            let sl = ctx.state.ui_sessions.get_or_create(ctx.connection_id);
+                            let mut session = sl.lock();
+                            if !session.is_shell_registered(
+                                &panel_open.addon_id,
+                                &panel_open.panel_id,
+                            ) {
+                                session.close_panel(
+                                    &panel_open.addon_id,
+                                    &panel_open.panel_id,
+                                );
+                                return Err(ProtocolError::internal(format!(
+                                    "addon '{}' opened panel '{}' but rendered no shell",
+                                    panel_open.addon_id, panel_open.panel_id
+                                )));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let sl = ctx.state.ui_sessions.get_or_create(ctx.connection_id);
+                        sl.lock()
+                            .close_panel(&panel_open.addon_id, &panel_open.panel_id);
+                        return Err(ProtocolError::internal(format!(
+                            "on_panel_open failed for addon '{}': {e}",
+                            panel_open.addon_id
+                        )));
+                    }
+                }
             }
             Ok(())
         })?;

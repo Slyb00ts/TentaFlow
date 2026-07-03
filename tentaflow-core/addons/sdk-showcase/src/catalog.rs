@@ -144,6 +144,7 @@ pub fn section_stack(tab: &str, section_header: &str) -> Component {
         align: FlexAlign::Stretch,
         children,
         padding: Some(Spacing::Md),
+        justify: None,
     }
     .into_component(format!("catalog-{}", tab))
     .expect("Stack encode")

@@ -109,6 +109,27 @@ pub extern "C" fn on_install() -> i32 {
 pub extern "C" fn on_start() -> i32 {
     log("contacts addon started");
     register_contacts_tools();
+    // The shell is NOT rendered here: on_start does not receive the
+    // host-assigned panel epoch, so a shell emitted now would carry the default
+    // epoch and be rejected on any session whose epoch advanced past 1. The
+    // host calls on_panel_open (with the authoritative epoch) on every open,
+    // including cold starts, so the shell is rendered there exactly once.
+    0
+}
+
+/// Canonical render entry: the host invokes this on every panel open (cold and
+/// warm) with the session-assigned epoch. Rendering here — never in on_start —
+/// guarantees the PanelShell carries the epoch the host expects.
+#[no_mangle]
+pub extern "C" fn on_panel_open(panel_id_ptr: i32, panel_id_len: i32, epoch: i64) -> i32 {
+    let panel_id = read_guest_string(panel_id_ptr, panel_id_len);
+    if panel_id != PANEL_ID {
+        return 0;
+    }
+    unsafe {
+        PANEL_EPOCH = epoch as u64;
+        STATE_REVISION = 0;
+    }
     send_panel_shell();
     send_tab_content("all");
     0
@@ -218,6 +239,7 @@ fn send_panel_shell() {
         align: FlexAlign::Stretch,
         children: vec![nav_tabs, content_host],
         padding: None,
+        justify: None,
     }
     .into_component("root")
     .expect("Stack encode");
@@ -417,6 +439,7 @@ fn stack_component(id: &str, children: &[Component]) -> Component {
         align: FlexAlign::Stretch,
         children: children.to_vec(),
         padding: Some(Spacing::Md),
+        justify: None,
     }
     .into_component(id)
     .expect("Stack encode")

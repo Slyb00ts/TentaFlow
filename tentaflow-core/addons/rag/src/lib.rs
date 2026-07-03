@@ -205,9 +205,11 @@ pub extern "C" fn on_start() -> i32 {
     // SQL, capy, paginacja, izolacja per-instancja.
     register_read_side_tools();
 
-    // Pelny panel GUI (Split: sidebar baz wiedzy | workspace czat-first) przez binarny
-    // protokol CBOR (sdk-runtime). send_panel_shell sam wypycha oba sloty.
-    ui::send_panel_shell();
+    // Panel GUI nie jest renderowany w on_start: ta funkcja nie dostaje epoki
+    // panelu przypisanej przez hosta, wiec shell wyslany tutaj niosby domyslna
+    // epoke i zostalby odrzucony w sesji, ktorej epoka przekroczyla 1. Host
+    // wola on_panel_open (z autorytatywna epoka) przy kazdym otwarciu, takze na
+    // zimnym starcie — tam shell jest renderowany dokladnie raz.
 
     log::info("rag: uruchomiony");
     0
