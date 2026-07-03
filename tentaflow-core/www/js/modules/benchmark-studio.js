@@ -82,11 +82,23 @@ function fmtMsInt(v) {
   return fmtInt(Math.round(v));
 }
 
-// Skrocony czas trwania z dwoch znacznikow ISO.
+// Znaczniki z backendu (started_at/finished_at) to SQLite `datetime('now')` —
+// naive UTC "YYYY-MM-DD HH:MM:SS" BEZ strefy. Date.parse traktuje taki format
+// jak LOCAL, co w strefie != UTC dawalo elapsed przesuniety o offset (np. +2h w
+// CEST -> licznik startowal od ~120:00). Normalizujemy: brak jawnej strefy =>
+// interpretuj jako UTC (spacja->T, doklej Z).
+function parseServerTs(s) {
+  if (!s) return NaN;
+  const str = String(s).trim();
+  if (/[zZ]$|[+-]\d{2}:?\d{2}$/.test(str)) return Date.parse(str);
+  return Date.parse(str.replace(' ', 'T') + 'Z');
+}
+
+// Skrocony czas trwania z dwoch znacznikow.
 function fmtDuration(startIso, endIso) {
   if (!startIso) return '—';
-  const start = Date.parse(startIso);
-  const end = endIso ? Date.parse(endIso) : Date.now();
+  const start = parseServerTs(startIso);
+  const end = endIso ? parseServerTs(endIso) : Date.now();
   if (Number.isNaN(start) || Number.isNaN(end)) return '—';
   const secs = Math.max(0, Math.round((end - start) / 1000));
   const m = Math.floor(secs / 60);
@@ -104,7 +116,7 @@ function fmtClock(ms) {
 // Skrocona data ISO → YYYY-MM-DD HH:MM (lokalnie).
 function fmtDate(iso) {
   if (!iso) return '—';
-  const t = Date.parse(iso);
+  const t = parseServerTs(iso);
   if (Number.isNaN(t)) return escapeHtml(iso);
   const d = new Date(t);
   const p = (n) => String(n).padStart(2, '0');
@@ -898,7 +910,7 @@ async function openRun(runId, benchmarkId, benchmarkName) {
   // Status → started_at + status.
   try {
     const st = await ApiBinary.one('benchmarkRunStatusRequest', { runId });
-    state.runStartedMs = Date.parse(st?.startedAt || '') || Date.now();
+    state.runStartedMs = parseServerTs(st?.startedAt || '') || Date.now();
     state.runStatus = st?.status || 'running';
   } catch { state.runStartedMs = Date.now(); }
 
