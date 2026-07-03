@@ -217,6 +217,19 @@ fn stream_subscribe_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
             }
         };
 
+        // Tozsamosc subskrybenta w logu — diagnostyka: kto i kiedy podpina
+        // sie pod stream (ten handler obsluguje wylacznie dashboard binary-WS;
+        // relaye mesh i konsumenci systemowi subskrybuja StreamHub innymi
+        // sciezkami i loguja u siebie).
+        tracing::info!(
+            user_id = %user_id,
+            correlation_id = ctx.correlation_id,
+            stream_id = %stream_id,
+            preview,
+            source = "dashboard-ws",
+            "stream: subscribe"
+        );
+
         let handle = match StreamHub::global().subscribe(&hub_key).await {
             Ok(h) => h,
             Err(StreamHubError::NotRegistered(_)) => {

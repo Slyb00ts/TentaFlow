@@ -47,6 +47,17 @@ const MEDIA_QUEUE_CAPACITY: usize = 64;
 /// czekajacych na kanale control.
 const SINK_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Interwal serwerowego WS Ping (kanalem control). Klient (przegladarka)
+/// odpowiada Pongiem na poziomie protokolu, co zasila read-idle-timeout —
+/// martwe polaczenie (zamknieta karta, zerwana siec) wykrywamy w ~30 s
+/// zamiast czekac na spozniony blad odczytu TLS (~90-150 s).
+const KEEPALIVE_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Read-idle-timeout: jesli od peera nie przyszla ZADNA ramka (w tym Pong na
+/// nasz keepalive) przez ten czas, polaczenie jest martwe — przerywamy petle
+/// odczytu, co uruchamia istniejacy cleanup (subskrypcje, writer, sesje UI).
+const READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Monotonic counter for unique per-connection identifiers. Used as key in the
 /// UI SessionRegistry so panel lifecycle state is scoped per WS socket.
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -266,6 +277,29 @@ pub async fn handle_ws_connection<S>(
 
     debug!("binary-WS: nowe polaczenie");
 
+    // Serwerowy keepalive: cykliczny WS Ping kanalem control (priorytet przed
+    // media, wiec wychodzi tez pod obciazeniem). Task konczy sie, gdy writer
+    // polaczenia padnie (send zwraca Err po dropie odbiornika kanalu).
+    {
+        let tx_ping = control_tx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(KEEPALIVE_PING_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if tx_ping
+                    .send(ControlFrame::Raw(Message::Ping(
+                        tokio_tungstenite::tungstenite::Bytes::new(),
+                    )))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+
     // Spawnuj task ktory pushuje audit eventy jako unsolicited frames.
     {
         let tx_audit = control_tx.clone();
@@ -416,7 +450,21 @@ pub async fn handle_ws_connection<S>(
         });
     }
 
-    while let Some(msg) = source.next().await {
+    loop {
+        // Read-idle-timeout: timeout restartuje sie przy kazdej ramce (takze
+        // Pong na serwerowy keepalive) — brak jakiejkolwiek ramki przez
+        // READ_IDLE_TIMEOUT oznacza martwe polaczenie.
+        let msg = match tokio::time::timeout(READ_IDLE_TIMEOUT, source.next()).await {
+            Ok(Some(m)) => m,
+            Ok(None) => break,
+            Err(_) => {
+                warn!(
+                    "binary-WS: brak ramek od klienta przez {}s — zamykam martwe polaczenie",
+                    READ_IDLE_TIMEOUT.as_secs()
+                );
+                break;
+            }
+        };
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
