@@ -570,8 +570,8 @@ function renderGeneralTab() {
       const value = s.value == null ? '' : s.value;
       return `
         <tr data-key="gen-${escapeAttr(key)}">
-          <td><code style="font-size:12px;">${escapeHtml(key)}</code></td>
-          <td>
+          <td data-label="${escapeAttr(I18n.t('settings.key'))}"><code style="font-size:12px;">${escapeHtml(key)}</code></td>
+          <td data-label="${escapeAttr(I18n.t('settings.value'))}">
             <tf-input
               type="${isSecret ? 'password' : 'text'}"
               value="${escapeAttr(value)}"
@@ -579,7 +579,7 @@ function renderGeneralTab() {
               placeholder="${isSecret ? '***' : ''}"
             ></tf-input>
           </td>
-          <td style="font-size:11px;color:var(--text-3);white-space:nowrap;">${s.updatedAt ? escapeHtml(formatDate(s.updatedAt)) : '—'}</td>
+          <td data-label="${escapeAttr(I18n.t('settings.last_change'))}" style="font-size:11px;color:var(--text-3);white-space:nowrap;">${s.updatedAt ? escapeHtml(formatDate(s.updatedAt)) : '—'}</td>
           <td style="text-align:right;">
             <tf-button variant="primary" size="sm" icon="check" data-general-save="${escapeAttr(key)}">${escapeHtml(I18n.t('common.save'))}</tf-button>
           </td>
@@ -641,11 +641,11 @@ function renderSsoTab() {
     ? `<tr><td colspan="6"><div class="empty-big" style="padding:24px;">${escapeHtml(I18n.t('settings.sso_empty'))}</div></td></tr>`
     : ssoProviders.map((p) => `
       <tr>
-        <td><strong>${escapeHtml(p.name)}</strong></td>
-        <td>${escapeHtml(typeLabel(p.providerType))}</td>
-        <td><code style="font-size:11px;">${escapeHtml(p.discoveryUrl || '')}</code></td>
-        <td>${p.autoCreateUsers ? '<tf-chip status="ok">' + escapeHtml(I18n.t('common.yes')) + '</tf-chip>' : '<tf-chip status="info">' + escapeHtml(I18n.t('common.no')) + '</tf-chip>'}</td>
-        <td>${p.enabled ? '<tf-chip status="ok">' + escapeHtml(I18n.t('settings.sso_active')) + '</tf-chip>' : '<tf-chip status="warn">' + escapeHtml(I18n.t('settings.sso_disabled')) + '</tf-chip>'}</td>
+        <td data-label="${escapeAttr(I18n.t('settings.sso_name'))}"><strong>${escapeHtml(p.name)}</strong></td>
+        <td data-label="${escapeAttr(I18n.t('settings.sso_type'))}">${escapeHtml(typeLabel(p.providerType))}</td>
+        <td data-label="${escapeAttr(I18n.t('settings.sso_discovery'))}"><code style="font-size:11px;">${escapeHtml(p.discoveryUrl || '')}</code></td>
+        <td data-label="${escapeAttr(I18n.t('settings.sso_auto_create'))}">${p.autoCreateUsers ? '<tf-chip status="ok">' + escapeHtml(I18n.t('common.yes')) + '</tf-chip>' : '<tf-chip status="info">' + escapeHtml(I18n.t('common.no')) + '</tf-chip>'}</td>
+        <td data-label="${escapeAttr(I18n.t('common.status'))}">${p.enabled ? '<tf-chip status="ok">' + escapeHtml(I18n.t('settings.sso_active')) + '</tf-chip>' : '<tf-chip status="warn">' + escapeHtml(I18n.t('settings.sso_disabled')) + '</tf-chip>'}</td>
         <td style="text-align:right;">
           <tf-button variant="danger" size="sm" icon="trash" data-sso-delete="${p.id}" title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>
         </td>
@@ -928,9 +928,9 @@ function renderRegistryRows() {
     ? `<tr><td colspan="3"><div class="empty-big" style="padding:24px;">${escapeHtml(I18n.t('registries.empty'))}</div></td></tr>`
     : registries.map((r) => `
       <tr>
-        <td><code>${escapeHtml(r.url)}</code></td>
-        <td><tf-chip status="accent">${escapeHtml(r.kind)}</tf-chip></td>
-        <td>${r.authRequired ? `<tf-chip status="warn">${escapeHtml(I18n.t('registries.auth_yes'))}</tf-chip>` : `<tf-chip status="ok">${escapeHtml(I18n.t('registries.auth_no'))}</tf-chip>`}</td>
+        <td data-label="${escapeAttr(I18n.t('registries.col_url'))}"><code>${escapeHtml(r.url)}</code></td>
+        <td data-label="${escapeAttr(I18n.t('registries.col_type'))}"><tf-chip status="accent">${escapeHtml(r.kind)}</tf-chip></td>
+        <td data-label="${escapeAttr(I18n.t('registries.col_auth'))}">${r.authRequired ? `<tf-chip status="warn">${escapeHtml(I18n.t('registries.auth_yes'))}</tf-chip>` : `<tf-chip status="ok">${escapeHtml(I18n.t('registries.auth_no'))}</tf-chip>`}</td>
       </tr>
     `).join('');
 }
