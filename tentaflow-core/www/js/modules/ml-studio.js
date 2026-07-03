@@ -5610,6 +5610,14 @@ async function showJobsOverview() {
 
 // Wyciąga skrótowe metryki z metricsJson modelu (np. "acc 0.94" / "loss 1.2").
 // Zwraca pusty string, gdy JSON nie zawiera znanych pól — wtedy kolumna pokaże "—".
+// Formatuje loss tak, by mikroskopijna niezerowa wartość (przeuczenie na małym
+// zbiorze daje ~1e-6) nie zaokrąglała się do „0.00" — to myli z brakiem metryki
+// albo zepsutym modelem. Bardzo małe wartości pokazujemy w notacji wykładniczej.
+function formatLoss(n) {
+  if (n !== 0 && Math.abs(n) < 0.005) return n.toExponential(1);
+  return n.toFixed(2);
+}
+
 function modelMetricsSummary(metricsJson) {
   if (!metricsJson) return '';
   let m = metricsJson;
@@ -5624,7 +5632,7 @@ function modelMetricsSummary(metricsJson) {
   const loss = num(m.train_loss ?? m.trainLoss ?? m.eval_loss ?? m.evalLoss ?? m.loss);
   if (acc != null) parts.push(`acc ${acc.toFixed(2)}`);
   if (f1 != null) parts.push(`f1 ${f1.toFixed(2)}`);
-  if (loss != null) parts.push(`loss ${loss.toFixed(2)}`);
+  if (loss != null) parts.push(`loss ${formatLoss(loss)}`);
   return parts.join(' · ');
 }
 
