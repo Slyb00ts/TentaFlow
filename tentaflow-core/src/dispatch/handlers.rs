@@ -5035,6 +5035,21 @@ pub async fn deploy_vllm_recommend(
                 toks = crate::deploy::python_venv::dedup_cli_args_last_wins(toks);
                 base = toks.join(" ");
             }
+            // DeepSeek V4 (Flash/Pro, w tym warianty -DSpark): MoE + DSA long-context.
+            // `--block-size 256` pod efektywny KV przy kontekstach do 1M (recepta
+            // vLLM V4). fp8 kv-cache i --enable-expert-parallel dokladane sa juz
+            // wyzej (model_type deepseek_v4 + MoE na multi-GPU); DSpark self-speculative
+            // wnosi preset (`speculator_method="dspark"`). `--data-parallel-size` i
+            // fp4-indexer-cache sa hardware-specyficzne (liczba B200) → recepta/extra-args.
+            if spec.model_type.eq_ignore_ascii_case("deepseek_v4")
+                || model_lc.contains("deepseek-v4")
+            {
+                let mut toks: Vec<String> = base.split_whitespace().map(String::from).collect();
+                toks.push("--block-size".into());
+                toks.push("256".into());
+                toks = crate::deploy::python_venv::dedup_cli_args_last_wins(toks);
+                base = toks.join(" ");
+            }
             base
         }
         // MLX (mlx-lm) uruchamiany jest przez wlasny runner, nie przez flagi CLI

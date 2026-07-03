@@ -113,3 +113,28 @@ id = "nemotron-nano-12b-v2-vl"
 display_name = "Nemotron Nano 12B v2 VL (captioning)"
 repo = "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-FP8"
 quantization = "fp8"
+
+# DeepSeek V4 (Flash 284B/13B-act, Pro 1.6T/49B-act) — MoE + DSA long-context (1M).
+# Warianty -DSpark maja glowe draftujaca WBUDOWANA w checkpoint (self-speculative,
+# ~1.2-1.4x vs stock MTP, lossless), wiec speculator BEZ osobnego repo. Turnkey
+# max-perf: Core auto-dokłada fp8 kv-cache (model_type deepseek_v4), --block-size 256
+# i --enable-expert-parallel (MoE na multi-GPU). --data-parallel-size zalezy od
+# liczby kart → recepta vLLM / extra-args. Datacenter Blackwell/Hopper LUB cluster
+# 4-8x DGX Spark przez RDMA 200Gbit (Flash sie mie sci; Pro 1.6T nie na 8 Sparkach).
+[[model_preset]]
+id = "deepseek-v4-flash-dspark"
+display_name = "DeepSeek V4 Flash (DSpark, MoE, 1M ctx)"
+repo = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
+quantization = "fp8"
+speculator_method = "dspark"
+speculator_num_tokens = 4
+featured = true
+
+[[model_preset]]
+id = "deepseek-v4-pro-dspark"
+display_name = "DeepSeek V4 Pro (DSpark, 1.6T MoE, 1M ctx)"
+repo = "deepseek-ai/DeepSeek-V4-Pro-DSpark"
+quantization = "fp8"
+speculator_method = "dspark"
+speculator_num_tokens = 4
+featured = true

@@ -1819,13 +1819,16 @@ pub(crate) fn vllm_native_speculative_arg(
             let repo = preset.speculator_repo.as_ref()?;
             format!("{{\"model\":\"{repo}\",\"num_speculative_tokens\":{ntok}}}")
         }
-        // DSpark / DFlash / PFlash / Eagle(3) / Medusa: method + model draftujacy.
-        other => {
-            let repo = preset.speculator_repo.as_ref()?;
-            format!(
+        // DSpark / DFlash / PFlash / Eagle(3) / Medusa. Z osobnym drafterem
+        // (Gemma/Qwen: `speculator_repo`) → method + model. BEZ repo (np.
+        // DeepSeek-V4-*-DSpark ma glowe draftujaca WBUDOWANA w checkpoint,
+        // self-speculative jak MTP) → sama method.
+        other => match preset.speculator_repo.as_ref() {
+            Some(repo) => format!(
                 "{{\"method\":\"{other}\",\"model\":\"{repo}\",\"num_speculative_tokens\":{ntok}}}"
-            )
-        }
+            ),
+            None => format!("{{\"method\":\"{other}\",\"num_speculative_tokens\":{ntok}}}"),
+        },
     };
     // Flaga i JSON jako DWA osobne elementy argv. JSON nigdy nie przechodzi
     // przez shlex/xargs, wiec wewnetrzne cudzyslowy zostaja nietkniete i
