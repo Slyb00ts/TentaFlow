@@ -3768,6 +3768,7 @@
     "huggingfaceToken": "Token HuggingFace (opcjonalny)",
     "noPresets": "Brak rekomendowanych modeli — użyj wyszukiwarki HuggingFace",
     "presetHint": "Wybierz rekomendowany model dla tego silnika",
+    "quantVariant": "Kwantyzacja",
     "hfSearchHint": "Wpisz minimum 2 znaki, aby wyszukać",
     "hfSearchPlaceholder": "np. qwen, llama, mistral...",
     "ggufFileLabel": "Plik GGUF",

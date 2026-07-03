@@ -1100,6 +1100,19 @@ mod services_manifest_build {
         /// Mirror `ModelPreset::checkpoint_file` z `services/manifest/types.rs`.
         #[serde(default)]
         pub checkpoint_file: Option<String>,
+        /// Warianty kwantyzacji tego samego modelu — kazdy to inne repo HF pod
+        /// wybrana kwantyzacje. `repo`/`quantization` na preset = wariant „standard".
+        /// Wizard pokazuje je jako wybor przy kalkulatorze i podmienia repo.
+        #[serde(default, rename = "quant_variant")]
+        pub quant_variants: Vec<QuantVariant>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct QuantVariant {
+        pub quantization: String,
+        pub repo: String,
+        #[serde(default)]
+        pub display_name: Option<String>,
     }
 
     // Single source of truth for the three wire-string allow-lists is

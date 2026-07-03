@@ -3632,6 +3632,7 @@
     "huggingfaceToken": "HuggingFace token (optional)",
     "noPresets": "No recommended models — use HuggingFace search",
     "presetHint": "Select a recommended model for this engine",
+    "quantVariant": "Quantization",
     "hfSearchHint": "Type at least 2 characters to search",
     "hfSearchPlaceholder": "e.g. qwen, llama, mistral...",
     "ggufFileLabel": "GGUF file",

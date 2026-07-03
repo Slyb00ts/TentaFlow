@@ -85,6 +85,16 @@ speculator_repo = "google/gemma-4-31B-it-assistant"
 speculator_method = "draft_model"
 speculator_num_tokens = 4
 featured = true
+# Warianty kwantyzacji — wizard pokaze dropdown i podmieni repo HF pod wybor.
+# `repo` wyzej = domyslny (nvfp4). Kazdy wariant = inne repo tej samej rodziny.
+[[model_preset.quant_variant]]
+quantization = "nvfp4"
+repo = "nvidia/Gemma-4-31B-IT-NVFP4"
+display_name = "NVFP4 (Blackwell)"
+[[model_preset.quant_variant]]
+quantization = "bf16"
+repo = "google/gemma-4-31B-it"
+display_name = "standard (bf16)"
 
 [[model_preset]]
 id = "gemma-4-12b-it-nvfp4"

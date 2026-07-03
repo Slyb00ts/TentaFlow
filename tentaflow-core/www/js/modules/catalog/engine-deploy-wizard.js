@@ -251,6 +251,12 @@ export async function openDeployWizard(engineId, opts = {}) {
     if (rec) {
       selection.modelPresetId = rec.id;
       applySpeculatorPreset(rec);
+      // Domyslny wariant kwantyzacji (gdy preset go ma) — repo wariantu jako
+      // model_repo (wygrywa nad preset.repo w backendzie).
+      const dv = defaultQuantVariant(rec);
+      selection.quantVariant = dv ? dv.quantization : null;
+      selection.modelRepo = dv ? dv.repo : null;
+      if (dv) selection.advanced.quantization = dv.quantization;
     }
   } else {
     modelSourceMode = 'hf';
@@ -649,7 +655,45 @@ function renderPresetSelector(presets) {
 
   return `
     <div class="model-list">${items}</div>
+    ${renderQuantVariantSelector(presets)}
     <p class="form-hint">${escapeHtml(I18n.t('wizard.presetHint'))}</p>
+  `;
+}
+
+/// Warianty kwantyzacji wybranego presetu (`[[model_preset.quant_variant]]`).
+function presetQuantVariants(preset) {
+  return (preset && Array.isArray(preset.quant_variant)) ? preset.quant_variant.filter(Boolean) : [];
+}
+
+/// Domyslny wariant: dopasowany do `quantization` presetu, inaczej pierwszy.
+function defaultQuantVariant(preset) {
+  const vs = presetQuantVariants(preset);
+  if (!vs.length) return null;
+  const q = (preset.quantization || '').toLowerCase();
+  return vs.find((v) => (v.quantization || '').toLowerCase() === q) || vs[0];
+}
+
+/// Dropdown wyboru kwantyzacji (= podmiana repo HF) pod lista presetow. Renderuje
+/// sie tylko gdy wybrany preset ma zdefiniowane `quant_variant`. Pod spodem widac
+/// docelowe repo, zgodnie z pomyslem: wybor kwantyzacji + od razu wiadomo model.
+function renderQuantVariantSelector(presets) {
+  const preset = presets.find((p) => p?.id === selection.modelPresetId);
+  const variants = presetQuantVariants(preset);
+  if (variants.length < 2) return '';
+  const current = (selection.quantVariant || (defaultQuantVariant(preset) || {}).quantization || '').toLowerCase();
+  const opts = variants.map((v) => {
+    const q = v.quantization || '';
+    const label = v.display_name || q;
+    const sel = q.toLowerCase() === current ? ' selected' : '';
+    return `<option value="${escapeAttr(q)}"${sel}>${escapeHtml(label)}</option>`;
+  }).join('');
+  const active = variants.find((v) => (v.quantization || '').toLowerCase() === current) || variants[0];
+  return `
+    <div class="quant-variant-row">
+      <label class="form-label" for="edw-quant-variant">${escapeHtml(I18n.t('wizard.quantVariant'))}</label>
+      <tf-select id="edw-quant-variant" value="${escapeAttr(active.quantization || '')}">${opts}</tf-select>
+      <div class="model-item-info mono">${escapeHtml(active.repo || '')}</div>
+    </div>
   `;
 }
 
@@ -2552,18 +2596,39 @@ function bindStepModelInputs() {
   document.querySelectorAll('.model-item[data-preset-id]').forEach((it) => {
     it.addEventListener('click', () => {
       selection.modelPresetId = it.dataset.presetId;
-      selection.modelRepo = null;
       selection.modelFile = null;
-      document.querySelectorAll('.model-item[data-preset-id]').forEach((x) => x.classList.remove('selected'));
-      it.classList.add('selected');
       const preset = Manifest.modelPresets(engineEntry).find((p) => p?.id === selection.modelPresetId);
       if (preset) applySpeculatorPreset(preset);
-      // Zmiana modelu uniewaznia estymacje VRAM — wymus ponowny /recommend
-      // (z nowa quantization presetu) przy wejsciu na krok Advanced.
+      // Wariant kwantyzacji: domyslny (dopasowany do quantization presetu). Repo
+      // wariantu ida jako `model_repo`, ktory w backendzie wygrywa nad preset.repo
+      // (resolve_model_repo) — bez wariantow dv=null → modelRepo=null (repo presetu).
+      const dv = preset ? defaultQuantVariant(preset) : null;
+      selection.quantVariant = dv ? dv.quantization : null;
+      selection.modelRepo = dv ? dv.repo : null;
+      if (dv) selection.advanced.quantization = dv.quantization;
+      // Zmiana modelu uniewaznia estymacje VRAM — wymus ponowny /recommend.
       advancedRecommendation = null;
       cachedModelSpec = null;
+      // Re-render, zeby pokazac dropdown wariantow dla wybranego presetu.
+      refreshModal();
     });
   });
+
+  const quantVariantSel = document.getElementById('edw-quant-variant');
+  if (quantVariantSel) {
+    quantVariantSel.addEventListener('change', (e) => {
+      const q = String(e.detail?.value ?? quantVariantSel.value ?? '').toLowerCase();
+      const preset = Manifest.modelPresets(engineEntry).find((p) => p?.id === selection.modelPresetId);
+      const v = presetQuantVariants(preset).find((x) => (x.quantization || '').toLowerCase() === q);
+      if (!v) return;
+      selection.quantVariant = v.quantization;
+      selection.modelRepo = v.repo;
+      selection.advanced.quantization = v.quantization;
+      advancedRecommendation = null;
+      cachedModelSpec = null;
+      refreshModal();
+    });
+  }
 
   const search = document.getElementById('edw-hf-search');
   if (search) {
