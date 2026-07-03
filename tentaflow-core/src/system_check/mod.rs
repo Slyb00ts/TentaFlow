@@ -197,6 +197,20 @@ impl GpuSnapshot {
             }
         }
     }
+
+    /// Czy karta ma SPRZETOWE fp8 E4M3 (`fp8e4nv`) uzywane przez fp8 kv-cache.
+    /// Natywne dopiero od Ada (sm_89): ada / hopper / blackwell / spark. Ampere
+    /// (sm_80/86/87) i starsze go NIE maja — vLLM wywala sie wtedy w torch.compile
+    /// autotuningu ("type fp8e4nv not supported in this architecture"). ROCm /
+    /// Metal / XPU / CPU idzie inna sciezka fp8 — konserwatywnie `false`.
+    /// Bazuje na `cuda_arch_tag` (karta o najwiekszym VRAM rozstrzyga), wiec jedno
+    /// zrodlo prawdy z wyborem wariantu builda.
+    pub fn has_fp8_kv_hardware(&self) -> bool {
+        matches!(
+            self.cuda_arch_tag().as_str(),
+            "cuda-ada" | "cuda-hopper" | "cuda-blackwell" | "cuda-spark"
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

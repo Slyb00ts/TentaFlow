@@ -1460,7 +1460,11 @@ impl DeployStrategy for DockerDeploy {
         }
         // Dedup last-wins (extra/user args wygrywaja nad bundle/manifest base).
         // entrypoint.sh dorzuca tylko AUTO_PARALLEL gdy brak TP/PP w tych argach.
-        let engine_args = crate::deploy::python_venv::dedup_cli_args_last_wins(engine_args);
+        let mut engine_args = crate::deploy::python_venv::dedup_cli_args_last_wins(engine_args);
+        // Ten sam gate co native: fp8 kv-cache pada na GPU bez fp8e4nv (Ampere).
+        // Kontener widzi karty hosta przez nvidia runtime, wiec host `collect()`
+        // = arch kontenera.
+        crate::deploy::python_venv::gate_fp8_kv_cache(&mut engine_args, None);
 
         let mut labels = HashMap::new();
         labels.insert(
