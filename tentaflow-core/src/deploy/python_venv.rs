@@ -1507,13 +1507,16 @@ fn pick_install_variant<'a>(
     // Tagi CUDA degraduja do ogolnego 'cuda', potem do dowolnego wariantu CUDA.
     if backend.starts_with("cuda") {
         if let Some(v) = variants.iter().find(|v| v.backend == "cuda") {
-            // Brak arch-specyficznego wariantu NIE jest problemem: deploy
-            // wstrzykuje dokladny TORCH_CUDA_ARCH_LIST pod wykryte GPU do
-            // ogolnego wariantu 'cuda' (inject_torch_cuda_arch), wiec kernele
-            // i tak kompiluja sie pod realna karte. Stad info!, nie warn!.
-            tracing::info!(
-                "brak arch-specyficznego wariantu '{}', uzywam ogolnego 'cuda' \
-                 (+ wstrzyniety TORCH_CUDA_ARCH_LIST pod wykryte GPU)",
+            // To ZAMIERZONA sciezka, nie fallback z powodu bledu: bundle vLLM
+            // celowo deklaruje JEDEN generyczny wariant 'cuda' (PyPI fat wheels
+            // sm80..sm120), a pod konkretna karte wstrzykujemy dokladny
+            // TORCH_CUDA_ARCH_LIST (inject_torch_cuda_arch), wiec custom-kernele
+            // i tak kompiluja sie pod realne GPU. Osobne bundle per-arch nie sa
+            // potrzebne. Log na debug!, zeby nie wygladal jak problem na kazdej
+            // karcie — deploy dziala poprawnie na Ampere/Ada/Hopper/Blackwell.
+            tracing::debug!(
+                "GPU arch '{}' -> generyczny bundle 'cuda' + TORCH_CUDA_ARCH_LIST \
+                 pod te karte (per-arch bundle nie jest potrzebny)",
                 backend
             );
             return Ok(Some(v));
