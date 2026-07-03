@@ -178,6 +178,13 @@ fn stream_subscribe_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
         })
         .await;
         drop(auth_permit);
+        // Sprzatanie wpisu semafora: usuwamy tylko gdy nikt inny nie trzyma
+        // Arc (mapa ma jedyna referencje) i wszystkie permity sa wolne —
+        // inaczej churn wielu uzytkownikow zostawialby wpisy do restartu.
+        SUBSCRIBE_AUTH_SEMS.get_or_init(DashMap::new).remove_if(&user_id, |_, sem| {
+            Arc::strong_count(sem) == 1
+                && sem.available_permits() == MAX_CONCURRENT_SUBSCRIBE_AUTH
+        });
         let hub_key = match auth_result {
             Ok(Ok(key)) => key,
             Ok(Err(err)) => {

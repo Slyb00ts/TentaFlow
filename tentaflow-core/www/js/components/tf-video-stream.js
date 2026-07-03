@@ -26,6 +26,13 @@ const RESUBSCRIBE_BACKOFF_MS = [1000, 2000, 5000];
 // handler po stronie serwera).
 const NO_DATA_WATCHDOG_MS = 6000;
 
+// Twardy limit dlugosci kolejki appendow do SourceBuffera. Gdy dekoder nie
+// nadaza (karta w tle, wolny sprzet), WebSocket dalej dostarcza chunki i
+// kolejka roslaby bez granic. Pojedynczych chunkow fMP4 NIE wolno dropowac
+// (dziura psuje strumien), wiec po przekroczeniu limitu robimy czysty restart
+// pipeline'u + resubscribe. 200 fragmentow po ~200 ms = ~40 s zaleglosci.
+const MAX_APPEND_QUEUE = 200;
+
 class TfVideoStream extends HTMLElement {
   static get observedAttributes() {
     return ['stream-id', 'label', 'height-px'];
@@ -398,6 +405,14 @@ class TfVideoStream extends HTMLElement {
   }
 
   _enqueueAppend(bytes) {
+    // Dekoder trwale nie nadaza za dostarczaniem — dalsze kolejkowanie tylko
+    // puchnie w pamieci, a dropniecie chunka zepsuloby strumien fMP4.
+    if (this._appendQueue.length >= MAX_APPEND_QUEUE) {
+      console.warn('[tf-video-stream] append queue overflow — restart pipeline');
+      this._resetMediaPipeline();
+      this._scheduleResubscribe();
+      return;
+    }
     this._appendQueue.push(bytes);
     this._drainAppendQueue();
   }

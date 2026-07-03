@@ -952,11 +952,14 @@ pub(super) fn wire_mp4_appsink(
 }
 
 /// Odstep klatek kluczowych (`key-int-max`) transkodera x264enc, skalowany do
-/// fps zrodla: keyframe co ~2 s, w granicach 10..=120 klatek. MSE potrzebuje
-/// regularnych punktow wejscia — stala wartosc w klatkach dawala przy kamerze
-/// 5 fps GOP 10 s i wolny odzysk po reconnect/resync.
+/// fps zrodla: keyframe co ~2 s osi czasu, w granicach 2..=120 klatek. Dolna
+/// granica jest w klatkach odpowiadajacych ~2 s przy 1 fps — granica w
+/// wiekszej liczbie klatek wydluzalaby GOP w SEKUNDACH przy niskim fps (np.
+/// 10 klatek przy 1 fps = GOP 10 s), a klient przycina bufor MSE wzgledem
+/// currentTime i kasowalby keyframe aktywnego GOP (stall). MSE potrzebuje
+/// regularnych punktow wejscia.
 pub(super) fn transcoder_key_int_max(source_fps: u32) -> u32 {
-    (2 * source_fps.max(1)).clamp(10, 120)
+    (2 * source_fps.max(1)).clamp(2, 120)
 }
 
 /// Pad-probe ustalajacy baze PTS publishera: PIERWSZY bufor z ustawionym PTS
