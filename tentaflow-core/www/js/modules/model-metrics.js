@@ -372,7 +372,13 @@ function wirePeriodKey(reload) {
 }
 
 function meshBannerHtml(nodeCount, extra = '') {
-  const nodes = nodesList.map((n) => `<tf-chip variant="success">${escapeHtml(n.label)}</tf-chip>`).join('');
+  const nodes = nodesList.map((n) => {
+    const full = n.label || '';
+    // Node id to 64-znakowy hex — skracamy w chipie (pełny w tooltipie), inaczej
+    // nierozbijalny ciag przelewa banner poza ekran na mobile.
+    const short = full.length > 14 ? `${full.slice(0, 10)}…${full.slice(-4)}` : full;
+    return `<tf-chip variant="success" title="${escapeAttr(full)}">${escapeHtml(short)}</tf-chip>`;
+  }).join('');
   return `
     <section class="card mm-banner">
       <span>${escapeHtml(T('mesh_note', { count: nodeCount }))}${extra ? ` • ${extra}` : ''}</span>
