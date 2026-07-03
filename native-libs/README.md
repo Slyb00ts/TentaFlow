@@ -79,13 +79,37 @@ artifact, which is required for SM_103 (B300, Blackwell Ultra).
 ./scripts/native-libs/build-onnxruntime.sh linux-x86_64 --from-source  # native SM_103 cubins
 ```
 
-Runtime host requirements for the `gpu_cuda13` variant (not bundled):
+For the `gpu_cuda13` variant the script also vendors the full NVIDIA runtime
+stack from the official NVIDIA wheels (pypi.nvidia.com / pypi.org, SHA-256
+pinned):
 
-- NVIDIA driver R580+ (CUDA 13 compatible),
-- cuDNN 9 for the CUDA EP,
-- TensorRT >= 10.13 for the TensorRT EP — the provider dlopens
-  `libnvinfer.so.10` / `libnvonnxparser.so.10` at runtime; without them the
-  detector falls back to the CUDA EP gracefully.
+- TensorRT: `libnvinfer.so.10` + `libnvinfer_plugin.so.10` +
+  `libnvonnxparser.so.10` + the builder resource for the target SM
+  (per-SM split since TRT 10.15; sm100 + ptx ≈ 1.24 GB),
+- the full cuDNN 9 split-lib set (≈ 0.97 GB),
+- the CUDA toolkit runtime libs the EPs DT_NEED and a driver-only host lacks:
+  `libcudart.so.13`, `libcublas.so.13` + `libcublasLt.so.13`,
+  `libcufft.so.12`, `libcurand.so.10` (≈ 0.96 GB, from the
+  `nvidia-cuda-runtime` / `nvidia-cublas` / `nvidia-cufft` / `nvidia-curand`
+  wheels — the CUDA 13 line dropped the `-cuXX` package suffix).
+
+Everything lands flat in `lib-dynamic/`, so `tentaflow/build.rs` copies it
+next to the binary and the loader resolves it via `$ORIGIN` — **no system
+TensorRT, cuDNN or CUDA toolkit install is needed on the target host; an
+NVIDIA R580+ driver (CUDA 13 compatible) is the only host requirement**.
+Expect ~3.2 GB in `lib-dynamic/` (and again next to the binary).
+
+- `TENTAFLOW_SKIP_TRT_VENDOR=1` skips ALL vendoring on hosts that have a
+  system TensorRT/cuDNN/CUDA toolkit.
+- `TENTAFLOW_SKIP_CUDA_VENDOR=1` skips only the CUDA toolkit libs (host has
+  the toolkit installed but no TensorRT/cuDNN).
+- `TENSORRT_SMS` picks builder-resource buckets (`auto` detects the local
+  GPU; use `TENSORRT_SMS=sm100` when provisioning for a B300 from another
+  machine; `all` vendors every SM bucket, ~1.9 GB extra).
+- `TENSORRT_VENDOR_REF` / `CUDNN_VENDOR_REF` / `CUDART_VENDOR_REF` /
+  `CUBLAS_VENDOR_REF` / `CUFFT_VENDOR_REF` / `CURAND_VENDOR_REF` override the
+  pinned wheel versions (for TRT/cuDNN provide `*_VENDOR_SHA256` to keep
+  checksum verification; other overrides warn loudly and skip verification).
 
 Prebuilt CUDA 13 binaries ship PTX, so kernels JIT-compile on SM_103 (slower
 first session load). `--from-source` builds native cubins

@@ -11,15 +11,37 @@
 #   - SM_103 needs the CUDA 13 toolchain and TensorRT >= 10.13. The official
 #     `gpu_cuda13` release artifact is built against CUDA 13 / cuDNN 9 and its
 #     TensorRT EP dlopens the system libnvinfer.so.10 at runtime.
-#   - Runtime host requirements (not bundled in the archive): NVIDIA driver
-#     R580+ (CUDA 13 compatible), cuDNN 9 for the CUDA EP, TensorRT >= 10.13
-#     (libnvinfer) for the TensorRT EP. A missing TensorRT install only
-#     disables the TRT EP — detector code falls back to CUDA gracefully.
+#   - The TensorRT + cuDNN runtimes are vendored below, so the only host
+#     requirement left is an NVIDIA R580+ driver (CUDA 13 compatible). If the
+#     TRT EP still cannot load at runtime, detector code falls back to the
+#     CUDA EP gracefully.
 #   - Prebuilt CUDA 13 binaries carry PTX, so kernels JIT-compile on new SMs
 #     like SM_103. That works but slows the first session load; `--from-source`
 #     compiles native SM_103 cubins (CMAKE_CUDA_ARCHITECTURES=103) for fast
 #     startup. Prebuilt stays the default because it needs no local CUDA/TRT
 #     build toolchain.
+#
+# Self-contained GPU runtime (no system TensorRT/cuDNN on the target host):
+#   When the CUDA-13 GPU variant is selected, the script additionally vendors
+#   the TensorRT and cuDNN runtime libs from the official NVIDIA wheels
+#   (pypi.nvidia.com / pypi.org, no login) into lib-dynamic/, flat, so
+#   tentaflow/build.rs copies them next to the binary and libonnxruntime
+#   resolves them via rpath/$ORIGIN. Vendored set:
+#     TensorRT: libnvinfer.so.10, libnvinfer_plugin.so.10,
+#               libnvonnxparser.so.10, libnvinfer_builder_resource_<sm>/_ptx
+#               (per-SM builder resources since TRT 10.15; older 10.13/10.14
+#               wheels ship one monolithic ~1.3 GB resource)
+#     cuDNN 9:  libcudnn.so.9 + all split libs it dlopens (ops/cnn/adv/graph/
+#               heuristic/engines_*)
+#     CUDA toolkit runtime (the EPs DT_NEED these and a driver-only host has
+#     none of them): libcudart.so.13, libcublas.so.13 + libcublasLt.so.13,
+#     libcufft.so.12, libcurand.so.10 — from the nvidia-cuda-runtime /
+#     nvidia-cublas / nvidia-cufft / nvidia-curand wheels (CUDA 13 line
+#     dropped the -cuXX package suffix; the CUDA major is in the version).
+#   This is ~3.2 GB on disk (and again next to the binary). Opt-outs:
+#   TENTAFLOW_SKIP_TRT_VENDOR=1 skips ALL vendoring (system TRT+cuDNN+CUDA
+#   toolkit expected); TENTAFLOW_SKIP_CUDA_VENDOR=1 skips only the CUDA
+#   toolkit libs (host has the toolkit but no TensorRT/cuDNN).
 #
 # Env knobs:
 #   ONNXRUNTIME_REF        git tag / release tag (default: pinned below)
@@ -30,6 +52,20 @@
 #   ONNXRUNTIME_CUDA_ARCHS CMAKE_CUDA_ARCHITECTURES for source builds
 #                          (default: 103 = B300)
 #   CUDA_HOME / TENSORRT_HOME  toolchain roots for source builds
+#   TENTAFLOW_SKIP_TRT_VENDOR  1 = do not vendor TensorRT/cuDNN wheels
+#   TENSORRT_VENDOR_REF    TensorRT wheel version (default: pinned below)
+#   TENSORRT_VENDOR_SHA256 wheel checksum override for custom versions
+#   TENSORRT_SMS           builder-resource buckets: auto (default) | all |
+#                          comma list (sm75,sm80,sm86,sm89,sm90,sm100,sm120);
+#                          the ptx resource is always included. Cross-
+#                          provisioning for B300: TENSORRT_SMS=sm100.
+#   CUDNN_VENDOR_REF       cuDNN wheel version (default: pinned below)
+#   CUDNN_VENDOR_SHA256    wheel checksum override for custom versions
+#   TENTAFLOW_SKIP_CUDA_VENDOR 1 = do not vendor CUDA toolkit runtime libs
+#   CUDART_VENDOR_REF / CUBLAS_VENDOR_REF / CUFFT_VENDOR_REF /
+#   CURAND_VENDOR_REF      CUDA toolkit wheel versions (defaults pinned
+#                          below; overriding without a pinned checksum
+#                          downgrades to a loud unverified-download warning)
 # =============================================================================
 
 set -euo pipefail
@@ -115,6 +151,284 @@ verify_archive_checksum() {
     return 1
   fi
   echo ">>> SHA-256 verified: $(basename "$archive_path")"
+}
+
+# ---------------------------------------------------------------------------
+# TensorRT + cuDNN runtime vendoring (CUDA-13 GPU variant only).
+# TRT 10.16.1.11: newest 10.x CUDA-13 line (soname .10 matches what the ORT
+# TRT EP dlopens; SM_103 support landed in 10.13). Since 10.15 the wheel
+# splits builder resources per SM, so we vendor only the needed bucket + ptx
+# (~1.24 GB) instead of the monolithic 10.13 resource (~1.34 GB alone).
+# cuDNN 9.24.0.43: newest cuDNN 9 CUDA-13 wheel; libcudnn.so.9 is a shim that
+# dlopens the split libs, so the whole lib/ set is required (~0.97 GB).
+# ---------------------------------------------------------------------------
+TENSORRT_VENDOR_REF="${TENSORRT_VENDOR_REF:-10.16.1.11}"
+CUDNN_VENDOR_REF="${CUDNN_VENDOR_REF:-9.24.0.43}"
+# CUDA 13 toolkit runtime lines (versions differ per component; the CUDA
+# major moved into the wheel version when NVIDIA dropped the -cuXX suffix).
+CUDART_VENDOR_REF="${CUDART_VENDOR_REF:-13.3.29}"
+CUBLAS_VENDOR_REF="${CUBLAS_VENDOR_REF:-13.6.0.2}"
+CUFFT_VENDOR_REF="${CUFFT_VENDOR_REF:-12.3.0.29}"
+CURAND_VENDOR_REF="${CURAND_VENDOR_REF:-10.4.3.29}"
+
+pinned_wheel_sha256() {
+  case "$1" in
+    tensorrt_cu13_libs-10.16.1.11-py3-none-manylinux_2_28_x86_64.whl) echo "91142c8ab3c58bed213cf1a563a6eb4e4f0ac529d05b5f909073acece0e3b712" ;;
+    nvidia_cudnn_cu13-9.24.0.43-py3-none-manylinux_2_27_x86_64.whl)   echo "71f181cd810e90f9b6023b01186fe82d13d65f0ec098581ee201d39fad769e4b" ;;
+    nvidia_cuda_runtime-13.3.29-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl) echo "e04420616e72f563167a7733272992d7e6df6dc5cb54b2f94f9f1520ea9e30c1" ;;
+    nvidia_cublas-13.6.0.2-py3-none-manylinux_2_27_x86_64.whl)        echo "b82c80c886cea6da6e149a5c3bdba274f12b7e4ec4b00a050b916b0446fb4153" ;;
+    nvidia_cufft-12.3.0.29-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl)      echo "edb25c0626bd202ee5acc035b5dd361a3b89ed3b75a81a52df72c89150cb57c2" ;;
+    nvidia_curand-10.4.3.29-py3-none-manylinux_2_27_x86_64.whl)       echo "1859bf37a62754d2c65001393096ca79de399f995971fa7826d0adfd88c3cf7b" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Resolves the x86_64 wheel filename for a package/version from the NVIDIA
+# simple index — the manylinux platform tag varies per package and version,
+# so it cannot be reconstructed from the version alone.
+resolve_nvidia_wheel() {
+  local package="$1"
+  local version="$2"
+  local underscored="${package//-/_}"
+  local filename
+  filename="$(curl -fsSL --max-time 30 "https://pypi.nvidia.com/$package/" \
+    | grep -oE "href=\"${underscored}-${version}-[^\"#]*x86_64[^\"#]*\\.whl" \
+    | head -n1 | sed 's/^href="//')"
+  if [ -z "$filename" ]; then
+    echo "ERROR: no x86_64 wheel for $package==$version on pypi.nvidia.com" >&2
+    return 1
+  fi
+  printf '%s\n' "$filename"
+}
+
+# Downloads + verifies + extracts one CUDA toolkit runtime wheel from the
+# NVIDIA index. Members live under nvidia/cu13/lib/ in every cu13-era wheel.
+vendor_cuda_wheel() {
+  local package="$1"
+  local version="$2"
+  local member_regex="$3"
+  local lib_dir="$NATIVE_ROOT/$PLATFORM/lib-dynamic"
+  local wheel
+  wheel="$(resolve_nvidia_wheel "$package" "$version")" || return 1
+  local wheel_path="$NATIVE_CACHE/downloads/$wheel"
+  download_cached "https://pypi.nvidia.com/$package/$wheel" "$wheel_path" || return 1
+  verify_wheel_checksum "$wheel_path" "" || return 1
+  echo ">>> Vendoring $package $version:"
+  extract_wheel_members "$wheel_path" "^nvidia/cu13/lib/($member_regex)$" "$lib_dir" || return 1
+}
+
+verify_wheel_checksum() {
+  local wheel_path="$1"
+  local override="$2"
+  local expected
+  if [ -n "$override" ]; then
+    expected="$override"
+  elif ! expected="$(pinned_wheel_sha256 "$(basename "$wheel_path")")"; then
+    echo ">>> WARNING: no pinned SHA-256 for $(basename "$wheel_path") — set the *_VENDOR_SHA256 env to verify custom versions." >&2
+    return 0
+  fi
+  local actual
+  actual="$(sha256_of "$wheel_path")"
+  if [ "$actual" != "$expected" ]; then
+    echo "ERROR: SHA-256 mismatch for $(basename "$wheel_path")" >&2
+    echo "  expected: $expected" >&2
+    echo "  actual:   $actual" >&2
+    echo "Delete $wheel_path and retry (corrupted or tampered download)." >&2
+    return 1
+  fi
+  echo ">>> SHA-256 verified: $(basename "$wheel_path")"
+}
+
+download_cached() {
+  local url="$1"
+  local dest="$2"
+  if [ ! -f "$dest" ] || [ "${TENTAFLOW_NATIVE_UPDATE:-0}" = "1" ]; then
+    echo ">>> Downloading $url"
+    curl -fL "$url" -o "$dest"
+  fi
+}
+
+# Extracts wheel members matching a python regex flat (basename only) into a
+# directory. Wheels are plain zips; python3 is already a script prerequisite.
+extract_wheel_members() {
+  local wheel_path="$1"
+  local pattern="$2"
+  local dest="$3"
+  WHEEL="$wheel_path" PATTERN="$pattern" DEST="$dest" python3 - <<'PYEOF'
+import os, re, sys, zipfile
+pattern = re.compile(os.environ["PATTERN"])
+dest = os.environ["DEST"]
+extracted = []
+with zipfile.ZipFile(os.environ["WHEEL"]) as zf:
+    for info in zf.infolist():
+        if info.is_dir() or not pattern.search(info.filename):
+            continue
+        target = os.path.join(dest, os.path.basename(info.filename))
+        with zf.open(info) as src, open(target, "wb") as out:
+            while chunk := src.read(1 << 20):
+                out.write(chunk)
+        os.chmod(target, 0o755)
+        extracted.append((os.path.basename(info.filename), info.file_size))
+if not extracted:
+    print(f"ERROR: no members matching {pattern.pattern} in {os.environ['WHEEL']}", file=sys.stderr)
+    sys.exit(1)
+for name, size in sorted(extracted):
+    print(f"    {size / 1e6:9.1f} MB  {name}")
+PYEOF
+}
+
+# Maps the host GPU compute capability to a TRT builder-resource bucket.
+# B300 (Blackwell Ultra) reports cap 10.3 -> the sm100 datacenter-Blackwell
+# resource. No GPU on the provisioning host defaults to sm100 because B300 is
+# the primary cross-provisioning target (override with TENSORRT_SMS).
+detect_trt_sm_bucket() {
+  local cap
+  cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | tr -d ' ' || true)"
+  case "$cap" in
+    7.5) echo "sm75" ;;
+    8.0|8.7) echo "sm80" ;;
+    8.6) echo "sm86" ;;
+    8.9) echo "sm89" ;;
+    9.*) echo "sm90" ;;
+    10.*) echo "sm100" ;;
+    12.*) echo "sm120" ;;
+    "") echo "sm100" ;;
+    *) echo "" ;;
+  esac
+}
+
+# Vendors the TensorRT + cuDNN + CUDA toolkit runtimes into lib-dynamic/ so
+# the shipped binary needs nothing but the NVIDIA driver on the target host —
+# the EP libs DT_NEED/dlopen libnvinfer.so.10, libnvonnxparser.so.10,
+# libcudnn.so.9, libcudart.so.13, libcublas(Lt).so.13, libcufft.so.12 and
+# libcurand.so.10 from the binary directory ($ORIGIN) after
+# tentaflow/build.rs copies them.
+vendor_nvidia_runtimes() {
+  if [ "${TENTAFLOW_SKIP_TRT_VENDOR:-0}" = "1" ]; then
+    echo ">>> Skipping TensorRT/cuDNN/CUDA vendoring (TENTAFLOW_SKIP_TRT_VENDOR=1 — system TRT/cuDNN/CUDA expected on the target host)."
+    return 0
+  fi
+  require_cmd python3
+  local lib_dir="$NATIVE_ROOT/$PLATFORM/lib-dynamic"
+  local download_dir="$NATIVE_CACHE/downloads"
+  mkdir -p "$download_dir"
+
+  # --- TensorRT runtime from the NVIDIA PyPI index (pypi.nvidia.com serves
+  # the wheel files directly next to the simple-index page). ---
+  local trt_wheel="tensorrt_cu13_libs-$TENSORRT_VENDOR_REF-py3-none-manylinux_2_28_x86_64.whl"
+  local trt_path="$download_dir/$trt_wheel"
+  download_cached "https://pypi.nvidia.com/tensorrt-cu13-libs/$trt_wheel" "$trt_path" || return 1
+  verify_wheel_checksum "$trt_path" "${TENSORRT_VENDOR_SHA256:-}" || return 1
+
+  local sms="${TENSORRT_SMS:-auto}"
+  local bucket_re
+  case "$sms" in
+    auto)
+      local bucket
+      bucket="$(detect_trt_sm_bucket)"
+      if [ -z "$bucket" ]; then
+        echo ">>> WARNING: unrecognized GPU compute capability — vendoring only the ptx builder resource (JIT on first engine build)." >&2
+        bucket_re=""
+      else
+        bucket_re="|$bucket"
+      fi
+      ;;
+    all) bucket_re="|sm[0-9]+" ;;
+    *) bucket_re="|$(printf '%s' "$sms" | tr ',' '|')" ;;
+  esac
+  # The optional suffix group matches only ptx + the selected SM buckets, so
+  # the win_* Windows builder resources bundled in the same wheel stay out;
+  # the empty-suffix branch keeps the monolithic pre-10.15 resource working.
+  local trt_pattern="^tensorrt_libs/(libnvinfer\\.so\\.10|libnvinfer_plugin\\.so\\.10|libnvonnxparser\\.so\\.10|libnvinfer_builder_resource(_(ptx${bucket_re}))?\\.so\\..*)$"
+  rm -f "$lib_dir"/libnvinfer*.so* "$lib_dir"/libnvonnxparser*.so* 2>/dev/null || true
+  echo ">>> Vendoring TensorRT $TENSORRT_VENDOR_REF runtime (builder resources: ptx${bucket_re//|/, }):"
+  extract_wheel_members "$trt_path" "$trt_pattern" "$lib_dir" || return 1
+  # A builder resource MUST have landed: either the monolithic pre-10.15 file
+  # or at least one per-SM/ptx variant. A typo in TENSORRT_SMS would otherwise
+  # ship a runtime that cannot build engines.
+  if ! ls "$lib_dir"/libnvinfer_builder_resource*.so.* >/dev/null 2>&1; then
+    echo "ERROR: no libnvinfer_builder_resource* extracted — check TENSORRT_SMS ('$sms') against the wheel contents." >&2
+    return 1
+  fi
+
+  # --- cuDNN 9 runtime; the wheel URL on files.pythonhosted.org contains a
+  # content hash, so resolve it through the PyPI JSON API. ---
+  local cudnn_wheel="nvidia_cudnn_cu13-$CUDNN_VENDOR_REF-py3-none-manylinux_2_27_x86_64.whl"
+  local cudnn_path="$download_dir/$cudnn_wheel"
+  if [ ! -f "$cudnn_path" ] || [ "${TENTAFLOW_NATIVE_UPDATE:-0}" = "1" ]; then
+    local cudnn_url
+    cudnn_url="$(curl -fsSL --max-time 30 "https://pypi.org/pypi/nvidia-cudnn-cu13/$CUDNN_VENDOR_REF/json" \
+      | WHEEL_NAME="$cudnn_wheel" python3 -c '
+import json, os, sys
+data = json.load(sys.stdin)
+for url in data["urls"]:
+    if url["filename"] == os.environ["WHEEL_NAME"]:
+        print(url["url"])
+        break
+else:
+    sys.exit(f"wheel {os.environ['WHEEL_NAME']} not found in PyPI release")')"
+    download_cached "$cudnn_url" "$cudnn_path"
+  fi
+  verify_wheel_checksum "$cudnn_path" "${CUDNN_VENDOR_SHA256:-}" || return 1
+  rm -f "$lib_dir"/libcudnn*.so* 2>/dev/null || true
+  echo ">>> Vendoring cuDNN $CUDNN_VENDOR_REF runtime:"
+  extract_wheel_members "$cudnn_path" '^nvidia/cudnn/lib/libcudnn.*\.so\.9.*$' "$lib_dir" || return 1
+
+  # --- CUDA toolkit runtime libs the EPs DT_NEED (a driver-only host has no
+  # toolkit): cudart, cublas/cublasLt, cufft, curand. libnvblas and libcufftw
+  # are deliberately excluded — nothing in the EP chain references them. ---
+  local required_libs=(libnvinfer.so.10 libnvonnxparser.so.10 libcudnn.so.9)
+  if [ "${TENTAFLOW_SKIP_CUDA_VENDOR:-0}" = "1" ]; then
+    echo ">>> Skipping CUDA toolkit runtime vendoring (TENTAFLOW_SKIP_CUDA_VENDOR=1 — system CUDA toolkit expected on the target host)."
+  else
+    rm -f "$lib_dir"/libcudart*.so* "$lib_dir"/libcublas*.so* \
+          "$lib_dir"/libcufft*.so* "$lib_dir"/libcurand*.so* 2>/dev/null || true
+    vendor_cuda_wheel nvidia-cuda-runtime "$CUDART_VENDOR_REF" 'libcudart\.so\..*' || return 1
+    vendor_cuda_wheel nvidia-cublas "$CUBLAS_VENDOR_REF" 'libcublas(Lt)?\.so\..*' || return 1
+    vendor_cuda_wheel nvidia-cufft "$CUFFT_VENDOR_REF" 'libcufft\.so\..*' || return 1
+    vendor_cuda_wheel nvidia-curand "$CURAND_VENDOR_REF" 'libcurand\.so\..*' || return 1
+    required_libs+=(libcudart.so.13 libcublas.so.13 libcublasLt.so.13 libcufft.so.12 libcurand.so.10)
+  fi
+
+  # --- Post-vendor sanity: both EP provider libs must resolve their NVIDIA
+  # deps from the vendored dir (this is exactly what $ORIGIN gives the
+  # binary). ---
+  local missing=0
+  for lib in "${required_libs[@]}"; do
+    if [ ! -f "$lib_dir/$lib" ]; then
+      echo "ERROR: vendored $lib missing in $lib_dir" >&2
+      missing=1
+    fi
+  done
+  [ "$missing" -eq 0 ] || return 1
+  if command -v ldd >/dev/null 2>&1; then
+    local provider unresolved
+    for provider in libonnxruntime_providers_tensorrt.so libonnxruntime_providers_cuda.so; do
+      [ -f "$lib_dir/$provider" ] || continue
+      unresolved="$(LD_LIBRARY_PATH="$lib_dir" ldd "$lib_dir/$provider" 2>/dev/null | grep 'not found' | awk '{print $1}' | tr '\n' ' ' || true)"
+      if [ -n "$unresolved" ]; then
+        echo ">>> NOTE: $provider still resolves these from the target host: $unresolved" >&2
+      else
+        echo ">>> $provider resolves fully against the vendored lib-dynamic."
+      fi
+    done
+  fi
+  # `|| true` guards pipefail: with TENTAFLOW_SKIP_CUDA_VENDOR=1 some globs
+  # stay unexpanded and du exits non-zero while still totalling the rest.
+  local vendored_size
+  vendored_size="$(du -shc "$lib_dir"/libnvinfer*.so* "$lib_dir"/libnvonnxparser*.so* "$lib_dir"/libcudnn*.so* \
+    "$lib_dir"/libcudart*.so* "$lib_dir"/libcublas*.so* "$lib_dir"/libcufft*.so* "$lib_dir"/libcurand*.so* 2>/dev/null \
+    | tail -n1 | awk '{print $1}' || true)"
+  echo ">>> Vendored NVIDIA runtimes total: $vendored_size"
+  append_manifest_library "$PLATFORM" "tensorrt-runtime" "dynamic" "$TENSORRT_VENDOR_REF" \
+    "Vendored from tensorrt-cu13-libs wheel (nvinfer/plugin/onnxparser + builder resources); TENTAFLOW_SKIP_TRT_VENDOR=1 skips."
+  append_manifest_library "$PLATFORM" "cudnn-runtime" "dynamic" "$CUDNN_VENDOR_REF" \
+    "Vendored from nvidia-cudnn-cu13 wheel (full split-lib set, ~1 GB)."
+  if [ "${TENTAFLOW_SKIP_CUDA_VENDOR:-0}" != "1" ]; then
+    append_manifest_library "$PLATFORM" "cuda-runtime" "dynamic" \
+      "cudart=$CUDART_VENDOR_REF cublas=$CUBLAS_VENDOR_REF cufft=$CUFFT_VENDOR_REF curand=$CURAND_VENDOR_REF" \
+      "Vendored CUDA toolkit runtime (cudart/cublas/cublasLt/cufft/curand, ~1 GB); TENTAFLOW_SKIP_CUDA_VENDOR=1 skips. Total vendored NVIDIA runtimes: $vendored_size."
+  fi
 }
 
 # Selects the prebuilt CUDA major for linux-x86_64 GPU archives. `auto` reads
@@ -264,6 +578,9 @@ if [ "$MODE" = "source" ]; then
   sanity_check_gpu_linux
   append_manifest_library "$PLATFORM" "onnxruntime" "dynamic" "$ONNXRUNTIME_REF" \
     "Source build: CUDA+TensorRT EPs, native cubins for SM $CUDA_ARCHS."
+  # A source build implies the CUDA 13 toolchain; the target host still needs
+  # the TRT/cuDNN runtimes, so vendor them the same way as the prebuilt path.
+  vendor_nvidia_runtimes
   exit 0
 fi
 
@@ -344,3 +661,10 @@ if [ "$GPU_LINUX" = "1" ]; then
   ORT_NOTE="GPU variant $ARCHIVE (TensorRT+CUDA providers); ONNXRUNTIME_GPU=0 -> CPU-only, ONNXRUNTIME_CUDA=12|13 pins the CUDA line, --from-source builds native SM cubins."
 fi
 append_manifest_library "$PLATFORM" "onnxruntime" "dynamic" "$ONNXRUNTIME_REF" "$ORT_NOTE"
+
+# CUDA-12 hosts pair with a system TensorRT/cuDNN matching their driver; only
+# the CUDA-13 variant targets self-contained deployments (B300 has no shell
+# access for installing system packages).
+if [ "$GPU_LINUX" = "1" ] && [ "$CUDA_MAJOR" = "13" ]; then
+  vendor_nvidia_runtimes
+fi
