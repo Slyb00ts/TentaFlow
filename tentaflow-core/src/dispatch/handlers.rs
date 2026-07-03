@@ -4887,8 +4887,15 @@ pub async fn deploy_vllm_recommend(
     // twardo wymaga fp8 kv-cache (vLLM asertuje "FlashMLA fp8 layout only
     // supports fp8 kv-cache" i ubija engine przy `auto`). Gdy user sam nie
     // wybrał dtype, domyślamy fp8 dla tej rodziny — inaczej każdy deploy V4 pada.
+    // NVFP4: waga w fp4, ale kv-cache w fp8 to sprawdzony sweet-spot (recepty
+    // recipes.vllm.ai dla nvfp4 ustawiaja tak samo). Ustawiamy fp8 jako
+    // strukturalny default, gdy user sam nie wybral — inaczej GUI pokazywalo
+    // "auto" (fp16 kv) niespojnie z recepta, ktora fp8 dorzucala tylko do
+    // surowej komendy.
     let kv_dtype = payload.kv_cache_dtype.clone().unwrap_or_else(|| {
-        if spec.model_type.eq_ignore_ascii_case("deepseek_v4") {
+        let quant = spec.quantization.as_deref().unwrap_or("").to_lowercase();
+        let is_nvfp4 = quant.contains("nvfp4") || quant.contains("fp4");
+        if spec.model_type.eq_ignore_ascii_case("deepseek_v4") || is_nvfp4 {
             "fp8".to_string()
         } else {
             "auto".to_string()
@@ -5000,6 +5007,29 @@ pub async fn deploy_vllm_recommend(
                     recommended_env = renv;
                     recipe_applied = Some(entry.hf_id.clone());
                 }
+            }
+            // Rodzina gemma-4 w NVFP4: vLLM potrzebuje jawnych flag tool-callingu
+            // + self-speculative chat template. Upstream recipe albo je gubi
+            // (chat-template `examples/*.jinja` jest dropowany przez build_args, bo
+            // szablon zyje w zrodlach vLLM), albo modelu w ogole nie ma w bazie
+            // recept (RedHatAI 12B). Wymuszamy spojnie dla calej rodziny — dziala
+            // tez dla recznego deployu gemma-4 nvfp4, nie tylko z prekonfigurowanego
+            // kafelka. Speculative draft dostarcza osobno preset (`speculator_repo`).
+            let model_lc = payload.model.to_lowercase();
+            let quant_lc = spec.quantization.as_deref().unwrap_or("").to_lowercase();
+            if model_lc.contains("gemma-4")
+                && (quant_lc.contains("nvfp4") || quant_lc.contains("fp4"))
+            {
+                let mut toks: Vec<String> = base.split_whitespace().map(String::from).collect();
+                toks.push("--max-model-len".into());
+                toks.push("auto".into());
+                toks.push("--enable-auto-tool-choice".into());
+                toks.push("--tool-call-parser".into());
+                toks.push("gemma4".into());
+                toks.push("--chat-template".into());
+                toks.push("examples/tool_chat_template_gemma4.jinja".into());
+                toks = crate::deploy::python_venv::dedup_cli_args_last_wins(toks);
+                base = toks.join(" ");
             }
             base
         }
