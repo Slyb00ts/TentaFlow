@@ -32,6 +32,8 @@ pub mod tracker;
 
 pub mod depth_mapping;
 
+pub mod cv_pipeline;
+
 pub use credentials::{credentials_cipher, CredentialsCipher, CredentialsError};
 pub use decoder_detect::{detect_hw_decoder, detect_profile, HardwareProfile, HwDecoder};
 pub use error::{CameraIngestError, Result};

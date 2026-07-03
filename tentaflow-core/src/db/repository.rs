@@ -4199,6 +4199,23 @@ fn flow_binding_changed_fields(
     fields
 }
 
+/// Replicated field set for a `camera_cv_pipelines` row. Timestamps are
+/// node-local (the materializer stamps its own), so only the content travels.
+fn camera_cv_pipeline_changed_fields(
+    name: &str,
+    pipeline_json: &str,
+    is_default: bool,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("name".to_string(), field_string(name));
+    fields.insert("pipeline_json".to_string(), field_string(pipeline_json));
+    fields.insert(
+        "is_default".to_string(),
+        crate::sync::ledger::FieldValue::Bool(is_default),
+    );
+    fields
+}
+
 /// Replicated field set for a `compliance_data_categories` row. Runtime
 /// timestamps (created_at/updated_at) are node-local and excluded.
 #[allow(clippy::too_many_arguments)]
@@ -6107,6 +6124,32 @@ pub fn reseed_core_state_from_current_rows(
                             audio_per_min,
                             image_each,
                         }),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::CameraCvPipeline => {
+                let mut stmt = tx.prepare(
+                    "SELECT id, name, pipeline_json, is_default FROM camera_cv_pipelines",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, bool>(3)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (id, name, pipeline_json, is_default) in rows {
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        id,
+                        Insert,
+                        camera_cv_pipeline_changed_fields(&name, &pipeline_json, is_default),
                         None,
                     )?;
                     emitted += 1;
@@ -21837,6 +21880,234 @@ pub fn list_camera_analysis_flows(pool: &DbPool) -> Result<Vec<(String, String)>
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+// --- Camera CV pipelines ---
+
+/// Lists every camera CV pipeline as `(id, name, is_default, updated_at)`,
+/// ordered by name. Powers the pipeline picker; the JSON body is fetched
+/// per-pipeline via [`get_camera_cv_pipeline`].
+pub fn list_camera_cv_pipelines(pool: &DbPool) -> Result<Vec<(String, String, bool, i64)>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, name, is_default, updated_at FROM camera_cv_pipelines ORDER BY name ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, bool>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Returns one pipeline as `(name, pipeline_json)`, or `None` when missing.
+pub fn get_camera_cv_pipeline(pool: &DbPool, id: &str) -> Result<Option<(String, String)>> {
+    let conn = acquire(pool)?;
+    let row = conn
+        .query_row(
+            "SELECT name, pipeline_json FROM camera_cv_pipelines WHERE id = ?1",
+            rusqlite::params![id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Upserts a pipeline after structural validation (`cv_pipeline::validate`)
+/// and alias-existence validation against `model_aliases`. `is_default` is
+/// deliberately NOT writable here — the default flag is seed-owned, so an
+/// upsert preserves the existing flag (new rows get 0). Captures the write
+/// for mesh sync like flow saves do.
+pub fn save_camera_cv_pipeline(
+    pool: &DbPool,
+    id: &str,
+    name: &str,
+    pipeline_json: &str,
+) -> Result<()> {
+    if id.trim().is_empty() || name.trim().is_empty() {
+        return Err(anyhow::anyhow!("pipeline id and name must not be empty"));
+    }
+    let parsed: crate::services::camera_ingest::cv_pipeline::CvPipeline =
+        serde_json::from_str(pipeline_json)
+            .map_err(|e| anyhow::anyhow!("invalid pipeline JSON: {e}"))?;
+    crate::services::camera_ingest::cv_pipeline::validate(&parsed)
+        .map_err(|e| anyhow::anyhow!("invalid pipeline: {e}"))?;
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    crate::services::camera_ingest::cv_pipeline::validate_aliases(&tx, &parsed)
+        .map_err(|e| anyhow::anyhow!("invalid pipeline: {e}"))?;
+    let now = chrono::Utc::now().timestamp();
+    tx.execute(
+        "INSERT INTO camera_cv_pipelines (id, name, pipeline_json, is_default, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, 0, ?4, ?4) \
+         ON CONFLICT(id) DO UPDATE SET \
+         name = excluded.name, pipeline_json = excluded.pipeline_json, updated_at = excluded.updated_at",
+        rusqlite::params![id, name, pipeline_json, now],
+    )?;
+    // The capture must carry the row's REAL default flag (preserved by the
+    // upsert), so a synced edit of the default pipeline keeps it default on
+    // every node.
+    let is_default: bool = tx.query_row(
+        "SELECT is_default FROM camera_cv_pipelines WHERE id = ?1",
+        rusqlite::params![id],
+        |r| r.get(0),
+    )?;
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::CameraCvPipeline,
+        id.to_string(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        camera_cv_pipeline_changed_fields(name, pipeline_json, is_default),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Deletes a pipeline. Refused for the seed-owned default (`is_default=1`) and
+/// while any live camera still references it. Captures the delete for mesh
+/// sync (tombstone, like flow deletes).
+pub fn delete_camera_cv_pipeline(pool: &DbPool, id: &str) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let is_default: Option<bool> = tx
+        .query_row(
+            "SELECT is_default FROM camera_cv_pipelines WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(is_default) = is_default else {
+        return Err(anyhow::anyhow!("pipeline not found: {id}"));
+    };
+    if is_default {
+        return Err(anyhow::anyhow!("the default pipeline cannot be deleted"));
+    }
+    let referencing: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM cameras WHERE cv_pipeline_id = ?1 AND removed_at IS NULL",
+        rusqlite::params![id],
+        |r| r.get(0),
+    )?;
+    if referencing > 0 {
+        return Err(anyhow::anyhow!(
+            "pipeline is assigned to {referencing} camera(s)"
+        ));
+    }
+    tx.execute(
+        "DELETE FROM camera_cv_pipelines WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    let mut fields = BTreeMap::new();
+    fields.insert("id".to_string(), field_string(id));
+    record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::CameraCvPipeline,
+        id.to_string(),
+        crate::sync::runtime::SqlWriteAction::Delete,
+        fields,
+        None,
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Per-camera CV pipeline id. `None` (NULL or empty) = the camera uses the
+/// default pipeline (see [`resolve_camera_cv_pipeline`]).
+pub fn camera_cv_pipeline_id(pool: &DbPool, camera_id: &str) -> Result<Option<String>> {
+    let conn = acquire(pool)?;
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT cv_pipeline_id FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
+            rusqlite::params![camera_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(id.filter(|s| !s.is_empty()))
+}
+
+/// Tri-state assignment like the `analysis_flow_id` patch: `None` = no change,
+/// `Some(None)` clears (camera falls back to the default pipeline),
+/// `Some(Some(id))` assigns after verifying the pipeline exists. Returns
+/// whether the camera row matched.
+pub fn set_camera_cv_pipeline_id(
+    pool: &DbPool,
+    camera_id: &str,
+    pipeline_id: Option<Option<String>>,
+) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let Some(pipeline_id) = pipeline_id else {
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
+                rusqlite::params![camera_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        return Ok(exists.is_some());
+    };
+    if let Some(id) = pipeline_id.as_deref() {
+        // An empty id in the assignment position is a caller bug, not a clear —
+        // explicit clear is `Some(None)`.
+        if id.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "pipeline id must not be empty; use an explicit clear to unassign"
+            ));
+        }
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM camera_cv_pipelines WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(anyhow::anyhow!("pipeline not found: {id}"));
+        }
+    }
+    let now = chrono::Utc::now().timestamp();
+    let n = conn.execute(
+        "UPDATE cameras SET cv_pipeline_id = ?2, updated_at = ?3 \
+         WHERE camera_id = ?1 AND removed_at IS NULL",
+        rusqlite::params![camera_id, pipeline_id, now],
+    )?;
+    Ok(n > 0)
+}
+
+/// Resolves the pipeline a camera should run: the camera's `cv_pipeline_id`
+/// when set AND the row still exists, otherwise the `is_default=1` pipeline.
+/// `None` only when neither exists (no seed ran and nothing assigned).
+pub fn resolve_camera_cv_pipeline(
+    pool: &DbPool,
+    camera_id: &str,
+) -> Result<Option<(String, String)>> {
+    let conn = acquire(pool)?;
+    let assigned = conn
+        .query_row(
+            "SELECT p.id, p.pipeline_json FROM cameras c \
+             JOIN camera_cv_pipelines p ON p.id = c.cv_pipeline_id \
+             WHERE c.camera_id = ?1 AND c.removed_at IS NULL",
+            rusqlite::params![camera_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    if assigned.is_some() {
+        return Ok(assigned);
+    }
+    let default = conn
+        .query_row(
+            "SELECT id, pipeline_json FROM camera_cv_pipelines \
+             WHERE is_default = 1 ORDER BY id ASC LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(default)
 }
 
 /// Applies a partial update. Returns `Ok(false)` if no row matched

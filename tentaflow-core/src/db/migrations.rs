@@ -582,7 +582,36 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "benchmark_permissions",
             MigrationStep::Rust(benchmark_add_permissions),
         ),
+        (
+            109,
+            "camera_cv_pipelines",
+            MigrationStep::Rust(create_camera_cv_pipelines),
+        ),
     ]
+}
+
+/// v109 — configurable camera CV pipelines. `camera_cv_pipelines` stores the
+/// stage graph as JSON (validated by `cv_pipeline::validate` on save);
+/// `is_default=1` marks the seed-owned fallback used by cameras without an
+/// explicit assignment. `cameras.cv_pipeline_id` is the per-camera pointer
+/// (NULL = default pipeline). Idempotent (IF NOT EXISTS + column probe).
+fn create_camera_cv_pipelines(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS camera_cv_pipelines (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            pipeline_json TEXT NOT NULL,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_cv_pipelines_default
+            ON camera_cv_pipelines(is_default) WHERE is_default = 1;",
+    )?;
+    if !column_exists(conn, "cameras", "cv_pipeline_id")? {
+        conn.execute_batch("ALTER TABLE cameras ADD COLUMN cv_pipeline_id TEXT NULL;")?;
+    }
+    Ok(())
 }
 
 // v108 — RBAC dla Benchmark Studio. Admin/DPO dostają odczyt i zapis (edycja

@@ -91,6 +91,7 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
     seed_default_flows(&tx)?;
     seed_camera_analysis_flow(&tx)?;
     seed_camera_cv_aliases(&tx)?;
+    seed_camera_cv_pipeline(&tx)?;
     seed_harness_flows(&tx)?;
     seed_system_agents(&tx)?;
 
@@ -1173,6 +1174,37 @@ fn seed_camera_cv_aliases(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Fixed UUID of the default camera CV pipeline. Like other seeds: identical
+/// on every node, the resource replicates by `id` (`camera_cv_pipelines` is in
+/// core sync). Cameras without `cv_pipeline_id` resolve to this row.
+pub(crate) const CAMERA_CV_PIPELINE_ID: &str = "00000000-0000-4000-8000-000000000030";
+
+/// Default pipeline JSON — a faithful transcription of today's hardcoded
+/// vision_analysis behavior: detector on the frame (threshold 0.5, fps omitted
+/// = the engine keeps pacing by `cameras.analysis_fps`), state classification
+/// for the `wants_state()` classes, and plate/ADR OCR (crop padding 15%/10% as
+/// in `enrich_detections`). A const (not a function literal) so the test can
+/// validate it via `cv_pipeline::validate`.
+const CAMERA_CV_PIPELINE_JSON: &str = r#"{"stages":[{"stage_id":"detect","op":"detect","model":"tentavision-detect","input":{"kind":"frame"},"threshold":0.5},{"stage_id":"stan","op":"classify","model":"tentavision-stan","input":{"kind":"stage","stage_id":"detect","classes":["nalepka*","znak_srodowiskowy","termometr","tablica_adr","tablica_rejestracyjna"]},"output":"stan"},{"stage_id":"ocr_plate","op":"ocr","model":"tentavision-ocr","input":{"kind":"stage","stage_id":"detect","classes":["tablica_rejestracyjna"]},"params":{"ocr_mode":"plate","crop_pad_x":0.15,"crop_pad_y":0.1},"output":"tekst"},{"stage_id":"ocr_adr","op":"ocr","model":"tentavision-ocr","input":{"kind":"stage","stage_id":"detect","classes":["tablica_adr"]},"params":{"ocr_mode":"adr","crop_pad_x":0.15,"crop_pad_y":0.1},"output":"tekst"}]}"#;
+
+/// Seeds the default camera CV pipeline (`is_default=1`). Idempotent by the
+/// fixed `id` — INSERT only when the row does not exist, so admin edits are
+/// never overwritten (same pattern as `seed_camera_analysis_flow`).
+fn seed_camera_cv_pipeline(conn: &Connection) -> Result<()> {
+    const NAME: &str = "Analiza domyślna (ADR)";
+    let now = chrono::Utc::now().timestamp();
+    let inserted = conn.execute(
+        "INSERT INTO camera_cv_pipelines (id, name, pipeline_json, is_default, created_at, updated_at) \
+         SELECT ?1, ?2, ?3, 1, ?4, ?4 \
+         WHERE NOT EXISTS (SELECT 1 FROM camera_cv_pipelines WHERE id = ?1)",
+        rusqlite::params![CAMERA_CV_PIPELINE_ID, NAME, CAMERA_CV_PIPELINE_JSON, now],
+    )?;
+    if inserted > 0 {
+        info!("seed: created default camera CV pipeline '{}'", NAME);
+    }
+    Ok(())
+}
+
 /// Seeduje trzy flow harnessa (§3.8) ze stalymi UUID. Wszystkie blocking,
 /// `is_default=0`, `service_type=NULL` (kolumna jest nullable; NULL czyni je
 /// celowo nieosiagalnymi przez resolver, ktory matchuje konkretne service_type
@@ -1402,6 +1434,32 @@ mod tests {
         reg.register(Arc::new(CameraAlertNodeAdapter::new()));
         CompiledFlow::from_json(super::CAMERA_ANALYSIS_FLOW_ID, &flow_json, &reg)
             .expect("camera analysis flow compiles");
+    }
+
+    /// The default camera CV pipeline is seeded (is_default=1), passes the
+    /// structural validator AND the alias validation on a fresh DB (the
+    /// `tentavision-*` aliases from `seed_camera_cv_aliases` must cover every
+    /// model the pipeline references).
+    #[test]
+    fn camera_cv_pipeline_seeded_and_validates() {
+        use crate::services::camera_ingest::cv_pipeline;
+
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.read().unwrap();
+        let (is_default, pipeline_json): (bool, String) = conn
+            .query_row(
+                "SELECT is_default, pipeline_json FROM camera_cv_pipelines WHERE id = ?1",
+                rusqlite::params![super::CAMERA_CV_PIPELINE_ID],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("camera cv pipeline seeded");
+        assert!(is_default);
+        assert_eq!(pipeline_json, super::CAMERA_CV_PIPELINE_JSON);
+
+        let parsed: cv_pipeline::CvPipeline =
+            serde_json::from_str(&pipeline_json).expect("seed pipeline parses");
+        cv_pipeline::validate(&parsed).expect("seed pipeline valid");
+        cv_pipeline::validate_aliases(&conn, &parsed).expect("seed pipeline aliases exist");
     }
 
     /// T1.2 — swieza baza ma dokladnie 5 promptow transcription_summarization

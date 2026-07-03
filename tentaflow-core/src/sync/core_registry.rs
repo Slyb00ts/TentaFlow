@@ -45,6 +45,7 @@ pub enum CoreSyncResourceKind {
     TokenLease,
     ModelMetricsRollup,
     ModelPricing,
+    CameraCvPipeline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -451,6 +452,18 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "metrics",
+    },
+    // Configurable camera CV pipelines. Admin-edited on any node (LWW) and
+    // replicated fleet-wide like flows; the per-camera assignment
+    // (`cameras.cv_pipeline_id`) stays node-local with the `cameras` table.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::CameraCvPipeline,
+        table_name: "camera_cv_pipelines",
+        resource_type: "core.camera_cv_pipeline",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "cameras",
     },
 ];
 

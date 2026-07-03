@@ -46,6 +46,7 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::TokenLease
             | CoreSyncResourceKind::ModelMetricsRollup
             | CoreSyncResourceKind::ModelPricing
+            | CoreSyncResourceKind::CameraCvPipeline
     )
 }
 
@@ -147,6 +148,7 @@ pub fn apply_core_operation(
             apply_model_metrics_rollup(&tx, operation)?
         }
         CoreSyncResourceKind::ModelPricing => apply_model_pricing(&tx, operation)?,
+        CoreSyncResourceKind::CameraCvPipeline => apply_camera_cv_pipeline(&tx, operation)?,
     };
 
     if lww_tracked {
@@ -2114,6 +2116,104 @@ fn apply_model_pricing(
                 rusqlite::params![id],
             )
             .map_err(sql_error),
+    }
+}
+
+/// Captures carry the full row (name, pipeline_json, is_default), so Insert and
+/// Update are the same upsert. Timestamps are node-local (unix seconds), like
+/// the `flows` materializer's `datetime('now')`.
+fn apply_camera_cv_pipeline(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            let pipeline_json = field_string(operation, "pipeline_json")?;
+            // A malformed replicated pipeline must not land in the table the
+            // engine reads from — skip the write (the sender's local validator
+            // should have rejected it; a bad payload here means a buggy or
+            // hostile peer). Alias existence is deliberately NOT checked:
+            // `model_aliases` rows may replicate after the pipeline does.
+            let structurally_valid = serde_json::from_str::<
+                crate::services::camera_ingest::cv_pipeline::CvPipeline,
+            >(&pipeline_json)
+            .map_err(|e| e.to_string())
+            .and_then(|p| {
+                crate::services::camera_ingest::cv_pipeline::validate(&p)
+                    .map_err(|e| e.to_string())
+            });
+            if let Err(err) = structurally_valid {
+                tracing::warn!(
+                    "core sync: skipping invalid camera cv pipeline '{}' from node '{}': {}",
+                    id,
+                    operation.body.actor_node_id,
+                    err
+                );
+                return Ok(0);
+            }
+            // The default flag is seed-owned: only the fixed seed row may carry
+            // is_default=1 (the partial unique index enforces at most one).
+            // Any other replicated row is forced to 0 so two nodes can never
+            // converge into a constraint violation.
+            let is_default = id == crate::db::seed::CAMERA_CV_PIPELINE_ID
+                && field_bool_or(operation, "is_default", false)?;
+            tx.execute(
+                "INSERT INTO camera_cv_pipelines \
+                 (id, name, pipeline_json, is_default, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, CAST(strftime('%s','now') AS INTEGER), \
+                 CAST(strftime('%s','now') AS INTEGER)) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                 name = excluded.name, pipeline_json = excluded.pipeline_json, \
+                 is_default = excluded.is_default, \
+                 updated_at = CAST(strftime('%s','now') AS INTEGER)",
+                rusqlite::params![
+                    id,
+                    field_string(operation, "name")?,
+                    pipeline_json,
+                    is_default,
+                ],
+            )
+            .map_err(sql_error)
+        }
+        ActionType::Delete => {
+            // A replicated delete must win mesh-wide, but local cameras may
+            // still point at the row — clear those references explicitly
+            // (they fall back to the default pipeline) instead of leaving
+            // dangling ids behind.
+            let referencing: Vec<String> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT camera_id FROM cameras \
+                         WHERE cv_pipeline_id = ?1 AND removed_at IS NULL",
+                    )
+                    .map_err(sql_error)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
+                    .map_err(sql_error)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(sql_error)?;
+                rows
+            };
+            if !referencing.is_empty() {
+                tracing::warn!(
+                    "core sync: pipeline '{}' deleted by node '{}' while assigned to cameras [{}] — clearing to default",
+                    id,
+                    operation.body.actor_node_id,
+                    referencing.join(", ")
+                );
+                tx.execute(
+                    "UPDATE cameras SET cv_pipeline_id = NULL WHERE cv_pipeline_id = ?1",
+                    rusqlite::params![id],
+                )
+                .map_err(sql_error)?;
+            }
+            tx.execute(
+                "DELETE FROM camera_cv_pipelines WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .map_err(sql_error)
+        }
     }
 }
 
