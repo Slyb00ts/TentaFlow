@@ -158,7 +158,14 @@ if [ ! -f "$CLANG_RT_LIB" ]; then
     CLANG_RT_LIB=$(find "$(xcode-select -p)" -name "libclang_rt.ios.a" 2>/dev/null | head -1)
 fi
 
-DEVICE_RUSTFLAGS="-C link-arg=-mios-version-min=$IOS_MIN_VERSION"
+# iOS bierze tylko staticlib (libtentaflow_mobile.a) — cdylib (.dylib) jest
+# budowany przez cargo, ale nieuzywany. cdylib linkuje sie eagerly i wywala sie
+# na symbolach C dostarczanych dopiero przez aplikacje Swift (tentaflow_get_device_name,
+# tentaflow_get_ram_mb z DeviceInfo.swift). `-undefined dynamic_lookup` odklada ich
+# rozwiazanie do load-time, wiec link nieuzywanego dyliba przechodzi; staticlib
+# (archiwum) nie jest linkowany, wiec zostaje nietkniety.
+DEFER_HOST_SYMBOLS="-C link-arg=-undefined -C link-arg=dynamic_lookup"
+DEVICE_RUSTFLAGS="$DEFER_HOST_SYMBOLS -C link-arg=-mios-version-min=$IOS_MIN_VERSION"
 if [ -n "$CLANG_RT_LIB" ] && [ -f "$CLANG_RT_LIB" ]; then
     echo "Using clang_rt: $CLANG_RT_LIB"
     DEVICE_RUSTFLAGS="-C link-arg=$CLANG_RT_LIB $DEVICE_RUSTFLAGS"
@@ -169,7 +176,7 @@ fi
 # Per-target RUSTFLAGS — stosowane tylko przy kompilacji tego targetu,
 # nie przy hostowych build scriptach.
 export CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS="$DEVICE_RUSTFLAGS"
-export CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUSTFLAGS="-C link-arg=-mios-simulator-version-min=$IOS_MIN_VERSION"
+export CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUSTFLAGS="$DEFER_HOST_SYMBOLS -C link-arg=-mios-simulator-version-min=$IOS_MIN_VERSION"
 
 echo "IPHONEOS_DEPLOYMENT_TARGET=$IOS_MIN_VERSION"
 echo "CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS=$CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS"
