@@ -32,7 +32,7 @@ inference-mlx-kokoro = ["dep:libloading"]
 # `ort` z feature `load-dynamic` dlopuje onnxruntime runtime'em (nie linkuje
 # statycznie), wiec NIE koliduje z sherpa-rs (ktore tez linkuje onnxruntime
 # dynamicznie) — oba moga byc wlaczone naraz bez kolizji symboli linkera.
-inference-supertonic = ["dep:ort", "dep:ndarray", "dep:rand_distr", "dep:unicode-normalization"]
+inference-supertonic = ["dep:ort", "dep:ndarray", "dep:rand_distr", "dep:unicode-normalization", "dep:crossbeam-channel"]
 # RF-DETR ADR detector (Burn). Gates the whole detector/state/OCR modules + the
 # per-camera always-on analysis loop. Pulls the wgpu backend as the universal
 # floor; add `vision-cuda`/`vision-metal`/`vision-rocm` for a native backend.
@@ -297,6 +297,10 @@ sherpa-rs = { version = "0.6.8", optional = true }
 # Value::from_array(Array3).
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "tls-rustls", "ndarray", "std", "api-24"], optional = true }
 ndarray = { version = "0.17", optional = true }
+# MPMC job channel feeding each pooled ort session's dedicated OS thread (see
+# vision::ort_common::SessionPool) — its Sender is Sync, so the shared pool stays
+# Send+Sync while many callers submit forwards concurrently.
+crossbeam-channel = { version = "0.5", optional = true }
 # Burn — camera-CV inference backend (replaces ort for vision). Architectures
 # are vendored under src/vision/generated/ (build-time ONNX→Burn codegen); the
 # backend is picked per platform via the `vision-*` features. Weights = runtime .bpk.

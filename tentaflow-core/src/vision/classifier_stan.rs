@@ -220,35 +220,34 @@ impl StateClassifier {
         let data = self.preprocess(crop_rgb, cw, ch)?;
         let input = ndarray::Array4::from_shape_vec((1, 3, s, s), data)
             .map_err(|e| anyhow!("classifier_stan: build tensor [1,3,{s},{s}]: {e}"))?;
-        let value = ort::value::Value::from_array(input)
-            .map_err(|e| anyhow!("classifier_stan: Value::from_array: {e}"))?;
-
-        let mut session = self.pool.checkout()?;
-        let input_name = session
-            .inputs()
-            .first()
-            .map(|i| i.name().to_string())
-            .ok_or_else(|| anyhow!("classifier_stan: model has no inputs"))?;
-        let output_name = session
-            .outputs()
-            .first()
-            .map(|o| o.name().to_string())
-            .ok_or_else(|| anyhow!("classifier_stan: model has no outputs"))?;
-        let outputs = session
-            .run(ort::inputs! { input_name => value })
-            .map_err(|e| anyhow!("classifier_stan: session.run: {e}"))?;
-        let (shape, logits) = outputs[output_name.as_str()]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| anyhow!("classifier_stan: extract logits: {e}"))?;
         let num_classes = self.classes.len();
-        if shape.len() != 2 || shape[0] != 1 || shape[1] as usize != num_classes {
-            bail!(
-                "state classifier output shape {shape:?} != [1, {num_classes}]"
-            );
-        }
-        let logits = logits[..num_classes].to_vec();
-        drop(outputs);
-        drop(session);
+
+        // Forward + extraction run on the session's dedicated thread (see
+        // `SessionPool::run`); only the owned logits cross back.
+        let logits = self.pool.run(move |session| {
+            let value = ort::value::Value::from_array(input)
+                .map_err(|e| anyhow!("classifier_stan: Value::from_array: {e}"))?;
+            let input_name = session
+                .inputs()
+                .first()
+                .map(|i| i.name().to_string())
+                .ok_or_else(|| anyhow!("classifier_stan: model has no inputs"))?;
+            let output_name = session
+                .outputs()
+                .first()
+                .map(|o| o.name().to_string())
+                .ok_or_else(|| anyhow!("classifier_stan: model has no outputs"))?;
+            let outputs = session
+                .run(ort::inputs! { input_name => value })
+                .map_err(|e| anyhow!("classifier_stan: session.run: {e}"))?;
+            let (shape, logits) = outputs[output_name.as_str()]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| anyhow!("classifier_stan: extract logits: {e}"))?;
+            if shape.len() != 2 || shape[0] != 1 || shape[1] as usize != num_classes {
+                bail!("state classifier output shape {shape:?} != [1, {num_classes}]");
+            }
+            Ok(logits[..num_classes].to_vec())
+        })?;
         self.label_from_logits(&logits)
     }
 

@@ -240,72 +240,65 @@ impl RfDetrDetector {
 
         let input = ndarray::Array4::from_shape_vec((n, 3, res, res), data)
             .map_err(|e| anyhow!("rfdetr-ort: budowa tensora [{n},3,{res},{res}]: {e}"))?;
-        let value = ort::value::Value::from_array(input)
-            .map_err(|e| anyhow!("rfdetr-ort: Value::from_array: {e}"))?;
 
-        // Checkout one pooled session (round-robin). At pool size 1 this always
-        // locks slot 0 — bit-identical to the historical single `Mutex<Session>`.
-        // `Session::run` needs `&mut`, hence the per-session Mutex guard.
-        let mut session = self.pool.checkout()?;
-        let outputs = session
-            .run(ort::inputs! { INPUT_NAME => value })
-            .map_err(|e| anyhow!("rfdetr-ort: session.run: {e}"))?;
+        // Forward + tensor extraction run on the session's dedicated thread (see
+        // `SessionPool::run`), which exclusively owns the `ort::Session`. Only the
+        // owned dets/labels buffers + derived dims cross back, so no per-thread
+        // CUDA resources accumulate on this (arbitrary) caller thread.
+        let (dets_owned, labels_owned, queries, label_dim) = self.pool.run(move |session| {
+            let value = ort::value::Value::from_array(input)
+                .map_err(|e| anyhow!("rfdetr-ort: Value::from_array: {e}"))?;
+            let outputs = session
+                .run(ort::inputs! { INPUT_NAME => value })
+                .map_err(|e| anyhow!("rfdetr-ort: session.run: {e}"))?;
 
-        let (dets_shape, dets_v) = outputs["dets"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| anyhow!("rfdetr-ort: extract dets: {e}"))?;
-        let (labels_shape, labels_v) = outputs["labels"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| anyhow!("rfdetr-ort: extract labels: {e}"))?;
+            let (dets_shape, dets_v) = outputs["dets"]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| anyhow!("rfdetr-ort: extract dets: {e}"))?;
+            let (labels_shape, labels_v) = outputs["labels"]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| anyhow!("rfdetr-ort: extract labels: {e}"))?;
 
-        // Walidacja kształtów PRZED slicowaniem — błędny graf (inny batch/queries/
-        // last-dim) prowadziłby do wycinków poza bufor.
-        if dets_shape.len() != 3 || labels_shape.len() != 3 {
-            bail!(
-                "rfdetr-ort: nieoczekiwana liczba wymiarów dets {dets_shape:?} / labels {labels_shape:?}"
-            );
-        }
-        let queries = dets_shape[1] as usize;
-        let label_dim = labels_shape[2] as usize;
-        if dets_shape[0] as usize != n || dets_shape[2] != 4 {
-            bail!(
-                "rfdetr-ort: nieoczekiwany kształt dets {dets_shape:?}, oczekiwano [{n}, queries, 4]"
-            );
-        }
-        if labels_shape[0] as usize != n || labels_shape[1] as usize != queries {
-            bail!(
-                "rfdetr-ort: nieoczekiwany kształt labels {labels_shape:?}, oczekiwano [{n}, {queries}, label_dim]"
-            );
-        }
-        if label_dim <= num_classes {
-            bail!(
-                "labels dim {label_dim} must exceed class count {num_classes} (background slot)"
-            );
-        }
-        if dets_v.len() < n * queries * 4 {
-            bail!(
-                "rfdetr-ort: bufor dets za krótki: {} < {}",
-                dets_v.len(),
-                n * queries * 4
-            );
-        }
-        if labels_v.len() < n * queries * label_dim {
-            bail!(
-                "rfdetr-ort: bufor labels za krótki: {} < {}",
-                labels_v.len(),
-                n * queries * label_dim
-            );
-        }
-
-        // Materializujemy bufory na własność, by zwolnić pożyczkę `outputs` (a przez
-        // nią checked-out sesję) PRZED pętlą postprocessu. Po skopiowaniu wyjść
-        // oddajemy sesję do puli JAK NAJSZYBCIEJ (drop guarda), żeby inne forwardy
-        // mogły ją przejąć podczas naszego postprocessu. Kopia jest znikoma
-        // (N×queries×~22 f32).
-        let dets_owned = dets_v.to_vec();
-        let labels_owned = labels_v.to_vec();
-        drop(outputs);
-        drop(session);
+            // Walidacja kształtów PRZED slicowaniem — błędny graf (inny batch/queries/
+            // last-dim) prowadziłby do wycinków poza bufor.
+            if dets_shape.len() != 3 || labels_shape.len() != 3 {
+                bail!(
+                    "rfdetr-ort: nieoczekiwana liczba wymiarów dets {dets_shape:?} / labels {labels_shape:?}"
+                );
+            }
+            let queries = dets_shape[1] as usize;
+            let label_dim = labels_shape[2] as usize;
+            if dets_shape[0] as usize != n || dets_shape[2] != 4 {
+                bail!(
+                    "rfdetr-ort: nieoczekiwany kształt dets {dets_shape:?}, oczekiwano [{n}, queries, 4]"
+                );
+            }
+            if labels_shape[0] as usize != n || labels_shape[1] as usize != queries {
+                bail!(
+                    "rfdetr-ort: nieoczekiwany kształt labels {labels_shape:?}, oczekiwano [{n}, {queries}, label_dim]"
+                );
+            }
+            if label_dim <= num_classes {
+                bail!(
+                    "labels dim {label_dim} must exceed class count {num_classes} (background slot)"
+                );
+            }
+            if dets_v.len() < n * queries * 4 {
+                bail!(
+                    "rfdetr-ort: bufor dets za krótki: {} < {}",
+                    dets_v.len(),
+                    n * queries * 4
+                );
+            }
+            if labels_v.len() < n * queries * label_dim {
+                bail!(
+                    "rfdetr-ort: bufor labels za krótki: {} < {}",
+                    labels_v.len(),
+                    n * queries * label_dim
+                );
+            }
+            Ok((dets_v.to_vec(), labels_v.to_vec(), queries, label_dim))
+        })?;
 
         // Wyjścia ułożone row-major `[N, queries, ...]` — slot `bi` to spójny
         // wycinek (ta sama funkcja offsetów co ścieżka Burn).

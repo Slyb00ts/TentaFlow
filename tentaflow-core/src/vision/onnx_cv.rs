@@ -327,7 +327,7 @@ fn get_or_load(row: &VisionModelRow) -> Result<Arc<CachedModel>> {
         );
     }
     drop(bytes);
-    let pool = Arc::new(SessionPool::new(sessions));
+    let pool = Arc::new(SessionPool::new(&row.model_name, sessions));
     info!(
         "[onnx-cv] loaded '{}' ({} classes, contract {:?}, {}px, pool={} session(s))",
         row.model_name,
@@ -412,53 +412,54 @@ fn detect_blocking(
     }
     let input = ndarray::Array4::from_shape_vec((n, 3, res, res), data)
         .map_err(|e| anyhow!("onnx-cv: build tensor [{n},3,{res},{res}]: {e}"))?;
-    let value = ort::value::Value::from_array(input)
-        .map_err(|e| anyhow!("onnx-cv: Value::from_array: {e}"))?;
 
-    let mut session = model.pool.checkout()?;
-    let input_name = session
-        .inputs()
-        .first()
-        .map(|i| i.name().to_string())
-        .ok_or_else(|| anyhow!("onnx-cv: model has no inputs"))?;
-    let outputs = session
-        .run(ort::inputs! { input_name => value })
-        .map_err(|e| anyhow!("onnx-cv: session.run: {e}"))?;
+    // The forward runs on the session's dedicated thread (see `SessionPool::run`),
+    // which owns the `ort::Session`; only the OWNED tensors + derived dims cross
+    // back, so no per-thread CUDA resources accumulate on this caller thread.
+    let (dets_owned, labels_owned, queries, label_dim) = model.pool.run(move |session| {
+        let value = ort::value::Value::from_array(input)
+            .map_err(|e| anyhow!("onnx-cv: Value::from_array: {e}"))?;
+        let input_name = session
+            .inputs()
+            .first()
+            .map(|i| i.name().to_string())
+            .ok_or_else(|| anyhow!("onnx-cv: model has no inputs"))?;
+        let outputs = session
+            .run(ort::inputs! { input_name => value })
+            .map_err(|e| anyhow!("onnx-cv: session.run: {e}"))?;
 
-    // RF-DETR export contract: `dets [N,queries,4]` (cxcywh) + `labels
-    // [N,queries,label_dim]` — identical shape validation to the fixed
-    // detector, so a wrong graph fails loudly instead of slicing garbage.
-    let (dets_shape, dets_v) = outputs["dets"]
-        .try_extract_tensor::<f32>()
-        .map_err(|e| anyhow!("onnx-cv: extract dets: {e}"))?;
-    let (labels_shape, labels_v) = outputs["labels"]
-        .try_extract_tensor::<f32>()
-        .map_err(|e| anyhow!("onnx-cv: extract labels: {e}"))?;
-    if dets_shape.len() != 3 || labels_shape.len() != 3 {
-        bail!(
-            "onnx-cv: unexpected output rank dets {dets_shape:?} / labels {labels_shape:?}"
-        );
-    }
-    let queries = dets_shape[1] as usize;
-    let label_dim = labels_shape[2] as usize;
-    if dets_shape[0] as usize != n || dets_shape[2] != 4 {
-        bail!("onnx-cv: unexpected dets shape {dets_shape:?}, expected [{n}, queries, 4]");
-    }
-    if labels_shape[0] as usize != n || labels_shape[1] as usize != queries {
-        bail!(
-            "onnx-cv: unexpected labels shape {labels_shape:?}, expected [{n}, {queries}, label_dim]"
-        );
-    }
-    if label_dim <= num_classes {
-        bail!("labels dim {label_dim} must exceed class count {num_classes} (background slot)");
-    }
-    if dets_v.len() < n * queries * 4 || labels_v.len() < n * queries * label_dim {
-        bail!("onnx-cv: output buffers shorter than declared shape");
-    }
-    let dets_owned = dets_v.to_vec();
-    let labels_owned = labels_v.to_vec();
-    drop(outputs);
-    drop(session);
+        // RF-DETR export contract: `dets [N,queries,4]` (cxcywh) + `labels
+        // [N,queries,label_dim]` — identical shape validation to the fixed
+        // detector, so a wrong graph fails loudly instead of slicing garbage.
+        let (dets_shape, dets_v) = outputs["dets"]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| anyhow!("onnx-cv: extract dets: {e}"))?;
+        let (labels_shape, labels_v) = outputs["labels"]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| anyhow!("onnx-cv: extract labels: {e}"))?;
+        if dets_shape.len() != 3 || labels_shape.len() != 3 {
+            bail!(
+                "onnx-cv: unexpected output rank dets {dets_shape:?} / labels {labels_shape:?}"
+            );
+        }
+        let queries = dets_shape[1] as usize;
+        let label_dim = labels_shape[2] as usize;
+        if dets_shape[0] as usize != n || dets_shape[2] != 4 {
+            bail!("onnx-cv: unexpected dets shape {dets_shape:?}, expected [{n}, queries, 4]");
+        }
+        if labels_shape[0] as usize != n || labels_shape[1] as usize != queries {
+            bail!(
+                "onnx-cv: unexpected labels shape {labels_shape:?}, expected [{n}, {queries}, label_dim]"
+            );
+        }
+        if label_dim <= num_classes {
+            bail!("labels dim {label_dim} must exceed class count {num_classes} (background slot)");
+        }
+        if dets_v.len() < n * queries * 4 || labels_v.len() < n * queries * label_dim {
+            bail!("onnx-cv: output buffers shorter than declared shape");
+        }
+        Ok((dets_v.to_vec(), labels_v.to_vec(), queries, label_dim))
+    })?;
 
     let effective_threshold = threshold.or(model.default_threshold);
     let mut results = Vec::with_capacity(n);
@@ -502,32 +503,34 @@ fn classify_blocking(model: &CachedModel, crop: &CvFrameLocal) -> Result<(String
     fill_frame_spec(&mut data, 0, &crop.data, crop.width, crop.height, &model.pre)?;
     let input = ndarray::Array4::from_shape_vec((1, 3, res, res), data)
         .map_err(|e| anyhow!("onnx-cv: build tensor [1,3,{res},{res}]: {e}"))?;
-    let value = ort::value::Value::from_array(input)
-        .map_err(|e| anyhow!("onnx-cv: Value::from_array: {e}"))?;
 
-    let mut session = model.pool.checkout()?;
-    let input_name = session
-        .inputs()
-        .first()
-        .map(|i| i.name().to_string())
-        .ok_or_else(|| anyhow!("onnx-cv: model has no inputs"))?;
-    let output_name = session
-        .outputs()
-        .first()
-        .map(|o| o.name().to_string())
-        .ok_or_else(|| anyhow!("onnx-cv: model has no outputs"))?;
-    let outputs = session
-        .run(ort::inputs! { input_name => value })
-        .map_err(|e| anyhow!("onnx-cv: session.run: {e}"))?;
-    let (shape, logits) = outputs[output_name.as_str()]
-        .try_extract_tensor::<f32>()
-        .map_err(|e| anyhow!("onnx-cv: extract logits: {e}"))?;
-    if shape.len() != 2 || shape[0] != 1 || shape[1] as usize != num_classes {
-        bail!(
-            "onnx-cv: classifier output shape {shape:?} != [1, {num_classes}]"
-        );
-    }
-    let (best_idx, score) = softmax_argmax(&logits[..num_classes]);
+    // Forward + extraction run on the session's dedicated thread; only the owned
+    // logits cross back (see `SessionPool::run`).
+    let logits = model.pool.run(move |session| {
+        let value = ort::value::Value::from_array(input)
+            .map_err(|e| anyhow!("onnx-cv: Value::from_array: {e}"))?;
+        let input_name = session
+            .inputs()
+            .first()
+            .map(|i| i.name().to_string())
+            .ok_or_else(|| anyhow!("onnx-cv: model has no inputs"))?;
+        let output_name = session
+            .outputs()
+            .first()
+            .map(|o| o.name().to_string())
+            .ok_or_else(|| anyhow!("onnx-cv: model has no outputs"))?;
+        let outputs = session
+            .run(ort::inputs! { input_name => value })
+            .map_err(|e| anyhow!("onnx-cv: session.run: {e}"))?;
+        let (shape, logits) = outputs[output_name.as_str()]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| anyhow!("onnx-cv: extract logits: {e}"))?;
+        if shape.len() != 2 || shape[0] != 1 || shape[1] as usize != num_classes {
+            bail!("onnx-cv: classifier output shape {shape:?} != [1, {num_classes}]");
+        }
+        Ok(logits[..num_classes].to_vec())
+    })?;
+    let (best_idx, score) = softmax_argmax(&logits);
     Ok((model.classes[best_idx].clone(), score))
 }
 

@@ -11591,6 +11591,7 @@ dependencies = [
  "ciborium",
  "core-foundation 0.10.1",
  "cozo",
+ "crossbeam-channel",
  "csv",
  "dashmap 6.2.1",
  "dirs 6.0.0",

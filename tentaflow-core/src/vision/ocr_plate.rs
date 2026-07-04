@@ -279,48 +279,43 @@ impl PlateOcr {
     /// `session.run` na puli sesji; ścieżka Burn: `guarded_forward` (jeden wątek).
     #[cfg(feature = "inference-supertonic")]
     fn forward_logits(&self, gray: &[u8]) -> Result<Vec<f32>> {
-        let shape = (1usize, self.img_h as usize, self.img_w as usize, 1usize);
-        let input = ndarray::Array4::from_shape_vec(shape, gray.to_vec())
-            .map_err(|e| anyhow!("ocr_plate: build tensor {shape:?}: {e}"))?;
-        let value = ort::value::Value::from_array(input)
-            .map_err(|e| anyhow!("ocr_plate: Value::from_array: {e}"))?;
-
-        let mut session = self.pool.checkout()?;
-        let input_name = session
-            .inputs()
-            .first()
-            .map(|i| i.name().to_string())
-            .ok_or_else(|| anyhow!("ocr_plate: model has no inputs"))?;
-        let output_name = session
-            .outputs()
-            .first()
-            .map(|o| o.name().to_string())
-            .ok_or_else(|| anyhow!("ocr_plate: model has no outputs"))?;
-        let outputs = session
-            .run(ort::inputs! { input_name => value })
-            .map_err(|e| anyhow!("ocr_plate: session.run: {e}"))?;
-        let (shape, logits) = outputs[output_name.as_str()]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| anyhow!("ocr_plate: extract logits: {e}"))?;
-        // Exact-shape contract `[1, slots*vocab]` (row-major flat logits). A
-        // larger/differently-shaped tensor must fail loudly, not silently decode
-        // from the first slots*vocab values (mirrors the classifier's strictness).
+        let tensor_shape = (1usize, self.img_h as usize, self.img_w as usize, 1usize);
+        let input = ndarray::Array4::from_shape_vec(tensor_shape, gray.to_vec())
+            .map_err(|e| anyhow!("ocr_plate: build tensor {tensor_shape:?}: {e}"))?;
         let expected = self.slots * self.vocab;
-        if shape.len() != 2 || shape[0] != 1 || shape[1] as usize != expected {
-            bail!(
-                "ocr_plate: output shape {shape:?} != [1, {expected}] (slots*vocab)"
-            );
-        }
-        if logits.len() != expected {
-            bail!(
-                "ocr_plate: logits len {} != slots*vocab {expected}",
-                logits.len()
-            );
-        }
-        let logits = logits.to_vec();
-        drop(outputs);
-        drop(session);
-        Ok(logits)
+
+        // Forward + extraction run on the session's dedicated thread (see
+        // `SessionPool::run`); only the owned logits cross back.
+        self.pool.run(move |session| {
+            let value = ort::value::Value::from_array(input)
+                .map_err(|e| anyhow!("ocr_plate: Value::from_array: {e}"))?;
+            let input_name = session
+                .inputs()
+                .first()
+                .map(|i| i.name().to_string())
+                .ok_or_else(|| anyhow!("ocr_plate: model has no inputs"))?;
+            let output_name = session
+                .outputs()
+                .first()
+                .map(|o| o.name().to_string())
+                .ok_or_else(|| anyhow!("ocr_plate: model has no outputs"))?;
+            let outputs = session
+                .run(ort::inputs! { input_name => value })
+                .map_err(|e| anyhow!("ocr_plate: session.run: {e}"))?;
+            let (shape, logits) = outputs[output_name.as_str()]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| anyhow!("ocr_plate: extract logits: {e}"))?;
+            // Exact-shape contract `[1, slots*vocab]` (row-major flat logits). A
+            // larger/differently-shaped tensor must fail loudly, not silently decode
+            // from the first slots*vocab values (mirrors the classifier's strictness).
+            if shape.len() != 2 || shape[0] != 1 || shape[1] as usize != expected {
+                bail!("ocr_plate: output shape {shape:?} != [1, {expected}] (slots*vocab)");
+            }
+            if logits.len() != expected {
+                bail!("ocr_plate: logits len {} != slots*vocab {expected}", logits.len());
+            }
+            Ok(logits.to_vec())
+        })
     }
 
     #[cfg(not(feature = "inference-supertonic"))]

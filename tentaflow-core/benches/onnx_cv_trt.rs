@@ -37,9 +37,36 @@ use tentaflow_core::vision::ort_common::{self, TrtShapeProfile};
 /// Square input resolution of the exported RF-DETR graph.
 const RESOLUTION: usize = 560;
 const BATCHES: [usize; 3] = [1, 8, 16];
-/// Session-pool sizes probed by the concurrency bench (Workstream-1 Chunk 1):
-/// each level runs `n` forwards in parallel, one per independent session.
-const POOL_SIZES: [usize; 3] = [1, 2, 4];
+/// Env selecting the session-pool sizes the concurrency bench probes (comma
+/// list, e.g. `"1,2,4,8"`). With the per-session TensorRT workspace capped
+/// (`TENTAFLOW_TRT_WORKSPACE_MB`, default 1 GiB) each RF-DETR session costs only
+/// ~2.1 GB VRAM, so 8+ sessions co-reside on a free 24 GB 4090; aggregate
+/// throughput plateaus around N=4 (compute-bound: ~214 / 287 / 312 / 310 img/s
+/// at N=1/2/4/8). The default `"1,2"` stays conservative so the whole bench
+/// (determinism at `widest` + timed levels) fits even on a partly-loaded box.
+const CONCURRENCY_ENV: &str = "TENTAFLOW_BENCH_CONCURRENCY";
+const DEFAULT_CONCURRENCY: &str = "1,2";
+
+/// Parses [`CONCURRENCY_ENV`] into the ordered, de-duplicated pool sizes to
+/// probe. Falls back to [`DEFAULT_CONCURRENCY`] on unset/empty/all-garbage input;
+/// every level is `>= 1`.
+fn concurrency_levels() -> Vec<usize> {
+    let raw = std::env::var(CONCURRENCY_ENV).unwrap_or_default();
+    let source = if raw.trim().is_empty() { DEFAULT_CONCURRENCY } else { raw.as_str() };
+    let mut levels: Vec<usize> = Vec::new();
+    for tok in source.split(',') {
+        if let Ok(n) = tok.trim().parse::<usize>() {
+            if n >= 1 && !levels.contains(&n) {
+                levels.push(n);
+            }
+        }
+    }
+    if levels.is_empty() {
+        vec![1, 2]
+    } else {
+        levels
+    }
+}
 
 /// Builds one deterministic `[n,3,560,560]` input value (content is irrelevant
 /// to inference cost; non-constant values avoid any degenerate all-zero paths).
@@ -220,21 +247,31 @@ fn bench_concurrent_sessions(c: &mut Criterion) {
 
     let value = synthetic_input(1);
 
-    // Concurrent determinism gate: build the widest pool, then forward the SAME
-    // input on ALL sessions AT THE SAME TIME (a Barrier releases every thread
-    // into `run` together) and assert byte-identical dets+labels across
-    // sessions. Sequential comparison would miss races that only surface when
-    // sessions execute simultaneously — this is the real corruption detector.
-    // Repeated for several iterations to catch intermittent races. Runs before
-    // timing so a corrupt build aborts loudly instead of publishing numbers.
-    let widest = *POOL_SIZES.iter().max().unwrap();
-    let mut sessions: Vec<ort::session::Session> = (0..widest).map(|_| build()).collect();
-    // Warm each session once so the TRT engine build is out of the comparison
+    // ONE pool of `widest` sessions serves BOTH the determinism gate and every
+    // timed level. Building fresh sessions per phase (widest for the gate + one
+    // set per level) kept every prior phase's sessions resident — many large TRT
+    // arenas — and exhausted the 4090's 24 GB (`BFCArena Failed to allocate`).
+    // A single `widest`-session pool caps resident VRAM at `widest` model copies
+    // and each level times a prefix `&mut pool[..n]`. `widest` is the max of the
+    // ACTUALLY-TIMED levels ([`concurrency_levels`], default `1,2`), so the gate
+    // only ever allocates the sessions the timed run actually uses.
+    let levels = concurrency_levels();
+    let widest = *levels.iter().max().unwrap();
+    let mut pool: Vec<ort::session::Session> = (0..widest).map(|_| build()).collect();
+    // Warm each session once so the TRT engine build is out of every measurement
     // and every session is in steady state before the concurrent forwards.
-    for s in sessions.iter_mut() {
+    for s in pool.iter_mut() {
         let _ = run_forward(s, &input_name, &value);
     }
-    let reference = run_forward(&mut sessions[0], &input_name, &value);
+
+    // Concurrent determinism gate: forward the SAME input on ALL sessions AT THE
+    // SAME TIME (a Barrier releases every thread into `run` together) and assert
+    // byte-identical dets+labels across sessions. Sequential comparison would
+    // miss races that only surface when sessions execute simultaneously — this
+    // is the real corruption detector. Repeated for several iterations to catch
+    // intermittent races. Runs before timing so a corrupt build aborts loudly
+    // instead of publishing numbers.
+    let reference = run_forward(&mut pool[0], &input_name, &value);
     const DET_ITERS: usize = 5;
     let barrier = std::sync::Barrier::new(widest);
     for iter in 0..DET_ITERS {
@@ -242,7 +279,7 @@ fn bench_concurrent_sessions(c: &mut Criterion) {
             let name = input_name.as_str();
             let value_ref = &value;
             let barrier_ref = &barrier;
-            let handles: Vec<_> = sessions
+            let handles: Vec<_> = pool
                 .iter_mut()
                 .enumerate()
                 .map(|(i, s)| {
@@ -270,36 +307,51 @@ fn bench_concurrent_sessions(c: &mut Criterion) {
     );
 
     let mut group = c.benchmark_group("rfdetr_concurrent_sessions");
-    for &n in &POOL_SIZES {
-        // Each level uses its own `n` warmed sessions so the TRT engine build is
-        // out of the measured samples and threads never share a session.
-        let mut pool: Vec<ort::session::Session> = (0..n).map(|_| build()).collect();
-        for s in pool.iter_mut() {
-            let out = s
-                .run(ort::inputs! { input_name.as_str() => &value })
-                .expect("warmup run");
-            drop(out);
-        }
-        group.throughput(Throughput::Elements(n as u64));
-        group.bench_function(format!("threads_{n}"), |b| {
-            b.iter(|| {
-                // One scoped thread per session runs its own `&mut` forward; the
-                // whole scope joins each iteration, so the sample times the
-                // slowest of `n` parallel forwards = aggregate wall time for `n`
-                // images. Throughput=Elements(n) turns that into images/s.
-                std::thread::scope(|scope| {
-                    let name = input_name.as_str();
-                    let value_ref = &value;
-                    for s in pool.iter_mut() {
-                        scope.spawn(move || {
-                            let out = s
-                                .run(ort::inputs! { name => value_ref })
-                                .expect("session.run");
-                            drop(out);
-                        });
+    for &n in &levels {
+        // Reuse a prefix of the single warmed pool — no new sessions per level,
+        // so resident VRAM never grows across phases.
+        let slice = &mut pool[..n];
+        let name = input_name.as_str();
+        let value_ref = &value;
+        // PERSISTENT workers, one per session, spawned ONCE and reused for every
+        // criterion iteration. A fresh scoped thread per iteration made ORT's
+        // CUDA EP accumulate per-OS-thread device resources (streams/handles it
+        // caches by thread id and never frees), so ~1400 short-lived threads grew
+        // VRAM until even a 62 MB alloc OOM'd — a bench artifact, not the pool.
+        // Two barriers fence one synchronized round: `go` releases all workers
+        // into `run` at once, `done` rejoins them; the timed closure just passes
+        // through both, so a sample = wall time of the slowest of `n` parallel
+        // forwards = aggregate time for `n` images. Throughput=Elements(n) turns
+        // that into images/s.
+        let go = std::sync::Barrier::new(n + 1);
+        let done = std::sync::Barrier::new(n + 1);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for s in slice.iter_mut() {
+                let go = &go;
+                let done = &done;
+                let stop = &stop;
+                scope.spawn(move || loop {
+                    go.wait();
+                    if stop.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
                     }
+                    let out = s.run(ort::inputs! { name => value_ref }).expect("session.run");
+                    drop(out);
+                    done.wait();
+                });
+            }
+            group.throughput(Throughput::Elements(n as u64));
+            group.bench_function(format!("threads_{n}"), |b| {
+                b.iter(|| {
+                    go.wait();
+                    done.wait();
                 });
             });
+            // Release the workers one final time with `stop` set so they break
+            // before `done.wait()` and the scope can join them.
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            go.wait();
         });
     }
     group.finish();
