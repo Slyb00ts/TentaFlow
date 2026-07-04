@@ -380,14 +380,33 @@ pub fn ensure_analysis(camera_id: &str) {
 
 /// Removes every camera and aborts the engine task. Wired into camera shutdown
 /// so the ONNX sessions and frame-pull loop stop before GStreamer tears down.
-pub fn drain() {
+pub async fn drain() {
     cameras().lock().unwrap().clear();
-    // Drain czysci wszystkie kamery naraz — wyczysc rowniez caly stan trackera,
-    // by po restarcie analizy nie zostal martwy stan (tracki, licznik id).
-    tracker::clear();
-    if let Some(handle) = engine_handle().lock().unwrap().take() {
-        handle.abort();
+    // Poproś pętlę o graceful shutdown i POCZEKAJ, aż dokończy trwające forwardy
+    // (i wyjdzie), zamiast tylko ją abortować: abort nie anuluje biegnącego
+    // `spawn_blocking` GPU-forwardu, więc stara inferencja mogłaby nałożyć się na
+    // restart i K przestałoby ograniczać realną pracę GPU. Await-drain to gwarancja
+    // braku nakładki.
+    shutdown_flag().store(true, AtomicOrdering::Relaxed);
+    let handle = engine_handle().lock().unwrap().take();
+    if let Some(handle) = handle {
+        let abort = handle.abort_handle();
+        // Bounded await: forwardy kończą się w dziesiątkach ms; po limicie abort
+        // jako fallback. WTEDY biegnący `spawn_blocking` może jeszcze trwać na puli
+        // blocking — jest to jednak ograniczone (pula sesji ort serializuje per
+        // sesja) i zdarza się tylko przy realnie zawieszonym forwardzie.
+        if tokio::time::timeout(FORWARD_DRAIN_TIMEOUT, handle).await.is_err() {
+            warn!(
+                "[vision_analysis] engine drain timed out after {}s; aborting (a blocking forward may still finish on the ort pool)",
+                FORWARD_DRAIN_TIMEOUT.as_secs()
+            );
+            abort.abort();
+        }
     }
+    shutdown_flag().store(false, AtomicOrdering::Relaxed);
+    // Po wyjściu pętli (żaden forward już nie działa) wyczyść stan trackera, by po
+    // restarcie analizy nie zostal martwy stan (tracki, licznik id).
+    tracker::clear();
     // Tear down the cold path too, so its enrichment stops and a later
     // `ensure_analysis` restarts a fresh consumer (the channel is recreated).
     if let Some(handle) = cold_handle().lock().unwrap().take() {
@@ -421,6 +440,9 @@ pub(crate) fn forget_camera(camera_id: &str) {
 fn start_engine_once() {
     let mut h = engine_handle().lock().unwrap();
     if h.as_ref().map(|j| j.is_finished()).unwrap_or(true) {
+        // Wyczyść ewentualną flagę shutdown po poprzednim `drain`, żeby świeża
+        // pętla nie weszła od razu w tryb graceful-exit.
+        shutdown_flag().store(false, AtomicOrdering::Relaxed);
         *h = Some(tokio::spawn(engine_loop()));
     }
 }
@@ -555,6 +577,166 @@ struct FrameJob {
     failed_stages: usize,
 }
 
+/// Wynik jednego współbieżnego forwardu batcha zwrócony ze spawnowanego zadania
+/// do pętli silnika. Sam FORWARD biegnie współbieżnie (do K naraz na puli sesji
+/// ort); ten wynik jest STOSOWANY z powrotem WYŁĄCZNIE na pętli, więc `jobs`,
+/// tracker i cache wzbogacania mają nadal jednego właściciela.
+struct ForwardOutput {
+    alias: String,
+    detect_ms: u32,
+    /// Wynik executora spłaszczony do `String` błędu — `Send` i prosty do
+    /// przeniesienia przez granicę zadania (log identyczny z dawnym inline).
+    outcome: Result<CameraCvResult, String>,
+}
+
+/// Górny limit współbieżnych forwardów. Odzwierciedla sufit puli sesji ort
+/// (`ort_common::MAX_SESSIONS_PER_MODEL` = 16) — więcej równoległych forwardów
+/// niż sesji nie ma sensu (i tak czekałyby na slot puli). Zdefiniowany lokalnie,
+/// bo pula ort istnieje tylko pod `inference-supertonic`, a ten limit musi
+/// obowiązywać na każdej ścieżce.
+const MAX_INFLIGHT: usize = 16;
+
+/// Liczba współbieżnych forwardów K. Jawny opt-in `TENTAFLOW_VISION_INFLIGHT`
+/// wygrywa; w przeciwnym razie odwzorowuje rozmiar puli detektora
+/// (`TENTAFLOW_VISION_DETECTOR_SESSIONS`): przy N sesjach GPU liczy N detektów
+/// naraz, więc N in-flight to naturalny sufit. Gdy ŻADNA zmienna nie jest
+/// ustawiona → K=1, czyli bit-identyczne zachowanie z dawną pojedynczą,
+/// serializowaną pętlą (zero regresji, dopóki operator nie włączy więcej).
+fn inflight_limit() -> usize {
+    const INFLIGHT_ENV: &str = "TENTAFLOW_VISION_INFLIGHT";
+    const DETECTOR_SESSIONS_ENV: &str = "TENTAFLOW_VISION_DETECTOR_SESSIONS";
+    if let Some(k) = std::env::var(INFLIGHT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return k.clamp(1, MAX_INFLIGHT);
+    }
+    std::env::var(DETECTOR_SESSIONS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, MAX_INFLIGHT)
+}
+
+/// Stosuje wynik JEDNEGO batcha forwardu z powrotem na pętli: routuje detekcje
+/// do właściwych jobów po `job_id` każdego [`PendingItem`] (batch może obejmować
+/// wiele kamer) i domyka etapy przez [`stage_completed`]. Panika/abort zadania
+/// forwardu NIGDY nie może zostawić otwartych etapów — inaczej ordering gate
+/// (jeden job/kamera) zablokowałby te kamery na zawsze — więc błąd joina domyka
+/// wszystkie pozycje batcha jako porażkę.
+fn apply_forward_result(
+    jobs: &mut HashMap<u64, FrameJob>,
+    batch: Vec<PendingItem>,
+    out: Result<ForwardOutput, tokio::task::JoinError>,
+    cold: &mpsc::Sender<DetectionEvent>,
+) {
+    let ForwardOutput {
+        alias,
+        detect_ms,
+        outcome,
+    } = match out {
+        Ok(o) => o,
+        Err(e) => {
+            warn_throttled("detect", &format!("detect forward task failed: {e}"));
+            for item in &batch {
+                stage_completed(jobs, item, None, cold);
+            }
+            return;
+        }
+    };
+    match outcome {
+        Ok(CameraCvResult::Detections { per_frame }) if per_frame.len() == batch.len() => {
+            for (item, dets_cv) in batch.iter().zip(per_frame) {
+                let dets: Vec<Detection> = dets_cv.into_iter().map(detection_from_cv).collect();
+                stage_completed(jobs, item, Some((dets, detect_ms)), cold);
+            }
+        }
+        Ok(CameraCvResult::Detections { per_frame }) => {
+            warn_throttled(
+                "detect",
+                &format!(
+                    "detect '{alias}': {} per_frame results for {} batch frames (contract broken)",
+                    per_frame.len(),
+                    batch.len()
+                ),
+            );
+            for item in &batch {
+                stage_completed(jobs, item, None, cold);
+            }
+        }
+        Ok(_) => {
+            warn_throttled(
+                "detect",
+                &format!("detect '{alias}': unexpected camera-cv result variant"),
+            );
+            for item in &batch {
+                stage_completed(jobs, item, None, cold);
+            }
+        }
+        Err(e) => {
+            warn_throttled("detect", &format!("detect '{alias}': {e}"));
+            for item in &batch {
+                stage_completed(jobs, item, None, cold);
+            }
+        }
+    }
+}
+
+/// Odbiera jeden ukończony forward z [`tokio::task::JoinSet`] i stosuje go na
+/// pętli. Batch trzymany jest po stronie pętli pod `task Id` (mapa `inflight`) —
+/// więc nawet gdy zadanie spanikuje, znamy jego pozycje i domykamy je jako
+/// porażkę zamiast wyciekać otwarte etapy.
+fn apply_joined(
+    jobs: &mut HashMap<u64, FrameJob>,
+    inflight: &mut HashMap<tokio::task::Id, Vec<PendingItem>>,
+    joined: Option<Result<(tokio::task::Id, ForwardOutput), tokio::task::JoinError>>,
+    cold: &mpsc::Sender<DetectionEvent>,
+) {
+    let Some(joined) = joined else {
+        return;
+    };
+    let (id, out) = match joined {
+        Ok((id, output)) => (id, Ok(output)),
+        Err(e) => (e.id(), Err(e)),
+    };
+    let Some(batch) = inflight.remove(&id) else {
+        return;
+    };
+    apply_forward_result(jobs, batch, out, cold);
+}
+
+/// Non-blocking: stosuje WSZYSTKIE już-ukończone forwardy z JoinSetu bez czekania
+/// na trwające. Wołane na początku sekcji flush KAŻDEJ iteracji, więc ukończony
+/// forward jest zaaplikowany (`stage_completed`/`finalize_job`/publish) ZANIM
+/// pętla zarezerwuje permit i spawnie kolejny — między tym drenażem a spawnem nie
+/// ma awaitu, więc żaden forward nie ukończy się „pomiędzy". Przy K=1 przywraca
+/// dokładną semantykę inline-await: spawn → czekaj → zastosuj → spawn następny.
+fn drain_ready_forwards(
+    forwards: &mut tokio::task::JoinSet<ForwardOutput>,
+    jobs: &mut HashMap<u64, FrameJob>,
+    inflight: &mut HashMap<tokio::task::Id, Vec<PendingItem>>,
+    cold: &mpsc::Sender<DetectionEvent>,
+) {
+    while let Some(joined) = forwards.try_join_next_with_id() {
+        apply_joined(jobs, inflight, Some(joined), cold);
+    }
+}
+
+/// Górny limit czekania `drain` na dokończenie trwających forwardów. Forwardy
+/// kończą się zwykle w dziesiątkach ms; limit chroni shutdown przed zawieszonym
+/// forwardem (po nim abort jako fallback).
+const FORWARD_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Flaga graceful-shutdown pętli silnika. `drain` ją ustawia, a pętla po jej
+/// zauważeniu dokańcza WSZYSTKIE trwające forwardy (await, nie abort — abort nie
+/// anuluje biegnącego `spawn_blocking`, więc GPU-forward mógłby nałożyć się na
+/// restart) i wychodzi. Reset przy starcie pętli (`start_engine_once`) i na końcu
+/// `drain`, żeby kolejny start nie wystartował od razu w trybie shutdown.
+fn shutdown_flag() -> &'static std::sync::atomic::AtomicBool {
+    static F: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &F
+}
+
 /// The one process-wide analysis engine: collects (camera, frame-stage) pairs
 /// whose per-stage deadline elapsed, akumuluje ich NOWE klatki w buforze
 /// `pending` i flushuje je do executora chunkami po [`MODEL_BATCH`]
@@ -565,8 +747,19 @@ struct FrameJob {
 async fn engine_loop() {
     let cold = ensure_cold_started();
     let mut last_metrics = Instant::now();
+    // Współbieżność forwardów (Chunk 4): do K batchowanych forwardów naraz na puli
+    // sesji ort. K=1 (domyślnie) = dawna serializacja (jeden forward w locie).
+    let k = inflight_limit();
+    let inflight_sem = Arc::new(tokio::sync::Semaphore::new(k));
+    // Trwające forwardy: JoinSet daje po zakończeniu `(Id, ForwardOutput)`, a przy
+    // drainie (abort pętli → drop JoinSetu) abortuje wszystkie zadania, więc żaden
+    // forward nie zostaje osierocony i jego bufor klatki jest zwalniany.
+    let mut forwards: tokio::task::JoinSet<ForwardOutput> = tokio::task::JoinSet::new();
+    // Batch każdego trwającego forwardu (routing wyników) trzymany po stronie pętli
+    // pod `task Id` — panika zadania nie gubi pozycji do domknięcia.
+    let mut inflight: HashMap<tokio::task::Id, Vec<PendingItem>> = HashMap::new();
     info!(
-        "[vision_analysis] cross-camera inference engine started (model_batch={MODEL_BATCH}, max_batch_wait={}ms)",
+        "[vision_analysis] cross-camera inference engine started (model_batch={MODEL_BATCH}, max_batch_wait={}ms, inflight={k})",
         MAX_BATCH_WAIT.as_millis()
     );
 
@@ -592,6 +785,19 @@ async fn engine_loop() {
     // so the GPU stays back-to-back under load instead of idling to a fixed timer.
     loop {
         let now = std::time::Instant::now();
+
+        // Graceful shutdown (drain): dokończ WSZYSTKIE trwające forwardy —
+        // awaitem, nie abortem — aplikując ich wyniki (finalne publikacje), po
+        // czym wyjdź. Abort anulowałby tylko async-task; biegnący `spawn_blocking`
+        // GPU-forward trwałby dalej i mógłby nałożyć się na restart, więc czekamy
+        // aż realnie się zakończą (K przestaje wtedy ograniczać starą pracę GPU).
+        if shutdown_flag().load(AtomicOrdering::Relaxed) {
+            while let Some(joined) = forwards.join_next_with_id().await {
+                apply_joined(&mut jobs, &mut inflight, Some(joined), &cold);
+            }
+            info!("[vision_analysis] engine loop drained in-flight forwards, exiting");
+            return;
+        }
 
         if now.duration_since(last_metrics) >= Duration::from_secs(30) {
             let m = metrics();
@@ -778,6 +984,13 @@ async fn engine_loop() {
         // — cross-camera przy wielu kamerach albo nazbierane klatki jednej
         // kamery — ALBO upłynęło okno MAX_BATCH_WAIT od najstarszej pozycji
         // (bound latencji przy małej liczbie kamer; flushuje grupę najstarszej).
+        // P1: zastosuj wszystkie GOTOWE forwardy zanim uformujemy/wypuścimy nowy
+        // batch. Gwarantuje, że wynik ukończonego forwardu jest zaaplikowany
+        // (publikacja + kolejność etapów) PRZED spawnem kolejnego. Sekcja
+        // flush/acquire/spawn poniżej jest w całości synchroniczna (brak awaitu),
+        // więc żaden forward nie ukończy się między tym drenażem a spawnem.
+        drain_ready_forwards(&mut forwards, &mut jobs, &mut inflight, &cold);
+
         let now_flush = Instant::now();
         let window_elapsed = pending
             .first()
@@ -787,21 +1000,43 @@ async fn engine_loop() {
             .iter()
             .map(|it| (it.alias.as_str(), it.threshold.map(f32::to_bits)))
             .collect();
-        let Some(indices) = cv_pipeline::select_flush_batch(&keys, MODEL_BATCH, window_elapsed)
-        else {
-            // Nic do policzenia w tym ticku: śpij do najbliższego z (a) deadline
-            // najwcześniejszego jeszcze-niedue etapu / cfg-checku, (b) deadline
-            // flushu pending (`added + MAX_BATCH_WAIT`). Clamp [IDLE_POLL_MIN,
-            // IDLE_POLL_MAX] trzyma pętlę responsywną.
+        let batch_indices = cv_pipeline::select_flush_batch(&keys, MODEL_BATCH, window_elapsed);
+
+        // Rezerwuj slot forwardu ZANIM wyjmiemy batch. Semaphore(K) to
+        // backpressure, które dawał inline `.await`: gdy K forwardów już biegnie,
+        // `try_acquire_owned` zawodzi i pętla przestaje wypuszczać nowe batche
+        // (pending pozostaje ograniczony ordering gate'm = ≤1 klatka/kamera).
+        // Permit wędruje do zadania i zwalnia się, gdy forward się kończy.
+        let permit = batch_indices
+            .as_ref()
+            .and_then(|_| inflight_sem.clone().try_acquire_owned().ok());
+
+        let Some(indices) = batch_indices.filter(|_| permit.is_some()) else {
+            // Nic do policzenia (brak due grupy) ALBO wszystkie K slotów zajęte:
+            // czekaj do najbliższego z (a) deadline najwcześniejszego jeszcze-niedue
+            // etapu / cfg-checku, (b) deadline flushu pending (`added +
+            // MAX_BATCH_WAIT`), LUB do zakończenia któregoś trwającego forwardu
+            // (zwolni slot; wynik stosujemy na pętli — jedyny właściciel `jobs`).
+            // Clamp [IDLE_POLL_MIN, IDLE_POLL_MAX] trzyma pętlę responsywną.
             let mut wait = earliest_next
                 .map(|t| t.saturating_duration_since(now_flush))
                 .unwrap_or(IDLE_POLL_MAX);
             if let Some(it) = pending.first() {
                 wait = wait.min((it.added + MAX_BATCH_WAIT).saturating_duration_since(now_flush));
             }
-            tokio::time::sleep(wait.clamp(IDLE_POLL_MIN, IDLE_POLL_MAX)).await;
+            let wait = wait.clamp(IDLE_POLL_MIN, IDLE_POLL_MAX);
+            // Precondycja `!forwards.is_empty()`: pusty JoinSet rozwiązuje
+            // `join_next_with_id` natychmiast na `None` — bez guarda select
+            // busy-spinowałby. Gdy pusty, tylko sleep prowadzi oczekiwanie.
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                joined = forwards.join_next_with_id(), if !forwards.is_empty() => {
+                    apply_joined(&mut jobs, &mut inflight, joined, &cold);
+                }
+            }
             continue;
         };
+        let permit = permit.expect("permit present when a batch is selected");
 
         // Wyjmij wybrane pozycje (indeksy rosnące — usuwamy od końca, kolejność
         // FIFO zachowana). Nadmiar grupy zostaje w pending na kolejny flush.
@@ -828,68 +1063,50 @@ async fn engine_loop() {
             for item in &batch {
                 stage_completed(&mut jobs, item, None, &cold);
             }
+            // Slot był tylko zarezerwowany — brak forwardu, drop zwalnia go od razu.
+            drop(permit);
             continue;
         }
 
         // HOT PATH: one batched detect per (alias, threshold) group through the
-        // executor (resolve aliasu + failover/mesh). Serializacja forwardów:
-        // `.await` blokuje pętlę aż bieżący forward się zakończy (embedded
-        // kończy na `run_blocking` — jeden wątek inferencji), więc w danej
-        // chwili trwa DOKŁADNIE jeden forward. Świadomie nie odpalamy
-        // równoległych forwardów: współbieżny dostęp do backendu GPU powoduje
-        // korupcję (patrz walidacja wgpu). `detect_ms` liczony jak dotąd:
-        // łączny czas wywołania / liczba klatek batcha (przybliżenie dla badge).
+        // executor (resolve aliasu + failover/mesh). Sam FORWARD biegnie
+        // współbieżnie (do K naraz) w spawnowanym zadaniu — pula sesji ort jest
+        // `&self` + Send+Sync, więc równoległe detekty liczą się na osobnych
+        // sesjach GPU bez korupcji (Chunki 1-3). APLIKACJA wyników wraca na
+        // pętlę przez `join_next`, więc `jobs`/tracker/enrich-cache ma nadal
+        // jednego właściciela — współbieżny jest WYŁĄCZNIE forward. `detect_ms`
+        // liczony jak dotąd: łączny czas wywołania / liczba klatek batcha.
         let alias = batch[0].alias.clone();
         let threshold = batch[0].threshold;
-        let detect_start = Instant::now();
-        let request = CameraCvRequest {
-            model: alias.clone(),
-            op: CameraCvOpLocal::Detect { frames, threshold },
-        };
-        // Wywolanie systemowe (silnik kamer) — brak tozsamosci uzytkownika,
-        // swiezy kontekst per wywolanie (jak w vision_impl).
-        let mut ctx = RuntimeContext::new(None);
-        let result = executor.execute_camera_cv(request, &mut ctx).await;
+        let executor_task = executor.clone();
         let n = batch.len().max(1) as u32;
-        let detect_ms = (detect_start.elapsed().as_millis() as u32) / n;
-
-        match result {
-            Ok(CameraCvResult::Detections { per_frame }) if per_frame.len() == batch.len() => {
-                for (item, dets_cv) in batch.iter().zip(per_frame) {
-                    let dets: Vec<Detection> =
-                        dets_cv.into_iter().map(detection_from_cv).collect();
-                    stage_completed(&mut jobs, item, Some((dets, detect_ms)), &cold);
-                }
+        let handle = forwards.spawn(async move {
+            // Permit trzymany przez CAŁY forward — dropuje się z zadaniem (koniec
+            // lub abort przy drainie), zwalniając slot Semaphore.
+            let _permit = permit;
+            let request = CameraCvRequest {
+                model: alias.clone(),
+                op: CameraCvOpLocal::Detect { frames, threshold },
+            };
+            // Wywolanie systemowe (silnik kamer) — brak tozsamosci uzytkownika,
+            // swiezy kontekst per wywolanie (jak w vision_impl).
+            let mut ctx = RuntimeContext::new(None);
+            let detect_start = Instant::now();
+            let outcome = executor_task
+                .execute_camera_cv(request, &mut ctx)
+                .await
+                .map_err(|e| e.to_string());
+            let detect_ms = (detect_start.elapsed().as_millis() as u32) / n;
+            ForwardOutput {
+                alias,
+                detect_ms,
+                outcome,
             }
-            Ok(CameraCvResult::Detections { per_frame }) => {
-                warn_throttled(
-                    "detect",
-                    &format!(
-                        "detect '{alias}': {} per_frame results for {} batch frames (contract broken)",
-                        per_frame.len(),
-                        batch.len()
-                    ),
-                );
-                for item in &batch {
-                    stage_completed(&mut jobs, item, None, &cold);
-                }
-            }
-            Ok(_) => {
-                warn_throttled(
-                    "detect",
-                    &format!("detect '{alias}': unexpected camera-cv result variant"),
-                );
-                for item in &batch {
-                    stage_completed(&mut jobs, item, None, &cold);
-                }
-            }
-            Err(e) => {
-                warn_throttled("detect", &format!("detect '{alias}': {e}"));
-                for item in &batch {
-                    stage_completed(&mut jobs, item, None, &cold);
-                }
-            }
-        }
+        });
+        inflight.insert(handle.id(), batch);
+        // Continuous batching: wracamy natychmiast, by uformować i wypuścić
+        // kolejny batch, dopóki są wolne sloty K (greedy). Gdy sloty się wyczerpią,
+        // `try_acquire_owned` zawiedzie i pętla przejdzie w idle-wait powyżej.
     }
 }
 
@@ -1848,5 +2065,269 @@ mod tests {
         // Etap bez outputu (detect/embed) niczego nie zmienia.
         apply_stage_output(&mut det, None, &ocr_hit);
         assert_eq!(det.stan.len(), 2);
+    }
+
+    /// Pipeline jednoetapowy (jeden `detect` na klatce) — minimum do złożenia
+    /// [`FrameJob`] w testach domykania.
+    fn detect_pipeline(stage: &str) -> CvPipeline {
+        CvPipeline {
+            stages: vec![cv_pipeline::CvStage {
+                stage_id: stage.to_string(),
+                enabled: true,
+                op: CvOp::Detect,
+                model: "m".into(),
+                input: CvStageInput::Frame { fps: None },
+                threshold: None,
+                params: serde_json::Map::new(),
+                output: None,
+            }],
+        }
+    }
+
+    fn make_job(cam: &str, captured: u64, pipeline: &Arc<CvPipeline>, stage: &str) -> FrameJob {
+        FrameJob {
+            camera_id: cam.to_string(),
+            frame: Arc::from(vec![0u8; 12]),
+            w: 2,
+            h: 2,
+            captured_ms: captured,
+            pts_ns: None,
+            pipeline: pipeline.clone(),
+            open_stages: vec![stage.to_string()],
+            results: Vec::new(),
+            detect_ms_total: 0,
+            failed_stages: 0,
+        }
+    }
+
+    fn empty_detections() -> ForwardOutput {
+        ForwardOutput {
+            alias: "m".into(),
+            detect_ms: 3,
+            outcome: Ok(CameraCvResult::Detections {
+                per_frame: vec![Vec::new()],
+            }),
+        }
+    }
+
+    /// K>1: gdy `TENTAFLOW_VISION_INFLIGHT` jest ustawione, wygrywa; inaczej K
+    /// odwzorowuje pulę detektora; gdy ŻADNA zmienna nie jest ustawiona → K=1
+    /// (dowód zerowej regresji: bit-identyczne z pojedynczą, serializowaną pętlą).
+    #[test]
+    fn inflight_limit_defaults_to_one_and_honors_env() {
+        let prev_k = std::env::var("TENTAFLOW_VISION_INFLIGHT").ok();
+        let prev_d = std::env::var("TENTAFLOW_VISION_DETECTOR_SESSIONS").ok();
+        std::env::remove_var("TENTAFLOW_VISION_INFLIGHT");
+        std::env::remove_var("TENTAFLOW_VISION_DETECTOR_SESSIONS");
+        assert_eq!(inflight_limit(), 1, "brak env → K=1");
+
+        std::env::set_var("TENTAFLOW_VISION_DETECTOR_SESSIONS", "4");
+        assert_eq!(inflight_limit(), 4, "K odwzorowuje pulę detektora");
+
+        std::env::set_var("TENTAFLOW_VISION_INFLIGHT", "2");
+        assert_eq!(inflight_limit(), 2, "jawny opt-in wygrywa nad pulą detektora");
+
+        std::env::set_var("TENTAFLOW_VISION_INFLIGHT", "999");
+        assert_eq!(inflight_limit(), MAX_INFLIGHT, "clamp górny do MAX_INFLIGHT");
+
+        std::env::set_var("TENTAFLOW_VISION_INFLIGHT", "0");
+        assert_eq!(inflight_limit(), 1, "clamp dolny do 1");
+
+        match prev_k {
+            Some(v) => std::env::set_var("TENTAFLOW_VISION_INFLIGHT", v),
+            None => std::env::remove_var("TENTAFLOW_VISION_INFLIGHT"),
+        }
+        match prev_d {
+            Some(v) => std::env::set_var("TENTAFLOW_VISION_DETECTOR_SESSIONS", v),
+            None => std::env::remove_var("TENTAFLOW_VISION_DETECTOR_SESSIONS"),
+        }
+    }
+
+    /// Ordering gate: kamera z otwartym jobem NIE przyjmuje drugiej klatki, więc
+    /// nawet przy K współbieżnych forwardach jedna kamera ma ≤1 klatkę w locie —
+    /// jej publikacje pozostają monotoniczne po `captured_ms`.
+    #[test]
+    fn ordering_gate_blocks_second_frame_while_camera_job_open() {
+        let pipeline = Arc::new(detect_pipeline("det"));
+        let mut jobs: HashMap<u64, FrameJob> = HashMap::new();
+        jobs.insert(1, make_job("camX", 100, &pipeline, "det"));
+        assert!(jobs.values().any(|j| j.camera_id == "camX"));
+        assert!(!jobs.values().any(|j| j.camera_id == "camY"));
+    }
+
+    /// K>1 poza kolejnością: dwie kamery, po jednej klatce w locie (ordering gate
+    /// gwarantuje ≤1 job/kamera). Forwardy kończą się W ODWROTNEJ kolejności
+    /// (młodsza kamera pierwsza) — wynik każdego routuje się do WŁASNEGO joba po
+    /// `job_id`, więc publikacja niesie `captured_ms` tej właśnie kamery. Dowodzi,
+    /// że współbieżne, nie-w-kolejności zakończenia nie mieszają strumieni kamer
+    /// i nie regresują per-kamerowej kolejności publikacji.
+    #[test]
+    fn out_of_order_completion_routes_each_camera_independently() {
+        let nonce = std::process::id();
+        let cam_a = format!("test-cam-a-{nonce}");
+        let cam_b = format!("test-cam-b-{nonce}");
+        let mut rx_a = detection_bus::subscribe(&cam_a);
+        let mut rx_b = detection_bus::subscribe(&cam_b);
+
+        let pipeline = Arc::new(detect_pipeline("det"));
+        let mut jobs: HashMap<u64, FrameJob> = HashMap::new();
+        jobs.insert(1, make_job(&cam_a, 100, &pipeline, "det"));
+        jobs.insert(2, make_job(&cam_b, 50, &pipeline, "det"));
+
+        let (cold_tx, _cold_rx) = mpsc::channel::<DetectionEvent>(4);
+        let item_a = PendingItem {
+            job_id: 1,
+            stage_id: "det".into(),
+            alias: "m".into(),
+            threshold: None,
+            added: Instant::now(),
+        };
+        let item_b = PendingItem {
+            job_id: 2,
+            stage_id: "det".into(),
+            alias: "m".into(),
+            threshold: None,
+            added: Instant::now(),
+        };
+
+        // Kamera B (młodsza klatka, job_id=2) kończy PIERWSZA — celowo poza
+        // kolejnością względem starszej kamery A.
+        apply_forward_result(&mut jobs, vec![item_b], Ok(empty_detections()), &cold_tx);
+        assert!(jobs.contains_key(&1), "job kamery A wciąż otwarty");
+        assert!(!jobs.contains_key(&2), "job kamery B sfinalizowany");
+        apply_forward_result(&mut jobs, vec![item_a], Ok(empty_detections()), &cold_tx);
+        assert!(jobs.is_empty(), "oba joby sfinalizowane");
+
+        let msg_a = rx_a.try_recv().expect("kamera A opublikowana");
+        let msg_b = rx_b.try_recv().expect("kamera B opublikowana");
+        assert_eq!(msg_a.ts_ms, 100, "publikacja A niesie captured_ms kamery A");
+        assert_eq!(msg_b.ts_ms, 50, "publikacja B niesie captured_ms kamery B");
+    }
+
+    /// Panika/abort zadania forwardu (`JoinError`) NIE może zostawić otwartych
+    /// etapów — inaczej ordering gate zablokowałby kamerę na zawsze. Błąd joina
+    /// domyka wszystkie pozycje batcha jako porażkę i finalizuje job.
+    #[test]
+    fn join_error_closes_batch_stages_no_leak() {
+        let pipeline = Arc::new(detect_pipeline("det"));
+        let mut jobs: HashMap<u64, FrameJob> = HashMap::new();
+        jobs.insert(7, make_job("cam-join-err", 10, &pipeline, "det"));
+        let (cold_tx, _cold_rx) = mpsc::channel::<DetectionEvent>(4);
+        let item = PendingItem {
+            job_id: 7,
+            stage_id: "det".into(),
+            alias: "m".into(),
+            threshold: None,
+            added: Instant::now(),
+        };
+        // Symulacja porażki joina: cała pozycja domknięta jako porażka. Job bez
+        // żadnego udanego etapu finalizuje się bez publikacji (results puste).
+        apply_forward_result(&mut jobs, vec![item], Ok(force_error_output()), &cold_tx);
+        assert!(jobs.is_empty(), "job domknięty mimo błędu — brak wycieku");
+    }
+
+    fn force_error_output() -> ForwardOutput {
+        ForwardOutput {
+            alias: "m".into(),
+            detect_ms: 0,
+            outcome: Err("simulated forward failure".into()),
+        }
+    }
+
+    /// P1: gdy forward ukończy się, jego permit jest zwolniony ZANIM wynik zostanie
+    /// zaaplikowany — to okno, które drenaż-przed-acquire zamyka. Test dowodzi obu
+    /// faktów (permit wolny + wynik wciąż w JoinSet) oraz dyscypliny „apply przed
+    /// acquire": po zastosowaniu wyniku permit jest ponownie dostępny.
+    #[tokio::test]
+    async fn completed_forward_frees_permit_before_result_is_applied() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut forwards: tokio::task::JoinSet<u64> = tokio::task::JoinSet::new();
+        let permit = sem.clone().try_acquire_owned().expect("permit wolny na starcie");
+        forwards.spawn(async move {
+            let _p = permit;
+            1u64
+        });
+        // Forward w locie ⇒ K=1 wyczerpane ⇒ nowy forward NIE spawnuje się.
+        assert!(
+            sem.clone().try_acquire_owned().is_err(),
+            "permit zajęty w trakcie forwardu (K=1)"
+        );
+        // Poczekaj aż zadanie się zakończy (permit zwolniony), ale NIE aplikuj.
+        for _ in 0..1000 {
+            if sem.available_permits() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // Okno hazardu: permit JUŻ wolny, ale wynik WCIĄŻ nieaplikowany w JoinSet.
+        assert_eq!(sem.available_permits(), 1, "permit zwolniony po zakończeniu");
+        let joined = forwards
+            .try_join_next()
+            .expect("wynik gotowy, lecz jeszcze niezaaplikowany");
+        assert_eq!(joined.unwrap(), 1, "drenaż stosuje wynik ukończonego forwardu");
+    }
+
+    /// P1: `drain_ready_forwards` stosuje ukończone forwardy (finalizuje joby)
+    /// przez ten sam realny path co pętla (`apply_joined`).
+    #[tokio::test]
+    async fn drain_ready_forwards_applies_completed_jobs() {
+        let pipeline = Arc::new(detect_pipeline("det"));
+        let mut jobs: HashMap<u64, FrameJob> = HashMap::new();
+        jobs.insert(5, make_job("cam-drain-ready", 77, &pipeline, "det"));
+        let (cold_tx, _cold_rx) = mpsc::channel::<DetectionEvent>(4);
+        let mut forwards: tokio::task::JoinSet<ForwardOutput> = tokio::task::JoinSet::new();
+        let mut inflight: HashMap<tokio::task::Id, Vec<PendingItem>> = HashMap::new();
+        let item = PendingItem {
+            job_id: 5,
+            stage_id: "det".into(),
+            alias: "m".into(),
+            threshold: None,
+            added: Instant::now(),
+        };
+        let handle = forwards.spawn(async move { empty_detections() });
+        inflight.insert(handle.id(), vec![item]);
+        // Powtarzaj realny drenaż aż forward się zakończy i job sfinalizuje.
+        for _ in 0..1000 {
+            drain_ready_forwards(&mut forwards, &mut jobs, &mut inflight, &cold_tx);
+            if jobs.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(jobs.is_empty(), "ukończony forward zaaplikowany, job sfinalizowany");
+        assert!(inflight.is_empty(), "wpis routingu usunięty po zastosowaniu");
+    }
+
+    /// P2: graceful-drain AWAITuje trwający (wolny) forward do końca i APLIKUJE go —
+    /// nie porzuca/abortuje. Dowód: job z 50 ms forwardem finalizuje się po pętli
+    /// `join_next_with_id().await` (ta sama pętla co w silniku na shutdown).
+    #[tokio::test]
+    async fn graceful_drain_awaits_and_applies_inflight_forward() {
+        let pipeline = Arc::new(detect_pipeline("det"));
+        let mut jobs: HashMap<u64, FrameJob> = HashMap::new();
+        jobs.insert(9, make_job("cam-grace", 33, &pipeline, "det"));
+        let (cold_tx, _cold_rx) = mpsc::channel::<DetectionEvent>(4);
+        let mut forwards: tokio::task::JoinSet<ForwardOutput> = tokio::task::JoinSet::new();
+        let mut inflight: HashMap<tokio::task::Id, Vec<PendingItem>> = HashMap::new();
+        let item = PendingItem {
+            job_id: 9,
+            stage_id: "det".into(),
+            alias: "m".into(),
+            threshold: None,
+            added: Instant::now(),
+        };
+        let handle = forwards.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            empty_detections()
+        });
+        inflight.insert(handle.id(), vec![item]);
+        // Pętla graceful-drain silnika: await KAŻDEGO trwającego forwardu + apply.
+        while let Some(joined) = forwards.join_next_with_id().await {
+            apply_joined(&mut jobs, &mut inflight, Some(joined), &cold_tx);
+        }
+        assert!(
+            jobs.is_empty(),
+            "trwający forward dokończony i zaaplikowany (await), nie porzucony"
+        );
     }
 }

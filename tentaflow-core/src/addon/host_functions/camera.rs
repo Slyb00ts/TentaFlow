@@ -275,7 +275,7 @@ async fn hydrate_supervisor_from_db(sup: &Arc<CameraIngestSupervisor>) {
 /// the router begins releasing locks.
 pub async fn shutdown_camera_supervisor_global() {
     #[cfg(feature = "inference-vision-gpu")]
-    crate::services::camera_ingest::vision_analysis::drain();
+    crate::services::camera_ingest::vision_analysis::drain().await;
     crate::services::camera_ingest::depth_mapping::drain();
     if let Some(sup) = SUPERVISOR.get() {
         sup.drain().await;
