@@ -14,11 +14,15 @@
 // (`TENTAFLOW_ONNX_CV_MAX_SESSIONS`, domyślnie 4); sha256 pliku jest
 // weryfikowane przy pierwszym załadowaniu (mismatch = odmowa). Każdy model ma
 // własny podkatalog engine-cache TensorRT (`trt-cache/<model_name>/`), żeby
-// plany silników różnych grafów się nie mieszały.
+// plany silników różnych grafów się nie mieszały. Wpis modelu trzyma PULĘ N
+// niezależnych sesji (`TENTAFLOW_ONNX_CV_SESSIONS_PER_MODEL`, domyślnie 1)
+// wybieranych round-robin — `Session::run` wymaga `&mut self`, więc dopiero
+// kilka sesji tego samego grafu pozwala na równoległe forwardy na GPU.
 
 #![cfg(feature = "inference-supertonic")]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -30,9 +34,33 @@ use crate::paths;
 use crate::services::runtime::local_cv::CvFrameLocal;
 use tentaflow_protocol::{CameraCvResult, CvDetection};
 
-/// Env var capping the number of resident ort sessions (LRU eviction).
+/// Env var capping the number of resident ort model entries (LRU eviction).
+/// Each entry now owns a whole [`SessionPool`], so the resident VRAM ceiling is
+/// `MAX_SESSIONS * SESSIONS_PER_MODEL` model copies, not `MAX_SESSIONS`.
 const MAX_SESSIONS_ENV: &str = "TENTAFLOW_ONNX_CV_MAX_SESSIONS";
 const DEFAULT_MAX_SESSIONS: usize = 4;
+
+/// Env var setting how many independent ort sessions each resident model keeps.
+/// `ort::Session::run` takes `&mut self`, so one shared session serializes every
+/// forward of that model; N sessions (each its own `&mut`, same ONNX graph)
+/// checked out round-robin let N forwards run concurrently on the GPU. Default 1
+/// is byte-identical to the historical single-`Mutex<Session>` behavior.
+const SESSIONS_PER_MODEL_ENV: &str = "TENTAFLOW_ONNX_CV_SESSIONS_PER_MODEL";
+const DEFAULT_SESSIONS_PER_MODEL: usize = 1;
+const MAX_SESSIONS_PER_MODEL: usize = 16;
+
+/// Parsed-once pool size from [`SESSIONS_PER_MODEL_ENV`], clamped to
+/// `1..=MAX_SESSIONS_PER_MODEL`.
+fn sessions_per_model() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var(SESSIONS_PER_MODEL_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_SESSIONS_PER_MODEL)
+            .clamp(1, MAX_SESSIONS_PER_MODEL)
+    })
+}
 
 /// Parsed `preprocess_json`: `{resolution, mean, std, layout}`. Mean/std
 /// default to the ImageNet transform (the training default for both RF-DETR
@@ -85,10 +113,82 @@ enum Contract {
     Softmax,
 }
 
-/// One resident model: ort session (behind a Mutex — `Session::run` needs
-/// exclusive access) + everything postprocess needs.
+/// Round-robin cursor over a pool of `len` sessions, separated from the
+/// sessions themselves so the wrap-around is unit-testable without ort/GPU.
+struct RoundRobin {
+    next: AtomicUsize,
+    len: usize,
+}
+
+impl RoundRobin {
+    fn new(len: usize) -> Self {
+        Self {
+            next: AtomicUsize::new(0),
+            len: len.max(1),
+        }
+    }
+
+    /// Next slot index, wrapping modulo `len`. `Relaxed` is enough: the cursor
+    /// only spreads load, it guards no data (each session has its own Mutex).
+    fn pick(&self) -> usize {
+        self.next.fetch_add(1, Ordering::Relaxed) % self.len
+    }
+}
+
+/// N independent ort sessions of the SAME model, checked out round-robin so
+/// concurrent forwards don't serialize on one `Mutex<Session>`. Each session is
+/// built from identical (sha256-verified) ONNX bytes; `Session::run` needs
+/// `&mut self`, hence one Mutex per session rather than one shared session. With
+/// a single session (`SESSIONS_PER_MODEL=1`) `checkout` always locks index 0 —
+/// exactly the historical single-Mutex path, zero behavioral change.
+struct SessionPool {
+    sessions: Vec<Mutex<ort::session::Session>>,
+    cursor: RoundRobin,
+    /// Set once any pooled session's Mutex is found poisoned (a panic mid-`run`).
+    /// An `ort::Session` owns FFI/provider state that a panicked forward may have
+    /// left inconsistent, so a poisoned pool is treated as dead: checkout errors
+    /// and `get_or_load` evicts + rebuilds the whole pool fresh.
+    poisoned: std::sync::atomic::AtomicBool,
+}
+
+impl SessionPool {
+    fn new(sessions: Vec<ort::session::Session>) -> Self {
+        let len = sessions.len();
+        Self {
+            sessions: sessions.into_iter().map(Mutex::new).collect(),
+            cursor: RoundRobin::new(len),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    /// Picks the next session round-robin and locks it. If that session is busy
+    /// the caller blocks on its Mutex (never busy-loops); other pool sessions
+    /// stay free for other callers. A poisoned Mutex (panic mid-`run`) does NOT
+    /// recover-and-reuse: the pool is marked dead and an error is returned so
+    /// `get_or_load` rebuilds it — never hand out a possibly-corrupt ort session.
+    fn checkout(&self) -> Result<std::sync::MutexGuard<'_, ort::session::Session>> {
+        if self.is_poisoned() {
+            bail!("onnx-cv: session pool poisoned by a prior panicked forward — reload required");
+        }
+        let idx = self.cursor.pick();
+        self.sessions[idx].lock().map_err(|_| {
+            self.poisoned.store(true, Ordering::Release);
+            anyhow!("onnx-cv: session poisoned by a panicked forward — reload required")
+        })
+    }
+}
+
+/// One resident model: a pool of ort sessions + everything postprocess needs.
 struct CachedModel {
-    session: Mutex<ort::session::Session>,
+    pool: Arc<SessionPool>,
     classes: Vec<String>,
     pre: PreprocessSpec,
     contract: Contract,
@@ -188,7 +288,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn get_or_load(row: &VisionModelRow) -> Result<Arc<CachedModel>> {
     let cache_hit = |guard: &mut SessionCache| -> Option<Arc<CachedModel>> {
         let existing = guard.models.get(&row.model_name)?;
-        if existing.sha256 != row.sha256 {
+        // A registry update (new hash) OR a poisoned pool (a panicked forward)
+        // invalidates the cached entry and forces a fresh rebuild.
+        if existing.sha256 != row.sha256 || existing.pool.is_poisoned() {
             guard.models.remove(&row.model_name);
             guard.lru.remove(&row.model_name);
             return None;
@@ -243,7 +345,7 @@ fn get_or_load(row: &VisionModelRow) -> Result<Arc<CachedModel>> {
     }
 
     crate::vision::ort_common::ensure_ort_dylib();
-    let trt_cache = paths::vision_models_dir()
+    let trt_cache_root = paths::vision_models_dir()
         .join("trt-cache")
         .join(&row.model_name);
     // TRT shape profile pins one engine over the batch range this runner
@@ -272,22 +374,36 @@ fn get_or_load(row: &VisionModelRow) -> Result<Arc<CachedModel>> {
             row.model_name
         );
     }
-    let session = crate::vision::ort_common::build_ort_session_from_memory(
-        &bytes,
-        &trt_cache,
-        trt_profile.as_ref(),
-    )?;
+    // Build the whole pool under the SINGLE load-lock critical section. Each
+    // session gets its OWN engine-cache subdir (`trt-cache/<model>/s<i>/`): the
+    // lazy (unprofiled) TRT path compiles engines on the FIRST FORWARD, which
+    // happens after this lock is released, so once sessions run concurrently
+    // (N>1) they must never share a cache dir — per-session dirs remove the
+    // write race entirely. The profiled detector path works identically per
+    // dir; it just serializes one engine copy into each.
+    let n_sessions = sessions_per_model();
+    let mut sessions = Vec::with_capacity(n_sessions);
+    for i in 0..n_sessions {
+        let session_cache = trt_cache_root.join(format!("s{i}"));
+        sessions.push(crate::vision::ort_common::build_ort_session_from_memory(
+            &bytes,
+            &session_cache,
+            trt_profile.as_ref(),
+        )?);
+    }
     drop(bytes);
+    let pool = Arc::new(SessionPool::new(sessions));
     info!(
-        "[onnx-cv] loaded '{}' ({} classes, contract {:?}, {}px)",
+        "[onnx-cv] loaded '{}' ({} classes, contract {:?}, {}px, pool={} session(s))",
         row.model_name,
         classes.len(),
         contract,
-        pre.resolution
+        pre.resolution,
+        pool.len()
     );
 
     let loaded = Arc::new(CachedModel {
-        session: Mutex::new(session),
+        pool,
         classes,
         pre,
         contract,
@@ -364,7 +480,7 @@ fn detect_blocking(
     let value = ort::value::Value::from_array(input)
         .map_err(|e| anyhow!("onnx-cv: Value::from_array: {e}"))?;
 
-    let mut session = model.session.lock().unwrap_or_else(|e| e.into_inner());
+    let mut session = model.pool.checkout()?;
     let input_name = session
         .inputs()
         .first()
@@ -454,7 +570,7 @@ fn classify_blocking(model: &CachedModel, crop: &CvFrameLocal) -> Result<(String
     let value = ort::value::Value::from_array(input)
         .map_err(|e| anyhow!("onnx-cv: Value::from_array: {e}"))?;
 
-    let mut session = model.session.lock().unwrap_or_else(|e| e.into_inner());
+    let mut session = model.pool.checkout()?;
     let input_name = session
         .inputs()
         .first()
@@ -592,6 +708,23 @@ mod tests {
         assert!(
             PreprocessSpec::parse(r#"{"resolution":224,"std":[0.0,0.2,0.2]}"#).is_err()
         );
+    }
+
+    /// Round-robin cursor: len 1 always yields index 0; len 3 cycles
+    /// 0,1,2,0,... — the pool's load-spread contract at any size.
+    #[test]
+    fn round_robin_wraps_over_len() {
+        let rr = RoundRobin::new(1);
+        assert_eq!([rr.pick(), rr.pick(), rr.pick()], [0, 0, 0]);
+        let rr = RoundRobin::new(3);
+        assert_eq!(
+            [rr.pick(), rr.pick(), rr.pick(), rr.pick(), rr.pick()],
+            [0, 1, 2, 0, 1]
+        );
+        // A zero-length pool is impossible (builder clamps ≥1), but the cursor
+        // must not divide by zero if constructed with 0.
+        let rr = RoundRobin::new(0);
+        assert_eq!(rr.pick(), 0);
     }
 
     #[test]
