@@ -299,22 +299,32 @@ fn get_or_load(row: &VisionModelRow) -> Result<Arc<CachedModel>> {
             row.model_name
         );
     }
-    // Build the whole pool under the SINGLE load-lock critical section. Each
-    // session gets its OWN engine-cache subdir (`trt-cache/<model>/s<i>/`): the
-    // lazy (unprofiled) TRT path compiles engines on the FIRST FORWARD, which
-    // happens after this lock is released, so once sessions run concurrently
-    // (N>1) they must never share a cache dir — per-session dirs remove the
-    // write race entirely. The profiled detector path works identically per
-    // dir; it just serializes one engine copy into each.
+    // Build the whole pool under the SINGLE load-lock critical section, spread
+    // round-robin across the configured GPU set (session i → device
+    // `gpus[i % gpus.len()]`; default `[0]` = single GPU, unchanged). Each session
+    // gets its OWN per-(device,session) engine-cache subdir
+    // (`trt-cache/<model>/s<i>/` on device 0, `d<dev>_s<i>` elsewhere): the lazy
+    // (unprofiled) TRT path compiles engines on the FIRST FORWARD, which happens
+    // after this lock is released, so once sessions run concurrently (N>1) they
+    // must never share a cache dir, and a device-`d` session must never reuse a
+    // plan built for another device. The profiled detector path works identically
+    // per dir; it just serializes one engine copy into each.
     let n_sessions = sessions_per_model();
+    let gpus = crate::vision::ort_common::vision_gpu_set();
     let mut sessions = Vec::with_capacity(n_sessions);
     for i in 0..n_sessions {
-        let session_cache = trt_cache_root.join(format!("s{i}"));
-        sessions.push(crate::vision::ort_common::build_ort_session_from_memory(
-            &bytes,
-            &session_cache,
-            trt_profile.as_ref(),
-        )?);
+        let device_id = gpus[i % gpus.len()];
+        let session_cache =
+            trt_cache_root.join(crate::vision::ort_common::session_cache_subdir(device_id, i));
+        sessions.push(
+            crate::vision::ort_common::build_ort_session_from_memory(
+                &bytes,
+                &session_cache,
+                trt_profile.as_ref(),
+                device_id,
+            )
+            .map_err(|e| anyhow!("onnx-cv session slot {i} on GPU device {device_id}: {e:#}"))?,
+        );
     }
     drop(bytes);
     let pool = Arc::new(SessionPool::new(sessions));

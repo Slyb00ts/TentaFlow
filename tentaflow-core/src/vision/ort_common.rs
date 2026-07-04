@@ -12,7 +12,7 @@
 #![cfg(feature = "inference-supertonic")]
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{anyhow, bail, Result};
 use tracing::{info, warn};
@@ -166,6 +166,84 @@ pub fn pool_size_from_env(env_var: &str, default: usize) -> usize {
         .clamp(1, MAX_SESSIONS_PER_MODEL)
 }
 
+/// Upper bound on the number of GPUs a single vision pool will spread across.
+/// A misconfigured `TENTAFLOW_VISION_GPUS=1000` must not allocate a 1000-element
+/// device vector; no real box has more than this many CUDA devices.
+pub const MAX_VISION_GPUS: usize = 64;
+
+/// Environment knob selecting which CUDA device ids the vision session pools
+/// spread across. See [`vision_gpu_set`] for the grammar.
+pub const VISION_GPUS_ENV: &str = "TENTAFLOW_VISION_GPUS";
+
+/// Parsed CUDA device-id set that vision session pools spread across, resolved
+/// ONCE for the process lifetime from `TENTAFLOW_VISION_GPUS`.
+///
+/// Grammar (single-GPU device 0 is always the safe default — never panics):
+///   * unset / empty / whitespace → `[0]` (today's single-GPU behavior).
+///   * a bare count `N` (e.g. `"2"`) → devices `[0, 1, … N-1]`.
+///   * an explicit comma list (e.g. `"0,2,3"`) → exactly those device ids,
+///     de-duplicated with order preserved.
+///   * anything unparseable / a non-positive count → `[0]`.
+///
+/// There is deliberately no CUDA auto-detection here: adding an nvml dependency
+/// just to count GPUs is not worth it, and the mesh `NodeInfo.gpus` count is not
+/// reachable from this low-level ort layer. Multi-GPU is opt-in by the operator
+/// setting this var; the default stays single-device-0 and byte-identical.
+pub fn vision_gpu_set() -> &'static [i32] {
+    static SET: OnceLock<Vec<i32>> = OnceLock::new();
+    SET.get_or_init(|| parse_gpu_set(std::env::var(VISION_GPUS_ENV).ok().as_deref()))
+        .as_slice()
+}
+
+/// Pure parser behind [`vision_gpu_set`], split out so the grammar is unit-testable
+/// without touching the process environment or the `OnceLock`.
+fn parse_gpu_set(raw: Option<&str>) -> Vec<i32> {
+    let raw = raw.map(str::trim).unwrap_or("");
+    if raw.is_empty() {
+        return vec![0];
+    }
+    // No comma → a bare device COUNT (count semantics, per the documented grammar):
+    // "2" means "use two GPUs, devices 0 and 1", NOT "use device 2".
+    if !raw.contains(',') {
+        return match raw.parse::<i32>() {
+            Ok(count) if count >= 1 => {
+                let count = (count as usize).min(MAX_VISION_GPUS);
+                (0..count as i32).collect()
+            }
+            _ => vec![0],
+        };
+    }
+    // Comma list → explicit device ids, de-duplicated, order preserved, garbage
+    // and negatives dropped.
+    let mut ids: Vec<i32> = Vec::new();
+    for tok in raw.split(',') {
+        if let Ok(id) = tok.trim().parse::<i32>() {
+            if id >= 0 && !ids.contains(&id) && ids.len() < MAX_VISION_GPUS {
+                ids.push(id);
+            }
+        }
+    }
+    if ids.is_empty() {
+        vec![0]
+    } else {
+        ids
+    }
+}
+
+/// Per-(device, session) TRT engine-cache subdir name. TRT engine plans are
+/// GPU-specific, so a session on device `d` must never reuse a plan compiled for
+/// another device. Device 0 keeps the historical `s<i>` name — single-GPU is the
+/// default, so every existing on-disk cache stays valid (no forced rebuild for
+/// current deployments, including the live instance). Non-zero devices get a
+/// `d<device>_s<i>` name so multi-GPU plans never collide in one `trt-cache` root.
+pub fn session_cache_subdir(device_id: i32, session_idx: usize) -> String {
+    if device_id == 0 {
+        format!("s{session_idx}")
+    } else {
+        format!("d{device_id}_s{session_idx}")
+    }
+}
+
 /// Round-robin cursor over a pool of `len` sessions, separated from the sessions
 /// themselves so the wrap-around is unit-testable without ort/GPU.
 pub struct RoundRobin {
@@ -280,15 +358,24 @@ impl SessionPool {
     }
 }
 
-/// Builds a pool of `n` independent ort sessions from one on-disk ONNX model.
-/// Each session gets its OWN TensorRT engine-cache subdir (`<cache_root>/s{i}`):
-/// the lazy (unprofiled) TRT path compiles engines on the FIRST FORWARD, so once
-/// sessions run concurrently (n>1) they must never share a cache dir. `n` is
-/// clamped to `1..=MAX_SESSIONS_PER_MODEL`.
+/// Builds a pool of `n` independent ort sessions from one on-disk ONNX model,
+/// spread round-robin across the configured GPU set ([`vision_gpu_set`]): session
+/// `i` lands on device `gpus[i % gpus.len()]`, so `n=8` over 2 GPUs gives 4
+/// sessions per GPU. VRAM is budgeted PER DEVICE (each session is a full model
+/// copy on its own GPU). With the default single-GPU set (`[0]`) this is the
+/// historical behavior unchanged.
 ///
-/// The pool carries a rebuilder (same model path + per-slot cache + profile) so
-/// a session poisoned by a panicked forward is rebuilt in place on next use —
-/// the fixed runner always loads the identical model, so this is safe.
+/// Each session gets its OWN TensorRT engine-cache subdir
+/// ([`session_cache_subdir`] → `<cache_root>/s{i}` on device 0,
+/// `<cache_root>/d{dev}_s{i}` elsewhere): the lazy (unprofiled) TRT path compiles
+/// engines on the FIRST FORWARD, so once sessions run concurrently (n>1) they
+/// must never share a cache dir, and a device-`d` session must never reuse a
+/// plan built for another device. `n` is clamped to `1..=MAX_SESSIONS_PER_MODEL`.
+///
+/// The pool carries a rebuilder (same model path + per-(device,slot) cache +
+/// profile) so a session poisoned by a panicked forward is rebuilt in place on
+/// next use, on the SAME device — the fixed runner always loads the identical
+/// model, so this is safe.
 pub fn build_session_pool_from_file(
     model_path: &std::path::Path,
     cache_root: &std::path::Path,
@@ -296,12 +383,21 @@ pub fn build_session_pool_from_file(
     n: usize,
 ) -> Result<SessionPool> {
     let n = n.clamp(1, MAX_SESSIONS_PER_MODEL);
+    let gpus: Vec<i32> = vision_gpu_set().to_vec();
     let build_slot = {
         let model_path = model_path.to_path_buf();
         let cache_root = cache_root.to_path_buf();
         let trt_profile = trt_profile.cloned();
         move |i: usize| -> Result<ort::session::Session> {
-            build_ort_session(&model_path, &cache_root.join(format!("s{i}")), trt_profile.as_ref())
+            let device_id = gpus[i % gpus.len()];
+            let subdir = session_cache_subdir(device_id, i);
+            build_ort_session(
+                &model_path,
+                &cache_root.join(subdir),
+                trt_profile.as_ref(),
+                device_id,
+            )
+            .map_err(|e| anyhow!("session slot {i} on GPU device {device_id}: {e:#}"))
         }
     };
     let mut sessions = Vec::with_capacity(n);
@@ -328,14 +424,17 @@ pub fn build_session_pool_from_file(
 /// plany silników; pierwszy forward po zmianie modelu/GPU buduje je od nowa).
 /// `trt_profile` (opcjonalny) pinuje zakres batcha jednym silnikiem TRT —
 /// patrz [`TrtShapeProfile`]; `None` zachowuje leniwe per-shape buildy.
+/// `device_id` pins BOTH the TensorRT and CUDA EPs to the same CUDA device
+/// (default `0` = today's single-GPU path).
 ///
 /// Kolejność: TensorRT (engine-cache + FP16) → CUDA → [macOS] CoreML → CPU.
 pub fn build_ort_session(
     model_path: &std::path::Path,
     trt_cache_dir: &std::path::Path,
     trt_profile: Option<&TrtShapeProfile>,
+    device_id: i32,
 ) -> Result<ort::session::Session> {
-    session_builder_with_eps(trt_cache_dir, trt_profile)?
+    session_builder_with_eps(trt_cache_dir, trt_profile, device_id)?
         .commit_from_file(model_path)
         .map_err(|e| anyhow!("ort commit_from_file {}: {e}", model_path.display()))
 }
@@ -347,8 +446,9 @@ pub fn build_ort_session_from_memory(
     model_bytes: &[u8],
     trt_cache_dir: &std::path::Path,
     trt_profile: Option<&TrtShapeProfile>,
+    device_id: i32,
 ) -> Result<ort::session::Session> {
-    session_builder_with_eps(trt_cache_dir, trt_profile)?
+    session_builder_with_eps(trt_cache_dir, trt_profile, device_id)?
         .commit_from_memory(model_bytes)
         .map_err(|e| anyhow!("ort commit_from_memory: {e}"))
 }
@@ -356,6 +456,7 @@ pub fn build_ort_session_from_memory(
 fn session_builder_with_eps(
     trt_cache_dir: &std::path::Path,
     trt_profile: Option<&TrtShapeProfile>,
+    device_id: i32,
 ) -> Result<ort::session::builder::SessionBuilder> {
     use ort::ep::{ExecutionProvider, ExecutionProviderDispatch};
     use ort::session::Session;
@@ -374,6 +475,7 @@ fn session_builder_with_eps(
             );
         }
         let mut trt = ort::ep::TensorRT::default()
+            .with_device_id(device_id)
             .with_engine_cache(true)
             .with_engine_cache_path(trt_cache_dir.to_string_lossy().to_string())
             .with_timing_cache(true)
@@ -391,12 +493,13 @@ fn session_builder_with_eps(
         }
         eps.push(trt.build());
         // CUDA — dotychczasowa, działająca ścieżka; teraz MIĘKKO (bez
-        // error_on_failure), bo poprzedza ją TensorRT.
-        eps.push(ort::ep::CUDA::default().build());
+        // error_on_failure), bo poprzedza ją TensorRT. Ten sam `device_id` co TRT,
+        // żeby fallback TRT→CUDA został na tej samej karcie.
+        eps.push(ort::ep::CUDA::default().with_device_id(device_id).build());
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (trt_cache_dir, trt_profile);
+        let _ = (trt_cache_dir, trt_profile, device_id);
         // CoreML (Metal/ANE) — akceleracja na Apple Silicon.
         eps.push(ort::ep::CoreML::default().build());
     }
@@ -547,7 +650,10 @@ fn message_string_field(msg: &[u8], field_no: u64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{onnx_first_input_name, pool_size_from_env, RoundRobin, TrtShapeProfile};
+    use super::{
+        onnx_first_input_name, parse_gpu_set, pool_size_from_env, session_cache_subdir, RoundRobin,
+        TrtShapeProfile,
+    };
 
     /// Round-robin cursor: len 1 always yields index 0; len 3 cycles
     /// 0,1,2,0,... — the pool's load-spread contract at any size.
@@ -627,6 +733,56 @@ mod tests {
         // Graph present but with no inputs.
         let model = len_field(7, &[]);
         assert_eq!(onnx_first_input_name(&model), None);
+    }
+
+    /// GPU-set grammar: unset/empty/garbage → single device 0; a bare count → a
+    /// 0-based dense range; an explicit comma list → those ids (dedup, ordered).
+    #[test]
+    fn gpu_set_parses_grammar() {
+        assert_eq!(parse_gpu_set(None), vec![0]);
+        assert_eq!(parse_gpu_set(Some("")), vec![0]);
+        assert_eq!(parse_gpu_set(Some("   ")), vec![0]);
+        // Bare count → devices 0..N.
+        assert_eq!(parse_gpu_set(Some("2")), vec![0, 1]);
+        assert_eq!(parse_gpu_set(Some(" 4 ")), vec![0, 1, 2, 3]);
+        // Explicit list → exactly those ids, order preserved.
+        assert_eq!(parse_gpu_set(Some("0,2,3")), vec![0, 2, 3]);
+        assert_eq!(parse_gpu_set(Some(" 3 , 1 ")), vec![3, 1]);
+        // Dedup within a list.
+        assert_eq!(parse_gpu_set(Some("1,1,2")), vec![1, 2]);
+        // Garbage / non-positive count / negatives → safe single-GPU default.
+        assert_eq!(parse_gpu_set(Some("not-a-number")), vec![0]);
+        assert_eq!(parse_gpu_set(Some("0")), vec![0]);
+        assert_eq!(parse_gpu_set(Some("-3")), vec![0]);
+        // A list of only-garbage collapses to the default; valid ids survive.
+        assert_eq!(parse_gpu_set(Some("x,y")), vec![0]);
+        assert_eq!(parse_gpu_set(Some("x,1,-2,3")), vec![1, 3]);
+        // Count clamps to MAX_VISION_GPUS.
+        assert_eq!(parse_gpu_set(Some("9999")).len(), super::MAX_VISION_GPUS);
+    }
+
+    /// Session→device round-robin: 8 sessions over 2 GPUs alternate 0,1,0,1,…;
+    /// over an explicit `[0,2,3]` set they cycle 0,2,3,0,2,…. This is exactly the
+    /// `gpus[i % gpus.len()]` mapping `build_session_pool_from_file` applies.
+    #[test]
+    fn sessions_map_round_robin_to_devices() {
+        let gpus = [0, 1];
+        let assigned: Vec<i32> = (0..8).map(|i| gpus[i % gpus.len()]).collect();
+        assert_eq!(assigned, vec![0, 1, 0, 1, 0, 1, 0, 1]);
+
+        let gpus = [0, 2, 3];
+        let assigned: Vec<i32> = (0..7).map(|i| gpus[i % gpus.len()]).collect();
+        assert_eq!(assigned, vec![0, 2, 3, 0, 2, 3, 0]);
+    }
+
+    /// Cache subdir keeps the historical `s<i>` for device 0 (no cache
+    /// invalidation for single-GPU deployments) and namespaces other devices.
+    #[test]
+    fn cache_subdir_preserves_device0_and_namespaces_others() {
+        assert_eq!(session_cache_subdir(0, 0), "s0");
+        assert_eq!(session_cache_subdir(0, 3), "s3");
+        assert_eq!(session_cache_subdir(1, 0), "d1_s0");
+        assert_eq!(session_cache_subdir(2, 5), "d2_s5");
     }
 
     #[test]

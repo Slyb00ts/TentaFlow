@@ -131,7 +131,7 @@ fn bench_cpu_vs_trt(c: &mut Criterion) {
         height: RESOLUTION as u32,
         width: RESOLUTION as u32,
     };
-    match ort_common::build_ort_session(&model_path, &trt_cache, Some(&profile)) {
+    match ort_common::build_ort_session(&model_path, &trt_cache, Some(&profile), 0) {
         Ok(mut session) => bench_session(c, "rfdetr_fp16_trt", &mut session),
         Err(e) => eprintln!("onnx_cv_trt: skipping TRT bench — session build failed: {e}"),
     }
@@ -214,7 +214,7 @@ fn bench_concurrent_sessions(c: &mut Criterion) {
         width: RESOLUTION as u32,
     };
     let build = || -> ort::session::Session {
-        ort_common::build_ort_session_from_memory(&model_bytes, &trt_cache, Some(&profile))
+        ort_common::build_ort_session_from_memory(&model_bytes, &trt_cache, Some(&profile), 0)
             .expect("build session")
     };
 

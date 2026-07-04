@@ -131,12 +131,14 @@ impl RfDetrDetector {
                 DETECTOR_SESSIONS_ENV,
                 DEFAULT_DETECTOR_SESSIONS,
             );
-            // Every pooled session is a full model copy on the GPU, so a build
+            // Every pooled session is a full model copy on ITS GPU, so a build
             // failure past the first is almost certainly VRAM exhaustion. Fail
-            // LOUDLY naming the pool size + VRAM math and refuse to fall back to
-            // fewer sessions — a silent degrade would mask a misconfigured
-            // `TENTAFLOW_VISION_DETECTOR_SESSIONS` (per-slot cache subdir `s<i>/`
-            // in the error identifies which session's engine build OOM'd).
+            // LOUDLY naming the pool size + per-GPU VRAM math and refuse to fall
+            // back to fewer sessions — a silent degrade would mask a misconfigured
+            // `TENTAFLOW_VISION_DETECTOR_SESSIONS` / `TENTAFLOW_VISION_GPUS`. The
+            // wrapped error names the failing session slot AND its CUDA device id.
+            let gpus = crate::vision::ort_common::vision_gpu_set();
+            let per_gpu = n.div_ceil(gpus.len());
             let pool = crate::vision::ort_common::build_session_pool_from_file(
                 &onnx_path,
                 &dir.join("trt-cache"),
@@ -145,12 +147,15 @@ impl RfDetrDetector {
             )
             .map_err(|e| {
                 anyhow!(
-                    "building RF-DETR ort session pool of {n} session(s) failed: {e:#}. \
-                     Each session is a full model copy (~{DETECTOR_SESSION_VRAM_GB} GB VRAM), \
-                     so {n} sessions need ~{:.1} GB resident — a failure past the first \
-                     session is almost certainly GPU OOM. Lower {DETECTOR_SESSIONS_ENV} \
-                     (currently {n}); NOT falling back to fewer sessions.",
-                    n as f32 * DETECTOR_SESSION_VRAM_GB
+                    "building RF-DETR ort session pool of {n} session(s) across {n_gpus} GPU(s) \
+                     {gpus:?} failed: {e:#}. Each session is a full model copy \
+                     (~{DETECTOR_SESSION_VRAM_GB} GB VRAM); sessions spread round-robin, so up to \
+                     {per_gpu} land on one GPU needing ~{per_gpu_gb:.1} GB resident PER DEVICE — a \
+                     failure past the first session on a device is almost certainly GPU OOM. Lower \
+                     {DETECTOR_SESSIONS_ENV} (currently {n}) or add GPUs via TENTAFLOW_VISION_GPUS; \
+                     NOT falling back to fewer sessions.",
+                    n_gpus = gpus.len(),
+                    per_gpu_gb = per_gpu as f32 * DETECTOR_SESSION_VRAM_GB
                 )
             })?;
             info!(
