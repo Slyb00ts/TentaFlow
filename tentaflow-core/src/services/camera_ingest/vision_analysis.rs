@@ -85,21 +85,52 @@ pub(crate) async fn get_detector() -> Option<std::sync::Arc<Mutex<RfDetrDetector
         .clone()
 }
 
+/// Handle to the process-wide classifier/OCR singletons. On the ort path
+/// (`inference-supertonic`) the runner is internally pooled + `&self` + Send+Sync,
+/// so it is shared bare as `Arc<_>` and every crop rides the concurrency-safe ort
+/// pool off the single Burn/wgpu thread. On the Burn path the runner still needs
+/// the whole-process wgpu serialization, so it stays behind `Arc<Mutex<_>>` and
+/// callers funnel forwards through `burn_backend::run_blocking`.
+#[cfg(feature = "inference-supertonic")]
+pub(crate) type ClassifierHandle = std::sync::Arc<StateClassifier>;
+#[cfg(not(feature = "inference-supertonic"))]
+pub(crate) type ClassifierHandle = std::sync::Arc<Mutex<StateClassifier>>;
+#[cfg(feature = "inference-supertonic")]
+pub(crate) type OcrHandle = std::sync::Arc<PlateOcr>;
+#[cfg(not(feature = "inference-supertonic"))]
+pub(crate) type OcrHandle = std::sync::Arc<Mutex<PlateOcr>>;
+
+#[cfg(feature = "inference-supertonic")]
+fn wrap_classifier(c: StateClassifier) -> ClassifierHandle {
+    std::sync::Arc::new(c)
+}
+#[cfg(not(feature = "inference-supertonic"))]
+fn wrap_classifier(c: StateClassifier) -> ClassifierHandle {
+    std::sync::Arc::new(Mutex::new(c))
+}
+#[cfg(feature = "inference-supertonic")]
+fn wrap_ocr(o: PlateOcr) -> OcrHandle {
+    std::sync::Arc::new(o)
+}
+#[cfg(not(feature = "inference-supertonic"))]
+fn wrap_ocr(o: PlateOcr) -> OcrHandle {
+    std::sync::Arc::new(Mutex::new(o))
+}
+
 /// Process-wide state classifier, loaded on first use with the same lazy
 /// `OnceCell` + `spawn_blocking` pattern as the detector. A failed load is
 /// `None` for the process lifetime: detections still publish, just without a
 /// `stan` (condition is skipped, never a crash).
-fn classifier() -> &'static OnceCell<Option<std::sync::Arc<Mutex<StateClassifier>>>> {
-    static CLASSIFIER: OnceCell<Option<std::sync::Arc<Mutex<StateClassifier>>>> =
-        OnceCell::const_new();
+fn classifier() -> &'static OnceCell<Option<ClassifierHandle>> {
+    static CLASSIFIER: OnceCell<Option<ClassifierHandle>> = OnceCell::const_new();
     &CLASSIFIER
 }
 
-pub(crate) async fn get_classifier() -> Option<std::sync::Arc<Mutex<StateClassifier>>> {
+pub(crate) async fn get_classifier() -> Option<ClassifierHandle> {
     classifier()
         .get_or_init(|| async {
             tokio::task::spawn_blocking(|| match StateClassifier::load() {
-                Ok(c) => Some(std::sync::Arc::new(Mutex::new(c))),
+                Ok(c) => Some(wrap_classifier(c)),
                 Err(e) => {
                     warn!("[vision_analysis] state classifier load failed, stan skipped: {e:#}");
                     None
@@ -116,16 +147,16 @@ pub(crate) async fn get_classifier() -> Option<std::sync::Arc<Mutex<StateClassif
 /// `OnceCell` + `spawn_blocking` pattern as the detector. A failed load is
 /// `None` for the process lifetime: detections still publish, just without
 /// `tekst` (OCR is skipped, never a crash).
-fn ocr() -> &'static OnceCell<Option<std::sync::Arc<Mutex<PlateOcr>>>> {
-    static OCR: OnceCell<Option<std::sync::Arc<Mutex<PlateOcr>>>> = OnceCell::const_new();
+fn ocr() -> &'static OnceCell<Option<OcrHandle>> {
+    static OCR: OnceCell<Option<OcrHandle>> = OnceCell::const_new();
     &OCR
 }
 
-pub(crate) async fn get_ocr() -> Option<std::sync::Arc<Mutex<PlateOcr>>> {
+pub(crate) async fn get_ocr() -> Option<OcrHandle> {
     ocr()
         .get_or_init(|| async {
             tokio::task::spawn_blocking(|| match PlateOcr::load() {
-                Ok(o) => Some(std::sync::Arc::new(Mutex::new(o))),
+                Ok(o) => Some(wrap_ocr(o)),
                 Err(e) => {
                     warn!("[vision_analysis] plate OCR load failed, tekst skipped: {e:#}");
                     None

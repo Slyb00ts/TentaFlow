@@ -494,6 +494,13 @@ required-features = ["inference-supertonic"]
 name = "agent_run_inline_region_e2e"
 required-features = ["test-support"]
 
+# ort-backed state classifier + plate OCR: load pool + run one forward on a real
+# model. `#[ignore]`, env-gated (`TENTAFLOW_VISION_ORT_TEST=<home dir>`) — needs
+# the ort dylib + provisioned model files (falls back to CPU EP without a GPU).
+[[test]]
+name = "vision_ort_runners_e2e"
+required-features = ["inference-vision-gpu", "inference-supertonic"]
+
 [patch.crates-io]
 llama-cpp-sys-2 = { path = "../vendor/crates/llama-cpp-sys-2" }
 sherpa-rs-sys = { path = "../vendor/crates/sherpa-rs-sys" }

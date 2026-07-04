@@ -22,7 +22,6 @@
 #![cfg(feature = "inference-supertonic")]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -32,6 +31,7 @@ use tracing::info;
 use crate::db::repository::VisionModelRow;
 use crate::paths;
 use crate::services::runtime::local_cv::CvFrameLocal;
+use crate::vision::ort_common::SessionPool;
 use tentaflow_protocol::{CameraCvResult, CvDetection};
 
 /// Env var capping the number of resident ort model entries (LRU eviction).
@@ -47,18 +47,16 @@ const DEFAULT_MAX_SESSIONS: usize = 4;
 /// is byte-identical to the historical single-`Mutex<Session>` behavior.
 const SESSIONS_PER_MODEL_ENV: &str = "TENTAFLOW_ONNX_CV_SESSIONS_PER_MODEL";
 const DEFAULT_SESSIONS_PER_MODEL: usize = 1;
-const MAX_SESSIONS_PER_MODEL: usize = 16;
 
 /// Parsed-once pool size from [`SESSIONS_PER_MODEL_ENV`], clamped to
-/// `1..=MAX_SESSIONS_PER_MODEL`.
+/// `1..=ort_common::MAX_SESSIONS_PER_MODEL`.
 fn sessions_per_model() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var(SESSIONS_PER_MODEL_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(DEFAULT_SESSIONS_PER_MODEL)
-            .clamp(1, MAX_SESSIONS_PER_MODEL)
+        crate::vision::ort_common::pool_size_from_env(
+            SESSIONS_PER_MODEL_ENV,
+            DEFAULT_SESSIONS_PER_MODEL,
+        )
     })
 }
 
@@ -111,79 +109,6 @@ impl PreprocessSpec {
 enum Contract {
     Rfdetr,
     Softmax,
-}
-
-/// Round-robin cursor over a pool of `len` sessions, separated from the
-/// sessions themselves so the wrap-around is unit-testable without ort/GPU.
-struct RoundRobin {
-    next: AtomicUsize,
-    len: usize,
-}
-
-impl RoundRobin {
-    fn new(len: usize) -> Self {
-        Self {
-            next: AtomicUsize::new(0),
-            len: len.max(1),
-        }
-    }
-
-    /// Next slot index, wrapping modulo `len`. `Relaxed` is enough: the cursor
-    /// only spreads load, it guards no data (each session has its own Mutex).
-    fn pick(&self) -> usize {
-        self.next.fetch_add(1, Ordering::Relaxed) % self.len
-    }
-}
-
-/// N independent ort sessions of the SAME model, checked out round-robin so
-/// concurrent forwards don't serialize on one `Mutex<Session>`. Each session is
-/// built from identical (sha256-verified) ONNX bytes; `Session::run` needs
-/// `&mut self`, hence one Mutex per session rather than one shared session. With
-/// a single session (`SESSIONS_PER_MODEL=1`) `checkout` always locks index 0 —
-/// exactly the historical single-Mutex path, zero behavioral change.
-struct SessionPool {
-    sessions: Vec<Mutex<ort::session::Session>>,
-    cursor: RoundRobin,
-    /// Set once any pooled session's Mutex is found poisoned (a panic mid-`run`).
-    /// An `ort::Session` owns FFI/provider state that a panicked forward may have
-    /// left inconsistent, so a poisoned pool is treated as dead: checkout errors
-    /// and `get_or_load` evicts + rebuilds the whole pool fresh.
-    poisoned: std::sync::atomic::AtomicBool,
-}
-
-impl SessionPool {
-    fn new(sessions: Vec<ort::session::Session>) -> Self {
-        let len = sessions.len();
-        Self {
-            sessions: sessions.into_iter().map(Mutex::new).collect(),
-            cursor: RoundRobin::new(len),
-            poisoned: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.sessions.len()
-    }
-
-    fn is_poisoned(&self) -> bool {
-        self.poisoned.load(Ordering::Acquire)
-    }
-
-    /// Picks the next session round-robin and locks it. If that session is busy
-    /// the caller blocks on its Mutex (never busy-loops); other pool sessions
-    /// stay free for other callers. A poisoned Mutex (panic mid-`run`) does NOT
-    /// recover-and-reuse: the pool is marked dead and an error is returned so
-    /// `get_or_load` rebuilds it — never hand out a possibly-corrupt ort session.
-    fn checkout(&self) -> Result<std::sync::MutexGuard<'_, ort::session::Session>> {
-        if self.is_poisoned() {
-            bail!("onnx-cv: session pool poisoned by a prior panicked forward — reload required");
-        }
-        let idx = self.cursor.pick();
-        self.sessions[idx].lock().map_err(|_| {
-            self.poisoned.store(true, Ordering::Release);
-            anyhow!("onnx-cv: session poisoned by a panicked forward — reload required")
-        })
-    }
 }
 
 /// One resident model: a pool of ort sessions + everything postprocess needs.
@@ -708,23 +633,6 @@ mod tests {
         assert!(
             PreprocessSpec::parse(r#"{"resolution":224,"std":[0.0,0.2,0.2]}"#).is_err()
         );
-    }
-
-    /// Round-robin cursor: len 1 always yields index 0; len 3 cycles
-    /// 0,1,2,0,... — the pool's load-spread contract at any size.
-    #[test]
-    fn round_robin_wraps_over_len() {
-        let rr = RoundRobin::new(1);
-        assert_eq!([rr.pick(), rr.pick(), rr.pick()], [0, 0, 0]);
-        let rr = RoundRobin::new(3);
-        assert_eq!(
-            [rr.pick(), rr.pick(), rr.pick(), rr.pick(), rr.pick()],
-            [0, 1, 2, 0, 1]
-        );
-        // A zero-length pool is impossible (builder clamps ≥1), but the cursor
-        // must not divide by zero if constructed with 0.
-        let rr = RoundRobin::new(0);
-        assert_eq!(rr.pick(), 0);
     }
 
     #[test]

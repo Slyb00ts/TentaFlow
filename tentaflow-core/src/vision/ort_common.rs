@@ -11,7 +11,10 @@
 
 #![cfg(feature = "inference-supertonic")]
 
-use anyhow::{anyhow, Result};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+use anyhow::{anyhow, bail, Result};
 use tracing::{info, warn};
 
 /// Domyślna ścieżka biblioteki ONNX Runtime dla dlopen (`ort` z `load-dynamic`),
@@ -145,6 +148,173 @@ impl TrtShapeProfile {
             self.input_name, batch, self.channels, self.height, self.width
         )
     }
+}
+
+/// Hard ceiling on any model's session-pool size, shared by every ort runner
+/// (dynamic `onnx-cv` models and the fixed camera-CV engines). Bounds resident
+/// VRAM: N pooled sessions = N model copies on the GPU.
+pub const MAX_SESSIONS_PER_MODEL: usize = 16;
+
+/// Reads a session-pool size from `env_var`, clamped to `1..=MAX_SESSIONS_PER_MODEL`.
+/// Default `1` is byte-identical to a single-`Mutex<Session>` path (checkout
+/// always locks slot 0), so the historical serialized behavior is the default.
+pub fn pool_size_from_env(env_var: &str, default: usize) -> usize {
+    std::env::var(env_var)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(1, MAX_SESSIONS_PER_MODEL)
+}
+
+/// Round-robin cursor over a pool of `len` sessions, separated from the sessions
+/// themselves so the wrap-around is unit-testable without ort/GPU.
+pub struct RoundRobin {
+    next: AtomicUsize,
+    len: usize,
+}
+
+impl RoundRobin {
+    pub fn new(len: usize) -> Self {
+        Self {
+            next: AtomicUsize::new(0),
+            len: len.max(1),
+        }
+    }
+
+    /// Next slot index, wrapping modulo `len`. `Relaxed` is enough: the cursor
+    /// only spreads load, it guards no data (each session has its own Mutex).
+    pub fn pick(&self) -> usize {
+        self.next.fetch_add(1, Ordering::Relaxed) % self.len
+    }
+}
+
+/// N independent ort sessions of the SAME model, checked out round-robin so
+/// concurrent forwards don't serialize on one `Mutex<Session>`. `Session::run`
+/// needs `&mut self`, hence one Mutex per session rather than one shared session.
+/// With a single session (pool size 1) `checkout` always locks index 0 —
+/// exactly the historical single-Mutex path, zero behavioral change.
+///
+/// Shared by the dynamic `onnx-cv` registry runner and the fixed camera-CV
+/// engines (state classifier, plate OCR) so all ort forwards ride the same
+/// concurrency-safe path off the single-threaded Burn/wgpu executor.
+///
+/// Poison recovery differs by owner. A panic mid-`run` poisons that session's
+/// Mutex (its `ort::Session` may hold inconsistent FFI/provider state):
+///   * With a `rebuilder` (fixed engines, always the SAME model) `checkout`
+///     rebuilds JUST that session in place from the same ONNX on the next use,
+///     so one panic never permanently disables the runner — the process-lifetime
+///     `OnceCell<Arc<_>>` singleton self-heals without a restart.
+///   * Without a rebuilder (`onnx-cv` registry) the pool latches `poisoned` and
+///     `checkout` errors "reload required"; `onnx-cv`'s cache evicts + rebuilds
+///     the whole entry via its LRU (unchanged behavior).
+pub struct SessionPool {
+    sessions: Vec<Mutex<ort::session::Session>>,
+    cursor: RoundRobin,
+    /// Latched only for rebuilder-less pools (`onnx-cv`) — see type docs.
+    poisoned: AtomicBool,
+    /// Builds a fresh session for slot `i` (its own engine-cache subdir). `Some`
+    /// only for fixed engines that always reload the identical model, enabling
+    /// in-place per-session recovery instead of a permanent dead pool.
+    #[allow(clippy::type_complexity)]
+    rebuilder: Option<Box<dyn Fn(usize) -> Result<ort::session::Session> + Send + Sync>>,
+}
+
+impl SessionPool {
+    pub fn new(sessions: Vec<ort::session::Session>) -> Self {
+        let len = sessions.len();
+        Self {
+            sessions: sessions.into_iter().map(Mutex::new).collect(),
+            cursor: RoundRobin::new(len),
+            poisoned: AtomicBool::new(false),
+            rebuilder: None,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    /// Picks the next session round-robin and locks it. If that session is busy
+    /// the caller blocks on its Mutex (never busy-loops); other pool sessions
+    /// stay free for other callers.
+    ///
+    /// On a poisoned Mutex (panic mid-`run`): a rebuilder-backed pool rebuilds
+    /// that one session in place from the same model and hands out the fresh
+    /// guard (self-healing); a rebuilder-less pool latches `poisoned` and errors
+    /// so the owner rebuilds the whole entry.
+    pub fn checkout(&self) -> Result<std::sync::MutexGuard<'_, ort::session::Session>> {
+        // Rebuilder-less pools stay dead once latched; rebuilder-backed pools
+        // never latch, so this only short-circuits the `onnx-cv` path.
+        if self.rebuilder.is_none() && self.is_poisoned() {
+            bail!("ort session pool poisoned by a prior panicked forward — reload required");
+        }
+        let idx = self.cursor.pick();
+        match self.sessions[idx].lock() {
+            Ok(guard) => Ok(guard),
+            Err(poison) => match &self.rebuilder {
+                Some(rebuild) => {
+                    // Recover the guard (the mutexed data is still there, just
+                    // flagged), swap in a fresh session, clear the flag.
+                    let mut guard = poison.into_inner();
+                    *guard = rebuild(idx).map_err(|e| {
+                        anyhow!("rebuild poisoned ort session slot {idx}: {e}")
+                    })?;
+                    self.sessions[idx].clear_poison();
+                    warn!("[ort] rebuilt poisoned session slot {idx} in place after a panicked forward");
+                    Ok(guard)
+                }
+                None => {
+                    self.poisoned.store(true, Ordering::Release);
+                    bail!("ort session poisoned by a panicked forward — reload required");
+                }
+            },
+        }
+    }
+}
+
+/// Builds a pool of `n` independent ort sessions from one on-disk ONNX model.
+/// Each session gets its OWN TensorRT engine-cache subdir (`<cache_root>/s{i}`):
+/// the lazy (unprofiled) TRT path compiles engines on the FIRST FORWARD, so once
+/// sessions run concurrently (n>1) they must never share a cache dir. `n` is
+/// clamped to `1..=MAX_SESSIONS_PER_MODEL`.
+///
+/// The pool carries a rebuilder (same model path + per-slot cache + profile) so
+/// a session poisoned by a panicked forward is rebuilt in place on next use —
+/// the fixed runner always loads the identical model, so this is safe.
+pub fn build_session_pool_from_file(
+    model_path: &std::path::Path,
+    cache_root: &std::path::Path,
+    trt_profile: Option<&TrtShapeProfile>,
+    n: usize,
+) -> Result<SessionPool> {
+    let n = n.clamp(1, MAX_SESSIONS_PER_MODEL);
+    let build_slot = {
+        let model_path = model_path.to_path_buf();
+        let cache_root = cache_root.to_path_buf();
+        let trt_profile = trt_profile.cloned();
+        move |i: usize| -> Result<ort::session::Session> {
+            build_ort_session(&model_path, &cache_root.join(format!("s{i}")), trt_profile.as_ref())
+        }
+    };
+    let mut sessions = Vec::with_capacity(n);
+    for i in 0..n {
+        sessions.push(build_slot(i)?);
+    }
+    let len = sessions.len();
+    Ok(SessionPool {
+        sessions: sessions.into_iter().map(Mutex::new).collect(),
+        cursor: RoundRobin::new(len),
+        poisoned: AtomicBool::new(false),
+        rebuilder: Some(Box::new(build_slot)),
+    })
 }
 
 /// Buduje sesję `ort` z modelu ONNX, rejestrując łańcuch execution providerów w
@@ -377,7 +547,42 @@ fn message_string_field(msg: &[u8], field_no: u64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{onnx_first_input_name, TrtShapeProfile};
+    use super::{onnx_first_input_name, pool_size_from_env, RoundRobin, TrtShapeProfile};
+
+    /// Round-robin cursor: len 1 always yields index 0; len 3 cycles
+    /// 0,1,2,0,... — the pool's load-spread contract at any size.
+    #[test]
+    fn round_robin_wraps_over_len() {
+        let rr = RoundRobin::new(1);
+        assert_eq!([rr.pick(), rr.pick(), rr.pick()], [0, 0, 0]);
+        let rr = RoundRobin::new(3);
+        assert_eq!(
+            [rr.pick(), rr.pick(), rr.pick(), rr.pick(), rr.pick()],
+            [0, 1, 2, 0, 1]
+        );
+        // A zero-length pool is impossible (builder clamps ≥1), but the cursor
+        // must not divide by zero if constructed with 0.
+        let rr = RoundRobin::new(0);
+        assert_eq!(rr.pick(), 0);
+    }
+
+    /// Pool size parses from env and clamps to `1..=MAX`; an unset/garbage var
+    /// falls back to the default (never 0).
+    #[test]
+    fn pool_size_parses_and_clamps() {
+        let var = "TENTAFLOW_TEST_POOL_SIZE_KNOB";
+        std::env::remove_var(var);
+        assert_eq!(pool_size_from_env(var, 1), 1);
+        std::env::set_var(var, "4");
+        assert_eq!(pool_size_from_env(var, 1), 4);
+        std::env::set_var(var, "0");
+        assert_eq!(pool_size_from_env(var, 1), 1);
+        std::env::set_var(var, "999");
+        assert_eq!(pool_size_from_env(var, 1), super::MAX_SESSIONS_PER_MODEL);
+        std::env::set_var(var, "not-a-number");
+        assert_eq!(pool_size_from_env(var, 2), 2);
+        std::env::remove_var(var);
+    }
 
     /// Encodes one length-delimited protobuf field (`field << 3 | 2`).
     fn len_field(field: u64, payload: &[u8]) -> Vec<u8> {

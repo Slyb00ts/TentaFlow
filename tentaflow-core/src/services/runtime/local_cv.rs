@@ -154,15 +154,36 @@ async fn detect_local(
     Ok(CameraCvResult::Detections { per_frame })
 }
 
-/// Klasyfikacja stanu na cropie — singleton `vision_analysis::get_classifier`,
-/// forward przez `burn_backend::run_blocking` (jeden forward GPU naraz).
-#[cfg(feature = "inference-vision-gpu")]
+/// Klasyfikacja stanu na cropie (ort) — singleton `vision_analysis::get_classifier`
+/// jest wewnętrznie pulowany (`&self`, Send+Sync), więc forward idzie przez
+/// zwykły `spawn_blocking` z puli ort, a NIE przez jednowątkowy egzekutor
+/// Burn/wgpu — cold-path nie serializuje się na tym wątku ani nie konkuruje z
+/// detektorem.
+#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+async fn classify_local(crop: CvFrameLocal) -> Result<CameraCvResult, String> {
+    let classifier = crate::services::camera_ingest::vision_analysis::get_classifier()
+        .await
+        .ok_or_else(|| "klasyfikator stanu niedostępny (load nie powiódł się)".to_string())?;
+    let stan = tokio::task::spawn_blocking(move || {
+        classifier
+            .classify(&crop.data, crop.width, crop.height)
+            .map_err(|e| format!("classify: {e:#}"))
+    })
+    .await
+    .map_err(|e| format!("camera-cv classify executor: {e}"))??;
+    Ok(CameraCvResult::Labels { stan })
+}
+
+/// Klasyfikacja stanu na cropie (Burn) — singleton `vision_analysis::get_classifier`,
+/// forward przez `burn_backend::run_blocking` (jeden forward GPU naraz — wgpu psuje
+/// pamięć przy równoległych forwardach).
+#[cfg(all(feature = "inference-vision-gpu", not(feature = "inference-supertonic")))]
 async fn classify_local(crop: CvFrameLocal) -> Result<CameraCvResult, String> {
     let classifier = crate::services::camera_ingest::vision_analysis::get_classifier()
         .await
         .ok_or_else(|| "klasyfikator stanu niedostępny (load nie powiódł się)".to_string())?;
     let stan = crate::vision::burn_backend::run_blocking(move || {
-        let mut guard = classifier.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = classifier.lock().unwrap_or_else(|e| e.into_inner());
         guard
             .classify(&crop.data, crop.width, crop.height)
             .map_err(|e| format!("classify: {e:#}"))
@@ -172,16 +193,37 @@ async fn classify_local(crop: CvFrameLocal) -> Result<CameraCvResult, String> {
     Ok(CameraCvResult::Labels { stan })
 }
 
-/// OCR tablic na cropie — singleton `vision_analysis::get_ocr`, forward przez
-/// `burn_backend::run_blocking` (jeden forward GPU naraz). Tryb `Adr` używa
-/// dedykowanej ścieżki `read_adr`; `Plate` i `Generic` idą przez `read`.
-#[cfg(feature = "inference-vision-gpu")]
+/// OCR tablic na cropie (ort) — pulowany singleton `vision_analysis::get_ocr`
+/// (`&self`), forward przez `spawn_blocking` z puli ort (poza wątkiem Burn/wgpu).
+/// Tryb `Adr` używa dedykowanej ścieżki `read_adr`; `Plate`/`Generic` idą przez `read`.
+#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+async fn ocr_local(crop: CvFrameLocal, mode: CvOcrMode) -> Result<CameraCvResult, String> {
+    let ocr = crate::services::camera_ingest::vision_analysis::get_ocr()
+        .await
+        .ok_or_else(|| "OCR tablic niedostępny (load nie powiódł się)".to_string())?;
+    let tekst = tokio::task::spawn_blocking(move || {
+        match mode {
+            CvOcrMode::Adr => ocr.read_adr(&crop.data, crop.width, crop.height),
+            CvOcrMode::Plate | CvOcrMode::Generic => {
+                ocr.read(&crop.data, crop.width, crop.height)
+            }
+        }
+        .map_err(|e| format!("ocr: {e:#}"))
+    })
+    .await
+    .map_err(|e| format!("camera-cv ocr executor: {e}"))??;
+    Ok(CameraCvResult::Text { tekst })
+}
+
+/// OCR tablic na cropie (Burn) — singleton `vision_analysis::get_ocr`, forward
+/// przez `burn_backend::run_blocking` (jeden forward GPU naraz).
+#[cfg(all(feature = "inference-vision-gpu", not(feature = "inference-supertonic")))]
 async fn ocr_local(crop: CvFrameLocal, mode: CvOcrMode) -> Result<CameraCvResult, String> {
     let ocr = crate::services::camera_ingest::vision_analysis::get_ocr()
         .await
         .ok_or_else(|| "OCR tablic niedostępny (load nie powiódł się)".to_string())?;
     let tekst = crate::vision::burn_backend::run_blocking(move || {
-        let mut guard = ocr.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = ocr.lock().unwrap_or_else(|e| e.into_inner());
         match mode {
             CvOcrMode::Adr => guard.read_adr(&crop.data, crop.width, crop.height),
             CvOcrMode::Plate | CvOcrMode::Generic => {
