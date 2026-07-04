@@ -41,6 +41,20 @@ const RESOLUTION: u32 = 560;
 #[cfg(feature = "inference-supertonic")]
 const INPUT_NAME: &str = "input";
 
+/// Env sterujący rozmiarem puli sesji ort detektora — hot path CV. Domyślnie 1 =
+/// ścieżka bit-identyczna z pojedynczą sesją (jeden forward naraz, checkout zawsze
+/// bierze slot 0), a >1 pozwala wielu batchowanym forwardom RF-DETR liczyć się
+/// równolegle na GPU (każda sesja to własna kopia modelu ≈2.6 GB VRAM).
+#[cfg(feature = "inference-supertonic")]
+const DETECTOR_SESSIONS_ENV: &str = "TENTAFLOW_VISION_DETECTOR_SESSIONS";
+#[cfg(feature = "inference-supertonic")]
+const DEFAULT_DETECTOR_SESSIONS: usize = 1;
+
+/// Przybliżony rozmiar rezydentny JEDNEJ sesji RF-DETR na GPU (do komunikatu
+/// OOM). N sesji ≈ N×tyle VRAM — patrz fail-loud w [`RfDetrDetector::load`].
+#[cfg(feature = "inference-supertonic")]
+const DETECTOR_SESSION_VRAM_GB: f32 = 2.6;
+
 /// Rozmiar batcha wkompilowany na stałe w wyeksportowany graf RF-DETR.
 /// Model przyjmuje WYŁĄCZNIE wejście `[MODEL_BATCH,3,560,560]` — mniejszy lub
 /// większy batch panikuje na stałych kształtach grafu. Klatki chunkujemy po
@@ -60,11 +74,16 @@ struct ClassesFile {
 }
 
 /// Loaded RF-DETR model + class-name table + backend device. `detect`/`detect_batch`
-/// keep `&mut self` so the cross-camera engine can hold it behind a single mutex.
+/// take `&self`: the ort path drives an internally-concurrent [`SessionPool`]
+/// (interior mutability per session), and the Burn path's `Model::forward` is
+/// already `&self` (the singleton still serializes forwards through its own Mutex
+/// + the single Burn/wgpu thread).
 pub struct RfDetrDetector {
-    /// Sesja ONNX Runtime (CUDA EP) — ścieżka ort. Tworzona RAZ w `load`.
+    /// Pula sesji ONNX Runtime (TensorRT→CUDA→CPU) — ścieżka ort. Wewnętrznie
+    /// współbieżna (round-robin `Mutex<Session>`), więc `detect_batch` bierze
+    /// `&self` i wiele forwardów może biec równolegle na GPU. Budowana RAZ w `load`.
     #[cfg(feature = "inference-supertonic")]
-    session: ort::session::Session,
+    pool: crate::vision::ort_common::SessionPool,
     #[cfg(not(feature = "inference-supertonic"))]
     model: Model<VisionBackend>,
     #[cfg(not(feature = "inference-supertonic"))]
@@ -108,18 +127,40 @@ impl RfDetrDetector {
                 height: RESOLUTION,
                 width: RESOLUTION,
             };
-            let session = crate::vision::ort_common::build_ort_session(
+            let n = crate::vision::ort_common::pool_size_from_env(
+                DETECTOR_SESSIONS_ENV,
+                DEFAULT_DETECTOR_SESSIONS,
+            );
+            // Every pooled session is a full model copy on the GPU, so a build
+            // failure past the first is almost certainly VRAM exhaustion. Fail
+            // LOUDLY naming the pool size + VRAM math and refuse to fall back to
+            // fewer sessions — a silent degrade would mask a misconfigured
+            // `TENTAFLOW_VISION_DETECTOR_SESSIONS` (per-slot cache subdir `s<i>/`
+            // in the error identifies which session's engine build OOM'd).
+            let pool = crate::vision::ort_common::build_session_pool_from_file(
                 &onnx_path,
                 &dir.join("trt-cache"),
                 Some(&trt_profile),
-            )?;
+                n,
+            )
+            .map_err(|e| {
+                anyhow!(
+                    "building RF-DETR ort session pool of {n} session(s) failed: {e:#}. \
+                     Each session is a full model copy (~{DETECTOR_SESSION_VRAM_GB} GB VRAM), \
+                     so {n} sessions need ~{:.1} GB resident — a failure past the first \
+                     session is almost certainly GPU OOM. Lower {DETECTOR_SESSIONS_ENV} \
+                     (currently {n}); NOT falling back to fewer sessions.",
+                    n as f32 * DETECTOR_SESSION_VRAM_GB
+                )
+            })?;
             info!(
-                "[rfdetr] loaded {} ({} classes, backend ort TensorRT→CUDA→CPU)",
+                "[rfdetr] loaded {} ({} classes, backend ort TensorRT→CUDA→CPU, pool={} session(s))",
                 onnx_path.display(),
-                parsed.classes.len()
+                parsed.classes.len(),
+                pool.len()
             );
             Ok(Self {
-                session,
+                pool,
                 classes: parsed.classes,
             })
         }
@@ -156,7 +197,7 @@ impl RfDetrDetector {
     /// Single-frame convenience. Delegates to `detect_batch` (N=1) so there is
     /// exactly one preprocess + postprocess code path — a single live camera
     /// gets bit-identical results to the batched fleet path.
-    pub fn detect(&mut self, rgb: &[u8], w: u32, h: u32) -> Result<Vec<Detection>> {
+    pub fn detect(&self, rgb: &[u8], w: u32, h: u32) -> Result<Vec<Detection>> {
         Ok(self
             .detect_batch(&[(rgb, w, h)], None)?
             .into_iter()
@@ -174,7 +215,7 @@ impl RfDetrDetector {
     /// == kolejność `frames`, długość wektora == `frames.len()`.
     #[cfg(feature = "inference-supertonic")]
     pub fn detect_batch(
-        &mut self,
+        &self,
         frames: &[(&[u8], u32, u32)],
         threshold: Option<f32>,
     ) -> Result<Vec<Vec<Detection>>> {
@@ -197,8 +238,11 @@ impl RfDetrDetector {
         let value = ort::value::Value::from_array(input)
             .map_err(|e| anyhow!("rfdetr-ort: Value::from_array: {e}"))?;
 
-        let outputs = self
-            .session
+        // Checkout one pooled session (round-robin). At pool size 1 this always
+        // locks slot 0 — bit-identical to the historical single `Mutex<Session>`.
+        // `Session::run` needs `&mut`, hence the per-session Mutex guard.
+        let mut session = self.pool.checkout()?;
+        let outputs = session
             .run(ort::inputs! { INPUT_NAME => value })
             .map_err(|e| anyhow!("rfdetr-ort: session.run: {e}"))?;
 
@@ -249,11 +293,14 @@ impl RfDetrDetector {
         }
 
         // Materializujemy bufory na własność, by zwolnić pożyczkę `outputs` (a przez
-        // nią `&mut self.session`) PRZED pętlą postprocessu, która potrzebuje `&self`
-        // (dostęp do `self.classes`). Kopia jest znikoma (N×queries×~22 f32).
+        // nią checked-out sesję) PRZED pętlą postprocessu. Po skopiowaniu wyjść
+        // oddajemy sesję do puli JAK NAJSZYBCIEJ (drop guarda), żeby inne forwardy
+        // mogły ją przejąć podczas naszego postprocessu. Kopia jest znikoma
+        // (N×queries×~22 f32).
         let dets_owned = dets_v.to_vec();
         let labels_owned = labels_v.to_vec();
         drop(outputs);
+        drop(session);
 
         // Wyjścia ułożone row-major `[N, queries, ...]` — slot `bi` to spójny
         // wycinek (ta sama funkcja offsetów co ścieżka Burn).
@@ -283,7 +330,7 @@ impl RfDetrDetector {
     /// a długość wektora wynikowego == `frames.len()`.
     #[cfg(not(feature = "inference-supertonic"))]
     pub fn detect_batch(
-        &mut self,
+        &self,
         frames: &[(&[u8], u32, u32)],
         threshold: Option<f32>,
     ) -> Result<Vec<Vec<Detection>>> {

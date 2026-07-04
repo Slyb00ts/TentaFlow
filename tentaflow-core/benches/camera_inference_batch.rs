@@ -15,7 +15,7 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use tentaflow_core::vision::detector_rfdetr::RfDetrDetector;
 
 fn bench_batch(c: &mut Criterion) {
-    let mut detector = match RfDetrDetector::load() {
+    let detector = match RfDetrDetector::load() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("camera_inference_batch: skipping — model not available: {e:#}");

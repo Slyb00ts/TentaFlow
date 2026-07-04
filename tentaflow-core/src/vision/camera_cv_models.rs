@@ -31,15 +31,32 @@ use crate::services::model_download::{download_with_progress, ProgressFn};
 
 /// One file in a camera-CV bundle. `remote` set → fetched from `<base>/<name>`;
 /// `embedded` set → written from the binary-embedded bytes (config sidecars).
+/// `supertonic_only` marks artifacts (the ort `.onnx` graphs) that ONLY the
+/// `inference-supertonic` build loads — a pure-Burn deploy must not require them.
 struct CvFile {
     name: &'static str,
     remote: bool,
     embedded: Option<&'static str>,
+    supertonic_only: bool,
 }
 
 struct CvBundle {
     engine_id: &'static str,
     files: &'static [CvFile],
+}
+
+impl CvBundle {
+    /// Files that apply to THIS build. On a pure-Burn build the ort-only `.onnx`
+    /// artifacts are dropped, so `ensure_bundle` never demands them from the
+    /// release URL / remote manifest (they are a supertonic-only rollout dep).
+    /// `cfg!(...)` is a plain runtime bool, so one const array serves both builds.
+    fn effective_files(&self) -> Vec<&'static CvFile> {
+        let supertonic = cfg!(feature = "inference-supertonic");
+        self.files
+            .iter()
+            .filter(|f| supertonic || !f.supertonic_only)
+            .collect()
+    }
 }
 
 const RFDETR_CLASSES: &str = include_str!("cv_assets/rfdetr-classes.json");
@@ -56,11 +73,22 @@ const BUNDLES: &[CvBundle] = &[
                 name: "rfdetr-base.bpk",
                 remote: true,
                 embedded: None,
+                supertonic_only: false,
+            },
+            CvFile {
+                // ONNX graph for the ort/TensorRT session pool. Only the supertonic
+                // build loads it — `supertonic_only` keeps it out of a pure-Burn
+                // deploy's required set (see `CvBundle::effective_files`).
+                name: "rfdetr-base.onnx",
+                remote: true,
+                embedded: None,
+                supertonic_only: true,
             },
             CvFile {
                 name: "rfdetr-classes.json",
                 remote: false,
                 embedded: Some(RFDETR_CLASSES),
+                supertonic_only: false,
             },
         ],
     },
@@ -71,11 +99,27 @@ const BUNDLES: &[CvBundle] = &[
                 name: "model_stan.bpk",
                 remote: true,
                 embedded: None,
+                supertonic_only: false,
+            },
+            CvFile {
+                // ONNX graph + its external-weights sidecar for the ort session
+                // pool. Supertonic-only (see rfdetr-base.onnx).
+                name: "model_stan.onnx",
+                remote: true,
+                embedded: None,
+                supertonic_only: true,
+            },
+            CvFile {
+                name: "model_stan.onnx.data",
+                remote: true,
+                embedded: None,
+                supertonic_only: true,
             },
             CvFile {
                 name: "stan-classes.json",
                 remote: false,
                 embedded: Some(STAN_CLASSES),
+                supertonic_only: false,
             },
         ],
     },
@@ -86,11 +130,20 @@ const BUNDLES: &[CvBundle] = &[
                 name: "plate_ocr.bpk",
                 remote: true,
                 embedded: None,
+                supertonic_only: false,
+            },
+            CvFile {
+                // ONNX graph for the ort session pool. Supertonic-only (see rfdetr).
+                name: "plate_ocr.onnx",
+                remote: true,
+                embedded: None,
+                supertonic_only: true,
             },
             CvFile {
                 name: "plate-ocr-config.json",
                 remote: false,
                 embedded: Some(PLATE_CONFIG),
+                supertonic_only: false,
             },
         ],
     },
@@ -104,6 +157,7 @@ const BUNDLES: &[CvBundle] = &[
             name: "depth-anything-v2-metric.bpk",
             remote: true,
             embedded: None,
+            supertonic_only: false,
         }],
     },
 ];
@@ -118,7 +172,7 @@ pub fn is_camera_cv_engine(engine_id: &str) -> bool {
 /// `/models/manifest` + `/models/file` endpoints to scope what a named-bundle
 /// token may serve.
 pub fn bundle_file_names(engine_id: &str) -> Option<Vec<&'static str>> {
-    bundle(engine_id).map(|b| b.files.iter().map(|f| f.name).collect())
+    bundle(engine_id).map(|b| b.effective_files().iter().map(|f| f.name).collect())
 }
 
 /// PP-OCRv5 (onnx-ocr) bundle: `(nazwa, wymagany, opcjonalny_absolutny_url)`.
@@ -240,8 +294,9 @@ pub async fn ensure_bundle(
     std::fs::create_dir_all(&dir)
         .map_err(|e| anyhow!("create {}: {}", dir.display(), e))?;
 
+    let effective = bundle.effective_files();
     let mut missing: Vec<&'static str> = Vec::new();
-    for f in bundle.files {
+    for f in &effective {
         let dest = dir.join(f.name);
 
         if let Some(contents) = f.embedded {
@@ -262,8 +317,7 @@ pub async fn ensure_bundle(
         // file is verified against the manifest — already-present files with
         // a mismatched hash are deleted and re-downloaded. Deploy-time only,
         // so the extra hashing cost is acceptable.
-        let required: Vec<&'static str> = bundle
-            .files
+        let required: Vec<&'static str> = effective
             .iter()
             .filter(|f| f.remote)
             .map(|f| f.name)

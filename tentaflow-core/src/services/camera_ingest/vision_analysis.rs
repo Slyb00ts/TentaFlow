@@ -61,18 +61,18 @@ fn interval_for_fps(fps: u32) -> Duration {
 /// `None` inside the `OnceCell` Ok means the load failed once and analysis is
 /// disabled for the process lifetime. Used by the executor's embedded local
 /// handler (`local_cv`), not directly by the analysis engine.
-fn detector() -> &'static OnceCell<Option<std::sync::Arc<Mutex<RfDetrDetector>>>> {
-    static DETECTOR: OnceCell<Option<std::sync::Arc<Mutex<RfDetrDetector>>>> = OnceCell::const_new();
+fn detector() -> &'static OnceCell<Option<DetectorHandle>> {
+    static DETECTOR: OnceCell<Option<DetectorHandle>> = OnceCell::const_new();
     &DETECTOR
 }
 
-pub(crate) async fn get_detector() -> Option<std::sync::Arc<Mutex<RfDetrDetector>>> {
+pub(crate) async fn get_detector() -> Option<DetectorHandle> {
     detector()
         .get_or_init(|| async {
-            // Loading touches the filesystem + builds an ONNX session; keep it
-            // off the async worker thread.
+            // Loading touches the filesystem + builds the ONNX session pool; keep
+            // it off the async worker thread.
             tokio::task::spawn_blocking(|| match RfDetrDetector::load() {
-                Ok(d) => Some(std::sync::Arc::new(Mutex::new(d))),
+                Ok(d) => Some(wrap_detector(d)),
                 Err(e) => {
                     warn!("[vision_analysis] RF-DETR load failed, analysis disabled: {e:#}");
                     None
@@ -92,6 +92,10 @@ pub(crate) async fn get_detector() -> Option<std::sync::Arc<Mutex<RfDetrDetector
 /// the whole-process wgpu serialization, so it stays behind `Arc<Mutex<_>>` and
 /// callers funnel forwards through `burn_backend::run_blocking`.
 #[cfg(feature = "inference-supertonic")]
+pub(crate) type DetectorHandle = std::sync::Arc<RfDetrDetector>;
+#[cfg(not(feature = "inference-supertonic"))]
+pub(crate) type DetectorHandle = std::sync::Arc<Mutex<RfDetrDetector>>;
+#[cfg(feature = "inference-supertonic")]
 pub(crate) type ClassifierHandle = std::sync::Arc<StateClassifier>;
 #[cfg(not(feature = "inference-supertonic"))]
 pub(crate) type ClassifierHandle = std::sync::Arc<Mutex<StateClassifier>>;
@@ -100,6 +104,14 @@ pub(crate) type OcrHandle = std::sync::Arc<PlateOcr>;
 #[cfg(not(feature = "inference-supertonic"))]
 pub(crate) type OcrHandle = std::sync::Arc<Mutex<PlateOcr>>;
 
+#[cfg(feature = "inference-supertonic")]
+fn wrap_detector(d: RfDetrDetector) -> DetectorHandle {
+    std::sync::Arc::new(d)
+}
+#[cfg(not(feature = "inference-supertonic"))]
+fn wrap_detector(d: RfDetrDetector) -> DetectorHandle {
+    std::sync::Arc::new(Mutex::new(d))
+}
 #[cfg(feature = "inference-supertonic")]
 fn wrap_classifier(c: StateClassifier) -> ClassifierHandle {
     std::sync::Arc::new(c)

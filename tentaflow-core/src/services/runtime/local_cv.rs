@@ -113,11 +113,52 @@ async fn onnx_cv_local(_model_name: &str, _op: CameraCvOpLocal) -> Result<Camera
     Err("onnx-cv wymaga feature 'inference-supertonic' (ONNX Runtime)".into())
 }
 
-/// Detekcja RF-DETR na batchu klatek. Używa TEGO SAMEGO procesowego singletonu
-/// co zawsze-włączony silnik kamer (`vision_analysis::get_detector`), a forward
-/// idzie przez `burn_backend::run_blocking` — pojedynczy wątek inferencji
-/// gwarantuje jeden forward GPU naraz (równoległe forwardy = korupcja stanu).
-#[cfg(feature = "inference-vision-gpu")]
+/// Detekcja RF-DETR na batchu klatek (ort) — pulowany singleton
+/// `vision_analysis::get_detector` (`&self`, Send+Sync). Forward idzie przez
+/// zwykły `spawn_blocking` z puli sesji ort (round-robin), a NIE przez
+/// jednowątkowy egzekutor Burn/wgpu ani globalny lock — wiele batchowanych
+/// forwardów detektora może biec równolegle na GPU.
+#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+async fn detect_local(
+    frames: Vec<CvFrameLocal>,
+    threshold: Option<f32>,
+) -> Result<CameraCvResult, String> {
+    use tentaflow_protocol::CvDetection;
+
+    let detector = crate::services::camera_ingest::vision_analysis::get_detector()
+        .await
+        .ok_or_else(|| "detektor RF-DETR niedostępny (load nie powiódł się)".to_string())?;
+    let batch = tokio::task::spawn_blocking(move || {
+        let refs: Vec<(&[u8], u32, u32)> = frames
+            .iter()
+            .map(|f| (&f.data[..], f.width, f.height))
+            .collect();
+        detector
+            .detect_batch(&refs, threshold)
+            .map_err(|e| format!("detect_batch: {e:#}"))
+    })
+    .await
+    .map_err(|e| format!("camera-cv detect executor: {e}"))??;
+    let per_frame = batch
+        .into_iter()
+        .map(|dets| {
+            dets.into_iter()
+                .map(|d| CvDetection {
+                    klasa: d.klasa,
+                    bbox: d.bbox,
+                    score: d.score,
+                })
+                .collect()
+        })
+        .collect();
+    Ok(CameraCvResult::Detections { per_frame })
+}
+
+/// Detekcja RF-DETR na batchu klatek (Burn) — singleton
+/// `vision_analysis::get_detector`, forward przez `burn_backend::run_blocking`
+/// (pojedynczy wątek inferencji gwarantuje jeden forward GPU naraz — równoległe
+/// forwardy wgpu = korupcja stanu).
+#[cfg(all(feature = "inference-vision-gpu", not(feature = "inference-supertonic")))]
 async fn detect_local(
     frames: Vec<CvFrameLocal>,
     threshold: Option<f32>,
@@ -132,7 +173,7 @@ async fn detect_local(
             .iter()
             .map(|f| (&f.data[..], f.width, f.height))
             .collect();
-        let mut guard = detector.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = detector.lock().unwrap_or_else(|e| e.into_inner());
         guard
             .detect_batch(&refs, threshold)
             .map_err(|e| format!("detect_batch: {e:#}"))
