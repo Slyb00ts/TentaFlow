@@ -112,14 +112,14 @@ visibility = "private"
 id = "tentavision-ocr"
 display_name = "Rozpoznawanie tekstu (OCR)"
 methods = ["recognize", "recognize_cropped"]
-suggested_default = "ppocrv5-ocr"
+suggested_default = "plate-ocr-fast"
 visibility = "private"
 
 [[alias]]
 id = "tentavision-action"
 display_name = "Klasyfikacja akcji"
 methods = ["classify_window"]
-suggested_default = "videomae-v2-rwf2k"
+suggested_default = "nalepka-stan-mnv4"
 visibility = "private"
 
 [[alias]]

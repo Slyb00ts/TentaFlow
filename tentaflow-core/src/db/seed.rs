@@ -1180,6 +1180,40 @@ fn seed_camera_cv_aliases(conn: &Connection) -> Result<()> {
             info!("seed: utworzono alias CV '{}' -> '{}'", alias, target);
         }
     }
+    // Naprawa wierszy utworzonych przez starszy manifest TentaVision, ktory
+    // rejestrowal aliasy z `suggested_default` wskazujacym model spoza katalogu
+    // (resolver konczy wtedy fatalnym AliasPrimaryMissing). INSERT OR IGNORE
+    // powyzej nie koryguje istniejacych wierszy, wiec UPDATE przepina target —
+    // ale TYLKO gdy rowna sie dokladnie zepsutemu hintowi, zeby nigdy nie
+    // nadpisac modelu podpietego recznie przez admina.
+    let repairs: &[(&str, &str, &str, Option<&str>)] = &[
+        (
+            "tentavision-ocr",
+            "ppocrv5-ocr",
+            "plate-ocr-fast",
+            Some(r#"["ppocrv5-mobile-onnx","apple-vision-ocr"]"#),
+        ),
+        (
+            "tentavision-action",
+            "videomae-v2-rwf2k",
+            "nalepka-stan-mnv4",
+            None,
+        ),
+    ];
+    let mut repair_stmt = conn.prepare(
+        "UPDATE model_aliases SET target_model = ?3, \
+         fallback_targets = COALESCE(fallback_targets, ?4) \
+         WHERE alias = ?1 AND target_model = ?2",
+    )?;
+    for (alias, broken, target, fallbacks) in repairs {
+        let updated = repair_stmt.execute(rusqlite::params![alias, broken, target, fallbacks])?;
+        if updated > 0 {
+            info!(
+                "seed: naprawiono alias CV '{}' -> '{}' (byl '{}')",
+                alias, target, broken
+            );
+        }
+    }
     Ok(())
 }
 
