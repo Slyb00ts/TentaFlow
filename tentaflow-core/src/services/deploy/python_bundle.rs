@@ -294,6 +294,23 @@ impl DeployStrategy for PythonBundleDeploy {
             extra_args.extend(spec_args);
         }
 
+        // Chat template gemma-4 (tool-calling) — absolutna sciezka do
+        // zbundlowanego szablonu; recepta vLLM podawala repo-relative
+        // `examples/...`, ktorego pip-owy vLLM nie ma. `.exists()` guard w
+        // helperze chroni deploy przed crashem gdy pliku brak.
+        if let Some(ct) = super::resolve_model_repo(&self.manifest, &self.user_config)
+            .and_then(|repo| super::vllm_native_chat_template_arg(&repo))
+        {
+            extra_args.extend(ct);
+        }
+
+        // DGX Spark (vllm-spark, sm_121a): eager + Marlin dla NVFP4. Bezwarunkowo
+        // dla tego silnika (env marlin no-op dla nie-fp4). Single-node native.
+        extra_args.extend(super::spark_engine_args(&engine_id));
+        for (k, v) in super::spark_engine_env(&engine_id) {
+            env.insert(k, v);
+        }
+
         // gpu_memory_utilization jest pojeciem specyficznym dla vllm. Inne
         // python-bundle silniki (qwen-asr, parakeet, xtts itd.) odpalaja przez
         // uvicorn / wlasny entrypoint ktore nie znaja `--gpu-memory-utilization`,

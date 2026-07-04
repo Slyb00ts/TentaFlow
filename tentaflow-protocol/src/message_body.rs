@@ -136,6 +136,12 @@ pub struct ServiceInfo {
     /// propagowane do BackendClient przez handles_cache. Puste mapy gdy
     /// service nie ma konfigurowalnych parametrow.
     pub request_time_parameters: RequestTimeParameters,
+    /// Karty GPU, na ktorych dziala serwis (z deploy configu `gpu_select_mode` +
+    /// `gpu_ids`): `"all"` = wszystkie widoczne, `"0,1"` = konkretne indeksy,
+    /// `"CPU"` = bez GPU, `""` = nieznane/nie dotyczy. `#[serde(default)]` dla
+    /// kompatybilnosci ze starszymi peerami mesh.
+    #[serde(default)]
+    pub gpu_selection: String,
 }
 
 /// Wartosci parametrow konsumowane przy kazdym requestcie do silnika.
@@ -684,6 +690,11 @@ pub struct ChatStreamRequest {
     /// starszymi peerami.
     #[serde(default)]
     pub flow_id: Option<String>,
+    /// Konwersacja UI = sesja flow. Bez tego węzły `conversation_history` /
+    /// `memory` w wybranym flow nie mają klucza sesji i twardo failują
+    /// ("no session_id"). `#[serde(default)]` — starsi peerzy wysyłają None.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -883,6 +894,11 @@ pub struct FlowSummary {
     /// instead of the synthetic no-flow chat.
     #[serde(default)]
     pub is_default: bool,
+    /// When set, the flow is exposed as a model under this id (`/v1/models`,
+    /// catalog). It is the name external clients call and the resource id the
+    /// access-key wizard must grant — the flow's own UUID is not callable.
+    #[serde(default)]
+    pub published_model_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -6957,9 +6973,14 @@ pub enum MessageBody {
         client_version: u16,
     },
     /// Serwer -> klient: potwierdzenie (accepted=false => disconnect).
+    /// `asset_build_hash` to zbiorczy SHA-256 frontu serwera — front porownuje
+    /// z wlasnym przy KAZDYM (re)connect i przy roznicy proponuje reload
+    /// (nieaktualny front po aktualizacji backendu/addonu). Rozne od
+    /// `server_version`: hash lapie zmiany JS/CSS/panelu bez zmiany protokolu.
     MetaSchemaVersionAck {
         server_version: u16,
         accepted: bool,
+        asset_build_hash: String,
     },
     /// Dwukierunkowy keepalive (WSS ping substitute, liczy RTT).
     MetaHeartbeat {
@@ -7682,6 +7703,7 @@ mod tests {
         let body = MessageBody::MetaSchemaVersionAck {
             server_version: 2,
             accepted: true,
+            asset_build_hash: "abc123def456".to_string(),
         };
         assert_eq!(round_trip(body.clone()), body);
     }
@@ -7989,6 +8011,7 @@ mod tests {
             temperature: Some(0.7),
             max_tokens: Some(256),
             flow_id: Some("flow-1".to_string()),
+            session_id: Some("sess-1".to_string()),
         });
         assert_eq!(round_trip(req.clone()), req);
 

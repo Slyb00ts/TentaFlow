@@ -203,7 +203,7 @@ async function refresh() {
   try {
     const [metrics, nodes, services, flows, models] = await Promise.allSettled([
       ApiBinary.one('dashboardMetricsRequest'),
-      ApiBinary.list('nodeListRequest'),
+      ApiBinary.list('meshNodeListRequest'),
       ApiBinary.list('serviceListRequest'),
       ApiBinary.list('flowListRequest'),
       ApiBinary.list('modelListRequest'),

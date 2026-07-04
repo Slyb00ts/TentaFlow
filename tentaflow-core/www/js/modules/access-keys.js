@@ -131,7 +131,13 @@ async function loadSubjectsAndResources() {
     .map((name) => ({ id: name, name }));
   resources = {
     model: (models || []).map((m) => ({ id: String(m.id || m.name || ''), name: String(m.name || m.id || '') })),
-    flow: (flows || []).map((f) => ({ id: String(f.id || f.name || ''), name: String(f.name || f.id || '') })),
+    // Only flows published as a model are callable via /v1, and the resource
+    // id must be the published model name (what the catalog + authorizer key
+    // on) — NOT the flow UUID. A grant on the UUID would never match a request
+    // that comes in under the published name.
+    flow: (flows || [])
+      .filter((f) => f.publishedModelName)
+      .map((f) => ({ id: String(f.publishedModelName), name: `${f.name || f.publishedModelName} (${f.publishedModelName})` })),
     alias: (aliases || []).map((a) => ({ id: String(a.alias || a.id || ''), name: String(a.alias || a.id || '') })),
     model_bundle: [...bundleStatic, ...bundleRegistry],
   };

@@ -13,7 +13,6 @@ const CATEGORY_ORDER = [
 
 let services = [];
 let schemaVersion = null;
-let generatedAt = null;
 let loaded = false;
 let loadPromise = null;
 
@@ -27,7 +26,6 @@ export async function init() {
     .then((mod) => {
       services = Array.isArray(mod.SERVICES) ? mod.SERVICES : [];
       schemaVersion = mod.SCHEMA_VERSION || null;
-      generatedAt = mod.GENERATED_AT || null;
       loaded = true;
       return true;
     })
@@ -51,10 +49,6 @@ export function all() {
 
 export function getSchemaVersion() {
   return schemaVersion;
-}
-
-export function getGeneratedAt() {
-  return generatedAt;
 }
 
 export function byId(engineId) {

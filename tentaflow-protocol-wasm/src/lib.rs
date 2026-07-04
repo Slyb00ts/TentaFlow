@@ -395,6 +395,7 @@ pub fn encode_chat_stream_request_simple(
     model_id: String,
     user_message: String,
     flow_id: Option<String>,
+    session_id: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ChatStreamRequestBody(ChatStreamRequest {
         model_id,
@@ -405,6 +406,7 @@ pub fn encode_chat_stream_request_simple(
         temperature: None,
         max_tokens: None,
         flow_id,
+        session_id,
     }))
     .map_err(|e| JsError::new(&e))
 }
@@ -4833,6 +4835,8 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
                 set(&item, "updated_at", s.updated_at.into());
                 set(&item, "updateAvailable", s.update_available.into());
                 set(&item, "update_available", s.update_available.into());
+                set(&item, "gpuSelection", s.gpu_selection.clone().into());
+                set(&item, "gpu_selection", s.gpu_selection.into());
 
                 let models = js_sys::Array::new();
                 for m in s.models {
@@ -5099,10 +5103,12 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::MetaSchemaVersionAck {
             server_version,
             accepted,
+            asset_build_hash,
         } => {
             set(&obj, "variant", "MetaSchemaVersionAck".into());
             set(&obj, "serverVersion", (server_version as u32).into());
             set(&obj, "accepted", accepted.into());
+            set(&obj, "assetBuildHash", asset_build_hash.as_str().into());
         }
         MessageBody::MetaHeartbeat { sent_at_epoch } => {
             set(&obj, "variant", "MetaHeartbeat".into());
@@ -5612,6 +5618,12 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&item, "createdAtEpoch", f.created_at_epoch.into());
                 set(&item, "updatedAtEpoch", f.updated_at_epoch.into());
                 set(&item, "enabled", f.enabled.into());
+                set(&item, "isDefault", f.is_default.into());
+                set(&item, "is_default", f.is_default.into());
+                if let Some(pmn) = f.published_model_name {
+                    set(&item, "publishedModelName", pmn.clone().into());
+                    set(&item, "published_model_name", pmn.into());
+                }
                 arr.push(&item.into());
             }
             set(&obj, "flows", arr.into());

@@ -2601,6 +2601,7 @@
     "gpu_list_hint": "GPUs disponibles ({n})"
   },
   "category": {
+    "engines": "Motores",
     "llm": "Modelos de lenguaje (LLM)",
     "stt": "Reconocimiento de voz (STT)",
     "tts": "Síntesis de voz (TTS)",

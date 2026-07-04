@@ -473,6 +473,8 @@
     "col_actions": "Akcje",
     "col_transport": "Transport",
     "col_models": "Modele",
+    "col_gpu": "Karty GPU",
+    "gpu_all": "wszystkie",
     "col_restart": "Restarty",
     "col_category": "Kategoria",
     "col_display_name": "Serwis",
@@ -3772,6 +3774,7 @@
     "huggingfaceToken": "Token HuggingFace (opcjonalny)",
     "noPresets": "Brak rekomendowanych modeli — użyj wyszukiwarki HuggingFace",
     "presetHint": "Wybierz rekomendowany model dla tego silnika",
+    "quantVariant": "Kwantyzacja",
     "hfSearchHint": "Wpisz minimum 2 znaki, aby wyszukać",
     "hfSearchPlaceholder": "np. qwen, llama, mistral...",
     "ggufFileLabel": "Plik GGUF",
@@ -3843,6 +3846,7 @@
     }
   },
   "category": {
+    "engines": "Silniki",
     "llm": "Modele językowe (LLM)",
     "stt": "Rozpoznawanie mowy (STT)",
     "tts": "Synteza mowy (TTS)",
@@ -4329,6 +4333,16 @@
     "log_manual_retry": "Ręczny reconnect — próba teraz",
     "log_restored": "Połączenie przywrócone"
   },
+  "update": {
+    "title": "Nowa wersja aplikacji",
+    "desc": "Serwer został zaktualizowany. Odśwież, aby załadować najnowszą wersję.",
+    "title_required": "Wymagana aktualizacja",
+    "desc_required": "Front jest niezgodny z serwerem. Odśwież, aby kontynuować.",
+    "cmp": "Aktualizacja gotowa do instalacji",
+    "cmp_required": "Zmiana protokołu komunikacji",
+    "reload": "Odśwież",
+    "later": "Później"
+  },
   "system_events": {
     "service_connected": "Serwis {name} ({type}) ponownie aktywny",
     "service_disconnected": "Serwis {name} ({type}) odłączony",
@@ -4579,6 +4593,8 @@
     "run_results_short": "Run {id} · wyniki",
     "results_subtitle": "{date} · {dur} · {targets} targety × {scenarios} testy · {requests} zapytań",
     "export_csv": "Eksport CSV",
+    "export_pdf": "Eksport PDF",
+    "pdf_popup_blocked": "Przeglądarka zablokowała okno PDF — zezwól na pop-upy dla tej strony.",
     "compare": "Porównaj",
     "results_table": "Tabela wyników",
     "results_table_hint": "mean ± σ z N powtórzeń · ★ = najlepszy w kolumnie w ramach testu · decode przy równoległości = per-request",

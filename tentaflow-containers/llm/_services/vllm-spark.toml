@@ -70,3 +70,41 @@ speculator_repo = "TentaFlow/Bielik-1.5B-NVFP4"
 speculator_method = "draft_model"
 speculator_num_tokens = 3
 featured = true
+
+# Gemma 4 NVFP4 na DGX Spark. sm_121 nie ma tcgen05 (natywny fp4), wiec deploy
+# wymusza Marlin GEMM + eager (patrz spark_nvfp4_env / spark_baseline_args w
+# services/deploy) — bez tego CUTLASS fp4 sie sypie. 12B dense mie sci sie luzno na
+# jednym Sparku; 31B dense jest bandwidth-bound (~7 tok/s single) — praktycznie
+# wymaga klastra 2x Spark (TP=2, Ray dokladany automatycznie przez distributed.rs).
+[[model_preset]]
+id = "gemma-4-12b-it-nvfp4"
+display_name = "Gemma 4 12B IT (NVFP4 + tools + draft)"
+repo = "RedHatAI/gemma-4-12B-it-NVFP4"
+quantization = "nvfp4"
+speculator_repo = "google/gemma-4-12B-it-assistant"
+speculator_method = "draft_model"
+speculator_num_tokens = 4
+featured = true
+
+[[model_preset]]
+id = "gemma-4-31b-it-nvfp4"
+display_name = "Gemma 4 31B IT (NVFP4 + tools + draft, cluster 2x Spark)"
+repo = "nvidia/Gemma-4-31B-IT-NVFP4"
+quantization = "nvfp4"
+speculator_repo = "google/gemma-4-31B-it-assistant"
+speculator_method = "draft_model"
+speculator_num_tokens = 4
+featured = true
+
+# DeepSeek V4 Flash (284B/13B-act MoE, 1M ctx) na CLUSTER 4-8x DGX Spark przez
+# RDMA 200Gbit (distributed.rs: Ray + NCCL/RoCE). DSpark self-speculative (glowa w
+# checkpoincie). fp8 kv-cache + block-size 256 + EP dokłada Core. Pro 1.6T nie
+# mie sci sie nawet na 8 Sparkach (1TB unified) — Pro tylko na datacenter (vllm.toml).
+[[model_preset]]
+id = "deepseek-v4-flash-dspark"
+display_name = "DeepSeek V4 Flash (DSpark, cluster Spark RDMA)"
+repo = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
+quantization = "fp8"
+speculator_method = "dspark"
+speculator_num_tokens = 4
+featured = true

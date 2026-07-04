@@ -18,6 +18,22 @@ const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
 let GLOBAL_NEXT_SEQUENCE = 1n;
 
+// Zbakowany w tym buildzie hash frontu (build.rs -> asset-manifest.js). Ladowany
+// leniwie i cache'owany — modul ESM i tak jest cache'owany przez przegladarke.
+// Zwraca null gdy manifestu brak (np. front bez zbudowanego manifestu), co
+// bezpiecznie wylacza porownanie.
+let _localAssetHash;
+async function loadLocalAssetHash() {
+  if (_localAssetHash !== undefined) return _localAssetHash;
+  try {
+    const m = await import('../generated/asset-manifest.js');
+    _localAssetHash = m.ASSET_BUILD_HASH ?? null;
+  } catch {
+    _localAssetHash = null;
+  }
+  return _localAssetHash;
+}
+
 export class BinaryWsClient {
   /**
    * @param {string} url — WebSocket URL (`ws://` / `wss://`)
@@ -58,6 +74,11 @@ export class BinaryWsClient {
     this.onReconnectScheduled = opts.onReconnectScheduled ?? noop;
     this.onReconnectAttempt = opts.onReconnectAttempt ?? noop;
     this.onDisconnected = opts.onDisconnected ?? noop;
+    // onUpdateAvailable({ required, current, server }) — handshake wykryl, ze
+    // front nie zgadza sie z backendem. required=true => twardy mismatch
+    // protokolu (stary wasm) i trzeba reload; required=false => tylko zmiana
+    // zasobow (JS/CSS/panel), reload opcjonalny.
+    this.onUpdateAvailable = opts.onUpdateAvailable ?? noop;
     // P2c FIX: lista listenerow dla unsolicited frame (kazda screen moze
     // dodac swoj). Stare onUnsolicited (single) zachowane jako shortcut.
     this._unsolicitedListeners = [];
@@ -380,9 +401,28 @@ export class BinaryWsClient {
     await this.transport.send(frame);
     const { body } = await resultPromise;
     if (body.variant !== 'MetaSchemaVersionAck' || !body.accepted) {
+      // Twardy mismatch protokolu — wasm/kodek jest nieaktualny wzgledem
+      // backendu. Front MUSI sie przeladowac; zglos to zanim rzucimy.
+      try {
+        this.onUpdateAvailable({
+          required: true,
+          current: schemaVersion(),
+          server: body?.serverVersion,
+        });
+      } catch { /* ignore */ }
       throw new Error(
         `schema version mismatch: client=${schemaVersion()} server=${body.serverVersion}`,
       );
+    }
+    // Miekki sygnal: protokol zgodny, ale zasoby frontu (JS/CSS/panel addona)
+    // rozne od serwera => zaproponuj reload. Sprawdzane przy KAZDYM (re)connect,
+    // wiec restart+aktualizacja backendu jest wykryta natychmiast po reconnect.
+    const localHash = await loadLocalAssetHash();
+    const serverHash = body.assetBuildHash;
+    if (localHash && serverHash && localHash !== serverHash) {
+      try {
+        this.onUpdateAvailable({ required: false, current: localHash, server: serverHash });
+      } catch { /* ignore */ }
     }
   }
 

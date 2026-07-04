@@ -627,6 +627,21 @@ pub struct ModelPreset {
     /// montuje go do kontenerowego katalogu checkpointow.
     #[serde(default)]
     pub checkpoint_file: Option<String>,
+    /// Warianty kwantyzacji tego samego modelu (`[[model_preset.quant_variant]]`):
+    /// kazdy mapuje kwantyzacje na osobne repo HF. `repo`/`quantization` presetu =
+    /// wariant „standard". Wizard renderuje je jako wybor przy kalkulatorze VRAM i
+    /// podmienia `payload.model` na repo wybranego wariantu (+ przelicza wagi).
+    #[serde(default, rename = "quant_variant")]
+    pub quant_variants: Vec<QuantVariant>,
+}
+
+/// Jeden wariant kwantyzacji presetu — kwantyzacja + repo HF pod nia.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuantVariant {
+    pub quantization: String,
+    pub repo: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 /// vLLM self-quantization knobs for a `[[model_preset]]`. When `quantize` is

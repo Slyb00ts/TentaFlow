@@ -703,6 +703,7 @@ function renderListTab() {
           <th>${escapeHtml(I18n.t('services.col_category'))}</th>
           <th>${escapeHtml(I18n.t('services.col_status'))}</th>
           <th>${escapeHtml(I18n.t('services.col_models'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_gpu'))}</th>
           <th>${escapeHtml(I18n.t('services.col_restart'))}</th>
           <th style="text-align:right;">${escapeHtml(I18n.t('services.col_actions'))}</th>
         </tr>
@@ -856,6 +857,15 @@ function renderRow(s) {
           title="${escapeAttr(I18n.t('services.btn_deploy_logs'))}"></tf-button>`
     : '';
 
+  // Karty GPU serwisu (z deploy configu): "all" | "0,1" | "CPU". Puste = nie
+  // dotyczy (np. serwis zdalny bez tej informacji) -> myslnik. Indeksy monospace.
+  const gpuSel = String(s.gpuSelection ?? s.gpu_selection ?? '').trim();
+  const gpuCell = !gpuSel
+    ? '<span style="color:var(--text-3);">—</span>'
+    : (gpuSel === 'all' || gpuSel === 'CPU'
+        ? `<span style="color:var(--text-2);">${escapeHtml(gpuSel === 'all' ? I18n.t('services.gpu_all') : gpuSel)}</span>`
+        : `<span class="mono">${escapeHtml(gpuSel)}</span>`);
+
   return `
     <tr data-key="${rowKey}">
       <td data-label="${escapeAttr(I18n.t('services.col_node'))}">${nodeCell}</td>
@@ -879,6 +889,7 @@ function renderRow(s) {
       <td data-label="${escapeAttr(I18n.t('services.col_models'))}">
         <div style="display:flex;flex-wrap:wrap;gap:4px;">${modelChips}</div>
       </td>
+      <td data-label="${escapeAttr(I18n.t('services.col_gpu'))}">${gpuCell}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_restart'))}">${restartCell}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;white-space:nowrap;">
         <tf-button variant="ghost" size="sm" icon="${ppIcon}"

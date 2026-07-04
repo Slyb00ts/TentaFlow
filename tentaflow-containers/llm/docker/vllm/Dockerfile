@@ -58,6 +58,9 @@ ENV HF_HUB_ENABLE_HF_TRANSFER=1 \
 COPY tentaflow-containers/llm/docker/vllm/entrypoint.sh /app/entrypoint.sh
 COPY tentaflow-containers/llm/docker/_shared/quantize_nvfp4.py /app/quantize_nvfp4.py
 COPY tentaflow-containers/llm/docker/_shared/prepare-vllm-model.sh /app/prepare-vllm-model.sh
+# Zbundlowane chat templates (gemma-4 tool-calling itd.) — pip-owy vLLM nie niesie
+# katalogu `examples/`, wiec Core wskazuje deploy na /app/chat_templates.
+COPY tentaflow-containers/llm/docker/_shared/chat_templates /app/chat_templates
 RUN chmod +x /app/entrypoint.sh /app/prepare-vllm-model.sh
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=3 \

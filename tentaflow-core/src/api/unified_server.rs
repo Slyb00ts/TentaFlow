@@ -46,6 +46,11 @@ pub fn is_openai_path(path: &str) -> bool {
 fn is_public_openai_path(path: &str) -> bool {
     path == "/health"
         || path == "/ready"
+        // `/v1/*` aliases are handled as public probes in the OpenAI server and
+        // documented as auth-free — they must be exempted here too, otherwise
+        // the API-key gate answers a monitoring probe with 401.
+        || path == "/v1/health"
+        || path == "/v1/ready"
         || path == "/openapi.json"
         || path == "/docs"
         || path.starts_with("/docs/")
@@ -523,7 +528,7 @@ pub fn start_unified_server_with_permissions(
                                         let full = http_body_util::Full::new(
                                             hyper::body::Bytes::from(err_body),
                                         );
-                                        let resp = hyper::Response::builder()
+                                        let mut resp = hyper::Response::builder()
                                             .status(401)
                                             .header("Content-Type", "application/json")
                                             .body(UnsyncBoxBody::new(full.map_err(
@@ -532,6 +537,11 @@ pub fn start_unified_server_with_permissions(
                                                 },
                                             )))
                                             .unwrap();
+                                        // Early auth failure bypasses the handler path — apply the
+                                        // same unconditional security headers (HSTS etc.).
+                                        crate::api::mtls::apply_universal_security_headers(
+                                            resp.headers_mut(),
+                                        );
                                         return Ok(resp);
                                     }
 
@@ -547,7 +557,7 @@ pub fn start_unified_server_with_permissions(
                                             let full = http_body_util::Full::new(
                                                 hyper::body::Bytes::from(body),
                                             );
-                                            let resp = hyper::Response::builder()
+                                            let mut resp = hyper::Response::builder()
                                                 .status(429)
                                                 .header("Content-Type", "application/json")
                                                 .header("Retry-After", retry_secs.to_string())
@@ -557,6 +567,12 @@ pub fn start_unified_server_with_permissions(
                                                     },
                                                 )))
                                                 .unwrap();
+                                            // This early 429 bypasses the normal handler path, so
+                                            // apply the same security headers (HSTS is uncondi-
+                                            // tional) that every other response gets.
+                                            crate::api::mtls::apply_universal_security_headers(
+                                                resp.headers_mut(),
+                                            );
                                             return Ok(resp);
                                         }
                                     }

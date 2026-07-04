@@ -473,6 +473,8 @@
     "col_actions": "Actions",
     "col_transport": "Transport",
     "col_models": "Models",
+    "col_gpu": "GPUs",
+    "gpu_all": "all",
     "col_restart": "Restarts",
     "col_category": "Category",
     "col_display_name": "Service",
@@ -3636,6 +3638,7 @@
     "huggingfaceToken": "HuggingFace token (optional)",
     "noPresets": "No recommended models — use HuggingFace search",
     "presetHint": "Select a recommended model for this engine",
+    "quantVariant": "Quantization",
     "hfSearchHint": "Type at least 2 characters to search",
     "hfSearchPlaceholder": "e.g. qwen, llama, mistral...",
     "ggufFileLabel": "GGUF file",
@@ -3707,6 +3710,7 @@
     }
   },
   "category": {
+    "engines": "Engines",
     "llm": "Language Models (LLM)",
     "stt": "Speech to Text (STT)",
     "tts": "Text to Speech (TTS)",
@@ -4193,6 +4197,16 @@
     "log_manual_retry": "Manual reconnect — trying now",
     "log_restored": "Connection restored"
   },
+  "update": {
+    "title": "New app version",
+    "desc": "The server was updated. Reload to load the latest version.",
+    "title_required": "Update required",
+    "desc_required": "The frontend is out of sync with the server. Reload to continue.",
+    "cmp": "Update ready to install",
+    "cmp_required": "Communication protocol change",
+    "reload": "Reload",
+    "later": "Later"
+  },
   "system_events": {
     "service_connected": "Service {name} ({type}) back online",
     "service_disconnected": "Service {name} ({type}) disconnected",
@@ -4443,6 +4457,8 @@
     "run_results_short": "Run {id} · results",
     "results_subtitle": "{date} · {dur} · {targets} targets × {scenarios} tests · {requests} requests",
     "export_csv": "Export CSV",
+    "export_pdf": "Export PDF",
+    "pdf_popup_blocked": "Browser blocked the PDF window — allow pop-ups for this site.",
     "compare": "Compare",
     "results_table": "Results table",
     "results_table_hint": "mean ± σ over N repeats · ★ = best in column within a test · decode under concurrency = per-request",

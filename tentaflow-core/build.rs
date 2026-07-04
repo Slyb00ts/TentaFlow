@@ -29,6 +29,12 @@ fn main() {
     // MUSI byc przed generate_wwwroot_embed zeby wynikowe pliki trafily do embed.
     build_voxel_wasm_bindings();
 
+    // Wygeneruj asset-manifest.js + sw-version.js + staly ASSET_BUILD_HASH z
+    // SHA-256 calego frontu. MUSI byc PO wygenerowaniu wasm glue i
+    // services-manifest.js (zeby wliczyc ich tresc) i PRZED wwwroot_embed
+    // (zeby wynikowe pliki trafily do embed).
+    generate_asset_manifest(&out_dir_env);
+
     // Generuj wwwroot_embed.rs — pliki statyczne wbudowane w binarie
     // (po wygenerowaniu services-manifest.js, zeby trafil do embed).
     generate_wwwroot_embed(&out_dir_env);
@@ -570,11 +576,12 @@ fn escape_path(path: &Path) -> String {
 /// dla kazdego pliku. Rejestruje rerun-if-changed na kazdym pliku zeby cargo
 /// automatycznie rekompilowalo po zmianie jakiegokolwiek zasobu www.
 fn generate_wwwroot_embed(out_dir: &Path) {
+    use sha2::{Digest, Sha256};
     let wwwroot = Path::new("www");
     if !wwwroot.exists() {
         // Brak www — generuj pusta funkcje lookup
         let code =
-            "fn wwwroot_lookup(_path: &str) -> Option<(&'static str, &'static [u8])> { None }\n";
+            "fn wwwroot_lookup(_path: &str) -> Option<(&'static str, &'static [u8], &'static str)> { None }\n";
         std::fs::write(out_dir.join("wwwroot_embed.rs"), code).unwrap();
         return;
     }
@@ -604,15 +611,23 @@ fn generate_wwwroot_embed(out_dir: &Path) {
 
     code.push_str("\n");
 
-    // Generuj funkcje lookup
-    code.push_str("fn wwwroot_lookup(path: &str) -> Option<(&'static str, &'static [u8])> {\n");
+    // Generuj funkcje lookup — trzeci element to ETag (per-plik SHA-256, 16 hex).
+    // Serwer uzywa go do warunkowych GET (If-None-Match -> 304), wiec caching w
+    // przegladarce dziala ZAWSZE, niezaleznie od service workera/certa.
+    code.push_str(
+        "fn wwwroot_lookup(path: &str) -> Option<(&'static str, &'static [u8], &'static str)> {\n",
+    );
     code.push_str("    match path {\n");
 
-    for (i, (rel_path, _)) in files.iter().enumerate() {
+    for (i, (rel_path, abs_path)) in files.iter().enumerate() {
         let mime = guess_mime(rel_path);
+        let bytes = std::fs::read(abs_path).unwrap_or_default();
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        let etag: String = h.finalize().iter().take(8).map(|b| format!("{:02x}", b)).collect();
         code.push_str(&format!(
-            "        \"{}\" => Some((\"{}\", WWWROOT_FILE_{})),\n",
-            rel_path, mime, i
+            "        \"{}\" => Some((\"{}\", WWWROOT_FILE_{}, \"{}\")),\n",
+            rel_path, mime, i, etag
         ));
     }
 
@@ -621,6 +636,95 @@ fn generate_wwwroot_embed(out_dir: &Path) {
     code.push_str("}\n");
 
     std::fs::write(out_dir.join("wwwroot_embed.rs"), code).unwrap();
+}
+
+/// Zapisuje plik tylko gdy tresc sie zmienila — bez tego przepisywanie
+/// identycznej tresci bije mtime i wpada w petle rebuildu (rerun-if-changed=www).
+fn write_if_changed(path: &Path, content: &str) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if existing == content {
+            return;
+        }
+    }
+    std::fs::write(path, content).unwrap();
+}
+
+/// Skanuje www/ i liczy zbiorczy SHA-256 calego frontu (ASSET_BUILD_HASH).
+/// Generuje trzy artefakty z tego samego hasha:
+///   - www/js/generated/asset-manifest.js — lista wszystkich zasobow +
+///     ASSET_BUILD_HASH (browser: precache w service workerze + porownanie
+///     w handshake WS),
+///   - www/js/generated/sw-version.js — importScripts w service workerze; zmiana
+///     hasha zmienia bajty importu => browser wykrywa update SW i przecacheowuje,
+///   - $OUT_DIR/asset_build_hash.rs — staly Rust wysylany w MetaSchemaVersionAck.
+/// Dzieki temu KAZDA zmiana frontu (JS/CSS/wasm glue/panel addona) wywoluje
+/// odswiezenie cache i wykrycie nieaktualnego frontu przy (re)connect WS.
+fn generate_asset_manifest(out_dir: &Path) {
+    use sha2::{Digest, Sha256};
+
+    let wwwroot = Path::new("www");
+    // Pliki generowane w tym kroku wykluczamy z hasha (self-reference) —
+    // inaczej ich wlasna tresc zmienialaby hash w nieskonczonosc.
+    const SELF: &[&str] = &[
+        "js/generated/asset-manifest.js",
+        "js/generated/sw-version.js",
+    ];
+
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    if wwwroot.exists() {
+        collect_wwwroot_files(wwwroot, wwwroot, &mut files);
+    }
+    // Deterministyczna kolejnosc — hash niezalezny od kolejnosci read_dir.
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut agg = Sha256::new();
+    let mut list: Vec<String> = Vec::new();
+    for (rel, abs) in &files {
+        if SELF.contains(&rel.as_str()) {
+            continue;
+        }
+        let bytes = std::fs::read(abs).unwrap_or_default();
+        let mut fh = Sha256::new();
+        fh.update(&bytes);
+        let digest = fh.finalize();
+        agg.update(rel.as_bytes());
+        agg.update([0u8]);
+        agg.update(digest);
+        list.push(format!("/{}", rel));
+    }
+    let full: String = agg.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+    let hash = &full[..16];
+
+    let mut js = String::new();
+    js.push_str("// Auto-generated by build.rs — NIE EDYTUJ RECZNIE\n");
+    js.push_str(&format!("export const ASSET_BUILD_HASH = \"{}\";\n", hash));
+    js.push_str("export const ASSET_MANIFEST = [\n");
+    for p in &list {
+        js.push_str(&format!("  {:?},\n", p));
+    }
+    js.push_str("];\n");
+    write_if_changed(&wwwroot.join("js/generated/asset-manifest.js"), &js);
+
+    // Classic worker importScripts — service worker nie moze importowac ESM,
+    // wiec hash i pelna lista sa tu jako globalne (self.__ASSET_*).
+    let mut sw = String::new();
+    sw.push_str("// Auto-generated by build.rs — NIE EDYTUJ RECZNIE\n");
+    sw.push_str(&format!("self.__ASSET_BUILD_HASH = {:?};\n", hash));
+    sw.push_str("self.__ASSET_MANIFEST = [\n");
+    for p in &list {
+        sw.push_str(&format!("  {:?},\n", p));
+    }
+    sw.push_str("];\n");
+    write_if_changed(&wwwroot.join("js/generated/sw-version.js"), &sw);
+
+    std::fs::write(
+        out_dir.join("asset_build_hash.rs"),
+        format!("pub const ASSET_BUILD_HASH: &str = {:?};\n", hash),
+    )
+    .unwrap();
 }
 
 /// Rekurencyjnie zbiera pliki z katalogu www.
@@ -1100,6 +1204,19 @@ mod services_manifest_build {
         /// Mirror `ModelPreset::checkpoint_file` z `services/manifest/types.rs`.
         #[serde(default)]
         pub checkpoint_file: Option<String>,
+        /// Warianty kwantyzacji tego samego modelu — kazdy to inne repo HF pod
+        /// wybrana kwantyzacje. `repo`/`quantization` na preset = wariant „standard".
+        /// Wizard pokazuje je jako wybor przy kalkulatorze i podmienia repo.
+        #[serde(default, rename = "quant_variant")]
+        pub quant_variants: Vec<QuantVariant>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct QuantVariant {
+        pub quantization: String,
+        pub repo: String,
+        #[serde(default)]
+        pub display_name: Option<String>,
     }
 
     // Single source of truth for the three wire-string allow-lists is
@@ -1877,7 +1994,10 @@ fn write_generated(out_dir: &Path, json: &str) {
 }
 
 fn write_js_module(path: &Path, json_pretty: &str) {
-    let now = chrono_now_iso();
+    // Bez wall-clock timestampu — tresc musi byc DETERMINISTYCZNA, bo wchodzi do
+    // ASSET_BUILD_HASH (build.rs generate_asset_manifest). Zmienny timestamp
+    // powodowalby nowy hash przy KAZDYM buildzie backendu i falszywy komunikat
+    // "nowa wersja" mimo braku zmian frontu.
     let content = format!(
         "// =============================================================================\n\
          // Plik: services-manifest.js\n\
@@ -1886,9 +2006,8 @@ fn write_js_module(path: &Path, json_pretty: &str) {
          // =============================================================================\n\
          \n\
          export const SCHEMA_VERSION = 2;\n\
-         export const GENERATED_AT = \"{}\";\n\
          export const SERVICES = {};\n",
-        now, json_pretty
+        json_pretty
     );
     if let Err(e) = std::fs::write(path, content) {
         println!(

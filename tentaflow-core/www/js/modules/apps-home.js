@@ -13,10 +13,10 @@ import { byId, escapeHtml } from '/js/utils.js';
 const TILES = [
   { id: 'chat',         route: 'chat',         icon: 'chat' },
   { id: 'images',       route: 'images',       icon: 'image',        soon: true },
-  { id: 'notes',        route: 'notes',        icon: 'mic',          soon: true },
+  { id: 'notes',        route: 'notes',        icon: 'mic' },
   { id: 'meeting',      route: 'meeting',      icon: 'meeting',      soon: true },
   { id: 'pose',         route: 'pose',         icon: 'image' },
-  { id: 'translate',    route: 'translate',    icon: 'globe',        soon: true },
+  { id: 'translate',    route: 'translate',    icon: 'globe' },
 ];
 
 function sprite(id) {

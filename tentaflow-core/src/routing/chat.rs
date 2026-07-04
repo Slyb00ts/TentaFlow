@@ -132,6 +132,73 @@ impl Router {
             None
         };
 
+        // === DIRECT MODEL: raw model → backend bez flow ===
+        // A plain model name is answered by the backend directly (no synthetic
+        // /default flow, no PII buffering). Only a Flow published as a model
+        // (or an alias resolving to one) routes through the flow engine below.
+        let route_via_flow = model_resolves_to_flow(&self.catalog_snapshot(), &request.model);
+        if !route_via_flow {
+            let executor = match self.executor() {
+                Some(e) => e,
+                None => {
+                    if let Some(event) = compliance_event.as_ref() {
+                        let _ = event.finish_failed("runtime_executor_not_wired");
+                    }
+                    return Err(CoreError::InternalError {
+                        message: "runtime executor not wired — direct model dispatch unavailable"
+                            .to_string(),
+                        source: None,
+                    }
+                    .into());
+                }
+            };
+            let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(user);
+            match executor.execute_chat(request.clone(), &mut exec_ctx).await {
+                Ok(response) => {
+                    let usage = response.usage.as_ref().map(|u| {
+                        crate::routing::middleware::TokenUsageMetadata {
+                            prompt_tokens: u.prompt_tokens as u64,
+                            completion_tokens: u.completion_tokens as u64,
+                            total_tokens: u.total_tokens as u64,
+                        }
+                    });
+                    let finish_reason = response
+                        .choices
+                        .first()
+                        .and_then(|c| c.finish_reason.clone());
+                    if let Some(event) = compliance_event.as_ref() {
+                        event
+                            .finish_success(&response)
+                            .map_err(|e| CoreError::InternalError {
+                                message: "compliance AI audit finish failed".to_string(),
+                                source: Some(e),
+                            })?;
+                    }
+                    let metadata = crate::routing::RouteMetadata {
+                        served_by_node: exec_ctx
+                            .route_metadata
+                            .served_by_node
+                            .clone()
+                            .unwrap_or_else(crate::mesh::node_info_collector::local_hostname),
+                        backend_type: "direct".to_string(),
+                        strategy_used: "direct".to_string(),
+                        fallbacks_tried: exec_ctx.route_metadata.fallbacks_tried,
+                        hop_count: 0,
+                        latency_ms: None,
+                        usage,
+                        finish_reason,
+                    };
+                    return Ok(crate::routing::RouteResult { response, metadata });
+                }
+                Err(e) => {
+                    if let Some(event) = compliance_event.as_ref() {
+                        let _ = event.finish_failed(&e.to_string());
+                    }
+                    return Err(executor_error_to_core(e, &request.model).into());
+                }
+            }
+        }
+
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
             let blobs = dispatcher.blobs();
@@ -487,12 +554,67 @@ pub(crate) fn catalog_target_accepts_audio(
     false
 }
 
+/// Whether the requested `model` id names a Flow published as a model
+/// (`CatalogEntryKind::Flow`) and therefore MUST execute through the flow
+/// engine, vs a raw service model that is answered by a direct backend call.
+///
+/// Design (2026-07): a client requesting a plain model name gets the model
+/// directly (no synthetic/default flow, no PII buffering, lowest latency);
+/// a client requesting a flow's published name gets the flow. An alias is
+/// resolved to its primary target and classified by that target's kind, so
+/// `alias → flow` routes through the flow engine while `alias → model`
+/// stays direct. Unknown ids (internal callers that bypass the catalog)
+/// default to direct — the executor resolves or returns a typed error.
+pub(crate) fn model_resolves_to_flow(
+    snapshot: &crate::services::catalog::CatalogSnapshot,
+    model: &str,
+) -> bool {
+    use crate::services::catalog::CatalogEntryKind;
+    // One alias hop is enough — aliases target models/flows, not other
+    // aliases — but a small depth guard keeps a misconfigured chain from
+    // looping.
+    let mut current = model;
+    for _ in 0..4 {
+        let Some(entry) = snapshot.entries.iter().find(|e| e.id == current) else {
+            return false;
+        };
+        match &entry.kind {
+            CatalogEntryKind::Flow { .. } => return true,
+            CatalogEntryKind::ServiceModel { .. } => return false,
+            CatalogEntryKind::Alias { target, .. } => {
+                current = target;
+            }
+        }
+    }
+    false
+}
+
 /// Konwertuje wynik flow engine na standardowy ChatCompletionResponse.
 pub(crate) fn flow_outcome_to_chat_response(
     outcome: FlowExecutionOutcome,
     model: &str,
 ) -> ChatCompletionResponse {
     converter::flow_outcome_to_chat_response(&outcome, model)
+}
+
+/// Maps an `ExecutorError` from the direct (no-flow) backend path onto a
+/// `CoreError`. Resolve failures become `ModelNotFound` so `/v1` keeps its
+/// "never reveal whether a model exists" 404 contract; everything else is a
+/// backend/internal failure (500).
+pub(crate) fn executor_error_to_core(
+    e: crate::services::runtime::executor::ExecutorError,
+    model: &str,
+) -> CoreError {
+    use crate::services::runtime::executor::ExecutorError;
+    match e {
+        ExecutorError::Resolve(_) => CoreError::ModelNotFound {
+            model_name: model.to_string(),
+        },
+        other => CoreError::InternalError {
+            message: format!("direct backend dispatch failed: {other}"),
+            source: None,
+        },
+    }
 }
 
 #[cfg(test)]

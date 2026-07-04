@@ -2001,6 +2001,16 @@ pub fn build_vllm_args_string(spec: &ModelSpec, input: &VramEstimateInput) -> St
     if input.tensor_parallel > 1 {
         parts.push("--tensor-parallel-size".into());
         parts.push(input.tensor_parallel.to_string());
+        // MoE na wielu kartach: expert-parallel kladzie CALE eksperty na roznych
+        // GPU (token routing all-to-all) zamiast TP-tnac kazdego eksperta na
+        // wszystkie karty (redundantny all-reduce co warstwe). vLLM dzieli
+        // eksperty przez EP W OBREBIE grupy TP — nie zmienia rachunku GPU
+        // (calkowite = TP), wiec bezpieczne domyslnie dla MoE. Pelny DP/EP
+        // restructuring (--data-parallel-size, TP=1) jest model/cluster-specyficzny
+        // i zostaje w recepturach recipes.vllm.ai / jawnej konfiguracji usera.
+        if spec.num_experts > 0 {
+            parts.push("--enable-expert-parallel".into());
+        }
     }
     if input.pipeline_parallel > 1 {
         parts.push("--pipeline-parallel-size".into());

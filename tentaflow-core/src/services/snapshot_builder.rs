@@ -101,6 +101,7 @@ pub fn project_service_row(
         .collect();
 
     let request_time_parameters = parse_request_time_parameters(&svc.config_json);
+    let gpu_selection = gpu_selection_summary(&svc.config_json);
 
     // Wykrycie aktualizacji: hash zrodel z deployu vs aktualny hash z manifestu
     // (build.rs liczy go w czasie kompilacji). Roznica = wbudowany bundle
@@ -147,7 +148,48 @@ pub fn project_service_row(
         created_at: svc.created_at,
         updated_at: svc.updated_at,
         request_time_parameters,
+        gpu_selection,
     })
+}
+
+/// Podsumowanie kart GPU serwisu z deploy configu (`gpu_select_mode` + `gpu_ids`)
+/// do kolumny "Karty" w liscie serwisow: `"all"` (wszystkie widoczne), `"0,1"`
+/// (konkretne indeksy), `"CPU"` (bez GPU). Domyslnie `"all"` — tak jak
+/// `apply_gpu_selection_env` traktuje brak trybu.
+fn gpu_selection_summary(config_json: &str) -> String {
+    let cfg: serde_json::Value =
+        serde_json::from_str(config_json).unwrap_or(serde_json::Value::Null);
+    let mode = cfg
+        .get("gpu_select_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("all");
+    match mode {
+        "none" => "CPU".to_string(),
+        "specific" => {
+            let ids: Vec<String> = cfg
+                .get("gpu_ids")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|id| match id {
+                            serde_json::Value::String(s) => {
+                                let t = s.trim();
+                                (!t.is_empty()).then(|| t.to_string())
+                            }
+                            serde_json::Value::Number(n) => Some(n.to_string()),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if ids.is_empty() {
+                "all".to_string()
+            } else {
+                ids.join(",")
+            }
+        }
+        _ => "all".to_string(),
+    }
 }
 
 /// Build the full `Vec<ServiceInfo>` snapshot of the local node's currently

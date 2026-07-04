@@ -370,13 +370,22 @@ function renderProviderTab(provider) {
         ? I18n.t(`category.${cat}`)
         : cat.toUpperCase();
 
-      groupHtml += `
-        <h3 class="catalog-section-title">${escapeHtml(categoryLabel)} <span class="section-count">${cardCount}</span></h3>
-        <div class="catalog-grid">
-          ${engines.map((e) => renderEngineCard(e, targetOs, target)).join('')}
-          ${featured.map((f) => renderFeaturedCard(f.engine, f.preset, targetOs, target)).join('')}
-        </div>
+      const section = (label, count, cardsHtml) => `
+        <h3 class="catalog-section-title">${escapeHtml(label)} <span class="section-count">${count}</span></h3>
+        <div class="catalog-grid">${cardsHtml}</div>
       `;
+      const enginesHtml = engines.map((e) => renderEngineCard(e, targetOs, target)).join('');
+      const featuredHtml = featured.map((f) => renderFeaturedCard(f.engine, f.preset, targetOs, target)).join('');
+
+      if (cat === 'llm') {
+        // Rozdzial: same silniki (backendy vLLM/llama.cpp/MLX) -> "Silniki";
+        // prekonfigurowane presety modeli (Bielik, DeepSeek, Gemma-4) -> "Modele
+        // jezykowe". Presety i tak sa osobnymi kafelkami, wiec to naturalny podzial.
+        if (engines.length) groupHtml += section(I18n.t('category.engines'), engines.length, enginesHtml);
+        if (featured.length) groupHtml += section(categoryLabel, featured.length, featuredHtml);
+      } else {
+        groupHtml += section(categoryLabel, cardCount, enginesHtml + featuredHtml);
+      }
     }
     if (groupCount > 0) {
       html += `

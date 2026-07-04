@@ -229,9 +229,9 @@ export const encode = {
   },
 
   /** MessageBody::ChatStreamRequest (simplified: 1 user message). */
-  chatStreamRequest(correlationId, { modelId, userMessage, flowId }, sequence = 1) {
+  chatStreamRequest(correlationId, { modelId, userMessage, flowId, sessionId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeChatStreamRequestSimple(modelId, userMessage, flowId ?? null);
+    const body = _wasm.encodeChatStreamRequestSimple(modelId, userMessage, flowId ?? null, sessionId ?? null);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),

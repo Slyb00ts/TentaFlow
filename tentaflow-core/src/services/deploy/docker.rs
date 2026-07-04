@@ -1323,6 +1323,11 @@ impl DeployStrategy for DockerDeploy {
         for (k, v) in param_app.env {
             env.insert(k, v);
         }
+        // DGX Spark: Marlin NVFP4 GEMM (CUTLASS fp4 pada na sm_121). No-op dla
+        // nie-fp4, wiec bezwarunkowo dla vllm-spark. Single-node docker.
+        for (k, v) in super::spark_engine_env(&self.manifest.engine.id) {
+            env.insert(k, v);
+        }
         env.insert("PORT".into(), internal_port.to_string());
         // Distributed: VLLM_PORT is the torch.distributed TCPStore master port and
         // MUST differ from the serve API port — the manifest default (8000) is never
@@ -1414,6 +1419,17 @@ impl DeployStrategy for DockerDeploy {
         {
             engine_args.extend(spec_args);
         }
+        // Chat template gemma-4 (tool-calling): sciezka W KONTENERZE — Dockerfile
+        // COPY-uje zbundlowany szablon do /app/chat_templates. Recepta vLLM
+        // podawala repo-relative `examples/...`, ktorego pip-owy vLLM nie ma.
+        if super::resolve_model_repo(&self.manifest, &self.user_config)
+            .map(|r| r.to_lowercase().contains("gemma-4"))
+            .unwrap_or(false)
+        {
+            engine_args.push("--chat-template".to_string());
+            engine_args
+                .push("/app/chat_templates/tool_chat_template_gemma4.jinja".to_string());
+        }
         if self.manifest.engine.is_cuda_vllm() {
             let is_pooling = matches!(
                 self.manifest.engine.category,
@@ -1436,20 +1452,19 @@ impl DeployStrategy for DockerDeploy {
                     s.info(&format!("[docker] gpu_memory_utilization={:.2}", ratio));
                 }
             }
-            if self.manifest.engine.id == "vllm-spark" {
-                // Spark wymaga wylaczenia flashinfer autotune; dedup last-wins
-                // skasuje ewentualny `--enable-...` z user args.
-                engine_args.push("--no-enable-flashinfer-autotune".to_string());
-                // GB10 ma pamiec ZUNIFIKOWANA (GPU == RAM). torch.compile + CUDA
-                // graphs alokuja pamiec POZA budzetem `--gpu-memory-utilization`,
-                // wiec 0.6 puchnie do ~100% calego poola. `--enforce-eager`
-                // wylacza compile/cudagraphs → vLLM trzyma sie budzetu.
-                engine_args.push("--enforce-eager".to_string());
-            }
+            // DGX Spark (sm_121a): eager + no-flashinfer-autotune. GB10 ma pamiec
+            // ZUNIFIKOWANA — compile/CUDA-graphs alokuja poza budzetem
+            // `--gpu-memory-utilization` i puchna do ~100% poola; eager tego unika.
+            // Jedno zrodlo prawdy z native/cluster (super::spark_engine_args).
+            engine_args.extend(super::spark_engine_args(&self.manifest.engine.id));
         }
         // Dedup last-wins (extra/user args wygrywaja nad bundle/manifest base).
         // entrypoint.sh dorzuca tylko AUTO_PARALLEL gdy brak TP/PP w tych argach.
-        let engine_args = crate::deploy::python_venv::dedup_cli_args_last_wins(engine_args);
+        let mut engine_args = crate::deploy::python_venv::dedup_cli_args_last_wins(engine_args);
+        // Ten sam gate co native: fp8 kv-cache pada na GPU bez fp8e4nv (Ampere).
+        // Kontener widzi karty hosta przez nvidia runtime, wiec host `collect()`
+        // = arch kontenera.
+        crate::deploy::python_venv::gate_fp8_kv_cache(&mut engine_args, None);
 
         let mut labels = HashMap::new();
         labels.insert(

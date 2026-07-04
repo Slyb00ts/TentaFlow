@@ -82,11 +82,23 @@ function fmtMsInt(v) {
   return fmtInt(Math.round(v));
 }
 
-// Skrocony czas trwania z dwoch znacznikow ISO.
+// Znaczniki z backendu (started_at/finished_at) to SQLite `datetime('now')` —
+// naive UTC "YYYY-MM-DD HH:MM:SS" BEZ strefy. Date.parse traktuje taki format
+// jak LOCAL, co w strefie != UTC dawalo elapsed przesuniety o offset (np. +2h w
+// CEST -> licznik startowal od ~120:00). Normalizujemy: brak jawnej strefy =>
+// interpretuj jako UTC (spacja->T, doklej Z).
+function parseServerTs(s) {
+  if (!s) return NaN;
+  const str = String(s).trim();
+  if (/[zZ]$|[+-]\d{2}:?\d{2}$/.test(str)) return Date.parse(str);
+  return Date.parse(str.replace(' ', 'T') + 'Z');
+}
+
+// Skrocony czas trwania z dwoch znacznikow.
 function fmtDuration(startIso, endIso) {
   if (!startIso) return '—';
-  const start = Date.parse(startIso);
-  const end = endIso ? Date.parse(endIso) : Date.now();
+  const start = parseServerTs(startIso);
+  const end = endIso ? parseServerTs(endIso) : Date.now();
   if (Number.isNaN(start) || Number.isNaN(end)) return '—';
   const secs = Math.max(0, Math.round((end - start) / 1000));
   const m = Math.floor(secs / 60);
@@ -104,7 +116,7 @@ function fmtClock(ms) {
 // Skrocona data ISO → YYYY-MM-DD HH:MM (lokalnie).
 function fmtDate(iso) {
   if (!iso) return '—';
-  const t = Date.parse(iso);
+  const t = parseServerTs(iso);
   if (Number.isNaN(t)) return escapeHtml(iso);
   const d = new Date(t);
   const p = (n) => String(n).padStart(2, '0');
@@ -507,7 +519,7 @@ function renderWizardTargets() {
       sel.addEventListener('change', (e) => {
         const model = e.detail?.value || sel.value;
         const t = state.draft.targets.find((tt) => tt.kind === 'service' && tt.serviceRef === serviceRef);
-        if (t) { t.model = model; t.label = s.displayName || model; }
+        if (t) { t.model = model; t.label = model || s.displayName; }
       });
     }
     if (!cb) return;
@@ -590,7 +602,7 @@ function toggleMeshTarget(s, checked) {
       host: endpoint,
       port: 0,
       model,
-      label: s.displayName || model,
+      label: model || s.displayName,
       hasKey: false,
       apiKey: undefined,
     });
@@ -885,7 +897,7 @@ async function openRun(runId, benchmarkId, benchmarkName) {
   try {
     const resp = await ApiBinary.one('benchmarkGetRequest', { id: benchmarkId });
     const b = resp?.benchmark;
-    state.runTargets = (b?.targets || []).map((t) => ({ id: t.id, label: t.label || t.model, model: t.model }));
+    state.runTargets = (b?.targets || []).map((t) => ({ id: t.id, label: t.model || t.label, model: t.model }));
     const cfg = parseJson(b?.configJson, {});
     state.runScenarios = SCENARIO_ORDER.filter((s) => cfg[s]);
   } catch {
@@ -898,7 +910,7 @@ async function openRun(runId, benchmarkId, benchmarkName) {
   // Status → started_at + status.
   try {
     const st = await ApiBinary.one('benchmarkRunStatusRequest', { runId });
-    state.runStartedMs = Date.parse(st?.startedAt || '') || Date.now();
+    state.runStartedMs = parseServerTs(st?.startedAt || '') || Date.now();
     state.runStatus = st?.status || 'running';
   } catch { state.runStartedMs = Date.now(); }
 
@@ -1051,12 +1063,28 @@ async function cancelRun() {
 }
 
 // Odswiez czesciowe/koncowe wyniki + macierz statusow.
+// Wiersze wynikow niosa `targetLabel` = displayName SERWISU, ktory jest nazwa
+// SILNIKA (np. "vLLM", "MLX"), a nie modelu. Podmieniamy etykiete na rzeczywisty
+// model targetu (to jego benchmarkujemy; silnik to tylko backend). Mapowanie po
+// `targetId` z targetow benchmarku/runu. Naprawia tez stare runy zapisane z
+// etykieta-silnikiem, bo model bierzemy ze zrodla targetu przy renderze.
+function withTargetModel(rows, targetsOrBench) {
+  const targets = Array.isArray(targetsOrBench) ? targetsOrBench : (targetsOrBench?.targets || []);
+  const modelById = new Map();
+  for (const t of targets) {
+    const m = t && t.model ? String(t.model).trim() : '';
+    if (m && t.id != null) modelById.set(t.id, m);
+  }
+  if (!modelById.size) return rows;
+  return rows.map((r) => (modelById.has(r.targetId) ? { ...r, targetLabel: modelById.get(r.targetId) } : r));
+}
+
 async function refreshRunResults() {
   if (state.view !== 'run') return;
   let rows = [];
   try {
     const resp = await ApiBinary.one('benchmarkRunResultsRequest', { runId: state.runId });
-    rows = Array.isArray(resp?.results) ? resp.results : [];
+    rows = withTargetModel(Array.isArray(resp?.results) ? resp.results : [], state.runTargets);
   } catch { return; }
   renderMatrix(rows);
   renderResultsTable(byId('run-results'), rows, { partial: true });
@@ -1105,11 +1133,14 @@ async function openResults(runId, benchmarkId, benchmarkName) {
   let rows = [];
   let status = null;
   try {
-    const [res, st] = await Promise.all([
+    const [res, st, benchResp] = await Promise.all([
       ApiBinary.one('benchmarkRunResultsRequest', { runId }),
       ApiBinary.one('benchmarkRunStatusRequest', { runId }).catch(() => null),
+      state.resultsBenchmarkId
+        ? ApiBinary.one('benchmarkGetRequest', { id: state.resultsBenchmarkId }).catch(() => null)
+        : Promise.resolve(null),
     ]);
-    rows = Array.isArray(res?.results) ? res.results : [];
+    rows = withTargetModel(Array.isArray(res?.results) ? res.results : [], benchResp?.benchmark);
     status = st;
   } catch (err) {
     root().innerHTML = `<div class="bench-empty">${escapeHtml(err.message || T('load_failed'))}</div>`;
@@ -1140,6 +1171,7 @@ function renderResults(rows, status) {
       </div>
       <div class="bench-actions">
         <tf-button variant="secondary" icon="download" id="res-csv">${escapeHtml(T('export_csv'))}</tf-button>
+        <tf-button variant="secondary" icon="file" id="res-pdf">${escapeHtml(T('export_pdf'))}</tf-button>
         <tf-button variant="primary" icon="refresh" id="res-compare">${escapeHtml(T('compare'))}</tf-button>
       </div>
     </div>
@@ -1174,6 +1206,7 @@ function renderResults(rows, status) {
   `;
   wireCrumbs(crumbs);
   byId('res-csv')?.addEventListener('click', () => exportResultsCsv(rows));
+  byId('res-pdf')?.addEventListener('click', () => exportResultsPdf(rows, status));
   byId('res-compare')?.addEventListener('click', () => goCompare(state.resultsBenchmarkId, state.resultsBenchmarkName, state.resultsRunId));
 
   renderResultsTable(byId('res-table'), rows, { partial: false });
@@ -1594,6 +1627,44 @@ function exportResultsCsv(rows) {
     r.requests ?? 0, r.errors ?? 0,
   ]);
   downloadCsv(`benchmark-${state.resultsRunId.slice(0, 8)}.csv`, header, data);
+}
+
+// PDF eksport: otwiera okno print z DOKLADNIE tymi samymi tabelami wynikow co na
+// stronie (renderResultsTable) + linkowany CSS appki (ten sam origin, wiec CSP
+// przepuszcza) + `print-color-adjust: exact`, zeby ciemny motyw i kolory
+// (best/★/errory) przetrwaly. User zapisuje jako PDF w dialogu drukowania.
+function exportResultsPdf(rows, status) {
+  if (!rows || !rows.length) { toast(T('no_results'), 'error'); return; }
+  const tmp = document.createElement('div');
+  renderResultsTable(tmp, rows, { partial: false });
+  const tablesHtml = tmp.innerHTML;
+  const title = `${state.resultsBenchmarkName || T('run')} · ${T('run_results_short', { id: state.resultsRunId.slice(0, 8) })}`;
+  const sub = resultsSubtitle(status, rows);
+  const win = window.open('', '_blank');
+  if (!win) { toast(T('pdf_popup_blocked'), 'error'); return; }
+  win.document.write(`<!doctype html><html lang="${escapeAttr(I18n.getLanguage())}"><head><meta charset="utf-8">
+<title>${escapeHtml(title)}</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/css/style.css">
+<link rel="stylesheet" href="/css/controls.css">
+<link rel="stylesheet" href="/css/benchmark-studio.css">
+<style>
+  @page { margin: 12mm; size: A4 landscape; }
+  html, body { background: var(--bg, #0b0e1a); color: var(--text, #e6e9f5);
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+    margin: 0; padding: 28px 32px; font-family: 'Manrope', system-ui, -apple-system, sans-serif; }
+  .pdf-h { font-size: 20px; font-weight: 800; letter-spacing: -0.01em; }
+  .pdf-sub { color: var(--text-3, #8a90a8); font-size: 12px; margin: 6px 0 22px; }
+  .results-table { width: 100%; }
+  .results-group-title { margin: 20px 0 8px; }
+  tr, .results-table { break-inside: avoid; }
+</style></head><body>
+<div class="pdf-h">${escapeHtml(title)}</div>
+<div class="pdf-sub">${escapeHtml(sub)}</div>
+${tablesHtml}
+<script>window.addEventListener('load',function(){setTimeout(function(){window.focus();window.print();},400);});<\/script>
+</body></html>`);
+  win.document.close();
 }
 
 function downloadCsv(filename, header, rows) {
