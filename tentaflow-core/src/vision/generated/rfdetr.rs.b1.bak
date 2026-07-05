@@ -1,4 +1,4 @@
-// Generated from ONNX "/tmp/claude-1000/-mnt-abyss-Files-Dokumenty-Praca-Euvic-Tematy-Acme-PoC-AI/8ac0e073-68ff-4807-b1e6-520512a7b517/scratchpad/rfdetr-base-simp.onnx" by burn-onnx
+// Generated from ONNX "/tmp/claude-1000/-mnt-abyss-Files-Dokumenty-Praca-Euvic-Tematy-ADR-PoC-AI/8ac0e073-68ff-4807-b1e6-520512a7b517/scratchpad/rfdetr-base-simp.onnx" by burn-onnx
 use burn::prelude::*;
 use burn::nn::LayerNorm;
 use burn::nn::LayerNormConfig;

@@ -3168,7 +3168,7 @@ function renderRecogDataTab(panel, p) {
           <p class="ml-studio-data-origin-text" style="margin:10px 0">Zbiory detekcji to dziesiątki/setki MB obrazów — podajesz ŚCIEŻKĘ do katalogu COCO (z <code>_annotations.coco.json</code>), nie wgrywasz bajtów. Klasy i liczba obrazów są czytane z plików COCO.</p>
           <div class="ml-studio-source-fields">
             <tf-input id="ml-studio-recog-path" label="Ścieżka katalogu COCO" placeholder="/home/.../dataset_aug" style="flex:1;min-width:260px"></tf-input>
-            <tf-input id="ml-studio-recog-name" label="Nazwa (opcjonalnie)" placeholder="np. Acme ADR" style="min-width:180px"></tf-input>
+            <tf-input id="ml-studio-recog-name" label="Nazwa (opcjonalnie)" placeholder="np. ADR" style="min-width:180px"></tf-input>
             <tf-button variant="secondary" icon="plus" id="ml-studio-recog-register">Zarejestruj dataset</tf-button>
           </div>
         </details>

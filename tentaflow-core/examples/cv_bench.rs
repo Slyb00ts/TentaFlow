@@ -2,7 +2,7 @@
 // File: examples/cv_bench.rs — camera-CV pipeline latency + fleet-capacity bench
 // =============================================================================
 //
-// Answers two operational questions for the Acme PoC:
+// Answers two operational questions for the ADR PoC:
 //   1. How long does one frame's analysis really take? (detector + state + OCR)
 //   2. How many cameras can one GPU sustain at a target FPS?
 //

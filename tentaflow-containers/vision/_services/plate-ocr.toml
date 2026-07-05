@@ -28,5 +28,5 @@ feature_flag = "inference-vision-gpu"
 [[model_preset]]
 id = "plate-ocr-fast"
 display_name = "Plate OCR (fast-plate)"
-repo = "https://models.tentaflow.local/acme/plate-ocr/v1"
+repo = "https://models.tentaflow.local/adr/plate-ocr/v1"
 recommended = true

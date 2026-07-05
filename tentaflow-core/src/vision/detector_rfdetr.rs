@@ -2,7 +2,7 @@
 // File: vision/detector_rfdetr.rs — RF-DETR ADR detector (ort+CUDA / Burn)
 // =============================================================================
 //
-// Always-on ADR (dangerous-goods placards / labels) detector for the Acme
+// Always-on ADR (dangerous-goods placards / labels) detector for the ADR
 // camera-CV PoC. Backend inferencji wybierany cfg/feature:
 //   * `inference-supertonic` (ONNX Runtime, crate `ort`) → sesja ort + CUDA EP na
 //     natywnej CUDA 13.3, model dynamic-batch `rfdetr-base.onnx` (prawdziwy

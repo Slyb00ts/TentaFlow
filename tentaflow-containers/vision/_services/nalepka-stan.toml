@@ -28,5 +28,5 @@ feature_flag = "inference-vision-gpu"
 [[model_preset]]
 id = "nalepka-stan-mnv4"
 display_name = "Nalepka Stan (MobileNetV4, 5 klas)"
-repo = "https://models.tentaflow.local/acme/nalepka-stan/v1"
+repo = "https://models.tentaflow.local/adr/nalepka-stan/v1"
 recommended = true

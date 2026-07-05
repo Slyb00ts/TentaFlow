@@ -1,7 +1,7 @@
 // =============================================================================
 // Plik: benches/resize_perf.rs
 // Opis: Benchmark perf resizera RGB24 (vision::resize) na realnych zdjeciach
-//       Acme vs image::imageops::resize (Triangle). Mierzy downscale do
+//       ADR PoC vs image::imageops::resize (Triangle). Mierzy downscale do
 //       560x560 i 1280x720 — czas/obraz i przepustowosc MPx/s.
 // =============================================================================
 
@@ -14,9 +14,9 @@ use image::{imageops::FilterType, RgbImage};
 
 use tentaflow_core::vision::resize::resize_rgb;
 
-/// Katalog z realnymi zdjeciami Acme (PoC AI). Jesli niedostepny (CI bez
+/// Katalog z realnymi zdjeciami ADR (PoC AI). Jesli niedostepny (CI bez
 /// montowanego dysku), bench loguje i konczy bez panic.
-const ORLEN_DIR: &str = "/mnt/abyss/Files/Dokumenty/Praca/Euvic/Tematy/Acme/PoC AI/Zdjęcia/5";
+const ADR_DIR: &str = "/mnt/abyss/Files/Dokumenty/Praca/Euvic/Tematy/ADR/PoC AI/Zdjęcia/5";
 
 /// Zdjecia do benchu — kilka klatek ~5152x3864.
 const SAMPLES: &[&str] = &[
@@ -33,7 +33,7 @@ fn load_rgb(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
 }
 
 fn bench_resize(c: &mut Criterion) {
-    let dir = Path::new(ORLEN_DIR);
+    let dir = Path::new(ADR_DIR);
     let mut images: Vec<(String, Vec<u8>, u32, u32)> = Vec::new();
     for name in SAMPLES {
         let p = dir.join(name);
@@ -44,7 +44,7 @@ fn bench_resize(c: &mut Criterion) {
 
     if images.is_empty() {
         eprintln!(
-            "resize_perf: brak zdjec Acme w {ORLEN_DIR} — bench pominiety (zamontuj dysk)"
+            "resize_perf: brak zdjec ADR w {ADR_DIR} — bench pominiety (zamontuj dysk)"
         );
         return;
     }

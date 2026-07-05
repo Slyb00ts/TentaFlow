@@ -1,5 +1,5 @@
 // =============================================================================
-// File: vision/camera_cv_models.rs — camera-CV model bundle download (Acme PoC)
+// File: vision/camera_cv_models.rs — camera-CV model bundle download (ADR PoC)
 // =============================================================================
 //
 // The always-on camera analysis pipeline (RF-DETR detector + state classifier +
