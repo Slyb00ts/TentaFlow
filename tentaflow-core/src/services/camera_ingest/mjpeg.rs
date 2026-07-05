@@ -105,11 +105,19 @@ pub(super) fn build_mjpeg_pipeline(
     // Źródło HTTP. `is-live=true` — strumień na żywo (bez seek, timestamps od
     // zegara). `retries=0` — retry zarządzamy na poziomie sesji (ten sam
     // backoff co RTSP), wewnętrzny retry souphttpsrc tylko by go maskował.
+    // `ssl-strict=false` — kamery IP (Axis, Hikvision, Dahua) serwują MJPEG
+    // po https z self-signed certem; domyślna walidacja zrywa strumień
+    // ("streaming stopped, reason error (-5)") mimo że test połączenia
+    // przechodzi. Ten sam udokumentowany trade-off co `tls-validation-flags=0`
+    // w build_rtspsrc i AcceptAnyServerCert w probe RTSPS: kamera to zasób
+    // jawnie zarejestrowany przez admina na zaufanym segmencie LAN, a TLS
+    // nadal szyfruje transport (w tym Basic/Digest creds).
     let src = gst::ElementFactory::make("souphttpsrc")
         .property("location", url)
         .property("is-live", true)
         .property("timeout", timeout_secs)
         .property("retries", 0i32)
+        .property("ssl-strict", false)
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("souphttpsrc: {e}")))?;
     if let Some((user, pass)) = creds {

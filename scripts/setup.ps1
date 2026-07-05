@@ -170,7 +170,11 @@ function Add-PersistentPathList {
 function Winget-Install {
     param(
         [Parameter(Mandatory)][string]$Id,
-        [string]$Label = $null
+        [string]$Label = $null,
+        # Extra arguments appended to the underlying installer command line
+        # (winget --custom). For MSI packages these are msiexec properties,
+        # e.g. 'ADDLOCAL=ALL'.
+        [string]$CustomArgs = $null
     )
     if (-not $Label) { $Label = $Id }
 
@@ -187,7 +191,9 @@ function Winget-Install {
     }
 
     Log-Info "Instalacja $Label przez winget ($Id)..."
-    & winget install --id $Id --exact --silent --accept-source-agreements --accept-package-agreements
+    $wingetArgs = @('install', '--id', $Id, '--exact', '--silent', '--accept-source-agreements', '--accept-package-agreements')
+    if ($CustomArgs) { $wingetArgs += @('--custom', $CustomArgs) }
+    & winget @wingetArgs
     if ($LASTEXITCODE -ne 0) {
         # winget zwraca rozne kody bledow. Sprawdz czy mimo to pakiet jest dostepny.
         Refresh-Path
@@ -440,7 +446,13 @@ function Configure-Gstreamer {
     $root = Find-GstreamerInstall
     if (-not $root) {
         Log-Info "Nie znaleziono GStreamer SDK, probuje instalacji przez winget..."
-        Winget-Install -Id 'gstreamerproject.gstreamer' -Label 'GStreamer SDK' | Out-Null
+        # ADDLOCAL=ALL: silent MSI defaults to the Typical feature set, which
+        # skips part of the plugin catalog. Camera ingest resolves elements at
+        # runtime (souphttpsrc/multipartdemux/jpegdec — good, jpegparse/
+        # h264parse — bad, x264enc — ugly, avdec_h264 — libav), so we need the
+        # complete install; a missing plugin fails the pipeline build per
+        # camera ("Failed to find element factory").
+        Winget-Install -Id 'gstreamerproject.gstreamer' -Label 'GStreamer SDK' -CustomArgs 'ADDLOCAL=ALL' | Out-Null
         Refresh-Path
         $root = Find-GstreamerInstall
     }

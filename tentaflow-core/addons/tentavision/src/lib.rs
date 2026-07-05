@@ -3367,6 +3367,18 @@ fn handle_camera_remove(params: &JsonValue) -> JsonValue {
     let camera_id = params.get("camera_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     with_state(|s| s.clear_messages());
     if camera_id.is_empty() { with_state(|s| { s.error_message = Some("Wybierz kamerę do usunięcia.".to_string()); }); return json!({"ok":false,"error":"empty camera_id"}); }
+    // Remove from the CORE first — this soft-deletes the platform row and
+    // tears down the ingest pipeline. Deleting only the addon-local row would
+    // orphan the core camera: gone from the list, but the supervisor keeps
+    // (re)connecting to it forever. NotFound is tolerated so a locally
+    // orphaned row (core side already gone) can still be cleaned up.
+    match camera_remove(&camera_id) {
+        Ok(()) | Err(AbiError::NotFound) => {}
+        Err(e) => {
+            with_state(|s| { s.error_message = Some(alloc::format!("Błąd usuwania z rdzenia: {}", abi_message(e))); });
+            return json!({"ok":false,"error":alloc::format!("{}",e)});
+        }
+    }
     match db::delete_camera(&camera_id) {
         Ok(_) => { with_state(|s| { s.camera_pending_remove = None; s.success_message = Some("Kamera usunięta.".to_string()); }); json!({"ok":true}) }
         Err(e) => { with_state(|s| { s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e))); }); json!({"ok":false,"error":alloc::format!("{}",e)}) }

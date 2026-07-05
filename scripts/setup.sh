@@ -353,6 +353,16 @@ install_base() {
                 glib2
                 gstreamer
                 gst-plugins-base-libs
+                # Runtime plugins for camera ingest — build only needs base-devel,
+                # but the binary resolves elements at runtime: good (souphttpsrc,
+                # multipartdemux, jpegdec, mp4mux, rtspsrc, rtph264depay),
+                # bad (jpegparse, h264parse, h264timestamper, nvcodec),
+                # ugly (x264enc), libav (avdec_h264). Missing plugin = pipeline
+                # build fails per camera ("Failed to find element factory").
+                gst-plugins-good
+                gst-plugins-bad
+                gst-plugins-ugly
+                gst-libav
                 openssl
                 vulkan-icd-loader
                 sqlite
@@ -382,7 +392,7 @@ install_base() {
                 run_privileged pacman -S --needed --noconfirm protobuf
                 INSTALLED+=("protobuf")
             fi
-            INSTALLED+=("base-devel" "cmake" "clang" "lld" "git" "git-lfs" "jdk17-openjdk" "unzip" "glib2" "gstreamer" "gst-plugins-base-libs" "vulkan-loader" "sqlite" "perf" "sysstat")
+            INSTALLED+=("base-devel" "cmake" "clang" "lld" "git" "git-lfs" "jdk17-openjdk" "unzip" "glib2" "gstreamer" "gst-plugins-base-libs" "gst-plugins-good" "gst-plugins-bad" "gst-plugins-ugly" "gst-libav" "vulkan-loader" "sqlite" "perf" "sysstat")
             ;;
         debian)
             log_info "Aktualizacja listy pakietow apt..."
@@ -401,6 +411,17 @@ install_base() {
                 libglib2.0-dev
                 libgstreamer1.0-dev
                 libgstreamer-plugins-base1.0-dev
+                # Runtime plugins for camera ingest — dev packages above only
+                # cover the build; the binary resolves elements at runtime:
+                # good (souphttpsrc, multipartdemux, jpegdec, mp4mux, rtspsrc,
+                # rtph264depay), bad (jpegparse, h264parse, h264timestamper,
+                # nvcodec), ugly (x264enc), libav (avdec_h264). Missing plugin
+                # = pipeline build fails per camera ("Failed to find element
+                # factory").
+                gstreamer1.0-plugins-good
+                gstreamer1.0-plugins-bad
+                gstreamer1.0-plugins-ugly
+                gstreamer1.0-libav
                 libssl-dev
                 libvulkan1
                 libsqlite3-dev
@@ -424,7 +445,7 @@ install_base() {
             fi
             log_info "Instalacja: ${pkgs[*]}"
             run_privileged apt-get install -y "${pkgs[@]}"
-            INSTALLED+=("build-essential" "cmake" "clang" "lld" "git" "git-lfs" "openjdk-17-jdk" "unzip" "libglib2.0-dev" "libgstreamer1.0-dev" "libgstreamer-plugins-base1.0-dev" "libvulkan1" "sqlite3-dev" "perf" "sysstat" "libclang-dev" "patchelf")
+            INSTALLED+=("build-essential" "cmake" "clang" "lld" "git" "git-lfs" "openjdk-17-jdk" "unzip" "libglib2.0-dev" "libgstreamer1.0-dev" "libgstreamer-plugins-base1.0-dev" "gstreamer1.0-plugins-good" "gstreamer1.0-plugins-bad" "gstreamer1.0-plugins-ugly" "gstreamer1.0-libav" "libvulkan1" "sqlite3-dev" "perf" "sysstat" "libclang-dev" "patchelf")
             ;;
         fedora)
             local pkgs=(
@@ -454,6 +475,18 @@ install_base() {
                 glib2-devel
                 gstreamer1-devel
                 gstreamer1-plugins-base-devel
+                # Runtime plugins for camera ingest: good (souphttpsrc,
+                # multipartdemux, jpegdec, mp4mux, rtspsrc, rtph264depay),
+                # bad (jpegparse, h264parse, h264timestamper, nvcodec).
+                # x264enc (ugly) and avdec_h264 (libav) live in RPM Fusion —
+                # listed here and picked up when the repo is enabled;
+                # --skip-unavailable keeps setup green without it, but the
+                # camera preview transcode (x264enc) and RTSP H.264 decode
+                # (avdec_h264) REQUIRE them at runtime.
+                gstreamer1-plugins-good
+                gstreamer1-plugins-bad-free
+                gstreamer1-plugins-ugly
+                gstreamer1-libav
                 openssl-devel
                 vulkan-loader
                 sqlite-devel
@@ -474,7 +507,7 @@ install_base() {
             # --skip-unavailable: nie przerywaj calej transakcji gdy jeden pakiet
             # zniknal w danej wersji Fedory (np. java-17 na F44) — reszta wchodzi.
             run_privileged dnf install -y --skip-unavailable "${pkgs[@]}"
-            INSTALLED+=("gcc/g++" "libstdc++-static" "glibc-static" "cmake" "clang" "lld" "git" "git-lfs" "java-latest-openjdk-devel" "unzip" "glib2-devel" "gstreamer1-devel" "gstreamer1-plugins-base-devel" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
+            INSTALLED+=("gcc/g++" "libstdc++-static" "glibc-static" "cmake" "clang" "lld" "git" "git-lfs" "java-latest-openjdk-devel" "unzip" "glib2-devel" "gstreamer1-devel" "gstreamer1-plugins-base-devel" "gstreamer1-plugins-good" "gstreamer1-plugins-bad-free" "gstreamer1-plugins-ugly (RPM Fusion)" "gstreamer1-libav (RPM Fusion)" "vulkan-loader" "sqlite-devel" "perf" "sysstat")
             ;;
         macos)
             if ! command -v brew &>/dev/null; then
@@ -496,6 +529,10 @@ install_base() {
                 unzip
                 pkg-config
                 glib
+                # Homebrew's gstreamer formula is monolithic (since 2023 it
+                # bundles base/good/bad/ugly/libav in one keg), so all camera
+                # runtime elements (souphttpsrc, x264enc, avdec_h264, ...) come
+                # with it — no separate plugin formulas needed.
                 gstreamer
                 gst-plugins-base
                 openssl@3
