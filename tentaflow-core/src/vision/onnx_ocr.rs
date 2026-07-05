@@ -221,8 +221,10 @@ impl OnnxOcrEngine {
         Ok(built)
     }
 
-    /// Pelny pipeline na obrazku RGB: det -> (cls) -> rec -> konkatenacja linii.
-    fn run_pipeline(&self, rgb: &[u8], width: u32, height: u32) -> Result<Option<String>> {
+    /// Pelny pipeline na obrazku RGB: det -> (cls) -> rec -> linie tekstu
+    /// posortowane top->bottom, left->right. Baza dla `read` (konkatenacja) i
+    /// dla odczytu ADR (`read_lines`).
+    fn run_pipeline(&self, rgb: &[u8], width: u32, height: u32) -> Result<Vec<String>> {
         let expected = width as usize * height as usize * 3;
         if rgb.len() < expected {
             return Err(anyhow!(
@@ -238,7 +240,7 @@ impl OnnxOcrEngine {
 
         let mut boxes = self.detect(&img)?;
         if boxes.is_empty() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         // Sortuj linie top->bottom, a w obrebie podobnej wysokosci left->right.
         boxes.sort_by(|a, b| {
@@ -265,11 +267,7 @@ impl OnnxOcrEngine {
             }
         }
 
-        if lines.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(lines.join("\n")))
-        }
+        Ok(lines)
     }
 
     /// Detekcja DB. Skaluje obraz do statycznego boku det, uruchamia model,
@@ -419,8 +417,17 @@ impl OnnxOcrEngine {
 }
 
 impl OcrRunner for OnnxOcrEngine {
-    fn read(&self, crop_rgb: &[u8], cw: u32, ch: u32) -> Result<Option<String>> {
+    fn read_lines(&self, crop_rgb: &[u8], cw: u32, ch: u32) -> Result<Vec<String>> {
         self.run_pipeline(crop_rgb, cw, ch)
+    }
+
+    fn read(&self, crop_rgb: &[u8], cw: u32, ch: u32) -> Result<Option<String>> {
+        let lines = self.run_pipeline(crop_rgb, cw, ch)?;
+        if lines.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(lines.join("\n")))
+        }
     }
 }
 

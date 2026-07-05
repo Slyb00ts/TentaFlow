@@ -117,12 +117,22 @@ pub extern "C" fn tentaflow_register_apple_ocr(
     tracing::info!("[apple-ocr] Swift callbacks zarejestrowane");
 }
 
-/// Ksztalt JSON zwracanego przez `MLXAppleOCR_recognize`. Czytamy `text`; `lines`
-/// (boxy/pewnosc) sa dostepne dla bogatszych konsumentow, ale `OcrRunner::read`
-/// zwraca tylko polaczony tekst.
+/// Ksztalt JSON zwracanego przez `MLXAppleOCR_recognize`: `{ text, lines: [{
+/// text, confidence, x, y, width, height }] }`. `read` uzywa `text`, a
+/// `read_lines` — obserwacji per-linia (z boxem, do sortowania top->bottom).
 #[derive(Debug, Deserialize)]
 struct OcrJson {
     text: String,
+    #[serde(default)]
+    lines: Vec<OcrLineJson>,
+}
+
+/// Pojedyncza obserwacja Vision: tekst linii + jej box w znormalizowanych
+/// wspolrzednych (origin dolny-lewy, wiec wieksze `y` = wyzej na obrazie).
+#[derive(Debug, Deserialize)]
+struct OcrLineJson {
+    text: String,
+    y: f32,
 }
 
 /// Domyslne jezyki rozpoznawania. Vision sam dobiera model per-jezyk; podajemy
@@ -156,9 +166,10 @@ impl AppleOcrEngine {
         Ok(())
     }
 
-    /// Surowy odczyt: enkoduje crop RGB24 do PNG i woła Vision. Wspoldzielony
-    /// przez `OcrRunner::read` (camera crop) i deploy smoke.
-    fn recognize_rgb(&self, rgb: &[u8], width: u32, height: u32) -> Result<Option<String>> {
+    /// Surowy odczyt: enkoduje crop RGB24 do PNG i woła Vision, zwracajac
+    /// sparsowany JSON (`text` + `lines`). Wspoldzielony przez `read`/`read_lines`.
+    /// `None` = Vision zwrocil NULL (blad enkodowania/rozpoznania).
+    fn recognize_rgb(&self, rgb: &[u8], width: u32, height: u32) -> Result<Option<OcrJson>> {
         self.ensure_bridge()?;
         let png = encode_png(rgb, width, height)?;
         let (recognize, free_string) = {
@@ -187,12 +198,7 @@ impl AppleOcrEngine {
 
         let parsed: OcrJson =
             serde_json::from_str(&json).context("parse Apple OCR JSON")?;
-        let text = parsed.text.trim().to_string();
-        if text.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(text))
-        }
+        Ok(Some(parsed))
     }
 }
 
@@ -203,8 +209,33 @@ impl Default for AppleOcrEngine {
 }
 
 impl OcrRunner for AppleOcrEngine {
+    fn read_lines(&self, crop_rgb: &[u8], cw: u32, ch: u32) -> Result<Vec<String>> {
+        let Some(parsed) = self.recognize_rgb(crop_rgb, cw, ch)? else {
+            return Ok(Vec::new());
+        };
+        // Vision zwraca boxy z origin dolny-lewy, wiec wieksze `y` = wyzej na
+        // obrazie. Sortujemy malejaco po `y`, zeby linie szly top->bottom.
+        let mut lines = parsed.lines;
+        lines.sort_by(|a, b| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(lines
+            .into_iter()
+            .filter_map(|l| {
+                let t = l.text.trim().to_string();
+                (!t.is_empty()).then_some(t)
+            })
+            .collect())
+    }
+
     fn read(&self, crop_rgb: &[u8], cw: u32, ch: u32) -> Result<Option<String>> {
-        self.recognize_rgb(crop_rgb, cw, ch)
+        let Some(parsed) = self.recognize_rgb(crop_rgb, cw, ch)? else {
+            return Ok(None);
+        };
+        let text = parsed.text.trim().to_string();
+        if text.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(text))
+        }
     }
 }
 
