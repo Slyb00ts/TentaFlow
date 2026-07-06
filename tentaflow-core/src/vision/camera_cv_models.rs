@@ -62,6 +62,7 @@ impl CvBundle {
 const RFDETR_CLASSES: &str = include_str!("cv_assets/rfdetr-classes.json");
 const STAN_CLASSES: &str = include_str!("cv_assets/stan-classes.json");
 const PLATE_CONFIG: &str = include_str!("cv_assets/plate-ocr-config.json");
+const ADR_OCR_ALPHABET: &str = include_str!("cv_assets/adr-ocr-alphabet.txt");
 
 const BUNDLES: &[CvBundle] = &[
     CvBundle {
@@ -143,6 +144,23 @@ const BUNDLES: &[CvBundle] = &[
                 name: "plate-ocr-config.json",
                 remote: false,
                 embedded: Some(PLATE_CONFIG),
+                supertonic_only: false,
+            },
+            CvFile {
+                // Nasz wytrenowany CRNN do numerów ADR (~4 MB). GŁÓWNY czytnik
+                // trybu ADR (`vision::adr_ocr`); dystrybuowany z bundlem OCR do
+                // pozostałych node'ów przez release URL, jak plate/rfdetr/stan.
+                name: "adr_ocr.onnx",
+                remote: true,
+                embedded: None,
+                supertonic_only: false,
+            },
+            CvFile {
+                // Alfabet klas ADR OCR (`0123456789`) — mały i stabilny, więc
+                // wbudowany w binarkę i zapisywany verbatim, jak sidecar-konfigi.
+                name: "adr_ocr_alphabet.txt",
+                remote: false,
+                embedded: Some(ADR_OCR_ALPHABET),
                 supertonic_only: false,
             },
         ],

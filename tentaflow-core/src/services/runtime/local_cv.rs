@@ -277,12 +277,30 @@ async fn ocr_local(crop: CvFrameLocal, mode: CvOcrMode) -> Result<CameraCvResult
     Ok(CameraCvResult::Text { tekst })
 }
 
-/// Odczyt tablicy ADR: ogólny OCR PP-OCRv5 (`read_lines`) daje linie góra→dół,
-/// z których `adr::snap_adr_from_lines` wyłuskuje numer UN i dopasowuje go do
-/// `adr-list.json` (kemler + opis z trafionego wpisu). PP-OCRv5 nie jest
-/// silnikiem Burn/GPU — wystarczy `spawn_blocking`.
+/// Odczyt tablicy ADR. GŁÓWNIE nasz wytrenowany CRNN (`vision::adr_ocr`):
+/// crop → `read_adr` (orientation-search) → numer UN → `adr::snap_adr`
+/// (kemler + opis z trafionego wpisu `adr-list.json`). FALLBACK, gdy nasz model
+/// jest niedostępny, nic nie odczyta lub UN nie dopasuje się do listy: ogólny
+/// PP-OCRv5 (`read_lines` → `adr::snap_adr_from_lines`). Żaden z silników nie
+/// jest Burn/GPU — wystarczy `spawn_blocking`.
 #[cfg(feature = "inference-vision-gpu")]
 async fn ocr_adr_local(crop: CvFrameLocal) -> Result<CameraCvResult, String> {
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    if let Some(engine) = crate::vision::adr_ocr::get() {
+        let c = crop.clone();
+        match tokio::task::spawn_blocking(move || {
+            engine
+                .read_adr(&c.data, c.width, c.height)
+                .and_then(|(_, un)| crate::vision::adr::snap_adr(&un))
+        })
+        .await
+        {
+            Ok(Some(text)) => return Ok(CameraCvResult::Text { tekst: Some(text) }),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("[adr] nasz AdrOcr task nie powiódł się: {e}"),
+        }
+    }
+
     crate::vision::ensure_camera_ocr_runner();
     let runner = crate::vision::get_ocr_runner()
         .ok_or_else(|| "OCR ogólny (PP-OCRv5) niedostępny — deploy ppocrv5-ocr".to_string())?;

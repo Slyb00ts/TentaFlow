@@ -73,6 +73,12 @@ pub mod paddle_ocr_mlx;
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub mod onnx_ocr;
 
+// Nasz wytrenowany czytnik numerów ADR (mały CRNN) przez tract-onnx. Główny
+// silnik trybu ADR; PP-OCRv5 (`onnx_ocr`) jest fallbackiem. Nie-Apple (na
+// macOS/iOS OCR pokrywa apple_ocr), jak `onnx_ocr`.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+pub mod adr_ocr;
+
 pub mod hsemotion;
 pub mod movenet;
 pub mod scrfd;

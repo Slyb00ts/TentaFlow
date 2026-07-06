@@ -87,7 +87,7 @@ pub fn snap_adr_from_lines(lines: &[String]) -> Option<String> {
 /// `None`. Zwraca `"<kemler>/<un> <opis>"` z listy (opis po separatorze-spacji,
 /// żeby front mógł go odczepić bez żadnych danych wbudowanych po swojej stronie).
 /// Gdy lista pusta (brak pliku `adr-list.json`) — zawsze `None`.
-fn snap_adr(dolny: &str) -> Option<String> {
+pub fn snap_adr(dolny: &str) -> Option<String> {
     if dolny.is_empty() {
         return None;
     }

@@ -1,12 +1,11 @@
 // =============================================================================
-// File: examples/adr_probe.rs — real-image ADR OCR probe (PP-OCRv5 + snap)
+// File: examples/adr_probe.rs — real-image ADR OCR probe (our CRNN + snap)
 // =============================================================================
 //
-// Verifies the ADR reading path end-to-end on REAL cropped ADR plates:
-//   crop → OnnxOcrEngine::read_lines (PP-OCRv5 det→rec) → adr::snap_adr_from_lines
-//   → "<kemler>/<un> <opis>" from adr-list.json.
-//
-// No Tesseract anywhere. Pass one or more image paths as CLI args.
+// Verifies the ADR reading path end-to-end on REAL cropped ADR plates using OUR
+// trained CRNN (vision::adr_ocr::AdrOcr): crop → read_adr (orientation-search,
+// top/bottom split, CTC) → adr::snap_adr(un) → "<kemler>/<un> <opis>".
+// Pass one or more image paths as CLI args.
 //   cargo run --release --features inference-vision-gpu --example adr_probe -- crops/*.png
 #![cfg(feature = "inference-vision-gpu")]
 
@@ -14,13 +13,12 @@ use anyhow::Result;
 
 use tentaflow_core::paths;
 use tentaflow_core::vision::adr;
-use tentaflow_core::vision::onnx_ocr::OnnxOcrEngine;
-use tentaflow_core::vision::OcrRunner;
+use tentaflow_core::vision::adr_ocr::AdrOcr;
 
 fn main() -> Result<()> {
     let dir = paths::vision_models_dir();
-    println!("PP-OCRv5 z: {}", dir.display());
-    let engine = OnnxOcrEngine::from_dir(&dir)?;
+    println!("AdrOcr z: {}", dir.display());
+    let engine = AdrOcr::from_dir(&dir)?;
     println!("model załadowany.\n");
 
     let mut hit = 0usize;
@@ -29,8 +27,10 @@ fn main() -> Result<()> {
         total += 1;
         let img = image::open(&path)?.to_rgb8();
         let (w, h) = img.dimensions();
-        let lines = engine.read_lines(img.as_raw(), w, h)?;
-        let snap = adr::snap_adr_from_lines(&lines);
+        let read = engine.read_adr(img.as_raw(), w, h);
+        let snap = read
+            .as_ref()
+            .and_then(|(_k, un)| adr::snap_adr(un));
         if snap.is_some() {
             hit += 1;
         }
@@ -38,8 +38,8 @@ fn main() -> Result<()> {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.clone());
-        println!("{name}: linie={lines:?} -> ADR={snap:?}");
+        println!("{name}: read={read:?} -> ADR={snap:?}");
     }
-    println!("\n== {hit}/{total} cropów dopasowano do listy ADR ==");
+    println!("\n== {hit}/{total} cropów dopasowano do listy ADR (nasz CRNN) ==");
     Ok(())
 }
