@@ -383,9 +383,14 @@ internal sealed class TranslatorAddon : AddonBase
         string orig = stt.Text.Trim();
         if (orig.Length == 0)
         {
+            // Terminal path: clear the streaming caret, but only if this is still
+            // the current generation (a newer utterance owns the flag otherwise) —
+            // a prior superseded utterance may have left `translating` true.
             if (!IsStaleGeneration(userId, gen))
             {
-                SendPatch(SetOp("pipeline", "Gotowy — mów, aby rozpocząć"));
+                SendPatch(
+                    SetOp("translating", TfValue.Bool(false)),
+                    SetOp("pipeline", "Gotowy — mów, aby rozpocząć"));
             }
             return Ok();
         }
@@ -407,6 +412,8 @@ internal sealed class TranslatorAddon : AddonBase
             SetOp("live_prev1", prev1),
             SetOp("live_orig", orig),
             SetOp("live_cur", ""),
+            // `translating` drives the streaming caret on the current line.
+            SetOp("translating", TfValue.Bool(true)),
             SetOp("pipeline", $"{ModelLabel()} — tłumaczenie…"));
 
         var (trans, finish, _) = StreamTranslation(
@@ -422,7 +429,9 @@ internal sealed class TranslatorAddon : AddonBase
 
         if (finish == "error")
         {
-            SendPatch(SetOp("pipeline", "Błąd tłumaczenia — spróbuj ponownie"));
+            SendPatch(
+                SetOp("translating", TfValue.Bool(false)),
+                SetOp("pipeline", "Błąd tłumaczenia — spróbuj ponownie"));
             return Ok();
         }
 
@@ -433,7 +442,9 @@ internal sealed class TranslatorAddon : AddonBase
         }
         WriteLiveBuffer(userId, buffer);
 
-        SendPatch(SetOp("pipeline", "Gotowy — mów dalej"));
+        SendPatch(
+            SetOp("translating", TfValue.Bool(false)),
+            SetOp("pipeline", "Gotowy — mów dalej"));
 
         if (SaveHistory())
         {
@@ -862,6 +873,28 @@ internal sealed class TranslatorAddon : AddonBase
 
     private void SendShell(ulong epoch)
     {
+        // App title with a leading accent glyph (a badge carrying the addon's
+        // translate icon — no CSS ::before).
+        var title = new Box
+        {
+            Id = "app-title",
+            Direction = FlexDirection.Row,
+            Align = FlexAlign.Center,
+            Gap = Spacing.Sm,
+            Children = new List<Component>
+            {
+                new Badge
+                {
+                    Id = "app-glyph",
+                    Variant = BadgeVariant.Soft,
+                    Tone = Tone.Primary,
+                    Icon = new IconRefNamed { Name = IconName.Globe },
+                    Label = Bind.Lit(""),
+                },
+                new Heading { Id = "app-title-text", Content = Bind.Lit("Tłumacz"), Level = 3 },
+            },
+        };
+
         var topBar = new Box
         {
             Id = "topbar",
@@ -872,17 +905,26 @@ internal sealed class TranslatorAddon : AddonBase
             Style = new BoxStyle
             {
                 Padding = AllEdges(Spacing.Md),
+                Border = AllBorders(1, BorderColor.Default),
+                Radius = AllCorners(RadiusToken.Lg),
                 Background = BackgroundToken.Subtle,
+            },
+            // Center once narrow; stack title / mode switch / status pill into a
+            // column on a phone so the row never overflows.
+            Responsive = new List<ResponsiveRule>
+            {
+                new ResponsiveRule { MaxWidth = Px(680), Justify = FlexJustify.Center },
+                new ResponsiveRule { MaxWidth = Px(460), Direction = FlexDirection.Column, Align = FlexAlign.Center },
             },
             Children = new List<Component>
             {
-                new Heading { Id = "app-title", Content = Bind.Lit("Tłumacz"), Level = 3 },
+                title,
                 ModeSwitch(),
                 new Badge
                 {
                     Id = "model-pill",
-                    Variant = BadgeVariant.Soft,
-                    Tone = Tone.Primary,
+                    Variant = BadgeVariant.Pulse,
+                    Tone = Tone.Success,
                     Label = Bind.State("status"),
                 },
             },
@@ -1002,6 +1044,7 @@ internal sealed class TranslatorAddon : AddonBase
             Id = "lang-bar",
             Direction = FlexDirection.Row,
             Align = FlexAlign.Center,
+            Justify = FlexJustify.Center,
             Gap = Spacing.Sm,
             Children = new List<Component>
             {
@@ -1033,9 +1076,14 @@ internal sealed class TranslatorAddon : AddonBase
             Direction = FlexDirection.Row,
             Gap = Spacing.Md,
             Align = FlexAlign.Stretch,
+            // Two equal panes side by side; stack into a column on a narrow panel.
+            Responsive = new List<ResponsiveRule>
+            {
+                new ResponsiveRule { MaxWidth = Px(680), Direction = FlexDirection.Column },
+            },
             Children = new List<Component>
             {
-                PanelBox("pane-src", "Tekst źródłowy",
+                PanelBox("pane-src", "Tekst źródłowy", accent: false,
                     new IconButton
                     {
                         Id = "clear-btn",
@@ -1064,7 +1112,7 @@ internal sealed class TranslatorAddon : AddonBase
                         Style = TextStyle.Caption,
                         Tone = Tone.Muted,
                     }),
-                PanelBox("pane-tgt", "Tłumaczenie",
+                PanelBox("pane-tgt", "Tłumaczenie", accent: true,
                     new Box
                     {
                         Id = "tgt-actions",
@@ -1101,6 +1149,8 @@ internal sealed class TranslatorAddon : AddonBase
                         Content = Bind.State("target_text"),
                         Style = TextStyle.Body,
                         Wrap = TextWrap.Wrap,
+                        // Streaming caret while a translation is being produced.
+                        Streaming = Bind.State("translating"),
                     }),
             },
         };
@@ -1112,6 +1162,12 @@ internal sealed class TranslatorAddon : AddonBase
             Align = FlexAlign.Center,
             Justify = FlexJustify.SpaceBetween,
             Gap = Spacing.Md,
+            // Stack the toggle over the (full-width) button on a narrow panel so
+            // the controls never overflow.
+            Responsive = new List<ResponsiveRule>
+            {
+                new ResponsiveRule { MaxWidth = Px(460), Direction = FlexDirection.Column, Align = FlexAlign.Stretch },
+            },
             Children = new List<Component>
             {
                 new Toggle
@@ -1142,12 +1198,18 @@ internal sealed class TranslatorAddon : AddonBase
             Direction = FlexDirection.Row,
             Align = FlexAlign.Center,
             Gap = Spacing.Md,
+            // The engine pill + stat chips stack on a narrow panel instead of
+            // overflowing (Box has no flex-wrap; a column is the safe fallback).
+            Responsive = new List<ResponsiveRule>
+            {
+                new ResponsiveRule { MaxWidth = Px(460), Direction = FlexDirection.Column, Align = FlexAlign.Stretch },
+            },
             Children = new List<Component>
             {
                 new Badge
                 {
                     Id = "engine-pill",
-                    Variant = BadgeVariant.Soft,
+                    Variant = BadgeVariant.Pulse,
                     Tone = Tone.Success,
                     Label = Bind.State("engine_label"),
                 },
@@ -1188,6 +1250,18 @@ internal sealed class TranslatorAddon : AddonBase
             Id = "live-langs",
             Gap = Spacing.Sm,
             Align = FlexAlign.Stretch,
+            Style = new BoxStyle
+            {
+                Padding = AllEdges(Spacing.Md),
+                Border = AllBorders(1, BorderColor.Default),
+                Radius = AllCorners(RadiusToken.Lg),
+                Background = BackgroundToken.Subtle,
+            },
+            // On a phone the reading stage goes first — keep the language pair on top.
+            Responsive = new List<ResponsiveRule>
+            {
+                new ResponsiveRule { MaxWidth = Px(460), Order = 0 },
+            },
             Children = new List<Component>
             {
                 LiveLangRow("live-hear", "Słyszę:", "speaker-select", "speaker_lang", "speaker", withAuto: true),
@@ -1209,7 +1283,18 @@ internal sealed class TranslatorAddon : AddonBase
             Direction = FlexDirection.Column,
             Align = FlexAlign.Center,
             Gap = Spacing.Sm,
-            Style = new BoxStyle { Padding = AllEdges(Spacing.Md) },
+            Style = new BoxStyle
+            {
+                Padding = AllEdges(Spacing.Md),
+                Border = AllBorders(1, BorderColor.Default),
+                Radius = AllCorners(RadiusToken.Lg),
+                Background = BackgroundToken.Subtle,
+            },
+            // On a phone the mic is demoted below the subtitle stage.
+            Responsive = new List<ResponsiveRule>
+            {
+                new ResponsiveRule { MaxWidth = Px(460), Order = 2 },
+            },
             Children = new List<Component>
             {
                 new AudioCapture
@@ -1220,33 +1305,43 @@ internal sealed class TranslatorAddon : AddonBase
                     RecordingPath = StatePath.Keys("recording"),
                     LanguageHint = "en",
                 },
-                new Text { Id = "pipeline-status", Content = Bind.State("pipeline"), Style = TextStyle.Caption, Tone = Tone.Muted, Wrap = TextWrap.Wrap },
+                new Text { Id = "pipeline-status", Content = Bind.State("pipeline"), Style = TextStyle.Caption, Tone = Tone.Muted, Align = TextAlign.Center, Wrap = TextWrap.Wrap },
             },
         };
 
-        // Large, readable stage: two fading prior translations, the source line,
-        // and the big current translation streaming in. `Grow` lets it fill the
-        // available height; the text wraps so it never overflows a narrow screen.
+        // The dominant surface: two fading prior translations, the source line
+        // (uppercase accent), and the big current translation streaming in. Accent
+        // surface + glow declared via BoxStyle. On a phone it fills more height and
+        // sits directly under the language pair (order 1, above the mic).
         var stage = new Box
         {
             Id = "live-stage",
             Grow = true,
             Direction = FlexDirection.Column,
             Align = FlexAlign.Stretch,
+            Justify = FlexJustify.End,
             Gap = Spacing.Sm,
             Style = new BoxStyle
             {
                 Padding = AllEdges(Spacing.Lg),
-                MinHeight = new DimensionTokenPx { Value = 240 },
+                MinHeight = PxDim(240),
+                // Dark panel surface with a subtle accent halo (glow + accent
+                // border), not a saturated purple fill.
                 Background = BackgroundToken.Subtle,
+                Border = AllBorders(1, BorderColor.Accent),
                 Radius = AllCorners(RadiusToken.Md),
+                Shadow = ShadowToken.AccentGlow,
+            },
+            Responsive = new List<ResponsiveRule>
+            {
+                new ResponsiveRule { MaxWidth = Px(460), Order = 1, MinHeight = PxDim(420) },
             },
             Children = new List<Component>
             {
                 new Text { Id = "live-prev2", Content = Bind.State("live_prev2"), Style = TextStyle.Body, Tone = Tone.Muted, Wrap = TextWrap.Wrap },
                 new Text { Id = "live-prev1", Content = Bind.State("live_prev1"), Style = TextStyle.Body, Tone = Tone.Muted, Wrap = TextWrap.Wrap },
-                new Text { Id = "live-orig", Content = Bind.State("live_orig"), Style = TextStyle.Caption, Tone = Tone.Muted, Wrap = TextWrap.Wrap },
-                new Text { Id = "live-cur", Content = Bind.State("live_cur"), Style = TextStyle.Title, Wrap = TextWrap.Wrap },
+                new Text { Id = "live-orig", Content = Bind.State("live_orig"), Style = TextStyle.Overline, Tone = Tone.Primary, Wrap = TextWrap.Wrap },
+                new Text { Id = "live-cur", Content = Bind.State("live_cur"), Style = TextStyle.Display, Wrap = TextWrap.Wrap, Streaming = Bind.State("translating") },
             },
         };
 
@@ -1255,7 +1350,12 @@ internal sealed class TranslatorAddon : AddonBase
             Id = "live-pipeline",
             Direction = FlexDirection.Row,
             Align = FlexAlign.Center,
+            Justify = FlexJustify.Center,
             Gap = Spacing.Xs,
+            Responsive = new List<ResponsiveRule>
+            {
+                new ResponsiveRule { MaxWidth = Px(460), Order = 3 },
+            },
             Children = new List<Component>
             {
                 new Badge { Id = "pipe-mic", Variant = BadgeVariant.Soft, Tone = Tone.Neutral, Icon = new IconRefNamed { Name = IconName.Mic }, Label = Bind.Lit("Mikrofon") },
@@ -1266,12 +1366,23 @@ internal sealed class TranslatorAddon : AddonBase
             },
         };
 
-        return new Stack
+        // Width-capped, centered column (no margin-auto — center via the parent).
+        var column = new Box
         {
             Id = "live-mode",
-            Gap = Spacing.Md,
+            Direction = FlexDirection.Column,
             Align = FlexAlign.Stretch,
+            Gap = Spacing.Md,
+            Style = new BoxStyle { MaxWidth = PxDim(720) },
             Children = new List<Component> { langCard, mic, stage, pipeline },
+        };
+
+        return new Stack
+        {
+            Id = "live-mode-center",
+            Gap = Spacing.Md,
+            Align = FlexAlign.Center,
+            Children = new List<Component> { column },
         };
     }
 
@@ -1286,6 +1397,11 @@ internal sealed class TranslatorAddon : AddonBase
             Direction = FlexDirection.Row,
             Align = FlexAlign.Center,
             Gap = Spacing.Sm,
+            // Label over control once the row is too narrow for both side by side.
+            Responsive = new List<ResponsiveRule>
+            {
+                new ResponsiveRule { MaxWidth = Px(460), Direction = FlexDirection.Column, Align = FlexAlign.Stretch },
+            },
             Children = new List<Component>
             {
                 new Text { Id = $"{id}-lbl", Content = Bind.Lit(label), Style = TextStyle.Caption, Tone = Tone.Muted },
@@ -1311,7 +1427,7 @@ internal sealed class TranslatorAddon : AddonBase
             Gap = Spacing.Md,
             Children = new List<Component>
             {
-                new Text { Id = "save-note", Content = Bind.State("settings_saved"), Style = TextStyle.Caption, Tone = Tone.Muted },
+                new Text { Id = "save-note", Content = Bind.State("settings_saved"), Style = TextStyle.Caption, Tone = Tone.Success },
                 new Button
                 {
                     Id = "save-btn",
@@ -1325,11 +1441,13 @@ internal sealed class TranslatorAddon : AddonBase
             },
         };
 
-        return new Stack
+        var column = new Box
         {
             Id = "settings-mode",
-            Gap = Spacing.Md,
+            Direction = FlexDirection.Column,
             Align = FlexAlign.Stretch,
+            Gap = Spacing.Md,
+            Style = new BoxStyle { MaxWidth = PxDim(760) },
             Children = new List<Component>
             {
                 SettingsCard("Modele", new List<Component>
@@ -1392,6 +1510,14 @@ internal sealed class TranslatorAddon : AddonBase
                 saveBar,
             },
         };
+
+        return new Stack
+        {
+            Id = "settings-mode-center",
+            Gap = Spacing.Md,
+            Align = FlexAlign.Center,
+            Children = new List<Component> { column },
+        };
     }
 
     // Dropdown of the granted models for a picker; an empty list yields a clear
@@ -1452,7 +1578,12 @@ internal sealed class TranslatorAddon : AddonBase
     // UI builders
     // -------------------------------------------------------------------------
 
-    private static Component PanelBox(string id, string title, Component? headerAction, params Component[] body)
+    // Equal text pane. `accent` marks the output pane, which carries the accent
+    // surface + glow (declared via BoxStyle, not CSS). The header is an uppercase
+    // accent Overline. On a narrow container (≤680px) the pane shrinks and its
+    // parent restacks the two panes into a column.
+    private static Component PanelBox(
+        string id, string title, bool accent, Component? headerAction, params Component[] body)
     {
         var header = new Box
         {
@@ -1462,7 +1593,7 @@ internal sealed class TranslatorAddon : AddonBase
             Justify = FlexJustify.SpaceBetween,
             Children = new List<Component>
             {
-                new Text { Id = $"{id}-title", Content = Bind.Lit(title), Style = TextStyle.BodyStrong },
+                new Text { Id = $"{id}-title", Content = Bind.Lit(title), Style = TextStyle.Overline, Tone = Tone.Primary },
                 headerAction ?? new Text { Id = $"{id}-spacer", Content = Bind.Lit(""), Style = TextStyle.Caption },
             },
         };
@@ -1477,10 +1608,17 @@ internal sealed class TranslatorAddon : AddonBase
             Style = new BoxStyle
             {
                 Padding = AllEdges(Spacing.Md),
-                MinHeight = new DimensionTokenPx { Value = 320 },
-                Border = AllBorders(1, BorderColor.Default),
+                MinHeight = PxDim(420),
+                Border = AllBorders(1, accent ? BorderColor.Accent : BorderColor.Default),
                 Radius = AllCorners(RadiusToken.Md),
+                // Same dark surface as the source pane; the accent is only a halo
+                // (glow + accent border), not a saturated fill.
                 Background = BackgroundToken.Subtle,
+                Shadow = accent ? ShadowToken.AccentGlow : (ShadowToken?)null,
+            },
+            Responsive = new List<ResponsiveRule>
+            {
+                new ResponsiveRule { MaxWidth = Px(680), MinHeight = PxDim(220) },
             },
             Children = children,
         };
@@ -1490,7 +1628,7 @@ internal sealed class TranslatorAddon : AddonBase
     {
         var children = new List<Component>
         {
-            new Heading { Id = $"card-{Slug(title)}", Content = Bind.Lit(title), Level = 4 },
+            new Text { Id = $"card-{Slug(title)}", Content = Bind.Lit(title), Style = TextStyle.Overline, Tone = Tone.Primary },
         };
         children.AddRange(rows);
         return new Box
@@ -1502,7 +1640,8 @@ internal sealed class TranslatorAddon : AddonBase
             {
                 Padding = AllEdges(Spacing.Md),
                 Border = AllBorders(1, BorderColor.Default),
-                Radius = AllCorners(RadiusToken.Md),
+                Radius = AllCorners(RadiusToken.Lg),
+                Background = BackgroundToken.Subtle,
             },
             Children = children,
         };
@@ -1513,6 +1652,7 @@ internal sealed class TranslatorAddon : AddonBase
         var labelCol = new Box
         {
             Id = $"lblcol-{Slug(label)}",
+            Grow = true,
             Direction = FlexDirection.Column,
             Gap = Spacing.Xxs,
             Children = new List<Component>
@@ -1528,6 +1668,11 @@ internal sealed class TranslatorAddon : AddonBase
             Align = FlexAlign.Center,
             Justify = FlexJustify.SpaceBetween,
             Gap = Spacing.Md,
+            // Stack label over control on a narrow panel.
+            Responsive = new List<ResponsiveRule>
+            {
+                new ResponsiveRule { MaxWidth = Px(460), Direction = FlexDirection.Column, Align = FlexAlign.Stretch },
+            },
             Children = new List<Component> { labelCol, control },
         };
     }
@@ -1659,6 +1804,14 @@ internal sealed class TranslatorAddon : AddonBase
         var side = new BorderSide { WidthPx = width, Color = color, Style = BorderLineStyle.Solid };
         return new BorderEdges { Top = side, Right = side, Bottom = side, Left = side };
     }
+
+    // -------------------------------------------------------------------------
+    // Responsive helpers (container-query reflow, declared by the addon)
+    // -------------------------------------------------------------------------
+
+    private static ContainerWidth Px(ushort px) => new ContainerWidthPx { Value = px };
+
+    private static DimensionToken PxDim(ushort px) => new DimensionTokenPx { Value = px };
 
     // -------------------------------------------------------------------------
     // Small utilities
