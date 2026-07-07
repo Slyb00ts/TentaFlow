@@ -73,10 +73,33 @@ fn main() {
             if !addon_dir.is_dir() {
                 continue;
             }
-            if !addon_dir.join("Cargo.toml").exists() {
+            let manifest_path = addon_dir.join("manifest.toml");
+            if !manifest_path.exists() {
                 continue;
             }
-            if !addon_dir.join("manifest.toml").exists() {
+
+            // The manifest `runtime` field is the source of truth for which
+            // toolchain builds the addon (must match language_adapter.rs):
+            // "dotnet" → dotnet publish, everything else (wasmtime/wasmi, or
+            // unset) → cargo. Gating on the manifest — not on which project
+            // file happens to exist — keeps the build path aligned with the
+            // adapter the host will select at load time.
+            let runtime = read_manifest_runtime(&manifest_path);
+            let is_dotnet = runtime.as_deref() == Some("dotnet");
+            let csproj = if is_dotnet {
+                find_csproj(&addon_dir)
+            } else {
+                None
+            };
+            let is_rust = !is_dotnet && addon_dir.join("Cargo.toml").exists();
+            if is_dotnet && csproj.is_none() {
+                println!(
+                    "cargo:warning=Addon '{}' — manifest runtime=\"dotnet\" ale brak pliku .csproj, pomijam",
+                    addon_dir.file_name().unwrap().to_string_lossy()
+                );
+                continue;
+            }
+            if !is_rust && !is_dotnet {
                 continue;
             }
 
@@ -92,15 +115,25 @@ fn main() {
                     println!("cargo:rerun-if-changed={}", src_entry.display());
                 }
             }
-            println!(
-                "cargo:rerun-if-changed={}",
-                addon_dir.join("Cargo.toml").display()
-            );
+            if is_rust {
+                println!(
+                    "cargo:rerun-if-changed={}",
+                    addon_dir.join("Cargo.toml").display()
+                );
+            }
+            if let Some(csproj_path) = &csproj {
+                println!("cargo:rerun-if-changed={}", csproj_path.display());
+                for cs in list_cs_sources(&addon_dir) {
+                    println!("cargo:rerun-if-changed={}", cs.display());
+                }
+            }
             println!(
                 "cargo:rerun-if-changed={}",
                 addon_dir.join("manifest.toml").display()
             );
-            println!("cargo:rerun-if-changed={}", addon_dir.join("src").display());
+            if src_dir.is_dir() {
+                println!("cargo:rerun-if-changed={}", src_dir.display());
+            }
             if addon_dir.join("migrations").exists() {
                 println!(
                     "cargo:rerun-if-changed={}",
@@ -118,6 +151,43 @@ fn main() {
                 "cargo:warning=Addon '{}' — rozpoczynam budowanie WASM",
                 addon_name
             );
+
+            if is_dotnet {
+                // Addon .NET (NativeAOT-LLVM) — dotnet publish do wasm32-wasip1.
+                let wasm_path = match build_dotnet_addon(&addon_dir, &addon_name) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                if let Err(bad_imports) = validate_wasm_imports(&wasm_path) {
+                    panic!(
+                        "\n\nAddon '{}' — WASM import namespace error!\n\
+                         The following imports use the \"env\" module instead of \"tentaflow\":\n\
+                         {}\n",
+                        addon_name, bad_imports
+                    );
+                }
+                let bundle_addon_dir = bundle_dir.join(&addon_name);
+                std::fs::create_dir_all(&bundle_addon_dir).unwrap();
+                std::fs::copy(&wasm_path, bundle_addon_dir.join("addon.wasm")).unwrap();
+                std::fs::copy(
+                    addon_dir.join("manifest.toml"),
+                    bundle_addon_dir.join("manifest.toml"),
+                )
+                .unwrap();
+                for file in &["SKILL.md", "DESCRIPTION.md", "blocks.json", "icon.png"] {
+                    let src = addon_dir.join(file);
+                    if src.exists() {
+                        std::fs::copy(&src, bundle_addon_dir.join(file)).ok();
+                    }
+                }
+                copy_dir_flat(&addon_dir.join("migrations"), &bundle_addon_dir.join("migrations"));
+                copy_dir_flat(&addon_dir.join("flows"), &bundle_addon_dir.join("flows"));
+                bundled_addons.push(BundledAddonInfo {
+                    name: addon_name,
+                    bundle_path: bundle_addon_dir,
+                });
+                continue;
+            }
 
             if !has_wasm_target {
                 println!(
@@ -371,6 +441,211 @@ fn shared_addon_wasm_target() -> PathBuf {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let repo_root = manifest.parent().unwrap_or(&manifest);
     repo_root.join("target-addon-wasm")
+}
+
+// =============================================================================
+// Addony .NET — dotnet publish (NativeAOT-LLVM) do wasm32-wasip1
+// =============================================================================
+
+/// Odczytuje `runtime = "..."` z sekcji `[addon]` manifestu. Zwraca None gdy
+/// pole nie istnieje. Parser jest liniowy (jak reszta build.rs) i czyta tylko
+/// dopoki jest w sekcji [addon], zeby nie zlapac `runtime` z innej sekcji.
+fn read_manifest_runtime(manifest_path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(manifest_path).ok()?;
+    let mut in_addon = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_addon = trimmed == "[addon]";
+            continue;
+        }
+        if in_addon && trimmed.starts_with("runtime") {
+            if let Some(val) = extract_toml_string_value(trimmed) {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+/// Znajduje plik .csproj w katalogu addonu (poziom root).
+fn find_csproj(addon_dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(addon_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e == "csproj").unwrap_or(false) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Zbiera pliki .cs addonu (rekursywnie, pomijajac bin/ i obj/).
+fn list_cs_sources(addon_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![addon_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if name != "bin" && name != "obj" {
+                    stack.push(path);
+                }
+            } else if path.extension().map(|e| e == "cs").unwrap_or(false) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Zwraca sciezke do WASI SDK: env WASI_SDK_PATH albo auto-detekcja w cache
+/// natywnym TentaFlow (katalog `wasi-sdk-*` w TENTAFLOW_NATIVE_CACHE).
+fn resolve_wasi_sdk() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("WASI_SDK_PATH") {
+        let path = PathBuf::from(p);
+        if path.join("share/wasi-sysroot").exists() {
+            return Some(path);
+        }
+    }
+    let cache_root = std::env::var("TENTAFLOW_NATIVE_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let base = std::env::var("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache")
+                });
+            base.join("tentaflow-native-libs")
+        });
+    let entries = std::fs::read_dir(&cache_root).ok()?;
+    let mut candidates: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with("wasi-sdk-"))
+                    .unwrap_or(false)
+                && p.join("share/wasi-sysroot").exists()
+        })
+        .collect();
+    candidates.sort();
+    candidates.pop()
+}
+
+/// Buduje addon .NET przez `dotnet publish -r wasi-wasm` (NativeAOT-LLVM,
+/// bare module wasip1 przez IlcLlvmTarget + LinkerFlavor z Directory.Build.rsp
+/// addonu). Zwraca sciezke do wynikowego .wasm albo None (skip z warningiem) —
+/// jak Rustowa sciezka przy braku targetu wasm32-wasip1.
+fn build_dotnet_addon(addon_dir: &Path, addon_name: &str) -> Option<PathBuf> {
+    let dotnet_ok = Command::new("dotnet")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !dotnet_ok {
+        println!(
+            "cargo:warning=Addon '{}' — pomijam: brak dotnet SDK w PATH \
+             (zainstaluj .NET 10 SDK aby budowac addony C#)",
+            addon_name
+        );
+        return None;
+    }
+
+    let Some(wasi_sdk) = resolve_wasi_sdk() else {
+        println!(
+            "cargo:warning=Addon '{}' — pomijam: brak WASI SDK \
+             (ustaw WASI_SDK_PATH albo rozpakuj wasi-sdk-25+ do \
+             ~/.cache/tentaflow-native-libs/)",
+            addon_name
+        );
+        return None;
+    };
+
+    let status = Command::new("dotnet")
+        .args(["publish", "-c", "Release", "-r", "wasi-wasm"])
+        .current_dir(addon_dir)
+        .env("WASI_SDK_PATH", &wasi_sdk)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            println!(
+                "cargo:warning=Addon '{}' — blad dotnet publish (kod: {}), pomijam",
+                addon_name, s
+            );
+            return None;
+        }
+        Err(e) => {
+            println!(
+                "cargo:warning=Addon '{}' — nie udalo sie uruchomic dotnet: {}, pomijam",
+                addon_name, e
+            );
+            return None;
+        }
+    }
+
+    // Wynik: bin/Release/net*/wasi-wasm/publish/<Assembly>.wasm — bierzemy
+    // jedyny plik .wasm z katalogu publish.
+    let release_dir = addon_dir.join("bin/Release");
+    let mut wasm_files: Vec<PathBuf> = Vec::new();
+    if let Ok(tfms) = std::fs::read_dir(&release_dir) {
+        for tfm in tfms.flatten() {
+            let publish = tfm.path().join("wasi-wasm/publish");
+            if let Ok(files) = std::fs::read_dir(&publish) {
+                for f in files.flatten() {
+                    let p = f.path();
+                    if p.extension().map(|e| e == "wasm").unwrap_or(false) {
+                        wasm_files.push(p);
+                    }
+                }
+            }
+        }
+    }
+    match wasm_files.len() {
+        1 => {
+            println!(
+                "cargo:warning=Addon '{}' — kompilacja WASM (.NET) zakonczona pomyslnie",
+                addon_name
+            );
+            wasm_files.pop()
+        }
+        0 => {
+            println!(
+                "cargo:warning=Addon '{}' — dotnet publish nie wytworzyl pliku .wasm, pomijam",
+                addon_name
+            );
+            None
+        }
+        n => {
+            println!(
+                "cargo:warning=Addon '{}' — znaleziono {} plikow .wasm w publish, pomijam",
+                addon_name, n
+            );
+            None
+        }
+    }
+}
+
+/// Kopiuje pliki (plasko) z katalogu zrodlowego do docelowego, jesli istnieje.
+fn copy_dir_flat(src: &Path, dest: &Path) {
+    if !src.exists() {
+        return;
+    }
+    std::fs::create_dir_all(dest).unwrap();
+    if let Ok(entries) = std::fs::read_dir(src) {
+        for e in entries.flatten() {
+            std::fs::copy(e.path(), dest.join(e.file_name())).ok();
+        }
+    }
 }
 
 // =============================================================================

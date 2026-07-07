@@ -1,0 +1,83 @@
+[addon]
+id = "hello-dotnet"
+name = "Hello .NET"
+version = "1.0.0"
+description = "Smoke-test addon proving the .NET (NativeAOT-LLVM, wasm32-wasip1) addon toolchain: lifecycle, storage, logging, tools and a CBOR UI panel."
+category = "test"
+keywords = ["test", "dotnet", "csharp", "sdk"]
+author = "TentaFlow"
+license = "Apache-2.0"
+homepage = ""
+icon = "code"
+runtime = "dotnet"
+platforms = ["linux", "macos", "windows"]
+wasm_file = "addon.wasm"
+
+[[permission]]
+id = "storage.read"
+display_name = "Read addon storage"
+description = "Read key-value entries scoped to this addon."
+risk = "low"
+
+[[permission]]
+id = "storage.write"
+display_name = "Write addon storage"
+description = "Write key-value entries scoped to this addon."
+risk = "medium"
+
+[[permission]]
+id = "ui"
+display_name = "Render UI panels"
+description = "Renders the Hello .NET panel via the CBOR UI channel."
+risk = "low"
+
+[visibility]
+admin_only = false
+default_groups = []
+show_in_catalog = true
+
+[application]
+entry_panel = "main"
+title = "Hello .NET"
+icon = "code"
+description = "C# addon smoke test."
+sort_order = 900
+
+[resources]
+memory_mb = 128
+fuel_limit = 50000000
+storage_total_mb = 16
+
+[lifecycle]
+background = false
+auto_start = false
+
+[[tool]]
+id = "echo"
+display_name = "Echo"
+description = "Returns the provided text (smoke test)."
+keywords = ["test", "echo"]
+
+[[tool.parameter]]
+name = "text"
+param_type = "string"
+description = "Text to echo back."
+required = true
+
+[[tool]]
+id = "test_storage"
+display_name = "Storage round-trip"
+description = "Writes and reads back a key-value pair in addon storage."
+keywords = ["test", "storage"]
+
+[[tool.parameter]]
+name = "key"
+param_type = "string"
+description = "Storage key."
+required = true
+
+[[tool.parameter]]
+name = "value"
+param_type = "string"
+description = "Value to store."
+required = true

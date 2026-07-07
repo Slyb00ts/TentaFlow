@@ -2,6 +2,11 @@
 // File: gen_csharp.rs — C# SDK source generator
 // Reads ManifestEnvelope, emits a single .cs file with all components,
 // enums, inline structs and tagged unions for TentaFlow.Sdk.Components.
+//
+// Every emitted type knows how to lower itself into the support library's
+// `Value` model (`ToValue()` / `ToWire()` / `ToFieldMap()`), which the
+// hand-written canonical CBOR writer in TentaFlow.Sdk serializes
+// byte-for-byte compatibly with the Rust `tentaflow-sdk-spec` encoders.
 // =============================================================================
 
 use std::fmt::Write;
@@ -13,7 +18,7 @@ use crate::{
 
 /// Produce a complete C# source file from the manifest.
 pub fn generate(manifest: &ManifestEnvelope) -> String {
-    let mut out = String::with_capacity(128 * 1024);
+    let mut out = String::with_capacity(256 * 1024);
     emit_header(&mut out);
     emit_enums(&mut out, &manifest.enums);
     emit_inline_structs(&mut out, &manifest.inline_structs);
@@ -28,6 +33,9 @@ fn emit_header(out: &mut String) {
     out.push_str("using System;\n");
     out.push_str("using System.Collections.Generic;\n\n");
     out.push_str("namespace TentaFlow.Sdk.Components;\n\n");
+    // Alias shields generated ToValue bodies from the "property named like a
+    // type" lookup problem (e.g. a variant class with a `Value` property).
+    out.push_str("using TfValue = TentaFlow.Sdk.Components.Value;\n\n");
 }
 
 fn emit_enums(out: &mut String, enums: &[EnumEntry]) {
@@ -44,6 +52,33 @@ fn emit_enums(out: &mut String, enums: &[EnumEntry]) {
             );
         }
         out.push_str("}\n\n");
+
+        // Wire lowering: enum value → wire tstr → Value.Text. Switch-based, no
+        // reflection (NativeAOT / trimming safe).
+        let _ = writeln!(out, "public static class {}WireExtensions {{", e.name);
+        let _ = writeln!(
+            out,
+            "    public static string WireName(this {} v) => v switch {{",
+            e.name
+        );
+        for v in &e.variants {
+            let _ = writeln!(
+                out,
+                "        {}.{} => \"{}\",",
+                e.name, v.rust_name, v.wire
+            );
+        }
+        let _ = writeln!(
+            out,
+            "        _ => throw new ArgumentOutOfRangeException(nameof(v)),"
+        );
+        out.push_str("    };\n");
+        let _ = writeln!(
+            out,
+            "    public static TfValue ToWire(this {} v) => TfValue.Text(v.WireName());",
+            e.name
+        );
+        out.push_str("}\n\n");
     }
 }
 
@@ -51,9 +86,55 @@ fn emit_inline_structs(out: &mut String, inlines: &[InlineEntry]) {
     for s in inlines {
         let _ = writeln!(out, "/// <summary>Inline struct: {}</summary>", s.name);
         let _ = writeln!(out, "public sealed class {} {{", s.name);
-        emit_field_properties(out, &s.fields);
-        emit_to_field_map(out, &s.fields);
+        emit_field_properties(out, &s.fields, &s.name);
+        emit_struct_to_value(out, &s.fields, &s.name);
         out.push_str("}\n\n");
+    }
+}
+
+/// Emits `ToValue()` for a `#[cbor(map)]` u8-keyed struct: a Value map with
+/// unsigned-integer keys, omitting `null` optional fields — the same wire
+/// shape minicbor derive produces in Rust.
+fn emit_struct_to_value(out: &mut String, fields: &[FieldEntry], owner: &str) {
+    out.push('\n');
+    out.push_str("    public TfValue ToValue() {\n");
+    out.push_str("        var entries = new List<KeyValuePair<TfValue, TfValue>>();\n");
+    for f in fields {
+        emit_map_entry(
+            out,
+            f,
+            &format!("TfValue.UInt({})", f.key),
+            "        ",
+            owner,
+        );
+    }
+    out.push_str("        return TfValue.Map(entries);\n");
+    out.push_str("    }\n");
+}
+
+/// Emits one `entries.Add(new(<key_expr>, <value_expr>))` line, wrapping
+/// optional fields in a null guard.
+fn emit_map_entry(out: &mut String, f: &FieldEntry, key_expr: &str, indent: &str, owner: &str) {
+    let prop = resolved_prop_name(&f.name, owner);
+    let is_optional = f.wire.starts_with("Option<");
+    let inner_wire = if is_optional {
+        &f.wire[7..f.wire.len() - 1]
+    } else {
+        &f.wire
+    };
+    let access = if is_optional && is_csharp_value_type(inner_wire) {
+        format!("{prop}.Value")
+    } else {
+        prop.clone()
+    };
+    let value = value_expr(inner_wire, &access);
+    if is_optional {
+        let _ = writeln!(
+            out,
+            "{indent}if ({prop} != null) entries.Add(new({key_expr}, {value}));"
+        );
+    } else {
+        let _ = writeln!(out, "{indent}entries.Add(new({key_expr}, {value}));");
     }
 }
 
@@ -65,39 +146,49 @@ fn emit_tagged_unions(out: &mut String, unions: &[UnionEntry]) {
             u.name, u.discriminator_key
         );
         let _ = writeln!(out, "public abstract class {} {{", u.name);
-        let _ = writeln!(
-            out,
-            "    public abstract string {}Kind {{ get; }}",
-            u.name
-        );
+        let _ = writeln!(out, "    public abstract string {}Kind {{ get; }}", u.name);
+        out.push_str("    public abstract TfValue ToValue();\n");
         out.push_str("}\n\n");
         for v in &u.variants {
-            emit_union_variant(out, &u.name, v);
+            emit_union_variant(out, u, v);
         }
     }
 }
 
-fn emit_union_variant(out: &mut String, union_name: &str, v: &VariantEntry) {
-    let class_name = format!("{}{}", union_name, v.rust_name);
+fn emit_union_variant(out: &mut String, u: &UnionEntry, v: &VariantEntry) {
+    let class_name = format!("{}{}", u.name, v.rust_name);
     let _ = writeln!(
         out,
         "/// <summary>{} variant: {} (wire kind \"{}\")</summary>",
-        union_name, v.rust_name, v.wire_kind
+        u.name, v.rust_name, v.wire_kind
     );
-    let _ = writeln!(
-        out,
-        "public sealed class {} : {} {{",
-        class_name, union_name
-    );
+    let _ = writeln!(out, "public sealed class {} : {} {{", class_name, u.name);
     let _ = writeln!(
         out,
         "    public override string {}Kind => \"{}\";",
-        union_name, v.wire_kind
+        u.name, v.wire_kind
     );
     if !v.fields.is_empty() {
         out.push('\n');
-        emit_field_properties(out, &v.fields);
+        emit_field_properties(out, &v.fields, &class_name);
     }
+    // Wire shape: map {"<discriminator>": "<kind>", "<field>": <value>, ...}.
+    // Entry order is irrelevant — the support Value encoder sorts map keys
+    // into RFC 8949 canonical (bytewise) order, matching the Rust encoders.
+    out.push('\n');
+    out.push_str("    public override TfValue ToValue() {\n");
+    out.push_str("        var entries = new List<KeyValuePair<TfValue, TfValue>>();\n");
+    let _ = writeln!(
+        out,
+        "        entries.Add(new(TfValue.Text(\"{}\"), TfValue.Text(\"{}\")));",
+        u.discriminator_key, v.wire_kind
+    );
+    for f in &v.fields {
+        let key = format!("TfValue.Text(\"{}\")", wire_key(&f.name));
+        emit_map_entry(out, f, &key, "        ", &class_name);
+    }
+    out.push_str("        return TfValue.Map(entries);\n");
+    out.push_str("    }\n");
     out.push_str("}\n\n");
 }
 
@@ -108,12 +199,11 @@ fn emit_components(out: &mut String, components: &[ComponentEntry]) {
             "/// <summary>{} component (tag 0x{:04X}, §{})</summary>",
             c.name, c.tag, c.section
         );
-        let _ = writeln!(
-            out,
-            "public sealed class {} : Component {{",
-            c.name
-        );
-        let _ = writeln!(out, "    public const ushort Tag = 0x{:04X};", c.tag);
+        let _ = writeln!(out, "public sealed class {} : Component {{", c.name);
+        // A const may not share its enclosing type's name (the `Tag` component).
+        let tag_const = if c.name == "Tag" { "CatalogTag" } else { "Tag" };
+        let _ = writeln!(out, "    public const ushort {} = 0x{:04X};", tag_const, c.tag);
+        let _ = writeln!(out, "    public override ushort ComponentTag => {};", tag_const);
         if !c.handlers.is_empty() {
             out.push('\n');
             for h in &c.handlers {
@@ -126,17 +216,30 @@ fn emit_components(out: &mut String, components: &[ComponentEntry]) {
             }
         }
         out.push('\n');
-        emit_field_properties(out, &c.fields);
-        emit_to_field_map(out, &c.fields);
+        emit_field_properties(out, &c.fields, &c.name);
+        emit_to_field_map(out, &c.fields, &c.name);
         out.push_str("}\n\n");
     }
 }
 
-fn emit_field_properties(out: &mut String, fields: &[FieldEntry]) {
+/// Property name for a field, renamed to `<Name>Field` when the PascalCase
+/// form collides with the enclosing type's name (illegal in C#). MUST be used
+/// everywhere the property is referenced (declaration AND serialization) so the
+/// two never drift.
+fn resolved_prop_name(field: &str, owner: &str) -> String {
+    let p = to_pascal_case(field);
+    if p == owner {
+        format!("{p}Field")
+    } else {
+        p
+    }
+}
+
+fn emit_field_properties(out: &mut String, fields: &[FieldEntry], owner: &str) {
     for f in fields {
         let cs_type = wire_to_csharp(&f.wire);
-        let prop_name = to_pascal_case(&f.name);
-        let default = csharp_default(&f.wire, &f.default, f.required);
+        let prop = resolved_prop_name(&f.name, owner);
+        let default = csharp_default(&f.wire, &f.default, &cs_type);
         let _ = writeln!(
             out,
             "    /// <summary>Field {}: {} ({})</summary>",
@@ -146,82 +249,81 @@ fn emit_field_properties(out: &mut String, fields: &[FieldEntry]) {
             out,
             "    public {ty} {name} {{ get; set; }}{def}",
             ty = cs_type,
-            name = prop_name,
+            name = prop,
             def = default,
         );
     }
 }
 
-fn emit_to_field_map(out: &mut String, fields: &[FieldEntry]) {
+fn emit_to_field_map(out: &mut String, fields: &[FieldEntry], owner: &str) {
     out.push('\n');
-    out.push_str("    public FieldMap ToFieldMap() {\n");
+    out.push_str("    public override FieldMap ToFieldMap() {\n");
     out.push_str("        var map = new FieldMap();\n");
     for f in fields {
-        let prop = to_pascal_case(&f.name);
+        let prop = resolved_prop_name(&f.name, owner);
         let is_optional = f.wire.starts_with("Option<");
         let inner_wire = if is_optional {
             &f.wire[7..f.wire.len() - 1]
         } else {
             &f.wire
         };
-        let setter = field_map_setter(inner_wire, &prop);
+        let access = if is_optional && is_csharp_value_type(inner_wire) {
+            format!("{prop}.Value")
+        } else {
+            prop.clone()
+        };
+        let value = value_expr(inner_wire, &access);
         if is_optional {
             let _ = writeln!(
                 out,
-                "        if ({prop} != null) map.Set({key}, {setter});",
+                "        if ({prop} != null) map.Set({key}, {value});",
                 prop = prop,
                 key = f.key,
-                setter = setter,
+                value = value,
             );
         } else {
-            let _ = writeln!(
-                out,
-                "        map.Set({key}, {setter});",
-                key = f.key,
-                setter = setter,
-            );
+            let _ = writeln!(out, "        map.Set({key}, {value});", key = f.key);
         }
     }
     out.push_str("        return map;\n");
     out.push_str("    }\n");
 }
 
-/// Produce the `Value.Xxx(...)` expression for a field setter.
-fn field_map_setter(inner_wire: &str, prop: &str) -> String {
-    if inner_wire == "tstr" {
-        return format!("Value.Text({prop})");
-    }
-    if inner_wire == "bool" {
-        return format!("Value.Bool({prop})");
-    }
-    if inner_wire == "Value" || inner_wire == "CborMap" {
-        return format!("Value.Raw({prop})");
-    }
-    if inner_wire == "BindRef" || inner_wire == "StatePath" {
-        return format!("Value.Text({prop}.ToString())");
-    }
-    if matches!(
-        inner_wire,
-        "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64"
-    ) {
-        return format!("Value.Int({prop})");
-    }
-    if inner_wire == "f32" || inner_wire == "f64" {
-        return format!("Value.Float({prop})");
+/// Produce the `TfValue` expression lowering `access` (a non-null C# expression
+/// of the C# type mapped from `inner_wire`) into the CBOR `Value` model.
+fn value_expr(inner_wire: &str, access: &str) -> String {
+    if let Some(inner) = inner_wire
+        .strip_prefix("Array<")
+        .and_then(|s| s.strip_suffix('>'))
+    {
+        let elem = value_expr(inner, "x");
+        return format!("TfValue.Array({access}.ConvertAll(x => {elem}))");
     }
     if inner_wire.starts_with("Enum<") {
-        return format!("{prop}.ToWire()");
+        return format!("{access}.ToWire()");
     }
-    if inner_wire.starts_with("Inline<") || inner_wire.starts_with("ComponentRef<") {
-        return format!("{prop}.ToFieldMap()");
+    match inner_wire {
+        "tstr" => format!("TfValue.Text({access})"),
+        "bool" => format!("TfValue.Bool({access})"),
+        "u8" | "u16" | "u32" | "u64" => format!("TfValue.UInt({access})"),
+        "i8" | "i16" | "i32" | "i64" => format!("TfValue.Int({access})"),
+        "f32" | "f64" => format!("TfValue.Float({access})"),
+        // `Value` / `CborMap` fields are already the raw Value model.
+        "Value" | "CborMap" => access.to_string(),
+        // Everything else (BindRef, StatePath, Component, ComponentRef<..>,
+        // Inline<..>, tagged-union names) lowers via its own ToValue().
+        _ => format!("{access}.ToValue()"),
     }
-    if inner_wire == "Component" {
-        return format!("{prop}.ToFieldMap()");
+}
+
+/// Map a manifest field name to the wire map key emitted by the Rust
+/// encoders. Raw-identifier suffixes are stripped (`ref_` → `ref`) and
+/// `else_branch` maps to the reserved word `else`.
+fn wire_key(name: &str) -> &str {
+    if name == "else_branch" {
+        return "else";
     }
-    if inner_wire.starts_with("Array<") {
-        return format!("Value.Array({prop})");
-    }
-    format!("Value.Raw({prop})")
+    name.trim_end_matches('_')
 }
 
 /// Map a manifest wire type string to a C# type string.
@@ -232,7 +334,7 @@ fn wire_to_csharp(wire: &str) -> String {
         if is_csharp_value_type(inner) {
             return format!("{base}?");
         }
-        return base;
+        return format!("{base}?");
     }
     if let Some(inner) = wire.strip_prefix("Array<").and_then(|s| s.strip_suffix('>')) {
         let elem = wire_to_csharp(inner);
@@ -286,7 +388,7 @@ fn is_csharp_value_type(wire: &str) -> bool {
     ) || wire.starts_with("Enum<")
 }
 
-fn csharp_default(wire: &str, default: &Option<String>, _required: bool) -> String {
+fn csharp_default(wire: &str, default: &Option<String>, cs_type: &str) -> String {
     if wire.starts_with("Option<") {
         return String::new();
     }
@@ -303,9 +405,17 @@ fn csharp_default(wire: &str, default: &Option<String>, _required: bool) -> Stri
             cs_type_base,
             "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64"
         ) {
-            return format!(" = {d};");
+            // Non-numeric defaults ("columns_default" helper fn names) fall
+            // back to the zero value.
+            if d.parse::<i128>().is_ok() {
+                return format!(" = {d};");
+            }
+            return " = 0;".to_string();
         }
         if cs_type_base == "f32" || cs_type_base == "f64" {
+            if d.parse::<f64>().is_err() {
+                return " = 0;".to_string();
+            }
             let suffix = if cs_type_base == "f32" { "f" } else { "d" };
             return format!(" = {d}{suffix};");
         }
@@ -313,9 +423,34 @@ fn csharp_default(wire: &str, default: &Option<String>, _required: bool) -> Stri
             .strip_prefix("Enum<")
             .and_then(|s| s.strip_suffix('>'))
         {
-            return format!(" = {enum_name}.{d};");
+            // Registry defaults are Rust-flavoured ("Spacing::Lg",
+            // "super::super::tokens::Spacing::Lg") or prose
+            // ("variant-dependent (...)"). Keep only a plain variant ident;
+            // anything else falls back to the enum's zero value.
+            let variant = d.rsplit("::").next().unwrap_or(d);
+            if !variant.is_empty()
+                && variant.chars().all(|c| c.is_ascii_alphanumeric())
+            {
+                return format!(" = {enum_name}.{variant};");
+            }
+            return String::new();
         }
-        return format!(" = {d};");
+        if let Some(inner) = cs_type_base
+            .strip_prefix("Inline<")
+            .and_then(|s| s.strip_suffix('>'))
+        {
+            // Tagged-union defaults name a variant ("...::DimensionToken::Full")
+            // → the generated `{Union}{Variant}` class. Non-ident defaults
+            // (prose) fall through to the required-field fallback below.
+            let variant = d.rsplit("::").next().unwrap_or(d);
+            if !variant.is_empty()
+                && variant.chars().all(|c| c.is_ascii_alphanumeric())
+            {
+                return format!(" = new {inner}{variant}();");
+            }
+        }
+        // Array / Component / BindRef defaults in the registry are prose or
+        // Rust paths — ignore them and use the type-based fallback.
     }
     // Non-optional fields without explicit defaults need sensible zero values
     match wire {
@@ -327,7 +462,19 @@ fn csharp_default(wire: &str, default: &Option<String>, _required: bool) -> Stri
             let elem = wire_to_csharp(&w[6..w.len() - 1]);
             format!(" = new List<{elem}>();")
         }
-        _ => String::new(),
+        w if w.starts_with("Enum<") => String::new(),
+        // A required CborMap is an empty map when the addon sets nothing
+        // (mirrors Rust `CborMap::default()`); a required raw Value defaults
+        // to CBOR null.
+        "CborMap" => " = TfValue.Map(new List<KeyValuePair<TfValue, TfValue>>());".to_string(),
+        "Value" => " = TfValue.Null();".to_string(),
+        // Required reference-typed fields (BindRef, Component, unions, ...) —
+        // the addon must assign them before serializing; `null!` silences the
+        // non-nullable-uninitialized warning without inventing a fake default.
+        _ => {
+            let _ = cs_type;
+            " = null!;".to_string()
+        }
     }
 }
 
@@ -379,6 +526,8 @@ mod tests {
         assert!(code.contains("public enum ButtonVariant {"));
         assert!(code.contains("[Wire(\"primary\")] Primary,"));
         assert!(code.contains("[Wire(\"secondary\")] Secondary"));
+        assert!(code.contains("public static class ButtonVariantWireExtensions {"));
+        assert!(code.contains("ButtonVariant.Primary => \"primary\","));
     }
 
     #[test]
@@ -415,9 +564,63 @@ mod tests {
         let code = generate(&manifest);
         assert!(code.contains("public sealed class Text : Component {"));
         assert!(code.contains("public const ushort Tag = 0x0200;"));
+        assert!(code.contains("public override ushort ComponentTag => Tag;"));
         assert!(code.contains("public string Content { get; set; } = \"\";"));
         assert!(code.contains("public TextStyle? Style { get; set; }"));
         assert!(code.contains("public const string HandlerOnClick = \"on_click\";"));
+        assert!(code.contains("map.Set(0, TfValue.Text(Content));"));
+        assert!(code.contains("if (Style != null) map.Set(1, Style.Value.ToWire());"));
+    }
+
+    #[test]
+    fn generates_union_to_value_with_wire_keys() {
+        use crate::VariantEntry;
+        let unions = vec![UnionEntry {
+            name: "IconRef".into(),
+            discriminator_key: "kind".into(),
+            variants: vec![VariantEntry {
+                rust_name: "Url".into(),
+                wire_kind: "url".into(),
+                fields: vec![
+                    FieldEntry {
+                        key: 0,
+                        name: "ref_".into(),
+                        wire: "tstr".into(),
+                        required: true,
+                        default: None,
+                    },
+                    FieldEntry {
+                        key: 1,
+                        name: "size_px".into(),
+                        wire: "Option<u16>".into(),
+                        required: false,
+                        default: None,
+                    },
+                ],
+            }],
+        }];
+        let manifest = ManifestEnvelope {
+            protocol_version: 1,
+            components: vec![],
+            enums: vec![],
+            inline_structs: vec![],
+            tagged_unions: unions,
+        };
+        let code = generate(&manifest);
+        assert!(code.contains("public sealed class IconRefUrl : IconRef {"));
+        assert!(code.contains("entries.Add(new(TfValue.Text(\"kind\"), TfValue.Text(\"url\")));"));
+        // Raw-ident suffix stripped on the wire key, kept in the property name.
+        assert!(code.contains("entries.Add(new(TfValue.Text(\"ref\"), TfValue.Text(Ref)));"));
+        assert!(code.contains(
+            "if (SizePx != null) entries.Add(new(TfValue.Text(\"size_px\"), TfValue.UInt(SizePx.Value)));"
+        ));
+    }
+
+    #[test]
+    fn else_branch_maps_to_else_wire_key() {
+        assert_eq!(wire_key("else_branch"), "else");
+        assert_eq!(wire_key("ref_"), "ref");
+        assert_eq!(wire_key("path"), "path");
     }
 
     #[test]
@@ -442,6 +645,14 @@ mod tests {
                 e.name
             );
         }
+        // Every tagged union produces an abstract class with ToValue
+        for u in &manifest.tagged_unions {
+            assert!(
+                code.contains(&format!("public abstract class {} {{", u.name)),
+                "missing union class: {}",
+                u.name
+            );
+        }
     }
 
     #[test]
@@ -450,7 +661,7 @@ mod tests {
         assert_eq!(wire_to_csharp("u32"), "uint");
         assert_eq!(wire_to_csharp("f64"), "double");
         assert_eq!(wire_to_csharp("bool"), "bool");
-        assert_eq!(wire_to_csharp("Option<tstr>"), "string");
+        assert_eq!(wire_to_csharp("Option<tstr>"), "string?");
         assert_eq!(wire_to_csharp("Option<u32>"), "uint?");
         assert_eq!(wire_to_csharp("Array<tstr>"), "List<string>");
         assert_eq!(wire_to_csharp("Enum<ButtonVariant>"), "ButtonVariant");
