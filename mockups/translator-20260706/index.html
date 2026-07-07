@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>Tłumacz — Mockupy v1</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .index-card { animation: blur-in 0.4s cubic-bezier(0.34,1.56,0.64,1) both; }
+  .index-card:nth-child(2) { animation-delay: 0.06s; }
+  .index-card:nth-child(3) { animation-delay: 0.12s; }
+  .index-card:nth-child(4) { animation-delay: 0.18s; }
+  @keyframes blur-in {
+    from { opacity: 0; transform: translateY(22px) scale(0.95); filter: blur(6px); }
+    to   { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+  }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-text" viewBox="0 0 24 24"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></symbol>
+  <symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></symbol>
+</defs></svg>
+
+<div class="index-page">
+  <h1>Tłumacz</h1>
+  <p class="subtitle">Addon tłumaczeń dla TentaFlow — w pełni lokalny (Bielik&nbsp;4.5B przez llama.cpp + Whisper Large&nbsp;v3), zero danych wysyłanych na zewnątrz. Dwa tryby: <strong>Tekst</strong> (dwa duże panele, streaming tłumaczenia token-po-tokenie) i <strong>Na&nbsp;żywo</strong> (mowa → Whisper → Bielik → napisy słowo po słowie, z udostępnianiem sesji drugiej osobie kodem/linkiem). Mockupy v1.</p>
+
+  <div class="intro" style="margin:0 0 28px;padding:0;">
+    <div class="rules">
+      <div class="rule">
+        <h3><svg class="icon"><use href="#i-text"/></svg>Dwa tryby, jeden addon</h3>
+        <p>Segmented switch „Tekst / Na żywo" z animowanym gradientowym pillem. Tryb tekstowy stawia na przestrzeń (panele min. 420px), tryb na żywo — na mikrofon i strumień napisów.</p>
+      </div>
+      <div class="rule">
+        <h3><svg class="icon"><use href="#i-mic"/></svg>Pipeline lokalny STT → LLM</h3>
+        <p>Mikrofon → Whisper (transkrypcja) → Bielik (tłumaczenie), wszystko na serwisach z mesh. Stan każdego kroku widoczny w panelu bocznym, opóźnienie end-to-end ~1&nbsp;s.</p>
+      </div>
+      <div class="rule">
+        <h3><svg class="icon"><use href="#i-eye"/></svg>Napisy dla drugiej osoby</h3>
+        <p>Nadawca udostępnia sesję kodem (np. <code>TRX-4F2K</code>) — widz dostaje minimalistyczny, niemal pełnoekranowy widok dużych napisów z opcjonalnym oryginałem.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="index-grid">
+    <a class="index-card" href="m01-text-translate.html"><div class="id">M1</div><h3><svg class="icon"><use href="#i-text"/></svg>Tłumacz tekstu</h3><p>Dwa duże panele źródło → wynik, pill-selecty języków z autodetekcją, swap ⇄, streaming z caretem i shimmerem, badge modelu z metrykami tok/s, przycisk „Przetłumacz" + auto-tłumaczenie.</p></a>
+    <a class="index-card" href="m02-live-subtitles.html"><div class="id">M2</div><h3><svg class="icon"><use href="#i-mic"/></svg>Na żywo — nadawca</h3><p>Gradientowy mikrofon z falami i waveformem, napisy słowo po słowie z wygasającą historią EN + PL, panel udostępniania sesji (kod, link, licznik widzów) i status pipeline Whisper → Bielik.</p></a>
+    <a class="index-card" href="m03-live-viewer.html"><div class="id">M3</div><h3><svg class="icon"><use href="#i-eye"/></svg>Widok widza</h3><p>Niemal pełnoekranowe napisy 31px na dole, animacja słów, poprzednia linia wygaszona, pasek z parą języków „EN → PL", statusem „Na żywo", A− / A+ i togglem oryginału. Plus stan oczekiwania.</p></a>
+    <a class="index-card" href="m04-settings.html"><div class="id">M4</div><h3><svg class="icon"><use href="#i-sliders"/></svg>Ustawienia</h3><p>Wybór modeli LLM/STT z mesh (z pulsującym statusem serwisu), domyślna para języków, autodetekcja języka mowy, suwak opóźnienia napisów i toggle historii tłumaczeń.</p></a>
+  </div>
+</div>
+
+</body>
+</html>

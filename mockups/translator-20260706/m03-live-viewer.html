@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Tłumacz · Widok widza (M3)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .viewer-shell {
+    position: relative; min-height: 760px; display: flex; flex-direction: column;
+    background:
+      radial-gradient(1000px 480px at 50% 118%, rgba(99,102,241,0.13), transparent 62%),
+      radial-gradient(700px 320px at 82% -8%, rgba(167,139,250,0.07), transparent 60%),
+      var(--bg);
+    overflow: hidden;
+  }
+
+  /* ----- Top bar ----- */
+  .viewer-top {
+    display: flex; align-items: center; gap: 14px; padding: 14px 24px;
+    background: linear-gradient(180deg, rgba(5,8,24,0.92), rgba(5,8,24,0.55) 80%, transparent);
+    position: relative; z-index: 2;
+    animation: top-in 0.5s cubic-bezier(0.34,1.56,0.64,1) both;
+  }
+  @keyframes top-in { from { opacity: 0; transform: translateY(-14px); } to { opacity: 1; transform: translateY(0); } }
+  .viewer-top .s-name { font-size: 14px; font-weight: 700; display: flex; align-items: center; gap: 10px; }
+  .viewer-top .s-name .t-ico {
+    width: 28px; height: 28px; border-radius: 8px; background: var(--gradient-accent);
+    display: flex; align-items: center; justify-content: center; color: white;
+    box-shadow: 0 0 14px rgba(99,102,241,.4);
+  }
+  .viewer-top .s-name .t-ico .icon { width: 15px; height: 15px; }
+  .viewer-top .s-code {
+    font-family: ui-monospace, 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-3);
+    background: var(--bg-3); border: 1px solid var(--border); padding: 3px 9px; border-radius: 9px;
+  }
+  .lang-pair-chip {
+    display: inline-flex; align-items: center; gap: 7px; padding: 4px 12px;
+    border-radius: 14px; background: rgba(99,102,241,0.1); border: 1px solid rgba(99,102,241,0.3);
+    font-size: 11.5px; font-weight: 800; color: var(--accent-2);
+    font-family: ui-monospace, 'JetBrains Mono', monospace; letter-spacing: 0.04em;
+  }
+  .lang-pair-chip .icon { width: 12px; height: 12px; }
+  .live-pill {
+    display: inline-flex; align-items: center; gap: 7px; padding: 4px 12px;
+    border-radius: 14px; background: rgba(239,68,68,0.12); border: 1px solid rgba(239,68,68,0.35);
+    font-size: 10.5px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em; color: var(--danger);
+  }
+  .live-pill .dot {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--danger);
+    animation: pulse-red 1.8s cubic-bezier(0.32,0.72,0,1) infinite;
+  }
+  @keyframes pulse-red {
+    0%   { box-shadow: 0 0 0 0 rgba(239,68,68,0.55); }
+    70%  { box-shadow: 0 0 0 7px rgba(239,68,68,0); }
+    100% { box-shadow: 0 0 0 0 rgba(239,68,68,0); }
+  }
+  .viewer-top .controls { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+  .ctl-btn {
+    display: inline-flex; align-items: center; gap: 6px; padding: 6px 11px;
+    background: var(--bg-3); border: 1px solid var(--border); border-radius: 9px;
+    color: var(--text-2); font: inherit; font-size: 12px; font-weight: 700; cursor: pointer;
+    transition: all 0.15s;
+  }
+  .ctl-btn:hover { color: var(--text); border-color: var(--border-hover); }
+  .ctl-btn.on {
+    background: rgba(99,102,241,0.14); border-color: var(--accent-1); color: var(--accent-2);
+    box-shadow: 0 0 14px rgba(99,102,241,.25);
+  }
+  .ctl-btn .icon { width: 13px; height: 13px; }
+  .font-ctl { display: inline-flex; border: 1px solid var(--border); border-radius: 9px; overflow: hidden; }
+  .font-ctl button {
+    padding: 6px 11px; background: var(--bg-3); border: 0; color: var(--text-2);
+    font: inherit; font-weight: 800; cursor: pointer; transition: all 0.15s;
+  }
+  .font-ctl button:hover { color: var(--text); background: var(--bg-card); }
+  .font-ctl button:first-child { border-right: 1px solid var(--border); font-size: 10.5px; }
+  .font-ctl button:last-child { font-size: 13.5px; }
+
+  /* ----- Subtitles zone ----- */
+  .viewer-stage { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; padding: 0 clamp(24px, 8vw, 110px) 56px; position: relative; z-index: 1; }
+  .v-sub-prev {
+    font-size: 19px; font-weight: 600; color: var(--text-3); line-height: 1.55;
+    max-width: 980px; margin: 0 auto 22px; text-align: center; opacity: 0.62;
+  }
+  .v-sub-current { max-width: 980px; margin: 0 auto; text-align: center; }
+  .v-orig {
+    font-size: 15px; color: var(--text-3); margin-bottom: 12px;
+    display: flex; align-items: baseline; justify-content: center; gap: 9px;
+    animation: sub-in 0.5s cubic-bezier(0.32,0.72,0,1) both;
+  }
+  .v-orig .lang-tag {
+    font-size: 9.5px; font-weight: 800; color: var(--accent-2);
+    background: rgba(99,102,241,0.12); border: 1px solid rgba(99,102,241,0.3);
+    padding: 1px 7px; border-radius: 9px; flex-shrink: 0;
+    font-family: ui-monospace, 'JetBrains Mono', monospace;
+  }
+  .v-trans {
+    font-size: 31px; font-weight: 700; line-height: 1.45; color: var(--text);
+    text-shadow: 0 2px 18px rgba(0,0,0,0.65), 0 0 44px rgba(99,102,241,0.14);
+    animation: sub-in 0.5s cubic-bezier(0.32,0.72,0,1) both;
+  }
+  @keyframes sub-in { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
+  .word-in { display: inline-block; animation: word-fade 0.55s cubic-bezier(0.32,0.72,0,1) both; }
+  .word-in.w2 { animation-delay: 0.4s; }
+  .word-in.w3 { animation-delay: 0.8s; }
+  @keyframes word-fade {
+    from { opacity: 0; transform: translateY(9px); filter: blur(4px); }
+    to   { opacity: 1; transform: translateY(0); filter: blur(0); }
+  }
+  .v-caret {
+    display: inline-block; width: 3px; height: 27px; margin-left: 6px; vertical-align: baseline;
+    background: var(--accent-2); border-radius: 2px;
+    box-shadow: 0 0 8px rgba(167,139,250,.85), 0 0 22px rgba(167,139,250,.4);
+    animation: caret-blink 1s step-end infinite;
+  }
+  @keyframes caret-blink { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
+
+  /* ----- Waiting state ----- */
+  .divider-note {
+    display: flex; align-items: center; gap: 14px; max-width: 980px; margin: 46px auto 24px; width: 100%;
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.14em; font-weight: 800; color: var(--text-3);
+  }
+  .divider-note::before, .divider-note::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+  .v-waiting {
+    max-width: 980px; margin: 0 auto; text-align: center; padding: 30px 20px 4px;
+  }
+  .v-waiting .w-ring {
+    width: 58px; height: 58px; border-radius: 50%; margin: 0 auto 16px;
+    background: var(--bg-card); border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center; color: var(--accent-2);
+    animation: wait-glow 2.4s cubic-bezier(0.32,0.72,0,1) infinite;
+  }
+  @keyframes wait-glow {
+    0%   { box-shadow: 0 0 0 0 rgba(99,102,241,0.4); }
+    70%  { box-shadow: 0 0 0 16px rgba(99,102,241,0); }
+    100% { box-shadow: 0 0 0 0 rgba(99,102,241,0); }
+  }
+  .v-waiting .w-ring .icon { width: 24px; height: 24px; }
+  .v-waiting .w-title { font-size: 17px; font-weight: 700; color: var(--text-2); display: inline-flex; align-items: baseline; }
+  .typing-dots { display: inline-flex; gap: 4px; margin-left: 6px; }
+  .typing-dots span {
+    width: 5px; height: 5px; border-radius: 50%; background: var(--accent-2);
+    animation: t-dot 1.3s cubic-bezier(0.32,0.72,0,1) infinite;
+  }
+  .typing-dots span:nth-child(2) { animation-delay: 0.18s; }
+  .typing-dots span:nth-child(3) { animation-delay: 0.36s; }
+  @keyframes t-dot { 0%,60%,100% { opacity: 0.3; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-5px); } }
+  .v-waiting .w-sub { font-size: 12.5px; color: var(--text-3); margin-top: 6px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-translate" viewBox="0 0 24 24"><path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/></symbol>
+  <symbol id="i-arrow-r" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></symbol>
+</defs></svg>
+
+<div class="intro">
+  <h1>Tłumacz — widok widza (M3)</h1>
+  <p class="lead">Druga osoba otwiera link z kodem sesji (<code>TRX-4F2K</code>) i widzi niemal pełnoekranowe napisy: duża, wysokoczytelna bieżąca linia na dole, słowa pojawiają się w rytmie streamingu z Bielika, poprzednia wypowiedź wygasa powyżej. Zero rozpraszaczy — do postawienia na stole podczas spotkania lub na drugim monitorze.</p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon"><use href="#i-eye"/></svg>Czytelność przede wszystkim</h3>
+      <p>Napisy 31px z miękkim text-shadow na ciemnym tle, wycentrowane w dolnej ⅓ ekranu — czytelne z 2–3 metrów. Przełącznik A− / A+ zmienia rozmiar w locie.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon"><use href="#i-translate"/></svg>Opcjonalny oryginał</h3>
+      <p>Toggle „Pokaż oryginał" dokłada nad tłumaczeniem mniejszą linię angielskiego źródła z tagiem języka — przydatne, gdy widz zna oba języki i chce weryfikować.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon"><use href="#i-mic"/></svg>Stan oczekiwania</h3>
+      <p>Gdy mówca milczy albo sesja dopiero startuje: pulsujący pierścień z ikoną mikrofonu i „Oczekiwanie na mówcę…" z trzema skaczącymi kropkami.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M3</span>
+    <h2>Napisy na żywo — widz</h2>
+    <div class="desc">Sesja aktywna „EN → PL": bieżąca linia streamuje się słowo po słowie, oryginał włączony. Poniżej, po separatorze, alternatywny stan oczekiwania.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="viewer-shell">
+
+      <div class="viewer-top">
+        <div class="s-name">
+          <span class="t-ico"><svg class="icon"><use href="#i-translate"/></svg></span>
+          Demo TentaFlow — sala A
+          <span class="s-code">TRX-4F2K</span>
+        </div>
+        <span class="lang-pair-chip">EN<svg class="icon"><use href="#i-arrow-r"/></svg>PL</span>
+        <span class="live-pill"><span class="dot"></span>Na żywo</span>
+        <div class="controls">
+          <div class="font-ctl"><button>A−</button><button>A+</button></div>
+          <button class="ctl-btn on"><svg class="icon"><use href="#i-eye"/></svg>Pokaż oryginał</button>
+        </div>
+      </div>
+
+      <div class="viewer-stage">
+        <div class="v-sub-prev">Żaden dźwięk nie opuszcza tej sali — transkrypcja i tłumaczenie są w pełni lokalne.</div>
+        <div class="v-sub-current">
+          <div class="v-orig"><span class="lang-tag">EN</span>Let me now show you how the live subtitles look on the viewer's device.</div>
+          <div class="v-trans">Pokażę wam teraz, jak napisy na żywo <span class="word-in">wyglądają</span> <span class="word-in w2">na&nbsp;urządzeniu</span> <span class="word-in w3">widza</span><span class="v-caret"></span></div>
+        </div>
+
+        <div class="divider-note">Stan oczekiwania (wariant)</div>
+        <div class="v-waiting">
+          <div class="w-ring"><svg class="icon"><use href="#i-mic"/></svg></div>
+          <div class="w-title">Oczekiwanie na mówcę<span class="typing-dots"><span></span><span></span><span></span></span></div>
+          <div class="w-sub">Połączono z sesją TRX-4F2K · napisy pojawią się automatycznie</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+</body>
+</html>
