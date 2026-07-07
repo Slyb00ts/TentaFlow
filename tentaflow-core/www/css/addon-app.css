@@ -411,3 +411,668 @@ tf-heatmap {
 .tf-heatmap-legend-swatch[data-level="2"] { background: rgba(99, 102, 241, 0.55); border-color: rgba(99, 102, 241, 0.6); }
 .tf-heatmap-legend-swatch[data-level="3"] { background: rgba(167, 139, 250, 0.75); border-color: rgba(167, 139, 250, 0.8); }
 .tf-heatmap-legend-swatch[data-level="4"] { background: rgba(239, 68, 68, 0.9); border-color: rgba(239, 68, 68, 0.95); }
+
+/* =============================================================================
+   Translator addon — screen polish (scoped to [data-addon="translator"]).
+   Deep-navy surface, indigo→lilac accents, equal text panes, streaming caret,
+   and a phone-first live captioning stage. Uses only shared tokens (no new
+   colors). Responsive layout is driven by CONTAINER queries on the shell, so a
+   docked/narrow panel restacks the same way a small viewport does.
+   ============================================================================= */
+.addon-app-shell[data-addon="translator"] {
+  --tr-accent: var(--tf-accent-1);
+  --tr-accent-2: #a78bfa;
+  --tr-glow: rgba(99, 102, 241, 0.35);
+  container-type: inline-size;
+  container-name: tr;
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-lg);
+  color: var(--tf-text);
+}
+
+/* ----- Top bar ----- */
+.addon-app-shell[data-addon="translator"] [data-component-id="topbar"] {
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-lg);
+  padding: 14px 18px !important;
+  flex-wrap: wrap;
+  row-gap: 12px !important;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="app-title"] {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 22px;
+  font-weight: 800;
+  margin: 0;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="app-title"]::before {
+  content: "";
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  /* White translate glyph (文A) composited over the accent gradient square. */
+  background:
+    url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/></svg>') center / 21px 21px no-repeat,
+    var(--tf-gradient-accent);
+  box-shadow: 0 0 14px var(--tr-glow), 0 0 28px rgba(99, 102, 241, 0.2);
+  flex-shrink: 0;
+}
+
+/* Segmented mode switch — active pill gets the accent gradient + glow. */
+.addon-app-shell[data-addon="translator"] [data-component-id="mode-switch"] .tf-segmented {
+  background: var(--tf-bg-input);
+  border: 1px solid var(--tf-border);
+  border-radius: 12px;
+  padding: 4px;
+  gap: 2px;
+}
+.addon-app-shell[data-addon="translator"] .tf-seg-opt {
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--tf-text-3);
+  border-radius: 9px;
+  padding: 7px 16px;
+  white-space: nowrap;
+}
+.addon-app-shell[data-addon="translator"] .tf-seg-opt.active {
+  color: #fff;
+  background: var(--tf-gradient-accent);
+  box-shadow: 0 0 14px var(--tr-glow), 0 0 30px rgba(99, 102, 241, 0.2);
+}
+
+/* Model status pill (green live dot). */
+.addon-app-shell[data-addon="translator"] [data-component-id="model-pill"] .tf-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 13px;
+  border-radius: 18px;
+  background: var(--tf-bg-card);
+  border: 1px solid var(--tf-border);
+  color: var(--tf-text-2);
+  font-weight: 700;
+  white-space: nowrap;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="model-pill"] .tf-badge::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--tf-success);
+  animation: tr-pulse-green 2.2s cubic-bezier(0.32, 0.72, 0, 1) infinite;
+  flex-shrink: 0;
+}
+@keyframes tr-pulse-green {
+  0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.5); }
+  70% { box-shadow: 0 0 0 6px rgba(34, 197, 94, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+}
+/* Red pulsing "NA ŻYWO" pill while the Live tab is active (generic :has). */
+.addon-app-shell[data-addon="translator"]:has(.tf-seg-opt[data-value="live"].active)
+  [data-component-id="model-pill"] .tf-badge {
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.4);
+  color: #fca5a5;
+}
+.addon-app-shell[data-addon="translator"]:has(.tf-seg-opt[data-value="live"].active)
+  [data-component-id="model-pill"] .tf-badge::before {
+  background: #ef4444;
+  animation: tr-pulse-red 1.6s cubic-bezier(0.32, 0.72, 0, 1) infinite;
+}
+@keyframes tr-pulse-red {
+  0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5); }
+  70% { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+}
+
+/* ----- Language bar (text mode) ----- */
+.addon-app-shell[data-addon="translator"] [data-component-id="lang-bar"] {
+  justify-content: center !important;
+  flex-wrap: wrap;
+  gap: 12px !important;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="lang-bar"] tf-select {
+  flex: 1 1 200px;
+  min-width: 0;
+  max-width: 300px;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="lang-bar"] .tf-select {
+  border-radius: var(--tf-radius-pill);
+  padding-block: 10px;
+  font-weight: 700;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="swap-btn"] .tf-btn {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  border: 1px solid var(--tf-border);
+  flex-shrink: 0;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="detected-chip"] .tf-badge {
+  border-radius: var(--tf-radius-pill);
+  font-weight: 700;
+}
+
+/* ----- Text panes ----- */
+.addon-app-shell[data-addon="translator"] [data-component-id="panes"] {
+  gap: 16px !important;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="pane-src"],
+.addon-app-shell[data-addon="translator"] [data-component-id="pane-tgt"] {
+  flex: 1 1 0 !important;
+  min-width: 0;
+  min-height: 420px !important;
+  background: var(--tf-bg-card) !important;
+  border-radius: var(--tf-radius-lg) !important;
+  overflow: hidden;
+}
+/* Translation pane carries the accent halo (the "output" pane). */
+.addon-app-shell[data-addon="translator"] [data-component-id="pane-tgt"] {
+  border-color: rgba(99, 102, 241, 0.35) !important;
+  box-shadow: 0 0 14px rgba(99, 102, 241, 0.12), 0 0 52px rgba(99, 102, 241, 0.06);
+}
+/* Pane header row → uppercase accent label. */
+.addon-app-shell[data-addon="translator"] [data-component-id="pane-src-head"],
+.addon-app-shell[data-addon="translator"] [data-component-id="pane-tgt-head"] {
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--tf-border);
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="pane-src-head"] .tf-text,
+.addon-app-shell[data-addon="translator"] [data-component-id="pane-tgt-head"] .tf-text {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-weight: 700;
+  color: var(--tr-accent-2);
+}
+/* Source textarea fills its pane. */
+.addon-app-shell[data-addon="translator"] [data-component-id="source-text"] {
+  flex: 1;
+  display: flex;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="source-text"] .tf-input-group,
+.addon-app-shell[data-addon="translator"] [data-component-id="source-text"] .tf-textarea {
+  width: 100%;
+  flex: 1;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="source-text"] .tf-textarea {
+  background: transparent;
+  border: 0;
+  resize: none;
+  font-size: 15.5px;
+  line-height: 1.75;
+  min-height: 320px;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="char-count"] {
+  align-self: flex-end;
+  font-variant-numeric: tabular-nums;
+}
+/* Streamed translation text + blinking caret. */
+.addon-app-shell[data-addon="translator"] [data-component-id="target-text"] {
+  flex: 1;
+  font-size: 15.5px;
+  line-height: 1.75;
+  color: var(--tf-text);
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="target-text"]::after {
+  content: "";
+  display: inline-block;
+  width: 2.5px;
+  height: 18px;
+  margin-left: 3px;
+  vertical-align: text-bottom;
+  background: var(--tr-accent-2);
+  border-radius: 2px;
+  box-shadow: 0 0 8px rgba(167, 139, 250, 0.8);
+  animation: tr-caret 1s step-end infinite;
+}
+@keyframes tr-caret { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+/* ----- Bottom controls + status bar ----- */
+.addon-app-shell[data-addon="translator"] [data-component-id="text-controls"] {
+  flex-wrap: wrap;
+  gap: 12px !important;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="translate-btn"] .tf-btn {
+  font-weight: 800;
+  padding: 12px 28px;
+  background: var(--tf-gradient-accent);
+  color: #fff;
+  box-shadow: 0 0 14px var(--tr-glow), 0 0 28px rgba(99, 102, 241, 0.16);
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="status-bar"] {
+  font-variant-numeric: tabular-nums;
+  flex-wrap: wrap;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="engine-pill"] .tf-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 13px;
+  border-radius: 18px;
+  background: var(--tf-bg-card);
+  border: 1px solid var(--tf-border);
+  color: var(--tf-text-2);
+  font-weight: 700;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="engine-pill"] .tf-badge::before {
+  content: "";
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--tf-success);
+  animation: tr-pulse-green 2.2s cubic-bezier(0.32, 0.72, 0, 1) infinite;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id^="stat-"] .tf-badge {
+  background: transparent;
+  border: 0;
+  color: var(--tf-text-3);
+  font-weight: 600;
+  gap: 5px;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id^="stat-"] .tf-badge svg {
+  color: var(--tr-accent-2);
+}
+
+/* =============================================================================
+   Live captioning (phone-first). A compact mic stage on top and a large,
+   dominant subtitle stage that fills the rest of the screen. Everything is
+   centered and width-capped on wide panels so it never spreads edge-to-edge.
+   ============================================================================= */
+.addon-app-shell[data-addon="translator"] [data-component-id="live-mode"] {
+  width: 100%;
+  max-width: 720px;
+  margin-inline: auto;
+}
+
+/* Language rows: caption label + a growing select. */
+.addon-app-shell[data-addon="translator"] [data-component-id="live-langs"] {
+  padding: 14px 16px;
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-lg);
+  background: var(--tf-bg-card);
+}
+.addon-app-shell[data-addon="translator"] [data-component-id^="live-hear"] [data-component-id$="-lbl"],
+.addon-app-shell[data-addon="translator"] [data-component-id^="live-show"] [data-component-id$="-lbl"] {
+  min-width: 62px;
+  font-weight: 700;
+  color: var(--tf-text-2);
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="live-langs"] .tf-select {
+  border-radius: var(--tf-radius-pill);
+  padding-block: 9px;
+  font-weight: 700;
+}
+
+/* Mic stage — compact card with pulsing rings + waveform. */
+.addon-app-shell[data-addon="translator"] [data-component-id="mic-stage"] {
+  background: var(--tf-bg-card);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-lg);
+  padding: 20px 16px !important;
+  gap: 10px !important;
+}
+.addon-app-shell[data-addon="translator"] .tf-audio-capture {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  --tf-audio-capture-level: 0.45;
+}
+.addon-app-shell[data-addon="translator"] .tf-audio-capture__mic-wrap {
+  position: relative;
+  width: 84px;
+  height: 84px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.addon-app-shell[data-addon="translator"] .tf-audio-capture__ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 2px solid rgba(99, 102, 241, 0.5);
+  animation: tr-ring 2.4s cubic-bezier(0.32, 0.72, 0, 1) infinite;
+}
+.addon-app-shell[data-addon="translator"] .tf-audio-capture__ring:nth-child(2) { animation-delay: 0.8s; }
+.addon-app-shell[data-addon="translator"] .tf-audio-capture__ring:nth-child(3) { animation-delay: 1.6s; }
+@keyframes tr-ring {
+  0% { transform: scale(0.65); opacity: 0.7; }
+  100% { transform: scale(1.5); opacity: 0; }
+}
+.addon-app-shell[data-addon="translator"] .tf-audio-capture__button {
+  position: relative;
+  z-index: 1;
+  width: 66px;
+  height: 66px;
+  border-radius: 50%;
+  border: 0;
+  cursor: pointer;
+  background: var(--tf-gradient-accent);
+  box-shadow: 0 0 18px var(--tr-glow), 0 0 44px rgba(99, 102, 241, 0.25);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.addon-app-shell[data-addon="translator"] .tf-audio-capture__icon {
+  width: 28px;
+  height: 28px;
+  background: #fff;
+  -webkit-mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>') center / contain no-repeat;
+  mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>') center / contain no-repeat;
+}
+.addon-app-shell[data-addon="translator"] .tf-audio-capture__level { display: none; }
+.addon-app-shell[data-addon="translator"] .tf-audio-capture__label {
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--tf-text-2);
+}
+/* Waveform bars framing the mic (top mirrored + bottom). */
+.addon-app-shell[data-addon="translator"] .tf-audio-capture__wave {
+  display: flex;
+  align-items: flex-end;
+  gap: 5px;
+  height: 40px;
+  max-width: 100%;
+  overflow: hidden;
+}
+.addon-app-shell[data-addon="translator"] .tf-audio-capture__wave--mirror { align-items: flex-start; }
+.addon-app-shell[data-addon="translator"] .tf-audio-capture__wave span {
+  width: 5px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, var(--tr-accent) 0%, var(--tr-accent-2) 100%);
+  height: calc(8px + (32px * var(--tf-audio-capture-level, 0.45)) * var(--tr-b, 1));
+  animation: tr-wave 1.1s ease-in-out infinite alternate;
+}
+.addon-app-shell[data-addon="translator"] .tf-audio-capture__wave span:nth-child(3n) { animation-delay: 0.15s; --tr-b: 1.4; }
+.addon-app-shell[data-addon="translator"] .tf-audio-capture__wave span:nth-child(3n+1) { animation-delay: 0.35s; --tr-b: 0.7; }
+.addon-app-shell[data-addon="translator"] .tf-audio-capture__wave span:nth-child(4n) { animation-delay: 0.5s; --tr-b: 1.1; }
+@keyframes tr-wave { from { transform: scaleY(0.5); } to { transform: scaleY(1); } }
+.addon-app-shell[data-addon="translator"] [data-component-id="pipeline-status"] {
+  text-align: center;
+  color: var(--tf-text-3);
+}
+
+/* Subtitle stage — the dominant surface. Fluid subtitle size via container
+   units so the current translation is big and readable held at arm's length. */
+.addon-app-shell[data-addon="translator"] [data-component-id="live-stage"] {
+  background: linear-gradient(180deg, rgba(99, 102, 241, 0.06), rgba(99, 102, 241, 0.02)) , var(--tf-bg-card) !important;
+  border: 1px solid rgba(99, 102, 241, 0.25) !important;
+  box-shadow: 0 0 22px rgba(99, 102, 241, 0.08), inset 0 0 60px rgba(99, 102, 241, 0.04);
+  min-height: 46cqi !important;
+  justify-content: flex-end;
+  padding: 20px 18px !important;
+  gap: 10px !important;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="live-prev2"],
+.addon-app-shell[data-addon="translator"] [data-component-id="live-prev1"] {
+  font-size: clamp(13px, 3cqi, 16px);
+  line-height: 1.45;
+  color: var(--tf-text-3);
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="live-prev2"] { opacity: 0.4; }
+.addon-app-shell[data-addon="translator"] [data-component-id="live-prev1"] { opacity: 0.62; }
+.addon-app-shell[data-addon="translator"] [data-component-id="live-orig"] {
+  font-size: clamp(12px, 3cqi, 15px);
+  color: var(--tr-accent-2);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.85;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="live-cur"] {
+  font-size: clamp(24px, 7cqi, 40px);
+  font-weight: 700;
+  line-height: 1.25;
+  color: var(--tf-text);
+  letter-spacing: -0.01em;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="live-cur"]::after {
+  content: "";
+  display: inline-block;
+  width: 3px; height: 0.85em; margin-left: 4px; vertical-align: text-bottom;
+  background: var(--tr-accent-2); border-radius: 2px;
+  box-shadow: 0 0 8px rgba(167, 139, 250, 0.8);
+  animation: tr-caret 1s step-end infinite;
+}
+
+/* Pipeline strip under the stage — Mic → Whisper → model. */
+.addon-app-shell[data-addon="translator"] [data-component-id="live-pipeline"] {
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px !important;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id^="pipe-"] .tf-badge {
+  border-radius: var(--tf-radius-pill);
+  background: var(--tf-bg-card);
+  border: 1px solid var(--tf-border);
+  font-weight: 600;
+}
+
+/* =============================================================================
+   Settings — full-width cards, label+control rows that stack on narrow panels.
+   ============================================================================= */
+.addon-app-shell[data-addon="translator"] [data-component-id="settings-mode"] {
+  width: 100%;
+  max-width: 760px;
+  margin-inline: auto;
+  gap: 16px !important;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id^="settings-"] {
+  background: var(--tf-bg-card) !important;
+  border-color: var(--tf-border) !important;
+  border-radius: var(--tf-radius-lg) !important;
+  padding: 18px 20px !important;
+  gap: 12px !important;
+}
+/* Card heading (Modele / Języki / Napisy na żywo). */
+.addon-app-shell[data-addon="translator"] [data-component-id^="card-"] {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--tr-accent-2);
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--tf-border);
+  margin: 0;
+}
+/* Setting rows: label left, control right, wrap+stack on narrow. */
+.addon-app-shell[data-addon="translator"] [data-component-id^="row-"] {
+  padding: 8px 0;
+  flex-wrap: wrap;
+  row-gap: 10px !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+.addon-app-shell[data-addon="translator"] [data-component-id^="row-"]:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id^="lblcol-"] {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id^="lbl-"] {
+  font-weight: 600;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id^="desc-"] {
+  color: var(--tf-text-3);
+  font-size: 12px;
+  line-height: 1.5;
+}
+/* Right-hand controls: give them room but never overflow the card. */
+.addon-app-shell[data-addon="translator"] [data-component-id^="row-"] > .tf-select,
+.addon-app-shell[data-addon="translator"] [data-component-id^="row-"] tf-select,
+.addon-app-shell[data-addon="translator"] [data-component-id="model-llm"],
+.addon-app-shell[data-addon="translator"] [data-component-id="model-stt"] {
+  flex: 0 1 320px;
+  min-width: 0;
+  max-width: 100%;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id^="row-"] tf-slider,
+.addon-app-shell[data-addon="translator"] [data-component-id="set-delay"] {
+  flex: 1 1 220px;
+  min-width: 0;
+  max-width: 100%;
+}
+/* Model picker (name + backend sub-line + status dot). */
+.addon-app-shell[data-addon="translator"] [data-component-id="model-llm"],
+.addon-app-shell[data-addon="translator"] [data-component-id="model-stt"] {
+  position: relative;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id$="-dot"] {
+  flex: 0 0 8px;
+  width: 8px; min-width: 8px; max-width: 8px; height: 8px;
+  overflow: hidden;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id$="-dot"] .tf-badge {
+  display: block;
+  width: 8px; height: 8px; min-width: 0; padding: 0; border: 0; border-radius: 50%;
+  font-size: 0; color: transparent;
+  background: var(--tf-success);
+  animation: tr-pulse-green 2.2s cubic-bezier(0.32, 0.72, 0, 1) infinite;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id^="model-"][data-component-id$="-labels"] {
+  align-items: flex-start !important;
+  flex: 1 1 auto !important;
+  text-align: left;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id^="model-"][data-component-id$="-name"],
+.addon-app-shell[data-addon="translator"] [data-component-id^="model-"][data-component-id$="-sub"] {
+  display: block;
+  width: 100%;
+  text-align: left !important;
+}
+/* Chevron affordance on the model picker (read-only display). */
+.addon-app-shell[data-addon="translator"] [data-component-id="model-llm"]::after,
+.addon-app-shell[data-addon="translator"] [data-component-id="model-stt"]::after {
+  content: "";
+  width: 14px; height: 14px; margin-left: 6px; flex-shrink: 0;
+  background: var(--tf-text-3);
+  -webkit-mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>') center/contain no-repeat;
+  mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>') center/contain no-repeat;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="settings-save"] {
+  padding: 4px 2px;
+  flex-wrap: wrap;
+  gap: 12px !important;
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="save-btn"] .tf-btn {
+  background: var(--tf-gradient-accent);
+  color: #fff;
+  font-weight: 800;
+  box-shadow: 0 0 14px var(--tr-glow);
+}
+.addon-app-shell[data-addon="translator"] [data-component-id="save-note"] {
+  color: var(--tf-success);
+}
+
+/* =============================================================================
+   Responsive (container queries on the shell). ≤680: text panes stack, header
+   centers. ≤460: settings rows stack label-over-control, tighter live stage.
+   ============================================================================= */
+@container tr (max-width: 680px) {
+  .addon-app-shell[data-addon="translator"] [data-component-id="panes"] {
+    flex-direction: column !important;
+  }
+  .addon-app-shell[data-addon="translator"] [data-component-id="pane-src"],
+  .addon-app-shell[data-addon="translator"] [data-component-id="pane-tgt"] {
+    min-height: 220px !important;
+  }
+  .addon-app-shell[data-addon="translator"] [data-component-id="source-text"] .tf-textarea {
+    min-height: 160px;
+  }
+  .addon-app-shell[data-addon="translator"] [data-component-id="topbar"] {
+    justify-content: center !important;
+  }
+  .addon-app-shell[data-addon="translator"] [data-component-id="mode-switch"] {
+    order: 3;
+    flex-basis: 100%;
+  }
+  .addon-app-shell[data-addon="translator"] [data-component-id="mode-switch"] .tf-segmented {
+    display: flex;
+  }
+  .addon-app-shell[data-addon="translator"] [data-component-id="mode-switch"] .tf-seg-opt {
+    flex: 1 1 0;
+    text-align: center;
+    padding-inline: 8px;
+  }
+  .addon-app-shell[data-addon="translator"] [data-component-id="text-controls"] {
+    justify-content: center !important;
+  }
+  .addon-app-shell[data-addon="translator"] [data-component-id="translate-btn"] {
+    flex: 1 1 100%;
+  }
+  .addon-app-shell[data-addon="translator"] [data-component-id="translate-btn"] .tf-btn {
+    width: 100%;
+  }
+}
+
+@container tr (max-width: 460px) {
+  /* Settings: label column above the control, control full width. */
+  .addon-app-shell[data-addon="translator"] [data-component-id^="row-"] {
+    flex-direction: column !important;
+    align-items: stretch !important;
+  }
+  .addon-app-shell[data-addon="translator"] [data-component-id^="lblcol-"] {
+    flex: 1 1 auto;
+  }
+  .addon-app-shell[data-addon="translator"] [data-component-id^="row-"] > .tf-select,
+  .addon-app-shell[data-addon="translator"] [data-component-id^="row-"] tf-select,
+  .addon-app-shell[data-addon="translator"] [data-component-id="model-llm"],
+  .addon-app-shell[data-addon="translator"] [data-component-id="model-stt"],
+  .addon-app-shell[data-addon="translator"] [data-component-id^="row-"] tf-slider,
+  .addon-app-shell[data-addon="translator"] [data-component-id="set-delay"] {
+    flex: 1 1 auto;
+    width: 100%;
+  }
+  /* Toggles align left once stacked, not stretched. */
+  .addon-app-shell[data-addon="translator"] [data-component-id="set-auto-detect"],
+  .addon-app-shell[data-addon="translator"] [data-component-id="set-history"] {
+    align-self: flex-start;
+  }
+
+  /* Reading-first live layout: this is a phone held up to read subtitles, so the
+     subtitle stage must dominate and sit directly under the language pair — the
+     mic is demoted to a compact controller below it. Pure CSS reorder of the
+     same flex children (no DOM/ABI change); container-type is inline-size so we
+     size the stage in vh, not cqh. */
+  .addon-app-shell[data-addon="translator"] [data-component-id="live-mode"] {
+    display: flex;
+    flex-direction: column;
+  }
+  .addon-app-shell[data-addon="translator"] [data-component-id="live-langs"]    { order: 0; }
+  .addon-app-shell[data-addon="translator"] [data-component-id="live-stage"]    { order: 1; }
+  .addon-app-shell[data-addon="translator"] [data-component-id="mic-stage"]     { order: 2; }
+  .addon-app-shell[data-addon="translator"] [data-component-id="live-pipeline"] { order: 3; }
+
+  /* Subtitles fill most of the screen. */
+  .addon-app-shell[data-addon="translator"] [data-component-id="live-stage"] {
+    min-height: 58vh !important;
+  }
+  .addon-app-shell[data-addon="translator"] [data-component-id="live-cur"] {
+    font-size: clamp(26px, 8cqi, 40px);
+  }
+
+  /* Compact mic controller: smaller button, shorter waveform, tighter padding. */
+  .addon-app-shell[data-addon="translator"] [data-component-id="mic-stage"] {
+    padding: 12px 12px !important;
+    gap: 6px !important;
+  }
+  .addon-app-shell[data-addon="translator"] .tf-audio-capture { gap: 8px; }
+  .addon-app-shell[data-addon="translator"] .tf-audio-capture__mic-wrap {
+    width: 58px;
+    height: 58px;
+  }
+  .addon-app-shell[data-addon="translator"] .tf-audio-capture__button {
+    width: 46px;
+    height: 46px;
+  }
+  .addon-app-shell[data-addon="translator"] .tf-audio-capture__icon {
+    width: 20px;
+    height: 20px;
+  }
+  .addon-app-shell[data-addon="translator"] .tf-audio-capture__wave {
+    height: 22px;
+  }
+  .addon-app-shell[data-addon="translator"] .tf-audio-capture__label {
+    font-size: 12px;
+  }
+}
