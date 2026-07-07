@@ -1601,6 +1601,9 @@ internal sealed class TranslatorAddon : AddonBase
         children.AddRange(body);
         return new Box
         {
+            // Grow + MinWidth 0 makes the two panes share the row equally (flex:
+            // 1 1 0) and shrink below their content, so a long text wraps inside
+            // its half instead of pushing the pane wide and starving the other.
             Id = id,
             Grow = true,
             Direction = FlexDirection.Column,
@@ -1608,6 +1611,7 @@ internal sealed class TranslatorAddon : AddonBase
             Style = new BoxStyle
             {
                 Padding = AllEdges(Spacing.Md),
+                MinWidth = PxDim(0),
                 MinHeight = PxDim(420),
                 Border = AllBorders(1, accent ? BorderColor.Accent : BorderColor.Default),
                 Radius = AllCorners(RadiusToken.Md),
