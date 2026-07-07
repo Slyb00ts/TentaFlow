@@ -9,6 +9,7 @@ import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
   _clearComponentRendererRegistry,
+  _clearResponsiveStyles,
 } from './component-renderer.js';
 import { registerLayoutAtomicRenderers, SPACER_TAG, DIVIDER_TAG } from './layout-atomic-renderers.js';
 import {
@@ -83,9 +84,15 @@ function comp(tag, fields, extra = {}) {
 }
 function setup() {
   _clearComponentRendererRegistry();
+  _clearResponsiveStyles();
   registerLayoutAtomicRenderers();
   registerLayoutContainersRenderers();
   document.body.innerHTML = '';
+}
+
+function injectedResponsiveCss() {
+  const el = document.head.querySelector('style[data-sdk-responsive]');
+  return el ? el.textContent : '';
 }
 
 // ============================================================================
@@ -832,6 +839,145 @@ test('bootstrap registers atomic + containers renderers idempotentnie', () => {
       [0, 'row'], [1, 'sm'], [2, 'start'], [3, 'center'], [4, 'no_wrap'],
     ])
   );
+});
+
+// ============================================================================
+// BoxStyle.shadow (key 13)
+// ============================================================================
+
+test('BoxStyle shadow=elevated → box-shadow token', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(FLEX_TAG, [
+      [0, 'row'], [2, 'start'], [3, 'stretch'], [4, 'no_wrap'],
+      [9, [[13, 'elevated']]],
+    ])
+  );
+  assertEq(el.style.boxShadow, 'var(--tf-shadow-lg)');
+});
+
+test('BoxStyle shadow=accent_glow → accent halo token', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(BOX_TAG, [[6, [[13, 'accent_glow']]]])
+  );
+  assertEq(el.style.boxShadow, 'var(--tf-glow-accent)');
+});
+
+test('BoxStyle shadow=none → none', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(BOX_TAG, [[6, [[13, 'none']]]]));
+  assertEq(el.style.boxShadow, 'none');
+});
+
+test('BoxStyle unknown shadow token rejected', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() => engine.render(comp(BOX_TAG, [[6, [[13, 'glow']]]])));
+});
+
+// ============================================================================
+// ResponsiveRule (Flex key 10 / Stack key 6 / Box key 11)
+// ============================================================================
+
+test('Flex responsive → data-responsive + injected @container rule', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(FLEX_TAG, [
+      [0, 'row'], [2, 'start'], [3, 'stretch'], [4, 'no_wrap'],
+      [5, []],
+      // one rule: at Px(680) stack column with lg gap
+      [10, [[[0, { kind: 'px', value: 680 }], [1, 'column'], [2, 'lg']]]],
+    ])
+  );
+  const hash = el.getAttribute('data-responsive');
+  assert(hash && /^[0-9a-f]{8}$/.test(hash), 'stable 8-hex hash on data-responsive');
+  const css = injectedResponsiveCss();
+  assert(css.includes('@container addon (max-width: 680px)'), 'container query at 680px');
+  assert(css.includes(`[data-responsive="${hash}"]`), 'scoped by hash selector');
+  assert(css.includes('flex-direction:column !important'), 'direction override with !important');
+  assert(css.includes('gap:var(--tf-space-lg) !important'), 'gap override with !important');
+});
+
+test('Responsive Breakpoint token maps to px scale', () => {
+  setup();
+  const engine = makeEngine();
+  engine.render(
+    comp(STACK_TAG, [
+      [2, []],
+      [6, [[[0, { kind: 'token', value: 'md' }], [1, 'column']]]],
+    ])
+  );
+  assert(injectedResponsiveCss().includes('(max-width: 1024px)'), 'md → 1024px');
+});
+
+test('Responsive order + hidden target the element itself', () => {
+  setup();
+  const engine = makeEngine();
+  engine.render(
+    comp(BOX_TAG, [
+      [11, [[[0, { kind: 'px', value: 460 }], [7, 2], [8, true]]]],
+    ])
+  );
+  const css = injectedResponsiveCss();
+  assert(css.includes('order:2 !important'), 'order override with !important');
+  assert(css.includes('display:none !important'), 'hidden → display:none with !important');
+});
+
+test('Responsive emits smaller max_width LAST so it wins the cascade', () => {
+  setup();
+  const engine = makeEngine();
+  // Author order deliberately narrow-first; the emitted CSS must still put the
+  // wider (680) block before the narrower (460) one.
+  engine.render(comp(FLEX_TAG, [
+    [0, 'row'], [2, 'start'], [3, 'stretch'], [4, 'no_wrap'], [5, []],
+    [10, [
+      [[0, { kind: 'px', value: 460 }], [2, 'sm']],
+      [[0, { kind: 'px', value: 680 }], [2, 'lg']],
+    ]],
+  ]));
+  const css = injectedResponsiveCss();
+  const i680 = css.indexOf('(max-width: 680px)');
+  const i460 = css.indexOf('(max-width: 460px)');
+  assert(i680 !== -1 && i460 !== -1, 'both breakpoints emitted');
+  assert(i680 < i460, '680px block precedes 460px block so 460 overrides');
+});
+
+test('Responsive rules deduped by content hash (no duplicate injection)', () => {
+  setup();
+  const engine = makeEngine();
+  const rule = [[[0, { kind: 'px', value: 680 }], [1, 'column']]];
+  engine.render(comp(FLEX_TAG, [[0, 'row'], [2, 'start'], [3, 'stretch'], [4, 'no_wrap'], [5, []], [10, rule]]));
+  engine.render(comp(FLEX_TAG, [[0, 'row'], [2, 'start'], [3, 'stretch'], [4, 'no_wrap'], [5, []], [10, rule]]));
+  const css = injectedResponsiveCss();
+  const occurrences = css.split('@container addon (max-width: 680px)').length - 1;
+  assertEq(occurrences, 1);
+});
+
+test('Responsive padding EdgeValues → padding longhands', () => {
+  setup();
+  const engine = makeEngine();
+  engine.render(
+    comp(BOX_TAG, [
+      [11, [[[0, { kind: 'px', value: 460 }],
+        [5, [[0, { kind: 'token', value: 'sm' }], [2, { kind: 'px', value: 12 }]]]]]],
+    ])
+  );
+  const css = injectedResponsiveCss();
+  assert(css.includes('padding-top:var(--tf-space-sm) !important'), 'top from token');
+  assert(css.includes('padding-bottom:12px !important'), 'bottom from px');
+});
+
+test('Responsive empty array is a no-op', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(BOX_TAG, [[11, []]]));
+  assert(!el.hasAttribute('data-responsive'), 'no attribute for empty rules');
+  assertEq(injectedResponsiveCss(), '');
 });
 
 // ---- report ----

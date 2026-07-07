@@ -346,6 +346,26 @@ test('Badge variant=dot bez tekstu, z sr-only label', () => {
   assertEq(sr.textContent, 'New activity');
 });
 
+test('Badge reflects variant + pulse so generic CSS can target dot/pulse', () => {
+  setup();
+  const engine = makeEngine();
+  const dot = engine.render(comp(BADGE_TAG, [
+    [0, 'dot'], [1, 'success'],
+    [2, { kind: 'literal', value: 'online' }],
+    [5, 99], [6, true],
+  ]));
+  assertEq(dot.getAttribute('variant'), 'dot');
+  assert(dot.hasAttribute('pulse'), 'pulse attribute set when Badge.pulse=true');
+
+  const pill = engine.render(comp(BADGE_TAG, [
+    [0, 'pulse'], [1, 'critical'],
+    [2, { kind: 'literal', value: 'LIVE' }],
+    [5, 99], [6, false],
+  ]));
+  assertEq(pill.getAttribute('variant'), 'pulse');
+  assert(!pill.hasAttribute('pulse'), 'no pulse attribute when Badge.pulse=false');
+});
+
 test('Badge max=0 with a count throws', () => {
   setup();
   const engine = makeEngine();

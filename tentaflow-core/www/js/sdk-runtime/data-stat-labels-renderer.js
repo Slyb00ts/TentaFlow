@@ -506,6 +506,10 @@ function renderBadge(component, ctx) {
   const TONE_MAP = { neutral: 'accent', primary: 'accent', success: 'success', warning: 'warning', critical: 'danger', info: 'info', muted: 'accent' };
   const wrapper = document.createElement('tf-badge');
   wrapper.setAttribute('tone', TONE_MAP[tone] || 'accent');
+  // Reflect the variant + pulse flag so the generic tf-badge CSS can render the
+  // dot/pulse status-indicator variants (no per-addon styling).
+  wrapper.setAttribute('variant', variant);
+  if (pulse) wrapper.setAttribute('pulse', '');
 
   if (variant !== 'dot') {
     const applyLabel = () => {
