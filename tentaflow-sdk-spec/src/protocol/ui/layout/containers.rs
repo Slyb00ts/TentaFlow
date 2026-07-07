@@ -4,7 +4,7 @@
 
 use super::super::component::{Component, FieldMap};
 use super::super::inline::{
-    GridChild, GridTrack, SplitSize, BoxStyle,
+    GridChild, GridTrack, SplitSize, BoxStyle, ResponsiveRule,
 };
 use super::super::tokens::{
     BackgroundToken, FlexAlign, FlexDirection, FlexJustify,
@@ -36,13 +36,14 @@ pub struct Flex {
     pub background: Option<BackgroundToken>,
     pub radius: Option<RadiusToken>,
     pub style: Option<BoxStyle>,
+    pub responsive: Option<Vec<ResponsiveRule>>,
 }
 
 impl Flex {
     pub const TAG: u16 = 0x0101;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(10);
+        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(11);
         entries.push((0, encode_to_value(&self.direction)?));
         entries.push((1, encode_to_value(&self.gap)?));
         entries.push((2, encode_to_value(&self.justify)?));
@@ -53,6 +54,7 @@ impl Flex {
         if let Some(b) = &self.background { entries.push((7, encode_to_value(b)?)); }
         if let Some(r) = &self.radius { entries.push((8, encode_to_value(r)?)); }
         if let Some(s) = &self.style { entries.push((9, encode_to_value(s)?)); }
+        if let Some(rr) = &self.responsive { entries.push((10, encode_to_value(rr)?)); }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -69,6 +71,7 @@ impl Flex {
         let mut background = None;
         let mut radius = None;
         let mut style = None;
+        let mut responsive = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => direction = Some(decode_from_value(v)?),
@@ -81,6 +84,7 @@ impl Flex {
                 7 => background = Some(decode_from_value(v)?),
                 8 => radius = Some(decode_from_value(v)?),
                 9 => style = Some(decode_from_value(v)?),
+                10 => responsive = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("Flex", *other)),
             }
         }
@@ -96,6 +100,7 @@ impl Flex {
             background,
             radius,
             style,
+            responsive,
         })
     }
 }
@@ -190,19 +195,21 @@ pub struct Stack {
     /// w Stacku o ustalonej wysokości; brak = domyślne pakowanie od startu.
     pub justify: Option<FlexJustify>,
     pub style: Option<BoxStyle>,
+    pub responsive: Option<Vec<ResponsiveRule>>,
 }
 
 impl Stack {
     pub const TAG: u16 = 0x0103;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(6);
+        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(7);
         entries.push((0, encode_to_value(&self.gap)?));
         entries.push((1, encode_to_value(&self.align)?));
         entries.push((2, encode_to_value(&self.children)?));
         if let Some(p) = &self.padding { entries.push((3, encode_to_value(p)?)); }
         if let Some(j) = &self.justify { entries.push((4, encode_to_value(j)?)); }
         if let Some(s) = &self.style { entries.push((5, encode_to_value(s)?)); }
+        if let Some(rr) = &self.responsive { entries.push((6, encode_to_value(rr)?)); }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -215,6 +222,7 @@ impl Stack {
         let mut padding = None;
         let mut justify = None;
         let mut style = None;
+        let mut responsive = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => gap = Some(decode_from_value(v)?),
@@ -223,6 +231,7 @@ impl Stack {
                 3 => padding = Some(decode_from_value(v)?),
                 4 => justify = Some(decode_from_value(v)?),
                 5 => style = Some(decode_from_value(v)?),
+                6 => responsive = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("Stack", *other)),
             }
         }
@@ -234,6 +243,7 @@ impl Stack {
             padding,
             justify,
             style,
+            responsive,
         })
     }
 }
@@ -451,13 +461,14 @@ pub struct Box {
     pub gap: Option<super::super::tokens::Spacing>,
     pub align: Option<FlexAlign>,
     pub justify: Option<FlexJustify>,
+    pub responsive: Option<Vec<ResponsiveRule>>,
 }
 
 impl Box {
     pub const TAG: u16 = 0x0115;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(11);
+        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(12);
         if let Some(w) = &self.width { entries.push((0, encode_to_value(w)?)); }
         if let Some(g) = &self.grow { entries.push((1, encode_to_value(g)?)); }
         if let Some(a) = &self.align_self { entries.push((2, encode_to_value(a)?)); }
@@ -469,6 +480,7 @@ impl Box {
         if let Some(g) = &self.gap { entries.push((8, encode_to_value(g)?)); }
         if let Some(a) = &self.align { entries.push((9, encode_to_value(a)?)); }
         if let Some(j) = &self.justify { entries.push((10, encode_to_value(j)?)); }
+        if let Some(rr) = &self.responsive { entries.push((11, encode_to_value(rr)?)); }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -486,6 +498,7 @@ impl Box {
         let mut gap = None;
         let mut align = None;
         let mut justify = None;
+        let mut responsive = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => width = Some(decode_from_value(v)?),
@@ -499,6 +512,7 @@ impl Box {
                 8 => gap = Some(decode_from_value(v)?),
                 9 => align = Some(decode_from_value(v)?),
                 10 => justify = Some(decode_from_value(v)?),
+                11 => responsive = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("Box", *other)),
             }
         }
@@ -514,6 +528,7 @@ impl Box {
             gap,
             align,
             justify,
+            responsive,
         })
     }
 }

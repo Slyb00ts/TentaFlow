@@ -254,7 +254,8 @@ public enum ShadowToken {
     [Wire("subtle")] Subtle,
     [Wire("medium")] Medium,
     [Wire("elevated")] Elevated,
-    [Wire("floating")] Floating
+    [Wire("floating")] Floating,
+    [Wire("accent_glow")] AccentGlow
 }
 
 public static class ShadowTokenWireExtensions {
@@ -264,6 +265,7 @@ public static class ShadowTokenWireExtensions {
         ShadowToken.Medium => "medium",
         ShadowToken.Elevated => "elevated",
         ShadowToken.Floating => "floating",
+        ShadowToken.AccentGlow => "accent_glow",
         _ => throw new ArgumentOutOfRangeException(nameof(v)),
     };
     public static TfValue ToWire(this ShadowToken v) => TfValue.Text(v.WireName());
@@ -4248,6 +4250,8 @@ public sealed class BoxStyle {
     public Overflow? OverflowX { get; set; }
     /// <summary>Field 12: overflow_y (Option<Enum<Overflow>>)</summary>
     public Overflow? OverflowY { get; set; }
+    /// <summary>Field 13: shadow (Option<Enum<ShadowToken>>)</summary>
+    public ShadowToken? Shadow { get; set; }
 
     public TfValue ToValue() {
         var entries = new List<KeyValuePair<TfValue, TfValue>>();
@@ -4264,6 +4268,43 @@ public sealed class BoxStyle {
         if (MaxHeight != null) entries.Add(new(TfValue.UInt(10), MaxHeight.ToValue()));
         if (OverflowX != null) entries.Add(new(TfValue.UInt(11), OverflowX.Value.ToWire()));
         if (OverflowY != null) entries.Add(new(TfValue.UInt(12), OverflowY.Value.ToWire()));
+        if (Shadow != null) entries.Add(new(TfValue.UInt(13), Shadow.Value.ToWire()));
+        return TfValue.Map(entries);
+    }
+}
+
+/// <summary>Inline struct: ResponsiveRule</summary>
+public sealed class ResponsiveRule {
+    /// <summary>Field 0: max_width (Inline<ContainerWidth>)</summary>
+    public ContainerWidth MaxWidth { get; set; } = null!;
+    /// <summary>Field 1: direction (Option<Enum<FlexDirection>>)</summary>
+    public FlexDirection? Direction { get; set; }
+    /// <summary>Field 2: gap (Option<Enum<Spacing>>)</summary>
+    public Spacing? Gap { get; set; }
+    /// <summary>Field 3: align (Option<Enum<FlexAlign>>)</summary>
+    public FlexAlign? Align { get; set; }
+    /// <summary>Field 4: justify (Option<Enum<FlexJustify>>)</summary>
+    public FlexJustify? Justify { get; set; }
+    /// <summary>Field 5: padding (Option<Inline<EdgeValues>>)</summary>
+    public EdgeValues? Padding { get; set; }
+    /// <summary>Field 6: min_height (Option<Inline<DimensionToken>>)</summary>
+    public DimensionToken? MinHeight { get; set; }
+    /// <summary>Field 7: order (Option<i32>)</summary>
+    public int? Order { get; set; }
+    /// <summary>Field 8: hidden (Option<bool>)</summary>
+    public bool? Hidden { get; set; }
+
+    public TfValue ToValue() {
+        var entries = new List<KeyValuePair<TfValue, TfValue>>();
+        entries.Add(new(TfValue.UInt(0), MaxWidth.ToValue()));
+        if (Direction != null) entries.Add(new(TfValue.UInt(1), Direction.Value.ToWire()));
+        if (Gap != null) entries.Add(new(TfValue.UInt(2), Gap.Value.ToWire()));
+        if (Align != null) entries.Add(new(TfValue.UInt(3), Align.Value.ToWire()));
+        if (Justify != null) entries.Add(new(TfValue.UInt(4), Justify.Value.ToWire()));
+        if (Padding != null) entries.Add(new(TfValue.UInt(5), Padding.ToValue()));
+        if (MinHeight != null) entries.Add(new(TfValue.UInt(6), MinHeight.ToValue()));
+        if (Order != null) entries.Add(new(TfValue.UInt(7), TfValue.Int(Order.Value)));
+        if (Hidden != null) entries.Add(new(TfValue.UInt(8), TfValue.Bool(Hidden.Value)));
         return TfValue.Map(entries);
     }
 }
@@ -6119,6 +6160,42 @@ public sealed class RadiusValuePx : RadiusValue {
     }
 }
 
+/// <summary>Tagged union: ContainerWidth (discriminator: "kind")</summary>
+public abstract class ContainerWidth {
+    public abstract string ContainerWidthKind { get; }
+    public abstract TfValue ToValue();
+}
+
+/// <summary>ContainerWidth variant: Token (wire kind "token")</summary>
+public sealed class ContainerWidthToken : ContainerWidth {
+    public override string ContainerWidthKind => "token";
+
+    /// <summary>Field 0: value (Enum<Breakpoint>)</summary>
+    public Breakpoint Value { get; set; }
+
+    public override TfValue ToValue() {
+        var entries = new List<KeyValuePair<TfValue, TfValue>>();
+        entries.Add(new(TfValue.Text("kind"), TfValue.Text("token")));
+        entries.Add(new(TfValue.Text("value"), Value.ToWire()));
+        return TfValue.Map(entries);
+    }
+}
+
+/// <summary>ContainerWidth variant: Px (wire kind "px")</summary>
+public sealed class ContainerWidthPx : ContainerWidth {
+    public override string ContainerWidthKind => "px";
+
+    /// <summary>Field 0: value (u16)</summary>
+    public ushort Value { get; set; } = 0;
+
+    public override TfValue ToValue() {
+        var entries = new List<KeyValuePair<TfValue, TfValue>>();
+        entries.Add(new(TfValue.Text("kind"), TfValue.Text("px")));
+        entries.Add(new(TfValue.Text("value"), TfValue.UInt(Value)));
+        return TfValue.Map(entries);
+    }
+}
+
 /// <summary>Tagged union: SplitSize (discriminator: "kind")</summary>
 public abstract class SplitSize {
     public abstract string SplitSizeKind { get; }
@@ -7397,6 +7474,8 @@ public sealed class Flex : Component {
     public RadiusToken? Radius { get; set; }
     /// <summary>Field 9: style (Option<Inline<BoxStyle>>)</summary>
     public BoxStyle? Style { get; set; }
+    /// <summary>Field 10: responsive (Option<Array<Inline<ResponsiveRule>>>)</summary>
+    public List<ResponsiveRule>? Responsive { get; set; }
 
     public override FieldMap ToFieldMap() {
         var map = new FieldMap();
@@ -7410,6 +7489,7 @@ public sealed class Flex : Component {
         if (Background != null) map.Set(7, Background.Value.ToWire());
         if (Radius != null) map.Set(8, Radius.Value.ToWire());
         if (Style != null) map.Set(9, Style.ToValue());
+        if (Responsive != null) map.Set(10, TfValue.Array(Responsive.ConvertAll(x => x.ToValue())));
         return map;
     }
 }
@@ -7467,6 +7547,8 @@ public sealed class Stack : Component {
     public FlexJustify? Justify { get; set; }
     /// <summary>Field 5: style (Option<Inline<BoxStyle>>)</summary>
     public BoxStyle? Style { get; set; }
+    /// <summary>Field 6: responsive (Option<Array<Inline<ResponsiveRule>>>)</summary>
+    public List<ResponsiveRule>? Responsive { get; set; }
 
     public override FieldMap ToFieldMap() {
         var map = new FieldMap();
@@ -7476,6 +7558,7 @@ public sealed class Stack : Component {
         if (Padding != null) map.Set(3, Padding.Value.ToWire());
         if (Justify != null) map.Set(4, Justify.Value.ToWire());
         if (Style != null) map.Set(5, Style.ToValue());
+        if (Responsive != null) map.Set(6, TfValue.Array(Responsive.ConvertAll(x => x.ToValue())));
         return map;
     }
 }
@@ -7600,6 +7683,8 @@ public sealed class Box : Component {
     public FlexAlign? Align { get; set; }
     /// <summary>Field 10: justify (Option<Enum<FlexJustify>>)</summary>
     public FlexJustify? Justify { get; set; }
+    /// <summary>Field 11: responsive (Option<Array<Inline<ResponsiveRule>>>)</summary>
+    public List<ResponsiveRule>? Responsive { get; set; }
 
     public override FieldMap ToFieldMap() {
         var map = new FieldMap();
@@ -7614,6 +7699,7 @@ public sealed class Box : Component {
         if (Gap != null) map.Set(8, Gap.Value.ToWire());
         if (Align != null) map.Set(9, Align.Value.ToWire());
         if (Justify != null) map.Set(10, Justify.Value.ToWire());
+        if (Responsive != null) map.Set(11, TfValue.Array(Responsive.ConvertAll(x => x.ToValue())));
         return map;
     }
 }
@@ -8744,6 +8830,8 @@ public sealed class Text : Component {
     public byte? MaxLines { get; set; }
     /// <summary>Field 6: format (Option<Inline<ValueFormat>>)</summary>
     public ValueFormat? Format { get; set; }
+    /// <summary>Field 7: streaming (Option<BindRef>)</summary>
+    public BindRef? Streaming { get; set; }
 
     public override FieldMap ToFieldMap() {
         var map = new FieldMap();
@@ -8754,6 +8842,7 @@ public sealed class Text : Component {
         if (Wrap != null) map.Set(4, Wrap.Value.ToWire());
         if (MaxLines != null) map.Set(5, TfValue.UInt(MaxLines.Value));
         if (Format != null) map.Set(6, Format.ToValue());
+        if (Streaming != null) map.Set(7, Streaming.ToValue());
         return map;
     }
 }

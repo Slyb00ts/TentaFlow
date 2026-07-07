@@ -61,9 +61,37 @@ mod tests {
             background: Some(BackgroundToken::Subtle),
             radius: Some(RadiusToken::Md),
             style: None,
+            responsive: None,
         };
         let c = f.clone().into_component("f").unwrap();
         assert_eq!(c.tag, Flex::TAG);
+        assert_eq!(Flex::try_from_component(&c).unwrap(), f);
+    }
+
+    #[test]
+    fn flex_with_responsive_rules_roundtrip() {
+        use crate::protocol::ui::inline::{ContainerWidth, ResponsiveRule};
+        use crate::protocol::ui::tokens::Breakpoint;
+        let f = Flex {
+            direction: FlexDirection::Row,
+            gap: Spacing::Md,
+            justify: FlexJustify::SpaceBetween,
+            align: FlexAlign::Center,
+            wrap: FlexWrap::Wrap,
+            children: vec![],
+            padding: None,
+            background: None,
+            radius: None,
+            style: None,
+            responsive: Some(vec![
+                ResponsiveRule::at(ContainerWidth::Px(460))
+                    .direction(FlexDirection::Column)
+                    .gap(Spacing::Sm)
+                    .hidden(true),
+                ResponsiveRule::at(Breakpoint::Md).justify(FlexJustify::Start),
+            ]),
+        };
+        let c = f.clone().into_component("f").unwrap();
         assert_eq!(Flex::try_from_component(&c).unwrap(), f);
     }
 
@@ -94,12 +122,30 @@ mod tests {
             padding: None,
             justify: None,
             style: None,
+            responsive: None,
         };
         let mut c = s.into_component("s").unwrap();
         c.fields.0.retain(|(k, _)| *k != 0 && *k != 1);
         let back = Stack::try_from_component(&c).unwrap();
         assert_eq!(back.gap, Spacing::Md);
         assert_eq!(back.align, FlexAlign::Stretch);
+    }
+
+    #[test]
+    fn stack_with_responsive_rules_roundtrip() {
+        use crate::protocol::ui::inline::ResponsiveRule;
+        use crate::protocol::ui::tokens::Breakpoint;
+        let s = Stack {
+            gap: Spacing::Lg,
+            align: FlexAlign::Stretch,
+            children: vec![],
+            padding: None,
+            justify: None,
+            style: None,
+            responsive: Some(vec![ResponsiveRule::at(Breakpoint::Sm).gap(Spacing::Xs)]),
+        };
+        let c = s.clone().into_component("s").unwrap();
+        assert_eq!(Stack::try_from_component(&c).unwrap(), s);
     }
 
     #[test]
@@ -116,6 +162,7 @@ mod tests {
             padding: None,
             background: None,
             radius: None,
+            responsive: None,
             style: Some(
                 BoxStyle::new()
                     .margin_y(Spacing::Md)
@@ -148,6 +195,10 @@ mod tests {
             gap: Some(Spacing::Sm),
             align: Some(FlexAlign::Center),
             justify: Some(FlexJustify::SpaceBetween),
+            responsive: Some(vec![
+                crate::protocol::ui::inline::ResponsiveRule::at(680u16)
+                    .direction(FlexDirection::Column),
+            ]),
         };
         let c = b.clone().into_component("bx").unwrap();
         assert_eq!(c.tag, Box::TAG);

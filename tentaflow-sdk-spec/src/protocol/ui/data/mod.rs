@@ -70,6 +70,17 @@ mod tests {
             content: lit("hello"), style: TextStyle::Body,
             tone: Some(Tone::Primary), align: Some(TextAlign::Start),
             wrap: Some(TextWrap::Wrap), max_lines: Some(3), format: None,
+            streaming: Some(lit("stream_flag")),
+        };
+        rt(t, |m| m.into_component("t").unwrap(), Text::try_from_component);
+    }
+
+    #[test]
+    fn text_streaming_absent_roundtrip() {
+        let t = Text {
+            content: lit("hello"), style: TextStyle::Body,
+            tone: None, align: None, wrap: None, max_lines: None, format: None,
+            streaming: None,
         };
         rt(t, |m| m.into_component("t").unwrap(), Text::try_from_component);
     }

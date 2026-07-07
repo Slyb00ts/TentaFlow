@@ -138,6 +138,7 @@ string_enum! {
         Medium = "medium",
         Elevated = "elevated",
         Floating = "floating",
+        AccentGlow = "accent_glow",
     }
 }
 
@@ -267,6 +268,21 @@ mod tests {
     fn navigate_target_wire_strings_match_doc() {
         assert_eq!(NavigateTarget::NewTab.as_str(), "new_tab");
         assert_eq!(NavigateTarget::SystemBrowser.as_str(), "system_browser");
+    }
+
+    #[test]
+    fn shadow_token_roundtrip_all_variants() {
+        for v in [
+            ShadowToken::None,
+            ShadowToken::Subtle,
+            ShadowToken::Medium,
+            ShadowToken::Elevated,
+            ShadowToken::Floating,
+            ShadowToken::AccentGlow,
+        ] {
+            roundtrip(v);
+        }
+        assert_eq!(ShadowToken::AccentGlow.as_str(), "accent_glow");
     }
 }
 

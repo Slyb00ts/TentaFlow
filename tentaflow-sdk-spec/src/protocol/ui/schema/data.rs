@@ -298,6 +298,7 @@ pub const FLEX_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 7, name: "background", wire: "Option<Enum<BackgroundToken>>", required: false, default: None },
         FieldMeta { key: 8, name: "radius", wire: "Option<Enum<RadiusToken>>", required: false, default: None },
         FieldMeta { key: 9, name: "style", wire: "Option<Inline<BoxStyle>>", required: false, default: None },
+        FieldMeta { key: 10, name: "responsive", wire: "Option<Array<Inline<ResponsiveRule>>>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -330,6 +331,7 @@ pub const STACK_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 3, name: "padding", wire: "Option<Enum<Spacing>>", required: false, default: None },
         FieldMeta { key: 4, name: "justify", wire: "Option<Enum<FlexJustify>>", required: false, default: None },
         FieldMeta { key: 5, name: "style", wire: "Option<Inline<BoxStyle>>", required: false, default: None },
+        FieldMeta { key: 6, name: "responsive", wire: "Option<Array<Inline<ResponsiveRule>>>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -396,6 +398,7 @@ pub const BOX_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 8, name: "gap", wire: "Option<Enum<Spacing>>", required: false, default: None },
         FieldMeta { key: 9, name: "align", wire: "Option<Enum<FlexAlign>>", required: false, default: None },
         FieldMeta { key: 10, name: "justify", wire: "Option<Enum<FlexJustify>>", required: false, default: None },
+        FieldMeta { key: 11, name: "responsive", wire: "Option<Array<Inline<ResponsiveRule>>>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -955,6 +958,7 @@ pub const TEXT_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 4, name: "wrap", wire: "Option<Enum<TextWrap>>", required: false, default: None },
         FieldMeta { key: 5, name: "max_lines", wire: "Option<u8>", required: false, default: None },
         FieldMeta { key: 6, name: "format", wire: "Option<Inline<ValueFormat>>", required: false, default: None },
+        FieldMeta { key: 7, name: "streaming", wire: "Option<BindRef>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -2433,6 +2437,7 @@ pub const SHADOWTOKEN_ENUM: EnumMeta = EnumMeta {
         ("Medium", "medium"),
         ("Elevated", "elevated"),
         ("Floating", "floating"),
+        ("AccentGlow", "accent_glow"),
     ],
 };
 
@@ -4595,6 +4600,22 @@ pub const BOXSTYLE_INLINE: InlineMeta = InlineMeta {
         FieldMeta { key: 10, name: "max_height", wire: "Option<Inline<DimensionToken>>", required: false, default: None },
         FieldMeta { key: 11, name: "overflow_x", wire: "Option<Enum<Overflow>>", required: false, default: None },
         FieldMeta { key: 12, name: "overflow_y", wire: "Option<Enum<Overflow>>", required: false, default: None },
+        FieldMeta { key: 13, name: "shadow", wire: "Option<Enum<ShadowToken>>", required: false, default: None },
+    ],
+};
+
+pub const RESPONSIVERULE_INLINE: InlineMeta = InlineMeta {
+    name: "ResponsiveRule",
+    fields: &[
+        FieldMeta { key: 0, name: "max_width", wire: "Inline<ContainerWidth>", required: true, default: None },
+        FieldMeta { key: 1, name: "direction", wire: "Option<Enum<FlexDirection>>", required: false, default: None },
+        FieldMeta { key: 2, name: "gap", wire: "Option<Enum<Spacing>>", required: false, default: None },
+        FieldMeta { key: 3, name: "align", wire: "Option<Enum<FlexAlign>>", required: false, default: None },
+        FieldMeta { key: 4, name: "justify", wire: "Option<Enum<FlexJustify>>", required: false, default: None },
+        FieldMeta { key: 5, name: "padding", wire: "Option<Inline<EdgeValues>>", required: false, default: None },
+        FieldMeta { key: 6, name: "min_height", wire: "Option<Inline<DimensionToken>>", required: false, default: None },
+        FieldMeta { key: 7, name: "order", wire: "Option<i32>", required: false, default: None },
+        FieldMeta { key: 8, name: "hidden", wire: "Option<bool>", required: false, default: None },
     ],
 };
 
@@ -4701,6 +4722,7 @@ pub const ALL_INLINE_STRUCTS: &[&InlineMeta] = &[
     &BORDEREDGES_INLINE,
     &CORNERVALUES_INLINE,
     &BOXSTYLE_INLINE,
+    &RESPONSIVERULE_INLINE,
     &LOGEVENT_INLINE,
     &FORMFIELDVALUE_INLINE,
     &FIELDERROR_INLINE,

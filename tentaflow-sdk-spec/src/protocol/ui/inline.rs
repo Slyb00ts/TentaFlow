@@ -3470,6 +3470,98 @@ impl From<u16> for RadiusValue {
     }
 }
 
+/// Container-width threshold for a `ResponsiveRule`: a semantic `Breakpoint`
+/// token or a raw pixel width measured against the CONTAINER (not the viewport).
+/// Wire: `{kind:"token", value: Breakpoint}` / `{kind:"px", value: u16}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerWidth {
+    Token(super::tokens::Breakpoint),
+    Px(u16),
+}
+
+impl<C> Encode<C> for ContainerWidth {
+    fn encode<W: minicbor::encode::Write>(
+        &self,
+        e: &mut Encoder<W>,
+        ctx: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        // Canonical key order: kind(0x64..) < value(0x65..).
+        e.map(2)?;
+        match self {
+            ContainerWidth::Token(value) => {
+                e.str("kind")?.str("token")?;
+                e.str("value")?;
+                value.encode(e, ctx)?;
+            }
+            ContainerWidth::Px(value) => {
+                e.str("kind")?.str("px")?;
+                e.str("value")?.u16(*value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'b, C> Decode<'b, C> for ContainerWidth {
+    fn decode(
+        d: &mut Decoder<'b>,
+        ctx: &mut C,
+    ) -> Result<Self, minicbor::decode::Error> {
+        let len = d.map()?.ok_or_else(|| {
+            minicbor::decode::Error::message("indefinite-length map forbidden")
+        })?;
+        let mut kind: Option<String> = None;
+        let mut value: Option<Value> = None;
+        for _ in 0..len {
+            let k = d.str()?;
+            match k {
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "ContainerWidth", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "value" => {
+                    assert_no_dup_tstr(&value, "ContainerWidth", "value")?;
+                    value = Some(Value::decode(d, ctx)?);
+                }
+                other => {
+                    return Err(minicbor::decode::Error::message(format!(
+                        "unknown ContainerWidth key: {other}"
+                    )))
+                }
+            }
+        }
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("ContainerWidth missing kind"))?;
+        let value =
+            value.ok_or_else(|| minicbor::decode::Error::message("ContainerWidth missing value"))?;
+        match (kind.as_str(), value) {
+            ("token", Value::Text(s)) => Ok(ContainerWidth::Token(
+                super::tokens::Breakpoint::from_wire(&s).ok_or_else(|| {
+                    minicbor::decode::Error::message("ContainerWidth.token: unknown Breakpoint")
+                })?,
+            )),
+            ("px", Value::U64(n)) => Ok(ContainerWidth::Px(u16::try_from(n).map_err(|_| {
+                minicbor::decode::Error::message("ContainerWidth.px value out of u16 range")
+            })?)),
+            (other, _) => Err(minicbor::decode::Error::message(format!(
+                "ContainerWidth.kind '{other}' does not match value type"
+            ))),
+        }
+    }
+}
+
+impl From<super::tokens::Breakpoint> for ContainerWidth {
+    fn from(value: super::tokens::Breakpoint) -> Self {
+        ContainerWidth::Token(value)
+    }
+}
+
+impl From<u16> for ContainerWidth {
+    fn from(value: u16) -> Self {
+        ContainerWidth::Px(value)
+    }
+}
+
 // -----------------------------------------------------------------------------
 // BoxStyle — generic container styling (catalog §1.5).
 // -----------------------------------------------------------------------------
@@ -3605,6 +3697,8 @@ pub struct BoxStyle {
     pub overflow_x: Option<super::tokens::Overflow>,
     #[n(12)]
     pub overflow_y: Option<super::tokens::Overflow>,
+    #[n(13)]
+    pub shadow: Option<super::tokens::ShadowToken>,
 }
 
 impl BoxStyle {
@@ -3716,13 +3810,104 @@ impl BoxStyle {
         self.overflow_y = Some(v);
         self
     }
+
+    pub fn shadow(mut self, v: super::tokens::ShadowToken) -> Self {
+        self.shadow = Some(v);
+        self
+    }
+}
+
+/// One responsive override applied when the CONTAINER's own width is `<=
+/// max_width`. Addon declares layout adaptation semantically (container-query
+/// style) instead of shipping media-query CSS. Every override field is optional;
+/// `None` leaves the base layout value untouched at that breakpoint. Multiple
+/// rules on a container are evaluated smallest-`max_width`-first by the renderer.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct ResponsiveRule {
+    #[n(0)]
+    pub max_width: ContainerWidth,
+    #[n(1)]
+    pub direction: Option<super::tokens::FlexDirection>,
+    #[n(2)]
+    pub gap: Option<super::tokens::Spacing>,
+    #[n(3)]
+    pub align: Option<super::tokens::FlexAlign>,
+    #[n(4)]
+    pub justify: Option<super::tokens::FlexJustify>,
+    #[n(5)]
+    pub padding: Option<EdgeValues>,
+    #[n(6)]
+    pub min_height: Option<DimensionToken>,
+    #[n(7)]
+    pub order: Option<i32>,
+    #[n(8)]
+    pub hidden: Option<bool>,
+}
+
+impl ResponsiveRule {
+    /// New rule keyed on the container width threshold; all overrides start unset.
+    pub fn at(max_width: impl Into<ContainerWidth>) -> Self {
+        Self {
+            max_width: max_width.into(),
+            direction: None,
+            gap: None,
+            align: None,
+            justify: None,
+            padding: None,
+            min_height: None,
+            order: None,
+            hidden: None,
+        }
+    }
+
+    pub fn direction(mut self, v: super::tokens::FlexDirection) -> Self {
+        self.direction = Some(v);
+        self
+    }
+
+    pub fn gap(mut self, v: super::tokens::Spacing) -> Self {
+        self.gap = Some(v);
+        self
+    }
+
+    pub fn align(mut self, v: super::tokens::FlexAlign) -> Self {
+        self.align = Some(v);
+        self
+    }
+
+    pub fn justify(mut self, v: super::tokens::FlexJustify) -> Self {
+        self.justify = Some(v);
+        self
+    }
+
+    pub fn padding(mut self, v: EdgeValues) -> Self {
+        self.padding = Some(v);
+        self
+    }
+
+    pub fn min_height(mut self, v: DimensionToken) -> Self {
+        self.min_height = Some(v);
+        self
+    }
+
+    pub fn order(mut self, v: i32) -> Self {
+        self.order = Some(v);
+        self
+    }
+
+    pub fn hidden(mut self, v: bool) -> Self {
+        self.hidden = Some(v);
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests_box_style {
     use super::*;
     use crate::protocol::ui::tokens::{
-        BackgroundToken, BorderColor, BorderLineStyle, Overflow, RadiusToken, Spacing,
+        BackgroundToken, BorderColor, BorderLineStyle, Breakpoint, FlexAlign, FlexDirection,
+        FlexJustify, Overflow, RadiusToken, ShadowToken, Spacing,
     };
 
     fn rt<T>(v: T)
@@ -3836,7 +4021,8 @@ mod tests_box_style {
             .height(DimensionToken::Px { value: 240 })
             .min_width(DimensionToken::Px { value: 100 })
             .max_height(DimensionToken::Percent { value: 80 })
-            .overflow_y(Overflow::Auto));
+            .overflow_y(Overflow::Auto)
+            .shadow(ShadowToken::AccentGlow));
     }
 
     #[test]
@@ -3850,6 +4036,42 @@ mod tests_box_style {
         let p = s.padding.unwrap();
         assert_eq!(p.top, Some(SpaceValue::Px { value: 8 }));
         assert_eq!(p.bottom, Some(SpaceValue::Px { value: 8 }));
+    }
+
+    #[test]
+    fn container_width_variants_roundtrip() {
+        rt(ContainerWidth::Token(Breakpoint::Md));
+        rt(ContainerWidth::Px(460));
+        rt(ContainerWidth::Px(680));
+    }
+
+    #[test]
+    fn container_width_kind_type_mismatch_rejected() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.map(2).unwrap()
+            .str("kind").unwrap().str("px").unwrap()
+            .str("value").unwrap().str("md").unwrap();
+        let res: Result<ContainerWidth, _> = minicbor::decode(&buf);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn responsive_rule_full_roundtrip() {
+        rt(ResponsiveRule::at(460u16)
+            .direction(FlexDirection::Column)
+            .gap(Spacing::Sm)
+            .align(FlexAlign::Start)
+            .justify(FlexJustify::SpaceBetween)
+            .padding(EdgeValues::all(Spacing::Md))
+            .min_height(DimensionToken::Px { value: 120 })
+            .order(-1)
+            .hidden(true));
+    }
+
+    #[test]
+    fn responsive_rule_minimal_roundtrip() {
+        rt(ResponsiveRule::at(Breakpoint::Sm));
     }
 }
 
