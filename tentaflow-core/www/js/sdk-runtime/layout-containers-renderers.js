@@ -1059,7 +1059,11 @@ function renderBox(component, ctx) {
   const el = document.createElement('div');
   el.classList.add('tf-box');
   if (widthCss != null) el.style.width = widthCss;
-  if (grow) el.style.flexGrow = '1';
+  // grow=true → `flex: 1 1 0` (grow + basis 0), not just flex-grow. With the
+  // default `flex-basis: auto`, siblings size from their content first, so two
+  // grow children with different content end up unequal. Basis 0 makes them
+  // split the free space equally regardless of content (design-system "fill").
+  if (grow) { el.style.flexGrow = '1'; el.style.flexBasis = '0'; }
   if (alignSelf) el.style.alignSelf = flexAlignToCss(alignSelf);
   if (padding) el.classList.add(`tf-box--padding-${padding}`);
   if (margin) el.classList.add(`tf-box--margin-${margin}`);

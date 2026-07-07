@@ -808,6 +808,24 @@ test('Box renders flex behavior + BoxStyle', () => {
   assertEq(el.style.borderLeftStyle, 'solid');
 });
 
+test('Box grow=true → flex-grow 1 + flex-basis 0 (equal fill)', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(BOX_TAG, [[1, true], [5, []]]));
+  assertEq(el.style.flexGrow, '1');
+  // happy-dom normalizes `0` → `0px`; both are the same zero flex-basis.
+  assert(el.style.flexBasis === '0' || el.style.flexBasis === '0px',
+    `flex-basis should be zero, got ${el.style.flexBasis}`);
+});
+
+test('Box grow absent → no flex-grow/basis', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(BOX_TAG, [[5, []]]));
+  assertEq(el.style.flexGrow, '');
+  assertEq(el.style.flexBasis, '');
+});
+
 test('Box without flex fields stays a plain div', () => {
   setup();
   const engine = makeEngine();
