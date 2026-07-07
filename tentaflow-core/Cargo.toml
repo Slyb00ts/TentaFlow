@@ -50,6 +50,10 @@ rdma-probe = []
 # stub_ctx) poza testami, żeby benchmarki mogły konstruować ExecutionContext
 # bez powielania no-op implów. Włączane tylko przez `[[bench]] required-features`.
 test-support = []
+# Desktop-only: pulls the mobile wasmi backend + exposes `runtime::runtime_wasmi`
+# so `tests/addon_dotnet_e2e.rs` can prove a .NET `wasm32-wasip1` module
+# instantiates under the wasmi interpreter with the production WASI shim.
+wasmi-runtime-test = ["dep:wasmi"]
 # Camera ingest (M1.W6) — GStreamer 1.x based pipeline for RTSP/file/V4L2/MIPI
 # inputs. Optional because GStreamer pulls a large dynamic-library surface
 # (gst-plugins-base, -good, -bad). Default builds stay slim; enable
@@ -382,6 +386,11 @@ libloading = "0.9.0"
 wasmtime = "46.0.0"
 wasmtime-wasi = "46.0.0"
 wgpu = "29.0.3"
+# Off by default. Enabled only by the `wasmi-runtime-test` feature so a Desktop
+# test can instantiate a .NET `wasm32-wasip1` module through the real mobile
+# wasmi backend (regression guard for the WASI preview1 shim). Normal Desktop
+# builds never pull wasmi.
+wasmi = { version = "1.1.0", optional = true }
 
 [target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
 wasmi = "1.1.0"
