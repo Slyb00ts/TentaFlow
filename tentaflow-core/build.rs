@@ -2363,6 +2363,10 @@ fn build_protocol_wasm_bindings() {
         "cargo:rerun-if-changed={}/Cargo.toml",
         protocol_dir.display()
     );
+    // The glue's decode is schema-driven (component/inline wire metadata comes
+    // from tentaflow-sdk-spec), so a spec change must regenerate wasm_glue too —
+    // otherwise new fields decode against stale metadata.
+    rerun_if_changed_recursive(Path::new("../tentaflow-sdk-spec/src"));
 
     // Sprawdz wasm32-unknown-unknown target
     if !check_wasm_browser_target() {
