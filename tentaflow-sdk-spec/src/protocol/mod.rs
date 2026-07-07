@@ -22,6 +22,7 @@ pub mod gate;
 pub mod global_pose;
 pub mod graph;
 pub mod ids;
+pub mod inference;
 pub mod ingest;
 pub mod lidar;
 pub mod recording;

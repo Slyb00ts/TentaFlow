@@ -629,6 +629,7 @@ fn collection_card(index: usize, c: &JsonValue, selected: &str, graph_on: bool) 
         ],
         padding: None,
         justify: None,
+        style: None,
     }
     .into_component(format!("cc-info-{index}"))
     .expect("kodowanie Stack card info");
@@ -688,6 +689,7 @@ fn collection_card(index: usize, c: &JsonValue, selected: &str, graph_on: bool) 
         children: vec![row],
         interactive: true,
         clickable: true,
+        style: None,
     }
     .into_component(format!("cc-{index}"))
     .expect("kodowanie Card kolekcji");
@@ -742,6 +744,7 @@ fn sidebar_create_card() -> Component {
         children: vec![name, actions],
         interactive: false,
         clickable: false,
+        style: None,
     }
     .into_component("sb-create")
     .expect("kodowanie Card create")
@@ -978,6 +981,7 @@ fn chat_view() -> Component {
         children: vec![box_grow("chat-scroll-grow", scroll), input_bar],
         padding: Some(Spacing::Md),
         justify: Some(FlexJustify::SpaceBetween),
+        style: None,
     }
     .into_component("tab-chat")
     .expect("kodowanie Stack chat")
@@ -999,6 +1003,7 @@ fn message_bubble(index: usize, role: &str, content: &str) -> Component {
             children: vec![body_text(&format!("msg-u-{index}"), lit(content))],
             interactive: false,
             clickable: false,
+            style: None,
         }
         .into_component(format!("msg-card-{index}"))
         .expect("kodowanie Card user");
@@ -1035,6 +1040,7 @@ fn message_bubble(index: usize, role: &str, content: &str) -> Component {
             children: vec![chat_markdown(&format!("msg-md-{index}"), content)],
             interactive: false,
             clickable: false,
+            style: None,
         }
         .into_component(format!("msg-card-{index}"))
         .expect("kodowanie Card assistant");
@@ -1138,6 +1144,11 @@ fn box_grow(id: &str, child: Component) -> Component {
         padding: None,
         margin: None,
         children: vec![child],
+        style: None,
+        direction: None,
+        gap: None,
+        align: None,
+        justify: None,
     }
     .into_component(id)
     .expect("kodowanie Box grow")
@@ -1167,6 +1178,7 @@ fn section_card(
         border: BorderToken::Hairline,
         background: BackgroundToken::None,
         accent: None,
+        style: None,
     }
     .into_component(id)
     .expect("kodowanie SectionCard")
@@ -1244,6 +1256,7 @@ fn stack(id: &str, children: Vec<Component>) -> Component {
         children,
         padding: Some(Spacing::Md),
         justify: None,
+        style: None,
     }
     .into_component(id)
     .expect("kodowanie Stack")
@@ -1258,6 +1271,7 @@ fn sidebar_stack(id: &str, children: Vec<Component>) -> Component {
         children,
         padding: Some(Spacing::Sm),
         justify: None,
+        style: None,
     }
     .into_component(id)
     .expect("kodowanie Stack sidebar")
@@ -1272,6 +1286,7 @@ fn section_stack(id: &str, children: Vec<Component>) -> Component {
         children,
         padding: Some(Spacing::Md),
         justify: None,
+        style: None,
     }
     .into_component(id)
     .expect("kodowanie Stack sekcji")

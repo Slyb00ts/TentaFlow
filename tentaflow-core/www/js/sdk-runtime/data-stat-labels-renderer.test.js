@@ -346,14 +346,29 @@ test('Badge variant=dot bez tekstu, z sr-only label', () => {
   assertEq(sr.textContent, 'New activity');
 });
 
-test('Badge max=0 throws', () => {
+test('Badge max=0 with a count throws', () => {
   setup();
   const engine = makeEngine();
+  // max bounds the count overflow badge, so it is only validated when a count
+  // is present; max=0 alongside a count is invalid.
   assertThrows(() => engine.render(comp(BADGE_TAG, [
     [0, 'solid'], [1, 'primary'],
     [2, { kind: 'literal', value: 'X' }],
-    [5, 0], [6, false],
+    [4, 5], [5, 0], [6, false],
   ])));
+});
+
+test('Badge max=0 without a count is a plain label (no throw)', () => {
+  setup();
+  const engine = makeEngine();
+  // A label/pill badge carries no count; its encoded default max (0) must not
+  // reject the badge.
+  const el = engine.render(comp(BADGE_TAG, [
+    [0, 'solid'], [1, 'primary'],
+    [2, { kind: 'literal', value: 'X' }],
+    [5, 0], [6, false],
+  ]));
+  assert(el != null, 'label badge renders');
 });
 
 // ============================================================================

@@ -250,6 +250,64 @@ AspectRatio (discriminated union, always CBOR map z `kind` keyem):
   - { kind: "3:2" } | { kind: "2:1" } | { kind: "9:16" } | { kind: "3:4" }
   - { kind: "custom", ratio: f32 }                                          // width/height
 
+BorderColor (enum, tstr):                                                   // semantic → theme CSS var
+  "default" | "hover" | "accent" | "success" | "warning" | "danger" | "transparent"
+
+BorderLineStyle (enum, tstr):
+  "solid" | "dashed" | "none"
+
+Overflow (enum, tstr):
+  "visible" | "hidden" | "auto" | "scroll"
+
+SpaceValue (discriminated union, always CBOR map z `kind`):                 // margins/paddings BoxStyle
+  - { kind: "token", value: Spacing }
+  - { kind: "px",    value: u16 }
+
+RadiusValue (discriminated union, always CBOR map z `kind`):                // narożniki BoxStyle
+  - { kind: "token", value: RadiusToken }
+  - { kind: "px",    value: u16 }
+
+BorderSide:                                                                 // jedna krawędź borderu
+  0: width_px        u8
+  1: color           BorderColor
+  2: style           BorderLineStyle                                        // "none" wyłącza krawędź
+
+EdgeValues:                                                                 // per-krawędź; brak klucza = default kontenera
+  0: top             SpaceValue or null
+  1: right           SpaceValue or null
+  2: bottom          SpaceValue or null
+  3: left            SpaceValue or null
+  // Skróty all/x/y rozwiązują buildery SDK — wire niesie wyłącznie krawędzie.
+
+BorderEdges:
+  0: top             BorderSide or null
+  1: right           BorderSide or null
+  2: bottom          BorderSide or null
+  3: left            BorderSide or null
+
+CornerValues:
+  0: top_left        RadiusValue or null
+  1: top_right       RadiusValue or null
+  2: bottom_right    RadiusValue or null
+  3: bottom_left     RadiusValue or null
+
+BoxStyle:                                                                   // wspólny styling kontenerów (Flex/Grid/Stack/Box/Card/SectionCard `style`)
+  0: margin          EdgeValues or null
+  1: padding         EdgeValues or null
+  2: border          BorderEdges or null
+  3: background      BackgroundToken or null
+  4: radius          CornerValues or null
+  5: width           DimensionToken or null
+  6: height          DimensionToken or null
+  7: min_width       DimensionToken or null
+  8: min_height      DimensionToken or null
+  9: max_width       DimensionToken or null
+  10: max_height     DimensionToken or null
+  11: overflow_x     Overflow or null
+  12: overflow_y     Overflow or null
+  // Renderer aplikuje BoxStyle PO tokenowych polach kontenera (inline style
+  // nadpisuje klasy tokenowe). Px → inline style; tokeny → var(--tf-*).
+
 Trend:
   direction: TrendDirection                                                 // "up" | "down" | "flat"
   percent: f64                                                              // -100..+inf (finite; Value-roundtrip path requires f64)
@@ -1060,6 +1118,7 @@ Fields:
   6: padding         Spacing or null
   7: background      BackgroundToken or null        // "none" | "subtle" | "muted" | "accent"
   8: radius          RadiusToken or null
+  9: style           BoxStyle or null               // §1.5 — nadpisuje pola tokenowe
 Handlers: none
 ```
 
@@ -1076,6 +1135,7 @@ Fields:
   4: children        array<GridChild>               // { component, col_span?, row_span?, col_start? }
   5: padding         Spacing or null
   6: align_items     FlexAlign or null
+  7: style           BoxStyle or null               // §1.5
 
 GridTrack (discriminated union, always CBOR map z `kind`):
   - { kind: "equal",    count: u8 }                                 // N equal-width columns
@@ -1097,6 +1157,8 @@ Fields:
   1: align           FlexAlign
   2: children        array<Component>
   3: padding         Spacing or null
+  4: justify         FlexJustify or null            // rozkład na głównej (pionowej) osi
+  5: style           BoxStyle or null               // §1.5
 ```
 
 ### 0x0104 — `Cluster`
@@ -1148,6 +1210,7 @@ Fields:
   8: children        array<Component>
   9: interactive     bool                           // hover/focus visuals
   10: clickable      bool                           // emits "click" event
+  11: style          BoxStyle or null               // §1.5
 Handlers:
   "click":           Handler (if clickable=true)
 ```
@@ -1172,6 +1235,7 @@ Fields:
   11: border         BorderToken
   12: background     BackgroundToken
   13: accent         Tone or null                    // left-edge accent bar
+  14: style          BoxStyle or null                // §1.5
 Handlers: none
 ```
 
@@ -1316,6 +1380,29 @@ Fields:
   5: virtualize      bool                            // virtual scroll dla long lists
 Handlers:
   "scroll_end":      Handler                         // infinite scroll trigger
+```
+
+### 0x0115 — `Box`
+
+Uniwersalny, przezroczysty kontener („div"): kontrola dziecka wewnątrz
+Flex/Cluster (grow/align_self/width/margin), pełne stylowanie pudełka przez
+`BoxStyle` (§1.5) i opcjonalne proste zachowanie flex dla własnych dzieci.
+Wszystkie pola opcjonalne — pusty Box renderuje się jako goły `div.tf-box`.
+
+```
+Fields:
+  0: width           DimensionToken or null
+  1: grow            bool or null                   // flex-grow:1 wewnątrz rodzica flex
+  2: align_self      FlexAlign or null
+  3: padding         Spacing or null                // token na wszystkie krawędzie
+  4: margin          Spacing or null                // token na wszystkie krawędzie
+  5: children        array<Component>
+  6: style           BoxStyle or null               // §1.5 — margin/padding/border/bg/radius/wymiary/overflow
+  7: direction       FlexDirection or null          // dowolne z 7-10 włącza display:flex
+  8: gap             Spacing or null
+  9: align           FlexAlign or null
+  10: justify        FlexJustify or null
+Handlers: none
 ```
 
 ---
@@ -3206,6 +3293,24 @@ Fields:
   0: started_at_path StatePath                        // ts_ms or null
   1: variant         StopwatchVariant                 // "seconds" | "minutes" | "hours" | "full"
   2: tone            Tone
+```
+
+### 0x0612 — `AudioCapture`
+
+Mikrofon w panelu addona. Nagrywa wypowiedź użytkownika (push-to-talk lub VAD),
+uploaduje gotowy WAV przez kanał document-upload i emituje `action_id` z
+referencją nagrania (bajty audio NIGDY nie jadą w evencie). Host wymaga
+uprawnienia `audio.capture` — addon bez grantu nie dostaje audio (fail-closed).
+
+```
+Fields:
+  0: action_id       tstr                             // backend action z params {doc_ref, mime, sample_rate, duration_ms, size, language_hint?}
+  1: mode            AudioCaptureMode                 // "push_to_talk" | "vad"
+  2: silence_ms      u16 or null                      // VAD: cisza kończąca wypowiedź (default 800)
+  3: min_speech_ms   u16 or null                      // VAD: min. długość mowy (default 200)
+  4: language_hint   tstr or null                     // ISO-639-1, przekazywane w params
+  5: recording_path  StatePath or null                // renderer zapisuje tu bool `recording`
+  6: disabled        BindRef or null
 ```
 
 ---

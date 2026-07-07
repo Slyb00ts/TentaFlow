@@ -1062,6 +1062,7 @@ fn card(title: Option<&str>, children: Vec<Component>) -> Component {
             border: BorderToken::Hairline,
             background: BackgroundToken::None,
             accent: None,
+            style: None,
         }.into_component(next_id()).expect("SectionCard")
     } else {
         Card {
@@ -1076,6 +1077,7 @@ fn card(title: Option<&str>, children: Vec<Component>) -> Component {
             children,
             interactive: false,
             clickable: false,
+            style: None,
         }.into_component(next_id()).expect("Card")
     }
 }
@@ -1115,6 +1117,7 @@ fn card_with_icon_action(title: &str, _icon: &str, action_label: Option<&str>, c
         border: BorderToken::Hairline,
         background: BackgroundToken::None,
         accent: None,
+        style: None,
     }.into_component(next_id()).expect("SectionCard")
 }
 
@@ -1125,6 +1128,7 @@ fn stack_v(children: Vec<Component>) -> Component {
         children,
         padding: None,
         justify: None,
+        style: None,
     }.into_component(next_id()).expect("Stack")
 }
 
@@ -1139,6 +1143,7 @@ fn stack_h(children: Vec<Component>) -> Component {
         padding: None,
         background: None,
         radius: None,
+        style: None,
     }.into_component(next_id()).expect("Flex")
 }
 
@@ -1153,6 +1158,7 @@ fn stack_h_gap(gap: &str, children: Vec<Component>) -> Component {
         padding: None,
         background: None,
         radius: None,
+        style: None,
     }.into_component(next_id()).expect("Flex")
 }
 
@@ -1163,6 +1169,7 @@ fn stack_v_gap(gap: &str, children: Vec<Component>) -> Component {
         children,
         padding: None,
         justify: None,
+        style: None,
     }.into_component(next_id()).expect("Stack")
 }
 
@@ -1184,6 +1191,7 @@ fn grid(columns: u32, children: Vec<Component>) -> Component {
         children: grid_children,
         padding: None,
         align_items: None,
+        style: None,
     }.into_component(next_id()).expect("Grid")
 }
 
@@ -4772,6 +4780,7 @@ fn build_alarm_card(a: &db::AlarmRow) -> Component {
         padding: Some(Spacing::Sm),
         background: None,
         radius: None,
+        style: None,
     }.into_component(next_id()).expect("Flex")
 }
 
@@ -4794,11 +4803,13 @@ fn build_runtime_kv_row(label: &str, value_children: Vec<Component>) -> Componen
                 padding: None,
                 background: None,
                 radius: None,
+                style: None,
             }.into_component(next_id()).expect("Flex"),
         ],
         padding: None,
         background: None,
         radius: None,
+        style: None,
     }.into_component(next_id()).expect("Flex")
 }
 
@@ -6282,6 +6293,7 @@ fn build_config_onvif() -> Component {
             children: vec![row_content],
             interactive: true,
             clickable: true,
+            style: None,
         }.into_component(next_id()).expect("Card");
         let mut params = CborMap::default();
         params.0.push(("index".into(), Value::U64(*i as u64)));
@@ -6597,6 +6609,7 @@ fn build_alarm_feed_card(a: &db::AlarmRow, selected: bool) -> Component {
         children: vec![body],
         interactive: true,
         clickable: true,
+        style: None,
     }.into_component(next_id()).expect("Card");
     let mut params = CborMap::default();
     params.0.push(("alarm_id".into(), Value::Text(a.id.clone())));
@@ -8154,6 +8167,7 @@ fn reid_check_row(cond: &GateCondition) -> Component {
         children: vec![row],
         interactive: false,
         clickable: false,
+        style: None,
     }.into_component(next_id()).expect("Card")
 }
 
@@ -8227,6 +8241,7 @@ fn build_reid_content() -> Component {
         ],
         interactive: false,
         clickable: false,
+        style: None,
     }.into_component(next_id()).expect("Card");
 
     // Checklist of compliance preconditions, each showing its real persisted state.
@@ -8254,6 +8269,7 @@ fn build_reid_content() -> Component {
         border: BorderToken::Hairline,
         background: BackgroundToken::None,
         accent: Some(Tone::Critical),
+        style: None,
     }.into_component(next_id()).expect("SectionCard");
 
     // Legal-reference box.
@@ -9451,6 +9467,7 @@ fn build_audit_row(e: &db::AuditRow, expanded: bool) -> Component {
         children,
         interactive: false,
         clickable: false,
+        style: None,
     }.into_component(next_id()).expect("Card")
 }
 

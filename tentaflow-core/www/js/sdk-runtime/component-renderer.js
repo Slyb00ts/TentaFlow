@@ -419,10 +419,34 @@ function readField(fields, key) {
 // =============================================================================
 
 function applyCommonAttributes(element, component, ctx) {
-  if (component.id) element.setAttribute('data-component-id', component.id);
+  if (component.id) {
+    element.setAttribute('data-component-id', component.id);
+    applyFontScale(element, component.id, ctx);
+  }
   if (component.test_id) element.setAttribute('data-testid', component.test_id);
   applyAccessibility(element, component.a11y, ctx);
   applyVisibility(element, component.visibility, ctx);
+}
+
+// Generic reactive font-size scaling: a component whose id is `fontscale-<key>`
+// binds its inline `font-size` (in px) to that numeric state value, so an addon
+// can offer user-controlled text sizing (e.g. viewer A−/A+) without a bespoke
+// component. Keyed on `id` (not `test_id`) because the UI CBOR decoder does not
+// carry test_id through to the JS render tree. Not translator-specific.
+function applyFontScale(element, id, ctx) {
+  if (typeof id !== 'string' || !id.startsWith('fontscale-')) return;
+  const key = id.slice('fontscale-'.length);
+  if (!key || !ctx.store) return;
+  const path = [{ kind: 'key', value: key }];
+  const apply = () => {
+    const raw = ctx.store.read(path);
+    const n = typeof raw === 'bigint' ? Number(raw) : raw;
+    if (typeof n === 'number' && Number.isFinite(n) && n > 0) {
+      element.style.fontSize = `${n}px`;
+    }
+  };
+  apply();
+  ctx.registerCleanup(ctx.store.subscribe(path, apply));
 }
 
 function applyAccessibility(element, a11y, ctx) {

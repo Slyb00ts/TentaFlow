@@ -4,7 +4,7 @@
 
 use super::super::component::{Component, FieldMap};
 use super::super::inline::{
-    GridChild, GridTrack, SplitSize,
+    GridChild, GridTrack, SplitSize, BoxStyle,
 };
 use super::super::tokens::{
     BackgroundToken, FlexAlign, FlexDirection, FlexJustify,
@@ -35,13 +35,14 @@ pub struct Flex {
     pub padding: Option<super::super::tokens::Spacing>,
     pub background: Option<BackgroundToken>,
     pub radius: Option<RadiusToken>,
+    pub style: Option<BoxStyle>,
 }
 
 impl Flex {
     pub const TAG: u16 = 0x0101;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(9);
+        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(10);
         entries.push((0, encode_to_value(&self.direction)?));
         entries.push((1, encode_to_value(&self.gap)?));
         entries.push((2, encode_to_value(&self.justify)?));
@@ -51,6 +52,7 @@ impl Flex {
         if let Some(p) = &self.padding { entries.push((6, encode_to_value(p)?)); }
         if let Some(b) = &self.background { entries.push((7, encode_to_value(b)?)); }
         if let Some(r) = &self.radius { entries.push((8, encode_to_value(r)?)); }
+        if let Some(s) = &self.style { entries.push((9, encode_to_value(s)?)); }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -66,6 +68,7 @@ impl Flex {
         let mut padding = None;
         let mut background = None;
         let mut radius = None;
+        let mut style = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => direction = Some(decode_from_value(v)?),
@@ -77,6 +80,7 @@ impl Flex {
                 6 => padding = Some(decode_from_value(v)?),
                 7 => background = Some(decode_from_value(v)?),
                 8 => radius = Some(decode_from_value(v)?),
+                9 => style = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("Flex", *other)),
             }
         }
@@ -91,6 +95,7 @@ impl Flex {
             padding,
             background,
             radius,
+            style,
         })
     }
 }
@@ -112,13 +117,14 @@ pub struct Grid {
     pub children: Vec<GridChild>,
     pub padding: Option<super::super::tokens::Spacing>,
     pub align_items: Option<FlexAlign>,
+    pub style: Option<BoxStyle>,
 }
 
 impl Grid {
     pub const TAG: u16 = 0x0102;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(7);
+        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(8);
         entries.push((0, encode_to_value(&self.columns)?));
         entries.push((1, encode_to_value(&self.gap)?));
         if let Some(g) = &self.row_gap { entries.push((2, encode_to_value(g)?)); }
@@ -126,6 +132,7 @@ impl Grid {
         entries.push((4, encode_to_value(&self.children)?));
         if let Some(p) = &self.padding { entries.push((5, encode_to_value(p)?)); }
         if let Some(a) = &self.align_items { entries.push((6, encode_to_value(a)?)); }
+        if let Some(s) = &self.style { entries.push((7, encode_to_value(s)?)); }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -139,6 +146,7 @@ impl Grid {
         let mut children = None;
         let mut padding = None;
         let mut align_items = None;
+        let mut style = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => columns = Some(decode_from_value(v)?),
@@ -148,6 +156,7 @@ impl Grid {
                 4 => children = Some(decode_from_value(v)?),
                 5 => padding = Some(decode_from_value(v)?),
                 6 => align_items = Some(decode_from_value(v)?),
+                7 => style = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("Grid", *other)),
             }
         }
@@ -162,6 +171,7 @@ impl Grid {
             children: children.unwrap_or_default(),
             padding,
             align_items,
+            style,
         })
     }
 }
@@ -179,18 +189,20 @@ pub struct Stack {
     /// Główna oś (pionowa) — pozwala rozłożyć dzieci (np. `space_between`)
     /// w Stacku o ustalonej wysokości; brak = domyślne pakowanie od startu.
     pub justify: Option<FlexJustify>,
+    pub style: Option<BoxStyle>,
 }
 
 impl Stack {
     pub const TAG: u16 = 0x0103;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(5);
+        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(6);
         entries.push((0, encode_to_value(&self.gap)?));
         entries.push((1, encode_to_value(&self.align)?));
         entries.push((2, encode_to_value(&self.children)?));
         if let Some(p) = &self.padding { entries.push((3, encode_to_value(p)?)); }
         if let Some(j) = &self.justify { entries.push((4, encode_to_value(j)?)); }
+        if let Some(s) = &self.style { entries.push((5, encode_to_value(s)?)); }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -202,6 +214,7 @@ impl Stack {
         let mut children = None;
         let mut padding = None;
         let mut justify = None;
+        let mut style = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => gap = Some(decode_from_value(v)?),
@@ -209,6 +222,7 @@ impl Stack {
                 2 => children = Some(decode_from_value(v)?),
                 3 => padding = Some(decode_from_value(v)?),
                 4 => justify = Some(decode_from_value(v)?),
+                5 => style = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("Stack", *other)),
             }
         }
@@ -219,6 +233,7 @@ impl Stack {
             children: children.unwrap_or_default(),
             padding,
             justify,
+            style,
         })
     }
 }
@@ -419,8 +434,11 @@ impl ScrollContainer {
 /// Rozwiązuje brak sterowania marginesem i rozmiarem dziecka wewnątrz
 /// Flex/Cluster: `grow` pozwala jednemu elementowi rosnąć (np. „info rośnie,
 /// badge stały"), `width` ustala wymiar, `margin` dokłada zewnętrzny odstęp.
-/// Wszystkie pola opcjonalne — pusty Box jest przezroczystym `div`em.
-#[derive(Debug, Clone, PartialEq)]
+/// `style` daje pełną, HTML-podobną kontrolę pudełka (BoxStyle §1.5), a
+/// opcjonalne `direction`/`gap`/`align`/`justify` włączają proste zachowanie
+/// flex dla dzieci. Wszystkie pola opcjonalne — pusty Box jest przezroczystym
+/// `div`em.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Box {
     pub width: Option<super::super::inline::DimensionToken>,
     pub grow: Option<bool>,
@@ -428,19 +446,29 @@ pub struct Box {
     pub padding: Option<super::super::tokens::Spacing>,
     pub margin: Option<super::super::tokens::Spacing>,
     pub children: Vec<Component>,
+    pub style: Option<BoxStyle>,
+    pub direction: Option<FlexDirection>,
+    pub gap: Option<super::super::tokens::Spacing>,
+    pub align: Option<FlexAlign>,
+    pub justify: Option<FlexJustify>,
 }
 
 impl Box {
     pub const TAG: u16 = 0x0115;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(6);
+        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(11);
         if let Some(w) = &self.width { entries.push((0, encode_to_value(w)?)); }
         if let Some(g) = &self.grow { entries.push((1, encode_to_value(g)?)); }
         if let Some(a) = &self.align_self { entries.push((2, encode_to_value(a)?)); }
         if let Some(p) = &self.padding { entries.push((3, encode_to_value(p)?)); }
         if let Some(m) = &self.margin { entries.push((4, encode_to_value(m)?)); }
         entries.push((5, encode_to_value(&self.children)?));
+        if let Some(s) = &self.style { entries.push((6, encode_to_value(s)?)); }
+        if let Some(d) = &self.direction { entries.push((7, encode_to_value(d)?)); }
+        if let Some(g) = &self.gap { entries.push((8, encode_to_value(g)?)); }
+        if let Some(a) = &self.align { entries.push((9, encode_to_value(a)?)); }
+        if let Some(j) = &self.justify { entries.push((10, encode_to_value(j)?)); }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -453,6 +481,11 @@ impl Box {
         let mut padding = None;
         let mut margin = None;
         let mut children = None;
+        let mut style = None;
+        let mut direction = None;
+        let mut gap = None;
+        let mut align = None;
+        let mut justify = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => width = Some(decode_from_value(v)?),
@@ -461,6 +494,11 @@ impl Box {
                 3 => padding = Some(decode_from_value(v)?),
                 4 => margin = Some(decode_from_value(v)?),
                 5 => children = Some(decode_from_value(v)?),
+                6 => style = Some(decode_from_value(v)?),
+                7 => direction = Some(decode_from_value(v)?),
+                8 => gap = Some(decode_from_value(v)?),
+                9 => align = Some(decode_from_value(v)?),
+                10 => justify = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("Box", *other)),
             }
         }
@@ -471,6 +509,11 @@ impl Box {
             padding,
             margin,
             children: children.unwrap_or_default(),
+            style,
+            direction,
+            gap,
+            align,
+            justify,
         })
     }
 }

@@ -240,6 +240,7 @@ fn send_panel_shell() {
         children: vec![nav_tabs, content_host],
         padding: None,
         justify: None,
+        style: None,
     }
     .into_component("root")
     .expect("Stack encode");
@@ -440,6 +441,7 @@ fn stack_component(id: &str, children: &[Component]) -> Component {
         children: children.to_vec(),
         padding: Some(Spacing::Md),
         justify: None,
+        style: None,
     }
     .into_component(id)
     .expect("Stack encode")

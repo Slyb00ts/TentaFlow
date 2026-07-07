@@ -110,11 +110,18 @@ function assertOnlyKnownObjectKeys(obj, allowedKeys, ctx) {
 
 function assertOnlyKnownFieldMapKeys(fields, allowedKeys, ctx) {
   if (!Array.isArray(fields)) throw new TypeError(`${ctx}: expected FieldMap`);
+  // Mirror of Rust `ensure_no_duplicate_keys` — a duplicate key would
+  // silently resolve first-wins in readField, so reject it outright.
+  const seen = new Set();
   for (const entry of fields) {
     if (!Array.isArray(entry) || entry.length !== 2) throw new TypeError(`${ctx}: entry must be [u8, Value]`);
     if (!allowedKeys.has(entry[0])) {
       throw new TypeError(`${ctx}: unexpected key ${entry[0]}`);
     }
+    if (seen.has(entry[0])) {
+      throw new TypeError(`${ctx}: duplicate key ${entry[0]}`);
+    }
+    seen.add(entry[0]);
   }
 }
 
@@ -124,12 +131,181 @@ const MAX_GRID_COLS = 256;
 const MAX_GRID_PX = 100_000;
 
 // =============================================================================
+// BoxStyle (spec §1.5) — shared container styling (margin/padding/border/
+// background/radius/dimensions/overflow). Px values go to inline style
+// (controlled fields, not free CSS); tokens map to `var(--tf-*)` variables.
+// =============================================================================
+
+const OVERFLOWS = new Set(['visible', 'hidden', 'auto', 'scroll']);
+const BORDER_LINE_STYLES = new Set(['solid', 'dashed', 'none']);
+// BorderColor → theme CSS var. Mirror of Rust enum `BorderColor` in tokens.rs.
+const BORDER_COLOR_CSS = {
+  default: 'var(--tf-border)',
+  hover: 'var(--tf-border-hover)',
+  accent: 'var(--tf-accent-1)',
+  success: 'var(--tf-success)',
+  warning: 'var(--tf-warning)',
+  danger: 'var(--tf-danger)',
+  transparent: 'transparent',
+};
+
+function requireU16(value, ctx) {
+  if (typeof value === 'bigint') {
+    if (value < 0n || value > 0xFFFFn) {
+      throw new TypeError(`${ctx}: expected u16 (0..=65535), got ${value}`);
+    }
+    return Number(value);
+  }
+  if (!Number.isInteger(value) || value < 0 || value > 0xFFFF) {
+    throw new TypeError(`${ctx}: expected u16 (0..=65535), got ${value}`);
+  }
+  return value;
+}
+
+/// SpaceValue / RadiusValue: `{kind:"token", value:<tstr>}` | `{kind:"px", value:u16}`.
+/// `tokenSet` is the token whitelist, `cssVarPrefix` e.g. 'tf-space'.
+function spaceLikeToCss(raw, tokenSet, cssVarPrefix, ctx) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new TypeError(`${ctx}: expected {kind, value} object`);
+  }
+  assertOnlyKnownObjectKeys(raw, new Set(['kind', 'value']), ctx);
+  switch (raw.kind) {
+    case 'token': {
+      const t = requireEnum(raw.value, tokenSet, `${ctx}.token`);
+      return `var(--${cssVarPrefix}-${t})`;
+    }
+    case 'px': {
+      const v = requireU16(raw.value, `${ctx}.px.value`);
+      return `${v}px`;
+    }
+    default:
+      throw new TypeError(`${ctx}.kind must be 'token'/'px', got ${raw.kind}`);
+  }
+}
+
+// EdgeValues / BorderEdges edges and CornerValues corners are int-keyed
+// FieldMaps: 0=top/top_left, 1=right/top_right, 2=bottom/bottom_right,
+// 3=left/bottom_left. Mirror of Rust `#[cbor(map)]` in inline.rs.
+const EDGE_KEYS = new Set([0, 1, 2, 3]);
+
+function applyEdgeValues(el, raw, cssProp, ctx) {
+  assertOnlyKnownFieldMapKeys(raw, EDGE_KEYS, ctx);
+  const sides = ['Top', 'Right', 'Bottom', 'Left'];
+  for (let i = 0; i < 4; i += 1) {
+    const v = readFieldMap(raw, i);
+    if (v === undefined) continue;
+    el.style[`${cssProp}${sides[i]}`] =
+      spaceLikeToCss(v, SPACINGS, 'tf-space', `${ctx}.${sides[i].toLowerCase()}`);
+  }
+}
+
+// BorderSide: 0=width_px(u8), 1=color(BorderColor), 2=style(BorderLineStyle).
+const BORDER_SIDE_KEYS = new Set([0, 1, 2]);
+
+// Longhands instead of the `borderTop` shorthand — precise and independent
+// of shorthand-parser behavior in the test environment.
+function applyBorderSide(el, raw, side, ctx) {
+  if (!Array.isArray(raw)) throw new TypeError(`${ctx}: BorderSide must be FieldMap`);
+  assertOnlyKnownFieldMapKeys(raw, BORDER_SIDE_KEYS, ctx);
+  const width = requireU8(readFieldMap(raw, 0), `${ctx}.width_px`);
+  const colorToken = readFieldMap(raw, 1);
+  if (typeof colorToken !== 'string' || !(colorToken in BORDER_COLOR_CSS)) {
+    throw new TypeError(`${ctx}.color: unknown BorderColor ${JSON.stringify(colorToken)}`);
+  }
+  const style = requireEnum(readFieldMap(raw, 2), BORDER_LINE_STYLES, `${ctx}.style`);
+  if (style === 'none') {
+    el.style[`border${side}Style`] = 'none';
+    return;
+  }
+  el.style[`border${side}Width`] = `${width}px`;
+  el.style[`border${side}Style`] = style;
+  el.style[`border${side}Color`] = BORDER_COLOR_CSS[colorToken];
+}
+
+function applyBorderEdges(el, raw, ctx) {
+  assertOnlyKnownFieldMapKeys(raw, EDGE_KEYS, ctx);
+  const sides = ['Top', 'Right', 'Bottom', 'Left'];
+  for (let i = 0; i < 4; i += 1) {
+    const v = readFieldMap(raw, i);
+    if (v === undefined) continue;
+    applyBorderSide(el, v, sides[i], `${ctx}.${sides[i].toLowerCase()}`);
+  }
+}
+
+function applyCornerValues(el, raw, ctx) {
+  assertOnlyKnownFieldMapKeys(raw, EDGE_KEYS, ctx);
+  const corners = ['TopLeft', 'TopRight', 'BottomRight', 'BottomLeft'];
+  for (let i = 0; i < 4; i += 1) {
+    const v = readFieldMap(raw, i);
+    if (v === undefined) continue;
+    el.style[`border${corners[i]}Radius`] =
+      spaceLikeToCss(v, RADIUS_TOKENS, 'tf-radius', `${ctx}.${corners[i]}`);
+  }
+}
+
+/// Local reader for an int-keyed FieldMap (pair-array [[u8, Value], ...]) —
+/// like ctx.readField, but also usable for nested BoxStyle structures.
+function readFieldMap(fields, key) {
+  for (const [k, v] of fields) {
+    if (k === key) return v;
+  }
+  return undefined;
+}
+
+const BOX_STYLE_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+/// Applies BoxStyle (spec §1.5) to an element. `raw` is an int-keyed FieldMap:
+/// 0=margin, 1=padding, 2=border, 3=background, 4=radius, 5=width, 6=height,
+/// 7=min_width, 8=min_height, 9=max_width, 10=max_height, 11=overflow_x,
+/// 12=overflow_y. Called AFTER the container token classes — inline style
+/// overrides classes per the CSS cascade.
+export function applyBoxStyle(el, raw, ctx) {
+  if (raw === undefined) return;
+  if (!Array.isArray(raw)) throw new TypeError(`${ctx}: BoxStyle must be FieldMap`);
+  assertOnlyKnownFieldMapKeys(raw, BOX_STYLE_KEYS, ctx);
+
+  const margin = readFieldMap(raw, 0);
+  if (margin !== undefined) applyEdgeValues(el, margin, 'margin', `${ctx}.margin`);
+  const padding = readFieldMap(raw, 1);
+  if (padding !== undefined) applyEdgeValues(el, padding, 'padding', `${ctx}.padding`);
+  const border = readFieldMap(raw, 2);
+  if (border !== undefined) applyBorderEdges(el, border, `${ctx}.border`);
+  const background = readFieldMap(raw, 3);
+  if (background !== undefined) {
+    const b = requireEnum(background, BACKGROUND_TOKENS, `${ctx}.background`);
+    el.style.background = `var(--tf-bg-${b})`;
+  }
+  const radius = readFieldMap(raw, 4);
+  if (radius !== undefined) applyCornerValues(el, radius, `${ctx}.radius`);
+
+  const dims = [
+    [5, 'width'], [6, 'height'], [7, 'minWidth'], [8, 'minHeight'],
+    [9, 'maxWidth'], [10, 'maxHeight'],
+  ];
+  for (const [key, prop] of dims) {
+    const v = readFieldMap(raw, key);
+    if (v === undefined) continue;
+    const t = parseDimensionToken(v, `${ctx}.${prop}`);
+    el.style[prop] = t === 'full' ? '100%' : t === 'fit_content' ? 'fit-content' : t;
+  }
+
+  const overflowX = readFieldMap(raw, 11);
+  if (overflowX !== undefined) {
+    el.style.overflowX = requireEnum(overflowX, OVERFLOWS, `${ctx}.overflow_x`);
+  }
+  const overflowY = readFieldMap(raw, 12);
+  if (overflowY !== undefined) {
+    el.style.overflowY = requireEnum(overflowY, OVERFLOWS, `${ctx}.overflow_y`);
+  }
+}
+
+// =============================================================================
 // Flex (0x0101)
 // =============================================================================
 
 export const FLEX_TAG = 0x0101;
 
-const FLEX_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+const FLEX_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
 function renderFlex(component, ctx) {
   assertOnlyKnownFields(component.fields, FLEX_FIELD_KEYS, 'Flex');
@@ -184,6 +360,7 @@ function renderFlex(component, ctx) {
   if (padding) el.classList.add(`tf-flex--padding-${padding}`);
   if (background) el.classList.add(`tf-flex--bg-${background}`);
   if (radius) el.classList.add(`tf-flex--radius-${radius}`);
+  applyBoxStyle(el, ctx.readField(component.fields, 9), 'Flex.style');
 
   for (const childComponent of children) {
     const childEl = ctx.renderChild(childComponent);
@@ -198,7 +375,7 @@ function renderFlex(component, ctx) {
 
 export const GRID_TAG = 0x0102;
 
-const GRID_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6]);
+const GRID_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7]);
 
 function renderGrid(component, ctx) {
   assertOnlyKnownFields(component.fields, GRID_FIELD_KEYS, 'Grid');
@@ -243,6 +420,7 @@ function renderGrid(component, ctx) {
   // pokrywają arbitralnego trackingu kolumn. Trzymamy je w inline style
   // jako jedyną dozwoloną drogę; addon nie kontroluje raw CSS poza tym.
   el.style.gridTemplateColumns = columnsCss;
+  applyBoxStyle(el, ctx.readField(component.fields, 7), 'Grid.style');
 
   // GridChild: 0=component, 1=col_span(u8), 2=row_span(u8), 3=col_start(u8), 4=row_start(u8), 5=align_self, 6=justify_self
   const GRID_CHILD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6]);
@@ -379,7 +557,7 @@ function flexJustifyToCss(token) {
 
 export const STACK_TAG = 0x0103;
 
-const STACK_FIELD_KEYS = new Set([0, 1, 2, 3, 4]);
+const STACK_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5]);
 
 function renderStack(component, ctx) {
   assertOnlyKnownFields(component.fields, STACK_FIELD_KEYS, 'Stack');
@@ -409,6 +587,7 @@ function renderStack(component, ctx) {
   el.classList.add(`tf-stack--align-${align}`);
   if (padding) el.classList.add(`tf-stack--padding-${padding}`);
   if (justify) el.classList.add(`tf-stack--justify-${justify}`);
+  applyBoxStyle(el, ctx.readField(component.fields, 5), 'Stack.style');
 
   for (const childComponent of children) {
     el.appendChild(ctx.renderChild(childComponent));
@@ -630,7 +809,7 @@ export function renderSplit(component, ctx) {
 
 export const BOX_TAG = 0x0115;
 
-const BOX_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5]);
+const BOX_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
 // DimensionToken → CSS length. parseDimensionToken zwraca string-kind dla
 // wariantów jednostkowych (auto/full/fit_content) i gotowy CSS dla wartości.
@@ -673,6 +852,28 @@ function renderBox(component, ctx) {
   );
   const childrenRaw = ctx.readField(component.fields, 5);
   const children = childrenRaw === undefined ? [] : requireArray(childrenRaw, 'Box.children');
+  // Keys 7-10: simple flex behavior for children — any of them enables
+  // display:flex (mirror of Rust Box.direction/gap/align/justify).
+  const direction = optionalEnum(
+    ctx.readField(component.fields, 7),
+    FLEX_DIRECTIONS,
+    'Box.direction'
+  );
+  const gap = optionalEnum(
+    ctx.readField(component.fields, 8),
+    SPACINGS,
+    'Box.gap'
+  );
+  const align = optionalEnum(
+    ctx.readField(component.fields, 9),
+    FLEX_ALIGNS,
+    'Box.align'
+  );
+  const justify = optionalEnum(
+    ctx.readField(component.fields, 10),
+    FLEX_JUSTIFIES,
+    'Box.justify'
+  );
 
   const el = document.createElement('div');
   el.classList.add('tf-box');
@@ -681,6 +882,14 @@ function renderBox(component, ctx) {
   if (alignSelf) el.style.alignSelf = flexAlignToCss(alignSelf);
   if (padding) el.classList.add(`tf-box--padding-${padding}`);
   if (margin) el.classList.add(`tf-box--margin-${margin}`);
+  if (direction || gap || align || justify) {
+    el.style.display = 'flex';
+    el.style.flexDirection = direction ? direction.replace(/_/g, '-') : 'row';
+    if (gap) el.style.gap = `var(--tf-space-${gap})`;
+    if (align) el.style.alignItems = flexAlignToCss(align);
+    if (justify) el.style.justifyContent = flexJustifyToCss(justify);
+  }
+  applyBoxStyle(el, ctx.readField(component.fields, 6), 'Box.style');
 
   for (const childComponent of children) {
     el.appendChild(ctx.renderChild(childComponent));

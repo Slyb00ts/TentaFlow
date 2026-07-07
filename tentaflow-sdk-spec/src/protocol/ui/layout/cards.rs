@@ -5,7 +5,7 @@
 use super::super::bind::BindRef;
 use super::super::component::{Component, FieldMap};
 use super::super::inline::{
-    AccordionItem, BorderToken,
+    AccordionItem, BorderToken, BoxStyle,
 };
 use super::super::tokens::{
     AccordionMode, BackgroundToken, CardVariant, RadiusToken, ShadowToken, Tone,
@@ -41,13 +41,14 @@ pub struct Card {
     pub children: Vec<Component>,
     pub interactive: bool,
     pub clickable: bool,
+    pub style: Option<BoxStyle>,
 }
 
 impl Card {
     pub const TAG: u16 = 0x0106;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(11);
+        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(12);
         entries.push((0, encode_to_value(&self.variant)?));
         entries.push((1, encode_to_value(&self.padding)?));
         entries.push((2, encode_to_value(&self.gap)?));
@@ -59,6 +60,7 @@ impl Card {
         entries.push((8, encode_to_value(&self.children)?));
         entries.push((9, encode_to_value(&self.interactive)?));
         entries.push((10, encode_to_value(&self.clickable)?));
+        if let Some(s) = &self.style { entries.push((11, encode_to_value(s)?)); }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -76,6 +78,7 @@ impl Card {
         let mut children = None;
         let mut interactive = None;
         let mut clickable = None;
+        let mut style = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => variant = Some(decode_from_value(v)?),
@@ -89,6 +92,7 @@ impl Card {
                 8 => children = Some(decode_from_value(v)?),
                 9 => interactive = Some(decode_from_value(v)?),
                 10 => clickable = Some(decode_from_value(v)?),
+                11 => style = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("Card", *other)),
             }
         }
@@ -111,6 +115,7 @@ impl Card {
             children: children.unwrap_or_default(),
             interactive: interactive.ok_or_else(|| missing_field("Card", "interactive"))?,
             clickable: clickable.ok_or_else(|| missing_field("Card", "clickable"))?,
+            style,
         })
     }
 }
@@ -135,6 +140,7 @@ pub struct SectionCard {
     pub border: BorderToken,
     pub background: BackgroundToken,
     pub accent: Option<Tone>,
+    pub style: Option<BoxStyle>,
 }
 
 impl SectionCard {
@@ -144,7 +150,7 @@ impl SectionCard {
         for b in &self.header_actions {
             ensure_ref_tag_encode(b.tag, Button::TAG, "SectionCard", "header_actions")?;
         }
-        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(14);
+        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(15);
         entries.push((0, encode_to_value(&self.title)?));
         if let Some(s) = &self.subtitle { entries.push((1, encode_to_value(s)?)); }
         entries.push((2, encode_to_value(&self.header_actions)?));
@@ -159,6 +165,7 @@ impl SectionCard {
         entries.push((11, encode_to_value(&self.border)?));
         entries.push((12, encode_to_value(&self.background)?));
         if let Some(a) = &self.accent { entries.push((13, encode_to_value(a)?)); }
+        if let Some(s) = &self.style { entries.push((14, encode_to_value(s)?)); }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -179,6 +186,7 @@ impl SectionCard {
         let mut border = None;
         let mut background = None;
         let mut accent = None;
+        let mut style = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => title = Some(decode_from_value(v)?),
@@ -195,6 +203,7 @@ impl SectionCard {
                 11 => border = Some(decode_from_value(v)?),
                 12 => background = Some(decode_from_value(v)?),
                 13 => accent = Some(decode_from_value(v)?),
+                14 => style = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("SectionCard", *other)),
             }
         }
@@ -218,6 +227,7 @@ impl SectionCard {
             border: border.ok_or_else(|| missing_field("SectionCard", "border"))?,
             background: background.ok_or_else(|| missing_field("SectionCard", "background"))?,
             accent,
+            style,
         })
     }
 }

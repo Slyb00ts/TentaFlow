@@ -55,6 +55,7 @@ import { registerFeedbackOverlayRenderers } from './feedback-overlay-renderer.js
 import { registerMoleculePageRenderers } from './molecule-page-renderer.js';
 import { registerMoleculeShellRenderers } from './molecule-shell-renderer.js';
 import { registerSpecializedMediaRenderers } from './specialized-media-renderer.js';
+import { registerSpecializedAudioCaptureRenderer } from './specialized-audio-capture-renderer.js';
 import { registerSpecializedContentRenderers } from './specialized-content-renderer.js';
 export { SlotManager } from './slot-manager.js';
 
@@ -106,6 +107,7 @@ export function bootstrapSdkRuntime() {
   registerMoleculeShellRenderers();
   registerMoleculePageRenderers();
   registerSpecializedMediaRenderers();
+  registerSpecializedAudioCaptureRenderer();
   registerSpecializedContentRenderers();
   // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: KOMPLETNE (26/26).
   // 3.3d Data Display: KOMPLETNE (38/38). 3.3e Feedback: KOMPLETNE (14/14).

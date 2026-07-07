@@ -924,6 +924,7 @@ fn send_panel_shell() {
         children: vec![nav, body],
         padding: None,
         justify: None,
+        style: None,
     }
     .into_component("root")
     .expect("Stack encode");
@@ -1064,6 +1065,7 @@ fn live_tab() -> Component {
         ],
         padding: Some(Spacing::Md),
         justify: None,
+        style: None,
     }
     .into_component("tab-live")
     .expect("Stack encode")
@@ -1089,6 +1091,7 @@ fn storage_tab() -> Component {
         ],
         padding: Some(Spacing::Md),
         justify: None,
+        style: None,
     }
     .into_component("tab-storage")
     .expect("Stack encode")

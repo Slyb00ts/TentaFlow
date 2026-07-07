@@ -145,6 +145,7 @@ pub fn section_stack(tab: &str, section_header: &str) -> Component {
         children,
         padding: Some(Spacing::Md),
         justify: None,
+        style: None,
     }
     .into_component(format!("catalog-{}", tab))
     .expect("Stack encode")

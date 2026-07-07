@@ -1274,6 +1274,14 @@ string_enum! {
 }
 
 string_enum! {
+    /// `AudioCapture.mode` (catalog §8 0x0612).
+    pub enum AudioCaptureMode {
+        PushToTalk = "push_to_talk",
+        Vad = "vad",
+    }
+}
+
+string_enum! {
     /// `FpsCounter.variant` (catalog §8 0x060E).
     pub enum FpsVariant {
         Minimal = "minimal",
@@ -1342,6 +1350,39 @@ string_enum! {
         StrictOrigin = "strict-origin",
         StrictOriginWhenCrossOrigin = "strict-origin-when-cross-origin",
         UnsafeUrl = "unsafe-url",
+    }
+}
+
+string_enum! {
+    /// Semantic border color token for `BorderSide` (catalog §1.5 BoxStyle).
+    /// Renderer maps to theme CSS vars (`--tf-border`, `--tf-accent-1`, …).
+    pub enum BorderColor {
+        Default = "default",
+        Hover = "hover",
+        Accent = "accent",
+        Success = "success",
+        Warning = "warning",
+        Danger = "danger",
+        Transparent = "transparent",
+    }
+}
+
+string_enum! {
+    /// Border line style for `BorderSide` (catalog §1.5 BoxStyle).
+    pub enum BorderLineStyle {
+        Solid = "solid",
+        Dashed = "dashed",
+        None = "none",
+    }
+}
+
+string_enum! {
+    /// CSS overflow behavior for `BoxStyle` (catalog §1.5).
+    pub enum Overflow {
+        Visible = "visible",
+        Hidden = "hidden",
+        Auto = "auto",
+        Scroll = "scroll",
     }
 }
 

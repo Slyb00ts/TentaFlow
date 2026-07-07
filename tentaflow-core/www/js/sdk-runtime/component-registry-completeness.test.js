@@ -169,6 +169,7 @@ const CATALOG_TAGS = new Map([
   [0x060F, 'StepProgress'],
   [0x0610, 'Stopwatch'],
   [0x0611, 'VirtualizedLog'],
+  [0x0612, 'AudioCapture'],
   // §9 Domain-specific (0x0700–0x07FF)
   [0x0701, 'PermissionMatrix'],
   [0x0702, 'NetworkRuleEditor'],

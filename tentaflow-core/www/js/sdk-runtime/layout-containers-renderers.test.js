@@ -18,6 +18,7 @@ import {
   STACK_TAG,
   CLUSTER_TAG,
   SPLIT_TAG,
+  BOX_TAG,
 } from './layout-containers-renderers.js';
 import { bootstrapSdkRuntime } from './bootstrap.js';
 
@@ -640,6 +641,178 @@ test('destroy on Flex root unhooks bound child subscriptions', () => {
   });
   // Po destroy subskrypcja dziecka jest zwolniona — tekst nie zmienia się.
   assertEq(labelEl.textContent, 'first');
+});
+
+// ============================================================================
+// BoxStyle (spec §1.5) — shared container styling
+// ============================================================================
+
+// BoxStyle FieldMap: 0=margin, 1=padding, 2=border, 3=background, 4=radius,
+// 5=width, 6=height, 7=min_width, 8=min_height, 9=max_width, 10=max_height,
+// 11=overflow_x, 12=overflow_y.
+function tokenSpace(t) { return { kind: 'token', value: t }; }
+function pxSpace(v) { return { kind: 'px', value: v }; }
+
+test('Flex applies BoxStyle margins/paddings/border/background/radius', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(FLEX_TAG, [
+      [0, 'row'], [1, 'sm'], [2, 'start'], [3, 'center'], [4, 'no_wrap'],
+      [9, [
+        [0, [[0, tokenSpace('md')], [2, tokenSpace('md')]]],           // margin y
+        [1, [[1, pxSpace(12)], [3, pxSpace(12)]]],                     // padding x px
+        [2, [[2, [[0, 2], [1, 'accent'], [2, 'dashed']]]]],            // border bottom
+        [3, 'subtle'],                                                 // background
+        [4, [[0, tokenSpace('lg')], [1, tokenSpace('lg')]]],           // radius top
+        [5, { kind: 'full' }],                                         // width
+        [10, { kind: 'px', value: 480 }],                              // max_height
+        [12, 'auto'],                                                  // overflow_y
+      ]],
+    ])
+  );
+  assertEq(el.style.marginTop, 'var(--tf-space-md)');
+  assertEq(el.style.marginBottom, 'var(--tf-space-md)');
+  assertEq(el.style.marginLeft, '');
+  assertEq(el.style.paddingRight, '12px');
+  assertEq(el.style.paddingLeft, '12px');
+  assertEq(el.style.borderBottomWidth, '2px');
+  assertEq(el.style.borderBottomStyle, 'dashed');
+  assertEq(el.style.borderBottomColor, 'var(--tf-accent-1)');
+  assertEq(el.style.borderTopStyle, '');
+  assertEq(el.style.background, 'var(--tf-bg-subtle)');
+  assertEq(el.style.borderTopLeftRadius, 'var(--tf-radius-lg)');
+  assertEq(el.style.borderTopRightRadius, 'var(--tf-radius-lg)');
+  assertEq(el.style.width, '100%');
+  assertEq(el.style.maxHeight, '480px');
+  assertEq(el.style.overflowY, 'auto');
+});
+
+test('BoxStyle rejects unknown keys, bad tokens and out-of-range px', () => {
+  setup();
+  const engine = makeEngine();
+  const flexWithStyle = (style) =>
+    comp(FLEX_TAG, [
+      [0, 'row'], [1, 'sm'], [2, 'start'], [3, 'center'], [4, 'no_wrap'],
+      [9, style],
+    ]);
+  // Unknown BoxStyle key 13.
+  assertThrows(() => engine.render(flexWithStyle([[13, 'x']])));
+  // Unknown Spacing token in margin.
+  assertThrows(() => engine.render(flexWithStyle([[0, [[0, tokenSpace('gigantic')]]]])));
+  // Px out of u16 range.
+  assertThrows(() => engine.render(flexWithStyle([[1, [[0, pxSpace(70000)]]]])));
+  // Unknown BorderColor.
+  assertThrows(() => engine.render(flexWithStyle([[2, [[0, [[0, 1], [1, 'magenta'], [2, 'solid']]]]]])));
+  // Unknown overflow token.
+  assertThrows(() => engine.render(flexWithStyle([[11, 'wrap']])));
+});
+
+test('BoxStyle rejects duplicate keys in nested FieldMaps', () => {
+  setup();
+  const engine = makeEngine();
+  const flexWithStyle = (style) =>
+    comp(FLEX_TAG, [
+      [0, 'row'], [1, 'sm'], [2, 'start'], [3, 'center'], [4, 'no_wrap'],
+      [9, style],
+    ]);
+  // Duplicate BoxStyle key (padding twice).
+  assertThrows(() => engine.render(flexWithStyle([
+    [1, [[0, pxSpace(4)]]],
+    [1, [[0, pxSpace(8)]]],
+  ])));
+  // Duplicate edge inside EdgeValues (margin.top twice — first-wins forbidden).
+  assertThrows(() => engine.render(flexWithStyle([
+    [0, [[0, pxSpace(4)], [0, pxSpace(8)]]],
+  ])));
+  // Duplicate side inside BorderEdges.
+  assertThrows(() => engine.render(flexWithStyle([
+    [2, [[0, [[0, 1], [1, 'default'], [2, 'solid']]], [0, [[0, 3], [1, 'danger'], [2, 'solid']]]]],
+  ])));
+  // Duplicate field inside BorderSide (width_px twice).
+  assertThrows(() => engine.render(flexWithStyle([
+    [2, [[0, [[0, 1], [0, 2], [1, 'default'], [2, 'solid']]]]],
+  ])));
+  // Duplicate corner inside CornerValues.
+  assertThrows(() => engine.render(flexWithStyle([
+    [4, [[0, tokenSpace('md')], [0, tokenSpace('lg')]]],
+  ])));
+});
+
+test('BorderLineStyle none maps to border none', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(FLEX_TAG, [
+      [0, 'row'], [1, 'sm'], [2, 'start'], [3, 'center'], [4, 'no_wrap'],
+      [9, [[2, [[0, [[0, 1], [1, 'default'], [2, 'none']]]]]]],
+    ])
+  );
+  assertEq(el.style.borderTopStyle, 'none');
+  assertEq(el.style.borderTopWidth, '');
+});
+
+test('Grid and Stack accept BoxStyle field', () => {
+  setup();
+  const engine = makeEngine();
+  const grid = engine.render(
+    comp(GRID_TAG, [
+      [0, { kind: 'equal', count: 2 }],
+      [1, 'md'],
+      [4, []],
+      [7, [[1, [[0, pxSpace(8)]]]]],
+    ])
+  );
+  assertEq(grid.style.paddingTop, '8px');
+  const stack = engine.render(
+    comp(STACK_TAG, [
+      [5, [[0, [[3, tokenSpace('xl')]]]]],
+    ])
+  );
+  assertEq(stack.style.marginLeft, 'var(--tf-space-xl)');
+});
+
+// ============================================================================
+// Box (0x0115) — style(6), direction(7), gap(8), align(9), justify(10)
+// ============================================================================
+
+test('Box renders flex behavior + BoxStyle', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(BOX_TAG, [
+      [5, []],
+      [6, [[2, [[0, [[0, 1], [1, 'default'], [2, 'solid']]], [1, [[0, 1], [1, 'default'], [2, 'solid']]], [2, [[0, 1], [1, 'default'], [2, 'solid']]], [3, [[0, 1], [1, 'default'], [2, 'solid']]]]]]],
+      [7, 'column'],
+      [8, 'sm'],
+      [9, 'center'],
+      [10, 'space_between'],
+    ])
+  );
+  assert(el.classList.contains('tf-box'));
+  assertEq(el.style.display, 'flex');
+  assertEq(el.style.flexDirection, 'column');
+  assertEq(el.style.gap, 'var(--tf-space-sm)');
+  assertEq(el.style.alignItems, 'center');
+  assertEq(el.style.justifyContent, 'space-between');
+  assertEq(el.style.borderTopWidth, '1px');
+  assertEq(el.style.borderTopStyle, 'solid');
+  assertEq(el.style.borderTopColor, 'var(--tf-border)');
+  assertEq(el.style.borderLeftStyle, 'solid');
+});
+
+test('Box without flex fields stays a plain div', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(BOX_TAG, [[5, []]]));
+  assertEq(el.style.display, '');
+});
+
+test('Box rejects invalid direction and unknown field key', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() => engine.render(comp(BOX_TAG, [[7, 'diagonal']])));
+  assertThrows(() => engine.render(comp(BOX_TAG, [[11, 'x']])));
 });
 
 // ============================================================================

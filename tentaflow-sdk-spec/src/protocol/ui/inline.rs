@@ -1635,9 +1635,11 @@ impl<'b, C> Decode<'b, C> for DimensionToken {
         let len = d.map()?.ok_or_else(|| {
             minicbor::decode::Error::message("indefinite-length map forbidden")
         })?;
+        // Two-pass: buffer `value` as generic `Value` so decode stays
+        // independent of `kind` vs `value` ordering on the wire; the
+        // `spacing` token text is resolved after `kind` is known.
         let mut kind: Option<String> = None;
         let mut value_raw: Option<Value> = None;
-        let mut spacing_value: Option<super::tokens::Spacing> = None;
         for _ in 0..len {
             let k = d.str()?;
             match k {
@@ -1646,17 +1648,8 @@ impl<'b, C> Decode<'b, C> for DimensionToken {
                     kind = Some(d.str()?.to_string());
                 }
                 "value" => {
-                    if value_raw.is_some() || spacing_value.is_some() {
-                        return Err(minicbor::decode::Error::message(
-                            "DimensionToken: duplicate key 'value'",
-                        ));
-                    }
-                    match kind.as_deref() {
-                        Some("spacing") => {
-                            spacing_value = Some(super::tokens::Spacing::decode(d, ctx)?);
-                        }
-                        _ => value_raw = Some(Value::decode(d, ctx)?),
-                    }
+                    assert_no_dup_tstr(&value_raw, "DimensionToken", "value")?;
+                    value_raw = Some(Value::decode(d, ctx)?);
                 }
                 other => {
                     return Err(minicbor::decode::Error::message(format!(
@@ -1678,18 +1671,15 @@ impl<'b, C> Decode<'b, C> for DimensionToken {
             };
         match kind.as_str() {
             "auto" => {
-                need_no_value(value_raw.is_some() || spacing_value.is_some(), "auto")?;
+                need_no_value(value_raw.is_some(), "auto")?;
                 Ok(DimensionToken::Auto)
             }
             "full" => {
-                need_no_value(value_raw.is_some() || spacing_value.is_some(), "full")?;
+                need_no_value(value_raw.is_some(), "full")?;
                 Ok(DimensionToken::Full)
             }
             "fit_content" => {
-                need_no_value(
-                    value_raw.is_some() || spacing_value.is_some(),
-                    "fit_content",
-                )?;
+                need_no_value(value_raw.is_some(), "fit_content")?;
                 Ok(DimensionToken::FitContent)
             }
             other => {
@@ -1727,13 +1717,21 @@ impl<'b, C> Decode<'b, C> for DimensionToken {
                             minicbor::decode::Error::message("DimensionToken.percent value out of u8 range")
                         })?,
                     }),
-                    "spacing" => Ok(DimensionToken::Spacing {
-                        value: spacing_value.ok_or_else(|| {
-                            minicbor::decode::Error::message(
-                                "DimensionToken.spacing missing value",
-                            )
-                        })?,
-                    }),
+                    "spacing" => match value_raw {
+                        Some(Value::Text(s)) => Ok(DimensionToken::Spacing {
+                            value: super::tokens::Spacing::from_wire(&s).ok_or_else(|| {
+                                minicbor::decode::Error::message(
+                                    "DimensionToken.spacing: unknown Spacing token",
+                                )
+                            })?,
+                        }),
+                        Some(_) => Err(minicbor::decode::Error::message(
+                            "DimensionToken.spacing value must be a Spacing token (tstr)",
+                        )),
+                        None => Err(minicbor::decode::Error::message(
+                            "DimensionToken.spacing missing value",
+                        )),
+                    },
                     other => Err(minicbor::decode::Error::message(format!(
                         "unknown DimensionToken.kind: {other}"
                     ))),
@@ -2433,6 +2431,38 @@ mod tests_chunk_1_7b {
         rt(DimensionToken::Fr { value: 2 });
         rt(DimensionToken::Percent { value: 75 });
         rt(DimensionToken::Spacing { value: Spacing::Md });
+    }
+
+    #[test]
+    fn dimension_token_decode_value_before_kind() {
+        // Non-canonical key order on input (`value` before `kind`) must decode
+        // for both the numeric and the spacing-token variants.
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.map(2).unwrap()
+            .str("value").unwrap().str("md").unwrap()
+            .str("kind").unwrap().str("spacing").unwrap();
+        let v: DimensionToken = minicbor::decode(&buf).unwrap();
+        assert_eq!(v, DimensionToken::Spacing { value: Spacing::Md });
+
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.map(2).unwrap()
+            .str("value").unwrap().u32(320).unwrap()
+            .str("kind").unwrap().str("px").unwrap();
+        let v: DimensionToken = minicbor::decode(&buf).unwrap();
+        assert_eq!(v, DimensionToken::Px { value: 320 });
+    }
+
+    #[test]
+    fn dimension_token_spacing_unknown_token_rejected() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.map(2).unwrap()
+            .str("kind").unwrap().str("spacing").unwrap()
+            .str("value").unwrap().str("gigantic").unwrap();
+        let res: Result<DimensionToken, _> = minicbor::decode(&buf);
+        assert!(res.is_err());
     }
 
     #[test]
@@ -3246,6 +3276,582 @@ impl<'b, C> Decode<'b, C> for GridTrack {
 // -----------------------------------------------------------------------------
 // LogEvent — inline struct for VirtualizedLog (catalog §8 0x0611).
 // -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// SpaceValue / RadiusValue — discriminated unions (catalog §1.5 BoxStyle).
+// -----------------------------------------------------------------------------
+
+/// Spacing value for `BoxStyle` margins/paddings: semantic `Spacing` token or
+/// a raw pixel count. Wire: `{kind:"token", value: Spacing}` /
+/// `{kind:"px", value: u16}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpaceValue {
+    Token { value: super::tokens::Spacing },
+    Px { value: u16 },
+}
+
+impl<C> Encode<C> for SpaceValue {
+    fn encode<W: minicbor::encode::Write>(
+        &self,
+        e: &mut Encoder<W>,
+        ctx: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        // Canonical key order: kind(0x64..) < value(0x65..).
+        e.map(2)?;
+        match self {
+            SpaceValue::Token { value } => {
+                e.str("kind")?.str("token")?;
+                e.str("value")?;
+                value.encode(e, ctx)?;
+            }
+            SpaceValue::Px { value } => {
+                e.str("kind")?.str("px")?;
+                e.str("value")?.u16(*value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'b, C> Decode<'b, C> for SpaceValue {
+    fn decode(
+        d: &mut Decoder<'b>,
+        ctx: &mut C,
+    ) -> Result<Self, minicbor::decode::Error> {
+        let len = d.map()?.ok_or_else(|| {
+            minicbor::decode::Error::message("indefinite-length map forbidden")
+        })?;
+        // Two-pass: buffer `value` as generic `Value` so decode stays
+        // independent of `kind` vs `value` ordering on the wire.
+        let mut kind: Option<String> = None;
+        let mut value: Option<Value> = None;
+        for _ in 0..len {
+            let k = d.str()?;
+            match k {
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "SpaceValue", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "value" => {
+                    assert_no_dup_tstr(&value, "SpaceValue", "value")?;
+                    value = Some(Value::decode(d, ctx)?);
+                }
+                other => {
+                    return Err(minicbor::decode::Error::message(format!(
+                        "unknown SpaceValue key: {other}"
+                    )))
+                }
+            }
+        }
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("SpaceValue missing kind"))?;
+        let value =
+            value.ok_or_else(|| minicbor::decode::Error::message("SpaceValue missing value"))?;
+        match (kind.as_str(), value) {
+            ("token", Value::Text(s)) => Ok(SpaceValue::Token {
+                value: super::tokens::Spacing::from_wire(&s).ok_or_else(|| {
+                    minicbor::decode::Error::message("SpaceValue.token: unknown Spacing token")
+                })?,
+            }),
+            ("px", Value::U64(n)) => Ok(SpaceValue::Px {
+                value: u16::try_from(n).map_err(|_| {
+                    minicbor::decode::Error::message("SpaceValue.px value out of u16 range")
+                })?,
+            }),
+            (other, _) => Err(minicbor::decode::Error::message(format!(
+                "SpaceValue.kind '{other}' does not match value type"
+            ))),
+        }
+    }
+}
+
+impl From<super::tokens::Spacing> for SpaceValue {
+    fn from(value: super::tokens::Spacing) -> Self {
+        SpaceValue::Token { value }
+    }
+}
+
+impl From<u16> for SpaceValue {
+    fn from(value: u16) -> Self {
+        SpaceValue::Px { value }
+    }
+}
+
+/// Corner radius value for `BoxStyle`: semantic `RadiusToken` or raw pixels.
+/// Wire: `{kind:"token", value: RadiusToken}` / `{kind:"px", value: u16}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RadiusValue {
+    Token { value: super::tokens::RadiusToken },
+    Px { value: u16 },
+}
+
+impl<C> Encode<C> for RadiusValue {
+    fn encode<W: minicbor::encode::Write>(
+        &self,
+        e: &mut Encoder<W>,
+        ctx: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        // Canonical key order: kind(0x64..) < value(0x65..).
+        e.map(2)?;
+        match self {
+            RadiusValue::Token { value } => {
+                e.str("kind")?.str("token")?;
+                e.str("value")?;
+                value.encode(e, ctx)?;
+            }
+            RadiusValue::Px { value } => {
+                e.str("kind")?.str("px")?;
+                e.str("value")?.u16(*value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'b, C> Decode<'b, C> for RadiusValue {
+    fn decode(
+        d: &mut Decoder<'b>,
+        ctx: &mut C,
+    ) -> Result<Self, minicbor::decode::Error> {
+        let len = d.map()?.ok_or_else(|| {
+            minicbor::decode::Error::message("indefinite-length map forbidden")
+        })?;
+        let mut kind: Option<String> = None;
+        let mut value: Option<Value> = None;
+        for _ in 0..len {
+            let k = d.str()?;
+            match k {
+                "kind" => {
+                    assert_no_dup_tstr(&kind, "RadiusValue", "kind")?;
+                    kind = Some(d.str()?.to_string());
+                }
+                "value" => {
+                    assert_no_dup_tstr(&value, "RadiusValue", "value")?;
+                    value = Some(Value::decode(d, ctx)?);
+                }
+                other => {
+                    return Err(minicbor::decode::Error::message(format!(
+                        "unknown RadiusValue key: {other}"
+                    )))
+                }
+            }
+        }
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("RadiusValue missing kind"))?;
+        let value =
+            value.ok_or_else(|| minicbor::decode::Error::message("RadiusValue missing value"))?;
+        match (kind.as_str(), value) {
+            ("token", Value::Text(s)) => Ok(RadiusValue::Token {
+                value: super::tokens::RadiusToken::from_wire(&s).ok_or_else(|| {
+                    minicbor::decode::Error::message("RadiusValue.token: unknown RadiusToken")
+                })?,
+            }),
+            ("px", Value::U64(n)) => Ok(RadiusValue::Px {
+                value: u16::try_from(n).map_err(|_| {
+                    minicbor::decode::Error::message("RadiusValue.px value out of u16 range")
+                })?,
+            }),
+            (other, _) => Err(minicbor::decode::Error::message(format!(
+                "RadiusValue.kind '{other}' does not match value type"
+            ))),
+        }
+    }
+}
+
+impl From<super::tokens::RadiusToken> for RadiusValue {
+    fn from(value: super::tokens::RadiusToken) -> Self {
+        RadiusValue::Token { value }
+    }
+}
+
+impl From<u16> for RadiusValue {
+    fn from(value: u16) -> Self {
+        RadiusValue::Px { value }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// BoxStyle — generic container styling (catalog §1.5).
+// -----------------------------------------------------------------------------
+
+/// One border edge: width in px + semantic color token + line style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct BorderSide {
+    #[n(0)]
+    pub width_px: u8,
+    #[n(1)]
+    pub color: super::tokens::BorderColor,
+    #[n(2)]
+    pub style: super::tokens::BorderLineStyle,
+}
+
+impl BorderSide {
+    pub fn new(width_px: u8, color: super::tokens::BorderColor) -> Self {
+        Self { width_px, color, style: super::tokens::BorderLineStyle::Solid }
+    }
+}
+
+/// Per-edge spacing values (margin / padding). Absent edge = renderer leaves
+/// the container default untouched. `all`/`x`/`y` shorthands are resolved by
+/// SDK builders into explicit edges — the wire carries edges only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct EdgeValues {
+    #[n(0)]
+    pub top: Option<SpaceValue>,
+    #[n(1)]
+    pub right: Option<SpaceValue>,
+    #[n(2)]
+    pub bottom: Option<SpaceValue>,
+    #[n(3)]
+    pub left: Option<SpaceValue>,
+}
+
+impl EdgeValues {
+    pub fn all(v: impl Into<SpaceValue>) -> Self {
+        let v = v.into();
+        Self { top: Some(v), right: Some(v), bottom: Some(v), left: Some(v) }
+    }
+
+    pub fn x(v: impl Into<SpaceValue>) -> Self {
+        let v = v.into();
+        Self { left: Some(v), right: Some(v), ..Self::default() }
+    }
+
+    pub fn y(v: impl Into<SpaceValue>) -> Self {
+        let v = v.into();
+        Self { top: Some(v), bottom: Some(v), ..Self::default() }
+    }
+}
+
+/// Per-edge border sides. Absent edge = no border on that edge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct BorderEdges {
+    #[n(0)]
+    pub top: Option<BorderSide>,
+    #[n(1)]
+    pub right: Option<BorderSide>,
+    #[n(2)]
+    pub bottom: Option<BorderSide>,
+    #[n(3)]
+    pub left: Option<BorderSide>,
+}
+
+impl BorderEdges {
+    pub fn all(side: BorderSide) -> Self {
+        Self { top: Some(side), right: Some(side), bottom: Some(side), left: Some(side) }
+    }
+}
+
+/// Per-corner radius values. Absent corner = container default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+pub struct CornerValues {
+    #[n(0)]
+    pub top_left: Option<RadiusValue>,
+    #[n(1)]
+    pub top_right: Option<RadiusValue>,
+    #[n(2)]
+    pub bottom_right: Option<RadiusValue>,
+    #[n(3)]
+    pub bottom_left: Option<RadiusValue>,
+}
+
+impl CornerValues {
+    pub fn all(v: impl Into<RadiusValue>) -> Self {
+        let v = v.into();
+        Self {
+            top_left: Some(v),
+            top_right: Some(v),
+            bottom_right: Some(v),
+            bottom_left: Some(v),
+        }
+    }
+}
+
+/// Shared container styling (catalog §1.5): margins, paddings, borders,
+/// background, radii, dimensions and overflow — HTML-like box control without
+/// raw CSS. Every field optional; `None` keeps the container's own defaults.
+/// Attached to layout containers via their `style` field; renderer applies it
+/// on top of the container's token-level fields.
+#[derive(Debug, Clone, Default, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct BoxStyle {
+    #[n(0)]
+    pub margin: Option<EdgeValues>,
+    #[n(1)]
+    pub padding: Option<EdgeValues>,
+    #[n(2)]
+    pub border: Option<BorderEdges>,
+    #[n(3)]
+    pub background: Option<super::tokens::BackgroundToken>,
+    #[n(4)]
+    pub radius: Option<CornerValues>,
+    #[n(5)]
+    pub width: Option<DimensionToken>,
+    #[n(6)]
+    pub height: Option<DimensionToken>,
+    #[n(7)]
+    pub min_width: Option<DimensionToken>,
+    #[n(8)]
+    pub min_height: Option<DimensionToken>,
+    #[n(9)]
+    pub max_width: Option<DimensionToken>,
+    #[n(10)]
+    pub max_height: Option<DimensionToken>,
+    #[n(11)]
+    pub overflow_x: Option<super::tokens::Overflow>,
+    #[n(12)]
+    pub overflow_y: Option<super::tokens::Overflow>,
+}
+
+impl BoxStyle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn margin(mut self, edges: EdgeValues) -> Self {
+        self.margin = Some(edges);
+        self
+    }
+
+    pub fn margin_all(self, v: impl Into<SpaceValue>) -> Self {
+        self.margin(EdgeValues::all(v))
+    }
+
+    pub fn margin_x(self, v: impl Into<SpaceValue>) -> Self {
+        self.margin(EdgeValues::x(v))
+    }
+
+    pub fn margin_y(self, v: impl Into<SpaceValue>) -> Self {
+        self.margin(EdgeValues::y(v))
+    }
+
+    pub fn padding(mut self, edges: EdgeValues) -> Self {
+        self.padding = Some(edges);
+        self
+    }
+
+    pub fn padding_all(self, v: impl Into<SpaceValue>) -> Self {
+        self.padding(EdgeValues::all(v))
+    }
+
+    pub fn padding_x(self, v: impl Into<SpaceValue>) -> Self {
+        self.padding(EdgeValues::x(v))
+    }
+
+    pub fn padding_y(self, v: impl Into<SpaceValue>) -> Self {
+        self.padding(EdgeValues::y(v))
+    }
+
+    pub fn border(mut self, width_px: u8, color: super::tokens::BorderColor) -> Self {
+        self.border = Some(BorderEdges::all(BorderSide::new(width_px, color)));
+        self
+    }
+
+    pub fn border_edges(mut self, edges: BorderEdges) -> Self {
+        self.border = Some(edges);
+        self
+    }
+
+    pub fn bg(mut self, token: super::tokens::BackgroundToken) -> Self {
+        self.background = Some(token);
+        self
+    }
+
+    pub fn radius(mut self, v: impl Into<RadiusValue>) -> Self {
+        self.radius = Some(CornerValues::all(v));
+        self
+    }
+
+    pub fn radius_corners(mut self, corners: CornerValues) -> Self {
+        self.radius = Some(corners);
+        self
+    }
+
+    pub fn width(mut self, v: DimensionToken) -> Self {
+        self.width = Some(v);
+        self
+    }
+
+    pub fn height(mut self, v: DimensionToken) -> Self {
+        self.height = Some(v);
+        self
+    }
+
+    pub fn min_width(mut self, v: DimensionToken) -> Self {
+        self.min_width = Some(v);
+        self
+    }
+
+    pub fn min_height(mut self, v: DimensionToken) -> Self {
+        self.min_height = Some(v);
+        self
+    }
+
+    pub fn max_width(mut self, v: DimensionToken) -> Self {
+        self.max_width = Some(v);
+        self
+    }
+
+    pub fn max_height(mut self, v: DimensionToken) -> Self {
+        self.max_height = Some(v);
+        self
+    }
+
+    pub fn overflow(mut self, v: super::tokens::Overflow) -> Self {
+        self.overflow_x = Some(v);
+        self.overflow_y = Some(v);
+        self
+    }
+
+    pub fn overflow_x(mut self, v: super::tokens::Overflow) -> Self {
+        self.overflow_x = Some(v);
+        self
+    }
+
+    pub fn overflow_y(mut self, v: super::tokens::Overflow) -> Self {
+        self.overflow_y = Some(v);
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests_box_style {
+    use super::*;
+    use crate::protocol::ui::tokens::{
+        BackgroundToken, BorderColor, BorderLineStyle, Overflow, RadiusToken, Spacing,
+    };
+
+    fn rt<T>(v: T)
+    where
+        T: minicbor::Encode<()>
+            + for<'b> minicbor::Decode<'b, ()>
+            + PartialEq
+            + core::fmt::Debug,
+    {
+        let mut b1 = Vec::new();
+        minicbor::encode(&v, &mut b1).unwrap();
+        let d: T = minicbor::decode(&b1).unwrap();
+        assert_eq!(d, v);
+        let mut b2 = Vec::new();
+        minicbor::encode(&d, &mut b2).unwrap();
+        assert_eq!(b1, b2);
+    }
+
+    #[test]
+    fn space_value_variants_roundtrip() {
+        rt(SpaceValue::Token { value: Spacing::Md });
+        rt(SpaceValue::Px { value: 0 });
+        rt(SpaceValue::Px { value: 65535 });
+    }
+
+    #[test]
+    fn space_value_kind_type_mismatch_rejected() {
+        // kind="px" but value is a string — must reject.
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.map(2).unwrap()
+            .str("kind").unwrap().str("px").unwrap()
+            .str("value").unwrap().str("md").unwrap();
+        let res: Result<SpaceValue, _> = minicbor::decode(&buf);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn space_value_unknown_token_rejected() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.map(2).unwrap()
+            .str("kind").unwrap().str("token").unwrap()
+            .str("value").unwrap().str("gigantic").unwrap();
+        let res: Result<SpaceValue, _> = minicbor::decode(&buf);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn space_value_px_out_of_u16_rejected() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.map(2).unwrap()
+            .str("kind").unwrap().str("px").unwrap()
+            .str("value").unwrap().u32(70_000).unwrap();
+        let res: Result<SpaceValue, _> = minicbor::decode(&buf);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn space_value_decode_value_before_kind() {
+        let mut buf = Vec::new();
+        let mut enc = minicbor::Encoder::new(&mut buf);
+        enc.map(2).unwrap()
+            .str("value").unwrap().u16(12).unwrap()
+            .str("kind").unwrap().str("px").unwrap();
+        let v: SpaceValue = minicbor::decode(&buf).unwrap();
+        assert_eq!(v, SpaceValue::Px { value: 12 });
+    }
+
+    #[test]
+    fn radius_value_variants_roundtrip() {
+        rt(RadiusValue::Token { value: RadiusToken::Pill });
+        rt(RadiusValue::Px { value: 6 });
+    }
+
+    #[test]
+    fn border_side_and_edges_roundtrip() {
+        let side = BorderSide {
+            width_px: 2,
+            color: BorderColor::Accent,
+            style: BorderLineStyle::Dashed,
+        };
+        rt(side);
+        rt(BorderEdges::all(side));
+        rt(BorderEdges { bottom: Some(side), ..BorderEdges::default() });
+    }
+
+    #[test]
+    fn edge_and_corner_values_roundtrip() {
+        rt(EdgeValues::all(Spacing::Lg));
+        rt(EdgeValues::x(SpaceValue::Px { value: 12 }));
+        rt(EdgeValues::y(Spacing::Sm));
+        rt(CornerValues::all(RadiusToken::Md));
+        rt(CornerValues {
+            top_left: Some(RadiusValue::Px { value: 4 }),
+            ..CornerValues::default()
+        });
+    }
+
+    #[test]
+    fn box_style_empty_and_full_roundtrip() {
+        rt(BoxStyle::default());
+        rt(BoxStyle::new()
+            .margin_y(Spacing::Md)
+            .padding_all(12u16)
+            .border(1, BorderColor::Default)
+            .bg(BackgroundToken::Subtle)
+            .radius(RadiusToken::Lg)
+            .width(DimensionToken::Full)
+            .height(DimensionToken::Px { value: 240 })
+            .min_width(DimensionToken::Px { value: 100 })
+            .max_height(DimensionToken::Percent { value: 80 })
+            .overflow_y(Overflow::Auto));
+    }
+
+    #[test]
+    fn box_style_builder_shorthands_resolve_edges() {
+        let s = BoxStyle::new().margin_x(Spacing::Sm).padding_all(8u16);
+        let m = s.margin.unwrap();
+        assert_eq!(m.left, Some(SpaceValue::Token { value: Spacing::Sm }));
+        assert_eq!(m.right, Some(SpaceValue::Token { value: Spacing::Sm }));
+        assert_eq!(m.top, None);
+        assert_eq!(m.bottom, None);
+        let p = s.padding.unwrap();
+        assert_eq!(p.top, Some(SpaceValue::Px { value: 8 }));
+        assert_eq!(p.bottom, Some(SpaceValue::Px { value: 8 }));
+    }
+}
 
 /// One entry in a `VirtualizedLog.events_path` stream (catalog §8 0x0611).
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]

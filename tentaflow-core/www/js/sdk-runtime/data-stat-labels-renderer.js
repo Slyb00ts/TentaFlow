@@ -491,8 +491,16 @@ function renderBadge(component, ctx) {
   if (label == null) throw new TypeError('Badge.label is required');
   const iconRaw = ctx.readField(component.fields, 3);
   const count = ctx.readField(component.fields, 4);
-  const max = requireU32(ctx.readField(component.fields, 5), 'Badge.max');
-  if (max === 0) throw new TypeError('Badge.max must be > 0');
+  // `max` bounds the count overflow badge (e.g. "99+"); it is only meaningful
+  // when a count is present. A plain label/pill badge carries no count and its
+  // encoded default max (0) must not reject the whole badge.
+  const max = count != null
+    ? (() => {
+        const m = requireU32(ctx.readField(component.fields, 5), 'Badge.max');
+        if (m === 0) throw new TypeError('Badge.max must be > 0');
+        return m;
+      })()
+    : 0;
   const pulse = requireBool(ctx.readField(component.fields, 6), 'Badge.pulse');
 
   const TONE_MAP = { neutral: 'accent', primary: 'accent', success: 'success', warning: 'warning', critical: 'danger', info: 'info', muted: 'accent' };
