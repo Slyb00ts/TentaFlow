@@ -15606,6 +15606,15 @@ fn value_to_js_with_wire(
     wire: &str,
 ) -> Result<JsValue, String> {
     use tentaflow_sdk_spec::protocol::value::Value;
+    // A present field carries no `Option` on the wire, but its declared wire
+    // type still does (e.g. `Option<Array<Inline<ResponsiveRule>>>`). Strip the
+    // outer `Option<…>` so the `Array<…>` / `Inline<…>` matching below sees the
+    // real container type; without this an optional list-of-inline decodes its
+    // elements as plain objects instead of FieldMaps.
+    let wire = wire
+        .strip_prefix("Option<")
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(wire);
     match v {
         // Bytes with a Component wire → decode child Component.
         // Without wire context bytes stay as Uint8Array (no speculative decode).
