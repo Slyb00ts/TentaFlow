@@ -12,6 +12,8 @@
 // kropka (3.14) nie powinny byc rozpoznawane jako koniec zdania — heurystyka
 // na bazie blacklisty + sasiadujacej cyfry. drain() flushuje reszte na koniec
 // streamu (np. zdanie bez konczacej interpunkcji).
+import { PCM_WORKLET_SRC, floatToWav, rmsOf } from '../lib/mic-capture.js';
+
 const SENTENCE_END_RE = /[.!?…]/g;
 const ABBREV_BLOCKLIST = /\b(np|tj|dr|mr|mrs|ms|inc|etc|por|str|vs|ok|tzn|prof|sb|im|tj)$/i;
 const MIN_SENTENCE_CHARS = 4;
@@ -63,23 +65,6 @@ export class SentenceBuffer {
   }
 }
 
-// AudioWorklet processor — generuje ramki Float32 z mikrofonu. Inline jako
-// Blob, zeby modul byl samowystarczalny i nie wymagal extra pliku w www/.
-const PCM_WORKLET_SRC = `
-class PcmCollectorProcessor extends AudioWorkletProcessor {
-  process(inputs) {
-    const input = inputs[0];
-    if (input && input[0]) {
-      // Kopiujemy — bufor process() jest reuzywany, postMessage strukturalnie
-      // klonuje, wiec slice() unika race condition na nastepnej ramce.
-      this.port.postMessage(input[0].slice(0));
-    }
-    return true;
-  }
-}
-registerProcessor('pcm-collector', PcmCollectorProcessor);
-`;
-
 // Parametry akustyczne. Komentarze WHY:
 // - DEFAULT_RMS_THRESHOLD: 0.012 to RMS dla cichego pokoju z mikrofonem
 //   laptopowym; wyzej = false negatives, nizej = false positives na hum.
@@ -126,64 +111,6 @@ const FACE_MODE = {
   speaking: 'speak',
   error: 'idle',
 };
-
-// Konwersja Float32 [-1..1] -> 16-bit PCM little-endian + WAV header.
-// Wynik to Uint8Array gotowy do upload jako 'audio/wav'. Resampling z
-// browser AudioContext sample rate (typowo 48kHz) do 16kHz — STT (whisper)
-// preferuje 16kHz mono.
-function floatToWav(float32, srcSampleRate, dstSampleRate = 16000) {
-  // Linear interpolation resampling — adekwatne dla mowy w typowym 48k->16k
-  // ratio. Bez aliasingu lowpass'a, ale STT jest tolerancyjny (nie audio HQ).
-  const ratio = srcSampleRate / dstSampleRate;
-  const dstLen = Math.floor(float32.length / ratio);
-  const dst = new Int16Array(dstLen);
-  for (let i = 0; i < dstLen; i++) {
-    const srcIdx = i * ratio;
-    const i0 = Math.floor(srcIdx);
-    const i1 = Math.min(i0 + 1, float32.length - 1);
-    const frac = srcIdx - i0;
-    const sample = float32[i0] * (1 - frac) + float32[i1] * frac;
-    const clamped = Math.max(-1, Math.min(1, sample));
-    dst[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
-  }
-
-  const dataBytes = dst.length * 2;
-  const buf = new ArrayBuffer(44 + dataBytes);
-  const view = new DataView(buf);
-  // RIFF header
-  writeStr(view, 0, 'RIFF');
-  view.setUint32(4, 36 + dataBytes, true);
-  writeStr(view, 8, 'WAVE');
-  // fmt chunk
-  writeStr(view, 12, 'fmt ');
-  view.setUint32(16, 16, true); // chunk size
-  view.setUint16(20, 1, true); // PCM
-  view.setUint16(22, 1, true); // mono
-  view.setUint32(24, dstSampleRate, true);
-  view.setUint32(28, dstSampleRate * 2, true); // byte rate
-  view.setUint16(32, 2, true); // block align
-  view.setUint16(34, 16, true); // bits per sample
-  // data chunk
-  writeStr(view, 36, 'data');
-  view.setUint32(40, dataBytes, true);
-  // PCM data
-  let offset = 44;
-  for (let i = 0; i < dst.length; i++, offset += 2) {
-    view.setInt16(offset, dst[i], true);
-  }
-  return new Uint8Array(buf);
-}
-
-function writeStr(view, offset, str) {
-  for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
-}
-
-function rmsOf(frame) {
-  // RMS w domenie czasu — operujemy na Float32 [-1..1].
-  let sum = 0;
-  for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
-  return Math.sqrt(sum / Math.max(1, frame.length));
-}
 
 export class AudioPipeline {
   constructor(opts) {

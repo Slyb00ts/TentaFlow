@@ -6928,6 +6928,16 @@ pub struct AddonDocumentUploadChunkRequest {
     pub mime: String,
     pub seq: u32,
     pub total_chunks: u32,
+    /// Zaufany marker źródła uploadu ustawiany WYŁĄCZNIE przez renderer po stronie
+    /// hosta (dashboard SDK-runtime), NIE przez guest addon. Wartość
+    /// `"audio_capture"` znaczy, że bajty pochodzą z mikrofonu (komponent
+    /// `AudioCapture`) — host bramkuje takie uploady na uprawnieniu
+    /// `audio.capture`. Zwykły upload plików (FileInput) zostawia to puste i NIE
+    /// wymaga tego uprawnienia (wybór pliku audio to nie przechwycenie mikrofonu).
+    /// Addon nie może podrobić tej wartości: nie kontroluje wywołania kanału
+    /// upload, robi to zaufany renderer per typ komponentu.
+    #[serde(default)]
+    pub source: String,
     /// Surowe bajty fragmentu. `serde_bytes` wymusza w ciborium kodowanie jako CBOR
     /// byte-string (length-prefixed, zero narzutu per-bajt) — goły `Vec<u8>` przez
     /// serde+ciborium dałby array-of-integers (~2× rozmiar), co zabiło wydajność
@@ -6935,6 +6945,11 @@ pub struct AddonDocumentUploadChunkRequest {
     #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
 }
+
+/// Marker `AddonDocumentUploadChunkRequest.source` dla przechwytu mikrofonu
+/// (komponent `AudioCapture`). Host bramkuje uploady z tym markerem na
+/// uprawnieniu `audio.capture`.
+pub const UPLOAD_SOURCE_AUDIO_CAPTURE: &str = "audio_capture";
 
 /// Odpowiedź na fragment uploadu dokumentu addona. Dla fragmentów pośrednich
 /// `doc_ref` jest `None` i zwracamy postęp; po ostatnim fragmencie `doc_ref`
@@ -8995,6 +9010,7 @@ mod tests {
             mime: "m".to_string(),
             seq: 0,
             total_chunks: 1,
+            source: String::new(),
             bytes: vec![0xABu8; 1000],
         };
         // Kodujemy SAMĄ strukturę (bez owijki MessageBody), żeby zmierzyć narzut pola.

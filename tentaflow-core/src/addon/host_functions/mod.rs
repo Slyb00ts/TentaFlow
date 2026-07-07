@@ -40,6 +40,7 @@ pub mod state;
 pub mod storage;
 #[cfg(feature = "camera")]
 pub mod streaming;
+pub mod stt;
 pub mod sync_acl;
 pub mod ui;
 pub mod user;
@@ -98,6 +99,19 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
             llm::llm_generate_stream_next,
         )
         .map_err(|e| anyhow::anyhow!("Rejestracja llm_generate_stream_next: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tentaflow",
+            "llm_generate_stream_cancel",
+            llm::llm_generate_stream_cancel,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja llm_generate_stream_cancel: {e}"))?;
+
+    // --- STT API ---
+    linker
+        .func_wrap("tentaflow", "stt_transcribe_v1", stt::stt_transcribe_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja stt_transcribe_v1: {e}"))?;
 
     // --- Storage API ---
     linker

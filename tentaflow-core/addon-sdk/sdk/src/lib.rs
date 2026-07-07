@@ -503,6 +503,27 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
 
+    /// LLM streaming API — start zwraca callback_id (>0) albo ujemny kod bledu;
+    /// next to CBOR `LlmStreamNextInput` → `LlmStreamNextOutput` (batch
+    /// fragmentow); cancel zwalnia slot + anuluje generacje.
+    fn llm_generate_stream_start(
+        prompt_ptr: i32, prompt_len: i32,
+        model_ptr: i32, model_len: i32,
+        options_ptr: i32, options_len: i32,
+    ) -> i32;
+    fn llm_generate_stream_next(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn llm_generate_stream_cancel(callback_id: i32) -> i32;
+
+    /// STT API — CBOR `SttTranscribeInput` (audio inline, max 25 MiB) →
+    /// `SttTranscribeOutput`. Wymaga uprawnienia "stt".
+    fn stt_transcribe_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
     /// Streaming API (F1a M1.W7) — frame bus + PickupToken. Frame bytes are
     /// NOT inlined in `stream_next` output; the addon receives `frame_ref`
     /// + metadata and uses `service_call` to hand the frame to a service.
@@ -802,10 +823,25 @@ fn call_host_log(
 // Wysokopoziomowe wrappery — LLM
 // =============================================================================
 
-/// Generuje tekst przez LLM dostepny w Core.
+/// Generuje tekst przez LLM dostepny w Core (domyslny model, bez opcji).
 /// Wymaga uprawnienia "llm" w manifescie addonu.
 pub fn generate(prompt: &str) -> Result<String, String> {
+    generate_with_options(prompt, None, None)
+}
+
+/// Generuje tekst przez LLM z jawnym modelem i opcjami JSON. `options` to opaque
+/// JSON forwardowany do hosta; obsluguje m.in. `temperature`, `max_tokens`, `top_p`
+/// oraz `system` (string) — niepusty `system` daje request `[system, user]` zamiast
+/// samego `[user]`. Wymaga uprawnienia "llm".
+pub fn generate_with_options(
+    prompt: &str,
+    model: Option<&str>,
+    options: Option<&serde_json::Value>,
+) -> Result<String, String> {
     let prompt_bytes = prompt.as_bytes();
+    let model_bytes = model.map(str::as_bytes);
+    let options_str = options.map(|o| o.to_string());
+    let options_bytes = options_str.as_deref().map(str::as_bytes);
     let mut buffer = vec![0u8; RESPONSE_BUFFER_SIZE];
     let mut out_len: i32 = 0;
 
@@ -813,8 +849,10 @@ pub fn generate(prompt: &str) -> Result<String, String> {
         llm_generate(
             prompt_bytes.as_ptr() as i32,
             prompt_bytes.len() as i32,
-            0, 0,   // model_ptr, model_len — domyslny model
-            0, 0,   // options_ptr, options_len — domyslne opcje
+            model_bytes.map_or(0, |b| b.as_ptr() as i32),
+            model_bytes.map_or(0, |b| b.len() as i32),
+            options_bytes.map_or(0, |b| b.as_ptr() as i32),
+            options_bytes.map_or(0, |b| b.len() as i32),
             buffer.as_mut_ptr() as i32,
             RESPONSE_BUFFER_SIZE as i32,
             &mut out_len as *mut i32 as i32,
@@ -830,6 +868,194 @@ pub fn generate(prompt: &str) -> Result<String, String> {
     }
 
     Ok(String::from_utf8_lossy(&buffer[..out_len as usize]).to_string())
+}
+
+// =============================================================================
+// Wysokopoziomowe wrappery — LLM streaming
+// =============================================================================
+
+/// Uchwyt aktywnego strumienia LLM. Drop bez `cancel()` zostawia strumien
+/// hostowi — zostanie zreapowany po 60 s bezczynnosci, ale jawny `cancel()`
+/// zwalnia zasoby natychmiast.
+#[derive(Debug)]
+pub struct LlmStream {
+    callback_id: i32,
+    finished: bool,
+}
+
+/// Partia fragmentow strumienia zwrocona przez [`LlmStream::next_batch`].
+#[derive(Debug, Clone)]
+pub struct LlmStreamBatch {
+    /// Kolejne delty tekstu w kolejnosci generacji. Pusta lista przy
+    /// `finished == false` oznacza timeout oczekiwania — polluj dalej.
+    pub chunks: Vec<String>,
+    /// Strumien zakonczony — uchwyt jest po tym niewazny.
+    pub finished: bool,
+    /// Powod zakonczenia (`stop`, `length`, `error`, ...) na ostatniej partii.
+    pub finish_reason: Option<String>,
+    /// Blad generacji (gdy `finish_reason == "error"`).
+    pub error: Option<String>,
+}
+
+/// Mapuje ujemne kody zwracane przez `llm_generate_stream_start` na AbiError.
+/// Start uzywa historycznych kodow ABI_ERR_* (-1 permission, -4 rate limit)
+/// oraz zanegowanego `AbiError::QuotaExceeded` (-11) dla kwoty strumieni.
+fn map_stream_start_error(rc: i32) -> AbiError {
+    match rc {
+        -1 => AbiError::Permission,
+        -4 | -11 => AbiError::QuotaExceeded,
+        _ => AbiError::Operation,
+    }
+}
+
+/// Rozpoczyna strumieniowe generowanie tekstu przez LLM.
+/// Wymaga uprawnienia "llm" (oraz "llm_model" dla surowego nadpisania modelu).
+/// Max 4 rownolegle strumienie per addon.
+pub fn generate_stream_start(
+    prompt: &str,
+    model: Option<&str>,
+    options: Option<&serde_json::Value>,
+) -> Result<LlmStream, AbiError> {
+    let prompt_bytes = prompt.as_bytes();
+    let model_bytes = model.map(str::as_bytes);
+    let options_str = options.map(|o| o.to_string());
+    let options_bytes = options_str.as_deref().map(str::as_bytes);
+
+    let rc = unsafe {
+        llm_generate_stream_start(
+            prompt_bytes.as_ptr() as i32,
+            prompt_bytes.len() as i32,
+            model_bytes.map_or(0, |b| b.as_ptr() as i32),
+            model_bytes.map_or(0, |b| b.len() as i32),
+            options_bytes.map_or(0, |b| b.as_ptr() as i32),
+            options_bytes.map_or(0, |b| b.len() as i32),
+        )
+    };
+    if rc <= 0 {
+        return Err(map_stream_start_error(rc));
+    }
+    Ok(LlmStream {
+        callback_id: rc,
+        finished: false,
+    })
+}
+
+impl LlmStream {
+    /// Pobiera kolejna partie fragmentow. `timeout_ms` dotyczy PIERWSZEGO
+    /// fragmentu partii (host clampuje do 30 s); wszystko co juz czeka w
+    /// kolejce hosta wraca w jednej partii. Po `finished == true` kolejne
+    /// wywolania zwracaja `StreamNotFound`.
+    pub fn next_batch(&mut self, timeout_ms: u64) -> Result<LlmStreamBatch, AbiError> {
+        if self.finished {
+            return Err(AbiError::StreamClosed);
+        }
+        let input = tentaflow_sdk_spec::LlmStreamNextInput {
+            callback_id: self.callback_id,
+            timeout_ms,
+        };
+        let payload = encode_cbor_input(&input)?;
+        let bytes = call_sql_with_one_input_capped(
+            llm_generate_stream_next,
+            &payload,
+            MAX_OUT_CAP,
+        )?;
+        let out: tentaflow_sdk_spec::LlmStreamNextOutput = decode_cbor(&bytes)?;
+        if out.finished {
+            self.finished = true;
+        }
+        Ok(LlmStreamBatch {
+            chunks: out.chunks,
+            finished: out.finished,
+            finish_reason: out.finish_reason,
+            error: out.error,
+        })
+    }
+
+    /// Anuluje strumien i natychmiast zwalnia zasoby hosta.
+    pub fn cancel(mut self) -> Result<(), AbiError> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        let rc = unsafe { llm_generate_stream_cancel(self.callback_id) };
+        match AbiError::from_i32(rc) {
+            AbiError::Ok => Ok(()),
+            e => Err(e),
+        }
+    }
+}
+
+impl Drop for LlmStream {
+    fn drop(&mut self) {
+        // Best-effort: porzucony `LlmStream` (bez `cancel()`) zwalnia slot hosta
+        // od razu. Guest Drop NIE jest gwarantowany przy wycieku pamieci, dlatego
+        // host ma dodatkowo background-sweeper reapujacy bezczynne strumienie —
+        // ten Drop jest szybka sciezka, sweeper twardym backstopem.
+        if !self.finished {
+            unsafe { llm_generate_stream_cancel(self.callback_id) };
+        }
+    }
+}
+
+// =============================================================================
+// Wysokopoziomowe wrappery — STT
+// =============================================================================
+
+/// Parametry transkrypcji dla [`stt_transcribe`].
+#[derive(Debug, Clone, Default)]
+pub struct SttTranscribeOptions {
+    /// Czestotliwosc probkowania (informacyjnie, np. 16000).
+    pub sample_rate: Option<u32>,
+    /// Nazwa modelu STT; brak = domyslny lokalny silnik (whisper).
+    pub model: Option<String>,
+    /// Kod jezyka ISO-639-1 (np. "pl") — pomija auto-detekcje.
+    pub language: Option<String>,
+    /// Prompt kontekstowy dla modelu.
+    pub prompt: Option<String>,
+}
+
+/// Wynik transkrypcji.
+#[derive(Debug, Clone)]
+pub struct SttTranscription {
+    pub text: String,
+    pub detected_language: Option<String>,
+    pub duration_ms: Option<u64>,
+}
+
+/// Transkrybuje audio (WAV/Opus/MP3, max 25 MiB) przez skonfigurowana
+/// sciezke STT Core (ta sama co node stt flow engine).
+/// Wymaga uprawnienia "stt" w manifescie addonu.
+/// Twardy limit rozmiaru audio (25 MiB) — lustro `PayloadKind::AudioInline` w
+/// hoscie. Sprawdzany PRZED alokacja/serializacja, zeby wielki bufor nie byl
+/// kopiowany tylko po to, by host go odrzucil.
+const MAX_STT_AUDIO_BYTES: usize = 25 * 1024 * 1024;
+
+pub fn stt_transcribe(
+    audio: &[u8],
+    mime: &str,
+    options: &SttTranscribeOptions,
+) -> Result<SttTranscription, AbiError> {
+    // Wczesne odrzucenie: nie kopiuj + nie koduj CBOR bufora, ktory i tak
+    // przekracza limit hosta.
+    if audio.len() > MAX_STT_AUDIO_BYTES {
+        return Err(AbiError::PayloadTooLarge);
+    }
+    let input = tentaflow_sdk_spec::SttTranscribeInput {
+        audio: audio.to_vec(),
+        mime: mime.to_string(),
+        sample_rate: options.sample_rate,
+        model: options.model.clone(),
+        language: options.language.clone(),
+        prompt: options.prompt.clone(),
+    };
+    let payload = encode_cbor_input(&input)?;
+    let bytes = call_sql_with_one_input_capped(stt_transcribe_v1, &payload, MAX_OUT_CAP)?;
+    let out: tentaflow_sdk_spec::SttTranscribeOutput = decode_cbor(&bytes)?;
+    Ok(SttTranscription {
+        text: out.text,
+        detected_language: out.detected_language,
+        duration_ms: out.duration_ms,
+    })
 }
 
 // =============================================================================

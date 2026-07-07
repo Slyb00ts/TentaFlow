@@ -2093,6 +2093,7 @@ pub fn encode_addon_document_upload_chunk_request(
     mime: String,
     seq: u32,
     total_chunks: u32,
+    source: String,
     bytes: Vec<u8>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::AddonDocumentBody(
@@ -2103,6 +2104,7 @@ pub fn encode_addon_document_upload_chunk_request(
             mime,
             seq,
             total_chunks,
+            source,
             bytes,
         }),
     ))
@@ -9388,6 +9390,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "seq", req.seq.into());
             set(&obj, "totalChunks", req.total_chunks.into());
             set(&obj, "total_chunks", req.total_chunks.into());
+            set(&obj, "source", req.source.into());
         }
         MessageBody::AddonDocumentBody(AddonDocumentPayload::UploadChunkResponse(resp)) => {
             set(&obj, "variant", "AddonDocumentUploadChunkResponse".into());

@@ -419,6 +419,64 @@ Generuje tekst za pomoca modelu LLM.
 - Tokeny per minuta ograniczone przez `addon_resource_limits.llm_tokens_per_min`
 - Model musi byc dostepny i skonfigurowany w systemie
 
+**System prompt:** opcjonalne pole `options.system` (string) ustawia wiadomosc roli
+`system` przed promptem uzytkownika — zamiast `[user]` request zawiera `[system, user]`.
+Pusty / bialy string jest ignorowany (dotychczasowe zachowanie), a system prompt jest
+przycinany do 8192 znakow. Dotyczy zarowno `llm_generate`, jak i strumienia.
+
+### LLM streaming — `llm_generate_stream_start` / `llm_generate_stream_next` / `llm_generate_stream_cancel`
+
+Strumieniowe generowanie tekstu. `start` uruchamia pump-task konsumujacy router
+streaming (ta sama sciezka co `route_chat_completion_stream`, przez compliance
+`AiGatewayContext`) do kolejki per-strumien; addon odbiera PARTIE fragmentow.
+
+- `llm_generate_stream_start(prompt_ptr, prompt_len, model_ptr, model_len, options_ptr, options_len) -> i32`
+  — zwraca `callback_id > 0` albo ujemny kod bledu (`-1` brak `llm`, `-4`
+  rate-limit, `-11` przekroczona kwota rownoleglych strumieni). `options` to JSON
+  `{temperature, max_tokens, top_p, system}` (`system` — patrz wyzej).
+- `llm_generate_stream_next(in_ptr, in_len, out_ptr, out_cap, out_len_ptr) -> i32`
+  — wejscie CBOR `LlmStreamNextInput {callback_id, timeout_ms}` (timeout clampowany
+  do 30 s, dotyczy PIERWSZEGO fragmentu partii), wyjscie CBOR `LlmStreamNextOutput
+  {chunks: [tekst...], finished: bool, finish_reason?, error?}`. Batch: jeden call
+  zwraca WSZYSTKO co czeka w kolejce (nie 1 token). Pusta partia + `finished=false`
+  = timeout, polluj dalej. Po `finished=true` `callback_id` jest niewazny.
+  Uprawnienie `llm` jest rewalidowane przy KAZDYM `next` (cofniecie w trakcie
+  blokuje kolejne pobrania).
+- `llm_generate_stream_cancel(callback_id) -> i32` — anuluje strumien, zwalnia slot
+  i ubija pump-task (drop strumienia backendu anuluje generacje).
+
+**Limity / zywotnosc:** max 4 rownolegle strumienie per addon; strumien bez `next`
+przez 60 s jest anulowany (background-sweeper hosta + best-effort `Drop` w SDK);
+strumienie addonu sa sprzatane przy unload instancji.
+
+## 8a. STT API
+
+Transkrypcja audio przez skonfigurowana sciezke STT (ta sama co node `stt`
+flow engine: `FlowDispatcher` → `SttDispatcher` → `executor.execute_stt`).
+
+**Wymagane uprawnienie:** `stt`
+
+### `stt_transcribe_v1(in_ptr, in_len, out_ptr, out_cap, out_len_ptr) -> i32`
+
+Transkrybuje pojedyncze audio inline.
+
+| Pole wejscia (CBOR `SttTranscribeInput`) | Typ | Opis |
+|------------------------------------------|-----|------|
+| `audio` | `bytes` | Bajty audio (WAV/Opus/MP3...), max 25 MiB (`PayloadKind::AudioInline`) |
+| `mime` | `tstr` | Typ MIME (np. `audio/wav`) — okresla rozszerzenie pliku dla backendu |
+| `sample_rate` | `u32?` | Informacyjnie |
+| `model` | `tstr?` | Pusty/brak = domyslny lokalny silnik (whisper) |
+| `language` | `tstr?` | ISO-639-1 (np. `pl`), pomija auto-detekcje |
+| `prompt` | `tstr?` | Kontekst dla modelu |
+
+**Wyjscie** (CBOR `SttTranscribeOutput`): `{text, detected_language?, duration_ms?}`.
+
+**Zwraca:** `AbiError` (0 = OK). `PayloadTooLarge` gdy audio > 25 MiB (SDK
+sprawdza limit PRZED alokacja/serializacja). `Permission` bez uprawnienia `stt`.
+
+**SDK (Rust):** `stt_transcribe(audio, mime, &SttTranscribeOptions { sample_rate,
+model, language, prompt })`.
+
 ---
 
 ## 9. Network API (proxy TCP/UDP)

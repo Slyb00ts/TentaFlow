@@ -2250,6 +2250,10 @@ impl AddonManager {
             }
         }
 
+        // Anuluj aktywne strumienie LLM addonu — pump-taski sa abortowane, a
+        // porzucone strumienie backendu przerywaja generacje.
+        host_functions::llm::cleanup_addon_streams(&addon_id);
+
         // Lifecycle on_stop (export name from language adapter)
         let stop_export = addon_instance.language_adapter.export_on_stop();
         if let Some(on_stop) = addon_instance

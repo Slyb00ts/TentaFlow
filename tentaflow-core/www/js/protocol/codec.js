@@ -2951,6 +2951,7 @@ export const encode = {
       String(payload.mime ?? ''),
       Number(payload.seq ?? 0),
       Number(payload.totalChunks ?? payload.total_chunks ?? 0),
+      String(payload.source ?? ''),
       bytes,
     );
     return _wasm.encodeEnvelopeDirect(

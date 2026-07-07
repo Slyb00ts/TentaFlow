@@ -71,6 +71,7 @@ pub use message_body::{
     AddonDocumentPayload,
     AddonDocumentUploadChunkRequest,
     AddonDocumentUploadChunkResponse,
+    UPLOAD_SOURCE_AUDIO_CAPTURE,
     AddonInfo,
     AddonInstallRequest,
     AddonInstallResponse,
