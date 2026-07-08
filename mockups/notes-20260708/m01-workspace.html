@@ -1,0 +1,96 @@
+<!-- =============================================================================
+     Plik: m01-workspace.html
+     Opis: Główny widok addona Notes: lista notatek, edytor i panel AI/grafu.
+     Przykład: otwórz plik w przeglądarce.
+     ============================================================================= -->
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TentaFlow Notes — Workspace</title>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="shared.css">
+  <style>
+    .workspace { padding: 18px 22px 22px; display: grid; grid-template-columns: 330px minmax(0, 1fr) 360px; gap: 14px; }
+    .note-list { display: grid; gap: 8px; padding: 12px; }
+    .note-item { padding: 12px; border: 1px solid var(--border); background: var(--card); border-radius: var(--radius); }
+    .note-item.active { border-color: rgba(99,102,241,.62); box-shadow: 0 0 0 1px rgba(99,102,241,.25) inset; }
+    .note-item h3 { margin: 0 0 7px; font-size: 14px; }
+    .note-meta { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 9px; }
+    .editor { min-height: 690px; display: flex; flex-direction: column; }
+    .editor-title { padding: 18px 20px 10px; }
+    .editor-title h2 { margin: 0; font-size: 28px; letter-spacing: 0; }
+    .editor-tools { padding: 0 20px 14px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .body { flex: 1; padding: 18px 22px; color: var(--text-2); font-size: 15px; line-height: 1.75; border-top: 1px solid var(--border); }
+    .body h3 { color: var(--text); margin: 18px 0 7px; }
+    .mention { color: var(--cyan); background: rgba(34,211,238,.08); border-bottom: 1px solid rgba(34,211,238,.55); }
+    .auto-link { color: var(--accent-2); background: rgba(167,139,250,.10); border-radius: 4px; padding: 0 4px; }
+    .composer { border-top: 1px solid var(--border); padding: 12px; display: flex; gap: 8px; }
+    .composer textarea { flex: 1; min-height: 54px; resize: none; border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); background: var(--input); padding: 10px 12px; outline: none; }
+    .side-panel { display: grid; gap: 14px; align-content: start; }
+    .mini-graph { height: 230px; position: relative; overflow: hidden; }
+    .node { position: absolute; width: 82px; height: 36px; border: 1px solid rgba(167,139,250,.55); background: rgba(99,102,241,.16); border-radius: 18px; display: grid; place-items: center; font-size: 11px; font-weight: 800; }
+    .node.n1 { left: 34px; top: 42px; }
+    .node.n2 { left: 180px; top: 28px; border-color: rgba(34,211,238,.55); background: rgba(34,211,238,.12); }
+    .node.n3 { left: 132px; top: 145px; border-color: rgba(34,197,94,.55); background: rgba(34,197,94,.10); }
+    .edge { position: absolute; height: 2px; background: linear-gradient(90deg, rgba(167,139,250,.8), rgba(34,211,238,.55)); transform-origin: left center; }
+    .edge.e1 { width: 120px; left: 105px; top: 64px; transform: rotate(-5deg); }
+    .edge.e2 { width: 112px; left: 93px; top: 81px; transform: rotate(38deg); }
+    .edge.e3 { width: 86px; left: 190px; top: 73px; transform: rotate(108deg); }
+    .fact { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+    @media (max-width: 1180px) { .workspace { grid-template-columns: 1fr; } .editor { min-height: 520px; } }
+  </style>
+</head>
+<body>
+  <section class="screen">
+    <div class="screen-head">
+      <div><h1>Notes — workspace</h1><p>Widok roboczy zbliżony rytmem do Chatu: lewa lista, środek jako szybki edytor, prawa kolumna jako kontekst AI, graf i uprawnienia.</p></div>
+      <span class="pill blue">mockup 01</span>
+    </div>
+    <div class="frame">
+      <div class="app">
+        <aside class="side">
+          <div class="brand"><div class="mark">N</div><div><b>Notes</b><span>Knowledge graph</span></div></div>
+          <div><div class="nav-title">Widoki</div><div class="nav-item active">Inbox <span class="badge">18</span></div><div class="nav-item">Mój graf</div><div class="nav-item">Organizacja</div><div class="nav-item">Udostępnione</div></div>
+          <div><div class="nav-title">Zakres</div><div class="nav-item">Prywatne</div><div class="nav-item">Grupy</div><div class="nav-item">Organizacja</div></div>
+        </aside>
+        <main class="main">
+          <div class="topbar">
+            <div class="crumb"><strong>Notes</strong> / Inbox / Strategia Q3</div>
+            <div class="search">⌘K Szukaj semantycznie lub po grafie</div>
+            <button class="btn">Dyktuj</button>
+            <button class="btn primary">Nowa notatka</button>
+          </div>
+          <div class="workspace">
+            <section class="panel fade-in">
+              <div class="panel-head"><h2>Notatki</h2><span class="muted small">sort: ostatnie</span></div>
+              <div class="note-list">
+                <article class="note-item active"><h3>Strategia Q3 — inference edge</h3><p class="small muted">Automatycznie połączono z 12 notatkami i 4 faktami RAG.</p><div class="note-meta"><span class="pill private">tylko ja</span><span class="pill blue">AI 0.91</span></div></article>
+                <article class="note-item"><h3>Spotkanie: model metrics</h3><p class="small muted">Udostępnione grupie ML Platform.</p><div class="note-meta"><span class="pill green">grupa</span><span class="pill">6 linków</span></div></article>
+                <article class="note-item"><h3>Plan benchmarków GPU</h3><p class="small muted">Widoczne dla organizacji, bez prywatnych źródeł.</p><div class="note-meta"><span class="pill yellow">org</span><span class="pill">graf</span></div></article>
+              </div>
+            </section>
+            <section class="panel editor fade-in">
+              <div class="editor-title"><h2>Strategia Q3 — inference edge</h2><div class="row muted small">Krystian · dziś 13:42 · auto-save 2 s temu</div></div>
+              <div class="editor-tools"><span class="pill private">Prywatna</span><span class="pill blue">12 zależności</span><span class="pill green">embedding aktualny</span><span class="pill">wersja 8</span></div>
+              <div class="body">
+                <p>Główna teza: <span class="mention">TentaFlow Edge</span> powinien umieć przełączać lokalne modele zależnie od kosztu, opóźnienia i prywatności danych.</p>
+                <h3>Automatyczne zależności</h3>
+                <p>System wykrył podobieństwo do <span class="auto-link">Plan benchmarków GPU</span>, <span class="auto-link">Model metrics</span> i <span class="auto-link">RAG GraphRAG</span>. Połączenia są prywatne, bo ta notatka nie jest udostępniona.</p>
+                <h3>Decyzje</h3>
+                <p>Wyszukiwanie powinno łączyć BM25, embeddingi, PPR po grafie i filtr ACL przed rankingiem końcowym.</p>
+              </div>
+              <div class="composer"><textarea>Dodaj akapit, wklej obraz albo dyktuj...</textarea><button class="btn">OCR</button><button class="btn primary">Zapisz</button></div>
+            </section>
+            <aside class="side-panel fade-in">
+              <section class="panel"><div class="panel-head"><h3>Graf lokalny</h3><span class="pill private">ACL</span></div><div class="mini-graph"><div class="edge e1"></div><div class="edge e2"></div><div class="edge e3"></div><div class="node n1 pulse">Ta notatka</div><div class="node n2">GPU plan</div><div class="node n3">RAG</div></div></section>
+              <section class="panel"><div class="panel-head"><h3>AI context</h3><span class="muted small">bez wycieku prywatnych danych</span></div><div class="fact">3 mocne podobieństwa semantyczne</div><div class="fact">2 relacje przyczynowe</div><div class="fact">1 konflikt nazewnictwa: „edge node”</div></section>
+            </aside>
+          </div>
+        </main>
+      </div>
+    </div>
+  </section>
+</body>
+</html>

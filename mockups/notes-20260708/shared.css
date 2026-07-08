@@ -1,0 +1,93 @@
+/* =============================================================================
+   Plik: shared.css
+   Opis: Wspólne style statycznych mockupów addona Notes.
+   Przykład: <link rel="stylesheet" href="shared.css">
+   ============================================================================= */
+
+:root {
+  color-scheme: dark;
+  --bg: #050818;
+  --bg-2: #0a0d24;
+  --bg-3: #111535;
+  --card: #141836;
+  --card-2: #181d42;
+  --input: #0b0e22;
+  --border: #22284d;
+  --border-2: #343b6d;
+  --text: #edf0ff;
+  --text-2: #a8b0ce;
+  --text-3: #6f779b;
+  --accent: #6366f1;
+  --accent-2: #a78bfa;
+  --cyan: #22d3ee;
+  --green: #22c55e;
+  --yellow: #f59e0b;
+  --red: #ef4444;
+  --blue: #60a5fa;
+  --radius: 8px;
+  --shadow: 0 18px 56px rgba(0, 0, 0, 0.58);
+  --gradient: linear-gradient(135deg, #6366f1 0%, #22d3ee 100%);
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: Manrope, Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+button, input, textarea, select { font: inherit; }
+.icon { width: 16px; height: 16px; stroke: currentColor; stroke-width: 1.8; fill: none; stroke-linecap: round; stroke-linejoin: round; flex: 0 0 auto; }
+.screen { max-width: 1480px; margin: 32px auto; padding: 0 24px; }
+.screen-head { display: flex; justify-content: space-between; gap: 18px; margin-bottom: 14px; }
+.screen-head h1 { margin: 0; font-size: 24px; letter-spacing: 0; }
+.screen-head p { margin: 4px 0 0; color: var(--text-2); max-width: 820px; }
+.frame { border: 1px solid var(--border); border-radius: 12px; overflow: hidden; box-shadow: var(--shadow); background: var(--bg); }
+.app { min-height: 820px; display: grid; grid-template-columns: 248px minmax(0, 1fr); }
+.side { background: var(--bg-2); border-right: 1px solid var(--border); padding: 14px 12px; display: flex; flex-direction: column; gap: 14px; }
+.brand { display: flex; align-items: center; gap: 10px; padding: 6px 4px 10px; border-bottom: 1px solid var(--border); }
+.mark { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; background: var(--gradient); color: white; font-weight: 800; }
+.brand b { display: block; font-size: 14px; }
+.brand span { color: var(--text-3); font-size: 11px; }
+.nav-title { margin: 8px 8px 4px; color: var(--accent-2); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .12em; }
+.nav-item { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border-radius: var(--radius); color: var(--text-2); }
+.nav-item.active { background: rgba(99, 102, 241, .18); color: var(--text); border-left: 3px solid var(--accent); padding-left: 7px; }
+.badge { margin-left: auto; color: var(--accent-2); background: rgba(167, 139, 250, .13); border: 1px solid rgba(167, 139, 250, .22); border-radius: 999px; padding: 1px 7px; font-size: 10px; font-weight: 800; }
+.main { min-width: 0; background: radial-gradient(circle at 70% 0%, rgba(34, 211, 238, .06), transparent 32%), var(--bg); }
+.topbar { height: 64px; display: flex; align-items: center; gap: 14px; padding: 0 22px; border-bottom: 1px solid var(--border); background: rgba(10, 13, 36, .86); }
+.crumb { color: var(--text-3); font-size: 12px; }
+.crumb strong { color: var(--text); }
+.search { display: flex; align-items: center; gap: 8px; min-width: 280px; margin-left: auto; padding: 8px 11px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--input); color: var(--text-3); }
+.btn { border: 1px solid var(--border); background: var(--bg-3); color: var(--text-2); border-radius: var(--radius); padding: 8px 12px; display: inline-flex; align-items: center; gap: 7px; cursor: default; }
+.btn.primary { background: var(--gradient); border-color: transparent; color: white; font-weight: 800; }
+.btn.ghost { background: transparent; }
+.pill { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); background: var(--bg-3); border-radius: 999px; color: var(--text-2); padding: 4px 9px; font-size: 11px; font-weight: 800; }
+.pill.green { color: var(--green); border-color: rgba(34,197,94,.32); background: rgba(34,197,94,.08); }
+.pill.yellow { color: var(--yellow); border-color: rgba(245,158,11,.32); background: rgba(245,158,11,.08); }
+.pill.blue { color: var(--blue); border-color: rgba(96,165,250,.32); background: rgba(96,165,250,.08); }
+.pill.private { color: var(--red); border-color: rgba(239,68,68,.32); background: rgba(239,68,68,.08); }
+.panel { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); }
+.panel-head { padding: 13px 15px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.panel-head h2, .panel-head h3 { margin: 0; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--accent-2); }
+.muted { color: var(--text-3); }
+.small { font-size: 12px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.avatar { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; background: var(--gradient); color: white; font-size: 11px; font-weight: 800; }
+.row { display: flex; align-items: center; gap: 10px; }
+.kpi-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.kpi { padding: 14px; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); }
+.kpi b { display: block; font-size: 20px; margin-top: 6px; }
+.fade-in { animation: fadeIn .36s cubic-bezier(.2,.8,.2,1) both; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+.pulse { animation: pulse 2s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(99,102,241,.42); } 60% { box-shadow: 0 0 0 8px rgba(99,102,241,0); } }
+
+@media (max-width: 980px) {
+  .app { grid-template-columns: 1fr; }
+  .side { display: none; }
+  .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .screen { padding: 0 12px; }
+}

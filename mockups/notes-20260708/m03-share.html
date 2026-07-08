@@ -1,0 +1,59 @@
+<!-- =============================================================================
+     Plik: m03-share.html
+     Opis: Modal wyboru adresatów i zakresu widoczności notatki.
+     Przykład: otwórz plik w przeglądarce.
+     ============================================================================= -->
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TentaFlow Notes — Share</title>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="shared.css">
+  <style>
+    .blurred { filter: blur(5px) saturate(.75); opacity: .45; }
+    .overlay { position: fixed; inset: 0; display: grid; place-items: center; background: rgba(5,8,24,.62); padding: 24px; }
+    .modal { width: min(980px, 100%); background: var(--bg-2); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); overflow: hidden; animation: fadeIn .34s cubic-bezier(.2,.8,.2,1) both; }
+    .modal-body { display: grid; grid-template-columns: 1fr 320px; gap: 0; }
+    .left { padding: 18px; border-right: 1px solid var(--border); }
+    .right { padding: 18px; background: rgba(17,21,53,.62); }
+    .scope-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 12px 0 18px; }
+    .scope { padding: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--card); }
+    .scope.active { border-color: rgba(99,102,241,.7); background: rgba(99,102,241,.16); }
+    .picker { border: 1px solid var(--border); border-radius: var(--radius); background: var(--input); padding: 10px; display: flex; gap: 8px; flex-wrap: wrap; min-height: 48px; }
+    .person { padding: 10px 0; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); }
+    .footer { padding: 14px 18px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 10px; }
+  </style>
+</head>
+<body>
+  <section class="screen blurred"><div class="frame"><div class="app"><aside class="side"><div class="brand"><div class="mark">N</div><div><b>Notes</b><span>Workspace</span></div></div></aside><main class="main"><div class="topbar"><div class="crumb"><strong>Notes</strong> / Strategia Q3</div></div><div style="padding:24px"><div class="panel" style="height:640px"></div></div></main></div></div></section>
+  <div class="overlay">
+    <section class="modal">
+      <div class="panel-head"><h2>Udostępnij notatkę</h2><span class="pill private">zmiana ACL wpływa na graf</span></div>
+      <div class="modal-body">
+        <div class="left">
+          <p class="muted">Autor wybiera, czy notatka jest prywatna, dla konkretnych osób, grupy, roli albo całej organizacji. Graf i wyszukiwarka przeliczą tylko dozwolone krawędzie.</p>
+          <div class="scope-grid">
+            <div class="scope"><span class="pill private">Prywatna</span><p class="small muted">Widoczna tylko dla autora.</p></div>
+            <div class="scope active"><span class="pill green">Wybrane osoby/grupy</span><p class="small muted">Najlepsze dla pracy zespołowej.</p></div>
+            <div class="scope"><span class="pill yellow">Organizacja</span><p class="small muted">Dostęp dla całej organizacji.</p></div>
+          </div>
+          <h3>Adresaci</h3>
+          <div class="picker"><span class="pill blue">Anna Kowalska</span><span class="pill green">ML Platform</span><span class="pill yellow">rola: org_operator</span></div>
+          <div class="person"><div class="avatar">AK</div><div><b>Anna Kowalska</b><div class="small muted">user · Sales</div></div><span class="pill green">read</span></div>
+          <div class="person"><div class="avatar">ML</div><div><b>ML Platform</b><div class="small muted">group · 8 osób</div></div><span class="pill green">read/write</span></div>
+          <div class="person"><div class="avatar">OP</div><div><b>org_operator</b><div class="small muted">role · 11 osób</div></div><span class="pill blue">read</span></div>
+        </div>
+        <aside class="right">
+          <h3>Skutek dla grafu</h3>
+          <p class="small muted">Po zapisaniu powstaną publiczne krawędzie tylko do notatek, które mają wspólny widoczny zakres z tą notatką.</p>
+          <div class="kpi-grid" style="grid-template-columns:1fr 1fr;margin-top:14px"><div class="kpi"><span class="muted small">Nowe krawędzie</span><b>7</b></div><div class="kpi"><span class="muted small">Ukryte</span><b>3</b></div></div>
+          <p class="small muted">Prywatne źródła autora nie zostaną dołączone do grafu grupy. Zostaną tylko w prywatnym indeksie autora.</p>
+        </aside>
+      </div>
+      <div class="footer"><button class="btn">Anuluj</button><button class="btn primary">Zapisz dostęp</button></div>
+    </section>
+  </div>
+</body>
+</html>

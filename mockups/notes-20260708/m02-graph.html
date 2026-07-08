@@ -1,0 +1,66 @@
+<!-- =============================================================================
+     Plik: m02-graph.html
+     Opis: Widok grafu Notes z filtrem ACL i zależnościami automatycznymi.
+     Przykład: otwórz plik w przeglądarce.
+     ============================================================================= -->
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TentaFlow Notes — Graph</title>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="shared.css">
+  <style>
+    .graph-layout { display: grid; grid-template-columns: 1fr 340px; gap: 14px; padding: 18px 22px 22px; }
+    .canvas { height: 700px; position: relative; overflow: hidden; background: radial-gradient(circle at 50% 42%, rgba(99,102,241,.12), transparent 38%), var(--bg-2); }
+    .g-node { position: absolute; border-radius: 50%; display: grid; place-items: center; text-align: center; border: 1px solid var(--border-2); background: var(--card); box-shadow: 0 0 30px rgba(99,102,241,.12); font-size: 11px; font-weight: 800; }
+    .g-node.big { width: 112px; height: 112px; left: 48%; top: 42%; background: rgba(99,102,241,.22); border-color: rgba(167,139,250,.7); }
+    .g-node.a { width: 84px; height: 84px; left: 28%; top: 20%; }
+    .g-node.b { width: 76px; height: 76px; left: 68%; top: 22%; background: rgba(34,211,238,.14); }
+    .g-node.c { width: 92px; height: 92px; left: 22%; top: 58%; background: rgba(34,197,94,.10); }
+    .g-node.d { width: 68px; height: 68px; left: 72%; top: 61%; background: rgba(245,158,11,.10); }
+    .g-node.locked { opacity: .38; filter: grayscale(.4); border-style: dashed; }
+    .g-edge { position: absolute; height: 2px; transform-origin: left center; background: linear-gradient(90deg, rgba(167,139,250,.62), rgba(34,211,238,.48)); }
+    .g-edge.e1 { width: 235px; left: 34%; top: 30%; transform: rotate(29deg); }
+    .g-edge.e2 { width: 190px; left: 56%; top: 33%; transform: rotate(139deg); }
+    .g-edge.e3 { width: 250px; left: 32%; top: 65%; transform: rotate(-31deg); }
+    .g-edge.e4 { width: 205px; left: 58%; top: 59%; transform: rotate(28deg); opacity: .35; border-top: 1px dashed var(--yellow); background: transparent; }
+    .legend { display: flex; gap: 8px; flex-wrap: wrap; padding: 12px; border-bottom: 1px solid var(--border); }
+    .detail-list { padding: 12px; display: grid; gap: 10px; }
+    .detail { padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--card); }
+  </style>
+</head>
+<body>
+  <section class="screen">
+    <div class="screen-head">
+      <div><h1>Notes — graph explorer</h1><p>Graf pokazuje tylko krawędzie dozwolone w aktualnym kontekście ACL. Prywatne notatki nie tworzą widocznych zależności dla innych użytkowników.</p></div>
+      <span class="pill blue">mockup 02</span>
+    </div>
+    <div class="frame">
+      <div class="app">
+        <aside class="side"><div class="brand"><div class="mark">N</div><div><b>Notes</b><span>Graph ACL</span></div></div><div class="nav-item">Workspace</div><div class="nav-item active">Graf globalny</div><div class="nav-item">Konflikty encji <span class="badge">3</span></div><div class="nav-item">Indeks</div></aside>
+        <main class="main">
+          <div class="topbar"><div class="crumb"><strong>Notes</strong> / Graf / Zakres: grupa ML Platform</div><div class="search">Filtruj: entity, note, tag, owner</div><button class="btn">Depth 2</button><button class="btn primary">Uruchom PPR</button></div>
+          <div class="graph-layout">
+            <section class="panel canvas fade-in">
+              <div class="legend"><span class="pill private">prywatne ukryte</span><span class="pill green">grupa ML Platform</span><span class="pill yellow">org</span><span class="pill blue">auto-link ≥ 0.82</span></div>
+              <div class="g-edge e1"></div><div class="g-edge e2"></div><div class="g-edge e3"></div><div class="g-edge e4"></div>
+              <div class="g-node big pulse">Inference edge</div><div class="g-node a">GPU benchmark</div><div class="g-node b">Model metrics</div><div class="g-node c">GraphRAG</div><div class="g-node d locked">Private note</div>
+            </section>
+            <aside class="panel fade-in">
+              <div class="panel-head"><h3>Wybrany node</h3><span class="pill green">visible</span></div>
+              <div class="detail-list">
+                <div class="detail"><b>Inference edge</b><p class="small muted">note: 38f2... · owner: Krystian · scope: group</p></div>
+                <div class="detail"><b>Top relacje</b><p class="small muted">references, contradicts, extends, same_entity, derived_from_audio</p></div>
+                <div class="detail"><b>Ranking</b><p class="small muted">PageRank 0.084 · PPR 0.71 · semantic 0.89 · recency 0.63</p></div>
+                <div class="detail"><b>ACL</b><p class="small muted">3 krawędzie pokazane, 1 krawędź ukryta, 2 prywatne źródła wykluczone przed rankingiem.</p></div>
+              </div>
+            </aside>
+          </div>
+        </main>
+      </div>
+    </div>
+  </section>
+</body>
+</html>
