@@ -140,6 +140,14 @@ pub struct SnapshotData {
     /// input. `None` only before the first frame lands. Consumed by the vision
     /// analysis loop's detect stage; the UI snapshot path ignores it.
     pub detect: Option<DetectFrame>,
+    /// Zero-copy CROPS path ONLY: a DEVICE reference to the latest NV12 surface
+    /// (see [`super::fakefile::DeviceCropsFrame`]). When `Some`, the analysis loop
+    /// reads it directly to cut per-detection crops off the GPU (only the small
+    /// crop is downloaded). The UI snapshot path instead calls [`Self::rgb_data`],
+    /// which materializes host RGB on demand. `None` on every other path (the
+    /// mailbox already held host bytes). Rides the same round-trip as the crops
+    /// frame.
+    pub crops_device: Option<super::fakefile::DeviceCropsFrame>,
 }
 
 impl SnapshotData {
@@ -150,14 +158,35 @@ impl SnapshotData {
     pub fn rgb_data(&self) -> std::borrow::Cow<'_, [u8]> {
         match self.crops_format {
             DetectFrameFormat::Rgb24 => std::borrow::Cow::Borrowed(&self.data),
-            DetectFrameFormat::Nv12 { .. } => super::fakefile::nv12_frame_to_rgb24(
-                &self.data,
-                self.width,
-                self.height,
-                &self.crops_format,
-            )
-            .map(std::borrow::Cow::Owned)
-            .unwrap_or(std::borrow::Cow::Borrowed(&self.data)),
+            DetectFrameFormat::Nv12 { .. } => {
+                // Zero-copy crops: `data` is empty (the frame was never downloaded
+                // per-frame). Download the FULL NV12 ON DEMAND here — this is the
+                // only place a snapshot actually needs the whole frame — then
+                // convert to RGB. The analysis path never calls `rgb_data`; it
+                // reads `crops_device` directly for small per-crop downloads.
+                if self.data.is_empty() {
+                    if let Some(dev) = &self.crops_device {
+                        if let Some((nv12, fmt)) = dev.download_full_nv12() {
+                            if let Some(rgb) = super::fakefile::nv12_frame_to_rgb24(
+                                &nv12,
+                                self.width,
+                                self.height,
+                                &fmt,
+                            ) {
+                                return std::borrow::Cow::Owned(rgb);
+                            }
+                        }
+                    }
+                }
+                super::fakefile::nv12_frame_to_rgb24(
+                    &self.data,
+                    self.width,
+                    self.height,
+                    &self.crops_format,
+                )
+                .map(std::borrow::Cow::Owned)
+                .unwrap_or(std::borrow::Cow::Borrowed(&self.data))
+            }
         }
     }
 }
@@ -588,6 +617,12 @@ async fn run_session(
                                     data: f.data.to_vec(),
                                     crops_format: f.format,
                                     detect: mailbox.get_detect(),
+                                    // Zero-copy crops: pass the device handle
+                                    // through WITHOUT downloading — the analysis
+                                    // loop crops per-detection off it; `rgb_data`
+                                    // downloads the full frame only on a UI
+                                    // snapshot. `None` on every other path.
+                                    crops_device: f.device.clone(),
                                 });
                             }
                             let h = health_tx.borrow().clone();

@@ -158,7 +158,17 @@ pub struct RtspPipelineHandles {
     /// GPU-resident NVDEC path — the attach point for the on-demand RGB branch
     /// (Stage 3). `None` on every other path (crops are already RGB, so no
     /// on-demand convert is needed).
+    ///
+    /// On the zero-copy CROPS path this is instead the CUDA-memory tee
+    /// (`tee_cuda`, BEFORE `cudadownload`): the on-demand RGB branch then carries
+    /// its OWN `cudadownload` so the 4K download runs ONLY while a viewer watches.
+    /// [`RtspPipelineHandles::decode_tee_is_cuda`] tells the two apart.
     pub decode_tee: Option<gst::Element>,
+    /// `true` when `decode_tee` is the CUDA-memory tee (zero-copy crops): the
+    /// on-demand RGB attach must insert `cudadownload` itself
+    /// ([`attach_rgb_branch_cuda`]) rather than start from host NV12
+    /// ([`attach_rgb_branch`]).
+    pub decode_tee_is_cuda: bool,
 }
 
 /// Którą ścieżką dekodowania budujemy pipeline dla bieżącej próby. `Cpu` to
@@ -709,6 +719,90 @@ pub(super) fn attach_detect_branch_cuda(
     Ok(())
 }
 
+/// Zero-copy CROPS appsink: consumes NVDEC output IN DEVICE MEMORY
+/// (`video/x-raw(memory:CUDAMemory), NV12`) off `tee_cuda` — no `cudadownload` on
+/// the per-frame path. The callback ([`install_frame_callback_crops_cuda`]) maps
+/// the CUDA surface and stores a device reference in the mailbox (host-download
+/// fallback per frame on map failure). Only built with the GPU inference features.
+#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+pub(super) fn build_appsink_crops_cuda(
+    camera_id: String,
+    mailbox: Arc<FrameMailbox>,
+    counters: Arc<FrameCounters>,
+) -> Result<gst::Element> {
+    let appsink = gst::ElementFactory::make("appsink")
+        .property("name", "sink")
+        .property("emit-signals", false)
+        .property("sync", false)
+        .property("max-buffers", 1u32)
+        .property("drop", true)
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("appsink crops cuda: {e}")))?;
+    let appsink_app = appsink
+        .clone()
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_| CameraIngestError::PipelineBuild("appsink crops cuda downcast failed".into()))?;
+    super::fakefile::install_frame_callback_crops_cuda(&appsink_app, camera_id, mailbox, counters);
+    Ok(appsink)
+}
+
+/// Attaches the zero-copy CROPS branch to the CUDA-memory `tee` (`tee_cuda`),
+/// BEFORE `cudadownload`, so the decoder's device NV12 never touches the CPU on
+/// the crops path:
+///
+///   tee_cuda → queue(max-buffers=1, leaky) → capsfilter(CUDAMemory, NV12)
+///     → appsink_crops_cuda
+///
+/// The queue caps at ONE buffer (leaky downstream) so the branch pins at most one
+/// extra decode surface (plus the mailbox's latest) — never starving the pool.
+/// Built before Playing (no `sync_state_with_parent`).
+#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+pub(super) fn attach_crops_branch_cuda(
+    pipeline: &gst::Pipeline,
+    tee: &gst::Element,
+    camera_id: String,
+    mailbox: Arc<FrameMailbox>,
+    counters: Arc<FrameCounters>,
+) -> Result<()> {
+    // Minimal-pinning queue: a single device buffer, dropped when superseded, so
+    // this branch never holds more than one NVDEC surface.
+    let queue = gst::ElementFactory::make("queue")
+        .property("name", "queue_crops_cuda")
+        .property("max-size-buffers", 1u32)
+        .property("max-size-bytes", 0u32)
+        .property("max-size-time", 0u64)
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("queue_crops_cuda: {e}")))?;
+    queue.set_property_from_str("leaky", "downstream");
+    let caps = gst::Caps::builder("video/x-raw")
+        .features(["memory:CUDAMemory"])
+        .field("format", "NV12")
+        .build();
+    let capsfilter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &caps)
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("capsfilter crops cuda: {e}")))?;
+    let appsink = build_appsink_crops_cuda(camera_id, mailbox, counters)?;
+
+    pipeline
+        .add_many([&queue, &capsfilter, &appsink])
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many crops cuda: {e}")))?;
+
+    let tee_src = tee.request_pad_simple("src_%u").ok_or_else(|| {
+        CameraIngestError::PipelineBuild("tee_cuda src_%u (crops) request failed".into())
+    })?;
+    let queue_sink = queue.static_pad("sink").ok_or_else(|| {
+        CameraIngestError::PipelineBuild("queue_crops_cuda sink pad missing".into())
+    })?;
+    tee_src
+        .link(&queue_sink)
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("tee_cuda → queue_crops_cuda: {e:?}")))?;
+    gst::Element::link_many([&queue, &capsfilter, &appsink]).map_err(|e| {
+        CameraIngestError::PipelineBuild(format!("link_many crops cuda branch: {e}"))
+    })?;
+    Ok(())
+}
+
 /// Czy dobudować gałąź GPU-owego skalowania klatki detekcji. `true` gdy runtime
 /// ma komplet elementów CUDA (`cudaupload/cudaconvert/cudascale/cudadownload`)
 /// ORAZ operator nie wymusił ścieżki CPU przez `TENTAFLOW_VISION_GPU_RESIZE=0`.
@@ -880,6 +974,7 @@ fn build_rtsp_pipeline(
             gpu_resize,
             true,
             zerocopy_enabled(),
+            super::fakefile::zerocopy_crops_enabled(),
             mailbox,
             counters,
         ),
@@ -888,6 +983,7 @@ fn build_rtsp_pipeline(
             url,
             timeout_secs,
             gpu_resize,
+            false,
             false,
             false,
             mailbox,
@@ -1082,6 +1178,7 @@ fn build_rtsp_pipeline_cpu(
         pipeline,
         tee,
         decode_tee: None,
+        decode_tee_is_cuda: false,
     })
 }
 
@@ -1283,6 +1380,7 @@ fn build_rtsp_pipeline_gpu_resident(
         pipeline,
         tee,
         decode_tee: None,
+        decode_tee_is_cuda: false,
     })
 }
 
@@ -1316,6 +1414,7 @@ fn build_rtsp_pipeline_gpu_resident(
 /// (`videoconvert` NV12→RGB). `false` is the deployed NvdecCpuConvert path,
 /// byte-identical to before.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn build_rtsp_pipeline_nvdec(
     camera_id: String,
     url: &str,
@@ -1323,12 +1422,17 @@ fn build_rtsp_pipeline_nvdec(
     gpu_resize: bool,
     nv12_detect: bool,
     zerocopy: bool,
+    zerocopy_crops: bool,
     mailbox: Arc<FrameMailbox>,
     counters: Arc<FrameCounters>,
 ) -> Result<RtspPipelineHandles> {
     // Zero-copy detect is a sub-mode of the NV12 detect path (Stage 3). Without
     // `nv12_detect` there is no device NV12 detect branch to keep on the GPU.
     let zerocopy = zerocopy && nv12_detect;
+    // Zero-copy CROPS builds on zero-copy detect: the crops appsink reads DEVICE
+    // NV12 off `tee_cuda` (no per-frame `cudadownload`), so it requires the CUDA
+    // tee. Without `zerocopy` there is no `tee_cuda` to hang the crops on.
+    let zerocopy_crops = zerocopy_crops && zerocopy;
     let pipeline = gst::Pipeline::new();
     let rtspsrc = build_rtspsrc(url, timeout_secs)?;
     let (rtp_filter, tee, queue_a) = build_rtp_front()?;
@@ -1336,12 +1440,26 @@ fn build_rtsp_pipeline_nvdec(
     // Statyczny ogon branchu A. `cudadownload` to punkt wpięcia dekodera:
     // przenosi zdekodowaną klatkę z pamięci CUDA do pamięci hosta, a NV12→RGB
     // robi już `videoconvert` na CPU (brak cudaconvert w tym wariancie).
-    let cudadownload = gst::ElementFactory::make("cudadownload")
-        .build()
-        .map_err(|e| CameraIngestError::PipelineBuild(format!("cudadownload: {e}")))?;
+    //
+    // Zero-copy crops: NO always-on `cudadownload`/`queue_dec`/crops appsink here
+    // — the crops appsink reads DEVICE NV12 off `tee_cuda`, and the on-demand RGB
+    // display branch carries its own `cudadownload` (attached only while watched).
+    let cudadownload = if zerocopy_crops {
+        None
+    } else {
+        Some(
+            gst::ElementFactory::make("cudadownload")
+                .build()
+                .map_err(|e| CameraIngestError::PipelineBuild(format!("cudadownload: {e}")))?,
+        )
+    };
     // Kolejka leaky ZA dekoderem (po zejściu klatki do pamięci hosta) — jedyne
     // bezpieczne miejsce gubienia przy spiętrzeniu, patrz `build_raw_leaky_queue`.
-    let queue_dec = build_raw_leaky_queue("queue_decoded_a")?;
+    let queue_dec = if zerocopy_crops {
+        None
+    } else {
+        Some(build_raw_leaky_queue("queue_decoded_a")?)
+    };
     // Stage 3: on the GPU-resident NV12 path the crops appsink delivers RAW NV12
     // (no per-frame `videoconvert` — the full-4K NV12→RGB was ~90% of a core per
     // camera), and RGB is produced only on-demand by `attach_rgb_branch`. On the
@@ -1362,10 +1480,22 @@ fn build_rtsp_pipeline_nvdec(
             .map_err(|e| CameraIngestError::PipelineBuild(format!("capsfilter: {e}")))?;
         (Some(convert), Some(capsfilter))
     };
-    let appsink = if nv12_detect {
-        build_appsink_crops_nv12(camera_id, mailbox.clone(), counters)?
+    // Zero-copy crops: the crops appsink is built + attached off `tee_cuda` below
+    // (device NV12). Otherwise it sits on the always-on host tail here.
+    let appsink = if zerocopy_crops {
+        None
+    } else if nv12_detect {
+        Some(build_appsink_crops_nv12(
+            camera_id.clone(),
+            mailbox.clone(),
+            counters.clone(),
+        )?)
     } else {
-        build_appsink_crops(camera_id, mailbox.clone(), counters)?
+        Some(build_appsink_crops(
+            camera_id.clone(),
+            mailbox.clone(),
+            counters.clone(),
+        )?)
     };
 
     // Opcjonalny tee po `cudadownload` (surowe wideo w pamięci hosta) na gałąź
@@ -1376,7 +1506,9 @@ fn build_rtsp_pipeline_nvdec(
     //     `cudaconvert`/`cudascale`, których brak — inaczej byłby GPU-resident).
     // `nv12_detect` wygrywa nad `gpu_resize`: raw NV12 idzie prosto do detektora
     // (YUV→RGB + resize na GPU), więc RGB-560 tee jest zbędny.
-    let decode_tee = if nv12_detect || gpu_resize {
+    // Zero-copy crops has no post-`cudadownload` host tee — display attaches its
+    // own `cudadownload` off `tee_cuda` on demand.
+    let decode_tee = if !zerocopy_crops && (nv12_detect || gpu_resize) {
         Some(build_decode_tee("tee_decode")?)
     } else {
         None
@@ -1393,16 +1525,23 @@ fn build_rtsp_pipeline_nvdec(
     };
 
     pipeline
-        .add_many([
-            &rtspsrc,
-            &rtp_filter,
-            &tee,
-            &queue_a,
-            &cudadownload,
-            &queue_dec,
-            &appsink,
-        ])
+        .add_many([&rtspsrc, &rtp_filter, &tee, &queue_a])
         .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many nvdec: {e}")))?;
+    if let Some(cd) = &cudadownload {
+        pipeline
+            .add_many([cd])
+            .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many cudadownload: {e}")))?;
+    }
+    if let Some(qd) = &queue_dec {
+        pipeline
+            .add_many([qd])
+            .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many queue_dec: {e}")))?;
+    }
+    if let Some(a) = &appsink {
+        pipeline
+            .add_many([a])
+            .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many crops appsink: {e}")))?;
+    }
     if let Some(tc) = &tee_cuda {
         pipeline.add_many([tc]).map_err(|e| {
             CameraIngestError::PipelineBuild(format!("add_many tee_cuda nvdec: {e}"))
@@ -1437,65 +1576,101 @@ fn build_rtsp_pipeline_nvdec(
     tee_src_a
         .link(&queue_a_sink)
         .map_err(|e| CameraIngestError::PipelineBuild(format!("tee → queue_a: {e:?}")))?;
-    // Zero-copy: the decoder feeds `tee_cuda`; one src downloads to host (crops),
-    // one keeps device NV12 (detect). Link `tee_cuda → cudadownload` here so the
-    // host crops/on-demand-RGB tail below is unchanged.
+    // Zero-copy: the decoder feeds `tee_cuda`; one src keeps device NV12 (detect)
+    // and — on the zero-copy CROPS path — a second src also keeps device NV12 for
+    // the crops appsink (no per-frame `cudadownload`). Otherwise one src links to
+    // `cudadownload` so the host crops/on-demand-RGB tail below is unchanged.
     if let Some(tc) = &tee_cuda {
-        let tc_src = tc.request_pad_simple("src_%u").ok_or_else(|| {
-            CameraIngestError::PipelineBuild("tee_cuda src_%u (crops) request failed".into())
-        })?;
-        let cudl_sink = cudadownload.static_pad("sink").ok_or_else(|| {
-            CameraIngestError::PipelineBuild("cudadownload sink pad missing".into())
-        })?;
-        tc_src.link(&cudl_sink).map_err(|e| {
-            CameraIngestError::PipelineBuild(format!("tee_cuda → cudadownload: {e:?}"))
-        })?;
+        #[allow(unused_mut)]
+        let mut crops_on_cuda = false;
+        #[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+        {
+            if zerocopy_crops {
+                // Crops read DEVICE NV12 off the CUDA tee — the full-4K download is
+                // gone from the per-frame path (mailbox holds a device reference).
+                attach_crops_branch_cuda(
+                    &pipeline,
+                    tc,
+                    camera_id.clone(),
+                    mailbox.clone(),
+                    counters.clone(),
+                )?;
+                crops_on_cuda = true;
+            }
+        }
+        if !crops_on_cuda {
+            let cudadownload = cudadownload
+                .as_ref()
+                .ok_or_else(|| CameraIngestError::PipelineBuild("cudadownload missing".into()))?;
+            let tc_src = tc.request_pad_simple("src_%u").ok_or_else(|| {
+                CameraIngestError::PipelineBuild("tee_cuda src_%u (crops) request failed".into())
+            })?;
+            let cudl_sink = cudadownload.static_pad("sink").ok_or_else(|| {
+                CameraIngestError::PipelineBuild("cudadownload sink pad missing".into())
+            })?;
+            tc_src.link(&cudl_sink).map_err(|e| {
+                CameraIngestError::PipelineBuild(format!("tee_cuda → cudadownload: {e:?}"))
+            })?;
+        }
         // Device NV12 detect off the CUDA tee (no download for the detect branch).
         #[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
         attach_detect_branch_cuda(&pipeline, tc, mailbox.clone())?;
     }
-    // Ogon: cudadownload wprost do queue_dec (crops) albo przez tee_decode
-    // rozgałęziający na crops + detect.
-    if let Some(t) = &decode_tee {
-        gst::Element::link(&cudadownload, t).map_err(|e| {
-            CameraIngestError::PipelineBuild(format!("cudadownload → tee_decode: {e}"))
-        })?;
-        let tee_crops = t.request_pad_simple("src_%u").ok_or_else(|| {
-            CameraIngestError::PipelineBuild("tee_decode src_%u (crops) request failed".into())
-        })?;
-        let queue_dec_sink = queue_dec
-            .static_pad("sink")
-            .ok_or_else(|| CameraIngestError::PipelineBuild("queue_dec sink pad missing".into()))?;
-        tee_crops.link(&queue_dec_sink).map_err(|e| {
-            CameraIngestError::PipelineBuild(format!("tee_decode → queue_dec: {e:?}"))
-        })?;
-        // DETECT branch: on zero-copy the detect is already wired to `tee_cuda`
-        // (device NV12, above); otherwise it hangs off the host tee — raw NV12
-        // straight to the detector when `nv12_detect`, else the RGB-560 branch.
-        if zerocopy {
-            // Detect handled by the CUDA tee; host tee serves crops + RGB only.
-        } else if nv12_detect {
-            attach_detect_branch_nv12(&pipeline, t, mailbox.clone())?;
+    // Host crops/display tail (only when NOT zero-copy crops — otherwise crops are
+    // on the CUDA tee above and there is no always-on `cudadownload`).
+    if !zerocopy_crops {
+        let cudadownload = cudadownload
+            .as_ref()
+            .ok_or_else(|| CameraIngestError::PipelineBuild("cudadownload missing".into()))?;
+        let queue_dec = queue_dec
+            .as_ref()
+            .ok_or_else(|| CameraIngestError::PipelineBuild("queue_dec missing".into()))?;
+        let appsink = appsink
+            .as_ref()
+            .ok_or_else(|| CameraIngestError::PipelineBuild("crops appsink missing".into()))?;
+        // Ogon: cudadownload wprost do queue_dec (crops) albo przez tee_decode
+        // rozgałęziający na crops + detect.
+        if let Some(t) = &decode_tee {
+            gst::Element::link(cudadownload, t).map_err(|e| {
+                CameraIngestError::PipelineBuild(format!("cudadownload → tee_decode: {e}"))
+            })?;
+            let tee_crops = t.request_pad_simple("src_%u").ok_or_else(|| {
+                CameraIngestError::PipelineBuild("tee_decode src_%u (crops) request failed".into())
+            })?;
+            let queue_dec_sink = queue_dec.static_pad("sink").ok_or_else(|| {
+                CameraIngestError::PipelineBuild("queue_dec sink pad missing".into())
+            })?;
+            tee_crops.link(&queue_dec_sink).map_err(|e| {
+                CameraIngestError::PipelineBuild(format!("tee_decode → queue_dec: {e:?}"))
+            })?;
+            // DETECT branch: on zero-copy the detect is already wired to `tee_cuda`
+            // (device NV12, above); otherwise it hangs off the host tee — raw NV12
+            // straight to the detector when `nv12_detect`, else the RGB-560 branch.
+            if zerocopy {
+                // Detect handled by the CUDA tee; host tee serves crops + RGB only.
+            } else if nv12_detect {
+                attach_detect_branch_nv12(&pipeline, t, mailbox.clone())?;
+            } else {
+                attach_detect_branch(&pipeline, t, mailbox.clone())?;
+            }
         } else {
-            attach_detect_branch(&pipeline, t, mailbox.clone())?;
-        }
-    } else {
-        gst::Element::link(&cudadownload, &queue_dec).map_err(|e| {
-            CameraIngestError::PipelineBuild(format!("cudadownload → queue_dec: {e}"))
-        })?;
-    }
-    // NV12 crops tail: `queue_dec → appsink` (raw NV12, no convert). RGB crops
-    // tail: `queue_dec → videoconvert → capsfilter → appsink` (unchanged).
-    match (&convert, &capsfilter) {
-        (Some(convert), Some(capsfilter)) => {
-            gst::Element::link_many([&queue_dec, convert, capsfilter, &appsink]).map_err(|e| {
-                CameraIngestError::PipelineBuild(format!("link_many nvdec tail: {e}"))
+            gst::Element::link(cudadownload, queue_dec).map_err(|e| {
+                CameraIngestError::PipelineBuild(format!("cudadownload → queue_dec: {e}"))
             })?;
         }
-        _ => {
-            gst::Element::link(&queue_dec, &appsink).map_err(|e| {
-                CameraIngestError::PipelineBuild(format!("link nvdec nv12 tail: {e}"))
-            })?;
+        // NV12 crops tail: `queue_dec → appsink` (raw NV12, no convert). RGB crops
+        // tail: `queue_dec → videoconvert → capsfilter → appsink` (unchanged).
+        match (&convert, &capsfilter) {
+            (Some(convert), Some(capsfilter)) => {
+                gst::Element::link_many([queue_dec, convert, capsfilter, appsink]).map_err(|e| {
+                    CameraIngestError::PipelineBuild(format!("link_many nvdec tail: {e}"))
+                })?;
+            }
+            _ => {
+                gst::Element::link(queue_dec, appsink).map_err(|e| {
+                    CameraIngestError::PipelineBuild(format!("link nvdec nv12 tail: {e}"))
+                })?;
+            }
         }
     }
 
@@ -1507,9 +1682,13 @@ fn build_rtsp_pipeline_nvdec(
     // Decoder output goes into `tee_cuda` on the zero-copy path (device NV12 is
     // kept for detect; `cudadownload` sits downstream of the tee), else straight
     // into `cudadownload` (host download) as before.
-    let downstream_weak = match &tee_cuda {
-        Some(tc) => tc.downgrade(),
-        None => cudadownload.downgrade(),
+    let downstream_weak = match (&tee_cuda, &cudadownload) {
+        (Some(tc), _) => tc.downgrade(),
+        (None, Some(cd)) => cd.downgrade(),
+        // Unreachable: `tee_cuda` is None only when `!zerocopy_crops`, where
+        // `cudadownload` is always built. Fall back to the pipeline weak-ref shape
+        // by pointing at `tee` so the closure still type-checks.
+        (None, None) => tee.downgrade(),
     };
     let queue_a_src = queue_a
         .static_pad("src")
@@ -1561,14 +1740,24 @@ fn build_rtsp_pipeline_nvdec(
     // Front RTP identyczny jak w pozostałych wariantach.
     connect_rtspsrc_video_pad(&rtspsrc, &rtp_filter);
 
-    // Expose the decode tee only on the NV12 crops path — that is where the crops
-    // frame is NV12 and the on-demand RGB branch attaches (Stage 3). On the RGB
-    // crops path (gpu_resize / NvdecCpuConvert) no on-demand convert is needed.
-    let decode_tee = if nv12_detect { decode_tee } else { None };
+    // Expose the tee the on-demand RGB display branch attaches to:
+    //   * zero-copy crops → the CUDA tee (`tee_cuda`); the display branch carries
+    //     its own `cudadownload` (`attach_rgb_branch_cuda`), so downloads run only
+    //     while a viewer watches;
+    //   * NV12 crops (host) → the post-`cudadownload` tee (`attach_rgb_branch`);
+    //   * RGB crops (gpu_resize / NvdecCpuConvert) → none (crops already RGB).
+    let (decode_tee, decode_tee_is_cuda) = if zerocopy_crops {
+        (tee_cuda.clone(), true)
+    } else if nv12_detect {
+        (decode_tee, false)
+    } else {
+        (None, false)
+    };
     Ok(RtspPipelineHandles {
         pipeline,
         tee,
         decode_tee,
+        decode_tee_is_cuda,
     })
 }
 
@@ -2292,6 +2481,87 @@ fn attach_rgb_branch(
     })
 }
 
+/// On-demand RGB streaming branch for the ZERO-COPY CROPS path. Identical to
+/// [`attach_rgb_branch`] but starts from the CUDA-memory tee (`tee_cuda`), so it
+/// carries its OWN `cudadownload` (device NV12 → host) before the NV12→RGB
+/// convert:
+///   `tee_cuda → queue(leaky) → cudadownload → videoconvert(NV12→RGB)
+///     → capsfilter(RGB) → appsink`
+/// The full 4K download therefore runs ONLY while a viewer is subscribed — steady
+/// state (no viewer) does zero downloads AND zero converts, which is the whole
+/// point of the zero-copy crops path. Reuses [`Mp4BranchState`] +
+/// [`detach_mp4_branch`] for teardown (same shape).
+fn attach_rgb_branch_cuda(
+    pipeline: &gst::Pipeline,
+    tee_cuda: &gst::Element,
+    camera_id: &str,
+) -> std::result::Result<Mp4BranchState, String> {
+    let queue = build_raw_leaky_queue("queue_rgb_stream_cuda").map_err(|e| e.to_string())?;
+    let cudadownload = gst::ElementFactory::make("cudadownload")
+        .build()
+        .map_err(|e| format!("cudadownload rgb branch: {e}"))?;
+    let convert = gst::ElementFactory::make("videoconvert")
+        .build()
+        .map_err(|e| format!("videoconvert rgb branch (cuda): {e}"))?;
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("format", "RGB")
+        .build();
+    let capsfilter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &caps)
+        .build()
+        .map_err(|e| format!("capsfilter rgb branch (cuda): {e}"))?;
+    let sink = gst::ElementFactory::make("appsink")
+        .property("name", "sink_rgb_stream")
+        .property("emit-signals", false)
+        .property("sync", false)
+        .property("max-buffers", 1u32)
+        .property("drop", true)
+        .build()
+        .map_err(|e| format!("appsink rgb branch (cuda): {e}"))?;
+    let sink_app = sink
+        .clone()
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_| "rgb branch (cuda) appsink downcast failed".to_string())?;
+    super::fakefile::install_rgb_stream_callback(&sink_app, camera_id.to_string());
+
+    let elements = [&queue, &cudadownload, &convert, &capsfilter, &sink];
+    pipeline
+        .add_many(elements)
+        .map_err(|e| format!("add_many rgb branch (cuda): {e}"))?;
+    gst::Element::link_many(elements).map_err(|e| format!("link rgb branch (cuda): {e}"))?;
+    for el in elements {
+        el.sync_state_with_parent()
+            .map_err(|e| format!("sync_state rgb branch (cuda) element: {e}"))?;
+    }
+
+    let queue_sink = queue
+        .static_pad("sink")
+        .ok_or_else(|| "rgb branch (cuda) queue sink pad missing".to_string())?;
+    let Some(tee_src_pad) = tee_cuda.request_pad_simple("src_%u") else {
+        for el in elements {
+            let _ = el.set_state(gst::State::Null);
+        }
+        let _ = pipeline.remove_many(elements);
+        return Err("tee_cuda src_%u request for rgb branch failed".to_string());
+    };
+    if let Err(e) = tee_src_pad.link(&queue_sink) {
+        detach_mp4_branch(
+            pipeline,
+            tee_cuda,
+            Mp4BranchState {
+                tee_src_pad,
+                elements: vec![queue, cudadownload, convert, capsfilter, sink],
+            },
+        );
+        return Err(format!("tee_cuda → rgb queue: {e:?}"));
+    }
+
+    Ok(Mp4BranchState {
+        tee_src_pad,
+        elements: vec![queue, cudadownload, convert, capsfilter, sink],
+    })
+}
+
 /// Zamyka strumień fMP4 aktywnej gałęzi B przy rozbiórce pipeline'u (reconnect,
 /// restart, stop). Protokół WS niesie `base_pts_ns` WYŁĄCZNIE w
 /// `StreamSubscribeResponse`, więc po rebuildzie pipeline'u nie da się dostarczyć
@@ -2509,6 +2779,9 @@ pub async fn run_rtsp_session(
         // with the pipeline on teardown/reconnect (no explicit teardown needed,
         // like Branch B's elements).
         let decode_tee = handles.decode_tee.clone();
+        // Whether `decode_tee` is the CUDA-memory tee (zero-copy crops): the
+        // on-demand RGB attach then inserts its own `cudadownload`.
+        let decode_tee_is_cuda = handles.decode_tee_is_cuda;
         let mut rgb_branch: Option<Mp4BranchState> = None;
         // Branch B mux state — `Some` whenever a consumer is subscribed.
         // Dwa niezależne sloty na tym samym tee: pełna jakość (passthrough,
@@ -2690,6 +2963,11 @@ pub async fn run_rtsp_session(
                                         data: f.data.to_vec(),
                                         crops_format: f.format,
                                         detect: mailbox.get_detect(),
+                                        // Zero-copy crops: pass the device handle
+                                        // through without downloading (analysis
+                                        // crops per-detection; `rgb_data`
+                                        // downloads full only on a UI snapshot).
+                                        crops_device: f.device.clone(),
                                     });
                                 }
                                 let h = health_tx.borrow().clone();
@@ -2826,7 +3104,15 @@ pub async fn run_rtsp_session(
                     if let Some(decode_tee) = decode_tee.as_ref() {
                         let watched = !streaming_bus().list_subscribers(&cam_id).is_empty();
                         if watched && rgb_branch.is_none() {
-                            match attach_rgb_branch(pipeline, decode_tee, &cam_id) {
+                            // Zero-copy crops: the on-demand branch carries its own
+                            // `cudadownload` off the CUDA tee. Host NV12 crops path:
+                            // convert straight off the post-download tee.
+                            let attached = if decode_tee_is_cuda {
+                                attach_rgb_branch_cuda(pipeline, decode_tee, &cam_id)
+                            } else {
+                                attach_rgb_branch(pipeline, decode_tee, &cam_id)
+                            };
+                            match attached {
                                 Ok(state) => {
                                     rgb_branch = Some(state);
                                     tracing::info!(camera_id = %cam_id, "rtsp: on-demand RGB branch attached (viewer subscribed)");

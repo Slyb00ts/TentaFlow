@@ -257,8 +257,17 @@ fn crop_rgb(frame: &[u8], frame_w: u32, x0: u32, y0: u32, cw: u32, ch: u32) -> V
 /// Even x/y origins for the NV12 chroma alignment are handled inside `crop_nv12`;
 /// the returned crop's real (possibly even-snapped) dims are returned so the
 /// caller feeds the model the exact bytes it produced.
+///
+/// Zero-copy crops (`frame_device` = `Some`, `frame` empty): the crop is cut
+/// straight off the DEVICE NV12 surface — only the small crop sub-rectangle is
+/// downloaded, never the full 4K frame — via
+/// [`super::fakefile::DeviceCropsFrame::crop_detection_rgb`], which reuses the
+/// SAME host `crop_nv12` on the downloaded sub-frame so the RGB is bit-identical
+/// to the host path. On any map/download error it falls back to the host `frame`
+/// (which the caller materialized) — never loses enrichment.
 fn crop_for_detection(
     frame: &[u8],
+    frame_device: Option<&super::fakefile::DeviceCropsFrame>,
     frame_w: u32,
     frame_h: u32,
     format: &super::fakefile::DetectFrameFormat,
@@ -267,6 +276,14 @@ fn crop_for_detection(
     cw: u32,
     ch: u32,
 ) -> (Vec<u8>, u32, u32) {
+    // Zero-copy crops: cut off the device surface (small per-crop download).
+    #[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+    if let Some(dev) = frame_device {
+        if let Some(out) = dev.crop_detection_rgb(x0, y0, cw, ch) {
+            return out;
+        }
+    }
+    let _ = frame_device;
     match *format {
         super::fakefile::DetectFrameFormat::Rgb24 => {
             (crop_rgb(frame, frame_w, x0, y0, cw, ch), cw, ch)
@@ -286,6 +303,91 @@ fn crop_for_detection(
             );
             (rgb, ecw, ech)
         }
+    }
+}
+
+/// Remaining zero-copy CROPS verify frames. `TENTAFLOW_ZEROCOPY_CROPS_VERIFY`
+/// seeds it (8 crops); each verified crop decrements it. `0` (env unset) makes
+/// [`verify_zerocopy_crop`] a cheap no-op.
+fn verify_crops_counter() -> &'static AtomicU64 {
+    static C: OnceLock<AtomicU64> = OnceLock::new();
+    C.get_or_init(|| {
+        AtomicU64::new(if std::env::var("TENTAFLOW_ZEROCOPY_CROPS_VERIFY").is_ok() {
+            8
+        } else {
+            0
+        })
+    })
+}
+
+/// VERIFY gate (`TENTAFLOW_ZEROCOPY_CROPS_VERIFY`): for the first few crops, cut
+/// the SAME detection rect from the full host-downloaded NV12 frame and assert the
+/// RGB is byte-identical to the zero-copy device crop (`device_rgb`). Correctness
+/// gate for the per-crop device path. Logged, never panics — a mismatch surfaces
+/// without killing a live camera. No-op when the env var is unset or no device
+/// frame is present.
+#[allow(clippy::too_many_arguments)]
+fn verify_zerocopy_crop(
+    frame_device: Option<&super::fakefile::DeviceCropsFrame>,
+    frame_w: u32,
+    frame_h: u32,
+    _format: &super::fakefile::DetectFrameFormat,
+    x0: u32,
+    y0: u32,
+    cw: u32,
+    ch: u32,
+    device_rgb: &[u8],
+) {
+    let Some(dev) = frame_device else {
+        return;
+    };
+    if verify_crops_counter().load(AtomicOrdering::Relaxed) == 0 {
+        return;
+    }
+    // Reference: download the FULL NV12 and cut the same rect on the host.
+    let Some((nv12, fmt)) = dev.download_full_nv12() else {
+        return;
+    };
+    let super::fakefile::DetectFrameFormat::Nv12 {
+        y_stride,
+        uv_stride,
+        y_offset,
+        uv_offset,
+        kr,
+        kb,
+        full_range,
+    } = fmt
+    else {
+        return;
+    };
+    let (host_rgb, _, _, _, _) = super::fakefile::crop_nv12(
+        &nv12, frame_w, frame_h, y_stride, uv_stride, y_offset, uv_offset, kr, kb, full_range, x0,
+        y0, cw, ch,
+    );
+    verify_crops_counter().fetch_sub(1, AtomicOrdering::Relaxed);
+    if host_rgb.len() != device_rgb.len() {
+        error!(
+            "[vision_analysis] zero-copy crops VERIFY: length mismatch device={} host={}",
+            device_rgb.len(),
+            host_rgb.len()
+        );
+        return;
+    }
+    let mismatches = host_rgb
+        .iter()
+        .zip(device_rgb.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    if mismatches == 0 {
+        info!(
+            "[vision_analysis] zero-copy crops VERIFY: device crop MATCHES host download (bytes={})",
+            device_rgb.len()
+        );
+    } else {
+        error!(
+            "[vision_analysis] zero-copy crops VERIFY: MISMATCH device vs host ({mismatches}/{} bytes differ)",
+            device_rgb.len()
+        );
     }
 }
 
@@ -627,6 +729,12 @@ struct PendingItem {
 struct FrameJob {
     camera_id: String,
     frame: Arc<[u8]>,
+    /// Zero-copy CROPS path ONLY: a DEVICE reference to the full-res NV12 frame.
+    /// When `Some`, `frame` is EMPTY and enrichment cuts each detection's crop
+    /// straight off this device surface (small per-crop download). The held
+    /// `gst::Sample` keeps the surface alive until the cold event that consumes it
+    /// finishes (bounded ~1 in-flight + 1 pending per camera). `None` otherwise.
+    frame_device: Option<super::fakefile::DeviceCropsFrame>,
     w: u32,
     h: u32,
     /// Pixel layout of the full-res crops `frame`: `Rgb24` for every non-NVDEC
@@ -1156,7 +1264,7 @@ async fn engine_loop() {
             if jobs.values().any(|j| j.camera_id == *id) {
                 continue;
             }
-            let Some((crops, w, h, captured_ms, pts_ns, crops_format, detect)) =
+            let Some((crops, w, h, captured_ms, pts_ns, crops_format, detect, crops_device)) =
                 crate::addon::host_functions::camera::latest_frame_global(id).await
             else {
                 continue;
@@ -1208,6 +1316,7 @@ async fn engine_loop() {
                 FrameJob {
                     camera_id: id.clone(),
                     frame: crops,
+                    frame_device: crops_device,
                     w,
                     h,
                     frame_format: crops_format,
@@ -1686,6 +1795,7 @@ fn finalize_job(mut job: FrameJob, cold: &mpsc::Sender<DetectionEvent>) {
     let ev = DetectionEvent {
         camera_id: job.camera_id,
         frame: job.frame,
+        frame_device: job.frame_device,
         w: job.w,
         h: job.h,
         frame_format: job.frame_format,
@@ -1746,6 +1856,12 @@ const COLD_QUEUE_CAP: usize = 32;
 struct DetectionEvent {
     camera_id: String,
     frame: Arc<[u8]>,
+    /// Zero-copy CROPS path ONLY: DEVICE reference to the full-res NV12 frame (the
+    /// held `gst::Sample` keeps the surface valid until this event is enriched).
+    /// When `Some`, `frame` is EMPTY and `run_cold_stages` cuts each crop off the
+    /// device surface. `None` otherwise. Bounded surface pinning: ≤1 in-flight +
+    /// ≤1 pending per camera (see the cold admission gate).
+    frame_device: Option<super::fakefile::DeviceCropsFrame>,
     w: u32,
     h: u32,
     /// Pixel layout of `frame` (`Rgb24` or GPU-resident `Nv12`). Cold enrichment
@@ -2057,6 +2173,7 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
             let DetectionEvent {
                 camera_id,
                 frame,
+                frame_device,
                 w,
                 h,
                 frame_format,
@@ -2078,6 +2195,7 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
             run_cold_stages(
                 &camera_id,
                 &frame,
+                frame_device.as_ref(),
                 w,
                 h,
                 &frame_format,
@@ -2106,8 +2224,17 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
                     let _slot = slot;
                     // The analysis flow reads the frame as an RGB24 image blob; on
                     // the GPU-resident path `frame` is NV12, so convert once here
-                    // (only when a camera actually has an assigned flow).
-                    let rgb_frame = nv12_to_rgb_if_needed(&frame, w, h, &frame_format);
+                    // (only when a camera actually has an assigned flow). Zero-copy
+                    // crops: `frame` is empty, so download the full NV12 on demand.
+                    let host_frame = if frame.is_empty() {
+                        match frame_device.as_ref().and_then(|d| d.download_full_nv12()) {
+                            Some((nv12, _fmt)) => nv12,
+                            None => frame.clone(),
+                        }
+                    } else {
+                        frame.clone()
+                    };
+                    let rgb_frame = nv12_to_rgb_if_needed(&host_frame, w, h, &frame_format);
                     run_camera_flow(
                         disp,
                         flow_id,
@@ -2519,6 +2646,7 @@ fn apply_cached_enrichment(
 async fn run_cold_stages(
     camera_id: &str,
     frame: &[u8],
+    frame_device: Option<&super::fakefile::DeviceCropsFrame>,
     w: u32,
     h: u32,
     frame_format: &super::fakefile::DetectFrameFormat,
@@ -2594,7 +2722,10 @@ async fn run_cold_stages(
             };
             // NV12 crops are cut + converted per-crop (small, off the full-frame
             // convert); the crop may be even-snapped, so use its returned dims.
-            let (rgb, acw, ach) = crop_for_detection(frame, w, h, frame_format, x0, y0, cw, ch);
+            let (rgb, acw, ach) =
+                crop_for_detection(frame, frame_device, w, h, frame_format, x0, y0, cw, ch);
+            // VERIFY gate: compare the device crop against the host-download crop.
+            verify_zerocopy_crop(frame_device, w, h, frame_format, x0, y0, cw, ch, &rgb);
             let crop: Arc<[u8]> = Arc::from(rgb);
             items.push((idx, crop, acw, ach, det.klasa.clone()));
         }
@@ -3077,6 +3208,7 @@ mod tests {
         FrameJob {
             camera_id: cam.to_string(),
             frame: Arc::from(vec![0u8; 12]),
+            frame_device: None,
             w: 2,
             h: 2,
             frame_format: crate::services::camera_ingest::fakefile::DetectFrameFormat::Rgb24,

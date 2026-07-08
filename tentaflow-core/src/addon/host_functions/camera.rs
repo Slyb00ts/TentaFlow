@@ -709,6 +709,11 @@ pub async fn latest_frame_global(
         // ignores the NV12 bytes/format above. `None` on every other path.
         Option<crate::services::camera_ingest::fakefile::DeviceDetectTensor>,
     )>,
+    // Zero-copy CROPS path: a DEVICE reference to the latest full-res NV12 frame.
+    // When `Some`, the crops `Arc<[u8]>` above is EMPTY (never downloaded per
+    // frame) and enrichment cuts per-detection crops off this device handle;
+    // snapshots/display download on demand. `None` on every other path.
+    Option<crate::services::camera_ingest::fakefile::DeviceCropsFrame>,
 )> {
     let sup = SUPERVISOR.get()?;
     match sup.snapshot(camera_id).await {
@@ -716,6 +721,7 @@ pub async fn latest_frame_global(
             let detect = snap
                 .detect
                 .map(|d| (d.data, d.width, d.height, d.format, d.device));
+            let crops_device = snap.crops_device;
             // The crops frame rides raw (NV12 on the GPU-resident path) with its
             // format tag so the analysis loop cuts enrichment crops from NV12 and
             // never triggers the full videoconvert. RGB consumers use
@@ -728,6 +734,7 @@ pub async fn latest_frame_global(
                 snap.pts_ns,
                 snap.crops_format,
                 detect,
+                crops_device,
             ))
         }
         Err(_) => None,

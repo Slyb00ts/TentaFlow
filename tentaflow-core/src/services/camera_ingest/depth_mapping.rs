@@ -199,10 +199,20 @@ async fn central_worker() {
             // camera latency × angular velocity whenever the robot turns.
             // Depth needs the full-res crops frame; the detect frame (last) is
             // ignored — it is the small 560 detector input.
-            let Some((crops, w, h, captured_ms, _pts_ns, crops_format, _detect)) =
+            let Some((crops, w, h, captured_ms, _pts_ns, crops_format, _detect, crops_device)) =
                 crate::addon::host_functions::camera::latest_frame_global(cam).await
             else {
                 continue; // no frame yet
+            };
+            // Zero-copy crops: the crops bytes are empty (device-resident). Depth
+            // runs at a low cadence, so download the full NV12 on demand here.
+            let crops = if crops.is_empty() {
+                match crops_device.as_ref().and_then(|d| d.download_full_nv12()) {
+                    Some((nv12, _fmt)) => nv12,
+                    None => crops,
+                }
+            } else {
+                crops
             };
             // Depth back-projection assumes RGB24. On the GPU-resident NVDEC path
             // the crops frame is NV12 — convert on demand (depth runs at a low

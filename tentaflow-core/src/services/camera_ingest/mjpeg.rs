@@ -293,6 +293,7 @@ pub(super) fn build_mjpeg_pipeline(
         pipeline,
         tee,
         decode_tee: None,
+        decode_tee_is_cuda: false,
     })
 }
 
