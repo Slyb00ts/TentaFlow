@@ -194,6 +194,7 @@ pub fn handle_frame_url(
     };
     let pf = match stored.metadata.pixel_format {
         FramePixelFormat::Rgb24 => "rgb24",
+        FramePixelFormat::Nv12 => "nv12",
     };
     let outcome = FrameOutcome::Ok {
         bytes: stored.data,

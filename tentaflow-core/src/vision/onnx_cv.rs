@@ -322,6 +322,9 @@ fn get_or_load(row: &VisionModelRow) -> Result<Arc<CachedModel>> {
                 &session_cache,
                 trt_profile.as_ref(),
                 device_id,
+                // Dynamic CV models (incl. OCR/classifier heads like nalepka-stan):
+                // FP32 by default so fp16 rounding can't corrupt reads. See `ocr_fp16`.
+                crate::vision::ort_common::ocr_fp16(),
             )
             .map_err(|e| anyhow!("onnx-cv session slot {i} on GPU device {device_id}: {e:#}"))?,
         );

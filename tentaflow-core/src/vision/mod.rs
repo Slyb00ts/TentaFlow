@@ -23,6 +23,8 @@ pub mod nms;
 pub mod onnx_cv;
 #[cfg(feature = "inference-supertonic")]
 pub mod ort_common;
+#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+pub mod gpu_preprocess;
 pub mod preprocessing;
 pub mod resize;
 #[cfg(any(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
@@ -48,12 +50,20 @@ pub mod burn_depth_anything;
 
 #[cfg(feature = "inference-vision-gpu")]
 pub mod classifier_stan;
+// Cross-camera dynamic-batching inference front-end. Aggregates state/plate
+// crops from ALL cameras into one big batched forward per model (ort/TRT path).
+#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+pub mod inference_batcher;
 #[cfg(feature = "inference-vision-gpu")]
 pub mod detector_rfdetr;
 #[cfg(feature = "inference-vision-gpu")]
 pub mod depth_anything;
 #[cfg(feature = "inference-vision-gpu")]
 pub mod ocr_plate;
+// Shared OCR crop pre-processing: perspective deskew (angled plates) + env-gated
+// crop dumps. Feeds both the plate and ADR readers before the model.
+#[cfg(feature = "inference-vision-gpu")]
+pub mod ocr_prep;
 
 // Apple Vision OCR (VNRecognizeTextRequest) — ZAWSZE skompilowany na macOS/iOS,
 // bez feature flag (jak apple-tts). Systemowy silnik, nie wymaga modelu na dysku.

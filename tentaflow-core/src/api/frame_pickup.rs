@@ -240,6 +240,7 @@ pub fn handle_pickup(
 
     let pf = match stored.metadata.pixel_format {
         FramePixelFormat::Rgb24 => "rgb24",
+        FramePixelFormat::Nv12 => "nv12",
     };
     let outcome = PickupOutcome::Ok {
         bytes: stored.data,

@@ -21,8 +21,11 @@
 //   * synchronizacja PTS (media-time): gdy strumien niesie wspolna os czasu
 //     (init-segment MSE ma `base_pts_ns`, a kazda ramka detekcji `pts_ns`),
 //     bufor trzymamy po `ptsMs = (pts_ns - base_pts_ns)/1e6`, a cel rysowania to
-//     `video.currentTime*1000` — overlay i wideo sa w tym samym media-time. Bez
-//     tej osi (brak PTS) degradujemy do sciezki wall-clock (Date.now()).
+//     `video.currentTime*1000 - base_pts_ns/1e6`. `currentTime` jest ABSOLUTNE
+//     (fMP4 niesie oś PTS kamery, setki sekund w glab), wiec REBAZUJEMY je tym
+//     samym `base` co detekcje — inaczej playhead odstaje o caly `base` i nic
+//     nie ląduje w oknie wieku. Bez PTS degradujemy do sciezki wall-clock
+//     (Date.now()).
 //   * plynnosc 60fps: zamiast rysowac jedna "wybrana" ramke, w kazdej klatce rAF
 //     budujemy mape `track_id -> box` w chwili `t=currentTime*1000` interpolujac
 //     (lerp) miedzy sasiednimi detekcjami tego samego tracku albo ekstrapolujac
@@ -915,8 +918,16 @@ class DetectionsOverlay {
       return this.itemsAsRender(this.selectFrame());
     }
 
-    // Cel rysowania = pozycja playheadu w osi media (ms). Overlay i wideo
-    // startuja od ~0 w tej samej osi, wiec nie potrzeba offsetu sciany.
+    // Cel rysowania = pozycja playheadu w osi media (ms). `video.currentTime`
+    // to 0-bazowy czas ODTWARZANIA fMP4 (mp4mux/x264enc startuja oś fragmentu od
+    // ~0 przy attachu gałęzi B — potwierdzone runtime: ct~106 s przy pts detekcji
+    // ~96733 s). Detekcje niosą ABSOLUTNY pts osi źródła; `base` (= pts wejścia
+    // gałęzi B w chwili startu, zdjęty przez pad-probe) rebazuje je do TEJ SAMEJ
+    // osi 0-bazowej w `frameCaptureMs` (captureMs = (pts - base)/1e6). Dlatego
+    // playhead to WPROST `ct*1000` — NIE odejmujemy `base` drugi raz (inaczej
+    // base skraca sie z captureMs i zostaje goła różnica osi ct↔pts → nic nie
+    // rysuje). `base` musi byc niepusty: serwer sle go w StreamSubscribeResponse
+    // (souphttpsrc do-timestamp → pad-probe gałęzi B ustala mux_base_pts_ns).
     const v = this.videoEl();
     const ct = v ? v.currentTime : NaN;
     const t = Number.isFinite(ct) && ct > 0 ? ct * 1000 : null;
@@ -1267,6 +1278,9 @@ class DetectionsOverlay {
     // Tor media-time: target, wybrana ramka (ta sama logika co render), delta,
     // odchylka NAJBLIZSZEJ ramki (dowolnej — takze z przyszlosci) od targetu.
     const base = this.mediaBasePtsNs();
+    // Playhead = ct*1000 (0-bazowy czas odtwarzania), TA SAMA logika co render:
+    // captureMs=(pts-base)/1e6 rebazuje absolutny pts detekcji do tej osi, wiec
+    // playheadu nie rebazujemy powtornie. `base` uzywany tylko w frameCaptureMs.
     const t = ct > 0 ? ct * 1000 : null;
     let selMs = null;
     let selWiek = null;

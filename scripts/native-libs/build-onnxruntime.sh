@@ -554,6 +554,28 @@ sanity_check_gpu_linux() {
     fi
   done
   [ "$missing" -eq 0 ] || return 1
+
+  # The ORT provider libs (providers_cuda/tensorrt) ship with an EMPTY rpath and
+  # are dlopened by libonnxruntime at session-build time. The main binary's
+  # DT_RUNPATH ($ORIGIN + native-libs) does NOT propagate to transitively
+  # dlopened libraries, so on a host without system TensorRT/cuDNN the provider's
+  # DT_NEEDED (libnvinfer.so.10, libcudnn.so.9, libcublas*, libcudart) fail to
+  # resolve, the GPU EP silently soft-fails, and inference falls back to CPU
+  # (~60x slower — 250 ms vs 4 ms/frame). Give each provider its own `$ORIGIN`
+  # rpath so it finds the sibling vendored NVIDIA runtimes regardless of the
+  # launch LD_LIBRARY_PATH. The NVIDIA wheel libs already carry $ORIGIN rpaths.
+  if command -v patchelf >/dev/null 2>&1; then
+    for provider in libonnxruntime_providers_cuda.so libonnxruntime_providers_tensorrt.so libonnxruntime_providers_shared.so; do
+      [ -f "$lib_dir/$provider" ] || continue
+      if [ -z "$(patchelf --print-rpath "$lib_dir/$provider" 2>/dev/null)" ]; then
+        patchelf --set-rpath '$ORIGIN' "$lib_dir/$provider" \
+          && echo "    rpath: set \$ORIGIN on $provider (self-resolve vendored NVIDIA deps)"
+      fi
+    done
+  else
+    echo ">>> WARNING: patchelf not found — GPU provider libs keep an empty rpath and may fall back to CPU unless launched with LD_LIBRARY_PATH=<lib-dynamic>. Install patchelf (setup.sh does)." >&2
+  fi
+
   echo ">>> ONNX Runtime GPU sanity check:"
   echo "    runtime:   $main_so"
   echo "    providers: $(find "$lib_dir" -maxdepth 1 -name 'libonnxruntime_providers_*.so' -exec basename {} \; | sort | tr '\n' ' ')"

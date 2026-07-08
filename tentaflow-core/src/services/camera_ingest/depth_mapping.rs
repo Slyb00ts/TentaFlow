@@ -197,17 +197,42 @@ async fn central_worker() {
             // pose from THAT time — not "latest". The camera (WebRTC decode) lags the
             // light pose telemetry, so using the latest pose smears the cloud by the
             // camera latency × angular velocity whenever the robot turns.
-            let Some((rgb, w, h, captured_ms, _pts_ns)) =
+            // Depth needs the full-res crops frame; the detect frame (last) is
+            // ignored — it is the small 560 detector input.
+            let Some((crops, w, h, captured_ms, _pts_ns, crops_format, _detect)) =
                 crate::addon::host_functions::camera::latest_frame_global(cam).await
             else {
                 continue; // no frame yet
+            };
+            // Depth back-projection assumes RGB24. On the GPU-resident NVDEC path
+            // the crops frame is NV12 — convert on demand (depth runs at a low
+            // cadence, so a per-pulled-frame convert here is acceptable).
+            let rgb: std::sync::Arc<[u8]> = match crops_format {
+                crate::services::camera_ingest::fakefile::DetectFrameFormat::Rgb24 => crops,
+                crate::services::camera_ingest::fakefile::DetectFrameFormat::Nv12 { .. } => {
+                    match crate::services::camera_ingest::fakefile::nv12_frame_to_rgb24(
+                        &crops,
+                        w,
+                        h,
+                        &crops_format,
+                    ) {
+                        Some(v) => std::sync::Arc::from(v),
+                        None => continue,
+                    }
+                }
             };
             let Some(pose) = SlamSceneManager::global()
                 .scene_pose_at(&cfg.pose_robot_id, (captured_ms as i64) * 1000)
             else {
                 continue; // robot not localized yet
             };
-            jobs.push(Job { cfg, pose, rgb, w, h });
+            jobs.push(Job {
+                cfg,
+                pose,
+                rgb,
+                w,
+                h,
+            });
         }
         if jobs.is_empty() {
             continue;
@@ -289,15 +314,24 @@ async fn acquire_depth_batch(jobs: &[Job], _client: &reqwest::Client) -> Vec<Opt
     // Runs on a large-stack thread — the burn-generated forward overruns the default
     // blocking-thread stack in debug builds. See `burn_backend::run_blocking`.
     let result = crate::vision::burn_backend::run_blocking(move || {
-        let refs: Vec<(&[u8], u32, u32)> =
-            inputs.iter().map(|(r, w, h)| (r.as_ref(), *w, *h)).collect();
+        let refs: Vec<(&[u8], u32, u32)> = inputs
+            .iter()
+            .map(|(r, w, h)| (r.as_ref(), *w, *h))
+            .collect();
         crate::vision::depth_anything::infer_global_batch(&refs)
     })
     .await;
     match result {
         Ok(Ok(maps)) => maps
             .into_iter()
-            .map(|(depth, width, height)| Some(DepthMap { width, height, is_metric: true, depth }))
+            .map(|(depth, width, height)| {
+                Some(DepthMap {
+                    width,
+                    height,
+                    is_metric: true,
+                    depth,
+                })
+            })
             .collect(),
         Ok(Err(e)) => {
             debug!("[depth_mapping] batch depth inference failed: {e}");
@@ -400,9 +434,18 @@ async fn request_depth(
         .get("data")
         .and_then(|d| d.get(0))
         .ok_or_else(|| "missing data[0]".to_string())?;
-    let width = item.get("width").and_then(|x| x.as_u64()).ok_or("no width")? as u32;
-    let height = item.get("height").and_then(|x| x.as_u64()).ok_or("no height")? as u32;
-    let is_metric = item.get("is_metric").and_then(|x| x.as_bool()).unwrap_or(false);
+    let width = item
+        .get("width")
+        .and_then(|x| x.as_u64())
+        .ok_or("no width")? as u32;
+    let height = item
+        .get("height")
+        .and_then(|x| x.as_u64())
+        .ok_or("no height")? as u32;
+    let is_metric = item
+        .get("is_metric")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
     let b64 = item
         .get("depth_base64")
         .and_then(|x| x.as_str())
@@ -415,7 +458,12 @@ async fn request_depth(
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
-    Ok(DepthMap { width, height, is_metric, depth })
+    Ok(DepthMap {
+        width,
+        height,
+        is_metric,
+        depth,
+    })
 }
 
 /// One-shot calibration capture (env `TENTAFLOW_CALIB_DUMP=1`): writes the raw metric
@@ -595,7 +643,11 @@ mod tests {
         let dm = flat_depth(3, 3, 2.0);
         let pts = backproject_to_scene(&dm, 90.0, 0.0, 0.0, 1.0, &Pose::identity());
         assert_eq!(pts.len(), 3, "one sampled pixel → one point");
-        assert!((pts[0] - 2.0).abs() < 1e-4, "x forward = depth, got {}", pts[0]);
+        assert!(
+            (pts[0] - 2.0).abs() < 1e-4,
+            "x forward = depth, got {}",
+            pts[0]
+        );
         assert!((pts[1] - 2.0).abs() < 1e-4, "y from -x_opt, got {}", pts[1]);
         assert!((pts[2] - 2.0).abs() < 1e-4, "z from -y_opt, got {}", pts[2]);
     }

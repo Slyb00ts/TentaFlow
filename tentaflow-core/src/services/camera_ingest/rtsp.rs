@@ -25,9 +25,14 @@ use std::sync::OnceLock;
 use tokio::sync::{mpsc, watch};
 
 use super::credentials::{credentials_cipher, overlay_credentials};
-use super::decoder_detect::{detect_profile, gpu_resident_available, HwDecoder};
+use super::decoder_detect::{
+    cuda_scale_available, detect_profile, gpu_resident_available, nvdec_decode_available, HwDecoder,
+};
 use super::error::{CameraIngestError, Result};
-use super::fakefile::{ensure_gst_initialized, FrameCounters, FrameMailbox, LatestFrame};
+use super::fakefile::{
+    ensure_gst_initialized, install_detect_frame_callback, install_detect_frame_callback_nv12,
+    install_frame_callback_nv12, FrameCounters, FrameMailbox, LatestFrame, DETECT_RESIZE_DIM,
+};
 use super::session::{
     CameraConfig, CameraHealth, CameraStatus, PixelFormat, SessionCommand, SnapshotData,
 };
@@ -149,16 +154,33 @@ pub fn validate_rtsp_url(url: &str) -> Result<()> {
 pub struct RtspPipelineHandles {
     pub pipeline: gst::Pipeline,
     pub tee: gst::Element,
+    /// Post-`cudadownload` decode tee (raw NV12 in host memory) on the
+    /// GPU-resident NVDEC path — the attach point for the on-demand RGB branch
+    /// (Stage 3). `None` on every other path (crops are already RGB, so no
+    /// on-demand convert is needed).
+    pub decode_tee: Option<gst::Element>,
 }
 
 /// Którą ścieżką dekodowania budujemy pipeline dla bieżącej próby. `Cpu` to
 /// zawsze działający fallback (decodebin → videoconvert). `GpuResidentNvidia`
 /// to wariant NVIDIA, w którym dekoding I konwersja kolorów dzieją się na GPU
 /// (nvhXdec → cudaconvert → cudadownload), a na CPU schodzi dopiero pełna
-/// klatka RGB. Wybór i fallback GPU-resident → CPU obsługuje `run_rtsp_session`.
+/// klatka RGB. `NvdecCpuConvert` to wariant pośredni: sam DEKOD schodzi na GPU
+/// (nvhXdec → cudadownload), a konwersja kolorów NV12→RGB zostaje na CPU
+/// (videoconvert) — działa na nvcodec bez `cudaconvert`/`cudascale` (GStreamer
+/// 1.24), gdzie pełny GPU-resident jest niedostępny, a mimo to zdejmuje z CPU
+/// najdroższy koszt (programowy dekod 4K H.264). Wybór i kaskadę fallbacków
+/// (GPU-resident → NvdecCpuConvert → CPU) obsługuje `run_rtsp_session`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IngestPath {
     GpuResidentNvidia,
+    /// GPU-resident detect: NVDEC decode → `cudadownload` → tee into a raw-NV12
+    /// DETECT appsink (detector does YUV→RGB + resize on the GPU) plus the
+    /// existing NV12→RGB `videoconvert` crops/display branch. Kills the
+    /// detector's CPU resize; the crops `videoconvert` still runs this stage
+    /// (removed in Stage 3). Requires NVDEC + the ort GPU detect features.
+    NvdecNv12,
+    NvdecCpuConvert,
     Cpu,
 }
 
@@ -168,8 +190,39 @@ impl IngestPath {
     fn label(self) -> &'static str {
         match self {
             IngestPath::GpuResidentNvidia => "GPU-resident CUDA",
+            IngestPath::NvdecNv12 => "NVDEC + GPU NV12 detect",
+            IngestPath::NvdecCpuConvert => "NVDEC + CPU convert",
             IngestPath::Cpu => "CPU decode",
         }
+    }
+}
+
+/// Whether the GPU-resident NV12 detect path is usable: the ort GPU detect
+/// features must be compiled (`detect_batch_gpu` exists to consume the raw NV12
+/// frame) and the operator must not have disabled it via
+/// `TENTAFLOW_VISION_NV12_DETECT=0`. When false, NVDEC ingest uses the
+/// CPU-convert path (the detector then reads an RGB frame). Decode availability
+/// is checked separately (`nvdec_decode_available`).
+fn nv12_gpu_detect_available() -> bool {
+    let forced_off = std::env::var("TENTAFLOW_VISION_NV12_DETECT")
+        .map(|v| v.trim() == "0")
+        .unwrap_or(false);
+    !forced_off
+        && cfg!(all(
+            feature = "inference-vision-gpu",
+            feature = "inference-supertonic"
+        ))
+}
+
+/// Next ingest path to try after a hardware path fails to build/negotiate. The
+/// NV12 detect path degrades to the deployed NVDEC+CPU-convert path first (keeps
+/// GPU decode, drops only the GPU detect); every other hardware path degrades
+/// straight to CPU — the historical "always works" floor. A camera never goes
+/// dark.
+fn degrade_ingest_path(p: IngestPath) -> IngestPath {
+    match p {
+        IngestPath::NvdecNv12 => IngestPath::NvdecCpuConvert,
+        _ => IngestPath::Cpu,
     }
 }
 
@@ -188,17 +241,35 @@ fn resolve_use_hw_decode(config: &CameraConfig) -> bool {
     }
 }
 
-/// Rozstrzyga ścieżkę ingestu NA STARCIE sesji. Preferujemy wariant
-/// GPU-resident NVIDIA, gdy operator nie wymusił dekodera programowego
-/// (`decoder_override = Some(Software)`) ORAZ runtime ma kompletny łańcuch
-/// CUDA (`gpu_resident_available`). W przeciwnym razie idziemy ścieżką CPU
-/// (decodebin), która działa na każdej platformie. Fallback w runtime
-/// (GPU-resident nie zbuduje się / nie znegocjuje) obsługuje
-/// `run_rtsp_session`, stąd „na starcie".
+/// Rozstrzyga ścieżkę ingestu NA STARCIE sesji, gdy operator nie wymusił
+/// dekodera programowego (`decoder_override = Some(Software)` → zawsze CPU).
+/// Preferencja od najwydajniejszej ścieżki w dół:
+///   1. `GpuResidentNvidia` — pełny łańcuch CUDA (`gpu_resident_available`:
+///      wymaga `cudaconvert`, obecny dopiero w nvcodec ≥1.26); dekod I
+///      konwersja kolorów na GPU.
+///   2. `NvdecCpuConvert` — NVDEC + `cudadownload` (`nvdec_decode_available`,
+///      bez `cudaconvert`/`cudascale`); dekod na GPU, konwersja NV12→RGB na CPU.
+///      To zdejmuje z CPU programowy dekod 4K H.264 tam, gdzie pełny
+///      GPU-resident jest niedostępny (GStreamer 1.24).
+///   3. `Cpu` — decodebin → videoconvert; działa na każdej platformie.
+/// Kaskadę fallbacków w runtime (wariant nie zbuduje się / nie znegocjuje)
+/// obsługuje `run_rtsp_session`, stąd „na starcie".
 fn resolve_ingest_path(config: &CameraConfig) -> IngestPath {
     let forced_software = matches!(config.decoder_override, Some(HwDecoder::Software));
-    if !forced_software && gpu_resident_available() {
+    if forced_software {
+        IngestPath::Cpu
+    } else if gpu_resident_available() {
         IngestPath::GpuResidentNvidia
+    } else if nvdec_decode_available() {
+        // Prefer the GPU-resident NV12 detect path when the ort GPU features are
+        // built (detector consumes raw NV12); else the deployed CPU-convert
+        // NVDEC path. Runtime fallback (build/negotiation failure) steps
+        // NvdecNv12 → NvdecCpuConvert → Cpu via `degrade_ingest_path`.
+        if nv12_gpu_detect_available() {
+            IngestPath::NvdecNv12
+        } else {
+            IngestPath::NvdecCpuConvert
+        }
     } else {
         IngestPath::Cpu
     }
@@ -419,10 +490,20 @@ pub(super) fn build_raw_leaky_queue(name: &str) -> Result<gst::Element> {
 }
 
 /// Buduje appsink z kontraktem ingestu (RGB24, max-buffers=1, drop=true) i
-/// instaluje callback ramki. Wspólny dla obu wariantów RTSP oraz dla
-/// konektora MJPEG — kontrakt downstream (FrameStorage / StreamingBus / fMP4)
-/// jest niezależny od źródła i ścieżki dekodowania.
+/// instaluje callback ramki. Cienki wrapper na `build_appsink_crops` — zostaje,
+/// bo konektor MJPEG i inne miejsca wołają go bezpośrednio.
 pub(super) fn build_appsink(
+    camera_id: String,
+    mailbox: Arc<FrameMailbox>,
+    counters: Arc<FrameCounters>,
+) -> Result<gst::Element> {
+    build_appsink_crops(camera_id, mailbox, counters)
+}
+
+/// Appsink gałęzi CROPS: pełna/1440p klatka RGB → mailbox (`LatestFrame`),
+/// FrameStorage, StreamingBus. Wspólny dla obu wariantów RTSP oraz MJPEG —
+/// kontrakt downstream jest niezależny od źródła i ścieżki dekodowania.
+pub(super) fn build_appsink_crops(
     camera_id: String,
     mailbox: Arc<FrameMailbox>,
     counters: Arc<FrameCounters>,
@@ -445,9 +526,318 @@ pub(super) fn build_appsink(
     Ok(appsink)
 }
 
+/// Crops appsink for the GPU-resident NV12 path (Stage 3): delivers RAW NV12 (no
+/// per-frame `videoconvert` — that full-4K NV12→RGB is the CPU cost Stage 3
+/// removes) into the mailbox only. Enrichment cuts crops from NV12; snapshots
+/// convert lazily; the RGB streaming/`FrameStorage` path is served by the
+/// on-demand RGB branch, only while a viewer is watching.
+pub(super) fn build_appsink_crops_nv12(
+    camera_id: String,
+    mailbox: Arc<FrameMailbox>,
+    counters: Arc<FrameCounters>,
+) -> Result<gst::Element> {
+    let appsink = gst::ElementFactory::make("appsink")
+        .property("name", "sink")
+        .property("emit-signals", false)
+        .property("sync", false)
+        .property("max-buffers", 1u32)
+        .property("drop", true)
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("appsink nv12: {e}")))?;
+    let appsink_app = appsink
+        .clone()
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_| CameraIngestError::PipelineBuild("appsink nv12 downcast failed".into()))?;
+    install_frame_callback_nv12(&appsink_app, camera_id, mailbox, counters);
+    Ok(appsink)
+}
+
+/// Appsink gałęzi DETECT: GPU-skalowana klatka RGB 560×560 → mailbox slot
+/// detekcji (`put_detect`). Analizowy wyłącznie — NIE trafia do FrameStorage /
+/// StreamingBus / counters (to domena gałęzi crops).
+pub(super) fn build_appsink_detect(mailbox: Arc<FrameMailbox>) -> Result<gst::Element> {
+    let appsink = gst::ElementFactory::make("appsink")
+        .property("name", "sink_detect")
+        .property("emit-signals", false)
+        .property("sync", false)
+        .property("max-buffers", 1u32)
+        .property("drop", true)
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("appsink_detect: {e}")))?;
+    let appsink_app = appsink
+        .clone()
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_| CameraIngestError::PipelineBuild("appsink_detect downcast failed".into()))?;
+    install_detect_frame_callback(&appsink_app, mailbox);
+    Ok(appsink)
+}
+
+/// Appsink gałęzi DETECT w wariancie GPU-resident: SUROWA klatka NV12 → mailbox
+/// slot detekcji (`put_detect`) z metadanymi NV12 (strides + colorimetry).
+/// Detektor robi YUV→RGB + resize na GPU (`detect_batch_gpu`) — brak
+/// videoconvert/resize na CPU. Analizowy wyłącznie (poza FrameStorage /
+/// StreamingBus / counters).
+pub(super) fn build_appsink_detect_nv12(mailbox: Arc<FrameMailbox>) -> Result<gst::Element> {
+    let appsink = gst::ElementFactory::make("appsink")
+        .property("name", "sink_detect_nv12")
+        .property("emit-signals", false)
+        .property("sync", false)
+        .property("max-buffers", 1u32)
+        .property("drop", true)
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("appsink_detect_nv12: {e}")))?;
+    let appsink_app = appsink
+        .clone()
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_| {
+            CameraIngestError::PipelineBuild("appsink_detect_nv12 downcast failed".into())
+        })?;
+    install_detect_frame_callback_nv12(&appsink_app, mailbox);
+    Ok(appsink)
+}
+
+/// Buduje i wpina gałąź DETECT NV12 do już dodanego `tee` z surowym wideo w
+/// pamięci HOSTA (po `cudadownload`):
+///
+///   tee → queue(leaky) → capsfilter(video/x-raw,format=NV12) → appsink_detect_nv12
+///
+/// Bez `videoconvert`/`cudascale`: detektor dostaje pełnorozdzielczą klatkę NV12
+/// i sam robi YUV→RGB + resize do 560 na GPU. Capsfilter pinuje format NV12
+/// (cudadownload domyślnie oddaje NV12, ale wymuszamy jawnie). Budowane przed
+/// Playing, więc bez `sync_state_with_parent`.
+pub(super) fn attach_detect_branch_nv12(
+    pipeline: &gst::Pipeline,
+    tee: &gst::Element,
+    mailbox: Arc<FrameMailbox>,
+) -> Result<()> {
+    let queue = build_raw_leaky_queue("queue_detect_nv12")?;
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("format", "NV12")
+        .build();
+    let capsfilter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &caps)
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("capsfilter detect nv12: {e}")))?;
+    let appsink = build_appsink_detect_nv12(mailbox)?;
+
+    pipeline
+        .add_many([&queue, &capsfilter, &appsink])
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many detect nv12: {e}")))?;
+
+    let tee_src = tee.request_pad_simple("src_%u").ok_or_else(|| {
+        CameraIngestError::PipelineBuild("tee src_%u (detect nv12) request failed".into())
+    })?;
+    let queue_sink = queue.static_pad("sink").ok_or_else(|| {
+        CameraIngestError::PipelineBuild("queue_detect_nv12 sink pad missing".into())
+    })?;
+    tee_src
+        .link(&queue_sink)
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("tee → queue_detect_nv12: {e:?}")))?;
+    gst::Element::link_many([&queue, &capsfilter, &appsink]).map_err(|e| {
+        CameraIngestError::PipelineBuild(format!("link_many detect nv12 branch: {e}"))
+    })?;
+    Ok(())
+}
+
+/// Stage-4 zero-copy DETECT appsink: consumes NVDEC output IN DEVICE MEMORY
+/// (`video/x-raw(memory:CUDAMemory), format=NV12`) — no `cudadownload`. The
+/// callback maps the CUDA surface, runs the fused device preprocess, and hands
+/// the detector an owned device tensor (host-download fallback per frame on any
+/// map failure). Only built with the GPU inference features.
+#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+pub(super) fn build_appsink_detect_cuda(mailbox: Arc<FrameMailbox>) -> Result<gst::Element> {
+    let appsink = gst::ElementFactory::make("appsink")
+        .property("name", "sink_detect_cuda")
+        .property("emit-signals", false)
+        .property("sync", false)
+        .property("max-buffers", 1u32)
+        .property("drop", true)
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("appsink_detect_cuda: {e}")))?;
+    let appsink_app = appsink
+        .clone()
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_| {
+            CameraIngestError::PipelineBuild("appsink_detect_cuda downcast failed".into())
+        })?;
+    super::fakefile::install_detect_frame_callback_cuda(&appsink_app, mailbox);
+    Ok(appsink)
+}
+
+/// Attaches the Stage-4 zero-copy DETECT branch to a CUDA-memory `tee`
+/// (`tee_cuda`), placed BEFORE `cudadownload` so the decoder's device NV12 never
+/// touches the CPU on this branch:
+///
+///   tee_cuda → queue(leaky) → capsfilter(video/x-raw(memory:CUDAMemory),NV12)
+///     → appsink_detect_cuda
+///
+/// The capsfilter pins the CUDA memory feature + NV12 so negotiation keeps the
+/// frame on the GPU. Built before Playing (no `sync_state_with_parent`).
+#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+pub(super) fn attach_detect_branch_cuda(
+    pipeline: &gst::Pipeline,
+    tee: &gst::Element,
+    mailbox: Arc<FrameMailbox>,
+) -> Result<()> {
+    let queue = build_raw_leaky_queue("queue_detect_cuda")?;
+    let caps = gst::Caps::builder("video/x-raw")
+        .features(["memory:CUDAMemory"])
+        .field("format", "NV12")
+        .build();
+    let capsfilter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &caps)
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("capsfilter detect cuda: {e}")))?;
+    let appsink = build_appsink_detect_cuda(mailbox)?;
+
+    pipeline
+        .add_many([&queue, &capsfilter, &appsink])
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many detect cuda: {e}")))?;
+
+    let tee_src = tee.request_pad_simple("src_%u").ok_or_else(|| {
+        CameraIngestError::PipelineBuild("tee_cuda src_%u (detect) request failed".into())
+    })?;
+    let queue_sink = queue.static_pad("sink").ok_or_else(|| {
+        CameraIngestError::PipelineBuild("queue_detect_cuda sink pad missing".into())
+    })?;
+    tee_src
+        .link(&queue_sink)
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("tee_cuda → queue_detect_cuda: {e:?}")))?;
+    gst::Element::link_many([&queue, &capsfilter, &appsink]).map_err(|e| {
+        CameraIngestError::PipelineBuild(format!("link_many detect cuda branch: {e}"))
+    })?;
+    Ok(())
+}
+
+/// Czy dobudować gałąź GPU-owego skalowania klatki detekcji. `true` gdy runtime
+/// ma komplet elementów CUDA (`cudaupload/cudaconvert/cudascale/cudadownload`)
+/// ORAZ operator nie wymusił ścieżki CPU przez `TENTAFLOW_VISION_GPU_RESIZE=0`.
+/// Gdy `false`, pipeline zostaje przy pojedynczym appsinku (crops) i detektor
+/// resize'uje 4K→560 na CPU jak dotąd. Fallback runtime (negocjacja CUDA pada
+/// przy Playing) obsługuje `run_rtsp_session` przez ponowną budowę z `false`.
+pub(super) fn gpu_resize_enabled() -> bool {
+    let forced_off = std::env::var("TENTAFLOW_VISION_GPU_RESIZE")
+        .map(|v| v.trim() == "0")
+        .unwrap_or(false);
+    !forced_off && cuda_scale_available()
+}
+
+/// Whether to use the Stage-4 ZERO-COPY detect branch (device NV12 straight to
+/// the detector, no `cudadownload`/re-upload round-trip). Opt-in via
+/// `TENTAFLOW_ZEROCOPY=1` and only meaningful with the GPU inference features
+/// built in (they link cudart and provide the device-tensor detect path). OFF by
+/// default: the deployed host-download NV12 detect is the guaranteed fallback.
+pub(super) fn zerocopy_enabled() -> bool {
+    #[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+    {
+        std::env::var("TENTAFLOW_ZEROCOPY")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+    }
+    #[cfg(not(all(feature = "inference-vision-gpu", feature = "inference-supertonic")))]
+    {
+        false
+    }
+}
+
+/// Buduje i wpina gałąź DETECT do już dodanego do pipeline'u `tee` z surowym
+/// wideo w pamięci HOSTA (po dekodzie, ewentualnym `cudadownload`):
+///
+///   tee → queue(leaky) → cudaupload → cudaconvert → cudascale →
+///     cudadownload → videoconvert → capsfilter(RGB, DIM×DIM) → appsink_detect
+///
+/// Rozmiar 560 pinujemy WYŁĄCZNIE na końcowym capsfilterze RGB w pamięci hosta —
+/// jedynym elementem skalującym w łańcuchu jest `cudascale`, więc negocjacja
+/// caps przeciąga wymaganie rozmiaru w górę do niego (tak samo jak ogon
+/// GPU-resident pinuje tylko format RGB i pozwala `cudaconvert` negocjować).
+/// `cudaconvert` normalizuje natywny format dekodera (I420/NV12/RGBA) do postaci,
+/// którą `cudascale` obsługuje niezawodnie — lustro działającego ogona
+/// GpuResidentNvidia. Budowane przed Playing, więc bez `sync_state_with_parent`.
+pub(super) fn attach_detect_branch(
+    pipeline: &gst::Pipeline,
+    tee: &gst::Element,
+    mailbox: Arc<FrameMailbox>,
+) -> Result<()> {
+    let dim = DETECT_RESIZE_DIM as i32;
+    let queue = build_raw_leaky_queue("queue_detect")?;
+    let cudaupload = gst::ElementFactory::make("cudaupload")
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("cudaupload: {e}")))?;
+    let cudaconvert = gst::ElementFactory::make("cudaconvert")
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("cudaconvert detect: {e}")))?;
+    let cudascale = gst::ElementFactory::make("cudascale")
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("cudascale: {e}")))?;
+    let cudadownload = gst::ElementFactory::make("cudadownload")
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("cudadownload detect: {e}")))?;
+    let convert = gst::ElementFactory::make("videoconvert")
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("videoconvert detect: {e}")))?;
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("format", "RGB")
+        .field("width", dim)
+        .field("height", dim)
+        .build();
+    let capsfilter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &caps)
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("capsfilter detect: {e}")))?;
+    let appsink = build_appsink_detect(mailbox)?;
+
+    pipeline
+        .add_many([
+            &queue,
+            &cudaupload,
+            &cudaconvert,
+            &cudascale,
+            &cudadownload,
+            &convert,
+            &capsfilter,
+            &appsink,
+        ])
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many detect: {e}")))?;
+
+    let tee_src = tee.request_pad_simple("src_%u").ok_or_else(|| {
+        CameraIngestError::PipelineBuild("tee src_%u (detect) request failed".into())
+    })?;
+    let queue_sink = queue
+        .static_pad("sink")
+        .ok_or_else(|| CameraIngestError::PipelineBuild("queue_detect sink pad missing".into()))?;
+    tee_src
+        .link(&queue_sink)
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("tee → queue_detect: {e:?}")))?;
+    gst::Element::link_many([
+        &queue,
+        &cudaupload,
+        &cudaconvert,
+        &cudascale,
+        &cudadownload,
+        &convert,
+        &capsfilter,
+        &appsink,
+    ])
+    .map_err(|e| CameraIngestError::PipelineBuild(format!("link_many detect branch: {e}")))?;
+    Ok(())
+}
+
+/// Buduje `tee` (host raw video) rozgałęziający klatki dekodera na gałąź CROPS i
+/// gałąź DETECT. `allow-not-linked=true` — okna między linkowaniem gałęzi.
+pub(super) fn build_decode_tee(name: &str) -> Result<gst::Element> {
+    gst::ElementFactory::make("tee")
+        .property("name", name)
+        .property("allow-not-linked", true)
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("{name}: {e}")))
+}
+
 /// Dispatcher budowy pipeline'u RTSP. Wybiera wariant wg `ingest_path`:
 ///   * `GpuResidentNvidia` → `build_rtsp_pipeline_gpu_resident` (dekod +
 ///     konwersja kolorów na GPU, na CPU schodzi dopiero pełna klatka RGB),
+///   * `NvdecCpuConvert`   → `build_rtsp_pipeline_nvdec` (dekod na GPU przez
+///     NVDEC → cudadownload, konwersja kolorów NV12→RGB na CPU; bez wymogu
+///     `cudaconvert`/`cudascale`, więc działa na nvcodec GStreamer 1.24),
 ///   * `Cpu`               → `build_rtsp_pipeline_cpu` (decodebin → videoconvert,
 ///     działa na każdej platformie; `use_hw_decode` pozwala decodebinowi
 ///     autoplugować dekoder sprzętowy best-effort).
@@ -466,18 +856,49 @@ fn build_rtsp_pipeline(
     timeout_secs: u32,
     ingest_path: IngestPath,
     use_hw_decode: bool,
+    gpu_resize: bool,
     mailbox: Arc<FrameMailbox>,
     counters: Arc<FrameCounters>,
 ) -> Result<RtspPipelineHandles> {
     match ingest_path {
-        IngestPath::GpuResidentNvidia => {
-            build_rtsp_pipeline_gpu_resident(camera_id, url, timeout_secs, mailbox, counters)
-        }
+        IngestPath::GpuResidentNvidia => build_rtsp_pipeline_gpu_resident(
+            camera_id,
+            url,
+            timeout_secs,
+            gpu_resize,
+            mailbox,
+            counters,
+        ),
+        // NvdecNv12 and NvdecCpuConvert share the same builder; `nv12_detect`
+        // switches the DETECT branch to raw NV12 (no videoconvert/resize) and
+        // `zerocopy` (opt-in, Stage 4) further keeps the detect NV12 on the GPU
+        // (no `cudadownload` round-trip) — see `zerocopy_enabled`.
+        IngestPath::NvdecNv12 => build_rtsp_pipeline_nvdec(
+            camera_id,
+            url,
+            timeout_secs,
+            gpu_resize,
+            true,
+            zerocopy_enabled(),
+            mailbox,
+            counters,
+        ),
+        IngestPath::NvdecCpuConvert => build_rtsp_pipeline_nvdec(
+            camera_id,
+            url,
+            timeout_secs,
+            gpu_resize,
+            false,
+            false,
+            mailbox,
+            counters,
+        ),
         IngestPath::Cpu => build_rtsp_pipeline_cpu(
             camera_id,
             url,
             timeout_secs,
             use_hw_decode,
+            gpu_resize,
             mailbox,
             counters,
         ),
@@ -494,6 +915,7 @@ fn build_rtsp_pipeline_cpu(
     url: &str,
     timeout_secs: u32,
     use_hw_decode: bool,
+    gpu_resize: bool,
     mailbox: Arc<FrameMailbox>,
     counters: Arc<FrameCounters>,
 ) -> Result<RtspPipelineHandles> {
@@ -547,7 +969,16 @@ fn build_rtsp_pipeline_cpu(
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("capsfilter: {e}")))?;
 
-    let appsink = build_appsink(camera_id, mailbox, counters)?;
+    let appsink = build_appsink_crops(camera_id, mailbox.clone(), counters)?;
+
+    // Optional GPU detect tee inserted between the decoder and the crops tail.
+    // When present, the decoder's dynamic pad feeds THIS tee (not queue_dec
+    // directly); the tee fans out to the crops tail and the GPU detect branch.
+    let decode_tee = if gpu_resize {
+        Some(build_decode_tee("tee_decode")?)
+    } else {
+        None
+    };
 
     pipeline
         .add_many([
@@ -562,12 +993,17 @@ fn build_rtsp_pipeline_cpu(
             &appsink,
         ])
         .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many: {e}")))?;
+    if let Some(t) = &decode_tee {
+        pipeline
+            .add_many([t])
+            .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many tee_decode: {e}")))?;
+    }
 
     // Static segments:
     //   rtp_filter → tee (capsfilter pins RTP video before fan-out)
     //   tee.src_0 → queue_a → decodebin (request pad, Branch A always-on)
     //   queue_dec → convert → capsfilter → appsink (after decode)
-    // rtspsrc → rtp_filter is dynamic (pad-added below) and decodebin → queue_dec
+    // rtspsrc → rtp_filter is dynamic (pad-added below) and decodebin → decode_out
     // is dynamic (decoder src pad appears after autoplug).
     gst::Element::link(&rtp_filter, &tee)
         .map_err(|e| CameraIngestError::PipelineBuild(format!("rtp_filter → tee: {e}")))?;
@@ -585,14 +1021,34 @@ fn build_rtsp_pipeline_cpu(
     gst::Element::link_many([&queue_dec, &convert, &capsfilter, &appsink])
         .map_err(|e| CameraIngestError::PipelineBuild(format!("link_many tail: {e}")))?;
 
+    // With the detect tee present, link tee → queue_dec (crops) and attach the
+    // GPU detect branch. `decode_out` (the sink for the decoder's dynamic pad)
+    // becomes the tee; otherwise it stays queue_dec (original direct wiring).
+    let decode_out = if let Some(t) = &decode_tee {
+        let tee_crops = t.request_pad_simple("src_%u").ok_or_else(|| {
+            CameraIngestError::PipelineBuild("tee_decode src_%u (crops) request failed".into())
+        })?;
+        let queue_dec_sink = queue_dec
+            .static_pad("sink")
+            .ok_or_else(|| CameraIngestError::PipelineBuild("queue_dec sink pad missing".into()))?;
+        tee_crops.link(&queue_dec_sink).map_err(|e| {
+            CameraIngestError::PipelineBuild(format!("tee_decode → queue_dec: {e:?}"))
+        })?;
+        attach_detect_branch(&pipeline, t, mailbox.clone())?;
+        t.clone()
+    } else {
+        queue_dec.clone()
+    };
+
     // decodebin's video output pad appears dynamically once the codec is
-    // identified. Wire it into queue_dec when caps say video/x-raw.
-    let queue_dec_weak = queue_dec.downgrade();
+    // identified. Wire it into `decode_out` (detect tee or queue_dec) when caps
+    // say video/x-raw.
+    let decode_out_weak = decode_out.downgrade();
     decodebin.connect_pad_added(move |_dec, src_pad| {
-        let Some(queue_dec) = queue_dec_weak.upgrade() else {
+        let Some(decode_out) = decode_out_weak.upgrade() else {
             return;
         };
-        let Some(sink_pad) = queue_dec.static_pad("sink") else {
+        let Some(sink_pad) = decode_out.static_pad("sink") else {
             return;
         };
         if sink_pad.is_linked() {
@@ -612,7 +1068,7 @@ fn build_rtsp_pipeline_cpu(
             return;
         }
         if let Err(e) = src_pad.link(&sink_pad) {
-            tracing::warn!("rtsp: decodebin → queue_dec link failed: {e:?}");
+            tracing::warn!("rtsp: decodebin → decode_out link failed: {e:?}");
         } else {
             tracing::info!("rtsp: decodebin video pad linked (codec auto-detected)");
         }
@@ -622,7 +1078,11 @@ fn build_rtsp_pipeline_cpu(
     // to `decodebin` above.
     connect_rtspsrc_video_pad(&rtspsrc, &rtp_filter);
 
-    Ok(RtspPipelineHandles { pipeline, tee })
+    Ok(RtspPipelineHandles {
+        pipeline,
+        tee,
+        decode_tee: None,
+    })
 }
 
 /// Wariant GPU-resident NVIDIA. Branch A dekoduje I konwertuje kolory na GPU:
@@ -649,6 +1109,7 @@ fn build_rtsp_pipeline_gpu_resident(
     camera_id: String,
     url: &str,
     timeout_secs: u32,
+    gpu_resize: bool,
     mailbox: Arc<FrameMailbox>,
     counters: Arc<FrameCounters>,
 ) -> Result<RtspPipelineHandles> {
@@ -680,7 +1141,17 @@ fn build_rtsp_pipeline_gpu_resident(
         .property("caps", &caps)
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("capsfilter: {e}")))?;
-    let appsink = build_appsink(camera_id, mailbox, counters)?;
+    let appsink = build_appsink_crops(camera_id, mailbox.clone(), counters)?;
+
+    // Optional GPU detect tee inserted after `cudadownload` (host raw video).
+    // The full frame is already in host memory here (crops need it), so the
+    // detect branch re-uploads it to CUDA for the 560 scale — cheaper than the
+    // detector's ~4 ms CPU resize of the full 4K frame.
+    let decode_tee = if gpu_resize {
+        Some(build_decode_tee("tee_decode")?)
+    } else {
+        None
+    };
 
     pipeline
         .add_many([
@@ -696,11 +1167,16 @@ fn build_rtsp_pipeline_gpu_resident(
             &appsink,
         ])
         .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many gpu: {e}")))?;
+    if let Some(t) = &decode_tee {
+        pipeline.add_many([t]).map_err(|e| {
+            CameraIngestError::PipelineBuild(format!("add_many tee_decode gpu: {e}"))
+        })?;
+    }
 
     // Statyczne segmenty znane przed negocjacją:
     //   rtp_filter → tee → queue_a (front RTP)
-    //   cudaconvert → cudadownload → queue_dec → videoconvert → capsfilter →
-    //   appsink (ogon)
+    //   cudaconvert → cudadownload → [tee_decode →] queue_dec → videoconvert →
+    //   capsfilter → appsink (ogon)
     // Środek (depay → parse → nvhXdec) dobudowujemy dynamicznie po poznaniu
     // kodeka i wpinamy między queue_a a cudaconvert.
     gst::Element::link(&rtp_filter, &tee)
@@ -714,15 +1190,32 @@ fn build_rtsp_pipeline_gpu_resident(
     tee_src_a
         .link(&queue_a_sink)
         .map_err(|e| CameraIngestError::PipelineBuild(format!("tee → queue_a: {e:?}")))?;
-    gst::Element::link_many([
-        &cudaconvert,
-        &cudadownload,
-        &queue_dec,
-        &convert,
-        &capsfilter,
-        &appsink,
-    ])
-    .map_err(|e| CameraIngestError::PipelineBuild(format!("link_many gpu tail: {e}")))?;
+    // Ogon: cudaconvert → cudadownload, potem albo wprost do queue_dec (crops),
+    // albo przez tee_decode rozgałęziający na crops + detect.
+    gst::Element::link(&cudaconvert, &cudadownload).map_err(|e| {
+        CameraIngestError::PipelineBuild(format!("cudaconvert → cudadownload: {e}"))
+    })?;
+    if let Some(t) = &decode_tee {
+        gst::Element::link(&cudadownload, t).map_err(|e| {
+            CameraIngestError::PipelineBuild(format!("cudadownload → tee_decode: {e}"))
+        })?;
+        let tee_crops = t.request_pad_simple("src_%u").ok_or_else(|| {
+            CameraIngestError::PipelineBuild("tee_decode src_%u (crops) request failed".into())
+        })?;
+        let queue_dec_sink = queue_dec
+            .static_pad("sink")
+            .ok_or_else(|| CameraIngestError::PipelineBuild("queue_dec sink pad missing".into()))?;
+        tee_crops.link(&queue_dec_sink).map_err(|e| {
+            CameraIngestError::PipelineBuild(format!("tee_decode → queue_dec: {e:?}"))
+        })?;
+        attach_detect_branch(&pipeline, t, mailbox.clone())?;
+    } else {
+        gst::Element::link(&cudadownload, &queue_dec).map_err(|e| {
+            CameraIngestError::PipelineBuild(format!("cudadownload → queue_dec: {e}"))
+        })?;
+    }
+    gst::Element::link_many([&queue_dec, &convert, &capsfilter, &appsink])
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("link_many gpu tail: {e}")))?;
 
     // Dobudowa dekodera NVDEC po negocjacji RTP. queue_a ma stałe caps
     // `application/x-rtp` (rtp_filter wymusza video), ale `encoding-name`
@@ -786,20 +1279,313 @@ fn build_rtsp_pipeline_gpu_resident(
     // Front RTP identyczny jak w wariancie CPU.
     connect_rtspsrc_video_pad(&rtspsrc, &rtp_filter);
 
-    Ok(RtspPipelineHandles { pipeline, tee })
+    Ok(RtspPipelineHandles {
+        pipeline,
+        tee,
+        decode_tee: None,
+    })
+}
+
+/// Wariant NvdecCpuConvert — dekod na GPU (NVDEC), konwersja kolorów na CPU.
+/// Pośredni między pełnym GPU-resident (wymaga `cudaconvert`/`cudascale`,
+/// obecnych dopiero w nvcodec GStreamer ≥1.26) a czystym CPU. Branch A:
+///
+///   rtspsrc → rtp_filter → tee → queue_a → rtphXdepay → hXparse →
+///     nvhXdec (klatka w `video/x-raw(memory:CUDAMemory),NV12`) →
+///     cudadownload (CUDAMemory→host) → queue (leaky) →
+///     videoconvert (NV12→RGB na CPU) → capsfilter RGB → appsink
+///
+/// Kluczowa różnica względem GPU-resident: BRAK `cudaconvert` (konwersja NV12→RGB
+/// schodzi na CPU do `videoconvert`), więc pipeline zbuduje się na nvcodec bez
+/// `cudaconvert`/`cudascale`. Mimo to najdroższy koszt — programowy dekod 4K
+/// H.264 (~15-20% rdzenia na kamerę) — schodzi na NVDEC; na CPU zostaje tylko
+/// dużo tańsza konwersja kolorów.
+///
+/// `nvhXdec`/`rtphXdepay`/`hXparse` dobierane są w runtime wg `encoding-name`
+/// z caps RTP (H264 → nvh264dec, H265/HEVC → nvh265dec). Branch A dobudowywany
+/// dynamicznie po negocjacji caps RTP (kodek znamy dopiero wtedy). Gdy kodek nie
+/// ma odpowiednika NVDEC (np. MJPEG), branch A się nie zbuduje, pipeline nie da
+/// klatek i `run_rtsp_session` przełączy się na ścieżkę CPU. Wyjście identyczne
+/// jak w wariantach CPU/GPU-resident (RGB, ten sam appsink callback) — reszta
+/// systemu jest bez zmian.
+///
+/// `nv12_detect` selects the GPU-resident DETECT branch: instead of the RGB-560
+/// GPU-resize tee, the decoded host NV12 is teed straight into a raw-NV12 detect
+/// appsink (no videoconvert/resize) and the detector does YUV→RGB + resize on
+/// the GPU (`detect_batch_gpu`). The crops/display branch is unchanged
+/// (`videoconvert` NV12→RGB). `false` is the deployed NvdecCpuConvert path,
+/// byte-identical to before.
+#[allow(clippy::too_many_arguments)]
+fn build_rtsp_pipeline_nvdec(
+    camera_id: String,
+    url: &str,
+    timeout_secs: u32,
+    gpu_resize: bool,
+    nv12_detect: bool,
+    zerocopy: bool,
+    mailbox: Arc<FrameMailbox>,
+    counters: Arc<FrameCounters>,
+) -> Result<RtspPipelineHandles> {
+    // Zero-copy detect is a sub-mode of the NV12 detect path (Stage 3). Without
+    // `nv12_detect` there is no device NV12 detect branch to keep on the GPU.
+    let zerocopy = zerocopy && nv12_detect;
+    let pipeline = gst::Pipeline::new();
+    let rtspsrc = build_rtspsrc(url, timeout_secs)?;
+    let (rtp_filter, tee, queue_a) = build_rtp_front()?;
+
+    // Statyczny ogon branchu A. `cudadownload` to punkt wpięcia dekodera:
+    // przenosi zdekodowaną klatkę z pamięci CUDA do pamięci hosta, a NV12→RGB
+    // robi już `videoconvert` na CPU (brak cudaconvert w tym wariancie).
+    let cudadownload = gst::ElementFactory::make("cudadownload")
+        .build()
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("cudadownload: {e}")))?;
+    // Kolejka leaky ZA dekoderem (po zejściu klatki do pamięci hosta) — jedyne
+    // bezpieczne miejsce gubienia przy spiętrzeniu, patrz `build_raw_leaky_queue`.
+    let queue_dec = build_raw_leaky_queue("queue_decoded_a")?;
+    // Stage 3: on the GPU-resident NV12 path the crops appsink delivers RAW NV12
+    // (no per-frame `videoconvert` — the full-4K NV12→RGB was ~90% of a core per
+    // camera), and RGB is produced only on-demand by `attach_rgb_branch`. On the
+    // NvdecCpuConvert path (nv12_detect=false) the crops tail stays
+    // `videoconvert → RGB` — byte-identical to before.
+    let (convert, capsfilter) = if nv12_detect {
+        (None, None)
+    } else {
+        let convert = gst::ElementFactory::make("videoconvert")
+            .build()
+            .map_err(|e| CameraIngestError::PipelineBuild(format!("videoconvert: {e}")))?;
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("format", "RGB")
+            .build();
+        let capsfilter = gst::ElementFactory::make("capsfilter")
+            .property("caps", &caps)
+            .build()
+            .map_err(|e| CameraIngestError::PipelineBuild(format!("capsfilter: {e}")))?;
+        (Some(convert), Some(capsfilter))
+    };
+    let appsink = if nv12_detect {
+        build_appsink_crops_nv12(camera_id, mailbox.clone(), counters)?
+    } else {
+        build_appsink_crops(camera_id, mailbox.clone(), counters)?
+    };
+
+    // Opcjonalny tee po `cudadownload` (surowe wideo w pamięci hosta) na gałąź
+    // CROPS + gałąź DETECT. Potrzebny gdy:
+    //   * `nv12_detect` — gałąź detekcji surowego NV12 (ścieżka GPU-resident),
+    //   * `gpu_resize`  — gałąź GPU-skalowania klatki detekcji do RGB 560
+    //     (w praktyce false tutaj: `cuda_scale_available` wymaga
+    //     `cudaconvert`/`cudascale`, których brak — inaczej byłby GPU-resident).
+    // `nv12_detect` wygrywa nad `gpu_resize`: raw NV12 idzie prosto do detektora
+    // (YUV→RGB + resize na GPU), więc RGB-560 tee jest zbędny.
+    let decode_tee = if nv12_detect || gpu_resize {
+        Some(build_decode_tee("tee_decode")?)
+    } else {
+        None
+    };
+
+    // Stage 4: a CUDA-memory `tee` placed BEFORE `cudadownload`. One branch still
+    // downloads to host (crops + on-demand RGB, unchanged); the other keeps the
+    // decoder's device NV12 and feeds the zero-copy detect appsink — no
+    // GPU→CPU→GPU round-trip for detection. Only when `zerocopy`.
+    let tee_cuda = if zerocopy {
+        Some(build_decode_tee("tee_cuda")?)
+    } else {
+        None
+    };
+
+    pipeline
+        .add_many([
+            &rtspsrc,
+            &rtp_filter,
+            &tee,
+            &queue_a,
+            &cudadownload,
+            &queue_dec,
+            &appsink,
+        ])
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many nvdec: {e}")))?;
+    if let Some(tc) = &tee_cuda {
+        pipeline.add_many([tc]).map_err(|e| {
+            CameraIngestError::PipelineBuild(format!("add_many tee_cuda nvdec: {e}"))
+        })?;
+    }
+    // RGB crops path adds the `videoconvert → capsfilter`; the NV12 path omits them.
+    if let (Some(convert), Some(capsfilter)) = (&convert, &capsfilter) {
+        pipeline.add_many([convert, capsfilter]).map_err(|e| {
+            CameraIngestError::PipelineBuild(format!("add_many nvdec convert: {e}"))
+        })?;
+    }
+    if let Some(t) = &decode_tee {
+        pipeline.add_many([t]).map_err(|e| {
+            CameraIngestError::PipelineBuild(format!("add_many tee_decode nvdec: {e}"))
+        })?;
+    }
+
+    // Statyczne segmenty znane przed negocjacją:
+    //   rtp_filter → tee → queue_a (front RTP)
+    //   cudadownload → [tee_decode →] queue_dec → videoconvert → capsfilter →
+    //   appsink (ogon)
+    // Środek (depay → parse → nvhXdec) dobudowujemy dynamicznie po poznaniu
+    // kodeka i wpinamy między queue_a a cudadownload.
+    gst::Element::link(&rtp_filter, &tee)
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("rtp_filter → tee: {e}")))?;
+    let tee_src_a = tee
+        .request_pad_simple("src_%u")
+        .ok_or_else(|| CameraIngestError::PipelineBuild("tee src_%u request failed".into()))?;
+    let queue_a_sink = queue_a
+        .static_pad("sink")
+        .ok_or_else(|| CameraIngestError::PipelineBuild("queue_a sink pad missing".into()))?;
+    tee_src_a
+        .link(&queue_a_sink)
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("tee → queue_a: {e:?}")))?;
+    // Zero-copy: the decoder feeds `tee_cuda`; one src downloads to host (crops),
+    // one keeps device NV12 (detect). Link `tee_cuda → cudadownload` here so the
+    // host crops/on-demand-RGB tail below is unchanged.
+    if let Some(tc) = &tee_cuda {
+        let tc_src = tc.request_pad_simple("src_%u").ok_or_else(|| {
+            CameraIngestError::PipelineBuild("tee_cuda src_%u (crops) request failed".into())
+        })?;
+        let cudl_sink = cudadownload.static_pad("sink").ok_or_else(|| {
+            CameraIngestError::PipelineBuild("cudadownload sink pad missing".into())
+        })?;
+        tc_src.link(&cudl_sink).map_err(|e| {
+            CameraIngestError::PipelineBuild(format!("tee_cuda → cudadownload: {e:?}"))
+        })?;
+        // Device NV12 detect off the CUDA tee (no download for the detect branch).
+        #[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+        attach_detect_branch_cuda(&pipeline, tc, mailbox.clone())?;
+    }
+    // Ogon: cudadownload wprost do queue_dec (crops) albo przez tee_decode
+    // rozgałęziający na crops + detect.
+    if let Some(t) = &decode_tee {
+        gst::Element::link(&cudadownload, t).map_err(|e| {
+            CameraIngestError::PipelineBuild(format!("cudadownload → tee_decode: {e}"))
+        })?;
+        let tee_crops = t.request_pad_simple("src_%u").ok_or_else(|| {
+            CameraIngestError::PipelineBuild("tee_decode src_%u (crops) request failed".into())
+        })?;
+        let queue_dec_sink = queue_dec
+            .static_pad("sink")
+            .ok_or_else(|| CameraIngestError::PipelineBuild("queue_dec sink pad missing".into()))?;
+        tee_crops.link(&queue_dec_sink).map_err(|e| {
+            CameraIngestError::PipelineBuild(format!("tee_decode → queue_dec: {e:?}"))
+        })?;
+        // DETECT branch: on zero-copy the detect is already wired to `tee_cuda`
+        // (device NV12, above); otherwise it hangs off the host tee — raw NV12
+        // straight to the detector when `nv12_detect`, else the RGB-560 branch.
+        if zerocopy {
+            // Detect handled by the CUDA tee; host tee serves crops + RGB only.
+        } else if nv12_detect {
+            attach_detect_branch_nv12(&pipeline, t, mailbox.clone())?;
+        } else {
+            attach_detect_branch(&pipeline, t, mailbox.clone())?;
+        }
+    } else {
+        gst::Element::link(&cudadownload, &queue_dec).map_err(|e| {
+            CameraIngestError::PipelineBuild(format!("cudadownload → queue_dec: {e}"))
+        })?;
+    }
+    // NV12 crops tail: `queue_dec → appsink` (raw NV12, no convert). RGB crops
+    // tail: `queue_dec → videoconvert → capsfilter → appsink` (unchanged).
+    match (&convert, &capsfilter) {
+        (Some(convert), Some(capsfilter)) => {
+            gst::Element::link_many([&queue_dec, convert, capsfilter, &appsink]).map_err(|e| {
+                CameraIngestError::PipelineBuild(format!("link_many nvdec tail: {e}"))
+            })?;
+        }
+        _ => {
+            gst::Element::link(&queue_dec, &appsink).map_err(|e| {
+                CameraIngestError::PipelineBuild(format!("link nvdec nv12 tail: {e}"))
+            })?;
+        }
+    }
+
+    // Dobudowa dekodera NVDEC po negocjacji RTP — identyczna mechanika jak w
+    // wariancie GPU-resident, tylko wyjście dekodera wpinamy w `cudadownload`
+    // (nie `cudaconvert`). Kodek (H264 vs H265) znamy dopiero po SETUP rtspsrc,
+    // więc wieszamy watcher na src padzie queue_a.
+    let pipeline_weak = pipeline.downgrade();
+    // Decoder output goes into `tee_cuda` on the zero-copy path (device NV12 is
+    // kept for detect; `cudadownload` sits downstream of the tee), else straight
+    // into `cudadownload` (host download) as before.
+    let downstream_weak = match &tee_cuda {
+        Some(tc) => tc.downgrade(),
+        None => cudadownload.downgrade(),
+    };
+    let queue_a_src = queue_a
+        .static_pad("src")
+        .ok_or_else(|| CameraIngestError::PipelineBuild("queue_a src pad missing".into()))?;
+    let built = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let build_decoder = move |caps: &gst::Caps| {
+        if built.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let Some(pipeline) = pipeline_weak.upgrade() else {
+            return;
+        };
+        let Some(downstream) = downstream_weak.upgrade() else {
+            return;
+        };
+        let Some(queue_a) = pipeline.by_name("queue_branch_a") else {
+            return;
+        };
+        let encoding = caps
+            .structure(0)
+            .and_then(|s| s.get::<String>("encoding-name").ok())
+            .unwrap_or_default();
+        if let Err(e) = link_nvdec_branch(&pipeline, &queue_a, &downstream, &encoding) {
+            // Nie panikujemy: brak NVDEC dla tego kodeka (np. MJPEG) oznacza,
+            // że branch A nie ruszy, pipeline nie da klatek, a sesja zejdzie na
+            // ścieżkę CPU. Logujemy, żeby było jasne dlaczego.
+            tracing::warn!(
+                encoding = %encoding,
+                error = %e,
+                "rtsp: nie udało się zbudować gałęzi NVDEC — fallback CPU nastąpi przez sesję"
+            );
+        }
+    };
+    let build_decoder = std::sync::Arc::new(build_decoder);
+    if let Some(caps) = queue_a_src.current_caps() {
+        build_decoder(&caps);
+    } else {
+        let build_notify = build_decoder.clone();
+        // Patrz komentarz w `build_rtsp_pipeline_gpu_resident`: `connect_notify`
+        // (nie `_local`), bo `notify::caps` fired jest na wątku streamingu, a
+        // domknięcie łapie tylko stan Send+Sync (AtomicBool + WeakRef).
+        queue_a_src.connect_notify(Some("caps"), move |pad, _spec| {
+            if let Some(caps) = pad.current_caps() {
+                build_notify(&caps);
+            }
+        });
+    }
+
+    // Front RTP identyczny jak w pozostałych wariantach.
+    connect_rtspsrc_video_pad(&rtspsrc, &rtp_filter);
+
+    // Expose the decode tee only on the NV12 crops path — that is where the crops
+    // frame is NV12 and the on-demand RGB branch attaches (Stage 3). On the RGB
+    // crops path (gpu_resize / NvdecCpuConvert) no on-demand convert is needed.
+    let decode_tee = if nv12_detect { decode_tee } else { None };
+    Ok(RtspPipelineHandles {
+        pipeline,
+        tee,
+        decode_tee,
+    })
 }
 
 /// Tworzy i wpina łańcuch dekodera NVDEC `depay → parse → nvhXdec` między
-/// `queue_a` a `cudaconvert`, dobierając elementy wg `encoding-name` RTP:
+/// `queue_a` a `downstream`, dobierając elementy wg `encoding-name` RTP:
 /// H264 → rtph264depay+h264parse+nvh264dec, H265/HEVC → rtph265depay+
-/// h265parse+nvh265dec. Po dodaniu elementów podnosi ich stan do stanu
+/// h265parse+nvh265dec. `downstream` to element, do którego wpina się wyjście
+/// dekodera: `cudaconvert` w wariancie GPU-resident (konwersja kolorów na GPU)
+/// lub `cudadownload` w wariancie NvdecCpuConvert (od razu zejście do pamięci
+/// hosta, konwersja na CPU). Po dodaniu elementów podnosi ich stan do stanu
 /// pipeline'u (`sync_state_with_parent`), bo dokładamy je po starcie. Zwraca
 /// błąd dla kodeków bez odpowiednika NVDEC (np. MJPEG) — wtedy branch A nie
 /// rusza i sesja schodzi na CPU.
 fn link_nvdec_branch(
     pipeline: &gst::Pipeline,
     queue_a: &gst::Element,
-    cudaconvert: &gst::Element,
+    downstream: &gst::Element,
     encoding: &str,
 ) -> std::result::Result<(), String> {
     let (depay_name, parse_name, dec_name) = if encoding.eq_ignore_ascii_case("H264") {
@@ -819,11 +1605,31 @@ fn link_nvdec_branch(
     let dec = gst::ElementFactory::make(dec_name)
         .build()
         .map_err(|e| format!("{dec_name}: {e}"))?;
+    // Pin NVDEC to CUDA device 0 so its output device pointer shares the same
+    // primary context ORT's CUDA/TRT provider runs on — required for the Stage-4
+    // zero-copy detect (a device pointer from another device fails validation and
+    // falls back). Harmless on the download path. Guarded: skip if the decoder
+    // build lacks the property.
+    // Only set when actually settable NOW: on some nvcodec builds `cuda-device-id`
+    // exists but is read-only or CONSTRUCT_ONLY (fixed at element creation), and
+    // `set_property_from_str` PANICS on a non-writable prop. Skip silently otherwise
+    // — nvh264dec then uses its default device (0); a non-device-0 pointer just fails
+    // zero-copy validation and falls back to the download path, never crashing.
+    if dec
+        .find_property("cuda-device-id")
+        .map(|p| p.flags())
+        .is_some_and(|f| {
+            f.contains(gst::glib::ParamFlags::WRITABLE)
+                && !f.contains(gst::glib::ParamFlags::CONSTRUCT_ONLY)
+        })
+    {
+        dec.set_property_from_str("cuda-device-id", "0");
+    }
 
     pipeline
         .add_many([&depay, &parse, &dec])
         .map_err(|e| format!("add_many nvdec: {e}"))?;
-    gst::Element::link_many([queue_a, &depay, &parse, &dec, cudaconvert])
+    gst::Element::link_many([queue_a, &depay, &parse, &dec, downstream])
         .map_err(|e| format!("link nvdec branch: {e}"))?;
 
     for el in [&depay, &parse, &dec] {
@@ -884,6 +1690,8 @@ fn install_frame_callback(
                     timestamp_unix_ms: ts_ms,
                     pts_ns,
                     data: shared.clone(),
+                    format: super::fakefile::DetectFrameFormat::Rgb24,
+                    device: None,
                 });
                 counters_cb.increment_public(ts_ms / 1000);
 
@@ -987,7 +1795,10 @@ fn install_base_pts_probe(pad: gst::Pad, publisher: &Arc<Mp4StreamPublisher>) {
 /// bo Branch A i B dziela `tee` przed dekodem/muxem — klient odejmuje te baze
 /// od PTS detekcji, kotwiczac overlay na wlasciwej klatce MSE. WYLACZNIE dla
 /// gałęzi passthrough (bez transkodu) — za x264enc PTS jest juz przesuniety.
-pub(super) fn install_mux_base_pts_probe(parse: &gst::Element, publisher: &Arc<Mp4StreamPublisher>) {
+pub(super) fn install_mux_base_pts_probe(
+    parse: &gst::Element,
+    publisher: &Arc<Mp4StreamPublisher>,
+) {
     if let Some(parse_src) = parse.static_pad("src") {
         install_base_pts_probe(parse_src, publisher);
     }
@@ -1300,8 +2111,7 @@ fn attach_mp4_branch_preview(
     let queue_b_sink = queue_b
         .static_pad("sink")
         .ok_or_else(|| "queue_b preview sink pad missing".to_string())?;
-    gst::Element::link_many(elements)
-        .map_err(|e| format!("link branch B preview: {e}"))?;
+    gst::Element::link_many(elements).map_err(|e| format!("link branch B preview: {e}"))?;
 
     wire_mp4_appsink(&sink, publisher)?;
 
@@ -1381,7 +2191,11 @@ fn attach_mp4_branch_preview(
 
 /// Walk Branch B's elements back to NULL and remove them from the pipeline.
 /// Idempotent: the caller is expected to `.take()` the state once.
-pub(super) fn detach_mp4_branch(pipeline: &gst::Pipeline, tee: &gst::Element, state: Mp4BranchState) {
+pub(super) fn detach_mp4_branch(
+    pipeline: &gst::Pipeline,
+    tee: &gst::Element,
+    state: Mp4BranchState,
+) {
     // Unlink the request pad first so the upstream tee stops pushing into
     // a half-disposed branch. `unlink` on an already-unlinked pad is a no-op.
     if let Some(peer) = state.tee_src_pad.peer() {
@@ -1395,6 +2209,87 @@ pub(super) fn detach_mp4_branch(pipeline: &gst::Pipeline, tee: &gst::Element, st
         tracing::warn!("rtsp: branch B remove_many failed: {e:?}");
     }
     tee.release_request_pad(&state.tee_src_pad);
+}
+
+/// Attach the ON-DEMAND RGB streaming branch (Stage 3) off the post-`cudadownload`
+/// decode tee (raw NV12 in host memory). Modeled exactly on [`attach_mp4_branch`]:
+/// build + add + link + `sync_state_with_parent` the whole branch, THEN request a
+/// tee src pad and link it last (a tee pad linked before the branch is active gets
+/// permanently marked flushing). Branch:
+///   `tee_decode → queue(leaky) → videoconvert(NV12→RGB) → capsfilter(RGB) → appsink`
+/// The appsink feeds `FrameStorage` + `StreamingBus` (the raw-frame consumers),
+/// so this single per-frame full videoconvert runs ONLY while a viewer is
+/// subscribed — steady state (no viewer) does zero full converts. Reuses
+/// [`Mp4BranchState`] + [`detach_mp4_branch`] for teardown (same shape).
+fn attach_rgb_branch(
+    pipeline: &gst::Pipeline,
+    decode_tee: &gst::Element,
+    camera_id: &str,
+) -> std::result::Result<Mp4BranchState, String> {
+    let queue = build_raw_leaky_queue("queue_rgb_stream").map_err(|e| e.to_string())?;
+    let convert = gst::ElementFactory::make("videoconvert")
+        .build()
+        .map_err(|e| format!("videoconvert rgb branch: {e}"))?;
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("format", "RGB")
+        .build();
+    let capsfilter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &caps)
+        .build()
+        .map_err(|e| format!("capsfilter rgb branch: {e}"))?;
+    let sink = gst::ElementFactory::make("appsink")
+        .property("name", "sink_rgb_stream")
+        .property("emit-signals", false)
+        .property("sync", false)
+        .property("max-buffers", 1u32)
+        .property("drop", true)
+        .build()
+        .map_err(|e| format!("appsink rgb branch: {e}"))?;
+    let sink_app = sink
+        .clone()
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_| "rgb branch appsink downcast failed".to_string())?;
+    super::fakefile::install_rgb_stream_callback(&sink_app, camera_id.to_string());
+
+    let elements = [&queue, &convert, &capsfilter, &sink];
+    pipeline
+        .add_many(elements)
+        .map_err(|e| format!("add_many rgb branch: {e}"))?;
+    gst::Element::link_many(elements).map_err(|e| format!("link rgb branch: {e}"))?;
+    for el in elements {
+        el.sync_state_with_parent()
+            .map_err(|e| format!("sync_state rgb branch element: {e}"))?;
+    }
+
+    // Link the tee pad LAST (after the branch is active) — same rationale as
+    // Branch B. On failure tear the just-activated branch down cleanly so a later
+    // attach does not collide on the fixed element names.
+    let queue_sink = queue
+        .static_pad("sink")
+        .ok_or_else(|| "rgb branch queue sink pad missing".to_string())?;
+    let Some(tee_src_pad) = decode_tee.request_pad_simple("src_%u") else {
+        for el in elements {
+            let _ = el.set_state(gst::State::Null);
+        }
+        let _ = pipeline.remove_many(elements);
+        return Err("tee_decode src_%u request for rgb branch failed".to_string());
+    };
+    if let Err(e) = tee_src_pad.link(&queue_sink) {
+        detach_mp4_branch(
+            pipeline,
+            decode_tee,
+            Mp4BranchState {
+                tee_src_pad,
+                elements: vec![queue, convert, capsfilter, sink],
+            },
+        );
+        return Err(format!("tee_decode → rgb queue: {e:?}"));
+    }
+
+    Ok(Mp4BranchState {
+        tee_src_pad,
+        elements: vec![queue, convert, capsfilter, sink],
+    })
 }
 
 /// Zamyka strumień fMP4 aktywnej gałęzi B przy rozbiórce pipeline'u (reconnect,
@@ -1459,9 +2354,18 @@ pub async fn run_rtsp_session(
     } else {
         resolve_use_hw_decode(&config)
     };
+    // Czy dobudować gałąź GPU-owego skalowania klatki detekcji (4K→560 na GPU,
+    // zdejmuje ~4 ms resize'u z detektora). Start wg `gpu_resize_enabled`
+    // (elementy CUDA obecne + brak `TENTAFLOW_VISION_GPU_RESIZE=0`). Po
+    // nieudanej negocjacji CUDA przy Playing schodzimy na pojedynczy appsink
+    // (detektor resize'uje na CPU) i zostajemy tam do końca sesji — „musi
+    // działać". Dotyczy MJPEG i RTSP jednakowo (skalowanie działa też przy
+    // dekodzie CPU).
+    let mut gpu_resize = gpu_resize_enabled();
     tracing::info!(
         camera_id = %cam_id,
         path = ingest_path.label(),
+        gpu_resize,
         "rtsp: wybrana ścieżka ingestu (fallback na CPU przy błędzie negocjacji)"
     );
 
@@ -1528,6 +2432,7 @@ pub async fn run_rtsp_session(
                 &final_url,
                 http_creds.as_ref(),
                 timeout_secs,
+                gpu_resize,
                 mailbox.clone(),
                 counters.clone(),
             )
@@ -1538,6 +2443,7 @@ pub async fn run_rtsp_session(
                 timeout_secs,
                 ingest_path,
                 use_hw_decode,
+                gpu_resize,
                 mailbox.clone(),
                 counters.clone(),
             )
@@ -1546,17 +2452,38 @@ pub async fn run_rtsp_session(
             Ok(h) => h,
             Err(e) => {
                 let reason = redact_url_in_text(&format!("build failed: {e}"));
-                // Fallback budowy GPU-resident → CPU. Gdy wariant GPU-resident
-                // nie zbuduje się (np. element CUDA zniknął z rejestru),
-                // przebudowujemy od razu na zawsze działającą ścieżkę CPU
-                // zamiast kończyć sesję błędem.
-                if ingest_path == IngestPath::GpuResidentNvidia {
+                // Fallback budowy: najpierw zdejmij gałąź GPU-resize (najświeższe
+                // ryzyko — element CUDA zniknął / caps), potem ewentualnie
+                // GPU-resident → CPU. Rozbieramy stopniowo do „zawsze działa".
+                if gpu_resize {
                     tracing::warn!(
                         camera_id = %cam_id,
                         reason = %reason,
-                        "rtsp: budowa pipeline GPU-resident nie powiodła się — przełączam na CPU"
+                        "rtsp: budowa gałęzi GPU-resize nie powiodła się — wyłączam GPU-resize (CPU resize w detektorze)"
                     );
-                    ingest_path = IngestPath::Cpu;
+                    gpu_resize = false;
+                    continue 'outer;
+                }
+                // Fallback budowy GPU (GPU-resident lub NVDEC) → niższa ścieżka.
+                // Gdy wariant sprzętowy nie zbuduje się (np. element CUDA/NVDEC
+                // zniknął z rejestru), schodzimy o jeden szczebel
+                // (`degrade_ingest_path`: NvdecNv12 → NvdecCpuConvert → Cpu)
+                // zamiast kończyć sesję błędem.
+                if matches!(
+                    ingest_path,
+                    IngestPath::GpuResidentNvidia
+                        | IngestPath::NvdecNv12
+                        | IngestPath::NvdecCpuConvert
+                ) {
+                    let next = degrade_ingest_path(ingest_path);
+                    tracing::warn!(
+                        camera_id = %cam_id,
+                        reason = %reason,
+                        path = ingest_path.label(),
+                        next = next.label(),
+                        "rtsp: budowa pipeline GPU nie powiodła się — schodzę o szczebel niżej"
+                    );
+                    ingest_path = next;
                     continue 'outer;
                 }
                 tracing::error!(camera_id = %cam_id, reason = %reason, "rtsp: pipeline build failed");
@@ -1575,6 +2502,14 @@ pub async fn run_rtsp_session(
         };
         let pipeline = &handles.pipeline;
         let tee = handles.tee.clone();
+        // On-demand RGB streaming branch (Stage 3): present only on the
+        // GPU-resident NV12 crops path (`decode_tee` is `Some`). Attached in the
+        // tick when a raw-frame subscriber appears, detached when the last one
+        // leaves — so the full NV12→RGB videoconvert runs ONLY while watched. Dies
+        // with the pipeline on teardown/reconnect (no explicit teardown needed,
+        // like Branch B's elements).
+        let decode_tee = handles.decode_tee.clone();
+        let mut rgb_branch: Option<Mp4BranchState> = None;
         // Branch B mux state — `Some` whenever a consumer is subscribed.
         // Dwa niezależne sloty na tym samym tee: pełna jakość (passthrough,
         // klucz hubu `camera:<id>`) i podgląd (transkod 720p, klucz
@@ -1600,15 +2535,37 @@ pub async fn run_rtsp_session(
             let reason = redact_url_in_text(&raw_reason);
             tracing::error!(camera_id = %cam_id, reason = %reason, "rtsp: set_state Playing failed");
             let _ = super::session::set_state_blocking(pipeline, gst::State::Null).await;
-            // Ścieżka GPU-resident padła już przy przejściu do Playing —
-            // natychmiast schodzimy na CPU (bez backoffu).
-            if ingest_path == IngestPath::GpuResidentNvidia {
+            // Gałąź GPU-resize padła przy przejściu do Playing (negocjacja caps
+            // cudascale) — najpierw ją zdejmujemy (bez backoffu). Detekcja dalej
+            // działa: mailbox `get_detect` zwraca wtedy klatkę crops i detektor
+            // resize'uje na CPU. Rozbieramy najświeższe ryzyko przed dekoderem.
+            if gpu_resize {
                 tracing::warn!(
                     camera_id = %cam_id,
                     reason = %reason,
-                    "rtsp: ścieżka GPU-resident zawiodła przy starcie (set_state) — przełączam na CPU"
+                    "rtsp: gałąź GPU-resize zawiodła przy starcie (set_state) — wyłączam GPU-resize (CPU resize w detektorze)"
                 );
-                ingest_path = IngestPath::Cpu;
+                gpu_resize = false;
+                streaming_bus().close_camera(&cam_id, &reason).await;
+                backoff = policy.initial_backoff;
+                continue 'outer;
+            }
+            // Ścieżka GPU (GPU-resident lub NVDEC) padła już przy przejściu do
+            // Playing — schodzimy o jeden szczebel (NvdecNv12 → NvdecCpuConvert
+            // → Cpu) bez backoffu.
+            if matches!(
+                ingest_path,
+                IngestPath::GpuResidentNvidia | IngestPath::NvdecNv12 | IngestPath::NvdecCpuConvert
+            ) {
+                let next = degrade_ingest_path(ingest_path);
+                tracing::warn!(
+                    camera_id = %cam_id,
+                    reason = %reason,
+                    path = ingest_path.label(),
+                    next = next.label(),
+                    "rtsp: ścieżka GPU zawiodła przy starcie (set_state) — schodzę o szczebel niżej"
+                );
+                ingest_path = next;
                 streaming_bus().close_camera(&cam_id, &reason).await;
                 backoff = policy.initial_backoff;
                 continue 'outer;
@@ -1719,6 +2676,10 @@ pub async fn run_rtsp_session(
                             let deadline = tokio::time::Instant::now() + Duration::from_millis(4500);
                             let snap = loop {
                                 if let Some(f) = mailbox.get() {
+                                    // Detect frame (Arc-shared) rides alongside
+                                    // the crops frame in ONE round-trip; falls
+                                    // back to crops when the GPU detect branch is
+                                    // absent, so detection always has an input.
                                     break Ok(SnapshotData {
                                         camera_id: cam_id.clone(),
                                         width: f.width,
@@ -1727,6 +2688,8 @@ pub async fn run_rtsp_session(
                                         timestamp_unix_ms: f.timestamp_unix_ms,
                                         pts_ns: f.pts_ns,
                                         data: f.data.to_vec(),
+                                        crops_format: f.format,
+                                        detect: mailbox.get_detect(),
                                     });
                                 }
                                 let h = health_tx.borrow().clone();
@@ -1856,6 +2819,28 @@ pub async fn run_rtsp_session(
                         break Some(reason);
                     }
 
+                    // On-demand RGB branch (Stage 3, NV12 crops path only): attach
+                    // when a raw-frame subscriber appears, detach when the last one
+                    // leaves. Steady state (no viewer) = zero full videoconvert; the
+                    // analysis path stays NV12 regardless.
+                    if let Some(decode_tee) = decode_tee.as_ref() {
+                        let watched = !streaming_bus().list_subscribers(&cam_id).is_empty();
+                        if watched && rgb_branch.is_none() {
+                            match attach_rgb_branch(pipeline, decode_tee, &cam_id) {
+                                Ok(state) => {
+                                    rgb_branch = Some(state);
+                                    tracing::info!(camera_id = %cam_id, "rtsp: on-demand RGB branch attached (viewer subscribed)");
+                                }
+                                Err(e) => tracing::warn!(camera_id = %cam_id, error = %e, "rtsp: on-demand RGB branch attach failed"),
+                            }
+                        } else if !watched {
+                            if let Some(state) = rgb_branch.take() {
+                                detach_mp4_branch(pipeline, decode_tee, state);
+                                tracing::info!(camera_id = %cam_id, "rtsp: on-demand RGB branch detached (no viewers)");
+                            }
+                        }
+                    }
+
                     let (total, dropped, last_at) = counters.snapshot();
                     let delta = total.saturating_sub(last_total) as f32;
                     last_total = total;
@@ -1928,19 +2913,48 @@ pub async fn run_rtsp_session(
         let reason =
             redact_url_in_text(&inner_reason.unwrap_or_else(|| "unknown pipeline failure".into()));
 
-        // Fallback GPU-resident → CPU. Pipeline GPU-resident padł na busie,
-        // ZANIM wszedł Online (brak ani jednej klatki) — typowy objaw
-        // nieudanej negocjacji łańcucha CUDA albo kodeka bez NVDEC (np. MJPEG,
-        // gdy gałąź NVDEC się nie wpięła). Przebudowujemy natychmiast na CPU
-        // (bez backoffu, bez liczenia do limitu prób). Gdy GPU-resident zdążyło
-        // dać klatki (`online`), traktujemy awarię jako sieciową i zostajemy.
-        if ingest_path == IngestPath::GpuResidentNvidia && !online {
+        // Fallback GPU-resize → CPU resize. Pipeline padł na busie ZANIM wszedł
+        // Online (brak ani jednej klatki) — gałąź detekcji negocjuje caps przy
+        // prerollu (PAUSED→PLAYING), więc `not-negotiated` na `cudascale`/
+        // `cudaupload` wywala pipeline zanim klatka crops dojdzie do appsinku.
+        // Zdejmujemy gałąź GPU-resize PRZED fallbackami dekodera (jest w obu
+        // wariantach dekodowania — inaczej GPU-resident↔CPU wpadłyby w pętlę na
+        // tej samej wadliwej gałęzi). Detekcja dalej działa (CPU resize).
+        // Gdy klatki już poszły (`online`), to awaria sieciowa — zostawiamy
+        // GPU-resize włączone.
+        if gpu_resize && !online {
             tracing::warn!(
                 camera_id = %cam_id,
                 reason = %reason,
-                "rtsp: ścieżka GPU-resident zawiodła na starcie — przełączam na CPU"
+                "rtsp: gałąź GPU-resize zawiodła na starcie — wyłączam GPU-resize (CPU resize w detektorze)"
             );
-            ingest_path = IngestPath::Cpu;
+            gpu_resize = false;
+            streaming_bus().close_camera(&cam_id, &reason).await;
+            backoff = policy.initial_backoff;
+            continue 'outer;
+        }
+
+        // Fallback GPU (GPU-resident lub NVDEC) → niższa ścieżka. Pipeline
+        // sprzętowy padł na busie, ZANIM wszedł Online (brak ani jednej klatki)
+        // — typowy objaw nieudanej negocjacji łańcucha CUDA/NVDEC albo kodeka
+        // bez NVDEC (np. MJPEG, gdy gałąź NVDEC się nie wpięła). Schodzimy o
+        // jeden szczebel (NvdecNv12 → NvdecCpuConvert → Cpu) bez backoffu i bez
+        // liczenia do limitu prób. Gdy ścieżka sprzętowa zdążyła dać klatki
+        // (`online`), traktujemy awarię jako sieciową i zostajemy.
+        if matches!(
+            ingest_path,
+            IngestPath::GpuResidentNvidia | IngestPath::NvdecNv12 | IngestPath::NvdecCpuConvert
+        ) && !online
+        {
+            let next = degrade_ingest_path(ingest_path);
+            tracing::warn!(
+                camera_id = %cam_id,
+                reason = %reason,
+                path = ingest_path.label(),
+                next = next.label(),
+                "rtsp: ścieżka GPU zawiodła na starcie — schodzę o szczebel niżej"
+            );
+            ingest_path = next;
             streaming_bus().close_camera(&cam_id, &reason).await;
             backoff = policy.initial_backoff;
             continue 'outer;
@@ -2250,7 +3264,11 @@ mod tests {
     async fn test_teardown_closes_active_mp4_stream() {
         use crate::services::stream_hub::BinaryStreamSource;
         let (cmd_tx, _cmd_rx) = mpsc::channel(8);
-        let publisher = Arc::new(Mp4StreamPublisher::new("cam_teardown".into(), cmd_tx, false));
+        let publisher = Arc::new(Mp4StreamPublisher::new(
+            "cam_teardown".into(),
+            cmd_tx,
+            false,
+        ));
         let mut rx = publisher
             .chunk_broadcaster()
             .expect("broadcaster live")
@@ -2365,13 +3383,22 @@ mod tests {
 
     #[test]
     fn ingest_path_default_matches_runtime_gpu_availability() {
-        // Bez override ścieżka startowa zależy wyłącznie od tego, czy runtime
-        // ma kompletny łańcuch GPU-resident. Na maszynie z NVIDIA + CUDA wyjdzie
-        // GPU-resident, na pozostałych CPU — test pilnuje spójności tej reguły
-        // z `gpu_resident_available`, nie konkretnego sprzętu CI.
+        // Bez override ścieżka startowa zależy wyłącznie od tego, które elementy
+        // runtime ma: pełny łańcuch GPU-resident, samo NVDEC + cudadownload, czy
+        // nic z tego. Test pilnuje spójności tej kaskady precedencji z
+        // `gpu_resident_available`/`nvdec_decode_available`, nie konkretnego
+        // sprzętu CI.
         let cfg = CameraConfig::new_unowned("cam_auto", "rtsp", "rtsp://x/y", 30, None);
         let expected = if gpu_resident_available() {
             IngestPath::GpuResidentNvidia
+        } else if nvdec_decode_available() {
+            // NVDEC ingest prefers the GPU NV12 detect path when the ort GPU
+            // features are built; else the CPU-convert NVDEC path.
+            if nv12_gpu_detect_available() {
+                IngestPath::NvdecNv12
+            } else {
+                IngestPath::NvdecCpuConvert
+            }
         } else {
             IngestPath::Cpu
         };
@@ -2379,12 +3406,38 @@ mod tests {
     }
 
     #[test]
-    fn ingest_path_labels_are_distinct() {
-        assert_ne!(
-            IngestPath::GpuResidentNvidia.label(),
-            IngestPath::Cpu.label()
+    fn degrade_ingest_steps_down_one_rung() {
+        // NV12 detect degrades to the deployed NVDEC+CPU-convert path first
+        // (keeps GPU decode); every other hardware path degrades to CPU.
+        assert_eq!(
+            degrade_ingest_path(IngestPath::NvdecNv12),
+            IngestPath::NvdecCpuConvert
         );
+        assert_eq!(
+            degrade_ingest_path(IngestPath::NvdecCpuConvert),
+            IngestPath::Cpu
+        );
+        assert_eq!(
+            degrade_ingest_path(IngestPath::GpuResidentNvidia),
+            IngestPath::Cpu
+        );
+    }
+
+    #[test]
+    fn ingest_path_labels_are_distinct() {
+        let labels = [
+            IngestPath::GpuResidentNvidia.label(),
+            IngestPath::NvdecNv12.label(),
+            IngestPath::NvdecCpuConvert.label(),
+            IngestPath::Cpu.label(),
+        ];
+        let mut deduped = labels.to_vec();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(deduped.len(), labels.len(), "etykiety muszą być unikalne");
         assert!(IngestPath::GpuResidentNvidia.label().contains("GPU"));
+        assert!(IngestPath::NvdecNv12.label().contains("NV12"));
+        assert!(IngestPath::NvdecCpuConvert.label().contains("NVDEC"));
     }
 
     #[test]

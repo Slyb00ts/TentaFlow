@@ -1607,6 +1607,33 @@ impl ModelRuntimeExecutor {
             })
     }
 
+    /// Resolves a camera-CV model alias to its LOCAL embedded `engine_id`, but
+    /// only when the top-ranked live candidate is an in-process `Embedded`
+    /// backend on THIS node. Returns `None` for mesh-forward / remote / dynamic
+    /// non-embedded targets (and when nothing resolves), so the camera analysis
+    /// engine can take the direct batched-singleton fast path exclusively for
+    /// aliases that truly map to a bundled in-process engine (rfdetr-adr /
+    /// nalepka-stan / plate-ocr / onnx-cv …) and fall back to the per-crop
+    /// `execute_camera_cv` path for everything else. Resolution reuses the same
+    /// surface/modality contract as `execute_camera_cv`.
+    pub fn local_camera_cv_engine(&self, model: &str, ctx: &mut ExecutionContext) -> Option<String> {
+        let target = self
+            .resolve_proxy_target(
+                model,
+                ServiceSurface::CameraCv,
+                &[InputModality::Image],
+                ctx,
+            )
+            .ok()?;
+        match target {
+            ResolvedExecutionTarget::Local {
+                handle: BackendHandle::Embedded { engine_id, .. },
+                ..
+            } => Some(engine_id),
+            _ => None,
+        }
+    }
+
     /// Per-target embeddings dispatch. Embedded backends route through
     /// `LocalInferenceHandler::handle_embeddings` — engines that don't
     /// implement embeddings (the trait default is `bail!`) surface their

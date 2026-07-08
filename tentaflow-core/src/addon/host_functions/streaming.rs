@@ -29,7 +29,9 @@ use super::{audit_log_with_risk, check_permission, get_memory, AddonState, WasmC
 use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
 use crate::db::repository::get_camera_for_addon;
-use crate::services::streaming::{NextOutcome, StreamFilter, StreamMessage, StreamSubscriber};
+use crate::services::streaming::{
+    NextOutcome, StreamFilter, StreamId, StreamMessage, StreamSubscriber,
+};
 use crate::services::streaming_bus;
 
 // =============================================================================
@@ -50,15 +52,27 @@ const PERM_STREAMS_SUBSCRIBE: &str = "streams.subscribe";
 type RegistryKey = (String, String);
 
 struct SubscriberSlot {
-    /// Camera id is duplicated here so future eager `unsubscribe(bus, …)`
-    /// paths do not have to re-query DB. Today the lazy reap path covers it,
-    /// so `#[allow(dead_code)]` until M3 wires explicit unsubscribe.
-    #[allow(dead_code)]
+    /// Camera id + bus stream id are duplicated here so the RAII `Drop` guard
+    /// can `unsubscribe` from the bus without re-querying the DB or locking
+    /// the subscriber.
     camera_id: String,
+    stream_id: StreamId,
     /// `Arc<tokio::sync::Mutex<…>>` — `stream_next` is sync from the host side
     /// (it goes through `run_async`) but mutates the subscriber's receiver, so
     /// concurrent calls on the same stream_id must serialize.
     subscriber: Arc<tokio::sync::Mutex<StreamSubscriber>>,
+}
+
+impl Drop for SubscriberSlot {
+    /// RAII cleanup — fires on EVERY registry removal (explicit `stream_close`,
+    /// `CameraOffline`/`Closed` eviction in `stream_next`, quota-clear tests).
+    /// Removing the bus entry here — rather than relying on the lazy
+    /// broadcast-only reap — guarantees `list_subscribers` shrinks promptly
+    /// when a viewer disconnects, so the RTSP session tick detaches its
+    /// expensive on-demand RGB convert branch instead of running it forever.
+    fn drop(&mut self) {
+        streaming_bus().unsubscribe(&self.camera_id, &self.stream_id);
+    }
 }
 
 static SUBSCRIBERS: OnceLock<DashMap<RegistryKey, SubscriberSlot>> = OnceLock::new();
@@ -256,11 +270,13 @@ pub fn stream_subscribe_v1(
         None => StreamFilter::default(),
     };
     let sub = streaming_bus().subscribe(&camera_id, filter);
-    let stream_id = sub.stream_id.to_string();
+    let stream_id_typed = sub.stream_id.clone();
+    let stream_id = stream_id_typed.to_string();
     registry.insert(
         (addon_id.clone(), stream_id.clone()),
         SubscriberSlot {
             camera_id: camera_id.clone(),
+            stream_id: stream_id_typed,
             subscriber: Arc::new(tokio::sync::Mutex::new(sub)),
         },
     );
@@ -372,6 +388,7 @@ pub fn stream_next_v1(
         }) => {
             let pf = match metadata.pixel_format {
                 crate::services::frame_storage::FramePixelFormat::Rgb24 => "rgb24",
+                crate::services::frame_storage::FramePixelFormat::Nv12 => "nv12",
             };
             let out = StreamNextOutput::frame(
                 frame_ref.as_str().to_string(),
@@ -545,11 +562,10 @@ pub fn stream_close_v1(
     }
     let addon_id = caller.data().addon_id.clone();
     let key = (addon_id, input.stream_id.clone());
-    // Dropping the slot drops the `Arc<Mutex<StreamSubscriber>>` which closes
-    // the receiver; the next `broadcast` from the bus side will see `Closed`
-    // on `try_send` and prune the dead entry. We do not have the original
-    // `StreamId` here so the explicit `unsubscribe(camera_id, &sid)` path is
-    // skipped — the lazy reap path covers it.
+    // Removing the slot drops it; its `Drop` guard eagerly calls
+    // `streaming_bus().unsubscribe(camera_id, stream_id)`, so the bus entry
+    // disappears immediately (no dependence on the next broadcast) and the
+    // `Arc<Mutex<StreamSubscriber>>` receiver closes with it.
     if subscribers().remove(&key).is_some() {
         audit(
             caller.data(),
@@ -623,11 +639,13 @@ pub mod test_api {
     #[doc(hidden)]
     pub fn subscribe_for_test(addon_id: &str, camera_id: &str) -> String {
         let sub = streaming_bus().subscribe(camera_id, StreamFilter::default());
-        let stream_id = sub.stream_id.to_string();
+        let stream_id_typed = sub.stream_id.clone();
+        let stream_id = stream_id_typed.to_string();
         subscribers().insert(
             (addon_id.to_string(), stream_id.clone()),
             SubscriberSlot {
                 camera_id: camera_id.to_string(),
+                stream_id: stream_id_typed,
                 subscriber: Arc::new(tokio::sync::Mutex::new(sub)),
             },
         );
@@ -660,6 +678,25 @@ mod tests {
         assert_eq!(per_addon, MAX_STREAMS_PER_ADDON);
         // Any further subscribe for the same addon would exceed the cap.
         assert!(per_addon >= MAX_STREAMS_PER_ADDON);
+    }
+
+    #[test]
+    fn slot_drop_unsubscribes_from_bus() {
+        // subscribe_for_test registers a bus subscriber AND a registry slot.
+        // Removing the slot must fire the RAII `Drop` guard and clear the bus
+        // entry immediately — with NO broadcast — so `list_subscribers` (which
+        // gates the on-demand RGB convert branch) shrinks the moment the
+        // viewer's slot goes away.
+        let addon = format!("addon-drop-{}", uuid::Uuid::new_v4());
+        let cam = format!("cam-drop-{}", uuid::Uuid::new_v4());
+        let sid = test_api::subscribe_for_test(&addon, &cam);
+        assert_eq!(streaming_bus().list_subscribers(&cam).len(), 1);
+        // Explicit close path: removing the slot drops the guard.
+        assert!(subscribers().remove(&(addon, sid)).is_some());
+        assert!(
+            streaming_bus().list_subscribers(&cam).is_empty(),
+            "bus entry must be gone after slot drop without a broadcast"
+        );
     }
 
     #[test]

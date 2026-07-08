@@ -597,6 +597,7 @@ pub fn build_session_pool_from_file(
     cache_root: &std::path::Path,
     trt_profile: Option<&TrtShapeProfile>,
     n: usize,
+    fp16: bool,
 ) -> Result<SessionPool> {
     let n = n.clamp(1, MAX_SESSIONS_PER_MODEL);
     // Self-heal an ONNX external-data name mismatch before ANY session opens the
@@ -618,6 +619,7 @@ pub fn build_session_pool_from_file(
                 &cache_root.join(subdir),
                 trt_profile.as_ref(),
                 device_id,
+                fp16,
             )
             .map_err(|e| anyhow!("session slot {i} on GPU device {device_id}: {e:#}"))
         }
@@ -658,8 +660,9 @@ pub fn build_ort_session(
     trt_cache_dir: &std::path::Path,
     trt_profile: Option<&TrtShapeProfile>,
     device_id: i32,
+    fp16: bool,
 ) -> Result<ort::session::Session> {
-    session_builder_with_eps(trt_cache_dir, trt_profile, device_id)?
+    session_builder_with_eps(trt_cache_dir, trt_profile, device_id, fp16)?
         .commit_from_file(model_path)
         .map_err(|e| anyhow!("ort commit_from_file {}: {e}", model_path.display()))
 }
@@ -672,16 +675,31 @@ pub fn build_ort_session_from_memory(
     trt_cache_dir: &std::path::Path,
     trt_profile: Option<&TrtShapeProfile>,
     device_id: i32,
+    fp16: bool,
 ) -> Result<ort::session::Session> {
-    session_builder_with_eps(trt_cache_dir, trt_profile, device_id)?
+    session_builder_with_eps(trt_cache_dir, trt_profile, device_id, fp16)?
         .commit_from_memory(model_bytes)
         .map_err(|e| anyhow!("ort commit_from_memory: {e}"))
+}
+
+/// Whether the small OCR / classifier CRNN heads run in TensorRT FP16. Default
+/// FALSE (fp32) — fp16 rounding corrupts character reads. `TENTAFLOW_VISION_OCR_FP16=1`
+/// forces fp16 back on for A/B comparison of accuracy vs speed on a live feed.
+pub fn ocr_fp16() -> bool {
+    std::env::var("TENTAFLOW_VISION_OCR_FP16")
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
 }
 
 fn session_builder_with_eps(
     trt_cache_dir: &std::path::Path,
     trt_profile: Option<&TrtShapeProfile>,
     device_id: i32,
+    fp16: bool,
 ) -> Result<ort::session::builder::SessionBuilder> {
     use ort::ep::{ExecutionProvider, ExecutionProviderDispatch};
     use ort::session::Session;
@@ -709,7 +727,11 @@ fn session_builder_with_eps(
             .with_engine_cache(true)
             .with_engine_cache_path(trt_cache_dir.to_string_lossy().to_string())
             .with_timing_cache(true)
-            .with_fp16(true);
+            // FP16 boosts detector throughput and it tolerates the precision loss
+            // (localization is robust). Small CRNN OCR heads do NOT: fp16 rounding
+            // flips argmax on ambiguous glyphs (3↔2, 8↔0), silently corrupting reads
+            // — so OCR/classifier sessions pass `fp16=false`. See `ocr_fp16`.
+            .with_fp16(fp16);
         // Explicit min/opt/max shape profile (trt_profile_{min,opt,max}_shapes):
         // one engine covers the whole batch range instead of a per-batch-size
         // rebuild stall. An input outside the range makes ORT's TRT EP update
@@ -751,8 +773,23 @@ fn session_builder_with_eps(
         info!("[ort] dostępne EP w runtime — CoreML={coreml} (priorytet: CoreML>CPU)");
     }
 
+    // Anti-spin: each pooled session lives on its OWN dedicated OS thread and runs
+    // one forward at a time, and cross-session parallelism comes from N sessions —
+    // NOT from ORT's per-session thread pools. By default those pools BUSY-SPIN
+    // waiting for work/GPU sync; with 30 sessions that pins every core spinning
+    // (perf: 82 % of CPU in one libonnxruntime spin loop) while the GPU sits at 0 %.
+    // One intra/inter thread + spinning OFF makes the CPU SLEEP on GPU sync instead
+    // of burning a core, so the card can actually be fed → many more cameras/GPU.
     Session::builder()
         .map_err(|e| anyhow!("ort Session::builder: {e}"))?
+        .with_intra_threads(1)
+        .map_err(|e| anyhow!("ort with_intra_threads: {e}"))?
+        .with_inter_threads(1)
+        .map_err(|e| anyhow!("ort with_inter_threads: {e}"))?
+        .with_intra_op_spinning(false)
+        .map_err(|e| anyhow!("ort intra_op_spinning: {e}"))?
+        .with_inter_op_spinning(false)
+        .map_err(|e| anyhow!("ort inter_op_spinning: {e}"))?
         .with_execution_providers(eps)
         .map_err(|e| anyhow!("ort with_execution_providers: {e}"))
 }

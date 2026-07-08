@@ -53,12 +53,14 @@ impl std::fmt::Display for RawFrameRef {
     }
 }
 
-/// Pixel format carried in `FrameMetadata`. F1a only ever produces `Rgb24`
-/// (the GStreamer pipeline forces `video/x-raw,format=RGB`); future
-/// connectors will add variants.
+/// Pixel format carried in `FrameMetadata`. The crops/display path forces
+/// `Rgb24` (the GStreamer pipeline caps `video/x-raw,format=RGB`); `Nv12` is
+/// the GPU-resident detect path's raw NVDEC output (4:2:0, Y plane followed by
+/// interleaved UV), consumed straight by the detector's device preprocess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FramePixelFormat {
     Rgb24,
+    Nv12,
 }
 
 #[derive(Debug, Clone)]

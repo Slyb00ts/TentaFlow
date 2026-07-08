@@ -34,8 +34,11 @@ use crate::vision::burn_backend::{self, VisionBackend, VisionDevice};
 #[cfg(not(feature = "inference-supertonic"))]
 use crate::vision::burn_rfdetr::Model;
 
-/// Square input resolution the exported RF-DETR graph expects.
-const RESOLUTION: u32 = 560;
+/// Square input resolution the exported RF-DETR graph expects. Public so the
+/// camera ingest pipeline can GPU-scale its detect branch to exactly this size
+/// and hit the [`fill_frame`] copy fast-path (single source of truth — the scale
+/// target and the fast-path threshold can never drift apart).
+pub const RESOLUTION: u32 = 560;
 
 /// Nazwa tensora wejściowego w grafie ONNX (`[batch,3,560,560]`).
 #[cfg(feature = "inference-supertonic")]
@@ -116,13 +119,27 @@ impl RfDetrDetector {
             }
             crate::vision::ort_common::ensure_ort_dylib();
             // Fixed 560x560 but VARIABLE batch (per-tick camera count): pin one
-            // TRT engine over 1..=MODEL_BATCH so the first inference of each new
-            // batch size does not trigger a per-shape engine rebuild.
+            // TRT engine over 1..=max_batch so the first inference of each new
+            // batch size does not trigger a per-shape engine rebuild. On a large
+            // GPU (B300) a wider batch amortizes fixed per-launch overhead, so the
+            // profile ceiling and optimization point are env-tunable to measure
+            // and exploit cross-camera batching beyond MODEL_BATCH. Changing these
+            // makes TRT rebuild the engine on next load (profile mismatch).
+            let opt_batch = std::env::var("TENTAFLOW_VISION_OPT_BATCH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n >= 1)
+                .unwrap_or(MODEL_BATCH);
+            let max_batch = std::env::var("TENTAFLOW_VISION_MAX_BATCH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n >= opt_batch)
+                .unwrap_or(opt_batch);
             let trt_profile = crate::vision::ort_common::TrtShapeProfile {
                 input_name: INPUT_NAME.to_string(),
                 min_batch: 1,
-                opt_batch: MODEL_BATCH,
-                max_batch: MODEL_BATCH,
+                opt_batch,
+                max_batch,
                 channels: 3,
                 height: RESOLUTION,
                 width: RESOLUTION,
@@ -144,6 +161,8 @@ impl RfDetrDetector {
                 &dir.join("trt-cache"),
                 Some(&trt_profile),
                 n,
+                // Detector keeps FP16 — localization tolerates it, throughput matters.
+                true,
             )
             .map_err(|e| {
                 anyhow!(
@@ -259,63 +278,172 @@ impl RfDetrDetector {
                 .try_extract_tensor::<f32>()
                 .map_err(|e| anyhow!("rfdetr-ort: extract labels: {e}"))?;
 
-            // Walidacja kształtów PRZED slicowaniem — błędny graf (inny batch/queries/
-            // last-dim) prowadziłby do wycinków poza bufor.
-            if dets_shape.len() != 3 || labels_shape.len() != 3 {
-                bail!(
-                    "rfdetr-ort: nieoczekiwana liczba wymiarów dets {dets_shape:?} / labels {labels_shape:?}"
-                );
-            }
-            let queries = dets_shape[1] as usize;
-            let label_dim = labels_shape[2] as usize;
-            if dets_shape[0] as usize != n || dets_shape[2] != 4 {
-                bail!(
-                    "rfdetr-ort: nieoczekiwany kształt dets {dets_shape:?}, oczekiwano [{n}, queries, 4]"
-                );
-            }
-            if labels_shape[0] as usize != n || labels_shape[1] as usize != queries {
-                bail!(
-                    "rfdetr-ort: nieoczekiwany kształt labels {labels_shape:?}, oczekiwano [{n}, {queries}, label_dim]"
-                );
-            }
-            if label_dim <= num_classes {
-                bail!(
-                    "labels dim {label_dim} must exceed class count {num_classes} (background slot)"
-                );
-            }
-            if dets_v.len() < n * queries * 4 {
-                bail!(
-                    "rfdetr-ort: bufor dets za krótki: {} < {}",
-                    dets_v.len(),
-                    n * queries * 4
-                );
-            }
-            if labels_v.len() < n * queries * label_dim {
-                bail!(
-                    "rfdetr-ort: bufor labels za krótki: {} < {}",
-                    labels_v.len(),
-                    n * queries * label_dim
-                );
-            }
+            // Walidacja kształtów PRZED slicowaniem — WSPÓLNA z detect_batch_gpu,
+            // więc oba wejścia (host tensor tu, device tensor tam) egzekwują ten
+            // sam kontrakt grafu.
+            let (queries, label_dim) = validate_detr_shapes(
+                dets_shape,
+                labels_shape,
+                dets_v.len(),
+                labels_v.len(),
+                n,
+                num_classes,
+            )?;
             Ok((dets_v.to_vec(), labels_v.to_vec(), queries, label_dim))
         })?;
 
-        // Wyjścia ułożone row-major `[N, queries, ...]` — slot `bi` to spójny
-        // wycinek (ta sama funkcja offsetów co ścieżka Burn).
-        let mut results = Vec::with_capacity(n);
-        for bi in 0..n {
-            let (dets_slice, labels_slice) =
-                slot_slices(&dets_owned, &labels_owned, bi, queries, label_dim);
-            results.push(crate::vision::rfdetr_post::postprocess_image(
-                dets_slice,
-                labels_slice,
-                queries,
-                label_dim,
-                &self.classes,
-                threshold,
+        // Decode WSPÓLNY z detect_batch_gpu — współrzędne detekcji nie mogą się
+        // różnić między ścieżką host-tensor a device-tensor.
+        Ok(decode_detr_batch(
+            &dets_owned,
+            &labels_owned,
+            n,
+            queries,
+            label_dim,
+            &self.classes,
+            threshold,
+        ))
+    }
+
+    /// GPU-resident detect: mirror of [`RfDetrDetector::detect_batch`] whose
+    /// input is a batch of NV12 frames preprocessed ENTIRELY on the GPU. The
+    /// fused CUDA kernel (`gpu_preprocess::preprocess_nv12_batch_gpu`) does
+    /// YUV→RGB [+ the SAME Q8 bilinear resize to 560 + /255 + ImageNet
+    /// normalize] the host path does, leaving the NCHW `[n,3,560,560]` f32 input
+    /// in DEVICE memory. That device buffer is handed to ONNX Runtime via
+    /// `TensorRefMut::from_raw` (zero host→device copy of the model input), then
+    /// the SAME RF-DETR forward + decode as `detect_batch` runs — detections are
+    /// bit-parity with the RGB path (the kernel is parity-verified and the
+    /// validate/decode are the shared functions).
+    ///
+    /// `color` is the YUV→RGB matrix/range read from the frame colorimetry
+    /// (default BT.709 limited) and applies to the WHOLE batch — callers batch
+    /// only frames sharing colorimetry. `mean`/`std`/`s` match `fill_frame`.
+    #[cfg(feature = "inference-supertonic")]
+    pub fn detect_batch_gpu(
+        &self,
+        frames: &[crate::vision::gpu_preprocess::Nv12Frame<'_>],
+        color: crate::vision::gpu_preprocess::ColorCoeffs,
+        threshold: Option<f32>,
+    ) -> Result<Vec<Vec<Detection>>> {
+        if frames.is_empty() {
+            return Ok(Vec::new());
+        }
+        let res = RESOLUTION as usize;
+        let n = frames.len();
+
+        // Fused GPU preprocess → device buffer [n,3,560,560] f32.
+        let batch =
+            crate::vision::gpu_preprocess::preprocess_nv12_batch_gpu(frames, res, MEAN, STD, color)?;
+
+        // The device buffer must OUTLIVE the ORT run. It lives in this thread's
+        // reusable preprocess scratch (a thread_local in gpu_preprocess); only
+        // its raw pointer crosses into the pooled session thread. `pool.run`
+        // blocks until the forward completes and this method runs on ONE worker
+        // thread, so no other preprocess call can reallocate the scratch mid-run.
+        let out = self.forward_device_ptr(batch.device_ptr() as usize, n, res, threshold);
+        // Explicit drop marks the end of the device buffer's required lifetime;
+        // the backing memory stays in the thread scratch for the next batch.
+        drop(batch);
+        out
+    }
+
+    /// GPU-resident detect from an ALREADY-preprocessed, OWNED device tensor
+    /// ([`gpu_preprocess::OwnedDeviceTensor`], `[1,3,560,560]` f32 on device 0) —
+    /// the zero-copy (Stage 4) path where the fused NV12→RGB + resize + normalize
+    /// ran directly on the NVDEC decode surface (no host download/re-upload) in
+    /// the appsink callback. Skips preprocess and runs the SAME ORT forward +
+    /// decode as [`detect_batch_gpu`], so detections are bit-identical to the
+    /// download path (same kernel output, same shared decode). The tensor is
+    /// kept alive by the caller (an `Arc`) for the whole blocking run.
+    #[cfg(feature = "inference-supertonic")]
+    pub fn detect_device_tensor(
+        &self,
+        tensor: &crate::vision::gpu_preprocess::OwnedDeviceTensor,
+        threshold: Option<f32>,
+    ) -> Result<Vec<Detection>> {
+        let res = RESOLUTION as usize;
+        if tensor.s() != res || tensor.n() != 1 {
+            return Err(anyhow!(
+                "rfdetr-ort gpu: device tensor shape [{},3,{},{}] != [1,3,{res},{res}]",
+                tensor.n(),
+                tensor.s(),
+                tensor.s()
             ));
         }
-        Ok(results)
+        Ok(self
+            .forward_device_ptr(tensor.device_ptr() as usize, 1, res, threshold)?
+            .into_iter()
+            .next()
+            .unwrap_or_default())
+    }
+
+    /// Shared ORT device-tensor forward + decode for both the download
+    /// ([`detect_batch_gpu`]) and zero-copy ([`detect_device_tensor`]) paths.
+    /// `dev_ptr` is a CUDA device-0 buffer of exactly `n·3·res·res` f32 that the
+    /// CALLER keeps alive for the whole (synchronous, blocking) run.
+    #[cfg(feature = "inference-supertonic")]
+    fn forward_device_ptr(
+        &self,
+        dev_ptr: usize,
+        n: usize,
+        res: usize,
+        threshold: Option<f32>,
+    ) -> Result<Vec<Vec<Detection>>> {
+        let num_classes = self.classes.len();
+        let (dets_owned, labels_owned, queries, label_dim) = self.pool.run(move |session| {
+            use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
+            use ort::value::{Shape, TensorRefMut};
+
+            let info = MemoryInfo::new(
+                AllocationDevice::CUDA,
+                0,
+                AllocatorType::Device,
+                MemoryType::Default,
+            )
+            .map_err(|e| anyhow!("rfdetr-ort gpu: MemoryInfo::new: {e}"))?;
+
+            // SAFETY: `dev_ptr` is a CUDA device buffer of exactly n·3·res·res f32,
+            // valid on device 0, kept alive by the caller for the whole blocking run.
+            let tensor = unsafe {
+                TensorRefMut::<f32>::from_raw(
+                    info,
+                    (dev_ptr as *mut ()).cast(),
+                    Shape::new([n as i64, 3, res as i64, res as i64]),
+                )
+            }
+            .map_err(|e| anyhow!("rfdetr-ort gpu: TensorRefMut::from_raw: {e}"))?;
+
+            let outputs = session
+                .run(ort::inputs! { INPUT_NAME => tensor })
+                .map_err(|e| anyhow!("rfdetr-ort gpu: session.run: {e}"))?;
+
+            let (dets_shape, dets_v) = outputs["dets"]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| anyhow!("rfdetr-ort gpu: extract dets: {e}"))?;
+            let (labels_shape, labels_v) = outputs["labels"]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| anyhow!("rfdetr-ort gpu: extract labels: {e}"))?;
+            let (queries, label_dim) = validate_detr_shapes(
+                dets_shape,
+                labels_shape,
+                dets_v.len(),
+                labels_v.len(),
+                n,
+                num_classes,
+            )?;
+            Ok((dets_v.to_vec(), labels_v.to_vec(), queries, label_dim))
+        })?;
+
+        Ok(decode_detr_batch(
+            &dets_owned,
+            &labels_owned,
+            n,
+            queries,
+            label_dim,
+            &self.classes,
+            threshold,
+        ))
     }
 
     /// Przetwarza N klatek kamer prawdziwym batchowanym forwardem.
@@ -436,6 +564,79 @@ impl RfDetrDetector {
     }
 }
 
+/// Validates the RF-DETR head output shapes/lengths against the batch size and
+/// class table, returning `(queries, label_dim)`. Shared by the host-tensor
+/// (`detect_batch`) and device-tensor (`detect_batch_gpu`) ort paths so the
+/// graph contract can never drift between them. `dets_shape`/`labels_shape`
+/// deref to `[i64]` (ort `Shape`).
+#[cfg(feature = "inference-supertonic")]
+fn validate_detr_shapes(
+    dets_shape: &[i64],
+    labels_shape: &[i64],
+    dets_len: usize,
+    labels_len: usize,
+    n: usize,
+    num_classes: usize,
+) -> Result<(usize, usize)> {
+    if dets_shape.len() != 3 || labels_shape.len() != 3 {
+        bail!(
+            "rfdetr-ort: nieoczekiwana liczba wymiarów dets {dets_shape:?} / labels {labels_shape:?}"
+        );
+    }
+    let queries = dets_shape[1] as usize;
+    let label_dim = labels_shape[2] as usize;
+    if dets_shape[0] as usize != n || dets_shape[2] != 4 {
+        bail!("rfdetr-ort: nieoczekiwany kształt dets {dets_shape:?}, oczekiwano [{n}, queries, 4]");
+    }
+    if labels_shape[0] as usize != n || labels_shape[1] as usize != queries {
+        bail!(
+            "rfdetr-ort: nieoczekiwany kształt labels {labels_shape:?}, oczekiwano [{n}, {queries}, label_dim]"
+        );
+    }
+    if label_dim <= num_classes {
+        bail!("labels dim {label_dim} must exceed class count {num_classes} (background slot)");
+    }
+    if dets_len < n * queries * 4 {
+        bail!("rfdetr-ort: bufor dets za krótki: {dets_len} < {}", n * queries * 4);
+    }
+    if labels_len < n * queries * label_dim {
+        bail!(
+            "rfdetr-ort: bufor labels za krótki: {labels_len} < {}",
+            n * queries * label_dim
+        );
+    }
+    Ok((queries, label_dim))
+}
+
+/// Decodes the flat `[n, queries, ...]` RF-DETR head buffers into per-image
+/// detections via [`slot_slices`] + `rfdetr_post::postprocess_image`. Shared by
+/// the host-tensor and device-tensor ort paths — the decode is identical, only
+/// the model input differs, so both paths yield bit-identical detections.
+#[cfg(feature = "inference-supertonic")]
+fn decode_detr_batch(
+    dets_owned: &[f32],
+    labels_owned: &[f32],
+    n: usize,
+    queries: usize,
+    label_dim: usize,
+    classes: &[String],
+    threshold: Option<f32>,
+) -> Vec<Vec<Detection>> {
+    let mut results = Vec::with_capacity(n);
+    for bi in 0..n {
+        let (dets_slice, labels_slice) = slot_slices(dets_owned, labels_owned, bi, queries, label_dim);
+        results.push(crate::vision::rfdetr_post::postprocess_image(
+            dets_slice,
+            labels_slice,
+            queries,
+            label_dim,
+            classes,
+            threshold,
+        ));
+    }
+    results
+}
+
 /// Zwraca wycinki (dets, labels) slotu `bi` z płaskich buforów batcha ułożonych
 /// row-major `[MODEL_BATCH, queries, ...]`. Czysta funkcja (offsety/wycinki)
 /// wydzielona z `detect_batch`, by dala sie przetestowac bez modelu/GPU. Wywolujacy
@@ -460,10 +661,28 @@ fn slot_slices<'a>(
 /// stretch-resize to 560×560, /255, per-channel ImageNet normalize.
 fn fill_frame(data: &mut [f32], bi: usize, rgb: &[u8], w: u32, h: u32) -> Result<()> {
     let res = RESOLUTION as usize;
-    let resized = crate::vision::resize::resize_rgb(rgb, w, h, RESOLUTION, RESOLUTION)
-        .map_err(|e| anyhow!("resize_rgb failed: {e}"))?;
     let plane = res * res;
     let base = bi * 3 * plane;
+    // FAST PATH: the frame is already exactly 560×560 (GPU-scaled by the camera
+    // ingest detect branch), so skip `resize_rgb` entirely — normalize + pack
+    // straight from the borrowed buffer. This is what makes the pre-scaled
+    // detect frame free (removes the ~4 ms full-frame CPU resize). Guarded on
+    // the exact input length so a truncated/wrong-stride buffer can never index
+    // out of bounds; anything else takes the CPU resize fallback below.
+    if w == RESOLUTION && h == RESOLUTION && rgb.len() == plane * 3 {
+        for y in 0..res {
+            for x in 0..res {
+                let p = (y * res + x) * 3;
+                for c in 0..3 {
+                    let v = rgb[p + c] as f32 / 255.0;
+                    data[base + c * plane + y * res + x] = (v - MEAN[c]) / STD[c];
+                }
+            }
+        }
+        return Ok(());
+    }
+    let resized = crate::vision::resize::resize_rgb(rgb, w, h, RESOLUTION, RESOLUTION)
+        .map_err(|e| anyhow!("resize_rgb failed: {e}"))?;
     for y in 0..res {
         for x in 0..res {
             let p = (y * res + x) * 3;

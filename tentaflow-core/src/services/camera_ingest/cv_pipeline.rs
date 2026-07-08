@@ -352,12 +352,17 @@ pub fn stage_index(p: &CvPipeline, stage_id: &str) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-/// Crop padding of a cold stage as fractions of the detection box. Defaults
-/// mirror the pre-pipeline hardcoded behavior: OCR padded 15%/10% (detector
-/// boxes often clip the right edge of plates), classify/embed on the tight box.
+/// Crop padding of a cold stage as fractions of the detection box. OCR pads
+/// 30%/20%: side-view cameras see plates at an angle, so an axis-aligned detector
+/// box is tight and clips characters off the near/far edge. The generous pad
+/// captures the WHOLE plate for the OCR-side perspective deskew
+/// (`ocr_prep::deskew_plate_rgb`), which crops back to the plate quad — so the
+/// extra margin costs nothing on the common (quad-found) path and only adds
+/// background on the rare no-quad fallback (the model tolerates background far
+/// better than clipped glyphs). Classify/embed stay on the tight box.
 pub fn crop_pads(stage: &CvStage) -> (f32, f32) {
     let default = match stage.op {
-        CvOp::Ocr => (0.15, 0.10),
+        CvOp::Ocr => (0.30, 0.20),
         _ => (0.0, 0.0),
     };
     let read = |name: &str, fallback: f32| {
@@ -458,7 +463,7 @@ mod tests {
         r#"{"stages":[
             {"stage_id":"detect","op":"detect","model":"tentavision-detect","input":{"kind":"frame"},"threshold":0.5},
             {"stage_id":"stan","op":"classify","model":"tentavision-stan","input":{"kind":"stage","stage_id":"detect","classes":["nalepka*","znak_srodowiskowy","termometr","tablica_adr","tablica_rejestracyjna"]},"output":"stan"},
-            {"stage_id":"ocr_plate","op":"ocr","model":"tentavision-ocr","input":{"kind":"stage","stage_id":"detect","classes":["tablica_rejestracyjna"]},"params":{"ocr_mode":"plate","crop_pad_x":0.15,"crop_pad_y":0.1},"output":"tekst"},
+            {"stage_id":"ocr_plate","op":"ocr","model":"tentavision-ocr","input":{"kind":"stage","stage_id":"detect","classes":["tablica_rejestracyjna"]},"params":{"ocr_mode":"plate","crop_pad_x":0.3,"crop_pad_y":0.2},"output":"tekst"},
             {"stage_id":"ocr_adr","op":"ocr","model":"tentavision-ocr","input":{"kind":"stage","stage_id":"detect","classes":["tablica_adr"]},"params":{"ocr_mode":"adr","crop_pad_x":0.15,"crop_pad_y":0.1},"output":"tekst"}
         ]}"#
     }
@@ -588,12 +593,12 @@ mod tests {
         let p = parse(default_pipeline_json());
         // Classify without params: tight box, like the pre-pipeline code.
         assert_eq!(crop_pads(&p.stages[1]), (0.0, 0.0));
-        // OCR stages carry explicit 0.15/0.10 in the seed.
-        assert_eq!(crop_pads(&p.stages[2]), (0.15, 0.10));
-        // OCR without params falls back to the historical padding.
+        // OCR stages carry explicit 0.30/0.20 in the seed.
+        assert_eq!(crop_pads(&p.stages[2]), (0.30, 0.20));
+        // OCR without params falls back to the generous deskew-friendly default.
         let mut ocr = p.stages[2].clone();
         ocr.params = serde_json::Map::new();
-        assert_eq!(crop_pads(&ocr), (0.15, 0.10));
+        assert_eq!(crop_pads(&ocr), (0.30, 0.20));
         assert_eq!(ocr_mode(&ocr), "generic");
         assert_eq!(ocr_mode(&p.stages[2]), "plate");
         assert_eq!(ocr_mode(&p.stages[3]), "adr");

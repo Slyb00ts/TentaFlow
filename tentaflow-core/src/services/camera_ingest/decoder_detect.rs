@@ -140,6 +140,52 @@ pub fn gpu_resident_available() -> bool {
     )
 }
 
+/// Czy dostępna jest pośrednia ścieżka NVDEC + konwersja kolorów na CPU dla
+/// NVIDIA: dekoder NVDEC (`nvh264dec`/`nvh265dec`) i `cudadownload` są obecne,
+/// a wykryty dekoder to NVIDIA — BEZ wymagania `cudaconvert`/`cudascale`. Te
+/// dwa elementy pojawiają się dopiero w nvcodec z GStreamer ≥1.26, więc na
+/// 1.24 (obecnym na wielu instalacjach) pełny GPU-resident jest niedostępny,
+/// ale sam NVDEC + `cudadownload` już są. Pozwala zbudować łańcuch
+/// `nvhXdec → cudadownload → videoconvert → RGB`: DEKOD schodzi na GPU (zdejmuje
+/// z CPU najdroższy koszt — programowy dekod 4K H.264), a na CPU zostaje jedynie
+/// konwersja kolorów NV12→RGB. To wariant pośredni między pełnym GPU-resident
+/// (`gpu_resident_available`) a czystym CPU (decodebin + software). Wymaga
+/// zainicjalizowanego GStreamera — `detect_hw_decoder` gwarantuje idempotentny
+/// `gst::init` przed `element_present`.
+pub fn nvdec_decode_available() -> bool {
+    let decoder = detect_hw_decoder();
+    if decoder != HwDecoder::Nvidia {
+        return false;
+    }
+    let has_decoder = element_present("nvh264dec") || element_present("nvh265dec");
+    nvdec_decode_path_for(decoder, has_decoder, element_present("cudadownload"))
+}
+
+/// Czysta reguła wyboru ścieżki NVDEC + CPU-convert — wydzielona z
+/// `nvdec_decode_available`, by testy mogły sprawdzić logikę bez realnego
+/// sprzętu ani rejestru GStreamera. Wymaga jednocześnie: dekodera NVIDIA,
+/// obecnego NVDEC i `cudadownload`. W przeciwieństwie do `gpu_resident_path_for`
+/// NIE wymaga `cudaconvert` — konwersja kolorów schodzi na CPU (videoconvert).
+fn nvdec_decode_path_for(decoder: HwDecoder, has_nvdec: bool, has_cudadownload: bool) -> bool {
+    decoder == HwDecoder::Nvidia && has_nvdec && has_cudadownload
+}
+
+/// Czy runtime ma komplet elementów CUDA potrzebnych do GPU-owego skalowania
+/// klatki detekcji (`cudaupload → cudaconvert → cudascale → cudadownload`).
+/// Niezależne od ścieżki dekodowania: skalowanie 4K→560 na GPU ma sens także
+/// przy dekodzie CPU/MJPEG (usuwa ~4 ms resize'u pełnej klatki na CPU). Brak
+/// któregokolwiek elementu → `false` i gałąź detekcji nie jest dobudowywana
+/// (detektor resize'uje na CPU jak dotąd). Wymaga zainicjalizowanego GStreamera
+/// — wołamy `detect_hw_decoder` (idempotentny `gst::init`) dla bezpieczeństwa
+/// `ElementFactory::find` na innych platformach niż NVIDIA.
+pub fn cuda_scale_available() -> bool {
+    let _ = detect_hw_decoder();
+    element_present("cudaupload")
+        && element_present("cudaconvert")
+        && element_present("cudascale")
+        && element_present("cudadownload")
+}
+
 /// Czysta reguła wyboru ścieżki GPU-resident — wydzielona z
 /// `gpu_resident_available`, by testy mogły sprawdzić logikę bez realnego
 /// sprzętu ani rejestru GStreamera. GPU-resident wymaga jednocześnie: dekodera
@@ -321,6 +367,19 @@ mod tests {
         assert!(!gpu_resident_path_for(HwDecoder::Nvidia, false, true, true));
         assert!(!gpu_resident_path_for(HwDecoder::Nvidia, true, false, true));
         assert!(!gpu_resident_path_for(HwDecoder::Nvidia, true, true, false));
+    }
+
+    #[test]
+    fn nvdec_decode_requires_nvidia_nvdec_and_cudadownload_only() {
+        // NVIDIA + NVDEC + cudadownload → ścieżka NVDEC + CPU-convert. Nie
+        // wymaga cudaconvert/cudascale (kontrast z gpu_resident_path_for).
+        assert!(nvdec_decode_path_for(HwDecoder::Nvidia, true, true));
+        // Software / inna rodzina HW nigdy nie wybiera NVDEC — jest tylko NVIDIA.
+        assert!(!nvdec_decode_path_for(HwDecoder::Software, true, true));
+        assert!(!nvdec_decode_path_for(HwDecoder::Vaapi, true, true));
+        // NVIDIA, ale brak NVDEC albo cudadownload → fallback CPU.
+        assert!(!nvdec_decode_path_for(HwDecoder::Nvidia, false, true));
+        assert!(!nvdec_decode_path_for(HwDecoder::Nvidia, true, false));
     }
 
     #[test]

@@ -23,6 +23,7 @@ use crate::services::frame_storage::{FramePixelFormat, FrameStorage, RawFrameRef
 fn pixel_format_to_str(fmt: FramePixelFormat) -> &'static str {
     match fmt {
         FramePixelFormat::Rgb24 => "rgb24",
+        FramePixelFormat::Nv12 => "nv12",
     }
 }
 

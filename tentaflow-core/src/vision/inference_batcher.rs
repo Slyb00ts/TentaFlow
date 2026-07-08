@@ -1,0 +1,239 @@
+// =============================================================================
+// File: vision/inference_batcher.rs — cross-camera dynamic-batching front-end
+// =============================================================================
+//
+// A Triton-style dynamic batcher. Every camera's cold-path enrichment submits
+// its crops here instead of calling a model's batched API directly, so crops
+// from ALL cameras aggregate into ONE big batched forward per model. This turns
+// "thousands of tiny per-camera batch-1 forwards" (kernel-launch + CPU<->GPU
+// transfer bound, GPU idle) into a few large forwards that saturate the GPU.
+//
+// One worker thread per model owns the queue: it blocks for the first job, then
+// drains up to `max_batch` jobs OR until `window` elapses, runs the model's
+// existing batched API ONCE on the whole collected batch, and routes each result
+// back to the exact job that submitted it via that job's private response
+// channel — never by position across cameras. On a batch error every waiter in
+// the batch gets the error; no submitter is ever dropped or left hanging.
+//
+// Scoped to the ort/TensorRT path (`inference-supertonic`): the session pools
+// are `&self` + Send+Sync and take a batch dim (TRT profile 1..=16), so the
+// worker can call `classify_batch`/`read_batch` straight off its own thread. The
+// Burn/wgpu path must serialize forwards on the single wgpu thread and is left on
+// its existing `classify_batch_local`/`read_batch_local` route.
+
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, Result};
+use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
+use tokio::sync::OnceCell;
+use tracing::warn;
+
+use super::classifier_stan::StateClassifier;
+use super::ocr_plate::PlateOcr;
+use crate::services::camera_ingest::vision_analysis::{get_classifier, get_ocr};
+
+/// Max jobs per batched forward. Matches the models' TensorRT dynamic profile
+/// upper bound (1..=16) — a bigger batch would fall out of the profile and force
+/// a slow rebuild, so this is the natural aggregation cap.
+pub const MAX_BATCH: usize = 16;
+
+/// Longest a partially filled batch waits for more jobs before it is flushed.
+/// Env-tunable (`TENTAFLOW_VISION_BATCH_WINDOW_US`, microseconds). A wider window
+/// aggregates more crops per forward (higher GPU efficiency) at the cost of more
+/// per-crop latency; the default keeps latency low while still coalescing the
+/// bursts that many cameras produce within the same millisecond.
+pub fn batch_window() -> Duration {
+    const ENV: &str = "TENTAFLOW_VISION_BATCH_WINDOW_US";
+    const DEFAULT_US: u64 = 2000;
+    let us = std::env::var(ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_US);
+    Duration::from_micros(us)
+}
+
+/// One submitted crop plus the private channel its result must return on. The
+/// per-job channel is the correctness anchor: a batched result is routed back by
+/// this sender, never by position across a cross-camera batch.
+struct Job<R> {
+    crop: Arc<[u8]>,
+    w: u32,
+    h: u32,
+    respond: Sender<Result<R>>,
+}
+
+/// Generic cross-camera dynamic batcher. `R` is the per-crop result type
+/// (`Vec<String>` for state labels, `Option<String>` for a plate read). Cheap to
+/// share: `submit`/`submit_all` take `&self`, so a single instance fronts every
+/// camera through an `Arc`/`&'static`.
+pub struct InferenceBatcher<R> {
+    job_tx: Sender<Job<R>>,
+    // Kept so the batcher owns its worker; on drop the sender closes and the
+    // worker's `recv` returns `Err`, so the thread exits instead of leaking.
+    _worker: JoinHandle<()>,
+}
+
+impl<R> InferenceBatcher<R>
+where
+    R: Send + 'static,
+{
+    /// Builds a batcher and spawns its single worker thread. `run_batch` calls
+    /// the model's existing batched API on the whole collected batch and must
+    /// return exactly one result per input crop, in order.
+    pub fn new(
+        max_batch: usize,
+        window: Duration,
+        run_batch: Arc<dyn Fn(&[(Arc<[u8]>, u32, u32)]) -> Result<Vec<R>> + Send + Sync>,
+    ) -> Self {
+        let (job_tx, job_rx) = unbounded::<Job<R>>();
+        let max_batch = max_batch.max(1);
+        let worker = std::thread::Builder::new()
+            .name("vision-inference-batcher".to_string())
+            .spawn(move || worker_loop(job_rx, max_batch, window, run_batch))
+            .expect("spawn vision inference batcher worker");
+        Self {
+            job_tx,
+            _worker: worker,
+        }
+    }
+
+    /// Submits one crop and blocks until its batched result returns. Call from a
+    /// blocking context (e.g. inside `spawn_blocking`), never on a tokio worker.
+    pub fn submit(&self, crop: Arc<[u8]>, w: u32, h: u32) -> Result<R> {
+        let (tx, rx) = bounded::<Result<R>>(1);
+        self.job_tx
+            .send(Job { crop, w, h, respond: tx })
+            .map_err(|_| anyhow!("inference batcher worker gone"))?;
+        rx.recv()
+            .map_err(|_| anyhow!("inference batcher dropped response"))?
+    }
+
+    /// Enqueues every crop FIRST, then blocks collecting all results in order.
+    /// Enqueuing before blocking is what lets a single caller's crops (and, when
+    /// callers run concurrently, crops from every camera) land in the queue
+    /// together and coalesce into one forward — a submit-one-block-one loop would
+    /// instead flush each crop as its own batch. Result `i` corresponds to crop
+    /// `i`; a per-crop error is returned in that slot without affecting the rest.
+    pub fn submit_all(&self, crops: &[(Arc<[u8]>, u32, u32)]) -> Vec<Result<R>> {
+        if crops.is_empty() {
+            return Vec::new();
+        }
+        let mut receivers = Vec::with_capacity(crops.len());
+        for (crop, w, h) in crops {
+            let (tx, rx) = bounded::<Result<R>>(1);
+            let sent = self
+                .job_tx
+                .send(Job {
+                    crop: crop.clone(),
+                    w: *w,
+                    h: *h,
+                    respond: tx,
+                })
+                .is_ok();
+            receivers.push(sent.then_some(rx));
+        }
+        receivers
+            .into_iter()
+            .map(|rx| match rx {
+                Some(rx) => rx
+                    .recv()
+                    .unwrap_or_else(|_| Err(anyhow!("inference batcher dropped response"))),
+                None => Err(anyhow!("inference batcher worker gone")),
+            })
+            .collect()
+    }
+}
+
+/// Worker loop: block for the first job, drain up to `max_batch` OR until the
+/// window (measured from the first job) elapses, run `run_batch` ONCE, then route
+/// each result back by index. Jobs are owned locally for the whole run — no lock
+/// is held across `run_batch`, so a slow forward cannot block submitters or
+/// deadlock. A `run_batch` error (or a length-mismatch contract break) errors
+/// EVERY waiter in the batch; a waiter is never silently dropped.
+fn worker_loop<R>(
+    job_rx: Receiver<Job<R>>,
+    max_batch: usize,
+    window: Duration,
+    run_batch: Arc<dyn Fn(&[(Arc<[u8]>, u32, u32)]) -> Result<Vec<R>> + Send + Sync>,
+) where
+    R: Send + 'static,
+{
+    while let Ok(first) = job_rx.recv() {
+        let deadline = Instant::now() + window;
+        let mut batch: Vec<Job<R>> = Vec::with_capacity(max_batch);
+        batch.push(first);
+        while batch.len() < max_batch {
+            match job_rx.recv_deadline(deadline) {
+                Ok(job) => batch.push(job),
+                // Window elapsed (flush what we have) or the sender is gone
+                // (drain this batch, then the outer `recv` ends the loop).
+                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        let crops: Vec<(Arc<[u8]>, u32, u32)> =
+            batch.iter().map(|j| (j.crop.clone(), j.w, j.h)).collect();
+
+        match run_batch(&crops) {
+            Ok(results) if results.len() == batch.len() => {
+                for (job, r) in batch.into_iter().zip(results) {
+                    let _ = job.respond.send(Ok(r));
+                }
+            }
+            Ok(results) => {
+                let n = results.len();
+                let m = batch.len();
+                warn!(
+                    "[inference_batcher] run_batch returned {n} results for {m} jobs (contract broken)"
+                );
+                for job in batch {
+                    let _ = job.respond.send(Err(anyhow!(
+                        "inference batcher: {n} results for {m} jobs (contract broken)"
+                    )));
+                }
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                warn!("[inference_batcher] batched forward failed: {msg}");
+                for job in batch {
+                    let _ = job
+                        .respond
+                        .send(Err(anyhow!("inference batcher forward failed: {msg}")));
+                }
+            }
+        }
+    }
+}
+
+/// Process-wide state-classifier batcher, lazily built on first use over the
+/// process classifier singleton. `None` when the classifier failed to load —
+/// callers then take their per-crop fallback (never lose enrichment).
+pub(crate) async fn state_batcher() -> Option<&'static InferenceBatcher<Vec<String>>> {
+    static B: OnceCell<Option<InferenceBatcher<Vec<String>>>> = OnceCell::const_new();
+    B.get_or_init(|| async {
+        let classifier: Arc<StateClassifier> = get_classifier().await?;
+        let run_batch: Arc<dyn Fn(&[(Arc<[u8]>, u32, u32)]) -> Result<Vec<Vec<String>>> + Send + Sync> =
+            Arc::new(move |crops| classifier.classify_batch(crops));
+        Some(InferenceBatcher::new(MAX_BATCH, batch_window(), run_batch))
+    })
+    .await
+    .as_ref()
+}
+
+/// Process-wide plate-OCR batcher, lazily built on first use over the process
+/// OCR singleton. `None` when the OCR engine failed to load — callers then take
+/// their per-crop fallback.
+pub(crate) async fn plate_batcher() -> Option<&'static InferenceBatcher<Option<String>>> {
+    static B: OnceCell<Option<InferenceBatcher<Option<String>>>> = OnceCell::const_new();
+    B.get_or_init(|| async {
+        let ocr: Arc<PlateOcr> = get_ocr().await?;
+        let run_batch: Arc<
+            dyn Fn(&[(Arc<[u8]>, u32, u32)]) -> Result<Vec<Option<String>>> + Send + Sync,
+        > = Arc::new(move |crops| ocr.read_batch(crops));
+        Some(InferenceBatcher::new(MAX_BATCH, batch_window(), run_batch))
+    })
+    .await
+    .as_ref()
+}

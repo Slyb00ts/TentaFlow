@@ -14,6 +14,11 @@ fn main() {
 
     let out_dir_env = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
+    // Compile the fused GPU crop-preprocess CUDA kernel (nvcc) and emit its link
+    // flags. Gated on the vision-gpu + supertonic features so non-GPU builds
+    // never need nvcc. Done early so a missing toolchain fails fast.
+    compile_cuda_preprocess(&out_dir_env);
+
     // Skanuj manifesty serwisow tentaflow-containers/*/_services/*.toml,
     // waliduj semantycznie i wygeneruj services_generated.rs + services-manifest.js.
     // To musi byc PRZED dlugim WASM-buildem, zeby blad walidacji wykryl sie szybko.
@@ -271,6 +276,91 @@ fn main() {
 
     // Generuj plik Rust z osadzonymi danymi addonow
     generate_bundled_rs(&out_dir, &bundled_addons);
+}
+
+// =============================================================================
+// GPU crop-preprocess CUDA kernel — nvcc compile + link flags
+// =============================================================================
+
+/// Compiles the fused-preprocess CUDA kernels (`cuda/crop_resize_normalize.cu`
+/// and `cuda/nv12_to_rgb_resize_normalize.cu`) into static libs in OUT_DIR via
+/// nvcc and emits the link flags for them + the CUDA runtime. Gated on the
+/// vision-gpu AND supertonic features (the only consumer is the ort device
+/// tensor path in `vision::gpu_preprocess`), so a default / non-GPU build never
+/// invokes nvcc. `--fmad=false` keeps the kernel's f64 sampling math bit-for-bit
+/// with the CPU `resize_rgb` (an FMA-contracted `(d+0.5)*scale-0.5` rounds
+/// differently and could flip a Q8 boundary weight).
+fn compile_cuda_preprocess(out_dir: &Path) {
+    let want = std::env::var_os("CARGO_FEATURE_INFERENCE_VISION_GPU").is_some()
+        && std::env::var_os("CARGO_FEATURE_INFERENCE_SUPERTONIC").is_some();
+    if !want {
+        return;
+    }
+
+    let nvcc = locate_nvcc();
+    // CUDA lib dir is <cuda-root>/lib64 (nvcc lives in <cuda-root>/bin).
+    let cuda_lib_dir = nvcc
+        .parent()
+        .and_then(|bin| bin.parent())
+        .map(|root| root.join("lib64"))
+        .filter(|p| p.is_dir());
+
+    // Each fused kernel compiles to its own static lib in OUT_DIR. `--fmad=false`
+    // keeps the shared f64 sampling math bit-for-bit with the CPU `resize_rgb`.
+    for (src, lib) in [
+        ("cuda/crop_resize_normalize.cu", "libtf_crop_resize.a"),
+        (
+            "cuda/nv12_to_rgb_resize_normalize.cu",
+            "libtf_nv12_preprocess.a",
+        ),
+    ] {
+        let cu = Path::new(src);
+        if !cu.exists() {
+            panic!("CUDA preprocess source missing: {}", cu.display());
+        }
+        println!("cargo:rerun-if-changed={src}");
+
+        let lib_path = out_dir.join(lib);
+        let status = Command::new(&nvcc)
+            .arg("-O3")
+            .arg("-Xcompiler")
+            .arg("-fPIC")
+            .arg("--fmad=false")
+            .arg("-lib")
+            .arg(cu)
+            .arg("-o")
+            .arg(&lib_path)
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run nvcc ({}): {e}", nvcc.display()));
+        if !status.success() {
+            panic!("nvcc failed to compile {} (status {status})", cu.display());
+        }
+    }
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=tf_crop_resize");
+    println!("cargo:rustc-link-lib=static=tf_nv12_preprocess");
+    if let Some(dir) = &cuda_lib_dir {
+        println!("cargo:rustc-link-search=native={}", dir.display());
+    }
+    // Debian/Ubuntu ship libcudart in the multiarch dir; keep both searchable.
+    println!("cargo:rustc-link-search=native=/usr/lib/x86_64-linux-gnu");
+    println!("cargo:rustc-link-lib=dylib=cudart");
+    // nvcc-generated host stubs pull the C++ runtime.
+    println!("cargo:rustc-link-lib=dylib=stdc++");
+}
+
+/// Locates nvcc: `$NVCC`, then the pinned/standard CUDA install paths, then PATH.
+fn locate_nvcc() -> PathBuf {
+    if let Ok(p) = std::env::var("NVCC") {
+        return PathBuf::from(p);
+    }
+    for cand in ["/usr/local/cuda-13.0/bin/nvcc", "/usr/local/cuda/bin/nvcc"] {
+        if Path::new(cand).exists() {
+            return PathBuf::from(cand);
+        }
+    }
+    PathBuf::from("nvcc")
 }
 
 // =============================================================================
