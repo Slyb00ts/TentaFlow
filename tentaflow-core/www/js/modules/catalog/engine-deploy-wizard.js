@@ -3376,7 +3376,10 @@ async function startClusterDeploy() {
   const gpuMem = adv.gpu_memory_utilization ?? 0.5;
 
   if (btn) btn.setAttribute('disabled', '');
-  const readyTimeoutSecs = 600;
+  // P6 (model load -> /v1/models 200) budget. A 100-300GB TP=2 model's first
+  // boot includes weight load on every member + CUDA-graph capture + FlashInfer
+  // autotune — 10 min is too tight and a timeout tears the whole cluster down.
+  const readyTimeoutSecs = 1800;
   try {
     const resp = await ApiBinary.action(
       'clusterDeployRequest',
