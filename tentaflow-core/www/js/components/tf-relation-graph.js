@@ -128,6 +128,9 @@ export class TfRelationGraph extends HTMLElement {
     if (typeof ResizeObserver !== 'undefined' && !this._ro) {
       this._ro = new ResizeObserver(() => {
         this._resizeCanvas();
+        // Container size changed (responsive stacking, panel resize): refit
+        // the camera unless the user already took over pan/zoom.
+        if (!this._userMovedView) this._fitViewIfNeeded(true);
         this._requestFrame();
       });
       this._ro.observe(this);
@@ -555,6 +558,9 @@ export class TfRelationGraph extends HTMLElement {
       if (this._selectedId !== null) {
         this._selectedId = null;
         this._requestFrame();
+        // Consumers tracking the selection (BFS depth filters, detail panels)
+        // need to know the background click cleared it.
+        this.dispatchEvent(new CustomEvent('deselect', { bubbles: false, detail: {} }));
       }
     };
     cv.addEventListener('pointerup', endPointer);

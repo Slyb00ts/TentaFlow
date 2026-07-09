@@ -27,7 +27,7 @@ import {
 
 export const RELATION_GRAPH_TAG = 0x0703;
 
-const RELATION_GRAPH_FIELD_KEYS = new Set([0, 1, 2, 3, 4]);
+const RELATION_GRAPH_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5]);
 const GRAPH_LAYOUTS = new Set(['force_directed', 'hierarchical', 'radial', 'manual']);
 
 function requireU32(v, ctx) {
@@ -136,6 +136,13 @@ function renderRelationGraph(component, ctx) {
   const maxNodes = requireU32(
     ctx.readField(component.fields, 4), 'RelationGraph.max_nodes'
   );
+  // Field 5 (optional): selected_path — StatePath of the selected node id.
+  // Lets the addon drive/clear the highlight (e.g. detail-panel rows or a
+  // BFS-depth reset) without re-rendering the canvas.
+  const selectedPathRaw = ctx.readField(component.fields, 5);
+  const selectedPath = selectedPathRaw == null
+    ? null
+    : requirePath(selectedPathRaw, 'RelationGraph.selected_path');
 
   const el = document.createElement('tf-relation-graph');
   el.classList.add('tf-relation-graph');
@@ -147,12 +154,29 @@ function renderRelationGraph(component, ctx) {
       ? window.matchMedia('(prefers-reduced-motion: reduce)').matches
       : false;
 
-  const syncNodes = () => { el.nodes = readGraphNodes(ctx.store, nodesPath); };
+  // Selection is only applied when the id exists in the CURRENT node set —
+  // a stale id (node filtered out between patches) would otherwise keep the
+  // pulse loop running with no visible selection. Re-validated on every
+  // nodes update as well, since either path can change first.
+  const syncSelected = () => {
+    if (!selectedPath) return;
+    let v;
+    try { v = ctx.store.read(selectedPath); } catch { v = null; }
+    const id = typeof v === 'string' && v.length > 0 ? v : null;
+    el.selectedNodeId = id && el.nodes.some((n) => n.id === id) ? id : null;
+  };
+  const syncNodes = () => {
+    el.nodes = readGraphNodes(ctx.store, nodesPath);
+    syncSelected();
+  };
   const syncEdges = () => { el.edges = readGraphEdges(ctx.store, edgesPath); };
   syncNodes();
   syncEdges();
   ctx.registerCleanup(ctx.store.subscribe(nodesPath, syncNodes));
   ctx.registerCleanup(ctx.store.subscribe(edgesPath, syncEdges));
+  if (selectedPath) {
+    ctx.registerCleanup(ctx.store.subscribe(selectedPath, syncSelected));
+  }
 
   return el;
 }

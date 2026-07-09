@@ -10,6 +10,7 @@
 mod analysis;
 mod db;
 mod ui;
+mod ui_graph;
 
 use serde_json::{json, Value};
 use tentaflow_addon_sdk::{log, read_string, write_string};
@@ -83,9 +84,11 @@ pub extern "C" fn on_panel_open(panel_id_ptr: i32, panel_id_len: i32, epoch: i64
         log::warn(&format!("notes: on_panel_open unknown panel '{panel_id}'"));
         return 0;
     }
-    ui::reset_for_open(epoch as u64);
+    // Identity FIRST: reset_for_open zeroes the per-(user, epoch) revision in
+    // the host KV, and the key needs the acting user.
     let user_id = current_user_id().unwrap_or_default();
     ui::set_session_user(Some(&user_id));
+    ui::reset_for_open(epoch as u64);
     ui::render_full(&user_id);
     0
 }

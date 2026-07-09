@@ -20,7 +20,7 @@ use tentaflow_addon_sdk::ui_v1::{
     CachePolicy, Card, CardVariant, CborMap, Chip, ChipVariant, Cluster, Component, CornerValues,
     Density, DimensionToken, Divider, DividerOrientation, DividerVariant, EmptyState,
     EmptyStateVariant, EventKind, FailurePolicy, FilterChipDef, FilterChips, FilterChipsMode, Flex,
-    FlexAlign, FlexDirection, FlexJustify, FlexWrap, Handler, HandlerMap, Heading, IconName,
+    FlexAlign, FlexDirection, FlexJustify, FlexWrap, Handler, HandlerMap, IconName,
     IconRef, InputSize, PanelShell, PatchOp, PatchOpKind, RadiusValue,
     ScrollContainer, ScrollOrientation, SearchBox, SearchVariant, Select,
     SelectOption, SelectValue, ShadowToken, SlotContent, SlotDecl, SlotDefault, SlotSemantics,
@@ -51,6 +51,10 @@ const SP_SAVE_OK_VIS: &str = "editor.save_ok_visible";
 const SP_SAVE_ERR_VIS: &str = "editor.save_err_visible";
 const SP_CHAR_COUNT: &str = "editor.char_count";
 const SP_LINK_PICK: &str = "links.pick";
+// One shell hosts BOTH views (the host rejects a second PanelShell per open
+// panel); these booleans drive the state-bound visibility of each subtree.
+const SP_VIEW_NOTES: &str = "view.notes";
+const SP_VIEW_GRAPH: &str = "view.graph";
 
 // Hard server-side input limits (client caps mirror them where the component
 // supports one). Values beyond a limit are rejected with a readable message
@@ -68,10 +72,9 @@ const MAX_TAG_CHARS: usize = 64;
 // =============================================================================
 
 static mut PANEL_EPOCH: u64 = 1;
-static mut STATE_REVISION: u64 = 0;
 static mut SESSION_USER_ID: Option<String> = None;
 
-fn panel_epoch() -> u64 {
+pub(crate) fn panel_epoch() -> u64 {
     unsafe { PANEL_EPOCH }
 }
 
@@ -93,20 +96,47 @@ fn session_user() -> String {
 pub fn reset_for_open(epoch: u64) {
     unsafe {
         PANEL_EPOCH = epoch;
-        STATE_REVISION = 0;
     }
+    store_revision(0);
 }
 
 /// Adopts the host-validated `__panel_epoch` carried by a UI action. A pooled
 /// instance may hold a stale static epoch; without adoption its StatePatch /
 /// SlotContent would be rejected by the session.
 pub fn adopt_action_epoch(epoch: u64) {
-    unsafe {
-        if PANEL_EPOCH != epoch {
-            PANEL_EPOCH = epoch;
-            STATE_REVISION = 0;
-        }
+    let changed = unsafe {
+        let changed = PANEL_EPOCH != epoch;
+        PANEL_EPOCH = epoch;
+        changed
+    };
+    if changed {
+        store_revision(0);
     }
+}
+
+// The StatePatch base revision is tracked per (user, panel_epoch) in the
+// host KV — a global static would let two open panels (or two users on one
+// pooled instance) corrupt each other's base_revision and get every patch
+// rejected by the session.
+fn revision_key() -> String {
+    format!("rev:{}:{}", session_user(), panel_epoch())
+}
+
+fn load_revision() -> u64 {
+    state_get(&revision_key())
+        .ok()
+        .flatten()
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+fn store_revision(value: u64) {
+    let _ = state_set(
+        &revision_key(),
+        value.to_string().as_bytes(),
+        StateTier::Ephemeral,
+    );
 }
 
 // =============================================================================
@@ -116,12 +146,35 @@ pub fn adopt_action_epoch(epoch: u64) {
 // =============================================================================
 
 #[derive(Debug, Clone)]
-struct Session {
-    scope: String,
-    search: String,
-    active: String,
+pub(crate) struct Session {
+    pub scope: String,
+    pub search: String,
+    pub active: String,
     /// Manual-link picker open in the links panel of the active note.
-    link_picker: bool,
+    pub link_picker: bool,
+    /// Active view: "notes" | "graph".
+    pub mode: String,
+    // Graph view filters (mockup n02). Scope toggles / entity-type checkboxes
+    // / sliders / selected node id.
+    pub g_mine: bool,
+    pub g_shared: bool,
+    pub g_group: bool,
+    pub g_org: bool,
+    pub g_person: bool,
+    pub g_project: bool,
+    pub g_company: bool,
+    pub g_topic: bool,
+    pub g_note: bool,
+    pub g_min_weight: f64,
+    pub g_depth: i64,
+    pub g_selected: String,
+    /// Editor render generation. Bumped by new_note; every editor widget
+    /// carries the generation of its render ("egen" param), so a Change from
+    /// a widget predating the CURRENT note's creation is dropped instead of
+    /// writing text meant for the new note into the previous one. Plain
+    /// navigation (open_note) does NOT bump it — a late blur-save of the
+    /// previously open note stays valid and is written to ITS note_id.
+    pub editor_gen: i64,
 }
 
 impl Default for Session {
@@ -131,6 +184,20 @@ impl Default for Session {
             search: String::new(),
             active: String::new(),
             link_picker: false,
+            mode: "notes".to_string(),
+            g_mine: true,
+            g_shared: true,
+            g_group: true,
+            g_org: false,
+            g_person: true,
+            g_project: true,
+            g_company: true,
+            g_topic: true,
+            g_note: true,
+            g_min_weight: 0.4,
+            g_depth: 2,
+            g_selected: String::new(),
+            editor_gen: 0,
         }
     }
 }
@@ -139,26 +206,55 @@ fn session_key() -> String {
     format!("sess:{}:{}", session_user(), panel_epoch())
 }
 
-fn load_session() -> Session {
+pub(crate) fn load_session() -> Session {
     let raw = state_get(&session_key()).ok().flatten();
     let parsed: Option<JsonValue> = raw.and_then(|b| serde_json::from_slice(&b).ok());
+    let d = Session::default();
     match parsed {
         Some(v) => Session {
             scope: v["scope"].as_str().unwrap_or("all").to_string(),
             search: v["search"].as_str().unwrap_or("").to_string(),
             active: v["active"].as_str().unwrap_or("").to_string(),
             link_picker: v["link_picker"].as_bool().unwrap_or(false),
+            mode: v["mode"].as_str().unwrap_or("notes").to_string(),
+            g_mine: v["g_mine"].as_bool().unwrap_or(d.g_mine),
+            g_shared: v["g_shared"].as_bool().unwrap_or(d.g_shared),
+            g_group: v["g_group"].as_bool().unwrap_or(d.g_group),
+            g_org: v["g_org"].as_bool().unwrap_or(d.g_org),
+            g_person: v["g_person"].as_bool().unwrap_or(d.g_person),
+            g_project: v["g_project"].as_bool().unwrap_or(d.g_project),
+            g_company: v["g_company"].as_bool().unwrap_or(d.g_company),
+            g_topic: v["g_topic"].as_bool().unwrap_or(d.g_topic),
+            g_note: v["g_note"].as_bool().unwrap_or(d.g_note),
+            g_min_weight: v["g_min_weight"].as_f64().unwrap_or(d.g_min_weight),
+            g_depth: v["g_depth"].as_i64().unwrap_or(d.g_depth),
+            g_selected: v["g_selected"].as_str().unwrap_or("").to_string(),
+            editor_gen: v["editor_gen"].as_i64().unwrap_or(0),
         },
-        None => Session::default(),
+        None => d,
     }
 }
 
-fn store_session(sess: &Session) {
+pub(crate) fn store_session(sess: &Session) {
     let v = json!({
         "scope": sess.scope,
         "search": sess.search,
         "active": sess.active,
         "link_picker": sess.link_picker,
+        "mode": sess.mode,
+        "g_mine": sess.g_mine,
+        "g_shared": sess.g_shared,
+        "g_group": sess.g_group,
+        "g_org": sess.g_org,
+        "g_person": sess.g_person,
+        "g_project": sess.g_project,
+        "g_company": sess.g_company,
+        "g_topic": sess.g_topic,
+        "g_note": sess.g_note,
+        "g_min_weight": sess.g_min_weight,
+        "g_depth": sess.g_depth,
+        "g_selected": sess.g_selected,
+        "editor_gen": sess.editor_gen,
     });
     let _ = state_set(
         &session_key(),
@@ -171,12 +267,12 @@ fn store_session(sess: &Session) {
 // Small builders
 // =============================================================================
 
-fn send(payload: &UiPayload) -> bool {
+pub(crate) fn send(payload: &UiPayload) -> bool {
     render(payload).is_ok()
 }
 
-fn send_state_patch(ops: Vec<PatchOp>) {
-    let base = unsafe { STATE_REVISION };
+pub(crate) fn send_state_patch(ops: Vec<PatchOp>) {
+    let base = load_revision();
     let new = base + 1;
     let patch = StatePatch {
         addon_id: ADDON_ID.into(),
@@ -186,15 +282,13 @@ fn send_state_patch(ops: Vec<PatchOp>) {
         new_revision: new,
         ops,
     };
-    // Advance the local revision only when the host accepted the patch.
+    // Advance the per-(user, epoch) revision only when the host accepted it.
     if send(&UiPayload::StatePatch(patch)) {
-        unsafe {
-            STATE_REVISION = new;
-        }
+        store_revision(new);
     }
 }
 
-fn send_slot(slot_id: &str, fragment: Component, overlay: Option<Vec<StateEntry>>) {
+pub(crate) fn send_slot(slot_id: &str, fragment: Component, overlay: Option<Vec<StateEntry>>) {
     let content = SlotContent {
         addon_id: ADDON_ID.into(),
         panel_id: PANEL_ID.into(),
@@ -208,7 +302,7 @@ fn send_slot(slot_id: &str, fragment: Component, overlay: Option<Vec<StateEntry>
 
 /// Backend handler with static CBOR params (event detail is merged in by the
 /// client dispatcher on top of these).
-fn backend_params(kind: EventKind, action_id: &str, params: Vec<(&str, CborValue)>) -> HandlerMap {
+pub(crate) fn backend_params(kind: EventKind, action_id: &str, params: Vec<(&str, CborValue)>) -> HandlerMap {
     HandlerMap(vec![(
         kind,
         Handler::Backend {
@@ -225,7 +319,7 @@ fn backend_params(kind: EventKind, action_id: &str, params: Vec<(&str, CborValue
     )])
 }
 
-fn icon(name: IconName) -> IconRef {
+pub(crate) fn icon(name: IconName) -> IconRef {
     IconRef::Named {
         name,
         size: None,
@@ -278,7 +372,7 @@ fn feedback_err(message: &str) {
     send_state_patch(save_feedback_ops(None, Some(message)));
 }
 
-fn text_c(id: &str, content: BindRef, style: TextStyle, tone: Option<Tone>) -> Component {
+pub(crate) fn text_c(id: &str, content: BindRef, style: TextStyle, tone: Option<Tone>) -> Component {
     Text {
         content,
         style,
@@ -309,7 +403,7 @@ fn rel_time(id: &str, unix_secs: i64) -> Component {
     .expect("Text encode")
 }
 
-fn slot_decl(id: &str, semantics: SlotSemantics) -> SlotDecl {
+pub(crate) fn slot_decl(id: &str, semantics: SlotSemantics) -> SlotDecl {
     SlotDecl {
         id: id.into(),
         semantics,
@@ -333,20 +427,25 @@ fn initials(display_name: &str) -> String {
 // Panel shell
 // =============================================================================
 
-/// Addon topbar (mockup n01): panel title on the left, auto-graph status pill
-/// on the right. The pill reflects the REAL alias state at panel open — both
-/// notes-embeddings and notes-llm bound = analysis runs; otherwise the admin
-/// is pointed at alias configuration. The mode switch (Notatki/Graf/Szukaj)
-/// lands with the graph/search stages.
+/// Addon topbar (mockups n01/n02): gradient app tile + title + mode switch
+/// (Notatki/Graf; "Szukaj" lands with the search stage) on the left, the
+/// auto-graph status pill on the right. The pill reflects the REAL alias
+/// state at panel open — both notes-embeddings and notes-llm bound =
+/// analysis runs; otherwise the admin is pointed at alias configuration.
 fn topbar() -> Component {
-    let title = Heading {
-        content: lit("Notatki"),
-        level: 3,
-        tone: None,
-        align: None,
+    let left = Cluster {
+        gap: Spacing::Md,
+        align: FlexAlign::Center,
+        justify: FlexJustify::Start,
+        children: vec![
+            crate::ui_graph::app_icon_tile(),
+            crate::ui_graph::app_title(),
+            crate::ui_graph::mode_switch(),
+        ],
+        wrap: Some(true),
     }
-    .into_component("topbar-title")
-    .expect("Heading encode");
+    .into_component("topbar-left")
+    .expect("Cluster encode");
 
     let status: Component = if analysis::auto_graph_ready() {
         Badge {
@@ -373,6 +472,18 @@ fn topbar() -> Component {
         .into_component("topbar-status")
         .expect("Badge encode")
     };
+    // Right side per view: alias-status badge (notes) vs graph counter pill.
+    let status = with_visible_bound(status, SP_VIEW_NOTES);
+    let pill = with_visible_bound(crate::ui_graph::topbar_counter_pill(), SP_VIEW_GRAPH);
+    let right = Cluster {
+        gap: Spacing::Sm,
+        align: FlexAlign::Center,
+        justify: FlexJustify::End,
+        children: vec![status, pill],
+        wrap: Some(false),
+    }
+    .into_component("topbar-right")
+    .expect("Cluster encode");
 
     // Mockup n01: the topbar sits directly on the page background — no pill.
     Flex {
@@ -381,7 +492,7 @@ fn topbar() -> Component {
         justify: FlexJustify::SpaceBetween,
         align: FlexAlign::Center,
         wrap: FlexWrap::Wrap,
-        children: vec![title, status],
+        children: vec![left, right],
         padding: None,
         background: None,
         radius: None,
@@ -436,13 +547,20 @@ pub fn send_panel_shell() {
     .into_component("split-grow")
     .expect("Box encode");
 
+    // Both view subtrees live in the ONE shell; visibility bound to the mode.
+    let notes_view = with_visible_bound(split_grow, SP_VIEW_NOTES);
+    let graph_view = with_visible_bound(
+        crate::ui_graph::graph_view_component(),
+        SP_VIEW_GRAPH,
+    );
+
     let layout = Flex {
         direction: FlexDirection::Column,
         gap: Spacing::Md,
         justify: FlexJustify::Start,
         align: FlexAlign::Stretch,
         wrap: FlexWrap::NoWrap,
-        children: vec![topbar(), split_grow],
+        children: vec![topbar(), notes_view, graph_view],
         padding: None,
         background: None,
         radius: None,
@@ -452,6 +570,16 @@ pub fn send_panel_shell() {
     .into_component("root")
     .expect("Flex encode");
 
+    let mut initial_state = crate::ui_graph::initial_graph_state(&Session::default());
+    initial_state.push(StateEntry {
+        path: state_path(SP_VIEW_NOTES),
+        value: CborValue::Bool(true),
+    });
+    initial_state.push(StateEntry {
+        path: state_path(SP_VIEW_GRAPH),
+        value: CborValue::Bool(false),
+    });
+
     let shell = PanelShell {
         addon_id: ADDON_ID.into(),
         panel_id: PANEL_ID.into(),
@@ -460,8 +588,13 @@ pub fn send_panel_shell() {
         slots: vec![
             slot_decl(SLOT_LIST, SlotSemantics::SidePanel),
             slot_decl(SLOT_MAIN, SlotSemantics::MainContent),
+            slot_decl(crate::ui_graph::SLOT_DETAIL, SlotSemantics::SidePanel),
         ],
         initial_state: vec![
+            StateEntry {
+                path: state_path("mode"),
+                value: CborValue::Text("notes".into()),
+            },
             StateEntry {
                 path: state_path(SP_SEARCH),
                 value: CborValue::Text(String::new()),
@@ -510,7 +643,10 @@ pub fn send_panel_shell() {
                 path: state_path(SP_LINK_PICK),
                 value: CborValue::Text(String::new()),
             },
-        ],
+        ]
+        .into_iter()
+        .chain(initial_state)
+        .collect(),
         initial_commands: vec![],
     };
     send(&UiPayload::PanelShell(shell));
@@ -690,7 +826,7 @@ fn list_fragment(notes: &[NoteSummary], sess: &Session) -> Component {
     .expect("Box encode")
 }
 
-fn scope_badge(id: &str, scope: &str) -> Component {
+pub(crate) fn scope_badge(id: &str, scope: &str) -> Component {
     let (tone, icon_name, label) = match scope {
         "org" => (Tone::Primary, IconName::Users, "Organizacja"),
         "group" => (Tone::Info, IconName::Users, "Grupa"),
@@ -814,8 +950,9 @@ fn note_card(index: usize, note: &NoteSummary, active_id: &str) -> Component {
 // =============================================================================
 
 pub fn send_main(ctx: &UserCtx, note: Option<&NoteDetail>) {
+    let gen = load_session().editor_gen;
     let (editor, overlay) = match note {
-        Some(n) => (editor_fragment(ctx, n), editor_overlay(n)),
+        Some(n) => (editor_fragment(ctx, n, gen), editor_overlay(n)),
         None => (empty_editor_fragment(), empty_editor_overlay()),
     };
     let links = match note {
@@ -1041,7 +1178,7 @@ fn empty_editor_fragment() -> Component {
     .expect("Box encode")
 }
 
-fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
+fn editor_fragment(ctx: &UserCtx, n: &NoteDetail, gen: i64) -> Component {
     let readonly_bind = if n.can_write {
         None
     } else {
@@ -1081,6 +1218,7 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
             vec![
                 ("note_id", CborValue::Text(n.id.clone())),
                 ("field", CborValue::Text("title".into())),
+                ("egen", CborValue::Text(gen.to_string())),
             ],
         ));
     }
@@ -1133,7 +1271,10 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
         tags.handlers = Some(backend_params(
             EventKind::Change,
             "save_tags",
-            vec![("note_id", CborValue::Text(n.id.clone()))],
+            vec![
+                ("note_id", CborValue::Text(n.id.clone())),
+                ("egen", CborValue::Text(gen.to_string())),
+            ],
         ));
     }
 
@@ -1236,7 +1377,10 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
         select.handlers = Some(backend_params(
             EventKind::Change,
             "set_share",
-            vec![("note_id", CborValue::Text(n.id.clone()))],
+            vec![
+                ("note_id", CborValue::Text(n.id.clone())),
+                ("egen", CborValue::Text(gen.to_string())),
+            ],
         ));
         // Keep the control pill-sized (mockup btn-share) — without the wrapper
         // the select stretches to the full row width.
@@ -1316,6 +1460,7 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
             vec![
                 ("note_id", CborValue::Text(n.id.clone())),
                 ("field", CborValue::Text("content".into())),
+                ("egen", CborValue::Text(gen.to_string())),
             ],
         ));
     }
@@ -1378,7 +1523,10 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
         delete_btn.handlers = Some(backend_params(
             EventKind::Click,
             "delete_note",
-            vec![("note_id", CborValue::Text(n.id.clone()))],
+            vec![
+                ("note_id", CborValue::Text(n.id.clone())),
+                ("egen", CborValue::Text(gen.to_string())),
+            ],
         ));
         right.push(delete_btn);
     }
@@ -1587,7 +1735,19 @@ fn links_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
 
     let mut children: Vec<Component> = Vec::new();
 
-    if let Some((attempts, last_error)) = analysis::queue_state(&n.id) {
+    // Alias misconfiguration gets ONE friendly message; raw host errors stay
+    // in analysis_queue.last_error / logs and never reach the UI.
+    if !analysis::auto_graph_ready() {
+        children.push(text_c(
+            "analysis-status",
+            lit(
+                "Skonfiguruj aliasy notes-embeddings i notes-llm w ustawieniach \
+                 addonu, aby uruchomić auto-graf.",
+            ),
+            TextStyle::Caption,
+            Some(Tone::Warning),
+        ));
+    } else if let Some((attempts, _last_error)) = analysis::queue_state(&n.id) {
         let status = if analysis::is_pending(attempts) {
             text_c(
                 "analysis-status",
@@ -1596,14 +1756,9 @@ fn links_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
                 Some(Tone::Muted),
             )
         } else {
-            let detail = if last_error.is_empty() {
-                "Analiza nie powiodła się.".to_string()
-            } else {
-                format!("Analiza nie powiodła się: {last_error}")
-            };
             text_c(
                 "analysis-status",
-                lit(detail),
+                lit("Analiza nie powiodła się — spróbujemy ponownie po edycji notatki."),
                 TextStyle::Caption,
                 Some(Tone::Critical),
             )
@@ -1908,7 +2063,7 @@ fn related_card(index: usize, r: &db::RelatedNote, now: i64) -> Component {
     card
 }
 
-fn merge_suggestion_card(index: usize, s: &analysis::MergeSuggestionView) -> Component {
+pub(crate) fn merge_suggestion_card(index: usize, s: &analysis::MergeSuggestionView) -> Component {
     let percent = (s.similarity.clamp(0.0, 1.0) * 100.0).round() as i64;
     let text = text_c(
         &format!("msug-{index}-text"),
@@ -2037,15 +2192,20 @@ fn entity_chip(index: usize, name: &str, entity_type: &str) -> Component {
     entity_chip_id(&format!("ent-{index}"), name, entity_type)
 }
 
-/// Neutral micro-chip with a type-colored leading dot (mockup n01 ent-chip).
-fn entity_chip_id(id: &str, name: &str, entity_type: &str) -> Component {
-    let tone = match entity_type {
+/// Tone of an entity type — shared by chips, graph nodes and detail rows.
+pub(crate) fn entity_tone(entity_type: &str) -> Tone {
+    match entity_type {
         "person" => Tone::Info,
         "company" => Tone::Success,
         "project" => Tone::Primary,
         "topic" => Tone::Warning,
         _ => Tone::Neutral,
-    };
+    }
+}
+
+/// Neutral micro-chip with a type-colored leading dot (mockup n01 ent-chip).
+fn entity_chip_id(id: &str, name: &str, entity_type: &str) -> Component {
+    let tone = entity_tone(entity_type);
     Chip {
         variant: ChipVariant::Soft,
         tone: Tone::Neutral,
@@ -2064,7 +2224,7 @@ fn entity_chip_id(id: &str, name: &str, entity_type: &str) -> Component {
 // Shared fragments
 // =============================================================================
 
-fn error_fragment(id: &str, message: &str) -> Component {
+pub(crate) fn error_fragment(id: &str, message: &str) -> Component {
     EmptyState {
         icon: icon(IconName::Warning),
         heading: lit("Coś poszło nie tak"),
@@ -2079,7 +2239,7 @@ fn error_fragment(id: &str, message: &str) -> Component {
 
 /// Framed panel column (mockup n01): subtle background, hairline border and
 /// rounded corners through tokens, full height.
-fn panel_style() -> ui::BoxStyle {
+pub(crate) fn panel_style() -> ui::BoxStyle {
     ui::BoxStyle {
         background: Some(ui::BackgroundToken::Subtle),
         border: Some(BorderEdges::all(BorderSide::new(1, BorderColor::Default))),
@@ -2139,6 +2299,32 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
         "manual_link_open" => action_link_picker(&ctx, true),
         "manual_link_close" => action_link_picker(&ctx, false),
         "manual_link_add" => action_manual_link_add(&ctx, params),
+        "set_mode" => action_set_mode(&ctx, params),
+        "graph_open_note" => action_graph_open_note(&ctx, params),
+        "graph_scope" => {
+            let mut sess = load_session();
+            crate::ui_graph::action_graph_scope(&ctx, &mut sess, params)
+        }
+        "graph_type" => {
+            let mut sess = load_session();
+            crate::ui_graph::action_graph_type(&ctx, &mut sess, params)
+        }
+        "graph_min_weight" => {
+            let mut sess = load_session();
+            crate::ui_graph::action_graph_min_weight(&ctx, &mut sess, params)
+        }
+        "graph_depth" => {
+            let mut sess = load_session();
+            crate::ui_graph::action_graph_depth(&ctx, &mut sess, params)
+        }
+        "graph_select" => {
+            let mut sess = load_session();
+            crate::ui_graph::action_graph_select(&ctx, &mut sess, params)
+        }
+        "graph_deselect" => {
+            let mut sess = load_session();
+            crate::ui_graph::action_graph_deselect(&ctx, &mut sess)
+        }
         other => json!({"ok": false, "error": format!("Nieznana akcja: {other}")}),
     };
 
@@ -2151,10 +2337,15 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
     if action_id != "set_search" {
         let processed = analysis::process_queue(1);
         if !processed.is_empty() {
-            let active = load_session().active;
+            let sess = load_session();
+            let active = sess.active;
             // Refresh the panel only when the open note gained fresh links and
             // the user is not mid-typing (save_note keeps the caret alive).
-            if processed.iter().any(|id| id == &active) && action_id != "save_note" {
+            // In graph mode the editor slot does not exist — skip.
+            if sess.mode == "notes"
+                && processed.iter().any(|id| id == &active)
+                && action_id != "save_note"
+            {
                 if let Ok(Some(note)) = db::get_note(&ctx, &active) {
                     send_main(&ctx, Some(&note));
                 }
@@ -2163,6 +2354,78 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
     }
 
     result
+}
+
+/// Post-merge refresh matching the active view: the notes editor re-renders
+/// its links panel, the graph re-pushes data + detail.
+fn refresh_after_merge(ctx: &UserCtx) {
+    let mut sess = load_session();
+    if sess.mode == "graph" {
+        let _ = crate::ui_graph::refresh_after_change(ctx, &mut sess);
+    } else {
+        refresh_active_main(ctx);
+    }
+}
+
+/// Patches the per-view visibility booleans (one shell hosts both views).
+fn push_view_visibility(mode: &str) {
+    let set = |path: &str, value: bool| PatchOp {
+        path: state_path(path),
+        op: PatchOpKind::Set {
+            value: CborValue::Bool(value),
+        },
+    };
+    send_state_patch(vec![
+        set(SP_VIEW_NOTES, mode == "notes"),
+        set(SP_VIEW_GRAPH, mode == "graph"),
+        PatchOp {
+            path: state_path("mode"),
+            op: PatchOpKind::Set {
+                value: CborValue::Text(mode.to_string()),
+            },
+        },
+    ]);
+}
+
+/// Switches between the Notatki and Graf views by toggling the state-bound
+/// visibility of the two shell subtrees; entering the graph refreshes its
+/// data (the canvas itself is state-driven and never re-rendered).
+fn action_set_mode(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
+    let mode = match params.get("value").and_then(|v| v.as_str()) {
+        Some("graph") => "graph",
+        Some("notes") => "notes",
+        other => {
+            return json!({"ok": false, "error": format!("Nieznany tryb: {other:?}")});
+        }
+    };
+    let mut sess = load_session();
+    if sess.mode == mode {
+        return json!({"ok": true});
+    }
+    sess.mode = mode.to_string();
+    store_session(&sess);
+    push_view_visibility(mode);
+    if mode == "graph" {
+        return crate::ui_graph::refresh_after_change(ctx, &mut sess);
+    }
+    json!({"ok": true})
+}
+
+/// "Otwórz notatkę" in the graph detail rail: jumps to the notes view with
+/// that note active.
+fn action_graph_open_note(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
+    let note_id = match param_str(params, "note_id") {
+        Some(id) => id.to_string(),
+        None => return json!({"ok": false, "error": "Brak note_id"}),
+    };
+    let mut sess = load_session();
+    sess.mode = "notes".to_string();
+    sess.active = note_id.clone();
+    store_session(&sess);
+    // Also flips the segmented control back to Notatki (bound "mode" path).
+    push_view_visibility("notes");
+    open_active(ctx, &note_id);
+    json!({"ok": true})
 }
 
 fn action_merge_decision(ctx: &UserCtx, params: &JsonValue, accept: bool) -> JsonValue {
@@ -2177,7 +2440,7 @@ fn action_merge_decision(ctx: &UserCtx, params: &JsonValue, accept: bool) -> Jso
     };
     match outcome {
         Ok(()) => {
-            refresh_active_main(ctx);
+            refresh_after_merge(ctx);
             json!({"ok": true})
         }
         Err(e) => {
@@ -2194,7 +2457,7 @@ fn action_merge_undo(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
     };
     match analysis::merge_undo(ctx, &merge_id) {
         Ok(()) => {
-            refresh_active_main(ctx);
+            refresh_after_merge(ctx);
             json!({"ok": true})
         }
         Err(e) => {
@@ -2264,6 +2527,9 @@ pub fn render_full(user_id: &str) {
             send_slot(SLOT_MAIN, error_fragment("main-error", &e), None);
         }
     }
+    // The graph detail slot is declared in the same shell — give it its
+    // empty-selection content up front.
+    crate::ui_graph::send_empty_detail();
 }
 
 fn param_str<'a>(params: &'a JsonValue, key: &str) -> Option<&'a str> {
@@ -2283,6 +2549,9 @@ fn action_new_note(ctx: &UserCtx) -> JsonValue {
     };
     let mut sess = load_session();
     sess.active = id.clone();
+    // Invalidate widgets of the previous editor render: any Change they still
+    // emit was text meant for THIS new note, not for their own note_id.
+    sess.editor_gen += 1;
     store_session(&sess);
     open_active(ctx, &id);
     json!({"ok": true, "note_id": id})
@@ -2314,6 +2583,37 @@ fn open_active(ctx: &UserCtx, note_id: &str) {
         }
     }
     send_list(ctx);
+}
+
+/// True when the action was emitted by an editor widget whose render
+/// generation predates the current one. Pure — unit-tested natively.
+///
+/// The generation is bumped ONLY by new_note: the E2E race is text typed for
+/// the freshly created note landing in the previously rendered widget (which
+/// still carries the old note_id). A missing "egen" or a matching one keeps
+/// the write — in particular a late blur-save of note A arriving after the
+/// user navigated to note B is legitimate (its note_id and value both come
+/// from A's widget) and MUST persist.
+fn stale_editor_gen(param_gen: Option<i64>, session_gen: i64) -> bool {
+    matches!(param_gen, Some(g) if g != session_gen)
+}
+
+/// Drops an editor mutation from a widget of an outdated render generation.
+fn is_stale_note_action(action: &str, note_id: &str, params: &JsonValue) -> Option<JsonValue> {
+    // Sent as text (a JSON-serialized BigInt would throw client-side), but
+    // accept a numeric form too.
+    let param_gen = params
+        .get("egen")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()));
+    let session_gen = load_session().editor_gen;
+    if !stale_editor_gen(param_gen, session_gen) {
+        return None;
+    }
+    tentaflow_addon_sdk::log::info(&format!(
+        "notes: dropped stale '{action}' for '{note_id}' \
+         (widget gen {param_gen:?}, current {session_gen})"
+    ));
+    Some(json!({"ok": true, "dropped": true}))
 }
 
 /// Hard-limit check for one save_note value. Pure — unit-tested natively.
@@ -2348,6 +2648,9 @@ fn action_save_note(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
         Some(id) => id.to_string(),
         None => return json!({"ok": false, "error": "Brak note_id"}),
     };
+    if let Some(dropped) = is_stale_note_action("save_note", &note_id, params) {
+        return dropped;
+    }
     let field = param_str(params, "field").unwrap_or("content");
     let raw = params.get("value").and_then(|v| v.as_str()).unwrap_or("");
     // The title renders as a single-row auto-grow textarea — typed or pasted
@@ -2393,6 +2696,9 @@ fn action_save_tags(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
         Some(id) => id.to_string(),
         None => return json!({"ok": false, "error": "Brak note_id"}),
     };
+    if let Some(dropped) = is_stale_note_action("save_tags", &note_id, params) {
+        return dropped;
+    }
     let tags: Vec<String> = params
         .get("tags")
         .and_then(|v| v.as_array())
@@ -2424,6 +2730,9 @@ fn action_set_share(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
         Some(id) => id.to_string(),
         None => return json!({"ok": false, "error": "Brak note_id"}),
     };
+    if let Some(dropped) = is_stale_note_action("set_share", &note_id, params) {
+        return dropped;
+    }
     let mode = params
         .get("value")
         .and_then(|v| v.as_str())
@@ -2453,6 +2762,9 @@ fn action_delete_note(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
         Some(id) => id.to_string(),
         None => return json!({"ok": false, "error": "Brak note_id"}),
     };
+    if let Some(dropped) = is_stale_note_action("delete_note", &note_id, params) {
+        return dropped;
+    }
     match db::delete_note(ctx, &note_id) {
         Ok(()) => {
             // The queue worker sees deleted_at and runs the tombstone cleanup
@@ -2580,6 +2892,37 @@ mod tests {
         assert!(validate_tags(&too_many).is_err());
         assert!(validate_tags(&["x".repeat(MAX_TAG_CHARS + 1)]).is_err());
         assert!(validate_tags(&["x".repeat(MAX_TAG_CHARS)]).is_ok());
+    }
+
+    #[test]
+    fn late_save_after_note_switch_is_kept() {
+        // Scenario (a): the user edits note A, clicks note B; A's blur-save
+        // arrives after open_note(B). Navigation does NOT bump editor_gen, so
+        // the widget generation still matches and the save goes through — it
+        // carries A's note_id and A's value; dropping it would lose user data.
+        let gen_at_render_of_a = 3;
+        let session_gen_after_open_b = 3;
+        assert!(!stale_editor_gen(
+            Some(gen_at_render_of_a),
+            session_gen_after_open_b
+        ));
+        // Editor widgets always carry egen; a missing param is permissive —
+        // note_id + the write ACL still gate the mutation.
+        assert!(!stale_editor_gen(None, 7));
+    }
+
+    #[test]
+    fn save_from_widget_predating_new_note_is_dropped() {
+        // Scenario (b): the user clicks "Nowa notatka" and types before the
+        // editor re-rendered. The stale widget still carries the PREVIOUS
+        // note's id — new_note bumped editor_gen, so the mutation is dropped
+        // instead of writing the new note's title into the old note.
+        let gen_at_render_of_old_widget = 3;
+        let session_gen_after_new_note = 4;
+        assert!(stale_editor_gen(
+            Some(gen_at_render_of_old_widget),
+            session_gen_after_new_note
+        ));
     }
 
     #[test]

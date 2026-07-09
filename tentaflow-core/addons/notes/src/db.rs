@@ -400,7 +400,7 @@ pub fn card_entities_sql(note_count: usize, group_count: usize) -> String {
 /// Name shown on a card chip: the canonical (merged) name only when the
 /// reader can see the canonical entity through some readable note of their
 /// own; otherwise the alias name from the listed note. Pure — unit-tested.
-fn pick_card_entity_name(
+pub(crate) fn pick_card_entity_name(
     local: &str,
     canonical: Option<&str>,
     canonical_visible: bool,
@@ -1112,6 +1112,178 @@ pub fn manual_link(ctx: &UserCtx, src_note_id: &str, dst_note_id: &str) -> Resul
 }
 
 // =============================================================================
+// Graph view read side (mockup n02). All rows returned here already passed
+// the reader's ACL: notes through acl_read_clause, entities through the
+// direct-mention visibility rule of card_entities_sql. The pure graph build
+// (scope/type filters, BFS depth, node cap) lives in ui_graph.rs.
+// =============================================================================
+
+/// Upper bound of notes considered for the graph BEFORE the 500-node cap.
+pub const GRAPH_NOTE_LIMIT: usize = 800;
+
+/// One accessible note for the graph, with its filter bucket.
+#[derive(Debug, Clone)]
+pub struct GraphNoteRow {
+    pub id: String,
+    pub title: String,
+    pub updated_at: i64,
+    /// "mine" | "shared" (direct user share) | "group" | "org" — the grant
+    /// through which THIS reader reaches the note (most specific wins).
+    pub bucket: String,
+}
+
+/// SQL of the graph notes read: accessible live notes, newest first, with the
+/// reader-specific bucket. Pure — unit-tested natively. Placeholders: user id
+/// (mine), user id (shared), group ids (group branch, when any), then
+/// `acl_params`.
+pub fn graph_notes_sql(group_count: usize) -> String {
+    let acl = acl_read_clause(group_count);
+    let group_branch = if group_count > 0 {
+        format!(
+            "WHEN EXISTS (SELECT 1 FROM note_shares s WHERE s.note_id = n.id \
+             AND s.subject_type = 'group' AND s.subject_id IN ({})) THEN 'group' ",
+            placeholders(group_count)
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "SELECT n.id, n.title, n.updated_at, \
+         CASE WHEN n.owner_user_id = ? THEN 'mine' \
+              WHEN EXISTS (SELECT 1 FROM note_shares s WHERE s.note_id = n.id \
+                   AND s.subject_type = 'user' AND s.subject_id = ?) THEN 'shared' \
+              {group_branch}ELSE 'org' END \
+         FROM notes n WHERE n.deleted_at IS NULL AND {acl} \
+         ORDER BY n.updated_at DESC LIMIT {GRAPH_NOTE_LIMIT}"
+    )
+}
+
+/// Accessible notes for the graph view, newest first.
+pub fn graph_notes(ctx: &UserCtx) -> Result<Vec<GraphNoteRow>, String> {
+    let sql = graph_notes_sql(ctx.group_ids.len());
+    let mut params = vec![
+        SqlValue::String(ctx.user_id.clone()),
+        SqlValue::String(ctx.user_id.clone()),
+    ];
+    params.extend(ctx.group_ids.iter().map(|g| SqlValue::String(g.clone())));
+    params.extend(acl_params(ctx));
+    let rows = sql_query(&sql, &params).map_err(|e| format!("Błąd odczytu grafu: {e}"))?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let id = r.first().and_then(|v| v.as_str())?.to_string();
+            Some(GraphNoteRow {
+                id,
+                title: r.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                updated_at: r.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
+                bucket: r
+                    .get(3)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("org")
+                    .to_string(),
+            })
+        })
+        .collect())
+}
+
+/// One entity mention on a note the reader can open. The entity id is the
+/// canonical id (merge survivor) and the name is the reader-visible one.
+#[derive(Debug, Clone)]
+pub struct GraphMentionRow {
+    pub note_id: String,
+    pub entity_id: String,
+    pub name: String,
+    pub entity_type: String,
+}
+
+/// Entity mentions of the given (already ACL-passed) notes for the graph —
+/// the same batched query + canonical-name disclosure rule as the list cards.
+pub fn graph_mentions(ctx: &UserCtx, note_ids: &[String]) -> Vec<GraphMentionRow> {
+    if note_ids.is_empty() {
+        return Vec::new();
+    }
+    let sql = card_entities_sql(note_ids.len(), ctx.group_ids.len());
+    let mut params: Vec<SqlValue> = note_ids
+        .iter()
+        .map(|id| SqlValue::String(id.clone()))
+        .collect();
+    params.extend(acl_params(ctx));
+    let rows = match sql_query(&sql, &params) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    rows.iter()
+        .filter_map(|r| {
+            let note_id = r.first().and_then(|v| v.as_str())?.to_string();
+            let entity_id = r.get(1).and_then(|v| v.as_str())?.to_string();
+            let local = r.get(2).and_then(|v| v.as_str()).unwrap_or("");
+            let canonical = r.get(3).and_then(|v| v.as_str());
+            let visible = r.get(4 + 1).and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+            let name = pick_card_entity_name(local, canonical, visible);
+            if entity_id.is_empty() || name.is_empty() {
+                return None;
+            }
+            Some(GraphMentionRow {
+                note_id,
+                entity_id,
+                name,
+                entity_type: r
+                    .get(4)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("other")
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// One note-to-note link where BOTH endpoints are in the reader's note set.
+#[derive(Debug, Clone)]
+pub struct GraphLinkRow {
+    pub src: String,
+    pub dst: String,
+    pub kind: String,
+    pub weight: f64,
+    /// Persisted machine token (see `parse_link_reason`).
+    pub reason: String,
+}
+
+/// Links among the given (already ACL-passed) notes. Constraining BOTH
+/// endpoints to the accessible set is the ACL guarantee: a link touching an
+/// inaccessible note never reaches the view.
+pub fn graph_links(ctx: &UserCtx, note_ids: &[String]) -> Vec<GraphLinkRow> {
+    let _ = ctx;
+    if note_ids.is_empty() {
+        return Vec::new();
+    }
+    let ph = placeholders(note_ids.len());
+    let sql = format!(
+        "SELECT src_note_id, dst_note_id, kind, weight, reason FROM note_links \
+         WHERE src_note_id IN ({ph}) AND dst_note_id IN ({ph})"
+    );
+    let mut params: Vec<SqlValue> = note_ids
+        .iter()
+        .map(|id| SqlValue::String(id.clone()))
+        .collect();
+    params.extend(note_ids.iter().map(|id| SqlValue::String(id.clone())));
+    let rows = match sql_query(&sql, &params) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    rows.iter()
+        .filter_map(|r| {
+            Some(GraphLinkRow {
+                src: r.first().and_then(|v| v.as_str())?.to_string(),
+                dst: r.get(1).and_then(|v| v.as_str())?.to_string(),
+                kind: r.get(2).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                weight: r.get(3).and_then(value_f64).unwrap_or(0.0),
+                reason: r.get(4).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            })
+        })
+        .collect()
+}
+
+// =============================================================================
 // Misc helpers
 // =============================================================================
 
@@ -1396,6 +1568,24 @@ mod tests {
         assert!(sql.contains("n.deleted_at IS NULL"));
         assert!(sql.contains("n.owner_user_id = ?"));
         assert_eq!(sql.matches('?').count(), 1 + acl_params(&c).len());
+    }
+
+    #[test]
+    fn graph_notes_sql_buckets_and_placeholders_match_params() {
+        let c = ctx(&["g1", "g2"]);
+        let sql = graph_notes_sql(c.group_ids.len());
+        // mine (owner) wins over any share; direct user share over group; org last.
+        assert!(sql.contains("THEN 'mine'"));
+        assert!(sql.contains("THEN 'shared'"));
+        assert!(sql.contains("THEN 'group'"));
+        assert!(sql.contains("ELSE 'org'"));
+        assert!(sql.contains("n.deleted_at IS NULL"));
+        // Placeholders: mine, shared, 2 group ids, then the ACL params.
+        assert_eq!(sql.matches('?').count(), 2 + 2 + acl_params(&c).len());
+
+        let no_groups = graph_notes_sql(0);
+        assert!(!no_groups.contains("THEN 'group'"));
+        assert_eq!(no_groups.matches('?').count(), 2 + acl_params(&ctx(&[])).len());
     }
 
     #[test]

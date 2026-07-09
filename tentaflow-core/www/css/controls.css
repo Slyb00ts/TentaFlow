@@ -5455,8 +5455,11 @@ tf-skeleton {
   gap: var(--tf-space-sm);
   cursor: pointer;
 }
-.tf-toggle--label-leading  { flex-direction: row; }
-.tf-toggle--label-trailing { flex-direction: row-reverse; }
+/* DOM order already encodes the label position (renderer appends the label
+   before/after the control) — reversing here made BOTH variants render
+   label-first and the enum meaningless. */
+.tf-toggle--label-leading,
+.tf-toggle--label-trailing { flex-direction: row; }
 .tf-toggle__label { font: inherit; }
 .tf-toggle__hint  { font-size: 0.85em; color: var(--tf-text-3); }
 
@@ -6868,6 +6871,9 @@ tf-relation-graph {
   display: block;
   width: 100%;
   min-height: 320px;
+  /* Fills the leftover height when placed in a flex column (graph canvas
+     panes); inert in plain block flow. */
+  flex: 1 1 auto;
   position: relative;
   overflow: hidden;
   border: 1px solid var(--tf-border);

@@ -3379,9 +3379,11 @@ Fields:
   2: layout          GraphLayout                      // "force_directed" | "hierarchical" | "radial" | "manual"
   3: interactive     bool
   4: max_nodes       u32                              // cap dla performance
+  5: selected_path   StatePath or null                // bound tstr — id zaznaczonego noda; addon może sterować/kasować highlight bez re-renderu
 Handlers:
-  "node_click":      Handler
-  "edge_click":      Handler
+  "node_click":      Handler                          // params { node_id }
+  "edge_click":      Handler                          // params { edge_id }
+  "deselect":        Handler                          // klik w tło wyczyścił zaznaczenie
 ```
 
 ### 0x0704 — `AlarmFeed`

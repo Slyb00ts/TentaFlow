@@ -270,6 +270,63 @@ test('selecting via click dispatches node_click from canvas hit test', () => {
 // timers — otherwise the happy-dom timer queue keeps the Node process alive.
 document.body.innerHTML = '';
 
+test('selected_path (field 5) drives selectedNodeId reactively', () => {
+  const { store, engine } = setup();
+  const SELECTED_PATH = [{ kind: 'key', value: 'graph' }, { kind: 'key', value: 'selected' }];
+  store.applyPatch({
+    base_revision: 0,
+    new_revision: 1,
+    ops: [{ path: SELECTED_PATH, op: { kind: 'set', value: 'n2' } }],
+  });
+  const el = engine.render(comp(graphFields({ 5: SELECTED_PATH })));
+  assertEq(el.selectedNodeId, 'n2', 'initial selection from store');
+  store.applyPatch({
+    base_revision: 1,
+    new_revision: 2,
+    ops: [{ path: SELECTED_PATH, op: { kind: 'set', value: '' } }],
+  });
+  assertEq(el.selectedNodeId, null, 'empty string clears selection');
+  // Field 5 absent → property untouched (null default).
+  const el2 = engine.render(comp(graphFields()));
+  assertEq(el2.selectedNodeId, null, 'no selected_path leaves default');
+});
+
+test('selected_path ignores ids absent from the node set', () => {
+  const { store, engine } = setup();
+  const SELECTED_PATH = [{ kind: 'key', value: 'graph' }, { kind: 'key', value: 'selected' }];
+  // Stale id from the start: selection never applied.
+  store.applyPatch({
+    base_revision: 0,
+    new_revision: 1,
+    ops: [{ path: SELECTED_PATH, op: { kind: 'set', value: 'ghost' } }],
+  });
+  const el = engine.render(comp(graphFields({ 5: SELECTED_PATH })));
+  assertEq(el.selectedNodeId, null, 'unknown id never selects');
+
+  // Valid selection, then a nodes patch that drops the selected node —
+  // the highlight must clear instead of pulsing an invisible node.
+  store.applyPatch({
+    base_revision: 1,
+    new_revision: 2,
+    ops: [{ path: SELECTED_PATH, op: { kind: 'set', value: 'n2' } }],
+  });
+  assertEq(el.selectedNodeId, 'n2', 'valid id selects');
+  store.applyPatch({
+    base_revision: 2,
+    new_revision: 3,
+    ops: [{ path: NODES_PATH, op: { kind: 'set', value: [SAMPLE_NODES[0]] } }],
+  });
+  assertEq(el.selectedNodeId, null, 'selection cleared when node vanishes');
+
+  // Node returns → the still-stored selection re-applies.
+  store.applyPatch({
+    base_revision: 3,
+    new_revision: 4,
+    ops: [{ path: NODES_PATH, op: { kind: 'set', value: SAMPLE_NODES } }],
+  });
+  assertEq(el.selectedNodeId, 'n2', 'selection restored with the node');
+});
+
 function reportResults() {
   let pass = 0;
   let fail = 0;
