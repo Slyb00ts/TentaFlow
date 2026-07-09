@@ -195,4 +195,23 @@ replace(
 """,
 )
 
-print("nvfp4_ds_mla stage A/B/C patches applied")
+# ---------------- Stage D: restore VLLM_SKIP_INIT_MEMORY_CHECK ----------------
+# The recipe's verified profile runs gpu_memory_utilization=0.85 with
+# VLLM_SKIP_INIT_MEMORY_CHECK=1, but this vLLM build lost the flag: request_memory
+# hard-fails when free < util*total. On GB10 unified memory the OS page cache
+# (e.g. after reading the 167GB checkpoint) counts as "used" yet is fully
+# reclaimable when cudaMalloc asks, so the startup check is a false negative.
+replace(
+    "v1/worker/utils.py",
+    """    if init_snapshot.free_memory < requested_memory:
+        raise ValueError(""",
+    """    import os as _os
+
+    if (
+        _os.environ.get("VLLM_SKIP_INIT_MEMORY_CHECK") != "1"
+        and init_snapshot.free_memory < requested_memory
+    ):
+        raise ValueError(""",
+)
+
+print("nvfp4_ds_mla stage A/B/C/D patches applied")
