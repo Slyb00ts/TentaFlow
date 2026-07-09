@@ -2,7 +2,7 @@
 // File: examples/adr_rowtrim_ab.rs — A/B row content-trim on real ADR crops
 // =============================================================================
 //
-// Measures the `TENTAFLOW_ADR_ROW_TRIM` row content-trim (adr_ocr) on REAL
+// Measures the `[vision] adr_row_trim` row content-trim (adr_ocr) on REAL
 // captured placard crops. For every `adr_*_raw.png` in the dump dir it runs
 // `AdrOcr::read_adr` twice — trim OFF then trim ON — and reports per-crop
 // (kemler, un) both ways, how many reads CHANGED, and how many land on the known
@@ -27,16 +27,18 @@ const GT_KEMLER: &str = "99";
 const GT_UN: &str = "3257";
 
 fn read_with_trim(engine: &AdrOcr, rgb: &[u8], w: u32, h: u32, trim: bool) -> (String, String) {
-    // Read fresh per call in adr_ocr, so flipping the env flips the behavior.
-    std::env::set_var("TENTAFLOW_ADR_ROW_TRIM", if trim { "1" } else { "0" });
+    // adr_ocr reads the trim flag fresh per call, so flipping the bench-only
+    // programmatic override flips the behavior between the two arms.
+    tentaflow_core::vision::adr_ocr::set_row_trim_override(trim);
     engine
         .read_adr(rgb, w, h)
         .unwrap_or_else(|| (String::new(), String::new()))
 }
 
 fn main() -> Result<()> {
-    // Never re-dump into the folder we are iterating (would spawn new crops).
-    std::env::remove_var("TENTAFLOW_OCR_DUMP_DIR");
+    // Default vision settings: crucially `ocr_dump_dir = None`, so we never
+    // re-dump into the folder we are iterating (would spawn new crops).
+    tentaflow_core::vision::settings::init(Default::default())?;
 
     let dump_dir = std::env::args()
         .nth(1)

@@ -306,13 +306,13 @@ fn crop_for_detection(
     }
 }
 
-/// Remaining zero-copy CROPS verify frames. `TENTAFLOW_ZEROCOPY_CROPS_VERIFY`
-/// seeds it (8 crops); each verified crop decrements it. `0` (env unset) makes
-/// [`verify_zerocopy_crop`] a cheap no-op.
+/// Remaining zero-copy CROPS verify frames. `[vision] zerocopy_crops_verify`
+/// seeds it (8 crops); each verified crop decrements it. `0` (off, the default)
+/// makes [`verify_zerocopy_crop`] a cheap no-op.
 fn verify_crops_counter() -> &'static AtomicU64 {
     static C: OnceLock<AtomicU64> = OnceLock::new();
     C.get_or_init(|| {
-        AtomicU64::new(if std::env::var("TENTAFLOW_ZEROCOPY_CROPS_VERIFY").is_ok() {
+        AtomicU64::new(if crate::vision::settings::get().zerocopy_crops_verify {
             8
         } else {
             0
@@ -320,11 +320,11 @@ fn verify_crops_counter() -> &'static AtomicU64 {
     })
 }
 
-/// VERIFY gate (`TENTAFLOW_ZEROCOPY_CROPS_VERIFY`): for the first few crops, cut
+/// VERIFY gate (`[vision] zerocopy_crops_verify`): for the first few crops, cut
 /// the SAME detection rect from the full host-downloaded NV12 frame and assert the
 /// RGB is byte-identical to the zero-copy device crop (`device_rgb`). Correctness
 /// gate for the per-crop device path. Logged, never panics — a mismatch surfaces
-/// without killing a live camera. No-op when the env var is unset or no device
+/// without killing a live camera. No-op when the gate is off or no device
 /// frame is present.
 #[allow(clippy::too_many_arguments)]
 fn verify_zerocopy_crop(
@@ -792,29 +792,21 @@ struct ForwardOutput {
 /// obowiązywać na każdej ścieżce.
 const MAX_INFLIGHT: usize = 16;
 
-/// Liczba współbieżnych forwardów K. Jawny opt-in `TENTAFLOW_VISION_INFLIGHT`
-/// wygrywa; w przeciwnym razie odwzorowuje rozmiar puli detektora
-/// (`TENTAFLOW_VISION_DETECTOR_SESSIONS`): przy N sesjach GPU liczy N detektów
-/// naraz, więc N in-flight to naturalny sufit. Gdy ŻADNA zmienna nie jest
-/// ustawiona → K=1, czyli bit-identyczne zachowanie z dawną pojedynczą,
-/// serializowaną pętlą (zero regresji, dopóki operator nie włączy więcej).
+/// Liczba współbieżnych forwardów K. Jawny opt-in `[vision] inflight` wygrywa;
+/// w przeciwnym razie odwzorowuje rozmiar puli detektora
+/// (`[vision] detector_sessions`, domyślnie 4): przy N sesjach GPU liczy N
+/// detektów naraz, więc N in-flight to naturalny sufit. Z 4 sesjami w puli 4
+/// pipelinowane batched forwardy dają ~3× przepustowości detektora
+/// (~1300 vs ~430 frames/s na jednym GPU) względem serializacji.
 fn inflight_limit() -> usize {
-    const INFLIGHT_ENV: &str = "TENTAFLOW_VISION_INFLIGHT";
-    const DETECTOR_SESSIONS_ENV: &str = "TENTAFLOW_VISION_DETECTOR_SESSIONS";
-    if let Some(k) = std::env::var(INFLIGHT_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-    {
-        return k.clamp(1, MAX_INFLIGHT);
-    }
-    std::env::var(DETECTOR_SESSIONS_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        // Mirrors the detector pool's DEFAULT_DETECTOR_SESSIONS (4): with 4 pooled
-        // sessions, 4 in-flight batched forwards pipeline instead of serializing —
-        // measured ~3× detect throughput (~1300 vs ~430 frames/s on one GPU).
-        .unwrap_or(4)
-        .clamp(1, MAX_INFLIGHT)
+    let vision = crate::vision::settings::get();
+    resolve_inflight_limit(vision.inflight, vision.detector_sessions)
+}
+
+/// Pure resolution behind [`inflight_limit`], split out so the precedence and
+/// clamps are unit-testable without touching the frozen process settings.
+fn resolve_inflight_limit(inflight: Option<usize>, detector_sessions: usize) -> usize {
+    inflight.unwrap_or(detector_sessions).clamp(1, MAX_INFLIGHT)
 }
 
 /// Grouping key that keeps a detect flush batch homogeneous: `None` for RGB
@@ -1684,21 +1676,20 @@ fn stage_completed(
     }
 }
 
-/// Bench-only load-generator toggle. `TENTAFLOW_BENCH_FORCE_DETECT=1` makes the
-/// cold enrichment path run on frames the detector left empty (see
-/// [`synthesize_forced_detections`]). Read once via `OnceLock`; OFF by default,
-/// so production behaviour is unchanged.
+/// Bench-only load-generator toggle, flipped programmatically by the
+/// `pipeline_bench` example via [`set_force_detect`]. When on, the cold
+/// enrichment path runs on frames the detector left empty (see
+/// [`synthesize_forced_detections`]). OFF by default, so production behaviour
+/// is unchanged.
+static FORCE_DETECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Bench-only programmatic switch for the forced-enrichment load generator.
+pub fn set_force_detect(enabled: bool) {
+    FORCE_DETECT.store(enabled, AtomicOrdering::Relaxed);
+}
+
 fn force_detect_enabled() -> bool {
-    static FORCE: OnceLock<bool> = OnceLock::new();
-    *FORCE.get_or_init(|| {
-        std::env::var("TENTAFLOW_BENCH_FORCE_DETECT")
-            .ok()
-            .map(|v| {
-                let v = v.trim();
-                v == "1" || v.eq_ignore_ascii_case("true")
-            })
-            .unwrap_or(false)
-    })
+    FORCE_DETECT.load(AtomicOrdering::Relaxed)
 }
 
 /// Bench-only load generator (behind [`force_detect_enabled`]): synthesizes one
@@ -1758,7 +1749,7 @@ fn finalize_job(mut job: FrameJob, cold: &mpsc::Sender<DetectionEvent>) {
     }
     job.results
         .sort_by_key(|(sid, _)| cv_pipeline::stage_index(&job.pipeline, sid));
-    // Bench-only forced enrichment load (`TENTAFLOW_BENCH_FORCE_DETECT=1`, off by
+    // Bench-only forced enrichment load (`set_force_detect`, off by
     // default): when the real detector left this frame empty, inject synthetic
     // detections into the frame-stage results so the REAL cold path runs. This
     // MUST land here — before the empty-set gate below — because the cold event
@@ -2153,12 +2144,7 @@ impl Drop for ColdSlot {
 /// into one big GPU forward per model. Per-camera in-flight is still 1 (admit_cold)
 /// and the byte budget still bounds memory — this only widens CROSS-camera concurrency.
 fn cold_workers() -> usize {
-    std::env::var("TENTAFLOW_VISION_COLD_WORKERS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or(64)
-        .min(1024)
+    crate::vision::settings::get().cold_workers.clamp(1, 1024)
 }
 
 async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
@@ -3329,46 +3315,34 @@ mod tests {
         }
     }
 
-    /// K>1: gdy `TENTAFLOW_VISION_INFLIGHT` jest ustawione, wygrywa; inaczej K
-    /// odwzorowuje pulę detektora; gdy ŻADNA zmienna nie jest ustawiona → K=4,
-    /// lustrzanie do DEFAULT_DETECTOR_SESSIONS (4 pipelinowane forwardy ≈ 3×
+    /// K>1: gdy `[vision] inflight` jest ustawione, wygrywa; inaczej K
+    /// odwzorowuje `[vision] detector_sessions`; przy configu domyślnym → K=4,
+    /// lustrzanie do domyślnej puli detektora (4 pipelinowane forwardy ≈ 3×
     /// przepustowości detektora vs serializacja).
     #[test]
-    fn inflight_limit_defaults_to_one_and_honors_env() {
-        let prev_k = std::env::var("TENTAFLOW_VISION_INFLIGHT").ok();
-        let prev_d = std::env::var("TENTAFLOW_VISION_DETECTOR_SESSIONS").ok();
-        std::env::remove_var("TENTAFLOW_VISION_INFLIGHT");
-        std::env::remove_var("TENTAFLOW_VISION_DETECTOR_SESSIONS");
-        assert_eq!(inflight_limit(), 4, "brak env → K=4 (default puli detektora)");
-
-        std::env::set_var("TENTAFLOW_VISION_DETECTOR_SESSIONS", "4");
-        assert_eq!(inflight_limit(), 4, "K odwzorowuje pulę detektora");
-
-        std::env::set_var("TENTAFLOW_VISION_INFLIGHT", "2");
+    fn inflight_limit_follows_detector_sessions_and_honors_override() {
+        let defaults = crate::config::VisionConfig::default();
         assert_eq!(
-            inflight_limit(),
+            resolve_inflight_limit(defaults.inflight, defaults.detector_sessions),
+            4,
+            "default config → K=4 (default detector pool)"
+        );
+        assert_eq!(
+            resolve_inflight_limit(None, 4),
+            4,
+            "K mirrors the detector pool"
+        );
+        assert_eq!(
+            resolve_inflight_limit(Some(2), 4),
             2,
-            "jawny opt-in wygrywa nad pulą detektora"
+            "explicit inflight wins over the detector pool"
         );
-
-        std::env::set_var("TENTAFLOW_VISION_INFLIGHT", "999");
         assert_eq!(
-            inflight_limit(),
+            resolve_inflight_limit(Some(999), 4),
             MAX_INFLIGHT,
-            "clamp górny do MAX_INFLIGHT"
+            "upper clamp to MAX_INFLIGHT"
         );
-
-        std::env::set_var("TENTAFLOW_VISION_INFLIGHT", "0");
-        assert_eq!(inflight_limit(), 1, "clamp dolny do 1");
-
-        match prev_k {
-            Some(v) => std::env::set_var("TENTAFLOW_VISION_INFLIGHT", v),
-            None => std::env::remove_var("TENTAFLOW_VISION_INFLIGHT"),
-        }
-        match prev_d {
-            Some(v) => std::env::set_var("TENTAFLOW_VISION_DETECTOR_SESSIONS", v),
-            None => std::env::remove_var("TENTAFLOW_VISION_DETECTOR_SESSIONS"),
-        }
+        assert_eq!(resolve_inflight_limit(Some(0), 4), 1, "lower clamp to 1");
     }
 
     /// Ordering gate: kamera z otwartym jobem NIE przyjmuje drugiej klatki, więc

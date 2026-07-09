@@ -20,9 +20,9 @@
 // current bilinear-stretch path — deskew is a strictly fallback-protected
 // enhancement, never worse than today.
 //
-// Toggles (zero cost when unset):
-//   * `TENTAFLOW_OCR_DESKEW=0` disables deskew (A/B against the stretch path).
-//   * `TENTAFLOW_OCR_DUMP_DIR=<dir>` dumps, per OCR call, the raw crop, the
+// Toggles (config `[vision]` section, zero cost when unset):
+//   * `ocr_deskew = false` disables deskew (A/B against the stretch path).
+//   * `ocr_dump_dir = "<dir>"` dumps, per OCR call, the raw crop, the
 //     rectified crop (when any) and the exact model-input tensor as PNGs named
 //     with the read result + score, so a human can SEE what the model saw.
 
@@ -32,29 +32,23 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-/// `TENTAFLOW_OCR_DESKEW` — default ON. `0`/`false`/`off`/`no` disable it.
+/// `[vision] ocr_deskew` — default ON.
 pub fn deskew_enabled() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("TENTAFLOW_OCR_DESKEW") {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"),
-        Err(_) => true,
-    })
+    crate::vision::settings::get().ocr_deskew
 }
 
-/// `TENTAFLOW_OCR_DUMP_DIR` — when set to an existing/creatable dir, OCR calls
+/// `[vision] ocr_dump_dir` — when set to an existing/creatable dir, OCR calls
 /// dump their crops there. `None` (unset) means every dump call is a no-op.
 pub fn dump_dir() -> Option<&'static Path> {
     static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
     CACHE
         .get_or_init(|| {
-            let raw = std::env::var("TENTAFLOW_OCR_DUMP_DIR").ok()?;
-            let raw = raw.trim();
-            if raw.is_empty() {
-                return None;
-            }
-            let dir = PathBuf::from(raw);
+            let dir = crate::vision::settings::get().ocr_dump_dir.clone()?;
             if let Err(e) = std::fs::create_dir_all(&dir) {
-                tracing::warn!("[ocr_prep] TENTAFLOW_OCR_DUMP_DIR {} unusable: {e}", dir.display());
+                tracing::warn!(
+                    "[ocr_prep] [vision] ocr_dump_dir {} unusable: {e}",
+                    dir.display()
+                );
                 return None;
             }
             tracing::info!("[ocr_prep] OCR crop dump enabled → {}", dir.display());
@@ -518,7 +512,7 @@ fn solve8(a: &mut [[f64; 8]; 8], b: &mut [f64; 8]) -> Option<[f64; 8]> {
     Some(x)
 }
 
-/// Dump one OCR sample when `TENTAFLOW_OCR_DUMP_DIR` is set. Writes the raw crop,
+/// Dump one OCR sample when `[vision] ocr_dump_dir` is set. Writes the raw crop,
 /// the rectified crop (when deskew produced one) and the exact model-input tensor
 /// (grayscale, `gw×gh`) as PNGs whose names carry the read result + score, so a
 /// human can inspect whether the plate was clipped, skewed, too small or stretched.

@@ -4,8 +4,9 @@
 // =============================================================================
 //
 // Master key: <tentaflow_home>/keys/cameras.key (32 raw bytes, mode 0600 on
-// Unix). The path is overridable via the `TENTAFLOW_CAMERAS_KEY` env var so
-// tests and CI can pin a tempfile without touching the user's HOME.
+// Unix). The path is overridable programmatically via `set_key_path_override`
+// so tests and CI can pin a tempfile without touching the user's HOME (there
+// is deliberately no environment knob).
 //
 // Encrypted blob format: [nonce(12)][ciphertext + 16-byte tag].
 // Decrypted plaintext: UTF-8 string "user:pass" (RTSP user-info portion). The
@@ -27,9 +28,17 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use rand::Rng;
 use thiserror::Error;
 
-/// Override for the master-key file. When set, takes precedence over
-/// `<tentaflow_home>/keys/cameras.key`.
-pub const KEY_PATH_ENV: &str = "TENTAFLOW_CAMERAS_KEY";
+/// Programmatic override for the master-key file (tests/CI). When set, takes
+/// precedence over `<tentaflow_home>/keys/cameras.key`.
+static KEY_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Pins the master-key file to an explicit path for this process (tests/CI pin
+/// a tempfile so they never touch the node's real `cameras.key`). Must run
+/// before the first cipher load; a later call is ignored once the override is
+/// frozen.
+pub fn set_key_path_override(path: PathBuf) {
+    let _ = KEY_PATH_OVERRIDE.set(path);
+}
 
 /// Subdirectory under `tentaflow_home()` that holds AES-GCM master keys.
 const KEY_SUBDIR: &str = "keys";
@@ -183,12 +192,12 @@ impl CredentialsCipher {
     }
 }
 
-/// Default on-disk location of the master key file. Honours the
-/// `TENTAFLOW_CAMERAS_KEY` env override; otherwise resolves to
+/// Default on-disk location of the master key file. Honours the programmatic
+/// [`set_key_path_override`] (tests/CI); otherwise resolves to
 /// `<tentaflow_home>/keys/cameras.key`.
 pub fn default_key_path() -> PathBuf {
-    if let Ok(p) = std::env::var(KEY_PATH_ENV) {
-        return PathBuf::from(p);
+    if let Some(p) = KEY_PATH_OVERRIDE.get() {
+        return p.clone();
     }
     crate::paths::tentaflow_home()
         .join(KEY_SUBDIR)

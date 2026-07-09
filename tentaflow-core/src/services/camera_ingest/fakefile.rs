@@ -42,7 +42,7 @@ pub struct LatestFrame {
     /// `videoconvert` never runs on the analysis hot path. Additive — every
     /// consumer that needs RGB (snapshots, streaming) converts on demand.
     pub format: DetectFrameFormat,
-    /// Zero-copy CROPS path (`TENTAFLOW_ZEROCOPY_CROPS`) ONLY: a DEVICE reference
+    /// Zero-copy CROPS path (`[vision] zerocopy_crops`) ONLY: a DEVICE reference
     /// to the latest NVDEC NV12 surface (the `gst::Sample` ref-holds ONE decode
     /// surface + carries its device geometry/colorimetry). When `Some`, `data` is
     /// EMPTY: the full 4K NV12 was NOT downloaded to host this frame. Enrichment
@@ -433,7 +433,7 @@ pub fn build_pipeline(
         .ok_or_else(|| CameraIngestError::InvalidUrl(file_path.to_string_lossy().into_owned()))?;
     let loc = location.replace('"', "\\\"");
 
-    // Stage-1 bench hook (`TENTAFLOW_FAKEFILE_NV12_DETECT=1`): tee the decoded
+    // Stage-1 bench hook (`set_nv12_bench_mode`): tee the decoded
     // NV12 into a raw-NV12 detect appsink (mirrors the real NvdecNv12 tee) so
     // the GPU-resident detect path (`detect_batch_gpu`) is exercised end-to-end
     // WITHOUT a live camera. Default off → the exact single-appsink RGB pipeline.
@@ -497,32 +497,41 @@ pub fn build_pipeline(
     build_pipeline_from_description(&desc, camera_id, mailbox, counters)
 }
 
+/// Bench-only NV12 gates for the fakefile connector, flipped programmatically
+/// by `pipeline_bench` via [`set_nv12_bench_mode`] BEFORE any camera pipeline
+/// builds. Both default off — production behavior is unchanged.
+static NV12_DETECT_BENCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static NV12_FULL_BENCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Bench-only programmatic switch (called by the `pipeline_bench` example):
+/// `detect` tees the decoded NV12 into a raw-NV12 detect appsink (Stage 1);
+/// `full` additionally delivers the crops frame as raw NV12 (Stage 3, implies
+/// the detect branch).
+pub fn set_nv12_bench_mode(detect: bool, full: bool) {
+    NV12_DETECT_BENCH.store(detect, std::sync::atomic::Ordering::Relaxed);
+    NV12_FULL_BENCH.store(full, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Whether the fakefile connector should emit a raw-NV12 detect frame (Stage-1
-/// bench gate). Opt-in via `TENTAFLOW_FAKEFILE_NV12_DETECT=1`; default off. Also
-/// requires the ort GPU detect features — without them nothing consumes NV12
-/// detect frames, so we never produce one.
+/// bench gate, [`set_nv12_bench_mode`]); default off. Also requires the ort GPU
+/// detect features — without them nothing consumes NV12 detect frames, so we
+/// never produce one.
 pub fn nv12_detect_bench_enabled() -> bool {
     cfg!(all(
         feature = "inference-vision-gpu",
         feature = "inference-supertonic"
-    )) && (env_flag("TENTAFLOW_FAKEFILE_NV12_DETECT") || nv12_full_bench_enabled())
+    )) && (NV12_DETECT_BENCH.load(std::sync::atomic::Ordering::Relaxed)
+        || nv12_full_bench_enabled())
 }
 
-/// Whether the fakefile connector should ALSO deliver the crops frame as raw NV12
-/// (Stage-3 bench gate). Opt-in via `TENTAFLOW_FAKEFILE_NV12=1`; implies the NV12
-/// detect branch too, so `--nv12` drives detect + enrichment on NV12 end to end.
+/// Whether the fakefile connector should ALSO deliver the crops frame as raw
+/// NV12 (Stage-3 bench gate, [`set_nv12_bench_mode`]); implies the NV12 detect
+/// branch too, so `--nv12` drives detect + enrichment on NV12 end to end.
 pub fn nv12_full_bench_enabled() -> bool {
     cfg!(all(
         feature = "inference-vision-gpu",
         feature = "inference-supertonic"
-    )) && env_flag("TENTAFLOW_FAKEFILE_NV12")
-}
-
-/// `true` when the named env var is set to `1`.
-fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false)
+    )) && NV12_FULL_BENCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) fn build_pipeline_from_description(
@@ -778,7 +787,7 @@ pub(crate) fn install_detect_frame_callback_nv12(
 /// readable host map of a GstCudaMemory copies device→host), storing a normal
 /// NV12 detect frame. A camera never breaks.
 ///
-/// VERIFY: with `TENTAFLOW_ZEROCOPY_VERIFY` set, after the device preprocess it
+/// VERIFY: with `[vision] zerocopy_verify = true`, after the device preprocess it
 /// ALSO downloads the NV12 and runs the download preprocess, asserting the two
 /// device tensors are element-identical (same kernel, same pixels) on the first
 /// few frames — the correctness gate for the zero-copy path.
@@ -798,7 +807,7 @@ pub(crate) fn install_detect_frame_callback_cuda(
 
     let fallback_logged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let verify_frames = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
-        if std::env::var("TENTAFLOW_ZEROCOPY_VERIFY").is_ok() {
+        if crate::vision::settings::get().zerocopy_verify {
             8
         } else {
             0
@@ -949,7 +958,7 @@ fn warn_zerocopy_fallback(logged: &std::sync::atomic::AtomicBool, reason: &str) 
     }
 }
 
-/// `TENTAFLOW_ZEROCOPY_VERIFY`: run the DOWNLOAD preprocess on the same frame and
+/// `[vision] zerocopy_verify`: run the DOWNLOAD preprocess on the same frame and
 /// assert its device tensor is element-identical to the zero-copy one (same
 /// kernel, same pixels → must be bit-identical). Logged, not panicking, so a
 /// mismatch surfaces without killing a live camera.
@@ -1100,7 +1109,7 @@ pub(crate) fn install_frame_callback_nv12(
     );
 }
 
-/// Whether the zero-copy CROPS path is active (`TENTAFLOW_ZEROCOPY_CROPS=1`).
+/// Whether the zero-copy CROPS path is active (`[vision] zerocopy_crops = true`).
 /// OFF by default: the mailbox keeps the full host `[Y | UV]` download
 /// ([`install_frame_callback_nv12`]) and everything is byte-identical to today.
 /// ON: the crops appsink consumes the NVDEC surface in DEVICE memory
@@ -1111,9 +1120,7 @@ pub(crate) fn install_frame_callback_nv12(
 pub fn zerocopy_crops_enabled() -> bool {
     #[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
     {
-        std::env::var("TENTAFLOW_ZEROCOPY_CROPS")
-            .map(|v| v.trim() == "1")
-            .unwrap_or(false)
+        crate::vision::settings::get().zerocopy_crops
     }
     #[cfg(not(all(feature = "inference-vision-gpu", feature = "inference-supertonic")))]
     {

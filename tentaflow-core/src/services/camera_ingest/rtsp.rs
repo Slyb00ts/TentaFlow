@@ -210,14 +210,11 @@ impl IngestPath {
 /// Whether the GPU-resident NV12 detect path is usable: the ort GPU detect
 /// features must be compiled (`detect_batch_gpu` exists to consume the raw NV12
 /// frame) and the operator must not have disabled it via
-/// `TENTAFLOW_VISION_NV12_DETECT=0`. When false, NVDEC ingest uses the
+/// `[vision] nv12_detect = false`. When false, NVDEC ingest uses the
 /// CPU-convert path (the detector then reads an RGB frame). Decode availability
 /// is checked separately (`nvdec_decode_available`).
 fn nv12_gpu_detect_available() -> bool {
-    let forced_off = std::env::var("TENTAFLOW_VISION_NV12_DETECT")
-        .map(|v| v.trim() == "0")
-        .unwrap_or(false);
-    !forced_off
+    crate::vision::settings::get().nv12_detect
         && cfg!(all(
             feature = "inference-vision-gpu",
             feature = "inference-supertonic"
@@ -805,28 +802,24 @@ pub(super) fn attach_crops_branch_cuda(
 
 /// Czy dobudować gałąź GPU-owego skalowania klatki detekcji. `true` gdy runtime
 /// ma komplet elementów CUDA (`cudaupload/cudaconvert/cudascale/cudadownload`)
-/// ORAZ operator nie wymusił ścieżki CPU przez `TENTAFLOW_VISION_GPU_RESIZE=0`.
+/// ORAZ operator nie wymusił ścieżki CPU przez `[vision] gpu_resize = false`.
 /// Gdy `false`, pipeline zostaje przy pojedynczym appsinku (crops) i detektor
 /// resize'uje 4K→560 na CPU jak dotąd. Fallback runtime (negocjacja CUDA pada
 /// przy Playing) obsługuje `run_rtsp_session` przez ponowną budowę z `false`.
 pub(super) fn gpu_resize_enabled() -> bool {
-    let forced_off = std::env::var("TENTAFLOW_VISION_GPU_RESIZE")
-        .map(|v| v.trim() == "0")
-        .unwrap_or(false);
-    !forced_off && cuda_scale_available()
+    crate::vision::settings::get().gpu_resize && cuda_scale_available()
 }
 
 /// Whether to use the Stage-4 ZERO-COPY detect branch (device NV12 straight to
 /// the detector, no `cudadownload`/re-upload round-trip). Opt-in via
-/// `TENTAFLOW_ZEROCOPY=1` and only meaningful with the GPU inference features
-/// built in (they link cudart and provide the device-tensor detect path). OFF by
-/// default: the deployed host-download NV12 detect is the guaranteed fallback.
+/// `[vision] zerocopy_detect = true` and only meaningful with the GPU inference
+/// features built in (they link cudart and provide the device-tensor detect
+/// path). OFF by default: the deployed host-download NV12 detect is the
+/// guaranteed fallback.
 pub(super) fn zerocopy_enabled() -> bool {
     #[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
     {
-        std::env::var("TENTAFLOW_ZEROCOPY")
-            .map(|v| v.trim() == "1")
-            .unwrap_or(false)
+        crate::vision::settings::get().zerocopy_detect
     }
     #[cfg(not(all(feature = "inference-vision-gpu", feature = "inference-supertonic")))]
     {
@@ -2626,7 +2619,7 @@ pub async fn run_rtsp_session(
     };
     // Czy dobudować gałąź GPU-owego skalowania klatki detekcji (4K→560 na GPU,
     // zdejmuje ~4 ms resize'u z detektora). Start wg `gpu_resize_enabled`
-    // (elementy CUDA obecne + brak `TENTAFLOW_VISION_GPU_RESIZE=0`). Po
+    // (elementy CUDA obecne + brak `[vision] gpu_resize = false`). Po
     // nieudanej negocjacji CUDA przy Playing schodzimy na pojedynczy appsink
     // (detektor resize'uje na CPU) i zostajemy tam do końca sesji — „musi
     // działać". Dotyczy MJPEG i RTSP jednakowo (skalowanie działa też przy

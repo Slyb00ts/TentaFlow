@@ -521,7 +521,7 @@ name = "nv12_preprocess_smoke"
 required-features = ["inference-vision-gpu", "inference-supertonic"]
 
 # A/B plate-OCR preprocessing: current stretch vs. perspective deskew, side by
-# side over a folder of crops (feed it TENTAFLOW_OCR_DUMP_DIR captures).
+# side over a folder of crops (feed it `[vision] ocr_dump_dir` captures).
 [[example]]
 name = "ocr_deskew_ab"
 required-features = ["inference-vision-gpu", "inference-supertonic"]

@@ -87,18 +87,209 @@ pub struct NodeConfig {
 // Konfiguracja vision workers (sekcja [vision])
 // =============================================================================
 
-/// Multi-process vision worker sharding (docs/VISION_WORKER_SHARDING.md).
-/// The config TOML is the ONLY operator mechanism for this feature — there is
-/// deliberately no environment knob. Defaults keep the feature off, so a node
-/// without a `[vision]` section behaves exactly as before (all detection stays
-/// in-process).
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+/// Vision / camera-CV runtime configuration (docs/VISION_WORKER_SHARDING.md
+/// for the worker fleet). The config TOML is the ONLY operator mechanism for
+/// every knob here — there are deliberately NO environment variables. Every
+/// default matches the historical behavior, so a node without a `[vision]`
+/// section behaves exactly as before. The parsed section is frozen process-wide
+/// via `vision::settings::init` at startup; vision worker processes receive it
+/// as a serialized CLI argument from the spawning supervisor.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VisionConfig {
     /// Vision worker processes spawned per GPU in the vision GPU set. `0`
     /// (default) disables the worker fleet entirely: no processes are spawned
     /// and no link socket is bound.
     #[serde(default)]
     pub workers_per_gpu: usize,
+
+    /// CUDA device set the vision session pools spread across. Grammar:
+    /// empty (default) → device `[0]`; a bare count `"2"` → devices `[0, 1]`;
+    /// an explicit comma list `"0,2,3"` → exactly those device ids.
+    #[serde(default)]
+    pub gpus: String,
+
+    /// RF-DETR detector session-pool size (each session ≈2.6 GB VRAM).
+    #[serde(default = "default_vision_sessions")]
+    pub detector_sessions: usize,
+
+    /// State-classifier (nalepka-stan) session-pool size.
+    #[serde(default = "default_vision_sessions")]
+    pub stan_sessions: usize,
+
+    /// Plate-OCR session-pool size.
+    #[serde(default = "default_vision_sessions")]
+    pub plate_sessions: usize,
+
+    /// ADR-OCR session-pool size.
+    #[serde(default = "default_vision_sessions")]
+    pub adr_sessions: usize,
+
+    /// PP-OCRv5 fallback OCR session-pool size (shared by det/rec/cls heads).
+    #[serde(default = "default_ppocr_sessions")]
+    pub ppocr_sessions: usize,
+
+    /// Max resident dynamic `onnx-cv` registry models (LRU eviction).
+    #[serde(default = "default_vision_sessions")]
+    pub onnx_cv_max_models: usize,
+
+    /// Session-pool size per resident `onnx-cv` registry model.
+    #[serde(default = "default_one")]
+    pub onnx_cv_sessions_per_model: usize,
+
+    /// TensorRT shape-profile optimization batch for the fixed camera-CV
+    /// engines. `None` keeps each model's built-in default (detector 8,
+    /// classifier/plate 8). Changing it forces a TRT engine rebuild on load.
+    #[serde(default)]
+    pub opt_batch: Option<usize>,
+
+    /// TensorRT shape-profile max batch. `None` keeps each model's built-in
+    /// default (detector = opt, classifier/plate = max(opt, 16)).
+    #[serde(default)]
+    pub max_batch: Option<usize>,
+
+    /// Concurrent detect forwards K. `None` (default) follows
+    /// `detector_sessions` — N pooled sessions pipeline N batched forwards.
+    #[serde(default)]
+    pub inflight: Option<usize>,
+
+    /// Cross-camera inference-batcher flush window in microseconds.
+    #[serde(default = "default_batch_window_us")]
+    pub batch_window_us: u64,
+
+    /// Max cameras whose cold enrichment runs concurrently (1..=1024).
+    #[serde(default = "default_cold_workers")]
+    pub cold_workers: usize,
+
+    /// Run the small OCR/classifier CRNN heads in TensorRT FP16. Default OFF —
+    /// fp16 rounding corrupts character reads; ON only for A/B measurement.
+    #[serde(default)]
+    pub ocr_fp16: bool,
+
+    /// Per-session TensorRT workspace cap in MiB (clamped 128..=8192). The TRT
+    /// 10.x default (0 = all free VRAM) makes pooled sessions unusable at N>1.
+    #[serde(default = "default_trt_workspace_mib")]
+    pub trt_workspace_mib: usize,
+
+    /// Capture + replay the TRT forward as one CUDA Graph. Opt-in: graph
+    /// capture requires stable shapes per session; mixed batches can regress.
+    #[serde(default)]
+    pub trt_cuda_graph: bool,
+
+    /// Zero-copy DETECT branch: feed the NVDEC device surface straight to the
+    /// detector (no download/re-upload round-trip). Opt-in.
+    #[serde(default)]
+    pub zerocopy_detect: bool,
+
+    /// Zero-copy CROPS path: enrichment cuts crops off the device surface
+    /// instead of downloading the full frame to host every stream frame. Opt-in.
+    #[serde(default)]
+    pub zerocopy_crops: bool,
+
+    /// Trust that `gst_memory_map(GST_MAP_CUDA)` already synced the decode
+    /// surface and skip the `cudaDeviceSynchronize` barrier (lower latency;
+    /// enable only once confirmed on the target GStreamer build).
+    #[serde(default)]
+    pub zerocopy_map_sync: bool,
+
+    /// Verify the zero-copy DETECT preprocess against the download path on the
+    /// first few frames (correctness gate; logged, never fatal).
+    #[serde(default)]
+    pub zerocopy_verify: bool,
+
+    /// Verify the zero-copy CROPS path against host crops on the first few
+    /// crops (correctness gate; logged, never fatal).
+    #[serde(default)]
+    pub zerocopy_crops_verify: bool,
+
+    /// GPU-resident NV12 detect path for NVDEC ingest. Default ON; `false`
+    /// forces the NVDEC + CPU-convert path (detector reads an RGB frame).
+    #[serde(default = "default_true")]
+    pub nv12_detect: bool,
+
+    /// GPU scaling branch for the detect frame (cudascale). Default ON;
+    /// `false` forces the CPU resize path.
+    #[serde(default = "default_true")]
+    pub gpu_resize: bool,
+
+    /// When set, OCR calls dump their raw/rectified crops + model-input
+    /// tensors as PNGs into this directory. `None` (default) disables dumps.
+    #[serde(default)]
+    pub ocr_dump_dir: Option<std::path::PathBuf>,
+
+    /// Perspective-deskew plate crops before OCR. Default ON; `false` keeps
+    /// the plain bilinear-stretch path (A/B toggle).
+    #[serde(default = "default_true")]
+    pub ocr_deskew: bool,
+
+    /// Content-trim each ADR placard row before the 32×128 resize. Default ON.
+    #[serde(default = "default_true")]
+    pub adr_row_trim: bool,
+
+    /// Placard orientations tried by ADR OCR (1 = upright only, up to 4 =
+    /// full 0/90/180/270 rotation search). Stationary cameras see placards
+    /// upright, so extra rotations are usually wasted forwards.
+    #[serde(default = "default_one")]
+    pub adr_orientations: usize,
+
+    /// One-shot depth-calibration capture: dump the metric depth map + pose +
+    /// lidar cloud to `/tmp/tf_calib/` for the offline `depth_calib` example.
+    #[serde(default)]
+    pub calib_dump: bool,
+}
+
+impl Default for VisionConfig {
+    fn default() -> Self {
+        Self {
+            workers_per_gpu: 0,
+            gpus: String::new(),
+            detector_sessions: default_vision_sessions(),
+            stan_sessions: default_vision_sessions(),
+            plate_sessions: default_vision_sessions(),
+            adr_sessions: default_vision_sessions(),
+            ppocr_sessions: default_ppocr_sessions(),
+            onnx_cv_max_models: default_vision_sessions(),
+            onnx_cv_sessions_per_model: default_one(),
+            opt_batch: None,
+            max_batch: None,
+            inflight: None,
+            batch_window_us: default_batch_window_us(),
+            cold_workers: default_cold_workers(),
+            ocr_fp16: false,
+            trt_workspace_mib: default_trt_workspace_mib(),
+            trt_cuda_graph: false,
+            zerocopy_detect: false,
+            zerocopy_crops: false,
+            zerocopy_map_sync: false,
+            zerocopy_verify: false,
+            zerocopy_crops_verify: false,
+            nv12_detect: default_true(),
+            gpu_resize: default_true(),
+            ocr_dump_dir: None,
+            ocr_deskew: default_true(),
+            adr_row_trim: default_true(),
+            adr_orientations: default_one(),
+            calib_dump: false,
+        }
+    }
+}
+
+fn default_vision_sessions() -> usize {
+    4
+}
+fn default_ppocr_sessions() -> usize {
+    2
+}
+fn default_one() -> usize {
+    1
+}
+fn default_batch_window_us() -> u64 {
+    2000
+}
+fn default_cold_workers() -> usize {
+    64
+}
+fn default_trt_workspace_mib() -> usize {
+    1024
 }
 
 // =============================================================================
@@ -1026,5 +1217,42 @@ impl Default for MonitoringConfig {
             tracing_enabled: false,
             tracing_endpoint: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod vision_config_tests {
+    use super::*;
+
+    /// An absent `[vision]` section must yield exactly `VisionConfig::default()`
+    /// — the serde field defaults and the manual `Default` impl share the same
+    /// default fns, so a node without the section keeps today's behavior.
+    #[test]
+    fn absent_vision_section_equals_default() {
+        let parsed: VisionConfig = toml::from_str("").expect("empty [vision] parses");
+        let default = VisionConfig::default();
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            serde_json::to_value(&default).unwrap()
+        );
+    }
+
+    /// The default config file written on first boot must serialize cleanly
+    /// with the extended `[vision]` section (Option fields skipped by TOML) and
+    /// survive a JSON round-trip — the supervisor hands the section to vision
+    /// workers as `--vision-config` JSON.
+    #[test]
+    fn vision_config_serializes_to_toml_and_json() {
+        let toml_str = NodeConfig::default()
+            .to_toml_string()
+            .expect("default config serializes");
+        assert!(toml_str.contains("[vision]"));
+
+        let json = serde_json::to_string(&VisionConfig::default()).expect("to json");
+        let back: VisionConfig = serde_json::from_str(&json).expect("from json");
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(&VisionConfig::default()).unwrap()
+        );
     }
 }

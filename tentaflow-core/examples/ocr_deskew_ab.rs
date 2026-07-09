@@ -5,10 +5,10 @@
 //
 //   cargo run --example ocr_deskew_ab --features inference-vision-gpu,inference-supertonic -- <dir-of-crops>
 //
-// Feed it the raw crops dumped by TENTAFLOW_OCR_DUMP_DIR (the `*_raw.png` files
-// are exactly the crop the model received) and/or any synthetic skewed plates.
-// Only `*_raw*.png` / non-tensor PNGs are read (tensor/deskew dumps are skipped
-// so a dump folder can be pointed at directly).
+// Feed it the raw crops dumped by `[vision] ocr_dump_dir` (the `*_raw.png`
+// files are exactly the crop the model received) and/or any synthetic skewed
+// plates. Only `*_raw*.png` / non-tensor PNGs are read (tensor/deskew dumps are
+// skipped so a dump folder can be pointed at directly).
 #[cfg(feature = "inference-vision-gpu")]
 fn main() -> anyhow::Result<()> {
     use tentaflow_core::vision::ocr_plate::PlateOcr;
@@ -17,10 +17,9 @@ fn main() -> anyhow::Result<()> {
         .nth(1)
         .expect("usage: ocr_deskew_ab <dir-of-crop-pngs>");
 
-    // Force deskew available for the "on" arm regardless of the ambient env; the
-    // harness drives both arms explicitly via `read_ab`, so this only guards a
-    // stray `TENTAFLOW_OCR_DESKEW=0` in the caller's shell.
-    std::env::set_var("TENTAFLOW_OCR_DESKEW", "1");
+    // Default vision settings: deskew ON, no dump dir — the harness drives both
+    // arms explicitly via `read_ab`, so nothing else needs tuning.
+    tentaflow_core::vision::settings::init(Default::default())?;
 
     let ocr = PlateOcr::load()?;
 

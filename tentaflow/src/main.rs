@@ -95,6 +95,10 @@ enum Subcommand {
         /// Core SQLite database path (the worker opens it READ-ONLY)
         #[arg(long = "db")]
         db: Option<PathBuf>,
+        /// The core's `[vision]` config section serialized as JSON — the worker
+        /// freezes these process-wide vision settings at boot (absent = defaults)
+        #[arg(long = "vision-config")]
+        vision_config: Option<String>,
     },
 }
 
@@ -225,6 +229,14 @@ async fn run_server(args: Args) -> Result<()> {
     apply_cli_overrides(&mut config, &args);
 
     info!("Konfiguracja wczytana pomyslnie");
+
+    // Freeze the process-wide vision settings from `[vision]` BEFORE anything
+    // vision-related (camera ingest, detector pools, worker supervisor) can
+    // read them — the config TOML is the only operator mechanism (no env vars).
+    if let Err(e) = tentaflow_core::vision::settings::init(config.vision.clone()) {
+        error!("Vision settings init: {}", e);
+        return Err(anyhow::anyhow!("vision settings init: {}", e));
+    }
 
     tentaflow_core::compliance::ai_gateway::set_token_quota_enabled(
         config.token_metrics.enabled,
@@ -987,7 +999,7 @@ async fn run_server(args: Args) -> Result<()> {
     )?;
 
     // Multi-process vision workers (docs/VISION_WORKER_SHARDING.md).
-    // Configured EXCLUSIVELY via `[vision].workers_per_gpu` in the config TOML;
+    // Configured EXCLUSIVELY via the `[vision]` config TOML section;
     // the default 0 spawns nothing and binds no link socket, so production
     // behavior without the section is unchanged. MUST start before the camera
     // hydrate below: the hydrate consults the worker fleet to decide which
@@ -996,7 +1008,7 @@ async fn run_server(args: Args) -> Result<()> {
     #[cfg(unix)]
     let vision_workers =
         tentaflow_core::services::vision_worker::supervisor::VisionWorkerSupervisor::start(
-            config.vision.workers_per_gpu,
+            &config.vision,
             db_path.clone(),
         );
 
@@ -1520,22 +1532,39 @@ fn run_subcommand(cmd: &Subcommand, verbose: bool) -> Result<()> {
             link,
             token,
             db,
-        } => run_vision_worker_mode(*worker_id, *gpu, link.clone(), token.clone(), db.clone()),
+            vision_config,
+        } => run_vision_worker_mode(
+            *worker_id,
+            *gpu,
+            link.clone(),
+            token.clone(),
+            db.clone(),
+            vision_config.clone(),
+        ),
     }
 }
 
 /// Boots the slim vision-worker runtime (docs/VISION_WORKER_SHARDING.md Stage
 /// A). Every parameter arrives via CLI args from the spawning supervisor —
-/// there is no environment contract for this mode.
+/// there is no environment contract for this mode. The `[vision]` settings
+/// travel as `--vision-config` JSON and are frozen BEFORE anything vision runs.
 fn run_vision_worker_mode(
     worker_id: u32,
     gpu: i32,
     link: PathBuf,
     token: String,
     db: Option<PathBuf>,
+    vision_config: Option<String>,
 ) -> Result<()> {
     #[cfg(unix)]
     {
+        let vision: tentaflow_core::config::VisionConfig = match vision_config.as_deref() {
+            Some(json) => serde_json::from_str(json)
+                .map_err(|e| anyhow::anyhow!("parse --vision-config JSON: {e}"))?,
+            None => tentaflow_core::config::VisionConfig::default(),
+        };
+        tentaflow_core::vision::settings::init(vision)
+            .map_err(|e| anyhow::anyhow!("freeze vision settings: {e}"))?;
         let db_path = db.unwrap_or_else(tentaflow_core::paths::database_path);
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         builder.enable_all();
@@ -1555,7 +1584,7 @@ fn run_vision_worker_mode(
     }
     #[cfg(not(unix))]
     {
-        let _ = (worker_id, gpu, link, token, db);
+        let _ = (worker_id, gpu, link, token, db, vision_config);
         anyhow::bail!("vision-worker mode requires Unix domain sockets (Linux/macOS only)")
     }
 }

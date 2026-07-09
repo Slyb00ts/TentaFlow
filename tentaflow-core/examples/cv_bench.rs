@@ -245,7 +245,7 @@ fn main() -> anyhow::Result<()> {
 
     if detector.detect_batch(&det_frames, None).is_err() {
         println!(
-            "(skipped: detect_batch failed at window batch = {} — lower --nframes or raise TENTAFLOW_VISION_MAX_BATCH)",
+            "(skipped: detect_batch failed at window batch = {} — lower --nframes or raise [vision] max_batch)",
             n_frames
         );
     } else {

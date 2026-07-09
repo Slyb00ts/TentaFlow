@@ -3,7 +3,7 @@
 // =============================================================================
 //
 // Loads a one-shot capture written by `depth_mapping::maybe_dump_calibration`
-// (`TENTAFLOW_CALIB_DUMP=1` on a live run) from `/tmp/tf_calib/{depth,lidar}.bin`
+// (`[vision] calib_dump = true` on a live run) from `/tmp/tf_calib/{depth,lidar}.bin`
 // and finds the camera extrinsics (FOV, scale, and a full yaw/pitch/roll mount
 // rotation) that best align the back-projected depth cloud onto the lidar cloud
 // (ground truth). The metric is a trimmed-mean nearest-neighbour distance from

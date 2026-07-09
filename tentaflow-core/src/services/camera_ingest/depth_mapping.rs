@@ -476,14 +476,14 @@ async fn request_depth(
     })
 }
 
-/// One-shot calibration capture (env `TENTAFLOW_CALIB_DUMP=1`): writes the raw metric
+/// One-shot calibration capture (`[vision] calib_dump = true`): writes the raw metric
 /// depth map + camera pose + current (fov,pitch,scale) and the real robot's accumulated
 /// lidar cloud (ground truth) to `/tmp/tf_calib/{depth,lidar}.bin`. Lets the offline
 /// `depth_calib` example optimize the extrinsics against lidar without the robot live.
 fn maybe_dump_calibration(depth: &DepthMap, job: &Job) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
-    if std::env::var("TENTAFLOW_CALIB_DUMP").is_err() {
+    if !crate::vision::settings::get().calib_dump {
         return;
     }
     let lidar = match SlamSceneManager::global().snapshot(&job.cfg.pose_robot_id) {

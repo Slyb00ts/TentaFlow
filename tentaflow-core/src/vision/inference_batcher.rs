@@ -40,18 +40,12 @@ use crate::services::camera_ingest::vision_analysis::{get_classifier, get_ocr};
 pub const MAX_BATCH: usize = 16;
 
 /// Longest a partially filled batch waits for more jobs before it is flushed.
-/// Env-tunable (`TENTAFLOW_VISION_BATCH_WINDOW_US`, microseconds). A wider window
+/// Tunable via `[vision] batch_window_us` (microseconds). A wider window
 /// aggregates more crops per forward (higher GPU efficiency) at the cost of more
 /// per-crop latency; the default keeps latency low while still coalescing the
 /// bursts that many cameras produce within the same millisecond.
 pub fn batch_window() -> Duration {
-    const ENV: &str = "TENTAFLOW_VISION_BATCH_WINDOW_US";
-    const DEFAULT_US: u64 = 2000;
-    let us = std::env::var(ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_US);
-    Duration::from_micros(us)
+    Duration::from_micros(crate::vision::settings::get().batch_window_us)
 }
 
 /// One submitted crop plus the private channel its result must return on. The

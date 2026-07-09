@@ -39,7 +39,7 @@ const RESOLUTION: usize = 560;
 const BATCHES: [usize; 3] = [1, 8, 16];
 /// Env selecting the session-pool sizes the concurrency bench probes (comma
 /// list, e.g. `"1,2,4,8"`). With the per-session TensorRT workspace capped
-/// (`TENTAFLOW_TRT_WORKSPACE_MB`, default 1 GiB) each RF-DETR session costs only
+/// (`[vision] trt_workspace_mib`, default 1 GiB) each RF-DETR session costs only
 /// ~2.1 GB VRAM, so 8+ sessions co-reside on a free 24 GB 4090; aggregate
 /// throughput plateaus around N=4 (compute-bound: ~214 / 287 / 312 / 310 img/s
 /// at N=1/2/4/8). The default `"1,2"` stays conservative so the whole bench

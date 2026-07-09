@@ -7,13 +7,15 @@
 // driving the FULL per-frame pipeline (detect + 3×state + 1×plate + 1×adr) at a
 // target fps, ramps N, and reports whether the fleet keeps up (per-frame p99 <
 // frame budget) plus achieved throughput and GPU utilization. The models'
-// session pools (env `TENTAFLOW_VISION_{DETECTOR,STAN,PLATE,ADR}_SESSIONS`)
-// bound real concurrency — run at pool=1 (today) and pool=8 to see headroom.
+// session pools (`--sessions <n>`, mirroring `[vision] *_sessions`) bound real
+// concurrency — run at pool=1 and pool=8 to see headroom.
 //
-//   TENTAFLOW_VISION_GPUS=7 cargo run --release \
+//   cargo run --release \
 //     --features inference-vision-gpu,inference-supertonic --example cam_scale -- \
-//     --levels 1,5,10,20,40,80,160 --secs 5 --fps 25
+//     --gpus 7 --levels 1,5,10,20,40,80,160 --secs 5 --fps 25
 //   add --detect-only to measure detect-alone capacity (enrichment is event-driven).
+//   All knobs are CLI flags — this bench sets the process-wide vision settings
+//   itself (vision::settings::init); there are no environment variables.
 #![cfg(feature = "inference-vision-gpu")]
 
 use std::process::Command;
@@ -42,6 +44,15 @@ struct Args {
     /// of calling `classify_batch`/`read_batch` per camera — measures whether
     /// aggregation lifts GPU util and breaks the per-camera batch-1 plateau.
     batched: bool,
+    /// `[vision] gpus` spec (same grammar: count or comma list). Empty = device 0.
+    gpus: String,
+    /// Session-pool size applied to detector/stan/plate/adr (`[vision] *_sessions`).
+    /// `None` keeps the built-in defaults (4 each).
+    sessions: Option<usize>,
+    /// Detect-batcher pipelined workers (needs `--sessions` >= this).
+    detect_workers: usize,
+    /// Detect-batcher aggregation batch cap (RF-DETR batch 8 measured optimal).
+    detect_batch: Option<usize>,
 }
 
 fn parse_args() -> Args {
@@ -52,6 +63,10 @@ fn parse_args() -> Args {
         detect_only: false,
         dets: 3,
         batched: false,
+        gpus: String::new(),
+        sessions: None,
+        detect_workers: 1,
+        detect_batch: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -66,16 +81,33 @@ fn parse_args() -> Args {
             "--dets" => a.dets = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.dets),
             "--detect-only" => a.detect_only = true,
             "--batched" => a.batched = true,
+            "--gpus" => a.gpus = it.next().unwrap_or_default(),
+            "--sessions" => a.sessions = it.next().and_then(|v| v.parse().ok()),
+            "--detect-workers" => {
+                a.detect_workers = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&n: &usize| n >= 1)
+                    .unwrap_or(a.detect_workers)
+            }
+            "--detect-batch" => {
+                a.detect_batch = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&n: &usize| n >= 1)
+            }
             _ => {}
         }
     }
     a
 }
 
-fn gpu_index() -> String {
-    std::env::var("TENTAFLOW_VISION_GPUS")
-        .ok()
-        .and_then(|v| v.split([',', ' ']).next().map(|s| s.trim().to_string()))
+/// First GPU index from the `--gpus` spec (default 0) — the card we sample with
+/// `nvidia-smi`.
+fn gpu_index(gpus: &str) -> String {
+    gpus.split([',', ' '])
+        .next()
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "0".to_string())
 }
@@ -103,8 +135,24 @@ fn pctl(sorted: &[f64], p: f64) -> f64 {
 
 fn main() -> anyhow::Result<()> {
     let args = parse_args();
-    let gpu = gpu_index();
+    let gpu = gpu_index(&args.gpus);
     let budget_ms = 1000.0 / args.fps;
+
+    // Freeze the process-wide vision settings from the CLI flags BEFORE any
+    // model singleton loads (the settings are the only tuning mechanism).
+    {
+        let mut vision = tentaflow_core::config::VisionConfig {
+            gpus: args.gpus.clone(),
+            ..Default::default()
+        };
+        if let Some(n) = args.sessions {
+            vision.detector_sessions = n;
+            vision.stan_sessions = n;
+            vision.plate_sessions = n;
+            vision.adr_sessions = n;
+        }
+        tentaflow_core::vision::settings::init(vision)?;
+    }
 
     println!("loading models (GPU {gpu})...");
     let detector = Arc::new(RfDetrDetector::load()?);
@@ -136,17 +184,14 @@ fn main() -> anyhow::Result<()> {
     // forward. Without it every camera thread calls detect_batch(1) directly and 60
     // threads contend on the detector session pool (perf: 31% CPU in futex/kernel) +
     // fire tiny per-camera launches — this coalesces them into big cross-camera batches.
-    // Sweep knobs for the detect batcher: `TENTAFLOW_BENCH_DETECT_WORKERS` pipelines
-    // N batched forwards across the detector session pool (needs sessions >= N);
-    // `TENTAFLOW_BENCH_DETECT_BATCH` caps the aggregation batch (RF-DETR batch 8 was
-    // measured optimal; 16 saturates) — used to find the p99-optimal config.
-    let env_usize = |k: &str, d: usize| {
-        std::env::var(k).ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n >= 1).unwrap_or(d)
-    };
+    // Sweep knobs for the detect batcher: `--detect-workers` pipelines N batched
+    // forwards across the detector session pool (needs `--sessions` >= N);
+    // `--detect-batch` caps the aggregation batch (RF-DETR batch 8 was measured
+    // optimal; 16 saturates) — used to find the p99-optimal config.
     #[cfg(feature = "inference-supertonic")]
-    let detect_workers = env_usize("TENTAFLOW_BENCH_DETECT_WORKERS", 1);
+    let detect_workers = args.detect_workers;
     #[cfg(feature = "inference-supertonic")]
-    let detect_max_batch = env_usize("TENTAFLOW_BENCH_DETECT_BATCH", MAX_BATCH);
+    let detect_max_batch = args.detect_batch.unwrap_or(MAX_BATCH);
     #[cfg(feature = "inference-supertonic")]
     let detect_batcher = Arc::new(InferenceBatcher::<Vec<Detection>>::with_workers(
         detect_max_batch,
@@ -395,7 +440,7 @@ fn main() -> anyhow::Result<()> {
 
     println!(
         "\nreal cameras/GPU (this pool config) = the LAST 'YES' row. Raise pools via\n\
-         TENTAFLOW_VISION_DETECTOR_SESSIONS / _STAN_ / _PLATE_ / _ADR_SESSIONS to see headroom.\n\
+         --sessions <n> (production: [vision] detector/stan/plate/adr_sessions) to see headroom.\n\
          Enrichment is event-driven in production, so --detect-only is the more realistic ceiling."
     );
     Ok(())

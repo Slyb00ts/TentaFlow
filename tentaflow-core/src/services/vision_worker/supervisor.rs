@@ -72,11 +72,15 @@ pub struct VisionWorkerSupervisor {
 }
 
 impl VisionWorkerSupervisor {
-    /// Boots the worker fleet from `[vision].workers_per_gpu` (config TOML is
-    /// the ONLY configuration mechanism). Returns `None` — spawning nothing
+    /// Boots the worker fleet from the `[vision]` config section (config TOML
+    /// is the ONLY configuration mechanism). Returns `None` — spawning nothing
     /// and binding nothing — when the feature is off, or when the link socket
     /// cannot be bound (logged; the core keeps running detection in-process).
-    pub fn start(workers_per_gpu: usize, db_path: PathBuf) -> Option<Arc<Self>> {
+    /// The whole section is serialized and handed to every worker as its
+    /// `--vision-config` CLI argument, so worker processes share the core's
+    /// vision settings without any environment contract.
+    pub fn start(vision: &crate::config::VisionConfig, db_path: PathBuf) -> Option<Arc<Self>> {
+        let workers_per_gpu = vision.workers_per_gpu;
         let per_gpu = workers_per_gpu.min(MAX_WORKERS_PER_GPU);
         if per_gpu == 0 {
             return None;
@@ -87,6 +91,13 @@ impl VisionWorkerSupervisor {
                 workers_per_gpu, MAX_WORKERS_PER_GPU
             );
         }
+        let vision_json = match serde_json::to_string(vision) {
+            Ok(json) => Arc::new(json),
+            Err(e) => {
+                error!("[vision-worker] supervisor disabled — serialize [vision] config: {e}");
+                return None;
+            }
+        };
 
         let gpus = crate::vision::ort_common::vision_gpu_set();
         let socket_path = crate::paths::data_dir().join(LINK_SOCKET_NAME);
@@ -128,6 +139,7 @@ impl VisionWorkerSupervisor {
                     stop_notify.clone(),
                     socket_path_shared.clone(),
                     db_path.clone(),
+                    vision_json.clone(),
                 )));
                 worker_id += 1;
             }
@@ -193,6 +205,7 @@ async fn supervise_worker(
     stop_notify: Arc<Notify>,
     socket_path: Arc<PathBuf>,
     db_path: Arc<PathBuf>,
+    vision_json: Arc<String>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     loop {
@@ -205,7 +218,7 @@ async fn supervise_worker(
         let token = new_token();
         state.register_worker(spec.worker_id, token.clone());
 
-        let mut child = match spawn_worker(&spec, &socket_path, &db_path, &token) {
+        let mut child = match spawn_worker(&spec, &socket_path, &db_path, &token, &vision_json) {
             Ok(child) => child,
             Err(e) => {
                 error!(
@@ -324,12 +337,16 @@ async fn supervise_worker(
 /// Spawns one `vision-worker` process. All worker parameters travel as CLI
 /// args (no environment contract): `--home` pins the shared portable home the
 /// same way an operator would on the command line, `--db` pins the exact
-/// SQLite file the core opened (which may be a `--db` override itself).
+/// SQLite file the core opened (which may be a `--db` override itself), and
+/// `--vision-config` carries the core's `[vision]` section as JSON so the
+/// worker freezes identical vision settings (its GPU pin from `--gpu` still
+/// overrides the GPU set).
 fn spawn_worker(
     spec: &WorkerSpec,
     socket_path: &Path,
     db_path: &Path,
     token: &str,
+    vision_json: &str,
 ) -> Result<Child> {
     let exe = std::env::current_exe().context("resolve current_exe")?;
     let mut cmd = Command::new(exe);
@@ -345,7 +362,9 @@ fn spawn_worker(
         .arg("--token")
         .arg(token)
         .arg("--db")
-        .arg(db_path);
+        .arg(db_path)
+        .arg("--vision-config")
+        .arg(vision_json);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());

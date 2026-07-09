@@ -17,6 +17,9 @@
 pub mod adr;
 pub mod camera_cv_models;
 pub mod nms;
+// Process-wide vision runtime settings, frozen once from the `[vision]` config
+// section (core) or the `--vision-config` CLI arg (vision-worker).
+pub mod settings;
 // Generyczny runner ONNX dla dynamicznych modeli z rejestru `vision_models`
 // (silnik `onnx-cv`) + wspoldzielona warstwa ort i postprocess RF-DETR.
 #[cfg(feature = "inference-supertonic")]

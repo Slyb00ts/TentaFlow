@@ -44,12 +44,8 @@ use std::sync::Arc;
 #[cfg(feature = "inference-supertonic")]
 const INPUT_NAME: &str = "input";
 
-/// Env sterujący rozmiarem puli sesji ort dla OCR tablic. Domyślnie 1 =
-/// bit-identyczna z pojedynczą sesją; >1 pozwala wielu cropom OCR-ować równolegle.
-#[cfg(feature = "inference-supertonic")]
-const PLATE_SESSIONS_ENV: &str = "TENTAFLOW_PLATE_SESSIONS";
-#[cfg(feature = "inference-supertonic")]
-const DEFAULT_PLATE_SESSIONS: usize = 4;
+// Plate-OCR session-pool size comes from `[vision] plate_sessions` (default 4);
+// >1 lets many crops OCR concurrently.
 
 /// `plate-ocr-config.json` shape — the deploy-time config next to the model.
 #[derive(Debug, Deserialize)]
@@ -127,17 +123,14 @@ impl PlateOcr {
             // Fixed H×W but VARIABLE batch: cold-path enrichment batches every
             // plate crop of a frame into ONE forward (`read_batch`), so pin a TRT
             // engine over 1..=max_batch and the first inference of each new batch
-            // size does not trigger a per-shape rebuild. Env-tunable to match the
-            // detector/classifier cross-crop batching knobs (defaults opt=8,
-            // max=16); changing these makes TRT rebuild the engine on next load.
-            let opt_batch = std::env::var("TENTAFLOW_VISION_OPT_BATCH")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&n| n >= 1)
-                .unwrap_or(8);
-            let max_batch = std::env::var("TENTAFLOW_VISION_MAX_BATCH")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
+            // size does not trigger a per-shape rebuild. Tunable via `[vision]
+            // opt_batch`/`max_batch` to match the detector/classifier cross-crop
+            // batching knobs (defaults opt=8, max=16); changing these makes TRT
+            // rebuild the engine on next load.
+            let vision = crate::vision::settings::get();
+            let opt_batch = vision.opt_batch.filter(|&n| n >= 1).unwrap_or(8);
+            let max_batch = vision
+                .max_batch
                 .filter(|&n| n >= opt_batch)
                 .unwrap_or(opt_batch.max(16));
             let trt_profile = crate::vision::ort_common::TrtShapeProfile {
@@ -151,10 +144,7 @@ impl PlateOcr {
                 height: cfg.img_width,
                 width: 1,
             };
-            let n = crate::vision::ort_common::pool_size_from_env(
-                PLATE_SESSIONS_ENV,
-                DEFAULT_PLATE_SESSIONS,
-            );
+            let n = crate::vision::ort_common::pool_size(vision.plate_sessions);
             let pool = crate::vision::ort_common::build_session_pool_from_file(
                 &onnx_path,
                 &dir.join("trt-cache-plate"),

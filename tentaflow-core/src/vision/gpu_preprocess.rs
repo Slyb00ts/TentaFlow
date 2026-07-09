@@ -779,7 +779,7 @@ pub struct Nv12CropDownload {
 /// `cudaDeviceSynchronize()` before the copies so the decoder has finished
 /// writing the surface (the enrichment crop runs off the mailbox's latest frame,
 /// usually already complete, but the barrier is correct against any stream
-/// setup). `TENTAFLOW_ZEROCOPY_MAP_SYNC=1` trusts the map already synced and
+/// setup). `[vision] zerocopy_map_sync = true` trusts the map already synced and
 /// skips it (lower latency once confirmed on the target GStreamer build).
 pub fn download_nv12_crop_rect(
     planes: Nv12DevicePlanes,
@@ -806,9 +806,7 @@ pub fn download_nv12_crop_rect(
     let uv_bytes = uv_stride * chroma_rows;
     let mut data = vec![0u8; y_bytes + uv_bytes];
 
-    let trust_map_sync = std::env::var("TENTAFLOW_ZEROCOPY_MAP_SYNC")
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false);
+    let trust_map_sync = crate::vision::settings::get().zerocopy_map_sync;
     if !trust_map_sync {
         cuda_check(
             unsafe { cudaDeviceSynchronize() },
@@ -888,7 +886,7 @@ pub struct Nv12DevicePlanes {
 /// writing the surface when we map it. Before launching the kernel we ensure the
 /// decode has completed: by default `cudaDeviceSynchronize()` (correct against
 /// ANY nvcodec stream configuration, the safe choice for the opt-in path). Set
-/// `TENTAFLOW_ZEROCOPY_MAP_SYNC=1` to trust that `gst_memory_map(GST_MAP_CUDA)`
+/// `[vision] zerocopy_map_sync = true` to trust that `gst_memory_map(GST_MAP_CUDA)`
 /// already synced the surface's stream and skip the device sync (lower latency,
 /// only once confirmed on the target GStreamer build).
 ///
@@ -925,9 +923,7 @@ pub fn preprocess_nv12_device_gpu(
 
     // Default-on device sync guarantees the decoder finished writing the surface
     // before the kernel reads it, regardless of nvcodec's internal stream setup.
-    let trust_map_sync = std::env::var("TENTAFLOW_ZEROCOPY_MAP_SYNC")
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false);
+    let trust_map_sync = crate::vision::settings::get().zerocopy_map_sync;
 
     SCRATCH.with(|cell| {
         let mut guard = cell.borrow_mut();

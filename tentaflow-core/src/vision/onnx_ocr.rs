@@ -54,13 +54,13 @@ type OcrModel = crate::vision::ort_common::SessionPool;
 #[cfg(not(feature = "inference-supertonic"))]
 type OcrModel = Runnable;
 
-/// Env sterujący rozmiarem puli sesji ort dla PP-OCRv5 (wspólny dla det/rec/cls).
-/// Domyślnie 2 = kilka cropów OCR-uje się równolegle na GPU bez nadmiernego
-/// zajęcia VRAM (każda sesja to pełna kopia modelu na karcie).
+/// Rozmiar puli sesji ort dla PP-OCRv5 (wspólny dla det/rec/cls) z
+/// `[vision] ppocr_sessions`. Domyślnie 2 = kilka cropów OCR-uje się równolegle
+/// na GPU bez nadmiernego zajęcia VRAM (każda sesja to pełna kopia modelu).
 #[cfg(feature = "inference-supertonic")]
-const PPOCR_SESSIONS_ENV: &str = "TENTAFLOW_PPOCR_SESSIONS";
-#[cfg(feature = "inference-supertonic")]
-const DEFAULT_PPOCR_SESSIONS: usize = 2;
+fn ppocr_pool_size() -> usize {
+    crate::vision::ort_common::pool_size(crate::vision::settings::get().ppocr_sessions)
+}
 
 /// Laduje model ONNX PP-OCRv5 z USTALONYM rozmiarem wejscia (NCHW f32) na tract.
 ///
@@ -233,10 +233,7 @@ impl OnnxOcrEngine {
     #[cfg(feature = "inference-supertonic")]
     fn build_det_model(&self, _side: u32) -> Result<Arc<OcrModel>> {
         crate::vision::ort_common::ensure_ort_dylib();
-        let n = crate::vision::ort_common::pool_size_from_env(
-            PPOCR_SESSIONS_ENV,
-            DEFAULT_PPOCR_SESSIONS,
-        );
+        let n = ppocr_pool_size();
         let pool = crate::vision::ort_common::build_session_pool_from_file(
             &self.det_path,
             &self.model_dir().join("trt-cache-ppocr-det"),
@@ -268,10 +265,7 @@ impl OnnxOcrEngine {
     #[cfg(feature = "inference-supertonic")]
     fn build_rec_model(&self) -> Result<Arc<OcrModel>> {
         crate::vision::ort_common::ensure_ort_dylib();
-        let n = crate::vision::ort_common::pool_size_from_env(
-            PPOCR_SESSIONS_ENV,
-            DEFAULT_PPOCR_SESSIONS,
-        );
+        let n = ppocr_pool_size();
         let pool = crate::vision::ort_common::build_session_pool_from_file(
             &self.rec_path,
             &self.model_dir().join("trt-cache-ppocr-rec"),
@@ -306,10 +300,7 @@ impl OnnxOcrEngine {
             return Ok(None);
         };
         crate::vision::ort_common::ensure_ort_dylib();
-        let n = crate::vision::ort_common::pool_size_from_env(
-            PPOCR_SESSIONS_ENV,
-            DEFAULT_PPOCR_SESSIONS,
-        );
+        let n = ppocr_pool_size();
         let pool = crate::vision::ort_common::build_session_pool_from_file(
             path,
             &self.model_dir().join("trt-cache-ppocr-cls"),

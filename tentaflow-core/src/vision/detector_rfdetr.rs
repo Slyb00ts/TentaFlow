@@ -44,17 +44,10 @@ pub const RESOLUTION: u32 = 560;
 #[cfg(feature = "inference-supertonic")]
 const INPUT_NAME: &str = "input";
 
-/// Env sterujący rozmiarem puli sesji ort detektora — hot path CV. >1 pozwala
-/// wielu batchowanym forwardom RF-DETR liczyć się równolegle na GPU (każda sesja
-/// to własna kopia modelu ≈2.6 GB VRAM), a detect-flush `inflight_limit` podąża
-/// za tą wartością.
-#[cfg(feature = "inference-supertonic")]
-const DETECTOR_SESSIONS_ENV: &str = "TENTAFLOW_VISION_DETECTOR_SESSIONS";
-// 4 pipelined batch-8 forwards measured ~1300 frames/s vs ~430 serialized on one
-// GPU (cam_scale sweep) — ~48 cameras @25fps with per-frame p99 inside the 40 ms
-// frame budget, vs ~16 at 1 session. Costs ~4×2.6 GB VRAM; override via the env.
-#[cfg(feature = "inference-supertonic")]
-const DEFAULT_DETECTOR_SESSIONS: usize = 4;
+// Detector session-pool size comes from `[vision] detector_sessions` (default
+// 4). 4 pipelined batch-8 forwards measured ~1300 frames/s vs ~430 serialized
+// on one GPU (cam_scale sweep) — ~48 cameras @25fps with per-frame p99 inside
+// the 40 ms frame budget, vs ~16 at 1 session. Costs ~4×2.6 GB VRAM.
 
 /// Przybliżony rozmiar rezydentny JEDNEJ sesji RF-DETR na GPU (do komunikatu
 /// OOM). N sesji ≈ N×tyle VRAM — patrz fail-loud w [`RfDetrDetector::load`].
@@ -136,17 +129,14 @@ impl RfDetrDetector {
             // TRT engine over 1..=max_batch so the first inference of each new
             // batch size does not trigger a per-shape engine rebuild. On a large
             // GPU (B300) a wider batch amortizes fixed per-launch overhead, so the
-            // profile ceiling and optimization point are env-tunable to measure
-            // and exploit cross-camera batching beyond MODEL_BATCH. Changing these
-            // makes TRT rebuild the engine on next load (profile mismatch).
-            let opt_batch = std::env::var("TENTAFLOW_VISION_OPT_BATCH")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&n| n >= 1)
-                .unwrap_or(MODEL_BATCH);
-            let max_batch = std::env::var("TENTAFLOW_VISION_MAX_BATCH")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
+            // profile ceiling and optimization point are tunable via `[vision]
+            // opt_batch`/`max_batch` to measure and exploit cross-camera batching
+            // beyond MODEL_BATCH. Changing these makes TRT rebuild the engine on
+            // next load (profile mismatch).
+            let vision = crate::vision::settings::get();
+            let opt_batch = vision.opt_batch.filter(|&n| n >= 1).unwrap_or(MODEL_BATCH);
+            let max_batch = vision
+                .max_batch
                 .filter(|&n| n >= opt_batch)
                 .unwrap_or(opt_batch);
             let trt_profile = crate::vision::ort_common::TrtShapeProfile {
@@ -158,10 +148,7 @@ impl RfDetrDetector {
                 height: RESOLUTION,
                 width: RESOLUTION,
             };
-            let n = crate::vision::ort_common::pool_size_from_env(
-                DETECTOR_SESSIONS_ENV,
-                DEFAULT_DETECTOR_SESSIONS,
-            );
+            let n = crate::vision::ort_common::pool_size(vision.detector_sessions);
             // Every pooled session is a full model copy on ITS GPU. The pool
             // builder degrades on a failure PAST slot 0 (keeps the sessions that
             // built, WARNs loudly) so a transient TRT engine-build failure can
@@ -185,7 +172,7 @@ impl RfDetrDetector {
                      (~{DETECTOR_SESSION_VRAM_GB} GB VRAM); sessions spread round-robin, so up to \
                      {per_gpu} land on one GPU needing ~{per_gpu_gb:.1} GB resident PER DEVICE — a \
                      failure of the FIRST session means nothing can run at all. Lower \
-                     {DETECTOR_SESSIONS_ENV} (currently {n}) or add GPUs via TENTAFLOW_VISION_GPUS.",
+                     `[vision] detector_sessions` (currently {n}) or add GPUs via `[vision] gpus`.",
                     n_gpus = gpus.len(),
                     per_gpu_gb = per_gpu as f32 * DETECTOR_SESSION_VRAM_GB
                 )

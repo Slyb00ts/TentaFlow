@@ -39,13 +39,8 @@ use crate::vision::burn_stan::Model;
 #[cfg(feature = "inference-supertonic")]
 const INPUT_NAME: &str = "input";
 
-/// Env sterujący rozmiarem puli sesji ort klasyfikatora. Domyślnie 1 = ścieżka
-/// bit-identyczna z pojedynczą sesją (jeden forward naraz), a >1 pozwala wielu
-/// cropom klasyfikować się równolegle na GPU.
-#[cfg(feature = "inference-supertonic")]
-const STAN_SESSIONS_ENV: &str = "TENTAFLOW_STAN_SESSIONS";
-#[cfg(feature = "inference-supertonic")]
-const DEFAULT_STAN_SESSIONS: usize = 4;
+// Classifier session-pool size comes from `[vision] stan_sessions` (default 4);
+// >1 lets many crops classify concurrently on the GPU.
 
 /// `stan-classes.json` shape — the deploy-time config next to the model.
 /// `progi` jest ignorowane dla modelu softmax (single-label), więc opcjonalne.
@@ -108,17 +103,14 @@ impl StateClassifier {
             // Fixed SxS but VARIABLE batch: cold-path enrichment batches every
             // matching crop of a frame into ONE forward (`classify_batch`), so pin
             // a TRT engine over 1..=max_batch and the first inference of each new
-            // batch size does not trigger a per-shape rebuild. Env-tunable to match
-            // the detector's cross-crop batching knobs (defaults opt=8, max=16);
-            // changing these makes TRT rebuild the engine on next load.
-            let opt_batch = std::env::var("TENTAFLOW_VISION_OPT_BATCH")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&n| n >= 1)
-                .unwrap_or(8);
-            let max_batch = std::env::var("TENTAFLOW_VISION_MAX_BATCH")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
+            // batch size does not trigger a per-shape rebuild. Tunable via
+            // `[vision] opt_batch`/`max_batch` to match the detector's cross-crop
+            // batching knobs (defaults opt=8, max=16); changing these makes TRT
+            // rebuild the engine on next load.
+            let vision = crate::vision::settings::get();
+            let opt_batch = vision.opt_batch.filter(|&n| n >= 1).unwrap_or(8);
+            let max_batch = vision
+                .max_batch
                 .filter(|&n| n >= opt_batch)
                 .unwrap_or(opt_batch.max(16));
             let trt_profile = crate::vision::ort_common::TrtShapeProfile {
@@ -130,10 +122,7 @@ impl StateClassifier {
                 height: parsed.img_size,
                 width: parsed.img_size,
             };
-            let n = crate::vision::ort_common::pool_size_from_env(
-                STAN_SESSIONS_ENV,
-                DEFAULT_STAN_SESSIONS,
-            );
+            let n = crate::vision::ort_common::pool_size(vision.stan_sessions);
             let pool = crate::vision::ort_common::build_session_pool_from_file(
                 &onnx_path,
                 &dir.join("trt-cache-stan"),

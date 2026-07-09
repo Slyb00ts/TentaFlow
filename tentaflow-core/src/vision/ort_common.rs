@@ -18,20 +18,23 @@ use anyhow::{anyhow, bail, Result};
 use tracing::{info, warn};
 
 /// Domyślna ścieżka biblioteki ONNX Runtime dla dlopen (`ort` z `load-dynamic`),
-/// gdy `ORT_DYLIB_PATH` nie jest ustawione w środowisku.
+/// gdy autodetekcja w drzewie `native-libs/` nic nie znajdzie.
 const DEFAULT_ORT_DYLIB: &str = "/usr/lib/libonnxruntime.so.1.24.4";
 
-/// Ustawia `ORT_DYLIB_PATH` na wykrytą ścieżkę, jeśli nie ma jej w środowisku —
-/// `ort` z `load-dynamic` dlopuje onnxruntime spod tej zmiennej przy pierwszym
-/// użyciu. Preferujemy runtime z drzewa `native-libs/` (zawiera providery
-/// TensorRT i CUDA), a dopiero gdy go brak — systemowy [`DEFAULT_ORT_DYLIB`]
-/// (który ma zwykle tylko CUDA). Edycja 2021: `set_var` jest bezpieczne.
+/// Ustawia `ORT_DYLIB_PATH` na wykrytą ścieżkę — `ort` z `load-dynamic` dlopuje
+/// onnxruntime spod tej zmiennej przy pierwszym użyciu (to kontrakt crate'a
+/// `ort`, nie operatorska zmienna środowiskowa; operator niczego nie ustawia).
+/// Preferujemy runtime z drzewa `native-libs/` (zawiera providery TensorRT i
+/// CUDA), a dopiero gdy go brak — systemowy [`DEFAULT_ORT_DYLIB`] (który ma
+/// zwykle tylko CUDA). Idempotentne przez `OnceLock`; edycja 2021: `set_var`
+/// jest bezpieczne.
 pub fn ensure_ort_dylib() {
-    if std::env::var_os("ORT_DYLIB_PATH").is_some() {
-        return;
-    }
-    let path = locate_ort_dylib().unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_ORT_DYLIB));
-    std::env::set_var("ORT_DYLIB_PATH", &path);
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        let path =
+            locate_ort_dylib().unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_ORT_DYLIB));
+        std::env::set_var("ORT_DYLIB_PATH", &path);
+    });
 }
 
 /// Szuka `libonnxruntime.{so*,dylib}` w drzewie `native-libs/<platform>/lib-dynamic/`
@@ -155,63 +158,47 @@ impl TrtShapeProfile {
 /// VRAM: N pooled sessions = N model copies on the GPU.
 pub const MAX_SESSIONS_PER_MODEL: usize = 16;
 
-/// Reads a session-pool size from `env_var`, clamped to `1..=MAX_SESSIONS_PER_MODEL`.
-/// Default `1` is byte-identical to a single-`Mutex<Session>` path (checkout
-/// always locks slot 0), so the historical serialized behavior is the default.
-pub fn pool_size_from_env(env_var: &str, default: usize) -> usize {
-    std::env::var(env_var)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(default)
-        .clamp(1, MAX_SESSIONS_PER_MODEL)
+/// Clamps a configured session-pool size to `1..=MAX_SESSIONS_PER_MODEL`. The
+/// configured value comes from the `[vision]` config section (serde defaults
+/// carry each model's historical default), never from the environment.
+pub fn pool_size(configured: usize) -> usize {
+    configured.clamp(1, MAX_SESSIONS_PER_MODEL)
 }
 
 /// Upper bound on the number of GPUs a single vision pool will spread across.
-/// A misconfigured `TENTAFLOW_VISION_GPUS=1000` must not allocate a 1000-element
+/// A misconfigured `[vision] gpus = "1000"` must not allocate a 1000-element
 /// device vector; no real box has more than this many CUDA devices.
 pub const MAX_VISION_GPUS: usize = 64;
-
-/// Environment knob selecting which CUDA device ids the vision session pools
-/// spread across. See [`vision_gpu_set`] for the grammar.
-pub const VISION_GPUS_ENV: &str = "TENTAFLOW_VISION_GPUS";
 
 /// Per-session TensorRT workspace cap in MiB. TensorRT 10.x defaults
 /// `trt_max_workspace_size` to 0 = "use ALL available device memory": each
 /// unbounded TRT session then reserves as much free VRAM as it can, so two
 /// pooled sessions already eat ~18 GB and a third won't fit on a 24 GB card —
 /// the session pool is unusable at N>1 without a cap. Overridable via
-/// [`TRT_WORKSPACE_MB_ENV`].
+/// `[vision] trt_workspace_mib`.
 pub const DEFAULT_TRT_WORKSPACE_MB: usize = 1024;
-
-/// Environment knob for the per-session TensorRT workspace cap (MiB). Clamped to
-/// [`TRT_WORKSPACE_MB_MIN`]..=[`TRT_WORKSPACE_MB_MAX`]; unset/garbage →
-/// [`DEFAULT_TRT_WORKSPACE_MB`].
-pub const TRT_WORKSPACE_MB_ENV: &str = "TENTAFLOW_TRT_WORKSPACE_MB";
 pub const TRT_WORKSPACE_MB_MIN: usize = 128;
 pub const TRT_WORKSPACE_MB_MAX: usize = 8192;
 
 /// Per-session TensorRT workspace cap in BYTES, resolved ONCE for the process
-/// lifetime from [`TRT_WORKSPACE_MB_ENV`]. See [`DEFAULT_TRT_WORKSPACE_MB`] for
-/// why an explicit cap is mandatory for the pool to scale past one session.
+/// lifetime from `[vision] trt_workspace_mib`. See [`DEFAULT_TRT_WORKSPACE_MB`]
+/// for why an explicit cap is mandatory for the pool to scale past one session.
 pub fn trt_workspace_bytes() -> usize {
     static BYTES: OnceLock<usize> = OnceLock::new();
     *BYTES.get_or_init(|| {
-        parse_trt_workspace_mb(std::env::var(TRT_WORKSPACE_MB_ENV).ok().as_deref())
-            * 1024
-            * 1024
+        clamp_trt_workspace_mb(crate::vision::settings::get().trt_workspace_mib) * 1024 * 1024
     })
 }
 
-/// Pure parser behind [`trt_workspace_bytes`], split out for unit-testing the
-/// clamp/default without touching the process environment or the `OnceLock`.
-fn parse_trt_workspace_mb(raw: Option<&str>) -> usize {
-    raw.and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_TRT_WORKSPACE_MB)
-        .clamp(TRT_WORKSPACE_MB_MIN, TRT_WORKSPACE_MB_MAX)
+/// Pure clamp behind [`trt_workspace_bytes`], split out for unit-testing the
+/// range without touching the settings or the `OnceLock`.
+fn clamp_trt_workspace_mb(mib: usize) -> usize {
+    mib.clamp(TRT_WORKSPACE_MB_MIN, TRT_WORKSPACE_MB_MAX)
 }
 
 /// Parsed CUDA device-id set that vision session pools spread across, resolved
-/// ONCE for the process lifetime from `TENTAFLOW_VISION_GPUS`.
+/// ONCE for the process lifetime from `[vision] gpus` (unless a programmatic
+/// pin via [`init_vision_gpu_set`] ran first — the vision-worker path).
 ///
 /// Grammar (single-GPU device 0 is always the safe default — never panics):
 ///   * unset / empty / whitespace → `[0]` (today's single-GPU behavior).
@@ -223,10 +210,10 @@ fn parse_trt_workspace_mb(raw: Option<&str>) -> usize {
 /// There is deliberately no CUDA auto-detection here: adding an nvml dependency
 /// just to count GPUs is not worth it, and the mesh `NodeInfo.gpus` count is not
 /// reachable from this low-level ort layer. Multi-GPU is opt-in by the operator
-/// setting this var; the default stays single-device-0 and byte-identical.
+/// setting the config field; the default stays single-device-0 and byte-identical.
 pub fn vision_gpu_set() -> &'static [i32] {
     VISION_GPU_SET
-        .get_or_init(|| parse_gpu_set(std::env::var(VISION_GPUS_ENV).ok().as_deref()))
+        .get_or_init(|| parse_gpu_set(Some(crate::vision::settings::get().gpus.as_str())))
         .as_slice()
 }
 
@@ -728,16 +715,11 @@ pub fn build_ort_session_from_memory(
 }
 
 /// Whether the small OCR / classifier CRNN heads run in TensorRT FP16. Default
-/// FALSE (fp32) — fp16 rounding corrupts character reads. `TENTAFLOW_VISION_OCR_FP16=1`
-/// forces fp16 back on for A/B comparison of accuracy vs speed on a live feed.
+/// FALSE (fp32) — fp16 rounding corrupts character reads. `[vision] ocr_fp16 =
+/// true` forces fp16 back on for A/B comparison of accuracy vs speed on a live
+/// feed.
 pub fn ocr_fp16() -> bool {
-    std::env::var("TENTAFLOW_VISION_OCR_FP16")
-        .ok()
-        .map(|v| {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true")
-        })
-        .unwrap_or(false)
+    crate::vision::settings::get().ocr_fp16
 }
 
 fn session_builder_with_eps(
@@ -794,7 +776,7 @@ fn session_builder_with_eps(
         // regardless of session count). Opt-in because graph capture requires
         // stable shapes per session — mixed batch sizes re-capture and can regress;
         // enable when the batcher feeds mostly-full fixed batches.
-        if std::env::var("TENTAFLOW_VISION_TRT_CUDA_GRAPH").is_ok_and(|v| v.trim() == "1") {
+        if crate::vision::settings::get().trt_cuda_graph {
             trt = trt.with_cuda_graph(true);
         }
         eps.push(trt.build());
@@ -1119,8 +1101,8 @@ fn message_string_field(msg: &[u8], field_no: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_external_data_present, onnx_external_data_locations, onnx_first_input_name,
-        parse_gpu_set, parse_trt_workspace_mb, pool_size_from_env, session_cache_subdir, Rebuilder,
+        clamp_trt_workspace_mb, ensure_external_data_present, onnx_external_data_locations,
+        onnx_first_input_name, parse_gpu_set, pool_size, session_cache_subdir, Rebuilder,
         RoundRobin, TrtShapeProfile, WorkerPool,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1143,35 +1125,27 @@ mod tests {
         assert_eq!(rr.pick(), 0);
     }
 
-    /// Pool size parses from env and clamps to `1..=MAX`; an unset/garbage var
-    /// falls back to the default (never 0).
+    /// Pool size clamps the configured value to `1..=MAX` (never 0).
     #[test]
-    fn pool_size_parses_and_clamps() {
-        let var = "TENTAFLOW_TEST_POOL_SIZE_KNOB";
-        std::env::remove_var(var);
-        assert_eq!(pool_size_from_env(var, 1), 1);
-        std::env::set_var(var, "4");
-        assert_eq!(pool_size_from_env(var, 1), 4);
-        std::env::set_var(var, "0");
-        assert_eq!(pool_size_from_env(var, 1), 1);
-        std::env::set_var(var, "999");
-        assert_eq!(pool_size_from_env(var, 1), super::MAX_SESSIONS_PER_MODEL);
-        std::env::set_var(var, "not-a-number");
-        assert_eq!(pool_size_from_env(var, 2), 2);
-        std::env::remove_var(var);
+    fn pool_size_clamps() {
+        assert_eq!(pool_size(1), 1);
+        assert_eq!(pool_size(4), 4);
+        assert_eq!(pool_size(0), 1);
+        assert_eq!(pool_size(999), super::MAX_SESSIONS_PER_MODEL);
     }
 
-    /// TRT workspace cap: default when unset/garbage, clamped to the MiB range.
+    /// TRT workspace cap: the configured MiB value clamps to the valid range.
     #[test]
-    fn trt_workspace_mb_parses_and_clamps() {
+    fn trt_workspace_mb_clamps() {
         use super::{DEFAULT_TRT_WORKSPACE_MB, TRT_WORKSPACE_MB_MAX, TRT_WORKSPACE_MB_MIN};
-        assert_eq!(parse_trt_workspace_mb(None), DEFAULT_TRT_WORKSPACE_MB);
-        assert_eq!(parse_trt_workspace_mb(Some("")), DEFAULT_TRT_WORKSPACE_MB);
-        assert_eq!(parse_trt_workspace_mb(Some("garbage")), DEFAULT_TRT_WORKSPACE_MB);
-        assert_eq!(parse_trt_workspace_mb(Some(" 2048 ")), 2048);
+        assert_eq!(
+            clamp_trt_workspace_mb(DEFAULT_TRT_WORKSPACE_MB),
+            DEFAULT_TRT_WORKSPACE_MB
+        );
+        assert_eq!(clamp_trt_workspace_mb(2048), 2048);
         // Clamp below min and above max.
-        assert_eq!(parse_trt_workspace_mb(Some("1")), TRT_WORKSPACE_MB_MIN);
-        assert_eq!(parse_trt_workspace_mb(Some("999999")), TRT_WORKSPACE_MB_MAX);
+        assert_eq!(clamp_trt_workspace_mb(1), TRT_WORKSPACE_MB_MIN);
+        assert_eq!(clamp_trt_workspace_mb(999999), TRT_WORKSPACE_MB_MAX);
     }
 
     /// Encodes one length-delimited protobuf field (`field << 3 | 2`).

@@ -25,16 +25,19 @@
 // tick. Cameras are real `fake_file` sessions decoding a looped synthetic clip;
 // the CODE PATH is what matters, not the pixels.
 //
-//   TENTAFLOW_VISION_GPUS=0 cargo run --release \
+//   cargo run --release \
 //     --features inference-vision-gpu,inference-supertonic --example pipeline_bench -- \
-//     --levels 5,10,20,40 --secs 8 --fps 10
+//     --gpus 0 --levels 5,10,20,40 --secs 8 --fps 10
 //
 // Prereqs (same as any real deploy): the vision model weights must be
 // provisioned on disk (RF-DETR / nalepka-stan / plate-ocr / adr) and the ort
 // GPU dylib present, otherwise detection resolves to an error and throughput is
-// zero. Point `TENTAFLOW_BENCH_VIDEO` at real ADR footage for a representative
+// zero. Point `--video <path>` at real ADR footage for a representative
 // enrichment (cold-path) load; the default synthetic clip exercises every code
-// path but may yield few confident detections.
+// path but may yield few confident detections. All knobs are CLI flags — the
+// bench sets the process-wide vision settings itself (vision::settings::init)
+// and flips the fakefile/forced-detect bench hooks programmatically; there are
+// no environment variables.
 #![cfg(all(
     feature = "inference-vision-gpu",
     feature = "inference-supertonic",
@@ -93,15 +96,22 @@ struct Args {
     /// Stage-1 gate: drive the detect stage from a raw-NV12 detect frame through
     /// the GPU-resident device path (`detect_batch_gpu`) instead of the RGB
     /// executor path. Verifies the NV12 detect path end-to-end without a live
-    /// camera. Sets `TENTAFLOW_FAKEFILE_NV12_DETECT=1` for the fakefile connector.
+    /// camera. Flips the fakefile connector's NV12-detect bench hook.
     nv12_detect: bool,
     /// Stage-3 gate: drive BOTH detect AND enrichment on NV12 end to end. The
     /// crops frame is delivered raw NV12 (no full-frame `videoconvert`), so
     /// enrichment cuts crops via `crop_nv12`; forced detection makes the cold path
     /// run every frame. Verifies enriched/s > 0 on the NV12 crops path with the
-    /// full videoconvert absent. Sets `TENTAFLOW_FAKEFILE_NV12=1` +
-    /// `TENTAFLOW_BENCH_FORCE_DETECT=1`.
+    /// full videoconvert absent. Flips the fakefile full-NV12 bench hook and the
+    /// forced-detect load generator.
     nv12: bool,
+    /// Force the cold enrichment path on frames the detector left empty
+    /// (`vision_analysis::set_force_detect`). Implied by `--nv12`.
+    force_detect: bool,
+    /// `[vision] gpus` spec (same grammar: count or comma list). Empty = device 0.
+    gpus: String,
+    /// Source video for the fake_file cameras; default = e2e sample / synthetic clip.
+    video: Option<PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -112,6 +122,9 @@ fn parse_args() -> Args {
         warmup_secs: 20,
         nv12_detect: false,
         nv12: false,
+        force_detect: false,
+        gpus: String::new(),
+        video: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -131,6 +144,9 @@ fn parse_args() -> Args {
             }
             "--nv12-detect" => a.nv12_detect = true,
             "--nv12" => a.nv12 = true,
+            "--force-detect" => a.force_detect = true,
+            "--gpus" => a.gpus = it.next().unwrap_or_default(),
+            "--video" => a.video = it.next().map(PathBuf::from),
             _ => {}
         }
     }
@@ -145,12 +161,12 @@ fn parse_args() -> Args {
     a
 }
 
-/// First GPU index from `TENTAFLOW_VISION_GPUS` (default 0) — the card we sample
+/// First GPU index from the `--gpus` spec (default 0) — the card we sample
 /// with `nvidia-smi`. Mirrors `cam_scale`.
-fn gpu_index() -> String {
-    std::env::var("TENTAFLOW_VISION_GPUS")
-        .ok()
-        .and_then(|v| v.split([',', ' ']).next().map(|s| s.trim().to_string()))
+fn gpu_index(gpus: &str) -> String {
+    gpus.split([',', ' '])
+        .next()
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "0".to_string())
 }
@@ -279,19 +295,15 @@ fn wire_executor(pool: &db::DbPool) -> anyhow::Result<()> {
 }
 
 /// Resolves a video file the `fake_file` connector can loop. Preference:
-/// `TENTAFLOW_BENCH_VIDEO`, then the e2e sample, then a synthetic clip generated
+/// the `--video` flag, then the e2e sample, then a synthetic clip generated
 /// once via GStreamer next to the crate (so `resolve_file_url`'s no-symlink
 /// containment holds).
-fn ensure_sample_video() -> anyhow::Result<PathBuf> {
-    if let Ok(p) = std::env::var("TENTAFLOW_BENCH_VIDEO") {
-        let p = PathBuf::from(p);
+fn ensure_sample_video(video: Option<&Path>) -> anyhow::Result<PathBuf> {
+    if let Some(p) = video {
         if p.is_file() {
-            return Ok(p);
+            return Ok(p.to_path_buf());
         }
-        anyhow::bail!(
-            "TENTAFLOW_BENCH_VIDEO does not point at a file: {}",
-            p.display()
-        );
+        anyhow::bail!("--video does not point at a file: {}", p.display());
     }
     let asset_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/test");
     let sample = asset_dir.join("sample_traffic.mp4");
@@ -441,17 +453,27 @@ async fn add_camera(
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = parse_args();
-    let gpu = gpu_index();
+    let gpu = gpu_index(&args.gpus);
     let budget_ms = 1000.0 / args.fps as f64;
+
+    // Freeze the process-wide vision settings from the CLI flags BEFORE any
+    // model singleton or camera pipeline can read them.
+    tentaflow_core::vision::settings::init(tentaflow_core::config::VisionConfig {
+        gpus: args.gpus.clone(),
+        ..Default::default()
+    })?;
 
     ensure_ort_dylib();
 
     // Stage-1 NV12 gate: make the fakefile connector tee the decoded NV12 into a
     // raw-NV12 detect appsink so the engine routes detect through the GPU-resident
-    // device path (`detect_batch_gpu`). Set BEFORE any camera session builds its
-    // pipeline. The warmup detect count then proves the NV12 path publishes.
+    // device path (`detect_batch_gpu`). Flipped BEFORE any camera session builds
+    // its pipeline. The warmup detect count then proves the NV12 path publishes.
+    tentaflow_core::services::camera_ingest::fakefile::set_nv12_bench_mode(
+        args.nv12_detect,
+        args.nv12,
+    );
     if args.nv12_detect {
-        std::env::set_var("TENTAFLOW_FAKEFILE_NV12_DETECT", "1");
         println!(
             "NV12 detect mode: detect stage runs from raw NV12 via detect_batch_gpu (GPU device path)\n"
         );
@@ -459,13 +481,16 @@ async fn main() -> anyhow::Result<()> {
     // Stage-3 full NV12 mode: crops frame delivered raw NV12 (no full videoconvert)
     // and forced detection so the cold path exercises enrichment on NV12 crops.
     if args.nv12 {
-        std::env::set_var("TENTAFLOW_FAKEFILE_NV12", "1");
-        std::env::set_var("TENTAFLOW_BENCH_FORCE_DETECT", "1");
         println!(
             "NV12 full mode: detect + enrichment run NV12 end to end (crops via crop_nv12, no full \
              videoconvert); forced detection drives the cold path every frame\n"
         );
     }
+    // Forced-enrichment load generator (implied by --nv12): the cold path runs
+    // even on frames the detector left empty.
+    tentaflow_core::services::camera_ingest::vision_analysis::set_force_detect(
+        args.force_detect || args.nv12,
+    );
 
     // Real DB init: runs migrations + seed (default ADR pipeline + tentavision-*
     // aliases + org-default) and installs the global pool the engine reads.
@@ -475,7 +500,7 @@ async fn main() -> anyhow::Result<()> {
 
     wire_executor(&pool)?;
 
-    let video = ensure_sample_video()?;
+    let video = ensure_sample_video(args.video.as_deref())?;
     let video = video.to_string_lossy().to_string();
 
     let cap = tentaflow_core::services::camera_ingest::MAX_CAMERAS_GLOBAL;
@@ -650,7 +675,7 @@ async fn main() -> anyhow::Result<()> {
     println!(
         "\nreal cameras/GPU (this build + models) = the LAST 'YES' row.\n\
          'enriched/s' = cold-path (state/plate/adr) completions; 0 means the source\n\
-         produced no confident ADR detections — point TENTAFLOW_BENCH_VIDEO at real\n\
+         produced no confident ADR detections — point --video at real\n\
          ADR footage to load the enrichment path. This bench drives the REAL engine\n\
          loop, detect-flush batching, executor and cold path — cam_scale does not."
     );

@@ -13,7 +13,7 @@ use tentaflow_core::db::repository::{
     set_camera_credentials_encrypted,
 };
 use tentaflow_core::services::camera_ingest::credentials::{
-    overlay_credentials, CredentialsCipher, KEY_PATH_ENV,
+    overlay_credentials, CredentialsCipher,
 };
 
 /// Create an isolated DbPool against an in-memory file. Mirrors the helper
@@ -378,19 +378,15 @@ fn plaintext_credentials_reject_url_breakers() {
 }
 
 #[test]
-fn env_override_for_key_path_is_picked_up() {
-    // Drop a sentinel value into a per-test env var space — we don't
-    // actually set the global env (other tests run in parallel) but we
-    // exercise the helper by passing the path explicitly through
-    // load_or_generate_at, which is what the env-override eventually
-    // resolves to. Smoke-test only.
+fn explicit_key_path_is_picked_up() {
+    // Exercise the helper by passing the path explicitly through
+    // load_or_generate_at, which is what the programmatic path override
+    // (`set_key_path_override`) eventually resolves to. Smoke-test only —
+    // the process-wide override itself is exercised by tests/camera_admin_rpcs.rs.
     let td = tempfile::tempdir().unwrap();
     let p = fresh_key_path(&td, "override.key");
     let c = CredentialsCipher::load_or_generate_at(&p).unwrap();
     assert!(p.exists(), "key file must be created on first use");
     let blob = c.encrypt("u:p").unwrap();
     assert_eq!(c.decrypt(&blob).unwrap(), "u:p");
-    // Confirm the env constant exists at compile time so consumers can
-    // reference it without typos.
-    let _name: &str = KEY_PATH_ENV;
 }

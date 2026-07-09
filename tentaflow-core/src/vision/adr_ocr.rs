@@ -45,7 +45,7 @@ const IMG_W: u32 = 128;
 /// Przerwa wokół linii środkowej przy podziale na wiersze (`split_rows`).
 const SPLIT_MARGIN: f32 = 0.06;
 
-// --- Row content-trim before resize (`TENTAFLOW_ADR_ROW_TRIM`, default ON) ---
+// --- Row content-trim before resize (`[vision] adr_row_trim`, default ON) ---
 // A row from `split_rows` still holds the full placard width: the dark metal
 // frame, the surrounding gray background AND the bright orange field with the
 // digits centered in it. A 2-digit top row ("99") therefore occupies only the
@@ -80,43 +80,44 @@ const ADR_TRIM_MIN_H_FRAC: f32 = 0.20;
 const ADR_TRIM_KEEP_W_FRAC: f32 = 0.90;
 const ADR_TRIM_KEEP_H_FRAC: f32 = 0.95;
 
+/// Per-call row-trim override for the `adr_rowtrim_ab` A/B harness: `0` =
+/// follow `[vision] adr_row_trim`, `1` = forced OFF, `2` = forced ON. The
+/// production path never touches this — it stays at the settings value.
+static ROW_TRIM_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Bench-only programmatic override so the A/B harness can flip the row trim
+/// per read within one process (the settings are frozen process-wide).
+pub fn set_row_trim_override(enabled: bool) {
+    ROW_TRIM_OVERRIDE.store(
+        if enabled { 2 } else { 1 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// Whether to content-trim each row before the 32×128 resize.
-/// `TENTAFLOW_ADR_ROW_TRIM` — default ON; set `0`/`false`/`off`/`no` to disable
-/// (A/B toggle). Read fresh each call so the A/B harness can flip it per run.
+/// `[vision] adr_row_trim` — default ON; `false` disables (A/B toggle).
 fn adr_row_trim() -> bool {
-    std::env::var("TENTAFLOW_ADR_ROW_TRIM")
-        .ok()
-        .map(|v| {
-            !matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "off" | "no"
-            )
-        })
-        .unwrap_or(true)
+    match ROW_TRIM_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => crate::vision::settings::get().adr_row_trim,
+    }
 }
 
 /// Ile orientacji tablicy próbować w `read_adr` (1=tylko pionowa, 4=pełny obrót
 /// 0/90/180/270). Domyślnie 1: kamery stacjonarne widzą planszę pionowo, więc
-/// obroty to zwykle marnowane forwardy. `TENTAFLOW_ADR_ORIENTATIONS` (1..=4).
+/// obroty to zwykle marnowane forwardy. `[vision] adr_orientations` (1..=4).
 fn adr_orientations() -> usize {
-    std::env::var("TENTAFLOW_ADR_ORIENTATIONS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .map(|n| n.clamp(1, 4))
-        .unwrap_or(1)
+    crate::vision::settings::get().adr_orientations.clamp(1, 4)
 }
 
 /// Nazwy plików bundla w `vision_models_dir()`.
 const MODEL_FILE: &str = "adr_ocr.onnx";
 const ALPHABET_FILE: &str = "adr_ocr_alphabet.txt";
 
-/// Env sterujący rozmiarem puli sesji ort dla ADR OCR. Domyślnie 1; >1 pozwala
-/// wielu cropom ADR OCR-ować równolegle (orientation-search robi 8 forwardów
-/// na crop, więc pula pomaga przy wielu tablicach ADR w kadrze).
-#[cfg(feature = "inference-supertonic")]
-const ADR_SESSIONS_ENV: &str = "TENTAFLOW_ADR_SESSIONS";
-#[cfg(feature = "inference-supertonic")]
-const DEFAULT_ADR_SESSIONS: usize = 4;
+// ADR-OCR session-pool size comes from `[vision] adr_sessions` (default 4);
+// >1 lets many ADR crops OCR concurrently (orientation-search does several
+// forwards per crop, so the pool helps with many placards in frame).
 
 /// TRT dynamic-batch profile bounds for the ROW batch (`[rows,1,32,128]`).
 /// Cross-placard batching (`read_adr_batch`) packs `2×orientations` rows per
@@ -198,10 +199,8 @@ impl AdrOcr {
         #[cfg(feature = "inference-supertonic")]
         {
             crate::vision::ort_common::ensure_ort_dylib();
-            let n = crate::vision::ort_common::pool_size_from_env(
-                ADR_SESSIONS_ENV,
-                DEFAULT_ADR_SESSIONS,
-            );
+            let n =
+                crate::vision::ort_common::pool_size(crate::vision::settings::get().adr_sessions);
             let trt_profile = std::fs::read(&model_path)
                 .ok()
                 .and_then(|bytes| crate::vision::ort_common::onnx_first_input_name(&bytes))
@@ -424,7 +423,7 @@ impl AdrOcr {
         }
         // Orientation count from `adr_orientations()`: default 1 (upright only)
         // — stationary cameras see the placard upright, so the 90/180/270
-        // rotations are usually wasted forwards. `TENTAFLOW_ADR_ORIENTATIONS=4`
+        // rotations are usually wasted forwards. `[vision] adr_orientations = 4`
         // enables the full search for feeds where VID placards come rotated.
         let orientations = adr_orientations();
         let per = (IMG_H * IMG_W) as usize;
@@ -543,7 +542,7 @@ fn prep_rows(
     produced.then_some(slots)
 }
 
-/// Env-gated ADR crop dump (`TENTAFLOW_OCR_DUMP_DIR`): writes the raw RGB crop
+/// Config-gated ADR crop dump (`[vision] ocr_dump_dir`): writes the raw RGB crop
 /// plus its full grayscale preview named with the read result, so a human can
 /// see whether the ADR placard is clipped/skewed/too small. No-op when the dump
 /// dir is unset, and compiled out entirely without `inference-vision-gpu` (the
