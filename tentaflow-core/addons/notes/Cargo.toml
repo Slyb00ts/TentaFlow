@@ -1,0 +1,24 @@
+# =============================================================================
+# File: addons/notes/Cargo.toml
+# Purpose: Notes addon crate (WASM cdylib) — notes CRUD with ACL shares and the
+#          three-column panel (list | editor | links) rendered via ui_v1.
+# =============================================================================
+[package]
+name = "tentaflow-addon-notes"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tentaflow-addon-sdk = { path = "../../addon-sdk/sdk" }
+tentaflow-sdk-spec = { path = "../../../tentaflow-sdk-spec" }
+minicbor = { version = "2.2", default-features = false, features = ["alloc"] }
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

@@ -1,0 +1,91 @@
+[addon]
+id = "notes"
+name = "Notatki"
+version = "0.1.0"
+description = "Notatki z lokalną analizą treści: lista, edytor z autozapisem i udostępnianie w organizacji. Schemat danych kładzie fundament pod auto-graf powiązań (encje, podobieństwo semantyczne) i dyktowanie."
+category = "productivity"
+keywords = ["notes", "notatki", "graf", "encje", "wiedza", "dyktowanie"]
+author = "TentaFlow"
+license = "Apache-2.0"
+homepage = ""
+icon = "file-text"
+runtime = "wasmtime"
+platforms = ["linux", "macos", "windows", "ios", "android"]
+wasm_file = "addon.wasm"
+
+# --- Uprawnienia ---
+# Tylko to, czego addon uzywa DZISIAJ. Deklaracje pod auto-graf/dyktowanie
+# (vector.*, graph.*, llm, stt, alias.read + [[vector_namespace]],
+# [[graph_collection]], [[alias]]/[[uses_alias]]) dojda w etapie analizy —
+# zmiana bundle_hash przeprowadzi wtedy update instalacji.
+
+[[permission]]
+id = "ui"
+display_name = "Interfejs Notatek"
+description = "Renderuje panel Notatek (lista, edytor, powiazania) w launcherze TentaFlow."
+risk = "low"
+
+[[permission]]
+id = "sql.read"
+display_name = "Odczyt notatek"
+description = "Czyta notatki, tagi, udostepnienia, encje i powiazania z bazy addonu."
+risk = "medium"
+
+[[permission]]
+id = "sql.write"
+display_name = "Zapis notatek"
+description = "Tworzy i aktualizuje notatki, tagi, udostepnienia, encje i powiazania."
+risk = "medium"
+
+[[permission]]
+id = "state.read"
+display_name = "Odczyt stanu sesji"
+description = "Czyta ulotny stan sesji panelu (filtr zakresu, fraza wyszukiwania, aktywna notatka)."
+risk = "low"
+
+[[permission]]
+id = "state.write"
+display_name = "Zapis stanu sesji"
+description = "Zapisuje ulotny stan sesji panelu (filtr zakresu, fraza wyszukiwania, aktywna notatka)."
+risk = "low"
+
+[[permission]]
+id = "directory.read"
+display_name = "Katalog uzytkownikow"
+description = "Czyta uzytkownikow, grupy i organizacje, aby rozstrzygac dostep do udostepnionych notatek i pokazywac autorow."
+risk = "low"
+
+[[permission]]
+id = "user_info"
+display_name = "Tozsamosc uzytkownika"
+description = "Odczytuje tozsamosc biezacego uzytkownika, aby pokazac jego notatki i egzekwowac zakresy dostepu."
+risk = "low"
+
+[visibility]
+admin_only = false
+default_groups = []
+show_in_catalog = true
+
+[application]
+entry_panel = "main"
+title = "Notatki"
+icon = "file-text"
+description = "Notatki z auto-grafem powiazan i udostepnianiem."
+sort_order = 25
+
+[storage]
+sql = true
+sql_backends = ["sqlite"]
+sql_dialect = "sqlite"
+migrations_dir = "migrations"
+encryption = "none"
+scope = "org"
+
+[resources]
+memory_mb = 128
+fuel_limit = 50000000
+storage_total_mb = 512
+
+[lifecycle]
+background = false
+auto_start = false

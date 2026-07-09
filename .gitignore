@@ -217,8 +217,9 @@ vendor/crates/*/llama.cpp/
 /native-libs/*
 !/native-libs/README.md
 
-# Notatki robocze — nie wysylamy do remote
-notes/
+# Notatki robocze — nie wysylamy do remote (tylko katalog w korzeniu repo,
+# NIE tentaflow-core/addons/notes)
+/notes/
 
 # Codex CLI session state — lokalne
 .context/
