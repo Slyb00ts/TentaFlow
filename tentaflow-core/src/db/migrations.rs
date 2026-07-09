@@ -602,6 +602,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cameras_vision_worker_slot",
             MigrationStep::Rust(cameras_add_vision_worker_slot_column),
         ),
+        (
+            113,
+            "recordings_event_meta",
+            MigrationStep::Rust(recordings_add_event_meta_column),
+        ),
     ]
 }
 
@@ -1472,6 +1477,19 @@ fn cameras_add_depth_pose_source_column(conn: &Connection) -> Result<()> {
 fn cameras_add_vision_worker_slot_column(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "cameras", "vision_worker_slot")? {
         conn.execute_batch("ALTER TABLE cameras ADD COLUMN vision_worker_slot INTEGER NULL;")?;
+    }
+    Ok(())
+}
+
+/// Adds `event_meta` to `recordings` — a nullable JSON blob written by the
+/// per-vehicle event recorder (`services/event_recorder.rs`): trigger classes,
+/// plate/ADR OCR votes, condition flags and the event's start/stop wall-clock
+/// range. NULL for every addon-saved snapshot/segment. `json_valid` is enforced
+/// at write time by the recorder (single writer), not by a CHECK, so the ALTER
+/// stays a cheap in-place column add. Idempotent — guarded by a column probe.
+fn recordings_add_event_meta_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "recordings", "event_meta")? {
+        conn.execute_batch("ALTER TABLE recordings ADD COLUMN event_meta TEXT NULL;")?;
     }
     Ok(())
 }

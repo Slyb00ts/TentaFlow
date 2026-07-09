@@ -244,6 +244,35 @@ pub struct VisionConfig {
     /// session.
     #[serde(default = "default_warmup_extra_secs")]
     pub warmup_extra_secs: u32,
+
+    /// Per-vehicle event recording: whenever detections appear on a camera
+    /// (scene non-empty), record fMP4 passthrough video until the scene stays
+    /// empty for `event_stop_hysteresis_secs`. Default ON per operator request;
+    /// it only ever engages on cameras that actually publish detections (i.e.
+    /// have a resolvable analysis pipeline), so nodes without CV are unaffected.
+    #[serde(default = "default_true")]
+    pub event_recording: bool,
+
+    /// Seconds the scene must stay empty (no detections) before an event
+    /// recording is finalized. A new detection inside the window extends the
+    /// same recording.
+    #[serde(default = "default_event_stop_hysteresis_secs")]
+    pub event_stop_hysteresis_secs: u64,
+
+    /// Seconds of video kept in a per-camera rolling buffer while idle and
+    /// prepended to each event recording (the vehicle is visible BEFORE the
+    /// first detection lands). `0` disables the buffer — the recording then
+    /// starts at the first fragment after the trigger. Non-zero keeps the
+    /// camera's passthrough mux branch attached permanently (cheap: no
+    /// transcode, ~`preroll × bitrate` bytes of RAM per camera).
+    #[serde(default = "default_event_preroll_secs")]
+    pub event_preroll_secs: u64,
+
+    /// Upper bound for one event recording file. A scene that never empties
+    /// (busy gate, stuck detection) rotates to a fresh file at this boundary
+    /// instead of growing one unbounded mp4; no video is lost across the cut.
+    #[serde(default = "default_event_max_duration_secs")]
+    pub event_max_duration_secs: u64,
 }
 
 fn default_warmup_extra_secs() -> u32 {
@@ -283,8 +312,22 @@ impl Default for VisionConfig {
             adr_orientations: default_one(),
             calib_dump: false,
             warmup_extra_secs: default_warmup_extra_secs(),
+            event_recording: default_true(),
+            event_stop_hysteresis_secs: default_event_stop_hysteresis_secs(),
+            event_preroll_secs: default_event_preroll_secs(),
+            event_max_duration_secs: default_event_max_duration_secs(),
         }
     }
+}
+
+fn default_event_stop_hysteresis_secs() -> u64 {
+    10
+}
+fn default_event_preroll_secs() -> u64 {
+    5
+}
+fn default_event_max_duration_secs() -> u64 {
+    3600
 }
 
 fn default_vision_sessions() -> usize {

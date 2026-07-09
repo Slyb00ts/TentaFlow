@@ -778,6 +778,7 @@ fn save_snapshot_core(
         &saved.hash_sha256,
         &retention_class,
         state.org_id.as_deref(),
+        None,
     ) {
         warn!("recording.save_snapshot insert_recording failed (compensating purge): {e}");
         let _ = run_async(purge_recording(&saved.file_path));
@@ -930,6 +931,7 @@ fn save_segment_core(
         &saved.hash_sha256,
         &retention_class,
         state.org_id.as_deref(),
+        None,
     ) {
         warn!("recording.save_segment insert_recording failed (compensating purge): {e}");
         let _ = run_async(purge_recording(&saved.file_path));

@@ -1,0 +1,1043 @@
+// =============================================================================
+// File: services/event_recorder.rs — per-vehicle event recording
+// =============================================================================
+//
+// Operator requirement: "Potrzebujemy nagrania zawsze jak pojawia się nowy
+// samochód i aż odjedzie" — whenever a vehicle appears at a camera, record
+// video until the scene empties.
+//
+// One background task per LOCAL camera, spawned lazily from the
+// `detection_bus::publish_detections` hook the first time a camera publishes
+// an analysis frame (empty or not). The task drives a small state machine:
+//
+//   EMPTY      --any detection-->                 RECORDING (start a file)
+//   RECORDING  --no detections for hysteresis-->  EMPTY     (finalize + DB row)
+//
+// Video comes from the SAME fMP4 passthrough source the Live view uses:
+// `StreamHub::subscribe("camera:<id>")` attaches Branch B (rtph264depay →
+// h264parse → mp4mux → appsink; NO transcode) and yields an init segment plus
+// self-contained moof+mdat media segments. Recording is therefore a plain
+// append of those bytes into `~/.tentaflow/recordings/<camera_id>/segments/`,
+// and the file is served/played through the existing `GET /recordings/<ref>`
+// signed-URL path with a normal `recordings` catalog row (kind = "segment").
+//
+// Pre-roll: while EMPTY the task keeps the hub subscription alive and holds
+// the last `event_preroll_secs` of media segments in a ring buffer, so the
+// vehicle is on tape from BEFORE its first detection. Fragments are 200 ms of
+// passthrough H.264 — the buffer costs ~`preroll × bitrate` RAM per camera and
+// zero transcode CPU. `event_preroll_secs = 0` subscribes only for the
+// duration of a recording (Branch B detaches between events).
+//
+// Camera scope: the recorder handles every camera whose VIDEO is reachable on
+// this node — core-owned sessions and Stage-B vision-worker cameras alike
+// (worker detections are republished on the core detection bus and worker
+// video is relayed through the same `camera:<id>` hub factories). Cameras that
+// live on ANOTHER mesh node are excluded by the node-local `cameras` table
+// gate; their owning node runs its own recorder.
+//
+// All knobs live in the `[vision]` config section (`event_recording`,
+// `event_stop_hysteresis_secs`, `event_preroll_secs`,
+// `event_max_duration_secs`) — deliberately NO environment variables.
+
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::broadcast::error::RecvError;
+use tracing::{debug, info, warn};
+
+use crate::services::detection_bus::{self, Detection, DetectionsMessage};
+use crate::services::recording::{
+    camera_subdir, recording_base_dir, validate_camera_id, RecordingKind,
+};
+use crate::services::stream_hub::{StreamHub, SubscriptionHandle};
+
+/// State-machine tick cadence. Bounds how late a hysteresis stop can fire.
+const TICK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// A recorder whose camera published NOTHING on the detection bus for this
+/// long (analysis stopped, camera removed) exits and frees its resources; the
+/// publish hook respawns it if the camera ever publishes again.
+const IDLE_EXIT: Duration = Duration::from_secs(15 * 60);
+
+/// Back-off between failed `camera:<id>` hub subscribe attempts, and the
+/// cooldown before re-trying to START a recording after a start failed because
+/// video was unavailable (prevents hammering attach on every detection frame).
+const VIDEO_RETRY: Duration = Duration::from_secs(30);
+
+/// Hard RAM ceiling for the pre-roll ring buffer, guarding against a camera
+/// with an absurd bitrate. Oldest fragments are dropped first.
+const PREROLL_MAX_BYTES: usize = 96 * 1024 * 1024;
+
+// -----------------------------------------------------------------------------
+// Publish hook + per-camera task registry
+// -----------------------------------------------------------------------------
+
+/// Cameras that already have a recorder task (or had one spawned this tick).
+/// The task removes itself on exit so a later publish can respawn it.
+fn handled() -> &'static Mutex<HashSet<String>> {
+    static SET: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Hook called by `detection_bus::publish_detections` for EVERY analysis
+/// frame (empty ones included, so the pre-roll buffer is warm before the
+/// first vehicle). Must stay cheap — it runs per frame per camera: one config
+/// read plus one hash-set probe on the hot path.
+pub fn on_detections_published(camera_id: &str) {
+    if !crate::vision::settings::get().event_recording {
+        return;
+    }
+    // Vision WORKER processes run this same publish path for their local bus
+    // but never initialize the core DB pool — recording (catalog rows, camera
+    // identity) is the core's job, which sees the same detections republished
+    // by the fleet link. The pool gate keeps workers (and early core boot,
+    // which self-heals on the next frame) out without per-frame task churn.
+    if crate::db::global_pool().is_none() {
+        return;
+    }
+    {
+        let mut set = handled().lock().unwrap_or_else(|p| p.into_inner());
+        if !set.insert(camera_id.to_string()) {
+            return;
+        }
+    }
+    // Publishers may run on non-tokio threads (GStreamer callbacks); only a
+    // live runtime can host the recorder. Without one, un-mark the camera so
+    // a later publish from a runtime thread retries the spawn.
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        handled()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(camera_id);
+        return;
+    };
+    let camera_id = camera_id.to_string();
+    rt.spawn(async move {
+        let respawnable = run_recorder(&camera_id).await;
+        // A camera that is not node-local can never become recordable under
+        // this id — keep it marked so remote/mesh detections stop probing the
+        // DB per frame. Idle exits DO unmark so a later frame respawns.
+        if respawnable {
+            handled()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&camera_id);
+        }
+        debug!(camera_id = %camera_id, respawnable, "[event_recorder] task exited");
+    });
+}
+
+// -----------------------------------------------------------------------------
+// Pure state machine (unit-tested)
+// -----------------------------------------------------------------------------
+
+/// EMPTY ⇄ RECORDING transitions driven by detection presence and time.
+/// Deliberately free of I/O so the hysteresis semantics are testable.
+#[derive(Debug)]
+struct EventStateMachine {
+    hysteresis: Duration,
+    /// `Some(last presence)` while RECORDING, `None` while EMPTY.
+    last_presence: Option<Instant>,
+}
+
+impl EventStateMachine {
+    fn new(hysteresis: Duration) -> Self {
+        Self {
+            hysteresis,
+            last_presence: None,
+        }
+    }
+
+    fn recording(&self) -> bool {
+        self.last_presence.is_some()
+    }
+
+    /// A non-empty detection frame arrived. Returns `true` when this is the
+    /// EMPTY → RECORDING edge (caller starts a file); re-triggers inside the
+    /// hysteresis window just refresh the presence timestamp.
+    fn on_presence(&mut self, now: Instant) -> bool {
+        let start = self.last_presence.is_none();
+        self.last_presence = Some(now);
+        start
+    }
+
+    /// Time-driven check: the scene has stayed empty past the hysteresis.
+    fn should_stop(&self, now: Instant) -> bool {
+        match self.last_presence {
+            Some(last) => now.duration_since(last) >= self.hysteresis,
+            None => false,
+        }
+    }
+
+    /// RECORDING → EMPTY (caller finalized the file).
+    fn on_stopped(&mut self) {
+        self.last_presence = None;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Event metadata accumulator
+// -----------------------------------------------------------------------------
+
+/// Aggregates every detection observed during one event into the JSON summary
+/// persisted in `recordings.event_meta`. Votes (frame counts) per class and
+/// per OCR text let a consumer pick the majority plate/ADR reading.
+#[derive(Debug, Default)]
+struct EventMeta {
+    /// class → frames it appeared in.
+    classes: BTreeMap<String, u64>,
+    /// class → OCR text → frames it was read (plates, ADR codes, …).
+    texts: BTreeMap<String, BTreeMap<String, u64>>,
+    /// condition flag (e.g. "uszkodzona") → frames observed.
+    stan: BTreeMap<String, u64>,
+    /// distinct non-zero tracker ids seen.
+    tracks: BTreeSet<u32>,
+    /// detection frames absorbed (non-empty only).
+    frames: u64,
+}
+
+impl EventMeta {
+    fn absorb(&mut self, items: &[Detection]) {
+        if items.is_empty() {
+            return;
+        }
+        self.frames += 1;
+        for d in items {
+            *self.classes.entry(d.klasa.clone()).or_insert(0) += 1;
+            if let Some(t) = d.tekst.as_deref() {
+                if !t.is_empty() {
+                    *self
+                        .texts
+                        .entry(d.klasa.clone())
+                        .or_default()
+                        .entry(t.to_string())
+                        .or_insert(0) += 1;
+                }
+            }
+            for s in &d.stan {
+                *self.stan.entry(s.clone()).or_insert(0) += 1;
+            }
+            if d.track_id != 0 {
+                self.tracks.insert(d.track_id);
+            }
+        }
+    }
+
+    /// Serialize the summary for one finalized file. `start/stop` are wall
+    /// clock (unix ms) of the FILE (pre-roll included), `part` numbers files
+    /// within one long event that rotated at `event_max_duration_secs`.
+    fn to_json(&self, start_ts_ms: u64, stop_ts_ms: u64, preroll_ms: u64, part: u32) -> String {
+        serde_json::json!({
+            "event": "vehicle_presence",
+            "start_ts_ms": start_ts_ms,
+            "stop_ts_ms": stop_ts_ms,
+            "preroll_ms": preroll_ms,
+            "part": part,
+            "detection_frames": self.frames,
+            "tracks": self.tracks.len(),
+            "classes": self.classes,
+            "texts": self.texts,
+            "stan": self.stan,
+        })
+        .to_string()
+    }
+}
+
+// -----------------------------------------------------------------------------
+// fMP4 helpers + pre-roll ring buffer
+// -----------------------------------------------------------------------------
+
+/// Four-CC of the first top-level box in a publisher chunk. Media chunks start
+/// with `moof`; a mid-stream `ftyp` means the camera pipeline rebuilt and a
+/// NEW init segment (new PTS axis) follows — appending across that boundary
+/// would corrupt the file, so the recorder rotates on it.
+fn fmp4_box_kind(chunk: &[u8]) -> Option<[u8; 4]> {
+    if chunk.len() < 8 {
+        return None;
+    }
+    Some([chunk[4], chunk[5], chunk[6], chunk[7]])
+}
+
+/// Rolling window of recent media segments kept while EMPTY.
+#[derive(Debug, Default)]
+struct PrerollBuffer {
+    segments: VecDeque<(Instant, Bytes)>,
+    bytes: usize,
+}
+
+impl PrerollBuffer {
+    fn push(&mut self, now: Instant, window: Duration, chunk: Bytes) {
+        self.bytes += chunk.len();
+        self.segments.push_back((now, chunk));
+        while let Some((t, b)) = self.segments.front() {
+            if now.duration_since(*t) > window && self.segments.len() > 1
+                || self.bytes > PREROLL_MAX_BYTES
+            {
+                self.bytes -= b.len();
+                self.segments.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.segments.clear();
+        self.bytes = 0;
+    }
+
+    /// Age of the oldest buffered fragment — the pre-roll actually achieved.
+    fn span(&self, now: Instant) -> Duration {
+        self.segments
+            .front()
+            .map(|(t, _)| now.duration_since(*t))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    fn drain(&mut self) -> Vec<Bytes> {
+        self.bytes = 0;
+        self.segments.drain(..).map(|(_, b)| b).collect()
+    }
+}
+
+// -----------------------------------------------------------------------------
+// File writer
+// -----------------------------------------------------------------------------
+
+/// One in-progress event file. Bytes stream into `<final>.mp4.tmp`; only a
+/// clean finalize renames to the final path (same invariant as the ad-hoc
+/// segment recorder: an observable `.mp4` is always complete). fMP4 needs no
+/// trailer, so a crash merely leaves a stale-but-harmless `.tmp`.
+struct ActiveFile {
+    file: tokio::fs::File,
+    tmp_path: PathBuf,
+    final_path: PathBuf,
+    recording_ref: String,
+    hasher: Sha256,
+    bytes: u64,
+    opened_at: Instant,
+    /// Wall-clock start of the FILE's content (event trigger minus pre-roll).
+    started_wall_ms: u64,
+    preroll_ms: u64,
+    part: u32,
+}
+
+/// Everything the DB row needs once the bytes are on disk.
+struct FinalizedFile {
+    recording_ref: String,
+    final_path: PathBuf,
+    bytes: u64,
+    duration_ms: u64,
+    started_wall_ms: u64,
+    stopped_wall_ms: u64,
+    preroll_ms: u64,
+    hash_sha256: String,
+    part: u32,
+}
+
+impl ActiveFile {
+    async fn create(camera_id: &str, preroll_ms: u64, part: u32) -> anyhow::Result<Self> {
+        let recording_ref = format!("clip_{}", uuid::Uuid::new_v4());
+        let base = recording_base_dir().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let dir = camera_subdir(&base, camera_id, RecordingKind::Segment);
+        tokio::fs::create_dir_all(&dir).await?;
+        let final_path = dir.join(format!("{recording_ref}.mp4"));
+        let tmp_path = dir.join(format!("{recording_ref}.mp4.tmp"));
+        let file = tokio::fs::File::create(&tmp_path).await?;
+        Ok(Self {
+            file,
+            tmp_path,
+            final_path,
+            recording_ref,
+            hasher: Sha256::new(),
+            bytes: 0,
+            opened_at: Instant::now(),
+            started_wall_ms: now_unix_ms().saturating_sub(preroll_ms),
+            preroll_ms,
+            part,
+        })
+    }
+
+    async fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.file.write_all(data).await?;
+        self.hasher.update(data);
+        self.bytes += data.len() as u64;
+        Ok(())
+    }
+
+    async fn finalize(mut self) -> anyhow::Result<FinalizedFile> {
+        self.file.flush().await?;
+        self.file.sync_all().await?;
+        drop(self.file);
+        tokio::fs::rename(&self.tmp_path, &self.final_path).await?;
+        let duration_ms =
+            self.opened_at.elapsed().as_millis().min(u64::MAX as u128) as u64 + self.preroll_ms;
+        Ok(FinalizedFile {
+            recording_ref: self.recording_ref,
+            final_path: self.final_path,
+            bytes: self.bytes,
+            duration_ms,
+            started_wall_ms: self.started_wall_ms,
+            stopped_wall_ms: now_unix_ms(),
+            preroll_ms: self.preroll_ms,
+            hash_sha256: hex::encode(self.hasher.finalize()),
+            part: self.part,
+        })
+    }
+
+    /// Drop the partial file (start failed mid-way / unplayable content).
+    async fn discard(self) {
+        drop(self.file);
+        let _ = tokio::fs::remove_file(&self.tmp_path).await;
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// -----------------------------------------------------------------------------
+// DB glue
+// -----------------------------------------------------------------------------
+
+/// `(owner_addon_id, org_id, retention_class)` of the local camera. `None` =
+/// not a local camera (mesh-remote or already removed) — the recorder exits.
+async fn camera_identity(camera_id: &str) -> Option<(String, String, String)> {
+    let id = camera_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let pool = crate::db::global_pool()?;
+        match crate::db::repository::camera_recording_identity(&pool, &id) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(camera_id = %id, "[event_recorder] camera identity lookup failed: {e}");
+                None
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Catalog the finalized file. Attribution goes to the camera's OWNING addon
+/// so the recording shows up in the exact same dashboard surfaces (addon
+/// storage stats, signed-URL playback) as addon-saved segments. On a DB
+/// failure the file is purged — same compensation as the host-function path.
+async fn insert_event_row(
+    camera_id: &str,
+    identity: &(String, String, String),
+    fin: FinalizedFile,
+    event_meta_json: String,
+) {
+    let (owner_addon_id, org_id, retention_class) = identity.clone();
+    let cam_for_db = camera_id.to_string();
+    let path_for_purge = fin.final_path.clone();
+    let inserted = tokio::task::spawn_blocking(move || {
+        let Some(pool) = crate::db::global_pool() else {
+            return Err(anyhow::anyhow!("no global DB pool"));
+        };
+        crate::db::repository::insert_recording(
+            &pool,
+            &fin.recording_ref,
+            "segment",
+            &owner_addon_id,
+            &cam_for_db,
+            &fin.final_path.to_string_lossy(),
+            fin.bytes as i64,
+            Some(fin.duration_ms.min(i64::MAX as u64) as i64),
+            None,
+            None,
+            None,
+            &fin.hash_sha256,
+            &retention_class,
+            Some(&org_id),
+            Some(&event_meta_json),
+        )
+        .map(|_| (fin.recording_ref, fin.duration_ms, fin.bytes, fin.part))
+        .map_err(anyhow::Error::from)
+    })
+    .await;
+    match inserted {
+        Ok(Ok((recording_ref, duration_ms, bytes, part))) => {
+            info!(
+                camera_id,
+                recording_ref = %recording_ref,
+                duration_ms,
+                bytes,
+                part,
+                "[event_recorder] event recording saved"
+            );
+        }
+        Ok(Err(e)) => {
+            warn!(
+                camera_id,
+                "[event_recorder] recordings insert failed (compensating purge): {e}"
+            );
+            let _ = tokio::fs::remove_file(&path_for_purge).await;
+        }
+        Err(e) => {
+            warn!(
+                camera_id,
+                "[event_recorder] recordings insert task join failed: {e}"
+            );
+            let _ = tokio::fs::remove_file(&path_for_purge).await;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Video stream wrapper
+// -----------------------------------------------------------------------------
+
+/// Live `camera:<id>` hub subscription plus the CURRENT init segment. The
+/// publisher forwards a rebuilt pipeline's fresh `ftyp`/`moov` boxes through
+/// the media channel, so the recorder mirrors the publisher's own init parse:
+/// a `ftyp` opens `collecting`, non-`moof` boxes append to it, and the next
+/// `moof` seals it as the new `init`.
+struct VideoStream {
+    handle: SubscriptionHandle,
+    init: Bytes,
+    collecting: Option<Vec<u8>>,
+}
+
+/// What a received chunk means for the recorder.
+enum VideoEvent {
+    /// A media segment (starts with `moof`, or a stray forwardable box).
+    Media(Bytes),
+    /// A new init segment was sealed — the PTS axis reset (pipeline rebuild);
+    /// any open file must rotate before the carried media segment (the
+    /// sealing `moof` chunk, first of the new axis) is written.
+    InitReset(Bytes),
+    /// Chunk consumed into the in-progress init collection; nothing to write.
+    Absorbed,
+}
+
+impl VideoStream {
+    async fn subscribe(camera_id: &str) -> Option<Self> {
+        let stream_id = format!("camera:{camera_id}");
+        match StreamHub::global().subscribe(&stream_id).await {
+            Ok(handle) => match handle.init_segment.clone() {
+                Some(init) => Some(Self {
+                    handle,
+                    init,
+                    collecting: None,
+                }),
+                None => {
+                    debug!(
+                        camera_id,
+                        "[event_recorder] subscribe yielded no init segment"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                debug!(camera_id, "[event_recorder] video subscribe failed: {e}");
+                None
+            }
+        }
+    }
+
+    fn classify(&mut self, chunk: Bytes) -> VideoEvent {
+        match fmp4_box_kind(&chunk) {
+            Some(kind) if &kind == b"ftyp" => {
+                self.collecting = Some(chunk.to_vec());
+                VideoEvent::Absorbed
+            }
+            Some(kind) if &kind == b"moof" => {
+                if let Some(collected) = self.collecting.take() {
+                    self.init = Bytes::from(collected);
+                    return VideoEvent::InitReset(chunk);
+                }
+                VideoEvent::Media(chunk)
+            }
+            _ => {
+                if let Some(collected) = self.collecting.as_mut() {
+                    collected.extend_from_slice(&chunk);
+                    return VideoEvent::Absorbed;
+                }
+                VideoEvent::Media(chunk)
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Recorder task
+// -----------------------------------------------------------------------------
+
+/// Returns whether the publish hook may respawn a recorder for this camera
+/// later (`false` = permanently out of scope on this node).
+async fn run_recorder(camera_id: &str) -> bool {
+    // The id becomes a filesystem path component — same containment rule as
+    // every other recording entry point. Real ids (`cam_<uuid>`) always pass;
+    // this shields against synthetic bus publishers with hostile ids.
+    if validate_camera_id(camera_id).is_err() {
+        debug!(
+            camera_id,
+            "[event_recorder] camera id not path-safe, recorder not started"
+        );
+        return false;
+    }
+    // Node-local camera gate + identity for the catalog row. A mesh-remote
+    // camera (its video lives on the owning node) never has a local row.
+    let Some(identity) = camera_identity(camera_id).await else {
+        debug!(
+            camera_id,
+            "[event_recorder] camera is not node-local, recorder not started"
+        );
+        return false;
+    };
+
+    let cfg = crate::vision::settings::get();
+    let hysteresis = Duration::from_secs(cfg.event_stop_hysteresis_secs.max(1));
+    let preroll = Duration::from_secs(cfg.event_preroll_secs);
+    let max_duration = Duration::from_secs(cfg.event_max_duration_secs.max(60));
+
+    info!(
+        camera_id,
+        hysteresis_s = hysteresis.as_secs(),
+        preroll_s = preroll.as_secs(),
+        "[event_recorder] recorder started"
+    );
+
+    let mut det_rx = detection_bus::subscribe(camera_id);
+    let mut sm = EventStateMachine::new(hysteresis);
+    let mut meta = EventMeta::default();
+    let mut ring = PrerollBuffer::default();
+    let mut video: Option<VideoStream> = None;
+    let mut file: Option<ActiveFile> = None;
+    let mut part: u32 = 0;
+    let mut last_bus_msg = Instant::now();
+    let mut video_retry_at = Instant::now();
+    let mut start_blocked_until: Option<Instant> = None;
+    let mut ticker = tokio::time::interval(TICK_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        // Keep the pre-roll subscription warm while idle (only when a pre-roll
+        // window is configured — otherwise Branch B attaches per event).
+        let want_video = !preroll.is_zero() || sm.recording();
+        if want_video && video.is_none() && Instant::now() >= video_retry_at {
+            video = VideoStream::subscribe(camera_id).await;
+            if video.is_none() {
+                video_retry_at = Instant::now() + VIDEO_RETRY;
+            }
+        }
+
+        tokio::select! {
+            msg = det_rx.recv() => match msg {
+                Ok(m) => {
+                    last_bus_msg = Instant::now();
+                    handle_detections(
+                        camera_id, m, &mut sm, &mut meta, &mut ring, &mut video,
+                        &mut file, &mut part, preroll, &mut start_blocked_until,
+                    ).await;
+                }
+                Err(RecvError::Lagged(_)) => { last_bus_msg = Instant::now(); }
+                // The per-camera bus sender lives for the whole process, so
+                // Closed is unreachable today; exit defensively if it ever is.
+                Err(RecvError::Closed) => break,
+            },
+            chunk = video_recv(&mut video), if video.is_some() => match chunk {
+                Ok(chunk) => {
+                    handle_video_chunk(
+                        camera_id, &identity, chunk, &mut sm, &mut meta, &mut ring,
+                        &mut video, &mut file, &mut part, preroll,
+                    ).await;
+                }
+                Err(RecvError::Lagged(n)) => {
+                    // Missed fragments = a gap. While idle the ring just loses
+                    // depth; mid-recording the file keeps only complete
+                    // self-contained segments either side of the gap.
+                    debug!(camera_id, missed = n, "[event_recorder] video broadcast lagged");
+                }
+                Err(RecvError::Closed) => {
+                    // Publisher went terminal (camera stopped / removed /
+                    // reconnecting). Finalize whatever is on disk.
+                    video = None;
+                    video_retry_at = Instant::now() + VIDEO_RETRY;
+                    ring.clear();
+                    if let Some(f) = file.take() {
+                        finalize_and_catalog(camera_id, &identity, f, &meta).await;
+                    }
+                    if sm.recording() {
+                        sm.on_stopped();
+                        meta = EventMeta::default();
+                        part = 0;
+                    }
+                }
+            },
+            _ = ticker.tick() => {
+                let now = Instant::now();
+                if sm.should_stop(now) {
+                    if let Some(f) = file.take() {
+                        finalize_and_catalog(camera_id, &identity, f, &meta).await;
+                    }
+                    sm.on_stopped();
+                    meta = EventMeta::default();
+                    part = 0;
+                    if preroll.is_zero() {
+                        // Release the hub subscription so Branch B detaches
+                        // between events.
+                        video = None;
+                        ring.clear();
+                    }
+                } else if sm.recording() {
+                    // Rotate an endless event (busy gate / stuck detection) so
+                    // no single file grows unbounded.
+                    let rotate = file
+                        .as_ref()
+                        .map(|f| f.opened_at.elapsed() >= max_duration)
+                        .unwrap_or(false);
+                    if rotate {
+                        rotate_file(camera_id, &identity, &mut file, &mut part, &mut video, &meta)
+                            .await;
+                    }
+                }
+                if !sm.recording() && last_bus_msg.elapsed() >= IDLE_EXIT {
+                    debug!(camera_id, "[event_recorder] idle (no analysis frames), exiting");
+                    break;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Awaitable video receive that borrows the optional stream. Only polled when
+/// `video.is_some()` (select guard).
+async fn video_recv(video: &mut Option<VideoStream>) -> Result<Bytes, RecvError> {
+    match video.as_mut() {
+        Some(v) => v.handle.receiver.recv().await,
+        // Guarded out by `if video.is_some()`; pend forever if ever polled.
+        None => std::future::pending().await,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_detections(
+    camera_id: &str,
+    msg: DetectionsMessage,
+    sm: &mut EventStateMachine,
+    meta: &mut EventMeta,
+    ring: &mut PrerollBuffer,
+    video: &mut Option<VideoStream>,
+    file: &mut Option<ActiveFile>,
+    part: &mut u32,
+    preroll: Duration,
+    start_blocked_until: &mut Option<Instant>,
+) {
+    if msg.items.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    if let Some(until) = *start_blocked_until {
+        if !sm.recording() && now < until {
+            return;
+        }
+        *start_blocked_until = None;
+    }
+    let started = sm.on_presence(now);
+    meta.absorb(&msg.items);
+    if !started {
+        return;
+    }
+    *part = 0;
+    // EMPTY → RECORDING: make sure video is up (pre-roll = 0 subscribes here)
+    // and open the file with init + buffered pre-roll.
+    if video.is_none() {
+        *video = VideoStream::subscribe(camera_id).await;
+    }
+    let Some(v) = video.as_ref() else {
+        warn!(
+            camera_id,
+            "[event_recorder] video unavailable, event NOT recorded (retry in {}s)",
+            VIDEO_RETRY.as_secs()
+        );
+        sm.on_stopped();
+        *meta = EventMeta::default();
+        *start_blocked_until = Some(now + VIDEO_RETRY);
+        return;
+    };
+    let preroll_ms = ring.span(now).min(preroll).as_millis() as u64;
+    match ActiveFile::create(camera_id, preroll_ms, *part).await {
+        Ok(mut f) => {
+            let mut ok = f.write(&v.init).await.is_ok();
+            if ok {
+                for seg in ring.drain() {
+                    if f.write(&seg).await.is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                info!(
+                    camera_id,
+                    recording_ref = %f.recording_ref,
+                    preroll_ms,
+                    "[event_recorder] event recording started"
+                );
+                *file = Some(f);
+            } else {
+                warn!(
+                    camera_id,
+                    "[event_recorder] write failed at start, event dropped"
+                );
+                f.discard().await;
+                sm.on_stopped();
+                *meta = EventMeta::default();
+                *start_blocked_until = Some(now + VIDEO_RETRY);
+            }
+        }
+        Err(e) => {
+            warn!(camera_id, "[event_recorder] cannot open event file: {e:#}");
+            sm.on_stopped();
+            *meta = EventMeta::default();
+            *start_blocked_until = Some(now + VIDEO_RETRY);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_video_chunk(
+    camera_id: &str,
+    identity: &(String, String, String),
+    chunk: Bytes,
+    sm: &mut EventStateMachine,
+    meta: &mut EventMeta,
+    ring: &mut PrerollBuffer,
+    video: &mut Option<VideoStream>,
+    file: &mut Option<ActiveFile>,
+    part: &mut u32,
+    preroll: Duration,
+) {
+    let Some(v) = video.as_mut() else { return };
+    let seg = match v.classify(chunk) {
+        VideoEvent::Absorbed => return,
+        VideoEvent::InitReset(seg) => {
+            // New PTS axis: the buffered pre-roll belongs to the old axis and
+            // an open file cannot span the boundary — rotate onto the new
+            // init, then write the carried first segment of the new axis.
+            ring.clear();
+            if sm.recording() && file.is_some() {
+                rotate_file(camera_id, identity, file, part, video, meta).await;
+            }
+            seg
+        }
+        VideoEvent::Media(seg) => seg,
+    };
+    if let Some(f) = file.as_mut() {
+        if let Err(e) = f.write(&seg).await {
+            warn!(
+                camera_id,
+                "[event_recorder] write failed mid-recording: {e}"
+            );
+            if let Some(f) = file.take() {
+                finalize_and_catalog(camera_id, identity, f, meta).await;
+            }
+            sm.on_stopped();
+            *meta = EventMeta::default();
+            *part = 0;
+        }
+    } else if !preroll.is_zero() {
+        ring.push(Instant::now(), preroll, seg);
+    }
+}
+
+/// Finalize the open file and immediately continue the SAME event in a fresh
+/// file (max-duration rotation or a pipeline-rebuild init reset). On any
+/// failure the event simply ends — the next detection re-triggers cleanly.
+async fn rotate_file(
+    camera_id: &str,
+    identity: &(String, String, String),
+    file: &mut Option<ActiveFile>,
+    part: &mut u32,
+    video: &mut Option<VideoStream>,
+    meta: &EventMeta,
+) {
+    if let Some(f) = file.take() {
+        finalize_and_catalog(camera_id, identity, f, meta).await;
+    }
+    *part += 1;
+    let Some(v) = video.as_ref() else { return };
+    match ActiveFile::create(camera_id, 0, *part).await {
+        Ok(mut f) => {
+            if f.write(&v.init).await.is_ok() {
+                *file = Some(f);
+            } else {
+                warn!(camera_id, "[event_recorder] rotation init write failed");
+                f.discard().await;
+            }
+        }
+        Err(e) => warn!(camera_id, "[event_recorder] rotation open failed: {e:#}"),
+    }
+}
+
+async fn finalize_and_catalog(
+    camera_id: &str,
+    identity: &(String, String, String),
+    file: ActiveFile,
+    meta: &EventMeta,
+) {
+    match file.finalize().await {
+        Ok(fin) => {
+            let json = meta.to_json(
+                fin.started_wall_ms,
+                fin.stopped_wall_ms,
+                fin.preroll_ms,
+                fin.part,
+            );
+            insert_event_row(camera_id, identity, fin, json).await;
+        }
+        Err(e) => warn!(
+            camera_id,
+            "[event_recorder] finalize failed, file dropped: {e:#}"
+        ),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn det(klasa: &str, tekst: Option<&str>, stan: &[&str], track_id: u32) -> Detection {
+        Detection {
+            klasa: klasa.into(),
+            bbox: [0.1, 0.1, 0.2, 0.2],
+            score: 0.9,
+            stan: stan.iter().map(|s| s.to_string()).collect(),
+            tekst: tekst.map(str::to_string),
+            track_id,
+            vx: 0.,
+            vy: 0.,
+        }
+    }
+
+    #[test]
+    fn state_machine_starts_on_first_presence() {
+        let mut sm = EventStateMachine::new(Duration::from_secs(10));
+        let t0 = Instant::now();
+        assert!(!sm.recording());
+        assert!(sm.on_presence(t0), "first presence must start a recording");
+        assert!(sm.recording());
+        assert!(
+            !sm.on_presence(t0 + Duration::from_secs(1)),
+            "presence while recording must not re-start"
+        );
+    }
+
+    #[test]
+    fn state_machine_stops_after_hysteresis() {
+        let mut sm = EventStateMachine::new(Duration::from_secs(10));
+        let t0 = Instant::now();
+        sm.on_presence(t0);
+        assert!(!sm.should_stop(t0 + Duration::from_secs(9)));
+        assert!(sm.should_stop(t0 + Duration::from_secs(10)));
+        sm.on_stopped();
+        assert!(!sm.recording());
+        assert!(!sm.should_stop(t0 + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn state_machine_retrigger_extends_recording() {
+        let mut sm = EventStateMachine::new(Duration::from_secs(10));
+        let t0 = Instant::now();
+        sm.on_presence(t0);
+        // A new vehicle 8 s in (inside the hysteresis window) extends the
+        // SAME recording: the stop deadline moves to last presence + 10 s.
+        assert!(!sm.on_presence(t0 + Duration::from_secs(8)));
+        assert!(!sm.should_stop(t0 + Duration::from_secs(17)));
+        assert!(sm.should_stop(t0 + Duration::from_secs(18)));
+    }
+
+    #[test]
+    fn event_meta_accumulates_votes() {
+        let mut meta = EventMeta::default();
+        meta.absorb(&[
+            det("tablica_adr", Some("30/1202"), &[], 7),
+            det("tablica_rejestracyjna", Some("WGM12345"), &[], 8),
+        ]);
+        meta.absorb(&[det("tablica_adr", Some("30/1202"), &["uszkodzona"], 7)]);
+        meta.absorb(&[]); // empty frames are ignored
+        assert_eq!(meta.frames, 2);
+        assert_eq!(meta.classes["tablica_adr"], 2);
+        assert_eq!(meta.texts["tablica_adr"]["30/1202"], 2);
+        assert_eq!(meta.texts["tablica_rejestracyjna"]["WGM12345"], 1);
+        assert_eq!(meta.stan["uszkodzona"], 1);
+        assert_eq!(meta.tracks.len(), 2);
+
+        let v: serde_json::Value =
+            serde_json::from_str(&meta.to_json(1_000, 21_000, 5_000, 0)).expect("valid json");
+        assert_eq!(v["event"], "vehicle_presence");
+        assert_eq!(v["start_ts_ms"], 1_000);
+        assert_eq!(v["stop_ts_ms"], 21_000);
+        assert_eq!(v["preroll_ms"], 5_000);
+        assert_eq!(v["texts"]["tablica_adr"]["30/1202"], 2);
+        assert_eq!(v["tracks"], 2);
+    }
+
+    #[test]
+    fn preroll_buffer_trims_by_time() {
+        let mut ring = PrerollBuffer::default();
+        let window = Duration::from_secs(5);
+        let t0 = Instant::now();
+        ring.push(t0, window, Bytes::from_static(b"a"));
+        ring.push(
+            t0 + Duration::from_secs(3),
+            window,
+            Bytes::from_static(b"b"),
+        );
+        // 7 s later the first fragment is out of the window and gets trimmed.
+        ring.push(
+            t0 + Duration::from_secs(7),
+            window,
+            Bytes::from_static(b"c"),
+        );
+        let drained = ring.drain();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(&drained[0][..], b"b");
+        assert_eq!(&drained[1][..], b"c");
+        assert_eq!(ring.bytes, 0);
+    }
+
+    #[test]
+    fn preroll_span_reports_achieved_window() {
+        let mut ring = PrerollBuffer::default();
+        let window = Duration::from_secs(5);
+        let t0 = Instant::now();
+        assert_eq!(ring.span(t0), Duration::ZERO);
+        ring.push(t0, window, Bytes::from_static(b"a"));
+        assert_eq!(
+            ring.span(t0 + Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+    }
+
+    fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = (8 + payload.len()) as u32;
+        let mut out = size.to_be_bytes().to_vec();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn box_kind_parses_top_level_fourcc() {
+        assert_eq!(fmp4_box_kind(&mp4_box(b"moof", &[1, 2])), Some(*b"moof"));
+        assert_eq!(fmp4_box_kind(&mp4_box(b"ftyp", &[])), Some(*b"ftyp"));
+        assert_eq!(fmp4_box_kind(&[0, 0]), None);
+    }
+}

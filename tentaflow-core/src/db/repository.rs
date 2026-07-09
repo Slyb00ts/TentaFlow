@@ -21848,6 +21848,30 @@ pub fn camera_analysis_fps(pool: &DbPool, camera_id: &str) -> Result<u32> {
     Ok(fps.map(|v| v.clamp(0, 30) as u32).unwrap_or(10))
 }
 
+/// Identity columns the per-vehicle event recorder stamps onto its catalog
+/// rows: `(owner_addon_id, org_id, retention_class)` of the active LOCAL
+/// camera, or `None` when no such camera exists on this node. Process-wide
+/// lookup (no org/addon filter) like [`camera_analysis_fps`] — the recorder is
+/// a node authority keyed by `camera_id`; remote-node cameras (mesh relay) are
+/// never in the node-local `cameras` table, so `None` doubles as the "do not
+/// record cameras whose video lives elsewhere" gate.
+#[cfg(feature = "camera")]
+pub fn camera_recording_identity(
+    pool: &DbPool,
+    camera_id: &str,
+) -> Result<Option<(String, String, String)>> {
+    let conn = acquire(pool)?;
+    let row = conn
+        .query_row(
+            "SELECT owner_addon_id, org_id, retention_class FROM cameras \
+             WHERE camera_id = ?1 AND removed_at IS NULL",
+            rusqlite::params![camera_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    Ok(row)
+}
+
 /// Per-camera depth-mapping configuration. When `enabled`, the depth loop feeds
 /// a world point cloud (reconstructed from a metric depth model) into the shared
 /// SLAM map under `robot_id`. `fov_deg` is the horizontal field of view used to
@@ -22866,12 +22890,16 @@ pub struct RecordingRow {
     pub retention_class: String,
     pub created_at: i64,
     pub purged_at: Option<i64>,
+    /// JSON summary written by the per-vehicle event recorder (classes seen,
+    /// plate/ADR OCR votes, event time range). NULL for addon-saved artifacts.
+    pub event_meta: Option<String>,
 }
 
 #[cfg(feature = "camera")]
 const RECORDING_SELECT_COLS: &str =
     "id, ref, kind, owner_addon_id, camera_id, file_path, file_size_bytes, duration_ms, \
-     width, height, pixel_format, hash_sha256, retention_class, created_at, purged_at";
+     width, height, pixel_format, hash_sha256, retention_class, created_at, purged_at, \
+     event_meta";
 
 #[cfg(feature = "camera")]
 fn row_to_recording(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordingRow> {
@@ -22891,6 +22919,7 @@ fn row_to_recording(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordingRow> {
         retention_class: row.get(12)?,
         created_at: row.get(13)?,
         purged_at: row.get(14)?,
+        event_meta: row.get(15)?,
     })
 }
 
@@ -22935,6 +22964,7 @@ pub fn insert_recording(
     hash_sha256: &str,
     retention_class: &str,
     org_id: Option<&str>,
+    event_meta: Option<&str>,
 ) -> Result<i64> {
     let conn = acquire(pool)?;
     let now = chrono::Utc::now().timestamp();
@@ -22945,8 +22975,8 @@ pub fn insert_recording(
         "INSERT INTO recordings \
          (ref, kind, owner_addon_id, camera_id, file_path, file_size_bytes, \
           duration_ms, width, height, pixel_format, hash_sha256, \
-          retention_class, created_at, purged_at, org_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14)",
+          retention_class, created_at, purged_at, org_id, event_meta) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, ?15)",
         rusqlite::params![
             recording_ref,
             kind,
@@ -22962,6 +22992,7 @@ pub fn insert_recording(
             retention_class,
             now,
             resolved_org,
+            event_meta,
         ],
     )?;
     Ok(conn.last_insert_rowid())

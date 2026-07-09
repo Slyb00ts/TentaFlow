@@ -163,6 +163,12 @@ pub fn publish_detections(
     proc_ms: u32,
     items: Vec<Detection>,
 ) {
+    // Per-vehicle event recording rides the same bus: the hook lazily spawns a
+    // recorder task for this camera (cheap set-probe once one exists). Fired
+    // for EMPTY frames too, so the recorder's pre-roll buffer is warm before
+    // the first vehicle of the day.
+    #[cfg(feature = "camera")]
+    crate::services::event_recorder::on_detections_published(camera_id);
     let msg = DetectionsMessage::new(camera_id.to_string(), ts_ms, pts_ns, proc_ms, items);
     // `send` zwraca Err tylko gdy nie ma zadnych odbiorcow — ignorujemy.
     let _ = detection_bus().sender(camera_id).send(msg);
