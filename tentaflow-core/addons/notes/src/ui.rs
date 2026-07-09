@@ -15,19 +15,21 @@ use serde_json::{json, Value as JsonValue};
 
 use tentaflow_addon_sdk::ui_v1::{self as ui, backend, bound, lit, lit_value, render, state_path};
 use tentaflow_addon_sdk::ui_v1::{
-    Avatar, AvatarRef, AvatarShape, AvatarSize, Badge, BadgeVariant, BindRef, BorderToken, Button,
-    ButtonSize, ButtonVariant, CachePolicy, Card, CardVariant, CborMap, Chip, ChipVariant, Cluster,
-    Component, Density, DimensionToken, Divider, DividerOrientation, DividerVariant, EmptyState,
+    Accessibility, Avatar, AvatarRef, AvatarShape, AvatarSize, Badge, BadgeVariant, BindRef,
+    BorderColor, BorderEdges, BorderSide, BorderToken, Button, ButtonSize, ButtonVariant,
+    CachePolicy, Card, CardVariant, CborMap, Chip, ChipVariant, Cluster, Component, CornerValues,
+    Density, DimensionToken, Divider, DividerOrientation, DividerVariant, EmptyState,
     EmptyStateVariant, EventKind, FailurePolicy, FilterChipDef, FilterChips, FilterChipsMode, Flex,
-    FlexAlign, FlexDirection, FlexJustify, FlexWrap, Handler, HandlerMap, IconName, IconRef, Input,
-    InputSize, InputType, PanelShell, PatchOp, PatchOpKind, ScrollContainer, ScrollOrientation,
-    SearchBox, SearchVariant, SectionHeader, Select, SelectOption, SelectValue, ShadowToken,
-    SlotContent, SlotDecl, SlotDefault, SlotSemantics, SlotVisibility, Spacing, Split,
-    SplitOrientation, SplitSize, StateEntry, StatePatch, TagInput, Text, TextStyle, Textarea, Tone,
-    UiPayload, Value as CborValue, ValueFormat,
+    FlexAlign, FlexDirection, FlexJustify, FlexWrap, Handler, HandlerMap, Heading, IconName,
+    IconRef, Input, InputSize, InputType, PanelShell, PatchOp, PatchOpKind, RadiusValue,
+    ScrollContainer, ScrollOrientation, SearchBox, SearchVariant, SectionHeader, Select,
+    SelectOption, SelectValue, ShadowToken, SlotContent, SlotDecl, SlotDefault, SlotSemantics,
+    SlotVisibility, Spacing, Split, SplitOrientation, SplitSize, StateEntry, StatePatch, TagInput,
+    Text, TextStyle, Textarea, Tone, UiPayload, Value as CborValue, ValueFormat, Visibility,
 };
 use tentaflow_addon_sdk::{state_get, state_set, StateTier};
 
+use crate::analysis;
 use crate::db::{self, NoteDetail, NoteSummary, UserCtx};
 
 pub const ADDON_ID: &str = "notes";
@@ -44,7 +46,11 @@ const SP_CONTENT: &str = "note.content";
 const SP_TAGS: &str = "note.tags";
 const SP_SHARE: &str = "note.share_mode";
 const SP_SAVE_STATUS: &str = "editor.save_status";
+const SP_SAVE_ERROR: &str = "editor.save_error";
+const SP_SAVE_OK_VIS: &str = "editor.save_ok_visible";
+const SP_SAVE_ERR_VIS: &str = "editor.save_err_visible";
 const SP_CHAR_COUNT: &str = "editor.char_count";
+const SP_LINK_PICK: &str = "links.pick";
 
 // Hard server-side input limits (client caps mirror them where the component
 // supports one). Values beyond a limit are rejected with a readable message
@@ -114,6 +120,8 @@ struct Session {
     scope: String,
     search: String,
     active: String,
+    /// Manual-link picker open in the links panel of the active note.
+    link_picker: bool,
 }
 
 impl Default for Session {
@@ -122,6 +130,7 @@ impl Default for Session {
             scope: "all".to_string(),
             search: String::new(),
             active: String::new(),
+            link_picker: false,
         }
     }
 }
@@ -138,13 +147,19 @@ fn load_session() -> Session {
             scope: v["scope"].as_str().unwrap_or("all").to_string(),
             search: v["search"].as_str().unwrap_or("").to_string(),
             active: v["active"].as_str().unwrap_or("").to_string(),
+            link_picker: v["link_picker"].as_bool().unwrap_or(false),
         },
         None => Session::default(),
     }
 }
 
 fn store_session(sess: &Session) {
-    let v = json!({"scope": sess.scope, "search": sess.search, "active": sess.active});
+    let v = json!({
+        "scope": sess.scope,
+        "search": sess.search,
+        "active": sess.active,
+        "link_picker": sess.link_picker,
+    });
     let _ = state_set(
         &session_key(),
         v.to_string().as_bytes(),
@@ -177,13 +192,6 @@ fn send_state_patch(ops: Vec<PatchOp>) {
             STATE_REVISION = new;
         }
     }
-}
-
-fn patch_set(key: &str, value: CborValue) {
-    send_state_patch(vec![PatchOp {
-        path: state_path(key),
-        op: PatchOpKind::Set { value },
-    }]);
 }
 
 fn send_slot(slot_id: &str, fragment: Component, overlay: Option<Vec<StateEntry>>) {
@@ -223,6 +231,51 @@ fn icon(name: IconName) -> IconRef {
         size: None,
         tone: None,
     }
+}
+
+/// Accessible name for label-less form components — the form renderers REJECT
+/// SearchBox / Input / Textarea without one and the whole SlotContent is
+/// dropped (tentavision pattern).
+fn with_a11y_label(mut component: Component, label: &str) -> Component {
+    component.a11y = Some(Accessibility {
+        label: Some(lit(label)),
+        ..Default::default()
+    });
+    component
+}
+
+/// Reactive visibility bound to a boolean state path (`false` hides).
+fn with_visible_bound(mut component: Component, path: &str) -> Component {
+    component.visibility = Some(Visibility {
+        visible: Some(bound(path)),
+        display_above_breakpoint: None,
+        display_below_breakpoint: None,
+        hidden_for_assistive: false,
+    });
+    component
+}
+
+/// One state patch that drives the autosave indicator: success badge with the
+/// message, error badge hidden (or the reverse).
+fn save_feedback_ops(ok: Option<&str>, err: Option<&str>) -> Vec<PatchOp> {
+    let set = |path: &str, value: CborValue| PatchOp {
+        path: state_path(path),
+        op: PatchOpKind::Set { value },
+    };
+    vec![
+        set(SP_SAVE_STATUS, CborValue::Text(ok.unwrap_or("").to_string())),
+        set(SP_SAVE_ERROR, CborValue::Text(err.unwrap_or("").to_string())),
+        set(SP_SAVE_OK_VIS, CborValue::Bool(ok.is_some())),
+        set(SP_SAVE_ERR_VIS, CborValue::Bool(err.is_some())),
+    ]
+}
+
+fn feedback_ok(message: &str) {
+    send_state_patch(save_feedback_ops(Some(message), None));
+}
+
+fn feedback_err(message: &str) {
+    send_state_patch(save_feedback_ops(None, Some(message)));
 }
 
 fn text_c(id: &str, content: BindRef, style: TextStyle, tone: Option<Tone>) -> Component {
@@ -280,8 +333,66 @@ fn initials(display_name: &str) -> String {
 // Panel shell
 // =============================================================================
 
+/// Addon topbar (mockup n01): panel title on the left, auto-graph status pill
+/// on the right. The pill reflects the REAL alias state at panel open — both
+/// notes-embeddings and notes-llm bound = analysis runs; otherwise the admin
+/// is pointed at alias configuration. The mode switch (Notatki/Graf/Szukaj)
+/// lands with the graph/search stages.
+fn topbar() -> Component {
+    let title = Heading {
+        content: lit("Notatki"),
+        level: 3,
+        tone: None,
+        align: None,
+    }
+    .into_component("topbar-title")
+    .expect("Heading encode");
+
+    let status: Component = if analysis::auto_graph_ready() {
+        Badge {
+            variant: BadgeVariant::Soft,
+            tone: Tone::Success,
+            label: lit("Auto-graf aktywny"),
+            icon: Some(icon(IconName::Check)),
+            count: None,
+            max: 0,
+            pulse: false,
+        }
+        .into_component("topbar-status")
+        .expect("Badge encode")
+    } else {
+        Badge {
+            variant: BadgeVariant::Soft,
+            tone: Tone::Warning,
+            label: lit("Auto-graf: skonfiguruj aliasy"),
+            icon: Some(icon(IconName::Warning)),
+            count: None,
+            max: 0,
+            pulse: false,
+        }
+        .into_component("topbar-status")
+        .expect("Badge encode")
+    };
+
+    Flex {
+        direction: FlexDirection::Row,
+        gap: Spacing::Md,
+        justify: FlexJustify::SpaceBetween,
+        align: FlexAlign::Center,
+        wrap: FlexWrap::Wrap,
+        children: vec![title, status],
+        padding: Some(Spacing::Sm),
+        background: Some(ui::BackgroundToken::Subtle),
+        radius: Some(ui::RadiusToken::Lg),
+        style: None,
+        responsive: None,
+    }
+    .into_component("topbar")
+    .expect("Flex encode")
+}
+
 pub fn send_panel_shell() {
-    let layout = Split {
+    let split = Split {
         orientation: SplitOrientation::Horizontal,
         primary_size: SplitSize::Px { value: 300 },
         min_primary: 240,
@@ -290,8 +401,24 @@ pub fn send_panel_shell() {
         primary_slot: SLOT_LIST.into(),
         secondary_slot: SLOT_MAIN.into(),
     }
-    .into_component("root")
+    .into_component("split")
     .expect("Split encode");
+
+    let layout = Flex {
+        direction: FlexDirection::Column,
+        gap: Spacing::Md,
+        justify: FlexJustify::Start,
+        align: FlexAlign::Stretch,
+        wrap: FlexWrap::NoWrap,
+        children: vec![topbar(), split],
+        padding: None,
+        background: None,
+        radius: None,
+        style: None,
+        responsive: None,
+    }
+    .into_component("root")
+    .expect("Flex encode");
 
     let shell = PanelShell {
         addon_id: ADDON_ID.into(),
@@ -332,7 +459,23 @@ pub fn send_panel_shell() {
                 value: CborValue::Text(String::new()),
             },
             StateEntry {
+                path: state_path(SP_SAVE_ERROR),
+                value: CborValue::Text(String::new()),
+            },
+            StateEntry {
+                path: state_path(SP_SAVE_OK_VIS),
+                value: CborValue::Bool(false),
+            },
+            StateEntry {
+                path: state_path(SP_SAVE_ERR_VIS),
+                value: CborValue::Bool(false),
+            },
+            StateEntry {
                 path: state_path(SP_CHAR_COUNT),
+                value: CborValue::Text(String::new()),
+            },
+            StateEntry {
+                path: state_path(SP_LINK_PICK),
                 value: CborValue::Text(String::new()),
             },
         ],
@@ -383,16 +526,19 @@ fn list_fragment(notes: &[NoteSummary], sess: &Session) -> Component {
 
     // Change (commit/blur/Enter) instead of Input: the search box lives in this
     // slot, so a per-keystroke re-render would destroy it and kill focus.
-    let mut search = SearchBox {
-        bind_path: state_path(SP_SEARCH),
-        placeholder: lit("Szukaj w notatkach…"),
-        debounce_ms: 300,
-        variant: SearchVariant::Default,
-        shortcut_hint: None,
-        on_search_action_id: None,
-    }
-    .into_component("list-search")
-    .expect("SearchBox encode");
+    let mut search = with_a11y_label(
+        SearchBox {
+            bind_path: state_path(SP_SEARCH),
+            placeholder: lit("Szukaj w notatkach…"),
+            debounce_ms: 300,
+            variant: SearchVariant::Default,
+            shortcut_hint: None,
+            on_search_action_id: None,
+        }
+        .into_component("list-search")
+        .expect("SearchBox encode"),
+        "Szukaj w notatkach",
+    );
     search.handlers = Some(backend(EventKind::Change, "set_search"));
 
     let chip = |id: &str, label: &str| FilterChipDef {
@@ -455,7 +601,7 @@ fn list_fragment(notes: &[NoteSummary], sess: &Session) -> Component {
         padding: Some(Spacing::Sm),
         margin: None,
         children: vec![new_btn, search, chips, body],
-        style: Some(full_height_style()),
+        style: Some(panel_style()),
         direction: Some(FlexDirection::Column),
         gap: Some(Spacing::Sm),
         align: Some(FlexAlign::Stretch),
@@ -671,21 +817,43 @@ fn editor_overlay(n: &NoteDetail) -> Vec<StateEntry> {
             path: state_path(SP_CHAR_COUNT),
             value: CborValue::Text(db::counter_label(&n.content)),
         },
-        StateEntry {
-            path: state_path(SP_SAVE_STATUS),
-            value: CborValue::Text(String::new()),
-        },
     ]
+    .into_iter()
+    .chain(feedback_reset_entries())
+    .collect()
 }
 
 fn empty_editor_overlay() -> Vec<StateEntry> {
+    std::iter::once(StateEntry {
+        path: state_path(SP_CHAR_COUNT),
+        value: CborValue::Text(String::new()),
+    })
+    .chain(feedback_reset_entries())
+    .collect()
+}
+
+/// Overlay entries clearing the autosave indicator and the link picker
+/// selection on every editor (re)render.
+fn feedback_reset_entries() -> Vec<StateEntry> {
     vec![
         StateEntry {
             path: state_path(SP_SAVE_STATUS),
             value: CborValue::Text(String::new()),
         },
         StateEntry {
-            path: state_path(SP_CHAR_COUNT),
+            path: state_path(SP_SAVE_ERROR),
+            value: CborValue::Text(String::new()),
+        },
+        StateEntry {
+            path: state_path(SP_SAVE_OK_VIS),
+            value: CborValue::Bool(false),
+        },
+        StateEntry {
+            path: state_path(SP_SAVE_ERR_VIS),
+            value: CborValue::Bool(false),
+        },
+        StateEntry {
+            path: state_path(SP_LINK_PICK),
             value: CborValue::Text(String::new()),
         },
     ]
@@ -727,29 +895,32 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
         Some(BindRef::Literal(CborValue::Bool(true)))
     };
 
-    let mut title = Input {
-        r#type: InputType::Text,
-        bind_path: state_path(SP_TITLE),
-        placeholder: Some(lit("Tytuł notatki…")),
-        label: None,
-        hint: None,
-        leading_icon: None,
-        trailing_icon: None,
-        prefix: None,
-        suffix: None,
-        validators: vec![],
-        max_length: Some(MAX_TITLE_CHARS as u16),
-        min_length: None,
-        pattern: None,
-        autocomplete: None,
-        input_mode: None,
-        disabled: None,
-        readonly: readonly_bind.clone(),
-        error: None,
-        size: InputSize::Lg,
-    }
-    .into_component("note-title")
-    .expect("Input encode");
+    let mut title = with_a11y_label(
+        Input {
+            r#type: InputType::Text,
+            bind_path: state_path(SP_TITLE),
+            placeholder: Some(lit("Tytuł notatki…")),
+            label: None,
+            hint: None,
+            leading_icon: None,
+            trailing_icon: None,
+            prefix: None,
+            suffix: None,
+            validators: vec![],
+            max_length: Some(MAX_TITLE_CHARS as u16),
+            min_length: None,
+            pattern: None,
+            autocomplete: None,
+            input_mode: None,
+            disabled: None,
+            readonly: readonly_bind.clone(),
+            error: None,
+            size: InputSize::Lg,
+        }
+        .into_component("note-title")
+        .expect("Input encode"),
+        "Tytuł notatki",
+    );
     if n.can_write {
         title.handlers = Some(backend_params(
             EventKind::Change,
@@ -919,25 +1090,28 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
     .into_component("editor-divider")
     .expect("Divider encode");
 
-    let mut content = Textarea {
-        bind_path: state_path(SP_CONTENT),
-        placeholder: Some(lit("Zacznij pisać…")),
-        label: None,
-        hint: None,
-        validators: vec![],
-        max_length: None,
-        min_length: None,
-        disabled: None,
-        readonly: readonly_bind,
-        error: None,
-        size: InputSize::Md,
-        rows: 18,
-        autoresize: true,
-        max_rows: None,
-        monospace: false,
-    }
-    .into_component("note-content")
-    .expect("Textarea encode");
+    let mut content = with_a11y_label(
+        Textarea {
+            bind_path: state_path(SP_CONTENT),
+            placeholder: Some(lit("Zacznij pisać…")),
+            label: None,
+            hint: None,
+            validators: vec![],
+            max_length: None,
+            min_length: None,
+            disabled: None,
+            readonly: readonly_bind,
+            error: None,
+            size: InputSize::Md,
+            rows: 18,
+            autoresize: true,
+            max_rows: None,
+            monospace: false,
+        }
+        .into_component("note-content")
+        .expect("Textarea encode"),
+        "Treść notatki",
+    );
     if n.can_write {
         content.handlers = Some(backend_params(
             EventKind::Change,
@@ -955,15 +1129,40 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
         TextStyle::Caption,
         Some(Tone::Muted),
     );
-    let save_status = text_c(
-        "save-status",
-        bound(SP_SAVE_STATUS),
-        TextStyle::Caption,
-        Some(Tone::Success),
+    // Autosave indicator (mockup n01: "✓ Zapisano · przed chwilą"): a success
+    // badge and a danger badge sharing the spot, toggled by StatePatch only —
+    // the editor slot is never re-rendered while typing.
+    let save_ok = with_visible_bound(
+        Badge {
+            variant: BadgeVariant::Soft,
+            tone: Tone::Success,
+            label: bound(SP_SAVE_STATUS),
+            icon: Some(icon(IconName::Check)),
+            count: None,
+            max: 0,
+            pulse: false,
+        }
+        .into_component("save-ok")
+        .expect("Badge encode"),
+        SP_SAVE_OK_VIS,
+    );
+    let save_err = with_visible_bound(
+        Badge {
+            variant: BadgeVariant::Soft,
+            tone: Tone::Critical,
+            label: bound(SP_SAVE_ERROR),
+            icon: Some(icon(IconName::Warning)),
+            count: None,
+            max: 0,
+            pulse: false,
+        }
+        .into_component("save-err")
+        .expect("Badge encode"),
+        SP_SAVE_ERR_VIS,
     );
 
     let mut toolbar_children = vec![counter];
-    let mut right = vec![save_status];
+    let mut right = vec![save_ok, save_err];
     if n.can_write {
         let mut delete_btn = Button {
             variant: ButtonVariant::Ghost,
@@ -1021,7 +1220,7 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
         padding: Some(Spacing::Md),
         margin: None,
         children: vec![title, meta, divider, content, toolbar],
-        style: Some(full_height_style()),
+        style: Some(panel_style()),
         direction: Some(FlexDirection::Column),
         gap: Some(Spacing::Sm),
         align: Some(FlexAlign::Stretch),
@@ -1033,9 +1232,13 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
 }
 
 // =============================================================================
-// Right column — links panel (real empty states; data appears once the
-// auto-graph stage populates note_links / note_entities)
+// Right column — links panel: analysis status, related-note cards (weight %,
+// reason, "nowe" chip for links younger than 24 h), detected entity chips,
+// open merge suggestions (Scal / Odrzuć) and recent merges (Cofnij).
 // =============================================================================
+
+/// Links younger than this show the "nowe" chip (mockup n01).
+const FRESH_LINK_SECS: i64 = 86_400;
 
 fn links_header() -> Component {
     SectionHeader {
@@ -1068,7 +1271,7 @@ fn links_placeholder() -> Component {
             .into_component("links-none")
             .expect("EmptyState encode"),
         ],
-        style: Some(full_height_style()),
+        style: Some(panel_style()),
         direction: Some(FlexDirection::Column),
         gap: Some(Spacing::Md),
         align: Some(FlexAlign::Stretch),
@@ -1082,6 +1285,37 @@ fn links_placeholder() -> Component {
 fn links_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
     let related = db::related_notes(ctx, &n.id).unwrap_or_default();
     let entities = db::note_entities(ctx, &n.id).unwrap_or_default();
+    let entity_ids: Vec<String> = entities.iter().map(|e| e.id.clone()).collect();
+    let suggestions = analysis::open_suggestions_for(ctx, &entity_ids);
+    let recent_merges = analysis::recent_merges_for(ctx, &entity_ids);
+    let now = db::now_unix();
+    let picker_open = load_session().link_picker;
+
+    let mut children = vec![links_header()];
+
+    if let Some((attempts, last_error)) = analysis::queue_state(&n.id) {
+        let status = if analysis::is_pending(attempts) {
+            text_c(
+                "analysis-status",
+                lit("W kolejce analizy…"),
+                TextStyle::Caption,
+                Some(Tone::Muted),
+            )
+        } else {
+            let detail = if last_error.is_empty() {
+                "Analiza nie powiodła się.".to_string()
+            } else {
+                format!("Analiza nie powiodła się: {last_error}")
+            };
+            text_c(
+                "analysis-status",
+                lit(detail),
+                TextStyle::Caption,
+                Some(Tone::Critical),
+            )
+        };
+        children.push(status);
+    }
 
     let related_section: Component = if related.is_empty() {
         EmptyState {
@@ -1102,7 +1336,7 @@ fn links_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
             children: related
                 .iter()
                 .enumerate()
-                .map(|(i, r)| related_card(i, r))
+                .map(|(i, r)| related_card(i, r, now))
                 .collect(),
             sticky_header_slot: None,
             virtualize: false,
@@ -1111,6 +1345,7 @@ fn links_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
         .into_component("related-list")
         .expect("ScrollContainer encode")
     };
+    children.push(related_section);
 
     let entities_header = SectionHeader {
         title: lit("Wykryte encje"),
@@ -1120,6 +1355,7 @@ fn links_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
     }
     .into_component("entities-header")
     .expect("SectionHeader encode");
+    children.push(entities_header);
 
     let entities_section: Component = if entities.is_empty() {
         text_c(
@@ -1136,13 +1372,55 @@ fn links_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
             children: entities
                 .iter()
                 .enumerate()
-                .map(|(i, (name, etype))| entity_chip(i, name, etype))
+                .map(|(i, e)| entity_chip(i, &e.name, &e.entity_type))
                 .collect(),
             wrap: Some(true),
         }
         .into_component("entity-chips")
         .expect("Cluster encode")
     };
+    children.push(entities_section);
+
+    if !suggestions.is_empty() {
+        children.push(
+            SectionHeader {
+                title: lit("Sugestia scalenia"),
+                subtitle: None,
+                actions: vec![],
+                divider: false,
+            }
+            .into_component("merge-header")
+            .expect("SectionHeader encode"),
+        );
+        for (i, s) in suggestions.iter().enumerate() {
+            children.push(merge_suggestion_card(i, s));
+        }
+    }
+
+    for (i, m) in recent_merges.iter().enumerate() {
+        children.push(recent_merge_card(i, m));
+    }
+
+    if picker_open {
+        children.push(manual_link_picker(ctx, n));
+    } else {
+        let mut add_btn = Button {
+            variant: ButtonVariant::Ghost,
+            tone: Tone::Neutral,
+            label: lit("Dodaj powiązanie ręcznie"),
+            icon_leading: Some(icon(IconName::Plus)),
+            icon_trailing: None,
+            size: ButtonSize::Sm,
+            full_width: true,
+            disabled: None,
+            loading: None,
+            density: Density::Compact,
+        }
+        .into_component("btn-add-link")
+        .expect("Button encode");
+        add_btn.handlers = Some(backend(EventKind::Click, "manual_link_open"));
+        children.push(add_btn);
+    }
 
     ui::Box {
         width: None,
@@ -1150,13 +1428,8 @@ fn links_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
         align_self: None,
         padding: Some(Spacing::Md),
         margin: None,
-        children: vec![
-            links_header(),
-            related_section,
-            entities_header,
-            entities_section,
-        ],
-        style: Some(full_height_style()),
+        children,
+        style: Some(panel_style()),
         direction: Some(FlexDirection::Column),
         gap: Some(Spacing::Md),
         align: Some(FlexAlign::Stretch),
@@ -1167,25 +1440,144 @@ fn links_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
     .expect("Box encode")
 }
 
-fn related_card(index: usize, r: &JsonValue) -> Component {
-    let title = r["title"].as_str().unwrap_or("(bez tytułu)");
-    let reason = r["reason"].as_str().unwrap_or("");
-    let note_id = r["id"].as_str().unwrap_or("");
+/// Manual-link picker: a select over the notes the user can read (minus the
+/// open note), confirm-on-change, plus a cancel button. Selecting a note
+/// inserts a note_links row of kind 'manual' (weight 1.0, both directions).
+fn manual_link_picker(ctx: &UserCtx, n: &NoteDetail) -> Component {
+    let candidates = db::list_notes(ctx, "all", "").unwrap_or_default();
+    let options: Vec<SelectOption> = candidates
+        .iter()
+        .filter(|c| c.id != n.id)
+        .take(50)
+        .map(|c| SelectOption {
+            value: SelectValue::Text(c.id.clone()),
+            label: lit(if c.title.is_empty() {
+                "(bez tytułu)"
+            } else {
+                &c.title
+            }),
+            icon: Some(icon(IconName::FileText)),
+            disabled: false,
+            group_id: None,
+            description: None,
+        })
+        .collect();
 
-    let mut children = vec![text_c(
-        &format!("rel-{index}-title"),
-        lit(title),
-        TextStyle::BodyStrong,
-        None,
-    )];
-    if !reason.is_empty() {
-        children.push(text_c(
+    let mut select = Select {
+        bind_path: state_path(SP_LINK_PICK),
+        options,
+        placeholder: Some(lit("Wybierz notatkę…")),
+        label: Some(lit("Dodaj powiązanie")),
+        searchable: true,
+        clearable: false,
+        virtualize: false,
+        disabled: None,
+        size: InputSize::Sm,
+        groups: None,
+    }
+    .into_component("link-pick")
+    .expect("Select encode");
+    select.handlers = Some(backend_params(
+        EventKind::Change,
+        "manual_link_add",
+        vec![("note_id", CborValue::Text(n.id.clone()))],
+    ));
+
+    let mut cancel = Button {
+        variant: ButtonVariant::Ghost,
+        tone: Tone::Neutral,
+        label: lit("Anuluj"),
+        icon_leading: None,
+        icon_trailing: None,
+        size: ButtonSize::Sm,
+        full_width: false,
+        disabled: None,
+        loading: None,
+        density: Density::Compact,
+    }
+    .into_component("link-pick-cancel")
+    .expect("Button encode");
+    cancel.handlers = Some(backend(EventKind::Click, "manual_link_close"));
+
+    ui::Box {
+        width: None,
+        grow: None,
+        align_self: None,
+        padding: None,
+        margin: None,
+        children: vec![select, cancel],
+        style: None,
+        direction: Some(FlexDirection::Column),
+        gap: Some(Spacing::Sm),
+        align: Some(FlexAlign::Stretch),
+        justify: None,
+        responsive: None,
+    }
+    .into_component("link-picker")
+    .expect("Box encode")
+}
+
+fn related_card(index: usize, r: &db::RelatedNote, now: i64) -> Component {
+    let title = if r.title.is_empty() {
+        "(bez tytułu)"
+    } else {
+        &r.title
+    };
+    let is_fresh = now - r.created_at < FRESH_LINK_SECS;
+    let percent = (r.weight.clamp(0.0, 1.0) * 100.0).round() as i64;
+
+    let title_text = Text {
+        content: lit(title),
+        style: TextStyle::BodyStrong,
+        tone: None,
+        align: None,
+        wrap: None,
+        max_lines: Some(1),
+        format: None,
+        streaming: None,
+    }
+    .into_component(format!("rel-{index}-title"))
+    .expect("Text encode");
+
+    let title_row: Component = if is_fresh {
+        let fresh = Chip {
+            variant: ChipVariant::Soft,
+            tone: Tone::Primary,
+            label: lit("nowe"),
+            icon: None,
+            avatar: None,
+            selected: None,
+            removable: false,
+        }
+        .into_component(format!("rel-{index}-fresh"))
+        .expect("Chip encode");
+        Cluster {
+            gap: Spacing::Xs,
+            align: FlexAlign::Center,
+            justify: FlexJustify::Start,
+            children: vec![title_text, fresh],
+            wrap: Some(false),
+        }
+        .into_component(format!("rel-{index}-head"))
+        .expect("Cluster encode")
+    } else {
+        title_text
+    };
+
+    let detail = if r.reason.is_empty() {
+        format!("{percent}%")
+    } else {
+        format!("{percent}% · {}", r.reason)
+    };
+    let children = vec![
+        title_row,
+        text_c(
             &format!("rel-{index}-reason"),
-            lit(reason),
+            lit(detail),
             TextStyle::Caption,
             Some(Tone::Muted),
-        ));
-    }
+        ),
+    ];
 
     let mut card = Card {
         variant: CardVariant::Outlined,
@@ -1195,7 +1587,7 @@ fn related_card(index: usize, r: &JsonValue) -> Component {
         shadow: ShadowToken::None,
         border: BorderToken::Hairline,
         background: ui::BackgroundToken::Subtle,
-        accent: None,
+        accent: if is_fresh { Some(Tone::Primary) } else { None },
         children,
         interactive: true,
         clickable: true,
@@ -1206,9 +1598,134 @@ fn related_card(index: usize, r: &JsonValue) -> Component {
     card.handlers = Some(backend_params(
         EventKind::Click,
         "open_note",
-        vec![("note_id", CborValue::Text(note_id.to_string()))],
+        vec![("note_id", CborValue::Text(r.id.clone()))],
     ));
     card
+}
+
+fn merge_suggestion_card(index: usize, s: &analysis::MergeSuggestionView) -> Component {
+    let percent = (s.similarity.clamp(0.0, 1.0) * 100.0).round() as i64;
+    let text = text_c(
+        &format!("msug-{index}-text"),
+        lit(format!(
+            "„{}” i „{}” wyglądają na tę samą encję — zbieżność nazw {percent}%.",
+            s.name_a, s.name_b
+        )),
+        TextStyle::Caption,
+        None,
+    );
+
+    let mut accept = Button {
+        variant: ButtonVariant::Primary,
+        tone: Tone::Primary,
+        label: lit("Scal"),
+        icon_leading: None,
+        icon_trailing: None,
+        size: ButtonSize::Sm,
+        full_width: false,
+        disabled: None,
+        loading: None,
+        density: Density::Compact,
+    }
+    .into_component(format!("msug-{index}-accept"))
+    .expect("Button encode");
+    accept.handlers = Some(backend_params(
+        EventKind::Click,
+        "merge_accept",
+        vec![("suggestion_id", CborValue::Text(s.id.clone()))],
+    ));
+
+    let mut reject = Button {
+        variant: ButtonVariant::Ghost,
+        tone: Tone::Neutral,
+        label: lit("Odrzuć"),
+        icon_leading: None,
+        icon_trailing: None,
+        size: ButtonSize::Sm,
+        full_width: false,
+        disabled: None,
+        loading: None,
+        density: Density::Compact,
+    }
+    .into_component(format!("msug-{index}-reject"))
+    .expect("Button encode");
+    reject.handlers = Some(backend_params(
+        EventKind::Click,
+        "merge_reject",
+        vec![("suggestion_id", CborValue::Text(s.id.clone()))],
+    ));
+
+    let actions = Cluster {
+        gap: Spacing::Sm,
+        align: FlexAlign::Center,
+        justify: FlexJustify::Start,
+        children: vec![accept, reject],
+        wrap: Some(false),
+    }
+    .into_component(format!("msug-{index}-actions"))
+    .expect("Cluster encode");
+
+    Card {
+        variant: CardVariant::Outlined,
+        padding: Spacing::Sm,
+        gap: Spacing::Sm,
+        radius: ui::RadiusToken::Md,
+        shadow: ShadowToken::None,
+        border: BorderToken::Accent { tone: Tone::Info },
+        background: ui::BackgroundToken::Subtle,
+        accent: Some(Tone::Info),
+        children: vec![text, actions],
+        interactive: false,
+        clickable: false,
+        style: None,
+    }
+    .into_component(format!("msug-{index}"))
+    .expect("Card encode")
+}
+
+fn recent_merge_card(index: usize, m: &analysis::RecentMergeView) -> Component {
+    let text = text_c(
+        &format!("mundo-{index}-text"),
+        lit(format!("Scalono „{}” z „{}”.", m.from_name, m.into_name)),
+        TextStyle::Caption,
+        Some(Tone::Muted),
+    );
+    let mut undo = Button {
+        variant: ButtonVariant::Ghost,
+        tone: Tone::Neutral,
+        label: lit("Cofnij scalenie"),
+        icon_leading: None,
+        icon_trailing: None,
+        size: ButtonSize::Sm,
+        full_width: false,
+        disabled: None,
+        loading: None,
+        density: Density::Compact,
+    }
+    .into_component(format!("mundo-{index}-btn"))
+    .expect("Button encode");
+    undo.handlers = Some(backend_params(
+        EventKind::Click,
+        "merge_undo",
+        vec![("merge_id", CborValue::Text(m.merge_id.clone()))],
+    ));
+
+    Card {
+        variant: CardVariant::Outlined,
+        padding: Spacing::Sm,
+        gap: Spacing::Xs,
+        radius: ui::RadiusToken::Md,
+        shadow: ShadowToken::None,
+        border: BorderToken::Hairline,
+        background: ui::BackgroundToken::Subtle,
+        accent: None,
+        children: vec![text, undo],
+        interactive: false,
+        clickable: false,
+        style: None,
+    }
+    .into_component(format!("mundo-{index}"))
+    .expect("Card encode")
 }
 
 fn entity_chip(index: usize, name: &str, entity_type: &str) -> Component {
@@ -1249,6 +1766,19 @@ fn error_fragment(id: &str, message: &str) -> Component {
     .expect("EmptyState encode")
 }
 
+/// Framed panel column (mockup n01): subtle background, hairline border and
+/// rounded corners through tokens, full height.
+fn panel_style() -> ui::BoxStyle {
+    ui::BoxStyle {
+        background: Some(ui::BackgroundToken::Subtle),
+        border: Some(BorderEdges::all(BorderSide::new(1, BorderColor::Default))),
+        radius: Some(CornerValues::all(RadiusValue::Token {
+            value: ui::RadiusToken::Lg,
+        })),
+        ..full_height_style()
+    }
+}
+
 fn full_height_style() -> ui::BoxStyle {
     ui::BoxStyle {
         margin: None,
@@ -1279,7 +1809,7 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
         Err(e) => return json!({"ok": false, "error": e}),
     };
 
-    match action_id {
+    let result = match action_id {
         "list_notes" => {
             send_list(&ctx);
             json!({"ok": true})
@@ -1292,7 +1822,119 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
         "delete_note" => action_delete_note(&ctx, params),
         "set_filter" => action_set_filter(&ctx, params),
         "set_search" => action_set_search(&ctx, params),
+        "merge_accept" => action_merge_decision(&ctx, params, true),
+        "merge_reject" => action_merge_decision(&ctx, params, false),
+        "merge_undo" => action_merge_undo(&ctx, params),
+        "manual_link_open" => action_link_picker(&ctx, true),
+        "manual_link_close" => action_link_picker(&ctx, false),
+        "manual_link_add" => action_manual_link_add(&ctx, params),
         other => json!({"ok": false, "error": format!("Nieznana akcja: {other}")}),
+    };
+
+    // Opportunistic analysis drain: at most ONE queued note per request so the
+    // UI response is delayed by at most one embed+extract pass. The 3 s
+    // debounce keeps the note being typed out of the drain; set_search is
+    // excluded as the highest-frequency action. Heavy lifting (LLM/embed) runs
+    // as host calls and does not burn wasm fuel — the in-wasm work (chunking,
+    // JSON parsing) is far below the 200M fuel budget.
+    if action_id != "set_search" {
+        let processed = analysis::process_queue(1);
+        if !processed.is_empty() {
+            let active = load_session().active;
+            // Refresh the panel only when the open note gained fresh links and
+            // the user is not mid-typing (save_note keeps the caret alive).
+            if processed.iter().any(|id| id == &active) && action_id != "save_note" {
+                if let Ok(Some(note)) = db::get_note(&ctx, &active) {
+                    send_main(&ctx, Some(&note));
+                }
+            }
+        }
+    }
+
+    result
+}
+
+fn action_merge_decision(ctx: &UserCtx, params: &JsonValue, accept: bool) -> JsonValue {
+    let suggestion_id = match param_str(params, "suggestion_id") {
+        Some(id) => id.to_string(),
+        None => return json!({"ok": false, "error": "Brak suggestion_id"}),
+    };
+    let outcome = if accept {
+        analysis::merge_accept(ctx, &suggestion_id)
+    } else {
+        analysis::merge_reject(ctx, &suggestion_id)
+    };
+    match outcome {
+        Ok(()) => {
+            refresh_active_main(ctx);
+            json!({"ok": true})
+        }
+        Err(e) => {
+            feedback_err(&e);
+            json!({"ok": false, "error": e})
+        }
+    }
+}
+
+fn action_merge_undo(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
+    let merge_id = match param_str(params, "merge_id") {
+        Some(id) => id.to_string(),
+        None => return json!({"ok": false, "error": "Brak merge_id"}),
+    };
+    match analysis::merge_undo(ctx, &merge_id) {
+        Ok(()) => {
+            refresh_active_main(ctx);
+            json!({"ok": true})
+        }
+        Err(e) => {
+            feedback_err(&e);
+            json!({"ok": false, "error": e})
+        }
+    }
+}
+
+fn action_link_picker(ctx: &UserCtx, open: bool) -> JsonValue {
+    let mut sess = load_session();
+    sess.link_picker = open;
+    store_session(&sess);
+    refresh_active_main(ctx);
+    json!({"ok": true})
+}
+
+fn action_manual_link_add(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
+    let src = match param_str(params, "note_id") {
+        Some(id) => id.to_string(),
+        None => return json!({"ok": false, "error": "Brak note_id"}),
+    };
+    let dst = match param_str(params, "value") {
+        Some(id) => id.to_string(),
+        None => return json!({"ok": false, "error": "Brak wybranej notatki"}),
+    };
+    match db::manual_link(ctx, &src, &dst) {
+        Ok(()) => {
+            let mut sess = load_session();
+            sess.link_picker = false;
+            store_session(&sess);
+            refresh_active_main(ctx);
+            feedback_ok("Dodano powiązanie");
+            json!({"ok": true})
+        }
+        Err(e) => {
+            feedback_err(&e);
+            json!({"ok": false, "error": e})
+        }
+    }
+}
+
+/// Re-renders the main slot for the currently open note (links panel data
+/// changed outside the editor: merge decision, background analysis).
+fn refresh_active_main(ctx: &UserCtx) {
+    let active = load_session().active;
+    if active.is_empty() {
+        return;
+    }
+    if let Ok(Some(note)) = db::get_note(ctx, &active) {
+        send_main(ctx, Some(&note));
     }
 }
 
@@ -1324,7 +1966,7 @@ fn action_new_note(ctx: &UserCtx) -> JsonValue {
     let id = match db::create_note(ctx) {
         Ok(id) => id,
         Err(e) => {
-            patch_set(SP_SAVE_STATUS, CborValue::Text(e.clone()));
+            feedback_err(&e);
             return json!({"ok": false, "error": e});
         }
     };
@@ -1354,10 +1996,7 @@ fn open_active(ctx: &UserCtx, note_id: &str) {
         }
         Ok(None) => {
             send_main(ctx, None);
-            patch_set(
-                SP_SAVE_STATUS,
-                CborValue::Text("Notatka nie istnieje lub nie masz do niej dostępu.".into()),
-            );
+            feedback_err("Notatka nie istnieje lub nie masz do niej dostępu.");
         }
         Err(e) => {
             send_slot(SLOT_MAIN, error_fragment("main-error", &e), None);
@@ -1401,18 +2040,14 @@ fn action_save_note(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
     let field = param_str(params, "field").unwrap_or("content");
     let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("");
     if let Err(e) = validate_note_field(field, value) {
-        patch_set(SP_SAVE_STATUS, CborValue::Text(e.clone()));
+        feedback_err(&e);
         return json!({"ok": false, "error": e});
     }
 
     match db::update_note_field(ctx, &note_id, field, value) {
         Ok(()) => {
-            let mut ops = vec![PatchOp {
-                path: state_path(SP_SAVE_STATUS),
-                op: PatchOpKind::Set {
-                    value: CborValue::Text("Zapisano przed chwilą".into()),
-                },
-            }];
+            analysis::enqueue(&note_id);
+            let mut ops = save_feedback_ops(Some("Zapisano · przed chwilą"), None);
             if field == "content" {
                 ops.push(PatchOp {
                     path: state_path(SP_CHAR_COUNT),
@@ -1428,7 +2063,7 @@ fn action_save_note(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
             json!({"ok": true})
         }
         Err(e) => {
-            patch_set(SP_SAVE_STATUS, CborValue::Text(e.clone()));
+            feedback_err(&e);
             json!({"ok": false, "error": e})
         }
     }
@@ -1449,19 +2084,17 @@ fn action_save_tags(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
         })
         .unwrap_or_default();
     if let Err(e) = validate_tags(&tags) {
-        patch_set(SP_SAVE_STATUS, CborValue::Text(e.clone()));
+        feedback_err(&e);
         return json!({"ok": false, "error": e});
     }
     match db::set_tags(ctx, &note_id, &tags) {
         Ok(()) => {
-            patch_set(
-                SP_SAVE_STATUS,
-                CborValue::Text("Zapisano przed chwilą".into()),
-            );
+            analysis::enqueue(&note_id);
+            feedback_ok("Zapisano · przed chwilą");
             json!({"ok": true})
         }
         Err(e) => {
-            patch_set(SP_SAVE_STATUS, CborValue::Text(e.clone()));
+            feedback_err(&e);
             json!({"ok": false, "error": e})
         }
     }
@@ -1478,25 +2111,19 @@ fn action_set_share(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
         .unwrap_or("private");
     match db::set_share_mode(ctx, &note_id, mode) {
         Ok(()) => {
-            send_state_patch(vec![
-                PatchOp {
-                    path: state_path(SP_SHARE),
-                    op: PatchOpKind::Set {
-                        value: CborValue::Text(mode.to_string()),
-                    },
+            let mut ops = save_feedback_ops(Some("Zapisano · przed chwilą"), None);
+            ops.push(PatchOp {
+                path: state_path(SP_SHARE),
+                op: PatchOpKind::Set {
+                    value: CborValue::Text(mode.to_string()),
                 },
-                PatchOp {
-                    path: state_path(SP_SAVE_STATUS),
-                    op: PatchOpKind::Set {
-                        value: CborValue::Text("Zapisano przed chwilą".into()),
-                    },
-                },
-            ]);
+            });
+            send_state_patch(ops);
             send_list(ctx);
             json!({"ok": true})
         }
         Err(e) => {
-            patch_set(SP_SAVE_STATUS, CborValue::Text(e.clone()));
+            feedback_err(&e);
             json!({"ok": false, "error": e})
         }
     }
@@ -1509,6 +2136,9 @@ fn action_delete_note(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
     };
     match db::delete_note(ctx, &note_id) {
         Ok(()) => {
+            // The queue worker sees deleted_at and runs the tombstone cleanup
+            // (graph node + vectors through the outbox).
+            analysis::enqueue(&note_id);
             let mut sess = load_session();
             if sess.active == note_id {
                 sess.active.clear();
@@ -1519,7 +2149,7 @@ fn action_delete_note(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
             json!({"ok": true})
         }
         Err(e) => {
-            patch_set(SP_SAVE_STATUS, CborValue::Text(e.clone()));
+            feedback_err(&e);
             json!({"ok": false, "error": e})
         }
     }
@@ -1546,7 +2176,7 @@ fn action_set_search(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
     let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("");
     if value.chars().count() > MAX_SEARCH_CHARS {
         let e = format!("Fraza wyszukiwania przekracza limit {MAX_SEARCH_CHARS} znaków.");
-        patch_set(SP_SAVE_STATUS, CborValue::Text(e.clone()));
+        feedback_err(&e);
         return json!({"ok": false, "error": e});
     }
     let mut sess = load_session();

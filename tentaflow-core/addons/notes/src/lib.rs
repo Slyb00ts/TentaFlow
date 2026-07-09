@@ -2,11 +2,12 @@
 // File: addons/notes/src/lib.rs
 // Purpose: Notes addon (WASM) entry points and action dispatch. Notes CRUD
 //          with ACL shares lives in db.rs; the three-column panel
-//          (list | editor | links) is rendered in ui.rs via the ui_v1 catalog.
-//          Later stages (auto-graph, semantic search, dictation) build on the
-//          schema and vector/graph declarations laid down here.
+//          (list | editor | links) is rendered in ui.rs via the ui_v1 catalog;
+//          the auto-graph pipeline (chunk + embed, entity extraction, note
+//          links, entity merge, graph outbox) lives in analysis.rs.
 // =============================================================================
 
+mod analysis;
 mod db;
 mod ui;
 
@@ -125,7 +126,15 @@ pub extern "C" fn on_request(
         return write_response(out_ptr, out_cap, out_len_ptr, &result);
     }
 
-    let result = json!({"ok": false, "error": format!("unknown tool: {tool_name}")});
+    let result = match tool_name {
+        // Queue worker: callable by the Admin Scheduler (interval job) and
+        // manually. Batch of 5 per invocation; the 3 s debounce applies.
+        "analyze_pending" => {
+            let processed = analysis::process_queue(5);
+            json!({"ok": true, "processed": processed})
+        }
+        other => json!({"ok": false, "error": format!("unknown tool: {other}")}),
+    };
     write_response(out_ptr, out_cap, out_len_ptr, &result)
 }
 

@@ -6,8 +6,6 @@
 //          native target (host fns exist only under wasm).
 // =============================================================================
 
-use serde_json::{json, Value as JsonValue};
-
 use tentaflow_addon_sdk::{
     directory_org, directory_users, sql_exec, sql_query, sql_query_one, sql_transaction, SqlValue,
 };
@@ -721,61 +719,299 @@ fn run_transaction(stmts: &[(String, Vec<SqlValue>)]) -> Result<(), String> {
 }
 
 // =============================================================================
-// Links / entities read side (populated by the auto-graph stage; empty today,
-// but the panel reads the real tables so future data shows up unchanged)
+// Links / entities read side (populated by the analysis pipeline). Every
+// query joins notes + acl_read_clause on the TARGET note, so a reader never
+// sees a link into a note they cannot open.
 // =============================================================================
 
-/// Related notes of `note_id` that the user can read, best first.
-pub fn related_notes(ctx: &UserCtx, note_id: &str) -> Result<Vec<JsonValue>, String> {
-    let acl = acl_read_clause(ctx.group_ids.len());
-    let sql = format!(
-        "SELECT n.id, n.title, l.kind, l.weight, l.reason \
+/// One related-note card in the links panel. `reason` is the DISPLAY string,
+/// resolved at read time from the persisted machine token — entity names are
+/// never stored in note_links (a canonical name from a private note must not
+/// leak to readers of the linked pair).
+#[derive(Debug, Clone)]
+pub struct RelatedNote {
+    pub id: String,
+    pub title: String,
+    /// Ranking weight in [0,1]; cosine similarity for kind='similar'.
+    pub weight: f64,
+    pub reason: String,
+    pub created_at: i64,
+}
+
+fn value_f64(v: &SqlValue) -> Option<f64> {
+    match v {
+        SqlValue::F64(f) => Some(*f),
+        SqlValue::I64(i) => Some(*i as f64),
+        _ => None,
+    }
+}
+
+// =============================================================================
+// Link reason tokens — note_links.reason persists ONLY machine identifiers;
+// the human label (and any entity name) is resolved per reader at read time.
+// =============================================================================
+
+/// Parsed machine token from note_links.reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkReason {
+    /// "similar" — semantic similarity, no name involved.
+    Similar,
+    /// "manual" — user-created link.
+    Manual,
+    /// "entity:{canonical_id}:{shared_count}" — shared-entity link.
+    Entity { entity_id: String, shared: usize },
+}
+
+/// Builds the persisted token of a shared-entity link.
+pub fn entity_reason_token(entity_id: &str, shared: usize) -> String {
+    format!("entity:{entity_id}:{shared}")
+}
+
+/// Parses a persisted reason token. None = unrecognized (never produced by
+/// current write paths; surfaces as a label-less card instead of leaking raw
+/// stored text).
+pub fn parse_link_reason(raw: &str) -> Option<LinkReason> {
+    match raw {
+        "similar" => Some(LinkReason::Similar),
+        "manual" => Some(LinkReason::Manual),
+        _ => {
+            let rest = raw.strip_prefix("entity:")?;
+            let (entity_id, shared) = rest.rsplit_once(':')?;
+            if entity_id.is_empty() {
+                return None;
+            }
+            Some(LinkReason::Entity {
+                entity_id: entity_id.to_string(),
+                shared: shared.parse().ok()?,
+            })
+        }
+    }
+}
+
+/// Display label of a link reason. For entity links `name` is the reader-
+/// visible entity name (None = the reader may not see any name — the label
+/// stays generic).
+pub fn link_reason_label(reason: &LinkReason, name: Option<&str>) -> String {
+    match reason {
+        LinkReason::Similar => "podobieństwo semantyczne".to_string(),
+        LinkReason::Manual => "powiązanie ręczne".to_string(),
+        LinkReason::Entity { shared, .. } => match (name, *shared) {
+            (Some(n), s) if s > 1 => format!("wspólne encje: {n} +{}", s - 1),
+            (Some(n), _) => format!("wspólna encja: {n}"),
+            (None, s) if s > 1 => "wspólne encje".to_string(),
+            (None, _) => "wspólna encja".to_string(),
+        },
+    }
+}
+
+/// SQL resolving the entity name a READER is allowed to see for a canonical
+/// entity: prefer the canonical row itself, otherwise any alias — but only
+/// through rows directly mentioned by a live note the reader can open.
+/// Placeholders: entity id ×2, `acl_params`, entity id. Pure — unit-tested.
+pub fn visible_entity_name_sql(group_count: usize) -> String {
+    let acl = acl_read_clause(group_count);
+    format!(
+        "SELECT e.name FROM entities e \
+         JOIN note_entities ne ON ne.entity_id = e.id \
+         JOIN notes n ON n.id = ne.note_id \
+         WHERE (e.id = ? OR e.canonical_id = ?) AND n.deleted_at IS NULL AND {acl} \
+         ORDER BY CASE WHEN e.id = ? THEN 0 ELSE 1 END LIMIT 1"
+    )
+}
+
+/// Reader-visible name of a canonical entity (canonical row first, then a
+/// visible alias). None = the reader cannot see this entity under any name.
+pub fn visible_entity_name(ctx: &UserCtx, entity_id: &str) -> Option<String> {
+    let sql = visible_entity_name_sql(ctx.group_ids.len());
+    let mut params = vec![
+        SqlValue::String(entity_id.to_string()),
+        SqlValue::String(entity_id.to_string()),
+    ];
+    params.extend(acl_params(ctx));
+    params.push(SqlValue::String(entity_id.to_string()));
+    sql_query_one(&sql, &params)
+        .ok()
+        .flatten()
+        .and_then(|r| r.first().and_then(|v| v.as_str()).map(str::to_string))
+}
+
+/// SQL of the related-notes read: links joined to the TARGET note with the
+/// reader's ACL and liveness re-checked there. Pure — unit-tested natively.
+pub fn related_notes_sql(group_count: usize) -> String {
+    let acl = acl_read_clause(group_count);
+    format!(
+        "SELECT n.id, n.title, l.weight, l.reason, l.created_at \
          FROM note_links l JOIN notes n ON n.id = l.dst_note_id \
          WHERE l.src_note_id = ? AND n.deleted_at IS NULL AND {acl} \
-         ORDER BY l.weight DESC LIMIT 12"
-    );
+         ORDER BY l.weight DESC LIMIT 24"
+    )
+}
+
+/// Related notes of `note_id` the user can read, best first. A pair linked
+/// both by similarity and by shared entities collapses to its strongest row.
+/// Reason labels are resolved HERE, per reader: entity names go through the
+/// same visibility logic as the entity chips.
+pub fn related_notes(ctx: &UserCtx, note_id: &str) -> Result<Vec<RelatedNote>, String> {
+    let sql = related_notes_sql(ctx.group_ids.len());
     let mut params = vec![SqlValue::String(note_id.to_string())];
     params.extend(acl_params(ctx));
     let rows = sql_query(&sql, &params).map_err(|e| format!("Błąd odczytu powiązań: {e}"))?;
-    Ok(rows
-        .iter()
-        .map(|r| {
-            json!({
-                "id": r.first().and_then(|v| v.as_str()).unwrap_or(""),
-                "title": r.get(1).and_then(|v| v.as_str()).unwrap_or(""),
-                "kind": r.get(2).and_then(|v| v.as_str()).unwrap_or(""),
-                "weight": r.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
-                "reason": r.get(4).and_then(|v| v.as_str()).unwrap_or(""),
-            })
-        })
-        .collect())
+    let mut out: Vec<RelatedNote> = Vec::new();
+    for r in &rows {
+        let id = r
+            .first()
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        // Rows arrive weight-desc, so the first row per target is its best.
+        if id.is_empty() || out.iter().any(|x| x.id == id) {
+            continue;
+        }
+        let raw_reason = r.get(3).and_then(|v| v.as_str()).unwrap_or("");
+        let reason = match parse_link_reason(raw_reason) {
+            Some(LinkReason::Entity { entity_id, shared }) => {
+                let name = visible_entity_name(ctx, &entity_id);
+                link_reason_label(
+                    &LinkReason::Entity { entity_id, shared },
+                    name.as_deref(),
+                )
+            }
+            Some(kind) => link_reason_label(&kind, None),
+            None => String::new(),
+        };
+        out.push(RelatedNote {
+            id,
+            title: r.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            weight: r.get(2).and_then(value_f64).unwrap_or(0.0),
+            reason,
+            created_at: r.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+        });
+        if out.len() >= 12 {
+            break;
+        }
+    }
+    Ok(out)
 }
 
-/// Detected entities of a note (name + type), canonical entity preferred.
-/// Same read ACL + liveness as every other note read path.
-pub fn note_entities(ctx: &UserCtx, note_id: &str) -> Result<Vec<(String, String)>, String> {
-    let acl = acl_read_clause(ctx.group_ids.len());
-    let sql = format!(
-        "SELECT COALESCE(c.name, e.name), COALESCE(c.entity_type, e.entity_type) \
+/// One detected entity of a note (canonical after merges).
+#[derive(Debug, Clone)]
+pub struct NoteEntity {
+    /// Canonical entity id (merge survivor when the mention was merged).
+    pub id: String,
+    pub name: String,
+    pub entity_type: String,
+}
+
+/// SQL of the note-entities read: attachments joined to the note with the
+/// reader's ACL and liveness. Local and canonical names are returned
+/// separately — the canonical name is DISCLOSED only after a separate
+/// visibility check (see `note_entities`). Pure — unit-tested natively.
+pub fn note_entities_sql(group_count: usize) -> String {
+    let acl = acl_read_clause(group_count);
+    format!(
+        "SELECT COALESCE(e.canonical_id, e.id), e.name, c.name, c.id, \
+                COALESCE(c.entity_type, e.entity_type) \
          FROM note_entities ne \
          JOIN notes n ON n.id = ne.note_id \
          JOIN entities e ON e.id = ne.entity_id \
          LEFT JOIN entities c ON c.id = e.canonical_id \
          WHERE ne.note_id = ? AND n.deleted_at IS NULL AND {acl} \
          ORDER BY ne.count DESC LIMIT 24"
-    );
+    )
+}
+
+/// SQL of the entity visibility test: does the reader have read access to at
+/// least one live note DIRECTLY mentioning the entity row? Direct semantics
+/// (ne.entity_id = ?) on purpose: resolution through an alias must not make a
+/// canonical name/entity visible to someone who only reads the alias' note.
+/// Pure — unit-tested natively. Placeholders: entity id, then `acl_params`.
+pub fn entity_visibility_sql(group_count: usize) -> String {
+    let acl = acl_read_clause(group_count);
+    format!(
+        "SELECT 1 FROM note_entities ne JOIN notes n ON n.id = ne.note_id \
+         WHERE ne.entity_id = ? AND n.deleted_at IS NULL AND {acl} LIMIT 1"
+    )
+}
+
+/// True when the reader can see the entity through some readable live note.
+pub fn entity_visible(ctx: &UserCtx, entity_id: &str) -> bool {
+    let sql = entity_visibility_sql(ctx.group_ids.len());
+    let mut params = vec![SqlValue::String(entity_id.to_string())];
+    params.extend(acl_params(ctx));
+    matches!(sql_query_one(&sql, &params), Ok(Some(_)))
+}
+
+/// Detected entities of a note, canonical entity preferred. Same read ACL +
+/// liveness as every other note read path. The canonical (merged) name is
+/// shown only when the reader can see the canonical entity through some
+/// readable note of their own — otherwise the alias name from THIS note is
+/// used, so a merge never leaks a name that originated in a private note.
+pub fn note_entities(ctx: &UserCtx, note_id: &str) -> Result<Vec<NoteEntity>, String> {
+    let sql = note_entities_sql(ctx.group_ids.len());
     let mut params = vec![SqlValue::String(note_id.to_string())];
     params.extend(acl_params(ctx));
     let rows = sql_query(&sql, &params).map_err(|e| format!("Błąd odczytu encji: {e}"))?;
-    Ok(rows
-        .iter()
-        .map(|r| {
-            (
-                r.first().and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                r.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            )
-        })
-        .collect())
+    let mut out: Vec<NoteEntity> = Vec::new();
+    for r in &rows {
+        let id = r
+            .first()
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        // Merged mentions can resolve to the same canonical — dedup for chips.
+        if id.is_empty() || out.iter().any(|e| e.id == id) {
+            continue;
+        }
+        let local_name = r.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let canonical_name = r.get(2).and_then(|v| v.as_str()).map(str::to_string);
+        let canonical_id = r.get(3).and_then(|v| v.as_str()).map(str::to_string);
+        let name = match (canonical_name, canonical_id) {
+            (Some(cn), Some(cid)) if entity_visible(ctx, &cid) => cn,
+            _ => local_name,
+        };
+        out.push(NoteEntity {
+            id,
+            name,
+            entity_type: r.get(4).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// Creates a manual note-to-note link (both directions, weight 1.0). Requires
+/// WRITE access to the source note (the user annotates it) and READ access to
+/// the target; both notes must be alive.
+pub fn manual_link(ctx: &UserCtx, src_note_id: &str, dst_note_id: &str) -> Result<(), String> {
+    if src_note_id == dst_note_id {
+        return Err("Nie można powiązać notatki z samą sobą.".to_string());
+    }
+    ensure_writable(ctx, src_note_id)?;
+    if get_note(ctx, dst_note_id)?.is_none() {
+        return Err("Wybrana notatka nie istnieje lub nie masz do niej dostępu.".to_string());
+    }
+    let now = now_unix();
+    let insert = "INSERT OR REPLACE INTO note_links \
+                  (src_note_id, dst_note_id, kind, weight, reason, created_at) \
+                  VALUES (?, ?, 'manual', 1.0, 'manual', ?)";
+    let stmts: Vec<(String, Vec<SqlValue>)> = vec![
+        (
+            insert.to_string(),
+            vec![
+                SqlValue::String(src_note_id.to_string()),
+                SqlValue::String(dst_note_id.to_string()),
+                SqlValue::I64(now),
+            ],
+        ),
+        (
+            insert.to_string(),
+            vec![
+                SqlValue::String(dst_note_id.to_string()),
+                SqlValue::String(src_note_id.to_string()),
+                SqlValue::I64(now),
+            ],
+        ),
+    ];
+    run_transaction(&stmts).map_err(|e| format!("Błąd zapisu powiązania: {e}"))
 }
 
 // =============================================================================
@@ -924,6 +1160,111 @@ mod tests {
         assert!(guard.contains("s.access = 'write'"));
         assert_eq!(owner_guard_clause().matches('?').count(), 2);
         assert!(owner_guard_clause().contains("n.owner_user_id = ?"));
+    }
+
+    #[test]
+    fn related_notes_sql_guards_target_note_with_read_acl() {
+        let c = ctx(&["g1", "g2"]);
+        let sql = related_notes_sql(c.group_ids.len());
+        // The ACL predicate applies to the TARGET note of the link.
+        assert!(sql.contains("JOIN notes n ON n.id = l.dst_note_id"));
+        assert!(sql.contains("n.deleted_at IS NULL"));
+        assert!(sql.contains("n.owner_user_id = ?"));
+        // Placeholders: note id + full ACL parameter set.
+        assert_eq!(sql.matches('?').count(), 1 + acl_params(&c).len());
+    }
+
+    #[test]
+    fn note_entities_sql_guards_note_with_read_acl_and_keeps_names_separate() {
+        let c = ctx(&[]);
+        let sql = note_entities_sql(c.group_ids.len());
+        assert!(sql.contains("COALESCE(e.canonical_id, e.id)"));
+        // Local and canonical names come back separately — the canonical name
+        // is disclosed only after entity_visible passes (no COALESCE leak).
+        assert!(sql.contains("e.name, c.name"));
+        assert!(!sql.contains("COALESCE(c.name"));
+        assert!(sql.contains("n.deleted_at IS NULL"));
+        assert!(sql.contains("n.owner_user_id = ?"));
+        assert_eq!(sql.matches('?').count(), 1 + acl_params(&c).len());
+    }
+
+    #[test]
+    fn link_reason_tokens_roundtrip_and_reject_garbage() {
+        let token = entity_reason_token("ent_00ff", 3);
+        assert_eq!(token, "entity:ent_00ff:3");
+        assert_eq!(
+            parse_link_reason(&token),
+            Some(LinkReason::Entity {
+                entity_id: "ent_00ff".into(),
+                shared: 3
+            })
+        );
+        assert_eq!(parse_link_reason("similar"), Some(LinkReason::Similar));
+        assert_eq!(parse_link_reason("manual"), Some(LinkReason::Manual));
+        // Legacy / malformed values never resolve to a label with a name.
+        assert_eq!(parse_link_reason("wspólna encja: Tajna Sp. z o.o."), None);
+        assert_eq!(parse_link_reason("entity:"), None);
+        assert_eq!(parse_link_reason("entity::1"), None);
+        assert_eq!(parse_link_reason("entity:ent_x:abc"), None);
+        assert_eq!(parse_link_reason(""), None);
+    }
+
+    #[test]
+    fn entity_link_label_never_uses_invisible_canonical_name() {
+        // Codex scenario: the reader can open notes A and B, linked by an
+        // entity whose CANONICAL name comes from a private note C. The row
+        // persists only the id; at read time the name resolver returns:
+        //   * None (nothing visible)          -> generic label, no name,
+        //   * the reader-visible ALIAS name   -> alias label,
+        //   * the canonical name ONLY when the canonical row itself is
+        //     reachable through the reader's notes.
+        let reason = parse_link_reason(&entity_reason_token("ent_c", 1)).unwrap();
+        assert_eq!(link_reason_label(&reason, None), "wspólna encja");
+        assert_eq!(
+            link_reason_label(&reason, Some("Nexadata (alias)")),
+            "wspólna encja: Nexadata (alias)"
+        );
+        let many = parse_link_reason(&entity_reason_token("ent_c", 3)).unwrap();
+        assert_eq!(link_reason_label(&many, None), "wspólne encje");
+        assert_eq!(
+            link_reason_label(&many, Some("Nexadata")),
+            "wspólne encje: Nexadata +2"
+        );
+        assert_eq!(
+            link_reason_label(&LinkReason::Similar, None),
+            "podobieństwo semantyczne"
+        );
+        assert_eq!(
+            link_reason_label(&LinkReason::Manual, None),
+            "powiązanie ręczne"
+        );
+    }
+
+    #[test]
+    fn visible_entity_name_sql_prefers_canonical_and_is_acl_guarded() {
+        let c = ctx(&["g1"]);
+        let sql = visible_entity_name_sql(c.group_ids.len());
+        // Canonical row OR its aliases, only through readable live notes,
+        // canonical preferred when both are visible.
+        assert!(sql.contains("e.id = ? OR e.canonical_id = ?"));
+        assert!(sql.contains("ORDER BY CASE WHEN e.id = ? THEN 0 ELSE 1 END"));
+        assert!(sql.contains("n.deleted_at IS NULL"));
+        assert!(sql.contains("n.owner_user_id = ?"));
+        // Placeholders: id, id, acl params, id (textual order).
+        assert_eq!(sql.matches('?').count(), 3 + acl_params(&c).len());
+    }
+
+    #[test]
+    fn entity_visibility_sql_requires_direct_mention_through_readable_note() {
+        let c = ctx(&["g1"]);
+        let sql = entity_visibility_sql(c.group_ids.len());
+        // Direct semantics: the entity row itself must be attached, resolution
+        // through an alias must not open visibility.
+        assert!(sql.contains("ne.entity_id = ?"));
+        assert!(!sql.contains("canonical_id"));
+        assert!(sql.contains("n.deleted_at IS NULL"));
+        assert!(sql.contains("n.owner_user_id = ?"));
+        assert_eq!(sql.matches('?').count(), 1 + acl_params(&c).len());
     }
 
     #[test]

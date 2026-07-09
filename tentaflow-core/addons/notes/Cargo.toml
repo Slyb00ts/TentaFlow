@@ -1,11 +1,13 @@
 # =============================================================================
 # File: addons/notes/Cargo.toml
-# Purpose: Notes addon crate (WASM cdylib) — notes CRUD with ACL shares and the
-#          three-column panel (list | editor | links) rendered via ui_v1.
+# Purpose: Notes addon crate (WASM cdylib) — notes CRUD with ACL shares, the
+#          three-column panel (list | editor | links) rendered via ui_v1 and
+#          the auto-graph analysis pipeline (embeddings, entities, note links,
+#          entity merge, graph outbox).
 # =============================================================================
 [package]
 name = "tentaflow-addon-notes"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]

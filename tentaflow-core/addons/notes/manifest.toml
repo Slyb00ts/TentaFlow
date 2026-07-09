@@ -1,8 +1,8 @@
 [addon]
 id = "notes"
 name = "Notatki"
-version = "0.1.0"
-description = "Notatki z lokalną analizą treści: lista, edytor z autozapisem i udostępnianie w organizacji. Schemat danych kładzie fundament pod auto-graf powiązań (encje, podobieństwo semantyczne) i dyktowanie."
+version = "0.2.0"
+description = "Notatki z lokalną analizą treści: lista, edytor z autozapisem, udostępnianie w organizacji oraz auto-graf powiązań (encje z LLM, podobieństwo semantyczne z embeddingów, sugestie scalania duplikatów encji)."
 category = "productivity"
 keywords = ["notes", "notatki", "graf", "encje", "wiedza", "dyktowanie"]
 author = "TentaFlow"
@@ -14,10 +14,8 @@ platforms = ["linux", "macos", "windows", "ios", "android"]
 wasm_file = "addon.wasm"
 
 # --- Uprawnienia ---
-# Tylko to, czego addon uzywa DZISIAJ. Deklaracje pod auto-graf/dyktowanie
-# (vector.*, graph.*, llm, stt, alias.read + [[vector_namespace]],
-# [[graph_collection]], [[alias]]/[[uses_alias]]) dojda w etapie analizy —
-# zmiana bundle_hash przeprowadzi wtedy update instalacji.
+# Deklaracje pod dyktowanie (stt + alias translator-stt-style) dojda w etapie
+# dyktowania — zmiana bundle_hash przeprowadzi wtedy update instalacji.
 
 [[permission]]
 id = "ui"
@@ -61,6 +59,119 @@ display_name = "Tozsamosc uzytkownika"
 description = "Odczytuje tozsamosc biezacego uzytkownika, aby pokazac jego notatki i egzekwowac zakresy dostepu."
 risk = "low"
 
+[[permission]]
+id = "vector.read"
+display_name = "Wyszukiwanie wektorowe"
+description = "k-NN nad przestrzeniami 'notes' (podobienstwo notatek) i 'entities' (podobienstwo nazw encji)."
+risk = "low"
+
+[[permission]]
+id = "vector.write"
+display_name = "Zapis wektorow"
+description = "Upsert/delete wektorow chunkow notatek ('notes') i nazw encji ('entities')."
+risk = "medium"
+
+[[permission]]
+id = "graph.read"
+display_name = "Odczyt grafu powiazan"
+description = "Odczyt notatek i encji z kolekcji grafowej 'notes_kg'."
+risk = "low"
+
+[[permission]]
+id = "graph.write"
+display_name = "Zapis grafu powiazan"
+description = "Materializacja notatek, encji i krawedzi (mentions, similar_to) do 'notes_kg' przez outbox."
+risk = "medium"
+
+[[permission]]
+id = "llm.generate"
+display_name = "Ekstrakcja encji / embeddingi"
+description = "Wola model embeddingow (notes-embeddings) i LLM ekstrakcji encji (notes-llm) przez host."
+risk = "medium"
+
+[[permission]]
+id = "alias.read"
+display_name = "Odczyt aliasow modeli"
+description = "Sprawdza dostepnosc aliasow notes-llm / notes-embeddings przed analiza."
+risk = "low"
+
+# --- Aliasy modeli wystawiane przez addon ---
+# suggested_default jest pusty: swieza instalacja tworzy aliasy ODPIETE
+# (is_active=0), admin podpina modele recznie (Services -> Aliasy) — wzor rag.
+
+[[alias]]
+id = "notes-llm"
+display_name = "Notatki — ekstrakcja encji"
+methods = ["chat"]
+suggested_default = ""
+visibility = "private"
+
+[[alias]]
+id = "notes-embeddings"
+display_name = "Notatki — embeddingi"
+methods = ["embed"]
+suggested_default = ""
+visibility = "private"
+
+[[uses_alias]]
+id = "notes-llm"
+required = true
+reason = "Ekstrakcja encji (osoby, firmy, projekty, tematy) z tresci notatek."
+
+[[uses_alias]]
+id = "notes-embeddings"
+required = true
+reason = "Embeddingi chunkow notatek i nazw encji (podobienstwo semantyczne, scalanie duplikatow)."
+
+# --- Przestrzen wektorowa chunkow notatek ---
+# Wymiar deklaratywny (1024); realny wymiar bierze sie z DANYCH przy pierwszym
+# upsercie i jest seedowany do KV instancji (embed_dimensions) — wzor rag.
+
+[[vector_namespace]]
+name = "notes"
+dimensions = 1024
+distance = "cosine"
+data_class = "C"
+
+[[vector_namespace.fields]]
+name = "note_id"
+type = "str"
+indexed = true
+
+[[vector_namespace.fields]]
+name = "owner_id"
+type = "str"
+indexed = true
+
+[[vector_namespace.fields]]
+name = "chunk_index"
+type = "int"
+indexed = false
+
+# --- Przestrzen wektorowa nazw encji (kandydaci scalenia przez k-NN) ---
+
+[[vector_namespace]]
+name = "entities"
+dimensions = 1024
+distance = "cosine"
+data_class = "C"
+
+[[vector_namespace.fields]]
+name = "entity_id"
+type = "str"
+indexed = true
+
+[[vector_namespace.fields]]
+name = "entity_type"
+type = "str"
+indexed = true
+
+# --- Kolekcja grafowa: materializacja graph_outbox (SQLite = zrodlo prawdy) ---
+
+[[graph_collection]]
+name = "notes_kg"
+data_class = "C"
+
 [visibility]
 admin_only = false
 default_groups = []
@@ -83,9 +194,22 @@ scope = "org"
 
 [resources]
 memory_mb = 128
-fuel_limit = 50000000
+# 200M jak rag: pipeline analizy (chunking + parsowanie JSON embeddingow/encji)
+# biegnie w wasm; same wywolania LLM/embed to host-fn i nie pala fuel.
+fuel_limit = 200000000
 storage_total_mb = 512
+llm_tokens_per_min = 200000
 
 [lifecycle]
 background = false
 auto_start = false
+
+# --- Narzedzia ---
+
+# Worker kolejki analizy — wolany przez Admin Scheduler (interval) ORAZ recznie.
+# Przetwarza do 5 notatek z analysis_queue (debounce 3 s od ostatniej edycji).
+[[tool]]
+id = "analyze_pending"
+display_name = "Analiza notatek w kolejce"
+description = "Przetwarza zalegle notatki z kolejki analizy (chunking, embeddingi, encje, powiazania). Batch do 5 notatek na wywolanie."
+keywords = ["notes", "analysis", "graph", "queue", "worker"]
