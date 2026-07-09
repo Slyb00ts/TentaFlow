@@ -44,14 +44,17 @@ pub const RESOLUTION: u32 = 560;
 #[cfg(feature = "inference-supertonic")]
 const INPUT_NAME: &str = "input";
 
-/// Env sterujący rozmiarem puli sesji ort detektora — hot path CV. Domyślnie 1 =
-/// ścieżka bit-identyczna z pojedynczą sesją (jeden forward naraz, checkout zawsze
-/// bierze slot 0), a >1 pozwala wielu batchowanym forwardom RF-DETR liczyć się
-/// równolegle na GPU (każda sesja to własna kopia modelu ≈2.6 GB VRAM).
+/// Env sterujący rozmiarem puli sesji ort detektora — hot path CV. >1 pozwala
+/// wielu batchowanym forwardom RF-DETR liczyć się równolegle na GPU (każda sesja
+/// to własna kopia modelu ≈2.6 GB VRAM), a detect-flush `inflight_limit` podąża
+/// za tą wartością.
 #[cfg(feature = "inference-supertonic")]
 const DETECTOR_SESSIONS_ENV: &str = "TENTAFLOW_VISION_DETECTOR_SESSIONS";
+// 4 pipelined batch-8 forwards measured ~1300 frames/s vs ~430 serialized on one
+// GPU (cam_scale sweep) — ~48 cameras @25fps with per-frame p99 inside the 40 ms
+// frame budget, vs ~16 at 1 session. Costs ~4×2.6 GB VRAM; override via the env.
 #[cfg(feature = "inference-supertonic")]
-const DEFAULT_DETECTOR_SESSIONS: usize = 1;
+const DEFAULT_DETECTOR_SESSIONS: usize = 4;
 
 /// Przybliżony rozmiar rezydentny JEDNEJ sesji RF-DETR na GPU (do komunikatu
 /// OOM). N sesji ≈ N×tyle VRAM — patrz fail-loud w [`RfDetrDetector::load`].
@@ -257,15 +260,15 @@ impl RfDetrDetector {
             fill_frame(&mut data, bi, rgb, w, h)?;
         }
 
-        let input = ndarray::Array4::from_shape_vec((n, 3, res, res), data)
-            .map_err(|e| anyhow!("rfdetr-ort: budowa tensora [{n},3,{res},{res}]: {e}"))?;
-
         // Forward + tensor extraction run on the session's dedicated thread (see
         // `SessionPool::run`), which exclusively owns the `ort::Session`. Only the
         // owned dets/labels buffers + derived dims cross back, so no per-thread
         // CUDA resources accumulate on this (arbitrary) caller thread.
         let (dets_owned, labels_owned, queries, label_dim) = self.pool.run(move |session| {
-            let value = ort::value::Value::from_array(input)
+            // `(shape, Vec)` hands the fill buffer to ort ZERO-COPY (ort keeps the
+            // Vec alive as the tensor's guard) — no ndarray round-trip, no second
+            // 30 MB copy of the batch.
+            let value = ort::value::Value::from_array(([n, 3, res, res], data))
                 .map_err(|e| anyhow!("rfdetr-ort: Value::from_array: {e}"))?;
             let outputs = session
                 .run(ort::inputs! { INPUT_NAME => value })
@@ -612,8 +615,9 @@ fn validate_detr_shapes(
 /// detections via [`slot_slices`] + `rfdetr_post::postprocess_image`. Shared by
 /// the host-tensor and device-tensor ort paths — the decode is identical, only
 /// the model input differs, so both paths yield bit-identical detections.
+/// `pub` so `examples/detect_post_bench.rs` can time the real decode.
 #[cfg(feature = "inference-supertonic")]
-fn decode_detr_batch(
+pub fn decode_detr_batch(
     dets_owned: &[f32],
     labels_owned: &[f32],
     n: usize,
@@ -657,12 +661,54 @@ fn slot_slices<'a>(
     )
 }
 
+/// Per-channel normalize lookup table: `lut[c][v] = (v/255 - MEAN[c]) / STD[c]`
+/// — the exact f32 expression [`fill_frame`] historically computed per pixel,
+/// memoized over all 256 byte values, so the hot loop is one table load per
+/// element with bit-identical output (3 KiB, stays in L1).
+fn normalize_lut() -> &'static [[f32; 256]; 3] {
+    static LUT: std::sync::OnceLock<[[f32; 256]; 3]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut lut = [[0f32; 256]; 3];
+        for c in 0..3 {
+            for (v, slot) in lut[c].iter_mut().enumerate() {
+                *slot = (v as f32 / 255.0 - MEAN[c]) / STD[c];
+            }
+        }
+        lut
+    })
+}
+
+/// Normalizes one already-560×560 RGB24 frame into a `[3, plane]` NCHW slot:
+/// single pass over the interleaved pixels, contiguous per-plane writes (the
+/// old per-pixel loop wrote all three planes strided, defeating store
+/// combining). The zip bounds every access, so the loop body is check-free.
+fn normalize_hwc_to_chw(out: &mut [f32], rgb: &[u8], plane: usize) {
+    debug_assert_eq!(rgb.len(), plane * 3, "RGB24 length must cover the plane");
+    let lut = normalize_lut();
+    let (r_plane, rest) = out.split_at_mut(plane);
+    let (g_plane, b_plane) = rest.split_at_mut(plane);
+    for (((px, r), g), b) in rgb
+        .chunks_exact(3)
+        .zip(r_plane.iter_mut())
+        .zip(g_plane.iter_mut())
+        .zip(b_plane.iter_mut())
+    {
+        *r = lut[0][px[0] as usize];
+        *g = lut[1][px[1] as usize];
+        *b = lut[2][px[2] as usize];
+    }
+}
+
 /// Writes one RGB24 frame into batch slot `bi` of a flat NCHW buffer:
 /// stretch-resize to 560×560, /255, per-channel ImageNet normalize.
-fn fill_frame(data: &mut [f32], bi: usize, rgb: &[u8], w: u32, h: u32) -> Result<()> {
+///
+/// `pub` so `examples/detect_post_bench.rs` can time the real host-tensor fill
+/// against a baseline copy without a model/GPU.
+pub fn fill_frame(data: &mut [f32], bi: usize, rgb: &[u8], w: u32, h: u32) -> Result<()> {
     let res = RESOLUTION as usize;
     let plane = res * res;
     let base = bi * 3 * plane;
+    let slot = &mut data[base..base + 3 * plane];
     // FAST PATH: the frame is already exactly 560×560 (GPU-scaled by the camera
     // ingest detect branch), so skip `resize_rgb` entirely — normalize + pack
     // straight from the borrowed buffer. This is what makes the pre-scaled
@@ -670,28 +716,12 @@ fn fill_frame(data: &mut [f32], bi: usize, rgb: &[u8], w: u32, h: u32) -> Result
     // the exact input length so a truncated/wrong-stride buffer can never index
     // out of bounds; anything else takes the CPU resize fallback below.
     if w == RESOLUTION && h == RESOLUTION && rgb.len() == plane * 3 {
-        for y in 0..res {
-            for x in 0..res {
-                let p = (y * res + x) * 3;
-                for c in 0..3 {
-                    let v = rgb[p + c] as f32 / 255.0;
-                    data[base + c * plane + y * res + x] = (v - MEAN[c]) / STD[c];
-                }
-            }
-        }
+        normalize_hwc_to_chw(slot, rgb, plane);
         return Ok(());
     }
     let resized = crate::vision::resize::resize_rgb(rgb, w, h, RESOLUTION, RESOLUTION)
         .map_err(|e| anyhow!("resize_rgb failed: {e}"))?;
-    for y in 0..res {
-        for x in 0..res {
-            let p = (y * res + x) * 3;
-            for c in 0..3 {
-                let v = resized[p + c] as f32 / 255.0;
-                data[base + c * plane + y * res + x] = (v - MEAN[c]) / STD[c];
-            }
-        }
-    }
+    normalize_hwc_to_chw(slot, &resized, plane);
     Ok(())
 }
 

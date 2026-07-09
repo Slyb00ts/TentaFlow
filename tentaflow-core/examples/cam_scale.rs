@@ -136,15 +136,31 @@ fn main() -> anyhow::Result<()> {
     // forward. Without it every camera thread calls detect_batch(1) directly and 60
     // threads contend on the detector session pool (perf: 31% CPU in futex/kernel) +
     // fire tiny per-camera launches — this coalesces them into big cross-camera batches.
+    // Sweep knobs for the detect batcher: `TENTAFLOW_BENCH_DETECT_WORKERS` pipelines
+    // N batched forwards across the detector session pool (needs sessions >= N);
+    // `TENTAFLOW_BENCH_DETECT_BATCH` caps the aggregation batch (RF-DETR batch 8 was
+    // measured optimal; 16 saturates) — used to find the p99-optimal config.
+    let env_usize = |k: &str, d: usize| {
+        std::env::var(k).ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n >= 1).unwrap_or(d)
+    };
     #[cfg(feature = "inference-supertonic")]
-    let detect_batcher = Arc::new(InferenceBatcher::<Vec<Detection>>::new(MAX_BATCH, batch_window(), {
-        let d = detector.clone();
-        Arc::new(move |frames: &[(Arc<[u8]>, u32, u32)]| {
-            let refs: Vec<(&[u8], u32, u32)> =
-                frames.iter().map(|(f, w, h)| (f.as_ref(), *w, *h)).collect();
-            d.detect_batch(&refs, None)
-        })
-    }));
+    let detect_workers = env_usize("TENTAFLOW_BENCH_DETECT_WORKERS", 1);
+    #[cfg(feature = "inference-supertonic")]
+    let detect_max_batch = env_usize("TENTAFLOW_BENCH_DETECT_BATCH", MAX_BATCH);
+    #[cfg(feature = "inference-supertonic")]
+    let detect_batcher = Arc::new(InferenceBatcher::<Vec<Detection>>::with_workers(
+        detect_max_batch,
+        batch_window(),
+        detect_workers,
+        {
+            let d = detector.clone();
+            Arc::new(move |frames: &[(Arc<[u8]>, u32, u32)]| {
+                let refs: Vec<(&[u8], u32, u32)> =
+                    frames.iter().map(|(f, w, h)| (f.as_ref(), *w, *h)).collect();
+                d.detect_batch(&refs, None)
+            })
+        },
+    ));
     // ADR batcher: a REAL cross-placard forward — `read_adr_batch` packs the
     // rows of every submitted placard into ONE tensor. (An earlier attempt that
     // looped `read_adr` per crop on the batcher worker only serialized the

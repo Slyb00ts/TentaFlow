@@ -70,9 +70,9 @@ struct Job<R> {
 /// camera through an `Arc`/`&'static`.
 pub struct InferenceBatcher<R> {
     job_tx: Sender<Job<R>>,
-    // Kept so the batcher owns its worker; on drop the sender closes and the
-    // worker's `recv` returns `Err`, so the thread exits instead of leaking.
-    _worker: JoinHandle<()>,
+    // Kept so the batcher owns its workers; on drop the sender closes and the
+    // workers' `recv` returns `Err`, so the threads exit instead of leaking.
+    _workers: Vec<JoinHandle<()>>,
 }
 
 impl<R> InferenceBatcher<R>
@@ -87,15 +87,37 @@ where
         window: Duration,
         run_batch: Arc<dyn Fn(&[(Arc<[u8]>, u32, u32)]) -> Result<Vec<R>> + Send + Sync>,
     ) -> Self {
+        Self::with_workers(max_batch, window, 1, run_batch)
+    }
+
+    /// Like [`new`], but with N workers draining ONE shared queue: while worker A's
+    /// forward runs on the GPU, worker B collects and launches the next batch, so
+    /// consecutive batched forwards PIPELINE across the model's session pool
+    /// instead of serializing on a single thread. Only useful when the session
+    /// pool has ≥ `workers` sessions — otherwise the extra workers just queue on
+    /// the pool. Result routing is unchanged (per-job channels).
+    pub fn with_workers(
+        max_batch: usize,
+        window: Duration,
+        workers: usize,
+        run_batch: Arc<dyn Fn(&[(Arc<[u8]>, u32, u32)]) -> Result<Vec<R>> + Send + Sync>,
+    ) -> Self {
         let (job_tx, job_rx) = unbounded::<Job<R>>();
         let max_batch = max_batch.max(1);
-        let worker = std::thread::Builder::new()
-            .name("vision-inference-batcher".to_string())
-            .spawn(move || worker_loop(job_rx, max_batch, window, run_batch))
-            .expect("spawn vision inference batcher worker");
+        let workers = workers.max(1);
+        let handles = (0..workers)
+            .map(|i| {
+                let rx = job_rx.clone();
+                let rb = run_batch.clone();
+                std::thread::Builder::new()
+                    .name(format!("vision-inference-batcher-{i}"))
+                    .spawn(move || worker_loop(rx, max_batch, window, rb))
+                    .expect("spawn vision inference batcher worker")
+            })
+            .collect();
         Self {
             job_tx,
-            _worker: worker,
+            _workers: handles,
         }
     }
 
