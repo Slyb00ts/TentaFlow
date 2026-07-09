@@ -275,12 +275,14 @@ pub struct VisionConfig {
     pub event_max_duration_secs: u64,
 
     /// RTSP lower transport for `rtsp://` cameras (GstRTSPLowerTrans flags
-    /// string). Default `"tcp"` = interleaved RTP inside the RTSP TCP
-    /// connection: across routed networks UDP media dies SILENTLY (conntrack /
-    /// NAT idle timeouts) while the control connection stays healthy — the
-    /// session then sits "ONLINE" with no frames. TCP cannot die silently.
-    /// Operators on a trusted L2 segment may set `"udp+udp-mcast+tcp"` to
-    /// prefer UDP. `rtsps://` URLs always use `"tcp+tls"` regardless.
+    /// string). Default `"udp+udp-mcast+tcp"` (UDP preferred). Interleaved
+    /// `"tcp"` was tried as a fix for UDP media dying silently across routed
+    /// networks, but rtspsrc pushes interleaved RTP synchronously from its
+    /// connection task and our tee chain's startup backpressure left the socket
+    /// unread (Recv-Q grew, session never came online) — measured on the live
+    /// camera. Until that is made compatible on a bench, UDP stays the default
+    /// and the 10 s mid-session stall watchdog covers silent UDP death.
+    /// `rtsps://` URLs always use `"tcp+tls"` regardless.
     #[serde(default = "default_rtsp_protocols")]
     pub rtsp_protocols: String,
 }
@@ -290,7 +292,7 @@ fn default_warmup_extra_secs() -> u32 {
 }
 
 fn default_rtsp_protocols() -> String {
-    "tcp".to_string()
+    "udp+udp-mcast+tcp".to_string()
 }
 
 impl Default for VisionConfig {
