@@ -747,6 +747,18 @@ pub async fn stop_all_supervised(
     };
     let mut errors: Vec<(i64, String)> = Vec::new();
     for svc in services {
+        // Czlonek distributed-deploymentu (cluster TP): kontener zyje NIEZALEZNIE
+        // od procesu core (detached docker) i serwuje klaster razem z rankami na
+        // INNYCH nodach. Restart/shutdown core nie moze go zatrzymywac — cyklem
+        // zycia zarzadza wylacznie cluster deploy/stop.
+        if distributed::service_is_distributed_member(&svc.config_json) {
+            tracing::info!(
+                service_id = svc.id,
+                engine = %svc.engine_id,
+                "shutdown: pomijam czlonka distributed-deploymentu (kontener zostaje)"
+            );
+            continue;
+        }
         let id = svc.id;
         let engine_id = svc.engine_id.clone();
         if let Err(e) = stop(&svc, ports.clone()).await {
