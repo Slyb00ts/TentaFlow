@@ -26,6 +26,10 @@ path = "src/bin/gen_csharp.rs"
 name = "tentaflow-sdk-gen-python"
 path = "src/bin/gen_python.rs"
 
+[[bin]]
+name = "tentaflow-sdk-gen-rust"
+path = "src/bin/gen_rust.rs"
+
 [dependencies]
 minicbor = { version = "2.2", default-features = false, features = ["alloc", "derive", "std"] }
 tentaflow-sdk-spec = { path = "../tentaflow-sdk-spec" }

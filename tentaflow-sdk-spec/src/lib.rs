@@ -44,6 +44,10 @@ pub use protocol::{
         RateLimitScope, RateLimitUpdate, RejectReason, Resume, ResumeMode, ResumeStatus,
         ServerLimits, SessionEnd, SessionEndCode,
     },
+    directory::{
+        DirectoryGroupOut, DirectoryGroupsOutput, DirectoryOrgOutput, DirectoryRoleOut,
+        DirectoryRolesOutput, DirectoryUserOut, DirectoryUsersOutput,
+    },
     doc_parse::{DocBlock, DocParseInput, DocParseOutput},
     document::{
         DocumentDeleteInput, DocumentDeleteOutput, DocumentGetInput, DocumentGetMeta,

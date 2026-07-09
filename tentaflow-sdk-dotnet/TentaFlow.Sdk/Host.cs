@@ -954,6 +954,254 @@ public static class Users
 }
 
 // -----------------------------------------------------------------------------
+// Directory (org users / groups / roles)
+// -----------------------------------------------------------------------------
+
+/// <summary>One active user of the caller's organization (directory_users_v1).</summary>
+public sealed class DirectoryUser
+{
+    public string Id { get; init; } = "";
+    public string Username { get; init; } = "";
+    public string DisplayName { get; init; } = "";
+    public string? Email { get; init; }
+    /// <summary>Group IDs (user_groups.id) the user belongs to.</summary>
+    public List<string> Groups { get; init; } = new();
+    public bool IsActive { get; init; }
+}
+
+/// <summary>One user group; MemberCount counts only active users of the caller's org.</summary>
+public sealed class DirectoryGroup
+{
+    public string Id { get; init; } = "";
+    public string Name { get; init; } = "";
+    public string Description { get; init; } = "";
+    public ulong MemberCount { get; init; }
+}
+
+/// <summary>One RBAC role (directory_roles_v1). Permission lists stay host-side.</summary>
+public sealed class DirectoryRole
+{
+    public string RoleId { get; init; } = "";
+    public string Name { get; init; } = "";
+}
+
+/// <summary>The caller's organization (directory_org_v1).</summary>
+public sealed class DirectoryOrg
+{
+    public string OrgId { get; init; } = "";
+    public string Name { get; init; } = "";
+    public string Slug { get; init; } = "";
+}
+
+/// <summary>
+/// Read-only directory of the caller org's users, groups, RBAC roles and the
+/// org itself. Backs sharing UIs (pick a person / group / org). All calls
+/// require the "directory.read" permission.
+/// Wire: CBOR Directory*Output shapes from tentaflow-sdk-spec (output-only ABI).
+/// </summary>
+public static class Directory
+{
+    /// <summary>Active users of the caller's organization.</summary>
+    public static List<DirectoryUser> Users()
+    {
+        var data = CallOutOnly(HostImports.DirectoryUsersV1, "directory_users_v1");
+        return DecodeUsers(data);
+    }
+
+    /// <summary>User groups with member counts scoped to the caller's org.</summary>
+    public static List<DirectoryGroup> Groups()
+    {
+        var data = CallOutOnly(HostImports.DirectoryGroupsV1, "directory_groups_v1");
+        return DecodeGroups(data);
+    }
+
+    /// <summary>RBAC roles (role_id + name).</summary>
+    public static List<DirectoryRole> Roles()
+    {
+        var data = CallOutOnly(HostImports.DirectoryRolesV1, "directory_roles_v1");
+        return DecodeRoles(data);
+    }
+
+    /// <summary>The caller's organization (org_id, name, slug).</summary>
+    public static DirectoryOrg Org()
+    {
+        var data = CallOutOnly(HostImports.DirectoryOrgV1, "directory_org_v1");
+        return DecodeOrg(data);
+    }
+
+    private delegate int OutOnlyFn(int outPtr, int outCap, int outLenPtr);
+
+    private static byte[] CallOutOnly(OutOnlyFn fn, string name)
+    {
+        var result = HostCalls.CallInOut(
+            (inPtr, inLen, outPtr, outCap, outLenPtr) => fn(outPtr, outCap, outLenPtr),
+            ReadOnlySpan<byte>.Empty);
+        if (result.Code != 0)
+        {
+            throw new HostCallException(name, result.Code);
+        }
+        return result.Data;
+    }
+
+    // Wire: DirectoryUsersOutput {0: [DirectoryUserOut {0: id, 1: username,
+    // 2: display_name, 3: email?, 4: [group_id], 5: is_active}]}.
+    internal static List<DirectoryUser> DecodeUsers(byte[] data)
+    {
+        var users = new List<DirectoryUser>();
+        var r = new Cbor.CborReader(data);
+        int outer = r.ReadMapHeader();
+        for (int f = 0; f < outer; f++)
+        {
+            ulong key = r.ReadUInt();
+            if (key != 0)
+            {
+                Value.Decode(r);
+                continue;
+            }
+            int count = r.ReadArrayHeader();
+            for (int i = 0; i < count; i++)
+            {
+                int n = r.ReadMapHeader();
+                string id = "", username = "", displayName = "";
+                string? email = null;
+                var groups = new List<string>();
+                bool isActive = false;
+                for (int j = 0; j < n; j++)
+                {
+                    ulong k = r.ReadUInt();
+                    switch (k)
+                    {
+                        case 0: id = r.ReadText(); break;
+                        case 1: username = r.ReadText(); break;
+                        case 2: displayName = r.ReadText(); break;
+                        case 3: email = r.TryReadNull() ? null : r.ReadText(); break;
+                        case 4:
+                            int gc = r.ReadArrayHeader();
+                            for (int g = 0; g < gc; g++)
+                            {
+                                groups.Add(r.ReadText());
+                            }
+                            break;
+                        case 5: isActive = r.ReadBool(); break;
+                        default: Value.Decode(r); break;
+                    }
+                }
+                users.Add(new DirectoryUser
+                {
+                    Id = id,
+                    Username = username,
+                    DisplayName = displayName,
+                    Email = email,
+                    Groups = groups,
+                    IsActive = isActive,
+                });
+            }
+        }
+        return users;
+    }
+
+    // Wire: DirectoryGroupsOutput {0: [DirectoryGroupOut {0: id, 1: name,
+    // 2: description, 3: member_count}]}.
+    internal static List<DirectoryGroup> DecodeGroups(byte[] data)
+    {
+        var groups = new List<DirectoryGroup>();
+        var r = new Cbor.CborReader(data);
+        int outer = r.ReadMapHeader();
+        for (int f = 0; f < outer; f++)
+        {
+            ulong key = r.ReadUInt();
+            if (key != 0)
+            {
+                Value.Decode(r);
+                continue;
+            }
+            int count = r.ReadArrayHeader();
+            for (int i = 0; i < count; i++)
+            {
+                int n = r.ReadMapHeader();
+                string id = "", name = "", description = "";
+                ulong memberCount = 0;
+                for (int j = 0; j < n; j++)
+                {
+                    ulong k = r.ReadUInt();
+                    switch (k)
+                    {
+                        case 0: id = r.ReadText(); break;
+                        case 1: name = r.ReadText(); break;
+                        case 2: description = r.ReadText(); break;
+                        case 3: memberCount = r.ReadUInt(); break;
+                        default: Value.Decode(r); break;
+                    }
+                }
+                groups.Add(new DirectoryGroup
+                {
+                    Id = id,
+                    Name = name,
+                    Description = description,
+                    MemberCount = memberCount,
+                });
+            }
+        }
+        return groups;
+    }
+
+    // Wire: DirectoryRolesOutput {0: [DirectoryRoleOut {0: role_id, 1: name}]}.
+    internal static List<DirectoryRole> DecodeRoles(byte[] data)
+    {
+        var roles = new List<DirectoryRole>();
+        var r = new Cbor.CborReader(data);
+        int outer = r.ReadMapHeader();
+        for (int f = 0; f < outer; f++)
+        {
+            ulong key = r.ReadUInt();
+            if (key != 0)
+            {
+                Value.Decode(r);
+                continue;
+            }
+            int count = r.ReadArrayHeader();
+            for (int i = 0; i < count; i++)
+            {
+                int n = r.ReadMapHeader();
+                string roleId = "", name = "";
+                for (int j = 0; j < n; j++)
+                {
+                    ulong k = r.ReadUInt();
+                    switch (k)
+                    {
+                        case 0: roleId = r.ReadText(); break;
+                        case 1: name = r.ReadText(); break;
+                        default: Value.Decode(r); break;
+                    }
+                }
+                roles.Add(new DirectoryRole { RoleId = roleId, Name = name });
+            }
+        }
+        return roles;
+    }
+
+    // Wire: DirectoryOrgOutput {0: org_id, 1: name, 2: slug}.
+    internal static DirectoryOrg DecodeOrg(byte[] data)
+    {
+        var r = new Cbor.CborReader(data);
+        int n = r.ReadMapHeader();
+        string orgId = "", name = "", slug = "";
+        for (int i = 0; i < n; i++)
+        {
+            ulong k = r.ReadUInt();
+            switch (k)
+            {
+                case 0: orgId = r.ReadText(); break;
+                case 1: name = r.ReadText(); break;
+                case 2: slug = r.ReadText(); break;
+                default: Value.Decode(r); break;
+            }
+        }
+        return new DirectoryOrg { OrgId = orgId, Name = name, Slug = slug };
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Model aliases (readonly)
 // -----------------------------------------------------------------------------
 

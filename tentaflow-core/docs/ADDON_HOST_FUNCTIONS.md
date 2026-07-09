@@ -397,6 +397,61 @@ Sprawdza czy uzytkownik ma dane uprawnienie.
 
 ---
 
+## 7a. Directory API
+
+Read-only katalog organizacji wolajacej instancji: uzytkownicy, grupy, role
+RBAC i sama organizacja. Przeznaczony pod UI udostepniania (wybor osoby /
+grupy / organizacji). Wszystkie cztery funkcje sa output-only (bez payloadu
+wejsciowego) — zakres wyznacza host z `AddonState` instancji (`org_id`,
+domyslnie `org-default` dla instancji systemowych). Struktury CBOR pochodza
+z `tentaflow-sdk-spec::directory`. Audit log per outcome, risk class B.
+
+**Wymagane uprawnienie:** `directory.read` (deklaracja `[[permission]]` w
+manifescie + grant per-user; wywolania systemowe wg CR-006).
+
+### `directory_users_v1(out_ptr, out_cap, out_len_ptr) -> i32`
+
+Aktywni czlonkowie organizacji wolajacego (JOIN `org_memberships`).
+Pola credentiali (`password_hash`, `sso_*`) nigdy nie przekraczaja ABI.
+
+**Wyjscie** (CBOR `DirectoryUsersOutput`):
+`{users: [{id, username, display_name, email?, groups: [group_id], is_active}]}`
+— `groups` niesie ID grup (`user_groups.id`), nie nazwy.
+
+### `directory_groups_v1(out_ptr, out_cap, out_len_ptr) -> i32`
+
+Grupy uzytkownikow. `user_groups` nie ma kolumny org — grupy sa globalne
+dla platformy; scoping org wyraza `member_count`, ktory liczy WYLACZNIE
+aktywnych uzytkownikow bedacych czlonkami organizacji wolajacego.
+
+**Wyjscie** (CBOR `DirectoryGroupsOutput`):
+`{groups: [{id, name, description, member_count}]}`
+
+### `directory_roles_v1(out_ptr, out_cap, out_len_ptr) -> i32`
+
+Role RBAC (preseed + własne). Lista uprawnien roli celowo NIE jest
+eksponowana do addonow.
+
+**Wyjscie** (CBOR `DirectoryRolesOutput`): `{roles: [{role_id, name}]}`
+
+### `directory_org_v1(out_ptr, out_cap, out_len_ptr) -> i32`
+
+Organizacja wolajacej instancji.
+
+**Wyjscie** (CBOR `DirectoryOrgOutput`): `{org_id, name, slug}`
+
+**Zwraca (wszystkie cztery):** `AbiError` (0 = OK). `Permission` bez
+uprawnienia `directory.read`. `NotFound` (tylko `directory_org_v1`) gdy
+wiersz organizacji nie istnieje. Limit odpowiedzi:
+`PayloadKind::ServiceCall` (8 MiB) + retry pattern `OutputBufferTooSmall`.
+
+**SDK (Rust):** `directory_users()`, `directory_groups()`,
+`directory_roles()`, `directory_org()`.
+**SDK (C#):** `Directory.Users()`, `Directory.Groups()`,
+`Directory.Roles()`, `Directory.Org()`.
+
+---
+
 ## 8. LLM API
 
 Generowanie tekstu przez modele LLM dostepne w systemie.

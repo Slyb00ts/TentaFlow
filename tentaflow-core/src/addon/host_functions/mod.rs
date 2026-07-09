@@ -13,6 +13,7 @@ pub mod camera;
 pub mod camera_metadata;
 pub mod cbor_io;
 pub mod config;
+pub mod directory;
 pub mod doc_parse;
 pub mod document;
 pub mod events;
@@ -227,6 +228,35 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
             user::user_check_permission,
         )
         .map_err(|e| anyhow::anyhow!("Rejestracja user_check_permission: {e}"))?;
+
+    // --- Directory API (read-only org users/groups/roles for sharing UIs) ---
+    linker
+        .func_wrap(
+            "tentaflow",
+            "directory_users_v1",
+            directory::directory_users_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja directory_users_v1: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tentaflow",
+            "directory_groups_v1",
+            directory::directory_groups_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja directory_groups_v1: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tentaflow",
+            "directory_roles_v1",
+            directory::directory_roles_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja directory_roles_v1: {e}"))?;
+
+    linker
+        .func_wrap("tentaflow", "directory_org_v1", directory::directory_org_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja directory_org_v1: {e}"))?;
 
     // --- Secrets API ---
     linker

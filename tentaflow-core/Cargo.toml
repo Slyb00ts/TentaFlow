@@ -433,6 +433,12 @@ wiremock = "0.6"
 dhat = "0.3"
 filetime = "0.2.29"
 
+# Drives host_functions::directory::test_api, which is compiled only with
+# the test-support feature (it bypasses check_permission + audit).
+[[test]]
+name = "directory_host_functions"
+required-features = ["test-support"]
+
 [[bench]]
 name = "noop"
 harness = false

@@ -42,6 +42,7 @@
 
 pub mod gen_csharp;
 pub mod gen_python;
+pub mod gen_rust;
 pub mod manifest;
 pub mod message;
 pub mod validation;

@@ -30,6 +30,11 @@ pub mod ui {
     pub use tentaflow_ui_schema::*;
 }
 
+/// Typed UI catalog v1 (`ui_render_cbor` wire): generated re-exports of the
+/// `tentaflow-sdk-spec` component/enum/inline/union catalog plus the panel /
+/// slot / state message client and handler builders.
+pub mod ui_v1;
+
 // =============================================================================
 // AbiError — kanoniczne kody bledow ABI dla F1a host functions
 // =============================================================================
@@ -523,6 +528,14 @@ extern "C" {
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
+
+    /// Directory API — read-only CBOR views of the caller org's users,
+    /// groups, RBAC roles and the org itself (`tentaflow-sdk-spec::directory`
+    /// shapes). Output-only ABI; requires the "directory.read" permission.
+    fn directory_users_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn directory_groups_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn directory_roles_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn directory_org_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
 
     /// Streaming API (F1a M1.W7) — frame bus + PickupToken. Frame bytes are
     /// NOT inlined in `stream_next` output; the addon receives `frame_ref`
@@ -1055,6 +1068,107 @@ pub fn stt_transcribe(
         text: out.text,
         detected_language: out.detected_language,
         duration_ms: out.duration_ms,
+    })
+}
+
+// =============================================================================
+// High-level wrappers — Directory (org users / groups / roles)
+// =============================================================================
+
+/// One active user of the caller's organization. `groups` carries group IDs.
+#[derive(Debug, Clone)]
+pub struct DirectoryUser {
+    pub id: String,
+    pub username: String,
+    pub display_name: String,
+    pub email: Option<String>,
+    pub groups: Vec<String>,
+    pub is_active: bool,
+}
+
+/// One user group; `member_count` counts only active users of the caller's org.
+#[derive(Debug, Clone)]
+pub struct DirectoryGroup {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub member_count: u64,
+}
+
+/// One RBAC role (preseed + custom). Permission lists are host-side only.
+#[derive(Debug, Clone)]
+pub struct DirectoryRole {
+    pub role_id: String,
+    pub name: String,
+}
+
+/// The caller's organization.
+#[derive(Debug, Clone)]
+pub struct DirectoryOrg {
+    pub org_id: String,
+    pub name: String,
+    pub slug: String,
+}
+
+/// Lists the active users of the caller's organization (id, username,
+/// display name, e-mail, group IDs). Requires the "directory.read" permission.
+pub fn directory_users() -> Result<Vec<DirectoryUser>, AbiError> {
+    let bytes = call_host_no_input(directory_users_v1)?;
+    let out: tentaflow_sdk_spec::DirectoryUsersOutput = decode_cbor(&bytes)?;
+    Ok(out
+        .users
+        .into_iter()
+        .map(|u| DirectoryUser {
+            id: u.id,
+            username: u.username,
+            display_name: u.display_name,
+            email: u.email,
+            groups: u.groups,
+            is_active: u.is_active,
+        })
+        .collect())
+}
+
+/// Lists user groups with member counts scoped to the caller's organization.
+/// Requires the "directory.read" permission.
+pub fn directory_groups() -> Result<Vec<DirectoryGroup>, AbiError> {
+    let bytes = call_host_no_input(directory_groups_v1)?;
+    let out: tentaflow_sdk_spec::DirectoryGroupsOutput = decode_cbor(&bytes)?;
+    Ok(out
+        .groups
+        .into_iter()
+        .map(|g| DirectoryGroup {
+            id: g.id,
+            name: g.name,
+            description: g.description,
+            member_count: g.member_count,
+        })
+        .collect())
+}
+
+/// Lists RBAC roles (role_id + name). Requires the "directory.read" permission.
+pub fn directory_roles() -> Result<Vec<DirectoryRole>, AbiError> {
+    let bytes = call_host_no_input(directory_roles_v1)?;
+    let out: tentaflow_sdk_spec::DirectoryRolesOutput = decode_cbor(&bytes)?;
+    Ok(out
+        .roles
+        .into_iter()
+        .map(|r| DirectoryRole {
+            role_id: r.role_id,
+            name: r.name,
+        })
+        .collect())
+}
+
+/// Returns the caller's organization (org_id, name, slug). Requires the
+/// "directory.read" permission. `NotFound` when the org row does not exist.
+pub fn directory_org() -> Result<DirectoryOrg, AbiError> {
+    let bytes = call_host_no_input(directory_org_v1)?;
+    let out: tentaflow_sdk_spec::DirectoryOrgOutput = decode_cbor(&bytes)?;
+    Ok(DirectoryOrg {
+        org_id: out.org_id,
+        name: out.name,
+        slug: out.slug,
     })
 }
 

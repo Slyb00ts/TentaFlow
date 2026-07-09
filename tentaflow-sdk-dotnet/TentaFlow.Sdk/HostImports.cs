@@ -178,6 +178,26 @@ internal static partial class HostImports
         int resourcePtr, int resourceLen,
         int accessLevelPtr, int accessLevelLen);
 
+    // --- Directory (org users / groups / roles) ---
+    // Output-only ABI: CBOR Directory*Output shapes from tentaflow-sdk-spec.
+    // All four require the "directory.read" permission.
+
+    [DllImport(Module, EntryPoint = "directory_users_v1")]
+    [WasmImportLinkage]
+    internal static extern int DirectoryUsersV1(int outPtr, int outCap, int outLenPtr);
+
+    [DllImport(Module, EntryPoint = "directory_groups_v1")]
+    [WasmImportLinkage]
+    internal static extern int DirectoryGroupsV1(int outPtr, int outCap, int outLenPtr);
+
+    [DllImport(Module, EntryPoint = "directory_roles_v1")]
+    [WasmImportLinkage]
+    internal static extern int DirectoryRolesV1(int outPtr, int outCap, int outLenPtr);
+
+    [DllImport(Module, EntryPoint = "directory_org_v1")]
+    [WasmImportLinkage]
+    internal static extern int DirectoryOrgV1(int outPtr, int outCap, int outLenPtr);
+
     // --- Model aliases (readonly; requires the "alias.read" permission) ---
 
     // No input; writes a JSON `{ "aliases": [AvailableAlias...] }` document — the
