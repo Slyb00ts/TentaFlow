@@ -3186,6 +3186,29 @@ pub async fn run_rtsp_session(
                         break Some("upgrading back to the preferred ingest path".into());
                     }
 
+                    // Mid-session stall watchdog: a pipeline can stop delivering
+                    // frames WITHOUT any bus error (camera stops sending RTP, a
+                    // branch wedges) — before this check the session stayed
+                    // "ONLINE" with a black tile forever. 10 s without a frame on
+                    // a continuous RTSP stream means dead: reconnect through the
+                    // normal path (the warmup/degrade cascade takes it from there).
+                    if online {
+                        let now_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        if let Some(t) = last_at {
+                            if now_unix.saturating_sub(t) > 10 {
+                                tracing::warn!(
+                                    camera_id = %cam_id,
+                                    stalled_for_s = now_unix.saturating_sub(t),
+                                    "rtsp: stream stalled (frames stopped) — reconnecting"
+                                );
+                                break Some("stream stalled — no frames for 10 s".into());
+                            }
+                        }
+                    }
+
                     let status = if online {
                         CameraStatus::Online
                     } else {
