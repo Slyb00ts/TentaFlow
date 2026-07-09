@@ -1186,6 +1186,18 @@ Fields:
   4: resizable       bool
   5: primary_slot    tstr
   6: secondary_slot  tstr
+  7: collapse_below  Breakpoint or null             // below this container width the split
+                                                    // stacks as a column (primary above
+                                                    // secondary); divider/resize disabled
+  8: divider         SplitDivider or null           // "handle" (default) | "line" | "none"
+                                                    // handle = classic draggable bar;
+                                                    // line = hairline (still draggable when
+                                                    // resizable); none = hidden divider,
+                                                    // panes separated by a standard gap
+  9: grow            bool or null                   // self-as-flex-child: true = split
+                                                    // wypelnia wolna przestrzen rodzica flex
+                                                    // (flex-grow:1, basis zostaje auto);
+                                                    // brak/false = rozmiar od contentu
 
 SplitSize (discriminated union, always CBOR map z `kind`):
   - { kind: "auto" }
@@ -1561,6 +1573,8 @@ Fields:
   4: avatar          AvatarRef or null
   5: selected        BindRef<bool> or null            // dla "selectable" variant
   6: removable       bool                             // adds X button
+  7: dot             Tone or null                     // leading status dot colored by
+                                                      // this tone, independent of chip tone
 Handlers:
   "click":           Handler (jeśli selectable/toggle)
   "remove":          Handler (jeśli removable)
@@ -2009,6 +2023,9 @@ Fields:
   16: readonly       BindRef<bool> or null
   17: error          BindRef<tstr> or null            // shown when not null
   18: size           InputSize                        // "sm" | "md" | "lg"
+  19: variant        InputVariant or null             // "outlined" (default) | "ghost"
+                                                      // ghost = borderless/transparent field
+                                                      // blending into content (inline titles)
 Handlers:
   "input":           Handler                           // emitted on each keystroke (debounce-able)
   "change":          Handler                           // emitted on blur z committed value
@@ -2049,6 +2066,7 @@ Fields:
   12: autoresize     bool                             // grow with content
   13: max_rows       u8 or null                      // cap autoresize
   14: monospace      bool                             // dla code-style input
+  15: variant        InputVariant or null             // "outlined" (default) | "ghost"
 Handlers:
   "input":           Handler
   "change":          Handler
@@ -3352,7 +3370,7 @@ Handlers:
 
 ### 0x0703 — `RelationGraph`
 
-Graph visualization (D3-based) dla Contacts/CRM.
+Graph visualization (Canvas 2D, force-directed) dla Contacts/CRM/Notes.
 
 ```
 Fields:
