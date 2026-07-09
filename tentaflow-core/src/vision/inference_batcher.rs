@@ -214,8 +214,19 @@ pub(crate) async fn state_batcher() -> Option<&'static InferenceBatcher<Vec<Stri
     static B: OnceCell<Option<InferenceBatcher<Vec<String>>>> = OnceCell::const_new();
     B.get_or_init(|| async {
         let classifier: Arc<StateClassifier> = get_classifier().await?;
+        // GPU-resident preprocess (fused resize+normalize on GPU + device tensor,
+        // parity-verified, ~5.5x faster than the CPU preprocess). Falls back to the
+        // CPU classify_batch on error so a preprocess/CUDA failure never drops a
+        // batch — same runtime-fallback contract as the zero-copy paths.
         let run_batch: Arc<dyn Fn(&[(Arc<[u8]>, u32, u32)]) -> Result<Vec<Vec<String>>> + Send + Sync> =
-            Arc::new(move |crops| classifier.classify_batch(crops));
+            Arc::new(move |crops| {
+                let refs: Vec<(&[u8], u32, u32)> =
+                    crops.iter().map(|(c, w, h)| (c.as_ref(), *w, *h)).collect();
+                classifier.classify_batch_gpu(&refs).or_else(|e| {
+                    tracing::warn!("state batcher: GPU preprocess failed ({e}); CPU fallback");
+                    classifier.classify_batch(crops)
+                })
+            });
         Some(InferenceBatcher::new(MAX_BATCH, batch_window(), run_batch))
     })
     .await
@@ -232,6 +243,34 @@ pub(crate) async fn plate_batcher() -> Option<&'static InferenceBatcher<Option<S
         let run_batch: Arc<
             dyn Fn(&[(Arc<[u8]>, u32, u32)]) -> Result<Vec<Option<String>>> + Send + Sync,
         > = Arc::new(move |crops| ocr.read_batch(crops));
+        Some(InferenceBatcher::new(MAX_BATCH, batch_window(), run_batch))
+    })
+    .await
+    .as_ref()
+}
+
+/// Process-wide ADR-OCR batcher, lazily built on first use over the process ADR
+/// singleton. Every submitted placard crop coalesces with placards from all
+/// other cameras into ONE cross-placard `read_adr_batch` forward (all rows of
+/// all placards in a single `[total_rows,1,32,128]` tensor), instead of one
+/// small 2-row forward per placard. `R` is the raw `(kemler, un)` read — the
+/// caller applies the same `snap_adr` catalog snap as the per-crop path. `None`
+/// when the ADR model is unavailable — callers then take the per-crop executor
+/// path (which keeps the PP-OCRv5 fallback).
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+pub(crate) async fn adr_batcher() -> Option<&'static InferenceBatcher<Option<(String, String)>>> {
+    static B: OnceCell<Option<InferenceBatcher<Option<(String, String)>>>> = OnceCell::const_new();
+    B.get_or_init(|| async {
+        // `adr_ocr::get` builds the ort/TRT session pool on first call — keep
+        // that heavy load off the async worker.
+        let adr: Arc<crate::vision::adr_ocr::AdrOcr> =
+            tokio::task::spawn_blocking(crate::vision::adr_ocr::get)
+                .await
+                .ok()
+                .flatten()?;
+        let run_batch: Arc<
+            dyn Fn(&[(Arc<[u8]>, u32, u32)]) -> Result<Vec<Option<(String, String)>>> + Send + Sync,
+        > = Arc::new(move |crops| Ok(adr.read_adr_batch(crops)));
         Some(InferenceBatcher::new(MAX_BATCH, batch_window(), run_batch))
     })
     .await

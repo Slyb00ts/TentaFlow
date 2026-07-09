@@ -2785,6 +2785,58 @@ async fn run_cold_stages(
                     }
                 }
             }
+            // ADR placards: submit every crop to the cross-camera ADR batcher —
+            // the rows of ALL placards (from all cameras) run as ONE forward
+            // instead of one tiny 2-row forward per placard. A crop the CRNN
+            // could not read (or whose UN failed the `snap_adr` catalog snap)
+            // keeps today's per-crop executor path, which retries the CRNN and
+            // then falls back to PP-OCRv5 — exactly `ocr_adr_local`'s
+            // semantics, so no read is ever lost to batching.
+            #[cfg(all(
+                feature = "inference-supertonic",
+                not(any(target_os = "macos", target_os = "ios"))
+            ))]
+            (CvOp::Ocr, Some("plate-ocr")) if matches!(ocr_mode, CvOcrMode::Adr) => {
+                match adr_batch_local(&crops).await {
+                    Some(reads) if reads.len() == crops.len() => {
+                        let mut outputs: Vec<CachedEnrich> = reads
+                            .into_iter()
+                            .map(|tekst| CachedEnrich {
+                                stan: Vec::new(),
+                                tekst,
+                                tekst_votes: Vec::new(),
+                                at: Instant::now(),
+                            })
+                            .collect();
+                        let missed: Vec<usize> = outputs
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, o)| o.tekst.is_none())
+                            .map(|(i, _)| i)
+                            .collect();
+                        if !missed.is_empty() {
+                            let missed_items: Vec<_> =
+                                missed.iter().map(|&i| items[i].clone()).collect();
+                            let fallback = cold_stage_per_crop(
+                                &executor,
+                                &stage.model,
+                                op,
+                                ocr_mode.clone(),
+                                &missed_items,
+                            )
+                            .await;
+                            for (&i, value) in missed.iter().zip(fallback) {
+                                outputs[i] = value;
+                            }
+                        }
+                        outputs
+                    }
+                    _ => {
+                        cold_stage_per_crop(&executor, &stage.model, op, ocr_mode.clone(), &items)
+                            .await
+                    }
+                }
+            }
             _ => cold_stage_per_crop(&executor, &stage.model, op, ocr_mode.clone(), &items).await,
         };
 
@@ -2925,6 +2977,43 @@ async fn read_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Option<
             Ok(t) => reads.push(t),
             Err(e) => {
                 warn_throttled("ocr", &format!("plate batcher submit: {e:#}"));
+                return None;
+            }
+        }
+    }
+    Some(reads)
+}
+
+/// COLD batched local ADR OCR: every placard crop of the stage is SUBMITTED to
+/// the process-wide cross-camera ADR batcher, so the rows of ALL placards from
+/// ALL cameras aggregate into one `AdrOcr::read_adr_batch` forward instead of a
+/// tiny 2-row forward per placard. The raw `(kemler, un)` read gets the same
+/// `snap_adr` catalog snap as `ocr_adr_local`; a per-crop `None` (nothing read /
+/// UN not in the catalog) is a RESULT — the caller re-routes just those crops
+/// through the per-crop executor path to keep the PP-OCRv5 fallback. Outer
+/// `None` (batcher unavailable / any submit error) → the caller falls back
+/// per-crop for the whole stage (never loses enrichment). `submit_all` blocks
+/// on the blocking pool, off the tokio worker.
+#[cfg(all(
+    feature = "inference-supertonic",
+    not(any(target_os = "macos", target_os = "ios"))
+))]
+async fn adr_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Option<String>>> {
+    let batcher = crate::vision::inference_batcher::adr_batcher().await?;
+    let crops = crops.to_vec();
+    let results = match tokio::task::spawn_blocking(move || batcher.submit_all(&crops)).await {
+        Ok(results) => results,
+        Err(e) => {
+            warn_throttled("ocr", &format!("adr batcher task: {e}"));
+            return None;
+        }
+    };
+    let mut reads = Vec::with_capacity(results.len());
+    for r in results {
+        match r {
+            Ok(read) => reads.push(read.and_then(|(_, un)| crate::vision::adr::snap_adr(&un))),
+            Err(e) => {
+                warn_throttled("ocr", &format!("adr batcher submit: {e:#}"));
                 return None;
             }
         }

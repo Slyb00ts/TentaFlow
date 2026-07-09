@@ -145,6 +145,18 @@ fn main() -> anyhow::Result<()> {
             d.detect_batch(&refs, None)
         })
     }));
+    // ADR batcher: a REAL cross-placard forward — `read_adr_batch` packs the
+    // rows of every submitted placard into ONE tensor. (An earlier attempt that
+    // looped `read_adr` per crop on the batcher worker only serialized the
+    // placards and measured slower; the shared forward is the win, not routing.)
+    #[cfg(feature = "inference-supertonic")]
+    let adr_batcher = adr.clone().map(|a| {
+        Arc::new(InferenceBatcher::<Option<(String, String)>>::new(
+            MAX_BATCH,
+            batch_window(),
+            Arc::new(move |crops: &[(Arc<[u8]>, u32, u32)]| Ok(a.read_adr_batch(crops))),
+        ))
+    });
     // Frame as Arc for the detect batcher submit path (560×560×3 synthetic).
     let det_frame_arc: Arc<[u8]> =
         Arc::from(vec![128u8; (RESOLUTION * RESOLUTION * 3) as usize].into_boxed_slice());
@@ -152,7 +164,7 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "inference-supertonic")]
     let batched_note = if args.batched {
         format!(
-            " [batched: state/plate via cross-camera batcher, window {}µs, max {}]",
+            " [batched: state/plate/adr via cross-camera batcher, window {}µs, max {}]",
             batch_window().as_micros(),
             MAX_BATCH
         )
@@ -243,6 +255,8 @@ fn main() -> anyhow::Result<()> {
             #[cfg(feature = "inference-supertonic")]
             let detect_batcher = detect_batcher.clone();
             #[cfg(feature = "inference-supertonic")]
+            let adr_batcher = adr_batcher.clone();
+            #[cfg(feature = "inference-supertonic")]
             let det_frame_arc = det_frame_arc.clone();
             let det_frame = det_frame.clone();
             let state_crops = state_crops.clone();
@@ -300,12 +314,26 @@ fn main() -> anyhow::Result<()> {
                             let _ = classifier.classify_batch(&state_crops);
                             let _ = ocr.read_batch(&plate_crops);
                         }
-                        // ADR stays per-camera: read_adr is one forward per placard,
-                        // so a batcher would only serialize it on one worker (measured
-                        // slower). The contended-but-parallel pool path wins here; a
-                        // real gain needs read_adr_batch (cross-placard), not routing.
-                        if let Some(a) = &adr {
-                            let _ = a.read_adr(&adr_crop, 128, 160);
+                        // ADR in --batched goes through the cross-placard batcher:
+                        // one `read_adr_batch` forward covers the rows of every
+                        // camera's placard collected in the window.
+                        #[cfg(feature = "inference-supertonic")]
+                        let did_adr_batched = if batched {
+                            if let Some(b) = &adr_batcher {
+                                let _ = b.submit(adr_crop.clone(), 128, 160);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        #[cfg(not(feature = "inference-supertonic"))]
+                        let did_adr_batched = false;
+                        if !did_adr_batched {
+                            if let Some(a) = &adr {
+                                let _ = a.read_adr(&adr_crop, 128, 160);
+                            }
                         }
                     }
                     local.push(t0.elapsed().as_secs_f64() * 1000.0);

@@ -50,7 +50,7 @@ pub mod burn_depth_anything;
 
 #[cfg(feature = "inference-vision-gpu")]
 pub mod classifier_stan;
-// Cross-camera dynamic-batching inference front-end. Aggregates state/plate
+// Cross-camera dynamic-batching inference front-end. Aggregates state/plate/adr
 // crops from ALL cameras into one big batched forward per model (ort/TRT path).
 #[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
 pub mod inference_batcher;

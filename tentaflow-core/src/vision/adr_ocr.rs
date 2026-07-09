@@ -15,7 +15,10 @@
 //         * CTC greedy decode (blank=0, kompresja powtórzeń), pewność = średnia
 //           softmax-max po wybranych krokach,
 //         * split górny/dolny wiersz z 6% przerwą wokół linii środkowej,
-//         * orientation-search 0/90/180/270 z heurystyką długości.
+//         * orientation-search 0/90/180/270 z heurystyką długości,
+//         * `read_adr_batch`: cross-placard batch — wiersze WIELU tablic w
+//           jednym forwardzie `[total_rows,1,32,128]` (ścieżka pojedyncza jest
+//           batchem o jednym elemencie, więc wyniki są identyczne).
 //       Numer UN dociągamy do katalogu przez `adr::snap_adr`. Ten silnik jest
 //       GŁÓWNYM czytnikiem ADR; PP-OCRv5 (`onnx_ocr`) jest fallbackiem, gdy nasz
 //       model jest niedostępny lub nic nie odczyta (patrz `local_cv::ocr_adr_local`).
@@ -115,6 +118,16 @@ const ADR_SESSIONS_ENV: &str = "TENTAFLOW_ADR_SESSIONS";
 #[cfg(feature = "inference-supertonic")]
 const DEFAULT_ADR_SESSIONS: usize = 4;
 
+/// TRT dynamic-batch profile bounds for the ROW batch (`[rows,1,32,128]`).
+/// Cross-placard batching (`read_adr_batch`) packs `2×orientations` rows per
+/// placard, so the max covers a full 16-placard batcher flush at the default
+/// 1 orientation (16 × 2 = 32 rows). Forwards larger than the max are chunked
+/// (`forward_batch_chunked`) so an input never falls outside the pinned TRT
+/// shape range — out-of-range inputs would force a slow engine rebuild.
+const ADR_ROWS_MAX_BATCH: usize = 32;
+#[cfg(feature = "inference-supertonic")]
+const ADR_ROWS_OPT_BATCH: usize = 16;
+
 /// Ładuje model CRNN (tract) z USTALONYM wejściem `[1,1,32,128]` (NCHW f32). Model
 /// niesie dynamiczne kształty (Shape/Gather/Reshape wokół LSTM), więc czyścimy
 /// fakty wyjść pośrednich i pozwalamy tractowi wywnioskować kształty z wejścia.
@@ -176,9 +189,12 @@ impl AdrOcr {
             return Err(anyhow!("adr-ocr: alfabet {} jest pusty", alphabet_path.display()));
         }
 
-        // Ścieżka ort+TensorRT: pula sesji na `adr_ocr.onnx`. Wejście NCHW
-        // [1,1,32,128] jest STAŁE (batch 1), więc TRT buduje jeden engine bez
-        // profilu kształtu; LSTM w grafie spada wewnętrznie na CUDA EP (nadal GPU).
+        // ort+TensorRT path: session pool on `adr_ocr.onnx`. The NCHW input
+        // [rows,1,32,128] has a VARIABLE batch (2×orientations rows per placard,
+        // and `read_adr_batch` packs the rows of MANY placards), so pin a TRT
+        // profile over 1..=ADR_ROWS_MAX_BATCH — without it the TRT EP would
+        // rebuild an engine on the first forward of EVERY new batch size. The
+        // LSTM in the graph internally falls to the CUDA EP (still GPU).
         #[cfg(feature = "inference-supertonic")]
         {
             crate::vision::ort_common::ensure_ort_dylib();
@@ -186,10 +202,27 @@ impl AdrOcr {
                 ADR_SESSIONS_ENV,
                 DEFAULT_ADR_SESSIONS,
             );
+            let trt_profile = std::fs::read(&model_path)
+                .ok()
+                .and_then(|bytes| crate::vision::ort_common::onnx_first_input_name(&bytes))
+                .map(|input_name| crate::vision::ort_common::TrtShapeProfile {
+                    input_name,
+                    min_batch: 1,
+                    opt_batch: ADR_ROWS_OPT_BATCH,
+                    max_batch: ADR_ROWS_MAX_BATCH,
+                    channels: 1,
+                    height: IMG_H,
+                    width: IMG_W,
+                });
+            if trt_profile.is_none() {
+                warn!(
+                    "[adr-ocr] could not resolve the ONNX input name; TRT falls back to lazy per-batch-size engine builds"
+                );
+            }
             let pool = crate::vision::ort_common::build_session_pool_from_file(
                 &model_path,
                 &dir.join("trt-cache-adr"),
-                None,
+                trt_profile.as_ref(),
                 n,
                 // FP32 — fp16 corrupts Kemler/UN digit reads (30/1863 → 20/1066).
                 crate::vision::ort_common::ocr_fp16(),
@@ -301,6 +334,29 @@ impl AdrOcr {
             .collect()
     }
 
+    /// Chunked wrapper over `forward_batch`: a row batch larger than
+    /// [`ADR_ROWS_MAX_BATCH`] is split into profile-sized forwards, so a
+    /// cross-placard batch never falls outside the pinned TRT shape range
+    /// (an out-of-range input triggers a slow engine rebuild, not an error).
+    fn forward_batch_chunked(
+        &self,
+        data: Vec<f32>,
+        n: usize,
+    ) -> Result<Vec<(Vec<f32>, usize, usize)>> {
+        if n <= ADR_ROWS_MAX_BATCH {
+            return self.forward_batch(data, n);
+        }
+        let per = (IMG_H * IMG_W) as usize;
+        let mut out = Vec::with_capacity(n);
+        let mut start = 0usize;
+        while start < n {
+            let end = (start + ADR_ROWS_MAX_BATCH).min(n);
+            out.extend(self.forward_batch(data[start * per..end * per].to_vec(), end - start)?);
+            start = end;
+        }
+        Ok(out)
+    }
+
     /// CTC greedy decode zgodny z `read_batch`: per krok softmax → argmax; znak
     /// `alphabet[v-1]` gdy `v≠0` i `v≠prev`; pewność = średnia softmax-max po
     /// wybranych (niepustych, nie-powtórzonych) krokach.
@@ -338,102 +394,153 @@ impl AdrOcr {
     /// conf_un`, +0.15 gdy `len(kemler)∈{2,3}`, +0.25 gdy `len(un)==4`. Zwraca
     /// `(kemler, un)` z najlepszej orientacji albo `None`, gdy nic sensownego
     /// (oba wiersze puste) — wtedy `local_cv` schodzi na fallback PP-OCRv5.
+    /// The single-crop path IS a one-element batch — zero logic drift from
+    /// [`Self::read_adr_batch`].
     pub fn read_adr(&self, crop_rgb: &[u8], cw: u32, ch: u32) -> Option<(String, String)> {
-        if cw == 0 || ch == 0 {
-            return None;
-        }
-        let expected = (cw as usize) * (ch as usize) * 3;
-        if crop_rgb.len() < expected {
-            return None;
-        }
-        let gray = rgb_to_gray(&crop_rgb[..expected], cw, ch);
+        self.read_adr_batch_refs(&[(crop_rgb, cw, ch)])
+            .pop()
+            .flatten()
+    }
 
-        // Zbierz wiersze (`orientations` orientacji × góra/dół) do jednego batcha i
-        // policz je JEDNYM forwardem. `slots[k]` mapuje orientację na pozycje w
-        // batchu (None gdy wiersz pusty/za mały po podziale). Liczba orientacji z
-        // `adr_orientations()`: domyślnie 1 (tylko pionowa) — kamery stacjonarne
-        // patrzą na planszę pionowo, więc obroty 90/180/270 to zwykle 7/8 forwardów
-        // zmarnowanych. `TENTAFLOW_ADR_ORIENTATIONS=4` włącza pełne wyszukiwanie dla
-        // ujęć, gdzie tablice VID bywają obrócone.
+    /// Cross-placard batched read: the same per-placard math as
+    /// [`Self::read_adr`], but the rows of ALL crops (2×orientations per crop)
+    /// are packed into ONE `[total_rows,1,32,128]` tensor and computed by one
+    /// pooled forward (chunked at [`ADR_ROWS_MAX_BATCH`] to stay inside the TRT
+    /// profile). Result `i` corresponds to crop `i` and is identical to a
+    /// per-crop `read_adr` call.
+    pub fn read_adr_batch(&self, crops: &[(Arc<[u8]>, u32, u32)]) -> Vec<Option<(String, String)>> {
+        let refs: Vec<(&[u8], u32, u32)> =
+            crops.iter().map(|(c, w, h)| (c.as_ref(), *w, *h)).collect();
+        self.read_adr_batch_refs(&refs)
+    }
+
+    /// Shared core of the single and batched paths: prep every crop's rows
+    /// (`prep_rows`), pack them into one batch, forward, CTC decode, then score
+    /// orientations + dump per crop. The slot map carries GLOBAL batch
+    /// positions, so logits route back to the exact (placard, orientation, row).
+    fn read_adr_batch_refs(&self, crops: &[(&[u8], u32, u32)]) -> Vec<Option<(String, String)>> {
+        if crops.is_empty() {
+            return Vec::new();
+        }
+        // Orientation count from `adr_orientations()`: default 1 (upright only)
+        // — stationary cameras see the placard upright, so the 90/180/270
+        // rotations are usually wasted forwards. `TENTAFLOW_ADR_ORIENTATIONS=4`
+        // enables the full search for feeds where VID placards come rotated.
         let orientations = adr_orientations();
         let per = (IMG_H * IMG_W) as usize;
-        let mut batch: Vec<f32> = Vec::with_capacity(2 * orientations * per);
-        let mut slots: Vec<(Option<usize>, Option<usize>)> = Vec::with_capacity(orientations);
-        let mut n = 0usize;
-        // k=0 to oryginał; kolejne to np.rot90 zaaplikowane k razy (CCW).
-        let mut rot = gray;
-        let (mut rw, mut rh) = (cw, ch);
-        for k in 0..orientations {
-            if k > 0 {
-                let (r, nw, nh) = rot90_ccw(&rot, rw, rh);
-                rot = r;
-                rw = nw;
-                rh = nh;
-            }
-            let (top, top_h, bot, bot_h) = split_rows(&rot, rw, rh);
-            let ti = match preprocess_row(top, rw, top_h) {
-                Some(d) => {
-                    batch.extend_from_slice(&d);
-                    let idx = n;
-                    n += 1;
-                    Some(idx)
-                }
-                None => None,
-            };
-            let bi = match preprocess_row(bot, rw, bot_h) {
-                Some(d) => {
-                    batch.extend_from_slice(&d);
-                    let idx = n;
-                    n += 1;
-                    Some(idx)
-                }
-                None => None,
-            };
-            slots.push((ti, bi));
+        let mut batch: Vec<f32> = Vec::with_capacity(crops.len() * 2 * orientations * per);
+        let mut next = 0usize;
+        // Per crop: orientation slot map → batch positions (None = invalid crop
+        // or no rows at all — exactly the cases where the single-crop path used
+        // to bail out before the forward).
+        let crop_slots: Vec<Option<Vec<(Option<usize>, Option<usize>)>>> = crops
+            .iter()
+            .map(|&(rgb, cw, ch)| prep_rows(rgb, cw, ch, orientations, &mut batch, &mut next))
+            .collect();
+        if next == 0 {
+            return vec![None; crops.len()];
         }
-        if n == 0 {
-            return None;
-        }
-        let decoded: Vec<(String, f32)> = match self.forward_batch(batch, n) {
+        let decoded: Vec<(String, f32)> = match self.forward_batch_chunked(batch, next) {
             Ok(items) => items
                 .iter()
                 .map(|(logits, t, c)| self.ctc_greedy_decode(logits, *t, *c))
                 .collect(),
             Err(e) => {
                 warn!("[adr-ocr] batch forward: {e}");
-                return None;
+                return vec![None; crops.len()];
             }
         };
 
-        let mut best: Option<(f32, String, String)> = None;
-        for (ti, bi) in slots {
-            let (kemler, kc) = ti.map(|i| decoded[i].clone()).unwrap_or_default();
-            let (un, uc) = bi.map(|i| decoded[i].clone()).unwrap_or_default();
-            let mut score = kc + uc;
-            if (2..=3).contains(&kemler.len()) {
-                score += 0.15;
-            }
-            if un.len() == 4 {
-                score += 0.25;
-            }
-            if best.as_ref().map(|b| score > b.0).unwrap_or(true) {
-                best = Some((score, kemler, un));
-            }
-        }
+        crops
+            .iter()
+            .zip(crop_slots)
+            .map(|(&(rgb, cw, ch), slots)| {
+                let slots = slots?;
+                let mut best: Option<(f32, String, String)> = None;
+                for (ti, bi) in slots {
+                    let (kemler, kc) = ti.map(|i| decoded[i].clone()).unwrap_or_default();
+                    let (un, uc) = bi.map(|i| decoded[i].clone()).unwrap_or_default();
+                    let mut score = kc + uc;
+                    if (2..=3).contains(&kemler.len()) {
+                        score += 0.15;
+                    }
+                    if un.len() == 4 {
+                        score += 0.25;
+                    }
+                    if best.as_ref().map(|b| score > b.0).unwrap_or(true) {
+                        best = Some((score, kemler, un));
+                    }
+                }
 
-        if crop_rgb.len() >= expected {
-            let (label, score) = match &best {
-                Some((s, k, u)) => (format!("{k}_{u}"), *s),
-                None => ("none".to_string(), 0.0),
-            };
-            dump_adr(&crop_rgb[..expected], cw, ch, &label, score);
-        }
+                // `prep_rows` returned Some, so the buffer holds `expected` bytes.
+                let expected = (cw as usize) * (ch as usize) * 3;
+                let (label, score) = match &best {
+                    Some((s, k, u)) => (format!("{k}_{u}"), *s),
+                    None => ("none".to_string(), 0.0),
+                };
+                dump_adr(&rgb[..expected], cw, ch, &label, score);
 
-        match best {
-            Some((_, kemler, un)) if !kemler.is_empty() || !un.is_empty() => Some((kemler, un)),
-            _ => None,
-        }
+                match best {
+                    Some((_, kemler, un)) if !kemler.is_empty() || !un.is_empty() => {
+                        Some((kemler, un))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
     }
+}
+
+/// Preps ALL rows of ONE placard for the shared batch: grayscale →
+/// `orientations` rotation variants (k=0 original; each further k applies
+/// np.rot90 once more, CCW) → `split_rows` → `preprocess_row`. Row data is
+/// appended to `batch` and `next` (the global position counter) grows by every
+/// appended row. Returns the orientation slot map with GLOBAL positions (a
+/// `None` slot = row empty/too small) or `None` when the crop is invalid or
+/// yielded no rows at all.
+fn prep_rows(
+    crop_rgb: &[u8],
+    cw: u32,
+    ch: u32,
+    orientations: usize,
+    batch: &mut Vec<f32>,
+    next: &mut usize,
+) -> Option<Vec<(Option<usize>, Option<usize>)>> {
+    if cw == 0 || ch == 0 {
+        return None;
+    }
+    let expected = (cw as usize) * (ch as usize) * 3;
+    if crop_rgb.len() < expected {
+        return None;
+    }
+    let gray = rgb_to_gray(&crop_rgb[..expected], cw, ch);
+
+    let mut slots: Vec<(Option<usize>, Option<usize>)> = Vec::with_capacity(orientations);
+    let mut produced = false;
+    let mut rot = gray;
+    let (mut rw, mut rh) = (cw, ch);
+    for k in 0..orientations {
+        if k > 0 {
+            let (r, nw, nh) = rot90_ccw(&rot, rw, rh);
+            rot = r;
+            rw = nw;
+            rh = nh;
+        }
+        let (top, top_h, bot, bot_h) = split_rows(&rot, rw, rh);
+        let mut push = |data: Option<Vec<f32>>| {
+            data.map(|d| {
+                batch.extend_from_slice(&d);
+                let idx = *next;
+                *next += 1;
+                produced = true;
+                idx
+            })
+        };
+        let ti = push(preprocess_row(top, rw, top_h));
+        let bi = push(preprocess_row(bot, rw, bot_h));
+        slots.push((ti, bi));
+    }
+    produced.then_some(slots)
 }
 
 /// Env-gated ADR crop dump (`TENTAFLOW_OCR_DUMP_DIR`): writes the raw RGB crop
