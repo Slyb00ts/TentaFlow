@@ -71,6 +71,17 @@ pub const MODEL_BATCH: usize = 8;
 const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const STD: [f32; 3] = [0.229, 0.224, 0.225];
 
+#[cfg(feature = "inference-supertonic")]
+thread_local! {
+    /// Reusable host input buffer for `detect_batch`. Grows to the largest
+    /// batch this thread has seen and then stays resident, so the per-batch
+    /// ~30 MB alloc + page-fault churn of a fresh `Vec` is paid once. Passed
+    /// to ort as a BORROWED tensor (raw pointer, blocking run) — see the
+    /// safety comment in `detect_batch`.
+    static HOST_INPUT_SCRATCH: std::cell::RefCell<Vec<f32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// `rfdetr-classes.json` shape: `{ "classes": [...], "resolution": 560 }`.
 #[derive(Debug, Deserialize)]
 struct ClassesFile {
@@ -255,57 +266,79 @@ impl RfDetrDetector {
 
         // Preprocessing WSPÓŁDZIELONY z Burn (`fill_frame`): stretch-resize 560×560,
         // /255, ImageNet normalize. Bufor bez slotów paddingowych — N=liczba klatek.
-        let mut data = vec![0f32; n * 3 * res * res];
-        for (bi, &(rgb, w, h)) in frames.iter().enumerate() {
-            fill_frame(&mut data, bi, rgb, w, h)?;
-        }
+        // The fill target is a REUSED thread-local scratch: a fresh ~30 MB Vec per
+        // batch costs ~1.3 ms of alloc + page-fault churn (measured by
+        // examples/detect_post_bench.rs); the scratch faults once and stays hot.
+        HOST_INPUT_SCRATCH.with(|cell| {
+            let mut data = cell.borrow_mut();
+            let need = n * 3 * res * res;
+            if data.len() < need {
+                data.resize(need, 0.0);
+            }
+            for (bi, &(rgb, w, h)) in frames.iter().enumerate() {
+                fill_frame(&mut data[..need], bi, rgb, w, h)?;
+            }
 
-        // Forward + tensor extraction run on the session's dedicated thread (see
-        // `SessionPool::run`), which exclusively owns the `ort::Session`. Only the
-        // owned dets/labels buffers + derived dims cross back, so no per-thread
-        // CUDA resources accumulate on this (arbitrary) caller thread.
-        let (dets_owned, labels_owned, queries, label_dim) = self.pool.run(move |session| {
-            // `(shape, Vec)` hands the fill buffer to ort ZERO-COPY (ort keeps the
-            // Vec alive as the tensor's guard) — no ndarray round-trip, no second
-            // 30 MB copy of the batch.
-            let value = ort::value::Value::from_array(([n, 3, res, res], data))
-                .map_err(|e| anyhow!("rfdetr-ort: Value::from_array: {e}"))?;
-            let outputs = session
-                .run(ort::inputs! { INPUT_NAME => value })
-                .map_err(|e| anyhow!("rfdetr-ort: session.run: {e}"))?;
+            // Forward + tensor extraction run on the session's dedicated thread (see
+            // `SessionPool::run`), which exclusively owns the `ort::Session`. Only the
+            // owned dets/labels buffers + derived dims cross back, so no per-thread
+            // CUDA resources accumulate on this (arbitrary) caller thread. The input
+            // crosses as a raw pointer wrapped into a BORROWED CPU tensor (the same
+            // `MemoryInfo::default()` an owned `Value::from_array` would carry), so
+            // the scratch is never copied or given away — mirror of the device-path
+            // pattern in `forward_device_ptr`.
+            let data_ptr = data.as_mut_ptr() as usize;
+            let (dets_owned, labels_owned, queries, label_dim) = self.pool.run(move |session| {
+                // SAFETY: `data_ptr` covers exactly `n·3·res·res` initialized f32 in
+                // this caller thread's scratch. `pool.run` BLOCKS until the forward
+                // completes and the scratch is thread-local behind a RefCell borrow
+                // held for this whole scope, so nothing can reallocate or reuse it
+                // mid-run.
+                let value = unsafe {
+                    ort::value::TensorRefMut::<f32>::from_raw(
+                        ort::memory::MemoryInfo::default(),
+                        (data_ptr as *mut ()).cast(),
+                        ort::value::Shape::new([n as i64, 3, res as i64, res as i64]),
+                    )
+                }
+                .map_err(|e| anyhow!("rfdetr-ort: TensorRefMut::from_raw: {e}"))?;
+                let outputs = session
+                    .run(ort::inputs! { INPUT_NAME => value })
+                    .map_err(|e| anyhow!("rfdetr-ort: session.run: {e}"))?;
 
-            let (dets_shape, dets_v) = outputs["dets"]
-                .try_extract_tensor::<f32>()
-                .map_err(|e| anyhow!("rfdetr-ort: extract dets: {e}"))?;
-            let (labels_shape, labels_v) = outputs["labels"]
-                .try_extract_tensor::<f32>()
-                .map_err(|e| anyhow!("rfdetr-ort: extract labels: {e}"))?;
+                let (dets_shape, dets_v) = outputs["dets"]
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| anyhow!("rfdetr-ort: extract dets: {e}"))?;
+                let (labels_shape, labels_v) = outputs["labels"]
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| anyhow!("rfdetr-ort: extract labels: {e}"))?;
 
-            // Walidacja kształtów PRZED slicowaniem — WSPÓLNA z detect_batch_gpu,
-            // więc oba wejścia (host tensor tu, device tensor tam) egzekwują ten
-            // sam kontrakt grafu.
-            let (queries, label_dim) = validate_detr_shapes(
-                dets_shape,
-                labels_shape,
-                dets_v.len(),
-                labels_v.len(),
+                // Walidacja kształtów PRZED slicowaniem — WSPÓLNA z detect_batch_gpu,
+                // więc oba wejścia (host tensor tu, device tensor tam) egzekwują ten
+                // sam kontrakt grafu.
+                let (queries, label_dim) = validate_detr_shapes(
+                    dets_shape,
+                    labels_shape,
+                    dets_v.len(),
+                    labels_v.len(),
+                    n,
+                    num_classes,
+                )?;
+                Ok((dets_v.to_vec(), labels_v.to_vec(), queries, label_dim))
+            })?;
+
+            // Decode WSPÓLNY z detect_batch_gpu — współrzędne detekcji nie mogą się
+            // różnić między ścieżką host-tensor a device-tensor.
+            Ok(decode_detr_batch(
+                &dets_owned,
+                &labels_owned,
                 n,
-                num_classes,
-            )?;
-            Ok((dets_v.to_vec(), labels_v.to_vec(), queries, label_dim))
-        })?;
-
-        // Decode WSPÓLNY z detect_batch_gpu — współrzędne detekcji nie mogą się
-        // różnić między ścieżką host-tensor a device-tensor.
-        Ok(decode_detr_batch(
-            &dets_owned,
-            &labels_owned,
-            n,
-            queries,
-            label_dim,
-            &self.classes,
-            threshold,
-        ))
+                queries,
+                label_dim,
+                &self.classes,
+                threshold,
+            ))
+        })
     }
 
     /// GPU-resident detect: mirror of [`RfDetrDetector::detect_batch`] whose

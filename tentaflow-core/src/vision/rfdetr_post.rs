@@ -33,12 +33,40 @@ pub fn postprocess_image(
 ) -> Vec<Detection> {
     let num_classes = classes.len();
     let score_threshold = threshold.unwrap_or(DEFAULT_SCORE_THRESHOLD);
+    // Conservative pre-gate in logit space: sigmoid is strictly monotonic, so a
+    // query can only pass `sigmoid(best) > t` when `best > logit(t)`. The 1e-3
+    // margin absorbs f32 rounding of ln/exp (orders of magnitude larger than
+    // their error near the gate), so the pre-gate can only let borderline
+    // queries THROUGH to the exact sigmoid check below — never drop one the
+    // exact check would keep. Degenerate thresholds (<=0, >=1, NaN) disable the
+    // gate entirely and fall through to the exact check, preserving historical
+    // behavior bit-for-bit. This skips the per-query `exp` for the vast
+    // majority of DETR queries (typically ~300 per image, few above threshold).
+    let logit_gate = if score_threshold > 0.0 && score_threshold < 1.0 {
+        (score_threshold / (1.0 - score_threshold)).ln() - 1e-3
+    } else {
+        f32::NEG_INFINITY
+    };
     let mut items = Vec::new();
     for q in 0..queries {
-        let logits = &labels[q * label_dim..q * label_dim + label_dim];
+        let logits = &labels[q * label_dim..q * label_dim + num_classes];
+        // Pass 1: value-only running max over the real classes (background slot
+        // excluded by the slice bound) — a branch-free select fold the compiler
+        // can keep in registers. NaN logits never win (`>` is false), same as
+        // the index-tracking fold below.
+        let mut max_logit = f32::NEG_INFINITY;
+        for &l in logits {
+            max_logit = if l > max_logit { l } else { max_logit };
+        }
+        if max_logit < logit_gate {
+            continue;
+        }
+        // Pass 2 (rare — only near/above threshold): the original first-max
+        // argmax fold, so index tie-breaking and the reported score are exactly
+        // the historical ones.
         let mut best_idx = 0usize;
         let mut best_logit = f32::NEG_INFINITY;
-        for (idx, &l) in logits.iter().take(num_classes).enumerate() {
+        for (idx, &l) in logits.iter().enumerate() {
             if l > best_logit {
                 best_logit = l;
                 best_idx = idx;
@@ -131,5 +159,57 @@ mod tests {
         let out = postprocess_image(&dets, &labels, 1, 3, &cls, Some(0.05));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].klasa, "class-1");
+    }
+
+    /// The logit-space pre-gate must be output-invisible: randomized logits
+    /// (including values landing arbitrarily close to the threshold) decoded
+    /// through `postprocess_image` must match a naive sigmoid-per-query
+    /// reference bit-for-bit, for regular AND degenerate thresholds.
+    #[test]
+    fn logit_pregate_matches_naive_reference() {
+        let queries = 400usize;
+        let label_dim = 18usize;
+        let num_classes = 17usize;
+        let cls = classes(num_classes);
+
+        // Deterministic LCG; logits spread across [-10, 10] so plenty of
+        // queries straddle every tested threshold.
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 40) as f32 / (1u64 << 24) as f32) * 20.0 - 10.0
+        };
+        let labels: Vec<f32> = (0..queries * label_dim).map(|_| next()).collect();
+        let dets: Vec<f32> = (0..queries * 4).map(|_| (next() + 10.0) / 20.0).collect();
+
+        for thr in [None, Some(0.0), Some(0.05), Some(0.5), Some(0.9999), Some(1.0)] {
+            let t = thr.unwrap_or(DEFAULT_SCORE_THRESHOLD);
+            // Naive reference: unconditional argmax + sigmoid per query.
+            let mut expected = Vec::new();
+            for q in 0..queries {
+                let logits = &labels[q * label_dim..q * label_dim + num_classes];
+                let (mut bi, mut bl) = (0usize, f32::NEG_INFINITY);
+                for (i, &l) in logits.iter().enumerate() {
+                    if l > bl {
+                        bl = l;
+                        bi = i;
+                    }
+                }
+                let score = sigmoid(bl);
+                if score > t {
+                    expected.push((q, bi, score));
+                }
+            }
+            let got = postprocess_image(&dets, &labels, queries, label_dim, &cls, thr);
+            assert_eq!(got.len(), expected.len(), "count mismatch at thr={thr:?}");
+            for (d, (q, bi, score)) in got.iter().zip(&expected) {
+                assert_eq!(d.klasa, cls[*bi], "class mismatch at thr={thr:?} q={q}");
+                assert_eq!(
+                    d.score.to_bits(),
+                    score.to_bits(),
+                    "score bits mismatch at thr={thr:?} q={q}"
+                );
+            }
+        }
     }
 }

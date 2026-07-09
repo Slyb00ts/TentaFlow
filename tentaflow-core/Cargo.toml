@@ -525,6 +525,12 @@ required-features = ["inference-vision-gpu", "inference-supertonic"]
 name = "ocr_deskew_ab"
 required-features = ["inference-vision-gpu", "inference-supertonic"]
 
+# CPU micro-bench for the detector's host-tensor fill + shared DETR decode,
+# with bit-identity gates against baseline copies of the pre-optimization code.
+[[example]]
+name = "detect_post_bench"
+required-features = ["inference-vision-gpu", "inference-supertonic"]
+
 [[test]]
 name = "agent_run_inline_region_e2e"
 required-features = ["test-support"]

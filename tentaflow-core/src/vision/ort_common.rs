@@ -743,6 +743,15 @@ fn session_builder_with_eps(
                 .with_profile_opt_shapes(profile.shape_spec(profile.opt_batch))
                 .with_profile_max_shapes(profile.shape_spec(profile.max_batch));
         }
+        // CUDA Graphs (opt-in): capture the whole TRT forward once and replay it,
+        // collapsing hundreds of per-forward kernel launches into one graph launch.
+        // Targets the measured launch-bound detect plateau (~1300 forwards*batch/s
+        // regardless of session count). Opt-in because graph capture requires
+        // stable shapes per session — mixed batch sizes re-capture and can regress;
+        // enable when the batcher feeds mostly-full fixed batches.
+        if std::env::var("TENTAFLOW_VISION_TRT_CUDA_GRAPH").is_ok_and(|v| v.trim() == "1") {
+            trt = trt.with_cuda_graph(true);
+        }
         eps.push(trt.build());
         // CUDA — dotychczasowa, działająca ścieżka; teraz MIĘKKO (bez
         // error_on_failure), bo poprzedza ją TensorRT. Ten sam `device_id` co TRT,
