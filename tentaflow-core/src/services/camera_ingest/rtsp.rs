@@ -2609,6 +2609,16 @@ pub async fn run_rtsp_session(
     } else {
         resolve_ingest_path(&config)
     };
+    // The path this session PREFERS. When the session ends up ONLINE but on a
+    // lower rung (a camera recovering from RTSP-session stress delivers its
+    // first frames too slowly for the warmup window and lands on CPU decode),
+    // one automatic upgrade reconnect is attempted after the stream has been
+    // stable for PATH_UPGRADE_AFTER — by then the camera is warm and the
+    // preferred-path warmup succeeds where the cold start didn't. Without this
+    // a degraded session stays on software decode until an unrelated reconnect.
+    let preferred_path = ingest_path;
+    let mut path_upgrade_attempted = false;
+    const PATH_UPGRADE_AFTER: Duration = Duration::from_secs(300);
     // Czy w wariancie CPU pozwolić decodebinowi autoplugować dekoder sprzętowy
     // (best-effort). Nieużywane dla ścieżki GPU-resident. Po nieudanej
     // negocjacji HW w wariancie CPU schodzimy na dekodowanie programowe.
@@ -2886,6 +2896,7 @@ pub async fn run_rtsp_session(
 
         let bus = pipeline.bus().expect("pipeline has bus");
         let mut online = false;
+        let mut online_at: Option<tokio::time::Instant> = None;
         let mut last_total: u64 = 0;
         let mut fps_window: std::collections::VecDeque<f32> =
             std::collections::VecDeque::with_capacity(30);
@@ -3141,6 +3152,7 @@ pub async fn run_rtsp_session(
                     if !online {
                         if total > 0 {
                             online = true;
+                            online_at = Some(tokio::time::Instant::now());
                             // Successful connect — clear backoff state so the
                             // next disconnect starts the schedule fresh.
                             attempt = 0;
@@ -3154,6 +3166,24 @@ pub async fn run_rtsp_session(
                         } else if tokio::time::Instant::now() >= warmup_deadline {
                             break Some("no frames within warmup window".into());
                         }
+                    } else if !path_upgrade_attempted
+                        && ingest_path != preferred_path
+                        && online_at.is_some_and(|t| t.elapsed() >= PATH_UPGRADE_AFTER)
+                    {
+                        // Self-heal a degraded path: stable ONLINE on a lower rung →
+                        // one reconnect at the preferred path this session. The
+                        // camera is warm now, so the preferred-path warmup gets
+                        // frames immediately; if it still fails, the normal degrade
+                        // cascade brings the stream back and no further upgrade is
+                        // attempted until the next session.
+                        path_upgrade_attempted = true;
+                        ingest_path = preferred_path;
+                        tracing::info!(
+                            camera_id = %cam_id,
+                            path = preferred_path.label(),
+                            "rtsp: stream stable on a degraded path — retrying the preferred path"
+                        );
+                        break Some("upgrading back to the preferred ingest path".into());
                     }
 
                     let status = if online {
