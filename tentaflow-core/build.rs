@@ -1290,6 +1290,9 @@ mod services_manifest_build {
         /// GUI deploy wizard can offer the engine for cluster targets.
         #[serde(default)]
         pub cluster_capable: Option<bool>,
+        /// Mirror of runtime `Engine.cluster_launch` ("ray" default / "vllm-mp").
+        #[serde(default)]
+        pub cluster_launch: Option<String>,
         pub default_port: u16,
         pub api: ApiKind,
         pub version: String,

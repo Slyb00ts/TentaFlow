@@ -36,6 +36,7 @@ fn make_engine(id: &str, category: Category) -> Engine {
         gpu_supported: None,
         dgx_spark: None,
         cluster_capable: None,
+        cluster_launch: None,
         service_surfaces: None,
         input_modalities: None,
         output_modalities: None,
@@ -1006,6 +1007,7 @@ mod capability_axes {
             speculator_num_tokens: None,
             vllm: None,
             checkpoint_file: None,
+            quant_variants: vec![],
         }
     }
 

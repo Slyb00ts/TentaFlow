@@ -1204,13 +1204,16 @@ async fn deploy_distributed_local(
 }
 
 /// Buduje per-node spec, wstrzykujac `_target_node_id` do `config_json` (tylko
-/// koordynator go czyta — `build_member_config_json` przepuszcza nieznane klucze).
+/// koordynator go czyta — `build_member_config_json` przepuszcza nieznane klucze)
+/// oraz `_mp_node_rank` (rank czlonka dla trybu `cluster_launch = "vllm-mp"`;
+/// nieszkodliwy dla trybu Ray).
 #[allow(clippy::too_many_arguments)]
 fn build_member_spec(
     deployment_cluster_id: &str,
     cluster_id: &str,
     engine_id: &str,
     role: &str,
+    mp_node_rank: u32,
     member: &crate::db::models::DbClusterMember,
     model: &str,
     served: &str,
@@ -1234,6 +1237,10 @@ fn build_member_spec(
         obj.insert(
             "_target_node_id".to_string(),
             serde_json::Value::String(member.node_id.clone()),
+        );
+        obj.insert(
+            "_mp_node_rank".to_string(),
+            serde_json::Value::from(mp_node_rank),
         );
     }
     tentaflow_protocol::mesh::DistributedDeploySpec {
@@ -1409,10 +1416,12 @@ pub async fn cluster_deploy(
     // Na unified memory (GB10/Spark) 119GB jest dzielone CPU+GPU, wiec 0.9 kaze vLLM
     // alokowac ~107GB i OOM-killuje rank0 przy TP init. Bezpieczny default 0.5; user
     // moze nadpisac w wizardzie jesli wie ile ma naglowka.
-    let gpu_mem = gpu_memory_utilization.unwrap_or(if engine_id == "vllm-spark" {
-        0.5
-    } else {
-        0.90
+    let gpu_mem = gpu_memory_utilization.unwrap_or(match engine_id.as_str() {
+        "vllm-spark" => 0.5,
+        // Zweryfikowany profil DSpark na GB10 (VLLM_SKIP_INIT_MEMORY_CHECK=1
+        // w obrazie pozwala na 0.85 mimo unified memory).
+        "vllm-dspark" => 0.85,
+        _ => 0.90,
     });
     let max_len = max_model_len.unwrap_or(8192);
     let ray_port: u16 = 6379;
@@ -1454,6 +1463,14 @@ pub async fn cluster_deploy(
     let mut persisted_members: Vec<crate::db::models::DbClusterDeploymentMember> = Vec::new();
     for (idx, m) in members.iter().enumerate() {
         let role = if idx == head_idx { "head" } else { "worker" };
+        // Rank vllm-mp: head=0, workery kolejno 1..n-1 (unikalne, ciagle).
+        let mp_rank = if idx == head_idx {
+            0
+        } else if idx < head_idx {
+            idx as u32 + 1
+        } else {
+            idx as u32
+        };
         specs.push((
             idx,
             build_member_spec(
@@ -1461,6 +1478,7 @@ pub async fn cluster_deploy(
                 cluster_id,
                 engine_id,
                 role,
+                mp_rank,
                 m,
                 &model,
                 &served,
@@ -2006,21 +2024,28 @@ async fn run_cluster_deploy_phases(
         return;
     }
 
-    cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 45, "P3: Ray GCS head");
-    info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P3: wait head Ray GCS");
-    if let Err(e) = poll_node_readiness(
-        ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
-        expected_nodes, ReadyPhase::GcsUp, gcs_timeout,
-    )
-    .await
-    {
-        cdeploy_fail(
-            ctx, &qm, &log_sender, &local_id, &deployment_cluster_id, serve_port, dist_port,
-            &head_node_id, endpoint_url, &persisted_members, statuses,
-            format!("Ray GCS head nie wstał: {e}"), start_ms,
+    // Tryb vllm-mp (natywny multi-node vLLM): brak Raya — P3 (GCS) i pozniejszy
+    // gate ClusterReady nie maja czego sondowac. Workery startuja pelne
+    // `vllm serve --headless` juz w P4 i czekaja na mastera TCPStore, ktorego
+    // binduje dopiero serve head-a w P5 (worker-first, jak wymaga mp init).
+    let vllm_mp = crate::services::deploy::distributed::engine_is_vllm_mp(&engine_id);
+    if !vllm_mp {
+        cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 45, "P3: Ray GCS head");
+        info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P3: wait head Ray GCS");
+        if let Err(e) = poll_node_readiness(
+            ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
+            expected_nodes, ReadyPhase::GcsUp, gcs_timeout,
         )
-        .await;
-        return;
+        .await
+        {
+            cdeploy_fail(
+                ctx, &qm, &log_sender, &local_id, &deployment_cluster_id, serve_port, dist_port,
+                &head_node_id, endpoint_url, &persisted_members, statuses,
+                format!("Ray GCS head nie wstał: {e}"), start_ms,
+            )
+            .await;
+            return;
+        }
     }
 
     cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 60, "P4: start workerów (join Ray)");
@@ -2060,20 +2085,22 @@ async fn run_cluster_deploy_phases(
         }
     }
 
-    cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 70, "P4: klaster Ray gotowy");
-    if let Err(e) = poll_node_readiness(
-        ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
-        expected_nodes, ReadyPhase::ClusterReady, gcs_timeout,
-    )
-    .await
-    {
-        cdeploy_fail(
-            ctx, &qm, &log_sender, &local_id, &deployment_cluster_id, serve_port, dist_port,
-            &head_node_id, endpoint_url, &persisted_members, statuses,
-            format!("workery nie dołączyły do klastra Ray w czasie: {e}"), start_ms,
+    if !vllm_mp {
+        cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 70, "P4: klaster Ray gotowy");
+        if let Err(e) = poll_node_readiness(
+            ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
+            expected_nodes, ReadyPhase::ClusterReady, gcs_timeout,
         )
-        .await;
-        return;
+        .await
+        {
+            cdeploy_fail(
+                ctx, &qm, &log_sender, &local_id, &deployment_cluster_id, serve_port, dist_port,
+                &head_node_id, endpoint_url, &persisted_members, statuses,
+                format!("workery nie dołączyły do klastra Ray w czasie: {e}"), start_ms,
+            )
+            .await;
+            return;
+        }
     }
 
     cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 80, "P5: start vllm serve");

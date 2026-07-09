@@ -1958,6 +1958,7 @@ mod tests {
                 default_port: 8000,
                 dgx_spark: None,
                 cluster_capable: None,
+                cluster_launch: None,
                 api: ApiKind::OpenaiCompatible,
                 version: "0".into(),
                 service_surfaces: None,
