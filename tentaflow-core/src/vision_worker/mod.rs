@@ -1,14 +1,18 @@
 // ===== File: vision_worker/mod.rs — slim vision worker process runtime =====
 //
-// Stage A of docs/VISION_WORKER_SHARDING.md: the `tentaflow vision-worker`
-// subcommand boots THIS runtime instead of the full router. It carries only
-// what the vision path needs — logging (set up by main.rs), shared paths, a
-// strictly READ-ONLY SQLite pool, GStreamer, the vision singletons and a
-// LOCAL-ONLY ModelRuntimeExecutor. There is deliberately NO HTTP API, NO mesh
-// identity, NO flow engine and NO dashboard here. All parameters arrive as
-// CLI args from the spawning supervisor (no environment contract).
+// docs/VISION_WORKER_SHARDING.md: the `tentaflow vision-worker` subcommand
+// boots THIS runtime instead of the full router. It carries only what the
+// vision path needs — logging (set up by main.rs), shared paths, a strictly
+// READ-ONLY SQLite pool, GStreamer, the vision singletons, a LOCAL-ONLY
+// ModelRuntimeExecutor and (Stage B) the camera runtime executing the core's
+// AssignCamera/RemoveCamera/Stream* link commands. There is deliberately NO
+// HTTP API, NO mesh identity, NO flow engine and NO dashboard here. All
+// parameters arrive as CLI args from the spawning supervisor (no environment
+// contract).
 
 #![cfg(all(unix, feature = "camera", feature = "inference-vision-gpu"))]
+
+pub mod cameras;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -17,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::net::UnixStream;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::flow_engine::dispatchers_impl::ModelRuntimeSlot;
@@ -24,6 +29,13 @@ use crate::services::camera_ingest::vision_analysis;
 use crate::services::vision_worker::link::{
     read_frame, write_frame, LinkFrame, WorkerStats, HEARTBEAT_INTERVAL, LINK_PROTO_VERSION,
 };
+
+use cameras::WorkerCameraRuntime;
+
+/// Outbound link queue depth. Sized for bursts of media frames from several
+/// active tile pumps; producers use `try_send` (drop / cut on full), so a
+/// congested UDS can never stall the analysis engine.
+const OUTBOUND_QUEUE: usize = 512;
 
 /// How long the worker waits for the core's HelloAck.
 const HELLO_ACK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -149,10 +161,24 @@ pub async fn run_vision_worker(cfg: VisionWorkerConfig) -> Result<()> {
 
     let (mut rd, mut wr) = stream.into_split();
 
-    // Heartbeat sender owns the write half; ends on the first send error
-    // (core gone → the read loop below unblocks too and the process exits).
+    // Single writer task owns the write half; every producer (heartbeat,
+    // detections flush, health reports, stream pumps) shares one bounded
+    // queue. Data producers use `try_send`, so link backpressure surfaces as
+    // dropped frames / cut pumps — never as a stalled engine.
+    let (out_tx, mut out_rx) = mpsc::channel::<LinkFrame>(OUTBOUND_QUEUE);
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = out_rx.recv().await {
+            if write_frame(&mut wr, &frame).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Heartbeats ride the shared queue; the sender ends on queue close (core
+    // gone → the read loop below unblocks too and the process exits).
     let heartbeat = {
         let detector_sessions = detector_sessions.clone();
+        let out_tx = out_tx.clone();
         let gpu = cfg.gpu;
         let started = Instant::now();
         tokio::spawn(async move {
@@ -164,15 +190,19 @@ pub async fn run_vision_worker(cfg: VisionWorkerConfig) -> Result<()> {
                     detector_sessions: detector_sessions.load(Ordering::Relaxed),
                     uptime_secs: started.elapsed().as_secs(),
                 };
-                if write_frame(&mut wr, &LinkFrame::Heartbeat { stats })
-                    .await
-                    .is_err()
-                {
+                if out_tx.send(LinkFrame::Heartbeat { stats }).await.is_err() {
                     break;
                 }
             }
         })
     };
+
+    // Stage B camera runtime: executes AssignCamera / RemoveCamera / Stream*
+    // commands against the process-local ingest supervisor + analysis engine
+    // and feeds detections/health/video back through the shared queue.
+    let camera_runtime = WorkerCameraRuntime::start(cfg.worker_id, out_tx.clone())
+        .await
+        .context("start worker camera runtime")?;
 
     // Wait for Shutdown over the link, link close, or a termination signal —
     // whichever comes first ends the process the same way: drain, then exit.
@@ -184,6 +214,10 @@ pub async fn run_vision_worker(cfg: VisionWorkerConfig) -> Result<()> {
             tokio::select! {
                 frame = read_frame(&mut rd) => match frame {
                     Ok(LinkFrame::Shutdown) => break "link Shutdown",
+                    Ok(frame @ (LinkFrame::AssignCamera { .. }
+                        | LinkFrame::RemoveCamera { .. }
+                        | LinkFrame::StreamStart { .. }
+                        | LinkFrame::StreamStop { .. })) => camera_runtime.handle_frame(frame),
                     Ok(other) => debug!(?other, "ignoring unexpected link frame"),
                     Err(_) => break "link closed",
                 },
@@ -194,11 +228,13 @@ pub async fn run_vision_worker(cfg: VisionWorkerConfig) -> Result<()> {
     };
 
     info!(
-        "[vision-worker {}] stopping ({reason}) — draining vision analysis",
+        "[vision-worker {}] stopping ({reason}) — draining cameras + vision analysis",
         cfg.worker_id
     );
     heartbeat.abort();
+    camera_runtime.shutdown().await;
     vision_analysis::drain().await;
+    writer.abort();
     info!("[vision-worker {}] drained; exiting", cfg.worker_id);
     Ok(())
 }

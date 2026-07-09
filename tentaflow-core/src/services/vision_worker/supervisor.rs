@@ -102,6 +102,15 @@ impl VisionWorkerSupervisor {
             }
         };
 
+        // Stage B: install the camera assignment authority + frame router
+        // BEFORE any worker can connect, so the first Hello already replays
+        // assignments. `worker_id` doubles as the assignment slot (workers
+        // are numbered 0..total across all GPUs).
+        let total_workers = (gpus.len() * per_gpu) as u32;
+        if let Some(fleet) = super::fleet::WorkerFleet::install(total_workers, link_state.clone()) {
+            link_state.set_fleet(Arc::downgrade(&fleet));
+        }
+
         let shutdown = Arc::new(AtomicBool::new(false));
         let stop_notify = Arc::new(Notify::new());
         let db_path = Arc::new(db_path);

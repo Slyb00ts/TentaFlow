@@ -203,9 +203,21 @@ fn camera_detections_subscribe_handler(
 
         // Production path: start the always-on RF-DETR analysis loop for this
         // camera (idempotent — one task per camera regardless of subscribers).
-        // Real detections flow into `detection_bus` and out through this stream.
+        // Real detections flow into `detection_bus` and out through this
+        // stream. A camera owned by the vision-worker fleet runs its analysis
+        // in the worker process, which relays detections into this SAME bus —
+        // starting a local loop too would double-publish overlays.
         #[cfg(feature = "inference-vision-gpu")]
-        crate::services::camera_ingest::vision_analysis::ensure_analysis(&camera_id);
+        {
+            #[cfg(all(unix, feature = "camera"))]
+            let worker_owned =
+                crate::services::vision_worker::fleet::is_worker_camera(&camera_id).is_some();
+            #[cfg(not(all(unix, feature = "camera")))]
+            let worker_owned = false;
+            if !worker_owned {
+                crate::services::camera_ingest::vision_analysis::ensure_analysis(&camera_id);
+            }
+        }
 
         // Dev/test only, behind the env flag (default off): when no real detector
         // publishes for this camera, spawn one synthetic source so the e2e suite

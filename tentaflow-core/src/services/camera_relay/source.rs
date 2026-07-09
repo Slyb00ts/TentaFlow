@@ -27,8 +27,9 @@ use crate::services::stream_hub::{BinaryStreamSource, BROADCAST_CAPACITY};
 
 /// Same generic fMP4/H.264 MIME the local publisher advertises — the relayed
 /// init segment carries the real `avcC` box, so the browser validates the codec
-/// from the bytes, not this string.
-const FMP4_H264_MIME: &str = "video/mp4; codecs=\"avc1.42E01E\"";
+/// from the bytes, not this string. Shared with the vision-worker relay source,
+/// which republishes the same fMP4 stream shape.
+pub(crate) const FMP4_H264_MIME: &str = "video/mp4; codecs=\"avc1.42E01E\"";
 
 /// Maximum time `init_segment()` waits for the first relayed `is_init` frame
 /// before giving up. Beyond this we assume the relay never started (owner gate

@@ -986,6 +986,20 @@ async fn run_server(args: Args) -> Result<()> {
         mesh_services_registry.clone(),
     )?;
 
+    // Multi-process vision workers (docs/VISION_WORKER_SHARDING.md).
+    // Configured EXCLUSIVELY via `[vision].workers_per_gpu` in the config TOML;
+    // the default 0 spawns nothing and binds no link socket, so production
+    // behavior without the section is unchanged. MUST start before the camera
+    // hydrate below: the hydrate consults the worker fleet to decide which
+    // cameras stay in-process — a late fleet install would double-ingest
+    // worker cameras locally.
+    #[cfg(unix)]
+    let vision_workers =
+        tentaflow_core::services::vision_worker::supervisor::VisionWorkerSupervisor::start(
+            config.vision.workers_per_gpu,
+            db_path.clone(),
+        );
+
     // Boot-time camera ingest hydrate. Without this, `CameraIngestSupervisor`
     // stays empty until SOMEONE opens TentaVision UI in a browser — kamera nie
     // produkuje klatek, analiza Flow nie ma na czym pracować, status zostaje
@@ -998,17 +1012,6 @@ async fn run_server(args: Args) -> Result<()> {
             tracing::warn!("boot: camera supervisor hydrate failed: {e}");
         }
     });
-
-    // Multi-process vision workers (Stage A, docs/VISION_WORKER_SHARDING.md).
-    // Configured EXCLUSIVELY via `[vision].workers_per_gpu` in the config TOML;
-    // the default 0 spawns nothing and binds no link socket, so production
-    // behavior without the section is unchanged.
-    #[cfg(unix)]
-    let vision_workers =
-        tentaflow_core::services::vision_worker::supervisor::VisionWorkerSupervisor::start(
-            config.vision.workers_per_gpu,
-            db_path.clone(),
-        );
 
     info!("Wszystkie serwery uruchomione. Nacisnij Ctrl+C aby zakonczyc...");
 

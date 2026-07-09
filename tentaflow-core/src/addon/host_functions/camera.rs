@@ -293,6 +293,13 @@ async fn hydrate_supervisor_from_db(sup: &Arc<CameraIngestSupervisor>) {
             );
             continue;
         }
+        // Vision-worker sharding: a camera claimed by the fleet is NOT started
+        // in-process — the owning worker receives AssignCamera when its link
+        // comes up (fleet replay); a local session here would double-ingest
+        // the stream and double-publish detections.
+        if worker_fleet_claim_persisted(&pool, &row).is_some() {
+            continue;
+        }
         let resolution = match (row.resolution_width, row.resolution_height) {
             (Some(w), Some(h)) if w > 0 && h > 0 => Some((w as u32, h as u32)),
             _ => None,
@@ -789,12 +796,123 @@ fn status_to_str(s: crate::services::camera_ingest::CameraStatus) -> &'static st
     }
 }
 
+// =============================================================================
+// Helpers — vision-worker fleet bridge (Stage B, docs/VISION_WORKER_SHARDING.md)
+// =============================================================================
+//
+// Cameras claimed by the vision-worker fleet are NOT started in this process:
+// the owning worker runs ingest + analysis and relays detections/health/video
+// over the UDS link. Every helper collapses to "not worker-owned" when the
+// fleet is off (`workers_per_gpu = 0`) or on platforms without workers, so
+// production behavior without the `[vision]` section is unchanged.
+
+/// Claims a persisted row for the fleet (assigning + persisting a slot when
+/// the column is NULL). `Some(slot)` = worker-owned, skip the local session.
+fn worker_fleet_claim_persisted(pool: &crate::db::DbPool, row: &CameraRow) -> Option<u32> {
+    #[cfg(all(unix, feature = "inference-vision-gpu"))]
+    {
+        crate::services::vision_worker::fleet::global()
+            .and_then(|fleet| fleet.claim_persisted(pool, row))
+    }
+    #[cfg(not(all(unix, feature = "inference-vision-gpu")))]
+    {
+        let _ = (pool, row);
+        None
+    }
+}
+
+/// Plans a slot for a camera being created right now (nothing persisted —
+/// the row does not exist yet). `Some(slot)` = the add path must skip the
+/// local session and commit the assignment after its DB insert.
+fn worker_fleet_plan(camera_id: &str, vendor: &str) -> Option<u32> {
+    #[cfg(all(unix, feature = "inference-vision-gpu"))]
+    {
+        crate::services::vision_worker::fleet::global()
+            .and_then(|fleet| fleet.plan_slot(camera_id, vendor))
+    }
+    #[cfg(not(all(unix, feature = "inference-vision-gpu")))]
+    {
+        let _ = (camera_id, vendor);
+        None
+    }
+}
+
+/// Commits a planned assignment after the camera row was inserted: persists
+/// the slot, registers the relay factories and pushes AssignCamera to the
+/// owning worker.
+fn worker_fleet_commit(pool: &crate::db::DbPool, slot: u32, cfg: &CameraConfig) {
+    #[cfg(all(unix, feature = "inference-vision-gpu"))]
+    {
+        use crate::services::vision_worker::{fleet, link::CameraAssignment};
+        if let Some(fleet) = fleet::global() {
+            fleet.commit_assignment(pool, slot, CameraAssignment::from_config(cfg));
+        }
+    }
+    #[cfg(not(all(unix, feature = "inference-vision-gpu")))]
+    {
+        let _ = (pool, slot, cfg);
+    }
+}
+
+/// Drops a removed camera from the fleet (stops the worker session, clears
+/// the relay factories). No-op for cameras that were never worker-owned.
+fn worker_fleet_forget(camera_id: &str) {
+    #[cfg(all(unix, feature = "inference-vision-gpu"))]
+    if let Some(fleet) = crate::services::vision_worker::fleet::global() {
+        fleet.forget_camera(camera_id);
+    }
+    #[cfg(not(all(unix, feature = "inference-vision-gpu")))]
+    {
+        let _ = camera_id;
+    }
+}
+
+/// Pushes a fresh config to the owning worker (credentials rotation for a
+/// live worker session). `true` = handled by the fleet; the caller skips the
+/// local session restart.
+fn worker_fleet_dispatch_restart(cfg: &CameraConfig) -> bool {
+    #[cfg(all(unix, feature = "inference-vision-gpu"))]
+    {
+        use crate::services::vision_worker::{fleet, link::CameraAssignment};
+        fleet::global()
+            .map(|fleet| fleet.dispatch_restart(CameraAssignment::from_config(cfg)))
+            .unwrap_or(false)
+    }
+    #[cfg(not(all(unix, feature = "inference-vision-gpu")))]
+    {
+        let _ = cfg;
+        false
+    }
+}
+
+/// Link-reported health of a worker-owned camera, if fresh.
+fn worker_fleet_health(
+    camera_id: &str,
+) -> Option<crate::services::camera_ingest::session::CameraHealth> {
+    #[cfg(all(unix, feature = "inference-vision-gpu"))]
+    {
+        crate::services::vision_worker::fleet::worker_camera_health(camera_id)
+    }
+    #[cfg(not(all(unix, feature = "inference-vision-gpu")))]
+    {
+        let _ = camera_id;
+        None
+    }
+}
+
 async fn build_camera_info(sup: &CameraIngestSupervisor, row: CameraRow) -> CameraInfoOut {
     let mut status = row.status.clone();
     let mut status_message = row.status_message.clone();
     let mut fps_actual = row.fps_actual;
     let mut last_frame_at = row.last_frame_at;
-    if let Ok(h) = sup.get_health(&row.camera_id).await {
+    // Local ingest session first, then the vision-worker fleet's link-reported
+    // health — worker cameras have no local session, but the same live merge
+    // must reach the dashboard.
+    let health = match sup.get_health(&row.camera_id).await {
+        Ok(h) => Some(h),
+        Err(_) => worker_fleet_health(&row.camera_id),
+    };
+    if let Some(h) = health {
         status = status_to_str(h.status).to_string();
         status_message = h.status_message;
         fps_actual = h.fps_actual.map(|v| v as f64);
@@ -1496,31 +1614,37 @@ pub fn camera_add_v1(
         credentials_encrypted: credentials_blob.clone(),
         decoder_override: None,
     };
-    let sup = match run_async(get_or_init_supervisor()) {
-        Ok(s) => s,
-        Err(e) => {
+    // Vision-worker sharding: a planned slot routes this camera to a worker —
+    // no local session is started; the assignment is committed (and pushed
+    // over the link) after the row insert succeeds.
+    let worker_slot = worker_fleet_plan(&camera_id, session_vendor);
+    if worker_slot.is_none() {
+        let sup = match run_async(get_or_init_supervisor()) {
+            Ok(s) => s,
+            Err(e) => {
+                audit(
+                    caller.data(),
+                    "camera.add",
+                    Some(&camera_id),
+                    RiskClass::A,
+                    "error",
+                    Some("supervisor_init_failed"),
+                );
+                return e.as_i32();
+            }
+        };
+        if let Err(e) = run_async(sup.add_camera(cfg.clone())) {
+            let mapped = map_ingest_error(&e);
             audit(
                 caller.data(),
                 "camera.add",
                 Some(&camera_id),
                 RiskClass::A,
                 "error",
-                Some("supervisor_init_failed"),
+                Some(&format!("session_start_failed: {e}")),
             );
-            return e.as_i32();
+            return mapped.as_i32();
         }
-    };
-    if let Err(e) = run_async(sup.add_camera(cfg)) {
-        let mapped = map_ingest_error(&e);
-        audit(
-            caller.data(),
-            "camera.add",
-            Some(&camera_id),
-            RiskClass::A,
-            "error",
-            Some(&format!("session_start_failed: {e}")),
-        );
-        return mapped.as_i32();
     }
 
     if let Err(e) = insert_camera(
@@ -1542,8 +1666,13 @@ pub fn camera_add_v1(
         org_id_for_insert.as_deref(),
     ) {
         warn!("camera.add insert_camera failed (compensating remove_camera): {e}");
-        // Compensate the started session so the registry stays consistent.
-        let _ = run_async(sup.remove_camera(&camera_id));
+        // Compensate the started session so the registry stays consistent
+        // (worker-planned cameras started nothing yet — nothing to undo).
+        if worker_slot.is_none() {
+            if let Ok(sup) = run_async(get_or_init_supervisor()) {
+                let _ = run_async(sup.remove_camera(&camera_id));
+            }
+        }
         audit(
             caller.data(),
             "camera.add",
@@ -1553,6 +1682,9 @@ pub fn camera_add_v1(
             Some("db_insert_failed"),
         );
         return AbiError::Operation.as_i32();
+    }
+    if let Some(slot) = worker_slot {
+        worker_fleet_commit(&db, slot, &cfg);
     }
 
     audit(
@@ -3626,6 +3758,9 @@ pub fn camera_remove_v1(
         }
     }
 
+    // Worker-owned cameras have no local session: tell the fleet to stop the
+    // worker's session + drop the relay factories. No-op for local cameras.
+    worker_fleet_forget(&input.camera_id);
     let sup_result = run_async(async {
         match get_or_init_supervisor().await {
             Ok(sup) => sup.remove_camera(&input.camera_id).await,
@@ -3922,8 +4057,14 @@ pub fn camera_health_v1(
                 };
             }
         };
-        match sup.get_health(&row.camera_id).await {
-            Ok(h) => CameraHealthOut {
+        // Local session first, then the vision-worker fleet's link-reported
+        // health (worker cameras have no local session).
+        let live = match sup.get_health(&row.camera_id).await {
+            Ok(h) => Some(h),
+            Err(_) => worker_fleet_health(&row.camera_id),
+        };
+        match live {
+            Some(h) => CameraHealthOut {
                 camera_id: h.camera_id,
                 status: status_to_str(h.status).to_string(),
                 status_message: h.status_message.unwrap_or_default(),
@@ -3932,7 +4073,7 @@ pub fn camera_health_v1(
                 frames_total: h.frames_total,
                 frames_dropped: h.frames_dropped,
             },
-            Err(_) => CameraHealthOut {
+            None => CameraHealthOut {
                 camera_id: row.camera_id.clone(),
                 status: row.status.clone(),
                 status_message: "session missing".to_string(),
@@ -4489,20 +4630,27 @@ pub fn camera_credentials_rotate_v1(
         credentials_encrypted: new_blob.clone(),
         decoder_override: None,
     };
-    let restart_result = run_async(async {
-        let sup = get_or_init_supervisor().await?;
-        sup.restart_camera(&row.camera_id, restart_cfg)
-            .await
-            .map_err(|e| map_ingest_error(&e))
-    });
-    let restart_note = match restart_result {
-        Ok(()) => "session_restart_signaled",
-        // A missing session (e.g. process restarted before the rotation but
-        // host singleton not yet warmed) is non-fatal — the persisted blob
-        // will be picked up when the supervisor reconciles. Surface it in
-        // the audit reason so operators can correlate.
-        Err(AbiError::NotFound) => "session_not_running",
-        Err(_) => "session_restart_failed",
+    // Worker-owned cameras restart on their worker: the fleet re-sends the
+    // assignment with the fresh (still-encrypted) blob and the worker session
+    // rebuilds, decrypting through the shared cameras.key.
+    let restart_note = if worker_fleet_dispatch_restart(&restart_cfg) {
+        "worker_session_restart_signaled"
+    } else {
+        let restart_result = run_async(async {
+            let sup = get_or_init_supervisor().await?;
+            sup.restart_camera(&row.camera_id, restart_cfg)
+                .await
+                .map_err(|e| map_ingest_error(&e))
+        });
+        match restart_result {
+            Ok(()) => "session_restart_signaled",
+            // A missing session (e.g. process restarted before the rotation but
+            // host singleton not yet warmed) is non-fatal — the persisted blob
+            // will be picked up when the supervisor reconciles. Surface it in
+            // the audit reason so operators can correlate.
+            Err(AbiError::NotFound) => "session_not_running",
+            Err(_) => "session_restart_failed",
+        }
     };
 
     let reason = format!(
@@ -4765,35 +4913,41 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         credentials_encrypted: credentials_blob.clone(),
         decoder_override: None,
     };
-    let sup = match run_async(get_or_init_supervisor()) {
-        Ok(s) => s,
-        Err(e) => {
+    // Vision-worker sharding — same routing as `camera_add_v1`: a planned
+    // slot skips the local session; the assignment is committed after the
+    // row insert.
+    let worker_slot = worker_fleet_plan(&camera_id, session_vendor);
+    if worker_slot.is_none() {
+        let sup = match run_async(get_or_init_supervisor()) {
+            Ok(s) => s,
+            Err(e) => {
+                audit(
+                    state,
+                    "camera.add",
+                    Some(&camera_id),
+                    RiskClass::A,
+                    "error",
+                    Some("supervisor_init_failed"),
+                );
+                return e.as_i32();
+            }
+        };
+        if let Err(e) = run_async(sup.add_camera(cfg.clone())) {
+            let mapped = map_ingest_error(&e);
+            let reason = match &e {
+                CameraIngestError::QuotaExceeded(_) => "quota_exceeded".to_string(),
+                other => format!("session_start_failed: {other}"),
+            };
             audit(
                 state,
                 "camera.add",
                 Some(&camera_id),
                 RiskClass::A,
                 "error",
-                Some("supervisor_init_failed"),
+                Some(&reason),
             );
-            return e.as_i32();
+            return mapped.as_i32();
         }
-    };
-    if let Err(e) = run_async(sup.add_camera(cfg)) {
-        let mapped = map_ingest_error(&e);
-        let reason = match &e {
-            CameraIngestError::QuotaExceeded(_) => "quota_exceeded".to_string(),
-            other => format!("session_start_failed: {other}"),
-        };
-        audit(
-            state,
-            "camera.add",
-            Some(&camera_id),
-            RiskClass::A,
-            "error",
-            Some(&reason),
-        );
-        return mapped.as_i32();
     }
 
     if let Err(e) = insert_camera(
@@ -4815,7 +4969,11 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
         org_id_for_insert.as_deref(),
     ) {
         warn!("camera.add insert_camera failed (compensating remove_camera): {e}");
-        let _ = run_async(sup.remove_camera(&camera_id));
+        if worker_slot.is_none() {
+            if let Ok(sup) = run_async(get_or_init_supervisor()) {
+                let _ = run_async(sup.remove_camera(&camera_id));
+            }
+        }
         audit(
             state,
             "camera.add",
@@ -4825,6 +4983,9 @@ pub(crate) fn camera_add_core(state: &AddonState, raw_input: &[u8]) -> i32 {
             Some("db_insert_failed"),
         );
         return AbiError::Operation.as_i32();
+    }
+    if let Some(slot) = worker_slot {
+        worker_fleet_commit(&db, slot, &cfg);
     }
 
     audit(

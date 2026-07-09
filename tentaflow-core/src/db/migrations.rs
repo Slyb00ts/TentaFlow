@@ -597,6 +597,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "vision_models_registry",
             MigrationStep::Rust(create_vision_models),
         ),
+        (
+            112,
+            "cameras_vision_worker_slot",
+            MigrationStep::Rust(cameras_add_vision_worker_slot_column),
+        ),
     ]
 }
 
@@ -1458,6 +1463,19 @@ fn cameras_add_depth_pose_source_column(conn: &Connection) -> Result<()> {
 /// the native frame cadence); the default of `10` matches
 /// `CAMERA_DEFAULT_ANALYSIS_FPS`. Idempotent — guarded by a column probe so a
 /// re-run on an already-migrated database is a no-op.
+/// Adds `vision_worker_slot` to `cameras` — the vision-worker sharding slot
+/// (docs/VISION_WORKER_SHARDING.md Stage B). NULL = the camera runs in-process
+/// on the core; a non-NULL slot means the camera is owned by that vision
+/// worker. The core is the ONLY writer of this column (assignment authority);
+/// workers act solely on AssignCamera/RemoveCamera link commands and never
+/// read it. Idempotent — guarded by a column probe.
+fn cameras_add_vision_worker_slot_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "cameras", "vision_worker_slot")? {
+        conn.execute_batch("ALTER TABLE cameras ADD COLUMN vision_worker_slot INTEGER NULL;")?;
+    }
+    Ok(())
+}
+
 fn cameras_add_analysis_fps_column(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "cameras", "analysis_fps")? {
         conn.execute_batch(

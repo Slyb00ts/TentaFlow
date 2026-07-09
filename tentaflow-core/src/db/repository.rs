@@ -21170,6 +21170,10 @@ pub struct CameraRow {
     /// Per-camera CV pipeline id. `None` = the camera resolves to the
     /// `is_default=1` pipeline (see [`resolve_camera_cv_pipeline`]).
     pub cv_pipeline_id: Option<String>,
+    /// Vision-worker sharding slot (docs/VISION_WORKER_SHARDING.md Stage B).
+    /// NULL = the camera runs in-process on the core. Written exclusively by
+    /// the core (assignment authority); workers never read this column.
+    pub vision_worker_slot: Option<i64>,
 }
 
 /// Patch payload for `update_camera`. `None` means "do not touch this column".
@@ -21231,6 +21235,7 @@ fn row_to_camera(row: &rusqlite::Row<'_>) -> rusqlite::Result<CameraRow> {
         analysis_fps: row.get(21)?,
         analysis_flow_id: row.get(22)?,
         cv_pipeline_id: row.get(23)?,
+        vision_worker_slot: row.get(24)?,
     })
 }
 
@@ -21240,7 +21245,7 @@ const CAMERA_SELECT_COLS: &str =
      resolution_width, resolution_height, retention_class, status, status_message, \
      fps_actual, last_frame_at, created_at, updated_at, credentials_encrypted, \
      onvif_url, onvif_profile_token, metadata_supported, analysis_fps, analysis_flow_id, \
-     cv_pipeline_id";
+     cv_pipeline_id, vision_worker_slot";
 
 /// Inserts a new camera row owned by `owner_addon_id`. The supervisor session
 /// is started separately; on supervisor failure the caller must
@@ -21287,6 +21292,21 @@ pub fn insert_camera(
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Persists the vision-worker sharding slot for one camera (Stage B of
+/// docs/VISION_WORKER_SHARDING.md). Core-internal assignment authority — no
+/// addon/org scoping, because the fleet shards EVERY active camera on this
+/// node regardless of owner. `None` returns the camera to in-process ingest.
+#[cfg(feature = "camera")]
+pub fn set_camera_worker_slot(pool: &DbPool, camera_id: &str, slot: Option<i64>) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let n = conn.execute(
+        "UPDATE cameras SET vision_worker_slot = ?1 \
+         WHERE camera_id = ?2 AND removed_at IS NULL",
+        rusqlite::params![slot, camera_id],
+    )?;
+    Ok(n > 0)
 }
 
 /// Replace the `credentials_encrypted` blob for one camera (per-camera

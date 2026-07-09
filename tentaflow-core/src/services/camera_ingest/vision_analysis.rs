@@ -3305,6 +3305,7 @@ mod tests {
             h: 2,
             frame_format: crate::services::camera_ingest::fakefile::DetectFrameFormat::Rgb24,
             detect_frame: Arc::from(vec![0u8; 12]),
+            detect_device: None,
             detect_w: 2,
             detect_h: 2,
             detect_format: crate::services::camera_ingest::fakefile::DetectFrameFormat::Rgb24,
