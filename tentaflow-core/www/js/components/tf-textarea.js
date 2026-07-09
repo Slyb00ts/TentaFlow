@@ -17,6 +17,8 @@ class TfTextarea extends HTMLElement {
     this._labelEl = null;
     this._hintEl = null;
     this._errorEl = null;
+    this._resizeObserver = null;
+    this._lastWidth = 0;
     this._onInput = this._onInput.bind(this);
     this._onChange = this._onChange.bind(this);
     this._onKeyDown = this._onKeyDown.bind(this);
@@ -25,6 +27,26 @@ class TfTextarea extends HTMLElement {
   connectedCallback() {
     if (!this._group) this._build();
     this._update();
+    // Auto-grow depends on line wrapping, so a width change (viewport resize,
+    // split collapse) must re-measure — height alone would go stale.
+    if (!this._resizeObserver && typeof ResizeObserver !== 'undefined') {
+      this._lastWidth = 0;
+      this._resizeObserver = new ResizeObserver((entries) => {
+        const w = entries[0]?.contentRect?.width ?? 0;
+        if (w !== this._lastWidth) {
+          this._lastWidth = w;
+          this._autogrow();
+        }
+      });
+      this._resizeObserver.observe(this._textarea);
+    }
+  }
+
+  disconnectedCallback() {
+    if (this._resizeObserver) {
+      this._resizeObserver.disconnect();
+      this._resizeObserver = null;
+    }
   }
 
   attributeChangedCallback(name, oldVal, newVal) {

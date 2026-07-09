@@ -15,10 +15,15 @@
 // =============================================================================
 
 const STATUS_CLASSES = new Set([
-  'ok', 'warn', 'err', 'info', 'accent',
+  'ok', 'warn', 'err', 'info', 'accent', 'neutral',
   'online', 'offline', 'pending', 'recording',
   'scope-chat', 'scope-deploy', 'scope-mesh-read',
   'scope-mesh-admin', 'scope-trace', 'scope-license',
+]);
+
+// Tones for the `dot-tone` attribute — dot color independent of chip status.
+const DOT_TONES = new Set([
+  'neutral', 'primary', 'success', 'warning', 'critical', 'info', 'muted',
 ]);
 
 const TAG_TONES = new Set([
@@ -34,7 +39,7 @@ function safeIconName(value) {
 class TfChip extends HTMLElement {
   static get observedAttributes() {
     return [
-      'status', 'dot', 'clickable', 'active', 'icon',
+      'status', 'dot', 'dot-tone', 'clickable', 'active', 'icon',
       'label', 'variant', 'tone', 'size', 'removable',
     ];
   }
@@ -117,6 +122,8 @@ class TfChip extends HTMLElement {
     if (hasDot) {
       const dot = document.createElement('span');
       dot.className = 'tf-chip-dot';
+      const dotTone = (this.getAttribute('dot-tone') || '').toLowerCase();
+      if (DOT_TONES.has(dotTone)) dot.classList.add(`tf-chip-dot--tone-${dotTone}`);
       span.appendChild(dot);
     }
     if (icon) {

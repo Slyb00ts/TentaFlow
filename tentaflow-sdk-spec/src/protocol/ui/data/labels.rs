@@ -96,13 +96,16 @@ pub struct Chip {
     pub avatar: Option<AvatarRef>,
     pub selected: Option<BindRef>,
     pub removable: bool,
+    /// Leading status dot colored by this tone (independent of the chip
+    /// tone — e.g. a neutral chip with an entity-type colored dot).
+    pub dot: Option<Tone>,
 }
 
 impl Chip {
     pub const TAG: u16 = 0x020B;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(7);
+        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(8);
         entries.push((0, encode_to_value(&self.variant)?));
         entries.push((1, encode_to_value(&self.tone)?));
         entries.push((2, encode_to_value(&self.label)?));
@@ -110,6 +113,7 @@ impl Chip {
         if let Some(a) = &self.avatar { entries.push((4, encode_to_value(a)?)); }
         if let Some(s) = &self.selected { entries.push((5, encode_to_value(s)?)); }
         entries.push((6, encode_to_value(&self.removable)?));
+        if let Some(d) = &self.dot { entries.push((7, encode_to_value(d)?)); }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -123,6 +127,7 @@ impl Chip {
         let mut avatar = None;
         let mut selected = None;
         let mut removable = None;
+        let mut dot = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => variant = Some(decode_from_value(v)?),
@@ -132,6 +137,7 @@ impl Chip {
                 4 => avatar = Some(decode_from_value(v)?),
                 5 => selected = Some(decode_from_value(v)?),
                 6 => removable = Some(decode_from_value(v)?),
+                7 => dot = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("Chip", *other)),
             }
         }
@@ -141,6 +147,7 @@ impl Chip {
             label: label.ok_or_else(|| missing_field("Chip", "label"))?,
             icon, avatar, selected,
             removable: removable.ok_or_else(|| missing_field("Chip", "removable"))?,
+            dot,
         })
     }
 }

@@ -498,6 +498,8 @@ test('Split horizontal renders panes, divider and percent basis', () => {
   const el = engine.render(comp(SPLIT_TAG, splitFields()));
   assert(el.classList.contains('tf-split'));
   assert(el.classList.contains('tf-split--horizontal'));
+  // Absent divider field → the default draggable handle.
+  assert(el.classList.contains('tf-split--divider-handle'));
   assert(!el.classList.contains('tf-split--resizable'));
   assertEq(el.children.length, 3);
   const [primary, divider, secondary] = el.children;
@@ -546,6 +548,21 @@ test('Split accepts BigInt min/max/px from wire decoder', () => {
   assertEq(primary.style.maxWidth, '400px');
 });
 
+test('Split grow=true fills the flex parent, absent/false keeps content sizing', () => {
+  setup();
+  const engine = makeEngine();
+  const grown = engine.render(comp(SPLIT_TAG, splitFields().concat([[9, true]])));
+  assertEq(grown.style.flexGrow, '1');
+  // Basis stays auto (content-driven) so a stacked split keeps its height.
+  assertEq(grown.style.flexBasis, '');
+  const plain = engine.render(comp(SPLIT_TAG, splitFields()));
+  assertEq(plain.style.flexGrow, '');
+  assertEq(plain.style.flexBasis, '');
+  const explicitOff = engine.render(comp(SPLIT_TAG, splitFields().concat([[9, false]])));
+  assertEq(explicitOff.style.flexGrow, '');
+  assertEq(explicitOff.style.flexBasis, '');
+});
+
 test('Split validation rejects malformed fields', () => {
   setup();
   const engine = makeEngine();
@@ -558,7 +575,10 @@ test('Split validation rejects malformed fields', () => {
     splitFields({ 2: 700 }),                                 // min_primary > max_primary
     splitFields({ 4: undefined }),                           // missing resizable
     splitFields({ 5: '' }),                                  // empty primary_slot
-    splitFields().concat([[7, 'x']]),                        // unknown field key
+    splitFields({ 7: 'x' }),                                 // unknown Breakpoint
+    splitFields({ 8: 'x' }),                                 // unknown SplitDivider
+    splitFields().concat([[9, 'x']]),                        // grow must be bool
+    splitFields().concat([[10, 'x']]),                       // unknown field key
   ];
   for (const fields of cases) {
     assertThrows(() => engine.render(comp(SPLIT_TAG, fields)));
@@ -586,6 +606,29 @@ test('Split resizable drag clamps flex-basis to min/max', () => {
   assertEq(primary.style.flexBasis, '100px');
 });
 
+test('Split divider "line" keeps resize, "none" hides divider and disables it', () => {
+  setup();
+  const engine = makeEngine();
+
+  const line = engine.render(comp(SPLIT_TAG, splitFields({ 4: true, 8: 'line' })));
+  assert(line.classList.contains('tf-split--divider-line'));
+  assert(line.classList.contains('tf-split--resizable'));
+  const [linePrimary, lineDivider] = line.children;
+  lineDivider.dispatchEvent(new MouseEvent('pointerdown', { clientX: 0, bubbles: true }));
+  document.dispatchEvent(new MouseEvent('pointermove', { clientX: 300 }));
+  assertEq(linePrimary.style.flexBasis, '300px');
+  document.dispatchEvent(new MouseEvent('pointerup', {}));
+
+  // divider:none has no drag hit-area, so resizable is force-disabled.
+  const none = engine.render(comp(SPLIT_TAG, splitFields({ 4: true, 8: 'none' })));
+  assert(none.classList.contains('tf-split--divider-none'));
+  assert(!none.classList.contains('tf-split--resizable'));
+  const [nonePrimary, noneDivider] = none.children;
+  noneDivider.dispatchEvent(new MouseEvent('pointerdown', { clientX: 0, bubbles: true }));
+  document.dispatchEvent(new MouseEvent('pointermove', { clientX: 300 }));
+  assertEq(nonePrimary.style.flexBasis, '30%');
+});
+
 test('Split destroy removes document drag listeners', () => {
   setup();
   const engine = makeEngine();
@@ -598,6 +641,53 @@ test('Split destroy removes document drag listeners', () => {
   document.dispatchEvent(new MouseEvent('pointermove', { clientX: 550 }));
   // Listeners are unhooked on destroy — basis stays frozen.
   assertEq(primary.style.flexBasis, '300px');
+});
+
+test('Split without collapse_below injects no collapse rule', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(SPLIT_TAG, splitFields()));
+  assertEq(el.getAttribute('data-split-collapse'), null);
+  assertEq(injectedResponsiveCss(), '');
+});
+
+test('Split collapse_below stacks horizontal panes below the breakpoint', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(SPLIT_TAG, splitFields({ 7: 'sm' })));
+  const hash = el.getAttribute('data-split-collapse');
+  assert(hash, 'expected data-split-collapse attribute');
+  const css = injectedResponsiveCss();
+  // Breakpoint sm → 768px container query.
+  assert(css.includes('@container addon (max-width: 768px)'), css);
+  assert(css.includes(`[data-split-collapse="${hash}"]{flex-direction:column !important}`), css);
+  assert(css.includes('> .tf-split__pane{flex-basis:auto !important'), css);
+  assert(css.includes('> .tf-split__pane--primary{max-height:45vh !important}'), css);
+  assert(css.includes('> .tf-split__divider{display:none !important}'), css);
+});
+
+test('Split collapse_below on vertical split only hides the divider', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(SPLIT_TAG, splitFields({ 0: 'vertical', 1: { kind: 'px', value: 240 }, 7: 'md' }))
+  );
+  assert(el.getAttribute('data-split-collapse'));
+  const css = injectedResponsiveCss();
+  assert(css.includes('@container addon (max-width: 1024px)'), css);
+  assert(css.includes('> .tf-split__divider{display:none !important}'), css);
+  assert(!css.includes('flex-direction:column'), css);
+  assert(!css.includes('max-height:45vh'), css);
+});
+
+test('Split collapse rules dedup across identical declarations', () => {
+  setup();
+  const engine = makeEngine();
+  const a = engine.render(comp(SPLIT_TAG, splitFields({ 7: 'sm' })));
+  const b = engine.render(comp(SPLIT_TAG, splitFields({ 7: 'sm' })));
+  assertEq(a.getAttribute('data-split-collapse'), b.getAttribute('data-split-collapse'));
+  const css = injectedResponsiveCss();
+  assertEq(css.split('@container').length - 1, 1);
 });
 
 // ============================================================================
@@ -919,6 +1009,22 @@ test('Flex responsive → data-responsive + injected @container rule', () => {
   assert(css.includes(`[data-responsive="${hash}"]`), 'scoped by hash selector');
   assert(css.includes('flex-direction:column !important'), 'direction override with !important');
   assert(css.includes('gap:var(--tf-space-lg) !important'), 'gap override with !important');
+});
+
+test('Responsive width override emits width + neutralizes min/max-width', () => {
+  setup();
+  const engine = makeEngine();
+  engine.render(
+    comp(BOX_TAG, [
+      [0, { kind: 'px', value: 280 }],
+      [5, []],
+      [11, [[[0, { kind: 'px', value: 900 }], [9, { kind: 'full' }]]]],
+    ])
+  );
+  const css = injectedResponsiveCss();
+  assert(css.includes('width:100% !important'), 'width full → 100%');
+  assert(css.includes('min-width:0 !important'), 'min-width reset');
+  assert(css.includes('max-width:none !important'), 'max-width reset');
 });
 
 test('Responsive Breakpoint token maps to px scale', () => {

@@ -331,7 +331,7 @@ export function applyBoxStyle(el, raw, ctx) {
 // (tokens.rs): 640/768/1024/1280/1536/1920.
 const BREAKPOINT_PX = { xs: 640, sm: 768, md: 1024, lg: 1280, xl: 1536, xxl: 1920 };
 
-const RESPONSIVE_RULE_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+const RESPONSIVE_RULE_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
 function requireI32(value, ctx) {
   if (typeof value === 'bigint') {
@@ -381,7 +381,8 @@ function containerWidthToPx(raw, ctx) {
 /// Applies a container's `responsive: Vec<ResponsiveRule>` by generating scoped
 /// `@container addon` rules. `rulesRaw` is an Array of int-keyed FieldMaps:
 /// 0=max_width(ContainerWidth), 1=direction, 2=gap, 3=align, 4=justify,
-/// 5=padding(EdgeValues), 6=min_height(DimensionToken), 7=order(i32), 8=hidden.
+/// 5=padding(EdgeValues), 6=min_height(DimensionToken), 7=order(i32), 8=hidden,
+/// 9=width(DimensionToken).
 /// `direction`/`gap`/`align`/`justify`/`padding`/`min_height` retarget the
 /// container's own flex layout at that width; `order`/`hidden` reposition or
 /// hide the container within ITS parent (self-as-flex-child), so all fields
@@ -443,6 +444,14 @@ export function applyResponsive(el, rulesRaw, ctx, name) {
     if (hidden !== undefined) {
       if (typeof hidden !== 'boolean') throw new TypeError(`${rctx}.hidden: expected bool`);
       if (hidden) props.push(['display', 'none']);
+    }
+    const width = readFieldMap(rule, 9);
+    if (width !== undefined) {
+      const t = parseDimensionToken(width, `${rctx}.width`);
+      props.push(['width', t === 'full' ? '100%' : t === 'fit_content' ? 'fit-content' : t]);
+      // Inline min/max-width (fixed side panel) must not survive the override.
+      props.push(['min-width', '0']);
+      props.push(['max-width', 'none']);
     }
     if (props.length === 0) continue; // max_width only — nothing to override
     decls.push({ maxPx, props });
@@ -833,8 +842,10 @@ function renderCluster(component, ctx) {
 
 export const SPLIT_TAG = 0x0105;
 
-const SPLIT_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6]);
+const SPLIT_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
 const SPLIT_ORIENTATIONS = new Set(['horizontal', 'vertical']);
+const SPLIT_DIVIDERS = new Set(['handle', 'line', 'none']);
+const BREAKPOINTS = new Set(Object.keys(BREAKPOINT_PX));
 
 function requireBool(value, ctx) {
   if (typeof value !== 'boolean') {
@@ -907,12 +918,36 @@ export function renderSplit(component, ctx) {
     ctx.readField(component.fields, 6),
     'Split.secondary_slot'
   );
+  const collapseBelowRaw = ctx.readField(component.fields, 7);
+  const collapseBelow = collapseBelowRaw === undefined || collapseBelowRaw === null
+    ? null
+    : requireEnum(collapseBelowRaw, BREAKPOINTS, 'Split.collapse_below');
+  const dividerModeRaw = ctx.readField(component.fields, 8);
+  const dividerMode = dividerModeRaw === undefined || dividerModeRaw === null
+    ? 'handle'
+    : requireEnum(dividerModeRaw, SPLIT_DIVIDERS, 'Split.divider');
+  // A hidden divider has no drag hit-area, so `none` also disables resize.
+  const canResize = resizable && dividerMode !== 'none';
+  const growRaw = ctx.readField(component.fields, 9);
+  let grow = false;
+  if (growRaw !== undefined && growRaw !== null) {
+    if (typeof growRaw !== 'boolean') {
+      throw new TypeError(`Split.grow: expected bool, got ${typeof growRaw}`);
+    }
+    grow = growRaw;
+  }
 
   const horizontal = orientation === 'horizontal';
   const el = document.createElement('div');
   el.classList.add('tf-split');
   el.classList.add(`tf-split--${orientation}`);
-  if (resizable) el.classList.add('tf-split--resizable');
+  el.classList.add(`tf-split--divider-${dividerMode}`);
+  if (canResize) el.classList.add('tf-split--resizable');
+  // Self-as-flex-child (Split.grow): take the leftover space of the flex
+  // parent so the panes get a real height/width to fill. Basis stays `auto`
+  // (unlike Box.grow): a stacked/collapsed split must keep its content
+  // height when the parent shrinks to fit-content.
+  if (grow) el.style.flexGrow = '1';
 
   const primary = document.createElement('div');
   primary.classList.add('tf-split__pane', 'tf-split__pane--primary');
@@ -940,7 +975,37 @@ export function renderSplit(component, ctx) {
   secondary.classList.add('tf-split__pane', 'tf-split__pane--secondary');
   secondary.setAttribute('data-slot-id', secondarySlot);
 
-  if (resizable) {
+  if (collapseBelow !== null) {
+    // Container-query collapse: below the breakpoint the split stacks as a
+    // column (primary above secondary) and the divider disappears (no drag
+    // resize in stacked mode). The inline flex-basis/min/max sizing set above
+    // needs `!important` to lose to the stacked layout, mirroring
+    // applyResponsive's inline-vs-@container contract. A vertical split is
+    // already a column, so only the divider rule applies there.
+    const px = BREAKPOINT_PX[collapseBelow];
+    const decls = [];
+    if (horizontal) {
+      decls.push(`{flex-direction:column !important}`);
+      decls.push(
+        ` > .tf-split__pane{flex-basis:auto !important;min-width:0 !important;` +
+        `max-width:none !important;width:100% !important}`
+      );
+      // Cap the stacked primary like the global 720px fallback does, so a
+      // fixed-basis list pane cannot push the secondary pane off-screen.
+      decls.push(` > .tf-split__pane--primary{max-height:45vh !important}`);
+    }
+    decls.push(` > .tf-split__divider{display:none !important}`);
+    const canonical = `split-collapse:${orientation}:${px}`;
+    const hash = fnv1aHex(canonical);
+    el.setAttribute('data-split-collapse', hash);
+    const sel = `[data-split-collapse="${hash}"]`;
+    const cssText = `@container addon (max-width: ${px}px){${decls
+      .map((d) => `${sel}${d}`)
+      .join('')}}\n`;
+    injectResponsiveCss(hash, cssText);
+  }
+
+  if (canResize) {
     // Pointer-drag resize: move/up listeners live on document so the drag
     // survives the pointer leaving the divider; both are released via
     // ctx.registerCleanup when the element is destroyed.

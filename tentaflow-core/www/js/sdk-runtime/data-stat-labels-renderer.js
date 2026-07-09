@@ -549,7 +549,7 @@ function renderBadge(component, ctx) {
 // =============================================================================
 
 export const CHIP_TAG = 0x020B;
-const CHIP_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6]);
+const CHIP_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7]);
 
 function renderChip(component, ctx) {
   assertOnlyKnownFields(component.fields, CHIP_FIELD_KEYS, 'Chip');
@@ -565,18 +565,27 @@ function renderChip(component, ctx) {
   }
   const selectedBind = ctx.readField(component.fields, 5);
   const removable = requireBool(ctx.readField(component.fields, 6), 'Chip.removable');
+  const dotRaw = ctx.readField(component.fields, 7);
+  const dotTone = dotRaw == null ? null : requireEnum(dotRaw, TONES, 'Chip.dot');
 
   // Map SDK tone to tf-chip status
   const TONE_TO_STATUS = {
-    neutral: 'info', primary: 'accent', success: 'ok', warning: 'warn',
-    critical: 'err', info: 'info', muted: 'info',
+    neutral: 'neutral', primary: 'accent', success: 'ok', warning: 'warn',
+    critical: 'err', info: 'info', muted: 'neutral',
   };
   const wrapper = document.createElement('tf-chip');
   wrapper.setAttribute('status', TONE_TO_STATUS[tone] || 'info');
   if (iconRaw != null) {
-    const iconName = typeof iconRaw === 'object' && iconRaw.fields
-      ? ctx.readField(iconRaw.fields, 0) : (typeof iconRaw === 'string' ? iconRaw : '');
-    if (iconName) wrapper.setAttribute('icon', iconName);
+    // IconRef Named on the wire is {kind:'named', name, size?, tone?};
+    // sprite ids are dash-separated (#i-record-dot for "record_dot").
+    const iconName = typeof iconRaw === 'object' && iconRaw !== null
+      ? (iconRaw.kind === 'named' ? iconRaw.name : '')
+      : (typeof iconRaw === 'string' ? iconRaw : '');
+    if (iconName) wrapper.setAttribute('icon', String(iconName).replace(/_/g, '-'));
+  }
+  if (dotTone != null) {
+    wrapper.setAttribute('dot', '');
+    wrapper.setAttribute('dot-tone', dotTone);
   }
   if (avatarRaw != null) {
     const avatar = renderAvatarRef(avatarRaw, 'Chip.avatar');

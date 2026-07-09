@@ -1651,6 +1651,9 @@
     "quick_add_allowed": "Ajouter aux autorisés",
     "quick_added_toast": "« {host} » ajouté à la liste des autorisés"
   },
+  "addon": {
+    "disabled": "Désactivé"
+  },
   "addon_toggle": {
     "enabling": "Activation…",
     "disabling": "Désactivation…",

@@ -411,6 +411,31 @@ test('Chip variant=solid non-interactive renderuje <tf-chip>', () => {
   assertEq(el.getAttribute('label'), 'tag');
 });
 
+test('Chip dot=success renderuje kropkę tonowaną, tone neutral → status neutral', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(CHIP_TAG, [
+    [0, 'soft'], [1, 'neutral'],
+    [2, { kind: 'literal', value: 'Nexadata' }],
+    [6, false],
+    [7, 'success'],
+  ]));
+  mount(el);
+  const inner = el.querySelector('.tf-chip');
+  assert(inner.classList.contains('neutral'));
+  const dot = el.querySelector('.tf-chip-dot');
+  assert(dot != null);
+  assert(dot.classList.contains('tf-chip-dot--tone-success'));
+
+  // Unknown dot tone rejected.
+  assertThrows(() => engine.render(comp(CHIP_TAG, [
+    [0, 'soft'], [1, 'neutral'],
+    [2, { kind: 'literal', value: 'x' }],
+    [6, false],
+    [7, 'rainbow'],
+  ], { id: 'c_baddot' })));
+});
+
 test('Chip root jest ZAWSZE <tf-chip>', () => {
   setup();
   const engine = makeEngine();

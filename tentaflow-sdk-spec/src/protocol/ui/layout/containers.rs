@@ -7,8 +7,8 @@ use super::super::inline::{
     GridChild, GridTrack, SplitSize, BoxStyle, ResponsiveRule,
 };
 use super::super::tokens::{
-    BackgroundToken, FlexAlign, FlexDirection, FlexJustify,
-    FlexWrap, RadiusToken, ScrollOrientation, SplitOrientation,
+    BackgroundToken, Breakpoint, FlexAlign, FlexDirection, FlexJustify,
+    FlexWrap, RadiusToken, ScrollOrientation, SplitDivider, SplitOrientation,
 };
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
@@ -317,13 +317,22 @@ pub struct Split {
     pub resizable: bool,
     pub primary_slot: String,
     pub secondary_slot: String,
+    /// Below this container breakpoint the split renders as a column stack
+    /// (primary pane above secondary) so narrow viewports fit both panes.
+    pub collapse_below: Option<Breakpoint>,
+    /// Divider rendering; absent = `handle` (the classic draggable bar).
+    pub divider: Option<SplitDivider>,
+    /// Self-as-flex-child: `true` makes the split take the leftover space of
+    /// its flex parent (`flex-grow: 1`, basis stays content-driven), so its
+    /// panes get a real height/width to fill. Absent/`false` = content size.
+    pub grow: Option<bool>,
 }
 
 impl Split {
     pub const TAG: u16 = 0x0105;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(7);
+        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(10);
         entries.push((0, encode_to_value(&self.orientation)?));
         entries.push((1, encode_to_value(&self.primary_size)?));
         entries.push((2, encode_to_value(&self.min_primary)?));
@@ -331,6 +340,9 @@ impl Split {
         entries.push((4, encode_to_value(&self.resizable)?));
         entries.push((5, encode_to_value(&self.primary_slot)?));
         entries.push((6, encode_to_value(&self.secondary_slot)?));
+        if let Some(b) = &self.collapse_below { entries.push((7, encode_to_value(b)?)); }
+        if let Some(d) = &self.divider { entries.push((8, encode_to_value(d)?)); }
+        if let Some(g) = &self.grow { entries.push((9, encode_to_value(g)?)); }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -344,6 +356,9 @@ impl Split {
         let mut resizable = None;
         let mut primary_slot = None;
         let mut secondary_slot = None;
+        let mut collapse_below = None;
+        let mut divider = None;
+        let mut grow = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => orientation = Some(decode_from_value(v)?),
@@ -353,6 +368,9 @@ impl Split {
                 4 => resizable = Some(decode_from_value(v)?),
                 5 => primary_slot = Some(decode_from_value(v)?),
                 6 => secondary_slot = Some(decode_from_value(v)?),
+                7 => collapse_below = Some(decode_from_value(v)?),
+                8 => divider = Some(decode_from_value(v)?),
+                9 => grow = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("Split", *other)),
             }
         }
@@ -364,6 +382,9 @@ impl Split {
             resizable: resizable.ok_or_else(|| missing_field("Split", "resizable"))?,
             primary_slot: primary_slot.ok_or_else(|| missing_field("Split", "primary_slot"))?,
             secondary_slot: secondary_slot.ok_or_else(|| missing_field("Split", "secondary_slot"))?,
+            collapse_below,
+            divider,
+            grow,
         })
     }
 }

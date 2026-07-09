@@ -3843,6 +3843,10 @@ pub struct ResponsiveRule {
     pub order: Option<i32>,
     #[n(8)]
     pub hidden: Option<bool>,
+    /// Width override below the threshold (e.g. a fixed side panel going
+    /// full-width once the row stacks into a column).
+    #[n(9)]
+    pub width: Option<DimensionToken>,
 }
 
 impl ResponsiveRule {
@@ -3858,6 +3862,7 @@ impl ResponsiveRule {
             min_height: None,
             order: None,
             hidden: None,
+            width: None,
         }
     }
 
@@ -3898,6 +3903,11 @@ impl ResponsiveRule {
 
     pub fn hidden(mut self, v: bool) -> Self {
         self.hidden = Some(v);
+        self
+    }
+
+    pub fn width(mut self, v: DimensionToken) -> Self {
+        self.width = Some(v);
         self
     }
 }

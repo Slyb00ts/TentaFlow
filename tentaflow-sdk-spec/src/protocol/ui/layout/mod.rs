@@ -233,9 +233,20 @@ mod tests {
             resizable: true,
             primary_slot: "left".into(),
             secondary_slot: "right".into(),
+            collapse_below: Some(crate::protocol::ui::tokens::Breakpoint::Sm),
+            divider: Some(crate::protocol::ui::tokens::SplitDivider::Line),
+            grow: Some(true),
         };
         let c = s.clone().into_component("sp").unwrap();
         assert_eq!(Split::try_from_component(&c).unwrap(), s);
+
+        // collapse_below / divider / grow are optional: None must be omitted
+        // from the wire (old decoders reject unknown keys 7/8/9) and absent
+        // keys must decode back to None (old payloads stay valid).
+        let legacy = Split { collapse_below: None, divider: None, grow: None, ..s };
+        let c2 = legacy.clone().into_component("sp2").unwrap();
+        assert!(c2.fields.0.iter().all(|(k, _)| *k != 7 && *k != 8 && *k != 9));
+        assert_eq!(Split::try_from_component(&c2).unwrap(), legacy);
     }
 
     #[test]

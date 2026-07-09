@@ -143,6 +143,28 @@ string_enum! {
 }
 
 string_enum! {
+    /// Split divider rendering (catalog §3 0x0105). `handle` is the default
+    /// draggable bar; `line` renders a hairline (still draggable when
+    /// `resizable`); `none` hides the divider and separates the panes with a
+    /// standard gap instead.
+    pub enum SplitDivider {
+        Handle = "handle",
+        Line = "line",
+        None = "none",
+    }
+}
+
+string_enum! {
+    /// Text-field visual variant (catalog §5 0x0301/0x0302). `outlined` is the
+    /// default framed field; `ghost` drops border/background/padding so the
+    /// control blends into surrounding content (e.g. inline title editing).
+    pub enum InputVariant {
+        Outlined = "outlined",
+        Ghost = "ghost",
+    }
+}
+
+string_enum! {
     /// Responsive breakpoint label. Maps to 640/768/1024/1280/1536/1920 px in theme CSS.
     pub enum Breakpoint {
         Xs = "xs",

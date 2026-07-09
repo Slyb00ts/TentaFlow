@@ -3937,6 +3937,9 @@
     "quick_add_allowed": "Dodaj do dozwolonych",
     "quick_added_toast": "Dodano „{host}” do listy dozwolonych"
   },
+  "addon": {
+    "disabled": "Wyłączony"
+  },
   "addon_toggle": {
     "enabling": "Włączanie…",
     "disabling": "Wyłączanie…",

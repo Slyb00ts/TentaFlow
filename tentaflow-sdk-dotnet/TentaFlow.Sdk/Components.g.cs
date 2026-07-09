@@ -271,6 +271,38 @@ public static class ShadowTokenWireExtensions {
     public static TfValue ToWire(this ShadowToken v) => TfValue.Text(v.WireName());
 }
 
+/// <summary>Enum: SplitDivider</summary>
+public enum SplitDivider {
+    [Wire("handle")] Handle,
+    [Wire("line")] Line,
+    [Wire("none")] None
+}
+
+public static class SplitDividerWireExtensions {
+    public static string WireName(this SplitDivider v) => v switch {
+        SplitDivider.Handle => "handle",
+        SplitDivider.Line => "line",
+        SplitDivider.None => "none",
+        _ => throw new ArgumentOutOfRangeException(nameof(v)),
+    };
+    public static TfValue ToWire(this SplitDivider v) => TfValue.Text(v.WireName());
+}
+
+/// <summary>Enum: InputVariant</summary>
+public enum InputVariant {
+    [Wire("outlined")] Outlined,
+    [Wire("ghost")] Ghost
+}
+
+public static class InputVariantWireExtensions {
+    public static string WireName(this InputVariant v) => v switch {
+        InputVariant.Outlined => "outlined",
+        InputVariant.Ghost => "ghost",
+        _ => throw new ArgumentOutOfRangeException(nameof(v)),
+    };
+    public static TfValue ToWire(this InputVariant v) => TfValue.Text(v.WireName());
+}
+
 /// <summary>Enum: Breakpoint</summary>
 public enum Breakpoint {
     [Wire("xs")] Xs,
@@ -4293,6 +4325,8 @@ public sealed class ResponsiveRule {
     public int? Order { get; set; }
     /// <summary>Field 8: hidden (Option<bool>)</summary>
     public bool? Hidden { get; set; }
+    /// <summary>Field 9: width (Option<Inline<DimensionToken>>)</summary>
+    public DimensionToken? Width { get; set; }
 
     public TfValue ToValue() {
         var entries = new List<KeyValuePair<TfValue, TfValue>>();
@@ -4305,6 +4339,7 @@ public sealed class ResponsiveRule {
         if (MinHeight != null) entries.Add(new(TfValue.UInt(6), MinHeight.ToValue()));
         if (Order != null) entries.Add(new(TfValue.UInt(7), TfValue.Int(Order.Value)));
         if (Hidden != null) entries.Add(new(TfValue.UInt(8), TfValue.Bool(Hidden.Value)));
+        if (Width != null) entries.Add(new(TfValue.UInt(9), Width.ToValue()));
         return TfValue.Map(entries);
     }
 }
@@ -7609,6 +7644,12 @@ public sealed class Split : Component {
     public string PrimarySlot { get; set; } = "";
     /// <summary>Field 6: secondary_slot (tstr)</summary>
     public string SecondarySlot { get; set; } = "";
+    /// <summary>Field 7: collapse_below (Option<Enum<Breakpoint>>)</summary>
+    public Breakpoint? CollapseBelow { get; set; }
+    /// <summary>Field 8: divider (Option<Enum<SplitDivider>>)</summary>
+    public SplitDivider? Divider { get; set; }
+    /// <summary>Field 9: grow (Option<bool>)</summary>
+    public bool? Grow { get; set; }
 
     public override FieldMap ToFieldMap() {
         var map = new FieldMap();
@@ -7619,6 +7660,9 @@ public sealed class Split : Component {
         map.Set(4, TfValue.Bool(Resizable));
         map.Set(5, TfValue.Text(PrimarySlot));
         map.Set(6, TfValue.Text(SecondarySlot));
+        if (CollapseBelow != null) map.Set(7, CollapseBelow.Value.ToWire());
+        if (Divider != null) map.Set(8, Divider.Value.ToWire());
+        if (Grow != null) map.Set(9, TfValue.Bool(Grow.Value));
         return map;
     }
 }
@@ -8215,6 +8259,8 @@ public sealed class Chip : Component {
     public BindRef? Selected { get; set; }
     /// <summary>Field 6: removable (bool)</summary>
     public bool Removable { get; set; } = false;
+    /// <summary>Field 7: dot (Option<Enum<Tone>>)</summary>
+    public Tone? Dot { get; set; }
 
     public override FieldMap ToFieldMap() {
         var map = new FieldMap();
@@ -8225,6 +8271,7 @@ public sealed class Chip : Component {
         if (Avatar != null) map.Set(4, Avatar.ToValue());
         if (Selected != null) map.Set(5, Selected.ToValue());
         map.Set(6, TfValue.Bool(Removable));
+        if (Dot != null) map.Set(7, Dot.Value.ToWire());
         return map;
     }
 }
@@ -9426,6 +9473,8 @@ public sealed class Input : Component {
     public BindRef? Error { get; set; }
     /// <summary>Field 18: size (Enum<InputSize>)</summary>
     public InputSize Size { get; set; }
+    /// <summary>Field 19: variant (Option<Enum<InputVariant>>)</summary>
+    public InputVariant? Variant { get; set; }
 
     public override FieldMap ToFieldMap() {
         var map = new FieldMap();
@@ -9448,6 +9497,7 @@ public sealed class Input : Component {
         if (Readonly != null) map.Set(16, Readonly.ToValue());
         if (Error != null) map.Set(17, Error.ToValue());
         map.Set(18, Size.ToWire());
+        if (Variant != null) map.Set(19, Variant.Value.ToWire());
         return map;
     }
 }
@@ -9492,6 +9542,8 @@ public sealed class Textarea : Component {
     public byte? MaxRows { get; set; }
     /// <summary>Field 14: monospace (bool)</summary>
     public bool Monospace { get; set; } = false;
+    /// <summary>Field 15: variant (Option<Enum<InputVariant>>)</summary>
+    public InputVariant? Variant { get; set; }
 
     public override FieldMap ToFieldMap() {
         var map = new FieldMap();
@@ -9510,6 +9562,7 @@ public sealed class Textarea : Component {
         map.Set(12, TfValue.Bool(Autoresize));
         if (MaxRows != null) map.Set(13, TfValue.UInt(MaxRows.Value));
         map.Set(14, TfValue.Bool(Monospace));
+        if (Variant != null) map.Set(15, Variant.Value.ToWire());
         return map;
     }
 }

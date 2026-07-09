@@ -362,6 +362,9 @@ pub const SPLIT_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 4, name: "resizable", wire: "bool", required: true, default: None },
         FieldMeta { key: 5, name: "primary_slot", wire: "tstr", required: true, default: None },
         FieldMeta { key: 6, name: "secondary_slot", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 7, name: "collapse_below", wire: "Option<Enum<Breakpoint>>", required: false, default: None },
+        FieldMeta { key: 8, name: "divider", wire: "Option<Enum<SplitDivider>>", required: false, default: None },
+        FieldMeta { key: 9, name: "grow", wire: "Option<bool>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -652,6 +655,7 @@ pub const CHIP_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 4, name: "avatar", wire: "Option<Inline<AvatarRef>>", required: false, default: None },
         FieldMeta { key: 5, name: "selected", wire: "Option<BindRef>", required: false, default: None },
         FieldMeta { key: 6, name: "removable", wire: "bool", required: true, default: None },
+        FieldMeta { key: 7, name: "dot", wire: "Option<Enum<Tone>>", required: false, default: None },
     ],
     handlers: &["click", "remove"],
 };
@@ -1236,6 +1240,7 @@ pub const INPUT_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 16, name: "readonly", wire: "Option<BindRef>", required: false, default: None },
         FieldMeta { key: 17, name: "error", wire: "Option<BindRef>", required: false, default: None },
         FieldMeta { key: 18, name: "size", wire: "Enum<InputSize>", required: true, default: None },
+        FieldMeta { key: 19, name: "variant", wire: "Option<Enum<InputVariant>>", required: false, default: None },
     ],
     handlers: &["input", "change", "submit", "focus", "blur"],
 };
@@ -1260,6 +1265,7 @@ pub const TEXTAREA_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 12, name: "autoresize", wire: "bool", required: true, default: None },
         FieldMeta { key: 13, name: "max_rows", wire: "Option<u8>", required: false, default: None },
         FieldMeta { key: 14, name: "monospace", wire: "bool", required: true, default: None },
+        FieldMeta { key: 15, name: "variant", wire: "Option<Enum<InputVariant>>", required: false, default: None },
     ],
     handlers: &["input", "change", "focus", "blur"],
 };
@@ -2438,6 +2444,23 @@ pub const SHADOWTOKEN_ENUM: EnumMeta = EnumMeta {
         ("Elevated", "elevated"),
         ("Floating", "floating"),
         ("AccentGlow", "accent_glow"),
+    ],
+};
+
+pub const SPLITDIVIDER_ENUM: EnumMeta = EnumMeta {
+    name: "SplitDivider",
+    variants: &[
+        ("Handle", "handle"),
+        ("Line", "line"),
+        ("None", "none"),
+    ],
+};
+
+pub const INPUTVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "InputVariant",
+    variants: &[
+        ("Outlined", "outlined"),
+        ("Ghost", "ghost"),
     ],
 };
 
@@ -3904,6 +3927,8 @@ pub const ALL_ENUMS: &[&EnumMeta] = &[
     &TEXTWRAP_ENUM,
     &RADIUSTOKEN_ENUM,
     &SHADOWTOKEN_ENUM,
+    &SPLITDIVIDER_ENUM,
+    &INPUTVARIANT_ENUM,
     &BREAKPOINT_ENUM,
     &ICONSIZE_ENUM,
     &SCROLLBEHAVIOR_ENUM,
@@ -4616,6 +4641,7 @@ pub const RESPONSIVERULE_INLINE: InlineMeta = InlineMeta {
         FieldMeta { key: 6, name: "min_height", wire: "Option<Inline<DimensionToken>>", required: false, default: None },
         FieldMeta { key: 7, name: "order", wire: "Option<i32>", required: false, default: None },
         FieldMeta { key: 8, name: "hidden", wire: "Option<bool>", required: false, default: None },
+        FieldMeta { key: 9, name: "width", wire: "Option<Inline<DimensionToken>>", required: false, default: None },
     ],
 };
 

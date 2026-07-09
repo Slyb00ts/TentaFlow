@@ -1651,6 +1651,9 @@
     "quick_add_allowed": "Zu Erlaubten hinzufügen",
     "quick_added_toast": "„{host}“ zur Positivliste hinzugefügt"
   },
+  "addon": {
+    "disabled": "Deaktiviert"
+  },
   "addon_toggle": {
     "enabling": "Wird aktiviert…",
     "disabling": "Wird deaktiviert…",

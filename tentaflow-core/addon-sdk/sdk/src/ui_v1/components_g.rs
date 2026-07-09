@@ -118,17 +118,18 @@ pub use tentaflow_sdk_spec::protocol::ui::tokens::{
     FileUploadStatus, FilterChipsMode, FlexAlign, FlexDirection, FlexJustify, FlexWrap,
     FormFieldLayout, FormLayout, FpsVariant, GateVariant, GaugeVariant,
     HeatmapLegendPosition, IFrameReferrerPolicy, IFrameSandbox, IconSize, ImageFit,
-    InputMode, InputSize, InputType, KvLayout, LinkTarget, LinkUnderline, LiveRegion,
-    LogLevel, LogVariant, MarkdownBlock, MarkdownFeature, MarkdownMark, MenuPlacement,
-    ModalSize, NavTabsVariant, NavigateTarget, Overflow, PaginationVariant, PdfZoomMode,
-    PieVariant, PopoverPlacement, ProgressSize, ProgressVariant, RadioCardVariant,
-    RadioGroupOrientation, RadiusToken, RatingPrecision, RatingVariant, ScrollBehavior,
-    ScrollOrientation, SearchVariant, SegmentSize, ShadowToken, SheetDetent,
+    InputMode, InputSize, InputType, InputVariant, KvLayout, LinkTarget, LinkUnderline,
+    LiveRegion, LogLevel, LogVariant, MarkdownBlock, MarkdownFeature, MarkdownMark,
+    MenuPlacement, ModalSize, NavTabsVariant, NavigateTarget, Overflow, PaginationVariant,
+    PdfZoomMode, PieVariant, PopoverPlacement, ProgressSize, ProgressVariant,
+    RadioCardVariant, RadioGroupOrientation, RadiusToken, RatingPrecision, RatingVariant,
+    ScrollBehavior, ScrollOrientation, SearchVariant, SegmentSize, ShadowToken, SheetDetent,
     SkeletonVariant, SliderRowLayout, SortDirection, SpacerAxis, Spacing, SparklineVariant,
-    SpinnerSize, SpinnerVariant, SplitOrientation, StatSize, StepProgressVariant,
-    StepStatus, StopwatchVariant, TableSelectMode, TableVariant, TabsVariant, TagSize,
-    TerminalTheme, TextAlign, TextStyle, TextWrap, TileProvider, TimePrecision,
-    TimelineOrientation, TogglePosition, ToggleSize, Tone, TreeVariant, VideoControls,
+    SpinnerSize, SpinnerVariant, SplitDivider, SplitOrientation, StatSize,
+    StepProgressVariant, StepStatus, StopwatchVariant, TableSelectMode, TableVariant,
+    TabsVariant, TagSize, TerminalTheme, TextAlign, TextStyle, TextWrap, TileProvider,
+    TimePrecision, TimelineOrientation, TogglePosition, ToggleSize, Tone, TreeVariant,
+    VideoControls,
 };
 pub use tentaflow_sdk_spec::protocol::ui::typed_field::{
     IntoComponentError, decode_from_value, encode_to_value,
@@ -377,6 +378,11 @@ mod catalog_conformance {
         assert_eq!(enc(&ShadowToken::Elevated), tstr("elevated"), "ShadowToken::Elevated");
         assert_eq!(enc(&ShadowToken::Floating), tstr("floating"), "ShadowToken::Floating");
         assert_eq!(enc(&ShadowToken::AccentGlow), tstr("accent_glow"), "ShadowToken::AccentGlow");
+        assert_eq!(enc(&SplitDivider::Handle), tstr("handle"), "SplitDivider::Handle");
+        assert_eq!(enc(&SplitDivider::Line), tstr("line"), "SplitDivider::Line");
+        assert_eq!(enc(&SplitDivider::None), tstr("none"), "SplitDivider::None");
+        assert_eq!(enc(&InputVariant::Outlined), tstr("outlined"), "InputVariant::Outlined");
+        assert_eq!(enc(&InputVariant::Ghost), tstr("ghost"), "InputVariant::Ghost");
         assert_eq!(enc(&Breakpoint::Xs), tstr("xs"), "Breakpoint::Xs");
         assert_eq!(enc(&Breakpoint::Sm), tstr("sm"), "Breakpoint::Sm");
         assert_eq!(enc(&Breakpoint::Md), tstr("md"), "Breakpoint::Md");

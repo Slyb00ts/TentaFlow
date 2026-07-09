@@ -3801,6 +3801,9 @@
     "quick_add_allowed": "Add to allowed",
     "quick_added_toast": "Added \"{host}\" to the allowed list"
   },
+  "addon": {
+    "disabled": "Disabled"
+  },
   "addon_toggle": {
     "enabling": "Enabling…",
     "disabling": "Disabling…",

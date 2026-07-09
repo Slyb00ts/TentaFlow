@@ -193,7 +193,6 @@ const KNOWN_MISSING = new Set([
   0x0603, // WGPUSurface
   0x0701, // PermissionMatrix
   0x0702, // NetworkRuleEditor
-  0x0703, // RelationGraph
   0x0704, // AlarmFeed
   0x0705, // WeeklyScheduleGrid
   0x0706, // AccessMatrix

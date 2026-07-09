@@ -195,8 +195,16 @@ mod tests {
             variant: ChipVariant::Removable, tone: Tone::Info,
             label: lit("filter1"), icon: None, avatar: None,
             selected: None, removable: true,
+            dot: Some(Tone::Success),
         };
-        rt(ch, |m| m.into_component("ch").unwrap(), Chip::try_from_component);
+        rt(ch.clone(), |m| m.into_component("ch").unwrap(), Chip::try_from_component);
+
+        // dot is optional: None omitted from the wire (old decoders reject
+        // unknown key 7) and absent key 7 decodes back to None.
+        let legacy = Chip { dot: None, ..ch };
+        let c = legacy.clone().into_component("ch2").unwrap();
+        assert!(c.fields.0.iter().all(|(k, _)| *k != 7));
+        assert_eq!(Chip::try_from_component(&c).unwrap(), legacy);
     }
 
     #[test]

@@ -1245,6 +1245,20 @@ th.tf-table__sticky-col { box-shadow: 1px 0 0 0 var(--tf-border); }
   background: currentColor;
   animation: tf-chip-pulse 2s ease-in-out infinite;
 }
+/* Neutral chip: plain framed pill (entity chips carry meaning in the dot). */
+.tf-chip.neutral {
+  background: var(--tf-bg-3, rgba(255, 255, 255, 0.04));
+  color: var(--tf-text-2);
+  border: 1px solid var(--tf-border);
+}
+/* Tone-colored dot independent of the chip status (dot-tone attribute). */
+.tf-chip-dot--tone-neutral  { color: var(--tf-text-3); }
+.tf-chip-dot--tone-muted    { color: var(--tf-text-3); }
+.tf-chip-dot--tone-primary  { color: #a78bfa; }
+.tf-chip-dot--tone-success  { color: #22c55e; }
+.tf-chip-dot--tone-warning  { color: #f59e0b; }
+.tf-chip-dot--tone-critical { color: #ef4444; }
+.tf-chip-dot--tone-info     { color: #60a5fa; }
 .tf-chip .tf-chip-icon {
   width: 12px;
   height: 12px;
@@ -4723,6 +4737,20 @@ tf-skeleton {
 .tf-split--horizontal > .tf-split__divider { width: 4px; cursor: col-resize; }
 .tf-split--vertical > .tf-split__divider { height: 4px; cursor: row-resize; }
 .tf-split--resizable > .tf-split__divider { touch-action: none; }
+/* Divider variants (Split.divider): "line" keeps an 8px drag hit-area but
+   paints only a centered hairline; "none" hides the divider entirely and
+   separates the panes with a standard gap instead. */
+.tf-split--divider-line > .tf-split__divider { background: transparent; }
+.tf-split--horizontal.tf-split--divider-line > .tf-split__divider {
+  width: 8px;
+  background: linear-gradient(to right, transparent calc(50% - 0.5px), var(--tf-border) calc(50% - 0.5px), var(--tf-border) calc(50% + 0.5px), transparent calc(50% + 0.5px));
+}
+.tf-split--vertical.tf-split--divider-line > .tf-split__divider {
+  height: 8px;
+  background: linear-gradient(to bottom, transparent calc(50% - 0.5px), var(--tf-border) calc(50% - 0.5px), var(--tf-border) calc(50% + 0.5px), transparent calc(50% + 0.5px));
+}
+.tf-split--divider-none { gap: var(--tf-space-md); }
+.tf-split--divider-none > .tf-split__divider { display: none; }
 
 /* Mobile: poziomy split (sidebar | workspace) nie mieści dwóch paneli na wąskim
    ekranie — panele nachodzą i ściskają się. Stackujemy w pionie, pełną szerokością;
@@ -6831,6 +6859,23 @@ tf-skeleton {
 .tf-pie-chart__legend-swatch--tone-muted    { background: var(--tf-text-3); }
 .tf-pie-chart__legend-label { flex: 1 1 auto; }
 .tf-pie-chart__legend-value { color: var(--tf-text-3); font-variant-numeric: tabular-nums; }
+
+/* =============================================================================
+   tf-relation-graph (RelationGraph 0x0703)
+   ============================================================================= */
+
+tf-relation-graph {
+  display: block;
+  width: 100%;
+  min-height: 320px;
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-lg);
+  background:
+    radial-gradient(ellipse 70% 60% at 46% 46%, rgba(99, 102, 241, 0.09), transparent 70%),
+    var(--tf-bg);
+}
 
 /* =============================================================================
    tf-heatmap (Heatmap 0x021B) + tf-gauge (Gauge 0x021C) — chunk 3.3d-12

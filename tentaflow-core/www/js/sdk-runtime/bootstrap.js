@@ -57,6 +57,7 @@ import { registerMoleculeShellRenderers } from './molecule-shell-renderer.js';
 import { registerSpecializedMediaRenderers } from './specialized-media-renderer.js';
 import { registerSpecializedAudioCaptureRenderer } from './specialized-audio-capture-renderer.js';
 import { registerSpecializedContentRenderers } from './specialized-content-renderer.js';
+import { registerDomainRelationGraphRenderer } from './domain-relation-graph-renderer.js';
 export { SlotManager } from './slot-manager.js';
 
 /// Registers all current component renderers. Called by the panel shell
@@ -109,6 +110,7 @@ export function bootstrapSdkRuntime() {
   registerSpecializedMediaRenderers();
   registerSpecializedAudioCaptureRenderer();
   registerSpecializedContentRenderers();
+  registerDomainRelationGraphRenderer();
   // 3.3b Action: KOMPLETNE (13/13). 3.3c Form: KOMPLETNE (26/26).
   // 3.3d Data Display: KOMPLETNE (38/38). 3.3e Feedback: KOMPLETNE (14/14).
   // 3.3f Molecules: KOMPLETNE (12/12). 3.3g Specialized: KOMPLETNE (14/14).
