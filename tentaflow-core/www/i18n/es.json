@@ -46,7 +46,6 @@
     "section_account": "Cuenta",
     "apps_home": "Todas las aplicaciones",
     "images": "Imágenes",
-    "notes": "Notas",
     "tts": "Texto a voz",
     "translate": "Traductor",
     "search_app": "Buscar",
@@ -2827,13 +2826,13 @@
       "name": "Chat",
       "desc": "Habla con un modelo local"
     },
+    "ml-studio": {
+      "name": "ML Studio",
+      "desc": "Anota y entrena modelos de visión"
+    },
     "images": {
       "name": "Imágenes",
       "desc": "Genera imágenes con IA"
-    },
-    "notes": {
-      "name": "Notas",
-      "desc": "Dicta notas de voz con STT"
     },
     "meeting": {
       "name": "Bot de reunión",
@@ -2864,7 +2863,6 @@
     "heading": "Aún no disponible",
     "back": "Volver a las apps",
     "images": "La generación de imágenes requiere un motor image-gen (p. ej. Stable Diffusion, ComfyUI). Pide al administrador que lo despliegue desde el Catálogo de servicios.",
-    "notes": "Las notas de voz requieren un motor STT (p. ej. Whisper) y backend para almacenarlas. En la hoja de ruta.",
     "meeting": "Meeting Bot requiere el addon teams-bot con OAuth y un handler binario de transcripciones. En la hoja de ruta.",
     "tts": "Texto a voz requiere un motor TTS desplegado y un handler de síntesis. Las reglas para admin ya existen; el flujo de usuario está en la hoja de ruta.",
     "translate": "Traducir reutilizará el backend de chat LLM cuando se conecte un handler dedicado de usuario. En la hoja de ruta.",
@@ -2945,32 +2943,6 @@
     "error": "Traducción fallida: {reason}",
     "model_info": "Traducido con {model} · {tokens} tokens",
     "swap": "Intercambiar idiomas"
-  },
-  "notes": {
-    "page_title": "Notas",
-    "subtitle": "Notas personales rápidas",
-    "count": "{n} notas",
-    "search_placeholder": "Buscar notas…",
-    "new_button": "Nueva nota",
-    "empty_state": "Aún no hay notas. Haz clic en «Nueva nota» para crear la primera.",
-    "empty_editor": "Selecciona una nota o crea una nueva.",
-    "title_placeholder": "Sin título",
-    "body_placeholder": "Empieza a escribir…",
-    "pin": "Fijar",
-    "unpin": "Desfijar",
-    "delete": "Eliminar",
-    "delete_confirm_title": "¿Eliminar nota?",
-    "delete_confirm_body": "Esta nota se eliminará permanentemente.",
-    "status": {
-      "saving": "Guardando…",
-      "saved": "Guardado",
-      "error": "Error"
-    },
-    "relative_just_now": "ahora mismo",
-    "relative_min_ago": "hace {n} min",
-    "relative_hours_ago": "hace {n} h",
-    "relative_days_ago": "hace {n} d",
-    "word_count": "{n} palabras"
   },
   "connection": {
     "title": "Conexión al servidor perdida",

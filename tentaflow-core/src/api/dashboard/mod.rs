@@ -11,7 +11,6 @@ pub mod handlers_addon_permissions;
 pub mod handlers_browser;
 pub mod handlers_meeting;
 pub mod handlers_my_accounts;
-pub mod handlers_notes;
 pub mod handlers_translate;
 pub mod handlers_vnc;
 pub mod oauth_addon_callback;

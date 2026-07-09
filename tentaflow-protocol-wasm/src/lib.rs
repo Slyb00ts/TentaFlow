@@ -52,8 +52,7 @@ use tentaflow_protocol::{
         MeshPairingConfirmRequest, MeshPairingRejectRequest, MeshPairingStartRequest,
         MeshTrustRetrustRequest, MeshTrustRevokeRequest, MessageBody, ModelAliasCreateRequest,
         ModelAliasDeleteRequest, ModelAliasUpdateRequest, ModelInstallRequest,
-        MyOAuthAccountsListRequest, NoteCreateRequest, NoteDeleteRequest, NoteDetailRequest,
-        NoteSetPinnedRequest, NoteUpdateRequest, NotesListRequest, NotesRequest, NotesResponse,
+        MyOAuthAccountsListRequest,
         ProtocolError, ProtocolErrorCode, ServiceManifestDeployRequest, SettingEntry,
         SettingsUpdateRequest, SsoProviderCreateRequest, SsoProviderDeleteRequest,
         TranslateRequest, TtsRule,
@@ -3649,77 +3648,6 @@ pub fn encode_prompt_detail_request(prompt_id: String) -> Result<Vec<u8>, JsErro
     encode_body_inner(&MessageBody::PromptDetailRequest { prompt_id }).map_err(|e| JsError::new(&e))
 }
 
-// --- Notes ----------------------------------------------------------------
-
-/// NotesRequest::List — empty inner struct.
-#[wasm_bindgen(js_name = encodeNotesListRequest)]
-pub fn encode_notes_list_request() -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::NotesRequestBody(NotesRequest::List(
-        NotesListRequest {},
-    )))
-    .map_err(|e| JsError::new(&e))
-}
-
-/// NotesRequest::Detail { note_id }.
-#[wasm_bindgen(js_name = encodeNoteDetailRequest)]
-pub fn encode_note_detail_request(note_id: f64) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::NotesRequestBody(NotesRequest::Detail(
-        NoteDetailRequest {
-            note_id: note_id as i64,
-        },
-    )))
-    .map_err(|e| JsError::new(&e))
-}
-
-/// NotesRequest::Create { title, body }.
-#[wasm_bindgen(js_name = encodeNoteCreateRequest)]
-pub fn encode_note_create_request(title: String, body: String) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::NotesRequestBody(NotesRequest::Create(
-        NoteCreateRequest { title, body },
-    )))
-    .map_err(|e| JsError::new(&e))
-}
-
-/// NotesRequest::Update { note_id, title, body }.
-#[wasm_bindgen(js_name = encodeNoteUpdateRequest)]
-pub fn encode_note_update_request(
-    note_id: f64,
-    title: String,
-    body: String,
-) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::NotesRequestBody(NotesRequest::Update(
-        NoteUpdateRequest {
-            note_id: note_id as i64,
-            title,
-            body,
-        },
-    )))
-    .map_err(|e| JsError::new(&e))
-}
-
-/// NotesRequest::SetPinned { note_id, pinned }.
-#[wasm_bindgen(js_name = encodeNoteSetPinnedRequest)]
-pub fn encode_note_set_pinned_request(note_id: f64, pinned: bool) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::NotesRequestBody(NotesRequest::SetPinned(
-        NoteSetPinnedRequest {
-            note_id: note_id as i64,
-            pinned,
-        },
-    )))
-    .map_err(|e| JsError::new(&e))
-}
-
-/// NotesRequest::Delete { note_id }.
-#[wasm_bindgen(js_name = encodeNoteDeleteRequest)]
-pub fn encode_note_delete_request(note_id: f64) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::NotesRequestBody(NotesRequest::Delete(
-        NoteDeleteRequest {
-            note_id: note_id as i64,
-        },
-    )))
-    .map_err(|e| JsError::new(&e))
-}
-
 // --- Meeting Bot ----------------------------------------------------------
 
 use tentaflow_protocol::{
@@ -6986,66 +6914,6 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "variables", vars.into());
             set(&obj, "updatedAtEpoch", d.updated_at_epoch.into());
         }
-        MessageBody::NotesRequestBody(_) => {
-            set(&obj, "variant", "NotesRequest".into());
-        }
-        MessageBody::NotesResponseBody(r) => match r {
-            NotesResponse::List(resp) => {
-                set(&obj, "variant", "NotesListResponse".into());
-                let arr = js_sys::Array::new();
-                for n in resp.notes {
-                    let item = js_sys::Object::new();
-                    set(&item, "id", n.id.clone().into());
-                    set(&item, "title", n.title.into());
-                    set(&item, "bodyPreview", n.body_preview.clone().into());
-                    set(&item, "body_preview", n.body_preview.into());
-                    set(&item, "pinned", n.pinned.into());
-                    set(&item, "createdAtEpoch", n.created_at_epoch.clone().into());
-                    set(
-                        &item,
-                        "created_at_epoch",
-                        n.created_at_epoch.clone().into(),
-                    );
-                    set(&item, "updatedAtEpoch", n.updated_at_epoch.clone().into());
-                    set(
-                        &item,
-                        "updated_at_epoch",
-                        n.updated_at_epoch.clone().into(),
-                    );
-                    arr.push(&item.into());
-                }
-                set(&obj, "notes", arr.into());
-            }
-            NotesResponse::Detail(d) => {
-                set(&obj, "variant", "NoteDetailResponse".into());
-                set(&obj, "id", d.id.clone().into());
-                set(&obj, "title", d.title.into());
-                set(&obj, "body", d.body.into());
-                set(&obj, "pinned", d.pinned.into());
-                set(&obj, "createdAtEpoch", d.created_at_epoch.clone().into());
-                set(&obj, "created_at_epoch", d.created_at_epoch.clone().into());
-                set(&obj, "updatedAtEpoch", d.updated_at_epoch.clone().into());
-                set(&obj, "updated_at_epoch", d.updated_at_epoch.clone().into());
-            }
-            NotesResponse::Create(c) => {
-                set(&obj, "variant", "NoteCreateResponse".into());
-                set(&obj, "id", c.id.clone().into());
-            }
-            NotesResponse::Update(u) => {
-                set(&obj, "variant", "NoteUpdateResponse".into());
-                set(&obj, "ok", u.ok.into());
-                set(&obj, "updatedAtEpoch", u.updated_at_epoch.clone().into());
-                set(&obj, "updated_at_epoch", u.updated_at_epoch.clone().into());
-            }
-            NotesResponse::SetPinned(p) => {
-                set(&obj, "variant", "NoteSetPinnedResponse".into());
-                set(&obj, "ok", p.ok.into());
-            }
-            NotesResponse::Delete(d) => {
-                set(&obj, "variant", "NoteDeleteResponse".into());
-                set(&obj, "ok", d.ok.into());
-            }
-        },
         MessageBody::RegistryListRequest => {
             set(&obj, "variant", "RegistryListRequest".into());
         }

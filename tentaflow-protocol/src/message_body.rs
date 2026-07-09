@@ -6113,109 +6113,6 @@ pub struct MyOAuthAccountsListResponse {
 }
 
 // =============================================================================
-// Notes (per-user) — inner-enum multiplex zeby nie przekroczyc 256 variantow
-// MessageBody. Payloady opakowane w strukty (nawet puste) dla spojnego wzorca.
-// =============================================================================
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NotesListRequest;
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteEntry {
-    pub id: i64,
-    pub title: String,
-    pub body_preview: String,
-    pub pinned: bool,
-    pub created_at_epoch: i64,
-    pub updated_at_epoch: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NotesListResponse {
-    pub notes: Vec<NoteEntry>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteDetailRequest {
-    pub note_id: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteDetailResponse {
-    pub id: i64,
-    pub title: String,
-    pub body: String,
-    pub pinned: bool,
-    pub created_at_epoch: i64,
-    pub updated_at_epoch: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteCreateRequest {
-    pub title: String,
-    pub body: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteCreateResponse {
-    pub id: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteUpdateRequest {
-    pub note_id: i64,
-    pub title: String,
-    pub body: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteUpdateResponse {
-    pub ok: bool,
-    pub updated_at_epoch: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteSetPinnedRequest {
-    pub note_id: i64,
-    pub pinned: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteSetPinnedResponse {
-    pub ok: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteDeleteRequest {
-    pub note_id: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteDeleteResponse {
-    pub ok: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub enum NotesRequest {
-    List(NotesListRequest),
-    Detail(NoteDetailRequest),
-    Create(NoteCreateRequest),
-    Update(NoteUpdateRequest),
-    SetPinned(NoteSetPinnedRequest),
-    Delete(NoteDeleteRequest),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub enum NotesResponse {
-    List(NotesListResponse),
-    Detail(NoteDetailResponse),
-    Create(NoteCreateResponse),
-    Update(NoteUpdateResponse),
-    SetPinned(NoteSetPinnedResponse),
-    Delete(NoteDeleteResponse),
-}
-
-// =============================================================================
 // Deployments — real build/run pipeline with streaming progress + log tail.
 // =============================================================================
 
@@ -7449,10 +7346,6 @@ pub enum MessageBody {
     // ---- My OAuth accounts (user-facing) ----
     MyOAuthAccountsListRequestBody(MyOAuthAccountsListRequest),
     MyOAuthAccountsListResponseBody(MyOAuthAccountsListResponse),
-
-    // ---- Notes (inner-enum multiplex) ----
-    NotesRequestBody(NotesRequest),
-    NotesResponseBody(NotesResponse),
 
     // ---- Meeting Bot (single-variant, req+res w inner enum) ----
     MeetingBody(MeetingPayload),

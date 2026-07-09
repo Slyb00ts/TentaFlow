@@ -597,8 +597,22 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "vision_models_registry",
             MigrationStep::Rust(create_vision_models),
         ),
+        (
+            112,
+            "drop_notes_table",
+            MigrationStep::Sql(DROP_NOTES_TABLE),
+        ),
     ]
 }
+
+// v112 — the built-in Notes screen was removed in favor of the notes addon
+// (which keeps its data in its own addon SQLite). The platform `notes` table
+// and its indexes are dead storage, so drop them.
+const DROP_NOTES_TABLE: &str = r#"
+DROP INDEX IF EXISTS idx_notes_user;
+DROP INDEX IF EXISTS idx_notes_user_updated;
+DROP TABLE IF EXISTS notes;
+"#;
 
 /// v111 — vision model registry for the configurable camera-CV pipeline.
 /// Rows describe dynamic ONNX models (trained in ML Studio or imported) that
@@ -1865,7 +1879,6 @@ fn child_remaps() -> Vec<ChildRemap> {
         f("addon_network_rules", "approved_by", UserAccounts),
         f("oauth_pending_states", "user_id", UserAccounts),
         f("user_oauth_accounts", "user_id", UserAccounts),
-        f("notes", "user_id", UserAccounts),
         f("meeting_settings", "user_id", UserAccounts),
         f("meeting_sessions", "owner_user_id", UserAccounts),
         f("deployments", "user_id", UserAccounts),
@@ -2113,6 +2126,13 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "polymorphic user|group id discriminated by key_type (NULL for 'general'), \
              not a single-table FK; born TEXT in v82 (rows wiped on the rebuild, \
              never held an INTEGER id)",
+        ),
+        t(
+            "model_metrics_rollup",
+            "user_id",
+            "metrics-rollup key born TEXT in v102 (post-flip, never held an INTEGER id); \
+             no declared user_accounts FK — synced rollup rows may reference an account \
+             a receiving node has not materialized yet (same rationale as token_usage_daily)",
         ),
         t(
             "token_usage_daily",
@@ -6955,7 +6975,6 @@ mod tests {
             INSERT INTO flow_versions (id, flow_id, version_num, flow_json, name) VALUES
                 (1, 5, 1, '{}', 'v1');
             INSERT INTO flow_executions (flow_id, status) VALUES (5, 'success');
-            INSERT INTO notes (user_id, title) VALUES (10, 'note');
             INSERT INTO api_keys (key_hash, key_prefix, name, owner_user_id)
                 VALUES ('kh', 'kp', 'k', 11);
             INSERT INTO addon_permissions (addon_id, subject_type, subject_id, permission_id)
@@ -7066,16 +7085,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(dangling_bindings, 0, "binding.flow_id must resolve");
-        let dangling_notes: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM notes n \
-                 LEFT JOIN user_accounts u ON u.id = n.user_id WHERE u.id IS NULL",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(dangling_notes, 0, "notes.user_id must resolve");
-
         // group_members both columns resolve.
         let dangling_members: i64 = conn
             .query_row(

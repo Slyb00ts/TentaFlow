@@ -687,7 +687,6 @@ input, textarea, select {
 .app-tile .app-icon .icon { width: 28px; height: 28px; color: white; stroke-width: 2; }
 .app-tile.chat .app-icon { background: linear-gradient(135deg, #3b82f6, #06b6d4); }
 .app-tile.img .app-icon { background: linear-gradient(135deg, #6366f1, #a78bfa); }
-.app-tile.notes .app-icon { background: linear-gradient(135deg, #f59e0b, #ef4444); }
 .app-tile.workflows .app-icon { background: linear-gradient(135deg, #22c55e, #10b981); }
 .app-tile.prompts .app-icon { background: linear-gradient(135deg, #8b5cf6, #6366f1); }
 .app-tile.tts .app-icon { background: linear-gradient(135deg, #06b6d4, #3b82f6); }
@@ -760,30 +759,6 @@ input, textarea, select {
 .imgen-result .preview-icon { width: 48px; height: 48px; color: var(--accent-2); opacity: 0.6; stroke-width: 1.5; }
 .imgen-result.generating .preview-icon { color: var(--accent-1); animation: spin 2s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
-
-/* ============ NOTES APP ============ */
-.notes-shell { padding: 60px 32px; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 500px; }
-.notes-coming { max-width: 520px; text-align: center; }
-.notes-coming .mascot { width: 90px; margin: 0 auto 20px; opacity: 0.75; }
-.notes-coming h1 { font-size: 30px; font-weight: 800; margin-bottom: 12px; color: var(--text); }
-.notes-coming .tag {
-  display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px;
-  background: var(--warning); color: #1a1a0a;
-  font-weight: 700; font-size: 11px; border-radius: 20px;
-  margin-bottom: 16px; letter-spacing: 0.06em;
-}
-.notes-coming .tag .icon { width: 12px; height: 12px; stroke-width: 2.5; }
-.notes-coming p { color: var(--text-2); margin-bottom: 8px; }
-.notes-coming .features {
-  display: flex; gap: 10px; justify-content: center; margin-top: 24px;
-  flex-wrap: wrap;
-}
-.feature-chip {
-  display: inline-flex; align-items: center; gap: 6px;
-  background: var(--bg-card); border: 1px solid var(--border);
-  padding: 7px 12px; border-radius: 20px; font-size: 12px; color: var(--text-2);
-}
-.feature-chip .icon { color: var(--accent-2); }
 
 /* ============ MESH VIEW ============ */
 .mesh-shell { padding: 24px 32px; }

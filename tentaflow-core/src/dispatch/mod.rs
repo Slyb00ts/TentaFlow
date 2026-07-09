@@ -970,19 +970,6 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::PromptListResponse { .. } => "PromptListResponse",
         MessageBody::PromptDetailRequest { .. } => "PromptDetailRequest",
         MessageBody::PromptDetailResponse(_) => "PromptDetailResponse",
-        // Inner-enum multiplex: JEDEN handler (`notes_dispatch`, zarejestrowany
-        // jako "NotesRequest") obsluguje wszystkie warianty, wiec lookup w
-        // registry MUSI trafic w te nazwe — granularne nazwy nie mialy handlera
-        // i konczyly sie NotImplemented.
-        MessageBody::NotesRequestBody(_) => "NotesRequest",
-        MessageBody::NotesResponseBody(r) => match r {
-            tentaflow_protocol::NotesResponse::List(_) => "NotesListResponse",
-            tentaflow_protocol::NotesResponse::Detail(_) => "NoteDetailResponse",
-            tentaflow_protocol::NotesResponse::Create(_) => "NoteCreateResponse",
-            tentaflow_protocol::NotesResponse::Update(_) => "NoteUpdateResponse",
-            tentaflow_protocol::NotesResponse::SetPinned(_) => "NoteSetPinnedResponse",
-            tentaflow_protocol::NotesResponse::Delete(_) => "NoteDeleteResponse",
-        },
         MessageBody::DeploymentBody(p) => match p {
             tentaflow_protocol::DeploymentPayload::ReqStart(_) => "ServiceManifestDeployRequest",
             tentaflow_protocol::DeploymentPayload::ResStart(_) => "ServiceManifestDeployResponse",

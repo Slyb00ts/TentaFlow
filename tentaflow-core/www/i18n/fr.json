@@ -46,7 +46,6 @@
     "section_account": "Compte",
     "apps_home": "Toutes les applications",
     "images": "Images",
-    "notes": "Notes",
     "tts": "Synthèse vocale",
     "translate": "Traducteur",
     "search_app": "Rechercher",
@@ -2827,13 +2826,13 @@
       "name": "Chat",
       "desc": "Discute avec un modèle local"
     },
+    "ml-studio": {
+      "name": "ML Studio",
+      "desc": "Annoter et entraîner des modèles de vision"
+    },
     "images": {
       "name": "Images",
       "desc": "Génère des images avec IA"
-    },
-    "notes": {
-      "name": "Notes",
-      "desc": "Dicte des notes vocales via STT"
     },
     "meeting": {
       "name": "Meeting Bot",
@@ -2864,7 +2863,6 @@
     "heading": "Pas encore disponible",
     "back": "Retour aux applis",
     "images": "La génération d’images nécessite un moteur image-gen (p. ex. Stable Diffusion, ComfyUI). Demande à ton administrateur de le déployer via le Catalogue de services.",
-    "notes": "Les notes vocales nécessitent un moteur STT (p. ex. Whisper) et un backend de stockage. Dans la feuille de route.",
     "meeting": "Meeting Bot nécessite l’addon teams-bot avec OAuth et un handler binaire pour les transcriptions. Dans la feuille de route.",
     "tts": "La synthèse vocale nécessite un moteur TTS déployé et un handler de synthèse. Les règles admin existent déjà ; le parcours utilisateur est dans la feuille de route.",
     "translate": "Traduire réutilisera le backend LLM du chat dès qu’un handler utilisateur dédié sera branché. Dans la feuille de route.",
@@ -2945,32 +2943,6 @@
     "error": "Échec de la traduction : {reason}",
     "model_info": "Traduit via {model} · {tokens} tokens",
     "swap": "Inverser les langues"
-  },
-  "notes": {
-    "page_title": "Notes",
-    "subtitle": "Notes personnelles rapides",
-    "count": "{n} notes",
-    "search_placeholder": "Rechercher des notes…",
-    "new_button": "Nouvelle note",
-    "empty_state": "Aucune note pour le moment. Cliquez sur « Nouvelle note ».",
-    "empty_editor": "Sélectionnez une note ou créez-en une nouvelle.",
-    "title_placeholder": "Sans titre",
-    "body_placeholder": "Commencez à écrire…",
-    "pin": "Épingler",
-    "unpin": "Désépingler",
-    "delete": "Supprimer",
-    "delete_confirm_title": "Supprimer la note ?",
-    "delete_confirm_body": "Cette note sera définitivement supprimée.",
-    "status": {
-      "saving": "Enregistrement…",
-      "saved": "Enregistré",
-      "error": "Erreur"
-    },
-    "relative_just_now": "à l'instant",
-    "relative_min_ago": "il y a {n} min",
-    "relative_hours_ago": "il y a {n} h",
-    "relative_days_ago": "il y a {n} j",
-    "word_count": "{n} mots"
   },
   "connection": {
     "title": "Connexion au serveur perdue",

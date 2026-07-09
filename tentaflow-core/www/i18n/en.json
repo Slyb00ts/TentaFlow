@@ -23,7 +23,6 @@
     "scheduler": "Scheduler",
     "agents": "Agents",
     "skills": "Skills",
-    "ml_studio": "ML Studio",
     "robots": "Robots",
     "playground": "Playground",
     "chat": "Chat",
@@ -52,7 +51,6 @@
     "section_account": "Account",
     "apps_home": "All apps",
     "images": "Images",
-    "notes": "Notes",
     "tts": "Text-to-Speech",
     "translate": "Translate",
     "search_app": "Search",
@@ -4034,13 +4032,13 @@
       "name": "Chat",
       "desc": "Talk with a local model"
     },
+    "ml-studio": {
+      "name": "ML Studio",
+      "desc": "Annotate and train vision models"
+    },
     "images": {
       "name": "Images",
       "desc": "Generate images with AI"
-    },
-    "notes": {
-      "name": "Notes",
-      "desc": "Dictate voice notes with STT"
     },
     "meeting": {
       "name": "Meeting Bot",
@@ -4075,7 +4073,6 @@
     "heading": "Not yet available",
     "back": "Back to apps",
     "images": "The image generation app requires an image-gen engine (e.g. Stable Diffusion, ComfyUI). Ask your administrator to deploy one from the Service Catalog.",
-    "notes": "Voice notes require an STT engine (e.g. Whisper) and backend wiring for note storage. Tracked on the roadmap.",
     "meeting": "Meeting Bot requires the teams-bot addon with OAuth configured, plus a backend binary handler for transcripts. Tracked on the roadmap.",
     "tts": "Text-to-Speech requires a deployed TTS engine and a synthesize binary handler. The TTS rules admin already exists; the user-facing synthesize flow is tracked on the roadmap.",
     "translate": "Translate will reuse the chat LLM backend once a dedicated user-facing handler is wired. Tracked on the roadmap.",
@@ -4156,32 +4153,6 @@
     "error": "Translation failed: {reason}",
     "model_info": "Translated via {model} · {tokens} tokens",
     "swap": "Swap languages"
-  },
-  "notes": {
-    "page_title": "Notes",
-    "subtitle": "Quick personal notes",
-    "count": "{n} notes",
-    "search_placeholder": "Search notes…",
-    "new_button": "New note",
-    "empty_state": "No notes yet. Click 'New note' to create one.",
-    "empty_editor": "Select a note or create a new one.",
-    "title_placeholder": "Untitled",
-    "body_placeholder": "Start typing…",
-    "pin": "Pin",
-    "unpin": "Unpin",
-    "delete": "Delete",
-    "delete_confirm_title": "Delete note?",
-    "delete_confirm_body": "This note will be removed permanently.",
-    "status": {
-      "saving": "Saving…",
-      "saved": "Saved",
-      "error": "Error"
-    },
-    "relative_just_now": "just now",
-    "relative_min_ago": "{n}m ago",
-    "relative_hours_ago": "{n}h ago",
-    "relative_days_ago": "{n}d ago",
-    "word_count": "{n} words"
   },
   "connection": {
     "title": "Connection to server lost",

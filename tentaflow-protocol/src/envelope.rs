@@ -153,7 +153,10 @@ mod serde_array64 {
 // vision-model import over HTTPS + API key). Appended at the enum's end so no
 // existing CBOR tag shifts, but a stale peer cannot decode the new variant —
 // handshake bump per the convention above.
-pub const SCHEMA_VERSION: u16 = 20;
+// v21: removed both Notes `MessageBody` variants (built-in Notes screen
+// replaced by the notes addon). Dropping mid-enum variants shifts the CBOR tag
+// of every later variant, so old/new peers must not mix.
+pub const SCHEMA_VERSION: u16 = 21;
 
 // =============================================================================
 // Message kind discriminants

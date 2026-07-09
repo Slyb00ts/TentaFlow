@@ -46,7 +46,6 @@ import AppsHomeScreen from '/js/modules/apps-home.js';
 import ProfileScreen from '/js/modules/profile.js';
 import SettingsUserScreen from '/js/modules/settings-user.js';
 import TranslateScreen from '/js/modules/translate.js';
-import NotesScreen from '/js/modules/notes.js';
 import MeetingScreen from '/js/modules/meeting.js';
 import MeetingLiveScreen from '/js/modules/meeting-live.js';
 import PoseScreen from '/js/modules/pose.js';
@@ -136,7 +135,6 @@ const ADMIN_NAV = [
     items: [
       { id: 'agents', labelKey: 'nav.agents', icon: 'brain' },
       { id: 'skills', labelKey: 'nav.skills', icon: 'sparkle' },
-      { id: 'ml-studio', labelKey: 'nav.ml_studio', icon: 'brain' },
       { id: 'robots', labelKey: 'nav.robots', icon: 'cpu' },
     ],
   },
@@ -173,11 +171,7 @@ const USER_NAV = [
     items: [
       { id: 'apps-home', labelKey: 'nav.apps_home', icon: 'apps' },
       { id: 'chat', labelKey: 'nav.chat', icon: 'chat' },
-      // ML Studio jest narzedziem zaawansowanym — widoczne tylko dla Power User
-      // i Admin (wymog §11.2). Gate realizuje filtr `requiresPowerUser` w paint().
-      { id: 'ml-studio', labelKey: 'nav.ml_studio', icon: 'brain', requiresPowerUser: true },
       { id: 'images', labelKey: 'nav.images', icon: 'image', badge: 'soon' },
-      { id: 'notes', labelKey: 'nav.notes', icon: 'mic' },
       { id: 'meeting', labelKey: 'nav.meeting', icon: 'meeting' },
       { id: 'pose', labelKey: 'nav.pose', icon: 'image' },
       { id: 'translate', labelKey: 'nav.translate', icon: 'globe' },
@@ -295,15 +289,7 @@ async function renderApp() {
 
   function paint() {
     // Admin sees their admin nav plus the user-facing apps appended — admin is a superset of user.
-    const rawNav = isAdmin ? [...ADMIN_NAV, ...USER_NAV] : USER_NAV;
-    // Gate pozycji wymagajacych roli: `requiresPowerUser` widoczne tylko dla
-    // Power User i Admin. Filtrujemy itemy, sekcje pomijamy gdy zostaja puste.
-    const nav = rawNav
-      .map((section) => ({
-        ...section,
-        items: section.items.filter((it) => !it.requiresPowerUser || isPowerUser),
-      }))
-      .filter((section) => section.items.length > 0);
+    const nav = isAdmin ? [...ADMIN_NAV, ...USER_NAV] : USER_NAV;
     const userClass = isAdmin ? 'admin' : isPowerUser ? 'power' : 'user';
     const roleLabel = I18n.t(
       isAdmin ? 'role.administrator' : isPowerUser ? 'users.role_power' : 'role.user',
@@ -547,7 +533,6 @@ async function renderApp() {
   Router.register('apps-home', AppsHomeScreen);
   Router.register('profile', ProfileScreen);
   Router.register('settings-user', SettingsUserScreen);
-  Router.register('notes', NotesScreen);
   // Apps whose binary handlers are not yet wired — honest placeholder, not a stub feature.
   Router.register('images',         makeComingSoonScreen('images',    'image'));
   Router.register('meeting', MeetingScreen);

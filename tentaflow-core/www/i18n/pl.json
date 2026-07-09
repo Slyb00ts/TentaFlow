@@ -23,7 +23,6 @@
     "scheduler": "Scheduler",
     "agents": "Agenci",
     "skills": "Skills",
-    "ml_studio": "ML Studio",
     "robots": "Roboty",
     "playground": "Playground",
     "chat": "Chat",
@@ -52,7 +51,6 @@
     "section_account": "Konto",
     "apps_home": "Wszystkie aplikacje",
     "images": "Obrazy",
-    "notes": "Notatki",
     "tts": "Synteza mowy",
     "translate": "Tłumacz",
     "search_app": "Wyszukaj",
@@ -4170,13 +4168,13 @@
       "name": "Czat",
       "desc": "Rozmowa z lokalnym modelem"
     },
+    "ml-studio": {
+      "name": "ML Studio",
+      "desc": "Anotuj i trenuj modele wizyjne"
+    },
     "images": {
       "name": "Obrazy",
       "desc": "Generuj obrazy z AI"
-    },
-    "notes": {
-      "name": "Notatki",
-      "desc": "Dyktuj notatki głosowe z STT"
     },
     "meeting": {
       "name": "Meeting Bot",
@@ -4211,7 +4209,6 @@
     "heading": "Jeszcze niedostępne",
     "back": "Wróć do aplikacji",
     "images": "Aplikacja generowania obrazów wymaga silnika image-gen (np. Stable Diffusion, ComfyUI). Poproś administratora o wdrożenie z Katalogu usług.",
-    "notes": "Notatki głosowe wymagają silnika STT (np. Whisper) oraz backendu do zapisu notatek. Pozycja na roadmapie.",
     "meeting": "Meeting Bot wymaga addona teams-bot z OAuth oraz binarnego handlera transkryptów. Pozycja na roadmapie.",
     "tts": "TTS wymaga wdrożonego silnika TTS i handlera syntezy. Panel reguł TTS dla admina istnieje; ścieżka użytkownika jest na roadmapie.",
     "translate": "Tłumacz użyje backendu czatu LLM po dodaniu dedykowanego handlera użytkownika. Pozycja na roadmapie.",
@@ -4292,32 +4289,6 @@
     "error": "Tłumaczenie nie powiodło się: {reason}",
     "model_info": "Wykonano przez {model} · {tokens} tokenów",
     "swap": "Zamień języki"
-  },
-  "notes": {
-    "page_title": "Notatki",
-    "subtitle": "Szybkie notatki osobiste",
-    "count": "{n} notatek",
-    "search_placeholder": "Szukaj notatek…",
-    "new_button": "Nowa notatka",
-    "empty_state": "Brak notatek. Kliknij „Nowa notatka”, aby utworzyć pierwszą.",
-    "empty_editor": "Wybierz notatkę lub utwórz nową.",
-    "title_placeholder": "Bez tytułu",
-    "body_placeholder": "Zacznij pisać…",
-    "pin": "Przypnij",
-    "unpin": "Odepnij",
-    "delete": "Usuń",
-    "delete_confirm_title": "Usunąć notatkę?",
-    "delete_confirm_body": "Notatka zostanie trwale usunięta.",
-    "status": {
-      "saving": "Zapisywanie…",
-      "saved": "Zapisano",
-      "error": "Błąd"
-    },
-    "relative_just_now": "przed chwilą",
-    "relative_min_ago": "{n} min temu",
-    "relative_hours_ago": "{n} godz. temu",
-    "relative_days_ago": "{n} dni temu",
-    "word_count": "{n} słów"
   },
   "connection": {
     "title": "Utracono połączenie z serwerem",

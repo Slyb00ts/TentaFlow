@@ -46,7 +46,6 @@
     "section_account": "Konto",
     "apps_home": "Alle Anwendungen",
     "images": "Bilder",
-    "notes": "Notizen",
     "tts": "Sprachausgabe",
     "translate": "Übersetzer",
     "search_app": "Suchen",
@@ -2827,13 +2826,13 @@
       "name": "Chat",
       "desc": "Mit einem lokalen Modell sprechen"
     },
+    "ml-studio": {
+      "name": "ML Studio",
+      "desc": "Vision-Modelle annotieren und trainieren"
+    },
     "images": {
       "name": "Bilder",
       "desc": "Bilder mit KI erzeugen"
-    },
-    "notes": {
-      "name": "Notizen",
-      "desc": "Sprachnotizen per STT aufnehmen"
     },
     "meeting": {
       "name": "Meeting-Bot",
@@ -2864,7 +2863,6 @@
     "heading": "Noch nicht verfügbar",
     "back": "Zurück zu den Apps",
     "images": "Die Bilderzeugung benötigt eine image-gen Engine (z. B. Stable Diffusion, ComfyUI). Bitte deinen Administrator, eine aus dem Dienstkatalog bereitzustellen.",
-    "notes": "Sprachnotizen brauchen eine STT-Engine (z. B. Whisper) und Backend-Anbindung für die Speicherung. Auf der Roadmap.",
     "meeting": "Meeting-Bot benötigt das teams-bot Addon mit OAuth und einen binären Transkript-Handler. Auf der Roadmap.",
     "tts": "Sprachausgabe benötigt eine bereitgestellte TTS-Engine und einen Synthese-Handler. Die Admin-Regeln existieren bereits; die Nutzerseite ist auf der Roadmap.",
     "translate": "Übersetzen wird den Chat-LLM-Backend nutzen, sobald ein eigener Nutzer-Handler angebunden ist. Auf der Roadmap.",
@@ -2945,32 +2943,6 @@
     "error": "Übersetzung fehlgeschlagen: {reason}",
     "model_info": "Übersetzt mit {model} · {tokens} Tokens",
     "swap": "Sprachen tauschen"
-  },
-  "notes": {
-    "page_title": "Notizen",
-    "subtitle": "Schnelle persönliche Notizen",
-    "count": "{n} Notizen",
-    "search_placeholder": "Notizen suchen…",
-    "new_button": "Neue Notiz",
-    "empty_state": "Noch keine Notizen. Klicken Sie auf „Neue Notiz“.",
-    "empty_editor": "Notiz auswählen oder neue erstellen.",
-    "title_placeholder": "Ohne Titel",
-    "body_placeholder": "Beginnen Sie zu tippen…",
-    "pin": "Anheften",
-    "unpin": "Lösen",
-    "delete": "Löschen",
-    "delete_confirm_title": "Notiz löschen?",
-    "delete_confirm_body": "Diese Notiz wird dauerhaft entfernt.",
-    "status": {
-      "saving": "Speichern…",
-      "saved": "Gespeichert",
-      "error": "Fehler"
-    },
-    "relative_just_now": "gerade eben",
-    "relative_min_ago": "vor {n} Min",
-    "relative_hours_ago": "vor {n} Std",
-    "relative_days_ago": "vor {n} T",
-    "word_count": "{n} Wörter"
   },
   "connection": {
     "title": "Verbindung zum Server verloren",
