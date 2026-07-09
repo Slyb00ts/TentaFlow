@@ -77,6 +77,28 @@ pub struct NodeConfig {
     /// Metryki zuzycia tokenow + egzekwowanie limitow (sekcja `[token_metrics]`).
     #[serde(default)]
     pub token_metrics: TokenMetricsConfig,
+
+    /// Multi-process vision worker sharding (sekcja `[vision]`).
+    #[serde(default)]
+    pub vision: VisionConfig,
+}
+
+// =============================================================================
+// Konfiguracja vision workers (sekcja [vision])
+// =============================================================================
+
+/// Multi-process vision worker sharding (docs/VISION_WORKER_SHARDING.md).
+/// The config TOML is the ONLY operator mechanism for this feature — there is
+/// deliberately no environment knob. Defaults keep the feature off, so a node
+/// without a `[vision]` section behaves exactly as before (all detection stays
+/// in-process).
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct VisionConfig {
+    /// Vision worker processes spawned per GPU in the vision GPU set. `0`
+    /// (default) disables the worker fleet entirely: no processes are spawned
+    /// and no link socket is bound.
+    #[serde(default)]
+    pub workers_per_gpu: usize,
 }
 
 // =============================================================================
@@ -990,6 +1012,7 @@ impl Default for NodeConfig {
             inference: None,
             services_runtime: ServicesRuntimeConfig::default(),
             token_metrics: TokenMetricsConfig::default(),
+            vision: VisionConfig::default(),
         }
     }
 }

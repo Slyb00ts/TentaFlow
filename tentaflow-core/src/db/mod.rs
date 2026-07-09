@@ -149,6 +149,47 @@ fn init_read_connection(conn: &mut Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Otwiera ISTNIEJĄCĄ bazę wyłącznie do odczytu — dla odchudzonych procesów
+/// roboczych (vision workers), które współdzielą plik SQLite core'a przez WAL.
+/// Brak migracji, seeda i pisarza: nawet slot `Db::write()` dostaje połączenie
+/// otwarte z `SQLITE_OPEN_READONLY` + `query_only=ON`, więc każda próba zapisu
+/// kończy się błędem SQLite zamiast złamać dyscyplinę single-writer (core jest
+/// jedynym pisarzem). Nie instaluje FlowScheduler-a ani innych singletonów
+/// runtime'u core'a — tylko pool + `set_global_pool` (moduły czytające przez
+/// `global_pool()` działają; piszące dostają twardy błąd, celowo).
+pub fn init_read_only(db_path: &Path) -> Result<DbPool> {
+    info!("Otwieranie bazy danych read-only: {:?}", db_path);
+
+    let (target, is_memory) = connection_target(db_path);
+    let flags = if is_memory {
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI
+    } else {
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+    };
+
+    // Slot "pisarza" — używany tylko jako fallback `Db::write()`; otwarty
+    // read-only, więc wołający zapis dostaje błąd zamiast zapisu.
+    let mut writer_slot = Connection::open_with_flags(&target, flags)?;
+    init_read_connection(&mut writer_slot)?;
+
+    let read_size = (num_cpus::get() as u32 * 2).clamp(4, 16);
+    let manager = SqliteConnectionManager::file(&target)
+        .with_flags(flags)
+        .with_init(init_read_connection);
+    let read_pool = r2d2::Pool::builder()
+        .max_size(read_size)
+        .min_idle(Some(1))
+        .connection_timeout(std::time::Duration::from_secs(5))
+        .build(manager)?;
+
+    let pool = Arc::new(Db {
+        writer: Mutex::new(writer_slot),
+        read_pool: Some(read_pool),
+    });
+    set_global_pool(pool.clone());
+    Ok(pool)
+}
+
 /// Monotoniczny licznik nadający unikalną nazwę każdej shared-cache bazie in-memory,
 /// żeby równoległe `init()` (testy) nie dzieliły przypadkiem jednej bazy.
 static MEMORY_DB_SEQ: AtomicU64 = AtomicU64::new(0);

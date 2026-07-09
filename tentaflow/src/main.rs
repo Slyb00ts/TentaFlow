@@ -77,6 +77,25 @@ enum Subcommand {
     },
     /// Wypisuje informacje o systemie + wykrytych GPU + dostepnych silnikach
     SystemCheck,
+    /// Slim GPU vision worker process — spawned and supervised by the core
+    /// process per `[vision].workers_per_gpu` (not intended for manual use)
+    VisionWorker {
+        /// Stable worker index assigned by the supervisor
+        #[arg(long = "worker-id")]
+        worker_id: u32,
+        /// CUDA device id this worker is pinned to
+        #[arg(long = "gpu")]
+        gpu: i32,
+        /// Unix socket path of the core's worker link
+        #[arg(long = "link")]
+        link: PathBuf,
+        /// Hex auth token for the link Hello (one per incarnation)
+        #[arg(long = "token")]
+        token: String,
+        /// Core SQLite database path (the worker opens it READ-ONLY)
+        #[arg(long = "db")]
+        db: Option<PathBuf>,
+    },
 }
 
 use tentaflow_core::mesh::pipeline::{start_mesh_pipeline, MeshPipelineConfig};
@@ -980,6 +999,17 @@ async fn run_server(args: Args) -> Result<()> {
         }
     });
 
+    // Multi-process vision workers (Stage A, docs/VISION_WORKER_SHARDING.md).
+    // Configured EXCLUSIVELY via `[vision].workers_per_gpu` in the config TOML;
+    // the default 0 spawns nothing and binds no link socket, so production
+    // behavior without the section is unchanged.
+    #[cfg(unix)]
+    let vision_workers =
+        tentaflow_core::services::vision_worker::supervisor::VisionWorkerSupervisor::start(
+            config.vision.workers_per_gpu,
+            db_path.clone(),
+        );
+
     info!("Wszystkie serwery uruchomione. Nacisnij Ctrl+C aby zakonczyc...");
 
     // Czekaj na SIGINT (Ctrl+C) lub SIGTERM (docker stop / systemd). Oba sa
@@ -988,6 +1018,13 @@ async fn run_server(args: Args) -> Result<()> {
     wait_for_shutdown_signal().await?;
 
     info!("Otrzymano sygnal shutdown, zamykanie routera...");
+    // Stop the vision worker fleet first: each worker gets a link Shutdown
+    // (drain + clean exit), then a bounded group kill — GPU memory must be
+    // released before anything else races the teardown.
+    #[cfg(unix)]
+    if let Some(sup) = &vision_workers {
+        sup.stop().await;
+    }
     // Zamknij addon manager: anuluj service tick loops, drop dispatcher
     // sender (rozwalenie cyklu referencyjnego Arc<AddonManager> w
     // spawn_blocking task), drop running instances. Bez tego proces nie
@@ -1474,6 +1511,49 @@ fn run_subcommand(cmd: &Subcommand, verbose: bool) -> Result<()> {
             Ok(())
         }
         Subcommand::Update { check, force } => run_update(*check, *force),
+        Subcommand::VisionWorker {
+            worker_id,
+            gpu,
+            link,
+            token,
+            db,
+        } => run_vision_worker_mode(*worker_id, *gpu, link.clone(), token.clone(), db.clone()),
+    }
+}
+
+/// Boots the slim vision-worker runtime (docs/VISION_WORKER_SHARDING.md Stage
+/// A). Every parameter arrives via CLI args from the spawning supervisor —
+/// there is no environment contract for this mode.
+fn run_vision_worker_mode(
+    worker_id: u32,
+    gpu: i32,
+    link: PathBuf,
+    token: String,
+    db: Option<PathBuf>,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let db_path = db.unwrap_or_else(tentaflow_core::paths::database_path);
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all();
+        // Same reasoning as the server runtime: GStreamer/CUDA pipeline builds
+        // overflow the default 2 MiB worker stacks.
+        builder.thread_stack_size(16 * 1024 * 1024);
+        let runtime = builder.build()?;
+        runtime.block_on(tentaflow_core::vision_worker::run_vision_worker(
+            tentaflow_core::vision_worker::VisionWorkerConfig {
+                worker_id,
+                gpu,
+                link_path: link,
+                token,
+                db_path,
+            },
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (worker_id, gpu, link, token, db);
+        anyhow::bail!("vision-worker mode requires Unix domain sockets (Linux/macOS only)")
     }
 }
 

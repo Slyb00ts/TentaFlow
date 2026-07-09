@@ -225,9 +225,38 @@ fn parse_trt_workspace_mb(raw: Option<&str>) -> usize {
 /// reachable from this low-level ort layer. Multi-GPU is opt-in by the operator
 /// setting this var; the default stays single-device-0 and byte-identical.
 pub fn vision_gpu_set() -> &'static [i32] {
-    static SET: OnceLock<Vec<i32>> = OnceLock::new();
-    SET.get_or_init(|| parse_gpu_set(std::env::var(VISION_GPUS_ENV).ok().as_deref()))
+    VISION_GPU_SET
+        .get_or_init(|| parse_gpu_set(std::env::var(VISION_GPUS_ENV).ok().as_deref()))
         .as_slice()
+}
+
+/// Process-lifetime slot behind [`vision_gpu_set`], hoisted to module level so
+/// [`init_vision_gpu_set`] can seed it programmatically before the first read.
+static VISION_GPU_SET: OnceLock<Vec<i32>> = OnceLock::new();
+
+/// Programmatic pin of the vision GPU set — for processes that receive their
+/// device assignment explicitly instead of via the environment (the
+/// `vision-worker` subprocess gets `--gpu <id>` from the spawning supervisor).
+/// Must run before ANY vision singleton resolves [`vision_gpu_set`]; once the
+/// set is frozen this returns an error so a late pin fails loudly instead of
+/// silently building sessions on the wrong device.
+pub fn init_vision_gpu_set(ids: &[i32]) -> anyhow::Result<()> {
+    let mut set: Vec<i32> = Vec::new();
+    for &id in ids {
+        if id >= 0 && !set.contains(&id) && set.len() < MAX_VISION_GPUS {
+            set.push(id);
+        }
+    }
+    if set.is_empty() {
+        anyhow::bail!("init_vision_gpu_set: no valid CUDA device ids in {ids:?}");
+    }
+    VISION_GPU_SET.set(set).map_err(|_| {
+        anyhow::anyhow!(
+            "vision GPU set already resolved to {:?} — init_vision_gpu_set must run before any \
+             vision singleton loads",
+            VISION_GPU_SET.get().map(Vec::as_slice).unwrap_or(&[])
+        )
+    })
 }
 
 /// Pure parser behind [`vision_gpu_set`], split out so the grammar is unit-testable
@@ -624,9 +653,25 @@ pub fn build_session_pool_from_file(
             .map_err(|e| anyhow!("session slot {i} on GPU device {device_id}: {e:#}"))
         }
     };
+    // Degrade, never disable: a TRT engine build can fail transiently on a busy
+    // GPU (flaky builder under memory pressure). If slot 0 fails nothing can run —
+    // hard error. But a failure PAST slot 0 must not take the whole model (and with
+    // it camera analysis) down: keep the sessions that DID build and warn loudly.
+    // This exact failure (slot 2/4 on a crowded device) once disabled production
+    // analysis entirely while the video kept flowing.
     let mut sessions = Vec::with_capacity(n);
     for i in 0..n {
-        sessions.push(build_slot(i)?);
+        match build_slot(i) {
+            Ok(s) => sessions.push(s),
+            Err(e) if i == 0 => return Err(e),
+            Err(e) => {
+                tracing::warn!(
+                    "[ort] session slot {i}/{n} build failed — continuing with {} session(s): {e:#}",
+                    sessions.len()
+                );
+                break;
+            }
+        }
     }
     // Name the dedicated threads after the model file stem (`vision-ort-<stem>-<i>`).
     let label = model_path

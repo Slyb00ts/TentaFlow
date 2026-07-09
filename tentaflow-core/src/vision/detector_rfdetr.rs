@@ -162,12 +162,12 @@ impl RfDetrDetector {
                 DETECTOR_SESSIONS_ENV,
                 DEFAULT_DETECTOR_SESSIONS,
             );
-            // Every pooled session is a full model copy on ITS GPU, so a build
-            // failure past the first is almost certainly VRAM exhaustion. Fail
-            // LOUDLY naming the pool size + per-GPU VRAM math and refuse to fall
-            // back to fewer sessions — a silent degrade would mask a misconfigured
-            // `TENTAFLOW_VISION_DETECTOR_SESSIONS` / `TENTAFLOW_VISION_GPUS`. The
-            // wrapped error names the failing session slot AND its CUDA device id.
+            // Every pooled session is a full model copy on ITS GPU. The pool
+            // builder degrades on a failure PAST slot 0 (keeps the sessions that
+            // built, WARNs loudly) so a transient TRT engine-build failure can
+            // never disable camera analysis outright; only slot 0 failing (nothing
+            // usable) reaches this hard error, which names the pool size + per-GPU
+            // VRAM math and the failing slot's CUDA device id.
             let gpus = crate::vision::ort_common::vision_gpu_set();
             let per_gpu = n.div_ceil(gpus.len());
             let pool = crate::vision::ort_common::build_session_pool_from_file(
@@ -184,9 +184,8 @@ impl RfDetrDetector {
                      {gpus:?} failed: {e:#}. Each session is a full model copy \
                      (~{DETECTOR_SESSION_VRAM_GB} GB VRAM); sessions spread round-robin, so up to \
                      {per_gpu} land on one GPU needing ~{per_gpu_gb:.1} GB resident PER DEVICE — a \
-                     failure past the first session on a device is almost certainly GPU OOM. Lower \
-                     {DETECTOR_SESSIONS_ENV} (currently {n}) or add GPUs via TENTAFLOW_VISION_GPUS; \
-                     NOT falling back to fewer sessions.",
+                     failure of the FIRST session means nothing can run at all. Lower \
+                     {DETECTOR_SESSIONS_ENV} (currently {n}) or add GPUs via TENTAFLOW_VISION_GPUS.",
                     n_gpus = gpus.len(),
                     per_gpu_gb = per_gpu as f32 * DETECTOR_SESSION_VRAM_GB
                 )
@@ -229,6 +228,20 @@ impl RfDetrDetector {
                 device,
                 classes: parsed.classes,
             })
+        }
+    }
+
+    /// Number of pooled ort sessions (each a full model copy on its GPU).
+    /// The Burn path holds exactly one model instance. Reported over the
+    /// vision-worker link as a heartbeat stat.
+    pub fn pool_size(&self) -> usize {
+        #[cfg(feature = "inference-supertonic")]
+        {
+            self.pool.len()
+        }
+        #[cfg(not(feature = "inference-supertonic"))]
+        {
+            1
         }
     }
 

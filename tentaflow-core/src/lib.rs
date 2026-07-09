@@ -36,6 +36,8 @@ pub mod sync;
 pub mod tts;
 pub mod vision;
 pub mod vision_models;
+#[cfg(all(unix, feature = "camera", feature = "inference-vision-gpu"))]
+pub mod vision_worker;
 pub mod web_research;
 
 // macos_ffi: dlopen helpery dla libMLXBridge.dylib. Zawsze aktywne na
