@@ -1345,7 +1345,16 @@ impl DeployStrategy for DockerDeploy {
         } else {
             internal_port
         };
-        env.insert("VLLM_PORT".into(), vllm_port.to_string());
+        // Tryb vllm-mp dostaje master TCPStore JAWNIE przez `--master-port
+        // <dist_port>` w komendzie serve. Env VLLM_PORT NIE moze wtedy wskazywac
+        // tego samego portu: vLLM binduje VLLM_PORT dla wewnetrznego message queue
+        // PRZED torch.distributed init i rank0 dostaje EADDRINUSE na wlasnym
+        // master porcie. Bez env vLLM sam wybiera wolne porty wewnetrzne.
+        let vllm_mp = distributed.is_some()
+            && super::distributed::engine_is_vllm_mp(&self.manifest.engine.id);
+        if !vllm_mp {
+            env.insert("VLLM_PORT".into(), vllm_port.to_string());
+        }
         if let Some(model) = super::resolve_model_repo(&self.manifest, &self.user_config) {
             env.insert("MODEL".into(), model);
         }
