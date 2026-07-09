@@ -19,6 +19,19 @@ pub fn container_name(engine_id: &str, port: u16) -> String {
     format!("tentaflow-{}-{}", engine_id, port)
 }
 
+/// Czy wiersz serwisu jest czlonkiem distributed-deploymentu (config_json niesie
+/// blok `_distributed`). Takich wierszy NIE wolno kasowac pojedynczo z listy
+/// serwisow (lokalnie ani przez mesh `ServiceDeleteRemote`) — usuniecie workera
+/// zabija rank calego klastra TP, ktory serwuje na INNYM nodzie. Jedyna legalna
+/// sciezka usuniecia to stop deploymentu klastra (`stop_distributed`), ktora
+/// kasuje wiersze bezposrednio w repo, z pominieciem tego guardu.
+pub fn service_is_distributed_member(config_json: &str) -> bool {
+    serde_json::from_str::<Value>(config_json)
+        .ok()
+        .and_then(|v| v.get("_distributed").cloned())
+        .is_some()
+}
+
 /// Informacyjny endpoint head-a (`http://<rdma_ip>:<port>/v1`). Workery headless
 /// → None. Routing realny idzie przez rejestr serwisow mesh (head rejestruje sie
 /// lokalnie z `127.0.0.1`), to tylko podglad dla GUI.
