@@ -2890,7 +2890,12 @@ pub async fn run_rtsp_session(
         let mut fps_window: std::collections::VecDeque<f32> =
             std::collections::VecDeque::with_capacity(30);
         let started_at = tokio::time::Instant::now();
-        let warmup_deadline = started_at + Duration::from_secs(timeout_secs as u64 + 5);
+        // `[vision] warmup_extra_secs` (default 20): grace past the connect
+        // timeout for FIRST frames before the path degrades a rung — a camera
+        // recovering from RTSP-session stress starts delivering slowly, and too
+        // little patience here drops a healthy NVDEC path to software decode.
+        let warmup_extra = crate::vision::settings::get().warmup_extra_secs as u64;
+        let warmup_deadline = started_at + Duration::from_secs(timeout_secs as u64 + warmup_extra);
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 

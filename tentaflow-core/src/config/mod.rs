@@ -235,6 +235,19 @@ pub struct VisionConfig {
     /// lidar cloud to `/tmp/tf_calib/` for the offline `depth_calib` example.
     #[serde(default)]
     pub calib_dump: bool,
+
+    /// Extra seconds (past the camera's connect timeout) an RTSP ingest path
+    /// waits for FIRST frames before degrading to the next rung (NVDEC → CPU
+    /// convert → CPU decode). Cameras recovering from RTSP-session stress can
+    /// take tens of seconds to start delivering, and too small a window makes a
+    /// perfectly healthy GPU path fall back to software decode for the whole
+    /// session.
+    #[serde(default = "default_warmup_extra_secs")]
+    pub warmup_extra_secs: u32,
+}
+
+fn default_warmup_extra_secs() -> u32 {
+    20
 }
 
 impl Default for VisionConfig {
@@ -269,6 +282,7 @@ impl Default for VisionConfig {
             adr_row_trim: default_true(),
             adr_orientations: default_one(),
             calib_dump: false,
+            warmup_extra_secs: default_warmup_extra_secs(),
         }
     }
 }
