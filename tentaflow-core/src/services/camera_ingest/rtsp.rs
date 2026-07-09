@@ -310,15 +310,16 @@ fn build_rtspsrc(url: &str, timeout_secs: u32) -> Result<gst::Element> {
 
     // `protocols` is GstRTSPLowerTrans (GFlags) — can't be set as raw u32.
     // We pass through stringified flags which gst-rs parses via GFlags::from_str:
-    //   - rtsp://  -> "udp+udp-mcast+tcp" (default behavior, UDP preferred)
+    //   - rtsp://  -> `[vision] rtsp_protocols`, default "tcp" (interleaved).
+    //     Across routed networks UDP media dies SILENTLY (conntrack/NAT idle
+    //     timeouts) while the RTSP control TCP stays healthy — the session then
+    //     sat "ONLINE" with a black tile. Interleaved TCP cannot die silently;
+    //     the mid-session stall watchdog remains as defense in depth.
     //   - rtsps:// -> "tcp+tls" (TLS over TCP; udp-over-tls is rare)
     // Without `tls` in the mask, rtspsrc would silently fail on rtsps:// URLs.
     let is_tls = url.starts_with("rtsps://");
-    let protocols_str = if is_tls {
-        "tcp+tls"
-    } else {
-        "udp+udp-mcast+tcp"
-    };
+    let configured = crate::vision::settings::get().rtsp_protocols.clone();
+    let protocols_str = if is_tls { "tcp+tls".to_string() } else { configured };
 
     let rtspsrc = gst::ElementFactory::make("rtspsrc")
         .property("location", url)
@@ -327,7 +328,7 @@ fn build_rtspsrc(url: &str, timeout_secs: u32) -> Result<gst::Element> {
         .property("timeout", (timeout_secs as u64).saturating_mul(1_000_000))
         // Disable rtspsrc's internal retry — we manage reconnect at session level.
         .property("retry", 0u32)
-        .property_from_str("protocols", protocols_str)
+        .property_from_str("protocols", protocols_str.as_str())
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("rtspsrc: {e}")))?;
 
