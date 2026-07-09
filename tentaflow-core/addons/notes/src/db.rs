@@ -296,6 +296,8 @@ pub struct NoteSummary {
     pub updated_at: i64,
     /// "private" | "user" | "group" | "org" — widest share on the note.
     pub scope: String,
+    /// Top detected entities as (name, entity_type), capped for card chips.
+    pub entities: Vec<(String, String)>,
 }
 
 /// Full note for the editor.
@@ -341,7 +343,7 @@ pub fn list_notes(ctx: &UserCtx, scope: &str, search: &str) -> Result<Vec<NoteSu
     sql.push_str(" ORDER BY n.updated_at DESC LIMIT 200");
 
     let rows = sql_query(&sql, &params).map_err(|e| format!("Błąd odczytu notatek: {e}"))?;
-    Ok(rows
+    let mut notes: Vec<NoteSummary> = rows
         .iter()
         .map(|row| NoteSummary {
             id: row
@@ -361,8 +363,103 @@ pub fn list_notes(ctx: &UserCtx, scope: &str, search: &str) -> Result<Vec<NoteSu
                 .and_then(|v| v.as_str())
                 .unwrap_or("private")
                 .to_string(),
+            entities: Vec::new(),
         })
-        .collect())
+        .collect();
+    attach_card_entities(ctx, &mut notes);
+    Ok(notes)
+}
+
+/// Entities shown on a list card (mockup n01 micro-chips with colored dots).
+const CARD_ENTITY_LIMIT: usize = 3;
+
+/// SQL of the batched card-entities read: one query for ALL listed notes.
+/// Local and canonical names come back separately together with a per-row
+/// canonical-visibility flag — the same direct-mention rule as
+/// `entity_visibility_sql` (correlated on `c.id` instead of a placeholder), so
+/// a merge never leaks a canonical name that originated in a note the reader
+/// cannot access. Pure — unit-tested natively.
+/// Placeholders: note ids, then `acl_params` (for the visibility EXISTS).
+pub fn card_entities_sql(note_count: usize, group_count: usize) -> String {
+    let visibility =
+        entity_visibility_sql(group_count).replace("ne.entity_id = ?", "ne.entity_id = c.id");
+    format!(
+        "SELECT ne.note_id, COALESCE(c.id, e.id), e.name, c.name, \
+                COALESCE(c.entity_type, e.entity_type), \
+                CASE WHEN c.id IS NOT NULL AND EXISTS ({visibility}) \
+                     THEN 1 ELSE 0 END \
+         FROM note_entities ne \
+         JOIN entities e ON e.id = ne.entity_id \
+         LEFT JOIN entities c ON c.id = e.canonical_id \
+         WHERE ne.note_id IN ({}) \
+         ORDER BY ne.note_id, ne.count DESC",
+        placeholders(note_count)
+    )
+}
+
+/// Name shown on a card chip: the canonical (merged) name only when the
+/// reader can see the canonical entity through some readable note of their
+/// own; otherwise the alias name from the listed note. Pure — unit-tested.
+fn pick_card_entity_name(
+    local: &str,
+    canonical: Option<&str>,
+    canonical_visible: bool,
+) -> String {
+    match canonical {
+        Some(c) if canonical_visible => c.to_string(),
+        _ => local.to_string(),
+    }
+}
+
+/// One batch query filling `NoteSummary.entities` for all listed notes (the
+/// notes themselves already passed the read ACL in `list_notes`). Canonical
+/// names are disclosed per the visibility rule of `note_entities`.
+fn attach_card_entities(ctx: &UserCtx, notes: &mut [NoteSummary]) {
+    if notes.is_empty() {
+        return;
+    }
+    let sql = card_entities_sql(notes.len(), ctx.group_ids.len());
+    let mut params: Vec<SqlValue> = notes
+        .iter()
+        .map(|n| SqlValue::String(n.id.clone()))
+        .collect();
+    params.extend(acl_params(ctx));
+    let rows = match sql_query(&sql, &params) {
+        Ok(r) => r,
+        // Card chips are decoration — a failed lookup must not break the list.
+        Err(_) => return,
+    };
+    for note in notes.iter_mut() {
+        // Merged mentions can resolve to the same canonical — dedup per card.
+        let mut seen_ids: Vec<String> = Vec::new();
+        for r in &rows {
+            if r.first().and_then(|v| v.as_str()) != Some(note.id.as_str()) {
+                continue;
+            }
+            let entity_id = r.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let local = r.get(2).and_then(|v| v.as_str()).unwrap_or("");
+            let canonical = r.get(3).and_then(|v| v.as_str());
+            let etype = r
+                .get(4)
+                .and_then(|v| v.as_str())
+                .unwrap_or("other")
+                .to_string();
+            let visible = r.get(5).and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+            let name = pick_card_entity_name(local, canonical, visible);
+            if name.is_empty()
+                || entity_id.is_empty()
+                || seen_ids.iter().any(|id| id == &entity_id)
+                || note.entities.iter().any(|(n, _)| n == &name)
+            {
+                continue;
+            }
+            seen_ids.push(entity_id);
+            note.entities.push((name, etype));
+            if note.entities.len() >= CARD_ENTITY_LIMIT {
+                break;
+            }
+        }
+    }
 }
 
 /// Loads one note through the read ACL. Ok(None) = absent or not accessible.
@@ -1252,6 +1349,40 @@ mod tests {
         assert!(sql.contains("n.owner_user_id = ?"));
         // Placeholders: id, id, acl params, id (textual order).
         assert_eq!(sql.matches('?').count(), 3 + acl_params(&c).len());
+    }
+
+    #[test]
+    fn card_entities_sql_guards_canonical_disclosure_per_reader() {
+        let c = ctx(&["g1"]);
+        let sql = card_entities_sql(3, c.group_ids.len());
+        // Local and canonical names are selected SEPARATELY — no blind
+        // COALESCE(c.name, e.name) that would leak a private canonical name.
+        assert!(sql.contains("e.name, c.name"));
+        assert!(!sql.contains("COALESCE(c.name"));
+        // The visibility flag reuses the direct-mention rule, correlated on
+        // the canonical row (not resolved through the alias).
+        assert!(sql.contains("ne.entity_id = c.id"));
+        assert!(sql.contains("CASE WHEN c.id IS NOT NULL AND EXISTS"));
+        assert!(sql.contains("n.deleted_at IS NULL"));
+        // Placeholders: 3 note ids + the ACL params of the EXISTS clause.
+        assert_eq!(sql.matches('?').count(), 3 + acl_params(&c).len());
+    }
+
+    #[test]
+    fn card_entity_name_hides_invisible_canonical() {
+        // Alias merged into a canonical that lives only in a private note of
+        // another user: the chip must show the alias name, never canonical.
+        assert_eq!(
+            pick_card_entity_name("Nexadata sp. z o.o.", Some("Nexadata"), false),
+            "Nexadata sp. z o.o."
+        );
+        // Reader can see the canonical through a readable note → canonical.
+        assert_eq!(
+            pick_card_entity_name("Nexadata sp. z o.o.", Some("Nexadata"), true),
+            "Nexadata"
+        );
+        // Unmerged entity → local name regardless of the flag.
+        assert_eq!(pick_card_entity_name("RODO", None, true), "RODO");
     }
 
     #[test]

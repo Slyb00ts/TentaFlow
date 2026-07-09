@@ -241,6 +241,7 @@ fn send_panel_shell() {
         padding: None,
         justify: None,
         style: None,
+        responsive: None,
     }
     .into_component("root")
     .expect("Stack encode");
@@ -418,6 +419,7 @@ fn text_component(id: &str, content: &str) -> Component {
         wrap: None,
         max_lines: None,
         format: None,
+        streaming: None,
     }
     .into_component(id)
     .expect("Text encode")
@@ -442,6 +444,7 @@ fn stack_component(id: &str, children: &[Component]) -> Component {
         padding: Some(Spacing::Md),
         justify: None,
         style: None,
+        responsive: None,
     }
     .into_component(id)
     .expect("Stack encode")
@@ -456,6 +459,7 @@ fn empty_state_component(id: &str, title: &str, message: &str) -> Component {
         wrap: None,
         max_lines: None,
         format: None,
+        streaming: None,
     }
     .into_component(id)
     .expect("Text encode")

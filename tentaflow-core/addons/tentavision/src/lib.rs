@@ -768,6 +768,7 @@ fn text(content: &str) -> Component {
         wrap: None,
         max_lines: None,
         format: None,
+        streaming: None,
     }.into_component(next_id()).expect("Text")
 }
 
@@ -793,6 +794,7 @@ fn text_styled(content: &str, style: &str) -> Component {
         wrap: None,
         max_lines: None,
         format: None,
+        streaming: None,
     }.into_component(next_id()).expect("Text")
 }
 
@@ -807,6 +809,7 @@ fn text_bound(key: &str) -> Component {
         wrap: None,
         max_lines: None,
         format: None,
+        streaming: None,
     }.into_component(next_id()).expect("Text")
 }
 
@@ -824,6 +827,7 @@ fn text_colored(content: &str, style: &str, color: &str) -> Component {
         wrap: None,
         max_lines: None,
         format: None,
+        streaming: None,
     }.into_component(next_id()).expect("Text")
 }
 
@@ -870,6 +874,7 @@ fn chip(label: &str, _variant: &str) -> Component {
         avatar: None,
         selected: None,
         removable: false,
+        dot: None,
     }.into_component(next_id()).expect("Chip")
 }
 
@@ -882,6 +887,7 @@ fn chip_with_icon(label: &str, _variant: &str, icon: &str) -> Component {
         avatar: None,
         selected: None,
         removable: false,
+        dot: None,
     }.into_component(next_id()).expect("Chip")
 }
 
@@ -894,6 +900,7 @@ fn chip_toned(label: &str, tone_str: &str) -> Component {
         avatar: None,
         selected: None,
         removable: false,
+        dot: None,
     }.into_component(next_id()).expect("Chip")
 }
 
@@ -906,6 +913,7 @@ fn chip_toned_icon(label: &str, tone_str: &str, icon: &str) -> Component {
         avatar: None,
         selected: None,
         removable: false,
+        dot: None,
     }.into_component(next_id()).expect("Chip")
 }
 
@@ -1129,6 +1137,7 @@ fn stack_v(children: Vec<Component>) -> Component {
         padding: None,
         justify: None,
         style: None,
+        responsive: None,
     }.into_component(next_id()).expect("Stack")
 }
 
@@ -1144,6 +1153,7 @@ fn stack_h(children: Vec<Component>) -> Component {
         background: None,
         radius: None,
         style: None,
+        responsive: None,
     }.into_component(next_id()).expect("Flex")
 }
 
@@ -1159,6 +1169,7 @@ fn stack_h_gap(gap: &str, children: Vec<Component>) -> Component {
         background: None,
         radius: None,
         style: None,
+        responsive: None,
     }.into_component(next_id()).expect("Flex")
 }
 
@@ -1170,6 +1181,7 @@ fn stack_v_gap(gap: &str, children: Vec<Component>) -> Component {
         padding: None,
         justify: None,
         style: None,
+        responsive: None,
     }.into_component(next_id()).expect("Stack")
 }
 
@@ -1413,6 +1425,7 @@ fn input(label: &str, placeholder: &str, field_id: &str) -> Component {
         readonly: None,
         error: None,
         size: InputSize::Md,
+        variant: None,
     }.into_component(field_id).expect("Input")
 }
 
@@ -1438,6 +1451,7 @@ fn number_input(label: &str, placeholder: &str, field_id: &str) -> Component {
         readonly: None,
         error: None,
         size: InputSize::Md,
+        variant: None,
     }.into_component(field_id).expect("Input")
 }
 
@@ -1486,6 +1500,7 @@ fn wizard_input(label: &str, placeholder: &str, field: &str, password: bool) -> 
         readonly: None,
         error: None,
         size: InputSize::Md,
+        variant: None,
     }.into_component(field).expect("Input");
     // Backend wizard state is the source of truth for validation (resolve_target
     // on Next/Test/Submit), so every keystroke must commit. Using `Input` rather
@@ -4781,6 +4796,7 @@ fn build_alarm_card(a: &db::AlarmRow) -> Component {
         background: None,
         radius: None,
         style: None,
+        responsive: None,
     }.into_component(next_id()).expect("Flex")
 }
 
@@ -4804,12 +4820,14 @@ fn build_runtime_kv_row(label: &str, value_children: Vec<Component>) -> Componen
                 background: None,
                 radius: None,
                 style: None,
+                responsive: None,
             }.into_component(next_id()).expect("Flex"),
         ],
         padding: None,
         background: None,
         radius: None,
         style: None,
+        responsive: None,
     }.into_component(next_id()).expect("Flex")
 }
 
@@ -5200,6 +5218,7 @@ fn build_cameras_content() -> Component {
             readonly: None,
             error: None,
             size: InputSize::Md,
+            variant: None,
         }.into_component("cameras_search").expect("Input")
     }, "Szukaj kamer");
     let toolbar = stack_h(vec![
@@ -6717,6 +6736,7 @@ fn alarm_note_textarea() -> Component {
         autoresize: true,
         max_rows: Some(8),
         monospace: false,
+        variant: None,
     }.into_component("alarm_note").expect("Textarea");
     let mut params = CborMap::default();
     params.0.push(("field".into(), Value::Text("note".into())));
@@ -7108,6 +7128,7 @@ fn search_query_input(label: &str, placeholder: &str, mode: &str, multiline: boo
             hint: None, validators: vec![], max_length: Some(500), min_length: None,
             disabled: None, readonly: None, error: None, size: InputSize::Md,
             rows: 2, autoresize: true, max_rows: Some(5), monospace: false,
+            variant: None,
         }.into_component(&store_key).expect("Textarea")
     } else {
         use tentaflow_sdk_spec::protocol::ui::form::Input;
@@ -7120,6 +7141,7 @@ fn search_query_input(label: &str, placeholder: &str, mode: &str, multiline: boo
             trailing_icon: None, prefix: None, suffix: None, validators: vec![],
             max_length: None, min_length: None, pattern: None, autocomplete: None,
             input_mode: None, disabled: None, readonly: None, error: None, size: InputSize::Md,
+            variant: None,
         }.into_component(&store_key).expect("Input")
     };
     comp.handlers = Some(HandlerMap(vec![(
@@ -7188,6 +7210,7 @@ fn search_time_input(label: &str, store_key: &str, field: &str) -> Component {
         validators: vec![], max_length: None, min_length: None, pattern: None,
         autocomplete: None, input_mode: None, disabled: None, readonly: None, error: None,
         size: InputSize::Md,
+        variant: None,
     }.into_component(store_key).expect("Input");
     let mut params = CborMap::default();
     params.0.push(("field".into(), Value::Text(field.into())));
@@ -9404,6 +9427,7 @@ fn retention_input(class: &str) -> Component {
         readonly: None,
         error: None,
         size: InputSize::Md,
+        variant: None,
     }.into_component(&key).expect("Input");
     let mut params = CborMap::default();
     params.0.push(("class".into(), Value::Text(class.into())));
@@ -9526,6 +9550,7 @@ fn audit_search_input() -> Component {
         readonly: None,
         error: None,
         size: InputSize::Md,
+        variant: None,
     }.into_component("audit_search").expect("Input");
     let mut params = CborMap::default();
     params.0.push(("id".into(), Value::Text("query".into())));
@@ -10297,6 +10322,7 @@ fn settings_text_input(label: &str, store_key: &str, setting_key: &str, secret: 
         validators: vec![], max_length: None, min_length: None, pattern: None,
         autocomplete: None, input_mode: None, disabled: None, readonly: None, error: None,
         size: InputSize::Md,
+        variant: None,
     }.into_component(store_key).expect("Input");
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Input,
@@ -10322,6 +10348,7 @@ fn settings_number_input(label: &str, store_key: &str, setting_key: &str) -> Com
         validators: vec![], max_length: None, min_length: None, pattern: None,
         autocomplete: None, input_mode: None, disabled: None, readonly: None, error: None,
         size: InputSize::Md,
+        variant: None,
     }.into_component(store_key).expect("Input");
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Input,
@@ -10536,6 +10563,7 @@ fn onboarding_input(label: &str, placeholder: &str, field: &str) -> Component {
         validators: vec![], max_length: None, min_length: None, pattern: None,
         autocomplete: None, input_mode: None, disabled: None, readonly: None, error: None,
         size: InputSize::Md,
+        variant: None,
     }.into_component(&store_key).expect("Input");
     let mut params = CborMap::default();
     params.0.push(("field".into(), Value::Text(field.into())));

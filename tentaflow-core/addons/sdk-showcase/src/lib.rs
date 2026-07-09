@@ -925,6 +925,7 @@ fn send_panel_shell() {
         padding: None,
         justify: None,
         style: None,
+        responsive: None,
     }
     .into_component("root")
     .expect("Stack encode");
@@ -1022,6 +1023,7 @@ fn body_text(id: &str, content: BindRef) -> Component {
         wrap: None,
         max_lines: None,
         format: None,
+        streaming: None,
     }
     .into_component(id)
     .expect("Text encode")
@@ -1066,6 +1068,7 @@ fn live_tab() -> Component {
         padding: Some(Spacing::Md),
         justify: None,
         style: None,
+        responsive: None,
     }
     .into_component("tab-live")
     .expect("Stack encode")
@@ -1092,6 +1095,7 @@ fn storage_tab() -> Component {
         padding: Some(Spacing::Md),
         justify: None,
         style: None,
+        responsive: None,
     }
     .into_component("tab-storage")
     .expect("Stack encode")

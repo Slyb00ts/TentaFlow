@@ -304,6 +304,9 @@ pub fn send_panel_shell() {
         resizable: true,
         primary_slot: SLOT_SIDEBAR.into(),
         secondary_slot: SLOT_WORKSPACE.into(),
+        collapse_below: None,
+        divider: None,
+        grow: None,
     }
     .into_component("root")
     .expect("kodowanie Split root");
@@ -541,6 +544,7 @@ fn sidebar_view() -> Component {
         readonly: None,
         error: None,
         size: InputSize::Md,
+        variant: None,
     }
     .into_component("sb-search")
     .expect("kodowanie Input search");
@@ -630,6 +634,7 @@ fn collection_card(index: usize, c: &JsonValue, selected: &str, graph_on: bool) 
         padding: None,
         justify: None,
         style: None,
+        responsive: None,
     }
     .into_component(format!("cc-info-{index}"))
     .expect("kodowanie Stack card info");
@@ -945,6 +950,7 @@ fn chat_view() -> Component {
         autoresize: true,
         max_rows: Some(8),
         monospace: false,
+        variant: None,
     }
     .into_component("chat-input")
     .expect("kodowanie Textarea chat");
@@ -982,6 +988,7 @@ fn chat_view() -> Component {
         padding: Some(Spacing::Md),
         justify: Some(FlexJustify::SpaceBetween),
         style: None,
+        responsive: None,
     }
     .into_component("tab-chat")
     .expect("kodowanie Stack chat")
@@ -1149,6 +1156,7 @@ fn box_grow(id: &str, child: Component) -> Component {
         gap: None,
         align: None,
         justify: None,
+        responsive: None,
     }
     .into_component(id)
     .expect("kodowanie Box grow")
@@ -1214,6 +1222,7 @@ fn body_text(id: &str, content: BindRef) -> Component {
         wrap: None,
         max_lines: None,
         format: None,
+        streaming: None,
     }
     .into_component(id)
     .expect("kodowanie Text")
@@ -1230,6 +1239,7 @@ fn strong_text(id: &str, content: &str) -> Component {
         wrap: None,
         max_lines: Some(1),
         format: None,
+        streaming: None,
     }
     .into_component(id)
     .expect("kodowanie Text strong")
@@ -1244,6 +1254,7 @@ fn muted_caption(id: &str, content: BindRef) -> Component {
         wrap: None,
         max_lines: None,
         format: None,
+        streaming: None,
     }
     .into_component(id)
     .expect("kodowanie Text caption")
@@ -1257,6 +1268,7 @@ fn stack(id: &str, children: Vec<Component>) -> Component {
         padding: Some(Spacing::Md),
         justify: None,
         style: None,
+        responsive: None,
     }
     .into_component(id)
     .expect("kodowanie Stack")
@@ -1272,6 +1284,7 @@ fn sidebar_stack(id: &str, children: Vec<Component>) -> Component {
         padding: Some(Spacing::Sm),
         justify: None,
         style: None,
+        responsive: None,
     }
     .into_component(id)
     .expect("kodowanie Stack sidebar")
@@ -1287,6 +1300,7 @@ fn section_stack(id: &str, children: Vec<Component>) -> Component {
         padding: Some(Spacing::Md),
         justify: None,
         style: None,
+        responsive: None,
     }
     .into_component(id)
     .expect("kodowanie Stack sekcji")
@@ -1332,6 +1346,7 @@ fn text_input(id: &str, bind_key: &str, label: &str, placeholder: &str) -> Compo
         readonly: None,
         error: None,
         size: InputSize::Md,
+        variant: None,
     }
     .into_component(id)
     .expect("kodowanie Input");

@@ -21,8 +21,8 @@ use tentaflow_addon_sdk::ui_v1::{
     Density, DimensionToken, Divider, DividerOrientation, DividerVariant, EmptyState,
     EmptyStateVariant, EventKind, FailurePolicy, FilterChipDef, FilterChips, FilterChipsMode, Flex,
     FlexAlign, FlexDirection, FlexJustify, FlexWrap, Handler, HandlerMap, Heading, IconName,
-    IconRef, Input, InputSize, InputType, PanelShell, PatchOp, PatchOpKind, RadiusValue,
-    ScrollContainer, ScrollOrientation, SearchBox, SearchVariant, SectionHeader, Select,
+    IconRef, InputSize, PanelShell, PatchOp, PatchOpKind, RadiusValue,
+    ScrollContainer, ScrollOrientation, SearchBox, SearchVariant, Select,
     SelectOption, SelectValue, ShadowToken, SlotContent, SlotDecl, SlotDefault, SlotSemantics,
     SlotVisibility, Spacing, Split, SplitOrientation, SplitSize, StateEntry, StatePatch, TagInput,
     Text, TextStyle, Textarea, Tone, UiPayload, Value as CborValue, ValueFormat, Visibility,
@@ -374,6 +374,7 @@ fn topbar() -> Component {
         .expect("Badge encode")
     };
 
+    // Mockup n01: the topbar sits directly on the page background — no pill.
     Flex {
         direction: FlexDirection::Row,
         gap: Spacing::Md,
@@ -381,9 +382,9 @@ fn topbar() -> Component {
         align: FlexAlign::Center,
         wrap: FlexWrap::Wrap,
         children: vec![title, status],
-        padding: Some(Spacing::Sm),
-        background: Some(ui::BackgroundToken::Subtle),
-        radius: Some(ui::RadiusToken::Lg),
+        padding: None,
+        background: None,
+        radius: None,
         style: None,
         responsive: None,
     }
@@ -392,17 +393,48 @@ fn topbar() -> Component {
 }
 
 pub fn send_panel_shell() {
+    // Mockup n01: 300px list | flexible main, 16px gap, no visible divider.
     let split = Split {
         orientation: SplitOrientation::Horizontal,
         primary_size: SplitSize::Px { value: 300 },
         min_primary: 240,
         max_primary: 420,
-        resizable: true,
+        resizable: false,
         primary_slot: SLOT_LIST.into(),
         secondary_slot: SLOT_MAIN.into(),
+        // Xs: only phone-width containers stack the list above the editor —
+        // the tablet keeps two columns like the mockup's 1180px rule.
+        collapse_below: Some(ui::Breakpoint::Xs),
+        divider: Some(ui::SplitDivider::None),
+        // Fill the grow-Box below so both panes get the full shell height.
+        grow: Some(true),
     }
     .into_component("split")
     .expect("Split encode");
+
+    // The split must own the leftover shell height (mockup: columns flex:1,
+    // min 640px) — without min-height the columns collapse to content height.
+    let split_grow = ui::Box {
+        width: None,
+        grow: Some(true),
+        align_self: None,
+        padding: None,
+        margin: None,
+        children: vec![split],
+        style: Some(ui::BoxStyle {
+            min_height: Some(DimensionToken::Vh { value: 85 }),
+            ..Default::default()
+        }),
+        direction: Some(FlexDirection::Column),
+        gap: None,
+        align: Some(FlexAlign::Stretch),
+        justify: None,
+        // Stacked mode: the page must grow with the stacked panes instead of
+        // trapping them inside an 85vh box with inner scrollbars.
+        responsive: Some(stacked_fit_content(640)),
+    }
+    .into_component("split-grow")
+    .expect("Box encode");
 
     let layout = Flex {
         direction: FlexDirection::Column,
@@ -410,7 +442,7 @@ pub fn send_panel_shell() {
         justify: FlexJustify::Start,
         align: FlexAlign::Stretch,
         wrap: FlexWrap::NoWrap,
-        children: vec![topbar(), split],
+        children: vec![topbar(), split_grow],
         padding: None,
         background: None,
         radius: None,
@@ -594,19 +626,65 @@ fn list_fragment(notes: &[NoteSummary], sess: &Session) -> Component {
         .expect("ScrollContainer encode")
     };
 
-    ui::Box {
+    // Mockup n01 list-head: framed header strip (new note / search / filters)
+    // with a bottom hairline; the card list scrolls under it.
+    let head = ui::Box {
         width: None,
-        grow: Some(true),
+        grow: None,
         align_self: None,
-        padding: Some(Spacing::Sm),
+        padding: Some(Spacing::Md),
         margin: None,
-        children: vec![new_btn, search, chips, body],
-        style: Some(panel_style()),
+        children: vec![new_btn, search, chips],
+        style: Some(ui::BoxStyle {
+            border: Some(BorderEdges {
+                bottom: Some(BorderSide::new(1, BorderColor::Default)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
         direction: Some(FlexDirection::Column),
         gap: Some(Spacing::Sm),
         align: Some(FlexAlign::Stretch),
         justify: None,
         responsive: None,
+    }
+    .into_component("list-head")
+    .expect("Box encode");
+
+    let list_body = ui::Box {
+        width: None,
+        grow: Some(true),
+        align_self: None,
+        padding: Some(Spacing::Sm),
+        margin: None,
+        children: vec![body],
+        style: Some(ui::BoxStyle {
+            min_height: Some(DimensionToken::Px { value: 0 }),
+            overflow_y: Some(ui::Overflow::Auto),
+            ..Default::default()
+        }),
+        direction: Some(FlexDirection::Column),
+        gap: None,
+        align: Some(FlexAlign::Stretch),
+        justify: None,
+        responsive: Some(stacked_fit_content(640)),
+    }
+    .into_component("list-body")
+    .expect("Box encode");
+
+    ui::Box {
+        width: None,
+        grow: Some(true),
+        align_self: None,
+        padding: None,
+        margin: None,
+        children: vec![head, list_body],
+        style: Some(panel_style()),
+        direction: Some(FlexDirection::Column),
+        gap: None,
+        align: Some(FlexAlign::Stretch),
+        justify: None,
+        responsive: Some(stacked_fit_content(640)),
     }
     .into_component("list-col")
     .expect("Box encode")
@@ -645,7 +723,7 @@ fn note_card(index: usize, note: &NoteSummary, active_id: &str) -> Component {
         tone: None,
         align: None,
         wrap: None,
-        max_lines: Some(1),
+        max_lines: Some(2),
         format: None,
         streaming: None,
     }
@@ -678,6 +756,27 @@ fn note_card(index: usize, note: &NoteSummary, active_id: &str) -> Component {
     .into_component(format!("nc-{index}-meta"))
     .expect("Cluster encode");
 
+    let mut children = vec![title, preview, meta];
+    if !note.entities.is_empty() {
+        let chips = Cluster {
+            gap: Spacing::Xs,
+            align: FlexAlign::Center,
+            justify: FlexJustify::Start,
+            children: note
+                .entities
+                .iter()
+                .enumerate()
+                .map(|(j, (name, etype))| {
+                    entity_chip_id(&format!("nc-{index}-ent-{j}"), name, etype)
+                })
+                .collect(),
+            wrap: Some(true),
+        }
+        .into_component(format!("nc-{index}-ents"))
+        .expect("Cluster encode");
+        children.push(chips);
+    }
+
     let mut card = Card {
         variant: CardVariant::Outlined,
         padding: Spacing::Sm,
@@ -693,7 +792,7 @@ fn note_card(index: usize, note: &NoteSummary, active_id: &str) -> Component {
         },
         background: ui::BackgroundToken::Subtle,
         accent: if is_active { Some(Tone::Primary) } else { None },
-        children: vec![title, preview, meta],
+        children,
         interactive: true,
         clickable: true,
         style: None,
@@ -736,24 +835,41 @@ pub fn send_main(ctx: &UserCtx, note: Option<&NoteDetail>) {
         gap: None,
         align: Some(FlexAlign::Stretch),
         justify: None,
-        responsive: None,
+        responsive: Some(stacked_fit_content(900)),
     }
     .into_component("editor-pane")
     .expect("Box encode");
 
+    // Mockup n01: fixed 280px links panel; the editor takes the leftover.
     let links_col = ui::Box {
-        width: None,
+        width: Some(DimensionToken::Px { value: 280 }),
         grow: None,
         align_self: None,
         padding: None,
         margin: None,
         children: vec![links],
-        style: Some(min_width_style(240)),
+        style: Some(ui::BoxStyle {
+            min_width: Some(DimensionToken::Px { value: 280 }),
+            ..full_height_style()
+        }),
         direction: Some(FlexDirection::Column),
         gap: None,
         align: Some(FlexAlign::Stretch),
         justify: None,
-        responsive: None,
+        // Stacked mode (narrow container): the panel goes full width.
+        responsive: Some(vec![ui::ResponsiveRule {
+            max_width: ui::ContainerWidth::Px(900),
+            direction: None,
+            gap: None,
+            align: None,
+            justify: None,
+            padding: None,
+            min_height: None,
+            order: None,
+            hidden: None,
+            width: Some(DimensionToken::Full),
+        }
+        .min_height(DimensionToken::FitContent)]),
     }
     .into_component("links-pane")
     .expect("Box encode");
@@ -780,6 +896,7 @@ pub fn send_main(ctx: &UserCtx, note: Option<&NoteDetail>) {
             min_height: None,
             order: None,
             hidden: None,
+            width: None,
         }]),
     }
     .into_component("main-row")
@@ -793,6 +910,24 @@ fn min_width_style(px: u32) -> ui::BoxStyle {
         min_width: Some(DimensionToken::Px { value: px }),
         ..full_height_style()
     }
+}
+
+/// Stacked-mode fix: a `grow` child (flex-basis 0) contributes no height when
+/// its parent is content-sized, so below the stacking breakpoint the body must
+/// be at least fit-content tall or it collapses to zero.
+fn stacked_fit_content(threshold_px: u16) -> Vec<ui::ResponsiveRule> {
+    vec![ui::ResponsiveRule {
+        max_width: ui::ContainerWidth::Px(threshold_px),
+        direction: None,
+        gap: None,
+        align: None,
+        justify: None,
+        padding: None,
+        min_height: Some(DimensionToken::FitContent),
+        order: None,
+        hidden: None,
+        width: None,
+    }]
 }
 
 fn editor_overlay(n: &NoteDetail) -> Vec<StateEntry> {
@@ -876,7 +1011,7 @@ fn empty_editor_fragment() -> Component {
     .expect("Button encode");
     new_btn.handlers = Some(backend(EventKind::Click, "new_note"));
 
-    EmptyState {
+    let empty = EmptyState {
         icon: icon(IconName::FileText),
         heading: lit("Wybierz notatkę"),
         message: Some(lit("Wybierz notatkę z listy po lewej albo utwórz nową.")),
@@ -885,7 +1020,25 @@ fn empty_editor_fragment() -> Component {
         variant: EmptyStateVariant::Default,
     }
     .into_component("editor-empty")
-    .expect("EmptyState encode")
+    .expect("EmptyState encode");
+
+    // Same framed panel as the populated editor (mockup col-editor).
+    ui::Box {
+        width: None,
+        grow: Some(true),
+        align_self: None,
+        padding: Some(Spacing::Md),
+        margin: None,
+        children: vec![empty],
+        style: Some(panel_style()),
+        direction: Some(FlexDirection::Column),
+        gap: None,
+        align: Some(FlexAlign::Center),
+        justify: Some(FlexJustify::Center),
+        responsive: None,
+    }
+    .into_component("editor-empty-panel")
+    .expect("Box encode")
 }
 
 fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
@@ -895,30 +1048,30 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
         Some(BindRef::Literal(CborValue::Bool(true)))
     };
 
+    // Mockup n01: the title is a borderless h1-like inline field. A single-row
+    // auto-grow Textarea (not Input) so a long title wraps and stays fully
+    // visible; save_note strips any pasted newlines.
     let mut title = with_a11y_label(
-        Input {
-            r#type: InputType::Text,
+        Textarea {
             bind_path: state_path(SP_TITLE),
             placeholder: Some(lit("Tytuł notatki…")),
             label: None,
             hint: None,
-            leading_icon: None,
-            trailing_icon: None,
-            prefix: None,
-            suffix: None,
             validators: vec![],
             max_length: Some(MAX_TITLE_CHARS as u16),
             min_length: None,
-            pattern: None,
-            autocomplete: None,
-            input_mode: None,
             disabled: None,
             readonly: readonly_bind.clone(),
             error: None,
             size: InputSize::Lg,
+            rows: 1,
+            autoresize: true,
+            max_rows: None,
+            monospace: false,
+            variant: Some(ui::InputVariant::Ghost),
         }
         .into_component("note-title")
-        .expect("Input encode"),
+        .expect("Textarea encode"),
         "Tytuł notatki",
     );
     if n.can_write {
@@ -984,7 +1137,7 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
         ));
     }
 
-    let meta_left = Cluster {
+    let meta_left_cluster = Cluster {
         gap: Spacing::Sm,
         align: FlexAlign::Center,
         justify: FlexJustify::Start,
@@ -1003,6 +1156,27 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
     }
     .into_component("editor-meta-left")
     .expect("Cluster encode");
+    // grow + min-width 0: the left side shrinks/wraps internally, keeping the
+    // share pill on the same row at the right edge (mockup btn-share).
+    let meta_left = ui::Box {
+        width: None,
+        grow: Some(true),
+        align_self: None,
+        padding: None,
+        margin: None,
+        children: vec![meta_left_cluster],
+        style: Some(ui::BoxStyle {
+            min_width: Some(DimensionToken::Px { value: 0 }),
+            ..Default::default()
+        }),
+        direction: Some(FlexDirection::Column),
+        gap: None,
+        align: Some(FlexAlign::Stretch),
+        justify: Some(FlexJustify::Center),
+        responsive: None,
+    }
+    .into_component("editor-meta-left-grow")
+    .expect("Box encode");
 
     let share_control: Component = if n.is_owner {
         let mut options = vec![
@@ -1041,26 +1215,47 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
                 description: None,
             });
         }
-        let mut select = Select {
-            bind_path: state_path(SP_SHARE),
-            options,
-            placeholder: None,
-            label: Some(lit("Udostępnij")),
-            searchable: false,
-            clearable: false,
-            virtualize: false,
-            disabled: None,
-            size: InputSize::Sm,
-            groups: None,
-        }
-        .into_component("share-select")
-        .expect("Select encode");
+        // Compact control without a stacked label (mockup: small share pill).
+        let mut select = with_a11y_label(
+            Select {
+                bind_path: state_path(SP_SHARE),
+                options,
+                placeholder: None,
+                label: None,
+                searchable: false,
+                clearable: false,
+                virtualize: false,
+                disabled: None,
+                size: InputSize::Sm,
+                groups: None,
+            }
+            .into_component("share-select")
+            .expect("Select encode"),
+            "Udostępnij",
+        );
         select.handlers = Some(backend_params(
             EventKind::Change,
             "set_share",
             vec![("note_id", CborValue::Text(n.id.clone()))],
         ));
-        select
+        // Keep the control pill-sized (mockup btn-share) — without the wrapper
+        // the select stretches to the full row width.
+        ui::Box {
+            width: Some(DimensionToken::Px { value: 220 }),
+            grow: None,
+            align_self: None,
+            padding: None,
+            margin: None,
+            children: vec![select],
+            style: None,
+            direction: Some(FlexDirection::Column),
+            gap: None,
+            align: Some(FlexAlign::Stretch),
+            justify: None,
+            responsive: None,
+        }
+        .into_component("share-wrap")
+        .expect("Box encode")
     } else {
         scope_badge("editor-scope-badge", &n.scope)
     };
@@ -1070,7 +1265,7 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
         gap: Spacing::Md,
         justify: FlexJustify::SpaceBetween,
         align: FlexAlign::Center,
-        wrap: FlexWrap::Wrap,
+        wrap: FlexWrap::NoWrap,
         children: vec![meta_left, share_control],
         padding: None,
         background: None,
@@ -1107,6 +1302,8 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
             autoresize: true,
             max_rows: None,
             monospace: false,
+            // Mockup n01: the note body is borderless editor content.
+            variant: Some(ui::InputVariant::Ghost),
         }
         .into_component("note-content")
         .expect("Textarea encode"),
@@ -1197,6 +1394,8 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
         .expect("Cluster encode"),
     );
 
+    // Mockup n01: the toolbar sits at the panel's bottom edge, separated by a
+    // full-bleed hairline; the body above it scrolls.
     let toolbar = Flex {
         direction: FlexDirection::Row,
         gap: Spacing::Md,
@@ -1206,26 +1405,58 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
         children: toolbar_children,
         padding: Some(Spacing::Sm),
         background: Some(ui::BackgroundToken::Subtle),
-        radius: Some(ui::RadiusToken::Md),
-        style: None,
+        radius: None,
+        style: Some(ui::BoxStyle {
+            border: Some(BorderEdges {
+                top: Some(BorderSide::new(1, BorderColor::Default)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
         responsive: None,
     }
     .into_component("editor-toolbar")
     .expect("Flex encode");
 
-    ui::Box {
+    let body = ui::Box {
         width: None,
         grow: Some(true),
         align_self: None,
         padding: Some(Spacing::Md),
         margin: None,
-        children: vec![title, meta, divider, content, toolbar],
-        style: Some(panel_style()),
+        children: vec![title, meta, divider, content],
+        style: Some(ui::BoxStyle {
+            min_height: Some(DimensionToken::Px { value: 0 }),
+            overflow_y: Some(ui::Overflow::Auto),
+            ..Default::default()
+        }),
         direction: Some(FlexDirection::Column),
         gap: Some(Spacing::Sm),
         align: Some(FlexAlign::Stretch),
         justify: None,
-        responsive: None,
+        responsive: Some(stacked_fit_content(900)),
+    }
+    .into_component("editor-body")
+    .expect("Box encode");
+
+    // Mockup col-editor: the active panel carries an accent border + glow.
+    ui::Box {
+        width: None,
+        grow: Some(true),
+        align_self: None,
+        padding: None,
+        margin: None,
+        children: vec![body, toolbar],
+        style: Some(ui::BoxStyle {
+            border: Some(BorderEdges::all(BorderSide::new(1, BorderColor::Accent))),
+            shadow: Some(ShadowToken::AccentGlow),
+            ..panel_style()
+        }),
+        direction: Some(FlexDirection::Column),
+        gap: None,
+        align: Some(FlexAlign::Stretch),
+        justify: None,
+        responsive: Some(stacked_fit_content(900)),
     }
     .into_component("editor-col")
     .expect("Box encode")
@@ -1240,46 +1471,109 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
 /// Links younger than this show the "nowe" chip (mockup n01).
 const FRESH_LINK_SECS: i64 = 86_400;
 
+/// Header strip (mockup n01 links-head): uppercase accent title with a small
+/// "Auto" chip, separated from the body by a full-bleed hairline.
 fn links_header() -> Component {
-    SectionHeader {
-        title: lit("Powiązania"),
-        subtitle: Some(lit("Auto")),
-        actions: vec![],
-        divider: true,
+    let title = text_c(
+        "links-title",
+        lit("Powiązania"),
+        TextStyle::Overline,
+        Some(Tone::Primary),
+    );
+    let auto_tag = Chip {
+        variant: ChipVariant::Soft,
+        tone: Tone::Primary,
+        label: lit("Auto"),
+        icon: None,
+        avatar: None,
+        selected: None,
+        removable: false,
+        dot: None,
+    }
+    .into_component("links-auto-tag")
+    .expect("Chip encode");
+
+    Flex {
+        direction: FlexDirection::Row,
+        gap: Spacing::Sm,
+        justify: FlexJustify::SpaceBetween,
+        align: FlexAlign::Center,
+        wrap: FlexWrap::NoWrap,
+        children: vec![title, auto_tag],
+        padding: Some(Spacing::Md),
+        background: None,
+        radius: None,
+        style: Some(ui::BoxStyle {
+            border: Some(BorderEdges {
+                bottom: Some(BorderSide::new(1, BorderColor::Default)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        responsive: None,
     }
     .into_component("links-header")
-    .expect("SectionHeader encode")
+    .expect("Flex encode")
 }
 
-fn links_placeholder() -> Component {
-    ui::Box {
+/// Uppercase accent-toned section label inside the links body (mockup n01
+/// links-section-title).
+fn links_section_title(id: &str, label: &str) -> Component {
+    text_c(id, lit(label), TextStyle::Overline, Some(Tone::Muted))
+}
+
+/// Framed links column: header strip + scrollable body content.
+fn links_panel(children: Vec<Component>) -> Component {
+    let body = ui::Box {
         width: None,
         grow: Some(true),
         align_self: None,
         padding: Some(Spacing::Md),
         margin: None,
-        children: vec![
-            links_header(),
-            EmptyState {
-                icon: icon(IconName::Sparkle),
-                heading: lit("Brak powiązań"),
-                message: Some(lit("Otwórz notatkę, aby zobaczyć jej powiązania.")),
-                primary_action: None,
-                secondary_action: None,
-                variant: EmptyStateVariant::Compact,
-            }
-            .into_component("links-none")
-            .expect("EmptyState encode"),
-        ],
-        style: Some(panel_style()),
+        children,
+        style: Some(ui::BoxStyle {
+            min_height: Some(DimensionToken::Px { value: 0 }),
+            overflow_y: Some(ui::Overflow::Auto),
+            ..Default::default()
+        }),
         direction: Some(FlexDirection::Column),
         gap: Some(Spacing::Md),
         align: Some(FlexAlign::Stretch),
         justify: None,
-        responsive: None,
+        responsive: Some(stacked_fit_content(900)),
+    }
+    .into_component("links-body")
+    .expect("Box encode");
+
+    ui::Box {
+        width: None,
+        grow: Some(true),
+        align_self: None,
+        padding: None,
+        margin: None,
+        children: vec![links_header(), body],
+        style: Some(panel_style()),
+        direction: Some(FlexDirection::Column),
+        gap: None,
+        align: Some(FlexAlign::Stretch),
+        justify: None,
+        responsive: Some(stacked_fit_content(900)),
     }
     .into_component("links-col")
     .expect("Box encode")
+}
+
+fn links_placeholder() -> Component {
+    links_panel(vec![EmptyState {
+        icon: icon(IconName::Sparkle),
+        heading: lit("Brak powiązań"),
+        message: Some(lit("Otwórz notatkę, aby zobaczyć jej powiązania.")),
+        primary_action: None,
+        secondary_action: None,
+        variant: EmptyStateVariant::Compact,
+    }
+    .into_component("links-none")
+    .expect("EmptyState encode")])
 }
 
 fn links_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
@@ -1291,7 +1585,7 @@ fn links_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
     let now = db::now_unix();
     let picker_open = load_session().link_picker;
 
-    let mut children = vec![links_header()];
+    let mut children: Vec<Component> = Vec::new();
 
     if let Some((attempts, last_error)) = analysis::queue_state(&n.id) {
         let status = if analysis::is_pending(attempts) {
@@ -1347,15 +1641,7 @@ fn links_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
     };
     children.push(related_section);
 
-    let entities_header = SectionHeader {
-        title: lit("Wykryte encje"),
-        subtitle: None,
-        actions: vec![],
-        divider: false,
-    }
-    .into_component("entities-header")
-    .expect("SectionHeader encode");
-    children.push(entities_header);
+    children.push(links_section_title("entities-header", "Wykryte encje"));
 
     let entities_section: Component = if entities.is_empty() {
         text_c(
@@ -1382,16 +1668,7 @@ fn links_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
     children.push(entities_section);
 
     if !suggestions.is_empty() {
-        children.push(
-            SectionHeader {
-                title: lit("Sugestia scalenia"),
-                subtitle: None,
-                actions: vec![],
-                divider: false,
-            }
-            .into_component("merge-header")
-            .expect("SectionHeader encode"),
-        );
+        children.push(links_section_title("merge-header", "Sugestia scalenia"));
         for (i, s) in suggestions.iter().enumerate() {
             children.push(merge_suggestion_card(i, s));
         }
@@ -1422,22 +1699,7 @@ fn links_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
         children.push(add_btn);
     }
 
-    ui::Box {
-        width: None,
-        grow: Some(true),
-        align_self: None,
-        padding: Some(Spacing::Md),
-        margin: None,
-        children,
-        style: Some(panel_style()),
-        direction: Some(FlexDirection::Column),
-        gap: Some(Spacing::Md),
-        align: Some(FlexAlign::Stretch),
-        justify: None,
-        responsive: None,
-    }
-    .into_component("links-col")
-    .expect("Box encode")
+    links_panel(children)
 }
 
 /// Manual-link picker: a select over the notes the user can read (minus the
@@ -1532,7 +1794,7 @@ fn related_card(index: usize, r: &db::RelatedNote, now: i64) -> Component {
         tone: None,
         align: None,
         wrap: None,
-        max_lines: Some(1),
+        max_lines: Some(2),
         format: None,
         streaming: None,
     }
@@ -1542,12 +1804,13 @@ fn related_card(index: usize, r: &db::RelatedNote, now: i64) -> Component {
     let title_row: Component = if is_fresh {
         let fresh = Chip {
             variant: ChipVariant::Soft,
-            tone: Tone::Primary,
+            tone: Tone::Success,
             label: lit("nowe"),
             icon: None,
             avatar: None,
             selected: None,
             removable: false,
+            dot: None,
         }
         .into_component(format!("rel-{index}-fresh"))
         .expect("Chip encode");
@@ -1564,20 +1827,62 @@ fn related_card(index: usize, r: &db::RelatedNote, now: i64) -> Component {
         title_text
     };
 
-    let detail = if r.reason.is_empty() {
-        format!("{percent}%")
-    } else {
-        format!("{percent}% · {}", r.reason)
-    };
-    let children = vec![
-        title_row,
-        text_c(
+    // Mockup n01 rel-card: similarity bar with the percent value on the right,
+    // then the reason line underneath.
+    let bar = ui::Box {
+        width: None,
+        grow: Some(true),
+        align_self: None,
+        padding: None,
+        margin: None,
+        children: vec![ui::ProgressBar {
+            value: lit_value(CborValue::F64(r.weight.clamp(0.0, 1.0))),
+            max: 1.0,
+            variant: ui::ProgressVariant::Default,
+            tone: Tone::Primary,
+            show_label: false,
+            label: None,
+            size: ui::ProgressSize::Sm,
+        }
+        .into_component(format!("rel-{index}-bar"))
+        .expect("ProgressBar encode")],
+        style: None,
+        direction: Some(FlexDirection::Column),
+        gap: None,
+        align: Some(FlexAlign::Stretch),
+        justify: Some(FlexJustify::Center),
+        responsive: None,
+    }
+    .into_component(format!("rel-{index}-bar-grow"))
+    .expect("Box encode");
+
+    let sim_row = Cluster {
+        gap: Spacing::Sm,
+        align: FlexAlign::Center,
+        justify: FlexJustify::Start,
+        children: vec![
+            bar,
+            text_c(
+                &format!("rel-{index}-pct"),
+                lit(format!("{percent}%")),
+                TextStyle::Caption,
+                Some(Tone::Primary),
+            ),
+        ],
+        wrap: Some(false),
+    }
+    .into_component(format!("rel-{index}-sim"))
+    .expect("Cluster encode");
+
+    let mut children = vec![title_row, sim_row];
+    if !r.reason.is_empty() {
+        children.push(text_c(
             &format!("rel-{index}-reason"),
-            lit(detail),
+            lit(&r.reason),
             TextStyle::Caption,
             Some(Tone::Muted),
-        ),
-    ];
+        ));
+    }
 
     let mut card = Card {
         variant: CardVariant::Outlined,
@@ -1729,6 +2034,11 @@ fn recent_merge_card(index: usize, m: &analysis::RecentMergeView) -> Component {
 }
 
 fn entity_chip(index: usize, name: &str, entity_type: &str) -> Component {
+    entity_chip_id(&format!("ent-{index}"), name, entity_type)
+}
+
+/// Neutral micro-chip with a type-colored leading dot (mockup n01 ent-chip).
+fn entity_chip_id(id: &str, name: &str, entity_type: &str) -> Component {
     let tone = match entity_type {
         "person" => Tone::Info,
         "company" => Tone::Success,
@@ -1738,14 +2048,15 @@ fn entity_chip(index: usize, name: &str, entity_type: &str) -> Component {
     };
     Chip {
         variant: ChipVariant::Soft,
-        tone,
+        tone: Tone::Neutral,
         label: lit(name),
         icon: None,
         avatar: None,
         selected: None,
         removable: false,
+        dot: Some(tone),
     }
-    .into_component(format!("ent-{index}"))
+    .into_component(id)
     .expect("Chip encode")
 }
 
@@ -2038,7 +2349,15 @@ fn action_save_note(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
         None => return json!({"ok": false, "error": "Brak note_id"}),
     };
     let field = param_str(params, "field").unwrap_or("content");
-    let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("");
+    let raw = params.get("value").and_then(|v| v.as_str()).unwrap_or("");
+    // The title renders as a single-row auto-grow textarea — typed or pasted
+    // line breaks become spaces so the stored title stays one logical line.
+    let value: std::borrow::Cow<'_, str> = if field == "title" && raw.contains(['\r', '\n']) {
+        std::borrow::Cow::Owned(raw.replace(['\r', '\n'], " "))
+    } else {
+        std::borrow::Cow::Borrowed(raw)
+    };
+    let value = value.as_ref();
     if let Err(e) = validate_note_field(field, value) {
         feedback_err(&e);
         return json!({"ok": false, "error": e});
@@ -2210,6 +2529,7 @@ mod tests {
             preview: "p".into(),
             updated_at: 1,
             scope: "private".into(),
+            entities: vec![("Nexadata".into(), "company".into())],
         };
         let card = note_card(0, &n, "note_1");
         let handlers = card.handlers.expect("handlers");
@@ -2233,10 +2553,11 @@ mod tests {
     #[test]
     fn list_fragment_renders_empty_state_without_notes() {
         let frag = list_fragment(&[], &Session::default());
-        // Box → children[3] is the body (EmptyState tag 0x0003).
+        // list-col → [list-head, list-body]; list-body wraps the EmptyState.
         let body_tag = {
-            let boxed = ui::Box::try_from_component(&frag).expect("Box decode");
-            boxed.children[3].tag
+            let col = ui::Box::try_from_component(&frag).expect("Box decode");
+            let body = ui::Box::try_from_component(&col.children[1]).expect("Box decode");
+            body.children[0].tag
         };
         assert_eq!(body_tag, EmptyState::TAG);
     }
