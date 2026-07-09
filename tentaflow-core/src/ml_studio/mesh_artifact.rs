@@ -8,25 +8,21 @@
 // per-fragment — w przeciwieństwie do komend request/response strumień QUIC sam
 // obsługuje kontrolę przepływu, więc 1 GB modelu leci niezawodnie i szybko.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::ml_studio::train_recognition::{blob_content_hash, zip_dir};
-
 /// Górny limit rozmiaru artefaktu ML Studio (model MLX/eksport treningu). Chroni
-/// odbiorcę przed alokacją bufora z ogromnego `zip_len` od złośliwego peera —
-/// ODEBRANY ZIP JEST TRZYMANY W CAŁOŚCI W RAM (patrz `recv_artifact_stream`), więc
-/// limit = maksymalny jednorazowy narzut pamięci ścieżki artefaktów ML Studio.
+/// DYSK odbiorcy przed zapisem ogromnego `zip_len` od złośliwego peera (odbiór
+/// idzie do temp-pliku, nie do RAM).
 const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 /// Osobny, WYŻSZY limit dla transferu modelu HF (`hf-model|...`, P0 cluster deploy):
 /// pełne wagi modelu potrafią mieć setki GB. Używany WYŁĄCZNIE dla nazw z prefiksem
 /// `HF_MODEL_NAME_PREFIX`, żeby nie rozszerzać powierzchni DoS ścieżki ML Studio.
-/// WHY bufor-w-RAM mimo dużego limitu: pełny streaming-zip (rozpakowanie w locie bez
-/// trzymania całości w `Vec`) to osobny, większy refactor (`store_*_zip` biorą
-/// `&[u8]`); tu wprowadzamy tylko rozdzielone limity, a streaming zostaje kolejnym
-/// krokiem. Ryzyko RAM przy dużym modelu jest świadome i ograniczone tą stałą.
-const MAX_HF_MODEL_BYTES: u64 = 200 * 1024 * 1024 * 1024;
+/// Cała ścieżka transferu jest plikowa (zip w temp-pliku po stronie nadawcy,
+/// odbiór do temp-pliku, unzip strumieniowy) — limit chroni wyłącznie DYSK
+/// odbiorcy, nie RAM.
+const MAX_HF_MODEL_BYTES: u64 = 400 * 1024 * 1024 * 1024;
 
 /// Prefiks nazwy strumienia znaczacy, ze artefakt to snapshot modelu HF do zapisu
 /// w cache HF (a NIE artefakt ML Studio). Format nazwy:
@@ -85,6 +81,79 @@ fn artifact_dest_root() -> PathBuf {
     crate::paths::cache_dir().join("ml-studio").join("mesh-artifacts")
 }
 
+/// Katalog temp-plików transferu (zip po stronie nadawcy i odbiorcy). Osobny od
+/// docelowych lokalizacji, żeby częściowe pliki nigdy nie wyglądały jak gotowe
+/// artefakty; sprzątany per-plik po zakończeniu/błędzie transferu.
+fn transfer_tmp_dir() -> anyhow::Result<PathBuf> {
+    let dir = crate::paths::cache_dir().join("mesh-transfer-tmp");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Ścieżka świeżego temp-pliku transferu (unikalna per wywołanie).
+fn transfer_tmp_file(prefix: &str) -> anyhow::Result<PathBuf> {
+    Ok(transfer_tmp_dir()?.join(format!("{prefix}-{}.zip", uuid::Uuid::new_v4())))
+}
+
+/// Usuwa temp-plik transferu (best-effort — brak pliku nie jest błędem).
+pub fn remove_transfer_tmp(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+/// sha256 zawartości PLIKU liczone strumieniowo (stały RAM) — odpowiednik
+/// `blob_content_hash` dla artefaktów zbyt dużych na wczytanie do pamięci.
+fn file_content_hash(path: &Path) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut f = std::fs::File::open(path)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(hex::encode(h.finalize()))
+}
+
+/// Pakuje katalog do ZIP-a W PLIKU `dest` (Stored + zip64) strumieniowo — stały
+/// RAM niezależnie od rozmiaru artefaktu (snapshot HF potrafi mieć setki GB).
+/// Zwraca rozmiar wynikowego pliku.
+fn zip_dir_to_file(dir: &Path, dest: &Path) -> anyhow::Result<u64> {
+    let file = std::fs::File::create(dest)?;
+    let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(file));
+    // large_file: safetensors shard może przekraczać 4 GB, a offsety w archiwum
+    // >4 GB wymagają zip64.
+    let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .large_file(true);
+    fn add<W: Write + std::io::Seek>(
+        zip: &mut zip::ZipWriter<W>,
+        opts: &zip::write::FileOptions<()>,
+        base: &Path,
+        cur: &Path,
+    ) -> anyhow::Result<()> {
+        for e in std::fs::read_dir(cur)? {
+            let p = e?.path();
+            let rel = p.strip_prefix(base)?.to_string_lossy().replace('\\', "/");
+            if p.is_dir() {
+                add(zip, opts, base, &p)?;
+            } else {
+                zip.start_file(rel, *opts)?;
+                // io::copy zamiast fs::read — plik wpada do archiwum porcjami,
+                // nigdy w całości do RAM (symlinki HF cache są podążane).
+                let mut src = std::fs::File::open(&p)?;
+                std::io::copy(&mut src, zip)?;
+            }
+        }
+        Ok(())
+    }
+    add(&mut zip, &opts, dir, dir)?;
+    zip.finish()?;
+    Ok(std::fs::metadata(dest)?.len())
+}
+
 /// Nazwa katalogu artefaktu na węźle docelowym (ostatni segment ścieżki źródła,
 /// odcięty z path-traversal). Pusta/niebezpieczna → `model`.
 fn safe_artifact_name(src_dir: &str) -> String {
@@ -135,13 +204,50 @@ pub async fn push_dir_to(
     if !Path::new(src_dir).is_dir() {
         anyhow::bail!("artefakt do transferu nie jest katalogiem: {}", src_dir);
     }
-    let zip = zip_dir(Path::new(src_dir))?;
-    if zip.len() as u64 > MAX_ARTIFACT_BYTES {
-        anyhow::bail!("artefakt przekracza limit transferu ({} B)", zip.len());
-    }
     let name = safe_artifact_name(src_dir);
-    iroh.push_artifact_stream(target_node_id, &name, &zip, progress_key)
+    push_zipped_dir(
+        iroh,
+        target_node_id,
+        &name,
+        Path::new(src_dir),
+        MAX_ARTIFACT_BYTES,
+        progress_key,
+    )
+    .await
+}
+
+/// Wspólny rdzeń nadawcy: zip katalogu do temp-PLIKU (spawn_blocking — sync IO),
+/// limit rozmiaru, strumień do peera, sprzątnięcie temp-pliku w każdej ścieżce.
+async fn push_zipped_dir(
+    iroh: &crate::mesh::iroh_manager::IrohMeshManager,
+    target_node_id: &str,
+    name: &str,
+    src_dir: &Path,
+    max_bytes: u64,
+    progress_key: Option<&str>,
+) -> anyhow::Result<String> {
+    let zip_path = transfer_tmp_file("push")?;
+    let zip_for_task = zip_path.clone();
+    let src_for_task = src_dir.to_path_buf();
+    let zipped = tokio::task::spawn_blocking(move || zip_dir_to_file(&src_for_task, &zip_for_task))
         .await
+        .map_err(|e| anyhow::anyhow!("zip artefaktu: join: {e}"))?;
+    let size = match zipped {
+        Ok(s) => s,
+        Err(e) => {
+            remove_transfer_tmp(&zip_path);
+            return Err(e);
+        }
+    };
+    if size > max_bytes {
+        remove_transfer_tmp(&zip_path);
+        anyhow::bail!("artefakt przekracza limit transferu ({size} B)");
+    }
+    let res = iroh
+        .push_artifact_stream(target_node_id, name, &zip_path, progress_key)
+        .await;
+    remove_transfer_tmp(&zip_path);
+    res
 }
 
 /// Węzeł-źródło (head cluster deploy): pakuje snapshot modelu z lokalnego cache HF
@@ -159,21 +265,26 @@ pub async fn push_hf_model_to(
     if !Path::new(snapshot_dir).is_dir() {
         anyhow::bail!("snapshot modelu do transferu nie jest katalogiem: {snapshot_dir}");
     }
-    let zip = zip_dir(Path::new(snapshot_dir))?;
-    if zip.len() as u64 > MAX_HF_MODEL_BYTES {
-        anyhow::bail!("snapshot modelu przekracza limit transferu ({} B)", zip.len());
-    }
     let models_dir = crate::services::deploy::distributed::model_dir_name(model_repo);
     let name = format!("{HF_MODEL_NAME_PREFIX}{models_dir}|{hash}");
-    iroh.push_artifact_stream(target_node_id, &name, &zip, progress_key)
-        .await
+    push_zipped_dir(
+        iroh,
+        target_node_id,
+        &name,
+        Path::new(snapshot_dir),
+        MAX_HF_MODEL_BYTES,
+        progress_key,
+    )
+    .await
 }
 
 /// Węzeł docelowy (accept loop ALPN_ARTIFACT): czyta z bi-streamu
-/// `[name_len u32][name][zip_len u64][zip]` i zwraca `(name, zip_bytes)`.
+/// `[name_len u32][name][zip_len u64][zip]`, składa ZIP do TEMP-PLIKU
+/// (stały RAM — snapshot HF potrafi mieć setki GB) i zwraca `(name, ścieżka)`.
+/// Caller odpowiada za usunięcie temp-pliku (`remove_transfer_tmp`).
 pub async fn recv_artifact_stream(
     recv: &mut iroh::endpoint::RecvStream,
-) -> anyhow::Result<(String, Vec<u8>)> {
+) -> anyhow::Result<(String, PathBuf)> {
     let mut l4 = [0u8; 4];
     recv.read_exact(&mut l4)
         .await
@@ -207,51 +318,72 @@ pub async fn recv_artifact_stream(
     // każdy `read` zwraca, gdy tylko napłyną JAKIEKOLWIEK bajty, i ma świeży limit
     // bezczynności (ARTIFACT_STALL_SECS). Dopóki choć bajt napływa w oknie, licznik
     // się resetuje — transfer może trwać dowolnie długo i wolno. Timeout pojedynczego
-    // `read` = ZERO bajtów przez okno = STALL (a nie „za wolno").
-    let mut zip = vec![0u8; zip_len as usize];
-    let mut filled = 0usize;
+    // `read` = ZERO bajtów przez okno = STALL (a nie „za wolno"). Bajty lecą wprost
+    // do temp-pliku (BufWriter przez spawn_blocking-free tokio::fs) — stały RAM.
+    let zip_path = transfer_tmp_file("recv")?;
+    let file = tokio::fs::File::create(&zip_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("artifact recv: create temp: {e}"))?;
+    let mut writer = tokio::io::BufWriter::with_capacity(4 * 1024 * 1024, file);
+    let mut buf = vec![0u8; ARTIFACT_CHUNK_BYTES];
+    let mut filled: u64 = 0;
     let stall = std::time::Duration::from_secs(ARTIFACT_STALL_SECS);
-    while filled < zip.len() {
-        match tokio::time::timeout(stall, recv.read(&mut zip[filled..])).await {
-            Ok(Ok(Some(0))) => anyhow::bail!(
-                "artifact recv: strumień zamknięty przedwcześnie ({}/{} B)",
-                filled,
-                zip.len()
-            ),
-            Ok(Ok(Some(n))) => filled += n,
-            Ok(Ok(None)) => anyhow::bail!(
-                "artifact recv: koniec strumienia przed pełnym zip ({}/{} B)",
-                filled,
-                zip.len()
-            ),
-            Ok(Err(e)) => return Err(anyhow::anyhow!("artifact recv: zip: {e}")),
-            Err(_) => anyhow::bail!(
-                "artifact recv: transfer utknął — brak NOWYCH danych przez {}s ({}/{} B)",
-                ARTIFACT_STALL_SECS,
-                filled,
-                zip.len()
-            ),
+    let res: anyhow::Result<()> = async {
+        use tokio::io::AsyncWriteExt;
+        while filled < zip_len {
+            let want = ((zip_len - filled) as usize).min(buf.len());
+            match tokio::time::timeout(stall, recv.read(&mut buf[..want])).await {
+                Ok(Ok(Some(0))) => anyhow::bail!(
+                    "artifact recv: strumień zamknięty przedwcześnie ({filled}/{zip_len} B)"
+                ),
+                Ok(Ok(Some(n))) => {
+                    writer
+                        .write_all(&buf[..n])
+                        .await
+                        .map_err(|e| anyhow::anyhow!("artifact recv: zapis temp: {e}"))?;
+                    filled += n as u64;
+                }
+                Ok(Ok(None)) => anyhow::bail!(
+                    "artifact recv: koniec strumienia przed pełnym zip ({filled}/{zip_len} B)"
+                ),
+                Ok(Err(e)) => return Err(anyhow::anyhow!("artifact recv: zip: {e}")),
+                Err(_) => anyhow::bail!(
+                    "artifact recv: transfer utknął — brak NOWYCH danych przez {}s ({filled}/{zip_len} B)",
+                    ARTIFACT_STALL_SECS,
+                ),
+            }
         }
+        writer
+            .flush()
+            .await
+            .map_err(|e| anyhow::anyhow!("artifact recv: flush temp: {e}"))?;
+        Ok(())
     }
-    Ok((name, zip))
+    .await;
+    if let Err(e) = res {
+        remove_transfer_tmp(&zip_path);
+        return Err(e);
+    }
+    Ok((name, zip_path))
 }
 
-/// Węzeł docelowy: rozpakowuje odebrany ZIP do unikalnego katalogu
+/// Węzeł docelowy: rozpakowuje odebrany ZIP (temp-plik) do unikalnego katalogu
 /// `<cache>/ml-studio/mesh-artifacts/<name>-<content-hash>` i zwraca ścieżkę.
-pub fn store_artifact_zip(name: &str, zip: &[u8]) -> anyhow::Result<String> {
+/// Sync IO (unzip setek GB) — wołający owija w `spawn_blocking`.
+pub fn store_artifact_zip(name: &str, zip_path: &Path) -> anyhow::Result<String> {
     // Transfery modelu HF (P0 cluster deploy) mają nazwę `hf-model|<dir>|<hash>`
     // i lądują w cache HF, a nie w `ml-studio/mesh-artifacts`.
     if let Some(rest) = name.strip_prefix(HF_MODEL_NAME_PREFIX) {
         let (models_dir, hash) = rest
             .split_once('|')
             .ok_or_else(|| anyhow::anyhow!("zła nazwa transferu modelu HF: {name}"))?;
-        return store_hf_model_zip(models_dir, hash, zip);
+        return store_hf_model_zip(models_dir, hash, zip_path);
     }
-    let id = blob_content_hash(zip);
+    let id = file_content_hash(zip_path)?;
     let dest = artifact_dest_root().join(format!("{}-{}", safe_artifact_name(name), id));
     // Artefakt ML Studio: brak sztywnego kontraktu plików, wymagamy tylko, by ZIP
     // rozpakował się do NIEPUSTEGO katalogu (nie zostawiamy pustego dest).
-    unzip_to_dir(zip, &dest, |staging| {
+    unzip_to_dir(zip_path, &dest, |staging| {
         if dir_is_empty(staging) {
             anyhow::bail!("artefakt jest pusty po rozpakowaniu");
         }
@@ -301,7 +433,7 @@ fn hf_segment_safe(s: &str, must_prefix: Option<&str>) -> bool {
 /// `models_root()/<models_dir>/snapshots/<hash>/` i zapisuje `refs/main = <hash>`,
 /// żeby `vllm serve` z `HF_HUB_OFFLINE=1` rozwiązał rewizję. Pliki są zwykłe (nie
 /// symlinki do blobów) — offline resolver huggingface_hub tego nie wymaga.
-fn store_hf_model_zip(models_dir: &str, hash: &str, zip: &[u8]) -> anyhow::Result<String> {
+fn store_hf_model_zip(models_dir: &str, hash: &str, zip_path: &Path) -> anyhow::Result<String> {
     if !hf_segment_safe(models_dir, Some("models--")) {
         anyhow::bail!("niebezpieczna nazwa katalogu modelu: {models_dir}");
     }
@@ -312,7 +444,7 @@ fn store_hf_model_zip(models_dir: &str, hash: &str, zip: &[u8]) -> anyhow::Resul
     let dest = base.join("snapshots").join(hash);
     // Walidacja kompletności PRZED podmianą — niekompletny transfer nie kasuje
     // istniejącego, dobrego snapshotu w cache HF (integralność, P1-C).
-    unzip_to_dir(zip, &dest, |staging| {
+    unzip_to_dir(zip_path, &dest, |staging| {
         if !hf_snapshot_complete(staging) {
             anyhow::bail!("snapshot modelu niekompletny (brak config.json lub *.safetensors)");
         }
@@ -330,7 +462,7 @@ fn store_hf_model_zip(models_dir: &str, hash: &str, zip: &[u8]) -> anyhow::Resul
 /// `dest` NIE jest ruszany — częściowy/złośliwy transfer nie kasuje już zapisanego,
 /// kompletnego artefaktu/modelu. Odcina path-traversal (`enclosed_name`).
 fn unzip_to_dir(
-    zip_bytes: &[u8],
+    zip_path: &Path,
     dest: &Path,
     validate: impl Fn(&Path) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
@@ -339,7 +471,7 @@ fn unzip_to_dir(
         .ok_or_else(|| anyhow::anyhow!("dest bez katalogu nadrzędnego: {}", dest.display()))?;
     std::fs::create_dir_all(parent)?;
     let dest_name = dest.file_name().and_then(|n| n.to_str()).unwrap_or("model");
-    let id = blob_content_hash(zip_bytes);
+    let id = uuid::Uuid::new_v4().simple().to_string();
     let staging = parent.join(format!(".{dest_name}.incoming-{id}"));
     if staging.exists() {
         let _ = std::fs::remove_dir_all(&staging);
@@ -347,9 +479,12 @@ fn unzip_to_dir(
     std::fs::create_dir_all(&staging)?;
 
     // Rozpakowanie + walidacja w stagingu; przy KAŻDYM błędzie sprzątamy staging i
-    // NIE dotykamy dest.
+    // NIE dotykamy dest. Archiwum czytane z PLIKU, wpisy kopiowane strumieniowo
+    // (io::copy) — stały RAM także dla wielogigabajtowych shardów safetensors.
     let staged = (|| -> anyhow::Result<()> {
-        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
+        let zip_file = std::fs::File::open(zip_path)
+            .map_err(|e| anyhow::anyhow!("otwarcie zip transferu: {e}"))?;
+        let mut archive = zip::ZipArchive::new(std::io::BufReader::new(zip_file))
             .map_err(|e| anyhow::anyhow!("artefakt nie jest poprawnym zip: {}", e))?;
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i)?;
@@ -364,9 +499,9 @@ fn unzip_to_dir(
             if let Some(p) = out_path.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf)?;
-            std::fs::write(&out_path, &buf)?;
+            let mut out = std::io::BufWriter::new(std::fs::File::create(&out_path)?);
+            std::io::copy(&mut entry, &mut out)?;
+            out.flush()?;
         }
         validate(&staging)
     })();
