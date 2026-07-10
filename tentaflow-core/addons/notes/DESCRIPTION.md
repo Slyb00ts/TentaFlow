@@ -42,10 +42,40 @@ node grafu i wektory znikaja przez outbox.
 
 ## Interfejs
 
-Panel `main`: lista (nowa notatka, szukajka, filtry zakresu Wszystkie / Moje /
-Udostepnione mi / Grupa / Organizacja), edytor (tytul, autor, tagi, wybor
-udostepniania, tresc, licznik znakow, status autozapisu) oraz panel
-"Powiazania": status analizy, karty powiazanych notatek (procent, powod,
-chip "nowe" dla powiazan mlodszych niz 24 h), chipy wykrytych encji, sugestie
-scalenia i mozliwosc cofniecia swiezych scalen. Powiazania i encje sa zawsze
-filtrowane ACL-em czytelnika po stronie notatki docelowej.
+Panel `main`, trzy widoki (Notatki / Graf / Szukaj):
+
+- **Notatki** — lista (nowa notatka, szukajka, filtry zakresu Wszystkie /
+  Moje / Udostepnione mi / Grupa / Organizacja), edytor (tytul, autor, tagi,
+  tresc, licznik znakow, status autozapisu) oraz panel "Powiazania": status
+  analizy, karty powiazanych notatek (procent, powod, chip "nowe" dla
+  powiazan mlodszych niz 24 h), chipy wykrytych encji, sugestie scalenia
+  i mozliwosc cofniecia swiezych scalen. Powiazania i encje sa zawsze
+  filtrowane ACL-em czytelnika po stronie notatki docelowej.
+- **Graf** — interaktywny graf notatek i encji z filtrami zakresu, typow,
+  progu wagi i glebokosci.
+- **Szukaj** — wyszukiwanie hybrydowe: embeddingi zapytania (k-NN po chunkach,
+  over-fetch) + wedrowka po grafie (widoczne encje -> notatki <= 2 skoki),
+  fuzja RRF. KAZDY kandydat przechodzi `acl_read_clause` PRZED rankingiem.
+  Nad wynikami streamowana synteza LLM (alias `notes-llm`) z chipami zrodel;
+  przy niepodpietych aliasach dziala fallback czysto tekstowy (badge
+  "tekstowo", bez karty odpowiedzi). Prawa kolumna: encje w wynikach
+  i zawezanie przez graf.
+
+## Udostepnianie
+
+Modal "Udostepnij notatke" (tylko wlasciciel): wyszukiwarka osob i grup
+z podpowiedziami na zywo, wpisy per uzytkownik / grupa z poziomem dostepu
+Odczyt / Edycja, przelacznik "cala organizacja — tylko odczyt". Zapis jest
+transakcyjny (`replace_all_shares`): walidacja podmiotow w katalogu,
+kazdy statement re-sprawdza wlasciciela i zywotnosc notatki w WHERE.
+Badge zakresu na kartach pokazuje najszerszy zasieg (org > grupa > osoby >
+prywatna).
+
+## Bloki flow i narzedzia LLM
+
+`blocks.json` rejestruje bloki `notes.search`, `notes.create`, `notes.append`
+i `notes.get_related` (wejscie/wyjscie jako FlowEnvelope; payload Json).
+Te same handlery sa dostepne jako narzedzia LLM: `search_notes`,
+`create_note`, `append_note`, `get_related_notes`. Kazda sciezka dziala
+w kontekscie uzytkownika wykonujacego flow i przechodzi przez istniejace
+ACL-e.

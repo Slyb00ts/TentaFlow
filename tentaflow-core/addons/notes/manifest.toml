@@ -1,8 +1,8 @@
 [addon]
 id = "notes"
 name = "Notatki"
-version = "0.2.0"
-description = "Notatki z lokalną analizą treści: lista, edytor z autozapisem, udostępnianie w organizacji oraz auto-graf powiązań (encje z LLM, podobieństwo semantyczne z embeddingów, sugestie scalania duplikatów encji)."
+version = "0.3.1"
+description = "Notatki z lokalną analizą treści: lista, edytor z autozapisem, granularne udostępnianie (osoby, grupy, organizacja), auto-graf powiązań (encje z LLM, podobieństwo semantyczne z embeddingów, sugestie scalania duplikatów encji), hybrydowe wyszukiwanie (wektory + graf, streamowana odpowiedź LLM) oraz bloki Flow Buildera i narzędzia LLM."
 category = "productivity"
 keywords = ["notes", "notatki", "graf", "encje", "wiedza", "dyktowanie"]
 author = "TentaFlow"
@@ -94,6 +94,12 @@ id = "alias.read"
 display_name = "Odczyt aliasow modeli"
 description = "Sprawdza dostepnosc aliasow notes-llm / notes-embeddings przed analiza."
 risk = "low"
+
+[[permission]]
+id = "flow_blocks"
+display_name = "Bloki Flow Buildera"
+description = "Udostepnia wyszukiwanie, tworzenie, dopisywanie i powiazania notatek jako bloki flow (z ACL uzytkownika flow)."
+risk = "medium"
 
 # --- Aliasy modeli wystawiane przez addon ---
 # suggested_default jest pusty: swieza instalacja tworzy aliasy ODPIETE
@@ -213,3 +219,89 @@ id = "analyze_pending"
 display_name = "Analiza notatek w kolejce"
 description = "Przetwarza zalegle notatki z kolejki analizy (chunking, embeddingi, encje, powiazania). Batch do 5 notatek na wywolanie."
 keywords = ["notes", "analysis", "graph", "queue", "worker"]
+
+# --- Narzedzia LLM (tool-calling) — te same sciezki kodu co bloki flow ---
+
+[[tool]]
+id = "search_notes"
+display_name = "Szukaj w notatkach"
+description = "Hybrydowe wyszukiwanie w notatkach uzytkownika: podobienstwo semantyczne (embeddingi) polaczone z grafem powiazan (encje, linki). Zwraca tylko notatki dostepne dla uzytkownika."
+keywords = ["notes", "search", "notatki", "szukaj", "wiedza"]
+
+[[tool.parameter]]
+name = "query"
+param_type = "string"
+description = "Pytanie lub fraza wyszukiwania w jezyku naturalnym."
+required = true
+
+[[tool.parameter]]
+name = "scope"
+param_type = "string"
+description = "Zakres: all (domyslnie), mine, group albo org."
+required = false
+
+[[tool.parameter]]
+name = "limit"
+param_type = "number"
+description = "Maksymalna liczba wynikow (1-12, domyslnie 8)."
+required = false
+
+[[tool]]
+id = "create_note"
+display_name = "Utworz notatke"
+description = "Tworzy nowa notatke uzytkownika z tytulem, trescia i opcjonalnymi tagami. Notatka trafia do kolejki analizy auto-grafu."
+keywords = ["notes", "create", "notatka", "utworz"]
+
+[[tool.parameter]]
+name = "title"
+param_type = "string"
+description = "Tytul notatki."
+required = false
+
+[[tool.parameter]]
+name = "content"
+param_type = "string"
+description = "Tresc notatki (markdown)."
+required = true
+
+[[tool.parameter]]
+name = "tags"
+param_type = "array"
+description = "Lista tagow (opcjonalna, max 32)."
+required = false
+
+[[tool]]
+id = "append_note"
+display_name = "Dopisz do notatki"
+description = "Dopisuje tresc na koncu istniejacej notatki. Wymaga uprawnienia do edycji tej notatki."
+keywords = ["notes", "append", "notatka", "dopisz"]
+
+[[tool.parameter]]
+name = "note_id"
+param_type = "string"
+description = "Identyfikator notatki."
+required = true
+
+[[tool.parameter]]
+name = "content"
+param_type = "string"
+description = "Tresc do dopisania na koncu notatki."
+required = true
+
+[[tool]]
+id = "get_related_notes"
+display_name = "Powiazane notatki"
+description = "Zwraca notatki powiazane z podana notatka przez graf powiazan (glebokosc 1-2) oraz jej wykryte encje. Tylko notatki dostepne dla uzytkownika."
+keywords = ["notes", "related", "graf", "powiazania", "encje"]
+
+[[tool.parameter]]
+name = "note_id"
+param_type = "string"
+description = "Identyfikator notatki wyjsciowej."
+required = true
+
+[[tool.parameter]]
+name = "depth"
+param_type = "number"
+description = "Glebokosc grafu: 1 (bezposrednie) albo 2 (powiazania powiazan)."
+required = false

@@ -7,7 +7,8 @@
 // =============================================================================
 
 use tentaflow_addon_sdk::{
-    directory_org, directory_users, sql_exec, sql_query, sql_query_one, sql_transaction, SqlValue,
+    directory_org, directory_users, log, sql_exec, sql_query, sql_query_one, sql_transaction,
+    SqlValue,
 };
 
 // =============================================================================
@@ -60,23 +61,6 @@ pub fn user_display_name(user_id: &str) -> String {
             })
         })
         .unwrap_or_else(|| user_id.to_string())
-}
-
-/// Names of the acting user's groups, for the share selector labels.
-pub fn group_names(group_ids: &[String]) -> Vec<(String, String)> {
-    let groups = match tentaflow_addon_sdk::directory_groups() {
-        Ok(g) => g,
-        Err(_) => return vec![],
-    };
-    group_ids
-        .iter()
-        .filter_map(|gid| {
-            groups
-                .iter()
-                .find(|g| &g.id == gid)
-                .map(|g| (gid.clone(), g.name.clone()))
-        })
-        .collect()
 }
 
 /// Organization id for new notes (single-org instance directory).
@@ -310,8 +294,9 @@ pub struct NoteDetail {
     pub created_at: i64,
     pub tags: Vec<String>,
     pub scope: String,
-    /// Share selector value ("private" | "org:read" | "org:write" | "group:<id>").
-    pub share_mode: String,
+    /// Share rows of the note (avatar group on the share button; the modal
+    /// re-reads them fresh on open).
+    pub shares: Vec<ShareEntry>,
     pub can_write: bool,
     pub is_owner: bool,
 }
@@ -542,7 +527,14 @@ pub fn get_note(ctx: &UserCtx, note_id: &str) -> Result<Option<NoteDetail>, Stri
             .to_string(),
         created_at: row.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
         scope: widest_scope(&share_rows),
-        share_mode: share_mode(&share_rows),
+        shares: share_rows
+            .iter()
+            .map(|(t, s, a)| ShareEntry {
+                subject_type: t.clone(),
+                subject_id: s.clone(),
+                access: a.clone(),
+            })
+            .collect(),
         owner_user_id: owner,
         can_write,
         is_owner,
@@ -562,18 +554,6 @@ pub fn widest_scope(shares: &[(String, String, String)]) -> String {
     } else {
         "private".to_string()
     }
-}
-
-/// Share selector value from the raw share rows. The selector drives one share
-/// at a time (chunk-2 scope); richer per-user grants land with the sharing UI.
-pub fn share_mode(shares: &[(String, String, String)]) -> String {
-    if let Some((_, _, access)) = shares.iter().find(|(t, _, _)| t == "org") {
-        return format!("org:{access}");
-    }
-    if let Some((_, gid, _)) = shares.iter().find(|(t, _, _)| t == "group") {
-        return format!("group:{gid}");
-    }
-    "private".to_string()
 }
 
 // =============================================================================
@@ -682,95 +662,6 @@ pub fn set_tags(ctx: &UserCtx, note_id: &str, tags: &[String]) -> Result<(), Str
     ));
 
     run_transaction(&stmts).map_err(|e| format!("Błąd zapisu tagów: {e}"))
-}
-
-/// Parses the share selector value into the row to insert (None = private).
-/// Pure and validated BEFORE any mutation — a malformed value never reaches
-/// the database.
-pub fn parse_share_mode(
-    mode: &str,
-    group_ids: &[String],
-) -> Result<Option<(String, String, String)>, String> {
-    match mode {
-        "private" => Ok(None),
-        "org:read" => Ok(Some(("org".into(), "".into(), "read".into()))),
-        "org:write" => Ok(Some(("org".into(), "".into(), "write".into()))),
-        _ => {
-            if let Some(gid) = mode.strip_prefix("group:") {
-                if gid.is_empty() {
-                    return Err("Nieznany tryb udostępniania.".to_string());
-                }
-                if !group_ids.iter().any(|g| g == gid) {
-                    return Err("Nie należysz do wybranej grupy.".to_string());
-                }
-                Ok(Some(("group".into(), gid.to_string(), "read".into())))
-            } else {
-                Err(format!("Nieznany tryb udostępniania: {mode}"))
-            }
-        }
-    }
-}
-
-/// Sets the single-selector share mode; owner only. Modes:
-/// "private" | "org:read" | "org:write" | "group:<group_id>". Validation runs
-/// first; the delete + insert pair is one transaction and every statement
-/// re-checks ownership/liveness in its WHERE, so a malformed value or a race
-/// can never leave the note stripped of its shares.
-pub fn set_share_mode(ctx: &UserCtx, note_id: &str, mode: &str) -> Result<(), String> {
-    let insert_row = parse_share_mode(mode, &ctx.group_ids)?;
-
-    // Friendly error up front; the guards below stay authoritative.
-    let owner_check = sql_query_one(
-        "SELECT owner_user_id FROM notes WHERE id = ? AND deleted_at IS NULL",
-        &[SqlValue::String(note_id.to_string())],
-    )
-    .map_err(|e| format!("Błąd odczytu notatki: {e}"))?;
-    let owner = owner_check
-        .and_then(|r| r.first().and_then(|v| v.as_str()).map(str::to_string))
-        .ok_or_else(|| "Notatka nie istnieje.".to_string())?;
-    if owner != ctx.user_id {
-        return Err("Tylko właściciel może zmieniać udostępnianie.".to_string());
-    }
-
-    let guard = owner_guard_clause();
-    let guard_params = vec![
-        SqlValue::String(note_id.to_string()),
-        SqlValue::String(ctx.user_id.clone()),
-    ];
-
-    // The selector owns exactly the org/group rows; direct per-user shares
-    // (future sharing UI) are left untouched.
-    let mut delete_params = vec![SqlValue::String(note_id.to_string())];
-    delete_params.extend(guard_params.clone());
-    let mut stmts: Vec<(String, Vec<SqlValue>)> = vec![(
-        format!(
-            "DELETE FROM note_shares \
-             WHERE note_id = ? AND subject_type IN ('org', 'group') AND {guard}"
-        ),
-        delete_params,
-    )];
-
-    if let Some((subject_type, subject_id, access)) = insert_row {
-        let mut params = vec![
-            SqlValue::String(note_id.to_string()),
-            SqlValue::String(subject_type),
-            SqlValue::String(subject_id),
-            SqlValue::String(access),
-            SqlValue::String(ctx.user_id.clone()),
-            SqlValue::I64(now_unix()),
-        ];
-        params.extend(guard_params);
-        stmts.push((
-            format!(
-                "INSERT INTO note_shares \
-                 (note_id, subject_type, subject_id, access, created_by, created_at) \
-                 SELECT ?, ?, ?, ?, ?, ? WHERE {guard}"
-            ),
-            params,
-        ));
-    }
-
-    run_transaction(&stmts).map_err(|e| format!("Błąd zapisu udostępnienia: {e}"))
 }
 
 /// Soft delete; requires write access.
@@ -1284,6 +1175,451 @@ pub fn graph_links(ctx: &UserCtx, note_ids: &[String]) -> Vec<GraphLinkRow> {
 }
 
 // =============================================================================
+// Hybrid search read side (mockup n05). Every helper here applies
+// acl_read_clause (and liveness) BEFORE any row leaves the database — the
+// engine in search.rs ranks only ids returned by these functions.
+// =============================================================================
+
+/// Metadata + content prefix of an accessible note (search result card and
+/// the answer-prompt source).
+#[derive(Debug, Clone)]
+pub struct SearchNoteMeta {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub updated_at: i64,
+    pub owner_user_id: String,
+    /// Widest share on the note ("private" | "user" | "group" | "org").
+    pub scope: String,
+}
+
+fn search_meta_from_row(row: &[SqlValue]) -> Option<SearchNoteMeta> {
+    Some(SearchNoteMeta {
+        id: row.first().and_then(|v| v.as_str())?.to_string(),
+        title: row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        content: row.get(2).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        updated_at: row.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
+        owner_user_id: row.get(4).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        scope: row
+            .get(5)
+            .and_then(|v| v.as_str())
+            .unwrap_or("private")
+            .to_string(),
+    })
+}
+
+const SEARCH_META_COLUMNS: &str = "n.id, n.title, substr(n.content, 1, 4000), n.updated_at, \
+     n.owner_user_id, \
+     (SELECT CASE \
+        WHEN EXISTS (SELECT 1 FROM note_shares x WHERE x.note_id = n.id AND x.subject_type = 'org') THEN 'org' \
+        WHEN EXISTS (SELECT 1 FROM note_shares x WHERE x.note_id = n.id AND x.subject_type = 'group') THEN 'group' \
+        WHEN EXISTS (SELECT 1 FROM note_shares x WHERE x.note_id = n.id AND x.subject_type = 'user') THEN 'user' \
+        ELSE 'private' END)";
+
+/// Accessible-set filter of the search candidates: the returned map contains
+/// ONLY live notes passing acl_read + the scope chip. Candidates absent here
+/// never reach ranking. Placeholder order: candidate ids, acl, scope.
+pub fn search_notes_meta(
+    ctx: &UserCtx,
+    candidate_ids: &[String],
+    scope: &str,
+) -> Result<std::collections::HashMap<String, SearchNoteMeta>, String> {
+    let mut out = std::collections::HashMap::new();
+    if candidate_ids.is_empty() {
+        return Ok(out);
+    }
+    let acl = acl_read_clause(ctx.group_ids.len());
+    let (scope_sql, scope_params) = scope_clause(scope, ctx);
+    let sql = format!(
+        "SELECT {SEARCH_META_COLUMNS} FROM notes n \
+         WHERE n.id IN ({}) AND n.deleted_at IS NULL AND {acl}{scope_sql}",
+        placeholders(candidate_ids.len())
+    );
+    let mut params: Vec<SqlValue> = candidate_ids
+        .iter()
+        .map(|id| SqlValue::String(id.clone()))
+        .collect();
+    params.extend(acl_params(ctx));
+    params.extend(scope_params);
+    let rows = sql_query(&sql, &params).map_err(|e| format!("Błąd odczytu wyników: {e}"))?;
+    for r in &rows {
+        if let Some(meta) = search_meta_from_row(r) {
+            out.insert(meta.id.clone(), meta);
+        }
+    }
+    Ok(out)
+}
+
+/// LIKE fallback search (aliases unbound): accessible live notes matching the
+/// phrase in title or content, newest first.
+pub fn text_search_notes(
+    ctx: &UserCtx,
+    scope: &str,
+    query: &str,
+) -> Result<Vec<SearchNoteMeta>, String> {
+    let acl = acl_read_clause(ctx.group_ids.len());
+    let (scope_sql, scope_params) = scope_clause(scope, ctx);
+    let sql = format!(
+        "SELECT {SEARCH_META_COLUMNS} FROM notes n \
+         WHERE n.deleted_at IS NULL AND {acl}{scope_sql} \
+         AND (n.title LIKE ? ESCAPE '\\' OR n.content LIKE ? ESCAPE '\\') \
+         ORDER BY n.updated_at DESC LIMIT 30"
+    );
+    let mut params = acl_params(ctx);
+    params.extend(scope_params);
+    let pattern = format!("%{}%", escape_like(query.trim()));
+    params.push(SqlValue::String(pattern.clone()));
+    params.push(SqlValue::String(pattern));
+    let rows = sql_query(&sql, &params).map_err(|e| format!("Błąd wyszukiwania: {e}"))?;
+    Ok(rows.iter().filter_map(|r| search_meta_from_row(r)).collect())
+}
+
+/// Canonical entities whose name matches any query token, restricted to
+/// entities the reader can SEE (direct mention through a readable live note —
+/// the same rule as chips). Returns (id, name, entity_type).
+pub fn match_query_entities(
+    ctx: &UserCtx,
+    tokens: &[String],
+) -> Result<Vec<(String, String, String)>, String> {
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+    let acl = acl_read_clause(ctx.group_ids.len());
+    let name_like = tokens
+        .iter()
+        .map(|_| "e.name LIKE ? ESCAPE '\\'")
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    // Visibility: some live readable note mentions a row resolving to this
+    // canonical entity — the reader already knows the entity exists.
+    let sql = format!(
+        "SELECT DISTINCT e.id, e.name, e.entity_type FROM entities e \
+         WHERE e.canonical_id IS NULL AND ({name_like}) \
+         AND EXISTS (SELECT 1 FROM note_entities ne \
+                     JOIN entities a ON a.id = ne.entity_id \
+                     JOIN notes n ON n.id = ne.note_id \
+                     WHERE COALESCE(a.canonical_id, a.id) = e.id \
+                       AND n.deleted_at IS NULL AND {acl}) \
+         LIMIT 8"
+    );
+    let mut params: Vec<SqlValue> = tokens
+        .iter()
+        .map(|t| SqlValue::String(format!("%{}%", escape_like(t))))
+        .collect();
+    params.extend(acl_params(ctx));
+    let rows = sql_query(&sql, &params).map_err(|e| format!("Błąd dopasowania encji: {e}"))?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            Some((
+                r.first().and_then(|v| v.as_str())?.to_string(),
+                r.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                r.get(2).and_then(|v| v.as_str()).unwrap_or("other").to_string(),
+            ))
+        })
+        .collect())
+}
+
+/// Accessible live notes directly mentioning any of the given canonical
+/// entities: (note_id, entity_id, mention_count), strongest mention first.
+pub fn notes_mentioning_entities(
+    ctx: &UserCtx,
+    entity_ids: &[String],
+) -> Result<Vec<(String, String, i64)>, String> {
+    if entity_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let acl = acl_read_clause(ctx.group_ids.len());
+    let sql = format!(
+        "SELECT ne.note_id, COALESCE(e.canonical_id, e.id), MAX(ne.count) \
+         FROM note_entities ne \
+         JOIN entities e ON e.id = ne.entity_id \
+         JOIN notes n ON n.id = ne.note_id \
+         WHERE COALESCE(e.canonical_id, e.id) IN ({}) \
+           AND n.deleted_at IS NULL AND {acl} \
+         GROUP BY ne.note_id, COALESCE(e.canonical_id, e.id) \
+         ORDER BY MAX(ne.count) DESC LIMIT 40",
+        placeholders(entity_ids.len())
+    );
+    let mut params: Vec<SqlValue> = entity_ids
+        .iter()
+        .map(|id| SqlValue::String(id.clone()))
+        .collect();
+    params.extend(acl_params(ctx));
+    let rows = sql_query(&sql, &params).map_err(|e| format!("Błąd odczytu wzmianek: {e}"))?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            Some((
+                r.first().and_then(|v| v.as_str())?.to_string(),
+                r.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                r.get(2).and_then(|v| v.as_i64()).unwrap_or(1),
+            ))
+        })
+        .collect())
+}
+
+/// Accessible live notes linked to any of the given notes (second graph hop):
+/// (via_note_id, note_id, link_weight), strongest link first. The TARGET note
+/// carries the ACL — a link into an unreadable note never returns.
+pub fn notes_linked_to(
+    ctx: &UserCtx,
+    note_ids: &[String],
+) -> Result<Vec<(String, String, f64)>, String> {
+    if note_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let acl = acl_read_clause(ctx.group_ids.len());
+    let sql = format!(
+        "SELECT l.src_note_id, l.dst_note_id, MAX(l.weight) FROM note_links l \
+         JOIN notes n ON n.id = l.dst_note_id \
+         WHERE l.src_note_id IN ({}) AND n.deleted_at IS NULL AND {acl} \
+         GROUP BY l.src_note_id, l.dst_note_id \
+         ORDER BY MAX(l.weight) DESC LIMIT 40",
+        placeholders(note_ids.len())
+    );
+    let mut params: Vec<SqlValue> = note_ids
+        .iter()
+        .map(|id| SqlValue::String(id.clone()))
+        .collect();
+    params.extend(acl_params(ctx));
+    let rows = sql_query(&sql, &params).map_err(|e| format!("Błąd odczytu powiązań: {e}"))?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            Some((
+                r.first().and_then(|v| v.as_str())?.to_string(),
+                r.get(1).and_then(|v| v.as_str())?.to_string(),
+                r.get(2).and_then(value_f64).unwrap_or(0.0),
+            ))
+        })
+        .collect())
+}
+
+/// Accessible notes connected to an entity within one hop: direct mentions
+/// plus notes linked to a mentioning note (right-rail narrowing).
+pub fn notes_connected_to_entity(ctx: &UserCtx, entity_id: &str) -> Result<Vec<String>, String> {
+    let direct = notes_mentioning_entities(ctx, &[entity_id.to_string()])?;
+    let mut out: Vec<String> = direct.iter().map(|(id, _, _)| id.clone()).collect();
+    let linked = notes_linked_to(ctx, &out)?;
+    for (_, id, _) in linked {
+        if !out.iter().any(|x| x == &id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+// =============================================================================
+// Granular shares (mockup n03). The modal owns ALL note_shares rows of a note;
+// reads are owner-gated in the UI layer, writes re-check ownership in SQL.
+// =============================================================================
+
+/// One share row of a note.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShareEntry {
+    /// "user" | "group" | "org".
+    pub subject_type: String,
+    pub subject_id: String,
+    /// "read" | "write".
+    pub access: String,
+}
+
+/// All share rows of a note (readable by anyone who can read the note; the
+/// modal itself opens only for the owner). Rows whose subject no longer
+/// resolves in the directory (deactivated/removed user, deleted group) are
+/// skipped: seeding the modal draft with them would make the whole save fail
+/// validation later.
+pub fn note_shares_list(ctx: &UserCtx, note_id: &str) -> Result<Vec<ShareEntry>, String> {
+    if get_note(ctx, note_id)?.is_none() {
+        return Err("Notatka nie istnieje lub nie masz do niej dostępu.".to_string());
+    }
+    let rows = sql_query(
+        "SELECT subject_type, subject_id, access FROM note_shares \
+         WHERE note_id = ? ORDER BY subject_type, subject_id",
+        &[SqlValue::String(note_id.to_string())],
+    )
+    .map_err(|e| format!("Błąd odczytu udostępnień: {e}"))?;
+    let entries: Vec<ShareEntry> = rows
+        .iter()
+        .filter_map(|r| {
+            Some(ShareEntry {
+                subject_type: r.first().and_then(|v| v.as_str())?.to_string(),
+                subject_id: r.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                access: r.get(2).and_then(|v| v.as_str()).unwrap_or("read").to_string(),
+            })
+        })
+        .collect();
+    let (users, groups) = directory_id_sets()?;
+    let (kept, skipped) = partition_stale_shares(entries, &users, &groups);
+    for subject in &skipped {
+        log::info(&format!(
+            "notes: pomijam nieaktualne udostępnienie notatki {note_id} — podmiot {subject} nie istnieje w katalogu"
+        ));
+    }
+    Ok(kept)
+}
+
+/// Current directory id sets: ACTIVE users only + all visible groups. The
+/// host already filters inactive accounts out of `directory_users`, but the
+/// SDK exposes `is_active`, so this filters again rather than trusting that
+/// behavior to never change.
+fn directory_id_sets() -> Result<(Vec<String>, Vec<String>), String> {
+    let users: Vec<String> = directory_users()
+        .map_err(|e| format!("Błąd katalogu użytkowników: {e}"))?
+        .into_iter()
+        .filter(|u| u.is_active)
+        .map(|u| u.id)
+        .collect();
+    let groups: Vec<String> = tentaflow_addon_sdk::directory_groups()
+        .map_err(|e| format!("Błąd katalogu grup: {e}"))?
+        .into_iter()
+        .map(|g| g.id)
+        .collect();
+    Ok((users, groups))
+}
+
+/// Splits share rows into (still resolvable in the directory, skipped subject
+/// ids). Org rows carry no subject and always stay. Pure w.r.t. the injected
+/// id sets — unit-tested natively.
+pub fn partition_stale_shares(
+    entries: Vec<ShareEntry>,
+    user_ids: &[String],
+    group_ids: &[String],
+) -> (Vec<ShareEntry>, Vec<String>) {
+    let mut kept = Vec::with_capacity(entries.len());
+    let mut skipped = Vec::new();
+    for e in entries {
+        let resolvable = match e.subject_type.as_str() {
+            "user" => user_ids.iter().any(|u| u == &e.subject_id),
+            "group" => group_ids.iter().any(|g| g == &e.subject_id),
+            _ => true,
+        };
+        if resolvable {
+            kept.push(e);
+        } else {
+            skipped.push(format!("{}:{}", e.subject_type, e.subject_id));
+        }
+    }
+    (kept, skipped)
+}
+
+/// Validates a share draft against the directory: every user id must resolve
+/// to an ACTIVE account, every group id must exist, org rows are read-only,
+/// access values constrained. Pure w.r.t. the injected id sets — unit-tested
+/// natively (callers pass the active-only sets from `directory_id_sets`).
+pub fn validate_share_entries(
+    entries: &[ShareEntry],
+    user_ids: &[String],
+    group_ids: &[String],
+    owner_id: &str,
+) -> Result<(), String> {
+    for e in entries {
+        if !matches!(e.access.as_str(), "read" | "write") {
+            return Err(format!("Nieznany poziom dostępu: {}", e.access));
+        }
+        match e.subject_type.as_str() {
+            "user" => {
+                if e.subject_id == owner_id {
+                    return Err("Właściciel ma zawsze pełny dostęp — nie dodawaj go do listy.".into());
+                }
+                if !user_ids.iter().any(|u| u == &e.subject_id) {
+                    return Err(
+                        "Wybrany użytkownik nie istnieje w katalogu lub jest nieaktywny."
+                            .to_string(),
+                    );
+                }
+            }
+            "group" => {
+                if !group_ids.iter().any(|g| g == &e.subject_id) {
+                    return Err("Wybrana grupa nie istnieje w katalogu.".to_string());
+                }
+            }
+            "org" => {
+                if e.access != "read" {
+                    return Err("Udostępnienie całej organizacji jest tylko do odczytu.".into());
+                }
+                if !e.subject_id.is_empty() {
+                    return Err("Wpis organizacyjny nie może wskazywać podmiotu.".to_string());
+                }
+            }
+            other => return Err(format!("Nieznany typ podmiotu: {other}")),
+        }
+    }
+    // Duplicates would silently collapse on the PK — reject up front.
+    for (i, a) in entries.iter().enumerate() {
+        if entries[i + 1..]
+            .iter()
+            .any(|b| b.subject_type == a.subject_type && b.subject_id == a.subject_id)
+        {
+            return Err("Ten sam podmiot występuje na liście dwa razy.".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Replaces ALL shares of a note with the validated draft — owner only, one
+/// transaction, every statement re-checking ownership/liveness in its WHERE.
+pub fn replace_all_shares(
+    ctx: &UserCtx,
+    note_id: &str,
+    entries: &[ShareEntry],
+) -> Result<(), String> {
+    // Friendly error up front; the guards below stay authoritative.
+    let owner_check = sql_query_one(
+        "SELECT owner_user_id FROM notes WHERE id = ? AND deleted_at IS NULL",
+        &[SqlValue::String(note_id.to_string())],
+    )
+    .map_err(|e| format!("Błąd odczytu notatki: {e}"))?;
+    let owner = owner_check
+        .and_then(|r| r.first().and_then(|v| v.as_str()).map(str::to_string))
+        .ok_or_else(|| "Notatka nie istnieje.".to_string())?;
+    if owner != ctx.user_id {
+        return Err("Tylko właściciel może zmieniać udostępnianie.".to_string());
+    }
+
+    // The directory is fetched HERE, right before the transaction — never
+    // from the draft: a modal left open across a user deactivation or group
+    // deletion must fail validation wholesale, not persist stale subjects.
+    let (users, groups) = directory_id_sets()?;
+    validate_share_entries(entries, &users, &groups, &owner)?;
+
+    let guard = owner_guard_clause();
+    let guard_params = vec![
+        SqlValue::String(note_id.to_string()),
+        SqlValue::String(ctx.user_id.clone()),
+    ];
+    let now = now_unix();
+
+    let mut delete_params = vec![SqlValue::String(note_id.to_string())];
+    delete_params.extend(guard_params.clone());
+    let mut stmts: Vec<(String, Vec<SqlValue>)> = vec![(
+        format!("DELETE FROM note_shares WHERE note_id = ? AND {guard}"),
+        delete_params,
+    )];
+    for e in entries {
+        let mut params = vec![
+            SqlValue::String(note_id.to_string()),
+            SqlValue::String(e.subject_type.clone()),
+            SqlValue::String(e.subject_id.clone()),
+            SqlValue::String(e.access.clone()),
+            SqlValue::String(ctx.user_id.clone()),
+            SqlValue::I64(now),
+        ];
+        params.extend(guard_params.clone());
+        stmts.push((
+            format!(
+                "INSERT INTO note_shares \
+                 (note_id, subject_type, subject_id, access, created_by, created_at) \
+                 SELECT ?, ?, ?, ?, ?, ? WHERE {guard}"
+            ),
+            params,
+        ));
+    }
+    run_transaction(&stmts).map_err(|e| format!("Błąd zapisu udostępnień: {e}"))
+}
+
+// =============================================================================
 // Misc helpers
 // =============================================================================
 
@@ -1397,26 +1733,97 @@ mod tests {
     }
 
     #[test]
-    fn parse_share_mode_validates_before_any_mutation() {
+    fn share_entries_validate_directory_and_reject_junk() {
+        let users = vec!["u2".to_string(), "u3".to_string()];
         let groups = vec!["g1".to_string()];
-        assert_eq!(parse_share_mode("private", &groups).unwrap(), None);
-        assert_eq!(
-            parse_share_mode("org:read", &groups).unwrap(),
-            Some(("org".into(), "".into(), "read".into()))
+        let entry = |t: &str, s: &str, a: &str| ShareEntry {
+            subject_type: t.into(),
+            subject_id: s.into(),
+            access: a.into(),
+        };
+        // Valid draft: two users, one group, org read.
+        assert!(validate_share_entries(
+            &[
+                entry("user", "u2", "write"),
+                entry("user", "u3", "read"),
+                entry("group", "g1", "read"),
+                entry("org", "", "read"),
+            ],
+            &users,
+            &groups,
+            "u1",
+        )
+        .is_ok());
+        // Unknown user / group is rejected up front.
+        assert!(validate_share_entries(&[entry("user", "ghost", "read")], &users, &groups, "u1").is_err());
+        assert!(validate_share_entries(&[entry("group", "g9", "read")], &users, &groups, "u1").is_err());
+        // Owner never appears on their own list.
+        assert!(validate_share_entries(&[entry("user", "u1", "read")], &users, &groups, "u1").is_err());
+        // Org must be read-only and subject-less.
+        assert!(validate_share_entries(&[entry("org", "", "write")], &users, &groups, "u1").is_err());
+        assert!(validate_share_entries(&[entry("org", "x", "read")], &users, &groups, "u1").is_err());
+        // Unknown access / subject type.
+        assert!(validate_share_entries(&[entry("user", "u2", "admin")], &users, &groups, "u1").is_err());
+        assert!(validate_share_entries(&[entry("robot", "r1", "read")], &users, &groups, "u1").is_err());
+        // Duplicate subject collapses on the PK — rejected explicitly.
+        assert!(validate_share_entries(
+            &[entry("user", "u2", "read"), entry("user", "u2", "write")],
+            &users,
+            &groups,
+            "u1",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stale_shares_are_partitioned_out_with_their_subject_ids() {
+        let users = vec!["u2".to_string()];
+        let groups = vec!["g1".to_string()];
+        let entry = |t: &str, s: &str, a: &str| ShareEntry {
+            subject_type: t.into(),
+            subject_id: s.into(),
+            access: a.into(),
+        };
+        let (kept, skipped) = partition_stale_shares(
+            vec![
+                entry("user", "u2", "write"),
+                // Deactivated/removed user — absent from the active id set.
+                entry("user", "u_gone", "read"),
+                entry("group", "g1", "read"),
+                entry("group", "g_deleted", "write"),
+                // Org rows carry no subject and always stay.
+                entry("org", "", "read"),
+            ],
+            &users,
+            &groups,
         );
         assert_eq!(
-            parse_share_mode("org:write", &groups).unwrap(),
-            Some(("org".into(), "".into(), "write".into()))
+            kept,
+            vec![
+                entry("user", "u2", "write"),
+                entry("group", "g1", "read"),
+                entry("org", "", "read"),
+            ]
         );
         assert_eq!(
-            parse_share_mode("group:g1", &groups).unwrap(),
-            Some(("group".into(), "g1".into(), "read".into()))
+            skipped,
+            vec!["user:u_gone".to_string(), "group:g_deleted".to_string()]
         );
-        // Malformed / unauthorized values are rejected up front.
-        assert!(parse_share_mode("group:other", &groups).is_err());
-        assert!(parse_share_mode("group:", &groups).is_err());
-        assert!(parse_share_mode("owner:hax", &groups).is_err());
-        assert!(parse_share_mode("", &groups).is_err());
+        // Nothing stale → nothing skipped.
+        let (kept, skipped) =
+            partition_stale_shares(vec![entry("user", "u2", "read")], &users, &groups);
+        assert_eq!(kept.len(), 1);
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn search_meta_sql_paths_apply_read_acl_and_scope() {
+        let c = ctx(&["g1"]);
+        // The shared column set already carries the widest-scope CASE; the
+        // accessible-set query gates on acl_read + liveness.
+        assert!(SEARCH_META_COLUMNS.contains("ELSE 'private' END"));
+        let (scope_sql, _) = scope_clause("mine", &c);
+        assert!(scope_sql.contains("owner_user_id"));
     }
 
     #[test]
@@ -1589,16 +1996,15 @@ mod tests {
     }
 
     #[test]
-    fn widest_scope_and_share_mode_prefer_org_over_group() {
+    fn widest_scope_prefers_org_over_group_over_user() {
         let shares = vec![
+            ("user".to_string(), "u2".to_string(), "read".to_string()),
             ("group".to_string(), "g1".to_string(), "read".to_string()),
-            ("org".to_string(), "".to_string(), "write".to_string()),
+            ("org".to_string(), "".to_string(), "read".to_string()),
         ];
         assert_eq!(widest_scope(&shares), "org");
-        assert_eq!(share_mode(&shares), "org:write");
-        let only_group = vec![("group".to_string(), "g9".to_string(), "read".to_string())];
-        assert_eq!(share_mode(&only_group), "group:g9");
+        assert_eq!(widest_scope(&shares[..2]), "group");
+        assert_eq!(widest_scope(&shares[..1]), "user");
         assert_eq!(widest_scope(&[]), "private");
-        assert_eq!(share_mode(&[]), "private");
     }
 }

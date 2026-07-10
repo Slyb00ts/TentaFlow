@@ -574,6 +574,44 @@ pub fn auto_graph_ready() -> bool {
     })
 }
 
+/// Model alias used by the search view for the streamed answer synthesis.
+pub const ANSWER_ALIAS: &str = LLM_ALIAS;
+
+/// Embeds a search query with the notes-embeddings alias (same dimension
+/// contract as the chunk vectors).
+pub fn embed_query(text: &str) -> Result<Vec<f32>, String> {
+    let dim = ensure_embed_dim()?;
+    embed_text(text, dim)
+}
+
+/// kNN over the 'notes' chunk namespace aggregated per note: max similarity
+/// over all chunk hits, best first. NO ACL here — callers MUST intersect the
+/// result with an acl_read-filtered note set BEFORE ranking or disclosure.
+pub fn query_note_vectors(vector: &[f32], k: u32) -> Result<Vec<(String, f64)>, String> {
+    let hits = vector_search(NOTES_NS, vector, k, None, None, &["note_id"])
+        .map_err(|e| format!("query vector search: {e}"))?;
+    let mut best: Vec<(String, f64)> = Vec::new();
+    for hit in &hits {
+        let Some(note_id) = hit.fields.iter().find(|f| f.name == "note_id").and_then(|f| {
+            match &f.value {
+                VectorFieldValue::Str(s) => Some(s.clone()),
+                _ => None,
+            }
+        }) else {
+            continue;
+        };
+        // Cosine score is a DISTANCE (lower = closer) — rag convention.
+        let similarity = f64::from(1.0 - hit.score);
+        match best.iter_mut().find(|(id, _)| id == &note_id) {
+            Some((_, s)) if *s < similarity => *s = similarity,
+            Some(_) => {}
+            None => best.push((note_id, similarity)),
+        }
+    }
+    best.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(best)
+}
+
 // =============================================================================
 // Queue
 // =============================================================================

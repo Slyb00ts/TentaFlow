@@ -8,9 +8,13 @@
 // =============================================================================
 
 mod analysis;
+mod blocks;
 mod db;
+mod search;
 mod ui;
 mod ui_graph;
+mod ui_search;
+mod ui_share;
 
 use serde_json::{json, Value};
 use tentaflow_addon_sdk::{log, read_string, write_string};
@@ -126,6 +130,22 @@ pub extern "C" fn on_request(
             ui::adopt_action_epoch(epoch);
         }
         let result = ui::handle_ui_action(action_id, &params);
+        return write_response(out_ptr, out_cap, out_len_ptr, &result);
+    }
+
+    // Flow Builder blocks: tool "block.notes.*", params = FlowEnvelope JSON,
+    // the acting user is the flow execution's user (never system).
+    let request_user = request
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if let Some(block_type) = tool_name.strip_prefix("block.") {
+        let result = blocks::handle_flow_block(block_type, &params, request_user);
+        return write_response(out_ptr, out_cap, out_len_ptr, &result);
+    }
+
+    // LLM tools sharing the block handlers (search/create/append/related).
+    if let Some(result) = blocks::handle_tool(tool_name, &params, request_user) {
         return write_response(out_ptr, out_cap, out_len_ptr, &result);
     }
 

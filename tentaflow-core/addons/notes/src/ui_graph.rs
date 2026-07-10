@@ -877,8 +877,7 @@ pub fn app_title() -> Component {
     .expect("Heading encode")
 }
 
-/// Mode switch (Notatki / Graf). "Szukaj" lands with the search stage — a
-/// dead segment is worse than a missing one.
+/// Mode switch (Notatki / Graf / Szukaj).
 pub fn mode_switch() -> Component {
     let mut seg = SegmentedControl {
         bind_path: state_path("mode"),
@@ -893,6 +892,12 @@ pub fn mode_switch() -> Component {
                 value: SelectValue::Text("graph".to_string()),
                 label: Some(lit("Graf")),
                 icon: Some(icon(IconName::Branch)),
+                badge: None,
+            },
+            SegmentOption {
+                value: SelectValue::Text("search".to_string()),
+                label: Some(lit("Szukaj")),
+                icon: Some(icon(IconName::Search)),
                 badge: None,
             },
         ],

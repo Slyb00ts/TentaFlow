@@ -44,17 +44,17 @@ const SP_SCOPE: &str = "filters.scope";
 const SP_TITLE: &str = "note.title";
 const SP_CONTENT: &str = "note.content";
 const SP_TAGS: &str = "note.tags";
-const SP_SHARE: &str = "note.share_mode";
 const SP_SAVE_STATUS: &str = "editor.save_status";
 const SP_SAVE_ERROR: &str = "editor.save_error";
 const SP_SAVE_OK_VIS: &str = "editor.save_ok_visible";
 const SP_SAVE_ERR_VIS: &str = "editor.save_err_visible";
 const SP_CHAR_COUNT: &str = "editor.char_count";
 const SP_LINK_PICK: &str = "links.pick";
-// One shell hosts BOTH views (the host rejects a second PanelShell per open
+// One shell hosts ALL views (the host rejects a second PanelShell per open
 // panel); these booleans drive the state-bound visibility of each subtree.
 const SP_VIEW_NOTES: &str = "view.notes";
 const SP_VIEW_GRAPH: &str = "view.graph";
+pub(crate) const SP_VIEW_SEARCH: &str = "view.search";
 
 // Hard server-side input limits (client caps mirror them where the component
 // supports one). Values beyond a limit are rejected with a readable message
@@ -84,7 +84,7 @@ pub fn set_session_user(user_id: Option<&str>) {
     }
 }
 
-fn session_user() -> String {
+pub(crate) fn session_user() -> String {
     unsafe {
         #[allow(static_mut_refs)]
         SESSION_USER_ID
@@ -152,8 +152,16 @@ pub(crate) struct Session {
     pub active: String,
     /// Manual-link picker open in the links panel of the active note.
     pub link_picker: bool,
-    /// Active view: "notes" | "graph".
+    /// Active view: "notes" | "graph" | "search".
     pub mode: String,
+    /// Search view (mockup n05): committed query, scope chip and the active
+    /// graph narrowing (entity id + reader-visible name).
+    pub s_query: String,
+    pub s_scope: String,
+    pub s_narrow: String,
+    pub s_narrow_name: String,
+    /// Share modal open for the active note (mockup n03).
+    pub share_open: bool,
     // Graph view filters (mockup n02). Scope toggles / entity-type checkboxes
     // / sliders / selected node id.
     pub g_mine: bool,
@@ -185,6 +193,11 @@ impl Default for Session {
             active: String::new(),
             link_picker: false,
             mode: "notes".to_string(),
+            s_query: String::new(),
+            s_scope: "all".to_string(),
+            s_narrow: String::new(),
+            s_narrow_name: String::new(),
+            share_open: false,
             g_mine: true,
             g_shared: true,
             g_group: true,
@@ -217,6 +230,11 @@ pub(crate) fn load_session() -> Session {
             active: v["active"].as_str().unwrap_or("").to_string(),
             link_picker: v["link_picker"].as_bool().unwrap_or(false),
             mode: v["mode"].as_str().unwrap_or("notes").to_string(),
+            s_query: v["s_query"].as_str().unwrap_or("").to_string(),
+            s_scope: v["s_scope"].as_str().unwrap_or("all").to_string(),
+            s_narrow: v["s_narrow"].as_str().unwrap_or("").to_string(),
+            s_narrow_name: v["s_narrow_name"].as_str().unwrap_or("").to_string(),
+            share_open: v["share_open"].as_bool().unwrap_or(false),
             g_mine: v["g_mine"].as_bool().unwrap_or(d.g_mine),
             g_shared: v["g_shared"].as_bool().unwrap_or(d.g_shared),
             g_group: v["g_group"].as_bool().unwrap_or(d.g_group),
@@ -242,6 +260,11 @@ pub(crate) fn store_session(sess: &Session) {
         "active": sess.active,
         "link_picker": sess.link_picker,
         "mode": sess.mode,
+        "s_query": sess.s_query,
+        "s_scope": sess.s_scope,
+        "s_narrow": sess.s_narrow,
+        "s_narrow_name": sess.s_narrow_name,
+        "share_open": sess.share_open,
         "g_mine": sess.g_mine,
         "g_shared": sess.g_shared,
         "g_group": sess.g_group,
@@ -271,7 +294,11 @@ pub(crate) fn send(payload: &UiPayload) -> bool {
     render(payload).is_ok()
 }
 
-pub(crate) fn send_state_patch(ops: Vec<PatchOp>) {
+/// Sends a StatePatch; returns whether the host accepted it. The host
+/// validates panel ownership + epoch on every outbound frame, so `false`
+/// reliably means "this panel/epoch is gone" (closed or superseded) — the
+/// streaming loop uses that as its cancellation signal.
+pub(crate) fn send_state_patch(ops: Vec<PatchOp>) -> bool {
     let base = load_revision();
     let new = base + 1;
     let patch = StatePatch {
@@ -283,9 +310,11 @@ pub(crate) fn send_state_patch(ops: Vec<PatchOp>) {
         ops,
     };
     // Advance the per-(user, epoch) revision only when the host accepted it.
-    if send(&UiPayload::StatePatch(patch)) {
+    let accepted = send(&UiPayload::StatePatch(patch));
+    if accepted {
         store_revision(new);
     }
+    accepted
 }
 
 pub(crate) fn send_slot(slot_id: &str, fragment: Component, overlay: Option<Vec<StateEntry>>) {
@@ -330,7 +359,7 @@ pub(crate) fn icon(name: IconName) -> IconRef {
 /// Accessible name for label-less form components — the form renderers REJECT
 /// SearchBox / Input / Textarea without one and the whole SlotContent is
 /// dropped (tentavision pattern).
-fn with_a11y_label(mut component: Component, label: &str) -> Component {
+pub(crate) fn with_a11y_label(mut component: Component, label: &str) -> Component {
     component.a11y = Some(Accessibility {
         label: Some(lit(label)),
         ..Default::default()
@@ -339,7 +368,7 @@ fn with_a11y_label(mut component: Component, label: &str) -> Component {
 }
 
 /// Reactive visibility bound to a boolean state path (`false` hides).
-fn with_visible_bound(mut component: Component, path: &str) -> Component {
+pub(crate) fn with_visible_bound(mut component: Component, path: &str) -> Component {
     component.visibility = Some(Visibility {
         visible: Some(bound(path)),
         display_above_breakpoint: None,
@@ -547,11 +576,18 @@ pub fn send_panel_shell() {
     .into_component("split-grow")
     .expect("Box encode");
 
-    // Both view subtrees live in the ONE shell; visibility bound to the mode.
+    // All view subtrees live in the ONE shell; visibility bound to the mode.
+    // The search RESULTS live in their own slot (its container sits at the
+    // shell root, so the fragment binds its own visibility) — only the hero
+    // is part of this subtree.
     let notes_view = with_visible_bound(split_grow, SP_VIEW_NOTES);
     let graph_view = with_visible_bound(
         crate::ui_graph::graph_view_component(),
         SP_VIEW_GRAPH,
+    );
+    let search_hero = with_visible_bound(
+        crate::ui_search::search_hero_component(),
+        SP_VIEW_SEARCH,
     );
 
     let layout = Flex {
@@ -560,7 +596,7 @@ pub fn send_panel_shell() {
         justify: FlexJustify::Start,
         align: FlexAlign::Stretch,
         wrap: FlexWrap::NoWrap,
-        children: vec![topbar(), notes_view, graph_view],
+        children: vec![topbar(), notes_view, graph_view, search_hero],
         padding: None,
         background: None,
         radius: None,
@@ -579,6 +615,12 @@ pub fn send_panel_shell() {
         path: state_path(SP_VIEW_GRAPH),
         value: CborValue::Bool(false),
     });
+    initial_state.push(StateEntry {
+        path: state_path(SP_VIEW_SEARCH),
+        value: CborValue::Bool(false),
+    });
+    initial_state.extend(crate::ui_search::initial_search_state());
+    initial_state.extend(crate::ui_share::initial_share_state());
 
     let shell = PanelShell {
         addon_id: ADDON_ID.into(),
@@ -589,6 +631,26 @@ pub fn send_panel_shell() {
             slot_decl(SLOT_LIST, SlotSemantics::SidePanel),
             slot_decl(SLOT_MAIN, SlotSemantics::MainContent),
             slot_decl(crate::ui_graph::SLOT_DETAIL, SlotSemantics::SidePanel),
+            slot_decl(crate::ui_search::SLOT_RESULTS, SlotSemantics::MainContent),
+            // Share-modal body/footer: Modal + Hidden — the declaration
+            // satisfies slot ownership while the real containers are created
+            // dynamically by the Modal (tentavision pattern).
+            SlotDecl {
+                id: crate::ui_share::SLOT_SHARE_BODY.into(),
+                semantics: SlotSemantics::Modal,
+                default_state: SlotDefault::Empty,
+                cache_policy: CachePolicy::None,
+                visibility: SlotVisibility::Hidden,
+                max_payload_bytes: None,
+            },
+            SlotDecl {
+                id: crate::ui_share::SLOT_SHARE_FOOT.into(),
+                semantics: SlotSemantics::Modal,
+                default_state: SlotDefault::Empty,
+                cache_policy: CachePolicy::None,
+                visibility: SlotVisibility::Hidden,
+                max_payload_bytes: None,
+            },
         ],
         initial_state: vec![
             StateEntry {
@@ -614,10 +676,6 @@ pub fn send_panel_shell() {
             StateEntry {
                 path: state_path(SP_TAGS),
                 value: CborValue::Array(vec![]),
-            },
-            StateEntry {
-                path: state_path(SP_SHARE),
-                value: CborValue::Text("private".into()),
             },
             StateEntry {
                 path: state_path(SP_SAVE_STATUS),
@@ -950,7 +1008,11 @@ fn note_card(index: usize, note: &NoteSummary, active_id: &str) -> Component {
 // =============================================================================
 
 pub fn send_main(ctx: &UserCtx, note: Option<&NoteDetail>) {
-    let gen = load_session().editor_gen;
+    let sess = load_session();
+    let gen = sess.editor_gen;
+    // The share Modal mounts inside this slot's tree while open (owner only);
+    // its body/footer arrive separately through the dynamic Modal slots.
+    let share_open = sess.share_open && note.map(|n| n.is_owner).unwrap_or(false);
     let (editor, overlay) = match note {
         Some(n) => (editor_fragment(ctx, n, gen), editor_overlay(n)),
         None => (empty_editor_fragment(), empty_editor_overlay()),
@@ -1011,13 +1073,17 @@ pub fn send_main(ctx: &UserCtx, note: Option<&NoteDetail>) {
     .into_component("links-pane")
     .expect("Box encode");
 
+    let mut row_children = vec![editor_col, links_col];
+    if share_open {
+        row_children.push(crate::ui_share::share_modal_component());
+    }
     let fragment = Flex {
         direction: FlexDirection::Row,
         gap: Spacing::Md,
         justify: FlexJustify::Start,
         align: FlexAlign::Stretch,
         wrap: FlexWrap::NoWrap,
-        children: vec![editor_col, links_col],
+        children: row_children,
         padding: None,
         background: None,
         radius: None,
@@ -1080,10 +1146,6 @@ fn editor_overlay(n: &NoteDetail) -> Vec<StateEntry> {
         StateEntry {
             path: state_path(SP_TAGS),
             value: CborValue::Array(n.tags.iter().map(|t| CborValue::Text(t.clone())).collect()),
-        },
-        StateEntry {
-            path: state_path(SP_SHARE),
-            value: CborValue::Text(n.share_mode.clone()),
         },
         StateEntry {
             path: state_path(SP_CHAR_COUNT),
@@ -1319,87 +1381,10 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail, gen: i64) -> Component {
     .into_component("editor-meta-left-grow")
     .expect("Box encode");
 
+    // Mockup n03: owners get a compact "Udostępnij" button with an avatar
+    // group of the current sharers; readers see the scope badge.
     let share_control: Component = if n.is_owner {
-        let mut options = vec![
-            SelectOption {
-                value: SelectValue::Text("private".into()),
-                label: lit("Prywatna"),
-                icon: Some(icon(IconName::Lock)),
-                disabled: false,
-                group_id: None,
-                description: None,
-            },
-            SelectOption {
-                value: SelectValue::Text("org:read".into()),
-                label: lit("Organizacja — odczyt"),
-                icon: Some(icon(IconName::Users)),
-                disabled: false,
-                group_id: None,
-                description: None,
-            },
-            SelectOption {
-                value: SelectValue::Text("org:write".into()),
-                label: lit("Organizacja — edycja"),
-                icon: Some(icon(IconName::Users)),
-                disabled: false,
-                group_id: None,
-                description: None,
-            },
-        ];
-        for (gid, name) in db::group_names(&ctx.group_ids) {
-            options.push(SelectOption {
-                value: SelectValue::Text(format!("group:{gid}")),
-                label: lit(format!("Grupa: {name} — odczyt")),
-                icon: Some(icon(IconName::Users)),
-                disabled: false,
-                group_id: None,
-                description: None,
-            });
-        }
-        // Compact control without a stacked label (mockup: small share pill).
-        let mut select = with_a11y_label(
-            Select {
-                bind_path: state_path(SP_SHARE),
-                options,
-                placeholder: None,
-                label: None,
-                searchable: false,
-                clearable: false,
-                virtualize: false,
-                disabled: None,
-                size: InputSize::Sm,
-                groups: None,
-            }
-            .into_component("share-select")
-            .expect("Select encode"),
-            "Udostępnij",
-        );
-        select.handlers = Some(backend_params(
-            EventKind::Change,
-            "set_share",
-            vec![
-                ("note_id", CborValue::Text(n.id.clone())),
-                ("egen", CborValue::Text(gen.to_string())),
-            ],
-        ));
-        // Keep the control pill-sized (mockup btn-share) — without the wrapper
-        // the select stretches to the full row width.
-        ui::Box {
-            width: Some(DimensionToken::Px { value: 220 }),
-            grow: None,
-            align_self: None,
-            padding: None,
-            margin: None,
-            children: vec![select],
-            style: None,
-            direction: Some(FlexDirection::Column),
-            gap: None,
-            align: Some(FlexAlign::Stretch),
-            justify: None,
-            responsive: None,
-        }
-        .into_component("share-wrap")
-        .expect("Box encode")
+        crate::ui_share::share_button(&n.id, &n.shares)
     } else {
         scope_badge("editor-scope-badge", &n.scope)
     };
@@ -2289,7 +2274,6 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
         "open_note" => action_open_note(&ctx, params),
         "save_note" => action_save_note(&ctx, params),
         "save_tags" => action_save_tags(&ctx, params),
-        "set_share" => action_set_share(&ctx, params),
         "delete_note" => action_delete_note(&ctx, params),
         "set_filter" => action_set_filter(&ctx, params),
         "set_search" => action_set_search(&ctx, params),
@@ -2300,7 +2284,20 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
         "manual_link_close" => action_link_picker(&ctx, false),
         "manual_link_add" => action_manual_link_add(&ctx, params),
         "set_mode" => action_set_mode(&ctx, params),
-        "graph_open_note" => action_graph_open_note(&ctx, params),
+        "run_search" => crate::ui_search::action_run_search(&ctx, params),
+        "search_scope" => crate::ui_search::action_search_scope(&ctx, params),
+        "search_narrow" => crate::ui_search::action_search_narrow(&ctx, params),
+        "search_narrow_clear" => crate::ui_search::action_search_narrow_clear(&ctx),
+        "search_open_note" => crate::ui_search::action_search_open_note(&ctx, params),
+        "share_open" => crate::ui_share::action_share_open(&ctx, params),
+        "share_close" => crate::ui_share::action_share_close(&ctx),
+        "share_suggest" => crate::ui_share::action_share_suggest(&ctx, params),
+        "share_pick" => crate::ui_share::action_share_pick(&ctx, params),
+        "share_remove" => crate::ui_share::action_share_remove(&ctx, params),
+        "share_access" => crate::ui_share::action_share_access(&ctx, params),
+        "share_org" => crate::ui_share::action_share_org(&ctx, params),
+        "share_save" => crate::ui_share::action_share_save(&ctx),
+        "graph_open_note" => open_note_from_other_view(&ctx, params),
         "graph_scope" => {
             let mut sess = load_session();
             crate::ui_graph::action_graph_scope(&ctx, &mut sess, params)
@@ -2334,7 +2331,7 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
     // excluded as the highest-frequency action. Heavy lifting (LLM/embed) runs
     // as host calls and does not burn wasm fuel — the in-wasm work (chunking,
     // JSON parsing) is far below the 200M fuel budget.
-    if action_id != "set_search" {
+    if !matches!(action_id, "set_search" | "run_search" | "search_scope" | "share_suggest") {
         let processed = analysis::process_queue(1);
         if !processed.is_empty() {
             let sess = load_session();
@@ -2378,6 +2375,7 @@ fn push_view_visibility(mode: &str) {
     send_state_patch(vec![
         set(SP_VIEW_NOTES, mode == "notes"),
         set(SP_VIEW_GRAPH, mode == "graph"),
+        set(SP_VIEW_SEARCH, mode == "search"),
         PatchOp {
             path: state_path("mode"),
             op: PatchOpKind::Set {
@@ -2394,6 +2392,7 @@ fn action_set_mode(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
     let mode = match params.get("value").and_then(|v| v.as_str()) {
         Some("graph") => "graph",
         Some("notes") => "notes",
+        Some("search") => "search",
         other => {
             return json!({"ok": false, "error": format!("Nieznany tryb: {other:?}")});
         }
@@ -2404,6 +2403,8 @@ fn action_set_mode(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
     }
     sess.mode = mode.to_string();
     store_session(&sess);
+    // Any view change supersedes an in-flight answer stream.
+    crate::ui_search::bump_generation();
     push_view_visibility(mode);
     if mode == "graph" {
         return crate::ui_graph::refresh_after_change(ctx, &mut sess);
@@ -2411,9 +2412,11 @@ fn action_set_mode(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
     json!({"ok": true})
 }
 
-/// "Otwórz notatkę" in the graph detail rail: jumps to the notes view with
-/// that note active.
-fn action_graph_open_note(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
+/// "Otwórz notatkę" from another view (graph detail rail, search results):
+/// jumps to the notes view with that note active. Also flips the segmented
+/// control back to Notatki (bound "mode" path) and supersedes any in-flight
+/// answer stream.
+pub(crate) fn open_note_from_other_view(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
     let note_id = match param_str(params, "note_id") {
         Some(id) => id.to_string(),
         None => return json!({"ok": false, "error": "Brak note_id"}),
@@ -2422,7 +2425,7 @@ fn action_graph_open_note(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
     sess.mode = "notes".to_string();
     sess.active = note_id.clone();
     store_session(&sess);
-    // Also flips the segmented control back to Notatki (bound "mode" path).
+    crate::ui_search::bump_generation();
     push_view_visibility("notes");
     open_active(ctx, &note_id);
     json!({"ok": true})
@@ -2502,7 +2505,7 @@ fn action_manual_link_add(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
 
 /// Re-renders the main slot for the currently open note (links panel data
 /// changed outside the editor: merge decision, background analysis).
-fn refresh_active_main(ctx: &UserCtx) {
+pub(crate) fn refresh_active_main(ctx: &UserCtx) {
     let active = load_session().active;
     if active.is_empty() {
         return;
@@ -2528,8 +2531,9 @@ pub fn render_full(user_id: &str) {
         }
     }
     // The graph detail slot is declared in the same shell — give it its
-    // empty-selection content up front.
+    // empty-selection content up front. Same for the search results slot.
     crate::ui_graph::send_empty_detail();
+    crate::ui_search::send_search_placeholder();
 }
 
 fn param_str<'a>(params: &'a JsonValue, key: &str) -> Option<&'a str> {
@@ -2716,38 +2720,6 @@ fn action_save_tags(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
         Ok(()) => {
             analysis::enqueue(&note_id);
             feedback_ok("Zapisano · przed chwilą");
-            json!({"ok": true})
-        }
-        Err(e) => {
-            feedback_err(&e);
-            json!({"ok": false, "error": e})
-        }
-    }
-}
-
-fn action_set_share(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
-    let note_id = match param_str(params, "note_id") {
-        Some(id) => id.to_string(),
-        None => return json!({"ok": false, "error": "Brak note_id"}),
-    };
-    if let Some(dropped) = is_stale_note_action("set_share", &note_id, params) {
-        return dropped;
-    }
-    let mode = params
-        .get("value")
-        .and_then(|v| v.as_str())
-        .unwrap_or("private");
-    match db::set_share_mode(ctx, &note_id, mode) {
-        Ok(()) => {
-            let mut ops = save_feedback_ops(Some("Zapisano · przed chwilą"), None);
-            ops.push(PatchOp {
-                path: state_path(SP_SHARE),
-                op: PatchOpKind::Set {
-                    value: CborValue::Text(mode.to_string()),
-                },
-            });
-            send_state_patch(ops);
-            send_list(ctx);
             json!({"ok": true})
         }
         Err(e) => {
