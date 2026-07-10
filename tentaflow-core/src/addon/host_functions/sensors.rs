@@ -162,11 +162,17 @@ fn read_sensor_bytes(
 
 /// `imu_publish_v1(in_ptr, in_len) -> i32` — one canonical `ImuSample`.
 pub fn imu_publish_v1(mut caller: WasmCaller<'_, AddonState>, in_ptr: i32, in_len: i32) -> i32 {
-    let bytes =
-        match read_sensor_bytes(&mut caller, "sensor.imu", PERM_SENSOR_IMU, IMU_SAMPLE_LEN, in_ptr, in_len) {
-            Ok(b) => b,
-            Err(code) => return code,
-        };
+    let bytes = match read_sensor_bytes(
+        &mut caller,
+        "sensor.imu",
+        PERM_SENSOR_IMU,
+        IMU_SAMPLE_LEN,
+        in_ptr,
+        in_len,
+    ) {
+        Ok(b) => b,
+        Err(code) => return code,
+    };
     let device_id = caller.data().addon_id.clone();
     if !feed_imu(&device_id, &bytes) {
         audit(caller.data(), "sensor.imu", "error", Some("bad_sample"));
@@ -177,11 +183,17 @@ pub fn imu_publish_v1(mut caller: WasmCaller<'_, AddonState>, in_ptr: i32, in_le
 
 /// `gnss_publish_v1(in_ptr, in_len) -> i32` — one canonical `GnssFix`.
 pub fn gnss_publish_v1(mut caller: WasmCaller<'_, AddonState>, in_ptr: i32, in_len: i32) -> i32 {
-    let bytes =
-        match read_sensor_bytes(&mut caller, "sensor.gps", PERM_SENSOR_GPS, GNSS_FIX_LEN, in_ptr, in_len) {
-            Ok(b) => b,
-            Err(code) => return code,
-        };
+    let bytes = match read_sensor_bytes(
+        &mut caller,
+        "sensor.gps",
+        PERM_SENSOR_GPS,
+        GNSS_FIX_LEN,
+        in_ptr,
+        in_len,
+    ) {
+        Ok(b) => b,
+        Err(code) => return code,
+    };
     let device_id = caller.data().addon_id.clone();
     if !feed_gnss(&device_id, &bytes) {
         audit(caller.data(), "sensor.gps", "error", Some("bad_fix"));
@@ -192,11 +204,17 @@ pub fn gnss_publish_v1(mut caller: WasmCaller<'_, AddonState>, in_ptr: i32, in_l
 
 /// `baro_publish_v1(in_ptr, in_len) -> i32` — one canonical `BaroSample`.
 pub fn baro_publish_v1(mut caller: WasmCaller<'_, AddonState>, in_ptr: i32, in_len: i32) -> i32 {
-    let bytes =
-        match read_sensor_bytes(&mut caller, "sensor.baro", PERM_SENSOR_BARO, BARO_SAMPLE_LEN, in_ptr, in_len) {
-            Ok(b) => b,
-            Err(code) => return code,
-        };
+    let bytes = match read_sensor_bytes(
+        &mut caller,
+        "sensor.baro",
+        PERM_SENSOR_BARO,
+        BARO_SAMPLE_LEN,
+        in_ptr,
+        in_len,
+    ) {
+        Ok(b) => b,
+        Err(code) => return code,
+    };
     let device_id = caller.data().addon_id.clone();
     if !feed_baro(&device_id, &bytes) {
         audit(caller.data(), "sensor.baro", "error", Some("bad_sample"));
@@ -217,10 +235,12 @@ pub fn mobile_sensor_drain_v1(caller: WasmCaller<'_, AddonState>) -> i32 {
     for (kind, bytes) in samples {
         let ok = match kind {
             SENSOR_KIND_IMU => {
-                check_permission(caller.data(), PERM_SENSOR_IMU, None) && feed_imu(&device_id, &bytes)
+                check_permission(caller.data(), PERM_SENSOR_IMU, None)
+                    && feed_imu(&device_id, &bytes)
             }
             SENSOR_KIND_GNSS => {
-                check_permission(caller.data(), PERM_SENSOR_GPS, None) && feed_gnss(&device_id, &bytes)
+                check_permission(caller.data(), PERM_SENSOR_GPS, None)
+                    && feed_gnss(&device_id, &bytes)
             }
             SENSOR_KIND_BARO => {
                 check_permission(caller.data(), PERM_SENSOR_BARO, None)
@@ -236,7 +256,8 @@ pub fn mobile_sensor_drain_v1(caller: WasmCaller<'_, AddonState>) -> i32 {
             }
             // Magnetometer rides the IMU grant (an orientation/inertial aid).
             SENSOR_KIND_MAG => {
-                check_permission(caller.data(), PERM_SENSOR_IMU, None) && feed_mag(&device_id, &bytes)
+                check_permission(caller.data(), PERM_SENSOR_IMU, None)
+                    && feed_mag(&device_id, &bytes)
             }
             _ => false,
         };

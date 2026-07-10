@@ -2,11 +2,11 @@
 // File: protocol/ui/layout/cards.rs — Card/SectionCard/Collapsible/Accordion (catalog §3)
 // =============================================================================
 
+use super::super::super::value::Value;
+use super::super::actions::Button;
 use super::super::bind::BindRef;
 use super::super::component::{Component, FieldMap};
-use super::super::inline::{
-    AccordionItem, BorderToken,
-};
+use super::super::inline::{AccordionItem, BorderToken};
 use super::super::tokens::{
     AccordionMode, BackgroundToken, CardVariant, RadiusToken, ShadowToken, Tone,
 };
@@ -14,12 +14,19 @@ use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_ref_tag_decode,
     ensure_ref_tag_encode, ensure_tag, missing_field, unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
-use super::super::actions::Button;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -55,7 +62,9 @@ impl Card {
         entries.push((4, encode_to_value(&self.shadow)?));
         entries.push((5, encode_to_value(&self.border)?));
         entries.push((6, encode_to_value(&self.background)?));
-        if let Some(a) = &self.accent { entries.push((7, encode_to_value(a)?)); }
+        if let Some(a) = &self.accent {
+            entries.push((7, encode_to_value(a)?));
+        }
         entries.push((8, encode_to_value(&self.children)?));
         entries.push((9, encode_to_value(&self.interactive)?));
         entries.push((10, encode_to_value(&self.clickable)?));
@@ -146,11 +155,15 @@ impl SectionCard {
         }
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(14);
         entries.push((0, encode_to_value(&self.title)?));
-        if let Some(s) = &self.subtitle { entries.push((1, encode_to_value(s)?)); }
+        if let Some(s) = &self.subtitle {
+            entries.push((1, encode_to_value(s)?));
+        }
         entries.push((2, encode_to_value(&self.header_actions)?));
         entries.push((3, encode_to_value(&self.header_divider)?));
         entries.push((4, encode_to_value(&self.body)?));
-        if let Some(f) = &self.footer { entries.push((5, encode_to_value(f)?)); }
+        if let Some(f) = &self.footer {
+            entries.push((5, encode_to_value(f)?));
+        }
         entries.push((6, encode_to_value(&self.padding)?));
         entries.push((7, encode_to_value(&self.gap)?));
         entries.push((8, encode_to_value(&self.variant)?));
@@ -158,7 +171,9 @@ impl SectionCard {
         entries.push((10, encode_to_value(&self.shadow)?));
         entries.push((11, encode_to_value(&self.border)?));
         entries.push((12, encode_to_value(&self.background)?));
-        if let Some(a) = &self.accent { entries.push((13, encode_to_value(a)?)); }
+        if let Some(a) = &self.accent {
+            entries.push((13, encode_to_value(a)?));
+        }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -206,7 +221,8 @@ impl SectionCard {
             title: title.ok_or_else(|| missing_field("SectionCard", "title"))?,
             subtitle,
             header_actions,
-            header_divider: header_divider.ok_or_else(|| missing_field("SectionCard", "header_divider"))?,
+            header_divider: header_divider
+                .ok_or_else(|| missing_field("SectionCard", "header_divider"))?,
             body: body.unwrap_or_default(),
             footer,
             // §3 0x0107 defaults: padding="lg", gap="md", radius="lg", shadow="subtle".
@@ -314,4 +330,3 @@ impl Accordion {
         })
     }
 }
-

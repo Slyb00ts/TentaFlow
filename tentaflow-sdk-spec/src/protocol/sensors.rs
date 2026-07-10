@@ -92,7 +92,10 @@ impl ImuSample {
 
     /// All numeric fields finite — the engine drops a sample that fails this.
     pub fn is_finite(&self) -> bool {
-        self.accel.iter().chain(self.gyro.iter()).all(|v| v.is_finite())
+        self.accel
+            .iter()
+            .chain(self.gyro.iter())
+            .all(|v| v.is_finite())
             && self.accel_noise_std.is_finite()
             && self.gyro_noise_std.is_finite()
     }
@@ -327,7 +330,10 @@ impl PoseSample {
     }
 
     pub fn is_finite(&self) -> bool {
-        self.position.iter().chain(self.quat_xyzw.iter()).all(|v| v.is_finite())
+        self.position
+            .iter()
+            .chain(self.quat_xyzw.iter())
+            .all(|v| v.is_finite())
     }
 }
 
@@ -361,7 +367,10 @@ mod tests {
         let mut nan = s;
         nan.accel[0] = f32::NAN;
         assert!(!nan.is_finite());
-        assert_eq!(ImuSample::decode(&nan.encode()).map(|d| d.is_finite()), Some(false));
+        assert_eq!(
+            ImuSample::decode(&nan.encode()).map(|d| d.is_finite()),
+            Some(false)
+        );
     }
 
     #[test]

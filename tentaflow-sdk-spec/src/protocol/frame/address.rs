@@ -51,8 +51,9 @@ impl<C> Encode<C> for NodeAddressKind {
 impl<'b, C> Decode<'b, C> for NodeAddressKind {
     fn decode(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
         let raw = d.u8()?;
-        Self::from_u8(raw)
-            .ok_or_else(|| minicbor::decode::Error::message("NodeAddressKind: unknown discriminant"))
+        Self::from_u8(raw).ok_or_else(|| {
+            minicbor::decode::Error::message("NodeAddressKind: unknown discriminant")
+        })
     }
 }
 

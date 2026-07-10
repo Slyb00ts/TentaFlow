@@ -23,9 +23,7 @@ use std::sync::Mutex;
 
 use ed25519_dalek::SigningKey;
 
-use super::aead::{
-    compute_aad, encrypt_body, AeadKey, NonceCounter, AEAD_NONCE_LEN, AEAD_TAG_LEN,
-};
+use super::aead::{compute_aad, encrypt_body, AeadKey, NonceCounter, AEAD_NONCE_LEN, AEAD_TAG_LEN};
 use super::compress::compress_body;
 use super::envelope::{Envelope, MessageId};
 use super::error::{FrameError, FrameErrorCode};
@@ -355,16 +353,16 @@ impl ReassemblyManager {
         // outer lock for the whole accept call — concurrent fragments for
         // DIFFERENT keys serialise behind it briefly, which is acceptable for
         // the small critical sections involved.
-        let mut outer = self.buffers.lock().expect("reassembly outer mutex poisoned");
+        let mut outer = self
+            .buffers
+            .lock()
+            .expect("reassembly outer mutex poisoned");
 
         // Opportunistic timeout sweep — drop any buffer whose first fragment
         // arrived more than `reassembly_timeout_ms` ago.
         let timeout = self.reassembly_timeout_ms;
         outer.retain(|_k, buf_mutex| {
-            let first = buf_mutex
-                .lock()
-                .map(|b| b.first_seen_ms)
-                .unwrap_or(now_ms);
+            let first = buf_mutex.lock().map(|b| b.first_seen_ms).unwrap_or(now_ms);
             now_ms.saturating_sub(first) <= timeout
         });
 
@@ -516,8 +514,7 @@ pub fn finalize_reassembled_envelope(
             )
         })?;
         let aad = compute_aad(envelope)?;
-        let plaintext =
-            super::aead::decrypt_body(&envelope.body, key, &aad)?;
+        let plaintext = super::aead::decrypt_body(&envelope.body, key, &aad)?;
         envelope.body = plaintext;
     }
 
@@ -547,9 +544,7 @@ mod tests {
     use crate::protocol::frame::auth::Auth;
     use crate::protocol::frame::channel::{channels, Kind};
     use crate::protocol::frame::compress::decompress_body;
-    use crate::protocol::frame::envelope::{
-        MessageId, Priority, MESSAGE_ID_LEN, NODE_ID_LEN,
-    };
+    use crate::protocol::frame::envelope::{MessageId, Priority, MESSAGE_ID_LEN, NODE_ID_LEN};
     use crate::protocol::frame::sign::{public_key_bytes, verify_envelope};
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
@@ -881,10 +876,7 @@ mod tests {
         // Confirm a genuinely new third fragment would be rejected by the cap.
         let r2 = mgr.accept_fragment(frags[2].clone(), 0);
         assert!(r2.is_err());
-        assert_eq!(
-            r2.unwrap_err().code,
-            FrameErrorCode::FragmentAssemblyError
-        );
+        assert_eq!(r2.unwrap_err().code, FrameErrorCode::FragmentAssemblyError);
     }
 
     #[test]
@@ -981,10 +973,7 @@ mod tests {
         frags[0].body = b"XXXXXXXX".to_vec();
         let r = mgr.accept_fragment(frags[0].clone(), 0);
         assert!(r.is_err());
-        assert_eq!(
-            r.unwrap_err().code,
-            FrameErrorCode::FragmentAssemblyError
-        );
+        assert_eq!(r.unwrap_err().code, FrameErrorCode::FragmentAssemblyError);
         assert_eq!(mgr.buffer_count(), 0, "conflict evicts buffer");
     }
 
@@ -1020,7 +1009,9 @@ mod tests {
             channels::STREAM,
             Kind(0x0001),
             Priority::Normal,
-            Flags::NONE.with(Flags::IS_FRAGMENT).with(Flags::IS_LAST_FRAGMENT),
+            Flags::NONE
+                .with(Flags::IS_FRAGMENT)
+                .with(Flags::IS_LAST_FRAGMENT),
             MessageId(mid),
             0,
         );
@@ -1052,10 +1043,7 @@ mod tests {
         frags[1].fragment_count = Some(99);
         let r = mgr.accept_fragment(frags[1].clone(), 0);
         assert!(r.is_err());
-        assert_eq!(
-            r.unwrap_err().code,
-            FrameErrorCode::FragmentAssemblyError
-        );
+        assert_eq!(r.unwrap_err().code, FrameErrorCode::FragmentAssemblyError);
     }
 
     #[test]
@@ -1098,10 +1086,7 @@ mod tests {
         let _ = mgr.accept_fragment(frags[0].clone(), 0).unwrap();
         let r = mgr.accept_fragment(frags[1].clone(), 0);
         assert!(r.is_err());
-        assert_eq!(
-            r.unwrap_err().code,
-            FrameErrorCode::FragmentAssemblyError
-        );
+        assert_eq!(r.unwrap_err().code, FrameErrorCode::FragmentAssemblyError);
     }
 
     #[test]

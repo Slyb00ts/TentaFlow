@@ -2,21 +2,30 @@
 // File: protocol/ui/data/tables.rs — Table/List/Tree/EmptyCell (catalog §4)
 // =============================================================================
 
+use super::super::super::value::Value;
+use super::super::actions::Button;
 use super::super::bind::{BindRef, StatePath};
 use super::super::component::{Component, FieldMap};
 use super::super::inline::{TableColumn, TablePagination};
+use super::super::molecules::EmptyState;
 use super::super::tokens::{Density, EmptyCellVariant, TableSelectMode, TableVariant, TreeVariant};
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_ref_tag_decode,
     ensure_ref_tag_encode, ensure_tag, missing_field, unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
-use super::super::actions::Button;
-use super::super::molecules::EmptyState;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -70,18 +79,28 @@ impl Table {
         e.push((3, encode_to_value(&self.variant)?));
         e.push((4, encode_to_value(&self.density)?));
         e.push((5, encode_to_value(&self.sortable)?));
-        if let Some(s) = &self.sort_by { e.push((6, encode_to_value(s)?)); }
+        if let Some(s) = &self.sort_by {
+            e.push((6, encode_to_value(s)?));
+        }
         e.push((7, encode_to_value(&self.selectable)?));
-        if let Some(s) = &self.selected_ids { e.push((8, encode_to_value(s)?)); }
+        if let Some(s) = &self.selected_ids {
+            e.push((8, encode_to_value(s)?));
+        }
         e.push((9, encode_to_value(&self.sticky_header)?));
         e.push((10, encode_to_value(&self.sticky_columns)?));
-        if let Some(p) = &self.pagination { e.push((11, encode_to_value(p)?)); }
-        if let Some(es) = &self.empty_state { e.push((12, encode_to_value(es)?)); }
+        if let Some(p) = &self.pagination {
+            e.push((11, encode_to_value(p)?));
+        }
+        if let Some(es) = &self.empty_state {
+            e.push((12, encode_to_value(es)?));
+        }
         e.push((13, encode_to_value(&self.row_actions)?));
         e.push((14, encode_to_value(&self.bulk_actions)?));
         e.push((15, encode_to_value(&self.virtualize)?));
         e.push((16, encode_to_value(&self.row_expandable)?));
-        if let Some(t) = &self.expanded_row_template_id { e.push((17, encode_to_value(t)?)); }
+        if let Some(t) = &self.expanded_row_template_id {
+            e.push((17, encode_to_value(t)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
@@ -140,7 +159,8 @@ impl Table {
             selectable: selectable.ok_or_else(|| missing_field("Table", "selectable"))?,
             selected_ids,
             sticky_header: sticky_header.ok_or_else(|| missing_field("Table", "sticky_header"))?,
-            sticky_columns: sticky_columns.ok_or_else(|| missing_field("Table", "sticky_columns"))?,
+            sticky_columns: sticky_columns
+                .ok_or_else(|| missing_field("Table", "sticky_columns"))?,
             pagination,
             empty_state: {
                 let es: Option<Component> = empty_state;
@@ -164,7 +184,8 @@ impl Table {
                 v
             },
             virtualize: virtualize.ok_or_else(|| missing_field("Table", "virtualize"))?,
-            row_expandable: row_expandable.ok_or_else(|| missing_field("Table", "row_expandable"))?,
+            row_expandable: row_expandable
+                .ok_or_else(|| missing_field("Table", "row_expandable"))?,
             expanded_row_template_id,
         })
     }
@@ -200,8 +221,12 @@ impl List {
         e.push((2, encode_to_value(&self.divider)?));
         e.push((3, encode_to_value(&self.density)?));
         e.push((4, encode_to_value(&self.virtualize)?));
-        if let Some(es) = &self.empty_state { e.push((5, encode_to_value(es)?)); }
-        if let Some(m) = &self.max_visible { e.push((6, encode_to_value(m)?)); }
+        if let Some(es) = &self.empty_state {
+            e.push((5, encode_to_value(es)?));
+        }
+        if let Some(m) = &self.max_visible {
+            e.push((6, encode_to_value(m)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
@@ -229,7 +254,8 @@ impl List {
         }
         Ok(List {
             items_path: items_path.ok_or_else(|| missing_field("List", "items_path"))?,
-            item_template_id: item_template_id.ok_or_else(|| missing_field("List", "item_template_id"))?,
+            item_template_id: item_template_id
+                .ok_or_else(|| missing_field("List", "item_template_id"))?,
             divider: divider.ok_or_else(|| missing_field("List", "divider"))?,
             density: density.ok_or_else(|| missing_field("List", "density"))?,
             virtualize: virtualize.ok_or_else(|| missing_field("List", "virtualize"))?,
@@ -266,7 +292,9 @@ impl Tree {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(5);
         e.push((0, encode_to_value(&self.nodes_path)?));
         e.push((1, encode_to_value(&self.expanded_ids)?));
-        if let Some(s) = &self.selected_id { e.push((2, encode_to_value(s)?)); }
+        if let Some(s) = &self.selected_id {
+            e.push((2, encode_to_value(s)?));
+        }
         e.push((3, encode_to_value(&self.variant)?));
         e.push((4, encode_to_value(&self.lazy_load)?));
         Ok(component(Self::TAG, id, e))

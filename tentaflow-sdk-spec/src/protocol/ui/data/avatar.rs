@@ -2,20 +2,27 @@
 // File: protocol/ui/data/avatar.rs — Avatar/AvatarGroup (catalog §4)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::component::{Component, FieldMap};
 use super::super::inline::AvatarRef;
-use super::super::tokens::{
-    AvatarOverlap, AvatarShape, AvatarSize, AvatarStatus, Tone,
-};
+use super::super::tokens::{AvatarOverlap, AvatarShape, AvatarSize, AvatarStatus, Tone};
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_ref_tag_decode,
     ensure_ref_tag_encode, ensure_tag, missing_field, unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -39,8 +46,12 @@ impl Avatar {
         entries.push((0, encode_to_value(&self.source)?));
         entries.push((1, encode_to_value(&self.size)?));
         entries.push((2, encode_to_value(&self.shape)?));
-        if let Some(s) = &self.status { entries.push((3, encode_to_value(s)?)); }
-        if let Some(t) = &self.tone { entries.push((4, encode_to_value(t)?)); }
+        if let Some(s) = &self.status {
+            entries.push((3, encode_to_value(s)?));
+        }
+        if let Some(t) = &self.tone {
+            entries.push((4, encode_to_value(t)?));
+        }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -66,7 +77,8 @@ impl Avatar {
             source: source.ok_or_else(|| missing_field("Avatar", "source"))?,
             size: size.ok_or_else(|| missing_field("Avatar", "size"))?,
             shape: shape.ok_or_else(|| missing_field("Avatar", "shape"))?,
-            status, tone,
+            status,
+            tone,
         })
     }
 }
@@ -127,4 +139,3 @@ impl AvatarGroup {
         })
     }
 }
-

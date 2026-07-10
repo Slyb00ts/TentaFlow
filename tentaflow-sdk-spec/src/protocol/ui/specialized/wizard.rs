@@ -2,6 +2,7 @@
 // File: protocol/ui/specialized/wizard.rs — StepProgress (catalog §8 0x060F)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::StatePath;
 use super::super::component::{Component, FieldMap};
 use super::super::inline::StepDef;
@@ -10,11 +11,19 @@ use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 /// Visual stepper for wizards (catalog §8 0x060F).
@@ -41,8 +50,10 @@ impl StepProgress {
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "StepProgress")?;
         ensure_no_duplicate_keys("StepProgress", &c.fields.0)?;
-        let mut steps = None; let mut current_id_path = None;
-        let mut variant = None; let mut clickable_completed = None;
+        let mut steps = None;
+        let mut current_id_path = None;
+        let mut variant = None;
+        let mut clickable_completed = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => steps = Some(decode_from_value(v)?),
@@ -54,9 +65,11 @@ impl StepProgress {
         }
         Ok(StepProgress {
             steps: steps.ok_or_else(|| missing_field("StepProgress", "steps"))?,
-            current_id_path: current_id_path.ok_or_else(|| missing_field("StepProgress", "current_id_path"))?,
+            current_id_path: current_id_path
+                .ok_or_else(|| missing_field("StepProgress", "current_id_path"))?,
             variant: variant.ok_or_else(|| missing_field("StepProgress", "variant"))?,
-            clickable_completed: clickable_completed.ok_or_else(|| missing_field("StepProgress", "clickable_completed"))?,
+            clickable_completed: clickable_completed
+                .ok_or_else(|| missing_field("StepProgress", "clickable_completed"))?,
         })
     }
 }

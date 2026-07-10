@@ -229,7 +229,8 @@ pub fn llm_generate(
         };
 
         let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(router.route_embeddings_for_user(request, None))
+            tokio::runtime::Handle::current()
+                .block_on(router.route_embeddings_for_user(request, None))
         });
 
         let route_result = match result {
@@ -350,7 +351,11 @@ pub fn llm_generate(
                 );
             }
         }
-        if let Some(k) = opts.get("top_k").and_then(|v| v.as_u64()).filter(|n| *n > 0) {
+        if let Some(k) = opts
+            .get("top_k")
+            .and_then(|v| v.as_u64())
+            .filter(|n| *n > 0)
+        {
             flow_meta.insert("top_k".to_string(), serde_json::Value::from(k));
         }
         // Toggle opcjonalnego grafu: addon RAG wysyla `graph_enabled` (bool) przy ask,
@@ -383,7 +388,10 @@ pub fn llm_generate(
                 })
                 .collect();
             if !pairs.is_empty() {
-                flow_meta.insert("entity_aliases".to_string(), serde_json::Value::Array(pairs));
+                flow_meta.insert(
+                    "entity_aliases".to_string(),
+                    serde_json::Value::Array(pairs),
+                );
             }
         }
         // MemGraphRAG eq. 19 — Information Density seedow grafu (retrieval-side). Addon RAG
@@ -395,14 +403,23 @@ pub fn llm_generate(
             let entries: Vec<serde_json::Value> = arr
                 .iter()
                 .filter_map(|e| {
-                    let id = e.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty())?;
-                    let d = e.get("density").and_then(|v| v.as_f64()).filter(|x| x.is_finite())?;
+                    let id = e
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())?;
+                    let d = e
+                        .get("density")
+                        .and_then(|v| v.as_f64())
+                        .filter(|x| x.is_finite())?;
                     Some(serde_json::json!({ "id": id, "density": d.clamp(0.0, 1.0) }))
                 })
                 .take(ENTITY_DENSITY_META_CAP)
                 .collect();
             if !entries.is_empty() {
-                flow_meta.insert("entity_density".to_string(), serde_json::Value::Array(entries));
+                flow_meta.insert(
+                    "entity_density".to_string(),
+                    serde_json::Value::Array(entries),
+                );
             }
         }
     }

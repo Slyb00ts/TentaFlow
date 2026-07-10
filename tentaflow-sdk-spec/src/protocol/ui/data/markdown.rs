@@ -2,6 +2,7 @@
 // File: protocol/ui/data/markdown.rs — Markdown/DataDefinitionList/JsonViewer (catalog §4)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::{BindRef, StatePath};
 use super::super::component::{Component, FieldMap};
 use super::super::inline::DefItem;
@@ -10,11 +11,19 @@ use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -38,7 +47,9 @@ impl Markdown {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(4);
         e.push((0, encode_to_value(&self.content)?));
         e.push((1, encode_to_value(&self.allowed_features)?));
-        if let Some(h) = &self.max_height_px { e.push((2, encode_to_value(h)?)); }
+        if let Some(h) = &self.max_height_px {
+            e.push((2, encode_to_value(h)?));
+        }
         e.push((3, encode_to_value(&self.link_target)?));
         Ok(component(Self::TAG, id, e))
     }
@@ -153,7 +164,8 @@ impl JsonViewer {
             value_path: value_path.ok_or_else(|| missing_field("JsonViewer", "value_path"))?,
             // §4 0x0222 default: collapsed_depth = 2.
             collapsed_depth: collapsed_depth.unwrap_or(2),
-            max_height_px: max_height_px.ok_or_else(|| missing_field("JsonViewer", "max_height_px"))?,
+            max_height_px: max_height_px
+                .ok_or_else(|| missing_field("JsonViewer", "max_height_px"))?,
             searchable: searchable.ok_or_else(|| missing_field("JsonViewer", "searchable"))?,
         })
     }

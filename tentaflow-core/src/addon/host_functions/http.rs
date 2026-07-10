@@ -341,14 +341,20 @@ fn raw_http10_post(
         head.push_str(&format!("Content-Type: {content_type}\r\n"));
     }
     head.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
-    stream.write_all(head.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    stream
+        .write_all(head.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
     if !body.is_empty() {
-        stream.write_all(body).map_err(|e| format!("write body: {e}"))?;
+        stream
+            .write_all(body)
+            .map_err(|e| format!("write body: {e}"))?;
     }
     stream.flush().ok();
 
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).map_err(|e| format!("read: {e}"))?;
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("read: {e}"))?;
     let (idx, sep_len) = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -362,7 +368,9 @@ fn raw_http10_post(
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|c| c.parse::<u16>().ok())
         .unwrap_or(0);
-    let body_text = String::from_utf8_lossy(&raw[idx + sep_len..]).trim().to_string();
+    let body_text = String::from_utf8_lossy(&raw[idx + sep_len..])
+        .trim()
+        .to_string();
     Ok((status, body_text))
 }
 
@@ -382,7 +390,8 @@ pub fn http_raw_v1(
         Some(m) => m,
         None => return ABI_ERR_OPERATION,
     };
-    let request_str = match read_guest_string(&memory, &caller, request_json_ptr, request_json_len) {
+    let request_str = match read_guest_string(&memory, &caller, request_json_ptr, request_json_len)
+    {
         Some(s) => s.to_string(),
         None => return ABI_ERR_OPERATION,
     };
@@ -399,31 +408,62 @@ pub fn http_raw_v1(
         None => return ABI_ERR_PERMISSION,
     };
     if !check_permission(caller.data(), "http.request", None) {
-        audit_log(caller.data(), "http.raw", Some("http"), Some(&url), "denied", Some("brak uprawnienia 'http.request'"));
+        audit_log(
+            caller.data(),
+            "http.raw",
+            Some("http"),
+            Some(&url),
+            "denied",
+            Some("brak uprawnienia 'http.request'"),
+        );
         return ABI_ERR_PERMISSION;
     }
     let rule_match = match approved_destination_match(caller.data(), &domain, port) {
         Some(m) => m,
         None => {
-            audit_log(caller.data(), "http.raw", Some("http"), Some(&url), "denied", Some("brak zatwierdzonej network_rule"));
+            audit_log(
+                caller.data(),
+                "http.raw",
+                Some("http"),
+                Some(&url),
+                "denied",
+                Some("brak zatwierdzonej network_rule"),
+            );
             return ABI_ERR_PERMISSION;
         }
     };
     let require_public = rule_match == ApprovedMatch::Wildcard;
     if require_public && !is_safe_url(&url) {
-        audit_log(caller.data(), "http.raw", Some("http"), Some(&url), "denied", Some("SSRF: adres lokalny (regula wildcard)"));
+        audit_log(
+            caller.data(),
+            "http.raw",
+            Some("http"),
+            Some(&url),
+            "denied",
+            Some("SSRF: adres lokalny (regula wildcard)"),
+        );
         return ABI_ERR_PERMISSION;
     }
     let resolved = match resolve_destination(&domain, port, require_public) {
         Some(a) => a,
         None => {
-            audit_log(caller.data(), "http.raw", Some("http"), Some(&url), "denied", Some("DNS/SSRF resolution failed"));
+            audit_log(
+                caller.data(),
+                "http.raw",
+                Some("http"),
+                Some(&url),
+                "denied",
+                Some("DNS/SSRF resolution failed"),
+            );
             return ABI_ERR_PERMISSION;
         }
     };
     if let Some(ref rate_limiter) = caller.data().rate_limiter {
         let addon_id = caller.data().addon_id.clone();
-        if rate_limiter.check(&addon_id, ResourceType::HttpRequests).is_err() {
+        if rate_limiter
+            .check(&addon_id, ResourceType::HttpRequests)
+            .is_err()
+        {
             return super::ABI_ERR_RATE_LIMIT;
         }
         rate_limiter.record_usage(&addon_id, ResourceType::HttpRequests, 1);
@@ -432,17 +472,34 @@ pub fn http_raw_v1(
         Some(a) => *a,
         None => return ABI_ERR_PERMISSION,
     };
-    let content_type = request.get("content_type").and_then(|v| v.as_str()).unwrap_or("");
+    let content_type = request
+        .get("content_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let body = request.get("body").and_then(|v| v.as_str()).unwrap_or("");
     let path = url_path(&url);
 
     let response_json = match raw_http10_post(addr, &domain, &path, content_type, body.as_bytes()) {
         Ok((status, body)) => {
-            audit_log(caller.data(), "http.raw", Some("http"), Some(&url), "ok", None);
+            audit_log(
+                caller.data(),
+                "http.raw",
+                Some("http"),
+                Some(&url),
+                "ok",
+                None,
+            );
             serde_json::json!({ "status": status, "body": body })
         }
         Err(e) => {
-            audit_log(caller.data(), "http.raw", Some("http"), Some(&url), "error", Some(&e));
+            audit_log(
+                caller.data(),
+                "http.raw",
+                Some("http"),
+                Some(&url),
+                "error",
+                Some(&e),
+            );
             serde_json::json!({ "status": 0, "body": "", "error": e })
         }
     };
@@ -951,9 +1008,12 @@ mod tests {
     #[test]
     fn resolve_destination_gates_private_only_when_required() {
         let public_only = resolve_destination("127.0.0.1", 8080, true);
-        assert!(public_only.is_none(), "wildcard match musi odrzucic loopback");
-        let exact = resolve_destination("127.0.0.1", 8080, false)
-            .expect("exact match pozwala na loopback");
+        assert!(
+            public_only.is_none(),
+            "wildcard match musi odrzucic loopback"
+        );
+        let exact =
+            resolve_destination("127.0.0.1", 8080, false).expect("exact match pozwala na loopback");
         assert!(!exact.is_empty());
     }
 

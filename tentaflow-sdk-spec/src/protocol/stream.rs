@@ -216,13 +216,10 @@ impl<C> Encode<C> for StreamPayload {
 }
 
 impl<'b, C> Decode<'b, C> for StreamPayload {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let n = d.array()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length array forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let n = d
+            .array()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length array forbidden"))?;
         if n != 2 {
             return Err(minicbor::decode::Error::message(
                 "Envelope payload tuple MUST be [tag, body]",
@@ -247,9 +244,7 @@ impl<'b, C> Decode<'b, C> for StreamPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::envelope::{
-        Channel, Envelope, Flags, Priority, ProtocolVersion,
-    };
+    use crate::protocol::envelope::{Channel, Envelope, Flags, Priority, ProtocolVersion};
     use crate::protocol::ids::SessionId;
     use crate::protocol::value::Value;
 

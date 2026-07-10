@@ -174,9 +174,7 @@ mod tests {
     use crate::protocol::frame::address::NodeAddress;
     use crate::protocol::frame::auth::Auth;
     use crate::protocol::frame::channel::{channels, Kind};
-    use crate::protocol::frame::envelope::{
-        MessageId, Priority, MESSAGE_ID_LEN, NODE_ID_LEN,
-    };
+    use crate::protocol::frame::envelope::{MessageId, Priority, MESSAGE_ID_LEN, NODE_ID_LEN};
     use crate::protocol::frame::sign::public_key_bytes;
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
@@ -208,8 +206,7 @@ mod tests {
     fn payload() -> Vec<u8> {
         // Big enough to be worth compressing (and to exercise lz4 frame
         // encoder past its minimum block size).
-        b"UFP/2 pipeline test payload - repeated to make compression meaningful. "
-            .repeat(128)
+        b"UFP/2 pipeline test payload - repeated to make compression meaningful. ".repeat(128)
     }
 
     #[test]
@@ -219,7 +216,11 @@ mod tests {
         env.body = pt.clone();
         send_envelope_pipeline(
             &mut env,
-            SendCrypto { signing_key: None, aead_key: None, nonce_counter: None },
+            SendCrypto {
+                signing_key: None,
+                aead_key: None,
+                nonce_counter: None,
+            },
         )
         .unwrap();
         assert_eq!(env.body, pt, "plain pipeline leaves body untouched");
@@ -235,7 +236,11 @@ mod tests {
         env.body = pt.clone();
         send_envelope_pipeline(
             &mut env,
-            SendCrypto { signing_key: None, aead_key: None, nonce_counter: None },
+            SendCrypto {
+                signing_key: None,
+                aead_key: None,
+                nonce_counter: None,
+            },
         )
         .unwrap();
         assert_ne!(env.body, pt);
@@ -262,7 +267,13 @@ mod tests {
         )
         .unwrap();
         assert_ne!(env.body, pt);
-        receive_envelope_pipeline(&mut env, ReceiveCrypto { aead_key: Some(&key) }).unwrap();
+        receive_envelope_pipeline(
+            &mut env,
+            ReceiveCrypto {
+                aead_key: Some(&key),
+            },
+        )
+        .unwrap();
         assert_eq!(env.body, pt);
     }
 
@@ -320,7 +331,13 @@ mod tests {
         assert!(env.auth.signature.is_some());
         assert_ne!(env.body, pt);
 
-        receive_envelope_pipeline(&mut env, ReceiveCrypto { aead_key: Some(&aead_key) }).unwrap();
+        receive_envelope_pipeline(
+            &mut env,
+            ReceiveCrypto {
+                aead_key: Some(&aead_key),
+            },
+        )
+        .unwrap();
         assert_eq!(env.body, pt);
     }
 
@@ -376,7 +393,11 @@ mod tests {
         env.fragment_count = Some(2);
         let r = send_envelope_pipeline(
             &mut env,
-            SendCrypto { signing_key: None, aead_key: None, nonce_counter: None },
+            SendCrypto {
+                signing_key: None,
+                aead_key: None,
+                nonce_counter: None,
+            },
         );
         assert!(r.is_err());
         assert_eq!(r.unwrap_err().code, FrameErrorCode::BodyValidationFailed);
@@ -400,7 +421,11 @@ mod tests {
         env.body = payload();
         let r = send_envelope_pipeline(
             &mut env,
-            SendCrypto { signing_key: None, aead_key: None, nonce_counter: None },
+            SendCrypto {
+                signing_key: None,
+                aead_key: None,
+                nonce_counter: None,
+            },
         );
         assert!(r.is_err());
         assert_eq!(r.unwrap_err().code, FrameErrorCode::BodyValidationFailed);
@@ -424,7 +449,11 @@ mod tests {
         env.body = payload();
         let r = send_envelope_pipeline(
             &mut env,
-            SendCrypto { signing_key: None, aead_key: None, nonce_counter: None },
+            SendCrypto {
+                signing_key: None,
+                aead_key: None,
+                nonce_counter: None,
+            },
         );
         assert!(r.is_err());
         assert_eq!(r.unwrap_err().code, FrameErrorCode::BodyValidationFailed);
@@ -460,7 +489,9 @@ mod tests {
 
         let r = receive_envelope_pipeline(
             &mut env,
-            ReceiveCrypto { aead_key: Some(&aead_key) },
+            ReceiveCrypto {
+                aead_key: Some(&aead_key),
+            },
         );
         assert!(r.is_err());
         assert_eq!(r.unwrap_err().code, FrameErrorCode::InvalidSignature);

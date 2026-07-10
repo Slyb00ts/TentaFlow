@@ -2,6 +2,7 @@
 // File: protocol/ui/form/file_color.rs — FileInput/ColorPicker (catalog §5)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::{BindRef, StatePath};
 use super::super::component::{Component, FieldMap};
 use super::super::tokens::{ColorPickerVariant, ColorToken, FileCapture};
@@ -9,11 +10,19 @@ use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -46,21 +55,32 @@ impl FileInput {
         e.push((3, encode_to_value(&self.max_files)?));
         e.push((4, encode_to_value(&self.multiple)?));
         e.push((5, encode_to_value(&self.drag_and_drop)?));
-        if let Some(v) = &self.capture { e.push((6, encode_to_value(v)?)); }
+        if let Some(v) = &self.capture {
+            e.push((6, encode_to_value(v)?));
+        }
         e.push((7, encode_to_value(&self.upload_action_id)?));
-        if let Some(v) = &self.label { e.push((8, encode_to_value(v)?)); }
-        if let Some(v) = &self.hint { e.push((9, encode_to_value(v)?)); }
+        if let Some(v) = &self.label {
+            e.push((8, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.hint {
+            e.push((9, encode_to_value(v)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "FileInput")?;
         ensure_no_duplicate_keys("FileInput", &c.fields.0)?;
-        let mut bind_path = None; let mut accept = None;
-        let mut max_size_bytes = None; let mut max_files = None;
-        let mut multiple = None; let mut drag_and_drop = None;
-        let mut capture = None; let mut upload_action_id = None;
-        let mut label = None; let mut hint = None;
+        let mut bind_path = None;
+        let mut accept = None;
+        let mut max_size_bytes = None;
+        let mut max_files = None;
+        let mut multiple = None;
+        let mut drag_and_drop = None;
+        let mut capture = None;
+        let mut upload_action_id = None;
+        let mut label = None;
+        let mut hint = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => bind_path = Some(decode_from_value(v)?),
@@ -79,13 +99,17 @@ impl FileInput {
         Ok(FileInput {
             bind_path: bind_path.ok_or_else(|| missing_field("FileInput", "bind_path"))?,
             accept: accept.ok_or_else(|| missing_field("FileInput", "accept"))?,
-            max_size_bytes: max_size_bytes.ok_or_else(|| missing_field("FileInput", "max_size_bytes"))?,
+            max_size_bytes: max_size_bytes
+                .ok_or_else(|| missing_field("FileInput", "max_size_bytes"))?,
             max_files: max_files.ok_or_else(|| missing_field("FileInput", "max_files"))?,
             multiple: multiple.ok_or_else(|| missing_field("FileInput", "multiple"))?,
-            drag_and_drop: drag_and_drop.ok_or_else(|| missing_field("FileInput", "drag_and_drop"))?,
+            drag_and_drop: drag_and_drop
+                .ok_or_else(|| missing_field("FileInput", "drag_and_drop"))?,
             capture,
-            upload_action_id: upload_action_id.ok_or_else(|| missing_field("FileInput", "upload_action_id"))?,
-            label, hint,
+            upload_action_id: upload_action_id
+                .ok_or_else(|| missing_field("FileInput", "upload_action_id"))?,
+            label,
+            hint,
         })
     }
 }
@@ -111,17 +135,24 @@ impl ColorPicker {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(5);
         e.push((0, encode_to_value(&self.bind_path)?));
         e.push((1, encode_to_value(&self.variant)?));
-        if let Some(v) = &self.allowed_tokens { e.push((2, encode_to_value(v)?)); }
+        if let Some(v) = &self.allowed_tokens {
+            e.push((2, encode_to_value(v)?));
+        }
         e.push((3, encode_to_value(&self.show_alpha)?));
-        if let Some(v) = &self.label { e.push((4, encode_to_value(v)?)); }
+        if let Some(v) = &self.label {
+            e.push((4, encode_to_value(v)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "ColorPicker")?;
         ensure_no_duplicate_keys("ColorPicker", &c.fields.0)?;
-        let mut bind_path = None; let mut variant = None;
-        let mut allowed_tokens = None; let mut show_alpha = None; let mut label = None;
+        let mut bind_path = None;
+        let mut variant = None;
+        let mut allowed_tokens = None;
+        let mut show_alpha = None;
+        let mut label = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => bind_path = Some(decode_from_value(v)?),

@@ -38,13 +38,15 @@ use dashmap::DashMap;
 use rusqlite::OpenFlags;
 use sha2::{Digest, Sha256};
 use tentaflow_sdk_spec::{
-    DocumentDeleteInput, DocumentDeleteOutput, DocumentGetInput, DocumentGetMeta, DocumentListInput,
-    DocumentListOutput, DocumentMeta, DocumentPutInput, DocumentPutOutput,
+    DocumentDeleteInput, DocumentDeleteOutput, DocumentGetInput, DocumentGetMeta,
+    DocumentListInput, DocumentListOutput, DocumentMeta, DocumentPutInput, DocumentPutOutput,
 };
 
 use super::abi_helpers::{write_output_with_retry_semantics, PayloadKind};
 use super::cbor_io::{read_input_cbor, write_cbor_capped};
-use super::{audit_log_with_risk, check_permission, get_memory, read_guest_bytes, AddonState, WasmCaller};
+use super::{
+    audit_log_with_risk, check_permission, get_memory, read_guest_bytes, AddonState, WasmCaller,
+};
 use crate::addon::errors::AbiError;
 use crate::addon::fs_sandbox::{addon_data_dir, validate_addon_id};
 use crate::audit::RiskClass;
@@ -111,7 +113,10 @@ fn root_override() -> &'static Mutex<Option<PathBuf>> {
 /// Ustawia override roota (testy). Zwraca poprzednią wartość.
 #[doc(hidden)]
 pub fn set_root_override(root: Option<PathBuf>) -> Option<PathBuf> {
-    std::mem::replace(&mut *root_override().lock().unwrap_or_else(|e| e.into_inner()), root)
+    std::mem::replace(
+        &mut *root_override().lock().unwrap_or_else(|e| e.into_inner()),
+        root,
+    )
 }
 
 /// Zwraca katalog `documents/` instancji, tworząc go idempotentnie. Gdy
@@ -328,15 +333,13 @@ pub fn sweep_abandoned_pending() -> usize {
 /// Łączna suma bajtów wszystkich pending partiali w procesie (do limitu
 /// globalnego). Liczona pod tym samym lockiem co reszta operacji pending.
 fn total_pending_bytes(map: &PendingMap) -> u64 {
-    map.values().map(|p| p.bytes_so_far).fold(0u64, |a, b| a.saturating_add(b))
+    map.values()
+        .map(|p| p.bytes_so_far)
+        .fold(0u64, |a, b| a.saturating_add(b))
 }
 
 /// Liczba pending uploadów danej instancji (org, addon).
-fn pending_count_for_instance(
-    map: &PendingMap,
-    org_id: &str,
-    addon_id: &str,
-) -> usize {
+fn pending_count_for_instance(map: &PendingMap, org_id: &str, addon_id: &str) -> usize {
     map.keys()
         .filter(|(o, a, _)| o == org_id && a == addon_id)
         .count()
@@ -360,7 +363,8 @@ pub fn purge_orphan_partials(dir: &Path) {
         return;
     };
     let map = pending_uploads().lock().unwrap_or_else(|e| e.into_inner());
-    let tracked: std::collections::HashSet<PathBuf> = map.values().map(|p| p.path.clone()).collect();
+    let tracked: std::collections::HashSet<PathBuf> =
+        map.values().map(|p| p.path.clone()).collect();
     drop(map);
     let now = now_unix();
     for entry in entries.flatten() {
@@ -422,7 +426,13 @@ fn purge_orphans_once(dir: &Path) {
 // Helpery audytu / limitu
 // =============================================================================
 
-fn audit(state: &AddonState, action: &str, doc_id: Option<&str>, result: &str, reason: Option<&str>) {
+fn audit(
+    state: &AddonState,
+    action: &str,
+    doc_id: Option<&str>,
+    result: &str,
+    reason: Option<&str>,
+) {
     audit_log_with_risk(
         state,
         action,
@@ -489,7 +499,8 @@ pub fn commit_document_row(
     created_at: &str,
     limit_mb: i64,
 ) -> Result<(), AbiError> {
-    conn.execute("BEGIN IMMEDIATE", []).map_err(|_| AbiError::Operation)?;
+    conn.execute("BEGIN IMMEDIATE", [])
+        .map_err(|_| AbiError::Operation)?;
 
     let res = (|| -> Result<(), AbiError> {
         let prev_size: i64 = conn
@@ -536,7 +547,8 @@ pub fn commit_document_row(
 
     match res {
         Ok(()) => {
-            conn.execute("COMMIT", []).map_err(|_| AbiError::Operation)?;
+            conn.execute("COMMIT", [])
+                .map_err(|_| AbiError::Operation)?;
             Ok(())
         }
         Err(e) => {
@@ -623,14 +635,18 @@ fn start_new_upload(
         return Err(("upload_too_large", AbiError::QuotaExceeded));
     }
     // Rezerwacja quoty PRZED akceptacją: minimalny projektowany rozmiar.
-    let pre = open_registry(dir).and_then(|conn| precheck_quota(&conn, doc_id, chunk_len_u64, limit_mb));
+    let pre =
+        open_registry(dir).and_then(|conn| precheck_quota(&conn, doc_id, chunk_len_u64, limit_mb));
     match pre {
-        Err(AbiError::QuotaExceeded) => return Err(("storage_limit_exceeded", AbiError::QuotaExceeded)),
+        Err(AbiError::QuotaExceeded) => {
+            return Err(("storage_limit_exceeded", AbiError::QuotaExceeded))
+        }
         Err(_) => return Err(("registry_open_failed", AbiError::Operation)),
         Ok(()) => {}
     }
     // Świeży partial — truncate ewentualnego osieroconego pliku.
-    let mut f = std::fs::File::create(part_path).map_err(|_| ("partial_create_failed", AbiError::Operation))?;
+    let mut f = std::fs::File::create(part_path)
+        .map_err(|_| ("partial_create_failed", AbiError::Operation))?;
     if f.write_all(chunk).is_err() {
         let _ = std::fs::remove_file(part_path);
         return Err(("partial_write_failed", AbiError::Operation));
@@ -716,7 +732,15 @@ fn finalize_partial(
     }
 
     let created_at = chrono::Utc::now().to_rfc3339();
-    match commit_document_row(&conn, doc_id, &sha256, mime, size_bytes, &created_at, limit_mb) {
+    match commit_document_row(
+        &conn,
+        doc_id,
+        &sha256,
+        mime,
+        size_bytes,
+        &created_at,
+        limit_mb,
+    ) {
         Ok(()) => Ok(sha256),
         Err(AbiError::QuotaExceeded) => {
             cleanup_unreferenced_blob(&conn, dir, &sha256);
@@ -787,7 +811,8 @@ pub fn accept_upload_chunk_host(
         return Err(("invalid_upload_id", AbiError::Operation));
     }
 
-    let dir = documents_dir(org_id, addon_id).map_err(|_| ("documents_dir_failed", AbiError::Operation))?;
+    let dir = documents_dir(org_id, addon_id)
+        .map_err(|_| ("documents_dir_failed", AbiError::Operation))?;
     tmp_dir(&dir).map_err(|_| ("tmp_dir_failed", AbiError::Operation))?;
 
     let inst_lock = instance_lock(org_id, addon_id);
@@ -821,8 +846,16 @@ pub fn accept_upload_chunk_host(
                     let _ = std::fs::remove_file(&stale.path);
                 }
                 start_new_upload(
-                    &mut map, limit_mb, &dir, &acc_key, &part_path,
-                    &input, chunk, chunk_len_u64, addon_id, &doc_id,
+                    &mut map,
+                    limit_mb,
+                    &dir,
+                    &acc_key,
+                    &part_path,
+                    &input,
+                    chunk,
+                    chunk_len_u64,
+                    addon_id,
+                    &doc_id,
                 )
             }
         } else {
@@ -860,7 +893,10 @@ pub fn accept_upload_chunk_host(
                             p.bytes_so_far = projected;
                             p.last_activity = now_unix();
                             if seq + 1 == total_chunks {
-                                Ok(PutOutcome::Finalize { mime: p.mime.clone(), size_bytes: p.bytes_so_far })
+                                Ok(PutOutcome::Finalize {
+                                    mime: p.mime.clone(),
+                                    size_bytes: p.bytes_so_far,
+                                })
                             } else {
                                 Ok(PutOutcome::Buffered)
                             }
@@ -880,9 +916,14 @@ pub fn accept_upload_chunk_host(
     match outcome? {
         PutOutcome::Buffered => Ok(HostUploadOutcome::Buffered { doc_id }),
         PutOutcome::Finalize { mime, size_bytes } => {
-            let sha = finalize_partial(&dir, &acc_key, &part_path, &doc_id, &mime, size_bytes, limit_mb)?;
+            let sha = finalize_partial(
+                &dir, &acc_key, &part_path, &doc_id, &mime, size_bytes, limit_mb,
+            )?;
             let _ = sha;
-            Ok(HostUploadOutcome::Finalized { doc_ref: doc_id, size_bytes })
+            Ok(HostUploadOutcome::Finalized {
+                doc_ref: doc_id,
+                size_bytes,
+            })
         }
     }
 }
@@ -930,13 +971,25 @@ pub fn document_put_v1(
     let memory = match get_memory(&mut caller) {
         Some(m) => m,
         None => {
-            audit(caller.data(), "document.put", None, "error", Some("memory_unavailable"));
+            audit(
+                caller.data(),
+                "document.put",
+                None,
+                "error",
+                Some("memory_unavailable"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
 
     if !check_permission(caller.data(), PERM_DOCUMENT_WRITE, None) {
-        audit(caller.data(), "document.put", None, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "document.put",
+            None,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
 
@@ -965,26 +1018,56 @@ pub fn document_put_v1(
     };
 
     if input.total_chunks == 0 || input.total_chunks > MAX_TOTAL_CHUNKS {
-        audit(caller.data(), "document.put", None, "denied", Some("invalid_total_chunks"));
+        audit(
+            caller.data(),
+            "document.put",
+            None,
+            "denied",
+            Some("invalid_total_chunks"),
+        );
         return AbiError::Operation.as_i32();
     }
     if input.chunk_index >= input.total_chunks {
-        audit(caller.data(), "document.put", None, "denied", Some("chunk_index_out_of_range"));
+        audit(
+            caller.data(),
+            "document.put",
+            None,
+            "denied",
+            Some("chunk_index_out_of_range"),
+        );
         return AbiError::Operation.as_i32();
     }
     if input.mime.len() > MAX_MIME_LEN {
-        audit(caller.data(), "document.put", None, "denied", Some("mime_too_long"));
+        audit(
+            caller.data(),
+            "document.put",
+            None,
+            "denied",
+            Some("mime_too_long"),
+        );
         return AbiError::Operation.as_i32();
     }
 
     let chunk = match read_guest_bytes(&memory, &caller, chunk_ptr, chunk_len) {
         Some(b) if b.len() <= MAX_PUT_CHUNK_BYTES => b.to_vec(),
         Some(_) => {
-            audit(caller.data(), "document.put", None, "denied", Some("chunk_too_large"));
+            audit(
+                caller.data(),
+                "document.put",
+                None,
+                "denied",
+                Some("chunk_too_large"),
+            );
             return AbiError::PayloadTooLarge.as_i32();
         }
         None => {
-            audit(caller.data(), "document.put", None, "denied", Some("invalid_chunk_ptr"));
+            audit(
+                caller.data(),
+                "document.put",
+                None,
+                "denied",
+                Some("invalid_chunk_ptr"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
@@ -1001,7 +1084,13 @@ pub fn document_put_v1(
         format!("doc-{}", uuid::Uuid::new_v4().simple())
     } else {
         if validate_doc_id(&input.doc_id).is_err() {
-            audit(caller.data(), "document.put", Some(&input.doc_id), "denied", Some("invalid_doc_id"));
+            audit(
+                caller.data(),
+                "document.put",
+                Some(&input.doc_id),
+                "denied",
+                Some("invalid_doc_id"),
+            );
             return AbiError::Operation.as_i32();
         }
         input.doc_id.clone()
@@ -1010,12 +1099,24 @@ pub fn document_put_v1(
     let dir = match documents_dir(&org_id, &addon_id) {
         Ok(d) => d,
         Err(_) => {
-            audit(caller.data(), "document.put", Some(&doc_id), "error", Some("documents_dir_failed"));
+            audit(
+                caller.data(),
+                "document.put",
+                Some(&doc_id),
+                "error",
+                Some("documents_dir_failed"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
     if tmp_dir(&dir).is_err() {
-        audit(caller.data(), "document.put", Some(&doc_id), "error", Some("tmp_dir_failed"));
+        audit(
+            caller.data(),
+            "document.put",
+            Some(&doc_id),
+            "error",
+            Some("tmp_dir_failed"),
+        );
         return AbiError::Operation.as_i32();
     }
     // Serializacja per-instancja: cały put (sweep GC, akceptacja chunku,
@@ -1154,18 +1255,46 @@ pub fn document_put_v1(
                 PayloadKind::DocumentMeta,
             );
             if code == AbiError::Ok.as_i32() {
-                audit(caller.data(), "document.put", Some(&doc_id), "ok", Some("chunk_buffered"));
+                audit(
+                    caller.data(),
+                    "document.put",
+                    Some(&doc_id),
+                    "ok",
+                    Some("chunk_buffered"),
+                );
             } else if code == AbiError::OutputBufferTooSmall.as_i32() {
-                audit(caller.data(), "document.put", Some(&doc_id), "error", Some("output_buffer_too_small"));
+                audit(
+                    caller.data(),
+                    "document.put",
+                    Some(&doc_id),
+                    "error",
+                    Some("output_buffer_too_small"),
+                );
             } else {
-                audit(caller.data(), "document.put", Some(&doc_id), "error", Some("output_write_failed"));
+                audit(
+                    caller.data(),
+                    "document.put",
+                    Some(&doc_id),
+                    "error",
+                    Some("output_write_failed"),
+                );
             }
             return code;
         }
         Ok(PutOutcome::Finalize { mime, size_bytes }) => (mime, size_bytes),
         Err((reason, err)) => {
-            let result = if err == AbiError::QuotaExceeded { "denied" } else { "error" };
-            audit(caller.data(), "document.put", Some(&doc_id), result, Some(reason));
+            let result = if err == AbiError::QuotaExceeded {
+                "denied"
+            } else {
+                "error"
+            };
+            audit(
+                caller.data(),
+                "document.put",
+                Some(&doc_id),
+                result,
+                Some(reason),
+            );
             return err.as_i32();
         }
     };
@@ -1179,11 +1308,23 @@ pub fn document_put_v1(
     //     (4) DOPIERO POTEM commit_document_row. Skutek: czytelnik widzący wiersz
     //     ZAWSZE ma istniejący blob (B); overwrite nie zostawia okna wiszącego.
     // -------------------------------------------------------------------------
-    let sha256 = match finalize_partial(&dir, &acc_key, &part_path, &doc_id, &mime, size_bytes, limit_mb) {
+    let sha256 = match finalize_partial(
+        &dir, &acc_key, &part_path, &doc_id, &mime, size_bytes, limit_mb,
+    ) {
         Ok(s) => s,
         Err((reason, err)) => {
-            let result = if err == AbiError::QuotaExceeded { "denied" } else { "error" };
-            audit(caller.data(), "document.put", Some(&doc_id), result, Some(reason));
+            let result = if err == AbiError::QuotaExceeded {
+                "denied"
+            } else {
+                "error"
+            };
+            audit(
+                caller.data(),
+                "document.put",
+                Some(&doc_id),
+                result,
+                Some(reason),
+            );
             return err.as_i32();
         }
     };
@@ -1206,9 +1347,21 @@ pub fn document_put_v1(
     if code == AbiError::Ok.as_i32() {
         audit(caller.data(), "document.put", Some(&doc_id), "ok", None);
     } else if code == AbiError::OutputBufferTooSmall.as_i32() {
-        audit(caller.data(), "document.put", Some(&doc_id), "error", Some("output_buffer_too_small"));
+        audit(
+            caller.data(),
+            "document.put",
+            Some(&doc_id),
+            "error",
+            Some("output_buffer_too_small"),
+        );
     } else {
-        audit(caller.data(), "document.put", Some(&doc_id), "error", Some("output_write_failed"));
+        audit(
+            caller.data(),
+            "document.put",
+            Some(&doc_id),
+            "error",
+            Some("output_write_failed"),
+        );
     }
     code
 }
@@ -1271,13 +1424,25 @@ pub fn document_get_v1(
     let memory = match get_memory(&mut caller) {
         Some(m) => m,
         None => {
-            audit(caller.data(), "document.get", None, "error", Some("memory_unavailable"));
+            audit(
+                caller.data(),
+                "document.get",
+                None,
+                "error",
+                Some("memory_unavailable"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
 
     if !check_permission(caller.data(), PERM_DOCUMENT_READ, None) {
-        audit(caller.data(), "document.get", None, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "document.get",
+            None,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
 
@@ -1290,13 +1455,25 @@ pub fn document_get_v1(
     ) {
         Ok(v) => v,
         Err(e) => {
-            audit(caller.data(), "document.get", None, "denied", Some("invalid_payload"));
+            audit(
+                caller.data(),
+                "document.get",
+                None,
+                "denied",
+                Some("invalid_payload"),
+            );
             return e.as_i32();
         }
     };
 
     if validate_doc_id(&input.doc_id).is_err() {
-        audit(caller.data(), "document.get", Some(&input.doc_id), "denied", Some("invalid_doc_id"));
+        audit(
+            caller.data(),
+            "document.get",
+            Some(&input.doc_id),
+            "denied",
+            Some("invalid_doc_id"),
+        );
         return AbiError::Operation.as_i32();
     }
 
@@ -1310,14 +1487,26 @@ pub fn document_get_v1(
     let dir = match documents_dir(&org_id, &addon_id) {
         Ok(d) => d,
         Err(_) => {
-            audit(caller.data(), "document.get", Some(&input.doc_id), "error", Some("documents_dir_failed"));
+            audit(
+                caller.data(),
+                "document.get",
+                Some(&input.doc_id),
+                "error",
+                Some("documents_dir_failed"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
     let conn = match open_registry(&dir) {
         Ok(c) => c,
         Err(_) => {
-            audit(caller.data(), "document.get", Some(&input.doc_id), "error", Some("registry_open_failed"));
+            audit(
+                caller.data(),
+                "document.get",
+                Some(&input.doc_id),
+                "error",
+                Some("registry_open_failed"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
@@ -1344,14 +1533,26 @@ pub fn document_get_v1(
     let (sha256, mime, size_bytes) = match row {
         Some(t) => t,
         None => {
-            audit(caller.data(), "document.get", Some(&input.doc_id), "denied", Some("not_found"));
+            audit(
+                caller.data(),
+                "document.get",
+                Some(&input.doc_id),
+                "denied",
+                Some("not_found"),
+            );
             return AbiError::NotFound.as_i32();
         }
     };
 
     let total_chunks = ((size_bytes as usize).div_ceil(DOCUMENT_CHUNK_BYTES)).max(1) as u32;
     if input.chunk_index >= total_chunks {
-        audit(caller.data(), "document.get", Some(&input.doc_id), "denied", Some("chunk_index_out_of_range"));
+        audit(
+            caller.data(),
+            "document.get",
+            Some(&input.doc_id),
+            "denied",
+            Some("chunk_index_out_of_range"),
+        );
         return AbiError::Operation.as_i32();
     }
 
@@ -1359,7 +1560,8 @@ pub fn document_get_v1(
     // przy zapisie — przy odczycie ufamy (zero re-hash per chunk).
     let path = blob_path(&dir, &sha256);
     let start = input.chunk_index as u64 * DOCUMENT_CHUNK_BYTES as u64;
-    let want = ((size_bytes as u64).saturating_sub(start)).min(DOCUMENT_CHUNK_BYTES as u64) as usize;
+    let want =
+        ((size_bytes as u64).saturating_sub(start)).min(DOCUMENT_CHUNK_BYTES as u64) as usize;
     let mut chunk = vec![0u8; want];
     let read_res = (|| -> std::io::Result<()> {
         let mut f = std::fs::File::open(&path)?;
@@ -1368,7 +1570,13 @@ pub fn document_get_v1(
         Ok(())
     })();
     if read_res.is_err() {
-        audit(caller.data(), "document.get", Some(&input.doc_id), "error", Some("blob_read_failed"));
+        audit(
+            caller.data(),
+            "document.get",
+            Some(&input.doc_id),
+            "error",
+            Some("blob_read_failed"),
+        );
         return AbiError::Operation.as_i32();
     }
 
@@ -1384,9 +1592,21 @@ pub fn document_get_v1(
     );
     if blob_code != AbiError::Ok.as_i32() {
         if blob_code == AbiError::OutputBufferTooSmall.as_i32() {
-            audit(caller.data(), "document.get", Some(&input.doc_id), "denied", Some("blob_buffer_too_small"));
+            audit(
+                caller.data(),
+                "document.get",
+                Some(&input.doc_id),
+                "denied",
+                Some("blob_buffer_too_small"),
+            );
         } else {
-            audit(caller.data(), "document.get", Some(&input.doc_id), "error", Some("blob_write_failed"));
+            audit(
+                caller.data(),
+                "document.get",
+                Some(&input.doc_id),
+                "error",
+                Some("blob_write_failed"),
+            );
         }
         return blob_code;
     }
@@ -1407,11 +1627,29 @@ pub fn document_get_v1(
         PayloadKind::DocumentMeta,
     );
     if meta_code == AbiError::Ok.as_i32() {
-        audit(caller.data(), "document.get", Some(&input.doc_id), "ok", None);
+        audit(
+            caller.data(),
+            "document.get",
+            Some(&input.doc_id),
+            "ok",
+            None,
+        );
     } else if meta_code == AbiError::OutputBufferTooSmall.as_i32() {
-        audit(caller.data(), "document.get", Some(&input.doc_id), "error", Some("meta_buffer_too_small"));
+        audit(
+            caller.data(),
+            "document.get",
+            Some(&input.doc_id),
+            "error",
+            Some("meta_buffer_too_small"),
+        );
     } else {
-        audit(caller.data(), "document.get", Some(&input.doc_id), "error", Some("meta_write_failed"));
+        audit(
+            caller.data(),
+            "document.get",
+            Some(&input.doc_id),
+            "error",
+            Some("meta_write_failed"),
+        );
     }
     meta_code
 }
@@ -1438,13 +1676,25 @@ pub fn document_delete_v1(
     let memory = match get_memory(&mut caller) {
         Some(m) => m,
         None => {
-            audit(caller.data(), "document.delete", None, "error", Some("memory_unavailable"));
+            audit(
+                caller.data(),
+                "document.delete",
+                None,
+                "error",
+                Some("memory_unavailable"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
 
     if !check_permission(caller.data(), PERM_DOCUMENT_WRITE, None) {
-        audit(caller.data(), "document.delete", None, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "document.delete",
+            None,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
 
@@ -1457,13 +1707,25 @@ pub fn document_delete_v1(
     ) {
         Ok(v) => v,
         Err(e) => {
-            audit(caller.data(), "document.delete", None, "denied", Some("invalid_payload"));
+            audit(
+                caller.data(),
+                "document.delete",
+                None,
+                "denied",
+                Some("invalid_payload"),
+            );
             return e.as_i32();
         }
     };
 
     if validate_doc_id(&input.doc_id).is_err() {
-        audit(caller.data(), "document.delete", Some(&input.doc_id), "denied", Some("invalid_doc_id"));
+        audit(
+            caller.data(),
+            "document.delete",
+            Some(&input.doc_id),
+            "denied",
+            Some("invalid_doc_id"),
+        );
         return AbiError::Operation.as_i32();
     }
 
@@ -1477,14 +1739,26 @@ pub fn document_delete_v1(
     let dir = match documents_dir(&org_id, &addon_id) {
         Ok(d) => d,
         Err(_) => {
-            audit(caller.data(), "document.delete", Some(&input.doc_id), "error", Some("documents_dir_failed"));
+            audit(
+                caller.data(),
+                "document.delete",
+                Some(&input.doc_id),
+                "error",
+                Some("documents_dir_failed"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
     let conn = match open_registry(&dir) {
         Ok(c) => c,
         Err(_) => {
-            audit(caller.data(), "document.delete", Some(&input.doc_id), "error", Some("registry_open_failed"));
+            audit(
+                caller.data(),
+                "document.delete",
+                Some(&input.doc_id),
+                "error",
+                Some("registry_open_failed"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
@@ -1519,9 +1793,21 @@ pub fn document_delete_v1(
                 PayloadKind::DocumentMeta,
             );
             if code == AbiError::Ok.as_i32() {
-                audit(caller.data(), "document.delete", Some(&input.doc_id), "ok", Some("not_found"));
+                audit(
+                    caller.data(),
+                    "document.delete",
+                    Some(&input.doc_id),
+                    "ok",
+                    Some("not_found"),
+                );
             } else {
-                audit(caller.data(), "document.delete", Some(&input.doc_id), "error", Some("output_write_failed"));
+                audit(
+                    caller.data(),
+                    "document.delete",
+                    Some(&input.doc_id),
+                    "error",
+                    Some("output_write_failed"),
+                );
             }
             return code;
         }
@@ -1546,7 +1832,13 @@ pub fn document_delete_v1(
         )
         .is_err()
     {
-        audit(caller.data(), "document.delete", Some(&input.doc_id), "error", Some("registry_delete_failed"));
+        audit(
+            caller.data(),
+            "document.delete",
+            Some(&input.doc_id),
+            "error",
+            Some("registry_delete_failed"),
+        );
         return AbiError::Operation.as_i32();
     }
 
@@ -1571,9 +1863,21 @@ pub fn document_delete_v1(
         PayloadKind::DocumentMeta,
     );
     if code == AbiError::Ok.as_i32() {
-        audit(caller.data(), "document.delete", Some(&input.doc_id), "ok", None);
+        audit(
+            caller.data(),
+            "document.delete",
+            Some(&input.doc_id),
+            "ok",
+            None,
+        );
     } else {
-        audit(caller.data(), "document.delete", Some(&input.doc_id), "error", Some("output_write_failed"));
+        audit(
+            caller.data(),
+            "document.delete",
+            Some(&input.doc_id),
+            "error",
+            Some("output_write_failed"),
+        );
     }
     code
 }
@@ -1596,13 +1900,25 @@ pub fn document_list_v1(
     let memory = match get_memory(&mut caller) {
         Some(m) => m,
         None => {
-            audit(caller.data(), "document.list", None, "error", Some("memory_unavailable"));
+            audit(
+                caller.data(),
+                "document.list",
+                None,
+                "error",
+                Some("memory_unavailable"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
 
     if !check_permission(caller.data(), PERM_DOCUMENT_READ, None) {
-        audit(caller.data(), "document.list", None, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "document.list",
+            None,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
 
@@ -1615,7 +1931,13 @@ pub fn document_list_v1(
     ) {
         Ok(v) => v,
         Err(e) => {
-            audit(caller.data(), "document.list", None, "denied", Some("invalid_payload"));
+            audit(
+                caller.data(),
+                "document.list",
+                None,
+                "denied",
+                Some("invalid_payload"),
+            );
             return e.as_i32();
         }
     };
@@ -1630,14 +1952,26 @@ pub fn document_list_v1(
     let dir = match documents_dir(&org_id, &addon_id) {
         Ok(d) => d,
         Err(_) => {
-            audit(caller.data(), "document.list", None, "error", Some("documents_dir_failed"));
+            audit(
+                caller.data(),
+                "document.list",
+                None,
+                "error",
+                Some("documents_dir_failed"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
     let conn = match open_registry(&dir) {
         Ok(c) => c,
         Err(_) => {
-            audit(caller.data(), "document.list", None, "error", Some("registry_open_failed"));
+            audit(
+                caller.data(),
+                "document.list",
+                None,
+                "error",
+                Some("registry_open_failed"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
@@ -1664,7 +1998,13 @@ pub fn document_list_v1(
         match rows {
             Ok(it) => it.filter_map(|r| r.ok()).collect(),
             Err(_) => {
-                audit(caller.data(), "document.list", None, "error", Some("registry_query_failed"));
+                audit(
+                    caller.data(),
+                    "document.list",
+                    None,
+                    "error",
+                    Some("registry_query_failed"),
+                );
                 return AbiError::Operation.as_i32();
             }
         }
@@ -1683,9 +2023,21 @@ pub fn document_list_v1(
     if code == AbiError::Ok.as_i32() {
         audit(caller.data(), "document.list", None, "ok", None);
     } else if code == AbiError::OutputBufferTooSmall.as_i32() {
-        audit(caller.data(), "document.list", None, "error", Some("output_buffer_too_small"));
+        audit(
+            caller.data(),
+            "document.list",
+            None,
+            "error",
+            Some("output_buffer_too_small"),
+        );
     } else {
-        audit(caller.data(), "document.list", None, "error", Some("output_write_failed"));
+        audit(
+            caller.data(),
+            "document.list",
+            None,
+            "error",
+            Some("output_write_failed"),
+        );
     }
     code
 }
@@ -1744,7 +2096,10 @@ mod tests {
                 let mut f = std::fs::File::create(&part).unwrap();
                 f.write_all(ch).unwrap();
             } else {
-                let mut f = std::fs::OpenOptions::new().append(true).open(&part).unwrap();
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&part)
+                    .unwrap();
                 f.write_all(ch).unwrap();
             }
             if assert_partial_midway && i + 1 < total {
@@ -1788,7 +2143,11 @@ mod tests {
     }
 
     /// Odczyt kawałka przez seek (lustro `document_get_v1`) — NIE ładuje całości.
-    fn get_chunk_seek(dir: &std::path::Path, doc_id: &str, chunk_index: usize) -> Option<(Vec<u8>, u32)> {
+    fn get_chunk_seek(
+        dir: &std::path::Path,
+        doc_id: &str,
+        chunk_index: usize,
+    ) -> Option<(Vec<u8>, u32)> {
         let conn = open_registry(dir).unwrap();
         let (sha, size): (String, i64) = conn
             .query_row(
@@ -1816,12 +2175,25 @@ mod tests {
 
         // Plik > 1MB (5 × 256KiB + ogon) — niemożliwy w KV. Streaming po 256 KiB.
         let big: Vec<u8> = (0..(1_300_000u32)).map(|i| (i % 251) as u8).collect();
-        let (doc_id, sha) =
-            stream_put(&dir, "doc-big", "application/pdf", &big, DOCUMENT_CHUNK_BYTES, 0, true);
+        let (doc_id, sha) = stream_put(
+            &dir,
+            "doc-big",
+            "application/pdf",
+            &big,
+            DOCUMENT_CHUNK_BYTES,
+            0,
+            true,
+        );
 
         // Po finalizacji partial nie istnieje, blob istnieje.
-        assert!(!partial_path(&dir, "doc-big").exists(), "partial skasowany po finalizacji");
-        assert!(blob_path(&dir, &sha).exists(), "blob istnieje po finalizacji");
+        assert!(
+            !partial_path(&dir, "doc-big").exists(),
+            "partial skasowany po finalizacji"
+        );
+        assert!(
+            blob_path(&dir, &sha).exists(),
+            "blob istnieje po finalizacji"
+        );
 
         // Odczyt kawałkami przez seek i ponowne złożenie.
         let mut assembled = Vec::new();
@@ -1926,8 +2298,16 @@ mod tests {
 
         let conn = open_registry(&dir).unwrap();
         // Pierwszy: 600 KB < 1 MB → OK.
-        commit_document_row(&conn, "doc-1", "sha1aaaa", "application/pdf", data.len() as u64, "t", limit_mb)
-            .expect("pierwszy 600KB mieści się w 1MB");
+        commit_document_row(
+            &conn,
+            "doc-1",
+            "sha1aaaa",
+            "application/pdf",
+            data.len() as u64,
+            "t",
+            limit_mb,
+        )
+        .expect("pierwszy 600KB mieści się w 1MB");
         // Drugi: projekcja 1.2 MB > 1 MB → QuotaExceeded (rollback).
         let r = commit_document_row(
             &conn,
@@ -1938,9 +2318,16 @@ mod tests {
             "t",
             limit_mb,
         );
-        assert_eq!(r, Err(AbiError::QuotaExceeded), "drugi przekracza limit → odrzucony");
+        assert_eq!(
+            r,
+            Err(AbiError::QuotaExceeded),
+            "drugi przekracza limit → odrzucony"
+        );
         let used = current_storage_bytes(&conn);
-        assert_eq!(used, 600_000, "tylko jeden dokument zaksięgowany — limit nieprzekroczony");
+        assert_eq!(
+            used, 600_000,
+            "tylko jeden dokument zaksięgowany — limit nieprzekroczony"
+        );
         set_root_override(None);
     }
 
@@ -1952,7 +2339,15 @@ mod tests {
         let dir_a = documents_dir("org-default", "alpha").unwrap();
         let dir_b = documents_dir("org-default", "beta").unwrap();
 
-        stream_put(&dir_a, "doc-secret", "text/plain", b"poufne A", DOCUMENT_CHUNK_BYTES, 0, false);
+        stream_put(
+            &dir_a,
+            "doc-secret",
+            "text/plain",
+            b"poufne A",
+            DOCUMENT_CHUNK_BYTES,
+            0,
+            false,
+        );
 
         let conn_b = open_registry(&dir_b).unwrap();
         let found: Option<String> = conn_b
@@ -1974,8 +2369,15 @@ mod tests {
         let _g = set_root_override(Some(tmp.path().to_path_buf()));
         let dir = documents_dir("org-default", "alpha").unwrap();
 
-        let (doc_id, sha) =
-            stream_put(&dir, "doc-del", "text/plain", b"do skasowania", DOCUMENT_CHUNK_BYTES, 0, false);
+        let (doc_id, sha) = stream_put(
+            &dir,
+            "doc-del",
+            "text/plain",
+            b"do skasowania",
+            DOCUMENT_CHUNK_BYTES,
+            0,
+            false,
+        );
         let path = blob_path(&dir, &sha);
         assert!(path.exists());
 
@@ -1990,11 +2392,18 @@ mod tests {
             .is_ok();
         assert!(!other_ref);
         std::fs::remove_file(&path).unwrap();
-        conn.execute("DELETE FROM documents WHERE doc_id = ?1", rusqlite::params![&doc_id])
-            .unwrap();
+        conn.execute(
+            "DELETE FROM documents WHERE doc_id = ?1",
+            rusqlite::params![&doc_id],
+        )
+        .unwrap();
         assert!(!path.exists(), "plik skasowany");
         let gone: bool = conn
-            .query_row("SELECT 1 FROM documents WHERE doc_id = ?1", rusqlite::params![&doc_id], |_| Ok(()))
+            .query_row(
+                "SELECT 1 FROM documents WHERE doc_id = ?1",
+                rusqlite::params![&doc_id],
+                |_| Ok(()),
+            )
             .is_ok();
         assert!(!gone, "wpis rejestru skasowany");
         set_root_override(None);
@@ -2007,13 +2416,28 @@ mod tests {
         let _g = set_root_override(Some(tmp.path().to_path_buf()));
         let dir_a = documents_dir("org-default", "alpha").unwrap();
         let dir_b = documents_dir("org-default", "beta").unwrap();
-        stream_put(&dir_a, "doc-a", "text/plain", b"A", DOCUMENT_CHUNK_BYTES, 0, false);
+        stream_put(
+            &dir_a,
+            "doc-a",
+            "text/plain",
+            b"A",
+            DOCUMENT_CHUNK_BYTES,
+            0,
+            false,
+        );
 
         let conn_b = open_registry(&dir_b).unwrap();
         let row: Option<String> = conn_b
-            .query_row("SELECT sha256 FROM documents WHERE doc_id = ?1", rusqlite::params!["doc-a"], |r| r.get(0))
+            .query_row(
+                "SELECT sha256 FROM documents WHERE doc_id = ?1",
+                rusqlite::params!["doc-a"],
+                |r| r.get(0),
+            )
             .ok();
-        assert!(row.is_none(), "obcy doc_id → NotFound (brak w rejestrze instancji)");
+        assert!(
+            row.is_none(),
+            "obcy doc_id → NotFound (brak w rejestrze instancji)"
+        );
         set_root_override(None);
     }
 
@@ -2023,12 +2447,28 @@ mod tests {
         let tmp = tempdir().unwrap();
         let _g = set_root_override(Some(tmp.path().to_path_buf()));
         let dir = documents_dir("org-default", "alpha").unwrap();
-        stream_put(&dir, "doc-1", "application/pdf", &vec![0u8; 600_000], DOCUMENT_CHUNK_BYTES, 0, false);
+        stream_put(
+            &dir,
+            "doc-1",
+            "application/pdf",
+            &vec![0u8; 600_000],
+            DOCUMENT_CHUNK_BYTES,
+            0,
+            false,
+        );
         let conn = open_registry(&dir).unwrap();
         assert_eq!(current_storage_bytes(&conn), 600_000);
 
         // Limit 1MB, nowy plik 600KB → transakcja odrzuca (projekcja 1.2MB > 1MB).
-        let r = commit_document_row(&conn, "doc-2", "shaXXXX", "application/pdf", 600_000, "t", 1);
+        let r = commit_document_row(
+            &conn,
+            "doc-2",
+            "shaXXXX",
+            "application/pdf",
+            600_000,
+            "t",
+            1,
+        );
         assert_eq!(r, Err(AbiError::QuotaExceeded));
         set_root_override(None);
     }
@@ -2086,7 +2526,10 @@ mod tests {
         let tmp = tempdir().unwrap();
         let _g = set_root_override(Some(tmp.path().to_path_buf()));
         let dir = documents_dir("org-default", "alpha").unwrap();
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
 
         // Pierwszy chunk-0 zakłada pending; drugi chunk-0 tego samego doc_id musi
         // dostać „in progress" i NIE nadpisać (truncate) partiala pierwszego.
@@ -2096,11 +2539,21 @@ mod tests {
         let before = std::fs::read(&part).unwrap();
 
         let second = try_start_chunk0(&dir, "org-default", "alpha", "doc-race", b"BBBBBBBB");
-        assert_eq!(second, Err("upload_already_in_progress"), "drugi chunk-0 odrzucony");
+        assert_eq!(
+            second,
+            Err("upload_already_in_progress"),
+            "drugi chunk-0 odrzucony"
+        );
         let after = std::fs::read(&part).unwrap();
-        assert_eq!(before, after, "partial pierwszego NIE został nadpisany przez drugi chunk-0");
+        assert_eq!(
+            before, after,
+            "partial pierwszego NIE został nadpisany przez drugi chunk-0"
+        );
 
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         set_root_override(None);
     }
 
@@ -2118,15 +2571,27 @@ mod tests {
         std::fs::write(&part, &data).unwrap();
 
         // Przed finalizacją: get NIE widzi wiersza (brak w rejestrze) → NotFound.
-        assert!(get_chunk_seek(&dir, "doc-pub", 0).is_none(), "przed publikacją brak wiersza");
+        assert!(
+            get_chunk_seek(&dir, "doc-pub", 0).is_none(),
+            "przed publikacją brak wiersza"
+        );
 
         // Finalizacja publikuje blob PRZED wierszem. Po commitcie wiersza blob
         // ZAWSZE istnieje, więc każdy get widzący wiersz odczyta bajty (nie dangling).
-        let sha = finalize_publish(&dir, "doc-pub", "application/pdf", data.len() as u64, 0).unwrap();
-        assert!(blob_path(&dir, &sha).exists(), "blob opublikowany przed/wraz z wierszem");
-        let (chunk0, total) = get_chunk_seek(&dir, "doc-pub", 0).expect("po publikacji get widzi wiersz i blob");
+        let sha =
+            finalize_publish(&dir, "doc-pub", "application/pdf", data.len() as u64, 0).unwrap();
+        assert!(
+            blob_path(&dir, &sha).exists(),
+            "blob opublikowany przed/wraz z wierszem"
+        );
+        let (chunk0, total) =
+            get_chunk_seek(&dir, "doc-pub", 0).expect("po publikacji get widzi wiersz i blob");
         assert_eq!(total, 3, "700KB / 256KiB → 3 kawałki");
-        assert_eq!(&chunk0[..], &data[..DOCUMENT_CHUNK_BYTES], "pierwszy kawałek poprawny");
+        assert_eq!(
+            &chunk0[..],
+            &data[..DOCUMENT_CHUNK_BYTES],
+            "pierwszy kawałek poprawny"
+        );
         set_root_override(None);
     }
 
@@ -2142,7 +2607,8 @@ mod tests {
         let old = vec![1u8; 500_000];
         let part = partial_path(&dir, "doc-ow");
         std::fs::write(&part, &old).unwrap();
-        let old_sha = finalize_publish(&dir, "doc-ow", "application/pdf", old.len() as u64, 1).unwrap();
+        let old_sha =
+            finalize_publish(&dir, "doc-ow", "application/pdf", old.len() as u64, 1).unwrap();
         assert!(blob_path(&dir, &old_sha).exists(), "stary blob istnieje");
 
         // Nadpisanie tego samego doc_id większym plikiem, który przekracza limit
@@ -2152,7 +2618,11 @@ mod tests {
         let new = vec![2u8; 1_200_000];
         std::fs::write(&part, &new).unwrap();
         let r = finalize_publish(&dir, "doc-ow", "application/pdf", new.len() as u64, 1);
-        assert_eq!(r, Err(AbiError::QuotaExceeded), "nadpisanie przekracza limit → odrzucone");
+        assert_eq!(
+            r,
+            Err(AbiError::QuotaExceeded),
+            "nadpisanie przekracza limit → odrzucone"
+        );
 
         // Stary dokument nadal kompletny: wiersz wskazuje stary sha, stary blob żyje.
         let conn = open_registry(&dir).unwrap();
@@ -2165,7 +2635,10 @@ mod tests {
             .expect("stary wiersz przetrwał fail nadpisania");
         assert_eq!(sha, old_sha, "wiersz nadal wskazuje stary blob");
         assert_eq!(size, 500_000, "rozmiar starego dokumentu nienaruszony");
-        assert!(blob_path(&dir, &old_sha).exists(), "stary blob nieskasowany");
+        assert!(
+            blob_path(&dir, &old_sha).exists(),
+            "stary blob nieskasowany"
+        );
         set_root_override(None);
     }
 
@@ -2176,8 +2649,15 @@ mod tests {
         let _g = set_root_override(Some(tmp.path().to_path_buf()));
         let dir = documents_dir("org-default", "alpha").unwrap();
 
-        let (doc_id, sha) =
-            stream_put(&dir, "doc-dg", "text/plain", b"do skasowania", DOCUMENT_CHUNK_BYTES, 0, false);
+        let (doc_id, sha) = stream_put(
+            &dir,
+            "doc-dg",
+            "text/plain",
+            b"do skasowania",
+            DOCUMENT_CHUNK_BYTES,
+            0,
+            false,
+        );
         assert!(blob_path(&dir, &sha).exists());
 
         // Delete transakcyjnie: DELETE wiersza PRZED unlink bloba (E).
@@ -2189,16 +2669,25 @@ mod tests {
                 |_| Ok(()),
             )
             .is_ok();
-        conn.execute("DELETE FROM documents WHERE doc_id = ?1", rusqlite::params![&doc_id])
-            .unwrap();
+        conn.execute(
+            "DELETE FROM documents WHERE doc_id = ?1",
+            rusqlite::params![&doc_id],
+        )
+        .unwrap();
         if !other_ref {
             let _ = std::fs::remove_file(blob_path(&dir, &sha));
         }
 
         // Po delete: get → NotFound (brak wiersza), NIE dangling (brak okna gdzie
         // wiersz istnieje a plik już nie).
-        assert!(get_chunk_seek(&dir, &doc_id, 0).is_none(), "po delete get → NotFound");
-        assert!(!blob_path(&dir, &sha).exists(), "blob skasowany (brak referencji)");
+        assert!(
+            get_chunk_seek(&dir, &doc_id, 0).is_none(),
+            "po delete get → NotFound"
+        );
+        assert!(
+            !blob_path(&dir, &sha).exists(),
+            "blob skasowany (brak referencji)"
+        );
         set_root_override(None);
     }
 
@@ -2209,7 +2698,10 @@ mod tests {
         let _g = set_root_override(Some(tmp.path().to_path_buf()));
         let dir = documents_dir("org-default", "alpha").unwrap();
         tmp_dir(&dir).unwrap();
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
 
         // Wgraj dokument, potem N rund: wątek get i wątek delete RÓWNOLEGLE na tym
         // samym doc_id, oba pod mutexem instancji (Bug 1). Inwariant: get widzący
@@ -2280,8 +2772,11 @@ mod tests {
                             |_| Ok(()),
                         )
                         .is_ok();
-                    conn.execute("DELETE FROM documents WHERE doc_id = ?1", rusqlite::params![&del_doc])
-                        .unwrap();
+                    conn.execute(
+                        "DELETE FROM documents WHERE doc_id = ?1",
+                        rusqlite::params![&del_doc],
+                    )
+                    .unwrap();
                     if !other_ref {
                         let _ = std::fs::remove_file(blob_path(&del_dir, &sha));
                     }
@@ -2297,7 +2792,10 @@ mod tests {
             );
         }
 
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         set_root_override(None);
     }
 
@@ -2314,7 +2812,8 @@ mod tests {
         let stale = finalizing_path(&dir, "doc-crashed");
         std::fs::write(&stale, b"osierocony po crashu").unwrap();
         // Cofnij mtime poza TTL.
-        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(PENDING_TTL_SECS + 60);
+        let old =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(PENDING_TTL_SECS + 60);
         filetime::set_file_mtime(&stale, filetime::FileTime::from_system_time(old)).unwrap();
         assert!(stale.exists());
 
@@ -2324,8 +2823,14 @@ mod tests {
 
         purge_orphan_partials(&dir);
 
-        assert!(!stale.exists(), "stary .finalizing po crashu skasowany przez GC");
-        assert!(fresh.exists(), "świeży .finalizing aktywnej finalizacji NIE ruszony");
+        assert!(
+            !stale.exists(),
+            "stary .finalizing po crashu skasowany przez GC"
+        );
+        assert!(
+            fresh.exists(),
+            "świeży .finalizing aktywnej finalizacji NIE ruszony"
+        );
         set_root_override(None);
     }
 
@@ -2336,7 +2841,10 @@ mod tests {
         let _g = set_root_override(Some(tmp.path().to_path_buf()));
         let dir = documents_dir("org-default", "alpha").unwrap();
         tmp_dir(&dir).unwrap();
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
 
         // N wątków finalizuje RÓŻNE doc_id tej samej instancji równolegle, każdy pod
         // mutexem instancji. Wszystkie muszą zaksięgować spójnie (brak korupcji
@@ -2373,7 +2881,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("{doc_id} ma wiersz i blob"));
             assert_eq!(chunk0[0], i as u8, "bajty {doc_id} poprawne");
         }
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         set_root_override(None);
     }
 
@@ -2388,7 +2899,10 @@ mod tests {
         let _lock = override_lock().lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempdir().unwrap();
         let _g = set_root_override(Some(tmp.path().to_path_buf()));
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let dir = documents_dir("org-default", "alpha").unwrap();
 
         // 1.3 MB → 6 fragmentów po 256 KiB (ostatni krótszy). Niemożliwe w KV.
@@ -2401,13 +2915,22 @@ mod tests {
             let start = seq as usize * DOCUMENT_CHUNK_BYTES;
             let end = (start + DOCUMENT_CHUNK_BYTES).min(data.len());
             let out = accept_upload_chunk_host(
-                "org-default", "alpha", upload_id, "application/pdf",
-                seq, total_chunks, &data[start..end], 0,
+                "org-default",
+                "alpha",
+                upload_id,
+                "application/pdf",
+                seq,
+                total_chunks,
+                &data[start..end],
+                0,
             )
             .unwrap();
             match out {
                 HostUploadOutcome::Buffered { .. } => assert!(seq + 1 < total_chunks),
-                HostUploadOutcome::Finalized { doc_ref: r, size_bytes } => {
+                HostUploadOutcome::Finalized {
+                    doc_ref: r,
+                    size_bytes,
+                } => {
                     assert_eq!(seq + 1, total_chunks, "finalizacja na ostatnim fragmencie");
                     assert_eq!(size_bytes, data.len() as u64);
                     doc_ref = Some(r);
@@ -2423,11 +2946,17 @@ mod tests {
             let (c, _t) = get_chunk_seek(&dir, &doc_ref, i).unwrap();
             assembled.extend_from_slice(&c);
         }
-        assert_eq!(assembled, data, "bajty wgrane = bajty czytane przez doc_ref");
+        assert_eq!(
+            assembled, data,
+            "bajty wgrane = bajty czytane przez doc_ref"
+        );
 
         // Brak osieroconego partiala po finalizacji.
         assert!(!partial_path(&dir, &doc_ref).exists(), "partial skasowany");
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         set_root_override(None);
     }
 
@@ -2437,16 +2966,21 @@ mod tests {
         let _lock = override_lock().lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempdir().unwrap();
         let _g = set_root_override(Some(tmp.path().to_path_buf()));
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let dir = documents_dir("org-default", "alpha").unwrap();
 
         let data = b"maly plik";
-        let out = accept_upload_chunk_host(
-            "org-default", "alpha", "u1", "text/plain", 0, 1, data, 0,
-        )
-        .unwrap();
+        let out =
+            accept_upload_chunk_host("org-default", "alpha", "u1", "text/plain", 0, 1, data, 0)
+                .unwrap();
         let doc_ref = match out {
-            HostUploadOutcome::Finalized { doc_ref, size_bytes } => {
+            HostUploadOutcome::Finalized {
+                doc_ref,
+                size_bytes,
+            } => {
                 assert_eq!(size_bytes, data.len() as u64);
                 doc_ref
             }
@@ -2455,7 +2989,10 @@ mod tests {
         let (chunk, total) = get_chunk_seek(&dir, &doc_ref, 0).unwrap();
         assert_eq!(total, 1);
         assert_eq!(chunk, data);
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         set_root_override(None);
     }
 
@@ -2466,12 +3003,14 @@ mod tests {
         let _lock = override_lock().lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempdir().unwrap();
         let _g = set_root_override(Some(tmp.path().to_path_buf()));
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
 
-        let out = accept_upload_chunk_host(
-            "org-a", "alpha", "u-iso", "text/plain", 0, 1, b"sekret", 0,
-        )
-        .unwrap();
+        let out =
+            accept_upload_chunk_host("org-a", "alpha", "u-iso", "text/plain", 0, 1, b"sekret", 0)
+                .unwrap();
         let doc_ref = match out {
             HostUploadOutcome::Finalized { doc_ref, .. } => doc_ref,
             _ => panic!("finalized"),
@@ -2479,14 +3018,26 @@ mod tests {
 
         // Inna instancja tego samego org — brak wiersza.
         let other_inst = documents_dir("org-a", "beta").unwrap();
-        assert!(get_chunk_seek(&other_inst, &doc_ref, 0).is_none(), "inna instancja nie widzi doc_ref");
+        assert!(
+            get_chunk_seek(&other_inst, &doc_ref, 0).is_none(),
+            "inna instancja nie widzi doc_ref"
+        );
         // Inny org, ta sama nazwa instancji — brak wiersza.
         let other_org = documents_dir("org-b", "alpha").unwrap();
-        assert!(get_chunk_seek(&other_org, &doc_ref, 0).is_none(), "inny org nie widzi doc_ref");
+        assert!(
+            get_chunk_seek(&other_org, &doc_ref, 0).is_none(),
+            "inny org nie widzi doc_ref"
+        );
         // Właściwa instancja — widzi.
         let own = documents_dir("org-a", "alpha").unwrap();
-        assert!(get_chunk_seek(&own, &doc_ref, 0).is_some(), "właściciel widzi doc_ref");
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        assert!(
+            get_chunk_seek(&own, &doc_ref, 0).is_some(),
+            "właściciel widzi doc_ref"
+        );
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         set_root_override(None);
     }
 
@@ -2496,16 +3047,44 @@ mod tests {
         let _lock = override_lock().lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempdir().unwrap();
         let _g = set_root_override(Some(tmp.path().to_path_buf()));
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
 
-        accept_upload_chunk_host("org-default", "alpha", "u-seq", "text/plain", 0, 3, b"aaa", 0).unwrap();
+        accept_upload_chunk_host(
+            "org-default",
+            "alpha",
+            "u-seq",
+            "text/plain",
+            0,
+            3,
+            b"aaa",
+            0,
+        )
+        .unwrap();
         // Skok do seq=2 (pominięty 1) → mismatch.
-        let err = accept_upload_chunk_host("org-default", "alpha", "u-seq", "text/plain", 2, 3, b"ccc", 0);
-        assert!(matches!(err, Err(("chunk_sequence_mismatch", AbiError::Operation))));
+        let err = accept_upload_chunk_host(
+            "org-default",
+            "alpha",
+            "u-seq",
+            "text/plain",
+            2,
+            3,
+            b"ccc",
+            0,
+        );
+        assert!(matches!(
+            err,
+            Err(("chunk_sequence_mismatch", AbiError::Operation))
+        ));
         // Partial skasowany po mismatch.
         let doc_id = format!("up-{}", sanitize_upload_id("u-seq"));
         assert!(!partial_path(&documents_dir("org-default", "alpha").unwrap(), &doc_id).exists());
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         set_root_override(None);
     }
 
@@ -2515,12 +3094,30 @@ mod tests {
         let _lock = override_lock().lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempdir().unwrap();
         let _g = set_root_override(Some(tmp.path().to_path_buf()));
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
 
         let huge = vec![0u8; MAX_PUT_CHUNK_BYTES + 1];
-        let err = accept_upload_chunk_host("org-default", "alpha", "u-big", "text/plain", 0, 1, &huge, 0);
-        assert!(matches!(err, Err(("chunk_too_large", AbiError::PayloadTooLarge))));
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let err = accept_upload_chunk_host(
+            "org-default",
+            "alpha",
+            "u-big",
+            "text/plain",
+            0,
+            1,
+            &huge,
+            0,
+        );
+        assert!(matches!(
+            err,
+            Err(("chunk_too_large", AbiError::PayloadTooLarge))
+        ));
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         set_root_override(None);
     }
 
@@ -2530,7 +3127,10 @@ mod tests {
         let _lock = override_lock().lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempdir().unwrap();
         let _g = set_root_override(Some(tmp.path().to_path_buf()));
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
 
         assert!(matches!(
             accept_upload_chunk_host("o", "alpha", "u", "text/plain", 0, 0, b"x", 0),
@@ -2549,18 +3149,28 @@ mod tests {
         let _lock = override_lock().lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempdir().unwrap();
         let _g = set_root_override(Some(tmp.path().to_path_buf()));
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
 
         // limit_mb=0 w precheck (start), ale finalizacja dostaje realny limit. Tu
         // 1 MB limit, plik 1 fragment ~9 bajtów → mieści się; potem duży > limit.
         let data = vec![7u8; 2 * 1024 * 1024];
         // 1 fragment 2 MB przekracza MAX_PUT_CHUNK_BYTES? Nie (8 MiB). limit 1 MB.
-        let err = accept_upload_chunk_host("org-default", "alpha", "u-q", "text/plain", 0, 1, &data, 1);
+        let err =
+            accept_upload_chunk_host("org-default", "alpha", "u-q", "text/plain", 0, 1, &data, 1);
         assert!(
-            matches!(err, Err(("storage_limit_exceeded", AbiError::QuotaExceeded))),
+            matches!(
+                err,
+                Err(("storage_limit_exceeded", AbiError::QuotaExceeded))
+            ),
             "2MB plik przy limicie 1MB odrzucony, dostałem {err:?}"
         );
-        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pending_uploads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         set_root_override(None);
     }
 }

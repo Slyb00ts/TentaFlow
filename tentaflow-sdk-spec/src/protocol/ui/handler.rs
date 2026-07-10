@@ -62,13 +62,10 @@ impl<C> Encode<C> for FailurePolicy {
 }
 
 impl<'b, C> Decode<'b, C> for FailurePolicy {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut action: Option<LocalAction> = None;
         for _ in 0..len {
@@ -89,8 +86,8 @@ impl<'b, C> Decode<'b, C> for FailurePolicy {
                 }
             }
         }
-        let kind = kind
-            .ok_or_else(|| minicbor::decode::Error::message("FailurePolicy missing kind"))?;
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("FailurePolicy missing kind"))?;
         match kind.as_str() {
             "toast" => {
                 if action.is_some() {
@@ -123,9 +120,15 @@ impl<'b, C> Decode<'b, C> for FailurePolicy {
 /// LocalAction tagged union (§10.3). Capability-gated by the addon manifest.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocalAction {
-    ShowModal { slot_id: String },
-    HideModal { slot_id: String },
-    ToggleSlot { slot_id: String },
+    ShowModal {
+        slot_id: String,
+    },
+    HideModal {
+        slot_id: String,
+    },
+    ToggleSlot {
+        slot_id: String,
+    },
     SetState {
         path: StatePath,
         value: crate::protocol::value::Value,
@@ -361,13 +364,10 @@ fn emit_single_tstr<W: minicbor::encode::Write>(
 }
 
 impl<'b, C> Decode<'b, C> for LocalAction {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut slot_id: Option<String> = None;
         let mut path: Option<StatePath> = None;
@@ -497,8 +497,8 @@ impl<'b, C> Decode<'b, C> for LocalAction {
                 }
             }
         }
-        let kind = kind
-            .ok_or_else(|| minicbor::decode::Error::message("LocalAction missing kind"))?;
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("LocalAction missing kind"))?;
         // Helper to assert only specified groups of fields are present.
         // We define a compact closure with bool flags per slot.
         struct Allow {
@@ -572,7 +572,10 @@ impl<'b, C> Decode<'b, C> for LocalAction {
         };
         match kind.as_str() {
             "show_modal" => {
-                check_extras(Allow { slot_id: true, ..none })?;
+                check_extras(Allow {
+                    slot_id: true,
+                    ..none
+                })?;
                 Ok(LocalAction::ShowModal {
                     slot_id: slot_id.ok_or_else(|| {
                         minicbor::decode::Error::message("show_modal missing slot_id")
@@ -580,7 +583,10 @@ impl<'b, C> Decode<'b, C> for LocalAction {
                 })
             }
             "hide_modal" => {
-                check_extras(Allow { slot_id: true, ..none })?;
+                check_extras(Allow {
+                    slot_id: true,
+                    ..none
+                })?;
                 Ok(LocalAction::HideModal {
                     slot_id: slot_id.ok_or_else(|| {
                         minicbor::decode::Error::message("hide_modal missing slot_id")
@@ -588,7 +594,10 @@ impl<'b, C> Decode<'b, C> for LocalAction {
                 })
             }
             "toggle_slot" => {
-                check_extras(Allow { slot_id: true, ..none })?;
+                check_extras(Allow {
+                    slot_id: true,
+                    ..none
+                })?;
                 Ok(LocalAction::ToggleSlot {
                     slot_id: slot_id.ok_or_else(|| {
                         minicbor::decode::Error::message("toggle_slot missing slot_id")
@@ -596,7 +605,11 @@ impl<'b, C> Decode<'b, C> for LocalAction {
                 })
             }
             "set_state" => {
-                check_extras(Allow { path: true, value: true, ..none })?;
+                check_extras(Allow {
+                    path: true,
+                    value: true,
+                    ..none
+                })?;
                 Ok(LocalAction::SetState {
                     path: path.ok_or_else(|| {
                         minicbor::decode::Error::message("set_state missing path")
@@ -617,13 +630,16 @@ impl<'b, C> Decode<'b, C> for LocalAction {
             "toggle" => {
                 check_extras(Allow { path: true, ..none })?;
                 Ok(LocalAction::Toggle {
-                    path: path.ok_or_else(|| {
-                        minicbor::decode::Error::message("toggle missing path")
-                    })?,
+                    path: path
+                        .ok_or_else(|| minicbor::decode::Error::message("toggle missing path"))?,
                 })
             }
             "increment" => {
-                check_extras(Allow { path: true, delta: true, ..none })?;
+                check_extras(Allow {
+                    path: true,
+                    delta: true,
+                    ..none
+                })?;
                 Ok(LocalAction::Increment {
                     path: path.ok_or_else(|| {
                         minicbor::decode::Error::message("increment missing path")
@@ -634,7 +650,10 @@ impl<'b, C> Decode<'b, C> for LocalAction {
                 })
             }
             "navigate" => {
-                check_extras(Allow { panel_id: true, ..none })?;
+                check_extras(Allow {
+                    panel_id: true,
+                    ..none
+                })?;
                 Ok(LocalAction::Navigate {
                     panel_id: panel_id.ok_or_else(|| {
                         minicbor::decode::Error::message("navigate missing panel_id")
@@ -642,7 +661,10 @@ impl<'b, C> Decode<'b, C> for LocalAction {
                 })
             }
             "focus" => {
-                check_extras(Allow { component_id: true, ..none })?;
+                check_extras(Allow {
+                    component_id: true,
+                    ..none
+                })?;
                 Ok(LocalAction::Focus {
                     component_id: component_id.ok_or_else(|| {
                         minicbor::decode::Error::message("focus missing component_id")
@@ -650,7 +672,11 @@ impl<'b, C> Decode<'b, C> for LocalAction {
                 })
             }
             "scroll" => {
-                check_extras(Allow { component_id: true, behavior: true, ..none })?;
+                check_extras(Allow {
+                    component_id: true,
+                    behavior: true,
+                    ..none
+                })?;
                 Ok(LocalAction::Scroll {
                     component_id: component_id.ok_or_else(|| {
                         minicbor::decode::Error::message("scroll missing component_id")
@@ -661,11 +687,13 @@ impl<'b, C> Decode<'b, C> for LocalAction {
                 })
             }
             "copy" => {
-                check_extras(Allow { copy_value: true, ..none })?;
+                check_extras(Allow {
+                    copy_value: true,
+                    ..none
+                })?;
                 Ok(LocalAction::Copy {
-                    value: copy_value.ok_or_else(|| {
-                        minicbor::decode::Error::message("copy missing value")
-                    })?,
+                    value: copy_value
+                        .ok_or_else(|| minicbor::decode::Error::message("copy missing value"))?,
                 })
             }
             "confirm" => {
@@ -677,18 +705,16 @@ impl<'b, C> Decode<'b, C> for LocalAction {
                     ..none
                 })?;
                 Ok(LocalAction::Confirm {
-                    title: title.ok_or_else(|| {
-                        minicbor::decode::Error::message("confirm missing title")
-                    })?,
+                    title: title
+                        .ok_or_else(|| minicbor::decode::Error::message("confirm missing title"))?,
                     message: message.ok_or_else(|| {
                         minicbor::decode::Error::message("confirm missing message")
                     })?,
                     destructive: destructive.ok_or_else(|| {
                         minicbor::decode::Error::message("confirm missing destructive")
                     })?,
-                    then: then.ok_or_else(|| {
-                        minicbor::decode::Error::message("confirm missing then")
-                    })?,
+                    then: then
+                        .ok_or_else(|| minicbor::decode::Error::message("confirm missing then"))?,
                 })
             }
             "validate" => {
@@ -711,18 +737,23 @@ impl<'b, C> Decode<'b, C> for LocalAction {
                 })
             }
             "debounce" => {
-                check_extras(Allow { ms: true, then: true, ..none })?;
+                check_extras(Allow {
+                    ms: true,
+                    then: true,
+                    ..none
+                })?;
                 Ok(LocalAction::Debounce {
-                    ms: ms.ok_or_else(|| {
-                        minicbor::decode::Error::message("debounce missing ms")
-                    })?,
-                    then: then.ok_or_else(|| {
-                        minicbor::decode::Error::message("debounce missing then")
-                    })?,
+                    ms: ms
+                        .ok_or_else(|| minicbor::decode::Error::message("debounce missing ms"))?,
+                    then: then
+                        .ok_or_else(|| minicbor::decode::Error::message("debounce missing then"))?,
                 })
             }
             "sequence" => {
-                check_extras(Allow { steps: true, ..none })?;
+                check_extras(Allow {
+                    steps: true,
+                    ..none
+                })?;
                 Ok(LocalAction::Sequence {
                     steps: steps.ok_or_else(|| {
                         minicbor::decode::Error::message("sequence missing steps")
@@ -847,13 +878,10 @@ impl<C> Encode<C> for Handler {
 }
 
 impl<'b, C> Decode<'b, C> for Handler {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut local_action: Option<LocalAction> = None;
         let mut action_id: Option<String> = None;
@@ -901,8 +929,7 @@ impl<'b, C> Decode<'b, C> for Handler {
                 }
             }
         }
-        let kind =
-            kind.ok_or_else(|| minicbor::decode::Error::message("Handler missing kind"))?;
+        let kind = kind.ok_or_else(|| minicbor::decode::Error::message("Handler missing kind"))?;
         match kind.as_str() {
             "local" => {
                 if action_id.is_some()
@@ -1106,7 +1133,9 @@ fn validate_local(
             }
             Ok(())
         }
-        LocalAction::Conditional { then, else_branch, .. } => {
+        LocalAction::Conditional {
+            then, else_branch, ..
+        } => {
             validate_handler(then, depth + 1, steps, inside_sequence)?;
             if let Some(eb) = else_branch {
                 validate_handler(eb, depth + 1, steps, inside_sequence)?;
@@ -1123,10 +1152,7 @@ mod tests {
 
     fn rt<T>(v: T)
     where
-        T: minicbor::Encode<()>
-            + for<'b> minicbor::Decode<'b, ()>
-            + PartialEq
-            + core::fmt::Debug,
+        T: minicbor::Encode<()> + for<'b> minicbor::Decode<'b, ()> + PartialEq + core::fmt::Debug,
     {
         let mut b1 = Vec::new();
         minicbor::encode(&v, &mut b1).unwrap();
@@ -1139,7 +1165,9 @@ mod tests {
 
     #[test]
     fn local_action_leaves_roundtrip() {
-        rt(LocalAction::ShowModal { slot_id: "x".into() });
+        rt(LocalAction::ShowModal {
+            slot_id: "x".into(),
+        });
         rt(LocalAction::Noop);
         rt(LocalAction::Increment {
             path: StatePath::new(vec![PathSegment::Key("__draft".into())]),
@@ -1318,8 +1346,7 @@ mod tests {
         let result = h.validate();
         assert!(matches!(
             result,
-            Err(HandlerValidationError::DepthExceeded)
-                | Err(HandlerValidationError::StepsExceeded)
+            Err(HandlerValidationError::DepthExceeded) | Err(HandlerValidationError::StepsExceeded)
         ));
     }
 }

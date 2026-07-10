@@ -226,7 +226,10 @@ mod tests {
     #[test]
     fn drain_roundtrip() {
         let v = WebRtcDrainOutput {
-            messages: vec![WebRtcMessage { is_text: true, data_b64: "aGk=".into() }],
+            messages: vec![WebRtcMessage {
+                is_text: true,
+                data_b64: "aGk=".into(),
+            }],
             dropped_count: 3,
             queue_len: 5,
             closed: false,
@@ -241,8 +244,14 @@ mod tests {
     fn drain_ref_encodes_same_bytes_as_owned() {
         let owned = WebRtcDrainOutput {
             messages: vec![
-                WebRtcMessage { is_text: true, data_b64: "aGk=".into() },
-                WebRtcMessage { is_text: false, data_b64: "AAEC".into() },
+                WebRtcMessage {
+                    is_text: true,
+                    data_b64: "aGk=".into(),
+                },
+                WebRtcMessage {
+                    is_text: false,
+                    data_b64: "AAEC".into(),
+                },
             ],
             dropped_count: 7,
             queue_len: 11,

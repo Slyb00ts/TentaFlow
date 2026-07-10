@@ -2,22 +2,28 @@
 // File: protocol/ui/data/text.rs — Text/Heading/Paragraph/RichText/MonoBlock/CodeBlock (catalog §4)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::BindRef;
 use super::super::component::{Component, FieldMap};
-use super::super::tokens::{
-    MarkdownBlock, MarkdownMark,
-    TextAlign, TextStyle, TextWrap, Tone,
-};
+use super::super::tokens::{MarkdownBlock, MarkdownMark, TextAlign, TextStyle, TextWrap, Tone};
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
 use super::super::value_format::ValueFormat;
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -42,11 +48,21 @@ impl Text {
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(7);
         entries.push((0, encode_to_value(&self.content)?));
         entries.push((1, encode_to_value(&self.style)?));
-        if let Some(t) = &self.tone { entries.push((2, encode_to_value(t)?)); }
-        if let Some(a) = &self.align { entries.push((3, encode_to_value(a)?)); }
-        if let Some(w) = &self.wrap { entries.push((4, encode_to_value(w)?)); }
-        if let Some(m) = &self.max_lines { entries.push((5, encode_to_value(m)?)); }
-        if let Some(f) = &self.format { entries.push((6, encode_to_value(f)?)); }
+        if let Some(t) = &self.tone {
+            entries.push((2, encode_to_value(t)?));
+        }
+        if let Some(a) = &self.align {
+            entries.push((3, encode_to_value(a)?));
+        }
+        if let Some(w) = &self.wrap {
+            entries.push((4, encode_to_value(w)?));
+        }
+        if let Some(m) = &self.max_lines {
+            entries.push((5, encode_to_value(m)?));
+        }
+        if let Some(f) = &self.format {
+            entries.push((6, encode_to_value(f)?));
+        }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -75,7 +91,11 @@ impl Text {
         Ok(Text {
             content: content.ok_or_else(|| missing_field("Text", "content"))?,
             style: style.ok_or_else(|| missing_field("Text", "style"))?,
-            tone, align, wrap, max_lines, format,
+            tone,
+            align,
+            wrap,
+            max_lines,
+            format,
         })
     }
 }
@@ -100,8 +120,12 @@ impl Heading {
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(4);
         entries.push((0, encode_to_value(&self.content)?));
         entries.push((1, encode_to_value(&self.level)?));
-        if let Some(t) = &self.tone { entries.push((2, encode_to_value(t)?)); }
-        if let Some(a) = &self.align { entries.push((3, encode_to_value(a)?)); }
+        if let Some(t) = &self.tone {
+            entries.push((2, encode_to_value(t)?));
+        }
+        if let Some(a) = &self.align {
+            entries.push((3, encode_to_value(a)?));
+        }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -124,7 +148,8 @@ impl Heading {
         Ok(Heading {
             content: content.ok_or_else(|| missing_field("Heading", "content"))?,
             level: level.ok_or_else(|| missing_field("Heading", "level"))?,
-            tone, align,
+            tone,
+            align,
         })
     }
 }
@@ -151,7 +176,9 @@ impl Paragraph {
         entries.push((1, encode_to_value(&self.style)?));
         entries.push((2, encode_to_value(&self.allowed_marks)?));
         entries.push((3, encode_to_value(&self.allow_links)?));
-        if let Some(m) = &self.max_lines { entries.push((4, encode_to_value(m)?)); }
+        if let Some(m) = &self.max_lines {
+            entries.push((4, encode_to_value(m)?));
+        }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -204,7 +231,9 @@ impl RichText {
         entries.push((0, encode_to_value(&self.content)?));
         entries.push((1, encode_to_value(&self.allowed_blocks)?));
         entries.push((2, encode_to_value(&self.allowed_marks)?));
-        if let Some(h) = &self.max_height_px { entries.push((3, encode_to_value(h)?)); }
+        if let Some(h) = &self.max_height_px {
+            entries.push((3, encode_to_value(h)?));
+        }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -251,7 +280,9 @@ impl MonoBlock {
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(4);
         entries.push((0, encode_to_value(&self.content)?));
-        if let Some(h) = &self.max_height_px { entries.push((1, encode_to_value(h)?)); }
+        if let Some(h) = &self.max_height_px {
+            entries.push((1, encode_to_value(h)?));
+        }
         entries.push((2, encode_to_value(&self.word_wrap)?));
         entries.push((3, encode_to_value(&self.copyable)?));
         Ok(component(Self::TAG, id, entries))
@@ -305,7 +336,9 @@ impl CodeBlock {
         entries.push((1, encode_to_value(&self.language)?));
         entries.push((2, encode_to_value(&self.show_line_numbers)?));
         entries.push((3, encode_to_value(&self.copyable)?));
-        if let Some(h) = &self.max_height_px { entries.push((4, encode_to_value(h)?)); }
+        if let Some(h) = &self.max_height_px {
+            entries.push((4, encode_to_value(h)?));
+        }
         entries.push((5, encode_to_value(&self.highlight_lines)?));
         Ok(component(Self::TAG, id, entries))
     }
@@ -333,11 +366,11 @@ impl CodeBlock {
         Ok(CodeBlock {
             content: content.ok_or_else(|| missing_field("CodeBlock", "content"))?,
             language: language.ok_or_else(|| missing_field("CodeBlock", "language"))?,
-            show_line_numbers: show_line_numbers.ok_or_else(|| missing_field("CodeBlock", "show_line_numbers"))?,
+            show_line_numbers: show_line_numbers
+                .ok_or_else(|| missing_field("CodeBlock", "show_line_numbers"))?,
             copyable: copyable.ok_or_else(|| missing_field("CodeBlock", "copyable"))?,
             max_height_px,
             highlight_lines: highlight_lines.unwrap_or_default(),
         })
     }
 }
-

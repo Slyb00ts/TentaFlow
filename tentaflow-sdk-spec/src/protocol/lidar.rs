@@ -150,7 +150,8 @@ impl LidarFrameHeader {
     /// Total frame size in bytes (`LIDAR_HEADER_LEN + body_len`).
     #[inline]
     pub fn frame_len(&self) -> Option<usize> {
-        self.body_len().and_then(|b| b.checked_add(LIDAR_HEADER_LEN))
+        self.body_len()
+            .and_then(|b| b.checked_add(LIDAR_HEADER_LEN))
     }
 
     /// Serialize the header to its fixed little-endian byte layout.
@@ -316,11 +317,7 @@ mod tests {
     #[test]
     fn lidar_full_frame_builds_and_parses_back_xyz() {
         // Build a full canonical frame: header + N interleaved [x,y,z] f32 points.
-        let points: [[f32; 3]; 3] = [
-            [0.0, 1.0, 2.0],
-            [-3.5, 4.25, 5.0],
-            [10.0, -20.0, 30.5],
-        ];
+        let points: [[f32; 3]; 3] = [[0.0, 1.0, 2.0], [-3.5, 4.25, 5.0], [10.0, -20.0, 30.5]];
         let h = sample_header(points.len() as u32);
         let body_len = h.body_len().unwrap();
         let mut frame = Vec::with_capacity(LIDAR_HEADER_LEN + body_len);
@@ -341,12 +338,8 @@ mod tests {
         for (i, p) in points.iter().enumerate() {
             for (c, expect) in p.iter().enumerate() {
                 let off = (i * stride + c) * 4;
-                let got = f32::from_le_bytes([
-                    body[off],
-                    body[off + 1],
-                    body[off + 2],
-                    body[off + 3],
-                ]);
+                let got =
+                    f32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
                 assert_eq!(got, *expect, "point {i} comp {c}");
             }
         }

@@ -5,6 +5,7 @@
 // typed SDK layer reflects the on-wire schema only.
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::component::{Component, FieldMap};
 use super::super::inline::DimensionToken;
 use super::super::tokens::{IFrameReferrerPolicy, IFrameSandbox};
@@ -12,11 +13,19 @@ use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 /// Sandboxed iframe (catalog §8 0x060A).
@@ -47,9 +56,12 @@ impl IFrame {
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "IFrame")?;
         ensure_no_duplicate_keys("IFrame", &c.fields.0)?;
-        let mut src = None; let mut sandbox = None;
-        let mut width = None; let mut height = None;
-        let mut title = None; let mut referrer_policy = None;
+        let mut src = None;
+        let mut sandbox = None;
+        let mut width = None;
+        let mut height = None;
+        let mut title = None;
+        let mut referrer_policy = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => src = Some(decode_from_value(v)?),
@@ -67,7 +79,8 @@ impl IFrame {
             width: width.ok_or_else(|| missing_field("IFrame", "width"))?,
             height: height.ok_or_else(|| missing_field("IFrame", "height"))?,
             title: title.ok_or_else(|| missing_field("IFrame", "title"))?,
-            referrer_policy: referrer_policy.ok_or_else(|| missing_field("IFrame", "referrer_policy"))?,
+            referrer_policy: referrer_policy
+                .ok_or_else(|| missing_field("IFrame", "referrer_policy"))?,
         })
     }
 }

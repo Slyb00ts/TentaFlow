@@ -89,18 +89,18 @@ pub fn doc_parse_v1(
         }
     };
 
-    let image_bytes = match base64::engine::general_purpose::STANDARD.decode(input.image_b64.as_bytes())
-    {
-        Ok(b) if !b.is_empty() => b,
-        Ok(_) => {
-            audit(caller.data(), "denied", Some("image_empty"));
-            return AbiError::Operation.as_i32();
-        }
-        Err(_) => {
-            audit(caller.data(), "denied", Some("image_b64_invalid"));
-            return AbiError::Operation.as_i32();
-        }
-    };
+    let image_bytes =
+        match base64::engine::general_purpose::STANDARD.decode(input.image_b64.as_bytes()) {
+            Ok(b) if !b.is_empty() => b,
+            Ok(_) => {
+                audit(caller.data(), "denied", Some("image_empty"));
+                return AbiError::Operation.as_i32();
+            }
+            Err(_) => {
+                audit(caller.data(), "denied", Some("image_b64_invalid"));
+                return AbiError::Operation.as_i32();
+            }
+        };
 
     let model = input
         .model_alias
@@ -109,12 +109,7 @@ pub fn doc_parse_v1(
 
     // Executor żyje pod routerem. Brak routera (DB-less harness) → operacja
     // niedostępna, nie cichy sukces.
-    let executor = match caller
-        .data()
-        .router
-        .as_ref()
-        .and_then(|r| r.executor())
-    {
+    let executor = match caller.data().router.as_ref().and_then(|r| r.executor()) {
         Some(e) => e,
         None => {
             audit(caller.data(), "error", Some("executor_unavailable"));
@@ -143,13 +138,11 @@ pub fn doc_parse_v1(
         .filter(|id| !id.is_empty())
         .map(|id| crate::auth::acl::UserContext::new(id, "user"));
 
-    let mut ctx =
-        ExecutionContext::new(caller_user).with_addon_identity(Some(addon_id), org_id);
+    let mut ctx = ExecutionContext::new(caller_user).with_addon_identity(Some(addon_id), org_id);
 
     // Most async→sync: host function jest synchroniczna, executor async.
     let result = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current()
-            .block_on(executor.execute_documents(request, &mut ctx))
+        tokio::runtime::Handle::current().block_on(executor.execute_documents(request, &mut ctx))
     });
 
     let response = match result {

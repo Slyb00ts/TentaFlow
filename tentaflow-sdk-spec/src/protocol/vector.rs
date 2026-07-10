@@ -234,7 +234,10 @@ mod tests {
         roundtrip(&VectorHybridSearchInput {
             namespace: "documents".into(),
             dense_b64: "AAAAAA==".into(),
-            sparse: crate::SparseVector { indices: vec![1], values: vec![1.0] },
+            sparse: crate::SparseVector {
+                indices: vec![1],
+                values: vec![1.0],
+            },
             k: 5,
             gate_claim_id: None,
             filter: None,

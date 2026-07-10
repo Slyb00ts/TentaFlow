@@ -91,9 +91,8 @@ impl<C> Encode<C> for Channel {
 impl<'b, C> Decode<'b, C> for Channel {
     fn decode(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
         let v = d.u8()?;
-        Self::from_u8(v).ok_or_else(|| {
-            minicbor::decode::Error::message("unknown Channel discriminant")
-        })
+        Self::from_u8(v)
+            .ok_or_else(|| minicbor::decode::Error::message("unknown Channel discriminant"))
     }
 }
 
@@ -138,9 +137,8 @@ impl<C> Encode<C> for Priority {
 impl<'b, C> Decode<'b, C> for Priority {
     fn decode(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
         let v = d.u8()?;
-        Self::from_u8(v).ok_or_else(|| {
-            minicbor::decode::Error::message("unknown Priority discriminant")
-        })
+        Self::from_u8(v)
+            .ok_or_else(|| minicbor::decode::Error::message("unknown Priority discriminant"))
     }
 }
 

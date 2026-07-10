@@ -2,6 +2,7 @@
 // File: protocol/ui/form/range.rs — Slider/RangeSlider/SliderRow (catalog §5)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::{BindRef, StatePath};
 use super::super::component::{Component, FieldMap};
 use super::super::inline::SliderMark;
@@ -11,11 +12,19 @@ use super::super::typed_field::{
     unknown_field, IntoComponentError,
 };
 use super::super::value_format::ValueFormat;
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -45,10 +54,16 @@ impl Slider {
         e.push((1, encode_to_value(&self.min)?));
         e.push((2, encode_to_value(&self.max)?));
         e.push((3, encode_to_value(&self.step)?));
-        if let Some(v) = &self.label { e.push((4, encode_to_value(v)?)); }
+        if let Some(v) = &self.label {
+            e.push((4, encode_to_value(v)?));
+        }
         e.push((5, encode_to_value(&self.show_value)?));
-        if let Some(v) = &self.format { e.push((6, encode_to_value(v)?)); }
-        if let Some(v) = &self.marks { e.push((7, encode_to_value(v)?)); }
+        if let Some(v) = &self.format {
+            e.push((6, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.marks {
+            e.push((7, encode_to_value(v)?));
+        }
         e.push((8, encode_to_value(&self.tone)?));
         Ok(component(Self::TAG, id, e))
     }
@@ -56,9 +71,15 @@ impl Slider {
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "Slider")?;
         ensure_no_duplicate_keys("Slider", &c.fields.0)?;
-        let mut bind_path = None; let mut min = None; let mut max = None; let mut step = None;
-        let mut label = None; let mut show_value = None; let mut format = None;
-        let mut marks = None; let mut tone = None;
+        let mut bind_path = None;
+        let mut min = None;
+        let mut max = None;
+        let mut step = None;
+        let mut label = None;
+        let mut show_value = None;
+        let mut format = None;
+        let mut marks = None;
+        let mut tone = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => bind_path = Some(decode_from_value(v)?),
@@ -80,7 +101,8 @@ impl Slider {
             step: step.ok_or_else(|| missing_field("Slider", "step"))?,
             label,
             show_value: show_value.ok_or_else(|| missing_field("Slider", "show_value"))?,
-            format, marks,
+            format,
+            marks,
             tone: tone.ok_or_else(|| missing_field("Slider", "tone"))?,
         })
     }
@@ -116,10 +138,16 @@ impl RangeSlider {
         e.push((2, encode_to_value(&self.min)?));
         e.push((3, encode_to_value(&self.max)?));
         e.push((4, encode_to_value(&self.step)?));
-        if let Some(v) = &self.label { e.push((5, encode_to_value(v)?)); }
+        if let Some(v) = &self.label {
+            e.push((5, encode_to_value(v)?));
+        }
         e.push((6, encode_to_value(&self.show_value)?));
-        if let Some(v) = &self.format { e.push((7, encode_to_value(v)?)); }
-        if let Some(v) = &self.marks { e.push((8, encode_to_value(v)?)); }
+        if let Some(v) = &self.format {
+            e.push((7, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.marks {
+            e.push((8, encode_to_value(v)?));
+        }
         e.push((9, encode_to_value(&self.tone)?));
         e.push((10, encode_to_value(&self.min_separation)?));
         Ok(component(Self::TAG, id, e))
@@ -128,10 +156,17 @@ impl RangeSlider {
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "RangeSlider")?;
         ensure_no_duplicate_keys("RangeSlider", &c.fields.0)?;
-        let mut bind_path_min = None; let mut bind_path_max = None;
-        let mut min = None; let mut max = None; let mut step = None;
-        let mut label = None; let mut show_value = None; let mut format = None;
-        let mut marks = None; let mut tone = None; let mut min_separation = None;
+        let mut bind_path_min = None;
+        let mut bind_path_max = None;
+        let mut min = None;
+        let mut max = None;
+        let mut step = None;
+        let mut label = None;
+        let mut show_value = None;
+        let mut format = None;
+        let mut marks = None;
+        let mut tone = None;
+        let mut min_separation = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => bind_path_min = Some(decode_from_value(v)?),
@@ -149,16 +184,20 @@ impl RangeSlider {
             }
         }
         Ok(RangeSlider {
-            bind_path_min: bind_path_min.ok_or_else(|| missing_field("RangeSlider", "bind_path_min"))?,
-            bind_path_max: bind_path_max.ok_or_else(|| missing_field("RangeSlider", "bind_path_max"))?,
+            bind_path_min: bind_path_min
+                .ok_or_else(|| missing_field("RangeSlider", "bind_path_min"))?,
+            bind_path_max: bind_path_max
+                .ok_or_else(|| missing_field("RangeSlider", "bind_path_max"))?,
             min: min.ok_or_else(|| missing_field("RangeSlider", "min"))?,
             max: max.ok_or_else(|| missing_field("RangeSlider", "max"))?,
             step: step.ok_or_else(|| missing_field("RangeSlider", "step"))?,
             label,
             show_value: show_value.ok_or_else(|| missing_field("RangeSlider", "show_value"))?,
-            format, marks,
+            format,
+            marks,
             tone: tone.ok_or_else(|| missing_field("RangeSlider", "tone"))?,
-            min_separation: min_separation.ok_or_else(|| missing_field("RangeSlider", "min_separation"))?,
+            min_separation: min_separation
+                .ok_or_else(|| missing_field("RangeSlider", "min_separation"))?,
         })
     }
 }
@@ -191,8 +230,12 @@ impl SliderRow {
         e.push((2, encode_to_value(&self.max)?));
         e.push((3, encode_to_value(&self.step)?));
         e.push((4, encode_to_value(&self.label)?));
-        if let Some(v) = &self.format { e.push((5, encode_to_value(v)?)); }
-        if let Some(v) = &self.marks { e.push((6, encode_to_value(v)?)); }
+        if let Some(v) = &self.format {
+            e.push((5, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.marks {
+            e.push((6, encode_to_value(v)?));
+        }
         e.push((7, encode_to_value(&self.tone)?));
         e.push((8, encode_to_value(&self.layout)?));
         Ok(component(Self::TAG, id, e))
@@ -201,9 +244,15 @@ impl SliderRow {
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "SliderRow")?;
         ensure_no_duplicate_keys("SliderRow", &c.fields.0)?;
-        let mut bind_path = None; let mut min = None; let mut max = None; let mut step = None;
-        let mut label = None; let mut format = None; let mut marks = None;
-        let mut tone = None; let mut layout = None;
+        let mut bind_path = None;
+        let mut min = None;
+        let mut max = None;
+        let mut step = None;
+        let mut label = None;
+        let mut format = None;
+        let mut marks = None;
+        let mut tone = None;
+        let mut layout = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => bind_path = Some(decode_from_value(v)?),
@@ -224,7 +273,8 @@ impl SliderRow {
             max: max.ok_or_else(|| missing_field("SliderRow", "max"))?,
             step: step.ok_or_else(|| missing_field("SliderRow", "step"))?,
             label: label.ok_or_else(|| missing_field("SliderRow", "label"))?,
-            format, marks,
+            format,
+            marks,
             tone: tone.ok_or_else(|| missing_field("SliderRow", "tone"))?,
             layout: layout.ok_or_else(|| missing_field("SliderRow", "layout"))?,
         })

@@ -2,6 +2,7 @@
 // File: protocol/ui/data/gauge.rs — Heatmap/Gauge (catalog §4)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::{BindRef, StatePath};
 use super::super::component::{Component, FieldMap};
 use super::super::inline::{GaugeThreshold, HeatmapColumn, HeatmapRow, HeatmapScale};
@@ -11,11 +12,19 @@ use super::super::typed_field::{
     unknown_field, IntoComponentError,
 };
 use super::super::value_format::ValueFormat;
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -76,7 +85,8 @@ impl Heatmap {
             columns: columns.unwrap_or_default(),
             cells_path: cells_path.ok_or_else(|| missing_field("Heatmap", "cells_path"))?,
             scale: scale.ok_or_else(|| missing_field("Heatmap", "scale"))?,
-            legend_position: legend_position.ok_or_else(|| missing_field("Heatmap", "legend_position"))?,
+            legend_position: legend_position
+                .ok_or_else(|| missing_field("Heatmap", "legend_position"))?,
             cell_size_px: cell_size_px.ok_or_else(|| missing_field("Heatmap", "cell_size_px"))?,
             tooltip: tooltip.ok_or_else(|| missing_field("Heatmap", "tooltip"))?,
         })
@@ -111,8 +121,12 @@ impl Gauge {
         e.push((2, encode_to_value(&self.max)?));
         e.push((3, encode_to_value(&self.thresholds)?));
         e.push((4, encode_to_value(&self.variant)?));
-        if let Some(l) = &self.label { e.push((5, encode_to_value(l)?)); }
-        if let Some(f) = &self.format { e.push((6, encode_to_value(f)?)); }
+        if let Some(l) = &self.label {
+            e.push((5, encode_to_value(l)?));
+        }
+        if let Some(f) = &self.format {
+            e.push((6, encode_to_value(f)?));
+        }
         e.push((7, encode_to_value(&self.size_px)?));
         Ok(component(Self::TAG, id, e))
     }

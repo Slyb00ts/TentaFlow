@@ -99,7 +99,13 @@ fn channel_id_valid(s: &str) -> bool {
     }
 }
 
-fn audit(state: &AddonState, action: &str, resource: Option<&str>, result: &str, reason: Option<&str>) {
+fn audit(
+    state: &AddonState,
+    action: &str,
+    resource: Option<&str>,
+    result: &str,
+    reason: Option<&str>,
+) {
     audit_log_with_risk(
         state,
         action,
@@ -140,7 +146,10 @@ fn lock_ops(entry: &ChannelEntry) -> std::sync::MutexGuard<'_, DrainPending> {
 
 /// Take the channel's inbound H.264 byte stream (single consumer). Used by the
 /// camera backed-registration path. `None` if no such channel / no video / taken.
-pub fn take_channel_video(addon_id: &str, channel_id: &str) -> Option<mpsc::Receiver<bytes::Bytes>> {
+pub fn take_channel_video(
+    addon_id: &str,
+    channel_id: &str,
+) -> Option<mpsc::Receiver<bytes::Bytes>> {
     lookup(addon_id, channel_id).and_then(|e| e.chan.take_h264_rx())
 }
 
@@ -226,20 +235,43 @@ pub fn webrtc_connect_v1(
         None => return AbiError::Operation.as_i32(),
     };
     if !check_permission(caller.data(), PERM_WEBRTC_CONNECT, None) {
-        audit(caller.data(), "webrtc.connect", None, "denied", Some("missing_permission"));
+        audit(
+            caller.data(),
+            "webrtc.connect",
+            None,
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
-    let input: WebRtcConnectInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
-            Ok(v) => v,
-            Err(e) => {
-                audit(caller.data(), "webrtc.connect", None, "error", Some("invalid_payload"));
-                return e.as_i32();
-            }
-        };
+    let input: WebRtcConnectInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "webrtc.connect",
+                None,
+                "error",
+                Some("invalid_payload"),
+            );
+            return e.as_i32();
+        }
+    };
 
     if input.data_channel_label.is_empty() || input.data_channel_label.len() > 64 {
-        audit(caller.data(), "webrtc.connect", None, "error", Some("invalid_label"));
+        audit(
+            caller.data(),
+            "webrtc.connect",
+            None,
+            "error",
+            Some("invalid_label"),
+        );
         return AbiError::Operation.as_i32();
     }
 
@@ -250,11 +282,23 @@ pub fn webrtc_connect_v1(
     let reg = channels();
     let global_count: usize = reg.iter().map(|e| e.value().len()).sum();
     if global_count >= MAX_CHANNELS_GLOBAL {
-        audit(caller.data(), "webrtc.connect", None, "denied", Some("quota_global"));
+        audit(
+            caller.data(),
+            "webrtc.connect",
+            None,
+            "denied",
+            Some("quota_global"),
+        );
         return AbiError::QuotaExceeded.as_i32();
     }
     if reg.get(&addon_id).map(|i| i.len()).unwrap_or(0) >= MAX_CHANNELS_PER_ADDON {
-        audit(caller.data(), "webrtc.connect", None, "denied", Some("quota_per_addon"));
+        audit(
+            caller.data(),
+            "webrtc.connect",
+            None,
+            "denied",
+            Some("quota_per_addon"),
+        );
         return AbiError::QuotaExceeded.as_i32();
     }
 
@@ -289,7 +333,13 @@ pub fn webrtc_connect_v1(
     let (chan, offer_sdp) = match created {
         Ok(v) => v,
         Err(_) => {
-            audit(caller.data(), "webrtc.connect", None, "error", Some("create_failed"));
+            audit(
+                caller.data(),
+                "webrtc.connect",
+                None,
+                "error",
+                Some("create_failed"),
+            );
             return AbiError::Operation.as_i32();
         }
     };
@@ -303,10 +353,27 @@ pub fn webrtc_connect_v1(
             bound_camera: Mutex::new(None),
         }),
     );
-    audit(caller.data(), "webrtc.connect", Some(&channel_id), "ok", None);
+    audit(
+        caller.data(),
+        "webrtc.connect",
+        Some(&channel_id),
+        "ok",
+        None,
+    );
 
-    let out = WebRtcConnectOutput { channel_id, offer_sdp };
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    let out = WebRtcConnectOutput {
+        channel_id,
+        offer_sdp,
+    };
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 // =============================================================================
@@ -328,11 +395,16 @@ pub fn webrtc_set_answer_v1(
     if !check_permission(caller.data(), PERM_WEBRTC_CONNECT, None) {
         return AbiError::Permission.as_i32();
     }
-    let input: WebRtcSetAnswerInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
-            Ok(v) => v,
-            Err(e) => return e.as_i32(),
-        };
+    let input: WebRtcSetAnswerInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => return e.as_i32(),
+    };
     if !channel_id_valid(&input.channel_id) {
         return AbiError::NotFound.as_i32();
     }
@@ -345,12 +417,32 @@ pub fn webrtc_set_answer_v1(
     let _g = lock_ops(&entry);
     let res = run_async(entry.chan.set_answer(input.answer_sdp));
     if res.is_err() {
-        audit(caller.data(), "webrtc.set_answer", Some(&input.channel_id), "error", Some("set_answer_failed"));
+        audit(
+            caller.data(),
+            "webrtc.set_answer",
+            Some(&input.channel_id),
+            "error",
+            Some("set_answer_failed"),
+        );
         return AbiError::Operation.as_i32();
     }
-    audit(caller.data(), "webrtc.set_answer", Some(&input.channel_id), "ok", None);
+    audit(
+        caller.data(),
+        "webrtc.set_answer",
+        Some(&input.channel_id),
+        "ok",
+        None,
+    );
     let out = WebRtcStatusOutput { ok: true };
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 // =============================================================================
@@ -372,11 +464,16 @@ pub fn webrtc_state_v1(
     if !check_permission(caller.data(), PERM_WEBRTC_CONNECT, None) {
         return AbiError::Permission.as_i32();
     }
-    let input: WebRtcStateInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
-            Ok(v) => v,
-            Err(e) => return e.as_i32(),
-        };
+    let input: WebRtcStateInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => return e.as_i32(),
+    };
     if !channel_id_valid(&input.channel_id) {
         return AbiError::NotFound.as_i32();
     }
@@ -394,7 +491,15 @@ pub fn webrtc_state_v1(
         queue_len,
         rtt_ms: entry.chan.rtt_ms(),
     };
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 // =============================================================================
@@ -416,11 +521,16 @@ pub fn webrtc_send_v1(
     if !check_permission(caller.data(), PERM_WEBRTC_CONNECT, None) {
         return AbiError::Permission.as_i32();
     }
-    let input: WebRtcSendInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
-            Ok(v) => v,
-            Err(e) => return e.as_i32(),
-        };
+    let input: WebRtcSendInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => return e.as_i32(),
+    };
     if !channel_id_valid(&input.channel_id) {
         return AbiError::NotFound.as_i32();
     }
@@ -453,7 +563,15 @@ pub fn webrtc_send_v1(
         return AbiError::Operation.as_i32();
     }
     let out = WebRtcStatusOutput { ok: true };
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 // =============================================================================
@@ -475,11 +593,16 @@ pub fn webrtc_drain_v1(
     if !check_permission(caller.data(), PERM_WEBRTC_CONNECT, None) {
         return AbiError::Permission.as_i32();
     }
-    let input: WebRtcDrainInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
-            Ok(v) => v,
-            Err(e) => return e.as_i32(),
-        };
+    let input: WebRtcDrainInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => return e.as_i32(),
+    };
     if !channel_id_valid(&input.channel_id) {
         return AbiError::NotFound.as_i32();
     }
@@ -497,12 +620,18 @@ pub fn webrtc_drain_v1(
     // one inbound-lock acquisition; a retry (staged batch kept) re-encodes the
     // frozen snapshot so the bytes are identical across OutputBufferTooSmall.
     if ops.pending.is_empty() {
-        let (msgs, remaining) =
-            run_async(entry.chan.dc_drain_budget_with_remaining(max, MAX_DRAIN_BYTES));
+        let (msgs, remaining) = run_async(
+            entry
+                .chan
+                .dc_drain_budget_with_remaining(max, MAX_DRAIN_BYTES),
+        );
         ops.pending = msgs.into_iter().map(to_message).collect();
         ops.dropped_count = entry.chan.dropped_count();
         ops.queue_len = remaining as u32;
-        ops.closed = matches!(entry.chan.state(), ChannelState::Closed | ChannelState::Failed);
+        ops.closed = matches!(
+            entry.chan.state(),
+            ChannelState::Closed | ChannelState::Failed
+        );
     }
     // Encode from a BORROW of the frozen staged batch (no deep clone).
     let out = WebRtcDrainOutputRef {
@@ -511,7 +640,15 @@ pub fn webrtc_drain_v1(
         queue_len: ops.queue_len,
         closed: ops.closed,
     };
-    let rc = write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall);
+    let rc = write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    );
     // Consume the staged batch ONLY once it actually reached the guest (rc == 0).
     // On OutputBufferTooSmall the SDK retries with a bigger buffer and gets the
     // same batch; on any other error the batch is kept (never silently lost).
@@ -540,11 +677,16 @@ pub fn webrtc_close_v1(
     if !check_permission(caller.data(), PERM_WEBRTC_CONNECT, None) {
         return AbiError::Permission.as_i32();
     }
-    let input: WebRtcCloseInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
-            Ok(v) => v,
-            Err(e) => return e.as_i32(),
-        };
+    let input: WebRtcCloseInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => return e.as_i32(),
+    };
     let addon_id = caller.data().addon_id.clone();
     let entry = match lookup(&addon_id, &input.channel_id) {
         Some(e) => e,
@@ -553,16 +695,32 @@ pub fn webrtc_close_v1(
     {
         // Serialize against in-flight ops, close the peer, then deregister.
         let _g = lock_ops(&entry);
-        run_async(async { let _ = entry.chan.close().await; });
+        run_async(async {
+            let _ = entry.chan.close().await;
+        });
         if let Some(inner) = channels().get(&addon_id) {
             inner.remove(&input.channel_id);
         }
     }
     #[cfg(feature = "camera")]
     remove_bound_camera(&addon_id, &entry);
-    audit(caller.data(), "webrtc.close", Some(&input.channel_id), "ok", None);
+    audit(
+        caller.data(),
+        "webrtc.close",
+        Some(&input.channel_id),
+        "ok",
+        None,
+    );
     let out = WebRtcStatusOutput { ok: true };
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::ServiceCall)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
 }
 
 /// Deterministic teardown of every channel owned by an addon — called from

@@ -102,13 +102,10 @@ impl<C> Encode<C> for PatchOpKind {
 }
 
 impl<'b, C> Decode<'b, C> for PatchOpKind {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut value: Option<Value> = None;
         let mut index: Option<u32> = None;
@@ -152,8 +149,8 @@ impl<'b, C> Decode<'b, C> for PatchOpKind {
                 }
             }
         }
-        let kind = kind
-            .ok_or_else(|| minicbor::decode::Error::message("PatchOpKind missing kind"))?;
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("PatchOpKind missing kind"))?;
         let no_extras = |allow_value: bool,
                          allow_index: bool,
                          allow_delta: bool,
@@ -187,9 +184,7 @@ impl<'b, C> Decode<'b, C> for PatchOpKind {
                 no_extras(true, false, false, false)?;
                 Ok(PatchOpKind::AppendArray {
                     value: value.ok_or_else(|| {
-                        minicbor::decode::Error::message(
-                            "PatchOpKind.append_array missing value",
-                        )
+                        minicbor::decode::Error::message("PatchOpKind.append_array missing value")
                     })?,
                 })
             }
@@ -197,9 +192,7 @@ impl<'b, C> Decode<'b, C> for PatchOpKind {
                 no_extras(true, false, false, false)?;
                 Ok(PatchOpKind::PrependArray {
                     value: value.ok_or_else(|| {
-                        minicbor::decode::Error::message(
-                            "PatchOpKind.prepend_array missing value",
-                        )
+                        minicbor::decode::Error::message("PatchOpKind.prepend_array missing value")
                     })?,
                 })
             }
@@ -207,14 +200,10 @@ impl<'b, C> Decode<'b, C> for PatchOpKind {
                 no_extras(true, true, false, false)?;
                 Ok(PatchOpKind::InsertArray {
                     index: index.ok_or_else(|| {
-                        minicbor::decode::Error::message(
-                            "PatchOpKind.insert_array missing index",
-                        )
+                        minicbor::decode::Error::message("PatchOpKind.insert_array missing index")
                     })?,
                     value: value.ok_or_else(|| {
-                        minicbor::decode::Error::message(
-                            "PatchOpKind.insert_array missing value",
-                        )
+                        minicbor::decode::Error::message("PatchOpKind.insert_array missing value")
                     })?,
                 })
             }
@@ -222,9 +211,7 @@ impl<'b, C> Decode<'b, C> for PatchOpKind {
                 no_extras(false, true, false, false)?;
                 Ok(PatchOpKind::RemoveArray {
                     index: index.ok_or_else(|| {
-                        minicbor::decode::Error::message(
-                            "PatchOpKind.remove_array missing index",
-                        )
+                        minicbor::decode::Error::message("PatchOpKind.remove_array missing index")
                     })?,
                 })
             }
@@ -232,9 +219,7 @@ impl<'b, C> Decode<'b, C> for PatchOpKind {
                 no_extras(false, false, false, true)?;
                 Ok(PatchOpKind::MergeMap {
                     value: map_value.ok_or_else(|| {
-                        minicbor::decode::Error::message(
-                            "PatchOpKind.merge_map missing value",
-                        )
+                        minicbor::decode::Error::message("PatchOpKind.merge_map missing value")
                     })?,
                 })
             }
@@ -260,10 +245,7 @@ mod tests {
 
     fn rt<T>(v: T)
     where
-        T: minicbor::Encode<()>
-            + for<'b> minicbor::Decode<'b, ()>
-            + PartialEq
-            + core::fmt::Debug,
+        T: minicbor::Encode<()> + for<'b> minicbor::Decode<'b, ()> + PartialEq + core::fmt::Debug,
     {
         let mut buf1 = Vec::new();
         minicbor::encode(&v, &mut buf1).unwrap();

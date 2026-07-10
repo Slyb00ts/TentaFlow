@@ -68,6 +68,19 @@ pub struct RecordingStatsInput {
     pub camera_id: Option<String>,
 }
 
+/// Input for `recording_list_v1`. `camera_id` is optional (absent = all of the
+/// addon's cameras); `limit` caps the returned rows (host clamps to a sane max).
+/// Only `kind = "segment"` per-vehicle event clips are returned — snapshots are
+/// intentionally excluded from the browsable recordings list.
+#[derive(Debug, Clone, Default, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct RecordingListInput {
+    #[n(0)]
+    pub camera_id: Option<String>,
+    #[n(1)]
+    pub limit: u32,
+}
+
 /// Input for `frame_url_v1`.
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 #[cbor(map)]
@@ -173,6 +186,36 @@ pub struct StatsOut {
     pub per_camera: Vec<StatsPerCamera>,
 }
 
+/// One row of `recording_list_v1`: the catalog fields a recordings browser
+/// needs to render a list and open a signed playback URL. `event_meta` is the
+/// raw JSON summary string written by the per-vehicle event recorder (plate/ADR
+/// OCR votes) — the addon parses it client-side; it is `None` for artifacts with
+/// no summary.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct RecordingListItem {
+    #[n(0)]
+    pub recording_ref: String,
+    #[n(1)]
+    pub camera_id: String,
+    #[n(2)]
+    pub created_at: i64,
+    #[n(3)]
+    pub duration_ms: Option<i64>,
+    #[n(4)]
+    pub file_size_bytes: i64,
+    #[n(5)]
+    pub event_meta: Option<String>,
+}
+
+/// Output of `recording_list_v1`.
+#[derive(Debug, Clone, Default, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct RecordingListOut {
+    #[n(0)]
+    pub items: Vec<RecordingListItem>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +302,26 @@ mod tests {
             hash_sha256: "cd".repeat(32),
         });
         roundtrip(&PurgeOut { purged: true });
+    }
+
+    #[test]
+    fn roundtrip_recording_list() {
+        roundtrip(&RecordingListInput {
+            camera_id: Some("cam_00000000-0000-0000-0000-000000000000".into()),
+            limit: 200,
+        });
+        roundtrip(&RecordingListInput::default());
+        roundtrip(&RecordingListOut {
+            items: vec![RecordingListItem {
+                recording_ref: "clip_00000000-0000-0000-0000-000000000000".into(),
+                camera_id: "cam_00000000-0000-0000-0000-000000000000".into(),
+                created_at: 1_700_000_000,
+                duration_ms: Some(12_000),
+                file_size_bytes: 4_096,
+                event_meta: Some("{\"texts\":{}}".into()),
+            }],
+        });
+        roundtrip(&RecordingListOut::default());
     }
 
     #[test]

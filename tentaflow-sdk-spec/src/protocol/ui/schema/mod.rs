@@ -24,7 +24,8 @@ mod tests {
             assert!(
                 seen.insert(c.tag),
                 "duplicate tag 0x{:04X} (component '{}')",
-                c.tag, c.name,
+                c.tag,
+                c.name,
             );
         }
     }
@@ -33,11 +34,7 @@ mod tests {
     fn registry_has_no_duplicate_names() {
         let mut seen: HashSet<&'static str> = HashSet::new();
         for c in ALL_COMPONENTS {
-            assert!(
-                seen.insert(c.name),
-                "duplicate component name '{}'",
-                c.name,
-            );
+            assert!(seen.insert(c.name), "duplicate component name '{}'", c.name,);
         }
     }
 
@@ -49,7 +46,9 @@ mod tests {
                 assert!(
                     seen.insert(f.key),
                     "{}: duplicate field key {} (field '{}')",
-                    c.name, f.key, f.name,
+                    c.name,
+                    f.key,
+                    f.name,
                 );
             }
         }
@@ -58,14 +57,20 @@ mod tests {
     #[test]
     fn registry_section_strings_well_known() {
         let allowed = [
-            section::MOLECULES, section::LAYOUT, section::DATA, section::FORM,
-            section::ACTION, section::FEEDBACK, section::SPECIALIZED,
+            section::MOLECULES,
+            section::LAYOUT,
+            section::DATA,
+            section::FORM,
+            section::ACTION,
+            section::FEEDBACK,
+            section::SPECIALIZED,
         ];
         for c in ALL_COMPONENTS {
             assert!(
                 allowed.contains(&c.section),
                 "{}: unknown section '{}'",
-                c.name, c.section,
+                c.name,
+                c.section,
             );
         }
     }
@@ -74,8 +79,20 @@ mod tests {
     /// `types.rs` grammar comment.
     fn validate_wire(s: &str) -> Result<(), String> {
         let primitives = [
-            "bool", "u8", "u16", "u32", "u64", "i32", "i64", "f64", "tstr",
-            "BindRef", "StatePath", "Component", "CborMap", "Value",
+            "bool",
+            "u8",
+            "u16",
+            "u32",
+            "u64",
+            "i32",
+            "i64",
+            "f64",
+            "tstr",
+            "BindRef",
+            "StatePath",
+            "Component",
+            "CborMap",
+            "Value",
         ];
         if primitives.contains(&s) {
             return Ok(());
@@ -106,9 +123,7 @@ mod tests {
         if let Some(inner) = s.strip_prefix("ComponentRef<") {
             if let Some(names) = inner.strip_suffix('>') {
                 for n in names.split('|') {
-                    if n.is_empty()
-                        || !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    {
+                    if n.is_empty() || !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                         return Err(format!("bad ComponentRef target '{n}' in '{s}'"));
                     }
                 }
@@ -150,7 +165,8 @@ mod tests {
                 // Walk inside Option<...> and Array<...> wrappers.
                 let mut w = f.wire;
                 while let Some(inner) = w
-                    .strip_prefix("Option<").and_then(|s| s.strip_suffix('>'))
+                    .strip_prefix("Option<")
+                    .and_then(|s| s.strip_suffix('>'))
                     .or_else(|| w.strip_prefix("Array<").and_then(|s| s.strip_suffix('>')))
                 {
                     w = inner;
@@ -163,7 +179,9 @@ mod tests {
                         assert!(
                             names.contains(target),
                             "{}: field '{}' references unknown component '{}'",
-                            c.name, f.name, target,
+                            c.name,
+                            f.name,
+                            target,
                         );
                     }
                 }
@@ -187,7 +205,9 @@ mod tests {
                 assert!(
                     seen.insert(wire),
                     "{}: duplicate wire string '{}' (variant {})",
-                    e.name, wire, rust,
+                    e.name,
+                    wire,
+                    rust,
                 );
             }
         }
@@ -197,7 +217,11 @@ mod tests {
     fn inline_registry_has_no_duplicate_names() {
         let mut seen: HashSet<&'static str> = HashSet::new();
         for s in ALL_INLINE_STRUCTS {
-            assert!(seen.insert(s.name), "duplicate inline struct name '{}'", s.name);
+            assert!(
+                seen.insert(s.name),
+                "duplicate inline struct name '{}'",
+                s.name
+            );
         }
     }
 
@@ -209,7 +233,9 @@ mod tests {
                 assert!(
                     seen.insert(f.key),
                     "{}: duplicate field key {} (field '{}')",
-                    s.name, f.key, f.name,
+                    s.name,
+                    f.key,
+                    f.name,
                 );
             }
         }
@@ -221,7 +247,8 @@ mod tests {
         let check = |wire: &'static str, ctx: String| {
             let mut w = wire;
             while let Some(inner) = w
-                .strip_prefix("Option<").and_then(|s| s.strip_suffix('>'))
+                .strip_prefix("Option<")
+                .and_then(|s| s.strip_suffix('>'))
                 .or_else(|| w.strip_prefix("Array<").and_then(|s| s.strip_suffix('>')))
             {
                 w = inner;
@@ -257,12 +284,12 @@ mod tests {
         // Any `Inline<X>` reference must resolve to either an inline-struct
         // entry OR a tagged-union entry. `BreadcrumbItem`/`SidebarItem` are
         // captured in `ALL_INLINE_STRUCTS` since chunk 2a relaxed the matcher.
-        let tagged_unions: HashSet<&str> =
-            ALL_TAGGED_UNIONS.iter().map(|u| u.name).collect();
+        let tagged_unions: HashSet<&str> = ALL_TAGGED_UNIONS.iter().map(|u| u.name).collect();
         let check = |wire: &'static str, ctx: String| {
             let mut w = wire;
             while let Some(inner) = w
-                .strip_prefix("Option<").and_then(|s| s.strip_suffix('>'))
+                .strip_prefix("Option<")
+                .and_then(|s| s.strip_suffix('>'))
                 .or_else(|| w.strip_prefix("Array<").and_then(|s| s.strip_suffix('>')))
             {
                 w = inner;
@@ -298,7 +325,8 @@ mod tests {
             for f in c.fields {
                 let mut w = f.wire;
                 while let Some(inner) = w
-                    .strip_prefix("Option<").and_then(|s| s.strip_suffix('>'))
+                    .strip_prefix("Option<")
+                    .and_then(|s| s.strip_suffix('>'))
                     .or_else(|| w.strip_prefix("Array<").and_then(|s| s.strip_suffix('>')))
                 {
                     w = inner;
@@ -308,7 +336,10 @@ mod tests {
                         assert!(
                             !name.contains("::") && !name.is_empty(),
                             "{}: field '{}' wire '{}': {} target must be plain identifier",
-                            c.name, f.name, f.wire, tag.trim_end_matches('<'),
+                            c.name,
+                            f.name,
+                            f.wire,
+                            tag.trim_end_matches('<'),
                         );
                     }
                 }
@@ -332,7 +363,9 @@ mod tests {
                 assert!(
                     seen.insert(v.wire_kind),
                     "{}: duplicate wire_kind '{}' (variant {})",
-                    u.name, v.wire_kind, v.rust_name,
+                    u.name,
+                    v.wire_kind,
+                    v.rust_name,
                 );
             }
         }
@@ -359,7 +392,13 @@ mod tests {
         // Spot-check unions whose wire_kinds came from manual overrides or
         // computed helpers — guards against future regressions in the
         // generator.
-        let by_name = |n: &str| ALL_TAGGED_UNIONS.iter().copied().find(|u| u.name == n).unwrap();
+        let by_name = |n: &str| {
+            ALL_TAGGED_UNIONS
+                .iter()
+                .copied()
+                .find(|u| u.name == n)
+                .unwrap()
+        };
         let select_value = by_name("SelectValue");
         let aspect_ratio = by_name("AspectRatio");
         let path_segment = by_name("PathSegment");
@@ -399,9 +438,7 @@ mod tests {
     #[test]
     fn registry_covers_all_chunks() {
         // Sanity counts per chunk — keeps the generator output honest.
-        let by_section = |s: &'static str| {
-            ALL_COMPONENTS.iter().filter(|c| c.section == s).count()
-        };
+        let by_section = |s: &'static str| ALL_COMPONENTS.iter().filter(|c| c.section == s).count();
         assert_eq!(by_section(section::MOLECULES), 12, "§2 Molecules");
         assert_eq!(by_section(section::LAYOUT), 19, "§3 Layout");
         assert_eq!(by_section(section::DATA), 38, "§4 Data Display");

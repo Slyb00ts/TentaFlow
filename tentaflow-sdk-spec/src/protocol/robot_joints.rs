@@ -65,9 +65,18 @@ impl RobotJointsFrame {
         let mut angles = Vec::with_capacity(joint_count);
         for i in 0..joint_count {
             let o = ROBOT_JOINTS_HEADER_LEN + i * 4;
-            angles.push(f32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]));
+            angles.push(f32::from_le_bytes([
+                bytes[o],
+                bytes[o + 1],
+                bytes[o + 2],
+                bytes[o + 3],
+            ]));
         }
-        Some(RobotJointsFrame { version: bytes[0], timestamp_us, angles })
+        Some(RobotJointsFrame {
+            version: bytes[0],
+            timestamp_us,
+            angles,
+        })
     }
 }
 

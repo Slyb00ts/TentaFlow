@@ -2,22 +2,29 @@
 // File: protocol/ui/layout/containers.rs — Flex/Grid/Stack/Cluster/Split/ScrollContainer (catalog §3)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::component::{Component, FieldMap};
-use super::super::inline::{
-    GridChild, GridTrack, SplitSize,
-};
+use super::super::inline::{GridChild, GridTrack, SplitSize};
 use super::super::tokens::{
-    BackgroundToken, FlexAlign, FlexDirection, FlexJustify,
-    FlexWrap, RadiusToken, ScrollOrientation, SplitOrientation,
+    BackgroundToken, FlexAlign, FlexDirection, FlexJustify, FlexWrap, RadiusToken,
+    ScrollOrientation, SplitOrientation,
 };
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -48,9 +55,15 @@ impl Flex {
         entries.push((3, encode_to_value(&self.align)?));
         entries.push((4, encode_to_value(&self.wrap)?));
         entries.push((5, encode_to_value(&self.children)?));
-        if let Some(p) = &self.padding { entries.push((6, encode_to_value(p)?)); }
-        if let Some(b) = &self.background { entries.push((7, encode_to_value(b)?)); }
-        if let Some(r) = &self.radius { entries.push((8, encode_to_value(r)?)); }
+        if let Some(p) = &self.padding {
+            entries.push((6, encode_to_value(p)?));
+        }
+        if let Some(b) = &self.background {
+            entries.push((7, encode_to_value(b)?));
+        }
+        if let Some(r) = &self.radius {
+            entries.push((8, encode_to_value(r)?));
+        }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -121,11 +134,19 @@ impl Grid {
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(7);
         entries.push((0, encode_to_value(&self.columns)?));
         entries.push((1, encode_to_value(&self.gap)?));
-        if let Some(g) = &self.row_gap { entries.push((2, encode_to_value(g)?)); }
-        if let Some(g) = &self.column_gap { entries.push((3, encode_to_value(g)?)); }
+        if let Some(g) = &self.row_gap {
+            entries.push((2, encode_to_value(g)?));
+        }
+        if let Some(g) = &self.column_gap {
+            entries.push((3, encode_to_value(g)?));
+        }
         entries.push((4, encode_to_value(&self.children)?));
-        if let Some(p) = &self.padding { entries.push((5, encode_to_value(p)?)); }
-        if let Some(a) = &self.align_items { entries.push((6, encode_to_value(a)?)); }
+        if let Some(p) = &self.padding {
+            entries.push((5, encode_to_value(p)?));
+        }
+        if let Some(a) = &self.align_items {
+            entries.push((6, encode_to_value(a)?));
+        }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -189,8 +210,12 @@ impl Stack {
         entries.push((0, encode_to_value(&self.gap)?));
         entries.push((1, encode_to_value(&self.align)?));
         entries.push((2, encode_to_value(&self.children)?));
-        if let Some(p) = &self.padding { entries.push((3, encode_to_value(p)?)); }
-        if let Some(j) = &self.justify { entries.push((4, encode_to_value(j)?)); }
+        if let Some(p) = &self.padding {
+            entries.push((3, encode_to_value(p)?));
+        }
+        if let Some(j) = &self.justify {
+            entries.push((4, encode_to_value(j)?));
+        }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -247,7 +272,9 @@ impl Cluster {
         entries.push((1, encode_to_value(&self.align)?));
         entries.push((2, encode_to_value(&self.justify)?));
         entries.push((3, encode_to_value(&self.children)?));
-        if let Some(w) = &self.wrap { entries.push((4, encode_to_value(w)?)); }
+        if let Some(w) = &self.wrap {
+            entries.push((4, encode_to_value(w)?));
+        }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -338,7 +365,8 @@ impl Split {
             max_primary: max_primary.ok_or_else(|| missing_field("Split", "max_primary"))?,
             resizable: resizable.ok_or_else(|| missing_field("Split", "resizable"))?,
             primary_slot: primary_slot.ok_or_else(|| missing_field("Split", "primary_slot"))?,
-            secondary_slot: secondary_slot.ok_or_else(|| missing_field("Split", "secondary_slot"))?,
+            secondary_slot: secondary_slot
+                .ok_or_else(|| missing_field("Split", "secondary_slot"))?,
         })
     }
 }
@@ -368,11 +396,17 @@ impl ScrollContainer {
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(7);
         entries.push((0, encode_to_value(&self.orientation)?));
         entries.push((1, encode_to_value(&self.height)?));
-        if let Some(m) = &self.max_height { entries.push((2, encode_to_value(m)?)); }
+        if let Some(m) = &self.max_height {
+            entries.push((2, encode_to_value(m)?));
+        }
         entries.push((3, encode_to_value(&self.children)?));
-        if let Some(s) = &self.sticky_header_slot { entries.push((4, encode_to_value(s)?)); }
+        if let Some(s) = &self.sticky_header_slot {
+            entries.push((4, encode_to_value(s)?));
+        }
         entries.push((5, encode_to_value(&self.virtualize)?));
-        if let Some(g) = &self.gap { entries.push((6, encode_to_value(g)?)); }
+        if let Some(g) = &self.gap {
+            entries.push((6, encode_to_value(g)?));
+        }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -399,7 +433,8 @@ impl ScrollContainer {
             }
         }
         Ok(ScrollContainer {
-            orientation: orientation.ok_or_else(|| missing_field("ScrollContainer", "orientation"))?,
+            orientation: orientation
+                .ok_or_else(|| missing_field("ScrollContainer", "orientation"))?,
             // §3 0x0112 default: height = {kind:"full"}.
             height: height.unwrap_or(super::super::inline::DimensionToken::Full),
             max_height,
@@ -435,11 +470,21 @@ impl Box {
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(6);
-        if let Some(w) = &self.width { entries.push((0, encode_to_value(w)?)); }
-        if let Some(g) = &self.grow { entries.push((1, encode_to_value(g)?)); }
-        if let Some(a) = &self.align_self { entries.push((2, encode_to_value(a)?)); }
-        if let Some(p) = &self.padding { entries.push((3, encode_to_value(p)?)); }
-        if let Some(m) = &self.margin { entries.push((4, encode_to_value(m)?)); }
+        if let Some(w) = &self.width {
+            entries.push((0, encode_to_value(w)?));
+        }
+        if let Some(g) = &self.grow {
+            entries.push((1, encode_to_value(g)?));
+        }
+        if let Some(a) = &self.align_self {
+            entries.push((2, encode_to_value(a)?));
+        }
+        if let Some(p) = &self.padding {
+            entries.push((3, encode_to_value(p)?));
+        }
+        if let Some(m) = &self.margin {
+            entries.push((4, encode_to_value(m)?));
+        }
         entries.push((5, encode_to_value(&self.children)?));
         Ok(component(Self::TAG, id, entries))
     }
@@ -474,4 +519,3 @@ impl Box {
         })
     }
 }
-

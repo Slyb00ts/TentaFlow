@@ -54,13 +54,10 @@ impl<C> Encode<C> for FieldMap {
 }
 
 impl<'b, C> Decode<'b, C> for FieldMap {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut entries = Vec::with_capacity(len as usize);
         for _ in 0..len {
             let k = d.u8()?;
@@ -82,13 +79,13 @@ impl<C> Encode<C> for HandlerMap {
         ctx: &mut C,
     ) -> Result<(), minicbor::encode::Error<W::Error>> {
         // Canonical: sort by bytewise CBOR encoding of EventKind's tstr form.
-        let mut indexed: Vec<(Vec<u8>, &(EventKind, Handler))> =
-            Vec::with_capacity(self.0.len());
+        let mut indexed: Vec<(Vec<u8>, &(EventKind, Handler))> = Vec::with_capacity(self.0.len());
         for entry in &self.0 {
             let mut k_bytes = Vec::new();
-            entry.0.encode(&mut Encoder::new(&mut k_bytes), ctx).expect(
-                "Vec writer infallible; EventKind::encode only fails on writer errors",
-            );
+            entry
+                .0
+                .encode(&mut Encoder::new(&mut k_bytes), ctx)
+                .expect("Vec writer infallible; EventKind::encode only fails on writer errors");
             indexed.push((k_bytes, entry));
         }
         indexed.sort_by(|a, b| a.0.cmp(&b.0));
@@ -113,13 +110,10 @@ impl<C> Encode<C> for HandlerMap {
 }
 
 impl<'b, C> Decode<'b, C> for HandlerMap {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut entries = Vec::with_capacity(len as usize);
         for _ in 0..len {
             let k = EventKind::decode(d, ctx)?;
@@ -165,10 +159,7 @@ pub enum TestIdError {
 impl core::fmt::Display for TestIdError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Length => write!(
-                f,
-                "test_id length must be 1..={TEST_ID_MAX_LEN}"
-            ),
+            Self::Length => write!(f, "test_id length must be 1..={TEST_ID_MAX_LEN}"),
             Self::Charset => write!(f, "test_id must match [a-z0-9_-]+"),
         }
     }
@@ -188,10 +179,7 @@ impl<C> Encode<C> for TestId {
 }
 
 impl<'b, C> Decode<'b, C> for TestId {
-    fn decode(
-        d: &mut Decoder<'b>,
-        _ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
+    fn decode(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
         let s = d.str()?;
         TestId::new(s).map_err(|err| minicbor::decode::Error::message(err.to_string()))
     }
@@ -294,10 +282,7 @@ mod tests {
     #[test]
     fn handler_map_canonical_order_after_encode() {
         let hm = HandlerMap(vec![
-            (
-                EventKind::FilesSelected,
-                Handler::Local(LocalAction::Noop),
-            ),
+            (EventKind::FilesSelected, Handler::Local(LocalAction::Noop)),
             (EventKind::Click, Handler::Local(LocalAction::Noop)),
             (EventKind::Focus, Handler::Local(LocalAction::Noop)),
         ]);

@@ -52,7 +52,9 @@ impl DedupKey {
     pub fn from_envelope(envelope: &Envelope) -> Self {
         Self {
             message_id: envelope.message_id,
-            fragment_index: envelope.fragment_index.unwrap_or(NON_FRAGMENT_INDEX_SENTINEL),
+            fragment_index: envelope
+                .fragment_index
+                .unwrap_or(NON_FRAGMENT_INDEX_SENTINEL),
         }
     }
 }
@@ -543,7 +545,8 @@ mod tests {
         });
         assert!(r.is_err());
         // Reservation released → retry can succeed.
-        g.try_observe(&env, 1_700_000_000_000, |_| Ok(7u32)).unwrap();
+        g.try_observe(&env, 1_700_000_000_000, |_| Ok(7u32))
+            .unwrap();
     }
 
     #[test]
@@ -556,7 +559,10 @@ mod tests {
         // inside the closure.
         let r = g.try_observe(&env, 1_700_000_000_000, |inside_env| {
             let nested = g.is_replay(inside_env);
-            assert!(nested.is_err(), "in-flight reservation MUST block concurrent same-key");
+            assert!(
+                nested.is_err(),
+                "in-flight reservation MUST block concurrent same-key"
+            );
             Ok(0u32)
         });
         r.unwrap();
@@ -575,7 +581,8 @@ mod tests {
         assert!(r.is_err());
         // After the panic, in_flight set is clean (Drop ran), so a retry
         // succeeds.
-        g.try_observe(&env, 1_700_000_000_000, |_| Ok(0u32)).unwrap();
+        g.try_observe(&env, 1_700_000_000_000, |_| Ok(0u32))
+            .unwrap();
     }
 
     #[test]
@@ -586,6 +593,7 @@ mod tests {
         assert!(r.is_err());
         assert_eq!(r.unwrap_err().code, FrameErrorCode::ClockSkewExceeded);
         // No reservation leaked → retry within window works.
-        g.try_observe(&env, 1_700_000_000_000, |_| Ok(0u32)).unwrap();
+        g.try_observe(&env, 1_700_000_000_000, |_| Ok(0u32))
+            .unwrap();
     }
 }

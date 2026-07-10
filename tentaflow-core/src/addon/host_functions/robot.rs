@@ -77,14 +77,19 @@ pub fn robot_dispatch_v1(
     // Decode BEFORE the permission gate so an e-stop is never silently dropped by
     // the addon-level `robot.control` check: an e-stop must always reach the owner
     // (the receiver still enforces `robot.estop` RBAC on the acting user).
-    let input: RobotDispatchInput =
-        match read_input_cbor(&memory, &caller, input_ptr, input_len, PayloadKind::ServiceCall) {
-            Ok(v) => v,
-            Err(e) => {
-                audit(caller.data(), None, "error", Some("invalid_payload"));
-                return e.as_i32();
-            }
-        };
+    let input: RobotDispatchInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(caller.data(), None, "error", Some("invalid_payload"));
+            return e.as_i32();
+        }
+    };
 
     let action = match RobotAction::from_wire(&input.action) {
         Some(a) => a,
@@ -103,10 +108,13 @@ pub fn robot_dispatch_v1(
     // E-stop-class actions bypass this sender-side gate by design — the owner node
     // re-authorizes them against the acting user's `robot.estop` permission, which
     // is the authoritative check; the addon gate must not be able to block a stop.
-    if !action.is_estop_class()
-        && !check_permission(caller.data(), PERM_ROBOT_CONTROL, None)
-    {
-        audit(caller.data(), Some(&input.robot_id), "denied", Some("missing_permission"));
+    if !action.is_estop_class() && !check_permission(caller.data(), PERM_ROBOT_CONTROL, None) {
+        audit(
+            caller.data(),
+            Some(&input.robot_id),
+            "denied",
+            Some("missing_permission"),
+        );
         return AbiError::Permission.as_i32();
     }
 
@@ -118,14 +126,24 @@ pub fn robot_dispatch_v1(
     let actor_user_id = match caller.data().user_id.clone() {
         Some(u) => u,
         None => {
-            audit(caller.data(), Some(&input.robot_id), "denied", Some("no_user_context"));
+            audit(
+                caller.data(),
+                Some(&input.robot_id),
+                "denied",
+                Some("no_user_context"),
+            );
             return AbiError::Permission.as_i32();
         }
     };
     let org_id = match caller.data().org_id.clone() {
         Some(o) => o,
         None => {
-            audit(caller.data(), Some(&input.robot_id), "error", Some("no_org_context"));
+            audit(
+                caller.data(),
+                Some(&input.robot_id),
+                "error",
+                Some("no_org_context"),
+            );
             return AbiError::Operation.as_i32();
         }
     };

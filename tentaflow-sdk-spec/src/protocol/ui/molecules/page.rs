@@ -2,35 +2,40 @@
 // File: protocol/ui/molecules/page.rs — Header / PageHeader / SectionHeader (catalog §2)
 // =============================================================================
 
+use super::super::super::value::Value;
+use super::super::actions::Button;
 use super::super::bind::BindRef;
 use super::super::component::{Component, FieldMap};
-use super::super::inline::{
-    BreadcrumbItem, IconRef, InlineBadge, InlineChip, NavTab,
-};
+use super::super::inline::{BreadcrumbItem, IconRef, InlineBadge, InlineChip, NavTab};
 use super::super::tokens::Density;
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_ref_tag_decode,
     ensure_ref_tag_encode, ensure_tag, missing_field, unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
-use super::super::actions::Button;
 
 #[inline]
 fn validate_button_refs_encode(
-    items: &[Component], parent: &'static str, field: &'static str,
+    items: &[Component],
+    parent: &'static str,
+    field: &'static str,
 ) -> Result<(), IntoComponentError> {
-    for b in items { ensure_ref_tag_encode(b.tag, Button::TAG, parent, field)?; }
+    for b in items {
+        ensure_ref_tag_encode(b.tag, Button::TAG, parent, field)?;
+    }
     Ok(())
 }
 
 #[inline]
 fn validate_button_refs_decode(
-    items: &[Component], parent: &'static str, field: &'static str,
+    items: &[Component],
+    parent: &'static str,
+    field: &'static str,
 ) -> Result<(), minicbor::decode::Error> {
-    for b in items { ensure_ref_tag_decode(b.tag, Button::TAG, parent, field)?; }
+    for b in items {
+        ensure_ref_tag_decode(b.tag, Button::TAG, parent, field)?;
+    }
     Ok(())
 }
-
 
 // -----------------------------------------------------------------------------
 // Header
@@ -248,4 +253,3 @@ impl SectionHeader {
         })
     }
 }
-

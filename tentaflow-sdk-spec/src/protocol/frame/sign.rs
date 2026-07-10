@@ -9,9 +9,7 @@
 // Spec ref: docs/UNIFIED_FRAME_PROTOCOL_v2.md §6.3 + §5.4 + §5.5.
 // =============================================================================
 
-use ed25519_dalek::{
-    Signature as DalekSignature, Signer, SigningKey, Verifier, VerifyingKey,
-};
+use ed25519_dalek::{Signature as DalekSignature, Signer, SigningKey, Verifier, VerifyingKey};
 
 use super::auth::AuthKind;
 use super::envelope::{Envelope, NODE_ID_LEN, SIGNATURE_LEN};
@@ -58,10 +56,7 @@ pub fn canonical_envelope_for_signing(envelope: &Envelope) -> Result<Vec<u8>, Fr
 /// before calling is the caller's responsibility.
 ///
 /// On success the envelope's `auth.signature` field is filled.
-pub fn sign_envelope(
-    envelope: &mut Envelope,
-    signing_key: &SigningKey,
-) -> Result<(), FrameError> {
+pub fn sign_envelope(envelope: &mut Envelope, signing_key: &SigningKey) -> Result<(), FrameError> {
     if !envelope.flags.contains(Flags::IS_SIGNED) {
         return Err(FrameError::new(
             FrameErrorCode::BodyValidationFailed,
@@ -170,23 +165,19 @@ pub fn verify_envelope(envelope: &Envelope) -> Result<(), FrameError> {
     let public_key = VerifyingKey::from_bytes(&subject_bytes).map_err(|e| {
         FrameError::new(
             FrameErrorCode::InvalidSignature,
-            format!(
-                "verify_envelope: auth.subject_id is not a valid Ed25519 public key: {e}"
-            ),
+            format!("verify_envelope: auth.subject_id is not a valid Ed25519 public key: {e}"),
         )
         .with_path("envelope.auth.subject_id")
     })?;
     let sig = DalekSignature::from_bytes(&signature_bytes);
     let to_verify = canonical_envelope_for_signing(envelope)?;
-    public_key
-        .verify(&to_verify, &sig)
-        .map_err(|_| {
-            FrameError::new(
-                FrameErrorCode::InvalidSignature,
-                "verify_envelope: Ed25519 signature verification failed",
-            )
-            .with_path("envelope.auth.signature")
-        })?;
+    public_key.verify(&to_verify, &sig).map_err(|_| {
+        FrameError::new(
+            FrameErrorCode::InvalidSignature,
+            "verify_envelope: Ed25519 signature verification failed",
+        )
+        .with_path("envelope.auth.signature")
+    })?;
     Ok(())
 }
 

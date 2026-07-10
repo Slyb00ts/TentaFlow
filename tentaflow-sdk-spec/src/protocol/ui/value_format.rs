@@ -4,8 +4,8 @@
 // uses these to format BindRef values before rendering text.
 // =============================================================================
 
-use minicbor::{Decode, Decoder, Encode, Encoder};
 use crate::protocol::ui::typed_field::assert_no_dup_tstr;
+use minicbor::{Decode, Decoder, Encode, Encoder};
 
 string_enum! {
     /// Base for byte formatting: SI (1000) or binary (1024).
@@ -150,13 +150,10 @@ impl<C> Encode<C> for ValueFormat {
 }
 
 impl<'b, C> Decode<'b, C> for ValueFormat {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut decimals: Option<u8> = None;
         let mut thousands_sep: Option<bool> = None;
@@ -197,14 +194,13 @@ impl<'b, C> Decode<'b, C> for ValueFormat {
                 }
             }
         }
-        let resolve_duration_style =
-            || -> Result<DurationStyle, minicbor::decode::Error> {
-                let raw = style_raw.as_deref().ok_or_else(|| {
-                    minicbor::decode::Error::message("ValueFormat.duration missing style")
-                })?;
-                DurationStyle::from_wire(raw)
-                    .ok_or_else(|| minicbor::decode::Error::message("invalid DurationStyle"))
-            };
+        let resolve_duration_style = || -> Result<DurationStyle, minicbor::decode::Error> {
+            let raw = style_raw.as_deref().ok_or_else(|| {
+                minicbor::decode::Error::message("ValueFormat.duration missing style")
+            })?;
+            DurationStyle::from_wire(raw)
+                .ok_or_else(|| minicbor::decode::Error::message("invalid DurationStyle"))
+        };
         let resolve_date_style = || -> Result<DateStyle, minicbor::decode::Error> {
             let raw = style_raw.as_deref().ok_or_else(|| {
                 minicbor::decode::Error::message("ValueFormat.date missing style")
@@ -219,36 +215,34 @@ impl<'b, C> Decode<'b, C> for ValueFormat {
             TimeStyle::from_wire(raw)
                 .ok_or_else(|| minicbor::decode::Error::message("invalid TimeStyle"))
         };
-        let resolve_datetime_style =
-            || -> Result<DateTimeStyle, minicbor::decode::Error> {
-                let raw = style_raw.as_deref().ok_or_else(|| {
-                    minicbor::decode::Error::message("ValueFormat.datetime missing style")
-                })?;
-                DateTimeStyle::from_wire(raw)
-                    .ok_or_else(|| minicbor::decode::Error::message("invalid DateTimeStyle"))
-            };
-        let kind = kind
-            .ok_or_else(|| minicbor::decode::Error::message("ValueFormat missing kind"))?;
+        let resolve_datetime_style = || -> Result<DateTimeStyle, minicbor::decode::Error> {
+            let raw = style_raw.as_deref().ok_or_else(|| {
+                minicbor::decode::Error::message("ValueFormat.datetime missing style")
+            })?;
+            DateTimeStyle::from_wire(raw)
+                .ok_or_else(|| minicbor::decode::Error::message("invalid DateTimeStyle"))
+        };
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("ValueFormat missing kind"))?;
         // Fields used by each variant. Anything else is rejected.
-        let extras_present =
-            |allowed_decimals: bool,
-             allowed_thousands: bool,
-             allowed_code: bool,
-             allowed_base: bool,
-             allowed_style: bool|
-             -> Result<(), minicbor::decode::Error> {
-                if !allowed_decimals && decimals.is_some()
-                    || !allowed_thousands && thousands_sep.is_some()
-                    || !allowed_code && code.is_some()
-                    || !allowed_base && base.is_some()
-                    || !allowed_style && style_raw.is_some()
-                {
-                    return Err(minicbor::decode::Error::message(
-                        "ValueFormat variant carries fields not allowed by its kind",
-                    ));
-                }
-                Ok(())
-            };
+        let extras_present = |allowed_decimals: bool,
+                              allowed_thousands: bool,
+                              allowed_code: bool,
+                              allowed_base: bool,
+                              allowed_style: bool|
+         -> Result<(), minicbor::decode::Error> {
+            if !allowed_decimals && decimals.is_some()
+                || !allowed_thousands && thousands_sep.is_some()
+                || !allowed_code && code.is_some()
+                || !allowed_base && base.is_some()
+                || !allowed_style && style_raw.is_some()
+            {
+                return Err(minicbor::decode::Error::message(
+                    "ValueFormat variant carries fields not allowed by its kind",
+                ));
+            }
+            Ok(())
+        };
         match kind.as_str() {
             "number" => {
                 extras_present(true, true, false, false, false)?;
@@ -257,9 +251,7 @@ impl<'b, C> Decode<'b, C> for ValueFormat {
                         minicbor::decode::Error::message("ValueFormat.number missing decimals")
                     })?,
                     thousands_sep: thousands_sep.ok_or_else(|| {
-                        minicbor::decode::Error::message(
-                            "ValueFormat.number missing thousands_sep",
-                        )
+                        minicbor::decode::Error::message("ValueFormat.number missing thousands_sep")
                     })?,
                 })
             }
@@ -346,9 +338,7 @@ mod tests {
             decimals: 2,
             thousands_sep: true,
         });
-        roundtrip(ValueFormat::Currency {
-            code: "PLN".into(),
-        });
+        roundtrip(ValueFormat::Currency { code: "PLN".into() });
         roundtrip(ValueFormat::Percent { decimals: 1 });
         roundtrip(ValueFormat::Bytes {
             base: BytesBase::Binary,
@@ -395,7 +385,12 @@ mod tests {
     fn unknown_kind_rejected() {
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
-        enc.map(1).unwrap().str("kind").unwrap().str("magic").unwrap();
+        enc.map(1)
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("magic")
+            .unwrap();
         let res: Result<ValueFormat, _> = minicbor::decode(&buf);
         assert!(res.is_err());
     }

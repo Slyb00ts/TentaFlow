@@ -15,14 +15,10 @@
 use tentaflow_sdk_spec::{StateEntryMeta, StateListOutput, StateSetInput};
 
 use super::super::errors::AbiError;
-use super::super::state_store::{
-    AddonStateStore, StateStoreError, Tier, MAX_VALUE_BYTES,
-};
+use super::super::state_store::{AddonStateStore, StateStoreError, Tier, MAX_VALUE_BYTES};
 use super::abi_helpers::{write_output_with_retry_semantics, PayloadKind};
 use super::cbor_io::{read_input_cbor, write_cbor_capped};
-use super::{
-    audit_log, check_permission, get_memory, read_guest_string, AddonState, WasmCaller,
-};
+use super::{audit_log, check_permission, get_memory, read_guest_string, AddonState, WasmCaller};
 
 const PERM_READ: &str = "state.read";
 const PERM_WRITE: &str = "state.write";
@@ -269,11 +265,7 @@ pub fn state_set_v1(mut caller: WasmCaller<'_, AddonState>, in_ptr: i32, in_len:
 /// ABI:
 /// - key_ptr/key_len: key (UTF-8)
 /// - Returns: 1 (deleted), 0 (absent), `Permission` or `Operation`.
-pub fn state_delete_v1(
-    mut caller: WasmCaller<'_, AddonState>,
-    key_ptr: i32,
-    key_len: i32,
-) -> i32 {
+pub fn state_delete_v1(mut caller: WasmCaller<'_, AddonState>, key_ptr: i32, key_len: i32) -> i32 {
     let memory = match get_memory(&mut caller) {
         Some(m) => m,
         None => return AbiError::Operation.as_i32(),
@@ -457,12 +449,8 @@ mod tests {
                 .set("addon", &format!("k{i:06}"), b"v".to_vec(), Tier::Ephemeral)
                 .unwrap();
         }
-        let (entries, truncated) = store.list_bounded(
-            "addon",
-            None,
-            STATE_LIST_MAX_ENTRIES,
-            STATE_LIST_MAX_BYTES,
-        );
+        let (entries, truncated) =
+            store.list_bounded("addon", None, STATE_LIST_MAX_ENTRIES, STATE_LIST_MAX_BYTES);
         assert_eq!(entries.len(), STATE_LIST_MAX_ENTRIES);
         assert!(truncated);
     }

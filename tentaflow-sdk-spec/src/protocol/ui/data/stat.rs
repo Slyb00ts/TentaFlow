@@ -2,22 +2,29 @@
 // File: protocol/ui/data/stat.rs — KeyValue/StatCard/Stat (catalog §4)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::BindRef;
 use super::super::component::{Component, FieldMap};
 use super::super::inline::{Footnote, IconRef, KvItem, Trend};
-use super::super::tokens::{
-    Density, KvLayout, StatSize, Tone,
-};
+use super::super::tokens::{Density, KvLayout, StatSize, Tone};
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
 use super::super::value_format::ValueFormat;
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -40,7 +47,9 @@ impl KeyValue {
         entries.push((0, encode_to_value(&self.items)?));
         entries.push((1, encode_to_value(&self.density)?));
         entries.push((2, encode_to_value(&self.layout)?));
-        if let Some(lw) = &self.label_width { entries.push((3, encode_to_value(lw)?)); }
+        if let Some(lw) = &self.label_width {
+            entries.push((3, encode_to_value(lw)?));
+        }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -92,13 +101,25 @@ impl StatCard {
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(9);
         entries.push((0, encode_to_value(&self.label)?));
-        if let Some(i) = &self.icon { entries.push((1, encode_to_value(i)?)); }
+        if let Some(i) = &self.icon {
+            entries.push((1, encode_to_value(i)?));
+        }
         entries.push((2, encode_to_value(&self.value)?));
-        if let Some(s) = &self.value_suffix { entries.push((3, encode_to_value(s)?)); }
-        if let Some(f) = &self.format { entries.push((4, encode_to_value(f)?)); }
-        if let Some(t) = &self.trend { entries.push((5, encode_to_value(t)?)); }
-        if let Some(fn_) = &self.footnote { entries.push((6, encode_to_value(fn_)?)); }
-        if let Some(a) = &self.accent { entries.push((7, encode_to_value(a)?)); }
+        if let Some(s) = &self.value_suffix {
+            entries.push((3, encode_to_value(s)?));
+        }
+        if let Some(f) = &self.format {
+            entries.push((4, encode_to_value(f)?));
+        }
+        if let Some(t) = &self.trend {
+            entries.push((5, encode_to_value(t)?));
+        }
+        if let Some(fn_) = &self.footnote {
+            entries.push((6, encode_to_value(fn_)?));
+        }
+        if let Some(a) = &self.accent {
+            entries.push((7, encode_to_value(a)?));
+        }
         entries.push((8, encode_to_value(&self.clickable)?));
         Ok(component(Self::TAG, id, entries))
     }
@@ -133,7 +154,11 @@ impl StatCard {
             label: label.ok_or_else(|| missing_field("StatCard", "label"))?,
             icon,
             value: value.ok_or_else(|| missing_field("StatCard", "value"))?,
-            value_suffix, format, trend, footnote, accent,
+            value_suffix,
+            format,
+            trend,
+            footnote,
+            accent,
             clickable: clickable.ok_or_else(|| missing_field("StatCard", "clickable"))?,
         })
     }
@@ -159,8 +184,12 @@ impl Stat {
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(5);
         entries.push((0, encode_to_value(&self.label)?));
         entries.push((1, encode_to_value(&self.value)?));
-        if let Some(f) = &self.format { entries.push((2, encode_to_value(f)?)); }
-        if let Some(t) = &self.trend { entries.push((3, encode_to_value(t)?)); }
+        if let Some(f) = &self.format {
+            entries.push((2, encode_to_value(f)?));
+        }
+        if let Some(t) = &self.trend {
+            entries.push((3, encode_to_value(t)?));
+        }
         entries.push((4, encode_to_value(&self.size)?));
         Ok(component(Self::TAG, id, entries))
     }
@@ -186,9 +215,9 @@ impl Stat {
         Ok(Stat {
             label: label.ok_or_else(|| missing_field("Stat", "label"))?,
             value: value.ok_or_else(|| missing_field("Stat", "value"))?,
-            format, trend,
+            format,
+            trend,
             size: size.ok_or_else(|| missing_field("Stat", "size"))?,
         })
     }
 }
-

@@ -26,8 +26,8 @@ mod tests {
     use crate::protocol::ui::tokens::{
         AccordionMode, BackgroundToken, BreadcrumbSeparator, CardVariant, Density,
         DividerOrientation, DividerVariant, FlexAlign, FlexDirection, FlexJustify, FlexWrap,
-        NavTabsVariant, PaginationVariant, RadiusToken, ScrollOrientation, ShadowToken,
-        SpacerAxis, SplitOrientation, Spacing, TabsVariant, Tone,
+        NavTabsVariant, PaginationVariant, RadiusToken, ScrollOrientation, ShadowToken, SpacerAxis,
+        Spacing, SplitOrientation, TabsVariant, Tone,
     };
     use crate::protocol::value::Value;
 
@@ -153,14 +153,19 @@ mod tests {
     fn section_card_rejects_non_button_header_action() {
         // SectionCard.header_actions is array<ComponentRef<Button>>.
         let bad = SectionCard {
-            title: lit("t"), subtitle: None,
+            title: lit("t"),
+            subtitle: None,
             header_actions: vec![dummy(0x040C)], // Fab tag, not Button
             header_divider: false,
-            body: vec![], footer: None,
-            padding: Spacing::Lg, gap: Spacing::Md,
+            body: vec![],
+            footer: None,
+            padding: Spacing::Lg,
+            gap: Spacing::Md,
             variant: CardVariant::Filled,
-            radius: RadiusToken::Lg, shadow: ShadowToken::Subtle,
-            border: BorderToken::None, background: BackgroundToken::None,
+            radius: RadiusToken::Lg,
+            shadow: ShadowToken::Subtle,
+            border: BorderToken::None,
+            background: BackgroundToken::None,
             accent: None,
         };
         assert!(bad.into_component("sc").is_err());
@@ -180,7 +185,10 @@ mod tests {
 
     #[test]
     fn spacer_roundtrip() {
-        let s = Spacer { size: Spacing::Lg, axis: SpacerAxis::Both };
+        let s = Spacer {
+            size: Spacing::Lg,
+            axis: SpacerAxis::Both,
+        };
         let c = s.into_component("sp").unwrap();
         assert_eq!(Spacer::try_from_component(&c).unwrap(), s);
     }

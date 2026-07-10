@@ -82,10 +82,7 @@ impl<C> Encode<C> for Value {
 }
 
 impl<'b, C> Decode<'b, C> for Value {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
         match d.datatype()? {
             Type::Null => {
                 d.null()?;
@@ -126,11 +123,11 @@ impl<'b, C> Decode<'b, C> for Value {
                 }
                 Ok(Value::Map(entries))
             }
-            Type::BytesIndef | Type::StringIndef | Type::ArrayIndef | Type::MapIndef => Err(
-                minicbor::decode::Error::message(
+            Type::BytesIndef | Type::StringIndef | Type::ArrayIndef | Type::MapIndef => {
+                Err(minicbor::decode::Error::message(
                     "indefinite-length items forbidden by canonical profile",
-                ),
-            ),
+                ))
+            }
             Type::Tag => Err(minicbor::decode::Error::message(
                 "CBOR semantic tags are not allowed in v1 (see §2.3)",
             )),
@@ -182,7 +179,10 @@ mod tests {
     #[test]
     fn roundtrip_nested() {
         let v = Value::Map(vec![
-            (Value::Text("a".into()), Value::Array(vec![Value::U64(1), Value::U64(2)])),
+            (
+                Value::Text("a".into()),
+                Value::Array(vec![Value::U64(1), Value::U64(2)]),
+            ),
             (Value::Text("b".into()), Value::Null),
         ]);
         assert_eq!(roundtrip(&v), v);
