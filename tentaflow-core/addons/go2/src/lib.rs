@@ -49,8 +49,15 @@ const BATTERY_ALERT_PCT: i64 = 20;
 const CONNECT_TIMEOUT_SECS: i64 = 20;
 const VALIDATION_TIMEOUT_SECS: i64 = 20;
 // Auto-connect backoff: when offline with connect-intent on, the tick retries a
-// connect at most this often (the tick runs every 100ms — don't hammer the robot).
-const RECONNECT_BACKOFF_SECS: i64 = 5;
+// connect with exponential backoff so an unreachable robot is not hammered every
+// few seconds forever. Each failed attempt doubles the delay from BASE up to MAX;
+// a successful link resets it, so a robot that comes back online reconnects fast.
+// The connect path itself does a blocking LAN signaling POST (~seconds when the
+// robot is down), so spacing attempts out keeps that off the hot loop.
+const RECONNECT_BACKOFF_BASE_SECS: i64 = 1;
+const RECONNECT_BACKOFF_MAX_SECS: i64 = 60;
+// Cap the doubling shift so `BASE << SHIFT` cannot overflow and settles at MAX.
+const RECONNECT_BACKOFF_MAX_SHIFT: u32 = 6;
 const ONLINE_STALE_SECS: i64 = 12;
 
 static REQ_ID: AtomicU64 = AtomicU64::new(1);
@@ -2066,8 +2073,20 @@ fn connect_intent() -> bool {
 
 std::thread_local! {
     // Wall-clock second of the last auto-connect attempt (backoff gate). Resets on
-    // restart, which is fine — a fresh process should attempt promptly.
+    // restart, which is fine — a fresh process should attempt promptly. (In the wasm
+    // instance this thread_local is effectively a per-instance global, so it persists
+    // across ticks.)
     static LAST_CONNECT_ATTEMPT: core::cell::Cell<i64> = const { core::cell::Cell::new(0) };
+    // Consecutive failed auto-connect attempts — drives the exponential backoff
+    // delay. Reset to 0 when the link reaches `online`.
+    static RECONNECT_FAILS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Current backoff delay (seconds) for `fails` consecutive failures:
+/// `BASE << min(fails, MAX_SHIFT)`, clamped to `MAX`.
+fn reconnect_backoff_secs(fails: u32) -> i64 {
+    (RECONNECT_BACKOFF_BASE_SECS << fails.min(RECONNECT_BACKOFF_MAX_SHIFT))
+        .min(RECONNECT_BACKOFF_MAX_SECS)
 }
 
 /// Tick: drive validation, then continuous telemetry.
@@ -2167,6 +2186,11 @@ fn tick() {
                                     }
                                     grant_vision_camera(&cam_id);
                                     mirror_status_from_db();
+                                    // Link is up — clear the reconnect backoff so a
+                                    // later drop reconnects promptly, not on a stale
+                                    // widened delay.
+                                    RECONNECT_FAILS.with(|c| c.set(0));
+                                    LAST_CONNECT_ATTEMPT.with(|c| c.set(0));
                                     publish_event("go2.online", json!({ "camera_id": cam_id }));
                                     log::info("go2: online");
                                 }
@@ -2421,8 +2445,15 @@ fn tick() {
             if connect_intent() {
                 let now = db::now_secs();
                 let last = LAST_CONNECT_ATTEMPT.with(|c| c.get());
-                if last == 0 || now - last >= RECONNECT_BACKOFF_SECS {
+                let fails = RECONNECT_FAILS.with(|c| c.get());
+                let delay = reconnect_backoff_secs(fails);
+                if last == 0 || now - last >= delay {
                     LAST_CONNECT_ATTEMPT.with(|c| c.set(now));
+                    // Count this attempt up front — do_connect blocks on LAN
+                    // signaling and only clears the counter (via set_online) once
+                    // the robot actually answers, so a persistently-down robot
+                    // keeps widening the gap instead of retrying every few seconds.
+                    RECONNECT_FAILS.with(|c| c.set(fails.saturating_add(1)));
                     let _ = do_connect();
                 }
             }
@@ -3022,6 +3053,23 @@ mod tests {
         let frame = decode_voxel_to_canonical(&grid, 0.05, [0.0; 3], 1, 0)
             .expect("at-cap frame must decode, not abort");
         assert_eq!(frame.len(), LIDAR_HEADER_LEN + count * 3 * 2);
+    }
+
+    #[test]
+    fn reconnect_backoff_grows_exponentially_and_caps() {
+        // Fresh failure count retries quickly, then doubles up to the cap. An
+        // unreachable robot must never keep retrying every few seconds forever.
+        assert_eq!(reconnect_backoff_secs(0), 1);
+        assert_eq!(reconnect_backoff_secs(1), 2);
+        assert_eq!(reconnect_backoff_secs(2), 4);
+        assert_eq!(reconnect_backoff_secs(3), 8);
+        assert_eq!(reconnect_backoff_secs(4), 16);
+        assert_eq!(reconnect_backoff_secs(5), 32);
+        // Shift caps at RECONNECT_BACKOFF_MAX_SHIFT and the value clamps to MAX,
+        // and stays there for arbitrarily large failure counts (no overflow).
+        assert_eq!(reconnect_backoff_secs(6), RECONNECT_BACKOFF_MAX_SECS);
+        assert_eq!(reconnect_backoff_secs(7), RECONNECT_BACKOFF_MAX_SECS);
+        assert_eq!(reconnect_backoff_secs(1_000_000), RECONNECT_BACKOFF_MAX_SECS);
     }
 
     #[test]
