@@ -373,11 +373,15 @@ async function goWizard(benchmarkId) {
   state.view = 'wizard';
   state.wizardStep = 1;
 
-  // Wczytaj serwisy mesh (kategoria LLM) do kolumny targetow.
+  // Wczytaj serwisy mesh (kategoria LLM) do kolumny targetow. Pomijamy serwisy
+  // BEZ endpointu (nie da sie ich zbenchmarkowac) — m.in. headless worker klastra
+  // TP, ktory ma te sama nazwe co head, ale nie serwuje inferencji. Bez tego user
+  // widzi dwa identyczne wiersze DeepSeek, z ktorych jeden (worker) jest martwy.
   try {
     const services = await ApiBinary.list('serviceListRequest', { arrayKey: 'services' });
     state.meshServices = (Array.isArray(services) ? services : [])
-      .filter((s) => (s.category || '').toLowerCase() === 'llm');
+      .filter((s) => (s.category || '').toLowerCase() === 'llm')
+      .filter((s) => (s.endpointUrl || s.endpoint_url || '').length > 0);
   } catch { state.meshServices = []; }
 
   if (benchmarkId) {
