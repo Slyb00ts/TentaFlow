@@ -12,6 +12,7 @@ mod blocks;
 mod db;
 mod search;
 mod ui;
+mod ui_dictate;
 mod ui_graph;
 mod ui_search;
 mod ui_share;

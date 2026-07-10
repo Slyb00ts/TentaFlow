@@ -299,6 +299,8 @@ pub struct NoteDetail {
     pub shares: Vec<ShareEntry>,
     pub can_write: bool,
     pub is_owner: bool,
+    /// "typed" | "dictated" — drives the „dyktowana" chip in the editor meta.
+    pub origin: String,
 }
 
 /// Lists accessible notes for the user, newest first, with scope filter and
@@ -451,7 +453,7 @@ fn attach_card_entities(ctx: &UserCtx, notes: &mut [NoteSummary]) {
 pub fn get_note(ctx: &UserCtx, note_id: &str) -> Result<Option<NoteDetail>, String> {
     let acl = acl_read_clause(ctx.group_ids.len());
     let sql = format!(
-        "SELECT n.id, n.title, n.content, n.owner_user_id, n.created_at \
+        "SELECT n.id, n.title, n.content, n.owner_user_id, n.created_at, n.origin \
          FROM notes n WHERE n.id = ? AND n.deleted_at IS NULL AND {acl}"
     );
     let mut params = vec![SqlValue::String(note_id.to_string())];
@@ -539,6 +541,11 @@ pub fn get_note(ctx: &UserCtx, note_id: &str) -> Result<Option<NoteDetail>, Stri
         can_write,
         is_owner,
         tags,
+        origin: row
+            .get(5)
+            .and_then(|v| v.as_str())
+            .unwrap_or("typed")
+            .to_string(),
         id,
     }))
 }
@@ -605,6 +612,28 @@ pub fn update_note_field(
     ];
     params.extend(acl_params(ctx));
     let res = sql_exec(&sql, &params).map_err(|e| format!("Błąd zapisu notatki: {e}"))?;
+    if res.rows_affected == 0 {
+        return Err("Brak uprawnień do edycji tej notatki.".to_string());
+    }
+    Ok(())
+}
+
+/// Commits one dictation write: replaces the content AND flags the note as
+/// dictated in the same guarded UPDATE, so the origin flip can never land on a
+/// note the user lost write access to mid-dictation.
+pub fn commit_dictated_content(ctx: &UserCtx, note_id: &str, content: &str) -> Result<(), String> {
+    let acl = acl_write_clause(ctx.group_ids.len());
+    let sql = format!(
+        "UPDATE notes AS n SET content = ?, origin = 'dictated', updated_at = ? \
+         WHERE n.id = ? AND n.deleted_at IS NULL AND {acl}"
+    );
+    let mut params = vec![
+        SqlValue::String(content.to_string()),
+        SqlValue::I64(now_unix()),
+        SqlValue::String(note_id.to_string()),
+    ];
+    params.extend(acl_params(ctx));
+    let res = sql_exec(&sql, &params).map_err(|e| format!("Błąd zapisu dyktowania: {e}"))?;
     if res.rows_affected == 0 {
         return Err("Brak uprawnień do edycji tej notatki.".to_string());
     }

@@ -61,6 +61,24 @@ Panel `main`, trzy widoki (Notatki / Graf / Szukaj):
   "tekstowo", bez karty odpowiedzi). Prawa kolumna: encje w wynikach
   i zawezanie przez graf.
 
+## Dyktowanie
+
+Mikrofon w pasku narzedzi edytora wlacza tryb dyktowania aktywnej notatki
+(dock na dole: mikrofon z waveformem, licznik czasu, chip "Nagrywanie",
+Pauza / Wznow, "Zakoncz i zapisz"). Kazda wypowiedz (VAD) trafia jako WAV
+przez schowek dokumentow do `stt_transcribe` z modelem rozwiazanym z aliasu
+`notes-stt` (walidacja PRZED kazdym wywolaniem — cofniety grant blokuje
+transkrypcje). Najnowszy segment wisi jako stanowa linia "partial"; poprzedni
+jest dopisywany do tresci (origin notatki przechodzi na `dictated`, chip
+"dyktowana" w metadanych) i re-enqueue'owany do `analysis_queue` — encje
+pojawiaja sie w trakcie mowienia dzieki debounce 3 s. Komendy glosowe na
+koncu segmentu: "nowa linia", "nowy akapit", "zakoncz dyktowanie"
+(case-insensitive, odporne na interpunkcje i brak diakrytykow). Bez
+podpietego aliasu przycisk jest wylaczony z podpowiedzia konfiguracji;
+blad transkrypcji zostawia dotychczasowy partial nietkniety. Nawigacja
+(inna notatka, inny widok) konczy dyktowanie jak "Zakoncz i zapisz" —
+partial nigdy nie ginie.
+
 ## Udostepnianie
 
 Modal "Udostepnij notatke" (tylko wlasciciel): wyszukiwarka osob i grup

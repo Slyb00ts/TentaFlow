@@ -1,8 +1,8 @@
 [addon]
 id = "notes"
 name = "Notatki"
-version = "0.3.1"
-description = "Notatki z lokalną analizą treści: lista, edytor z autozapisem, granularne udostępnianie (osoby, grupy, organizacja), auto-graf powiązań (encje z LLM, podobieństwo semantyczne z embeddingów, sugestie scalania duplikatów encji), hybrydowe wyszukiwanie (wektory + graf, streamowana odpowiedź LLM) oraz bloki Flow Buildera i narzędzia LLM."
+version = "0.4.0"
+description = "Notatki z lokalną analizą treści: lista, edytor z autozapisem, dyktowanie głosowe (STT przez alias notes-stt), granularne udostępnianie (osoby, grupy, organizacja), auto-graf powiązań (encje z LLM, podobieństwo semantyczne z embeddingów, sugestie scalania duplikatów encji), hybrydowe wyszukiwanie (wektory + graf, streamowana odpowiedź LLM) oraz bloki Flow Buildera i narzędzia LLM."
 category = "productivity"
 keywords = ["notes", "notatki", "graf", "encje", "wiedza", "dyktowanie"]
 author = "TentaFlow"
@@ -14,8 +14,6 @@ platforms = ["linux", "macos", "windows", "ios", "android"]
 wasm_file = "addon.wasm"
 
 # --- Uprawnienia ---
-# Deklaracje pod dyktowanie (stt + alias translator-stt-style) dojda w etapie
-# dyktowania — zmiana bundle_hash przeprowadzi wtedy update instalacji.
 
 [[permission]]
 id = "ui"
@@ -96,6 +94,30 @@ description = "Sprawdza dostepnosc aliasow notes-llm / notes-embeddings przed an
 risk = "low"
 
 [[permission]]
+id = "stt"
+display_name = "Transkrypcja mowy"
+description = "Zamienia nagrana wypowiedz na tekst przez model podpiety do aliasu notes-stt (tryb dyktowania notatki)."
+risk = "medium"
+
+[[permission]]
+id = "audio.capture"
+display_name = "Przechwytywanie mikrofonu"
+description = "Nagrywa wypowiedzi z mikrofonu w trybie dyktowania notatki."
+risk = "high"
+
+[[permission]]
+id = "document.read"
+display_name = "Odczyt nagran mikrofonu"
+description = "Czyta nagrana wypowiedz (WAV) ze schowka dokumentow, aby przekazac ja do transkrypcji STT."
+risk = "medium"
+
+[[permission]]
+id = "document.write"
+display_name = "Usuwanie nagran mikrofonu"
+description = "Kasuje nagranie WAV natychmiast po transkrypcji (retencja: nagrania glosu nie zalegaja w schowku dokumentow)."
+risk = "medium"
+
+[[permission]]
 id = "flow_blocks"
 display_name = "Bloki Flow Buildera"
 description = "Udostepnia wyszukiwanie, tworzenie, dopisywanie i powiazania notatek jako bloki flow (z ACL uzytkownika flow)."
@@ -119,6 +141,13 @@ methods = ["embed"]
 suggested_default = ""
 visibility = "private"
 
+[[alias]]
+id = "notes-stt"
+display_name = "Notatki — dyktowanie (STT)"
+methods = ["stt"]
+suggested_default = ""
+visibility = "private"
+
 [[uses_alias]]
 id = "notes-llm"
 required = true
@@ -128,6 +157,13 @@ reason = "Ekstrakcja encji (osoby, firmy, projekty, tematy) z tresci notatek."
 id = "notes-embeddings"
 required = true
 reason = "Embeddingi chunkow notatek i nazw encji (podobienstwo semantyczne, scalanie duplikatow)."
+
+# Dyktowanie jest funkcja opcjonalna: bez podpietego aliasu przycisk mikrofonu
+# jest wylaczony z podpowiedzia konfiguracji, install nie jest blokowany.
+[[uses_alias]]
+id = "notes-stt"
+required = false
+reason = "Transkrypcja mowy w trybie dyktowania notatki."
 
 # --- Przestrzen wektorowa chunkow notatek ---
 # Wymiar deklaratywny (1024); realny wymiar bierze sie z DANYCH przy pierwszym

@@ -42,13 +42,13 @@ const SLOT_MAIN: &str = "main-area";
 const SP_SEARCH: &str = "filters.search";
 const SP_SCOPE: &str = "filters.scope";
 const SP_TITLE: &str = "note.title";
-const SP_CONTENT: &str = "note.content";
+pub(crate) const SP_CONTENT: &str = "note.content";
 const SP_TAGS: &str = "note.tags";
 const SP_SAVE_STATUS: &str = "editor.save_status";
 const SP_SAVE_ERROR: &str = "editor.save_error";
 const SP_SAVE_OK_VIS: &str = "editor.save_ok_visible";
 const SP_SAVE_ERR_VIS: &str = "editor.save_err_visible";
-const SP_CHAR_COUNT: &str = "editor.char_count";
+pub(crate) const SP_CHAR_COUNT: &str = "editor.char_count";
 const SP_LINK_PICK: &str = "links.pick";
 // One shell hosts ALL views (the host rejects a second PanelShell per open
 // panel); these booleans drive the state-bound visibility of each subtree.
@@ -183,6 +183,17 @@ pub(crate) struct Session {
     /// navigation (open_note) does NOT bump it — a late blur-save of the
     /// previously open note stays valid and is written to ITS note_id.
     pub editor_gen: i64,
+    /// Dictation mode (mockup n04): active flag, the not-yet-committed
+    /// partial segment, pause state and the stopwatch bookkeeping (start of
+    /// the current run + elapsed time accumulated across pauses).
+    pub dictating: bool,
+    pub d_partial: String,
+    pub d_paused: bool,
+    pub d_started_ms: i64,
+    pub d_elapsed_ms: i64,
+    /// Highest utterance seq already applied — an out-of-order/duplicate
+    /// delivery (seq <= d_seq) is dropped instead of committing stale speech.
+    pub d_seq: i64,
 }
 
 impl Default for Session {
@@ -211,6 +222,12 @@ impl Default for Session {
             g_depth: 2,
             g_selected: String::new(),
             editor_gen: 0,
+            dictating: false,
+            d_partial: String::new(),
+            d_paused: false,
+            d_started_ms: 0,
+            d_elapsed_ms: 0,
+            d_seq: -1,
         }
     }
 }
@@ -248,6 +265,12 @@ pub(crate) fn load_session() -> Session {
             g_depth: v["g_depth"].as_i64().unwrap_or(d.g_depth),
             g_selected: v["g_selected"].as_str().unwrap_or("").to_string(),
             editor_gen: v["editor_gen"].as_i64().unwrap_or(0),
+            dictating: v["dictating"].as_bool().unwrap_or(false),
+            d_partial: v["d_partial"].as_str().unwrap_or("").to_string(),
+            d_paused: v["d_paused"].as_bool().unwrap_or(false),
+            d_started_ms: v["d_started_ms"].as_i64().unwrap_or(0),
+            d_elapsed_ms: v["d_elapsed_ms"].as_i64().unwrap_or(0),
+            d_seq: v["d_seq"].as_i64().unwrap_or(-1),
         },
         None => d,
     }
@@ -278,6 +301,12 @@ pub(crate) fn store_session(sess: &Session) {
         "g_depth": sess.g_depth,
         "g_selected": sess.g_selected,
         "editor_gen": sess.editor_gen,
+        "dictating": sess.dictating,
+        "d_partial": sess.d_partial,
+        "d_paused": sess.d_paused,
+        "d_started_ms": sess.d_started_ms,
+        "d_elapsed_ms": sess.d_elapsed_ms,
+        "d_seq": sess.d_seq,
     });
     let _ = state_set(
         &session_key(),
@@ -621,6 +650,7 @@ pub fn send_panel_shell() {
     });
     initial_state.extend(crate::ui_search::initial_search_state());
     initial_state.extend(crate::ui_share::initial_share_state());
+    initial_state.extend(crate::ui_dictate::initial_dictation_state());
 
     let shell = PanelShell {
         addon_id: ADDON_ID.into(),
@@ -1154,6 +1184,9 @@ fn editor_overlay(n: &NoteDetail) -> Vec<StateEntry> {
     ]
     .into_iter()
     .chain(feedback_reset_entries())
+    .chain(crate::ui_dictate::editor_overlay_entries(
+        n.origin == "dictated",
+    ))
     .collect()
 }
 
@@ -1163,6 +1196,7 @@ fn empty_editor_overlay() -> Vec<StateEntry> {
         value: CborValue::Text(String::new()),
     })
     .chain(feedback_reset_entries())
+    .chain(crate::ui_dictate::editor_overlay_entries(false))
     .collect()
 }
 
@@ -1353,6 +1387,7 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail, gen: i64) -> Component {
                 None,
             ),
             created,
+            crate::ui_dictate::dictated_chip(),
             tags,
         ],
         wrap: Some(true),
@@ -1488,7 +1523,32 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail, gen: i64) -> Component {
         SP_SAVE_ERR_VIS,
     );
 
-    let mut toolbar_children = vec![counter];
+    // Mockup n01 toolbar: mic + hairline separator ahead of the char counter,
+    // grouped so SpaceBetween keeps them together on the left.
+    let mut left = Vec::new();
+    if n.can_write {
+        left.push(crate::ui_dictate::toolbar_mic(&n.id, gen));
+        left.push(
+            Divider {
+                orientation: DividerOrientation::Vertical,
+                variant: DividerVariant::Subtle,
+                spacing: Spacing::Xs,
+                label: None,
+            }
+            .into_component("toolbar-mic-sep")
+            .expect("Divider encode"),
+        );
+    }
+    left.push(counter);
+    let mut toolbar_children = vec![Cluster {
+        gap: Spacing::Sm,
+        align: FlexAlign::Center,
+        justify: FlexJustify::Start,
+        children: left,
+        wrap: Some(false),
+    }
+    .into_component("toolbar-left")
+    .expect("Cluster encode")];
     let mut right = vec![save_ok, save_err];
     if n.can_write {
         let mut delete_btn = Button {
@@ -1557,7 +1617,13 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail, gen: i64) -> Component {
         align_self: None,
         padding: Some(Spacing::Md),
         margin: None,
-        children: vec![title, meta, divider, content],
+        children: vec![
+            title,
+            meta,
+            divider,
+            content,
+            crate::ui_dictate::partial_line(),
+        ],
         style: Some(ui::BoxStyle {
             min_height: Some(DimensionToken::Px { value: 0 }),
             overflow_y: Some(ui::Overflow::Auto),
@@ -1573,13 +1639,20 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail, gen: i64) -> Component {
     .expect("Box encode");
 
     // Mockup col-editor: the active panel carries an accent border + glow.
+    // The dictation dock (visibility-bound) floats between the body and the
+    // bottom toolbar (mockup n04).
+    let mut col_children = vec![body];
+    if n.can_write {
+        col_children.push(crate::ui_dictate::dock_area());
+    }
+    col_children.push(toolbar);
     ui::Box {
         width: None,
         grow: Some(true),
         align_self: None,
         padding: None,
         margin: None,
-        children: vec![body, toolbar],
+        children: col_children,
         style: Some(ui::BoxStyle {
             border: Some(BorderEdges::all(BorderSide::new(1, BorderColor::Accent))),
             shadow: Some(ShadowToken::AccentGlow),
@@ -2284,6 +2357,10 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
         "manual_link_close" => action_link_picker(&ctx, false),
         "manual_link_add" => action_manual_link_add(&ctx, params),
         "set_mode" => action_set_mode(&ctx, params),
+        "dictation_start" => crate::ui_dictate::action_dictation_start(&ctx, params),
+        "dictation_pause" => crate::ui_dictate::action_dictation_pause(&ctx),
+        "dictation_finish" => crate::ui_dictate::action_dictation_finish(&ctx),
+        "dictation_utterance" => crate::ui_dictate::action_dictation_utterance(&ctx, params),
         "run_search" => crate::ui_search::action_run_search(&ctx, params),
         "search_scope" => crate::ui_search::action_search_scope(&ctx, params),
         "search_narrow" => crate::ui_search::action_search_narrow(&ctx, params),
@@ -2331,17 +2408,24 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
     // excluded as the highest-frequency action. Heavy lifting (LLM/embed) runs
     // as host calls and does not burn wasm fuel — the in-wasm work (chunking,
     // JSON parsing) is far below the 200M fuel budget.
-    if !matches!(action_id, "set_search" | "run_search" | "search_scope" | "share_suggest") {
+    // dictation_utterance is excluded like set_search: the drain would add a
+    // full embed+extract pass of latency between speech and the partial line.
+    if !matches!(
+        action_id,
+        "set_search" | "run_search" | "search_scope" | "share_suggest" | "dictation_utterance"
+    ) {
         let processed = analysis::process_queue(1);
         if !processed.is_empty() {
             let sess = load_session();
             let active = sess.active;
             // Refresh the panel only when the open note gained fresh links and
             // the user is not mid-typing (save_note keeps the caret alive).
-            // In graph mode the editor slot does not exist — skip.
+            // In graph mode the editor slot does not exist — skip. Mid-dictation
+            // a re-render would reset the dock overlay — skip as well.
             if sess.mode == "notes"
                 && processed.iter().any(|id| id == &active)
                 && action_id != "save_note"
+                && !sess.dictating
             {
                 if let Ok(Some(note)) = db::get_note(&ctx, &active) {
                     send_main(&ctx, Some(&note));
@@ -2400,6 +2484,13 @@ fn action_set_mode(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
     let mut sess = load_session();
     if sess.mode == mode {
         return json!({"ok": true});
+    }
+    // Leaving the notes view ends dictation like "Zakończ i zapisz" — the
+    // pending partial is committed, never dropped, and the finish patch
+    // releases the microphone via the active_path bind.
+    if sess.dictating {
+        crate::ui_dictate::action_dictation_finish(ctx);
+        sess = load_session();
     }
     sess.mode = mode.to_string();
     store_session(&sess);
@@ -2552,6 +2643,12 @@ fn action_new_note(ctx: &UserCtx) -> JsonValue {
         }
     };
     let mut sess = load_session();
+    // Navigation ends dictation like "Zakończ i zapisz" (commits the pending
+    // partial into the PREVIOUS note before the active id changes).
+    if sess.dictating {
+        crate::ui_dictate::action_dictation_finish(ctx);
+        sess = load_session();
+    }
     sess.active = id.clone();
     // Invalidate widgets of the previous editor render: any Change they still
     // emit was text meant for THIS new note, not for their own note_id.
@@ -2567,6 +2664,12 @@ fn action_open_note(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
         None => return json!({"ok": false, "error": "Brak note_id"}),
     };
     let mut sess = load_session();
+    // Navigation ends dictation like "Zakończ i zapisz" (commits the pending
+    // partial into the PREVIOUS note before the active id changes).
+    if sess.dictating {
+        crate::ui_dictate::action_dictation_finish(ctx);
+        sess = load_session();
+    }
     sess.active = note_id.clone();
     store_session(&sess);
     open_active(ctx, &note_id);
@@ -2745,6 +2848,7 @@ fn action_delete_note(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
             let mut sess = load_session();
             if sess.active == note_id {
                 sess.active.clear();
+                sess.dictating = false;
                 store_session(&sess);
             }
             send_main(ctx, None);
