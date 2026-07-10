@@ -50,6 +50,22 @@ const KG_COLLECTION: &str = "notes_kg";
 const LLM_ALIAS: &str = "notes-llm";
 const EMBED_ALIAS: &str = "notes-embeddings";
 
+/// Marker prefix on errors that mean "the model host call itself failed"
+/// (router/backend unreachable, e.g. an alias whose target is a remote mesh
+/// model that is not in the catalog yet during cold-start), as opposed to a
+/// content/parse/DB error. A transient host-call failure is NOT the note's
+/// fault, so `process_queue` DEFERS it without spending a retry attempt —
+/// exactly like the unbound-alias path. Without this, a cold-mesh window
+/// burns all `MAX_ATTEMPTS` and poisons every note (empty entity column) even
+/// though the model becomes reachable seconds later.
+const LLM_UNAVAILABLE_PREFIX: &str = "llm-unavailable: ";
+
+/// True when `err` came from a failed model host call (see
+/// `LLM_UNAVAILABLE_PREFIX`) and should be retried without spending an attempt.
+fn is_transient_llm_error(err: &str) -> bool {
+    err.starts_with(LLM_UNAVAILABLE_PREFIX)
+}
+
 /// Instance KV key with the real embedding dimension of notes-embeddings.
 /// Seeded lazily from the first embedding (the namespace takes its dimension
 /// from data, the manifest value is declarative only) — rag pattern.
@@ -462,10 +478,16 @@ fn llm_call(prompt: &str, model: &str, options: &JsonValue, buffer_size: usize) 
         )
     };
     if rc < 0 {
-        return Err(format!("llm_generate ({model}) returned error {rc}"));
+        // Router/backend failure (model not resolvable, backend down) — transient
+        // from the note's perspective; defer instead of poisoning (see prefix doc).
+        return Err(format!(
+            "{LLM_UNAVAILABLE_PREFIX}llm_generate ({model}) returned error {rc}"
+        ));
     }
     if out_len <= 0 {
-        return Err(format!("llm_generate ({model}) returned an empty response"));
+        return Err(format!(
+            "{LLM_UNAVAILABLE_PREFIX}llm_generate ({model}) returned an empty response"
+        ));
     }
     Ok(String::from_utf8_lossy(&buffer[..out_len as usize]).to_string())
 }
@@ -762,6 +784,24 @@ pub fn process_queue(budget: usize) -> Vec<String> {
                     ],
                 );
                 processed.push(note_id);
+            }
+            Err(e) if is_transient_llm_error(&e) => {
+                // Model host call failed (backend/router unreachable) — NOT the
+                // note's fault. Keep it queued WITHOUT spending an attempt so a
+                // cold-mesh window can't poison every note; it retries once the
+                // model becomes reachable. Mirrors the unbound-alias defer.
+                log::info(&format!(
+                    "notes: analysis of '{note_id}' deferred — model unavailable: {e}"
+                ));
+                let _ = sql_exec(
+                    "UPDATE analysis_queue SET last_error = ? \
+                     WHERE note_id = ? AND enqueued_at = ?",
+                    &[
+                        SqlValue::String(e.chars().take(500).collect()),
+                        SqlValue::String(note_id.clone()),
+                        SqlValue::I64(enqueued_at),
+                    ],
+                );
             }
             Err(e) => {
                 log::warn(&format!("notes: analysis of '{note_id}' failed: {e}"));
@@ -2214,6 +2254,29 @@ pub fn recent_merges_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- transient LLM error classification ---------------------------------
+
+    #[test]
+    fn transient_classifier_matches_host_call_failures() {
+        // The two shapes `llm_call` emits on a host-side failure both classify
+        // as transient — process_queue must defer them without spending a retry.
+        assert!(is_transient_llm_error(&format!(
+            "{LLM_UNAVAILABLE_PREFIX}llm_generate (notes-llm) returned error -2"
+        )));
+        assert!(is_transient_llm_error(&format!(
+            "{LLM_UNAVAILABLE_PREFIX}llm_generate (notes-llm) returned an empty response"
+        )));
+    }
+
+    #[test]
+    fn transient_classifier_rejects_content_and_db_errors() {
+        // Content / DB / parse errors are the note's problem and DO burn an
+        // attempt — they must never be misread as transient (infinite defer).
+        assert!(!is_transient_llm_error("chunk vector upsert 0: db locked"));
+        assert!(!is_transient_llm_error("embedding dimension mismatch: 512 (expected 1024)"));
+        assert!(!is_transient_llm_error("note vanished before analysis"));
+    }
 
     // --- entity JSON parser -------------------------------------------------
 
