@@ -1555,81 +1555,13 @@ pub async fn cluster_deploy(
         ));
     }
 
-    // Canoniczny wpis `services` dla CALEGO cluster-deployu — od razu widoczny na
-    // liscie serwisow jako `deploying` (spojnie z single-node deployem), potem
-    // sterowany do `running`/`failed` przez maszyne faz. Per-node wpisy czlonkow
-    // (head + workery) sa ukrywane w `service_list` (dedup po
-    // `deployment_cluster_id`/członkostwie), wiec user widzi JEDEN wpis. Wiersz
-    // jest inertny dla supervisora (pinned=false, External/ExternalHttp, zero
-    // modeli), a routing i tak idzie przez realny wpis head-a.
-    {
-        let placeholder = crate::services::deploy::build_placeholder_for_cluster(
-            engine_id,
-            &served,
-            endpoint_url.clone(),
-            &deployment_cluster_id,
-        );
-        // Placeholder jest kontraktem „widoczny od startu" — jego brak lamie
-        // liste serwisow. Traktujemy insert jak czesc transakcyjnego startu:
-        // porazka aportuje deploy (release portow + delete cluster + delete
-        // wiersza deployments), spojnie z bledem `deployments::create` powyzej.
-        let insert_result = match ctx.state.db.write() {
-            Ok(conn) => crate::services_repo::services::insert(&conn, &placeholder)
-                .and_then(|service_id| {
-                    // Placeholder MUSI niesc realny wiersz model_registry z
-                    // `served_model_name`: to jedyny wpis klastra widoczny w
-                    // `service_list`/`unique_models` (czlonkowie sa dedup-ukryci),
-                    // wiec bez niego model nie istnieje dla chatu (modelList),
-                    // a Benchmark Studio bierze fallbackowo display_name z
-                    // sufiksem "(cluster TP)" i kazdy request konczy sie 400.
-                    crate::services_repo::models::insert(
-                        &conn,
-                        &crate::services_repo::models::NewModel {
-                            service_id,
-                            model_name: served.clone(),
-                            display_name: Some(served.clone()),
-                            capabilities: "[\"chat\"]".to_string(),
-                            context_length: Some(max_len as i64),
-                            quantization: None,
-                            is_default: true,
-                        },
-                    )
-                    .map(|_| service_id)
-                })
-                .map_err(|e| e.to_string()),
-            Err(_) => Err("db pool poisoned".to_string()),
-        };
-        match insert_result {
-            Ok(service_id) => {
-                if let Ok(Some(info)) = crate::services::snapshot_builder::build_one(
-                    &ctx.state.db,
-                    service_id,
-                    ctx.state.local_node_id.as_ref(),
-                ) {
-                    super::handlers::broadcast_service_change(
-                        ctx,
-                        tentaflow_protocol::ServiceChange::Added(info),
-                    );
-                }
-            }
-            Err(e) => {
-                let _ = port_allocator.release(serve_port);
-                let _ = port_allocator.release(dist_port);
-                let _ = crate::db::repository::delete_cluster_deployment(
-                    &ctx.state.db,
-                    &deployment_cluster_id,
-                );
-                let _ = crate::db::repository::deployments::delete(
-                    &ctx.state.db,
-                    &deployment_cluster_id,
-                );
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::Internal,
-                    format!("persist cluster placeholder service: {e}"),
-                ));
-            }
-        }
-    }
+    // BRAK osobnej „wizytowki" klastra: klaster jest reprezentowany na liscie
+    // serwisow WPROST przez per-node wiersze czlonkow (head + workery), po jednym
+    // na nodzie — dokladnie jak kazdy inny serwis, tyle ze rozciagniety na wiele
+    // nodow. `service_list` ich juz NIE ukrywa. Realny stan gotowosci calego
+    // klastra sledzi rekord `cluster_deployments` (widok Klastry) + modal postepu
+    // deployu; statusem wierszy czlonkow steruje ich wlasny pipeline, a supervisor
+    // ich nie sonduje ani nie respawnuje (patrz guardy `service_is_distributed_member`).
 
     // NIEBLOKUJACY zwrot: kanal log-busa MUSI istniec zanim frontend zdazy
     // zasubskrybowac `deploymentLogStreamRequest` (keyed by deployment_cluster_id),
@@ -2545,11 +2477,14 @@ pub async fn cluster_deploy_stop(
         .ok_or_else(|| ProtocolError::not_found("deployment not found"))?;
     // P2-3: the deployment must belong to the cluster named in the request — a
     // stale/forged cluster_id must not tear down another cluster's deployment.
-    if dep.cluster_id != *cluster_id {
+    // Pusty `cluster_id` = wywolanie z wiersza serwisu (GUI zna tylko
+    // deployment_cluster_id) — wtedy bierzemy cluster z rekordu deploymentu.
+    if !cluster_id.is_empty() && dep.cluster_id != *cluster_id {
         return Err(ProtocolError::bad_request(
             "deployment nie należy do podanego klastra",
         ));
     }
+    let cluster_id = &dep.cluster_id;
     let dep_members =
         crate::db::repository::list_cluster_deployment_members(&ctx.state.db, deployment_cluster_id)
             .map_err(|e| ProtocolError::new(ProtocolErrorCode::Internal, e.to_string()))?;

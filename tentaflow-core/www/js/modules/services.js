@@ -278,6 +278,7 @@ function bindTabEvents() {
         b.dataset.svcName,
         b.dataset.svcNode,
         b.dataset.svcNodeLabel,
+        b.dataset.svcClusterDep,
       );
     };
   });
@@ -917,6 +918,7 @@ function renderRow(s) {
           data-svc-name="${escapeAttr(displayName)}"
           data-svc-node="${svcNodeId}"
           data-svc-node-label="${svcNodeLabel}"
+          data-svc-cluster-dep="${escapeAttr(s.cluster_deployment_id || s.clusterDeploymentId || '')}"
           title="${escapeAttr(I18n.t('services.btn_delete'))}"></tf-button>
         <span class="svc-row-error" data-svc-error="${svcActionKey}" hidden></span>
       </td>
@@ -1775,19 +1777,40 @@ async function deleteAlias(id, name) {
 
 // ---- Helpers --------------------------------------------------------------
 
-async function stopService(id, name, nodeId, nodeLabel) {
+async function stopService(id, name, nodeId, nodeLabel, clusterDep) {
+  // Wiersz czlonka klastra (head/worker kontenera TP): usuniecie pojedynczego
+  // ranka rozwaliloby caly TP-klaster, wiec kierujemy akcje na CALY klaster —
+  // koordynator rozsyla stop do wszystkich nodow (ClusterDeployStopRequest).
+  const isCluster = !!(clusterDep && clusterDep.length);
   const ok = await TfWindow.confirm({
-    title: I18n.t('services.confirm_delete_title'),
-    message: I18n.t('services.confirm_delete_body', {
-      name: name || id,
-      node: nodeLabel || nodeId || '—',
-    }),
-    confirmLabel: I18n.t('services.btn_delete'),
+    title: isCluster
+      ? I18n.t('cluster_detail.deploy_stop_title')
+      : I18n.t('services.confirm_delete_title'),
+    message: isCluster
+      ? I18n.t('cluster_detail.deploy_stop_confirm')
+      : I18n.t('services.confirm_delete_body', {
+        name: name || id,
+        node: nodeLabel || nodeId || '—',
+      }),
+    confirmLabel: isCluster ? I18n.t('cluster_detail.deploy_stop') : I18n.t('services.btn_delete'),
     cancelLabel: I18n.t('common.cancel'),
     danger: true,
   });
   if (!ok) return;
   try {
+    if (isCluster) {
+      // Pusty clusterId — backend wyprowadza go z rekordu deploymentu; teardown
+      // usuwa kontenery i wiersze czlonkow na WSZYSTKICH nodach klastra.
+      const resp = await ApiBinary.action('clusterDeployStopRequest', {
+        clusterId: '',
+        deploymentClusterId: clusterDep,
+      }, { timeoutMs: 180000 });
+      if (resp && resp.ok === false) {
+        throw new Error(resp.message || 'stop klastra nieudany');
+      }
+      await refreshServiceList();
+      return;
+    }
     // ServiceDeleteRequest stops the runtime AND removes the row; FK cascade
     // wipes attached model_registry rows. When nodeId points at a remote peer
     // the dispatcher forwards the call as `MeshCommandType::ServiceDeleteRemote`.

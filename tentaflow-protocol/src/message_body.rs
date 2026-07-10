@@ -142,6 +142,13 @@ pub struct ServiceInfo {
     /// kompatybilnosci ze starszymi peerami mesh.
     #[serde(default)]
     pub gpu_selection: String,
+    /// Gdy niepuste: ten wiersz jest czlonkiem distributed-deploymentu klastra
+    /// (head/worker kontenera TP) i niesie `deployment_cluster_id` calego
+    /// klastra. GUI uzywa go do skierowania akcji stop/usun na CALY klaster
+    /// (`ClusterDeployStopRequest`) zamiast kasowac pojedynczy rank. Puste dla
+    /// zwyklych serwisow. `#[serde(default)]` dla kompatybilnosci mesh.
+    #[serde(default)]
+    pub cluster_deployment_id: String,
 }
 
 /// Wartosci parametrow konsumowane przy kazdym requestcie do silnika.

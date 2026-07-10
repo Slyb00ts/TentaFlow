@@ -102,6 +102,18 @@ pub fn project_service_row(
 
     let request_time_parameters = parse_request_time_parameters(&svc.config_json);
     let gpu_selection = gpu_selection_summary(&svc.config_json);
+    // `deployment_cluster_id` z bloku `_distributed` (pusty dla zwyklych serwisow)
+    // — wedruje w snapshotach mesh, wiec KAZDY dashboard moze skierowac stop/usun
+    // wiersza czlonka na caly klaster (ClusterDeployStopRequest).
+    let cluster_deployment_id = serde_json::from_str::<serde_json::Value>(&svc.config_json)
+        .ok()
+        .and_then(|v| {
+            v.get("_distributed")
+                .and_then(|d| d.get("deployment_cluster_id"))
+                .and_then(|x| x.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_default();
 
     // Wykrycie aktualizacji: hash zrodel z deployu vs aktualny hash z manifestu
     // (build.rs liczy go w czasie kompilacji). Roznica = wbudowany bundle
@@ -149,6 +161,7 @@ pub fn project_service_row(
         updated_at: svc.updated_at,
         request_time_parameters,
         gpu_selection,
+        cluster_deployment_id,
     })
 }
 
