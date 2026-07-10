@@ -317,6 +317,26 @@ fn url_path(url: &str) -> String {
 /// Raw HTTP/1.0 + `Connection: close` POST over a plain TCP socket. Some embedded
 /// HTTP servers (e.g. the Unitree Go2 LAN signaling endpoint) close the
 /// connection mid-request when hit with hyper/reqwest HTTP/1.1 bodied POSTs, so
+/// Runs a synchronous, potentially long blocking I/O closure without starving the
+/// async scheduler. On a multi-thread runtime it hands the worker off via
+/// `block_in_place` (same pattern every other host fn uses for its `block_on`);
+/// off-runtime or on a current-thread runtime it just runs inline. Without this a
+/// blocking `raw_http10_post` (up to 8 s to a dead host) pins a tokio worker — in
+/// the command path (`call_tool_inner`) the wasm call is NOT wrapped in
+/// `block_in_place`, so an addon hammering an offline endpoint could exhaust the
+/// pool and wedge the whole addon dispatcher.
+fn block_io<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if matches!(h.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread) => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 /// `http_request` (reqwest) fails against them. This speaks the minimal HTTP/1.0
 /// dialect and reads the whole response to EOF. Header terminator may be CRLFCRLF
 /// or bare LFLF. Returns `(status, body)`.
@@ -436,7 +456,7 @@ pub fn http_raw_v1(
     let body = request.get("body").and_then(|v| v.as_str()).unwrap_or("");
     let path = url_path(&url);
 
-    let response_json = match raw_http10_post(addr, &domain, &path, content_type, body.as_bytes()) {
+    let response_json = match block_io(|| raw_http10_post(addr, &domain, &path, content_type, body.as_bytes())) {
         Ok((status, body)) => {
             audit_log(caller.data(), "http.raw", Some("http"), Some(&url), "ok", None);
             serde_json::json!({ "status": status, "body": body })
