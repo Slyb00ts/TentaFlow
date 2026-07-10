@@ -566,9 +566,19 @@ fn softmax_argmax(row: &[f32]) -> (usize, f32) {
 /// - tylko wielkie litery ASCII i cyfry,
 /// - 1-3 początkowe litery (wyróżnik powiatu), potem mix cyfr/liter,
 /// - co najmniej jedna cyfra (odrzuca ciągi samych liter).
+/// Valid first letters of a Polish civil registration area code — one per
+/// voivodeship. A read whose first letter is outside this set is not a Polish
+/// plate (or a misread) and is rejected. (Military `U`, historical/temporary
+/// series are intentionally excluded — this gate is for civil ANPR.)
+const PL_VOIVODESHIP_FIRST: &[char] = &[
+    'B', 'C', 'D', 'E', 'F', 'G', 'K', 'L', 'N', 'O', 'P', 'R', 'S', 'T', 'W', 'Z',
+];
+
 pub fn waliduj_tablice_pl(tekst: &str) -> bool {
     let len = tekst.chars().count();
-    if !(4..=8).contains(&len) {
+    // Real plates are 6-8 characters (2-3 area letters + 4-5 alphanumerics).
+    // Shorter reads are almost always a partial/occluded plate, not a real one.
+    if !(6..=8).contains(&len) {
         return false;
     }
     if !tekst
@@ -577,9 +587,52 @@ pub fn waliduj_tablice_pl(tekst: &str) -> bool {
     {
         return false;
     }
+    // Area code is ALWAYS 2-3 letters (no single-letter civil prefix exists) and
+    // its first letter is a valid voivodeship code. This is what rejects garbage
+    // reads like "M88901" (1 leading letter) that a distant/occluded plate
+    // produced consistently enough to win a naive majority vote.
     let leading = tekst.chars().take_while(|c| c.is_ascii_alphabetic()).count();
-    if !(1..=3).contains(&leading) {
+    if !(2..=3).contains(&leading) {
         return false;
     }
-    tekst.chars().any(|c| c.is_ascii_digit())
+    if !tekst
+        .chars()
+        .next()
+        .is_some_and(|c| PL_VOIVODESHIP_FIRST.contains(&c))
+    {
+        return false;
+    }
+    // The part after the area code must contain at least one digit (no plate is
+    // all-letters) and be at least two characters (the registration number).
+    let tail: String = tekst.chars().skip(leading).collect();
+    tail.len() >= 2 && tail.chars().any(|c| c.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod plate_format_tests {
+    use super::waliduj_tablice_pl;
+
+    #[test]
+    fn rejects_garbage_reads_from_occluded_plates() {
+        // These are the exact reads a distant/occluded plate produced in the
+        // field; only the two with a real 2-letter voivodeship code survive.
+        assert!(!waliduj_tablice_pl("M88901"), "1 leading letter is not a PL plate");
+        assert!(!waliduj_tablice_pl("B67K714"), "1 leading letter");
+        assert!(!waliduj_tablice_pl("M221SA"), "1 leading letter");
+        assert!(!waliduj_tablice_pl("N59156"), "1 leading letter");
+        assert!(!waliduj_tablice_pl("SR996"), "too short (5) — partial read");
+        assert!(waliduj_tablice_pl("NZ2476"), "NZ = valid voivodeship code, 6 chars");
+    }
+
+    #[test]
+    fn accepts_real_plates_rejects_bad_prefix_and_shapes() {
+        assert!(waliduj_tablice_pl("WPL5HJ2"));
+        assert!(waliduj_tablice_pl("WWL7322"));
+        assert!(waliduj_tablice_pl("KR12345"));
+        assert!(waliduj_tablice_pl("SK1234A"));
+        assert!(!waliduj_tablice_pl("AB12345"), "A is not a voivodeship first letter");
+        assert!(!waliduj_tablice_pl("WWWW123"), "4 leading letters");
+        assert!(!waliduj_tablice_pl("WA"), "too short");
+        assert!(!waliduj_tablice_pl("WARSAW"), "no digit in tail");
+    }
 }
