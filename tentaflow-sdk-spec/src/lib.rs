@@ -192,7 +192,8 @@ pub use protocol::{
         },
         state::{PatchRejectReason, PatchRejected, StatePatch, StateReset, StateSnapshot},
         tokens::{
-            AccordionMode, AlertVariant, AreaStacking, AudioCaptureMode, AudioControls,
+            AccordionMode, AlertVariant, AreaStacking, AudioCaptureMode, AudioCaptureVariant,
+            AudioControls,
             AudioVariant, AutocompleteHint,
             AvatarOverlap, AvatarShape, AvatarSize, AvatarStatus, BackgroundToken, BadgeVariant,
             BannerPosition, BarStacking, BreadcrumbSeparator, Breakpoint, BulletListVariant,

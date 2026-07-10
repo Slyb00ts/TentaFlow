@@ -173,11 +173,28 @@ pub fn open_registry(dir: &std::path::Path) -> Result<rusqlite::Connection, AbiE
             sha256 TEXT NOT NULL,
             mime TEXT NOT NULL,
             size_bytes INTEGER NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT '',
+            uploader_user_id TEXT NOT NULL DEFAULT ''
         );",
     )
     .map_err(|_| AbiError::Operation)?;
+    // Legacy registries predate the provenance columns — idempotent upgrade
+    // (duplicate-column errors are the expected no-op on fresh schemas).
+    let _ = conn.execute_batch("ALTER TABLE documents ADD COLUMN source TEXT NOT NULL DEFAULT ''");
+    let _ = conn
+        .execute_batch("ALTER TABLE documents ADD COLUMN uploader_user_id TEXT NOT NULL DEFAULT ''");
     Ok(conn)
+}
+
+/// True when the document is a microphone capture uploaded by ANOTHER user.
+/// Mic recordings are personal: `document_get`/`document_delete`/`document_list`
+/// hide them from every caller except the uploader, even within one addon
+/// instance — a doc_ref smuggled through UI action params must not let user B
+/// read user A's voice. Documents without the `audio_capture` marker keep the
+/// instance-wide visibility (FileInput uploads, addon-generated blobs).
+fn capture_hidden_from_caller(source: &str, uploader: &str, caller_user: Option<&str>) -> bool {
+    source == tentaflow_protocol::UPLOAD_SOURCE_AUDIO_CAPTURE && caller_user != Some(uploader)
 }
 
 /// Sharded ścieżka pliku w obrębie per-instance roota: `<dir>/blobs/<sha[0:2]>/
@@ -205,6 +222,7 @@ pub fn read_full_document(
     org_id: &str,
     addon_id: &str,
     doc_id: &str,
+    caller_user: Option<&str>,
 ) -> Result<(Vec<u8>, String), AbiError> {
     validate_doc_id(doc_id)?;
     let dir = documents_dir(org_id, addon_id)?;
@@ -213,14 +231,20 @@ pub fn read_full_document(
     let inst_lock = instance_lock(org_id, addon_id);
     let _inst_guard = inst_lock.lock().unwrap_or_else(|e| e.into_inner());
 
-    let row: Option<(String, String, i64)> = conn
+    let row: Option<(String, String, i64, String, String)> = conn
         .query_row(
-            "SELECT sha256, mime, size_bytes FROM documents WHERE doc_id = ?1",
+            "SELECT sha256, mime, size_bytes, source, uploader_user_id \
+             FROM documents WHERE doc_id = ?1",
             rusqlite::params![doc_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .ok();
-    let (sha256, mime, size_bytes) = row.ok_or(AbiError::NotFound)?;
+    let (sha256, mime, size_bytes, source, uploader) = row.ok_or(AbiError::NotFound)?;
+    // Same per-user rule as document_get_v1 — the ingest path must not become
+    // a side door into another user's microphone capture.
+    if capture_hidden_from_caller(&source, &uploader, caller_user) {
+        return Err(AbiError::NotFound);
+    }
 
     let path = blob_path(&dir, &sha256);
     let mut f = std::fs::File::open(&path).map_err(|_| AbiError::Operation)?;
@@ -480,6 +504,7 @@ pub fn document_storage_limit_mb(db: &crate::db::DbPool, addon_id: &str) -> i64 
 /// błędzie DB (rollback). Limit netto przy nadpisaniu istniejącego `doc_id`:
 /// nowy rozmiar zastępuje stary.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn commit_document_row(
     conn: &rusqlite::Connection,
     doc_id: &str,
@@ -488,6 +513,8 @@ pub fn commit_document_row(
     size_bytes: u64,
     created_at: &str,
     limit_mb: i64,
+    source: &str,
+    uploader_user_id: &str,
 ) -> Result<(), AbiError> {
     conn.execute("BEGIN IMMEDIATE", []).map_err(|_| AbiError::Operation)?;
 
@@ -526,9 +553,18 @@ pub fn commit_document_row(
         }
 
         conn.execute(
-            "INSERT OR REPLACE INTO documents (doc_id, sha256, mime, size_bytes, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![doc_id, sha256, mime, size_bytes as i64, created_at],
+            "INSERT OR REPLACE INTO documents \
+             (doc_id, sha256, mime, size_bytes, created_at, source, uploader_user_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                doc_id,
+                sha256,
+                mime,
+                size_bytes as i64,
+                created_at,
+                source,
+                uploader_user_id
+            ],
         )
         .map_err(|_| AbiError::Operation)?;
         Ok(())
@@ -664,6 +700,7 @@ fn start_new_upload(
 /// sha256, (3) rename finalizing → blob NAJPIERW, (4) DOPIERO POTEM commit
 /// wiersza. Czytelnik widzący wiersz ZAWSZE ma istniejący blob. Wołać pod
 /// mutexem instancji. Zwraca sha256 albo `(reason, AbiError)`.
+#[allow(clippy::too_many_arguments)]
 fn finalize_partial(
     dir: &Path,
     acc_key: &PendingKey,
@@ -672,6 +709,8 @@ fn finalize_partial(
     mime: &str,
     size_bytes: u64,
     limit_mb: i64,
+    source: &str,
+    uploader_user_id: &str,
 ) -> Result<String, (&'static str, AbiError)> {
     let final_path = finalizing_path(dir, doc_id);
     {
@@ -716,7 +755,10 @@ fn finalize_partial(
     }
 
     let created_at = chrono::Utc::now().to_rfc3339();
-    match commit_document_row(&conn, doc_id, &sha256, mime, size_bytes, &created_at, limit_mb) {
+    match commit_document_row(
+        &conn, doc_id, &sha256, mime, size_bytes, &created_at, limit_mb, source,
+        uploader_user_id,
+    ) {
         Ok(()) => Ok(sha256),
         Err(AbiError::QuotaExceeded) => {
             cleanup_unreferenced_blob(&conn, dir, &sha256);
@@ -766,6 +808,8 @@ pub fn accept_upload_chunk_host(
     total_chunks: u32,
     chunk: &[u8],
     limit_mb: i64,
+    source: &str,
+    uploader_user_id: &str,
 ) -> Result<HostUploadOutcome, (&'static str, AbiError)> {
     if total_chunks == 0 || total_chunks > MAX_TOTAL_CHUNKS {
         return Err(("invalid_total_chunks", AbiError::Operation));
@@ -880,7 +924,10 @@ pub fn accept_upload_chunk_host(
     match outcome? {
         PutOutcome::Buffered => Ok(HostUploadOutcome::Buffered { doc_id }),
         PutOutcome::Finalize { mime, size_bytes } => {
-            let sha = finalize_partial(&dir, &acc_key, &part_path, &doc_id, &mime, size_bytes, limit_mb)?;
+            let sha = finalize_partial(
+                &dir, &acc_key, &part_path, &doc_id, &mime, size_bytes, limit_mb, source,
+                uploader_user_id,
+            )?;
             let _ = sha;
             Ok(HostUploadOutcome::Finalized { doc_ref: doc_id, size_bytes })
         }
@@ -1179,7 +1226,12 @@ pub fn document_put_v1(
     //     (4) DOPIERO POTEM commit_document_row. Skutek: czytelnik widzący wiersz
     //     ZAWSZE ma istniejący blob (B); overwrite nie zostawia okna wiszącego.
     // -------------------------------------------------------------------------
-    let sha256 = match finalize_partial(&dir, &acc_key, &part_path, &doc_id, &mime, size_bytes, limit_mb) {
+    // Addon-side puts carry no capture marker (source pusty = widoczność
+    // instancyjna); uploader zapisujemy dla audytu/atrybucji.
+    let uploader = caller.data().user_id.clone().unwrap_or_default();
+    let sha256 = match finalize_partial(
+        &dir, &acc_key, &part_path, &doc_id, &mime, size_bytes, limit_mb, "", &uploader,
+    ) {
         Ok(s) => s,
         Err((reason, err)) => {
             let result = if err == AbiError::QuotaExceeded { "denied" } else { "error" };
@@ -1334,20 +1386,28 @@ pub fn document_get_v1(
 
     // Ownership: SELECT scoped do rejestru tej instancji. Obcy doc_id → brak
     // wiersza → NotFound.
-    let row: Option<(String, String, i64)> = conn
+    let row: Option<(String, String, i64, String, String)> = conn
         .query_row(
-            "SELECT sha256, mime, size_bytes FROM documents WHERE doc_id = ?1",
+            "SELECT sha256, mime, size_bytes, source, uploader_user_id \
+             FROM documents WHERE doc_id = ?1",
             rusqlite::params![&input.doc_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .ok();
-    let (sha256, mime, size_bytes) = match row {
+    let (sha256, mime, size_bytes, source, uploader) = match row {
         Some(t) => t,
         None => {
             audit(caller.data(), "document.get", Some(&input.doc_id), "denied", Some("not_found"));
             return AbiError::NotFound.as_i32();
         }
     };
+    // Nagrania mikrofonu są per-użytkownik: doc_ref przemycony przez parametry
+    // akcji UI nie pozwala odczytać cudzego głosu. NotFound (nie Permission),
+    // żeby nie zdradzać istnienia cudzego dokumentu.
+    if capture_hidden_from_caller(&source, &uploader, caller.data().user_id.as_deref()) {
+        audit(caller.data(), "document.get", Some(&input.doc_id), "denied", Some("cross_user_capture"));
+        return AbiError::NotFound.as_i32();
+    }
 
     let total_chunks = ((size_bytes as usize).div_ceil(DOCUMENT_CHUNK_BYTES)).max(1) as u32;
     if input.chunk_index >= total_chunks {
@@ -1495,15 +1555,26 @@ pub fn document_delete_v1(
     let inst_lock = instance_lock(&org_id, &addon_id);
     let _inst_guard = inst_lock.lock().unwrap_or_else(|e| e.into_inner());
 
-    let sha256: Option<String> = conn
+    let row: Option<(String, String, String)> = conn
         .query_row(
-            "SELECT sha256 FROM documents WHERE doc_id = ?1",
+            "SELECT sha256, source, uploader_user_id FROM documents WHERE doc_id = ?1",
             rusqlite::params![&input.doc_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .ok();
-    let sha256 = match sha256 {
-        Some(s) => s,
+    // Cudze nagranie mikrofonu jest dla wołającego nieodróżnialne od
+    // nieistniejącego dokumentu (removed=false, bez leaku istnienia).
+    let row = match row {
+        Some((_, ref source, ref uploader))
+            if capture_hidden_from_caller(source, uploader, caller.data().user_id.as_deref()) =>
+        {
+            audit(caller.data(), "document.delete", Some(&input.doc_id), "denied", Some("cross_user_capture"));
+            None
+        }
+        other => other,
+    };
+    let sha256 = match row {
+        Some((s, _, _)) => s,
         None => {
             let out = DocumentDeleteOutput {
                 doc_id: input.doc_id.clone(),
@@ -1642,9 +1713,11 @@ pub fn document_list_v1(
         }
     };
 
+    let caller_user = caller.data().user_id.clone();
     let documents: Vec<DocumentMeta> = {
         let mut stmt = match conn.prepare(
-            "SELECT doc_id, mime, size_bytes, sha256, created_at FROM documents ORDER BY created_at",
+            "SELECT doc_id, mime, size_bytes, sha256, created_at, source, uploader_user_id \
+             FROM documents ORDER BY created_at",
         ) {
             Ok(s) => s,
             Err(_) => {
@@ -1653,16 +1726,32 @@ pub fn document_list_v1(
             }
         };
         let rows = stmt.query_map([], |r| {
-            Ok(DocumentMeta {
-                doc_id: r.get(0)?,
-                mime: r.get(1)?,
-                size_bytes: r.get::<_, i64>(2)? as u64,
-                sha256: r.get(3)?,
-                created_at: r.get(4)?,
-            })
+            Ok((
+                DocumentMeta {
+                    doc_id: r.get(0)?,
+                    mime: r.get(1)?,
+                    size_bytes: r.get::<_, i64>(2)? as u64,
+                    sha256: r.get(3)?,
+                    created_at: r.get(4)?,
+                    source: Some(r.get::<_, String>(5)?),
+                },
+                r.get::<_, String>(6)?,
+            ))
         });
         match rows {
-            Ok(it) => it.filter_map(|r| r.ok()).collect(),
+            // Cudze nagrania mikrofonu są niewidoczne na liście — ta sama
+            // reguła co w get/delete.
+            Ok(it) => it
+                .filter_map(|r| r.ok())
+                .filter(|(meta, uploader)| {
+                    !capture_hidden_from_caller(
+                        meta.source.as_deref().unwrap_or(""),
+                        uploader,
+                        caller_user.as_deref(),
+                    )
+                })
+                .map(|(meta, _)| meta)
+                .collect(),
             Err(_) => {
                 audit(caller.data(), "document.list", None, "error", Some("registry_query_failed"));
                 return AbiError::Operation.as_i32();
@@ -1778,7 +1867,7 @@ mod tests {
         }
         let conn = open_registry(dir).unwrap();
         let created = "2026-06-21T00:00:00Z";
-        match commit_document_row(&conn, doc_id, &sha, mime, size_bytes, created, limit_mb) {
+        match commit_document_row(&conn, doc_id, &sha, mime, size_bytes, created, limit_mb, "", "") {
             Ok(()) => Ok(sha),
             Err(e) => {
                 cleanup_unreferenced_blob(&conn, dir, &sha);
@@ -1926,7 +2015,7 @@ mod tests {
 
         let conn = open_registry(&dir).unwrap();
         // Pierwszy: 600 KB < 1 MB → OK.
-        commit_document_row(&conn, "doc-1", "sha1aaaa", "application/pdf", data.len() as u64, "t", limit_mb)
+        commit_document_row(&conn, "doc-1", "sha1aaaa", "application/pdf", data.len() as u64, "t", limit_mb, "", "")
             .expect("pierwszy 600KB mieści się w 1MB");
         // Drugi: projekcja 1.2 MB > 1 MB → QuotaExceeded (rollback).
         let r = commit_document_row(
@@ -1937,6 +2026,8 @@ mod tests {
             data.len() as u64,
             "t",
             limit_mb,
+            "",
+            "",
         );
         assert_eq!(r, Err(AbiError::QuotaExceeded), "drugi przekracza limit → odrzucony");
         let used = current_storage_bytes(&conn);
@@ -2028,7 +2119,7 @@ mod tests {
         assert_eq!(current_storage_bytes(&conn), 600_000);
 
         // Limit 1MB, nowy plik 600KB → transakcja odrzuca (projekcja 1.2MB > 1MB).
-        let r = commit_document_row(&conn, "doc-2", "shaXXXX", "application/pdf", 600_000, "t", 1);
+        let r = commit_document_row(&conn, "doc-2", "shaXXXX", "application/pdf", 600_000, "t", 1, "", "");
         assert_eq!(r, Err(AbiError::QuotaExceeded));
         set_root_override(None);
     }
@@ -2402,7 +2493,7 @@ mod tests {
             let end = (start + DOCUMENT_CHUNK_BYTES).min(data.len());
             let out = accept_upload_chunk_host(
                 "org-default", "alpha", upload_id, "application/pdf",
-                seq, total_chunks, &data[start..end], 0,
+                seq, total_chunks, &data[start..end], 0, "", "",
             )
             .unwrap();
             match out {
@@ -2442,7 +2533,7 @@ mod tests {
 
         let data = b"maly plik";
         let out = accept_upload_chunk_host(
-            "org-default", "alpha", "u1", "text/plain", 0, 1, data, 0,
+            "org-default", "alpha", "u1", "text/plain", 0, 1, data, 0, "", "",
         )
         .unwrap();
         let doc_ref = match out {
@@ -2469,7 +2560,7 @@ mod tests {
         pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
 
         let out = accept_upload_chunk_host(
-            "org-a", "alpha", "u-iso", "text/plain", 0, 1, b"sekret", 0,
+            "org-a", "alpha", "u-iso", "text/plain", 0, 1, b"sekret", 0, "", "",
         )
         .unwrap();
         let doc_ref = match out {
@@ -2490,6 +2581,53 @@ mod tests {
         set_root_override(None);
     }
 
+    /// Cross-user: nagranie mikrofonu (source=audio_capture) usera A jest dla
+    /// usera B tej samej instancji nieodróżnialne od nieistniejącego dokumentu;
+    /// dokument bez markera pozostaje widoczny instancyjnie.
+    #[test]
+    fn audio_capture_doc_hidden_from_other_users() {
+        let _lock = override_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir().unwrap();
+        let _g = set_root_override(Some(tmp.path().to_path_buf()));
+        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+        let out = accept_upload_chunk_host(
+            "org-default", "alpha", "u-cap", "audio/wav", 0, 1, b"wav-bytes", 0,
+            tentaflow_protocol::UPLOAD_SOURCE_AUDIO_CAPTURE, "user-a",
+        )
+        .unwrap();
+        let cap_ref = match out {
+            HostUploadOutcome::Finalized { doc_ref, .. } => doc_ref,
+            _ => panic!("finalized"),
+        };
+        let out = accept_upload_chunk_host(
+            "org-default", "alpha", "u-plain", "text/plain", 0, 1, b"plain", 0, "", "user-a",
+        )
+        .unwrap();
+        let plain_ref = match out {
+            HostUploadOutcome::Finalized { doc_ref, .. } => doc_ref,
+            _ => panic!("finalized"),
+        };
+
+        // Uploader czyta swoje nagranie; inny user i kontekst systemowy — nie.
+        assert!(read_full_document("org-default", "alpha", &cap_ref, Some("user-a")).is_ok());
+        assert_eq!(
+            read_full_document("org-default", "alpha", &cap_ref, Some("user-b")),
+            Err(AbiError::NotFound),
+            "cudze nagranie mikrofonu musi być niewidoczne"
+        );
+        assert_eq!(
+            read_full_document("org-default", "alpha", &cap_ref, None),
+            Err(AbiError::NotFound),
+            "brak usera (system) nie omija guardu nagrań"
+        );
+        // Zwykły dokument (bez markera) widoczny dla każdego usera instancji.
+        assert!(read_full_document("org-default", "alpha", &plain_ref, Some("user-b")).is_ok());
+
+        pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        set_root_override(None);
+    }
+
     /// Cap: niemonotoniczna sekwencja (skok seq) odrzucona i czyści partial.
     #[test]
     fn host_upload_rejects_sequence_gap() {
@@ -2498,9 +2636,9 @@ mod tests {
         let _g = set_root_override(Some(tmp.path().to_path_buf()));
         pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
 
-        accept_upload_chunk_host("org-default", "alpha", "u-seq", "text/plain", 0, 3, b"aaa", 0).unwrap();
+        accept_upload_chunk_host("org-default", "alpha", "u-seq", "text/plain", 0, 3, b"aaa", 0, "", "").unwrap();
         // Skok do seq=2 (pominięty 1) → mismatch.
-        let err = accept_upload_chunk_host("org-default", "alpha", "u-seq", "text/plain", 2, 3, b"ccc", 0);
+        let err = accept_upload_chunk_host("org-default", "alpha", "u-seq", "text/plain", 2, 3, b"ccc", 0, "", "");
         assert!(matches!(err, Err(("chunk_sequence_mismatch", AbiError::Operation))));
         // Partial skasowany po mismatch.
         let doc_id = format!("up-{}", sanitize_upload_id("u-seq"));
@@ -2518,7 +2656,7 @@ mod tests {
         pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
 
         let huge = vec![0u8; MAX_PUT_CHUNK_BYTES + 1];
-        let err = accept_upload_chunk_host("org-default", "alpha", "u-big", "text/plain", 0, 1, &huge, 0);
+        let err = accept_upload_chunk_host("org-default", "alpha", "u-big", "text/plain", 0, 1, &huge, 0, "", "");
         assert!(matches!(err, Err(("chunk_too_large", AbiError::PayloadTooLarge))));
         pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
         set_root_override(None);
@@ -2533,11 +2671,11 @@ mod tests {
         pending_uploads().lock().unwrap_or_else(|e| e.into_inner()).clear();
 
         assert!(matches!(
-            accept_upload_chunk_host("o", "alpha", "u", "text/plain", 0, 0, b"x", 0),
+            accept_upload_chunk_host("o", "alpha", "u", "text/plain", 0, 0, b"x", 0, "", ""),
             Err(("invalid_total_chunks", _))
         ));
         assert!(matches!(
-            accept_upload_chunk_host("o", "alpha", "u", "text/plain", 5, 3, b"x", 0),
+            accept_upload_chunk_host("o", "alpha", "u", "text/plain", 5, 3, b"x", 0, "", ""),
             Err(("chunk_index_out_of_range", _))
         ));
         set_root_override(None);
@@ -2555,7 +2693,7 @@ mod tests {
         // 1 MB limit, plik 1 fragment ~9 bajtów → mieści się; potem duży > limit.
         let data = vec![7u8; 2 * 1024 * 1024];
         // 1 fragment 2 MB przekracza MAX_PUT_CHUNK_BYTES? Nie (8 MiB). limit 1 MB.
-        let err = accept_upload_chunk_host("org-default", "alpha", "u-q", "text/plain", 0, 1, &data, 1);
+        let err = accept_upload_chunk_host("org-default", "alpha", "u-q", "text/plain", 0, 1, &data, 1, "", "");
         assert!(
             matches!(err, Err(("storage_limit_exceeded", AbiError::QuotaExceeded))),
             "2MB plik przy limicie 1MB odrzucony, dostałem {err:?}"

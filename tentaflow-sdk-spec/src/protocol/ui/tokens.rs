@@ -1321,6 +1321,17 @@ string_enum! {
 }
 
 string_enum! {
+    /// `AudioCapture.variant` (catalog §8 0x0612). `standalone` is the vertical
+    /// column (waves framing the mic, label + status below); `docked` is the
+    /// horizontal strip for recording docks (mic on the left, one waveform on
+    /// the right, no idle label — status only when non-empty).
+    pub enum AudioCaptureVariant {
+        Standalone = "standalone",
+        Docked = "docked",
+    }
+}
+
+string_enum! {
     /// `FpsCounter.variant` (catalog §8 0x060E).
     pub enum FpsVariant {
         Minimal = "minimal",

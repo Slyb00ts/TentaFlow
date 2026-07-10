@@ -171,6 +171,11 @@ pub fn addon_document_upload_chunk(
     let seq = payload.seq;
     let total_chunks = payload.total_chunks;
     let bytes = payload.bytes.clone();
+    // Provenance trafia do rejestru dokumentów: `source` (zaufany marker
+    // kanału, patrz gate wyżej) + user sesji jako uploader. Dla nagrań
+    // mikrofonu store egzekwuje potem uploader==caller w get/delete/list.
+    let source = payload.source.clone();
+    let uploader = user_id.clone();
     let outcome = run_blocking(move || {
         accept_upload_chunk_host(
             &org_id,
@@ -181,6 +186,8 @@ pub fn addon_document_upload_chunk(
             total_chunks,
             &bytes,
             limit_mb,
+            &source,
+            &uploader,
         )
     })
     .map_err(|(reason, err)| map_store_err(reason, err))?;

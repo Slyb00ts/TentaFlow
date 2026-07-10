@@ -5,7 +5,9 @@
 use super::super::bind::{BindRef, StatePath};
 use super::super::component::{Component, FieldMap};
 use super::super::inline::AspectRatio;
-use super::super::tokens::{AudioCaptureMode, AudioControls, AudioVariant, ImageFit, VideoControls};
+use super::super::tokens::{
+    AudioCaptureMode, AudioCaptureVariant, AudioControls, AudioVariant, ImageFit, VideoControls,
+};
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
@@ -202,10 +204,12 @@ impl Audio {
 /// Microphone capture control (catalog §8 0x0612). Records the user's voice in
 /// the browser (push-to-talk or VAD end-of-utterance detection), uploads the
 /// finished WAV utterance through the addon document-upload channel and emits
-/// `action_id` with `{doc_ref, mime, sample_rate, duration_ms, size,
-/// language_hint?}` params. Audio bytes never travel inside the action event.
-/// The host refuses audio uploads for addons without the `audio.capture`
-/// permission, so the component is fail-closed end-to-end.
+/// `action_id` with `{doc_ref, mime, sample_rate, duration_ms, size, seq,
+/// language_hint?}` params. `seq` is a monotonic per-mount utterance counter
+/// (deliveries are also serialized renderer-side); addons drop `seq <= last`
+/// to stay immune to reordering. Audio bytes never travel inside the action
+/// event. The host refuses audio uploads for addons without the
+/// `audio.capture` permission, so the component is fail-closed end-to-end.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioCapture {
     /// Backend action invoked with the utterance reference params.
@@ -224,13 +228,20 @@ pub struct AudioCapture {
     pub recording_path: Option<StatePath>,
     /// Reactive disabled flag.
     pub disabled: Option<BindRef>,
+    /// VAD only: two-way bound bool controlling the listening state. The addon
+    /// sets it to pause/resume capture programmatically (dock „Pauza"/„Wznów"
+    /// buttons); the renderer writes it back when the user toggles the mic
+    /// button, so the path always reflects whether the mic is armed.
+    pub active_path: Option<StatePath>,
+    /// Layout variant. Default `standalone`.
+    pub variant: Option<AudioCaptureVariant>,
 }
 
 impl AudioCapture {
     pub const TAG: u16 = 0x0612;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut e: Vec<(u8, Value)> = Vec::with_capacity(7);
+        let mut e: Vec<(u8, Value)> = Vec::with_capacity(9);
         e.push((0, encode_to_value(&self.action_id)?));
         e.push((1, encode_to_value(&self.mode)?));
         if let Some(v) = &self.silence_ms { e.push((2, encode_to_value(v)?)); }
@@ -238,6 +249,8 @@ impl AudioCapture {
         if let Some(v) = &self.language_hint { e.push((4, encode_to_value(v)?)); }
         if let Some(v) = &self.recording_path { e.push((5, encode_to_value(v)?)); }
         if let Some(v) = &self.disabled { e.push((6, encode_to_value(v)?)); }
+        if let Some(v) = &self.active_path { e.push((7, encode_to_value(v)?)); }
+        if let Some(v) = &self.variant { e.push((8, encode_to_value(v)?)); }
         Ok(component(Self::TAG, id, e))
     }
 
@@ -247,6 +260,7 @@ impl AudioCapture {
         let mut action_id = None; let mut mode = None; let mut silence_ms = None;
         let mut min_speech_ms = None; let mut language_hint = None;
         let mut recording_path = None; let mut disabled = None;
+        let mut active_path = None; let mut variant = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => action_id = Some(decode_from_value(v)?),
@@ -256,6 +270,8 @@ impl AudioCapture {
                 4 => language_hint = Some(decode_from_value(v)?),
                 5 => recording_path = Some(decode_from_value(v)?),
                 6 => disabled = Some(decode_from_value(v)?),
+                7 => active_path = Some(decode_from_value(v)?),
+                8 => variant = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("AudioCapture", *other)),
             }
         }
@@ -267,6 +283,8 @@ impl AudioCapture {
             language_hint,
             recording_path,
             disabled,
+            active_path,
+            variant,
         })
     }
 }

@@ -139,6 +139,9 @@ pub struct WhisperTranscribeOutput {
     pub text: String,
     pub duration_seconds: f64,
     pub segments: Vec<WhisperSegment>,
+    /// ISO-639-1 code of the language whisper actually used (explicit or
+    /// auto-detected), from `whisper_full_lang_id`. `None` when unknown.
+    pub detected_language: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -219,7 +222,10 @@ impl WhisperRuntime {
         params.language = language
             .as_ref()
             .map_or(ptr::null(), |value| value.as_ptr());
-        params.detect_language = language.is_none();
+        // NULL language already means "detect, then transcribe" inside
+        // whisper_full. `detect_language = true` would make whisper.cpp STOP
+        // after the detection pass and return zero segments.
+        params.detect_language = false;
         params.initial_prompt = initial_prompt
             .as_ref()
             .map_or(ptr::null(), |value| value.as_ptr());
@@ -271,10 +277,23 @@ impl WhisperRuntime {
             });
         }
 
+        // Language whisper actually decoded with — explicit or auto-detected
+        // (whisper.cpp sets `state->lang_id` on both paths).
+        let detected_language = {
+            let lang_id = unsafe { sys::whisper_full_lang_id(self.ctx.ptr) };
+            if lang_id >= 0 {
+                let lang = cstr_to_string(unsafe { sys::whisper_lang_str(lang_id) });
+                if lang.is_empty() { None } else { Some(lang) }
+            } else {
+                None
+            }
+        };
+
         Ok(WhisperTranscribeOutput {
             text: full_text,
             duration_seconds: pcm.len() as f64 / 16000.0,
             segments,
+            detected_language,
         })
     }
 }

@@ -241,7 +241,7 @@ impl SttRuntime {
         Ok(TranscriptionResponse {
             text,
             task: Some("transcribe".to_string()),
-            language: Some(result.language),
+            language: result.language,
             duration: Some(result.duration_seconds as f32),
             segments,
             speakers: None,

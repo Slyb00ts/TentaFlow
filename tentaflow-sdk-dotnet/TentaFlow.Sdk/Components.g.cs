@@ -2371,6 +2371,21 @@ public static class AudioCaptureModeWireExtensions {
     public static TfValue ToWire(this AudioCaptureMode v) => TfValue.Text(v.WireName());
 }
 
+/// <summary>Enum: AudioCaptureVariant</summary>
+public enum AudioCaptureVariant {
+    [Wire("standalone")] Standalone,
+    [Wire("docked")] Docked
+}
+
+public static class AudioCaptureVariantWireExtensions {
+    public static string WireName(this AudioCaptureVariant v) => v switch {
+        AudioCaptureVariant.Standalone => "standalone",
+        AudioCaptureVariant.Docked => "docked",
+        _ => throw new ArgumentOutOfRangeException(nameof(v)),
+    };
+    public static TfValue ToWire(this AudioCaptureVariant v) => TfValue.Text(v.WireName());
+}
+
 /// <summary>Enum: FpsVariant</summary>
 public enum FpsVariant {
     [Wire("minimal")] Minimal,
@@ -11297,6 +11312,10 @@ public sealed class AudioCapture : Component {
     public StatePath? RecordingPath { get; set; }
     /// <summary>Field 6: disabled (Option<BindRef>)</summary>
     public BindRef? Disabled { get; set; }
+    /// <summary>Field 7: active_path (Option<StatePath>)</summary>
+    public StatePath? ActivePath { get; set; }
+    /// <summary>Field 8: variant (Option<Enum<AudioCaptureVariant>>)</summary>
+    public AudioCaptureVariant? Variant { get; set; }
 
     public override FieldMap ToFieldMap() {
         var map = new FieldMap();
@@ -11307,6 +11326,8 @@ public sealed class AudioCapture : Component {
         if (LanguageHint != null) map.Set(4, TfValue.Text(LanguageHint));
         if (RecordingPath != null) map.Set(5, RecordingPath.ToValue());
         if (Disabled != null) map.Set(6, Disabled.ToValue());
+        if (ActivePath != null) map.Set(7, ActivePath.ToValue());
+        if (Variant != null) map.Set(8, Variant.Value.ToWire());
         return map;
     }
 }

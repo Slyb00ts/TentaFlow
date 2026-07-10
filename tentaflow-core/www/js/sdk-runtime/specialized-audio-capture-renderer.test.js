@@ -105,6 +105,21 @@ test('AudioCapture unknown field key throws', () => {
   ])), 'unknown field rejected');
 });
 
+test('AudioCapture docked variant adds the variant class', () => {
+  setup();
+  const el = mount(makeEngine().render(comp(AUDIO_CAPTURE_TAG, [
+    [0, 'a'], [1, 'vad'], [8, 'docked'],
+  ])));
+  assert(el.classList.contains('tf-audio-capture--docked'), 'variant class');
+});
+
+test('AudioCapture invalid variant throws', () => {
+  setup();
+  assertThrows(() => makeEngine().render(comp(AUDIO_CAPTURE_TAG, [
+    [0, 'a'], [1, 'vad'], [8, 'floating'],
+  ])), 'variant enum enforced');
+});
+
 test('AudioCapture invalid mode throws', () => {
   setup();
   assertThrows(() => makeEngine().render(comp(AUDIO_CAPTURE_TAG, [
@@ -162,12 +177,18 @@ function installAudioMocks() {
   }
   globalThis.AudioContext = AudioContextMock;
   if (globalThis.window) globalThis.window.AudioContext = AudioContextMock;
-  globalThis.AudioWorkletNode = class { constructor() { this.port = { onmessage: null }; } connect(n) { return n; } disconnect() {} };
+  let lastWorklet = null;
+  globalThis.AudioWorkletNode = class {
+    constructor() { this.port = { onmessage: null }; lastWorklet = this; }
+    connect(n) { return n; }
+    disconnect() {}
+  };
   globalThis.Blob = class { constructor() {} };
   globalThis.URL = { createObjectURL: () => 'blob:x', revokeObjectURL() {} };
   if (!globalThis.performance) globalThis.performance = { now: () => 0 };
   return {
     getCalls: () => getUserMediaCalls,
+    lastWorklet: () => lastWorklet,
     restore: () => {
       if (saved.navigator) Object.defineProperty(globalThis, 'navigator', saved.navigator);
       else delete globalThis.navigator;
@@ -217,6 +238,106 @@ test('AudioCapture disabled button ignores pointerdown (no getUserMedia)', async
     await Promise.resolve();
     assertEq(mocks.getCalls(), 0, 'disabled control must not request the mic');
   } finally {
+    mocks.restore();
+  }
+});
+
+test('AudioCapture active_path=true arms VAD listening; false stops it', async () => {
+  setup();
+  const mocks = installAudioMocks();
+  try {
+    const store = makeStore();
+    store.applySnapshot({
+      entries: [{ path: PATH('dic', 'active'), value: false }],
+      state_revision: 0, truncated: false,
+    });
+    const el = mount(makeEngine(store).render(comp(AUDIO_CAPTURE_TAG, [
+      [0, 'a'], [1, 'vad'],
+      [7, PATH('dic', 'active')],
+    ])));
+    const label = el.querySelector('.tf-audio-capture__label');
+    assertEq(label.textContent, 'Rozpocznij nagrywanie');
+    store.applyOverlay([{ path: PATH('dic', 'active'), value: true }]);
+    await new Promise((r) => setTimeout(r, 10));
+    assert(mocks.getCalls() >= 1, 'resume must open the mic');
+    assertEq(label.textContent, 'Zatrzymaj nagrywanie');
+    store.applyOverlay([{ path: PATH('dic', 'active'), value: false }]);
+    await new Promise((r) => setTimeout(r, 10));
+    assertEq(label.textContent, 'Rozpocznij nagrywanie', 'pause must stop listening');
+  } finally {
+    mocks.restore();
+  }
+});
+
+test('AudioCapture user VAD toggle publishes active_path back to the store', async () => {
+  setup();
+  const mocks = installAudioMocks();
+  try {
+    const store = makeStore();
+    store.applySnapshot({
+      entries: [{ path: PATH('dic', 'active'), value: false }],
+      state_revision: 0, truncated: false,
+    });
+    const el = mount(makeEngine(store).render(comp(AUDIO_CAPTURE_TAG, [
+      [0, 'a'], [1, 'vad'],
+      [7, PATH('dic', 'active')],
+    ])));
+    const btn = el.querySelector('.tf-audio-capture__button');
+    btn.dispatchEvent(new (globalThis.Event)('pointerdown', { bubbles: true, cancelable: true }));
+    await new Promise((r) => setTimeout(r, 10));
+    assertEq(store.read(PATH('dic', 'active')), true, 'toggle-on mirrored');
+    btn.dispatchEvent(new (globalThis.Event)('pointerdown', { bubbles: true, cancelable: true }));
+    await new Promise((r) => setTimeout(r, 10));
+    assertEq(store.read(PATH('dic', 'active')), false, 'toggle-off mirrored');
+  } finally {
+    mocks.restore();
+  }
+});
+
+test('AudioCapture utterances carry seq and deliver strictly in order', async () => {
+  setup();
+  const mocks = installAudioMocks();
+  const { ApiBinary } = await import('../protocol/api-binary-shim.js');
+  const origOne = ApiBinary.one;
+  const emitted = [];
+  let firstResolve = null;
+  let uploadCalls = 0;
+  // First upload hangs until released — the second utterance is already
+  // captured by then, so ordering is only correct if deliveries are chained.
+  ApiBinary.one = () => {
+    uploadCalls += 1;
+    if (uploadCalls === 1) {
+      return new Promise((res) => { firstResolve = () => res({ docRef: 'doc-first' }); });
+    }
+    return Promise.resolve({ docRef: `doc-${uploadCalls}` });
+  };
+  try {
+    const dispatcher = { emit: (e) => emitted.push(e.dom_event.detail) };
+    const el = mount(makeEngine(makeStore(), dispatcher).render(comp(AUDIO_CAPTURE_TAG, [
+      [0, 'onUtterance'], [1, 'push_to_talk'],
+    ])));
+    const btn = el.querySelector('.tf-audio-capture__button');
+    const speak = async () => {
+      btn.dispatchEvent(new (globalThis.Event)('pointerdown', { bubbles: true, cancelable: true }));
+      await new Promise((r) => setTimeout(r, 10));
+      // 1 s of audio at the mocked 48 kHz rate (over min_speech_ms).
+      mocks.lastWorklet().port.onmessage({ data: new Float32Array(48000) });
+      btn.dispatchEvent(new (globalThis.Event)('pointerup', { bubbles: true, cancelable: true }));
+      await new Promise((r) => setTimeout(r, 10));
+    };
+    await speak();
+    await speak();
+    // The first upload is still pending — utterance 2 must NOT overtake it.
+    assertEq(emitted.length, 0, 'second delivery must wait for the first');
+    assertEq(uploadCalls, 1, 'uploads are serialized');
+    firstResolve();
+    await new Promise((r) => setTimeout(r, 20));
+    assertEq(emitted.length, 2, 'both utterances delivered');
+    assertEq(emitted[0].doc_ref, 'doc-first');
+    assertEq(emitted[0].seq, 0);
+    assertEq(emitted[1].seq, 1, 'seq is monotonic');
+  } finally {
+    ApiBinary.one = origOne;
     mocks.restore();
   }
 });

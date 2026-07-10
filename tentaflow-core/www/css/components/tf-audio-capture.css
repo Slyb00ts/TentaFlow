@@ -104,3 +104,45 @@
   from { transform: scaleY(0.5); }
   to { transform: scaleY(1); }
 }
+
+/* Docked variant — horizontal strip for recording docks: compact mic on the
+   left, ONE waveform to the right, no idle label (status only when set). */
+.tf-audio-capture--docked {
+  flex-direction: row;
+  align-items: center;
+  gap: 14px;
+}
+.tf-audio-capture--docked .tf-audio-capture__wave--mirror,
+.tf-audio-capture--docked .tf-audio-capture__label { display: none; }
+.tf-audio-capture--docked .tf-audio-capture__mic-wrap {
+  width: 56px;
+  height: 56px;
+}
+.tf-audio-capture--docked .tf-audio-capture__button {
+  width: 56px;
+  height: 56px;
+}
+.tf-audio-capture--docked .tf-audio-capture__icon {
+  width: 23px;
+  height: 23px;
+}
+.tf-audio-capture--docked .tf-audio-capture__wave {
+  gap: 3px;
+  height: 34px;
+  align-items: center;
+}
+.tf-audio-capture--docked .tf-audio-capture__wave span {
+  width: 3px;
+  height: calc(6px + (26px * var(--tf-audio-capture-level, 0.45)) * var(--tf-audio-capture-bar, 1));
+}
+/* Transient status floats under the mic/wave group so it never widens the
+   dock row (the addon-side status line carries persistent errors). */
+.tf-audio-capture--docked { position: relative; }
+.tf-audio-capture--docked .tf-audio-capture__status {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  min-height: 0;
+  white-space: nowrap;
+}
+.tf-audio-capture--docked .tf-audio-capture__status:empty { display: none; }

@@ -76,7 +76,10 @@ impl Default for TranscribeParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscribeResult {
     pub text: String,
-    pub language: String,
+    /// Language the engine actually decoded with: explicit request language or
+    /// the auto-detected one. `None` when the engine cannot tell — consumers
+    /// must NOT substitute a placeholder ("auto" would leak into TTS).
+    pub language: Option<String>,
     pub duration_seconds: f64,
     pub segments: Vec<TranscribeSegment>,
 }

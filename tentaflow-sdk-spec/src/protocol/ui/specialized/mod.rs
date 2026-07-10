@@ -32,7 +32,8 @@ mod tests {
     use crate::protocol::ui::component::{Component, FieldMap};
     use crate::protocol::ui::inline::{AspectRatio, DimensionToken, StepDef};
     use crate::protocol::ui::tokens::{
-        AudioCaptureMode, AudioControls, AudioVariant, CarouselGestures, CodeEditorTheme, Density,
+        AudioCaptureMode, AudioCaptureVariant, AudioControls, AudioVariant, CarouselGestures,
+        CodeEditorTheme, Density,
         FpsVariant,
         IFrameReferrerPolicy, IFrameSandbox, ImageFit, LogLevel, LogVariant, PdfZoomMode, Spacing,
         StepProgressVariant, StopwatchVariant, TerminalTheme, TileProvider, Tone, VideoControls,
@@ -99,6 +100,8 @@ mod tests {
             language_hint: Some("pl".into()),
             recording_path: Some(p("recording")),
             disabled: Some(BindRef::Literal(Value::Bool(false))),
+            active_path: Some(p("dictation.active")),
+            variant: Some(AudioCaptureVariant::Docked),
         };
         rt(v, |m| m.into_component("ac").unwrap(), AudioCapture::try_from_component);
     }
@@ -114,6 +117,8 @@ mod tests {
             language_hint: None,
             recording_path: None,
             disabled: None,
+            active_path: None,
+            variant: None,
         };
         rt(v, |m| m.into_component("ac2").unwrap(), AudioCapture::try_from_component);
     }

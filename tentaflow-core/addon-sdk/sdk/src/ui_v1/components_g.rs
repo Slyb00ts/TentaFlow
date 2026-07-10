@@ -105,9 +105,9 @@ pub use tentaflow_sdk_spec::protocol::ui::state::{
     PatchRejectReason, PatchRejected, StatePatch, StateReset, StateSnapshot,
 };
 pub use tentaflow_sdk_spec::protocol::ui::tokens::{
-    AccordionMode, AlertVariant, AreaStacking, AudioCaptureMode, AudioControls,
-    AudioVariant, AutocompleteHint, AvatarOverlap, AvatarShape, AvatarSize, AvatarStatus,
-    BackgroundToken, BadgeVariant, BannerPosition, BarStacking, BorderColor,
+    AccordionMode, AlertVariant, AreaStacking, AudioCaptureMode, AudioCaptureVariant,
+    AudioControls, AudioVariant, AutocompleteHint, AvatarOverlap, AvatarShape, AvatarSize,
+    AvatarStatus, BackgroundToken, BadgeVariant, BannerPosition, BarStacking, BorderColor,
     BorderLineStyle, BreadcrumbSeparator, Breakpoint, BulletListVariant,
     ButtonGroupOrientation, ButtonSize, ButtonVariant, CameraStatus, CardVariant,
     CarouselGestures, ChartAxisScale, ChartLegendAlign, ChartLegendPosition,
@@ -823,6 +823,8 @@ mod catalog_conformance {
         assert_eq!(enc(&AudioVariant::Waveform), tstr("waveform"), "AudioVariant::Waveform");
         assert_eq!(enc(&AudioCaptureMode::PushToTalk), tstr("push_to_talk"), "AudioCaptureMode::PushToTalk");
         assert_eq!(enc(&AudioCaptureMode::Vad), tstr("vad"), "AudioCaptureMode::Vad");
+        assert_eq!(enc(&AudioCaptureVariant::Standalone), tstr("standalone"), "AudioCaptureVariant::Standalone");
+        assert_eq!(enc(&AudioCaptureVariant::Docked), tstr("docked"), "AudioCaptureVariant::Docked");
         assert_eq!(enc(&FpsVariant::Minimal), tstr("minimal"), "FpsVariant::Minimal");
         assert_eq!(enc(&FpsVariant::Detailed), tstr("detailed"), "FpsVariant::Detailed");
         assert_eq!(enc(&StopwatchVariant::Seconds), tstr("seconds"), "StopwatchVariant::Seconds");

@@ -2087,6 +2087,8 @@ pub const AUDIOCAPTURE_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 4, name: "language_hint", wire: "Option<tstr>", required: false, default: None },
         FieldMeta { key: 5, name: "recording_path", wire: "Option<StatePath>", required: false, default: None },
         FieldMeta { key: 6, name: "disabled", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 7, name: "active_path", wire: "Option<StatePath>", required: false, default: None },
+        FieldMeta { key: 8, name: "variant", wire: "Option<Enum<AudioCaptureVariant>>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -3552,6 +3554,14 @@ pub const AUDIOCAPTUREMODE_ENUM: EnumMeta = EnumMeta {
     ],
 };
 
+pub const AUDIOCAPTUREVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "AudioCaptureVariant",
+    variants: &[
+        ("Standalone", "standalone"),
+        ("Docked", "docked"),
+    ],
+};
+
 pub const FPSVARIANT_ENUM: EnumMeta = EnumMeta {
     name: "FpsVariant",
     variants: &[
@@ -4038,6 +4048,7 @@ pub const ALL_ENUMS: &[&EnumMeta] = &[
     &AUDIOCONTROLS_ENUM,
     &AUDIOVARIANT_ENUM,
     &AUDIOCAPTUREMODE_ENUM,
+    &AUDIOCAPTUREVARIANT_ENUM,
     &FPSVARIANT_ENUM,
     &STOPWATCHVARIANT_ENUM,
     &CAROUSELGESTURES_ENUM,

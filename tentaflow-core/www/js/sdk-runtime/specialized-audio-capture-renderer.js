@@ -20,8 +20,9 @@ import {
 } from '../lib/mic-capture.js';
 
 export const AUDIO_CAPTURE_TAG = 0x0612;
-const AC_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6]);
+const AC_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8]);
 const AC_MODES = new Set(['push_to_talk', 'vad']);
+const AC_VARIANTS = new Set(['standalone', 'docked']);
 
 // 256 KiB upload chunk — same as the FileInput host uploader (fits one WS frame
 // with room to spare).
@@ -105,11 +106,15 @@ function renderAudioCapture(component, ctx) {
   const recordingPathRaw = ctx.readField(component.fields, 5);
   const recordingPath = recordingPathRaw != null ? requirePath(recordingPathRaw, 'AudioCapture.recording_path') : null;
   const disabledBind = ctx.readField(component.fields, 6); // Option<BindRef>
+  const activePathRaw = ctx.readField(component.fields, 7);
+  const activePath = activePathRaw != null ? requirePath(activePathRaw, 'AudioCapture.active_path') : null;
+  const variantRaw = ctx.readField(component.fields, 8);
+  const variant = variantRaw != null ? requireEnum(variantRaw, AC_VARIANTS, 'AudioCapture.variant') : 'standalone';
 
   const addonId = ctx.store && ctx.store.addon_id;
 
   const wrapper = document.createElement('div');
-  wrapper.classList.add('tf-audio-capture', `tf-audio-capture--${mode}`);
+  wrapper.classList.add('tf-audio-capture', `tf-audio-capture--${mode}`, `tf-audio-capture--${variant}`);
 
   // Decorative waveform bars (top + mirrored bottom) framing the mic; the RMS
   // level meter drives their amplitude via the shared `--tf-audio-capture-level`
@@ -177,8 +182,19 @@ function renderAudioCapture(component, ctx) {
   let lastTickAt = 0;
   let permissionDenied = false;
   let destroyed = false;
+  // Utterance ordering: a monotonic per-mount sequence rides in the action
+  // detail, and deliveries are chained so a slow upload can never let a later
+  // utterance overtake an earlier one on the wire.
+  let utteranceSeq = 0;
+  let deliverChain = Promise.resolve();
 
   const setStatus = (text) => { status.textContent = text || ''; };
+  // Ambient listening prompts are redundant in the docked variant (the
+  // recording chip + pulse rings already convey the state) and would overlap
+  // the dock's neighbours — only errors/transfers surface there.
+  const setAmbientStatus = (text) => {
+    setStatus(variant === 'docked' ? '' : text);
+  };
 
   const setRecordingFlag = (value) => {
     recording = value;
@@ -192,7 +208,7 @@ function renderAudioCapture(component, ctx) {
     }
   };
 
-  const emitUtterance = (docRef, wavBytes, sampleRate, durationMs) => {
+  const emitUtterance = (docRef, wavBytes, sampleRate, durationMs, seq) => {
     // The addon-declared handler for `action_id` receives these as params; the
     // eventDispatcher merges dom_event.detail into the backend action payload.
     const detail = {
@@ -201,6 +217,7 @@ function renderAudioCapture(component, ctx) {
       sample_rate: sampleRate,
       duration_ms: Math.round(durationMs),
       size: wavBytes.length,
+      seq,
     };
     if (languageHint) detail.language_hint = languageHint;
     ctx.eventDispatcher.emit({
@@ -214,8 +231,40 @@ function renderAudioCapture(component, ctx) {
     });
   };
 
-  // Flush the accumulated speech to a WAV, upload it and emit the action.
-  const flushUtterance = async () => {
+  // Upload + emit of ONE captured utterance (already WAV-encoded). Runs on the
+  // serialized delivery chain, so utterances reach the addon in seq order.
+  const deliverUtterance = async (wav, durationMs, seq) => {
+    setStatus('Wysyłanie…');
+    try {
+      const docRef = await uploadUtterance(addonId, wav);
+      if (destroyed) return;
+      if (docRef == null) {
+        setStatus('Nie udało się zapisać nagrania.');
+        return;
+      }
+      setStatus('');
+      emitUtterance(docRef, wav, 16000, durationMs, seq);
+    } catch (err) {
+      if (destroyed) return;
+      if (err && err.code === 'PolicyDenied') {
+        // Host refused the audio upload — the addon lacks `audio.capture`.
+        // Disable the control and explain via tooltip.
+        permissionDenied = true;
+        button.disabled = true;
+        button.title = 'Brak uprawnienia audio.capture — poproś administratora o zgodę.';
+        setStatus('Brak uprawnienia audio.capture.');
+        stopMic();
+      } else {
+        setStatus('Błąd wysyłania nagrania.');
+        console.warn('[audio-capture] upload failed:', err?.message ?? err);
+      }
+    }
+  };
+
+  // Flush the accumulated speech to a WAV and queue it for delivery. The PCM
+  // buffer is drained SYNCHRONOUSLY (the next utterance starts clean); only
+  // the upload+emit is deferred onto the ordered chain.
+  const flushUtterance = () => {
     if (pcmFrames.length === 0) return;
     const frames = pcmFrames.slice(speechStartIdx);
     let totalSamples = 0;
@@ -238,31 +287,11 @@ function renderAudioCapture(component, ctx) {
       setStatus('Brak kontekstu addonu — nagrania nie wysłano.');
       return;
     }
-    setStatus('Wysyłanie…');
-    try {
-      const docRef = await uploadUtterance(addonId, wav);
-      if (destroyed) return;
-      if (docRef == null) {
-        setStatus('Nie udało się zapisać nagrania.');
-        return;
-      }
-      setStatus('');
-      emitUtterance(docRef, wav, 16000, durationMs);
-    } catch (err) {
-      if (destroyed) return;
-      if (err && err.code === 'PolicyDenied') {
-        // Host refused the audio upload — the addon lacks `audio.capture`.
-        // Disable the control and explain via tooltip.
-        permissionDenied = true;
-        button.disabled = true;
-        button.title = 'Brak uprawnienia audio.capture — poproś administratora o zgodę.';
-        setStatus('Brak uprawnienia audio.capture.');
-        stopMic();
-      } else {
-        setStatus('Błąd wysyłania nagrania.');
-        console.warn('[audio-capture] upload failed:', err?.message ?? err);
-      }
-    }
+    const seq = utteranceSeq;
+    utteranceSeq += 1;
+    deliverChain = deliverChain
+      .then(() => deliverUtterance(wav, durationMs, seq))
+      .catch(() => {});
   };
 
   const onFrame = (frame) => {
@@ -314,7 +343,7 @@ function renderAudioCapture(component, ctx) {
           }
           speechStartIdx = startIdx;
           setRecordingFlag(true);
-          setStatus('Słucham…');
+          setAmbientStatus('Słucham…');
         }
       } else {
         silenceAccum = 0;
@@ -325,7 +354,7 @@ function renderAudioCapture(component, ctx) {
         silenceAccum += dtMs;
         if (silenceAccum >= silenceMs) {
           setRecordingFlag(false);
-          void flushUtterance();
+          flushUtterance();
         }
       }
     }
@@ -357,6 +386,42 @@ function renderAudioCapture(component, ctx) {
     if (mic) { mic.close(); mic = null; }
   };
 
+  // Mirrors the armed VAD state into the addon-controlled active_path, so
+  // backend logic (pause buttons, dictation docks) sees user toggles too.
+  const publishActive = (value) => {
+    if (!activePath) return;
+    try {
+      ctx.store.applyOverlay([{ path: activePath, value }]);
+    } catch (e) {
+      console.warn('[audio-capture] active_path overlay failed:', e?.message ?? e);
+    }
+  };
+
+  const startListening = async () => {
+    if (vadActive) return;
+    await startMic();
+    if (!mic) return;
+    vadActive = true;
+    label.textContent = 'Zatrzymaj nagrywanie';
+    setAmbientStatus('Czekam na mowę…');
+    publishActive(true);
+  };
+
+  const stopListening = () => {
+    if (!vadActive) return;
+    vadActive = false;
+    // Pausing mid-utterance flushes what was already heard instead of
+    // silently dropping the tail of the user's speech.
+    if (recording) {
+      setRecordingFlag(false);
+      flushUtterance();
+    }
+    stopMic();
+    setStatus('');
+    label.textContent = 'Rozpocznij nagrywanie';
+    publishActive(false);
+  };
+
   // Push-to-talk: hold the button. VAD: toggle listening on/off.
   const onPointerDown = async (e) => {
     if (button.disabled) return;
@@ -369,30 +434,21 @@ function renderAudioCapture(component, ctx) {
       speechStartIdx = 0;
       setRecordingFlag(true);
       setStatus('Nagrywam…');
+    } else if (vadActive) {
+      stopListening();
     } else {
-      // VAD toggle.
-      if (vadActive) {
-        vadActive = false;
-        setRecordingFlag(false);
-        stopMic();
-        setStatus('');
-        label.textContent = 'Rozpocznij nagrywanie';
-      } else {
-        await startMic();
-        if (!mic) return;
-        vadActive = true;
-        label.textContent = 'Zatrzymaj nagrywanie';
-        setStatus('Czekam na mowę…');
-      }
+      await startListening();
     }
   };
 
   const onPointerUp = () => {
     if (mode !== 'push_to_talk' || !recording) return;
     setRecordingFlag(false);
-    setStatus('Wysyłanie…');
-    // In PTT the whole recording is the utterance (speechStartIdx stays 0).
-    void flushUtterance().finally(() => stopMic());
+    // In PTT the whole recording is the utterance (speechStartIdx stays 0);
+    // the WAV is drained synchronously, so the mic can close right away while
+    // the delivery chain uploads in the background.
+    flushUtterance();
+    stopMic();
   };
 
   button.addEventListener('pointerdown', onPointerDown);
@@ -403,6 +459,29 @@ function renderAudioCapture(component, ctx) {
     button.removeEventListener('pointerup', onPointerUp);
     button.removeEventListener('pointerleave', onPointerUp);
   });
+
+  // Two-way active_path (VAD only): the addon pauses/resumes the mic by
+  // patching the bound bool; equal-value writes from publishActive land in the
+  // no-op branches, so there is no feedback loop.
+  if (mode === 'vad' && activePath) {
+    const applyActive = () => {
+      let value = null;
+      try {
+        value = ctx.store.read(activePath);
+      } catch {
+        return;
+      }
+      if (value === true && !vadActive && !button.disabled && !permissionDenied) {
+        void startListening();
+      } else if (value === false && vadActive) {
+        stopListening();
+      }
+    };
+    // Adopt an already-armed state on (re)mount so a slot re-render mid-capture
+    // resumes listening instead of silently dropping the mic.
+    applyActive();
+    ctx.registerCleanup(ctx.store.subscribe(activePath, applyActive));
+  }
 
   // Reactive disabled — addon-controlled, ORed with a host permission denial.
   if (disabledBind != null) {
