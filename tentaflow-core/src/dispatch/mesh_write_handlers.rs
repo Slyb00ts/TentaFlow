@@ -1575,6 +1575,27 @@ pub async fn cluster_deploy(
         // wiersza deployments), spojnie z bledem `deployments::create` powyzej.
         let insert_result = match ctx.state.db.write() {
             Ok(conn) => crate::services_repo::services::insert(&conn, &placeholder)
+                .and_then(|service_id| {
+                    // Placeholder MUSI niesc realny wiersz model_registry z
+                    // `served_model_name`: to jedyny wpis klastra widoczny w
+                    // `service_list`/`unique_models` (czlonkowie sa dedup-ukryci),
+                    // wiec bez niego model nie istnieje dla chatu (modelList),
+                    // a Benchmark Studio bierze fallbackowo display_name z
+                    // sufiksem "(cluster TP)" i kazdy request konczy sie 400.
+                    crate::services_repo::models::insert(
+                        &conn,
+                        &crate::services_repo::models::NewModel {
+                            service_id,
+                            model_name: served.clone(),
+                            display_name: Some(served.clone()),
+                            capabilities: "[\"chat\"]".to_string(),
+                            context_length: Some(max_len as i64),
+                            quantization: None,
+                            is_default: true,
+                        },
+                    )
+                    .map(|_| service_id)
+                })
                 .map_err(|e| e.to_string()),
             Err(_) => Err("db pool poisoned".to_string()),
         };
