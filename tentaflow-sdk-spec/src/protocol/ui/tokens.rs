@@ -89,6 +89,7 @@ string_enum! {
         Body = "body",
         BodyStrong = "body_strong",
         Caption = "caption",
+        CaptionStrong = "caption_strong",
         Overline = "overline",
         Code = "code",
         Mono = "mono",

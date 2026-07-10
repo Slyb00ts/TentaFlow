@@ -352,6 +352,7 @@ mod catalog_conformance {
         assert_eq!(enc(&TextStyle::Body), tstr("body"), "TextStyle::Body");
         assert_eq!(enc(&TextStyle::BodyStrong), tstr("body_strong"), "TextStyle::BodyStrong");
         assert_eq!(enc(&TextStyle::Caption), tstr("caption"), "TextStyle::Caption");
+        assert_eq!(enc(&TextStyle::CaptionStrong), tstr("caption_strong"), "TextStyle::CaptionStrong");
         assert_eq!(enc(&TextStyle::Overline), tstr("overline"), "TextStyle::Overline");
         assert_eq!(enc(&TextStyle::Code), tstr("code"), "TextStyle::Code");
         assert_eq!(enc(&TextStyle::Mono), tstr("mono"), "TextStyle::Mono");

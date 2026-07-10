@@ -6213,6 +6213,7 @@ tf-skeleton {
 .tf-text--style-body       { font-size: 1rem; }
 .tf-text--style-body_strong { font-size: 1rem; font-weight: 600; }
 .tf-text--style-caption    { font-size: 0.85em; color: var(--tf-text-3); }
+.tf-text--style-caption_strong { font-size: 0.85em; font-weight: 700; }
 .tf-text--style-overline   { font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.05em; }
 .tf-text--style-code       { font-family: var(--tf-font-mono, ui-monospace, monospace); font-size: 0.9em; }
 .tf-text--style-mono       { font-family: var(--tf-font-mono, ui-monospace, monospace); }

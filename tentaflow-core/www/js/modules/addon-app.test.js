@@ -45,7 +45,7 @@ register('data:text/javascript,' + encodeURIComponent(hookSource), import.meta.u
 globalThis.addEventListener?.('unhandledrejection', (e) => e.preventDefault?.());
 process.on('unhandledRejection', () => {});
 
-const { isOverlaySlot, handleSlotContent, __setSessionForTest } = await import('./addon-app.js');
+const { isOverlaySlot, handleSlotContent, stringifyWithBigInt, __setSessionForTest } = await import('./addon-app.js');
 await import('../protocol/codec.js')
   .then((m) => m.codecReady)
   .catch(() => {});
@@ -136,4 +136,20 @@ test('handleSlotContent: missing stateOverlay forwards undefined (not an error)'
   }
   assert.equal(captured.slot_id, 's');
   assert.equal(captured.state_overlay, undefined);
+});
+
+test('stringifyWithBigInt: safe-range BigInt serializes as Number', () => {
+  const json = stringifyWithBigInt({ __panel_epoch: 3n, note_id: 'n1' });
+  assert.deepEqual(JSON.parse(json), { __panel_epoch: 3, note_id: 'n1' });
+});
+
+test('stringifyWithBigInt: out-of-range BigInt serializes as decimal string', () => {
+  const big = 9007199254740993n; // MAX_SAFE_INTEGER + 2 — not representable as Number
+  const json = stringifyWithBigInt({ v: big, neg: -9007199254740993n });
+  assert.deepEqual(JSON.parse(json), { v: '9007199254740993', neg: '-9007199254740993' });
+});
+
+test('stringifyWithBigInt: nested params and plain values pass through', () => {
+  const json = stringifyWithBigInt({ a: [1n, 'x', { b: 2n }], c: true, d: null });
+  assert.deepEqual(JSON.parse(json), { a: [1, 'x', { b: 2 }], c: true, d: null });
 });

@@ -284,7 +284,7 @@ function handlePanelShell(decoded) {
   // Create event dispatcher that sends actions to backend
   const eventDispatcher = {
     emit({ addon_id, panel_id, panel_epoch, source_id, event_kind, handler, dom_event }) {
-      console.log('[event-dispatch]', event_kind, 'handler:', JSON.stringify(handler), 'detail:', dom_event?.detail);
+      console.log('[event-dispatch]', event_kind, 'handler:', stringifyWithBigInt(handler), 'detail:', dom_event?.detail);
       if (!handler) return;
       if (handler.kind === 'backend' || handler.kind === 'both') {
         const params = { ...(handler.params || {}) };
@@ -413,6 +413,19 @@ function handlePanelReset(decoded) {
   }
 }
 
+// CBOR-decoded handler params may contain BigInt (I64 wire values) which
+// JSON.stringify rejects with a TypeError. Serialize them as a Number when
+// exactly representable (safe-integer range) and as a decimal string
+// otherwise — the addon side parses both forms.
+function stringifyWithBigInt(value) {
+  return JSON.stringify(value, (_key, v) => {
+    if (typeof v !== 'bigint') return v;
+    return v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER)
+      ? Number(v)
+      : v.toString();
+  });
+}
+
 async function sendAction(addonId, panelId, panelEpoch, actionId, params) {
   if (!_session) return;
   const s = _session;
@@ -420,7 +433,7 @@ async function sendAction(addonId, panelId, panelEpoch, actionId, params) {
     const client = await ApiBinary.client();
     const correlationId = client.nextCorrelationId();
     const sequence = client.takeSequence();
-    const paramsJson = JSON.stringify(params ?? {});
+    const paramsJson = stringifyWithBigInt(params ?? {});
     console.log('[addon-app] sendAction:', actionId, paramsJson, 'epoch:', panelEpoch);
     const body = s.wasm.encodeUiAction(
       addonId, panelId, BigInt(panelEpoch), actionId, paramsJson
@@ -451,4 +464,4 @@ function __setSessionForTest(session) {
 }
 
 export default AddonAppScreen;
-export { VIEW_ID, isOverlaySlot, handleSlotContent, __setSessionForTest };
+export { VIEW_ID, isOverlaySlot, handleSlotContent, stringifyWithBigInt, __setSessionForTest };

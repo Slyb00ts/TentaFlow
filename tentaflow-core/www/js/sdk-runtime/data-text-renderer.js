@@ -29,7 +29,7 @@ import { resolveBindRef, subscribeBindRef, formatValue } from './bind-resolver.j
 
 const TEXT_STYLES = new Set([
   'display', 'title', 'h1', 'h2', 'h3', 'h4',
-  'body_lg', 'body', 'body_strong', 'caption', 'overline',
+  'body_lg', 'body', 'body_strong', 'caption', 'caption_strong', 'overline',
   'code', 'mono', 'quote',
 ]);
 const TEXT_ALIGNS = new Set(['start', 'center', 'end', 'justify']);

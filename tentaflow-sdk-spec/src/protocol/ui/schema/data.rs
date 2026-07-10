@@ -2394,6 +2394,7 @@ pub const TEXTSTYLE_ENUM: EnumMeta = EnumMeta {
         ("Body", "body"),
         ("BodyStrong", "body_strong"),
         ("Caption", "caption"),
+        ("CaptionStrong", "caption_strong"),
         ("Overline", "overline"),
         ("Code", "code"),
         ("Mono", "mono"),
