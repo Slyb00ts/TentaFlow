@@ -373,6 +373,7 @@ fn chart_sample(tag: u16, ctr: &mut u64) -> Option<Component> {
             show_label: true,
             label: None,
             size: ProgressSize::Md,
+            orientation: None,
         }
         .into_component(id("progressbar"))
         .expect("ProgressBar sample encode"),
