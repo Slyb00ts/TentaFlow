@@ -397,17 +397,25 @@ fn default_one() -> usize {
 fn default_batch_window_us() -> u64 {
     2000
 }
+// Gate defaults are 0.0 = OFF: report the format-validated, confidence-weighted
+// winner, never suppress. Enabling the suppression (a real "unreadable" for
+// occluded plates) needs two things first: (1) fix the cold-stage output paths
+// that leave `tekst_conf: None` (which collapses the vote confidence to 0 and
+// would reject even a crystal-clear plate — observed as "Rejestracja: —" on a
+// perfectly readable WPL1YR8), and (2) calibrate the thresholds against real
+// measured confidence/agreement values. Format validation (waliduj_tablice_pl)
+// still runs and blocks garbage like "M88901" regardless of these thresholds.
 fn default_plate_min_confidence() -> f32 {
-    0.5
+    0.0
 }
 fn default_plate_min_agreement() -> f32 {
-    0.5
+    0.0
 }
 fn default_adr_min_confidence() -> f32 {
-    0.35
+    0.0
 }
 fn default_adr_min_agreement() -> f32 {
-    0.5
+    0.0
 }
 fn default_cold_workers() -> usize {
     64
