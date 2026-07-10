@@ -2898,7 +2898,14 @@ pub async fn run_rtsp_session(
         let bus = pipeline.bus().expect("pipeline has bus");
         let mut online = false;
         let mut online_at: Option<tokio::time::Instant> = None;
-        let mut last_total: u64 = 0;
+        // FrameCounters are shared across reconnect attempts, so ONLINE (and the
+        // stall watchdog keyed off it) must be judged against THIS attempt's
+        // baseline. Judging against the cumulative total made a reconnect look
+        // online instantly (frames from the previous incarnation), which armed
+        // the stall watchdog against a stale last_frame_at and produced an
+        // instant stall -> reconnect storm (tens of thousands per night).
+        let base_total = counters.snapshot().0;
+        let mut last_total: u64 = base_total;
         let mut fps_window: std::collections::VecDeque<f32> =
             std::collections::VecDeque::with_capacity(30);
         let started_at = tokio::time::Instant::now();
@@ -3151,7 +3158,7 @@ pub async fn run_rtsp_session(
                     };
 
                     if !online {
-                        if total > 0 {
+                        if total > base_total {
                             online = true;
                             online_at = Some(tokio::time::Instant::now());
                             // Successful connect — clear backoff state so the
