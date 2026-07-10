@@ -335,6 +335,15 @@ impl Supervisor {
             if svc.paused {
                 continue;
             }
+            // Czlonek distributed-deploymentu: zdrowie mierzy koordynator klastra
+            // (endpoint heada), nie lokalny probe. Worker jest headless (bez
+            // endpointu i bez wierszy modeli), wiec lokalna sonda ZAWSZE oznaczy
+            // go Failed/AWARIA mimo ze klaster serwuje — pomijamy w calosci.
+            if crate::services::deploy::distributed::service_is_distributed_member(
+                &svc.config_json,
+            ) {
+                continue;
+            }
             // PID-reuse defence runs only for transports that actually own a process.
             if let Some(pid) = svc.runtime_pid {
                 let needs_pid_check = matches!(
@@ -675,6 +684,13 @@ impl Supervisor {
                 // so we neither flip status nor count restart attempts. The user
                 // controls the runtime state directly through the pin/pause API.
                 if svc.paused {
+                    continue;
+                }
+                // Czlonek distributed-deploymentu — patrz run_first_tick: zdrowie
+                // klastra mierzy koordynator, lokalna sonda daje falszywe Failed.
+                if crate::services::deploy::distributed::service_is_distributed_member(
+                    &svc.config_json,
+                ) {
                     continue;
                 }
                 // Status=Starting/Deploying znaczy ze deploy task wciaz pracuje

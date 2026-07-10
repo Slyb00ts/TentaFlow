@@ -9382,13 +9382,19 @@ pub async fn service_delete(
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
 
     let svc = fetch_service_row(ctx, payload.service_id)?;
-    // Czlonek aktywnego klastra TP: usuniecie workera/heada z listy serwisow
+    // Czlonek AKTYWNEGO klastra TP: usuniecie workera/heada z listy serwisow
     // zabija rank calego distributed-deploymentu (serwujacego czesto na INNYM
     // nodzie). Legalna sciezka = stop deploymentu klastra, ktory kasuje wiersze
-    // czlonkow sam w teardownie.
-    if crate::services::deploy::distributed::service_is_distributed_member(&svc.config_json) {
+    // czlonkow sam w teardownie. Osierocony wiersz (deployment martwy) przechodzi.
+    if crate::services::deploy::distributed::service_is_distributed_member(&svc.config_json)
+        && crate::services::deploy::distributed::distributed_member_deployment_active(
+            &ctx.state.db,
+            &svc.config_json,
+        )
+        .await
+    {
         return Err(ProtocolError::bad_request(
-            "serwis jest czlonkiem deploymentu klastra — zatrzymaj deployment klastra zamiast kasowac pojedynczy wiersz",
+            "serwis jest czlonkiem AKTYWNEGO deploymentu klastra — zatrzymaj deployment klastra zamiast kasowac pojedynczy wiersz",
         ));
     }
     let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {

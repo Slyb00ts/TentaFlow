@@ -32,6 +32,54 @@ pub fn service_is_distributed_member(config_json: &str) -> bool {
         .is_some()
 }
 
+/// `deployment_cluster_id` z bloku `_distributed` wiersza-czlonka (None gdy
+/// wiersz nie jest czlonkiem albo blok nie niesie id).
+fn member_deployment_id(config_json: &str) -> Option<String> {
+    serde_json::from_str::<Value>(config_json)
+        .ok()?
+        .get("_distributed")?
+        .get("deployment_cluster_id")?
+        .as_str()
+        .map(String::from)
+}
+
+/// Czy deployment wiersza-czlonka jest AKTYWNY z perspektywy TEGO noda: lokalny
+/// kontener z etykieta deploymentu nadal istnieje LUB (na koordynatorze) rekord
+/// `cluster_deployments` jest deploying/running. Osierocony wiersz po deployu,
+/// ktorego nikt juz nie zna (rekord skasowany, kontener zniknal), zwraca false —
+/// wtedy delete-guard przepuszcza sprzatanie z listy serwisow. Brak id w config
+/// = fail-closed (true), zeby uszkodzony wiersz zywego klastra nie byl kasowalny.
+pub async fn distributed_member_deployment_active(
+    db: &crate::db::DbPool,
+    config_json: &str,
+) -> bool {
+    let Some(did) = member_deployment_id(config_json) else {
+        return true;
+    };
+    #[cfg(feature = "docker")]
+    {
+        if let Ok(out) = tokio::process::Command::new("docker")
+            .args([
+                "ps",
+                "-q",
+                "--filter",
+                &format!("label={}={}", super::docker::DISTRIBUTED_LABEL, did),
+            ])
+            .output()
+            .await
+        {
+            if !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+                return true;
+            }
+        }
+    }
+    crate::db::repository::get_cluster_deployment(db, &did)
+        .ok()
+        .flatten()
+        .map(|d| matches!(d.status.as_str(), "deploying" | "running"))
+        .unwrap_or(false)
+}
+
 /// Informacyjny endpoint head-a (`http://<rdma_ip>:<port>/v1`). Workery headless
 /// → None. Routing realny idzie przez rejestr serwisow mesh (head rejestruje sie
 /// lokalnie z `127.0.0.1`), to tylko podglad dla GUI.
