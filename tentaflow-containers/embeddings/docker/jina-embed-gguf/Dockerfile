@@ -28,7 +28,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
+# Upstream llama.cpp master linkuje llama-server dynamicznie z rozdzielonymi
+# .so (libllama-server-impl, libllama, libggml*, libmtmd*). Kopiujemy komplet
+# bibliotek obok binarki i rejestrujemy sciezke przez ldconfig, inaczej runtime
+# pada na "error while loading shared libraries: libllama-server-impl.so".
 COPY --from=llamacpp-builder /build/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
+COPY --from=llamacpp-builder /build/llama.cpp/build/bin/*.so /usr/local/lib/
+RUN ldconfig
 COPY tentaflow-containers/embeddings/docker/jina-embed-gguf/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 

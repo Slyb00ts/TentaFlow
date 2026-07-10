@@ -27,6 +27,7 @@ output_modalities = ["embedding"]
 context_path = "embeddings/docker/jina-embed-gguf"
 platforms = ["linux", "windows"]
 transport = "direct-http"
+gguf_model_mount = true
 
 [deploy.native]
 platforms = ["linux", "macos", "windows", "ios", "android"]

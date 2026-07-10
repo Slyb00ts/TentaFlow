@@ -1593,6 +1593,96 @@ impl DeployStrategy for DockerDeploy {
             }
         }
 
+        // Silniki llama-server (gguf_model_mount): entrypoint laduje pojedynczy
+        // GGUF z `/data/models/model.gguf` i pada gdy pliku brak. Pobieramy GGUF
+        // wybranego presetu na host cache modeli (juz zamontowany pod
+        // CONTAINER_MODELS_PATH) i wskazujemy `MODEL_PATH` na jego sciezke w
+        // kontenerze — bez osobnego binda. Odpowiednik ComfyUI `checkpoint_file`.
+        if docker_section.gguf_model_mount {
+            let repo = super::resolve_model_repo(&self.manifest, &self.user_config).ok_or_else(
+                || {
+                    DeployError::Manifest(
+                        "gguf_model_mount engine has no resolvable model repo".into(),
+                    )
+                },
+            )?;
+            let model_file = self
+                .user_config
+                .get("model_file")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let quantization = self
+                .user_config
+                .get("quantization")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    super::resolve_selected_preset(&self.manifest, &self.user_config)
+                        .and_then(|p| p.quantization.clone())
+                });
+            let selection = if let Some(file) = model_file.as_deref() {
+                if !crate::hub::model_store::valid_hf_relative_path(file) {
+                    return Err(DeployError::Manifest(format!(
+                        "invalid GGUF filename '{file}'"
+                    )));
+                }
+                crate::hub::model_store::ModelDownloadSelection::ExactFile(file.to_string())
+            } else if let Some(q) = quantization.as_deref() {
+                crate::hub::model_store::ModelDownloadSelection::GgufQuantization(q.to_string())
+            } else {
+                return Err(DeployError::Manifest(
+                    "gguf_model_mount deploy requires model_file or preset quantization".into(),
+                ));
+            };
+
+            if let Some(s) = &self.log_sink {
+                s.info(&format!("[docker] gguf model: ensuring {repo}"));
+            }
+            let store = crate::hub::model_store::ModelStore::new(crate::paths::models_root());
+            let (progress_tx, mut progress_rx) =
+                tokio::sync::mpsc::channel::<crate::hub::model_store::DownloadProgress>(128);
+            let progress_sink = self.log_sink.clone();
+            let progress_task = tokio::spawn(async move {
+                while let Some(p) = progress_rx.recv().await {
+                    if let Some(sink) = &progress_sink {
+                        sink.info(&format!(
+                            "[docker] gguf {} {:.1}% ({}/{} MB)",
+                            p.file_name,
+                            p.percent,
+                            p.bytes_downloaded / 1_048_576,
+                            p.bytes_total / 1_048_576
+                        ));
+                    }
+                }
+            });
+            let host_path = store
+                .download_model_selection(&repo, self.hf_token.as_deref(), progress_tx, selection)
+                .await
+                .map_err(|e| DeployError::Manifest(format!("download gguf {repo}: {e}")))?;
+            let _ = progress_task.await;
+
+            // Host cache lezy pod models_root() zamontowanym jako
+            // CONTAINER_MODELS_PATH, wiec wystarczy przelozyc sciezke.
+            let rel = host_path
+                .strip_prefix(crate::paths::models_root())
+                .map_err(|_| {
+                    DeployError::Manifest(format!(
+                        "gguf path {} is not under models_root",
+                        host_path.display()
+                    ))
+                })?;
+            let container_path = format!(
+                "{}/{}",
+                crate::paths::CONTAINER_MODELS_PATH,
+                rel.to_string_lossy()
+            );
+            env.insert("MODEL_PATH".into(), container_path);
+        }
+
         let gpu = resolve_gpu_selection(
             &self.user_config,
             self.manifest

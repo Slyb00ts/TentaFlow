@@ -29,6 +29,7 @@ input_modalities = ["text"]
 context_path = "reranker/docker/jina-rerank-gguf"
 platforms = ["linux", "windows"]
 transport = "direct-http"
+gguf_model_mount = true
 
 [deploy.native]
 platforms = ["linux", "macos", "windows", "ios", "android"]

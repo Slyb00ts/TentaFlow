@@ -17,6 +17,7 @@ version = "b3974"
 context_path = "llm/docker/llama-cpp"
 platforms = ["linux", "windows"]
 transport = "direct-http"
+gguf_model_mount = true
 
 [deploy.native]
 platforms = ["linux", "macos", "windows", "ios", "android"]

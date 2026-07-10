@@ -472,6 +472,13 @@ pub struct DockerDeploy {
     /// Tag obrazu dostaje sufiks arch, wiec obrazy roznych arch nie koliduja.
     #[serde(default)]
     pub arch_variants: HashMap<String, DockerArchVariant>,
+    /// Silnik uruchamia llama-server z GGUF zamontowanym jako pojedynczy plik
+    /// `/data/models/model.gguf` (entrypoint pada gdy pliku brak). Przy deployu
+    /// Core pobiera GGUF presetu na host (cache modeli, idempotentnie) i montuje
+    /// go do kontenera + ustawia `MODEL_PATH`. Bez tego llama-server nie ma czego
+    /// zaladowac (odpowiednik ComfyUI `checkpoint_file`).
+    #[serde(default)]
+    pub gguf_model_mount: bool,
 }
 
 /// Build-args specyficzne dla jednej architektury GPU (sekcja
