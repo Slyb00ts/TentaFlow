@@ -39,7 +39,8 @@ use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
 use crate::db::repository::{
     get_camera_for_addon, get_recording_for_addon, insert_recording, list_recordings_for_addon,
-    recording_stats_for_addon, soft_delete_recording, RecordingStatsAggregate,
+    recording_stats_for_addon, soft_delete_recording, RecordingListFilters,
+    RecordingStatsAggregate,
 };
 use crate::services::frame_storage::RawFrameRef;
 #[cfg(feature = "camera")]
@@ -867,6 +868,10 @@ fn save_snapshot_core(
         &retention_class,
         state.org_id.as_deref(),
         None,
+        None,
+        None,
+        None,
+        None,
     ) {
         warn!("recording.save_snapshot insert_recording failed (compensating purge): {e}");
         let _ = run_async(purge_recording(&saved.file_path));
@@ -1019,6 +1024,10 @@ fn save_segment_core(
         &saved.hash_sha256,
         &retention_class,
         state.org_id.as_deref(),
+        None,
+        None,
+        None,
+        None,
         None,
     ) {
         warn!("recording.save_segment insert_recording failed (compensating purge): {e}");
@@ -1368,12 +1377,24 @@ fn list_core(state: &AddonState, input: &RecordingListInput) -> CoreResult<Recor
     } else {
         input.limit.min(RECORDING_LIST_MAX)
     };
+    // Date filters arrive as unix MILLISECONDS on the wire; `created_at` is unix
+    // SECONDS, so divide (floor `from`, ceil `to` conceptually — floor is fine as
+    // the wire value is a day boundary from the picker, seconds resolution).
+    let created_from = input.date_from.map(|ms| ms / 1000);
+    let created_to = input.date_to.map(|ms| ms / 1000);
+    let filters = RecordingListFilters {
+        kind: Some("segment"),
+        camera_id: input.camera_id.as_deref(),
+        created_from,
+        created_to,
+        plate: input.plate.as_deref(),
+        adr: input.adr.as_deref(),
+    };
     let rows = match list_recordings_for_addon(
         &state.db,
         &state.addon_id,
-        Some("segment"),
-        input.camera_id.as_deref(),
         state.org_id.as_deref(),
+        &filters,
         limit,
     ) {
         Ok(r) => r,
@@ -1398,6 +1419,10 @@ fn list_core(state: &AddonState, input: &RecordingListInput) -> CoreResult<Recor
             duration_ms: r.duration_ms,
             file_size_bytes: r.file_size_bytes,
             event_meta: r.event_meta,
+            plate_text: r.plate_text,
+            adr_text: r.adr_text,
+            plate_thumb_ref: r.plate_thumb_ref,
+            adr_thumb_ref: r.adr_thumb_ref,
         })
         .collect();
     audit(state, "recording.list", None, RiskClass::B, "ok", None);

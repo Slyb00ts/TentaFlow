@@ -233,7 +233,17 @@ struct EventMeta {
     tracks: BTreeSet<u32>,
     /// detection frames absorbed (non-empty only).
     frames: u64,
+    /// class → best (highest-confidence) full-frame thumbnail seen for that
+    /// class during the event: the snapshot ref plus the confidence that backs
+    /// it. The enrichment path only sets `tekst_thumb_ref` on a NEW best read, so
+    /// keeping the max here promotes the clearest scene to the recordings list.
+    best_thumb: BTreeMap<String, (String, f32)>,
 }
+
+/// Detection class carrying vehicle plate reads.
+const CLASS_PLATE: &str = "tablica_rejestracyjna";
+/// Detection class carrying ADR placard reads.
+const CLASS_ADR: &str = "tablica_adr";
 
 impl EventMeta {
     fn absorb(&mut self, items: &[Detection]) {
@@ -260,6 +270,23 @@ impl EventMeta {
                     vote.conf_sum += conf;
                 }
             }
+            // A thumbnail rides only the read that just set a new best confidence
+            // for its track; keep the highest-confidence one per class across the
+            // whole event (the frame where the plate/ADR is clearest).
+            if let Some(thumb) = d.tekst_thumb_ref.as_deref() {
+                if !thumb.is_empty() {
+                    let conf = d.tekst_conf.unwrap_or(0.0).clamp(0.0, 1.0);
+                    let better = self
+                        .best_thumb
+                        .get(&d.klasa)
+                        .map(|(_, c)| conf > *c)
+                        .unwrap_or(true);
+                    if better {
+                        self.best_thumb
+                            .insert(d.klasa.clone(), (thumb.to_string(), conf));
+                    }
+                }
+            }
             for s in &d.stan {
                 *self.stan.entry(s.clone()).or_insert(0) += 1;
             }
@@ -267,6 +294,30 @@ impl EventMeta {
                 self.tracks.insert(d.track_id);
             }
         }
+    }
+
+    /// Gated plate/ADR winner strings for the finalized event, mirroring the JSON
+    /// `texts.<class>` winners but as plain columns for indexed search. `None`
+    /// when a class was unreadable or absent.
+    fn winner_texts(&self) -> (Option<String>, Option<String>) {
+        let plate = self
+            .texts
+            .get(CLASS_PLATE)
+            .map(Self::winner)
+            .and_then(|w| w.text);
+        let adr = self
+            .texts
+            .get(CLASS_ADR)
+            .map(Self::winner)
+            .and_then(|w| w.text);
+        (plate, adr)
+    }
+
+    /// Best full-frame thumbnail refs for the event: `(plate_thumb, adr_thumb)`.
+    fn thumb_refs(&self) -> (Option<String>, Option<String>) {
+        let plate = self.best_thumb.get(CLASS_PLATE).map(|(r, _)| r.clone());
+        let adr = self.best_thumb.get(CLASS_ADR).map(|(r, _)| r.clone());
+        (plate, adr)
     }
 
     /// Confidence+agreement gate over one class's votes: winner = heaviest
@@ -517,11 +568,16 @@ async fn camera_identity(camera_id: &str) -> Option<(String, String, String)> {
 /// so the recording shows up in the exact same dashboard surfaces (addon
 /// storage stats, signed-URL playback) as addon-saved segments. On a DB
 /// failure the file is purged — same compensation as the host-function path.
+#[allow(clippy::too_many_arguments)]
 async fn insert_event_row(
     camera_id: &str,
     identity: &(String, String, String),
     fin: FinalizedFile,
     event_meta_json: String,
+    plate_text: Option<String>,
+    adr_text: Option<String>,
+    plate_thumb_ref: Option<String>,
+    adr_thumb_ref: Option<String>,
 ) {
     let (owner_addon_id, org_id, retention_class) = identity.clone();
     let cam_for_db = camera_id.to_string();
@@ -546,6 +602,10 @@ async fn insert_event_row(
             &retention_class,
             Some(&org_id),
             Some(&event_meta_json),
+            plate_text.as_deref(),
+            adr_text.as_deref(),
+            plate_thumb_ref.as_deref(),
+            adr_thumb_ref.as_deref(),
         )
         .map(|_| (fin.recording_ref, fin.duration_ms, fin.bytes, fin.part))
         .map_err(anyhow::Error::from)
@@ -982,7 +1042,12 @@ async fn finalize_and_catalog(
                 fin.preroll_ms,
                 fin.part,
             );
-            insert_event_row(camera_id, identity, fin, json).await;
+            let (plate_text, adr_text) = meta.winner_texts();
+            let (plate_thumb, adr_thumb) = meta.thumb_refs();
+            insert_event_row(
+                camera_id, identity, fin, json, plate_text, adr_text, plate_thumb, adr_thumb,
+            )
+            .await;
         }
         Err(e) => warn!(
             camera_id,
@@ -1017,6 +1082,7 @@ mod tests {
             stan: stan.iter().map(|s| s.to_string()).collect(),
             tekst: tekst.map(str::to_string),
             tekst_conf,
+            tekst_thumb_ref: None,
             track_id,
             vx: 0.,
             vy: 0.,
@@ -1134,6 +1200,55 @@ mod tests {
         assert_eq!(plate["text"], "WPL5HJ2");
         assert_eq!(plate["unreadable"], false);
         assert!((plate["agreement"].as_f64().unwrap() - 1.0).abs() < 1e-6);
+    }
+
+    /// `winner_texts` mirrors the JSON gate: a confident consistent plate + a
+    /// confident ADR are surfaced as the indexed search columns; an unreadable
+    /// class collapses to `None`.
+    #[test]
+    fn event_meta_winner_texts_extracts_plate_and_adr() {
+        let mut meta = EventMeta::default();
+        meta.absorb(&[
+            det_conf(CLASS_PLATE, Some("WGM12345"), Some(0.9), &[], 3),
+            det_conf(CLASS_ADR, Some("30/1202"), Some(0.9), &[], 4),
+        ]);
+        meta.absorb(&[det_conf(CLASS_PLATE, Some("WGM12345"), Some(0.9), &[], 3)]);
+        let (plate, adr) = meta.winner_texts();
+        assert_eq!(plate.as_deref(), Some("WGM12345"));
+        assert_eq!(adr.as_deref(), Some("30/1202"));
+
+        // An occluded, low-confidence disagreeing plate → column stays NULL.
+        let mut occluded = EventMeta::default();
+        for s in ["M88901", "N59156", "B67K71"] {
+            occluded.absorb(&[det_conf(CLASS_PLATE, Some(s), Some(0.3), &[], 5)]);
+        }
+        let (plate, adr) = occluded.winner_texts();
+        assert!(plate.is_none(), "occluded plate must not populate the column");
+        assert!(adr.is_none(), "absent ADR class → None");
+    }
+
+    /// The best-thumbnail-per-class rule: a thumbnail rides only a new-best read,
+    /// and the recorder keeps the HIGHEST-confidence one across the event.
+    #[test]
+    fn event_meta_keeps_best_confidence_thumbnail_per_class() {
+        let with_thumb = |klasa: &str, conf: f32, thumb: &str| {
+            let mut d = det_conf(klasa, Some("WGM12345"), Some(conf), &[], 3);
+            d.tekst_thumb_ref = Some(thumb.to_string());
+            d
+        };
+        let mut meta = EventMeta::default();
+        // Plate thumbs arrive at rising then falling confidence; the recorder must
+        // retain the 0.92 one. ADR gets its own independent best.
+        meta.absorb(&[with_thumb(CLASS_PLATE, 0.60, "snap_plate_a")]);
+        meta.absorb(&[with_thumb(CLASS_PLATE, 0.92, "snap_plate_b")]);
+        meta.absorb(&[with_thumb(CLASS_PLATE, 0.70, "snap_plate_c")]);
+        meta.absorb(&[with_thumb(CLASS_ADR, 0.85, "snap_adr_a")]);
+        // A read with no thumb ref must not clear the retained best.
+        meta.absorb(&[det_conf(CLASS_PLATE, Some("WGM12345"), Some(0.99), &[], 3)]);
+
+        let (plate_thumb, adr_thumb) = meta.thumb_refs();
+        assert_eq!(plate_thumb.as_deref(), Some("snap_plate_b"));
+        assert_eq!(adr_thumb.as_deref(), Some("snap_adr_a"));
     }
 
     #[test]

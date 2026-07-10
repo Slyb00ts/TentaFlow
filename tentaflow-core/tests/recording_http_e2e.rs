@@ -345,6 +345,11 @@ async fn save_and_register(
         &saved.hash_sha256,
         "B",
         None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
     .expect("insert");
 

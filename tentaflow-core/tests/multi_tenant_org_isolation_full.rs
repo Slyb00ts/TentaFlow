@@ -172,6 +172,11 @@ fn insert_recording_in_org(
         "deadbeef",
         "B",
         Some(org_id),
+        None,
+        None,
+        None,
+        None,
+        None,
     )
     .expect("insert_recording ok")
 }

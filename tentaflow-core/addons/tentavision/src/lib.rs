@@ -534,13 +534,34 @@ fn camera_test_connection(vendor: &str, url: &str) -> Result<CameraTestConnectio
 // Recording ABI wrappers
 // =============================================================================
 
+/// Server-side search filters for the recordings browser. All fields optional;
+/// they compose with AND on the host. `date_from`/`date_to` are unix
+/// milliseconds bounding the recording `created_at`; `plate`/`adr` are
+/// case-insensitive substrings over the event's gated OCR winners.
+#[derive(Default, Clone)]
+struct RecordingSearch {
+    camera_id: Option<String>,
+    date_from: Option<i64>,
+    date_to: Option<i64>,
+    plate: Option<String>,
+    adr: Option<String>,
+}
+
 /// Lists the addon's per-vehicle event recordings (`kind = "segment"`), newest
-/// first. Needs the `recording.read` permission; the host scopes rows to this
-/// addon + org and returns only browsable segment clips.
-fn host_recording_list(camera_id: Option<&str>, limit: u32) -> Result<Vec<RecordingListItem>, AbiError> {
+/// first, applying the server-side search filters. Needs the `recording.read`
+/// permission; the host scopes rows to this addon + org and returns only
+/// browsable segment clips.
+fn host_recording_list(
+    search: &RecordingSearch,
+    limit: u32,
+) -> Result<Vec<RecordingListItem>, AbiError> {
     let input = RecordingListInput {
-        camera_id: camera_id.map(str::to_string),
+        camera_id: search.camera_id.clone(),
         limit,
+        date_from: search.date_from,
+        date_to: search.date_to,
+        plate: search.plate.clone(),
+        adr: search.adr.clone(),
     };
     let out: RecordingListOut = call_cbor_in_out(&input, recording_list_v1)?;
     Ok(out.items)
@@ -1663,6 +1684,12 @@ struct PanelState {
     recording_playing: Option<String>,
     // Camera filter applied to the recordings list (empty = all cameras).
     recordings_camera_filter: String,
+    // Recordings-browser search inputs (empty string = filter inactive). Dates
+    // are `YYYY-MM-DD` day strings from the date inputs; plate/ADR are raw text.
+    recordings_date_from: String,
+    recordings_date_to: String,
+    recordings_plate_query: String,
+    recordings_adr_query: String,
     cv_pipelines: CvPipelinesState,
     error_message: Option<String>,
     success_message: Option<String>,
@@ -2346,6 +2373,10 @@ impl PanelState {
             camera_pipeline_edit: None,
             recording_playing: None,
             recordings_camera_filter: String::new(),
+            recordings_date_from: String::new(),
+            recordings_date_to: String::new(),
+            recordings_plate_query: String::new(),
+            recordings_adr_query: String::new(),
             cv_pipelines: CvPipelinesState::new(),
             error_message: None, success_message: None,
             discover: DiscoverState::new(), profiles: ProfilesState::new(),
@@ -2712,6 +2743,28 @@ fn render_panel(panel_id: &str) {
                 value: rows,
             });
         }
+        // Seed the search inputs' bound keys so they mount showing the persisted
+        // query values across re-renders (otherwise each re-query would reset the
+        // field the user is typing in).
+        let (df, dt, pq, aq) = with_state(|s| {
+            (
+                s.recordings_date_from.clone(),
+                s.recordings_date_to.clone(),
+                s.recordings_plate_query.clone(),
+                s.recordings_adr_query.clone(),
+            )
+        });
+        for (key, val) in [
+            ("recordings_date_from", df),
+            ("recordings_date_to", dt),
+            ("recordings_plate_query", pq),
+            ("recordings_adr_query", aq),
+        ] {
+            entries.push(StateEntry {
+                path: StatePath::new(vec![PathSegment::Key(key.into())]),
+                value: Value::Text(val),
+            });
+        }
         let overlay = if entries.is_empty() { None } else { Some(entries) };
         send_slot_content_with_overlay("content", content, overlay);
     } else if panel_id == "profiles" {
@@ -2913,6 +2966,35 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
                 .to_string();
             with_state(|s| {
                 s.recordings_camera_filter = if v == "all" { String::new() } else { v };
+            });
+            render_panel("recordings");
+            json!({"ok":true})
+        }
+        "recordings-search-change" => {
+            // A search field committed a keystroke: store it under its `field`
+            // key and re-query server-side on the next render.
+            let field = params.get("field").and_then(|x| x.as_str()).unwrap_or("");
+            let value = params
+                .get("value")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            with_state(|s| match field {
+                "recordings_date_from" => s.recordings_date_from = value,
+                "recordings_date_to" => s.recordings_date_to = value,
+                "recordings_plate_query" => s.recordings_plate_query = value,
+                "recordings_adr_query" => s.recordings_adr_query = value,
+                _ => {}
+            });
+            render_panel("recordings");
+            json!({"ok":true})
+        }
+        "recordings-search-clear" => {
+            with_state(|s| {
+                s.recordings_date_from.clear();
+                s.recordings_date_to.clear();
+                s.recordings_plate_query.clear();
+                s.recordings_adr_query.clear();
             });
             render_panel("recordings");
             json!({"ok":true})
@@ -5380,21 +5462,50 @@ fn format_size_mb(bytes: i64) -> String {
     alloc::format!("{:.1} MB", mb)
 }
 
+/// Resolves a signed image URL for a plate/ADR thumbnail snapshot ref, or an
+/// empty string when there is no thumb (the `img` cell renderer then shows a
+/// muted placeholder). A URL-issue failure also degrades to the placeholder
+/// rather than surfacing an error in the list.
+fn recording_thumb_url(thumb_ref: &Option<String>) -> String {
+    match thumb_ref.as_deref() {
+        Some(r) if !r.trim().is_empty() => host_recording_get_url(r, RECORDING_URL_TTL_SECS)
+            .map(|u| u.url)
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 /// One recordings Table row. `recording_ref` is the row key the "Odtwórz"
-/// action carries; the plate/ADR winners are parsed from `event_meta`.
+/// action carries; the plate/ADR winners prefer the indexed columns and fall
+/// back to `event_meta`. The thumbnail cells carry signed image URLs of the
+/// full-scene snapshots captured at the best plate/ADR read.
 fn recording_table_row_value(item: &RecordingListItem, camera_name: &str) -> Value {
     let meta: Option<JsonValue> = item
         .event_meta
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok());
-    let plate = recording_meta_text(&meta, "tablica_rejestracyjna");
-    let adr = recording_meta_text(&meta, "tablica_adr");
+    // Prefer the indexed winner columns (written at finalize); fall back to the
+    // event_meta blob for rows recorded before the columns existed.
+    let plate = item
+        .plate_text
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| recording_meta_text(&meta, "tablica_rejestracyjna"));
+    let adr = item
+        .adr_text
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| recording_meta_text(&meta, "tablica_adr"));
+    let plate_thumb = recording_thumb_url(&item.plate_thumb_ref);
+    let adr_thumb = recording_thumb_url(&item.adr_thumb_ref);
     let entries: Vec<(Value, Value)> = vec![
         (Value::Text("recording_ref".into()), Value::Text(item.recording_ref.clone())),
         (Value::Text("czas".into()), Value::Text(format_alarm_datetime(item.created_at))),
         (Value::Text("kamera".into()), Value::Text(camera_name.to_string())),
         (Value::Text("czas_trwania".into()), Value::Text(format_duration_ms(item.duration_ms))),
+        (Value::Text("tablica_thumb".into()), Value::Text(plate_thumb)),
         (Value::Text("tablica".into()), Value::Text(plate)),
+        (Value::Text("adr_thumb".into()), Value::Text(adr_thumb)),
         (Value::Text("adr".into()), Value::Text(adr)),
         (Value::Text("rozmiar".into()), Value::Text(format_size_mb(item.file_size_bytes))),
     ];
@@ -5417,19 +5528,26 @@ fn recording_camera_name(camera_id: &str, owned: &[db::CameraRow], shared: &[Sha
     camera_id.to_string()
 }
 
-fn recording_table_column(id: &str, header: &str) -> TableColumn {
+fn recording_table_column_render(id: &str, header: &str, render: ColumnRender) -> TableColumn {
+    // Image columns are not sortable (the cell value is a signed URL, not a
+    // comparable field) and never hide by default.
+    let sortable = !matches!(render, ColumnRender::Image);
     TableColumn {
         id: id.into(),
         header: lit(header),
         field_path: vec![PathSegment::Key(id.into())],
         width: TableColumnWidth::Auto,
-        render: ColumnRender::Text,
+        render,
         format: None,
         align: None,
-        sortable: true,
+        sortable,
         hidden_by_default: false,
         sticky_left: false,
     }
+}
+
+fn recording_table_column(id: &str, header: &str) -> TableColumn {
+    recording_table_column_render(id, header, ColumnRender::Text)
 }
 
 fn build_recordings_table() -> Component {
@@ -5437,7 +5555,9 @@ fn build_recordings_table() -> Component {
         recording_table_column("czas", "Czas"),
         recording_table_column("kamera", "Kamera"),
         recording_table_column("czas_trwania", "Czas trwania"),
+        recording_table_column_render("tablica_thumb", "Podgląd tablicy", ColumnRender::Image),
         recording_table_column("tablica", "Tablica"),
+        recording_table_column_render("adr_thumb", "Podgląd ADR", ColumnRender::Image),
         recording_table_column("adr", "ADR"),
         recording_table_column("rozmiar", "Rozmiar"),
     ];
@@ -5546,7 +5666,10 @@ fn build_recording_player_body(recording_ref: &str) -> Component {
 /// by re-reading the recording list (single row lookup by ref). Returns
 /// `(camera_label, when, plate, adr)` with graceful fallbacks.
 fn recording_playing_meta(recording_ref: &str) -> (String, String, String, String) {
-    let items = host_recording_list(None, RECORDING_LIST_LIMIT).unwrap_or_default();
+    // Reuse the active search so the playing row is found within the same
+    // filtered set the list showed (it was clicked from there).
+    let search = recordings_search_from_state();
+    let items = host_recording_list(&search, RECORDING_LIST_LIMIT).unwrap_or_default();
     let Some(item) = items.iter().find(|i| i.recording_ref == recording_ref) else {
         return ("—".into(), "—".into(), "—".into(), "—".into());
     };
@@ -5563,6 +5686,152 @@ fn recording_playing_meta(recording_ref: &str) -> (String, String, String, Strin
     (camera_label, when, plate, adr)
 }
 
+/// Parses a `YYYY-MM-DD` day string to unix MILLISECONDS at the given
+/// end-of-day flag: `false` → 00:00:00 (inclusive lower bound), `true` →
+/// 23:59:59 (inclusive upper bound). `None` for an empty/malformed string so an
+/// absent or half-typed date simply drops the bound rather than erroring. Uses
+/// the shared `days_from_civil` (proleptic Gregorian, UTC).
+fn parse_day_bound_ms(day: &str, end_of_day: bool) -> Option<i64> {
+    let day = day.trim();
+    if day.is_empty() {
+        return None;
+    }
+    let mut parts = day.split('-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let d: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let secs = days_from_civil(y, m, d) * 86_400 + if end_of_day { 86_399 } else { 0 };
+    Some(secs * 1000)
+}
+
+/// Builds the server-side `RecordingSearch` from the current panel state:
+/// camera-chip filter + date range + plate/ADR text queries.
+fn recordings_search_from_state() -> RecordingSearch {
+    with_state(|s| {
+        let camera_id = if s.recordings_camera_filter.is_empty() {
+            None
+        } else {
+            Some(s.recordings_camera_filter.clone())
+        };
+        let plate = {
+            let t = s.recordings_plate_query.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        };
+        let adr = {
+            let t = s.recordings_adr_query.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        };
+        RecordingSearch {
+            camera_id,
+            date_from: parse_day_bound_ms(&s.recordings_date_from, false),
+            date_to: parse_day_bound_ms(&s.recordings_date_to, true),
+            plate,
+            adr,
+        }
+    })
+}
+
+/// `true` when any of the date/plate/ADR search filters are active (the camera
+/// chip is surfaced separately) — drives the "Wyczyść" affordance visibility.
+fn recordings_search_active() -> bool {
+    with_state(|s| {
+        !s.recordings_date_from.trim().is_empty()
+            || !s.recordings_date_to.trim().is_empty()
+            || !s.recordings_plate_query.trim().is_empty()
+            || !s.recordings_adr_query.trim().is_empty()
+    })
+}
+
+/// A recordings-search text field (plate / ADR) bound to `field` in state,
+/// committing every keystroke to the backend via `recordings-search-change` so a
+/// re-render re-queries with the new filter (server-side).
+fn recordings_search_input(label: &str, placeholder: &str, field: &str) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Input;
+    let mut comp = Input {
+        r#type: InputType::Search,
+        bind_path: StatePath::new(vec![PathSegment::Key(field.into())]),
+        placeholder: Some(lit(placeholder)),
+        label: Some(lit(label)),
+        hint: None,
+        leading_icon: Some(icon_named(parse_icon_name("search"))),
+        trailing_icon: None,
+        prefix: None,
+        suffix: None,
+        validators: vec![],
+        max_length: Some(64),
+        min_length: None,
+        pattern: None,
+        autocomplete: None,
+        input_mode: None,
+        disabled: None,
+        readonly: None,
+        error: None,
+        size: InputSize::Md,
+    }
+    .into_component(field)
+    .expect("Input");
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend {
+            action_id: "recordings-search-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// A recordings-search date field (from / to) as a plain `Date`-typed
+/// `Input` bound to `field`, committing on change via `recordings-search-change`.
+/// A native date input yields the canonical `YYYY-MM-DD` the range parser wants,
+/// and stays a single `tf-*` primitive without the DatePicker calendar overlay.
+fn recordings_date_input(label: &str, field: &str) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Input;
+    let mut comp = Input {
+        // No dedicated Date InputType exists; Text keeps the field a real tf-input
+        // while the `YYYY-MM-DD` value is validated by `parse_day_bound_ms`.
+        r#type: InputType::Text,
+        bind_path: StatePath::new(vec![PathSegment::Key(field.into())]),
+        placeholder: Some(lit("RRRR-MM-DD")),
+        label: Some(lit(label)),
+        hint: None,
+        leading_icon: Some(icon_named(parse_icon_name("calendar"))),
+        trailing_icon: None,
+        prefix: None,
+        suffix: None,
+        validators: vec![],
+        max_length: Some(10),
+        min_length: None,
+        pattern: None,
+        autocomplete: None,
+        input_mode: None,
+        disabled: None,
+        readonly: None,
+        error: None,
+        size: InputSize::Md,
+    }
+    .into_component(field)
+    .expect("Input");
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend {
+            action_id: "recordings-search-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
 fn build_recordings_content() -> Component {
     let messages = build_messages_section();
     let mut children = vec![messages];
@@ -5575,11 +5844,24 @@ fn build_recordings_content() -> Component {
     ]);
     children.push(toolbar);
 
+    // Server-side search controls: date range + plate + ADR, plus a clear
+    // affordance shown only when a filter is active.
+    let mut search_fields = vec![
+        recordings_date_input("Od", "recordings_date_from"),
+        recordings_date_input("Do", "recordings_date_to"),
+        recordings_search_input("Tablica", "np. WGM12345", "recordings_plate_query"),
+        recordings_search_input("ADR", "np. 30/1202", "recordings_adr_query"),
+    ];
+    if recordings_search_active() {
+        search_fields.push(button("Wyczyść", "recordings-search-clear", "ghost"));
+    }
+    children.push(card(Some("Szukaj"), vec![stack_h(search_fields)]));
+
     let owned = db::list_cameras().unwrap_or_default();
     let shared = shared_cameras();
 
-    let camera_filter = if filter.is_empty() { None } else { Some(filter.as_str()) };
-    let list_result = host_recording_list(camera_filter, RECORDING_LIST_LIMIT);
+    let search = recordings_search_from_state();
+    let list_result = host_recording_list(&search, RECORDING_LIST_LIMIT);
     let items = match list_result {
         Ok(v) => v,
         Err(e) => {

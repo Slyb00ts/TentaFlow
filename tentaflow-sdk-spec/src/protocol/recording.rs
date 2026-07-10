@@ -71,7 +71,11 @@ pub struct RecordingStatsInput {
 /// Input for `recording_list_v1`. `camera_id` is optional (absent = all of the
 /// addon's cameras); `limit` caps the returned rows (host clamps to a sane max).
 /// Only `kind = "segment"` per-vehicle event clips are returned — snapshots are
-/// intentionally excluded from the browsable recordings list.
+/// intentionally excluded from the browsable recordings list. The optional
+/// server-side search filters compose with AND: `date_from`/`date_to` are unix
+/// MILLISECONDS bounding `created_at`; `plate`/`adr` are case-insensitive
+/// substring matches over the event's gated OCR winners. All new fields carry
+/// high CBOR keys so an older client that omits them still decodes.
 #[derive(Debug, Clone, Default, PartialEq, Encode, Decode)]
 #[cbor(map)]
 pub struct RecordingListInput {
@@ -79,6 +83,14 @@ pub struct RecordingListInput {
     pub camera_id: Option<String>,
     #[n(1)]
     pub limit: u32,
+    #[n(2)]
+    pub date_from: Option<i64>,
+    #[n(3)]
+    pub date_to: Option<i64>,
+    #[n(4)]
+    pub plate: Option<String>,
+    #[n(5)]
+    pub adr: Option<String>,
 }
 
 /// Input for `frame_url_v1`.
@@ -206,6 +218,20 @@ pub struct RecordingListItem {
     pub file_size_bytes: i64,
     #[n(5)]
     pub event_meta: Option<String>,
+    /// Gated plate OCR winner for the event (NULL when unreadable). Also the
+    /// server-side `plate` search target.
+    #[n(6)]
+    pub plate_text: Option<String>,
+    /// Gated ADR OCR winner for the event (NULL when unreadable).
+    #[n(7)]
+    pub adr_text: Option<String>,
+    /// Snapshot ref of the full downscaled frame at the event's best plate read
+    /// (whole scene, not a crop). Resolve to an image URL via `frame_url_v1`.
+    #[n(8)]
+    pub plate_thumb_ref: Option<String>,
+    /// Snapshot ref of the full downscaled frame at the event's best ADR read.
+    #[n(9)]
+    pub adr_thumb_ref: Option<String>,
 }
 
 /// Output of `recording_list_v1`.
@@ -309,6 +335,10 @@ mod tests {
         roundtrip(&RecordingListInput {
             camera_id: Some("cam_00000000-0000-0000-0000-000000000000".into()),
             limit: 200,
+            date_from: Some(1_700_000_000_000),
+            date_to: Some(1_700_500_000_000),
+            plate: Some("WGM".into()),
+            adr: Some("30/1202".into()),
         });
         roundtrip(&RecordingListInput::default());
         roundtrip(&RecordingListOut {
@@ -319,9 +349,56 @@ mod tests {
                 duration_ms: Some(12_000),
                 file_size_bytes: 4_096,
                 event_meta: Some("{\"texts\":{}}".into()),
+                plate_text: Some("WGM12345".into()),
+                adr_text: Some("30/1202".into()),
+                plate_thumb_ref: Some("snap_00000000-0000-0000-0000-000000000000".into()),
+                adr_thumb_ref: None,
             }],
         });
         roundtrip(&RecordingListOut::default());
+    }
+
+    /// An OLDER encoder that only knew keys 0..5 for `RecordingListItem` must
+    /// still decode into the extended struct (new `Option` fields default to
+    /// `None`) — the CBOR map keys are additive and absent maps to `None`.
+    #[test]
+    fn recording_list_item_back_compat_missing_new_keys() {
+        // Hand-build the pre-extension map: keys 0..5 only.
+        let old = RecordingListItemLegacy {
+            recording_ref: "clip_00000000-0000-0000-0000-000000000000".into(),
+            camera_id: "cam_00000000-0000-0000-0000-000000000000".into(),
+            created_at: 1_700_000_000,
+            duration_ms: Some(12_000),
+            file_size_bytes: 4_096,
+            event_meta: None,
+        };
+        let mut buf = Vec::new();
+        minicbor::encode(&old, &mut buf).unwrap();
+        let decoded: RecordingListItem = minicbor::decode(&buf).unwrap();
+        assert_eq!(decoded.recording_ref, old.recording_ref);
+        assert_eq!(decoded.plate_text, None);
+        assert_eq!(decoded.adr_text, None);
+        assert_eq!(decoded.plate_thumb_ref, None);
+        assert_eq!(decoded.adr_thumb_ref, None);
+    }
+
+    /// Mirror of the pre-extension `RecordingListItem` (keys 0..5), used only to
+    /// prove forward-compatible decode of an old-encoder payload.
+    #[derive(Encode)]
+    #[cbor(map)]
+    struct RecordingListItemLegacy {
+        #[n(0)]
+        recording_ref: String,
+        #[n(1)]
+        camera_id: String,
+        #[n(2)]
+        created_at: i64,
+        #[n(3)]
+        duration_ms: Option<i64>,
+        #[n(4)]
+        file_size_bytes: i64,
+        #[n(5)]
+        event_meta: Option<String>,
     }
 
     #[test]

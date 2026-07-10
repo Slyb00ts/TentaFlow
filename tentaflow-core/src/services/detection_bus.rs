@@ -53,6 +53,15 @@ pub struct Detection {
     /// `#[serde(default)]` keeps older CBOR/JSON without the field decodable.
     #[serde(default)]
     pub tekst_conf: Option<f32>,
+    /// Snapshot ref (`snap_<uuid>`) of the FULL downscaled camera frame captured
+    /// at the moment this track's OCR read reached a new best confidence — the
+    /// whole visible scene, NOT a crop. `None` when no thumbnail was captured for
+    /// this frame's read. The event recorder promotes this ref into the
+    /// `recordings.plate_thumb_ref`/`adr_thumb_ref` list thumbnail when the read
+    /// is the event's best so far. Serialized as `null`; `#[serde(default)]`
+    /// keeps older CBOR/JSON without the field decodable.
+    #[serde(default)]
+    pub tekst_thumb_ref: Option<String>,
     /// Stabilny identyfikator sledzenia nadany przez tracker IOU. 0 = brak
     /// przypisania (np. detekcje ze zrodel bez trackera).
     #[serde(default)]
@@ -222,6 +231,7 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                 stan: Vec::new(),
                 tekst: Some("30/1202".to_string()),
                 tekst_conf: None,
+                tekst_thumb_ref: None,
                 track_id: 0,
                 vx: 0.,
                 vy: 0.,
@@ -240,6 +250,7 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                 },
                 tekst: None,
                 tekst_conf: None,
+                tekst_thumb_ref: None,
                 track_id: 0,
                 vx: 0.,
                 vy: 0.,
@@ -257,6 +268,7 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                     stan: Vec::new(),
                     tekst: None,
                     tekst_conf: None,
+                    tekst_thumb_ref: None,
                     track_id: 0,
                     vx: 0.,
                     vy: 0.,
@@ -297,6 +309,7 @@ mod tests {
                     stan: Vec::new(),
                     tekst: Some("30/1202".to_string()),
                     tekst_conf: None,
+                    tekst_thumb_ref: None,
                     track_id: 0,
                     vx: 0.,
                     vy: 0.,
@@ -308,6 +321,7 @@ mod tests {
                     stan: vec!["uszkodzona".to_string()],
                     tekst: None,
                     tekst_conf: None,
+                    tekst_thumb_ref: None,
                     track_id: 0,
                     vx: 0.,
                     vy: 0.,
@@ -367,6 +381,7 @@ mod tests {
                 stan: Vec::new(),
                 tekst: None,
                 tekst_conf: None,
+                tekst_thumb_ref: None,
                 track_id: 0,
                 vx: 0.,
                 vy: 0.,
@@ -393,6 +408,7 @@ mod tests {
                 stan: Vec::new(),
                 tekst: None,
                 tekst_conf: None,
+                tekst_thumb_ref: None,
                 track_id: 0,
                 vx: 0.,
                 vy: 0.,

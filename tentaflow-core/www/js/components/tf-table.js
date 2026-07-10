@@ -414,6 +414,27 @@ class TfTable extends HTMLElement {
       // Skip jesli identyczne — eliminuje koszt parsowania HTML komorki gdy
       // wiersz przyszedl niezmieniony z API (najczestsze w 2-sekundowym refreshu).
       if (td.innerHTML !== next) td.innerHTML = next;
+    } else if (col.renderer === 'img') {
+      // Small inline thumbnail from an image URL cell. An empty value renders a
+      // muted em-dash so a missing thumbnail is visible but unobtrusive. The URL
+      // is set via the DOM `.src` property (never innerHTML) so the cell value
+      // cannot inject markup.
+      const url = typeof value === 'string' ? value.trim() : '';
+      if (!url) {
+        if (td.firstChild == null || td.firstChild.nodeName !== '#text' || td.textContent !== '—') {
+          td.replaceChildren(document.createTextNode('—'));
+        }
+        return;
+      }
+      let img = td.firstChild;
+      if (!(img instanceof HTMLImageElement)) {
+        img = document.createElement('img');
+        img.className = 'tf-table__thumb';
+        img.loading = 'lazy';
+        img.alt = '';
+        td.replaceChildren(img);
+      }
+      if (img.getAttribute('src') !== url) img.src = url;
     } else {
       const next = value ?? '';
       const txt = typeof next === 'string' ? next : String(next);

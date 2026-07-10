@@ -22927,13 +22927,24 @@ pub struct RecordingRow {
     /// JSON summary written by the per-vehicle event recorder (classes seen,
     /// plate/ADR OCR votes, event time range). NULL for addon-saved artifacts.
     pub event_meta: Option<String>,
+    /// Gated plate OCR winner for the event (indexed search column). NULL when
+    /// unreadable or for addon-saved artifacts.
+    pub plate_text: Option<String>,
+    /// Gated ADR OCR winner for the event. NULL when unreadable / not present.
+    pub adr_text: Option<String>,
+    /// Snapshot ref of the full downscaled frame captured at the event's
+    /// highest-confidence plate read (whole scene, not a crop). NULL when none.
+    pub plate_thumb_ref: Option<String>,
+    /// Snapshot ref of the full downscaled frame captured at the event's
+    /// highest-confidence ADR read. NULL when none.
+    pub adr_thumb_ref: Option<String>,
 }
 
 #[cfg(feature = "camera")]
 const RECORDING_SELECT_COLS: &str =
     "id, ref, kind, owner_addon_id, camera_id, file_path, file_size_bytes, duration_ms, \
      width, height, pixel_format, hash_sha256, retention_class, created_at, purged_at, \
-     event_meta";
+     event_meta, plate_text, adr_text, plate_thumb_ref, adr_thumb_ref";
 
 #[cfg(feature = "camera")]
 fn row_to_recording(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordingRow> {
@@ -22954,6 +22965,10 @@ fn row_to_recording(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordingRow> {
         created_at: row.get(13)?,
         purged_at: row.get(14)?,
         event_meta: row.get(15)?,
+        plate_text: row.get(16)?,
+        adr_text: row.get(17)?,
+        plate_thumb_ref: row.get(18)?,
+        adr_thumb_ref: row.get(19)?,
     })
 }
 
@@ -22999,6 +23014,10 @@ pub fn insert_recording(
     retention_class: &str,
     org_id: Option<&str>,
     event_meta: Option<&str>,
+    plate_text: Option<&str>,
+    adr_text: Option<&str>,
+    plate_thumb_ref: Option<&str>,
+    adr_thumb_ref: Option<&str>,
 ) -> Result<i64> {
     let conn = acquire(pool)?;
     let now = chrono::Utc::now().timestamp();
@@ -23009,8 +23028,10 @@ pub fn insert_recording(
         "INSERT INTO recordings \
          (ref, kind, owner_addon_id, camera_id, file_path, file_size_bytes, \
           duration_ms, width, height, pixel_format, hash_sha256, \
-          retention_class, created_at, purged_at, org_id, event_meta) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, ?15)",
+          retention_class, created_at, purged_at, org_id, event_meta, \
+          plate_text, adr_text, plate_thumb_ref, adr_thumb_ref) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, ?15, \
+                 ?16, ?17, ?18, ?19)",
         rusqlite::params![
             recording_ref,
             kind,
@@ -23027,6 +23048,10 @@ pub fn insert_recording(
             now,
             resolved_org,
             event_meta,
+            plate_text,
+            adr_text,
+            plate_thumb_ref,
+            adr_thumb_ref,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -23058,18 +23083,48 @@ pub fn get_recording_for_addon(
     Ok(row)
 }
 
-/// Lists active recordings owned by `addon_id`, newest first. `kind` filters to
-/// one recording kind (`"segment"` / `"snapshot"`); `None` returns both.
-/// `camera_id` narrows to a single camera when provided. `limit` caps the row
-/// count so a dashboard list never pulls an unbounded catalog into memory. The
-/// org scope mirrors `get_recording_for_addon` so cross-tenant rows cannot leak.
+/// Optional server-side filters for [`list_recordings_for_addon`]. Every field
+/// is `None` = "no filter"; they compose with AND. Dates are unix SECONDS
+/// (matching `recordings.created_at`); `plate`/`adr` are case-insensitive
+/// substring (`LIKE %x%`) matches against the indexed `plate_text`/`adr_text`
+/// columns written by the event recorder.
+#[cfg(feature = "camera")]
+#[derive(Debug, Default, Clone)]
+pub struct RecordingListFilters<'a> {
+    pub kind: Option<&'a str>,
+    pub camera_id: Option<&'a str>,
+    pub created_from: Option<i64>,
+    pub created_to: Option<i64>,
+    pub plate: Option<&'a str>,
+    pub adr: Option<&'a str>,
+}
+
+/// Escapes the LIKE metacharacters (`%`, `_`, `\`) in a user substring so a
+/// plate query like `50%` matches literally rather than as a wildcard. Paired
+/// with an explicit `ESCAPE '\'` clause in the SQL.
+#[cfg(feature = "camera")]
+fn like_contains(needle: &str) -> String {
+    let mut escaped = String::with_capacity(needle.len() + 2);
+    for c in needle.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    format!("%{escaped}%")
+}
+
+/// Lists active recordings owned by `addon_id`, newest first, applying the
+/// optional [`RecordingListFilters`]. `kind` filters to one recording kind
+/// (`"segment"` / `"snapshot"`); `None` returns both. `limit` caps the row count
+/// so a dashboard list never pulls an unbounded catalog into memory. The org
+/// scope mirrors `get_recording_for_addon` so cross-tenant rows cannot leak.
 #[cfg(feature = "camera")]
 pub fn list_recordings_for_addon(
     pool: &DbPool,
     addon_id: &str,
-    kind: Option<&str>,
-    camera_id: Option<&str>,
     org_id: Option<&str>,
+    filters: &RecordingListFilters<'_>,
     limit: u32,
 ) -> Result<Vec<RecordingRow>> {
     let conn = acquire(pool)?;
@@ -23084,13 +23139,37 @@ pub fn list_recordings_for_addon(
         "SELECT {RECORDING_SELECT_COLS} FROM recordings \
          WHERE owner_addon_id = ?1 AND org_id = ?2 AND purged_at IS NULL"
     );
-    if let Some(k) = kind {
+    if let Some(k) = filters.kind {
         params.push(Box::new(k.to_string()));
         sql.push_str(&format!(" AND kind = ?{}", params.len()));
     }
-    if let Some(cam) = camera_id {
+    if let Some(cam) = filters.camera_id {
         params.push(Box::new(cam.to_string()));
         sql.push_str(&format!(" AND camera_id = ?{}", params.len()));
+    }
+    if let Some(from) = filters.created_from {
+        params.push(Box::new(from));
+        sql.push_str(&format!(" AND created_at >= ?{}", params.len()));
+    }
+    if let Some(to) = filters.created_to {
+        params.push(Box::new(to));
+        sql.push_str(&format!(" AND created_at <= ?{}", params.len()));
+    }
+    if let Some(plate) = filters.plate.filter(|s| !s.trim().is_empty()) {
+        params.push(Box::new(like_contains(plate.trim())));
+        // NOCASE keeps the ASCII-case-insensitive match; ESCAPE lets a plate with
+        // a literal `%`/`_` still search literally.
+        sql.push_str(&format!(
+            " AND plate_text LIKE ?{} ESCAPE '\\' COLLATE NOCASE",
+            params.len()
+        ));
+    }
+    if let Some(adr) = filters.adr.filter(|s| !s.trim().is_empty()) {
+        params.push(Box::new(like_contains(adr.trim())));
+        sql.push_str(&format!(
+            " AND adr_text LIKE ?{} ESCAPE '\\' COLLATE NOCASE",
+            params.len()
+        ));
     }
     params.push(Box::new(limit as i64));
     sql.push_str(&format!(

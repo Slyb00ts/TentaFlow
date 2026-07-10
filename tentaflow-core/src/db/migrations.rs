@@ -607,6 +607,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "recordings_event_meta",
             MigrationStep::Rust(recordings_add_event_meta_column),
         ),
+        (
+            114,
+            "recordings_search_columns",
+            MigrationStep::Rust(recordings_add_search_columns),
+        ),
     ]
 }
 
@@ -1491,6 +1496,38 @@ fn recordings_add_event_meta_column(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "recordings", "event_meta")? {
         conn.execute_batch("ALTER TABLE recordings ADD COLUMN event_meta TEXT NULL;")?;
     }
+    Ok(())
+}
+
+/// Adds the four search/thumbnail columns to `recordings`, all nullable and
+/// written only by the per-vehicle event recorder at finalize:
+///   * `plate_text` / `adr_text` — the gated OCR winner strings for the event
+///     (NULL when unreadable), used by the recordings-browser LIKE search.
+///   * `plate_thumb_ref` / `adr_thumb_ref` — snapshot refs of the FULL downscaled
+///     camera frame captured at the highest-confidence plate/ADR read of the
+///     event (whole scene, not a crop), rendered as list thumbnails.
+/// `created_at` already carries `idx_recordings_owner`/`idx_recordings_camera`
+/// (both begin with a purged-scan column, not `created_at`), so an explicit
+/// `created_at` index backs the date-range filter's `ORDER BY`/range scan.
+/// A `%plate%` LIKE cannot use an index, but the per-addon row count is small
+/// (event clips, not raw frames) so a scan of the owner-scoped subset is fine.
+/// Idempotent — every add is guarded by a column probe.
+fn recordings_add_search_columns(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "recordings", "plate_text")? {
+        conn.execute_batch("ALTER TABLE recordings ADD COLUMN plate_text TEXT NULL;")?;
+    }
+    if !column_exists(conn, "recordings", "adr_text")? {
+        conn.execute_batch("ALTER TABLE recordings ADD COLUMN adr_text TEXT NULL;")?;
+    }
+    if !column_exists(conn, "recordings", "plate_thumb_ref")? {
+        conn.execute_batch("ALTER TABLE recordings ADD COLUMN plate_thumb_ref TEXT NULL;")?;
+    }
+    if !column_exists(conn, "recordings", "adr_thumb_ref")? {
+        conn.execute_batch("ALTER TABLE recordings ADD COLUMN adr_thumb_ref TEXT NULL;")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_recordings_created_at ON recordings(created_at);",
+    )?;
     Ok(())
 }
 

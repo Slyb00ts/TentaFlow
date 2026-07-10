@@ -618,6 +618,7 @@ mod tests {
                     stan: vec!["uszkodzona".into()],
                     tekst: Some("30/1202".into()),
                     tekst_conf: None,
+                    tekst_thumb_ref: None,
                     track_id: 7,
                     vx: 0.5,
                     vy: -0.5,

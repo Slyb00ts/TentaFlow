@@ -1732,6 +1732,7 @@ fn synthesize_forced_detections(pipeline: &CvPipeline, captured_ms: u64) -> Vec<
             stan: Vec::new(),
             tekst: None,
             tekst_conf: None,
+            tekst_thumb_ref: None,
             track_id: 0,
             vx: 0.0,
             vy: 0.0,
@@ -1834,6 +1835,7 @@ fn detection_from_cv(d: CvDetection) -> Detection {
         stan: Vec::new(),
         tekst: None,
         tekst_conf: None,
+        tekst_thumb_ref: None,
         track_id: 0,
         vx: 0.0,
         vy: 0.0,
@@ -2747,6 +2749,154 @@ fn apply_cached_enrichment(
     }
 }
 
+// -----------------------------------------------------------------------------
+// Event thumbnail capture (full downscaled frame at the best OCR read)
+// -----------------------------------------------------------------------------
+//
+// When a track's plate/ADR OCR winner reaches a NEW best confidence, we snapshot
+// the WHOLE camera frame (downscaled), NOT a crop — the operator wants the scene
+// where the plate/ADR is clearly visible. The snap ref rides the `Detection`
+// (`tekst_thumb_ref`) to the event recorder, which promotes it into the
+// `recordings.plate_thumb_ref`/`adr_thumb_ref` list thumbnail. Capture is
+// THROTTLED per (camera, ocr_mode, track): a save happens only when the read's
+// confidence beats the track's previous best by a margin, so I/O is bounded to a
+// handful of snaps per vehicle instead of one per frame.
+
+/// Longest edge of a saved event thumbnail. Full-scene context at a fraction of
+/// the frame bytes so the recordings list stays light.
+const THUMB_MAX_EDGE: u32 = 480;
+
+/// A read must beat the track's previous best confidence by at least this margin
+/// to trigger a fresh thumbnail save — bounds churn from frame-to-frame jitter.
+const THUMB_CONF_IMPROVE_MARGIN: f32 = 0.03;
+
+/// Per-(camera, ocr_mode, track) best OCR confidence for which a thumbnail was
+/// already captured. Keyed like the enrich cache; reused via the same eviction
+/// cadence so dead tracks fall out without a separate sweeper.
+struct ThumbBest {
+    best_conf: f32,
+    at: Instant,
+}
+
+fn thumb_best_cache() -> &'static Mutex<HashMap<(String, String, u32), ThumbBest>> {
+    static C: OnceLock<Mutex<HashMap<(String, String, u32), ThumbBest>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Returns `true` when `conf` is a new best for this track worth capturing (and
+/// records it), `false` otherwise. Under one lock; opportunistically evicts
+/// stale entries so the map stays bounded without a background task.
+fn thumb_should_capture(camera_id: &str, mode_key: &str, track_id: u32, conf: f32) -> bool {
+    static PUT_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let mut cache = thumb_best_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let key = (camera_id.to_string(), mode_key.to_string(), track_id);
+    let capture = match cache.get(&key) {
+        Some(prev) => conf >= prev.best_conf + THUMB_CONF_IMPROVE_MARGIN,
+        None => true,
+    };
+    if capture {
+        cache.insert(
+            key,
+            ThumbBest {
+                best_conf: conf,
+                at: Instant::now(),
+            },
+        );
+    }
+    if PUT_COUNT.fetch_add(1, AtomicOrdering::Relaxed) % ENRICH_EVICT_EVERY == 0 {
+        cache.retain(|_, b| b.at.elapsed() < ENRICH_CACHE_EVICT_AGE);
+    }
+    capture
+}
+
+/// Downscales the full RGB24 frame so its longest edge is at most
+/// [`THUMB_MAX_EDGE`] (keeping aspect, never upscaling), persists it via
+/// `save_snapshot_rgb24`, and catalogs a `kind = "snapshot"` `recordings` row so
+/// the ref resolves through the signed `/recordings/<ref>` image endpoint the
+/// panel renders. Attribution goes to the camera's owning addon/org/retention
+/// (same identity the event recorder uses), so the thumbnail lives in the same
+/// tenant scope as the clip. Returns the snapshot ref on success, `None` on any
+/// failure (a missing thumbnail degrades to a placeholder — never fatal to
+/// enrichment). On a DB-insert failure the just-written file is purged so no
+/// orphan is left behind, mirroring the host-function snapshot path.
+async fn save_event_thumbnail(camera_id: &str, rgb24: &[u8], w: u32, h: u32) -> Option<String> {
+    if w == 0 || h == 0 || rgb24.len() != (w as usize) * (h as usize) * 3 {
+        return None;
+    }
+    let longest = w.max(h);
+    let (tw, th, data) = if longest > THUMB_MAX_EDGE {
+        let scale = THUMB_MAX_EDGE as f32 / longest as f32;
+        let tw = ((w as f32 * scale).round() as u32).max(1);
+        let th = ((h as f32 * scale).round() as u32).max(1);
+        let img = image::RgbImage::from_raw(w, h, rgb24.to_vec())?;
+        let resized =
+            image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle);
+        (tw, th, resized.into_raw())
+    } else {
+        (w, h, rgb24.to_vec())
+    };
+    let saved = match crate::services::recording::save_snapshot_rgb24(camera_id, &data, tw, th)
+        .await
+    {
+        Ok(saved) => saved,
+        Err(e) => {
+            warn_throttled("thumb", &format!("event thumbnail save failed: {e}"));
+            return None;
+        }
+    };
+    // Catalog the snapshot so the signed-URL endpoint can serve it. Without a row
+    // the ref is un-resolvable and the panel shows a placeholder.
+    let camera_id_owned = camera_id.to_string();
+    let saved_ref = saved.recording_ref.as_str().to_string();
+    let file_path = saved.file_path.clone();
+    let cataloged = tokio::task::spawn_blocking(move || {
+        let Some(pool) = crate::db::global_pool() else {
+            return Err(anyhow::anyhow!("no global DB pool"));
+        };
+        let (owner_addon_id, org_id, retention_class) =
+            match crate::db::repository::camera_recording_identity(&pool, &camera_id_owned)? {
+                Some(v) => v,
+                None => return Err(anyhow::anyhow!("camera not node-local")),
+            };
+        crate::db::repository::insert_recording(
+            &pool,
+            &saved_ref,
+            "snapshot",
+            &owner_addon_id,
+            &camera_id_owned,
+            &saved.file_path.to_string_lossy(),
+            saved.file_size_bytes as i64,
+            None,
+            saved.width.map(|v| v as i64),
+            saved.height.map(|v| v as i64),
+            saved.pixel_format.as_deref(),
+            &saved.hash_sha256,
+            &retention_class,
+            Some(&org_id),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .map(|_| saved_ref)
+        .map_err(anyhow::Error::from)
+    })
+    .await;
+    match cataloged {
+        Ok(Ok(r)) => Some(r),
+        Ok(Err(e)) => {
+            warn_throttled("thumb", &format!("event thumbnail catalog failed: {e}"));
+            let _ = crate::services::recording::purge_recording(&file_path).await;
+            None
+        }
+        Err(e) => {
+            warn_throttled("thumb", &format!("event thumbnail catalog task: {e}"));
+            None
+        }
+    }
+}
+
 /// COLD: generyczny interpreter etapow `stage` pipeline'u. Dla kazdego etapu
 /// wybiera detekcje rodzica pasujace klasami (`class_matches`), wycina crop z
 /// paddingiem etapu i wzbogaca: classify → `stan`, ocr → `tekst` (tryb z
@@ -2962,6 +3112,16 @@ async fn run_cold_stages(
         // bez id (track_id=0) emituje surowy odczyt wprost. Classify: `stan`
         // przypisany od zera, bez cache-put (kazda klatka czyta na nowo).
         let (min_conf, min_agreement) = ocr_gate_thresholds(&ocr_mode);
+        // Key thumbnail throttling by the READ MODE (plate vs adr) so a plate and
+        // an ADR read on the same track_id keep independent best-confidence
+        // baselines and each produces its own scene thumbnail.
+        let thumb_mode_key = match ocr_mode {
+            CvOcrMode::Adr => "adr",
+            CvOcrMode::Plate | CvOcrMode::Generic => "plate",
+        };
+        // Lazily built full-scene RGB frame (whole camera image), produced at most
+        // once per stage and only when a capture actually fires — the NV12
+        // download/convert on the zero-copy path is not free.
         for ((idx, _, _, _, _), value) in items.iter().zip(outputs) {
             let det = &mut dets[*idx];
             if op == CvOp::Ocr && det.track_id > 0 {
@@ -2974,6 +3134,18 @@ async fn run_cold_stages(
                     min_conf,
                     min_agreement,
                 );
+                // New best confident read for this track+mode → snapshot the WHOLE
+                // downscaled frame (not the crop) and hand its ref to the recorder.
+                if let Some(c) = conf {
+                    if thumb_should_capture(camera_id, thumb_mode_key, det.track_id, c) {
+                        if let Some(rgb) =
+                            cold_full_rgb(frame, frame_device, w, h, frame_format)
+                        {
+                            det.tekst_thumb_ref =
+                                save_event_thumbnail(camera_id, &rgb, w, h).await;
+                        }
+                    }
+                }
                 det.tekst = tekst;
                 det.tekst_conf = conf;
             } else {
@@ -2981,6 +3153,26 @@ async fn run_cold_stages(
             }
         }
     }
+}
+
+/// Materializes the FULL RGB24 camera frame for a thumbnail capture. On the host
+/// path `frame` already holds RGB (or NV12 that `nv12_to_rgb_if_needed`
+/// converts); on the GPU zero-copy path `frame` is empty, so the full NV12 is
+/// downloaded from the device once and converted. `None` when no frame is
+/// recoverable (capture is then simply skipped this cycle).
+fn cold_full_rgb(
+    frame: &[u8],
+    frame_device: Option<&super::fakefile::DeviceCropsFrame>,
+    w: u32,
+    h: u32,
+    frame_format: &super::fakefile::DetectFrameFormat,
+) -> Option<Arc<[u8]>> {
+    if !frame.is_empty() {
+        let arc: Arc<[u8]> = Arc::from(frame.to_vec());
+        return Some(nv12_to_rgb_if_needed(&arc, w, h, frame_format));
+    }
+    let (nv12, fmt) = frame_device?.download_full_nv12()?;
+    Some(nv12_to_rgb_if_needed(&nv12, w, h, &fmt))
 }
 
 /// COLD fallback per-crop: gdy alias etapu NIE rozwiazuje sie do lokalnego
