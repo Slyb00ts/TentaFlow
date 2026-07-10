@@ -59,6 +59,7 @@ class TfModal extends HTMLElement {
     // Preserve slot children before clearing.
     const bodyContent = this.querySelector('[slot="body"]');
     const footerContent = this.querySelector('[slot="footer"]');
+    const titleIcon = this.querySelector('[slot="title-icon"]');
     this.innerHTML = '';
 
     const backdrop = document.createElement('div');
@@ -72,6 +73,13 @@ class TfModal extends HTMLElement {
 
     const header = document.createElement('div');
     header.className = 'tf-modal-header';
+
+    // Optional header icon slotted before the title (SDK Modal.icon).
+    if (titleIcon) {
+      titleIcon.removeAttribute('slot');
+      titleIcon.classList.add('tf-modal-title-icon');
+      header.appendChild(titleIcon);
+    }
 
     const titleEl = document.createElement('h2');
     titleEl.className = 'tf-modal-title';

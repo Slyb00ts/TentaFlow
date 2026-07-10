@@ -221,8 +221,18 @@ mod tests {
             body_slot: "body".into(), footer_slot: Some("footer".into()),
             size: ModalSize::Md, dismissible: true,
             prevent_scroll: true, closable: true,
+            icon: None,
         };
         rt(v, |m| m.into_component("m").unwrap(), Modal::try_from_component);
+
+        let with_icon = Modal {
+            title: lit("Share"), subtitle: None,
+            body_slot: "body".into(), footer_slot: None,
+            size: ModalSize::Lg, dismissible: true,
+            prevent_scroll: true, closable: true,
+            icon: Some(icon()),
+        };
+        rt(with_icon, |m| m.into_component("m").unwrap(), Modal::try_from_component);
     }
 
     #[test]

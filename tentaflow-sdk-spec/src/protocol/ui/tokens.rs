@@ -837,6 +837,16 @@ string_enum! {
 }
 
 string_enum! {
+    /// `ProgressBar` fill orientation (catalog §4 0x021D). `Horizontal` is the
+    /// default (fill grows left→right); `Vertical` is a narrow column whose
+    /// fill grows bottom→top, used by ranked-score columns.
+    pub enum ProgressOrientation {
+        Horizontal = "horizontal",
+        Vertical = "vertical",
+    }
+}
+
+string_enum! {
     /// `RatingDisplay` visual variant (catalog §4 0x021E).
     pub enum RatingVariant {
         Stars = "stars",

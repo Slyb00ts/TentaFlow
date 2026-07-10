@@ -121,15 +121,15 @@ pub use tentaflow_sdk_spec::protocol::ui::tokens::{
     InputMode, InputSize, InputType, InputVariant, KvLayout, LinkTarget, LinkUnderline,
     LiveRegion, LogLevel, LogVariant, MarkdownBlock, MarkdownFeature, MarkdownMark,
     MenuPlacement, ModalSize, NavTabsVariant, NavigateTarget, Overflow, PaginationVariant,
-    PdfZoomMode, PieVariant, PopoverPlacement, ProgressSize, ProgressVariant,
-    RadioCardVariant, RadioGroupOrientation, RadiusToken, RatingPrecision, RatingVariant,
-    ScrollBehavior, ScrollOrientation, SearchVariant, SegmentSize, ShadowToken, SheetDetent,
-    SkeletonVariant, SliderRowLayout, SortDirection, SpacerAxis, Spacing, SparklineVariant,
-    SpinnerSize, SpinnerVariant, SplitDivider, SplitOrientation, StatSize,
-    StepProgressVariant, StepStatus, StopwatchVariant, TableSelectMode, TableVariant,
-    TabsVariant, TagSize, TerminalTheme, TextAlign, TextStyle, TextWrap, TileProvider,
-    TimePrecision, TimelineOrientation, TogglePosition, ToggleSize, Tone, TreeVariant,
-    VideoControls,
+    PdfZoomMode, PieVariant, PopoverPlacement, ProgressOrientation, ProgressSize,
+    ProgressVariant, RadioCardVariant, RadioGroupOrientation, RadiusToken, RatingPrecision,
+    RatingVariant, ScrollBehavior, ScrollOrientation, SearchVariant, SegmentSize,
+    ShadowToken, SheetDetent, SkeletonVariant, SliderRowLayout, SortDirection, SpacerAxis,
+    Spacing, SparklineVariant, SpinnerSize, SpinnerVariant, SplitDivider, SplitOrientation,
+    StatSize, StepProgressVariant, StepStatus, StopwatchVariant, TableSelectMode,
+    TableVariant, TabsVariant, TagSize, TerminalTheme, TextAlign, TextStyle, TextWrap,
+    TileProvider, TimePrecision, TimelineOrientation, TogglePosition, ToggleSize, Tone,
+    TreeVariant, VideoControls,
 };
 pub use tentaflow_sdk_spec::protocol::ui::typed_field::{
     IntoComponentError, decode_from_value, encode_to_value,
@@ -633,6 +633,8 @@ mod catalog_conformance {
         assert_eq!(enc(&ProgressSize::Sm), tstr("sm"), "ProgressSize::Sm");
         assert_eq!(enc(&ProgressSize::Md), tstr("md"), "ProgressSize::Md");
         assert_eq!(enc(&ProgressSize::Lg), tstr("lg"), "ProgressSize::Lg");
+        assert_eq!(enc(&ProgressOrientation::Horizontal), tstr("horizontal"), "ProgressOrientation::Horizontal");
+        assert_eq!(enc(&ProgressOrientation::Vertical), tstr("vertical"), "ProgressOrientation::Vertical");
         assert_eq!(enc(&RatingVariant::Stars), tstr("stars"), "RatingVariant::Stars");
         assert_eq!(enc(&RatingVariant::Hearts), tstr("hearts"), "RatingVariant::Hearts");
         assert_eq!(enc(&RatingVariant::Circles), tstr("circles"), "RatingVariant::Circles");

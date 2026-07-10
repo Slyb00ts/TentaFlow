@@ -30,7 +30,7 @@ const RADIUS_TOKENS = new Set([
   'none', 'xs', 'sm', 'md', 'lg', 'xl', 'pill', 'circle',
 ]);
 const SHADOW_TOKENS = new Set([
-  'none', 'subtle', 'medium', 'elevated', 'floating',
+  'none', 'subtle', 'medium', 'elevated', 'floating', 'accent_glow',
 ]);
 const BACKGROUND_TOKENS = new Set([
   'none', 'subtle', 'muted', 'accent', 'inverse',

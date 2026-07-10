@@ -1084,6 +1084,8 @@ pub struct DirectoryUser {
     pub email: Option<String>,
     pub groups: Vec<String>,
     pub is_active: bool,
+    /// Organization RBAC role (`user` | `power_user` | `admin`).
+    pub role: String,
 }
 
 /// One user group; `member_count` counts only active users of the caller's org.
@@ -1125,6 +1127,7 @@ pub fn directory_users() -> Result<Vec<DirectoryUser>, AbiError> {
             email: u.email,
             groups: u.groups,
             is_active: u.is_active,
+            role: u.role,
         })
         .collect())
 }

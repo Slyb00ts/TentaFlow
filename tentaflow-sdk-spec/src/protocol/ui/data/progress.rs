@@ -5,7 +5,8 @@
 use super::super::bind::{BindRef, StatePath};
 use super::super::component::{Component, FieldMap};
 use super::super::tokens::{
-    DiffVariant, ProgressSize, ProgressVariant, RatingPrecision, RatingVariant, Tone,
+    DiffVariant, ProgressOrientation, ProgressSize, ProgressVariant, RatingPrecision,
+    RatingVariant, Tone,
 };
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
@@ -33,13 +34,17 @@ pub struct ProgressBar {
     pub show_label: bool,
     pub label: Option<BindRef>,
     pub size: ProgressSize,
+    /// Fill orientation. Absent on the wire (and `None`) means the default
+    /// `Horizontal`; only `Some(Vertical)` is encoded, so existing horizontal
+    /// bars keep byte-identical payloads.
+    pub orientation: Option<ProgressOrientation>,
 }
 
 impl ProgressBar {
     pub const TAG: u16 = 0x021D;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut e: Vec<(u8, Value)> = Vec::with_capacity(7);
+        let mut e: Vec<(u8, Value)> = Vec::with_capacity(8);
         e.push((0, encode_to_value(&self.value)?));
         e.push((1, encode_to_value(&self.max)?));
         e.push((2, encode_to_value(&self.variant)?));
@@ -47,6 +52,10 @@ impl ProgressBar {
         e.push((4, encode_to_value(&self.show_label)?));
         if let Some(l) = &self.label { e.push((5, encode_to_value(l)?)); }
         e.push((6, encode_to_value(&self.size)?));
+        // Wire-compat: emit key 7 ONLY for the non-default vertical orientation.
+        if matches!(self.orientation, Some(ProgressOrientation::Vertical)) {
+            e.push((7, encode_to_value(&ProgressOrientation::Vertical)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
@@ -60,6 +69,7 @@ impl ProgressBar {
         let mut show_label = None;
         let mut label = None;
         let mut size = None;
+        let mut orientation = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => value = Some(decode_from_value(v)?),
@@ -69,6 +79,7 @@ impl ProgressBar {
                 4 => show_label = Some(decode_from_value(v)?),
                 5 => label = Some(decode_from_value(v)?),
                 6 => size = Some(decode_from_value(v)?),
+                7 => orientation = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("ProgressBar", *other)),
             }
         }
@@ -81,6 +92,7 @@ impl ProgressBar {
             show_label: show_label.ok_or_else(|| missing_field("ProgressBar", "show_label"))?,
             label,
             size: size.ok_or_else(|| missing_field("ProgressBar", "size"))?,
+            orientation,
         })
     }
 }

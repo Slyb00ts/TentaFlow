@@ -1215,6 +1215,11 @@ th.tf-table__sticky-col { box-shadow: 1px 0 0 0 var(--tf-border); }
   text-transform: uppercase;
   white-space: nowrap;
 }
+tf-chip[data-sdk-chip] .tf-chip { text-transform: none; letter-spacing: normal; }
+tf-chip[data-sdk-chip] .tf-chip.active {
+  background: var(--tf-accent-glow);
+  color: var(--tf-accent-2);
+}
 .tf-chip.ok   { background: rgba(34, 197, 94, 0.15);  color: #22c55e; }
 .tf-chip.warn { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
 .tf-chip.err  { background: rgba(239, 68, 68, 0.15);  color: #ef4444; }
@@ -2578,6 +2583,26 @@ tf-progress-bar { display: block; }
 .tf-progress-bar-fill.success { background: var(--tf-gradient-success); }
 .tf-progress-bar-fill.warning { background: linear-gradient(135deg, #f59e0b 0%, #fbbf24 100%); }
 .tf-progress-bar-fill.danger  { background: var(--tf-gradient-danger); }
+
+/* Vertical orientation: a narrow column whose fill rises from the bottom.
+   The track fills the wrapper height (host sets it via a fixed-height Box);
+   the width comes from the size token. */
+tf-progress-bar[orientation="vertical"] { height: 100%; }
+tf-progress-bar[orientation="vertical"] .tf-progress-bar-wrap { height: 100%; }
+.tf-progress-bar.vertical { width: 6px; height: 100%; }
+.tf-progress-bar.vertical.xs { width: 4px; }
+.tf-progress-bar.vertical.sm { width: 6px; }
+.tf-progress-bar.vertical.md { width: 8px; }
+.tf-progress-bar.vertical.lg { width: 14px; }
+.tf-progress-bar.vertical .tf-progress-bar-fill {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  width: 100%;
+  height: 0;
+  transition: height 0.4s var(--tf-spring-smooth);
+}
 
 .tf-progress-bar-fill::after {
   content: '';
@@ -4371,6 +4396,15 @@ tf-modal {
   text-overflow: ellipsis;
 }
 
+.tf-modal-title-icon {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  margin-right: 9px;
+  color: var(--tf-accent-2, var(--tf-accent));
+}
+.tf-modal-title-icon svg { width: 100%; height: 100%; }
+
 .tf-modal-close {
   background: none;
   border: none;
@@ -4957,6 +4991,7 @@ tf-skeleton {
 .tf-card--shadow-medium   { box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08); }
 .tf-card--shadow-elevated { box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12); }
 .tf-card--shadow-floating { box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18); }
+.tf-card--shadow-accent_glow { box-shadow: var(--tf-glow-accent); }
 .tf-card--bg-none    { background: var(--tf-bg-none); }
 .tf-card--bg-subtle  { background: var(--tf-bg-subtle); }
 .tf-card--bg-muted   { background: var(--tf-bg-muted); }
@@ -6438,6 +6473,21 @@ tf-skeleton {
 }
 .tf-avatar-source__img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .tf-avatar-source__initials { font-weight: 600; }
+
+/* Deterministic initials palette (B2): a person's initials hash to one bucket,
+   so the same person is always the same color. White glyphs on a gradient. */
+.tf-avatar-source--auto-0,
+.tf-avatar-source--auto-1,
+.tf-avatar-source--auto-2,
+.tf-avatar-source--auto-3,
+.tf-avatar-source--auto-4,
+.tf-avatar-source--auto-5 { color: #fff; }
+.tf-avatar-source--auto-0 { background: linear-gradient(135deg, #6366f1, #a78bfa); }
+.tf-avatar-source--auto-1 { background: linear-gradient(135deg, #0ea5e9, #6366f1); }
+.tf-avatar-source--auto-2 { background: linear-gradient(135deg, #f59e0b, #ef4444); }
+.tf-avatar-source--auto-3 { background: linear-gradient(135deg, #22c55e, #0ea5e9); }
+.tf-avatar-source--auto-4 { background: linear-gradient(135deg, #ec4899, #8b5cf6); }
+.tf-avatar-source--auto-5 { background: linear-gradient(135deg, #14b8a6, #22c55e); }
 .tf-avatar__status {
   position: absolute;
   bottom: 0;

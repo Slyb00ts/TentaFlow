@@ -748,6 +748,7 @@ pub const PROGRESSBAR_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 4, name: "show_label", wire: "bool", required: true, default: None },
         FieldMeta { key: 5, name: "label", wire: "Option<BindRef>", required: false, default: None },
         FieldMeta { key: 6, name: "size", wire: "Enum<ProgressSize>", required: true, default: None },
+        FieldMeta { key: 7, name: "orientation", wire: "Option<Enum<ProgressOrientation>>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -1879,6 +1880,7 @@ pub const MODAL_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 5, name: "dismissible", wire: "bool", required: true, default: None },
         FieldMeta { key: 6, name: "prevent_scroll", wire: "bool", required: true, default: None },
         FieldMeta { key: 7, name: "closable", wire: "bool", required: true, default: None },
+        FieldMeta { key: 8, name: "icon", wire: "Option<Inline<IconRef>>", required: false, default: None },
     ],
     handlers: &["close"],
 };
@@ -3070,6 +3072,14 @@ pub const PROGRESSSIZE_ENUM: EnumMeta = EnumMeta {
     ],
 };
 
+pub const PROGRESSORIENTATION_ENUM: EnumMeta = EnumMeta {
+    name: "ProgressOrientation",
+    variants: &[
+        ("Horizontal", "horizontal"),
+        ("Vertical", "vertical"),
+    ],
+};
+
 pub const RATINGVARIANT_ENUM: EnumMeta = EnumMeta {
     name: "RatingVariant",
     variants: &[
@@ -3999,6 +4009,7 @@ pub const ALL_ENUMS: &[&EnumMeta] = &[
     &GAUGEVARIANT_ENUM,
     &PROGRESSVARIANT_ENUM,
     &PROGRESSSIZE_ENUM,
+    &PROGRESSORIENTATION_ENUM,
     &RATINGVARIANT_ENUM,
     &RATINGPRECISION_ENUM,
     &DIFFVARIANT_ENUM,

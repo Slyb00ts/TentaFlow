@@ -1452,6 +1452,21 @@ public static class ProgressSizeWireExtensions {
     public static TfValue ToWire(this ProgressSize v) => TfValue.Text(v.WireName());
 }
 
+/// <summary>Enum: ProgressOrientation</summary>
+public enum ProgressOrientation {
+    [Wire("horizontal")] Horizontal,
+    [Wire("vertical")] Vertical
+}
+
+public static class ProgressOrientationWireExtensions {
+    public static string WireName(this ProgressOrientation v) => v switch {
+        ProgressOrientation.Horizontal => "horizontal",
+        ProgressOrientation.Vertical => "vertical",
+        _ => throw new ArgumentOutOfRangeException(nameof(v)),
+    };
+    public static TfValue ToWire(this ProgressOrientation v) => TfValue.Text(v.WireName());
+}
+
 /// <summary>Enum: RatingVariant</summary>
 public enum RatingVariant {
     [Wire("stars")] Stars,
@@ -8452,6 +8467,8 @@ public sealed class ProgressBar : Component {
     public BindRef? Label { get; set; }
     /// <summary>Field 6: size (Enum<ProgressSize>)</summary>
     public ProgressSize Size { get; set; }
+    /// <summary>Field 7: orientation (Option<Enum<ProgressOrientation>>)</summary>
+    public ProgressOrientation? Orientation { get; set; }
 
     public override FieldMap ToFieldMap() {
         var map = new FieldMap();
@@ -8462,6 +8479,7 @@ public sealed class ProgressBar : Component {
         map.Set(4, TfValue.Bool(ShowLabel));
         if (Label != null) map.Set(5, Label.ToValue());
         map.Set(6, Size.ToWire());
+        if (Orientation != null) map.Set(7, Orientation.Value.ToWire());
         return map;
     }
 }
@@ -10857,6 +10875,8 @@ public sealed class Modal : Component {
     public bool PreventScroll { get; set; } = false;
     /// <summary>Field 7: closable (bool)</summary>
     public bool Closable { get; set; } = false;
+    /// <summary>Field 8: icon (Option<Inline<IconRef>>)</summary>
+    public IconRef? Icon { get; set; }
 
     public override FieldMap ToFieldMap() {
         var map = new FieldMap();
@@ -10868,6 +10888,7 @@ public sealed class Modal : Component {
         map.Set(5, TfValue.Bool(Dismissible));
         map.Set(6, TfValue.Bool(PreventScroll));
         map.Set(7, TfValue.Bool(Closable));
+        if (Icon != null) map.Set(8, Icon.ToValue());
         return map;
     }
 }

@@ -138,6 +138,24 @@ fn inactive_users_are_excluded() {
 }
 
 #[test]
+fn users_carry_rbac_role() {
+    let db = make_core_db();
+    let org = create_org(&db, "Org", "org");
+    let admin = create_user(&db, "boss", "boss@x");
+    let plain = create_user(&db, "member", "member@x");
+    add_org_member(&db, &org, &admin);
+    add_org_member(&db, &org, &plain);
+    repository::set_user_role(&db, &admin, "admin").expect("set admin role");
+
+    let out = test_api::users(&db, &org).unwrap();
+    let boss = out.users.iter().find(|u| u.username == "boss").unwrap();
+    assert_eq!(boss.role, "admin");
+    // Fresh accounts default to the `user` role.
+    let member = out.users.iter().find(|u| u.username == "member").unwrap();
+    assert_eq!(member.role, "user");
+}
+
+#[test]
 fn users_carry_group_ids_and_no_credentials() {
     let db = make_core_db();
     let org = create_org(&db, "Org", "org");

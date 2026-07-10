@@ -967,6 +967,8 @@ public sealed class DirectoryUser
     /// <summary>Group IDs (user_groups.id) the user belongs to.</summary>
     public List<string> Groups { get; init; } = new();
     public bool IsActive { get; init; }
+    /// <summary>Organization RBAC role (user | power_user | admin).</summary>
+    public string Role { get; init; } = "";
 }
 
 /// <summary>One user group; MemberCount counts only active users of the caller's org.</summary>
@@ -1044,7 +1046,7 @@ public static class Directory
     }
 
     // Wire: DirectoryUsersOutput {0: [DirectoryUserOut {0: id, 1: username,
-    // 2: display_name, 3: email?, 4: [group_id], 5: is_active}]}.
+    // 2: display_name, 3: email?, 4: [group_id], 5: is_active, 6: role}]}.
     internal static List<DirectoryUser> DecodeUsers(byte[] data)
     {
         var users = new List<DirectoryUser>();
@@ -1062,7 +1064,7 @@ public static class Directory
             for (int i = 0; i < count; i++)
             {
                 int n = r.ReadMapHeader();
-                string id = "", username = "", displayName = "";
+                string id = "", username = "", displayName = "", role = "";
                 string? email = null;
                 var groups = new List<string>();
                 bool isActive = false;
@@ -1083,6 +1085,7 @@ public static class Directory
                             }
                             break;
                         case 5: isActive = r.ReadBool(); break;
+                        case 6: role = r.ReadText(); break;
                         default: Value.Decode(r); break;
                     }
                 }
@@ -1094,6 +1097,7 @@ public static class Directory
                     Email = email,
                     Groups = groups,
                     IsActive = isActive,
+                    Role = role,
                 });
             }
         }

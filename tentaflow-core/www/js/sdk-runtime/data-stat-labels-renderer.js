@@ -575,6 +575,9 @@ function renderChip(component, ctx) {
   };
   const wrapper = document.createElement('tf-chip');
   wrapper.setAttribute('status', TONE_TO_STATUS[tone] || 'info');
+  // SDK Chips carry content labels (names, filters), not status codes, so they
+  // keep their given casing instead of the legacy status-pill uppercase.
+  wrapper.setAttribute('data-sdk-chip', '');
   if (iconRaw != null) {
     // IconRef Named on the wire is {kind:'named', name, size?, tone?};
     // sprite ids are dash-separated (#i-record-dot for "record_dot").

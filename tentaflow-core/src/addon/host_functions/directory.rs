@@ -241,7 +241,7 @@ fn list_org_users(db: &DbPool, org_id: &str) -> Result<DirectoryUsersOutput, Abi
 
     let mut stmt = conn
         .prepare(
-            "SELECT u.id, u.username, u.display_name, u.email FROM user_accounts u \
+            "SELECT u.id, u.username, u.display_name, u.email, u.role FROM user_accounts u \
              JOIN org_memberships m ON m.user_id = u.id \
              WHERE m.org_id = ?1 AND u.is_active = 1 \
              ORDER BY u.username",
@@ -254,13 +254,14 @@ fn list_org_users(db: &DbPool, org_id: &str) -> Result<DirectoryUsersOutput, Abi
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })
         .map_err(|_| AbiError::Operation)?;
 
     let mut users = Vec::new();
     for row in rows {
-        let (id, username, display_name, email) = row.map_err(|_| AbiError::Operation)?;
+        let (id, username, display_name, email, role) = row.map_err(|_| AbiError::Operation)?;
         let groups = groups_by_user.remove(&id).unwrap_or_default();
         users.push(DirectoryUserOut {
             id,
@@ -269,6 +270,7 @@ fn list_org_users(db: &DbPool, org_id: &str) -> Result<DirectoryUsersOutput, Abi
             email,
             groups,
             is_active: true,
+            role,
         });
     }
     Ok(DirectoryUsersOutput { users })

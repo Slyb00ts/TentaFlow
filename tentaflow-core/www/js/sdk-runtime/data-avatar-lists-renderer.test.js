@@ -79,6 +79,32 @@ test('Avatar initials renderuje <span> z size+shape class', () => {
   assertEq(el.querySelector('.tf-avatar-source__initials').textContent, 'AB');
 });
 
+test('Avatar initials bez tone dostaje deterministyczny kolor (B2)', () => {
+  setup();
+  const engine = makeEngine();
+  const src = () => engine.render(avatarComp({ source: { kind: 'initials', initials: 'MW' } }))
+    .querySelector('.tf-avatar-source');
+  const first = src();
+  const auto = [...first.classList].find((c) => c.startsWith('tf-avatar-source--auto-'));
+  assert(auto, 'expected an auto-color class');
+  // Deterministic: the same initials always map to the same bucket.
+  assert(src().classList.contains(auto), 'same initials → same bucket');
+  // Different initials can land in a different bucket (not asserting inequality,
+  // just that the class is present and well-formed).
+  const other = engine.render(avatarComp({ source: { kind: 'initials', initials: 'MK' } }))
+    .querySelector('.tf-avatar-source');
+  assert([...other.classList].some((c) => c.startsWith('tf-avatar-source--auto-')));
+});
+
+test('Avatar initials z tone NIE dostaje auto-koloru', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(avatarComp({ source: { kind: 'initials', initials: 'MW' }, tone: 'primary' }));
+  const wrap = el.querySelector('.tf-avatar-source');
+  assert(![...wrap.classList].some((c) => c.startsWith('tf-avatar-source--auto-')),
+    'explicit tone must suppress the auto-color bucket');
+});
+
 test('Avatar image z https://... renderuje <img>', () => {
   setup();
   const engine = makeEngine();

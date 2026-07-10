@@ -532,6 +532,7 @@ mod tests {
             show_label: true,
             label: Some(lit("50%")),
             size: ProgressSize::Lg,
+            orientation: None,
         };
         let c = p.clone().into_component("pb").unwrap();
         assert_eq!(ProgressBar::try_from_component(&c).unwrap(), p);
@@ -547,6 +548,7 @@ mod tests {
             tone: Tone::Primary,
             show_label: true, label: None,
             size: ProgressSize::Md,
+            orientation: None,
         };
         let mut c = p.into_component("pb").unwrap();
         c.fields.0.retain(|(k, _)| *k != 1);
@@ -690,6 +692,41 @@ mod tests {
         };
         let c = vh.clone().into_component("vh").unwrap();
         assert_eq!(VisuallyHidden::try_from_component(&c).unwrap(), vh);
+    }
+
+    #[test]
+    fn progress_bar_vertical_roundtrip() {
+        use crate::protocol::ui::tokens::{ProgressOrientation, ProgressSize, ProgressVariant};
+        let p = ProgressBar {
+            value: lit("score"),
+            max: 1.0,
+            variant: ProgressVariant::Default,
+            tone: Tone::Primary,
+            show_label: false,
+            label: None,
+            size: ProgressSize::Sm,
+            orientation: Some(ProgressOrientation::Vertical),
+        };
+        rt(p, |m| m.into_component("p").unwrap(), ProgressBar::try_from_component);
+    }
+
+    #[test]
+    fn progress_bar_orientation_absent_omits_key_and_decodes_none() {
+        use crate::protocol::ui::tokens::{ProgressSize, ProgressVariant};
+        let p = ProgressBar {
+            value: lit("score"),
+            max: 1.0,
+            variant: ProgressVariant::Default,
+            tone: Tone::Primary,
+            show_label: false,
+            label: None,
+            size: ProgressSize::Sm,
+            orientation: None,
+        };
+        let c = p.clone().into_component("p").unwrap();
+        // Key 7 must be absent so horizontal bars keep byte-identical payloads.
+        assert!(c.fields.0.iter().all(|(k, _)| *k != 7), "orientation key must be omitted");
+        assert_eq!(ProgressBar::try_from_component(&c).unwrap().orientation, None);
     }
 
     #[test]

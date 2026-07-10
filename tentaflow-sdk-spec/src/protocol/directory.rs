@@ -32,6 +32,10 @@ pub struct DirectoryUserOut {
     pub groups: Vec<String>,
     #[n(5)]
     pub is_active: bool,
+    /// Organization RBAC role (`user_accounts.role`): `user` | `power_user` |
+    /// `admin`. Backs the sharing UI role chip; permission lists stay host-side.
+    #[n(6)]
+    pub role: String,
 }
 
 /// Output of `directory_users_v1`.
@@ -131,6 +135,7 @@ mod tests {
                 email: Some("jan@example.com".into()),
                 groups: vec!["g-1".into(), "g-2".into()],
                 is_active: true,
+                role: "admin".into(),
             }],
         });
         roundtrip(&DirectoryUsersOutput::default());
