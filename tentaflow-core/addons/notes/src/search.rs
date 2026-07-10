@@ -33,6 +33,17 @@ pub const MAX_NARROW_SUGGESTIONS: usize = 3;
 pub const ANSWER_SOURCES: usize = 4;
 /// Content prefix (chars) of one source in the answer prompt.
 const ANSWER_SOURCE_CHARS: usize = 2_500;
+/// "Ostatnie 90 dni" window in seconds (mockup n05 recency filter chip).
+const RECENT_WINDOW_SECS: i64 = 90 * 86_400;
+
+/// The `created_at` cutoff for the recency filter, or `None` when off.
+fn recent_cutoff(recent: bool) -> Option<i64> {
+    if recent {
+        Some(db::now_unix() - RECENT_WINDOW_SECS)
+    } else {
+        None
+    }
+}
 
 // =============================================================================
 // Result model
@@ -65,6 +76,10 @@ pub struct SearchHit {
     pub owner_user_id: String,
     /// Widest-share scope of the note ("private" | "user" | "group" | "org").
     pub scope: String,
+    /// True when the reader owns the note (scope badge "Moje").
+    pub is_owner: bool,
+    /// Group display name when group-scoped and resolvable (scope badge).
+    pub group_name: Option<String>,
     /// Display score 0..100 (similarity for vector, link heuristic for graph,
     /// occurrence weight for text).
     pub percent: i64,
@@ -284,6 +299,29 @@ fn partial_marker_suffix_len(s: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Which engines a query runs, decided by the two alias tiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchTier {
+    /// No llm alias — pure LIKE, no answer card ("tekstowo").
+    TextOnly,
+    /// llm bound, embeddings not — graph + text fusion, answer card, no
+    /// "wektorowo" badge.
+    GraphText,
+    /// Both bound — vector + graph fusion, answer card.
+    VectorGraph,
+}
+
+/// Pure tier selector (unit-tested); mirrors the branch order of `run_hybrid`.
+pub fn search_tier(llm_ready: bool, embeddings_ready: bool) -> SearchTier {
+    if !llm_ready {
+        SearchTier::TextOnly
+    } else if !embeddings_ready {
+        SearchTier::GraphText
+    } else {
+        SearchTier::VectorGraph
+    }
+}
+
 // =============================================================================
 // Engine
 // =============================================================================
@@ -305,22 +343,29 @@ pub fn run_hybrid(
     query: &str,
     scope: &str,
     narrow: Option<&str>,
+    recent: bool,
 ) -> Result<SearchOutput, String> {
     let terms = tokenize_query(query);
     if query.trim().is_empty() {
         return Ok(SearchOutput::default());
     }
+    let cutoff = recent_cutoff(recent);
 
-    if !analysis::auto_graph_ready() {
-        return text_search(ctx, query, scope, &terms);
+    match search_tier(analysis::llm_ready(), analysis::embeddings_ready()) {
+        // Tier 1 missing → pure LIKE fallback, no answer card.
+        SearchTier::TextOnly => return text_search(ctx, query, scope, &terms, cutoff),
+        // Tier 2 missing → graph + text hybrid (still an answer card, just no
+        // vector similarity / "wektorowo" badge).
+        SearchTier::GraphText => return graph_text_search(ctx, query, scope, &terms, narrow, cutoff),
+        SearchTier::VectorGraph => {}
     }
 
     // --- Vector engine (over-fetch, then ACL) -----------------------------
     let vector_ranked_raw = match analysis::embed_query(query) {
         Ok(vector) => analysis::query_note_vectors(&vector, VECTOR_OVERFETCH_K)?,
-        // A bound but unreachable embeddings model degrades to text search
+        // A bound but unreachable embeddings model degrades to graph + text
         // instead of an error page.
-        Err(_) => return text_search(ctx, query, scope, &terms),
+        Err(_) => return graph_text_search(ctx, query, scope, &terms, narrow, cutoff),
     };
 
     // --- Graph engine (visible entities only) ------------------------------
@@ -333,7 +378,7 @@ pub fn run_hybrid(
             candidate_ids.push(c.note_id.clone());
         }
     }
-    let mut meta = db::search_notes_meta(ctx, &candidate_ids, scope)?;
+    let mut meta = db::search_notes_meta(ctx, &candidate_ids, scope, cutoff)?;
 
     // Narrow filter: keep only notes connected to the chosen entity.
     if let Some(entity_id) = narrow {
@@ -390,6 +435,8 @@ pub fn run_hybrid(
             title: m.title.clone(),
             snippet: extract_snippet(&m.content, &terms, SNIPPET_WORDS),
             updated_at: m.updated_at,
+            is_owner: m.owner_user_id == ctx.user_id,
+            group_name: m.group_name.clone(),
             owner_user_id: m.owner_user_id.clone(),
             scope: m.scope.clone(),
             percent: (score.clamp(0.0, 1.0) * 100.0).round() as i64,
@@ -413,8 +460,9 @@ fn text_search(
     query: &str,
     scope: &str,
     terms: &[String],
+    cutoff: Option<i64>,
 ) -> Result<SearchOutput, String> {
-    let rows = db::text_search_notes(ctx, scope, query)?;
+    let rows = db::text_search_notes(ctx, scope, query, cutoff)?;
     let mut scored: Vec<(db::SearchNoteMeta, f64)> = rows
         .into_iter()
         .map(|m| {
@@ -434,6 +482,8 @@ fn text_search(
             note_id: m.id,
             title: m.title,
             updated_at: m.updated_at,
+            is_owner: m.owner_user_id == ctx.user_id,
+            group_name: m.group_name,
             owner_user_id: m.owner_user_id,
             scope: m.scope,
             content: m.content,
@@ -444,6 +494,99 @@ fn text_search(
         hits,
         entities,
         text_fallback: true,
+    })
+}
+
+/// Graph + text hybrid used when the llm alias is bound but the embeddings
+/// alias is not: the graph engine (entity → note walk) is fused with the LIKE
+/// text engine through RRF. No vector similarity, so no "wektorowo" badge — a
+/// hit is either `Graph` (walked) or `Text` (LIKE). The answer card still
+/// streams (llm is available), so `text_fallback` stays false.
+fn graph_text_search(
+    ctx: &UserCtx,
+    query: &str,
+    scope: &str,
+    terms: &[String],
+    narrow: Option<&str>,
+    cutoff: Option<i64>,
+) -> Result<SearchOutput, String> {
+    let graph_candidates = graph_walk(ctx, terms)?;
+    let text_rows = db::text_search_notes(ctx, scope, query, cutoff)?;
+
+    let mut candidate_ids: Vec<String> = text_rows.iter().map(|m| m.id.clone()).collect();
+    for c in &graph_candidates {
+        if !candidate_ids.iter().any(|id| id == &c.note_id) {
+            candidate_ids.push(c.note_id.clone());
+        }
+    }
+    let mut meta = db::search_notes_meta(ctx, &candidate_ids, scope, cutoff)?;
+    if let Some(entity_id) = narrow {
+        let connected = db::notes_connected_to_entity(ctx, entity_id)?;
+        meta.retain(|id, _| connected.iter().any(|c| c == id));
+    }
+
+    let mut text_scored: Vec<(String, f64)> = text_rows
+        .iter()
+        .filter(|m| meta.contains_key(&m.id))
+        .map(|m| (m.id.clone(), text_match_score(&m.title, &m.content, terms).max(1.0)))
+        .collect();
+    text_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let text_max = text_scored.first().map(|(_, s)| *s).unwrap_or(1.0);
+
+    let graph_ranked: Vec<String> = graph_candidates
+        .iter()
+        .filter(|c| meta.contains_key(&c.note_id))
+        .map(|c| c.note_id.clone())
+        .collect();
+    let text_ranked: Vec<String> = text_scored.iter().map(|(id, _)| id.clone()).collect();
+
+    let fused = rrf_fuse(&[graph_ranked, text_ranked], RRF_K);
+
+    let mut hits: Vec<SearchHit> = Vec::new();
+    for (note_id, _) in fused.into_iter().take(MAX_RESULTS) {
+        let Some(m) = meta.get(&note_id) else { continue };
+        let graph_hit = graph_candidates.iter().find(|c| c.note_id == note_id);
+        let (method, score) = match graph_hit {
+            Some(g) => (
+                Method::Graph {
+                    hops: g.hops,
+                    entity: g.entity_name.clone(),
+                    via: g
+                        .via_note_id
+                        .as_ref()
+                        .and_then(|via| meta.get(via).map(|vm| vm.title.clone())),
+                },
+                g.score,
+            ),
+            None => {
+                let raw = text_scored
+                    .iter()
+                    .find(|(id, _)| id == &note_id)
+                    .map(|(_, s)| *s)
+                    .unwrap_or(1.0);
+                (Method::Text, raw / text_max)
+            }
+        };
+        hits.push(SearchHit {
+            note_id: note_id.clone(),
+            title: m.title.clone(),
+            snippet: extract_snippet(&m.content, terms, SNIPPET_WORDS),
+            updated_at: m.updated_at,
+            is_owner: m.owner_user_id == ctx.user_id,
+            group_name: m.group_name.clone(),
+            owner_user_id: m.owner_user_id.clone(),
+            scope: m.scope.clone(),
+            percent: (score.clamp(0.0, 1.0) * 100.0).round() as i64,
+            method,
+            content: m.content.clone(),
+        });
+    }
+
+    let entities = rail_entities(ctx, &hits);
+    Ok(SearchOutput {
+        hits,
+        entities,
+        text_fallback: false,
     })
 }
 
@@ -536,6 +679,17 @@ fn rail_entities(ctx: &UserCtx, hits: &[SearchHit]) -> Vec<RailEntity> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_tier_reflects_both_alias_levels() {
+        // No llm → text-only, whatever embeddings do.
+        assert_eq!(search_tier(false, false), SearchTier::TextOnly);
+        assert_eq!(search_tier(false, true), SearchTier::TextOnly);
+        // llm but no embeddings → graph + text (still an answer card).
+        assert_eq!(search_tier(true, false), SearchTier::GraphText);
+        // Both → full vector + graph hybrid.
+        assert_eq!(search_tier(true, true), SearchTier::VectorGraph);
+    }
 
     #[test]
     fn tokenize_drops_short_tokens_and_dedups() {

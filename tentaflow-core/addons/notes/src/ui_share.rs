@@ -24,7 +24,7 @@ use tentaflow_addon_sdk::ui_v1::{
     Value as CborValue,
 };
 use tentaflow_addon_sdk::{
-    directory_groups, directory_users, state_get, state_set, StateTier,
+    directory_groups, directory_org, directory_users, state_get, state_set, StateTier,
 };
 
 use crate::db::{self, ShareEntry, UserCtx};
@@ -57,6 +57,8 @@ pub(crate) struct DraftEntry {
     pub sub: String,
     /// "read" | "write".
     pub access: String,
+    /// RBAC role of a user entry (`user`|`power_user`|`admin`); empty for groups.
+    pub role: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -78,7 +80,7 @@ fn suggestions_key() -> String {
 }
 
 fn entry_to_json(e: &DraftEntry) -> JsonValue {
-    json!({"id": e.id, "name": e.name, "sub": e.sub, "access": e.access})
+    json!({"id": e.id, "name": e.name, "sub": e.sub, "access": e.access, "role": e.role})
 }
 
 fn entry_from_json(v: &JsonValue) -> DraftEntry {
@@ -87,6 +89,7 @@ fn entry_from_json(v: &JsonValue) -> DraftEntry {
         name: v["name"].as_str().unwrap_or("").to_string(),
         sub: v["sub"].as_str().unwrap_or("").to_string(),
         access: v["access"].as_str().unwrap_or("read").to_string(),
+        role: v["role"].as_str().unwrap_or("").to_string(),
     }
 }
 
@@ -133,6 +136,8 @@ pub(crate) struct Suggestion {
     pub id: String,
     pub name: String,
     pub sub: String,
+    /// RBAC role of a user suggestion; empty for groups.
+    pub role: String,
 }
 
 /// Directory row inputs of the suggestion filter (kept dumb so the filter is
@@ -141,6 +146,47 @@ pub(crate) struct DirUserRow {
     pub id: String,
     pub name: String,
     pub email: String,
+    pub role: String,
+}
+
+/// Polish label for an RBAC role shown next to a person (mockup n03 role chip).
+pub(crate) fn role_label_pl(role: &str) -> String {
+    match role {
+        "admin" => "org_admin".to_string(),
+        "power_user" => "power user".to_string(),
+        _ => "użytkownik".to_string(),
+    }
+}
+
+/// Splits `name` into (before, match, after) around the first case-insensitive
+/// occurrence of `query`, so the matched span can render bold/accented as
+/// separate structural Text nodes (never markup in a string). No match →
+/// everything lands in `before`.
+pub(crate) fn highlight_split(name: &str, query: &str) -> (String, String, String) {
+    let q = query.trim();
+    if q.is_empty() {
+        return (name.to_string(), String::new(), String::new());
+    }
+    let name_lc = name.to_lowercase();
+    let q_lc = q.to_lowercase();
+    match name_lc.find(&q_lc) {
+        // Lowercasing can shift byte lengths (e.g. some non-Latin scripts), so
+        // the lowercase indices may not be char boundaries in the original.
+        // Fall back to no-highlight rather than risk a slice panic.
+        Some(byte_idx) => {
+            let end = byte_idx + q_lc.len();
+            if name.is_char_boundary(byte_idx) && name.is_char_boundary(end) {
+                (
+                    name[..byte_idx].to_string(),
+                    name[byte_idx..end].to_string(),
+                    name[end..].to_string(),
+                )
+            } else {
+                (name.to_string(), String::new(), String::new())
+            }
+        }
+        None => (name.to_string(), String::new(), String::new()),
+    }
 }
 
 pub(crate) struct DirGroupRow {
@@ -174,6 +220,7 @@ pub(crate) fn filter_suggestions(
                 id: u.id.clone(),
                 name: u.name.clone(),
                 sub: u.email.clone(),
+                role: u.role.clone(),
             });
             if out.len() >= SUGGESTION_ROWS {
                 return out;
@@ -190,6 +237,7 @@ pub(crate) fn filter_suggestions(
                 id: g.id.clone(),
                 name: g.name.clone(),
                 sub: group_member_label(g.member_count),
+                role: String::new(),
             });
             if out.len() >= SUGGESTION_ROWS {
                 return out;
@@ -199,12 +247,28 @@ pub(crate) fn filter_suggestions(
     out
 }
 
-/// "8 osób · grupa organizacyjna"-style member line of a group row.
+/// "8 osób · grupa organizacyjna"-style member line of a group row (mockup n03).
 pub(crate) fn group_member_label(count: u64) -> String {
     format!(
-        "{count} {}",
+        "{count} {} · grupa organizacyjna",
         db::plural_pl(count as usize, "osoba", "osoby", "osób")
     )
+}
+
+/// Org-share toggle label (mockup n03): names the organization when the
+/// directory resolves it, otherwise a bare "Cała organizacja". Pure.
+pub(crate) fn org_toggle_label(org_name: Option<&str>) -> String {
+    match org_name {
+        Some(name) if !name.trim().is_empty() => {
+            format!("Cała organizacja {} — tylko odczyt", name.trim())
+        }
+        _ => "Cała organizacja — tylko odczyt".to_string(),
+    }
+}
+
+/// "Grupy (N)" section header label with the live count of shared groups.
+pub(crate) fn group_section_label(count: usize) -> String {
+    format!("Grupy ({count})")
 }
 
 /// Footer summary: "Udostępniasz: 3 osoby · 1 grupa · cała organizacja".
@@ -287,13 +351,19 @@ pub(crate) fn share_button(note_id: &str, shares: &[ShareEntry]) -> Component {
                 icon: crate::ui::icon(IconName::Users),
             },
         };
+        // Initials sources auto-color from their text (B2); the group icon
+        // keeps an explicit Info tone.
+        let tone = match s.subject_type.as_str() {
+            "user" => None,
+            _ => Some(Tone::Info),
+        };
         avatars.push(
             Avatar {
                 source,
                 size: AvatarSize::Sm,
                 shape: AvatarShape::Circle,
                 status: None,
-                tone: Some(Tone::Primary),
+                tone,
             }
             .into_component(format!("share-av-{i}"))
             .expect("Avatar encode"),
@@ -360,6 +430,7 @@ pub(crate) fn share_modal_component() -> Component {
         dismissible: true,
         prevent_scroll: true,
         closable: true,
+        icon: Some(crate::ui::icon(IconName::Share)),
     }
     .into_component("share-modal")
     .expect("Modal encode");
@@ -412,6 +483,22 @@ fn suggestion_row(i: usize) -> Component {
         &sug_path(i, "is_group"),
     );
 
+    // Name with the matched query span accent-colored (E3): three bound Text
+    // pieces, so the highlight is structural — never markup inside a string.
+    let name_line = Cluster {
+        gap: ui::Spacing::Zero,
+        align: FlexAlign::Center,
+        justify: FlexJustify::Start,
+        children: vec![
+            crate::ui::text_c(&format!("sug-{i}-npre"), bound(&sug_path(i, "npre")), TextStyle::BodyStrong, None),
+            crate::ui::text_c(&format!("sug-{i}-nmark"), bound(&sug_path(i, "nmark")), TextStyle::BodyStrong, Some(Tone::Primary)),
+            crate::ui::text_c(&format!("sug-{i}-npost"), bound(&sug_path(i, "npost")), TextStyle::BodyStrong, None),
+        ],
+        wrap: Some(true),
+    }
+    .into_component(format!("sug-{i}-nameline"))
+    .expect("Cluster encode");
+
     let name_block = ui::Box {
         width: None,
         grow: Some(true),
@@ -419,7 +506,7 @@ fn suggestion_row(i: usize) -> Component {
         padding: None,
         margin: None,
         children: vec![
-            crate::ui::text_c(&format!("sug-{i}-name"), bound(&sug_path(i, "name")), TextStyle::BodyStrong, None),
+            name_line,
             crate::ui::text_c(&format!("sug-{i}-sub"), bound(&sug_path(i, "sub")), TextStyle::Caption, Some(Tone::Muted)),
         ],
         style: None,
@@ -445,15 +532,19 @@ fn suggestion_row(i: usize) -> Component {
     .into_component(format!("sug-{i}-type"))
     .expect("Chip encode");
 
+    // Row 0 is always the top match (the filter fills rows top-down), so it
+    // carries the "selected card" look (accent border + tinted background) via
+    // the shared Filled+accent-primary styling — mockup n03 first-suggestion.
+    let highlight = i == 0;
     let mut card = Card {
-        variant: CardVariant::Outlined,
+        variant: if highlight { CardVariant::Filled } else { CardVariant::Outlined },
         padding: ui::Spacing::Sm,
         gap: ui::Spacing::Xs,
         radius: ui::RadiusToken::Md,
         shadow: ShadowToken::None,
         border: ui::BorderToken::Hairline,
         background: ui::BackgroundToken::Subtle,
-        accent: None,
+        accent: if highlight { Some(Tone::Primary) } else { None },
         children: vec![Cluster {
             gap: ui::Spacing::Sm,
             align: FlexAlign::Center,
@@ -489,7 +580,9 @@ fn share_row(idx: usize, subject_type: &str, e: &DraftEntry, is_new: bool) -> Co
             size: AvatarSize::Sm,
             shape: AvatarShape::Circle,
             status: None,
-            tone: Some(Tone::Primary),
+            // No explicit tone → the renderer derives a deterministic color
+            // from the initials (B2), so people read as distinct chips.
+            tone: None,
         }
     } else {
         Avatar {
@@ -511,6 +604,23 @@ fn share_row(idx: usize, subject_type: &str, e: &DraftEntry, is_new: bool) -> Co
         TextStyle::BodyStrong,
         None,
     )];
+    // RBAC role chip next to a person's name (mockup n03). org_admin stands out.
+    if subject_type == "user" && !e.role.is_empty() {
+        name_row_children.push(
+            Chip {
+                variant: ChipVariant::Soft,
+                tone: if e.role == "admin" { Tone::Warning } else { Tone::Neutral },
+                label: lit(role_label_pl(&e.role)),
+                icon: None,
+                avatar: None,
+                selected: None,
+                removable: false,
+                dot: None,
+            }
+            .into_component(format!("shr-{subject_type}-{idx}-role"))
+            .expect("Chip encode"),
+        );
+    }
     if is_new {
         name_row_children.push(
             Chip {
@@ -715,7 +825,11 @@ fn body_fragment(draft: &ShareDraft) -> (Component, Vec<StateEntry>) {
         children.push(share_row(i, "user", u, is_new));
     }
 
-    children.push(section_label("share-sec-groups", IconName::Users, "Grupy"));
+    children.push(section_label(
+        "share-sec-groups",
+        IconName::Users,
+        &group_section_label(draft.groups.len()),
+    ));
     if draft.groups.is_empty() {
         children.push(crate::ui::text_c(
             "share-groups-empty",
@@ -730,9 +844,10 @@ fn body_fragment(draft: &ShareDraft) -> (Component, Vec<StateEntry>) {
     }
 
     children.push(section_label("share-sec-org", IconName::Users, "Organizacja"));
+    let org_name = directory_org().ok().map(|o| o.name);
     let mut org_toggle = Toggle {
         bind_path: state_path(SP_ORG),
-        label: Some(lit("Cała organizacja — tylko odczyt")),
+        label: Some(lit(org_toggle_label(org_name.as_deref()))),
         hint: None,
         size: ToggleSize::Md,
         tone: Tone::Primary,
@@ -938,7 +1053,7 @@ fn suggestion_reset_entries() -> Vec<StateEntry> {
                 value,
             });
         }
-        for field in ["name", "sub", "type"] {
+        for field in ["npre", "nmark", "npost", "sub", "type"] {
             out.push(StateEntry {
                 path: state_path(&sug_path(i, field)),
                 value: CborValue::Text(String::new()),
@@ -1026,7 +1141,7 @@ pub(crate) fn action_share_open(ctx: &UserCtx, params: &JsonValue) -> JsonValue 
     for s in &shares {
         match s.subject_type.as_str() {
             "user" => {
-                let (name, sub) = users
+                let (name, sub, role) = users
                     .iter()
                     .find(|u| u.id == s.subject_id)
                     .map(|u| {
@@ -1035,14 +1150,15 @@ pub(crate) fn action_share_open(ctx: &UserCtx, params: &JsonValue) -> JsonValue 
                         } else {
                             u.display_name.clone()
                         };
-                        (name, u.email.clone().unwrap_or_default())
+                        (name, u.email.clone().unwrap_or_default(), u.role.clone())
                     })
-                    .unwrap_or_else(|| (s.subject_id.clone(), String::new()));
+                    .unwrap_or_else(|| (s.subject_id.clone(), String::new(), String::new()));
                 draft.users.push(DraftEntry {
                     id: s.subject_id.clone(),
                     name,
                     sub,
                     access: s.access.clone(),
+                    role,
                 });
             }
             "group" => {
@@ -1056,6 +1172,7 @@ pub(crate) fn action_share_open(ctx: &UserCtx, params: &JsonValue) -> JsonValue 
                     name,
                     sub,
                     access: s.access.clone(),
+                    role: String::new(),
                 });
             }
             "org" => draft.org_read = true,
@@ -1098,6 +1215,7 @@ pub(crate) fn action_share_suggest(ctx: &UserCtx, params: &JsonValue) -> JsonVal
                 u.display_name
             },
             email: u.email.unwrap_or_default(),
+            role: u.role,
         })
         .collect();
     let groups: Vec<DirGroupRow> = directory_groups()
@@ -1123,7 +1241,7 @@ pub(crate) fn action_share_suggest(ctx: &UserCtx, params: &JsonValue) -> JsonVal
     // Persist for share_pick (index → subject) in the session KV.
     let stored: Vec<JsonValue> = suggestions
         .iter()
-        .map(|s| json!({"is_group": s.is_group, "id": s.id, "name": s.name, "sub": s.sub}))
+        .map(|s| json!({"is_group": s.is_group, "id": s.id, "name": s.name, "sub": s.sub, "role": s.role}))
         .collect();
     let _ = state_set(
         &suggestions_key(),
@@ -1142,7 +1260,10 @@ pub(crate) fn action_share_suggest(ctx: &UserCtx, params: &JsonValue) -> JsonVal
                 ops.push(set(sug_path(i, "vis"), CborValue::Bool(true)));
                 ops.push(set(sug_path(i, "is_user"), CborValue::Bool(!s.is_group)));
                 ops.push(set(sug_path(i, "is_group"), CborValue::Bool(s.is_group)));
-                ops.push(set(sug_path(i, "name"), CborValue::Text(s.name.clone())));
+                let (pre, mark, post) = highlight_split(&s.name, query);
+                ops.push(set(sug_path(i, "npre"), CborValue::Text(pre)));
+                ops.push(set(sug_path(i, "nmark"), CborValue::Text(mark)));
+                ops.push(set(sug_path(i, "npost"), CborValue::Text(post)));
                 ops.push(set(sug_path(i, "sub"), CborValue::Text(s.sub.clone())));
                 ops.push(set(
                     sug_path(i, "type"),
@@ -1179,6 +1300,7 @@ pub(crate) fn action_share_pick(_ctx: &UserCtx, params: &JsonValue) -> JsonValue
         name: picked["name"].as_str().unwrap_or("").to_string(),
         sub: picked["sub"].as_str().unwrap_or("").to_string(),
         access: "read".to_string(),
+        role: picked["role"].as_str().unwrap_or("").to_string(),
     };
     if entry.id.is_empty() {
         return json!({"ok": false, "error": "Nieprawidłowa podpowiedź."});
@@ -1285,16 +1407,19 @@ mod tests {
                 id: "u1".into(),
                 name: "Piotr Jarocki".into(),
                 email: "piotr@ex.pl".into(),
+                role: "admin".into(),
             },
             DirUserRow {
                 id: "u2".into(),
                 name: "Marta Wiśniewska".into(),
                 email: "marta.wisniewska@ex.pl".into(),
+                role: "user".into(),
             },
             DirUserRow {
                 id: "u3".into(),
                 name: "Marek Kowal".into(),
                 email: "marek.kowal@ex.pl".into(),
+                role: "power_user".into(),
             },
         ]
     }
@@ -1355,12 +1480,14 @@ mod tests {
                 name: "Marta".into(),
                 sub: String::new(),
                 access: "write".into(),
+                role: "user".into(),
             }],
             groups: vec![DraftEntry {
                 id: "g2".into(),
                 name: "R&D".into(),
                 sub: String::new(),
                 access: "read".into(),
+                role: String::new(),
             }],
             org_read: true,
             last_added: String::new(),
@@ -1379,9 +1506,73 @@ mod tests {
     }
 
     #[test]
-    fn group_member_label_pluralizes() {
-        assert_eq!(group_member_label(1), "1 osoba");
-        assert_eq!(group_member_label(3), "3 osoby");
-        assert_eq!(group_member_label(12), "12 osób");
+    fn group_member_label_pluralizes_with_org_group_suffix() {
+        assert_eq!(group_member_label(1), "1 osoba · grupa organizacyjna");
+        assert_eq!(group_member_label(3), "3 osoby · grupa organizacyjna");
+        assert_eq!(group_member_label(12), "12 osób · grupa organizacyjna");
+    }
+
+    #[test]
+    fn org_toggle_label_names_the_organization_when_known() {
+        assert_eq!(
+            org_toggle_label(Some("Euvic")),
+            "Cała organizacja Euvic — tylko odczyt"
+        );
+        assert_eq!(
+            org_toggle_label(None),
+            "Cała organizacja — tylko odczyt"
+        );
+        assert_eq!(
+            org_toggle_label(Some("   ")),
+            "Cała organizacja — tylko odczyt"
+        );
+    }
+
+    #[test]
+    fn group_section_label_carries_the_count() {
+        assert_eq!(group_section_label(0), "Grupy (0)");
+        assert_eq!(group_section_label(3), "Grupy (3)");
+    }
+
+    #[test]
+    fn role_labels_map_to_polish() {
+        assert_eq!(role_label_pl("admin"), "org_admin");
+        assert_eq!(role_label_pl("power_user"), "power user");
+        assert_eq!(role_label_pl("user"), "użytkownik");
+        // Unknown roles degrade to the plain-user label.
+        assert_eq!(role_label_pl("whatever"), "użytkownik");
+    }
+
+    #[test]
+    fn suggestions_carry_user_role_and_empty_for_groups() {
+        let s = filter_suggestions(&users(), &groups(), "mar", &[], &[], "u1");
+        // "Marta Wiśniewska" (user), "Marek Kowal" (power_user), "Marketing" (group).
+        assert_eq!(s[0].role, "user");
+        assert_eq!(s[1].role, "power_user");
+        assert!(s[2].is_group);
+        assert!(s[2].role.is_empty());
+    }
+
+    #[test]
+    fn highlight_split_matches_prefix_case_insensitively() {
+        assert_eq!(
+            highlight_split("Marta Wiśniewska", "mar"),
+            ("".into(), "Mar".into(), "ta Wiśniewska".into())
+        );
+        // Match in the middle keeps the surrounding text.
+        assert_eq!(
+            highlight_split("Zespół R&D", "R&D"),
+            ("Zespół ".into(), "R&D".into(), "".into())
+        );
+        // No match → everything in the prefix, nothing highlighted.
+        assert_eq!(
+            highlight_split("Anna", "xyz"),
+            ("Anna".into(), "".into(), "".into())
+        );
+        // Empty query → no highlight.
+        assert_eq!(
+            highlight_split("Anna", "  "),
+            ("Anna".into(), "".into(), "".into())
+        );
     }
 }

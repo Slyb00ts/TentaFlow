@@ -419,6 +419,18 @@ pub fn entity_link_weight(shared_count: usize) -> f64 {
     0.45 + 0.15 * (shared_count.saturating_sub(1).min(3) as f64)
 }
 
+/// Link kinds a save re-materializes. `similar` edges are a product of the
+/// embeddings tier — when it is off (`rebuild_similar = false`) they are
+/// preserved verbatim and only `entity` edges are rebuilt, so a temporary
+/// notes-embeddings outage never wipes the semantic link graph.
+pub fn managed_link_kinds(rebuild_similar: bool) -> &'static [&'static str] {
+    if rebuild_similar {
+        &["similar", "entity"]
+    } else {
+        &["entity"]
+    }
+}
+
 fn value_f64(v: &SqlValue) -> Option<f64> {
     match v {
         SqlValue::F64(f) => Some(*f),
@@ -564,14 +576,42 @@ fn call_extraction_llm(text: &str) -> Result<String, String> {
     )
 }
 
-/// True when both model aliases of the pipeline are bound to a model — the
-/// topbar shows "Auto-graf aktywny" vs a configure-aliases warning.
-pub fn auto_graph_ready() -> bool {
-    [EMBED_ALIAS, LLM_ALIAS].iter().all(|alias| {
-        alias_get(alias)
-            .map(|info| info.is_active && !info.current_target.is_empty())
-            .unwrap_or(false)
-    })
+/// True when the alias is bound to an active, non-empty target.
+fn alias_active(alias: &str) -> bool {
+    alias_get(alias)
+        .map(|info| info.is_active && !info.current_target.is_empty())
+        .unwrap_or(false)
+}
+
+/// Real target name behind an active alias (empty when unbound) — used to
+/// label the answer stream / model pill with the actual model, never a
+/// hardcoded name.
+pub fn alias_target(alias: &str) -> Option<String> {
+    alias_get(alias)
+        .ok()
+        .filter(|info| info.is_active && !info.current_target.is_empty())
+        .map(|info| info.current_target)
+}
+
+/// Real target name behind the notes-llm alias (for the search-view model
+/// pill / streaming chip), or None when the alias is not bound.
+pub fn llm_target() -> Option<String> {
+    alias_target(LLM_ALIAS)
+}
+
+/// Tier 1 gate: the notes-llm alias is bound to a model. Enables entity
+/// extraction, the mention / co-occurrence graph, text + graph search and the
+/// streamed LLM answer card — all WITHOUT embeddings.
+pub fn llm_ready() -> bool {
+    alias_active(LLM_ALIAS)
+}
+
+/// Tier 2 gate: the notes-embeddings alias is bound. On top of the llm tier it
+/// enables chunk / entity embedding, vector similarity (`similar_to` edges),
+/// the "wektorowo" badge and embedding-based entity merge. Its absence is a
+/// soft downgrade (text + graph only), never a hard error.
+pub fn embeddings_ready() -> bool {
+    alias_active(EMBED_ALIAS)
 }
 
 /// Model alias used by the search view for the streamed answer synthesis.
@@ -680,6 +720,14 @@ pub fn process_queue(budget: usize) -> Vec<String> {
         }
     };
 
+    // Live-note analysis needs the notes-llm alias (entity extraction). Without
+    // it, live notes stay queued — no attempt is spent — until the admin binds
+    // the alias; a tombstone cleanup needs no model and always runs.
+    let llm = llm_ready();
+    if !llm {
+        log::info("notes: analysis deferred — notes-llm alias not bound (tombstones still run)");
+    }
+
     let mut processed = Vec::new();
     for row in &rows {
         let note_id = row
@@ -691,6 +739,9 @@ pub fn process_queue(budget: usize) -> Vec<String> {
         let deleted = row.get(2).and_then(|v| v.as_i64()).is_some()
             || row.get(3).and_then(|v| v.as_i64()).unwrap_or(0) == 1;
         if note_id.is_empty() {
+            continue;
+        }
+        if !deleted && !llm {
             continue;
         }
 
@@ -759,58 +810,73 @@ fn analyze_note(note_id: &str) -> Result<(), String> {
         format!("{title}\n\n{content}")
     };
 
-    // --- 1. Chunk + embed into the 'notes' namespace ---------------------
-    let mut chunks = split_into_chunks(&full_text, CHUNK_MAX_CHARS, CHUNK_OVERLAP_CHARS);
-    chunks.truncate(MAX_CHUNKS_PER_NOTE);
-    let dim = if chunks.is_empty() { 0 } else { ensure_embed_dim()? };
+    // Embeddings are the second tier: when notes-embeddings is unbound the
+    // whole vector path (chunk embed, similar_to edges, entity-merge-by-kNN) is
+    // skipped WITHOUT touching already-registered vectors — a later analysis
+    // with the alias bound backfills them. The llm tier (entities + graph) runs
+    // regardless (the caller only reaches analyze_note when llm_ready).
+    let do_vectors = embeddings_ready();
 
-    // High-water mark FIRST: if the analysis dies after some upserts, the
-    // vectors above the registered range are still covered by
-    // max_chunk_count, so the tombstone cleanup can purge them.
-    sql_exec(
-        "INSERT INTO note_chunks (note_id, chunk_count, max_chunk_count, updated_at) \
-         VALUES (?, 0, ?, ?) \
-         ON CONFLICT(note_id) DO UPDATE SET \
-           max_chunk_count = MAX(max_chunk_count, excluded.max_chunk_count), \
-           updated_at = excluded.updated_at",
-        &[
-            SqlValue::String(note_id.to_string()),
-            SqlValue::I64(chunks.len() as i64),
-            SqlValue::I64(now),
-        ],
-    )
-    .map_err(|e| format!("chunk high-water mark: {e}"))?;
+    // --- 1. Chunk + embed into the 'notes' namespace (vector tier only) ---
+    let mut chunk_vectors: Vec<Vec<f32>> = Vec::new();
+    let mut chunks_len = 0usize;
+    let mut old_count = 0usize;
+    if do_vectors {
+        let mut chunks = split_into_chunks(&full_text, CHUNK_MAX_CHARS, CHUNK_OVERLAP_CHARS);
+        chunks.truncate(MAX_CHUNKS_PER_NOTE);
+        let dim = if chunks.is_empty() { 0 } else { ensure_embed_dim()? };
 
-    let mut chunk_vectors: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
-    for (i, chunk) in chunks.iter().enumerate() {
-        let vector = embed_text(chunk, dim)?;
-        let fields = vec![
-            VectorField {
-                name: "note_id".to_string(),
-                value: VectorFieldValue::Str(note_id.to_string()),
-            },
-            VectorField {
-                name: "owner_id".to_string(),
-                value: VectorFieldValue::Str(owner_id.clone()),
-            },
-            VectorField {
-                name: "chunk_index".to_string(),
-                value: VectorFieldValue::Int(i as i64),
-            },
-        ];
-        vector_upsert(NOTES_NS, note_chunk_ref(note_id, i), &vector, &fields)
-            .map_err(|e| format!("chunk vector upsert {i}: {e}"))?;
-        chunk_vectors.push(vector);
+        // High-water mark FIRST: if the analysis dies after some upserts, the
+        // vectors above the registered range are still covered by
+        // max_chunk_count, so the tombstone cleanup can purge them.
+        sql_exec(
+            "INSERT INTO note_chunks (note_id, chunk_count, max_chunk_count, updated_at) \
+             VALUES (?, 0, ?, ?) \
+             ON CONFLICT(note_id) DO UPDATE SET \
+               max_chunk_count = MAX(max_chunk_count, excluded.max_chunk_count), \
+               updated_at = excluded.updated_at",
+            &[
+                SqlValue::String(note_id.to_string()),
+                SqlValue::I64(chunks.len() as i64),
+                SqlValue::I64(now),
+            ],
+        )
+        .map_err(|e| format!("chunk high-water mark: {e}"))?;
+
+        chunk_vectors.reserve(chunks.len());
+        for (i, chunk) in chunks.iter().enumerate() {
+            let vector = embed_text(chunk, dim)?;
+            let fields = vec![
+                VectorField {
+                    name: "note_id".to_string(),
+                    value: VectorFieldValue::Str(note_id.to_string()),
+                },
+                VectorField {
+                    name: "owner_id".to_string(),
+                    value: VectorFieldValue::Str(owner_id.clone()),
+                },
+                VectorField {
+                    name: "chunk_index".to_string(),
+                    value: VectorFieldValue::Int(i as i64),
+                },
+            ];
+            vector_upsert(NOTES_NS, note_chunk_ref(note_id, i), &vector, &fields)
+                .map_err(|e| format!("chunk vector upsert {i}: {e}"))?;
+            chunk_vectors.push(vector);
+        }
+        chunks_len = chunks.len();
+
+        // Shrunk content: stale chunk vectors are deleted through the outbox.
+        old_count = sql_query_one(
+            "SELECT chunk_count FROM note_chunks WHERE note_id = ?",
+            &[SqlValue::String(note_id.to_string())],
+        )
+        .map_err(|e| format!("note_chunks read: {e}"))?
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0) as usize;
+    } else {
+        log::info("notes: embeddings tier skipped — notes-embeddings alias not bound");
     }
-
-    // Shrunk content: stale chunk vectors are deleted through the outbox.
-    let old_count = sql_query_one(
-        "SELECT chunk_count FROM note_chunks WHERE note_id = ?",
-        &[SqlValue::String(note_id.to_string())],
-    )
-    .map_err(|e| format!("note_chunks read: {e}"))?
-    .and_then(|r| r.first().and_then(|v| v.as_i64()))
-    .unwrap_or(0) as usize;
 
     // --- 2. Extract entities ----------------------------------------------
     let extract_input: String = full_text.chars().take(MAX_EXTRACT_CHARS).collect();
@@ -876,51 +942,66 @@ fn analyze_note(note_id: &str) -> Result<(), String> {
             ],
         ));
     }
-    stmts.push((
-        "INSERT INTO note_chunks (note_id, chunk_count, max_chunk_count, updated_at) \
-         VALUES (?, ?, ?, ?) \
-         ON CONFLICT(note_id) DO UPDATE SET \
-           chunk_count = excluded.chunk_count, \
-           max_chunk_count = MAX(max_chunk_count, excluded.max_chunk_count), \
-           updated_at = excluded.updated_at"
-            .to_string(),
-        vec![
-            SqlValue::String(note_id.to_string()),
-            SqlValue::I64(chunks.len() as i64),
-            SqlValue::I64(chunks.len() as i64),
-            SqlValue::I64(now),
-        ],
-    ));
-    // Shrink: stale chunk vectors are deleted through the outbox. The payload
-    // carries (note_id, chunk_index) so the drain can skip the delete when a
-    // later grow re-registered the same ref_id (shrink→grow race).
-    for i in chunks.len()..old_count {
-        push_outbox(
-            &mut stmts,
-            "vector_delete",
-            &outbox_dedup_key("vector_delete", &[NOTES_NS, note_id, &i.to_string()]),
-            json!({
-                "ns": NOTES_NS,
-                "ref": note_chunk_ref(note_id, i),
-                "note_id": note_id,
-                "chunk_index": i,
-            }),
-            now,
-        );
+    // The chunk registry is rewritten only when the vector tier ran — without
+    // embeddings we must NOT reset chunk_count to 0 (that would make the
+    // tombstone / shrink logic think the note has no live vectors).
+    if do_vectors {
+        stmts.push((
+            "INSERT INTO note_chunks (note_id, chunk_count, max_chunk_count, updated_at) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(note_id) DO UPDATE SET \
+               chunk_count = excluded.chunk_count, \
+               max_chunk_count = MAX(max_chunk_count, excluded.max_chunk_count), \
+               updated_at = excluded.updated_at"
+                .to_string(),
+            vec![
+                SqlValue::String(note_id.to_string()),
+                SqlValue::I64(chunks_len as i64),
+                SqlValue::I64(chunks_len as i64),
+                SqlValue::I64(now),
+            ],
+        ));
+        // Shrink: stale chunk vectors are deleted through the outbox. The
+        // payload carries (note_id, chunk_index) so the drain can skip the
+        // delete when a later grow re-registered the same ref_id (shrink→grow
+        // race).
+        for i in chunks_len..old_count {
+            push_outbox(
+                &mut stmts,
+                "vector_delete",
+                &outbox_dedup_key("vector_delete", &[NOTES_NS, note_id, &i.to_string()]),
+                json!({
+                    "ns": NOTES_NS,
+                    "ref": note_chunk_ref(note_id, i),
+                    "note_id": note_id,
+                    "chunk_index": i,
+                }),
+                now,
+            );
+        }
     }
     run_transaction(&stmts).map_err(|e| format!("entity persist: {e}"))?;
 
-    // --- 4. Merge-candidate scan for new entities --------------------------
-    for (eid, name, etype) in &new_entity_rows {
-        if let Err(e) = scan_merge_candidates(eid, name, etype, now) {
-            // Best-effort: a failed scan must not fail the whole analysis;
-            // the entity stays unmerged and a later note can re-trigger it.
-            log::warn(&format!("notes: merge scan for '{name}' failed: {e}"));
+    // --- 4. Merge-candidate scan for new entities (vector tier only) -------
+    if do_vectors {
+        for (eid, name, etype) in &new_entity_rows {
+            if let Err(e) = scan_merge_candidates(eid, name, etype, now) {
+                // Best-effort: a failed scan must not fail the whole analysis;
+                // the entity stays unmerged and a later note can re-trigger it.
+                log::warn(&format!("notes: merge scan for '{name}' failed: {e}"));
+            }
         }
     }
 
     // --- 5. Note links: semantic similarity + shared entities -------------
-    let similar = similar_notes(note_id, &chunk_vectors)?;
+    // `similar_to` edges are a vector product; without embeddings the existing
+    // ones are LEFT INTACT (rebuild_similar = false) so a temporary alias
+    // outage does not wipe the semantic link graph.
+    let similar = if do_vectors {
+        similar_notes(note_id, &chunk_vectors)?
+    } else {
+        Vec::new()
+    };
     let entity_links = shared_entity_links(note_id)?;
     persist_links_and_graph(
         note_id,
@@ -928,6 +1009,7 @@ fn analyze_note(note_id: &str) -> Result<(), String> {
         &old_entity_ids,
         &similar,
         &entity_links,
+        do_vectors,
         now,
     )?;
 
@@ -1083,12 +1165,24 @@ fn persist_links_and_graph(
     old_entities: &[(String, String, String)],
     similar: &[(String, f32)],
     entity_links: &[(String, usize, String)],
+    rebuild_similar: bool,
     now: i64,
 ) -> Result<(), String> {
+    // Which link kinds this pass rewrites. When the embeddings tier is off,
+    // `similar` links are preserved verbatim — only `entity` links are rebuilt.
+    let managed_kinds = managed_link_kinds(rebuild_similar);
+    let kinds_in = managed_kinds
+        .iter()
+        .map(|k| format!("'{k}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     // Old auto links touching this note (created_at preservation + edge deletes).
     let old_rows = sql_query(
-        "SELECT src_note_id, dst_note_id, kind, created_at FROM note_links \
-         WHERE (src_note_id = ? OR dst_note_id = ?) AND kind IN ('similar', 'entity')",
+        &format!(
+            "SELECT src_note_id, dst_note_id, kind, created_at FROM note_links \
+             WHERE (src_note_id = ? OR dst_note_id = ?) AND kind IN ({kinds_in})"
+        ),
         &[
             SqlValue::String(note_id.to_string()),
             SqlValue::String(note_id.to_string()),
@@ -1124,9 +1218,10 @@ fn persist_links_and_graph(
 
     let mut stmts: Vec<(String, Vec<SqlValue>)> = Vec::new();
     stmts.push((
-        "DELETE FROM note_links WHERE (src_note_id = ? OR dst_note_id = ?) \
-         AND kind IN ('similar', 'entity')"
-            .to_string(),
+        format!(
+            "DELETE FROM note_links WHERE (src_note_id = ? OR dst_note_id = ?) \
+             AND kind IN ({kinds_in})"
+        ),
         vec![
             SqlValue::String(note_id.to_string()),
             SqlValue::String(note_id.to_string()),
@@ -2264,6 +2359,17 @@ mod tests {
     }
 
     // --- merge thresholds -----------------------------------------------------
+
+    // --- tiered auto-graph gate ---------------------------------------------
+
+    #[test]
+    fn managed_link_kinds_preserve_similar_without_embeddings() {
+        // Full tier (embeddings on) rebuilds both kinds.
+        assert_eq!(managed_link_kinds(true), &["similar", "entity"]);
+        // Llm-only tier leaves `similar` edges untouched — only `entity` is
+        // rewritten, so an embeddings outage can't wipe semantic links.
+        assert_eq!(managed_link_kinds(false), &["entity"]);
+    }
 
     #[test]
     fn merge_band_thresholds() {

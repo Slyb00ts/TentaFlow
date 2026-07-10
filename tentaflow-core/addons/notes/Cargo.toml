@@ -20,6 +20,11 @@ minicbor = { version = "2.2", default-features = false, features = ["alloc"] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 
+[dev-dependencies]
+# Native-only: exercises the pure SQL string builders + their bind-param order
+# against a real in-memory SQLite (host fns are unavailable on the test target).
+rusqlite = { version = "0.31", features = ["bundled"] }
+
 [profile.release]
 opt-level = "s"
 lto = true

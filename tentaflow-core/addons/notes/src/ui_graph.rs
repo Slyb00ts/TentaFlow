@@ -1021,7 +1021,7 @@ pub fn graph_view_component() -> Component {
     .expect("Flex encode");
 
     let mut children: Vec<Component> = Vec::new();
-    if !analysis::auto_graph_ready() {
+    if !analysis::llm_ready() {
         children.push(
             Callout {
                 tone: Tone::Warning,
@@ -1030,14 +1030,35 @@ pub fn graph_view_component() -> Component {
                 content: vec![text_c(
                     "g-ready-text",
                     lit(
-                        "Skonfiguruj aliasy notes-embeddings i notes-llm w ustawieniach \
-                         addonu, aby uruchomić auto-graf.",
+                        "Skonfiguruj alias notes-llm w ustawieniach addonu, aby uruchomić \
+                         auto-graf (encje i powiązania).",
                     ),
                     TextStyle::Caption,
                     None,
                 )],
             }
             .into_component("g-ready-callout")
+            .expect("Callout encode"),
+        );
+    } else if !analysis::embeddings_ready() {
+        // Soft downgrade: the graph is built from mentions / co-occurrence;
+        // only vector similarity edges wait for the embeddings alias.
+        children.push(
+            Callout {
+                tone: Tone::Info,
+                icon: Some(icon(IconName::Sparkle)),
+                title: None,
+                content: vec![text_c(
+                    "g-embeddings-text",
+                    lit(
+                        "Podłącz alias notes-embeddings, aby dodać do grafu krawędzie \
+                         podobieństwa wektorowego między notatkami.",
+                    ),
+                    TextStyle::Caption,
+                    None,
+                )],
+            }
+            .into_component("g-embeddings-callout")
             .expect("Callout encode"),
         );
     }
@@ -1342,7 +1363,11 @@ fn detail_note(ctx: &UserCtx, view: &GraphView, note_id: &str) -> Component {
         gap: Spacing::Sm,
         align: FlexAlign::Center,
         justify: FlexJustify::Start,
-        children: vec![author, created, scope_badge("g-d-scope", &note.scope)],
+        children: vec![
+            author,
+            created,
+            scope_badge("g-d-scope", note.is_owner, &note.scope, note.group_name.as_deref()),
+        ],
         wrap: Some(true),
     }
     .into_component("g-d-meta")

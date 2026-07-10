@@ -35,6 +35,8 @@ pub const SP_QUERY: &str = "search.query";
 pub const SP_SCOPE: &str = "search.scope";
 const SP_ANSWER: &str = "search.answer";
 const SP_STREAMING: &str = "search.streaming";
+/// "Ostatnie 90 dni" recency chip selected flag.
+const SP_RECENT: &str = "search.recent";
 
 // Streaming bounds (translator pattern): per-batch wait, wall-clock deadline
 // and a consecutive-empty-batch cap so a stalled backend cannot pin the
@@ -94,7 +96,32 @@ pub(crate) fn initial_search_state() -> Vec<StateEntry> {
             path: state_path(SP_STREAMING),
             value: CborValue::Bool(false),
         },
+        StateEntry {
+            path: state_path(SP_RECENT),
+            value: CborValue::Bool(false),
+        },
     ]
+}
+
+/// Model pill (mockup n05 top-right): the REAL notes-llm target name with a
+/// live-status dot. Absent when the alias is unbound — never a hardcoded name.
+/// Lives in the shell topbar (same row as the mode switch), not the hero.
+pub(crate) fn model_pill() -> Option<Component> {
+    let model = analysis::llm_target()?;
+    Some(
+        Chip {
+            variant: ChipVariant::Soft,
+            tone: Tone::Neutral,
+            label: lit(model),
+            icon: None,
+            avatar: None,
+            selected: None,
+            removable: false,
+            dot: Some(Tone::Success),
+        }
+        .into_component("search-model-pill")
+        .expect("Chip encode"),
+    )
 }
 
 /// The hero: prominent search box (Enter/blur commits → run_search) and the
@@ -137,13 +164,41 @@ pub(crate) fn search_hero_component() -> Component {
     .expect("FilterChips encode");
     chips.handlers = Some(backend(EventKind::Change, "search_scope"));
 
+    // Standalone recency toggle after the scope chips (mockup n05): a real
+    // filter — its selected state binds to SP_RECENT and drives run_search.
+    let mut recent_chip = Chip {
+        variant: ChipVariant::Soft,
+        tone: Tone::Neutral,
+        label: lit("Ostatnie 90 dni"),
+        icon: Some(crate::ui::icon(IconName::Clock)),
+        avatar: None,
+        selected: Some(bound(SP_RECENT)),
+        removable: false,
+        dot: None,
+    }
+    .into_component("search-recent-chip")
+    .expect("Chip encode");
+    recent_chip.handlers = Some(backend(EventKind::Click, "search_recent_toggle"));
+
+    let filters = Cluster {
+        gap: ui::Spacing::Sm,
+        align: FlexAlign::Center,
+        justify: FlexJustify::Start,
+        children: vec![chips, recent_chip],
+        wrap: Some(true),
+    }
+    .into_component("search-filters")
+    .expect("Cluster encode");
+
+    let children: Vec<Component> = vec![big_search, filters];
+
     ui::Box {
         width: None,
         grow: None,
         align_self: None,
         padding: None,
         margin: None,
-        children: vec![big_search, chips],
+        children,
         style: None,
         direction: Some(FlexDirection::Column),
         gap: Some(ui::Spacing::Sm),
@@ -295,7 +350,12 @@ fn result_card(index: usize, hit: &SearchHit) -> Component {
         align: FlexAlign::Center,
         justify: FlexJustify::Start,
         children: vec![
-            crate::ui::scope_badge(&format!("{id}-scope"), &hit.scope),
+            crate::ui::scope_badge(
+                &format!("{id}-scope"),
+                hit.is_owner,
+                &hit.scope,
+                hit.group_name.as_deref(),
+            ),
             date,
             crate::ui::text_c(
                 &format!("{id}-author"),
@@ -342,10 +402,10 @@ fn result_card(index: usize, hit: &SearchHit) -> Component {
     .into_component(format!("{id}-left"))
     .expect("Box encode");
 
-    // Score column: method badge + horizontal bar + percent (the mockup's
-    // vertical bar has no token equivalent; phones use this layout anyway).
+    // Score column (mockup n05 desktop): method badge on top, below it a
+    // vertical fill bar (grows bottom→top) with the percent to its right.
     let bar = ui::Box {
-        width: Some(DimensionToken::Px { value: 64 }),
+        width: Some(DimensionToken::Px { value: 6 }),
         grow: None,
         align_self: None,
         padding: None,
@@ -358,25 +418,29 @@ fn result_card(index: usize, hit: &SearchHit) -> Component {
             show_label: false,
             label: None,
             size: ui::ProgressSize::Sm,
+            orientation: Some(ui::ProgressOrientation::Vertical),
         }
         .into_component(format!("{id}-bar"))
         .expect("ProgressBar encode")],
-        style: None,
+        style: Some(ui::BoxStyle {
+            width: Some(DimensionToken::Px { value: 6 }),
+            height: Some(DimensionToken::Px { value: 46 }),
+            ..Default::default()
+        }),
         direction: Some(FlexDirection::Column),
         gap: None,
         align: Some(FlexAlign::Stretch),
-        justify: Some(FlexJustify::Center),
+        justify: Some(FlexJustify::End),
         responsive: None,
     }
     .into_component(format!("{id}-barwrap"))
     .expect("Box encode");
 
-    let score = Cluster {
+    let bar_row = Cluster {
         gap: ui::Spacing::Sm,
         align: FlexAlign::Center,
         justify: FlexJustify::End,
         children: vec![
-            method_badge(&format!("{id}-method"), &hit.method),
             bar,
             crate::ui::text_c(
                 &format!("{id}-pct"),
@@ -387,8 +451,36 @@ fn result_card(index: usize, hit: &SearchHit) -> Component {
         ],
         wrap: Some(false),
     }
-    .into_component(format!("{id}-score"))
+    .into_component(format!("{id}-barrow"))
     .expect("Cluster encode");
+
+    let score = ui::Box {
+        width: None,
+        grow: None,
+        align_self: None,
+        padding: None,
+        margin: None,
+        children: vec![method_badge(&format!("{id}-method"), &hit.method), bar_row],
+        style: None,
+        direction: Some(FlexDirection::Column),
+        gap: Some(ui::Spacing::Sm),
+        align: Some(FlexAlign::End),
+        justify: Some(FlexJustify::Center),
+        responsive: Some(vec![ui::ResponsiveRule {
+            max_width: ui::ContainerWidth::Px(600),
+            direction: Some(FlexDirection::Row),
+            gap: Some(ui::Spacing::Sm),
+            align: Some(FlexAlign::Center),
+            justify: Some(FlexJustify::SpaceBetween),
+            padding: None,
+            min_height: None,
+            order: None,
+            hidden: None,
+            width: Some(DimensionToken::Full),
+        }]),
+    }
+    .into_component(format!("{id}-score"))
+    .expect("Box encode");
 
     let mut card = Card {
         variant: CardVariant::Outlined,
@@ -439,6 +531,18 @@ fn result_card(index: usize, hit: &SearchHit) -> Component {
     card
 }
 
+/// Citation pill label for source `index` (0-based): a bracketed number that
+/// mirrors the inline `[n]` markers the LLM emits in the answer body, followed
+/// by the source title. Pure — unit-tested.
+fn citation_label(index: usize, title: &str) -> String {
+    let title = if title.trim().is_empty() {
+        "(bez tytułu)"
+    } else {
+        title.trim()
+    };
+    format!("[{}] {title}", index + 1)
+}
+
 /// The streamed answer card: overline header + streaming chip, a bound Text
 /// with the semantic streaming caret, and the numbered source chips (klik →
 /// otwiera notatkę).
@@ -449,11 +553,18 @@ fn answer_card(sources: &[&SearchHit]) -> Component {
         TextStyle::Overline,
         Some(Tone::Primary),
     );
+    // Streaming chip labels with the REAL notes-llm target (mockup shows a
+    // sample model — never hardcode it). Falls back to a bare "streaming" when
+    // the alias target can't be resolved.
+    let streaming_label = match analysis::llm_target() {
+        Some(model) => format!("streaming · {model}"),
+        None => "streaming".to_string(),
+    };
     let streaming_chip = crate::ui::with_visible_bound(
         Chip {
             variant: ChipVariant::Soft,
             tone: Tone::Primary,
-            label: lit("streaming"),
+            label: lit(streaming_label),
             icon: None,
             avatar: None,
             selected: None,
@@ -500,20 +611,15 @@ fn answer_card(sources: &[&SearchHit]) -> Component {
         Some(Tone::Muted),
     )];
     for (i, hit) in sources.iter().enumerate() {
-        let title = if hit.title.is_empty() {
-            "(bez tytułu)".to_string()
-        } else {
-            hit.title.clone()
-        };
         let mut cite = Chip {
-            variant: ChipVariant::Outline,
-            tone: Tone::Neutral,
-            label: lit(format!("{} {title}", i + 1)),
+            variant: ChipVariant::Soft,
+            tone: Tone::Primary,
+            label: lit(citation_label(i, &hit.title)),
             icon: None,
             avatar: None,
             selected: None,
             removable: false,
-            dot: Some(Tone::Primary),
+            dot: None,
         }
         .into_component(format!("ans-cite-{i}"))
         .expect("Chip encode");
@@ -539,7 +645,7 @@ fn answer_card(sources: &[&SearchHit]) -> Component {
         padding: ui::Spacing::Md,
         gap: ui::Spacing::Sm,
         radius: ui::RadiusToken::Lg,
-        shadow: ShadowToken::AccentGlow,
+        shadow: ShadowToken::None,
         border: ui::BorderToken::Accent {
             tone: Tone::Primary,
         },
@@ -548,7 +654,13 @@ fn answer_card(sources: &[&SearchHit]) -> Component {
         children: vec![head, body, sources_row],
         interactive: false,
         clickable: false,
-        style: None,
+        // The accent-glow halo is applied through the BoxStyle `style` path,
+        // which the Card renderer maps via applyBoxStyle (var(--tf-glow-accent)).
+        // The Card `shadow` prop enum does not carry accent_glow.
+        style: Some(ui::BoxStyle {
+            shadow: Some(ShadowToken::AccentGlow),
+            ..Default::default()
+        }),
     }
     .into_component("answer-card")
     .expect("Card encode")
@@ -911,7 +1023,7 @@ pub(crate) fn run_search(ctx: &UserCtx) -> JsonValue {
 
     let generation = bump_generation();
 
-    let output = match search::run_hybrid(ctx, &query, &scope, narrow) {
+    let output = match search::run_hybrid(ctx, &query, &scope, narrow, sess.s_recent) {
         Ok(o) => o,
         Err(e) => {
             crate::ui::send_slot(
@@ -1086,6 +1198,21 @@ pub(crate) fn action_search_narrow(ctx: &UserCtx, params: &JsonValue) -> JsonVal
     run_search(ctx)
 }
 
+/// Toggles the "Ostatnie 90 dni" recency filter and re-runs the search.
+pub(crate) fn action_search_recent_toggle(ctx: &UserCtx) -> JsonValue {
+    let mut sess = crate::ui::load_session();
+    sess.s_recent = !sess.s_recent;
+    crate::ui::store_session(&sess);
+    // Reflect the new chip state immediately (the hero is not re-rendered).
+    crate::ui::send_state_patch(vec![PatchOp {
+        path: state_path(SP_RECENT),
+        op: PatchOpKind::Set {
+            value: CborValue::Bool(sess.s_recent),
+        },
+    }]);
+    run_search(ctx)
+}
+
 pub(crate) fn action_search_narrow_clear(ctx: &UserCtx) -> JsonValue {
     let mut sess = crate::ui::load_session();
     sess.s_narrow.clear();
@@ -1098,4 +1225,17 @@ pub(crate) fn action_search_narrow_clear(ctx: &UserCtx) -> JsonValue {
 /// flow as the graph detail rail).
 pub(crate) fn action_search_open_note(ctx: &UserCtx, params: &JsonValue) -> JsonValue {
     crate::ui::open_note_from_other_view(ctx, params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::citation_label;
+
+    #[test]
+    fn citation_label_is_bracketed_one_based_and_titled() {
+        assert_eq!(citation_label(0, "Plan rollbacku"), "[1] Plan rollbacku");
+        assert_eq!(citation_label(2, "  spacje  "), "[3] spacje");
+        // Mirrors the inline [n] markers the LLM emits in the answer body.
+        assert_eq!(citation_label(0, ""), "[1] (bez tytułu)");
+    }
 }

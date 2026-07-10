@@ -97,7 +97,7 @@ fn handle_search(ctx: &UserCtx, input: &JsonValue) -> JsonValue {
         .unwrap_or(8)
         .clamp(1, 12) as usize;
 
-    match search::run_hybrid(ctx, &query, scope, None) {
+    match search::run_hybrid(ctx, &query, scope, None, false) {
         Ok(output) => {
             let results: Vec<JsonValue> = output
                 .hits

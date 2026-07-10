@@ -7,8 +7,8 @@
 // =============================================================================
 
 use tentaflow_addon_sdk::{
-    directory_org, directory_users, log, sql_exec, sql_query, sql_query_one, sql_transaction,
-    SqlValue,
+    directory_groups, directory_org, directory_users, log, sql_exec, sql_query, sql_query_one,
+    sql_transaction, SqlValue,
 };
 
 // =============================================================================
@@ -280,6 +280,11 @@ pub struct NoteSummary {
     pub updated_at: i64,
     /// "private" | "user" | "group" | "org" — widest share on the note.
     pub scope: String,
+    /// True when the reader owns the note (drives the "Moje" scope badge).
+    pub is_owner: bool,
+    /// Display name of the group the note is shared with, when group-scoped and
+    /// resolvable through the directory (drives "Grupa · {name}").
+    pub group_name: Option<String>,
     /// Top detected entities as (name, entity_type), capped for card chips.
     pub entities: Vec<(String, String)>,
 }
@@ -294,6 +299,8 @@ pub struct NoteDetail {
     pub created_at: i64,
     pub tags: Vec<String>,
     pub scope: String,
+    /// Group display name when group-scoped and resolvable (scope badge).
+    pub group_name: Option<String>,
     /// Share rows of the note (avatar group on the share button; the modal
     /// re-reads them fresh on open).
     pub shares: Vec<ShareEntry>,
@@ -314,7 +321,9 @@ pub fn list_notes(ctx: &UserCtx, scope: &str, search: &str) -> Result<Vec<NoteSu
             WHEN EXISTS (SELECT 1 FROM note_shares x WHERE x.note_id = n.id AND x.subject_type = 'org') THEN 'org' \
             WHEN EXISTS (SELECT 1 FROM note_shares x WHERE x.note_id = n.id AND x.subject_type = 'group') THEN 'group' \
             WHEN EXISTS (SELECT 1 FROM note_shares x WHERE x.note_id = n.id AND x.subject_type = 'user') THEN 'user' \
-            ELSE 'private' END) \
+            ELSE 'private' END), \
+         n.owner_user_id, \
+         (SELECT g.subject_id FROM note_shares g WHERE g.note_id = n.id AND g.subject_type = 'group' LIMIT 1) \
          FROM notes n WHERE n.deleted_at IS NULL AND {acl}{scope_sql}"
     );
     let mut params = acl_params(ctx);
@@ -350,11 +359,52 @@ pub fn list_notes(ctx: &UserCtx, scope: &str, search: &str) -> Result<Vec<NoteSu
                 .and_then(|v| v.as_str())
                 .unwrap_or("private")
                 .to_string(),
+            is_owner: row.get(5).and_then(|v| v.as_str()) == Some(ctx.user_id.as_str()),
+            group_name: row
+                .get(6)
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             entities: Vec::new(),
         })
         .collect();
+    resolve_group_names(notes.iter_mut().map(|n| (&n.scope, &mut n.group_name)));
     attach_card_entities(ctx, &mut notes);
     Ok(notes)
+}
+
+/// Directory group id → display name. One host call; empty on failure (badge
+/// degrades to a bare "Grupa"). Used to turn the group subject id carried on a
+/// note into the readable name shown on the scope badge.
+pub fn group_name_map() -> std::collections::HashMap<String, String> {
+    directory_groups()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|g| (g.id, g.name))
+        .collect()
+}
+
+/// Replaces each `group_name` slot (currently holding the group SUBJECT ID) with
+/// the resolved group display name, but only for group-scoped notes. Non-group
+/// notes have their slot cleared so a stray group share never labels them. Skips
+/// the directory call entirely when no note is group-scoped.
+fn resolve_group_names<'a>(
+    notes: impl Iterator<Item = (&'a String, &'a mut Option<String>)>,
+) {
+    let items: Vec<(&String, &mut Option<String>)> = notes.collect();
+    if !items.iter().any(|(scope, _)| scope.as_str() == "group") {
+        for (_, slot) in items {
+            *slot = None;
+        }
+        return;
+    }
+    let map = group_name_map();
+    for (scope, slot) in items {
+        if scope.as_str() == "group" {
+            *slot = slot.as_ref().and_then(|id| map.get(id).cloned());
+        } else {
+            *slot = None;
+        }
+    }
 }
 
 /// Entities shown on a list card (mockup n01 micro-chips with colored dots).
@@ -366,7 +416,10 @@ const CARD_ENTITY_LIMIT: usize = 3;
 /// `entity_visibility_sql` (correlated on `c.id` instead of a placeholder), so
 /// a merge never leaks a canonical name that originated in a note the reader
 /// cannot access. Pure — unit-tested natively.
-/// Placeholders: note ids, then `acl_params` (for the visibility EXISTS).
+/// Placeholder ORDER follows the SQL text: the visibility `EXISTS` lives in the
+/// SELECT list, so its `acl_params` come FIRST, then the `WHERE ne.note_id IN`
+/// ids. Callers MUST bind `acl_params` before the note ids (see
+/// `card_entities_params`).
 pub fn card_entities_sql(note_count: usize, group_count: usize) -> String {
     let visibility =
         entity_visibility_sql(group_count).replace("ne.entity_id = ?", "ne.entity_id = c.id");
@@ -382,6 +435,17 @@ pub fn card_entities_sql(note_count: usize, group_count: usize) -> String {
          ORDER BY ne.note_id, ne.count DESC",
         placeholders(note_count)
     )
+}
+
+/// Bind params for `card_entities_sql` in SQL-text order: `acl_params` for the
+/// SELECT-clause visibility `EXISTS` FIRST, then the note ids of the `IN`
+/// clause. Binding the ids first (the intuitive but wrong order) makes SQLite
+/// feed note ids into the ACL owner/user slots and shift the `IN` list, so only
+/// one note ever matches — that was the empty search right-rail bug.
+pub fn card_entities_params(ctx: &UserCtx, note_ids: &[String]) -> Vec<SqlValue> {
+    let mut params = acl_params(ctx);
+    params.extend(note_ids.iter().map(|id| SqlValue::String(id.clone())));
+    params
 }
 
 /// Name shown on a card chip: the canonical (merged) name only when the
@@ -406,11 +470,8 @@ fn attach_card_entities(ctx: &UserCtx, notes: &mut [NoteSummary]) {
         return;
     }
     let sql = card_entities_sql(notes.len(), ctx.group_ids.len());
-    let mut params: Vec<SqlValue> = notes
-        .iter()
-        .map(|n| SqlValue::String(n.id.clone()))
-        .collect();
-    params.extend(acl_params(ctx));
+    let note_ids: Vec<String> = notes.iter().map(|n| n.id.clone()).collect();
+    let params = card_entities_params(ctx, &note_ids);
     let rows = match sql_query(&sql, &params) {
         Ok(r) => r,
         // Card chips are decoration — a failed lookup must not break the list.
@@ -516,6 +577,17 @@ pub fn get_note(ctx: &UserCtx, note_id: &str) -> Result<Option<NoteDetail>, Stri
                 }
         });
 
+    let scope = widest_scope(&share_rows);
+    // Resolve the group name only when the badge will actually show a group.
+    let group_name = if scope == "group" {
+        share_rows
+            .iter()
+            .find(|(t, _, _)| t == "group")
+            .and_then(|(_, gid, _)| group_name_map().get(gid).cloned())
+    } else {
+        None
+    };
+
     Ok(Some(NoteDetail {
         title: row
             .get(1)
@@ -528,7 +600,8 @@ pub fn get_note(ctx: &UserCtx, note_id: &str) -> Result<Option<NoteDetail>, Stri
             .unwrap_or("")
             .to_string(),
         created_at: row.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
-        scope: widest_scope(&share_rows),
+        group_name,
+        scope,
         shares: share_rows
             .iter()
             .map(|(t, s, a)| ShareEntry {
@@ -1123,11 +1196,7 @@ pub fn graph_mentions(ctx: &UserCtx, note_ids: &[String]) -> Vec<GraphMentionRow
         return Vec::new();
     }
     let sql = card_entities_sql(note_ids.len(), ctx.group_ids.len());
-    let mut params: Vec<SqlValue> = note_ids
-        .iter()
-        .map(|id| SqlValue::String(id.clone()))
-        .collect();
-    params.extend(acl_params(ctx));
+    let params = card_entities_params(ctx, note_ids);
     let rows = match sql_query(&sql, &params) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
@@ -1220,6 +1289,9 @@ pub struct SearchNoteMeta {
     pub owner_user_id: String,
     /// Widest share on the note ("private" | "user" | "group" | "org").
     pub scope: String,
+    /// Group display name when group-scoped and resolvable (scope badge). Holds
+    /// the raw group subject id until `search_notes_meta` resolves the names.
+    pub group_name: Option<String>,
 }
 
 fn search_meta_from_row(row: &[SqlValue]) -> Option<SearchNoteMeta> {
@@ -1234,6 +1306,7 @@ fn search_meta_from_row(row: &[SqlValue]) -> Option<SearchNoteMeta> {
             .and_then(|v| v.as_str())
             .unwrap_or("private")
             .to_string(),
+        group_name: row.get(6).and_then(|v| v.as_str()).map(str::to_string),
     })
 }
 
@@ -1243,7 +1316,8 @@ const SEARCH_META_COLUMNS: &str = "n.id, n.title, substr(n.content, 1, 4000), n.
         WHEN EXISTS (SELECT 1 FROM note_shares x WHERE x.note_id = n.id AND x.subject_type = 'org') THEN 'org' \
         WHEN EXISTS (SELECT 1 FROM note_shares x WHERE x.note_id = n.id AND x.subject_type = 'group') THEN 'group' \
         WHEN EXISTS (SELECT 1 FROM note_shares x WHERE x.note_id = n.id AND x.subject_type = 'user') THEN 'user' \
-        ELSE 'private' END)";
+        ELSE 'private' END), \
+     (SELECT g.subject_id FROM note_shares g WHERE g.note_id = n.id AND g.subject_type = 'group' LIMIT 1)";
 
 /// Accessible-set filter of the search candidates: the returned map contains
 /// ONLY live notes passing acl_read + the scope chip. Candidates absent here
@@ -1252,6 +1326,7 @@ pub fn search_notes_meta(
     ctx: &UserCtx,
     candidate_ids: &[String],
     scope: &str,
+    recent_cutoff: Option<i64>,
 ) -> Result<std::collections::HashMap<String, SearchNoteMeta>, String> {
     let mut out = std::collections::HashMap::new();
     if candidate_ids.is_empty() {
@@ -1259,9 +1334,14 @@ pub fn search_notes_meta(
     }
     let acl = acl_read_clause(ctx.group_ids.len());
     let (scope_sql, scope_params) = scope_clause(scope, ctx);
+    let recent_sql = if recent_cutoff.is_some() {
+        " AND n.created_at >= ?"
+    } else {
+        ""
+    };
     let sql = format!(
         "SELECT {SEARCH_META_COLUMNS} FROM notes n \
-         WHERE n.id IN ({}) AND n.deleted_at IS NULL AND {acl}{scope_sql}",
+         WHERE n.id IN ({}) AND n.deleted_at IS NULL AND {acl}{scope_sql}{recent_sql}",
         placeholders(candidate_ids.len())
     );
     let mut params: Vec<SqlValue> = candidate_ids
@@ -1270,12 +1350,16 @@ pub fn search_notes_meta(
         .collect();
     params.extend(acl_params(ctx));
     params.extend(scope_params);
+    if let Some(cutoff) = recent_cutoff {
+        params.push(SqlValue::I64(cutoff));
+    }
     let rows = sql_query(&sql, &params).map_err(|e| format!("Błąd odczytu wyników: {e}"))?;
     for r in &rows {
         if let Some(meta) = search_meta_from_row(r) {
             out.insert(meta.id.clone(), meta);
         }
     }
+    resolve_group_names(out.values_mut().map(|m| (&m.scope, &mut m.group_name)));
     Ok(out)
 }
 
@@ -1285,22 +1369,33 @@ pub fn text_search_notes(
     ctx: &UserCtx,
     scope: &str,
     query: &str,
+    recent_cutoff: Option<i64>,
 ) -> Result<Vec<SearchNoteMeta>, String> {
     let acl = acl_read_clause(ctx.group_ids.len());
     let (scope_sql, scope_params) = scope_clause(scope, ctx);
+    let recent_sql = if recent_cutoff.is_some() {
+        " AND n.created_at >= ?"
+    } else {
+        ""
+    };
     let sql = format!(
         "SELECT {SEARCH_META_COLUMNS} FROM notes n \
-         WHERE n.deleted_at IS NULL AND {acl}{scope_sql} \
+         WHERE n.deleted_at IS NULL AND {acl}{scope_sql}{recent_sql} \
          AND (n.title LIKE ? ESCAPE '\\' OR n.content LIKE ? ESCAPE '\\') \
          ORDER BY n.updated_at DESC LIMIT 30"
     );
     let mut params = acl_params(ctx);
     params.extend(scope_params);
+    if let Some(cutoff) = recent_cutoff {
+        params.push(SqlValue::I64(cutoff));
+    }
     let pattern = format!("%{}%", escape_like(query.trim()));
     params.push(SqlValue::String(pattern.clone()));
     params.push(SqlValue::String(pattern));
     let rows = sql_query(&sql, &params).map_err(|e| format!("Błąd wyszukiwania: {e}"))?;
-    Ok(rows.iter().filter_map(|r| search_meta_from_row(r)).collect())
+    let mut metas: Vec<SearchNoteMeta> = rows.iter().filter_map(|r| search_meta_from_row(r)).collect();
+    resolve_group_names(metas.iter_mut().map(|m| (&m.scope, &mut m.group_name)));
+    Ok(metas)
 }
 
 /// Canonical entities whose name matches any query token, restricted to
@@ -2035,5 +2130,89 @@ mod tests {
         assert_eq!(widest_scope(&shares[..2]), "group");
         assert_eq!(widest_scope(&shares[..1]), "user");
         assert_eq!(widest_scope(&[]), "private");
+    }
+
+    // Binds a SqlValue param onto a rusqlite statement (only the variants the
+    // card-entities query uses: text ids and integer counts).
+    fn bind(v: &SqlValue) -> rusqlite::types::Value {
+        match v {
+            SqlValue::String(s) => rusqlite::types::Value::Text(s.clone()),
+            SqlValue::I64(i) => rusqlite::types::Value::Integer(*i),
+            SqlValue::Null => rusqlite::types::Value::Null,
+            other => panic!("unexpected SqlValue in card-entities params: {other:?}"),
+        }
+    }
+
+    // Minimal seed reproducing the live notes-427b306a data: three notes owned
+    // by the reader, each with several entity mentions (none merged).
+    fn seed_card_entities_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notes (id TEXT PRIMARY KEY, owner_user_id TEXT, deleted_at INTEGER);
+             CREATE TABLE note_shares (note_id TEXT, subject_type TEXT, subject_id TEXT, access TEXT);
+             CREATE TABLE entities (id TEXT PRIMARY KEY, name TEXT, entity_type TEXT, canonical_id TEXT);
+             CREATE TABLE note_entities (note_id TEXT, entity_id TEXT, count INTEGER);
+             INSERT INTO notes VALUES ('n2','u1',NULL),('n6','u1',NULL),('n7','u1',NULL);
+             INSERT INTO entities VALUES
+               ('e_firma','Firma Sp. z o.o.','company',NULL),
+               ('e_marta','Marta Wiśniewska','person',NULL),
+               ('e_euvic','Euvic','company',NULL),
+               ('e_rnd','zespół R&D','project',NULL);
+             INSERT INTO note_entities VALUES
+               ('n2','e_firma',1),('n2','e_marta',1),
+               ('n6','e_euvic',1),('n6','e_rnd',1),('n6','e_marta',1),
+               ('n7','e_firma',1),('n7','e_euvic',1);",
+        )
+        .unwrap();
+        conn
+    }
+
+    // Executes card_entities_sql with the given bound params and returns the set
+    // of note ids that came back with at least one entity row.
+    fn notes_with_entities(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[SqlValue],
+    ) -> std::collections::BTreeSet<String> {
+        let bound: Vec<rusqlite::types::Value> = params.iter().map(bind).collect();
+        let mut stmt = conn.prepare(sql).unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(bound.iter()), |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    // Regression for the empty search right-rail: card_entities_sql puts the
+    // visibility EXISTS (with its ACL placeholders) in the SELECT list, so those
+    // '?' come BEFORE the WHERE `IN (...)` ids. Binding the note ids first shifts
+    // them into the ACL owner/user slots and only ONE note survives the IN list
+    // — leaving `graph_mentions`/`attach_card_entities` (hence the rail) empty.
+    #[test]
+    fn card_entities_returns_all_notes_only_with_correct_bind_order() {
+        let c = ctx(&[]);
+        let conn = seed_card_entities_db();
+        let ids = vec!["n2".to_string(), "n6".to_string(), "n7".to_string()];
+        let sql = card_entities_sql(ids.len(), c.group_ids.len());
+
+        // Correct order (the fix): acl_params first, then the note ids.
+        let good = card_entities_params(&c, &ids);
+        let seen = notes_with_entities(&conn, &sql, &good);
+        assert_eq!(
+            seen,
+            ["n2", "n6", "n7"].iter().map(|s| s.to_string()).collect(),
+            "every result note must contribute its entities to the rail"
+        );
+
+        // The old (buggy) order — note ids first, then acl_params — collapses to
+        // a single matching note, which is exactly the empty-rail symptom.
+        let mut bad: Vec<SqlValue> = ids.iter().map(|i| SqlValue::String(i.clone())).collect();
+        bad.extend(acl_params(&c));
+        let seen_bad = notes_with_entities(&conn, &sql, &bad);
+        assert!(
+            seen_bad.len() < 3,
+            "the pre-fix bind order must NOT return all notes (proves the regression)"
+        );
     }
 }

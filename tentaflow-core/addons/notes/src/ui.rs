@@ -160,6 +160,9 @@ pub(crate) struct Session {
     pub s_scope: String,
     pub s_narrow: String,
     pub s_narrow_name: String,
+    /// "Ostatnie 90 dni" filter chip (mockup n05): when set, results are
+    /// restricted to notes created within the last 90 days.
+    pub s_recent: bool,
     /// Share modal open for the active note (mockup n03).
     pub share_open: bool,
     // Graph view filters (mockup n02). Scope toggles / entity-type checkboxes
@@ -208,6 +211,7 @@ impl Default for Session {
             s_scope: "all".to_string(),
             s_narrow: String::new(),
             s_narrow_name: String::new(),
+            s_recent: false,
             share_open: false,
             g_mine: true,
             g_shared: true,
@@ -251,6 +255,7 @@ pub(crate) fn load_session() -> Session {
             s_scope: v["s_scope"].as_str().unwrap_or("all").to_string(),
             s_narrow: v["s_narrow"].as_str().unwrap_or("").to_string(),
             s_narrow_name: v["s_narrow_name"].as_str().unwrap_or("").to_string(),
+            s_recent: v["s_recent"].as_bool().unwrap_or(false),
             share_open: v["share_open"].as_bool().unwrap_or(false),
             g_mine: v["g_mine"].as_bool().unwrap_or(d.g_mine),
             g_shared: v["g_shared"].as_bool().unwrap_or(d.g_shared),
@@ -287,6 +292,7 @@ pub(crate) fn store_session(sess: &Session) {
         "s_scope": sess.s_scope,
         "s_narrow": sess.s_narrow,
         "s_narrow_name": sess.s_narrow_name,
+        "s_recent": sess.s_recent,
         "share_open": sess.share_open,
         "g_mine": sess.g_mine,
         "g_shared": sess.g_shared,
@@ -505,39 +511,39 @@ fn topbar() -> Component {
     .into_component("topbar-left")
     .expect("Cluster encode");
 
-    let status: Component = if analysis::auto_graph_ready() {
-        Badge {
-            variant: BadgeVariant::Soft,
-            tone: Tone::Success,
-            label: lit("Auto-graf aktywny"),
-            icon: Some(icon(IconName::Check)),
-            count: None,
-            max: 0,
-            pulse: false,
-        }
-        .into_component("topbar-status")
-        .expect("Badge encode")
+    // Three-state pill: full (llm+embeddings), llm-only (soft, no vectors) and
+    // unconfigured (hard, no llm).
+    let (tone, label, ico) = if !analysis::llm_ready() {
+        (Tone::Warning, "Auto-graf: skonfiguruj notes-llm", IconName::Warning)
+    } else if analysis::embeddings_ready() {
+        (Tone::Success, "Auto-graf aktywny", IconName::Check)
     } else {
-        Badge {
-            variant: BadgeVariant::Soft,
-            tone: Tone::Warning,
-            label: lit("Auto-graf: skonfiguruj aliasy"),
-            icon: Some(icon(IconName::Warning)),
-            count: None,
-            max: 0,
-            pulse: false,
-        }
-        .into_component("topbar-status")
-        .expect("Badge encode")
+        (Tone::Info, "Auto-graf: bez wektorów", IconName::Check)
     };
-    // Right side per view: alias-status badge (notes) vs graph counter pill.
+    let status: Component = Badge {
+        variant: BadgeVariant::Soft,
+        tone,
+        label: lit(label),
+        icon: Some(icon(ico)),
+        count: None,
+        max: 0,
+        pulse: false,
+    }
+    .into_component("topbar-status")
+    .expect("Badge encode");
+    // Right side per view: alias-status badge (notes) vs graph counter pill vs
+    // the search model pill (mockup n05: same row as the mode switch).
     let status = with_visible_bound(status, SP_VIEW_NOTES);
     let pill = with_visible_bound(crate::ui_graph::topbar_counter_pill(), SP_VIEW_GRAPH);
+    let mut right_children = vec![status, pill];
+    if let Some(model_pill) = crate::ui_search::model_pill() {
+        right_children.push(with_visible_bound(model_pill, SP_VIEW_SEARCH));
+    }
     let right = Cluster {
         gap: Spacing::Sm,
         align: FlexAlign::Center,
         justify: FlexJustify::End,
-        children: vec![status, pill],
+        children: right_children,
         wrap: Some(false),
     }
     .into_component("topbar-right")
@@ -914,13 +920,41 @@ fn list_fragment(notes: &[NoteSummary], sess: &Session) -> Component {
     .expect("Box encode")
 }
 
-pub(crate) fn scope_badge(id: &str, scope: &str) -> Component {
-    let (tone, icon_name, label) = match scope {
-        "org" => (Tone::Primary, IconName::Users, "Organizacja"),
-        "group" => (Tone::Info, IconName::Users, "Grupa"),
-        "user" => (Tone::Success, IconName::User, "Udostępniona"),
-        _ => (Tone::Neutral, IconName::User, "Prywatna"),
-    };
+/// Visual spec of the scope badge (mockup n01/n05). The reader's relation to the
+/// note drives the vocabulary, not just the widest share:
+///
+/// - org share → "Organizacja" (amber) — the broadest reach is the headline,
+/// - group share → "Grupa · {name}" (blue) — with the group name when resolved,
+/// - own note → "Moje" (green) — private OR shared-by-me,
+/// - shared to me → "Udostępnione" (neutral) — a user share from someone else.
+///
+/// Pure — unit-tested. `group_name` is only consulted for the group tone.
+pub(crate) fn scope_badge_spec(
+    is_owner: bool,
+    scope: &str,
+    group_name: Option<&str>,
+) -> (Tone, IconName, String) {
+    match scope {
+        "org" => (Tone::Warning, IconName::Users, "Organizacja".to_string()),
+        "group" => {
+            let label = match group_name {
+                Some(name) if !name.trim().is_empty() => format!("Grupa · {name}"),
+                _ => "Grupa".to_string(),
+            };
+            (Tone::Info, IconName::Users, label)
+        }
+        _ if is_owner => (Tone::Success, IconName::User, "Moje".to_string()),
+        _ => (Tone::Neutral, IconName::User, "Udostępnione".to_string()),
+    }
+}
+
+pub(crate) fn scope_badge(
+    id: &str,
+    is_owner: bool,
+    scope: &str,
+    group_name: Option<&str>,
+) -> Component {
+    let (tone, icon_name, label) = scope_badge_spec(is_owner, scope, group_name);
     Badge {
         variant: BadgeVariant::Soft,
         tone,
@@ -973,7 +1007,12 @@ fn note_card(index: usize, note: &NoteSummary, active_id: &str) -> Component {
         justify: FlexJustify::Start,
         children: vec![
             rel_time(&format!("nc-{index}-date"), note.updated_at),
-            scope_badge(&format!("nc-{index}-scope"), &note.scope),
+            scope_badge(
+                &format!("nc-{index}-scope"),
+                note.is_owner,
+                &note.scope,
+                note.group_name.as_deref(),
+            ),
         ],
         wrap: Some(true),
     }
@@ -1421,7 +1460,12 @@ fn editor_fragment(ctx: &UserCtx, n: &NoteDetail, gen: i64) -> Component {
     let share_control: Component = if n.is_owner {
         crate::ui_share::share_button(&n.id, &n.shares)
     } else {
-        scope_badge("editor-scope-badge", &n.scope)
+        scope_badge(
+            "editor-scope-badge",
+            n.is_owner,
+            &n.scope,
+            n.group_name.as_deref(),
+        )
     };
 
     let meta = Flex {
@@ -1795,17 +1839,31 @@ fn links_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
 
     // Alias misconfiguration gets ONE friendly message; raw host errors stay
     // in analysis_queue.last_error / logs and never reach the UI.
-    if !analysis::auto_graph_ready() {
+    if !analysis::llm_ready() {
         children.push(text_c(
             "analysis-status",
             lit(
-                "Skonfiguruj aliasy notes-embeddings i notes-llm w ustawieniach \
-                 addonu, aby uruchomić auto-graf.",
+                "Skonfiguruj alias notes-llm w ustawieniach addonu, aby uruchomić \
+                 auto-graf (encje, powiązania, odpowiedzi).",
             ),
             TextStyle::Caption,
             Some(Tone::Warning),
         ));
-    } else if let Some((attempts, _last_error)) = analysis::queue_state(&n.id) {
+    } else {
+        if !analysis::embeddings_ready() {
+            // Soft, non-blocking notice: the graph works, only vector
+            // similarity is off until the embeddings alias is bound.
+            children.push(text_c(
+                "analysis-embeddings-hint",
+                lit(
+                    "Podłącz alias notes-embeddings, aby włączyć podobieństwo \
+                     wektorowe między notatkami.",
+                ),
+                TextStyle::Caption,
+                Some(Tone::Info),
+            ));
+        }
+        if let Some((attempts, _last_error)) = analysis::queue_state(&n.id) {
         let status = if analysis::is_pending(attempts) {
             text_c(
                 "analysis-status",
@@ -1822,6 +1880,7 @@ fn links_fragment(ctx: &UserCtx, n: &NoteDetail) -> Component {
             )
         };
         children.push(status);
+        }
     }
 
     let related_section: Component = if related.is_empty() {
@@ -2056,6 +2115,7 @@ fn related_card(index: usize, r: &db::RelatedNote, now: i64) -> Component {
             show_label: false,
             label: None,
             size: ui::ProgressSize::Sm,
+            orientation: None,
         }
         .into_component(format!("rel-{index}-bar"))
         .expect("ProgressBar encode")],
@@ -2365,6 +2425,7 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
         "search_scope" => crate::ui_search::action_search_scope(&ctx, params),
         "search_narrow" => crate::ui_search::action_search_narrow(&ctx, params),
         "search_narrow_clear" => crate::ui_search::action_search_narrow_clear(&ctx),
+        "search_recent_toggle" => crate::ui_search::action_search_recent_toggle(&ctx),
         "search_open_note" => crate::ui_search::action_search_open_note(&ctx, params),
         "share_open" => crate::ui_share::action_share_open(&ctx, params),
         "share_close" => crate::ui_share::action_share_close(&ctx),
@@ -2412,7 +2473,8 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
     // full embed+extract pass of latency between speech and the partial line.
     if !matches!(
         action_id,
-        "set_search" | "run_search" | "search_scope" | "share_suggest" | "dictation_utterance"
+        "set_search" | "run_search" | "search_scope" | "search_recent_toggle"
+            | "share_suggest" | "dictation_utterance"
     ) {
         let processed = analysis::process_queue(1);
         if !processed.is_empty() {
@@ -2917,6 +2979,8 @@ mod tests {
             preview: "p".into(),
             updated_at: 1,
             scope: "private".into(),
+            is_owner: true,
+            group_name: None,
             entities: vec![("Nexadata".into(), "company".into())],
         };
         let card = note_card(0, &n, "note_1");
@@ -3002,16 +3066,41 @@ mod tests {
     }
 
     #[test]
-    fn scope_badge_maps_all_scopes() {
-        for (scope, label_contains) in [
-            ("org", "Organizacja"),
-            ("group", "Grupa"),
-            ("user", "Udostępniona"),
-            ("private", "Prywatna"),
-        ] {
-            let badge = scope_badge("b", scope);
-            let decoded = Badge::try_from_component(&badge).expect("Badge decode");
-            assert_eq!(decoded.label, lit(label_contains), "scope {scope}");
-        }
+    fn scope_badge_spec_follows_reader_relation_and_mockup_tones() {
+        // Own private note → "Moje" (green), not "Prywatna".
+        assert_eq!(
+            scope_badge_spec(true, "private", None),
+            (Tone::Success, IconName::User, "Moje".to_string())
+        );
+        // Own note shared to a user is still MY note.
+        assert_eq!(
+            scope_badge_spec(true, "user", None).2,
+            "Moje".to_string()
+        );
+        // A user share from someone else → "Udostępnione" (neutral).
+        assert_eq!(
+            scope_badge_spec(false, "user", None),
+            (Tone::Neutral, IconName::User, "Udostępnione".to_string())
+        );
+        // Group scope carries the group name (blue), owner or not.
+        assert_eq!(
+            scope_badge_spec(true, "group", Some("Zespół R&D")),
+            (Tone::Info, IconName::Users, "Grupa · Zespół R&D".to_string())
+        );
+        // Group scope without a resolved name degrades gracefully.
+        assert_eq!(scope_badge_spec(false, "group", None).2, "Grupa".to_string());
+        assert_eq!(scope_badge_spec(false, "group", Some("  ")).2, "Grupa".to_string());
+        // Org scope is amber and wins over ownership.
+        assert_eq!(
+            scope_badge_spec(true, "org", None),
+            (Tone::Warning, IconName::Users, "Organizacja".to_string())
+        );
+    }
+
+    #[test]
+    fn scope_badge_renders_spec_label() {
+        let badge = scope_badge("b", false, "org", None);
+        let decoded = Badge::try_from_component(&badge).expect("Badge decode");
+        assert_eq!(decoded.label, lit("Organizacja"));
     }
 }
