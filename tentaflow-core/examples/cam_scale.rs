@@ -176,7 +176,7 @@ fn main() -> anyhow::Result<()> {
         })
     }));
     #[cfg(feature = "inference-supertonic")]
-    let plate_batcher = Arc::new(InferenceBatcher::<Option<String>>::new(MAX_BATCH, batch_window(), {
+    let plate_batcher = Arc::new(InferenceBatcher::<(Option<String>, f32)>::new(MAX_BATCH, batch_window(), {
         let o = ocr.clone();
         Arc::new(move |crops: &[(Arc<[u8]>, u32, u32)]| o.read_batch(crops))
     }));
@@ -212,7 +212,7 @@ fn main() -> anyhow::Result<()> {
     // placards and measured slower; the shared forward is the win, not routing.)
     #[cfg(feature = "inference-supertonic")]
     let adr_batcher = adr.clone().map(|a| {
-        Arc::new(InferenceBatcher::<Option<(String, String)>>::new(
+        Arc::new(InferenceBatcher::<Option<(String, String, f32)>>::new(
             MAX_BATCH,
             batch_window(),
             Arc::new(move |crops: &[(Arc<[u8]>, u32, u32)]| Ok(a.read_adr_batch(crops))),

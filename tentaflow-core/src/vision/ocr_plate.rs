@@ -273,8 +273,13 @@ impl PlateOcr {
     /// `[n, slots*vocab]` slice'owane per crop — kolejność == kolejność `crops`,
     /// długość == `crops.len()`. Odczyt niezwalidowany (patrz [`waliduj_tablice_pl`])
     /// → `None` w danym slocie. Wzoruje `adr_ocr::forward_batch`.
+    ///
+    /// Each slot carries the mean per-slot confidence (`decode_logits_scored`,
+    /// 0..1) alongside the validated string, so the temporal vote can weight and
+    /// gate reads instead of treating a repeated low-confidence misread as a
+    /// confident plate. An unvalidated/empty read still returns `(None, score)`.
     #[cfg(feature = "inference-supertonic")]
-    pub fn read_batch(&self, crops: &[(Arc<[u8]>, u32, u32)]) -> Result<Vec<Option<String>>> {
+    pub fn read_batch(&self, crops: &[(Arc<[u8]>, u32, u32)]) -> Result<Vec<(Option<String>, f32)>> {
         if crops.is_empty() {
             return Ok(Vec::new());
         }
@@ -353,8 +358,8 @@ impl PlateOcr {
                     );
                 }
                 Ok(match raw {
-                    Some(plate) if waliduj_tablice_pl(&plate) => Some(plate),
-                    _ => None,
+                    Some(plate) if waliduj_tablice_pl(&plate) => (Some(plate), score),
+                    _ => (None, score),
                 })
             })
             .collect()
@@ -363,11 +368,24 @@ impl PlateOcr {
     /// Ścieżka Burn: model wkompilowany pod `[1,H,W,1]`, więc batch to pętla po
     /// pojedynczych forwardach (jak `adr_ocr::forward_batch` w wariancie tract).
     #[cfg(not(feature = "inference-supertonic"))]
-    pub fn read_batch(&self, crops: &[(Arc<[u8]>, u32, u32)]) -> Result<Vec<Option<String>>> {
+    pub fn read_batch(&self, crops: &[(Arc<[u8]>, u32, u32)]) -> Result<Vec<(Option<String>, f32)>> {
         crops
             .iter()
-            .map(|(crop, cw, ch)| self.read(crop, *cw, *ch))
+            .map(|(crop, cw, ch)| self.read_scored(crop, *cw, *ch))
             .collect()
+    }
+
+    /// Single-crop read plus its mean confidence — the scored twin of
+    /// [`Self::read`], used by the Burn batch loop so both backends thread the
+    /// same `(plate, score)` pair into the vote.
+    #[cfg(not(feature = "inference-supertonic"))]
+    fn read_scored(&self, crop_rgb: &[u8], cw: u32, ch: u32) -> Result<(Option<String>, f32)> {
+        let deskew = ocr_prep::deskew_enabled();
+        let (gray, _) = self.preprocess(crop_rgb, cw, ch, deskew, false)?;
+        let logits = self.forward_logits(&gray)?;
+        let (raw, score) = self.decode_logits_scored(&logits)?;
+        let validated = raw.filter(|p| waliduj_tablice_pl(p));
+        Ok((validated, score))
     }
 
     /// Per-slot argmax płaskich logitów `[slots*vocab]` (row-major) → surowy

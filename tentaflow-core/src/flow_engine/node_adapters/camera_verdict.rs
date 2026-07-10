@@ -120,6 +120,7 @@ mod tests {
             score: 0.9,
             stan: stan.into_iter().map(|s| s.to_string()).collect(),
             tekst: tekst.map(|s| s.to_string()),
+            tekst_conf: None,
             track_id: 0,
             vx: 0.,
             vy: 0.,

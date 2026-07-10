@@ -385,6 +385,7 @@ mod tests {
             score: 0.9,
             stan: Vec::new(),
             tekst: None,
+            tekst_conf: None,
             track_id: 0,
             vx: 0.,
             vy: 0.,

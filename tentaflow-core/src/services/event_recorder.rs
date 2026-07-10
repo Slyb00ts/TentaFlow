@@ -184,15 +184,49 @@ impl EventStateMachine {
 // Event metadata accumulator
 // -----------------------------------------------------------------------------
 
+/// Per-OCR-text accumulator inside one event: how many frames read this exact
+/// string and the SUM of their confidences. `weight` (confidence-weighted count)
+/// picks the winner; `conf_sum / count` recovers its mean confidence for the
+/// gate. A text with no confidence (executor-path read) contributes a full unit.
+#[derive(Debug, Default, Clone)]
+struct TextVote {
+    count: u64,
+    weight: f64,
+    conf_sum: f64,
+}
+
+/// Minimum winner mean-confidence and agreement for an event's reported plate.
+/// Reads below these are recorded as `unreadable` in `event_meta` rather than
+/// surfaced as a confident plate — the same gate the live overlay applies, so a
+/// repeated occluded misread ("M88901 ×12") no longer becomes the event's plate.
+/// Kept in sync with the `[vision]` defaults (`plate_min_*`); the recorder does
+/// not read the vision settings so a camera node without `[vision]` still gates.
+const EVENT_TEXT_MIN_CONFIDENCE: f64 = 0.5;
+const EVENT_TEXT_MIN_AGREEMENT: f64 = 0.5;
+
+/// Gated winner for one class's OCR votes: the reported string (or unreadable),
+/// its mean confidence and the agreement ratio, serialized into `event_meta`.
+#[derive(Debug, serde::Serialize)]
+struct TextWinner {
+    /// Winning string, or `null` when gated out (see `unreadable`).
+    text: Option<String>,
+    confidence: f64,
+    agreement: f64,
+    unreadable: bool,
+    /// Per-variant frame counts, kept for downstream inspection/debugging.
+    votes: BTreeMap<String, u64>,
+}
+
 /// Aggregates every detection observed during one event into the JSON summary
-/// persisted in `recordings.event_meta`. Votes (frame counts) per class and
-/// per OCR text let a consumer pick the majority plate/ADR reading.
+/// persisted in `recordings.event_meta`. OCR reads are voted per class with a
+/// CONFIDENCE-WEIGHTED tally so a repeated low-confidence misread on an occluded
+/// plate is reported `unreadable`, not as a confident plate.
 #[derive(Debug, Default)]
 struct EventMeta {
     /// class → frames it appeared in.
     classes: BTreeMap<String, u64>,
-    /// class → OCR text → frames it was read (plates, ADR codes, …).
-    texts: BTreeMap<String, BTreeMap<String, u64>>,
+    /// class → OCR text → confidence-weighted vote (plates, ADR codes, …).
+    texts: BTreeMap<String, BTreeMap<String, TextVote>>,
     /// condition flag (e.g. "uszkodzona") → frames observed.
     stan: BTreeMap<String, u64>,
     /// distinct non-zero tracker ids seen.
@@ -211,12 +245,19 @@ impl EventMeta {
             *self.classes.entry(d.klasa.clone()).or_insert(0) += 1;
             if let Some(t) = d.tekst.as_deref() {
                 if !t.is_empty() {
-                    *self
+                    // An executor-path read has no numeric score; treat it as a
+                    // full-confidence unit so it still clears the confidence
+                    // floor and is gated on agreement (mirrors the live vote).
+                    let conf = d.tekst_conf.unwrap_or(1.0).clamp(0.0, 1.0) as f64;
+                    let vote = self
                         .texts
                         .entry(d.klasa.clone())
                         .or_default()
                         .entry(t.to_string())
-                        .or_insert(0) += 1;
+                        .or_default();
+                    vote.count += 1;
+                    vote.weight += conf.max(0.01);
+                    vote.conf_sum += conf;
                 }
             }
             for s in &d.stan {
@@ -228,10 +269,55 @@ impl EventMeta {
         }
     }
 
+    /// Confidence+agreement gate over one class's votes: winner = heaviest
+    /// variant, agreement = winner_weight / total_weight, reported only when the
+    /// winner's mean confidence and agreement clear the floors — otherwise the
+    /// class is `unreadable`.
+    fn winner(votes: &BTreeMap<String, TextVote>) -> TextWinner {
+        let counts: BTreeMap<String, u64> =
+            votes.iter().map(|(t, v)| (t.clone(), v.count)).collect();
+        let total_weight: f64 = votes.values().map(|v| v.weight).sum();
+        let best = votes.iter().max_by(|a, b| a.1.weight.total_cmp(&b.1.weight));
+        let Some((text, v)) = best else {
+            return TextWinner {
+                text: None,
+                confidence: 0.0,
+                agreement: 0.0,
+                unreadable: true,
+                votes: counts,
+            };
+        };
+        let agreement = if total_weight > 0.0 {
+            v.weight / total_weight
+        } else {
+            0.0
+        };
+        let mean_conf = if v.count > 0 {
+            v.conf_sum / v.count as f64
+        } else {
+            0.0
+        };
+        let ok = mean_conf >= EVENT_TEXT_MIN_CONFIDENCE && agreement >= EVENT_TEXT_MIN_AGREEMENT;
+        TextWinner {
+            text: ok.then(|| text.clone()),
+            confidence: mean_conf,
+            agreement,
+            unreadable: !ok,
+            votes: counts,
+        }
+    }
+
     /// Serialize the summary for one finalized file. `start/stop` are wall
     /// clock (unix ms) of the FILE (pre-roll included), `part` numbers files
     /// within one long event that rotated at `event_max_duration_secs`.
     fn to_json(&self, start_ts_ms: u64, stop_ts_ms: u64, preroll_ms: u64, part: u32) -> String {
+        // Per class: the gated winner (plate/ADR or unreadable) + its confidence,
+        // agreement and the raw per-variant counts, so a consumer sees WHY.
+        let texts: BTreeMap<String, TextWinner> = self
+            .texts
+            .iter()
+            .map(|(klasa, votes)| (klasa.clone(), Self::winner(votes)))
+            .collect();
         serde_json::json!({
             "event": "vehicle_presence",
             "start_ts_ms": start_ts_ms,
@@ -241,7 +327,7 @@ impl EventMeta {
             "detection_frames": self.frames,
             "tracks": self.tracks.len(),
             "classes": self.classes,
-            "texts": self.texts,
+            "texts": texts,
             "stan": self.stan,
         })
         .to_string()
@@ -914,12 +1000,23 @@ mod tests {
     use super::*;
 
     fn det(klasa: &str, tekst: Option<&str>, stan: &[&str], track_id: u32) -> Detection {
+        det_conf(klasa, tekst, None, stan, track_id)
+    }
+
+    fn det_conf(
+        klasa: &str,
+        tekst: Option<&str>,
+        tekst_conf: Option<f32>,
+        stan: &[&str],
+        track_id: u32,
+    ) -> Detection {
         Detection {
             klasa: klasa.into(),
             bbox: [0.1, 0.1, 0.2, 0.2],
             score: 0.9,
             stan: stan.iter().map(|s| s.to_string()).collect(),
             tekst: tekst.map(str::to_string),
+            tekst_conf,
             track_id,
             vx: 0.,
             vy: 0.,
@@ -974,8 +1071,9 @@ mod tests {
         meta.absorb(&[]); // empty frames are ignored
         assert_eq!(meta.frames, 2);
         assert_eq!(meta.classes["tablica_adr"], 2);
-        assert_eq!(meta.texts["tablica_adr"]["30/1202"], 2);
-        assert_eq!(meta.texts["tablica_rejestracyjna"]["WGM12345"], 1);
+        // Raw per-variant frame counts still tallied.
+        assert_eq!(meta.texts["tablica_adr"]["30/1202"].count, 2);
+        assert_eq!(meta.texts["tablica_rejestracyjna"]["WGM12345"].count, 1);
         assert_eq!(meta.stan["uszkodzona"], 1);
         assert_eq!(meta.tracks.len(), 2);
 
@@ -985,8 +1083,57 @@ mod tests {
         assert_eq!(v["start_ts_ms"], 1_000);
         assert_eq!(v["stop_ts_ms"], 21_000);
         assert_eq!(v["preroll_ms"], 5_000);
-        assert_eq!(v["texts"]["tablica_adr"]["30/1202"], 2);
+        // Two consistent reads with no explicit conf (executor-path = full unit)
+        // → agreement 1.0, confidence 1.0, reported.
+        let adr = &v["texts"]["tablica_adr"];
+        assert_eq!(adr["text"], "30/1202");
+        assert_eq!(adr["unreadable"], false);
+        assert_eq!(adr["votes"]["30/1202"], 2);
         assert_eq!(v["tracks"], 2);
+    }
+
+    /// The field regression: an occluded plate reads several DIFFERENT
+    /// low-confidence strings; the highest COUNT ("M88901" ×4) must NOT be
+    /// reported — it loses the confidence+agreement gate → `unreadable`.
+    #[test]
+    fn event_meta_gates_low_confidence_disagreeing_reads() {
+        let mut meta = EventMeta::default();
+        for s in ["M88901", "M88901", "M88901", "M88901", "N59156", "B67K71", "DRR740"] {
+            meta.absorb(&[det_conf(
+                "tablica_rejestracyjna",
+                Some(s),
+                Some(0.32),
+                &[],
+                5,
+            )]);
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&meta.to_json(0, 0, 0, 0)).expect("valid json");
+        let plate = &v["texts"]["tablica_rejestracyjna"];
+        assert_eq!(plate["unreadable"], true, "occluded plate must be unreadable");
+        assert!(plate["text"].is_null(), "no fabricated plate is reported");
+        // Counts are still preserved for inspection.
+        assert_eq!(plate["votes"]["M88901"], 4);
+    }
+
+    /// A single high-confidence, valid read is reported immediately (agreement
+    /// 1.0) — the gate must not require many frames.
+    #[test]
+    fn event_meta_single_confident_read_is_reported() {
+        let mut meta = EventMeta::default();
+        meta.absorb(&[det_conf(
+            "tablica_rejestracyjna",
+            Some("WPL5HJ2"),
+            Some(0.94),
+            &[],
+            3,
+        )]);
+        let v: serde_json::Value =
+            serde_json::from_str(&meta.to_json(0, 0, 0, 0)).expect("valid json");
+        let plate = &v["texts"]["tablica_rejestracyjna"];
+        assert_eq!(plate["text"], "WPL5HJ2");
+        assert_eq!(plate["unreadable"], false);
+        assert!((plate["agreement"].as_f64().unwrap() - 1.0).abs() < 1e-6);
     }
 
     #[test]

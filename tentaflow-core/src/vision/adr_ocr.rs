@@ -399,6 +399,7 @@ impl AdrOcr {
         self.read_adr_batch_refs(&[(crop_rgb, cw, ch)])
             .pop()
             .flatten()
+            .map(|(kemler, un, _conf)| (kemler, un))
     }
 
     /// Cross-placard batched read: the same per-placard math as
@@ -407,7 +408,14 @@ impl AdrOcr {
     /// pooled forward (chunked at [`ADR_ROWS_MAX_BATCH`] to stay inside the TRT
     /// profile). Result `i` corresponds to crop `i` and is identical to a
     /// per-crop `read_adr` call.
-    pub fn read_adr_batch(&self, crops: &[(Arc<[u8]>, u32, u32)]) -> Vec<Option<(String, String)>> {
+    /// Result `i` is `Some((kemler, un, confidence))` where `confidence` is the
+    /// mean CTC softmax-max (0..1) of the winning orientation's two rows — the
+    /// same scale as the plate OCR — so the temporal vote can gate a placard on
+    /// read confidence, not just count. `None` when nothing sensible was read.
+    pub fn read_adr_batch(
+        &self,
+        crops: &[(Arc<[u8]>, u32, u32)],
+    ) -> Vec<Option<(String, String, f32)>> {
         let refs: Vec<(&[u8], u32, u32)> =
             crops.iter().map(|(c, w, h)| (c.as_ref(), *w, *h)).collect();
         self.read_adr_batch_refs(&refs)
@@ -417,7 +425,10 @@ impl AdrOcr {
     /// (`prep_rows`), pack them into one batch, forward, CTC decode, then score
     /// orientations + dump per crop. The slot map carries GLOBAL batch
     /// positions, so logits route back to the exact (placard, orientation, row).
-    fn read_adr_batch_refs(&self, crops: &[(&[u8], u32, u32)]) -> Vec<Option<(String, String)>> {
+    fn read_adr_batch_refs(
+        &self,
+        crops: &[(&[u8], u32, u32)],
+    ) -> Vec<Option<(String, String, f32)>> {
         if crops.is_empty() {
             return Vec::new();
         }
@@ -455,7 +466,10 @@ impl AdrOcr {
             .zip(crop_slots)
             .map(|(&(rgb, cw, ch), slots)| {
                 let slots = slots?;
-                let mut best: Option<(f32, String, String)> = None;
+                // `conf` = mean CTC softmax-max over the rows that produced text
+                // (0..1); `score` = that plus the orientation-selection length
+                // bonuses (only ranks orientations, never leaves the crop).
+                let mut best: Option<(f32, String, String, f32)> = None;
                 for (ti, bi) in slots {
                     let (kemler, kc) = ti.map(|i| decoded[i].clone()).unwrap_or_default();
                     let (un, uc) = bi.map(|i| decoded[i].clone()).unwrap_or_default();
@@ -466,22 +480,34 @@ impl AdrOcr {
                     if un.len() == 4 {
                         score += 0.25;
                     }
+                    // Mean confidence over the rows that actually decoded text —
+                    // an empty row contributes no confidence and no divisor.
+                    let (mut cs, mut cn) = (0.0f32, 0u32);
+                    if !kemler.is_empty() {
+                        cs += kc;
+                        cn += 1;
+                    }
+                    if !un.is_empty() {
+                        cs += uc;
+                        cn += 1;
+                    }
+                    let conf = if cn > 0 { cs / cn as f32 } else { 0.0 };
                     if best.as_ref().map(|b| score > b.0).unwrap_or(true) {
-                        best = Some((score, kemler, un));
+                        best = Some((score, kemler, un, conf));
                     }
                 }
 
                 // `prep_rows` returned Some, so the buffer holds `expected` bytes.
                 let expected = (cw as usize) * (ch as usize) * 3;
                 let (label, score) = match &best {
-                    Some((s, k, u)) => (format!("{k}_{u}"), *s),
+                    Some((s, k, u, _)) => (format!("{k}_{u}"), *s),
                     None => ("none".to_string(), 0.0),
                 };
                 dump_adr(&rgb[..expected], cw, ch, &label, score);
 
                 match best {
-                    Some((_, kemler, un)) if !kemler.is_empty() || !un.is_empty() => {
-                        Some((kemler, un))
+                    Some((_, kemler, un, conf)) if !kemler.is_empty() || !un.is_empty() => {
+                        Some((kemler, un, conf))
                     }
                     _ => None,
                 }

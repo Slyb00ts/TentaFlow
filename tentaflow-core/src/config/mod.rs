@@ -231,6 +231,40 @@ pub struct VisionConfig {
     #[serde(default = "default_one")]
     pub adr_orientations: usize,
 
+    /// Minimum mean OCR confidence (0..1) the WINNING plate read must reach
+    /// before a plate is reported. The plate OCR's `decode_logits_scored`
+    /// returns the mean softmax probability of the chosen character across the
+    /// non-pad slots: a genuine sharp plate scores ~0.8-0.99, while an occluded
+    /// or blurry plate produces low-probability argmaxes (~0.3-0.6). Below this
+    /// floor the plate is reported as "unreadable" (`None`) instead of a
+    /// fabricated guess. Default 0.5 keeps genuine reads while rejecting the
+    /// low-evidence misreads that a naive count vote used to surface.
+    #[serde(default = "default_plate_min_confidence")]
+    pub plate_min_confidence: f32,
+
+    /// Minimum vote AGREEMENT (winner_weight / total_weight, 0..1) before a
+    /// plate is reported. Each frame's read is weighted by its OCR confidence;
+    /// a plate whose reads disagree frame-to-frame (occlusion/blur produces
+    /// several different low-confidence strings) never lets one variant reach a
+    /// clear majority of the weight and is reported "unreadable". A single
+    /// confident read has agreement 1.0, so one strong frame still passes.
+    /// Default 0.5.
+    #[serde(default = "default_plate_min_agreement")]
+    pub plate_min_agreement: f32,
+
+    /// Minimum mean OCR confidence (0..1) the winning ADR code must reach. The
+    /// ADR CRNN's CTC decode reports the mean softmax-max over the selected
+    /// steps (same 0..1 scale as the plate OCR). The UN number already passes
+    /// the `snap_adr` catalog snap before it can vote, so this floor is a
+    /// secondary guard and defaults lower (0.35) than the plate floor.
+    #[serde(default = "default_adr_min_confidence")]
+    pub adr_min_confidence: f32,
+
+    /// Minimum vote agreement before an ADR code is reported (same math as
+    /// `plate_min_agreement`). Default 0.5.
+    #[serde(default = "default_adr_min_agreement")]
+    pub adr_min_agreement: f32,
+
     /// One-shot depth-calibration capture: dump the metric depth map + pose +
     /// lidar cloud to `/tmp/tf_calib/` for the offline `depth_calib` example.
     #[serde(default)]
@@ -326,6 +360,10 @@ impl Default for VisionConfig {
             ocr_deskew: default_true(),
             adr_row_trim: default_true(),
             adr_orientations: default_one(),
+            plate_min_confidence: default_plate_min_confidence(),
+            plate_min_agreement: default_plate_min_agreement(),
+            adr_min_confidence: default_adr_min_confidence(),
+            adr_min_agreement: default_adr_min_agreement(),
             calib_dump: false,
             warmup_extra_secs: default_warmup_extra_secs(),
             event_recording: default_true(),
@@ -358,6 +396,18 @@ fn default_one() -> usize {
 }
 fn default_batch_window_us() -> u64 {
     2000
+}
+fn default_plate_min_confidence() -> f32 {
+    0.5
+}
+fn default_plate_min_agreement() -> f32 {
+    0.5
+}
+fn default_adr_min_confidence() -> f32 {
+    0.35
+}
+fn default_adr_min_agreement() -> f32 {
+    0.5
 }
 fn default_cold_workers() -> usize {
     64

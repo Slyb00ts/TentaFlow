@@ -47,6 +47,12 @@ pub struct Detection {
     pub stan: Vec<String>,
     #[serde(default)]
     pub tekst: Option<String>,
+    /// Mean OCR confidence (0..1) of the WINNING `tekst` — the vote's weighted
+    /// winner confidence, not one raw frame. `None` when there is no OCR text
+    /// (or the read was gated out as unreadable). Serialized as `null`; the
+    /// `#[serde(default)]` keeps older CBOR/JSON without the field decodable.
+    #[serde(default)]
+    pub tekst_conf: Option<f32>,
     /// Stabilny identyfikator sledzenia nadany przez tracker IOU. 0 = brak
     /// przypisania (np. detekcje ze zrodel bez trackera).
     #[serde(default)]
@@ -215,6 +221,7 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                 score: 0.96,
                 stan: Vec::new(),
                 tekst: Some("30/1202".to_string()),
+                tekst_conf: None,
                 track_id: 0,
                 vx: 0.,
                 vy: 0.,
@@ -232,6 +239,7 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                     Vec::new()
                 },
                 tekst: None,
+                tekst_conf: None,
                 track_id: 0,
                 vx: 0.,
                 vy: 0.,
@@ -248,6 +256,7 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                     score: 0.88,
                     stan: Vec::new(),
                     tekst: None,
+                    tekst_conf: None,
                     track_id: 0,
                     vx: 0.,
                     vy: 0.,
@@ -287,6 +296,7 @@ mod tests {
                     score: 0.96,
                     stan: Vec::new(),
                     tekst: Some("30/1202".to_string()),
+                    tekst_conf: None,
                     track_id: 0,
                     vx: 0.,
                     vy: 0.,
@@ -297,6 +307,7 @@ mod tests {
                     score: 0.94,
                     stan: vec!["uszkodzona".to_string()],
                     tekst: None,
+                    tekst_conf: None,
                     track_id: 0,
                     vx: 0.,
                     vy: 0.,
@@ -355,6 +366,7 @@ mod tests {
                 score: 0.5,
                 stan: Vec::new(),
                 tekst: None,
+                tekst_conf: None,
                 track_id: 0,
                 vx: 0.,
                 vy: 0.,
@@ -380,6 +392,7 @@ mod tests {
                 score: 0.9,
                 stan: Vec::new(),
                 tekst: None,
+                tekst_conf: None,
                 track_id: 0,
                 vx: 0.,
                 vy: 0.,

@@ -1731,6 +1731,7 @@ fn synthesize_forced_detections(pipeline: &CvPipeline, captured_ms: u64) -> Vec<
             score: 0.99,
             stan: Vec::new(),
             tekst: None,
+            tekst_conf: None,
             track_id: 0,
             vx: 0.0,
             vy: 0.0,
@@ -1832,6 +1833,7 @@ fn detection_from_cv(d: CvDetection) -> Detection {
         score: d.score,
         stan: Vec::new(),
         tekst: None,
+        tekst_conf: None,
         track_id: 0,
         vx: 0.0,
         vy: 0.0,
@@ -2444,18 +2446,41 @@ const ENRICH_EVICT_EVERY: usize = 256;
 /// więc `stan` jest nakładany bezpośrednio i NIE jest już cache'owany. Jedynym
 /// stanem cross-frame trzymanym w tej strukturze jest histogram głosów OCR.
 ///
-/// `tekst` niesie AKTUALNIE zwycięski (najczęściej głosowany) odczyt OCR — nie
-/// surowy odczyt jednej klatki. `tekst_votes` to histogram głosów per track: OCR
-/// chwieje się o ±1 znak klatka-do-klatki (OKR7408↔ORR7408↔DRR7408), a poprawne
-/// znaki są stałe między odczytami, więc głosowanie większościowe wygrywa
-/// prawdziwą tablicę, a szumowy znak rozprasza swoje głosy. `at` datuje ostatnie
-/// dotknięcie wpisu (ocena świeżości względem `ENRICH_TTL` + ewikcja).
+/// `tekst` niesie AKTUALNIE zwycięski odczyt OCR PO BRAMCE pewności+zgodności —
+/// nie surowy odczyt jednej klatki. `tekst_conf` to średnia pewność zwycięzcy
+/// (0..1). `tekst_votes` to CONFIDENCE-WEIGHTED histogram głosów per track: OCR
+/// chwieje się o ±1 znak klatka-do-klatki (OKR7408↔ORR7408↔DRR7408); poprawne
+/// znaki są stałe i czytane z wysoką pewnością, więc ważone głosowanie wygrywa
+/// prawdziwą tablicę, a niepewny szum (tablica zasłonięta/rozmyta) nie zbiera ani
+/// dużej wagi, ani zgody — bramka zwraca wtedy "nieczytelna" (`None`) zamiast
+/// zmyślonego numeru. `at` datuje ostatnie dotknięcie wpisu.
 #[derive(Clone)]
 struct CachedEnrich {
     stan: Vec<String>,
     tekst: Option<String>,
-    tekst_votes: Vec<(String, u32)>,
+    tekst_conf: Option<f32>,
+    tekst_votes: Vec<TekstVote>,
     at: Instant,
+}
+
+/// One variant in a track's confidence-weighted OCR vote. `weight` accumulates
+/// the OCR confidence of every frame that read this exact string (so a confident
+/// read counts more than a blurry one); `conf_sum`/`count` recover the variant's
+/// mean confidence for the gate.
+#[derive(Clone)]
+struct TekstVote {
+    text: String,
+    weight: f32,
+    conf_sum: f32,
+    count: u32,
+}
+
+/// Outcome of the confidence+agreement gate over a track's weighted vote.
+struct VoteOutcome {
+    /// The reported string, or `None` when the evidence is too weak
+    /// (unreadable). The winner's mean confidence when `text` is `Some`.
+    text: Option<String>,
+    confidence: Option<f32>,
 }
 
 /// Proces-wide stan glosowania OCR kluczowany po (camera_id, stage_id, track_id) —
@@ -2491,68 +2516,154 @@ const OCR_VOTE_MAX_VARIANTS: usize = 8;
 /// prowadzenie.
 const OCR_VOTE_MAX_TOTAL: u32 = 30;
 
-/// Wciela jeden zwalidowany odczyt OCR do histogramu głosów tracku i zwraca
-/// aktualnego zwycięzcę (najczęściej głosowany string). Głosowanie po klatkach
-/// tracku kasuje wobble ±1 znaku: poprawne znaki są stałe między odczytami,
-/// szumowy dzieli głosy, więc prawdziwa tablica wygrywa.
-fn ocr_vote(votes: &mut Vec<(String, u32)>, read: &str, prev: Option<&str>) -> Option<String> {
-    let total: u32 = votes.iter().map(|(_, n)| *n).sum();
+/// Weight floor for a single read so a 0-confidence read still nudges its
+/// variant (the confidence is a mean softmax prob and is never exactly 0 for a
+/// real decode, but this keeps the vote well-defined).
+const OCR_VOTE_MIN_WEIGHT: f32 = 0.01;
+
+/// `(min_confidence, min_agreement)` gate thresholds for the OCR vote, resolved
+/// from `[vision]` per read mode: plate reads use `plate_min_*`, ADR placards
+/// use `adr_min_*` (the ADR UN already passes the `snap_adr` catalog snap, so
+/// its confidence floor is lower). `Generic` follows the plate thresholds.
+fn ocr_gate_thresholds(mode: &CvOcrMode) -> (f32, f32) {
+    let v = crate::vision::settings::get();
+    match mode {
+        CvOcrMode::Adr => (v.adr_min_confidence, v.adr_min_agreement),
+        CvOcrMode::Plate | CvOcrMode::Generic => (v.plate_min_confidence, v.plate_min_agreement),
+    }
+}
+
+/// Wciela jeden zwalidowany odczyt OCR (string + pewność 0..1) do CONFIDENCE-
+/// WEIGHTED histogramu głosów tracku, po czym stosuje bramkę pewności+zgodności:
+///   * każdy odczyt dokłada `max(conf, floor)` do wagi swojego wariantu,
+///   * zwycięzca = wariant o największej wadze,
+///   * `agreement` = waga_zwycięzcy / suma_wag,
+///   * zwycięzca jest EMITOWANY tylko gdy jego średnia pewność ≥ `min_conf`
+///     ORAZ `agreement ≥ min_agreement`; inaczej `None` ("nieczytelna").
+/// To odrzuca powtarzany, ale niepewny i niespójny błąd (zasłonięta tablica),
+/// a wpuszcza jeden mocny, zgodny odczyt (agreement 1.0).
+fn ocr_vote(
+    votes: &mut Vec<TekstVote>,
+    read: &str,
+    conf: f32,
+    min_conf: f32,
+    min_agreement: f32,
+    prev: Option<&str>,
+) -> VoteOutcome {
+    let total_count: u32 = votes.iter().map(|v| v.count).sum();
     // Wykładnicze zapominanie: po zliczeniu limitu odczytów połowimy wszystko,
     // aby realnie zmieniona tablica mogła wyprzedzić przestarzałego zwycięzcę.
-    if total >= OCR_VOTE_MAX_TOTAL {
-        votes.retain_mut(|(_, n)| {
-            *n /= 2;
-            *n > 0
+    if total_count >= OCR_VOTE_MAX_TOTAL {
+        votes.retain_mut(|v| {
+            v.weight *= 0.5;
+            v.conf_sum *= 0.5;
+            v.count /= 2;
+            v.count > 0
         });
     }
-    match votes.iter_mut().find(|(s, _)| s == read) {
-        Some((_, n)) => *n += 1,
+    let w = conf.max(OCR_VOTE_MIN_WEIGHT);
+    match votes.iter_mut().find(|v| v.text == read) {
+        Some(v) => {
+            v.weight += w;
+            v.conf_sum += conf;
+            v.count += 1;
+        }
         None => {
             if votes.len() >= OCR_VOTE_MAX_VARIANTS {
-                // Wyrzuć najsłabszy wariant, by ograniczyć mapę — wobble rodzi
+                // Wyrzuć najlżejszy wariant, by ograniczyć mapę — wobble rodzi
                 // tylko kilka wariantów, więc ewikcja odpala się rzadko.
                 if let Some(pos) = votes
                     .iter()
                     .enumerate()
-                    .min_by_key(|(_, (_, n))| *n)
+                    .min_by(|(_, a), (_, b)| a.weight.total_cmp(&b.weight))
                     .map(|(i, _)| i)
                 {
                     votes.swap_remove(pos);
                 }
             }
-            votes.push((read.to_string(), 1));
+            votes.push(TekstVote {
+                text: read.to_string(),
+                weight: w,
+                conf_sum: conf,
+                count: 1,
+            });
         }
     }
-    let max = votes.iter().map(|(_, n)| *n).max().unwrap_or(0);
-    if max == 0 {
-        return None;
-    }
-    // Tie-break: przy remisie utrzymaj poprzednio wyemitowany string, by uniknąć
-    // migotania między dwoma równo obstawionymi wariantami.
-    if let Some(p) = prev {
-        if votes.iter().any(|(s, n)| s == p && *n == max) {
-            return Some(p.to_string());
-        }
-    }
-    votes
-        .iter()
-        .find(|(_, n)| *n == max)
-        .map(|(s, _)| s.clone())
+    gate_votes(votes, min_conf, min_agreement, prev)
 }
 
-/// COLD, ścieżka OCR: pod JEDNYM lockiem wciela jeden odczyt do histogramu głosów
-/// tracku i zwraca aktualnego zwycięzcę. W odróżnieniu od classify OCR nie jest
-/// cache-skipowany — re-czytamy co cykl cold (GPU-tani ~2-3 ms) i pozwalamy
-/// głosowaniu większościowemu ustabilizować chwiejny znak. `read == None`
-/// (odczyt niezwalidowany/nieudany, format już sprawdzony w `ocr_crop`/upstream)
-/// NIE jest głosowany, ale wciąż odświeża `at`, aby histogram przeżył ewikcję,
-/// dopóki track żyje. Zwraca dotychczasowego zwycięzcę.
+/// Applies the confidence+agreement gate to a track's current weighted votes
+/// WITHOUT adding a read — used both after a vote and when a frame produced no
+/// read (the winner may still be strong enough from earlier frames). Returns the
+/// gated winner or an unreadable outcome.
+fn gate_votes(
+    votes: &[TekstVote],
+    min_conf: f32,
+    min_agreement: f32,
+    prev: Option<&str>,
+) -> VoteOutcome {
+    let total_weight: f32 = votes.iter().map(|v| v.weight).sum();
+    if total_weight <= 0.0 {
+        return VoteOutcome {
+            text: None,
+            confidence: None,
+        };
+    }
+    // Winner = heaviest variant; tie-break to the previously emitted string so a
+    // stable read does not flicker between two equally weighted variants.
+    let max_weight = votes
+        .iter()
+        .map(|v| v.weight)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let winner = prev
+        .and_then(|p| {
+            votes
+                .iter()
+                .find(|v| v.text == p && (max_weight - v.weight).abs() <= f32::EPSILON)
+        })
+        .or_else(|| votes.iter().find(|v| v.weight == max_weight));
+    let Some(winner) = winner else {
+        return VoteOutcome {
+            text: None,
+            confidence: None,
+        };
+    };
+    let agreement = winner.weight / total_weight;
+    let mean_conf = if winner.count > 0 {
+        winner.conf_sum / winner.count as f32
+    } else {
+        0.0
+    };
+    if mean_conf >= min_conf && agreement >= min_agreement {
+        VoteOutcome {
+            text: Some(winner.text.clone()),
+            confidence: Some(mean_conf),
+        }
+    } else {
+        VoteOutcome {
+            text: None,
+            confidence: None,
+        }
+    }
+}
+
+/// COLD, ścieżka OCR: pod JEDNYM lockiem wciela jeden odczyt (string + pewność)
+/// do CONFIDENCE-WEIGHTED histogramu głosów tracku, stosuje bramkę
+/// pewności+zgodności i zwraca aktualnego zwycięzcę (albo `None` = nieczytelna).
+/// W odróżnieniu od classify OCR nie jest cache-skipowany — re-czytamy co cykl
+/// cold (GPU-tani ~2-3 ms) i pozwalamy ważonemu głosowaniu ustabilizować
+/// chwiejny znak. `read == None` (odczyt niezwalidowany/nieudany) NIE jest
+/// głosowany, ale wciąż PRZELICZA bramkę nad dotychczasowymi głosami (zwycięzca
+/// może być już wystarczająco mocny) i odświeża `at`, aby histogram przeżył
+/// ewikcję, dopóki track żyje. Ustawia `entry.tekst`/`entry.tekst_conf`.
 fn enrich_cache_vote_ocr(
     camera_id: &str,
     stage_id: &str,
     track_id: u32,
-    read: Option<String>,
-) -> Option<String> {
+    read: Option<(String, f32)>,
+    min_conf: f32,
+    min_agreement: f32,
+) -> (Option<String>, Option<f32>) {
     static PUT_COUNT: AtomicUsize = AtomicUsize::new(0);
     let mut cache = enrich_cache().lock().unwrap_or_else(|e| e.into_inner());
     let entry = cache
@@ -2560,19 +2671,31 @@ fn enrich_cache_vote_ocr(
         .or_insert_with(|| CachedEnrich {
             stan: Vec::new(),
             tekst: None,
+            tekst_conf: None,
             tekst_votes: Vec::new(),
             at: Instant::now(),
         });
-    if let Some(read) = read.as_deref() {
-        let prev = entry.tekst.clone();
-        entry.tekst = ocr_vote(&mut entry.tekst_votes, read, prev.as_deref());
-    }
+    let prev = entry.tekst.clone();
+    let outcome = match read {
+        Some((read, conf)) => ocr_vote(
+            &mut entry.tekst_votes,
+            &read,
+            conf,
+            min_conf,
+            min_agreement,
+            prev.as_deref(),
+        ),
+        // No read this frame: re-gate the accumulated votes so an already-strong
+        // winner keeps showing and a weak one stays unreadable.
+        None => gate_votes(&entry.tekst_votes, min_conf, min_agreement, prev.as_deref()),
+    };
+    entry.tekst = outcome.text.clone();
+    entry.tekst_conf = outcome.confidence;
     entry.at = Instant::now();
-    let result = entry.tekst.clone();
     if PUT_COUNT.fetch_add(1, AtomicOrdering::Relaxed) % ENRICH_EVICT_EVERY == 0 {
         cache.retain(|_, c| c.at.elapsed() < ENRICH_CACHE_EVICT_AGE);
     }
-    result
+    (outcome.text, outcome.confidence)
 }
 
 /// Przypisuje detekcji wynik etapu cold zgodnie z jego `output`: classify
@@ -2584,6 +2707,7 @@ fn apply_stage_output(det: &mut Detection, output: Option<CvStageOutput>, value:
         Some(CvStageOutput::Tekst) => {
             if value.tekst.is_some() {
                 det.tekst = value.tekst.clone();
+                det.tekst_conf = value.tekst_conf;
             }
         }
         None => {}
@@ -2747,6 +2871,7 @@ async fn run_cold_stages(
                     .map(|stan| CachedEnrich {
                         stan,
                         tekst: None,
+                        tekst_conf: None,
                         tekst_votes: Vec::new(),
                         at: Instant::now(),
                     })
@@ -2761,8 +2886,9 @@ async fn run_cold_stages(
                 match read_batch_local(&crops).await {
                     Some(reads) if reads.len() == crops.len() => reads
                         .into_iter()
-                        .map(|tekst| CachedEnrich {
+                        .map(|(tekst, conf)| CachedEnrich {
                             stan: Vec::new(),
+                            tekst_conf: tekst.as_ref().map(|_| conf),
                             tekst,
                             tekst_votes: Vec::new(),
                             at: Instant::now(),
@@ -2790,8 +2916,9 @@ async fn run_cold_stages(
                     Some(reads) if reads.len() == crops.len() => {
                         let mut outputs: Vec<CachedEnrich> = reads
                             .into_iter()
-                            .map(|tekst| CachedEnrich {
+                            .map(|(tekst, conf)| CachedEnrich {
                                 stan: Vec::new(),
+                                tekst_conf: tekst.as_ref().map(|_| conf),
                                 tekst,
                                 tekst_votes: Vec::new(),
                                 at: Instant::now(),
@@ -2834,11 +2961,21 @@ async fn run_cold_stages(
         // (surowy odczyt wciela sie do histogramu, `det.tekst` = zwyciezca); track
         // bez id (track_id=0) emituje surowy odczyt wprost. Classify: `stan`
         // przypisany od zera, bez cache-put (kazda klatka czyta na nowo).
+        let (min_conf, min_agreement) = ocr_gate_thresholds(&ocr_mode);
         for ((idx, _, _, _, _), value) in items.iter().zip(outputs) {
             let det = &mut dets[*idx];
             if op == CvOp::Ocr && det.track_id > 0 {
-                det.tekst =
-                    enrich_cache_vote_ocr(camera_id, &stage.stage_id, det.track_id, value.tekst);
+                let read = value.tekst.map(|t| (t, value.tekst_conf.unwrap_or(0.0)));
+                let (tekst, conf) = enrich_cache_vote_ocr(
+                    camera_id,
+                    &stage.stage_id,
+                    det.track_id,
+                    read,
+                    min_conf,
+                    min_agreement,
+                );
+                det.tekst = tekst;
+                det.tekst_conf = conf;
             } else {
                 apply_stage_output(det, stage.output, &value);
             }
@@ -2879,9 +3016,17 @@ async fn cold_stage_per_crop(
                 ),
                 CvOp::Detect | CvOp::Embed => (Vec::new(), None),
             };
+            // The executor path (mesh/remote/PP-OCRv5) carries NO per-read
+            // confidence — its `CameraCvResult::Text` has already passed the
+            // engine's own validation (`waliduj_tablice_pl` / `snap_adr`), so a
+            // hit is treated as fully confident (`1.0`) for the vote. It then
+            // still gates on AGREEMENT, matching the pre-confidence behavior of
+            // this fallback while the primary batched path gates on real scores.
+            let tekst_conf = tekst.as_ref().map(|_| EXECUTOR_READ_CONFIDENCE);
             CachedEnrich {
                 stan,
                 tekst,
+                tekst_conf,
                 tekst_votes: Vec::new(),
                 at: Instant::now(),
             }
@@ -2889,6 +3034,11 @@ async fn cold_stage_per_crop(
     });
     futures::future::join_all(jobs).await
 }
+
+/// Confidence assigned to an executor-path (per-crop fallback) OCR hit, which
+/// carries no numeric score of its own. The read already passed the engine's
+/// validation, so it clears the confidence floor and is gated on agreement only.
+const EXECUTOR_READ_CONFIDENCE: f32 = 1.0;
 
 /// COLD batched local classify: every crop of the stage is SUBMITTED to the
 /// process-wide cross-camera state batcher, so crops from ALL cameras aggregate
@@ -2950,7 +3100,7 @@ async fn classify_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Vec
 /// batch-1. `None` (batcher unavailable / any per-crop error) → caller drops to
 /// the per-crop fallback. `submit_all` blocks on the blocking pool.
 #[cfg(feature = "inference-supertonic")]
-async fn read_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Option<String>>> {
+async fn read_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<(Option<String>, f32)>> {
     let batcher = crate::vision::inference_batcher::plate_batcher().await?;
     let crops = crops.to_vec();
     let results = match tokio::task::spawn_blocking(move || batcher.submit_all(&crops)).await {
@@ -2987,7 +3137,7 @@ async fn read_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Option<
     feature = "inference-supertonic",
     not(any(target_os = "macos", target_os = "ios"))
 ))]
-async fn adr_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Option<String>>> {
+async fn adr_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<(Option<String>, f32)>> {
     let batcher = crate::vision::inference_batcher::adr_batcher().await?;
     let crops = crops.to_vec();
     let results = match tokio::task::spawn_blocking(move || batcher.submit_all(&crops)).await {
@@ -3000,7 +3150,12 @@ async fn adr_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Option<S
     let mut reads = Vec::with_capacity(results.len());
     for r in results {
         match r {
-            Ok(read) => reads.push(read.and_then(|(_, un)| crate::vision::adr::snap_adr(&un))),
+            // Keep the read's confidence alongside the catalog-snapped UN; a UN
+            // that fails `snap_adr` is a miss (None) and its confidence is moot.
+            Ok(read) => reads.push(match read {
+                Some((_, un, conf)) => (crate::vision::adr::snap_adr(&un), conf),
+                None => (None, 0.0),
+            }),
             Err(e) => {
                 warn_throttled("ocr", &format!("adr batcher submit: {e:#}"));
                 return None;
@@ -3013,7 +3168,7 @@ async fn adr_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Option<S
 /// Ścieżka Burn: forward serializowany na jednym watku wgpu przez `run_blocking`
 /// + `Mutex` (jak `ocr_local`); `read_batch` sam petli po cropach.
 #[cfg(not(feature = "inference-supertonic"))]
-async fn read_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Option<String>>> {
+async fn read_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<(Option<String>, f32)>> {
     let ocr = get_ocr().await?;
     let crops = crops.to_vec();
     match crate::vision::burn_backend::run_blocking(move || {
@@ -3176,12 +3331,14 @@ mod tests {
         let stan_a = CachedEnrich {
             stan: vec!["ok".into()],
             tekst: None,
+            tekst_conf: None,
             tekst_votes: Vec::new(),
             at: Instant::now(),
         };
         let stan_b = CachedEnrich {
             stan: vec!["czytelna".into()],
             tekst: None,
+            tekst_conf: None,
             tekst_votes: Vec::new(),
             at: Instant::now(),
         };
@@ -3192,12 +3349,14 @@ mod tests {
         let ocr_hit = CachedEnrich {
             stan: Vec::new(),
             tekst: Some("30/1203".into()),
+            tekst_conf: None,
             tekst_votes: Vec::new(),
             at: Instant::now(),
         };
         let ocr_miss = CachedEnrich {
             stan: Vec::new(),
             tekst: None,
+            tekst_conf: None,
             tekst_votes: Vec::new(),
             at: Instant::now(),
         };
@@ -3210,57 +3369,101 @@ mod tests {
         assert_eq!(det.stan.len(), 2);
     }
 
-    /// `ocr_vote`: głosowanie większościowe kasuje wobble ±1 znaku, tie-break
-    /// trzyma poprzedni string (anty-migotanie), a wykładnicze wygaszanie po
-    /// limicie pozwala realnie zmienionej tablicy przejąć prowadzenie.
+    /// Gate defaults used by the vote unit tests (mirror the `[vision]` plate
+    /// defaults so the tests read like the production gate).
+    const MC: f32 = 0.5;
+    const MA: f32 = 0.5;
+
+    /// `ocr_vote` (confidence-weighted): a stream of consistent HIGH-confidence
+    /// reads with ±1-char wobble still resolves to the true plate (majority of
+    /// the weight), and the tie-break holds the previously emitted string.
     #[test]
     fn ocr_vote_majority_stabilizes_wobble() {
-        let mut votes: Vec<(String, u32)> = Vec::new();
-        // Wobble OKR7408↔ORR7408↔DRR7408: prawdziwa tablica dostaje więcej głosów.
+        let mut votes: Vec<TekstVote> = Vec::new();
+        // High-confidence wobble OKR7408↔ORR7408↔DRR7408 around one true plate.
         assert_eq!(
-            ocr_vote(&mut votes, "OKR7408", None).as_deref(),
+            ocr_vote(&mut votes, "OKR7408", 0.9, MC, MA, None).text.as_deref(),
             Some("OKR7408")
         );
         assert_eq!(
-            ocr_vote(&mut votes, "ORR7408", Some("OKR7408")).as_deref(),
+            ocr_vote(&mut votes, "OKR7408", 0.9, MC, MA, Some("OKR7408"))
+                .text
+                .as_deref(),
             Some("OKR7408")
         );
+        // A single low-weight wobble variant does not dislodge the leader.
         assert_eq!(
-            ocr_vote(&mut votes, "OKR7408", Some("OKR7408")).as_deref(),
+            ocr_vote(&mut votes, "ORR7408", 0.6, MC, MA, Some("OKR7408"))
+                .text
+                .as_deref(),
             Some("OKR7408")
         );
-        assert_eq!(
-            ocr_vote(&mut votes, "DRR7408", Some("OKR7408")).as_deref(),
-            Some("OKR7408")
-        );
+    }
 
-        // Tie-break: przy remisie utrzymaj poprzednio wyemitowany.
-        let mut tie: Vec<(String, u32)> = vec![("AAA".into(), 2), ("BBB".into(), 1)];
-        assert_eq!(
-            ocr_vote(&mut tie, "BBB", Some("AAA")).as_deref(),
-            Some("AAA")
-        );
+    /// (a) 7 DISAGREEING low-confidence reads (the field case) → unreadable:
+    /// neither confidence nor agreement clears the gate, so no plate is emitted.
+    #[test]
+    fn ocr_vote_low_conf_disagreement_is_unreadable() {
+        let mut votes: Vec<TekstVote> = Vec::new();
+        let mut out: Option<String> = None;
+        for s in ["M88901", "M88901", "N59156", "B67K71", "M88901", "DRR740", "SR9961"] {
+            out = ocr_vote(&mut votes, s, 0.30, MC, MA, out.as_deref()).text;
+        }
+        assert!(out.is_none(), "occluded plate must be unreadable, not a guess");
+    }
 
-        // Nowa tablica na tym samym track_id po wielu odczytach ostatecznie wygrywa.
-        let mut churn: Vec<(String, u32)> = Vec::new();
-        let mut last = None;
-        for _ in 0..40 {
-            last = ocr_vote(&mut churn, "OLD123", last.as_deref());
+    /// (b) ONE high-confidence valid read → reported immediately (agreement 1.0);
+    /// the gate must not require many frames.
+    #[test]
+    fn ocr_vote_single_high_conf_read_is_reported() {
+        let mut votes: Vec<TekstVote> = Vec::new();
+        let out = ocr_vote(&mut votes, "WPL5HJ2", 0.94, MC, MA, None);
+        assert_eq!(out.text.as_deref(), Some("WPL5HJ2"));
+        assert!((out.confidence.unwrap() - 0.94).abs() < 1e-6);
+    }
+
+    /// (c) 5 consistent high-confidence reads → reported with agreement ~1.0.
+    #[test]
+    fn ocr_vote_consistent_high_conf_reported_full_agreement() {
+        let mut votes: Vec<TekstVote> = Vec::new();
+        let mut prev: Option<String> = None;
+        for _ in 0..5 {
+            prev = ocr_vote(&mut votes, "WWL7322", 0.9, MC, MA, prev.as_deref()).text;
         }
-        assert_eq!(last.as_deref(), Some("OLD123"));
-        for _ in 0..60 {
-            last = ocr_vote(&mut churn, "NEW999", last.as_deref());
+        assert_eq!(prev.as_deref(), Some("WWL7322"));
+        let total: f32 = votes.iter().map(|v| v.weight).sum();
+        let winner = votes.iter().find(|v| v.text == "WWL7322").unwrap();
+        assert!((winner.weight / total - 1.0).abs() < 1e-6, "agreement ~1.0");
+    }
+
+    /// (d) A high-COUNT but low-confidence misread must LOSE to a lower-count but
+    /// high-confidence correct read: 4×"M88901"@0.30 vs 2×"WPL5HJ2"@0.95 —
+    /// weight 1.2 vs 1.9, so the correct plate wins and is reported.
+    #[test]
+    fn ocr_vote_high_conf_beats_high_count_misread() {
+        let mut votes: Vec<TekstVote> = Vec::new();
+        let mut prev: Option<String> = None;
+        for _ in 0..4 {
+            prev = ocr_vote(&mut votes, "M88901", 0.30, MC, MA, prev.as_deref()).text;
         }
-        assert_eq!(last.as_deref(), Some("NEW999"));
+        for _ in 0..2 {
+            prev = ocr_vote(&mut votes, "WPL5HJ2", 0.95, MC, MA, prev.as_deref()).text;
+        }
+        let final_outcome = gate_votes(&votes, MC, MA, None);
+        assert_eq!(
+            final_outcome.text.as_deref(),
+            Some("WPL5HJ2"),
+            "high-confidence correct read must beat a high-count low-confidence misread"
+        );
     }
 
     /// Histogram jest ograniczony: >OCR_VOTE_MAX_VARIANTS różnych stringów nie
-    /// rozdyma mapy — najsłabszy wariant wypada.
+    /// rozdyma mapy — najlżejszy wariant wypada.
     #[test]
     fn ocr_vote_bounds_variant_count() {
-        let mut votes: Vec<(String, u32)> = Vec::new();
+        let mut votes: Vec<TekstVote> = Vec::new();
         for i in 0..(OCR_VOTE_MAX_VARIANTS + 5) {
-            ocr_vote(&mut votes, &format!("PLATE{i}"), None);
+            ocr_vote(&mut votes, &format!("PLATE{i}"), 0.8, MC, MA, None);
         }
         assert!(votes.len() <= OCR_VOTE_MAX_VARIANTS);
     }
