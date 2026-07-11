@@ -19,6 +19,67 @@ pub fn container_name(engine_id: &str, port: u16) -> String {
     format!("tentaflow-{}-{}", engine_id, port)
 }
 
+/// Czy wiersz serwisu jest czlonkiem distributed-deploymentu (config_json niesie
+/// blok `_distributed`). Takich wierszy NIE wolno kasowac pojedynczo z listy
+/// serwisow (lokalnie ani przez mesh `ServiceDeleteRemote`) — usuniecie workera
+/// zabija rank calego klastra TP, ktory serwuje na INNYM nodzie. Jedyna legalna
+/// sciezka usuniecia to stop deploymentu klastra (`stop_distributed`), ktora
+/// kasuje wiersze bezposrednio w repo, z pominieciem tego guardu.
+pub fn service_is_distributed_member(config_json: &str) -> bool {
+    serde_json::from_str::<Value>(config_json)
+        .ok()
+        .and_then(|v| v.get("_distributed").cloned())
+        .is_some()
+}
+
+/// `deployment_cluster_id` z bloku `_distributed` wiersza-czlonka (None gdy
+/// wiersz nie jest czlonkiem albo blok nie niesie id).
+fn member_deployment_id(config_json: &str) -> Option<String> {
+    serde_json::from_str::<Value>(config_json)
+        .ok()?
+        .get("_distributed")?
+        .get("deployment_cluster_id")?
+        .as_str()
+        .map(String::from)
+}
+
+/// Czy deployment wiersza-czlonka jest AKTYWNY z perspektywy TEGO noda: lokalny
+/// kontener z etykieta deploymentu nadal istnieje LUB (na koordynatorze) rekord
+/// `cluster_deployments` jest deploying/running. Osierocony wiersz po deployu,
+/// ktorego nikt juz nie zna (rekord skasowany, kontener zniknal), zwraca false —
+/// wtedy delete-guard przepuszcza sprzatanie z listy serwisow. Brak id w config
+/// = fail-closed (true), zeby uszkodzony wiersz zywego klastra nie byl kasowalny.
+pub async fn distributed_member_deployment_active(
+    db: &crate::db::DbPool,
+    config_json: &str,
+) -> bool {
+    let Some(did) = member_deployment_id(config_json) else {
+        return true;
+    };
+    #[cfg(feature = "docker")]
+    {
+        if let Ok(out) = tokio::process::Command::new("docker")
+            .args([
+                "ps",
+                "-q",
+                "--filter",
+                &format!("label={}={}", super::docker::DISTRIBUTED_LABEL, did),
+            ])
+            .output()
+            .await
+        {
+            if !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+                return true;
+            }
+        }
+    }
+    crate::db::repository::get_cluster_deployment(db, &did)
+        .ok()
+        .flatten()
+        .map(|d| matches!(d.status.as_str(), "deploying" | "running"))
+        .unwrap_or(false)
+}
+
 /// Informacyjny endpoint head-a (`http://<rdma_ip>:<port>/v1`). Workery headless
 /// → None. Routing realny idzie przez rejestr serwisow mesh (head rejestruje sie
 /// lokalnie z `127.0.0.1`), to tylko podglad dla GUI.
@@ -48,6 +109,122 @@ fn sh_quote(s: &str) -> String {
     out
 }
 
+/// Czy silnik deklaruje multi-node przez natywny vLLM mp (`cluster_launch =
+/// "vllm-mp"` w manifescie) zamiast Raya. Brak manifestu = false (Ray).
+pub fn engine_is_vllm_mp(engine_id: &str) -> bool {
+    crate::services::manifest::registry()
+        .by_id(engine_id)
+        .map(|m| m.engine.cluster_launch.as_deref() == Some("vllm-mp"))
+        .unwrap_or(false)
+}
+
+/// Rank czlonka w trybie vllm-mp — koordynator wstrzykuje `_mp_node_rank` do
+/// `config_json` spec-a (head=0, workery 1..). Brak klucza = blad (spec zbudowany
+/// przez koordynatora bez rankow nie moze odpalic `--node-rank`).
+fn mp_node_rank(spec: &DistributedDeploySpec) -> Result<u32, String> {
+    serde_json::from_str::<Value>(&spec.config_json)
+        .ok()
+        .and_then(|v| v.get("_mp_node_rank").and_then(|x| x.as_u64()))
+        .map(|r| r as u32)
+        .ok_or_else(|| "vllm-mp: brak _mp_node_rank w config_json spec-a".to_string())
+}
+
+/// Stale argumenty `vllm serve` dla silnika w trybie vllm-mp. `vllm-dspark` =
+/// zweryfikowany profil DeepSeek V4 Flash DSpark (garble-fix 2026-07-03:
+/// probabilistyczny draft, 3 tokeny spekulacyjne, capture-size == max-num-seqs).
+/// `--max-num-seqs`/`--max-cudagraph-capture-size` mozna nadpisac przez
+/// `vllm_args` (argparse: ostatnie wystapienie wygrywa).
+fn vllm_mp_engine_args(engine_id: &str) -> Vec<String> {
+    if engine_id != "vllm-dspark" {
+        return Vec::new();
+    }
+    [
+        "--trust-remote-code",
+        "--kv-cache-dtype",
+        "nvfp4_ds_mla",
+        "--block-size",
+        "256",
+        "--max-num-seqs",
+        "12",
+        "--max-num-batched-tokens",
+        "8192",
+        "--max-cudagraph-capture-size",
+        "12",
+        "--enable-prefix-caching",
+        "--async-scheduling",
+        "--enable-chunked-prefill",
+        "--speculative-config",
+        r#"{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}"#,
+        "--tokenizer-mode",
+        "deepseek_v4",
+        "--tool-call-parser",
+        "deepseek_v4",
+        "--enable-auto-tool-choice",
+        "--reasoning-parser",
+        "deepseek_v4",
+        "--reasoning-config",
+        r#"{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}"#,
+        "--default-chat-template-kwargs",
+        r#"{"thinking":false}"#,
+        "--generation-config",
+        "vllm",
+        "--enable-flashinfer-autotune",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// Pelna komenda `vllm serve` w trybie vllm-mp — IDENTYCZNA na kazdym czlonku
+/// poza `--node-rank` i `--headless` (kontrakt natywnego multi-node vLLM).
+/// Master TCPStore = `ray_head_ip:dist_port` (ta sama para co tryb Ray, tylko
+/// konsumowana flagami zamiast przez GCS). KAZDY token jest shell-quote'owany
+/// (argi silnika niosa JSON-y ze spacjami/nawiasami).
+fn build_mp_serve_command(
+    spec: &DistributedDeploySpec,
+    rank: u32,
+    headless: bool,
+) -> Result<String, String> {
+    let nnodes = (spec.tp_size / spec.num_gpus.max(1)).max(1);
+    let mut serve = format!(
+        "vllm serve {model} \
+         --host 0.0.0.0 \
+         --port {port} \
+         --served-model-name {served} \
+         --tensor-parallel-size {tp} \
+         --pipeline-parallel-size 1 \
+         --gpu-memory-utilization {util:.2} \
+         --max-model-len {maxlen} \
+         --distributed-executor-backend mp \
+         --nnodes {nnodes} \
+         --node-rank {rank} \
+         --master-addr {master} \
+         --master-port {master_port}",
+        model = sh_quote(&spec.model),
+        port = spec.port,
+        served = sh_quote(&spec.served_model_name),
+        tp = spec.tp_size,
+        util = spec.gpu_memory_utilization,
+        maxlen = spec.max_model_len,
+        nnodes = nnodes,
+        rank = rank,
+        master = sh_quote(&spec.ray_head_ip),
+        master_port = spec.dist_port,
+    );
+    if headless {
+        serve.push_str(" --headless");
+    }
+    for tok in vllm_mp_engine_args(&spec.engine_id) {
+        serve.push(' ');
+        serve.push_str(&sh_quote(&tok));
+    }
+    for tok in user_vllm_arg_tokens(spec)? {
+        serve.push(' ');
+        serve.push_str(&sh_quote(&tok));
+    }
+    Ok(serve)
+}
+
 /// Komenda STARTU KONTENERA dla danej roli (idzie jako entrypoint `bash -c`).
 /// KAZDA interpolowana wartosc jest shell-quote'owana.
 ///
@@ -57,7 +234,19 @@ fn sh_quote(s: &str) -> String {
 /// dolacza dopiero pozniej → vLLM timeoutuje i head pada. Zamiast tego koordynator
 /// odpala `vllm serve` przez `docker exec` DOPIERO gdy `ray status` pokaze pelny
 /// klaster (patrz `build_serve_command`). Worker = ray join + `--block`.
+///
+/// Tryb vllm-mp (natywny multi-node vLLM, bez Raya): worker startuje OD RAZU
+/// pelne `vllm serve --headless --node-rank N` (worker-first — czeka na mastera
+/// TCPStore), a head trzyma kontener na `sleep infinity`; serve head-a (rank 0,
+/// binduje master port) odpala koordynator przez `docker exec` w P5 — czyli
+/// dokladnie ostatni, jak wymaga tego mp init.
 fn build_launch_command(spec: &DistributedDeploySpec) -> Result<String, String> {
+    if engine_is_vllm_mp(&spec.engine_id) {
+        if spec.role == "worker" {
+            return build_mp_serve_command(spec, mp_node_rank(spec)?, true);
+        }
+        return Ok("sleep infinity".to_string());
+    }
     let ray_addr = format!("{}:{}", spec.ray_head_ip, spec.ray_port);
     if spec.role == "worker" {
         return Ok(format!(
@@ -83,6 +272,11 @@ fn build_launch_command(spec: &DistributedDeploySpec) -> Result<String, String> 
 /// VLLM_HOST_IP, HF_HUB_CACHE/OFFLINE) dziedziczone z konfiguracji kontenera.
 /// Shell-quoting jak w `build_launch_command`. Tylko dla roli head.
 pub fn build_serve_command(spec: &DistributedDeploySpec) -> Result<String, String> {
+    if engine_is_vllm_mp(&spec.engine_id) {
+        // Head = rank 0, nie-headless (serwuje API); workery juz czekaja na
+        // mastera TCPStore, wiec ten exec domyka init caly klaster.
+        return build_mp_serve_command(spec, 0, false);
+    }
     let mut serve = format!(
         "cd /root && vllm serve {model} \
          --tensor-parallel-size {tp} \
@@ -145,7 +339,12 @@ fn nccl_env(spec: &DistributedDeploySpec) -> Map<String, Value> {
     m.insert("VLLM_HOST_IP".into(), json!(spec.rdma_ip));
     // Native PyTorch sampler zamiast FlashInfer: FlashInfer robi wolny kernel JIT (ninja)
     // na GB10 (sm_121a, brak prebuiltu), co blokuje faze profiling w TP init.
-    m.insert("VLLM_USE_FLASHINFER_SAMPLER".into(), json!("0"));
+    // Tryb vllm-mp NIE dostaje tego override'u: obraz (np. vllm-dspark) wypala
+    // wlasna, zweryfikowana wartosc (FlashInfer sampler=1 jest czescia garble-fixa
+    // DSpark) i ma prebuiltowe kernele dla sm_121.
+    if !engine_is_vllm_mp(&spec.engine_id) {
+        m.insert("VLLM_USE_FLASHINFER_SAMPLER".into(), json!("0"));
+    }
     // Persist fp4_gemm autotune (leci wielokrotnie przy starcie) w bind-montowanym cache.
     let autotune_cache = format!("{}/fi-at", crate::paths::CONTAINER_VLLM_CACHE_PATH);
     m.insert(

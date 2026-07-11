@@ -1170,6 +1170,22 @@ impl MeshCommandExecutor {
                 Err(e) => return CommandResponse::fail(e.to_string()),
             }
         };
+        // Czlonek AKTYWNEGO klastra TP: usuniecie workera z listy serwisow
+        // zabija rank calego distributed-deploymentu serwujacego na innym nodzie.
+        // Legalna sciezka = stop deploymentu klastra (teardown kasuje wiersze sam).
+        // Osierocony wiersz (deployment juz nie istnieje/nie zyje) przechodzi —
+        // user musi moc posprzatac wraki z listy.
+        if crate::services::deploy::distributed::service_is_distributed_member(&svc.config_json)
+            && crate::services::deploy::distributed::distributed_member_deployment_active(
+                &actions.db,
+                &svc.config_json,
+            )
+            .await
+        {
+            return CommandResponse::fail(
+                "serwis jest czlonkiem AKTYWNEGO deploymentu klastra — zatrzymaj deployment klastra zamiast kasowac pojedynczy wiersz",
+            );
+        }
         // Best-effort runtime stop, then drop the row regardless.
         let _ = crate::services::deploy::stop(&svc, actions.port_allocator.clone()).await;
         // Scoped lock: drop the MutexGuard before awaiting again.

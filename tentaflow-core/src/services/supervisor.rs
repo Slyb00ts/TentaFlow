@@ -335,6 +335,15 @@ impl Supervisor {
             if svc.paused {
                 continue;
             }
+            // Czlonek distributed-deploymentu: zdrowie mierzy koordynator klastra
+            // (endpoint heada), nie lokalny probe. Worker jest headless (bez
+            // endpointu i bez wierszy modeli), wiec lokalna sonda ZAWSZE oznaczy
+            // go Failed/AWARIA mimo ze klaster serwuje — pomijamy w calosci.
+            if crate::services::deploy::distributed::service_is_distributed_member(
+                &svc.config_json,
+            ) {
+                continue;
+            }
             // PID-reuse defence runs only for transports that actually own a process.
             if let Some(pid) = svc.runtime_pid {
                 let needs_pid_check = matches!(
@@ -507,6 +516,19 @@ impl Supervisor {
     /// row to `Running` / `Failed`. Shared by pinned auto-start and embedded
     /// boot-reload; `label` prefixes log + error messages.
     async fn spawn_detached_respawn(&self, svc: &ServiceRow, label: &'static str) {
+        // Czlonek distributed-deploymentu (cluster TP): respawn przez zwykly
+        // pipeline odtwarza SAM kontener (`sleep infinity` na headzie), gubiac
+        // `vllm serve` odpalony przez koordynatora w P5 — czyli zabija zywy
+        // klaster. Cyklem zycia czlonkow zarzadza WYLACZNIE cluster deploy/stop.
+        if crate::services::deploy::distributed::service_is_distributed_member(&svc.config_json) {
+            tracing::warn!(
+                service_id = svc.id,
+                engine = %svc.engine_id,
+                label,
+                "supervisor: pomijam respawn czlonka distributed-deploymentu (zarzadza nim cluster deploy)"
+            );
+            return;
+        }
         self.mark_status(svc.id, ServiceStatus::Starting, None)
             .await;
 
@@ -662,6 +684,13 @@ impl Supervisor {
                 // so we neither flip status nor count restart attempts. The user
                 // controls the runtime state directly through the pin/pause API.
                 if svc.paused {
+                    continue;
+                }
+                // Czlonek distributed-deploymentu — patrz run_first_tick: zdrowie
+                // klastra mierzy koordynator, lokalna sonda daje falszywe Failed.
+                if crate::services::deploy::distributed::service_is_distributed_member(
+                    &svc.config_json,
+                ) {
                     continue;
                 }
                 // Status=Starting/Deploying znaczy ze deploy task wciaz pracuje
@@ -1290,6 +1319,20 @@ impl Supervisor {
                 state.record_attempt(self.restart_backoff_max);
                 let attempt = state.attempts;
                 drop(states);
+
+                // Cluster-TP member: health-restart would recreate the bare
+                // container and drop the coordinator-exec'd `vllm serve` —
+                // the cluster deploy/stop lifecycle owns these rows.
+                if crate::services::deploy::distributed::service_is_distributed_member(
+                    &svc.config_json,
+                ) {
+                    tracing::warn!(
+                        service_id = svc.id,
+                        engine = %svc.engine_id,
+                        "supervisor: pomijam health-restart czlonka distributed-deploymentu"
+                    );
+                    return;
+                }
 
                 self.mark_status(svc.id, ServiceStatus::Starting, None)
                     .await;

@@ -60,6 +60,14 @@ pub struct Engine {
     /// across a cluster. The unified deploy wizard offers it as a cluster target.
     #[serde(default)]
     pub cluster_capable: Option<bool>,
+    /// Multi-node launch mode for cluster deploy. `None`/"ray" = Ray GCS on the
+    /// head + `vllm serve --distributed-executor-backend ray` exec'd on the head
+    /// once every worker joined. "vllm-mp" = vLLM native multi-node
+    /// (`--nnodes/--node-rank/--master-addr/--master-port`, headless workers,
+    /// worker-first ordering; the head's serve binds the torch TCPStore master
+    /// last) — required by runtimes without Ray, e.g. `vllm-dspark`.
+    #[serde(default)]
+    pub cluster_launch: Option<String>,
     pub default_port: u16,
     pub api: ApiKind,
     pub version: String,

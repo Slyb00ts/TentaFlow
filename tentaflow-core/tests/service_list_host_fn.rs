@@ -40,6 +40,8 @@ fn svc(id: i64, node: &str, name: &str, kind: &str, status: &str) -> ServiceInfo
         created_at: "2026-01-01 00:00:00".into(),
         updated_at: "2026-01-01 00:00:00".into(),
         request_time_parameters: RequestTimeParameters::default(),
+        gpu_selection: String::new(),
+        cluster_deployment_id: String::new(),
     }
 }
 

@@ -1,0 +1,48 @@
+# Manifest serwisu vLLM-DSpark — dedykowany runtime DeepSeek V4 Flash na
+# klaster 2x DGX Spark (GB10, sm_121a). Osobny silnik od `vllm-spark.toml`, bo
+# bazuje na prebuiltowym obrazie vLLM 0.24 (unholy-fusion) + overlay/patche
+# nvfp4_ds_mla z przepisu tonyd2wild (zweryfikowany deploy 2026-07-04,
+# 50-60 tok/s code na 2 Sparkach po RoCE). Cluster-only: 284B MoE nie miesci
+# sie na jednym Sparku; deploy uzywa natywnego multi-node vLLM
+# (`--nnodes/--node-rank/--headless`, worker-first), NIE Raya — patrz
+# `cluster_launch = "vllm-mp"` i `services/deploy/distributed.rs`.
+
+[engine]
+id = "vllm-dspark"
+backend = "vllm"  # served by vLLM — drives gpu_memory_utilization + VRAM calculator
+category = "llm"
+name = "DeepSeek V4 Flash DSpark (2x Spark)"
+description_pl = "DeepSeek V4 Flash 284B MoE z DSpark spec-decode i NVFP4 KV-cache na klaster 2x DGX Spark (RoCE). 50-60 tok/s."
+description_en = "DeepSeek V4 Flash 284B MoE with DSpark spec-decode and NVFP4 KV cache on a 2x DGX Spark cluster (RoCE). 50-60 tok/s."
+homepage = "https://github.com/tonyd2wild/DeepSeek-v4-Flash-DSpark-1M-NVFP4-KV-2x-DGX-Spark"
+license = "Apache-2.0"
+icon = "vllm"
+default_port = 8000
+api = "openai-compatible"
+version = "0.24.0"
+# Silnik widoczny TYLKO na Sparku — manifest-store filtruje po polu engine.dgx_spark.
+dgx_spark = true
+# Cluster-ONLY: single-node deploy nie ma sensu (model nie miesci sie na 119GB).
+cluster_capable = true
+# Multi-node przez natywny vLLM mp (--nnodes/--headless, worker-first), nie Ray.
+cluster_launch = "vllm-mp"
+
+[deploy.docker]
+context_path = "llm/docker/vllm-dspark"
+platforms = ["linux"]
+transport = "direct-http"
+
+# Zweryfikowany profil "C12": pula KV ~3.2M tokenow na 2 Sparkach. Przy 256k
+# kontekstu per user 12 rownoleglych slotow wypelnia pule (12 x 262144 = 3.1M).
+# Kontekst (max_model_len) i gpu_memory_utilization ustawiane w wizardzie;
+# max-num-seqs mozna nadpisac w polu vllm_args (`--max-num-seqs N
+# --max-cudagraph-capture-size N`). Sufit YaRN modelu = 1M (1048576).
+[[model_preset]]
+id = "deepseek-v4-flash-dspark-nvfp4"
+display_name = "DeepSeek V4 Flash (NVFP4 KV, 1M ctx, cluster 2x Spark)"
+repo = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
+quantization = "nvfp4"
+speculator_method = "dspark"
+speculator_num_tokens = 3
+recommended = true
+featured = true

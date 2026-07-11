@@ -4767,6 +4767,12 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
                 set(&item, "update_available", s.update_available.into());
                 set(&item, "gpuSelection", s.gpu_selection.clone().into());
                 set(&item, "gpu_selection", s.gpu_selection.into());
+                set(
+                    &item,
+                    "clusterDeploymentId",
+                    s.cluster_deployment_id.clone().into(),
+                );
+                set(&item, "cluster_deployment_id", s.cluster_deployment_id.into());
 
                 let models = js_sys::Array::new();
                 for m in s.models {

@@ -66,6 +66,7 @@ fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
             // dgx_spark: brak ograniczen Spark dla testowego silnika
             dgx_spark: None,
             cluster_capable: None,
+            cluster_launch: None,
             default_port: 0,
             api: ApiKind::OpenaiCompatible,
             version: "0.0.1".into(),
@@ -101,6 +102,7 @@ fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
             speculator_method: None,
             speculator_num_tokens: None,
             vllm: None,
+            quant_variants: vec![],
         }],
         parameters: vec![],
         docker_source_hash: String::new(),
@@ -145,6 +147,8 @@ fn fake_service_info(id: i64, node_id: &str, model_name: &str) -> ServiceInfo {
         updated_at: String::new(),
         // request_time_parameters: domyslna pusta mapa parametrow
         request_time_parameters: Default::default(),
+        gpu_selection: String::new(),
+        cluster_deployment_id: String::new(),
     }
 }
 

@@ -1204,13 +1204,16 @@ async fn deploy_distributed_local(
 }
 
 /// Buduje per-node spec, wstrzykujac `_target_node_id` do `config_json` (tylko
-/// koordynator go czyta — `build_member_config_json` przepuszcza nieznane klucze).
+/// koordynator go czyta — `build_member_config_json` przepuszcza nieznane klucze)
+/// oraz `_mp_node_rank` (rank czlonka dla trybu `cluster_launch = "vllm-mp"`;
+/// nieszkodliwy dla trybu Ray).
 #[allow(clippy::too_many_arguments)]
 fn build_member_spec(
     deployment_cluster_id: &str,
     cluster_id: &str,
     engine_id: &str,
     role: &str,
+    mp_node_rank: u32,
     member: &crate::db::models::DbClusterMember,
     model: &str,
     served: &str,
@@ -1234,6 +1237,10 @@ fn build_member_spec(
         obj.insert(
             "_target_node_id".to_string(),
             serde_json::Value::String(member.node_id.clone()),
+        );
+        obj.insert(
+            "_mp_node_rank".to_string(),
+            serde_json::Value::from(mp_node_rank),
         );
     }
     tentaflow_protocol::mesh::DistributedDeploySpec {
@@ -1409,10 +1416,12 @@ pub async fn cluster_deploy(
     // Na unified memory (GB10/Spark) 119GB jest dzielone CPU+GPU, wiec 0.9 kaze vLLM
     // alokowac ~107GB i OOM-killuje rank0 przy TP init. Bezpieczny default 0.5; user
     // moze nadpisac w wizardzie jesli wie ile ma naglowka.
-    let gpu_mem = gpu_memory_utilization.unwrap_or(if engine_id == "vllm-spark" {
-        0.5
-    } else {
-        0.90
+    let gpu_mem = gpu_memory_utilization.unwrap_or(match engine_id.as_str() {
+        "vllm-spark" => 0.5,
+        // Zweryfikowany profil DSpark na GB10 (VLLM_SKIP_INIT_MEMORY_CHECK=1
+        // w obrazie pozwala na 0.85 mimo unified memory).
+        "vllm-dspark" => 0.85,
+        _ => 0.90,
     });
     let max_len = max_model_len.unwrap_or(8192);
     let ray_port: u16 = 6379;
@@ -1454,6 +1463,14 @@ pub async fn cluster_deploy(
     let mut persisted_members: Vec<crate::db::models::DbClusterDeploymentMember> = Vec::new();
     for (idx, m) in members.iter().enumerate() {
         let role = if idx == head_idx { "head" } else { "worker" };
+        // Rank vllm-mp: head=0, workery kolejno 1..n-1 (unikalne, ciagle).
+        let mp_rank = if idx == head_idx {
+            0
+        } else if idx < head_idx {
+            idx as u32 + 1
+        } else {
+            idx as u32
+        };
         specs.push((
             idx,
             build_member_spec(
@@ -1461,6 +1478,7 @@ pub async fn cluster_deploy(
                 cluster_id,
                 engine_id,
                 role,
+                mp_rank,
                 m,
                 &model,
                 &served,
@@ -1537,60 +1555,13 @@ pub async fn cluster_deploy(
         ));
     }
 
-    // Canoniczny wpis `services` dla CALEGO cluster-deployu — od razu widoczny na
-    // liscie serwisow jako `deploying` (spojnie z single-node deployem), potem
-    // sterowany do `running`/`failed` przez maszyne faz. Per-node wpisy czlonkow
-    // (head + workery) sa ukrywane w `service_list` (dedup po
-    // `deployment_cluster_id`/członkostwie), wiec user widzi JEDEN wpis. Wiersz
-    // jest inertny dla supervisora (pinned=false, External/ExternalHttp, zero
-    // modeli), a routing i tak idzie przez realny wpis head-a.
-    {
-        let placeholder = crate::services::deploy::build_placeholder_for_cluster(
-            engine_id,
-            &served,
-            endpoint_url.clone(),
-            &deployment_cluster_id,
-        );
-        // Placeholder jest kontraktem „widoczny od startu" — jego brak lamie
-        // liste serwisow. Traktujemy insert jak czesc transakcyjnego startu:
-        // porazka aportuje deploy (release portow + delete cluster + delete
-        // wiersza deployments), spojnie z bledem `deployments::create` powyzej.
-        let insert_result = match ctx.state.db.write() {
-            Ok(conn) => crate::services_repo::services::insert(&conn, &placeholder)
-                .map_err(|e| e.to_string()),
-            Err(_) => Err("db pool poisoned".to_string()),
-        };
-        match insert_result {
-            Ok(service_id) => {
-                if let Ok(Some(info)) = crate::services::snapshot_builder::build_one(
-                    &ctx.state.db,
-                    service_id,
-                    ctx.state.local_node_id.as_ref(),
-                ) {
-                    super::handlers::broadcast_service_change(
-                        ctx,
-                        tentaflow_protocol::ServiceChange::Added(info),
-                    );
-                }
-            }
-            Err(e) => {
-                let _ = port_allocator.release(serve_port);
-                let _ = port_allocator.release(dist_port);
-                let _ = crate::db::repository::delete_cluster_deployment(
-                    &ctx.state.db,
-                    &deployment_cluster_id,
-                );
-                let _ = crate::db::repository::deployments::delete(
-                    &ctx.state.db,
-                    &deployment_cluster_id,
-                );
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::Internal,
-                    format!("persist cluster placeholder service: {e}"),
-                ));
-            }
-        }
-    }
+    // BRAK osobnej „wizytowki" klastra: klaster jest reprezentowany na liscie
+    // serwisow WPROST przez per-node wiersze czlonkow (head + workery), po jednym
+    // na nodzie — dokladnie jak kazdy inny serwis, tyle ze rozciagniety na wiele
+    // nodow. `service_list` ich juz NIE ukrywa. Realny stan gotowosci calego
+    // klastra sledzi rekord `cluster_deployments` (widok Klastry) + modal postepu
+    // deployu; statusem wierszy czlonkow steruje ich wlasny pipeline, a supervisor
+    // ich nie sonduje ani nie respawnuje (patrz guardy `service_is_distributed_member`).
 
     // NIEBLOKUJACY zwrot: kanal log-busa MUSI istniec zanim frontend zdazy
     // zasubskrybowac `deploymentLogStreamRequest` (keyed by deployment_cluster_id),
@@ -2006,21 +1977,28 @@ async fn run_cluster_deploy_phases(
         return;
     }
 
-    cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 45, "P3: Ray GCS head");
-    info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P3: wait head Ray GCS");
-    if let Err(e) = poll_node_readiness(
-        ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
-        expected_nodes, ReadyPhase::GcsUp, gcs_timeout,
-    )
-    .await
-    {
-        cdeploy_fail(
-            ctx, &qm, &log_sender, &local_id, &deployment_cluster_id, serve_port, dist_port,
-            &head_node_id, endpoint_url, &persisted_members, statuses,
-            format!("Ray GCS head nie wstał: {e}"), start_ms,
+    // Tryb vllm-mp (natywny multi-node vLLM): brak Raya — P3 (GCS) i pozniejszy
+    // gate ClusterReady nie maja czego sondowac. Workery startuja pelne
+    // `vllm serve --headless` juz w P4 i czekaja na mastera TCPStore, ktorego
+    // binduje dopiero serve head-a w P5 (worker-first, jak wymaga mp init).
+    let vllm_mp = crate::services::deploy::distributed::engine_is_vllm_mp(&engine_id);
+    if !vllm_mp {
+        cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 45, "P3: Ray GCS head");
+        info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P3: wait head Ray GCS");
+        if let Err(e) = poll_node_readiness(
+            ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
+            expected_nodes, ReadyPhase::GcsUp, gcs_timeout,
         )
-        .await;
-        return;
+        .await
+        {
+            cdeploy_fail(
+                ctx, &qm, &log_sender, &local_id, &deployment_cluster_id, serve_port, dist_port,
+                &head_node_id, endpoint_url, &persisted_members, statuses,
+                format!("Ray GCS head nie wstał: {e}"), start_ms,
+            )
+            .await;
+            return;
+        }
     }
 
     cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 60, "P4: start workerów (join Ray)");
@@ -2060,20 +2038,22 @@ async fn run_cluster_deploy_phases(
         }
     }
 
-    cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 70, "P4: klaster Ray gotowy");
-    if let Err(e) = poll_node_readiness(
-        ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
-        expected_nodes, ReadyPhase::ClusterReady, gcs_timeout,
-    )
-    .await
-    {
-        cdeploy_fail(
-            ctx, &qm, &log_sender, &local_id, &deployment_cluster_id, serve_port, dist_port,
-            &head_node_id, endpoint_url, &persisted_members, statuses,
-            format!("workery nie dołączyły do klastra Ray w czasie: {e}"), start_ms,
+    if !vllm_mp {
+        cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 70, "P4: klaster Ray gotowy");
+        if let Err(e) = poll_node_readiness(
+            ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
+            expected_nodes, ReadyPhase::ClusterReady, gcs_timeout,
         )
-        .await;
-        return;
+        .await
+        {
+            cdeploy_fail(
+                ctx, &qm, &log_sender, &local_id, &deployment_cluster_id, serve_port, dist_port,
+                &head_node_id, endpoint_url, &persisted_members, statuses,
+                format!("workery nie dołączyły do klastra Ray w czasie: {e}"), start_ms,
+            )
+            .await;
+            return;
+        }
     }
 
     cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 80, "P5: start vllm serve");
@@ -2497,11 +2477,14 @@ pub async fn cluster_deploy_stop(
         .ok_or_else(|| ProtocolError::not_found("deployment not found"))?;
     // P2-3: the deployment must belong to the cluster named in the request — a
     // stale/forged cluster_id must not tear down another cluster's deployment.
-    if dep.cluster_id != *cluster_id {
+    // Pusty `cluster_id` = wywolanie z wiersza serwisu (GUI zna tylko
+    // deployment_cluster_id) — wtedy bierzemy cluster z rekordu deploymentu.
+    if !cluster_id.is_empty() && dep.cluster_id != *cluster_id {
         return Err(ProtocolError::bad_request(
             "deployment nie należy do podanego klastra",
         ));
     }
+    let cluster_id = &dep.cluster_id;
     let dep_members =
         crate::db::repository::list_cluster_deployment_members(&ctx.state.db, deployment_cluster_id)
             .map_err(|e| ProtocolError::new(ProtocolErrorCode::Internal, e.to_string()))?;

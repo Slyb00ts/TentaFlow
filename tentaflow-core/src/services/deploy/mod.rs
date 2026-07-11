@@ -747,6 +747,18 @@ pub async fn stop_all_supervised(
     };
     let mut errors: Vec<(i64, String)> = Vec::new();
     for svc in services {
+        // Czlonek distributed-deploymentu (cluster TP): kontener zyje NIEZALEZNIE
+        // od procesu core (detached docker) i serwuje klaster razem z rankami na
+        // INNYCH nodach. Restart/shutdown core nie moze go zatrzymywac — cyklem
+        // zycia zarzadza wylacznie cluster deploy/stop.
+        if distributed::service_is_distributed_member(&svc.config_json) {
+            tracing::info!(
+                service_id = svc.id,
+                engine = %svc.engine_id,
+                "shutdown: pomijam czlonka distributed-deploymentu (kontener zostaje)"
+            );
+            continue;
+        }
         let id = svc.id;
         let engine_id = svc.engine_id.clone();
         if let Err(e) = stop(&svc, ports.clone()).await {
@@ -2001,6 +2013,7 @@ mod apply_parameters_deploy_tests {
             default_port: 8000,
             dgx_spark: None,
             cluster_capable: None,
+            cluster_launch: None,
             api: ApiKind::OpenaiCompatible,
             version: "0.1.0".into(),
             service_surfaces: None,
@@ -2285,6 +2298,7 @@ mod hf_token_gate_tests {
             default_port: 8000,
             dgx_spark: None,
             cluster_capable: None,
+            cluster_launch: None,
             api,
             version: "0.1.0".into(),
             service_surfaces: None,
@@ -2938,6 +2952,7 @@ mod tests {
                 default_port: 8000,
                 dgx_spark: None,
                 cluster_capable: None,
+                cluster_launch: None,
                 api: ApiKind::OpenaiCompatible,
                 version: "0.0.1".into(),
                 service_surfaces: None,
