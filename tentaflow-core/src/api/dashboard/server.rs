@@ -684,6 +684,46 @@ fn check_signed_url_rate_limit(
     }
 }
 
+/// Charge the strict invalid-signed-token limiter after an HMAC token FAILED
+/// verification on `/frames` or `/recordings`. Returns:
+///   * `None`  → the strict bucket still had budget; caller serves the normal
+///     401/403 (with its own already-emitted audit).
+///   * `Some(resp)` → the strict bucket is exhausted; caller returns this 429
+///     (with the `rate_limit_denied` audit) INSTEAD of the 401/403, bounding
+///     both forged-token throughput and the audit-INSERT cost per IP.
+///
+/// Valid requests from a logged-in user never reach this path, so they are
+/// never throttled beyond the generous pre-verify ceiling.
+fn charge_invalid_signed_token(
+    db: &DbPool,
+    ip: &str,
+    user_agent: Option<&str>,
+    endpoint: &str,
+) -> Option<Response<DashboardBody>> {
+    use crate::api::rate_limit::{invalid_signed_token_limiter, RateLimitResult};
+    match invalid_signed_token_limiter().check(ip) {
+        RateLimitResult::Allow => None,
+        RateLimitResult::IpLimit {
+            retry_after_secs, ..
+        } => Some(build_rate_limit_response(
+            db,
+            ip,
+            user_agent,
+            endpoint,
+            retry_after_secs,
+            false,
+        )),
+        RateLimitResult::GlobalLimit { retry_after_secs } => Some(build_rate_limit_response(
+            db,
+            ip,
+            user_agent,
+            endpoint,
+            retry_after_secs,
+            true,
+        )),
+    }
+}
+
 /// Bearer token for the `/models/*` endpoints, extracted before the request
 /// is dropped (the streaming body handler must not hold `req`).
 fn models_bearer_token(headers: &hyper::HeaderMap) -> Option<String> {
@@ -1476,7 +1516,32 @@ pub async fn handle_request(
                     .body(Either::Left(Full::new(Bytes::from(body))))
                     .unwrap());
             }
-            FrameOutcome::Denied(_) | FrameOutcome::NotFound => {
+            FrameOutcome::Denied(_) => {
+                // Token verification FAILED (forged / expired / scope mismatch).
+                // Charge the strict invalid-token bucket: if it is exhausted for
+                // this IP, return 429 instead of 403 to bound forged-token spam
+                // and its audit cost. `handle_frame_url` already emitted the
+                // per-outcome "denied" audit above.
+                if let Some(resp) = charge_invalid_signed_token(
+                    &db,
+                    &client_ip,
+                    user_agent.as_deref(),
+                    "/frames",
+                ) {
+                    return Ok(resp);
+                }
+                return Ok(Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from_static(
+                        b"{\"error\":\"frame_denied\"}",
+                    ))))
+                    .unwrap());
+            }
+            FrameOutcome::NotFound => {
+                // Valid token pointing at an evicted/unknown frame — NOT a
+                // verification failure, so it must not charge the strict bucket
+                // (a logged-in user hitting a stale thumbnail is legitimate).
                 return Ok(Response::builder()
                     .status(status)
                     .header("Content-Type", "application/json")
@@ -1577,9 +1642,31 @@ pub async fn handle_request(
                     .body(Either::Left(Full::new(Bytes::from(body))))
                     .unwrap());
             }
-            RecordingOutcome::Denied(_)
-            | RecordingOutcome::NotFound
-            | RecordingOutcome::InternalError(_) => {
+            RecordingOutcome::Denied(_) => {
+                // Token verification FAILED (forged / expired / scope mismatch).
+                // Charge the strict invalid-token bucket: exhausted → 429 instead
+                // of 403, bounding forged-token spam and its audit cost.
+                // `handle_recording_url` already emitted the "denied" audit above.
+                if let Some(resp) = charge_invalid_signed_token(
+                    &db,
+                    &client_ip,
+                    user_agent.as_deref(),
+                    "/recordings",
+                ) {
+                    return Ok(resp);
+                }
+                return Ok(Response::builder()
+                    .status(auth_status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from_static(
+                        b"{\"error\":\"recording_denied\"}",
+                    ))))
+                    .unwrap());
+            }
+            RecordingOutcome::NotFound | RecordingOutcome::InternalError(_) => {
+                // Valid token, but the row is purged (404) or a DB/internal
+                // failure (500). Neither is a token-verify failure, so the
+                // strict invalid-token bucket must not be charged.
                 return Ok(Response::builder()
                     .status(auth_status)
                     .header("Content-Type", "application/json")
