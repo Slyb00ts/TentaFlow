@@ -38,9 +38,16 @@ pub struct RateLimitConfig {
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            per_ip_capacity: 10,
-            per_ip_refill_per_sec: 1.0,
-            global_capacity: 100,
+            // The dashboard's recordings gallery legitimately loads a page of
+            // signed-URL images from ONE IP in a burst (each row has a plate +
+            // ADR thumbnail, ~20+ requests) plus a video on playback. A burst of
+            // 10 threw 429 and left thumbnails blank. 80 burst / 20-per-second
+            // sustain covers a gallery + browsing while still bounding forged-
+            // token spam (the HMAC token is the primary defense; the global
+            // bucket below is the DoS ceiling).
+            per_ip_capacity: 80,
+            per_ip_refill_per_sec: 20.0,
+            global_capacity: 400,
             global_refill_per_sec: 1000.0,
         }
     }
