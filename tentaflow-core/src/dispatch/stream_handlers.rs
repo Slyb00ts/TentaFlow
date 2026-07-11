@@ -116,12 +116,13 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             audio_input: None,
         };
 
-        // Selektor flow z UI czatu: konkretny flow po ID albo synthetic
-        // "Default Chat". Celowo NIE Auto — Auto rozwiązuje default flow z DB
-        // (edytowalny w Flow Builderze), a UI czatu ma jawny wybór flow.
+        // Selektor flow z UI czatu: konkretny flow po ID albo "Default Chat".
+        // "Default Chat" = Auto: czysty model / alias→model wykonywany wprost na
+        // backendzie (bez flow, bez pii). Tylko flow published as a model /
+        // alias→flow trafia w flow engine.
         let flow_selector = match stream_req.flow_id.clone() {
             Some(flow_id) => crate::routing::streaming::ChatFlowSelector::FlowId(flow_id),
-            None => crate::routing::streaming::ChatFlowSelector::Synthetic,
+            None => crate::routing::streaming::ChatFlowSelector::Auto,
         };
         // Realny zalogowany użytkownik z sesji → atrybucja zużycia tokenów i kwot
         // per-user (bez tego AiGateway zapisywałby zużycie na sentinel __system__).

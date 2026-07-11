@@ -21,11 +21,10 @@ pub struct TtsBytes {
 }
 
 impl Router {
-    /// Syntezuje mowe z tekstu przez flow_engine (stage 3d Universal Flow
-    /// Gateway). Synthetic flow `trigger → tts(model) → output` aktywuje
-    /// się gdy admin nie skonfigurował user-defined flow; backend dispatch
-    /// (embedded sherpa, HTTP, QUIC, mesh) idzie przez TtsDispatcherImpl
-    /// → executor.execute_tts.
+    /// Syntezuje mowe z tekstu przez FlowDispatcher. Jawny flow gdy
+    /// skonfigurowany; gdy brak — model TTS wykonywany BEZPOŚREDNIO na
+    /// executorze; backend dispatch (embedded sherpa, HTTP, QUIC, mesh) idzie
+    /// przez TtsDispatcherImpl → executor.execute_tts.
     ///
     /// Parametry:
     /// - `request`: TTSRequest z OpenAI API format (model, input, voice, format, speed)
@@ -89,10 +88,9 @@ impl Router {
         let tts_model = cleaned_request.model.clone();
         let t = std::time::Instant::now();
 
-        // Stage 3d Universal Flow Gateway: TTS path zawsze przez
-        // FlowDispatcher. Synthetic flow `trigger → tts(model) → output`
-        // aktywuje się gdy admin nie skonfigurował user-defined flow.
-        // Direct executor.execute_tts fallback wycięty w 3d-0b-final.
+        // TTS path zawsze przez FlowDispatcher: jawny flow gdy skonfigurowany,
+        // inaczej model TTS wykonywany bezpośrednio na executorze (NotFound →
+        // direct execution wewnątrz dispatchera).
         if let Some(ref dispatcher) = self.flow_dispatcher {
             let (initial, meta) =
                 crate::services::runtime::executor::tts_request_to_initial_envelope(
@@ -148,10 +146,8 @@ impl Router {
             }
         }
 
-        // Stage 3d-0b-final: brak flow_dispatcher (DB-less router) → 500.
-        // Direct executor.execute_tts fallback wycięty. Plan v1.5 wymaga
-        // że KAŻDY TTS request przechodzi przez flow_engine (synthetic
-        // albo user-defined).
+        // Brak flow_dispatcher (DB-less router) → 500. KAŻDY TTS request
+        // przechodzi przez FlowDispatcher (jawny flow albo direct execution).
         let _ = t;
         self.log_tts_dispatch_diagnostics(&tts_model);
         Err(crate::error::CoreError::InternalError {

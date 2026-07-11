@@ -21,8 +21,8 @@ use tracing::debug;
 ///    = "text"`. Vision request (`request_modality = "image"`) bez bindingu
 ///    zwraca `None`; default flows są zakładowo text-only bo `vision_llm` node
 ///    wymaga R8 input_port_type=Image.
-/// 3. None — `FlowDispatcher` aktywuje synthetic ad-hoc flow (Universal Flow
-///    Gateway, stage 3d). Zero direct executor fallback po stage 3d-0b-final.
+/// 3. None — brak jawnego flow: `FlowDispatcher` wykonuje model BEZPOŚREDNIO na
+///    executorze (pojedyncza capability, bez flow engine, bez pii_filter).
 pub fn resolve_flow(
     pool: &DbPool,
     model_name: &str,

@@ -610,7 +610,7 @@ pub async fn dispatch_reverse_stream_request(
         target: "mesh::reverse",
         request_id = %request_id,
         model = %completion_payload.model,
-        "mesh reverse chat stream start (synthetic dispatch)"
+        "mesh reverse chat stream start (direct model dispatch)"
     );
     let mut chat_request = match build_chat_request(completion_payload) {
         Ok(req) => req,
@@ -632,18 +632,18 @@ pub async fn dispatch_reverse_stream_request(
     chat_request.stream = true;
 
     // Mesh reverse stream = the INITIATOR's flow already ran (its llm node
-    // forwarded a raw model call here). Re-entering flow dispatch (`Auto`:
-    // model binding > default flow > synthetic) executes the owner's flow a
-    // second time on top of it — doubled prompts/PII/memory, a voice flow's
-    // TTS pushes Audio deltas into the chat bridge ("flow misconfig" abort),
-    // and a default flow can silently swap the model. Mirrors the
-    // EXEMPT-MESH-INBOUND direct-executor rule of the non-streaming branch.
+    // forwarded a raw model call here). The forwarded name is a concrete service
+    // model, so `Auto` classifies it as a plain model and streams it straight
+    // from the backend — no flow re-entry (which would double prompts/PII/memory,
+    // push a voice flow's TTS audio into the chat bridge, or silently swap the
+    // model). Mirrors the EXEMPT-MESH-INBOUND direct-executor rule of the
+    // non-streaming branch.
     let route_result = match router
         .route_chat_completion_stream(
             chat_request,
             None,
             None,
-            crate::routing::streaming::ChatFlowSelector::Synthetic,
+            crate::routing::streaming::ChatFlowSelector::Auto,
         )
         .await
     {

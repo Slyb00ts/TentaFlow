@@ -22,13 +22,12 @@ impl Router {
     /// for internal callers (addons, reverse mesh, translate) that bypass
     /// ACL by design.
     ///
-    /// Dispatch (stage 3d Universal Flow Gateway):
+    /// Dispatch:
     /// 1. Model-level ACL when a user is attached.
-    /// 2. FlowDispatcher::try_dispatch — user-defined flow (gdy admin
-    ///    skonfigurował) albo synthetic ad-hoc flow `trigger → llm(model)
-    ///    → output` (auto-fallback). Każdy chat request przechodzi przez
-    ///    flow_engine; backend dispatch idzie przez LlmDispatcherImpl →
-    ///    executor.execute_chat.
+    /// 2. Czysty model / alias→model → bezpośrednie wykonanie na backendzie
+    ///    (bez flow). Flow published as a model / alias→flow → FlowDispatcher:
+    ///    jawny user-defined flow, a gdy go brak — model wykonywany bezpośrednio
+    ///    (LlmDispatcherImpl → executor.execute_chat, bez pii_filter).
     pub async fn route_chat_completion(
         &self,
         request: ChatCompletionRequest,
@@ -286,10 +285,8 @@ impl Router {
             }
         }
 
-        // Stage 3d-0b-final: brak flow_dispatcher (DB-less router) → 500.
-        // Plan v1.5 wymaga że KAŻDY chat request przechodzi przez flow_engine
-        // (synthetic albo user-defined). Direct executor.execute_chat fallback
-        // wycięty.
+        // Brak flow_dispatcher (DB-less router) i model klasyfikowany jako flow
+        // → 500 (plain models obsłużone wyżej ścieżką direct).
         if let Some(event) = compliance_event.as_ref() {
             if let Err(audit_error) = event.finish_failed("flow_dispatcher_not_wired") {
                 tracing::warn!(

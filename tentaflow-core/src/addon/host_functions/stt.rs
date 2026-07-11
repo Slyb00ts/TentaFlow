@@ -168,7 +168,7 @@ pub fn stt_transcribe_v1(
     };
 
     // Most async→sync jak w llm_generate — TA SAMA sciezka co node stt
-    // (FlowDispatcher, synthetic flow trigger → stt → output).
+    // (FlowDispatcher: jawny flow albo direct STT execution).
     let result = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current()
             .block_on(router.route_audio_transcription_for_user(request, None))

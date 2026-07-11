@@ -1033,8 +1033,8 @@ fn seed_default_flows(conn: &Connection) -> Result<()> {
     // Fresh DB seeduje tylko jeden domyslny flow: "Default Chat" (streaming
     // chat z filtrem PII, default=1). Reszta pipeline'ow (TTS, Audio Chat,
     // teams-flow, osobny "Standardowy pipeline LLM") nie jest zakladana —
-    // brakujace service_type/modality rozwiazuje synthetic fallback
-    // (synthetic.rs), a uzytkownik buduje wlasne flowy w Flow Builderze.
+    // brakujace service_type/modality wykonuje sie bezposrednio na executorze
+    // (direct execution), a uzytkownik buduje wlasne flowy w Flow Builderze.
     //
     // Flow seedowany jako STREAMING (LLM -> pii_filter -> output z mode=stream,
     // edges od LLM dalej z from_port=stream). Bez tego try_dispatch_streaming

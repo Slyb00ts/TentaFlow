@@ -1215,8 +1215,8 @@ async fn handle_audio_tts_stream(
 /// - User-defined blocking flow z `FlowValue::Audio` na output → single
 ///   chunk z całością bytes (`wrap_blocking_as_stream` fetchuje BlobStore
 ///   przed emitem).
-/// - Synthetic TTS (gdy admin nie skonfigurował user-defined) → blocking
-///   path → single chunk.
+/// - Direct TTS (gdy admin nie skonfigurował jawnego flow) → blocking path →
+///   single chunk.
 ///
 /// Cancel propaguje przez `CancelOnDropStream` — hyper drop body → token
 /// cancel → executor finalizer EOF.

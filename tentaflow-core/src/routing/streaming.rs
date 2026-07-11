@@ -20,10 +20,10 @@ use futures::Stream;
 /// Wybór flow dla streamowanego chatu (`route_chat_completion_stream`).
 #[derive(Debug, Clone)]
 pub enum ChatFlowSelector {
-    /// Standardowa rezolucja: binding modelu > default flow z DB > synthetic.
+    /// Standardowa rezolucja: czysty model / alias→model → bezpośrednie
+    /// wykonanie na backendzie; alias→flow / flow published as model → flow
+    /// engine (jawny flow albo — gdy brak — direct execution).
     Auto,
-    /// Wymuszony synthetic chat-stream (opcja "Default Chat" w UI czatu).
-    Synthetic,
     /// Konkretny flow użytkownika po ID (wybrany w selektorze czatu).
     FlowId(String),
 }
@@ -605,15 +605,14 @@ enum UsageSplitState {
 }
 
 impl Router {
-    /// Routuje chat completion request (STREAMING MODE) przez flow_engine
-    /// (stage 3d Universal Flow Gateway). Synthetic streaming flow `trigger
-    /// → llm(model) → output(stream)` aktywuje się gdy admin nie
-    /// skonfigurował user-defined flow. User-defined blocking-only flow
-    /// jest opakowywany w single-chunk stream (wrapper sync→stream w
-    /// FlowDispatcher::try_dispatch_streaming). PII cleaning idzie przez
-    /// `pii_filter` StreamingNodeAdapter wewnątrz flow_engine — synthetic
-    /// chat-stream wstrzykuje node domyślnie; user-defined flow dodaje
-    /// `pii_filter` opcjonalnie (PII jest opt-in).
+    /// Routuje chat completion request (STREAMING MODE). Czysty model /
+    /// alias→model streamuje wprost z backendu (bez flow, bez PII buforowania).
+    /// Flow published as a model / alias→flow idzie przez flow_engine: jawny
+    /// user-defined flow, a gdy go brak — model wykonywany BEZPOŚREDNIO na
+    /// executorze (bez pii_filter). User-defined blocking-only flow jest
+    /// opakowywany w single-chunk stream (wrapper sync→stream w
+    /// FlowDispatcher::try_dispatch_streaming). PII cleaning istnieje wyłącznie
+    /// jako opcjonalny `pii_filter` node w jawnym flow (PII jest opt-in).
     pub async fn route_chat_completion_stream(
         &self,
         request: ChatCompletionRequest,
@@ -720,11 +719,11 @@ impl Router {
         };
 
         // === DIRECT MODEL: raw model → backend stream bez flow ===
-        // A plain model name streams straight from the backend (no synthetic
-        // /default flow, no PII sentence-buffering → token-level TTFT). Only a
-        // Flow published as a model (or an alias resolving to one) takes the
-        // flow-engine path below. Explicit Synthetic / FlowId selectors (dashboard
-        // "Default Chat", picked flow) always go through the flow engine.
+        // A plain model name (or an alias resolving to one) streams straight from
+        // the backend (no flow, no PII sentence-buffering → token-level TTFT).
+        // Only a Flow published as a model (or an alias resolving to one) takes
+        // the flow-engine path below. An explicit FlowId selector (a picked flow)
+        // always goes through the flow engine.
         if matches!(flow_selector, ChatFlowSelector::Auto)
             && !crate::routing::chat::model_resolves_to_flow(
                 &self.catalog_snapshot(),
@@ -826,16 +825,6 @@ impl Router {
                         .try_dispatch_streaming(&request.model, "chat", initial_stream, meta_stream)
                         .await
                 }
-                ChatFlowSelector::Synthetic => {
-                    dispatcher
-                        .dispatch_synthetic_streaming(
-                            &request.model,
-                            "chat",
-                            initial_stream,
-                            meta_stream,
-                        )
-                        .await
-                }
                 ChatFlowSelector::FlowId(flow_id) => {
                     dispatcher
                         .dispatch_by_flow_id_streaming(
@@ -864,11 +853,9 @@ impl Router {
                         model_for_stream,
                         need_usage,
                     );
-                    // PII cleaning idzie teraz przez `pii_filter`
-                    // StreamingNodeAdapter wewnątrz flow_engine — wire
-                    // layer już nie filtruje. Synthetic chat-stream
-                    // automatycznie wpina pii_filter; user-defined flowy
-                    // dodają pii_filter opcjonalnie (PII jest opt-in).
+                    // PII cleaning istnieje wyłącznie jako opcjonalny
+                    // `pii_filter` node w jawnym user-defined flow (PII jest
+                    // opt-in); direct execution i wire layer nie filtrują.
                     let filtered = chunk_stream;
                     let cancel_wrapped: std::pin::Pin<
                         Box<
@@ -925,11 +912,8 @@ impl Router {
             }
         }
 
-        // Stage 3d-0b-final: brak flow_dispatcher (DB-less router) → 500.
-        // Plan v1.5 wymaga że KAŻDY chat streaming request przechodzi przez
-        // flow_engine (synthetic streaming albo user-defined flow). Direct
-        // executor.stream_chat fallback wycięty — Universal Flow Gateway
-        // jest jedyną ścieżką dispatch.
+        // Brak flow_dispatcher (DB-less router) i model klasyfikowany jako flow
+        // → 500 (plain models obsłużone wyżej ścieżką direct stream).
         let _ = target_accepts_audio;
         let _ = stream_start;
         let _ = stream_node_name;

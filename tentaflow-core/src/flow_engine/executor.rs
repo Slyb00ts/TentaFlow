@@ -299,6 +299,164 @@ pub async fn execute_blocking(
     Ok(outcome)
 }
 
+/// Direct single-capability execution — no DAG, no trigger/output wrapper, no
+/// pii_filter. Called by `FlowDispatcher` when there is no user-defined flow for
+/// `model:service_type:modality`: the model runs straight on the executor via
+/// its capability node adapter (`llm` / `vision_llm` / `tts` / `stt` /
+/// `embeddings`), which is the canonical builder that turns the seed envelope
+/// into a dispatcher request. Compliance AI events + token accounting still fire
+/// inside the capability dispatcher (`ctx.llm` etc.), so removing the synthetic
+/// flow loses no audit. Ephemeral: no `flow_executions` audit row.
+pub async fn execute_direct_blocking(
+    node: FlowNode,
+    initial: FlowEnvelope,
+    mut ctx: ExecutionContext,
+    adapters: Arc<AdapterRegistry>,
+) -> Result<FlowExecutionOutcome> {
+    let started = Instant::now();
+    let initial_arc = Arc::new(initial);
+    ctx.initial_envelope = initial_arc.clone();
+    let ctx = Arc::new(ctx);
+
+    let adapter = adapters.get(&node.node_type).ok_or_else(|| {
+        anyhow!(
+            "no adapter for direct node '{}' (type '{}')",
+            node.id,
+            node.node_type
+        )
+    })?;
+
+    let inputs = vec![NodeInput {
+        from_node_id: "direct".to_string(),
+        from_port: "full".to_string(),
+        envelope: initial_arc.clone(),
+    }];
+
+    let step_started = ctx.clock.now_ms();
+    let attempt = Instant::now();
+    emit_node_started(&ctx, &node.id, &node.node_type);
+    let final_envelope = match adapter.execute(&node, &inputs, &ctx).await {
+        Ok(env) => {
+            emit_node_finished(&ctx, &node.id, &TraceStatus::Ok);
+            env
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            emit_node_finished(
+                &ctx,
+                &node.id,
+                &TraceStatus::Error {
+                    message: msg.clone(),
+                },
+            );
+            return Err(anyhow!("direct '{}' execution failed: {msg}", node.node_type));
+        }
+    };
+
+    let mut trace = vec![TraceStep {
+        node_id: node.id.clone(),
+        node_type: node.node_type.clone(),
+        started_at_ms: step_started,
+        duration_ms: attempt.elapsed().as_millis() as u64,
+        status: TraceStatus::Ok,
+        usage: None,
+    }];
+    attribute_usage(&ctx, &mut trace);
+    let aggregate_usage = aggregate_usage(&trace);
+
+    Ok(FlowExecutionOutcome {
+        final_envelope,
+        trace,
+        usage: aggregate_usage,
+        perf: None,
+        finish_reason: FinishReason::Stop,
+        total_latency_ms: started.elapsed().as_millis() as i64,
+        error: None,
+    })
+}
+
+/// Streaming counterpart of [`execute_direct_blocking`] for a stream-producing
+/// capability (the `llm` node). Builds the producer's `EnvelopeDelta` stream and
+/// hands it to the shared [`finalize_streaming_flow`] task, so usage/perf/finish
+/// accumulation and the usage trailer are identical to the flow path (compliance
+/// token accounting downstream depends on that trailer). No DAG, no chain nodes,
+/// no pii_filter; ephemeral (`execution_id = 0`, no audit row).
+pub async fn execute_direct_streaming(
+    db: DbPool,
+    node: FlowNode,
+    initial: FlowEnvelope,
+    mut ctx: ExecutionContext,
+    adapters: Arc<AdapterRegistry>,
+) -> Result<StreamingExecution> {
+    let started = Instant::now();
+    let initial_arc = Arc::new(initial);
+    ctx.initial_envelope = initial_arc.clone();
+
+    let producer = adapters.stream_producer(&node.node_type).ok_or_else(|| {
+        anyhow!(
+            "no StreamProducerAdapter for direct node '{}' (type '{}')",
+            node.id,
+            node.node_type
+        )
+    })?;
+
+    let inputs = vec![NodeInput {
+        from_node_id: "direct".to_string(),
+        from_port: "full".to_string(),
+        envelope: initial_arc.clone(),
+    }];
+
+    let producer_step_started = ctx.clock.now_ms();
+    emit_node_started(&ctx, &node.id, &node.node_type);
+    let envelope_stream = producer
+        .produce_stream(&node, &inputs, &ctx)
+        .await
+        .map_err(|e| {
+            emit_node_finished(
+                &ctx,
+                &node.id,
+                &TraceStatus::Error {
+                    message: e.to_string(),
+                },
+            );
+            anyhow!("direct stream producer '{}' failed: {e}", node.id)
+        })?;
+
+    let cancel = ctx.cancel_token.clone();
+    let progress = ctx.progress.clone();
+    let progress_scope = ctx.progress_scope.clone();
+    let (outbound_tx, outbound_rx) = mpsc::channel::<Result<EnvelopeDelta>>(64);
+    let (outcome_tx, outcome_rx) = oneshot::channel::<FlowExecutionOutcome>();
+
+    tokio::spawn(finalize_streaming_flow(
+        0,
+        envelope_stream,
+        outbound_tx,
+        outcome_tx,
+        cancel,
+        FinalizerInputs {
+            started,
+            producer_step_started,
+            producer_node_id: node.id.clone(),
+            producer_node_type: node.node_type.clone(),
+            producer_input_envelope: initial_arc,
+            trace: Vec::new(),
+            db,
+            progress,
+            progress_scope,
+        },
+    ));
+
+    let stream = futures::stream::unfold(outbound_rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    let stream: BoxStream<'static, Result<EnvelopeDelta>> = Box::pin(stream);
+    Ok(StreamingExecution {
+        stream,
+        outcome: outcome_rx,
+    })
+}
+
 /// Wynik wykonania pojedynczego node'a w schedulerze dataflow — wraca z taska
 /// `JoinSet` do pętli koordynującej.
 struct NodeRun {
@@ -4123,5 +4281,223 @@ mod loop_region_tests {
             matches!(err, FlowValidationError::InvalidLoopRegion { .. }),
             "expected InvalidLoopRegion, got: {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod direct_execution_tests {
+    //! Direct (flow-less) execution: `execute_direct_blocking` /
+    //! `execute_direct_streaming` run a single capability node straight on the
+    //! executor when there is no user-defined flow. Proves: exactly one node ran
+    //! (no trigger/output/pii_filter wrapper), the model output passes through
+    //! verbatim (no PII redaction), and token usage is preserved so compliance
+    //! accounting downstream still sees it.
+    use super::*;
+    use crate::flow_engine::dispatchers::{LlmDispatcher, LlmRequest, LlmResponse};
+    use crate::flow_engine::envelope::{FinishReason, FlowEnvelope, FlowValue, LlmStreamChunk};
+    use crate::flow_engine::node_adapter::{test_support::stub_ctx, AdapterRegistry};
+    use crate::flow_engine::node_adapters::LlmNodeAdapter;
+    use crate::flow_engine::types::FlowNode;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use futures::stream::{BoxStream, StreamExt};
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    /// Blocking fake: returns fixed content + usage; `stream_chat` unused.
+    struct FakeBlockingLlm {
+        content: String,
+        usage: TokenUsage,
+    }
+
+    #[async_trait]
+    impl LlmDispatcher for FakeBlockingLlm {
+        async fn execute_chat(&self, _req: LlmRequest) -> Result<LlmResponse> {
+            Ok(LlmResponse {
+                content: self.content.clone(),
+                usage: self.usage.clone(),
+                finish_reason: FinishReason::Stop,
+                tool_calls: Vec::new(),
+            })
+        }
+        async fn stream_chat(
+            &self,
+            _req: LlmRequest,
+        ) -> Result<BoxStream<'static, Result<LlmStreamChunk>>> {
+            panic!("blocking test must not stream");
+        }
+    }
+
+    /// Streaming fake: emits a predefined chunk sequence once.
+    struct FakeStreamingLlm {
+        chunks: Mutex<Option<Vec<LlmStreamChunk>>>,
+    }
+
+    #[async_trait]
+    impl LlmDispatcher for FakeStreamingLlm {
+        async fn execute_chat(&self, _req: LlmRequest) -> Result<LlmResponse> {
+            panic!("streaming test must not block");
+        }
+        async fn stream_chat(
+            &self,
+            _req: LlmRequest,
+        ) -> Result<BoxStream<'static, Result<LlmStreamChunk>>> {
+            let chunks = self.chunks.lock().unwrap().take().expect("stream once");
+            Ok(futures::stream::iter(chunks.into_iter().map(Ok)).boxed())
+        }
+    }
+
+    fn llm_registry() -> Arc<AdapterRegistry> {
+        let mut r = AdapterRegistry::new();
+        r.register_llm(Arc::new(LlmNodeAdapter::new()));
+        Arc::new(r)
+    }
+
+    fn llm_node() -> FlowNode {
+        FlowNode {
+            id: "direct_llm".into(),
+            node_type: "llm".into(),
+            config: serde_json::json!({ "model": "qwen3.5-0.8b" }),
+            position: None,
+            label: None,
+            region: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_blocking_runs_single_node_no_pii_keeps_usage() {
+        let registry = llm_registry();
+        // Content that a pii_filter would redact — direct path must NOT touch it.
+        let raw = "Contact me at jan.kowalski@example.com today.";
+        let mut ctx = stub_ctx();
+        ctx.llm = Arc::new(FakeBlockingLlm {
+            content: raw.to_string(),
+            usage: TokenUsage {
+                prompt_tokens: 5,
+                completion_tokens: 7,
+                total_tokens: 12,
+            },
+        });
+
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Text("hi".into());
+
+        let outcome = execute_direct_blocking(llm_node(), initial, ctx, registry)
+            .await
+            .expect("direct blocking");
+
+        // Verbatim model output — no synthetic pii_filter node in the path.
+        assert_eq!(outcome.final_envelope.payload.as_text(), Some(raw));
+        // Exactly one node ran (no trigger / output / pii wrapper).
+        assert_eq!(outcome.trace.len(), 1);
+        assert_eq!(outcome.trace[0].node_type, "llm");
+        // Usage preserved for downstream compliance/token accounting.
+        assert_eq!(outcome.usage.prompt_tokens, 5);
+        assert_eq!(outcome.usage.completion_tokens, 7);
+        assert_eq!(outcome.usage.total_tokens, 12);
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+        assert!(outcome.error.is_none());
+    }
+
+    /// Stalling backend: `execute_chat` never returns. Direct blocking must be
+    /// abortable by a wrapping `tokio::time::timeout` — this is exactly the
+    /// backstop `FlowDispatcher::run_direct_blocking` wraps around it, so a
+    /// blocking-only capability reached on the streaming NotFound path (vision/
+    /// tts/stt/embeddings) can never hang forever before the single-chunk wrap.
+    #[tokio::test]
+    async fn direct_blocking_is_backstop_abortable_when_backend_stalls() {
+        struct StallLlm;
+        #[async_trait]
+        impl LlmDispatcher for StallLlm {
+            async fn execute_chat(&self, _req: LlmRequest) -> Result<LlmResponse> {
+                // Never completes within the test's backstop window.
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                unreachable!("stall backend must be aborted by the backstop");
+            }
+            async fn stream_chat(
+                &self,
+                _req: LlmRequest,
+            ) -> Result<BoxStream<'static, Result<LlmStreamChunk>>> {
+                panic!("blocking test must not stream");
+            }
+        }
+
+        let registry = llm_registry();
+        let mut ctx = stub_ctx();
+        ctx.llm = Arc::new(StallLlm);
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Text("hi".into());
+
+        let fut = execute_direct_blocking(llm_node(), initial, ctx, registry);
+        let res = tokio::time::timeout(std::time::Duration::from_millis(100), fut).await;
+        assert!(res.is_err(), "stalled direct execution must hit the backstop");
+    }
+
+    #[tokio::test]
+    async fn direct_blocking_missing_model_errors() {
+        let registry = llm_registry();
+        let ctx = stub_ctx();
+        let mut node = llm_node();
+        node.config = serde_json::json!({});
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Text("hi".into());
+        // No model in node config nor envelope.meta → llm adapter bails; the
+        // direct path surfaces the error instead of fabricating a flow.
+        let err = execute_direct_blocking(node, initial, ctx, registry)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("direct 'llm' execution failed"));
+    }
+
+    #[tokio::test]
+    async fn direct_streaming_emits_deltas_and_usage_tail() {
+        let registry = llm_registry();
+        let chunks = vec![
+            LlmStreamChunk {
+                choice_index: 0,
+                text_delta: "Hello ".into(),
+                ..Default::default()
+            },
+            LlmStreamChunk {
+                choice_index: 0,
+                text_delta: "world.".into(),
+                usage: Some(TokenUsage {
+                    prompt_tokens: 3,
+                    completion_tokens: 4,
+                    total_tokens: 7,
+                }),
+                finish_reason: Some(FinishReason::Stop),
+                ..Default::default()
+            },
+        ];
+        let mut ctx = stub_ctx();
+        ctx.llm = Arc::new(FakeStreamingLlm {
+            chunks: Mutex::new(Some(chunks)),
+        });
+
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Text("hi".into());
+
+        let db = crate::db::init(Path::new(":memory:")).expect("db");
+        let exec = execute_direct_streaming(db, llm_node(), initial, ctx, registry)
+            .await
+            .expect("direct streaming");
+
+        let mut concat = String::new();
+        let mut stream = exec.stream;
+        while let Some(item) = stream.next().await {
+            if let EnvelopeDelta::Llm(c) = item.expect("delta") {
+                concat.push_str(&c.text_delta);
+            }
+        }
+        assert!(concat.contains("Hello world."), "got {concat:?}");
+
+        // Outcome carries the accumulated usage (compliance token tail relies on
+        // this) — one node, ephemeral, no audit row.
+        let outcome = exec.outcome.await.expect("outcome");
+        assert_eq!(outcome.usage.total_tokens, 7);
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+        assert_eq!(outcome.trace.len(), 1);
+        assert_eq!(outcome.trace[0].node_type, "llm");
     }
 }
