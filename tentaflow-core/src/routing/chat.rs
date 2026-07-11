@@ -749,3 +749,115 @@ mod audio_policy_tests {
         assert!(!catalog_target_accepts_audio(&snap, "txt-only"));
     }
 }
+
+/// Discriminator used by the mesh reverse chat handler
+/// (`mesh::inference_proxy::dispatch_reverse_stream_request`) to decide whether
+/// a forwarded model runs raw on the executor or through the flow engine.
+/// A raw service model MUST classify as "not a flow" so the forwarding node's
+/// flow is not silently re-applied on the serving node (no is_default "Default
+/// Chat" fallback, no hidden PII redaction). A model published from a flow MUST
+/// classify as "flow" so it still executes as the flow it represents.
+#[cfg(test)]
+mod mesh_reverse_flow_discriminator_tests {
+    use super::*;
+    use crate::services::catalog::{
+        CatalogEntry, CatalogEntryKind, CatalogSnapshot, InputModality, OutputModality,
+        ServiceSurface, Strategy,
+    };
+    use std::sync::Arc;
+
+    fn snapshot_with(entries: Vec<CatalogEntry>) -> CatalogSnapshot {
+        CatalogSnapshot {
+            entries: Arc::from(entries.into_boxed_slice()),
+            version: 1,
+        }
+    }
+
+    fn service_model(id: &str) -> CatalogEntry {
+        CatalogEntry {
+            id: id.into(),
+            kind: CatalogEntryKind::ServiceModel { instances: vec![] },
+            service_surfaces: vec![ServiceSurface::Chat],
+            input_modalities: vec![InputModality::Text],
+            output_modalities: vec![OutputModality::Text],
+            diagnostic: None,
+        }
+    }
+
+    fn published_flow(id: &str, flow_id: &str) -> CatalogEntry {
+        CatalogEntry {
+            id: id.into(),
+            kind: CatalogEntryKind::Flow {
+                flow_id: flow_id.into(),
+                published_name: id.into(),
+            },
+            service_surfaces: vec![ServiceSurface::Chat],
+            input_modalities: vec![InputModality::Text],
+            output_modalities: vec![OutputModality::Text],
+            diagnostic: None,
+        }
+    }
+
+    /// Raw service model forwarded over the mesh → direct executor path (no
+    /// flow, no Default Chat, no PII). This is the core of the fix: even when
+    /// the serving node has a default chat flow, a forwarded raw model must NOT
+    /// resolve to a flow here.
+    #[test]
+    fn forwarded_raw_model_is_not_a_flow() {
+        let snap = snapshot_with(vec![service_model("deepseek")]);
+        assert!(!model_resolves_to_flow(&snap, "deepseek"));
+    }
+
+    /// Model published from a flow → flow engine path preserved.
+    #[test]
+    fn forwarded_published_flow_is_a_flow() {
+        let snap = snapshot_with(vec![published_flow("my-agent", "flow-123")]);
+        assert!(model_resolves_to_flow(&snap, "my-agent"));
+    }
+
+    /// Alias that ultimately targets a raw model stays direct.
+    #[test]
+    fn forwarded_alias_to_model_is_not_a_flow() {
+        let alias = CatalogEntry {
+            id: "chat".into(),
+            kind: CatalogEntryKind::Alias {
+                target: "deepseek".into(),
+                fallback_targets: vec![],
+                strategy: Strategy::FirstAvailable,
+            },
+            service_surfaces: vec![ServiceSurface::Chat],
+            input_modalities: vec![InputModality::Text],
+            output_modalities: vec![OutputModality::Text],
+            diagnostic: None,
+        };
+        let snap = snapshot_with(vec![alias, service_model("deepseek")]);
+        assert!(!model_resolves_to_flow(&snap, "chat"));
+    }
+
+    /// Alias that targets a published flow routes through the flow engine.
+    #[test]
+    fn forwarded_alias_to_flow_is_a_flow() {
+        let alias = CatalogEntry {
+            id: "assistant".into(),
+            kind: CatalogEntryKind::Alias {
+                target: "my-agent".into(),
+                fallback_targets: vec![],
+                strategy: Strategy::FirstAvailable,
+            },
+            service_surfaces: vec![ServiceSurface::Chat],
+            input_modalities: vec![InputModality::Text],
+            output_modalities: vec![OutputModality::Text],
+            diagnostic: None,
+        };
+        let snap = snapshot_with(vec![alias, published_flow("my-agent", "flow-123")]);
+        assert!(model_resolves_to_flow(&snap, "assistant"));
+    }
+
+    /// Unknown model id (not in the serving node's catalog) defaults to direct
+    /// dispatch — never silently wrapped in the local default flow.
+    #[test]
+    fn forwarded_unknown_model_is_not_a_flow() {
+        let snap = snapshot_with(vec![]);
+        assert!(!model_resolves_to_flow(&snap, "ghost"));
+    }
+}

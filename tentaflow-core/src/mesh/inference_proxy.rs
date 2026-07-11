@@ -610,7 +610,7 @@ pub async fn dispatch_reverse_stream_request(
         target: "mesh::reverse",
         request_id = %request_id,
         model = %completion_payload.model,
-        "mesh reverse chat stream start (direct model dispatch)"
+        "mesh reverse chat stream start"
     );
     let mut chat_request = match build_chat_request(completion_payload) {
         Ok(req) => req,
@@ -631,40 +631,92 @@ pub async fn dispatch_reverse_stream_request(
     };
     chat_request.stream = true;
 
-    // Mesh reverse stream = the INITIATOR's flow already ran (its llm node
-    // forwarded a raw model call here). The forwarded name is a concrete service
-    // model, so `Auto` classifies it as a plain model and streams it straight
-    // from the backend — no flow re-entry (which would double prompts/PII/memory,
-    // push a voice flow's TTS audio into the chat bridge, or silently swap the
-    // model). Mirrors the EXEMPT-MESH-INBOUND direct-executor rule of the
-    // non-streaming branch.
-    let route_result = match router
-        .route_chat_completion_stream(
-            chat_request,
-            None,
-            None,
-            crate::routing::streaming::ChatFlowSelector::Auto,
-        )
-        .await
-    {
-        Ok(result) => result,
-        Err(e) => {
+    // Mesh reverse stream = the INITIATOR's flow already ran; its llm node
+    // forwarded a model call here. A RAW model MUST stream straight from the
+    // backend on this node — no flow re-entry, no is_default "Default Chat"
+    // fallback, no hidden PII redaction (all of which live only inside the
+    // flow-engine path of route_chat_completion_stream). The forwarding node
+    // owns the flow; this node provides raw model compute only. Only a model
+    // that IS an explicit published flow on this node runs as a flow — the
+    // forwarded name resolves to that flow's definition, which is what the model
+    // means. `model_resolves_to_flow` is true ONLY for an explicit Flow catalog
+    // entry, never for the is_default fallback, so it is the exact raw-vs-flow
+    // discriminator. Mirrors the direct-executor rule of the non-streaming
+    // Completion branch (`executor.execute_chat`).
+    let model_name = chat_request.model.clone();
+    let mut stream: std::pin::Pin<
+        Box<
+            dyn futures::Stream<
+                    Item = crate::error::Result<crate::api::openai::types::ChatCompletionChunk>,
+                > + Send,
+        >,
+    > = if crate::routing::chat::model_resolves_to_flow(&router.catalog_snapshot(), &model_name) {
+        // Published flow-as-model: execute THAT flow on this node.
+        match router
+            .route_chat_completion_stream(
+                chat_request,
+                None,
+                None,
+                crate::routing::streaming::ChatFlowSelector::Auto,
+            )
+            .await
+        {
+            Ok(result) => result.response,
+            Err(e) => {
+                send_stream_chunk_bytes(
+                    &tx,
+                    ModelStreamChunk {
+                        request_id,
+                        chunk: StreamChunkType::Error(ErrorInfo {
+                            error_type: ErrorType::InternalError,
+                            message: format!("route_chat_completion_stream: {}", e),
+                            details: None,
+                        }),
+                    },
+                );
+                return;
+            }
+        }
+    } else {
+        // Raw model: direct executor stream. `hop_count = MAX_HOP_COUNT` is the
+        // same A→B→A re-forward guard the non-streaming branch applies.
+        let Some(executor) = router.executor() else {
             send_stream_chunk_bytes(
                 &tx,
                 ModelStreamChunk {
                     request_id,
                     chunk: StreamChunkType::Error(ErrorInfo {
                         error_type: ErrorType::InternalError,
-                        message: format!("route_chat_completion_stream: {}", e),
+                        message: "router executor not wired for mesh-reverse chat stream"
+                            .to_string(),
                         details: None,
                     }),
                 },
             );
             return;
+        };
+        let mut exec_ctx = crate::services::runtime::context::ExecutionContext {
+            hop_count: crate::services::runtime::context::MAX_HOP_COUNT,
+            ..crate::services::runtime::context::ExecutionContext::default()
+        };
+        match executor.stream_chat(chat_request, &mut exec_ctx).await {
+            Ok(s) => s,
+            Err(e) => {
+                send_stream_chunk_bytes(
+                    &tx,
+                    ModelStreamChunk {
+                        request_id,
+                        chunk: StreamChunkType::Error(ErrorInfo {
+                            error_type: ErrorType::InternalError,
+                            message: format!("mesh reverse direct stream: {}", e),
+                            details: None,
+                        }),
+                    },
+                );
+                return;
+            }
         }
     };
-
-    let mut stream = route_result.response;
     let mut errored = false;
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
