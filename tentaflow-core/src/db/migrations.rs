@@ -602,6 +602,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "drop_notes_table",
             MigrationStep::Sql(DROP_NOTES_TABLE),
         ),
+        (
+            113,
+            "strip_pii_from_default_chat_flow",
+            MigrationStep::Rust(strip_pii_from_default_chat_flow),
+        ),
     ]
 }
 
@@ -1545,6 +1550,39 @@ fn rewrite_agent_run_to_inline_region(conn: &Connection) -> Result<()> {
     conn.execute(
         "UPDATE flows SET flow_json = ?1 WHERE id = ?2 AND flow_json != ?1",
         rusqlite::params![target, AGENT_RUN_FLOW_ID],
+    )?;
+    Ok(())
+}
+
+/// Stable id of the seeded "Default Chat" flow (mirrors `seed::DEFAULT_CHAT_FLOW_ID`).
+const DEFAULT_CHAT_FLOW_ID: &str = "00000000-0000-4000-8000-000000000010";
+
+/// Exact JSON of the previously-seeded "Default Chat" flow that carried a hidden
+/// `pii_filter` node (`trigger -> llm -> pii_filter -> output(stream)`). This is
+/// the byte-for-byte shape shipped to every already-seeded DB. Matched verbatim
+/// so the migration only rewrites the untouched seeded row — any admin edit
+/// (reordering, added node, whitespace) changes the string and is left alone.
+const DEFAULT_CHAT_FLOW_JSON_WITH_PII: &str = r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1","from_port":"text","data_type":"text"},{"from_node":"l1","to_node":"p1","from_port":"stream"},{"from_node":"p1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#;
+
+/// Removes the hidden `pii_filter` from the seeded default chat flow. The default
+/// flow resolves for every model without its own flow (like the removed synthetic
+/// flow), so silently redacting the query/context/response was a hidden default a
+/// user never configured. Rewrites the seeded `…010` row (is_default=1) to the
+/// clean `trigger -> llm -> output(stream)` pipeline IN PLACE, but ONLY when its
+/// stored JSON is exactly the seeded pii shape. Admin-edited flows and flows that
+/// deliberately include pii_filter differ from that literal and are untouched.
+/// Fresh installs already seed the clean shape, so this is a no-op there.
+/// `pii_filter` stays a first-class node users can add themselves in Flow Builder.
+fn strip_pii_from_default_chat_flow(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE flows SET flow_json = ?1, \
+         description = 'Streaming chat pipeline: trigger -> LLM -> output(stream).' \
+         WHERE id = ?2 AND is_default = 1 AND flow_json = ?3",
+        rusqlite::params![
+            crate::db::seed::DEFAULT_CHAT_FLOW_JSON,
+            DEFAULT_CHAT_FLOW_ID,
+            DEFAULT_CHAT_FLOW_JSON_WITH_PII,
+        ],
     )?;
     Ok(())
 }
@@ -7800,6 +7838,89 @@ mod tests {
             )
             .unwrap();
         assert_eq!(again, target);
+    }
+
+    /// v113 strips the hidden `pii_filter` from the seeded "Default Chat" flow:
+    /// the seeded-pii row is rewritten to the clean `trigger -> llm ->
+    /// output(stream)` pipeline, while an admin-customized flow that also
+    /// contains a pii_filter is left untouched (matched only against the exact
+    /// seeded literal).
+    #[test]
+    fn migration_v113_strips_pii_from_seeded_default_chat() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        // Reproduce an already-seeded DB: the canonical Default Chat row carrying
+        // the hidden pii_filter (the shape shipped before v113).
+        conn.execute(
+            "INSERT OR REPLACE INTO flows (id, name, description, service_type, flow_json, status, is_default) \
+             VALUES (?1, 'Default Chat', 'Streaming chat pipeline: trigger -> LLM -> pii_filter -> output(stream).', 'chat', ?2, 'active', 1)",
+            rusqlite::params![DEFAULT_CHAT_FLOW_ID, DEFAULT_CHAT_FLOW_JSON_WITH_PII],
+        )
+        .unwrap();
+
+        // A separate, admin-customized flow that deliberately keeps pii_filter.
+        let custom_id = uuid::Uuid::new_v4().to_string();
+        let custom_json = r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1","from_port":"text","data_type":"text"},{"from_node":"l1","to_node":"p1","from_port":"text"},{"from_node":"p1","to_node":"o1","from_port":"text","to_port":"text","data_type":"text"}]}"#;
+        conn.execute(
+            "INSERT INTO flows (id, name, description, service_type, flow_json, status, is_default) \
+             VALUES (?1, 'My PII Chat', 'custom', 'chat', ?2, 'active', 0)",
+            rusqlite::params![custom_id, custom_json],
+        )
+        .unwrap();
+
+        strip_pii_from_default_chat_flow(&conn).unwrap();
+
+        // (a) seeded Default Chat lost pii_filter and now streams llm -> output.
+        let (default_json, default_desc): (String, String) = conn
+            .query_row(
+                "SELECT flow_json, description FROM flows WHERE id = ?1",
+                rusqlite::params![DEFAULT_CHAT_FLOW_ID],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(default_json, crate::db::seed::DEFAULT_CHAT_FLOW_JSON);
+        assert!(!default_json.contains("pii_filter"), "pii_filter removed");
+        assert!(!default_desc.contains("pii_filter"), "description updated");
+        let parsed: serde_json::Value = serde_json::from_str(&default_json).unwrap();
+        let types: Vec<&str> = parsed["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, vec!["trigger", "llm", "output"]);
+        let edges = parsed["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 2);
+        // The llm -> output edge is the streaming shape (from stream, to text).
+        let has_stream_edge = edges.iter().any(|e| {
+            e["from_node"] == "l1"
+                && e["to_node"] == "o1"
+                && e["from_port"] == "stream"
+                && e["to_port"] == "text"
+        });
+        assert!(has_stream_edge, "llm -> output streaming edge preserved");
+
+        // (b) the admin-customized pii flow is untouched.
+        let custom_after: String = conn
+            .query_row(
+                "SELECT flow_json FROM flows WHERE id = ?1",
+                rusqlite::params![custom_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(custom_after, custom_json, "custom pii flow untouched");
+
+        // (c) idempotent re-run is a no-op (row no longer matches the pii literal).
+        strip_pii_from_default_chat_flow(&conn).unwrap();
+        let again: String = conn
+            .query_row(
+                "SELECT flow_json FROM flows WHERE id = ?1",
+                rusqlite::params![DEFAULT_CHAT_FLOW_ID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(again, crate::db::seed::DEFAULT_CHAT_FLOW_JSON);
     }
 
     /// A fresh `run(&conn)` (all migrations + nothing else) leaves the seeded

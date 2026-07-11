@@ -22,6 +22,14 @@ const DEFAULT_ADMIN_ID: &str = "00000000-0000-4000-8000-000000000002";
 /// (UPDATE 0 wierszy -> "target row not found").
 const DEFAULT_CHAT_FLOW_ID: &str = "00000000-0000-4000-8000-000000000010";
 
+/// Kanoniczny JSON domyslnego flow "Default Chat": czysty streaming przelot
+/// `trigger -> llm -> output(stream)`, BEZ pii_filter. To jest flow rozwiazywany
+/// dla kazdego modelu bez wlasnego flow (jak synthetic), wiec nie moze cicho
+/// redagowac tresci — pii_filter jest dostepny tylko gdy user wstawi go SAM.
+/// Wspoldzielony przez seed INSERT i migracje v113, zeby oba emitowaly
+/// bajt-identyczny JSON.
+pub const DEFAULT_CHAT_FLOW_JSON: &str = r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":400,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1","from_port":"text","data_type":"text"},{"from_node":"l1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#;
+
 /// Stale UUID seedowanych flow harnessa (§3.8). Jak Default Chat: id musi byc
 /// identyczne na kazdym node, bo zasob jest seedowany lokalnie a synchronizowany
 /// po `id`. Losowe per-node id rozjechalyby sync i blok `subflow`/`loop`/`agent`
@@ -1030,21 +1038,26 @@ N'ajoute pas de champs absents du schéma ci-dessus. Ne commente pas. Renvoie un
 
 /// Seeduje domyslne diagramy flow reprezentujace pipeline routera.
 fn seed_default_flows(conn: &Connection) -> Result<()> {
-    // Fresh DB seeduje tylko jeden domyslny flow: "Default Chat" (streaming
-    // chat z filtrem PII, default=1). Reszta pipeline'ow (TTS, Audio Chat,
+    // Fresh DB seeduje tylko jeden domyslny flow: "Default Chat" (czysty
+    // streaming chat, default=1). Reszta pipeline'ow (TTS, Audio Chat,
     // teams-flow, osobny "Standardowy pipeline LLM") nie jest zakladana —
     // brakujace service_type/modality wykonuje sie bezposrednio na executorze
     // (direct execution), a uzytkownik buduje wlasne flowy w Flow Builderze.
     //
-    // Flow seedowany jako STREAMING (LLM -> pii_filter -> output z mode=stream,
-    // edges od LLM dalej z from_port=stream). Bez tego try_dispatch_streaming
-    // wpada na is_streaming=false -> wrap_blocking_as_stream -> single chunk z
-    // całością odpowiedzi (klient widzi calosc po EOF zamiast token-by-token).
+    // Flow seedowany jako STREAMING (LLM -> output z mode=stream, edge od LLM
+    // z from_port=stream). Bez tego try_dispatch_streaming wpada na
+    // is_streaming=false -> wrap_blocking_as_stream -> single chunk z całością
+    // odpowiedzi (klient widzi calosc po EOF zamiast token-by-token).
+    //
+    // BEZ pii_filter: to jest domyslny przelot dla kazdego modelu bez wlasnego
+    // flow (jak synthetic), wiec nie moze cicho redagowac zapytania/kontekstu/
+    // odpowiedzi. pii_filter zostaje dostepnym wezlem — user wstawia go SAM w
+    // Flow Builderze, jesli go chce.
     let flows: &[(&str, &str, &str, &str, i64)] = &[(
         "Default Chat",
-        "Streaming chat pipeline: trigger -> LLM -> pii_filter -> output(stream).",
+        "Streaming chat pipeline: trigger -> LLM -> output(stream).",
         "chat",
-        r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1","from_port":"text","data_type":"text"},{"from_node":"l1","to_node":"p1","from_port":"stream"},{"from_node":"p1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#,
+        DEFAULT_CHAT_FLOW_JSON,
         1,
     )];
 
@@ -1616,8 +1629,8 @@ mod tests {
 
         let (st, def) = assert_dag(
             "Default Chat",
-            &["trigger", "llm", "pii_filter", "output"],
-            3,
+            &["trigger", "llm", "output"],
+            2,
         );
         assert_eq!(st.as_deref(), Some("chat"));
         assert_eq!(def, 1, "Default Chat jest domyslnym flow");
