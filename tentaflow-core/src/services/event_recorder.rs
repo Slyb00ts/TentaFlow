@@ -391,8 +391,13 @@ impl EventMeta {
     fn winner(votes: &BTreeMap<String, TextVote>) -> TextWinner {
         let counts: BTreeMap<String, u64> =
             votes.iter().map(|(t, v)| (t.clone(), v.count)).collect();
-        let total_weight: f64 = votes.values().map(|v| v.weight).sum();
-        let best = votes.iter().max_by(|a, b| a.1.weight.total_cmp(&b.1.weight));
+        // Winner by RAW COUNT (most-read across the event), never by confidence
+        // weight: the plate-OCR softmax confidence is near-uniform (~0.05) with
+        // per-frame noise, so a weighted winner handed the plate to a 21-read blur
+        // over a 2018-read correct plate. Raw majority is robust; agreement =
+        // winner_count / total_count.
+        let total_count: u64 = votes.values().map(|v| v.count).sum();
+        let best = votes.iter().max_by(|a, b| a.1.count.cmp(&b.1.count));
         let Some((text, v)) = best else {
             return TextWinner {
                 text: None,
@@ -402,8 +407,8 @@ impl EventMeta {
                 votes: counts,
             };
         };
-        let agreement = if total_weight > 0.0 {
-            v.weight / total_weight
+        let agreement = if total_count > 0 {
+            v.count as f64 / total_count as f64
         } else {
             0.0
         };

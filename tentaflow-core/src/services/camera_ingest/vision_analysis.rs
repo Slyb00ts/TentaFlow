@@ -2604,38 +2604,39 @@ fn gate_votes(
     min_agreement: f32,
     prev: Option<&str>,
 ) -> VoteOutcome {
-    let total_weight: f32 = votes.iter().map(|v| v.weight).sum();
-    if total_weight <= 0.0 {
+    // Winner = MOST-READ variant by RAW COUNT, never by confidence weight. The
+    // plate-OCR softmax confidence is near-uniform (~0.05) with per-frame noise,
+    // so a confidence-weighted winner could hand the plate to a 21-read blur over
+    // a 2018-read correct plate (observed: NM2356 beat WGM1416P). Raw majority
+    // over the whole event is the robust signal; agreement = winner_count/total.
+    let total_count: u32 = votes.iter().map(|v| v.count).sum();
+    if total_count == 0 {
         return VoteOutcome {
             text: None,
             confidence: None,
         };
     }
-    // Winner = heaviest variant; tie-break to the previously emitted string so a
-    // stable read does not flicker between two equally weighted variants.
-    let max_weight = votes
-        .iter()
-        .map(|v| v.weight)
-        .fold(f32::NEG_INFINITY, f32::max);
+    let max_count = votes.iter().map(|v| v.count).max().unwrap_or(0);
+    // Tie-break to the previously emitted string so a stable read does not
+    // flicker between two equally-read variants.
     let winner = prev
-        .and_then(|p| {
-            votes
-                .iter()
-                .find(|v| v.text == p && (max_weight - v.weight).abs() <= f32::EPSILON)
-        })
-        .or_else(|| votes.iter().find(|v| v.weight == max_weight));
+        .and_then(|p| votes.iter().find(|v| v.text == p && v.count == max_count))
+        .or_else(|| votes.iter().find(|v| v.count == max_count));
     let Some(winner) = winner else {
         return VoteOutcome {
             text: None,
             confidence: None,
         };
     };
-    let agreement = winner.weight / total_weight;
+    let agreement = winner.count as f32 / total_count as f32;
     let mean_conf = if winner.count > 0 {
         winner.conf_sum / winner.count as f32
     } else {
         0.0
     };
+    // Confidence floor stays a no-op unless configured (the model confidence is
+    // unreliable); the real gate is agreement. `min_conf` is honored only when a
+    // deployment sets it > 0.
     if mean_conf >= min_conf && agreement >= min_agreement {
         VoteOutcome {
             text: Some(winner.text.clone()),
@@ -2807,6 +2808,29 @@ fn thumb_should_capture(camera_id: &str, mode_key: &str, track_id: u32, conf: f3
         cache.retain(|_, b| b.at.elapsed() < ENRICH_CACHE_EVICT_AGE);
     }
     capture
+}
+
+/// Minimum wall-time between scene-thumbnail captures for a camera. Guarantees
+/// every event gets a photo even when the plate/ADR is never read, without
+/// snapshotting every frame.
+const SCENE_THUMB_INTERVAL: Duration = Duration::from_secs(3);
+
+/// True at most once per [`SCENE_THUMB_INTERVAL`] per camera — so a vehicle
+/// present but unread (no plate/ADR) still yields a full-frame thumbnail.
+fn scene_thumb_should_capture(camera_id: &str) -> bool {
+    static LAST: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    let mut map = LAST
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    match map.get(camera_id) {
+        Some(t) if now.duration_since(*t) < SCENE_THUMB_INTERVAL => false,
+        _ => {
+            map.insert(camera_id.to_string(), now);
+            true
+        }
+    }
 }
 
 /// Downscales the full RGB24 frame so its longest edge is at most
@@ -3134,16 +3158,21 @@ async fn run_cold_stages(
                     min_conf,
                     min_agreement,
                 );
-                // New best confident read for this track+mode → snapshot the WHOLE
-                // downscaled frame (not the crop) and hand its ref to the recorder.
-                if let Some(c) = conf {
-                    if thumb_should_capture(camera_id, thumb_mode_key, det.track_id, c) {
-                        if let Some(rgb) =
-                            cold_full_rgb(frame, frame_device, w, h, frame_format)
-                        {
-                            det.tekst_thumb_ref =
-                                save_event_thumbnail(camera_id, &rgb, w, h).await;
-                        }
+                // Snapshot the WHOLE downscaled frame (not the crop) as the event
+                // thumbnail: on a new best read for this track, OR on the per-camera
+                // scene throttle so an event ALWAYS gets a photo even when the plate/
+                // ADR is never read (a vehicle is present — this OCR stage is running
+                // on its placard/plate detection). Never overwrite a thumb already
+                // captured for this detection.
+                let want_best = conf
+                    .map(|c| thumb_should_capture(camera_id, thumb_mode_key, det.track_id, c))
+                    .unwrap_or(false);
+                if det.tekst_thumb_ref.is_none()
+                    && (want_best || scene_thumb_should_capture(camera_id))
+                {
+                    if let Some(rgb) = cold_full_rgb(frame, frame_device, w, h, frame_format) {
+                        det.tekst_thumb_ref =
+                            save_event_thumbnail(camera_id, &rgb, w, h).await;
                     }
                 }
                 det.tekst = tekst;
