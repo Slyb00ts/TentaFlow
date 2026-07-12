@@ -94,6 +94,7 @@ pub fn postprocess_image(
             tekst_conf: None,
             tekst_thumb_ref: None,
             track_id: 0,
+            vehicle_id: 0,
             vx: 0.,
             vy: 0.,
         });

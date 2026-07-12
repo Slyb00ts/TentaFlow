@@ -66,6 +66,14 @@ pub struct Detection {
     /// przypisania (np. detekcje ze zrodel bez trackera).
     #[serde(default)]
     pub track_id: u32,
+    /// Stabilny identyfikator POJAZDU, na ktorym siedzi ten znak/tablica, nadany
+    /// przez asocjacje (`assign_vehicle`) do stabilnego track_id trackera
+    /// "vehicles". 0 = brak przypisania (znak poza jakimkolwiek pojazdem albo
+    /// model pojazdow niedostepny) — trzymany do overlayu, ale wykluczony z
+    /// grupowania per-pojazd. Dla samych boxow pojazdow rowna sie ich track_id.
+    /// `#[serde(default)]` zachowuje kompatybilnosc CBOR/JSON jak `track_id`.
+    #[serde(default)]
+    pub vehicle_id: u32,
     /// Prędkość srodka boxa w jednostkach znormalizowanych/s (os X). 0 gdy brak
     /// bazy czasu (pts_ns) albo pierwsza obserwacja tracku.
     #[serde(default)]
@@ -233,6 +241,7 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                 tekst_conf: None,
                 tekst_thumb_ref: None,
                 track_id: 0,
+                vehicle_id: 0,
                 vx: 0.,
                 vy: 0.,
             };
@@ -252,6 +261,7 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                 tekst_conf: None,
                 tekst_thumb_ref: None,
                 track_id: 0,
+                vehicle_id: 0,
                 vx: 0.,
                 vy: 0.,
             };
@@ -270,6 +280,7 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                     tekst_conf: None,
                     tekst_thumb_ref: None,
                     track_id: 0,
+                    vehicle_id: 0,
                     vx: 0.,
                     vy: 0.,
                 });
@@ -311,6 +322,7 @@ mod tests {
                     tekst_conf: None,
                     tekst_thumb_ref: None,
                     track_id: 0,
+                    vehicle_id: 0,
                     vx: 0.,
                     vy: 0.,
                 },
@@ -323,6 +335,7 @@ mod tests {
                     tekst_conf: None,
                     tekst_thumb_ref: None,
                     track_id: 0,
+                    vehicle_id: 0,
                     vx: 0.,
                     vy: 0.,
                 },
@@ -383,6 +396,7 @@ mod tests {
                 tekst_conf: None,
                 tekst_thumb_ref: None,
                 track_id: 0,
+                vehicle_id: 0,
                 vx: 0.,
                 vy: 0.,
             }],
@@ -410,6 +424,7 @@ mod tests {
                 tekst_conf: None,
                 tekst_thumb_ref: None,
                 track_id: 0,
+                vehicle_id: 0,
                 vx: 0.,
                 vy: 0.,
             }],

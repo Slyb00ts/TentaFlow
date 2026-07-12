@@ -124,6 +124,12 @@ pub struct VisionConfig {
     #[serde(default = "default_vision_sessions")]
     pub adr_sessions: usize,
 
+    /// ort session-pool size for the parallel YOLOv8 vehicle detector. The model
+    /// is tiny (~tens of MB per session) and only produces coarse vehicle boxes,
+    /// so a small pool (default 2) is plenty. `0` falls back to that default.
+    #[serde(default = "default_vehicle_sessions")]
+    pub vehicle_sessions: usize,
+
     /// PP-OCRv5 fallback OCR session-pool size (shared by det/rec/cls heads).
     #[serde(default = "default_ppocr_sessions")]
     pub ppocr_sessions: usize,
@@ -338,6 +344,7 @@ impl Default for VisionConfig {
             stan_sessions: default_vision_sessions(),
             plate_sessions: default_vision_sessions(),
             adr_sessions: default_vision_sessions(),
+            vehicle_sessions: default_vehicle_sessions(),
             ppocr_sessions: default_ppocr_sessions(),
             onnx_cv_max_models: default_vision_sessions(),
             onnx_cv_sessions_per_model: default_one(),
@@ -387,6 +394,10 @@ fn default_event_max_duration_secs() -> u64 {
 
 fn default_vision_sessions() -> usize {
     4
+}
+
+fn default_vehicle_sessions() -> usize {
+    2
 }
 fn default_ppocr_sessions() -> usize {
     2

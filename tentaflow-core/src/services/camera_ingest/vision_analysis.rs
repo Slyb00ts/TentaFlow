@@ -129,6 +129,45 @@ fn wrap_ocr(o: PlateOcr) -> OcrHandle {
     std::sync::Arc::new(Mutex::new(o))
 }
 
+/// Process-wide YOLOv8 vehicle detector, loaded on first use — the SECOND
+/// detector run in parallel with RF-DETR. Own ort session pool (independent CUDA
+/// streams), so a `tokio::join!` of the two forwards costs ~max(DETR, YOLO). A
+/// failed/absent load is `None` for the process lifetime: association degrades
+/// to RF-DETR-only (no vehicle boxes, every sign keeps `vehicle_id = 0`), never
+/// a crash. Only the ort path builds a real detector; the Burn path has no
+/// YOLOv8 vehicle graph, so it is always `None`.
+#[cfg(feature = "inference-supertonic")]
+pub(crate) type VehicleHandle = std::sync::Arc<crate::vision::detector_vehicle::VehicleDetector>;
+
+#[cfg(feature = "inference-supertonic")]
+fn vehicle_detector() -> &'static OnceCell<Option<VehicleHandle>> {
+    static VEHICLE: OnceCell<Option<VehicleHandle>> = OnceCell::const_new();
+    &VEHICLE
+}
+
+#[cfg(feature = "inference-supertonic")]
+pub(crate) async fn get_vehicle_detector() -> Option<VehicleHandle> {
+    vehicle_detector()
+        .get_or_init(|| async {
+            tokio::task::spawn_blocking(
+                || match crate::vision::detector_vehicle::VehicleDetector::load() {
+                    Ok(d) => Some(std::sync::Arc::new(d)),
+                    Err(e) => {
+                        warn!(
+                            "[vision_analysis] YOLOv8 vehicle detector load failed, \
+                             per-truck association disabled: {e:#}"
+                        );
+                        None
+                    }
+                },
+            )
+            .await
+            .unwrap_or(None)
+        })
+        .await
+        .clone()
+}
+
 /// Process-wide state classifier, loaded on first use with the same lazy
 /// `OnceCell` + `spawn_blocking` pattern as the detector. A failed load is
 /// `None` for the process lifetime: detections still publish, just without a
@@ -771,6 +810,12 @@ struct FrameJob {
     detect_ms_total: u32,
     /// Liczba etapów zakończonych błędem executora (bez wyniku).
     failed_stages: usize,
+    /// Boxy pojazdow (`klasa="vehicle"`) wykryte przez YOLOv8 RÓWNOLEGLE z
+    /// RF-DETR na TEJ SAMEJ klatce (tokio::join!). Trakowane osobnym trackerem
+    /// IOU `(kamera,"vehicles")` w `stage_completed`, potem propagowane do cold
+    /// path do asocjacji znak→pojazd. Puste, gdy model pojazdow niedostepny
+    /// (degradacja do RF-DETR-only).
+    vehicles: Vec<Detection>,
 }
 
 /// Wynik jednego współbieżnego forwardu batcha zwrócony ze spawnowanego zadania
@@ -783,6 +828,11 @@ struct ForwardOutput {
     /// Wynik executora spłaszczony do `String` błędu — `Send` i prosty do
     /// przeniesienia przez granicę zadania (log identyczny z dawnym inline).
     outcome: Result<CameraCvResult, String>,
+    /// Boxy pojazdow per klatka batcha (kolejnosc == kolejnosc batcha), policzone
+    /// RÓWNOLEGLE z forwardem detekcji przez `tokio::join!` na osobnej puli sesji.
+    /// Puste gdy model pojazdow niedostepny albo forward pojazdow zawiodl
+    /// (degradacja do RF-DETR-only). `apply_forward_result` doklada je do jobów.
+    vehicles: Vec<Vec<Detection>>,
 }
 
 /// Górny limit współbieżnych forwardów. Odzwierciedla sufit puli sesji ort
@@ -851,6 +901,7 @@ fn job_batch_key(job: &FrameJob) -> Option<(u32, u32, u32)> {
 /// forward: the packed `[Y | UV]` bytes plus plane strides/offsets and frame
 /// dims. Owned (Arc-cloned) so the spawned forward can outlive the loop tick.
 #[cfg(feature = "inference-supertonic")]
+#[derive(Clone)]
 struct Nv12DetectInput {
     data: Arc<[u8]>,
     width: u32,
@@ -969,6 +1020,85 @@ async fn run_device_detect_forward(
     Ok(batch)
 }
 
+/// Runs the YOLOv8 vehicle detector on a batch of NV12 detect frames — the
+/// PARALLEL half of the NV12 detect closure's `tokio::join!`. Its own ort pool
+/// gives independent CUDA streams, so this overlaps the RF-DETR forward. Any
+/// failure (model absent, forward error) degrades to an all-empty result, so
+/// vehicle detection can NEVER block or fail the primary detection.
+#[cfg(feature = "inference-supertonic")]
+async fn run_nv12_vehicle_forward(
+    frames: Vec<Nv12DetectInput>,
+    color: crate::vision::gpu_preprocess::ColorCoeffs,
+) -> Vec<Vec<Detection>> {
+    let n = frames.len();
+    let Some(detector) = get_vehicle_detector().await else {
+        return vec![Vec::new(); n];
+    };
+    let out = tokio::task::spawn_blocking(move || {
+        use crate::vision::gpu_preprocess::Nv12Frame;
+        let nv12: Vec<Nv12Frame> = frames
+            .iter()
+            .map(|f| Nv12Frame {
+                y: &f.data[f.y_offset as usize..],
+                y_stride: f.y_stride as usize,
+                uv: &f.data[f.uv_offset as usize..],
+                uv_stride: f.uv_stride as usize,
+                w: f.width,
+                h: f.height,
+            })
+            .collect();
+        detector.detect_batch_gpu(&nv12, color)
+    })
+    .await;
+    match out {
+        Ok(Ok(v)) if v.len() == n => v,
+        Ok(Ok(_)) => vec![Vec::new(); n],
+        Ok(Err(e)) => {
+            warn_throttled("vehicle", &format!("nv12 vehicle detect: {e:#}"));
+            vec![Vec::new(); n]
+        }
+        Err(e) => {
+            warn_throttled("vehicle", &format!("nv12 vehicle detect task: {e}"));
+            vec![Vec::new(); n]
+        }
+    }
+}
+
+/// Runs the YOLOv8 vehicle detector on a batch of RGB detect frames (the device
+/// zero-copy path has no YOLO-usable pixels — its `OwnedDeviceTensor` is already
+/// RF-DETR-normalized at 560 — so the launcher passes the full-res RGB `frame`
+/// here instead). Same degrade-to-empty guard as the NV12 path.
+#[cfg(feature = "inference-supertonic")]
+async fn run_rgb_vehicle_forward(frames: Vec<CvFrameLocal>) -> Vec<Vec<Detection>> {
+    let n = frames.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let Some(detector) = get_vehicle_detector().await else {
+        return vec![Vec::new(); n];
+    };
+    let out = tokio::task::spawn_blocking(move || {
+        let refs: Vec<(&[u8], u32, u32)> = frames
+            .iter()
+            .map(|f| (f.data.as_ref(), f.width, f.height))
+            .collect();
+        detector.detect_batch(&refs)
+    })
+    .await;
+    match out {
+        Ok(Ok(v)) if v.len() == n => v,
+        Ok(Ok(_)) => vec![Vec::new(); n],
+        Ok(Err(e)) => {
+            warn_throttled("vehicle", &format!("rgb vehicle detect: {e:#}"));
+            vec![Vec::new(); n]
+        }
+        Err(e) => {
+            warn_throttled("vehicle", &format!("rgb vehicle detect task: {e}"));
+            vec![Vec::new(); n]
+        }
+    }
+}
+
 /// Stosuje wynik JEDNEGO batcha forwardu z powrotem na pętli: routuje detekcje
 /// do właściwych jobów po `job_id` każdego [`PendingItem`] (batch może obejmować
 /// wiele kamer) i domyka etapy przez [`stage_completed`]. Panika/abort zadania
@@ -985,21 +1115,27 @@ fn apply_forward_result(
         alias,
         detect_ms,
         outcome,
+        mut vehicles,
     } = match out {
         Ok(o) => o,
         Err(e) => {
             warn_throttled("detect", &format!("detect forward task failed: {e}"));
             for item in &batch {
-                stage_completed(jobs, item, None, cold);
+                stage_completed(jobs, item, None, None, cold);
             }
             return;
         }
     };
+    // Pad/truncate the per-frame vehicle results to the batch length so the zip
+    // below always aligns (a degraded vehicle half returns `[]`, not per-frame).
+    if vehicles.len() != batch.len() {
+        vehicles = vec![Vec::new(); batch.len()];
+    }
     match outcome {
         Ok(CameraCvResult::Detections { per_frame }) if per_frame.len() == batch.len() => {
-            for (item, dets_cv) in batch.iter().zip(per_frame) {
+            for ((item, dets_cv), veh) in batch.iter().zip(per_frame).zip(vehicles) {
                 let dets: Vec<Detection> = dets_cv.into_iter().map(detection_from_cv).collect();
-                stage_completed(jobs, item, Some((dets, detect_ms)), cold);
+                stage_completed(jobs, item, Some((dets, detect_ms)), Some(veh), cold);
             }
         }
         Ok(CameraCvResult::Detections { per_frame }) => {
@@ -1012,7 +1148,7 @@ fn apply_forward_result(
                 ),
             );
             for item in &batch {
-                stage_completed(jobs, item, None, cold);
+                stage_completed(jobs, item, None, None, cold);
             }
         }
         Ok(_) => {
@@ -1021,13 +1157,13 @@ fn apply_forward_result(
                 &format!("detect '{alias}': unexpected camera-cv result variant"),
             );
             for item in &batch {
-                stage_completed(jobs, item, None, cold);
+                stage_completed(jobs, item, None, None, cold);
             }
         }
         Err(e) => {
             warn_throttled("detect", &format!("detect '{alias}': {e}"));
             for item in &batch {
-                stage_completed(jobs, item, None, cold);
+                stage_completed(jobs, item, None, None, cold);
             }
         }
     }
@@ -1327,6 +1463,7 @@ async fn engine_loop() {
                     results: Vec::new(),
                     detect_ms_total: 0,
                     failed_stages: 0,
+                    vehicles: Vec::new(),
                 },
             );
         }
@@ -1477,7 +1614,7 @@ async fn engine_loop() {
                     "pending item without a live device frame job; batch dropped",
                 );
                 for item in &batch {
-                    stage_completed(&mut jobs, item, None, &cold);
+                    stage_completed(&mut jobs, item, None, None, &cold);
                 }
                 drop(permit);
                 continue;
@@ -1485,6 +1622,12 @@ async fn engine_loop() {
             let alias = batch[0].alias.clone();
             let threshold = batch[0].threshold;
             let n = batch.len().max(1) as u32;
+            // Zero-copy DEVICE detect: the detect input is an already-RF-DETR-
+            // preprocessed device tensor (560, ImageNet-normalized) — there are NO
+            // YOLO-usable raw pixels here without downloading the surface (the very
+            // cost this path avoids). Vehicle detection therefore degrades to empty
+            // on the zero-copy path; use NV12/RGB ingest for per-truck association.
+            let vehicle_frames = batch.len();
             let handle = forwards.spawn(async move {
                 let _permit = permit;
                 let detect_start = Instant::now();
@@ -1494,6 +1637,7 @@ async fn engine_loop() {
                     alias,
                     detect_ms,
                     outcome,
+                    vehicles: vec![Vec::new(); vehicle_frames],
                 }
             });
             inflight.insert(handle.id(), batch);
@@ -1543,7 +1687,7 @@ async fn engine_loop() {
                     "pending item without a live NV12 frame job; batch dropped",
                 );
                 for item in &batch {
-                    stage_completed(&mut jobs, item, None, &cold);
+                    stage_completed(&mut jobs, item, None, None, &cold);
                 }
                 drop(permit);
                 continue;
@@ -1551,15 +1695,24 @@ async fn engine_loop() {
             let alias = batch[0].alias.clone();
             let threshold = batch[0].threshold;
             let n = batch.len().max(1) as u32;
+            let vehicle_nv12 = nv12.clone();
             let handle = forwards.spawn(async move {
                 let _permit = permit;
                 let detect_start = Instant::now();
-                let outcome = run_nv12_detect_forward(nv12, color, threshold).await;
+                // RF-DETR and YOLOv8-vehicle run CONCURRENTLY on the SAME frame:
+                // separate ort pools → independent CUDA streams → wall time ≈
+                // max(DETR, YOLO), NOT the sum. The vehicle half degrades to empty
+                // internally, so it never blocks or fails detection.
+                let (outcome, vehicles) = tokio::join!(
+                    run_nv12_detect_forward(nv12, color, threshold),
+                    run_nv12_vehicle_forward(vehicle_nv12, color),
+                );
                 let detect_ms = (detect_start.elapsed().as_millis() as u32) / n;
                 ForwardOutput {
                     alias,
                     detect_ms,
                     outcome,
+                    vehicles,
                 }
             });
             inflight.insert(handle.id(), batch);
@@ -1586,7 +1739,7 @@ async fn engine_loop() {
                 "pending item without a live frame job; batch dropped",
             );
             for item in &batch {
-                stage_completed(&mut jobs, item, None, &cold);
+                stage_completed(&mut jobs, item, None, None, &cold);
             }
             // Slot był tylko zarezerwowany — brak forwardu, drop zwalnia go od razu.
             drop(permit);
@@ -1605,6 +1758,11 @@ async fn engine_loop() {
         let threshold = batch[0].threshold;
         let executor_task = executor.clone();
         let n = batch.len().max(1) as u32;
+        // Vehicle detector runs on a CLONE of the SAME detect frames (Arc-cheap),
+        // concurrently with the executor detect (own ort pool). Only on the ort
+        // path — the Burn path has no YOLOv8 vehicle graph.
+        #[cfg(feature = "inference-supertonic")]
+        let vehicle_frames = frames.clone();
         let handle = forwards.spawn(async move {
             // Permit trzymany przez CAŁY forward — dropuje się z zadaniem (koniec
             // lub abort przy drainie), zwalniając slot Semaphore.
@@ -1617,15 +1775,30 @@ async fn engine_loop() {
             // swiezy kontekst per wywolanie (jak w vision_impl).
             let mut ctx = RuntimeContext::new(None);
             let detect_start = Instant::now();
-            let outcome = executor_task
-                .execute_camera_cv(request, &mut ctx)
-                .await
-                .map_err(|e| e.to_string());
+            #[cfg(feature = "inference-supertonic")]
+            let (outcome, vehicles) = tokio::join!(
+                async {
+                    executor_task
+                        .execute_camera_cv(request, &mut ctx)
+                        .await
+                        .map_err(|e| e.to_string())
+                },
+                run_rgb_vehicle_forward(vehicle_frames),
+            );
+            #[cfg(not(feature = "inference-supertonic"))]
+            let (outcome, vehicles) = (
+                executor_task
+                    .execute_camera_cv(request, &mut ctx)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Vec::new(),
+            );
             let detect_ms = (detect_start.elapsed().as_millis() as u32) / n;
             ForwardOutput {
                 alias,
                 detect_ms,
                 outcome,
+                vehicles,
             }
         });
         inflight.insert(handle.id(), batch);
@@ -1643,12 +1816,23 @@ fn stage_completed(
     jobs: &mut HashMap<u64, FrameJob>,
     item: &PendingItem,
     outcome: Option<(Vec<Detection>, u32)>,
+    vehicles: Option<Vec<Detection>>,
     cold: &mpsc::Sender<DetectionEvent>,
 ) {
     let Some(job) = jobs.get_mut(&item.job_id) else {
         return;
     };
     job.open_stages.retain(|s| s != &item.stage_id);
+    // Vehicle boxes ride the SAME frame as this detect forward. Run a dedicated
+    // IOU tracker keyed `(camera, "vehicles")` so each vehicle box gets a stable
+    // track_id (== its vehicle_id for association). Attached to the job; the last
+    // detect stage of a multi-stage frame wins (all share the frame).
+    if let Some(mut veh) = vehicles {
+        if !veh.is_empty() {
+            tracker::update(&tracker::key(&job.camera_id, "vehicles"), &mut veh, job.pts_ns);
+        }
+        job.vehicles = veh;
+    }
     match outcome {
         Some((mut dets, detect_ms)) => {
             // Tracker IOU per (kamera, etap detekcji): nadaje stabilne `track_id`
@@ -1734,6 +1918,7 @@ fn synthesize_forced_detections(pipeline: &CvPipeline, captured_ms: u64) -> Vec<
             tekst_conf: None,
             tekst_thumb_ref: None,
             track_id: 0,
+            vehicle_id: 0,
             vx: 0.0,
             vy: 0.0,
         })
@@ -1773,15 +1958,19 @@ fn finalize_job(mut job: FrameJob, cold: &mpsc::Sender<DetectionEvent>) {
     // dekodu + inferencji, a nie +OCR. Pusty zestaw tez publikujemy — czysci
     // overlay bez czekania na cold path. FAZA 1 zna tylko sume czasow detekcji;
     // pelny `proc_ms` publikuje FAZA 2, nadpisujac ramke dla tego samego
-    // captured_ms.
+    // captured_ms. Boxy pojazdow doklejamy TYLKO do publikacji overlayu (front
+    // rysuje ramki cieżarowek), NIE do `merged` uzytego do sygnatury/eventu.
+    let mut overlay = merged.clone();
+    overlay.extend(job.vehicles.iter().cloned());
     detection_bus::publish_detections(
         &job.camera_id,
         job.captured_ms,
         job.pts_ns,
         job.detect_ms_total,
-        merged.clone(),
+        overlay,
     );
-    // Pusty zestaw nie wymaga wzbogacenia: FAZA 1 juz wyczyscila overlay.
+    // Pusty zestaw nie wymaga wzbogacenia: FAZA 1 juz wyczyscila overlay. Sam
+    // pojazd bez znaku/tablicy NIE tworzy eventu (trigger to detekcje RF-DETR).
     if merged.is_empty() {
         return;
     }
@@ -1800,6 +1989,7 @@ fn finalize_job(mut job: FrameJob, cold: &mpsc::Sender<DetectionEvent>) {
         detect_ms: job.detect_ms_total,
         pipeline: job.pipeline,
         stage_dets: job.results,
+        vehicles: job.vehicles,
     };
     // FAZA 2 (cold): coalesce / byte-budget gate with latest-pending backpressure.
     // Busy camera → the event is HELD as the freshest pending (promoted by
@@ -1837,6 +2027,7 @@ fn detection_from_cv(d: CvDetection) -> Detection {
         tekst_conf: None,
         tekst_thumb_ref: None,
         track_id: 0,
+        vehicle_id: 0,
         vx: 0.0,
         vy: 0.0,
     }
@@ -1881,6 +2072,8 @@ struct DetectionEvent {
     /// wybieraja rodzica po `stage_id`; publikacja scala grupy w kolejności
     /// etapów pipeline'u.
     stage_dets: Vec<(String, Vec<Detection>)>,
+    /// Boxy pojazdow (trakowane) TEJ klatki — cold path asocjuje znaki do nich.
+    vehicles: Vec<Detection>,
 }
 
 /// Live cold-path sender + consumer handle, so `drain` can tear the cold path
@@ -2175,6 +2368,7 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
                 detect_ms,
                 pipeline,
                 mut stage_dets,
+                vehicles,
             } = ev;
             let bytes = frame.len();
             // RAII: releases this camera's in-flight slot + bytes on drop — including
@@ -2194,14 +2388,23 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
                 &frame_format,
                 &pipeline,
                 &mut stage_dets,
+                &vehicles,
             )
             .await;
             let enrich_ms = enrich_start.elapsed().as_millis() as u32;
             let proc_ms = detect_ms + enrich_ms;
-            let merged: Vec<Detection> = stage_dets
+            // Enriched signs now carry `vehicle_id`. Publish them WITH the vehicle
+            // boxes (self-assigned vehicle_id) so the event recorder groups per
+            // truck and the overlay keeps drawing vehicle rectangles.
+            let mut merged: Vec<Detection> = stage_dets
                 .iter()
                 .flat_map(|(_, d)| d.iter().cloned())
                 .collect();
+            let mut vehicles = vehicles;
+            for v in vehicles.iter_mut() {
+                v.vehicle_id = v.track_id;
+            }
+            merged.extend(vehicles);
             detection_bus::publish_detections(
                 &camera_id,
                 captured_ms,
@@ -2921,6 +3124,130 @@ async fn save_event_thumbnail(camera_id: &str, rgb24: &[u8], w: u32, h: u32) -> 
     }
 }
 
+/// Minimum overlap fraction `area(s∩v)/area(s)` for the max-overlap FALLBACK: a
+/// sign whose center lands in no vehicle box is still assigned to the vehicle it
+/// overlaps most, but only if that overlap covers at least this fraction of the
+/// sign. Below it the sign is left unassigned (`vehicle_id = 0`).
+const MIN_VEHICLE_OVERLAP: f32 = 0.3;
+
+/// One vehicle box for association: normalized `[x, y, w, h]` + its stable
+/// `vehicle_id` (the "vehicles" tracker track_id). Decoupled from `Detection`
+/// so [`assign_vehicle`] is a pure, testable function with no pipeline deps.
+#[derive(Debug, Clone, Copy)]
+struct VehicleBox {
+    bbox: [f32; 4],
+    vehicle_id: u32,
+}
+
+/// Assigns a sign/plate/sticker box to the vehicle it sits on. PURE + testable.
+///
+/// Rule (per the per-truck plan):
+///   1. CENTER-IN-BOX: every vehicle whose box contains the sign's center is a
+///      candidate. Ties (overlapping vehicles both containing the center) break
+///      by (a) larger containment fraction `area(s∩v)/area(s)`, then (b) smaller
+///      vehicle area (the tighter box is the real owner), then (c) smaller
+///      `vehicle_id` (stable, deterministic).
+///   2. FALLBACK — no vehicle contains the center: the vehicle with the largest
+///      overlap fraction, accepted only if it is ≥ [`MIN_VEHICLE_OVERLAP`].
+///   3. Otherwise `0` (unassigned): kept for overlay, excluded from per-truck
+///      grouping.
+fn assign_vehicle(sign_bbox: &[f32; 4], vehicles: &[VehicleBox]) -> u32 {
+    if vehicles.is_empty() {
+        return 0;
+    }
+    let (sx, sy, sw, sh) = (sign_bbox[0], sign_bbox[1], sign_bbox[2], sign_bbox[3]);
+    let sign_area = (sw.max(0.0)) * (sh.max(0.0));
+    let cx = sx + sw * 0.5;
+    let cy = sy + sh * 0.5;
+
+    // Containment fraction area(s∩v)/area(s) of the sign inside a vehicle box.
+    let contain_frac = |v: &VehicleBox| -> f32 {
+        if sign_area <= 0.0 {
+            return 0.0;
+        }
+        let (vx, vy, vw, vh) = (v.bbox[0], v.bbox[1], v.bbox[2], v.bbox[3]);
+        let ix1 = sx.max(vx);
+        let iy1 = sy.max(vy);
+        let ix2 = (sx + sw).min(vx + vw);
+        let iy2 = (sy + sh).min(vy + vh);
+        let iw = (ix2 - ix1).max(0.0);
+        let ih = (iy2 - iy1).max(0.0);
+        (iw * ih) / sign_area
+    };
+    let vehicle_area = |v: &VehicleBox| (v.bbox[2].max(0.0)) * (v.bbox[3].max(0.0));
+
+    // CENTER-IN-BOX candidates.
+    let mut best: Option<&VehicleBox> = None;
+    for v in vehicles {
+        let (vx, vy, vw, vh) = (v.bbox[0], v.bbox[1], v.bbox[2], v.bbox[3]);
+        let inside = cx >= vx && cx <= vx + vw && cy >= vy && cy <= vy + vh;
+        if !inside {
+            continue;
+        }
+        best = Some(match best {
+            None => v,
+            Some(cur) => {
+                // Larger containment fraction wins; then smaller vehicle area;
+                // then smaller vehicle_id.
+                let (fv, fc) = (contain_frac(v), contain_frac(cur));
+                if fv > fc + f32::EPSILON {
+                    v
+                } else if fc > fv + f32::EPSILON {
+                    cur
+                } else {
+                    let (av, ac) = (vehicle_area(v), vehicle_area(cur));
+                    if av < ac - f32::EPSILON {
+                        v
+                    } else if ac < av - f32::EPSILON {
+                        cur
+                    } else if v.vehicle_id < cur.vehicle_id {
+                        v
+                    } else {
+                        cur
+                    }
+                }
+            }
+        });
+    }
+    if let Some(v) = best {
+        return v.vehicle_id;
+    }
+
+    // FALLBACK: max overlap ≥ MIN_VEHICLE_OVERLAP.
+    let mut best_overlap = 0.0f32;
+    let mut best_id = 0u32;
+    for v in vehicles {
+        let f = contain_frac(v);
+        if f > best_overlap {
+            best_overlap = f;
+            best_id = v.vehicle_id;
+        }
+    }
+    if best_overlap >= MIN_VEHICLE_OVERLAP {
+        best_id
+    } else {
+        0
+    }
+}
+
+/// Stamps `vehicle_id` on every sign/plate/sticker detection of a frame from the
+/// tracked vehicle boxes. Vehicle boxes themselves (`klasa == "vehicle"`) get
+/// their own track_id as `vehicle_id` (self-assignment) so the overlay/grouping
+/// is uniform. Called at the TAIL of `run_cold_stages` (the full frame is known
+/// and enrichment is done). No-op when `vehicles` is empty (degrades to today's
+/// single-bag behavior — every sign keeps `vehicle_id = 0`).
+fn stamp_vehicle_ids(stage_dets: &mut [(String, Vec<Detection>)], vehicles: &[VehicleBox]) {
+    for (_, dets) in stage_dets.iter_mut() {
+        for det in dets.iter_mut() {
+            if det.klasa == crate::vision::detector_vehicle::VEHICLE_CLASS {
+                det.vehicle_id = det.track_id;
+                continue;
+            }
+            det.vehicle_id = assign_vehicle(&det.bbox, vehicles);
+        }
+    }
+}
+
 /// COLD: generyczny interpreter etapow `stage` pipeline'u. Dla kazdego etapu
 /// wybiera detekcje rodzica pasujace klasami (`class_matches`), wycina crop z
 /// paddingiem etapu i wzbogaca: classify → `stan`, ocr → `tekst` (tryb z
@@ -2929,7 +3256,8 @@ async fn save_event_thumbnail(camera_id: &str, rgb24: &[u8], w: u32, h: u32) -> 
 /// (`classify_batch`/`read_batch`); inaczej per-crop fallback przez executor
 /// (`cold_stage_per_crop`). Kazda klatka czyta OD ZERA — brak cache-skipu, jedynym
 /// stanem cross-frame jest histogram glosow OCR. Zaden blad nie wychodzi na
-/// zewnatrz — etap bez wyniku zostawia pole puste.
+/// zewnatrz — etap bez wyniku zostawia pole puste. Na koncu asocjuje kazdy
+/// znak/tablice z pojazdem (`stamp_vehicle_ids`).
 async fn run_cold_stages(
     camera_id: &str,
     frame: &[u8],
@@ -2939,12 +3267,15 @@ async fn run_cold_stages(
     frame_format: &super::fakefile::DetectFrameFormat,
     pipeline: &CvPipeline,
     stage_dets: &mut [(String, Vec<Detection>)],
+    vehicles: &[Detection],
 ) {
     let Some(executor) = runtime_executor() else {
         warn_throttled(
             "cold-executor",
             "runtime executor unavailable; cold enrichment skipped",
         );
+        // Even without enrichment, associate signs to vehicles for overlay/grouping.
+        stamp_vehicle_ids(stage_dets, &vehicle_boxes(vehicles));
         return;
     };
     // Wzbogacenie budowane od zera z cache/forwardow etapow — hot path zdazyl
@@ -3182,6 +3513,24 @@ async fn run_cold_stages(
             }
         }
     }
+    // TAIL: per-truck association. Now that every stage's boxes carry a stable
+    // track_id (hot path) and their reads (this cold pass), stamp each sign/plate
+    // with the vehicle it sits on so the recorder can group per truck.
+    stamp_vehicle_ids(stage_dets, &vehicle_boxes(vehicles));
+}
+
+/// Maps published vehicle detections to the `[VehicleBox]` association inputs,
+/// dropping any with `track_id = 0` (an untracked box has no stable vehicle_id
+/// to attribute signs to).
+fn vehicle_boxes(vehicles: &[Detection]) -> Vec<VehicleBox> {
+    vehicles
+        .iter()
+        .filter(|d| d.track_id != 0)
+        .map(|d| VehicleBox {
+            bbox: d.bbox,
+            vehicle_id: d.track_id,
+        })
+        .collect()
 }
 
 /// Materializes the FULL RGB24 camera frame for a thumbnail capture. On the host
@@ -3492,6 +3841,100 @@ async fn ocr_crop(
 mod tests {
     use super::*;
 
+    fn vb(id: u32, x: f32, y: f32, w: f32, h: f32) -> VehicleBox {
+        VehicleBox {
+            bbox: [x, y, w, h],
+            vehicle_id: id,
+        }
+    }
+
+    /// Two overlapping vehicles: the sign's center lands inside BOTH, so the
+    /// tie-break (larger containment, then smaller vehicle area, then smaller id)
+    /// must pick the vehicle that actually contains the sign more tightly.
+    #[test]
+    fn assign_vehicle_two_overlapping_picks_tighter() {
+        // Big vehicle 1 covers the left half; small vehicle 2 is a tight box
+        // fully around the sign, both containing the sign center.
+        let big = vb(1, 0.0, 0.0, 0.6, 1.0);
+        let small = vb(2, 0.35, 0.30, 0.20, 0.20);
+        // Sign fully inside the small box (and inside the big one too).
+        let sign = [0.40, 0.35, 0.05, 0.05];
+        // Small box fully contains the sign (frac 1.0) and has smaller area → wins.
+        assert_eq!(assign_vehicle(&sign, &[big, small]), 2);
+    }
+
+    /// A sign whose center is NOT inside any vehicle but overlaps one ≥ 0.3 is
+    /// assigned by the max-overlap fallback; below the floor it stays unassigned.
+    #[test]
+    fn assign_vehicle_cutoff_box_uses_overlap_fallback() {
+        // Vehicle occupies the top-left quadrant.
+        let v = vb(7, 0.0, 0.0, 0.5, 0.5);
+        // Sign straddles the right edge: center at x=0.5 is ON the border (inside),
+        // so nudge it just outside to force the fallback. Half of the sign overlaps.
+        let sign = [0.45, 0.20, 0.20, 0.10]; // center x=0.55 outside the box
+        // Overlap = x in [0.45,0.5] → 0.05 wide × 0.10 tall = 0.005; sign area
+        // 0.20×0.10 = 0.02 → frac 0.25 < 0.3 → unassigned.
+        assert_eq!(assign_vehicle(&sign, &[v]), 0);
+        // Widen the vehicle so ≥30% of the sign overlaps → assigned.
+        let v2 = vb(7, 0.0, 0.0, 0.6, 0.5);
+        // Overlap x in [0.45,0.6] → 0.15 wide but sign ends at 0.65, so overlap
+        // width = min(0.65,0.6)-0.45 = 0.15 × 0.10 = 0.015; frac 0.75 ≥ 0.3 → 7.
+        assert_eq!(assign_vehicle(&sign, &[v2]), 7);
+    }
+
+    /// A background sign far from every vehicle stays unassigned (id 0).
+    #[test]
+    fn assign_vehicle_background_sign_unassigned() {
+        let v = vb(3, 0.0, 0.0, 0.3, 0.3);
+        let sign = [0.80, 0.80, 0.05, 0.05];
+        assert_eq!(assign_vehicle(&sign, &[v]), 0);
+        // No vehicles at all → unassigned.
+        assert_eq!(assign_vehicle(&sign, &[]), 0);
+    }
+
+    /// A single vehicle containing the sign's center is assigned directly.
+    #[test]
+    fn assign_vehicle_single_vehicle_center_in_box() {
+        let v = vb(42, 0.1, 0.1, 0.6, 0.6);
+        let sign = [0.30, 0.30, 0.05, 0.05];
+        assert_eq!(assign_vehicle(&sign, &[v]), 42);
+    }
+
+    /// `stamp_vehicle_ids`: vehicle boxes self-assign (vehicle_id = track_id),
+    /// signs get their owning vehicle, background signs get 0.
+    #[test]
+    fn stamp_vehicle_ids_routes_signs_and_self_assigns_vehicles() {
+        let mk = |klasa: &str, bbox: [f32; 4], track: u32| {
+            let mut d = detection_from_cv(CvDetection {
+                klasa: klasa.into(),
+                bbox,
+                score: 0.9,
+            });
+            d.track_id = track;
+            d
+        };
+        let mut stage_dets = vec![(
+            "adr".to_string(),
+            vec![
+                mk("tablica_adr", [0.30, 0.30, 0.04, 0.04], 5), // inside vehicle 9
+                mk("tablica_rejestracyjna", [0.90, 0.90, 0.03, 0.03], 6), // background
+            ],
+        )];
+        let vehicles = vec![VehicleBox {
+            bbox: [0.1, 0.1, 0.6, 0.6],
+            vehicle_id: 9,
+        }];
+        // A vehicle box detection self-assigns.
+        stage_dets.push((
+            "veh".to_string(),
+            vec![mk(crate::vision::detector_vehicle::VEHICLE_CLASS, [0.1, 0.1, 0.6, 0.6], 9)],
+        ));
+        stamp_vehicle_ids(&mut stage_dets, &vehicles);
+        assert_eq!(stage_dets[0].1[0].vehicle_id, 9, "ADR sits on vehicle 9");
+        assert_eq!(stage_dets[0].1[1].vehicle_id, 0, "background plate unassigned");
+        assert_eq!(stage_dets[1].1[0].vehicle_id, 9, "vehicle box self-assigns");
+    }
+
     /// Mapowanie CvDetection→Detection: pola detektora przechodzą 1:1, pola
     /// wzbogacenia/śledzenia startują puste (nadaje je tracker i cold path).
     #[test]
@@ -3726,6 +4169,7 @@ mod tests {
             results: Vec::new(),
             detect_ms_total: 0,
             failed_stages: 0,
+            vehicles: Vec::new(),
         }
     }
 
@@ -3736,6 +4180,7 @@ mod tests {
             outcome: Ok(CameraCvResult::Detections {
                 per_frame: vec![Vec::new()],
             }),
+            vehicles: vec![Vec::new()],
         }
     }
 
@@ -3857,6 +4302,7 @@ mod tests {
             alias: "m".into(),
             detect_ms: 0,
             outcome: Err("simulated forward failure".into()),
+            vehicles: Vec::new(),
         }
     }
 

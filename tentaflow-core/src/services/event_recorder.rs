@@ -226,25 +226,36 @@ struct TextWinner {
 /// plate is reported `unreadable`, not as a confident plate. Sticker-condition
 /// labels (`stan`) are voted per label so the event reports the MAJORITY state
 /// of each sticker across all frames, not one noisy frame.
+/// Per-VEHICLE aggregation: every detection routed to one truck (by its
+/// `vehicle_id`) tallies its plates/ADR/stickers/thumbnails HERE. This is
+/// exactly the flat bag the recorder used to keep for the whole scene; the
+/// per-truck separation just keeps one of these per vehicle so two trucks in one
+/// event no longer mix their plates/placards.
 #[derive(Debug, Default)]
-struct EventMeta {
+struct VehicleMeta {
     /// class → frames it appeared in.
     classes: BTreeMap<String, u64>,
     /// class → OCR text → confidence-weighted vote (plates, ADR codes, …).
     texts: BTreeMap<String, BTreeMap<String, TextVote>>,
-    /// sticker label → observed state → frames seen with that state (e.g.
-    /// `"nalepka_3" → {"czysta": 40, "uszkodzona": 3}`). The majority state per
-    /// label is the event's reported sticker condition.
+    /// sticker label → observed state → frames seen with that state.
     stany: BTreeMap<String, BTreeMap<String, u64>>,
     /// distinct non-zero tracker ids seen.
     tracks: BTreeSet<u32>,
-    /// detection frames absorbed (non-empty only).
+    /// detection frames this vehicle appeared in.
     frames: u64,
     /// class → best (highest-confidence) full-frame thumbnail seen for that
-    /// class during the event: the snapshot ref plus the confidence that backs
-    /// it. The enrichment path only sets `tekst_thumb_ref` on a NEW best read, so
-    /// keeping the max here promotes the clearest scene to the recordings list.
+    /// class: the snapshot ref plus the confidence that backs it.
     best_thumb: BTreeMap<String, (String, f32)>,
+}
+
+/// Aggregates every detection observed during one event, GROUPED BY vehicle.
+/// `vehicles[id]` is one truck's plates/ADR/stickers/thumbnails; `vehicle_id = 0`
+/// is the "unassigned" bucket (signs outside any vehicle box, kept for the JSON
+/// but never the primary). With exactly one vehicle this collapses to today's
+/// single bag, so the scalar DB columns stay byte-identical for one-truck events.
+#[derive(Debug, Default)]
+struct EventMeta {
+    vehicles: BTreeMap<u32, VehicleMeta>,
 }
 
 /// Detection class carrying vehicle plate reads.
@@ -267,75 +278,70 @@ fn split_stan(raw: &str) -> (String, String) {
     }
 }
 
-impl EventMeta {
-    fn absorb(&mut self, items: &[Detection]) {
-        if items.is_empty() {
-            return;
+impl VehicleMeta {
+    /// Folds ONE detection (already routed to this vehicle) into the tally. This
+    /// is the exact per-detection logic the old scene-wide `absorb` ran — the
+    /// per-truck split only changed WHICH `VehicleMeta` a detection lands in.
+    fn absorb_one(&mut self, d: &Detection) {
+        *self.classes.entry(d.klasa.clone()).or_insert(0) += 1;
+        if let Some(t) = d.tekst.as_deref() {
+            if !t.is_empty() {
+                // An executor-path read has no numeric score; treat it as a
+                // full-confidence unit so it still clears the confidence floor and
+                // is gated on agreement (mirrors the live vote).
+                let conf = d.tekst_conf.unwrap_or(1.0).clamp(0.0, 1.0) as f64;
+                let vote = self
+                    .texts
+                    .entry(d.klasa.clone())
+                    .or_default()
+                    .entry(t.to_string())
+                    .or_default();
+                vote.count += 1;
+                vote.weight += conf.max(0.01);
+                vote.conf_sum += conf;
+            }
         }
-        self.frames += 1;
-        for d in items {
-            *self.classes.entry(d.klasa.clone()).or_insert(0) += 1;
-            if let Some(t) = d.tekst.as_deref() {
-                if !t.is_empty() {
-                    // An executor-path read has no numeric score; treat it as a
-                    // full-confidence unit so it still clears the confidence
-                    // floor and is gated on agreement (mirrors the live vote).
-                    let conf = d.tekst_conf.unwrap_or(1.0).clamp(0.0, 1.0) as f64;
-                    let vote = self
-                        .texts
-                        .entry(d.klasa.clone())
-                        .or_default()
-                        .entry(t.to_string())
-                        .or_default();
-                    vote.count += 1;
-                    vote.weight += conf.max(0.01);
-                    vote.conf_sum += conf;
+        // A thumbnail rides only the read that just set a new best confidence for
+        // its track; keep the highest-confidence one per class across the event.
+        if let Some(thumb) = d.tekst_thumb_ref.as_deref() {
+            if !thumb.is_empty() {
+                let conf = d.tekst_conf.unwrap_or(0.0).clamp(0.0, 1.0);
+                let better = self
+                    .best_thumb
+                    .get(&d.klasa)
+                    .map(|(_, c)| conf > *c)
+                    .unwrap_or(true);
+                if better {
+                    self.best_thumb
+                        .insert(d.klasa.clone(), (thumb.to_string(), conf));
                 }
             }
-            // A thumbnail rides only the read that just set a new best confidence
-            // for its track; keep the highest-confidence one per class across the
-            // whole event (the frame where the plate/ADR is clearest).
-            if let Some(thumb) = d.tekst_thumb_ref.as_deref() {
-                if !thumb.is_empty() {
-                    let conf = d.tekst_conf.unwrap_or(0.0).clamp(0.0, 1.0);
-                    let better = self
-                        .best_thumb
-                        .get(&d.klasa)
-                        .map(|(_, c)| conf > *c)
-                        .unwrap_or(true);
-                    if better {
-                        self.best_thumb
-                            .insert(d.klasa.clone(), (thumb.to_string(), conf));
-                    }
+        }
+        // The classifier emits the STATE word ("czysta"/"brudna"/…) in `d.stan`;
+        // the sticker it belongs to is the detection CLASS (`d.klasa`). Aggregate
+        // the majority state PER sticker class. (`split_stan` still handles a
+        // legacy "<label> <state>" string defensively.)
+        let sticker = d.klasa.trim();
+        if !sticker.is_empty() {
+            for s in &d.stan {
+                let s = s.trim();
+                if s.is_empty() {
+                    continue;
                 }
+                let (label, state) = if s.contains(' ') {
+                    split_stan(s)
+                } else {
+                    (sticker.to_string(), s.to_string())
+                };
+                *self.stany.entry(label).or_default().entry(state).or_insert(0) += 1;
             }
-            // The classifier emits the STATE word ("czysta"/"brudna"/…) in
-            // `d.stan`; the sticker it belongs to is the detection CLASS
-            // (`d.klasa`, e.g. "nalepka_3"). Aggregate the majority state PER
-            // sticker class. (`split_stan` still handles a legacy "<label>
-            // <state>" string defensively for any detector that packs both.)
-            let sticker = d.klasa.trim();
-            if !sticker.is_empty() {
-                for s in &d.stan {
-                    let s = s.trim();
-                    if s.is_empty() {
-                        continue;
-                    }
-                    let (label, state) = if s.contains(' ') {
-                        split_stan(s)
-                    } else {
-                        (sticker.to_string(), s.to_string())
-                    };
-                    *self.stany.entry(label).or_default().entry(state).or_insert(0) += 1;
-                }
-            }
-            if d.track_id != 0 {
-                self.tracks.insert(d.track_id);
-            }
+        }
+        if d.track_id != 0 {
+            self.tracks.insert(d.track_id);
         }
     }
 
-    /// Gated plate/ADR winner strings for the finalized event, mirroring the JSON
+    /// Gated plate/ADR winner strings for this vehicle, mirroring the JSON
     /// `texts.<class>` winners but as plain columns for indexed search. `None`
     /// when a class was unreadable or absent.
     fn winner_texts(&self) -> (Option<String>, Option<String>) {
@@ -352,16 +358,9 @@ impl EventMeta {
         (plate, adr)
     }
 
-    /// The single representative full-frame thumbnail for the event: one photo
-    /// of the truck for the recordings list.
-    ///
-    /// Heuristic: prefer the frame that produced the event's best PLATE read.
-    /// That is precisely when the truck faces the camera squarely enough for the
-    /// plate to be legible — the moment the whole vehicle is best captured — and
-    /// it reuses the enrichment path's existing best-confidence snapshot with no
-    /// new capture. Falls back to the best ADR-read frame, then to the best
-    /// thumbnail of any other class, so an event with no plate still shows a
-    /// photo.
+    /// The single representative full-frame thumbnail for this vehicle: prefer
+    /// the best PLATE-read frame, then the best ADR-read frame, then the best of
+    /// any remaining class.
     fn event_thumb(&self) -> Option<String> {
         if let Some((r, _)) = self.best_thumb.get(CLASS_PLATE) {
             return Some(r.clone());
@@ -369,17 +368,15 @@ impl EventMeta {
         if let Some((r, _)) = self.best_thumb.get(CLASS_ADR) {
             return Some(r.clone());
         }
-        // Any remaining class: take the highest-confidence thumbnail overall.
         self.best_thumb
             .values()
             .max_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(r, _)| r.clone())
     }
 
-    /// Majority sticker state per label for the finalized event: `{"nalepka_3":
-    /// "czysta", "znak_srodowiskowy": "uszkodzona"}`. The winner is the state
-    /// with the most frames; ties break on the lexically-smallest state for a
-    /// stable output. Labels with no votes are absent.
+    /// Majority sticker state per label for this vehicle: `{"nalepka_3":
+    /// "czysta", …}`. The winner is the state with the most frames; ties break on
+    /// the lexically-smallest state. Labels with no votes are absent.
     fn stany_winners(&self) -> BTreeMap<String, String> {
         self.stany
             .iter()
@@ -435,28 +432,154 @@ impl EventMeta {
         }
     }
 
-    /// Serialize the summary for one finalized file. `start/stop` are wall
-    /// clock (unix ms) of the FILE (pre-roll included), `part` numbers files
-    /// within one long event that rotated at `event_max_duration_secs`.
-    fn to_json(&self, start_ts_ms: u64, stop_ts_ms: u64, preroll_ms: u64, part: u32) -> String {
-        // Per class: the gated winner (plate/ADR or unreadable) + its confidence,
-        // agreement and the raw per-variant counts, so a consumer sees WHY.
-        let texts: BTreeMap<String, TextWinner> = self
-            .texts
+    /// Per-class gated winners (plate/ADR or unreadable) + confidence, agreement
+    /// and raw per-variant counts, for the JSON `texts` map.
+    fn texts_winners(&self) -> BTreeMap<String, TextWinner> {
+        self.texts
             .iter()
             .map(|(klasa, votes)| (klasa.clone(), Self::winner(votes)))
+            .collect()
+    }
+}
+
+impl EventMeta {
+    /// Routes every detection of a frame to its vehicle bucket by `vehicle_id`
+    /// (0 = unassigned bucket) and folds it in. Empty frames are ignored so the
+    /// event's `detection_frames`/`frames` count only frames that carried at
+    /// least one detection (matching the old scene-wide semantics per vehicle).
+    fn absorb(&mut self, items: &[Detection]) {
+        if items.is_empty() {
+            return;
+        }
+        // A vehicle is present in THIS frame iff at least one detection routed to
+        // it; bump each present vehicle's frame counter once (not once per det).
+        let mut present: BTreeSet<u32> = BTreeSet::new();
+        for d in items {
+            let vm = self.vehicles.entry(d.vehicle_id).or_default();
+            vm.absorb_one(d);
+            present.insert(d.vehicle_id);
+        }
+        for id in present {
+            self.vehicles.entry(id).or_default().frames += 1;
+        }
+    }
+
+    /// The PRIMARY vehicle: the one with the most detection frames (ties → the
+    /// smallest `vehicle_id` for determinism). Its plate/ADR/thumb feed the
+    /// scalar DB columns so the panel row + search stay working with NO
+    /// migration. `vehicle_id = 0` (unassigned) only wins when it is the ONLY
+    /// bucket — a real (non-zero) vehicle always outranks the unassigned bucket
+    /// at equal frames, so a single truck with an unassigned stray still reports
+    /// the truck. `None` for an empty event.
+    fn primary(&self) -> Option<(u32, &VehicleMeta)> {
+        self.vehicles
+            .iter()
+            .max_by(|(ida, a), (idb, b)| {
+                a.frames
+                    .cmp(&b.frames)
+                    // A non-zero vehicle beats the unassigned (0) bucket at a tie.
+                    .then_with(|| (**ida != 0).cmp(&(**idb != 0)))
+                    // Then the smaller id (stable).
+                    .then_with(|| idb.cmp(ida))
+            })
+            .map(|(id, vm)| (*id, vm))
+    }
+
+    /// Scalar plate/ADR winner columns = the PRIMARY vehicle's (one-truck events
+    /// stay byte-identical to the old single-bag output).
+    fn winner_texts(&self) -> (Option<String>, Option<String>) {
+        self.primary()
+            .map(|(_, vm)| vm.winner_texts())
+            .unwrap_or((None, None))
+    }
+
+    /// Scalar event thumbnail = the PRIMARY vehicle's photo.
+    fn event_thumb(&self) -> Option<String> {
+        self.primary().and_then(|(_, vm)| vm.event_thumb())
+    }
+
+    /// Serialize the summary for one finalized file. Keeps the historical
+    /// top-level `classes`/`texts`/`stany`/`tracks`/`detection_frames` — for a
+    /// single vehicle those equal that vehicle, so ONE-truck JSON stays
+    /// byte-identical there; multi-truck top-level fields are the UNION across
+    /// vehicles. The new `vehicles[]` array carries the per-truck breakdown the
+    /// panel renders. `start/stop` are wall clock (unix ms) of the FILE, `part`
+    /// numbers files within one long event.
+    fn to_json(&self, start_ts_ms: u64, stop_ts_ms: u64, preroll_ms: u64, part: u32) -> String {
+        // Top-level aggregate (union across vehicles) — back-compat shape.
+        let mut classes: BTreeMap<String, u64> = BTreeMap::new();
+        let mut texts_merged: BTreeMap<String, BTreeMap<String, TextVote>> = BTreeMap::new();
+        let mut stany_merged: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+        let mut tracks: BTreeSet<u32> = BTreeSet::new();
+        let mut frames = 0u64;
+        for vm in self.vehicles.values() {
+            for (k, c) in &vm.classes {
+                *classes.entry(k.clone()).or_insert(0) += c;
+            }
+            for (k, votes) in &vm.texts {
+                let dst = texts_merged.entry(k.clone()).or_default();
+                for (t, v) in votes {
+                    let e = dst.entry(t.clone()).or_default();
+                    e.count += v.count;
+                    e.weight += v.weight;
+                    e.conf_sum += v.conf_sum;
+                }
+            }
+            for (label, states) in &vm.stany {
+                let dst = stany_merged.entry(label.clone()).or_default();
+                for (st, c) in states {
+                    *dst.entry(st.clone()).or_insert(0) += c;
+                }
+            }
+            tracks.extend(vm.tracks.iter().copied());
+            frames = frames.max(vm.frames);
+        }
+        let texts: BTreeMap<String, TextWinner> = texts_merged
+            .iter()
+            .map(|(k, votes)| (k.clone(), VehicleMeta::winner(votes)))
             .collect();
+        let stany_winners: BTreeMap<String, String> = stany_merged
+            .iter()
+            .filter_map(|(label, states)| {
+                states
+                    .iter()
+                    .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+                    .map(|(state, _)| (label.clone(), state.clone()))
+            })
+            .collect();
+
+        // Per-vehicle breakdown — one object per truck (unassigned bucket 0
+        // included for completeness; the panel prefers non-zero vehicles).
+        let vehicles: Vec<serde_json::Value> = self
+            .vehicles
+            .iter()
+            .map(|(id, vm)| {
+                let (plate, adr) = vm.winner_texts();
+                serde_json::json!({
+                    "vehicle_id": id,
+                    "plate": plate,
+                    "adr": adr,
+                    "stany": vm.stany_winners(),
+                    "thumb": vm.event_thumb(),
+                    "detection_frames": vm.frames,
+                    "classes": vm.classes,
+                    "texts": vm.texts_winners(),
+                })
+            })
+            .collect();
+
         serde_json::json!({
             "event": "vehicle_presence",
             "start_ts_ms": start_ts_ms,
             "stop_ts_ms": stop_ts_ms,
             "preroll_ms": preroll_ms,
             "part": part,
-            "detection_frames": self.frames,
-            "tracks": self.tracks.len(),
-            "classes": self.classes,
+            "detection_frames": frames,
+            "tracks": tracks.len(),
+            "classes": classes,
             "texts": texts,
-            "stany": self.stany_winners(),
+            "stany": stany_winners,
+            "vehicles": vehicles,
         })
         .to_string()
     }
@@ -1174,9 +1297,74 @@ mod tests {
             tekst_conf,
             tekst_thumb_ref: None,
             track_id,
+            vehicle_id: 0,
             vx: 0.,
             vy: 0.,
         }
+    }
+
+    /// Like `det` but stamped with an explicit `vehicle_id` — for the per-truck
+    /// routing tests.
+    fn det_veh(klasa: &str, tekst: Option<&str>, track_id: u32, vehicle_id: u32) -> Detection {
+        let mut d = det(klasa, tekst, &[], track_id);
+        d.vehicle_id = vehicle_id;
+        d
+    }
+
+    /// Two trucks in one event must NOT mix their plates/ADR: each vehicle_id
+    /// gets its own `VehicleMeta`, `vehicles[]` carries both, and the scalar
+    /// columns report the PRIMARY (most-frames) truck.
+    #[test]
+    fn event_meta_two_trucks_do_not_mix() {
+        let mut meta = EventMeta::default();
+        // Truck 1 (vehicle_id 1) — plate + ADR, seen in 3 frames.
+        for _ in 0..3 {
+            meta.absorb(&[
+                det_veh(CLASS_PLATE, Some("WGM11111"), 10, 1),
+                det_veh(CLASS_ADR, Some("30/1202"), 11, 1),
+            ]);
+        }
+        // Truck 2 (vehicle_id 2) — a DIFFERENT plate, seen in 1 frame.
+        meta.absorb(&[det_veh(CLASS_PLATE, Some("KR22222"), 20, 2)]);
+
+        let v: serde_json::Value =
+            serde_json::from_str(&meta.to_json(0, 0, 0, 0)).expect("valid json");
+        let vehicles = v["vehicles"].as_array().expect("vehicles array");
+        assert_eq!(vehicles.len(), 2, "two distinct trucks");
+        // Vehicle 1 owns WGM11111 + the ADR; vehicle 2 owns KR22222 and NO ADR.
+        let by_id = |id: u64| vehicles.iter().find(|x| x["vehicle_id"] == id).unwrap();
+        let t1 = by_id(1);
+        assert_eq!(t1["plate"], "WGM11111");
+        assert_eq!(t1["adr"], "30/1202");
+        assert_eq!(t1["detection_frames"], 3);
+        let t2 = by_id(2);
+        assert_eq!(t2["plate"], "KR22222");
+        assert!(t2["adr"].is_null(), "truck 2 has no ADR — not truck 1's");
+        assert_eq!(t2["detection_frames"], 1);
+
+        // Scalar columns = the PRIMARY vehicle (truck 1, more frames).
+        let (plate, adr) = meta.winner_texts();
+        assert_eq!(plate.as_deref(), Some("WGM11111"));
+        assert_eq!(adr.as_deref(), Some("30/1202"));
+    }
+
+    /// A single-vehicle event must keep the scalar columns byte-identical to the
+    /// old single-bag output (no migration): one bucket → primary = that bucket.
+    #[test]
+    fn event_meta_single_truck_scalars_unchanged() {
+        let mut single = EventMeta::default();
+        single.absorb(&[det_veh(CLASS_PLATE, Some("WPL5HJ2"), 3, 1)]);
+        single.absorb(&[det_veh(CLASS_ADR, Some("33/1088"), 4, 1)]);
+        let (plate, adr) = single.winner_texts();
+        assert_eq!(plate.as_deref(), Some("WPL5HJ2"));
+        assert_eq!(adr.as_deref(), Some("33/1088"));
+
+        // Top-level JSON classes/texts equal the single vehicle's (union of one).
+        let v: serde_json::Value =
+            serde_json::from_str(&single.to_json(0, 0, 0, 0)).expect("valid json");
+        assert_eq!(v["texts"][CLASS_PLATE]["text"], "WPL5HJ2");
+        assert_eq!(v["classes"][CLASS_PLATE], 1);
+        assert_eq!(v["vehicles"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -1225,14 +1413,16 @@ mod tests {
         ]);
         meta.absorb(&[det("tablica_adr", Some("30/1202"), &["nalepka_3 uszkodzona"], 7)]);
         meta.absorb(&[]); // empty frames are ignored
-        assert_eq!(meta.frames, 2);
-        assert_eq!(meta.classes["tablica_adr"], 2);
+        // All these `det`s carry vehicle_id=0 → one bucket; assert on it.
+        let vm = &meta.vehicles[&0];
+        assert_eq!(vm.frames, 2);
+        assert_eq!(vm.classes["tablica_adr"], 2);
         // Raw per-variant frame counts still tallied.
-        assert_eq!(meta.texts["tablica_adr"]["30/1202"].count, 2);
-        assert_eq!(meta.texts["tablica_rejestracyjna"]["WGM12345"].count, 1);
+        assert_eq!(vm.texts["tablica_adr"]["30/1202"].count, 2);
+        assert_eq!(vm.texts["tablica_rejestracyjna"]["WGM12345"].count, 1);
         // Sticker states are voted per label (`<label> <state>` split).
-        assert_eq!(meta.stany["nalepka_3"]["uszkodzona"], 1);
-        assert_eq!(meta.tracks.len(), 2);
+        assert_eq!(vm.stany["nalepka_3"]["uszkodzona"], 1);
+        assert_eq!(vm.tracks.len(), 2);
 
         let v: serde_json::Value =
             serde_json::from_str(&meta.to_json(1_000, 21_000, 5_000, 0)).expect("valid json");
@@ -1401,13 +1591,16 @@ mod tests {
         meta.absorb(&[det("nalepka", None, &["nalepka_3 uszkodzona"], 1)]);
         // znak_srodowiskowy is uszkodzona in the only frame it appears.
         meta.absorb(&[det("nalepka", None, &["znak_srodowiskowy uszkodzona"], 2)]);
-        // A bare single-token flag has no separate label → keyed under itself.
+        // A bare single-token state ("ok") has no separate label, so it is keyed
+        // under the detection CLASS ("pojazd") — the sticker it belongs to (per
+        // the per-class aggregation).
         meta.absorb(&[det("pojazd", None, &["ok"], 3)]);
 
-        let winners = meta.stany_winners();
+        // All these `det`s carry vehicle_id=0 → one bucket; assert on it.
+        let winners = meta.vehicles[&0].stany_winners();
         assert_eq!(winners["nalepka_3"], "czysta");
         assert_eq!(winners["znak_srodowiskowy"], "uszkodzona");
-        assert_eq!(winners["ok"], "ok");
+        assert_eq!(winners["pojazd"], "ok");
 
         let v: serde_json::Value =
             serde_json::from_str(&meta.to_json(0, 0, 0, 0)).expect("valid json");

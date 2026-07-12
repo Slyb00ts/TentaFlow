@@ -59,6 +59,10 @@ pub mod classifier_stan;
 pub mod inference_batcher;
 #[cfg(feature = "inference-vision-gpu")]
 pub mod detector_rfdetr;
+// YOLOv8 vehicle detector — runs in parallel with RF-DETR (own ort pool) so each
+// ADR/plate/sticker can be associated to the vehicle it sits on (per-truck reads).
+#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+pub mod detector_vehicle;
 #[cfg(feature = "inference-vision-gpu")]
 pub mod depth_anything;
 #[cfg(feature = "inference-vision-gpu")]

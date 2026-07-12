@@ -5477,6 +5477,127 @@ fn recording_reads_text(plate: &str, adr: &str, stany: &str) -> String {
     alloc::format!("Rejestracja: {plate}\nADR: {adr}\nNalepki: {stany}")
 }
 
+/// One truck's reads parsed out of an `event_meta.vehicles[]` entry.
+struct VehicleReads {
+    vehicle_id: u64,
+    plate: String,
+    adr: String,
+    stany: String,
+}
+
+/// Parses the per-truck breakdown from `event_meta.vehicles[]`, dropping the
+/// unassigned bucket (`vehicle_id == 0`). Empty when the blob predates the
+/// per-vehicle shape (old single-bag rows) — callers then fall back to the
+/// scalar columns + the whole-scene `event_meta` via `recording_meta_text`.
+/// Plate/ADR tolerate BOTH the gated-winner object and the raw count-map (via
+/// `event_meta_winner_text`); a per-vehicle `plate`/`adr` string field wins when
+/// present (the recorder emits it directly).
+fn recording_meta_vehicles(meta: &Option<JsonValue>) -> Vec<VehicleReads> {
+    let Some(JsonValue::Array(items)) = meta.as_ref().and_then(|m| m.get("vehicles")) else {
+        return Vec::new();
+    };
+    let mut out: Vec<VehicleReads> = Vec::new();
+    for item in items {
+        let vehicle_id = item.get("vehicle_id").and_then(JsonValue::as_u64).unwrap_or(0);
+        if vehicle_id == 0 {
+            // Unassigned bucket — signs outside any truck; not a per-truck block.
+            continue;
+        }
+        // Prefer the direct `plate`/`adr` string field; else derive from
+        // `texts.<class>` (tolerant of both stored shapes).
+        let plate = item
+            .get("plate")
+            .and_then(JsonValue::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                event_meta_winner_text(
+                    item.get("texts").and_then(|t| t.get("tablica_rejestracyjna")),
+                )
+            });
+        let adr = item
+            .get("adr")
+            .and_then(JsonValue::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                event_meta_winner_text(item.get("texts").and_then(|t| t.get("tablica_adr")))
+            });
+        let stany = recording_stany_map(item.get("stany"));
+        out.push(VehicleReads {
+            vehicle_id,
+            plate,
+            adr,
+            stany,
+        });
+    }
+    // Stable order by vehicle_id so "Pojazd 1/2/…" numbering is deterministic.
+    out.sort_by_key(|v| v.vehicle_id);
+    out
+}
+
+/// Renders the "Odczyty" cell across one or more trucks. A SINGLE truck (or the
+/// old single-bag shape) renders exactly as before — no "Pojazd" prefix. Two or
+/// more trucks render one labelled block per truck ("Pojazd 1 — Rejestracja: … /
+/// ADR: … / Nalepki: …"), separated by a blank line.
+fn recording_reads_multi(vehicles: &[VehicleReads], fallback: &str) -> String {
+    match vehicles.len() {
+        0 => fallback.to_string(),
+        1 => {
+            let v = &vehicles[0];
+            recording_reads_text(&dash(&v.plate), &dash(&v.adr), &dash(&v.stany))
+        }
+        _ => {
+            let mut blocks: Vec<String> = Vec::with_capacity(vehicles.len());
+            for (i, v) in vehicles.iter().enumerate() {
+                blocks.push(alloc::format!(
+                    "Pojazd {} — Rejestracja: {}\nADR: {}\nNalepki: {}",
+                    i + 1,
+                    dash(&v.plate),
+                    dash(&v.adr),
+                    dash(&v.stany)
+                ));
+            }
+            blocks.join("\n\n")
+        }
+    }
+}
+
+/// "—" for an empty/blank string, else the trimmed string.
+fn dash(s: &str) -> String {
+    let t = s.trim();
+    if t.is_empty() {
+        "—".to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// Renders one vehicle's `stany` object (`{"nalepka_3":"czysta", …}`) as a
+/// compact `label: state, …` string, mirroring `recording_meta_stany` but for a
+/// per-vehicle sub-object. Empty/missing → "—".
+fn recording_stany_map(stany: Option<&JsonValue>) -> String {
+    let Some(JsonValue::Object(map)) = stany else {
+        return "—".to_string();
+    };
+    let parts: Vec<String> = map
+        .iter()
+        .filter_map(|(label, state)| {
+            let state = state.as_str()?.trim();
+            let label = label.trim();
+            if label.is_empty() || state.is_empty() {
+                return None;
+            }
+            Some(alloc::format!("{label}: {state}"))
+        })
+        .collect();
+    if parts.is_empty() {
+        "—".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
 /// mm:ss for a duration in milliseconds. `None`/0 → "—".
 fn format_duration_ms(ms: Option<i64>) -> String {
     match ms {
@@ -5534,9 +5655,19 @@ fn recording_table_row_value(item: &RecordingListItem, camera_name: &str) -> Val
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| recording_meta_text(&meta, "tablica_adr"));
     let stany = recording_meta_stany(&meta);
-    let odczyty = recording_reads_text(&plate, &adr, &stany);
+    // Per-truck breakdown from `event_meta.vehicles[]`. With 0 or 1 real truck the
+    // cell is byte-identical to the old single-bag output (scalar plate/adr +
+    // whole-scene stany, NO "Pojazd" prefix); ≥2 trucks render one block each.
+    let vehicles = recording_meta_vehicles(&meta);
+    let single_line = recording_reads_text(&plate, &adr, &stany);
+    let odczyty = if vehicles.len() >= 2 {
+        recording_reads_multi(&vehicles, &single_line)
+    } else {
+        single_line
+    };
     // The single truck photo is the repurposed `plate_thumb_ref` (best-read
-    // frame); `adr_thumb_ref` is no longer populated by the recorder.
+    // frame, = the PRIMARY vehicle's thumb); `adr_thumb_ref` is no longer
+    // populated by the recorder.
     let zdjecie = recording_thumb_url(&item.plate_thumb_ref);
     let entries: Vec<(Value, Value)> = vec![
         (Value::Text("recording_ref".into()), Value::Text(item.recording_ref.clone())),

@@ -620,6 +620,7 @@ mod tests {
                     tekst_conf: None,
                     tekst_thumb_ref: None,
                     track_id: 7,
+                    vehicle_id: 0,
                     vx: 0.5,
                     vy: -0.5,
                 }],
