@@ -309,17 +309,25 @@ impl EventMeta {
                     }
                 }
             }
-            for s in &d.stan {
-                if s.trim().is_empty() {
-                    continue;
+            // The classifier emits the STATE word ("czysta"/"brudna"/…) in
+            // `d.stan`; the sticker it belongs to is the detection CLASS
+            // (`d.klasa`, e.g. "nalepka_3"). Aggregate the majority state PER
+            // sticker class. (`split_stan` still handles a legacy "<label>
+            // <state>" string defensively for any detector that packs both.)
+            let sticker = d.klasa.trim();
+            if !sticker.is_empty() {
+                for s in &d.stan {
+                    let s = s.trim();
+                    if s.is_empty() {
+                        continue;
+                    }
+                    let (label, state) = if s.contains(' ') {
+                        split_stan(s)
+                    } else {
+                        (sticker.to_string(), s.to_string())
+                    };
+                    *self.stany.entry(label).or_default().entry(state).or_insert(0) += 1;
                 }
-                let (label, state) = split_stan(s);
-                *self
-                    .stany
-                    .entry(label)
-                    .or_default()
-                    .entry(state)
-                    .or_insert(0) += 1;
             }
             if d.track_id != 0 {
                 self.tracks.insert(d.track_id);
