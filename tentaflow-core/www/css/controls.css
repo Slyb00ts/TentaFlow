@@ -1012,6 +1012,10 @@ tf-tabs {
   padding: 12px 14px;
   text-align: left;
   vertical-align: middle;
+  /* Honour explicit `\n` in text cells (e.g. the recordings "Odczyty" multi-line
+     reads) without affecting single-line cells: `pre-line` only breaks on hard
+     newlines and still collapses incidental whitespace. */
+  white-space: pre-line;
 }
 .tf-table thead th {
   background: var(--tf-bg-2);

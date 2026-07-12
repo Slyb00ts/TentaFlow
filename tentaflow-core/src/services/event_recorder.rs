@@ -195,14 +195,17 @@ struct TextVote {
     conf_sum: f64,
 }
 
-/// Minimum winner mean-confidence and agreement for an event's reported plate.
-/// Reads below these are recorded as `unreadable` in `event_meta` rather than
-/// surfaced as a confident plate — the same gate the live overlay applies, so a
-/// repeated occluded misread ("M88901 ×12") no longer becomes the event's plate.
-/// Kept in sync with the `[vision]` defaults (`plate_min_*`); the recorder does
-/// not read the vision settings so a camera node without `[vision]` still gates.
-const EVENT_TEXT_MIN_CONFIDENCE: f64 = 0.5;
-const EVENT_TEXT_MIN_AGREEMENT: f64 = 0.5;
+/// Confidence/agreement floors for an event's reported plate/ADR.
+///
+/// Confidence is DISABLED (0.0): the plate-OCR model's per-char softmax is
+/// near-uniform, so its mean confidence sits at ~0.05 even for a plate read
+/// identically thousands of times at 99%+ agreement — gating on it marked every
+/// real plate `unreadable`. The trustworthy signal is AGREEMENT (a consistent
+/// read across the event), so we report the agreement-majority winner and never
+/// suppress a confidently-agreed plate. A tiny agreement floor still drops pure
+/// scatter (every frame a different string) to `unreadable`.
+const EVENT_TEXT_MIN_CONFIDENCE: f64 = 0.0;
+const EVENT_TEXT_MIN_AGREEMENT: f64 = 0.34;
 
 /// Gated winner for one class's OCR votes: the reported string (or unreadable),
 /// its mean confidence and the agreement ratio, serialized into `event_meta`.
@@ -220,15 +223,19 @@ struct TextWinner {
 /// Aggregates every detection observed during one event into the JSON summary
 /// persisted in `recordings.event_meta`. OCR reads are voted per class with a
 /// CONFIDENCE-WEIGHTED tally so a repeated low-confidence misread on an occluded
-/// plate is reported `unreadable`, not as a confident plate.
+/// plate is reported `unreadable`, not as a confident plate. Sticker-condition
+/// labels (`stan`) are voted per label so the event reports the MAJORITY state
+/// of each sticker across all frames, not one noisy frame.
 #[derive(Debug, Default)]
 struct EventMeta {
     /// class → frames it appeared in.
     classes: BTreeMap<String, u64>,
     /// class → OCR text → confidence-weighted vote (plates, ADR codes, …).
     texts: BTreeMap<String, BTreeMap<String, TextVote>>,
-    /// condition flag (e.g. "uszkodzona") → frames observed.
-    stan: BTreeMap<String, u64>,
+    /// sticker label → observed state → frames seen with that state (e.g.
+    /// `"nalepka_3" → {"czysta": 40, "uszkodzona": 3}`). The majority state per
+    /// label is the event's reported sticker condition.
+    stany: BTreeMap<String, BTreeMap<String, u64>>,
     /// distinct non-zero tracker ids seen.
     tracks: BTreeSet<u32>,
     /// detection frames absorbed (non-empty only).
@@ -244,6 +251,21 @@ struct EventMeta {
 const CLASS_PLATE: &str = "tablica_rejestracyjna";
 /// Detection class carrying ADR placard reads.
 const CLASS_ADR: &str = "tablica_adr";
+
+/// Splits a raw `stan` string into `(label, state)`. Sticker labels are emitted
+/// as `"<label> <state>"` (e.g. `"nalepka_3 czysta"`, `"znak_srodowiskowy
+/// uszkodzona"`), so the LAST whitespace token is the condition and everything
+/// before it is the label. A bare single-token flag (`"uszkodzona"`, `"ok"`)
+/// has no separate label — it is voted under itself as both.
+fn split_stan(raw: &str) -> (String, String) {
+    let raw = raw.trim();
+    match raw.rsplit_once(char::is_whitespace) {
+        Some((label, state)) if !label.trim().is_empty() && !state.trim().is_empty() => {
+            (label.trim().to_string(), state.trim().to_string())
+        }
+        _ => (raw.to_string(), raw.to_string()),
+    }
+}
 
 impl EventMeta {
     fn absorb(&mut self, items: &[Detection]) {
@@ -288,7 +310,16 @@ impl EventMeta {
                 }
             }
             for s in &d.stan {
-                *self.stan.entry(s.clone()).or_insert(0) += 1;
+                if s.trim().is_empty() {
+                    continue;
+                }
+                let (label, state) = split_stan(s);
+                *self
+                    .stany
+                    .entry(label)
+                    .or_default()
+                    .entry(state)
+                    .or_insert(0) += 1;
             }
             if d.track_id != 0 {
                 self.tracks.insert(d.track_id);
@@ -313,11 +344,44 @@ impl EventMeta {
         (plate, adr)
     }
 
-    /// Best full-frame thumbnail refs for the event: `(plate_thumb, adr_thumb)`.
-    fn thumb_refs(&self) -> (Option<String>, Option<String>) {
-        let plate = self.best_thumb.get(CLASS_PLATE).map(|(r, _)| r.clone());
-        let adr = self.best_thumb.get(CLASS_ADR).map(|(r, _)| r.clone());
-        (plate, adr)
+    /// The single representative full-frame thumbnail for the event: one photo
+    /// of the truck for the recordings list.
+    ///
+    /// Heuristic: prefer the frame that produced the event's best PLATE read.
+    /// That is precisely when the truck faces the camera squarely enough for the
+    /// plate to be legible — the moment the whole vehicle is best captured — and
+    /// it reuses the enrichment path's existing best-confidence snapshot with no
+    /// new capture. Falls back to the best ADR-read frame, then to the best
+    /// thumbnail of any other class, so an event with no plate still shows a
+    /// photo.
+    fn event_thumb(&self) -> Option<String> {
+        if let Some((r, _)) = self.best_thumb.get(CLASS_PLATE) {
+            return Some(r.clone());
+        }
+        if let Some((r, _)) = self.best_thumb.get(CLASS_ADR) {
+            return Some(r.clone());
+        }
+        // Any remaining class: take the highest-confidence thumbnail overall.
+        self.best_thumb
+            .values()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(r, _)| r.clone())
+    }
+
+    /// Majority sticker state per label for the finalized event: `{"nalepka_3":
+    /// "czysta", "znak_srodowiskowy": "uszkodzona"}`. The winner is the state
+    /// with the most frames; ties break on the lexically-smallest state for a
+    /// stable output. Labels with no votes are absent.
+    fn stany_winners(&self) -> BTreeMap<String, String> {
+        self.stany
+            .iter()
+            .filter_map(|(label, states)| {
+                states
+                    .iter()
+                    .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+                    .map(|(state, _)| (label.clone(), state.clone()))
+            })
+            .collect()
     }
 
     /// Confidence+agreement gate over one class's votes: winner = heaviest
@@ -379,7 +443,7 @@ impl EventMeta {
             "tracks": self.tracks.len(),
             "classes": self.classes,
             "texts": texts,
-            "stan": self.stan,
+            "stany": self.stany_winners(),
         })
         .to_string()
     }
@@ -576,7 +640,10 @@ async fn insert_event_row(
     event_meta_json: String,
     plate_text: Option<String>,
     adr_text: Option<String>,
-    plate_thumb_ref: Option<String>,
+    // Single representative event thumbnail (repurposed `plate_thumb_ref`).
+    thumb_ref: Option<String>,
+    // Retained NULL: the per-class `adr_thumb_ref` column is no longer written,
+    // kept only so the catalog schema/back-compat rows stay valid.
     adr_thumb_ref: Option<String>,
 ) {
     let (owner_addon_id, org_id, retention_class) = identity.clone();
@@ -604,7 +671,7 @@ async fn insert_event_row(
             Some(&event_meta_json),
             plate_text.as_deref(),
             adr_text.as_deref(),
-            plate_thumb_ref.as_deref(),
+            thumb_ref.as_deref(),
             adr_thumb_ref.as_deref(),
         )
         .map(|_| (fin.recording_ref, fin.duration_ms, fin.bytes, fin.part))
@@ -1043,9 +1110,19 @@ async fn finalize_and_catalog(
                 fin.part,
             );
             let (plate_text, adr_text) = meta.winner_texts();
-            let (plate_thumb, adr_thumb) = meta.thumb_refs();
+            // One representative truck thumbnail per event; carried in the
+            // repurposed `plate_thumb_ref` column (the old per-class `adr_thumb`
+            // is no longer populated — the list shows a single photo).
+            let event_thumb = meta.event_thumb();
             insert_event_row(
-                camera_id, identity, fin, json, plate_text, adr_text, plate_thumb, adr_thumb,
+                camera_id,
+                identity,
+                fin,
+                json,
+                plate_text,
+                adr_text,
+                event_thumb,
+                None,
             )
             .await;
         }
@@ -1133,14 +1210,15 @@ mod tests {
             det("tablica_adr", Some("30/1202"), &[], 7),
             det("tablica_rejestracyjna", Some("WGM12345"), &[], 8),
         ]);
-        meta.absorb(&[det("tablica_adr", Some("30/1202"), &["uszkodzona"], 7)]);
+        meta.absorb(&[det("tablica_adr", Some("30/1202"), &["nalepka_3 uszkodzona"], 7)]);
         meta.absorb(&[]); // empty frames are ignored
         assert_eq!(meta.frames, 2);
         assert_eq!(meta.classes["tablica_adr"], 2);
         // Raw per-variant frame counts still tallied.
         assert_eq!(meta.texts["tablica_adr"]["30/1202"].count, 2);
         assert_eq!(meta.texts["tablica_rejestracyjna"]["WGM12345"].count, 1);
-        assert_eq!(meta.stan["uszkodzona"], 1);
+        // Sticker states are voted per label (`<label> <state>` split).
+        assert_eq!(meta.stany["nalepka_3"]["uszkodzona"], 1);
         assert_eq!(meta.tracks.len(), 2);
 
         let v: serde_json::Value =
@@ -1149,6 +1227,8 @@ mod tests {
         assert_eq!(v["start_ts_ms"], 1_000);
         assert_eq!(v["stop_ts_ms"], 21_000);
         assert_eq!(v["preroll_ms"], 5_000);
+        // Majority sticker state per label is emitted under `stany`.
+        assert_eq!(v["stany"]["nalepka_3"], "uszkodzona");
         // Two consistent reads with no explicit conf (executor-path = full unit)
         // → agreement 1.0, confidence 1.0, reported.
         let adr = &v["texts"]["tablica_adr"];
@@ -1158,17 +1238,20 @@ mod tests {
         assert_eq!(v["tracks"], 2);
     }
 
-    /// The field regression: an occluded plate reads several DIFFERENT
-    /// low-confidence strings; the highest COUNT ("M88901" ×4) must NOT be
-    /// reported — it loses the confidence+agreement gate → `unreadable`.
+    /// Gate semantics after the confidence floor was disabled (0.0) and the
+    /// AGREEMENT floor (0.34) became the sole trust signal, because the plate-OCR
+    /// softmax is near-uniform. A consistent majority read (4/7 = 0.57 agreement)
+    /// at NEAR-ZERO per-char confidence must now be REPORTED — never suppressed by
+    /// the broken confidence — mirroring a plate read the same way thousands of
+    /// times in the field.
     #[test]
-    fn event_meta_gates_low_confidence_disagreeing_reads() {
+    fn event_meta_reports_agreement_majority_at_low_confidence() {
         let mut meta = EventMeta::default();
         for s in ["M88901", "M88901", "M88901", "M88901", "N59156", "B67K71", "DRR740"] {
             meta.absorb(&[det_conf(
                 "tablica_rejestracyjna",
                 Some(s),
-                Some(0.32),
+                Some(0.05),
                 &[],
                 5,
             )]);
@@ -1176,10 +1259,32 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&meta.to_json(0, 0, 0, 0)).expect("valid json");
         let plate = &v["texts"]["tablica_rejestracyjna"];
-        assert_eq!(plate["unreadable"], true, "occluded plate must be unreadable");
-        assert!(plate["text"].is_null(), "no fabricated plate is reported");
-        // Counts are still preserved for inspection.
+        assert_eq!(plate["unreadable"], false, "agreement majority is reported");
+        assert_eq!(plate["text"], "M88901");
         assert_eq!(plate["votes"]["M88901"], 4);
+    }
+
+    /// Pure scatter — every frame a DIFFERENT string — stays `unreadable`: no
+    /// variant clears the agreement floor, so the recorder reports nothing rather
+    /// than a fabricated plate.
+    #[test]
+    fn event_meta_gates_pure_scatter_as_unreadable() {
+        let mut meta = EventMeta::default();
+        for s in ["M88901", "N59156", "B67K71", "DRR740"] {
+            meta.absorb(&[det_conf(
+                "tablica_rejestracyjna",
+                Some(s),
+                Some(0.05),
+                &[],
+                5,
+            )]);
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&meta.to_json(0, 0, 0, 0)).expect("valid json");
+        let plate = &v["texts"]["tablica_rejestracyjna"];
+        // Each variant has agreement 0.25 < 0.34 → gated out.
+        assert_eq!(plate["unreadable"], true, "scatter must be unreadable");
+        assert!(plate["text"].is_null(), "no fabricated plate is reported");
     }
 
     /// A single high-confidence, valid read is reported immediately (agreement
@@ -1227,10 +1332,11 @@ mod tests {
         assert!(adr.is_none(), "absent ADR class → None");
     }
 
-    /// The best-thumbnail-per-class rule: a thumbnail rides only a new-best read,
-    /// and the recorder keeps the HIGHEST-confidence one across the event.
+    /// The single representative thumbnail: the recorder keeps the
+    /// highest-confidence thumbnail per class and the event photo prefers the
+    /// best PLATE-read frame (the truck facing the camera).
     #[test]
-    fn event_meta_keeps_best_confidence_thumbnail_per_class() {
+    fn event_meta_picks_best_plate_frame_as_event_thumb() {
         let with_thumb = |klasa: &str, conf: f32, thumb: &str| {
             let mut d = det_conf(klasa, Some("WGM12345"), Some(conf), &[], 3);
             d.tekst_thumb_ref = Some(thumb.to_string());
@@ -1238,7 +1344,8 @@ mod tests {
         };
         let mut meta = EventMeta::default();
         // Plate thumbs arrive at rising then falling confidence; the recorder must
-        // retain the 0.92 one. ADR gets its own independent best.
+        // retain the 0.92 one and use it as the event photo even though the ADR
+        // frame is present too.
         meta.absorb(&[with_thumb(CLASS_PLATE, 0.60, "snap_plate_a")]);
         meta.absorb(&[with_thumb(CLASS_PLATE, 0.92, "snap_plate_b")]);
         meta.absorb(&[with_thumb(CLASS_PLATE, 0.70, "snap_plate_c")]);
@@ -1246,9 +1353,67 @@ mod tests {
         // A read with no thumb ref must not clear the retained best.
         meta.absorb(&[det_conf(CLASS_PLATE, Some("WGM12345"), Some(0.99), &[], 3)]);
 
-        let (plate_thumb, adr_thumb) = meta.thumb_refs();
-        assert_eq!(plate_thumb.as_deref(), Some("snap_plate_b"));
-        assert_eq!(adr_thumb.as_deref(), Some("snap_adr_a"));
+        assert_eq!(meta.event_thumb().as_deref(), Some("snap_plate_b"));
+    }
+
+    /// With no plate frame, the event photo falls back to the best ADR frame,
+    /// then to any remaining class's best thumbnail.
+    #[test]
+    fn event_thumb_falls_back_when_no_plate() {
+        let with_thumb = |klasa: &str, conf: f32, thumb: &str| {
+            let mut d = det_conf(klasa, Some("30/1202"), Some(conf), &[], 3);
+            d.tekst_thumb_ref = Some(thumb.to_string());
+            d
+        };
+        let mut adr_only = EventMeta::default();
+        adr_only.absorb(&[with_thumb(CLASS_ADR, 0.85, "snap_adr_a")]);
+        assert_eq!(adr_only.event_thumb().as_deref(), Some("snap_adr_a"));
+
+        let mut other = EventMeta::default();
+        other.absorb(&[with_thumb("nalepka", 0.40, "snap_x")]);
+        assert_eq!(other.event_thumb().as_deref(), Some("snap_x"));
+
+        assert_eq!(EventMeta::default().event_thumb(), None);
+    }
+
+    /// Sticker-state aggregation: each `<label> <state>` frame votes for the
+    /// label's state; the reported state is the frame majority per label.
+    #[test]
+    fn event_meta_aggregates_stan_majority_per_label() {
+        let mut meta = EventMeta::default();
+        // nalepka_3 reads "czysta" ×4 and "uszkodzona" ×1 → majority czysta.
+        for _ in 0..4 {
+            meta.absorb(&[det("nalepka", None, &["nalepka_3 czysta"], 1)]);
+        }
+        meta.absorb(&[det("nalepka", None, &["nalepka_3 uszkodzona"], 1)]);
+        // znak_srodowiskowy is uszkodzona in the only frame it appears.
+        meta.absorb(&[det("nalepka", None, &["znak_srodowiskowy uszkodzona"], 2)]);
+        // A bare single-token flag has no separate label → keyed under itself.
+        meta.absorb(&[det("pojazd", None, &["ok"], 3)]);
+
+        let winners = meta.stany_winners();
+        assert_eq!(winners["nalepka_3"], "czysta");
+        assert_eq!(winners["znak_srodowiskowy"], "uszkodzona");
+        assert_eq!(winners["ok"], "ok");
+
+        let v: serde_json::Value =
+            serde_json::from_str(&meta.to_json(0, 0, 0, 0)).expect("valid json");
+        assert_eq!(v["stany"]["nalepka_3"], "czysta");
+        assert_eq!(v["stany"]["znak_srodowiskowy"], "uszkodzona");
+    }
+
+    #[test]
+    fn split_stan_separates_label_and_state() {
+        assert_eq!(
+            split_stan("nalepka_3 czysta"),
+            ("nalepka_3".to_string(), "czysta".to_string())
+        );
+        assert_eq!(
+            split_stan("znak_srodowiskowy uszkodzona"),
+            ("znak_srodowiskowy".to_string(), "uszkodzona".to_string())
+        );
+        // A bare flag becomes its own label + state.
+        assert_eq!(split_stan("ok"), ("ok".to_string(), "ok".to_string()));
     }
 
     #[test]

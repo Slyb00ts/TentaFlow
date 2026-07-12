@@ -5442,6 +5442,40 @@ fn recording_meta_text(meta: &Option<JsonValue>, class: &str) -> String {
     event_meta_winner_text(meta.get("texts").and_then(|t| t.get(class)))
 }
 
+/// Renders the aggregated sticker states (`event_meta.stany`) as a compact
+/// `label: state, label: state` string. `stany` is the majority state per
+/// sticker label written by the event recorder (`{"nalepka_3": "czysta", …}`).
+/// Empty / missing → "—". Keys are already sorted (BTreeMap) so order is stable.
+fn recording_meta_stany(meta: &Option<JsonValue>) -> String {
+    let Some(JsonValue::Object(map)) = meta.as_ref().and_then(|m| m.get("stany")) else {
+        return "—".to_string();
+    };
+    let parts: Vec<String> = map
+        .iter()
+        .filter_map(|(label, state)| {
+            let state = state.as_str()?.trim();
+            let label = label.trim();
+            if label.is_empty() || state.is_empty() {
+                return None;
+            }
+            Some(alloc::format!("{label}: {state}"))
+        })
+        .collect();
+    if parts.is_empty() {
+        "—".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Composes the single multi-line "Odczyty" cell for a recording: registration
+/// plate, ADR code and aggregated sticker states, one per line. Newlines render
+/// as line breaks via the `.tf-table td { white-space: pre-line }` rule. Empty
+/// fields collapse to "—" so every event shows all three read lines.
+fn recording_reads_text(plate: &str, adr: &str, stany: &str) -> String {
+    alloc::format!("Rejestracja: {plate}\nADR: {adr}\nNalepki: {stany}")
+}
+
 /// mm:ss for a duration in milliseconds. `None`/0 → "—".
 fn format_duration_ms(ms: Option<i64>) -> String {
     match ms {
@@ -5476,16 +5510,18 @@ fn recording_thumb_url(thumb_ref: &Option<String>) -> String {
 }
 
 /// One recordings Table row. `recording_ref` is the row key the "Odtwórz"
-/// action carries; the plate/ADR winners prefer the indexed columns and fall
-/// back to `event_meta`. The thumbnail cells carry signed image URLs of the
-/// full-scene snapshots captured at the best plate/ADR read.
+/// action carries. The two operator-facing columns are:
+///   * `zdjecie` — a signed image URL of the single representative truck frame
+///     (the event's best plate/ADR snapshot, carried in `plate_thumb_ref`);
+///   * `odczyty` — one multi-line cell combining the aggregated Rejestracja,
+///     ADR and Nalepki reads for the whole vehicle event.
+/// The plate/ADR winners prefer the indexed columns (used by search) and fall
+/// back to the `event_meta` blob for rows recorded before those columns existed.
 fn recording_table_row_value(item: &RecordingListItem, camera_name: &str) -> Value {
     let meta: Option<JsonValue> = item
         .event_meta
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok());
-    // Prefer the indexed winner columns (written at finalize); fall back to the
-    // event_meta blob for rows recorded before the columns existed.
     let plate = item
         .plate_text
         .clone()
@@ -5496,17 +5532,18 @@ fn recording_table_row_value(item: &RecordingListItem, camera_name: &str) -> Val
         .clone()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| recording_meta_text(&meta, "tablica_adr"));
-    let plate_thumb = recording_thumb_url(&item.plate_thumb_ref);
-    let adr_thumb = recording_thumb_url(&item.adr_thumb_ref);
+    let stany = recording_meta_stany(&meta);
+    let odczyty = recording_reads_text(&plate, &adr, &stany);
+    // The single truck photo is the repurposed `plate_thumb_ref` (best-read
+    // frame); `adr_thumb_ref` is no longer populated by the recorder.
+    let zdjecie = recording_thumb_url(&item.plate_thumb_ref);
     let entries: Vec<(Value, Value)> = vec![
         (Value::Text("recording_ref".into()), Value::Text(item.recording_ref.clone())),
         (Value::Text("czas".into()), Value::Text(format_alarm_datetime(item.created_at))),
         (Value::Text("kamera".into()), Value::Text(camera_name.to_string())),
         (Value::Text("czas_trwania".into()), Value::Text(format_duration_ms(item.duration_ms))),
-        (Value::Text("tablica_thumb".into()), Value::Text(plate_thumb)),
-        (Value::Text("tablica".into()), Value::Text(plate)),
-        (Value::Text("adr_thumb".into()), Value::Text(adr_thumb)),
-        (Value::Text("adr".into()), Value::Text(adr)),
+        (Value::Text("zdjecie".into()), Value::Text(zdjecie)),
+        (Value::Text("odczyty".into()), Value::Text(odczyty)),
         (Value::Text("rozmiar".into()), Value::Text(format_size_mb(item.file_size_bytes))),
     ];
     Value::Map(entries)
@@ -5555,10 +5592,10 @@ fn build_recordings_table() -> Component {
         recording_table_column("czas", "Czas"),
         recording_table_column("kamera", "Kamera"),
         recording_table_column("czas_trwania", "Czas trwania"),
-        recording_table_column_render("tablica_thumb", "Podgląd tablicy", ColumnRender::Image),
-        recording_table_column("tablica", "Tablica"),
-        recording_table_column_render("adr_thumb", "Podgląd ADR", ColumnRender::Image),
-        recording_table_column("adr", "ADR"),
+        recording_table_column_render("zdjecie", "Zdjęcie", ColumnRender::Image),
+        // Multi-line combined reads (Rejestracja / ADR / Nalepki). Not sortable —
+        // the cell is a composed multi-field block, not a single comparable key.
+        recording_table_column_render("odczyty", "Odczyty", ColumnRender::Text),
         recording_table_column("rozmiar", "Rozmiar"),
     ];
     // The Table injects the row key (`recording_ref`) into the row-action params
@@ -5646,13 +5683,15 @@ fn build_recording_player_body(recording_ref: &str) -> Component {
         }.into_component(next_id()).expect("VideoStream")
     };
 
-    // Metadata pulled from the corresponding list row (parsed the same way).
-    let (camera_label, when, plate, adr) = recording_playing_meta(recording_ref);
+    // Metadata pulled from the corresponding list row (parsed the same way):
+    // the same combined reads as the list — Rejestracja / ADR / Nalepki.
+    let (camera_label, when, plate, adr, stany) = recording_playing_meta(recording_ref);
     let metadata = card(Some("Metadane zdarzenia"), vec![key_value(vec![
         ("Kamera", camera_label.as_str()),
         ("Czas", when.as_str()),
-        ("Tablica", plate.as_str()),
+        ("Rejestracja", plate.as_str()),
         ("ADR", adr.as_str()),
+        ("Nalepki", stany.as_str()),
     ])]);
 
     stack_v(vec![
@@ -5664,14 +5703,16 @@ fn build_recording_player_body(recording_ref: &str) -> Component {
 
 /// Resolves the metadata shown beside the player for the currently-playing ref
 /// by re-reading the recording list (single row lookup by ref). Returns
-/// `(camera_label, when, plate, adr)` with graceful fallbacks.
-fn recording_playing_meta(recording_ref: &str) -> (String, String, String, String) {
+/// `(camera_label, when, plate, adr, stany)` with graceful fallbacks — the plate
+/// and ADR prefer the indexed winner columns (mirroring the list) and fall back
+/// to the `event_meta` blob.
+fn recording_playing_meta(recording_ref: &str) -> (String, String, String, String, String) {
     // Reuse the active search so the playing row is found within the same
     // filtered set the list showed (it was clicked from there).
     let search = recordings_search_from_state();
     let items = host_recording_list(&search, RECORDING_LIST_LIMIT).unwrap_or_default();
     let Some(item) = items.iter().find(|i| i.recording_ref == recording_ref) else {
-        return ("—".into(), "—".into(), "—".into(), "—".into());
+        return ("—".into(), "—".into(), "—".into(), "—".into(), "—".into());
     };
     let owned = db::list_cameras().unwrap_or_default();
     let shared = shared_cameras();
@@ -5681,9 +5722,18 @@ fn recording_playing_meta(recording_ref: &str) -> (String, String, String, Strin
         .event_meta
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok());
-    let plate = recording_meta_text(&meta, "tablica_rejestracyjna");
-    let adr = recording_meta_text(&meta, "tablica_adr");
-    (camera_label, when, plate, adr)
+    let plate = item
+        .plate_text
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| recording_meta_text(&meta, "tablica_rejestracyjna"));
+    let adr = item
+        .adr_text
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| recording_meta_text(&meta, "tablica_adr"));
+    let stany = recording_meta_stany(&meta);
+    (camera_label, when, plate, adr, stany)
 }
 
 /// Parses a `YYYY-MM-DD` day string to unix MILLISECONDS at the given
