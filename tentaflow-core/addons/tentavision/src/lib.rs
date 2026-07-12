@@ -5388,42 +5388,43 @@ fn event_meta_winner_text(class_entry: Option<&JsonValue>) -> String {
     let Some(entry) = class_entry else {
         return "—".to_string();
     };
-    match entry {
-        // Newer winner-object shape.
-        JsonValue::Object(map) => {
-            if map
-                .get("unreadable")
-                .and_then(JsonValue::as_bool)
-                .unwrap_or(false)
-            {
-                return "nieczytelna".to_string();
+    // Pick the highest-count key from a `variant -> count` map, skipping the
+    // structural keys of a winner object.
+    let max_vote = |m: &serde_json::Map<String, JsonValue>| -> Option<String> {
+        let mut best: Option<(String, i64)> = None;
+        for (k, v) in m {
+            if matches!(k.as_str(), "text" | "confidence" | "agreement" | "unreadable" | "votes") {
+                continue;
             }
+            if let Some(c) = v.as_i64() {
+                if best.as_ref().map(|(_, bc)| c > *bc).unwrap_or(true) && !k.trim().is_empty() {
+                    best = Some((k.trim().to_string(), c));
+                }
+            }
+        }
+        best.map(|(k, _)| k)
+    };
+    match entry {
+        // Winner-object shape. Prefer the finalized `text`; otherwise re-derive
+        // the agreement-majority read from `votes`. The stored `unreadable` flag
+        // is INTENTIONALLY ignored: it was set by the old confidence gate, which
+        // marked every plate unreadable because the plate-OCR softmax confidence
+        // is near-uniform (~0.05) even at 99% agreement. A recording whose votes
+        // agree on one plate should show that plate, not "nieczytelna".
+        JsonValue::Object(map) => {
             if let Some(t) = map.get("text").and_then(JsonValue::as_str) {
                 let t = t.trim();
                 if !t.is_empty() {
                     return t.to_string();
                 }
-                return "nieczytelna".to_string();
             }
-            // A `text: null` with no `unreadable` flag, or a raw count-map that
-            // happens to be an object of `variant -> count`: pick the max-count
-            // key. `text`/`confidence`/`agreement`/`votes` are structural keys of
-            // the winner object, never OCR variants, so exclude them.
-            let mut best: Option<(&str, i64)> = None;
-            for (k, v) in map {
-                if matches!(k.as_str(), "text" | "confidence" | "agreement" | "unreadable" | "votes") {
-                    continue;
-                }
-                if let Some(count) = v.as_i64() {
-                    if best.map(|(_, c)| count > c).unwrap_or(true) {
-                        best = Some((k.as_str(), count));
-                    }
+            if let Some(JsonValue::Object(votes)) = map.get("votes") {
+                if let Some(w) = max_vote(votes) {
+                    return w;
                 }
             }
-            match best {
-                Some((k, _)) if !k.trim().is_empty() => k.trim().to_string(),
-                _ => "—".to_string(),
-            }
+            // No `votes` object → treat the map itself as a raw count-map.
+            max_vote(map).unwrap_or_else(|| "—".to_string())
         }
         // A bare string winner (defensive; not emitted today).
         JsonValue::String(s) => {
