@@ -332,13 +332,12 @@ fn skill_view(db: &DbPool, arguments: &serde_json::Value) -> Result<serde_json::
 
     if let Some(path) = file_path {
         let files = repository::list_skill_files(db, &skill.id)?;
-        let file = files
-            .into_iter()
-            .find(|f| f.path == path)
-            .ok_or_else(|| BuiltinToolError::SkillFileNotFound {
+        let file = files.into_iter().find(|f| f.path == path).ok_or_else(|| {
+            BuiltinToolError::SkillFileNotFound {
                 skill: skill_name.to_string(),
                 path: path.to_string(),
-            })?;
+            }
+        })?;
         return Ok(serde_json::json!({
             "skill": skill.name,
             "file_path": file.path,
@@ -404,8 +403,7 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
         crate::db::migrations::run(&conn).expect("migrations");
         let pool: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
-        let err =
-            execute_core_tool(&pool, "core.agent_spawn", &serde_json::json!({})).unwrap_err();
+        let err = execute_core_tool(&pool, "core.agent_spawn", &serde_json::json!({})).unwrap_err();
         assert!(err.to_string().contains("async"), "{err}");
     }
 

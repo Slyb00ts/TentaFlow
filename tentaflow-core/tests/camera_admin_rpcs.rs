@@ -97,8 +97,8 @@ const GET_PROFILES_EMPTY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 fn ensure_cameras_key_env() {
     // CredentialsCipher generates a 32-byte master key on first use. In tests
     // we redirect it to a per-process tempfile so tests don't trample the dev
-    // node's real `cameras.key`. set_var is racy but every camera_admin test
-    // uses the same path so there is no contention.
+    // node's real `cameras.key`. The override is a process-wide OnceLock and
+    // every camera_admin test uses the same path, so there is no contention.
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         let tmp = tempfile::Builder::new()
@@ -114,7 +114,7 @@ fn ensure_cameras_key_env() {
         // Removing the empty file lets `load_or_generate_at` write a fresh
         // 32-byte CSPRNG key with the correct mode bits.
         let _ = std::fs::remove_file(&path);
-        std::env::set_var("TENTAFLOW_CAMERAS_KEY", path);
+        tentaflow_core::services::camera_ingest::credentials::set_key_path_override(path);
     });
 }
 

@@ -127,7 +127,9 @@ fn parse_nim_infer_regions(body: &serde_json::Value) -> Vec<tentaflow_protocol::
         // yolox: bounding_boxes = { "<class>": [ {x_min,y_min,x_max,y_max,confidence}, … ] }.
         if let Some(by_class) = entry.get("bounding_boxes").and_then(|v| v.as_object()) {
             for (class_name, boxes) in by_class {
-                let Some(boxes) = boxes.as_array() else { continue };
+                let Some(boxes) = boxes.as_array() else {
+                    continue;
+                };
                 for b in boxes {
                     let bbox = [
                         json_f32(b.get("x_min")),
@@ -1013,14 +1015,15 @@ impl BackendClient {
             .into());
         }
 
-        let body = response
-            .json::<serde_json::Value>()
-            .await
-            .map_err(|e| CoreError::BackendError {
-                backend_url: self.url.clone(),
-                message: format!("Nie mozna sparsowac document parse response: {}", e),
-                source: Some(e.into()),
-            })?;
+        let body =
+            response
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|e| CoreError::BackendError {
+                    backend_url: self.url.clone(),
+                    message: format!("Nie mozna sparsowac document parse response: {}", e),
+                    source: Some(e.into()),
+                })?;
 
         // Walidacja kształtu PRZED oznaczeniem sukcesu w circuit-breakerze.
         // Backend zwracający `200 {"error":"..."}` albo odpowiedź bez pola
@@ -1044,8 +1047,7 @@ impl BackendClient {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        let blocks =
-            crate::services::runtime::executor::parse_blocks_json(body.get("blocks"));
+        let blocks = crate::services::runtime::executor::parse_blocks_json(body.get("blocks"));
         Ok(crate::services::runtime::executor::DocumentParseResponse {
             markdown,
             blocks,
@@ -1124,14 +1126,15 @@ impl BackendClient {
             .into());
         }
 
-        let body = response
-            .json::<serde_json::Value>()
-            .await
-            .map_err(|e| CoreError::BackendError {
-                backend_url: self.url.clone(),
-                message: format!("Nie mozna sparsowac document infer response: {}", e),
-                source: Some(e.into()),
-            })?;
+        let body =
+            response
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|e| CoreError::BackendError {
+                    backend_url: self.url.clone(),
+                    message: format!("Nie mozna sparsowac document infer response: {}", e),
+                    source: Some(e.into()),
+                })?;
 
         let regions = parse_nim_infer_regions(&body);
 

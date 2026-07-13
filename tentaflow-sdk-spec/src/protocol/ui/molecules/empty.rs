@@ -2,19 +2,16 @@
 // File: protocol/ui/molecules/empty.rs — EmptyState / ErrorBoundary / WelcomeHero (catalog §2)
 // =============================================================================
 
+use super::super::super::value::Value;
+use super::super::actions::Button;
 use super::super::bind::BindRef;
 use super::super::component::{Component, FieldMap};
-use super::super::inline::{
-    FeatureItem, IconRef,
-};
+use super::super::inline::{FeatureItem, IconRef};
 use super::super::tokens::EmptyStateVariant;
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_ref_tag_decode,
     ensure_ref_tag_encode, ensure_tag, missing_field, unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
-use super::super::actions::Button;
-
 
 // -----------------------------------------------------------------------------
 // EmptyState
@@ -200,7 +197,12 @@ impl WelcomeHero {
     pub const TAG: u16 = 0x0009;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        ensure_ref_tag_encode(self.primary_action.tag, Button::TAG, "WelcomeHero", "primary_action")?;
+        ensure_ref_tag_encode(
+            self.primary_action.tag,
+            Button::TAG,
+            "WelcomeHero",
+            "primary_action",
+        )?;
         if let Some(s) = &self.secondary_action {
             ensure_ref_tag_encode(s.tag, Button::TAG, "WelcomeHero", "secondary_action")?;
         }
@@ -245,10 +247,15 @@ impl WelcomeHero {
                 other => return Err(unknown_field("WelcomeHero", *other)),
             }
         }
-        let primary_action: Component = primary_action
-            .ok_or_else(|| missing_field("WelcomeHero", "primary_action"))?;
+        let primary_action: Component =
+            primary_action.ok_or_else(|| missing_field("WelcomeHero", "primary_action"))?;
         let secondary_action: Option<Component> = secondary_action;
-        ensure_ref_tag_decode(primary_action.tag, Button::TAG, "WelcomeHero", "primary_action")?;
+        ensure_ref_tag_decode(
+            primary_action.tag,
+            Button::TAG,
+            "WelcomeHero",
+            "primary_action",
+        )?;
         if let Some(s) = &secondary_action {
             ensure_ref_tag_decode(s.tag, Button::TAG, "WelcomeHero", "secondary_action")?;
         }
@@ -263,4 +270,3 @@ impl WelcomeHero {
         })
     }
 }
-

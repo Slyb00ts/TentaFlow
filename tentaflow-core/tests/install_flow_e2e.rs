@@ -262,7 +262,8 @@ async fn materialize_creates_alias_and_preserves_admin_target() {
 
     // Reinstall (upgrade / mesh reconcile) — idempotentne: alias zostaje,
     // target admina NIE jest nadpisywany przez suggested_default.
-    mgr.install_manifest_aliases(&manifest).expect("reinstall ok");
+    mgr.install_manifest_aliases(&manifest)
+        .expect("reinstall ok");
     assert_eq!(
         alias_target(&db, "rag-embeddings").as_deref(),
         Some("my-real-embed-model")

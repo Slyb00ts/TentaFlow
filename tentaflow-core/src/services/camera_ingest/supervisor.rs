@@ -14,10 +14,10 @@ use tokio::sync::{oneshot, RwLock};
 
 use super::error::{CameraIngestError, Result};
 use super::fakefile::ensure_gst_initialized;
+use super::session::spawn_webrtc_session;
 use super::session::{
     spawn_session, CameraConfig, CameraHandle, CameraHealth, SessionCommand, SnapshotData,
 };
-use super::session::spawn_webrtc_session;
 use super::stream_publisher::Mp4StreamPublisher;
 use crate::services::stream_hub::StreamHub;
 
@@ -42,8 +42,10 @@ impl CameraIngestSupervisor {
         Self::with_caps(MAX_CAMERAS_PER_ADDON, MAX_CAMERAS_GLOBAL)
     }
 
-    /// Test-only constructor that lets unit tests verify quota with much
-    /// smaller caps so we never need to spawn 100+ GStreamer pipelines.
+    /// Constructor with explicit quotas. Unit tests verify quota with much
+    /// smaller caps (so they never spawn 100+ GStreamer pipelines); vision
+    /// worker processes lift the per-addon cap because admission control for
+    /// their cameras already ran on the core.
     pub fn with_caps(per_addon_cap: usize, global_cap: usize) -> Self {
         Self {
             registry: Arc::new(RwLock::new(HashMap::new())),

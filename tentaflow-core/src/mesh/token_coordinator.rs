@@ -97,8 +97,7 @@ mod tests {
         let winner = elect_coordinator(role, &full).unwrap();
 
         // Usuniecie zwyciezcy → nowy, stabilny zwyciezca (powtarzalny).
-        let without_winner: Vec<String> =
-            full.iter().filter(|n| **n != winner).cloned().collect();
+        let without_winner: Vec<String> = full.iter().filter(|n| **n != winner).cloned().collect();
         let new_winner = elect_coordinator(role, &without_winner).unwrap();
         assert_ne!(new_winner, winner);
         assert_eq!(
@@ -112,8 +111,7 @@ mod tests {
             if *victim == winner || *victim == new_winner {
                 continue;
             }
-            let reduced: Vec<String> =
-                full.iter().filter(|n| **n != *victim).cloned().collect();
+            let reduced: Vec<String> = full.iter().filter(|n| **n != *victim).cloned().collect();
             assert_eq!(elect_coordinator(role, &reduced), Some(winner.clone()));
         }
     }
@@ -128,6 +126,9 @@ mod tests {
             let role = format!("token-coord|org-{org}");
             winners.insert(elect_coordinator(&role, &set).unwrap());
         }
-        assert!(winners.len() > 1, "HRW powinno rozkladac role na wiele wezlow");
+        assert!(
+            winners.len() > 1,
+            "HRW powinno rozkladac role na wiele wezlow"
+        );
     }
 }

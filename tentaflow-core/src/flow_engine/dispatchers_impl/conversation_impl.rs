@@ -79,7 +79,10 @@ mod tests {
     #[tokio::test]
     async fn append_then_recent_roundtrip() {
         let store = ConversationHistoryImpl::new(test_db());
-        store.append("s1", ChatMessage::user("hello")).await.unwrap();
+        store
+            .append("s1", ChatMessage::user("hello"))
+            .await
+            .unwrap();
         store
             .append("s1", ChatMessage::assistant("hi back"))
             .await

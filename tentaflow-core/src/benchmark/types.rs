@@ -166,9 +166,7 @@ impl TargetSpec {
                     o[0] == 169 && o[1] == 254
                 }
                 // IPv6 cloud metadata endpoint (fd00:ec2::254).
-                IpAddr::V6(v6) => {
-                    v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)
-                }
+                IpAddr::V6(v6) => v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254),
             };
             if blocked {
                 anyhow::bail!(

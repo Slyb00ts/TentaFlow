@@ -94,7 +94,9 @@ impl SubflowRunner {
             registry,
             compiled,
             child_ctx,
-        } = self.prepare(flow_id, parent_ctx, extra_depth, light).await?;
+        } = self
+            .prepare(flow_id, parent_ctx, extra_depth, light)
+            .await?;
 
         let outcome: FlowExecutionOutcome = execute_blocking(
             self.db.clone(),
@@ -139,7 +141,9 @@ impl SubflowRunner {
             registry,
             compiled,
             child_ctx,
-        } = self.prepare(flow_id, parent_ctx, extra_depth, light).await?;
+        } = self
+            .prepare(flow_id, parent_ctx, extra_depth, light)
+            .await?;
 
         if compiled.is_streaming {
             return execute_streaming(
@@ -283,10 +287,8 @@ fn wrap_outcome_as_stream(
                 let text_delta = match &other {
                     FlowValue::Text(t) => t.clone(),
                     FlowValue::Empty => String::new(),
-                    v => serde_json::to_string(
-                        &crate::flow_engine::converter::payload_to_json(v),
-                    )
-                    .unwrap_or_default(),
+                    v => serde_json::to_string(&crate::flow_engine::converter::payload_to_json(v))
+                        .unwrap_or_default(),
                 };
                 Ok(EnvelopeDelta::Llm(LlmStreamChunk {
                     choice_index: 0,

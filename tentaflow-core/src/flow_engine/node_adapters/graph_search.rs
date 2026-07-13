@@ -116,7 +116,9 @@ impl GraphSearchNodeAdapter {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("graph_search adapter: brak wymaganego 'collection' w payload Json"))
+            .ok_or_else(|| {
+                anyhow!("graph_search adapter: brak wymaganego 'collection' w payload Json")
+            })
     }
 
     /// Bezpieczne odczytanie `u32` z pola JSON z CLAMPEM do `1..=max`. Wartość
@@ -160,7 +162,9 @@ impl GraphSearchNodeAdapter {
             .get("node_id")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow!("graph_search adapter: neighbors: brak 'node_id' w payload Json"))?;
+            .ok_or_else(|| {
+                anyhow!("graph_search adapter: neighbors: brak 'node_id' w payload Json")
+            })?;
 
         let direction = match payload.get("direction").and_then(|v| v.as_str()) {
             None | Some("out") => NeighborDir::Out,
@@ -189,9 +193,7 @@ impl GraphSearchNodeAdapter {
 
         let neighbors_json: Vec<serde_json::Value> = neighbors
             .into_iter()
-            .map(|(id, rel, weight)| {
-                serde_json::json!({ "id": id, "rel": rel, "weight": weight })
-            })
+            .map(|(id, rel, weight)| serde_json::json!({ "id": id, "rel": rel, "weight": weight }))
             .collect();
 
         out.payload = FlowValue::Json(serde_json::json!({
@@ -217,8 +219,12 @@ impl GraphSearchNodeAdapter {
 
         let top_n = Self::clamped_u32(payload, "top_n", DEFAULT_RESULT_ROWS, MAX_RESULT_ROWS);
         let damping = Self::clamped_damping(payload);
-        let iterations =
-            Self::clamped_u32(payload, "iterations", DEFAULT_ITERATIONS, MAX_RANK_ITERATIONS);
+        let iterations = Self::clamped_u32(
+            payload,
+            "iterations",
+            DEFAULT_ITERATIONS,
+            MAX_RANK_ITERATIONS,
+        );
 
         // Cap współbieżności: ten sam guard co host-fn (slot zwalnia Drop).
         let _compute = Self::acquire_compute(addon)?;
@@ -252,7 +258,9 @@ impl GraphSearchNodeAdapter {
         let seeds_raw = payload
             .get("seeds")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| anyhow!("graph_search adapter: ppr: brak 'seeds' (tablica) w payload Json"))?;
+            .ok_or_else(|| {
+                anyhow!("graph_search adapter: ppr: brak 'seeds' (tablica) w payload Json")
+            })?;
         if seeds_raw.is_empty() {
             return Err(anyhow!("graph_search adapter: ppr: pusta lista 'seeds'"));
         }
@@ -278,8 +286,12 @@ impl GraphSearchNodeAdapter {
 
         let top_n = Self::clamped_u32(payload, "top_n", DEFAULT_RESULT_ROWS, MAX_RESULT_ROWS);
         let damping = Self::clamped_damping(payload);
-        let iterations =
-            Self::clamped_u32(payload, "iterations", DEFAULT_ITERATIONS, MAX_RANK_ITERATIONS);
+        let iterations = Self::clamped_u32(
+            payload,
+            "iterations",
+            DEFAULT_ITERATIONS,
+            MAX_RANK_ITERATIONS,
+        );
 
         // Cap współbieżności: ten sam guard co host-fn (slot zwalnia Drop).
         let _compute = Self::acquire_compute(addon)?;
@@ -422,14 +434,20 @@ mod tests {
         let out = GraphSearchNodeAdapter::new()
             .execute(
                 &node(json!({"op": "neighbors"})),
-                &[input(json!({"collection": "kg", "node_id": "a", "direction": "out"}))],
+                &[input(
+                    json!({"collection": "kg", "node_id": "a", "direction": "out"}),
+                )],
                 &ctx,
             )
             .await
             .unwrap();
 
         let neighbors = match &out.payload {
-            FlowValue::Json(v) => v.get("neighbors").and_then(|n| n.as_array()).cloned().unwrap(),
+            FlowValue::Json(v) => v
+                .get("neighbors")
+                .and_then(|n| n.as_array())
+                .cloned()
+                .unwrap(),
             other => panic!("expected Json, got {other:?}"),
         };
         // a→b, a→c (dwóch sąsiadów out).
@@ -471,7 +489,10 @@ mod tests {
             .iter()
             .filter_map(|r| r.get("id").and_then(|v| v.as_str()))
             .collect();
-        assert!(ids.contains(&"a"), "seed 'a' ma być w rankingu, było: {ids:?}");
+        assert!(
+            ids.contains(&"a"),
+            "seed 'a' ma być w rankingu, było: {ids:?}"
+        );
     }
 
     #[tokio::test]
@@ -569,13 +590,19 @@ mod tests {
         let oa = GraphSearchNodeAdapter::new()
             .execute(
                 &node(json!({"op": "neighbors"})),
-                &[input(json!({"collection": "kg", "node_id": "a", "direction": "out"}))],
+                &[input(
+                    json!({"collection": "kg", "node_id": "a", "direction": "out"}),
+                )],
                 &ctx_a,
             )
             .await
             .unwrap();
         let na = match &oa.payload {
-            FlowValue::Json(v) => v.get("neighbors").and_then(|n| n.as_array()).map(|a| a.len()).unwrap(),
+            FlowValue::Json(v) => v
+                .get("neighbors")
+                .and_then(|n| n.as_array())
+                .map(|a| a.len())
+                .unwrap(),
             _ => panic!("expected Json"),
         };
         assert_eq!(na, 2, "inst-a/org-1 widzi swój graf");
@@ -642,7 +669,9 @@ mod tests {
         let out = GraphSearchNodeAdapter::new()
             .execute(
                 &node(json!({"op": "ppr"})),
-                &[input(json!({"collection": "kg", "seeds": seeds, "top_n": 10}))],
+                &[input(
+                    json!({"collection": "kg", "seeds": seeds, "top_n": 10}),
+                )],
                 &ctx,
             )
             .await
@@ -665,7 +694,9 @@ mod tests {
         let out = GraphSearchNodeAdapter::new()
             .execute(
                 &node(json!({"op": "neighbors"})),
-                &[input(json!({"collection": "kg", "node_id": "a", "direction": "out"}))],
+                &[input(
+                    json!({"collection": "kg", "node_id": "a", "direction": "out"}),
+                )],
                 &ctx,
             )
             .await
@@ -683,7 +714,10 @@ mod tests {
             _ => panic!("expected Json"),
         };
         // Po tombstone 'c' zostaje tylko a→b.
-        assert!(!ids.contains(&"c".to_string()), "tombstone 'c' nie może być w wyniku, było: {ids:?}");
+        assert!(
+            !ids.contains(&"c".to_string()),
+            "tombstone 'c' nie może być w wyniku, było: {ids:?}"
+        );
         assert!(ids.contains(&"b".to_string()), "a→b zostaje, było: {ids:?}");
     }
 
@@ -719,7 +753,10 @@ mod tests {
                 .unwrap(),
             _ => panic!("expected Json"),
         };
-        assert!(ids.contains(&"a".to_string()), "seed 'a' (alias node_id) ma być w rankingu, było: {ids:?}");
+        assert!(
+            ids.contains(&"a".to_string()),
+            "seed 'a' (alias node_id) ma być w rankingu, było: {ids:?}"
+        );
     }
 
     #[tokio::test]
@@ -749,7 +786,9 @@ mod tests {
         let err = GraphSearchNodeAdapter::new()
             .execute(
                 &node(json!({"op": "ppr"})),
-                &[input(json!({"collection": "kg", "seeds": [{"id": "a"}], "top_n": 10}))],
+                &[input(
+                    json!({"collection": "kg", "seeds": [{"id": "a"}], "top_n": 10}),
+                )],
                 &ctx,
             )
             .await
@@ -764,7 +803,9 @@ mod tests {
         let out = GraphSearchNodeAdapter::new()
             .execute(
                 &node(json!({"op": "ppr"})),
-                &[input(json!({"collection": "kg", "seeds": [{"id": "a"}], "top_n": 10}))],
+                &[input(
+                    json!({"collection": "kg", "seeds": [{"id": "a"}], "top_n": 10}),
+                )],
                 &ctx,
             )
             .await

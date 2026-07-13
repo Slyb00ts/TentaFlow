@@ -422,8 +422,7 @@ mod tests {
         // Foreign op authored by another node, admitted into the SAME partition. It
         // lands in operations/partition_index but carries no outbox entry.
         let foreign_new = operation(&foreign, partition.clone(), "foreign-1");
-        let foreign_op =
-            SyncOperation::from_new(foreign_new, 1, None, &foreign).unwrap();
+        let foreign_op = SyncOperation::from_new(foreign_new, 1, None, &foreign).unwrap();
         store
             .admit_verified_operation(
                 PeerId::new("peer-foreign").unwrap(),
@@ -547,9 +546,7 @@ mod tests {
         // ...but the node_log retains seq=1 so equivocation at that seq is still
         // detectable and a peer below the floor can be caught up.
         assert_eq!(
-            store
-                .get_node_log_entry(signer.node_id(), 1)
-                .unwrap(),
+            store.get_node_log_entry(signer.node_id(), 1).unwrap(),
             Some(first.op_id)
         );
         assert!(store

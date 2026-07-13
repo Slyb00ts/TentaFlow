@@ -161,7 +161,10 @@ mod tests {
         };
         assert!(!chunks.is_empty());
         assert_eq!(chunks[0]["index"].as_u64(), Some(0));
-        assert!(chunks[0]["text"].as_str().unwrap().contains("Pierwsze zdanie"));
+        assert!(chunks[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Pierwsze zdanie"));
         assert_eq!(
             out.meta.get("chunk_count").and_then(|v| v.as_u64()),
             Some(chunks.len() as u64)

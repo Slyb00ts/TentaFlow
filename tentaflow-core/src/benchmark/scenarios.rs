@@ -42,8 +42,7 @@ async fn join_workers_cancellable<T: Send + 'static>(
     handles: Vec<tokio::task::JoinHandle<T>>,
     cancel: &Arc<AtomicBool>,
 ) -> Vec<Result<T, tokio::task::JoinError>> {
-    let aborts: Vec<tokio::task::AbortHandle> =
-        handles.iter().map(|h| h.abort_handle()).collect();
+    let aborts: Vec<tokio::task::AbortHandle> = handles.iter().map(|h| h.abort_handle()).collect();
     let watcher = {
         let cancel = Arc::clone(cancel);
         tokio::spawn(async move {

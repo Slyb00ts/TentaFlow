@@ -17,8 +17,13 @@
 pub mod adr;
 pub mod camera_cv_models;
 pub mod nms;
+// Process-wide vision runtime settings, frozen once from the `[vision]` config
+// section (core) or the `--vision-config` CLI arg (vision-worker).
+pub mod settings;
 // Generyczny runner ONNX dla dynamicznych modeli z rejestru `vision_models`
 // (silnik `onnx-cv`) + wspoldzielona warstwa ort i postprocess RF-DETR.
+#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+pub mod gpu_preprocess;
 #[cfg(feature = "inference-supertonic")]
 pub mod onnx_cv;
 #[cfg(feature = "inference-supertonic")]
@@ -34,26 +39,38 @@ pub mod rfdetr_post;
 #[cfg(feature = "vision-burn")]
 pub mod burn_backend;
 #[cfg(feature = "vision-burn")]
+#[path = "generated/depth_anything.rs"]
+pub mod burn_depth_anything;
+#[cfg(feature = "vision-burn")]
+#[path = "generated/plate.rs"]
+pub mod burn_plate;
+#[cfg(feature = "vision-burn")]
 #[path = "generated/rfdetr.rs"]
 pub mod burn_rfdetr;
 #[cfg(feature = "vision-burn")]
 #[path = "generated/stan.rs"]
 pub mod burn_stan;
-#[cfg(feature = "vision-burn")]
-#[path = "generated/plate.rs"]
-pub mod burn_plate;
-#[cfg(feature = "vision-burn")]
-#[path = "generated/depth_anything.rs"]
-pub mod burn_depth_anything;
 
 #[cfg(feature = "inference-vision-gpu")]
 pub mod classifier_stan;
+// Cross-camera dynamic-batching inference front-end. Aggregates state/plate/adr
+// crops from ALL cameras into one big batched forward per model (ort/TRT path).
 #[cfg(feature = "inference-vision-gpu")]
 pub mod detector_rfdetr;
+#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+pub mod inference_batcher;
+// YOLOv8 vehicle detector — runs in parallel with RF-DETR (own ort pool) so each
+// ADR/plate/sticker can be associated to the vehicle it sits on (per-truck reads).
 #[cfg(feature = "inference-vision-gpu")]
 pub mod depth_anything;
+#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+pub mod detector_vehicle;
 #[cfg(feature = "inference-vision-gpu")]
 pub mod ocr_plate;
+// Shared OCR crop pre-processing: perspective deskew (angled plates) + env-gated
+// crop dumps. Feeds both the plate and ADR readers before the model.
+#[cfg(feature = "inference-vision-gpu")]
+pub mod ocr_prep;
 
 // Apple Vision OCR (VNRecognizeTextRequest) — ZAWSZE skompilowany na macOS/iOS,
 // bez feature flag (jak apple-tts). Systemowy silnik, nie wymaga modelu na dysku.

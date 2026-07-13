@@ -26,8 +26,8 @@ mod tests {
     use crate::protocol::ui::tokens::{
         AccordionMode, BackgroundToken, BreadcrumbSeparator, CardVariant, Density,
         DividerOrientation, DividerVariant, FlexAlign, FlexDirection, FlexJustify, FlexWrap,
-        NavTabsVariant, PaginationVariant, RadiusToken, ScrollOrientation, ShadowToken,
-        SpacerAxis, SplitOrientation, Spacing, TabsVariant, Tone,
+        NavTabsVariant, PaginationVariant, RadiusToken, ScrollOrientation, ShadowToken, SpacerAxis,
+        Spacing, SplitOrientation, TabsVariant, Tone,
     };
     use crate::protocol::value::Value;
 
@@ -190,15 +190,19 @@ mod tests {
             padding: None,
             margin: None,
             children: vec![dummy(0x0201)],
-            style: Some(BoxStyle::new().border(2, BorderColor::Accent).padding_x(Spacing::Lg)),
+            style: Some(
+                BoxStyle::new()
+                    .border(2, BorderColor::Accent)
+                    .padding_x(Spacing::Lg),
+            ),
             direction: Some(FlexDirection::Row),
             gap: Some(Spacing::Sm),
             align: Some(FlexAlign::Center),
             justify: Some(FlexJustify::SpaceBetween),
-            responsive: Some(vec![
-                crate::protocol::ui::inline::ResponsiveRule::at(680u16)
-                    .direction(FlexDirection::Column),
-            ]),
+            responsive: Some(vec![crate::protocol::ui::inline::ResponsiveRule::at(
+                680u16,
+            )
+            .direction(FlexDirection::Column)]),
         };
         let c = b.clone().into_component("bx").unwrap();
         assert_eq!(c.tag, Box::TAG);
@@ -243,9 +247,18 @@ mod tests {
         // collapse_below / divider / grow are optional: None must be omitted
         // from the wire (old decoders reject unknown keys 7/8/9) and absent
         // keys must decode back to None (old payloads stay valid).
-        let legacy = Split { collapse_below: None, divider: None, grow: None, ..s };
+        let legacy = Split {
+            collapse_below: None,
+            divider: None,
+            grow: None,
+            ..s
+        };
         let c2 = legacy.clone().into_component("sp2").unwrap();
-        assert!(c2.fields.0.iter().all(|(k, _)| *k != 7 && *k != 8 && *k != 9));
+        assert!(c2
+            .fields
+            .0
+            .iter()
+            .all(|(k, _)| *k != 7 && *k != 8 && *k != 9));
         assert_eq!(Split::try_from_component(&c2).unwrap(), legacy);
     }
 
@@ -276,15 +289,21 @@ mod tests {
     fn section_card_rejects_non_button_header_action() {
         // SectionCard.header_actions is array<ComponentRef<Button>>.
         let bad = SectionCard {
-            title: lit("t"), subtitle: None,
+            title: lit("t"),
+            subtitle: None,
             header_actions: vec![dummy(0x040C)], // Fab tag, not Button
             header_divider: false,
-            body: vec![], footer: None,
-            padding: Spacing::Lg, gap: Spacing::Md,
+            body: vec![],
+            footer: None,
+            padding: Spacing::Lg,
+            gap: Spacing::Md,
             variant: CardVariant::Filled,
-            radius: RadiusToken::Lg, shadow: ShadowToken::Subtle,
-            border: BorderToken::None, background: BackgroundToken::None,
-            accent: None, style: None,
+            radius: RadiusToken::Lg,
+            shadow: ShadowToken::Subtle,
+            border: BorderToken::None,
+            background: BackgroundToken::None,
+            accent: None,
+            style: None,
         };
         assert!(bad.into_component("sc").is_err());
     }
@@ -303,7 +322,10 @@ mod tests {
 
     #[test]
     fn spacer_roundtrip() {
-        let s = Spacer { size: Spacing::Lg, axis: SpacerAxis::Both };
+        let s = Spacer {
+            size: Spacing::Lg,
+            axis: SpacerAxis::Both,
+        };
         let c = s.into_component("sp").unwrap();
         assert_eq!(Spacer::try_from_component(&c).unwrap(), s);
     }

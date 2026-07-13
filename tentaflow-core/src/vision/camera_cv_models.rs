@@ -269,7 +269,9 @@ fn bundle(engine_id: &str) -> Option<&'static CvBundle> {
 }
 
 fn file_ok(path: &PathBuf) -> bool {
-    std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+    std::fs::metadata(path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
 }
 
 fn progress_for_sink(sink: LogSink, label: String) -> ProgressFn {
@@ -280,7 +282,13 @@ fn progress_for_sink(sink: LogSink, label: String) -> ProgressFn {
             0
         };
         let line = if total > 0 {
-            format!("{}: {}/{} KB ({}%)", label, downloaded / 1024, total / 1024, pct)
+            format!(
+                "{}: {}/{} KB ({}%)",
+                label,
+                downloaded / 1024,
+                total / 1024,
+                pct
+            )
         } else {
             format!("{}: {} KB", label, downloaded / 1024)
         };
@@ -305,12 +313,11 @@ pub async fn ensure_bundle(
     api_key: Option<&str>,
     log_sink: Option<&LogSink>,
 ) -> Result<()> {
-    let bundle = bundle(engine_id)
-        .ok_or_else(|| anyhow!("'{}' is not a camera-CV engine", engine_id))?;
+    let bundle =
+        bundle(engine_id).ok_or_else(|| anyhow!("'{}' is not a camera-CV engine", engine_id))?;
 
     let dir = vision_models_dir();
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| anyhow!("create {}: {}", dir.display(), e))?;
+    std::fs::create_dir_all(&dir).map_err(|e| anyhow!("create {}: {}", dir.display(), e))?;
 
     let effective = bundle.effective_files();
     let mut missing: Vec<&'static str> = Vec::new();
@@ -462,8 +469,8 @@ fn contained_model_dest(dir: &Path, name: &str) -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("destination '{}' has no parent", name))?;
     let canon_parent = std::fs::canonicalize(parent)
         .map_err(|e| anyhow!("canonicalize destination parent for '{}': {}", name, e))?;
-    let canon_dir = std::fs::canonicalize(dir)
-        .map_err(|e| anyhow!("canonicalize vision models dir: {}", e))?;
+    let canon_dir =
+        std::fs::canonicalize(dir).map_err(|e| anyhow!("canonicalize vision models dir: {}", e))?;
     if canon_parent != canon_dir {
         return Err(anyhow!(
             "destination '{}' escapes the vision models directory",
@@ -478,12 +485,9 @@ fn contained_model_dest(dir: &Path, name: &str) -> Result<PathBuf> {
 /// to the remaining cumulative budget. Either way the file may not push the
 /// running import total past `TOTAL_IMPORT_LIMIT`.
 fn per_file_ceiling(declared_size: u64, cumulative: u64) -> std::result::Result<u64, String> {
-    let remaining = TOTAL_IMPORT_LIMIT.checked_sub(cumulative).ok_or_else(|| {
-        format!(
-            "cumulative import exceeded {} bytes",
-            TOTAL_IMPORT_LIMIT
-        )
-    })?;
+    let remaining = TOTAL_IMPORT_LIMIT
+        .checked_sub(cumulative)
+        .ok_or_else(|| format!("cumulative import exceeded {} bytes", TOTAL_IMPORT_LIMIT))?;
     if remaining == 0 {
         return Err(format!(
             "cumulative import reached {} bytes",
@@ -607,10 +611,12 @@ async fn download_from_bundle_manifest(
         manifest_request =
             manifest_request.header(reqwest::header::AUTHORIZATION, format!("Bearer {}", key));
     }
-    let response = manifest_request
-        .send()
-        .await
-        .map_err(|e| anyhow!("GET bundle manifest: {}", redact_query_strings(&e.to_string())))?;
+    let response = manifest_request.send().await.map_err(|e| {
+        anyhow!(
+            "GET bundle manifest: {}",
+            redact_query_strings(&e.to_string())
+        )
+    })?;
     if response.status().is_redirection() {
         return Err(anyhow!(
             "bundle manifest responded with a redirect ({}) — redirects are not followed",
@@ -897,9 +903,12 @@ pub async fn fetch_custom_manifest_json(
             response.status()
         ));
     }
-    let response = response
-        .error_for_status()
-        .map_err(|e| anyhow!("błąd HTTP manifestu: {}", redact_query_strings(&e.to_string())))?;
+    let response = response.error_for_status().map_err(|e| {
+        anyhow!(
+            "błąd HTTP manifestu: {}",
+            redact_query_strings(&e.to_string())
+        )
+    })?;
     let body = read_capped_manifest_body(response).await?;
     serde_json::from_slice(&body).map_err(|e| anyhow!("parsowanie JSON manifestu: {}", e))
 }
@@ -1005,7 +1014,10 @@ pub async fn import_custom_model(
 
     let mut cumulative: u64 = 0;
     for entry in entries {
-        let name = entry.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+        let name = entry
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or_default();
         if name.is_empty() {
             cleanup(&written_files);
             return Err(anyhow!("wpis manifestu bez nazwy pliku"));
@@ -1062,8 +1074,10 @@ pub async fn import_custom_model(
         let progress: Option<ProgressFn> = log_sink
             .cloned()
             .map(|sink| progress_for_sink(sink, name.to_string()));
-        match download_signed_file(&client, file_url, bearer_opt, &dest, name, max_bytes, progress)
-            .await
+        match download_signed_file(
+            &client, file_url, bearer_opt, &dest, name, max_bytes, progress,
+        )
+        .await
         {
             Ok(written) => cumulative += written,
             Err(e) => {
@@ -1127,8 +1141,10 @@ mod tests {
     fn manifest_file_url_rejects_absolute_and_scheme_relative() {
         assert!(resolve_manifest_file_url(&base(), "https://internal/steal").is_err());
         assert!(resolve_manifest_file_url(&base(), "//internal/steal").is_err());
-        assert!(resolve_manifest_file_url(&base(), "http://node-a.example:8090/models/file/x/y")
-            .is_err());
+        assert!(
+            resolve_manifest_file_url(&base(), "http://node-a.example:8090/models/file/x/y")
+                .is_err()
+        );
         assert!(resolve_manifest_file_url(&base(), "relative/path").is_err());
         assert!(resolve_manifest_file_url(&base(), "/frames/somewhere").is_err());
     }
@@ -1167,7 +1183,10 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         // A plain allowlisted name resolves inside the dir.
         let dest = contained_model_dest(&tmp, "model.onnx").expect("plain name contained");
-        assert_eq!(dest.file_name().and_then(|s| s.to_str()), Some("model.onnx"));
+        assert_eq!(
+            dest.file_name().and_then(|s| s.to_str()),
+            Some("model.onnx")
+        );
         // A traversal name escapes the dir and is rejected.
         assert!(contained_model_dest(&tmp, "../evil.onnx").is_err());
         let _ = std::fs::remove_dir_all(&tmp);

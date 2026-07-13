@@ -498,7 +498,13 @@ mod tests {
 
         let pool = db();
         let child_id = "ffff0000-subf-strm-0000-000000000001";
-        insert_flow(&pool, child_id, "stream-child", &streaming_child_json(), "active");
+        insert_flow(
+            &pool,
+            child_id,
+            "stream-child",
+            &streaming_child_json(),
+            "active",
+        );
 
         // Registry with the streaming TestStreamProducer registered so the child
         // flow's output(stream) end-shape validates and produces a stream.
@@ -529,7 +535,10 @@ mod tests {
                 }
             }
         }
-        assert!(text.contains("hello from test producer"), "stream text: {text:?}");
+        assert!(
+            text.contains("hello from test producer"),
+            "stream text: {text:?}"
+        );
         assert!(saw_finish, "client never got finish_reason=Stop");
     }
 
@@ -542,14 +551,24 @@ mod tests {
 
         let pool = db();
         let child_id = "ffff0000-subf-strm-0000-000000000002";
-        insert_flow(&pool, child_id, "blocking-child", &passthrough_flow_json(), "active");
+        insert_flow(
+            &pool,
+            child_id,
+            "blocking-child",
+            &passthrough_flow_json(),
+            "active",
+        );
         let (_registry, slot) = registry_and_runner(pool.clone());
 
         let mut env = FlowEnvelope::empty();
         env.payload = FlowValue::Text("blocking-text".into());
 
         let stream = SubflowNodeAdapter::new(slot)
-            .produce_stream(&node(json!({"flow_id": child_id})), &[input(env)], &stub_ctx())
+            .produce_stream(
+                &node(json!({"flow_id": child_id})),
+                &[input(env)],
+                &stub_ctx(),
+            )
             .await
             .expect("produce_stream");
 
@@ -565,6 +584,9 @@ mod tests {
             }
         }
         assert_eq!(text, "blocking-text");
-        assert!(saw_finish, "wrapped blocking result must carry a terminal finish_reason");
+        assert!(
+            saw_finish,
+            "wrapped blocking result must carry a terminal finish_reason"
+        );
     }
 }

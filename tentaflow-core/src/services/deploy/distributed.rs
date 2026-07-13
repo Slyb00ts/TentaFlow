@@ -335,7 +335,10 @@ fn nccl_env(spec: &DistributedDeploySpec) -> Map<String, Value> {
     m.insert("NCCL_SOCKET_IFNAME".into(), json!(spec.socket_ifname));
     m.insert("GLOO_SOCKET_IFNAME".into(), json!(spec.socket_ifname));
     m.insert("NCCL_IB_DISABLE".into(), json!("0"));
-    m.insert("NCCL_IB_GID_INDEX".into(), json!(spec.gid_index.to_string()));
+    m.insert(
+        "NCCL_IB_GID_INDEX".into(),
+        json!(spec.gid_index.to_string()),
+    );
     m.insert("VLLM_HOST_IP".into(), json!(spec.rdma_ip));
     // Native PyTorch sampler zamiast FlashInfer: FlashInfer robi wolny kernel JIT (ninja)
     // na GB10 (sm_121a, brak prebuiltu), co blokuje faze profiling w TP init.
@@ -480,7 +483,8 @@ pub async fn ensure_model_downloaded_local(
     }
     #[cfg(feature = "docker")]
     {
-        download_model_via_container(model_repo, engine_id, hf_token, deployment_cluster_id).await?;
+        download_model_via_container(model_repo, engine_id, hf_token, deployment_cluster_id)
+            .await?;
         model_snapshot_dir(model_repo).ok_or_else(|| {
             format!("model {model_repo} pobrany, ale snapshot niekompletny (brak config.json/*.safetensors)")
         })
@@ -603,8 +607,7 @@ async fn download_model_via_container(
         )
     })?;
     let models_host = crate::paths::models_root();
-    std::fs::create_dir_all(&models_host)
-        .map_err(|e| format!("mkdir models_root: {e}"))?;
+    std::fs::create_dir_all(&models_host).map_err(|e| format!("mkdir models_root: {e}"))?;
     let cache_dir = models_host.join(model_dir_name(model_repo));
     let container_name = download_container_name(deployment_cluster_id);
     // Usun ewentualny nieszczelny kontener po poprzednim nieudanym pobieraniu,
@@ -618,7 +621,8 @@ async fn download_model_via_container(
     // `model_repo` jest ograniczony do [A-Za-z0-9._/-] przez `model_repo_is_safe`,
     // wiec nie moze wyrwac sie z literalu Pythona; caly `-c` idzie jako jeden argv
     // (bez powloki).
-    let py = format!("from huggingface_hub import snapshot_download; snapshot_download('{model_repo}')");
+    let py =
+        format!("from huggingface_hub import snapshot_download; snapshot_download('{model_repo}')");
 
     let mut args: Vec<String> = vec![
         "run".into(),

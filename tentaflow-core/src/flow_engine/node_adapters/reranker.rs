@@ -121,9 +121,7 @@ impl RerankerNodeAdapter {
     }
 
     /// Kontrakt #1: `{query, candidates:[{id,text}]}`.
-    fn parse_candidates_input(
-        obj: &serde_json::Value,
-    ) -> Result<(String, Vec<Candidate>)> {
+    fn parse_candidates_input(obj: &serde_json::Value) -> Result<(String, Vec<Candidate>)> {
         let query = obj
             .get("query")
             .and_then(|v| v.as_str())
@@ -141,13 +139,15 @@ impl RerankerNodeAdapter {
             let text = item
                 .get("text")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    anyhow!("reranker adapter: candidate[{pos}] missing string 'text'")
-                })?
+                .ok_or_else(|| anyhow!("reranker adapter: candidate[{pos}] missing string 'text'"))?
                 .to_string();
             let id = item
                 .get("id")
-                .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_u64().map(|n| n.to_string())))
+                .and_then(|v| {
+                    v.as_str()
+                        .map(|s| s.to_string())
+                        .or_else(|| v.as_u64().map(|n| n.to_string()))
+                })
                 .unwrap_or_else(|| pos.to_string());
             candidates.push(Candidate {
                 id,
@@ -197,7 +197,11 @@ impl RerankerNodeAdapter {
             };
             let id = hit
                 .get("ref_id")
-                .and_then(|v| v.as_u64().map(|n| n.to_string()).or_else(|| v.as_str().map(|s| s.to_string())))
+                .and_then(|v| {
+                    v.as_u64()
+                        .map(|n| n.to_string())
+                        .or_else(|| v.as_str().map(|s| s.to_string()))
+                })
                 .unwrap_or_else(|| text.to_string());
             let doc_id = fields
                 .and_then(|f| f.get("doc_id"))
@@ -207,10 +211,7 @@ impl RerankerNodeAdapter {
                 .and_then(|f| f.get("chunk_index"))
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
-            let vector_score = hit
-                .get("score")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0) as f32;
+            let vector_score = hit.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
             candidates.push(Candidate {
                 id,
                 text: text.to_string(),

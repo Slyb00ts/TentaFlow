@@ -18,20 +18,23 @@ use anyhow::{anyhow, bail, Result};
 use tracing::{info, warn};
 
 /// Domyślna ścieżka biblioteki ONNX Runtime dla dlopen (`ort` z `load-dynamic`),
-/// gdy `ORT_DYLIB_PATH` nie jest ustawione w środowisku.
+/// gdy autodetekcja w drzewie `native-libs/` nic nie znajdzie.
 const DEFAULT_ORT_DYLIB: &str = "/usr/lib/libonnxruntime.so.1.24.4";
 
-/// Ustawia `ORT_DYLIB_PATH` na wykrytą ścieżkę, jeśli nie ma jej w środowisku —
-/// `ort` z `load-dynamic` dlopuje onnxruntime spod tej zmiennej przy pierwszym
-/// użyciu. Preferujemy runtime z drzewa `native-libs/` (zawiera providery
-/// TensorRT i CUDA), a dopiero gdy go brak — systemowy [`DEFAULT_ORT_DYLIB`]
-/// (który ma zwykle tylko CUDA). Edycja 2021: `set_var` jest bezpieczne.
+/// Ustawia `ORT_DYLIB_PATH` na wykrytą ścieżkę — `ort` z `load-dynamic` dlopuje
+/// onnxruntime spod tej zmiennej przy pierwszym użyciu (to kontrakt crate'a
+/// `ort`, nie operatorska zmienna środowiskowa; operator niczego nie ustawia).
+/// Preferujemy runtime z drzewa `native-libs/` (zawiera providery TensorRT i
+/// CUDA), a dopiero gdy go brak — systemowy [`DEFAULT_ORT_DYLIB`] (który ma
+/// zwykle tylko CUDA). Idempotentne przez `OnceLock`; edycja 2021: `set_var`
+/// jest bezpieczne.
 pub fn ensure_ort_dylib() {
-    if std::env::var_os("ORT_DYLIB_PATH").is_some() {
-        return;
-    }
-    let path = locate_ort_dylib().unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_ORT_DYLIB));
-    std::env::set_var("ORT_DYLIB_PATH", &path);
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        let path =
+            locate_ort_dylib().unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_ORT_DYLIB));
+        std::env::set_var("ORT_DYLIB_PATH", &path);
+    });
 }
 
 /// Szuka `libonnxruntime.{so*,dylib}` w drzewie `native-libs/<platform>/lib-dynamic/`
@@ -43,12 +46,20 @@ fn locate_ort_dylib() -> Option<std::path::PathBuf> {
 
     let (platform, lib_glob): (&str, &[&str]) = if cfg!(target_os = "macos") {
         (
-            if cfg!(target_arch = "aarch64") { "macos-arm64" } else { "macos-x86_64" },
+            if cfg!(target_arch = "aarch64") {
+                "macos-arm64"
+            } else {
+                "macos-x86_64"
+            },
             &["libonnxruntime.dylib"],
         )
     } else if cfg!(target_os = "linux") {
         (
-            if cfg!(target_arch = "aarch64") { "linux-aarch64" } else { "linux-x86_64" },
+            if cfg!(target_arch = "aarch64") {
+                "linux-aarch64"
+            } else {
+                "linux-x86_64"
+            },
             // Prebuilty rozpakowują wersjonowany soname (np. .so.1.26.0) obok
             // dowiązania .so — bierzemy oba warianty, wersjonowany jako pierwszy.
             &["libonnxruntime.so", "libonnxruntime.so.*"],
@@ -155,63 +166,47 @@ impl TrtShapeProfile {
 /// VRAM: N pooled sessions = N model copies on the GPU.
 pub const MAX_SESSIONS_PER_MODEL: usize = 16;
 
-/// Reads a session-pool size from `env_var`, clamped to `1..=MAX_SESSIONS_PER_MODEL`.
-/// Default `1` is byte-identical to a single-`Mutex<Session>` path (checkout
-/// always locks slot 0), so the historical serialized behavior is the default.
-pub fn pool_size_from_env(env_var: &str, default: usize) -> usize {
-    std::env::var(env_var)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(default)
-        .clamp(1, MAX_SESSIONS_PER_MODEL)
+/// Clamps a configured session-pool size to `1..=MAX_SESSIONS_PER_MODEL`. The
+/// configured value comes from the `[vision]` config section (serde defaults
+/// carry each model's historical default), never from the environment.
+pub fn pool_size(configured: usize) -> usize {
+    configured.clamp(1, MAX_SESSIONS_PER_MODEL)
 }
 
 /// Upper bound on the number of GPUs a single vision pool will spread across.
-/// A misconfigured `TENTAFLOW_VISION_GPUS=1000` must not allocate a 1000-element
+/// A misconfigured `[vision] gpus = "1000"` must not allocate a 1000-element
 /// device vector; no real box has more than this many CUDA devices.
 pub const MAX_VISION_GPUS: usize = 64;
-
-/// Environment knob selecting which CUDA device ids the vision session pools
-/// spread across. See [`vision_gpu_set`] for the grammar.
-pub const VISION_GPUS_ENV: &str = "TENTAFLOW_VISION_GPUS";
 
 /// Per-session TensorRT workspace cap in MiB. TensorRT 10.x defaults
 /// `trt_max_workspace_size` to 0 = "use ALL available device memory": each
 /// unbounded TRT session then reserves as much free VRAM as it can, so two
 /// pooled sessions already eat ~18 GB and a third won't fit on a 24 GB card —
 /// the session pool is unusable at N>1 without a cap. Overridable via
-/// [`TRT_WORKSPACE_MB_ENV`].
+/// `[vision] trt_workspace_mib`.
 pub const DEFAULT_TRT_WORKSPACE_MB: usize = 1024;
-
-/// Environment knob for the per-session TensorRT workspace cap (MiB). Clamped to
-/// [`TRT_WORKSPACE_MB_MIN`]..=[`TRT_WORKSPACE_MB_MAX`]; unset/garbage →
-/// [`DEFAULT_TRT_WORKSPACE_MB`].
-pub const TRT_WORKSPACE_MB_ENV: &str = "TENTAFLOW_TRT_WORKSPACE_MB";
 pub const TRT_WORKSPACE_MB_MIN: usize = 128;
 pub const TRT_WORKSPACE_MB_MAX: usize = 8192;
 
 /// Per-session TensorRT workspace cap in BYTES, resolved ONCE for the process
-/// lifetime from [`TRT_WORKSPACE_MB_ENV`]. See [`DEFAULT_TRT_WORKSPACE_MB`] for
-/// why an explicit cap is mandatory for the pool to scale past one session.
+/// lifetime from `[vision] trt_workspace_mib`. See [`DEFAULT_TRT_WORKSPACE_MB`]
+/// for why an explicit cap is mandatory for the pool to scale past one session.
 pub fn trt_workspace_bytes() -> usize {
     static BYTES: OnceLock<usize> = OnceLock::new();
     *BYTES.get_or_init(|| {
-        parse_trt_workspace_mb(std::env::var(TRT_WORKSPACE_MB_ENV).ok().as_deref())
-            * 1024
-            * 1024
+        clamp_trt_workspace_mb(crate::vision::settings::get().trt_workspace_mib) * 1024 * 1024
     })
 }
 
-/// Pure parser behind [`trt_workspace_bytes`], split out for unit-testing the
-/// clamp/default without touching the process environment or the `OnceLock`.
-fn parse_trt_workspace_mb(raw: Option<&str>) -> usize {
-    raw.and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_TRT_WORKSPACE_MB)
-        .clamp(TRT_WORKSPACE_MB_MIN, TRT_WORKSPACE_MB_MAX)
+/// Pure clamp behind [`trt_workspace_bytes`], split out for unit-testing the
+/// range without touching the settings or the `OnceLock`.
+fn clamp_trt_workspace_mb(mib: usize) -> usize {
+    mib.clamp(TRT_WORKSPACE_MB_MIN, TRT_WORKSPACE_MB_MAX)
 }
 
 /// Parsed CUDA device-id set that vision session pools spread across, resolved
-/// ONCE for the process lifetime from `TENTAFLOW_VISION_GPUS`.
+/// ONCE for the process lifetime from `[vision] gpus` (unless a programmatic
+/// pin via [`init_vision_gpu_set`] ran first — the vision-worker path).
 ///
 /// Grammar (single-GPU device 0 is always the safe default — never panics):
 ///   * unset / empty / whitespace → `[0]` (today's single-GPU behavior).
@@ -223,11 +218,40 @@ fn parse_trt_workspace_mb(raw: Option<&str>) -> usize {
 /// There is deliberately no CUDA auto-detection here: adding an nvml dependency
 /// just to count GPUs is not worth it, and the mesh `NodeInfo.gpus` count is not
 /// reachable from this low-level ort layer. Multi-GPU is opt-in by the operator
-/// setting this var; the default stays single-device-0 and byte-identical.
+/// setting the config field; the default stays single-device-0 and byte-identical.
 pub fn vision_gpu_set() -> &'static [i32] {
-    static SET: OnceLock<Vec<i32>> = OnceLock::new();
-    SET.get_or_init(|| parse_gpu_set(std::env::var(VISION_GPUS_ENV).ok().as_deref()))
+    VISION_GPU_SET
+        .get_or_init(|| parse_gpu_set(Some(crate::vision::settings::get().gpus.as_str())))
         .as_slice()
+}
+
+/// Process-lifetime slot behind [`vision_gpu_set`], hoisted to module level so
+/// [`init_vision_gpu_set`] can seed it programmatically before the first read.
+static VISION_GPU_SET: OnceLock<Vec<i32>> = OnceLock::new();
+
+/// Programmatic pin of the vision GPU set — for processes that receive their
+/// device assignment explicitly instead of via the environment (the
+/// `vision-worker` subprocess gets `--gpu <id>` from the spawning supervisor).
+/// Must run before ANY vision singleton resolves [`vision_gpu_set`]; once the
+/// set is frozen this returns an error so a late pin fails loudly instead of
+/// silently building sessions on the wrong device.
+pub fn init_vision_gpu_set(ids: &[i32]) -> anyhow::Result<()> {
+    let mut set: Vec<i32> = Vec::new();
+    for &id in ids {
+        if id >= 0 && !set.contains(&id) && set.len() < MAX_VISION_GPUS {
+            set.push(id);
+        }
+    }
+    if set.is_empty() {
+        anyhow::bail!("init_vision_gpu_set: no valid CUDA device ids in {ids:?}");
+    }
+    VISION_GPU_SET.set(set).map_err(|_| {
+        anyhow::anyhow!(
+            "vision GPU set already resolved to {:?} — init_vision_gpu_set must run before any \
+             vision singleton loads",
+            VISION_GPU_SET.get().map(Vec::as_slice).unwrap_or(&[])
+        )
+    })
 }
 
 /// Pure parser behind [`vision_gpu_set`], split out so the grammar is unit-testable
@@ -350,9 +374,7 @@ impl<S: Send + 'static> WorkerPool<S> {
         let workers = sessions
             .into_iter()
             .enumerate()
-            .map(|(i, sess)| {
-                spawn_worker(label, i, sess, rebuilder.clone(), Arc::clone(&poisoned))
-            })
+            .map(|(i, sess)| spawn_worker(label, i, sess, rebuilder.clone(), Arc::clone(&poisoned)))
             .collect();
         Self {
             workers,
@@ -499,7 +521,9 @@ fn worker_loop<S>(
             Err(_) => {
                 session = None;
                 if rebuilder.is_some() {
-                    warn!("[ort] session slot {idx} forward panicked — rebuilding session in place");
+                    warn!(
+                        "[ort] session slot {idx} forward panicked — rebuilding session in place"
+                    );
                 } else {
                     warn!("[ort] session slot {idx} forward panicked — pool poisoned (reload required)");
                     poisoned.store(true, Ordering::Release);
@@ -597,6 +621,7 @@ pub fn build_session_pool_from_file(
     cache_root: &std::path::Path,
     trt_profile: Option<&TrtShapeProfile>,
     n: usize,
+    fp16: bool,
 ) -> Result<SessionPool> {
     let n = n.clamp(1, MAX_SESSIONS_PER_MODEL);
     // Self-heal an ONNX external-data name mismatch before ANY session opens the
@@ -618,13 +643,30 @@ pub fn build_session_pool_from_file(
                 &cache_root.join(subdir),
                 trt_profile.as_ref(),
                 device_id,
+                fp16,
             )
             .map_err(|e| anyhow!("session slot {i} on GPU device {device_id}: {e:#}"))
         }
     };
+    // Degrade, never disable: a TRT engine build can fail transiently on a busy
+    // GPU (flaky builder under memory pressure). If slot 0 fails nothing can run —
+    // hard error. But a failure PAST slot 0 must not take the whole model (and with
+    // it camera analysis) down: keep the sessions that DID build and warn loudly.
+    // This exact failure (slot 2/4 on a crowded device) once disabled production
+    // analysis entirely while the video kept flowing.
     let mut sessions = Vec::with_capacity(n);
     for i in 0..n {
-        sessions.push(build_slot(i)?);
+        match build_slot(i) {
+            Ok(s) => sessions.push(s),
+            Err(e) if i == 0 => return Err(e),
+            Err(e) => {
+                tracing::warn!(
+                    "[ort] session slot {i}/{n} build failed — continuing with {} session(s): {e:#}",
+                    sessions.len()
+                );
+                break;
+            }
+        }
     }
     // Name the dedicated threads after the model file stem (`vision-ort-<stem>-<i>`).
     let label = model_path
@@ -658,8 +700,9 @@ pub fn build_ort_session(
     trt_cache_dir: &std::path::Path,
     trt_profile: Option<&TrtShapeProfile>,
     device_id: i32,
+    fp16: bool,
 ) -> Result<ort::session::Session> {
-    session_builder_with_eps(trt_cache_dir, trt_profile, device_id)?
+    session_builder_with_eps(trt_cache_dir, trt_profile, device_id, fp16)?
         .commit_from_file(model_path)
         .map_err(|e| anyhow!("ort commit_from_file {}: {e}", model_path.display()))
 }
@@ -672,16 +715,26 @@ pub fn build_ort_session_from_memory(
     trt_cache_dir: &std::path::Path,
     trt_profile: Option<&TrtShapeProfile>,
     device_id: i32,
+    fp16: bool,
 ) -> Result<ort::session::Session> {
-    session_builder_with_eps(trt_cache_dir, trt_profile, device_id)?
+    session_builder_with_eps(trt_cache_dir, trt_profile, device_id, fp16)?
         .commit_from_memory(model_bytes)
         .map_err(|e| anyhow!("ort commit_from_memory: {e}"))
+}
+
+/// Whether the small OCR / classifier CRNN heads run in TensorRT FP16. Default
+/// FALSE (fp32) — fp16 rounding corrupts character reads. `[vision] ocr_fp16 =
+/// true` forces fp16 back on for A/B comparison of accuracy vs speed on a live
+/// feed.
+pub fn ocr_fp16() -> bool {
+    crate::vision::settings::get().ocr_fp16
 }
 
 fn session_builder_with_eps(
     trt_cache_dir: &std::path::Path,
     trt_profile: Option<&TrtShapeProfile>,
     device_id: i32,
+    fp16: bool,
 ) -> Result<ort::session::builder::SessionBuilder> {
     use ort::ep::{ExecutionProvider, ExecutionProviderDispatch};
     use ort::session::Session;
@@ -709,7 +762,11 @@ fn session_builder_with_eps(
             .with_engine_cache(true)
             .with_engine_cache_path(trt_cache_dir.to_string_lossy().to_string())
             .with_timing_cache(true)
-            .with_fp16(true);
+            // FP16 boosts detector throughput and it tolerates the precision loss
+            // (localization is robust). Small CRNN OCR heads do NOT: fp16 rounding
+            // flips argmax on ambiguous glyphs (3↔2, 8↔0), silently corrupting reads
+            // — so OCR/classifier sessions pass `fp16=false`. See `ocr_fp16`.
+            .with_fp16(fp16);
         // Explicit min/opt/max shape profile (trt_profile_{min,opt,max}_shapes):
         // one engine covers the whole batch range instead of a per-batch-size
         // rebuild stall. An input outside the range makes ORT's TRT EP update
@@ -720,6 +777,15 @@ fn session_builder_with_eps(
                 .with_profile_min_shapes(profile.shape_spec(profile.min_batch))
                 .with_profile_opt_shapes(profile.shape_spec(profile.opt_batch))
                 .with_profile_max_shapes(profile.shape_spec(profile.max_batch));
+        }
+        // CUDA Graphs (opt-in): capture the whole TRT forward once and replay it,
+        // collapsing hundreds of per-forward kernel launches into one graph launch.
+        // Targets the measured launch-bound detect plateau (~1300 forwards*batch/s
+        // regardless of session count). Opt-in because graph capture requires
+        // stable shapes per session — mixed batch sizes re-capture and can regress;
+        // enable when the batcher feeds mostly-full fixed batches.
+        if crate::vision::settings::get().trt_cuda_graph {
+            trt = trt.with_cuda_graph(true);
         }
         eps.push(trt.build());
         // CUDA — dotychczasowa, działająca ścieżka; teraz MIĘKKO (bez
@@ -751,8 +817,23 @@ fn session_builder_with_eps(
         info!("[ort] dostępne EP w runtime — CoreML={coreml} (priorytet: CoreML>CPU)");
     }
 
+    // Anti-spin: each pooled session lives on its OWN dedicated OS thread and runs
+    // one forward at a time, and cross-session parallelism comes from N sessions —
+    // NOT from ORT's per-session thread pools. By default those pools BUSY-SPIN
+    // waiting for work/GPU sync; with 30 sessions that pins every core spinning
+    // (perf: 82 % of CPU in one libonnxruntime spin loop) while the GPU sits at 0 %.
+    // One intra/inter thread + spinning OFF makes the CPU SLEEP on GPU sync instead
+    // of burning a core, so the card can actually be fed → many more cameras/GPU.
     Session::builder()
         .map_err(|e| anyhow!("ort Session::builder: {e}"))?
+        .with_intra_threads(1)
+        .map_err(|e| anyhow!("ort with_intra_threads: {e}"))?
+        .with_inter_threads(1)
+        .map_err(|e| anyhow!("ort with_inter_threads: {e}"))?
+        .with_intra_op_spinning(false)
+        .map_err(|e| anyhow!("ort intra_op_spinning: {e}"))?
+        .with_inter_op_spinning(false)
+        .map_err(|e| anyhow!("ort inter_op_spinning: {e}"))?
         .with_execution_providers(eps)
         .map_err(|e| anyhow!("ort with_execution_providers: {e}"))
 }
@@ -1028,8 +1109,8 @@ fn message_string_field(msg: &[u8], field_no: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_external_data_present, onnx_external_data_locations, onnx_first_input_name,
-        parse_gpu_set, parse_trt_workspace_mb, pool_size_from_env, session_cache_subdir, Rebuilder,
+        clamp_trt_workspace_mb, ensure_external_data_present, onnx_external_data_locations,
+        onnx_first_input_name, parse_gpu_set, pool_size, session_cache_subdir, Rebuilder,
         RoundRobin, TrtShapeProfile, WorkerPool,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1052,35 +1133,27 @@ mod tests {
         assert_eq!(rr.pick(), 0);
     }
 
-    /// Pool size parses from env and clamps to `1..=MAX`; an unset/garbage var
-    /// falls back to the default (never 0).
+    /// Pool size clamps the configured value to `1..=MAX` (never 0).
     #[test]
-    fn pool_size_parses_and_clamps() {
-        let var = "TENTAFLOW_TEST_POOL_SIZE_KNOB";
-        std::env::remove_var(var);
-        assert_eq!(pool_size_from_env(var, 1), 1);
-        std::env::set_var(var, "4");
-        assert_eq!(pool_size_from_env(var, 1), 4);
-        std::env::set_var(var, "0");
-        assert_eq!(pool_size_from_env(var, 1), 1);
-        std::env::set_var(var, "999");
-        assert_eq!(pool_size_from_env(var, 1), super::MAX_SESSIONS_PER_MODEL);
-        std::env::set_var(var, "not-a-number");
-        assert_eq!(pool_size_from_env(var, 2), 2);
-        std::env::remove_var(var);
+    fn pool_size_clamps() {
+        assert_eq!(pool_size(1), 1);
+        assert_eq!(pool_size(4), 4);
+        assert_eq!(pool_size(0), 1);
+        assert_eq!(pool_size(999), super::MAX_SESSIONS_PER_MODEL);
     }
 
-    /// TRT workspace cap: default when unset/garbage, clamped to the MiB range.
+    /// TRT workspace cap: the configured MiB value clamps to the valid range.
     #[test]
-    fn trt_workspace_mb_parses_and_clamps() {
+    fn trt_workspace_mb_clamps() {
         use super::{DEFAULT_TRT_WORKSPACE_MB, TRT_WORKSPACE_MB_MAX, TRT_WORKSPACE_MB_MIN};
-        assert_eq!(parse_trt_workspace_mb(None), DEFAULT_TRT_WORKSPACE_MB);
-        assert_eq!(parse_trt_workspace_mb(Some("")), DEFAULT_TRT_WORKSPACE_MB);
-        assert_eq!(parse_trt_workspace_mb(Some("garbage")), DEFAULT_TRT_WORKSPACE_MB);
-        assert_eq!(parse_trt_workspace_mb(Some(" 2048 ")), 2048);
+        assert_eq!(
+            clamp_trt_workspace_mb(DEFAULT_TRT_WORKSPACE_MB),
+            DEFAULT_TRT_WORKSPACE_MB
+        );
+        assert_eq!(clamp_trt_workspace_mb(2048), 2048);
         // Clamp below min and above max.
-        assert_eq!(parse_trt_workspace_mb(Some("1")), TRT_WORKSPACE_MB_MIN);
-        assert_eq!(parse_trt_workspace_mb(Some("999999")), TRT_WORKSPACE_MB_MAX);
+        assert_eq!(clamp_trt_workspace_mb(1), TRT_WORKSPACE_MB_MIN);
+        assert_eq!(clamp_trt_workspace_mb(999999), TRT_WORKSPACE_MB_MAX);
     }
 
     /// Encodes one length-delimited protobuf field (`field << 3 | 2`).
@@ -1309,7 +1382,10 @@ mod tests {
             let tid = pool
                 .run(|_sess: &mut FakeSession| Ok(std::thread::current().id()))
                 .expect("forward runs");
-            assert_ne!(tid, caller_thread, "forward must not run on the caller thread");
+            assert_ne!(
+                tid, caller_thread,
+                "forward must not run on the caller thread"
+            );
             seen.push(tid);
         }
         assert!(
@@ -1368,18 +1444,27 @@ mod tests {
             .run(|s: &mut FakeSession| Ok(s.generation))
             .expect("slot recovered after error");
         assert!(g1 > g0, "session must have been rebuilt (gen {g1} > {g0})");
-        assert!(!pool.is_poisoned(), "rebuilder-backed pool never latches poisoned");
+        assert!(
+            !pool.is_poisoned(),
+            "rebuilder-backed pool never latches poisoned"
+        );
 
         // Force a PANIC mid-forward → catch_unwind keeps the thread alive and the
         // worker rebuilds again; the slot still serves afterwards.
         let panicked = pool.run(|_s: &mut FakeSession| -> anyhow::Result<u64> {
             panic!("forced forward panic");
         });
-        assert!(panicked.is_err(), "panicked forward surfaces as an error, not a hang");
+        assert!(
+            panicked.is_err(),
+            "panicked forward surfaces as an error, not a hang"
+        );
         let g2 = pool
             .run(|s: &mut FakeSession| Ok(s.generation))
             .expect("slot recovered after panic");
-        assert!(g2 > g1, "session rebuilt again after the panic (gen {g2} > {g1})");
+        assert!(
+            g2 > g1,
+            "session rebuilt again after the panic (gen {g2} > {g1})"
+        );
     }
 
     /// A rebuilder-less pool (the `onnx-cv` path) latches `poisoned` on a panicked
@@ -1391,10 +1476,12 @@ mod tests {
             WorkerPool::from_sessions("test", vec![FakeSession { generation: 0 }], None);
 
         // A plain forward error does not poison the pool.
-        let _ = pool.run(|_s: &mut FakeSession| -> anyhow::Result<u64> {
-            anyhow::bail!("shape mismatch")
-        });
-        assert!(!pool.is_poisoned(), "a forward error must not poison an onnx-cv pool");
+        let _ = pool
+            .run(|_s: &mut FakeSession| -> anyhow::Result<u64> { anyhow::bail!("shape mismatch") });
+        assert!(
+            !pool.is_poisoned(),
+            "a forward error must not poison an onnx-cv pool"
+        );
         assert!(pool.run(|s: &mut FakeSession| Ok(s.generation)).is_ok());
 
         // A panic poisons it; subsequent runs short-circuit with "reload required".
@@ -1408,7 +1495,10 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        assert!(pool.is_poisoned(), "a panicked forward must poison a rebuilder-less pool");
+        assert!(
+            pool.is_poisoned(),
+            "a panicked forward must poison a rebuilder-less pool"
+        );
         assert!(
             pool.run(|s: &mut FakeSession| Ok(s.generation)).is_err(),
             "a poisoned pool short-circuits further forwards"
@@ -1441,7 +1531,10 @@ mod tests {
             ran_probe.fetch_add(1, Ordering::SeqCst);
             Ok(s.generation)
         });
-        assert!(out.is_err(), "a forward after a panic must error, not reuse the session");
+        assert!(
+            out.is_err(),
+            "a forward after a panic must error, not reuse the session"
+        );
         assert_eq!(
             ran.load(Ordering::SeqCst),
             0,
@@ -1478,7 +1571,11 @@ mod tests {
         for _ in 0..6 {
             pool.run(|_s: &mut CountedSession| Ok(())).unwrap();
         }
-        assert_eq!(dropped.load(Ordering::SeqCst), 0, "sessions alive while pool is alive");
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            0,
+            "sessions alive while pool is alive"
+        );
 
         // Dropping the pool must synchronously join all workers; the moment drop
         // returns, all three owned sessions have been dropped (no lingering thread

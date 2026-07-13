@@ -14,12 +14,10 @@ pub mod error;
 pub mod ppr;
 
 pub use backend::{CozoBackend, GraphBackend, GraphEngine, NeighborDir, TOMBSTONE_LABEL};
-pub use compute_guard::{
-    GraphComputeGuard, MAX_GLOBAL_GRAPH_COMPUTE, MAX_PER_ADDON_GRAPH_COMPUTE,
-};
 pub use collection::{
     GraphManager, MAX_COLLECTIONS_PER_ADDON, MAX_EDGES_PER_ADDON, MAX_NODES_PER_ADDON,
 };
+pub use compute_guard::{GraphComputeGuard, MAX_GLOBAL_GRAPH_COMPUTE, MAX_PER_ADDON_GRAPH_COMPUTE};
 pub use csr::Csr;
 pub use error::{GraphError, Result as GraphResult};
 pub use ppr::{personalized_pagerank, PprScores};

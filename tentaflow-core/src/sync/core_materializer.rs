@@ -135,9 +135,7 @@ pub fn apply_core_operation(
         CoreSyncResourceKind::ComplianceProcessingActivity => {
             apply_compliance_processing_activity(&tx, operation)?
         }
-        CoreSyncResourceKind::ComplianceLegalBasis => {
-            apply_compliance_legal_basis(&tx, operation)?
-        }
+        CoreSyncResourceKind::ComplianceLegalBasis => apply_compliance_legal_basis(&tx, operation)?,
         CoreSyncResourceKind::ComplianceRetentionPolicy => {
             apply_compliance_retention_policy(&tx, operation)?
         }
@@ -145,9 +143,7 @@ pub fn apply_core_operation(
         CoreSyncResourceKind::TokenUsageDaily => apply_token_usage_daily(&tx, operation)?,
         CoreSyncResourceKind::TokenQuota => apply_token_quota(&tx, operation)?,
         CoreSyncResourceKind::TokenLease => apply_token_lease(&tx, operation)?,
-        CoreSyncResourceKind::ModelMetricsRollup => {
-            apply_model_metrics_rollup(&tx, operation)?
-        }
+        CoreSyncResourceKind::ModelMetricsRollup => apply_model_metrics_rollup(&tx, operation)?,
         CoreSyncResourceKind::ModelPricing => apply_model_pricing(&tx, operation)?,
         CoreSyncResourceKind::CameraCvPipeline => apply_camera_cv_pipeline(&tx, operation)?,
         CoreSyncResourceKind::VisionModel => apply_vision_model(&tx, operation)?,
@@ -419,10 +415,7 @@ fn apply_addon_config(
 /// node-local and intentionally absent from the synced fields, so the UPSERT must
 /// preserve the existing local value rather than reset it to NULL (mirrors the
 /// skills use_count/last_used_at preservation).
-fn apply_api_key(
-    tx: &rusqlite::Transaction<'_>,
-    operation: &SyncOperation,
-) -> LedgerResult<usize> {
+fn apply_api_key(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> LedgerResult<usize> {
     let uid = &operation.body.resource_id;
     match operation.body.action {
         ActionType::Insert | ActionType::Update => tx
@@ -2142,8 +2135,7 @@ fn apply_camera_cv_pipeline(
             >(&pipeline_json)
             .map_err(|e| e.to_string())
             .and_then(|p| {
-                crate::services::camera_ingest::cv_pipeline::validate(&p)
-                    .map_err(|e| e.to_string())
+                crate::services::camera_ingest::cv_pipeline::validate(&p).map_err(|e| e.to_string())
             });
             if let Err(err) = structurally_valid {
                 tracing::warn!(
@@ -2162,11 +2154,8 @@ fn apply_camera_cv_pipeline(
                 && field_bool_or(operation, "is_default", false)?;
             // Pre-org-scope senders omit org_id — default them into the
             // single default org, matching the v110 column default.
-            let org_id = field_string_or(
-                operation,
-                "org_id",
-                crate::services::org::DEFAULT_ORG_ID,
-            )?;
+            let org_id =
+                field_string_or(operation, "org_id", crate::services::org::DEFAULT_ORG_ID)?;
             tx.execute(
                 "INSERT INTO camera_cv_pipelines \
                  (id, name, pipeline_json, is_default, org_id, created_at, updated_at) \
@@ -2436,9 +2425,9 @@ fn field_i64_or(operation: &SyncOperation, key: &str, default: i64) -> LedgerRes
 /// a convenience. A missing/null field yields `default`.
 fn field_f64_or(operation: &SyncOperation, key: &str, default: f64) -> LedgerResult<f64> {
     match operation.body.changed_fields.get(key) {
-        Some(FieldValue::Decimal(value)) => value.parse::<f64>().map_err(|e| {
-            SyncLedgerError::Runtime(format!("invalid f64 field {key}: {e}"))
-        }),
+        Some(FieldValue::Decimal(value)) => value
+            .parse::<f64>()
+            .map_err(|e| SyncLedgerError::Runtime(format!("invalid f64 field {key}: {e}"))),
         Some(FieldValue::I64(value)) => Ok(*value as f64),
         Some(FieldValue::U64(value)) => Ok(*value as f64),
         Some(FieldValue::Null) | None => Ok(default),

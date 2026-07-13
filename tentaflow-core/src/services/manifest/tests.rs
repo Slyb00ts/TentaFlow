@@ -1007,7 +1007,7 @@ mod capability_axes {
             speculator_num_tokens: None,
             vllm: None,
             checkpoint_file: None,
-            quant_variants: vec![],
+            quant_variants: Vec::new(),
         }
     }
 

@@ -130,7 +130,10 @@ pub fn stt_transcribe_v1(
     let router = match caller.data().router.as_ref() {
         Some(r) => r.clone(),
         None => {
-            warn!("stt_transcribe: router niedostepny dla addon='{}'", addon_id);
+            warn!(
+                "stt_transcribe: router niedostepny dla addon='{}'",
+                addon_id
+            );
             audit_log(
                 caller.data(),
                 "stt.transcribe",
@@ -198,7 +201,14 @@ pub fn stt_transcribe_v1(
         rate_limiter.record_usage(&addon_id, ResourceType::LlmTokens, estimated_tokens);
     }
 
-    audit_log(caller.data(), "stt.transcribe", Some("stt"), None, "ok", None);
+    audit_log(
+        caller.data(),
+        "stt.transcribe",
+        Some("stt"),
+        None,
+        "ok",
+        None,
+    );
 
     let out = SttTranscribeOutput {
         text: response.text,

@@ -120,12 +120,8 @@ pub enum AnthropicContent {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicContentBlock {
-    Text {
-        text: String,
-    },
-    Image {
-        source: AnthropicImageSource,
-    },
+    Text { text: String },
+    Image { source: AnthropicImageSource },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -234,8 +230,7 @@ fn anthropic_message_to_openai(msg: AnthropicMessage) -> std::result::Result<Mes
                                 source.source_type
                             ));
                         }
-                        let url =
-                            format!("data:{};base64,{}", source.media_type, source.data);
+                        let url = format!("data:{};base64,{}", source.media_type, source.data);
                         parts.push(ContentPart::ImageUrl {
                             image_url: ImageUrl { url, detail: None },
                         });
@@ -429,7 +424,10 @@ pub async fn handle_messages(
             }
         };
 
-        match router.route_chat_completion(openai_req, user_ctx, None).await {
+        match router
+            .route_chat_completion(openai_req, user_ctx, None)
+            .await
+        {
             Ok(route_result) => {
                 let anthropic =
                     to_anthropic_response(route_result.response, stop_sequences.as_deref());
@@ -454,9 +452,8 @@ pub async fn handle_messages(
 fn anthropic_sse_response(
     chunk_stream: Pin<
         Box<
-            dyn Stream<
-                    Item = crate::error::Result<crate::api::openai::types::ChatCompletionChunk>,
-                > + Send,
+            dyn Stream<Item = crate::error::Result<crate::api::openai::types::ChatCompletionChunk>>
+                + Send,
         >,
     >,
     model: String,
@@ -627,9 +624,7 @@ pub async fn handle_count_tokens(
     }
     for msg in &request.messages {
         total += match &msg.content {
-            AnthropicContent::Text(s) => {
-                crate::metrics::token_counter::estimate_tokens(s)
-            }
+            AnthropicContent::Text(s) => crate::metrics::token_counter::estimate_tokens(s),
             AnthropicContent::Blocks(blocks) => blocks
                 .iter()
                 .map(|b| match b {

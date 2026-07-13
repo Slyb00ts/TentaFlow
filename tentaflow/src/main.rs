@@ -77,6 +77,29 @@ enum Subcommand {
     },
     /// Wypisuje informacje o systemie + wykrytych GPU + dostepnych silnikach
     SystemCheck,
+    /// Slim GPU vision worker process — spawned and supervised by the core
+    /// process per `[vision].workers_per_gpu` (not intended for manual use)
+    VisionWorker {
+        /// Stable worker index assigned by the supervisor
+        #[arg(long = "worker-id")]
+        worker_id: u32,
+        /// CUDA device id this worker is pinned to
+        #[arg(long = "gpu")]
+        gpu: i32,
+        /// Unix socket path of the core's worker link
+        #[arg(long = "link")]
+        link: PathBuf,
+        /// Hex auth token for the link Hello (one per incarnation)
+        #[arg(long = "token")]
+        token: String,
+        /// Core SQLite database path (the worker opens it READ-ONLY)
+        #[arg(long = "db")]
+        db: Option<PathBuf>,
+        /// The core's `[vision]` config section serialized as JSON — the worker
+        /// freezes these process-wide vision settings at boot (absent = defaults)
+        #[arg(long = "vision-config")]
+        vision_config: Option<String>,
+    },
 }
 
 use tentaflow_core::mesh::pipeline::{start_mesh_pipeline, MeshPipelineConfig};
@@ -206,6 +229,14 @@ async fn run_server(args: Args) -> Result<()> {
     apply_cli_overrides(&mut config, &args);
 
     info!("Konfiguracja wczytana pomyslnie");
+
+    // Freeze the process-wide vision settings from `[vision]` BEFORE anything
+    // vision-related (camera ingest, detector pools, worker supervisor) can
+    // read them — the config TOML is the only operator mechanism (no env vars).
+    if let Err(e) = tentaflow_core::vision::settings::init(config.vision.clone()) {
+        error!("Vision settings init: {}", e);
+        return Err(anyhow::anyhow!("vision settings init: {}", e));
+    }
 
     tentaflow_core::compliance::ai_gateway::set_token_quota_enabled(
         config.token_metrics.enabled,
@@ -967,6 +998,20 @@ async fn run_server(args: Args) -> Result<()> {
         mesh_services_registry.clone(),
     )?;
 
+    // Multi-process vision workers (docs/VISION_WORKER_SHARDING.md).
+    // Configured EXCLUSIVELY via the `[vision]` config TOML section;
+    // the default 0 spawns nothing and binds no link socket, so production
+    // behavior without the section is unchanged. MUST start before the camera
+    // hydrate below: the hydrate consults the worker fleet to decide which
+    // cameras stay in-process — a late fleet install would double-ingest
+    // worker cameras locally.
+    #[cfg(unix)]
+    let vision_workers =
+        tentaflow_core::services::vision_worker::supervisor::VisionWorkerSupervisor::start(
+            &config.vision,
+            db_path.clone(),
+        );
+
     // Boot-time camera ingest hydrate. Without this, `CameraIngestSupervisor`
     // stays empty until SOMEONE opens TentaVision UI in a browser — kamera nie
     // produkuje klatek, analiza Flow nie ma na czym pracować, status zostaje
@@ -988,6 +1033,13 @@ async fn run_server(args: Args) -> Result<()> {
     wait_for_shutdown_signal().await?;
 
     info!("Otrzymano sygnal shutdown, zamykanie routera...");
+    // Stop the vision worker fleet first: each worker gets a link Shutdown
+    // (drain + clean exit), then a bounded group kill — GPU memory must be
+    // released before anything else races the teardown.
+    #[cfg(unix)]
+    if let Some(sup) = &vision_workers {
+        sup.stop().await;
+    }
     // Zamknij addon manager: anuluj service tick loops, drop dispatcher
     // sender (rozwalenie cyklu referencyjnego Arc<AddonManager> w
     // spawn_blocking task), drop running instances. Bez tego proces nie
@@ -1474,6 +1526,66 @@ fn run_subcommand(cmd: &Subcommand, verbose: bool) -> Result<()> {
             Ok(())
         }
         Subcommand::Update { check, force } => run_update(*check, *force),
+        Subcommand::VisionWorker {
+            worker_id,
+            gpu,
+            link,
+            token,
+            db,
+            vision_config,
+        } => run_vision_worker_mode(
+            *worker_id,
+            *gpu,
+            link.clone(),
+            token.clone(),
+            db.clone(),
+            vision_config.clone(),
+        ),
+    }
+}
+
+/// Boots the slim vision-worker runtime (docs/VISION_WORKER_SHARDING.md Stage
+/// A). Every parameter arrives via CLI args from the spawning supervisor —
+/// there is no environment contract for this mode. The `[vision]` settings
+/// travel as `--vision-config` JSON and are frozen BEFORE anything vision runs.
+fn run_vision_worker_mode(
+    worker_id: u32,
+    gpu: i32,
+    link: PathBuf,
+    token: String,
+    db: Option<PathBuf>,
+    vision_config: Option<String>,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let vision: tentaflow_core::config::VisionConfig = match vision_config.as_deref() {
+            Some(json) => serde_json::from_str(json)
+                .map_err(|e| anyhow::anyhow!("parse --vision-config JSON: {e}"))?,
+            None => tentaflow_core::config::VisionConfig::default(),
+        };
+        tentaflow_core::vision::settings::init(vision)
+            .map_err(|e| anyhow::anyhow!("freeze vision settings: {e}"))?;
+        let db_path = db.unwrap_or_else(tentaflow_core::paths::database_path);
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all();
+        // Same reasoning as the server runtime: GStreamer/CUDA pipeline builds
+        // overflow the default 2 MiB worker stacks.
+        builder.thread_stack_size(16 * 1024 * 1024);
+        let runtime = builder.build()?;
+        runtime.block_on(tentaflow_core::vision_worker::run_vision_worker(
+            tentaflow_core::vision_worker::VisionWorkerConfig {
+                worker_id,
+                gpu,
+                link_path: link,
+                token,
+                db_path,
+            },
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (worker_id, gpu, link, token, db, vision_config);
+        anyhow::bail!("vision-worker mode requires Unix domain sockets (Linux/macOS only)")
     }
 }
 

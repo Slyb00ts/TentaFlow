@@ -22,12 +22,11 @@ pub mod conversation_history;
 pub mod document_merge;
 pub mod document_parse;
 pub mod document_router;
-pub mod platform_switch;
 pub mod embed_chunks;
 pub mod embeddings;
-pub mod graphic_elements;
 #[cfg(feature = "graph")]
 pub mod graph_search;
+pub mod graphic_elements;
 pub mod interval;
 pub mod llm;
 pub mod loop_block;
@@ -44,14 +43,15 @@ pub mod page_detect_pages;
 pub mod pdf_rasterize;
 pub mod persist_turn;
 pub mod pii_filter;
+pub mod platform_switch;
 pub mod rag_graphrag;
 pub mod rag_multihop;
 pub mod reranker;
 pub mod sentence_buffer;
 pub mod session_context;
 pub mod spawn;
-pub mod store;
 pub mod speaker_context;
+pub mod store;
 pub mod stt;
 pub mod subagent_status;
 pub mod subflow;
@@ -86,12 +86,11 @@ pub use conversation_history::ConversationHistoryNodeAdapter;
 pub use document_merge::DocumentMergeNodeAdapter;
 pub use document_parse::DocumentParseNodeAdapter;
 pub use document_router::DocumentRouterNodeAdapter;
-pub use platform_switch::PlatformSwitchNodeAdapter;
 pub use embed_chunks::EmbedChunksNodeAdapter;
 pub use embeddings::EmbeddingsNodeAdapter;
-pub use graphic_elements::GraphicElementsNodeAdapter;
 #[cfg(feature = "graph")]
 pub use graph_search::GraphSearchNodeAdapter;
+pub use graphic_elements::GraphicElementsNodeAdapter;
 pub use interval::IntervalNodeAdapter;
 pub use llm::LlmNodeAdapter;
 pub use loop_block::LoopNodeAdapter;
@@ -99,9 +98,7 @@ pub use map_block::MapNodeAdapter;
 pub use memory::MemoryNodeAdapter;
 pub use ocr::OcrNodeAdapter;
 pub use ocr_pages::OcrPagesNodeAdapter;
-pub use office_extract::{
-    ExcelExtractNodeAdapter, PptxExtractNodeAdapter, WordExtractNodeAdapter,
-};
+pub use office_extract::{ExcelExtractNodeAdapter, PptxExtractNodeAdapter, WordExtractNodeAdapter};
 pub use on_subagent_complete::{CompletionFilter, OnSubagentCompleteNodeAdapter};
 pub use output::OutputNodeAdapter;
 pub use page_detect::PageDetectNodeAdapter;
@@ -109,10 +106,10 @@ pub use page_detect_pages::PageDetectPagesNodeAdapter;
 pub use pdf_rasterize::PdfRasterizeNodeAdapter;
 pub use persist_turn::PersistTurnNodeAdapter;
 pub use pii_filter::PiiFilterNodeAdapter;
+pub use platform_switch::PlatformSwitchNodeAdapter;
 pub use rag_graphrag::{RagGraphFactsNodeAdapter, RagGraphSeedNodeAdapter};
 pub use rag_multihop::{
-    RagAccumulateNodeAdapter, RagFinalizeNodeAdapter, RagJudgeNodeAdapter,
-    RagQuerySeedNodeAdapter,
+    RagAccumulateNodeAdapter, RagFinalizeNodeAdapter, RagJudgeNodeAdapter, RagQuerySeedNodeAdapter,
 };
 pub use reranker::RerankerNodeAdapter;
 pub use sentence_buffer::SentenceBufferNodeAdapter;

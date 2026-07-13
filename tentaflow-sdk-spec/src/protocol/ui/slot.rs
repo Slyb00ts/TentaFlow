@@ -63,13 +63,10 @@ impl<C> Encode<C> for SlotDefault {
 }
 
 impl<'b, C> Decode<'b, C> for SlotDefault {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut fragment: Option<Component> = None;
         for _ in 0..len {
@@ -149,13 +146,10 @@ impl<C> Encode<C> for CachePolicy {
 }
 
 impl<'b, C> Decode<'b, C> for CachePolicy {
-    fn decode(
-        d: &mut Decoder<'b>,
-        _ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut value: Option<u32> = None;
         for _ in 0..len {
@@ -236,13 +230,10 @@ impl<C> Encode<C> for SlotVisibility {
 }
 
 impl<'b, C> Decode<'b, C> for SlotVisibility {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut path: Option<StatePath> = None;
         for _ in 0..len {
@@ -257,8 +248,8 @@ impl<'b, C> Decode<'b, C> for SlotVisibility {
                 }
             }
         }
-        let kind = kind
-            .ok_or_else(|| minicbor::decode::Error::message("SlotVisibility missing kind"))?;
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("SlotVisibility missing kind"))?;
         match kind.as_str() {
             "always" => {
                 if path.is_some() {

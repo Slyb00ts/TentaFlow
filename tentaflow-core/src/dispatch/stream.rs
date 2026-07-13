@@ -181,10 +181,12 @@ fn stream_subscribe_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
         // Sprzatanie wpisu semafora: usuwamy tylko gdy nikt inny nie trzyma
         // Arc (mapa ma jedyna referencje) i wszystkie permity sa wolne —
         // inaczej churn wielu uzytkownikow zostawialby wpisy do restartu.
-        SUBSCRIBE_AUTH_SEMS.get_or_init(DashMap::new).remove_if(&user_id, |_, sem| {
-            Arc::strong_count(sem) == 1
-                && sem.available_permits() == MAX_CONCURRENT_SUBSCRIBE_AUTH
-        });
+        SUBSCRIBE_AUTH_SEMS
+            .get_or_init(DashMap::new)
+            .remove_if(&user_id, |_, sem| {
+                Arc::strong_count(sem) == 1
+                    && sem.available_permits() == MAX_CONCURRENT_SUBSCRIBE_AUTH
+            });
         let hub_key = match auth_result {
             Ok(Ok(key)) => key,
             Ok(Err(err)) => {
@@ -538,8 +540,7 @@ fn register_local_lidar_source(robot_id: &str) -> String {
     let hub_key = format!("{}{}", LIDAR_PREFIX, robot_id);
     let robot_id = robot_id.to_string();
     let factory = Box::new(move || {
-        let source =
-            crate::services::lidar_push::LocalLidarStreamSource::new(robot_id.clone());
+        let source = crate::services::lidar_push::LocalLidarStreamSource::new(robot_id.clone());
         Ok(source as Arc<dyn crate::services::stream_hub::BinaryStreamSource>)
     });
     let _ = StreamHub::global().register_factory(hub_key.clone(), factory);
@@ -659,10 +660,7 @@ fn register_remote_lidar_relay(
 /// (minted in `addon::lifecycle::unique_instance_id` as `{package_id}-{uuid}`,
 /// and a robot row is single-org), so org-scoping the resolution here — not the
 /// hub key — is sufficient. See the `LidarStreamHub` header for the full invariant.
-fn enforce_lidar_subscribe(
-    ctx: &HandlerContext,
-    robot_id: &str,
-) -> Result<String, ProtocolError> {
+fn enforce_lidar_subscribe(ctx: &HandlerContext, robot_id: &str) -> Result<String, ProtocolError> {
     if robot_id.is_empty() {
         return Err(ProtocolError::bad_request("stream_id missing robot id"));
     }
@@ -684,7 +682,10 @@ fn enforce_lidar_subscribe(
         .find(|r| r.org_id == org.org_id && r.robot_id == robot_id)
         .ok_or_else(|| {
             // Unknown-in-org: never leak existence across org boundaries.
-            ProtocolError::not_found(format!("stream_not_registered: {}{}", LIDAR_PREFIX, robot_id))
+            ProtocolError::not_found(format!(
+                "stream_not_registered: {}{}",
+                LIDAR_PREFIX, robot_id
+            ))
         })?;
 
     if robot.node_id != local_node_id {
@@ -698,13 +699,15 @@ fn enforce_lidar_subscribe(
         // unknown-in-org so a caller cannot distinguish "remote robot exists" from
         // "no such robot" — leaking that would expose mesh topology.
         return match remote_lidar_owner(&local_node_id, &org.org_id, robot_id) {
-            Some(owner_node) => match register_remote_lidar_relay(ctx, org, robot_id, &owner_node) {
-                Some(hub_key) => Ok(hub_key),
-                None => Err(ProtocolError::not_found(format!(
-                    "stream_not_registered: {}{}",
-                    LIDAR_PREFIX, robot_id
-                ))),
-            },
+            Some(owner_node) => {
+                match register_remote_lidar_relay(ctx, org, robot_id, &owner_node) {
+                    Some(hub_key) => Ok(hub_key),
+                    None => Err(ProtocolError::not_found(format!(
+                        "stream_not_registered: {}{}",
+                        LIDAR_PREFIX, robot_id
+                    ))),
+                }
+            }
             None => {
                 tracing::debug!(
                     robot_id = %robot_id,
@@ -746,7 +749,10 @@ fn enforce_scene_subscribe(ctx: &HandlerContext, robot_id: &str) -> Result<Strin
         .into_iter()
         .find(|r| r.org_id == org.org_id && r.robot_id == robot_id)
         .ok_or_else(|| {
-            ProtocolError::not_found(format!("stream_not_registered: {}{}", SCENE_PREFIX, robot_id))
+            ProtocolError::not_found(format!(
+                "stream_not_registered: {}{}",
+                SCENE_PREFIX, robot_id
+            ))
         })?;
     if robot.node_id != local_node_id {
         return Err(ProtocolError::not_found(format!(

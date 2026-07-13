@@ -182,7 +182,13 @@ impl ScanVerdict {
 // hidden text. Each entry is (regex, id, severity, category, description).
 // ---------------------------------------------------------------------------
 
-type RawPattern = (&'static str, &'static str, &'static str, &'static str, &'static str);
+type RawPattern = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+);
 
 const INJECTION_PATTERNS: &[RawPattern] = &[
     // Prompt injection.
@@ -314,8 +320,9 @@ fn compiled_patterns() -> &'static [(Regex, &'static RawPattern)] {
         INJECTION_PATTERNS
             .iter()
             .map(|p| {
-                let re = Regex::new(p.0)
-                    .unwrap_or_else(|e| panic!("invalid skills-hub injection pattern '{}': {e}", p.1));
+                let re = Regex::new(p.0).unwrap_or_else(|e| {
+                    panic!("invalid skills-hub injection pattern '{}': {e}", p.1)
+                });
                 (re, p)
             })
             .collect()
@@ -510,8 +517,8 @@ fn collect_github_dir(
         encode_path(dir_path),
     );
     let (_ct, body) = fetch_raw(&url)?;
-    let entries: Vec<GithubEntry> = serde_json::from_str(&body)
-        .map_err(|e| anyhow!("GitHub reference listing failed: {e}"))?;
+    let entries: Vec<GithubEntry> =
+        serde_json::from_str(&body).map_err(|e| anyhow!("GitHub reference listing failed: {e}"))?;
     for entry in entries {
         if entry.name.eq_ignore_ascii_case("scripts") {
             return Err(anyhow!(
@@ -525,10 +532,7 @@ fn collect_github_dir(
             };
             let (_ct, content) = fetch_raw(&download)?;
             let rel = relative_path(skill_root, &entry.path);
-            out.push(FetchedFile {
-                path: rel,
-                content,
-            });
+            out.push(FetchedFile { path: rel, content });
         }
         // One level deep is enough for references/templates; deeper nesting is
         // not part of the registry's flat reference model.
@@ -637,8 +641,8 @@ fn search_github_tap(
         encode_path(path),
     );
     let (_ct, body) = fetch_raw(&url)?;
-    let entries: Vec<GithubEntry> = serde_json::from_str(&body)
-        .map_err(|e| anyhow!("tap listing was not a directory: {e}"))?;
+    let entries: Vec<GithubEntry> =
+        serde_json::from_str(&body).map_err(|e| anyhow!("tap listing was not a directory: {e}"))?;
 
     let mut out = Vec::new();
     for dir in entries.iter().filter(|e| e.kind == "dir") {
@@ -838,7 +842,10 @@ mod tests {
         let raw = "---\nname: pdf-extract\ndescription: Extract text from PDFs\ntags: [pdf, ocr]\n---\n# Body\n";
         let parsed = parse_skill_md(raw);
         assert_eq!(parsed.name.as_deref(), Some("pdf-extract"));
-        assert_eq!(parsed.description.as_deref(), Some("Extract text from PDFs"));
+        assert_eq!(
+            parsed.description.as_deref(),
+            Some("Extract text from PDFs")
+        );
         assert_eq!(parsed.tags, vec!["pdf".to_string(), "ocr".to_string()]);
         assert_eq!(parsed.body.trim(), "# Body");
     }

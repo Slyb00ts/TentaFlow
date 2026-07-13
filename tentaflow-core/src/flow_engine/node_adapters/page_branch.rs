@@ -48,7 +48,10 @@ pub(crate) fn parse_page_blobs(envelope: &FlowEnvelope) -> Result<Vec<PageBlob>>
 
     let mut out = Vec::with_capacity(items.len());
     for (i, item) in items.iter().enumerate() {
-        let index = item.get("index").and_then(|v| v.as_u64()).unwrap_or(i as u64);
+        let index = item
+            .get("index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(i as u64);
         let id = item
             .get("blob_id")
             .and_then(|v| v.as_str())

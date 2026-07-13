@@ -207,8 +207,10 @@ impl NodeAdapter for RagQuerySeedNodeAdapter {
         out.meta
             .entry(META_ORIGINAL_QUESTION.to_string())
             .or_insert_with(|| Value::String(current.clone()));
-        out.meta
-            .insert(META_CURRENT_QUERY.to_string(), Value::String(current.clone()));
+        out.meta.insert(
+            META_CURRENT_QUERY.to_string(),
+            Value::String(current.clone()),
+        );
         out.payload = FlowValue::Text(current);
         Ok(out)
     }
@@ -262,10 +264,8 @@ impl NodeAdapter for RagAccumulateNodeAdapter {
         let incoming = passages_from_meta(&out, META_CITATIONS);
         let merged = merge_accumulated(&existing, &incoming);
 
-        out.meta.insert(
-            META_ACCUMULATED.to_string(),
-            Value::Array(merged.clone()),
-        );
+        out.meta
+            .insert(META_ACCUMULATED.to_string(), Value::Array(merged.clone()));
 
         // Payload = kontekst (oryginalne pytanie + zakumulowane pasaże) dla
         // sędziego LLM. Sędzia ocenia, czy STARCZA do odpowiedzi na ORYGINALNE
@@ -474,10 +474,8 @@ impl NodeAdapter for RagFinalizeNodeAdapter {
 
         // Cytaty finalnej odpowiedzi = WSZYSTKIE zakumulowane pasaże (dedup, top
         // wg score) — przepinamy je na rag_citations, bo output emituje stamtąd.
-        out.meta.insert(
-            META_CITATIONS.to_string(),
-            Value::Array(accumulated),
-        );
+        out.meta
+            .insert(META_CITATIONS.to_string(), Value::Array(accumulated));
         Ok(out)
     }
 }
@@ -531,7 +529,8 @@ mod tests {
     #[test]
     fn merge_keeps_existing_when_incoming_score_is_lower() {
         let existing = vec![json!({"doc_id": "d", "chunk_index": 0, "text": "good", "score": 0.8})];
-        let incoming = vec![json!({"doc_id": "d", "chunk_index": 0, "text": "worse", "score": 0.1})];
+        let incoming =
+            vec![json!({"doc_id": "d", "chunk_index": 0, "text": "worse", "score": 0.1})];
         let merged = merge_accumulated(&existing, &incoming);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0]["score"].as_f64(), Some(0.8));
@@ -544,7 +543,11 @@ mod tests {
             .map(|i| json!({"doc_id": "d", "chunk_index": i, "text": "t", "score": i as f64}))
             .collect();
         let merged = merge_accumulated(&[], &incoming);
-        assert_eq!(merged.len(), MAX_ACCUMULATED, "cap całkowitej liczby pasaży");
+        assert_eq!(
+            merged.len(),
+            MAX_ACCUMULATED,
+            "cap całkowitej liczby pasaży"
+        );
         // Top po score — najwyższy chunk_index (= najwyższy score) pierwszy.
         assert_eq!(
             merged[0]["chunk_index"].as_i64(),
@@ -615,7 +618,9 @@ mod tests {
             .unwrap();
         assert_eq!(out.payload.as_text(), Some("oryginalne pytanie"));
         assert_eq!(
-            out.meta.get(META_ORIGINAL_QUESTION).and_then(|v| v.as_str()),
+            out.meta
+                .get(META_ORIGINAL_QUESTION)
+                .and_then(|v| v.as_str()),
             Some("oryginalne pytanie")
         );
         assert_eq!(
@@ -630,10 +635,8 @@ mod tests {
         // Drugi hop: payload to śmieci po poprzednim output, ale meta niesie
         // pod-pytanie i oryginalne pytanie.
         env.payload = FlowValue::Text("stary output".into());
-        env.meta.insert(
-            META_ORIGINAL_QUESTION.into(),
-            json!("oryginalne pytanie"),
-        );
+        env.meta
+            .insert(META_ORIGINAL_QUESTION.into(), json!("oryginalne pytanie"));
         env.meta
             .insert(META_CURRENT_QUERY.into(), json!("pod-pytanie hop 2"));
         let out = RagQuerySeedNodeAdapter::new()
@@ -643,7 +646,9 @@ mod tests {
         assert_eq!(out.payload.as_text(), Some("pod-pytanie hop 2"));
         // Oryginalne pytanie NIE zostaje nadpisane pod-pytaniem.
         assert_eq!(
-            out.meta.get(META_ORIGINAL_QUESTION).and_then(|v| v.as_str()),
+            out.meta
+                .get(META_ORIGINAL_QUESTION)
+                .and_then(|v| v.as_str()),
             Some("oryginalne pytanie")
         );
     }
@@ -663,7 +668,11 @@ mod tests {
             .execute(&node("rag_accumulate"), &[input(env)], &stub_ctx())
             .await
             .unwrap();
-        let acc1 = out1.meta.get(META_ACCUMULATED).and_then(|v| v.as_array()).unwrap();
+        let acc1 = out1
+            .meta
+            .get(META_ACCUMULATED)
+            .and_then(|v| v.as_array())
+            .unwrap();
         assert_eq!(acc1.len(), 1);
 
         // Hop 2: meta z hopu 1 (akumulacja przetrwała) + nowy cytat [d2#0].
@@ -676,7 +685,11 @@ mod tests {
             .execute(&node("rag_accumulate"), &[input(env2)], &stub_ctx())
             .await
             .unwrap();
-        let acc2 = out2.meta.get(META_ACCUMULATED).and_then(|v| v.as_array()).unwrap();
+        let acc2 = out2
+            .meta
+            .get(META_ACCUMULATED)
+            .and_then(|v| v.as_array())
+            .unwrap();
         assert_eq!(acc2.len(), 2, "akumulacja rośnie między hopami");
         // Payload to kontekst dla sędziego — zawiera pytanie i oba pasaże.
         let ctx_text = out2.payload.as_text().unwrap();
@@ -703,8 +716,7 @@ mod tests {
     #[tokio::test]
     async fn judge_sets_next_query_when_not_enough() {
         let mut env = FlowEnvelope::empty();
-        env.payload =
-            FlowValue::Text(r#"{"enough": false, "next_query": "dalej"}"#.into());
+        env.payload = FlowValue::Text(r#"{"enough": false, "next_query": "dalej"}"#.into());
         let out = RagJudgeNodeAdapter::new()
             .execute(&node("rag_judge"), &[input(env)], &stub_ctx())
             .await
@@ -722,9 +734,7 @@ mod tests {
         // adapter przycina je do MAX_NEXT_QUERY_CHARS przed zapisem do meta.
         let long = "a".repeat(MAX_NEXT_QUERY_CHARS + 500);
         let mut env = FlowEnvelope::empty();
-        env.payload = FlowValue::Text(
-            json!({"enough": false, "next_query": long}).to_string(),
-        );
+        env.payload = FlowValue::Text(json!({"enough": false, "next_query": long}).to_string());
         let out = RagJudgeNodeAdapter::new()
             .execute(&node("rag_judge"), &[input(env)], &stub_ctx())
             .await
@@ -747,8 +757,7 @@ mod tests {
         // Brak sensownego pod-pytania (po trim puste) → kończymy pętlę zamiast
         // odpalać kolejny hop z pustym zapytaniem.
         let mut env = FlowEnvelope::empty();
-        env.payload =
-            FlowValue::Text(r#"{"enough": false, "next_query": "   "}"#.into());
+        env.payload = FlowValue::Text(r#"{"enough": false, "next_query": "   "}"#.into());
         let out = RagJudgeNodeAdapter::new()
             .execute(&node("rag_judge"), &[input(env)], &stub_ctx())
             .await
@@ -784,7 +793,11 @@ mod tests {
             .await
             .unwrap();
         // rag_citations = zakumulowane pasaże (output je wyemituje).
-        let cites = out.meta.get(META_CITATIONS).and_then(|v| v.as_array()).unwrap();
+        let cites = out
+            .meta
+            .get(META_CITATIONS)
+            .and_then(|v| v.as_array())
+            .unwrap();
         assert_eq!(cites.len(), 2);
         assert_eq!(cites[0]["doc_id"], "d1");
         // Payload to kontekst dla finalnego LLM (pytanie + pasaże).
@@ -799,7 +812,9 @@ mod tests {
     /// walidację R1–R10 z rejestrem wszystkich adapterów (w tym nowych węzłów
     /// multi-hop). To strażnik kontraktu: flow nie wejdzie do produkcji
     /// (register_engine_flows woła tę samą `validate`), jeśli kształt jest zły.
-    fn validate_flow_json(json: &str) -> Result<(), crate::flow_engine::validation::FlowValidationError> {
+    fn validate_flow_json(
+        json: &str,
+    ) -> Result<(), crate::flow_engine::validation::FlowValidationError> {
         let def: crate::flow_engine::types::FlowDefinition =
             serde_json::from_str(json).expect("flow JSON parsuje się do FlowDefinition");
         let registry = crate::flow_engine::dispatcher::build_registry_for_test();
@@ -830,15 +845,17 @@ mod tests {
     #[test]
     fn outer_flow_loop_config_is_capped_multihop() {
         let json = include_str!("../../../addons/rag/flows/query.flow.json");
-        let def: crate::flow_engine::types::FlowDefinition =
-            serde_json::from_str(json).unwrap();
+        let def: crate::flow_engine::types::FlowDefinition = serde_json::from_str(json).unwrap();
         let loop_node = def
             .nodes
             .iter()
             .find(|n| n.node_type == "loop")
             .expect("outer flow ma węzeł loop");
         assert_eq!(
-            loop_node.config.get("body_flow_engine_id").and_then(|v| v.as_str()),
+            loop_node
+                .config
+                .get("body_flow_engine_id")
+                .and_then(|v| v.as_str()),
             Some("retrieval-round"),
             "loop wskazuje na body retrieval-round przez engine-flow id"
         );
@@ -847,7 +864,10 @@ mod tests {
             .get("max_iterations")
             .and_then(|v| v.as_u64())
             .expect("loop ma max_iterations");
-        assert!(max_iter >= 1 && max_iter <= 4, "max_iterations capnięte do <=4: {max_iter}");
+        assert!(
+            max_iter >= 1 && max_iter <= 4,
+            "max_iterations capnięte do <=4: {max_iter}"
+        );
         assert_eq!(
             loop_node.config.get("until").and_then(|v| v.as_str()),
             Some("has(meta.harness_done) && meta.harness_done == true"),

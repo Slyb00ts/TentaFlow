@@ -1013,6 +1013,10 @@ tf-tabs {
   padding: 12px 14px;
   text-align: left;
   vertical-align: middle;
+  /* Honour explicit `\n` in text cells (e.g. the recordings "Odczyty" multi-line
+     reads) without affecting single-line cells: `pre-line` only breaks on hard
+     newlines and still collapses incidental whitespace. */
+  white-space: pre-line;
 }
 .tf-table thead th {
   background: var(--tf-bg-2);
@@ -1158,6 +1162,17 @@ tf-tabs {
   font: inherit;
 }
 .tf-table__page-btn[disabled] { opacity: 0.4; cursor: not-allowed; }
+/* Inline thumbnail cell (renderer="img"): fixed small box, contain-fit so a
+   full-frame scene thumbnail keeps its aspect without cropping the plate/ADR. */
+.tf-table__thumb {
+  display: block;
+  width: 96px;
+  height: 54px;
+  object-fit: contain;
+  background: var(--tf-bg-input);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-sm, 0.25rem);
+}
 .tf-table__page-info { font-variant-numeric: tabular-nums; color: var(--tf-text-3); font-size: 0.9em; }
 .tf-table__page-size {
   background: var(--tf-bg-input);

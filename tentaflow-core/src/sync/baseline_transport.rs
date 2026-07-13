@@ -43,8 +43,7 @@ use crate::mesh::security::MeshSecurity;
 use crate::sync::core_baseline::{
     begin_adopt_atomic, build_baseline_header, capture_baseline_snapshot, chunk_snapshot,
     decide_roles, decide_roles_by_content, deserialize_snapshot, import_baseline, load_adopt_state,
-    local_role,
-    reassemble_chunks, serialize_snapshot, store_adopt_state, validate_ack_agreement,
+    local_role, reassemble_chunks, serialize_snapshot, store_adopt_state, validate_ack_agreement,
     BaselineAdoptState, BaselineImportReport, BaselinePhase, BaselineRole, BeginOutcome,
     BASELINE_MAX_TOTAL_BYTES,
 };

@@ -674,7 +674,11 @@ fn catalog_tabs_emit_canonical_slot_content() {
                 assert_eq!(slot.panel_id, "main");
                 assert_eq!(slot.slot_id, "content");
             }
-            other => panic!("tab '{}': expected SlotContent, got tag {:?}", tab, other.tag()),
+            other => panic!(
+                "tab '{}': expected SlotContent, got tag {:?}",
+                tab,
+                other.tag()
+            ),
         }
     }
 }

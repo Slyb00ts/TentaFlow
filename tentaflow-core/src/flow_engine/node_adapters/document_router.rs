@@ -204,7 +204,10 @@ mod tests {
     #[tokio::test]
     async fn routes_text_and_unknown() {
         let ctx = stub_ctx();
-        assert_eq!(route_port(&ctx, "text/plain", b"hello".to_vec()).await, "text");
+        assert_eq!(
+            route_port(&ctx, "text/plain", b"hello".to_vec()).await,
+            "text"
+        );
         assert_eq!(
             route_port(&ctx, "application/x-tar", b"random".to_vec()).await,
             "unknown"

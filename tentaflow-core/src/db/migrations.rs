@@ -607,6 +607,21 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "strip_pii_from_default_chat_flow",
             MigrationStep::Rust(strip_pii_from_default_chat_flow),
         ),
+        (
+            114,
+            "cameras_vision_worker_slot",
+            MigrationStep::Rust(cameras_add_vision_worker_slot_column),
+        ),
+        (
+            115,
+            "recordings_event_meta",
+            MigrationStep::Rust(recordings_add_event_meta_column),
+        ),
+        (
+            116,
+            "recordings_search_columns",
+            MigrationStep::Rust(recordings_add_search_columns),
+        ),
     ]
 }
 
@@ -712,7 +727,11 @@ fn benchmark_add_permissions(conn: &Connection) -> Result<()> {
 // the same grants at a fresh version; `roles_add_permissions` is idempotent, so fresh
 // installs (which already got v87) are a no-op.
 fn ensure_token_permissions(conn: &Connection) -> Result<()> {
-    roles_add_permissions(conn, &["org_admin", "dpo"], &["tokens.read", "tokens.write"])?;
+    roles_add_permissions(
+        conn,
+        &["org_admin", "dpo"],
+        &["tokens.read", "tokens.write"],
+    )?;
     roles_add_permissions(conn, &["org_operator", "org_viewer"], &["tokens.read"])?;
     Ok(())
 }
@@ -1051,7 +1070,9 @@ fn cameras_add_depth_extrinsics_columns(conn: &Connection) -> Result<()> {
         )?;
     }
     if !column_exists(conn, "cameras", "depth_scale")? {
-        conn.execute_batch("ALTER TABLE cameras ADD COLUMN depth_scale REAL NOT NULL DEFAULT 1.0;")?;
+        conn.execute_batch(
+            "ALTER TABLE cameras ADD COLUMN depth_scale REAL NOT NULL DEFAULT 1.0;",
+        )?;
     }
     Ok(())
 }
@@ -1182,11 +1203,7 @@ fn token_metrics_add_permissions(conn: &Connection) -> Result<()> {
         &["org_admin", "dpo"],
         &["tokens.read", "tokens.write"],
     )?;
-    roles_add_permissions(
-        conn,
-        &["org_operator", "org_viewer"],
-        &["tokens.read"],
-    )?;
+    roles_add_permissions(conn, &["org_operator", "org_viewer"], &["tokens.read"])?;
     Ok(())
 }
 
@@ -1477,6 +1494,64 @@ fn cameras_add_depth_pose_source_column(conn: &Connection) -> Result<()> {
 /// the native frame cadence); the default of `10` matches
 /// `CAMERA_DEFAULT_ANALYSIS_FPS`. Idempotent — guarded by a column probe so a
 /// re-run on an already-migrated database is a no-op.
+/// Adds `vision_worker_slot` to `cameras` — the vision-worker sharding slot
+/// (docs/VISION_WORKER_SHARDING.md Stage B). NULL = the camera runs in-process
+/// on the core; a non-NULL slot means the camera is owned by that vision
+/// worker. The core is the ONLY writer of this column (assignment authority);
+/// workers act solely on AssignCamera/RemoveCamera link commands and never
+/// read it. Idempotent — guarded by a column probe.
+fn cameras_add_vision_worker_slot_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "cameras", "vision_worker_slot")? {
+        conn.execute_batch("ALTER TABLE cameras ADD COLUMN vision_worker_slot INTEGER NULL;")?;
+    }
+    Ok(())
+}
+
+/// Adds `event_meta` to `recordings` — a nullable JSON blob written by the
+/// per-vehicle event recorder (`services/event_recorder.rs`): trigger classes,
+/// plate/ADR OCR votes, condition flags and the event's start/stop wall-clock
+/// range. NULL for every addon-saved snapshot/segment. `json_valid` is enforced
+/// at write time by the recorder (single writer), not by a CHECK, so the ALTER
+/// stays a cheap in-place column add. Idempotent — guarded by a column probe.
+fn recordings_add_event_meta_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "recordings", "event_meta")? {
+        conn.execute_batch("ALTER TABLE recordings ADD COLUMN event_meta TEXT NULL;")?;
+    }
+    Ok(())
+}
+
+/// Adds the four search/thumbnail columns to `recordings`, all nullable and
+/// written only by the per-vehicle event recorder at finalize:
+///   * `plate_text` / `adr_text` — the gated OCR winner strings for the event
+///     (NULL when unreadable), used by the recordings-browser LIKE search.
+///   * `plate_thumb_ref` / `adr_thumb_ref` — snapshot refs of the FULL downscaled
+///     camera frame captured at the highest-confidence plate/ADR read of the
+///     event (whole scene, not a crop), rendered as list thumbnails.
+/// `created_at` already carries `idx_recordings_owner`/`idx_recordings_camera`
+/// (both begin with a purged-scan column, not `created_at`), so an explicit
+/// `created_at` index backs the date-range filter's `ORDER BY`/range scan.
+/// A `%plate%` LIKE cannot use an index, but the per-addon row count is small
+/// (event clips, not raw frames) so a scan of the owner-scoped subset is fine.
+/// Idempotent — every add is guarded by a column probe.
+fn recordings_add_search_columns(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "recordings", "plate_text")? {
+        conn.execute_batch("ALTER TABLE recordings ADD COLUMN plate_text TEXT NULL;")?;
+    }
+    if !column_exists(conn, "recordings", "adr_text")? {
+        conn.execute_batch("ALTER TABLE recordings ADD COLUMN adr_text TEXT NULL;")?;
+    }
+    if !column_exists(conn, "recordings", "plate_thumb_ref")? {
+        conn.execute_batch("ALTER TABLE recordings ADD COLUMN plate_thumb_ref TEXT NULL;")?;
+    }
+    if !column_exists(conn, "recordings", "adr_thumb_ref")? {
+        conn.execute_batch("ALTER TABLE recordings ADD COLUMN adr_thumb_ref TEXT NULL;")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_recordings_created_at ON recordings(created_at);",
+    )?;
+    Ok(())
+}
+
 fn cameras_add_analysis_fps_column(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "cameras", "analysis_fps")? {
         conn.execute_batch(

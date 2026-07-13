@@ -222,7 +222,10 @@ impl AgentService {
         tool_name: &str,
         user_id: &str,
     ) -> crate::addon::permissions::PermissionResult {
-        let addon_id = tool_name.split_once('.').map(|(a, _)| a).unwrap_or(tool_name);
+        let addon_id = tool_name
+            .split_once('.')
+            .map(|(a, _)| a)
+            .unwrap_or(tool_name);
         self.addon_manager
             .permission_checker()
             .check(addon_id, user_id, "llm", None)
@@ -239,9 +242,18 @@ impl AgentService {
         global: bool,
         actor_user_id: Option<&str>,
     ) -> Result<()> {
-        let addon_id = tool_name.split_once('.').map(|(a, _)| a).unwrap_or(tool_name);
+        let addon_id = tool_name
+            .split_once('.')
+            .map(|(a, _)| a)
+            .unwrap_or(tool_name);
         if global {
-            repository::upsert_permission_default(&self.db, addon_id, "llm", "allow", actor_user_id)?;
+            repository::upsert_permission_default(
+                &self.db,
+                addon_id,
+                "llm",
+                "allow",
+                actor_user_id,
+            )?;
         } else {
             repository::upsert_permission(
                 &self.db,
@@ -254,7 +266,9 @@ impl AgentService {
             )?;
         }
         // Refresh the proactive cache so the retried call sees the grant.
-        self.addon_manager.permission_checker().refresh_addon(addon_id);
+        self.addon_manager
+            .permission_checker()
+            .refresh_addon(addon_id);
         Ok(())
     }
 
@@ -396,8 +410,22 @@ mod tests {
     #[tokio::test]
     async fn skill_index_resolves_names_and_tags_deduplicated_and_sorted() {
         let pool = db();
-        seed_skill_full(&pool, "id-a", "alpha", "Alpha skill", r#"["research"]"#, "active");
-        seed_skill_full(&pool, "id-b", "beta", "Beta skill", r#"["research"]"#, "active");
+        seed_skill_full(
+            &pool,
+            "id-a",
+            "alpha",
+            "Alpha skill",
+            r#"["research"]"#,
+            "active",
+        );
+        seed_skill_full(
+            &pool,
+            "id-b",
+            "beta",
+            "Beta skill",
+            r#"["research"]"#,
+            "active",
+        );
         seed_skill_full(&pool, "id-c", "gamma", "Gamma skill", "[]", "disabled");
         let svc = service(pool);
 

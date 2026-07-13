@@ -240,17 +240,10 @@ pub async fn dispatch(
         // jest tu zawsze instancją addona. Executor przepisze to do
         // `FlowRequestMeta` dla `ResolvedExecutionTarget::Flow`.
         let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(None)
-            .with_addon_identity(
-                Some(req.caller.addon_id.clone()),
-                req.caller.org_id.clone(),
-            );
-        let routed = route_alias_via_executor(
-            executor,
-            &service_name,
-            &req.payload_json,
-            &mut exec_ctx,
-        )
-        .await;
+            .with_addon_identity(Some(req.caller.addon_id.clone()), req.caller.org_id.clone());
+        let routed =
+            route_alias_via_executor(executor, &service_name, &req.payload_json, &mut exec_ctx)
+                .await;
         let duration_ms = started.elapsed().as_millis() as i64;
         let request_id = uuid::Uuid::new_v4().to_string();
 

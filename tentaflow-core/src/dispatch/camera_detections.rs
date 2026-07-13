@@ -123,9 +123,8 @@ fn authorize(ctx: &HandlerContext, camera_id: &str) -> Result<String, ProtocolEr
     if !validate_camera_id(camera_id) {
         return Err(ProtocolError::bad_request("camera_id_invalid_format"));
     }
-    let exists =
-        crate::db::repository::camera_exists_in_org(&ctx.state.db, camera_id, &org.org_id)
-            .map_err(|e| ProtocolError::internal(format!("camera lookup failed: {e}")))?;
+    let exists = crate::db::repository::camera_exists_in_org(&ctx.state.db, camera_id, &org.org_id)
+        .map_err(|e| ProtocolError::internal(format!("camera lookup failed: {e}")))?;
     if !exists {
         // Static reason — never echo the camera id (cross-tenant probe defense).
         return Err(ProtocolError::not_found("camera_not_found"));
@@ -152,6 +151,7 @@ fn item_to_wire(d: Detection) -> DetectionItem {
         score: d.score,
         stan: d.stan,
         tekst: d.tekst,
+        tekst_conf: d.tekst_conf,
         track_id: d.track_id,
         vx: d.vx,
         vy: d.vy,
@@ -182,30 +182,41 @@ fn camera_detections_subscribe_handler(
         // ACL siega do rusqlite (camera_exists_in_org, sync) — biegnie na puli
         // blocking, zeby nie blokowac watkow tokio.
         let auth_camera_id = camera_id.clone();
-        let camera_id = match tokio::task::spawn_blocking(move || authorize(&ctx, &auth_camera_id))
-            .await
-        {
-            Ok(Ok(id)) => id,
-            Ok(Err(err)) => {
-                let _ = push_end(&sub, Some(MessageBody::Error(err)));
-                return;
-            }
-            Err(e) => {
-                let _ = push_end(
-                    &sub,
-                    Some(MessageBody::Error(ProtocolError::internal(format!(
-                        "camera authorization task failed: {e}"
-                    )))),
-                );
-                return;
-            }
-        };
+        let camera_id =
+            match tokio::task::spawn_blocking(move || authorize(&ctx, &auth_camera_id)).await {
+                Ok(Ok(id)) => id,
+                Ok(Err(err)) => {
+                    let _ = push_end(&sub, Some(MessageBody::Error(err)));
+                    return;
+                }
+                Err(e) => {
+                    let _ = push_end(
+                        &sub,
+                        Some(MessageBody::Error(ProtocolError::internal(format!(
+                            "camera authorization task failed: {e}"
+                        )))),
+                    );
+                    return;
+                }
+            };
 
         // Production path: start the always-on RF-DETR analysis loop for this
         // camera (idempotent — one task per camera regardless of subscribers).
-        // Real detections flow into `detection_bus` and out through this stream.
+        // Real detections flow into `detection_bus` and out through this
+        // stream. A camera owned by the vision-worker fleet runs its analysis
+        // in the worker process, which relays detections into this SAME bus —
+        // starting a local loop too would double-publish overlays.
         #[cfg(feature = "inference-vision-gpu")]
-        crate::services::camera_ingest::vision_analysis::ensure_analysis(&camera_id);
+        {
+            #[cfg(all(unix, feature = "camera"))]
+            let worker_owned =
+                crate::services::vision_worker::fleet::is_worker_camera(&camera_id).is_some();
+            #[cfg(not(all(unix, feature = "camera")))]
+            let worker_owned = false;
+            if !worker_owned {
+                crate::services::camera_ingest::vision_analysis::ensure_analysis(&camera_id);
+            }
+        }
 
         // Dev/test only, behind the env flag (default off): when no real detector
         // publishes for this camera, spawn one synthetic source so the e2e suite
@@ -260,22 +271,27 @@ mod tests {
 
     #[test]
     fn stream_handler_is_registered_and_user_gated() {
-        let meta = crate::dispatch::subscription::find_stream_handler(
-            "CameraDetectionsSubscribeRequest",
-        )
-        .expect("camera-detections stream handler registered in inventory");
+        let meta =
+            crate::dispatch::subscription::find_stream_handler("CameraDetectionsSubscribeRequest")
+                .expect("camera-detections stream handler registered in inventory");
         assert_eq!(meta.required_auth, SessionAuthKind::UserSession);
     }
 
     #[test]
     fn validate_camera_id_accepts_canonical_and_rejects_junk() {
-        assert!(validate_camera_id("cam_550e8400-e29b-41d4-a716-446655440000"));
+        assert!(validate_camera_id(
+            "cam_550e8400-e29b-41d4-a716-446655440000"
+        ));
         assert!(!validate_camera_id("550e8400-e29b-41d4-a716-446655440000"));
         assert!(!validate_camera_id("cam_short"));
         // Version nibble must be 4.
-        assert!(!validate_camera_id("cam_550e8400-e29b-31d4-a716-446655440000"));
+        assert!(!validate_camera_id(
+            "cam_550e8400-e29b-31d4-a716-446655440000"
+        ));
         // Variant nibble must be 8/9/a/b.
-        assert!(!validate_camera_id("cam_550e8400-e29b-41d4-c716-446655440000"));
+        assert!(!validate_camera_id(
+            "cam_550e8400-e29b-41d4-c716-446655440000"
+        ));
     }
 
     #[test]
@@ -293,6 +309,7 @@ mod tests {
             ts_ms: 1_700_000_000_123,
             pts_ns: Some(1_234_567_890),
             proc_ms: 42,
+            enriched: true,
             items: vec![
                 Detection {
                     klasa: "tablica_adr".into(),
@@ -300,7 +317,10 @@ mod tests {
                     score: 0.96,
                     stan: Vec::new(),
                     tekst: Some("30/1202".into()),
+                    tekst_conf: None,
+                    tekst_thumb_ref: None,
                     track_id: 7,
+                    vehicle_id: 0,
                     vx: 0.01,
                     vy: -0.02,
                 },
@@ -310,7 +330,10 @@ mod tests {
                     score: 0.94,
                     stan: vec!["uszkodzona".into()],
                     tekst: None,
+                    tekst_conf: None,
+                    tekst_thumb_ref: None,
                     track_id: 0,
+                    vehicle_id: 0,
                     vx: 0.,
                     vy: 0.,
                 },
@@ -342,13 +365,17 @@ mod tests {
             0,
             None,
             0,
+            true,
             vec![Detection {
                 klasa: "termometr".into(),
                 bbox: [0.1, 0.1, 0.2, 0.2],
                 score: 0.5,
                 stan: Vec::new(),
                 tekst: None,
+                tekst_conf: None,
+                tekst_thumb_ref: None,
                 track_id: 0,
+                vehicle_id: 0,
                 vx: 0.,
                 vy: 0.,
             }],
@@ -370,13 +397,17 @@ mod tests {
                 0,
                 None,
                 0,
+                false,
                 vec![Detection {
                     klasa: "nalepka_9".into(),
                     bbox: [0.0, 0.0, 0.1, 0.1],
                     score: 0.9,
                     stan: Vec::new(),
                     tekst: None,
+                    tekst_conf: None,
+                    tekst_thumb_ref: None,
                     track_id: 0,
+                    vehicle_id: 0,
                     vx: 0.,
                     vy: 0.,
                 }],

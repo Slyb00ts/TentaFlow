@@ -113,8 +113,7 @@ impl NodeAdapter for OutputNodeAdapter {
                     "answer": answer,
                     "citations": citations,
                 });
-                out.payload =
-                    FlowValue::Text(serde_json::to_string(&wrapped).unwrap_or(answer));
+                out.payload = FlowValue::Text(serde_json::to_string(&wrapped).unwrap_or(answer));
             }
         }
         Ok(out)

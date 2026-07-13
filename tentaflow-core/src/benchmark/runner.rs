@@ -35,7 +35,17 @@ pub async fn run_benchmark(
     cancel: Arc<AtomicBool>,
     progress: ProgressFn,
 ) -> Result<()> {
-    match execute(&db, org_id, benchmark_id, run_id, cipher, &cancel, &progress).await {
+    match execute(
+        &db,
+        org_id,
+        benchmark_id,
+        run_id,
+        cipher,
+        &cancel,
+        &progress,
+    )
+    .await
+    {
         Ok(()) => {
             let status = if cancel.load(Ordering::Relaxed) {
                 "cancelled"
@@ -131,15 +141,9 @@ async fn execute(
         }
 
         if let Some(cfg) = &config.context {
-            let outcomes = scenarios::run_context(
-                &client,
-                &target,
-                cfg,
-                config.gen_tokens,
-                timeout,
-                cancel,
-            )
-            .await;
+            let outcomes =
+                scenarios::run_context(&client, &target, cfg, config.gen_tokens, timeout, cancel)
+                    .await;
             run_scenario_variants(db, run_id, &target, "context", progress, outcomes)?;
         }
         if cancel.load(Ordering::Relaxed) {

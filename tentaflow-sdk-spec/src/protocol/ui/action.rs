@@ -53,13 +53,10 @@ impl<C> Encode<C> for FormFieldMap {
 }
 
 impl<'b, C> Decode<'b, C> for FormFieldMap {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut entries = Vec::with_capacity(len as usize);
         for _ in 0..len {
             let k = d.str()?.to_string();
@@ -119,12 +116,27 @@ pub struct ParamEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActionStatus {
     Ok,
-    Rejected { reason: String, error_code: u16 },
-    PermissionDenied { required_permission: String },
-    RateLimited { retry_after_ms: u32 },
-    ValidationFailed { field_errors: Vec<FieldError> },
-    Error { error_code: u16, message: String },
-    Redirected { to_action_id: String, params: Vec<ParamEntry> },
+    Rejected {
+        reason: String,
+        error_code: u16,
+    },
+    PermissionDenied {
+        required_permission: String,
+    },
+    RateLimited {
+        retry_after_ms: u32,
+    },
+    ValidationFailed {
+        field_errors: Vec<FieldError>,
+    },
+    Error {
+        error_code: u16,
+        message: String,
+    },
+    Redirected {
+        to_action_id: String,
+        params: Vec<ParamEntry>,
+    },
 }
 
 impl<C> Encode<C> for ActionStatus {
@@ -154,7 +166,9 @@ impl<C> Encode<C> for ActionStatus {
                 e.str("reason")?.str(reason)?;
                 e.str("error_code")?.u16(*error_code)?;
             }
-            ActionStatus::PermissionDenied { required_permission } => {
+            ActionStatus::PermissionDenied {
+                required_permission,
+            } => {
                 e.map(2)?;
                 e.str("kind")?.str("permission_denied")?;
                 e.str("required_permission")?.str(required_permission)?;
@@ -173,13 +187,19 @@ impl<C> Encode<C> for ActionStatus {
                     fe.encode(e, ctx)?;
                 }
             }
-            ActionStatus::Error { error_code, message } => {
+            ActionStatus::Error {
+                error_code,
+                message,
+            } => {
                 e.map(3)?;
                 e.str("kind")?.str("error")?;
                 e.str("message")?.str(message)?;
                 e.str("error_code")?.u16(*error_code)?;
             }
-            ActionStatus::Redirected { to_action_id, params } => {
+            ActionStatus::Redirected {
+                to_action_id,
+                params,
+            } => {
                 e.map(3)?;
                 e.str("kind")?.str("redirected")?;
                 e.str("params")?;
@@ -195,13 +215,10 @@ impl<C> Encode<C> for ActionStatus {
 }
 
 impl<'b, C> Decode<'b, C> for ActionStatus {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut reason: Option<String> = None;
         let mut error_code: Option<u16> = None;
@@ -227,7 +244,11 @@ impl<'b, C> Decode<'b, C> for ActionStatus {
                     error_code = Some(d.u16()?);
                 }
                 "required_permission" => {
-                    assert_no_dup_tstr(&required_permission, "ActionStatus", "required_permission")?;
+                    assert_no_dup_tstr(
+                        &required_permission,
+                        "ActionStatus",
+                        "required_permission",
+                    )?;
                     required_permission = Some(d.str()?.to_string());
                 }
                 "retry_after_ms" => {
@@ -271,8 +292,8 @@ impl<'b, C> Decode<'b, C> for ActionStatus {
                 }
             }
         }
-        let kind = kind
-            .ok_or_else(|| minicbor::decode::Error::message("ActionStatus missing kind"))?;
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("ActionStatus missing kind"))?;
         // Fixed-width per-variant whitelist.
         const FIELD_COUNT: usize = 8;
         let present: [bool; FIELD_COUNT] = [
@@ -327,9 +348,7 @@ impl<'b, C> Decode<'b, C> for ActionStatus {
                 want_only(&[false, false, false, true, false, false, false, false])?;
                 Ok(ActionStatus::RateLimited {
                     retry_after_ms: retry_after_ms.ok_or_else(|| {
-                        minicbor::decode::Error::message(
-                            "rate_limited missing retry_after_ms",
-                        )
+                        minicbor::decode::Error::message("rate_limited missing retry_after_ms")
                     })?,
                 })
             }
@@ -337,9 +356,7 @@ impl<'b, C> Decode<'b, C> for ActionStatus {
                 want_only(&[false, false, false, false, true, false, false, false])?;
                 Ok(ActionStatus::ValidationFailed {
                     field_errors: field_errors.ok_or_else(|| {
-                        minicbor::decode::Error::message(
-                            "validation_failed missing field_errors",
-                        )
+                        minicbor::decode::Error::message("validation_failed missing field_errors")
                     })?,
                 })
             }
@@ -349,9 +366,8 @@ impl<'b, C> Decode<'b, C> for ActionStatus {
                     error_code: error_code.ok_or_else(|| {
                         minicbor::decode::Error::message("error missing error_code")
                     })?,
-                    message: message.ok_or_else(|| {
-                        minicbor::decode::Error::message("error missing message")
-                    })?,
+                    message: message
+                        .ok_or_else(|| minicbor::decode::Error::message("error missing message"))?,
                 })
             }
             "redirected" => {
@@ -396,10 +412,7 @@ mod tests {
 
     fn rt<T>(v: T)
     where
-        T: minicbor::Encode<()>
-            + for<'b> minicbor::Decode<'b, ()>
-            + PartialEq
-            + core::fmt::Debug,
+        T: minicbor::Encode<()> + for<'b> minicbor::Decode<'b, ()> + PartialEq + core::fmt::Debug,
     {
         let mut b1 = Vec::new();
         minicbor::encode(&v, &mut b1).unwrap();
@@ -425,8 +438,20 @@ mod tests {
     #[test]
     fn form_field_map_canonical_sort() {
         let m = FormFieldMap(vec![
-            ("zzz".into(), FormFieldValue { value: Value::Bool(true), validated_locally: false }),
-            ("a".into(), FormFieldValue { value: Value::U64(1), validated_locally: true }),
+            (
+                "zzz".into(),
+                FormFieldValue {
+                    value: Value::Bool(true),
+                    validated_locally: false,
+                },
+            ),
+            (
+                "a".into(),
+                FormFieldValue {
+                    value: Value::U64(1),
+                    validated_locally: true,
+                },
+            ),
         ]);
         let mut buf = Vec::new();
         minicbor::encode(&m, &mut buf).unwrap();
@@ -500,7 +525,11 @@ mod tests {
         assert!(res.is_err());
     }
 
-    fn assert_extra_field_rejected(kind: &str, extra_key: &str, extra_value_emit: impl FnOnce(&mut minicbor::Encoder<&mut Vec<u8>>)) {
+    fn assert_extra_field_rejected(
+        kind: &str,
+        extra_key: &str,
+        extra_value_emit: impl FnOnce(&mut minicbor::Encoder<&mut Vec<u8>>),
+    ) {
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
         enc.map(2).unwrap().str("kind").unwrap().str(kind).unwrap();

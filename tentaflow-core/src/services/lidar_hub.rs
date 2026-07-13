@@ -125,16 +125,13 @@ impl LidarStreamHub {
         // waiting on this shard, forming a lock cycle. No DashMap guard may be
         // held across a watch send/subscribe call.
         let sender = {
-            let entry = self
-                .slots
-                .entry(robot_id.to_string())
-                .or_insert_with(|| {
-                    let (notify, _rx) = watch::channel(0);
-                    RobotSlot {
-                        frame: Bytes::new(),
-                        notify,
-                    }
-                });
+            let entry = self.slots.entry(robot_id.to_string()).or_insert_with(|| {
+                let (notify, _rx) = watch::channel(0);
+                RobotSlot {
+                    frame: Bytes::new(),
+                    notify,
+                }
+            });
             entry.notify.clone()
         };
         sender.subscribe()
@@ -291,7 +288,9 @@ mod tests {
         hub.publish("go2-a", 1, Bytes::from(f.clone()));
 
         // The receiver must observe the new seq, NOT a channel-close error.
-        rx.changed().await.expect("first frame seq, not channel close");
+        rx.changed()
+            .await
+            .expect("first frame seq, not channel close");
         assert_eq!(*rx.borrow(), 1);
         assert_eq!(&hub.latest("go2-a").expect("frame")[..], &f[..]);
     }

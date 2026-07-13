@@ -69,12 +69,27 @@ impl PoseEstimator for MovenetEngine {
             .run(tvec!(input.into()))
             .context("MoveNet: tract forward failed")?;
         if outputs.len() < 4 {
-            return Err(anyhow!("MoveNet: expected 4 head tensors, got {}", outputs.len()));
+            return Err(anyhow!(
+                "MoveNet: expected 4 head tensors, got {}",
+                outputs.len()
+            ));
         }
-        let center = outputs[0].view().as_slice::<f32>().context("MoveNet: center not f32")?;
-        let heatmap = outputs[1].view().as_slice::<f32>().context("MoveNet: heatmap not f32")?;
-        let regress = outputs[2].view().as_slice::<f32>().context("MoveNet: regress not f32")?;
-        let offset = outputs[3].view().as_slice::<f32>().context("MoveNet: offset not f32")?;
+        let center = outputs[0]
+            .view()
+            .as_slice::<f32>()
+            .context("MoveNet: center not f32")?;
+        let heatmap = outputs[1]
+            .view()
+            .as_slice::<f32>()
+            .context("MoveNet: heatmap not f32")?;
+        let regress = outputs[2]
+            .view()
+            .as_slice::<f32>()
+            .context("MoveNet: regress not f32")?;
+        let offset = outputs[3]
+            .view()
+            .as_slice::<f32>()
+            .context("MoveNet: offset not f32")?;
 
         let keypoints = decode_pose(center, heatmap, regress, offset, width, height);
         if keypoints.is_empty() {
@@ -118,9 +133,7 @@ pub fn load(model_path: &Path) -> Result<MovenetEngine> {
     // tracta wciaz przetwarza martwe wezly int32 i nie konczy optymalizacji.
     model.compact()?;
     let model = model.into_optimized()?.into_runnable()?;
-    Ok(MovenetEngine {
-        model,
-    })
+    Ok(MovenetEngine { model })
 }
 
 /// MoveNet (CenterNet single-pose) decode z czterech glow modelu, kazda NCHW [1,C,48,48]:

@@ -856,7 +856,13 @@ impl NamespaceManager {
         if items.is_empty() {
             return Ok(self
                 .get_or_create(
-                    org_id, addon_id, namespace, dim, metric, field_specs, sparse_flag,
+                    org_id,
+                    addon_id,
+                    namespace,
+                    dim,
+                    metric,
+                    field_specs,
+                    sparse_flag,
                 )?
                 .count());
         }
@@ -1426,29 +1432,81 @@ mod tests {
 
         // Three distinct refs in one batch -> count 3.
         let items = vec![
-            UpsertItem { ref_id: 1, vector: &v1, fields: &[], sparse: None },
-            UpsertItem { ref_id: 2, vector: &v2, fields: &[], sparse: None },
-            UpsertItem { ref_id: 3, vector: &v3, fields: &[], sparse: None },
+            UpsertItem {
+                ref_id: 1,
+                vector: &v1,
+                fields: &[],
+                sparse: None,
+            },
+            UpsertItem {
+                ref_id: 2,
+                vector: &v2,
+                fields: &[],
+                sparse: None,
+            },
+            UpsertItem {
+                ref_id: 3,
+                vector: &v3,
+                fields: &[],
+                sparse: None,
+            },
         ];
         let c1 = mgr
-            .upsert_batch_with_quota(ORG_A, "addon_a", "ns1", 3, Metric::Cosine, &[], false, &items)
+            .upsert_batch_with_quota(
+                ORG_A,
+                "addon_a",
+                "ns1",
+                3,
+                Metric::Cosine,
+                &[],
+                false,
+                &items,
+            )
             .unwrap();
         assert_eq!(c1, 3);
 
         // Re-batch the same refs (all replaces) -> count stays 3 (no quota delta).
         let c2 = mgr
-            .upsert_batch_with_quota(ORG_A, "addon_a", "ns1", 3, Metric::Cosine, &[], false, &items)
+            .upsert_batch_with_quota(
+                ORG_A,
+                "addon_a",
+                "ns1",
+                3,
+                Metric::Cosine,
+                &[],
+                false,
+                &items,
+            )
             .unwrap();
         assert_eq!(c2, 3);
 
         // One new ref + two replaces -> count 4.
         let v4 = [0.5, 0.5, 0.0];
         let mixed = vec![
-            UpsertItem { ref_id: 1, vector: &v1, fields: &[], sparse: None },
-            UpsertItem { ref_id: 4, vector: &v4, fields: &[], sparse: None },
+            UpsertItem {
+                ref_id: 1,
+                vector: &v1,
+                fields: &[],
+                sparse: None,
+            },
+            UpsertItem {
+                ref_id: 4,
+                vector: &v4,
+                fields: &[],
+                sparse: None,
+            },
         ];
         let c3 = mgr
-            .upsert_batch_with_quota(ORG_A, "addon_a", "ns1", 3, Metric::Cosine, &[], false, &mixed)
+            .upsert_batch_with_quota(
+                ORG_A,
+                "addon_a",
+                "ns1",
+                3,
+                Metric::Cosine,
+                &[],
+                false,
+                &mixed,
+            )
             .unwrap();
         assert_eq!(c3, 4);
     }

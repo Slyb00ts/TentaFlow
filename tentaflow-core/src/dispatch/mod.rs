@@ -835,8 +835,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 "MlStudioRecogSaveAnnotationsResponse"
             }
             tentaflow_protocol::MlStudioPayload::SchemaGetRequest(_) => "MlStudioSchemaGetRequest",
-            tentaflow_protocol::MlStudioPayload::SchemaGetResponse(_) => "MlStudioSchemaGetResponse",
-            tentaflow_protocol::MlStudioPayload::SchemaSaveRequest(_) => "MlStudioSchemaSaveRequest",
+            tentaflow_protocol::MlStudioPayload::SchemaGetResponse(_) => {
+                "MlStudioSchemaGetResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::SchemaSaveRequest(_) => {
+                "MlStudioSchemaSaveRequest"
+            }
             tentaflow_protocol::MlStudioPayload::SchemaSaveResponse(_) => {
                 "MlStudioSchemaSaveResponse"
             }
@@ -1497,7 +1501,9 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 "ModelMetricsNodeServiceResponse"
             }
             tentaflow_protocol::ModelMetricsPayload::PricingGet => "ModelMetricsPricingGet",
-            tentaflow_protocol::ModelMetricsPayload::PricingList { .. } => "ModelMetricsPricingList",
+            tentaflow_protocol::ModelMetricsPayload::PricingList { .. } => {
+                "ModelMetricsPricingList"
+            }
             tentaflow_protocol::ModelMetricsPayload::PricingSet { .. } => "ModelMetricsPricingSet",
             tentaflow_protocol::ModelMetricsPayload::PricingSetResult { .. } => {
                 "ModelMetricsPricingSetResult"
@@ -1549,7 +1555,9 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::BenchmarkPayload::RunStreamRequest { .. } => {
                 "BenchmarkRunStreamRequest"
             }
-            tentaflow_protocol::BenchmarkPayload::RunStreamChunk { .. } => "BenchmarkRunStreamChunk",
+            tentaflow_protocol::BenchmarkPayload::RunStreamChunk { .. } => {
+                "BenchmarkRunStreamChunk"
+            }
             tentaflow_protocol::BenchmarkPayload::RunStreamEnd { .. } => "BenchmarkRunStreamEnd",
         },
         MessageBody::VisionImportBody(p) => match p {

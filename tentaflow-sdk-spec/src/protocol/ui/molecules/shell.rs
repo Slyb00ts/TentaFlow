@@ -2,19 +2,15 @@
 // File: protocol/ui/molecules/shell.rs — AppShell / LoginShell / WizardShell (catalog §2)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::BindRef;
 use super::super::component::{Component, FieldMap};
-use super::super::inline::{
-    IconRef,
-    StepDef,
-};
+use super::super::inline::{IconRef, StepDef};
 use super::super::tokens::Spacing;
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
-
 
 // -----------------------------------------------------------------------------
 // AppShell
@@ -72,10 +68,8 @@ impl AppShell {
             }
         }
         Ok(AppShell {
-            sidebar_slot: sidebar_slot
-                .ok_or_else(|| missing_field("AppShell", "sidebar_slot"))?,
-            content_slot: content_slot
-                .ok_or_else(|| missing_field("AppShell", "content_slot"))?,
+            sidebar_slot: sidebar_slot.ok_or_else(|| missing_field("AppShell", "sidebar_slot"))?,
+            content_slot: content_slot.ok_or_else(|| missing_field("AppShell", "content_slot"))?,
             header_slot,
             // §2 0x0006: default sidebar_width = Spacing::Xl.
             sidebar_width: sidebar_width.unwrap_or(Spacing::Xl),
@@ -212,11 +206,8 @@ impl WizardShell {
                 .ok_or_else(|| missing_field("WizardShell", "current_step_id"))?,
             content_slot: content_slot
                 .ok_or_else(|| missing_field("WizardShell", "content_slot"))?,
-            footer_slot: footer_slot
-                .ok_or_else(|| missing_field("WizardShell", "footer_slot"))?,
-            cancellable: cancellable
-                .ok_or_else(|| missing_field("WizardShell", "cancellable"))?,
+            footer_slot: footer_slot.ok_or_else(|| missing_field("WizardShell", "footer_slot"))?,
+            cancellable: cancellable.ok_or_else(|| missing_field("WizardShell", "cancellable"))?,
         })
     }
 }
-

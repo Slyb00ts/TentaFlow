@@ -18,10 +18,10 @@ pub use builtins::{is_core_tool, BuiltinToolError, CoreToolName};
 pub use catalog::{tool_in_allowlist, AllowlistEntry, ToolCatalog};
 pub use interaction::{
     await_reply as await_interaction_reply, global as interaction_registry_global,
-    init_global as interaction_registry_init_global, no_response_sentinel, now_ms as interaction_now_ms,
-    run_ask_user, run_permission_request, wrap_user_reply, InteractionKind, InteractionOutcome,
-    InteractionRegistry, InteractionReply, PendingInteraction, PermissionDecision, QuestionReply,
-    DEFAULT_INTERACTION_TIMEOUT_SECS,
+    init_global as interaction_registry_init_global, no_response_sentinel,
+    now_ms as interaction_now_ms, run_ask_user, run_permission_request, wrap_user_reply,
+    InteractionKind, InteractionOutcome, InteractionRegistry, InteractionReply, PendingInteraction,
+    PermissionDecision, QuestionReply, DEFAULT_INTERACTION_TIMEOUT_SECS,
 };
 pub use principal::AgentPrincipal;
 pub use retention_purge::{purge_expired_agent_runtime, start_agent_runtime_purge_task};
@@ -32,8 +32,8 @@ pub use run_manager::{
 };
 pub use service::AgentService;
 pub use subagent_reactor::{
-    init_global as subagent_reactor_init_global, FlowDispatcherReactorDispatch, ReactorFlowDispatch,
-    SubagentReactor,
+    init_global as subagent_reactor_init_global, FlowDispatcherReactorDispatch,
+    ReactorFlowDispatch, SubagentReactor,
 };
 
 /// Late-bound `AgentService` slot (§3.5.0), mirroring `ModelRuntimeSlot`.

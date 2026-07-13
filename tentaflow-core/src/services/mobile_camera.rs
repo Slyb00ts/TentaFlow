@@ -26,7 +26,9 @@ pub struct MobileCameraIngest {
 
 impl MobileCameraIngest {
     fn new() -> Self {
-        Self { senders: DashMap::new() }
+        Self {
+            senders: DashMap::new(),
+        }
     }
 
     pub fn global() -> &'static MobileCameraIngest {

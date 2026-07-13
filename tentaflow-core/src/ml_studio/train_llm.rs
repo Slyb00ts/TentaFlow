@@ -201,9 +201,7 @@ async fn run_training(
 fn resolve_endpoint() -> anyhow::Result<String> {
     let pool = crate::db::global_pool()
         .ok_or_else(|| anyhow::anyhow!("core service registry unavailable"))?;
-    let conn = pool
-        .read()
-        .map_err(|_| anyhow::anyhow!("core db read"))?;
+    let conn = pool.read().map_err(|_| anyhow::anyhow!("core db read"))?;
     let svcs = services_repo::services::list_by_category(&conn, "training", Some("ml-training"))?;
     let svc = svcs.into_iter().next().ok_or_else(|| {
         anyhow::anyhow!("Serwis ml-training niedostępny — uruchom go w Serwisach")
@@ -278,18 +276,20 @@ fn map_tabular(headers: &[String], rows: &[Vec<String>]) -> Vec<Record> {
     let cell = |row: &[String], idx: usize| row.get(idx).cloned().unwrap_or_default();
 
     rows.iter()
-        .filter_map(|row| match (prompt_idx, chosen_idx, rejected_idx, response_idx) {
-            (Some(pi), Some(ci), Some(ri), _) => Some(json!({
-                "prompt": cell(row, pi),
-                "chosen": cell(row, ci),
-                "rejected": cell(row, ri),
-            })),
-            (Some(pi), _, _, Some(ri)) => Some(json!({
-                "prompt": cell(row, pi),
-                "response": cell(row, ri),
-            })),
-            _ => row.first().map(|text| json!({ "text": text })),
-        })
+        .filter_map(
+            |row| match (prompt_idx, chosen_idx, rejected_idx, response_idx) {
+                (Some(pi), Some(ci), Some(ri), _) => Some(json!({
+                    "prompt": cell(row, pi),
+                    "chosen": cell(row, ci),
+                    "rejected": cell(row, ri),
+                })),
+                (Some(pi), _, _, Some(ri)) => Some(json!({
+                    "prompt": cell(row, pi),
+                    "response": cell(row, ri),
+                })),
+                _ => row.first().map(|text| json!({ "text": text })),
+            },
+        )
         .collect()
 }
 
@@ -387,8 +387,8 @@ pub fn is_llm_mesh_job(run_id: &str) -> bool {
 /// przez mesh (cache content-addr po hashu), waliduje hash, parsuje rekordy i
 /// zleca trening LOKALNEMU serwisowi `ml-training` (multi-GPU/dist wg specu).
 pub async fn mesh_train_start_llm(run_id: &str, spec_json: &str) -> anyhow::Result<()> {
-    let spec: serde_json::Value = serde_json::from_str(spec_json)
-        .map_err(|e| anyhow::anyhow!("spec_json invalid: {}", e))?;
+    let spec: serde_json::Value =
+        serde_json::from_str(spec_json).map_err(|e| anyhow::anyhow!("spec_json invalid: {}", e))?;
     let dataset_ref = spec
         .get("dataset")
         .and_then(|v| v.as_str())
@@ -399,7 +399,10 @@ pub async fn mesh_train_start_llm(run_id: &str, spec_json: &str) -> anyhow::Resu
     let cache = crate::ml_studio::train_recognition::mesh_dataset_cache(hash);
     let blob_path = cache.join("dataset.bin");
     if !blob_path.is_file() {
-        anyhow::bail!("dataset LLM nie zmaterializowany na tym węźle (hash {})", hash);
+        anyhow::bail!(
+            "dataset LLM nie zmaterializowany na tym węźle (hash {})",
+            hash
+        );
     }
     let raw = std::fs::read(&blob_path)?;
     // Weryfikacja wspólnego zasobu / integralności transferu: hash bajtów == spec.
@@ -414,7 +417,10 @@ pub async fn mesh_train_start_llm(run_id: &str, spec_json: &str) -> anyhow::Resu
         }
     }
     // Format datasetu zachowany z A (jsonl/csv/xlsx) — parser musi go znać.
-    let kind = spec.get("dataset_kind").and_then(|v| v.as_str()).unwrap_or("jsonl");
+    let kind = spec
+        .get("dataset_kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("jsonl");
     let records = parse_records(&raw, kind)?;
     if records.is_empty() {
         anyhow::bail!("dataset LLM nie dał użytecznych rekordów");

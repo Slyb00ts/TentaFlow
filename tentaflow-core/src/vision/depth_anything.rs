@@ -78,7 +78,10 @@ impl DepthAnything {
     /// major), in input order, via ONE `[N,3,518,518]` forward. The whole point of
     /// batching is a SINGLE GPU launch shared across many robots/cameras instead of
     /// one per source. Empty input → empty output.
-    pub fn infer_batch(&mut self, frames: &[(&[u8], u32, u32)]) -> Result<Vec<(Vec<f32>, u32, u32)>> {
+    pub fn infer_batch(
+        &mut self,
+        frames: &[(&[u8], u32, u32)],
+    ) -> Result<Vec<(Vec<f32>, u32, u32)>> {
         if frames.is_empty() {
             return Ok(Vec::new());
         }
@@ -100,18 +103,31 @@ impl DepthAnything {
                 }
             }
         }
-        let input =
-            Tensor::<VisionBackend, 4>::from_data(TensorData::new(data, [n, 3, res, res]), &self.device);
+        let input = Tensor::<VisionBackend, 4>::from_data(
+            TensorData::new(data, [n, 3, res, res]),
+            &self.device,
+        );
         let out = self.model.forward(input); // [n, 518, 518] metric depth
         let all: Vec<f32> = out
             .to_data()
             .to_vec()
             .map_err(|e| anyhow!("depth to_vec: {e:?}"))?;
         if all.len() != n * plane {
-            bail!("depth batch output {} != expected {} ({}×518²)", all.len(), n * plane, n);
+            bail!(
+                "depth batch output {} != expected {} ({}×518²)",
+                all.len(),
+                n * plane,
+                n
+            );
         }
         Ok((0..n)
-            .map(|i| (all[i * plane..(i + 1) * plane].to_vec(), RESOLUTION, RESOLUTION))
+            .map(|i| {
+                (
+                    all[i * plane..(i + 1) * plane].to_vec(),
+                    RESOLUTION,
+                    RESOLUTION,
+                )
+            })
             .collect())
     }
 }
@@ -126,7 +142,9 @@ fn engine() -> &'static Mutex<Option<DepthAnything>> {
 /// Batched metric depth via the global engine (lazily loaded on first use). One GPU
 /// launch for all frames; results in input order, `(depth_metres_row_major, w, h)`.
 pub fn infer_global_batch(frames: &[(&[u8], u32, u32)]) -> Result<Vec<(Vec<f32>, u32, u32)>> {
-    let mut guard = engine().lock().map_err(|_| anyhow!("depth engine poisoned"))?;
+    let mut guard = engine()
+        .lock()
+        .map_err(|_| anyhow!("depth engine poisoned"))?;
     if guard.is_none() {
         *guard = Some(DepthAnything::load()?);
     }
@@ -136,7 +154,9 @@ pub fn infer_global_batch(frames: &[(&[u8], u32, u32)]) -> Result<Vec<(Vec<f32>,
 /// Pre-load + autotune the model off the hot path (the first forward compiles GPU
 /// kernels, ~20 s on wgpu). Call at startup so the first real frame isn't stalled.
 pub fn prewarm() -> Result<()> {
-    let mut guard = engine().lock().map_err(|_| anyhow!("depth engine poisoned"))?;
+    let mut guard = engine()
+        .lock()
+        .map_err(|_| anyhow!("depth engine poisoned"))?;
     if guard.is_none() {
         *guard = Some(DepthAnything::load()?);
     }

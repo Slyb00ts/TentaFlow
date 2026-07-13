@@ -155,7 +155,10 @@ async fn run_training_against_dir(
     let status_url = format!("{}/status/{}", base, job_id);
     loop {
         if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("classifier training timed out after {}s", JOB_TIMEOUT.as_secs());
+            anyhow::bail!(
+                "classifier training timed out after {}s",
+                JOB_TIMEOUT.as_secs()
+            );
         }
         tokio::time::sleep(POLL_INTERVAL).await;
 
@@ -266,8 +269,8 @@ pub fn is_classifier_mesh_job(run_id: &str) -> bool {
 /// mechanizm recognition (`mesh_dataset_cache`); weryfikacja content-hasha jak
 /// w recognition (ten sam zasób na obu nodach).
 pub async fn mesh_train_start_classifier(run_id: &str, spec_json: &str) -> anyhow::Result<()> {
-    let spec: serde_json::Value = serde_json::from_str(spec_json)
-        .map_err(|e| anyhow::anyhow!("spec_json invalid: {}", e))?;
+    let spec: serde_json::Value =
+        serde_json::from_str(spec_json).map_err(|e| anyhow::anyhow!("spec_json invalid: {}", e))?;
     let dataset_dir_raw = spec
         .get("dataset_dir")
         .and_then(|v| v.as_str())
@@ -277,7 +280,10 @@ pub async fn mesh_train_start_classifier(run_id: &str, spec_json: &str) -> anyho
     let dataset_dir: &str = if let Some(hash) = dataset_dir_raw.strip_prefix("mesh:") {
         let c = crate::ml_studio::train_recognition::mesh_dataset_cache(hash);
         if !c.is_dir() {
-            anyhow::bail!("dataset mesh nie zmaterializowany na tym nodzie (hash {})", hash);
+            anyhow::bail!(
+                "dataset mesh nie zmaterializowany na tym nodzie (hash {})",
+                hash
+            );
         }
         resolved = c.to_string_lossy().to_string();
         &resolved
@@ -288,9 +294,9 @@ pub async fn mesh_train_start_classifier(run_id: &str, spec_json: &str) -> anyho
         anyhow::bail!("dataset niedostępny na tym nodzie ({})", dataset_dir);
     }
     if let Some(expected) = spec.get("dataset_hash").and_then(|v| v.as_str()) {
-        let actual = crate::ml_studio::train_recognition::coco_content_hash(
-            std::path::Path::new(dataset_dir),
-        )?;
+        let actual = crate::ml_studio::train_recognition::coco_content_hash(std::path::Path::new(
+            dataset_dir,
+        ))?;
         if actual != expected {
             anyhow::bail!(
                 "dataset na tym nodzie to NIE ten sam zasób (hash mismatch: oczekiwano {}, jest {})",
@@ -301,7 +307,10 @@ pub async fn mesh_train_start_classifier(run_id: &str, spec_json: &str) -> anyho
     }
 
     let attribute = spec.get("attribute").and_then(|v| v.as_str()).unwrap_or("");
-    let source_class = spec.get("source_class").and_then(|v| v.as_str()).unwrap_or("");
+    let source_class = spec
+        .get("source_class")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let values = spec.get("values").cloned().unwrap_or(json!([]));
     let variant = spec
         .get("variant")

@@ -77,7 +77,9 @@ impl NodeAdapter for CameraAlertNodeAdapter {
             .unwrap_or("")
             .to_string();
         if camera_id.is_empty() {
-            return Err(anyhow!("camera_alert: alarm verdict but meta[camera_id] missing"));
+            return Err(anyhow!(
+                "camera_alert: alarm verdict but meta[camera_id] missing"
+            ));
         }
 
         let payload = serde_json::json!({
@@ -124,8 +126,10 @@ mod tests {
         let ctx = stub_ctx();
         let mut env = FlowEnvelope::with_payload(FlowValue::Empty);
         env.meta.insert("verdict".into(), verdict);
-        env.meta
-            .insert("camera_id".into(), serde_json::Value::String(camera_id.into()));
+        env.meta.insert(
+            "camera_id".into(),
+            serde_json::Value::String(camera_id.into()),
+        );
         let input = NodeInput {
             from_node_id: "v".into(),
             from_port: "out".into(),
@@ -150,7 +154,11 @@ mod tests {
 
     #[tokio::test]
     async fn silent_on_ok_verdict() {
-        let m = alert_meta(serde_json::json!({ "decision": "ok", "reason": "" }), "cam_1").await;
+        let m = alert_meta(
+            serde_json::json!({ "decision": "ok", "reason": "" }),
+            "cam_1",
+        )
+        .await;
         assert_eq!(m["emitted"], false);
     }
 }

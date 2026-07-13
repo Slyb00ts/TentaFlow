@@ -28,9 +28,7 @@ fn main() -> Result<()> {
         let img = image::open(&path)?.to_rgb8();
         let (w, h) = img.dimensions();
         let read = engine.read_adr(img.as_raw(), w, h);
-        let snap = read
-            .as_ref()
-            .and_then(|(_k, un)| adr::snap_adr(un));
+        let snap = read.as_ref().and_then(|(_k, un)| adr::snap_adr(un));
         if snap.is_some() {
             hit += 1;
         }

@@ -7,8 +7,8 @@
 
 use minicbor::{Decode, Decoder, Encode, Encoder};
 
-use crate::protocol::value::Value;
 use crate::protocol::ui::typed_field::assert_no_dup_tstr;
+use crate::protocol::value::Value;
 
 /// One segment of a compiled Topic.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -45,13 +45,10 @@ impl<C> Encode<C> for TopicSegment {
 }
 
 impl<'b, C> Decode<'b, C> for TopicSegment {
-    fn decode(
-        d: &mut Decoder<'b>,
-        _ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut value: Option<String> = None;
         for _ in 0..len {
@@ -72,10 +69,10 @@ impl<'b, C> Decode<'b, C> for TopicSegment {
                 }
             }
         }
-        let kind = kind
-            .ok_or_else(|| minicbor::decode::Error::message("TopicSegment missing kind"))?;
-        let value = value
-            .ok_or_else(|| minicbor::decode::Error::message("TopicSegment missing value"))?;
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("TopicSegment missing kind"))?;
+        let value =
+            value.ok_or_else(|| minicbor::decode::Error::message("TopicSegment missing value"))?;
         match kind.as_str() {
             "literal" => Ok(TopicSegment::Literal { value }),
             "id" => Ok(TopicSegment::Id { value }),
@@ -113,13 +110,10 @@ impl<C> Encode<C> for Topic {
 }
 
 impl<'b, C> Decode<'b, C> for Topic {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let n = d.array()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length array forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let n = d
+            .array()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length array forbidden"))?;
         let mut segments = Vec::with_capacity(n as usize);
         for _ in 0..n {
             segments.push(TopicSegment::decode(d, ctx)?);
@@ -149,10 +143,7 @@ mod tests {
 
     fn rt<T>(v: T)
     where
-        T: minicbor::Encode<()>
-            + for<'b> minicbor::Decode<'b, ()>
-            + PartialEq
-            + core::fmt::Debug,
+        T: minicbor::Encode<()> + for<'b> minicbor::Decode<'b, ()> + PartialEq + core::fmt::Debug,
     {
         let mut b1 = Vec::new();
         minicbor::encode(&v, &mut b1).unwrap();

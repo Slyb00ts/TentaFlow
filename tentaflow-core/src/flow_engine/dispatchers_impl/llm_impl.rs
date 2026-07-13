@@ -150,7 +150,10 @@ fn llm_response_to_chat_response(response: &LlmResponse, model: &str) -> ChatCom
                 tool_calls,
                 tool_call_id: None,
             },
-            finish_reason: response.finish_reason.as_openai_str().map(|s| s.to_string()),
+            finish_reason: response
+                .finish_reason
+                .as_openai_str()
+                .map(|s| s.to_string()),
             logprobs: None,
         }],
         usage: Some(Usage {
@@ -302,7 +305,10 @@ impl LlmDispatcher for LlmDispatcherImpl {
             Err(e) => Err(anyhow!("LlmDispatcher stream chunk: {e}")),
         });
         let bounded = StreamBoundary::new(Box::pin(mapped), deadline, cancel_for_stream);
-        Ok(Box::pin(AuditFinishStream::new(Box::pin(bounded), audit_event)))
+        Ok(Box::pin(AuditFinishStream::new(
+            Box::pin(bounded),
+            audit_event,
+        )))
     }
 }
 

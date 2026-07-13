@@ -289,7 +289,14 @@ mod tests {
 
         // Parent run + two spawned children (via the manager, as spawn would).
         let parent = mgr
-            .spawn("parent", "lead", None, &AgentPrincipal::user("u1"), &[], None)
+            .spawn(
+                "parent",
+                "lead",
+                None,
+                &AgentPrincipal::user("u1"),
+                &[],
+                None,
+            )
             .await
             .expect("parent");
         let caller = CallerRun {
@@ -349,7 +356,14 @@ mod tests {
         seed_agent(&pool, "parent2", "boss2", 4);
         let mgr = manager(pool.clone());
         let parent = mgr
-            .spawn("parent2", "lead", None, &AgentPrincipal::user("u1"), &[], None)
+            .spawn(
+                "parent2",
+                "lead",
+                None,
+                &AgentPrincipal::user("u1"),
+                &[],
+                None,
+            )
             .await
             .expect("parent");
 

@@ -519,7 +519,10 @@ mod tests {
             other => panic!("expected Json, got {other:?}"),
         };
         assert_eq!(written, 2);
-        assert_eq!(out.meta.get("stored_chunks").and_then(|n| n.as_u64()), Some(2));
+        assert_eq!(
+            out.meta.get("stored_chunks").and_then(|n| n.as_u64()),
+            Some(2)
+        );
     }
 
     /// Cleanup-then-reingest: drugi ingest tego samego doc_id z MNIEJSZĄ liczbą
@@ -551,7 +554,10 @@ mod tests {
         store
             .execute(
                 &node(json!({"namespace": "p", "doc_id": "docA"})),
-                &[input(chunks_payload(&[(0, "a2", vec![1.0, 0.0, 0.0])]), json!({}))],
+                &[input(
+                    chunks_payload(&[(0, "a2", vec![1.0, 0.0, 0.0])]),
+                    json!({}),
+                )],
                 &ctx,
             )
             .await
@@ -592,7 +598,11 @@ mod tests {
             .await
             .unwrap();
         let doc = match &out.payload {
-            FlowValue::Json(v) => v.get("doc_id").and_then(|d| d.as_str()).unwrap().to_string(),
+            FlowValue::Json(v) => v
+                .get("doc_id")
+                .and_then(|d| d.as_str())
+                .unwrap()
+                .to_string(),
             _ => panic!("expected Json"),
         };
         assert_eq!(doc, "from-meta");
@@ -605,7 +615,10 @@ mod tests {
         let err = StoreNodeAdapter::new()
             .execute(
                 &node(json!({"namespace": "p"})),
-                &[input(chunks_payload(&[(0, "x", vec![1.0, 0.0])]), json!({}))],
+                &[input(
+                    chunks_payload(&[(0, "x", vec![1.0, 0.0])]),
+                    json!({}),
+                )],
                 &ctx,
             )
             .await
@@ -643,7 +656,10 @@ mod tests {
         let err = StoreNodeAdapter::new()
             .execute(
                 &node(json!({"namespace": "p", "doc_id": "docA"})),
-                &[input(chunks_payload(&[(0, "x", vec![1.0, 0.0])]), json!({}))],
+                &[input(
+                    chunks_payload(&[(0, "x", vec![1.0, 0.0])]),
+                    json!({}),
+                )],
                 &ctx,
             )
             .await

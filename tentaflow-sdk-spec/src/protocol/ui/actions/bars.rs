@@ -2,6 +2,7 @@
 // File: protocol/ui/action/bars.rs — ActionBar/SegmentedControl/FilterChips/WizardFooter (catalog §6)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::StatePath;
 use super::super::component::{Component, FieldMap};
 use super::super::inline::{FilterChipDef, SegmentOption};
@@ -10,12 +11,20 @@ use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_ref_tag_decode,
     ensure_ref_tag_encode, ensure_tag, missing_field, unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 use super::buttons::Button;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -54,7 +63,8 @@ impl ActionBar {
         ensure_no_duplicate_keys("ActionBar", &c.fields.0)?;
         let mut leading_actions: Option<Vec<Component>> = None;
         let mut trailing_actions: Option<Vec<Component>> = None;
-        let mut divider_between = None; let mut sticky = None;
+        let mut divider_between = None;
+        let mut sticky = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => leading_actions = Some(decode_from_value(v)?),
@@ -64,8 +74,10 @@ impl ActionBar {
                 other => return Err(unknown_field("ActionBar", *other)),
             }
         }
-        let leading_actions = leading_actions.ok_or_else(|| missing_field("ActionBar", "leading_actions"))?;
-        let trailing_actions = trailing_actions.ok_or_else(|| missing_field("ActionBar", "trailing_actions"))?;
+        let leading_actions =
+            leading_actions.ok_or_else(|| missing_field("ActionBar", "leading_actions"))?;
+        let trailing_actions =
+            trailing_actions.ok_or_else(|| missing_field("ActionBar", "trailing_actions"))?;
         for b in &leading_actions {
             ensure_ref_tag_decode(b.tag, Button::TAG, "ActionBar", "leading_actions")?;
         }
@@ -73,8 +85,10 @@ impl ActionBar {
             ensure_ref_tag_decode(b.tag, Button::TAG, "ActionBar", "trailing_actions")?;
         }
         Ok(ActionBar {
-            leading_actions, trailing_actions,
-            divider_between: divider_between.ok_or_else(|| missing_field("ActionBar", "divider_between"))?,
+            leading_actions,
+            trailing_actions,
+            divider_between: divider_between
+                .ok_or_else(|| missing_field("ActionBar", "divider_between"))?,
             sticky: sticky.ok_or_else(|| missing_field("ActionBar", "sticky"))?,
         })
     }
@@ -108,8 +122,10 @@ impl SegmentedControl {
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "SegmentedControl")?;
         ensure_no_duplicate_keys("SegmentedControl", &c.fields.0)?;
-        let mut bind_path = None; let mut options = None;
-        let mut size = None; let mut full_width = None;
+        let mut bind_path = None;
+        let mut options = None;
+        let mut size = None;
+        let mut full_width = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => bind_path = Some(decode_from_value(v)?),
@@ -123,7 +139,8 @@ impl SegmentedControl {
             bind_path: bind_path.ok_or_else(|| missing_field("SegmentedControl", "bind_path"))?,
             options: options.ok_or_else(|| missing_field("SegmentedControl", "options"))?,
             size: size.ok_or_else(|| missing_field("SegmentedControl", "size"))?,
-            full_width: full_width.ok_or_else(|| missing_field("SegmentedControl", "full_width"))?,
+            full_width: full_width
+                .ok_or_else(|| missing_field("SegmentedControl", "full_width"))?,
         })
     }
 }
@@ -156,8 +173,10 @@ impl FilterChips {
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "FilterChips")?;
         ensure_no_duplicate_keys("FilterChips", &c.fields.0)?;
-        let mut chips = None; let mut selected_ids = None;
-        let mut mode = None; let mut clearable = None;
+        let mut chips = None;
+        let mut selected_ids = None;
+        let mut mode = None;
+        let mut clearable = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => chips = Some(decode_from_value(v)?),
@@ -169,7 +188,8 @@ impl FilterChips {
         }
         Ok(FilterChips {
             chips: chips.ok_or_else(|| missing_field("FilterChips", "chips"))?,
-            selected_ids: selected_ids.ok_or_else(|| missing_field("FilterChips", "selected_ids"))?,
+            selected_ids: selected_ids
+                .ok_or_else(|| missing_field("FilterChips", "selected_ids"))?,
             mode: mode.ok_or_else(|| missing_field("FilterChips", "mode"))?,
             clearable: clearable.ok_or_else(|| missing_field("FilterChips", "clearable"))?,
         })
@@ -210,10 +230,18 @@ impl WizardFooter {
             ensure_ref_tag_encode(b.tag, Button::TAG, "WizardFooter", "extra_actions")?;
         }
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(5);
-        if let Some(v) = &self.back_action { e.push((0, encode_to_value(v)?)); }
-        if let Some(v) = &self.next_action { e.push((1, encode_to_value(v)?)); }
-        if let Some(v) = &self.cancel_action { e.push((2, encode_to_value(v)?)); }
-        if let Some(v) = &self.skip_action { e.push((3, encode_to_value(v)?)); }
+        if let Some(v) = &self.back_action {
+            e.push((0, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.next_action {
+            e.push((1, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.cancel_action {
+            e.push((2, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.skip_action {
+            e.push((3, encode_to_value(v)?));
+        }
         e.push((4, encode_to_value(&self.extra_actions)?));
         Ok(component(Self::TAG, id, e))
     }
@@ -236,7 +264,8 @@ impl WizardFooter {
                 other => return Err(unknown_field("WizardFooter", *other)),
             }
         }
-        let extra_actions = extra_actions.ok_or_else(|| missing_field("WizardFooter", "extra_actions"))?;
+        let extra_actions =
+            extra_actions.ok_or_else(|| missing_field("WizardFooter", "extra_actions"))?;
         if let Some(b) = &back_action {
             ensure_ref_tag_decode(b.tag, Button::TAG, "WizardFooter", "back_action")?;
         }
@@ -253,7 +282,11 @@ impl WizardFooter {
             ensure_ref_tag_decode(b.tag, Button::TAG, "WizardFooter", "extra_actions")?;
         }
         Ok(WizardFooter {
-            back_action, next_action, cancel_action, skip_action, extra_actions,
+            back_action,
+            next_action,
+            cancel_action,
+            skip_action,
+            extra_actions,
         })
     }
 }

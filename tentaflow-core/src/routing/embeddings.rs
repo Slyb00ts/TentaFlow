@@ -248,10 +248,7 @@ impl Router {
     /// guard (`hop_count = MAX_HOP_COUNT`) przeciw re-forward loopowi. Bez tego
     /// rerank na zdalnym wezle pada (odbiorca nie obslugiwal Discriminant Rerank)
     /// i retrieval degradowal do czystego vector order.
-    pub async fn route_rerank_via_quic(
-        &self,
-        payload: &RerankPayload,
-    ) -> Result<ModelResponse> {
+    pub async fn route_rerank_via_quic(&self, payload: &RerankPayload) -> Result<ModelResponse> {
         use crate::api::openai::types::RerankRequest;
         use crate::services::runtime::context::ExecutionContext;
 

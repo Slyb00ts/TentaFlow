@@ -688,84 +688,85 @@ pub async fn handle_ws_connection<S>(
                         let mut rx = rx;
                         while let Some(event) = rx.recv().await {
                             match event {
-                                SubscriptionEvent::Chunk(chunk_body) => match media_class(
-                                    &chunk_body,
-                                ) {
-                                    Some(lossless) => {
-                                        let body_bytes =
-                                            match tentaflow_protocol::cbor::encode(&chunk_body) {
-                                                Ok(b) => b,
-                                                Err(e) => {
-                                                    warn!(
-                                                        "binary-WS: encode body failed: {}",
-                                                        e
-                                                    );
-                                                    continue;
-                                                }
+                                SubscriptionEvent::Chunk(chunk_body) => {
+                                    match media_class(&chunk_body) {
+                                        Some(lossless) => {
+                                            let body_bytes =
+                                                match tentaflow_protocol::cbor::encode(&chunk_body)
+                                                {
+                                                    Ok(b) => b,
+                                                    Err(e) => {
+                                                        warn!(
+                                                            "binary-WS: encode body failed: {}",
+                                                            e
+                                                        );
+                                                        continue;
+                                                    }
+                                                };
+                                            let frame = OutFrame {
+                                                correlation_id,
+                                                message_kind,
+                                                flags: EnvelopeFlags::IS_STREAM_CHUNK,
+                                                body_bytes,
                                             };
-                                        let frame = OutFrame {
-                                            correlation_id,
-                                            message_kind,
-                                            flags: EnvelopeFlags::IS_STREAM_CHUNK,
-                                            body_bytes,
-                                        };
-                                        let (cancels, own_poisoned) =
-                                            match media_stream.push(MediaFrame { frame, lossless })
+                                            let (cancels, own_poisoned) = match media_stream
+                                                .push(MediaFrame { frame, lossless })
                                             {
                                                 MediaPush::Accepted(c) => (c, false),
                                                 MediaPush::Poisoned(c) => (c, true),
                                                 MediaPush::Closed => break,
                                             };
-                                        // Streamy lossless, ktore stracily chunki w kolejce —
-                                        // zatrzymujemy producentow (best-effort). Ramke
-                                        // terminalna kazdego z nich dostarcza NIEZAWODNIE task
-                                        // wlasciciela: przy nastepnym push dostanie Poisoned
-                                        // (galaz nizej) albo skonsumuje event Error z cancel.
-                                        for cid in cancels {
-                                            if cid != correlation_id {
-                                                subscription::global().cancel(cid);
+                                            // Streamy lossless, ktore stracily chunki w kolejce —
+                                            // zatrzymujemy producentow (best-effort). Ramke
+                                            // terminalna kazdego z nich dostarcza NIEZAWODNIE task
+                                            // wlasciciela: przy nastepnym push dostanie Poisoned
+                                            // (galaz nizej) albo skonsumuje event Error z cancel.
+                                            for cid in cancels {
+                                                if cid != correlation_id {
+                                                    subscription::global().cancel(cid);
+                                                }
+                                            }
+                                            if own_poisoned {
+                                                // Wlasny stream stracil chunk — ramka terminalna
+                                                // idzie kanalem control (bounded + send().await),
+                                                // nie kolejka media, wiec dociera nawet przy
+                                                // przeciazeniu; klient robi resubscribe i odbudowuje
+                                                // MSE od nowego init segmentu.
+                                                media_stream.purge(correlation_id);
+                                                let _ = send_body(
+                                                    &control_tx_stream,
+                                                    correlation_id,
+                                                    message_kind,
+                                                    &MessageBody::Error(ProtocolError {
+                                                        code: ProtocolErrorCode::StreamCancelled,
+                                                        message: "subscriber_lagged: media queue \
+                                                              overflow — stream requires resync"
+                                                            .to_string(),
+                                                        trace_id: None,
+                                                    }),
+                                                    EnvelopeFlags::IS_ERROR
+                                                        | EnvelopeFlags::IS_STREAM_END,
+                                                )
+                                                .await;
+                                                break;
                                             }
                                         }
-                                        if own_poisoned {
-                                            // Wlasny stream stracil chunk — ramka terminalna
-                                            // idzie kanalem control (bounded + send().await),
-                                            // nie kolejka media, wiec dociera nawet przy
-                                            // przeciazeniu; klient robi resubscribe i odbudowuje
-                                            // MSE od nowego init segmentu.
-                                            media_stream.purge(correlation_id);
-                                            let _ = send_body(
+                                        None => {
+                                            if send_body(
                                                 &control_tx_stream,
                                                 correlation_id,
                                                 message_kind,
-                                                &MessageBody::Error(ProtocolError {
-                                                    code: ProtocolErrorCode::StreamCancelled,
-                                                    message: "subscriber_lagged: media queue \
-                                                              overflow — stream requires resync"
-                                                        .to_string(),
-                                                    trace_id: None,
-                                                }),
-                                                EnvelopeFlags::IS_ERROR
-                                                    | EnvelopeFlags::IS_STREAM_END,
+                                                &chunk_body,
+                                                EnvelopeFlags::IS_STREAM_CHUNK,
                                             )
-                                            .await;
-                                            break;
+                                            .await
+                                            .is_err()
+                                            {
+                                                break;
+                                            }
                                         }
                                     }
-                                    None => {
-                                        if send_body(
-                                            &control_tx_stream,
-                                            correlation_id,
-                                            message_kind,
-                                            &chunk_body,
-                                            EnvelopeFlags::IS_STREAM_CHUNK,
-                                        )
-                                        .await
-                                        .is_err()
-                                        {
-                                            break;
-                                        }
-                                    }
-                                },
+                                }
                                 SubscriptionEvent::End(final_body) => {
                                     media_stream.purge(correlation_id);
                                     let token = resume_token::issue(
@@ -846,7 +847,9 @@ pub async fn handle_ws_connection<S>(
                 break;
             }
             Message::Ping(data) => {
-                let _ = control_tx.send(ControlFrame::Raw(Message::Pong(data))).await;
+                let _ = control_tx
+                    .send(ControlFrame::Raw(Message::Pong(data)))
+                    .await;
             }
             Message::Pong(_) => {}
             Message::Close(_) => break,

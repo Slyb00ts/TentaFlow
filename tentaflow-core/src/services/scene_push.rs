@@ -309,7 +309,10 @@ mod tests {
         let source = SceneMapStreamSource::new(id.to_string());
         // init = current full map (2 cells).
         let init = source.init_segment().await.expect("seed = current map");
-        assert_eq!(LidarFrameHeader::decode_header(&init).unwrap().point_count, 2);
+        assert_eq!(
+            LidarFrameHeader::decode_header(&init).unwrap().point_count,
+            2
+        );
 
         let mut rx = source
             .chunk_broadcaster()
@@ -342,7 +345,11 @@ mod tests {
         mgr.on_lidar_frame(id, &frame(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], 0.05, 1));
         let g1 = mgr.generation(id);
         mgr.on_lidar_frame(id, &frame(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], 0.05, 2));
-        assert_eq!(mgr.generation(id), g1, "re-sent identical cells → no generation bump");
+        assert_eq!(
+            mgr.generation(id),
+            g1,
+            "re-sent identical cells → no generation bump"
+        );
         mgr.on_lidar_frame(id, &frame(&[[2.0, 0.0, 0.0]], 0.05, 3));
         assert!(mgr.generation(id) > g1, "a new cell bumps generation");
         mgr.remove(id);
@@ -379,6 +386,9 @@ mod tests {
             }
         };
         assert!(closed, "subscriber observes Closed after robot removal");
-        assert!(source.chunk_broadcaster().is_none(), "source marked terminal");
+        assert!(
+            source.chunk_broadcaster().is_none(),
+            "source marked terminal"
+        );
     }
 }

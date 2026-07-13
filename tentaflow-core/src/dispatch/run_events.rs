@@ -161,9 +161,9 @@ fn session_is_admin(ctx: &HandlerContext) -> bool {
 /// non-session caller is rejected for every non-admin scope.
 fn actor_id(ctx: &HandlerContext) -> Result<String, ProtocolError> {
     match &ctx.session {
-        SessionAuth::UserSession { user_id, .. } => Ok(uuid::Uuid::from_bytes(*user_id)
-            .hyphenated()
-            .to_string()),
+        SessionAuth::UserSession { user_id, .. } => {
+            Ok(uuid::Uuid::from_bytes(*user_id).hyphenated().to_string())
+        }
         _ => Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
             "run events require a session",
@@ -207,7 +207,9 @@ fn authorize_scope(
             let actor = actor_id(ctx)?;
             let run = crate::db::repository::get_agent_run(&ctx.state.db, run_id)
                 .map_err(|e| ProtocolError::internal(format!("run lookup failed: {e}")))?
-                .ok_or_else(|| ProtocolError::not_found(format!("agent run not found: {run_id}")))?;
+                .ok_or_else(|| {
+                    ProtocolError::not_found(format!("agent run not found: {run_id}"))
+                })?;
             if !session_is_admin(ctx) && run.user_id.as_deref() != Some(actor.as_str()) {
                 // Do not leak existence — report as not-found like the run views.
                 return Err(ProtocolError::not_found(format!(
@@ -337,10 +339,9 @@ mod tests {
 
     #[test]
     fn stream_handler_is_registered_and_user_gated() {
-        let meta = crate::dispatch::subscription::find_stream_handler(
-            "AgentRunEventsSubscribeRequest",
-        )
-        .expect("run-events stream handler registered in inventory");
+        let meta =
+            crate::dispatch::subscription::find_stream_handler("AgentRunEventsSubscribeRequest")
+                .expect("run-events stream handler registered in inventory");
         assert_eq!(meta.required_auth, SessionAuthKind::UserSession);
     }
 
@@ -377,9 +378,7 @@ mod tests {
         let state = AppState::for_test();
         let owner = uuid::Uuid::from_bytes([3u8; 16]).hyphenated().to_string();
         // Foreground dispatch binds the session scope to its principal.
-        state
-            .progress_broker
-            .bind_session_owner("sess-abc", &owner);
+        state.progress_broker.bind_session_owner("sess-abc", &owner);
 
         // Owner resolves to the bound key.
         let owner_ctx = ctx("user", [3u8; 16], state.clone());

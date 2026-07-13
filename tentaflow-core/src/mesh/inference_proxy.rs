@@ -1191,7 +1191,10 @@ mod tests {
         };
 
         let err = build_camera_cv_request(&payload).unwrap_err();
-        assert!(err.contains("Rgb24"), "blad powinien wskazywac Rgb24: {err}");
+        assert!(
+            err.contains("Rgb24"),
+            "blad powinien wskazywac Rgb24: {err}"
+        );
     }
 
     #[test]
@@ -1222,8 +1225,7 @@ mod tests {
         {
             use image::ImageEncoder;
             let pixels = vec![128u8; 4 * 4 * 3];
-            let encoder =
-                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, 90);
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, 90);
             encoder
                 .write_image(&pixels, 4, 4, image::ExtendedColorType::Rgb8)
                 .expect("kodowanie JPEG w tescie");

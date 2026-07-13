@@ -41,11 +41,14 @@ pub async fn handle(payload_bytes: Vec<u8>, tx: mpsc::Sender<Vec<u8>>, local_nod
     // THIS node in the requested org. The observer also gates (remote_camera_owner
     // with org match), but the owner re-checks independently so a forged request
     // from a trusted-but-mistaken peer cannot read a camera in another tenant.
-    let owned = crate::mesh::robot_dispatch::global().all().into_iter().any(|r| {
-        r.node_id == local_node_id
-            && r.camera_id.as_deref() == Some(req.camera_id.as_str())
-            && r.org_id == req.org_id
-    });
+    let owned = crate::mesh::robot_dispatch::global()
+        .all()
+        .into_iter()
+        .any(|r| {
+            r.node_id == local_node_id
+                && r.camera_id.as_deref() == Some(req.camera_id.as_str())
+                && r.org_id == req.org_id
+        });
     if !owned {
         tracing::debug!(
             target: "camera::relay",

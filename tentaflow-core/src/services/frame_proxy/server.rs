@@ -23,6 +23,7 @@ use crate::services::frame_storage::{FramePixelFormat, FrameStorage, RawFrameRef
 fn pixel_format_to_str(fmt: FramePixelFormat) -> &'static str {
     match fmt {
         FramePixelFormat::Rgb24 => "rgb24",
+        FramePixelFormat::Nv12 => "nv12",
     }
 }
 
@@ -309,7 +310,10 @@ mod tests {
         };
         let resp = build_response(&storage, &req, &cams(&["cam-robot"]));
         match resp {
-            FrameProxyResponsePayload::NotFound { raw_ref, request_id } => {
+            FrameProxyResponsePayload::NotFound {
+                raw_ref,
+                request_id,
+            } => {
                 assert_eq!(raw_ref, "cam-secret");
                 assert_eq!(request_id, "rid-deny");
             }

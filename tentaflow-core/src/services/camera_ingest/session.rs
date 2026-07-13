@@ -20,8 +20,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use super::error::{CameraIngestError, Result};
 use super::fakefile::{
-    build_pipeline, ensure_gst_initialized, resolve_file_url, seek_to_start, FrameCounters,
-    FrameMailbox,
+    build_pipeline, ensure_gst_initialized, resolve_file_url, seek_to_start, DetectFrame,
+    DetectFrameFormat, FrameCounters, FrameMailbox,
 };
 use super::local::build_local_pipeline;
 
@@ -127,6 +127,68 @@ pub struct SnapshotData {
     /// PTS klatki w osi mediów (nanosekundy) — propagowany z appsink do detekcji.
     pub pts_ns: Option<u64>,
     pub data: Vec<u8>,
+    /// Pixel layout of `data`. `Rgb24` for every non-NVDEC path (the historical
+    /// default) — `data` is directly usable RGB. `Nv12` on the GPU-resident path
+    /// (Stage 3): `data` holds packed `[Y | UV]` and a consumer that needs RGB
+    /// calls [`SnapshotData::rgb_data`], which converts LAZILY (only when a
+    /// snapshot is actually taken, never per frame). Analysis keeps the raw NV12.
+    pub crops_format: DetectFrameFormat,
+    /// Optional GPU-scaled detect frame (RGB 560×560), Arc-shared so it rides
+    /// the snapshot round-trip without copying the big crops frame twice. When
+    /// the detect branch is active this is the 560 frame; otherwise it falls
+    /// back to the crops frame (same Arc, cheap) so the detector always has an
+    /// input. `None` only before the first frame lands. Consumed by the vision
+    /// analysis loop's detect stage; the UI snapshot path ignores it.
+    pub detect: Option<DetectFrame>,
+    /// Zero-copy CROPS path ONLY: a DEVICE reference to the latest NV12 surface
+    /// (see [`super::fakefile::DeviceCropsFrame`]). When `Some`, the analysis loop
+    /// reads it directly to cut per-detection crops off the GPU (only the small
+    /// crop is downloaded). The UI snapshot path instead calls [`Self::rgb_data`],
+    /// which materializes host RGB on demand. `None` on every other path (the
+    /// mailbox already held host bytes). Rides the same round-trip as the crops
+    /// frame.
+    pub crops_device: Option<super::fakefile::DeviceCropsFrame>,
+}
+
+impl SnapshotData {
+    /// RGB24 view of the crops frame, converting from NV12 LAZILY (Stage 3): the
+    /// per-frame hot path never converts, so every RGB consumer (UI snapshot,
+    /// streaming fallback) pays the NV12→RGB cost here, only when it actually
+    /// takes a snapshot. `Rgb24` frames are returned borrowed (zero copy).
+    pub fn rgb_data(&self) -> std::borrow::Cow<'_, [u8]> {
+        match self.crops_format {
+            DetectFrameFormat::Rgb24 => std::borrow::Cow::Borrowed(&self.data),
+            DetectFrameFormat::Nv12 { .. } => {
+                // Zero-copy crops: `data` is empty (the frame was never downloaded
+                // per-frame). Download the FULL NV12 ON DEMAND here — this is the
+                // only place a snapshot actually needs the whole frame — then
+                // convert to RGB. The analysis path never calls `rgb_data`; it
+                // reads `crops_device` directly for small per-crop downloads.
+                if self.data.is_empty() {
+                    if let Some(dev) = &self.crops_device {
+                        if let Some((nv12, fmt)) = dev.download_full_nv12() {
+                            if let Some(rgb) = super::fakefile::nv12_frame_to_rgb24(
+                                &nv12,
+                                self.width,
+                                self.height,
+                                &fmt,
+                            ) {
+                                return std::borrow::Cow::Owned(rgb);
+                            }
+                        }
+                    }
+                }
+                super::fakefile::nv12_frame_to_rgb24(
+                    &self.data,
+                    self.width,
+                    self.height,
+                    &self.crops_format,
+                )
+                .map(std::borrow::Cow::Owned)
+                .unwrap_or(std::borrow::Cow::Borrowed(&self.data))
+            }
+        }
+    }
 }
 
 /// Control-plane messages sent into a session task.
@@ -155,7 +217,9 @@ pub enum SessionCommand {
     /// pipeline to baseline. Posted by `Mp4StreamPublisher::drop` when the
     /// hub releases the last strong reference (i.e. the last subscriber went
     /// away); `preview` routes the teardown to the right branch slot.
-    DetachMp4Branch { preview: bool },
+    DetachMp4Branch {
+        preview: bool,
+    },
 }
 
 /// External handle to a running session, stored in the supervisor registry.
@@ -539,6 +603,10 @@ async fn run_session(
                             tokio::time::Instant::now() + Duration::from_millis(4500);
                         let snap = loop {
                             if let Some(f) = mailbox.get() {
+                                // Detect frame (Arc-shared) rides alongside the
+                                // crops frame in ONE round-trip. `get_detect`
+                                // falls back to crops when the GPU detect branch
+                                // is absent, so detection always has an input.
                                 break Ok(SnapshotData {
                                     camera_id: cam_id.clone(),
                                     width: f.width,
@@ -547,6 +615,14 @@ async fn run_session(
                                     timestamp_unix_ms: f.timestamp_unix_ms,
                                     pts_ns: f.pts_ns,
                                     data: f.data.to_vec(),
+                                    crops_format: f.format,
+                                    detect: mailbox.get_detect(),
+                                    // Zero-copy crops: pass the device handle
+                                    // through WITHOUT downloading — the analysis
+                                    // loop crops per-detection off it; `rgb_data`
+                                    // downloads the full frame only on a UI
+                                    // snapshot. `None` on every other path.
+                                    crops_device: f.device.clone(),
                                 });
                             }
                             let h = health_tx.borrow().clone();

@@ -254,8 +254,7 @@ impl ModelSpec {
         } else {
             0.0
         };
-        let ffn_per_layer =
-            active_experts * 3.0 * h * moe_i + shared + h * self.num_experts as f64;
+        let ffn_per_layer = active_experts * 3.0 * h * moe_i + shared + h * self.num_experts as f64;
         let norms_per_layer = 2.0 * h;
         let lm_head = if self.tie_word_embeddings { 0.0 } else { v * h };
         (embed + l * (attn_per_layer + ffn_per_layer + norms_per_layer) + lm_head) as u64
@@ -688,9 +687,7 @@ pub fn estimate_vllm_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramE
             input.tensor_parallel, model.num_attention_heads
         ));
     }
-    if model.num_key_value_heads > 0
-        && (input.tensor_parallel as u64) > model.num_key_value_heads
-    {
+    if model.num_key_value_heads > 0 && (input.tensor_parallel as u64) > model.num_key_value_heads {
         warnings.push(format!(
             "tensor_parallel={} > num_key_value_heads={} - KV replikowane miedzy ranki, \
              brak dalszej oszczednosci KV per-GPU powyzej TP={}",
@@ -716,7 +713,8 @@ pub fn estimate_vllm_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramE
     // DRUG-1: budzet calkowity respektuje util (vLLM nie ma dostepu do calego VRAM)
     // i nigdy nie jest spelniony gdy ktorakolwiek GPU nie miesci stalego footprintu.
     let fits_total = fits_per_gpu
-        && total_gb <= input.gpu_memory_gb_each * input.gpu_count as f64 * input.gpu_memory_utilization;
+        && total_gb
+            <= input.gpu_memory_gb_each * input.gpu_count as f64 * input.gpu_memory_utilization;
 
     if required_fixed_per_gpu > usable_per_gpu {
         warnings.push(format!(
@@ -827,7 +825,8 @@ pub fn estimate_llamacpp_vram(model: &ModelSpec, input: &VramEstimateInput) -> V
     // + compute + cuda; secondary = weights/gpus + cuda. Layer-split (pp>1, tp==1):
     // warstwa KV zyje na karcie tej warstwy, wiec KV dzieli sie rowno (kv/gpus).
     let per_gpu_gb = if tp > 1 {
-        let main_gpu = weights_per_gpu + kv_cache_gb + compute_buffer_gb + LLAMACPP_CUDA_CTX_PER_GPU;
+        let main_gpu =
+            weights_per_gpu + kv_cache_gb + compute_buffer_gb + LLAMACPP_CUDA_CTX_PER_GPU;
         let secondary = weights_per_gpu + LLAMACPP_CUDA_CTX_PER_GPU;
         main_gpu.max(secondary)
     } else {
@@ -875,9 +874,8 @@ pub fn estimate_llamacpp_vram(model: &ModelSpec, input: &VramEstimateInput) -> V
     // Compute buffer wymaga vocab_size + hidden_size z metadanych GGUF. Gdy ich
     // brak liczymy 0 - user musi wiedziec ze ten skladnik jest pominiety.
     if model.vocab_size == 0 || model.hidden_size == 0 {
-        warnings.push(
-            "compute buffer niepoliczony - brak vocab/hidden w metadanych GGUF".to_string(),
-        );
+        warnings
+            .push("compute buffer niepoliczony - brak vocab/hidden w metadanych GGUF".to_string());
     }
 
     let usable_per_gpu = input.gpu_memory_gb_each * input.gpu_memory_utilization;
@@ -1427,9 +1425,8 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
             }
         }
     };
-    let fits = |ctx: u64, seqs: u64| -> bool {
-        kv_demand_bytes(ctx, seqs) <= kv_budget_bytes_for(seqs)
-    };
+    let fits =
+        |ctx: u64, seqs: u64| -> bool { kv_demand_bytes(ctx, seqs) <= kv_budget_bytes_for(seqs) };
 
     let make_applied = |ctx: u64, seqs: u64| -> VramEstimateInput {
         VramEstimateInput {
@@ -1810,11 +1807,14 @@ pub fn parse_hf_config_with_override(
     // zalezy od group_size (g64 4-bit = 0.5625, g32 = 0.625), wiec liczymy jawny
     // bytes/param i ustawiamy etykiete. vLLM/GGUF nie uzywaja tego pola, wiec
     // override ich nie dotyczy.
-    let mlx_bytes_override = cfg.get("quantization").and_then(|v| v.as_object()).and_then(|q| {
-        let bits = q.get("bits").and_then(|b| b.as_u64())?;
-        let group_size = q.get("group_size").and_then(|g| g.as_u64()).unwrap_or(64);
-        Some((bits, group_size, mlx_weight_bytes(bits, group_size)))
-    });
+    let mlx_bytes_override = cfg
+        .get("quantization")
+        .and_then(|v| v.as_object())
+        .and_then(|q| {
+            let bits = q.get("bits").and_then(|b| b.as_u64())?;
+            let group_size = q.get("group_size").and_then(|g| g.as_u64()).unwrap_or(64);
+            Some((bits, group_size, mlx_weight_bytes(bits, group_size)))
+        });
     let bytes_per_param_override = mlx_bytes_override.map(|(_, _, b)| b);
     if let Some((bits, group_size, _)) = mlx_bytes_override {
         if quantization.is_none() {
@@ -2311,9 +2311,9 @@ impl<'a> GgufReader<'a> {
     /// Zwraca rozmiar w bajtach dla typow stalej dlugosci.
     fn scalar_size(value_type: u32) -> Result<usize> {
         Ok(match value_type {
-            0 | 1 | 7 => 1,  // u8 / i8 / bool
-            2 | 3 => 2,      // u16 / i16
-            4 | 5 | 6 => 4,  // u32 / i32 / f32
+            0 | 1 | 7 => 1,    // u8 / i8 / bool
+            2 | 3 => 2,        // u16 / i16
+            4 | 5 | 6 => 4,    // u32 / i32 / f32
             10 | 11 | 12 => 8, // u64 / i64 / f64
             other => {
                 return Err(anyhow!(
@@ -2335,11 +2335,7 @@ impl<'a> GgufReader<'a> {
             5 => self.u32()? as i32 as i64 as u64,
             10 => self.u64()?,
             11 => self.u64()? as i64 as u64,
-            other => {
-                return Err(anyhow!(
-                    "GGUF: typ {other} nie jest skalarem calkowitym"
-                ))
-            }
+            other => return Err(anyhow!("GGUF: typ {other} nie jest skalarem calkowitym")),
         })
     }
 
@@ -2441,12 +2437,13 @@ pub fn parse_gguf_header(buf: &[u8], gguf_file: &str) -> Result<ModelSpec> {
             _ => None,
         }
     };
-    let get_str = |kv: &std::collections::HashMap<String, GgufValue>, key: &str| -> Option<String> {
-        match kv.get(key) {
-            Some(GgufValue::String(s)) => Some(s.clone()),
-            _ => None,
-        }
-    };
+    let get_str =
+        |kv: &std::collections::HashMap<String, GgufValue>, key: &str| -> Option<String> {
+            match kv.get(key) {
+                Some(GgufValue::String(s)) => Some(s.clone()),
+                _ => None,
+            }
+        };
     let get_arr_len =
         |kv: &std::collections::HashMap<String, GgufValue>, key: &str| -> Option<u64> {
             match kv.get(key) {
@@ -2536,8 +2533,7 @@ pub fn parse_gguf_header(buf: &[u8], gguf_file: &str) -> Result<ModelSpec> {
     // carries the max (display / TP heuristics); the per-layer values feed the
     // SWA-aware KV aggregates below.
     let kv_heads_arr = get_u64_array(&kv, &key("attention.head_count_kv"));
-    let num_key_value_heads = match (&kv_heads_arr, get_u64(&kv, &key("attention.head_count_kv")))
-    {
+    let num_key_value_heads = match (&kv_heads_arr, get_u64(&kv, &key("attention.head_count_kv"))) {
         (Some(a), _) => a.iter().copied().max().unwrap_or(num_attention_heads),
         (None, Some(v)) => v,
         (None, None) => num_attention_heads,
@@ -2609,7 +2605,9 @@ pub fn parse_gguf_header(buf: &[u8], gguf_file: &str) -> Result<ModelSpec> {
 
     // Quantization z nazwy pliku (jednoznaczna). Fallback: bf16 gdy nazwa milczy.
     let quant_label = detect_quant_from_name(gguf_file);
-    let dtype = quant_label.clone().unwrap_or_else(|| "bfloat16".to_string());
+    let dtype = quant_label
+        .clone()
+        .unwrap_or_else(|| "bfloat16".to_string());
 
     Ok(ModelSpec {
         model_type: arch,
@@ -2765,14 +2763,23 @@ pub async fn fetch_gguf_spec(
     // Probuj 1 MiB; przy braku bajtow na tablice tokenizera dociagnij 8 MiB.
     const CHUNK_1MIB: u64 = 1024 * 1024 - 1;
     const CHUNK_8MIB: u64 = 8 * 1024 * 1024 - 1;
-    let first = fetch_gguf_range(client, &url, CHUNK_1MIB.min(file_size.saturating_sub(1)), hf_token)
-        .await?;
+    let first = fetch_gguf_range(
+        client,
+        &url,
+        CHUNK_1MIB.min(file_size.saturating_sub(1)),
+        hf_token,
+    )
+    .await?;
     let spec = match parse_gguf_header(&first, gguf_file) {
         Ok(spec) => spec,
         Err(_) if file_size > CHUNK_1MIB + 1 => {
-            let bigger =
-                fetch_gguf_range(client, &url, CHUNK_8MIB.min(file_size.saturating_sub(1)), hf_token)
-                    .await?;
+            let bigger = fetch_gguf_range(
+                client,
+                &url,
+                CHUNK_8MIB.min(file_size.saturating_sub(1)),
+                hf_token,
+            )
+            .await?;
             parse_gguf_header(&bigger, gguf_file)?
         }
         Err(e) => return Err(e),
@@ -4606,7 +4613,10 @@ mod tests {
             est.concurrent_full_len_seqs.floor().max(1.0) as u64,
             "max_concurrent = floor(concurrent_full_len_seqs)"
         );
-        assert!(conc >= 7, "Qwen2.5-32B TP=2 puli starcza na >=7 sekwencji 32k: {conc}");
+        assert!(
+            conc >= 7,
+            "Qwen2.5-32B TP=2 puli starcza na >=7 sekwencji 32k: {conc}"
+        );
     }
 
     #[test]
@@ -4624,7 +4634,10 @@ mod tests {
         assert!(args.contains("-c 65536"), "caly ctx = 8192*8: {args}");
         assert!(args.contains("-np 8"), "8 slotow: {args}");
         assert!(args.contains("-ub 512"), "fizyczny ubatch: {args}");
-        assert!(!args.contains("-b 512"), "logiczny -b NIE emitowany: {args}");
+        assert!(
+            !args.contains("-b 512"),
+            "logiczny -b NIE emitowany: {args}"
+        );
     }
 
     #[test]
@@ -4642,7 +4655,10 @@ mod tests {
         let args = build_llamacpp_args_string(&m, &input);
         assert!(args.contains("--cache-type-k q8_0"), "K=q8_0: {args}");
         assert!(args.contains("--cache-type-v q4_0"), "V=q4_0: {args}");
-        assert!(args.contains("-fa"), "kwantyzowane V wymaga flash-attn: {args}");
+        assert!(
+            args.contains("-fa"),
+            "kwantyzowane V wymaga flash-attn: {args}"
+        );
 
         // f16/auto NIE emituja flagi cache-type ani -fa (domyslne 2.0 B).
         let input_default = VramEstimateInput {
@@ -4663,7 +4679,10 @@ mod tests {
             ..Default::default()
         };
         let args_fp8 = build_llamacpp_args_string(&m, &input_fp8);
-        assert!(args_fp8.contains("--cache-type-k q8_0"), "fp8->q8_0: {args_fp8}");
+        assert!(
+            args_fp8.contains("--cache-type-k q8_0"),
+            "fp8->q8_0: {args_fp8}"
+        );
     }
 
     #[test]
@@ -4820,7 +4839,11 @@ mod tests {
             weights_bytes_override: Some((16.0 * 1024.0 * 1024.0 * 1024.0) as u64),
         };
         let out = auto_fit_config(&m, &req);
-        assert!(out.error.is_none(), "ctx 8192 × 8 slotow miesci sie w 80 GB: {:?}", out.error);
+        assert!(
+            out.error.is_none(),
+            "ctx 8192 × 8 slotow miesci sie w 80 GB: {:?}",
+            out.error
+        );
         let est = estimate_llamacpp_vram(&m, &out.applied);
         assert_eq!(est.pool_tokens, 8192 * 8, "n_ctx liczone dla ctx*seqs");
     }
@@ -5005,7 +5028,11 @@ mod tests {
         gguf_kv_u32(&mut buf, "gemma4.attention.key_length_swa", 256);
         gguf_kv_u32(&mut buf, "gemma4.attention.value_length_swa", 256);
         gguf_kv_u32(&mut buf, "gemma4.attention.sliding_window", 1024);
-        gguf_kv_u32_array(&mut buf, "gemma4.attention.sliding_window_pattern", &swa_pattern);
+        gguf_kv_u32_array(
+            &mut buf,
+            "gemma4.attention.sliding_window_pattern",
+            &swa_pattern,
+        );
         gguf_kv_string_array(&mut buf, "tokenizer.ggml.tokens", &["<pad>", "a", "b"]);
 
         let spec = parse_gguf_header(&buf, "gemma-4-31b-it-qat-q4_0.gguf")
@@ -5253,7 +5280,10 @@ mod tests {
             out.applied.max_model_len
         );
         let est_q8 = estimate_llamacpp_vram(&m, &out_q8.applied);
-        assert!(est_q8.fits_per_gpu, "q8_0 po auto-fit musi fits: {est_q8:?}");
+        assert!(
+            est_q8.fits_per_gpu,
+            "q8_0 po auto-fit musi fits: {est_q8:?}"
+        );
         println!(
             "gemma4-31b/24GB q8_0: ctx={} seqs={} kv={:.2} GiB per_gpu={:.2} GiB",
             out_q8.applied.max_model_len,

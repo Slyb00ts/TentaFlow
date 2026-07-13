@@ -164,9 +164,7 @@ impl DeployStrategy for BinaryDeploy {
         if let Some(model) = super::resolve_model_repo(&self.manifest, &self.user_config) {
             env.insert("MODEL".to_string(), model);
         }
-        if let Some(served) =
-            super::resolve_served_model_name(&self.manifest, &self.user_config)
-        {
+        if let Some(served) = super::resolve_served_model_name(&self.manifest, &self.user_config) {
             env.insert("SERVED_MODEL_NAME".to_string(), served);
         }
         // HF_TOKEN only for engines that actually pull weights from HF.

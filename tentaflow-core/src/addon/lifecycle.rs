@@ -327,8 +327,8 @@ fn substitute_placeholders(
             .ok_or_else(|| anyhow::anyhow!("niezamkniety placeholder ${{ w manifescie"))?;
         let key = &after[..end];
         let value = config.get(key).map(|v| v.trim()).filter(|v| !v.is_empty());
-        let value = value
-            .ok_or_else(|| anyhow::anyhow!("brak wartosci dla placeholdera '${{{key}}}'"))?;
+        let value =
+            value.ok_or_else(|| anyhow::anyhow!("brak wartosci dla placeholdera '${{{key}}}'"))?;
         if validate_host {
             validate_host_token(key, value)?;
         }
@@ -390,7 +390,9 @@ fn is_valid_dns_hostname(host: &str) -> bool {
             && label.len() <= 63
             && !label.starts_with('-')
             && !label.ends_with('-')
-            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
     })
 }
 
@@ -633,11 +635,12 @@ fn install_core(
     // instancji, zeby detekcja aktualizacji reagowala na zmiane TRESCI pakietu
     // (manifest/wasm/migracje) nawet bez podbicia numeru wersji. Pobierane przed
     // zajeciem locka, zeby nie zagniezdzac blokady DB.
-    let installed_bundle_hash = crate::db::repository::get_addon_package(db, package_id, package_version)
-        .ok()
-        .flatten()
-        .map(|p| p.bundle_hash)
-        .unwrap_or_default();
+    let installed_bundle_hash =
+        crate::db::repository::get_addon_package(db, package_id, package_version)
+            .ok()
+            .flatten()
+            .map(|p| p.bundle_hash)
+            .unwrap_or_default();
 
     // 5-9. Zarejestruj w DB (w jednej transakcji)
     let conn = db.write().unwrap();
@@ -1850,7 +1853,8 @@ fn upgrade_core(
                 res.llm_tokens_per_minute.unwrap_or(0) as i64,
                 res.fuel_limit.unwrap_or(0) as i64,
             ],
-        ).ok();
+        )
+        .ok();
     } else {
         conn.execute(
             "INSERT OR IGNORE INTO addon_resource_limits \
@@ -2620,13 +2624,15 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
 /// `[robot.safety]`). Absent section → `None`.
 fn parse_robot_section(value: Option<&toml::Value>) -> Option<crate::addon::RobotManifestSection> {
     let table = value?.as_table()?;
-    let safety = table.get("safety").and_then(|s| s.as_table()).map(|st| {
-        crate::addon::RobotSafetySection {
-            max_linear_mps: st.get("max_linear_mps").and_then(|v| v.as_float()),
-            max_yaw_rps: st.get("max_yaw_rps").and_then(|v| v.as_float()),
-            require_estop_clear: st.get("require_estop_clear").and_then(|v| v.as_bool()),
-        }
-    });
+    let safety =
+        table
+            .get("safety")
+            .and_then(|s| s.as_table())
+            .map(|st| crate::addon::RobotSafetySection {
+                max_linear_mps: st.get("max_linear_mps").and_then(|v| v.as_float()),
+                max_yaw_rps: st.get("max_yaw_rps").and_then(|v| v.as_float()),
+                require_estop_clear: st.get("require_estop_clear").and_then(|v| v.as_bool()),
+            });
     Some(crate::addon::RobotManifestSection {
         controls_robot: table
             .get("controls_robot")
@@ -3201,11 +3207,7 @@ const ENGINE_FLOW_STATE_KEY_PREFIX: &str = "engine_flow_model:";
 /// Idempotentny (install + mesh reconcile + upgrade): istniejący flow o tej
 /// nazwie jest najpierw usuwany (kasuje też wiązanie przez ON DELETE CASCADE +
 /// jawnie), a potem tworzony od nowa ze świeżego JSON.
-fn register_engine_flows(
-    db: &DbPool,
-    manifest: &AddonManifest,
-    addon_dir: &Path,
-) -> Result<()> {
+fn register_engine_flows(db: &DbPool, manifest: &AddonManifest, addon_dir: &Path) -> Result<()> {
     if manifest.engine_flows.is_empty() {
         return Ok(());
     }
@@ -3222,25 +3224,39 @@ fn register_engine_flows(
         let published_name = engine_flow_published_name(addon_id, &spec.id);
 
         // Wczytaj DAG flow_engine z katalogu addona (ochrona path-traversal).
-        let flow_path = crate::util::path_safety::safe_resolve(addon_dir, &spec.path)
-            .map_err(|e| anyhow::anyhow!("[[engine_flow]] '{}': ścieżka '{}' odrzucona: {e}", spec.id, spec.path))?;
+        let flow_path =
+            crate::util::path_safety::safe_resolve(addon_dir, &spec.path).map_err(|e| {
+                anyhow::anyhow!(
+                    "[[engine_flow]] '{}': ścieżka '{}' odrzucona: {e}",
+                    spec.id,
+                    spec.path
+                )
+            })?;
         let flow_json = std::fs::read_to_string(&flow_path).map_err(|e| {
-            anyhow::anyhow!("[[engine_flow]] '{}': nie udało się odczytać '{}': {e}", spec.id, spec.path)
+            anyhow::anyhow!(
+                "[[engine_flow]] '{}': nie udało się odczytać '{}': {e}",
+                spec.id,
+                spec.path
+            )
         })?;
 
         // Parse + walidacja — fail-fast jak przy save flow. Bug 4: ZAWSZE
         // walidujemy, żeby nie persystować niepoprawnego DAG. Z dispatcherem:
         // pełne R1–R10 (rejestr adapterów). Bez dispatchera (bardzo wczesny start /
         // fixture): walidacja STRUKTURALNA (R1/R5/unikalność) — nie pomijamy jej.
-        let parsed: crate::flow_engine::types::FlowDefinition =
-            serde_json::from_str(&flow_json).map_err(|e| {
+        let parsed: crate::flow_engine::types::FlowDefinition = serde_json::from_str(&flow_json)
+            .map_err(|e| {
                 anyhow::anyhow!("[[engine_flow]] '{}': niepoprawny flow_json: {e}", spec.id)
             })?;
         match dispatcher.as_ref() {
-            Some(d) => crate::flow_engine::validation::validate(&parsed, d.registry())
-                .map_err(|e| {
-                    anyhow::anyhow!("[[engine_flow]] '{}': walidacja flow nie przeszła: {e}", spec.id)
-                })?,
+            Some(d) => {
+                crate::flow_engine::validation::validate(&parsed, d.registry()).map_err(|e| {
+                    anyhow::anyhow!(
+                        "[[engine_flow]] '{}': walidacja flow nie przeszła: {e}",
+                        spec.id
+                    )
+                })?
+            }
             None => crate::flow_engine::validation::validate_structural(&parsed).map_err(|e| {
                 anyhow::anyhow!(
                     "[[engine_flow]] '{}': walidacja strukturalna flow nie przeszła: {e}",
@@ -3266,12 +3282,8 @@ fn register_engine_flows(
             published_model_name: Some(published_name.as_str()),
             actor_user_id: None,
         };
-        let flow_id = crate::db::repository::register_engine_flow_atomic(
-            db,
-            &params,
-            &published_name,
-            100,
-        )?;
+        let flow_id =
+            crate::db::repository::register_engine_flow_atomic(db, &params, &published_name, 100)?;
 
         // Per-flow published-name do durable KV (`engine_flow_model:<id>`), żeby
         // addon mógł wyzwolić KONKRETNY engine-flow (np. ingest) bez znajomości
@@ -3885,14 +3897,20 @@ service_type = "chat"
             .expect("namespace passages");
         let field_names: Vec<&str> = passages.fields.iter().map(|f| f.name.as_str()).collect();
         assert!(field_names.contains(&"text"), "fields: {field_names:?}");
-        assert!(field_names.contains(&"collection_id"), "fields: {field_names:?}");
+        assert!(
+            field_names.contains(&"collection_id"),
+            "fields: {field_names:?}"
+        );
     }
 
     /// Dołączony `query.flow.json` addona RAG przechodzi `validation::validate`
     /// (R1–R10) na pełnym rejestrze adapterów — flow jest realnie wykonywalny.
     #[test]
     fn rag_query_flow_json_passes_validation() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/addons/rag/flows/query.flow.json");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/addons/rag/flows/query.flow.json"
+        );
         let json = std::fs::read_to_string(path).expect("query.flow.json istnieje");
         let def: crate::flow_engine::types::FlowDefinition =
             serde_json::from_str(&json).expect("parsuje się do FlowDefinition");
@@ -3934,9 +3952,11 @@ service_type = "chat"
         let id1 = crate::db::repository::get_flow_id_by_published_model_name(&db, name1)
             .unwrap()
             .expect("flow instancji 1");
-        assert!(crate::db::repository::get_flow_id_by_published_model_name(&db, name2)
-            .unwrap()
-            .is_some());
+        assert!(
+            crate::db::repository::get_flow_id_by_published_model_name(&db, name2)
+                .unwrap()
+                .is_some()
+        );
         // get_flow_for_model rozwiązuje WYŁĄCZNIE przez wiązanie (bez fallbacku do
         // default flow service_type), więc testuje dokładnie ścieżkę publish->bind.
         let resolved = crate::db::repository::get_flow_for_model(&db, name1)
@@ -3946,9 +3966,11 @@ service_type = "chat"
 
         // Idempotencja: ponowna rejestracja m1 nie duplikuje (UNIQUE) i podmienia.
         register_engine_flows(&db, &m1, dir.path()).unwrap();
-        assert!(crate::db::repository::get_flow_id_by_published_model_name(&db, name1)
-            .unwrap()
-            .is_some());
+        assert!(
+            crate::db::repository::get_flow_id_by_published_model_name(&db, name1)
+                .unwrap()
+                .is_some()
+        );
 
         // Uninstall instancji 1 kasuje JEJ flow + wiązanie, nie rusza instancji 2.
         unregister_engine_flows(&db, &m1);
@@ -4042,9 +4064,11 @@ service_type = "chat"
             "niepoprawny DAG musi paść na walidacji, był: {err}"
         );
         // Nic nie zostało zapisane.
-        assert!(crate::db::repository::get_flow_id_by_published_model_name(&db, "rag-cccc:query")
-            .unwrap()
-            .is_none());
+        assert!(
+            crate::db::repository::get_flow_id_by_published_model_name(&db, "rag-cccc:query")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Bug 5 — id z niedozwolonymi znakami LIKE (`_`/`%`) jest odrzucone przy

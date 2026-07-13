@@ -2,6 +2,7 @@
 // File: protocol/ui/action/menus.rs — MenuButton/Menu (catalog §6)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::BindRef;
 use super::super::component::{Component, FieldMap};
 use super::super::inline::{IconRef, MenuItem};
@@ -10,11 +11,19 @@ use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -36,8 +45,12 @@ impl MenuButton {
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(5);
-        if let Some(v) = &self.trigger_label { e.push((0, encode_to_value(v)?)); }
-        if let Some(v) = &self.trigger_icon { e.push((1, encode_to_value(v)?)); }
+        if let Some(v) = &self.trigger_label {
+            e.push((0, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.trigger_icon {
+            e.push((1, encode_to_value(v)?));
+        }
         e.push((2, encode_to_value(&self.trigger_variant)?));
         e.push((3, encode_to_value(&self.items)?));
         e.push((4, encode_to_value(&self.placement)?));
@@ -47,8 +60,11 @@ impl MenuButton {
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "MenuButton")?;
         ensure_no_duplicate_keys("MenuButton", &c.fields.0)?;
-        let mut trigger_label = None; let mut trigger_icon = None;
-        let mut trigger_variant = None; let mut items = None; let mut placement = None;
+        let mut trigger_label = None;
+        let mut trigger_icon = None;
+        let mut trigger_variant = None;
+        let mut items = None;
+        let mut placement = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => trigger_label = Some(decode_from_value(v)?),
@@ -60,8 +76,10 @@ impl MenuButton {
             }
         }
         Ok(MenuButton {
-            trigger_label, trigger_icon,
-            trigger_variant: trigger_variant.ok_or_else(|| missing_field("MenuButton", "trigger_variant"))?,
+            trigger_label,
+            trigger_icon,
+            trigger_variant: trigger_variant
+                .ok_or_else(|| missing_field("MenuButton", "trigger_variant"))?,
             items: items.ok_or_else(|| missing_field("MenuButton", "items"))?,
             placement: placement.ok_or_else(|| missing_field("MenuButton", "placement"))?,
         })
@@ -92,7 +110,8 @@ impl Menu {
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "Menu")?;
         ensure_no_duplicate_keys("Menu", &c.fields.0)?;
-        let mut items = None; let mut search = None;
+        let mut items = None;
+        let mut search = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => items = Some(decode_from_value(v)?),

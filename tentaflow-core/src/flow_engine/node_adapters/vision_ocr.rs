@@ -138,13 +138,24 @@ mod tests {
     #[async_trait]
     impl VisionDispatcher for FakeVision {
         async fn ocr(&self, req: VisionOcrRequest) -> Result<Option<String>> {
-            assert_eq!(req.rgb.len(), (req.width * req.height * 3) as usize, "tight crop");
+            assert_eq!(
+                req.rgb.len(),
+                (req.width * req.height * 3) as usize,
+                "tight crop"
+            );
             self.ocr_crops.lock().unwrap().push((req.width, req.height));
             Ok(Some("WX 12345".into()))
         }
         async fn classify(&self, req: VisionClassifyRequest) -> Result<Vec<String>> {
-            assert_eq!(req.rgb.len(), (req.width * req.height * 3) as usize, "tight crop");
-            self.classify_crops.lock().unwrap().push((req.width, req.height));
+            assert_eq!(
+                req.rgb.len(),
+                (req.width * req.height * 3) as usize,
+                "tight crop"
+            );
+            self.classify_crops
+                .lock()
+                .unwrap()
+                .push((req.width, req.height));
             Ok(vec!["pełna".into()])
         }
     }
@@ -156,7 +167,10 @@ mod tests {
             score: 0.9,
             stan: vec![],
             tekst: None,
+            tekst_conf: None,
+            tekst_thumb_ref: None,
             track_id: 0,
+            vehicle_id: 0,
             vx: 0.,
             vy: 0.,
         }

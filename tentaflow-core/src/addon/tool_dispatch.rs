@@ -125,8 +125,12 @@ impl ToolDispatcher {
     ) -> Result<serde_json::Value> {
         let tools = self.addon_manager.list_tools();
         let tool = resolve_tool(&tools, tool_name)?;
-        self.addon_manager
-            .call_tool_preauthorized(&tool.addon_id, &tool.tool_name, arguments, user_id)
+        self.addon_manager.call_tool_preauthorized(
+            &tool.addon_id,
+            &tool.tool_name,
+            arguments,
+            user_id,
+        )
     }
 
     /// Executes every call requested by one assistant turn, in order

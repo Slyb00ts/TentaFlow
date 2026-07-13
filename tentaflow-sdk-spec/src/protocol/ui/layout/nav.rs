@@ -2,12 +2,10 @@
 // File: protocol/ui/layout/nav.rs — Sidebar/Tabs/NavTabs/Breadcrumb/Pagination (catalog §3)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::BindRef;
 use super::super::component::{Component, FieldMap};
-use super::super::inline::{
-    BreadcrumbItem, NavTab,
-    SidebarItem, TabItem,
-};
+use super::super::inline::{BreadcrumbItem, NavTab, SidebarItem, TabItem};
 use super::super::tokens::{
     BreadcrumbSeparator, Density, NavTabsVariant, PaginationVariant, TabsVariant,
 };
@@ -15,11 +13,19 @@ use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -39,10 +45,16 @@ impl Sidebar {
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(4);
-        if let Some(h) = &self.header_slot { entries.push((0, encode_to_value(h)?)); }
+        if let Some(h) = &self.header_slot {
+            entries.push((0, encode_to_value(h)?));
+        }
         entries.push((1, encode_to_value(&self.items)?));
-        if let Some(f) = &self.footer_slot { entries.push((2, encode_to_value(f)?)); }
-        if let Some(c) = &self.collapsed { entries.push((3, encode_to_value(c)?)); }
+        if let Some(f) = &self.footer_slot {
+            entries.push((2, encode_to_value(f)?));
+        }
+        if let Some(c) = &self.collapsed {
+            entries.push((3, encode_to_value(c)?));
+        }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -169,7 +181,8 @@ impl NavTabs {
             items: items.unwrap_or_default(),
             active_id: active_id.ok_or_else(|| missing_field("NavTabs", "active_id"))?,
             variant: variant.ok_or_else(|| missing_field("NavTabs", "variant"))?,
-            scroll_overflow: scroll_overflow.ok_or_else(|| missing_field("NavTabs", "scroll_overflow"))?,
+            scroll_overflow: scroll_overflow
+                .ok_or_else(|| missing_field("NavTabs", "scroll_overflow"))?,
         })
     }
 }
@@ -260,11 +273,12 @@ impl Pagination {
             }
         }
         Ok(Pagination {
-            current_page: current_page.ok_or_else(|| missing_field("Pagination", "current_page"))?,
+            current_page: current_page
+                .ok_or_else(|| missing_field("Pagination", "current_page"))?,
             total_pages: total_pages.ok_or_else(|| missing_field("Pagination", "total_pages"))?,
             variant: variant.ok_or_else(|| missing_field("Pagination", "variant"))?,
-            show_summary: show_summary.ok_or_else(|| missing_field("Pagination", "show_summary"))?,
+            show_summary: show_summary
+                .ok_or_else(|| missing_field("Pagination", "show_summary"))?,
         })
     }
 }
-

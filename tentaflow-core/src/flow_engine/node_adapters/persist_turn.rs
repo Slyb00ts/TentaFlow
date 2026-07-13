@@ -13,9 +13,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
-use crate::flow_engine::envelope::{
-    ChatMessageContent, FlowEnvelope, MessagePart, NodeInput,
-};
+use crate::flow_engine::envelope::{ChatMessageContent, FlowEnvelope, MessagePart, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::node_adapters::conversation_history::HISTORY_BASE_LEN_META;
 use crate::flow_engine::types::{FlowDataType, FlowNode};
@@ -261,9 +259,6 @@ mod tests {
         let b = hist.batches.lock().unwrap();
         assert_eq!(b[0].1.len(), 1);
         // The message kept its multimodal Parts content.
-        assert!(matches!(
-            b[0].1[0].content,
-            ChatMessageContent::Parts(_)
-        ));
+        assert!(matches!(b[0].1[0].content, ChatMessageContent::Parts(_)));
     }
 }

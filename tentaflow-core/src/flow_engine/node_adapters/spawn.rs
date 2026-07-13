@@ -49,7 +49,10 @@ impl SpawnNodeAdapter {
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| {
-                anyhow!("spawn node '{}': 'agent_id' or 'agent_name' is required", node.id)
+                anyhow!(
+                    "spawn node '{}': 'agent_id' or 'agent_name' is required",
+                    node.id
+                )
             })?;
         let service = self
             .service
@@ -143,10 +146,7 @@ impl SpawnNodeAdapter {
             args["context"] = Value::String(context);
         }
         let outcome = manager.handle_agent_spawn(&caller, &args).await?;
-        let run_ids = outcome
-            .get("run_ids")
-            .cloned()
-            .unwrap_or_else(|| json!([]));
+        let run_ids = outcome.get("run_ids").cloned().unwrap_or_else(|| json!([]));
 
         let mut out: FlowEnvelope = envelope.clone();
         out.variables
@@ -210,9 +210,8 @@ mod tests {
 
     fn service(pool: DbPool) -> AgentServiceSlot {
         let cipher = Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]));
-        let addon_manager = Arc::new(
-            crate::addon::AddonManager::new(pool.clone(), cipher).expect("addon manager"),
-        );
+        let addon_manager =
+            Arc::new(crate::addon::AddonManager::new(pool.clone(), cipher).expect("addon manager"));
         let svc = Arc::new(crate::agents::AgentService::new(pool, addon_manager));
         Arc::new(parking_lot::RwLock::new(Some(svc)))
     }
@@ -289,9 +288,16 @@ mod tests {
     /// caller context (mirrors how agent_context primes a run). Returns the
     /// parent run id.
     async fn parent_run(mgr: &AgentRunManager, agent_id: &str) -> String {
-        mgr.spawn(agent_id, "lead", None, &AgentPrincipal::user("u1"), &[], None)
-            .await
-            .expect("spawn parent")
+        mgr.spawn(
+            agent_id,
+            "lead",
+            None,
+            &AgentPrincipal::user("u1"),
+            &[],
+            None,
+        )
+        .await
+        .expect("spawn parent")
     }
 
     #[tokio::test]
@@ -305,7 +311,8 @@ mod tests {
 
         let mut env = FlowEnvelope::empty();
         env.meta.insert("agent_id".into(), json!("parent"));
-        env.meta.insert("agent_run_id".into(), json!(parent.clone()));
+        env.meta
+            .insert("agent_run_id".into(), json!(parent.clone()));
 
         let out = SpawnNodeAdapter::new(service(pool.clone()))
             .spawn_with(
@@ -387,6 +394,9 @@ mod tests {
             )
             .await
             .expect_err("must error without run context");
-        assert!(err.to_string().contains("managed run context"), "got: {err}");
+        assert!(
+            err.to_string().contains("managed run context"),
+            "got: {err}"
+        );
     }
 }

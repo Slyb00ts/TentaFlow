@@ -5,11 +5,32 @@
 // Protects the unauthenticated signed-URL surfaces (`/frames/<ref>`,
 // `/recordings/<ref>`, `/core/frame/pickup`) against forged-token spam: an
 // attacker who blasts 1 000 req/s of garbage tokens otherwise burns CPU in
-// HMAC verify and explodes `audit_log`. Two buckets compose:
+// HMAC verify and explodes `audit_log`.
 //
-//   * per-IP — small bucket (burst 10, sustain 1/s) keyed by client IP.
-//   * global — coarse DoS budget (burst 100, sustain 1 000/s) shared across
-//     all clients; protects the process even if the per-IP table grows.
+// The signed-URL image/video surfaces (`/frames`, `/recordings`) use a
+// two-stage scheme because a logged-in dashboard admin loading a thumbnail
+// gallery legitimately bursts dozens of signed-URL requests, yet `<img>` /
+// `<video>` cannot carry the Bearer header that proves the request came from
+// an authenticated origin. The VALID HMAC token on the URL IS that proof:
+//
+//   * Stage 1 — generous ceiling (`rate_limiter()`, checked BEFORE HMAC
+//     verify): a coarse anti-flood budget that a real gallery + browsing
+//     never hits. Bounds raw request volume even for garbage tokens.
+//   * Stage 2 — strict invalid-token bucket (`invalid_signed_token_limiter()`,
+//     charged AFTER verify, ONLY when the token is invalid): a tight per-IP
+//     budget so forged-token spam is blocked (and its `audit_log` INSERT cost
+//     capped) within a handful of misses, while valid requests from a
+//     logged-in user never touch it and so are never throttled beyond the
+//     generous ceiling.
+//
+// `/core/frame/pickup` keeps ONLY the pre-verify ceiling — it is a distinct
+// mTLS-pinned Service-to-Core endpoint and its strict budget stays as-is.
+//
+// Each bucket composes a per-IP and a global tier:
+//
+//   * per-IP — bucket keyed by client IP.
+//   * global — coarse DoS budget shared across all clients; protects the
+//     process even if the per-IP table grows.
 //
 // The per-IP map is bounded by an idle-eviction sweep: entries last touched
 // more than `IDLE_EVICT_AFTER` ago are removed on every `check` call (cheap —
@@ -38,11 +59,42 @@ pub struct RateLimitConfig {
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            per_ip_capacity: 10,
-            per_ip_refill_per_sec: 1.0,
-            global_capacity: 100,
+            // Stage-1 GENEROUS CEILING for the signed-URL surfaces. This runs
+            // BEFORE HMAC verify, so it can only be a coarse anti-flood budget —
+            // the fine-grained defense against forged tokens is the strict
+            // post-verify bucket below (charged only on an invalid token). A
+            // logged-in dashboard admin loading a recordings thumbnail gallery
+            // bursts many signed-URL requests from ONE IP (each row has plate +
+            // ADR thumbnails, plus video on playback); 200 burst / 100-per-second
+            // sustain covers a gallery + brisk browsing without ever throttling
+            // a valid user, while still bounding raw request volume for garbage.
+            // The valid HMAC token IS the proof of a logged-in origin (`<img>` /
+            // `<video>` cannot send the dashboard's Bearer header).
+            per_ip_capacity: 200,
+            per_ip_refill_per_sec: 100.0,
+            global_capacity: 1000,
             global_refill_per_sec: 1000.0,
         }
+    }
+}
+
+/// Strict per-IP + global budget charged ONLY when a signed-URL token FAILS
+/// verification (`/frames`, `/recordings`). Valid requests never touch it, so a
+/// logged-in gallery is bounded solely by the generous ceiling above. Forged /
+/// expired tokens are blocked — and their `audit_log` INSERT cost capped —
+/// within a handful of misses per IP.
+fn invalid_signed_token_config() -> RateLimitConfig {
+    RateLimitConfig {
+        // 10-miss burst then 1 miss/s sustained per IP: enough slack for a
+        // stale-but-recently-valid URL an admin retries, tight enough that a
+        // forged-token flood is refused (and stops hitting `audit_log`) fast.
+        per_ip_capacity: 10,
+        per_ip_refill_per_sec: 1.0,
+        // Global tier mirrors the pre-verify ceiling's DoS budget so a
+        // distributed forged-token flood across many IPs is still capped
+        // process-wide even before any single IP exhausts its per-IP burst.
+        global_capacity: 1000,
+        global_refill_per_sec: 1000.0,
     }
 }
 
@@ -186,6 +238,17 @@ static RATE_LIMITER: OnceLock<Arc<RateLimiter>> = OnceLock::new();
 
 pub fn rate_limiter() -> &'static Arc<RateLimiter> {
     RATE_LIMITER.get_or_init(|| Arc::new(RateLimiter::new(RateLimitConfig::default())))
+}
+
+/// Process-wide singleton for the strict invalid-signed-token limiter. Charged
+/// by the `/frames` and `/recordings` handlers ONLY on a token-verify failure.
+/// Same per-IP DashMap + idle/hard-cap eviction as `rate_limiter()`, so it is
+/// memory-bounded under a flood of unique attacker IPs.
+static INVALID_SIGNED_TOKEN_LIMITER: OnceLock<Arc<RateLimiter>> = OnceLock::new();
+
+pub fn invalid_signed_token_limiter() -> &'static Arc<RateLimiter> {
+    INVALID_SIGNED_TOKEN_LIMITER
+        .get_or_init(|| Arc::new(RateLimiter::new(invalid_signed_token_config())))
 }
 
 // =============================================================================
@@ -449,6 +512,69 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1_100));
         // After 1.1 s with refill 1/s at least one token is back.
         assert!(rl.check("k", 1).is_none());
+    }
+
+    #[test]
+    fn invalid_signed_token_limiter_blocks_after_burst() {
+        // The strict post-verify bucket must refuse an IP after its 10-miss
+        // burst so forged-token spam (and its audit-INSERT cost) is capped.
+        let rl = RateLimiter::new(invalid_signed_token_config());
+        for _ in 0..10 {
+            assert_eq!(rl.check("attacker"), RateLimitResult::Allow);
+        }
+        match rl.check("attacker") {
+            RateLimitResult::IpLimit {
+                ip,
+                retry_after_secs,
+            } => {
+                assert_eq!(ip, "attacker");
+                assert!(retry_after_secs > 0.0 && retry_after_secs <= 1.0);
+            }
+            other => panic!("expected IpLimit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn valid_tokens_bypass_strict_bucket_while_invalid_charge_it() {
+        // Mirrors the /frames + /recordings branch: the strict bucket is checked
+        // ONLY on a token-verify failure. A logged-in user's valid requests skip
+        // it entirely and so are never throttled by it, while a forged-token
+        // flood from the same IP drains and then exhausts it.
+        //
+        // `verify_token` stands in for the HMAC verification in the handlers:
+        // even-numbered requests are "valid" (logged-in gallery), odd ones are
+        // forged. The strict bucket is charged only when verification fails.
+        let strict = RateLimiter::new(invalid_signed_token_config());
+        let verify_token = |n: usize| n % 2 == 0;
+
+        // 50 valid requests interleaved — none must ever touch the strict bucket.
+        for n in (0..100).step_by(2) {
+            assert!(verify_token(n), "test setup: even is valid");
+            // Handler serves the file directly; strict bucket untouched.
+        }
+        // The strict bucket therefore still holds its full 10-miss burst.
+        for _ in 0..10 {
+            assert_eq!(strict.check("mixed-ip"), RateLimitResult::Allow);
+        }
+        // The 11th INVALID attempt from the same IP is now blocked → the handler
+        // would return 429 instead of 403.
+        assert!(matches!(
+            strict.check("mixed-ip"),
+            RateLimitResult::IpLimit { .. }
+        ));
+    }
+
+    #[test]
+    fn generous_ceiling_absorbs_a_gallery_burst() {
+        // The Stage-1 ceiling (production default) must let a logged-in gallery
+        // burst of valid signed-URL requests through from one IP without a 429.
+        let rl = RateLimiter::new(RateLimitConfig::default());
+        for n in 0..200 {
+            match rl.check("dashboard-ip") {
+                RateLimitResult::Allow => {}
+                other => panic!("gallery request {n} throttled by ceiling: {other:?}"),
+            }
+        }
     }
 
     #[test]

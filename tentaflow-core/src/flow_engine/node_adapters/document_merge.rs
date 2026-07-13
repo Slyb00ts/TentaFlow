@@ -237,7 +237,10 @@ mod tests {
             .execute(&node(), &[input(payload)], &ctx)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("ani 'markdown' ani 'blocks'"), "{err}");
+        assert!(
+            err.to_string().contains("ani 'markdown' ani 'blocks'"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

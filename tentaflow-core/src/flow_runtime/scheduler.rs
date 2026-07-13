@@ -139,8 +139,7 @@ pub struct FlowScheduler {
     /// through it for availability-aware failover (embedded/local/remote)
     /// — the same path `/v1` uses. `None` until `set_executor`; Predict then
     /// keeps the legacy dispatch-by-name behavior.
-    executor:
-        PlMutex<Option<Arc<crate::services::runtime::executor::ModelRuntimeExecutor>>>,
+    executor: PlMutex<Option<Arc<crate::services::runtime::executor::ModelRuntimeExecutor>>>,
 }
 
 static GLOBAL: OnceLock<Arc<FlowScheduler>> = OnceLock::new();

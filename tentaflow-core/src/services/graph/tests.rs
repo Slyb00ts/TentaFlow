@@ -96,7 +96,9 @@ fn test_upsert_nodes_and_edges_counts() {
     mgr.upsert_node_with_quota(ORG_A, "addon_a", "kg", "n2", "Alice", "{}", "null")
         .unwrap();
     let edges = mgr
-        .upsert_edge_with_quota(ORG_A, "addon_a", "kg", "n2", "works_at", "n1", 1.0, "{}", "null")
+        .upsert_edge_with_quota(
+            ORG_A, "addon_a", "kg", "n2", "works_at", "n1", 1.0, "{}", "null",
+        )
         .unwrap();
     assert_eq!(edges, 1);
 
@@ -119,18 +121,21 @@ fn test_neighbors_out_edges() {
         mgr.upsert_node_with_quota(ORG_A, "addon_a", "kg", id, label, "{}", "null")
             .unwrap();
     }
-    mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", "n3", "works_at", "n1", 1.0, "{}", "null")
-        .unwrap();
-    mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", "n3", "knows", "n2", 0.5, "{}", "null")
-        .unwrap();
+    mgr.upsert_edge_with_quota(
+        ORG_A, "addon_a", "kg", "n3", "works_at", "n1", 1.0, "{}", "null",
+    )
+    .unwrap();
+    mgr.upsert_edge_with_quota(
+        ORG_A, "addon_a", "kg", "n3", "knows", "n2", 0.5, "{}", "null",
+    )
+    .unwrap();
 
     // Sąsiedzi n3 (out-edges) przez bezpieczny prymityw host-budowany.
     let out = mgr
         .neighbors(ORG_A, "addon_a", "kg", "n3", NeighborDir::Out, None, 10)
         .unwrap();
     assert_eq!(out.len(), 2);
-    let dsts: std::collections::HashSet<String> =
-        out.iter().map(|(id, _, _)| id.clone()).collect();
+    let dsts: std::collections::HashSet<String> = out.iter().map(|(id, _, _)| id.clone()).collect();
     assert!(dsts.contains("n1") && dsts.contains("n2"));
 }
 
@@ -149,16 +154,18 @@ fn test_global_pagerank() {
         mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", src, "to", "c", 1.0, "{}", "null")
             .unwrap();
     }
-    let ranked = mgr
-        .pagerank(ORG_A, "addon_a", "kg", 5, 0.85, 50)
-        .unwrap();
+    let ranked = mgr.pagerank(ORG_A, "addon_a", "kg", 5, 0.85, 50).unwrap();
     assert!(!ranked.is_empty());
     // Wyniki posortowane malejąco: pierwszy score >= ostatni.
     let first = ranked.first().unwrap().1;
     let last = ranked.last().unwrap().1;
     assert!(first >= last);
     // Hub `c` jest najwyżej.
-    assert_eq!(ranked.first().unwrap().0, "c", "hub powinien mieć najwyższy PageRank");
+    assert_eq!(
+        ranked.first().unwrap().0,
+        "c",
+        "hub powinien mieć najwyższy PageRank"
+    );
 }
 
 #[test]
@@ -213,8 +220,13 @@ fn test_ppr_empty_seeds_given_is_global_pagerank() {
         .unwrap();
 
     let no_seeds: Vec<(String, f64)> = Vec::new();
-    let ranked = mgr.ppr(ORG_A, "addon_a", "kg", &no_seeds, 10, 0.85, 30).unwrap();
-    assert!(!ranked.is_empty(), "pusta lista seedow -> globalny PageRank (niepusty)");
+    let ranked = mgr
+        .ppr(ORG_A, "addon_a", "kg", &no_seeds, 10, 0.85, 30)
+        .unwrap();
+    assert!(
+        !ranked.is_empty(),
+        "pusta lista seedow -> globalny PageRank (niepusty)"
+    );
 }
 
 #[test]
@@ -231,12 +243,19 @@ fn test_ppr_all_unknown_seeds_returns_empty() {
         .unwrap();
 
     let unknown: Vec<(String, f64)> = vec![("x".into(), 1.0), ("y".into(), 1.0)];
-    let ranked = mgr.ppr(ORG_A, "addon_a", "kg", &unknown, 10, 0.85, 30).unwrap();
-    assert!(ranked.is_empty(), "same nieznane seedy -> pusty wynik, bylo: {ranked:?}");
+    let ranked = mgr
+        .ppr(ORG_A, "addon_a", "kg", &unknown, 10, 0.85, 30)
+        .unwrap();
+    assert!(
+        ranked.is_empty(),
+        "same nieznane seedy -> pusty wynik, bylo: {ranked:?}"
+    );
 
     // Kontrola: jeden ZNANY seed wsrod nieznanych -> niepusty wynik (PPR dziala).
     let mixed: Vec<(String, f64)> = vec![("x".into(), 1.0), ("a".into(), 1.0)];
-    let ranked2 = mgr.ppr(ORG_A, "addon_a", "kg", &mixed, 10, 0.85, 30).unwrap();
+    let ranked2 = mgr
+        .ppr(ORG_A, "addon_a", "kg", &mixed, 10, 0.85, 30)
+        .unwrap();
     assert!(!ranked2.is_empty(), "jeden znany seed -> niepusty wynik");
 }
 
@@ -280,7 +299,8 @@ fn test_collection_quota_enforced() {
     use super::collection::MAX_COLLECTIONS_PER_ADDON;
     let (_dir, mgr) = mgr();
     for i in 0..MAX_COLLECTIONS_PER_ADDON {
-        mgr.ensure_collection(ORG_A, "addon_a", &format!("kg{i}")).unwrap();
+        mgr.ensure_collection(ORG_A, "addon_a", &format!("kg{i}"))
+            .unwrap();
     }
     let res = mgr.ensure_collection(ORG_A, "addon_a", "overflow");
     assert!(matches!(
@@ -597,7 +617,10 @@ fn test_concurrent_node_quota_never_exceeds_limit() {
     );
     // ...i nie przekroczyliśmy go ani o jeden „udany" insert.
     assert_eq!(count, total_ok, "successful inserts must equal live count");
-    assert_eq!(count, LIMIT, "writers should have filled exactly to the limit");
+    assert_eq!(
+        count, LIMIT,
+        "writers should have filled exactly to the limit"
+    );
 }
 
 #[test]
@@ -618,7 +641,9 @@ fn test_concurrent_get_or_create_same_new_collection() {
         }));
     }
     for h in handles {
-        h.join().unwrap().expect("ensure_collection must not surface raw UNIQUE error");
+        h.join()
+            .unwrap()
+            .expect("ensure_collection must not surface raw UNIQUE error");
     }
 
     let n: i64 = {
@@ -715,7 +740,13 @@ fn test_ppr_weighted_differs_from_unweighted() {
     let csr = be.export_edges().unwrap();
     let seed = csr.index_of("seed").unwrap();
     let scores = personalized_pagerank(&csr, &[(seed, 1.0)], 0.85, 100);
-    let score = |id: &str| scores.iter().find(|(x, _)| x == id).map(|(_, s)| *s).unwrap();
+    let score = |id: &str| {
+        scores
+            .iter()
+            .find(|(x, _)| x == id)
+            .map(|(_, s)| *s)
+            .unwrap()
+    };
     // Ciężka krawędź => `heavy` zbiera istotnie więcej masy niż `light`.
     assert!(
         score("heavy") > score("light") * 2.0,
@@ -740,7 +771,11 @@ fn test_ppr_weighted_seeds_shift_ranking() {
     let ia = csr.index_of("a").unwrap();
     let ib = csr.index_of("b").unwrap();
     let score = |scores: &PprScores, id: &str| {
-        scores.iter().find(|(x, _)| x == id).map(|(_, s)| *s).unwrap()
+        scores
+            .iter()
+            .find(|(x, _)| x == id)
+            .map(|(_, s)| *s)
+            .unwrap()
     };
 
     // Rowne wagi => symetria: `as` i `bs` dostaja tyle samo.
@@ -749,8 +784,14 @@ fn test_ppr_weighted_seeds_shift_ranking() {
 
     // Ciezszy seed `a` => `as` bije `bs` i sam `a` bije `b`.
     let skew = personalized_pagerank(&csr, &[(ia, 3.0), (ib, 1.0)], 0.85, 100);
-    assert!(score(&skew, "a") > score(&skew, "b"), "ciezszy seed -> wyzszy wynik");
-    assert!(score(&skew, "as") > score(&skew, "bs"), "waga seeda steruje rankingiem");
+    assert!(
+        score(&skew, "a") > score(&skew, "b"),
+        "ciezszy seed -> wyzszy wynik"
+    );
+    assert!(
+        score(&skew, "as") > score(&skew, "bs"),
+        "waga seeda steruje rankingiem"
+    );
 
     // Suma masy zachowana (normalizacja wag do 1).
     let sum: f64 = skew.iter().map(|(_, s)| s).sum();
@@ -803,8 +844,10 @@ fn test_ppr_with_p_init_log_degree_down_weights_hub() {
             .unwrap();
     }
     // rare: stopien 1 (-> rs). hub: stopien wysoki (-> hs + 5 hubow).
-    mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", "rare", "to", "rs", 1.0, "{}", "null")
-        .unwrap();
+    mgr.upsert_edge_with_quota(
+        ORG_A, "addon_a", "kg", "rare", "to", "rs", 1.0, "{}", "null",
+    )
+    .unwrap();
     for t in ["hs", "h1", "h2", "h3", "h4", "h5"] {
         mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", "hub", "to", t, 1.0, "{}", "null")
             .unwrap();
@@ -813,7 +856,13 @@ fn test_ppr_with_p_init_log_degree_down_weights_hub() {
     let ranked = mgr
         .ppr_with_p_init(ORG_A, "addon_a", "kg", &seeds, MAX_SEEDS, 20, 0.85, 50)
         .unwrap();
-    let score = |id: &str| ranked.iter().find(|(x, _)| x == id).map(|(_, s)| *s).unwrap();
+    let score = |id: &str| {
+        ranked
+            .iter()
+            .find(|(x, _)| x == id)
+            .map(|(_, s)| *s)
+            .unwrap()
+    };
     assert!(
         score("rs") > score("hs"),
         "hub down-weighted przez log-degree: rs={} hs={}",
@@ -841,7 +890,13 @@ fn test_ppr_with_p_init_caps_after_reweighting() {
     let ranked = mgr
         .ppr_with_p_init(ORG_A, "addon_a", "kg", &seeds, 1, 20, 0.85, 50)
         .unwrap();
-    let score = |id: &str| ranked.iter().find(|(x, _)| x == id).map(|(_, s)| *s).unwrap();
+    let score = |id: &str| {
+        ranked
+            .iter()
+            .find(|(x, _)| x == id)
+            .map(|(_, s)| *s)
+            .unwrap()
+    };
     // Tylko `zzz` zostal kotwica => `zs` dostaje mase, `as` praktycznie zero.
     assert!(
         score("zs") > score("as"),
@@ -863,8 +918,10 @@ fn test_ppr_with_p_init_unknown_does_not_evict_known_under_cap() {
         mgr.upsert_node_with_quota(ORG_A, "addon_a", "kg", id, "", "{}", "null")
             .unwrap();
     }
-    mgr.upsert_edge_with_quota(ORG_A, "addon_a", "kg", "anchor", "to", "sat", 1.0, "{}", "null")
-        .unwrap();
+    mgr.upsert_edge_with_quota(
+        ORG_A, "addon_a", "kg", "anchor", "to", "sat", 1.0, "{}", "null",
+    )
+    .unwrap();
     let seeds = [("ghost".to_string(), 99.0), ("anchor".to_string(), 1.0)];
     let ranked = mgr
         .ppr_with_p_init(ORG_A, "addon_a", "kg", &seeds, 1, 20, 0.85, 50)
@@ -1154,8 +1211,14 @@ fn test_delete_cache_miss_uses_deterministic_nonempty_path() {
         )
         .unwrap()
     };
-    assert!(!file_path.is_empty(), "deterministic file path must be non-empty");
-    assert!(file_path.ends_with("kg.cozo"), "path derived from key: {file_path}");
+    assert!(
+        !file_path.is_empty(),
+        "deterministic file path must be non-empty"
+    );
+    assert!(
+        file_path.ends_with("kg.cozo"),
+        "path derived from key: {file_path}"
+    );
 }
 
 #[test]
@@ -1368,11 +1431,3 @@ fn build_sample_graph() -> (TempDir, CozoBackend) {
     }
     (dir, be)
 }
-
-
-
-
-
-
-
-

@@ -95,7 +95,13 @@ fn dataset_dir(project_id: &str, build_id: &str) -> PathBuf {
 fn sanitize_component(s: &str) -> String {
     let cleaned: String = s
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let trimmed = cleaned.trim_matches('_').to_string();
     if trimmed.is_empty() {
@@ -121,7 +127,11 @@ fn reap_stale_staging() {
         // Newest mtime across the dir's files is its "last touch".
         let last = newest_mtime(&path);
         if let Some(last) = last {
-            if now.duration_since(last).map(|d| d > STAGING_TTL).unwrap_or(false) {
+            if now
+                .duration_since(last)
+                .map(|d| d > STAGING_TTL)
+                .unwrap_or(false)
+            {
                 let _ = std::fs::remove_dir_all(&path);
             }
         }
@@ -204,7 +214,8 @@ pub fn stage_file(project_id: &str, filename: &str, bytes: &[u8]) -> Result<Path
         .unwrap_or("upload");
     let safe = sanitize_filename(base);
     let dest = unique_path(&dir, &safe);
-    std::fs::write(&dest, bytes).with_context(|| format!("write staged file {}", dest.display()))?;
+    std::fs::write(&dest, bytes)
+        .with_context(|| format!("write staged file {}", dest.display()))?;
     Ok(dest)
 }
 
@@ -216,7 +227,11 @@ fn sanitize_filename(name: &str) -> String {
     };
     let safe_stem = sanitize_component(stem);
     match ext {
-        Some(e) => format!("{}.{}", safe_stem, sanitize_component(e).to_ascii_lowercase()),
+        Some(e) => format!(
+            "{}.{}",
+            safe_stem,
+            sanitize_component(e).to_ascii_lowercase()
+        ),
         None => safe_stem,
     }
 }
@@ -343,7 +358,10 @@ pub fn spawn_build(
         Some(dir) => {
             let path = Path::new(dir.trim());
             if !path.is_dir() {
-                anyhow::bail!("folder źródłowy nie istnieje lub nie jest katalogiem: {}", dir.trim());
+                anyhow::bail!(
+                    "folder źródłowy nie istnieje lub nie jest katalogiem: {}",
+                    dir.trim()
+                );
             }
         }
         None => {
@@ -422,7 +440,10 @@ fn run_build(
         Some(dir) => {
             let root = Path::new(dir.trim());
             if !root.is_dir() {
-                anyhow::bail!("folder źródłowy nie istnieje lub nie jest katalogiem: {}", dir.trim());
+                anyhow::bail!(
+                    "folder źródłowy nie istnieje lub nie jest katalogiem: {}",
+                    dir.trim()
+                );
             }
             gather_media_recursive(root, &mut sources)?;
         }
@@ -474,7 +495,10 @@ fn run_build(
     for src in &sources {
         if Instant::now() >= deadline {
             let _ = std::fs::remove_dir_all(&tmp_dir);
-            anyhow::bail!("budowa przekroczyła limit czasu ({}h)", BUILD_TIMEOUT.as_secs() / 3600);
+            anyhow::bail!(
+                "budowa przekroczyła limit czasu ({}h)",
+                BUILD_TIMEOUT.as_secs() / 3600
+            );
         }
         let produced = process_source(src, &train_dir, fps, MAX_TOTAL_FRAMES - frames_total)
             .with_context(|| format!("przetwarzanie pliku {}", src.display()))?;
@@ -502,14 +526,19 @@ fn run_build(
 
     // Atomic publish: rename the fully-built temp dir into the final location.
     let _ = std::fs::remove_dir_all(&coco_dir);
-    std::fs::rename(&tmp_dir, &coco_dir)
-        .with_context(|| format!("publish dataset {} -> {}", tmp_dir.display(), coco_dir.display()))?;
+    std::fs::rename(&tmp_dir, &coco_dir).with_context(|| {
+        format!(
+            "publish dataset {} -> {}",
+            tmp_dir.display(),
+            coco_dir.display()
+        )
+    })?;
 
     // Register the dataset row BEFORE clearing staging. If registration fails the
     // built files are removed and staging is left intact for a retry.
     let coco_path = coco_dir.to_string_lossy().to_string();
-    let prof = crate::dispatch::ml_studio::profile_coco_dir(&coco_dir)
-        .with_context(|| "profil COCO")?;
+    let prof =
+        crate::dispatch::ml_studio::profile_coco_dir(&coco_dir).with_context(|| "profil COCO")?;
     let profile_json = serde_json::to_string(&prof)?;
     let category_count = CATEGORIES.len() as u32;
 
@@ -558,8 +587,8 @@ const SOURCE_DIR_EXTS: &[&str] = &["jpg", "jpeg", "png", "heic", "mp4", "mov"];
 fn gather_media_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir)
-            .with_context(|| format!("read dir {}", dir.display()))?;
+        let entries =
+            std::fs::read_dir(&dir).with_context(|| format!("read dir {}", dir.display()))?;
         for entry in entries {
             let path = entry?.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");

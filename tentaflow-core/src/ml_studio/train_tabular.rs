@@ -164,7 +164,11 @@ pub fn train_tabular(
     // Drop rows whose target is missing — there is nothing to learn/score there.
     let kept: Vec<&Vec<String>> = rows
         .iter()
-        .filter(|r| r.get(target_idx).map(|v| !v.trim().is_empty()).unwrap_or(false))
+        .filter(|r| {
+            r.get(target_idx)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+        })
         .take(MAX_TRAIN_ROWS)
         .collect();
     if kept.len() < 10 {
@@ -194,9 +198,7 @@ pub fn train_tabular(
     let split = split_indices(kept.len());
 
     match task {
-        Task::Classification => {
-            train_classification(&encoded, &targets, &split, target_col)
-        }
+        Task::Classification => train_classification(&encoded, &targets, &split, target_col),
         Task::Regression => train_regression(&encoded, &targets, &split, target_col),
     }
 }
@@ -296,8 +298,14 @@ fn select_feature_columns(
 /// one-hot family for a categorical column. `OneHot` carries the most-frequent
 /// category up front so blank-imputation needs no second pass over the rows.
 enum ColumnEncoder {
-    Numeric { mean: f64, std: f64 },
-    OneHot { categories: Vec<String>, most_frequent: String },
+    Numeric {
+        mean: f64,
+        std: f64,
+    },
+    OneHot {
+        categories: Vec<String>,
+        most_frequent: String,
+    },
 }
 
 /// The encoding plan: which raw column maps to which encoder, plus the resulting
@@ -327,8 +335,7 @@ fn plan_encoding(
     for &c in feature_cols {
         let values: Vec<&str> = rows.iter().map(|r| r[c].trim()).collect();
         let non_empty: Vec<&&str> = values.iter().filter(|v| !v.is_empty()).collect();
-        let numeric = !non_empty.is_empty()
-            && non_empty.iter().all(|v| parse_num(v).is_some());
+        let numeric = !non_empty.is_empty() && non_empty.iter().all(|v| parse_num(v).is_some());
         if numeric {
             let nums: Vec<f64> = non_empty.iter().filter_map(|v| parse_num(v)).collect();
             let mean = nums.iter().sum::<f64>() / nums.len() as f64;
@@ -353,7 +360,13 @@ fn plan_encoding(
             for cat in &cats {
                 feature_names.push(format!("{}={}", headers[c], cat));
             }
-            encoders.push((c, ColumnEncoder::OneHot { categories: cats, most_frequent }));
+            encoders.push((
+                c,
+                ColumnEncoder::OneHot {
+                    categories: cats,
+                    most_frequent,
+                },
+            ));
         }
     }
 
@@ -382,9 +395,16 @@ fn materialize_features(rows: &[&Vec<String>], plan: EncodingPlan) -> Encoded {
                     let v = parse_num(r[*c].trim()).unwrap_or(*mean);
                     feat.push((v - mean) / std);
                 }
-                ColumnEncoder::OneHot { categories, most_frequent } => {
+                ColumnEncoder::OneHot {
+                    categories,
+                    most_frequent,
+                } => {
                     let raw = r[*c].trim();
-                    let chosen = if raw.is_empty() { most_frequent.as_str() } else { raw };
+                    let chosen = if raw.is_empty() {
+                        most_frequent.as_str()
+                    } else {
+                        raw
+                    };
                     for cat in categories {
                         feat.push(if cat == chosen { 1.0 } else { 0.0 });
                     }
@@ -568,11 +588,15 @@ fn train_classification(
 
         match fit_tree_classifier(&x_train, &y_train, n_classes, enc, split, truth) {
             Ok(entry) => leaderboard.push(entry),
-            Err(e) => tracing::warn!(error = %e, "smartcore decision tree (classification) skipped"),
+            Err(e) => {
+                tracing::warn!(error = %e, "smartcore decision tree (classification) skipped")
+            }
         }
         match fit_forest_classifier(&x_train, &y_train, n_classes, enc, split, truth) {
             Ok(entry) => leaderboard.push(entry),
-            Err(e) => tracing::warn!(error = %e, "smartcore random forest (classification) skipped"),
+            Err(e) => {
+                tracing::warn!(error = %e, "smartcore random forest (classification) skipped")
+            }
         }
     } else {
         tracing::warn!("smartcore classifiers skipped: empty training matrix");
@@ -676,7 +700,11 @@ fn classification_metrics(truth: &[usize], pred: &[usize], n_classes: usize) -> 
         };
         f1_sum += f1;
     }
-    let f1_macro = if present == 0 { 0.0 } else { f1_sum / present as f64 };
+    let f1_macro = if present == 0 {
+        0.0
+    } else {
+        f1_sum / present as f64
+    };
     (accuracy, f1_macro)
 }
 
@@ -801,10 +829,7 @@ fn train_regression(
         a.rmse
             .partial_cmp(&b.rmse)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then(
-                b.r2.partial_cmp(&a.r2)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
+            .then(b.r2.partial_cmp(&a.r2).unwrap_or(std::cmp::Ordering::Equal))
     });
     let best_model_name = leaderboard[0].model_name.clone();
     let best_loss_curve = if best_model_name == "Regresja liniowa" {
@@ -840,7 +865,11 @@ fn regression_metrics(truth: &[f64], pred: &[f64]) -> (f64, f64) {
         ss_tot += (t - mean).powi(2);
     }
     let rmse = (ss_res / n).sqrt();
-    let r2 = if ss_tot > 0.0 { 1.0 - ss_res / ss_tot } else { 0.0 };
+    let r2 = if ss_tot > 0.0 {
+        1.0 - ss_res / ss_tot
+    } else {
+        0.0
+    };
     (rmse, r2)
 }
 
@@ -884,12 +913,7 @@ where
 }
 
 /// Scores a fitted smartcore regressor on the holdout set via `regression_metrics`.
-fn score_regressor<F>(
-    enc: &Encoded,
-    split: &Split,
-    truth: &[f64],
-    predict: F,
-) -> Result<(f64, f64)>
+fn score_regressor<F>(enc: &Encoded, split: &Split, truth: &[f64], predict: F) -> Result<(f64, f64)>
 where
     F: Fn(&DenseMatrix<f64>) -> Result<Vec<f64>>,
 {
@@ -1217,7 +1241,11 @@ mod tests {
             assert!(e.rmse.is_none() && e.r2.is_none());
         }
         // Na separowalnych danych drzewa musza realnie sie uczyc (powyzej losowego).
-        assert!(tree.accuracy.unwrap() > 0.7, "tree acc: {:?}", tree.accuracy);
+        assert!(
+            tree.accuracy.unwrap() > 0.7,
+            "tree acc: {:?}",
+            tree.accuracy
+        );
         assert!(
             forest.accuracy.unwrap() > 0.7,
             "forest acc: {:?}",

@@ -89,8 +89,7 @@ impl EncodedMessage {
         };
         let tool_calls = match &msg.tool_calls {
             Some(calls) => Some(
-                serde_json::to_string(calls)
-                    .map_err(|e| anyhow!("serialize tool_calls: {e}"))?,
+                serde_json::to_string(calls).map_err(|e| anyhow!("serialize tool_calls: {e}"))?,
             ),
             None => None,
         };

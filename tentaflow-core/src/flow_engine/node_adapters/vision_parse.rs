@@ -27,10 +27,12 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 /// o sam tekst bez znaczników. VLM i tak zwraca tekst — różnica to ile struktury
 /// chcemy zachować. Bboxy są rolą detektorów (`page_detect`), nie tego nodu, więc
 /// `markdown_bbox` różni się od `markdown` tylko naciskiem na zachowanie layoutu.
-const INSTRUCTION_MARKDOWN: &str = "Wyodrębnij całą treść tej strony dokumentu jako czysty Markdown. \
+const INSTRUCTION_MARKDOWN: &str =
+    "Wyodrębnij całą treść tej strony dokumentu jako czysty Markdown. \
      Zachowaj strukturę tabel (GFM), nagłówki, listy i kolejność czytania. \
      Zwróć WYŁĄCZNIE treść dokumentu, bez komentarza.";
-const INSTRUCTION_TEXT: &str = "Wyodrębnij całą treść tekstową tej strony dokumentu w kolejności czytania. \
+const INSTRUCTION_TEXT: &str =
+    "Wyodrębnij całą treść tekstową tej strony dokumentu w kolejności czytania. \
      Zwróć czysty tekst bez znaczników Markdown ani komentarza.";
 
 pub struct VisionParseNodeAdapter;
@@ -202,9 +204,16 @@ impl NodeAdapter for VisionParseNodeAdapter {
         // message + ctx.llm.execute_chat) jest wspólna z batch-owym
         // `vision_parse_pages` przez `parse_image_to_markdown`. temperature=0
         // (deterministyczny parse) jest wewnątrz helpera.
-        let (content, usage) =
-            parse_image_to_markdown(ctx, node, envelope, blob_ref, model, max_tokens, instruction)
-                .await?;
+        let (content, usage) = parse_image_to_markdown(
+            ctx,
+            node,
+            envelope,
+            blob_ref,
+            model,
+            max_tokens,
+            instruction,
+        )
+        .await?;
 
         ctx.usage_sink.record(&node.id, usage);
 

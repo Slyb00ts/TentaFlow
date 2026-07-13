@@ -54,14 +54,41 @@ pub struct RobotActionWire {
 
 impl RobotActionWire {
     pub fn simple(kind: &str) -> Self {
-        Self { kind: kind.into(), vx: 0.0, vy: 0.0, vyaw: 0.0, p1: 0.0, p2: 0.0, p3: 0.0, p4: 0.0 }
+        Self {
+            kind: kind.into(),
+            vx: 0.0,
+            vy: 0.0,
+            vyaw: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+            p3: 0.0,
+            p4: 0.0,
+        }
     }
     pub fn move_to(vx: f64, vy: f64, vyaw: f64) -> Self {
-        Self { kind: "move".into(), vx, vy, vyaw, p1: 0.0, p2: 0.0, p3: 0.0, p4: 0.0 }
+        Self {
+            kind: "move".into(),
+            vx,
+            vy,
+            vyaw,
+            p1: 0.0,
+            p2: 0.0,
+            p3: 0.0,
+            p4: 0.0,
+        }
     }
     /// A parametered pose/level action carrying up to four generic numeric params.
     pub fn params(kind: &str, p1: f64, p2: f64, p3: f64, p4: f64) -> Self {
-        Self { kind: kind.into(), vx: 0.0, vy: 0.0, vyaw: 0.0, p1, p2, p3, p4 }
+        Self {
+            kind: kind.into(),
+            vx: 0.0,
+            vy: 0.0,
+            vyaw: 0.0,
+            p1,
+            p2,
+            p3,
+            p4,
+        }
     }
 }
 
@@ -142,7 +169,10 @@ mod tests {
         minicbor::encode(&v, &mut buf).unwrap();
         let back: RobotActionWire = minicbor::decode(&buf).unwrap();
         assert_eq!(v, back);
-        assert_eq!((back.p1, back.p2, back.p3, back.p4), (0.1, -0.2, 0.3, -0.04));
+        assert_eq!(
+            (back.p1, back.p2, back.p3, back.p4),
+            (0.1, -0.2, 0.3, -0.04)
+        );
     }
 
     /// An OLD sender that predates the p1..p4 fields only encodes keys 0..=3. The

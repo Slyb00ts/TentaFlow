@@ -32,13 +32,13 @@
 
 #![allow(clippy::too_many_arguments)]
 
+use tentaflow_sdk_spec::protocol::graph::GraphNode;
 use tentaflow_sdk_spec::{
     FieldValue, GraphDeleteInput, GraphDeleteOutput, GraphDeleteTarget, GraphDirection,
     GraphNeighbor, GraphNeighborsInput, GraphNeighborsOutput, GraphPagerankInput,
     GraphPagerankOutput, GraphPprInput, GraphPprOutput, GraphProp, GraphRankedNode,
     GraphUpsertEdgeInput, GraphUpsertEdgeOutput, GraphUpsertNodeInput, GraphUpsertNodeOutput,
 };
-use tentaflow_sdk_spec::protocol::graph::GraphNode;
 
 use super::abi_helpers::PayloadKind;
 use super::cbor_io::{read_input_cbor, write_cbor_capped};
@@ -176,7 +176,9 @@ pub fn props_to_json(props: &[GraphProp]) -> String {
 fn provenance_to_json(prov: &Option<tentaflow_sdk_spec::Provenance>) -> String {
     match prov {
         None => "null".to_string(),
-        Some(p) => serde_json::to_string(&ProvenanceJson::from(p)).unwrap_or_else(|_| "null".into()),
+        Some(p) => {
+            serde_json::to_string(&ProvenanceJson::from(p)).unwrap_or_else(|_| "null".into())
+        }
     }
 }
 
@@ -221,7 +223,13 @@ macro_rules! graph_preamble {
             None => return AbiError::Operation.as_i32(),
         };
         if !check_permission($caller.data(), $perm, None) {
-            audit($caller.data(), $action, None, "denied", Some("missing_permission"));
+            audit(
+                $caller.data(),
+                $action,
+                None,
+                "denied",
+                Some("missing_permission"),
+            );
             return AbiError::Permission.as_i32();
         }
         let input: $ty =
@@ -254,7 +262,13 @@ fn resolve_collection(
     collection: &str,
 ) -> Result<GraphCollectionSpec, i32> {
     if !crate::addon::manifest::graph_collection_name_ok(collection) {
-        audit(caller.data(), action, Some(collection), "denied", Some("invalid_collection_name"));
+        audit(
+            caller.data(),
+            action,
+            Some(collection),
+            "denied",
+            Some("invalid_collection_name"),
+        );
         return Err(AbiError::Operation.as_i32());
     }
     let spec = match lookup_collection_spec(caller.data(), collection) {
@@ -271,7 +285,13 @@ fn resolve_collection(
         }
     };
     if let Err(reason) = check_gate(&spec) {
-        audit(caller.data(), action, Some(collection), "gate_denied", Some(reason));
+        audit(
+            caller.data(),
+            action,
+            Some(collection),
+            "gate_denied",
+            Some(reason),
+        );
         return Err(AbiError::GateNotSatisfied.as_i32());
     }
     Ok(spec)
@@ -305,7 +325,13 @@ pub fn graph_upsert_node_v1(
     }
     let node: GraphNode = input.node;
     if node.id.is_empty() {
-        audit(caller.data(), action, Some(&input.collection), "denied", Some("empty_node_id"));
+        audit(
+            caller.data(),
+            action,
+            Some(&input.collection),
+            "denied",
+            Some("empty_node_id"),
+        );
         return AbiError::Operation.as_i32();
     }
 
@@ -327,7 +353,13 @@ pub fn graph_upsert_node_v1(
         Ok(c) => c,
         Err(e) => {
             let (abi, reason) = map_graph_error(&e);
-            audit(caller.data(), action, Some(&input.collection), "denied", Some(reason));
+            audit(
+                caller.data(),
+                action,
+                Some(&input.collection),
+                "denied",
+                Some(reason),
+            );
             return abi.as_i32();
         }
     };
@@ -338,7 +370,15 @@ pub fn graph_upsert_node_v1(
         id: node.id,
         count,
     };
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::GraphItem)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::GraphItem,
+    )
 }
 
 // =============================================================================
@@ -368,7 +408,13 @@ pub fn graph_upsert_edge_v1(
         return code;
     }
     if input.src.is_empty() || input.rel.is_empty() || input.dst.is_empty() {
-        audit(caller.data(), action, Some(&input.collection), "denied", Some("empty_edge_endpoint"));
+        audit(
+            caller.data(),
+            action,
+            Some(&input.collection),
+            "denied",
+            Some("empty_edge_endpoint"),
+        );
         return AbiError::Operation.as_i32();
     }
 
@@ -393,7 +439,13 @@ pub fn graph_upsert_edge_v1(
         Ok(c) => c,
         Err(e) => {
             let (abi, reason) = map_graph_error(&e);
-            audit(caller.data(), action, Some(&input.collection), "denied", Some(reason));
+            audit(
+                caller.data(),
+                action,
+                Some(&input.collection),
+                "denied",
+                Some(reason),
+            );
             return abi.as_i32();
         }
     };
@@ -403,7 +455,15 @@ pub fn graph_upsert_edge_v1(
         collection: input.collection,
         count,
     };
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::GraphItem)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::GraphItem,
+    )
 }
 
 // =============================================================================
@@ -433,7 +493,13 @@ pub fn graph_neighbors_v1(
         return code;
     }
     if input.node.is_empty() {
-        audit(caller.data(), action, Some(&input.collection), "denied", Some("empty_node"));
+        audit(
+            caller.data(),
+            action,
+            Some(&input.collection),
+            "denied",
+            Some("empty_node"),
+        );
         return AbiError::Operation.as_i32();
     }
     // Host-capped limit so a single call can't pull an unbounded adjacency set.
@@ -454,7 +520,13 @@ pub fn graph_neighbors_v1(
         Ok(g) => g,
         Err(e) => {
             let (abi, reason) = map_graph_error(&e);
-            audit(caller.data(), action, Some(&input.collection), "denied", Some(reason));
+            audit(
+                caller.data(),
+                action,
+                Some(&input.collection),
+                "denied",
+                Some(reason),
+            );
             return abi.as_i32();
         }
     };
@@ -471,7 +543,13 @@ pub fn graph_neighbors_v1(
         Ok(n) => n,
         Err(e) => {
             let (abi, reason) = map_graph_error(&e);
-            audit(caller.data(), action, Some(&input.collection), "denied", Some(reason));
+            audit(
+                caller.data(),
+                action,
+                Some(&input.collection),
+                "denied",
+                Some(reason),
+            );
             return abi.as_i32();
         }
     };
@@ -484,7 +562,15 @@ pub fn graph_neighbors_v1(
             .map(|(id, rel, weight)| GraphNeighbor { id, rel, weight })
             .collect(),
     };
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::GraphItem)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::GraphItem,
+    )
 }
 
 // =============================================================================
@@ -527,17 +613,35 @@ pub fn graph_pagerank_v1(
         Ok(g) => g,
         Err(e) => {
             let (abi, reason) = map_graph_error(&e);
-            audit(caller.data(), action, Some(&input.collection), "denied", Some(reason));
+            audit(
+                caller.data(),
+                action,
+                Some(&input.collection),
+                "denied",
+                Some(reason),
+            );
             return abi.as_i32();
         }
     };
 
-    let ranked = match mgr.pagerank(&org_id, &addon_id, &input.collection, top_n, damping, iterations)
-    {
+    let ranked = match mgr.pagerank(
+        &org_id,
+        &addon_id,
+        &input.collection,
+        top_n,
+        damping,
+        iterations,
+    ) {
         Ok(r) => r,
         Err(e) => {
             let (abi, reason) = map_graph_error(&e);
-            audit(caller.data(), action, Some(&input.collection), "denied", Some(reason));
+            audit(
+                caller.data(),
+                action,
+                Some(&input.collection),
+                "denied",
+                Some(reason),
+            );
             return abi.as_i32();
         }
     };
@@ -550,7 +654,15 @@ pub fn graph_pagerank_v1(
             .map(|(id, score)| GraphRankedNode { id, score })
             .collect(),
     };
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::GraphItem)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::GraphItem,
+    )
 }
 
 // =============================================================================
@@ -567,8 +679,14 @@ pub fn graph_ppr_v1(
     out_len_ptr: i32,
 ) -> i32 {
     let action = "graph.ppr";
-    let (memory, input) =
-        graph_preamble!(caller, PERM_GRAPH_READ, action, GraphPprInput, input_ptr, input_len);
+    let (memory, input) = graph_preamble!(
+        caller,
+        PERM_GRAPH_READ,
+        action,
+        GraphPprInput,
+        input_ptr,
+        input_len
+    );
 
     if let Err(code) = resolve_collection(&caller, action, &input.collection) {
         return code;
@@ -596,7 +714,13 @@ pub fn graph_ppr_v1(
         Ok(g) => g,
         Err(e) => {
             let (abi, reason) = map_graph_error(&e);
-            audit(caller.data(), action, Some(&input.collection), "denied", Some(reason));
+            audit(
+                caller.data(),
+                action,
+                Some(&input.collection),
+                "denied",
+                Some(reason),
+            );
             return abi.as_i32();
         }
     };
@@ -613,7 +737,13 @@ pub fn graph_ppr_v1(
         Ok(r) => r,
         Err(e) => {
             let (abi, reason) = map_graph_error(&e);
-            audit(caller.data(), action, Some(&input.collection), "denied", Some(reason));
+            audit(
+                caller.data(),
+                action,
+                Some(&input.collection),
+                "denied",
+                Some(reason),
+            );
             return abi.as_i32();
         }
     };
@@ -626,7 +756,15 @@ pub fn graph_ppr_v1(
             .map(|(id, score)| GraphRankedNode { id, score })
             .collect(),
     };
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::GraphItem)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::GraphItem,
+    )
 }
 
 // =============================================================================
@@ -643,8 +781,14 @@ pub fn graph_delete_v1(
     out_len_ptr: i32,
 ) -> i32 {
     let action = "graph.delete";
-    let (memory, input) =
-        graph_preamble!(caller, PERM_GRAPH_WRITE, action, GraphDeleteInput, input_ptr, input_len);
+    let (memory, input) = graph_preamble!(
+        caller,
+        PERM_GRAPH_WRITE,
+        action,
+        GraphDeleteInput,
+        input_ptr,
+        input_len
+    );
 
     if let Err(code) = resolve_collection(&caller, action, &input.collection) {
         return code;
@@ -663,7 +807,13 @@ pub fn graph_delete_v1(
         _ => Ok(()),
     };
     if let Err(reason) = result {
-        audit(caller.data(), action, Some(&input.collection), "denied", Some(reason));
+        audit(
+            caller.data(),
+            action,
+            Some(&input.collection),
+            "denied",
+            Some(reason),
+        );
         return AbiError::Operation.as_i32();
     }
 
@@ -683,7 +833,13 @@ pub fn graph_delete_v1(
         Ok(t) => t,
         Err(e) => {
             let (abi, reason) = map_graph_error(&e);
-            audit(caller.data(), action, Some(&input.collection), "denied", Some(reason));
+            audit(
+                caller.data(),
+                action,
+                Some(&input.collection),
+                "denied",
+                Some(reason),
+            );
             return abi.as_i32();
         }
     };
@@ -695,7 +851,15 @@ pub fn graph_delete_v1(
         node_count,
         edge_count,
     };
-    write_cbor_capped(&memory, &mut caller, &out, out_ptr, out_cap, out_len_ptr, PayloadKind::GraphItem)
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::GraphItem,
+    )
 }
 
 // =============================================================================
@@ -709,7 +873,10 @@ pub fn graph_delete_v1(
 pub mod test_api {
     use super::{GraphComputeGuard, GraphError};
 
-    pub use super::{check_gate, map_graph_error, props_to_json, MAX_PPR_SEEDS, MAX_RANK_ITERATIONS, MAX_RESULT_ROWS};
+    pub use super::{
+        check_gate, map_graph_error, props_to_json, MAX_PPR_SEEDS, MAX_RANK_ITERATIONS,
+        MAX_RESULT_ROWS,
+    };
     pub use crate::services::graph::{MAX_GLOBAL_GRAPH_COMPUTE, MAX_PER_ADDON_GRAPH_COMPUTE};
 
     /// Nieprzezroczysty uchwyt slotu obliczeń — trzymanie go zajmuje slot, a

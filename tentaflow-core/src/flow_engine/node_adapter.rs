@@ -576,9 +576,7 @@ pub mod test_support {
     use crate::flow_engine::dispatchers::metrics::NoopMetrics;
     use crate::flow_engine::dispatchers::pii_rules::PiiRule;
     use crate::flow_engine::dispatchers::progress::NoopProgress;
-    use crate::flow_engine::dispatchers::rerank::{
-        RerankRequest, RerankResponse, RerankResult,
-    };
+    use crate::flow_engine::dispatchers::rerank::{RerankRequest, RerankResponse, RerankResult};
     use crate::flow_engine::dispatchers::stt::{SttRequest, SttResponse};
     use crate::flow_engine::dispatchers::tts::{TtsRequest, TtsResponse};
     use crate::flow_engine::envelope::{ChatMessage, FlowEnvelope, LlmStreamChunk};
@@ -756,10 +754,8 @@ pub mod test_support {
         let conn = Connection::open_in_memory().expect("in-memory db");
         crate::db::migrations::run(&conn).expect("run migrations");
         let pool = Arc::new(crate::db::Db::from_connection(conn));
-        let root = std::env::temp_dir().join(format!(
-            "tf-vec-stub-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("tf-vec-stub-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&root).expect("create stub vectors root");
         Arc::new(crate::services::vector::NamespaceManager::with_root(
             pool, root,
@@ -776,10 +772,8 @@ pub mod test_support {
         let conn = Connection::open_in_memory().expect("in-memory db");
         crate::db::migrations::run(&conn).expect("run migrations");
         let pool = Arc::new(crate::db::Db::from_connection(conn));
-        let root = std::env::temp_dir().join(format!(
-            "tf-graph-stub-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("tf-graph-stub-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&root).expect("create stub graph root");
         Arc::new(crate::services::graph::GraphManager::with_root(pool, root))
     }
@@ -814,9 +808,11 @@ pub mod test_support {
             tts: Arc::new(StubTts),
             // Pusty slot executora — stub context testów idzie ścieżką fallback
             // (bezpośrednie singletony) w VisionDispatcherImpl.
-            vision: Arc::new(crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new(
-                Arc::new(parking_lot::RwLock::new(None)),
-            )),
+            vision: Arc::new(
+                crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new(Arc::new(
+                    parking_lot::RwLock::new(None),
+                )),
+            ),
             prompts: Arc::new(StubPrompts),
             memory: Arc::new(StubMemory),
             history: Arc::new(StubHistory),
@@ -920,9 +916,8 @@ pub mod test_support {
             _node: &FlowNode,
             _inputs: &[NodeInput],
             _ctx: &ExecutionContext,
-        ) -> Result<
-            BoxStream<'static, Result<crate::flow_engine::envelope::EnvelopeDelta>>,
-        > {
+        ) -> Result<BoxStream<'static, Result<crate::flow_engine::envelope::EnvelopeDelta>>>
+        {
             use crate::flow_engine::envelope::{EnvelopeDelta, FinishReason};
             use futures::StreamExt;
             let first = LlmStreamChunk {
@@ -933,10 +928,7 @@ pub mod test_support {
                 finish_reason: Some(FinishReason::Stop),
                 ..Default::default()
             };
-            let items = vec![
-                Ok(EnvelopeDelta::Llm(first)),
-                Ok(EnvelopeDelta::Llm(last)),
-            ];
+            let items = vec![Ok(EnvelopeDelta::Llm(first)), Ok(EnvelopeDelta::Llm(last))];
             Ok(futures::stream::iter(items).boxed())
         }
     }

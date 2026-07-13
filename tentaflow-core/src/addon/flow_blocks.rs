@@ -448,7 +448,10 @@ mod tests {
         let blocks = parse_blocks_json("deep-research", json).unwrap();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].label, "Szukaj w internecie");
-        assert_eq!(blocks[0].block_type, "addon.deep-research.deep-research.search_web");
+        assert_eq!(
+            blocks[0].block_type,
+            "addon.deep-research.deep-research.search_web"
+        );
         assert_eq!(blocks[0].inputs.len(), 1);
         assert_eq!(blocks[0].outputs[0].name, "results");
     }

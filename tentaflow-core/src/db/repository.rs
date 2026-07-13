@@ -2850,7 +2850,13 @@ pub fn create_model_alias_with_chain_check(
 ) -> Result<i64> {
     let conn = acquire(pool)?;
     let tx = conn.unchecked_transaction()?;
-    let id = create_model_alias_with_chain_check_tx(&tx, alias, target_model, fallback_targets, strategy)?;
+    let id = create_model_alias_with_chain_check_tx(
+        &tx,
+        alias,
+        target_model,
+        fallback_targets,
+        strategy,
+    )?;
     tx.commit()?;
     Ok(id)
 }
@@ -3589,10 +3595,7 @@ pub fn update_cluster_member_interface(
 
 /// Znajduje cluster, ktorego zbior `node_id` czlonkow jest rowny podanemu
 /// zbiorowi. Uzywane przez probe stream, gdy request nie niesie `cluster_id`.
-pub fn find_cluster_by_member_set(
-    pool: &DbPool,
-    node_ids: &[String],
-) -> Result<Option<String>> {
+pub fn find_cluster_by_member_set(pool: &DbPool, node_ids: &[String]) -> Result<Option<String>> {
     let target: std::collections::HashSet<&str> = node_ids.iter().map(|s| s.as_str()).collect();
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached("SELECT cluster_id FROM clusters")?;
@@ -3606,9 +3609,7 @@ pub fn find_cluster_by_member_set(
         let members: std::collections::HashSet<String> = mstmt
             .query_map(rusqlite::params![cluster_id], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<std::collections::HashSet<_>, _>>()?;
-        if members.len() == target.len()
-            && members.iter().all(|m| target.contains(m.as_str()))
-        {
+        if members.len() == target.len() && members.iter().all(|m| target.contains(m.as_str())) {
             return Ok(Some(cluster_id));
         }
     }
@@ -3843,7 +3844,10 @@ pub fn get_cluster_deployment(
         CLUSTER_DEPLOYMENT_COLS
     ))?;
     let res = stmt
-        .query_row(rusqlite::params![deployment_cluster_id], row_to_cluster_deployment)
+        .query_row(
+            rusqlite::params![deployment_cluster_id],
+            row_to_cluster_deployment,
+        )
         .optional()?;
     Ok(res)
 }
@@ -4299,10 +4303,7 @@ fn compliance_data_category_fields(
         "description_translations".to_string(),
         field_string(description_translations),
     );
-    fields.insert(
-        "personal_data".to_string(),
-        FieldValue::Bool(personal_data),
-    );
+    fields.insert("personal_data".to_string(), FieldValue::Bool(personal_data));
     fields.insert(
         "sensitive_data".to_string(),
         FieldValue::Bool(sensitive_data),
@@ -4337,10 +4338,7 @@ fn compliance_processing_activity_fields(
         "purpose_translations".to_string(),
         field_string(purpose_translations),
     );
-    fields.insert(
-        "controller_role".to_string(),
-        field_string(controller_role),
-    );
+    fields.insert("controller_role".to_string(), field_string(controller_role));
     fields.insert(
         "owner_user_id".to_string(),
         field_optional_string(owner_user_id),
@@ -4373,10 +4371,7 @@ fn compliance_legal_basis_fields(
         field_optional_string(category_id),
     );
     fields.insert("basis_kind".to_string(), field_string(basis_kind));
-    fields.insert(
-        "basis_reference".to_string(),
-        field_string(basis_reference),
-    );
+    fields.insert("basis_reference".to_string(), field_string(basis_reference));
     fields.insert(
         "description_translations".to_string(),
         field_string(description_translations),
@@ -6121,8 +6116,9 @@ pub fn reseed_core_state_from_current_rows(
                 }
             }
             K::ModelMetricsRollup => {
-                let mut stmt =
-                    tx.prepare(&format!("SELECT {MODEL_METRICS_COLS} FROM model_metrics_rollup"))?;
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT {MODEL_METRICS_COLS} FROM model_metrics_rollup"
+                ))?;
                 let rows = stmt
                     .query_map([], row_to_model_metrics_rollup)?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -6220,9 +6216,8 @@ pub fn reseed_core_state_from_current_rows(
                 }
             }
             K::VisionModel => {
-                let mut stmt = tx.prepare(&format!(
-                    "SELECT {VISION_MODEL_COLS} FROM vision_models"
-                ))?;
+                let mut stmt =
+                    tx.prepare(&format!("SELECT {VISION_MODEL_COLS} FROM vision_models"))?;
                 let rows = stmt
                     .query_map([], map_vision_model_row)?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -7110,9 +7105,10 @@ pub fn delete_flow_model_binding_for_pattern(pool: &DbPool, model_pattern: &str)
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
     let ids: Vec<String> = {
-        let mut stmt =
-            tx.prepare("SELECT id FROM flow_model_bindings WHERE model_pattern = ?1")?;
-        let rows = stmt.query_map(rusqlite::params![model_pattern], |row| row.get::<_, String>(0))?;
+        let mut stmt = tx.prepare("SELECT id FROM flow_model_bindings WHERE model_pattern = ?1")?;
+        let rows = stmt.query_map(rusqlite::params![model_pattern], |row| {
+            row.get::<_, String>(0)
+        })?;
         rows.collect::<rusqlite::Result<Vec<String>>>()?
     };
     for id in &ids {
@@ -9896,7 +9892,10 @@ pub fn token_lease_changed_fields(
     fields.insert("node_id".to_string(), field_string(node_id));
     fields.insert("period_key".to_string(), field_string(period_key));
     fields.insert("base_used".to_string(), FieldValue::I64(base_used));
-    fields.insert("granted_tokens".to_string(), FieldValue::I64(granted_tokens));
+    fields.insert(
+        "granted_tokens".to_string(),
+        FieldValue::I64(granted_tokens),
+    );
     fields.insert(
         "coordinator_node_id".to_string(),
         field_string(coordinator_node_id),
@@ -10027,11 +10026,7 @@ fn quota_usage_period_clause(period: &str) -> &'static str {
 
 /// Sumuje `total_tokens` na WSZYSTKICH wezlach pasujacych do podmiotu limitu w
 /// danym oknie okresu (z opcjonalnym ograniczeniem model_id limitu). Zwraca 0 dla NULL.
-pub fn global_usage_for_quota(
-    pool: &DbPool,
-    quota: &TokenQuota,
-    period_key: &str,
-) -> Result<i64> {
+pub fn global_usage_for_quota(pool: &DbPool, quota: &TokenQuota, period_key: &str) -> Result<i64> {
     let conn = acquire(pool)?;
     let period_clause = quota_usage_period_clause(&quota.period);
     let subject = quota.subject_id.as_deref().unwrap_or("");
@@ -10075,13 +10070,13 @@ pub fn global_usage_for_quota(
             rusqlite::params![quota.org_id, period_key, subject],
             |row| row.get(0),
         )?,
-        (false, true) => stmt.query_row(
-            rusqlite::params![quota.org_id, period_key, model],
-            |row| row.get(0),
-        )?,
-        (false, false) => {
-            stmt.query_row(rusqlite::params![quota.org_id, period_key], |row| row.get(0))?
-        }
+        (false, true) => stmt
+            .query_row(rusqlite::params![quota.org_id, period_key, model], |row| {
+                row.get(0)
+            })?,
+        (false, false) => stmt.query_row(rusqlite::params![quota.org_id, period_key], |row| {
+            row.get(0)
+        })?,
     };
     Ok(total)
 }
@@ -10346,15 +10341,27 @@ pub fn model_metrics_changed_fields(
         "histogram_version".to_string(),
         FieldValue::I64(row.histogram_version),
     );
-    fields.insert("request_count".to_string(), FieldValue::I64(row.request_count));
-    fields.insert("success_count".to_string(), FieldValue::I64(row.success_count));
+    fields.insert(
+        "request_count".to_string(),
+        FieldValue::I64(row.request_count),
+    );
+    fields.insert(
+        "success_count".to_string(),
+        FieldValue::I64(row.success_count),
+    );
     fields.insert("error_count".to_string(), FieldValue::I64(row.error_count));
-    fields.insert("prompt_tokens".to_string(), FieldValue::I64(row.prompt_tokens));
+    fields.insert(
+        "prompt_tokens".to_string(),
+        FieldValue::I64(row.prompt_tokens),
+    );
     fields.insert(
         "completion_tokens".to_string(),
         FieldValue::I64(row.completion_tokens),
     );
-    fields.insert("total_tokens".to_string(), FieldValue::I64(row.total_tokens));
+    fields.insert(
+        "total_tokens".to_string(),
+        FieldValue::I64(row.total_tokens),
+    );
     fields.insert(
         "embedding_tokens".to_string(),
         FieldValue::I64(row.embedding_tokens),
@@ -10365,12 +10372,18 @@ pub fn model_metrics_changed_fields(
         "prefill_secs_sum".to_string(),
         field_f64(row.prefill_secs_sum),
     );
-    fields.insert("decode_secs_sum".to_string(), field_f64(row.decode_secs_sum));
+    fields.insert(
+        "decode_secs_sum".to_string(),
+        field_f64(row.decode_secs_sum),
+    );
     fields.insert(
         "e2e_latency_ms_sum".to_string(),
         FieldValue::I64(row.e2e_latency_ms_sum),
     );
-    fields.insert("queue_ms_sum".to_string(), FieldValue::I64(row.queue_ms_sum));
+    fields.insert(
+        "queue_ms_sum".to_string(),
+        FieldValue::I64(row.queue_ms_sum),
+    );
     for (i, value) in row.ttft_buckets.iter().enumerate() {
         fields.insert(format!("ttft_b{i}"), FieldValue::I64(*value));
     }
@@ -10462,7 +10475,12 @@ pub fn bump_model_metrics_rollup(
         ],
     )?;
     if let Some(ttft) = perf.ttft_ms {
-        bump_histogram_bucket(&tx, &id, "ttft", histogram_bucket_index(&TTFT_MS_EDGES, ttft))?;
+        bump_histogram_bucket(
+            &tx,
+            &id,
+            "ttft",
+            histogram_bucket_index(&TTFT_MS_EDGES, ttft),
+        )?;
     }
     if let Some(tps) = perf.decode_tps {
         bump_histogram_bucket(
@@ -10558,7 +10576,8 @@ pub fn list_model_metrics_rollup(
     filter: &crate::db::models::ModelMetricsFilter<'_>,
 ) -> Result<Vec<crate::db::models::DbModelMetricsRollup>> {
     let conn = acquire(pool)?;
-    let mut sql = format!("SELECT {MODEL_METRICS_COLS} FROM model_metrics_rollup WHERE org_id = ?1");
+    let mut sql =
+        format!("SELECT {MODEL_METRICS_COLS} FROM model_metrics_rollup WHERE org_id = ?1");
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(org_id.to_string())];
     if let Some(model_id) = filter.model_id {
         params.push(Box::new(model_id.to_string()));
@@ -11549,7 +11568,9 @@ pub fn list_group_memberships(pool: &DbPool) -> Result<Vec<(String, String)>> {
          FROM group_members gm JOIN user_groups g ON g.id = gm.group_id",
     )?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -19500,7 +19521,10 @@ pub mod deployments {
     /// `services`) zawiedzie — wiersz `deployments` nie moze osierociec.
     pub fn delete(pool: &DbPool, deploy_id: &str) -> Result<()> {
         let conn = pool.write().unwrap();
-        conn.execute("DELETE FROM deployments WHERE deploy_id = ?1", params![deploy_id])?;
+        conn.execute(
+            "DELETE FROM deployments WHERE deploy_id = ?1",
+            params![deploy_id],
+        )?;
         Ok(())
     }
 
@@ -20923,6 +20947,10 @@ pub struct CameraRow {
     /// Per-camera CV pipeline id. `None` = the camera resolves to the
     /// `is_default=1` pipeline (see [`resolve_camera_cv_pipeline`]).
     pub cv_pipeline_id: Option<String>,
+    /// Vision-worker sharding slot (docs/VISION_WORKER_SHARDING.md Stage B).
+    /// NULL = the camera runs in-process on the core. Written exclusively by
+    /// the core (assignment authority); workers never read this column.
+    pub vision_worker_slot: Option<i64>,
 }
 
 /// Patch payload for `update_camera`. `None` means "do not touch this column".
@@ -20984,6 +21012,7 @@ fn row_to_camera(row: &rusqlite::Row<'_>) -> rusqlite::Result<CameraRow> {
         analysis_fps: row.get(21)?,
         analysis_flow_id: row.get(22)?,
         cv_pipeline_id: row.get(23)?,
+        vision_worker_slot: row.get(24)?,
     })
 }
 
@@ -20993,7 +21022,7 @@ const CAMERA_SELECT_COLS: &str =
      resolution_width, resolution_height, retention_class, status, status_message, \
      fps_actual, last_frame_at, created_at, updated_at, credentials_encrypted, \
      onvif_url, onvif_profile_token, metadata_supported, analysis_fps, analysis_flow_id, \
-     cv_pipeline_id";
+     cv_pipeline_id, vision_worker_slot";
 
 /// Inserts a new camera row owned by `owner_addon_id`. The supervisor session
 /// is started separately; on supervisor failure the caller must
@@ -21040,6 +21069,21 @@ pub fn insert_camera(
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Persists the vision-worker sharding slot for one camera (Stage B of
+/// docs/VISION_WORKER_SHARDING.md). Core-internal assignment authority — no
+/// addon/org scoping, because the fleet shards EVERY active camera on this
+/// node regardless of owner. `None` returns the camera to in-process ingest.
+#[cfg(feature = "camera")]
+pub fn set_camera_worker_slot(pool: &DbPool, camera_id: &str, slot: Option<i64>) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let n = conn.execute(
+        "UPDATE cameras SET vision_worker_slot = ?1 \
+         WHERE camera_id = ?2 AND removed_at IS NULL",
+        rusqlite::params![slot, camera_id],
+    )?;
+    Ok(n > 0)
 }
 
 /// Replace the `credentials_encrypted` blob for one camera (per-camera
@@ -21581,6 +21625,30 @@ pub fn camera_analysis_fps(pool: &DbPool, camera_id: &str) -> Result<u32> {
     Ok(fps.map(|v| v.clamp(0, 30) as u32).unwrap_or(10))
 }
 
+/// Identity columns the per-vehicle event recorder stamps onto its catalog
+/// rows: `(owner_addon_id, org_id, retention_class)` of the active LOCAL
+/// camera, or `None` when no such camera exists on this node. Process-wide
+/// lookup (no org/addon filter) like [`camera_analysis_fps`] — the recorder is
+/// a node authority keyed by `camera_id`; remote-node cameras (mesh relay) are
+/// never in the node-local `cameras` table, so `None` doubles as the "do not
+/// record cameras whose video lives elsewhere" gate.
+#[cfg(feature = "camera")]
+pub fn camera_recording_identity(
+    pool: &DbPool,
+    camera_id: &str,
+) -> Result<Option<(String, String, String)>> {
+    let conn = acquire(pool)?;
+    let row = conn
+        .query_row(
+            "SELECT owner_addon_id, org_id, retention_class FROM cameras \
+             WHERE camera_id = ?1 AND removed_at IS NULL",
+            rusqlite::params![camera_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    Ok(row)
+}
+
 /// Per-camera depth-mapping configuration. When `enabled`, the depth loop feeds
 /// a world point cloud (reconstructed from a metric depth model) into the shared
 /// SLAM map under `robot_id`. `fov_deg` is the horizontal field of view used to
@@ -21634,7 +21702,18 @@ pub fn camera_depth_mapping_config(
              depth_pose_robot_id, depth_camera_pitch_deg, depth_scale, depth_camera_fov_v_deg \
              FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
             rusqlite::params![camera_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            },
         )
         .optional()?;
     let Some((enabled, robot_id, fov, fps, pose_robot_id, pitch, scale, fov_v)) = row else {
@@ -21829,9 +21908,8 @@ pub fn save_camera_cv_pipeline(
         ));
     }
     let parsed: crate::services::camera_ingest::cv_pipeline::CvPipeline =
-        serde_json::from_str(pipeline_json).map_err(|e| {
-            CvPipelineWriteError::Refused(format!("invalid pipeline JSON: {e}"))
-        })?;
+        serde_json::from_str(pipeline_json)
+            .map_err(|e| CvPipelineWriteError::Refused(format!("invalid pipeline JSON: {e}")))?;
     crate::services::camera_ingest::cv_pipeline::validate(&parsed)
         .map_err(|e| CvPipelineWriteError::Refused(format!("invalid pipeline: {e}")))?;
     let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
@@ -22599,12 +22677,27 @@ pub struct RecordingRow {
     pub retention_class: String,
     pub created_at: i64,
     pub purged_at: Option<i64>,
+    /// JSON summary written by the per-vehicle event recorder (classes seen,
+    /// plate/ADR OCR votes, event time range). NULL for addon-saved artifacts.
+    pub event_meta: Option<String>,
+    /// Gated plate OCR winner for the event (indexed search column). NULL when
+    /// unreadable or for addon-saved artifacts.
+    pub plate_text: Option<String>,
+    /// Gated ADR OCR winner for the event. NULL when unreadable / not present.
+    pub adr_text: Option<String>,
+    /// Snapshot ref of the full downscaled frame captured at the event's
+    /// highest-confidence plate read (whole scene, not a crop). NULL when none.
+    pub plate_thumb_ref: Option<String>,
+    /// Snapshot ref of the full downscaled frame captured at the event's
+    /// highest-confidence ADR read. NULL when none.
+    pub adr_thumb_ref: Option<String>,
 }
 
 #[cfg(feature = "camera")]
 const RECORDING_SELECT_COLS: &str =
     "id, ref, kind, owner_addon_id, camera_id, file_path, file_size_bytes, duration_ms, \
-     width, height, pixel_format, hash_sha256, retention_class, created_at, purged_at";
+     width, height, pixel_format, hash_sha256, retention_class, created_at, purged_at, \
+     event_meta, plate_text, adr_text, plate_thumb_ref, adr_thumb_ref";
 
 #[cfg(feature = "camera")]
 fn row_to_recording(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordingRow> {
@@ -22624,6 +22717,11 @@ fn row_to_recording(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordingRow> {
         retention_class: row.get(12)?,
         created_at: row.get(13)?,
         purged_at: row.get(14)?,
+        event_meta: row.get(15)?,
+        plate_text: row.get(16)?,
+        adr_text: row.get(17)?,
+        plate_thumb_ref: row.get(18)?,
+        adr_thumb_ref: row.get(19)?,
     })
 }
 
@@ -22668,6 +22766,11 @@ pub fn insert_recording(
     hash_sha256: &str,
     retention_class: &str,
     org_id: Option<&str>,
+    event_meta: Option<&str>,
+    plate_text: Option<&str>,
+    adr_text: Option<&str>,
+    plate_thumb_ref: Option<&str>,
+    adr_thumb_ref: Option<&str>,
 ) -> Result<i64> {
     let conn = acquire(pool)?;
     let now = chrono::Utc::now().timestamp();
@@ -22678,8 +22781,10 @@ pub fn insert_recording(
         "INSERT INTO recordings \
          (ref, kind, owner_addon_id, camera_id, file_path, file_size_bytes, \
           duration_ms, width, height, pixel_format, hash_sha256, \
-          retention_class, created_at, purged_at, org_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14)",
+          retention_class, created_at, purged_at, org_id, event_meta, \
+          plate_text, adr_text, plate_thumb_ref, adr_thumb_ref) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, ?15, \
+                 ?16, ?17, ?18, ?19)",
         rusqlite::params![
             recording_ref,
             kind,
@@ -22695,6 +22800,11 @@ pub fn insert_recording(
             retention_class,
             now,
             resolved_org,
+            event_meta,
+            plate_text,
+            adr_text,
+            plate_thumb_ref,
+            adr_thumb_ref,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -22724,6 +22834,108 @@ pub fn get_recording_for_addon(
         )
         .optional()?;
     Ok(row)
+}
+
+/// Optional server-side filters for [`list_recordings_for_addon`]. Every field
+/// is `None` = "no filter"; they compose with AND. Dates are unix SECONDS
+/// (matching `recordings.created_at`); `plate`/`adr` are case-insensitive
+/// substring (`LIKE %x%`) matches against the indexed `plate_text`/`adr_text`
+/// columns written by the event recorder.
+#[cfg(feature = "camera")]
+#[derive(Debug, Default, Clone)]
+pub struct RecordingListFilters<'a> {
+    pub kind: Option<&'a str>,
+    pub camera_id: Option<&'a str>,
+    pub created_from: Option<i64>,
+    pub created_to: Option<i64>,
+    pub plate: Option<&'a str>,
+    pub adr: Option<&'a str>,
+}
+
+/// Escapes the LIKE metacharacters (`%`, `_`, `\`) in a user substring so a
+/// plate query like `50%` matches literally rather than as a wildcard. Paired
+/// with an explicit `ESCAPE '\'` clause in the SQL.
+#[cfg(feature = "camera")]
+fn like_contains(needle: &str) -> String {
+    let mut escaped = String::with_capacity(needle.len() + 2);
+    for c in needle.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    format!("%{escaped}%")
+}
+
+/// Lists active recordings owned by `addon_id`, newest first, applying the
+/// optional [`RecordingListFilters`]. `kind` filters to one recording kind
+/// (`"segment"` / `"snapshot"`); `None` returns both. `limit` caps the row count
+/// so a dashboard list never pulls an unbounded catalog into memory. The org
+/// scope mirrors `get_recording_for_addon` so cross-tenant rows cannot leak.
+#[cfg(feature = "camera")]
+pub fn list_recordings_for_addon(
+    pool: &DbPool,
+    addon_id: &str,
+    org_id: Option<&str>,
+    filters: &RecordingListFilters<'_>,
+    limit: u32,
+) -> Result<Vec<RecordingRow>> {
+    let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    // Bind params positionally; the optional filters are appended in a fixed
+    // order so the placeholder indices stay stable regardless of which are set.
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(addon_id.to_string()),
+        Box::new(resolved_org.to_string()),
+    ];
+    let mut sql = format!(
+        "SELECT {RECORDING_SELECT_COLS} FROM recordings \
+         WHERE owner_addon_id = ?1 AND org_id = ?2 AND purged_at IS NULL"
+    );
+    if let Some(k) = filters.kind {
+        params.push(Box::new(k.to_string()));
+        sql.push_str(&format!(" AND kind = ?{}", params.len()));
+    }
+    if let Some(cam) = filters.camera_id {
+        params.push(Box::new(cam.to_string()));
+        sql.push_str(&format!(" AND camera_id = ?{}", params.len()));
+    }
+    if let Some(from) = filters.created_from {
+        params.push(Box::new(from));
+        sql.push_str(&format!(" AND created_at >= ?{}", params.len()));
+    }
+    if let Some(to) = filters.created_to {
+        params.push(Box::new(to));
+        sql.push_str(&format!(" AND created_at <= ?{}", params.len()));
+    }
+    if let Some(plate) = filters.plate.filter(|s| !s.trim().is_empty()) {
+        params.push(Box::new(like_contains(plate.trim())));
+        // NOCASE keeps the ASCII-case-insensitive match; ESCAPE lets a plate with
+        // a literal `%`/`_` still search literally.
+        sql.push_str(&format!(
+            " AND plate_text LIKE ?{} ESCAPE '\\' COLLATE NOCASE",
+            params.len()
+        ));
+    }
+    if let Some(adr) = filters.adr.filter(|s| !s.trim().is_empty()) {
+        params.push(Box::new(like_contains(adr.trim())));
+        sql.push_str(&format!(
+            " AND adr_text LIKE ?{} ESCAPE '\\' COLLATE NOCASE",
+            params.len()
+        ));
+    }
+    params.push(Box::new(limit as i64));
+    sql.push_str(&format!(
+        " ORDER BY created_at DESC LIMIT ?{}",
+        params.len()
+    ));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt
+        .query_map(param_refs.as_slice(), row_to_recording)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// Look up an active recording row by `ref` alone, without scoping to an
@@ -25169,7 +25381,10 @@ mod engine_flow_binding_tests {
         assert_eq!(flow1.name, "v1");
 
         let id2 = register_engine_flow_atomic(&db, &params("v2", name), name, 100).unwrap();
-        assert_eq!(id1, id2, "re-rejestracja zachowuje stabilny flow id (FK-safe)");
+        assert_eq!(
+            id1, id2,
+            "re-rejestracja zachowuje stabilny flow id (FK-safe)"
+        );
         let flow2 = get_flow_for_model(&db, name).unwrap().unwrap();
         assert_eq!(flow2.id, id2, "model rozwiązuje się na ten sam flow");
         assert_eq!(flow2.name, "v2", "treść flow zaktualizowana w miejscu");
@@ -25198,8 +25413,7 @@ mod engine_flow_binding_tests {
             .unwrap();
         }
         // Bez in-place update poniższe rzuciłoby FOREIGN KEY constraint failed.
-        let flow_id2 =
-            register_engine_flow_atomic(&db, &params("v2", name), name, 100).unwrap();
+        let flow_id2 = register_engine_flow_atomic(&db, &params("v2", name), name, 100).unwrap();
         assert_eq!(flow_id, flow_id2, "id zachowane mimo historii wykonań");
         assert_eq!(get_flow_for_model(&db, name).unwrap().unwrap().name, "v2");
     }
@@ -25215,7 +25429,9 @@ mod engine_flow_binding_tests {
         register_engine_flow_atomic(&db, &params("u", pat), pat, 100).unwrap();
         // '_' nie może działać jako "dowolny znak": 'queXry' NIE matchuje.
         assert!(
-            get_flow_for_model(&db, "rag-aaaa:queXry").unwrap().is_none(),
+            get_flow_for_model(&db, "rag-aaaa:queXry")
+                .unwrap()
+                .is_none(),
             "'_' we wzorcu nie może być wildcardem LIKE"
         );
         // Dokładna nazwa nadal matchuje (literał).
@@ -25301,13 +25517,32 @@ mod token_metrics_tests {
         // Ten sam klucz (node,org,user,model,day) kumuluje; rozne nody = rozne wiersze.
         bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 10, 5).unwrap();
         bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 20, 10).unwrap();
-        bump_token_usage(&pool, "B", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 100, 50).unwrap();
+        bump_token_usage(
+            &pool,
+            "B",
+            DEFAULT_ORG_ID,
+            "u1",
+            "m1",
+            "2026-06-21",
+            100,
+            50,
+        )
+        .unwrap();
 
         let q = load_quota(&pool, &quota(&pool, "user", Some("u1"), None));
         // global = A(45) + B(150) = 195; node A = 45.
-        assert_eq!(global_usage_for_quota(&pool, &q, "2026-06-21").unwrap(), 195);
-        assert_eq!(node_usage_for_quota(&pool, "A", &q, "2026-06-21").unwrap(), 45);
-        assert_eq!(node_usage_for_quota(&pool, "B", &q, "2026-06-21").unwrap(), 150);
+        assert_eq!(
+            global_usage_for_quota(&pool, &q, "2026-06-21").unwrap(),
+            195
+        );
+        assert_eq!(
+            node_usage_for_quota(&pool, "A", &q, "2026-06-21").unwrap(),
+            45
+        );
+        assert_eq!(
+            node_usage_for_quota(&pool, "B", &q, "2026-06-21").unwrap(),
+            150
+        );
     }
 
     #[test]
@@ -25324,10 +25559,22 @@ mod token_metrics_tests {
         let model_q = load_quota(&pool, &quota(&pool, "model", Some("m1"), None));
         let org_q = load_quota(&pool, &quota(&pool, "org", None, None));
 
-        assert_eq!(global_usage_for_quota(&pool, &user_q, "2026-06-21").unwrap(), 130); // u1: m1+m2
-        assert_eq!(global_usage_for_quota(&pool, &group_q, "2026-06-21").unwrap(), 130); // g1 = {u1}
-        assert_eq!(global_usage_for_quota(&pool, &model_q, "2026-06-21").unwrap(), 107); // m1: u1+u2
-        assert_eq!(global_usage_for_quota(&pool, &org_q, "2026-06-21").unwrap(), 137); // wszystko
+        assert_eq!(
+            global_usage_for_quota(&pool, &user_q, "2026-06-21").unwrap(),
+            130
+        ); // u1: m1+m2
+        assert_eq!(
+            global_usage_for_quota(&pool, &group_q, "2026-06-21").unwrap(),
+            130
+        ); // g1 = {u1}
+        assert_eq!(
+            global_usage_for_quota(&pool, &model_q, "2026-06-21").unwrap(),
+            107
+        ); // m1: u1+u2
+        assert_eq!(
+            global_usage_for_quota(&pool, &org_q, "2026-06-21").unwrap(),
+            137
+        ); // wszystko
     }
 
     #[test]
@@ -25337,7 +25584,10 @@ mod token_metrics_tests {
         bump_token_usage(&pool, "A", DEFAULT_ORG_ID, "u1", "m1", "2026-06-21", 50, 0).unwrap();
         let q = load_quota(&pool, &quota(&pool, "model", Some("m1"), Some("m2")));
         assert_eq!(global_usage_for_quota(&pool, &q, "2026-06-21").unwrap(), 50);
-        assert_eq!(node_usage_for_quota(&pool, "A", &q, "2026-06-21").unwrap(), 50);
+        assert_eq!(
+            node_usage_for_quota(&pool, "A", &q, "2026-06-21").unwrap(),
+            50
+        );
     }
 
     #[test]
@@ -25464,7 +25714,8 @@ mod token_metrics_tests {
         assert_eq!(u1.total_tokens, 110);
         assert_eq!(u1.request_count, 2);
 
-        let by_model = usage_summary(&pool, DEFAULT_ORG_ID, "daily", "2026-06-21", "model").unwrap();
+        let by_model =
+            usage_summary(&pool, DEFAULT_ORG_ID, "daily", "2026-06-21", "model").unwrap();
         let m1 = by_model.iter().find(|r| r.key == "m1").unwrap();
         assert_eq!(m1.total_tokens, 140);
     }
@@ -25530,8 +25781,7 @@ mod token_metrics_tests {
         )
         .unwrap();
 
-        let rows =
-            list_model_metrics_rollup(&pool, DEFAULT_ORG_ID, &Default::default()).unwrap();
+        let rows = list_model_metrics_rollup(&pool, DEFAULT_ORG_ID, &Default::default()).unwrap();
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.request_count, 1);
@@ -25557,7 +25807,8 @@ mod token_metrics_tests {
             },
         )
         .unwrap();
-        let row = &list_model_metrics_rollup(&pool, DEFAULT_ORG_ID, &Default::default()).unwrap()[0];
+        let row =
+            &list_model_metrics_rollup(&pool, DEFAULT_ORG_ID, &Default::default()).unwrap()[0];
         assert_eq!(row.request_count, 2);
         assert_eq!(row.ttft_sample_count, 1);
         assert_eq!(row.ttft_buckets[2], 1); // 51 → bucket 2
@@ -26239,7 +26490,9 @@ mod vision_model_tests {
         let db = fresh_db();
         let row = valid_row("adr-v2");
         register_vision_model(&db, &row, None).expect("register");
-        let got = get_vision_model(&db, "adr-v2").unwrap().expect("row exists");
+        let got = get_vision_model(&db, "adr-v2")
+            .unwrap()
+            .expect("row exists");
         assert_eq!(got.op, "detect");
         assert_eq!(got.default_threshold, Some(0.4));
         // Upsert updates in place (new hash), no duplicate row.

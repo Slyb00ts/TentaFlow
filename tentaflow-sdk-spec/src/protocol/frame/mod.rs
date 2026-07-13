@@ -37,37 +37,35 @@ pub mod sign;
 pub mod validator;
 
 pub use address::{NodeAddress, NodeAddressKind};
+pub use aead::{
+    compute_aad, decrypt_body, decrypt_envelope_body, encrypt_body, encrypt_envelope_body, AeadKey,
+    NonceCounter, PersistHint, AEAD_KEY_LEN, AEAD_NONCE_LEN, AEAD_TAG_LEN,
+    COUNTER_ROTATION_THRESHOLD, MAX_KEY_AGE_MS, NONCE_COUNTER_LEN, NONCE_PREFIX_LEN,
+};
 pub use auth::{Auth, AuthKind};
 pub use channel::{channels, Channel, Kind};
+pub use compress::{
+    compress_body, decompress_body, decompress_body_with_limit, should_compress,
+    COMPRESSION_THRESHOLD_BYTES, DEFAULT_MAX_DECOMPRESSED_BYTES,
+};
 pub use envelope::{
     Envelope, FrameProtocolVersion, MessageId, Priority, TraceId, FRAME_PROTOCOL_VERSION,
     MESSAGE_ID_LEN, NODE_ID_LEN, SIGNATURE_LEN, TRACE_ID_LEN,
 };
 pub use error::{FrameError, FrameErrorCode};
 pub use flags::Flags;
-pub use sign::{
-    canonical_envelope_for_signing, public_key_bytes, sign_envelope, signing_key_from_bytes,
-    verify_envelope, SIGNATURE_PLACEHOLDER,
-};
-pub use aead::{
-    compute_aad, decrypt_body, decrypt_envelope_body, encrypt_body, encrypt_envelope_body,
-    AeadKey, NonceCounter, PersistHint, AEAD_KEY_LEN, AEAD_NONCE_LEN, AEAD_TAG_LEN,
-    COUNTER_ROTATION_THRESHOLD, MAX_KEY_AGE_MS, NONCE_COUNTER_LEN, NONCE_PREFIX_LEN,
-};
-pub use compress::{
-    compress_body, decompress_body, decompress_body_with_limit, should_compress,
-    COMPRESSION_THRESHOLD_BYTES, DEFAULT_MAX_DECOMPRESSED_BYTES,
-};
-pub use pipeline::{receive_envelope_pipeline, send_envelope_pipeline, ReceiveCrypto, SendCrypto};
 pub use fragment::{
     finalize_reassembled_envelope, split_envelope_into_fragments, AcceptOutcome,
     FragmentSendCrypto, ReassemblyManager, AEAD_OVERHEAD_BYTES, MAX_FRAGMENT_COUNT,
     MAX_REASSEMBLY_BYTES, REASSEMBLY_TIMEOUT_MS,
 };
+pub use pipeline::{receive_envelope_pipeline, send_envelope_pipeline, ReceiveCrypto, SendCrypto};
 pub use replay::{
     check_clock_skew_with, DedupKey, ReplayGuard, DEFAULT_CLOCK_SKEW_MS,
     DEFAULT_DEDUP_CAPACITY_PER_SOURCE, NON_FRAGMENT_INDEX_SENTINEL,
 };
-pub use validator::{
-    channel_auth_policy, validate_envelope, ChannelAuthPolicy, SignRequirement,
+pub use sign::{
+    canonical_envelope_for_signing, public_key_bytes, sign_envelope, signing_key_from_bytes,
+    verify_envelope, SIGNATURE_PLACEHOLDER,
 };
+pub use validator::{channel_auth_policy, validate_envelope, ChannelAuthPolicy, SignRequirement};

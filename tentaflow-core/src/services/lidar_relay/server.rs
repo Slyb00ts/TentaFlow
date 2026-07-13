@@ -204,8 +204,7 @@ mod tests {
     fn frame_cbor_round_trip() {
         let payload = b"\x01\x02header-and-packed-f32\xff".to_vec();
         let bytes = encode_frame(payload.clone()).expect("encode");
-        let decoded: LidarStreamFrame =
-            tentaflow_protocol::cbor::decode(&bytes).expect("decode");
+        let decoded: LidarStreamFrame = tentaflow_protocol::cbor::decode(&bytes).expect("decode");
         assert_eq!(decoded.data, payload);
     }
 

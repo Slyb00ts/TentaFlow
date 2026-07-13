@@ -169,11 +169,8 @@ pub fn replace_selection(
     // Remove rows no longer selected.
     for row in &existing {
         if !selected_names.contains(row.model_name.as_str()) {
-            conn.execute(
-                "DELETE FROM model_registry WHERE id = ?1",
-                params![row.id],
-            )
-            .context("delete deselected model_registry row")?;
+            conn.execute("DELETE FROM model_registry WHERE id = ?1", params![row.id])
+                .context("delete deselected model_registry row")?;
         }
     }
 

@@ -327,11 +327,9 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
     // scope below so run-events ACL (§3.3) can reject a foreign subscriber — the
     // client-minted session id is not an authorization token on its own.
     let actor_id = match &ctx.session {
-        SessionAuth::UserSession { user_id, .. } => Some(
-            uuid::Uuid::from_bytes(*user_id)
-                .hyphenated()
-                .to_string(),
-        ),
+        SessionAuth::UserSession { user_id, .. } => {
+            Some(uuid::Uuid::from_bytes(*user_id).hyphenated().to_string())
+        }
         _ => None,
     };
 
@@ -950,16 +948,9 @@ fn cluster_probe_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<
                 let mut best: Option<cluster_probe::PairProbeResult> = None;
                 for (x, y) in &candidates {
                     let nonce: [u8; 32] = rand::random();
-                    let Some((bw, lat_us, rdma)) = run_interface_probe(
-                        &qm,
-                        &local_id,
-                        x,
-                        y,
-                        &nonce,
-                        NUM_STREAMS,
-                        DURATION_MS,
-                    )
-                    .await
+                    let Some((bw, lat_us, rdma)) =
+                        run_interface_probe(&qm, &local_id, x, y, &nonce, NUM_STREAMS, DURATION_MS)
+                            .await
                     else {
                         continue;
                     };
@@ -1070,7 +1061,12 @@ fn cluster_probe_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<
                 Some(nif) => (
                     nif.ip.clone(),
                     nif.speed_mbps as u32,
-                    if nif.rdma_available { "rdma" } else { "ethernet" }.to_string(),
+                    if nif.rdma_available {
+                        "rdma"
+                    } else {
+                        "ethernet"
+                    }
+                    .to_string(),
                 ),
                 None => (String::new(), 0u32, "ethernet".to_string()),
             };

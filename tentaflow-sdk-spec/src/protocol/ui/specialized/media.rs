@@ -2,6 +2,7 @@
 // File: protocol/ui/specialized/media.rs — VideoStream/LiveCameraTile/Audio (catalog §8)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::{BindRef, StatePath};
 use super::super::component::{Component, FieldMap};
 use super::super::inline::AspectRatio;
@@ -12,11 +13,19 @@ use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -42,22 +51,31 @@ impl VideoStream {
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(8);
         e.push((0, encode_to_value(&self.stream_id)?));
-        if let Some(v) = &self.width_px { e.push((1, encode_to_value(v)?)); }
+        if let Some(v) = &self.width_px {
+            e.push((1, encode_to_value(v)?));
+        }
         e.push((2, encode_to_value(&self.aspect_ratio)?));
         e.push((3, encode_to_value(&self.controls)?));
         e.push((4, encode_to_value(&self.autoplay)?));
         e.push((5, encode_to_value(&self.muted)?));
         e.push((6, encode_to_value(&self.object_fit)?));
-        if let Some(v) = &self.poster_ref { e.push((7, encode_to_value(v)?)); }
+        if let Some(v) = &self.poster_ref {
+            e.push((7, encode_to_value(v)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "VideoStream")?;
         ensure_no_duplicate_keys("VideoStream", &c.fields.0)?;
-        let mut stream_id = None; let mut width_px = None; let mut aspect_ratio = None;
-        let mut controls = None; let mut autoplay = None; let mut muted = None;
-        let mut object_fit = None; let mut poster_ref = None;
+        let mut stream_id = None;
+        let mut width_px = None;
+        let mut aspect_ratio = None;
+        let mut controls = None;
+        let mut autoplay = None;
+        let mut muted = None;
+        let mut object_fit = None;
+        let mut poster_ref = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => stream_id = Some(decode_from_value(v)?),
@@ -74,7 +92,8 @@ impl VideoStream {
         Ok(VideoStream {
             stream_id: stream_id.ok_or_else(|| missing_field("VideoStream", "stream_id"))?,
             width_px,
-            aspect_ratio: aspect_ratio.ok_or_else(|| missing_field("VideoStream", "aspect_ratio"))?,
+            aspect_ratio: aspect_ratio
+                .ok_or_else(|| missing_field("VideoStream", "aspect_ratio"))?,
             controls: controls.ok_or_else(|| missing_field("VideoStream", "controls"))?,
             autoplay: autoplay.ok_or_else(|| missing_field("VideoStream", "autoplay"))?,
             muted: muted.ok_or_else(|| missing_field("VideoStream", "muted"))?,
@@ -108,7 +127,9 @@ impl LiveCameraTile {
         e.push((0, encode_to_value(&self.stream_id)?));
         e.push((1, encode_to_value(&self.camera_label)?));
         e.push((2, encode_to_value(&self.status)?));
-        if let Some(v) = &self.fps { e.push((3, encode_to_value(v)?)); }
+        if let Some(v) = &self.fps {
+            e.push((3, encode_to_value(v)?));
+        }
         e.push((4, encode_to_value(&self.show_overlay)?));
         e.push((5, encode_to_value(&self.show_fullscreen_button)?));
         e.push((6, encode_to_value(&self.aspect_ratio)?));
@@ -118,9 +139,13 @@ impl LiveCameraTile {
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "LiveCameraTile")?;
         ensure_no_duplicate_keys("LiveCameraTile", &c.fields.0)?;
-        let mut stream_id = None; let mut camera_label = None; let mut status = None;
-        let mut fps = None; let mut show_overlay = None;
-        let mut show_fullscreen_button = None; let mut aspect_ratio = None;
+        let mut stream_id = None;
+        let mut camera_label = None;
+        let mut status = None;
+        let mut fps = None;
+        let mut show_overlay = None;
+        let mut show_fullscreen_button = None;
+        let mut aspect_ratio = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => stream_id = Some(decode_from_value(v)?),
@@ -135,12 +160,16 @@ impl LiveCameraTile {
         }
         Ok(LiveCameraTile {
             stream_id: stream_id.ok_or_else(|| missing_field("LiveCameraTile", "stream_id"))?,
-            camera_label: camera_label.ok_or_else(|| missing_field("LiveCameraTile", "camera_label"))?,
+            camera_label: camera_label
+                .ok_or_else(|| missing_field("LiveCameraTile", "camera_label"))?,
             status: status.ok_or_else(|| missing_field("LiveCameraTile", "status"))?,
             fps,
-            show_overlay: show_overlay.ok_or_else(|| missing_field("LiveCameraTile", "show_overlay"))?,
-            show_fullscreen_button: show_fullscreen_button.ok_or_else(|| missing_field("LiveCameraTile", "show_fullscreen_button"))?,
-            aspect_ratio: aspect_ratio.ok_or_else(|| missing_field("LiveCameraTile", "aspect_ratio"))?,
+            show_overlay: show_overlay
+                .ok_or_else(|| missing_field("LiveCameraTile", "show_overlay"))?,
+            show_fullscreen_button: show_fullscreen_button
+                .ok_or_else(|| missing_field("LiveCameraTile", "show_fullscreen_button"))?,
+            aspect_ratio: aspect_ratio
+                .ok_or_else(|| missing_field("LiveCameraTile", "aspect_ratio"))?,
         })
     }
 }
@@ -175,8 +204,11 @@ impl Audio {
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "Audio")?;
         ensure_no_duplicate_keys("Audio", &c.fields.0)?;
-        let mut src_ref = None; let mut controls = None; let mut autoplay = None;
-        let mut r#loop = None; let mut variant = None;
+        let mut src_ref = None;
+        let mut controls = None;
+        let mut autoplay = None;
+        let mut r#loop = None;
+        let mut variant = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => src_ref = Some(decode_from_value(v)?),
@@ -244,23 +276,42 @@ impl AudioCapture {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(9);
         e.push((0, encode_to_value(&self.action_id)?));
         e.push((1, encode_to_value(&self.mode)?));
-        if let Some(v) = &self.silence_ms { e.push((2, encode_to_value(v)?)); }
-        if let Some(v) = &self.min_speech_ms { e.push((3, encode_to_value(v)?)); }
-        if let Some(v) = &self.language_hint { e.push((4, encode_to_value(v)?)); }
-        if let Some(v) = &self.recording_path { e.push((5, encode_to_value(v)?)); }
-        if let Some(v) = &self.disabled { e.push((6, encode_to_value(v)?)); }
-        if let Some(v) = &self.active_path { e.push((7, encode_to_value(v)?)); }
-        if let Some(v) = &self.variant { e.push((8, encode_to_value(v)?)); }
+        if let Some(v) = &self.silence_ms {
+            e.push((2, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.min_speech_ms {
+            e.push((3, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.language_hint {
+            e.push((4, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.recording_path {
+            e.push((5, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.disabled {
+            e.push((6, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.active_path {
+            e.push((7, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.variant {
+            e.push((8, encode_to_value(v)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "AudioCapture")?;
         ensure_no_duplicate_keys("AudioCapture", &c.fields.0)?;
-        let mut action_id = None; let mut mode = None; let mut silence_ms = None;
-        let mut min_speech_ms = None; let mut language_hint = None;
-        let mut recording_path = None; let mut disabled = None;
-        let mut active_path = None; let mut variant = None;
+        let mut action_id = None;
+        let mut mode = None;
+        let mut silence_ms = None;
+        let mut min_speech_ms = None;
+        let mut language_hint = None;
+        let mut recording_path = None;
+        let mut disabled = None;
+        let mut active_path = None;
+        let mut variant = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => action_id = Some(decode_from_value(v)?),

@@ -27,8 +27,9 @@ use crate::services::stream_hub::{BinaryStreamSource, BROADCAST_CAPACITY};
 
 /// Same generic fMP4/H.264 MIME the local publisher advertises — the relayed
 /// init segment carries the real `avcC` box, so the browser validates the codec
-/// from the bytes, not this string.
-const FMP4_H264_MIME: &str = "video/mp4; codecs=\"avc1.42E01E\"";
+/// from the bytes, not this string. Shared with the vision-worker relay source,
+/// which republishes the same fMP4 stream shape.
+pub(crate) const FMP4_H264_MIME: &str = "video/mp4; codecs=\"avc1.42E01E\"";
 
 /// Maximum time `init_segment()` waits for the first relayed `is_init` frame
 /// before giving up. Beyond this we assume the relay never started (owner gate
@@ -71,7 +72,10 @@ impl std::fmt::Debug for RemoteCameraStreamSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemoteCameraStreamSource")
             .field("stream_id", &self.stream_id)
-            .field("init_segment_len", &self.init_segment.lock().as_ref().map(|b| b.len()))
+            .field(
+                "init_segment_len",
+                &self.init_segment.lock().as_ref().map(|b| b.len()),
+            )
             .field("terminal", &self.terminal.load(Ordering::Acquire))
             .finish()
     }
@@ -139,7 +143,10 @@ async fn spawn_relay(
     camera_id: String,
     org_id: String,
 ) {
-    let mut stream = match iroh.camera_stream_request(&owner_node, &camera_id, &org_id).await {
+    let mut stream = match iroh
+        .camera_stream_request(&owner_node, &camera_id, &org_id)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             tracing::debug!(

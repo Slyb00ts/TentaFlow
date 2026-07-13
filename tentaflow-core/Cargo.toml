@@ -150,6 +150,7 @@ http-body-util = "0.1.3"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
+serde_bytes = "0.11"
 serde_json = "1.0.150"
 
 # CEL expression engine (flow variables / io-mapping / condition / loop / map —
@@ -504,6 +505,14 @@ required-features = ["inference-supertonic"]
 name = "cv_bench"
 required-features = ["inference-vision-gpu"]
 
+# Authoritative end-to-end camera CV capacity bench: drives the REAL always-on
+# vision engine (ingest session → latest_frame_global → engine_loop → detect
+# batching → executor → cold path) instead of reimplementing per-frame work like
+# cam_scale. One GPU. Needs provisioned vision models + ort GPU dylib.
+[[example]]
+name = "pipeline_bench"
+required-features = ["inference-vision-gpu", "inference-supertonic", "camera"]
+
 [[example]]
 name = "adr_probe"
 required-features = ["inference-vision-gpu"]
@@ -512,6 +521,31 @@ required-features = ["inference-vision-gpu"]
 [[example]]
 name = "ort_cuda_probe"
 required-features = ["inference-supertonic"]
+
+# GPU-resident crop preprocess (fused CUDA resize+normalize → ORT device tensor)
+# vs the CPU-preprocess path: correctness (label parity) + speed gate. Needs a
+# CUDA GPU + provisioned model_stan.onnx.
+[[example]]
+name = "gpu_preprocess_smoke"
+required-features = ["inference-vision-gpu", "inference-supertonic"]
+
+# Stage-0 NV12->RGB+resize+normalize CUDA kernel parity gate: GPU device tensor
+# vs a CPU reference (same YUV matrix + resize_rgb + normalize). Needs a CUDA GPU.
+[[example]]
+name = "nv12_preprocess_smoke"
+required-features = ["inference-vision-gpu", "inference-supertonic"]
+
+# A/B plate-OCR preprocessing: current stretch vs. perspective deskew, side by
+# side over a folder of crops (feed it `[vision] ocr_dump_dir` captures).
+[[example]]
+name = "ocr_deskew_ab"
+required-features = ["inference-vision-gpu", "inference-supertonic"]
+
+# CPU micro-bench for the detector's host-tensor fill + shared DETR decode,
+# with bit-identity gates against baseline copies of the pre-optimization code.
+[[example]]
+name = "detect_post_bench"
+required-features = ["inference-vision-gpu", "inference-supertonic"]
 
 [[test]]
 name = "agent_run_inline_region_e2e"

@@ -36,7 +36,9 @@ fn parse_ref_id(v: &serde_json::Value, ctx: &str) -> Result<u64> {
         .as_u64()
         .ok_or_else(|| anyhow!("vector adapter: {ctx}: ref_id musi być nieujemną liczbą całkowitą <= u64::MAX, dostał {v}"))?;
     if id == 0 {
-        return Err(anyhow!("vector adapter: {ctx}: ref_id musi być > 0 (0 jest zarezerwowane)"));
+        return Err(anyhow!(
+            "vector adapter: {ctx}: ref_id musi być > 0 (0 jest zarezerwowane)"
+        ));
     }
     Ok(id)
 }
@@ -45,7 +47,10 @@ fn parse_ref_id(v: &serde_json::Value, ctx: &str) -> Result<u64> {
 /// i 3 z review: `u64 as u32` zawijał np. 4294967297 → 1).
 fn u64_to_u32(n: u64, what: &str) -> Result<u32> {
     u32::try_from(n).map_err(|_| {
-        anyhow!("vector adapter: {what}={n} poza zakresem u32 (max {})", u32::MAX)
+        anyhow!(
+            "vector adapter: {what}={n} poza zakresem u32 (max {})",
+            u32::MAX
+        )
     })
 }
 
@@ -101,8 +106,9 @@ impl VectorNodeAdapter {
     fn pick_metric(node: &FlowNode) -> Result<Metric> {
         match node.config.get("metric").and_then(|v| v.as_str()) {
             None => Ok(Metric::Cosine),
-            Some(s) => Metric::parse(s)
-                .ok_or_else(|| anyhow!("vector adapter: nieznana metryka '{s}' (cosine|euclidean|dot)")),
+            Some(s) => Metric::parse(s).ok_or_else(|| {
+                anyhow!("vector adapter: nieznana metryka '{s}' (cosine|euclidean|dot)")
+            }),
         }
     }
 
@@ -165,9 +171,9 @@ impl VectorNodeAdapter {
         }
         let mut indices = Vec::with_capacity(indices_raw.len());
         for (i, idx) in indices_raw.iter().enumerate() {
-            let n = idx
-                .as_u64()
-                .ok_or_else(|| anyhow!("vector adapter: sparse.indices[{i}] nie jest liczbą całkowitą >= 0"))?;
+            let n = idx.as_u64().ok_or_else(|| {
+                anyhow!("vector adapter: sparse.indices[{i}] nie jest liczbą całkowitą >= 0")
+            })?;
             indices.push(u64_to_u32(n, &format!("sparse.indices[{i}]"))?);
         }
         let mut values = Vec::with_capacity(values_raw.len());
@@ -221,7 +227,10 @@ impl VectorNodeAdapter {
             .filter(|s| !s.is_empty());
         match (collection, config_filter) {
             (Some(cid), Some(cfg)) => Some(Filter::And(vec![
-                Filter::Eq("collection_id".to_string(), FieldValue::Str(cid.to_string())),
+                Filter::Eq(
+                    "collection_id".to_string(),
+                    FieldValue::Str(cid.to_string()),
+                ),
                 cfg,
             ])),
             (Some(cid), None) => Some(Filter::Eq(
@@ -301,10 +310,11 @@ impl VectorNodeAdapter {
         let metric = Self::pick_metric(node)?;
 
         let items = match &envelope.payload {
-            FlowValue::Json(obj) => obj
-                .get("items")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| anyhow!("vector adapter: upsert: payload Json bez 'items' (tablica)"))?,
+            FlowValue::Json(obj) => {
+                obj.get("items").and_then(|v| v.as_array()).ok_or_else(|| {
+                    anyhow!("vector adapter: upsert: payload Json bez 'items' (tablica)")
+                })?
+            }
             other => {
                 return Err(anyhow!(
                     "vector adapter: upsert: payload musi być Json{{items:[...]}}, dostał {}",
@@ -635,9 +645,9 @@ fn parse_filter_inner(v: &serde_json::Value) -> Result<Filter> {
                 .as_str()
                 .ok_or_else(|| anyhow!("vector adapter: filter 'in': field nie jest stringiem"))?
                 .to_string();
-            let values_arr = arr[1]
-                .as_array()
-                .ok_or_else(|| anyhow!("vector adapter: filter 'in': drugi element musi być tablicą"))?;
+            let values_arr = arr[1].as_array().ok_or_else(|| {
+                anyhow!("vector adapter: filter 'in': drugi element musi być tablicą")
+            })?;
             let mut values = Vec::with_capacity(values_arr.len());
             for item in values_arr {
                 values.push(json_to_field_value(item, 0)?.1);
@@ -647,7 +657,9 @@ fn parse_filter_inner(v: &serde_json::Value) -> Result<Filter> {
         "and" => Ok(Filter::And(parse_filter_list(val)?)),
         "or" => Ok(Filter::Or(parse_filter_list(val)?)),
         "not" => Ok(Filter::Not(Box::new(parse_filter_inner(val)?))),
-        other => Err(anyhow!("vector adapter: nieznany operator filter '{other}'")),
+        other => Err(anyhow!(
+            "vector adapter: nieznany operator filter '{other}'"
+        )),
     }
 }
 
@@ -843,12 +855,17 @@ mod tests {
             FlowValue::Json(v) => v.get("hits").and_then(|h| h.as_array()).cloned().unwrap(),
             other => panic!("expected Json, got {other:?}"),
         };
-        assert_eq!(hits.len(), 1, "filtr po collection_id zwraca tylko kolekcję A");
+        assert_eq!(
+            hits.len(),
+            1,
+            "filtr po collection_id zwraca tylko kolekcję A"
+        );
         assert_eq!(hits[0]["fields"]["collection_id"].as_str(), Some("col-A"));
         assert_eq!(hits[0]["fields"]["doc_id"].as_str(), Some("docA"));
         // Pasaż kolekcji B NIE może wyciec.
         assert!(
-            hits.iter().all(|h| h["fields"]["collection_id"].as_str() != Some("col-B")),
+            hits.iter()
+                .all(|h| h["fields"]["collection_id"].as_str() != Some("col-B")),
             "pasaż kolekcji B nie może trafić do wyniku zapytania o kolekcję A"
         );
     }
@@ -901,7 +918,10 @@ mod tests {
         assert_eq!(cites[0]["doc_id"].as_str(), Some("docA"));
         assert_eq!(cites[0]["chunk_index"].as_i64(), Some(7));
         assert_eq!(cites[0]["text"].as_str(), Some("realny pasaz"));
-        assert!(cites[0]["score"].as_f64().is_some(), "cytat niesie realny score");
+        assert!(
+            cites[0]["score"].as_f64().is_some(),
+            "cytat niesie realny score"
+        );
     }
 
     #[tokio::test]
@@ -913,7 +933,9 @@ mod tests {
         VectorNodeAdapter::new()
             .execute(
                 &node(json!({"op": "upsert", "namespace": "p", "dim": 2})),
-                &[input(upsert_payload(json!([{"ref_id": 1, "vector": [1.0, 0.0]}])))],
+                &[input(upsert_payload(
+                    json!([{"ref_id": 1, "vector": [1.0, 0.0]}]),
+                ))],
                 &ctx,
             )
             .await
@@ -921,11 +943,17 @@ mod tests {
         let out = VectorNodeAdapter::new()
             .execute(
                 &node(json!({"op": "search", "namespace": "p"})),
-                &[search_input_with_meta(vec![1.0, 0.0], json!({"top_k": 9_999_999}))],
+                &[search_input_with_meta(
+                    vec![1.0, 0.0],
+                    json!({"top_k": 9_999_999}),
+                )],
                 &ctx,
             )
             .await;
-        assert!(out.is_ok(), "top_k z meta ponad MAX ma być capowany, nie błąd");
+        assert!(
+            out.is_ok(),
+            "top_k z meta ponad MAX ma być capowany, nie błąd"
+        );
     }
 
     #[tokio::test]
@@ -948,7 +976,10 @@ mod tests {
             other => panic!("expected Json, got {other:?}"),
         };
         assert_eq!(written, 2);
-        assert_eq!(out.meta.get("vector_count").and_then(|n| n.as_u64()), Some(2));
+        assert_eq!(
+            out.meta.get("vector_count").and_then(|n| n.as_u64()),
+            Some(2)
+        );
     }
 
     #[tokio::test]
@@ -1029,17 +1060,34 @@ mod tests {
             .unwrap();
 
         let count = |out: &FlowEnvelope| match &out.payload {
-            FlowValue::Json(v) => v.get("hits").and_then(|h| h.as_array()).map(|a| a.len()).unwrap(),
+            FlowValue::Json(v) => v
+                .get("hits")
+                .and_then(|h| h.as_array())
+                .map(|a| a.len())
+                .unwrap(),
             _ => panic!("expected Json"),
         };
         let search_node = node(json!({"op": "search", "namespace": "ns", "top_k": 10}));
         let q = || input(FlowValue::Embedding(vec![1.0, 0.0, 0.0]));
 
-        let oa = VectorNodeAdapter::new().execute(&search_node, &[q()], &ctx_a).await.unwrap();
-        let ob = VectorNodeAdapter::new().execute(&search_node, &[q()], &ctx_b).await.unwrap();
-        let oc = VectorNodeAdapter::new().execute(&search_node, &[q()], &ctx_c).await.unwrap();
+        let oa = VectorNodeAdapter::new()
+            .execute(&search_node, &[q()], &ctx_a)
+            .await
+            .unwrap();
+        let ob = VectorNodeAdapter::new()
+            .execute(&search_node, &[q()], &ctx_b)
+            .await
+            .unwrap();
+        let oc = VectorNodeAdapter::new()
+            .execute(&search_node, &[q()], &ctx_c)
+            .await
+            .unwrap();
         assert_eq!(count(&oa), 2, "inst-a/org-1 ma 2 wektory");
-        assert_eq!(count(&ob), 1, "inst-b/org-1 ma 1 wektor (izolacja per-addon)");
+        assert_eq!(
+            count(&ob),
+            1,
+            "inst-b/org-1 ma 1 wektor (izolacja per-addon)"
+        );
         assert_eq!(count(&oc), 1, "inst-a/org-2 ma 1 wektor (izolacja per-org)");
     }
 
@@ -1114,7 +1162,9 @@ mod tests {
         VectorNodeAdapter::new()
             .execute(
                 &node(json!({"op": "upsert", "namespace": "p", "dim": 2})),
-                &[input(upsert_payload(json!([{"ref_id": 1, "vector": [1.0, 0.0]}])))],
+                &[input(upsert_payload(
+                    json!([{"ref_id": 1, "vector": [1.0, 0.0]}]),
+                ))],
                 &ctx,
             )
             .await
@@ -1140,7 +1190,9 @@ mod tests {
         VectorNodeAdapter::new()
             .execute(
                 &node(json!({"op": "upsert", "namespace": "p", "dim": 2})),
-                &[input(upsert_payload(json!([{"ref_id": 1, "vector": [1.0, 0.0]}])))],
+                &[input(upsert_payload(
+                    json!([{"ref_id": 1, "vector": [1.0, 0.0]}]),
+                ))],
                 &ctx,
             )
             .await

@@ -846,10 +846,7 @@ fn ensure_ort_dylib() {
 
 /// Szuka wersjonowanego `<libname>.<ver>` (np. `libonnxruntime.so.1.22.0`) w
 /// podanych katalogach — `ensure_ort_dylib` probuje go gdy brak dokladnej nazwy.
-fn find_versioned_dylib(
-    dirs: &[std::path::PathBuf],
-    libname: &str,
-) -> Option<std::path::PathBuf> {
+fn find_versioned_dylib(dirs: &[std::path::PathBuf], libname: &str) -> Option<std::path::PathBuf> {
     let prefix = format!("{libname}.");
     for dir in dirs {
         let Ok(entries) = std::fs::read_dir(dir) else {

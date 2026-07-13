@@ -201,7 +201,10 @@ async fn run_training_against_dir(
     let status_url = format!("{}/status/{}", base, job_id);
     loop {
         if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("RF-DETR training timed out after {}s", JOB_TIMEOUT.as_secs());
+            anyhow::bail!(
+                "RF-DETR training timed out after {}s",
+                JOB_TIMEOUT.as_secs()
+            );
         }
         tokio::time::sleep(POLL_INTERVAL).await;
 
@@ -339,7 +342,9 @@ fn prepare_dataset_with_valid(coco_path: &Path, run_id: &str) -> anyhow::Result<
             test_ids.insert(id);
         }
     }
-    let train_count = images.len().saturating_sub(valid_ids.len() + test_ids.len());
+    let train_count = images
+        .len()
+        .saturating_sub(valid_ids.len() + test_ids.len());
     if train_count < MIN_TRAIN_IMAGES {
         anyhow::bail!("zbiór za mały do treningu — dodaj więcej obrazów");
     }
@@ -540,8 +545,9 @@ fn coco_class_names(json_bytes: &[u8]) -> Vec<String> {
 // Rejestr jobów treningowych uruchomionych PRZEZ MESH na tym nodzie (odbiorca).
 // Mapuje `run_id` (klucz inicjatora Node A) na lokalny job serwisu (base+job_id).
 // In-memory — joby to byty runtime; artefakty żyją na dysku tego noda.
-static MESH_JOBS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (String, String)>>> =
-    std::sync::OnceLock::new();
+static MESH_JOBS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
+> = std::sync::OnceLock::new();
 
 fn mesh_jobs() -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, String)>> {
     MESH_JOBS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
@@ -553,7 +559,8 @@ static MESH_DS_ACCUM: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, Vec<Option<Vec<u8>>>>>,
 > = std::sync::OnceLock::new();
 
-fn ds_accum() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<Option<Vec<u8>>>>> {
+fn ds_accum() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<Option<Vec<u8>>>>>
+{
     MESH_DS_ACCUM.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -619,8 +626,8 @@ static RECOG_SYNC: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, DatasetSyncProgress>>,
 > = std::sync::OnceLock::new();
 
-fn recog_sync_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, DatasetSyncProgress>>
-{
+fn recog_sync_map(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, DatasetSyncProgress>> {
     RECOG_SYNC.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -645,8 +652,9 @@ pub fn clear_recog_sync(run_id: &str) {
 // Licznik kolejnych nieudanych pollingów statusu zdalnego runu (Node B nieosiągalny
 // / zgubił job po restarcie). Po przekroczeniu progu run domykamy jako failed,
 // zamiast trzymać go w „running" w nieskończoność.
-static REMOTE_POLL_FAILS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> =
-    std::sync::OnceLock::new();
+static REMOTE_POLL_FAILS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, u32>>,
+> = std::sync::OnceLock::new();
 const REMOTE_POLL_FAIL_LIMIT: u32 = 15;
 
 fn remote_poll_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
@@ -656,7 +664,9 @@ fn remote_poll_map() -> &'static std::sync::Mutex<std::collections::HashMap<Stri
 /// Rejestruje wynik pollingu zdalnego statusu. `ok=true` zeruje licznik; `false`
 /// inkrementuje i zwraca true gdy próg przekroczony (czas domknąć run jako failed).
 pub fn note_remote_poll(run_id: &str, ok: bool) -> bool {
-    let Ok(mut m) = remote_poll_map().lock() else { return false };
+    let Ok(mut m) = remote_poll_map().lock() else {
+        return false;
+    };
     if ok {
         m.remove(run_id);
         false
@@ -693,15 +703,25 @@ pub fn spawn_mesh_dataset_push_and_train(
         let zipped = {
             set_recog_sync(
                 &run_id,
-                DatasetSyncProgress { phase: "zipping".into(), ..Default::default() },
+                DatasetSyncProgress {
+                    phase: "zipping".into(),
+                    ..Default::default()
+                },
             );
             let dir = std::path::PathBuf::from(&dataset_dir);
             tokio::task::spawn_blocking(move || zip_dir(&dir)).await
         };
         let result = match zipped {
             Ok(Ok(zip_bytes)) => {
-                mesh_push_and_train(&iroh, &target, &run_id, zip_bytes, &dataset_hash, &spec_json)
-                    .await
+                mesh_push_and_train(
+                    &iroh,
+                    &target,
+                    &run_id,
+                    zip_bytes,
+                    &dataset_hash,
+                    &spec_json,
+                )
+                .await
             }
             Ok(Err(e)) => Err(e),
             Err(e) => Err(anyhow::anyhow!("zip join: {}", e)),
@@ -732,8 +752,15 @@ pub fn spawn_mesh_push_and_train(
     spec_json: String,
 ) {
     tokio::spawn(async move {
-        if let Err(err) =
-            mesh_push_and_train(&iroh, &target, &run_id, zip_bytes, &dataset_hash, &spec_json).await
+        if let Err(err) = mesh_push_and_train(
+            &iroh,
+            &target,
+            &run_id,
+            zip_bytes,
+            &dataset_hash,
+            &spec_json,
+        )
+        .await
         {
             tracing::warn!(run_id = %run_id, error = %err, "mesh blob push/train failed");
             set_recog_sync(
@@ -909,8 +936,12 @@ pub fn mesh_dataset_chunk(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data_b64.as_bytes())
         .map_err(|e| anyhow::anyhow!("chunk base64: {}", e))?;
-    let mut map = ds_accum().lock().map_err(|_| anyhow::anyhow!("accum lock poisoned"))?;
-    let slot = map.entry(hash.to_string()).or_insert_with(|| vec![None; total as usize]);
+    let mut map = ds_accum()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("accum lock poisoned"))?;
+    let slot = map
+        .entry(hash.to_string())
+        .or_insert_with(|| vec![None; total as usize]);
     if slot.len() != total as usize {
         *slot = vec![None; total as usize];
     }
@@ -1005,8 +1036,8 @@ pub fn coco_content_hash(dir: &Path) -> anyhow::Result<String> {
 /// mesh dla NIE-wspólnego zasobu jest osobnym, jeszcze niezaimplementowanym
 /// krokiem; NIE wolno trenować na cudzych/nie-tych danych).
 pub async fn mesh_train_start(run_id: &str, spec_json: &str) -> anyhow::Result<()> {
-    let spec: serde_json::Value = serde_json::from_str(spec_json)
-        .map_err(|e| anyhow::anyhow!("spec_json invalid: {}", e))?;
+    let spec: serde_json::Value =
+        serde_json::from_str(spec_json).map_err(|e| anyhow::anyhow!("spec_json invalid: {}", e))?;
     let dataset_dir_raw = spec
         .get("dataset_dir")
         .and_then(|v| v.as_str())
@@ -1016,7 +1047,10 @@ pub async fn mesh_train_start(run_id: &str, spec_json: &str) -> anyhow::Result<(
     let dataset_dir: &str = if let Some(hash) = dataset_dir_raw.strip_prefix("mesh:") {
         let c = mesh_dataset_cache(hash);
         if !c.is_dir() {
-            anyhow::bail!("dataset mesh nie zmaterializowany na tym nodzie (hash {})", hash);
+            anyhow::bail!(
+                "dataset mesh nie zmaterializowany na tym nodzie (hash {})",
+                hash
+            );
         }
         resolved = c.to_string_lossy().to_string();
         &resolved
@@ -1045,7 +1079,10 @@ pub async fn mesh_train_start(run_id: &str, spec_json: &str) -> anyhow::Result<(
         }
     }
     let class_names = spec.get("class_names").cloned().unwrap_or(json!([]));
-    let variant = spec.get("variant").and_then(|v| v.as_str()).unwrap_or("base");
+    let variant = spec
+        .get("variant")
+        .and_then(|v| v.as_str())
+        .unwrap_or("base");
     let output_dir = spec
         .get("output_dir")
         .and_then(|v| v.as_str())
@@ -1062,8 +1099,7 @@ pub async fn mesh_train_start(run_id: &str, spec_json: &str) -> anyhow::Result<(
         "hyperparams": hyperparams,
     });
     let url = format!("{}/train", base);
-    let job_id =
-        tokio::task::spawn_blocking(move || post_train(&url, train_body)).await??;
+    let job_id = tokio::task::spawn_blocking(move || post_train(&url, train_body)).await??;
     mesh_jobs()
         .lock()
         .map_err(|_| anyhow::anyhow!("mesh_jobs lock poisoned"))?
@@ -1181,10 +1217,7 @@ pub async fn run_export(
             // /train, /status, /export, /export_status, /detect) — the worker
             // thread finishes on its own and releases its export slot; the
             // caller cleans partial local output under the publish export dir.
-            anyhow::bail!(
-                "ONNX export timed out after {}s",
-                EXPORT_TIMEOUT.as_secs()
-            );
+            anyhow::bail!("ONNX export timed out after {}s", EXPORT_TIMEOUT.as_secs());
         }
         tokio::time::sleep(EXPORT_POLL).await;
         let status_url = format!("{base}/export_status/{export_id}");
@@ -1224,9 +1257,7 @@ pub async fn run_export(
 fn resolve_endpoint() -> anyhow::Result<String> {
     let pool = crate::db::global_pool()
         .ok_or_else(|| anyhow::anyhow!("core service registry unavailable"))?;
-    let conn = pool
-        .read()
-        .map_err(|_| anyhow::anyhow!("core db read"))?;
+    let conn = pool.read().map_err(|_| anyhow::anyhow!("core db read"))?;
     let svcs =
         services_repo::services::list_by_category(&conn, "training", Some("rfdetr-training"))?;
     let svc = svcs.into_iter().next().ok_or_else(|| {

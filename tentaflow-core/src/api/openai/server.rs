@@ -188,9 +188,12 @@ fn entry_access_allowed(db: &DbPool, entry: &CatalogEntry, principal: &Principal
             crate::auth::acl::check_v1_access(db, "flow", &entry.id, principal)
                 || crate::auth::acl::check_v1_access(db, "flow", flow_id, principal)
         }
-        other => {
-            crate::auth::acl::check_v1_access(db, resource_type_for_kind(other), &entry.id, principal)
-        }
+        other => crate::auth::acl::check_v1_access(
+            db,
+            resource_type_for_kind(other),
+            &entry.id,
+            principal,
+        ),
     }
 }
 
@@ -815,9 +818,7 @@ async fn handle_image_generation(
 
     let wants_url = request.response_format.as_deref() == Some("url");
     if wants_url {
-        warn!(
-            "Image-gen: response_format=url nie jest wspierany dla ComfyUI — zwracam b64_json"
-        );
+        warn!("Image-gen: response_format=url nie jest wspierany dla ComfyUI — zwracam b64_json");
     }
 
     let client = match ComfyClient::new(base) {
@@ -1753,10 +1754,13 @@ async fn handle_passthrough(
     } = &target
     {
         if forward_path == "/v1/infer" {
-            return Ok(
-                infer_embedded_vision(&parsed, model_name, engine_id, router.executor.clone())
-                    .await,
-            );
+            return Ok(infer_embedded_vision(
+                &parsed,
+                model_name,
+                engine_id,
+                router.executor.clone(),
+            )
+            .await);
         }
         return Ok(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1807,12 +1811,15 @@ async fn handle_passthrough(
 
     match upstream {
         Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status().as_u16())
-                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let status =
+                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             match resp.bytes().await {
                 Ok(bytes) => Ok(json_response(status, bytes.to_vec())),
                 Err(e) => {
-                    error!("Passthrough {}: odczyt body z upstream: {}", forward_path, e);
+                    error!(
+                        "Passthrough {}: odczyt body z upstream: {}",
+                        forward_path, e
+                    );
                     Ok(error_response(
                         StatusCode::BAD_GATEWAY,
                         "service_unavailable",
@@ -1846,8 +1853,15 @@ fn resolve_local_v1_base(
     user_ctx: Option<crate::auth::acl::UserContext>,
     context_label: &str,
 ) -> std::result::Result<String, Response<OpenAIBody>> {
-    resolve_local_v1_base_url(router, model, surface, input_modalities, user_ctx, context_label)
-        .map_err(|msg| error_response(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable", msg))
+    resolve_local_v1_base_url(
+        router,
+        model,
+        surface,
+        input_modalities,
+        user_ctx,
+        context_label,
+    )
+    .map_err(|msg| error_response(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable", msg))
 }
 
 /// Rozwiązuje `ResolvedExecutionTarget` przez ten sam resolver/ACL co reszta
@@ -2121,12 +2135,7 @@ fn vision_infer_to_json(out: crate::vision::InferOutput, w: f32, h: f32) -> serd
             let probabilities: serde_json::Map<String, serde_json::Value> = em
                 .probabilities
                 .iter()
-                .map(|(label, p)| {
-                    (
-                        label.clone(),
-                        serde_json::Value::from(*p),
-                    )
-                })
+                .map(|(label, p)| (label.clone(), serde_json::Value::from(*p)))
                 .collect();
             serde_json::json!({
                 "data": [{
@@ -2188,12 +2197,12 @@ pub fn resolve_local_v1_base_url(
                 )),
             }
         }
-        crate::services::runtime::target::ResolvedExecutionTarget::MeshForward { node_id, .. } => {
-            Err(format!(
-                "model '{}' żyje tylko na zdalnym węźle '{}' — {} obsługuje wyłącznie lokalne serwisy",
-                model, node_id, context_label
-            ))
-        }
+        crate::services::runtime::target::ResolvedExecutionTarget::MeshForward {
+            node_id, ..
+        } => Err(format!(
+            "model '{}' żyje tylko na zdalnym węźle '{}' — {} obsługuje wyłącznie lokalne serwisy",
+            model, node_id, context_label
+        )),
         crate::services::runtime::target::ResolvedExecutionTarget::Flow { .. } => Err(format!(
             "model '{}' rozwiązał się do flow, nie do serwisu HTTP",
             model
@@ -2243,7 +2252,12 @@ async fn try_embedded_rerank(
     // Model rerankera zaladowany przez embedded deploy (load_embedder_model).
     let scores = match crate::inference::mlx_swift_bridge::rerank(query, documents).await {
         Ok(s) => s,
-        Err(e) => return Some(Err(format!("{}: embedded MLX rerank: {}", context_label, e))),
+        Err(e) => {
+            return Some(Err(format!(
+                "{}: embedded MLX rerank: {}",
+                context_label, e
+            )))
+        }
     };
     let mut ranked: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -2386,7 +2400,11 @@ pub async fn rerank_forward(
             let relevance_score = item.get("relevance_score").and_then(|s| s.as_f64())? as f32;
             let document = item
                 .get("document")
-                .and_then(|d| d.get("text").and_then(|t| t.as_str()).or_else(|| d.as_str()))
+                .and_then(|d| {
+                    d.get("text")
+                        .and_then(|t| t.as_str())
+                        .or_else(|| d.as_str())
+                })
                 .map(|s| s.to_string());
             Some(tentaflow_protocol::RerankResultItem {
                 index,
@@ -2484,9 +2502,10 @@ async fn handle_ranking(
             for passage in arr {
                 let text = match passage {
                     serde_json::Value::String(s) => Some(s.clone()),
-                    serde_json::Value::Object(o) => {
-                        o.get("text").and_then(|t| t.as_str()).map(|t| t.to_string())
-                    }
+                    serde_json::Value::Object(o) => o
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t.to_string()),
                     _ => None,
                 };
                 match text {

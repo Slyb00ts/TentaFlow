@@ -563,7 +563,10 @@ fn process_four_node_snapshot_tail_respects_acl() {
     // A non-target chain pull is served REDACTED (no body leak); a snapshot pull
     // is still hard-denied because a SQL snapshot package cannot be partially
     // redacted (all-or-nothing per partition).
-    source.command(&format!("ASSERT_REPAIR_REDACTED {}", receiver_denied.node_id));
+    source.command(&format!(
+        "ASSERT_REPAIR_REDACTED {}",
+        receiver_denied.node_id
+    ));
     source.command(&format!(
         "ASSERT_SNAPSHOT_DENIED {} {} {}",
         receiver_denied.node_id, snapshot.0, snapshot.1
@@ -1183,8 +1186,7 @@ async fn handle_child_command(
             Ok("SEND_REPAIR".to_string())
         }
         ["APPLY_INBOX"] => {
-            let applied =
-                tentaflow_core::sync::runtime::apply_unapplied_inbox(256)?.unwrap_or(0);
+            let applied = tentaflow_core::sync::runtime::apply_unapplied_inbox(256)?.unwrap_or(0);
             Ok(format!("APPLY_INBOX {applied}"))
         }
         ["READ_FLOW_HLC"] => {

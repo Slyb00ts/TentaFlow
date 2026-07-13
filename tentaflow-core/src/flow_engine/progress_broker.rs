@@ -179,7 +179,12 @@ mod tests {
         let broker = Arc::new(ProgressBroker::new());
         let sink = BrokerProgressSink::new(broker.clone());
         // No subscriber for this scope — publish must not create an entry.
-        sink.emit("orphan", ProgressEvent::Compaction { node_id: "n".into() });
+        sink.emit(
+            "orphan",
+            ProgressEvent::Compaction {
+                node_id: "n".into(),
+            },
+        );
         assert_eq!(broker.subscriber_count("orphan"), 0);
     }
 
@@ -226,7 +231,12 @@ mod tests {
             },
         );
         let got = rx_a.recv().await.expect("scope a delivered");
-        assert_eq!(got, ProgressEvent::ToolCallStarted { name: "search".into() });
+        assert_eq!(
+            got,
+            ProgressEvent::ToolCallStarted {
+                name: "search".into()
+            }
+        );
         // Scope b saw nothing.
         assert!(rx_b.try_recv().is_err());
     }

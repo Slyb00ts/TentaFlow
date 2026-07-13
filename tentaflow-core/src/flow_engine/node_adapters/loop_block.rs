@@ -278,10 +278,7 @@ impl LoopNodeAdapter {
             .get(META_EMPTY_NUDGE_USED)
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        if final_text.trim().is_empty()
-            && Self::used_tools_recently(envelope)
-            && !empty_used
-        {
+        if final_text.trim().is_empty() && Self::used_tools_recently(envelope) && !empty_used {
             Self::inject_nudge(envelope, NUDGE_EMPTY_AFTER_TOOLS);
             envelope
                 .meta
@@ -414,7 +411,10 @@ impl LoopNodeAdapter {
             // driver reads `effective_deadline`, never the bare `deadline` —
             // otherwise the next iteration boundary would abort a run that the
             // §3.13 extension just kept alive.
-            if ctx.effective_deadline().is_some_and(|d| Instant::now() >= d) {
+            if ctx
+                .effective_deadline()
+                .is_some_and(|d| Instant::now() >= d)
+            {
                 break "cancelled";
             }
             // Exit-on-until is checked at the top so an already-satisfied
@@ -514,7 +514,9 @@ impl NodeAdapter for LoopNodeAdapter {
         if plan.final_pass
             && exit_reason == "max_iterations"
             && !ctx.cancel_token.is_cancelled()
-            && !ctx.effective_deadline().is_some_and(|d| Instant::now() >= d)
+            && !ctx
+                .effective_deadline()
+                .is_some_and(|d| Instant::now() >= d)
         {
             current
                 .meta
@@ -545,7 +547,9 @@ impl NodeAdapter for LoopNodeAdapter {
             // surface — the loop chose "max_iterations" before the pass, so
             // re-check here and convert to the cancelled error path below.
             if ctx.cancel_token.is_cancelled()
-                || ctx.effective_deadline().is_some_and(|d| Instant::now() >= d)
+                || ctx
+                    .effective_deadline()
+                    .is_some_and(|d| Instant::now() >= d)
             {
                 return Err(anyhow!(
                     "loop '{}': cancelled during final pass after {iterations} iteration(s)",
@@ -838,7 +842,13 @@ mod tests {
     async fn iterations_create_no_flow_executions_rows() {
         let pool = db();
         let body_id = "99999999-loop-0000-0000-000000000001";
-        insert_flow(&pool, body_id, "counter-body", &counter_body_json(), "active");
+        insert_flow(
+            &pool,
+            body_id,
+            "counter-body",
+            &counter_body_json(),
+            "active",
+        );
         // Body never stops on its own → the loop runs the full budget.
         let (_registry, slot) = counter_registry_and_runner(pool.clone(), 1000);
 
@@ -882,7 +892,12 @@ mod tests {
     async fn body_flow_engine_id_resolves_published_name_and_meta_accumulates() {
         let pool = db();
         let body_id = "abcabcab-loop-0000-0000-000000000001";
-        insert_published_flow(&pool, body_id, "inst-7:retrieval_round", &counter_body_json());
+        insert_published_flow(
+            &pool,
+            body_id,
+            "inst-7:retrieval_round",
+            &counter_body_json(),
+        );
         // Body flips harness_done at iter 3 → exits `until` after 3 hops.
         let (_registry, slot) = counter_registry_and_runner(pool.clone(), 3);
 
@@ -1299,9 +1314,7 @@ mod tests {
         (registry, slot)
     }
 
-    async fn collect_stream(
-        stream: BoxStream<'static, Result<EnvelopeDelta>>,
-    ) -> (String, bool) {
+    async fn collect_stream(stream: BoxStream<'static, Result<EnvelopeDelta>>) -> (String, bool) {
         use crate::flow_engine::envelope::FinishReason;
         use futures::StreamExt;
         let mut text = String::new();
@@ -1347,7 +1360,10 @@ mod tests {
         // The forwarded answer is the blocking iteration's payload, NOT the
         // streaming body's "final-answer ..." marker (which only appears when a
         // fresh streaming pass runs).
-        assert_eq!(text, "iter 1", "expected forwarded computed answer: {text:?}");
+        assert_eq!(
+            text, "iter 1",
+            "expected forwarded computed answer: {text:?}"
+        );
         assert!(
             !text.contains("final-answer"),
             "until exit must not run a streaming pass: {text:?}"
@@ -1376,7 +1392,10 @@ mod tests {
             .expect("produce_stream");
 
         let (text, saw_finish) = collect_stream(stream).await;
-        assert_eq!(text, "iter 3", "expected forwarded computed answer: {text:?}");
+        assert_eq!(
+            text, "iter 3",
+            "expected forwarded computed answer: {text:?}"
+        );
         assert!(
             !text.contains("final-answer"),
             "until exit must not run a streaming pass: {text:?}"
@@ -1408,8 +1427,14 @@ mod tests {
         let (text, saw_finish) = collect_stream(stream).await;
         // 2 blocking iterations ran; the streaming grace pass then carries
         // iter=2 (the last blocking iteration's count) and loop_final_pass=true.
-        assert!(text.contains("final-answer"), "grace pass must stream: {text:?}");
-        assert!(text.contains("iter=2"), "expected grace pass on iter 2: {text:?}");
+        assert!(
+            text.contains("final-answer"),
+            "grace pass must stream: {text:?}"
+        );
+        assert!(
+            text.contains("iter=2"),
+            "expected grace pass on iter 2: {text:?}"
+        );
         assert!(text.contains("final_pass=true"), "stream text: {text:?}");
         assert!(saw_finish, "client never got finish_reason=Stop");
     }
@@ -1434,7 +1459,10 @@ mod tests {
             .expect("produce_stream");
 
         let (text, saw_finish) = collect_stream(stream).await;
-        assert_eq!(text, "iter 2", "expected forwarded computed answer: {text:?}");
+        assert_eq!(
+            text, "iter 2",
+            "expected forwarded computed answer: {text:?}"
+        );
         assert!(
             !text.contains("final-answer"),
             "no final_pass must not run a streaming pass: {text:?}"
@@ -1522,9 +1550,7 @@ mod tests {
             };
 
             if answer_now {
-                env.context
-                    .messages
-                    .push(ChatMessage::assistant("done"));
+                env.context.messages.push(ChatMessage::assistant("done"));
                 env.payload = FlowValue::Text("done".into());
             } else if self.mode == "empty_after_tools" {
                 // A tool result then an empty assistant final.

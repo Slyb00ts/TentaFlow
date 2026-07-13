@@ -45,25 +45,20 @@ use crate::flow_engine::node_adapters::{
     AwaitSubagentsNodeAdapter, CameraAlertNodeAdapter, CameraVerdictNodeAdapter, ChunkNodeAdapter,
     CombineNodeAdapter, CompactContextNodeAdapter, ConditionNodeAdapter,
     ConversationHistoryNodeAdapter, DocumentMergeNodeAdapter, DocumentParseNodeAdapter,
-    DocumentRouterNodeAdapter,
-    EmbedChunksNodeAdapter, EmbeddingsNodeAdapter, ExcelExtractNodeAdapter,
-    GraphicElementsNodeAdapter, IntervalNodeAdapter,
-    LlmNodeAdapter,
+    DocumentRouterNodeAdapter, EmbedChunksNodeAdapter, EmbeddingsNodeAdapter,
+    ExcelExtractNodeAdapter, GraphicElementsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter,
     LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OcrNodeAdapter, OcrPagesNodeAdapter,
-    OnSubagentCompleteNodeAdapter,
-    OutputNodeAdapter, PageDetectNodeAdapter, PageDetectPagesNodeAdapter, PdfRasterizeNodeAdapter,
-    PlatformSwitchNodeAdapter,
-    PersistTurnNodeAdapter,
-    PiiFilterNodeAdapter, PptxExtractNodeAdapter, RagAccumulateNodeAdapter, RagFinalizeNodeAdapter,
-    RagGraphFactsNodeAdapter, RagGraphSeedNodeAdapter, RagJudgeNodeAdapter,
-    RagQuerySeedNodeAdapter, RerankerNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter,
-    SpeakerContextNodeAdapter, StoreNodeAdapter,
+    OnSubagentCompleteNodeAdapter, OutputNodeAdapter, PageDetectNodeAdapter,
+    PageDetectPagesNodeAdapter, PdfRasterizeNodeAdapter, PersistTurnNodeAdapter,
+    PiiFilterNodeAdapter, PlatformSwitchNodeAdapter, PptxExtractNodeAdapter,
+    RagAccumulateNodeAdapter, RagFinalizeNodeAdapter, RagGraphFactsNodeAdapter,
+    RagGraphSeedNodeAdapter, RagJudgeNodeAdapter, RagQuerySeedNodeAdapter, RerankerNodeAdapter,
+    SessionContextNodeAdapter, SpawnNodeAdapter, SpeakerContextNodeAdapter, StoreNodeAdapter,
     SttNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, TableStructureNodeAdapter,
-    TextExtractNodeAdapter,
-    ToolExecNodeAdapter,
-    TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter, VectorNodeAdapter,
-    VisionClassifyNodeAdapter, VisionNodeAdapter, VisionOcrNodeAdapter, VisionParseNodeAdapter,
-    VisionParsePagesNodeAdapter, WordExtractNodeAdapter,
+    TextExtractNodeAdapter, ToolExecNodeAdapter, TriggerNodeAdapter, TtsCleanNodeAdapter,
+    TtsNodeAdapter, VectorNodeAdapter, VisionClassifyNodeAdapter, VisionNodeAdapter,
+    VisionOcrNodeAdapter, VisionParseNodeAdapter, VisionParsePagesNodeAdapter,
+    WordExtractNodeAdapter,
 };
 use crate::flow_engine::resolver;
 use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
@@ -324,12 +319,11 @@ impl FlowDispatcher {
         // and can therefore see the ephemeral frame, not just durable blobs.
         let frame_blobs: Arc<dyn BlobStore> =
             Arc::new(crate::flow_engine::blob_store::EphemeralBlobStore::new());
-        let ctx_blobs: Arc<dyn BlobStore> = Arc::new(
-            crate::flow_engine::blob_store::CompositeBlobStore::new(
+        let ctx_blobs: Arc<dyn BlobStore> =
+            Arc::new(crate::flow_engine::blob_store::CompositeBlobStore::new(
                 frame_blobs.clone(),
                 blobs.clone(),
-            ),
-        );
+            ));
 
         let audit_node_id = crate::mesh::node_info_collector::local_hostname();
         let llm: Arc<dyn LlmDispatcher> = Arc::new(LlmDispatcherImpl::new(
@@ -344,10 +338,14 @@ impl FlowDispatcher {
             Arc::new(RerankDispatcherImpl::new(runtime_slot.clone()));
         let documents: Arc<dyn DocumentsDispatcher> =
             Arc::new(DocumentsDispatcherImpl::new(runtime_slot.clone()));
-        let tts: Arc<dyn TtsDispatcher> =
-            Arc::new(TtsDispatcherImpl::new(runtime_slot.clone(), ctx_blobs.clone()));
-        let stt: Arc<dyn SttDispatcher> =
-            Arc::new(SttDispatcherImpl::new(runtime_slot.clone(), ctx_blobs.clone()));
+        let tts: Arc<dyn TtsDispatcher> = Arc::new(TtsDispatcherImpl::new(
+            runtime_slot.clone(),
+            ctx_blobs.clone(),
+        ));
+        let stt: Arc<dyn SttDispatcher> = Arc::new(SttDispatcherImpl::new(
+            runtime_slot.clone(),
+            ctx_blobs.clone(),
+        ));
         let vision: Arc<dyn VisionDispatcher> = Arc::new(VisionDispatcherImpl::new(runtime_slot));
 
         // RAG E1.0 — współdzielony proces-szeroki rejestr przestrzeni wektorowych.
@@ -831,7 +829,10 @@ impl FlowDispatcher {
                 Err(e)
             }
             Err(_) => {
-                warn!(flow_id, "Backstop flow po {FLOW_BACKSTOP_SECS}s (zawieszony flow)");
+                warn!(
+                    flow_id,
+                    "Backstop flow po {FLOW_BACKSTOP_SECS}s (zawieszony flow)"
+                );
                 Err(anyhow::anyhow!(
                     "flow {flow_id} backstop timeout after {FLOW_BACKSTOP_SECS}s"
                 ))
@@ -1160,7 +1161,9 @@ fn build_registry(
     // share the late-bound AgentServiceSlot (filled by main.rs after the
     // AddonManager exists). agent_router/compact_context also issue audited LLM
     // calls via ctx.llm; they need only the registry/service.
-    r.register(Arc::new(AgentContextNodeAdapter::new(agent_service.clone())));
+    r.register(Arc::new(AgentContextNodeAdapter::new(
+        agent_service.clone(),
+    )));
     r.register(Arc::new(ToolExecNodeAdapter::new(agent_service.clone())));
     r.register(Arc::new(AgentRouterNodeAdapter::new(agent_service.clone())));
     // `spawn` resolves an agent_id config to the agent's name through the service
@@ -1180,7 +1183,10 @@ fn build_registry(
     r.register_stream_producer(Arc::new(SubflowNodeAdapter::new(subflow_runner.clone())));
     r.register_stream_producer(Arc::new(LoopNodeAdapter::new(subflow_runner.clone())));
     r.register(Arc::new(MapNodeAdapter::new(subflow_runner.clone())));
-    r.register_stream_producer(Arc::new(AgentNodeAdapter::new(agent_service, subflow_runner)));
+    r.register_stream_producer(Arc::new(AgentNodeAdapter::new(
+        agent_service,
+        subflow_runner,
+    )));
     r.register_llm(Arc::new(LlmNodeAdapter::new()));
     // Streaming-aware adaptery (dual-trait NodeAdapter + StreamingNodeAdapter)
     // trafiają do obu slotów. `tts` jest dual: blocking (całość) + streaming
@@ -1244,9 +1250,11 @@ mod tests {
             tts: Arc::new(StubTts),
             // Pusty slot executora — stub factory testów idzie ścieżką fallback
             // (bezpośrednie singletony) w VisionDispatcherImpl.
-            vision: Arc::new(crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new(
-                Arc::new(parking_lot::RwLock::new(None)),
-            )),
+            vision: Arc::new(
+                crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new(Arc::new(
+                    parking_lot::RwLock::new(None),
+                )),
+            ),
             prompts: Arc::new(StubPrompts),
             memory: Arc::new(StubMemory),
             history: Arc::new(StubHistory),

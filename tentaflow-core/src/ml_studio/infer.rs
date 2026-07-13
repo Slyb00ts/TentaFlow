@@ -59,7 +59,9 @@ pub async fn run_local_chat(
     let response = executor
         .execute_chat(request, &mut exec_ctx)
         .await
-        .map_err(|e| anyhow::anyhow!("inferencja modelu '{}' nie powiodła się: {}", model_name, e))?;
+        .map_err(|e| {
+            anyhow::anyhow!("inferencja modelu '{}' nie powiodła się: {}", model_name, e)
+        })?;
 
     let answer = response
         .choices

@@ -66,8 +66,10 @@ fn manifest_validates_data_class_and_name() {
     // Invalid collection name (uppercase).
     assert!(validate_graph_collections(&[col_spec("KG", "B", None)]).is_err());
     // Duplicate names.
-    assert!(validate_graph_collections(&[col_spec("kg", "B", None), col_spec("kg", "B", None)])
-        .is_err());
+    assert!(
+        validate_graph_collections(&[col_spec("kg", "B", None), col_spec("kg", "B", None)])
+            .is_err()
+    );
 }
 
 #[test]
@@ -133,7 +135,15 @@ fn e2e_upsert_node_edge_and_neighbors() {
     let m = mgr(pool, root.path().to_path_buf());
 
     let n1 = m
-        .upsert_node_with_quota(ORG_A, "addon_a", "kg", "n1", "Person", r#"{"name":"Ada"}"#, "null")
+        .upsert_node_with_quota(
+            ORG_A,
+            "addon_a",
+            "kg",
+            "n1",
+            "Person",
+            r#"{"name":"Ada"}"#,
+            "null",
+        )
         .unwrap();
     let n2 = m
         .upsert_node_with_quota(ORG_A, "addon_a", "kg", "n2", "Person", "{}", "null")
@@ -142,7 +152,9 @@ fn e2e_upsert_node_edge_and_neighbors() {
     assert!(n1 >= 1);
 
     let edges = m
-        .upsert_edge_with_quota(ORG_A, "addon_a", "kg", "n1", "KNOWS", "n2", 1.0, "{}", "null")
+        .upsert_edge_with_quota(
+            ORG_A, "addon_a", "kg", "n1", "KNOWS", "n2", 1.0, "{}", "null",
+        )
         .unwrap();
     assert_eq!(edges, 1);
 
@@ -161,18 +173,26 @@ fn e2e_neighbors_and_pagerank() {
     let m = mgr(pool, root.path().to_path_buf());
 
     for id in ["a", "b", "c"] {
-        m.upsert_node_with_quota(ORG_A, "ad", "g", id, "N", "{}", "null").unwrap();
+        m.upsert_node_with_quota(ORG_A, "ad", "g", id, "N", "{}", "null")
+            .unwrap();
     }
-    m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "b", 1.0, "{}", "null").unwrap();
-    m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "c", 2.0, "{}", "null").unwrap();
-    m.upsert_edge_with_quota(ORG_A, "ad", "g", "b", "R", "c", 1.0, "{}", "null").unwrap();
+    m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "b", 1.0, "{}", "null")
+        .unwrap();
+    m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "c", 2.0, "{}", "null")
+        .unwrap();
+    m.upsert_edge_with_quota(ORG_A, "ad", "g", "b", "R", "c", 1.0, "{}", "null")
+        .unwrap();
 
-    let out = m.neighbors(ORG_A, "ad", "g", "a", NeighborDir::Out, None, 10).unwrap();
+    let out = m
+        .neighbors(ORG_A, "ad", "g", "a", NeighborDir::Out, None, 10)
+        .unwrap();
     let ids: Vec<&str> = out.iter().map(|(id, _, _)| id.as_str()).collect();
     assert!(ids.contains(&"b") && ids.contains(&"c"));
     assert_eq!(out.len(), 2);
 
-    let inn = m.neighbors(ORG_A, "ad", "g", "c", NeighborDir::In, None, 10).unwrap();
+    let inn = m
+        .neighbors(ORG_A, "ad", "g", "c", NeighborDir::In, None, 10)
+        .unwrap();
     assert_eq!(inn.len(), 2, "c has two in-edges (a, b)");
 
     let ranked = m.pagerank(ORG_A, "ad", "g", 10, 0.85, 20).unwrap();
@@ -189,15 +209,24 @@ fn e2e_ppr_with_seeds_biases_toward_seed_neighborhood() {
 
     // Two disconnected pairs: a->b and c->d.
     for id in ["a", "b", "c", "d"] {
-        m.upsert_node_with_quota(ORG_A, "ad", "g", id, "N", "{}", "null").unwrap();
+        m.upsert_node_with_quota(ORG_A, "ad", "g", id, "N", "{}", "null")
+            .unwrap();
     }
-    m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "b", 1.0, "{}", "null").unwrap();
-    m.upsert_edge_with_quota(ORG_A, "ad", "g", "c", "R", "d", 1.0, "{}", "null").unwrap();
+    m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "b", 1.0, "{}", "null")
+        .unwrap();
+    m.upsert_edge_with_quota(ORG_A, "ad", "g", "c", "R", "d", 1.0, "{}", "null")
+        .unwrap();
 
     let seeded = m
         .ppr(ORG_A, "ad", "g", &[("a".to_string(), 1.0)], 10, 0.85, 30)
         .unwrap();
-    let score = |id: &str| seeded.iter().find(|(x, _)| x == id).map(|(_, s)| *s).unwrap_or(0.0);
+    let score = |id: &str| {
+        seeded
+            .iter()
+            .find(|(x, _)| x == id)
+            .map(|(_, s)| *s)
+            .unwrap_or(0.0)
+    };
     // Mass concentrated on the seed's component (a/b) over the unrelated (c/d).
     assert!(score("a") + score("b") > score("c") + score("d"));
 }
@@ -212,32 +241,46 @@ fn e2e_delete_is_soft_and_does_not_rewrite_relation() {
     let m = mgr(pool, root.path().to_path_buf());
 
     for id in ["a", "b", "c"] {
-        m.upsert_node_with_quota(ORG_A, "ad", "g", id, "N", "{}", "null").unwrap();
+        m.upsert_node_with_quota(ORG_A, "ad", "g", id, "N", "{}", "null")
+            .unwrap();
     }
-    m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "b", 1.0, "{}", "null").unwrap();
-    m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "c", 1.0, "{}", "null").unwrap();
+    m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "b", 1.0, "{}", "null")
+        .unwrap();
+    m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "c", 1.0, "{}", "null")
+        .unwrap();
 
     // Soft-delete one edge: wiersz zostaje (edge_count bez zmian), ale znika z
     // sąsiadów. To dowodzi, że NIE przepisano relacji bez tej krawędzi.
     let (removed, _n, edges) = m.delete_edge_in(ORG_A, "ad", "g", "a", "R", "b").unwrap();
     assert!(removed);
     assert_eq!(edges, 2, "soft-delete keeps the row → edge_count unchanged");
-    let nb = m.neighbors(ORG_A, "ad", "g", "a", NeighborDir::Out, None, 10).unwrap();
+    let nb = m
+        .neighbors(ORG_A, "ad", "g", "a", NeighborDir::Out, None, 10)
+        .unwrap();
     assert!(nb.iter().all(|(id, _, _)| id != "b"), "dead edge hidden");
     assert!(nb.iter().any(|(id, _, _)| id == "c"), "live edge stays");
     // Re-delete tej samej (już martwej) krawędzi → idempotent (removed=false).
     let (removed2, _, _) = m.delete_edge_in(ORG_A, "ad", "g", "a", "R", "b").unwrap();
     assert!(!removed2);
     // Upsert ożywia krawędź.
-    m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "b", 1.0, "{}", "null").unwrap();
-    let nb2 = m.neighbors(ORG_A, "ad", "g", "a", NeighborDir::Out, None, 10).unwrap();
-    assert!(nb2.iter().any(|(id, _, _)| id == "b"), "re-upsert revives edge");
+    m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "b", 1.0, "{}", "null")
+        .unwrap();
+    let nb2 = m
+        .neighbors(ORG_A, "ad", "g", "a", NeighborDir::Out, None, 10)
+        .unwrap();
+    assert!(
+        nb2.iter().any(|(id, _, _)| id == "b"),
+        "re-upsert revives edge"
+    );
 
     // Delete węzła = tombstone: wiersz zostaje (node_count bez zmian).
     let before = m.node_count(ORG_A, "ad", "g").unwrap();
     let (removed_n, nodes, _e) = m.delete_node_in(ORG_A, "ad", "g", "a").unwrap();
     assert!(removed_n);
-    assert_eq!(nodes, before, "node delete = tombstone → node_count unchanged");
+    assert_eq!(
+        nodes, before,
+        "node delete = tombstone → node_count unchanged"
+    );
 }
 
 #[test]
@@ -249,23 +292,36 @@ fn e2e_tombstone_excluded_from_all_retrieval_paths() {
     let m = mgr(pool, root.path().to_path_buf());
 
     for id in ["a", "b", "c", "z"] {
-        m.upsert_node_with_quota(ORG_A, "ad", "g", id, "N", "{}", "null").unwrap();
+        m.upsert_node_with_quota(ORG_A, "ad", "g", id, "N", "{}", "null")
+            .unwrap();
     }
     // z jest mocno dowiązany (żeby pagerank/ppr go widziały, gdyby nie tombstone).
-    m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "z", 1.0, "{}", "null").unwrap();
-    m.upsert_edge_with_quota(ORG_A, "ad", "g", "b", "R", "z", 1.0, "{}", "null").unwrap();
-    m.upsert_edge_with_quota(ORG_A, "ad", "g", "c", "R", "z", 1.0, "{}", "null").unwrap();
-    m.upsert_edge_with_quota(ORG_A, "ad", "g", "z", "R", "a", 1.0, "{}", "null").unwrap();
-    m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "b", 1.0, "{}", "null").unwrap();
+    m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "z", 1.0, "{}", "null")
+        .unwrap();
+    m.upsert_edge_with_quota(ORG_A, "ad", "g", "b", "R", "z", 1.0, "{}", "null")
+        .unwrap();
+    m.upsert_edge_with_quota(ORG_A, "ad", "g", "c", "R", "z", 1.0, "{}", "null")
+        .unwrap();
+    m.upsert_edge_with_quota(ORG_A, "ad", "g", "z", "R", "a", 1.0, "{}", "null")
+        .unwrap();
+    m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "b", 1.0, "{}", "null")
+        .unwrap();
 
     // Tombstone z.
     let (removed, _, _) = m.delete_node_in(ORG_A, "ad", "g", "z").unwrap();
     assert!(removed);
 
     // 1) neighbors: b nie ma już sąsiada z; z (tombstone) nie ma sąsiadów.
-    let nb = m.neighbors(ORG_A, "ad", "g", "b", NeighborDir::Out, None, 10).unwrap();
-    assert!(nb.iter().all(|(id, _, _)| id != "z"), "z hidden from neighbors");
-    let nz = m.neighbors(ORG_A, "ad", "g", "z", NeighborDir::Out, None, 10).unwrap();
+    let nb = m
+        .neighbors(ORG_A, "ad", "g", "b", NeighborDir::Out, None, 10)
+        .unwrap();
+    assert!(
+        nb.iter().all(|(id, _, _)| id != "z"),
+        "z hidden from neighbors"
+    );
+    let nz = m
+        .neighbors(ORG_A, "ad", "g", "z", NeighborDir::Out, None, 10)
+        .unwrap();
     assert!(nz.is_empty(), "tombstoned node has no neighbors");
 
     // 2) pagerank: z nie pojawia się w rankingu.
@@ -273,7 +329,9 @@ fn e2e_tombstone_excluded_from_all_retrieval_paths() {
     assert!(pr.iter().all(|(id, _)| id != "z"), "z absent from pagerank");
 
     // 3) ppr: seed a — z nie pojawia się w wyniku.
-    let ppr = m.ppr(ORG_A, "ad", "g", &[("a".to_string(), 1.0)], 10, 0.85, 20).unwrap();
+    let ppr = m
+        .ppr(ORG_A, "ad", "g", &[("a".to_string(), 1.0)], 10, 0.85, 20)
+        .unwrap();
     assert!(ppr.iter().all(|(id, _)| id != "z"), "z absent from ppr");
 
     // 4) export_csr: z ani jego krawędzie nie wchodzą do CSR.
@@ -292,11 +350,14 @@ fn neighbors_limit_is_clamped() {
     let root = TempDir::new().unwrap();
     let m = mgr(pool, root.path().to_path_buf());
 
-    m.upsert_node_with_quota(ORG_A, "ad", "g", "a", "N", "{}", "null").unwrap();
+    m.upsert_node_with_quota(ORG_A, "ad", "g", "a", "N", "{}", "null")
+        .unwrap();
     for i in 0..5 {
         let dst = format!("n{i}");
-        m.upsert_node_with_quota(ORG_A, "ad", "g", &dst, "N", "{}", "null").unwrap();
-        m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", &dst, 1.0, "{}", "null").unwrap();
+        m.upsert_node_with_quota(ORG_A, "ad", "g", &dst, "N", "{}", "null")
+            .unwrap();
+        m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", &dst, 1.0, "{}", "null")
+            .unwrap();
     }
     // Wywołanie z absurdalnym limitem; backend i tak clampuje do MAX_RESULT_ROWS i
     // zwraca tylko realnie istniejące krawędzie.
@@ -326,12 +387,22 @@ fn ppr_iterations_and_seed_caps_are_finite() {
     let root = TempDir::new().unwrap();
     let m = mgr(pool, root.path().to_path_buf());
     for id in ["a", "b"] {
-        m.upsert_node_with_quota(ORG_A, "ad", "g", id, "N", "{}", "null").unwrap();
+        m.upsert_node_with_quota(ORG_A, "ad", "g", id, "N", "{}", "null")
+            .unwrap();
     }
-    m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "b", 1.0, "{}", "null").unwrap();
+    m.upsert_edge_with_quota(ORG_A, "ad", "g", "a", "R", "b", 1.0, "{}", "null")
+        .unwrap();
     // Host-fn clampuje iteracje do MAX_RANK_ITERATIONS; tu podajemy już cap.
     let ranked = m
-        .ppr(ORG_A, "ad", "g", &[("a".to_string(), 1.0)], 10, 0.85, graph_api::MAX_RANK_ITERATIONS)
+        .ppr(
+            ORG_A,
+            "ad",
+            "g",
+            &[("a".to_string(), 1.0)],
+            10,
+            0.85,
+            graph_api::MAX_RANK_ITERATIONS,
+        )
         .unwrap();
     assert!(!ranked.is_empty());
 }
@@ -350,14 +421,15 @@ fn compute_concurrency_cap_per_addon_fails_closed() {
 
     let mut held = Vec::new();
     for _ in 0..cap {
-        held.push(
-            graph_api::try_acquire_compute(addon).expect("slot w obrębie capa per-addon"),
-        );
+        held.push(graph_api::try_acquire_compute(addon).expect("slot w obrębie capa per-addon"));
     }
     // N+1 dla tego addona → fail-closed.
     match graph_api::try_acquire_compute(addon) {
         Ok(_) => panic!("nadmiarowy acquire MUSI dostać fail-closed (per-addon cap)"),
-        Err(e) => assert!(graph_api::is_compute_busy(&e), "oczekiwano ComputeBusy, mam: {e:?}"),
+        Err(e) => assert!(
+            graph_api::is_compute_busy(&e),
+            "oczekiwano ComputeBusy, mam: {e:?}"
+        ),
     }
     // Zwolnij jeden slot (Drop) i sprawdź, że kolejny acquire znów przechodzi.
     held.pop();
@@ -397,7 +469,10 @@ fn compute_concurrency_cap_is_global_and_thread_safe() {
                     drop(slot);
                 }
                 Err(e) => {
-                    assert!(graph_api::is_compute_busy(&e), "oczekiwano ComputeBusy: {e:?}");
+                    assert!(
+                        graph_api::is_compute_busy(&e),
+                        "oczekiwano ComputeBusy: {e:?}"
+                    );
                     busy.fetch_add(1, Ordering::AcqRel);
                 }
             }
@@ -412,8 +487,14 @@ fn compute_concurrency_cap_is_global_and_thread_safe() {
     println!("global compute cap: cap={global} total={total} ok={ok_n} busy={busy_n}");
     // Nigdy nie wpuściliśmy więcej niż globalny cap równolegle, więc co najmniej
     // (total - global) wywołań dostało fail-closed.
-    assert!(ok_n <= global, "nie wolno wpuścić więcej niż globalny cap równolegle");
-    assert!(busy_n >= total - global, "nadmiarowi MUSZĄ dostać fail-closed");
+    assert!(
+        ok_n <= global,
+        "nie wolno wpuścić więcej niż globalny cap równolegle"
+    );
+    assert!(
+        busy_n >= total - global,
+        "nadmiarowi MUSZĄ dostać fail-closed"
+    );
     // Po zakończeniu wszystkie sloty zwolnione → fresh acquire przechodzi.
     let _free = graph_api::try_acquire_compute("addon-after").expect("po zwolnieniu slot wolny");
 }
@@ -429,8 +510,10 @@ fn e2e_two_instances_are_physically_isolated() {
     let m = mgr(pool, root.path().to_path_buf());
 
     // Two installed instances of the same package (distinct instance/addon ids).
-    m.upsert_node_with_quota(ORG_A, "pkg-aaaa1111", "kg", "x", "N", "{}", "null").unwrap();
-    m.upsert_node_with_quota(ORG_A, "pkg-bbbb2222", "kg", "y", "N", "{}", "null").unwrap();
+    m.upsert_node_with_quota(ORG_A, "pkg-aaaa1111", "kg", "x", "N", "{}", "null")
+        .unwrap();
+    m.upsert_node_with_quota(ORG_A, "pkg-bbbb2222", "kg", "y", "N", "{}", "null")
+        .unwrap();
 
     assert_eq!(m.node_count(ORG_A, "pkg-aaaa1111", "kg").unwrap(), 1);
     assert_eq!(m.node_count(ORG_A, "pkg-bbbb2222", "kg").unwrap(), 1);
@@ -453,7 +536,8 @@ fn e2e_cross_org_isolation() {
     let m = mgr(pool, root.path().to_path_buf());
 
     // Same addon_id, two orgs → physically separate graphs.
-    m.upsert_node_with_quota(ORG_A, "ad", "kg", "x", "N", "{}", "null").unwrap();
+    m.upsert_node_with_quota(ORG_A, "ad", "kg", "x", "N", "{}", "null")
+        .unwrap();
     assert_eq!(m.node_count(ORG_A, "ad", "kg").unwrap(), 1);
     let res_b = m.node_count(ORG_B, "ad", "kg");
     assert!(matches!(res_b, Err(GraphError::CollectionNotFound { .. })));
@@ -466,7 +550,8 @@ fn uninstall_success_deletes_files_then_row() {
     let root = TempDir::new().unwrap();
     let m = mgr(pool, root.path().to_path_buf());
 
-    m.upsert_node_with_quota(ORG_A, "ad", "kg", "x", "N", "{}", "null").unwrap();
+    m.upsert_node_with_quota(ORG_A, "ad", "kg", "x", "N", "{}", "null")
+        .unwrap();
     let file = m.collection_file_path(ORG_A, "ad", "kg").unwrap();
     assert!(file.exists(), "plik kolekcji istnieje przed uninstall");
 
@@ -491,7 +576,8 @@ fn uninstall_file_delete_failure_keeps_row_for_retry() {
     let root = TempDir::new().unwrap();
     let m = mgr(pool, root.path().to_path_buf());
 
-    m.upsert_node_with_quota(ORG_A, "ad", "kg", "x", "N", "{}", "null").unwrap();
+    m.upsert_node_with_quota(ORG_A, "ad", "kg", "x", "N", "{}", "null")
+        .unwrap();
     let file = m.collection_file_path(ORG_A, "ad", "kg").unwrap();
     assert!(file.exists());
 

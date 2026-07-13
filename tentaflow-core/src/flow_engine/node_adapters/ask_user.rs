@@ -175,9 +175,7 @@ impl NodeAdapter for AskUserNodeAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::{
-        interaction_registry_global, InteractionReply, QuestionReply,
-    };
+    use crate::agents::{interaction_registry_global, InteractionReply, QuestionReply};
     use crate::flow_engine::node_adapter::test_support::stub_ctx;
     use serde_json::json;
     use std::sync::Arc;

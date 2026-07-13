@@ -42,7 +42,11 @@ pub const ROBOT_BLOCK_FUEL: u64 = 200_000_000;
 pub enum RobotAction {
     /// Set body velocity until the command deadline (NOT incremental). Values are
     /// normalized -1..1 and clamped by `sanitized()`.
-    Move { vx: f64, vy: f64, vyaw: f64 },
+    Move {
+        vx: f64,
+        vy: f64,
+        vyaw: f64,
+    },
     /// Soft stop (stop current motion). E-stop-class: always allowed through.
     Stop,
     /// Emergency stop + durable safety latch. E-stop-class: always allowed through.
@@ -58,17 +62,32 @@ pub enum RobotAction {
     Hello,
     Stretch,
     /// Body orientation in radians. Clamped to `EULER_LIMIT` per axis.
-    Euler { roll: f64, pitch: f64, yaw: f64 },
+    Euler {
+        roll: f64,
+        pitch: f64,
+        yaw: f64,
+    },
     /// Body height delta in meters. Clamped to `BODY_HEIGHT_RANGE`.
-    BodyHeight { height: f64 },
+    BodyHeight {
+        height: f64,
+    },
     /// Foot lift height in meters (trot gait). Clamped to `FOOT_RAISE_RANGE`.
-    FootRaiseHeight { height: f64 },
+    FootRaiseHeight {
+        height: f64,
+    },
     /// Gait speed level: -1 slow, 0 normal, 1 fast. Clamped to [-1, 1] integer.
-    SpeedLevel { level: f64 },
+    SpeedLevel {
+        level: f64,
+    },
     /// Composite static body pose: an `Euler` orientation plus a `BodyHeight`
     /// delta. Implemented as a composite (Euler+BodyHeight) rather than relying on
     /// the firmware `Pose` toggle id, so it works on every firmware.
-    Pose { roll: f64, pitch: f64, yaw: f64, height: f64 },
+    Pose {
+        roll: f64,
+        pitch: f64,
+        yaw: f64,
+        height: f64,
+    },
     /// Hip wiggle gesture (Go2 WiggleHips).
     WiggleHips,
     /// "Finger heart" gesture (Go2 FingerHeart).
@@ -153,11 +172,20 @@ impl RobotAction {
             "sit" => RobotAction::Sit,
             "hello" => RobotAction::Hello,
             "stretch" => RobotAction::Stretch,
-            "euler" => RobotAction::Euler { roll: p1, pitch: p2, yaw: p3 },
+            "euler" => RobotAction::Euler {
+                roll: p1,
+                pitch: p2,
+                yaw: p3,
+            },
             "body_height" => RobotAction::BodyHeight { height: p1 },
             "foot_raise_height" => RobotAction::FootRaiseHeight { height: p1 },
             "speed_level" => RobotAction::SpeedLevel { level: p1 },
-            "pose" => RobotAction::Pose { roll: p1, pitch: p2, yaw: p3, height: p4 },
+            "pose" => RobotAction::Pose {
+                roll: p1,
+                pitch: p2,
+                yaw: p3,
+                height: p4,
+            },
             "wiggle_hips" => RobotAction::WiggleHips,
             "heart" => RobotAction::Heart,
             "dance1" => RobotAction::Dance1,
@@ -297,7 +325,12 @@ impl RobotAction {
                     level: level.round().clamp(-1.0, 1.0),
                 }
             }
-            RobotAction::Pose { roll, pitch, yaw, height } => {
+            RobotAction::Pose {
+                roll,
+                pitch,
+                yaw,
+                height,
+            } => {
                 if !roll.is_finite()
                     || !pitch.is_finite()
                     || !yaw.is_finite()
@@ -375,7 +408,12 @@ impl RobotAction {
                 tool: "go2.speed_level".to_string(),
                 params: json!({ "level": level }),
             },
-            RobotAction::Pose { roll, pitch, yaw, height } => Go2Call::Tool {
+            RobotAction::Pose {
+                roll,
+                pitch,
+                yaw,
+                height,
+            } => Go2Call::Tool {
                 tool: "go2.pose".to_string(),
                 params: json!({ "roll": roll, "pitch": pitch, "yaw": yaw, "height": height }),
             },
@@ -426,7 +464,11 @@ pub fn clamp_velocity(v: f64, cap: f64) -> f64 {
     }
     // A NaN cap (e.g. from bad config) would make `clamp` panic (min>max), so
     // coerce it to 0 (no motion) before clamping.
-    let cap = if cap.is_nan() { 0.0 } else { cap.clamp(0.0, MAX_VELOCITY) };
+    let cap = if cap.is_nan() {
+        0.0
+    } else {
+        cap.clamp(0.0, MAX_VELOCITY)
+    };
     v.clamp(-cap, cap)
 }
 
@@ -478,16 +520,36 @@ pub struct RobotControlResponse {
 
 impl RobotControlResponse {
     pub fn ok() -> Self {
-        Self { ok: true, result_json: None, rejected: None, error: None }
+        Self {
+            ok: true,
+            result_json: None,
+            rejected: None,
+            error: None,
+        }
     }
     pub fn ok_with(result_json: String) -> Self {
-        Self { ok: true, result_json: Some(result_json), rejected: None, error: None }
+        Self {
+            ok: true,
+            result_json: Some(result_json),
+            rejected: None,
+            error: None,
+        }
     }
     pub fn rejected(reason: RejectReason) -> Self {
-        Self { ok: false, result_json: None, rejected: Some(reason), error: None }
+        Self {
+            ok: false,
+            result_json: None,
+            rejected: Some(reason),
+            error: None,
+        }
     }
     pub fn failed(error: impl Into<String>) -> Self {
-        Self { ok: false, result_json: None, rejected: None, error: Some(error.into()) }
+        Self {
+            ok: false,
+            result_json: None,
+            rejected: None,
+            error: Some(error.into()),
+        }
     }
 }
 
@@ -555,7 +617,9 @@ pub struct IdempotencyCache {
 
 impl IdempotencyCache {
     pub fn new() -> Self {
-        Self { entries: HashMap::new() }
+        Self {
+            entries: HashMap::new(),
+        }
     }
 
     /// Return a prior response for this command if still within the TTL. E-stop-
@@ -581,7 +645,13 @@ impl IdempotencyCache {
 
     /// Record the result of executing a command. E-stop-class actions are not
     /// recorded (never deduplicated).
-    pub fn record(&mut self, key: IdemKey, action: &RobotAction, resp: RobotControlResponse, now_ms: u64) {
+    pub fn record(
+        &mut self,
+        key: IdemKey,
+        action: &RobotAction,
+        resp: RobotControlResponse,
+        now_ms: u64,
+    ) {
         if action.is_estop_class() {
             return;
         }
@@ -666,25 +736,23 @@ pub fn execute_robot_call(
         Go2Call::Tool { tool, params } => {
             addon_manager.call_tool(&plan.addon_id, tool, params.clone(), &plan.actor_user_id)
         }
-        Go2Call::Block { block_type, params } => {
-            match serde_json::to_vec(params) {
-                Ok(bytes) => addon_manager
-                    .invoke_block(
-                        &plan.addon_id,
-                        block_type,
-                        &bytes,
-                        Some(plan.actor_user_id.clone()),
-                        None,
-                        ROBOT_BLOCK_FUEL,
-                        None,
-                    )
-                    .and_then(|raw| {
-                        serde_json::from_slice::<serde_json::Value>(&raw)
-                            .map_err(|e| anyhow::anyhow!("decode block result: {e}"))
-                    }),
-                Err(e) => Err(anyhow::anyhow!("encode block params: {e}")),
-            }
-        }
+        Go2Call::Block { block_type, params } => match serde_json::to_vec(params) {
+            Ok(bytes) => addon_manager
+                .invoke_block(
+                    &plan.addon_id,
+                    block_type,
+                    &bytes,
+                    Some(plan.actor_user_id.clone()),
+                    None,
+                    ROBOT_BLOCK_FUEL,
+                    None,
+                )
+                .and_then(|raw| {
+                    serde_json::from_slice::<serde_json::Value>(&raw)
+                        .map_err(|e| anyhow::anyhow!("decode block result: {e}"))
+                }),
+            Err(e) => Err(anyhow::anyhow!("encode block params: {e}")),
+        },
     };
     match exec {
         Ok(json) => {
@@ -736,7 +804,11 @@ mod tests {
             org_id: "org-1".into(),
             command_id: id.into(),
             actor_user_id: "u1".into(),
-            action: RobotAction::Move { vx, vy: 0.0, vyaw: 0.0 },
+            action: RobotAction::Move {
+                vx,
+                vy: 0.0,
+                vyaw: 0.0,
+            },
             issued_at_ms: issued,
             expires_at_ms: expires,
         }
@@ -746,7 +818,11 @@ mod tests {
     fn from_kind_axes_maps_allowlist_and_rejects_unknown() {
         assert_eq!(
             RobotAction::from_kind_axes("move", 0.3, -0.1, 0.2),
-            Some(RobotAction::Move { vx: 0.3, vy: -0.1, vyaw: 0.2 })
+            Some(RobotAction::Move {
+                vx: 0.3,
+                vy: -0.1,
+                vyaw: 0.2
+            })
         );
         let cases = [
             ("stop", RobotAction::Stop),
@@ -786,7 +862,11 @@ mod tests {
     fn from_kind_params_maps_parametered_actions() {
         assert_eq!(
             RobotAction::from_kind_params("euler", 0.0, 0.0, 0.0, 0.1, -0.2, 0.3, 0.0),
-            Some(RobotAction::Euler { roll: 0.1, pitch: -0.2, yaw: 0.3 })
+            Some(RobotAction::Euler {
+                roll: 0.1,
+                pitch: -0.2,
+                yaw: 0.3
+            })
         );
         assert_eq!(
             RobotAction::from_kind_params("body_height", 0.0, 0.0, 0.0, -0.05, 0.0, 0.0, 0.0),
@@ -802,7 +882,12 @@ mod tests {
         );
         assert_eq!(
             RobotAction::from_kind_params("pose", 0.0, 0.0, 0.0, 0.1, 0.2, 0.3, -0.05),
-            Some(RobotAction::Pose { roll: 0.1, pitch: 0.2, yaw: 0.3, height: -0.05 })
+            Some(RobotAction::Pose {
+                roll: 0.1,
+                pitch: 0.2,
+                yaw: 0.3,
+                height: -0.05
+            })
         );
     }
 
@@ -810,27 +895,50 @@ mod tests {
     fn sanitized_clamps_euler_body_foot_speed_and_rejects_nan() {
         // Finite-but-out-of-range Euler is clamped to ±limit.
         assert_eq!(
-            RobotAction::Euler { roll: 5.0, pitch: -5.0, yaw: 0.1 }.sanitized(1.0),
-            Ok(RobotAction::Euler { roll: EULER_LIMIT, pitch: -EULER_LIMIT, yaw: 0.1 })
+            RobotAction::Euler {
+                roll: 5.0,
+                pitch: -5.0,
+                yaw: 0.1
+            }
+            .sanitized(1.0),
+            Ok(RobotAction::Euler {
+                roll: EULER_LIMIT,
+                pitch: -EULER_LIMIT,
+                yaw: 0.1
+            })
         );
         // A NaN axis is REJECTED (never coerced to a bound).
         assert_eq!(
-            RobotAction::Euler { roll: 5.0, pitch: -5.0, yaw: f64::NAN }.sanitized(1.0),
+            RobotAction::Euler {
+                roll: 5.0,
+                pitch: -5.0,
+                yaw: f64::NAN
+            }
+            .sanitized(1.0),
             Err(RejectReason::Malformed)
         );
         // +inf axis is REJECTED.
         assert_eq!(
-            RobotAction::Euler { roll: f64::INFINITY, pitch: 0.0, yaw: 0.0 }.sanitized(1.0),
+            RobotAction::Euler {
+                roll: f64::INFINITY,
+                pitch: 0.0,
+                yaw: 0.0
+            }
+            .sanitized(1.0),
             Err(RejectReason::Malformed)
         );
         // Body height clamped to range; out-of-range below clamps to min.
         assert_eq!(
             RobotAction::BodyHeight { height: -1.0 }.sanitized(1.0),
-            Ok(RobotAction::BodyHeight { height: BODY_HEIGHT_MIN })
+            Ok(RobotAction::BodyHeight {
+                height: BODY_HEIGHT_MIN
+            })
         );
         assert_eq!(
             RobotAction::BodyHeight { height: 1.0 }.sanitized(1.0),
-            Ok(RobotAction::BodyHeight { height: BODY_HEIGHT_MAX })
+            Ok(RobotAction::BodyHeight {
+                height: BODY_HEIGHT_MAX
+            })
         );
         // NaN / -inf body height is REJECTED.
         assert_eq!(
@@ -838,16 +946,24 @@ mod tests {
             Err(RejectReason::Malformed)
         );
         assert_eq!(
-            RobotAction::BodyHeight { height: f64::NEG_INFINITY }.sanitized(1.0),
+            RobotAction::BodyHeight {
+                height: f64::NEG_INFINITY
+            }
+            .sanitized(1.0),
             Err(RejectReason::Malformed)
         );
         // Foot raise clamped; non-finite rejected.
         assert_eq!(
             RobotAction::FootRaiseHeight { height: 9.0 }.sanitized(1.0),
-            Ok(RobotAction::FootRaiseHeight { height: FOOT_RAISE_MAX })
+            Ok(RobotAction::FootRaiseHeight {
+                height: FOOT_RAISE_MAX
+            })
         );
         assert_eq!(
-            RobotAction::FootRaiseHeight { height: f64::INFINITY }.sanitized(1.0),
+            RobotAction::FootRaiseHeight {
+                height: f64::INFINITY
+            }
+            .sanitized(1.0),
             Err(RejectReason::Malformed)
         );
         // Speed level rounded + clamped to discrete -1/0/1.
@@ -865,12 +981,21 @@ mod tests {
             Err(RejectReason::Malformed)
         );
         assert_eq!(
-            RobotAction::SpeedLevel { level: f64::INFINITY }.sanitized(1.0),
+            RobotAction::SpeedLevel {
+                level: f64::INFINITY
+            }
+            .sanitized(1.0),
             Err(RejectReason::Malformed)
         );
         // Pose clamps both orientation and height when all finite.
         assert_eq!(
-            RobotAction::Pose { roll: 5.0, pitch: 0.0, yaw: 0.0, height: -1.0 }.sanitized(1.0),
+            RobotAction::Pose {
+                roll: 5.0,
+                pitch: 0.0,
+                yaw: 0.0,
+                height: -1.0
+            }
+            .sanitized(1.0),
             Ok(RobotAction::Pose {
                 roll: EULER_LIMIT,
                 pitch: 0.0,
@@ -880,7 +1005,13 @@ mod tests {
         );
         // Any non-finite Pose param REJECTS (no partial sanitization).
         assert_eq!(
-            RobotAction::Pose { roll: 0.0, pitch: 0.0, yaw: 0.0, height: f64::NAN }.sanitized(1.0),
+            RobotAction::Pose {
+                roll: 0.0,
+                pitch: 0.0,
+                yaw: 0.0,
+                height: f64::NAN
+            }
+            .sanitized(1.0),
             Err(RejectReason::Malformed)
         );
     }
@@ -889,11 +1020,20 @@ mod tests {
     fn new_motion_actions_require_robot_command_only_status_read_only() {
         for a in [
             RobotAction::BalanceStand,
-            RobotAction::Euler { roll: 0.0, pitch: 0.0, yaw: 0.0 },
+            RobotAction::Euler {
+                roll: 0.0,
+                pitch: 0.0,
+                yaw: 0.0,
+            },
             RobotAction::BodyHeight { height: 0.0 },
             RobotAction::FootRaiseHeight { height: 0.0 },
             RobotAction::SpeedLevel { level: 0.0 },
-            RobotAction::Pose { roll: 0.0, pitch: 0.0, yaw: 0.0, height: 0.0 },
+            RobotAction::Pose {
+                roll: 0.0,
+                pitch: 0.0,
+                yaw: 0.0,
+                height: 0.0,
+            },
             RobotAction::WiggleHips,
             RobotAction::Heart,
             RobotAction::Dance1,
@@ -912,7 +1052,13 @@ mod tests {
 
     #[test]
     fn parametered_actions_map_to_param_tools() {
-        match (RobotAction::Euler { roll: 0.1, pitch: -0.2, yaw: 0.3 }).to_go2_call() {
+        match (RobotAction::Euler {
+            roll: 0.1,
+            pitch: -0.2,
+            yaw: 0.3,
+        })
+        .to_go2_call()
+        {
             Go2Call::Tool { tool, params } => {
                 assert_eq!(tool, "go2.euler");
                 assert_eq!(params.get("roll").and_then(|v| v.as_f64()), Some(0.1));
@@ -941,8 +1087,20 @@ mod tests {
 
     #[test]
     fn sanitized_clamps_move_to_safety_cap() {
-        let a = RobotAction::Move { vx: 5.0, vy: -5.0, vyaw: 0.7 }.sanitized(0.5);
-        assert_eq!(a, Ok(RobotAction::Move { vx: 0.5, vy: -0.5, vyaw: 0.5 }));
+        let a = RobotAction::Move {
+            vx: 5.0,
+            vy: -5.0,
+            vyaw: 0.7,
+        }
+        .sanitized(0.5);
+        assert_eq!(
+            a,
+            Ok(RobotAction::Move {
+                vx: 0.5,
+                vy: -0.5,
+                vyaw: 0.5
+            })
+        );
         // non-move unchanged
         assert_eq!(RobotAction::Sit.sanitized(0.5), Ok(RobotAction::Sit));
     }
@@ -953,7 +1111,12 @@ mod tests {
         assert_eq!(RobotAction::Estop.required_permission(), "robot.estop");
         assert_eq!(RobotAction::Stop.required_permission(), "robot.estop");
         assert_eq!(
-            RobotAction::Move { vx: 0.0, vy: 0.0, vyaw: 0.0 }.required_permission(),
+            RobotAction::Move {
+                vx: 0.0,
+                vy: 0.0,
+                vyaw: 0.0
+            }
+            .required_permission(),
             "robot.command"
         );
         assert_eq!(RobotAction::Hello.required_permission(), "robot.command");
@@ -961,12 +1124,21 @@ mod tests {
         // frame fetch is telemetry-class and can never move hardware.
         assert_eq!(RobotAction::LidarOn.required_permission(), "robot.command");
         assert_eq!(RobotAction::LidarOff.required_permission(), "robot.command");
-        assert_eq!(RobotAction::LidarFrame.required_permission(), "robot.telemetry");
+        assert_eq!(
+            RobotAction::LidarFrame.required_permission(),
+            "robot.telemetry"
+        );
         assert!(RobotAction::LidarFrame.is_read_only());
         assert!(!RobotAction::LidarOn.is_read_only());
         // Obstacle-avoidance toggle is an actuator toggle → robot.command, never read-only.
-        assert_eq!(RobotAction::ObstacleAvoidOn.required_permission(), "robot.command");
-        assert_eq!(RobotAction::ObstacleAvoidOff.required_permission(), "robot.command");
+        assert_eq!(
+            RobotAction::ObstacleAvoidOn.required_permission(),
+            "robot.command"
+        );
+        assert_eq!(
+            RobotAction::ObstacleAvoidOff.required_permission(),
+            "robot.command"
+        );
         assert!(!RobotAction::ObstacleAvoidOn.is_read_only());
     }
 
@@ -979,8 +1151,14 @@ mod tests {
         assert_eq!(tool_of(RobotAction::LidarOn), "go2.lidar_on");
         assert_eq!(tool_of(RobotAction::LidarOff), "go2.lidar_off");
         assert_eq!(tool_of(RobotAction::LidarFrame), "go2.lidar_frame");
-        assert_eq!(tool_of(RobotAction::ObstacleAvoidOn), "go2.obstacle_avoid_on");
-        assert_eq!(tool_of(RobotAction::ObstacleAvoidOff), "go2.obstacle_avoid_off");
+        assert_eq!(
+            tool_of(RobotAction::ObstacleAvoidOn),
+            "go2.obstacle_avoid_on"
+        );
+        assert_eq!(
+            tool_of(RobotAction::ObstacleAvoidOff),
+            "go2.obstacle_avoid_off"
+        );
     }
 
     #[test]
@@ -1013,7 +1191,10 @@ mod tests {
     fn move_duration_too_long_rejected() {
         let now = 1_000;
         let r = move_req("d1", 0.3, 1_000, 1_000 + MAX_MOVE_DURATION_MS + 1);
-        assert_eq!(validate_timing(&r, now), Err(RejectReason::MoveDurationTooLong));
+        assert_eq!(
+            validate_timing(&r, now),
+            Err(RejectReason::MoveDurationTooLong)
+        );
         let ok = move_req("d2", 0.3, 1_000, 1_000 + MAX_MOVE_DURATION_MS);
         assert!(validate_timing(&ok, now).is_ok());
     }
@@ -1027,22 +1208,42 @@ mod tests {
         let expires = issued + MAX_MOVE_DURATION_MS; // declared window == max
         let r = move_req("rr", 0.3, issued, expires);
         // remaining = expires - now = 5000 + 2000 = 7000 > 2000 → reject
-        assert_eq!(validate_timing(&r, now), Err(RejectReason::MoveDurationTooLong));
+        assert_eq!(
+            validate_timing(&r, now),
+            Err(RejectReason::MoveDurationTooLong)
+        );
     }
 
     #[test]
     fn malformed_window_rejected() {
         let now = 10_000;
         // expires < issued (would saturate to 0 duration and slip through).
-        let r = move_req("mw", 0.3, now + MAX_CLOCK_SKEW_MS, now + MAX_CLOCK_SKEW_MS - 1);
+        let r = move_req(
+            "mw",
+            0.3,
+            now + MAX_CLOCK_SKEW_MS,
+            now + MAX_CLOCK_SKEW_MS - 1,
+        );
         assert_eq!(validate_timing(&r, now), Err(RejectReason::Malformed));
     }
 
     #[test]
     fn nan_max_velocity_does_not_panic() {
-        let a = RobotAction::Move { vx: 0.5, vy: 0.5, vyaw: 0.5 }.sanitized(f64::NAN);
+        let a = RobotAction::Move {
+            vx: 0.5,
+            vy: 0.5,
+            vyaw: 0.5,
+        }
+        .sanitized(f64::NAN);
         // NaN cap coerced to 0 → no motion (action params are finite, so accepted).
-        assert_eq!(a, Ok(RobotAction::Move { vx: 0.0, vy: 0.0, vyaw: 0.0 }));
+        assert_eq!(
+            a,
+            Ok(RobotAction::Move {
+                vx: 0.0,
+                vy: 0.0,
+                vyaw: 0.0
+            })
+        );
     }
 
     #[test]
@@ -1053,7 +1254,10 @@ mod tests {
         assert!(cache.get(&key, &req.action, 100).is_none());
         cache.record(key.clone(), &req.action, RobotControlResponse::ok(), 100);
         // duplicate within TTL returns cached response
-        assert_eq!(cache.get(&key, &req.action, 200), Some(RobotControlResponse::ok()));
+        assert_eq!(
+            cache.get(&key, &req.action, 200),
+            Some(RobotControlResponse::ok())
+        );
         // estop is never recorded → never deduped
         let mut estop = move_req("e1", 0.0, 0, 1_000);
         estop.action = RobotAction::Estop;
@@ -1083,8 +1287,12 @@ mod tests {
         let req = move_req("m1", 0.3, 0, 1_000);
         let key = IdemKey::from_request("nodeB", &req);
         cache.record(key.clone(), &req.action, RobotControlResponse::ok(), 1_000);
-        assert!(cache.get(&key, &req.action, 1_000 + IDEMPOTENCY_TTL_MS).is_some());
-        assert!(cache.get(&key, &req.action, 1_000 + IDEMPOTENCY_TTL_MS + 1).is_none());
+        assert!(cache
+            .get(&key, &req.action, 1_000 + IDEMPOTENCY_TTL_MS)
+            .is_some());
+        assert!(cache
+            .get(&key, &req.action, 1_000 + IDEMPOTENCY_TTL_MS + 1)
+            .is_none());
         cache.evict_expired(1_000 + IDEMPOTENCY_TTL_MS + 1);
         assert!(cache.is_empty());
     }
@@ -1096,14 +1304,17 @@ mod tests {
             org_id: "org-1".into(),
             command_id: "c1".into(),
             actor_user_id: "u1".into(),
-            action: RobotAction::Move { vx: 0.3, vy: -0.1, vyaw: 0.2 },
+            action: RobotAction::Move {
+                vx: 0.3,
+                vy: -0.1,
+                vyaw: 0.2,
+            },
             issued_at_ms: 123,
             expires_at_ms: 456,
         };
         let mut buf = Vec::new();
         ciborium::ser::into_writer(&req, &mut buf).expect("encode");
-        let back: RobotControlRequest =
-            ciborium::de::from_reader(&buf[..]).expect("decode");
+        let back: RobotControlRequest = ciborium::de::from_reader(&buf[..]).expect("decode");
         assert_eq!(req, back);
 
         let resp = RobotControlResponse::ok_with("{\"battery\":80}".into());
@@ -1116,7 +1327,12 @@ mod tests {
 
     #[test]
     fn to_go2_call_move_builds_flow_variables_shape() {
-        let call = RobotAction::Move { vx: 0.4, vy: -0.2, vyaw: 0.1 }.to_go2_call();
+        let call = RobotAction::Move {
+            vx: 0.4,
+            vy: -0.2,
+            vyaw: 0.1,
+        }
+        .to_go2_call();
         match call {
             Go2Call::Block { block_type, params } => {
                 assert_eq!(block_type, "go2.move");
@@ -1170,7 +1386,10 @@ mod tests {
     #[test]
     fn plan_execution_permission_denied_when_unauthorized() {
         let req = move_req("p2", 0.3, 0, 1_000);
-        let resolved = ResolvedRobotAddon { addon_id: "go2".into(), max_velocity: 1.0 };
+        let resolved = ResolvedRobotAddon {
+            addon_id: "go2".into(),
+            max_velocity: 1.0,
+        };
         assert_eq!(
             plan_execution(&req, Some(&resolved), false),
             Err(RejectReason::PermissionDenied)
@@ -1182,7 +1401,10 @@ mod tests {
         // Request asks for vx=5.0; the resolved addon caps at 0.5 → the planned
         // call must already be clamped (the handler never sees the raw value).
         let req = move_req("p3", 5.0, 0, 1_000);
-        let resolved = ResolvedRobotAddon { addon_id: "go2-1".into(), max_velocity: 0.5 };
+        let resolved = ResolvedRobotAddon {
+            addon_id: "go2-1".into(),
+            max_velocity: 0.5,
+        };
         let plan = plan_execution(&req, Some(&resolved), true).expect("plan");
         assert_eq!(plan.addon_id, "go2-1");
         assert_eq!(plan.actor_user_id, "u1");
@@ -1204,11 +1426,17 @@ mod tests {
     fn plan_execution_estop_maps_to_tool() {
         let mut req = move_req("p4", 0.0, 0, 1_000);
         req.action = RobotAction::Estop;
-        let resolved = ResolvedRobotAddon { addon_id: "go2".into(), max_velocity: 1.0 };
+        let resolved = ResolvedRobotAddon {
+            addon_id: "go2".into(),
+            max_velocity: 1.0,
+        };
         let plan = plan_execution(&req, Some(&resolved), true).expect("plan");
         assert_eq!(
             plan.call,
-            Go2Call::Tool { tool: "go2.estop".into(), params: json!({}) }
+            Go2Call::Tool {
+                tool: "go2.estop".into(),
+                params: json!({})
+            }
         );
     }
 }

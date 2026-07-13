@@ -7,17 +7,18 @@
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     MessageBody, MlStudioPayload, MlStudioProjectDetail, MlStudioProjectInviteResponse,
-    MlStudioProjectMember, MlStudioProjectMemberRemoveResponse, MlStudioProjectMemberRoleSetResponse,
-    MlStudioProjectMembersListResponse, MlStudioProjectSummary, MlStudioProjectTypeInfo,
-    MlStudioProjectTypesListResponse, MlStudioProjectsListResponse, ProtocolError, ProtocolErrorCode,
+    MlStudioProjectMember, MlStudioProjectMemberRemoveResponse,
+    MlStudioProjectMemberRoleSetResponse, MlStudioProjectMembersListResponse,
+    MlStudioProjectSummary, MlStudioProjectTypeInfo, MlStudioProjectTypesListResponse,
+    MlStudioProjectsListResponse, ProtocolError, ProtocolErrorCode,
 };
 
 use super::HandlerContext;
+use crate::ml_studio::build_recog_dataset;
 use crate::ml_studio::models::{
     Dataset, ModelSummary, ProjectMember, ProjectRole, ProjectSummary, ProjectType, ResourceGrant,
     TrainingRunSummary,
 };
-use crate::ml_studio::build_recog_dataset;
 use crate::ml_studio::profile::{self, TableProfile};
 use crate::ml_studio::repository;
 use crate::ml_studio::train_autogluon;
@@ -125,7 +126,11 @@ pub fn ml_studio_projects_list(
 ) -> Result<MessageBody, ProtocolError> {
     match req {
         MessageBody::MlStudioBody(MlStudioPayload::ProjectsListRequest(_)) => {}
-        _ => return Err(ProtocolError::bad_request("expected MlStudioProjectsListRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioProjectsListRequest",
+            ))
+        }
     }
     let org = require_org(ctx)?;
     let projects = repository::list_projects(&org.user_id)
@@ -133,9 +138,9 @@ pub fn ml_studio_projects_list(
         .into_iter()
         .map(to_summary)
         .collect();
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::ProjectsListResponse(
-        MlStudioProjectsListResponse { projects },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ProjectsListResponse(MlStudioProjectsListResponse { projects }),
+    ))
 }
 
 #[handler(variant = "MlStudioProjectCreateRequest", since = (1, 0))]
@@ -147,7 +152,11 @@ pub fn ml_studio_project_create(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::ProjectCreateRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioProjectCreateRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioProjectCreateRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let summary = repository::create_project(
@@ -158,11 +167,11 @@ pub fn ml_studio_project_create(
         &payload.project_type,
     )
     .map_err(|e| ProtocolError::bad_request(format!("create project failed: {}", e)))?;
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::ProjectCreateResponse(
-        tentaflow_protocol::MlStudioProjectCreateResponse {
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ProjectCreateResponse(tentaflow_protocol::MlStudioProjectCreateResponse {
             project: to_detail(summary),
-        },
-    )))
+        }),
+    ))
 }
 
 #[handler(variant = "MlStudioProjectDetailRequest", since = (1, 0))]
@@ -174,17 +183,21 @@ pub fn ml_studio_project_detail(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::ProjectDetailRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioProjectDetailRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioProjectDetailRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let summary = repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::ProjectDetailResponse(
-        tentaflow_protocol::MlStudioProjectDetailResponse {
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ProjectDetailResponse(tentaflow_protocol::MlStudioProjectDetailResponse {
             project: to_detail(summary),
-        },
-    )))
+        }),
+    ))
 }
 
 #[handler(variant = "MlStudioProjectTypesListRequest", since = (1, 0))]
@@ -210,9 +223,9 @@ pub fn ml_studio_project_types_list(
             description: t.description_pl().to_string(),
         })
         .collect();
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::ProjectTypesListResponse(
-        MlStudioProjectTypesListResponse { types },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ProjectTypesListResponse(MlStudioProjectTypesListResponse { types }),
+    ))
 }
 
 /// Asserts the caller is the owner of `project_id`, returning `PolicyDenied`
@@ -282,9 +295,9 @@ pub fn ml_studio_project_members_list(
     let user_ids: Vec<String> = rows.iter().map(|m| m.user_id.clone()).collect();
     let names = repository::resolve_display_names(&user_ids);
     let members = rows.into_iter().map(|m| to_member(m, &names)).collect();
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::ProjectMembersListResponse(
-        MlStudioProjectMembersListResponse { members },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ProjectMembersListResponse(MlStudioProjectMembersListResponse { members }),
+    ))
 }
 
 /// Asserts the invitee is a Power User or Admin in the CORE user directory
@@ -292,9 +305,8 @@ pub fn ml_studio_project_members_list(
 /// ML Studio access is restricted to Power Users, so only Power Users / Admins
 /// may be invited into a project. A missing user surfaces as a `BadRequest`.
 fn require_invitee_power_user(invitee_user_id: &str) -> Result<(), ProtocolError> {
-    let pool = crate::db::global_pool().ok_or_else(|| {
-        ProtocolError::internal("core user directory unavailable")
-    })?;
+    let pool = crate::db::global_pool()
+        .ok_or_else(|| ProtocolError::internal("core user directory unavailable"))?;
     match crate::db::repository::get_user_role(&pool, invitee_user_id).map_err(db_err)? {
         Some((role, is_admin)) if is_admin || role == "power_user" => Ok(()),
         Some(_) => Err(ProtocolError::new(
@@ -314,7 +326,11 @@ pub fn ml_studio_project_invite(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::ProjectInviteRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioProjectInviteRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioProjectInviteRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     require_project_owner(&org.user_id, &payload.project_id)?;
@@ -327,11 +343,11 @@ pub fn ml_studio_project_invite(
     )
     .map_err(action_err)?;
     let names = repository::resolve_display_names(std::slice::from_ref(&member.user_id));
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::ProjectInviteResponse(
-        MlStudioProjectInviteResponse {
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ProjectInviteResponse(MlStudioProjectInviteResponse {
             member: to_member(member, &names),
-        },
-    )))
+        }),
+    ))
 }
 
 #[handler(variant = "MlStudioProjectMemberRemoveRequest", since = (1, 0))]
@@ -353,12 +369,12 @@ pub fn ml_studio_project_member_remove(
     require_project_owner(&org.user_id, &payload.project_id)?;
     repository::remove_member(&payload.project_id, &org.user_id, &payload.user_id)
         .map_err(action_err)?;
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::ProjectMemberRemoveResponse(
-        MlStudioProjectMemberRemoveResponse {
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ProjectMemberRemoveResponse(MlStudioProjectMemberRemoveResponse {
             project_id: payload.project_id.clone(),
             user_id: payload.user_id.clone(),
-        },
-    )))
+        }),
+    ))
 }
 
 #[handler(variant = "MlStudioProjectMemberRoleSetRequest", since = (1, 0))]
@@ -386,11 +402,11 @@ pub fn ml_studio_project_member_role_set(
     )
     .map_err(action_err)?;
     let names = repository::resolve_display_names(std::slice::from_ref(&member.user_id));
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::ProjectMemberRoleSetResponse(
-        MlStudioProjectMemberRoleSetResponse {
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ProjectMemberRoleSetResponse(MlStudioProjectMemberRoleSetResponse {
             member: to_member(member, &names),
-        },
-    )))
+        }),
+    ))
 }
 
 fn to_dataset_summary(d: &Dataset) -> tentaflow_protocol::DatasetSummary {
@@ -463,7 +479,11 @@ fn profile_coco_zip(zip_bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
         if !is_annot {
             continue;
         }
-        if let Some(split) = rel.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
+        if let Some(split) = rel
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+        {
             splits.push(split.to_string());
         }
         let mut buf = Vec::new();
@@ -594,7 +614,10 @@ pub fn ml_studio_recog_dataset_register(
         .and_then(|c| c.as_array())
         .map(|a| a.len() as u32)
         .unwrap_or(0);
-    let images = prof.get("image_count").and_then(|c| c.as_u64()).unwrap_or(0);
+    let images = prof
+        .get("image_count")
+        .and_then(|c| c.as_u64())
+        .unwrap_or(0);
 
     let name = if payload.name.trim().is_empty() {
         path.file_name().and_then(|n| n.to_str()).unwrap_or("COCO")
@@ -614,11 +637,13 @@ pub fn ml_studio_recog_dataset_register(
     )
     .map_err(|e| ProtocolError::bad_request(format!("create dataset failed: {}", e)))?;
 
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogDatasetRegisterResponse(
-        tentaflow_protocol::MlStudioRecogDatasetRegisterResponse {
-            dataset: to_dataset_summary(&dataset),
-        },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::RecogDatasetRegisterResponse(
+            tentaflow_protocol::MlStudioRecogDatasetRegisterResponse {
+                dataset: to_dataset_summary(&dataset),
+            },
+        ),
+    ))
 }
 
 #[handler(variant = "MlStudioSchemaGetRequest", since = (1, 0))]
@@ -630,14 +655,20 @@ pub fn ml_studio_schema_get(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::SchemaGetRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioSchemaGetRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioSchemaGetRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     require_project_member(&org.user_id, &payload.project_id)?;
     let schema_json = repository::schema_get(&payload.project_id).map_err(db_err)?;
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::SchemaGetResponse(
-        tentaflow_protocol::MlStudioSchemaGetResponse { schema_json },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::SchemaGetResponse(tentaflow_protocol::MlStudioSchemaGetResponse {
+            schema_json,
+        }),
+    ))
 }
 
 #[handler(variant = "MlStudioSchemaSaveRequest", since = (1, 0))]
@@ -649,14 +680,20 @@ pub fn ml_studio_schema_save(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::SchemaSaveRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioSchemaSaveRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioSchemaSaveRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     require_project_editor(&org.user_id, &payload.project_id)?;
     repository::schema_upsert(&payload.project_id, &payload.schema_json).map_err(db_err)?;
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::SchemaSaveResponse(
-        tentaflow_protocol::MlStudioSchemaSaveResponse { ok: true },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::SchemaSaveResponse(tentaflow_protocol::MlStudioSchemaSaveResponse {
+            ok: true,
+        }),
+    ))
 }
 
 #[handler(variant = "MlStudioLookupDictsListRequest", since = (1, 0))]
@@ -668,7 +705,11 @@ pub fn ml_studio_lookup_dicts_list(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::LookupDictsListRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioLookupDictsListRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioLookupDictsListRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     require_project_member(&org.user_id, &payload.project_id)?;
@@ -685,9 +726,11 @@ pub fn ml_studio_lookup_dicts_list(
         .collect();
     let dicts_json =
         serde_json::to_string(&arr).map_err(|e| ProtocolError::internal(e.to_string()))?;
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::LookupDictsListResponse(
-        tentaflow_protocol::MlStudioLookupDictsListResponse { dicts_json },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::LookupDictsListResponse(
+            tentaflow_protocol::MlStudioLookupDictsListResponse { dicts_json },
+        ),
+    ))
 }
 
 #[handler(variant = "MlStudioLookupDictSaveRequest", since = (1, 0))]
@@ -699,7 +742,11 @@ pub fn ml_studio_lookup_dict_save(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::LookupDictSaveRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioLookupDictSaveRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioLookupDictSaveRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     require_project_editor(&org.user_id, &payload.project_id)?;
@@ -710,9 +757,11 @@ pub fn ml_studio_lookup_dict_save(
         &payload.rows_json,
     )
     .map_err(|e| ProtocolError::bad_request(format!("save lookup dict failed: {}", e)))?;
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::LookupDictSaveResponse(
-        tentaflow_protocol::MlStudioLookupDictSaveResponse { dict_id },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::LookupDictSaveResponse(
+            tentaflow_protocol::MlStudioLookupDictSaveResponse { dict_id },
+        ),
+    ))
 }
 
 #[handler(variant = "MlStudioLookupDictDeleteRequest", since = (1, 0))]
@@ -724,7 +773,11 @@ pub fn ml_studio_lookup_dict_delete(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::LookupDictDeleteRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioLookupDictDeleteRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioLookupDictDeleteRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let project_id = repository::lookup_dict_project(&payload.dict_id)
@@ -732,9 +785,11 @@ pub fn ml_studio_lookup_dict_delete(
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "lookup dict not found"))?;
     require_project_editor(&org.user_id, &project_id)?;
     repository::lookup_dict_delete(&payload.dict_id).map_err(db_err)?;
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::LookupDictDeleteResponse(
-        tentaflow_protocol::MlStudioLookupDictDeleteResponse { ok: true },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::LookupDictDeleteResponse(
+            tentaflow_protocol::MlStudioLookupDictDeleteResponse { ok: true },
+        ),
+    ))
 }
 
 /// Built-in CV models that ship in-core (not registered in `service_models`).
@@ -744,7 +799,11 @@ pub fn ml_studio_lookup_dict_delete(
 const IN_CORE_MODELS: &[(&str, &str, &str)] = &[
     ("rfdetr-incore", "RF-DETR (wbudowany)", "detector"),
     ("ocr-plate-incore", "OCR tablic (wbudowany)", "ocr"),
-    ("classifier-stan-incore", "Klasyfikator stanu (wbudowany)", "classifier"),
+    (
+        "classifier-stan-incore",
+        "Klasyfikator stanu (wbudowany)",
+        "classifier",
+    ),
 ];
 
 #[handler(variant = "MlStudioServiceModelsListRequest", since = (1, 0))]
@@ -756,7 +815,11 @@ pub fn ml_studio_service_models_list(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::ServiceModelsListRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioServiceModelsListRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioServiceModelsListRequest",
+            ))
+        }
     };
     // Not project-scoped: any authenticated user (PowerUser policy) may list the
     // models a schema field can bind to.
@@ -788,9 +851,11 @@ pub fn ml_studio_service_models_list(
     }
     let models_json =
         serde_json::to_string(&arr).map_err(|e| ProtocolError::internal(e.to_string()))?;
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::ServiceModelsListResponse(
-        tentaflow_protocol::MlStudioServiceModelsListResponse { models_json },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ServiceModelsListResponse(
+            tentaflow_protocol::MlStudioServiceModelsListResponse { models_json },
+        ),
+    ))
 }
 
 #[handler(variant = "MlStudioDatasetUploadRequest", since = (1, 0))]
@@ -802,7 +867,11 @@ pub fn ml_studio_dataset_upload(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::DatasetUploadRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioDatasetUploadRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioDatasetUploadRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
@@ -818,11 +887,11 @@ pub fn ml_studio_dataset_upload(
         &payload.bytes,
     )?;
 
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::DatasetUploadResponse(
-        tentaflow_protocol::MlStudioDatasetUploadResponse {
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::DatasetUploadResponse(tentaflow_protocol::MlStudioDatasetUploadResponse {
             dataset: to_dataset_summary(&dataset),
-        },
-    )))
+        }),
+    ))
 }
 
 /// Profiluje surowe bajty pliku (ZIP COCO albo tabela CSV/XLSX) i tworzy rekord
@@ -842,13 +911,17 @@ fn finalize_dataset_upload(
     let (kind, row_count, column_count, profile_json) = if is_coco {
         let prof = profile_coco_zip(bytes)
             .map_err(|e| ProtocolError::bad_request(format!("COCO profiling failed: {}", e)))?;
-        let pj = serde_json::to_string(&prof).map_err(|e| ProtocolError::internal(e.to_string()))?;
+        let pj =
+            serde_json::to_string(&prof).map_err(|e| ProtocolError::internal(e.to_string()))?;
         let classes = prof
             .get("classes")
             .and_then(|c| c.as_array())
             .map(|a| a.len() as u32)
             .unwrap_or(0);
-        let images = prof.get("image_count").and_then(|c| c.as_u64()).unwrap_or(0);
+        let images = prof
+            .get("image_count")
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0);
         ("coco".to_string(), images, classes, pj)
     } else if is_jsonl {
         // Dataset SFT/DPO/KD: JSON Lines. Nie profilujemy kolumn jak tabeli —
@@ -864,13 +937,14 @@ fn finalize_dataset_upload(
                 continue;
             }
             let value: serde_json::Value = serde_json::from_str(line).map_err(|e| {
-                ProtocolError::bad_request(format!("invalid JSONL at record {}: {}", records + 1, e))
+                ProtocolError::bad_request(format!(
+                    "invalid JSONL at record {}: {}",
+                    records + 1,
+                    e
+                ))
             })?;
             let obj = value.as_object().ok_or_else(|| {
-                ProtocolError::bad_request(format!(
-                    "JSONL record {} is not an object",
-                    records + 1
-                ))
+                ProtocolError::bad_request(format!("JSONL record {} is not an object", records + 1))
             })?;
             if records == 0 {
                 keys = obj.keys().cloned().collect();
@@ -892,10 +966,19 @@ fn finalize_dataset_upload(
             .map_err(|e| ProtocolError::bad_request(format!("profiling failed: {}", e)))?;
         let pj =
             serde_json::to_string(&table).map_err(|e| ProtocolError::internal(e.to_string()))?;
-        (table.format.clone(), table.row_count, table.column_count, pj)
+        (
+            table.format.clone(),
+            table.row_count,
+            table.column_count,
+            pj,
+        )
     };
 
-    let dataset_name = if name.trim().is_empty() { filename } else { name };
+    let dataset_name = if name.trim().is_empty() {
+        filename
+    } else {
+        name
+    };
     repository::create_dataset(
         user_id,
         project_id,
@@ -946,7 +1029,11 @@ pub fn ml_studio_dataset_upload_chunk(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::DatasetUploadChunkRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioDatasetUploadChunkRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioDatasetUploadChunkRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
@@ -979,18 +1066,22 @@ pub fn ml_studio_dataset_upload_chunk(
             .map(|(_, e)| e.received_bytes)
             .sum();
         if other_bytes + payload.bytes.len() as u64 > MAX_TOTAL_UPLOAD_BYTES {
-            return Err(ProtocolError::bad_request("server upload buffer full, retry later"));
+            return Err(ProtocolError::bad_request(
+                "server upload buffer full, retry later",
+            ));
         }
 
-        let entry = map.entry(payload.upload_id.clone()).or_insert_with(|| UploadAccum {
-            project_id: payload.project_id.clone(),
-            name: payload.name.clone(),
-            filename: payload.filename.clone(),
-            total_chunks: payload.total_chunks,
-            chunks: (0..payload.total_chunks).map(|_| None).collect(),
-            received_bytes: 0,
-            last_touch: now,
-        });
+        let entry = map
+            .entry(payload.upload_id.clone())
+            .or_insert_with(|| UploadAccum {
+                project_id: payload.project_id.clone(),
+                name: payload.name.clone(),
+                filename: payload.filename.clone(),
+                total_chunks: payload.total_chunks,
+                chunks: (0..payload.total_chunks).map(|_| None).collect(),
+                received_bytes: 0,
+                last_touch: now,
+            });
 
         // Wszystkie fragmenty muszą zgadzać się co do całej niezmiennej metadanej
         // (projekt, nazwa, plik, liczba części) — inaczej dwa różne uploady o tym
@@ -1001,7 +1092,9 @@ pub fn ml_studio_dataset_upload_chunk(
             || entry.total_chunks != payload.total_chunks
         {
             map.remove(&payload.upload_id);
-            return Err(ProtocolError::bad_request("chunk metadata mismatch for upload_id"));
+            return Err(ProtocolError::bad_request(
+                "chunk metadata mismatch for upload_id",
+            ));
         }
         entry.last_touch = now;
 
@@ -1010,7 +1103,9 @@ pub fn ml_studio_dataset_upload_chunk(
             // Powtórzony fragment z inną treścią = niespójny upload → odrzucamy.
             Some(existing) if existing.as_slice() != payload.bytes.as_slice() => {
                 map.remove(&payload.upload_id);
-                return Err(ProtocolError::bad_request("conflicting bytes for chunk seq"));
+                return Err(ProtocolError::bad_request(
+                    "conflicting bytes for chunk seq",
+                ));
             }
             Some(_) => {}
             None => {
@@ -1048,14 +1143,16 @@ pub fn ml_studio_dataset_upload_chunk(
         None
     };
 
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::DatasetUploadChunkResponse(
-        tentaflow_protocol::MlStudioDatasetUploadChunkResponse {
-            upload_id: payload.upload_id.clone(),
-            received_chunks,
-            received_bytes,
-            dataset,
-        },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::DatasetUploadChunkResponse(
+            tentaflow_protocol::MlStudioDatasetUploadChunkResponse {
+                upload_id: payload.upload_id.clone(),
+                received_chunks,
+                received_bytes,
+                dataset,
+            },
+        ),
+    ))
 }
 
 // Staging accumulator for raw media uploads of recognition projects. Distinct
@@ -1087,7 +1184,11 @@ pub fn ml_studio_recog_stage_media(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::RecogStageMediaRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioRecogStageMediaRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioRecogStageMediaRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
@@ -1117,24 +1218,30 @@ pub fn ml_studio_recog_stage_media(
             .map(|(_, e)| e.received_bytes)
             .sum();
         if other_bytes + payload.bytes.len() as u64 > MAX_TOTAL_UPLOAD_BYTES {
-            return Err(ProtocolError::bad_request("server upload buffer full, retry later"));
+            return Err(ProtocolError::bad_request(
+                "server upload buffer full, retry later",
+            ));
         }
 
-        let entry = map.entry(payload.upload_id.clone()).or_insert_with(|| StageAccum {
-            project_id: payload.project_id.clone(),
-            filename: payload.filename.clone(),
-            total_chunks: payload.total_chunks,
-            chunks: (0..payload.total_chunks).map(|_| None).collect(),
-            received_bytes: 0,
-            last_touch: now,
-        });
+        let entry = map
+            .entry(payload.upload_id.clone())
+            .or_insert_with(|| StageAccum {
+                project_id: payload.project_id.clone(),
+                filename: payload.filename.clone(),
+                total_chunks: payload.total_chunks,
+                chunks: (0..payload.total_chunks).map(|_| None).collect(),
+                received_bytes: 0,
+                last_touch: now,
+            });
 
         if entry.project_id != payload.project_id
             || entry.filename != payload.filename
             || entry.total_chunks != payload.total_chunks
         {
             map.remove(&payload.upload_id);
-            return Err(ProtocolError::bad_request("chunk metadata mismatch for upload_id"));
+            return Err(ProtocolError::bad_request(
+                "chunk metadata mismatch for upload_id",
+            ));
         }
         entry.last_touch = now;
 
@@ -1142,7 +1249,9 @@ pub fn ml_studio_recog_stage_media(
         match &entry.chunks[idx] {
             Some(existing) if existing.as_slice() != payload.bytes.as_slice() => {
                 map.remove(&payload.upload_id);
-                return Err(ProtocolError::bad_request("conflicting bytes for chunk seq"));
+                return Err(ProtocolError::bad_request(
+                    "conflicting bytes for chunk seq",
+                ));
             }
             Some(_) => {}
             None => {
@@ -1179,14 +1288,16 @@ pub fn ml_studio_recog_stage_media(
         false
     };
 
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogStageMediaResponse(
-        tentaflow_protocol::MlStudioRecogStageMediaResponse {
-            upload_id: payload.upload_id.clone(),
-            received_chunks,
-            received_bytes,
-            staged,
-        },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::RecogStageMediaResponse(
+            tentaflow_protocol::MlStudioRecogStageMediaResponse {
+                upload_id: payload.upload_id.clone(),
+                received_chunks,
+                received_bytes,
+                staged,
+            },
+        ),
+    ))
 }
 
 #[handler(variant = "MlStudioRecogBuildDatasetRequest", since = (1, 0))]
@@ -1198,7 +1309,11 @@ pub fn ml_studio_recog_build_dataset(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::RecogBuildDatasetRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioRecogBuildDatasetRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioRecogBuildDatasetRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
@@ -1223,20 +1338,24 @@ pub fn ml_studio_recog_build_dataset(
         payload.fps,
         payload.source_dir.clone(),
     ) {
-        Ok(build_id) => Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogBuildDatasetResponse(
-            tentaflow_protocol::MlStudioRecogBuildDatasetResponse {
-                build_id,
-                status: "running".to_string(),
-                error: None,
-            },
-        ))),
-        Err(e) => Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogBuildDatasetResponse(
-            tentaflow_protocol::MlStudioRecogBuildDatasetResponse {
-                build_id: String::new(),
-                status: "failed".to_string(),
-                error: Some(e.to_string()),
-            },
-        ))),
+        Ok(build_id) => Ok(MessageBody::MlStudioBody(
+            MlStudioPayload::RecogBuildDatasetResponse(
+                tentaflow_protocol::MlStudioRecogBuildDatasetResponse {
+                    build_id,
+                    status: "running".to_string(),
+                    error: None,
+                },
+            ),
+        )),
+        Err(e) => Ok(MessageBody::MlStudioBody(
+            MlStudioPayload::RecogBuildDatasetResponse(
+                tentaflow_protocol::MlStudioRecogBuildDatasetResponse {
+                    build_id: String::new(),
+                    status: "failed".to_string(),
+                    error: Some(e.to_string()),
+                },
+            ),
+        )),
     }
 }
 
@@ -1249,7 +1368,11 @@ pub fn ml_studio_recog_build_status(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::RecogBuildStatusRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioRecogBuildStatusRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioRecogBuildStatusRequest",
+            ))
+        }
     };
     let _org = require_org(ctx)?;
 
@@ -1265,19 +1388,21 @@ pub fn ml_studio_recog_build_status(
         None => None,
     };
 
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogBuildStatusResponse(
-        tentaflow_protocol::MlStudioRecogBuildStatusResponse {
-            build_id: payload.build_id.clone(),
-            status: prog.status,
-            files_total: prog.files_total,
-            files_done: prog.files_done,
-            frames_extracted: prog.frames_extracted,
-            dataset,
-            image_count: prog.image_count,
-            category_count: prog.category_count,
-            error: prog.error,
-        },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::RecogBuildStatusResponse(
+            tentaflow_protocol::MlStudioRecogBuildStatusResponse {
+                build_id: payload.build_id.clone(),
+                status: prog.status,
+                files_total: prog.files_total,
+                files_done: prog.files_done,
+                frames_extracted: prog.frames_extracted,
+                dataset,
+                image_count: prog.image_count,
+                category_count: prog.category_count,
+                error: prog.error,
+            },
+        ),
+    ))
 }
 
 #[handler(variant = "MlStudioDatasetsListRequest", since = (1, 0))]
@@ -1289,7 +1414,11 @@ pub fn ml_studio_datasets_list(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::DatasetsListRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioDatasetsListRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioDatasetsListRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let datasets = repository::list_datasets(&org.user_id, &payload.project_id)
@@ -1303,9 +1432,11 @@ pub fn ml_studio_datasets_list(
         .iter()
         .map(to_dataset_summary)
         .collect();
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::DatasetsListResponse(
-        tentaflow_protocol::MlStudioDatasetsListResponse { datasets },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::DatasetsListResponse(tentaflow_protocol::MlStudioDatasetsListResponse {
+            datasets,
+        }),
+    ))
 }
 
 #[handler(variant = "MlStudioDatasetProfileRequest", since = (1, 0))]
@@ -1317,7 +1448,11 @@ pub fn ml_studio_dataset_profile(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::DatasetProfileRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioDatasetProfileRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioDatasetProfileRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
@@ -1327,12 +1462,14 @@ pub fn ml_studio_dataset_profile(
     let table: TableProfile = serde_json::from_str(&dataset.profile_json)
         .map_err(|e| ProtocolError::internal(format!("stored profile is corrupt: {}", e)))?;
 
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::DatasetProfileResponse(
-        tentaflow_protocol::MlStudioDatasetProfileResponse {
-            dataset: to_dataset_summary(&dataset),
-            profile: to_protocol_profile(table),
-        },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::DatasetProfileResponse(
+            tentaflow_protocol::MlStudioDatasetProfileResponse {
+                dataset: to_dataset_summary(&dataset),
+                profile: to_protocol_profile(table),
+            },
+        ),
+    ))
 }
 
 /// Zwraca WIERSZE datasetu (surowe linie JSONL) do podglądu/edycji w GUI. Generyczne
@@ -1346,7 +1483,11 @@ pub fn ml_studio_dataset_rows(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::DatasetRowsRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioDatasetRowsRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioDatasetRowsRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
@@ -1384,16 +1525,16 @@ pub fn ml_studio_dataset_rows(
         .as_ref()
         .and_then(|p| p.get("distill_status").and_then(|v| v.as_str()))
         .map_or(false, |s| s == "pending");
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::DatasetRowsResponse(
-        tentaflow_protocol::MlStudioDatasetRowsResponse {
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::DatasetRowsResponse(tentaflow_protocol::MlStudioDatasetRowsResponse {
             dataset_id: payload.dataset_id.clone(),
             kind: dataset.kind,
             total,
             rows,
             meta,
             pending,
-        },
-    )))
+        }),
+    ))
 }
 
 /// Nadpisuje zawartość datasetu ręcznie edytowanymi wierszami (JSONL). Waliduje, że
@@ -1407,7 +1548,11 @@ pub fn ml_studio_dataset_rows_save(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::DatasetRowsSaveRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioDatasetRowsSaveRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioDatasetRowsSaveRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
@@ -1420,7 +1565,11 @@ pub fn ml_studio_dataset_rows_save(
     // dopisującym wygenerowane pary. Edycja dopiero po zakończeniu generacji.
     let is_pending = serde_json::from_str::<serde_json::Value>(&dataset.profile_json)
         .ok()
-        .and_then(|p| p.get("distill_status").and_then(|v| v.as_str()).map(str::to_string))
+        .and_then(|p| {
+            p.get("distill_status")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
         .map_or(false, |s| s == "pending");
     if is_pending {
         return Err(ProtocolError::bad_request(
@@ -1451,14 +1600,21 @@ pub fn ml_studio_dataset_rows_save(
     if !jsonl.is_empty() {
         jsonl.push('\n');
     }
-    repository::update_dataset_data(&org.user_id, &payload.dataset_id, row_count, jsonl.as_bytes())
-        .map_err(db_err)?;
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::DatasetRowsSaveResponse(
-        tentaflow_protocol::MlStudioDatasetRowsSaveResponse {
-            dataset_id: payload.dataset_id.clone(),
-            row_count: row_count as u32,
-        },
-    )))
+    repository::update_dataset_data(
+        &org.user_id,
+        &payload.dataset_id,
+        row_count,
+        jsonl.as_bytes(),
+    )
+    .map_err(db_err)?;
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::DatasetRowsSaveResponse(
+            tentaflow_protocol::MlStudioDatasetRowsSaveResponse {
+                dataset_id: payload.dataset_id.clone(),
+                row_count: row_count as u32,
+            },
+        ),
+    ))
 }
 
 #[handler(variant = "MlStudioTabularTrainRequest", since = (1, 0))]
@@ -1470,7 +1626,11 @@ pub fn ml_studio_tabular_train(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::TabularTrainRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioTabularTrainRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioTabularTrainRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
@@ -1478,8 +1638,9 @@ pub fn ml_studio_tabular_train(
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
     require_project_editor(&org.user_id, &payload.project_id)?;
 
-    let task = Task::from_slug(&payload.task)
-        .ok_or_else(|| ProtocolError::bad_request("task must be 'classification' or 'regression'"))?;
+    let task = Task::from_slug(&payload.task).ok_or_else(|| {
+        ProtocolError::bad_request("task must be 'classification' or 'regression'")
+    })?;
 
     let raw = repository::get_dataset_raw(&org.user_id, &payload.dataset_id)
         .map_err(|e| ProtocolError::bad_request(format!("dataset unavailable: {}", e)))?;
@@ -1488,7 +1649,11 @@ pub fn ml_studio_tabular_train(
     let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
-    let ext = if dataset.kind == "xlsx" { "xlsx" } else { "csv" };
+    let ext = if dataset.kind == "xlsx" {
+        "xlsx"
+    } else {
+        "csv"
+    };
     let filename = format!("{}.{}", payload.dataset_id, ext);
 
     // Wybór silnika per request. None/""/"rust" → wbudowany silnik Rust
@@ -1523,9 +1688,8 @@ pub fn ml_studio_tabular_train(
                         "Silnik AutoGluon niedostępny — uruchom serwis „AutoGluon (Tabular AutoML)” w Serwisach",
                     )
                 })?;
-                svc.endpoint_url.ok_or_else(|| {
-                    ProtocolError::bad_request("serwis AutoGluon bez endpointu")
-                })?
+                svc.endpoint_url
+                    .ok_or_else(|| ProtocolError::bad_request("serwis AutoGluon bez endpointu"))?
             };
             let outcome = train_autogluon::train_via_service(
                 &endpoint,
@@ -1596,8 +1760,8 @@ pub fn ml_studio_tabular_train(
         })
         .collect();
 
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::TabularTrainResponse(
-        tentaflow_protocol::MlStudioTabularTrainResponse {
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::TabularTrainResponse(tentaflow_protocol::MlStudioTabularTrainResponse {
             run_id,
             best_model_id,
             best_model_name: outcome.best_model_name,
@@ -1606,8 +1770,8 @@ pub fn ml_studio_tabular_train(
             train_rows: outcome.train_rows as u64,
             holdout_rows: outcome.holdout_rows as u64,
             leaderboard,
-        },
-    )))
+        }),
+    ))
 }
 
 fn to_grant(g: ResourceGrant) -> tentaflow_protocol::MlStudioResourceGrant {
@@ -1650,11 +1814,13 @@ pub fn ml_studio_resource_grant_create(
         &org.user_id,
     )
     .map_err(|e| ProtocolError::bad_request(format!("create grant failed: {}", e)))?;
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::ResourceGrantCreateResponse(
-        tentaflow_protocol::MlStudioResourceGrantCreateResponse {
-            grant: to_grant(grant),
-        },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ResourceGrantCreateResponse(
+            tentaflow_protocol::MlStudioResourceGrantCreateResponse {
+                grant: to_grant(grant),
+            },
+        ),
+    ))
 }
 
 #[handler(variant = "MlStudioResourceGrantsListRequest", since = (1, 0))]
@@ -1677,9 +1843,11 @@ pub fn ml_studio_resource_grants_list(
         .into_iter()
         .map(to_grant)
         .collect();
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::ResourceGrantsListResponse(
-        tentaflow_protocol::MlStudioResourceGrantsListResponse { grants },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ResourceGrantsListResponse(
+            tentaflow_protocol::MlStudioResourceGrantsListResponse { grants },
+        ),
+    ))
 }
 
 #[handler(variant = "MlStudioResourceGrantRevokeRequest", since = (1, 0))]
@@ -1698,12 +1866,14 @@ pub fn ml_studio_resource_grant_revoke(
         }
     };
     let revoked = repository::revoke_grant(&payload.grant_id).map_err(db_err)?;
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::ResourceGrantRevokeResponse(
-        tentaflow_protocol::MlStudioResourceGrantRevokeResponse {
-            grant_id: payload.grant_id.clone(),
-            revoked,
-        },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ResourceGrantRevokeResponse(
+            tentaflow_protocol::MlStudioResourceGrantRevokeResponse {
+                grant_id: payload.grant_id.clone(),
+                revoked,
+            },
+        ),
+    ))
 }
 
 #[handler(variant = "MlStudioProjectResourcesRequest", since = (1, 0))]
@@ -1738,9 +1908,11 @@ pub fn ml_studio_project_resources(
         .into_iter()
         .map(to_grant)
         .collect();
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::ProjectResourcesResponse(
-        tentaflow_protocol::MlStudioProjectResourcesResponse { grants },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ProjectResourcesResponse(
+            tentaflow_protocol::MlStudioProjectResourcesResponse { grants },
+        ),
+    ))
 }
 
 fn to_training_run(r: TrainingRunSummary) -> tentaflow_protocol::MlStudioTrainingRunSummary {
@@ -1788,9 +1960,11 @@ pub fn ml_studio_training_runs_list(
         .into_iter()
         .map(to_training_run)
         .collect();
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::TrainingRunsListResponse(
-        tentaflow_protocol::MlStudioTrainingRunsListResponse { runs },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::TrainingRunsListResponse(
+            tentaflow_protocol::MlStudioTrainingRunsListResponse { runs },
+        ),
+    ))
 }
 
 #[handler(variant = "MlStudioJobsOverviewRequest", since = (1, 0))]
@@ -1802,7 +1976,11 @@ pub async fn ml_studio_jobs_overview(
 ) -> Result<MessageBody, ProtocolError> {
     match req {
         MessageBody::MlStudioBody(MlStudioPayload::JobsOverviewRequest(_)) => {}
-        _ => return Err(ProtocolError::bad_request("expected MlStudioJobsOverviewRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioJobsOverviewRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let rows = repository::list_active_runs_for_user(&org.user_id).map_err(db_err)?;
@@ -1855,9 +2033,12 @@ pub async fn ml_studio_jobs_overview(
             util_pct: 0,
         });
 
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::JobsOverviewResponse(
-        tentaflow_protocol::MlStudioJobsOverviewResponse { jobs, gpu },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::JobsOverviewResponse(tentaflow_protocol::MlStudioJobsOverviewResponse {
+            jobs,
+            gpu,
+        }),
+    ))
 }
 
 /// Rekoncyliacja statusu inferencji przy ODCZYCIE. `inference_status` w metrykach
@@ -1909,7 +2090,10 @@ fn reconcile_local_inference_status(
             if !obj.contains_key("inference_model_name") {
                 return m;
             }
-            let node = obj.get("inference_node").and_then(|v| v.as_str()).unwrap_or("");
+            let node = obj
+                .get("inference_node")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if !node.is_empty() && node != local_node {
                 return m;
             }
@@ -1940,7 +2124,11 @@ pub fn ml_studio_models_list(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::ModelsListRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioModelsListRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioModelsListRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     require_project_member(&org.user_id, &payload.project_id)?;
@@ -1949,9 +2137,11 @@ pub fn ml_studio_models_list(
         .into_iter()
         .map(to_model)
         .collect();
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::ModelsListResponse(
-        tentaflow_protocol::MlStudioModelsListResponse { models },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ModelsListResponse(tentaflow_protocol::MlStudioModelsListResponse {
+            models,
+        }),
+    ))
 }
 
 #[handler(variant = "MlStudioProjectGrantsListRequest", since = (1, 0))]
@@ -1976,9 +2166,11 @@ pub fn ml_studio_project_grants_list(
         .into_iter()
         .map(to_grant)
         .collect();
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::ProjectGrantsListResponse(
-        tentaflow_protocol::MlStudioProjectGrantsListResponse { grants },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ProjectGrantsListResponse(
+            tentaflow_protocol::MlStudioProjectGrantsListResponse { grants },
+        ),
+    ))
 }
 
 #[handler(variant = "MlStudioFtTrainStartRequest", since = (1, 0))]
@@ -1990,7 +2182,11 @@ pub async fn ml_studio_ft_train_start(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::FtTrainStartRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioFtTrainStartRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioFtTrainStartRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
@@ -2000,7 +2196,9 @@ pub async fn ml_studio_ft_train_start(
 
     // Cele FT: SFT/DPO/KD. KD wymaga modelu-nauczyciela.
     if !matches!(payload.objective.as_str(), "sft" | "dpo" | "kd") {
-        return Err(ProtocolError::bad_request("objective must be 'sft', 'dpo' or 'kd'"));
+        return Err(ProtocolError::bad_request(
+            "objective must be 'sft', 'dpo' or 'kd'",
+        ));
     }
     if payload.objective == "kd"
         && payload
@@ -2049,7 +2247,8 @@ pub async fn ml_studio_ft_train_start(
     })
     .to_string();
 
-    let run_id = repository::create_training_run(&payload.project_id, &config_json).map_err(db_err)?;
+    let run_id =
+        repository::create_training_run(&payload.project_id, &config_json).map_err(db_err)?;
 
     match target_node {
         None => {
@@ -2067,23 +2266,28 @@ pub async fn ml_studio_ft_train_start(
                 payload.merge_adapter,
                 payload.num_gpus,
             );
-            Ok(MessageBody::MlStudioBody(MlStudioPayload::FtTrainStartResponse(
-                tentaflow_protocol::MlStudioFtTrainStartResponse {
-                    run_id,
-                    status: "running".to_string(),
-                },
-            )))
+            Ok(MessageBody::MlStudioBody(
+                MlStudioPayload::FtTrainStartResponse(
+                    tentaflow_protocol::MlStudioFtTrainStartResponse {
+                        run_id,
+                        status: "running".to_string(),
+                    },
+                ),
+            ))
         }
         Some(target) => {
             // Trening ZDALNY (mesh): dataset → blob hash → spec → transfer → MlTrainStart.
-            let raw = repository::get_dataset_raw(&org.user_id, &payload.dataset_id).map_err(db_err)?;
+            let raw =
+                repository::get_dataset_raw(&org.user_id, &payload.dataset_id).map_err(db_err)?;
             if raw.is_empty() {
                 let _ = repository::update_training_run_status(&run_id, "failed");
                 return Err(ProtocolError::bad_request("dataset pusty"));
             }
             let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
                 .map_err(db_err)?
-                .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+                .ok_or_else(|| {
+                    ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found")
+                })?;
             let dataset_hash = crate::ml_studio::train_recognition::blob_content_hash(&raw);
             // Multi-rig (dist.nnodes>1): A = orkiestrator + worker rank-1, B = master
             // rank-0. master_addr = LAN-IP B z rejestru mesh (mDNS) — „mamy IP, bo po
@@ -2156,17 +2360,24 @@ pub async fn ml_studio_ft_train_start(
             // więc NIE wolno wysłać datasetu ani zlecić treningu nieznanemu peerowi.
             let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
                 let _ = repository::update_training_run_status(&run_id, "failed");
-                ProtocolError::internal("mesh security niedostępny — nie można zweryfikować zaufania peera")
+                ProtocolError::internal(
+                    "mesh security niedostępny — nie można zweryfikować zaufania peera",
+                )
             })?;
             if !security.is_trusted(&target) {
                 let _ = repository::update_training_run_status(&run_id, "failed");
-                return Err(ProtocolError::bad_request(format!("peer {} is not trusted", target)));
+                return Err(ProtocolError::bad_request(format!(
+                    "peer {} is not trusted",
+                    target
+                )));
             }
-            let zip_bytes = crate::ml_studio::train_recognition::zip_single_file("dataset.bin", &raw)
-                .map_err(|e| {
-                    let _ = repository::update_training_run_status(&run_id, "failed");
-                    ProtocolError::internal(format!("zip datasetu: {}", e))
-                })?;
+            let zip_bytes =
+                crate::ml_studio::train_recognition::zip_single_file("dataset.bin", &raw).map_err(
+                    |e| {
+                        let _ = repository::update_training_run_status(&run_id, "failed");
+                        ProtocolError::internal(format!("zip datasetu: {}", e))
+                    },
+                )?;
             let _ = repository::update_training_run_status(&run_id, "syncing");
             crate::ml_studio::train_recognition::spawn_mesh_push_and_train(
                 iroh,
@@ -2192,12 +2403,14 @@ pub async fn ml_studio_ft_train_start(
                     a_dist,
                 );
             }
-            Ok(MessageBody::MlStudioBody(MlStudioPayload::FtTrainStartResponse(
-                tentaflow_protocol::MlStudioFtTrainStartResponse {
-                    run_id,
-                    status: "syncing".to_string(),
-                },
-            )))
+            Ok(MessageBody::MlStudioBody(
+                MlStudioPayload::FtTrainStartResponse(
+                    tentaflow_protocol::MlStudioFtTrainStartResponse {
+                        run_id,
+                        status: "syncing".to_string(),
+                    },
+                ),
+            ))
         }
     }
 }
@@ -2297,7 +2510,11 @@ pub async fn ml_studio_ft_train_status(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::FtTrainStatusRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioFtTrainStatusRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioFtTrainStatusRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let mut run = repository::get_training_run(&payload.run_id)
@@ -2311,22 +2528,24 @@ pub async fn ml_studio_ft_train_status(
             "error" => {
                 let _ = repository::update_training_run_status(&payload.run_id, "failed");
                 crate::ml_studio::train_recognition::clear_recog_sync(&payload.run_id);
-                return Ok(MessageBody::MlStudioBody(MlStudioPayload::FtTrainStatusResponse(
-                    tentaflow_protocol::MlStudioFtTrainStatusResponse {
-                        run_id: payload.run_id.clone(),
-                        status: "failed".to_string(),
-                        step: 0,
-                        total_steps: 0,
-                        train_loss: None,
-                        eval_loss: None,
-                        error: sp.error.clone(),
-                        loss_curve: Vec::new(),
-                        sync_phase: Some("error".to_string()),
-                        sync_bytes_sent: sp.bytes_sent,
-                        sync_bytes_total: sp.bytes_total,
-                        sync_rate_bps: 0,
-                    },
-                )));
+                return Ok(MessageBody::MlStudioBody(
+                    MlStudioPayload::FtTrainStatusResponse(
+                        tentaflow_protocol::MlStudioFtTrainStatusResponse {
+                            run_id: payload.run_id.clone(),
+                            status: "failed".to_string(),
+                            step: 0,
+                            total_steps: 0,
+                            train_loss: None,
+                            eval_loss: None,
+                            error: sp.error.clone(),
+                            loss_curve: Vec::new(),
+                            sync_phase: Some("error".to_string()),
+                            sync_bytes_sent: sp.bytes_sent,
+                            sync_bytes_total: sp.bytes_total,
+                            sync_rate_bps: 0,
+                        },
+                    ),
+                ));
             }
             "training" => {
                 if run.status != "running" {
@@ -2336,22 +2555,24 @@ pub async fn ml_studio_ft_train_status(
                 crate::ml_studio::train_recognition::clear_recog_sync(&payload.run_id);
             }
             _ => {
-                return Ok(MessageBody::MlStudioBody(MlStudioPayload::FtTrainStatusResponse(
-                    tentaflow_protocol::MlStudioFtTrainStatusResponse {
-                        run_id: payload.run_id.clone(),
-                        status: "syncing".to_string(),
-                        step: 0,
-                        total_steps: 0,
-                        train_loss: None,
-                        eval_loss: None,
-                        error: None,
-                        loss_curve: Vec::new(),
-                        sync_phase: Some(sp.phase.clone()),
-                        sync_bytes_sent: sp.bytes_sent,
-                        sync_bytes_total: sp.bytes_total,
-                        sync_rate_bps: sp.rate_bps,
-                    },
-                )));
+                return Ok(MessageBody::MlStudioBody(
+                    MlStudioPayload::FtTrainStatusResponse(
+                        tentaflow_protocol::MlStudioFtTrainStatusResponse {
+                            run_id: payload.run_id.clone(),
+                            status: "syncing".to_string(),
+                            step: 0,
+                            total_steps: 0,
+                            train_loss: None,
+                            eval_loss: None,
+                            error: None,
+                            loss_curve: Vec::new(),
+                            sync_phase: Some(sp.phase.clone()),
+                            sync_bytes_sent: sp.bytes_sent,
+                            sync_bytes_total: sp.bytes_total,
+                            sync_rate_bps: sp.rate_bps,
+                        },
+                    ),
+                ));
             }
         }
     }
@@ -2404,11 +2625,13 @@ pub async fn ml_studio_ft_train_status(
     let curve = repository::loss_curve_for_run(&payload.run_id).map_err(db_err)?;
     let loss_curve: Vec<tentaflow_protocol::MlStudioLossPoint> = curve
         .iter()
-        .map(|(step, train, eval)| tentaflow_protocol::MlStudioLossPoint {
-            step: (*step).max(0) as u64,
-            train_loss: *train,
-            eval_loss: *eval,
-        })
+        .map(
+            |(step, train, eval)| tentaflow_protocol::MlStudioLossPoint {
+                step: (*step).max(0) as u64,
+                train_loss: *train,
+                eval_loss: *eval,
+            },
+        )
         .collect();
 
     // step = ostatni (największy) krok z krzywej; total_steps z config gdy znamy.
@@ -2423,8 +2646,8 @@ pub async fn ml_studio_ft_train_status(
         .and_then(|c| c.get("error")?.as_str().map(String::from))
         .filter(|_| run.status == "failed");
 
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::FtTrainStatusResponse(
-        tentaflow_protocol::MlStudioFtTrainStatusResponse {
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::FtTrainStatusResponse(tentaflow_protocol::MlStudioFtTrainStatusResponse {
             run_id: payload.run_id.clone(),
             status: run.status,
             step,
@@ -2437,8 +2660,8 @@ pub async fn ml_studio_ft_train_status(
             sync_bytes_sent: 0,
             sync_bytes_total: 0,
             sync_rate_bps: 0,
-        },
-    )))
+        }),
+    ))
 }
 
 /// Wybiera najlepszy adres LAN IPv4 peera dla rendezvous treningu (master_addr).
@@ -2466,7 +2689,9 @@ fn pick_lan_ipv4(addresses: &[std::net::IpAddr]) -> Option<String> {
             3
         }
     };
-    v4.into_iter().min_by_key(|v| score(v)).map(|v| v.to_string())
+    v4.into_iter()
+        .min_by_key(|v| score(v))
+        .map(|v| v.to_string())
 }
 
 /// Zapisuje metryki/stan zdalnego treningu LLM (z węzła B) do bazy A. Po sukcesie
@@ -2476,7 +2701,10 @@ fn sync_remote_ft_status(run_id: &str, run: &repository::TrainingRunRow, status_
         Ok(v) => v,
         Err(_) => return,
     };
-    let status = st.get("status").and_then(|v| v.as_str()).unwrap_or("running");
+    let status = st
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("running");
     let step = st.get("step").and_then(|v| v.as_i64()).unwrap_or(0);
     let train_loss = st.get("train_loss").and_then(|v| v.as_f64());
     let eval_loss = st.get("eval_loss").and_then(|v| v.as_f64());
@@ -2493,7 +2721,10 @@ fn sync_remote_ft_status(run_id: &str, run: &repository::TrainingRunRow, status_
             let base_model = cfg.get("base_model").and_then(|v| v.as_str()).unwrap_or("");
             let method = cfg.get("method").and_then(|v| v.as_str()).unwrap_or("lora");
             let node = cfg.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
-            let artifact = st.get("artifact_path").and_then(|v| v.as_str()).unwrap_or("");
+            let artifact = st
+                .get("artifact_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let metrics_json = serde_json::json!({
                 "train_loss": train_loss,
                 "eval_loss": eval_loss,
@@ -2503,15 +2734,23 @@ fn sync_remote_ft_status(run_id: &str, run: &repository::TrainingRunRow, status_
             })
             .to_string();
             let model_name = format!("{}-{}", base_model, method);
-            if let Ok(model_id) =
-                repository::insert_model(&run.project_id, &model_name, "huggingface", base_model, &metrics_json)
-            {
+            if let Ok(model_id) = repository::insert_model(
+                &run.project_id,
+                &model_name,
+                "huggingface",
+                base_model,
+                &metrics_json,
+            ) {
                 let _ = repository::set_training_run_model(run_id, &model_id);
             }
             let _ = repository::update_training_run_status(run_id, "succeeded");
         }
         "failed" => {
-            if let Some(err) = st.get("error").and_then(|v| v.as_str()).filter(|e| !e.is_empty()) {
+            if let Some(err) = st
+                .get("error")
+                .and_then(|v| v.as_str())
+                .filter(|e| !e.is_empty())
+            {
                 let _ = repository::set_training_run_error(run_id, err);
             }
             let _ = repository::update_training_run_status(run_id, "failed");
@@ -2536,7 +2775,11 @@ pub async fn ml_studio_recog_train_start(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::RecogTrainStartRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioRecogTrainStartRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioRecogTrainStartRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
@@ -2579,7 +2822,8 @@ pub async fn ml_studio_recog_train_start(
     })
     .to_string();
 
-    let run_id = repository::create_training_run(&payload.project_id, &config_json).map_err(db_err)?;
+    let run_id =
+        repository::create_training_run(&payload.project_id, &config_json).map_err(db_err)?;
 
     let target_was_remote = target_node.is_some();
     match target_node {
@@ -2599,14 +2843,17 @@ pub async fn ml_studio_recog_train_start(
             // Dataset musi być dostępny na B pod tą samą ścieżką (coco_path / NAS).
             let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
                 .map_err(db_err)?
-                .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+                .ok_or_else(|| {
+                    ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found")
+                })?;
             if dataset.kind != "coco_path" {
                 let _ = repository::update_training_run_status(&run_id, "failed");
                 return Err(ProtocolError::bad_request(
                     "trening zdalny wymaga datasetu COCO przez ścieżkę (coco_path) widoczną na węźle B",
                 ));
             }
-            let raw = repository::get_dataset_raw(&org.user_id, &payload.dataset_id).map_err(db_err)?;
+            let raw =
+                repository::get_dataset_raw(&org.user_id, &payload.dataset_id).map_err(db_err)?;
             let dataset_dir = String::from_utf8_lossy(&raw).trim().to_string();
             // Content-hash datasetu (detekcja wspólnego zasobu na B). Liczony z
             // adnotacji COCO u A; B porówna ze swoim — zgodność = ten sam zasób.
@@ -2614,11 +2861,16 @@ pub async fn ml_studio_recog_train_start(
                 std::path::Path::new(&dataset_dir),
             )
             .map_err(|e| ProtocolError::bad_request(format!("hash datasetu: {}", e)))?;
-            let classes: Vec<String> = serde_json::from_str::<serde_json::Value>(&dataset.profile_json)
-                .ok()
-                .and_then(|p| p.get("classes")?.as_array().cloned())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                .unwrap_or_default();
+            let classes: Vec<String> =
+                serde_json::from_str::<serde_json::Value>(&dataset.profile_json)
+                    .ok()
+                    .and_then(|p| p.get("classes")?.as_array().cloned())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
             // Dataset dostarczany do B PRZEZ MESH (content-addr po hashu). B robi
             // dedup: gdy ma już ten hash (wspólny zasób), przerywa transfer.
             let spec_json = serde_json::json!({
@@ -2646,11 +2898,16 @@ pub async fn ml_studio_recog_train_start(
             // więc NIE wolno wysłać datasetu ani zlecić treningu nieznanemu peerowi.
             let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
                 let _ = repository::update_training_run_status(&run_id, "failed");
-                ProtocolError::internal("mesh security niedostępny — nie można zweryfikować zaufania peera")
+                ProtocolError::internal(
+                    "mesh security niedostępny — nie można zweryfikować zaufania peera",
+                )
             })?;
             if !security.is_trusted(&target) {
                 let _ = repository::update_training_run_status(&run_id, "failed");
-                return Err(ProtocolError::bad_request(format!("peer {} is not trusted", target)));
+                return Err(ProtocolError::bad_request(format!(
+                    "peer {} is not trusted",
+                    target
+                )));
             }
 
             // Transfer datasetu + start treningu biegną ASYNCHRONICZNIE w tle —
@@ -2672,13 +2929,19 @@ pub async fn ml_studio_recog_train_start(
         }
     }
 
-    let start_status = if target_was_remote { "syncing" } else { "running" };
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogTrainStartResponse(
-        tentaflow_protocol::MlStudioRecogTrainStartResponse {
-            run_id,
-            status: start_status.to_string(),
-        },
-    )))
+    let start_status = if target_was_remote {
+        "syncing"
+    } else {
+        "running"
+    };
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::RecogTrainStartResponse(
+            tentaflow_protocol::MlStudioRecogTrainStartResponse {
+                run_id,
+                status: start_status.to_string(),
+            },
+        ),
+    ))
 }
 
 #[handler(variant = "MlStudioRecogTrainStatusRequest", since = (1, 0))]
@@ -2690,7 +2953,11 @@ pub async fn ml_studio_recog_train_status(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::RecogTrainStatusRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioRecogTrainStatusRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioRecogTrainStatusRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let mut run = repository::get_training_run(&payload.run_id)
@@ -2706,27 +2973,29 @@ pub async fn ml_studio_recog_train_status(
             "error" => {
                 let _ = repository::update_training_run_status(&payload.run_id, "failed");
                 crate::ml_studio::train_recognition::clear_recog_sync(&payload.run_id);
-                return Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogTrainStatusResponse(
-                    tentaflow_protocol::MlStudioRecogTrainStatusResponse {
-                        run_id: payload.run_id.clone(),
-                        status: "failed".to_string(),
-                        epoch: 0,
-                        total_epochs: recog_total_epochs(&run.config_json),
-                        train_loss: None,
-                        map50: None,
-                        map50_95: None,
-                        error: sp.error.clone(),
-                        curve: Vec::new(),
-                        sync_phase: Some("error".to_string()),
-                        sync_bytes_sent: sp.bytes_sent,
-                        sync_bytes_total: sp.bytes_total,
-                        sync_rate_bps: 0,
-                        eta_s: 0.0,
-                        elapsed_s: 0.0,
-                        gpu_mem_mb: 0.0,
-                        stage: String::new(),
-                    },
-                )));
+                return Ok(MessageBody::MlStudioBody(
+                    MlStudioPayload::RecogTrainStatusResponse(
+                        tentaflow_protocol::MlStudioRecogTrainStatusResponse {
+                            run_id: payload.run_id.clone(),
+                            status: "failed".to_string(),
+                            epoch: 0,
+                            total_epochs: recog_total_epochs(&run.config_json),
+                            train_loss: None,
+                            map50: None,
+                            map50_95: None,
+                            error: sp.error.clone(),
+                            curve: Vec::new(),
+                            sync_phase: Some("error".to_string()),
+                            sync_bytes_sent: sp.bytes_sent,
+                            sync_bytes_total: sp.bytes_total,
+                            sync_rate_bps: 0,
+                            eta_s: 0.0,
+                            elapsed_s: 0.0,
+                            gpu_mem_mb: 0.0,
+                            stage: String::new(),
+                        },
+                    ),
+                ));
             }
             "training" => {
                 if run.status != "running" {
@@ -2738,27 +3007,29 @@ pub async fn ml_studio_recog_train_status(
             }
             _ => {
                 // "zipping" | "syncing" | "starting" — zwróć pasek postępu transferu.
-                return Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogTrainStatusResponse(
-                    tentaflow_protocol::MlStudioRecogTrainStatusResponse {
-                        run_id: payload.run_id.clone(),
-                        status: "syncing".to_string(),
-                        epoch: 0,
-                        total_epochs: recog_total_epochs(&run.config_json),
-                        train_loss: None,
-                        map50: None,
-                        map50_95: None,
-                        error: None,
-                        curve: Vec::new(),
-                        sync_phase: Some(sp.phase.clone()),
-                        sync_bytes_sent: sp.bytes_sent,
-                        sync_bytes_total: sp.bytes_total,
-                        sync_rate_bps: sp.rate_bps,
-                        eta_s: 0.0,
-                        elapsed_s: 0.0,
-                        gpu_mem_mb: 0.0,
-                        stage: String::new(),
-                    },
-                )));
+                return Ok(MessageBody::MlStudioBody(
+                    MlStudioPayload::RecogTrainStatusResponse(
+                        tentaflow_protocol::MlStudioRecogTrainStatusResponse {
+                            run_id: payload.run_id.clone(),
+                            status: "syncing".to_string(),
+                            epoch: 0,
+                            total_epochs: recog_total_epochs(&run.config_json),
+                            train_loss: None,
+                            map50: None,
+                            map50_95: None,
+                            error: None,
+                            curve: Vec::new(),
+                            sync_phase: Some(sp.phase.clone()),
+                            sync_bytes_sent: sp.bytes_sent,
+                            sync_bytes_total: sp.bytes_total,
+                            sync_rate_bps: sp.rate_bps,
+                            eta_s: 0.0,
+                            elapsed_s: 0.0,
+                            gpu_mem_mb: 0.0,
+                            stage: String::new(),
+                        },
+                    ),
+                ));
             }
         }
     }
@@ -2811,14 +3082,21 @@ pub async fn ml_studio_recog_train_status(
     let curve_raw = repository::recog_curve_for_run(&payload.run_id).map_err(db_err)?;
     let curve: Vec<tentaflow_protocol::MlStudioRecogMetricPoint> = curve_raw
         .iter()
-        .map(|(epoch, loss, map50)| tentaflow_protocol::MlStudioRecogMetricPoint {
-            epoch: (*epoch).max(0) as u64,
-            train_loss: *loss,
-            map50: *map50,
-        })
+        .map(
+            |(epoch, loss, map50)| tentaflow_protocol::MlStudioRecogMetricPoint {
+                epoch: (*epoch).max(0) as u64,
+                train_loss: *loss,
+                map50: *map50,
+            },
+        )
         .collect();
 
-    let epoch = curve_raw.iter().map(|(e, _, _)| *e).max().unwrap_or(0).max(0) as u64;
+    let epoch = curve_raw
+        .iter()
+        .map(|(e, _, _)| *e)
+        .max()
+        .unwrap_or(0)
+        .max(0) as u64;
     let total_epochs = recog_total_epochs(&run.config_json);
     // Błąd treningu (np. z węzła B) zapisany w config_json.$.error — zwróć go do UI.
     let run_error = serde_json::from_str::<serde_json::Value>(&run.config_json)
@@ -2832,29 +3110,31 @@ pub async fn ml_studio_recog_train_status(
     // Live-view z serwisu (tylko lokalny job ma wpis; zdalny/sprzątnięty = default).
     let lv = crate::ml_studio::live_view::fetch_local_live_view(&payload.run_id).await;
 
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogTrainStatusResponse(
-        tentaflow_protocol::MlStudioRecogTrainStatusResponse {
-            run_id: payload.run_id.clone(),
-            status: run.status,
-            epoch,
-            total_epochs,
-            train_loss,
-            map50,
-            // mAP@50:95 nie jest w krzywej (tylko map50/loss); finalne metryki są
-            // w `models.metrics_json` po sukcesie. Tu zwracamy None.
-            map50_95: None,
-            error: run_error,
-            curve,
-            sync_phase: None,
-            sync_bytes_sent: 0,
-            sync_bytes_total: 0,
-            sync_rate_bps: 0,
-            eta_s: lv.eta_s,
-            elapsed_s: lv.elapsed_s,
-            gpu_mem_mb: lv.gpu_mem_mb,
-            stage: lv.stage,
-        },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::RecogTrainStatusResponse(
+            tentaflow_protocol::MlStudioRecogTrainStatusResponse {
+                run_id: payload.run_id.clone(),
+                status: run.status,
+                epoch,
+                total_epochs,
+                train_loss,
+                map50,
+                // mAP@50:95 nie jest w krzywej (tylko map50/loss); finalne metryki są
+                // w `models.metrics_json` po sukcesie. Tu zwracamy None.
+                map50_95: None,
+                error: run_error,
+                curve,
+                sync_phase: None,
+                sync_bytes_sent: 0,
+                sync_bytes_total: 0,
+                sync_rate_bps: 0,
+                eta_s: lv.eta_s,
+                elapsed_s: lv.elapsed_s,
+                gpu_mem_mb: lv.gpu_mem_mb,
+                stage: lv.stage,
+            },
+        ),
+    ))
 }
 
 #[handler(variant = "MlStudioClassifierTrainStartRequest", since = (1, 0))]
@@ -2866,7 +3146,11 @@ pub async fn ml_studio_classifier_train_start(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::ClassifierTrainStartRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioClassifierTrainStartRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioClassifierTrainStartRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
@@ -2946,7 +3230,8 @@ pub async fn ml_studio_classifier_train_start(
     })
     .to_string();
 
-    let run_id = repository::create_training_run(&payload.project_id, &config_json).map_err(db_err)?;
+    let run_id =
+        repository::create_training_run(&payload.project_id, &config_json).map_err(db_err)?;
 
     let target_was_remote = target_node.is_some();
     match target_node {
@@ -2969,14 +3254,17 @@ pub async fn ml_studio_classifier_train_start(
             // po zmaterializowaniu start treningu klasyfikatora na B (kind="classifier").
             let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
                 .map_err(db_err)?
-                .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+                .ok_or_else(|| {
+                    ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found")
+                })?;
             if dataset.kind != "coco_path" {
                 let _ = repository::update_training_run_status(&run_id, "failed");
                 return Err(ProtocolError::bad_request(
                     "trening zdalny wymaga datasetu COCO przez ścieżkę (coco_path) widoczną na węźle B",
                 ));
             }
-            let raw = repository::get_dataset_raw(&org.user_id, &payload.dataset_id).map_err(db_err)?;
+            let raw =
+                repository::get_dataset_raw(&org.user_id, &payload.dataset_id).map_err(db_err)?;
             let dataset_dir = String::from_utf8_lossy(&raw).trim().to_string();
             let dataset_hash = crate::ml_studio::train_recognition::coco_content_hash(
                 std::path::Path::new(&dataset_dir),
@@ -3006,11 +3294,16 @@ pub async fn ml_studio_classifier_train_start(
             })?;
             let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
                 let _ = repository::update_training_run_status(&run_id, "failed");
-                ProtocolError::internal("mesh security niedostępny — nie można zweryfikować zaufania peera")
+                ProtocolError::internal(
+                    "mesh security niedostępny — nie można zweryfikować zaufania peera",
+                )
             })?;
             if !security.is_trusted(&target) {
                 let _ = repository::update_training_run_status(&run_id, "failed");
-                return Err(ProtocolError::bad_request(format!("peer {} is not trusted", target)));
+                return Err(ProtocolError::bad_request(format!(
+                    "peer {} is not trusted",
+                    target
+                )));
             }
 
             let _ = repository::update_training_run_status(&run_id, "syncing");
@@ -3025,13 +3318,19 @@ pub async fn ml_studio_classifier_train_start(
         }
     }
 
-    let start_status = if target_was_remote { "syncing" } else { "running" };
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::ClassifierTrainStartResponse(
-        tentaflow_protocol::MlStudioClassifierTrainStartResponse {
-            run_id,
-            status: start_status.to_string(),
-        },
-    )))
+    let start_status = if target_was_remote {
+        "syncing"
+    } else {
+        "running"
+    };
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ClassifierTrainStartResponse(
+            tentaflow_protocol::MlStudioClassifierTrainStartResponse {
+                run_id,
+                status: start_status.to_string(),
+            },
+        ),
+    ))
 }
 
 #[handler(variant = "MlStudioGenericTrainStatusRequest", since = (1, 0))]
@@ -3043,7 +3342,11 @@ pub async fn ml_studio_generic_train_status(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::GenericTrainStatusRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioGenericTrainStatusRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioGenericTrainStatusRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let mut run = repository::get_training_run(&payload.run_id)
@@ -3058,24 +3361,26 @@ pub async fn ml_studio_generic_train_status(
             "error" => {
                 let _ = repository::update_training_run_status(&payload.run_id, "failed");
                 crate::ml_studio::train_recognition::clear_recog_sync(&payload.run_id);
-                return Ok(MessageBody::MlStudioBody(MlStudioPayload::GenericTrainStatusResponse(
-                    tentaflow_protocol::MlStudioGenericTrainStatusResponse {
-                        run_id: payload.run_id.clone(),
-                        status: "failed".to_string(),
-                        epoch: 0,
-                        total_epochs: generic_total_epochs(&run.config_json),
-                        curve: Vec::new(),
-                        error: sp.error.clone().unwrap_or_default(),
-                        sync_phase: Some("error".to_string()),
-                        sync_bytes_sent: sp.bytes_sent,
-                        sync_bytes_total: sp.bytes_total,
-                        sync_rate_bps: 0,
-                        eta_s: 0.0,
-                        elapsed_s: 0.0,
-                        gpu_mem_mb: 0.0,
-                        stage: String::new(),
-                    },
-                )));
+                return Ok(MessageBody::MlStudioBody(
+                    MlStudioPayload::GenericTrainStatusResponse(
+                        tentaflow_protocol::MlStudioGenericTrainStatusResponse {
+                            run_id: payload.run_id.clone(),
+                            status: "failed".to_string(),
+                            epoch: 0,
+                            total_epochs: generic_total_epochs(&run.config_json),
+                            curve: Vec::new(),
+                            error: sp.error.clone().unwrap_or_default(),
+                            sync_phase: Some("error".to_string()),
+                            sync_bytes_sent: sp.bytes_sent,
+                            sync_bytes_total: sp.bytes_total,
+                            sync_rate_bps: 0,
+                            eta_s: 0.0,
+                            elapsed_s: 0.0,
+                            gpu_mem_mb: 0.0,
+                            stage: String::new(),
+                        },
+                    ),
+                ));
             }
             "training" => {
                 if run.status != "running" {
@@ -3085,24 +3390,26 @@ pub async fn ml_studio_generic_train_status(
                 crate::ml_studio::train_recognition::clear_recog_sync(&payload.run_id);
             }
             _ => {
-                return Ok(MessageBody::MlStudioBody(MlStudioPayload::GenericTrainStatusResponse(
-                    tentaflow_protocol::MlStudioGenericTrainStatusResponse {
-                        run_id: payload.run_id.clone(),
-                        status: "syncing".to_string(),
-                        epoch: 0,
-                        total_epochs: generic_total_epochs(&run.config_json),
-                        curve: Vec::new(),
-                        error: String::new(),
-                        sync_phase: Some(sp.phase.clone()),
-                        sync_bytes_sent: sp.bytes_sent,
-                        sync_bytes_total: sp.bytes_total,
-                        sync_rate_bps: sp.rate_bps,
-                        eta_s: 0.0,
-                        elapsed_s: 0.0,
-                        gpu_mem_mb: 0.0,
-                        stage: String::new(),
-                    },
-                )));
+                return Ok(MessageBody::MlStudioBody(
+                    MlStudioPayload::GenericTrainStatusResponse(
+                        tentaflow_protocol::MlStudioGenericTrainStatusResponse {
+                            run_id: payload.run_id.clone(),
+                            status: "syncing".to_string(),
+                            epoch: 0,
+                            total_epochs: generic_total_epochs(&run.config_json),
+                            curve: Vec::new(),
+                            error: String::new(),
+                            sync_phase: Some(sp.phase.clone()),
+                            sync_bytes_sent: sp.bytes_sent,
+                            sync_bytes_total: sp.bytes_total,
+                            sync_rate_bps: sp.rate_bps,
+                            eta_s: 0.0,
+                            elapsed_s: 0.0,
+                            gpu_mem_mb: 0.0,
+                            stage: String::new(),
+                        },
+                    ),
+                ));
             }
         }
     }
@@ -3155,14 +3462,21 @@ pub async fn ml_studio_generic_train_status(
     let curve_raw = repository::generic_curve_for_run(&payload.run_id).map_err(db_err)?;
     let curve: Vec<tentaflow_protocol::GenericMetricPoint> = curve_raw
         .iter()
-        .map(|(epoch, name, value)| tentaflow_protocol::GenericMetricPoint {
-            epoch: (*epoch).max(0) as i32,
-            metric_name: name.clone(),
-            value: *value as f32,
-        })
+        .map(
+            |(epoch, name, value)| tentaflow_protocol::GenericMetricPoint {
+                epoch: (*epoch).max(0) as i32,
+                metric_name: name.clone(),
+                value: *value as f32,
+            },
+        )
         .collect();
 
-    let epoch = curve_raw.iter().map(|(e, _, _)| *e).max().unwrap_or(0).max(0) as i32;
+    let epoch = curve_raw
+        .iter()
+        .map(|(e, _, _)| *e)
+        .max()
+        .unwrap_or(0)
+        .max(0) as i32;
     let total_epochs = generic_total_epochs(&run.config_json);
     // Błąd treningu (np. z węzła B) zapisany w config_json.$.error — zwróć go do UI.
     let run_error = serde_json::from_str::<serde_json::Value>(&run.config_json)
@@ -3174,24 +3488,26 @@ pub async fn ml_studio_generic_train_status(
     // Live-view z serwisu (tylko lokalny job ma wpis; zdalny/sprzątnięty = default).
     let lv = crate::ml_studio::live_view::fetch_local_live_view(&payload.run_id).await;
 
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::GenericTrainStatusResponse(
-        tentaflow_protocol::MlStudioGenericTrainStatusResponse {
-            run_id: payload.run_id.clone(),
-            status: run.status,
-            epoch,
-            total_epochs,
-            curve,
-            error: run_error,
-            sync_phase: None,
-            sync_bytes_sent: 0,
-            sync_bytes_total: 0,
-            sync_rate_bps: 0,
-            eta_s: lv.eta_s,
-            elapsed_s: lv.elapsed_s,
-            gpu_mem_mb: lv.gpu_mem_mb,
-            stage: lv.stage,
-        },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::GenericTrainStatusResponse(
+            tentaflow_protocol::MlStudioGenericTrainStatusResponse {
+                run_id: payload.run_id.clone(),
+                status: run.status,
+                epoch,
+                total_epochs,
+                curve,
+                error: run_error,
+                sync_phase: None,
+                sync_bytes_sent: 0,
+                sync_bytes_total: 0,
+                sync_rate_bps: 0,
+                eta_s: lv.eta_s,
+                elapsed_s: lv.elapsed_s,
+                gpu_mem_mb: lv.gpu_mem_mb,
+                stage: lv.stage,
+            },
+        ),
+    ))
 }
 
 /// Synchronizuje status zdalnego runu klasyfikatora (z Node B) do bazy A: zapisuje
@@ -3205,7 +3521,10 @@ fn sync_remote_classifier_status(
         Ok(v) => v,
         Err(_) => return,
     };
-    let status = st.get("status").and_then(|v| v.as_str()).unwrap_or("running");
+    let status = st
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("running");
     let epoch = st.get("epoch").and_then(|v| v.as_i64()).unwrap_or(0);
     let train_loss = st.get("train_loss").and_then(|v| v.as_f64());
     let val_acc = st.get("val_acc").and_then(|v| v.as_f64());
@@ -3225,8 +3544,14 @@ fn sync_remote_classifier_status(
             let cfg: serde_json::Value =
                 serde_json::from_str(&run.config_json).unwrap_or(serde_json::json!({}));
             let attribute = cfg.get("attribute").and_then(|v| v.as_str()).unwrap_or("");
-            let source_class = cfg.get("source_class").and_then(|v| v.as_str()).unwrap_or("");
-            let variant = cfg.get("variant").and_then(|v| v.as_str()).unwrap_or("mobilenetv4");
+            let source_class = cfg
+                .get("source_class")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let variant = cfg
+                .get("variant")
+                .and_then(|v| v.as_str())
+                .unwrap_or("mobilenetv4");
             let values = cfg.get("values").cloned().unwrap_or(serde_json::json!([]));
             let metrics_json = serde_json::json!({
                 "task": "classifier",
@@ -3252,7 +3577,11 @@ fn sync_remote_classifier_status(
             let _ = repository::update_training_run_status(run_id, "succeeded");
         }
         "failed" => {
-            if let Some(err) = st.get("error").and_then(|v| v.as_str()).filter(|e| !e.is_empty()) {
+            if let Some(err) = st
+                .get("error")
+                .and_then(|v| v.as_str())
+                .filter(|e| !e.is_empty())
+            {
                 let _ = repository::set_training_run_error(run_id, err);
             }
             let _ = repository::update_training_run_status(run_id, "failed");
@@ -3286,7 +3615,9 @@ fn resolve_recog_dataset_dir(
         ));
     }
     let raw = repository::get_dataset_raw(owner_user_id, dataset_id).map_err(db_err)?;
-    Ok(std::path::PathBuf::from(String::from_utf8_lossy(&raw).trim().to_string()))
+    Ok(std::path::PathBuf::from(
+        String::from_utf8_lossy(&raw).trim().to_string(),
+    ))
 }
 
 #[handler(variant = "MlStudioRecogImagesListRequest", since = (1, 0))]
@@ -3298,18 +3629,24 @@ pub fn ml_studio_recog_images_list(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::RecogImagesListRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioRecogImagesListRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioRecogImagesListRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let dir = resolve_recog_dataset_dir(&org.user_id, &payload.dataset_id)?;
     let (images_json, categories_json) = crate::ml_studio::coco_annotate::list_images(&dir)
         .map_err(|e| ProtocolError::bad_request(format!("lista obrazów: {}", e)))?;
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogImagesListResponse(
-        tentaflow_protocol::MlStudioRecogImagesListResponse {
-            images_json,
-            categories_json,
-        },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::RecogImagesListResponse(
+            tentaflow_protocol::MlStudioRecogImagesListResponse {
+                images_json,
+                categories_json,
+            },
+        ),
+    ))
 }
 
 #[handler(variant = "MlStudioRecogImageRequest", since = (1, 0))]
@@ -3321,13 +3658,17 @@ pub fn ml_studio_recog_image(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::RecogImageRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioRecogImageRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioRecogImageRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let dir = resolve_recog_dataset_dir(&org.user_id, &payload.dataset_id)?;
     match crate::ml_studio::coco_annotate::get_image(&dir, &payload.image_id) {
-        Ok((image_b64, mime, orig_width, orig_height, annotations_json)) => {
-            Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogImageResponse(
+        Ok((image_b64, mime, orig_width, orig_height, annotations_json)) => Ok(
+            MessageBody::MlStudioBody(MlStudioPayload::RecogImageResponse(
                 tentaflow_protocol::MlStudioRecogImageResponse {
                     image_b64,
                     mime,
@@ -3336,18 +3677,18 @@ pub fn ml_studio_recog_image(
                     annotations_json,
                     error: None,
                 },
-            )))
-        }
-        Err(e) => Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogImageResponse(
-            tentaflow_protocol::MlStudioRecogImageResponse {
+            )),
+        ),
+        Err(e) => Ok(MessageBody::MlStudioBody(
+            MlStudioPayload::RecogImageResponse(tentaflow_protocol::MlStudioRecogImageResponse {
                 image_b64: String::new(),
                 mime: String::new(),
                 orig_width: 0,
                 orig_height: 0,
                 annotations_json: "[]".to_string(),
                 error: Some(e.to_string()),
-            },
-        ))),
+            }),
+        )),
     }
 }
 
@@ -3360,7 +3701,11 @@ pub fn ml_studio_recog_save_annotations(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::RecogSaveAnnotationsRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioRecogSaveAnnotationsRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioRecogSaveAnnotationsRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let dir = resolve_recog_dataset_dir(&org.user_id, &payload.dataset_id)?;
@@ -3373,9 +3718,11 @@ pub fn ml_studio_recog_save_annotations(
         Ok(()) => (true, None),
         Err(e) => (false, Some(e.to_string())),
     };
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogSaveAnnotationsResponse(
-        tentaflow_protocol::MlStudioRecogSaveAnnotationsResponse { ok, error },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::RecogSaveAnnotationsResponse(
+            tentaflow_protocol::MlStudioRecogSaveAnnotationsResponse { ok, error },
+        ),
+    ))
 }
 
 #[handler(variant = "MlStudioRecogAutolabelRequest", since = (1, 0))]
@@ -3387,7 +3734,11 @@ pub fn ml_studio_recog_autolabel_dataset(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::RecogAutolabelRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioRecogAutolabelRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioRecogAutolabelRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     // resolve_recog_dataset_dir already checks coco_path kind + project membership.
@@ -3410,20 +3761,24 @@ pub fn ml_studio_recog_autolabel_dataset(
         payload.threshold,
         payload.mode.clone(),
     ) {
-        Ok(job_id) => Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogAutolabelResponse(
-            tentaflow_protocol::MlStudioRecogAutolabelResponse {
-                job_id,
-                status: "running".to_string(),
-                error: None,
-            },
-        ))),
-        Err(e) => Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogAutolabelResponse(
-            tentaflow_protocol::MlStudioRecogAutolabelResponse {
-                job_id: String::new(),
-                status: "failed".to_string(),
-                error: Some(e.to_string()),
-            },
-        ))),
+        Ok(job_id) => Ok(MessageBody::MlStudioBody(
+            MlStudioPayload::RecogAutolabelResponse(
+                tentaflow_protocol::MlStudioRecogAutolabelResponse {
+                    job_id,
+                    status: "running".to_string(),
+                    error: None,
+                },
+            ),
+        )),
+        Err(e) => Ok(MessageBody::MlStudioBody(
+            MlStudioPayload::RecogAutolabelResponse(
+                tentaflow_protocol::MlStudioRecogAutolabelResponse {
+                    job_id: String::new(),
+                    status: "failed".to_string(),
+                    error: Some(e.to_string()),
+                },
+            ),
+        )),
     }
 }
 
@@ -3436,7 +3791,11 @@ pub fn ml_studio_recog_autolabel_status(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::RecogAutolabelStatusRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioRecogAutolabelStatusRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioRecogAutolabelStatusRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
 
@@ -3447,20 +3806,25 @@ pub fn ml_studio_recog_autolabel_status(
     // project the job belongs to (mirrors how the start handler authorizes via the
     // dataset's project). Unknown project => NotFound, so job existence is not leaked.
     if prog.project_id.is_empty() {
-        return Err(ProtocolError::new(ProtocolErrorCode::NotFound, "job not found"));
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::NotFound,
+            "job not found",
+        ));
     }
     require_project_member(&org.user_id, &prog.project_id)?;
 
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogAutolabelStatusResponse(
-        tentaflow_protocol::MlStudioRecogAutolabelStatusResponse {
-            status: prog.status,
-            images_total: prog.images_total,
-            images_done: prog.images_done,
-            detections: prog.detections,
-            skipped_unknown: prog.skipped_unknown,
-            error: prog.error,
-        },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::RecogAutolabelStatusResponse(
+            tentaflow_protocol::MlStudioRecogAutolabelStatusResponse {
+                status: prog.status,
+                images_total: prog.images_total,
+                images_done: prog.images_done,
+                detections: prog.detections,
+                skipped_unknown: prog.skipped_unknown,
+                error: prog.error,
+            },
+        ),
+    ))
 }
 
 /// Synchronizuje status zdalnego treningu recognition (z Node B) do bazy A:
@@ -3476,7 +3840,10 @@ fn sync_remote_recog_status(
         Ok(v) => v,
         Err(_) => return,
     };
-    let status = st.get("status").and_then(|v| v.as_str()).unwrap_or("running");
+    let status = st
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("running");
     let epoch = st.get("epoch").and_then(|v| v.as_i64()).unwrap_or(0);
     let train_loss = st.get("train_loss").and_then(|v| v.as_f64());
     let map50 = st.get("map50").and_then(|v| v.as_f64());
@@ -3492,9 +3859,15 @@ fn sync_remote_recog_status(
         "succeeded" => {
             let cfg: serde_json::Value =
                 serde_json::from_str(&run.config_json).unwrap_or(serde_json::json!({}));
-            let variant = cfg.get("variant").and_then(|v| v.as_str()).unwrap_or("base");
+            let variant = cfg
+                .get("variant")
+                .and_then(|v| v.as_str())
+                .unwrap_or("base");
             let node = cfg.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
-            let checkpoint = st.get("artifact_path").and_then(|v| v.as_str()).unwrap_or("");
+            let checkpoint = st
+                .get("artifact_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             // class_names z datasetu projektu (do późniejszej detekcji).
             let class_names: Vec<String> = cfg
                 .get("dataset_id")
@@ -3502,7 +3875,11 @@ fn sync_remote_recog_status(
                 .and_then(|did| repository::get_dataset(owner_user_id, did).ok().flatten())
                 .and_then(|d| serde_json::from_str::<serde_json::Value>(&d.profile_json).ok())
                 .and_then(|p| p.get("classes")?.as_array().cloned())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             let metrics_json = serde_json::json!({
                 "train_loss": train_loss,
@@ -3528,7 +3905,11 @@ fn sync_remote_recog_status(
             let _ = repository::update_training_run_status(run_id, "succeeded");
         }
         "failed" => {
-            if let Some(err) = st.get("error").and_then(|v| v.as_str()).filter(|e| !e.is_empty()) {
+            if let Some(err) = st
+                .get("error")
+                .and_then(|v| v.as_str())
+                .filter(|e| !e.is_empty())
+            {
                 let _ = repository::set_training_run_error(run_id, err);
             }
             let _ = repository::update_training_run_status(run_id, "failed");
@@ -3555,7 +3936,11 @@ pub async fn ml_studio_recog_detect(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::RecogDetectRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioRecogDetectRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioRecogDetectRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let model = repository::get_model(&payload.model_id)
@@ -3579,7 +3964,11 @@ pub async fn ml_studio_recog_detect(
     let class_names: Vec<String> = metrics
         .get("class_names")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     if class_names.is_empty() {
         return Err(ProtocolError::bad_request("model bez class_names"));
@@ -3597,30 +3986,34 @@ pub async fn ml_studio_recog_detect(
         .filter(|s| !s.is_empty() && *s != local_node)
         .map(str::to_string);
 
-    let (detections_json, width, height, error) = match model_node {
-        Some(node) => {
-            let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
-                ProtocolError::internal("mesh transport not available on this node")
-            })?;
-            // Fail-closed: brak mesh_security = nie weryfikujemy zaufania → odmowa.
-            let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
-                ProtocolError::internal("mesh security niedostępny — nie można zweryfikować zaufania peera")
-            })?;
-            if !security.is_trusted(&node) {
-                return Err(ProtocolError::bad_request(format!(
-                    "peer {} is not trusted",
-                    node
-                )));
-            }
-            let class_names_json = serde_json::to_string(&class_names).unwrap_or_else(|_| "[]".into());
-            let cmd = tentaflow_protocol::mesh::MeshCommandType::MlDetect {
-                checkpoint_path: checkpoint,
-                class_names_json,
-                variant,
-                threshold: payload.threshold,
-                image_b64: payload.image_b64.clone(),
-            };
-            match iroh.send_command_and_wait(&node, cmd, 120).await {
+    let (detections_json, width, height, error) =
+        match model_node {
+            Some(node) => {
+                let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
+                    ProtocolError::internal("mesh transport not available on this node")
+                })?;
+                // Fail-closed: brak mesh_security = nie weryfikujemy zaufania → odmowa.
+                let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
+                    ProtocolError::internal(
+                        "mesh security niedostępny — nie można zweryfikować zaufania peera",
+                    )
+                })?;
+                if !security.is_trusted(&node) {
+                    return Err(ProtocolError::bad_request(format!(
+                        "peer {} is not trusted",
+                        node
+                    )));
+                }
+                let class_names_json =
+                    serde_json::to_string(&class_names).unwrap_or_else(|_| "[]".into());
+                let cmd = tentaflow_protocol::mesh::MeshCommandType::MlDetect {
+                    checkpoint_path: checkpoint,
+                    class_names_json,
+                    variant,
+                    threshold: payload.threshold,
+                    image_b64: payload.image_b64.clone(),
+                };
+                match iroh.send_command_and_wait(&node, cmd, 120).await {
                 Ok(resp) => {
                     if let tentaflow_protocol::mesh::MeshCommandResponsePayload::MlDetectResult {
                         detections_json,
@@ -3638,31 +4031,31 @@ pub async fn ml_studio_recog_detect(
                 }
                 Err(e) => ("[]".to_string(), 0, 0, Some(format!("mesh detect: {}", e))),
             }
-        }
-        None => {
-            let outcome = crate::ml_studio::train_recognition::run_detect(
-                checkpoint,
-                class_names,
-                variant,
-                payload.threshold,
-                payload.image_b64.clone(),
-            )
-            .await;
-            match outcome {
-                Ok((dj, w, h)) => (dj, w, h, None),
-                Err(e) => ("[]".to_string(), 0, 0, Some(e.to_string())),
             }
-        }
-    };
+            None => {
+                let outcome = crate::ml_studio::train_recognition::run_detect(
+                    checkpoint,
+                    class_names,
+                    variant,
+                    payload.threshold,
+                    payload.image_b64.clone(),
+                )
+                .await;
+                match outcome {
+                    Ok((dj, w, h)) => (dj, w, h, None),
+                    Err(e) => ("[]".to_string(), 0, 0, Some(e.to_string())),
+                }
+            }
+        };
 
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogDetectResponse(
-        tentaflow_protocol::MlStudioRecogDetectResponse {
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::RecogDetectResponse(tentaflow_protocol::MlStudioRecogDetectResponse {
             detections_json,
             width,
             height,
             error,
-        },
-    )))
+        }),
+    ))
 }
 
 #[handler(variant = "MlStudioFtExportRequest", since = (1, 0))]
@@ -3674,7 +4067,11 @@ pub fn ml_studio_ft_export_start(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::FtExportRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioFtExportRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioFtExportRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let model = repository::get_model(&payload.model_id)
@@ -3724,14 +4121,20 @@ pub fn ml_studio_ft_export_start(
             })?;
             // Fail-closed: brak mesh_security = nie weryfikujemy zaufania → odmowa.
             let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
-                ProtocolError::internal("mesh security niedostępny — nie można zweryfikować zaufania peera")
+                ProtocolError::internal(
+                    "mesh security niedostępny — nie można zweryfikować zaufania peera",
+                )
             })?;
             if !security.is_trusted(&node) {
-                return Err(ProtocolError::bad_request(format!("peer {} is not trusted", node)));
+                return Err(ProtocolError::bad_request(format!(
+                    "peer {} is not trusted",
+                    node
+                )));
             }
             // Preflight OK → dopiero teraz oznacz `running` i odpal task.
             let running_metrics = set_export_status_running(&metrics);
-            repository::update_model_metrics(&payload.model_id, &running_metrics).map_err(db_err)?;
+            repository::update_model_metrics(&payload.model_id, &running_metrics)
+                .map_err(db_err)?;
             crate::ml_studio::export_llm::spawn_ft_export_mesh(
                 iroh,
                 node,
@@ -3744,7 +4147,8 @@ pub fn ml_studio_ft_export_start(
         }
         None => {
             let running_metrics = set_export_status_running(&metrics);
-            repository::update_model_metrics(&payload.model_id, &running_metrics).map_err(db_err)?;
+            repository::update_model_metrics(&payload.model_id, &running_metrics)
+                .map_err(db_err)?;
             crate::ml_studio::export_llm::spawn_ft_export(
                 payload.model_id.clone(),
                 model.base_model.clone(),
@@ -3755,12 +4159,12 @@ pub fn ml_studio_ft_export_start(
         }
     }
 
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::FtExportResponse(
-        tentaflow_protocol::MlStudioFtExportResponse {
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::FtExportResponse(tentaflow_protocol::MlStudioFtExportResponse {
             model_id: payload.model_id.clone(),
             status: "running".to_string(),
-        },
-    )))
+        }),
+    ))
 }
 
 #[handler(variant = "MlStudioFtExportStatusRequest", since = (1, 0))]
@@ -3772,7 +4176,11 @@ pub fn ml_studio_ft_export_status(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::FtExportStatusRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioFtExportStatusRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioFtExportStatusRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let model = repository::get_model(&payload.model_id)
@@ -3797,15 +4205,17 @@ pub fn ml_studio_ft_export_status(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::FtExportStatusResponse(
-        tentaflow_protocol::MlStudioFtExportStatusResponse {
-            model_id: payload.model_id.clone(),
-            status,
-            gguf_path,
-            size_bytes,
-            error,
-        },
-    )))
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::FtExportStatusResponse(
+            tentaflow_protocol::MlStudioFtExportStatusResponse {
+                model_id: payload.model_id.clone(),
+                status,
+                gguf_path,
+                size_bytes,
+                error,
+            },
+        ),
+    ))
 }
 
 /// Po zaakceptowanym deployu (`service_manifest_deploy` Ok) serwis inferencji
@@ -3824,23 +4234,25 @@ async fn resolve_inference_deploy_status(
             tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         }
         let row = ctx.state.db.read().ok().and_then(|conn| {
-            crate::services_repo::services::list_all(&conn).ok().and_then(|rows| {
-                rows.into_iter().find(|r| {
-                    // Match po SPARSOWANYM polu `model_file` (nie substring na surowym
-                    // JSON): na Windows ścieżki mają `\`, które w JSON są escapowane
-                    // (`C:\\...`), więc `contains` na surowcu chybia poprawny serwis.
-                    r.engine_id == engine_id
-                        && serde_json::from_str::<serde_json::Value>(&r.config_json)
-                            .ok()
-                            .and_then(|c| {
-                                c.get("model_file")
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_string)
-                            })
-                            .as_deref()
-                            == Some(model_file)
+            crate::services_repo::services::list_all(&conn)
+                .ok()
+                .and_then(|rows| {
+                    rows.into_iter().find(|r| {
+                        // Match po SPARSOWANYM polu `model_file` (nie substring na surowym
+                        // JSON): na Windows ścieżki mają `\`, które w JSON są escapowane
+                        // (`C:\\...`), więc `contains` na surowcu chybia poprawny serwis.
+                        r.engine_id == engine_id
+                            && serde_json::from_str::<serde_json::Value>(&r.config_json)
+                                .ok()
+                                .and_then(|c| {
+                                    c.get("model_file")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string)
+                                })
+                                .as_deref()
+                                == Some(model_file)
+                    })
                 })
-            })
         });
         match row.map(|r| (r.status, r.health_last_err)) {
             Some((ServiceStatus::Running, _)) => return ("deployed".to_string(), None),
@@ -3874,7 +4286,11 @@ pub async fn ml_studio_ft_deploy(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::FtDeployRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected MlStudioFtDeployRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioFtDeployRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let model = repository::get_model(&payload.model_id)
@@ -3935,11 +4351,16 @@ pub async fn ml_studio_ft_deploy(
     // Bez `mesh_security` odmawiamy (service_manifest_deploy pomija check gdy None).
     if artifact_node != local_node || deploy_node != local_node {
         let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
-            ProtocolError::internal("mesh security niedostępny — nie można zweryfikować zaufania peera")
+            ProtocolError::internal(
+                "mesh security niedostępny — nie można zweryfikować zaufania peera",
+            )
         })?;
         for node in [&artifact_node, &deploy_node] {
             if *node != local_node && !security.is_trusted(node) {
-                return Err(ProtocolError::bad_request(format!("peer {} is not trusted", node)));
+                return Err(ProtocolError::bad_request(format!(
+                    "peer {} is not trusted",
+                    node
+                )));
             }
         }
     }
@@ -3966,23 +4387,33 @@ pub async fn ml_studio_ft_deploy(
             let resp = iroh
                 .send_command_and_wait(&artifact_node, cmd, 600)
                 .await
-                .map_err(|e| ProtocolError::internal(format!("zlecenie transferu artefaktu: {}", e)))?;
+                .map_err(|e| {
+                    ProtocolError::internal(format!("zlecenie transferu artefaktu: {}", e))
+                })?;
             match resp.payload {
                 tentaflow_protocol::mesh::MeshCommandResponsePayload::MlArtifactPushResult {
                     target_path,
                     error,
                 } => {
                     if let Some(err) = error {
-                        return Err(ProtocolError::internal(format!("transfer artefaktu: {}", err)));
+                        return Err(ProtocolError::internal(format!(
+                            "transfer artefaktu: {}",
+                            err
+                        )));
                     }
                     target_path
                 }
                 _ if !resp.ok => {
                     return Err(ProtocolError::internal(
-                        resp.error.unwrap_or_else(|| "transfer artefaktu nieudany".into()),
+                        resp.error
+                            .unwrap_or_else(|| "transfer artefaktu nieudany".into()),
                     ))
                 }
-                _ => return Err(ProtocolError::internal("nieoczekiwana odpowiedź transferu artefaktu")),
+                _ => {
+                    return Err(ProtocolError::internal(
+                        "nieoczekiwana odpowiedź transferu artefaktu",
+                    ))
+                }
             }
         };
         let config_json = serde_json::json!({
@@ -3998,7 +4429,9 @@ pub async fn ml_studio_ft_deploy(
             config_json,
         };
         let (status, error) = match super::handlers::service_manifest_deploy(
-            &MessageBody::DeploymentBody(tentaflow_protocol::DeploymentPayload::ReqStart(deploy_req)),
+            &MessageBody::DeploymentBody(tentaflow_protocol::DeploymentPayload::ReqStart(
+                deploy_req,
+            )),
             ctx,
         )
         .await
@@ -4012,28 +4445,31 @@ pub async fn ml_studio_ft_deploy(
         };
         let mut merged = metrics.clone();
         if let Some(obj) = merged.as_object_mut() {
-            obj.insert("inference_model_name".to_string(), serde_json::json!(model_name));
+            obj.insert(
+                "inference_model_name".to_string(),
+                serde_json::json!(model_name),
+            );
             // RZECZYWISTA ścieżka serwowana (po ew. transferze z węzła zdalnego) —
             // rekoncyliacja matchuje serwis po niej, bo `gguf_path` może wskazywać
             // oryginalną (zdalną) lokalizację artefaktu, nie plik faktycznie ładowany.
-            obj.insert("inference_model_file".to_string(), serde_json::json!(deploy_path));
             obj.insert(
-                "inference_status".to_string(),
-                serde_json::json!(status),
+                "inference_model_file".to_string(),
+                serde_json::json!(deploy_path),
             );
+            obj.insert("inference_status".to_string(), serde_json::json!(status));
             if status == "deployed" {
                 obj.insert("inference_node".to_string(), serde_json::json!(deploy_node));
             }
         }
         repository::update_model_metrics(&payload.model_id, &merged.to_string()).map_err(db_err)?;
-        return Ok(MessageBody::MlStudioBody(MlStudioPayload::FtDeployResponse(
-            tentaflow_protocol::MlStudioFtDeployResponse {
+        return Ok(MessageBody::MlStudioBody(
+            MlStudioPayload::FtDeployResponse(tentaflow_protocol::MlStudioFtDeployResponse {
                 model_id: payload.model_id.clone(),
                 model_name,
                 status,
                 error,
-            },
-        )));
+            }),
+        ));
     }
 
     // DEPLOY ZDALNY (węzeł docelowy ≠ ten węzeł): transfer artefaktu może iść
@@ -4060,15 +4496,22 @@ pub async fn ml_studio_ft_deploy(
     // jest BAZĄ dla wszystkich późniejszych zapisów w tle (zachowuje alias/węzeł).
     let mut deploy_state = metrics.clone();
     if let Some(obj) = deploy_state.as_object_mut() {
-        obj.insert("inference_model_name".to_string(), serde_json::json!(model_name));
+        obj.insert(
+            "inference_model_name".to_string(),
+            serde_json::json!(model_name),
+        );
         obj.insert("inference_node".to_string(), serde_json::json!(deploy_node));
-        obj.insert("inference_status".to_string(), serde_json::json!("transferring"));
+        obj.insert(
+            "inference_status".to_string(),
+            serde_json::json!("transferring"),
+        );
         obj.remove("inference_error");
         obj.insert("inference_transfer_total".to_string(), serde_json::json!(0));
         obj.insert("inference_transfer_sent".to_string(), serde_json::json!(0));
         obj.insert("inference_transfer_rate".to_string(), serde_json::json!(0));
     }
-    repository::update_model_metrics(&payload.model_id, &deploy_state.to_string()).map_err(db_err)?;
+    repository::update_model_metrics(&payload.model_id, &deploy_state.to_string())
+        .map_err(db_err)?;
 
     let model_id = payload.model_id.clone();
     let model_name_bg = model_name.clone();
@@ -4087,14 +4530,14 @@ pub async fn ml_studio_ft_deploy(
         .await;
     });
 
-    Ok(MessageBody::MlStudioBody(MlStudioPayload::FtDeployResponse(
-        tentaflow_protocol::MlStudioFtDeployResponse {
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::FtDeployResponse(tentaflow_protocol::MlStudioFtDeployResponse {
             model_id: payload.model_id.clone(),
             model_name,
             status: "deploying".to_string(),
             error: None,
-        },
-    )))
+        }),
+    ))
 }
 
 /// Read-modify-write metryk modelu: czyta ŚWIEŻY `metrics_json` z DB, aplikuje
@@ -4172,23 +4615,40 @@ async fn run_remote_deploy(
             while !stop_t.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Some(p) = mesh_artifact::artifact_progress(&prog_id) {
                     update_inference_metrics(&prog_id, |obj| {
-                        obj.insert("inference_status".to_string(), serde_json::json!("transferring"));
-                        obj.insert("inference_transfer_total".to_string(), serde_json::json!(p.bytes_total));
-                        obj.insert("inference_transfer_sent".to_string(), serde_json::json!(p.bytes_sent));
-                        obj.insert("inference_transfer_rate".to_string(), serde_json::json!(p.rate_bps));
+                        obj.insert(
+                            "inference_status".to_string(),
+                            serde_json::json!("transferring"),
+                        );
+                        obj.insert(
+                            "inference_transfer_total".to_string(),
+                            serde_json::json!(p.bytes_total),
+                        );
+                        obj.insert(
+                            "inference_transfer_sent".to_string(),
+                            serde_json::json!(p.bytes_sent),
+                        );
+                        obj.insert(
+                            "inference_transfer_rate".to_string(),
+                            serde_json::json!(p.rate_bps),
+                        );
                     });
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
             }
         });
-        let res = mesh_artifact::push_dir_to(&iroh, &deploy_node, &gguf_path, Some(&model_id)).await;
+        let res =
+            mesh_artifact::push_dir_to(&iroh, &deploy_node, &gguf_path, Some(&model_id)).await;
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         ticker.abort();
         mesh_artifact::clear_artifact_progress(&model_id);
         match res {
             Ok(p) => p,
             Err(e) => {
-                set_inference_status(&model_id, "failed", Some(&format!("transfer artefaktu: {}", e)));
+                set_inference_status(
+                    &model_id,
+                    "failed",
+                    Some(&format!("transfer artefaktu: {}", e)),
+                );
                 return;
             }
         }
@@ -4198,14 +4658,21 @@ async fn run_remote_deploy(
             src_path: gguf_path.clone(),
             target_node_id: deploy_node.clone(),
         };
-        match iroh.send_command_and_wait(&artifact_node, cmd, PEER_WAIT_BACKSTOP_SECS).await {
+        match iroh
+            .send_command_and_wait(&artifact_node, cmd, PEER_WAIT_BACKSTOP_SECS)
+            .await
+        {
             Ok(resp) => match resp.payload {
                 tentaflow_protocol::mesh::MeshCommandResponsePayload::MlArtifactPushResult {
                     target_path,
                     error,
                 } => {
                     if let Some(err) = error {
-                        set_inference_status(&model_id, "failed", Some(&format!("transfer B→C: {}", err)));
+                        set_inference_status(
+                            &model_id,
+                            "failed",
+                            Some(&format!("transfer B→C: {}", err)),
+                        );
                         return;
                     }
                     target_path
@@ -4217,7 +4684,11 @@ async fn run_remote_deploy(
                 }
             },
             Err(e) => {
-                set_inference_status(&model_id, "failed", Some(&format!("zlecenie transferu B→C: {}", e)));
+                set_inference_status(
+                    &model_id,
+                    "failed",
+                    Some(&format!("zlecenie transferu B→C: {}", e)),
+                );
                 return;
             }
         }
@@ -4244,7 +4715,9 @@ async fn run_remote_deploy(
             // JAWNY błąd z węzła docelowego (resp.ok=false): deploy realnie padł —
             // NIE udajemy sukcesu, bo UI pokazałoby „Zapytaj" do nieistniejącego
             // serwisu. Cofamy alias i raportujemy błąd.
-            let msg = resp.error.unwrap_or_else(|| "zdalny deploy zgłosił błąd".into());
+            let msg = resp
+                .error
+                .unwrap_or_else(|| "zdalny deploy zgłosił błąd".into());
             tracing::warn!(model_id = %model_id, err = %msg, "remote deploy: węzeł docelowy zgłosił błąd");
             set_inference_status(&model_id, "failed", Some(&msg));
         }
@@ -4308,24 +4781,30 @@ pub async fn ml_studio_ft_chat(
         .filter(|s| !s.is_empty() && *s != local_node)
         .map(str::to_string);
 
-    let (answer, error) = match model_node {
-        Some(node) => {
-            let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
-                ProtocolError::internal("mesh transport not available on this node")
-            })?;
-            // Fail-closed: brak mesh_security = brak weryfikacji zaufania → odmowa.
-            let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
-                ProtocolError::internal("mesh security niedostępny — nie można zweryfikować zaufania peera")
-            })?;
-            if !security.is_trusted(&node) {
-                return Err(ProtocolError::bad_request(format!("peer {} is not trusted", node)));
-            }
-            let cmd = tentaflow_protocol::mesh::MeshCommandType::MlChat {
-                model_name: model_name.clone(),
-                message: payload.message.clone(),
-                max_tokens,
-            };
-            match iroh.send_command_and_wait(&node, cmd, 120).await {
+    let (answer, error) =
+        match model_node {
+            Some(node) => {
+                let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
+                    ProtocolError::internal("mesh transport not available on this node")
+                })?;
+                // Fail-closed: brak mesh_security = brak weryfikacji zaufania → odmowa.
+                let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
+                    ProtocolError::internal(
+                        "mesh security niedostępny — nie można zweryfikować zaufania peera",
+                    )
+                })?;
+                if !security.is_trusted(&node) {
+                    return Err(ProtocolError::bad_request(format!(
+                        "peer {} is not trusted",
+                        node
+                    )));
+                }
+                let cmd = tentaflow_protocol::mesh::MeshCommandType::MlChat {
+                    model_name: model_name.clone(),
+                    message: payload.message.clone(),
+                    max_tokens,
+                };
+                match iroh.send_command_and_wait(&node, cmd, 120).await {
                 Ok(resp) => {
                     if let tentaflow_protocol::mesh::MeshCommandResponsePayload::MlChatResult {
                         answer,
@@ -4341,19 +4820,19 @@ pub async fn ml_studio_ft_chat(
                 }
                 Err(e) => (String::new(), Some(format!("mesh chat: {}", e))),
             }
-        }
-        None => match crate::ml_studio::infer::run_local_chat(
-            &ctx.state.router,
-            &model_name,
-            &payload.message,
-            max_tokens,
-        )
-        .await
-        {
-            Ok(answer) => (answer, None),
-            Err(e) => (String::new(), Some(e.to_string())),
-        },
-    };
+            }
+            None => match crate::ml_studio::infer::run_local_chat(
+                &ctx.state.router,
+                &model_name,
+                &payload.message,
+                max_tokens,
+            )
+            .await
+            {
+                Ok(answer) => (answer, None),
+                Err(e) => (String::new(), Some(e.to_string())),
+            },
+        };
 
     Ok(MessageBody::MlStudioBody(MlStudioPayload::FtChatResponse(
         tentaflow_protocol::MlStudioFtChatResponse { answer, error },
@@ -4427,9 +4906,7 @@ async fn locate_or_export_onnx(
             .get("checkpoint_path")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                "model bez checkpoint_path — trening nie zapisał artefaktu".to_string()
-            })?
+            .ok_or_else(|| "model bez checkpoint_path — trening nie zapisał artefaktu".to_string())?
             .to_string();
         let output_dir = format!("exports/vision-publish/{}", model.model_id);
         let exported = match model.framework.as_str() {
@@ -4524,7 +5001,10 @@ async fn locate_or_export_onnx(
         .map(|d| d.join("classes.json"))
         .ok_or_else(|| format!("{} nie ma katalogu nadrzędnego", onnx_path.display()))?;
     let sidecar_path = contained_artifact_file(&sidecar_candidate).map_err(|e| {
-        format!("brak classes.json obok {} — wyeksportuj model ponownie ({e})", onnx_path.display())
+        format!(
+            "brak classes.json obok {} — wyeksportuj model ponownie ({e})",
+            onnx_path.display()
+        )
     })?;
     let sidecar: OnnxSidecar = std::fs::read(&sidecar_path)
         .map_err(|e| format!("odczyt {}: {e}", sidecar_path.display()))
@@ -4572,11 +5052,7 @@ fn stage_into_vision_dir(
     let bytes = std::fs::read(src)?;
     let digest = Sha256::digest(&bytes);
     let sha256: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    let temp = dir.join(format!(
-        ".staging-{}-{}",
-        std::process::id(),
-        file_name
-    ));
+    let temp = dir.join(format!(".staging-{}-{}", std::process::id(), file_name));
     std::fs::write(&temp, &bytes)?;
     Ok((sha256, temp))
 }
@@ -4711,8 +5187,7 @@ pub async fn ml_studio_vision_model_publish(
         op: expected_op.to_string(),
         file_name: file_name.clone(),
         sha256,
-        classes_json: serde_json::to_string(&sidecar.classes)
-            .unwrap_or_else(|_| "[]".to_string()),
+        classes_json: serde_json::to_string(&sidecar.classes).unwrap_or_else(|_| "[]".to_string()),
         preprocess_json,
         output_contract: contract.to_string(),
         source: "trained".to_string(),
@@ -4735,10 +5210,7 @@ pub async fn ml_studio_vision_model_publish(
         // The row is committed but the file is not in place; the onnx-cv
         // reconciler skips file-less rows, so nothing broken is advertised.
         let _ = std::fs::remove_file(&temp_path);
-        return respond(
-            false,
-            Some(format!("promocja pliku ONNX nieudana: {e}")),
-        );
+        return respond(false, Some(format!("promocja pliku ONNX nieudana: {e}")));
     }
 
     if alias.is_some() {

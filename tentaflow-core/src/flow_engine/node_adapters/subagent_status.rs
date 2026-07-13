@@ -222,7 +222,14 @@ mod tests {
         let mgr = manager(pool.clone(), rx);
 
         let parent = mgr
-            .spawn("parent", "lead", None, &AgentPrincipal::user("u1"), &[], None)
+            .spawn(
+                "parent",
+                "lead",
+                None,
+                &AgentPrincipal::user("u1"),
+                &[],
+                None,
+            )
             .await
             .expect("parent");
         let caller = CallerRun {

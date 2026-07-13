@@ -60,7 +60,8 @@ impl EmotionClassifier for HsemotionEngine {
             .context("HSEmotion: tract forward failed")?;
 
         let logits = outputs[0]
-            .view().as_slice::<f32>()
+            .view()
+            .as_slice::<f32>()
             .context("HSEmotion: output nie jest f32")?;
         if logits.len() < EMOTION_LABELS.len() {
             return Err(anyhow!(
@@ -125,7 +126,5 @@ pub fn load(model_path: &Path) -> Result<HsemotionEngine> {
         )?
         .into_optimized()?
         .into_runnable()?;
-    Ok(HsemotionEngine {
-        model,
-    })
+    Ok(HsemotionEngine { model })
 }

@@ -1746,7 +1746,10 @@ impl<'a> Installer<'a> {
     /// Jak wyzej, ale z `--no-deps` — buduje z torcha, lecz NIE instaluje grafu
     /// zaleznosci pakietu (dostarczamy je jawnie w `extras`).
     fn install_package_no_build_isolation_no_deps(&self, pkg: &str) -> Result<()> {
-        (self.log)(&format!("pip: install --no-build-isolation --no-deps {}", pkg));
+        (self.log)(&format!(
+            "pip: install --no-build-isolation --no-deps {}",
+            pkg
+        ));
         let mut c = self.cmd();
         c.arg("install");
         self.add_index(&mut c);

@@ -674,7 +674,10 @@ mod tests {
             SourceKind::Pdf
         );
         assert_eq!(classify_source("image/png", &[]), SourceKind::Image);
-        assert_eq!(classify_source("text/plain; charset=utf-8", &[]), SourceKind::Text);
+        assert_eq!(
+            classify_source("text/plain; charset=utf-8", &[]),
+            SourceKind::Text
+        );
         assert_eq!(classify_source("application/json", &[]), SourceKind::Text);
         assert_eq!(
             classify_source(
@@ -690,7 +693,10 @@ mod tests {
             ),
             SourceKind::Pptx
         );
-        assert_eq!(classify_source("application/x-tar", &[]), SourceKind::Unknown);
+        assert_eq!(
+            classify_source("application/x-tar", &[]),
+            SourceKind::Unknown
+        );
     }
 
     #[test]

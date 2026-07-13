@@ -59,9 +59,7 @@ impl ScrfdEngine {
             )?
             .into_optimized()?
             .into_runnable()?;
-        Ok(Self {
-            model,
-        })
+        Ok(Self { model })
     }
 }
 
@@ -188,11 +186,13 @@ impl FaceDetector for ScrfdEngine {
 
             let scores = score
                 .tensor
-                .view().as_slice::<f32>()
+                .view()
+                .as_slice::<f32>()
                 .context("SCRFD: score tensor nie jest f32")?;
             let bboxes = bbox
                 .tensor
-                .view().as_slice::<f32>()
+                .view()
+                .as_slice::<f32>()
                 .context("SCRFD: bbox tensor nie jest f32")?;
             let kps_slice = match kps {
                 Some(k) => k.tensor.view().as_slice::<f32>().ok(),

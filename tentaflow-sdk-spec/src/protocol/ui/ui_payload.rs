@@ -11,9 +11,7 @@ use minicbor::{Decode, Decoder, Encode, Encoder};
 use super::action::{Action, ActionAck};
 use super::command::Command;
 use super::event::Event;
-use super::panel::{
-    PanelClose, PanelError, PanelOpen, PanelReady, PanelReset, PanelShell,
-};
+use super::panel::{PanelClose, PanelError, PanelOpen, PanelReady, PanelReset, PanelShell};
 use super::slot_msg::{SlotClear, SlotContent, SlotHide, SlotShow};
 use super::state::{PatchRejected, StatePatch, StateReset, StateSnapshot};
 
@@ -162,13 +160,10 @@ impl<C> Encode<C> for UiPayload {
 }
 
 impl<'b, C> Decode<'b, C> for UiPayload {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let n = d.array()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length array forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let n = d
+            .array()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length array forbidden"))?;
         if n != 2 {
             return Err(minicbor::decode::Error::message(
                 "Envelope payload tuple MUST be [tag, body]",
@@ -292,13 +287,10 @@ fn encode_payload_body<W: minicbor::encode::Write, C>(
 }
 
 impl<'b, C> Decode<'b, C> for Batch {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut atomic: Option<bool> = None;
         let mut members: Option<Vec<BatchMember>> = None;
         for _ in 0..len {
@@ -317,9 +309,7 @@ impl<'b, C> Decode<'b, C> for Batch {
                     let mut v = Vec::with_capacity(n as usize);
                     for _ in 0..n {
                         let n2 = d.array()?.ok_or_else(|| {
-                            minicbor::decode::Error::message(
-                                "indefinite-length array forbidden",
-                            )
+                            minicbor::decode::Error::message("indefinite-length array forbidden")
                         })?;
                         if n2 != 2 {
                             return Err(minicbor::decode::Error::message(
@@ -393,13 +383,11 @@ fn decode_payload_body<'b, C>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::envelope::{
-        Channel, Envelope, Flags, Priority, ProtocolVersion,
-    };
+    use crate::protocol::control::CborMap;
+    use crate::protocol::envelope::{Channel, Envelope, Flags, Priority, ProtocolVersion};
     use crate::protocol::ids::SessionId;
     use crate::protocol::ui::action::{Action, ActionAck, ActionStatus};
     use crate::protocol::ui::panel::{PanelReady, PanelReset};
-    use crate::protocol::control::CborMap;
 
     fn envelope_with(payload: UiPayload) -> Envelope<UiPayload> {
         Envelope {
@@ -549,10 +537,10 @@ mod tests {
         use crate::protocol::ui::bind::{PathSegment, StatePath};
         use crate::protocol::ui::command::Command as Cmd;
         use crate::protocol::ui::component::{Component as Comp, FieldMap};
+        use crate::protocol::ui::error_code::ErrorCode;
         use crate::protocol::ui::event::{Event as Ev, Topic, TopicSegment};
         use crate::protocol::ui::panel::{
-            CloseReason, PanelClose, PanelError, PanelOpen, PanelOpenContext, PanelShell,
-            Viewport,
+            CloseReason, PanelClose, PanelError, PanelOpen, PanelOpenContext, PanelShell, Viewport,
         };
         use crate::protocol::ui::patch::{PatchOp, PatchOpKind};
         use crate::protocol::ui::slot::StateEntry;
@@ -560,7 +548,6 @@ mod tests {
         use crate::protocol::ui::state::{
             PatchRejectReason, PatchRejected, StatePatch, StateReset, StateSnapshot,
         };
-        use crate::protocol::ui::error_code::ErrorCode;
         use crate::protocol::value::Value;
 
         fn empty_comp() -> Comp {

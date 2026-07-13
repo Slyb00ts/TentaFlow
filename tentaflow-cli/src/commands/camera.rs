@@ -28,8 +28,7 @@ pub enum CameraCommand {
     /// SQL transaction.
     RotateKey {
         /// Explicit path to the live `cameras.key` (defaults to
-        /// `<tentaflow_home>/keys/cameras.key`, or the value of
-        /// `TENTAFLOW_CAMERAS_KEY` when set).
+        /// `<tentaflow_home>/keys/cameras.key`).
         #[arg(long)]
         key_path: Option<PathBuf>,
         /// Explicit path to the sqlite database (defaults to

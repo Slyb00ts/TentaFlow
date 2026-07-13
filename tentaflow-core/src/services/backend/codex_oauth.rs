@@ -148,7 +148,10 @@ async fn run_poll(flow_id: String, device_auth_id: String, user_code: String, in
 
     loop {
         if start.elapsed() >= MAX_WAIT {
-            set_state(&flow_id, FlowState::error("login timed out after 15 minutes"));
+            set_state(
+                &flow_id,
+                FlowState::error("login timed out after 15 minutes"),
+            );
             return;
         }
         let resp = client
@@ -163,7 +166,10 @@ async fn run_poll(flow_id: String, device_auth_id: String, user_code: String, in
                 let code_resp: Value = match r.json().await {
                     Ok(v) => v,
                     Err(e) => {
-                        set_state(&flow_id, FlowState::error(format!("device token parse: {e}")));
+                        set_state(
+                            &flow_id,
+                            FlowState::error(format!("device token parse: {e}")),
+                        );
                         return;
                     }
                 };
@@ -178,7 +184,10 @@ async fn run_poll(flow_id: String, device_auth_id: String, user_code: String, in
                     .unwrap_or_default()
                     .to_string();
                 if authorization_code.is_empty() || code_verifier.is_empty() {
-                    set_state(&flow_id, FlowState::error("device token response incomplete"));
+                    set_state(
+                        &flow_id,
+                        FlowState::error("device token response incomplete"),
+                    );
                     return;
                 }
                 match exchange_code(&client, &authorization_code, &code_verifier).await {
@@ -213,8 +222,9 @@ async fn run_poll(flow_id: String, device_auth_id: String, user_code: String, in
                 }
             }
             // 403/404 = still pending (user hasn't entered the code yet).
-            Ok(r) if r.status() == reqwest::StatusCode::FORBIDDEN
-                || r.status() == reqwest::StatusCode::NOT_FOUND =>
+            Ok(r)
+                if r.status() == reqwest::StatusCode::FORBIDDEN
+                    || r.status() == reqwest::StatusCode::NOT_FOUND =>
             {
                 tokio::time::sleep(Duration::from_secs(interval)).await;
             }
@@ -266,7 +276,11 @@ async fn exchange_code(
         .json()
         .await
         .map_err(|e| format!("token exchange bad response: {e}"))?;
-    let id_token = v.get("id_token").and_then(Value::as_str).unwrap_or_default().to_string();
+    let id_token = v
+        .get("id_token")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let access_token = v
         .get("access_token")
         .and_then(Value::as_str)

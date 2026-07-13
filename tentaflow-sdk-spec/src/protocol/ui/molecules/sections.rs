@@ -2,21 +2,18 @@
 // File: protocol/ui/molecules/sections.rs — Toolbar / StatGroup / Inspector (catalog §2)
 // =============================================================================
 
+use super::super::super::value::Value;
+use super::super::actions::{Button, SegmentedControl};
 use super::super::bind::BindRef;
 use super::super::component::{Component, FieldMap};
-use super::super::inline::{
-    FilterChipDef, NavTab,
-};
+use super::super::data::StatCard;
+use super::super::form::{SearchBox, Select};
+use super::super::inline::{FilterChipDef, NavTab};
 use super::super::tokens::Density;
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_ref_tag_decode,
     ensure_ref_tag_encode, ensure_tag, missing_field, unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
-use super::super::actions::{Button, SegmentedControl};
-use super::super::data::StatCard;
-use super::super::form::{SearchBox, Select};
-
 
 // -----------------------------------------------------------------------------
 // Toolbar
@@ -252,13 +249,10 @@ impl Inspector {
         }
         Ok(Inspector {
             title: title.ok_or_else(|| missing_field("Inspector", "title"))?,
-            content_slot: content_slot
-                .ok_or_else(|| missing_field("Inspector", "content_slot"))?,
+            content_slot: content_slot.ok_or_else(|| missing_field("Inspector", "content_slot"))?,
             actions,
             tabs,
-            collapsible: collapsible
-                .ok_or_else(|| missing_field("Inspector", "collapsible"))?,
+            collapsible: collapsible.ok_or_else(|| missing_field("Inspector", "collapsible"))?,
         })
     }
 }
-

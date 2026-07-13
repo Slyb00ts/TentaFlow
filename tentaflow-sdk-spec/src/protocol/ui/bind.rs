@@ -7,8 +7,8 @@
 
 use minicbor::{Decode, Decoder, Encode, Encoder};
 
-use crate::protocol::value::Value;
 use crate::protocol::ui::typed_field::assert_no_dup_tstr;
+use crate::protocol::value::Value;
 
 /// Maximum number of segments per StatePath (matches ServerLimits.max_state_path_segments).
 pub const MAX_STATE_PATH_SEGMENTS: usize = 32;
@@ -51,13 +51,10 @@ impl<C> Encode<C> for PathSegment {
 }
 
 impl<'b, C> Decode<'b, C> for PathSegment {
-    fn decode(
-        d: &mut Decoder<'b>,
-        _ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut key_value: Option<String> = None;
         let mut index_value: Option<u32> = None;
@@ -108,8 +105,8 @@ impl<'b, C> Decode<'b, C> for PathSegment {
                 }
             }
         }
-        let kind = kind
-            .ok_or_else(|| minicbor::decode::Error::message("PathSegment missing kind"))?;
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("PathSegment missing kind"))?;
         match kind.as_str() {
             "key" => {
                 if index_value.is_some() {
@@ -173,13 +170,10 @@ impl<C> Encode<C> for StatePath {
 }
 
 impl<'b, C> Decode<'b, C> for StatePath {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let n = d.array()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length array forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let n = d
+            .array()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length array forbidden"))?;
         if (n as usize) > MAX_STATE_PATH_SEGMENTS {
             return Err(minicbor::decode::Error::message(
                 "StatePath exceeds MAX_STATE_PATH_SEGMENTS (32)",
@@ -228,13 +222,10 @@ impl<C> Encode<C> for BindRef {
 }
 
 impl<'b, C> Decode<'b, C> for BindRef {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut value: Option<Value> = None;
         let mut path: Option<StatePath> = None;
@@ -260,8 +251,7 @@ impl<'b, C> Decode<'b, C> for BindRef {
                 }
             }
         }
-        let kind = kind
-            .ok_or_else(|| minicbor::decode::Error::message("BindRef missing kind"))?;
+        let kind = kind.ok_or_else(|| minicbor::decode::Error::message("BindRef missing kind"))?;
         match kind.as_str() {
             "literal" => {
                 if path.is_some() {
@@ -408,13 +398,10 @@ impl<C> Encode<C> for BindSpec {
 }
 
 impl<'b, C> Decode<'b, C> for BindSpec {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut path: Option<StatePath> = None;
         let mut format: Option<super::value_format::ValueFormat> = None;
@@ -465,8 +452,7 @@ impl<'b, C> Decode<'b, C> for BindSpec {
                 }
             }
         }
-        let kind = kind
-            .ok_or_else(|| minicbor::decode::Error::message("BindSpec missing kind"))?;
+        let kind = kind.ok_or_else(|| minicbor::decode::Error::message("BindSpec missing kind"))?;
         let no_extras = |allow_format: bool,
                          allow_name: bool,
                          allow_class: bool,
@@ -511,9 +497,7 @@ impl<'b, C> Decode<'b, C> for BindSpec {
                 no_extras(false, false, true, true, false, false)?;
                 Ok(BindSpec::ClassToggle {
                     class_name: class_name.ok_or_else(|| {
-                        minicbor::decode::Error::message(
-                            "BindSpec.class_toggle missing class_name",
-                        )
+                        minicbor::decode::Error::message("BindSpec.class_toggle missing class_name")
                     })?,
                     path: take_path(path)?,
                     negate: negate.ok_or_else(|| {
@@ -535,9 +519,7 @@ impl<'b, C> Decode<'b, C> for BindSpec {
                 Ok(BindSpec::List {
                     path: take_path(path)?,
                     item_template_id: item_template_id.ok_or_else(|| {
-                        minicbor::decode::Error::message(
-                            "BindSpec.list missing item_template_id",
-                        )
+                        minicbor::decode::Error::message("BindSpec.list missing item_template_id")
                     })?,
                     key_field,
                 })
@@ -596,7 +578,9 @@ mod tests {
     #[test]
     fn bind_ref_roundtrip_both_variants() {
         rt(BindRef::Literal(Value::U64(42)));
-        rt(BindRef::Bound(StatePath::new(vec![PathSegment::Key("a".into())])));
+        rt(BindRef::Bound(StatePath::new(vec![PathSegment::Key(
+            "a".into(),
+        )])));
     }
 
     #[test]
@@ -651,7 +635,12 @@ mod tests {
     fn bind_spec_unknown_kind_rejected() {
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
-        enc.map(1).unwrap().str("kind").unwrap().str("future").unwrap();
+        enc.map(1)
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("future")
+            .unwrap();
         let res: Result<BindSpec, _> = minicbor::decode(&buf);
         assert!(res.is_err());
     }

@@ -2,21 +2,27 @@
 // File: protocol/ui/layout/atomic.rs — Divider/Spacer/Tooltip (catalog §3)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::BindRef;
 use super::super::component::{Component, FieldMap};
-use super::super::tokens::{
-    DividerOrientation, DividerVariant, DrawerSide,
-    SpacerAxis,
-};
+use super::super::tokens::{DividerOrientation, DividerVariant, DrawerSide, SpacerAxis};
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -39,7 +45,9 @@ impl Divider {
         entries.push((0, encode_to_value(&self.orientation)?));
         entries.push((1, encode_to_value(&self.variant)?));
         entries.push((2, encode_to_value(&self.spacing)?));
-        if let Some(l) = &self.label { entries.push((3, encode_to_value(l)?)); }
+        if let Some(l) = &self.label {
+            entries.push((3, encode_to_value(l)?));
+        }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -155,4 +163,3 @@ impl Tooltip {
         })
     }
 }
-

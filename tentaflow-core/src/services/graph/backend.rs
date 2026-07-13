@@ -144,8 +144,13 @@ pub trait GraphBackend: Send + Sync {
 
     /// Upsert węzła. `props`/`provenance` to surowe stringi JSON (warstwa
     /// host-fn serializuje strukturę addona); pusty => `"{}"` / `"null"`.
-    fn upsert_node(&self, id: &str, label: &str, props_json: &str, provenance_json: &str)
-        -> Result<()>;
+    fn upsert_node(
+        &self,
+        id: &str,
+        label: &str,
+        props_json: &str,
+        provenance_json: &str,
+    ) -> Result<()>;
 
     /// Upsert krawędzi skierowanej `src -[rel]-> dst` z wagą.
     fn upsert_edge(
@@ -327,15 +332,16 @@ impl CozoBackend {
     /// Lista nazw relacji w tej bazie (`::relations` sys-op — wywoływane tylko
     /// przez host, nigdy przez skrypt addona).
     fn list_relations(&self) -> Result<Vec<String>> {
-        let rows = match self
-            .db
-            .run_script("::relations", BTreeMap::new(), ScriptMutability::Immutable)
-        {
-            Ok(r) => r,
-            // Świeża baza bez żadnych relacji może zwrócić błąd zamiast pustego
-            // zbioru — traktujemy jak „brak relacji".
-            Err(_) => return Ok(Vec::new()),
-        };
+        let rows =
+            match self
+                .db
+                .run_script("::relations", BTreeMap::new(), ScriptMutability::Immutable)
+            {
+                Ok(r) => r,
+                // Świeża baza bez żadnych relacji może zwrócić błąd zamiast pustego
+                // zbioru — traktujemy jak „brak relacji".
+                Err(_) => return Ok(Vec::new()),
+            };
         let name_idx = rows.headers.iter().position(|h| h == "name");
         let Some(idx) = name_idx else {
             return Ok(Vec::new());
@@ -371,7 +377,6 @@ impl CozoBackend {
             .unwrap_or(0);
         Ok(total.max(0) as u64)
     }
-
 }
 
 impl GraphBackend for CozoBackend {

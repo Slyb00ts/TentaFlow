@@ -124,9 +124,14 @@ impl EmbeddedDeploy {
                 self.log_sink.as_ref(),
             )
             .await
-            .map_err(|e| DeployError::Other(format!("camera-CV bundle '{}': {:#}", engine_id, e)))?;
+            .map_err(|e| {
+                DeployError::Other(format!("camera-CV bundle '{}': {:#}", engine_id, e))
+            })?;
             if let Some(s) = &self.log_sink {
-                s.info(&format!("[vision] camera-CV bundle ready for {}", engine_id));
+                s.info(&format!(
+                    "[vision] camera-CV bundle ready for {}",
+                    engine_id
+                ));
             }
             return Ok(());
         }
@@ -465,7 +470,10 @@ impl EmbeddedDeploy {
             }
 
             if let Some(s) = &self.log_sink {
-                s.phase("download-model", &format!("[embeddings] downloading {repo}"));
+                s.phase(
+                    "download-model",
+                    &format!("[embeddings] downloading {repo}"),
+                );
             }
             let store = crate::hub::model_store::ModelStore::default_for_platform();
             let (progress_tx, mut progress_rx) =
@@ -502,7 +510,10 @@ impl EmbeddedDeploy {
             if let Some(s) = &self.log_sink {
                 s.phase(
                     "load-model",
-                    &format!("[embeddings] loading {model_name} from {}", load_path.display()),
+                    &format!(
+                        "[embeddings] loading {model_name} from {}",
+                        load_path.display()
+                    ),
                 );
             }
             let _load_gate = EMBEDDED_LOAD_GATE
@@ -525,7 +536,9 @@ impl EmbeddedDeploy {
                         ))
                     })?;
                 if let Some(s) = &self.log_sink {
-                    s.info(&format!("[embeddings] loaded {model_name} via mlx (embedder)"));
+                    s.info(&format!(
+                        "[embeddings] loaded {model_name} via mlx (embedder)"
+                    ));
                 }
             }
             #[cfg(not(feature = "inference-mlx"))]
@@ -670,7 +683,10 @@ impl EmbeddedDeploy {
                         )));
                     }
                     if let Some(s) = &self.log_sink {
-                        s.info(&format!("[model] using local MLX safetensors: {}", local.display()));
+                        s.info(&format!(
+                            "[model] using local MLX safetensors: {}",
+                            local.display()
+                        ));
                     }
                 } else {
                     if local
@@ -1099,7 +1115,7 @@ mod tests {
                 speculator_num_tokens: None,
                 vllm: None,
                 checkpoint_file: None,
-                quant_variants: vec![],
+                quant_variants: Vec::new(),
             }],
             parameters: vec![],
             docker_source_hash: String::new(),

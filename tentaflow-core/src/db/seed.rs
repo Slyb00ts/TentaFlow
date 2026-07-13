@@ -1239,9 +1239,10 @@ pub(crate) const CAMERA_CV_PIPELINE_ID: &str = "00000000-0000-4000-8000-00000000
 /// hardcoded vision_analysis behavior: detector on the frame (threshold 0.5,
 /// fps omitted = the engine keeps pacing by `cameras.analysis_fps`), state
 /// classification for the placard/plate/thermometer classes, and plate/ADR OCR
-/// (crop padding 15%/10%). A const (not a function literal) so the test can
-/// validate it via `cv_pipeline::validate`.
-const CAMERA_CV_PIPELINE_JSON: &str = r#"{"stages":[{"stage_id":"detect","op":"detect","model":"tentavision-detect","input":{"kind":"frame"},"threshold":0.5},{"stage_id":"stan","op":"classify","model":"tentavision-stan","input":{"kind":"stage","stage_id":"detect","classes":["nalepka*","znak_srodowiskowy","termometr","tablica_adr","tablica_rejestracyjna"]},"output":"stan"},{"stage_id":"ocr_plate","op":"ocr","model":"tentavision-ocr","input":{"kind":"stage","stage_id":"detect","classes":["tablica_rejestracyjna"]},"params":{"ocr_mode":"plate","crop_pad_x":0.15,"crop_pad_y":0.1},"output":"tekst"},{"stage_id":"ocr_adr","op":"ocr","model":"tentavision-ocr","input":{"kind":"stage","stage_id":"detect","classes":["tablica_adr"]},"params":{"ocr_mode":"adr","crop_pad_x":0.15,"crop_pad_y":0.1},"output":"tekst"}]}"#;
+/// (crop padding 30%/20% — side-view plates are clipped by the tight detector
+/// box; the OCR-side perspective deskew crops back to the plate quad). A const
+/// (not a function literal) so the test can validate it via `cv_pipeline::validate`.
+const CAMERA_CV_PIPELINE_JSON: &str = r#"{"stages":[{"stage_id":"detect","op":"detect","model":"tentavision-detect","input":{"kind":"frame"},"threshold":0.5},{"stage_id":"stan","op":"classify","model":"tentavision-stan","input":{"kind":"stage","stage_id":"detect","classes":["nalepka*","znak_srodowiskowy","termometr","tablica_adr","tablica_rejestracyjna"]},"output":"stan"},{"stage_id":"ocr_plate","op":"ocr","model":"tentavision-ocr","input":{"kind":"stage","stage_id":"detect","classes":["tablica_rejestracyjna"]},"params":{"ocr_mode":"plate","crop_pad_x":0.3,"crop_pad_y":0.2},"output":"tekst"},{"stage_id":"ocr_adr","op":"ocr","model":"tentavision-ocr","input":{"kind":"stage","stage_id":"detect","classes":["tablica_adr"]},"params":{"ocr_mode":"adr","crop_pad_x":0.3,"crop_pad_y":0.2},"output":"tekst"}]}"#;
 
 /// Seeds the default camera CV pipeline (`is_default=1`) into the default
 /// org — the same single-org convention every other seed follows (all
@@ -1627,11 +1628,7 @@ mod tests {
             (service_type, is_default)
         };
 
-        let (st, def) = assert_dag(
-            "Default Chat",
-            &["trigger", "llm", "output"],
-            2,
-        );
+        let (st, def) = assert_dag("Default Chat", &["trigger", "llm", "output"], 2);
         assert_eq!(st.as_deref(), Some("chat"));
         assert_eq!(def, 1, "Default Chat jest domyslnym flow");
 

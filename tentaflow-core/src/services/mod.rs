@@ -26,6 +26,8 @@ pub mod catalog;
 pub mod deploy;
 pub mod detection_bus;
 pub mod document;
+#[cfg(feature = "camera")]
+pub mod event_recorder;
 pub mod frame_proxy;
 pub mod frame_storage;
 #[cfg(feature = "graph")]
@@ -36,14 +38,14 @@ pub mod handles_cache;
 pub mod key_storage;
 pub mod legal;
 pub mod lidar_hub;
-pub mod localization;
-pub mod mobile_camera;
-pub mod mobile_sensors;
 pub mod lidar_push;
 pub mod lidar_relay;
 pub mod lifecycle;
+pub mod localization;
 pub mod mesh_keys;
 pub mod mesh_registry;
+pub mod mobile_camera;
+pub mod mobile_sensors;
 pub mod onnx_cv_service;
 pub mod org;
 pub mod pickup_tokens;
@@ -56,10 +58,10 @@ pub mod registry;
 pub mod role_catalog;
 pub mod runtime;
 pub mod scene_push;
-pub mod slam_scene;
 pub mod service_call;
 pub mod service_call_rate_limit;
 pub mod signed_urls;
+pub mod slam_scene;
 pub mod snapshot_builder;
 pub mod storage_proxy;
 pub mod stream_hub;
@@ -67,6 +69,8 @@ pub mod streaming;
 pub mod supervisor;
 pub mod transport;
 pub mod vector;
+#[cfg(all(unix, feature = "camera", feature = "inference-vision-gpu"))]
+pub mod vision_worker;
 
 pub use tts::{TTSClient, TTSConfigCompat};
 
@@ -276,9 +280,7 @@ pub fn model_bundle_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
                     if let Some(iss) = weak.upgrade() {
                         iss.rotate_in_memory(*new);
                     }
-                    trigger_mesh_broadcast_on_rotate(
-                        signed_urls::UrlScope::ModelBundle.key_name(),
-                    );
+                    trigger_mesh_broadcast_on_rotate(signed_urls::UrlScope::ModelBundle.key_name());
                 },
             );
         }

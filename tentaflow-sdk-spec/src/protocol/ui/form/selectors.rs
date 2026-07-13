@@ -2,6 +2,7 @@
 // File: protocol/ui/form/selectors.rs — Select/MultiSelect/Combobox/Autocomplete (catalog §5)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::{BindRef, StatePath};
 use super::super::component::{Component, FieldMap};
 use super::super::inline::{SelectGroup, SelectOption};
@@ -10,11 +11,19 @@ use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -43,23 +52,38 @@ impl Select {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(10);
         e.push((0, encode_to_value(&self.bind_path)?));
         e.push((1, encode_to_value(&self.options)?));
-        if let Some(v) = &self.placeholder { e.push((2, encode_to_value(v)?)); }
-        if let Some(v) = &self.label { e.push((3, encode_to_value(v)?)); }
+        if let Some(v) = &self.placeholder {
+            e.push((2, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.label {
+            e.push((3, encode_to_value(v)?));
+        }
         e.push((4, encode_to_value(&self.searchable)?));
         e.push((5, encode_to_value(&self.clearable)?));
         e.push((6, encode_to_value(&self.virtualize)?));
-        if let Some(v) = &self.disabled { e.push((7, encode_to_value(v)?)); }
+        if let Some(v) = &self.disabled {
+            e.push((7, encode_to_value(v)?));
+        }
         e.push((8, encode_to_value(&self.size)?));
-        if let Some(v) = &self.groups { e.push((9, encode_to_value(v)?)); }
+        if let Some(v) = &self.groups {
+            e.push((9, encode_to_value(v)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "Select")?;
         ensure_no_duplicate_keys("Select", &c.fields.0)?;
-        let mut bind_path = None; let mut options = None; let mut placeholder = None;
-        let mut label = None; let mut searchable = None; let mut clearable = None;
-        let mut virtualize = None; let mut disabled = None; let mut size = None; let mut groups = None;
+        let mut bind_path = None;
+        let mut options = None;
+        let mut placeholder = None;
+        let mut label = None;
+        let mut searchable = None;
+        let mut clearable = None;
+        let mut virtualize = None;
+        let mut disabled = None;
+        let mut size = None;
+        let mut groups = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => bind_path = Some(decode_from_value(v)?),
@@ -78,7 +102,8 @@ impl Select {
         Ok(Select {
             bind_path: bind_path.ok_or_else(|| missing_field("Select", "bind_path"))?,
             options: options.ok_or_else(|| missing_field("Select", "options"))?,
-            placeholder, label,
+            placeholder,
+            label,
             searchable: searchable.ok_or_else(|| missing_field("Select", "searchable"))?,
             clearable: clearable.ok_or_else(|| missing_field("Select", "clearable"))?,
             virtualize: virtualize.ok_or_else(|| missing_field("Select", "virtualize"))?,
@@ -117,15 +142,25 @@ impl MultiSelect {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(12);
         e.push((0, encode_to_value(&self.selected_path)?));
         e.push((1, encode_to_value(&self.options)?));
-        if let Some(v) = &self.placeholder { e.push((2, encode_to_value(v)?)); }
-        if let Some(v) = &self.label { e.push((3, encode_to_value(v)?)); }
+        if let Some(v) = &self.placeholder {
+            e.push((2, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.label {
+            e.push((3, encode_to_value(v)?));
+        }
         e.push((4, encode_to_value(&self.searchable)?));
         e.push((5, encode_to_value(&self.clearable)?));
         e.push((6, encode_to_value(&self.virtualize)?));
-        if let Some(v) = &self.disabled { e.push((7, encode_to_value(v)?)); }
+        if let Some(v) = &self.disabled {
+            e.push((7, encode_to_value(v)?));
+        }
         e.push((8, encode_to_value(&self.size)?));
-        if let Some(v) = &self.groups { e.push((9, encode_to_value(v)?)); }
-        if let Some(v) = &self.max_selections { e.push((10, encode_to_value(v)?)); }
+        if let Some(v) = &self.groups {
+            e.push((9, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.max_selections {
+            e.push((10, encode_to_value(v)?));
+        }
         e.push((11, encode_to_value(&self.show_select_all)?));
         Ok(component(Self::TAG, id, e))
     }
@@ -133,10 +168,18 @@ impl MultiSelect {
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "MultiSelect")?;
         ensure_no_duplicate_keys("MultiSelect", &c.fields.0)?;
-        let mut selected_path = None; let mut options = None; let mut placeholder = None;
-        let mut label = None; let mut searchable = None; let mut clearable = None;
-        let mut virtualize = None; let mut disabled = None; let mut size = None; let mut groups = None;
-        let mut max_selections = None; let mut show_select_all = None;
+        let mut selected_path = None;
+        let mut options = None;
+        let mut placeholder = None;
+        let mut label = None;
+        let mut searchable = None;
+        let mut clearable = None;
+        let mut virtualize = None;
+        let mut disabled = None;
+        let mut size = None;
+        let mut groups = None;
+        let mut max_selections = None;
+        let mut show_select_all = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => selected_path = Some(decode_from_value(v)?),
@@ -155,9 +198,11 @@ impl MultiSelect {
             }
         }
         Ok(MultiSelect {
-            selected_path: selected_path.ok_or_else(|| missing_field("MultiSelect", "selected_path"))?,
+            selected_path: selected_path
+                .ok_or_else(|| missing_field("MultiSelect", "selected_path"))?,
             options: options.ok_or_else(|| missing_field("MultiSelect", "options"))?,
-            placeholder, label,
+            placeholder,
+            label,
             searchable: searchable.ok_or_else(|| missing_field("MultiSelect", "searchable"))?,
             clearable: clearable.ok_or_else(|| missing_field("MultiSelect", "clearable"))?,
             virtualize: virtualize.ok_or_else(|| missing_field("MultiSelect", "virtualize"))?,
@@ -165,7 +210,8 @@ impl MultiSelect {
             size: size.ok_or_else(|| missing_field("MultiSelect", "size"))?,
             groups,
             max_selections,
-            show_select_all: show_select_all.ok_or_else(|| missing_field("MultiSelect", "show_select_all"))?,
+            show_select_all: show_select_all
+                .ok_or_else(|| missing_field("MultiSelect", "show_select_all"))?,
         })
     }
 }
@@ -199,29 +245,48 @@ impl Combobox {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(14);
         e.push((0, encode_to_value(&self.bind_path)?));
         e.push((1, encode_to_value(&self.options)?));
-        if let Some(v) = &self.placeholder { e.push((2, encode_to_value(v)?)); }
-        if let Some(v) = &self.label { e.push((3, encode_to_value(v)?)); }
+        if let Some(v) = &self.placeholder {
+            e.push((2, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.label {
+            e.push((3, encode_to_value(v)?));
+        }
         // §5 0x0305: searchable always true — hardcoded.
         e.push((4, encode_to_value(&true)?));
         e.push((5, encode_to_value(&self.clearable)?));
         e.push((6, encode_to_value(&self.virtualize)?));
-        if let Some(v) = &self.disabled { e.push((7, encode_to_value(v)?)); }
+        if let Some(v) = &self.disabled {
+            e.push((7, encode_to_value(v)?));
+        }
         e.push((8, encode_to_value(&self.size)?));
-        if let Some(v) = &self.groups { e.push((9, encode_to_value(v)?)); }
+        if let Some(v) = &self.groups {
+            e.push((9, encode_to_value(v)?));
+        }
         e.push((10, encode_to_value(&self.free_input)?));
         e.push((11, encode_to_value(&self.min_search_chars)?));
         e.push((12, encode_to_value(&self.remote_search)?));
-        if let Some(v) = &self.remote_action_id { e.push((13, encode_to_value(v)?)); }
+        if let Some(v) = &self.remote_action_id {
+            e.push((13, encode_to_value(v)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "Combobox")?;
         ensure_no_duplicate_keys("Combobox", &c.fields.0)?;
-        let mut bind_path = None; let mut options = None; let mut placeholder = None;
-        let mut label = None; let mut seen_searchable = false; let mut clearable = None;
-        let mut virtualize = None; let mut disabled = None; let mut size = None; let mut groups = None;
-        let mut free_input = None; let mut min_search_chars = None; let mut remote_search = None;
+        let mut bind_path = None;
+        let mut options = None;
+        let mut placeholder = None;
+        let mut label = None;
+        let mut seen_searchable = false;
+        let mut clearable = None;
+        let mut virtualize = None;
+        let mut disabled = None;
+        let mut size = None;
+        let mut groups = None;
+        let mut free_input = None;
+        let mut min_search_chars = None;
+        let mut remote_search = None;
         let mut remote_action_id = None;
         for (k, v) in &c.fields.0 {
             match k {
@@ -256,15 +321,18 @@ impl Combobox {
         Ok(Combobox {
             bind_path: bind_path.ok_or_else(|| missing_field("Combobox", "bind_path"))?,
             options: options.ok_or_else(|| missing_field("Combobox", "options"))?,
-            placeholder, label,
+            placeholder,
+            label,
             clearable: clearable.ok_or_else(|| missing_field("Combobox", "clearable"))?,
             virtualize: virtualize.ok_or_else(|| missing_field("Combobox", "virtualize"))?,
             disabled,
             size: size.ok_or_else(|| missing_field("Combobox", "size"))?,
             groups,
             free_input: free_input.ok_or_else(|| missing_field("Combobox", "free_input"))?,
-            min_search_chars: min_search_chars.ok_or_else(|| missing_field("Combobox", "min_search_chars"))?,
-            remote_search: remote_search.ok_or_else(|| missing_field("Combobox", "remote_search"))?,
+            min_search_chars: min_search_chars
+                .ok_or_else(|| missing_field("Combobox", "min_search_chars"))?,
+            remote_search: remote_search
+                .ok_or_else(|| missing_field("Combobox", "remote_search"))?,
             remote_action_id,
         })
     }
@@ -293,20 +361,30 @@ impl Autocomplete {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(7);
         e.push((0, encode_to_value(&self.bind_path)?));
         e.push((1, encode_to_value(&self.remote_action_id)?));
-        if let Some(v) = &self.result_template_id { e.push((2, encode_to_value(v)?)); }
+        if let Some(v) = &self.result_template_id {
+            e.push((2, encode_to_value(v)?));
+        }
         e.push((3, encode_to_value(&self.min_search_chars)?));
         e.push((4, encode_to_value(&self.debounce_ms)?));
-        if let Some(v) = &self.placeholder { e.push((5, encode_to_value(v)?)); }
-        if let Some(v) = &self.label { e.push((6, encode_to_value(v)?)); }
+        if let Some(v) = &self.placeholder {
+            e.push((5, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.label {
+            e.push((6, encode_to_value(v)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "Autocomplete")?;
         ensure_no_duplicate_keys("Autocomplete", &c.fields.0)?;
-        let mut bind_path = None; let mut remote_action_id = None;
-        let mut result_template_id = None; let mut min_search_chars = None;
-        let mut debounce_ms = None; let mut placeholder = None; let mut label = None;
+        let mut bind_path = None;
+        let mut remote_action_id = None;
+        let mut result_template_id = None;
+        let mut min_search_chars = None;
+        let mut debounce_ms = None;
+        let mut placeholder = None;
+        let mut label = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => bind_path = Some(decode_from_value(v)?),
@@ -321,11 +399,14 @@ impl Autocomplete {
         }
         Ok(Autocomplete {
             bind_path: bind_path.ok_or_else(|| missing_field("Autocomplete", "bind_path"))?,
-            remote_action_id: remote_action_id.ok_or_else(|| missing_field("Autocomplete", "remote_action_id"))?,
+            remote_action_id: remote_action_id
+                .ok_or_else(|| missing_field("Autocomplete", "remote_action_id"))?,
             result_template_id,
-            min_search_chars: min_search_chars.ok_or_else(|| missing_field("Autocomplete", "min_search_chars"))?,
+            min_search_chars: min_search_chars
+                .ok_or_else(|| missing_field("Autocomplete", "min_search_chars"))?,
             debounce_ms: debounce_ms.ok_or_else(|| missing_field("Autocomplete", "debounce_ms"))?,
-            placeholder, label,
+            placeholder,
+            label,
         })
     }
 }

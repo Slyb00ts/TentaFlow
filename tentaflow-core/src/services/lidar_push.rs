@@ -278,7 +278,11 @@ mod tests {
         assert!(h.lz4_body(), "repetitive body must compress");
         assert!(wire.len() < frame.len(), "compressed frame is smaller");
         assert!(h.host_send_us > 0, "stamped");
-        assert_eq!(wire_body(&wire), &frame[LIDAR_HEADER_LEN..], "lossless inflate");
+        assert_eq!(
+            wire_body(&wire),
+            &frame[LIDAR_HEADER_LEN..],
+            "lossless inflate"
+        );
     }
 
     fn build_frame(points: &[[f32; 3]], seq: u32) -> Bytes {

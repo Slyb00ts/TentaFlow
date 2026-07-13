@@ -1607,6 +1607,37 @@ impl ModelRuntimeExecutor {
             })
     }
 
+    /// Resolves a camera-CV model alias to its LOCAL embedded `engine_id`, but
+    /// only when the top-ranked live candidate is an in-process `Embedded`
+    /// backend on THIS node. Returns `None` for mesh-forward / remote / dynamic
+    /// non-embedded targets (and when nothing resolves), so the camera analysis
+    /// engine can take the direct batched-singleton fast path exclusively for
+    /// aliases that truly map to a bundled in-process engine (rfdetr-adr /
+    /// nalepka-stan / plate-ocr / onnx-cv …) and fall back to the per-crop
+    /// `execute_camera_cv` path for everything else. Resolution reuses the same
+    /// surface/modality contract as `execute_camera_cv`.
+    pub fn local_camera_cv_engine(
+        &self,
+        model: &str,
+        ctx: &mut ExecutionContext,
+    ) -> Option<String> {
+        let target = self
+            .resolve_proxy_target(
+                model,
+                ServiceSurface::CameraCv,
+                &[InputModality::Image],
+                ctx,
+            )
+            .ok()?;
+        match target {
+            ResolvedExecutionTarget::Local {
+                handle: BackendHandle::Embedded { engine_id, .. },
+                ..
+            } => Some(engine_id),
+            _ => None,
+        }
+    }
+
     /// Per-target embeddings dispatch. Embedded backends route through
     /// `LocalInferenceHandler::handle_embeddings` — engines that don't
     /// implement embeddings (the trait default is `bail!`) surface their
@@ -2268,10 +2299,9 @@ impl ModelRuntimeExecutor {
                         ))
                     })?;
                     let model_request = document_infer_model_request(&request);
-                    let response = quic_client
-                        .send_request(model_request)
-                        .await
-                        .map_err(|e| ExecutorError::Internal(format!("QUIC document infer: {}", e)))?;
+                    let response = quic_client.send_request(model_request).await.map_err(|e| {
+                        ExecutorError::Internal(format!("QUIC document infer: {}", e))
+                    })?;
                     document_infer_result_to_response(response.result)
                 }
             },
@@ -2326,10 +2356,7 @@ impl ModelRuntimeExecutor {
         for target in ranked {
             attempts += 1;
             last_kind = target.telemetry_tag();
-            match self
-                .dispatch_camera_cv(&target, request.clone(), ctx)
-                .await
-            {
+            match self.dispatch_camera_cv(&target, request.clone(), ctx).await {
                 Ok(response) => {
                     ctx.route_metadata.served_by_node = served_by(&target);
                     ctx.route_metadata.served_model = Some(target.requested_model().to_string());
@@ -2428,8 +2455,10 @@ impl ModelRuntimeExecutor {
         request: DocumentParseRequest,
         ctx: &mut ExecutionContext,
     ) -> Result<DocumentParseResponse, ExecutorError> {
+        use crate::services::document::rasterize::{
+            rasterize_pdf_streaming, PageRender, SinkClosed,
+        };
         use crate::services::document::{self, DEFAULT_RENDER_DPI, MAX_PDF_PAGES};
-        use crate::services::document::rasterize::{rasterize_pdf_streaming, PageRender, SinkClosed};
 
         // Bug 1 (agregatowy memory-DoS): NIE materializujemy wszystkich stron
         // jako RGB/PNG przed parse. Streaming strona-po-stronie: producent
@@ -2535,7 +2564,9 @@ impl ModelRuntimeExecutor {
             if let Some(e) = last_page_err {
                 return Err(e);
             }
-            return Err(ExecutorError::Internal("PDF has no renderable pages".into()));
+            return Err(ExecutorError::Internal(
+                "PDF has no renderable pages".into(),
+            ));
         }
         if failed_pages > 0 {
             tracing::warn!(
@@ -2578,10 +2609,13 @@ impl ModelRuntimeExecutor {
                         let img = request.image_bytes.clone();
                         let mime = request.mime.clone();
                         // MLX liczy synchronicznie — poza tokio worker poolem.
-                        let markdown = tokio::task::spawn_blocking(move || parser.parse(&img, &mime))
-                            .await
-                            .map_err(|e| ExecutorError::Internal(format!("paddle parse task: {e}")))?
-                            .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+                        let markdown =
+                            tokio::task::spawn_blocking(move || parser.parse(&img, &mime))
+                                .await
+                                .map_err(|e| {
+                                    ExecutorError::Internal(format!("paddle parse task: {e}"))
+                                })?
+                                .map_err(|e| ExecutorError::Internal(e.to_string()))?;
                         Ok(DocumentParseResponse {
                             markdown,
                             blocks: Vec::new(),
@@ -2598,9 +2632,9 @@ impl ModelRuntimeExecutor {
                     .map_err(|e| ExecutorError::Internal(e.to_string())),
                 // Obraz przez QUIC nie ma jeszcze wpiętego payloadu — odkładamy
                 // do follow-up. Internal, żeby failover spróbował HTTP/Flow.
-                BackendHandle::Quic(_) => Err(ExecutorError::Internal(
-                    "documents over QUIC TBD".into(),
-                )),
+                BackendHandle::Quic(_) => {
+                    Err(ExecutorError::Internal("documents over QUIC TBD".into()))
+                }
             },
             // Mesh-forward obrazu (cross-node parse) to osobny slice — na razie
             // pending cutover, jak rerank.
@@ -3009,7 +3043,8 @@ impl ModelRuntimeExecutor {
                     .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
                 ctx.enter_flow(flow_id)
                     .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {e}")))?;
-                let (initial, mut meta) = tts_request_to_initial_envelope(&request, ctx.user.clone());
+                let (initial, mut meta) =
+                    tts_request_to_initial_envelope(&request, ctx.user.clone());
                 // RAG E1.0 — przeprowadź tożsamość addona-callera do flow.
                 meta.addon_id = ctx.addon_id.clone();
                 meta.org_id = ctx.org_id.clone();
@@ -3514,9 +3549,10 @@ fn rerank_result_to_response(
                 })
                 .collect(),
         }),
-        ModelResult::Error(err) => {
-            Err(ExecutorError::Internal(format!("rerank error: {}", err.message)))
-        }
+        ModelResult::Error(err) => Err(ExecutorError::Internal(format!(
+            "rerank error: {}",
+            err.message
+        ))),
         _ => Err(ExecutorError::Internal(
             "rerank returned unexpected result type".into(),
         )),
@@ -3549,9 +3585,7 @@ fn document_infer_result_to_response(
 ) -> Result<DocumentInferResponse, ExecutorError> {
     use tentaflow_protocol::ModelResult;
     match result {
-        ModelResult::Documents(r) => Ok(DocumentInferResponse {
-            regions: r.regions,
-        }),
+        ModelResult::Documents(r) => Ok(DocumentInferResponse { regions: r.regions }),
         ModelResult::Error(err) => Err(ExecutorError::Internal(format!(
             "document infer error: {}",
             err.message
@@ -3716,11 +3750,10 @@ pub(crate) fn flow_outcome_to_rerank_response(
             .ok_or_else(|| {
                 ExecutorError::Internal("rerank flow entry missing numeric 'id'".into())
             })?;
-        let relevance_score = entry
-            .get("score")
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| ExecutorError::Internal("rerank flow entry missing 'score'".into()))?
-            as f32;
+        let relevance_score =
+            entry.get("score").and_then(|v| v.as_f64()).ok_or_else(|| {
+                ExecutorError::Internal("rerank flow entry missing 'score'".into())
+            })? as f32;
         results.push(RerankResultEntry {
             index,
             relevance_score,

@@ -35,10 +35,7 @@ fn main() -> anyhow::Result<()> {
         let x2 = (nx + nw) * w as f32;
         let y2 = (ny + nh) * h as f32;
 
-        println!(
-            "{:22} score={:.3}",
-            d.klasa, d.score
-        );
+        println!("{:22} score={:.3}", d.klasa, d.score);
         println!(
             "   norm [x,y,w,h] = [{:.4}, {:.4}, {:.4}, {:.4}]",
             nx, ny, nw, nh

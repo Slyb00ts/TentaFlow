@@ -180,10 +180,7 @@ impl<C> Encode<C> for ErrorCode {
 }
 
 impl<'b, C> Decode<'b, C> for ErrorCode {
-    fn decode(
-        d: &mut Decoder<'b>,
-        _ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
+    fn decode(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
         let v = d.u16()?;
         Self::from_u16(v).ok_or_else(|| {
             minicbor::decode::Error::message("unknown ErrorCode value (not in §16 whitelist)")

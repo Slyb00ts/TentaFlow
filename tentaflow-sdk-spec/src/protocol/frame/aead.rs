@@ -243,7 +243,13 @@ pub fn encrypt_body(
     let mut wire = Vec::with_capacity(AEAD_NONCE_LEN + plaintext.len() + AEAD_TAG_LEN);
     wire.extend_from_slice(nonce);
     let ct = cipher
-        .encrypt(nonce_obj, Payload { msg: plaintext, aad })
+        .encrypt(
+            nonce_obj,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| {
             FrameError::new(
                 FrameErrorCode::DecryptionFailed,
@@ -259,11 +265,7 @@ pub fn encrypt_body(
 ///
 /// Returns `DecryptionFailed` (§11 code 0x000A) on any failure (auth tag
 /// mismatch, AAD mismatch, too-short body, malformed input).
-pub fn decrypt_body(
-    wire_body: &[u8],
-    key: &AeadKey,
-    aad: &[u8],
-) -> Result<Vec<u8>, FrameError> {
+pub fn decrypt_body(wire_body: &[u8], key: &AeadKey, aad: &[u8]) -> Result<Vec<u8>, FrameError> {
     if wire_body.len() < AEAD_NONCE_LEN + AEAD_TAG_LEN {
         return Err(FrameError::new(
             FrameErrorCode::DecryptionFailed,
@@ -274,7 +276,13 @@ pub fn decrypt_body(
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key.0));
     let nonce_obj = Nonce::from_slice(nonce_bytes);
     cipher
-        .decrypt(nonce_obj, Payload { msg: ct_with_tag, aad })
+        .decrypt(
+            nonce_obj,
+            Payload {
+                msg: ct_with_tag,
+                aad,
+            },
+        )
         .map_err(|_| {
             FrameError::new(
                 FrameErrorCode::DecryptionFailed,
@@ -654,4 +662,3 @@ mod tests {
         assert_eq!(env.body, plaintext);
     }
 }
-

@@ -15,7 +15,9 @@ use async_trait::async_trait;
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::node_adapters::page_branch::parse_page_blobs;
-use crate::flow_engine::node_adapters::vision_parse::{parse_image_to_markdown, VisionParseNodeAdapter};
+use crate::flow_engine::node_adapters::vision_parse::{
+    parse_image_to_markdown, VisionParseNodeAdapter,
+};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 const NODE_TYPE: &str = "vision_parse_pages";
@@ -142,11 +144,7 @@ mod tests {
     async fn pages_input(ctx: &ExecutionContext, n: usize) -> NodeInput {
         let mut entries = Vec::new();
         for i in 0..n {
-            let blob = ctx
-                .blobs
-                .put(vec![1u8; 16], "image/png")
-                .await
-                .unwrap();
+            let blob = ctx.blobs.put(vec![1u8; 16], "image/png").await.unwrap();
             entries.push(json!({
                 "index": i,
                 "blob_id": blob.id,
@@ -181,7 +179,10 @@ mod tests {
         assert_eq!(pages[0]["index"].as_u64(), Some(0));
         assert_eq!(pages[2]["index"].as_u64(), Some(2));
         assert_eq!(pages[1]["markdown"].as_str(), Some("# strona"));
-        assert_eq!(out.meta.get("parsed_pages").and_then(|v| v.as_u64()), Some(3));
+        assert_eq!(
+            out.meta.get("parsed_pages").and_then(|v| v.as_u64()),
+            Some(3)
+        );
     }
 
     #[tokio::test]

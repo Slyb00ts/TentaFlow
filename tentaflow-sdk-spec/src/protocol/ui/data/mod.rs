@@ -42,8 +42,8 @@ mod tests {
     use crate::protocol::ui::inline::{AvatarRef, IconRef, Trend, TrendDirection};
     use crate::protocol::ui::tokens::{
         AvatarOverlap, AvatarShape, AvatarSize, AvatarStatus, BadgeVariant, BulletListVariant,
-        ChipVariant, Density, KvLayout, MarkdownBlock, MarkdownMark, StatSize, TagSize,
-        TextAlign, TextStyle, TextWrap, TimelineOrientation, Tone,
+        ChipVariant, Density, KvLayout, MarkdownBlock, MarkdownMark, StatSize, TagSize, TextAlign,
+        TextStyle, TextWrap, TimelineOrientation, Tone,
     };
     use crate::protocol::value::Value;
 
@@ -53,13 +53,24 @@ mod tests {
 
     fn dummy(tag: u16) -> Component {
         Component {
-            tag, id: "x".into(), fields: FieldMap::default(),
-            handlers: None, bind: None, a11y: None, visibility: None, test_id: None,
+            tag,
+            id: "x".into(),
+            fields: FieldMap::default(),
+            handlers: None,
+            bind: None,
+            a11y: None,
+            visibility: None,
+            test_id: None,
         }
     }
 
-    fn rt<T>(make: T, into: impl Fn(T) -> Component, from: impl Fn(&Component) -> Result<T, minicbor::decode::Error>)
-    where T: PartialEq + std::fmt::Debug + Clone {
+    fn rt<T>(
+        make: T,
+        into: impl Fn(T) -> Component,
+        from: impl Fn(&Component) -> Result<T, minicbor::decode::Error>,
+    ) where
+        T: PartialEq + std::fmt::Debug + Clone,
+    {
         let c = into(make.clone());
         assert_eq!(from(&c).unwrap(), make);
     }
@@ -67,48 +78,80 @@ mod tests {
     #[test]
     fn text_roundtrip() {
         let t = Text {
-            content: lit("hello"), style: TextStyle::Body,
-            tone: Some(Tone::Primary), align: Some(TextAlign::Start),
-            wrap: Some(TextWrap::Wrap), max_lines: Some(3), format: None,
+            content: lit("hello"),
+            style: TextStyle::Body,
+            tone: Some(Tone::Primary),
+            align: Some(TextAlign::Start),
+            wrap: Some(TextWrap::Wrap),
+            max_lines: Some(3),
+            format: None,
             streaming: Some(lit("stream_flag")),
         };
-        rt(t, |m| m.into_component("t").unwrap(), Text::try_from_component);
+        rt(
+            t,
+            |m| m.into_component("t").unwrap(),
+            Text::try_from_component,
+        );
     }
 
     #[test]
     fn text_streaming_absent_roundtrip() {
         let t = Text {
-            content: lit("hello"), style: TextStyle::Body,
-            tone: None, align: None, wrap: None, max_lines: None, format: None,
+            content: lit("hello"),
+            style: TextStyle::Body,
+            tone: None,
+            align: None,
+            wrap: None,
+            max_lines: None,
+            format: None,
             streaming: None,
         };
-        rt(t, |m| m.into_component("t").unwrap(), Text::try_from_component);
+        rt(
+            t,
+            |m| m.into_component("t").unwrap(),
+            Text::try_from_component,
+        );
     }
 
     #[test]
     fn heading_roundtrip() {
         let h = Heading {
-            content: lit("Title"), level: 1, tone: None, align: None,
+            content: lit("Title"),
+            level: 1,
+            tone: None,
+            align: None,
         };
-        rt(h, |m| m.into_component("h").unwrap(), Heading::try_from_component);
+        rt(
+            h,
+            |m| m.into_component("h").unwrap(),
+            Heading::try_from_component,
+        );
     }
 
     #[test]
     fn paragraph_full_roundtrip() {
         let p = Paragraph {
-            content: lit("Hello"), style: TextStyle::H3,
+            content: lit("Hello"),
+            style: TextStyle::H3,
             allowed_marks: vec![MarkdownMark::Bold, MarkdownMark::Code],
-            allow_links: true, max_lines: Some(4),
+            allow_links: true,
+            max_lines: Some(4),
         };
-        rt(p, |m| m.into_component("p").unwrap(), Paragraph::try_from_component);
+        rt(
+            p,
+            |m| m.into_component("p").unwrap(),
+            Paragraph::try_from_component,
+        );
     }
 
     #[test]
     fn paragraph_style_default_on_absent() {
         let p = Paragraph {
-            content: lit("Hello"), style: TextStyle::Body,
+            content: lit("Hello"),
+            style: TextStyle::Body,
             allowed_marks: vec![],
-            allow_links: true, max_lines: None,
+            allow_links: true,
+            max_lines: None,
         };
         let mut c = p.into_component("p").unwrap();
         c.fields.0.retain(|(k, _)| *k != 1);
@@ -124,50 +167,83 @@ mod tests {
             allowed_marks: vec![MarkdownMark::Bold],
             max_height_px: Some(400),
         };
-        rt(r, |m| m.into_component("r").unwrap(), RichText::try_from_component);
+        rt(
+            r,
+            |m| m.into_component("r").unwrap(),
+            RichText::try_from_component,
+        );
     }
 
     #[test]
     fn mono_block_roundtrip() {
         let m = MonoBlock {
-            content: lit("plain text"), max_height_px: None,
-            word_wrap: false, copyable: true,
+            content: lit("plain text"),
+            max_height_px: None,
+            word_wrap: false,
+            copyable: true,
         };
-        rt(m, |x| x.into_component("m").unwrap(), MonoBlock::try_from_component);
+        rt(
+            m,
+            |x| x.into_component("m").unwrap(),
+            MonoBlock::try_from_component,
+        );
     }
 
     #[test]
     fn code_block_roundtrip() {
         let cb = CodeBlock {
-            content: lit("fn main() {}"), language: "rust".into(),
-            show_line_numbers: true, copyable: true,
-            max_height_px: Some(300), highlight_lines: vec![1, 2],
+            content: lit("fn main() {}"),
+            language: "rust".into(),
+            show_line_numbers: true,
+            copyable: true,
+            max_height_px: Some(300),
+            highlight_lines: vec![1, 2],
         };
-        rt(cb, |x| x.into_component("cb").unwrap(), CodeBlock::try_from_component);
+        rt(
+            cb,
+            |x| x.into_component("cb").unwrap(),
+            CodeBlock::try_from_component,
+        );
     }
 
     #[test]
     fn key_value_roundtrip() {
         let kv = KeyValue {
-            items: vec![], density: Density::Default,
-            layout: KvLayout::Stacked, label_width: None,
+            items: vec![],
+            density: Density::Default,
+            layout: KvLayout::Stacked,
+            label_width: None,
         };
-        rt(kv, |m| m.into_component("kv").unwrap(), KeyValue::try_from_component);
+        rt(
+            kv,
+            |m| m.into_component("kv").unwrap(),
+            KeyValue::try_from_component,
+        );
     }
 
     #[test]
     fn stat_card_roundtrip_with_trend() {
         let sc = StatCard {
-            label: lit("Active cameras"), icon: None,
+            label: lit("Active cameras"),
+            icon: None,
             value: BindRef::Literal(Value::U64(42)),
-            value_suffix: Some(lit("/50")), format: None,
+            value_suffix: Some(lit("/50")),
+            format: None,
             trend: Some(Trend {
                 direction: TrendDirection::Up,
-                percent: 5.0, label: None, tone: None,
+                percent: 5.0,
+                label: None,
+                tone: None,
             }),
-            footnote: None, accent: Some(Tone::Success), clickable: false,
+            footnote: None,
+            accent: Some(Tone::Success),
+            clickable: false,
         };
-        rt(sc, |m| m.into_component("sc").unwrap(), StatCard::try_from_component);
+        rt(
+            sc,
+            |m| m.into_component("sc").unwrap(),
+            StatCard::try_from_component,
+        );
     }
 
     #[test]
@@ -175,29 +251,52 @@ mod tests {
         let s = Stat {
             label: lit("Total"),
             value: BindRef::Literal(Value::U64(100)),
-            format: None, trend: None, size: StatSize::Md,
+            format: None,
+            trend: None,
+            size: StatSize::Md,
         };
-        rt(s, |m| m.into_component("s").unwrap(), Stat::try_from_component);
+        rt(
+            s,
+            |m| m.into_component("s").unwrap(),
+            Stat::try_from_component,
+        );
     }
 
     #[test]
     fn badge_roundtrip() {
         let b = Badge {
-            variant: BadgeVariant::Solid, tone: Tone::Success,
-            label: lit("OK"), icon: None, count: None, max: 99, pulse: false,
+            variant: BadgeVariant::Solid,
+            tone: Tone::Success,
+            label: lit("OK"),
+            icon: None,
+            count: None,
+            max: 99,
+            pulse: false,
         };
-        rt(b, |m| m.into_component("b").unwrap(), Badge::try_from_component);
+        rt(
+            b,
+            |m| m.into_component("b").unwrap(),
+            Badge::try_from_component,
+        );
     }
 
     #[test]
     fn chip_roundtrip() {
         let ch = Chip {
-            variant: ChipVariant::Removable, tone: Tone::Info,
-            label: lit("filter1"), icon: None, avatar: None,
-            selected: None, removable: true,
+            variant: ChipVariant::Removable,
+            tone: Tone::Info,
+            label: lit("filter1"),
+            icon: None,
+            avatar: None,
+            selected: None,
+            removable: true,
             dot: Some(Tone::Success),
         };
-        rt(ch.clone(), |m| m.into_component("ch").unwrap(), Chip::try_from_component);
+        rt(
+            ch.clone(),
+            |m| m.into_component("ch").unwrap(),
+            Chip::try_from_component,
+        );
 
         // dot is optional: None omitted from the wire (old decoders reject
         // unknown key 7) and absent key 7 decodes back to None.
@@ -209,46 +308,80 @@ mod tests {
 
     #[test]
     fn tag_roundtrip() {
-        let t = Tag { tone: Tone::Neutral, label: lit("v1.0"), size: TagSize::Sm };
-        rt(t, |m| m.into_component("t").unwrap(), Tag::try_from_component);
+        let t = Tag {
+            tone: Tone::Neutral,
+            label: lit("v1.0"),
+            size: TagSize::Sm,
+        };
+        rt(
+            t,
+            |m| m.into_component("t").unwrap(),
+            Tag::try_from_component,
+        );
     }
 
     #[test]
     fn avatar_roundtrip() {
         let a = Avatar {
-            source: AvatarRef::Initials { initials: "PJ".into() },
-            size: AvatarSize::Md, shape: AvatarShape::Circle,
-            status: Some(AvatarStatus::Online), tone: None,
+            source: AvatarRef::Initials {
+                initials: "PJ".into(),
+            },
+            size: AvatarSize::Md,
+            shape: AvatarShape::Circle,
+            status: Some(AvatarStatus::Online),
+            tone: None,
         };
-        rt(a, |m| m.into_component("a").unwrap(), Avatar::try_from_component);
+        rt(
+            a,
+            |m| m.into_component("a").unwrap(),
+            Avatar::try_from_component,
+        );
     }
 
     #[test]
     fn avatar_group_roundtrip() {
         let ag = AvatarGroup {
             avatars: vec![dummy(Avatar::TAG)],
-            max_visible: 5, overlap: AvatarOverlap::Default, size: AvatarSize::Sm,
+            max_visible: 5,
+            overlap: AvatarOverlap::Default,
+            size: AvatarSize::Sm,
         };
-        rt(ag, |m| m.into_component("ag").unwrap(), AvatarGroup::try_from_component);
+        rt(
+            ag,
+            |m| m.into_component("ag").unwrap(),
+            AvatarGroup::try_from_component,
+        );
     }
 
     #[test]
     fn bullet_list_roundtrip() {
         let bl = BulletList {
             items: vec![lit("a"), lit("b")],
-            variant: BulletListVariant::Numbered, tone: None,
+            variant: BulletListVariant::Numbered,
+            tone: None,
             density: Density::Compact,
         };
-        rt(bl, |m| m.into_component("bl").unwrap(), BulletList::try_from_component);
+        rt(
+            bl,
+            |m| m.into_component("bl").unwrap(),
+            BulletList::try_from_component,
+        );
     }
 
     #[test]
     fn timeline_roundtrip() {
         let t = Timeline {
-            items: vec![], orientation: TimelineOrientation::Vertical,
-            density: Density::Default, show_dates: true, group_by_day: false,
+            items: vec![],
+            orientation: TimelineOrientation::Vertical,
+            density: Density::Default,
+            show_dates: true,
+            group_by_day: false,
         };
-        rt(t, |m| m.into_component("tl").unwrap(), Timeline::try_from_component);
+        rt(
+            t,
+            |m| m.into_component("tl").unwrap(),
+            Timeline::try_from_component,
+        );
     }
 
     #[test]
@@ -289,8 +422,14 @@ mod tests {
 
     fn non_button(id: &str) -> Component {
         Component {
-            tag: 0x040C, id: id.into(), fields: FieldMap::default(),
-            handlers: None, bind: None, a11y: None, visibility: None, test_id: None,
+            tag: 0x040C,
+            id: id.into(),
+            fields: FieldMap::default(),
+            handlers: None,
+            bind: None,
+            a11y: None,
+            visibility: None,
+            test_id: None,
         }
     }
 
@@ -302,14 +441,20 @@ mod tests {
             columns: vec![],
             rows_path: StatePath::new(vec![PathSegment::Key("rows".into())]),
             row_key_field: "id".into(),
-            variant: TableVariant::Default, density: Density::Default,
-            sortable: false, sort_by: None,
-            selectable: TableSelectMode::None, selected_ids: None,
-            sticky_header: true, sticky_columns: 0,
-            pagination: None, empty_state: None,
+            variant: TableVariant::Default,
+            density: Density::Default,
+            sortable: false,
+            sort_by: None,
+            selectable: TableSelectMode::None,
+            selected_ids: None,
+            sticky_header: true,
+            sticky_columns: 0,
+            pagination: None,
+            empty_state: None,
             row_actions: vec![non_button("bad")],
             bulk_actions: vec![],
-            virtualize: false, row_expandable: false,
+            virtualize: false,
+            row_expandable: false,
             expanded_row_template_id: None,
         };
         assert!(bad.into_component("tbl").is_err());
@@ -323,14 +468,20 @@ mod tests {
             columns: vec![],
             rows_path: StatePath::new(vec![PathSegment::Key("rows".into())]),
             row_key_field: "id".into(),
-            variant: TableVariant::Default, density: Density::Default,
-            sortable: false, sort_by: None,
-            selectable: TableSelectMode::None, selected_ids: None,
-            sticky_header: true, sticky_columns: 0,
-            pagination: None, empty_state: None,
+            variant: TableVariant::Default,
+            density: Density::Default,
+            sortable: false,
+            sort_by: None,
+            selectable: TableSelectMode::None,
+            selected_ids: None,
+            sticky_header: true,
+            sticky_columns: 0,
+            pagination: None,
+            empty_state: None,
             row_actions: vec![],
             bulk_actions: vec![non_button("bad")],
-            virtualize: false, row_expandable: false,
+            virtualize: false,
+            row_expandable: false,
             expanded_row_template_id: None,
         };
         assert!(bad.into_component("tbl").is_err());
@@ -370,7 +521,9 @@ mod tests {
     #[test]
     fn empty_cell_roundtrip() {
         use crate::protocol::ui::tokens::EmptyCellVariant;
-        let ec = EmptyCell { variant: EmptyCellVariant::EmDash };
+        let ec = EmptyCell {
+            variant: EmptyCellVariant::EmDash,
+        };
         let c = ec.into_component("ec").unwrap();
         assert_eq!(EmptyCell::try_from_component(&c).unwrap(), ec);
     }
@@ -394,7 +547,11 @@ mod tests {
     fn axis() -> crate::protocol::ui::inline::ChartAxis {
         use crate::protocol::ui::tokens::ChartAxisScale;
         crate::protocol::ui::inline::ChartAxis {
-            label: None, format: None, min: None, max: None, ticks: None,
+            label: None,
+            format: None,
+            min: None,
+            max: None,
+            ticks: None,
             scale: ChartAxisScale::Linear,
         }
     }
@@ -408,16 +565,24 @@ mod tests {
     }
 
     fn tooltip() -> crate::protocol::ui::inline::ChartTooltip {
-        crate::protocol::ui::inline::ChartTooltip { enabled: true, format: None }
+        crate::protocol::ui::inline::ChartTooltip {
+            enabled: true,
+            format: None,
+        }
     }
 
     #[test]
     fn line_chart_roundtrip() {
         use crate::protocol::ui::tokens::ChartZoomMode;
         let lc = LineChart {
-            series: vec![], x_axis: axis(), y_axis: axis(),
-            legend: legend(), tooltip: tooltip(),
-            zoom: ChartZoomMode::X, brush: false, height_px: 200,
+            series: vec![],
+            x_axis: axis(),
+            y_axis: axis(),
+            legend: legend(),
+            tooltip: tooltip(),
+            zoom: ChartZoomMode::X,
+            brush: false,
+            height_px: 200,
         };
         let c = lc.clone().into_component("lc").unwrap();
         assert_eq!(LineChart::try_from_component(&c).unwrap(), lc);
@@ -427,10 +592,13 @@ mod tests {
     fn bar_chart_roundtrip() {
         use crate::protocol::ui::tokens::{BarStacking, ChartOrientation};
         let bc = BarChart {
-            series: vec![], x_axis: axis(), y_axis: axis(),
+            series: vec![],
+            x_axis: axis(),
+            y_axis: axis(),
             orientation: ChartOrientation::Vertical,
             stacking: BarStacking::Stacked,
-            legend: legend(), height_px: 200,
+            legend: legend(),
+            height_px: 200,
         };
         let c = bc.clone().into_component("bc").unwrap();
         assert_eq!(BarChart::try_from_component(&c).unwrap(), bc);
@@ -440,10 +608,16 @@ mod tests {
     fn area_chart_full_roundtrip_non_default_opacity() {
         use crate::protocol::ui::tokens::{AreaStacking, ChartZoomMode};
         let ac = AreaChart {
-            series: vec![], x_axis: axis(), y_axis: axis(),
-            legend: legend(), tooltip: tooltip(),
-            zoom: ChartZoomMode::Both, brush: true, height_px: 400,
-            stacking: AreaStacking::Percent, opacity: 0.75,
+            series: vec![],
+            x_axis: axis(),
+            y_axis: axis(),
+            legend: legend(),
+            tooltip: tooltip(),
+            zoom: ChartZoomMode::Both,
+            brush: true,
+            height_px: 400,
+            stacking: AreaStacking::Percent,
+            opacity: 0.75,
         };
         let c = ac.clone().into_component("ac").unwrap();
         assert_eq!(c.tag, AreaChart::TAG);
@@ -454,10 +628,16 @@ mod tests {
     fn area_chart_default_opacity_on_absent() {
         use crate::protocol::ui::tokens::{AreaStacking, ChartZoomMode};
         let ac = AreaChart {
-            series: vec![], x_axis: axis(), y_axis: axis(),
-            legend: legend(), tooltip: tooltip(),
-            zoom: ChartZoomMode::None, brush: false, height_px: 200,
-            stacking: AreaStacking::None, opacity: 0.4,
+            series: vec![],
+            x_axis: axis(),
+            y_axis: axis(),
+            legend: legend(),
+            tooltip: tooltip(),
+            zoom: ChartZoomMode::None,
+            brush: false,
+            height_px: 200,
+            stacking: AreaStacking::None,
+            opacity: 0.4,
         };
         let mut c = ac.into_component("ac").unwrap();
         c.fields.0.retain(|(k, _)| *k != 9);
@@ -472,7 +652,10 @@ mod tests {
         let p = PieChart {
             data_path: StatePath::new(vec![PathSegment::Key("data".into())]),
             variant: PieVariant::Donut,
-            show_labels: true, show_legend: true, max_segments: 5, height_px: 240,
+            show_labels: true,
+            show_legend: true,
+            max_segments: 5,
+            height_px: 240,
         };
         let c = p.clone().into_component("pc").unwrap();
         assert_eq!(PieChart::try_from_component(&c).unwrap(), p);
@@ -483,7 +666,9 @@ mod tests {
         let sb = StackedBar {
             segments: vec![],
             total: BindRef::Literal(Value::U64(100)),
-            show_legend: false, show_percentages: true, height_px: 30,
+            show_legend: false,
+            show_percentages: true,
+            height_px: 30,
         };
         let c = sb.clone().into_component("sb").unwrap();
         assert_eq!(StackedBar::try_from_component(&c).unwrap(), sb);
@@ -495,11 +680,18 @@ mod tests {
         use crate::protocol::ui::inline::HeatmapScale;
         use crate::protocol::ui::tokens::HeatmapLegendPosition;
         let h = Heatmap {
-            rows: vec![], columns: vec![],
+            rows: vec![],
+            columns: vec![],
             cells_path: StatePath::new(vec![PathSegment::Key("cells".into())]),
-            scale: HeatmapScale::Linear { min: 0.0, max: 100.0, color_from: Tone::Info, color_to: Tone::Critical },
+            scale: HeatmapScale::Linear {
+                min: 0.0,
+                max: 100.0,
+                color_from: Tone::Info,
+                color_to: Tone::Critical,
+            },
             legend_position: HeatmapLegendPosition::Bottom,
-            cell_size_px: 24, tooltip: true,
+            cell_size_px: 24,
+            tooltip: true,
         };
         let c = h.clone().into_component("hm").unwrap();
         assert_eq!(Heatmap::try_from_component(&c).unwrap(), h);
@@ -510,10 +702,13 @@ mod tests {
         use crate::protocol::ui::tokens::GaugeVariant;
         let g = Gauge {
             value: BindRef::Literal(Value::U64(42)),
-            min: 0.0, max: 100.0,
+            min: 0.0,
+            max: 100.0,
             thresholds: vec![],
             variant: GaugeVariant::Arc,
-            label: None, format: None, size_px: 120,
+            label: None,
+            format: None,
+            size_px: 120,
         };
         let c = g.clone().into_component("gg").unwrap();
         assert_eq!(Gauge::try_from_component(&c).unwrap(), g);
@@ -546,7 +741,8 @@ mod tests {
             max: 1.0,
             variant: ProgressVariant::Default,
             tone: Tone::Primary,
-            show_label: true, label: None,
+            show_label: true,
+            label: None,
             size: ProgressSize::Md,
             orientation: None,
         };
@@ -563,7 +759,8 @@ mod tests {
             value: BindRef::Literal(Value::U64(7)),
             max: 10,
             variant: RatingVariant::Hearts,
-            show_value: true, precision: RatingPrecision::Decimal,
+            show_value: true,
+            precision: RatingPrecision::Decimal,
         };
         let c = r.clone().into_component("rd").unwrap();
         assert_eq!(RatingDisplay::try_from_component(&c).unwrap(), r);
@@ -576,7 +773,8 @@ mod tests {
             value: BindRef::Literal(Value::U64(4)),
             max: 5,
             variant: RatingVariant::Stars,
-            show_value: true, precision: RatingPrecision::Half,
+            show_value: true,
+            precision: RatingPrecision::Half,
         };
         let mut c = r.into_component("rd").unwrap();
         c.fields.0.retain(|(k, _)| *k != 1);
@@ -593,7 +791,8 @@ mod tests {
             after_path: StatePath::new(vec![PathSegment::Key("after".into())]),
             variant: DiffVariant::Split,
             language: Some("rust".into()),
-            word_wrap: false, show_line_numbers: true,
+            word_wrap: false,
+            show_line_numbers: true,
         };
         let c = d.clone().into_component("diff").unwrap();
         assert_eq!(Diff::try_from_component(&c).unwrap(), d);
@@ -618,7 +817,8 @@ mod tests {
         use crate::protocol::ui::tokens::DlLayout;
         let dl = DataDefinitionList {
             items: vec![DefItem {
-                term: lit("Term"), definition: lit("Definition"),
+                term: lit("Term"),
+                definition: lit("Definition"),
             }],
             layout: DlLayout::TwoColumn,
         };
@@ -632,7 +832,8 @@ mod tests {
         let j = JsonViewer {
             value_path: StatePath::new(vec![PathSegment::Key("data".into())]),
             collapsed_depth: 4,
-            max_height_px: 600, searchable: false,
+            max_height_px: 600,
+            searchable: false,
         };
         let c = j.clone().into_component("jv").unwrap();
         assert_eq!(JsonViewer::try_from_component(&c).unwrap(), j);
@@ -644,7 +845,8 @@ mod tests {
         let j = JsonViewer {
             value_path: StatePath::new(vec![PathSegment::Key("data".into())]),
             collapsed_depth: 2,
-            max_height_px: 400, searchable: true,
+            max_height_px: 400,
+            searchable: true,
         };
         let mut c = j.into_component("jv").unwrap();
         c.fields.0.retain(|(k, _)| *k != 1);
@@ -677,7 +879,8 @@ mod tests {
             fit: ImageFit::Cover,
             aspect_ratio: None,
             radius: Some(RadiusToken::Md),
-            clickable: false, lazy_load: true,
+            clickable: false,
+            lazy_load: true,
         };
         let c = im.clone().into_component("im").unwrap();
         assert_eq!(Image::try_from_component(&c).unwrap(), im);
@@ -707,7 +910,11 @@ mod tests {
             size: ProgressSize::Sm,
             orientation: Some(ProgressOrientation::Vertical),
         };
-        rt(p, |m| m.into_component("p").unwrap(), ProgressBar::try_from_component);
+        rt(
+            p,
+            |m| m.into_component("p").unwrap(),
+            ProgressBar::try_from_component,
+        );
     }
 
     #[test]
@@ -725,8 +932,14 @@ mod tests {
         };
         let c = p.clone().into_component("p").unwrap();
         // Key 7 must be absent so horizontal bars keep byte-identical payloads.
-        assert!(c.fields.0.iter().all(|(k, _)| *k != 7), "orientation key must be omitted");
-        assert_eq!(ProgressBar::try_from_component(&c).unwrap().orientation, None);
+        assert!(
+            c.fields.0.iter().all(|(k, _)| *k != 7),
+            "orientation key must be omitted"
+        );
+        assert_eq!(
+            ProgressBar::try_from_component(&c).unwrap().orientation,
+            None
+        );
     }
 
     #[test]
@@ -736,7 +949,8 @@ mod tests {
             politeness: Pol::Assertive,
             content: lit("Saved camera C-25"),
             visible: false,
-            tone: None, icon: None,
+            tone: None,
+            icon: None,
             clear_after_ms: Some(3000),
         };
         let c = lr.clone().into_component("lr").unwrap();

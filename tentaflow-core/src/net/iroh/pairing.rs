@@ -162,11 +162,13 @@ impl PairingHandler {
                         .security
                         .get_all_trusted_keys()
                         .into_iter()
-                        .map(|(node_id, public_key_hex, approved_at)| PairingTrustedKeyEntry {
-                            node_id,
-                            public_key_hex,
-                            approved_at,
-                        })
+                        .map(
+                            |(node_id, public_key_hex, approved_at)| PairingTrustedKeyEntry {
+                                node_id,
+                                public_key_hex,
+                                approved_at,
+                            },
+                        )
                         .collect(),
                 },
                 Some(hints),

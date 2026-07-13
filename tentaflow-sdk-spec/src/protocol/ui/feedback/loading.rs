@@ -2,6 +2,7 @@
 // File: protocol/ui/feedback/loading.rs — Skeleton/Spinner/LoadingBar (catalog §7)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::BindRef;
 use super::super::component::{Component, FieldMap};
 use super::super::inline::DimensionToken;
@@ -10,11 +11,19 @@ use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -37,8 +46,12 @@ impl Skeleton {
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(5);
         e.push((0, encode_to_value(&self.variant)?));
-        if let Some(v) = &self.width { e.push((1, encode_to_value(v)?)); }
-        if let Some(v) = &self.height { e.push((2, encode_to_value(v)?)); }
+        if let Some(v) = &self.width {
+            e.push((1, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.height {
+            e.push((2, encode_to_value(v)?));
+        }
         e.push((3, encode_to_value(&self.animate)?));
         e.push((4, encode_to_value(&self.lines)?));
         Ok(component(Self::TAG, id, e))
@@ -47,8 +60,11 @@ impl Skeleton {
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "Skeleton")?;
         ensure_no_duplicate_keys("Skeleton", &c.fields.0)?;
-        let mut variant = None; let mut width = None; let mut height = None;
-        let mut animate = None; let mut lines = None;
+        let mut variant = None;
+        let mut width = None;
+        let mut height = None;
+        let mut animate = None;
+        let mut lines = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => variant = Some(decode_from_value(v)?),
@@ -61,7 +77,8 @@ impl Skeleton {
         }
         Ok(Skeleton {
             variant: variant.ok_or_else(|| missing_field("Skeleton", "variant"))?,
-            width, height,
+            width,
+            height,
             animate: animate.ok_or_else(|| missing_field("Skeleton", "animate"))?,
             lines: lines.ok_or_else(|| missing_field("Skeleton", "lines"))?,
         })
@@ -88,7 +105,9 @@ impl Spinner {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(4);
         e.push((0, encode_to_value(&self.size)?));
         e.push((1, encode_to_value(&self.tone)?));
-        if let Some(v) = &self.label { e.push((2, encode_to_value(v)?)); }
+        if let Some(v) = &self.label {
+            e.push((2, encode_to_value(v)?));
+        }
         e.push((3, encode_to_value(&self.variant)?));
         Ok(component(Self::TAG, id, e))
     }
@@ -96,8 +115,10 @@ impl Spinner {
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "Spinner")?;
         ensure_no_duplicate_keys("Spinner", &c.fields.0)?;
-        let mut size = None; let mut tone = None;
-        let mut label = None; let mut variant = None;
+        let mut size = None;
+        let mut tone = None;
+        let mut label = None;
+        let mut variant = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => size = Some(decode_from_value(v)?),
@@ -134,7 +155,9 @@ impl LoadingBar {
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(3);
         e.push((0, encode_to_value(&self.visible)?));
-        if let Some(v) = &self.progress { e.push((1, encode_to_value(v)?)); }
+        if let Some(v) = &self.progress {
+            e.push((1, encode_to_value(v)?));
+        }
         e.push((2, encode_to_value(&self.tone)?));
         Ok(component(Self::TAG, id, e))
     }
@@ -142,7 +165,9 @@ impl LoadingBar {
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "LoadingBar")?;
         ensure_no_duplicate_keys("LoadingBar", &c.fields.0)?;
-        let mut visible = None; let mut progress = None; let mut tone = None;
+        let mut visible = None;
+        let mut progress = None;
+        let mut tone = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => visible = Some(decode_from_value(v)?),

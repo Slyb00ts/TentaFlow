@@ -101,13 +101,10 @@ impl<C> Encode<C> for IconRef {
 }
 
 impl<'b, C> Decode<'b, C> for IconRef {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut name: Option<IconName> = None;
         let mut size: Option<IconSize> = None;
@@ -233,13 +230,10 @@ impl<C> Encode<C> for AvatarRef {
 }
 
 impl<'b, C> Decode<'b, C> for AvatarRef {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut ref_: Option<String> = None;
         let mut initials: Option<String> = None;
@@ -433,13 +427,10 @@ impl<C> Encode<C> for SelectValue {
 }
 
 impl<'b, C> Decode<'b, C> for SelectValue {
-    fn decode(
-        d: &mut Decoder<'b>,
-        _ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut value_raw: Option<Value> = None;
         for _ in 0..len {
@@ -462,8 +453,8 @@ impl<'b, C> Decode<'b, C> for SelectValue {
         }
         let kind =
             kind.ok_or_else(|| minicbor::decode::Error::message("SelectValue missing kind"))?;
-        let value =
-            value_raw.ok_or_else(|| minicbor::decode::Error::message("SelectValue missing value"))?;
+        let value = value_raw
+            .ok_or_else(|| minicbor::decode::Error::message("SelectValue missing value"))?;
         match (kind.as_str(), value) {
             ("tstr", Value::Text(s)) => Ok(SelectValue::Text(s)),
             ("u32", Value::U64(n)) if n <= u32::MAX as u64 => Ok(SelectValue::UInt(n as u32)),
@@ -502,13 +493,10 @@ pub struct BreadcrumbItem {
 }
 
 impl<'b, C> Decode<'b, C> for BreadcrumbItem {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut label: Option<BindRef> = None;
         let mut icon: Option<IconRef> = None;
         let mut action_id: Option<String> = None;
@@ -636,13 +624,10 @@ pub struct SidebarItem {
 }
 
 impl<'b, C> Decode<'b, C> for SidebarItem {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut id: Option<String> = None;
         let mut icon: Option<IconRef> = None;
         let mut label: Option<BindRef> = None;
@@ -732,10 +717,7 @@ mod tests {
 
     fn rt<T>(v: T)
     where
-        T: minicbor::Encode<()>
-            + for<'b> minicbor::Decode<'b, ()>
-            + PartialEq
-            + core::fmt::Debug,
+        T: minicbor::Encode<()> + for<'b> minicbor::Decode<'b, ()> + PartialEq + core::fmt::Debug,
     {
         let mut b1 = Vec::new();
         minicbor::encode(&v, &mut b1).unwrap();
@@ -938,14 +920,27 @@ mod tests {
         let mut enc = minicbor::Encoder::new(&mut buf);
         enc.map(4).unwrap();
         enc.u8(0).unwrap();
-        enc.map(2).unwrap().str("kind").unwrap().str("literal").unwrap();
+        enc.map(2)
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("literal")
+            .unwrap();
         enc.str("value").unwrap().str("Home").unwrap();
         enc.u8(2).unwrap().str("nav.home").unwrap();
         enc.u8(3).unwrap();
-        enc.map(1).unwrap().str("kind").unwrap().str("noop").unwrap();
+        enc.map(1)
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("noop")
+            .unwrap();
         enc.u8(4).unwrap().bool(false).unwrap();
         let res: Result<BreadcrumbItem, _> = minicbor::decode(&buf);
-        assert!(res.is_err(), "decode must reject action_id+local_action coexistence");
+        assert!(
+            res.is_err(),
+            "decode must reject action_id+local_action coexistence"
+        );
     }
 
     #[test]
@@ -955,11 +950,21 @@ mod tests {
         enc.map(4).unwrap();
         enc.u8(0).unwrap().str("id1").unwrap();
         enc.u8(2).unwrap();
-        enc.map(2).unwrap().str("kind").unwrap().str("literal").unwrap();
+        enc.map(2)
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("literal")
+            .unwrap();
         enc.str("value").unwrap().str("X").unwrap();
         enc.u8(5).unwrap().str("nav.x").unwrap();
         enc.u8(6).unwrap();
-        enc.map(1).unwrap().str("kind").unwrap().str("noop").unwrap();
+        enc.map(1)
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("noop")
+            .unwrap();
         let res: Result<SidebarItem, _> = minicbor::decode(&buf);
         assert!(res.is_err());
     }
@@ -1628,13 +1633,10 @@ impl<C> Encode<C> for DimensionToken {
 }
 
 impl<'b, C> Decode<'b, C> for DimensionToken {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         // Two-pass: buffer `value` as generic `Value` so decode stays
         // independent of `kind` vs `value` ordering on the wire; the
         // `spacing` token text is resolved after `kind` is known.
@@ -1658,17 +1660,16 @@ impl<'b, C> Decode<'b, C> for DimensionToken {
                 }
             }
         }
-        let kind = kind
-            .ok_or_else(|| minicbor::decode::Error::message("DimensionToken missing kind"))?;
-        let need_no_value =
-            |has: bool, k: &str| -> Result<(), minicbor::decode::Error> {
-                if has {
-                    return Err(minicbor::decode::Error::message(format!(
-                        "DimensionToken.{k} must not carry value"
-                    )));
-                }
-                Ok(())
-            };
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("DimensionToken missing kind"))?;
+        let need_no_value = |has: bool, k: &str| -> Result<(), minicbor::decode::Error> {
+            if has {
+                return Err(minicbor::decode::Error::message(format!(
+                    "DimensionToken.{k} must not carry value"
+                )));
+            }
+            Ok(())
+        };
         match kind.as_str() {
             "auto" => {
                 need_no_value(value_raw.is_some(), "auto")?;
@@ -1694,27 +1695,37 @@ impl<'b, C> Decode<'b, C> for DimensionToken {
                 match other {
                     "px" => Ok(DimensionToken::Px {
                         value: take_u()?.try_into().map_err(|_| {
-                            minicbor::decode::Error::message("DimensionToken.px value out of u32 range")
+                            minicbor::decode::Error::message(
+                                "DimensionToken.px value out of u32 range",
+                            )
                         })?,
                     }),
                     "vh" => Ok(DimensionToken::Vh {
                         value: take_u()?.try_into().map_err(|_| {
-                            minicbor::decode::Error::message("DimensionToken.vh value out of u8 range")
+                            minicbor::decode::Error::message(
+                                "DimensionToken.vh value out of u8 range",
+                            )
                         })?,
                     }),
                     "vw" => Ok(DimensionToken::Vw {
                         value: take_u()?.try_into().map_err(|_| {
-                            minicbor::decode::Error::message("DimensionToken.vw value out of u8 range")
+                            minicbor::decode::Error::message(
+                                "DimensionToken.vw value out of u8 range",
+                            )
                         })?,
                     }),
                     "fr" => Ok(DimensionToken::Fr {
                         value: take_u()?.try_into().map_err(|_| {
-                            minicbor::decode::Error::message("DimensionToken.fr value out of u8 range")
+                            minicbor::decode::Error::message(
+                                "DimensionToken.fr value out of u8 range",
+                            )
                         })?,
                     }),
                     "percent" => Ok(DimensionToken::Percent {
                         value: take_u()?.try_into().map_err(|_| {
-                            minicbor::decode::Error::message("DimensionToken.percent value out of u8 range")
+                            minicbor::decode::Error::message(
+                                "DimensionToken.percent value out of u8 range",
+                            )
                         })?,
                     }),
                     "spacing" => match value_raw {
@@ -1798,13 +1809,10 @@ impl<C> Encode<C> for AspectRatio {
 }
 
 impl<'b, C> Decode<'b, C> for AspectRatio {
-    fn decode(
-        d: &mut Decoder<'b>,
-        _ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut ratio: Option<f64> = None;
         for _ in 0..len {
@@ -1929,13 +1937,10 @@ impl<C> Encode<C> for TableColumnWidth {
 }
 
 impl<'b, C> Decode<'b, C> for TableColumnWidth {
-    fn decode(
-        d: &mut Decoder<'b>,
-        _ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut value: Option<u64> = None;
         for _ in 0..len {
@@ -1956,8 +1961,8 @@ impl<'b, C> Decode<'b, C> for TableColumnWidth {
                 }
             }
         }
-        let kind = kind
-            .ok_or_else(|| minicbor::decode::Error::message("TableColumnWidth missing kind"))?;
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("TableColumnWidth missing kind"))?;
         let no_val = |has: bool, k: &str| -> Result<(), minicbor::decode::Error> {
             if has {
                 return Err(minicbor::decode::Error::message(format!(
@@ -2084,13 +2089,10 @@ impl<C> Encode<C> for HeatmapScale {
 }
 
 impl<'b, C> Decode<'b, C> for HeatmapScale {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut min: Option<f64> = None;
         let mut max: Option<f64> = None;
@@ -2143,8 +2145,8 @@ impl<'b, C> Decode<'b, C> for HeatmapScale {
                 }
             }
         }
-        let kind = kind
-            .ok_or_else(|| minicbor::decode::Error::message("HeatmapScale missing kind"))?;
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("HeatmapScale missing kind"))?;
         match kind.as_str() {
             "linear" => {
                 if base.is_some() || buckets.is_some() {
@@ -2160,9 +2162,7 @@ impl<'b, C> Decode<'b, C> for HeatmapScale {
                         minicbor::decode::Error::message("HeatmapScale.linear missing max")
                     })?,
                     color_from: color_from.ok_or_else(|| {
-                        minicbor::decode::Error::message(
-                            "HeatmapScale.linear missing color_from",
-                        )
+                        minicbor::decode::Error::message("HeatmapScale.linear missing color_from")
                     })?,
                     color_to: color_to.ok_or_else(|| {
                         minicbor::decode::Error::message("HeatmapScale.linear missing color_to")
@@ -2183,23 +2183,24 @@ impl<'b, C> Decode<'b, C> for HeatmapScale {
                         minicbor::decode::Error::message("HeatmapScale.logarithmic missing max")
                     })?,
                     base: base.ok_or_else(|| {
-                        minicbor::decode::Error::message(
-                            "HeatmapScale.logarithmic missing base",
-                        )
+                        minicbor::decode::Error::message("HeatmapScale.logarithmic missing base")
                     })?,
                 })
             }
             "categorical" => {
-                if min.is_some() || max.is_some() || color_from.is_some() || color_to.is_some() || base.is_some() {
+                if min.is_some()
+                    || max.is_some()
+                    || color_from.is_some()
+                    || color_to.is_some()
+                    || base.is_some()
+                {
                     return Err(minicbor::decode::Error::message(
                         "HeatmapScale.categorical must only carry buckets",
                     ));
                 }
                 Ok(HeatmapScale::Categorical {
                     buckets: buckets.ok_or_else(|| {
-                        minicbor::decode::Error::message(
-                            "HeatmapScale.categorical missing buckets",
-                        )
+                        minicbor::decode::Error::message("HeatmapScale.categorical missing buckets")
                     })?,
                 })
             }
@@ -2269,13 +2270,10 @@ impl<C> Encode<C> for DatePresetResolve {
 }
 
 impl<'b, C> Decode<'b, C> for DatePresetResolve {
-    fn decode(
-        d: &mut Decoder<'b>,
-        _ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut offset_days: Option<i32> = None;
         for _ in 0..len {
@@ -2296,9 +2294,8 @@ impl<'b, C> Decode<'b, C> for DatePresetResolve {
                 }
             }
         }
-        let kind = kind.ok_or_else(|| {
-            minicbor::decode::Error::message("DatePresetResolve missing kind")
-        })?;
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("DatePresetResolve missing kind"))?;
         let no_offset = |has: bool, k: &str| -> Result<(), minicbor::decode::Error> {
             if has {
                 return Err(minicbor::decode::Error::message(format!(
@@ -2334,9 +2331,7 @@ impl<'b, C> Decode<'b, C> for DatePresetResolve {
             }
             "custom" => Ok(DatePresetResolve::Custom {
                 offset_days: offset_days.ok_or_else(|| {
-                    minicbor::decode::Error::message(
-                        "DatePresetResolve.custom missing offset_days",
-                    )
+                    minicbor::decode::Error::message("DatePresetResolve.custom missing offset_days")
                 })?,
             }),
             other => Err(minicbor::decode::Error::message(format!(
@@ -2369,10 +2364,7 @@ mod tests_chunk_1_7b {
 
     fn rt<T>(v: T)
     where
-        T: minicbor::Encode<()>
-            + for<'b> minicbor::Decode<'b, ()>
-            + PartialEq
-            + core::fmt::Debug,
+        T: minicbor::Encode<()> + for<'b> minicbor::Decode<'b, ()> + PartialEq + core::fmt::Debug,
     {
         let mut b1 = Vec::new();
         minicbor::encode(&v, &mut b1).unwrap();
@@ -2389,9 +2381,16 @@ mod tests_chunk_1_7b {
         // host validator handles canonical wire enforcement separately).
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
-        enc.map(2).unwrap()
-            .str("value").unwrap().f64(42.5).unwrap()
-            .str("kind").unwrap().str("percent").unwrap();
+        enc.map(2)
+            .unwrap()
+            .str("value")
+            .unwrap()
+            .f64(42.5)
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("percent")
+            .unwrap();
         let v: SplitSize = minicbor::decode(&buf).unwrap();
         assert_eq!(v, SplitSize::Percent { value: 42.5 });
     }
@@ -2400,9 +2399,16 @@ mod tests_chunk_1_7b {
     fn split_size_decode_px_value_before_kind() {
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
-        enc.map(2).unwrap()
-            .str("value").unwrap().u32(120).unwrap()
-            .str("kind").unwrap().str("px").unwrap();
+        enc.map(2)
+            .unwrap()
+            .str("value")
+            .unwrap()
+            .u32(120)
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("px")
+            .unwrap();
         let v: SplitSize = minicbor::decode(&buf).unwrap();
         assert_eq!(v, SplitSize::Px { value: 120 });
     }
@@ -2439,17 +2445,31 @@ mod tests_chunk_1_7b {
         // for both the numeric and the spacing-token variants.
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
-        enc.map(2).unwrap()
-            .str("value").unwrap().str("md").unwrap()
-            .str("kind").unwrap().str("spacing").unwrap();
+        enc.map(2)
+            .unwrap()
+            .str("value")
+            .unwrap()
+            .str("md")
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("spacing")
+            .unwrap();
         let v: DimensionToken = minicbor::decode(&buf).unwrap();
         assert_eq!(v, DimensionToken::Spacing { value: Spacing::Md });
 
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
-        enc.map(2).unwrap()
-            .str("value").unwrap().u32(320).unwrap()
-            .str("kind").unwrap().str("px").unwrap();
+        enc.map(2)
+            .unwrap()
+            .str("value")
+            .unwrap()
+            .u32(320)
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("px")
+            .unwrap();
         let v: DimensionToken = minicbor::decode(&buf).unwrap();
         assert_eq!(v, DimensionToken::Px { value: 320 });
     }
@@ -2458,9 +2478,16 @@ mod tests_chunk_1_7b {
     fn dimension_token_spacing_unknown_token_rejected() {
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
-        enc.map(2).unwrap()
-            .str("kind").unwrap().str("spacing").unwrap()
-            .str("value").unwrap().str("gigantic").unwrap();
+        enc.map(2)
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("spacing")
+            .unwrap()
+            .str("value")
+            .unwrap()
+            .str("gigantic")
+            .unwrap();
         let res: Result<DimensionToken, _> = minicbor::decode(&buf);
         assert!(res.is_err());
     }
@@ -2815,13 +2842,10 @@ impl<C> Encode<C> for BorderToken {
 }
 
 impl<'b, C> Decode<'b, C> for BorderToken {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut tone: Option<Tone> = None;
         let mut seen_kind = false;
@@ -2831,14 +2855,18 @@ impl<'b, C> Decode<'b, C> for BorderToken {
             match k {
                 "kind" => {
                     if seen_kind {
-                        return Err(minicbor::decode::Error::message("BorderToken: duplicate `kind` key"));
+                        return Err(minicbor::decode::Error::message(
+                            "BorderToken: duplicate `kind` key",
+                        ));
                     }
                     seen_kind = true;
                     kind = Some(d.str()?.to_string());
                 }
                 "tone" => {
                     if seen_tone {
-                        return Err(minicbor::decode::Error::message("BorderToken: duplicate `tone` key"));
+                        return Err(minicbor::decode::Error::message(
+                            "BorderToken: duplicate `tone` key",
+                        ));
                     }
                     seen_tone = true;
                     tone = Some(Tone::decode(d, ctx)?);
@@ -2850,7 +2878,8 @@ impl<'b, C> Decode<'b, C> for BorderToken {
                 }
             }
         }
-        let kind = kind.ok_or_else(|| minicbor::decode::Error::message("BorderToken missing kind"))?;
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("BorderToken missing kind"))?;
         let no_tone = |has: bool, k: &str| -> Result<(), minicbor::decode::Error> {
             if has {
                 return Err(minicbor::decode::Error::message(format!(
@@ -2860,10 +2889,22 @@ impl<'b, C> Decode<'b, C> for BorderToken {
             Ok(())
         };
         match kind.as_str() {
-            "none" => { no_tone(tone.is_some(), "none")?; Ok(BorderToken::None) }
-            "hairline" => { no_tone(tone.is_some(), "hairline")?; Ok(BorderToken::Hairline) }
-            "thin" => { no_tone(tone.is_some(), "thin")?; Ok(BorderToken::Thin) }
-            "strong" => { no_tone(tone.is_some(), "strong")?; Ok(BorderToken::Strong) }
+            "none" => {
+                no_tone(tone.is_some(), "none")?;
+                Ok(BorderToken::None)
+            }
+            "hairline" => {
+                no_tone(tone.is_some(), "hairline")?;
+                Ok(BorderToken::Hairline)
+            }
+            "thin" => {
+                no_tone(tone.is_some(), "thin")?;
+                Ok(BorderToken::Thin)
+            }
+            "strong" => {
+                no_tone(tone.is_some(), "strong")?;
+                Ok(BorderToken::Strong)
+            }
             "accent" => Ok(BorderToken::Accent {
                 tone: tone.ok_or_else(|| {
                     minicbor::decode::Error::message("BorderToken.accent missing tone")
@@ -2929,13 +2970,10 @@ impl<C> Encode<C> for SplitSize {
 }
 
 impl<'b, C> Decode<'b, C> for SplitSize {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         // Two-pass approach: buffer `value` as a generic `Value` regardless of
         // key order, then resolve to u32/f64 in the variant match below using
         // `kind`. This makes the decoder independent of `kind` vs `value`
@@ -2949,14 +2987,18 @@ impl<'b, C> Decode<'b, C> for SplitSize {
             match k {
                 "kind" => {
                     if seen_kind {
-                        return Err(minicbor::decode::Error::message("SplitSize: duplicate `kind` key"));
+                        return Err(minicbor::decode::Error::message(
+                            "SplitSize: duplicate `kind` key",
+                        ));
                     }
                     seen_kind = true;
                     kind = Some(d.str()?.to_string());
                 }
                 "value" => {
                     if seen_value {
-                        return Err(minicbor::decode::Error::message("SplitSize: duplicate `value` key"));
+                        return Err(minicbor::decode::Error::message(
+                            "SplitSize: duplicate `value` key",
+                        ));
                     }
                     seen_value = true;
                     value = Some(Value::decode(d, ctx)?);
@@ -2968,7 +3010,8 @@ impl<'b, C> Decode<'b, C> for SplitSize {
                 }
             }
         }
-        let kind = kind.ok_or_else(|| minicbor::decode::Error::message("SplitSize missing kind"))?;
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("SplitSize missing kind"))?;
         match kind.as_str() {
             "auto" => {
                 if value.is_some() {
@@ -3074,13 +3117,10 @@ impl<C> Encode<C> for GridCol {
 }
 
 impl<'b, C> Decode<'b, C> for GridCol {
-    fn decode(
-        d: &mut Decoder<'b>,
-        _ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut value: Option<u64> = None;
         let mut seen_kind = false;
@@ -3090,14 +3130,18 @@ impl<'b, C> Decode<'b, C> for GridCol {
             match k {
                 "kind" => {
                     if seen_kind {
-                        return Err(minicbor::decode::Error::message("GridCol: duplicate `kind` key"));
+                        return Err(minicbor::decode::Error::message(
+                            "GridCol: duplicate `kind` key",
+                        ));
                     }
                     seen_kind = true;
                     kind = Some(d.str()?.to_string());
                 }
                 "value" => {
                     if seen_value {
-                        return Err(minicbor::decode::Error::message("GridCol: duplicate `value` key"));
+                        return Err(minicbor::decode::Error::message(
+                            "GridCol: duplicate `value` key",
+                        ));
                     }
                     seen_value = true;
                     value = Some(d.u64()?);
@@ -3119,27 +3163,37 @@ impl<'b, C> Decode<'b, C> for GridCol {
             Ok(())
         };
         match kind.as_str() {
-            "auto" => { no_val(value.is_some(), "auto")?; Ok(GridCol::Auto) }
-            "fill" => { no_val(value.is_some(), "fill")?; Ok(GridCol::Fill) }
-            "min_content" => { no_val(value.is_some(), "min_content")?; Ok(GridCol::MinContent) }
-            "max_content" => { no_val(value.is_some(), "max_content")?; Ok(GridCol::MaxContent) }
+            "auto" => {
+                no_val(value.is_some(), "auto")?;
+                Ok(GridCol::Auto)
+            }
+            "fill" => {
+                no_val(value.is_some(), "fill")?;
+                Ok(GridCol::Fill)
+            }
+            "min_content" => {
+                no_val(value.is_some(), "min_content")?;
+                Ok(GridCol::MinContent)
+            }
+            "max_content" => {
+                no_val(value.is_some(), "max_content")?;
+                Ok(GridCol::MaxContent)
+            }
             "fr" => Ok(GridCol::Fr {
-                value: value.ok_or_else(|| {
-                    minicbor::decode::Error::message("GridCol.fr missing value")
-                })?
-                .try_into()
-                .map_err(|_| {
-                    minicbor::decode::Error::message("GridCol.fr value out of u8 range")
-                })?,
+                value: value
+                    .ok_or_else(|| minicbor::decode::Error::message("GridCol.fr missing value"))?
+                    .try_into()
+                    .map_err(|_| {
+                        minicbor::decode::Error::message("GridCol.fr value out of u8 range")
+                    })?,
             }),
             "px" => Ok(GridCol::Px {
-                value: value.ok_or_else(|| {
-                    minicbor::decode::Error::message("GridCol.px missing value")
-                })?
-                .try_into()
-                .map_err(|_| {
-                    minicbor::decode::Error::message("GridCol.px value out of u32 range")
-                })?,
+                value: value
+                    .ok_or_else(|| minicbor::decode::Error::message("GridCol.px missing value"))?
+                    .try_into()
+                    .map_err(|_| {
+                        minicbor::decode::Error::message("GridCol.px value out of u32 range")
+                    })?,
             }),
             other => Err(minicbor::decode::Error::message(format!(
                 "unknown GridCol.kind: {other}"
@@ -3173,7 +3227,7 @@ impl<C> Encode<C> for GridTrack {
                 e.str("count")?.u8(*count)?;
             }
             GridTrack::Explicit { cols } => {
-                // Keys: "cols"(0x64..), "kind"(0x64..). 
+                // Keys: "cols"(0x64..), "kind"(0x64..).
                 //   "cols" = 0x64 63.., "kind" = 0x64 6b.. → cols < kind.
                 e.map(2)?;
                 e.str("cols")?;
@@ -3189,13 +3243,10 @@ impl<C> Encode<C> for GridTrack {
 }
 
 impl<'b, C> Decode<'b, C> for GridTrack {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut count: Option<u8> = None;
         let mut cols: Option<Vec<GridCol>> = None;
@@ -3207,21 +3258,27 @@ impl<'b, C> Decode<'b, C> for GridTrack {
             match k {
                 "kind" => {
                     if seen_kind {
-                        return Err(minicbor::decode::Error::message("GridTrack: duplicate `kind` key"));
+                        return Err(minicbor::decode::Error::message(
+                            "GridTrack: duplicate `kind` key",
+                        ));
                     }
                     seen_kind = true;
                     kind = Some(d.str()?.to_string());
                 }
                 "count" => {
                     if seen_count {
-                        return Err(minicbor::decode::Error::message("GridTrack: duplicate `count` key"));
+                        return Err(minicbor::decode::Error::message(
+                            "GridTrack: duplicate `count` key",
+                        ));
                     }
                     seen_count = true;
                     count = Some(d.u8()?);
                 }
                 "cols" => {
                     if seen_cols {
-                        return Err(minicbor::decode::Error::message("GridTrack: duplicate `cols` key"));
+                        return Err(minicbor::decode::Error::message(
+                            "GridTrack: duplicate `cols` key",
+                        ));
                     }
                     seen_cols = true;
                     let n = d.array()?.ok_or_else(|| {
@@ -3240,7 +3297,8 @@ impl<'b, C> Decode<'b, C> for GridTrack {
                 }
             }
         }
-        let kind = kind.ok_or_else(|| minicbor::decode::Error::message("GridTrack missing kind"))?;
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("GridTrack missing kind"))?;
         match kind.as_str() {
             "equal" => {
                 if cols.is_some() {
@@ -3314,13 +3372,10 @@ impl<C> Encode<C> for SpaceValue {
 }
 
 impl<'b, C> Decode<'b, C> for SpaceValue {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         // Two-pass: buffer `value` as generic `Value` so decode stays
         // independent of `kind` vs `value` ordering on the wire.
         let mut kind: Option<String> = None;
@@ -3409,13 +3464,10 @@ impl<C> Encode<C> for RadiusValue {
 }
 
 impl<'b, C> Decode<'b, C> for RadiusValue {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut value: Option<Value> = None;
         for _ in 0..len {
@@ -3503,13 +3555,10 @@ impl<C> Encode<C> for ContainerWidth {
 }
 
 impl<'b, C> Decode<'b, C> for ContainerWidth {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut value: Option<Value> = None;
         for _ in 0..len {
@@ -3532,8 +3581,8 @@ impl<'b, C> Decode<'b, C> for ContainerWidth {
         }
         let kind =
             kind.ok_or_else(|| minicbor::decode::Error::message("ContainerWidth missing kind"))?;
-        let value =
-            value.ok_or_else(|| minicbor::decode::Error::message("ContainerWidth missing value"))?;
+        let value = value
+            .ok_or_else(|| minicbor::decode::Error::message("ContainerWidth missing value"))?;
         match (kind.as_str(), value) {
             ("token", Value::Text(s)) => Ok(ContainerWidth::Token(
                 super::tokens::Breakpoint::from_wire(&s).ok_or_else(|| {
@@ -3580,7 +3629,11 @@ pub struct BorderSide {
 
 impl BorderSide {
     pub fn new(width_px: u8, color: super::tokens::BorderColor) -> Self {
-        Self { width_px, color, style: super::tokens::BorderLineStyle::Solid }
+        Self {
+            width_px,
+            color,
+            style: super::tokens::BorderLineStyle::Solid,
+        }
     }
 }
 
@@ -3603,17 +3656,30 @@ pub struct EdgeValues {
 impl EdgeValues {
     pub fn all(v: impl Into<SpaceValue>) -> Self {
         let v = v.into();
-        Self { top: Some(v), right: Some(v), bottom: Some(v), left: Some(v) }
+        Self {
+            top: Some(v),
+            right: Some(v),
+            bottom: Some(v),
+            left: Some(v),
+        }
     }
 
     pub fn x(v: impl Into<SpaceValue>) -> Self {
         let v = v.into();
-        Self { left: Some(v), right: Some(v), ..Self::default() }
+        Self {
+            left: Some(v),
+            right: Some(v),
+            ..Self::default()
+        }
     }
 
     pub fn y(v: impl Into<SpaceValue>) -> Self {
         let v = v.into();
-        Self { top: Some(v), bottom: Some(v), ..Self::default() }
+        Self {
+            top: Some(v),
+            bottom: Some(v),
+            ..Self::default()
+        }
     }
 }
 
@@ -3633,7 +3699,12 @@ pub struct BorderEdges {
 
 impl BorderEdges {
     pub fn all(side: BorderSide) -> Self {
-        Self { top: Some(side), right: Some(side), bottom: Some(side), left: Some(side) }
+        Self {
+            top: Some(side),
+            right: Some(side),
+            bottom: Some(side),
+            left: Some(side),
+        }
     }
 }
 
@@ -3922,10 +3993,7 @@ mod tests_box_style {
 
     fn rt<T>(v: T)
     where
-        T: minicbor::Encode<()>
-            + for<'b> minicbor::Decode<'b, ()>
-            + PartialEq
-            + core::fmt::Debug,
+        T: minicbor::Encode<()> + for<'b> minicbor::Decode<'b, ()> + PartialEq + core::fmt::Debug,
     {
         let mut b1 = Vec::new();
         minicbor::encode(&v, &mut b1).unwrap();
@@ -3948,9 +4016,16 @@ mod tests_box_style {
         // kind="px" but value is a string — must reject.
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
-        enc.map(2).unwrap()
-            .str("kind").unwrap().str("px").unwrap()
-            .str("value").unwrap().str("md").unwrap();
+        enc.map(2)
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("px")
+            .unwrap()
+            .str("value")
+            .unwrap()
+            .str("md")
+            .unwrap();
         let res: Result<SpaceValue, _> = minicbor::decode(&buf);
         assert!(res.is_err());
     }
@@ -3959,9 +4034,16 @@ mod tests_box_style {
     fn space_value_unknown_token_rejected() {
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
-        enc.map(2).unwrap()
-            .str("kind").unwrap().str("token").unwrap()
-            .str("value").unwrap().str("gigantic").unwrap();
+        enc.map(2)
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("token")
+            .unwrap()
+            .str("value")
+            .unwrap()
+            .str("gigantic")
+            .unwrap();
         let res: Result<SpaceValue, _> = minicbor::decode(&buf);
         assert!(res.is_err());
     }
@@ -3970,9 +4052,16 @@ mod tests_box_style {
     fn space_value_px_out_of_u16_rejected() {
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
-        enc.map(2).unwrap()
-            .str("kind").unwrap().str("px").unwrap()
-            .str("value").unwrap().u32(70_000).unwrap();
+        enc.map(2)
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("px")
+            .unwrap()
+            .str("value")
+            .unwrap()
+            .u32(70_000)
+            .unwrap();
         let res: Result<SpaceValue, _> = minicbor::decode(&buf);
         assert!(res.is_err());
     }
@@ -3981,16 +4070,25 @@ mod tests_box_style {
     fn space_value_decode_value_before_kind() {
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
-        enc.map(2).unwrap()
-            .str("value").unwrap().u16(12).unwrap()
-            .str("kind").unwrap().str("px").unwrap();
+        enc.map(2)
+            .unwrap()
+            .str("value")
+            .unwrap()
+            .u16(12)
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("px")
+            .unwrap();
         let v: SpaceValue = minicbor::decode(&buf).unwrap();
         assert_eq!(v, SpaceValue::Px { value: 12 });
     }
 
     #[test]
     fn radius_value_variants_roundtrip() {
-        rt(RadiusValue::Token { value: RadiusToken::Pill });
+        rt(RadiusValue::Token {
+            value: RadiusToken::Pill,
+        });
         rt(RadiusValue::Px { value: 6 });
     }
 
@@ -4003,7 +4101,10 @@ mod tests_box_style {
         };
         rt(side);
         rt(BorderEdges::all(side));
-        rt(BorderEdges { bottom: Some(side), ..BorderEdges::default() });
+        rt(BorderEdges {
+            bottom: Some(side),
+            ..BorderEdges::default()
+        });
     }
 
     #[test]
@@ -4059,9 +4160,16 @@ mod tests_box_style {
     fn container_width_kind_type_mismatch_rejected() {
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
-        enc.map(2).unwrap()
-            .str("kind").unwrap().str("px").unwrap()
-            .str("value").unwrap().str("md").unwrap();
+        enc.map(2)
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("px")
+            .unwrap()
+            .str("value")
+            .unwrap()
+            .str("md")
+            .unwrap();
         let res: Result<ContainerWidth, _> = minicbor::decode(&buf);
         assert!(res.is_err());
     }

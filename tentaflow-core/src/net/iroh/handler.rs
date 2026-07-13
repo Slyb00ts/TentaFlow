@@ -93,9 +93,7 @@ pub async fn read_envelope_and_body(
 /// index-tagged enum, so a frame from a peer on a different version could
 /// decode "successfully" as the WRONG variant instead of being rejected
 /// (mirrors the `MetaSchemaVersionCheck` gate on the dashboard WS).
-pub fn decode_envelope_and_body(
-    buf: &[u8],
-) -> Result<(Envelope, MessageBody), IrohStreamError> {
+pub fn decode_envelope_and_body(buf: &[u8]) -> Result<(Envelope, MessageBody), IrohStreamError> {
     let envelope = tentaflow_protocol::cbor::decode::<Envelope>(buf)
         .map_err(IrohStreamError::EnvelopeDecode)?;
     if envelope.schema_version != tentaflow_protocol::SCHEMA_VERSION {
@@ -119,7 +117,8 @@ mod tests {
             client_version: version,
         })
         .expect("encode body");
-        let mut envelope = Envelope::new_direct(1, 1, message_kind::META_SCHEMA_VERSION_CHECK, body);
+        let mut envelope =
+            Envelope::new_direct(1, 1, message_kind::META_SCHEMA_VERSION_CHECK, body);
         envelope.schema_version = version;
         tentaflow_protocol::cbor::encode(&envelope).expect("encode envelope")
     }

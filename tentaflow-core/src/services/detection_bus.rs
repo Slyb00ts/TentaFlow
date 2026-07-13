@@ -47,10 +47,33 @@ pub struct Detection {
     pub stan: Vec<String>,
     #[serde(default)]
     pub tekst: Option<String>,
+    /// Mean OCR confidence (0..1) of the WINNING `tekst` — the vote's weighted
+    /// winner confidence, not one raw frame. `None` when there is no OCR text
+    /// (or the read was gated out as unreadable). Serialized as `null`; the
+    /// `#[serde(default)]` keeps older CBOR/JSON without the field decodable.
+    #[serde(default)]
+    pub tekst_conf: Option<f32>,
+    /// Snapshot ref (`snap_<uuid>`) of the FULL downscaled camera frame captured
+    /// at the moment this track's OCR read reached a new best confidence — the
+    /// whole visible scene, NOT a crop. `None` when no thumbnail was captured for
+    /// this frame's read. The event recorder promotes this ref into the
+    /// `recordings.plate_thumb_ref`/`adr_thumb_ref` list thumbnail when the read
+    /// is the event's best so far. Serialized as `null`; `#[serde(default)]`
+    /// keeps older CBOR/JSON without the field decodable.
+    #[serde(default)]
+    pub tekst_thumb_ref: Option<String>,
     /// Stabilny identyfikator sledzenia nadany przez tracker IOU. 0 = brak
     /// przypisania (np. detekcje ze zrodel bez trackera).
     #[serde(default)]
     pub track_id: u32,
+    /// Stabilny identyfikator POJAZDU, na ktorym siedzi ten znak/tablica, nadany
+    /// przez asocjacje (`assign_vehicle`) do stabilnego track_id trackera
+    /// "vehicles". 0 = brak przypisania (znak poza jakimkolwiek pojazdem albo
+    /// model pojazdow niedostepny) — trzymany do overlayu, ale wykluczony z
+    /// grupowania per-pojazd. Dla samych boxow pojazdow rowna sie ich track_id.
+    /// `#[serde(default)]` zachowuje kompatybilnosc CBOR/JSON jak `track_id`.
+    #[serde(default)]
+    pub vehicle_id: u32,
     /// Prędkość srodka boxa w jednostkach znormalizowanych/s (os X). 0 gdy brak
     /// bazy czasu (pts_ns) albo pierwsza obserwacja tracku.
     #[serde(default)]
@@ -86,6 +109,13 @@ pub struct DetectionsMessage {
     /// Czas CALOSCI obrobki klatki w ms (detekcja + OCR + klasyfikacja stanu).
     /// Klient pokazuje go jako badge. 0 gdy nieznany (np. surowa ramka FAZY 1).
     pub proc_ms: u32,
+    /// True tylko dla ramki FAZY 2 (cold): detekcje niosa ostateczne `vehicle_id`
+    /// (asocjacja znak→pojazd) ORAZ wzbogacenie OCR/stan. FAZA 1 (hot overlay) i
+    /// ramki flow/stub maja `false` — overlay je rysuje, ale event recorder ich
+    /// NIE bucketuje (inaczej co-klatkowe, niezstampowane detekcje zalewaja
+    /// bucket `vehicle_id = 0`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub enriched: bool,
     pub items: Vec<Detection>,
 }
 
@@ -95,6 +125,7 @@ impl DetectionsMessage {
         ts_ms: u64,
         pts_ns: Option<u64>,
         proc_ms: u32,
+        enriched: bool,
         items: Vec<Detection>,
     ) -> Self {
         Self {
@@ -103,6 +134,7 @@ impl DetectionsMessage {
             ts_ms,
             pts_ns,
             proc_ms,
+            enriched,
             items,
         }
     }
@@ -161,9 +193,23 @@ pub fn publish_detections(
     ts_ms: u64,
     pts_ns: Option<u64>,
     proc_ms: u32,
+    enriched: bool,
     items: Vec<Detection>,
 ) {
-    let msg = DetectionsMessage::new(camera_id.to_string(), ts_ms, pts_ns, proc_ms, items);
+    // Per-vehicle event recording rides the same bus: the hook lazily spawns a
+    // recorder task for this camera (cheap set-probe once one exists). Fired
+    // for EMPTY frames too, so the recorder's pre-roll buffer is warm before
+    // the first vehicle of the day.
+    #[cfg(feature = "camera")]
+    crate::services::event_recorder::on_detections_published(camera_id);
+    let msg = DetectionsMessage::new(
+        camera_id.to_string(),
+        ts_ms,
+        pts_ns,
+        proc_ms,
+        enriched,
+        items,
+    );
     // `send` zwraca Err tylko gdy nie ma zadnych odbiorcow — ignorujemy.
     let _ = detection_bus().sender(camera_id).send(msg);
 }
@@ -209,7 +255,10 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                 score: 0.96,
                 stan: Vec::new(),
                 tekst: Some("30/1202".to_string()),
+                tekst_conf: None,
+                tekst_thumb_ref: None,
                 track_id: 0,
+                vehicle_id: 0,
                 vx: 0.,
                 vy: 0.,
             };
@@ -226,7 +275,10 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                     Vec::new()
                 },
                 tekst: None,
+                tekst_conf: None,
+                tekst_thumb_ref: None,
                 track_id: 0,
+                vehicle_id: 0,
                 vx: 0.,
                 vy: 0.,
             };
@@ -242,7 +294,10 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                     score: 0.88,
                     stan: Vec::new(),
                     tekst: None,
+                    tekst_conf: None,
+                    tekst_thumb_ref: None,
                     track_id: 0,
+                    vehicle_id: 0,
                     vx: 0.,
                     vy: 0.,
                 });
@@ -254,7 +309,7 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            publish_detections(&camera_id, ts_ms, None, 0, items);
+            publish_detections(&camera_id, ts_ms, None, 0, false, items);
         }
     })
 }
@@ -274,6 +329,7 @@ mod tests {
             0,
             None,
             0,
+            false,
             vec![
                 Detection {
                     klasa: "tablica_adr".to_string(),
@@ -281,7 +337,10 @@ mod tests {
                     score: 0.96,
                     stan: Vec::new(),
                     tekst: Some("30/1202".to_string()),
+                    tekst_conf: None,
+                    tekst_thumb_ref: None,
                     track_id: 0,
+                    vehicle_id: 0,
                     vx: 0.,
                     vy: 0.,
                 },
@@ -291,7 +350,10 @@ mod tests {
                     score: 0.94,
                     stan: vec!["uszkodzona".to_string()],
                     tekst: None,
+                    tekst_conf: None,
+                    tekst_thumb_ref: None,
                     track_id: 0,
+                    vehicle_id: 0,
                     vx: 0.,
                     vy: 0.,
                 },
@@ -343,13 +405,17 @@ mod tests {
             0,
             None,
             0,
+            false,
             vec![Detection {
                 klasa: "termometr".to_string(),
                 bbox: [0.1, 0.1, 0.2, 0.2],
                 score: 0.5,
                 stan: Vec::new(),
                 tekst: None,
+                tekst_conf: None,
+                tekst_thumb_ref: None,
                 track_id: 0,
+                vehicle_id: 0,
                 vx: 0.,
                 vy: 0.,
             }],
@@ -368,13 +434,17 @@ mod tests {
             0,
             None,
             0,
+            false,
             vec![Detection {
                 klasa: "nalepka_9".to_string(),
                 bbox: [0.0, 0.0, 0.1, 0.1],
                 score: 0.9,
                 stan: Vec::new(),
                 tekst: None,
+                tekst_conf: None,
+                tekst_thumb_ref: None,
                 track_id: 0,
+                vehicle_id: 0,
                 vx: 0.,
                 vy: 0.,
             }],

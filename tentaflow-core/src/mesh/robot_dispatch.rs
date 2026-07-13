@@ -26,7 +26,7 @@ use tracing::warn;
 
 use crate::db::DbPool;
 use crate::mesh::robot_control::{
-    plan_execution, RobotAction, RobotControlRequest, RobotControlResponse, RejectReason,
+    plan_execution, RejectReason, RobotAction, RobotControlRequest, RobotControlResponse,
     MAX_MOVE_DURATION_MS, MAX_VELOCITY,
 };
 
@@ -657,7 +657,10 @@ fn parse_lidar_snapshot(status: &serde_json::Value) -> Option<RobotLidarSnapshot
         return None;
     }
     let enabled = l.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
-    let available = l.get("available").and_then(|v| v.as_bool()).unwrap_or(false);
+    let available = l
+        .get("available")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let point_count = l
         .get("point_count")
         .and_then(|v| v.as_u64())
@@ -670,7 +673,10 @@ fn parse_lidar_snapshot(status: &serde_json::Value) -> Option<RobotLidarSnapshot
         .map(|n| n as f32);
     let origin = parse_fixed_f64_array(l.get("origin"));
     let frame_seq = l.get("frame_seq").and_then(|v| v.as_u64()).unwrap_or(0);
-    let last_update_ts = l.get("last_update_ts").and_then(|v| v.as_i64()).unwrap_or(0);
+    let last_update_ts = l
+        .get("last_update_ts")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     Some(RobotLidarSnapshot {
         enabled,
         available,
@@ -806,8 +812,14 @@ fn parse_actions_meta(status: &serde_json::Value) -> Vec<AdvertisedAction> {
                 .filter(|s| !s.is_empty())
                 .unwrap_or("medium")
                 .to_string();
-            let acrobatic = entry.get("acrobatic").and_then(|v| v.as_bool()).unwrap_or(false);
-            let read_only = entry.get("read_only").and_then(|v| v.as_bool()).unwrap_or(false);
+            let acrobatic = entry
+                .get("acrobatic")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let read_only = entry
+                .get("read_only")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let params = entry
                 .get("params")
                 .and_then(|v| v.as_array())
@@ -820,8 +832,14 @@ fn parse_actions_meta(status: &serde_json::Value) -> Vec<AdvertisedAction> {
                             }
                             Some(AdvertisedActionParam {
                                 name: name.to_string(),
-                                min: p.get("min").and_then(|v| v.as_f64()).unwrap_or(f64::NEG_INFINITY),
-                                max: p.get("max").and_then(|v| v.as_f64()).unwrap_or(f64::INFINITY),
+                                min: p
+                                    .get("min")
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(f64::NEG_INFINITY),
+                                max: p
+                                    .get("max")
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(f64::INFINITY),
                             })
                         })
                         .collect()
@@ -1238,7 +1256,9 @@ impl RobotCommandSender for MeshRobotSender {
         if !response.ok {
             return Err(anyhow::anyhow!(
                 "remote robot control failed: {}",
-                response.error.unwrap_or_else(|| "unknown error".to_string())
+                response
+                    .error
+                    .unwrap_or_else(|| "unknown error".to_string())
             ));
         }
         match response.payload {
@@ -1279,9 +1299,7 @@ pub async fn dispatch_robot_action(
     };
 
     match resolve_robot_owner(db, local_node_id, robot_id) {
-        RobotOwner::Local => {
-            execute_local(&request, db, addon_manager).await
-        }
+        RobotOwner::Local => execute_local(&request, db, addon_manager).await,
         RobotOwner::Remote(node_id) => match sender.send_remote(&node_id, &request).await {
             Ok(resp) => resp,
             Err(e) => RobotControlResponse::failed(e.to_string()),
@@ -1434,10 +1452,7 @@ mod tests {
     #[test]
     fn owner_local_wins_over_remote() {
         // Both the local node AND a peer advertise go2 → local wins.
-        let advertised = vec![
-            ad("go2", "go2", "node-local"),
-            ad("go2", "go2", "node-b"),
-        ];
+        let advertised = vec![ad("go2", "go2", "node-local"), ad("go2", "go2", "node-b")];
         assert_eq!(
             select_robot_owner(&advertised, "go2", "node-local"),
             RobotOwner::Local
@@ -1475,10 +1490,7 @@ mod tests {
     #[test]
     fn owner_ambiguous_two_nodes_is_unknown() {
         // Two DIFFERENT nodes advertise the same robot id → never guess.
-        let advertised = vec![
-            ad("go2", "go2", "node-b"),
-            ad("go2", "go2", "node-c"),
-        ];
+        let advertised = vec![ad("go2", "go2", "node-b"), ad("go2", "go2", "node-c")];
         assert_eq!(
             select_robot_owner(&advertised, "go2", "node-local"),
             RobotOwner::Unknown
@@ -1501,7 +1513,11 @@ mod tests {
     #[test]
     fn build_request_has_command_id_and_move_window() {
         let req = build_request(
-            RobotAction::Move { vx: 0.3, vy: 0.0, vyaw: 0.0 },
+            RobotAction::Move {
+                vx: 0.3,
+                vy: 0.0,
+                vyaw: 0.0,
+            },
             "go2",
             "u1",
             "org-1",
@@ -1518,7 +1534,10 @@ mod tests {
     #[test]
     fn build_request_non_move_uses_default_window() {
         let req = build_request(RobotAction::Sit, "go2", "u1", "org-1").unwrap();
-        assert_eq!(req.expires_at_ms - req.issued_at_ms, DEFAULT_COMMAND_WINDOW_MS);
+        assert_eq!(
+            req.expires_at_ms - req.issued_at_ms,
+            DEFAULT_COMMAND_WINDOW_MS
+        );
     }
 
     #[test]
@@ -1526,7 +1545,11 @@ mod tests {
         // Sender-side defense-in-depth: out-of-range velocity is clamped to the
         // protocol ceiling before it ever hits the wire.
         let req = build_request(
-            RobotAction::Move { vx: 9.0, vy: -9.0, vyaw: 0.5 },
+            RobotAction::Move {
+                vx: 9.0,
+                vy: -9.0,
+                vyaw: 0.5,
+            },
             "go2",
             "u1",
             "org-1",
@@ -1814,8 +1837,14 @@ mod tests {
         let metas = parse_actions_meta(&status);
         assert_eq!(metas.len(), 2);
         assert_eq!(metas[0].kind, "hello");
-        assert_eq!(metas[0].label, "hello", "label defaults to kind when absent");
-        assert_eq!(metas[0].risk, "medium", "risk defaults to medium when absent");
+        assert_eq!(
+            metas[0].label, "hello",
+            "label defaults to kind when absent"
+        );
+        assert_eq!(
+            metas[0].risk, "medium",
+            "risk defaults to medium when absent"
+        );
         assert_eq!(metas[1].kind, "euler");
         assert_eq!(metas[1].params.len(), 1, "param without name is skipped");
         assert_eq!(metas[1].params[0].name, "roll");
@@ -1862,7 +1891,10 @@ mod tests {
             params: vec![],
         }];
         let new = vec![changed.clone()];
-        assert_eq!(diff_advertised(&old, &new), vec![RobotChange::Updated(changed)]);
+        assert_eq!(
+            diff_advertised(&old, &new),
+            vec![RobotChange::Updated(changed)]
+        );
     }
 
     #[test]
@@ -1898,7 +1930,9 @@ mod tests {
                 "last_update_ts": 1_700_000_000_i64
             }
         });
-        let l = parse_status_telemetry(&status).lidar.expect("lidar present");
+        let l = parse_status_telemetry(&status)
+            .lidar
+            .expect("lidar present");
         assert!(l.enabled);
         assert!(l.available);
         assert_eq!(l.point_count, 4096);
@@ -1923,7 +1957,9 @@ mod tests {
             "status": "online",
             "lidar": { "enabled": true }
         });
-        let l = parse_status_telemetry(&status).lidar.expect("lidar present");
+        let l = parse_status_telemetry(&status)
+            .lidar
+            .expect("lidar present");
         assert!(l.enabled);
         assert!(!l.available);
         assert_eq!(l.point_count, 0);
@@ -2006,7 +2042,9 @@ mod tests {
                 "battery": { "soc": 73.0, "voltage": 28.4, "current": -2.1, "temperature": 36.0 }
             }
         });
-        let t = parse_status_telemetry(&status).telemetry.expect("telemetry present");
+        let t = parse_status_telemetry(&status)
+            .telemetry
+            .expect("telemetry present");
         assert_eq!(t.mode, Some(1));
         assert_eq!(t.gait_type, Some(3));
         assert_eq!(t.body_height, Some(0.32));
@@ -2038,7 +2076,9 @@ mod tests {
                 "battery": { "soc": 55.0 }
             }
         });
-        let t = parse_status_telemetry(&status).telemetry.expect("telemetry present");
+        let t = parse_status_telemetry(&status)
+            .telemetry
+            .expect("telemetry present");
         assert_eq!(t.vx, Some(0.2));
         assert_eq!(t.vy, None);
         assert_eq!(t.mode, None);
@@ -2071,15 +2111,26 @@ mod tests {
                 }
             }
         });
-        let t = parse_status_telemetry(&status).telemetry.expect("telemetry present");
+        let t = parse_status_telemetry(&status)
+            .telemetry
+            .expect("telemetry present");
         assert_eq!(t.mode, Some(1));
         assert_eq!(t.body_height, Some(0.32));
-        assert!(t.position.is_empty(), "position with non-numeric element must be omitted whole");
-        assert!(t.foot_force.is_empty(), "foot_force with null element must be omitted whole");
+        assert!(
+            t.position.is_empty(),
+            "position with non-numeric element must be omitted whole"
+        );
+        assert!(
+            t.foot_force.is_empty(),
+            "foot_force with null element must be omitted whole"
+        );
         let imu = t.imu.expect("imu present (roll/temperature still valid)");
         assert_eq!(imu.roll, Some(0.01));
         assert_eq!(imu.temperature, Some(41.0));
-        assert!(imu.quaternion.is_empty(), "quaternion with null element must be omitted whole");
+        assert!(
+            imu.quaternion.is_empty(),
+            "quaternion with null element must be omitted whole"
+        );
     }
 
     #[test]
@@ -2091,7 +2142,10 @@ mod tests {
         changed.rtt_ms = Some(999);
         changed.telemetry = Some(RobotTelemetrySnapshot {
             vx: Some(0.5),
-            imu: Some(RobotImuSnapshot { yaw: Some(0.9), ..Default::default() }),
+            imu: Some(RobotImuSnapshot {
+                yaw: Some(0.9),
+                ..Default::default()
+            }),
             ..Default::default()
         });
         let new = vec![changed];
@@ -2134,10 +2188,7 @@ mod tests {
         });
         let t = parse_status_telemetry(&status);
         assert_eq!(t.battery_percent, None);
-        assert_eq!(
-            t.telemetry.unwrap().battery.unwrap().voltage,
-            Some(27.9)
-        );
+        assert_eq!(t.telemetry.unwrap().battery.unwrap().voltage, Some(27.9));
     }
 
     #[test]
@@ -2215,7 +2266,10 @@ mod tests {
         let mut changed = ad("go2", "go2", "node-a");
         changed.status = "degraded".to_string();
         let new = vec![changed.clone()];
-        assert_eq!(diff_advertised(&old, &new), vec![RobotChange::Updated(changed)]);
+        assert_eq!(
+            diff_advertised(&old, &new),
+            vec![RobotChange::Updated(changed)]
+        );
     }
 
     #[test]
@@ -2224,7 +2278,10 @@ mod tests {
         let mut changed = ad("go2", "go2", "node-a");
         changed.camera_id = Some("cam-7".to_string());
         let new = vec![changed.clone()];
-        assert_eq!(diff_advertised(&old, &new), vec![RobotChange::Updated(changed)]);
+        assert_eq!(
+            diff_advertised(&old, &new),
+            vec![RobotChange::Updated(changed)]
+        );
     }
 
     #[test]
@@ -2233,7 +2290,10 @@ mod tests {
         let mut changed = ad("go2", "go2", "node-a");
         changed.capabilities = vec!["move".to_string()];
         let new = vec![changed.clone()];
-        assert_eq!(diff_advertised(&old, &new), vec![RobotChange::Updated(changed)]);
+        assert_eq!(
+            diff_advertised(&old, &new),
+            vec![RobotChange::Updated(changed)]
+        );
     }
 
     #[test]
@@ -2351,7 +2411,11 @@ mod tests {
         let mut sorted = all.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), all.len(), "robot discriminants must be distinct");
+        assert_eq!(
+            sorted.len(),
+            all.len(),
+            "robot discriminants must be distinct"
+        );
     }
 
     #[test]
@@ -2478,10 +2542,7 @@ mod tests {
     #[test]
     fn bind_announce_drops_spoofed_sender() {
         // A trusted node-b advertising robots "on behalf of" node-c is dropped.
-        assert_eq!(
-            bind_announce_sender("node-c", "node-b", "node-local"),
-            None
-        );
+        assert_eq!(bind_announce_sender("node-c", "node-b", "node-local"), None);
     }
 
     #[test]
@@ -2507,7 +2568,10 @@ mod tests {
         if let Some(key) = bind_announce_sender(&spoof.from_node_id, "node-b", local) {
             reg.replace_node(key, spoof.robots);
         }
-        assert!(reg.all().is_empty(), "spoofed announce must not populate registry");
+        assert!(
+            reg.all().is_empty(),
+            "spoofed announce must not populate registry"
+        );
 
         let honest = RobotsAnnouncePayload {
             from_node_id: "node-b".to_string(),

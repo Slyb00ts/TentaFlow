@@ -54,7 +54,8 @@ mod tests {
         assert_ne!(a, b);
         // Divergence must appear within the first ~30 chars after the header so the
         // server's prefix-cache cannot latch onto a shared prefix.
-        let header = "Continue the following text with a long, detailed story. Do not stop early.\n";
+        let header =
+            "Continue the following text with a long, detailed story. Do not stop early.\n";
         let a_tail = &a[header.len()..];
         let b_tail = &b[header.len()..];
         let window = 30.min(a_tail.len()).min(b_tail.len());

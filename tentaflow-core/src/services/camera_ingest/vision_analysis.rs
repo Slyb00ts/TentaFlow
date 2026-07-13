@@ -26,14 +26,14 @@ use crate::services::detection_bus::Detection;
 
 use super::cv_pipeline::{self, CvOp, CvPipeline, CvStageInput, CvStageOutput};
 use super::tracker;
-use crate::services::detection_bus;
-use crate::vision::classifier_stan::StateClassifier;
-use crate::vision::detector_rfdetr::{RfDetrDetector, MODEL_BATCH};
-use crate::vision::ocr_plate::PlateOcr;
 use crate::flow_engine::dispatchers_impl::ModelRuntimeSlot;
+use crate::services::detection_bus;
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
 use crate::services::runtime::executor::ModelRuntimeExecutor;
 use crate::services::runtime::local_cv::{CameraCvOpLocal, CameraCvRequest, CvFrameLocal};
+use crate::vision::classifier_stan::StateClassifier;
+use crate::vision::detector_rfdetr::{RfDetrDetector, MODEL_BATCH};
+use crate::vision::ocr_plate::PlateOcr;
 use tentaflow_protocol::{CameraCvResult, CvDetection, CvOcrMode};
 
 /// Floor interval for `analysis_fps = 0` (unlimited). ~30 fps native cadence —
@@ -129,6 +129,45 @@ fn wrap_ocr(o: PlateOcr) -> OcrHandle {
     std::sync::Arc::new(Mutex::new(o))
 }
 
+/// Process-wide YOLOv8 vehicle detector, loaded on first use — the SECOND
+/// detector run in parallel with RF-DETR. Own ort session pool (independent CUDA
+/// streams), so a `tokio::join!` of the two forwards costs ~max(DETR, YOLO). A
+/// failed/absent load is `None` for the process lifetime: association degrades
+/// to RF-DETR-only (no vehicle boxes, every sign keeps `vehicle_id = 0`), never
+/// a crash. Only the ort path builds a real detector; the Burn path has no
+/// YOLOv8 vehicle graph, so it is always `None`.
+#[cfg(feature = "inference-supertonic")]
+pub(crate) type VehicleHandle = std::sync::Arc<crate::vision::detector_vehicle::VehicleDetector>;
+
+#[cfg(feature = "inference-supertonic")]
+fn vehicle_detector() -> &'static OnceCell<Option<VehicleHandle>> {
+    static VEHICLE: OnceCell<Option<VehicleHandle>> = OnceCell::const_new();
+    &VEHICLE
+}
+
+#[cfg(feature = "inference-supertonic")]
+pub(crate) async fn get_vehicle_detector() -> Option<VehicleHandle> {
+    vehicle_detector()
+        .get_or_init(|| async {
+            tokio::task::spawn_blocking(|| {
+                match crate::vision::detector_vehicle::VehicleDetector::load() {
+                    Ok(d) => Some(std::sync::Arc::new(d)),
+                    Err(e) => {
+                        warn!(
+                            "[vision_analysis] YOLOv8 vehicle detector load failed, \
+                             per-truck association disabled: {e:#}"
+                        );
+                        None
+                    }
+                }
+            })
+            .await
+            .unwrap_or(None)
+        })
+        .await
+        .clone()
+}
+
 /// Process-wide state classifier, loaded on first use with the same lazy
 /// `OnceCell` + `spawn_blocking` pattern as the detector. A failed load is
 /// `None` for the process lifetime: detections still publish, just without a
@@ -200,7 +239,9 @@ pub fn set_runtime_slot(slot: ModelRuntimeSlot) {
 
 /// Aktualny executor runtime albo `None` (slot niewpięty / jeszcze pusty).
 fn runtime_executor() -> Option<Arc<ModelRuntimeExecutor>> {
-    runtime_slot_cell().get().and_then(|s| s.read().as_ref().cloned())
+    runtime_slot_cell()
+        .get()
+        .and_then(|s| s.read().as_ref().cloned())
 }
 
 /// Ostrzeżenie ograniczone do jednego wpisu na ~30 s per klucz — błąd executora
@@ -246,6 +287,162 @@ fn crop_rgb(frame: &[u8], frame_w: u32, x0: u32, y0: u32, cw: u32, ch: u32) -> V
         out.extend_from_slice(&frame[start..start + cw as usize * 3]);
     }
     out
+}
+
+/// Cut an RGB24 crop for one detection out of the full-res crops `frame`,
+/// dispatching on its pixel format. `Rgb24` → [`crop_rgb`] (unchanged host path);
+/// `Nv12` → [`super::fakefile::crop_nv12`], which converts ONLY the crop rectangle
+/// (never the full 4K frame) to RGB24 using the parity-matched NV12→RGB formula.
+/// Even x/y origins for the NV12 chroma alignment are handled inside `crop_nv12`;
+/// the returned crop's real (possibly even-snapped) dims are returned so the
+/// caller feeds the model the exact bytes it produced.
+///
+/// Zero-copy crops (`frame_device` = `Some`, `frame` empty): the crop is cut
+/// straight off the DEVICE NV12 surface — only the small crop sub-rectangle is
+/// downloaded, never the full 4K frame — via
+/// [`super::fakefile::DeviceCropsFrame::crop_detection_rgb`], which reuses the
+/// SAME host `crop_nv12` on the downloaded sub-frame so the RGB is bit-identical
+/// to the host path. On any map/download error it falls back to the host `frame`
+/// (which the caller materialized) — never loses enrichment.
+fn crop_for_detection(
+    frame: &[u8],
+    frame_device: Option<&super::fakefile::DeviceCropsFrame>,
+    frame_w: u32,
+    frame_h: u32,
+    format: &super::fakefile::DetectFrameFormat,
+    x0: u32,
+    y0: u32,
+    cw: u32,
+    ch: u32,
+) -> (Vec<u8>, u32, u32) {
+    // Zero-copy crops: cut off the device surface (small per-crop download).
+    #[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+    if let Some(dev) = frame_device {
+        if let Some(out) = dev.crop_detection_rgb(x0, y0, cw, ch) {
+            return out;
+        }
+    }
+    let _ = frame_device;
+    match *format {
+        super::fakefile::DetectFrameFormat::Rgb24 => {
+            (crop_rgb(frame, frame_w, x0, y0, cw, ch), cw, ch)
+        }
+        super::fakefile::DetectFrameFormat::Nv12 {
+            y_stride,
+            uv_stride,
+            y_offset,
+            uv_offset,
+            kr,
+            kb,
+            full_range,
+        } => {
+            let (rgb, _, _, ecw, ech) = super::fakefile::crop_nv12(
+                frame, frame_w, frame_h, y_stride, uv_stride, y_offset, uv_offset, kr, kb,
+                full_range, x0, y0, cw, ch,
+            );
+            (rgb, ecw, ech)
+        }
+    }
+}
+
+/// Remaining zero-copy CROPS verify frames. `[vision] zerocopy_crops_verify`
+/// seeds it (8 crops); each verified crop decrements it. `0` (off, the default)
+/// makes [`verify_zerocopy_crop`] a cheap no-op.
+fn verify_crops_counter() -> &'static AtomicU64 {
+    static C: OnceLock<AtomicU64> = OnceLock::new();
+    C.get_or_init(|| {
+        AtomicU64::new(if crate::vision::settings::get().zerocopy_crops_verify {
+            8
+        } else {
+            0
+        })
+    })
+}
+
+/// VERIFY gate (`[vision] zerocopy_crops_verify`): for the first few crops, cut
+/// the SAME detection rect from the full host-downloaded NV12 frame and assert the
+/// RGB is byte-identical to the zero-copy device crop (`device_rgb`). Correctness
+/// gate for the per-crop device path. Logged, never panics — a mismatch surfaces
+/// without killing a live camera. No-op when the gate is off or no device
+/// frame is present.
+#[allow(clippy::too_many_arguments)]
+fn verify_zerocopy_crop(
+    frame_device: Option<&super::fakefile::DeviceCropsFrame>,
+    frame_w: u32,
+    frame_h: u32,
+    _format: &super::fakefile::DetectFrameFormat,
+    x0: u32,
+    y0: u32,
+    cw: u32,
+    ch: u32,
+    device_rgb: &[u8],
+) {
+    let Some(dev) = frame_device else {
+        return;
+    };
+    if verify_crops_counter().load(AtomicOrdering::Relaxed) == 0 {
+        return;
+    }
+    // Reference: download the FULL NV12 and cut the same rect on the host.
+    let Some((nv12, fmt)) = dev.download_full_nv12() else {
+        return;
+    };
+    let super::fakefile::DetectFrameFormat::Nv12 {
+        y_stride,
+        uv_stride,
+        y_offset,
+        uv_offset,
+        kr,
+        kb,
+        full_range,
+    } = fmt
+    else {
+        return;
+    };
+    let (host_rgb, _, _, _, _) = super::fakefile::crop_nv12(
+        &nv12, frame_w, frame_h, y_stride, uv_stride, y_offset, uv_offset, kr, kb, full_range, x0,
+        y0, cw, ch,
+    );
+    verify_crops_counter().fetch_sub(1, AtomicOrdering::Relaxed);
+    if host_rgb.len() != device_rgb.len() {
+        error!(
+            "[vision_analysis] zero-copy crops VERIFY: length mismatch device={} host={}",
+            device_rgb.len(),
+            host_rgb.len()
+        );
+        return;
+    }
+    let mismatches = host_rgb
+        .iter()
+        .zip(device_rgb.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    if mismatches == 0 {
+        info!(
+            "[vision_analysis] zero-copy crops VERIFY: device crop MATCHES host download (bytes={})",
+            device_rgb.len()
+        );
+    } else {
+        error!(
+            "[vision_analysis] zero-copy crops VERIFY: MISMATCH device vs host ({mismatches}/{} bytes differ)",
+            device_rgb.len()
+        );
+    }
+}
+
+/// Returns an RGB24 view of the full crops frame, converting from NV12 only when
+/// needed (rare paths: analysis-flow image blob). RGB frames pass through as the
+/// same `Arc` (zero copy).
+fn nv12_to_rgb_if_needed(
+    frame: &Arc<[u8]>,
+    w: u32,
+    h: u32,
+    format: &super::fakefile::DetectFrameFormat,
+) -> Arc<[u8]> {
+    match super::fakefile::nv12_frame_to_rgb24(frame, w, h, format) {
+        Some(rgb) => Arc::from(rgb),
+        None => frame.clone(),
+    }
 }
 
 /// Piksele cropu detekcji z opcjonalnym paddingiem (ułamek szer./wys. boxa,
@@ -395,7 +592,10 @@ pub async fn drain() {
         // jako fallback. WTEDY biegnący `spawn_blocking` może jeszcze trwać na puli
         // blocking — jest to jednak ograniczone (pula sesji ort serializuje per
         // sesja) i zdarza się tylko przy realnie zawieszonym forwardzie.
-        if tokio::time::timeout(FORWARD_DRAIN_TIMEOUT, handle).await.is_err() {
+        if tokio::time::timeout(FORWARD_DRAIN_TIMEOUT, handle)
+            .await
+            .is_err()
+        {
             warn!(
                 "[vision_analysis] engine drain timed out after {}s; aborting (a blocking forward may still finish on the ort pool)",
                 FORWARD_DRAIN_TIMEOUT.as_secs()
@@ -421,7 +621,10 @@ pub async fn drain() {
     // Cache wzbogacania trzyma stan/OCR per (camera_id, stage_id, track_id) —
     // po drainie tracki znikaja (tracker::clear resetuje licznik id), wiec stare
     // wpisy musza zniknac, by nie przypisac stanu do przypadkiem powtorzonego id.
-    enrich_cache().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    enrich_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// Usuwa proces-wide stan analizy JEDNEJ kamery przy jej teardownie (obok
@@ -501,7 +704,10 @@ fn apply_camera_config(
             slot.pipeline = None;
             slot.pipeline_raw = None;
             slot.stage_due.clear();
-            warn_changed(slot, "no CV pipeline resolvable; camera does no analysis".to_string());
+            warn_changed(
+                slot,
+                "no CV pipeline resolvable; camera does no analysis".to_string(),
+            );
         }
         Ok(Some(raw)) => {
             if slot.pipeline_raw.as_ref() == Some(&raw) {
@@ -562,8 +768,37 @@ struct PendingItem {
 struct FrameJob {
     camera_id: String,
     frame: Arc<[u8]>,
+    /// Zero-copy CROPS path ONLY: a DEVICE reference to the full-res NV12 frame.
+    /// When `Some`, `frame` is EMPTY and enrichment cuts each detection's crop
+    /// straight off this device surface (small per-crop download). The held
+    /// `gst::Sample` keeps the surface alive until the cold event that consumes it
+    /// finishes (bounded ~1 in-flight + 1 pending per camera). `None` otherwise.
+    frame_device: Option<super::fakefile::DeviceCropsFrame>,
     w: u32,
     h: u32,
+    /// Pixel layout of the full-res crops `frame`: `Rgb24` for every non-NVDEC
+    /// path, `Nv12` (packed `[Y | UV]` + strides + color) on the GPU-resident
+    /// path. Enrichment cuts crops with [`crop_nv12`] for NV12 and [`crop_rgb`]
+    /// otherwise, so the per-frame full videoconvert never runs.
+    frame_format: super::fakefile::DetectFrameFormat,
+    /// Detector input frame: GPU-scaled 560×560 when the pipeline's detect
+    /// branch is active, otherwise the same buffer as `frame` (detector then
+    /// CPU-resizes it). The HOT detect forward reads this; enrichment crops
+    /// always read the full-res `frame`/`w`/`h`, so crop→bbox math is unchanged.
+    detect_frame: Arc<[u8]>,
+    detect_w: u32,
+    detect_h: u32,
+    /// Pixel layout of `detect_frame`: `Rgb24` (host detect through the executor)
+    /// or `Nv12` (device preprocess through `detect_batch_gpu`, GPU-resident
+    /// path). Set from the ingest pipeline's detect branch.
+    detect_format: super::fakefile::DetectFrameFormat,
+    /// Zero-copy (Stage 4) ONLY: an owned, already-preprocessed device tensor
+    /// (`[1,3,560,560]`) produced from the NVDEC surface in the appsink callback.
+    /// When `Some`, the detect forward runs `detect_device_tensor` on it and
+    /// ignores `detect_frame`/`detect_format`. Read only under the ORT GPU
+    /// features; `None` on every other path.
+    #[cfg_attr(not(feature = "inference-supertonic"), allow(dead_code))]
+    detect_device: Option<super::fakefile::DeviceDetectTensor>,
     captured_ms: u64,
     pts_ns: Option<u64>,
     pipeline: Arc<CvPipeline>,
@@ -575,6 +810,12 @@ struct FrameJob {
     detect_ms_total: u32,
     /// Liczba etapów zakończonych błędem executora (bez wyniku).
     failed_stages: usize,
+    /// Boxy pojazdow (`klasa="vehicle"`) wykryte przez YOLOv8 RÓWNOLEGLE z
+    /// RF-DETR na TEJ SAMEJ klatce (tokio::join!). Trakowane osobnym trackerem
+    /// IOU `(kamera,"vehicles")` w `stage_completed`, potem propagowane do cold
+    /// path do asocjacji znak→pojazd. Puste, gdy model pojazdow niedostepny
+    /// (degradacja do RF-DETR-only).
+    vehicles: Vec<Detection>,
 }
 
 /// Wynik jednego współbieżnego forwardu batcha zwrócony ze spawnowanego zadania
@@ -587,6 +828,11 @@ struct ForwardOutput {
     /// Wynik executora spłaszczony do `String` błędu — `Send` i prosty do
     /// przeniesienia przez granicę zadania (log identyczny z dawnym inline).
     outcome: Result<CameraCvResult, String>,
+    /// Boxy pojazdow per klatka batcha (kolejnosc == kolejnosc batcha), policzone
+    /// RÓWNOLEGLE z forwardem detekcji przez `tokio::join!` na osobnej puli sesji.
+    /// Puste gdy model pojazdow niedostepny albo forward pojazdow zawiodl
+    /// (degradacja do RF-DETR-only). `apply_forward_result` doklada je do jobów.
+    vehicles: Vec<Vec<Detection>>,
 }
 
 /// Górny limit współbieżnych forwardów. Odzwierciedla sufit puli sesji ort
@@ -596,26 +842,260 @@ struct ForwardOutput {
 /// obowiązywać na każdej ścieżce.
 const MAX_INFLIGHT: usize = 16;
 
-/// Liczba współbieżnych forwardów K. Jawny opt-in `TENTAFLOW_VISION_INFLIGHT`
-/// wygrywa; w przeciwnym razie odwzorowuje rozmiar puli detektora
-/// (`TENTAFLOW_VISION_DETECTOR_SESSIONS`): przy N sesjach GPU liczy N detektów
-/// naraz, więc N in-flight to naturalny sufit. Gdy ŻADNA zmienna nie jest
-/// ustawiona → K=1, czyli bit-identyczne zachowanie z dawną pojedynczą,
-/// serializowaną pętlą (zero regresji, dopóki operator nie włączy więcej).
+/// Liczba współbieżnych forwardów K. Jawny opt-in `[vision] inflight` wygrywa;
+/// w przeciwnym razie odwzorowuje rozmiar puli detektora
+/// (`[vision] detector_sessions`, domyślnie 4): przy N sesjach GPU liczy N
+/// detektów naraz, więc N in-flight to naturalny sufit. Z 4 sesjami w puli 4
+/// pipelinowane batched forwardy dają ~3× przepustowości detektora
+/// (~1300 vs ~430 frames/s na jednym GPU) względem serializacji.
 fn inflight_limit() -> usize {
-    const INFLIGHT_ENV: &str = "TENTAFLOW_VISION_INFLIGHT";
-    const DETECTOR_SESSIONS_ENV: &str = "TENTAFLOW_VISION_DETECTOR_SESSIONS";
-    if let Some(k) = std::env::var(INFLIGHT_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-    {
-        return k.clamp(1, MAX_INFLIGHT);
+    let vision = crate::vision::settings::get();
+    resolve_inflight_limit(vision.inflight, vision.detector_sessions)
+}
+
+/// Pure resolution behind [`inflight_limit`], split out so the precedence and
+/// clamps are unit-testable without touching the frozen process settings.
+fn resolve_inflight_limit(inflight: Option<usize>, detector_sessions: usize) -> usize {
+    inflight.unwrap_or(detector_sessions).clamp(1, MAX_INFLIGHT)
+}
+
+/// Grouping key that keeps a detect flush batch homogeneous: `None` for RGB
+/// (executor path), `Some(color-bits)` for NV12 (device path — the bits pin the
+/// YUV→RGB matrix so one `detect_batch_gpu` call applies a single conversion).
+/// Without the ort GPU features NV12 frames are never produced, so every frame
+/// keys as RGB.
+#[cfg(feature = "inference-supertonic")]
+fn detect_batch_key(fmt: &super::fakefile::DetectFrameFormat) -> Option<(u32, u32, u32)> {
+    match fmt {
+        super::fakefile::DetectFrameFormat::Rgb24 => None,
+        super::fakefile::DetectFrameFormat::Nv12 {
+            kr, kb, full_range, ..
+        } => Some((kr.to_bits(), kb.to_bits(), *full_range as u32)),
     }
-    std::env::var(DETECTOR_SESSIONS_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(1)
-        .clamp(1, MAX_INFLIGHT)
+}
+#[cfg(not(feature = "inference-supertonic"))]
+fn detect_batch_key(_fmt: &super::fakefile::DetectFrameFormat) -> Option<(u32, u32, u32)> {
+    None
+}
+
+/// Sentinel batch key for the zero-copy DEVICE detect path — distinct from RGB
+/// (`None`) and any NV12 colorimetry key, so a device job never groups into an
+/// RGB/NV12 flush batch (its input is a preprocessed device tensor, not pixels).
+#[cfg(feature = "inference-supertonic")]
+const DEVICE_BATCH_KEY: (u32, u32, u32) = (u32::MAX, u32::MAX, u32::MAX);
+
+/// Job-level flush grouping key: the device sentinel when the job carries a
+/// zero-copy device tensor, else the pixel-format key ([`detect_batch_key`]).
+/// Defined for both feature sets so the flush call site is uniform (without the
+/// ort GPU features `detect_device` is always `None`, so this is just the format
+/// key).
+fn job_batch_key(job: &FrameJob) -> Option<(u32, u32, u32)> {
+    #[cfg(feature = "inference-supertonic")]
+    if job.detect_device.is_some() {
+        return Some(DEVICE_BATCH_KEY);
+    }
+    detect_batch_key(&job.detect_format)
+}
+
+/// One NV12 detect-frame descriptor collected off a [`FrameJob`] for the device
+/// forward: the packed `[Y | UV]` bytes plus plane strides/offsets and frame
+/// dims. Owned (Arc-cloned) so the spawned forward can outlive the loop tick.
+#[cfg(feature = "inference-supertonic")]
+#[derive(Clone)]
+struct Nv12DetectInput {
+    data: Arc<[u8]>,
+    width: u32,
+    height: u32,
+    y_stride: u32,
+    uv_stride: u32,
+    y_offset: u32,
+    uv_offset: u32,
+}
+
+/// YUV→RGB coefficients for an NV12 detect frame, or `None` for RGB.
+#[cfg(feature = "inference-supertonic")]
+fn nv12_color(
+    fmt: &super::fakefile::DetectFrameFormat,
+) -> Option<crate::vision::gpu_preprocess::ColorCoeffs> {
+    match fmt {
+        super::fakefile::DetectFrameFormat::Nv12 {
+            kr, kb, full_range, ..
+        } => Some(crate::vision::gpu_preprocess::ColorCoeffs {
+            kr: *kr,
+            kb: *kb,
+            full_range: *full_range,
+        }),
+        super::fakefile::DetectFrameFormat::Rgb24 => None,
+    }
+}
+
+/// Runs one homogeneous NV12 detect batch through the RF-DETR detector's device
+/// path (`detect_batch_gpu`): GPU YUV→RGB + resize + normalize + forward, with
+/// zero CPU pixel work. Bypasses the executor (a device frame has no RGB wire
+/// form for mesh failover); the returned [`CameraCvResult::Detections`] mirrors
+/// the executor's Detect op so `apply_forward_result` treats both paths alike.
+#[cfg(feature = "inference-supertonic")]
+async fn run_nv12_detect_forward(
+    frames: Vec<Nv12DetectInput>,
+    color: crate::vision::gpu_preprocess::ColorCoeffs,
+    threshold: Option<f32>,
+) -> Result<CameraCvResult, String> {
+    let detector = get_detector()
+        .await
+        .ok_or_else(|| "detektor RF-DETR niedostępny (load nie powiódł się)".to_string())?;
+    let batch = tokio::task::spawn_blocking(move || {
+        use crate::vision::gpu_preprocess::Nv12Frame;
+        let nv12: Vec<Nv12Frame> = frames
+            .iter()
+            .map(|f| Nv12Frame {
+                y: &f.data[f.y_offset as usize..],
+                y_stride: f.y_stride as usize,
+                uv: &f.data[f.uv_offset as usize..],
+                uv_stride: f.uv_stride as usize,
+                w: f.width,
+                h: f.height,
+            })
+            .collect();
+        detector
+            .detect_batch_gpu(&nv12, color, threshold)
+            .map_err(|e| format!("detect_batch_gpu: {e:#}"))
+    })
+    .await
+    .map_err(|e| format!("camera-cv nv12 detect executor: {e}"))??;
+    let per_frame = batch
+        .into_iter()
+        .map(|dets| {
+            dets.into_iter()
+                .map(|d| CvDetection {
+                    klasa: d.klasa,
+                    bbox: d.bbox,
+                    score: d.score,
+                })
+                .collect()
+        })
+        .collect();
+    Ok(CameraCvResult::Detections { per_frame })
+}
+
+/// Runs a batch of zero-copy DEVICE detect frames: each carries an owned,
+/// already-preprocessed `[1,3,560,560]` device tensor (produced from the NVDEC
+/// surface in the appsink callback), so this ONLY runs the ORT forward + decode
+/// (`detect_device_tensor`) — no preprocess. Results mirror the executor's Detect
+/// op so `apply_forward_result` treats every detect path alike. Each tensor is a
+/// separate device buffer, so they run one at a time (n=1) rather than as one
+/// concatenated ORT input; the batch just amortizes the loop bookkeeping.
+#[cfg(feature = "inference-supertonic")]
+async fn run_device_detect_forward(
+    handles: Vec<super::fakefile::DeviceDetectTensor>,
+    threshold: Option<f32>,
+) -> Result<CameraCvResult, String> {
+    let detector = get_detector()
+        .await
+        .ok_or_else(|| "detektor RF-DETR niedostępny (load nie powiódł się)".to_string())?;
+    let batch = tokio::task::spawn_blocking(move || {
+        let mut per_frame: Vec<Vec<CvDetection>> = Vec::with_capacity(handles.len());
+        for h in &handles {
+            let tensor =
+                h.0.clone()
+                    .downcast::<crate::vision::gpu_preprocess::OwnedDeviceTensor>()
+                    .map_err(|_| "device detect handle type mismatch".to_string())?;
+            let dets = detector
+                .detect_device_tensor(&tensor, threshold)
+                .map_err(|e| format!("detect_device_tensor: {e:#}"))?;
+            per_frame.push(
+                dets.into_iter()
+                    .map(|d| CvDetection {
+                        klasa: d.klasa,
+                        bbox: d.bbox,
+                        score: d.score,
+                    })
+                    .collect(),
+            );
+        }
+        Ok::<_, String>(CameraCvResult::Detections { per_frame })
+    })
+    .await
+    .map_err(|e| format!("camera-cv device detect executor: {e}"))??;
+    Ok(batch)
+}
+
+/// Runs the YOLOv8 vehicle detector on a batch of NV12 detect frames — the
+/// PARALLEL half of the NV12 detect closure's `tokio::join!`. Its own ort pool
+/// gives independent CUDA streams, so this overlaps the RF-DETR forward. Any
+/// failure (model absent, forward error) degrades to an all-empty result, so
+/// vehicle detection can NEVER block or fail the primary detection.
+#[cfg(feature = "inference-supertonic")]
+async fn run_nv12_vehicle_forward(
+    frames: Vec<Nv12DetectInput>,
+    color: crate::vision::gpu_preprocess::ColorCoeffs,
+) -> Vec<Vec<Detection>> {
+    let n = frames.len();
+    let Some(detector) = get_vehicle_detector().await else {
+        return vec![Vec::new(); n];
+    };
+    let out = tokio::task::spawn_blocking(move || {
+        use crate::vision::gpu_preprocess::Nv12Frame;
+        let nv12: Vec<Nv12Frame> = frames
+            .iter()
+            .map(|f| Nv12Frame {
+                y: &f.data[f.y_offset as usize..],
+                y_stride: f.y_stride as usize,
+                uv: &f.data[f.uv_offset as usize..],
+                uv_stride: f.uv_stride as usize,
+                w: f.width,
+                h: f.height,
+            })
+            .collect();
+        detector.detect_batch_gpu(&nv12, color)
+    })
+    .await;
+    match out {
+        Ok(Ok(v)) if v.len() == n => v,
+        Ok(Ok(_)) => vec![Vec::new(); n],
+        Ok(Err(e)) => {
+            warn_throttled("vehicle", &format!("nv12 vehicle detect: {e:#}"));
+            vec![Vec::new(); n]
+        }
+        Err(e) => {
+            warn_throttled("vehicle", &format!("nv12 vehicle detect task: {e}"));
+            vec![Vec::new(); n]
+        }
+    }
+}
+
+/// Runs the YOLOv8 vehicle detector on a batch of RGB detect frames (the device
+/// zero-copy path has no YOLO-usable pixels — its `OwnedDeviceTensor` is already
+/// RF-DETR-normalized at 560 — so the launcher passes the full-res RGB `frame`
+/// here instead). Same degrade-to-empty guard as the NV12 path.
+#[cfg(feature = "inference-supertonic")]
+async fn run_rgb_vehicle_forward(frames: Vec<CvFrameLocal>) -> Vec<Vec<Detection>> {
+    let n = frames.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let Some(detector) = get_vehicle_detector().await else {
+        return vec![Vec::new(); n];
+    };
+    let out = tokio::task::spawn_blocking(move || {
+        let refs: Vec<(&[u8], u32, u32)> = frames
+            .iter()
+            .map(|f| (f.data.as_ref(), f.width, f.height))
+            .collect();
+        detector.detect_batch(&refs)
+    })
+    .await;
+    match out {
+        Ok(Ok(v)) if v.len() == n => v,
+        Ok(Ok(_)) => vec![Vec::new(); n],
+        Ok(Err(e)) => {
+            warn_throttled("vehicle", &format!("rgb vehicle detect: {e:#}"));
+            vec![Vec::new(); n]
+        }
+        Err(e) => {
+            warn_throttled("vehicle", &format!("rgb vehicle detect task: {e}"));
+            vec![Vec::new(); n]
+        }
+    }
 }
 
 /// Stosuje wynik JEDNEGO batcha forwardu z powrotem na pętli: routuje detekcje
@@ -634,21 +1114,27 @@ fn apply_forward_result(
         alias,
         detect_ms,
         outcome,
+        mut vehicles,
     } = match out {
         Ok(o) => o,
         Err(e) => {
             warn_throttled("detect", &format!("detect forward task failed: {e}"));
             for item in &batch {
-                stage_completed(jobs, item, None, cold);
+                stage_completed(jobs, item, None, None, cold);
             }
             return;
         }
     };
+    // Pad/truncate the per-frame vehicle results to the batch length so the zip
+    // below always aligns (a degraded vehicle half returns `[]`, not per-frame).
+    if vehicles.len() != batch.len() {
+        vehicles = vec![Vec::new(); batch.len()];
+    }
     match outcome {
         Ok(CameraCvResult::Detections { per_frame }) if per_frame.len() == batch.len() => {
-            for (item, dets_cv) in batch.iter().zip(per_frame) {
+            for ((item, dets_cv), veh) in batch.iter().zip(per_frame).zip(vehicles) {
                 let dets: Vec<Detection> = dets_cv.into_iter().map(detection_from_cv).collect();
-                stage_completed(jobs, item, Some((dets, detect_ms)), cold);
+                stage_completed(jobs, item, Some((dets, detect_ms)), Some(veh), cold);
             }
         }
         Ok(CameraCvResult::Detections { per_frame }) => {
@@ -661,7 +1147,7 @@ fn apply_forward_result(
                 ),
             );
             for item in &batch {
-                stage_completed(jobs, item, None, cold);
+                stage_completed(jobs, item, None, None, cold);
             }
         }
         Ok(_) => {
@@ -670,13 +1156,13 @@ fn apply_forward_result(
                 &format!("detect '{alias}': unexpected camera-cv result variant"),
             );
             for item in &batch {
-                stage_completed(jobs, item, None, cold);
+                stage_completed(jobs, item, None, None, cold);
             }
         }
         Err(e) => {
             warn_throttled("detect", &format!("detect '{alias}': {e}"));
             for item in &batch {
-                stage_completed(jobs, item, None, cold);
+                stage_completed(jobs, item, None, None, cold);
             }
         }
     }
@@ -802,9 +1288,10 @@ async fn engine_loop() {
         if now.duration_since(last_metrics) >= Duration::from_secs(30) {
             let m = metrics();
             info!(
-                "[vision_analysis] cold metrics: emitted={} coalesced={} drop_inflight={} drop_full={} drop_budget={} bytes_inflight={}",
+                "[vision_analysis] cold metrics: emitted={} coalesced={} pended={} superseded={} drop_full={} drop_budget={} bytes_inflight={}",
                 m.emitted.load(AtomicOrdering::Relaxed),
                 m.coalesced.load(AtomicOrdering::Relaxed),
+                m.pended.load(AtomicOrdering::Relaxed),
                 m.dropped_inflight.load(AtomicOrdering::Relaxed),
                 m.dropped_full.load(AtomicOrdering::Relaxed),
                 m.dropped_budget.load(AtomicOrdering::Relaxed),
@@ -871,8 +1358,7 @@ async fn engine_loop() {
                     .map(|t| now.duration_since(t) >= EXECUTOR_STALL_ERROR_EVERY)
                     .unwrap_or(true);
                 if due_log {
-                    let cams: Vec<String> =
-                        cameras().lock().unwrap().keys().cloned().collect();
+                    let cams: Vec<String> = cameras().lock().unwrap().keys().cloned().collect();
                     error!(
                         "[vision_analysis] CV analysis stalled: runtime executor not initialized after {}s; cameras waiting: [{}]",
                         now.duration_since(since).as_secs(),
@@ -908,10 +1394,19 @@ async fn engine_loop() {
             if jobs.values().any(|j| j.camera_id == *id) {
                 continue;
             }
-            let Some((rgb, w, h, captured_ms, pts_ns)) =
+            let Some((crops, w, h, captured_ms, pts_ns, crops_format, detect, crops_device)) =
                 crate::addon::host_functions::camera::latest_frame_global(id).await
             else {
                 continue;
+            };
+            // Detector input: the detect-branch frame when present (GPU-scaled
+            // RGB 560, or raw NV12 on the GPU-resident path), else the full-res
+            // crops frame (detector CPU-resizes it). Enrichment crops keep using
+            // `rgb`/`w`/`h` below. `detect_format` routes RGB→executor,
+            // NV12→`detect_batch_gpu`.
+            let (detect_frame, detect_w, detect_h, detect_format, detect_device) = match detect {
+                Some((d, dw, dh, fmt, dev)) => (d, dw, dh, fmt, dev),
+                None => (crops.clone(), w, h, crops_format, None),
             };
             let ident = (captured_ms, pts_ns);
             let mut stages_for_job: Vec<String> = Vec::new();
@@ -919,7 +1414,10 @@ async fn engine_loop() {
                 let key = (id.clone(), sid.clone());
                 // Pomiń, gdy to ta sama klatka co ostatnio dołożona dla tego
                 // etapu (zero duplikatów).
-                let is_new = last_added.get(&key).map(|prev| *prev != ident).unwrap_or(true);
+                let is_new = last_added
+                    .get(&key)
+                    .map(|prev| *prev != ident)
+                    .unwrap_or(true);
                 if is_new {
                     stages_for_job.push(sid.clone());
                 }
@@ -947,9 +1445,16 @@ async fn engine_loop() {
                 job_id,
                 FrameJob {
                     camera_id: id.clone(),
-                    frame: rgb,
+                    frame: crops,
+                    frame_device: crops_device,
                     w,
                     h,
+                    frame_format: crops_format,
+                    detect_frame,
+                    detect_w,
+                    detect_h,
+                    detect_format,
+                    detect_device,
                     captured_ms,
                     pts_ns,
                     pipeline: pipeline.clone(),
@@ -957,6 +1462,7 @@ async fn engine_loop() {
                     results: Vec::new(),
                     detect_ms_total: 0,
                     failed_stages: 0,
+                    vehicles: Vec::new(),
                 },
             );
         }
@@ -1038,6 +1544,44 @@ async fn engine_loop() {
         };
         let permit = permit.expect("permit present when a batch is selected");
 
+        // Keep the flush batch homogeneous in DETECT FRAME FORMAT (and, for NV12,
+        // colorimetry): an RGB batch goes through the executor (cross-node
+        // failover), while an NV12 batch is device-preprocessed locally by ONE
+        // `detect_batch_gpu` call that applies a SINGLE YUV→RGB matrix. Items
+        // whose key differs from the first selected item stay in `pending` for
+        // the next flush (same as group-overflow — never dropped). In a uniform
+        // deployment every camera shares the ingest path, so this filters
+        // nothing; it only guards a mixed transition (a camera falling back to
+        // CPU while another is NV12).
+        let mut indices = indices;
+        let target_key = indices
+            .first()
+            .and_then(|&i| pending.get(i))
+            .and_then(|it| jobs.get(&it.job_id))
+            .map(job_batch_key);
+        indices.retain(|&i| {
+            pending
+                .get(i)
+                .and_then(|it| jobs.get(&it.job_id))
+                .map(job_batch_key)
+                == target_key
+        });
+        // A homogeneous batch is device (zero-copy), NV12 (download preprocess) or
+        // RGB (executor). Device jobs carry the sentinel key so they never mix.
+        #[cfg(feature = "inference-supertonic")]
+        let batch_is_device = matches!(target_key, Some(Some(k)) if k == DEVICE_BATCH_KEY);
+        #[allow(unused_variables)]
+        let batch_is_nv12 = matches!(target_key, Some(Some(_))) && {
+            #[cfg(feature = "inference-supertonic")]
+            {
+                !batch_is_device
+            }
+            #[cfg(not(feature = "inference-supertonic"))]
+            {
+                true
+            }
+        };
+
         // Wyjmij wybrane pozycje (indeksy rosnące — usuwamy od końca, kolejność
         // FIFO zachowana). Nadmiar grupy zostaje w pending na kolejny flush.
         let mut batch: Vec<PendingItem> = Vec::with_capacity(indices.len());
@@ -1046,22 +1590,155 @@ async fn engine_loop() {
         }
         batch.reverse();
 
+        // Zero-copy (Stage 4) device detect: the batch's frames each carry an
+        // owned, already-preprocessed device tensor (no NV12 pixels). Skip
+        // preprocess entirely and run only the ORT forward + decode. Bypasses the
+        // executor (a device tensor has no RGB wire form for mesh failover); the
+        // result shape mirrors the executor's Detect op so `apply_forward_result`
+        // handles it identically to every other detect path.
+        #[cfg(feature = "inference-supertonic")]
+        if batch_is_device {
+            let mut handles: Vec<super::fakefile::DeviceDetectTensor> =
+                Vec::with_capacity(batch.len());
+            for it in &batch {
+                if let Some(job) = jobs.get(&it.job_id) {
+                    if let Some(dev) = &job.detect_device {
+                        handles.push(dev.clone());
+                    }
+                }
+            }
+            if handles.len() != batch.len() {
+                warn_throttled(
+                    "detect",
+                    "pending item without a live device frame job; batch dropped",
+                );
+                for item in &batch {
+                    stage_completed(&mut jobs, item, None, None, &cold);
+                }
+                drop(permit);
+                continue;
+            }
+            let alias = batch[0].alias.clone();
+            let threshold = batch[0].threshold;
+            let n = batch.len().max(1) as u32;
+            // Zero-copy DEVICE detect: the detect input is an already-RF-DETR-
+            // preprocessed device tensor (560, ImageNet-normalized) — there are NO
+            // YOLO-usable raw pixels here without downloading the surface (the very
+            // cost this path avoids). Vehicle detection therefore degrades to empty
+            // on the zero-copy path; use NV12/RGB ingest for per-truck association.
+            let vehicle_frames = batch.len();
+            let handle = forwards.spawn(async move {
+                let _permit = permit;
+                let detect_start = Instant::now();
+                let outcome = run_device_detect_forward(handles, threshold).await;
+                let detect_ms = (detect_start.elapsed().as_millis() as u32) / n;
+                ForwardOutput {
+                    alias,
+                    detect_ms,
+                    outcome,
+                    vehicles: vec![Vec::new(); vehicle_frames],
+                }
+            });
+            inflight.insert(handle.id(), batch);
+            continue;
+        }
+
+        // GPU-resident NV12 detect: a homogeneous NV12 batch bypasses the
+        // executor and runs `detect_batch_gpu` directly (device preprocess; mesh
+        // failover / RGB wire serialization do not apply to a device frame). The
+        // result shape mirrors the executor's Detect op so `apply_forward_result`
+        // handles both paths identically. Only compiled with the ort GPU
+        // features; without them NV12 frames are never produced (see
+        // `resolve_ingest_path` / `nv12_detect_bench_enabled`).
+        #[cfg(feature = "inference-supertonic")]
+        if batch_is_nv12 {
+            let color = batch
+                .first()
+                .and_then(|it| jobs.get(&it.job_id))
+                .and_then(|j| nv12_color(&j.detect_format))
+                .unwrap_or_else(crate::vision::gpu_preprocess::ColorCoeffs::bt709_limited);
+            let mut nv12: Vec<Nv12DetectInput> = Vec::with_capacity(batch.len());
+            for it in &batch {
+                if let Some(job) = jobs.get(&it.job_id) {
+                    if let super::fakefile::DetectFrameFormat::Nv12 {
+                        y_stride,
+                        uv_stride,
+                        y_offset,
+                        uv_offset,
+                        ..
+                    } = job.detect_format
+                    {
+                        nv12.push(Nv12DetectInput {
+                            data: job.detect_frame.clone(),
+                            width: job.detect_w,
+                            height: job.detect_h,
+                            y_stride,
+                            uv_stride,
+                            y_offset,
+                            uv_offset,
+                        });
+                    }
+                }
+            }
+            if nv12.len() != batch.len() {
+                warn_throttled(
+                    "detect",
+                    "pending item without a live NV12 frame job; batch dropped",
+                );
+                for item in &batch {
+                    stage_completed(&mut jobs, item, None, None, &cold);
+                }
+                drop(permit);
+                continue;
+            }
+            let alias = batch[0].alias.clone();
+            let threshold = batch[0].threshold;
+            let n = batch.len().max(1) as u32;
+            let vehicle_nv12 = nv12.clone();
+            let handle = forwards.spawn(async move {
+                let _permit = permit;
+                let detect_start = Instant::now();
+                // RF-DETR and YOLOv8-vehicle run CONCURRENTLY on the SAME frame:
+                // separate ort pools → independent CUDA streams → wall time ≈
+                // max(DETR, YOLO), NOT the sum. The vehicle half degrades to empty
+                // internally, so it never blocks or fails detection.
+                let (outcome, vehicles) = tokio::join!(
+                    run_nv12_detect_forward(nv12, color, threshold),
+                    run_nv12_vehicle_forward(vehicle_nv12, color),
+                );
+                let detect_ms = (detect_start.elapsed().as_millis() as u32) / n;
+                ForwardOutput {
+                    alias,
+                    detect_ms,
+                    outcome,
+                    vehicles,
+                }
+            });
+            inflight.insert(handle.id(), batch);
+            continue;
+        }
+
         // Klatki batcha zero-copy (klon `Arc`) z jobów. Job pozycji w pending
         // zawsze istnieje (usuwany dopiero po domknięciu wszystkich etapów).
         let mut frames: Vec<CvFrameLocal> = Vec::with_capacity(batch.len());
         for it in &batch {
             if let Some(job) = jobs.get(&it.job_id) {
+                // Detect forward consumes the (GPU-scaled) detector frame — 560
+                // hits the detector's copy fast-path and skips the CPU resize.
                 frames.push(CvFrameLocal {
-                    data: job.frame.clone(),
-                    width: job.w,
-                    height: job.h,
+                    data: job.detect_frame.clone(),
+                    width: job.detect_w,
+                    height: job.detect_h,
                 });
             }
         }
         if frames.len() != batch.len() {
-            warn_throttled("detect", "pending item without a live frame job; batch dropped");
+            warn_throttled(
+                "detect",
+                "pending item without a live frame job; batch dropped",
+            );
             for item in &batch {
-                stage_completed(&mut jobs, item, None, &cold);
+                stage_completed(&mut jobs, item, None, None, &cold);
             }
             // Slot był tylko zarezerwowany — brak forwardu, drop zwalnia go od razu.
             drop(permit);
@@ -1080,6 +1757,11 @@ async fn engine_loop() {
         let threshold = batch[0].threshold;
         let executor_task = executor.clone();
         let n = batch.len().max(1) as u32;
+        // Vehicle detector runs on a CLONE of the SAME detect frames (Arc-cheap),
+        // concurrently with the executor detect (own ort pool). Only on the ort
+        // path — the Burn path has no YOLOv8 vehicle graph.
+        #[cfg(feature = "inference-supertonic")]
+        let vehicle_frames = frames.clone();
         let handle = forwards.spawn(async move {
             // Permit trzymany przez CAŁY forward — dropuje się z zadaniem (koniec
             // lub abort przy drainie), zwalniając slot Semaphore.
@@ -1092,15 +1774,30 @@ async fn engine_loop() {
             // swiezy kontekst per wywolanie (jak w vision_impl).
             let mut ctx = RuntimeContext::new(None);
             let detect_start = Instant::now();
-            let outcome = executor_task
-                .execute_camera_cv(request, &mut ctx)
-                .await
-                .map_err(|e| e.to_string());
+            #[cfg(feature = "inference-supertonic")]
+            let (outcome, vehicles) = tokio::join!(
+                async {
+                    executor_task
+                        .execute_camera_cv(request, &mut ctx)
+                        .await
+                        .map_err(|e| e.to_string())
+                },
+                run_rgb_vehicle_forward(vehicle_frames),
+            );
+            #[cfg(not(feature = "inference-supertonic"))]
+            let (outcome, vehicles) = (
+                executor_task
+                    .execute_camera_cv(request, &mut ctx)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Vec::new(),
+            );
             let detect_ms = (detect_start.elapsed().as_millis() as u32) / n;
             ForwardOutput {
                 alias,
                 detect_ms,
                 outcome,
+                vehicles,
             }
         });
         inflight.insert(handle.id(), batch);
@@ -1118,12 +1815,27 @@ fn stage_completed(
     jobs: &mut HashMap<u64, FrameJob>,
     item: &PendingItem,
     outcome: Option<(Vec<Detection>, u32)>,
+    vehicles: Option<Vec<Detection>>,
     cold: &mpsc::Sender<DetectionEvent>,
 ) {
     let Some(job) = jobs.get_mut(&item.job_id) else {
         return;
     };
     job.open_stages.retain(|s| s != &item.stage_id);
+    // Vehicle boxes ride the SAME frame as this detect forward. Run a dedicated
+    // IOU tracker keyed `(camera, "vehicles")` so each vehicle box gets a stable
+    // track_id (== its vehicle_id for association). Attached to the job; the last
+    // detect stage of a multi-stage frame wins (all share the frame).
+    if let Some(mut veh) = vehicles {
+        if !veh.is_empty() {
+            tracker::update(
+                &tracker::key(&job.camera_id, "vehicles"),
+                &mut veh,
+                job.pts_ns,
+            );
+        }
+        job.vehicles = veh;
+    }
     match outcome {
         Some((mut dets, detect_ms)) => {
             // Tracker IOU per (kamera, etap detekcji): nadaje stabilne `track_id`
@@ -1151,6 +1863,71 @@ fn stage_completed(
     }
 }
 
+/// Bench-only load-generator toggle, flipped programmatically by the
+/// `pipeline_bench` example via [`set_force_detect`]. When on, the cold
+/// enrichment path runs on frames the detector left empty (see
+/// [`synthesize_forced_detections`]). OFF by default, so production behaviour
+/// is unchanged.
+static FORCE_DETECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Bench-only programmatic switch for the forced-enrichment load generator.
+pub fn set_force_detect(enabled: bool) {
+    FORCE_DETECT.store(enabled, AtomicOrdering::Relaxed);
+}
+
+fn force_detect_enabled() -> bool {
+    FORCE_DETECT.load(AtomicOrdering::Relaxed)
+}
+
+/// Bench-only load generator (behind [`force_detect_enabled`]): synthesizes one
+/// detection per DISTINCT enrichment-stage class so every cold stage
+/// (classify → stan, ocr → tekst incl. ADR) gets a matching crop and its REAL
+/// forward runs through the inference batcher. The class is derived from each
+/// cold stage's own `classes` filter (a trailing-`*` pattern becomes its prefix,
+/// an exact pattern is used as-is) so [`cv_pipeline::class_matches`] accepts it
+/// for ANY pipeline. The bbox sweeps horizontally with `captured_ms` so
+/// consecutive frames carry distinct scene signatures and the cold-path
+/// coalescer does not drop them — worst-case per-frame enrichment load.
+fn synthesize_forced_detections(pipeline: &CvPipeline, captured_ms: u64) -> Vec<Detection> {
+    let mut classes: Vec<String> = Vec::new();
+    for stage in cv_pipeline::cold_stages(pipeline) {
+        let CvStageInput::Stage {
+            classes: patterns, ..
+        } = &stage.input
+        else {
+            continue;
+        };
+        let Some(first) = patterns.first() else {
+            continue;
+        };
+        let klasa = first.strip_suffix('*').unwrap_or(first).to_string();
+        if !klasa.is_empty() && !classes.contains(&klasa) {
+            classes.push(klasa);
+        }
+    }
+    // Horizontal sweep (> BBOX_BUCKET per frame at ≥5 fps) makes each frame a new
+    // scene for the coalescer; classes are stacked vertically so crops differ.
+    let phase = (captured_ms % 2000) as f32 / 2000.0;
+    let x = 0.05 + 0.6 * phase;
+    classes
+        .into_iter()
+        .enumerate()
+        .map(|(i, klasa)| Detection {
+            klasa,
+            bbox: [x, (0.1 + 0.18 * i as f32).min(0.8), 0.15, 0.15],
+            score: 0.99,
+            stan: Vec::new(),
+            tekst: None,
+            tekst_conf: None,
+            tekst_thumb_ref: None,
+            track_id: 0,
+            vehicle_id: 0,
+            vx: 0.0,
+            vy: 0.0,
+        })
+        .collect()
+}
+
 /// Finalizacja klatki po domknięciu wszystkich jej etapów `frame`: scala wyniki
 /// etapów w JEDNĄ publikację overlay (FAZA 1, kolejność etapów pipeline'u) i —
 /// dla niepustych zestawów — oddaje ramkę do cold path (FAZA 2, wzbogacenie).
@@ -1162,6 +1939,17 @@ fn finalize_job(mut job: FrameJob, cold: &mpsc::Sender<DetectionEvent>) {
     }
     job.results
         .sort_by_key(|(sid, _)| cv_pipeline::stage_index(&job.pipeline, sid));
+    // Bench-only forced enrichment load (`set_force_detect`, off by
+    // default): when the real detector left this frame empty, inject synthetic
+    // detections into the frame-stage results so the REAL cold path runs. This
+    // MUST land here — before the empty-set gate below — because the cold event
+    // is only created for a non-empty publication, so an injection inside
+    // `run_cold_stages` would never be reached for an empty frame.
+    if force_detect_enabled() && job.results.iter().all(|(_, d)| d.is_empty()) {
+        if let Some((_, dets)) = job.results.first_mut() {
+            dets.extend(synthesize_forced_detections(&job.pipeline, job.captured_ms));
+        }
+    }
     let merged: Vec<Detection> = job
         .results
         .iter()
@@ -1173,50 +1961,63 @@ fn finalize_job(mut job: FrameJob, cold: &mpsc::Sender<DetectionEvent>) {
     // dekodu + inferencji, a nie +OCR. Pusty zestaw tez publikujemy — czysci
     // overlay bez czekania na cold path. FAZA 1 zna tylko sume czasow detekcji;
     // pelny `proc_ms` publikuje FAZA 2, nadpisujac ramke dla tego samego
-    // captured_ms.
+    // captured_ms. Boxy pojazdow doklejamy TYLKO do publikacji overlayu (front
+    // rysuje ramki cieżarowek), NIE do `merged` uzytego do sygnatury/eventu.
+    let mut overlay = merged.clone();
+    overlay.extend(job.vehicles.iter().cloned());
     detection_bus::publish_detections(
         &job.camera_id,
         job.captured_ms,
         job.pts_ns,
         job.detect_ms_total,
-        merged.clone(),
+        // FAZA 1: hot overlay only — signs are NOT yet stamped with `vehicle_id`
+        // and enrichment is cache-only, so the event recorder must NOT bucket
+        // these (they would flood the unassigned `vehicle_id = 0` bucket).
+        false,
+        overlay,
     );
-    // Pusty zestaw nie wymaga wzbogacenia: FAZA 1 juz wyczyscila overlay.
+    // Pusty zestaw nie wymaga wzbogacenia: FAZA 1 juz wyczyscila overlay. Sam
+    // pojazd bez znaku/tablicy NIE tworzy eventu (trigger to detekcje RF-DETR).
     if merged.is_empty() {
         return;
     }
     let sig = detection_sig(&merged);
     let bytes = job.frame.len();
-    // FAZA 2 (cold): wzbogacenie pod dotychczasowym budzetem / backpressure.
-    // Coalesce / rate-limit / byte-budget gate (rezerwuje slot).
-    if admit_cold(&job.camera_id, sig, bytes).is_none() {
-        return;
-    }
     let camera_id = job.camera_id.clone();
     let ev = DetectionEvent {
         camera_id: job.camera_id,
         frame: job.frame,
+        frame_device: job.frame_device,
         w: job.w,
         h: job.h,
+        frame_format: job.frame_format,
         captured_ms: job.captured_ms,
         pts_ns: job.pts_ns,
         detect_ms: job.detect_ms_total,
         pipeline: job.pipeline,
         stage_dets: job.results,
+        vehicles: job.vehicles,
     };
-    match cold.try_send(ev) {
-        Ok(()) => {
-            commit_cold(&camera_id, sig);
-            metrics().emitted.fetch_add(1, AtomicOrdering::Relaxed);
-        }
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            metrics().dropped_full.fetch_add(1, AtomicOrdering::Relaxed);
-            release_cold(&camera_id, bytes);
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            warn!("[vision_analysis] cold path closed; detections dropped");
-            release_cold(&camera_id, bytes);
-        }
+    // FAZA 2 (cold): coalesce / byte-budget gate with latest-pending backpressure.
+    // Busy camera → the event is HELD as the freshest pending (promoted by
+    // `release_cold`), not dropped, so labels converge to the latest scene.
+    match admit_or_pend_cold(sig, bytes, ev) {
+        ColdAdmit::Send(ev) => match cold.try_send(ev) {
+            Ok(()) => {
+                commit_cold(&camera_id, sig);
+                metrics().emitted.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                metrics().dropped_full.fetch_add(1, AtomicOrdering::Relaxed);
+                release_cold(&camera_id, bytes);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!("[vision_analysis] cold path closed; detections dropped");
+                release_cold(&camera_id, bytes);
+            }
+        },
+        // Held as freshest pending, or coalesced/over-budget: nothing to send.
+        ColdAdmit::Held | ColdAdmit::Dropped => {}
     }
 }
 
@@ -1230,7 +2031,10 @@ fn detection_from_cv(d: CvDetection) -> Detection {
         score: d.score,
         stan: Vec::new(),
         tekst: None,
+        tekst_conf: None,
+        tekst_thumb_ref: None,
         track_id: 0,
+        vehicle_id: 0,
         vx: 0.0,
         vy: 0.0,
     }
@@ -1248,8 +2052,17 @@ const COLD_QUEUE_CAP: usize = 32;
 struct DetectionEvent {
     camera_id: String,
     frame: Arc<[u8]>,
+    /// Zero-copy CROPS path ONLY: DEVICE reference to the full-res NV12 frame (the
+    /// held `gst::Sample` keeps the surface valid until this event is enriched).
+    /// When `Some`, `frame` is EMPTY and `run_cold_stages` cuts each crop off the
+    /// device surface. `None` otherwise. Bounded surface pinning: ≤1 in-flight +
+    /// ≤1 pending per camera (see the cold admission gate).
+    frame_device: Option<super::fakefile::DeviceCropsFrame>,
     w: u32,
     h: u32,
+    /// Pixel layout of `frame` (`Rgb24` or GPU-resident `Nv12`). Cold enrichment
+    /// cuts crops with [`crop_nv12`] for NV12, keeping the RGB crop path unchanged.
+    frame_format: super::fakefile::DetectFrameFormat,
     /// Czas przechwycenia klatki (unix epoch ms) — propagowany do publish jako
     /// `ts_ms`, zeby overlay kotwiczyl detekcje na wlasciwej klatce.
     captured_ms: u64,
@@ -1266,6 +2079,8 @@ struct DetectionEvent {
     /// wybieraja rodzica po `stage_id`; publikacja scala grupy w kolejności
     /// etapów pipeline'u.
     stage_dets: Vec<(String, Vec<Detection>)>,
+    /// Boxy pojazdow (trakowane) TEJ klatki — cold path asocjuje znaki do nich.
+    vehicles: Vec<Detection>,
 }
 
 /// Live cold-path sender + consumer handle, so `drain` can tear the cold path
@@ -1313,6 +2128,12 @@ struct ColdCamState {
     last_sig: u64,
     last_emit: Instant,
     in_flight: bool,
+    /// Freshest frame that arrived while `in_flight` — held (not dropped) and
+    /// promoted by `release_cold` when the current enrichment finishes, so the
+    /// overlay always converges to the LATEST scene instead of stalling on the
+    /// one that happened to win the slot. `(sig, event)`; a newer arrival
+    /// replaces an older pending (the superseded one counts as dropped).
+    pending: Option<(u64, DetectionEvent)>,
 }
 
 fn cold_state() -> &'static Mutex<HashMap<String, ColdCamState>> {
@@ -1331,7 +2152,12 @@ fn cold_bytes() -> &'static AtomicUsize {
 struct ColdMetrics {
     emitted: AtomicU64,
     coalesced: AtomicU64,
+    /// Frames superseded while a newer pending replaced them (real loss). With
+    /// latest-pending this is the only "inflight drop": one held frame per camera
+    /// survives, older held frames are dropped in favour of the freshest.
     dropped_inflight: AtomicU64,
+    /// Frames HELD as the freshest pending (not lost — enriched when the slot frees).
+    pended: AtomicU64,
     dropped_full: AtomicU64,
     dropped_budget: AtomicU64,
 }
@@ -1363,42 +2189,70 @@ fn detection_sig(dets: &[Detection]) -> u64 {
     h.finish()
 }
 
-/// Coalesce + rate-limit + byte-budget gate. Decides whether this frame's
-/// detections become a cold event. Returns the bytes reserved (to release on
-/// failure / completion) or None when the event is dropped. Per-camera ordering
-/// is guaranteed by `in_flight = 1`: no second event for a camera is admitted
-/// until the consumer clears the flag.
-fn admit_cold(camera_id: &str, sig: u64, frame_bytes: usize) -> Option<()> {
+/// Outcome of the cold admission gate.
+enum ColdAdmit {
+    /// Slot reserved — send this event to the consumer now.
+    Send(DetectionEvent),
+    /// Camera busy — event stored as the freshest pending; `release_cold` will
+    /// promote it when the current enrichment finishes. Nothing to send now.
+    Held,
+    /// Coalesced (identical recent scene) or over byte budget — genuinely skipped.
+    Dropped,
+}
+
+/// Coalesce + rate-limit + byte-budget gate with LATEST-PENDING backpressure.
+/// When the camera is idle it reserves the slot and returns `Send(ev)`. When the
+/// camera is already enriching, it does NOT drop the frame — it keeps `ev` as the
+/// per-camera freshest pending (`Held`), so the overlay converges to the latest
+/// scene rather than stalling on whichever frame won the slot. Only identical
+/// recent scenes (coalesce) and budget overflow are truly `Dropped`. Per-camera
+/// ordering is still guaranteed by `in_flight = 1` plus the single pending slot.
+fn admit_or_pend_cold(sig: u64, frame_bytes: usize, ev: DetectionEvent) -> ColdAdmit {
     let now = Instant::now();
     let mut st = cold_state().lock().unwrap();
-    let entry = st.entry(camera_id.to_string()).or_insert(ColdCamState {
+    let entry = st.entry(ev.camera_id.clone()).or_insert(ColdCamState {
         last_sig: u64::MAX,
         last_emit: now - COALESCE_REFRESH * 2,
         in_flight: false,
+        pending: None,
     });
-    if entry.in_flight {
-        // A frame arriving while this camera's previous event is still processing
-        // is dropped (not queued) → overlay may show the prior scene until the
-        // next frame is admitted (~one cold cycle). Acceptable for a slow ADR
-        // gate; a per-camera "pending latest" replacement is a future refinement.
-        metrics().dropped_inflight.fetch_add(1, AtomicOrdering::Relaxed);
-        return None;
-    }
     let unchanged = sig == entry.last_sig;
+    if entry.in_flight {
+        // Identical recent scene: no point re-enriching, coalesce.
+        if unchanged && now.duration_since(entry.last_emit) < COALESCE_REFRESH {
+            metrics().coalesced.fetch_add(1, AtomicOrdering::Relaxed);
+            return ColdAdmit::Dropped;
+        }
+        // Keep the FRESHEST frame. Replacing an older pending drops the superseded
+        // one (real loss); a first pending is merely held. Pending frames are NOT
+        // byte-reserved here (≤1 per camera bounds memory) — reservation happens
+        // in `release_cold` at promotion, matching that run's later release.
+        if entry.pending.is_some() {
+            metrics()
+                .dropped_inflight
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        } else {
+            metrics().pended.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        entry.pending = Some((sig, ev));
+        return ColdAdmit::Held;
+    }
     if unchanged && now.duration_since(entry.last_emit) < COALESCE_REFRESH {
         metrics().coalesced.fetch_add(1, AtomicOrdering::Relaxed);
-        return None;
+        return ColdAdmit::Dropped;
     }
     if cold_bytes().load(AtomicOrdering::Relaxed) + frame_bytes > COLD_BYTE_BUDGET {
-        metrics().dropped_budget.fetch_add(1, AtomicOrdering::Relaxed);
-        return None;
+        metrics()
+            .dropped_budget
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        return ColdAdmit::Dropped;
     }
     // Reserve only. `last_sig`/`last_emit` are committed by `commit_cold` AFTER a
     // successful send, so a dropped (Full/Closed) event does not record its scene
     // as "recently emitted" and starve the next identical/clear frame.
     entry.in_flight = true;
     cold_bytes().fetch_add(frame_bytes, AtomicOrdering::Relaxed);
-    Some(())
+    ColdAdmit::Send(ev)
 }
 
 /// Records a successfully-sent event's scene signature + emit time (coalesce base).
@@ -1409,16 +2263,59 @@ fn commit_cold(camera_id: &str, sig: u64) {
     }
 }
 
-/// Releases a camera's in-flight slot + its reserved bytes. `saturating_sub` so a
-/// release racing a `drain()` reset can never underflow the byte counter (which
-/// would wrap huge and permanently reject the budget gate).
+/// Releases a camera's in-flight slot + its reserved bytes, then PROMOTES a held
+/// pending frame (latest-pending) if one is waiting: re-reserves its bytes, keeps
+/// the slot, and re-enqueues it on the cold channel so the freshest scene runs
+/// next. `saturating_sub` so a release racing a `drain()` reset can never underflow
+/// the byte counter (which would wrap huge and permanently reject the budget gate).
 fn release_cold(camera_id: &str, frame_bytes: usize) {
-    if let Some(slot) = cold_state().lock().unwrap().get_mut(camera_id) {
-        slot.in_flight = false;
-    }
+    // Free the finished event's bytes first.
     let _ = cold_bytes().fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |v| {
         Some(v.saturating_sub(frame_bytes))
     });
+    // Clear the slot and take any freshest pending under the lock.
+    let promoted = {
+        let mut st = cold_state().lock().unwrap();
+        match st.get_mut(camera_id) {
+            Some(slot) => {
+                slot.in_flight = false;
+                match slot.pending.take() {
+                    Some(pending) => {
+                        // Hold the slot for the promoted run (no window where a new
+                        // arrival could jump the queue ahead of this pending).
+                        slot.in_flight = true;
+                        Some(pending)
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        }
+    };
+    let Some((sig, ev)) = promoted else {
+        return;
+    };
+    let camera = ev.camera_id.clone();
+    let pending_bytes = ev.frame.len();
+    // Reserve bytes for the promoted run (balances its own later release_cold).
+    cold_bytes().fetch_add(pending_bytes, AtomicOrdering::Relaxed);
+    let sender = cold_chan().lock().unwrap().clone();
+    match sender {
+        Some(tx) => match tx.try_send(ev) {
+            Ok(()) => {
+                commit_cold(&camera, sig);
+                metrics().emitted.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_)) => {
+                // Channel saturated/closed: drop the promotion and unwind its slot +
+                // bytes (recurses once; the pending slot is already emptied above, so
+                // it clears `in_flight` and returns without further promotion).
+                metrics().dropped_full.fetch_add(1, AtomicOrdering::Relaxed);
+                release_cold(&camera, pending_bytes);
+            }
+        },
+        None => release_cold(&camera, pending_bytes),
+    }
 }
 
 /// RAII release: guarantees a received cold event's slot + bytes are released
@@ -1445,63 +2342,122 @@ impl Drop for ColdSlot {
 /// (`analysis_flow_id`), flow biegnie PO etapach cold pipeline'u i dostaje w
 /// meta już wzbogacone detekcje; publikacja flow może je nadpisać
 /// (`publish_flow_detections`).
+/// Max cameras whose cold enrichment runs CONCURRENTLY. Serial consumption meant
+/// the cross-camera inference batcher only ever saw one frame's crops per window;
+/// running up to `COLD_WORKERS` events at once lets crops from many cameras coalesce
+/// into one big GPU forward per model. Per-camera in-flight is still 1 (admit_cold)
+/// and the byte budget still bounds memory — this only widens CROSS-camera concurrency.
+fn cold_workers() -> usize {
+    crate::vision::settings::get().cold_workers.clamp(1, 1024)
+}
+
 async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
-    info!("[vision_analysis] cold enrichment consumer started");
+    let workers = cold_workers();
+    info!("[vision_analysis] cold enrichment consumer started (≤{workers} concurrent cameras)");
+    let sem = Arc::new(tokio::sync::Semaphore::new(workers));
     while let Some(ev) = rx.recv().await {
-        let DetectionEvent {
-            camera_id,
-            frame,
-            w,
-            h,
-            captured_ms,
-            pts_ns,
-            detect_ms,
-            pipeline,
-            mut stage_dets,
-        } = ev;
-        let bytes = frame.len();
-        // RAII: releases this camera's in-flight slot + bytes on drop — including
-        // an unwind if publish/enrich panics — so a camera can never be wedged.
-        let slot = ColdSlot {
-            camera_id: camera_id.clone(),
-            bytes,
-            released: false,
+        // Bound concurrency so we never spawn an unbounded task pile, but many
+        // cameras' crops still reach the batcher window together.
+        let Ok(permit) = sem.clone().acquire_owned().await else {
+            break;
         };
-        // Czas wzbogacenia tej klatki: pelna petla etapow cold. Dla trafien
-        // cache (pominiety realny forward) bedzie maly — klatka faktycznie tania.
-        let enrich_start = Instant::now();
-        run_cold_stages(&camera_id, &frame, w, h, &pipeline, &mut stage_dets).await;
-        let enrich_ms = enrich_start.elapsed().as_millis() as u32;
-        // proc_ms = calosc obrobki klatki: detekcja (FAZA 1) + etapy cold (FAZA 2).
-        let proc_ms = detect_ms + enrich_ms;
-        let merged: Vec<Detection> = stage_dets
-            .iter()
-            .flat_map(|(_, d)| d.iter().cloned())
-            .collect();
-        detection_bus::publish_detections(&camera_id, captured_ms, pts_ns, proc_ms, merged.clone());
-        if !merged.is_empty() {
-            if let (Some(flow_id), Some(disp)) = (
-                camera_flow_id(&camera_id).await,
-                crate::flow_engine::dispatcher::global_flow_dispatcher(),
-            ) {
-                // Detach: a flow can run up to its per-frame deadline, so awaiting
-                // it here would head-of-line block every other camera's enrichment.
-                // The spawned task owns `slot`, releasing this camera's in-flight
-                // slot + bytes when the flow finishes. Per-camera in-flight = 1
-                // (admit_cold) bounds a camera to one concurrent run; the byte
-                // budget bounds the fleet — so detaching stays bounded.
-                tokio::spawn(async move {
+        tokio::spawn(async move {
+            let _permit = permit;
+            let DetectionEvent {
+                camera_id,
+                frame,
+                frame_device,
+                w,
+                h,
+                frame_format,
+                captured_ms,
+                pts_ns,
+                detect_ms,
+                pipeline,
+                mut stage_dets,
+                mut vehicles,
+            } = ev;
+            let bytes = frame.len();
+            // RAII: releases this camera's in-flight slot + bytes on drop — including
+            // an unwind if publish/enrich panics — so a camera can never be wedged.
+            let slot = ColdSlot {
+                camera_id: camera_id.clone(),
+                bytes,
+                released: false,
+            };
+            let enrich_start = Instant::now();
+            run_cold_stages(
+                &camera_id,
+                &frame,
+                frame_device.as_ref(),
+                w,
+                h,
+                &frame_format,
+                &pipeline,
+                &mut stage_dets,
+                &mut vehicles,
+            )
+            .await;
+            let enrich_ms = enrich_start.elapsed().as_millis() as u32;
+            let proc_ms = detect_ms + enrich_ms;
+            // Enriched signs now carry `vehicle_id`. Publish them WITH the vehicle
+            // boxes (self-assigned vehicle_id) so the event recorder groups per
+            // truck and the overlay keeps drawing vehicle rectangles.
+            let mut merged: Vec<Detection> = stage_dets
+                .iter()
+                .flat_map(|(_, d)| d.iter().cloned())
+                .collect();
+            for v in vehicles.iter_mut() {
+                v.vehicle_id = v.track_id;
+            }
+            merged.extend(vehicles);
+            detection_bus::publish_detections(
+                &camera_id,
+                captured_ms,
+                pts_ns,
+                proc_ms,
+                // FAZA 2: signs now carry final `vehicle_id` + OCR/stan enrichment —
+                // this is the ONLY publish the event recorder buckets per vehicle.
+                true,
+                merged.clone(),
+            );
+            if !merged.is_empty() {
+                if let (Some(flow_id), Some(disp)) = (
+                    camera_flow_id(&camera_id).await,
+                    crate::flow_engine::dispatcher::global_flow_dispatcher(),
+                ) {
                     let _slot = slot;
+                    // The analysis flow reads the frame as an RGB24 image blob; on
+                    // the GPU-resident path `frame` is NV12, so convert once here
+                    // (only when a camera actually has an assigned flow). Zero-copy
+                    // crops: `frame` is empty, so download the full NV12 on demand.
+                    let host_frame = if frame.is_empty() {
+                        match frame_device.as_ref().and_then(|d| d.download_full_nv12()) {
+                            Some((nv12, _fmt)) => nv12,
+                            None => frame.clone(),
+                        }
+                    } else {
+                        frame.clone()
+                    };
+                    let rgb_frame = nv12_to_rgb_if_needed(&host_frame, w, h, &frame_format);
                     run_camera_flow(
-                        disp, flow_id, camera_id, frame, w, h, captured_ms, pts_ns, proc_ms,
+                        disp,
+                        flow_id,
+                        camera_id,
+                        rgb_frame,
+                        w,
+                        h,
+                        captured_ms,
+                        pts_ns,
+                        proc_ms,
                         merged,
                     )
                     .await;
-                });
-                continue;
+                    return;
+                }
             }
-        }
-        drop(slot);
+            drop(slot);
+        });
     }
 }
 
@@ -1633,7 +2589,14 @@ async fn run_camera_flow(
                 detections.len()
             );
             let proc_ms = detect_ms + enrich_start.elapsed().as_millis() as u32;
-            publish_flow_detections(&camera_id, captured_ms, pts_ns, proc_ms, detections, outcome);
+            publish_flow_detections(
+                &camera_id,
+                captured_ms,
+                pts_ns,
+                proc_ms,
+                detections,
+                outcome,
+            );
         }
         Err(e) => warn!("[vision_analysis] flow {flow_id} dispatch failed: {e}"),
     }
@@ -1673,6 +2636,9 @@ fn publish_flow_detections(
         captured_ms,
         pts_ns,
         proc_ms,
+        // Flow overlay: OCR-enriched but NOT vehicle-stamped (the flow engine has
+        // no vehicle association), so it feeds the overlay only — never bucketing.
+        false,
         enriched.unwrap_or(original),
     );
 }
@@ -1692,20 +2658,52 @@ const ENRICH_CACHE_EVICT_AGE: Duration = Duration::from_secs(10);
 /// osobnego watku — martwe tracki znikaja przy okazji kolejnych zapisow.
 const ENRICH_EVICT_EVERY: usize = 256;
 
-/// Wynik jednego etapu cold dla jednego tracku: stan (classify) LUB odczyt OCR
-/// (tylko pole właściwe dla `output` etapu jest niepuste), wraz z chwilą
-/// policzenia (`at`) do oceny świeżości względem `ENRICH_TTL`.
+/// Wynik jednego etapu cold dla jednego tracku. Po przejściu na batchowanie każda
+/// klatka liczy classify i OCR OD ZERA (żaden zły pierwszy odczyt się nie utrwala),
+/// więc `stan` jest nakładany bezpośrednio i NIE jest już cache'owany. Jedynym
+/// stanem cross-frame trzymanym w tej strukturze jest histogram głosów OCR.
+///
+/// `tekst` niesie AKTUALNIE zwycięski odczyt OCR PO BRAMCE pewności+zgodności —
+/// nie surowy odczyt jednej klatki. `tekst_conf` to średnia pewność zwycięzcy
+/// (0..1). `tekst_votes` to CONFIDENCE-WEIGHTED histogram głosów per track: OCR
+/// chwieje się o ±1 znak klatka-do-klatki (OKR7408↔ORR7408↔DRR7408); poprawne
+/// znaki są stałe i czytane z wysoką pewnością, więc ważone głosowanie wygrywa
+/// prawdziwą tablicę, a niepewny szum (tablica zasłonięta/rozmyta) nie zbiera ani
+/// dużej wagi, ani zgody — bramka zwraca wtedy "nieczytelna" (`None`) zamiast
+/// zmyślonego numeru. `at` datuje ostatnie dotknięcie wpisu.
 #[derive(Clone)]
 struct CachedEnrich {
     stan: Vec<String>,
     tekst: Option<String>,
+    tekst_conf: Option<f32>,
+    tekst_votes: Vec<TekstVote>,
     at: Instant,
 }
 
-/// Proces-wide cache wzbogacania kluczowany po (camera_id, stage_id, track_id) —
-/// stage_id to etap COLD pipeline'u, wiec dwa etapy classify nad tym samym
-/// rodzicem nie koliduja. Pozwala wzbogacic kazdy track RAZ per etap i reuzywac
-/// wynik zamiast wolac model per klatka (~10x mniej forwardow).
+/// One variant in a track's confidence-weighted OCR vote. `weight` accumulates
+/// the OCR confidence of every frame that read this exact string (so a confident
+/// read counts more than a blurry one); `conf_sum`/`count` recover the variant's
+/// mean confidence for the gate.
+#[derive(Clone)]
+struct TekstVote {
+    text: String,
+    weight: f32,
+    conf_sum: f32,
+    count: u32,
+}
+
+/// Outcome of the confidence+agreement gate over a track's weighted vote.
+struct VoteOutcome {
+    /// The reported string, or `None` when the evidence is too weak
+    /// (unreadable). The winner's mean confidence when `text` is `Some`.
+    text: Option<String>,
+    confidence: Option<f32>,
+}
+
+/// Proces-wide stan glosowania OCR kluczowany po (camera_id, stage_id, track_id) —
+/// stage_id to etap COLD pipeline'u, wiec dwa etapy OCR nad tym samym rodzicem nie
+/// koliduja. Trzyma histogram glosow per track (`tekst_votes`) + aktualnego
+/// zwyciezce; classify NIE jest juz cache'owany (kazda klatka liczy od zera).
 fn enrich_cache() -> &'static Mutex<HashMap<(String, String, u32), CachedEnrich>> {
     static C: OnceLock<Mutex<HashMap<(String, String, u32), CachedEnrich>>> = OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1722,29 +2720,200 @@ fn enrich_cache_fresh(camera_id: &str, stage_id: &str, track_id: u32) -> Option<
         .cloned()
 }
 
-/// Zapisuje wynik etapu cold dla tracku do cache i co `ENRICH_EVICT_EVERY`
-/// zapisow usuwa wpisy starsze niz `ENRICH_CACHE_EVICT_AGE` (ewikcja
-/// licznikowa), by mapa nie rosla po znikajacych trackach.
-fn enrich_cache_put(
+/// Maks. liczba różnych stringów trzymanych w histogramie głosów tracku. Kody
+/// tablic/ADR są krótkie, a track oscyluje tylko między kilkoma niemal
+/// identycznymi odczytami, więc mała mapa wystarcza; przy przepełnieniu wypada
+/// najsłabszy wariant.
+const OCR_VOTE_MAX_VARIANTS: usize = 8;
+
+/// Górny limit sumy zliczonych odczytów per track. Klamrowanie utrzymuje głos
+/// adaptacyjnym: gdy tablica realnie się zmieni (nowy pojazd dostał to samo
+/// track_id), stary zwycięzca nie może prowadzić w nieskończoność — po dojściu
+/// do limitu histogram jest wykładniczo wygaszany, więc nowe odczyty przejmują
+/// prowadzenie.
+const OCR_VOTE_MAX_TOTAL: u32 = 30;
+
+/// Weight floor for a single read so a 0-confidence read still nudges its
+/// variant (the confidence is a mean softmax prob and is never exactly 0 for a
+/// real decode, but this keeps the vote well-defined).
+const OCR_VOTE_MIN_WEIGHT: f32 = 0.01;
+
+/// `(min_confidence, min_agreement)` gate thresholds for the OCR vote, resolved
+/// from `[vision]` per read mode: plate reads use `plate_min_*`, ADR placards
+/// use `adr_min_*` (the ADR UN already passes the `snap_adr` catalog snap, so
+/// its confidence floor is lower). `Generic` follows the plate thresholds.
+fn ocr_gate_thresholds(mode: &CvOcrMode) -> (f32, f32) {
+    let v = crate::vision::settings::get();
+    match mode {
+        CvOcrMode::Adr => (v.adr_min_confidence, v.adr_min_agreement),
+        CvOcrMode::Plate | CvOcrMode::Generic => (v.plate_min_confidence, v.plate_min_agreement),
+    }
+}
+
+/// Wciela jeden zwalidowany odczyt OCR (string + pewność 0..1) do CONFIDENCE-
+/// WEIGHTED histogramu głosów tracku, po czym stosuje bramkę pewności+zgodności:
+///   * każdy odczyt dokłada `max(conf, floor)` do wagi swojego wariantu,
+///   * zwycięzca = wariant o największej wadze,
+///   * `agreement` = waga_zwycięzcy / suma_wag,
+///   * zwycięzca jest EMITOWANY tylko gdy jego średnia pewność ≥ `min_conf`
+///     ORAZ `agreement ≥ min_agreement`; inaczej `None` ("nieczytelna").
+/// To odrzuca powtarzany, ale niepewny i niespójny błąd (zasłonięta tablica),
+/// a wpuszcza jeden mocny, zgodny odczyt (agreement 1.0).
+fn ocr_vote(
+    votes: &mut Vec<TekstVote>,
+    read: &str,
+    conf: f32,
+    min_conf: f32,
+    min_agreement: f32,
+    prev: Option<&str>,
+) -> VoteOutcome {
+    let total_count: u32 = votes.iter().map(|v| v.count).sum();
+    // Wykładnicze zapominanie: po zliczeniu limitu odczytów połowimy wszystko,
+    // aby realnie zmieniona tablica mogła wyprzedzić przestarzałego zwycięzcę.
+    if total_count >= OCR_VOTE_MAX_TOTAL {
+        votes.retain_mut(|v| {
+            v.weight *= 0.5;
+            v.conf_sum *= 0.5;
+            v.count /= 2;
+            v.count > 0
+        });
+    }
+    let w = conf.max(OCR_VOTE_MIN_WEIGHT);
+    match votes.iter_mut().find(|v| v.text == read) {
+        Some(v) => {
+            v.weight += w;
+            v.conf_sum += conf;
+            v.count += 1;
+        }
+        None => {
+            if votes.len() >= OCR_VOTE_MAX_VARIANTS {
+                // Wyrzuć najlżejszy wariant, by ograniczyć mapę — wobble rodzi
+                // tylko kilka wariantów, więc ewikcja odpala się rzadko.
+                if let Some(pos) = votes
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| a.weight.total_cmp(&b.weight))
+                    .map(|(i, _)| i)
+                {
+                    votes.swap_remove(pos);
+                }
+            }
+            votes.push(TekstVote {
+                text: read.to_string(),
+                weight: w,
+                conf_sum: conf,
+                count: 1,
+            });
+        }
+    }
+    gate_votes(votes, min_conf, min_agreement, prev)
+}
+
+/// Applies the confidence+agreement gate to a track's current weighted votes
+/// WITHOUT adding a read — used both after a vote and when a frame produced no
+/// read (the winner may still be strong enough from earlier frames). Returns the
+/// gated winner or an unreadable outcome.
+fn gate_votes(
+    votes: &[TekstVote],
+    min_conf: f32,
+    min_agreement: f32,
+    prev: Option<&str>,
+) -> VoteOutcome {
+    // Winner = MOST-READ variant by RAW COUNT, never by confidence weight. The
+    // plate-OCR softmax confidence is near-uniform (~0.05) with per-frame noise,
+    // so a confidence-weighted winner could hand the plate to a 21-read blur over
+    // a 2018-read correct plate (observed: NM2356 beat WGM1416P). Raw majority
+    // over the whole event is the robust signal; agreement = winner_count/total.
+    let total_count: u32 = votes.iter().map(|v| v.count).sum();
+    if total_count == 0 {
+        return VoteOutcome {
+            text: None,
+            confidence: None,
+        };
+    }
+    let max_count = votes.iter().map(|v| v.count).max().unwrap_or(0);
+    // Tie-break to the previously emitted string so a stable read does not
+    // flicker between two equally-read variants.
+    let winner = prev
+        .and_then(|p| votes.iter().find(|v| v.text == p && v.count == max_count))
+        .or_else(|| votes.iter().find(|v| v.count == max_count));
+    let Some(winner) = winner else {
+        return VoteOutcome {
+            text: None,
+            confidence: None,
+        };
+    };
+    let agreement = winner.count as f32 / total_count as f32;
+    let mean_conf = if winner.count > 0 {
+        winner.conf_sum / winner.count as f32
+    } else {
+        0.0
+    };
+    // Confidence floor stays a no-op unless configured (the model confidence is
+    // unreliable); the real gate is agreement. `min_conf` is honored only when a
+    // deployment sets it > 0.
+    if mean_conf >= min_conf && agreement >= min_agreement {
+        VoteOutcome {
+            text: Some(winner.text.clone()),
+            confidence: Some(mean_conf),
+        }
+    } else {
+        VoteOutcome {
+            text: None,
+            confidence: None,
+        }
+    }
+}
+
+/// COLD, ścieżka OCR: pod JEDNYM lockiem wciela jeden odczyt (string + pewność)
+/// do CONFIDENCE-WEIGHTED histogramu głosów tracku, stosuje bramkę
+/// pewności+zgodności i zwraca aktualnego zwycięzcę (albo `None` = nieczytelna).
+/// W odróżnieniu od classify OCR nie jest cache-skipowany — re-czytamy co cykl
+/// cold (GPU-tani ~2-3 ms) i pozwalamy ważonemu głosowaniu ustabilizować
+/// chwiejny znak. `read == None` (odczyt niezwalidowany/nieudany) NIE jest
+/// głosowany, ale wciąż PRZELICZA bramkę nad dotychczasowymi głosami (zwycięzca
+/// może być już wystarczająco mocny) i odświeża `at`, aby histogram przeżył
+/// ewikcję, dopóki track żyje. Ustawia `entry.tekst`/`entry.tekst_conf`.
+fn enrich_cache_vote_ocr(
     camera_id: &str,
     stage_id: &str,
     track_id: u32,
-    stan: Vec<String>,
-    tekst: Option<String>,
-) {
+    read: Option<(String, f32)>,
+    min_conf: f32,
+    min_agreement: f32,
+) -> (Option<String>, Option<f32>) {
     static PUT_COUNT: AtomicUsize = AtomicUsize::new(0);
     let mut cache = enrich_cache().lock().unwrap_or_else(|e| e.into_inner());
-    cache.insert(
-        (camera_id.to_string(), stage_id.to_string(), track_id),
-        CachedEnrich {
-            stan,
-            tekst,
+    let entry = cache
+        .entry((camera_id.to_string(), stage_id.to_string(), track_id))
+        .or_insert_with(|| CachedEnrich {
+            stan: Vec::new(),
+            tekst: None,
+            tekst_conf: None,
+            tekst_votes: Vec::new(),
             at: Instant::now(),
-        },
-    );
+        });
+    let prev = entry.tekst.clone();
+    let outcome = match read {
+        Some((read, conf)) => ocr_vote(
+            &mut entry.tekst_votes,
+            &read,
+            conf,
+            min_conf,
+            min_agreement,
+            prev.as_deref(),
+        ),
+        // No read this frame: re-gate the accumulated votes so an already-strong
+        // winner keeps showing and a weak one stays unreadable.
+        None => gate_votes(&entry.tekst_votes, min_conf, min_agreement, prev.as_deref()),
+    };
+    entry.tekst = outcome.text.clone();
+    entry.tekst_conf = outcome.confidence;
+    entry.at = Instant::now();
     if PUT_COUNT.fetch_add(1, AtomicOrdering::Relaxed) % ENRICH_EVICT_EVERY == 0 {
         cache.retain(|_, c| c.at.elapsed() < ENRICH_CACHE_EVICT_AGE);
     }
+    (outcome.text, outcome.confidence)
 }
 
 /// Przypisuje detekcji wynik etapu cold zgodnie z jego `output`: classify
@@ -1756,15 +2925,18 @@ fn apply_stage_output(det: &mut Detection, output: Option<CvStageOutput>, value:
         Some(CvStageOutput::Tekst) => {
             if value.tekst.is_some() {
                 det.tekst = value.tekst.clone();
+                det.tekst_conf = value.tekst_conf;
             }
         }
         None => {}
     }
 }
 
-/// HOT: przypisuje detekcjom etapu `detect_stage_id` swieze wpisy cache
-/// wzbogacania wszystkich etapow cold, ktore maja ten etap za rodzica — boxy
-/// FAZY 1 niosa stan/tekst natychmiast, bez czekania na cold path.
+/// HOT: przypisuje detekcjom etapu `detect_stage_id` aktualnego zwyciezce
+/// glosowania OCR (`enrich_cache_fresh`) dla etapow cold, ktore maja ten etap za
+/// rodzica — box FAZY 1 niesie ustabilizowany `tekst` natychmiast, bez czekania na
+/// cold path. Classify nie jest juz cache'owany, wiec `stan` domalowuje dopiero
+/// FAZA 2 (swiezy odczyt per klatka).
 fn apply_cached_enrichment(
     camera_id: &str,
     pipeline: &CvPipeline,
@@ -1772,7 +2944,11 @@ fn apply_cached_enrichment(
     dets: &mut [Detection],
 ) {
     for stage in cv_pipeline::cold_stages(pipeline) {
-        let CvStageInput::Stage { stage_id: parent, classes } = &stage.input else {
+        let CvStageInput::Stage {
+            stage_id: parent,
+            classes,
+        } = &stage.input
+        else {
             continue;
         };
         if parent != detect_stage_id {
@@ -1789,27 +2965,327 @@ fn apply_cached_enrichment(
     }
 }
 
+// -----------------------------------------------------------------------------
+// Event thumbnail capture (full downscaled frame at the best OCR read)
+// -----------------------------------------------------------------------------
+//
+// When a track's plate/ADR OCR winner reaches a NEW best confidence, we snapshot
+// the WHOLE camera frame (downscaled), NOT a crop — the operator wants the scene
+// where the plate/ADR is clearly visible. The snap ref rides the `Detection`
+// (`tekst_thumb_ref`) to the event recorder, which promotes it into the
+// `recordings.plate_thumb_ref`/`adr_thumb_ref` list thumbnail. Capture is
+// THROTTLED per (camera, ocr_mode, track): a save happens only when the read's
+// confidence beats the track's previous best by a margin, so I/O is bounded to a
+// handful of snaps per vehicle instead of one per frame.
+
+/// Longest edge of a saved event thumbnail. Full-scene context at a fraction of
+/// the frame bytes so the recordings list stays light.
+const THUMB_MAX_EDGE: u32 = 480;
+
+/// A read must beat the track's previous best confidence by at least this margin
+/// to trigger a fresh thumbnail save — bounds churn from frame-to-frame jitter.
+const THUMB_CONF_IMPROVE_MARGIN: f32 = 0.03;
+
+/// Per-(camera, ocr_mode, track) best OCR confidence for which a thumbnail was
+/// already captured. Keyed like the enrich cache; reused via the same eviction
+/// cadence so dead tracks fall out without a separate sweeper.
+struct ThumbBest {
+    best_conf: f32,
+    at: Instant,
+}
+
+fn thumb_best_cache() -> &'static Mutex<HashMap<(String, String, u32), ThumbBest>> {
+    static C: OnceLock<Mutex<HashMap<(String, String, u32), ThumbBest>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Returns `true` when `conf` is a new best for this track worth capturing (and
+/// records it), `false` otherwise. Under one lock; opportunistically evicts
+/// stale entries so the map stays bounded without a background task.
+fn thumb_should_capture(camera_id: &str, mode_key: &str, track_id: u32, conf: f32) -> bool {
+    static PUT_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let mut cache = thumb_best_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let key = (camera_id.to_string(), mode_key.to_string(), track_id);
+    let capture = match cache.get(&key) {
+        Some(prev) => conf >= prev.best_conf + THUMB_CONF_IMPROVE_MARGIN,
+        None => true,
+    };
+    if capture {
+        cache.insert(
+            key,
+            ThumbBest {
+                best_conf: conf,
+                at: Instant::now(),
+            },
+        );
+    }
+    if PUT_COUNT.fetch_add(1, AtomicOrdering::Relaxed) % ENRICH_EVICT_EVERY == 0 {
+        cache.retain(|_, b| b.at.elapsed() < ENRICH_CACHE_EVICT_AGE);
+    }
+    capture
+}
+
+/// Minimum wall-time between scene-thumbnail captures for a camera. Guarantees
+/// every event gets a photo even when the plate/ADR is never read, without
+/// snapshotting every frame.
+const SCENE_THUMB_INTERVAL: Duration = Duration::from_secs(3);
+
+/// True at most once per [`SCENE_THUMB_INTERVAL`] per camera — so a vehicle
+/// present but unread (no plate/ADR) still yields a full-frame thumbnail.
+fn scene_thumb_should_capture(camera_id: &str) -> bool {
+    static LAST: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    let mut map = LAST
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    match map.get(camera_id) {
+        Some(t) if now.duration_since(*t) < SCENE_THUMB_INTERVAL => false,
+        _ => {
+            map.insert(camera_id.to_string(), now);
+            true
+        }
+    }
+}
+
+/// Downscales the full RGB24 frame so its longest edge is at most
+/// [`THUMB_MAX_EDGE`] (keeping aspect, never upscaling), persists it via
+/// `save_snapshot_rgb24`, and catalogs a `kind = "snapshot"` `recordings` row so
+/// the ref resolves through the signed `/recordings/<ref>` image endpoint the
+/// panel renders. Attribution goes to the camera's owning addon/org/retention
+/// (same identity the event recorder uses), so the thumbnail lives in the same
+/// tenant scope as the clip. Returns the snapshot ref on success, `None` on any
+/// failure (a missing thumbnail degrades to a placeholder — never fatal to
+/// enrichment). On a DB-insert failure the just-written file is purged so no
+/// orphan is left behind, mirroring the host-function snapshot path.
+async fn save_event_thumbnail(camera_id: &str, rgb24: &[u8], w: u32, h: u32) -> Option<String> {
+    if w == 0 || h == 0 || rgb24.len() != (w as usize) * (h as usize) * 3 {
+        return None;
+    }
+    let longest = w.max(h);
+    let (tw, th, data) = if longest > THUMB_MAX_EDGE {
+        let scale = THUMB_MAX_EDGE as f32 / longest as f32;
+        let tw = ((w as f32 * scale).round() as u32).max(1);
+        let th = ((h as f32 * scale).round() as u32).max(1);
+        let img = image::RgbImage::from_raw(w, h, rgb24.to_vec())?;
+        let resized = image::imageops::resize(&img, tw, th, image::imageops::FilterType::Triangle);
+        (tw, th, resized.into_raw())
+    } else {
+        (w, h, rgb24.to_vec())
+    };
+    let saved =
+        match crate::services::recording::save_snapshot_rgb24(camera_id, &data, tw, th).await {
+            Ok(saved) => saved,
+            Err(e) => {
+                warn_throttled("thumb", &format!("event thumbnail save failed: {e}"));
+                return None;
+            }
+        };
+    // Catalog the snapshot so the signed-URL endpoint can serve it. Without a row
+    // the ref is un-resolvable and the panel shows a placeholder.
+    let camera_id_owned = camera_id.to_string();
+    let saved_ref = saved.recording_ref.as_str().to_string();
+    let file_path = saved.file_path.clone();
+    let cataloged = tokio::task::spawn_blocking(move || {
+        let Some(pool) = crate::db::global_pool() else {
+            return Err(anyhow::anyhow!("no global DB pool"));
+        };
+        let (owner_addon_id, org_id, retention_class) =
+            match crate::db::repository::camera_recording_identity(&pool, &camera_id_owned)? {
+                Some(v) => v,
+                None => return Err(anyhow::anyhow!("camera not node-local")),
+            };
+        crate::db::repository::insert_recording(
+            &pool,
+            &saved_ref,
+            "snapshot",
+            &owner_addon_id,
+            &camera_id_owned,
+            &saved.file_path.to_string_lossy(),
+            saved.file_size_bytes as i64,
+            None,
+            saved.width.map(|v| v as i64),
+            saved.height.map(|v| v as i64),
+            saved.pixel_format.as_deref(),
+            &saved.hash_sha256,
+            &retention_class,
+            Some(&org_id),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .map(|_| saved_ref)
+        .map_err(anyhow::Error::from)
+    })
+    .await;
+    match cataloged {
+        Ok(Ok(r)) => Some(r),
+        Ok(Err(e)) => {
+            warn_throttled("thumb", &format!("event thumbnail catalog failed: {e}"));
+            let _ = crate::services::recording::purge_recording(&file_path).await;
+            None
+        }
+        Err(e) => {
+            warn_throttled("thumb", &format!("event thumbnail catalog task: {e}"));
+            None
+        }
+    }
+}
+
+/// Minimum overlap fraction `area(s∩v)/area(s)` for the max-overlap FALLBACK: a
+/// sign whose center lands in no vehicle box is still assigned to the vehicle it
+/// overlaps most, but only if that overlap covers at least this fraction of the
+/// sign. Below it the sign is left unassigned (`vehicle_id = 0`).
+const MIN_VEHICLE_OVERLAP: f32 = 0.3;
+
+/// One vehicle box for association: normalized `[x, y, w, h]` + its stable
+/// `vehicle_id` (the "vehicles" tracker track_id). Decoupled from `Detection`
+/// so [`assign_vehicle`] is a pure, testable function with no pipeline deps.
+#[derive(Debug, Clone, Copy)]
+struct VehicleBox {
+    bbox: [f32; 4],
+    vehicle_id: u32,
+}
+
+/// Assigns a sign/plate/sticker box to the vehicle it sits on. PURE + testable.
+///
+/// Rule (per the per-truck plan):
+///   1. CENTER-IN-BOX: every vehicle whose box contains the sign's center is a
+///      candidate. Ties (overlapping vehicles both containing the center) break
+///      by (a) larger containment fraction `area(s∩v)/area(s)`, then (b) smaller
+///      vehicle area (the tighter box is the real owner), then (c) smaller
+///      `vehicle_id` (stable, deterministic).
+///   2. FALLBACK — no vehicle contains the center: the vehicle with the largest
+///      overlap fraction, accepted only if it is ≥ [`MIN_VEHICLE_OVERLAP`].
+///   3. Otherwise `0` (unassigned): kept for overlay, excluded from per-truck
+///      grouping.
+fn assign_vehicle(sign_bbox: &[f32; 4], vehicles: &[VehicleBox]) -> u32 {
+    if vehicles.is_empty() {
+        return 0;
+    }
+    let (sx, sy, sw, sh) = (sign_bbox[0], sign_bbox[1], sign_bbox[2], sign_bbox[3]);
+    let sign_area = (sw.max(0.0)) * (sh.max(0.0));
+    let cx = sx + sw * 0.5;
+    let cy = sy + sh * 0.5;
+
+    // Containment fraction area(s∩v)/area(s) of the sign inside a vehicle box.
+    let contain_frac = |v: &VehicleBox| -> f32 {
+        if sign_area <= 0.0 {
+            return 0.0;
+        }
+        let (vx, vy, vw, vh) = (v.bbox[0], v.bbox[1], v.bbox[2], v.bbox[3]);
+        let ix1 = sx.max(vx);
+        let iy1 = sy.max(vy);
+        let ix2 = (sx + sw).min(vx + vw);
+        let iy2 = (sy + sh).min(vy + vh);
+        let iw = (ix2 - ix1).max(0.0);
+        let ih = (iy2 - iy1).max(0.0);
+        (iw * ih) / sign_area
+    };
+    let vehicle_area = |v: &VehicleBox| (v.bbox[2].max(0.0)) * (v.bbox[3].max(0.0));
+
+    // CENTER-IN-BOX candidates.
+    let mut best: Option<&VehicleBox> = None;
+    for v in vehicles {
+        let (vx, vy, vw, vh) = (v.bbox[0], v.bbox[1], v.bbox[2], v.bbox[3]);
+        let inside = cx >= vx && cx <= vx + vw && cy >= vy && cy <= vy + vh;
+        if !inside {
+            continue;
+        }
+        best = Some(match best {
+            None => v,
+            Some(cur) => {
+                // Larger containment fraction wins; then smaller vehicle area;
+                // then smaller vehicle_id.
+                let (fv, fc) = (contain_frac(v), contain_frac(cur));
+                if fv > fc + f32::EPSILON {
+                    v
+                } else if fc > fv + f32::EPSILON {
+                    cur
+                } else {
+                    let (av, ac) = (vehicle_area(v), vehicle_area(cur));
+                    if av < ac - f32::EPSILON {
+                        v
+                    } else if ac < av - f32::EPSILON {
+                        cur
+                    } else if v.vehicle_id < cur.vehicle_id {
+                        v
+                    } else {
+                        cur
+                    }
+                }
+            }
+        });
+    }
+    if let Some(v) = best {
+        return v.vehicle_id;
+    }
+
+    // FALLBACK: max overlap ≥ MIN_VEHICLE_OVERLAP.
+    let mut best_overlap = 0.0f32;
+    let mut best_id = 0u32;
+    for v in vehicles {
+        let f = contain_frac(v);
+        if f > best_overlap {
+            best_overlap = f;
+            best_id = v.vehicle_id;
+        }
+    }
+    if best_overlap >= MIN_VEHICLE_OVERLAP {
+        best_id
+    } else {
+        0
+    }
+}
+
+/// Stamps `vehicle_id` on every sign/plate/sticker detection of a frame from the
+/// tracked vehicle boxes. Vehicle boxes themselves (`klasa == "vehicle"`) get
+/// their own track_id as `vehicle_id` (self-assignment) so the overlay/grouping
+/// is uniform. Called at the TAIL of `run_cold_stages` (the full frame is known
+/// and enrichment is done). No-op when `vehicles` is empty (degrades to today's
+/// single-bag behavior — every sign keeps `vehicle_id = 0`).
+fn stamp_vehicle_ids(stage_dets: &mut [(String, Vec<Detection>)], vehicles: &[VehicleBox]) {
+    for (_, dets) in stage_dets.iter_mut() {
+        for det in dets.iter_mut() {
+            if det.klasa == crate::vision::detector_vehicle::VEHICLE_CLASS {
+                det.vehicle_id = det.track_id;
+                continue;
+            }
+            det.vehicle_id = assign_vehicle(&det.bbox, vehicles);
+        }
+    }
+}
+
 /// COLD: generyczny interpreter etapow `stage` pipeline'u. Dla kazdego etapu
 /// wybiera detekcje rodzica pasujace klasami (`class_matches`), wycina crop z
-/// paddingiem etapu i wykonuje operacje przez executor (alias ETAPU):
-/// classify → `stan`, ocr → `tekst` (tryb z `params.ocr_mode`), embed →
-/// jawny skip z warn-once (surface CameraCv nie ma jeszcze operacji Embed).
-/// Petla jest async: executor sam robi `run_blocking` per forward, wiec
-/// serializacja GPU jest zachowana (jeden forward naraz). Zaden blad nie
-/// wychodzi na zewnatrz — etap bez wyniku zostawia pole puste.
+/// paddingiem etapu i wzbogaca: classify → `stan`, ocr → `tekst` (tryb z
+/// `params.ocr_mode`), embed → jawny skip z warn-once. Wszystkie cropy etapu ida
+/// JEDNYM zbatchowanym forwardem gdy alias rozwiazuje sie do lokalnego silnika
+/// (`classify_batch`/`read_batch`); inaczej per-crop fallback przez executor
+/// (`cold_stage_per_crop`). Kazda klatka czyta OD ZERA — brak cache-skipu, jedynym
+/// stanem cross-frame jest histogram glosow OCR. Zaden blad nie wychodzi na
+/// zewnatrz — etap bez wyniku zostawia pole puste. Na koncu asocjuje kazdy
+/// znak/tablice z pojazdem (`stamp_vehicle_ids`).
 async fn run_cold_stages(
     camera_id: &str,
     frame: &[u8],
+    frame_device: Option<&super::fakefile::DeviceCropsFrame>,
     w: u32,
     h: u32,
+    frame_format: &super::fakefile::DetectFrameFormat,
     pipeline: &CvPipeline,
     stage_dets: &mut [(String, Vec<Detection>)],
+    vehicles: &mut [Detection],
 ) {
     let Some(executor) = runtime_executor() else {
         warn_throttled(
             "cold-executor",
             "runtime executor unavailable; cold enrichment skipped",
         );
+        // Even without enrichment, associate signs to vehicles for overlay/grouping.
+        stamp_vehicle_ids(stage_dets, &vehicle_boxes(vehicles));
         return;
     };
     // Wzbogacenie budowane od zera z cache/forwardow etapow — hot path zdazyl
@@ -1822,7 +3298,11 @@ async fn run_cold_stages(
         }
     }
     for stage in cv_pipeline::cold_stages(pipeline) {
-        let CvStageInput::Stage { stage_id: parent, classes } = &stage.input else {
+        let CvStageInput::Stage {
+            stage_id: parent,
+            classes,
+        } = &stage.input
+        else {
             continue;
         };
         if stage.op == CvOp::Embed {
@@ -1838,65 +3318,479 @@ async fn run_cold_stages(
             );
             continue;
         }
+        let op = stage.op;
+        // Tylko classify/ocr wzbogacaja — detect nie ma tu forwardu (embed
+        // odfiltrowany wyzej), wiec pomijamy caly etap bez zbierania cropow.
+        if !matches!(op, CvOp::Classify | CvOp::Ocr) {
+            continue;
+        }
         let (pad_x, pad_y) = cv_pipeline::crop_pads(stage);
+        let ocr_mode = match cv_pipeline::ocr_mode(stage) {
+            "adr" => CvOcrMode::Adr,
+            "plate" => CvOcrMode::Plate,
+            _ => CvOcrMode::Generic,
+        };
         let Some((_, dets)) = stage_dets.iter_mut().find(|(sid, _)| sid == parent) else {
             continue;
         };
-        for det in dets.iter_mut() {
+        // Zbierz WSZYSTKIE pasujace klasami detekcje tego etapu w JEDNA liste
+        // (indeks detekcji + crop Arc + wymiary + klasa do logu). NIE ma juz
+        // skipu cache po tracku: kazda klatka czyta od zera (zly pierwszy odczyt
+        // nie moze sie utrwalic) — jedynym stanem cross-frame jest histogram
+        // glosow OCR (`enrich_cache_vote_ocr`). `items` niesie dane WLASNE, wiec
+        // batchowany forward / fallback nie pozycza `dets` przez await; wyniki
+        // nakladamy mutowalnie PO obliczeniu (indeks wraca po pozycji w `items`).
+        let mut items: Vec<(usize, Arc<[u8]>, u32, u32, String)> = Vec::new();
+        for (idx, det) in dets.iter().enumerate() {
             if !cv_pipeline::class_matches(classes, &det.klasa) {
                 continue;
-            }
-            // Cache per (etap, track): swiezy wpis reuzywamy bez forwardu —
-            // wzbogacamy tylko NOWE tracki albo co ENRICH_TTL (odswiezenie).
-            // Detekcje z track_id=0 (brak trackingu) wzbogacamy zawsze, bez
-            // cache (nie ma stabilnego klucza).
-            if det.track_id > 0 {
-                if let Some(c) = enrich_cache_fresh(camera_id, &stage.stage_id, det.track_id) {
-                    apply_stage_output(det, stage.output, &c);
-                    continue;
-                }
             }
             let Some((x0, y0, cw, ch)) = padded_crop_rect(w, h, &det.bbox, pad_x, pad_y) else {
                 continue;
             };
-            let crop: Arc<[u8]> = Arc::from(crop_rgb(frame, w, x0, y0, cw, ch));
-            let (stan, tekst) = match stage.op {
+            // NV12 crops are cut + converted per-crop (small, off the full-frame
+            // convert); the crop may be even-snapped, so use its returned dims.
+            let (rgb, acw, ach) =
+                crop_for_detection(frame, frame_device, w, h, frame_format, x0, y0, cw, ch);
+            // VERIFY gate: compare the device crop against the host-download crop.
+            verify_zerocopy_crop(frame_device, w, h, frame_format, x0, y0, cw, ch, &rgb);
+            let crop: Arc<[u8]> = Arc::from(rgb);
+            items.push((idx, crop, acw, ach, det.klasa.clone()));
+        }
+        if items.is_empty() {
+            continue;
+        }
+
+        // Czy alias etapu rozwiazuje sie do LOKALNEGO wbudowanego silnika, ktory
+        // umiemy zbatchowac jednym forwardem? Jesli tak — omijamy per-crop
+        // indirection egzekutora i wolamy singleton wprost (`classify_batch` /
+        // `read_batch`). Jesli nie (mesh/zdalny/onnx-cv/tryb ADR) — fallback na
+        // istniejaca sciezke per-crop przez `execute_camera_cv`.
+        let engine = {
+            let mut ctx = RuntimeContext::new(None);
+            executor.local_camera_cv_engine(&stage.model, &mut ctx)
+        };
+        let crops: Vec<(Arc<[u8]>, u32, u32)> = items
+            .iter()
+            .map(|(_, crop, cw, ch, _)| (crop.clone(), *cw, *ch))
+            .collect();
+
+        // Wynik per crop (kolejnosc == kolejnosc `items`). Batchowana sciezka
+        // lokalna dla znanych silnikow; kazdy inny przypadek (w tym zwrot None /
+        // niezgodna dlugosc batcha) schodzi na per-crop fallback, wiec porazka
+        // batcha nigdy cicho nie gubi wzbogacenia.
+        let outputs: Vec<CachedEnrich> = match (op, engine.as_deref()) {
+            (CvOp::Classify, Some("nalepka-stan")) => match classify_batch_local(&crops).await {
+                Some(labels) if labels.len() == crops.len() => labels
+                    .into_iter()
+                    .map(|stan| CachedEnrich {
+                        stan,
+                        tekst: None,
+                        tekst_conf: None,
+                        tekst_votes: Vec::new(),
+                        at: Instant::now(),
+                    })
+                    .collect(),
+                _ => {
+                    cold_stage_per_crop(&executor, &stage.model, op, ocr_mode.clone(), &items).await
+                }
+            },
+            (CvOp::Ocr, Some("plate-ocr"))
+                if matches!(ocr_mode, CvOcrMode::Plate | CvOcrMode::Generic) =>
+            {
+                match read_batch_local(&crops).await {
+                    Some(reads) if reads.len() == crops.len() => reads
+                        .into_iter()
+                        .map(|(tekst, conf)| CachedEnrich {
+                            stan: Vec::new(),
+                            tekst_conf: tekst.as_ref().map(|_| conf),
+                            tekst,
+                            tekst_votes: Vec::new(),
+                            at: Instant::now(),
+                        })
+                        .collect(),
+                    _ => {
+                        cold_stage_per_crop(&executor, &stage.model, op, ocr_mode.clone(), &items)
+                            .await
+                    }
+                }
+            }
+            // ADR placards: submit every crop to the cross-camera ADR batcher —
+            // the rows of ALL placards (from all cameras) run as ONE forward
+            // instead of one tiny 2-row forward per placard. A crop the CRNN
+            // could not read (or whose UN failed the `snap_adr` catalog snap)
+            // keeps today's per-crop executor path, which retries the CRNN and
+            // then falls back to PP-OCRv5 — exactly `ocr_adr_local`'s
+            // semantics, so no read is ever lost to batching.
+            #[cfg(all(
+                feature = "inference-supertonic",
+                not(any(target_os = "macos", target_os = "ios"))
+            ))]
+            (CvOp::Ocr, Some("plate-ocr")) if matches!(ocr_mode, CvOcrMode::Adr) => {
+                match adr_batch_local(&crops).await {
+                    Some(reads) if reads.len() == crops.len() => {
+                        let mut outputs: Vec<CachedEnrich> = reads
+                            .into_iter()
+                            .map(|(tekst, conf)| CachedEnrich {
+                                stan: Vec::new(),
+                                tekst_conf: tekst.as_ref().map(|_| conf),
+                                tekst,
+                                tekst_votes: Vec::new(),
+                                at: Instant::now(),
+                            })
+                            .collect();
+                        let missed: Vec<usize> = outputs
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, o)| o.tekst.is_none())
+                            .map(|(i, _)| i)
+                            .collect();
+                        if !missed.is_empty() {
+                            let missed_items: Vec<_> =
+                                missed.iter().map(|&i| items[i].clone()).collect();
+                            let fallback = cold_stage_per_crop(
+                                &executor,
+                                &stage.model,
+                                op,
+                                ocr_mode.clone(),
+                                &missed_items,
+                            )
+                            .await;
+                            for (&i, value) in missed.iter().zip(fallback) {
+                                outputs[i] = value;
+                            }
+                        }
+                        outputs
+                    }
+                    _ => {
+                        cold_stage_per_crop(&executor, &stage.model, op, ocr_mode.clone(), &items)
+                            .await
+                    }
+                }
+            }
+            _ => cold_stage_per_crop(&executor, &stage.model, op, ocr_mode.clone(), &items).await,
+        };
+
+        // Naloz wyniki na wlasciwe detekcje po indeksie z `items` (bez pomieszania
+        // cropow). OCR: glosowanie temporalne per track stabilizuje chwiejny znak
+        // (surowy odczyt wciela sie do histogramu, `det.tekst` = zwyciezca); track
+        // bez id (track_id=0) emituje surowy odczyt wprost. Classify: `stan`
+        // przypisany od zera, bez cache-put (kazda klatka czyta na nowo).
+        let (min_conf, min_agreement) = ocr_gate_thresholds(&ocr_mode);
+        // Key thumbnail throttling by the READ MODE (plate vs adr) so a plate and
+        // an ADR read on the same track_id keep independent best-confidence
+        // baselines and each produces its own scene thumbnail.
+        let thumb_mode_key = match ocr_mode {
+            CvOcrMode::Adr => "adr",
+            CvOcrMode::Plate | CvOcrMode::Generic => "plate",
+        };
+        // Lazily built full-scene RGB frame (whole camera image), produced at most
+        // once per stage and only when a capture actually fires — the NV12
+        // download/convert on the zero-copy path is not free.
+        for ((idx, _, _, _, _), value) in items.iter().zip(outputs) {
+            let det = &mut dets[*idx];
+            if op == CvOp::Ocr && det.track_id > 0 {
+                let read = value.tekst.map(|t| (t, value.tekst_conf.unwrap_or(0.0)));
+                let (tekst, conf) = enrich_cache_vote_ocr(
+                    camera_id,
+                    &stage.stage_id,
+                    det.track_id,
+                    read,
+                    min_conf,
+                    min_agreement,
+                );
+                // Snapshot the WHOLE downscaled frame (not the crop) as the event
+                // thumbnail: on a new best read for this track, OR on the per-camera
+                // scene throttle so an event ALWAYS gets a photo even when the plate/
+                // ADR is never read (a vehicle is present — this OCR stage is running
+                // on its placard/plate detection). Never overwrite a thumb already
+                // captured for this detection.
+                let want_best = conf
+                    .map(|c| thumb_should_capture(camera_id, thumb_mode_key, det.track_id, c))
+                    .unwrap_or(false);
+                if det.tekst_thumb_ref.is_none()
+                    && (want_best || scene_thumb_should_capture(camera_id))
+                {
+                    if let Some(rgb) = cold_full_rgb(frame, frame_device, w, h, frame_format) {
+                        det.tekst_thumb_ref = save_event_thumbnail(camera_id, &rgb, w, h).await;
+                    }
+                }
+                det.tekst = tekst;
+                det.tekst_conf = conf;
+            } else {
+                apply_stage_output(det, stage.output, &value);
+            }
+        }
+    }
+    // TAIL: per-truck association. Now that every stage's boxes carry a stable
+    // track_id (hot path) and their reads (this cold pass), stamp each sign/plate
+    // with the vehicle it sits on so the recorder can group per truck.
+    stamp_vehicle_ids(stage_dets, &vehicle_boxes(vehicles));
+
+    // GUARANTEE a photo for EVERY event: the read-driven thumbnail above only
+    // fires inside an OCR stage, so a truck whose plate/ADR is never read (or one
+    // that shows only stickers) would get no picture. If no detection captured a
+    // thumbnail this frame, snapshot the whole scene once (per-camera throttled)
+    // and attach it to the largest vehicle box — else the first sign — so the
+    // recorder always promotes a list thumbnail.
+    let any_thumb = stage_dets
+        .iter()
+        .flat_map(|(_, d)| d.iter())
+        .any(|d| d.tekst_thumb_ref.is_some());
+    if !any_thumb && scene_thumb_should_capture(camera_id) {
+        if let Some(rgb) = cold_full_rgb(frame, frame_device, w, h, frame_format) {
+            if let Some(thumb_ref) = save_event_thumbnail(camera_id, &rgb, w, h).await {
+                let vbox_area = |d: &Detection| (d.bbox[2].max(0.0)) * (d.bbox[3].max(0.0));
+                if let Some(v) = vehicles
+                    .iter_mut()
+                    .max_by(|a, b| vbox_area(a).total_cmp(&vbox_area(b)))
+                {
+                    v.tekst_thumb_ref = Some(thumb_ref);
+                } else if let Some(d) = stage_dets.iter_mut().flat_map(|(_, d)| d.iter_mut()).next()
+                {
+                    d.tekst_thumb_ref = Some(thumb_ref);
+                }
+            }
+        }
+    }
+}
+
+/// Maps published vehicle detections to the `[VehicleBox]` association inputs,
+/// dropping any with `track_id = 0` (an untracked box has no stable vehicle_id
+/// to attribute signs to).
+fn vehicle_boxes(vehicles: &[Detection]) -> Vec<VehicleBox> {
+    vehicles
+        .iter()
+        .filter(|d| d.track_id != 0)
+        .map(|d| VehicleBox {
+            bbox: d.bbox,
+            vehicle_id: d.track_id,
+        })
+        .collect()
+}
+
+/// Materializes the FULL RGB24 camera frame for a thumbnail capture. On the host
+/// path `frame` already holds RGB (or NV12 that `nv12_to_rgb_if_needed`
+/// converts); on the GPU zero-copy path `frame` is empty, so the full NV12 is
+/// downloaded from the device once and converted. `None` when no frame is
+/// recoverable (capture is then simply skipped this cycle).
+fn cold_full_rgb(
+    frame: &[u8],
+    frame_device: Option<&super::fakefile::DeviceCropsFrame>,
+    w: u32,
+    h: u32,
+    frame_format: &super::fakefile::DetectFrameFormat,
+) -> Option<Arc<[u8]>> {
+    if !frame.is_empty() {
+        let arc: Arc<[u8]> = Arc::from(frame.to_vec());
+        return Some(nv12_to_rgb_if_needed(&arc, w, h, frame_format));
+    }
+    let (nv12, fmt) = frame_device?.download_full_nv12()?;
+    Some(nv12_to_rgb_if_needed(&nv12, w, h, &fmt))
+}
+
+/// COLD fallback per-crop: gdy alias etapu NIE rozwiazuje sie do lokalnego
+/// batchowalnego silnika (mesh/zdalny/onnx-cv/ADR), kazdy crop idzie osobno przez
+/// `execute_camera_cv` (`classify_crop`/`ocr_crop`). Forwardy lecą RÓWNOLEGLE
+/// (`join_all`) — pule sesji sa concurrency-safe, wiec latencja etapu to max(crop)
+/// zamiast sum(crops). Zwraca `CachedEnrich` per crop w kolejnosci `items`.
+async fn cold_stage_per_crop(
+    executor: &Arc<ModelRuntimeExecutor>,
+    alias: &str,
+    op: CvOp,
+    ocr_mode: CvOcrMode,
+    items: &[(usize, Arc<[u8]>, u32, u32, String)],
+) -> Vec<CachedEnrich> {
+    let jobs = items.iter().map(|(_, crop, cw, ch, klasa)| {
+        let executor = executor.clone();
+        let model = alias.to_string();
+        let crop = crop.clone();
+        let (cw, ch) = (*cw, *ch);
+        let klasa = klasa.clone();
+        let ocr_mode = ocr_mode.clone();
+        async move {
+            let (stan, tekst) = match op {
                 CvOp::Classify => (
-                    classify_crop(&executor, &stage.model, crop, cw, ch, &det.klasa)
+                    classify_crop(&executor, &model, crop, cw, ch, &klasa)
                         .await
                         .unwrap_or_default(),
                     None,
                 ),
-                CvOp::Ocr => {
-                    let mode = match cv_pipeline::ocr_mode(stage) {
-                        "adr" => CvOcrMode::Adr,
-                        "plate" => CvOcrMode::Plate,
-                        _ => CvOcrMode::Generic,
-                    };
-                    (
-                        Vec::new(),
-                        ocr_crop(&executor, &stage.model, crop, cw, ch, mode, &det.klasa).await,
-                    )
-                }
-                CvOp::Detect | CvOp::Embed => continue,
+                CvOp::Ocr => (
+                    Vec::new(),
+                    ocr_crop(&executor, &model, crop, cw, ch, ocr_mode, &klasa).await,
+                ),
+                CvOp::Detect | CvOp::Embed => (Vec::new(), None),
             };
-            let value = CachedEnrich {
+            // The executor path (mesh/remote/PP-OCRv5) carries NO per-read
+            // confidence — its `CameraCvResult::Text` has already passed the
+            // engine's own validation (`waliduj_tablice_pl` / `snap_adr`), so a
+            // hit is treated as fully confident (`1.0`) for the vote. It then
+            // still gates on AGREEMENT, matching the pre-confidence behavior of
+            // this fallback while the primary batched path gates on real scores.
+            let tekst_conf = tekst.as_ref().map(|_| EXECUTOR_READ_CONFIDENCE);
+            CachedEnrich {
                 stan,
                 tekst,
+                tekst_conf,
+                tekst_votes: Vec::new(),
                 at: Instant::now(),
-            };
-            apply_stage_output(det, stage.output, &value);
-            // Zapisz wynik (nawet pusty) pod (etap, track), aby hot path i
-            // kolejne klatki tego tracku reuzyly go bez ponownego forwardu.
-            if det.track_id > 0 {
-                enrich_cache_put(
-                    camera_id,
-                    &stage.stage_id,
-                    det.track_id,
-                    value.stan,
-                    value.tekst,
-                );
             }
+        }
+    });
+    futures::future::join_all(jobs).await
+}
+
+/// Confidence assigned to an executor-path (per-crop fallback) OCR hit, which
+/// carries no numeric score of its own. The read already passed the engine's
+/// validation, so it clears the confidence floor and is gated on agreement only.
+const EXECUTOR_READ_CONFIDENCE: f32 = 1.0;
+
+/// COLD batched local classify: every crop of the stage is SUBMITTED to the
+/// process-wide cross-camera state batcher, so crops from ALL cameras aggregate
+/// into one big `StateClassifier::classify_batch` forward instead of a tiny
+/// per-camera batch-1. `None` (batcher unavailable / any per-crop error) →
+/// caller drops to the per-crop fallback (never loses enrichment). The blocking
+/// `submit_all` runs on the blocking pool, off the tokio worker.
+#[cfg(feature = "inference-supertonic")]
+async fn classify_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Vec<String>>> {
+    let batcher = crate::vision::inference_batcher::state_batcher().await?;
+    let crops = crops.to_vec();
+    let results = match tokio::task::spawn_blocking(move || batcher.submit_all(&crops)).await {
+        Ok(results) => results,
+        Err(e) => {
+            warn_throttled("classify", &format!("state batcher task: {e}"));
+            return None;
+        }
+    };
+    let mut labels = Vec::with_capacity(results.len());
+    for r in results {
+        match r {
+            Ok(l) => labels.push(l),
+            Err(e) => {
+                warn_throttled("classify", &format!("state batcher submit: {e:#}"));
+                return None;
+            }
+        }
+    }
+    Some(labels)
+}
+
+/// Ścieżka Burn: forward serializowany na jednym watku wgpu przez `run_blocking`
+/// + `Mutex` (jak `classify_local`); `classify_batch` sam petli po cropach.
+#[cfg(not(feature = "inference-supertonic"))]
+async fn classify_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Vec<String>>> {
+    let classifier = get_classifier().await?;
+    let crops = crops.to_vec();
+    match crate::vision::burn_backend::run_blocking(move || {
+        let guard = classifier.lock().unwrap_or_else(|e| e.into_inner());
+        guard.classify_batch(&crops)
+    })
+    .await
+    {
+        Ok(Ok(labels)) => Some(labels),
+        Ok(Err(e)) => {
+            warn_throttled("classify", &format!("classify_batch: {e:#}"));
+            None
+        }
+        Err(e) => {
+            warn_throttled("classify", &format!("classify_batch task: {e}"));
+            None
+        }
+    }
+}
+
+/// COLD batched local plate OCR: every crop of the stage is SUBMITTED to the
+/// process-wide cross-camera plate batcher, so crops from ALL cameras aggregate
+/// into one big `PlateOcr::read_batch` forward instead of a tiny per-camera
+/// batch-1. `None` (batcher unavailable / any per-crop error) → caller drops to
+/// the per-crop fallback. `submit_all` blocks on the blocking pool.
+#[cfg(feature = "inference-supertonic")]
+async fn read_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<(Option<String>, f32)>> {
+    let batcher = crate::vision::inference_batcher::plate_batcher().await?;
+    let crops = crops.to_vec();
+    let results = match tokio::task::spawn_blocking(move || batcher.submit_all(&crops)).await {
+        Ok(results) => results,
+        Err(e) => {
+            warn_throttled("ocr", &format!("plate batcher task: {e}"));
+            return None;
+        }
+    };
+    let mut reads = Vec::with_capacity(results.len());
+    for r in results {
+        match r {
+            Ok(t) => reads.push(t),
+            Err(e) => {
+                warn_throttled("ocr", &format!("plate batcher submit: {e:#}"));
+                return None;
+            }
+        }
+    }
+    Some(reads)
+}
+
+/// COLD batched local ADR OCR: every placard crop of the stage is SUBMITTED to
+/// the process-wide cross-camera ADR batcher, so the rows of ALL placards from
+/// ALL cameras aggregate into one `AdrOcr::read_adr_batch` forward instead of a
+/// tiny 2-row forward per placard. The raw `(kemler, un)` read gets the same
+/// `snap_adr` catalog snap as `ocr_adr_local`; a per-crop `None` (nothing read /
+/// UN not in the catalog) is a RESULT — the caller re-routes just those crops
+/// through the per-crop executor path to keep the PP-OCRv5 fallback. Outer
+/// `None` (batcher unavailable / any submit error) → the caller falls back
+/// per-crop for the whole stage (never loses enrichment). `submit_all` blocks
+/// on the blocking pool, off the tokio worker.
+#[cfg(all(
+    feature = "inference-supertonic",
+    not(any(target_os = "macos", target_os = "ios"))
+))]
+async fn adr_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<(Option<String>, f32)>> {
+    let batcher = crate::vision::inference_batcher::adr_batcher().await?;
+    let crops = crops.to_vec();
+    let results = match tokio::task::spawn_blocking(move || batcher.submit_all(&crops)).await {
+        Ok(results) => results,
+        Err(e) => {
+            warn_throttled("ocr", &format!("adr batcher task: {e}"));
+            return None;
+        }
+    };
+    let mut reads = Vec::with_capacity(results.len());
+    for r in results {
+        match r {
+            // Keep the read's confidence alongside the catalog-snapped UN; a UN
+            // that fails `snap_adr` is a miss (None) and its confidence is moot.
+            Ok(read) => reads.push(match read {
+                Some((_, un, conf)) => (crate::vision::adr::snap_adr(&un), conf),
+                None => (None, 0.0),
+            }),
+            Err(e) => {
+                warn_throttled("ocr", &format!("adr batcher submit: {e:#}"));
+                return None;
+            }
+        }
+    }
+    Some(reads)
+}
+
+/// Ścieżka Burn: forward serializowany na jednym watku wgpu przez `run_blocking`
+/// + `Mutex` (jak `ocr_local`); `read_batch` sam petli po cropach.
+#[cfg(not(feature = "inference-supertonic"))]
+async fn read_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<(Option<String>, f32)>> {
+    let ocr = get_ocr().await?;
+    let crops = crops.to_vec();
+    match crate::vision::burn_backend::run_blocking(move || {
+        let guard = ocr.lock().unwrap_or_else(|e| e.into_inner());
+        guard.read_batch(&crops)
+    })
+    .await
+    {
+        Ok(Ok(reads)) => Some(reads),
+        Ok(Err(e)) => {
+            warn_throttled("ocr", &format!("read_batch: {e:#}"));
+            None
+        }
+        Err(e) => {
+            warn_throttled("ocr", &format!("read_batch task: {e}"));
+            None
         }
     }
 }
@@ -1983,6 +3877,107 @@ async fn ocr_crop(
 mod tests {
     use super::*;
 
+    fn vb(id: u32, x: f32, y: f32, w: f32, h: f32) -> VehicleBox {
+        VehicleBox {
+            bbox: [x, y, w, h],
+            vehicle_id: id,
+        }
+    }
+
+    /// Two overlapping vehicles: the sign's center lands inside BOTH, so the
+    /// tie-break (larger containment, then smaller vehicle area, then smaller id)
+    /// must pick the vehicle that actually contains the sign more tightly.
+    #[test]
+    fn assign_vehicle_two_overlapping_picks_tighter() {
+        // Big vehicle 1 covers the left half; small vehicle 2 is a tight box
+        // fully around the sign, both containing the sign center.
+        let big = vb(1, 0.0, 0.0, 0.6, 1.0);
+        let small = vb(2, 0.35, 0.30, 0.20, 0.20);
+        // Sign fully inside the small box (and inside the big one too).
+        let sign = [0.40, 0.35, 0.05, 0.05];
+        // Small box fully contains the sign (frac 1.0) and has smaller area → wins.
+        assert_eq!(assign_vehicle(&sign, &[big, small]), 2);
+    }
+
+    /// A sign whose center is NOT inside any vehicle but overlaps one ≥ 0.3 is
+    /// assigned by the max-overlap fallback; below the floor it stays unassigned.
+    #[test]
+    fn assign_vehicle_cutoff_box_uses_overlap_fallback() {
+        // Vehicle occupies the top-left quadrant.
+        let v = vb(7, 0.0, 0.0, 0.5, 0.5);
+        // Sign straddles the right edge: center at x=0.5 is ON the border (inside),
+        // so nudge it just outside to force the fallback. Half of the sign overlaps.
+        let sign = [0.45, 0.20, 0.20, 0.10]; // center x=0.55 outside the box
+                                             // Overlap = x in [0.45,0.5] → 0.05 wide × 0.10 tall = 0.005; sign area
+                                             // 0.20×0.10 = 0.02 → frac 0.25 < 0.3 → unassigned.
+        assert_eq!(assign_vehicle(&sign, &[v]), 0);
+        // Widen the vehicle so ≥30% of the sign overlaps → assigned.
+        let v2 = vb(7, 0.0, 0.0, 0.6, 0.5);
+        // Overlap x in [0.45,0.6] → 0.15 wide but sign ends at 0.65, so overlap
+        // width = min(0.65,0.6)-0.45 = 0.15 × 0.10 = 0.015; frac 0.75 ≥ 0.3 → 7.
+        assert_eq!(assign_vehicle(&sign, &[v2]), 7);
+    }
+
+    /// A background sign far from every vehicle stays unassigned (id 0).
+    #[test]
+    fn assign_vehicle_background_sign_unassigned() {
+        let v = vb(3, 0.0, 0.0, 0.3, 0.3);
+        let sign = [0.80, 0.80, 0.05, 0.05];
+        assert_eq!(assign_vehicle(&sign, &[v]), 0);
+        // No vehicles at all → unassigned.
+        assert_eq!(assign_vehicle(&sign, &[]), 0);
+    }
+
+    /// A single vehicle containing the sign's center is assigned directly.
+    #[test]
+    fn assign_vehicle_single_vehicle_center_in_box() {
+        let v = vb(42, 0.1, 0.1, 0.6, 0.6);
+        let sign = [0.30, 0.30, 0.05, 0.05];
+        assert_eq!(assign_vehicle(&sign, &[v]), 42);
+    }
+
+    /// `stamp_vehicle_ids`: vehicle boxes self-assign (vehicle_id = track_id),
+    /// signs get their owning vehicle, background signs get 0.
+    #[test]
+    fn stamp_vehicle_ids_routes_signs_and_self_assigns_vehicles() {
+        let mk = |klasa: &str, bbox: [f32; 4], track: u32| {
+            let mut d = detection_from_cv(CvDetection {
+                klasa: klasa.into(),
+                bbox,
+                score: 0.9,
+            });
+            d.track_id = track;
+            d
+        };
+        let mut stage_dets = vec![(
+            "adr".to_string(),
+            vec![
+                mk("tablica_adr", [0.30, 0.30, 0.04, 0.04], 5), // inside vehicle 9
+                mk("tablica_rejestracyjna", [0.90, 0.90, 0.03, 0.03], 6), // background
+            ],
+        )];
+        let vehicles = vec![VehicleBox {
+            bbox: [0.1, 0.1, 0.6, 0.6],
+            vehicle_id: 9,
+        }];
+        // A vehicle box detection self-assigns.
+        stage_dets.push((
+            "veh".to_string(),
+            vec![mk(
+                crate::vision::detector_vehicle::VEHICLE_CLASS,
+                [0.1, 0.1, 0.6, 0.6],
+                9,
+            )],
+        ));
+        stamp_vehicle_ids(&mut stage_dets, &vehicles);
+        assert_eq!(stage_dets[0].1[0].vehicle_id, 9, "ADR sits on vehicle 9");
+        assert_eq!(
+            stage_dets[0].1[1].vehicle_id, 0,
+            "background plate unassigned"
+        );
+        assert_eq!(stage_dets[1].1[0].vehicle_id, 9, "vehicle box self-assigns");
+    }
+
     /// Mapowanie CvDetection→Detection: pola detektora przechodzą 1:1, pola
     /// wzbogacenia/śledzenia startują puste (nadaje je tracker i cold path).
     #[test]
@@ -2009,7 +4004,10 @@ mod tests {
     fn padded_crop_rect_matches_legacy_classify_and_ocr_paths() {
         // 100x100 frame, box (10,20,40,30) px → bbox znormalizowany.
         let bbox = [0.10, 0.20, 0.40, 0.30];
-        assert_eq!(padded_crop_rect(100, 100, &bbox, 0.0, 0.0), Some((10, 20, 40, 30)));
+        assert_eq!(
+            padded_crop_rect(100, 100, &bbox, 0.0, 0.0),
+            Some((10, 20, 40, 30))
+        );
         // pad_x = 0.15*40 = 6 px, pad_y = 0.10*30 = 3 px z każdej strony.
         assert_eq!(
             padded_crop_rect(100, 100, &bbox, 0.15, 0.10),
@@ -2022,7 +4020,10 @@ mod tests {
             Some((0, 0, 46, 33))
         );
         // Box mniejszy niż 8 px → brak cropu.
-        assert_eq!(padded_crop_rect(100, 100, &[0.0, 0.0, 0.05, 0.5], 0.0, 0.0), None);
+        assert_eq!(
+            padded_crop_rect(100, 100, &[0.0, 0.0, 0.05, 0.5], 0.0, 0.0),
+            None
+        );
     }
 
     /// `apply_stage_output`: classify dokłada etykiety do `stan` (dwa etapy
@@ -2037,11 +4038,15 @@ mod tests {
         let stan_a = CachedEnrich {
             stan: vec!["ok".into()],
             tekst: None,
+            tekst_conf: None,
+            tekst_votes: Vec::new(),
             at: Instant::now(),
         };
         let stan_b = CachedEnrich {
             stan: vec!["czytelna".into()],
             tekst: None,
+            tekst_conf: None,
+            tekst_votes: Vec::new(),
             at: Instant::now(),
         };
         apply_stage_output(&mut det, Some(CvStageOutput::Stan), &stan_a);
@@ -2051,11 +4056,15 @@ mod tests {
         let ocr_hit = CachedEnrich {
             stan: Vec::new(),
             tekst: Some("30/1203".into()),
+            tekst_conf: None,
+            tekst_votes: Vec::new(),
             at: Instant::now(),
         };
         let ocr_miss = CachedEnrich {
             stan: Vec::new(),
             tekst: None,
+            tekst_conf: None,
+            tekst_votes: Vec::new(),
             at: Instant::now(),
         };
         apply_stage_output(&mut det, Some(CvStageOutput::Tekst), &ocr_hit);
@@ -2065,6 +4074,112 @@ mod tests {
         // Etap bez outputu (detect/embed) niczego nie zmienia.
         apply_stage_output(&mut det, None, &ocr_hit);
         assert_eq!(det.stan.len(), 2);
+    }
+
+    /// Gate defaults used by the vote unit tests (mirror the `[vision]` plate
+    /// defaults so the tests read like the production gate).
+    const MC: f32 = 0.5;
+    const MA: f32 = 0.5;
+
+    /// `ocr_vote` (confidence-weighted): a stream of consistent HIGH-confidence
+    /// reads with ±1-char wobble still resolves to the true plate (majority of
+    /// the weight), and the tie-break holds the previously emitted string.
+    #[test]
+    fn ocr_vote_majority_stabilizes_wobble() {
+        let mut votes: Vec<TekstVote> = Vec::new();
+        // High-confidence wobble OKR7408↔ORR7408↔DRR7408 around one true plate.
+        assert_eq!(
+            ocr_vote(&mut votes, "OKR7408", 0.9, MC, MA, None)
+                .text
+                .as_deref(),
+            Some("OKR7408")
+        );
+        assert_eq!(
+            ocr_vote(&mut votes, "OKR7408", 0.9, MC, MA, Some("OKR7408"))
+                .text
+                .as_deref(),
+            Some("OKR7408")
+        );
+        // A single low-weight wobble variant does not dislodge the leader.
+        assert_eq!(
+            ocr_vote(&mut votes, "ORR7408", 0.6, MC, MA, Some("OKR7408"))
+                .text
+                .as_deref(),
+            Some("OKR7408")
+        );
+    }
+
+    /// (a) 7 DISAGREEING low-confidence reads (the field case) → unreadable:
+    /// neither confidence nor agreement clears the gate, so no plate is emitted.
+    #[test]
+    fn ocr_vote_low_conf_disagreement_is_unreadable() {
+        let mut votes: Vec<TekstVote> = Vec::new();
+        let mut out: Option<String> = None;
+        for s in [
+            "M88901", "M88901", "N59156", "B67K71", "M88901", "DRR740", "SR9961",
+        ] {
+            out = ocr_vote(&mut votes, s, 0.30, MC, MA, out.as_deref()).text;
+        }
+        assert!(
+            out.is_none(),
+            "occluded plate must be unreadable, not a guess"
+        );
+    }
+
+    /// (b) ONE high-confidence valid read → reported immediately (agreement 1.0);
+    /// the gate must not require many frames.
+    #[test]
+    fn ocr_vote_single_high_conf_read_is_reported() {
+        let mut votes: Vec<TekstVote> = Vec::new();
+        let out = ocr_vote(&mut votes, "WPL5HJ2", 0.94, MC, MA, None);
+        assert_eq!(out.text.as_deref(), Some("WPL5HJ2"));
+        assert!((out.confidence.unwrap() - 0.94).abs() < 1e-6);
+    }
+
+    /// (c) 5 consistent high-confidence reads → reported with agreement ~1.0.
+    #[test]
+    fn ocr_vote_consistent_high_conf_reported_full_agreement() {
+        let mut votes: Vec<TekstVote> = Vec::new();
+        let mut prev: Option<String> = None;
+        for _ in 0..5 {
+            prev = ocr_vote(&mut votes, "WWL7322", 0.9, MC, MA, prev.as_deref()).text;
+        }
+        assert_eq!(prev.as_deref(), Some("WWL7322"));
+        let total: f32 = votes.iter().map(|v| v.weight).sum();
+        let winner = votes.iter().find(|v| v.text == "WWL7322").unwrap();
+        assert!((winner.weight / total - 1.0).abs() < 1e-6, "agreement ~1.0");
+    }
+
+    /// (d) A high-COUNT but low-confidence misread must LOSE to a lower-count but
+    /// high-confidence correct read: 4×"M88901"@0.30 vs 2×"WPL5HJ2"@0.95 —
+    /// weight 1.2 vs 1.9, so the correct plate wins and is reported.
+    #[test]
+    fn ocr_vote_high_conf_beats_high_count_misread() {
+        let mut votes: Vec<TekstVote> = Vec::new();
+        let mut prev: Option<String> = None;
+        for _ in 0..4 {
+            prev = ocr_vote(&mut votes, "M88901", 0.30, MC, MA, prev.as_deref()).text;
+        }
+        for _ in 0..2 {
+            prev = ocr_vote(&mut votes, "WPL5HJ2", 0.95, MC, MA, prev.as_deref()).text;
+        }
+        let final_outcome = gate_votes(&votes, MC, MA, None);
+        assert_eq!(
+            final_outcome.text.as_deref(),
+            Some("WPL5HJ2"),
+            "high-confidence correct read must beat a high-count low-confidence misread"
+        );
+    }
+
+    /// Histogram jest ograniczony: >OCR_VOTE_MAX_VARIANTS różnych stringów nie
+    /// rozdyma mapy — najlżejszy wariant wypada.
+    #[test]
+    fn ocr_vote_bounds_variant_count() {
+        let mut votes: Vec<TekstVote> = Vec::new();
+        for i in 0..(OCR_VOTE_MAX_VARIANTS + 5) {
+            ocr_vote(&mut votes, &format!("PLATE{i}"), 0.8, MC, MA, None);
+        }
+        assert!(votes.len() <= OCR_VOTE_MAX_VARIANTS);
     }
 
     /// Pipeline jednoetapowy (jeden `detect` na klatce) — minimum do złożenia
@@ -2088,8 +4203,15 @@ mod tests {
         FrameJob {
             camera_id: cam.to_string(),
             frame: Arc::from(vec![0u8; 12]),
+            frame_device: None,
             w: 2,
             h: 2,
+            frame_format: crate::services::camera_ingest::fakefile::DetectFrameFormat::Rgb24,
+            detect_frame: Arc::from(vec![0u8; 12]),
+            detect_device: None,
+            detect_w: 2,
+            detect_h: 2,
+            detect_format: crate::services::camera_ingest::fakefile::DetectFrameFormat::Rgb24,
             captured_ms: captured,
             pts_ns: None,
             pipeline: pipeline.clone(),
@@ -2097,6 +4219,7 @@ mod tests {
             results: Vec::new(),
             detect_ms_total: 0,
             failed_stages: 0,
+            vehicles: Vec::new(),
         }
     }
 
@@ -2107,40 +4230,38 @@ mod tests {
             outcome: Ok(CameraCvResult::Detections {
                 per_frame: vec![Vec::new()],
             }),
+            vehicles: vec![Vec::new()],
         }
     }
 
-    /// K>1: gdy `TENTAFLOW_VISION_INFLIGHT` jest ustawione, wygrywa; inaczej K
-    /// odwzorowuje pulę detektora; gdy ŻADNA zmienna nie jest ustawiona → K=1
-    /// (dowód zerowej regresji: bit-identyczne z pojedynczą, serializowaną pętlą).
+    /// K>1: gdy `[vision] inflight` jest ustawione, wygrywa; inaczej K
+    /// odwzorowuje `[vision] detector_sessions`; przy configu domyślnym → K=4,
+    /// lustrzanie do domyślnej puli detektora (4 pipelinowane forwardy ≈ 3×
+    /// przepustowości detektora vs serializacja).
     #[test]
-    fn inflight_limit_defaults_to_one_and_honors_env() {
-        let prev_k = std::env::var("TENTAFLOW_VISION_INFLIGHT").ok();
-        let prev_d = std::env::var("TENTAFLOW_VISION_DETECTOR_SESSIONS").ok();
-        std::env::remove_var("TENTAFLOW_VISION_INFLIGHT");
-        std::env::remove_var("TENTAFLOW_VISION_DETECTOR_SESSIONS");
-        assert_eq!(inflight_limit(), 1, "brak env → K=1");
-
-        std::env::set_var("TENTAFLOW_VISION_DETECTOR_SESSIONS", "4");
-        assert_eq!(inflight_limit(), 4, "K odwzorowuje pulę detektora");
-
-        std::env::set_var("TENTAFLOW_VISION_INFLIGHT", "2");
-        assert_eq!(inflight_limit(), 2, "jawny opt-in wygrywa nad pulą detektora");
-
-        std::env::set_var("TENTAFLOW_VISION_INFLIGHT", "999");
-        assert_eq!(inflight_limit(), MAX_INFLIGHT, "clamp górny do MAX_INFLIGHT");
-
-        std::env::set_var("TENTAFLOW_VISION_INFLIGHT", "0");
-        assert_eq!(inflight_limit(), 1, "clamp dolny do 1");
-
-        match prev_k {
-            Some(v) => std::env::set_var("TENTAFLOW_VISION_INFLIGHT", v),
-            None => std::env::remove_var("TENTAFLOW_VISION_INFLIGHT"),
-        }
-        match prev_d {
-            Some(v) => std::env::set_var("TENTAFLOW_VISION_DETECTOR_SESSIONS", v),
-            None => std::env::remove_var("TENTAFLOW_VISION_DETECTOR_SESSIONS"),
-        }
+    fn inflight_limit_follows_detector_sessions_and_honors_override() {
+        let defaults = crate::config::VisionConfig::default();
+        assert_eq!(
+            resolve_inflight_limit(defaults.inflight, defaults.detector_sessions),
+            4,
+            "default config → K=4 (default detector pool)"
+        );
+        assert_eq!(
+            resolve_inflight_limit(None, 4),
+            4,
+            "K mirrors the detector pool"
+        );
+        assert_eq!(
+            resolve_inflight_limit(Some(2), 4),
+            2,
+            "explicit inflight wins over the detector pool"
+        );
+        assert_eq!(
+            resolve_inflight_limit(Some(999), 4),
+            MAX_INFLIGHT,
+            "upper clamp to MAX_INFLIGHT"
+        );
+        assert_eq!(resolve_inflight_limit(Some(0), 4), 1, "lower clamp to 1");
     }
 
     /// Ordering gate: kamera z otwartym jobem NIE przyjmuje drugiej klatki, więc
@@ -2231,6 +4352,7 @@ mod tests {
             alias: "m".into(),
             detect_ms: 0,
             outcome: Err("simulated forward failure".into()),
+            vehicles: Vec::new(),
         }
     }
 
@@ -2242,7 +4364,10 @@ mod tests {
     async fn completed_forward_frees_permit_before_result_is_applied() {
         let sem = Arc::new(tokio::sync::Semaphore::new(1));
         let mut forwards: tokio::task::JoinSet<u64> = tokio::task::JoinSet::new();
-        let permit = sem.clone().try_acquire_owned().expect("permit wolny na starcie");
+        let permit = sem
+            .clone()
+            .try_acquire_owned()
+            .expect("permit wolny na starcie");
         forwards.spawn(async move {
             let _p = permit;
             1u64
@@ -2260,11 +4385,19 @@ mod tests {
             tokio::task::yield_now().await;
         }
         // Okno hazardu: permit JUŻ wolny, ale wynik WCIĄŻ nieaplikowany w JoinSet.
-        assert_eq!(sem.available_permits(), 1, "permit zwolniony po zakończeniu");
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "permit zwolniony po zakończeniu"
+        );
         let joined = forwards
             .try_join_next()
             .expect("wynik gotowy, lecz jeszcze niezaaplikowany");
-        assert_eq!(joined.unwrap(), 1, "drenaż stosuje wynik ukończonego forwardu");
+        assert_eq!(
+            joined.unwrap(),
+            1,
+            "drenaż stosuje wynik ukończonego forwardu"
+        );
     }
 
     /// P1: `drain_ready_forwards` stosuje ukończone forwardy (finalizuje joby)
@@ -2294,8 +4427,14 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-        assert!(jobs.is_empty(), "ukończony forward zaaplikowany, job sfinalizowany");
-        assert!(inflight.is_empty(), "wpis routingu usunięty po zastosowaniu");
+        assert!(
+            jobs.is_empty(),
+            "ukończony forward zaaplikowany, job sfinalizowany"
+        );
+        assert!(
+            inflight.is_empty(),
+            "wpis routingu usunięty po zastosowaniu"
+        );
     }
 
     /// P2: graceful-drain AWAITuje trwający (wolny) forward do końca i APLIKUJE go —

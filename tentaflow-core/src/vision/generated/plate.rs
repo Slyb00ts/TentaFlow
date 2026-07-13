@@ -4,16 +4,15 @@
 // (e.g. H=4 instead of 6) and panics the downstream window `reshape`. They are
 // pinned to exact `with_output_size` from ONNX shape inference (NCHW H,W):
 // Resize 1..6 = [10,18],[9,18],[6,10],[5,9],[4,6],[3,5]. Model is fixed-input 70x140.
-use burn::prelude::*;
+use burn::nn::conv::Conv2d;
+use burn::nn::conv::Conv2dConfig;
 use burn::nn::Linear;
 use burn::nn::LinearConfig;
 use burn::nn::PaddingConfig2d;
-use burn::nn::conv::Conv2d;
-use burn::nn::conv::Conv2dConfig;
+use burn::prelude::*;
 use burn::tensor::Bytes;
 use burn_store::BurnpackStore;
 use burn_store::ModuleSnapshot;
-
 
 #[derive(Module, Debug)]
 pub struct Submodule1<B: Backend> {
@@ -53,13 +52,12 @@ impl<B: Backend> Submodule1<B> {
     pub fn new(device: &B::Device) -> Self {
         let constant171: burn::module::Param<Tensor<B, 1>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                1,
-            >::from_data(
-                burn::tensor::TensorData::from([0.003921568859368563f64]),
-                (device, burn::tensor::DType::F32),
-            ),
+            move |device, _require_grad| {
+                Tensor::<B, 1>::from_data(
+                    burn::tensor::TensorData::from([0.003921568859368563f64]),
+                    (device, burn::tensor::DType::F32),
+                )
+            },
             device.clone(),
             false,
             [1].into(),
@@ -87,20 +85,18 @@ impl<B: Backend> Submodule1<B> {
             .init(device);
         let constant170: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                4,
-            >::zeros([1, 32, 1, 1], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 4>::zeros([1, 32, 1, 1], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 32, 1, 1].into(),
         );
         let constant190: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                4,
-            >::zeros([1, 32, 1, 1], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 4>::zeros([1, 32, 1, 1], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 32, 1, 1].into(),
@@ -128,20 +124,18 @@ impl<B: Backend> Submodule1<B> {
             .init(device);
         let constant165: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                4,
-            >::zeros([1, 64, 1, 1], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 4>::zeros([1, 64, 1, 1], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 64, 1, 1].into(),
         );
         let constant199: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                4,
-            >::zeros([1, 64, 1, 1], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 4>::zeros([1, 64, 1, 1], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 64, 1, 1].into(),
@@ -169,20 +163,18 @@ impl<B: Backend> Submodule1<B> {
             .init(device);
         let constant160: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                4,
-            >::zeros([1, 128, 1, 1], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 4>::zeros([1, 128, 1, 1], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 128, 1, 1].into(),
         );
         let constant193: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                4,
-            >::zeros([1, 128, 1, 1], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 4>::zeros([1, 128, 1, 1], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 128, 1, 1].into(),
@@ -210,20 +202,18 @@ impl<B: Backend> Submodule1<B> {
             .init(device);
         let constant155: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                4,
-            >::zeros([1, 128, 1, 1], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 4>::zeros([1, 128, 1, 1], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 128, 1, 1].into(),
         );
         let constant198: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                4,
-            >::zeros([1, 128, 1, 1], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 4>::zeros([1, 128, 1, 1], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 128, 1, 1].into(),
@@ -244,20 +234,18 @@ impl<B: Backend> Submodule1<B> {
             .init(device);
         let constant149: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                4,
-            >::zeros([1, 128, 1, 1], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 4>::zeros([1, 128, 1, 1], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 128, 1, 1].into(),
         );
         let constant197: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                4,
-            >::zeros([1, 128, 1, 1], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 4>::zeros([1, 128, 1, 1], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 128, 1, 1].into(),
@@ -311,8 +299,8 @@ impl<B: Backend> Submodule1<B> {
     pub fn forward(&self, input: Tensor<B, 4, Int>) -> Tensor<B, 6> {
         let cast1_out1 = input.float().cast(burn::tensor::DType::F32);
         let constant171_out1 = self.constant171.val();
-        let mul1_out1 = cast1_out1
-            .mul((constant171_out1).unsqueeze_dims(&[0isize, 1isize, 2isize]));
+        let mul1_out1 =
+            cast1_out1.mul((constant171_out1).unsqueeze_dims(&[0isize, 1isize, 2isize]));
         let reshape1_out1 = mul1_out1.reshape([-1, 1, 70, 140]);
         let conv2d1_out1 = self.conv2d1.forward(reshape1_out1);
         let sigmoid1_out1 = burn::tensor::activation::sigmoid(conv2d1_out1.clone());
@@ -401,33 +389,30 @@ impl<B: Backend> Submodule2<B> {
     pub fn new(device: &B::Device) -> Self {
         let constant14: burn::module::Param<Tensor<B, 1>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                1,
-            >::from_data(
-                burn::tensor::TensorData::from([0.000009999999747378752f64]),
-                (device, burn::tensor::DType::F32),
-            ),
+            move |device, _require_grad| {
+                Tensor::<B, 1>::from_data(
+                    burn::tensor::TensorData::from([0.000009999999747378752f64]),
+                    (device, burn::tensor::DType::F32),
+                )
+            },
             device.clone(),
             false,
             [1].into(),
         );
         let constant136: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 64].into(),
         );
         let constant135: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 64].into(),
@@ -448,20 +433,18 @@ impl<B: Backend> Submodule2<B> {
             .init(device);
         let constant134: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 64].into(),
         );
         let constant133: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 64].into(),
@@ -482,20 +465,18 @@ impl<B: Backend> Submodule2<B> {
             .init(device);
         let constant124: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 64].into(),
         );
         let constant123: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 64].into(),
@@ -533,27 +514,28 @@ impl<B: Backend> Submodule2<B> {
         }
     }
     #[allow(clippy::let_and_return, clippy::approx_constant)]
-    pub fn forward(
-        &self,
-        transpose2_out1: Tensor<B, 6>,
-    ) -> (Tensor<B, 4>, Tensor<B, 1>) {
+    pub fn forward(&self, transpose2_out1: Tensor<B, 6>) -> (Tensor<B, 4>, Tensor<B, 1>) {
         let reshape3_out1 = transpose2_out1.reshape([-1, 4, 45, 64]);
         let reshape4_out1 = reshape3_out1.clone().reshape([-1, 4, 45, 1, 64]);
         let reducemean1_out1 = {
-            reshape4_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape4_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg1_out1 = reducemean1_out1.clone().neg();
         let sub1_out1 = reshape4_out1.clone().sub(reducemean1_out1);
         let mul17_out1 = sub1_out1.clone().mul(sub1_out1);
         let reducemean2_out1 = {
-            mul17_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul17_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let constant14_out1 = self.constant14.val();
         let add7_out1 = reducemean2_out1
-            .add(
-                (constant14_out1.clone())
-                    .unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]),
-            );
+            .add((constant14_out1.clone()).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
         let sqrt1_out1 = add7_out1.sqrt();
         let reciprocal1_out1 = sqrt1_out1.recip();
         let constant136_out1 = self.constant136.val();
@@ -581,19 +563,23 @@ impl<B: Backend> Submodule2<B> {
         let transpose7_out1 = add10_out1.clone().permute([0, 2, 3, 1]);
         let reshape6_out1 = transpose7_out1.reshape([-1, 4, 45, 1, 64]);
         let reducemean3_out1 = {
-            reshape6_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape6_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg2_out1 = reducemean3_out1.clone().neg();
         let sub2_out1 = reshape6_out1.clone().sub(reducemean3_out1);
         let mul23_out1 = sub2_out1.clone().mul(sub2_out1);
         let reducemean4_out1 = {
-            mul23_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul23_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add11_out1 = reducemean4_out1
-            .add(
-                (constant14_out1.clone())
-                    .unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]),
-            );
+            .add((constant14_out1.clone()).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
         let sqrt2_out1 = add11_out1.sqrt();
         let reciprocal2_out1 = sqrt2_out1.recip();
         let constant134_out1 = self.constant134.val();
@@ -613,19 +599,23 @@ impl<B: Backend> Submodule2<B> {
         let transpose9_out1 = add14_out1.clone().permute([0, 2, 3, 1]);
         let reshape8_out1 = transpose9_out1.reshape([-1, 4, 45, 1, 64]);
         let reducemean5_out1 = {
-            reshape8_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape8_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg3_out1 = reducemean5_out1.clone().neg();
         let sub3_out1 = reshape8_out1.clone().sub(reducemean5_out1);
         let mul28_out1 = sub3_out1.clone().mul(sub3_out1);
         let reducemean6_out1 = {
-            mul28_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul28_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add15_out1 = reducemean6_out1
-            .add(
-                (constant14_out1.clone())
-                    .unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]),
-            );
+            .add((constant14_out1.clone()).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
         let sqrt3_out1 = add15_out1.sqrt();
         let reciprocal3_out1 = sqrt3_out1.recip();
         let constant124_out1 = self.constant124.val();
@@ -679,20 +669,18 @@ impl<B: Backend> Submodule3<B> {
     pub fn new(device: &B::Device) -> Self {
         let constant122: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 64].into(),
         );
         let constant121: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 64].into(),
@@ -713,20 +701,18 @@ impl<B: Backend> Submodule3<B> {
             .init(device);
         let constant146: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 64].into(),
         );
         let constant145: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 64], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 64].into(),
@@ -760,20 +746,18 @@ impl<B: Backend> Submodule3<B> {
             .init(device);
         let constant120: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                4,
-            >::zeros([1, 256, 1, 1], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 4>::zeros([1, 256, 1, 1], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 256, 1, 1].into(),
         );
         let constant195: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                4,
-            >::zeros([1, 256, 1, 1], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 4>::zeros([1, 256, 1, 1], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 256, 1, 1].into(),
@@ -794,20 +778,18 @@ impl<B: Backend> Submodule3<B> {
             .init(device);
         let constant114: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                4,
-            >::zeros([1, 192, 1, 1], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 4>::zeros([1, 192, 1, 1], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 192, 1, 1].into(),
         );
         let constant192: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                4,
-            >::zeros([1, 192, 1, 1], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 4>::zeros([1, 192, 1, 1], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 192, 1, 1].into(),
@@ -834,27 +816,27 @@ impl<B: Backend> Submodule3<B> {
         }
     }
     #[allow(clippy::let_and_return, clippy::approx_constant)]
-    pub fn forward(
-        &self,
-        add18_out1: Tensor<B, 4>,
-        constant14_out1: Tensor<B, 1>,
-    ) -> Tensor<B, 4> {
+    pub fn forward(&self, add18_out1: Tensor<B, 4>, constant14_out1: Tensor<B, 1>) -> Tensor<B, 4> {
         let transpose13_out1 = add18_out1.clone().permute([0, 2, 3, 1]);
         let reshape10_out1 = transpose13_out1.reshape([-1, 4, 45, 1, 64]);
         let reducemean7_out1 = {
-            reshape10_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape10_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg4_out1 = reducemean7_out1.clone().neg();
         let sub4_out1 = reshape10_out1.clone().sub(reducemean7_out1);
         let mul34_out1 = sub4_out1.clone().mul(sub4_out1);
         let reducemean8_out1 = {
-            mul34_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul34_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add19_out1 = reducemean8_out1
-            .add(
-                (constant14_out1.clone())
-                    .unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]),
-            );
+            .add((constant14_out1.clone()).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
         let sqrt4_out1 = add19_out1.sqrt();
         let reciprocal4_out1 = sqrt4_out1.recip();
         let constant122_out1 = self.constant122.val();
@@ -874,13 +856,20 @@ impl<B: Backend> Submodule3<B> {
         let transpose15_out1 = add22_out1.permute([0, 2, 3, 1]);
         let reshape12_out1 = transpose15_out1.reshape([-1, 4, 45, 1, 64]);
         let reducemean9_out1 = {
-            reshape12_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape12_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg5_out1 = reducemean9_out1.clone().neg();
         let sub5_out1 = reshape12_out1.clone().sub(reducemean9_out1);
         let mul39_out1 = sub5_out1.clone().mul(sub5_out1);
         let reducemean10_out1 = {
-            mul39_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul39_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add23_out1 = reducemean10_out1
             .add((constant14_out1).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
@@ -958,20 +947,18 @@ impl<B: Backend> Submodule4<B> {
             .init();
         let constant101: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 96].into(),
         );
         let constant100: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 96].into(),
@@ -992,20 +979,18 @@ impl<B: Backend> Submodule4<B> {
             .init(device);
         let constant99: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 96].into(),
         );
         let constant98: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 96].into(),
@@ -1026,20 +1011,18 @@ impl<B: Backend> Submodule4<B> {
             .init(device);
         let constant89: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 96].into(),
         );
         let constant88: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 96].into(),
@@ -1078,11 +1061,7 @@ impl<B: Backend> Submodule4<B> {
         }
     }
     #[allow(clippy::let_and_return, clippy::approx_constant)]
-    pub fn forward(
-        &self,
-        mul47_out1: Tensor<B, 4>,
-        constant14_out1: Tensor<B, 1>,
-    ) -> Tensor<B, 4> {
+    pub fn forward(&self, mul47_out1: Tensor<B, 4>, constant14_out1: Tensor<B, 1>) -> Tensor<B, 4> {
         let conv2d29_out1 = self.conv2d29.forward(mul47_out1);
         let resize3_out1 = self.resize3.forward(conv2d29_out1);
         let transpose18_out1 = resize3_out1.permute([0, 2, 3, 1]);
@@ -1091,19 +1070,23 @@ impl<B: Backend> Submodule4<B> {
         let reshape16_out1 = transpose19_out1.reshape([-1, 4, 15, 96]);
         let reshape17_out1 = reshape16_out1.clone().reshape([-1, 4, 15, 1, 96]);
         let reducemean11_out1 = {
-            reshape17_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape17_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg6_out1 = reducemean11_out1.clone().neg();
         let sub6_out1 = reshape17_out1.clone().sub(reducemean11_out1);
         let mul48_out1 = sub6_out1.clone().mul(sub6_out1);
         let reducemean12_out1 = {
-            mul48_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul48_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add28_out1 = reducemean12_out1
-            .add(
-                (constant14_out1.clone())
-                    .unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]),
-            );
+            .add((constant14_out1.clone()).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
         let sqrt6_out1 = add28_out1.sqrt();
         let reciprocal6_out1 = sqrt6_out1.recip();
         let constant101_out1 = self.constant101.val();
@@ -1131,19 +1114,23 @@ impl<B: Backend> Submodule4<B> {
         let transpose24_out1 = add31_out1.clone().permute([0, 2, 3, 1]);
         let reshape19_out1 = transpose24_out1.reshape([-1, 4, 15, 1, 96]);
         let reducemean13_out1 = {
-            reshape19_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape19_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg7_out1 = reducemean13_out1.clone().neg();
         let sub7_out1 = reshape19_out1.clone().sub(reducemean13_out1);
         let mul54_out1 = sub7_out1.clone().mul(sub7_out1);
         let reducemean14_out1 = {
-            mul54_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul54_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add32_out1 = reducemean14_out1
-            .add(
-                (constant14_out1.clone())
-                    .unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]),
-            );
+            .add((constant14_out1.clone()).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
         let sqrt7_out1 = add32_out1.sqrt();
         let reciprocal7_out1 = sqrt7_out1.recip();
         let constant99_out1 = self.constant99.val();
@@ -1163,13 +1150,20 @@ impl<B: Backend> Submodule4<B> {
         let transpose26_out1 = add35_out1.clone().permute([0, 2, 3, 1]);
         let reshape21_out1 = transpose26_out1.reshape([-1, 4, 15, 1, 96]);
         let reducemean15_out1 = {
-            reshape21_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape21_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg8_out1 = reducemean15_out1.clone().neg();
         let sub8_out1 = reshape21_out1.clone().sub(reducemean15_out1);
         let mul59_out1 = sub8_out1.clone().mul(sub8_out1);
         let reducemean16_out1 = {
-            mul59_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul59_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add36_out1 = reducemean16_out1
             .add((constant14_out1).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
@@ -1222,20 +1216,18 @@ impl<B: Backend> Submodule5<B> {
     pub fn new(device: &B::Device) -> Self {
         let constant87: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 96].into(),
         );
         let constant86: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 96].into(),
@@ -1256,20 +1248,18 @@ impl<B: Backend> Submodule5<B> {
             .init(device);
         let constant77: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 96].into(),
         );
         let constant76: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 96].into(),
@@ -1290,20 +1280,18 @@ impl<B: Backend> Submodule5<B> {
             .init(device);
         let constant75: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 96].into(),
         );
         let constant74: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 96].into(),
@@ -1340,27 +1328,27 @@ impl<B: Backend> Submodule5<B> {
         }
     }
     #[allow(clippy::let_and_return, clippy::approx_constant)]
-    pub fn forward(
-        &self,
-        add39_out1: Tensor<B, 4>,
-        constant14_out1: Tensor<B, 1>,
-    ) -> Tensor<B, 4> {
+    pub fn forward(&self, add39_out1: Tensor<B, 4>, constant14_out1: Tensor<B, 1>) -> Tensor<B, 4> {
         let transpose30_out1 = add39_out1.clone().permute([0, 2, 3, 1]);
         let reshape23_out1 = transpose30_out1.reshape([-1, 4, 15, 1, 96]);
         let reducemean17_out1 = {
-            reshape23_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape23_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg9_out1 = reducemean17_out1.clone().neg();
         let sub9_out1 = reshape23_out1.clone().sub(reducemean17_out1);
         let mul65_out1 = sub9_out1.clone().mul(sub9_out1);
         let reducemean18_out1 = {
-            mul65_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul65_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add40_out1 = reducemean18_out1
-            .add(
-                (constant14_out1.clone())
-                    .unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]),
-            );
+            .add((constant14_out1.clone()).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
         let sqrt9_out1 = add40_out1.sqrt();
         let reciprocal9_out1 = sqrt9_out1.recip();
         let constant87_out1 = self.constant87.val();
@@ -1380,19 +1368,23 @@ impl<B: Backend> Submodule5<B> {
         let transpose32_out1 = add43_out1.clone().permute([0, 2, 3, 1]);
         let reshape25_out1 = transpose32_out1.reshape([-1, 4, 15, 1, 96]);
         let reducemean19_out1 = {
-            reshape25_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape25_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg10_out1 = reducemean19_out1.clone().neg();
         let sub10_out1 = reshape25_out1.clone().sub(reducemean19_out1);
         let mul70_out1 = sub10_out1.clone().mul(sub10_out1);
         let reducemean20_out1 = {
-            mul70_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul70_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add44_out1 = reducemean20_out1
-            .add(
-                (constant14_out1.clone())
-                    .unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]),
-            );
+            .add((constant14_out1.clone()).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
         let sqrt10_out1 = add44_out1.sqrt();
         let reciprocal10_out1 = sqrt10_out1.recip();
         let constant77_out1 = self.constant77.val();
@@ -1419,13 +1411,20 @@ impl<B: Backend> Submodule5<B> {
         let transpose36_out1 = add47_out1.clone().permute([0, 2, 3, 1]);
         let reshape27_out1 = transpose36_out1.reshape([-1, 4, 15, 1, 96]);
         let reducemean21_out1 = {
-            reshape27_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape27_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg11_out1 = reducemean21_out1.clone().neg();
         let sub11_out1 = reshape27_out1.clone().sub(reducemean21_out1);
         let mul76_out1 = sub11_out1.clone().mul(sub11_out1);
         let reducemean22_out1 = {
-            mul76_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul76_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add48_out1 = reducemean22_out1
             .add((constant14_out1).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
@@ -1469,20 +1468,18 @@ impl<B: Backend> Submodule6<B> {
     pub fn new(device: &B::Device) -> Self {
         let constant65: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 96].into(),
         );
         let constant64: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 96].into(),
@@ -1503,20 +1500,18 @@ impl<B: Backend> Submodule6<B> {
             .init(device);
         let constant63: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 96].into(),
         );
         let constant62: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 96].into(),
@@ -1537,20 +1532,18 @@ impl<B: Backend> Submodule6<B> {
             .init(device);
         let constant111: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 96].into(),
         );
         let constant110: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 96], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 96].into(),
@@ -1571,27 +1564,27 @@ impl<B: Backend> Submodule6<B> {
         }
     }
     #[allow(clippy::let_and_return, clippy::approx_constant)]
-    pub fn forward(
-        &self,
-        add51_out1: Tensor<B, 4>,
-        constant14_out1: Tensor<B, 1>,
-    ) -> Tensor<B, 5> {
+    pub fn forward(&self, add51_out1: Tensor<B, 4>, constant14_out1: Tensor<B, 1>) -> Tensor<B, 5> {
         let transpose38_out1 = add51_out1.clone().permute([0, 2, 3, 1]);
         let reshape29_out1 = transpose38_out1.reshape([-1, 4, 15, 1, 96]);
         let reducemean23_out1 = {
-            reshape29_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape29_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg12_out1 = reducemean23_out1.clone().neg();
         let sub12_out1 = reshape29_out1.clone().sub(reducemean23_out1);
         let mul81_out1 = sub12_out1.clone().mul(sub12_out1);
         let reducemean24_out1 = {
-            mul81_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul81_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add52_out1 = reducemean24_out1
-            .add(
-                (constant14_out1.clone())
-                    .unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]),
-            );
+            .add((constant14_out1.clone()).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
         let sqrt12_out1 = add52_out1.sqrt();
         let reciprocal12_out1 = sqrt12_out1.recip();
         let constant65_out1 = self.constant65.val();
@@ -1618,19 +1611,23 @@ impl<B: Backend> Submodule6<B> {
         let transpose42_out1 = add55_out1.clone().permute([0, 2, 3, 1]);
         let reshape31_out1 = transpose42_out1.reshape([-1, 4, 15, 1, 96]);
         let reducemean25_out1 = {
-            reshape31_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape31_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg13_out1 = reducemean25_out1.clone().neg();
         let sub13_out1 = reshape31_out1.clone().sub(reducemean25_out1);
         let mul87_out1 = sub13_out1.clone().mul(sub13_out1);
         let reducemean26_out1 = {
-            mul87_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul87_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add56_out1 = reducemean26_out1
-            .add(
-                (constant14_out1.clone())
-                    .unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]),
-            );
+            .add((constant14_out1.clone()).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
         let sqrt13_out1 = add56_out1.sqrt();
         let reciprocal13_out1 = sqrt13_out1.recip();
         let constant63_out1 = self.constant63.val();
@@ -1650,13 +1647,20 @@ impl<B: Backend> Submodule6<B> {
         let transpose44_out1 = add59_out1.permute([0, 2, 3, 1]);
         let reshape33_out1 = transpose44_out1.reshape([-1, 4, 15, 1, 96]);
         let reducemean27_out1 = {
-            reshape33_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape33_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg14_out1 = reducemean27_out1.clone().neg();
         let sub14_out1 = reshape33_out1.clone().sub(reducemean27_out1);
         let mul92_out1 = sub14_out1.clone().mul(sub14_out1);
         let reducemean28_out1 = {
-            mul92_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul92_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add60_out1 = reducemean28_out1
             .add((constant14_out1).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
@@ -1730,20 +1734,18 @@ impl<B: Backend> Submodule7<B> {
             .init(device);
         let constant61: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                4,
-            >::zeros([1, 384, 1, 1], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 4>::zeros([1, 384, 1, 1], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 384, 1, 1].into(),
         );
         let constant196: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                4,
-            >::zeros([1, 384, 1, 1], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 4>::zeros([1, 384, 1, 1], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 384, 1, 1].into(),
@@ -1764,20 +1766,18 @@ impl<B: Backend> Submodule7<B> {
             .init(device);
         let constant55: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                4,
-            >::zeros([1, 256, 1, 1], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 4>::zeros([1, 256, 1, 1], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 256, 1, 1].into(),
         );
         let constant194: burn::module::Param<Tensor<B, 4>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                4,
-            >::zeros([1, 256, 1, 1], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 4>::zeros([1, 256, 1, 1], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 256, 1, 1].into(),
@@ -1797,20 +1797,18 @@ impl<B: Backend> Submodule7<B> {
             .init();
         let constant42: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 128].into(),
         );
         let constant41: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 128].into(),
@@ -1831,20 +1829,18 @@ impl<B: Backend> Submodule7<B> {
             .init(device);
         let constant40: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 128].into(),
         );
         let constant39: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 128].into(),
@@ -1889,11 +1885,7 @@ impl<B: Backend> Submodule7<B> {
         }
     }
     #[allow(clippy::let_and_return, clippy::approx_constant)]
-    pub fn forward(
-        &self,
-        add62_out1: Tensor<B, 5>,
-        constant14_out1: Tensor<B, 1>,
-    ) -> Tensor<B, 4> {
+    pub fn forward(&self, add62_out1: Tensor<B, 5>, constant14_out1: Tensor<B, 1>) -> Tensor<B, 4> {
         let reshape34_out1 = add62_out1.reshape([-1, 2, 2, 3, 5, 96]);
         let transpose45_out1 = reshape34_out1.permute([0, 3, 1, 4, 2, 5]);
         let reshape35_out1 = transpose45_out1.reshape([-1, 6, 10, 96]);
@@ -1926,19 +1918,23 @@ impl<B: Backend> Submodule7<B> {
         let reshape37_out1 = transpose48_out1.reshape([-1, 4, 6, 128]);
         let reshape38_out1 = reshape37_out1.clone().reshape([-1, 4, 6, 1, 128]);
         let reducemean29_out1 = {
-            reshape38_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape38_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg15_out1 = reducemean29_out1.clone().neg();
         let sub15_out1 = reshape38_out1.clone().sub(reducemean29_out1);
         let mul101_out1 = sub15_out1.clone().mul(sub15_out1);
         let reducemean30_out1 = {
-            mul101_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul101_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add65_out1 = reducemean30_out1
-            .add(
-                (constant14_out1.clone())
-                    .unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]),
-            );
+            .add((constant14_out1.clone()).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
         let sqrt15_out1 = add65_out1.sqrt();
         let reciprocal15_out1 = sqrt15_out1.recip();
         let constant42_out1 = self.constant42.val();
@@ -1966,13 +1962,20 @@ impl<B: Backend> Submodule7<B> {
         let transpose53_out1 = add68_out1.clone().permute([0, 2, 3, 1]);
         let reshape40_out1 = transpose53_out1.reshape([-1, 4, 6, 1, 128]);
         let reducemean31_out1 = {
-            reshape40_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape40_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg16_out1 = reducemean31_out1.clone().neg();
         let sub16_out1 = reshape40_out1.clone().sub(reducemean31_out1);
         let mul107_out1 = sub16_out1.clone().mul(sub16_out1);
         let reducemean32_out1 = {
-            mul107_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul107_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add69_out1 = reducemean32_out1
             .add((constant14_out1).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
@@ -2018,20 +2021,18 @@ impl<B: Backend> Submodule8<B> {
     pub fn new(device: &B::Device) -> Self {
         let constant30: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 128].into(),
         );
         let constant29: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 128].into(),
@@ -2052,20 +2053,18 @@ impl<B: Backend> Submodule8<B> {
             .init(device);
         let constant28: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 128].into(),
         );
         let constant27: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 128].into(),
@@ -2086,20 +2085,18 @@ impl<B: Backend> Submodule8<B> {
             .init(device);
         let constant18: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 128].into(),
         );
         let constant17: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 128].into(),
@@ -2136,27 +2133,27 @@ impl<B: Backend> Submodule8<B> {
         }
     }
     #[allow(clippy::let_and_return, clippy::approx_constant)]
-    pub fn forward(
-        &self,
-        add72_out1: Tensor<B, 4>,
-        constant14_out1: Tensor<B, 1>,
-    ) -> Tensor<B, 4> {
+    pub fn forward(&self, add72_out1: Tensor<B, 4>, constant14_out1: Tensor<B, 1>) -> Tensor<B, 4> {
         let transpose55_out1 = add72_out1.clone().permute([0, 2, 3, 1]);
         let reshape42_out1 = transpose55_out1.reshape([-1, 4, 6, 1, 128]);
         let reducemean33_out1 = {
-            reshape42_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape42_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg17_out1 = reducemean33_out1.clone().neg();
         let sub17_out1 = reshape42_out1.clone().sub(reducemean33_out1);
         let mul112_out1 = sub17_out1.clone().mul(sub17_out1);
         let reducemean34_out1 = {
-            mul112_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul112_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add73_out1 = reducemean34_out1
-            .add(
-                (constant14_out1.clone())
-                    .unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]),
-            );
+            .add((constant14_out1.clone()).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
         let sqrt17_out1 = add73_out1.sqrt();
         let reciprocal17_out1 = sqrt17_out1.recip();
         let constant30_out1 = self.constant30.val();
@@ -2183,19 +2180,23 @@ impl<B: Backend> Submodule8<B> {
         let transpose59_out1 = add76_out1.clone().permute([0, 2, 3, 1]);
         let reshape44_out1 = transpose59_out1.reshape([-1, 4, 6, 1, 128]);
         let reducemean35_out1 = {
-            reshape44_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape44_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg18_out1 = reducemean35_out1.clone().neg();
         let sub18_out1 = reshape44_out1.clone().sub(reducemean35_out1);
         let mul118_out1 = sub18_out1.clone().mul(sub18_out1);
         let reducemean36_out1 = {
-            mul118_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul118_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add77_out1 = reducemean36_out1
-            .add(
-                (constant14_out1.clone())
-                    .unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]),
-            );
+            .add((constant14_out1.clone()).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
         let sqrt18_out1 = add77_out1.sqrt();
         let reciprocal18_out1 = sqrt18_out1.recip();
         let constant28_out1 = self.constant28.val();
@@ -2215,13 +2216,20 @@ impl<B: Backend> Submodule8<B> {
         let transpose61_out1 = add80_out1.clone().permute([0, 2, 3, 1]);
         let reshape46_out1 = transpose61_out1.reshape([-1, 4, 6, 1, 128]);
         let reducemean37_out1 = {
-            reshape46_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape46_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg19_out1 = reducemean37_out1.clone().neg();
         let sub19_out1 = reshape46_out1.clone().sub(reducemean37_out1);
         let mul123_out1 = sub19_out1.clone().mul(sub19_out1);
         let reducemean38_out1 = {
-            mul123_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul123_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add81_out1 = reducemean38_out1
             .add((constant14_out1).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
@@ -2279,20 +2287,18 @@ impl<B: Backend> Submodule9<B> {
     pub fn new(device: &B::Device) -> Self {
         let constant16: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 128].into(),
         );
         let constant15: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 128].into(),
@@ -2313,20 +2319,18 @@ impl<B: Backend> Submodule9<B> {
             .init(device);
         let constant52: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 128].into(),
         );
         let constant51: burn::module::Param<Tensor<B, 5>> = burn::module::Param::uninitialized(
             burn::module::ParamId::new(),
-            move |device, _require_grad| Tensor::<
-                B,
-                5,
-            >::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32)),
+            move |device, _require_grad| {
+                Tensor::<B, 5>::zeros([1, 1, 1, 1, 128], (device, burn::tensor::DType::F32))
+            },
             device.clone(),
             false,
             [1, 1, 1, 1, 128].into(),
@@ -2376,27 +2380,27 @@ impl<B: Backend> Submodule9<B> {
         }
     }
     #[allow(clippy::let_and_return, clippy::approx_constant)]
-    pub fn forward(
-        &self,
-        add84_out1: Tensor<B, 4>,
-        constant14_out1: Tensor<B, 1>,
-    ) -> Tensor<B, 2> {
+    pub fn forward(&self, add84_out1: Tensor<B, 4>, constant14_out1: Tensor<B, 1>) -> Tensor<B, 2> {
         let transpose65_out1 = add84_out1.clone().permute([0, 2, 3, 1]);
         let reshape48_out1 = transpose65_out1.reshape([-1, 4, 6, 1, 128]);
         let reducemean39_out1 = {
-            reshape48_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape48_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg20_out1 = reducemean39_out1.clone().neg();
         let sub20_out1 = reshape48_out1.clone().sub(reducemean39_out1);
         let mul129_out1 = sub20_out1.clone().mul(sub20_out1);
         let reducemean40_out1 = {
-            mul129_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul129_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add85_out1 = reducemean40_out1
-            .add(
-                (constant14_out1.clone())
-                    .unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]),
-            );
+            .add((constant14_out1.clone()).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
         let sqrt20_out1 = add85_out1.sqrt();
         let reciprocal20_out1 = sqrt20_out1.recip();
         let constant16_out1 = self.constant16.val();
@@ -2416,13 +2420,20 @@ impl<B: Backend> Submodule9<B> {
         let transpose67_out1 = add88_out1.permute([0, 2, 3, 1]);
         let reshape50_out1 = transpose67_out1.reshape([-1, 4, 6, 1, 128]);
         let reducemean41_out1 = {
-            reshape50_out1.clone().mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            reshape50_out1
+                .clone()
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let neg21_out1 = reducemean41_out1.clone().neg();
         let sub21_out1 = reshape50_out1.clone().sub(reducemean41_out1);
         let mul134_out1 = sub21_out1.clone().mul(sub21_out1);
         let reducemean42_out1 = {
-            mul134_out1.mean_dim(1usize).mean_dim(2usize).mean_dim(4usize)
+            mul134_out1
+                .mean_dim(1usize)
+                .mean_dim(2usize)
+                .mean_dim(4usize)
         };
         let add89_out1 = reducemean42_out1
             .add((constant14_out1).unsqueeze_dims(&[0isize, 1isize, 2isize, 3isize]));
@@ -2478,7 +2489,7 @@ impl<B: Backend> Submodule9<B> {
                 softmax12_out1,
                 softmax11_out1,
             ]
-                .into(),
+            .into(),
             1,
         );
         concat1_out1
@@ -2501,15 +2512,11 @@ pub struct Model<B: Backend> {
     device: B::Device,
 }
 
-
 extern crate std;
 
 impl<B: Backend> Default for Model<B> {
     fn default() -> Self {
-        Self::from_file(
-            "plate_ocr.bpk",
-            &Default::default(),
-        )
+        Self::from_file("plate_ocr.bpk", &Default::default())
     }
 }
 
@@ -2518,7 +2525,9 @@ impl<B: Backend> Model<B> {
     pub fn from_file<P: AsRef<std::path::Path>>(file: P, device: &B::Device) -> Self {
         let mut model = Self::new(device);
         let mut store = BurnpackStore::from_file(file);
-        model.load_from(&mut store).expect("Failed to load burnpack file");
+        model
+            .load_from(&mut store)
+            .expect("Failed to load burnpack file");
         model
     }
 
@@ -2528,7 +2537,9 @@ impl<B: Backend> Model<B> {
     pub fn from_bytes(bytes: Bytes, device: &B::Device) -> Self {
         let mut model = Self::new(device);
         let mut store = BurnpackStore::from_bytes(Some(bytes));
-        model.load_from(&mut store).expect("Failed to load burnpack bytes");
+        model
+            .load_from(&mut store)
+            .expect("Failed to load burnpack bytes");
         model
     }
 }

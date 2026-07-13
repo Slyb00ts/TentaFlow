@@ -416,11 +416,7 @@ pub fn resolve_retention_policy(
     Ok(policy)
 }
 
-pub fn start_ai_event(
-    conn: &Connection,
-    event_id: &str,
-    event: &NewAiEvent<'_>,
-) -> Result<()> {
+pub fn start_ai_event(conn: &Connection, event_id: &str, event: &NewAiEvent<'_>) -> Result<()> {
     let retention =
         resolve_retention_policy(conn, event.org_id, RetentionScopeKind::AiAudit, None)?;
     if let Some(legal_basis_id) = event.legal_basis_id {

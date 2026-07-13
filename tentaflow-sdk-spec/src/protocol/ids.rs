@@ -35,10 +35,7 @@ macro_rules! fixed_bstr_newtype {
         }
 
         impl<'b, C> Decode<'b, C> for $name {
-            fn decode(
-                d: &mut Decoder<'b>,
-                _ctx: &mut C,
-            ) -> Result<Self, minicbor::decode::Error> {
+            fn decode(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
                 let b = d.bytes()?;
                 if b.len() != $len {
                     return Err(minicbor::decode::Error::message(concat!(
@@ -56,12 +53,32 @@ macro_rules! fixed_bstr_newtype {
     };
 }
 
-fixed_bstr_newtype!(SessionId, 16, "Stable session identifier (UUID v4); survives resume.");
-fixed_bstr_newtype!(TraceId, 16, "Distributed-tracing identifier (W3C trace-id form).");
+fixed_bstr_newtype!(
+    SessionId,
+    16,
+    "Stable session identifier (UUID v4); survives resume."
+);
+fixed_bstr_newtype!(
+    TraceId,
+    16,
+    "Distributed-tracing identifier (W3C trace-id form)."
+);
 fixed_bstr_newtype!(NodeId, 16, "TentaFlow node identifier in the mesh.");
-fixed_bstr_newtype!(DeviceId, 16, "Mobile/device identifier used for session pinning.");
-fixed_bstr_newtype!(ClientActionId, 16, "Idempotency key for an Action submitted by the client.");
-fixed_bstr_newtype!(Hash32, 32, "SHA-256 hash used in handshake Capability.hash and similar bstr 32 fields.");
+fixed_bstr_newtype!(
+    DeviceId,
+    16,
+    "Mobile/device identifier used for session pinning."
+);
+fixed_bstr_newtype!(
+    ClientActionId,
+    16,
+    "Idempotency key for an Action submitted by the client."
+);
+fixed_bstr_newtype!(
+    Hash32,
+    32,
+    "SHA-256 hash used in handshake Capability.hash and similar bstr 32 fields."
+);
 
 #[cfg(test)]
 mod tests {

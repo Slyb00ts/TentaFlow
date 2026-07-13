@@ -12,10 +12,10 @@
 
 use std::path::PathBuf;
 
+use tentaflow_core::inference::llamacpp::LlamaCppEngine;
 use tentaflow_core::inference::{
     DeployParamsSnapshot, GenerateParams, InferenceEngine, StopReason,
 };
-use tentaflow_core::inference::llamacpp::LlamaCppEngine;
 
 fn model_path() -> Option<PathBuf> {
     std::env::var("TENTAFLOW_LLAMA_TEST_MODEL")
@@ -28,7 +28,8 @@ fn deploy_params() -> DeployParamsSnapshot {
     let mut s = DeployParamsSnapshot::default();
     s.llamacpp
         .insert("n_gpu_layers".into(), serde_json::json!(99));
-    s.llamacpp.insert("ctx_size".into(), serde_json::json!(2048));
+    s.llamacpp
+        .insert("ctx_size".into(), serde_json::json!(2048));
     s.llamacpp.insert("n_parallel".into(), serde_json::json!(2));
     s
 }
@@ -64,10 +65,7 @@ async fn generate_and_stream_then_release() {
         !result.text.trim().is_empty(),
         "generate zwrócił niepustą odpowiedź"
     );
-    assert!(
-        result.tokens_generated > 0,
-        "generate zgłosił >0 tokenów"
-    );
+    assert!(result.tokens_generated > 0, "generate zgłosił >0 tokenów");
     assert!(
         result.prompt_tokens > 0,
         "CR-004: realne prompt_tokens z silnika (nie 0)"
@@ -107,11 +105,17 @@ async fn generate_and_stream_then_release() {
         }
     }
     assert!(saw_final, "strumień dostarczył token finalny");
-    assert!(final_error.is_none(), "CR-003: brak błędu silnika w streamie");
+    assert!(
+        final_error.is_none(),
+        "CR-003: brak błędu silnika w streamie"
+    );
     assert!(!streamed.trim().is_empty(), "strumień zwrócił tekst");
 
     // Zwolnienie zasobów: unload nie błądzi i model_info znika.
-    engine.unload_model().await.expect("unload_model powiodło się");
+    engine
+        .unload_model()
+        .await
+        .expect("unload_model powiodło się");
     assert!(
         engine.model_info().is_none(),
         "po unload model_info() jest None — zasoby zwolnione"

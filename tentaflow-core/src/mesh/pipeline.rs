@@ -705,11 +705,13 @@ async fn handle_peer_connected(
                 if !all_keys.is_empty() {
                     let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
                         .iter()
-                        .map(|(nid, pk, approved_at)| tentaflow_protocol::mesh::TrustedKeyEntry {
-                            node_id: nid.clone(),
-                            public_key_hex: pk.clone(),
-                            approved_at: approved_at.clone(),
-                        })
+                        .map(
+                            |(nid, pk, approved_at)| tentaflow_protocol::mesh::TrustedKeyEntry {
+                                node_id: nid.clone(),
+                                public_key_hex: pk.clone(),
+                                approved_at: approved_at.clone(),
+                            },
+                        )
                         .collect();
                     let payload =
                         tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
@@ -1678,10 +1680,12 @@ fn spawn_quic_event_handler(
                         if !all_keys.is_empty() {
                             let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
                                 .iter()
-                                .map(|(nid, pk, approved_at)| tentaflow_protocol::mesh::TrustedKeyEntry {
-                                    node_id: nid.clone(),
-                                    public_key_hex: pk.clone(),
-                                    approved_at: approved_at.clone(),
+                                .map(|(nid, pk, approved_at)| {
+                                    tentaflow_protocol::mesh::TrustedKeyEntry {
+                                        node_id: nid.clone(),
+                                        public_key_hex: pk.clone(),
+                                        approved_at: approved_at.clone(),
+                                    }
                                 })
                                 .collect();
                             let payload =
@@ -2366,8 +2370,7 @@ fn spawn_quic_event_handler(
                                         count = robots.len(),
                                         "RobotsAnnounce: replace_node"
                                     );
-                                    crate::mesh::robot_dispatch::global()
-                                        .replace_node(key, robots);
+                                    crate::mesh::robot_dispatch::global().replace_node(key, robots);
                                 }
                                 None => {
                                     if payload.from_node_id != from_node_id
@@ -2415,17 +2418,15 @@ fn spawn_quic_event_handler(
                     // org). Each advertised robot carries `org_id`, so that layer can
                     // filter. A requester-declared org filter here would be bogus
                     // (forgeable) and inconsistent with services discovery.
-                    let robots = crate::mesh::robot_dispatch::global()
-                        .local_robots(&local_node_id);
+                    let robots = crate::mesh::robot_dispatch::global().local_robots(&local_node_id);
                     let qm = qm_events.clone();
                     let local = local_node_id.clone();
                     let peer = from_node_id.clone();
                     tokio::spawn(async move {
-                        let payload =
-                            crate::mesh::robot_dispatch::RobotsGetResponsePayload {
-                                from_node_id: local,
-                                robots,
-                            };
+                        let payload = crate::mesh::robot_dispatch::RobotsGetResponsePayload {
+                            from_node_id: local,
+                            robots,
+                        };
                         let bytes = match crate::mesh::cbor::encode(&payload) {
                             Ok(b) => b,
                             Err(e) => {
@@ -2480,8 +2481,7 @@ fn spawn_quic_event_handler(
                                         count = robots.len(),
                                         "RobotsGetResponse: replace_node"
                                     );
-                                    crate::mesh::robot_dispatch::global()
-                                        .replace_node(key, robots);
+                                    crate::mesh::robot_dispatch::global().replace_node(key, robots);
                                 }
                                 None => {
                                     if payload.from_node_id != from_node_id
@@ -2544,8 +2544,7 @@ fn spawn_quic_event_handler(
                                         RobotChange::Removed(id) => RobotChange::Removed(id),
                                     };
                                     debug!(peer = %from_node_id, "RobotsUpdate: apply_change");
-                                    crate::mesh::robot_dispatch::global()
-                                        .apply_change(key, change);
+                                    crate::mesh::robot_dispatch::global().apply_change(key, change);
                                 }
                                 None => {
                                     if payload.from_node_id != from_node_id
@@ -2592,8 +2591,7 @@ fn spawn_quic_event_handler(
                                     // Odswiez stan in-memory routera. Odbior synca
                                     // NIE re-broadcastuje (anty-petla) — dlatego nie
                                     // uzywamy broadcast_alias_mutation.
-                                    if let Some(router) = crate::routing::router::active_router()
-                                    {
+                                    if let Some(router) = crate::routing::router::active_router() {
                                         router.update_alias_cache_from_sync(aliases);
                                         router.rebuild_catalog();
                                     }
@@ -3499,7 +3497,10 @@ fn spawn_trust_expiry_prune(
             let trusted = match crate::db::repository::list_trusted_nodes(&mesh_security.db) {
                 Ok(t) => t,
                 Err(e) => {
-                    warn!("trust-expiry prune: nie udalo sie odczytac trusted_nodes: {}", e);
+                    warn!(
+                        "trust-expiry prune: nie udalo sie odczytac trusted_nodes: {}",
+                        e
+                    );
                     continue;
                 }
             };
@@ -3513,13 +3514,11 @@ fn spawn_trust_expiry_prune(
                 if qm.is_connected(&node.node_id).await {
                     continue;
                 }
-                let last_seen = crate::db::repository::get_peer_last_seen_ms(
-                    &mesh_security.db,
-                    &node.node_id,
-                )
-                .ok()
-                .flatten()
-                .unwrap_or(0);
+                let last_seen =
+                    crate::db::repository::get_peer_last_seen_ms(&mesh_security.db, &node.node_id)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0);
                 // Floor activity at pairing time so a just-paired peer that has not yet
                 // connected is not pruned before the TTL elapses.
                 let approved_ms = approved_at_to_ms(&node.approved_at).unwrap_or(0);
@@ -3695,7 +3694,10 @@ async fn run_token_lease_coordinator_tick(
     let trusted = match crate::db::repository::list_trusted_nodes(&mesh_security.db) {
         Ok(t) => t,
         Err(e) => {
-            warn!("token-lease coordinator: odczyt trusted_nodes nieudany: {}", e);
+            warn!(
+                "token-lease coordinator: odczyt trusted_nodes nieudany: {}",
+                e
+            );
             return;
         }
     };
@@ -3864,7 +3866,10 @@ pub(crate) async fn run_sync_repair_scheduler_tick_with<BuildPush, BuildRepairs>
     // in the same tick. Cheap when no epoch advanced.
     match crate::sync::runtime::backfill_outbox_for_permission_grants() {
         Ok(Some(count)) if count > 0 => {
-            debug!("sync repair: permission backfill re-enqueued {} outbox entries", count);
+            debug!(
+                "sync repair: permission backfill re-enqueued {} outbox entries",
+                count
+            );
         }
         Ok(_) => {}
         Err(e) => warn!("sync repair: permission backfill failed: {}", e),

@@ -75,7 +75,8 @@ impl PoseEstimator for YoloPoseEngine {
             .ok_or_else(|| anyhow!("YOLO-pose: missing output tensor"))?;
         let shape = out.shape().to_vec();
         let data = out
-            .view().as_slice::<f32>()
+            .view()
+            .as_slice::<f32>()
             .context("YOLO-pose: output is not f32")?;
 
         let (attrs, anchors, transposed) = match shape.as_slice() {
@@ -150,9 +151,7 @@ pub fn load(model_path: &Path) -> Result<YoloPoseEngine> {
         )?
         .into_optimized()?
         .into_runnable()?;
-    Ok(YoloPoseEngine {
-        model,
-    })
+    Ok(YoloPoseEngine { model })
 }
 
 fn nms_pose(detections: Vec<PoseDetection>, iou_threshold: f32) -> Vec<PoseDetection> {

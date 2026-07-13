@@ -65,8 +65,8 @@ impl AgentNodeAdapter {
     /// agent's configured budget, mirroring how `subflow` clamps to `timeout_ms`.
     /// A non-positive `timeout_secs` leaves the parent deadline untouched.
     fn clamp_deadline(timeout_secs: i64, parent: Option<Instant>) -> Option<Instant> {
-        let configured = (timeout_secs > 0)
-            .then(|| Instant::now() + Duration::from_secs(timeout_secs as u64));
+        let configured =
+            (timeout_secs > 0).then(|| Instant::now() + Duration::from_secs(timeout_secs as u64));
         match (parent, configured) {
             (Some(p), Some(c)) => Some(p.min(c)),
             (Some(p), None) => Some(p),
@@ -180,7 +180,9 @@ impl NodeAdapter for AgentNodeAdapter {
     ) -> Result<FlowEnvelope> {
         let (flow_id, child_input, runner, child_ctx) = self.prepare(node, inputs, ctx).await?;
 
-        let child_final = runner.run(&flow_id, child_input, &child_ctx, 1, false).await?;
+        let child_final = runner
+            .run(&flow_id, child_input, &child_ctx, 1, false)
+            .await?;
 
         // Codex-review pattern: only the summary returns. The parent keeps its
         // OWN envelope as the base (its context, variables, artifacts) and the
@@ -631,7 +633,13 @@ mod tests {
 
         let pool = db();
         let flow_id = "eeee0000-agnt-strm-0000-000000000001";
-        insert_flow(&pool, flow_id, "agent-run", &streaming_harness_flow_json(), "active");
+        insert_flow(
+            &pool,
+            flow_id,
+            "agent-run",
+            &streaming_harness_flow_json(),
+            "active",
+        );
         seed_agent(&pool, "agent-stream", "streamer", Some(flow_id), true);
         let svc = service(pool.clone());
 
@@ -663,7 +671,10 @@ mod tests {
             }
         }
         // The harness flow producer saw the agent id the block stamped.
-        assert!(text.contains("streamed answer for agent-stream"), "stream text: {text:?}");
+        assert!(
+            text.contains("streamed answer for agent-stream"),
+            "stream text: {text:?}"
+        );
         assert!(saw_finish, "client never got finish_reason=Stop");
     }
 

@@ -390,7 +390,11 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
 
     // --- Ingest-as-flow API (RAG Partia 3 — binarny dokument → flow rag:ingest) ---
     linker
-        .func_wrap("tentaflow", "ingest_invoke_v1", ingest_invoke::ingest_invoke_v1)
+        .func_wrap(
+            "tentaflow",
+            "ingest_invoke_v1",
+            ingest_invoke::ingest_invoke_v1,
+        )
         .map_err(|e| anyhow::anyhow!("Rejestracja ingest_invoke_v1: {e}"))?;
 
     // --- Document/blob store API (RAG E1.3 — per-instancja upload pliku) ---
@@ -401,7 +405,11 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
         .func_wrap("tentaflow", "document_get_v1", document::document_get_v1)
         .map_err(|e| anyhow::anyhow!("Rejestracja document_get_v1: {e}"))?;
     linker
-        .func_wrap("tentaflow", "document_delete_v1", document::document_delete_v1)
+        .func_wrap(
+            "tentaflow",
+            "document_delete_v1",
+            document::document_delete_v1,
+        )
         .map_err(|e| anyhow::anyhow!("Rejestracja document_delete_v1: {e}"))?;
     linker
         .func_wrap("tentaflow", "document_list_v1", document::document_list_v1)
@@ -411,10 +419,18 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
     #[cfg(feature = "graph")]
     {
         linker
-            .func_wrap("tentaflow", "graph_upsert_node_v1", graph::graph_upsert_node_v1)
+            .func_wrap(
+                "tentaflow",
+                "graph_upsert_node_v1",
+                graph::graph_upsert_node_v1,
+            )
             .map_err(|e| anyhow::anyhow!("Rejestracja graph_upsert_node_v1: {e}"))?;
         linker
-            .func_wrap("tentaflow", "graph_upsert_edge_v1", graph::graph_upsert_edge_v1)
+            .func_wrap(
+                "tentaflow",
+                "graph_upsert_edge_v1",
+                graph::graph_upsert_edge_v1,
+            )
             .map_err(|e| anyhow::anyhow!("Rejestracja graph_upsert_edge_v1: {e}"))?;
         linker
             .func_wrap("tentaflow", "graph_neighbors_v1", graph::graph_neighbors_v1)
@@ -456,7 +472,11 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
             .func_wrap("tentaflow", "camera_add_v1", camera::camera_add_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja camera_add_v1: {e}"))?;
         linker
-            .func_wrap("tentaflow", "camera_register_pushed_v1", camera::camera_register_pushed_v1)
+            .func_wrap(
+                "tentaflow",
+                "camera_register_pushed_v1",
+                camera::camera_register_pushed_v1,
+            )
             .map_err(|e| anyhow::anyhow!("Rejestracja camera_register_pushed_v1: {e}"))?;
         linker
             .func_wrap("tentaflow", "camera_list_v1", camera::camera_list_v1)
@@ -623,6 +643,13 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
             )
             .map_err(|e| anyhow::anyhow!("Rejestracja recording_stats_v1: {e}"))?;
         linker
+            .func_wrap(
+                "tentaflow",
+                "recording_list_v1",
+                recording::recording_list_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja recording_list_v1: {e}"))?;
+        linker
             .func_wrap("tentaflow", "frame_url_v1", recording::frame_url_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja frame_url_v1: {e}"))?;
 
@@ -656,7 +683,11 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
             .func_wrap("tentaflow", "webrtc_connect_v1", webrtc::webrtc_connect_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja webrtc_connect_v1: {e}"))?;
         linker
-            .func_wrap("tentaflow", "webrtc_set_answer_v1", webrtc::webrtc_set_answer_v1)
+            .func_wrap(
+                "tentaflow",
+                "webrtc_set_answer_v1",
+                webrtc::webrtc_set_answer_v1,
+            )
             .map_err(|e| anyhow::anyhow!("Rejestracja webrtc_set_answer_v1: {e}"))?;
         linker
             .func_wrap("tentaflow", "webrtc_state_v1", webrtc::webrtc_state_v1)
@@ -703,7 +734,11 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
             .func_wrap("tentaflow", "baro_publish_v1", sensors::baro_publish_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja baro_publish_v1: {e}"))?;
         linker
-            .func_wrap("tentaflow", "mobile_sensor_drain_v1", sensors::mobile_sensor_drain_v1)
+            .func_wrap(
+                "tentaflow",
+                "mobile_sensor_drain_v1",
+                sensors::mobile_sensor_drain_v1,
+            )
             .map_err(|e| anyhow::anyhow!("Rejestracja mobile_sensor_drain_v1: {e}"))?;
     }
 

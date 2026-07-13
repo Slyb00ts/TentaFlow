@@ -263,7 +263,10 @@ fn build_large_payload() -> Vec<u8> {
         encode_u16(&mut buf, 2);
         encode_tstr(&mut buf, &format!("jan.kowalski.{r}@acme-corp.example.com"));
         encode_u16(&mut buf, 3);
-        encode_tstr(&mut buf, &format!("+48 600 {:03} {:03}", r * 7 % 1000, r * 13 % 1000));
+        encode_tstr(
+            &mut buf,
+            &format!("+48 600 {:03} {:03}", r * 7 % 1000, r * 13 % 1000),
+        );
         encode_u16(&mut buf, 4);
         encode_bool(&mut buf, r % 5 != 0);
     }
@@ -278,7 +281,10 @@ fn build_large_payload() -> Vec<u8> {
         encode_u16(&mut buf, 1);
         encode_tstr(&mut buf, &format!("2025-06-{:02}T10:30:00Z", (ev % 28) + 1));
         encode_u16(&mut buf, 2);
-        encode_tstr(&mut buf, "Updated contact information for employee record in the system database");
+        encode_tstr(
+            &mut buf,
+            "Updated contact information for employee record in the system database",
+        );
         encode_u16(&mut buf, 3);
         encode_tstr(&mut buf, "admin@acme-corp.example.com");
         encode_u16(&mut buf, 4);

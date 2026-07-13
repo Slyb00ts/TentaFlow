@@ -1020,9 +1020,7 @@ mod embedding_decode_tests {
     fn embedding_base64_roundtrip_bit_identical() {
         let vector: Vec<f32> = vec![0.0, -1.5, 3.141_592_7, f32::MIN_POSITIVE, 12345.678];
         let b64 = encode_b64_f32(&vector);
-        let json = format!(
-            r#"{{"object":"embedding","index":0,"embedding":"{b64}"}}"#
-        );
+        let json = format!(r#"{{"object":"embedding","index":0,"embedding":"{b64}"}}"#);
         let data: EmbeddingData = serde_json::from_str(&json).expect("decode base64 embedding");
 
         assert_eq!(data.embedding.len(), vector.len());
@@ -1033,8 +1031,7 @@ mod embedding_decode_tests {
 
     #[test]
     fn embedding_float_array_still_decodes() {
-        let json =
-            r#"{"object":"embedding","index":2,"embedding":[0.1,0.2,0.3]}"#;
+        let json = r#"{"object":"embedding","index":2,"embedding":[0.1,0.2,0.3]}"#;
         let data: EmbeddingData = serde_json::from_str(json).expect("decode float embedding");
         assert_eq!(data.embedding, vec![0.1_f32, 0.2, 0.3]);
         assert_eq!(data.index, 2);

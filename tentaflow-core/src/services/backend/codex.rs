@@ -21,11 +21,11 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tracing::warn;
 
+use crate::api::openai::types::ContentPart;
 use crate::api::openai::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Choice, ChunkChoice, Delta,
     Message, MessageContent,
 };
-use crate::api::openai::types::ContentPart;
 use crate::error::{CoreError, Result};
 
 /// Full Responses endpoint for the ChatGPT (Codex) backend.
@@ -475,11 +475,21 @@ pub async fn chat_completion(
         message: format!("Codex responses: read body: {e}"),
         source: Some(e.into()),
     })?;
-    Ok(build_chat_response(&request.model, &collect_output_text(&raw)))
+    Ok(build_chat_response(
+        &request.model,
+        &collect_output_text(&raw),
+    ))
 }
 
 fn role_chunk(id: &str, model: &str, created: u64) -> ChatCompletionChunk {
-    chunk(id, model, created, Some("assistant".to_string()), None, None)
+    chunk(
+        id,
+        model,
+        created,
+        Some("assistant".to_string()),
+        None,
+        None,
+    )
 }
 
 fn content_chunk(id: &str, model: &str, created: u64, delta: &str) -> ChatCompletionChunk {

@@ -74,13 +74,7 @@ fn make_state(
 fn system_call_grants_declared_permission_without_user_grant() {
     let db = fresh_db();
     // Mirror the go2 addon: it DECLARES `sql.read` but no per-user grant exists.
-    let state = make_state(
-        db,
-        "robot-go2",
-        vec!["sql.read".to_string()],
-        None,
-        true,
-    );
+    let state = make_state(db, "robot-go2", vec!["sql.read".to_string()], None, true);
     assert!(
         check_permission(&state, "sql.read", None),
         "system call must grant a DECLARED permission via CR-006 (no user grant needed)"
@@ -91,13 +85,7 @@ fn system_call_grants_declared_permission_without_user_grant() {
 fn system_call_does_not_grant_undeclared_permission() {
     let db = fresh_db();
     // Addon declares only `sql.read`; a system call must NOT reach `sql.write`.
-    let state = make_state(
-        db,
-        "robot-go2",
-        vec!["sql.read".to_string()],
-        None,
-        true,
-    );
+    let state = make_state(db, "robot-go2", vec!["sql.read".to_string()], None, true);
     assert!(
         !check_permission(&state, "sql.write", None),
         "system call must NOT grant a permission the addon never declared"
@@ -128,13 +116,7 @@ fn user_id_none_without_system_flag_is_rejected() {
     let db = fresh_db();
     // Defense-in-depth: missing principal alone must NOT grant — only the
     // explicit `is_system_call = true` flag opens the CR-006 path.
-    let state = make_state(
-        db,
-        "robot-go2",
-        vec!["sql.read".to_string()],
-        None,
-        false,
-    );
+    let state = make_state(db, "robot-go2", vec!["sql.read".to_string()], None, false);
     assert!(
         !check_permission(&state, "sql.read", None),
         "user_id=None without is_system_call must NOT grant (CR-006 invariant)"

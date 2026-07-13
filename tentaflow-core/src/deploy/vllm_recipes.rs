@@ -142,7 +142,11 @@ fn parse_raw_recipe(v: &serde_json::Value) -> RecipeEntry {
     let argv: Vec<String> = rc
         .and_then(|r| r.get("argv"))
         .and_then(|a| a.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let base_env: HashMap<String, String> = rc
         .and_then(|r| r.get("env"))
@@ -153,7 +157,11 @@ fn parse_raw_recipe(v: &serde_json::Value) -> RecipeEntry {
         .and_then(|h| serde_json::from_value(h.clone()).ok())
         .unwrap_or_default();
     RecipeEntry {
-        hf_id: v.get("hf_id").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+        hf_id: v
+            .get("hf_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
         base_argv: strip_serve_prefix(argv),
         base_env,
         hardware_overrides,
@@ -278,9 +286,17 @@ mod tests {
             variant_env: HashMap::new(),
         };
         let (argv, env) = build_args(&entry, Some("blackwell"), 4, 1);
-        assert!(!argv.iter().any(|a| a == "--chat-template"), "repo template dropped");
-        assert!(argv.windows(2).any(|w| w[0] == "--tensor-parallel-size" && w[1] == "4"));
+        assert!(
+            !argv.iter().any(|a| a == "--chat-template"),
+            "repo template dropped"
+        );
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "--tensor-parallel-size" && w[1] == "4"));
         assert!(argv.iter().any(|a| a == "--tool-call-parser"));
-        assert_eq!(env.get("VLLM_USE_FLASHINFER_MOE_FP4").map(String::as_str), Some("1"));
+        assert_eq!(
+            env.get("VLLM_USE_FLASHINFER_MOE_FP4").map(String::as_str),
+            Some("1")
+        );
     }
 }

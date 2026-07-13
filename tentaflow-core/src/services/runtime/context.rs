@@ -117,11 +117,7 @@ impl ExecutionContext {
     /// `service_call.rs` z `req.caller`, żeby executor mógł ją przepisać do
     /// `FlowRequestMeta` dla flow-targetu. Builder (zwraca `self`) — zwięzłe
     /// wpięcie tuż po `ExecutionContext::new(None)`.
-    pub fn with_addon_identity(
-        mut self,
-        addon_id: Option<String>,
-        org_id: Option<String>,
-    ) -> Self {
+    pub fn with_addon_identity(mut self, addon_id: Option<String>, org_id: Option<String>) -> Self {
         self.addon_id = addon_id;
         self.org_id = org_id;
         self

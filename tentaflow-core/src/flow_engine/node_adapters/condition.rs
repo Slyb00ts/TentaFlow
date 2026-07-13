@@ -400,7 +400,9 @@ mod tests {
             .execute(&node, &inputs, &stub_ctx())
             .await
             .unwrap();
-        let active = ConditionNodeAdapter.active_output_ports(&node, &out).unwrap();
+        let active = ConditionNodeAdapter
+            .active_output_ports(&node, &out)
+            .unwrap();
         assert_eq!(active, HashSet::from(["true".to_string()]));
     }
 
@@ -413,7 +415,9 @@ mod tests {
             .execute(&node, &inputs, &stub_ctx())
             .await
             .unwrap();
-        let active = ConditionNodeAdapter.active_output_ports(&node, &out).unwrap();
+        let active = ConditionNodeAdapter
+            .active_output_ports(&node, &out)
+            .unwrap();
         assert_eq!(active, HashSet::from(["false".to_string()]));
     }
 
@@ -446,7 +450,9 @@ mod tests {
                 .and_then(|v| v.as_bool()),
             Some(true)
         );
-        let active = ConditionNodeAdapter.active_output_ports(&node, &out).unwrap();
+        let active = ConditionNodeAdapter
+            .active_output_ports(&node, &out)
+            .unwrap();
         assert_eq!(active, HashSet::from(["true".to_string()]));
     }
 
@@ -461,7 +467,9 @@ mod tests {
             .execute(&node, &inputs, &stub_ctx())
             .await
             .unwrap();
-        let active = ConditionNodeAdapter.active_output_ports(&node, &out).unwrap();
+        let active = ConditionNodeAdapter
+            .active_output_ports(&node, &out)
+            .unwrap();
         assert_eq!(active, HashSet::from(["false".to_string()]));
     }
 

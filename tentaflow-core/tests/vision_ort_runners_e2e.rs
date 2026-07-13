@@ -24,7 +24,9 @@ use tentaflow_core::vision::ocr_plate::PlateOcr;
 /// Home dir whose `models/vision/` holds the provisioned ONNX models, or `None`
 /// when the gate env var is unset (test then no-ops even under `--ignored`).
 fn gate_home() -> Option<String> {
-    std::env::var("TENTAFLOW_VISION_ORT_TEST").ok().filter(|v| !v.is_empty())
+    std::env::var("TENTAFLOW_VISION_ORT_TEST")
+        .ok()
+        .filter(|v| !v.is_empty())
 }
 
 /// A synthetic mid-gray RGB24 crop of `w*h` — a fixed, GPU-independent input so
@@ -44,8 +46,14 @@ fn ort_state_classifier_loads_and_classifies() {
 
     let clf = StateClassifier::load().expect("load ort state classifier");
     // Pool + forward on a single crop → exactly one label from the 4-class set.
-    let stan = clf.classify(&gray_crop(96, 96), 96, 96).expect("classify crop");
-    assert_eq!(stan.len(), 1, "single-label classifier returns exactly one tag");
+    let stan = clf
+        .classify(&gray_crop(96, 96), 96, 96)
+        .expect("classify crop");
+    assert_eq!(
+        stan.len(),
+        1,
+        "single-label classifier returns exactly one tag"
+    );
     let allowed = ["czysta", "brudna", "uszkodzona", "nieczytelna"];
     assert!(
         allowed.contains(&stan[0].as_str()),
@@ -54,7 +62,9 @@ fn ort_state_classifier_loads_and_classifies() {
     );
 
     // Second call proves the pooled session is reusable (no move-out / poison).
-    let again = clf.classify(&gray_crop(64, 32), 64, 32).expect("classify again");
+    let again = clf
+        .classify(&gray_crop(64, 32), 64, 32)
+        .expect("classify again");
     assert_eq!(again.len(), 1);
 }
 
@@ -71,8 +81,15 @@ fn ort_plate_ocr_loads_and_reads() {
     // A blank crop is unlikely to be a valid PL plate; the contract is that the
     // forward + decode + PL validation run without panicking and yield Ok — the
     // synthetic input legitimately validates to `None`.
-    let plate = ocr.read(&gray_crop(140, 70), 140, 70).expect("plate read runs");
-    assert!(plate.is_none(), "blank crop must not validate as a plate: {plate:?}");
+    let plate = ocr
+        .read(&gray_crop(140, 70), 140, 70)
+        .expect("plate read runs");
+    assert!(
+        plate.is_none(),
+        "blank crop must not validate as a plate: {plate:?}"
+    );
     // Re-run proves the pooled session is reusable across reads.
-    let _ = ocr.read(&gray_crop(200, 60), 200, 60).expect("second plate read runs");
+    let _ = ocr
+        .read(&gray_crop(200, 60), 200, 60)
+        .expect("second plate read runs");
 }

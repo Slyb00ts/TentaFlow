@@ -11,11 +11,11 @@
 // przechodzą przez ten runner — rejestr obsługuje wyłącznie modele dynamiczne.
 //
 // Sesje ort są cache'owane per `model_name` z limitem LRU
-// (`TENTAFLOW_ONNX_CV_MAX_SESSIONS`, domyślnie 4); sha256 pliku jest
+// (`[vision] onnx_cv_max_models`, domyślnie 4); sha256 pliku jest
 // weryfikowane przy pierwszym załadowaniu (mismatch = odmowa). Każdy model ma
 // własny podkatalog engine-cache TensorRT (`trt-cache/<model_name>/`), żeby
 // plany silników różnych grafów się nie mieszały. Wpis modelu trzyma PULĘ N
-// niezależnych sesji (`TENTAFLOW_ONNX_CV_SESSIONS_PER_MODEL`, domyślnie 1)
+// niezależnych sesji (`[vision] onnx_cv_sessions_per_model`, domyślnie 1)
 // wybieranych round-robin — `Session::run` wymaga `&mut self`, więc dopiero
 // kilka sesji tego samego grafu pozwala na równoległe forwardy na GPU.
 
@@ -34,28 +34,23 @@ use crate::services::runtime::local_cv::CvFrameLocal;
 use crate::vision::ort_common::SessionPool;
 use tentaflow_protocol::{CameraCvResult, CvDetection};
 
-/// Env var capping the number of resident ort model entries (LRU eviction).
-/// Each entry now owns a whole [`SessionPool`], so the resident VRAM ceiling is
-/// `MAX_SESSIONS * SESSIONS_PER_MODEL` model copies, not `MAX_SESSIONS`.
-const MAX_SESSIONS_ENV: &str = "TENTAFLOW_ONNX_CV_MAX_SESSIONS";
-const DEFAULT_MAX_SESSIONS: usize = 4;
+// The resident-model LRU cap comes from `[vision] onnx_cv_max_models` (each
+// entry owns a whole [`SessionPool`], so the resident VRAM ceiling is
+// `max_models * sessions_per_model` model copies). How many independent ort
+// sessions each resident model keeps comes from
+// `[vision] onnx_cv_sessions_per_model`: `ort::Session::run` takes `&mut self`,
+// so one shared session serializes every forward of that model; N sessions
+// (each its own `&mut`, same ONNX graph) checked out round-robin let N forwards
+// run concurrently on the GPU. Default 1 is byte-identical to the historical
+// single-`Mutex<Session>` behavior.
 
-/// Env var setting how many independent ort sessions each resident model keeps.
-/// `ort::Session::run` takes `&mut self`, so one shared session serializes every
-/// forward of that model; N sessions (each its own `&mut`, same ONNX graph)
-/// checked out round-robin let N forwards run concurrently on the GPU. Default 1
-/// is byte-identical to the historical single-`Mutex<Session>` behavior.
-const SESSIONS_PER_MODEL_ENV: &str = "TENTAFLOW_ONNX_CV_SESSIONS_PER_MODEL";
-const DEFAULT_SESSIONS_PER_MODEL: usize = 1;
-
-/// Parsed-once pool size from [`SESSIONS_PER_MODEL_ENV`], clamped to
+/// Parsed-once pool size from `[vision] onnx_cv_sessions_per_model`, clamped to
 /// `1..=ort_common::MAX_SESSIONS_PER_MODEL`.
 fn sessions_per_model() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
-        crate::vision::ort_common::pool_size_from_env(
-            SESSIONS_PER_MODEL_ENV,
-            DEFAULT_SESSIONS_PER_MODEL,
+        crate::vision::ort_common::pool_size(
+            crate::vision::settings::get().onnx_cv_sessions_per_model,
         )
     })
 }
@@ -95,7 +90,10 @@ impl PreprocessSpec {
             );
         }
         if !spec.layout.eq_ignore_ascii_case("nchw") {
-            bail!("unsupported preprocess layout '{}' (only nchw)", spec.layout);
+            bail!(
+                "unsupported preprocess layout '{}' (only nchw)",
+                spec.layout
+            );
         }
         if spec.std.iter().any(|v| *v <= 0.0) {
             bail!("preprocess std must be positive");
@@ -165,11 +163,7 @@ struct SessionCache {
 fn cache() -> &'static Mutex<SessionCache> {
     static CACHE: OnceLock<Mutex<SessionCache>> = OnceLock::new();
     CACHE.get_or_init(|| {
-        let cap = std::env::var(MAX_SESSIONS_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|v| *v >= 1)
-            .unwrap_or(DEFAULT_MAX_SESSIONS);
+        let cap = crate::vision::settings::get().onnx_cv_max_models.max(1);
         Mutex::new(SessionCache {
             models: HashMap::new(),
             lru: LruIndex::new(cap),
@@ -255,8 +249,8 @@ fn get_or_load(row: &VisionModelRow) -> Result<Arc<CachedModel>> {
         .with_context(|| format!("vision model '{}'", row.model_name))?;
 
     let model_path = paths::vision_models_dir().join(&row.file_name);
-    let bytes = std::fs::read(&model_path)
-        .with_context(|| format!("read {}", model_path.display()))?;
+    let bytes =
+        std::fs::read(&model_path).with_context(|| format!("read {}", model_path.display()))?;
     let actual = sha256_hex(&bytes);
     if !actual.eq_ignore_ascii_case(&row.sha256) {
         bail!(
@@ -314,14 +308,18 @@ fn get_or_load(row: &VisionModelRow) -> Result<Arc<CachedModel>> {
     let mut sessions = Vec::with_capacity(n_sessions);
     for i in 0..n_sessions {
         let device_id = gpus[i % gpus.len()];
-        let session_cache =
-            trt_cache_root.join(crate::vision::ort_common::session_cache_subdir(device_id, i));
+        let session_cache = trt_cache_root.join(crate::vision::ort_common::session_cache_subdir(
+            device_id, i,
+        ));
         sessions.push(
             crate::vision::ort_common::build_ort_session_from_memory(
                 &bytes,
                 &session_cache,
                 trt_profile.as_ref(),
                 device_id,
+                // Dynamic CV models (incl. OCR/classifier heads like nalepka-stan):
+                // FP32 by default so fp16 rounding can't corrupt reads. See `ocr_fp16`.
+                crate::vision::ort_common::ocr_fp16(),
             )
             .map_err(|e| anyhow!("onnx-cv session slot {i} on GPU device {device_id}: {e:#}"))?,
         );
@@ -500,7 +498,14 @@ fn classify_blocking(model: &CachedModel, crop: &CvFrameLocal) -> Result<(String
     let num_classes = model.classes.len();
 
     let mut data = vec![0f32; 3 * res * res];
-    fill_frame_spec(&mut data, 0, &crop.data, crop.width, crop.height, &model.pre)?;
+    fill_frame_spec(
+        &mut data,
+        0,
+        &crop.data,
+        crop.width,
+        crop.height,
+        &model.pre,
+    )?;
     let input = ndarray::Array4::from_shape_vec((1, 3, res, res), data)
         .map_err(|e| anyhow!("onnx-cv: build tensor [1,3,{res},{res}]: {e}"))?;
 
@@ -643,9 +648,7 @@ mod tests {
         assert_eq!(spec.std, imagenet_std());
         assert!(PreprocessSpec::parse(r#"{"resolution":0}"#).is_err());
         assert!(PreprocessSpec::parse(r#"{"resolution":224,"layout":"nhwc"}"#).is_err());
-        assert!(
-            PreprocessSpec::parse(r#"{"resolution":224,"std":[0.0,0.2,0.2]}"#).is_err()
-        );
+        assert!(PreprocessSpec::parse(r#"{"resolution":224,"std":[0.0,0.2,0.2]}"#).is_err());
     }
 
     #[test]

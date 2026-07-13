@@ -740,7 +740,10 @@ pub fn validate_manifest_extensions(
 /// `validate_manifest_extensions`, żeby nie łamać jej stabilnej sygnatury (i
 /// testów). Wołane z `lifecycle::parse_manifest_toml` obok tamtej walidacji.
 pub fn validate_graph_collections(collections: &[GraphCollectionSpec]) -> Result<()> {
-    check_unique_ids("graph_collection", collections.iter().map(|c| c.name.as_str()))?;
+    check_unique_ids(
+        "graph_collection",
+        collections.iter().map(|c| c.name.as_str()),
+    )?;
     for col in collections {
         if !VECTOR_DATA_CLASSES.contains(&col.data_class.as_str()) {
             bail!(

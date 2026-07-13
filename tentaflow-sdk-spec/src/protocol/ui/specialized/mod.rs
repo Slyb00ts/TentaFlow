@@ -33,15 +33,16 @@ mod tests {
     use crate::protocol::ui::inline::{AspectRatio, DimensionToken, StepDef};
     use crate::protocol::ui::tokens::{
         AudioCaptureMode, AudioCaptureVariant, AudioControls, AudioVariant, CarouselGestures,
-        CodeEditorTheme, Density,
-        FpsVariant,
-        IFrameReferrerPolicy, IFrameSandbox, ImageFit, LogLevel, LogVariant, PdfZoomMode, Spacing,
-        StepProgressVariant, StopwatchVariant, TerminalTheme, TileProvider, Tone, VideoControls,
+        CodeEditorTheme, Density, FpsVariant, IFrameReferrerPolicy, IFrameSandbox, ImageFit,
+        LogLevel, LogVariant, PdfZoomMode, Spacing, StepProgressVariant, StopwatchVariant,
+        TerminalTheme, TileProvider, Tone, VideoControls,
     };
     use crate::protocol::value::Value;
 
     fn p(s: &str) -> StatePath {
-        StatePath { segments: vec![PathSegment::Key(s.into())] }
+        StatePath {
+            segments: vec![PathSegment::Key(s.into())],
+        }
     }
     fn lit(s: &str) -> BindRef {
         BindRef::Literal(Value::Text(s.into()))
@@ -59,25 +60,38 @@ mod tests {
     #[test]
     fn video_stream_roundtrip() {
         let v = VideoStream {
-            stream_id: lit("cam-1"), width_px: Some(1280),
+            stream_id: lit("cam-1"),
+            width_px: Some(1280),
             aspect_ratio: AspectRatio::R16To9,
             controls: VideoControls::Full,
-            autoplay: false, muted: true, object_fit: ImageFit::Contain,
+            autoplay: false,
+            muted: true,
+            object_fit: ImageFit::Contain,
             poster_ref: Some("poster123".into()),
         };
-        rt(v, |m| m.into_component("vs").unwrap(), VideoStream::try_from_component);
+        rt(
+            v,
+            |m| m.into_component("vs").unwrap(),
+            VideoStream::try_from_component,
+        );
     }
 
     #[test]
     fn live_camera_tile_roundtrip() {
         let v = LiveCameraTile {
-            stream_id: lit("cam-2"), camera_label: lit("Front door"),
+            stream_id: lit("cam-2"),
+            camera_label: lit("Front door"),
             status: lit("online"),
             fps: Some(BindRef::Literal(Value::F64(30.0))),
-            show_overlay: true, show_fullscreen_button: true,
+            show_overlay: true,
+            show_fullscreen_button: true,
             aspect_ratio: AspectRatio::R4To3,
         };
-        rt(v, |m| m.into_component("lct").unwrap(), LiveCameraTile::try_from_component);
+        rt(
+            v,
+            |m| m.into_component("lct").unwrap(),
+            LiveCameraTile::try_from_component,
+        );
     }
 
     #[test]
@@ -85,9 +99,15 @@ mod tests {
         let v = Audio {
             src_ref: lit("audio123"),
             controls: AudioControls::Full,
-            autoplay: false, r#loop: true, variant: AudioVariant::Waveform,
+            autoplay: false,
+            r#loop: true,
+            variant: AudioVariant::Waveform,
         };
-        rt(v, |m| m.into_component("au").unwrap(), Audio::try_from_component);
+        rt(
+            v,
+            |m| m.into_component("au").unwrap(),
+            Audio::try_from_component,
+        );
     }
 
     #[test]
@@ -103,7 +123,11 @@ mod tests {
             active_path: Some(p("dictation.active")),
             variant: Some(AudioCaptureVariant::Docked),
         };
-        rt(v, |m| m.into_component("ac").unwrap(), AudioCapture::try_from_component);
+        rt(
+            v,
+            |m| m.into_component("ac").unwrap(),
+            AudioCapture::try_from_component,
+        );
     }
 
     #[test]
@@ -120,47 +144,74 @@ mod tests {
             active_path: None,
             variant: None,
         };
-        rt(v, |m| m.into_component("ac2").unwrap(), AudioCapture::try_from_component);
+        rt(
+            v,
+            |m| m.into_component("ac2").unwrap(),
+            AudioCapture::try_from_component,
+        );
     }
 
     #[test]
     fn map_view_roundtrip() {
         let v = MapView {
-            center_path: p("center"), zoom_path: p("zoom"),
+            center_path: p("center"),
+            zoom_path: p("zoom"),
             tile_provider: TileProvider::Osm,
             tile_server_url: None,
             height: DimensionToken::Px { value: 400 },
             markers_path: p("markers"),
-            polygons_path: None, heatmap_path: None,
-            interactive: true, show_attribution: true,
+            polygons_path: None,
+            heatmap_path: None,
+            interactive: true,
+            show_attribution: true,
         };
-        rt(v, |m| m.into_component("mv").unwrap(), MapView::try_from_component);
+        rt(
+            v,
+            |m| m.into_component("mv").unwrap(),
+            MapView::try_from_component,
+        );
     }
 
     #[test]
     fn code_editor_roundtrip() {
         let v = CodeEditor {
-            bind_path: p("source"), language: "rust".into(),
-            read_only: false, line_numbers: true, word_wrap: false,
+            bind_path: p("source"),
+            language: "rust".into(),
+            read_only: false,
+            line_numbers: true,
+            word_wrap: false,
             theme: CodeEditorTheme::Dark,
-            min_height_px: 200, max_height_px: Some(800),
-            tab_size: 4, indent_with_tabs: false,
-            bracket_matching: true, autocomplete: true,
+            min_height_px: 200,
+            max_height_px: Some(800),
+            tab_size: 4,
+            indent_with_tabs: false,
+            bracket_matching: true,
+            autocomplete: true,
             linting_action_id: Some("lintRust".into()),
         };
-        rt(v, |m| m.into_component("ce").unwrap(), CodeEditor::try_from_component);
+        rt(
+            v,
+            |m| m.into_component("ce").unwrap(),
+            CodeEditor::try_from_component,
+        );
     }
 
     #[test]
     fn terminal_roundtrip() {
         let v = Terminal {
             stream_id: lit("log-stream"),
-            rows: 24, cols: 80,
+            rows: 24,
+            cols: 80,
             theme: TerminalTheme::HighContrast,
-            searchable: true, copyable: true,
+            searchable: true,
+            copyable: true,
             max_buffer_lines: 5_000,
         };
-        rt(v, |m| m.into_component("tm").unwrap(), Terminal::try_from_component);
+        rt(
+            v,
+            |m| m.into_component("tm").unwrap(),
+            Terminal::try_from_component,
+        );
     }
 
     #[test]
@@ -170,7 +221,11 @@ mod tests {
             variant: FpsVariant::Detailed,
             history_secs: 30,
         };
-        rt(v, |m| m.into_component("fc").unwrap(), FpsCounter::try_from_component);
+        rt(
+            v,
+            |m| m.into_component("fc").unwrap(),
+            FpsCounter::try_from_component,
+        );
     }
 
     #[test]
@@ -180,28 +235,47 @@ mod tests {
             variant: StopwatchVariant::Full,
             tone: Tone::Primary,
         };
-        rt(v, |m| m.into_component("sw").unwrap(), Stopwatch::try_from_component);
+        rt(
+            v,
+            |m| m.into_component("sw").unwrap(),
+            Stopwatch::try_from_component,
+        );
     }
 
     #[test]
     fn image_gallery_roundtrip() {
         let v = ImageGallery {
-            images_path: p("images"), columns: 3,
-            aspect_ratio: AspectRatio::R1To1, gap: Spacing::Md,
-            lightbox: true, lazy_load: true,
+            images_path: p("images"),
+            columns: 3,
+            aspect_ratio: AspectRatio::R1To1,
+            gap: Spacing::Md,
+            lightbox: true,
+            lazy_load: true,
         };
-        rt(v, |m| m.into_component("ig").unwrap(), ImageGallery::try_from_component);
+        rt(
+            v,
+            |m| m.into_component("ig").unwrap(),
+            ImageGallery::try_from_component,
+        );
     }
 
     #[test]
     fn carousel_roundtrip() {
         let v = Carousel {
-            items_path: p("items"), current_index_path: p("idx"),
-            autoplay: true, autoplay_ms: 3000, r#loop: true,
-            show_indicators: true, show_arrows: true,
+            items_path: p("items"),
+            current_index_path: p("idx"),
+            autoplay: true,
+            autoplay_ms: 3000,
+            r#loop: true,
+            show_indicators: true,
+            show_arrows: true,
             gestures: CarouselGestures::Swipe,
         };
-        rt(v, |m| m.into_component("car").unwrap(), Carousel::try_from_component);
+        rt(
+            v,
+            |m| m.into_component("car").unwrap(),
+            Carousel::try_from_component,
+        );
     }
 
     #[test]
@@ -210,23 +284,35 @@ mod tests {
             src_ref: "ref123".into(),
             page_path: Some(p("page")),
             height: DimensionToken::Vh { value: 80 },
-            zoom_mode: PdfZoomMode::FitWidth, searchable: true,
+            zoom_mode: PdfZoomMode::FitWidth,
+            searchable: true,
         };
-        rt(v, |m| m.into_component("pdf").unwrap(), PdfViewer::try_from_component);
+        rt(
+            v,
+            |m| m.into_component("pdf").unwrap(),
+            PdfViewer::try_from_component,
+        );
     }
 
     #[test]
     fn step_progress_roundtrip() {
         let v = StepProgress {
             steps: vec![StepDef {
-                id: "s1".into(), label: lit("Step 1"),
-                optional: false, status: None, description: None,
+                id: "s1".into(),
+                label: lit("Step 1"),
+                optional: false,
+                status: None,
+                description: None,
             }],
             current_id_path: p("current"),
             variant: StepProgressVariant::Horizontal,
             clickable_completed: true,
         };
-        rt(v, |m| m.into_component("sp").unwrap(), StepProgress::try_from_component);
+        rt(
+            v,
+            |m| m.into_component("sp").unwrap(),
+            StepProgress::try_from_component,
+        );
     }
 
     #[test]
@@ -239,7 +325,11 @@ mod tests {
             title: "Embedded chart".into(),
             referrer_policy: IFrameReferrerPolicy::NoReferrer,
         };
-        rt(v, |m| m.into_component("if").unwrap(), IFrame::try_from_component);
+        rt(
+            v,
+            |m| m.into_component("if").unwrap(),
+            IFrame::try_from_component,
+        );
     }
 
     #[test]
@@ -248,14 +338,21 @@ mod tests {
             events_path: p("events"),
             variant: LogVariant::Expanded,
             max_buffer_events: 5_000,
-            auto_scroll: true, searchable: true,
+            auto_scroll: true,
+            searchable: true,
             filter_levels: vec![LogLevel::Info, LogLevel::Warn, LogLevel::Error],
-            show_timestamps: true, show_source: false, copyable: true,
+            show_timestamps: true,
+            show_source: false,
+            copyable: true,
             height: DimensionToken::Full,
             max_height: Some(DimensionToken::Px { value: 600 }),
             density: Density::Compact,
         };
-        rt(v, |m| m.into_component("vl").unwrap(), VirtualizedLog::try_from_component);
+        rt(
+            v,
+            |m| m.into_component("vl").unwrap(),
+            VirtualizedLog::try_from_component,
+        );
     }
 
     #[test]
@@ -265,10 +362,14 @@ mod tests {
             events_path: p("ev"),
             variant: LogVariant::Default,
             max_buffer_events: 10_000,
-            auto_scroll: true, searchable: false,
+            auto_scroll: true,
+            searchable: false,
             filter_levels: vec![],
-            show_timestamps: true, show_source: false, copyable: false,
-            height: DimensionToken::Full, max_height: None,
+            show_timestamps: true,
+            show_source: false,
+            copyable: false,
+            height: DimensionToken::Full,
+            max_height: None,
             density: Density::Default,
         };
         let mut c = v.clone().into_component("vl").unwrap();
@@ -283,10 +384,14 @@ mod tests {
             events_path: p("ev"),
             variant: LogVariant::Default,
             max_buffer_events: 1000,
-            auto_scroll: true, searchable: false,
+            auto_scroll: true,
+            searchable: false,
             filter_levels: vec![],
-            show_timestamps: false, show_source: false, copyable: false,
-            height: DimensionToken::Full, max_height: None,
+            show_timestamps: false,
+            show_source: false,
+            copyable: false,
+            height: DimensionToken::Full,
+            max_height: None,
             density: Density::Default,
         };
         let mut c = v.clone().into_component("vl").unwrap();
@@ -297,8 +402,14 @@ mod tests {
     #[test]
     fn tag_mismatch_rejected() {
         let bogus = Component {
-            tag: 0x9999, id: "x".into(), fields: FieldMap::default(),
-            handlers: None, bind: None, a11y: None, visibility: None, test_id: None,
+            tag: 0x9999,
+            id: "x".into(),
+            fields: FieldMap::default(),
+            handlers: None,
+            bind: None,
+            a11y: None,
+            visibility: None,
+            test_id: None,
         };
         assert!(VideoStream::try_from_component(&bogus).is_err());
         assert!(MapView::try_from_component(&bogus).is_err());

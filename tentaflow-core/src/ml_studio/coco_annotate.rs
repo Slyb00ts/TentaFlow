@@ -42,8 +42,15 @@ pub fn list_images(dir: &Path) -> anyhow::Result<(String, String)> {
     let mut splits: Vec<String> = Vec::new();
     for e in std::fs::read_dir(dir)? {
         let p = e?.path();
-        if p.is_dir() && annot_path(dir, p.file_name().and_then(|n| n.to_str()).unwrap_or("")).is_file() {
-            splits.push(p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string());
+        if p.is_dir()
+            && annot_path(dir, p.file_name().and_then(|n| n.to_str()).unwrap_or("")).is_file()
+        {
+            splits.push(
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
         }
     }
     splits.sort();
@@ -54,10 +61,15 @@ pub fn list_images(dir: &Path) -> anyhow::Result<(String, String)> {
             if let Some(cats) = coco.get("categories").and_then(|c| c.as_array()) {
                 let mut cs: Vec<(i64, String)> = cats
                     .iter()
-                    .filter_map(|c| Some((c.get("id")?.as_i64()?, c.get("name")?.as_str()?.to_string())))
+                    .filter_map(|c| {
+                        Some((c.get("id")?.as_i64()?, c.get("name")?.as_str()?.to_string()))
+                    })
                     .collect();
                 cs.sort_by_key(|(id, _)| *id);
-                categories = cs.into_iter().map(|(id, name)| json!({"id": id, "name": name})).collect();
+                categories = cs
+                    .into_iter()
+                    .map(|(id, name)| json!({"id": id, "name": name}))
+                    .collect();
             }
         }
         // ann_count per image_id.
@@ -92,10 +104,7 @@ pub fn list_images(dir: &Path) -> anyhow::Result<(String, String)> {
 
 /// Pojedynczy obraz (przeskalowany do wyświetlenia, JPEG base64) + jego bboxy w
 /// oryginalnych współrzędnych. Zwraca (image_b64, mime, orig_w, orig_h, anns_json).
-pub fn get_image(
-    dir: &Path,
-    image_id: &str,
-) -> anyhow::Result<(String, String, u32, u32, String)> {
+pub fn get_image(dir: &Path, image_id: &str) -> anyhow::Result<(String, String, u32, u32, String)> {
     let (split, coco_id) = split_image_id(image_id)?;
     let buf = std::fs::read(annot_path(dir, &split))?;
     let coco: Value = serde_json::from_slice(&buf)?;
@@ -119,14 +128,21 @@ pub fn get_image(
     );
     // Downscale do MAX_DISPLAY_DIM (zachowując proporcje) — tylko gdy za duży.
     let scaled = if ow.max(oh) > MAX_DISPLAY_DIM {
-        dyn_img.resize(MAX_DISPLAY_DIM, MAX_DISPLAY_DIM, image::imageops::FilterType::Triangle)
+        dyn_img.resize(
+            MAX_DISPLAY_DIM,
+            MAX_DISPLAY_DIM,
+            image::imageops::FilterType::Triangle,
+        )
     } else {
         dyn_img
     };
     let mut jpeg: Vec<u8> = Vec::new();
     scaled
         .to_rgb8()
-        .write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
+        .write_to(
+            &mut std::io::Cursor::new(&mut jpeg),
+            image::ImageFormat::Jpeg,
+        )
         .map_err(|e| anyhow::anyhow!("kodowanie JPEG: {}", e))?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
 
@@ -203,7 +219,11 @@ pub fn save_annotations(
         + 1;
     for a in &new_anns {
         let cat = a.get("category_id").and_then(|v| v.as_i64()).unwrap_or(0);
-        let bbox = a.get("bbox").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let bbox = a
+            .get("bbox")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
         let w = bbox.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
         let h = bbox.get(3).and_then(|v| v.as_f64()).unwrap_or(0.0);
         let mut ann = json!({

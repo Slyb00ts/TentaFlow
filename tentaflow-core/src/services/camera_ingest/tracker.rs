@@ -385,7 +385,10 @@ mod tests {
             score: 0.9,
             stan: Vec::new(),
             tekst: None,
+            tekst_conf: None,
+            tekst_thumb_ref: None,
             track_id: 0,
+            vehicle_id: 0,
             vx: 0.,
             vy: 0.,
         }
@@ -472,8 +475,15 @@ mod tests {
         // obiekt i bootstrapuje prędkość vx = 0.30 / 0.1 = 3.0.
         let mut f2 = vec![det([0.30, 0.40, 0.10, 0.10])];
         update(cam, &mut f2, Some(100_000_000));
-        assert_eq!(f2[0].track_id, id1, "asocjacja po odleglosci powinna trzymac id");
-        assert!(f2[0].vx > 0.0, "prędkość powinna byc zbootstrapowana, vx={}", f2[0].vx);
+        assert_eq!(
+            f2[0].track_id, id1,
+            "asocjacja po odleglosci powinna trzymac id"
+        );
+        assert!(
+            f2[0].vx > 0.0,
+            "prędkość powinna byc zbootstrapowana, vx={}",
+            f2[0].vx
+        );
 
         // Klatka 3 (+0.1 s): kolejny skok o +0.30. Teraz predykcja przesuwa box
         // tracku o vx*dt ≈ 0.30 — srodek przewidziany pokrywa sie z detekcja, wiec
@@ -484,7 +494,11 @@ mod tests {
             f3[0].track_id, id1,
             "predykcja powinna utrzymac id na szybkim ruchu"
         );
-        assert!(f3[0].vx > 0.0, "vx powinna pozostac dodatnia, vx={}", f3[0].vx);
+        assert!(
+            f3[0].vx > 0.0,
+            "vx powinna pozostac dodatnia, vx={}",
+            f3[0].vx
+        );
     }
 
     #[test]
@@ -527,7 +541,11 @@ mod tests {
         assert!(ids.iter().all(|&id| id > 0));
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), 3, "track_id nie moze sie powtorzyc miedzy etapami");
+        assert_eq!(
+            ids.len(),
+            3,
+            "track_id nie moze sie powtorzyc miedzy etapami"
+        );
         // `remove(camera)` sprzata trackery etapow ORAZ licznik kamery.
         remove(cam);
         let mut c = vec![det([0.10, 0.10, 0.20, 0.20])];

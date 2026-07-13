@@ -97,7 +97,9 @@ pub fn create_engine() -> Result<WasmEngine> {
         warn!("nie udalo sie wystartowac epoch tickera: {e} — timeouty WASM nieaktywne");
     }
 
-    info!("Silnik Wasmtime utworzony (fuel metering + epoch interruption, ticker {EPOCH_TICK_MS}ms)");
+    info!(
+        "Silnik Wasmtime utworzony (fuel metering + epoch interruption, ticker {EPOCH_TICK_MS}ms)"
+    );
 
     Ok(engine)
 }

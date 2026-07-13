@@ -96,7 +96,11 @@ pub async fn vision_import_fetch_manifest(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string(),
-            op: m.get("op").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            op: m
+                .get("op")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
             file_name: m
                 .get("file_name")
                 .and_then(|v| v.as_str())
@@ -129,7 +133,11 @@ pub async fn vision_import_model(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::VisionImportBody(VisionImportPayload::ImportRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected VisionImportModelRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected VisionImportModelRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
 

@@ -63,7 +63,11 @@ impl NodeAdapter for VisionClassifyNodeAdapter {
 
         let (blob_ref, dims) = match &envelope.payload {
             FlowValue::Image { blob_ref, dims, .. } => (blob_ref.clone(), *dims),
-            _ => return Err(anyhow!("vision_classify: expected Image payload (raw RGB24)")),
+            _ => {
+                return Err(anyhow!(
+                    "vision_classify: expected Image payload (raw RGB24)"
+                ))
+            }
         };
         let (w, h) = dims.ok_or_else(|| anyhow!("vision_classify: image has no dims"))?;
         let rgb = ctx.blobs.get(&blob_ref).await?;

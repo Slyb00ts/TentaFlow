@@ -46,7 +46,11 @@ pub const META_GRAPH_ENABLED: &str = "graph_enabled";
 /// jawne `graph_enabled=false` => pomin graf; brak klucza => legacy ON. JEDNO
 /// zrodlo prawdy dla `rag_graph_seed`/`rag_graph_facts`.
 fn graph_enabled_in_meta(envelope: &FlowEnvelope) -> bool {
-    match envelope.meta.get(META_GRAPH_ENABLED).and_then(|v| v.as_bool()) {
+    match envelope
+        .meta
+        .get(META_GRAPH_ENABLED)
+        .and_then(|v| v.as_bool())
+    {
         Some(enabled) => enabled,
         None => true,
     }
@@ -131,7 +135,10 @@ const STOPWORDS: &[&str] = &[
 /// collapse bialych znakow + lowercase. Dzieki temu seed pasuje 1:1 do `node_id`
 /// w grafie (id wezla = znormalizowana nazwa encji).
 fn normalize_phrase(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Czy znormalizowany token jest sensownym kandydatem na encje (nie stopword,
@@ -238,7 +245,10 @@ pub fn identify_query_entities(query: &str) -> Vec<(String, f64)> {
 /// jak seed) staje sie `canonical`. Gdy dwa seedy zmapuja na ten sam canonical, scalamy je biorac
 /// WIEKSZA wage (najsilniejszy sygnal personalizacji PPR). Czysta funkcja — testowalna bez hosta.
 /// Mapa to TYLKO ulatwienie retrievalu; brak/zly ksztalt => seedy bez zmian (degradacja).
-fn rewrite_seeds_with_aliases(seeds: Vec<(String, f64)>, aliases: Option<&Value>) -> Vec<(String, f64)> {
+fn rewrite_seeds_with_aliases(
+    seeds: Vec<(String, f64)>,
+    aliases: Option<&Value>,
+) -> Vec<(String, f64)> {
     use std::collections::HashMap;
     let map: HashMap<String, String> = aliases
         .and_then(|v| v.as_array())
@@ -803,7 +813,10 @@ mod tests {
         // 2-gram „ada lovelace" musi byc kandydatem (znormalizowany jak w grafie).
         assert!(ids.contains(&"ada lovelace"), "ids: {ids:?}");
         // Pojedyncze tokeny tez (unigramy).
-        assert!(ids.contains(&"ada") && ids.contains(&"lovelace"), "ids: {ids:?}");
+        assert!(
+            ids.contains(&"ada") && ids.contains(&"lovelace"),
+            "ids: {ids:?}"
+        );
     }
 
     #[test]
@@ -811,7 +824,11 @@ mod tests {
         let seeds = identify_query_entities("Albert Einstein");
         // 2-gram „albert einstein" ma wyzsza wage niz unigramy -> jest pierwszy.
         assert_eq!(seeds[0].0, "albert einstein");
-        assert!(seeds[0].1 > 1.0, "fraza wielowyrazowa ma wage > 1: {:?}", seeds[0]);
+        assert!(
+            seeds[0].1 > 1.0,
+            "fraza wielowyrazowa ma wage > 1: {:?}",
+            seeds[0]
+        );
     }
 
     #[test]
@@ -819,9 +836,18 @@ mod tests {
         let seeds = identify_query_entities("kto byl prezesem w IBM");
         let ids: Vec<&str> = seeds.iter().map(|(id, _)| id.as_str()).collect();
         // „kto", „byl", „w" to stopwordy / za krotkie — nie sa unigramami-seedami.
-        assert!(!ids.contains(&"kto"), "stopword 'kto' nie jest seedem: {ids:?}");
-        assert!(!ids.contains(&"byl"), "stopword 'byl' nie jest seedem: {ids:?}");
-        assert!(!ids.contains(&"w"), "za krotki 'w' nie jest seedem: {ids:?}");
+        assert!(
+            !ids.contains(&"kto"),
+            "stopword 'kto' nie jest seedem: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"byl"),
+            "stopword 'byl' nie jest seedem: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"w"),
+            "za krotki 'w' nie jest seedem: {ids:?}"
+        );
         // „ibm" (3 znaki, nie stopword) JEST seedem.
         assert!(ids.contains(&"ibm"), "'ibm' ma byc seedem: {ids:?}");
     }
@@ -871,7 +897,10 @@ mod tests {
         let aliases = json!([{ "alias": "einstein", "canonical": "albert einstein" }]);
         let out = rewrite_seeds_with_aliases(seeds, Some(&aliases));
         let ids: Vec<&str> = out.iter().map(|(id, _)| id.as_str()).collect();
-        assert!(ids.contains(&"albert einstein"), "alias przepisany na canonical: {ids:?}");
+        assert!(
+            ids.contains(&"albert einstein"),
+            "alias przepisany na canonical: {ids:?}"
+        );
         assert!(!ids.contains(&"einstein"), "alias zniknal: {ids:?}");
         assert!(ids.contains(&"physics"), "nie-alias bez zmian: {ids:?}");
     }
@@ -887,7 +916,10 @@ mod tests {
         let out = rewrite_seeds_with_aliases(seeds, Some(&aliases));
         assert_eq!(out.len(), 1, "duplikaty canonical scalone: {out:?}");
         assert_eq!(out[0].0, "united states");
-        assert_eq!(out[0].1, 3.0, "scalona waga = MAX (najsilniejszy sygnal PPR)");
+        assert_eq!(
+            out[0].1, 3.0,
+            "scalona waga = MAX (najsilniejszy sygnal PPR)"
+        );
     }
 
     #[test]
@@ -895,8 +927,14 @@ mod tests {
         let seeds = vec![("einstein".to_string(), 2.0)];
         // Brak mapy / pusta / zly ksztalt => seedy bez zmian (degradacja).
         assert_eq!(rewrite_seeds_with_aliases(seeds.clone(), None), seeds);
-        assert_eq!(rewrite_seeds_with_aliases(seeds.clone(), Some(&json!([]))), seeds);
-        assert_eq!(rewrite_seeds_with_aliases(seeds.clone(), Some(&json!("garbage"))), seeds);
+        assert_eq!(
+            rewrite_seeds_with_aliases(seeds.clone(), Some(&json!([]))),
+            seeds
+        );
+        assert_eq!(
+            rewrite_seeds_with_aliases(seeds.clone(), Some(&json!("garbage"))),
+            seeds
+        );
     }
 
     #[test]
@@ -910,14 +948,26 @@ mod tests {
         );
         let ctx = stub_ctx();
         let adapter = RagGraphSeedNodeAdapter::new();
-        let out = tokio_test_block(adapter.execute(&node("rag_graph_seed"), &[input(env)], &ctx)).unwrap();
-        let seeds = out.meta.get(META_GRAPH_SEEDS).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let out = tokio_test_block(adapter.execute(&node("rag_graph_seed"), &[input(env)], &ctx))
+            .unwrap();
+        let seeds = out
+            .meta
+            .get(META_GRAPH_SEEDS)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
         let ids: Vec<String> = seeds
             .iter()
             .filter_map(|s| s.get("id").and_then(|v| v.as_str()).map(str::to_string))
             .collect();
-        assert!(ids.iter().any(|i| i == "albert einstein"), "seed przepisany na canonical: {ids:?}");
-        assert!(!ids.iter().any(|i| i == "einstein"), "alias zniknal z seedow: {ids:?}");
+        assert!(
+            ids.iter().any(|i| i == "albert einstein"),
+            "seed przepisany na canonical: {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|i| i == "einstein"),
+            "alias zniknal z seedow: {ids:?}"
+        );
     }
 
     /// Mini-runtime do odpalenia jednego async execute w tescie synchronicznym.
@@ -946,8 +996,14 @@ mod tests {
             },
         ];
         let text = format_graph_facts(&facts);
-        assert!(text.contains("einstein — pracowal_w → princeton"), "tekst: {text}");
-        assert!(text.contains("einstein — urodzil_sie_w → ulm"), "tekst: {text}");
+        assert!(
+            text.contains("einstein — pracowal_w → princeton"),
+            "tekst: {text}"
+        );
+        assert!(
+            text.contains("einstein — urodzil_sie_w → ulm"),
+            "tekst: {text}"
+        );
     }
 
     #[test]
@@ -966,7 +1022,10 @@ mod tests {
             .collect();
         let text = format_graph_facts(&facts);
         let lines = text.lines().count();
-        assert_eq!(lines, MAX_GRAPH_FACTS, "liczba faktow capnieta, bylo {lines} linii");
+        assert_eq!(
+            lines, MAX_GRAPH_FACTS,
+            "liczba faktow capnieta, bylo {lines} linii"
+        );
     }
 
     // --- fuse_context (fuzja pasaze + fakty) -------------------------------
@@ -978,8 +1037,14 @@ mod tests {
         let fused = fuse_context(vec_ctx, facts);
         // Oba zrodla obecne: pasaze (wektor) + sekcja faktow (graf).
         assert!(fused.contains("pasaz"), "pasaze zachowane: {fused}");
-        assert!(fused.contains("Fakty z grafu wiedzy:"), "naglowek faktow: {fused}");
-        assert!(fused.contains("einstein — pracowal_w → princeton"), "fakt: {fused}");
+        assert!(
+            fused.contains("Fakty z grafu wiedzy:"),
+            "naglowek faktow: {fused}"
+        );
+        assert!(
+            fused.contains("einstein — pracowal_w → princeton"),
+            "fakt: {fused}"
+        );
     }
 
     #[test]
@@ -1016,7 +1081,9 @@ mod tests {
             .collect();
         assert!(ids.contains(&"albert einstein"), "ids: {ids:?}");
         // Kazdy seed niesie wage (ksztalt GraphSeed).
-        assert!(seeds.iter().all(|s| s.get("weight").and_then(|w| w.as_f64()).is_some()));
+        assert!(seeds
+            .iter()
+            .all(|s| s.get("weight").and_then(|w| w.as_f64()).is_some()));
     }
 
     #[tokio::test]
@@ -1024,7 +1091,8 @@ mod tests {
         // Zapytanie bez encji (same stopwordy) -> pusta lista seedow w meta,
         // NIE blad. Hop grafowy zostanie pominiety (degradacja do wektora).
         let mut env = FlowEnvelope::empty();
-        env.meta.insert(META_CURRENT_QUERY.into(), json!("kto co czy"));
+        env.meta
+            .insert(META_CURRENT_QUERY.into(), json!("kto co czy"));
         let out = RagGraphSeedNodeAdapter::new()
             .execute(&node("rag_graph_seed"), &[input(env)], &stub_ctx())
             .await
@@ -1052,7 +1120,10 @@ mod tests {
             .unwrap();
         let ctx_text = out.payload.as_text().unwrap();
         assert_eq!(ctx_text, "Pytanie: Q\n\npasaze...\n", "kontekst bez zmian");
-        assert!(!ctx_text.contains("Fakty z grafu wiedzy"), "brak sekcji faktow");
+        assert!(
+            !ctx_text.contains("Fakty z grafu wiedzy"),
+            "brak sekcji faktow"
+        );
         // meta.rag_graph_facts ustawione na pusty string (spojny stan).
         assert_eq!(
             out.meta.get(META_GRAPH_FACTS).and_then(|v| v.as_str()),
@@ -1097,7 +1168,10 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out.meta.get(META_GRAPH_SEEDS).and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty()),
+            out.meta
+                .get(META_GRAPH_SEEDS)
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| !a.is_empty()),
             "brak flagi => graf ON => seedy wyliczone"
         );
     }
@@ -1110,7 +1184,10 @@ mod tests {
         let mut env = FlowEnvelope::empty();
         env.payload = FlowValue::Text("Pytanie: Q\n\npasaze...\n".into());
         // Nawet z obecnymi seedami adapter ma byc NO-OP przy OFF.
-        env.meta.insert(META_GRAPH_SEEDS.into(), json!([{"id": "einstein", "weight": 1.0}]));
+        env.meta.insert(
+            META_GRAPH_SEEDS.into(),
+            json!([{"id": "einstein", "weight": 1.0}]),
+        );
         env.meta.insert(META_GRAPH_ENABLED.into(), json!(false));
         let out = RagGraphFactsNodeAdapter::new()
             .execute(&node("rag_graph_facts"), &[input(env)], &stub_ctx())
@@ -1118,9 +1195,15 @@ mod tests {
             .unwrap();
         let ctx_text = out.payload.as_text().unwrap();
         assert_eq!(ctx_text, "Pytanie: Q\n\npasaze...\n", "kontekst bez zmian");
-        assert!(!ctx_text.contains("Fakty z grafu wiedzy"), "brak sekcji faktow");
+        assert!(
+            !ctx_text.contains("Fakty z grafu wiedzy"),
+            "brak sekcji faktow"
+        );
         // Adapter wyszedl przed fuzja -> nie zapisuje meta faktow.
-        assert!(out.meta.get(META_GRAPH_FACTS).is_none(), "OFF nie zapisuje faktow");
+        assert!(
+            out.meta.get(META_GRAPH_FACTS).is_none(),
+            "OFF nie zapisuje faktow"
+        );
     }
 
     /// Pod feature `graph`: hop grafowy seeduje PPR realnymi encjami zapytania,
@@ -1142,7 +1225,14 @@ mod tests {
                 .unwrap();
         }
         g.upsert_edge_with_quota(
-            "org-1", "inst-a", KG_COLLECTION, "einstein", "pracowal_w", "princeton", 1.0, "{}",
+            "org-1",
+            "inst-a",
+            KG_COLLECTION,
+            "einstein",
+            "pracowal_w",
+            "princeton",
+            1.0,
+            "{}",
             "null",
         )
         .unwrap();
@@ -1150,7 +1240,8 @@ mod tests {
         // rag_graph_seed identyfikuje „einstein" z pytania; rag_graph_facts
         // seeduje PPR i wyciaga fakt.
         let mut env = FlowEnvelope::empty();
-        env.payload = FlowValue::Text("Pytanie: gdzie pracowal Einstein?\n\npasaz wektorowy\n".into());
+        env.payload =
+            FlowValue::Text("Pytanie: gdzie pracowal Einstein?\n\npasaz wektorowy\n".into());
         env.meta
             .insert(META_CURRENT_QUERY.into(), json!("gdzie pracowal Einstein"));
         let seeded = RagGraphSeedNodeAdapter::new()
@@ -1164,8 +1255,14 @@ mod tests {
 
         let ctx_text = out.payload.as_text().unwrap();
         // Fuzja: pasaz wektorowy ZOSTAJE + fakt grafowy dolaczony.
-        assert!(ctx_text.contains("pasaz wektorowy"), "pasaz wektorowy zachowany: {ctx_text}");
-        assert!(ctx_text.contains("Fakty z grafu wiedzy:"), "sekcja faktow: {ctx_text}");
+        assert!(
+            ctx_text.contains("pasaz wektorowy"),
+            "pasaz wektorowy zachowany: {ctx_text}"
+        );
+        assert!(
+            ctx_text.contains("Fakty z grafu wiedzy:"),
+            "sekcja faktow: {ctx_text}"
+        );
         assert!(
             ctx_text.contains("einstein — pracowal_w → princeton"),
             "fakt grafowy: {ctx_text}"
@@ -1194,7 +1291,15 @@ mod tests {
                 .unwrap();
         }
         g.upsert_edge_with_quota(
-            "org-1", "inst-a", KG_COLLECTION, "tesla", "wynalazl", "radio", 1.0, "{}", "null",
+            "org-1",
+            "inst-a",
+            KG_COLLECTION,
+            "tesla",
+            "wynalazl",
+            "radio",
+            1.0,
+            "{}",
+            "null",
         )
         .unwrap();
 
@@ -1213,7 +1318,10 @@ mod tests {
         // globalnej encji NIE wyciekl.
         assert_eq!(ctx_text, "kontekst wektorowy\n");
         assert!(!ctx_text.contains("Fakty z grafu wiedzy"));
-        assert!(!ctx_text.contains("tesla"), "globalna encja nie wyciekla: {ctx_text}");
+        assert!(
+            !ctx_text.contains("tesla"),
+            "globalna encja nie wyciekla: {ctx_text}"
+        );
     }
 
     // --- seeds_from_meta pula kandydatow (bug 2) ---------------------------
@@ -1228,7 +1336,8 @@ mod tests {
             .map(|i| json!({"id": format!("e{i}"), "weight": 1.0}))
             .collect();
         let mut env = FlowEnvelope::empty();
-        env.meta.insert(META_GRAPH_SEEDS.into(), Value::Array(seeds_json));
+        env.meta
+            .insert(META_GRAPH_SEEDS.into(), Value::Array(seeds_json));
         let seeds = seeds_from_meta(&env);
         assert_eq!(
             seeds.len(),
@@ -1263,7 +1372,10 @@ mod tests {
         // Encja obecna w top-pasazach wektorowych dostaje boost relevance.
         let passages = "Albert Einstein opracowal teorie wzglednosci.";
         let out = apply_relevance_boost(
-            vec![("albert einstein".into(), 1.0), ("isaac newton".into(), 1.0)],
+            vec![
+                ("albert einstein".into(), 1.0),
+                ("isaac newton".into(), 1.0),
+            ],
             passages,
             &std::collections::HashMap::new(),
         );
@@ -1292,7 +1404,11 @@ mod tests {
             &density,
         );
         let w = |id: &str| out.iter().find(|(x, _)| x == id).map(|(_, w)| *w).unwrap();
-        assert_eq!(w("osimertinib"), RELEVANCE_BOOST * 2.0, "rzadka encja: 2× boost");
+        assert_eq!(
+            w("osimertinib"),
+            RELEVANCE_BOOST * 2.0,
+            "rzadka encja: 2× boost"
+        );
         assert_eq!(w("pacjent"), RELEVANCE_BOOST, "pospolita encja: 1× boost");
         assert!(
             w("osimertinib") > w("pacjent"),
@@ -1317,7 +1433,11 @@ mod tests {
         let map = density_from_meta(&env);
         assert_eq!(map.get("osimertinib"), Some(&0.9));
         assert_eq!(map.get("pacjent"), Some(&0.0));
-        assert_eq!(map.get("przepelnione"), Some(&1.0), "density > 1 clamp do 1");
+        assert_eq!(
+            map.get("przepelnione"),
+            Some(&1.0),
+            "density > 1 clamp do 1"
+        );
         assert!(!map.contains_key(""), "puste id pominiete");
         assert!(!map.contains_key("brak_density"));
         assert!(!map.contains_key("nan"));
@@ -1326,7 +1446,10 @@ mod tests {
     #[test]
     fn density_from_meta_absent_is_empty() {
         let env = FlowEnvelope::empty();
-        assert!(density_from_meta(&env).is_empty(), "brak klucza => pusta mapa");
+        assert!(
+            density_from_meta(&env).is_empty(),
+            "brak klucza => pusta mapa"
+        );
     }
 
     // --- merge_accumulated_facts (bug 3: dedup + cap przez hopy) -----------
@@ -1356,7 +1479,11 @@ mod tests {
         let existing = vec![fact("a", "r", "b")];
         let incoming = vec![fact("a", "r", "b"), fact("a", "r", "c")];
         let merged = merge_accumulated_facts(&existing, &incoming);
-        assert_eq!(merged.len(), 2, "duplikat (a,r,b) zdeduplikowany: {merged:?}");
+        assert_eq!(
+            merged.len(),
+            2,
+            "duplikat (a,r,b) zdeduplikowany: {merged:?}"
+        );
         assert_eq!(merged[0], fact("a", "r", "b"));
         assert_eq!(merged[1], fact("a", "r", "c"));
     }
@@ -1409,20 +1536,37 @@ mod tests {
                 .unwrap();
         }
         g.upsert_edge_with_quota(
-            "org-1", "inst-a", KG_COLLECTION, "einstein", "pracowal_w", "princeton", 1.0, "{}",
+            "org-1",
+            "inst-a",
+            KG_COLLECTION,
+            "einstein",
+            "pracowal_w",
+            "princeton",
+            1.0,
+            "{}",
             "null",
         )
         .unwrap();
         g.upsert_edge_with_quota(
-            "org-1", "inst-a", KG_COLLECTION, "tesla", "wynalazl", "radio", 1.0, "{}", "null",
+            "org-1",
+            "inst-a",
+            KG_COLLECTION,
+            "tesla",
+            "wynalazl",
+            "radio",
+            1.0,
+            "{}",
+            "null",
         )
         .unwrap();
 
         // Hop 1: seed „einstein" -> fakt pracowal_w.
         let mut env1 = FlowEnvelope::empty();
         env1.payload = FlowValue::Text("kontekst hop1\n".into());
-        env1.meta
-            .insert(META_GRAPH_SEEDS.into(), json!([{"id": "einstein", "weight": 1.0}]));
+        env1.meta.insert(
+            META_GRAPH_SEEDS.into(),
+            json!([{"id": "einstein", "weight": 1.0}]),
+        );
         let after1 = RagGraphFactsNodeAdapter::new()
             .execute(&node("rag_graph_facts"), &[input(env1)], &ctx)
             .await
@@ -1432,8 +1576,10 @@ mod tests {
         // (meta.rag_graph_facts_accumulated) przechodzi z hopu 1 do hopu 2.
         let mut env2: FlowEnvelope = after1;
         env2.payload = FlowValue::Text("kontekst hop2\n".into());
-        env2.meta
-            .insert(META_GRAPH_SEEDS.into(), json!([{"id": "tesla", "weight": 1.0}]));
+        env2.meta.insert(
+            META_GRAPH_SEEDS.into(),
+            json!([{"id": "tesla", "weight": 1.0}]),
+        );
         let after2 = RagGraphFactsNodeAdapter::new()
             .execute(&node("rag_graph_facts"), &[input(env2)], &ctx)
             .await

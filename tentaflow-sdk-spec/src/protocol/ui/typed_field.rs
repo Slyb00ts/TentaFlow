@@ -27,7 +27,11 @@ pub type IntoComponentError = minicbor::encode::Error<core::convert::Infallible>
 
 /// Tag-mismatch validator used by every per-tag typed component's
 /// `try_from_component` (catalog §2-§7).
-pub fn ensure_tag(actual: u16, expected: u16, name: &'static str) -> Result<(), minicbor::decode::Error> {
+pub fn ensure_tag(
+    actual: u16,
+    expected: u16,
+    name: &'static str,
+) -> Result<(), minicbor::decode::Error> {
     if actual != expected {
         return Err(minicbor::decode::Error::message(format!(
             "{name}: Component.tag = 0x{actual:04X}, expected 0x{expected:04X}"

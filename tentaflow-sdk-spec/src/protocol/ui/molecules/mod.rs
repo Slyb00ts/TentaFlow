@@ -54,15 +54,23 @@ mod tests {
     }
 
     fn icon(name: IconName) -> IconRef {
-        IconRef::Named { name, size: None, tone: None }
+        IconRef::Named {
+            name,
+            size: None,
+            tone: None,
+        }
     }
 
     fn lit(s: &str) -> BindRef {
         BindRef::Literal(Value::Text(s.into()))
     }
 
-    fn rt_molecule<F, M>(make: F, tag: u16, into: impl Fn(M) -> Component, from: impl Fn(&Component) -> Result<M, minicbor::decode::Error>)
-    where
+    fn rt_molecule<F, M>(
+        make: F,
+        tag: u16,
+        into: impl Fn(M) -> Component,
+        from: impl Fn(&Component) -> Result<M, minicbor::decode::Error>,
+    ) where
         F: Fn() -> M,
         M: PartialEq + std::fmt::Debug + Clone,
     {
@@ -99,7 +107,12 @@ mod tests {
             actions: vec![dummy_button("btn_add")],
             density: Density::Default,
         };
-        rt_molecule(make, Header::TAG, |m| m.into_component("h1").unwrap(), Header::try_from_component);
+        rt_molecule(
+            make,
+            Header::TAG,
+            |m| m.into_component("h1").unwrap(),
+            Header::try_from_component,
+        );
     }
 
     #[test]
@@ -111,7 +124,12 @@ mod tests {
             actions: vec![dummy_button("save")],
             tabs: None,
         };
-        rt_molecule(make, PageHeader::TAG, |m| m.into_component("ph").unwrap(), PageHeader::try_from_component);
+        rt_molecule(
+            make,
+            PageHeader::TAG,
+            |m| m.into_component("ph").unwrap(),
+            PageHeader::try_from_component,
+        );
     }
 
     #[test]
@@ -124,7 +142,12 @@ mod tests {
             secondary_action: None,
             variant: EmptyStateVariant::Illustrated,
         };
-        rt_molecule(make, EmptyState::TAG, |m| m.into_component("es").unwrap(), EmptyState::try_from_component);
+        rt_molecule(
+            make,
+            EmptyState::TAG,
+            |m| m.into_component("es").unwrap(),
+            EmptyState::try_from_component,
+        );
     }
 
     #[test]
@@ -135,7 +158,12 @@ mod tests {
             actions: vec![],
             divider: true,
         };
-        rt_molecule(make, SectionHeader::TAG, |m| m.into_component("sh").unwrap(), SectionHeader::try_from_component);
+        rt_molecule(
+            make,
+            SectionHeader::TAG,
+            |m| m.into_component("sh").unwrap(),
+            SectionHeader::try_from_component,
+        );
     }
 
     #[test]
@@ -148,7 +176,12 @@ mod tests {
             trailing_actions: vec![],
             density: Density::Compact,
         };
-        rt_molecule(make, Toolbar::TAG, |m| m.into_component("tb").unwrap(), Toolbar::try_from_component);
+        rt_molecule(
+            make,
+            Toolbar::TAG,
+            |m| m.into_component("tb").unwrap(),
+            Toolbar::try_from_component,
+        );
     }
 
     #[test]
@@ -160,7 +193,12 @@ mod tests {
             sidebar_width: Spacing::Xl,
             collapsible_sidebar: true,
         };
-        rt_molecule(make, AppShell::TAG, |m| m.into_component("shell").unwrap(), AppShell::try_from_component);
+        rt_molecule(
+            make,
+            AppShell::TAG,
+            |m| m.into_component("shell").unwrap(),
+            AppShell::try_from_component,
+        );
     }
 
     #[test]
@@ -172,7 +210,12 @@ mod tests {
             content_slot: "form".into(),
             footer_slot: None,
         };
-        rt_molecule(make, LoginShell::TAG, |m| m.into_component("login").unwrap(), LoginShell::try_from_component);
+        rt_molecule(
+            make,
+            LoginShell::TAG,
+            |m| m.into_component("login").unwrap(),
+            LoginShell::try_from_component,
+        );
     }
 
     #[test]
@@ -184,7 +227,12 @@ mod tests {
             actions: vec![dummy_button("retry")],
             technical_details: None,
         };
-        rt_molecule(make, ErrorBoundary::TAG, |m| m.into_component("err").unwrap(), ErrorBoundary::try_from_component);
+        rt_molecule(
+            make,
+            ErrorBoundary::TAG,
+            |m| m.into_component("err").unwrap(),
+            ErrorBoundary::try_from_component,
+        );
     }
 
     #[test]
@@ -197,7 +245,12 @@ mod tests {
             primary_action: dummy_button("start"),
             secondary_action: None,
         };
-        rt_molecule(make, WelcomeHero::TAG, |m| m.into_component("wh").unwrap(), WelcomeHero::try_from_component);
+        rt_molecule(
+            make,
+            WelcomeHero::TAG,
+            |m| m.into_component("wh").unwrap(),
+            WelcomeHero::try_from_component,
+        );
     }
 
     #[test]
@@ -207,7 +260,12 @@ mod tests {
             columns: 4,
             density: Density::Default,
         };
-        rt_molecule(make, StatGroup::TAG, |m| m.into_component("sg").unwrap(), StatGroup::try_from_component);
+        rt_molecule(
+            make,
+            StatGroup::TAG,
+            |m| m.into_component("sg").unwrap(),
+            StatGroup::try_from_component,
+        );
     }
 
     #[test]
@@ -219,7 +277,12 @@ mod tests {
             footer_slot: "wizard_footer".into(),
             cancellable: true,
         };
-        rt_molecule(make, WizardShell::TAG, |m| m.into_component("wz").unwrap(), WizardShell::try_from_component);
+        rt_molecule(
+            make,
+            WizardShell::TAG,
+            |m| m.into_component("wz").unwrap(),
+            WizardShell::try_from_component,
+        );
     }
 
     #[test]
@@ -231,7 +294,12 @@ mod tests {
             tabs: None,
             collapsible: true,
         };
-        rt_molecule(make, Inspector::TAG, |m| m.into_component("ins").unwrap(), Inspector::try_from_component);
+        rt_molecule(
+            make,
+            Inspector::TAG,
+            |m| m.into_component("ins").unwrap(),
+            Inspector::try_from_component,
+        );
     }
 
     #[test]
@@ -244,16 +312,25 @@ mod tests {
     fn non_button(id: &str) -> Component {
         // 0x040C Fab carrying the wrong tag for ComponentRef<Button>.
         Component {
-            tag: 0x040C, id: id.into(), fields: FieldMap::default(),
-            handlers: None, bind: None, a11y: None, visibility: None, test_id: None,
+            tag: 0x040C,
+            id: id.into(),
+            fields: FieldMap::default(),
+            handlers: None,
+            bind: None,
+            a11y: None,
+            visibility: None,
+            test_id: None,
         }
     }
 
     #[test]
     fn header_rejects_non_button_action() {
         let bad = Header {
-            icon: icon(IconName::Brain), title: lit("T"),
-            status_badge: None, subtitle: None, meta_chips: vec![],
+            icon: icon(IconName::Brain),
+            title: lit("T"),
+            status_badge: None,
+            subtitle: None,
+            meta_chips: vec![],
             actions: vec![non_button("bad")],
             density: Density::Default,
         };
@@ -263,7 +340,8 @@ mod tests {
     #[test]
     fn empty_state_rejects_non_button_primary_action() {
         let bad = EmptyState {
-            icon: icon(IconName::Brain), heading: lit("h"),
+            icon: icon(IconName::Brain),
+            heading: lit("h"),
             message: None,
             primary_action: Some(non_button("bad")),
             secondary_action: None,
@@ -276,7 +354,8 @@ mod tests {
     fn welcome_hero_rejects_non_button_primary_action() {
         let bad = WelcomeHero {
             illustration: icon(IconName::Brain),
-            title: lit("t"), subtitle: lit("s"),
+            title: lit("t"),
+            subtitle: lit("s"),
             features: vec![],
             primary_action: non_button("bad"),
             secondary_action: None,
@@ -287,7 +366,10 @@ mod tests {
     #[test]
     fn toolbar_rejects_non_button_trailing_action() {
         let bad = Toolbar {
-            search: None, filters: vec![], view_mode: None, sort_control: None,
+            search: None,
+            filters: vec![],
+            view_mode: None,
+            sort_control: None,
             trailing_actions: vec![non_button("bad")],
             density: Density::Default,
         };
@@ -299,8 +381,11 @@ mod tests {
         // ComponentRef<SearchBox> (0x0307) — provide a Fab (0x040C) instead.
         let bad = Toolbar {
             search: Some(non_button("nope")), // 0x040C
-            filters: vec![], view_mode: None, sort_control: None,
-            trailing_actions: vec![], density: Density::Default,
+            filters: vec![],
+            view_mode: None,
+            sort_control: None,
+            trailing_actions: vec![],
+            density: Density::Default,
         };
         assert!(bad.into_component("tb").is_err());
     }
@@ -310,7 +395,8 @@ mod tests {
         // ComponentRef<StatCard> (0x0208) — provide a Fab instead.
         let bad = StatGroup {
             stats: vec![non_button("nope")],
-            columns: 2, density: Density::Default,
+            columns: 2,
+            density: Density::Default,
         };
         assert!(bad.into_component("sg").is_err());
     }
@@ -318,9 +404,11 @@ mod tests {
     #[test]
     fn inspector_rejects_non_button_action() {
         let bad = Inspector {
-            title: lit("t"), content_slot: "x".into(),
+            title: lit("t"),
+            content_slot: "x".into(),
             actions: vec![non_button("bad")],
-            tabs: None, collapsible: false,
+            tabs: None,
+            collapsible: false,
         };
         assert!(bad.into_component("i").is_err());
     }
@@ -328,7 +416,9 @@ mod tests {
     #[test]
     fn error_boundary_rejects_non_button_action() {
         let bad = ErrorBoundary {
-            error_code: None, title: lit("err"), message: None,
+            error_code: None,
+            title: lit("err"),
+            message: None,
             actions: vec![non_button("bad")],
             technical_details: None,
         };

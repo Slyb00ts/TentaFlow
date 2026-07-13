@@ -574,7 +574,13 @@ impl MeshSecurity {
         let trusted = db::repository::list_trusted_nodes(&self.db).unwrap_or_default();
         trusted
             .iter()
-            .map(|n| (n.node_id.clone(), n.public_key.clone(), n.approved_at.clone()))
+            .map(|n| {
+                (
+                    n.node_id.clone(),
+                    n.public_key.clone(),
+                    n.approved_at.clone(),
+                )
+            })
             .collect()
     }
 

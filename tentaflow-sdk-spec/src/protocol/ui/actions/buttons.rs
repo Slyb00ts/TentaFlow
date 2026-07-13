@@ -2,6 +2,7 @@
 // File: protocol/ui/action/buttons.rs — Button/IconButton/ButtonGroup/LinkButton/Link/Fab (catalog §6)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::BindRef;
 use super::super::component::{Component, FieldMap};
 use super::super::inline::IconRef;
@@ -13,11 +14,19 @@ use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_ref_tag_decode,
     ensure_ref_tag_encode, ensure_tag, missing_field, unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -47,12 +56,20 @@ impl Button {
         e.push((0, encode_to_value(&self.variant)?));
         e.push((1, encode_to_value(&self.tone)?));
         e.push((2, encode_to_value(&self.label)?));
-        if let Some(v) = &self.icon_leading { e.push((3, encode_to_value(v)?)); }
-        if let Some(v) = &self.icon_trailing { e.push((4, encode_to_value(v)?)); }
+        if let Some(v) = &self.icon_leading {
+            e.push((3, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.icon_trailing {
+            e.push((4, encode_to_value(v)?));
+        }
         e.push((5, encode_to_value(&self.size)?));
         e.push((6, encode_to_value(&self.full_width)?));
-        if let Some(v) = &self.disabled { e.push((7, encode_to_value(v)?)); }
-        if let Some(v) = &self.loading { e.push((8, encode_to_value(v)?)); }
+        if let Some(v) = &self.disabled {
+            e.push((7, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.loading {
+            e.push((8, encode_to_value(v)?));
+        }
         e.push((9, encode_to_value(&self.density)?));
         Ok(component(Self::TAG, id, e))
     }
@@ -60,10 +77,16 @@ impl Button {
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "Button")?;
         ensure_no_duplicate_keys("Button", &c.fields.0)?;
-        let mut variant = None; let mut tone = None; let mut label = None;
-        let mut icon_leading = None; let mut icon_trailing = None;
-        let mut size = None; let mut full_width = None;
-        let mut disabled = None; let mut loading = None; let mut density = None;
+        let mut variant = None;
+        let mut tone = None;
+        let mut label = None;
+        let mut icon_leading = None;
+        let mut icon_trailing = None;
+        let mut size = None;
+        let mut full_width = None;
+        let mut disabled = None;
+        let mut loading = None;
+        let mut density = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => variant = Some(decode_from_value(v)?),
@@ -83,10 +106,12 @@ impl Button {
             variant: variant.ok_or_else(|| missing_field("Button", "variant"))?,
             tone: tone.ok_or_else(|| missing_field("Button", "tone"))?,
             label: label.ok_or_else(|| missing_field("Button", "label"))?,
-            icon_leading, icon_trailing,
+            icon_leading,
+            icon_trailing,
             size: size.ok_or_else(|| missing_field("Button", "size"))?,
             full_width: full_width.ok_or_else(|| missing_field("Button", "full_width"))?,
-            disabled, loading,
+            disabled,
+            loading,
             density: density.ok_or_else(|| missing_field("Button", "density"))?,
         })
     }
@@ -118,17 +143,25 @@ impl IconButton {
         e.push((2, encode_to_value(&self.tone)?));
         e.push((3, encode_to_value(&self.size)?));
         e.push((4, encode_to_value(&self.aria_label)?));
-        if let Some(v) = &self.disabled { e.push((5, encode_to_value(v)?)); }
-        if let Some(v) = &self.loading { e.push((6, encode_to_value(v)?)); }
+        if let Some(v) = &self.disabled {
+            e.push((5, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.loading {
+            e.push((6, encode_to_value(v)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "IconButton")?;
         ensure_no_duplicate_keys("IconButton", &c.fields.0)?;
-        let mut icon = None; let mut variant = None; let mut tone = None;
-        let mut size = None; let mut aria_label = None;
-        let mut disabled = None; let mut loading = None;
+        let mut icon = None;
+        let mut variant = None;
+        let mut tone = None;
+        let mut size = None;
+        let mut aria_label = None;
+        let mut disabled = None;
+        let mut loading = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => icon = Some(decode_from_value(v)?),
@@ -147,7 +180,8 @@ impl IconButton {
             tone: tone.ok_or_else(|| missing_field("IconButton", "tone"))?,
             size: size.ok_or_else(|| missing_field("IconButton", "size"))?,
             aria_label: aria_label.ok_or_else(|| missing_field("IconButton", "aria_label"))?,
-            disabled, loading,
+            disabled,
+            loading,
         })
     }
 }
@@ -182,7 +216,8 @@ impl ButtonGroup {
         ensure_tag(c.tag, Self::TAG, "ButtonGroup")?;
         ensure_no_duplicate_keys("ButtonGroup", &c.fields.0)?;
         let mut buttons: Option<Vec<Component>> = None;
-        let mut orientation = None; let mut attached = None;
+        let mut orientation = None;
+        let mut attached = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => buttons = Some(decode_from_value(v)?),
@@ -223,8 +258,12 @@ impl LinkButton {
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(5);
         e.push((0, encode_to_value(&self.label)?));
-        if let Some(v) = &self.icon_leading { e.push((1, encode_to_value(v)?)); }
-        if let Some(v) = &self.icon_trailing { e.push((2, encode_to_value(v)?)); }
+        if let Some(v) = &self.icon_leading {
+            e.push((1, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.icon_trailing {
+            e.push((2, encode_to_value(v)?));
+        }
         e.push((3, encode_to_value(&self.tone)?));
         e.push((4, encode_to_value(&self.underline)?));
         Ok(component(Self::TAG, id, e))
@@ -233,8 +272,11 @@ impl LinkButton {
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "LinkButton")?;
         ensure_no_duplicate_keys("LinkButton", &c.fields.0)?;
-        let mut label = None; let mut icon_leading = None; let mut icon_trailing = None;
-        let mut tone = None; let mut underline = None;
+        let mut label = None;
+        let mut icon_leading = None;
+        let mut icon_trailing = None;
+        let mut tone = None;
+        let mut underline = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => label = Some(decode_from_value(v)?),
@@ -247,7 +289,8 @@ impl LinkButton {
         }
         Ok(LinkButton {
             label: label.ok_or_else(|| missing_field("LinkButton", "label"))?,
-            icon_leading, icon_trailing,
+            icon_leading,
+            icon_trailing,
             tone: tone.ok_or_else(|| missing_field("LinkButton", "tone"))?,
             underline: underline.ok_or_else(|| missing_field("LinkButton", "underline"))?,
         })
@@ -276,16 +319,23 @@ impl Link {
         e.push((0, encode_to_value(&self.label)?));
         e.push((1, encode_to_value(&self.underline)?));
         e.push((2, encode_to_value(&self.tone)?));
-        if let Some(v) = &self.leading_icon { e.push((3, encode_to_value(v)?)); }
-        if let Some(v) = &self.trailing_icon { e.push((4, encode_to_value(v)?)); }
+        if let Some(v) = &self.leading_icon {
+            e.push((3, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.trailing_icon {
+            e.push((4, encode_to_value(v)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "Link")?;
         ensure_no_duplicate_keys("Link", &c.fields.0)?;
-        let mut label = None; let mut underline = None; let mut tone = None;
-        let mut leading_icon = None; let mut trailing_icon = None;
+        let mut label = None;
+        let mut underline = None;
+        let mut tone = None;
+        let mut leading_icon = None;
+        let mut trailing_icon = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => label = Some(decode_from_value(v)?),
@@ -300,7 +350,8 @@ impl Link {
             label: label.ok_or_else(|| missing_field("Link", "label"))?,
             underline: underline.ok_or_else(|| missing_field("Link", "underline"))?,
             tone: tone.ok_or_else(|| missing_field("Link", "tone"))?,
-            leading_icon, trailing_icon,
+            leading_icon,
+            trailing_icon,
         })
     }
 }
@@ -328,15 +379,20 @@ impl Fab {
         e.push((1, encode_to_value(&self.tone)?));
         e.push((2, encode_to_value(&self.size)?));
         e.push((3, encode_to_value(&self.position)?));
-        if let Some(v) = &self.label { e.push((4, encode_to_value(v)?)); }
+        if let Some(v) = &self.label {
+            e.push((4, encode_to_value(v)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "Fab")?;
         ensure_no_duplicate_keys("Fab", &c.fields.0)?;
-        let mut icon = None; let mut tone = None; let mut size = None;
-        let mut position = None; let mut label = None;
+        let mut icon = None;
+        let mut tone = None;
+        let mut size = None;
+        let mut position = None;
+        let mut label = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => icon = Some(decode_from_value(v)?),

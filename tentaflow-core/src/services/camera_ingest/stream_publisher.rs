@@ -104,11 +104,7 @@ impl std::fmt::Debug for Mp4StreamPublisher {
             )
             .field(
                 "subscribers",
-                &self
-                    .chunks_tx
-                    .lock()
-                    .as_ref()
-                    .map(|tx| tx.receiver_count()),
+                &self.chunks_tx.lock().as_ref().map(|tx| tx.receiver_count()),
             )
             .field("terminal", &self.terminal.load(Ordering::Acquire))
             .finish()
@@ -165,7 +161,6 @@ impl Mp4StreamPublisher {
     pub fn reset_base_pts_ns(&self) {
         *self.base_pts_ns.lock() = None;
     }
-
 
     /// Push bytes from the `mp4mux` appsink. The muxer flushes raw fMP4
     /// boxes in arbitrary chunks — a single `GstBuffer` may contain a partial
@@ -480,7 +475,10 @@ mod tests {
         assert!(cmd_rx.try_recv().is_err());
         drop(pub_);
         let cmd = cmd_rx.recv().await.expect("detach command on drop");
-        assert!(matches!(cmd, SessionCommand::DetachMp4Branch { preview: false }));
+        assert!(matches!(
+            cmd,
+            SessionCommand::DetachMp4Branch { preview: false }
+        ));
     }
 
     #[tokio::test]
@@ -499,7 +497,10 @@ mod tests {
     async fn mark_unsupported_makes_broadcaster_terminal() {
         let (pub_, _cmd_rx) = make_publisher();
         // A live receiver before the terminal transition observes Closed.
-        let mut rx = pub_.chunk_broadcaster().expect("broadcaster live").subscribe();
+        let mut rx = pub_
+            .chunk_broadcaster()
+            .expect("broadcaster live")
+            .subscribe();
         pub_.mark_unsupported();
         assert!(
             pub_.chunk_broadcaster().is_none(),

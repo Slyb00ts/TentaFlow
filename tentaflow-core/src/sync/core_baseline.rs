@@ -184,9 +184,7 @@ fn conflicts_with(
     // started", so the flip is safe. This is narrow: only the `Elected` phase, only
     // the same peer+epoch — an active transfer (Receiving/Importing/Imported) or a
     // different peer/epoch still conflicts, so split-brain protection is intact.
-    if existing.peer == peer
-        && &existing.epoch == epoch
-        && existing.phase == BaselinePhase::Elected
+    if existing.peer == peer && &existing.epoch == epoch && existing.phase == BaselinePhase::Elected
     {
         return false;
     }

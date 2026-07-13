@@ -15,7 +15,9 @@ use tentaflow_protocol::{
 };
 
 use super::HandlerContext;
-use crate::db::models::{DbModelMetricsRollup, DbModelPricing, ModelMetricsFilter, NewModelPricing};
+use crate::db::models::{
+    DbModelMetricsRollup, DbModelPricing, ModelMetricsFilter, NewModelPricing,
+};
 use crate::db::repository::{
     self, DECODE_TPS_EDGES, E2E_MS_EDGES, MODEL_METRICS_HISTOGRAM_VERSION, TTFT_MS_EDGES,
 };
@@ -378,8 +380,8 @@ impl<'a> PricingCache<'a> {
 
     fn get(&mut self, model_id: &str) -> Option<&DbModelPricing> {
         if !self.cache.contains_key(model_id) {
-            let pricing = repository::get_model_pricing(self.pool, self.org_id, model_id)
-                .unwrap_or(None);
+            let pricing =
+                repository::get_model_pricing(self.pool, self.org_id, model_id).unwrap_or(None);
             self.cache.insert(model_id.to_string(), pricing);
         }
         self.cache.get(model_id).and_then(|o| o.as_ref())

@@ -3,7 +3,7 @@
 // =============================================================================
 //
 // Loads a one-shot capture written by `depth_mapping::maybe_dump_calibration`
-// (`TENTAFLOW_CALIB_DUMP=1` on a live run) from `/tmp/tf_calib/{depth,lidar}.bin`
+// (`[vision] calib_dump = true` on a live run) from `/tmp/tf_calib/{depth,lidar}.bin`
 // and finds the camera extrinsics (FOV, scale, and a full yaw/pitch/roll mount
 // rotation) that best align the back-projected depth cloud onto the lidar cloud
 // (ground truth). The metric is a trimmed-mean nearest-neighbour distance from
@@ -155,7 +155,8 @@ fn backproject(cap: &Capture, p: &Params, stride: usize) -> Vec<[f32; 3]> {
                 // optical → body (FLU, Z-up), then mount rotation
                 let body = rotate_body([z_opt, -x_opt, -y_opt], p.yaw, p.pitch, p.roll);
                 let world =
-                    cap.pose.transform_point([body[0] as f64, body[1] as f64, body[2] as f64]);
+                    cap.pose
+                        .transform_point([body[0] as f64, body[1] as f64, body[2] as f64]);
                 out.push([world[0] as f32, world[1] as f32, world[2] as f32]);
             }
             u += stride;
@@ -258,7 +259,15 @@ fn extents(pts: &[[f32; 3]]) -> ([f32; 3], [f32; 3], [f32; 3]) {
         }
     }
     let n = pts.len().max(1) as f64;
-    ([c[0] as f32 / n as f32, c[1] as f32 / n as f32, c[2] as f32 / n as f32], mn, mx)
+    (
+        [
+            c[0] as f32 / n as f32,
+            c[1] as f32 / n as f32,
+            c[2] as f32 / n as f32,
+        ],
+        mn,
+        mx,
+    )
 }
 
 /// Top-down (x-y plane) overlay: lidar green, depth magenta. A quick visual check
@@ -317,7 +326,12 @@ fn main() {
         roll: 0.0,
     };
     // Depth value distribution — a quick check of the monocular metric scale.
-    let mut dv: Vec<f32> = cap.depth.iter().copied().filter(|&d| d.is_finite() && d > 0.05).collect();
+    let mut dv: Vec<f32> = cap
+        .depth
+        .iter()
+        .copied()
+        .filter(|&d| d.is_finite() && d > 0.05)
+        .collect();
     dv.sort_by(|a, b| a.partial_cmp(b).unwrap());
     if !dv.is_empty() {
         let pct = |f: f32| dv[((dv.len() as f32 * f) as usize).min(dv.len() - 1)];
@@ -331,14 +345,22 @@ fn main() {
     }
     let dp0 = backproject(&cap, &init, 6);
     let (dc, dmn, dmx) = extents(&dp0);
-    println!("capture: {}x{} depth, {} lidar pts", cap.width, cap.height, cap.lidar.len());
+    println!(
+        "capture: {}x{} depth, {} lidar pts",
+        cap.width,
+        cap.height,
+        cap.lidar.len()
+    );
     println!(
         "  current params: fov={:.1} pitch={:.1} scale={:.2}",
         cap.cap_fov, cap.cap_pitch, cap.cap_scale
     );
     println!("  lidar  centroid={lc:?} min={lmn:?} max={lmx:?}");
     println!("  depth  centroid={dc:?} min={dmn:?} max={dmx:?}");
-    println!("  start cost = {:.3} m", cost(&dp0, &grid, &lidar_sub, init.scale));
+    println!(
+        "  start cost = {:.3} m",
+        cost(&dp0, &grid, &lidar_sub, init.scale)
+    );
 
     // Pattern search (Hooke-Jeeves) over the 5 params, multi-start over a few scale
     // seeds since the monocular metric scale is the most uncertain DOF.
@@ -360,7 +382,13 @@ fn main() {
     // PITCH (the Go2 camera angles down), so multi-start over pitch seeds.
     for &pitch0 in &[-10.0f32, -25.0, -40.0, -55.0] {
         for &y0 in &[0.0f32, -20.0, 20.0] {
-            let mut p = Params { scale: 1.0, yaw: y0, pitch: pitch0, roll: 0.0, ..init };
+            let mut p = Params {
+                scale: 1.0,
+                yaw: y0,
+                pitch: pitch0,
+                roll: 0.0,
+                ..init
+            };
             // step sizes: fov_h, fov_v, scale, pitch, yaw, roll (FOV fixed → skipped)
             let mut step = [0.0f32, 0.0, 0.05, 12.0, 10.0, 10.0];
             let mut c = eval(&p);
@@ -408,11 +436,33 @@ fn main() {
         "  fov_h={:.1} fov_v={:.1}  scale={:.3}  pitch={:.1}  yaw={:.1}  roll={:.1}",
         best.fov, best.fov_v, best.scale, best.pitch, best.yaw, best.roll
     );
-    println!("  cost: {:.3} m  ->  {:.3} m", best_cost.max(final_cost), final_cost);
+    println!(
+        "  cost: {:.3} m  ->  {:.3} m",
+        best_cost.max(final_cost),
+        final_cost
+    );
     let dp_before = backproject(&cap, &init, 4);
-    render_view(&cap.lidar, &dp_before, "/tmp/tf_calib/overlay_before.png", 0, 1); // top-down x-y
-    render_view(&cap.lidar, &dp_before, "/tmp/tf_calib/side_before.png", 0, 2); // side x-z (height)
-    render_view(&cap.lidar, &backproject(&cap, &best, 4), "/tmp/tf_calib/overlay_after.png", 0, 1);
+    render_view(
+        &cap.lidar,
+        &dp_before,
+        "/tmp/tf_calib/overlay_before.png",
+        0,
+        1,
+    ); // top-down x-y
+    render_view(
+        &cap.lidar,
+        &dp_before,
+        "/tmp/tf_calib/side_before.png",
+        0,
+        2,
+    ); // side x-z (height)
+    render_view(
+        &cap.lidar,
+        &backproject(&cap, &best, 4),
+        "/tmp/tf_calib/overlay_after.png",
+        0,
+        1,
+    );
     println!("  wrote /tmp/tf_calib/overlay_{{before,after}}.png (lidar=green depth=magenta)");
     if best.yaw.abs() < 2.0 && best.roll.abs() < 2.0 {
         println!(

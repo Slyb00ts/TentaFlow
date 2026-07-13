@@ -349,7 +349,10 @@ pub async fn execute_direct_blocking(
                     message: msg.clone(),
                 },
             );
-            return Err(anyhow!("direct '{}' execution failed: {msg}", node.node_type));
+            return Err(anyhow!(
+                "direct '{}' execution failed: {msg}",
+                node.node_type
+            ));
         }
     };
 
@@ -647,7 +650,15 @@ fn spawn_unit(
     pos: usize,
 ) -> Result<()> {
     let Some(region) = compiled.region_at_entry(pos) else {
-        return spawn_node(join_set, compiled, adapters, ctx, outputs, active_ports, pos);
+        return spawn_node(
+            join_set,
+            compiled,
+            adapters,
+            ctx,
+            outputs,
+            active_ports,
+            pos,
+        );
     };
     let region = region.clone();
     let def_idx = compiled.execution_order[region.entry_pos];
@@ -720,7 +731,10 @@ async fn run_loop_region(
         if ctx.cancel_token.is_cancelled() {
             break "cancelled";
         }
-        if ctx.effective_deadline().is_some_and(|d| Instant::now() >= d) {
+        if ctx
+            .effective_deadline()
+            .is_some_and(|d| Instant::now() >= d)
+        {
             break "cancelled";
         }
         if iterations >= max_iterations {
@@ -783,7 +797,9 @@ async fn run_loop_region(
             },
         );
         if ctx.cancel_token.is_cancelled()
-            || ctx.effective_deadline().is_some_and(|d| Instant::now() >= d)
+            || ctx
+                .effective_deadline()
+                .is_some_and(|d| Instant::now() >= d)
         {
             return Err(anyhow!(
                 "loop region '{}': cancelled during final pass after {iterations} iteration(s)",
@@ -792,9 +808,10 @@ async fn run_loop_region(
         }
     }
 
-    current
-        .meta
-        .insert("loop_iterations".into(), serde_json::Value::from(iterations));
+    current.meta.insert(
+        "loop_iterations".into(),
+        serde_json::Value::from(iterations),
+    );
     current.meta.insert(
         "loop_exit_reason".into(),
         serde_json::Value::String(exit_reason.to_string()),
@@ -834,7 +851,11 @@ async fn execute_subdag(
         let def_idx = compiled.execution_order[pos];
         let node = &compiled.definition.nodes[def_idx];
         let adapter = adapters.get(&node.node_type).ok_or_else(|| {
-            anyhow!("no adapter for node '{}' (type '{}')", node.id, node.node_type)
+            anyhow!(
+                "no adapter for node '{}' (type '{}')",
+                node.id,
+                node.node_type
+            )
         })?;
 
         // Internal inputs from predecessor members (loop_back excluded). The
@@ -922,7 +943,10 @@ async fn run_loop_region_streaming(
         if ctx.cancel_token.is_cancelled() {
             break "cancelled";
         }
-        if ctx.effective_deadline().is_some_and(|d| Instant::now() >= d) {
+        if ctx
+            .effective_deadline()
+            .is_some_and(|d| Instant::now() >= d)
+        {
             break "cancelled";
         }
         if iterations >= max_iterations {
@@ -937,9 +961,10 @@ async fn run_loop_region_streaming(
                 max: max_iterations,
             },
         );
-        current =
-            execute_subdag_streaming(compiled, adapters, ctx, region, current, outbound, last_usage, last_perf)
-                .await?;
+        current = execute_subdag_streaming(
+            compiled, adapters, ctx, region, current, outbound, last_usage, last_perf,
+        )
+        .await?;
         iterations += 1;
         ctx.progress.emit(
             &ctx.progress_scope,
@@ -970,9 +995,10 @@ async fn run_loop_region_streaming(
                 max: max_iterations,
             },
         );
-        current =
-            execute_subdag_streaming(compiled, adapters, ctx, region, current, outbound, last_usage, last_perf)
-                .await?;
+        current = execute_subdag_streaming(
+            compiled, adapters, ctx, region, current, outbound, last_usage, last_perf,
+        )
+        .await?;
         iterations += 1;
         current.meta.remove("loop_final_pass");
         ctx.progress.emit(
@@ -983,7 +1009,9 @@ async fn run_loop_region_streaming(
             },
         );
         if ctx.cancel_token.is_cancelled()
-            || ctx.effective_deadline().is_some_and(|d| Instant::now() >= d)
+            || ctx
+                .effective_deadline()
+                .is_some_and(|d| Instant::now() >= d)
         {
             return Err(anyhow!(
                 "loop region '{}': cancelled during final pass after {iterations} iteration(s)",
@@ -992,9 +1020,10 @@ async fn run_loop_region_streaming(
         }
     }
 
-    current
-        .meta
-        .insert("loop_iterations".into(), serde_json::Value::from(iterations));
+    current.meta.insert(
+        "loop_iterations".into(),
+        serde_json::Value::from(iterations),
+    );
     current.meta.insert(
         "loop_exit_reason".into(),
         serde_json::Value::String(exit_reason.to_string()),
@@ -1070,12 +1099,19 @@ async fn execute_subdag_streaming(
         // never overlays a stream producer (R7), so the streamed member takes the
         // raw-config produce_stream path while the rest keep the io-mapping seam.
         let result = if adapters.is_stream_producer(&node.node_type) {
-            stream_llm_member(adapters, node, &inputs, ctx, outbound, last_usage, last_perf).await?
+            stream_llm_member(
+                adapters, node, &inputs, ctx, outbound, last_usage, last_perf,
+            )
+            .await?
         } else {
             let inbound: &FlowEnvelope =
                 io_mapping_inbound(&inputs).unwrap_or_else(|| seed_arc.as_ref());
             let adapter = adapters.get(&node.node_type).ok_or_else(|| {
-                anyhow!("no adapter for node '{}' (type '{}')", node.id, node.node_type)
+                anyhow!(
+                    "no adapter for node '{}' (type '{}')",
+                    node.id,
+                    node.node_type
+                )
             })?;
             run_node_with_io_mapping(adapter.as_ref(), node, inbound, &inputs, ctx).await?
         };
@@ -1131,7 +1167,10 @@ async fn stream_llm_member(
             Err(e) => {
                 let msg = format!("{e}");
                 let _ = outbound.send(Err(anyhow!("{msg}"))).await;
-                return Err(anyhow!("region llm member '{}' stream error: {msg}", node.id));
+                return Err(anyhow!(
+                    "region llm member '{}' stream error: {msg}",
+                    node.id
+                ));
             }
         };
 
@@ -1378,10 +1417,7 @@ pub async fn execute_streaming(
     // final answer token-by-token. The region runner drives the iterations
     // inline and the post-producer blocking nodes (`persist_turn`, `output`) run
     // over the fully accumulated turn once the stream settles.
-    if compiled
-        .stream_producer_region(adapters.as_ref())
-        .is_some()
-    {
+    if compiled.stream_producer_region(adapters.as_ref()).is_some() {
         return execute_streaming_region(db, compiled, initial_arc, ctx, adapters, started).await;
     }
 
@@ -1651,7 +1687,11 @@ async fn execute_streaming_region(
         }
         let inputs = build_inputs(&compiled, run_idx, &outputs, &active_by_pos);
         let adapter = adapters.get(&node.node_type).ok_or_else(|| {
-            anyhow!("no adapter for node '{}' (type '{}')", node.id, node.node_type)
+            anyhow!(
+                "no adapter for node '{}' (type '{}')",
+                node.id,
+                node.node_type
+            )
         })?;
         let step_started = ctx.clock.now_ms();
         let attempt_started = Instant::now();
@@ -2331,7 +2371,14 @@ async fn create_execution_record(
     let pool = db.clone();
     let flow_id = flow_id.to_string();
     let id = tokio::task::spawn_blocking(move || {
-        repository::create_flow_execution(&pool, &flow_id, None, None, "running", parent_execution_id)
+        repository::create_flow_execution(
+            &pool,
+            &flow_id,
+            None,
+            None,
+            "running",
+            parent_execution_id,
+        )
     })
     .await??;
     Ok(id)
@@ -2491,9 +2538,9 @@ mod chain_integration_tests {
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("strict_stt: no input"))?;
             match &input.envelope.payload {
-                FlowValue::Audio { .. } => {
-                    Ok(FlowEnvelope::with_payload(FlowValue::Text("transcript".into())))
-                }
+                FlowValue::Audio { .. } => Ok(FlowEnvelope::with_payload(FlowValue::Text(
+                    "transcript".into(),
+                ))),
                 other => Err(anyhow::anyhow!(
                     "stt adapter: payload must be Audio, got {other:?}"
                 )),
@@ -2777,7 +2824,9 @@ mod chain_integration_tests {
     /// output(stream) streams its EnvelopeDelta chunks through to the client.
     #[tokio::test]
     async fn execute_streaming_with_non_llm_stream_producer() {
-        use crate::flow_engine::node_adapter::test_support::{CapturingProgress, TestStreamProducer};
+        use crate::flow_engine::node_adapter::test_support::{
+            CapturingProgress, TestStreamProducer,
+        };
         let mut r = AdapterRegistry::new();
         r.register(Arc::new(TriggerNodeAdapter::new()));
         r.register(Arc::new(OutputNodeAdapter::new()));
@@ -2975,6 +3024,7 @@ mod concurrent_executor_tests {
     use super::execute_blocking;
     use crate::db::DbPool;
     use crate::flow_engine::cache::CompiledFlow;
+    use crate::flow_engine::envelope::TraceStatus;
     use crate::flow_engine::envelope::{
         FinishReason, FlowEnvelope, FlowExecutionOutcome, FlowValue, NodeInput,
     };
@@ -2985,7 +3035,6 @@ mod concurrent_executor_tests {
         CombineNodeAdapter, ConditionNodeAdapter, OutputNodeAdapter, TriggerNodeAdapter,
     };
     use crate::flow_engine::types::{FlowDataType, FlowNode};
-    use crate::flow_engine::envelope::TraceStatus;
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
     use std::path::Path;
@@ -3311,7 +3360,10 @@ mod concurrent_executor_tests {
         }"#;
         let outcome = run_with_input(json, "nope").await;
         assert_eq!(node_status(&outcome, "live"), Some(&TraceStatus::Ok));
-        assert_eq!(node_status(&outcome, "dead_in"), Some(&TraceStatus::Skipped));
+        assert_eq!(
+            node_status(&outcome, "dead_in"),
+            Some(&TraceStatus::Skipped)
+        );
         assert_eq!(
             node_status(&outcome, "c"),
             Some(&TraceStatus::Ok),
@@ -3475,13 +3527,19 @@ mod concurrent_executor_tests {
         }"#;
         let outcome = run_with_input(json, "go").await;
         assert_eq!(node_status(&outcome, "t_branch"), Some(&TraceStatus::Ok));
-        assert_eq!(node_status(&outcome, "f_branch"), Some(&TraceStatus::Skipped));
+        assert_eq!(
+            node_status(&outcome, "f_branch"),
+            Some(&TraceStatus::Skipped)
+        );
         assert_eq!(outcome.final_envelope.payload.as_text(), Some("t_branch"));
 
         // input="stop" ⇒ false branch runs, true branch Skipped.
         let outcome = run_with_input(json, "stop").await;
         assert_eq!(node_status(&outcome, "f_branch"), Some(&TraceStatus::Ok));
-        assert_eq!(node_status(&outcome, "t_branch"), Some(&TraceStatus::Skipped));
+        assert_eq!(
+            node_status(&outcome, "t_branch"),
+            Some(&TraceStatus::Skipped)
+        );
         assert_eq!(outcome.final_envelope.payload.as_text(), Some("f_branch"));
     }
 
@@ -3860,9 +3918,8 @@ mod harness_streaming_tests {
                 ]
             }}"#
         );
-        let compiled = Arc::new(
-            CompiledFlow::from_json("0", &outer_json, &registry).expect("compile outer"),
-        );
+        let compiled =
+            Arc::new(CompiledFlow::from_json("0", &outer_json, &registry).expect("compile outer"));
 
         let mut initial = FlowEnvelope::empty();
         initial.payload = FlowValue::Text("go".into());
@@ -3898,7 +3955,10 @@ mod harness_streaming_tests {
 
         let outcome = exec.outcome.await.expect("outcome");
         assert_eq!(outcome.finish_reason, FinishReason::Stop);
-        assert_eq!(outcome.final_envelope.payload.as_text(), Some("blocking iter 3"));
+        assert_eq!(
+            outcome.final_envelope.payload.as_text(),
+            Some("blocking iter 3")
+        );
     }
 
     /// Finding 3 (end-to-end) — the grace-summary streaming pass runs through the
@@ -3954,9 +4014,8 @@ mod harness_streaming_tests {
                 ]
             }}"#
         );
-        let compiled = Arc::new(
-            CompiledFlow::from_json("0", &outer_json, &registry).expect("compile outer"),
-        );
+        let compiled =
+            Arc::new(CompiledFlow::from_json("0", &outer_json, &registry).expect("compile outer"));
 
         let mut initial = FlowEnvelope::empty();
         initial.payload = FlowValue::Text("go".into());
@@ -3978,12 +4037,18 @@ mod harness_streaming_tests {
         }
         // 2 blocking iterations exhausted the budget; the grace pass streamed
         // with the last blocking iteration's count (iter=2).
-        assert!(text.contains("FINAL(iter=2)"), "grace pass did not stream: {text:?}");
+        assert!(
+            text.contains("FINAL(iter=2)"),
+            "grace pass did not stream: {text:?}"
+        );
         assert!(saw_finish, "client never got finish_reason=Stop");
 
         let outcome = exec.outcome.await.expect("outcome");
         assert_eq!(outcome.finish_reason, FinishReason::Stop);
-        assert_eq!(outcome.final_envelope.payload.as_text(), Some("FINAL(iter=2)"));
+        assert_eq!(
+            outcome.final_envelope.payload.as_text(),
+            Some("FINAL(iter=2)")
+        );
     }
 }
 
@@ -3998,7 +4063,8 @@ mod loop_region_tests {
     use crate::db::DbPool;
     use crate::flow_engine::cache::CompiledFlow;
     use crate::flow_engine::envelope::{
-        ChatMessage, ChatRole, FlowEnvelope, FlowExecutionOutcome, FlowValue, LlmToolCall, NodeInput,
+        ChatMessage, ChatRole, FlowEnvelope, FlowExecutionOutcome, FlowValue, LlmToolCall,
+        NodeInput,
     };
     use crate::flow_engine::node_adapter::{
         test_support::stub_ctx, AdapterRegistry, ExecutionContext, NodeAdapter, PortSpec,
@@ -4135,7 +4201,11 @@ mod loop_region_tests {
         let outcome = run(&region_flow(25, false), 3).await;
         // 3 iterations: turns 1,2 carry tool calls; turn 3 has none → stop.
         assert_eq!(
-            outcome.final_envelope.meta.get("loop_iterations").and_then(|v| v.as_i64()),
+            outcome
+                .final_envelope
+                .meta
+                .get("loop_iterations")
+                .and_then(|v| v.as_i64()),
             Some(3)
         );
         assert_eq!(
@@ -4154,7 +4224,11 @@ mod loop_region_tests {
         // stop_at far above the budget → the body always emits tool calls.
         let outcome = run(&region_flow(4, false), 1000).await;
         assert_eq!(
-            outcome.final_envelope.meta.get("loop_iterations").and_then(|v| v.as_i64()),
+            outcome
+                .final_envelope
+                .meta
+                .get("loop_iterations")
+                .and_then(|v| v.as_i64()),
             Some(4)
         );
         assert_eq!(
@@ -4174,11 +4248,19 @@ mod loop_region_tests {
         let outcome = run(&region_flow(2, true), 1000).await;
         // 2 budgeted + 1 grace = 3 body runs.
         assert_eq!(
-            outcome.final_envelope.meta.get("iter").and_then(|v| v.as_i64()),
+            outcome
+                .final_envelope
+                .meta
+                .get("iter")
+                .and_then(|v| v.as_i64()),
             Some(3)
         );
         assert_eq!(
-            outcome.final_envelope.meta.get("loop_iterations").and_then(|v| v.as_i64()),
+            outcome
+                .final_envelope
+                .meta
+                .get("loop_iterations")
+                .and_then(|v| v.as_i64()),
             Some(3)
         );
         assert!(outcome.final_envelope.meta.get("loop_final_pass").is_none());
@@ -4188,15 +4270,20 @@ mod loop_region_tests {
     #[tokio::test]
     async fn cancelled_region_is_flow_error() {
         let reg = registry(1000);
-        let compiled =
-            Arc::new(CompiledFlow::from_json("0", &region_flow(10, false).to_string(), &reg).expect("compile"));
+        let compiled = Arc::new(
+            CompiledFlow::from_json("0", &region_flow(10, false).to_string(), &reg)
+                .expect("compile"),
+        );
         let ctx = stub_ctx();
         ctx.cancel_token.cancel();
         let outcome = execute_blocking(db(), compiled, FlowEnvelope::empty(), ctx, reg)
             .await
             .expect("execute_blocking returns an outcome carrying the error");
         assert!(
-            outcome.error.as_deref().is_some_and(|e| e.contains("cancelled")),
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("cancelled")),
             "expected a cancelled error, got: {:?}",
             outcome.error
         );
@@ -4226,7 +4313,11 @@ mod loop_region_tests {
             .rev()
             .find(|m| m.role == ChatRole::Assistant)
             .unwrap();
-        assert!(last.tool_calls.as_ref().map(|c| c.is_empty()).unwrap_or(true));
+        assert!(last
+            .tool_calls
+            .as_ref()
+            .map(|c| c.is_empty())
+            .unwrap_or(true));
     }
 
     /// (e) R11 rejects a region whose external edge leaves at a non-exit node.
@@ -4430,7 +4521,10 @@ mod direct_execution_tests {
 
         let fut = execute_direct_blocking(llm_node(), initial, ctx, registry);
         let res = tokio::time::timeout(std::time::Duration::from_millis(100), fut).await;
-        assert!(res.is_err(), "stalled direct execution must hit the backstop");
+        assert!(
+            res.is_err(),
+            "stalled direct execution must hit the backstop"
+        );
     }
 
     #[tokio::test]

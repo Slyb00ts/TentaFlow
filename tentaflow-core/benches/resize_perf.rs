@@ -19,11 +19,7 @@ use tentaflow_core::vision::resize::resize_rgb;
 const ADR_DIR: &str = "/mnt/abyss/Files/Dokumenty/Praca/Euvic/Tematy/ADR/PoC AI/Zdjęcia/5";
 
 /// Zdjecia do benchu — kilka klatek ~5152x3864.
-const SAMPLES: &[&str] = &[
-    "DSCN9751.JPG",
-    "DSCN9752.JPG",
-    "DSCN9753.JPG",
-];
+const SAMPLES: &[&str] = &["DSCN9751.JPG", "DSCN9752.JPG", "DSCN9753.JPG"];
 
 /// Wczytuje i dekoduje zdjecie do (RGB24 bytes, w, h).
 fn load_rgb(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
@@ -43,9 +39,7 @@ fn bench_resize(c: &mut Criterion) {
     }
 
     if images.is_empty() {
-        eprintln!(
-            "resize_perf: brak zdjec ADR w {ADR_DIR} — bench pominiety (zamontuj dysk)"
-        );
+        eprintln!("resize_perf: brak zdjec ADR w {ADR_DIR} — bench pominiety (zamontuj dysk)");
         return;
     }
 
@@ -71,12 +65,8 @@ fn bench_resize(c: &mut Criterion) {
             group.bench_function("image_triangle", |b| {
                 let img = RgbImage::from_raw(*sw, *sh, src.clone()).unwrap();
                 b.iter(|| {
-                    let out = image::imageops::resize(
-                        black_box(&img),
-                        dw,
-                        dh,
-                        FilterType::Triangle,
-                    );
+                    let out =
+                        image::imageops::resize(black_box(&img), dw, dh, FilterType::Triangle);
                     black_box(out);
                 })
             });

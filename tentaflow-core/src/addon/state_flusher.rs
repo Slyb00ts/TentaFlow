@@ -261,7 +261,10 @@ pub fn purge_addon(db: &Db, addon_id: &str) -> Result<()> {
         )
         .context("addon state purge: delete")?;
     if deleted > 0 {
-        info!("addon state: purged {} persisted row(s) for '{}'", deleted, addon_id);
+        info!(
+            "addon state: purged {} persisted row(s) for '{}'",
+            deleted, addon_id
+        );
     }
     Ok(())
 }
@@ -332,7 +335,9 @@ mod tests {
     fn rows_for(db: &Db, addon_id: &str) -> Vec<(String, Vec<u8>)> {
         let conn = db.read().unwrap();
         let mut stmt = conn
-            .prepare("SELECT state_key, value FROM addon_state WHERE addon_id = ?1 ORDER BY state_key")
+            .prepare(
+                "SELECT state_key, value FROM addon_state WHERE addon_id = ?1 ORDER BY state_key",
+            )
             .unwrap();
         let rows = stmt
             .query_map(rusqlite::params![addon_id], |r| {
@@ -406,7 +411,9 @@ mod tests {
         let db = test_db();
         let store = AddonStateStore::new();
 
-        store.set("a", "eph", b"x".to_vec(), Tier::Ephemeral).unwrap();
+        store
+            .set("a", "eph", b"x".to_vec(), Tier::Ephemeral)
+            .unwrap();
         store.set("a", "dur", b"y".to_vec(), Tier::Durable).unwrap();
 
         let stats = flush_once(&db, &store).unwrap();
@@ -476,7 +483,10 @@ mod tests {
         assert_eq!(store.get("a", "k"), Some(b"new".to_vec()));
         let _ = bad; // bad DB only here to document the failed-write origin.
         flush_once(&good, &store).unwrap();
-        assert_eq!(rows_for(&good, "a"), vec![("k".to_string(), b"new".to_vec())]);
+        assert_eq!(
+            rows_for(&good, "a"),
+            vec![("k".to_string(), b"new".to_vec())]
+        );
     }
 
     #[test]
@@ -627,9 +637,7 @@ mod tests {
         );
 
         // Write AFTER the flusher started; no tick will fire before cancel.
-        store
-            .set(addon, "k", b"v".to_vec(), Tier::Durable)
-            .unwrap();
+        store.set(addon, "k", b"v".to_vec(), Tier::Durable).unwrap();
 
         // Cancel + await the final drain (mirrors AddonManager::shutdown +
         // await_state_flusher_drain).

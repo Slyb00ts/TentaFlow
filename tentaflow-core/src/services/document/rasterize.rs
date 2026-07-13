@@ -243,7 +243,11 @@ pub fn rasterize_pdf_streaming(
         return Err(RasterizeError::EmptyDocument);
     }
 
-    let dpi = if dpi.is_finite() && dpi > 0.0 { dpi } else { 150.0 };
+    let dpi = if dpi.is_finite() && dpi > 0.0 {
+        dpi
+    } else {
+        150.0
+    };
     // Cap stron: min(żądane, faktyczne). `max_pages` klampujemy do i32.
     let limit: i32 = max_pages.min(i32::MAX as u32) as i32;
     let limit = limit.min(total);
@@ -419,56 +423,56 @@ pub(crate) fn text_layer_pdf(pages: usize) -> Vec<u8> {
 /// go w warstwie tekstowej (FPDFText).
 #[cfg(test)]
 fn build_pdf(pages: usize, page_text: impl Fn(usize) -> String) -> Vec<u8> {
-        let mut objs: Vec<String> = Vec::new();
-        objs.push("<< /Type /Catalog /Pages 2 0 R >>".to_string());
-        let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", 3 + i * 2)).collect();
+    let mut objs: Vec<String> = Vec::new();
+    objs.push("<< /Type /Catalog /Pages 2 0 R >>".to_string());
+    let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", 3 + i * 2)).collect();
+    objs.push(format!(
+        "<< /Type /Pages /Kids [{}] /Count {} >>",
+        kids.join(" "),
+        pages
+    ));
+    for i in 0..pages {
+        let content_obj = 4 + i * 2;
         objs.push(format!(
-            "<< /Type /Pages /Kids [{}] /Count {} >>",
-            kids.join(" "),
-            pages
-        ));
-        for i in 0..pages {
-            let content_obj = 4 + i * 2;
-            objs.push(format!(
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] \
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] \
                  /Resources << /Font << /F1 {} 0 R >> >> /Contents {} 0 R >>",
-                2 + pages * 2 + 1,
-                content_obj
-            ));
-            // Tekst łamiemy na linie (~60 znaków) i każdą emitujemy osobnym `Tj`
-            // z przesunięciem `Td` w dół. Inaczej jedna długa linia wybiega poza
-            // MediaBox i pdfium ekstrahuje tylko widoczne glify — testowy PDF z
-            // bogatą warstwą tekstową musi faktycznie zmieścić tekst na stronie.
-            let full = page_text(i);
-            let chars: Vec<char> = full.chars().collect();
-            let mut content = String::from("BT /F1 10 Tf 72 760 Td 12 TL\n");
-            for chunk in chars.chunks(60) {
-                let line: String = chunk.iter().collect();
-                content.push_str(&format!("({line}) Tj T*\n"));
-            }
-            content.push_str("ET");
-            objs.push(format!(
-                "<< /Length {} >>\nstream\n{}\nendstream",
-                content.len(),
-                content
-            ));
+            2 + pages * 2 + 1,
+            content_obj
+        ));
+        // Tekst łamiemy na linie (~60 znaków) i każdą emitujemy osobnym `Tj`
+        // z przesunięciem `Td` w dół. Inaczej jedna długa linia wybiega poza
+        // MediaBox i pdfium ekstrahuje tylko widoczne glify — testowy PDF z
+        // bogatą warstwą tekstową musi faktycznie zmieścić tekst na stronie.
+        let full = page_text(i);
+        let chars: Vec<char> = full.chars().collect();
+        let mut content = String::from("BT /F1 10 Tf 72 760 Td 12 TL\n");
+        for chunk in chars.chunks(60) {
+            let line: String = chunk.iter().collect();
+            content.push_str(&format!("({line}) Tj T*\n"));
         }
-        objs.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string());
+        content.push_str("ET");
+        objs.push(format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            content
+        ));
+    }
+    objs.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string());
 
-        let mut pdf = String::from("%PDF-1.4\n");
-        let mut offsets = Vec::with_capacity(objs.len());
-        for (i, body) in objs.iter().enumerate() {
-            offsets.push(pdf.len());
-            pdf.push_str(&format!("{} 0 obj\n{}\nendobj\n", i + 1, body));
-        }
-        let xref_pos = pdf.len();
-        pdf.push_str(&format!("xref\n0 {}\n", objs.len() + 1));
-        pdf.push_str("0000000000 65535 f \n");
-        for off in &offsets {
-            pdf.push_str(&format!("{:010} 00000 n \n", off));
-        }
-        pdf.push_str(&format!(
-            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+    let mut pdf = String::from("%PDF-1.4\n");
+    let mut offsets = Vec::with_capacity(objs.len());
+    for (i, body) in objs.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.push_str(&format!("{} 0 obj\n{}\nendobj\n", i + 1, body));
+    }
+    let xref_pos = pdf.len();
+    pdf.push_str(&format!("xref\n0 {}\n", objs.len() + 1));
+    pdf.push_str("0000000000 65535 f \n");
+    for off in &offsets {
+        pdf.push_str(&format!("{:010} 00000 n \n", off));
+    }
+    pdf.push_str(&format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
         objs.len() + 1,
         xref_pos
     ));
@@ -481,7 +485,11 @@ mod tests {
 
     /// Helper testowy: zbiera wszystkie wyemitowane strony do `Vec` (eager —
     /// tylko do asercji w testach; ścieżka produkcyjna streamuje przez kanał).
-    fn collect_pages(bytes: &[u8], dpi: f32, max_pages: u32) -> Result<Vec<PageRender>, RasterizeError> {
+    fn collect_pages(
+        bytes: &[u8],
+        dpi: f32,
+        max_pages: u32,
+    ) -> Result<Vec<PageRender>, RasterizeError> {
         let mut out = Vec::new();
         rasterize_pdf_streaming(bytes, dpi, max_pages, |p| {
             out.push(p);
@@ -499,13 +507,17 @@ mod tests {
         assert_eq!(p.index, 0);
         // PNG ma poprawny nagłówek magic i niezerową długość.
         assert!(!p.png.is_empty());
-        assert_eq!(&p.png[..8], &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']);
+        assert_eq!(
+            &p.png[..8],
+            &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']
+        );
     }
 
     #[test]
     fn rasterize_respects_page_cap() {
         let pdf = minimal_pdf(5);
-        let count = rasterize_pdf_streaming(&pdf, 100.0, 2, |_| Ok(())).expect("rasteryzacja z cap-em");
+        let count =
+            rasterize_pdf_streaming(&pdf, 100.0, 2, |_| Ok(())).expect("rasteryzacja z cap-em");
         assert_eq!(count, 2, "cap stron egzekwowany");
     }
 
@@ -528,7 +540,10 @@ mod tests {
         })
         .expect("streaming 6 stron");
         assert_eq!(total, 6, "wszystkie strony wyemitowane");
-        assert_eq!(max_alive, 1, "co najwyżej jedna strona w pamięci naraz (O(1))");
+        assert_eq!(
+            max_alive, 1,
+            "co najwyżej jedna strona w pamięci naraz (O(1))"
+        );
     }
 
     /// Sink zwracający `SinkClosed` (konsument odszedł) zatrzymuje render wcześnie
@@ -577,7 +592,10 @@ mod tests {
     fn extract_pdf_text_respects_max_pages() {
         let pdf = text_layer_pdf(5);
         let res = extract_pdf_text(&pdf, 2).expect("ekstrakcja z cap-em stron");
-        assert_eq!(res.page_count, 2, "cap stron egzekwowany w ekstrakcji tekstu");
+        assert_eq!(
+            res.page_count, 2,
+            "cap stron egzekwowany w ekstrakcji tekstu"
+        );
     }
 
     #[test]

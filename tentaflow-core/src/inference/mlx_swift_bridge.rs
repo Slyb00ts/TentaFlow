@@ -627,9 +627,9 @@ impl InferenceEngine for MlxSwiftEngine {
     }
 
     async fn embeddings(&self, params: EmbeddingParams) -> Result<EmbeddingResult> {
-        let embed = SWIFT_EMBED
-            .get()
-            .context("Swift MLX embed callback nie zostal zarejestrowany (stary libMLXBridge.dylib?)")?;
+        let embed = SWIFT_EMBED.get().context(
+            "Swift MLX embed callback nie zostal zarejestrowany (stary libMLXBridge.dylib?)",
+        )?;
         let callbacks = get_callbacks()?;
         let embed_fn = embed.embed_fn;
         let ctx = SendPtr::from_raw(callbacks.context);

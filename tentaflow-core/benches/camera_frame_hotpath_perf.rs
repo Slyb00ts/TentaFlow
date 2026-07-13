@@ -40,8 +40,8 @@ use tentaflow_core::services::streaming::{StreamFilter, StreamingBus};
 
 /// Resolutions exercised, as (label, width, height). RGB24 => w*h*3 bytes.
 const RESOLUTIONS: &[(&str, u32, u32)] = &[
-    ("720p", 1280, 720),     // 2.76 MB
-    ("1080p", 1920, 1080),   // 6.22 MB
+    ("720p", 1280, 720),       // 2.76 MB
+    ("1080p", 1920, 1080),     // 6.22 MB
     ("1600x1200", 1600, 1200), // 5.76 MB — the production camera case
 ];
 

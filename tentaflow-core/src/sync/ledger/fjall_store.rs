@@ -6,11 +6,10 @@
 use super::types::{
     decode, encode, partition_materialization_order, AppendResult, BaselineEpoch, CompactionPolicy,
     HybridLogicalTimestamp, InboxEntry, LedgerResult, NewSyncOperation, NodeChainEntry,
-    NodeFrontierEntry, NodeHead,
-    NodeLogQuery, OperationId, OperationQuery, OutboxEntry, PartitionId, PeerId, RedactedRecord,
-    RepairQueueEntry,
-    SnapshotId, SyncLedgerError, SyncLedgerStore, SyncOperation, SyncOperationSigner,
-    SyncOperationVerifier, SyncSnapshot, SyncTarget,
+    NodeFrontierEntry, NodeHead, NodeLogQuery, OperationId, OperationQuery, OutboxEntry,
+    PartitionId, PeerId, RedactedRecord, RepairQueueEntry, SnapshotId, SyncLedgerError,
+    SyncLedgerStore, SyncOperation, SyncOperationSigner, SyncOperationVerifier, SyncSnapshot,
+    SyncTarget,
 };
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use parking_lot::Mutex;
@@ -91,10 +90,7 @@ impl FjallSyncLedgerStore {
     /// node frontier and make us re-pull (and possibly re-admit as a fork) every seq
     /// between the upgraded position and the real head. Keep the higher head and its
     /// hash; only adopt the candidate when it genuinely advances the chain.
-    fn frontier_to_persist(
-        &self,
-        candidate: NodeFrontierEntry,
-    ) -> LedgerResult<NodeFrontierEntry> {
+    fn frontier_to_persist(&self, candidate: NodeFrontierEntry) -> LedgerResult<NodeFrontierEntry> {
         match self.get_node_frontier(&candidate.node_id)? {
             Some(existing) if existing.last_seq >= candidate.last_seq => Ok(existing),
             _ => Ok(candidate),
@@ -132,8 +128,12 @@ impl FjallSyncLedgerStore {
                 store = Self::open_at(path)?;
                 // Stamp the version AND the durable reseed marker in one persist:
                 // the marker must survive a crash before the runtime reseeds.
-                store.meta.insert(META_SCHEMA_KEY, encode(&LEDGER_SCHEMA_VERSION)?)?;
-                store.meta.insert(META_NEEDS_BASELINE_RESET_KEY, encode(&true)?)?;
+                store
+                    .meta
+                    .insert(META_SCHEMA_KEY, encode(&LEDGER_SCHEMA_VERSION)?)?;
+                store
+                    .meta
+                    .insert(META_NEEDS_BASELINE_RESET_KEY, encode(&true)?)?;
                 store.persist()?;
                 store.needs_baseline_reset = true;
                 tracing::warn!(
@@ -143,7 +143,9 @@ impl FjallSyncLedgerStore {
             }
             None if store_is_empty(&store)? => {
                 // Brand-new ledger: stamp the current version, nothing to migrate.
-                store.meta.insert(META_SCHEMA_KEY, encode(&LEDGER_SCHEMA_VERSION)?)?;
+                store
+                    .meta
+                    .insert(META_SCHEMA_KEY, encode(&LEDGER_SCHEMA_VERSION)?)?;
                 store.persist()?;
             }
             None => {
@@ -152,8 +154,12 @@ impl FjallSyncLedgerStore {
                 drop(store);
                 wipe_ledger_dir(path)?;
                 store = Self::open_at(path)?;
-                store.meta.insert(META_SCHEMA_KEY, encode(&LEDGER_SCHEMA_VERSION)?)?;
-                store.meta.insert(META_NEEDS_BASELINE_RESET_KEY, encode(&true)?)?;
+                store
+                    .meta
+                    .insert(META_SCHEMA_KEY, encode(&LEDGER_SCHEMA_VERSION)?)?;
+                store
+                    .meta
+                    .insert(META_NEEDS_BASELINE_RESET_KEY, encode(&true)?)?;
                 store.persist()?;
                 store.needs_baseline_reset = true;
                 tracing::warn!(
@@ -315,10 +321,7 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         Ok(operations)
     }
 
-    fn get_node_chain_entries(
-        &self,
-        query: NodeLogQuery,
-    ) -> LedgerResult<Vec<NodeChainEntry>> {
+    fn get_node_chain_entries(&self, query: NodeLogQuery) -> LedgerResult<Vec<NodeChainEntry>> {
         let mut entries = Vec::new();
         let prefix = node_prefix(&query.node_id);
         for item in self.node_log.prefix(&prefix) {
@@ -1286,9 +1289,7 @@ mod tests {
         // node_log resolves the position (so equivocation detection works) and the
         // redacted record is retrievable, but the inbox stays empty.
         assert_eq!(
-            store
-                .get_node_log_entry(signer.node_id(), 1)
-                .unwrap(),
+            store.get_node_log_entry(signer.node_id(), 1).unwrap(),
             Some(op.op_id)
         );
         assert!(store.get_redacted_record(op.op_id).unwrap().is_some());
@@ -1337,12 +1338,7 @@ mod tests {
         assert!(store.get_redacted_record(op.op_id).unwrap().is_some());
 
         store
-            .admit_verified_operation(
-                source,
-                op.clone(),
-                frontier,
-                &HexNodeIdOperationVerifier,
-            )
+            .admit_verified_operation(source, op.clone(), frontier, &HexNodeIdOperationVerifier)
             .unwrap();
 
         assert!(store.get_redacted_record(op.op_id).unwrap().is_none());
@@ -1369,7 +1365,10 @@ mod tests {
                 .unwrap();
             store
                 .meta
-                .insert(META_SCHEMA_KEY, encode(&(LEDGER_SCHEMA_VERSION - 1)).unwrap())
+                .insert(
+                    META_SCHEMA_KEY,
+                    encode(&(LEDGER_SCHEMA_VERSION - 1)).unwrap(),
+                )
                 .unwrap();
             store.persist().unwrap();
         }

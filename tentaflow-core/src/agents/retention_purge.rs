@@ -42,9 +42,7 @@ pub fn purge_expired_agent_runtime(pool: &DbPool) -> anyhow::Result<(usize, usiz
             match resolve_retention_policy(&conn, org_id, RetentionScopeKind::AgentRuns, None) {
                 Ok(policy) => policy.retention_days,
                 Err(e) => {
-                    tracing::warn!(
-                        "agent-runs purge: no retention policy for org '{org_id}': {e}"
-                    );
+                    tracing::warn!("agent-runs purge: no retention policy for org '{org_id}': {e}");
                     continue;
                 }
             }

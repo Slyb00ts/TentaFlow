@@ -157,7 +157,10 @@ pub fn build_webrtc_pipeline(
         if sink_pad.is_linked() {
             return;
         }
-        if let Some(structure) = src_pad.current_caps().and_then(|c| c.structure(0).map(|s| s.name().to_string())) {
+        if let Some(structure) = src_pad
+            .current_caps()
+            .and_then(|c| c.structure(0).map(|s| s.name().to_string()))
+        {
             if !structure.starts_with("video/") {
                 return;
             }
@@ -273,17 +276,16 @@ pub(super) fn attach_mp4_branch_webrtc(
         .add_many([&queue_b, &parse, &timestamper, &mux, &sink])
         .map_err(|e| format!("add_many branch B: {e}"))?;
 
-    let tee_src_pad = tee
-        .request_pad_simple("src_%u")
-        .ok_or_else(|| {
-            // No request pad yet, but the elements ARE in the pipeline — remove
-            // them so a failed attach never leaves dangling elements that a
-            // later attach would trip over.
-            let refs: Vec<&gst::Element> =
-                [&queue_b, &parse, &timestamper, &mux, &sink].into_iter().collect();
-            let _ = pipeline.remove_many(refs);
-            "tee src_%u request for branch B failed".to_string()
-        })?;
+    let tee_src_pad = tee.request_pad_simple("src_%u").ok_or_else(|| {
+        // No request pad yet, but the elements ARE in the pipeline — remove
+        // them so a failed attach never leaves dangling elements that a
+        // later attach would trip over.
+        let refs: Vec<&gst::Element> = [&queue_b, &parse, &timestamper, &mux, &sink]
+            .into_iter()
+            .collect();
+        let _ = pipeline.remove_many(refs);
+        "tee src_%u request for branch B failed".to_string()
+    })?;
 
     // From here the request pad exists alongside the added elements: capture
     // both as a single `Mp4BranchState` so EVERY subsequent failure path can
@@ -372,8 +374,7 @@ fn wire_and_link_webrtc_branch(
     let queue_b_sink = queue_b
         .static_pad("sink")
         .ok_or_else(|| "queue_b sink pad missing".to_string())?;
-    gst::Element::link_many(state.elements.iter())
-        .map_err(|e| format!("link branch B: {e}"))?;
+    gst::Element::link_many(state.elements.iter()).map_err(|e| format!("link branch B: {e}"))?;
 
     wire_mp4_appsink(sink, publisher)?;
 

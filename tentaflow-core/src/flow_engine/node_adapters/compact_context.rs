@@ -446,9 +446,13 @@ impl NodeAdapter for CompactContextNodeAdapter {
 
         // Detect an existing summary at the head of the dropped span BEFORE
         // phase-1 rewrites the span, so re-compaction updates it in place.
-        let prior_summary =
-            Self::existing_summary(&out.context.messages, &dropped, summary_prefix, summary_suffix)
-                .map(|(body, _)| body.to_string());
+        let prior_summary = Self::existing_summary(
+            &out.context.messages,
+            &dropped,
+            summary_prefix,
+            summary_suffix,
+        )
+        .map(|(body, _)| body.to_string());
 
         // Phase 1 (no LLM): prune tool results / dedup / truncate args.
         let pruned = Self::phase1_prune(&out.context.messages, &dropped);
@@ -613,9 +617,7 @@ mod tests {
     use super::*;
     use crate::flow_engine::dispatchers::llm::LlmDispatcher;
     use crate::flow_engine::dispatchers::llm::{LlmRequest as Req, LlmResponse};
-    use crate::flow_engine::envelope::{
-        FinishReason, LlmStreamChunk, LlmToolCall, TokenUsage,
-    };
+    use crate::flow_engine::envelope::{FinishReason, LlmStreamChunk, LlmToolCall, TokenUsage};
     use crate::flow_engine::node_adapter::test_support::{stub_ctx, CapturingProgress};
     use futures::stream::BoxStream;
     use serde_json::json;
@@ -843,11 +845,18 @@ mod tests {
         assert!(first.ends_with(SUMMARY_SUFFIX));
         assert!(first.contains("## Active Task"));
         // The newest two messages survive verbatim (tail protection).
-        assert!(out.context.messages[1].text_or_default().starts_with("eeee"));
-        assert!(out.context.messages[2].text_or_default().starts_with("ffff"));
+        assert!(out.context.messages[1]
+            .text_or_default()
+            .starts_with("eeee"));
+        assert!(out.context.messages[2]
+            .text_or_default()
+            .starts_with("ffff"));
         assert_eq!(out.context.system_prompts, vec!["system rules".to_string()]);
         // The summary flag is set for the next re-compaction.
-        assert_eq!(out.meta.get(META_HAS_SUMMARY).and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            out.meta.get(META_HAS_SUMMARY).and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     /// Tail protection: the most-recent user message is kept even when it is
@@ -856,18 +865,17 @@ mod tests {
     #[tokio::test]
     async fn tail_protects_user_and_keeps_pairs_intact() {
         let messages = vec![
-            big(ChatRole::User, 'a', 4000),               // 0
-            assistant_with_call("c0", "t.run", "{}"),     // 1
-            tool_result("c0", "t.run", "old result"),     // 2
-            big(ChatRole::User, 'q', 4000),               // 3 recent user
-            assistant_with_call("c1", "t.run", "{}"),     // 4
-            tool_result("c1", "t.run", "result"),         // 5 newest (a tool msg)
+            big(ChatRole::User, 'a', 4000),           // 0
+            assistant_with_call("c0", "t.run", "{}"), // 1
+            tool_result("c0", "t.run", "old result"), // 2
+            big(ChatRole::User, 'q', 4000),           // 3 recent user
+            assistant_with_call("c1", "t.run", "{}"), // 4
+            tool_result("c1", "t.run", "result"),     // 5 newest (a tool msg)
         ];
         // protect_last=1 would start the tail on index 5 (a Tool message) — the
         // boundary aligner must pull its assistant (index 4) into the tail, and
         // the recent-user rule must pull index 3 in too.
-        let (dropped, protected) =
-            CompactContextNodeAdapter::plan_split(&messages, 1);
+        let (dropped, protected) = CompactContextNodeAdapter::plan_split(&messages, 1);
         // Tail must begin no later than the recent user (3) and on a non-tool.
         assert_eq!(*protected.first().unwrap(), 3);
         assert_ne!(messages[*protected.first().unwrap()].role, ChatRole::Tool);
@@ -952,10 +960,16 @@ mod tests {
             .await
             .expect("execute 1");
         assert_eq!(
-            out1.meta.get(META_LOW_YIELD_STREAK).and_then(|v| v.as_u64()),
+            out1.meta
+                .get(META_LOW_YIELD_STREAK)
+                .and_then(|v| v.as_u64()),
             Some(1)
         );
-        assert!(out1.meta.get(META_DISABLED).and_then(|v| v.as_bool()).is_none());
+        assert!(out1
+            .meta
+            .get(META_DISABLED)
+            .and_then(|v| v.as_bool())
+            .is_none());
 
         // Pass 2: carry the streak forward (simulate the run's meta) → disabled.
         let mut env2 = make_env();
@@ -964,7 +978,10 @@ mod tests {
             .execute(&cfg, &[input(env2)], &ctx)
             .await
             .expect("execute 2");
-        assert_eq!(out2.meta.get(META_DISABLED).and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            out2.meta.get(META_DISABLED).and_then(|v| v.as_bool()),
+            Some(true)
+        );
 
         // Pass 3: disabled → passthrough, no further LLM call.
         let calls_before = llm.calls.load(Ordering::SeqCst);
@@ -1060,7 +1077,10 @@ mod tests {
             .await
             .expect("execute");
 
-        assert_eq!(*llm.last_system.lock().unwrap(), "CUSTOM SUMMARY INSTRUCTION");
+        assert_eq!(
+            *llm.last_system.lock().unwrap(),
+            "CUSTOM SUMMARY INSTRUCTION"
+        );
         let first = out.context.messages[0].text_or_default();
         assert!(first.starts_with("[[BEGIN]]"), "got: {first}");
         assert!(first.ends_with("[[END]]"), "got: {first}");
@@ -1101,7 +1121,10 @@ mod tests {
             .expect("execute");
 
         // The prior summary was detected (configured prefix) → UPDATE path used.
-        assert_eq!(*llm.last_system.lock().unwrap(), "CUSTOM UPDATE INSTRUCTION");
+        assert_eq!(
+            *llm.last_system.lock().unwrap(),
+            "CUSTOM UPDATE INSTRUCTION"
+        );
         assert!(llm.last_user.lock().unwrap().contains("Previous summary:"));
         assert!(llm.last_user.lock().unwrap().contains("old"));
     }

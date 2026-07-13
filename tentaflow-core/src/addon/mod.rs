@@ -1690,18 +1690,15 @@ impl AddonManager {
         // DB ERROR FAILS start: running on phantom-empty state would let on_start
         // overwrite/invalidate persisted durable data (an empty store is Ok with
         // 0 rows, which is fine — only a real read failure aborts start).
-        let outcome = state_flusher::load_addon(
-            &self.db,
-            state_store::AddonStateStore::global(),
-            addon_id,
-        )
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "addon '{}' start aborted: cannot load persisted durable state: {}",
-                addon_id,
-                e
-            )
-        })?;
+        let outcome =
+            state_flusher::load_addon(&self.db, state_store::AddonStateStore::global(), addon_id)
+                .map_err(|e| {
+                anyhow::anyhow!(
+                    "addon '{}' start aborted: cannot load persisted durable state: {}",
+                    addon_id,
+                    e
+                )
+            })?;
         if !outcome.already_loaded
             && (outcome.loaded > 0
                 || outcome.skipped_quota > 0
@@ -2150,8 +2147,10 @@ impl AddonManager {
                     .instance
                     .get_typed_func::<(i32, i32), ()>(&mut addon_instance.store, "dealloc")
                 {
-                    let _ = dealloc_fn
-                        .call(&mut addon_instance.store, (ptr, panel_id_bytes.len() as i32));
+                    let _ = dealloc_fn.call(
+                        &mut addon_instance.store,
+                        (ptr, panel_id_bytes.len() as i32),
+                    );
                 }
 
                 if call_result != 0 {
@@ -2177,13 +2176,12 @@ impl AddonManager {
         // Token wyzwala `select` w petli, ktora wychodzi cleanly bez
         // szarpania trzymanej instancji — po cancel mozemy bezpiecznie
         // wyciagnac instancje z mapy ponizej.
-        let had_service_token =
-            if let Some(token) = self.service_tasks.lock().remove(instance_id) {
-                token.cancel();
-                true
-            } else {
-                false
-            };
+        let had_service_token = if let Some(token) = self.service_tasks.lock().remove(instance_id) {
+            token.cancel();
+            true
+        } else {
+            false
+        };
         // Zdejmij rezerwację instancji serwisowej (no-op dla workerów puli).
         self.service_instance_ids.lock().remove(instance_id);
 
@@ -2373,7 +2371,13 @@ impl AddonManager {
         params: serde_json::Value,
         user_id: &str,
     ) -> Result<serde_json::Value> {
-        self.call_tool_inner(addon_id, tool_name, params, CallIdentity::User(user_id), false)
+        self.call_tool_inner(
+            addon_id,
+            tool_name,
+            params,
+            CallIdentity::User(user_id),
+            false,
+        )
     }
 
     /// Like `call_tool` but skips the per-addon `"llm"` permission check because
@@ -2389,7 +2393,13 @@ impl AddonManager {
         params: serde_json::Value,
         user_id: &str,
     ) -> Result<serde_json::Value> {
-        self.call_tool_inner(addon_id, tool_name, params, CallIdentity::User(user_id), true)
+        self.call_tool_inner(
+            addon_id,
+            tool_name,
+            params,
+            CallIdentity::User(user_id),
+            true,
+        )
     }
 
     /// Invokes a tool as a GENUINE system call: the worker's `AddonState` runs
@@ -2439,9 +2449,9 @@ impl AddonManager {
         // lub gdy to system call — system call nie ma principala do adjudykacji,
         // a uprawnienia host-fn rozstrzyga check_permission ścieżką CR-006).
         if !skip_permission_check {
-            let perm_result =
-                self.permission_checker
-                    .check(addon_id, audit_user, "llm", None);
+            let perm_result = self
+                .permission_checker
+                .check(addon_id, audit_user, "llm", None);
             if !perm_result.is_granted() {
                 bail!(
                     "Brak uprawnien do wywolania narzedzia '{}.{}' dla user_id={}",
@@ -2924,7 +2934,10 @@ impl AddonManager {
             // Refuel — store wspoldzielony z tickami, ktore zostawiaja maly
             // budzet (patrz call_tool_inner).
             if let Err(e) = runtime::refuel_store(&mut addon_instance.store, DEFAULT_FUEL_LIMIT) {
-                warn!("refuel_store przed on_event nieudany dla '{}': {e}", addon_id);
+                warn!(
+                    "refuel_store przed on_event nieudany dla '{}': {e}",
+                    addon_id
+                );
                 continue;
             }
             let event_export = addon_instance.language_adapter.export_on_event();
@@ -3051,8 +3064,11 @@ impl AddonManager {
         // unless the catalog's current bundle hash (= what's on disk now) equals the
         // instance's `installed_bundle_hash` (= what was approved at install/"Aktualizuj").
         // A content change without a manual update is rejected, not silently executed.
-        let catalog_hash =
-            crate::db::repository::get_package_bundle_hash(&self.db, &package_id, &package_version)?;
+        let catalog_hash = crate::db::repository::get_package_bundle_hash(
+            &self.db,
+            &package_id,
+            &package_version,
+        )?;
         let approved_hash =
             crate::db::repository::get_instance_installed_bundle_hash(&self.db, addon_id)?;
         if let Some(catalog) = catalog_hash.as_deref() {

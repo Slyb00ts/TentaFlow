@@ -406,12 +406,14 @@ impl LocalInferenceHandler {
                     warn!("Strumień inferencji zakończony błędem silnika: {err}");
                     Some("error".to_string())
                 } else {
-                    Some(match &token.finish_reason {
-                        Some(StopReason::MaxTokens) => "length",
-                        Some(StopReason::StopSequence(_)) => "stop",
-                        Some(StopReason::EndOfText) | None => "stop",
-                    }
-                    .to_string())
+                    Some(
+                        match &token.finish_reason {
+                            Some(StopReason::MaxTokens) => "length",
+                            Some(StopReason::StopSequence(_)) => "stop",
+                            Some(StopReason::EndOfText) | None => "stop",
+                        }
+                        .to_string(),
+                    )
                 }
             } else {
                 None
@@ -430,17 +432,16 @@ impl LocalInferenceHandler {
             // Usage jedzie na tokenie finalnym z realnymi licznikami silnika; tym
             // chunkiem token accounting (AiGateway) zlicza zużycie. Silniki nie
             // raportujące liczb (np. MLX) dają 0 → pomijamy, by nie wpisywać zer.
-            let usage = if token.is_final
-                && (token.prompt_tokens > 0 || token.completion_tokens > 0)
-            {
-                Some(Usage {
-                    prompt_tokens: token.prompt_tokens,
-                    completion_tokens: token.completion_tokens,
-                    total_tokens: token.prompt_tokens + token.completion_tokens,
-                })
-            } else {
-                None
-            };
+            let usage =
+                if token.is_final && (token.prompt_tokens > 0 || token.completion_tokens > 0) {
+                    Some(Usage {
+                        prompt_tokens: token.prompt_tokens,
+                        completion_tokens: token.completion_tokens,
+                        total_tokens: token.prompt_tokens + token.completion_tokens,
+                    })
+                } else {
+                    None
+                };
             // Metryki przepustowości: preferujemy pomiar silnika (realne granice faz
             // prefill/dekodowanie), wall-clock jest tylko fallbackiem gdy silnik nie
             // podał wartości (0.0). TTFT zostaje zawsze wall-clock — to realny,

@@ -6,7 +6,6 @@
 // authoritative and MUST match icons.svg symbol ids one-to-one.
 // =============================================================================
 
-
 string_enum! {
     /// Whitelist of known icon names. Unknown decode → `Error{InvalidIcon}`.
     pub enum IconName {

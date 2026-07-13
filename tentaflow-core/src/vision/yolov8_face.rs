@@ -77,7 +77,10 @@ impl FaceDetector for Yolov8FaceEngine {
             .ok_or_else(|| anyhow!("YOLO: brak output tensorow"))?;
 
         let shape = out.shape().to_vec();
-        let data = out.view().as_slice::<f32>().context("YOLO: output nie jest f32")?;
+        let data = out
+            .view()
+            .as_slice::<f32>()
+            .context("YOLO: output nie jest f32")?;
 
         // YOLOv8/v11 zwraca (1, attrs, anchors) lub transponowane (1, anchors, attrs).
         // attrs zalezy od eksportu:
@@ -158,7 +161,5 @@ pub fn load(model_path: &Path) -> Result<Yolov8FaceEngine> {
         )?
         .into_optimized()?
         .into_runnable()?;
-    Ok(Yolov8FaceEngine {
-        model,
-    })
+    Ok(Yolov8FaceEngine { model })
 }

@@ -345,10 +345,7 @@ pub(crate) async fn running_container_image_tag(engine_id: &str, host_port: u16)
         let matches_name = c
             .names
             .as_ref()
-            .map(|ns| {
-                ns.iter()
-                    .any(|n| n.trim_start_matches('/') == expected)
-            })
+            .map(|ns| ns.iter().any(|n| n.trim_start_matches('/') == expected))
             .unwrap_or(false);
         if matches_name {
             c.image
@@ -368,7 +365,11 @@ pub(crate) fn hash12_from_image_tag(image: &str) -> Option<String> {
     // Tag to część po OSTATNIM `:` (repo może zawierać port rejestru z `:`).
     let tag = image.rsplit(':').next()?;
     let last = tag.rsplit('-').next()?;
-    if last.len() == 12 && last.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+    if last.len() == 12
+        && last
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
         Some(last.to_string())
     } else {
         None
@@ -1136,15 +1137,14 @@ impl DeployStrategy for DockerDeploy {
         // Bollard build (`bundle_root.join(dockerfile_rel)`); IO error = nie
         // wstrzykujemy (bezpieczny default, brak warningu).
         if !build_args.contains_key("TORCH_CUDA_ARCH_LIST") {
-            let dockerfile_declares_arch_arg = std::fs::read_to_string(
-                bundle_root.join(&dockerfile_rel),
-            )
-            .map(|contents| {
-                contents
-                    .lines()
-                    .any(|l| l.trim_start().starts_with("ARG TORCH_CUDA_ARCH_LIST"))
-            })
-            .unwrap_or(false);
+            let dockerfile_declares_arch_arg =
+                std::fs::read_to_string(bundle_root.join(&dockerfile_rel))
+                    .map(|contents| {
+                        contents
+                            .lines()
+                            .any(|l| l.trim_start().starts_with("ARG TORCH_CUDA_ARCH_LIST"))
+                    })
+                    .unwrap_or(false);
             if dockerfile_declares_arch_arg {
                 if let Some(arch_list) = gpu.torch_cuda_arch_list() {
                     build_args.insert("TORCH_CUDA_ARCH_LIST".to_string(), arch_list);
@@ -1229,8 +1229,7 @@ impl DeployStrategy for DockerDeploy {
                     ],
                 )
                 .await?;
-                let thin_tag =
-                    format!("tentaflow/vllm-spark-ray:{}", self.manifest.engine.version);
+                let thin_tag = format!("tentaflow/vllm-spark-ray:{}", self.manifest.engine.version);
                 let mut ba: HashMap<String, String> = HashMap::new();
                 ba.insert("BASE_IMAGE".to_string(), base);
                 (
@@ -1436,8 +1435,7 @@ impl DeployStrategy for DockerDeploy {
             .unwrap_or(false)
         {
             engine_args.push("--chat-template".to_string());
-            engine_args
-                .push("/app/chat_templates/tool_chat_template_gemma4.jinja".to_string());
+            engine_args.push("/app/chat_templates/tool_chat_template_gemma4.jinja".to_string());
         }
         if self.manifest.engine.is_cuda_vllm() {
             let is_pooling = matches!(
@@ -1498,7 +1496,10 @@ impl DeployStrategy for DockerDeploy {
         // Group label so a distributed teardown can find every member container
         // even when the service row is gone.
         if let Some(d) = &distributed {
-            labels.insert(DISTRIBUTED_LABEL.to_string(), d.deployment_cluster_id.clone());
+            labels.insert(
+                DISTRIBUTED_LABEL.to_string(),
+                d.deployment_cluster_id.clone(),
+            );
             labels.insert("tentaflow.distributed_role".to_string(), d.role.clone());
         }
 
@@ -1540,8 +1541,7 @@ impl DeployStrategy for DockerDeploy {
         // katalog do `models/checkpoints`, zeby `/object_info` widzial go od
         // razu po wstaniu kontenera.
         if self.manifest.engine.id == "comfyui" {
-            if let Some(preset) =
-                super::resolve_selected_preset(&self.manifest, &self.user_config)
+            if let Some(preset) = super::resolve_selected_preset(&self.manifest, &self.user_config)
             {
                 if let Some(file) = preset
                     .checkpoint_file
@@ -1608,13 +1608,12 @@ impl DeployStrategy for DockerDeploy {
         // CONTAINER_MODELS_PATH) i wskazujemy `MODEL_PATH` na jego sciezke w
         // kontenerze — bez osobnego binda. Odpowiednik ComfyUI `checkpoint_file`.
         if docker_section.gguf_model_mount {
-            let repo = super::resolve_model_repo(&self.manifest, &self.user_config).ok_or_else(
-                || {
+            let repo =
+                super::resolve_model_repo(&self.manifest, &self.user_config).ok_or_else(|| {
                     DeployError::Manifest(
                         "gguf_model_mount engine has no resolvable model repo".into(),
                     )
-                },
-            )?;
+                })?;
             let model_file = self
                 .user_config
                 .get("model_file")
@@ -1704,12 +1703,11 @@ impl DeployStrategy for DockerDeploy {
             match &gpu {
                 GpuSelection::None => s.info("[docker] GPU passthrough: none (CPU)"),
                 GpuSelection::Count(c) if *c < 0 => s.info("[docker] GPU passthrough: all"),
-                GpuSelection::Count(c) => {
-                    s.info(&format!("[docker] GPU passthrough: count={}", c))
-                }
-                GpuSelection::Devices(ids) => {
-                    s.info(&format!("[docker] GPU passthrough: devices=[{}]", ids.join(",")))
-                }
+                GpuSelection::Count(c) => s.info(&format!("[docker] GPU passthrough: count={}", c)),
+                GpuSelection::Devices(ids) => s.info(&format!(
+                    "[docker] GPU passthrough: devices=[{}]",
+                    ids.join(",")
+                )),
             }
         }
 

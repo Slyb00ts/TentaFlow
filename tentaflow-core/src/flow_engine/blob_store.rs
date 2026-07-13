@@ -663,12 +663,18 @@ mod tests {
         let persistent = Arc::new(InMemoryBlobStore::new());
         let store = CompositeBlobStore::new(ephemeral.clone(), persistent.clone());
 
-        let blob = store.put(b"page-image".to_vec(), "image/png").await.unwrap();
+        let blob = store
+            .put(b"page-image".to_vec(), "image/png")
+            .await
+            .unwrap();
         assert_eq!(persistent.len(), 1, "put zapisuje do persistent");
 
         store.delete(&blob).await.unwrap();
         assert_eq!(persistent.len(), 0, "delete kasuje z persistent");
-        assert!(store.get(&blob).await.is_err(), "blob nie do odczytania po delete");
+        assert!(
+            store.get(&blob).await.is_err(),
+            "blob nie do odczytania po delete"
+        );
     }
 
     // Minimal recursive iterator to avoid pulling walkdir as a dev-dep just for one test.

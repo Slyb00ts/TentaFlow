@@ -162,10 +162,7 @@ async fn run_element(
 
     // Light-mode body run (§3.5 block 2): the runner skips the per-element
     // flow_executions row.
-    match runner
-        .run(&body_flow_id, element_env, &ctx, 1, true)
-        .await
-    {
+    match runner.run(&body_flow_id, element_env, &ctx, 1, true).await {
         Ok(final_env) => {
             let payload = flow_value_to_json(&final_env.payload);
             ElementOutcome {
@@ -250,7 +247,9 @@ impl NodeAdapter for MapNodeAdapter {
             // (ask_user / permission grant) and extended the shared deadline Arc
             // is not aborted by the human-wait time it just added back (§3.13).
             if ctx.cancel_token.is_cancelled()
-                || ctx.effective_deadline().is_some_and(|d| Instant::now() >= d)
+                || ctx
+                    .effective_deadline()
+                    .is_some_and(|d| Instant::now() >= d)
             {
                 join_set.abort_all();
                 return Err(anyhow!("map '{}': cancelled before completion", node.id));
@@ -294,7 +293,9 @@ impl NodeAdapter for MapNodeAdapter {
             // Cancel / deadline aborts the rest in flight (effective deadline —
             // see the pre-spawn gate above).
             if ctx.cancel_token.is_cancelled()
-                || ctx.effective_deadline().is_some_and(|d| Instant::now() >= d)
+                || ctx
+                    .effective_deadline()
+                    .is_some_and(|d| Instant::now() >= d)
             {
                 join_set.abort_all();
                 return Err(anyhow!("map '{}': cancelled mid-flight", node.id));

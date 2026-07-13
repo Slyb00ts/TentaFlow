@@ -106,10 +106,7 @@ static APPLE_OCR_REG: std::sync::OnceLock<AppleOcrRegistration> = std::sync::Onc
 /// `tentaflow_register_apple_tts`.
 #[cfg(target_os = "ios")]
 #[no_mangle]
-pub extern "C" fn tentaflow_register_apple_ocr(
-    recognize: RecognizeFn,
-    free_string: FreeStringFn,
-) {
+pub extern "C" fn tentaflow_register_apple_ocr(recognize: RecognizeFn, free_string: FreeStringFn) {
     let _ = APPLE_OCR_REG.set(AppleOcrRegistration {
         recognize,
         free_string,
@@ -196,8 +193,7 @@ impl AppleOcrEngine {
             .into_owned();
         unsafe { free_string(ptr) };
 
-        let parsed: OcrJson =
-            serde_json::from_str(&json).context("parse Apple OCR JSON")?;
+        let parsed: OcrJson = serde_json::from_str(&json).context("parse Apple OCR JSON")?;
         Ok(Some(parsed))
     }
 }

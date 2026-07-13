@@ -247,7 +247,8 @@ impl GraphManager {
                     // bierze slot-lock, widzi Removed i re-fetchuje kanoniczny wpis.
                     if let Some(entry) = self.collections.get(&k).map(|e| e.value().clone()) {
                         self.mark_removed(&entry);
-                        self.collections.remove_if(&k, |_, v| Arc::ptr_eq(v, &entry));
+                        self.collections
+                            .remove_if(&k, |_, v| Arc::ptr_eq(v, &entry));
                     }
                 }
                 None => break,
@@ -355,8 +356,9 @@ impl GraphManager {
         // Engine z wiersza (metadane) jeśli istnieje — czysty odczyt, NIE tworzy
         // wiersza. Domyślny gdy wiersza brak; ścieżka zawsze deterministyczna.
         let engine = match self.load_engine(org_id, addon_id, collection)? {
-            Some(engine_str) => GraphEngine::parse(&engine_str)
-                .ok_or_else(|| GraphError::Db(format!("invalid engine '{engine_str}' in DB row")))?,
+            Some(engine_str) => GraphEngine::parse(&engine_str).ok_or_else(|| {
+                GraphError::Db(format!("invalid engine '{engine_str}' in DB row"))
+            })?,
             None => GraphEngine::default_for_build(),
         };
         let file_path = self.file_path_for(org_id, addon_id, collection)?;
@@ -656,7 +658,12 @@ impl GraphManager {
     }
 
     /// Czy kolekcja istnieje w rejestrze (bez otwierania backendu).
-    pub fn collection_exists(&self, org_id: &str, addon_id: &str, collection: &str) -> Result<bool> {
+    pub fn collection_exists(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        collection: &str,
+    ) -> Result<bool> {
         validate_org_id(org_id).map_err(map_vector_err)?;
         validate_addon_id(addon_id).map_err(map_vector_err)?;
         validate_namespace_name(collection).map_err(map_vector_err)?;
@@ -714,8 +721,7 @@ impl GraphManager {
         iterations: u32,
     ) -> Result<Vec<(String, f64)>> {
         let csr = self.export_csr(org_id, addon_id, collection)?;
-        let mut scored =
-            super::ppr::personalized_pagerank(&csr, &[], damping, iterations as usize);
+        let mut scored = super::ppr::personalized_pagerank(&csr, &[], damping, iterations as usize);
         scored.truncate(top_n as usize);
         Ok(scored)
     }
@@ -1215,7 +1221,12 @@ impl GraphManager {
     /// zaraz go usunie). Interuje wpis, jeśli go nie ma — to gwarantuje, że delete
     /// i równoległy `get_or_create` dzielą TEN SAM `Arc<GraphEntry>` i serializują
     /// się na jego write-locku (bug H przy cache-miss).
-    fn canonical_entry_for(&self, key: &GraphKey, engine: GraphEngine, file_path: PathBuf) -> Arc<GraphEntry> {
+    fn canonical_entry_for(
+        &self,
+        key: &GraphKey,
+        engine: GraphEngine,
+        file_path: PathBuf,
+    ) -> Arc<GraphEntry> {
         self.collections
             .entry(key.clone())
             .or_insert_with(|| {

@@ -23,9 +23,7 @@ impl ServiceRegistry {
 
     /// Loads every row from `services` (regardless of status) into memory.
     pub fn load_from_db(&self, pool: &DbPool) -> Result<usize> {
-        let conn = pool
-            .read()
-            .map_err(|e| anyhow::anyhow!("db read: {}", e))?;
+        let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {}", e))?;
         let rows = services::list_all(&conn).context("registry::load_from_db")?;
         let mut guard = self
             .by_id

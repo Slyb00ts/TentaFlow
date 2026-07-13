@@ -323,7 +323,8 @@ impl SignedUrlIssuer {
 }
 
 fn hmac_sign(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
-    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
     let result = mac.finalize().into_bytes();
     let mut arr = [0u8; 32];

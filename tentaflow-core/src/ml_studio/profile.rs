@@ -178,7 +178,12 @@ impl ColumnAcc {
 
     fn finish(self, scanned_rows: u64) -> ColumnProfile {
         let unique_count = self.distinct.len() as u64;
-        let detected = infer_type(&self.type_sample, unique_count, scanned_rows, self.distinct_capped);
+        let detected = infer_type(
+            &self.type_sample,
+            unique_count,
+            scanned_rows,
+            self.distinct_capped,
+        );
         let missing_ratio = if scanned_rows == 0 {
             0.0
         } else {
@@ -213,7 +218,12 @@ impl ColumnAcc {
 /// Infers a column type from a sample of its non-empty values plus cardinality
 /// context. Order matters: integer before float, then date, then categorical
 /// (low cardinality relative to row count), else text.
-fn infer_type(sample: &[String], unique_count: u64, scanned_rows: u64, distinct_capped: bool) -> ColumnType {
+fn infer_type(
+    sample: &[String],
+    unique_count: u64,
+    scanned_rows: u64,
+    distinct_capped: bool,
+) -> ColumnType {
     if sample.is_empty() {
         return ColumnType::Text;
     }
@@ -289,7 +299,8 @@ fn parse_date(v: &str) -> bool {
     }
     // Year-first or year-last; require one four-or-fewer-digit year and the other
     // two fields in month/day ranges.
-    let plausible = |y: u32, m: u32, d: u32| y >= 1 && (1..=12).contains(&m) && (1..=31).contains(&d);
+    let plausible =
+        |y: u32, m: u32, d: u32| y >= 1 && (1..=12).contains(&m) && (1..=31).contains(&d);
     let (a, b, c) = (nums[0], nums[1], nums[2]);
     plausible(a, b, c) || plausible(c, b, a) || plausible(c, a, b)
 }
@@ -316,7 +327,10 @@ pub fn profile_table(bytes: &[u8], filename: &str) -> Result<TableProfile> {
         "csv" => profile_csv(bytes, b','),
         "tsv" => profile_csv(bytes, b'\t'),
         "xlsx" | "xlsm" | "xlsb" | "xls" => profile_xlsx(bytes),
-        other => bail!("unsupported file extension '.{}' (expected csv or xlsx)", other),
+        other => bail!(
+            "unsupported file extension '.{}' (expected csv or xlsx)",
+            other
+        ),
     }
 }
 
@@ -350,7 +364,10 @@ pub fn parse_table(bytes: &[u8], filename: &str) -> Result<(Vec<String>, Vec<Vec
         "csv" => parse_csv(bytes, b','),
         "tsv" => parse_csv(bytes, b'\t'),
         "xlsx" | "xlsm" | "xlsb" | "xls" => parse_xlsx(bytes),
-        other => bail!("unsupported file extension '.{}' (expected csv or xlsx)", other),
+        other => bail!(
+            "unsupported file extension '.{}' (expected csv or xlsx)",
+            other
+        ),
     }
 }
 
@@ -402,7 +419,9 @@ fn parse_xlsx(bytes: &[u8]) -> Result<(Vec<String>, Vec<Vec<String>>)> {
         .worksheet_range(&sheet_name)
         .map_err(|e| anyhow::anyhow!("failed to read worksheet '{sheet_name}': {e}"))?;
     let mut iter = range.rows();
-    let header_row = iter.next().ok_or_else(|| anyhow::anyhow!("XLSX sheet is empty"))?;
+    let header_row = iter
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("XLSX sheet is empty"))?;
     let names: Vec<String> = header_row.iter().map(cell_to_string).collect();
     if names.is_empty() {
         bail!("XLSX sheet has no columns");
@@ -480,7 +499,9 @@ fn profile_xlsx(bytes: &[u8]) -> Result<TableProfile> {
         .map_err(|e| anyhow::anyhow!("failed to read worksheet '{sheet_name}': {e}"))?;
 
     let mut rows = range.rows();
-    let header_row = rows.next().ok_or_else(|| anyhow::anyhow!("XLSX sheet is empty"))?;
+    let header_row = rows
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("XLSX sheet is empty"))?;
     let names: Vec<String> = header_row.iter().map(cell_to_string).collect();
     if names.is_empty() {
         bail!("XLSX sheet has no columns");
@@ -506,7 +527,12 @@ fn profile_xlsx(bytes: &[u8]) -> Result<TableProfile> {
     Ok(finish_profile("xlsx", accs, row_count, scanned))
 }
 
-fn finish_profile(format: &str, accs: Vec<ColumnAcc>, row_count: u64, scanned: u64) -> TableProfile {
+fn finish_profile(
+    format: &str,
+    accs: Vec<ColumnAcc>,
+    row_count: u64,
+    scanned: u64,
+) -> TableProfile {
     let columns: Vec<ColumnProfile> = accs.into_iter().map(|a| a.finish(scanned)).collect();
     TableProfile {
         format: format.to_string(),

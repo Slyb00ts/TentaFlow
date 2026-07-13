@@ -293,10 +293,7 @@ pub fn encrypt_api_key_in_config(
                 let trimmed = key.trim();
                 if !trimmed.is_empty() && !trimmed.starts_with("enc:") {
                     if let Ok(encrypted) = settings_cipher.encrypt(trimmed) {
-                        map.insert(
-                            config_key.to_string(),
-                            serde_json::Value::String(encrypted),
-                        );
+                        map.insert(config_key.to_string(), serde_json::Value::String(encrypted));
                     }
                 }
             }
@@ -952,9 +949,7 @@ pub async fn stop_checked(
                     ..Default::default()
                 }))
                 .await
-                .map_err(|e| {
-                    DeployError::Other(format!("stop_checked: list containers: {}", e))
-                })?;
+                .map_err(|e| DeployError::Other(format!("stop_checked: list containers: {}", e)))?;
             // Nazwy w bollard mają wiodący `/`; normalizujemy przed porównaniem.
             let lingering: Vec<String> = listed
                 .into_iter()
@@ -1031,10 +1026,14 @@ pub async fn stop_engine_orphans(engine_id: &str, keep_ports: &[u16]) {
             let Some((pid_s, args)) = line.split_once(char::is_whitespace) else {
                 continue;
             };
-            let Some(idx) = args.find(&marker) else { continue };
+            let Some(idx) = args.find(&marker) else {
+                continue;
+            };
             // Path segment right after the marker is `<engine>-<port>`.
             let inst = args[idx + marker.len()..].split('/').next().unwrap_or("");
-            let port = inst.strip_prefix(&inst_prefix).and_then(|s| s.parse::<u16>().ok());
+            let port = inst
+                .strip_prefix(&inst_prefix)
+                .and_then(|s| s.parse::<u16>().ok());
             if let Some(p) = port {
                 if keep_ports.contains(&p) {
                     continue;
@@ -2985,7 +2984,7 @@ mod tests {
                 speculator_num_tokens: None,
                 vllm: None,
                 checkpoint_file: None,
-                quant_variants: vec![],
+                quant_variants: Vec::new(),
             }],
             parameters: vec![],
             docker_source_hash: String::new(),

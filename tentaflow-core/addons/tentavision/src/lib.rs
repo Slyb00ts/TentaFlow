@@ -25,6 +25,9 @@ use tentaflow_sdk_spec::{
     Value, PathSegment, StatePath, PatchOp, PatchOpKind,
 };
 use tentaflow_sdk_spec::protocol::control::CborMap;
+use tentaflow_sdk_spec::protocol::recording::{
+    RecordingGetUrlInput, RecordingListInput, RecordingListItem, RecordingListOut, UrlOut,
+};
 use tentaflow_sdk_spec::protocol::camera::{
     CameraAddInput, CameraAddOutput, CameraCvPipelineDeleteOut, CameraCvPipelineIdInput,
     CameraCvPipelineOut, CameraCvPipelineSaveInput, CameraCvPipelineSaveOut,
@@ -128,6 +131,14 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
     fn alias_list_available_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn recording_list_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn recording_get_url_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
     fn event_subscribe(
         event_type_ptr: i32, event_type_len: i32,
         filter_json_ptr: i32, filter_json_len: i32,
@@ -517,6 +528,54 @@ fn camera_local_devices() -> Result<Vec<LocalCameraDeviceOut>, AbiError> {
 fn camera_test_connection(vendor: &str, url: &str) -> Result<CameraTestConnectionOut, AbiError> {
     let input = CameraTestConnectionInput { vendor: vendor.to_string(), url: url.to_string() };
     call_cbor_in_out(&input, camera_test_connection_v1)
+}
+
+// =============================================================================
+// Recording ABI wrappers
+// =============================================================================
+
+/// Server-side search filters for the recordings browser. All fields optional;
+/// they compose with AND on the host. `date_from`/`date_to` are unix
+/// milliseconds bounding the recording `created_at`; `plate`/`adr` are
+/// case-insensitive substrings over the event's gated OCR winners.
+#[derive(Default, Clone)]
+struct RecordingSearch {
+    camera_id: Option<String>,
+    date_from: Option<i64>,
+    date_to: Option<i64>,
+    plate: Option<String>,
+    adr: Option<String>,
+}
+
+/// Lists the addon's per-vehicle event recordings (`kind = "segment"`), newest
+/// first, applying the server-side search filters. Needs the `recording.read`
+/// permission; the host scopes rows to this addon + org and returns only
+/// browsable segment clips.
+fn host_recording_list(
+    search: &RecordingSearch,
+    limit: u32,
+) -> Result<Vec<RecordingListItem>, AbiError> {
+    let input = RecordingListInput {
+        camera_id: search.camera_id.clone(),
+        limit,
+        date_from: search.date_from,
+        date_to: search.date_to,
+        plate: search.plate.clone(),
+        adr: search.adr.clone(),
+    };
+    let out: RecordingListOut = call_cbor_in_out(&input, recording_list_v1)?;
+    Ok(out.items)
+}
+
+/// Issues a multi-use signed playback URL for a recording ref (relative
+/// `/recordings/<ref>?token=…`, resolved by the browser against the app origin).
+/// Needs the `recording.read` permission.
+fn host_recording_get_url(recording_ref: &str, ttl_secs: u64) -> Result<UrlOut, AbiError> {
+    let input = RecordingGetUrlInput {
+        recording_ref: recording_ref.to_string(),
+        ttl_secs,
+    };
+    call_cbor_in_out(&input, recording_get_url_v1)
 }
 
 // =============================================================================
@@ -1644,6 +1703,16 @@ struct PanelState {
     camera_flow_edit: Option<String>,
     // Camera whose CV-pipeline selector is open (its "Pipeline" row action).
     camera_pipeline_edit: Option<String>,
+    // Recording ref whose playback modal is open (its "Odtwórz" row action).
+    recording_playing: Option<String>,
+    // Camera filter applied to the recordings list (empty = all cameras).
+    recordings_camera_filter: String,
+    // Recordings-browser search inputs (empty string = filter inactive). Dates
+    // are `YYYY-MM-DD` day strings from the date inputs; plate/ADR are raw text.
+    recordings_date_from: String,
+    recordings_date_to: String,
+    recordings_plate_query: String,
+    recordings_adr_query: String,
     cv_pipelines: CvPipelinesState,
     error_message: Option<String>,
     success_message: Option<String>,
@@ -2325,6 +2394,12 @@ impl PanelState {
             camera_pending_remove: None,
             camera_flow_edit: None,
             camera_pipeline_edit: None,
+            recording_playing: None,
+            recordings_camera_filter: String::new(),
+            recordings_date_from: String::new(),
+            recordings_date_to: String::new(),
+            recordings_plate_query: String::new(),
+            recordings_adr_query: String::new(),
             cv_pipelines: CvPipelinesState::new(),
             error_message: None, success_message: None,
             discover: DiscoverState::new(), profiles: ProfilesState::new(),
@@ -2486,6 +2561,7 @@ pub extern "C" fn on_request(
         .or_else(|| tool.strip_prefix("ui.cameras."))
         .or_else(|| tool.strip_prefix("ui.overview."))
         .or_else(|| tool.strip_prefix("ui.live."))
+        .or_else(|| tool.strip_prefix("ui.recordings."))
         .or_else(|| tool.strip_prefix("ui.profiles."))
         .or_else(|| tool.strip_prefix("ui.alarms."))
         .or_else(|| tool.strip_prefix("ui.search."))
@@ -2577,6 +2653,17 @@ fn send_initial_shell() {
             visibility: SlotVisibility::Hidden,
             max_payload_bytes: Some(64 * 1024),
         },
+        // Dynamic modal body for the recordings playback dialog (video player +
+        // event metadata). Same Modal/Hidden overlay semantics as the wizard
+        // slots: its real container is created by the Modal when it mounts.
+        SlotDecl {
+            id: "recording_player_body".into(),
+            semantics: SlotSemantics::Modal,
+            default_state: SlotDefault::Empty,
+            cache_policy: CachePolicy::None,
+            visibility: SlotVisibility::Hidden,
+            max_payload_bytes: Some(64 * 1024),
+        },
     ];
     // The frontend resets its reactive store revision to 0 whenever it receives
     // a PanelShell (new shell/epoch). Reset the guest counter in lockstep so the
@@ -2611,6 +2698,7 @@ fn render_panel(panel_id: &str) {
     let content = match panel_id {
         "overview" => build_overview_content(),
         "live" => build_live_content(),
+        "recordings" => build_recordings_content(),
         "cameras" => build_cameras_content(),
         "alarms" => build_alarms_content(),
         "search" => build_search_content(),
@@ -2665,6 +2753,40 @@ fn render_panel(panel_id: &str) {
         // the inputs / selects / toggles mount with the backend draft values.
         if with_state(|s| s.cv_pipelines.manager_visible && s.cv_pipelines.editor_visible) {
             entries.extend(pipeline_editor_overlay());
+        }
+        let overlay = if entries.is_empty() { None } else { Some(entries) };
+        send_slot_content_with_overlay("content", content, overlay);
+    } else if panel_id == "recordings" {
+        // Seed the recordings Table rows into the content slot's state_overlay so
+        // it mounts populated (same mechanism as the cameras Table).
+        let mut entries: Vec<StateEntry> = Vec::new();
+        if let Some(rows) = PENDING_RECORDING_ROWS.lock().ok().and_then(|mut g| g.take()) {
+            entries.push(StateEntry {
+                path: StatePath::new(vec![PathSegment::Key("recordings_rows".into())]),
+                value: rows,
+            });
+        }
+        // Seed the search inputs' bound keys so they mount showing the persisted
+        // query values across re-renders (otherwise each re-query would reset the
+        // field the user is typing in).
+        let (df, dt, pq, aq) = with_state(|s| {
+            (
+                s.recordings_date_from.clone(),
+                s.recordings_date_to.clone(),
+                s.recordings_plate_query.clone(),
+                s.recordings_adr_query.clone(),
+            )
+        });
+        for (key, val) in [
+            ("recordings_date_from", df),
+            ("recordings_date_to", dt),
+            ("recordings_plate_query", pq),
+            ("recordings_adr_query", aq),
+        ] {
+            entries.push(StateEntry {
+                path: StatePath::new(vec![PathSegment::Key(key.into())]),
+                value: Value::Text(val),
+            });
         }
         let overlay = if entries.is_empty() { None } else { Some(entries) };
         send_slot_content_with_overlay("content", content, overlay);
@@ -2820,6 +2942,15 @@ fn render_panel(panel_id: &str) {
         send_slot_content_with_overlay("add_camera_body", build_add_camera_body(), Some(wizard_full_overlay()));
         send_slot_content("add_camera_footer", build_add_camera_footer());
     }
+
+    // When a recording playback modal is open on the recordings panel, fill its
+    // body slot with the video player + metadata. Sent AFTER "content" so the
+    // Modal's dynamic slot container already exists.
+    if panel_id == "recordings" {
+        if let Some(rec_ref) = with_state(|s| s.recording_playing.clone()) {
+            send_slot_content("recording_player_body", build_recording_player_body(&rec_ref));
+        }
+    }
 }
 
 // =============================================================================
@@ -2829,6 +2960,69 @@ fn render_panel(panel_id: &str) {
 fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
     log::info(&alloc::format!("TentaVision UI action '{}'", action));
     match action {
+        "recordings-play" => {
+            let rec_ref = params
+                .get("row_id")
+                .and_then(|x| x.as_str())
+                .or_else(|| params.get("recording_ref").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            with_state(|s| {
+                s.clear_messages();
+                s.recording_playing = if rec_ref.is_empty() { None } else { Some(rec_ref) };
+            });
+            render_panel("recordings");
+            json!({"ok":true})
+        }
+        "recordings-close" => {
+            with_state(|s| { s.recording_playing = None; s.clear_messages(); });
+            render_panel("recordings");
+            json!({"ok":true})
+        }
+        "recordings-filter-change" => {
+            let v = params
+                .get("value")
+                .and_then(|x| x.as_str())
+                .or_else(|| params.get("chipId").and_then(|x| x.as_str()))
+                .unwrap_or("all")
+                .to_string();
+            with_state(|s| {
+                s.recordings_camera_filter = if v == "all" { String::new() } else { v };
+            });
+            render_panel("recordings");
+            json!({"ok":true})
+        }
+        "recordings-search-change" => {
+            // A search field committed a keystroke: store it under its `field`
+            // key and re-query server-side on the next render.
+            let field = params.get("field").and_then(|x| x.as_str()).unwrap_or("");
+            let value = params
+                .get("value")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            with_state(|s| match field {
+                "recordings_date_from" => s.recordings_date_from = value,
+                "recordings_date_to" => s.recordings_date_to = value,
+                "recordings_plate_query" => s.recordings_plate_query = value,
+                "recordings_adr_query" => s.recordings_adr_query = value,
+                _ => {}
+            });
+            render_panel("recordings");
+            json!({"ok":true})
+        }
+        "recordings-search-clear" => {
+            with_state(|s| {
+                s.recordings_date_from.clear();
+                s.recordings_date_to.clear();
+                s.recordings_plate_query.clear();
+                s.recordings_adr_query.clear();
+            });
+            render_panel("recordings");
+            json!({"ok":true})
+        }
+        "recordings-refresh" => { render_panel("recordings"); json!({"ok":true}) }
         "camera-add-show" => handle_camera_add_show(),
         "camera-add-cancel" => { with_state(|s| { s.add_form_visible = false; s.wizard_step = 0; s.discover.reset(); s.clear_messages(); }); render_panel("cameras"); json!({"ok":true}) }
         "wizard-source-select" => handle_wizard_source_select(params),
@@ -3390,6 +3584,18 @@ fn handle_camera_remove(params: &JsonValue) -> JsonValue {
     let camera_id = params.get("camera_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     with_state(|s| s.clear_messages());
     if camera_id.is_empty() { with_state(|s| { s.error_message = Some("Wybierz kamerę do usunięcia.".to_string()); }); return json!({"ok":false,"error":"empty camera_id"}); }
+    // Remove from the CORE first — this soft-deletes the platform row and
+    // tears down the ingest pipeline. Deleting only the addon-local row would
+    // orphan the core camera: gone from the list, but the supervisor keeps
+    // (re)connecting to it forever. NotFound is tolerated so a locally
+    // orphaned row (core side already gone) can still be cleaned up.
+    match camera_remove(&camera_id) {
+        Ok(()) | Err(AbiError::NotFound) => {}
+        Err(e) => {
+            with_state(|s| { s.error_message = Some(alloc::format!("Błąd usuwania z rdzenia: {}", abi_message(e))); });
+            return json!({"ok":false,"error":alloc::format!("{}",e)});
+        }
+    }
     match db::delete_camera(&camera_id) {
         Ok(_) => { with_state(|s| { s.camera_pending_remove = None; s.success_message = Some("Kamera usunięta.".to_string()); }); json!({"ok":true}) }
         Err(e) => { with_state(|s| { s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e))); }); json!({"ok":false,"error":alloc::format!("{}",e)}) }
@@ -4625,6 +4831,7 @@ fn build_nav_tab_items(_active: &str) -> Vec<NavTab> {
     let entries: &[(&str, &str, &str)] = &[
         ("overview", "Dashboard", "dashboard"),
         ("live", "Live view", "video"),
+        ("recordings", "Nagrania", "video"),
         ("cameras", "Kamery", "cameras"),
         ("profiles", "Profile analityczne", "brain"),
         ("alarms", "Alarmy", "bell"),
@@ -5186,6 +5393,768 @@ fn build_live_content() -> Component {
     }
     let grid_comp = grid(columns, tiles);
     stack_v(vec![messages, toolbar, grid_comp])
+}
+
+// =============================================================================
+// Recordings panel — browse + play per-vehicle event clips
+// =============================================================================
+
+/// Rows for the recordings Table, seeded into the content slot's state_overlay
+/// so the Table mounts populated (same mechanism as `PENDING_CAMERA_ROWS`).
+static PENDING_RECORDING_ROWS: Mutex<Option<Value>> = Mutex::new(None);
+
+/// TTL for a recording playback signed URL. Comfortably longer than a single
+/// clip so the player never loses the source mid-playback, still bounded.
+const RECORDING_URL_TTL_SECS: u64 = 3600;
+/// Max recordings pulled into the browse list at once.
+const RECORDING_LIST_LIMIT: u32 = 200;
+
+/// The winner plate/ADR text parsed out of one `event_meta.texts.<class>` entry.
+/// `event_meta` has drifted between two shapes over builds, so this handles
+/// BOTH: the newer gated-winner object `{text, confidence, agreement,
+/// unreadable, votes}` and the older raw count-map `{"PL5657": 1972, ...}`.
+fn event_meta_winner_text(class_entry: Option<&JsonValue>) -> String {
+    let Some(entry) = class_entry else {
+        return "—".to_string();
+    };
+    // Pick the highest-count key from a `variant -> count` map, skipping the
+    // structural keys of a winner object.
+    let max_vote = |m: &serde_json::Map<String, JsonValue>| -> Option<String> {
+        let mut best: Option<(String, i64)> = None;
+        for (k, v) in m {
+            if matches!(k.as_str(), "text" | "confidence" | "agreement" | "unreadable" | "votes") {
+                continue;
+            }
+            if let Some(c) = v.as_i64() {
+                if best.as_ref().map(|(_, bc)| c > *bc).unwrap_or(true) && !k.trim().is_empty() {
+                    best = Some((k.trim().to_string(), c));
+                }
+            }
+        }
+        best.map(|(k, _)| k)
+    };
+    match entry {
+        // Winner-object shape. Prefer the finalized `text`; otherwise re-derive
+        // the agreement-majority read from `votes`. The stored `unreadable` flag
+        // is INTENTIONALLY ignored: it was set by the old confidence gate, which
+        // marked every plate unreadable because the plate-OCR softmax confidence
+        // is near-uniform (~0.05) even at 99% agreement. A recording whose votes
+        // agree on one plate should show that plate, not "nieczytelna".
+        JsonValue::Object(map) => {
+            if let Some(t) = map.get("text").and_then(JsonValue::as_str) {
+                let t = t.trim();
+                if !t.is_empty() {
+                    return t.to_string();
+                }
+            }
+            if let Some(JsonValue::Object(votes)) = map.get("votes") {
+                if let Some(w) = max_vote(votes) {
+                    return w;
+                }
+            }
+            // No `votes` object → treat the map itself as a raw count-map.
+            max_vote(map).unwrap_or_else(|| "—".to_string())
+        }
+        // A bare string winner (defensive; not emitted today).
+        JsonValue::String(s) => {
+            let s = s.trim();
+            if s.is_empty() { "—".to_string() } else { s.to_string() }
+        }
+        _ => "—".to_string(),
+    }
+}
+
+/// Extracts the winner text for one OCR class from a parsed `event_meta` blob.
+fn recording_meta_text(meta: &Option<JsonValue>, class: &str) -> String {
+    let Some(meta) = meta else {
+        return "—".to_string();
+    };
+    event_meta_winner_text(meta.get("texts").and_then(|t| t.get(class)))
+}
+
+/// Renders the aggregated sticker states (`event_meta.stany`) as a compact
+/// `label: state, label: state` string. `stany` is the majority state per
+/// sticker label written by the event recorder (`{"nalepka_3": "czysta", …}`).
+/// Empty / missing → "—". Keys are already sorted (BTreeMap) so order is stable.
+fn recording_meta_stany(meta: &Option<JsonValue>) -> String {
+    let Some(JsonValue::Object(map)) = meta.as_ref().and_then(|m| m.get("stany")) else {
+        return "—".to_string();
+    };
+    let parts: Vec<String> = map
+        .iter()
+        .filter_map(|(label, state)| {
+            let state = state.as_str()?.trim();
+            let label = label.trim();
+            if label.is_empty() || state.is_empty() {
+                return None;
+            }
+            Some(alloc::format!("{label}: {state}"))
+        })
+        .collect();
+    if parts.is_empty() {
+        "—".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Composes the single multi-line "Odczyty" cell for a recording: registration
+/// plate, ADR code and aggregated sticker states, one per line. Newlines render
+/// as line breaks via the `.tf-table td { white-space: pre-line }` rule. Empty
+/// fields collapse to "—" so every event shows all three read lines.
+fn recording_reads_text(plate: &str, adr: &str, stany: &str) -> String {
+    alloc::format!("Rejestracja: {plate}\nADR: {adr}\nNalepki: {stany}")
+}
+
+/// One truck's reads parsed out of an `event_meta.vehicles[]` entry.
+struct VehicleReads {
+    vehicle_id: u64,
+    plate: String,
+    adr: String,
+    stany: String,
+}
+
+/// Parses the per-truck breakdown from `event_meta.vehicles[]`, dropping the
+/// unassigned bucket (`vehicle_id == 0`). Empty when the blob predates the
+/// per-vehicle shape (old single-bag rows) — callers then fall back to the
+/// scalar columns + the whole-scene `event_meta` via `recording_meta_text`.
+/// Plate/ADR tolerate BOTH the gated-winner object and the raw count-map (via
+/// `event_meta_winner_text`); a per-vehicle `plate`/`adr` string field wins when
+/// present (the recorder emits it directly).
+fn recording_meta_vehicles(meta: &Option<JsonValue>) -> Vec<VehicleReads> {
+    let Some(JsonValue::Array(items)) = meta.as_ref().and_then(|m| m.get("vehicles")) else {
+        return Vec::new();
+    };
+    let mut out: Vec<VehicleReads> = Vec::new();
+    for item in items {
+        let vehicle_id = item.get("vehicle_id").and_then(JsonValue::as_u64).unwrap_or(0);
+        if vehicle_id == 0 {
+            // Unassigned bucket — signs outside any truck; not a per-truck block.
+            continue;
+        }
+        // Prefer the direct `plate`/`adr` string field; else derive from
+        // `texts.<class>` (tolerant of both stored shapes).
+        let plate = item
+            .get("plate")
+            .and_then(JsonValue::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                event_meta_winner_text(
+                    item.get("texts").and_then(|t| t.get("tablica_rejestracyjna")),
+                )
+            });
+        let adr = item
+            .get("adr")
+            .and_then(JsonValue::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                event_meta_winner_text(item.get("texts").and_then(|t| t.get("tablica_adr")))
+            });
+        let stany = recording_stany_map(item.get("stany"));
+        // Read-less buckets (a background car YOLO boxed but with no plate/ADR/
+        // sticker read) carry no information for the "Odczyty" column — skip them
+        // so the panel lists only trucks that actually read something.
+        if plate.trim().is_empty() && adr.trim().is_empty() && stany.trim().is_empty() {
+            continue;
+        }
+        out.push(VehicleReads {
+            vehicle_id,
+            plate,
+            adr,
+            stany,
+        });
+    }
+    // Stable order by vehicle_id so "Pojazd 1/2/…" numbering is deterministic.
+    out.sort_by_key(|v| v.vehicle_id);
+    out
+}
+
+/// Renders the "Odczyty" cell across one or more trucks. A SINGLE truck (or the
+/// old single-bag shape) renders exactly as before — no "Pojazd" prefix. Two or
+/// more trucks render one labelled block per truck ("Pojazd 1 — Rejestracja: … /
+/// ADR: … / Nalepki: …"), separated by a blank line.
+fn recording_reads_multi(vehicles: &[VehicleReads], fallback: &str) -> String {
+    match vehicles.len() {
+        0 => fallback.to_string(),
+        1 => {
+            let v = &vehicles[0];
+            recording_reads_text(&dash(&v.plate), &dash(&v.adr), &dash(&v.stany))
+        }
+        _ => {
+            let mut blocks: Vec<String> = Vec::with_capacity(vehicles.len());
+            for (i, v) in vehicles.iter().enumerate() {
+                blocks.push(alloc::format!(
+                    "Pojazd {} — Rejestracja: {}\nADR: {}\nNalepki: {}",
+                    i + 1,
+                    dash(&v.plate),
+                    dash(&v.adr),
+                    dash(&v.stany)
+                ));
+            }
+            blocks.join("\n\n")
+        }
+    }
+}
+
+/// "—" for an empty/blank string, else the trimmed string.
+fn dash(s: &str) -> String {
+    let t = s.trim();
+    if t.is_empty() {
+        "—".to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// Renders one vehicle's `stany` object (`{"nalepka_3":"czysta", …}`) as a
+/// compact `label: state, …` string, mirroring `recording_meta_stany` but for a
+/// per-vehicle sub-object. Empty/missing → "—".
+fn recording_stany_map(stany: Option<&JsonValue>) -> String {
+    let Some(JsonValue::Object(map)) = stany else {
+        return "—".to_string();
+    };
+    let parts: Vec<String> = map
+        .iter()
+        .filter_map(|(label, state)| {
+            let state = state.as_str()?.trim();
+            let label = label.trim();
+            if label.is_empty() || state.is_empty() {
+                return None;
+            }
+            Some(alloc::format!("{label}: {state}"))
+        })
+        .collect();
+    if parts.is_empty() {
+        "—".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// mm:ss for a duration in milliseconds. `None`/0 → "—".
+fn format_duration_ms(ms: Option<i64>) -> String {
+    match ms {
+        Some(ms) if ms > 0 => {
+            let total = ms / 1000;
+            alloc::format!("{}:{:02}", total / 60, total % 60)
+        }
+        _ => "—".to_string(),
+    }
+}
+
+/// Human file size in MB (one decimal). `<= 0` → "—".
+fn format_size_mb(bytes: i64) -> String {
+    if bytes <= 0 {
+        return "—".to_string();
+    }
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    alloc::format!("{:.1} MB", mb)
+}
+
+/// Resolves a signed image URL for a plate/ADR thumbnail snapshot ref, or an
+/// empty string when there is no thumb (the `img` cell renderer then shows a
+/// muted placeholder). A URL-issue failure also degrades to the placeholder
+/// rather than surfacing an error in the list.
+fn recording_thumb_url(thumb_ref: &Option<String>) -> String {
+    match thumb_ref.as_deref() {
+        Some(r) if !r.trim().is_empty() => host_recording_get_url(r, RECORDING_URL_TTL_SECS)
+            .map(|u| u.url)
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// One recordings Table row. `recording_ref` is the row key the "Odtwórz"
+/// action carries. The two operator-facing columns are:
+///   * `zdjecie` — a signed image URL of the single representative truck frame
+///     (the event's best plate/ADR snapshot, carried in `plate_thumb_ref`);
+///   * `odczyty` — one multi-line cell combining the aggregated Rejestracja,
+///     ADR and Nalepki reads for the whole vehicle event.
+/// The plate/ADR winners prefer the indexed columns (used by search) and fall
+/// back to the `event_meta` blob for rows recorded before those columns existed.
+fn recording_table_row_value(item: &RecordingListItem, camera_name: &str) -> Value {
+    let meta: Option<JsonValue> = item
+        .event_meta
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let plate = item
+        .plate_text
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| recording_meta_text(&meta, "tablica_rejestracyjna"));
+    let adr = item
+        .adr_text
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| recording_meta_text(&meta, "tablica_adr"));
+    let stany = recording_meta_stany(&meta);
+    // Per-truck breakdown from `event_meta.vehicles[]`. With 0 or 1 real truck the
+    // cell is byte-identical to the old single-bag output (scalar plate/adr +
+    // whole-scene stany, NO "Pojazd" prefix); ≥2 trucks render one block each.
+    let vehicles = recording_meta_vehicles(&meta);
+    let single_line = recording_reads_text(&plate, &adr, &stany);
+    let odczyty = if vehicles.len() >= 2 {
+        recording_reads_multi(&vehicles, &single_line)
+    } else {
+        single_line
+    };
+    // The single truck photo is the repurposed `plate_thumb_ref` (best-read
+    // frame, = the PRIMARY vehicle's thumb); `adr_thumb_ref` is no longer
+    // populated by the recorder.
+    let zdjecie = recording_thumb_url(&item.plate_thumb_ref);
+    let entries: Vec<(Value, Value)> = vec![
+        (Value::Text("recording_ref".into()), Value::Text(item.recording_ref.clone())),
+        (Value::Text("czas".into()), Value::Text(format_alarm_datetime(item.created_at))),
+        (Value::Text("kamera".into()), Value::Text(camera_name.to_string())),
+        (Value::Text("czas_trwania".into()), Value::Text(format_duration_ms(item.duration_ms))),
+        (Value::Text("zdjecie".into()), Value::Text(zdjecie)),
+        (Value::Text("odczyty".into()), Value::Text(odczyty)),
+        (Value::Text("rozmiar".into()), Value::Text(format_size_mb(item.file_size_bytes))),
+    ];
+    Value::Map(entries)
+}
+
+/// Friendly camera name for an id, falling back to the id itself. Built once per
+/// render from the addon's owned + shared camera lists.
+fn recording_camera_name(camera_id: &str, owned: &[db::CameraRow], shared: &[SharedCamera]) -> String {
+    if let Some(c) = owned.iter().find(|c| c.id == camera_id) {
+        if !c.name.trim().is_empty() {
+            return c.name.clone();
+        }
+    }
+    if let Some(c) = shared.iter().find(|c| c.camera_id == camera_id) {
+        if !c.display_name.trim().is_empty() {
+            return c.display_name.clone();
+        }
+    }
+    camera_id.to_string()
+}
+
+fn recording_table_column_render(id: &str, header: &str, render: ColumnRender) -> TableColumn {
+    // Image columns are not sortable (the cell value is a signed URL, not a
+    // comparable field) and never hide by default.
+    let sortable = !matches!(render, ColumnRender::Image);
+    TableColumn {
+        id: id.into(),
+        header: lit(header),
+        field_path: vec![PathSegment::Key(id.into())],
+        width: TableColumnWidth::Auto,
+        render,
+        format: None,
+        align: None,
+        sortable,
+        hidden_by_default: false,
+        sticky_left: false,
+    }
+}
+
+fn recording_table_column(id: &str, header: &str) -> TableColumn {
+    recording_table_column_render(id, header, ColumnRender::Text)
+}
+
+fn build_recordings_table() -> Component {
+    let columns = vec![
+        recording_table_column("czas", "Czas"),
+        recording_table_column("kamera", "Kamera"),
+        recording_table_column("czas_trwania", "Czas trwania"),
+        recording_table_column_render("zdjecie", "Zdjęcie", ColumnRender::Image),
+        // Multi-line combined reads (Rejestracja / ADR / Nalepki). Not sortable —
+        // the cell is a composed multi-field block, not a single comparable key.
+        recording_table_column_render("odczyty", "Odczyty", ColumnRender::Text),
+        recording_table_column("rozmiar", "Rozmiar"),
+    ];
+    // The Table injects the row key (`recording_ref`) into the row-action params
+    // as both `row_id` and `recording_ref`, so "Odtwórz" dispatches
+    // `recordings-play` with the clicked recording's ref.
+    let play_action = button("Odtwórz", "recordings-play", "primary");
+    TableComp {
+        columns,
+        rows_path: StatePath::new(vec![PathSegment::Key("recordings_rows".into())]),
+        row_key_field: "recording_ref".into(),
+        variant: TableVariant::Default,
+        density: Density::Default,
+        sortable: true,
+        sort_by: None,
+        selectable: TableSelectMode::None,
+        selected_ids: None,
+        sticky_header: true,
+        sticky_columns: 0,
+        pagination: None,
+        empty_state: None,
+        row_actions: vec![play_action],
+        bulk_actions: vec![],
+        virtualize: false,
+        row_expandable: false,
+        expanded_row_template_id: None,
+    }.into_component(next_id()).expect("Table")
+}
+
+/// Modal shell for recording playback. Its body slot (`recording_player_body`)
+/// is filled separately via SlotContent in `render_panel`; Dismiss routes to the
+/// same `recordings-close` action as the body's close button.
+fn build_recording_player_modal() -> Component {
+    let mut modal = ModalComp {
+        title: lit("Odtwarzanie nagrania"),
+        subtitle: None,
+        body_slot: "recording_player_body".into(),
+        footer_slot: None,
+        size: ModalSize::Lg,
+        dismissible: true,
+        prevent_scroll: true,
+        closable: true,
+    }.into_component(next_id()).expect("Modal");
+    modal.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Dismiss,
+        Handler::Backend {
+            action_id: "recordings-close".into(),
+            params: CborMap::default(),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    modal
+}
+
+/// Body of the playback modal: the HTML5 video player pointed at the signed URL,
+/// the event metadata (plate/ADR/time/camera) beside it, and a close button. A
+/// URL-issue failure degrades to an honest alert — no fabricated player.
+fn build_recording_player_body(recording_ref: &str) -> Component {
+    let url = match host_recording_get_url(recording_ref, RECORDING_URL_TTL_SECS) {
+        Ok(u) => u.url,
+        Err(e) => {
+            return stack_v(vec![
+                alert(
+                    &alloc::format!("Nie udało się przygotować odtwarzania: {}", abi_message(e)),
+                    "critical",
+                ),
+                button("Zamknij", "recordings-close", "ghost"),
+            ]);
+        }
+    };
+
+    // A non-`camera:` stream_id makes the SDK VideoStream renderer fall back to a
+    // plain <video src controls> element — exactly what a signed mp4 URL needs.
+    let player = {
+        use tentaflow_sdk_spec::protocol::ui::specialized::VideoStream;
+        VideoStream {
+            stream_id: BindRef::Literal(Value::Text(url)),
+            width_px: None,
+            aspect_ratio: AspectRatio::R16To9,
+            controls: VideoControls::Full,
+            autoplay: true,
+            muted: false,
+            object_fit: ImageFit::Contain,
+            poster_ref: None,
+        }.into_component(next_id()).expect("VideoStream")
+    };
+
+    // Metadata pulled from the corresponding list row (parsed the same way):
+    // the same combined reads as the list — Rejestracja / ADR / Nalepki.
+    let (camera_label, when, plate, adr, stany) = recording_playing_meta(recording_ref);
+    let metadata = card(Some("Metadane zdarzenia"), vec![key_value(vec![
+        ("Kamera", camera_label.as_str()),
+        ("Czas", when.as_str()),
+        ("Rejestracja", plate.as_str()),
+        ("ADR", adr.as_str()),
+        ("Nalepki", stany.as_str()),
+    ])]);
+
+    stack_v(vec![
+        player,
+        metadata,
+        button("Zamknij", "recordings-close", "ghost"),
+    ])
+}
+
+/// Resolves the metadata shown beside the player for the currently-playing ref
+/// by re-reading the recording list (single row lookup by ref). Returns
+/// `(camera_label, when, plate, adr, stany)` with graceful fallbacks — the plate
+/// and ADR prefer the indexed winner columns (mirroring the list) and fall back
+/// to the `event_meta` blob.
+fn recording_playing_meta(recording_ref: &str) -> (String, String, String, String, String) {
+    // Reuse the active search so the playing row is found within the same
+    // filtered set the list showed (it was clicked from there).
+    let search = recordings_search_from_state();
+    let items = host_recording_list(&search, RECORDING_LIST_LIMIT).unwrap_or_default();
+    let Some(item) = items.iter().find(|i| i.recording_ref == recording_ref) else {
+        return ("—".into(), "—".into(), "—".into(), "—".into(), "—".into());
+    };
+    let owned = db::list_cameras().unwrap_or_default();
+    let shared = shared_cameras();
+    let camera_label = recording_camera_name(&item.camera_id, &owned, &shared);
+    let when = format_alarm_datetime(item.created_at);
+    let meta: Option<JsonValue> = item
+        .event_meta
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let plate = item
+        .plate_text
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| recording_meta_text(&meta, "tablica_rejestracyjna"));
+    let adr = item
+        .adr_text
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| recording_meta_text(&meta, "tablica_adr"));
+    let stany = recording_meta_stany(&meta);
+    (camera_label, when, plate, adr, stany)
+}
+
+/// Parses a `YYYY-MM-DD` day string to unix MILLISECONDS at the given
+/// end-of-day flag: `false` → 00:00:00 (inclusive lower bound), `true` →
+/// 23:59:59 (inclusive upper bound). `None` for an empty/malformed string so an
+/// absent or half-typed date simply drops the bound rather than erroring. Uses
+/// the shared `days_from_civil` (proleptic Gregorian, UTC).
+fn parse_day_bound_ms(day: &str, end_of_day: bool) -> Option<i64> {
+    let day = day.trim();
+    if day.is_empty() {
+        return None;
+    }
+    let mut parts = day.split('-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let d: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let secs = days_from_civil(y, m, d) * 86_400 + if end_of_day { 86_399 } else { 0 };
+    Some(secs * 1000)
+}
+
+/// Builds the server-side `RecordingSearch` from the current panel state:
+/// camera-chip filter + date range + plate/ADR text queries.
+fn recordings_search_from_state() -> RecordingSearch {
+    with_state(|s| {
+        let camera_id = if s.recordings_camera_filter.is_empty() {
+            None
+        } else {
+            Some(s.recordings_camera_filter.clone())
+        };
+        let plate = {
+            let t = s.recordings_plate_query.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        };
+        let adr = {
+            let t = s.recordings_adr_query.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        };
+        RecordingSearch {
+            camera_id,
+            date_from: parse_day_bound_ms(&s.recordings_date_from, false),
+            date_to: parse_day_bound_ms(&s.recordings_date_to, true),
+            plate,
+            adr,
+        }
+    })
+}
+
+/// `true` when any of the date/plate/ADR search filters are active (the camera
+/// chip is surfaced separately) — drives the "Wyczyść" affordance visibility.
+fn recordings_search_active() -> bool {
+    with_state(|s| {
+        !s.recordings_date_from.trim().is_empty()
+            || !s.recordings_date_to.trim().is_empty()
+            || !s.recordings_plate_query.trim().is_empty()
+            || !s.recordings_adr_query.trim().is_empty()
+    })
+}
+
+/// A recordings-search text field (plate / ADR) bound to `field` in state,
+/// committing every keystroke to the backend via `recordings-search-change` so a
+/// re-render re-queries with the new filter (server-side).
+fn recordings_search_input(label: &str, placeholder: &str, field: &str) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Input;
+    let mut comp = Input {
+        r#type: InputType::Search,
+        bind_path: StatePath::new(vec![PathSegment::Key(field.into())]),
+        placeholder: Some(lit(placeholder)),
+        label: Some(lit(label)),
+        hint: None,
+        leading_icon: Some(icon_named(parse_icon_name("search"))),
+        trailing_icon: None,
+        prefix: None,
+        suffix: None,
+        validators: vec![],
+        max_length: Some(64),
+        min_length: None,
+        pattern: None,
+        autocomplete: None,
+        input_mode: None,
+        disabled: None,
+        readonly: None,
+        error: None,
+        size: InputSize::Md,
+    }
+    .into_component(field)
+    .expect("Input");
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend {
+            action_id: "recordings-search-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+/// A recordings-search date field (from / to) as a plain `Date`-typed
+/// `Input` bound to `field`, committing on change via `recordings-search-change`.
+/// A native date input yields the canonical `YYYY-MM-DD` the range parser wants,
+/// and stays a single `tf-*` primitive without the DatePicker calendar overlay.
+fn recordings_date_input(label: &str, field: &str) -> Component {
+    use tentaflow_sdk_spec::protocol::ui::form::Input;
+    let mut comp = Input {
+        // No dedicated Date InputType exists; Text keeps the field a real tf-input
+        // while the `YYYY-MM-DD` value is validated by `parse_day_bound_ms`.
+        r#type: InputType::Text,
+        bind_path: StatePath::new(vec![PathSegment::Key(field.into())]),
+        placeholder: Some(lit("RRRR-MM-DD")),
+        label: Some(lit(label)),
+        hint: None,
+        leading_icon: Some(icon_named(parse_icon_name("calendar"))),
+        trailing_icon: None,
+        prefix: None,
+        suffix: None,
+        validators: vec![],
+        max_length: Some(10),
+        min_length: None,
+        pattern: None,
+        autocomplete: None,
+        input_mode: None,
+        disabled: None,
+        readonly: None,
+        error: None,
+        size: InputSize::Md,
+    }
+    .into_component(field)
+    .expect("Input");
+    let mut params = CborMap::default();
+    params.0.push(("field".into(), Value::Text(field.into())));
+    comp.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Input,
+        Handler::Backend {
+            action_id: "recordings-search-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    comp
+}
+
+fn build_recordings_content() -> Component {
+    let messages = build_messages_section();
+    let mut children = vec![messages];
+
+    let filter = with_state(|s| s.recordings_camera_filter.clone());
+
+    let toolbar = stack_h(vec![
+        heading(2, "Nagrania"),
+        button_with_icon("Odśwież", "recordings-refresh", "secondary", "refresh"),
+    ]);
+    children.push(toolbar);
+
+    // Server-side search controls: date range + plate + ADR, plus a clear
+    // affordance shown only when a filter is active.
+    let mut search_fields = vec![
+        recordings_date_input("Od", "recordings_date_from"),
+        recordings_date_input("Do", "recordings_date_to"),
+        recordings_search_input("Tablica", "np. WGM12345", "recordings_plate_query"),
+        recordings_search_input("ADR", "np. 30/1202", "recordings_adr_query"),
+    ];
+    if recordings_search_active() {
+        search_fields.push(button("Wyczyść", "recordings-search-clear", "ghost"));
+    }
+    children.push(card(Some("Szukaj"), vec![stack_h(search_fields)]));
+
+    let owned = db::list_cameras().unwrap_or_default();
+    let shared = shared_cameras();
+
+    let search = recordings_search_from_state();
+    let list_result = host_recording_list(&search, RECORDING_LIST_LIMIT);
+    let items = match list_result {
+        Ok(v) => v,
+        Err(e) => {
+            children.push(alert(
+                &alloc::format!("Nie udało się pobrać nagrań: {}", abi_message(e)),
+                "critical",
+            ));
+            return stack_v(children);
+        }
+    };
+
+    // Camera filter chips (only when there is more than one camera to filter by).
+    let mut cam_ids: Vec<String> = owned.iter().map(|c| c.id.clone()).collect();
+    for c in &shared {
+        if !cam_ids.iter().any(|id| id == &c.camera_id) {
+            cam_ids.push(c.camera_id.clone());
+        }
+    }
+    if cam_ids.len() > 1 {
+        let mut chips = vec![FilterChipDef {
+            id: "all".into(),
+            label: lit(&alloc::format!("Wszystkie ({})", items.len())),
+            icon: None,
+            badge: None,
+            count_path: None,
+        }];
+        for id in &cam_ids {
+            chips.push(FilterChipDef {
+                id: id.clone(),
+                label: lit(&recording_camera_name(id, &owned, &shared)),
+                icon: None,
+                badge: None,
+                count_path: None,
+            });
+        }
+        let active = if filter.is_empty() { "all" } else { &filter };
+        let mut chip_comp = filter_chips(chips, active);
+        chip_comp.handlers = Some(HandlerMap(vec![(
+            tentaflow_sdk_spec::EventKind::Select,
+            Handler::Backend {
+                action_id: "recordings-filter-change".into(),
+                params: CborMap::default(),
+                optimistic: None,
+                on_failure: FailurePolicy::Toast,
+            },
+        )]));
+        children.push(chip_comp);
+    }
+
+    // The playback Modal is placed in the content tree while a recording is
+    // selected; its body is filled by SlotContent (see render_panel).
+    if with_state(|s| s.recording_playing.is_some()) {
+        children.push(build_recording_player_modal());
+    }
+
+    if items.is_empty() {
+        children.push(empty_state(
+            "Brak nagrań",
+            Some("Nagrania zdarzeń pojazdowych pojawią się tutaj po ich zarejestrowaniu przez kamery."),
+            Some("video"),
+        ));
+    } else {
+        let rows: Vec<Value> = items
+            .iter()
+            .map(|item| {
+                let name = recording_camera_name(&item.camera_id, &owned, &shared);
+                recording_table_row_value(item, &name)
+            })
+            .collect();
+        if let Ok(mut g) = PENDING_RECORDING_ROWS.lock() {
+            *g = Some(Value::Array(rows));
+        }
+        children.push(build_recordings_table());
+    }
+
+    stack_v(children)
 }
 
 fn build_cameras_content() -> Component {

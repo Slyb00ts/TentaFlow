@@ -108,7 +108,9 @@ fn begin_baseline_adopt_after_confirm(
     remote_node_id: &str,
     quic_mesh: &Option<Arc<IrohMeshManager>>,
 ) {
-    use crate::sync::core_baseline::{begin_adopt_atomic, BaselinePhase, BaselineRole, BeginOutcome};
+    use crate::sync::core_baseline::{
+        begin_adopt_atomic, BaselinePhase, BaselineRole, BeginOutcome,
+    };
 
     let donor_epoch = crate::sync::runtime::core_epoch();
 
@@ -257,11 +259,13 @@ async fn send_pairing_bootstrap(
     if !all_keys.is_empty() {
         let entries: Vec<tentaflow_protocol::mesh::TrustedKeyEntry> = all_keys
             .iter()
-            .map(|(nid, pk, approved_at)| tentaflow_protocol::mesh::TrustedKeyEntry {
-                node_id: nid.clone(),
-                public_key_hex: pk.clone(),
-                approved_at: approved_at.clone(),
-            })
+            .map(
+                |(nid, pk, approved_at)| tentaflow_protocol::mesh::TrustedKeyEntry {
+                    node_id: nid.clone(),
+                    public_key_hex: pk.clone(),
+                    approved_at: approved_at.clone(),
+                },
+            )
             .collect();
         let payload = tentaflow_protocol::mesh::TrustedKeysSyncPayload { keys: entries };
         if let Ok(sync_data) = crate::mesh::cbor::encode(&payload) {

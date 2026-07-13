@@ -7,19 +7,30 @@
 // `LiveRegion` token enum (§1.1).
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::{BindRef, StatePath};
 use super::super::component::{Component, FieldMap};
 use super::super::inline::{AspectRatio, DimensionToken, IconRef};
-use super::super::tokens::{DayOfWeek, ImageFit, LiveRegion as LiveRegionPoliteness, RadiusToken, Tone};
+use super::super::tokens::{
+    DayOfWeek, ImageFit, LiveRegion as LiveRegionPoliteness, RadiusToken, Tone,
+};
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -42,7 +53,9 @@ impl CalendarMonth {
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(4);
         e.push((0, encode_to_value(&self.month)?));
-        if let Some(ep) = &self.events_path { e.push((1, encode_to_value(ep)?)); }
+        if let Some(ep) = &self.events_path {
+            e.push((1, encode_to_value(ep)?));
+        }
         e.push((2, encode_to_value(&self.show_week_numbers)?));
         e.push((3, encode_to_value(&self.first_day_of_week)?));
         Ok(component(Self::TAG, id, e))
@@ -67,8 +80,10 @@ impl CalendarMonth {
         Ok(CalendarMonth {
             month: month.ok_or_else(|| missing_field("CalendarMonth", "month"))?,
             events_path,
-            show_week_numbers: show_week_numbers.ok_or_else(|| missing_field("CalendarMonth", "show_week_numbers"))?,
-            first_day_of_week: first_day_of_week.ok_or_else(|| missing_field("CalendarMonth", "first_day_of_week"))?,
+            show_week_numbers: show_week_numbers
+                .ok_or_else(|| missing_field("CalendarMonth", "show_week_numbers"))?,
+            first_day_of_week: first_day_of_week
+                .ok_or_else(|| missing_field("CalendarMonth", "first_day_of_week"))?,
         })
     }
 }
@@ -98,11 +113,19 @@ impl Image {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(9);
         e.push((0, encode_to_value(&self.src_ref)?));
         e.push((1, encode_to_value(&self.alt)?));
-        if let Some(w) = &self.width { e.push((2, encode_to_value(w)?)); }
-        if let Some(h) = &self.height { e.push((3, encode_to_value(h)?)); }
+        if let Some(w) = &self.width {
+            e.push((2, encode_to_value(w)?));
+        }
+        if let Some(h) = &self.height {
+            e.push((3, encode_to_value(h)?));
+        }
         e.push((4, encode_to_value(&self.fit)?));
-        if let Some(ar) = &self.aspect_ratio { e.push((5, encode_to_value(ar)?)); }
-        if let Some(r) = &self.radius { e.push((6, encode_to_value(r)?)); }
+        if let Some(ar) = &self.aspect_ratio {
+            e.push((5, encode_to_value(ar)?));
+        }
+        if let Some(r) = &self.radius {
+            e.push((6, encode_to_value(r)?));
+        }
         e.push((7, encode_to_value(&self.clickable)?));
         e.push((8, encode_to_value(&self.lazy_load)?));
         Ok(component(Self::TAG, id, e))
@@ -165,7 +188,9 @@ impl VisuallyHidden {
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(2);
         e.push((0, encode_to_value(&self.content)?));
-        if let Some(l) = &self.as_live { e.push((1, encode_to_value(l)?)); }
+        if let Some(l) = &self.as_live {
+            e.push((1, encode_to_value(l)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
@@ -215,9 +240,15 @@ impl LiveRegionComponent {
         e.push((0, encode_to_value(&self.politeness)?));
         e.push((1, encode_to_value(&self.content)?));
         e.push((2, encode_to_value(&self.visible)?));
-        if let Some(t) = &self.tone { e.push((3, encode_to_value(t)?)); }
-        if let Some(ic) = &self.icon { e.push((4, encode_to_value(ic)?)); }
-        if let Some(ca) = &self.clear_after_ms { e.push((5, encode_to_value(ca)?)); }
+        if let Some(t) = &self.tone {
+            e.push((3, encode_to_value(t)?));
+        }
+        if let Some(ic) = &self.icon {
+            e.push((4, encode_to_value(ic)?));
+        }
+        if let Some(ca) = &self.clear_after_ms {
+            e.push((5, encode_to_value(ca)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
@@ -242,7 +273,8 @@ impl LiveRegionComponent {
             }
         }
         Ok(LiveRegionComponent {
-            politeness: politeness.ok_or_else(|| missing_field("LiveRegionComponent", "politeness"))?,
+            politeness: politeness
+                .ok_or_else(|| missing_field("LiveRegionComponent", "politeness"))?,
             content: content.ok_or_else(|| missing_field("LiveRegionComponent", "content"))?,
             visible: visible.ok_or_else(|| missing_field("LiveRegionComponent", "visible"))?,
             tone,

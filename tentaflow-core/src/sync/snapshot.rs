@@ -10,12 +10,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::sync::ledger::{
     build_merkle_summary, hash_canonical, node_frontier_for_operations,
     partition_materialization_order, validate_hash_chain, validate_hash_chain_anchored,
-    HexNodeIdOperationVerifier, LedgerResult,
-    OperationQuery, PartitionId, SnapshotId, SyncLedgerError, SyncLedgerStore, SyncOperation,
-    SyncOperationSigner, SyncOperationVerifier, SyncSnapshot,
+    HexNodeIdOperationVerifier, LedgerResult, OperationQuery, PartitionId, SnapshotId,
+    SyncLedgerError, SyncLedgerStore, SyncOperation, SyncOperationSigner, SyncOperationVerifier,
+    SyncSnapshot,
 };
-use std::collections::BTreeMap;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use std::collections::BTreeMap;
 
 const SNAPSHOT_SIGNATURE_DOMAIN: &[u8] = b"tentaflow-sync-snapshot-v1";
 const SNAPSHOT_STATE_DOMAIN: &[u8] = b"tentaflow-sync-snapshot-state-v1";
@@ -360,10 +360,8 @@ impl<'a> SnapshotManager<'a> {
         // op_ids from the live ledger and treat everything not in that set as the
         // tail. This stays correct after compaction (prefix ops are gone, so the
         // whole live partition is tail). Each node's chain in the tail is checked.
-        let prefix = self.partition_prefix_operations(
-            &request.partition_id,
-            Some(snapshot.up_to_sequence),
-        )?;
+        let prefix =
+            self.partition_prefix_operations(&request.partition_id, Some(snapshot.up_to_sequence))?;
         let covered: std::collections::HashSet<crate::sync::ledger::OperationId> =
             prefix.iter().map(|op| op.op_id).collect();
         let mut operations_after_snapshot =
@@ -452,7 +450,11 @@ impl<'a> SnapshotManager<'a> {
         }
 
         let mut sqlite_rows_changed = 0u64;
-        for operation in blob.operations.iter().chain(operations_after_snapshot.iter()) {
+        for operation in blob
+            .operations
+            .iter()
+            .chain(operations_after_snapshot.iter())
+        {
             let capture = crate::sync::runtime::capture_from_operation(operation)?;
             sqlite_rows_changed +=
                 crate::addon::storage_sql_exec::apply_replicated_write(&capture, operation.op_id)
@@ -541,8 +543,8 @@ impl<'a> SnapshotManager<'a> {
         &self,
         snapshot: &SyncSnapshot,
     ) -> LedgerResult<Vec<SyncOperation>> {
-        let operations =
-            self.partition_prefix_operations(&snapshot.partition_id, Some(snapshot.up_to_sequence))?;
+        let operations = self
+            .partition_prefix_operations(&snapshot.partition_id, Some(snapshot.up_to_sequence))?;
         if operations.len() as u64 != snapshot.operation_count {
             return Err(snapshot_mismatch(snapshot, "operation_count"));
         }
@@ -1672,8 +1674,12 @@ mod tests {
             crate::sync::ledger::node_frontier_for_operations(&reversed)
         );
         assert_eq!(
-            crate::sync::ledger::build_merkle_summary(&ops).unwrap().root_hash,
-            crate::sync::ledger::build_merkle_summary(&reversed).unwrap().root_hash
+            crate::sync::ledger::build_merkle_summary(&ops)
+                .unwrap()
+                .root_hash,
+            crate::sync::ledger::build_merkle_summary(&reversed)
+                .unwrap()
+                .root_hash
         );
     }
 
@@ -1857,9 +1863,7 @@ mod tests {
         // actor_node_id: the signature no longer verifies against that node's key.
         let foreign = signer();
         let mut forged = tail.clone();
-        forged.signature = foreign
-            .sign_operation(&forged.signing_bytes())
-            .unwrap();
+        forged.signature = foreign.sign_operation(&forged.signing_bytes()).unwrap();
 
         let result = manager.restore_sql_from_package_parts(&snapshot, &blob_bytes, &[forged]);
         assert!(

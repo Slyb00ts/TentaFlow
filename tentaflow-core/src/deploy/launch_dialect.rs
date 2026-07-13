@@ -226,12 +226,7 @@ pub fn docker_baseline_args(engine_id: &str) -> Vec<String> {
             s("--enable-chunked-prefill"),
             s("--enable-flashinfer-autotune"),
         ],
-        Dialect::Sglang => vec![
-            s("--tp"),
-            s("1"),
-            s("--mem-fraction-static"),
-            s("0.85"),
-        ],
+        Dialect::Sglang => vec![s("--tp"), s("1"), s("--mem-fraction-static"), s("0.85")],
         // llama.cpp / MLX / Generic — baza/args sa zarzadzane przez entrypoint
         // wzglednie wlasny runner; brak Rust-side baseline.
         _ => Vec::new(),

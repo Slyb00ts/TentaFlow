@@ -145,9 +145,7 @@ pub fn list_members(project_id: &str) -> Result<Vec<ProjectMember>> {
 /// się zrobić JOIN-a między bazami w jednym zapytaniu. Zwraca mapę id→nazwa tylko
 /// dla znalezionych wierszy; gdy CORE jest niedostępne lub id nie istnieje,
 /// pomija je (frontend ma własny fallback do UUID). Nie panikuje przy błędzie.
-pub fn resolve_display_names(
-    user_ids: &[String],
-) -> std::collections::HashMap<String, String> {
+pub fn resolve_display_names(user_ids: &[String]) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     let Some(core) = crate::db::global_pool() else {
         return out;
@@ -304,11 +302,7 @@ pub fn set_member_role(
 /// Asserts that `user_id` is the owner of `project_id`, returning an error
 /// otherwise. The single repository-side authorization gate for owner-only
 /// actions (invite/remove/role change).
-fn require_owner(
-    conn: &rusqlite::Connection,
-    project_id: &str,
-    user_id: &str,
-) -> Result<()> {
+fn require_owner(conn: &rusqlite::Connection, project_id: &str, user_id: &str) -> Result<()> {
     let role: Option<String> = conn
         .query_row(
             "SELECT role FROM project_members WHERE project_id = ?1 AND user_id = ?2",
@@ -325,11 +319,7 @@ fn require_owner(
 /// Asserts `user_id` is an active member of `project_id`. Membership is the
 /// access boundary for dataset operations, mirroring `get_project`. A non-member
 /// cannot create, list or read datasets in a project they cannot see.
-fn require_member(
-    conn: &rusqlite::Connection,
-    project_id: &str,
-    user_id: &str,
-) -> Result<()> {
+fn require_member(conn: &rusqlite::Connection, project_id: &str, user_id: &str) -> Result<()> {
     let role: Option<String> = conn
         .query_row(
             "SELECT role FROM project_members \
@@ -625,7 +615,14 @@ pub fn insert_model(
         "INSERT INTO models \
              (model_id, project_id, name, framework, base_model, metrics_json, status) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'trained')",
-        params![model_id, project_id, name, framework, base_model, metrics_json],
+        params![
+            model_id,
+            project_id,
+            name,
+            framework,
+            base_model,
+            metrics_json
+        ],
     )?;
     Ok(model_id)
 }

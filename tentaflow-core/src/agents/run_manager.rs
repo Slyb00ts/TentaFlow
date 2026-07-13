@@ -461,11 +461,7 @@ impl AgentRunManager {
     /// child tools with the caller's, and returns `{run_ids}`. Caps that would
     /// be exceeded fail the call (the model sees a recoverable tool error), they
     /// do not silently drop tasks.
-    pub async fn handle_agent_spawn(
-        &self,
-        caller: &CallerRun,
-        args: &Value,
-    ) -> Result<Value> {
+    pub async fn handle_agent_spawn(&self, caller: &CallerRun, args: &Value) -> Result<Value> {
         let tasks = parse_spawn_tasks(args)?;
         if tasks.is_empty() {
             return Err(anyhow!("agent_spawn: no tasks provided"));
@@ -540,15 +536,16 @@ impl AgentRunManager {
         let run_ids: Vec<String> = args
             .get("run_ids")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         if run_ids.is_empty() {
             return Err(anyhow!("agent_wait: run_ids required"));
         }
-        let wait_any = matches!(
-            args.get("mode").and_then(|v| v.as_str()),
-            Some("any")
-        );
+        let wait_any = matches!(args.get("mode").and_then(|v| v.as_str()), Some("any"));
         let timeout_secs = args
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
@@ -668,7 +665,11 @@ impl AgentRunManager {
     /// same `wait_one` (its own `watch` subscription + initial DB read for a run
     /// that already settled); `select_all` races them without spawning, so every
     /// future keeps borrowing `&self`.
-    async fn wait_any(&self, run_ids: &[String], deadline: Instant) -> serde_json::Map<String, Value> {
+    async fn wait_any(
+        &self,
+        run_ids: &[String],
+        deadline: Instant,
+    ) -> serde_json::Map<String, Value> {
         let mut pending: Vec<_> = run_ids
             .iter()
             .map(|id| {
@@ -1073,7 +1074,11 @@ async fn run_task(ctx: TaskContext) {
         (RunStatus::Cancelled, "cancelled".to_string(), None)
     } else {
         match outcome {
-            Ok(text) => (RunStatus::Completed, "final_response".to_string(), Some(text)),
+            Ok(text) => (
+                RunStatus::Completed,
+                "final_response".to_string(),
+                Some(text),
+            ),
             Err(e) => (RunStatus::Failed, format!("error:{e}"), None),
         }
     };
@@ -1544,7 +1549,11 @@ mod tests {
         }
     }
 
-    fn manager(db: DbPool, runner: Arc<dyn BackgroundFlowRunner>, cap: usize) -> Arc<AgentRunManager> {
+    fn manager(
+        db: DbPool,
+        runner: Arc<dyn BackgroundFlowRunner>,
+        cap: usize,
+    ) -> Arc<AgentRunManager> {
         let mgr = Arc::new(AgentRunManager::new(
             db,
             runner,
@@ -1621,10 +1630,7 @@ mod tests {
             session_id: None,
         };
         let spawn_out = mgr
-            .handle_agent_spawn(
-                &caller,
-                &json!({"agent_name": "worker", "task": "subtask"}),
-            )
+            .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
             .await
             .expect("spawn child");
         let child_id = spawn_out["run_ids"][0].as_str().unwrap().to_string();
@@ -1811,14 +1817,7 @@ mod tests {
         // Simulate by giving the child spawn rights and asking it to spawn.
         seed_agent(&pool, "spawner", "midboss", "[]", 2, 1);
         let child_run = mgr
-            .spawn(
-                "spawner",
-                "mid",
-                Some(&parent_run),
-                &principal,
-                &[],
-                None,
-            )
+            .spawn("spawner", "mid", Some(&parent_run), &principal, &[], None)
             .await
             .expect("spawn mid");
         let mid_caller = CallerRun {
@@ -1855,7 +1854,10 @@ mod tests {
         let out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "x"}))
             .await;
-        assert!(out.is_err(), "child tool outside parent surface must reject");
+        assert!(
+            out.is_err(),
+            "child tool outside parent surface must reject"
+        );
         assert!(out.unwrap_err().to_string().contains("tool surface"));
     }
 
@@ -1948,9 +1950,16 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         // First run wins the single permit and parks on the gate.
-        let run_a = mgr.spawn("a", "first", None, &principal, &[], None).await.expect("spawn a");
+        let run_a = mgr
+            .spawn("a", "first", None, &principal, &[], None)
+            .await
+            .expect("spawn a");
         tokio::time::sleep(Duration::from_millis(80)).await;
-        assert_eq!(mgr.semaphore.available_permits(), 0, "run holds the only permit");
+        assert_eq!(
+            mgr.semaphore.available_permits(),
+            0,
+            "run holds the only permit"
+        );
 
         // It enters waiting_user → releases the permit.
         let had = mgr.enter_waiting_user(&run_a);
@@ -1960,7 +1969,9 @@ mod tests {
             1,
             "waiting_user must free the permit"
         );
-        let row = repository::get_agent_run(&pool, &run_a).expect("get").expect("row");
+        let row = repository::get_agent_run(&pool, &run_a)
+            .expect("get")
+            .expect("row");
         assert_eq!(row.status, "waiting_user");
 
         // Resume reacquires it.
@@ -1970,7 +1981,9 @@ mod tests {
             0,
             "resume must reacquire the permit"
         );
-        let row = repository::get_agent_run(&pool, &run_a).expect("get").expect("row");
+        let row = repository::get_agent_run(&pool, &run_a)
+            .expect("get")
+            .expect("row");
         assert_eq!(row.status, "running");
 
         // Release the gate so the run completes and frees its permit.
@@ -2033,7 +2046,10 @@ mod tests {
 
         // Cancel the parent while it is parked, then release the gate so the
         // child completes and the wait returns.
-        assert!(mgr.cancel(&parent_run), "parent run is live and cancellable");
+        assert!(
+            mgr.cancel(&parent_run),
+            "parent run is live and cancellable"
+        );
         gate.open();
         let _ = wait.await.expect("join").expect("wait ok");
 
@@ -2041,7 +2057,10 @@ mod tests {
         let row = repository::get_agent_run(&pool, &parent_run)
             .expect("get")
             .expect("row");
-        assert_eq!(row.status, "cancelled", "resume resurrected a cancelled run");
+        assert_eq!(
+            row.status, "cancelled",
+            "resume resurrected a cancelled run"
+        );
         // No permit was reacquired for the finished parent (the child already
         // freed its own on completion, leaving the pool full).
         assert_eq!(
@@ -2173,7 +2192,9 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        assert!(continuation.prompt.contains(&format!("result-of-{child_id}")));
+        assert!(continuation
+            .prompt
+            .contains(&format!("result-of-{child_id}")));
         assert_eq!(continuation.agent_id, "parent");
     }
 

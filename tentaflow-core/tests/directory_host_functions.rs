@@ -52,11 +52,9 @@ fn add_org_member(db: &DbPool, org_id: &str, user_id: &str) {
 }
 
 fn create_org(db: &DbPool, name: &str, slug: &str) -> String {
-    tentaflow_core::services::org::repo::create_organization(
-        db, name, slug, None, None, None, None,
-    )
-    .expect("create org")
-    .org_id
+    tentaflow_core::services::org::repo::create_organization(db, name, slug, None, None, None, None)
+        .expect("create org")
+        .org_id
 }
 
 /// Mirrors how a pooled worker's `AddonState` is configured for a call —
@@ -246,7 +244,13 @@ fn roles_lists_preseed_roles_without_permissions() {
     let db = make_core_db();
     let out = test_api::roles(&db).unwrap();
     let names: Vec<&str> = out.roles.iter().map(|r| r.name.as_str()).collect();
-    for expected in ["org_admin", "org_operator", "org_viewer", "dpo", "supervisor"] {
+    for expected in [
+        "org_admin",
+        "org_operator",
+        "org_viewer",
+        "dpo",
+        "supervisor",
+    ] {
         assert!(names.contains(&expected), "missing role {expected}");
     }
 }

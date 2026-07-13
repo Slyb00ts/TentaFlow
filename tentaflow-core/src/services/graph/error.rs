@@ -14,7 +14,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum GraphError {
-    #[error("graph collection not found: org_id={org_id} addon_id={addon_id} collection={collection}")]
+    #[error(
+        "graph collection not found: org_id={org_id} addon_id={addon_id} collection={collection}"
+    )]
     CollectionNotFound {
         org_id: String,
         addon_id: String,
@@ -28,7 +30,9 @@ pub enum GraphError {
         collection: String,
     },
 
-    #[error("quota exceeded: addon {addon_id} already has {current} graph collections (max {max})")]
+    #[error(
+        "quota exceeded: addon {addon_id} already has {current} graph collections (max {max})"
+    )]
     CollectionQuotaExceeded {
         addon_id: String,
         current: u32,

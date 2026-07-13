@@ -31,9 +31,17 @@ pub type VisionBackend = burn::backend::Rocm<f32, i32>;
 ))]
 pub type VisionDevice = burn::backend::rocm::RocmDevice;
 
-#[cfg(not(any(feature = "vision-cuda", feature = "vision-metal", feature = "vision-rocm")))]
+#[cfg(not(any(
+    feature = "vision-cuda",
+    feature = "vision-metal",
+    feature = "vision-rocm"
+)))]
 pub type VisionBackend = burn::backend::wgpu::Wgpu<f32, i32>;
-#[cfg(not(any(feature = "vision-cuda", feature = "vision-metal", feature = "vision-rocm")))]
+#[cfg(not(any(
+    feature = "vision-cuda",
+    feature = "vision-metal",
+    feature = "vision-rocm"
+)))]
 pub type VisionDevice = burn::backend::wgpu::WgpuDevice;
 
 /// Default device for the selected backend.
@@ -138,7 +146,8 @@ type InferJob = Box<dyn FnOnce() + Send + 'static>;
 /// A panicking job is isolated with `catch_unwind` so one bad forward can't kill the
 /// executor (its oneshot sender drops → the caller observes `Err`).
 fn infer_executor() -> &'static std::sync::mpsc::Sender<InferJob> {
-    static EXEC: std::sync::OnceLock<std::sync::mpsc::Sender<InferJob>> = std::sync::OnceLock::new();
+    static EXEC: std::sync::OnceLock<std::sync::mpsc::Sender<InferJob>> =
+        std::sync::OnceLock::new();
     EXEC.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<InferJob>();
         std::thread::Builder::new()

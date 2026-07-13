@@ -95,12 +95,11 @@ impl SyncOperationVerifier for TrustedKeyOperationVerifier {
                 actual: record.op_id,
             });
         }
-        let key = self
-            .keys
-            .get(&record.actor_node_id)
-            .ok_or_else(|| SyncLedgerError::InvalidPublicKey {
+        let key = self.keys.get(&record.actor_node_id).ok_or_else(|| {
+            SyncLedgerError::InvalidPublicKey {
                 actor_node_id: record.actor_node_id.clone(),
-            })?;
+            }
+        })?;
         verify_signature(
             &record.actor_node_id,
             key,
@@ -209,9 +208,10 @@ fn validate_per_node_chain(
     for operation in sorted {
         operation.validate_integrity()?;
         let node = operation.body.actor_node_id.as_str();
-        if let Some(existing) =
-            seen.insert((node.to_string(), operation.body.node_seq), operation.operation_hash)
-        {
+        if let Some(existing) = seen.insert(
+            (node.to_string(), operation.body.node_seq),
+            operation.operation_hash,
+        ) {
             if existing != operation.operation_hash {
                 return Err(SyncLedgerError::NodeEquivocation {
                     node: node.to_string(),

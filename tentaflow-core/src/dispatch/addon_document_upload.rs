@@ -24,10 +24,10 @@ use tentaflow_protocol::{
 
 use super::ui_channel::run_blocking;
 use super::HandlerContext;
+use crate::addon::errors::AbiError;
 use crate::addon::host_functions::document::{
     accept_upload_chunk_host, document_storage_limit_mb, HostUploadOutcome,
 };
-use crate::addon::errors::AbiError;
 
 /// Górny limit liczby fragmentów (zgodny z document store `MAX_TOTAL_CHUNKS`).
 const MAX_TOTAL_CHUNKS: u32 = 100_000;
@@ -36,7 +36,9 @@ const MAX_UPLOAD_ID_LEN: usize = 128;
 /// Maksymalna długość `mime` (sanity).
 const MAX_MIME_LEN: usize = 255;
 
-fn org_from_session(ctx: &HandlerContext) -> Result<&crate::services::rbac::OrgContext, ProtocolError> {
+fn org_from_session(
+    ctx: &HandlerContext,
+) -> Result<&crate::services::rbac::OrgContext, ProtocolError> {
     ctx.org_context
         .as_ref()
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required"))
@@ -46,10 +48,13 @@ fn org_from_session(ctx: &HandlerContext) -> Result<&crate::services::rbac::OrgC
 /// TooManyRequests (klient powinien przerwać), reszta → BadRequest/Internal.
 fn map_store_err(reason: &'static str, err: AbiError) -> ProtocolError {
     match err {
-        AbiError::QuotaExceeded => {
-            ProtocolError::new(ProtocolErrorCode::RateLimited, format!("upload rejected: {reason}"))
+        AbiError::QuotaExceeded => ProtocolError::new(
+            ProtocolErrorCode::RateLimited,
+            format!("upload rejected: {reason}"),
+        ),
+        AbiError::PayloadTooLarge => {
+            ProtocolError::bad_request(format!("chunk too large: {reason}"))
         }
-        AbiError::PayloadTooLarge => ProtocolError::bad_request(format!("chunk too large: {reason}")),
         AbiError::Operation => ProtocolError::bad_request(format!("upload error: {reason}")),
         _ => ProtocolError::internal(format!("upload failed: {reason}")),
     }
@@ -64,7 +69,11 @@ pub fn addon_document_upload_chunk(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::AddonDocumentBody(AddonDocumentPayload::UploadChunkRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected AddonDocumentUploadChunkRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AddonDocumentUploadChunkRequest",
+            ))
+        }
     };
 
     // org z UWIERZYTELNIONEJ sesji — NIGDY z requestu.

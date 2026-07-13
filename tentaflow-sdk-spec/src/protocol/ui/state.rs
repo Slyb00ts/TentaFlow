@@ -103,10 +103,7 @@ mod tests {
 
     fn rt<T>(v: T)
     where
-        T: minicbor::Encode<()>
-            + for<'b> minicbor::Decode<'b, ()>
-            + PartialEq
-            + core::fmt::Debug,
+        T: minicbor::Encode<()> + for<'b> minicbor::Decode<'b, ()> + PartialEq + core::fmt::Debug,
     {
         let mut b1 = Vec::new();
         minicbor::encode(&v, &mut b1).unwrap();

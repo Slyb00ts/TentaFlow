@@ -18,9 +18,7 @@ use crate::flow_engine::types::{FlowDataType, FlowNode};
 use crate::services::document::rasterize::{
     extract_pdf_text, rasterize_pdf_streaming, PageRender, PdfTextResult, SinkClosed,
 };
-use crate::services::document::{
-    DEFAULT_RENDER_DPI, MAX_PDF_PAGES, MIN_TEXT_LAYER_CHARS_PER_PAGE,
-};
+use crate::services::document::{DEFAULT_RENDER_DPI, MAX_PDF_PAGES, MIN_TEXT_LAYER_CHARS_PER_PAGE};
 
 const NODE_TYPE: &str = "pdf_rasterize";
 
@@ -144,20 +142,17 @@ impl NodeAdapter for PdfRasterizeNodeAdapter {
         // schodzimy na ścieżkę rasteryzacja+vision (gałąź NIENARUSZONA).
         let text_pdf_bytes = pdf_bytes.clone();
         let text_max_pages = max_pages as usize;
-        let text_result: PdfTextResult = tokio::task::spawn_blocking(move || {
-            extract_pdf_text(&text_pdf_bytes, text_max_pages)
-        })
-        .await
-        .map_err(|e| anyhow!("pdf_rasterize: join ekstrakcji tekstu: {e}"))?
-        .map_err(|e| anyhow!("pdf_rasterize: ekstrakcja tekstu: {e}"))?;
+        let text_result: PdfTextResult =
+            tokio::task::spawn_blocking(move || extract_pdf_text(&text_pdf_bytes, text_max_pages))
+                .await
+                .map_err(|e| anyhow!("pdf_rasterize: join ekstrakcji tekstu: {e}"))?
+                .map_err(|e| anyhow!("pdf_rasterize: ekstrakcja tekstu: {e}"))?;
 
         if Self::has_text_layer(&text_result) {
             let mut out = (**envelope).clone();
             out.payload = FlowValue::Text(text_result.markdown);
-            out.meta.insert(
-                ROUTE_META_KEY.to_string(),
-                serde_json::json!("text"),
-            );
+            out.meta
+                .insert(ROUTE_META_KEY.to_string(), serde_json::json!("text"));
             out.meta.insert(
                 "pdf_page_count".to_string(),
                 serde_json::json!(text_result.page_count),
@@ -215,14 +210,10 @@ impl NodeAdapter for PdfRasterizeNodeAdapter {
             "page_count": page_count,
             "pages": page_entries,
         }));
-        out.meta.insert(
-            "pdf_page_count".to_string(),
-            serde_json::json!(page_count),
-        );
-        out.meta.insert(
-            ROUTE_META_KEY.to_string(),
-            serde_json::json!("images"),
-        );
+        out.meta
+            .insert("pdf_page_count".to_string(), serde_json::json!(page_count));
+        out.meta
+            .insert(ROUTE_META_KEY.to_string(), serde_json::json!("images"));
         Ok(out)
     }
 
@@ -300,7 +291,10 @@ mod tests {
         assert_eq!(pages[0]["index"].as_u64(), Some(0));
         assert_eq!(pages[1]["index"].as_u64(), Some(1));
         assert_eq!(pages[0]["mime"].as_str(), Some("image/png"));
-        assert_eq!(out.meta.get("pdf_page_count").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(
+            out.meta.get("pdf_page_count").and_then(|v| v.as_u64()),
+            Some(2)
+        );
 
         // Blob-refy są realnie odczytywalne i to PNG-i.
         for page in &pages {
@@ -311,7 +305,10 @@ mod tests {
                 sha256: page["sha256"].as_str().unwrap().to_string(),
             };
             let bytes = ctx.blobs.get(&blob_ref).await.unwrap();
-            assert_eq!(&bytes[..8], &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']);
+            assert_eq!(
+                &bytes[..8],
+                &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']
+            );
         }
     }
 
@@ -320,7 +317,11 @@ mod tests {
         let ctx = stub_ctx();
         let input = pdf_input(&ctx, 5).await;
         let out = PdfRasterizeNodeAdapter::new()
-            .execute(&node(serde_json::json!({"dpi": 80, "max_pages": 2})), &[input], &ctx)
+            .execute(
+                &node(serde_json::json!({"dpi": 80, "max_pages": 2})),
+                &[input],
+                &ctx,
+            )
             .await
             .unwrap();
         let count = match &out.payload {
@@ -365,7 +366,9 @@ mod tests {
         };
         assert!(text.contains("Tresc"), "warstwa tekstowa w payloadzie Text");
 
-        let active = adapter.active_output_ports(&node(serde_json::json!({})), &out).unwrap();
+        let active = adapter
+            .active_output_ports(&node(serde_json::json!({})), &out)
+            .unwrap();
         assert_eq!(
             active,
             HashSet::from(["text".to_string()]),
@@ -387,7 +390,9 @@ mod tests {
             matches!(out.payload, FlowValue::Json(_)),
             "skanopodobny PDF emituje listę obrazów (Json)"
         );
-        let active = adapter.active_output_ports(&node(serde_json::json!({})), &out).unwrap();
+        let active = adapter
+            .active_output_ports(&node(serde_json::json!({})), &out)
+            .unwrap();
         assert_eq!(
             active,
             HashSet::from(["images".to_string()]),

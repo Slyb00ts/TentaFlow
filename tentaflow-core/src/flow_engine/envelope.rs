@@ -601,12 +601,17 @@ mod tests {
     #[test]
     fn variables_round_trip_and_default_on_missing() {
         let mut env = FlowEnvelope::empty();
-        env.variables
-            .insert("harness_done".into(), FlowValue::Json(serde_json::json!(true)));
+        env.variables.insert(
+            "harness_done".into(),
+            FlowValue::Json(serde_json::json!(true)),
+        );
         env.variables
             .insert("attempt".into(), FlowValue::Text("3".into()));
         let s = serde_json::to_string(&env).unwrap();
-        assert!(s.contains("variables"), "non-empty variables must serialize");
+        assert!(
+            s.contains("variables"),
+            "non-empty variables must serialize"
+        );
         let back: FlowEnvelope = serde_json::from_str(&s).unwrap();
         assert_eq!(back.variables, env.variables);
 

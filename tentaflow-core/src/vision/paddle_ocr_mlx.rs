@@ -176,7 +176,9 @@ impl PaddleOcrMlxEngine {
         if ptr.is_null() {
             anyhow::bail!("PaddleOCR: recognize zwrócił NULL");
         }
-        let text = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned();
+        let text = unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { libc_free(ptr as *mut c_void) };
         Ok(text)
     }

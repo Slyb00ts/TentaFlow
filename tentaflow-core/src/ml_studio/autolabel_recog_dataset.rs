@@ -130,7 +130,14 @@ pub fn spawn_autolabel(
 
     #[cfg(not(feature = "inference-vision-gpu"))]
     {
-        let _ = (dataset_id, project_id, owner_user_id, dataset_dir, threshold, mode);
+        let _ = (
+            dataset_id,
+            project_id,
+            owner_user_id,
+            dataset_dir,
+            threshold,
+            mode,
+        );
         anyhow::bail!(
             "auto-etykietowanie wymaga wbudowanego detektora wizyjnego (feature inference-vision-gpu) — niedostępne w tej kompilacji"
         );
@@ -203,8 +210,8 @@ fn run_autolabel(job_id: &str, train_dir: &Path, threshold: f32, mode: &str) -> 
     use crate::vision::detector_rfdetr::RfDetrDetector;
 
     let annot_path = train_dir.join("_annotations.coco.json");
-    let buf = std::fs::read(&annot_path)
-        .with_context(|| format!("odczyt {}", annot_path.display()))?;
+    let buf =
+        std::fs::read(&annot_path).with_context(|| format!("odczyt {}", annot_path.display()))?;
     let coco: Value = serde_json::from_slice(&buf)
         .with_context(|| format!("parsowanie {}", annot_path.display()))?;
 
@@ -218,10 +225,7 @@ fn run_autolabel(job_id: &str, train_dir: &Path, threshold: f32, mode: &str) -> 
         .map(|cats| {
             cats.iter()
                 .filter_map(|c| {
-                    Some((
-                        c.get("name")?.as_str()?.to_string(),
-                        c.get("id")?.as_i64()?,
-                    ))
+                    Some((c.get("name")?.as_str()?.to_string(), c.get("id")?.as_i64()?))
                 })
                 .collect()
         })
@@ -314,9 +318,13 @@ fn run_autolabel(job_id: &str, train_dir: &Path, threshold: f32, mode: &str) -> 
                             total_dets += 1;
                         }
                     }
-                    Err(e) => tracing::warn!(image = %img_path.display(), error = %e, "auto-label detect failed"),
+                    Err(e) => {
+                        tracing::warn!(image = %img_path.display(), error = %e, "auto-label detect failed")
+                    }
                 },
-                Err(e) => tracing::warn!(image = %img_path.display(), error = %e, "auto-label decode failed"),
+                Err(e) => {
+                    tracing::warn!(image = %img_path.display(), error = %e, "auto-label decode failed")
+                }
             }
         }
         let dets_snapshot = total_dets;
@@ -353,7 +361,11 @@ fn run_autolabel(job_id: &str, train_dir: &Path, threshold: f32, mode: &str) -> 
     let mut next_ann_id: i64 = fresh
         .get("annotations")
         .and_then(|a| a.as_array())
-        .and_then(|arr| arr.iter().filter_map(|a| a.get("id").and_then(|v| v.as_i64())).max())
+        .and_then(|arr| {
+            arr.iter()
+                .filter_map(|a| a.get("id").and_then(|v| v.as_i64()))
+                .max()
+        })
         .unwrap_or(0)
         + 1;
 
@@ -417,8 +429,7 @@ fn run_autolabel(job_id: &str, train_dir: &Path, threshold: f32, mode: &str) -> 
 /// Decodes an image file to a tightly packed RGB8 buffer + its dimensions.
 #[cfg(feature = "inference-vision-gpu")]
 fn decode_rgb(path: &Path) -> Result<(Vec<u8>, u32, u32)> {
-    let dyn_img = image::open(path)
-        .with_context(|| format!("dekodowanie {}", path.display()))?;
+    let dyn_img = image::open(path).with_context(|| format!("dekodowanie {}", path.display()))?;
     let rgb = dyn_img.to_rgb8();
     let (w, h) = (rgb.width(), rgb.height());
     Ok((rgb.into_raw(), w, h))

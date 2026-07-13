@@ -2,6 +2,7 @@
 // File: protocol/ui/form/datetime.rs — DatePicker/DateRangePicker/TimePicker/DateTimePicker (catalog §5)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::{BindRef, StatePath};
 use super::super::component::{Component, FieldMap};
 use super::super::inline::{DatePreset, RangePreset};
@@ -11,11 +12,19 @@ use super::super::typed_field::{
     unknown_field, IntoComponentError,
 };
 use super::super::value_format::{DateStyle, TimeStyle};
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -43,25 +52,45 @@ impl DatePicker {
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(10);
         e.push((0, encode_to_value(&self.bind_path)?));
-        if let Some(v) = &self.label { e.push((1, encode_to_value(v)?)); }
-        if let Some(v) = &self.min_date { e.push((2, encode_to_value(v)?)); }
-        if let Some(v) = &self.max_date { e.push((3, encode_to_value(v)?)); }
-        if let Some(v) = &self.locale { e.push((4, encode_to_value(v)?)); }
+        if let Some(v) = &self.label {
+            e.push((1, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.min_date {
+            e.push((2, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.max_date {
+            e.push((3, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.locale {
+            e.push((4, encode_to_value(v)?));
+        }
         e.push((5, encode_to_value(&self.format)?));
         e.push((6, encode_to_value(&self.first_day_of_week)?));
-        if let Some(v) = &self.disabled_dates { e.push((7, encode_to_value(v)?)); }
-        if let Some(v) = &self.presets { e.push((8, encode_to_value(v)?)); }
-        if let Some(v) = &self.placeholder { e.push((9, encode_to_value(v)?)); }
+        if let Some(v) = &self.disabled_dates {
+            e.push((7, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.presets {
+            e.push((8, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.placeholder {
+            e.push((9, encode_to_value(v)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "DatePicker")?;
         ensure_no_duplicate_keys("DatePicker", &c.fields.0)?;
-        let mut bind_path = None; let mut label = None; let mut min_date = None;
-        let mut max_date = None; let mut locale = None; let mut format = None;
-        let mut first_day_of_week = None; let mut disabled_dates = None;
-        let mut presets = None; let mut placeholder = None;
+        let mut bind_path = None;
+        let mut label = None;
+        let mut min_date = None;
+        let mut max_date = None;
+        let mut locale = None;
+        let mut format = None;
+        let mut first_day_of_week = None;
+        let mut disabled_dates = None;
+        let mut presets = None;
+        let mut placeholder = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => bind_path = Some(decode_from_value(v)?),
@@ -79,10 +108,16 @@ impl DatePicker {
         }
         Ok(DatePicker {
             bind_path: bind_path.ok_or_else(|| missing_field("DatePicker", "bind_path"))?,
-            label, min_date, max_date, locale,
+            label,
+            min_date,
+            max_date,
+            locale,
             format: format.ok_or_else(|| missing_field("DatePicker", "format"))?,
-            first_day_of_week: first_day_of_week.ok_or_else(|| missing_field("DatePicker", "first_day_of_week"))?,
-            disabled_dates, presets, placeholder,
+            first_day_of_week: first_day_of_week
+                .ok_or_else(|| missing_field("DatePicker", "first_day_of_week"))?,
+            disabled_dates,
+            presets,
+            placeholder,
         })
     }
 }
@@ -116,27 +151,53 @@ impl DateRangePicker {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(13);
         e.push((0, encode_to_value(&self.from_path)?));
         e.push((1, encode_to_value(&self.to_path)?));
-        if let Some(v) = &self.label { e.push((2, encode_to_value(v)?)); }
-        if let Some(v) = &self.min_date { e.push((3, encode_to_value(v)?)); }
-        if let Some(v) = &self.max_date { e.push((4, encode_to_value(v)?)); }
-        if let Some(v) = &self.locale { e.push((5, encode_to_value(v)?)); }
+        if let Some(v) = &self.label {
+            e.push((2, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.min_date {
+            e.push((3, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.max_date {
+            e.push((4, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.locale {
+            e.push((5, encode_to_value(v)?));
+        }
         e.push((6, encode_to_value(&self.format)?));
         e.push((7, encode_to_value(&self.first_day_of_week)?));
-        if let Some(v) = &self.disabled_dates { e.push((8, encode_to_value(v)?)); }
-        if let Some(v) = &self.presets { e.push((9, encode_to_value(v)?)); }
-        if let Some(v) = &self.placeholder_from { e.push((10, encode_to_value(v)?)); }
-        if let Some(v) = &self.placeholder_to { e.push((11, encode_to_value(v)?)); }
-        if let Some(v) = &self.max_range_days { e.push((12, encode_to_value(v)?)); }
+        if let Some(v) = &self.disabled_dates {
+            e.push((8, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.presets {
+            e.push((9, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.placeholder_from {
+            e.push((10, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.placeholder_to {
+            e.push((11, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.max_range_days {
+            e.push((12, encode_to_value(v)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "DateRangePicker")?;
         ensure_no_duplicate_keys("DateRangePicker", &c.fields.0)?;
-        let mut from_path = None; let mut to_path = None; let mut label = None;
-        let mut min_date = None; let mut max_date = None; let mut locale = None;
-        let mut format = None; let mut first_day_of_week = None; let mut disabled_dates = None;
-        let mut presets = None; let mut placeholder_from = None; let mut placeholder_to = None;
+        let mut from_path = None;
+        let mut to_path = None;
+        let mut label = None;
+        let mut min_date = None;
+        let mut max_date = None;
+        let mut locale = None;
+        let mut format = None;
+        let mut first_day_of_week = None;
+        let mut disabled_dates = None;
+        let mut presets = None;
+        let mut placeholder_from = None;
+        let mut placeholder_to = None;
         let mut max_range_days = None;
         for (k, v) in &c.fields.0 {
             match k {
@@ -159,10 +220,18 @@ impl DateRangePicker {
         Ok(DateRangePicker {
             from_path: from_path.ok_or_else(|| missing_field("DateRangePicker", "from_path"))?,
             to_path: to_path.ok_or_else(|| missing_field("DateRangePicker", "to_path"))?,
-            label, min_date, max_date, locale,
+            label,
+            min_date,
+            max_date,
+            locale,
             format: format.ok_or_else(|| missing_field("DateRangePicker", "format"))?,
-            first_day_of_week: first_day_of_week.ok_or_else(|| missing_field("DateRangePicker", "first_day_of_week"))?,
-            disabled_dates, presets, placeholder_from, placeholder_to, max_range_days,
+            first_day_of_week: first_day_of_week
+                .ok_or_else(|| missing_field("DateRangePicker", "first_day_of_week"))?,
+            disabled_dates,
+            presets,
+            placeholder_from,
+            placeholder_to,
+            max_range_days,
         })
     }
 }
@@ -190,15 +259,20 @@ impl TimePicker {
         e.push((1, encode_to_value(&self.precision)?));
         e.push((2, encode_to_value(&self.format)?));
         e.push((3, encode_to_value(&self.step_minutes)?));
-        if let Some(v) = &self.label { e.push((4, encode_to_value(v)?)); }
+        if let Some(v) = &self.label {
+            e.push((4, encode_to_value(v)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "TimePicker")?;
         ensure_no_duplicate_keys("TimePicker", &c.fields.0)?;
-        let mut bind_path = None; let mut precision = None; let mut format = None;
-        let mut step_minutes = None; let mut label = None;
+        let mut bind_path = None;
+        let mut precision = None;
+        let mut format = None;
+        let mut step_minutes = None;
+        let mut label = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => bind_path = Some(decode_from_value(v)?),
@@ -213,7 +287,8 @@ impl TimePicker {
             bind_path: bind_path.ok_or_else(|| missing_field("TimePicker", "bind_path"))?,
             precision: precision.ok_or_else(|| missing_field("TimePicker", "precision"))?,
             format: format.ok_or_else(|| missing_field("TimePicker", "format"))?,
-            step_minutes: step_minutes.ok_or_else(|| missing_field("TimePicker", "step_minutes"))?,
+            step_minutes: step_minutes
+                .ok_or_else(|| missing_field("TimePicker", "step_minutes"))?,
             label,
         })
     }
@@ -246,29 +321,47 @@ impl DateTimePicker {
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
         let mut e: Vec<(u8, Value)> = Vec::with_capacity(12);
         e.push((0, encode_to_value(&self.bind_path)?));
-        if let Some(v) = &self.label { e.push((1, encode_to_value(v)?)); }
-        if let Some(v) = &self.min_datetime { e.push((2, encode_to_value(v)?)); }
-        if let Some(v) = &self.max_datetime { e.push((3, encode_to_value(v)?)); }
+        if let Some(v) = &self.label {
+            e.push((1, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.min_datetime {
+            e.push((2, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.max_datetime {
+            e.push((3, encode_to_value(v)?));
+        }
         e.push((4, encode_to_value(&self.date_format)?));
         e.push((5, encode_to_value(&self.time_format)?));
         e.push((6, encode_to_value(&self.time_precision)?));
         e.push((7, encode_to_value(&self.step_minutes)?));
-        if let Some(v) = &self.locale { e.push((8, encode_to_value(v)?)); }
+        if let Some(v) = &self.locale {
+            e.push((8, encode_to_value(v)?));
+        }
         e.push((9, encode_to_value(&self.first_day_of_week)?));
-        if let Some(v) = &self.placeholder { e.push((10, encode_to_value(v)?)); }
-        if let Some(v) = &self.timezone { e.push((11, encode_to_value(v)?)); }
+        if let Some(v) = &self.placeholder {
+            e.push((10, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.timezone {
+            e.push((11, encode_to_value(v)?));
+        }
         Ok(component(Self::TAG, id, e))
     }
 
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "DateTimePicker")?;
         ensure_no_duplicate_keys("DateTimePicker", &c.fields.0)?;
-        let mut bind_path = None; let mut label = None;
-        let mut min_datetime = None; let mut max_datetime = None;
-        let mut date_format = None; let mut time_format = None;
-        let mut time_precision = None; let mut step_minutes = None;
-        let mut locale = None; let mut first_day_of_week = None;
-        let mut placeholder = None; let mut timezone = None;
+        let mut bind_path = None;
+        let mut label = None;
+        let mut min_datetime = None;
+        let mut max_datetime = None;
+        let mut date_format = None;
+        let mut time_format = None;
+        let mut time_precision = None;
+        let mut step_minutes = None;
+        let mut locale = None;
+        let mut first_day_of_week = None;
+        let mut placeholder = None;
+        let mut timezone = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => bind_path = Some(decode_from_value(v)?),
@@ -288,14 +381,22 @@ impl DateTimePicker {
         }
         Ok(DateTimePicker {
             bind_path: bind_path.ok_or_else(|| missing_field("DateTimePicker", "bind_path"))?,
-            label, min_datetime, max_datetime,
-            date_format: date_format.ok_or_else(|| missing_field("DateTimePicker", "date_format"))?,
-            time_format: time_format.ok_or_else(|| missing_field("DateTimePicker", "time_format"))?,
-            time_precision: time_precision.ok_or_else(|| missing_field("DateTimePicker", "time_precision"))?,
-            step_minutes: step_minutes.ok_or_else(|| missing_field("DateTimePicker", "step_minutes"))?,
+            label,
+            min_datetime,
+            max_datetime,
+            date_format: date_format
+                .ok_or_else(|| missing_field("DateTimePicker", "date_format"))?,
+            time_format: time_format
+                .ok_or_else(|| missing_field("DateTimePicker", "time_format"))?,
+            time_precision: time_precision
+                .ok_or_else(|| missing_field("DateTimePicker", "time_precision"))?,
+            step_minutes: step_minutes
+                .ok_or_else(|| missing_field("DateTimePicker", "step_minutes"))?,
             locale,
-            first_day_of_week: first_day_of_week.ok_or_else(|| missing_field("DateTimePicker", "first_day_of_week"))?,
-            placeholder, timezone,
+            first_day_of_week: first_day_of_week
+                .ok_or_else(|| missing_field("DateTimePicker", "first_day_of_week"))?,
+            placeholder,
+            timezone,
         })
     }
 }

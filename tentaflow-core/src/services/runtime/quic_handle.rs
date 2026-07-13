@@ -849,7 +849,8 @@ mod snapshot_helpers_tests {
                 updated_at: "2026-01-01 00:00:00".into(),
                 request_time_parameters: Default::default(),
             gpu_selection: String::new(),
-            }],
+                            cluster_deployment_id: String::new(),
+}],
         );
         mgr.set_mesh_services_registry(registry);
 
@@ -919,7 +920,8 @@ mod snapshot_helpers_tests {
                 updated_at: "2026-01-01 00:00:00".into(),
                 request_time_parameters: Default::default(),
             gpu_selection: String::new(),
-            }],
+                            cluster_deployment_id: String::new(),
+}],
         );
         let h = shared_cache
             .get_for_model("qwen-tiny", &registry2)

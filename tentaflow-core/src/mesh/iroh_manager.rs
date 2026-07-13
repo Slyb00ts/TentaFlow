@@ -906,7 +906,9 @@ impl IrohMeshManager {
                                 }
                             }
                         }
-                        Err(e) => warn!(peer = %remote_hex, "artifact: odbiór streamu nieudany: {}", e),
+                        Err(e) => {
+                            warn!(peer = %remote_hex, "artifact: odbiór streamu nieudany: {}", e)
+                        }
                     }
                     // Daj czas na flush odpowiedzi zanim połączenie zniknie.
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -2639,9 +2641,7 @@ impl IrohMeshManagerRef {
             let close_paths = close_snap
                 .paths
                 .iter()
-                .map(|p| {
-                    format!("{}@{} selected={}", p.transport, p.address, p.selected)
-                })
+                .map(|p| format!("{}@{} selected={}", p.transport, p.address, p.selected))
                 .collect::<Vec<_>>()
                 .join(" | ");
             info!(
@@ -3075,7 +3075,11 @@ async fn read_reply_stall(
     while got < buf.len() {
         match tokio::time::timeout(stall, recv.read(&mut buf[got..])).await {
             Ok(Ok(Some(0))) | Ok(Ok(None)) => {
-                anyhow::bail!("strumień odpowiedzi zamknięty przedwcześnie ({}/{} B)", got, buf.len())
+                anyhow::bail!(
+                    "strumień odpowiedzi zamknięty przedwcześnie ({}/{} B)",
+                    got,
+                    buf.len()
+                )
             }
             Ok(Ok(Some(k))) => got += k,
             Ok(Err(e)) => anyhow::bail!("read reply: {e}"),

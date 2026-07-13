@@ -384,7 +384,9 @@ pub async fn run_ask_user(
 
     // Enter waiting_user (release permit, pause status). A foreground run holds
     // no permit, so this is a no-op and `had_permit` is false.
-    let had_permit = manager.map(|m| m.enter_waiting_user(run_id)).unwrap_or(false);
+    let had_permit = manager
+        .map(|m| m.enter_waiting_user(run_id))
+        .unwrap_or(false);
 
     progress.emit(
         progress_scope,
@@ -447,7 +449,8 @@ pub async fn run_permission_request(
     timeout: Duration,
 ) -> (PermissionDecision, Duration) {
     let interaction_id = uuid::Uuid::new_v4().to_string();
-    let prompt = format!("Allow tool '{tool_name}' (addon '{addon_id}', permission '{permission}')?");
+    let prompt =
+        format!("Allow tool '{tool_name}' (addon '{addon_id}', permission '{permission}')?");
     let info = PendingInteraction {
         id: interaction_id.clone(),
         run_id: run_id.to_string(),
@@ -462,7 +465,9 @@ pub async fn run_permission_request(
     };
     let rx = registry.register(info);
 
-    let had_permit = manager.map(|m| m.enter_waiting_user(run_id)).unwrap_or(false);
+    let had_permit = manager
+        .map(|m| m.enter_waiting_user(run_id))
+        .unwrap_or(false);
 
     progress.emit(
         progress_scope,
@@ -612,8 +617,14 @@ mod tests {
 
     #[test]
     fn sentinel_rounds_seconds_up_to_minutes() {
-        assert_eq!(no_response_sentinel(Duration::from_secs(600)), "[user did not respond within 10 min]");
-        assert_eq!(no_response_sentinel(Duration::from_secs(90)), "[user did not respond within 2 min]");
+        assert_eq!(
+            no_response_sentinel(Duration::from_secs(600)),
+            "[user did not respond within 10 min]"
+        );
+        assert_eq!(
+            no_response_sentinel(Duration::from_secs(90)),
+            "[user did not respond within 2 min]"
+        );
     }
 
     #[test]
@@ -709,7 +720,10 @@ mod tests {
         });
         let id = loop {
             let pending = reg.list_for(true, &[]);
-            if let Some(p) = pending.iter().find(|p| p.kind == InteractionKind::Permission) {
+            if let Some(p) = pending
+                .iter()
+                .find(|p| p.kind == InteractionKind::Permission)
+            {
                 break p.id.clone();
             }
             tokio::time::sleep(Duration::from_millis(5)).await;

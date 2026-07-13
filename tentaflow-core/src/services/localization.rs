@@ -72,7 +72,9 @@ pub struct LocalizationEngine {
 
 impl LocalizationEngine {
     fn new() -> Self {
-        Self { devices: DashMap::new() }
+        Self {
+            devices: DashMap::new(),
+        }
     }
 
     pub fn global() -> &'static LocalizationEngine {
@@ -170,7 +172,11 @@ impl LocalizationEngine {
         }
         // Producers convert ARKit/ARCore (Y-up) → the engine's Z-up convention before
         // sending, so `position`/`quat_xyzw` are already Z-up here.
-        let ar = [s.position[0] as f64, s.position[1] as f64, s.position[2] as f64];
+        let ar = [
+            s.position[0] as f64,
+            s.position[1] as f64,
+            s.position[2] as f64,
+        ];
         let quat = [
             s.quat_xyzw[0] as f64,
             s.quat_xyzw[1] as f64,
@@ -224,7 +230,12 @@ impl LocalizationEngine {
     /// The device's current global pose (ESKF) as a `GlobalPose` frame — WGS84 once
     /// GNSS-anchored, scene-local ENU otherwise. The authoritative "where is this
     /// phone in the world" answer, independent of the depth-map frame.
-    pub fn global_pose(&self, device_id: &str, timestamp_us: i64, scene_id: u64) -> Option<GlobalPoseFrame> {
+    pub fn global_pose(
+        &self,
+        device_id: &str,
+        timestamp_us: i64,
+        scene_id: u64,
+    ) -> Option<GlobalPoseFrame> {
         self.devices
             .get(device_id)
             .map(|e| e.lock().engine.global_pose(timestamp_us, scene_id))
@@ -307,7 +318,9 @@ mod tests {
         eng.ingest_imu(id, &imu(0));
         eng.ingest_gnss(id, &gnss(0, 52.2297, 21.0122, 118.5));
         assert!(eng.is_georeferenced(id));
-        let anchor = SlamSceneManager::global().geo_anchor(id).expect("ENU scene anchored");
+        let anchor = SlamSceneManager::global()
+            .geo_anchor(id)
+            .expect("ENU scene anchored");
         assert!((anchor.lat_deg - 52.2297).abs() < 1e-9);
         assert!((anchor.heading_deg - 90.0).abs() < 1e-9);
         SlamSceneManager::global().remove(id);
@@ -335,14 +348,25 @@ mod tests {
         eng.ingest_gnss(id, &gnss(0, origin.0, origin.1, origin.2));
         for k in 0..12 {
             let ts = k * 100_000;
-            let (lat, lon, alt) = enu_to_geodetic([k as f64, 0.0, 0.0], origin.0, origin.1, origin.2);
+            let (lat, lon, alt) =
+                enu_to_geodetic([k as f64, 0.0, 0.0], origin.0, origin.1, origin.2);
             eng.ingest_gnss(id, &gnss(ts, lat, lon, alt));
             eng.ingest_pose(id, &pose(ts, k as f32));
         }
         // The AR-frame map is now georeferenced near the GNSS origin (yaw≈0 → heading≈90).
-        let anchor = SlamSceneManager::global().geo_anchor(id).expect("AR map georeferenced");
-        assert!((anchor.lat_deg - 52.0).abs() < 1e-3, "anchor near origin lat: {}", anchor.lat_deg);
-        assert!((anchor.heading_deg - 90.0).abs() < 5.0, "heading ~90: {}", anchor.heading_deg);
+        let anchor = SlamSceneManager::global()
+            .geo_anchor(id)
+            .expect("AR map georeferenced");
+        assert!(
+            (anchor.lat_deg - 52.0).abs() < 1e-3,
+            "anchor near origin lat: {}",
+            anchor.lat_deg
+        );
+        assert!(
+            (anchor.heading_deg - 90.0).abs() < 5.0,
+            "heading ~90: {}",
+            anchor.heading_deg
+        );
         SlamSceneManager::global().remove(id);
     }
 
@@ -372,9 +396,18 @@ mod tests {
         let mut bad = gnss(0, 999.0, 0.0, 0.0);
         bad.lat_deg = 999.0;
         eng.ingest_gnss(id, &bad);
-        assert!(!eng.is_georeferenced(id), "invalid fix does not georeference");
-        assert!(SlamSceneManager::global().geo_anchor(id).is_none(), "no anchor from a bad fix");
-        assert!(SlamSceneManager::global().latest_pose(id).is_none(), "no stale pose published");
+        assert!(
+            !eng.is_georeferenced(id),
+            "invalid fix does not georeference"
+        );
+        assert!(
+            SlamSceneManager::global().geo_anchor(id).is_none(),
+            "no anchor from a bad fix"
+        );
+        assert!(
+            SlamSceneManager::global().latest_pose(id).is_none(),
+            "no stale pose published"
+        );
         SlamSceneManager::global().remove(id);
     }
 

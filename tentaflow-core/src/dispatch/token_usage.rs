@@ -241,8 +241,8 @@ fn delete_quota_v1(ctx: &HandlerContext, id: &str) -> Result<MessageBody, Protoc
 
 fn coordinator_status_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let leases =
-        repository::list_token_leases(&ctx.state.db, &org.org_id).map_err(|e| db_error("leases", e))?;
+    let leases = repository::list_token_leases(&ctx.state.db, &org.org_id)
+        .map_err(|e| db_error("leases", e))?;
     // Koordynator wynika z wierszy lease — bez ponownego liczenia HRW tutaj.
     let coordinator_node_id = leases
         .iter()

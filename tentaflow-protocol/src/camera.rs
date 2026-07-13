@@ -145,6 +145,10 @@ pub struct DetectionItem {
     pub stan: Vec<String>,
     /// OCR read or `None` (serialized as `null`).
     pub tekst: Option<String>,
+    /// Mean OCR confidence (0..1) of the winning `tekst`, or `None` when there
+    /// is no text. Lets the dashboard show HOW confident a plate/ADR read is.
+    #[serde(default)]
+    pub tekst_conf: Option<f32>,
     /// Stable tracking id from the IOU tracker. 0 = unassigned.
     #[serde(default)]
     pub track_id: u32,

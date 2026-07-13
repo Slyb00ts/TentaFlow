@@ -98,8 +98,8 @@ impl LocalCameraCvHandler {
 /// zarejestrowanym kontraktem.
 #[cfg(feature = "inference-supertonic")]
 async fn onnx_cv_local(model_name: &str, op: CameraCvOpLocal) -> Result<CameraCvResult, String> {
-    let pool = crate::db::global_pool()
-        .ok_or_else(|| "onnx-cv: baza danych niedostępna".to_string())?;
+    let pool =
+        crate::db::global_pool().ok_or_else(|| "onnx-cv: baza danych niedostępna".to_string())?;
     let row = crate::db::repository::get_vision_model(&pool, model_name)
         .map_err(|e| format!("onnx-cv: odczyt rejestru: {e:#}"))?
         .ok_or_else(|| {
@@ -158,7 +158,10 @@ async fn detect_local(
 /// `vision_analysis::get_detector`, forward przez `burn_backend::run_blocking`
 /// (pojedynczy wątek inferencji gwarantuje jeden forward GPU naraz — równoległe
 /// forwardy wgpu = korupcja stanu).
-#[cfg(all(feature = "inference-vision-gpu", not(feature = "inference-supertonic")))]
+#[cfg(all(
+    feature = "inference-vision-gpu",
+    not(feature = "inference-supertonic")
+))]
 async fn detect_local(
     frames: Vec<CvFrameLocal>,
     threshold: Option<f32>,
@@ -218,7 +221,10 @@ async fn classify_local(crop: CvFrameLocal) -> Result<CameraCvResult, String> {
 /// Klasyfikacja stanu na cropie (Burn) — singleton `vision_analysis::get_classifier`,
 /// forward przez `burn_backend::run_blocking` (jeden forward GPU naraz — wgpu psuje
 /// pamięć przy równoległych forwardach).
-#[cfg(all(feature = "inference-vision-gpu", not(feature = "inference-supertonic")))]
+#[cfg(all(
+    feature = "inference-vision-gpu",
+    not(feature = "inference-supertonic")
+))]
 async fn classify_local(crop: CvFrameLocal) -> Result<CameraCvResult, String> {
     let classifier = crate::services::camera_ingest::vision_analysis::get_classifier()
         .await
@@ -258,7 +264,10 @@ async fn ocr_local(crop: CvFrameLocal, mode: CvOcrMode) -> Result<CameraCvResult
 /// OCR tablic na cropie (Burn) — singleton `vision_analysis::get_ocr`, forward
 /// przez `burn_backend::run_blocking` (jeden forward GPU naraz). Tryb `Adr` jak
 /// wyżej idzie przez ogólny PP-OCRv5, poza wątkiem Burn.
-#[cfg(all(feature = "inference-vision-gpu", not(feature = "inference-supertonic")))]
+#[cfg(all(
+    feature = "inference-vision-gpu",
+    not(feature = "inference-supertonic")
+))]
 async fn ocr_local(crop: CvFrameLocal, mode: CvOcrMode) -> Result<CameraCvResult, String> {
     if matches!(mode, CvOcrMode::Adr) {
         return ocr_adr_local(crop).await;

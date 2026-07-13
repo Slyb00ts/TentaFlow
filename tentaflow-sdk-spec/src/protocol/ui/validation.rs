@@ -18,18 +18,38 @@ use crate::protocol::ui::typed_field::assert_no_dup_tstr;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidationRule {
     Required,
-    MinLength { value: u16 },
-    MaxLength { value: u16 },
-    Min { value: f64 },
-    Max { value: f64 },
-    Pattern { regex: String },
+    MinLength {
+        value: u16,
+    },
+    MaxLength {
+        value: u16,
+    },
+    Min {
+        value: f64,
+    },
+    Max {
+        value: f64,
+    },
+    Pattern {
+        regex: String,
+    },
     Email,
-    Url { schemes: Vec<String> },
+    Url {
+        schemes: Vec<String>,
+    },
     Iban,
-    Phone { region: Option<String> },
+    Phone {
+        region: Option<String>,
+    },
     Uuid,
-    DateRange { min: Option<String>, max: Option<String> },
-    Custom { id: String, params: Option<CborMap> },
+    DateRange {
+        min: Option<String>,
+        max: Option<String>,
+    },
+    Custom {
+        id: String,
+        params: Option<CborMap>,
+    },
 }
 
 impl<C> Encode<C> for ValidationRule {
@@ -146,13 +166,10 @@ impl<C> Encode<C> for ValidationRule {
 }
 
 impl<'b, C> Decode<'b, C> for ValidationRule {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut value_u16: Option<u16> = None;
         let mut value_f64: Option<f64> = None;
@@ -232,8 +249,8 @@ impl<'b, C> Decode<'b, C> for ValidationRule {
                 }
             }
         }
-        let kind = kind
-            .ok_or_else(|| minicbor::decode::Error::message("ValidationRule missing kind"))?;
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("ValidationRule missing kind"))?;
         let allowed = |val_u16: bool,
                        val_f64: bool,
                        allow_regex: bool,
@@ -262,7 +279,9 @@ impl<'b, C> Decode<'b, C> for ValidationRule {
         };
         match kind.as_str() {
             "required" => {
-                allowed(false, false, false, false, false, false, false, false, false)?;
+                allowed(
+                    false, false, false, false, false, false, false, false, false,
+                )?;
                 Ok(ValidationRule::Required)
             }
             "min_length" => {
@@ -284,41 +303,41 @@ impl<'b, C> Decode<'b, C> for ValidationRule {
             "min" => {
                 allowed(false, true, false, false, false, false, false, false, false)?;
                 Ok(ValidationRule::Min {
-                    value: value_f64.ok_or_else(|| {
-                        minicbor::decode::Error::message("min missing value")
-                    })?,
+                    value: value_f64
+                        .ok_or_else(|| minicbor::decode::Error::message("min missing value"))?,
                 })
             }
             "max" => {
                 allowed(false, true, false, false, false, false, false, false, false)?;
                 Ok(ValidationRule::Max {
-                    value: value_f64.ok_or_else(|| {
-                        minicbor::decode::Error::message("max missing value")
-                    })?,
+                    value: value_f64
+                        .ok_or_else(|| minicbor::decode::Error::message("max missing value"))?,
                 })
             }
             "pattern" => {
                 allowed(false, false, true, false, false, false, false, false, false)?;
                 Ok(ValidationRule::Pattern {
-                    regex: regex.ok_or_else(|| {
-                        minicbor::decode::Error::message("pattern missing regex")
-                    })?,
+                    regex: regex
+                        .ok_or_else(|| minicbor::decode::Error::message("pattern missing regex"))?,
                 })
             }
             "email" => {
-                allowed(false, false, false, false, false, false, false, false, false)?;
+                allowed(
+                    false, false, false, false, false, false, false, false, false,
+                )?;
                 Ok(ValidationRule::Email)
             }
             "url" => {
                 allowed(false, false, false, true, false, false, false, false, false)?;
                 Ok(ValidationRule::Url {
-                    schemes: schemes.ok_or_else(|| {
-                        minicbor::decode::Error::message("url missing schemes")
-                    })?,
+                    schemes: schemes
+                        .ok_or_else(|| minicbor::decode::Error::message("url missing schemes"))?,
                 })
             }
             "iban" => {
-                allowed(false, false, false, false, false, false, false, false, false)?;
+                allowed(
+                    false, false, false, false, false, false, false, false, false,
+                )?;
                 Ok(ValidationRule::Iban)
             }
             "phone" => {
@@ -326,19 +345,22 @@ impl<'b, C> Decode<'b, C> for ValidationRule {
                 Ok(ValidationRule::Phone { region })
             }
             "uuid" => {
-                allowed(false, false, false, false, false, false, false, false, false)?;
+                allowed(
+                    false, false, false, false, false, false, false, false, false,
+                )?;
                 Ok(ValidationRule::Uuid)
             }
             "date_range" => {
                 allowed(false, false, false, false, false, true, true, false, false)?;
-                Ok(ValidationRule::DateRange { min: min_s, max: max_s })
+                Ok(ValidationRule::DateRange {
+                    min: min_s,
+                    max: max_s,
+                })
             }
             "custom" => {
                 allowed(false, false, false, false, false, false, false, true, true)?;
                 Ok(ValidationRule::Custom {
-                    id: id.ok_or_else(|| {
-                        minicbor::decode::Error::message("custom missing id")
-                    })?,
+                    id: id.ok_or_else(|| minicbor::decode::Error::message("custom missing id"))?,
                     params,
                 })
             }
@@ -402,13 +424,10 @@ impl<C> Encode<C> for StateCondition {
 }
 
 impl<'b, C> Decode<'b, C> for StateCondition {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut path: Option<StatePath> = None;
         let mut value: Option<Value> = None;
@@ -434,8 +453,8 @@ impl<'b, C> Decode<'b, C> for StateCondition {
                 }
             }
         }
-        let kind = kind
-            .ok_or_else(|| minicbor::decode::Error::message("StateCondition missing kind"))?;
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("StateCondition missing kind"))?;
         let path =
             path.ok_or_else(|| minicbor::decode::Error::message("StateCondition missing path"))?;
         match kind.as_str() {
@@ -481,10 +500,7 @@ mod tests {
 
     fn rt<T>(v: T)
     where
-        T: minicbor::Encode<()>
-            + for<'b> minicbor::Decode<'b, ()>
-            + PartialEq
-            + core::fmt::Debug,
+        T: minicbor::Encode<()> + for<'b> minicbor::Decode<'b, ()> + PartialEq + core::fmt::Debug,
     {
         let mut b1 = Vec::new();
         minicbor::encode(&v, &mut b1).unwrap();
@@ -523,7 +539,10 @@ mod tests {
             min: Some("2026-01-01".into()),
             max: Some("2026-12-31".into()),
         });
-        rt(ValidationRule::DateRange { min: None, max: None });
+        rt(ValidationRule::DateRange {
+            min: None,
+            max: None,
+        });
         rt(ValidationRule::Custom {
             id: "ssn".into(),
             params: Some(CborMap(vec![("country".into(), Value::Text("PL".into()))])),
@@ -552,9 +571,16 @@ mod tests {
     fn validation_rule_duplicate_kind_rejected() {
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
-        enc.map(2).unwrap()
-            .str("kind").unwrap().str("required").unwrap()
-            .str("kind").unwrap().str("required").unwrap();
+        enc.map(2)
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("required")
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("required")
+            .unwrap();
         let err = minicbor::decode::<ValidationRule>(&buf).unwrap_err();
         assert!(format!("{err}").contains("duplicate key 'kind'"));
     }
@@ -563,10 +589,20 @@ mod tests {
     fn validation_rule_duplicate_value_rejected() {
         let mut buf = Vec::new();
         let mut enc = minicbor::Encoder::new(&mut buf);
-        enc.map(3).unwrap()
-            .str("kind").unwrap().str("min_length").unwrap()
-            .str("value").unwrap().u16(2).unwrap()
-            .str("value").unwrap().u16(5).unwrap();
+        enc.map(3)
+            .unwrap()
+            .str("kind")
+            .unwrap()
+            .str("min_length")
+            .unwrap()
+            .str("value")
+            .unwrap()
+            .u16(2)
+            .unwrap()
+            .str("value")
+            .unwrap()
+            .u16(5)
+            .unwrap();
         let err = minicbor::decode::<ValidationRule>(&buf).unwrap_err();
         assert!(format!("{err}").contains("duplicate"));
     }

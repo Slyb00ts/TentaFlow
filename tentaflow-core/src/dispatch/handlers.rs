@@ -985,9 +985,10 @@ pub async fn model_delete(
     // Stop the runtime BEFORE dropping the row — same contract as service_delete.
     // Without this the process/container is orphaned with no DB trace (the model
     // list's delete must clean up exactly like the service list's).
-    if let (Ok(svc), Some(port_allocator)) =
-        (fetch_service_row(ctx, service_id), ctx.state.port_allocator.clone())
-    {
+    if let (Ok(svc), Some(port_allocator)) = (
+        fetch_service_row(ctx, service_id),
+        ctx.state.port_allocator.clone(),
+    ) {
         let _ = crate::services::deploy::stop(&svc, port_allocator).await;
     }
 
@@ -2832,13 +2833,9 @@ pub fn pii_rule_list(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let rules = repository::list_pii_rules(
-        &ctx.state.db,
-        crate::services::org::DEFAULT_ORG_ID,
-        0,
-        1000,
-    )
-    .map_err(db_err)?;
+    let rules =
+        repository::list_pii_rules(&ctx.state.db, crate::services::org::DEFAULT_ORG_ID, 0, 1000)
+            .map_err(db_err)?;
     let summaries: Vec<tentaflow_protocol::PiiRule> = rules
         .into_iter()
         .map(|r| tentaflow_protocol::PiiRule {
@@ -2963,10 +2960,7 @@ pub fn vision_infer(
 #[handler(variant = "RerankRequest", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
-pub async fn rerank(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
+pub async fn rerank(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::RerankBody(tentaflow_protocol::RerankExchange::Request(p)) => p,
         _ => {
@@ -4199,7 +4193,14 @@ pub async fn service_manifest_deploy(
         broadcast_service_change(ctx, tentaflow_protocol::ServiceChange::Added(info));
     }
 
-    let slug = spawn_deploy_pipeline(ctx, job, deploy_method, &manifest, &user_config, port_allocator);
+    let slug = spawn_deploy_pipeline(
+        ctx,
+        job,
+        deploy_method,
+        &manifest,
+        &user_config,
+        port_allocator,
+    );
 
     Ok(MessageBody::DeploymentBody(
         tentaflow_protocol::DeploymentPayload::ResStart(
@@ -4508,7 +4509,10 @@ pub async fn service_redeploy(
         None => return Ok(not_found("service not found")),
     };
 
-    let manifest = match crate::services::manifest::registry().by_id(&row.engine_id).cloned() {
+    let manifest = match crate::services::manifest::registry()
+        .by_id(&row.engine_id)
+        .cloned()
+    {
         Some(m) => m,
         None => {
             return Ok(MessageBody::DeploymentBody(
@@ -4519,10 +4523,7 @@ pub async fn service_redeploy(
                         engine_id: row.engine_id.clone(),
                         deploy_method: row.deploy_method.as_db_tag().to_string(),
                         node_id: ctx.state.local_node_id.to_string(),
-                        message: format!(
-                            "engine '{}' nie istnieje w manifescie",
-                            row.engine_id
-                        ),
+                        message: format!("engine '{}' nie istnieje w manifescie", row.engine_id),
                     },
                 ),
             ));
@@ -4678,7 +4679,14 @@ pub async fn service_redeploy(
         broadcast_service_change(ctx, tentaflow_protocol::ServiceChange::Updated(info));
     }
 
-    let slug = spawn_deploy_pipeline(ctx, job, deploy_method, &manifest, &user_config, port_allocator);
+    let slug = spawn_deploy_pipeline(
+        ctx,
+        job,
+        deploy_method,
+        &manifest,
+        &user_config,
+        port_allocator,
+    );
 
     Ok(MessageBody::DeploymentBody(
         tentaflow_protocol::DeploymentPayload::ResRedeploy(
@@ -4976,99 +4984,100 @@ pub async fn deploy_vllm_recommend(
     // sglang dzieli fizyke VRAM z vLLM, ale ma wlasne nazwy flag). Gdy dialekt
     // to sglang, generujemy argumenty sglang zamiast vLLM (inaczej kontener
     // odrzuca `--max-model-len` i pada na starcie).
-    use crate::deploy::launch_dialect::{self, Dialect, DeployMethod};
+    use crate::deploy::launch_dialect::{self, DeployMethod, Dialect};
     let dialect = launch_dialect::dialect_for(eng_norm.as_deref().unwrap_or("vllm"));
     let recommended_vllm_args = if dialect == Dialect::Sglang {
         launch_dialect::build_args(Dialect::Sglang, &spec, &applied_input).join(" ")
     } else {
         match engine {
-        DeployEngine::LlamaCpp => build_llamacpp_args_string(&spec, &applied_input),
-        DeployEngine::Vllm => {
-            let mut base = build_vllm_args_string(&spec, &applied_input);
-            // vLLM deployment recipe (recipes.vllm.ai): expert launch flags
-            // (tool/reasoning parser, expert-parallel, ...) + per-GPU-family env
-            // (Blackwell FP4 MoE / Hopper FP8 MoE). Embedded snapshot first so
-            // offline/HF-only deploys are instant; live fetch only fills models
-            // missing from the snapshot (added upstream after the last vendor).
-            use crate::deploy::vllm_recipes;
-            let entry = match vllm_recipes::resolve_embedded(&payload.model) {
-                Some(e) => Some(e),
-                None => vllm_recipes::fetch_live(&client, &payload.model).await,
-            };
-            if let Some(entry) = entry {
-                let family = payload
-                    .gpus
-                    .first()
-                    .and_then(|g| vllm_recipes::gpu_family(&g.name));
-                let (rargv, renv) = vllm_recipes::build_args(
-                    &entry,
-                    family,
-                    applied_input.tensor_parallel,
-                    applied_input.pipeline_parallel,
-                );
-                if !rargv.is_empty() || !renv.is_empty() {
-                    // Merge our tuned args (gpu-mem, ctx, kv) with the recipe
-                    // expert flags; recipe is appended last so dedup last-wins
-                    // lets it override on overlap.
+            DeployEngine::LlamaCpp => build_llamacpp_args_string(&spec, &applied_input),
+            DeployEngine::Vllm => {
+                let mut base = build_vllm_args_string(&spec, &applied_input);
+                // vLLM deployment recipe (recipes.vllm.ai): expert launch flags
+                // (tool/reasoning parser, expert-parallel, ...) + per-GPU-family env
+                // (Blackwell FP4 MoE / Hopper FP8 MoE). Embedded snapshot first so
+                // offline/HF-only deploys are instant; live fetch only fills models
+                // missing from the snapshot (added upstream after the last vendor).
+                use crate::deploy::vllm_recipes;
+                let entry = match vllm_recipes::resolve_embedded(&payload.model) {
+                    Some(e) => Some(e),
+                    None => vllm_recipes::fetch_live(&client, &payload.model).await,
+                };
+                if let Some(entry) = entry {
+                    let family = payload
+                        .gpus
+                        .first()
+                        .and_then(|g| vllm_recipes::gpu_family(&g.name));
+                    let (rargv, renv) = vllm_recipes::build_args(
+                        &entry,
+                        family,
+                        applied_input.tensor_parallel,
+                        applied_input.pipeline_parallel,
+                    );
+                    if !rargv.is_empty() || !renv.is_empty() {
+                        // Merge our tuned args (gpu-mem, ctx, kv) with the recipe
+                        // expert flags; recipe is appended last so dedup last-wins
+                        // lets it override on overlap.
+                        let mut toks: Vec<String> =
+                            base.split_whitespace().map(String::from).collect();
+                        toks.extend(rargv);
+                        toks = crate::deploy::python_venv::dedup_cli_args_last_wins(toks);
+                        base = toks.join(" ");
+                        recommended_env = renv;
+                        recipe_applied = Some(entry.hf_id.clone());
+                    }
+                }
+                // Rodzina gemma-4 w NVFP4: vLLM potrzebuje jawnych flag tool-callingu
+                // + self-speculative chat template. Upstream recipe albo je gubi
+                // (chat-template `examples/*.jinja` jest dropowany przez build_args, bo
+                // szablon zyje w zrodlach vLLM), albo modelu w ogole nie ma w bazie
+                // recept (RedHatAI 12B). Wymuszamy spojnie dla calej rodziny — dziala
+                // tez dla recznego deployu gemma-4 nvfp4, nie tylko z prekonfigurowanego
+                // kafelka. Speculative draft dostarcza osobno preset (`speculator_repo`).
+                let model_lc = payload.model.to_lowercase();
+                let quant_lc = spec.quantization.as_deref().unwrap_or("").to_lowercase();
+                if model_lc.contains("gemma-4")
+                    && (quant_lc.contains("nvfp4") || quant_lc.contains("fp4"))
+                {
+                    // NIE wymuszamy `--chat-template examples/tool_chat_template_gemma4.jinja`:
+                    // pip-owy vLLM (docker i native python-bundle) nie niesie katalogu
+                    // `examples/`, wiec vLLM padal z "chat template ... doesn't exist".
+                    // Tool-calling gemma-4 dziala z szablonem wbudowanym w tokenizer;
+                    // parser + auto-tool-choice wystarczaja. Kto chce override szablonu,
+                    // podaje absolutna sciezke recznie w extra-args.
                     let mut toks: Vec<String> = base.split_whitespace().map(String::from).collect();
-                    toks.extend(rargv);
+                    toks.push("--max-model-len".into());
+                    toks.push("auto".into());
+                    toks.push("--enable-auto-tool-choice".into());
+                    toks.push("--tool-call-parser".into());
+                    toks.push("gemma4".into());
                     toks = crate::deploy::python_venv::dedup_cli_args_last_wins(toks);
                     base = toks.join(" ");
-                    recommended_env = renv;
-                    recipe_applied = Some(entry.hf_id.clone());
                 }
+                // DeepSeek V4 (Flash/Pro, w tym warianty -DSpark): MoE + DSA long-context.
+                // `--block-size 256` pod efektywny KV przy kontekstach do 1M (recepta
+                // vLLM V4). fp8 kv-cache i --enable-expert-parallel dokladane sa juz
+                // wyzej (model_type deepseek_v4 + MoE na multi-GPU); DSpark self-speculative
+                // wnosi preset (`speculator_method="dspark"`). `--data-parallel-size` i
+                // fp4-indexer-cache sa hardware-specyficzne (liczba B200) → recepta/extra-args.
+                if spec.model_type.eq_ignore_ascii_case("deepseek_v4")
+                    || model_lc.contains("deepseek-v4")
+                {
+                    let mut toks: Vec<String> = base.split_whitespace().map(String::from).collect();
+                    toks.push("--block-size".into());
+                    toks.push("256".into());
+                    toks = crate::deploy::python_venv::dedup_cli_args_last_wins(toks);
+                    base = toks.join(" ");
+                }
+                base
             }
-            // Rodzina gemma-4 w NVFP4: vLLM potrzebuje jawnych flag tool-callingu
-            // + self-speculative chat template. Upstream recipe albo je gubi
-            // (chat-template `examples/*.jinja` jest dropowany przez build_args, bo
-            // szablon zyje w zrodlach vLLM), albo modelu w ogole nie ma w bazie
-            // recept (RedHatAI 12B). Wymuszamy spojnie dla calej rodziny — dziala
-            // tez dla recznego deployu gemma-4 nvfp4, nie tylko z prekonfigurowanego
-            // kafelka. Speculative draft dostarcza osobno preset (`speculator_repo`).
-            let model_lc = payload.model.to_lowercase();
-            let quant_lc = spec.quantization.as_deref().unwrap_or("").to_lowercase();
-            if model_lc.contains("gemma-4")
-                && (quant_lc.contains("nvfp4") || quant_lc.contains("fp4"))
-            {
-                // NIE wymuszamy `--chat-template examples/tool_chat_template_gemma4.jinja`:
-                // pip-owy vLLM (docker i native python-bundle) nie niesie katalogu
-                // `examples/`, wiec vLLM padal z "chat template ... doesn't exist".
-                // Tool-calling gemma-4 dziala z szablonem wbudowanym w tokenizer;
-                // parser + auto-tool-choice wystarczaja. Kto chce override szablonu,
-                // podaje absolutna sciezke recznie w extra-args.
-                let mut toks: Vec<String> = base.split_whitespace().map(String::from).collect();
-                toks.push("--max-model-len".into());
-                toks.push("auto".into());
-                toks.push("--enable-auto-tool-choice".into());
-                toks.push("--tool-call-parser".into());
-                toks.push("gemma4".into());
-                toks = crate::deploy::python_venv::dedup_cli_args_last_wins(toks);
-                base = toks.join(" ");
-            }
-            // DeepSeek V4 (Flash/Pro, w tym warianty -DSpark): MoE + DSA long-context.
-            // `--block-size 256` pod efektywny KV przy kontekstach do 1M (recepta
-            // vLLM V4). fp8 kv-cache i --enable-expert-parallel dokladane sa juz
-            // wyzej (model_type deepseek_v4 + MoE na multi-GPU); DSpark self-speculative
-            // wnosi preset (`speculator_method="dspark"`). `--data-parallel-size` i
-            // fp4-indexer-cache sa hardware-specyficzne (liczba B200) → recepta/extra-args.
-            if spec.model_type.eq_ignore_ascii_case("deepseek_v4")
-                || model_lc.contains("deepseek-v4")
-            {
-                let mut toks: Vec<String> = base.split_whitespace().map(String::from).collect();
-                toks.push("--block-size".into());
-                toks.push("256".into());
-                toks = crate::deploy::python_venv::dedup_cli_args_last_wins(toks);
-                base = toks.join(" ");
-            }
-            base
-        }
-        // MLX (mlx-lm) uruchamiany jest przez wlasny runner, nie przez flagi CLI
-        // jednego procesu serwera - kontekst/seqs/KV przekazuje config deployu.
-        DeployEngine::Mlx => format!(
-            "--max-tokens {} --max-kv-size {}",
-            applied_input.max_model_len,
-            applied_input.max_num_seqs.max(1) * applied_input.max_model_len
-        ),
+            // MLX (mlx-lm) uruchamiany jest przez wlasny runner, nie przez flagi CLI
+            // jednego procesu serwera - kontekst/seqs/KV przekazuje config deployu.
+            DeployEngine::Mlx => format!(
+                "--max-tokens {} --max-kv-size {}",
+                applied_input.max_model_len,
+                applied_input.max_num_seqs.max(1) * applied_input.max_model_len
+            ),
         }
     };
 
@@ -10228,7 +10237,8 @@ pub async fn service_model_selection(
                     {
                         continue;
                     }
-                    let valid = |v: Option<f64>| v.map(|x| x.is_finite() && x >= 0.0).unwrap_or(true);
+                    let valid =
+                        |v: Option<f64>| v.map(|x| x.is_finite() && x >= 0.0).unwrap_or(true);
                     if !(valid(entry.prompt_per_1k)
                         && valid(entry.completion_per_1k)
                         && valid(entry.audio_per_min)

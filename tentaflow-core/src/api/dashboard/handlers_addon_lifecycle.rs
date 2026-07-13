@@ -1196,28 +1196,27 @@ pub fn addon_instance_dispatch(
                 // required IP field and let install proceed then fail late. Skip
                 // the offending package (one bad third-party manifest cannot break
                 // the whole catalog list) and log loudly so it is not hidden.
-                let connection_params = match crate::addon::lifecycle::parse_connection_params(
-                    &row.manifest_json,
-                ) {
-                    Ok(params) => params
-                        .into_iter()
-                        .map(|p| tentaflow_protocol::AddonConnectionParam {
-                            key: p.key,
-                            label: p.label,
-                            param_type: p.param_type,
-                            required: p.required,
-                            placeholder: p.placeholder,
-                        })
-                        .collect(),
-                    Err(e) => {
-                        tracing::warn!(
-                            package_id = %row.package_id,
-                            error = %e,
-                            "skipping package from catalog: connection_params parse failed",
-                        );
-                        continue;
-                    }
-                };
+                let connection_params =
+                    match crate::addon::lifecycle::parse_connection_params(&row.manifest_json) {
+                        Ok(params) => params
+                            .into_iter()
+                            .map(|p| tentaflow_protocol::AddonConnectionParam {
+                                key: p.key,
+                                label: p.label,
+                                param_type: p.param_type,
+                                required: p.required,
+                                placeholder: p.placeholder,
+                            })
+                            .collect(),
+                        Err(e) => {
+                            tracing::warn!(
+                                package_id = %row.package_id,
+                                error = %e,
+                                "skipping package from catalog: connection_params parse failed",
+                            );
+                            continue;
+                        }
+                    };
                 packages.push(AddonPackageInfo {
                     package_id: row.package_id,
                     name: row.name,

@@ -339,9 +339,8 @@ impl Supervisor {
             // (endpoint heada), nie lokalny probe. Worker jest headless (bez
             // endpointu i bez wierszy modeli), wiec lokalna sonda ZAWSZE oznaczy
             // go Failed/AWARIA mimo ze klaster serwuje — pomijamy w calosci.
-            if crate::services::deploy::distributed::service_is_distributed_member(
-                &svc.config_json,
-            ) {
+            if crate::services::deploy::distributed::service_is_distributed_member(&svc.config_json)
+            {
                 continue;
             }
             // PID-reuse defence runs only for transports that actually own a process.
@@ -394,10 +393,11 @@ impl Supervisor {
         // the reconcile handlers keep it fresh after boot.
         {
             let db = self.db.clone();
-            if let Err(e) =
-                tokio::task::spawn_blocking(move || crate::services::onnx_cv_service::reconcile(&db))
-                    .await
-                    .map_err(|e| SupervisorError::Database(format!("join: {e}")))?
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                crate::services::onnx_cv_service::reconcile(&db)
+            })
+            .await
+            .map_err(|e| SupervisorError::Database(format!("join: {e}")))?
             {
                 tracing::warn!("supervisor: onnx-cv reconcile failed: {e:#}");
             }
@@ -788,10 +788,7 @@ impl Supervisor {
             if svc.deploy_method != DeployMethod::Docker {
                 continue;
             }
-            if !matches!(
-                svc.status,
-                ServiceStatus::Running | ServiceStatus::Degraded
-            ) {
+            if !matches!(svc.status, ServiceStatus::Running | ServiceStatus::Degraded) {
                 continue;
             }
             let Some(port) = svc.runtime_port else {
@@ -832,9 +829,7 @@ impl Supervisor {
             let db = self.db.clone();
             let id = svc.id;
             let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let conn = db
-                    .write()
-                    .map_err(|e| anyhow::anyhow!("db write: {}", e))?;
+                let conn = db.write().map_err(|e| anyhow::anyhow!("db write: {}", e))?;
                 services_repo::update_deployed_source_hash(&conn, id, &new_deployed)?;
                 Ok(())
             })
@@ -849,9 +844,7 @@ impl Supervisor {
         let db = self.db.clone();
         let err_owned = err.map(|s| s.to_string());
         let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = db
-                .write()
-                .map_err(|e| anyhow::anyhow!("db write: {}", e))?;
+            let conn = db.write().map_err(|e| anyhow::anyhow!("db write: {}", e))?;
             services_repo::update_status(&conn, id, status)?;
             if let Some(msg) = err_owned {
                 services_repo::update_health(&conn, id, false, Some(&msg))?;
@@ -865,9 +858,7 @@ impl Supervisor {
         let db = self.db.clone();
         let err_owned = err.map(|s| s.to_string());
         let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = db
-                .write()
-                .map_err(|e| anyhow::anyhow!("db write: {}", e))?;
+            let conn = db.write().map_err(|e| anyhow::anyhow!("db write: {}", e))?;
             services_repo::update_health(&conn, id, ok, err_owned.as_deref())?;
             Ok(())
         })
@@ -894,9 +885,7 @@ impl Supervisor {
         let sidecar = runtime.sidecar_port;
         let url = runtime.endpoint_url.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = db
-                .write()
-                .map_err(|e| anyhow::anyhow!("db write: {}", e))?;
+            let conn = db.write().map_err(|e| anyhow::anyhow!("db write: {}", e))?;
             services_repo::update_runtime(&conn, id, pid, port, sidecar, url.as_deref())?;
             Ok(())
         })
@@ -1410,9 +1399,7 @@ async fn update_runtime_detached(
     let sidecar = runtime.sidecar_port;
     let url = runtime.endpoint_url.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let conn = db
-            .write()
-            .map_err(|e| anyhow::anyhow!("db write: {}", e))?;
+        let conn = db.write().map_err(|e| anyhow::anyhow!("db write: {}", e))?;
         services_repo::update_runtime(&conn, id, pid, port, sidecar, url.as_deref())?;
         Ok(())
     })
@@ -1520,9 +1507,7 @@ fn handle_endpoint_signature(
 async fn clear_runtime_detached(db: &DbPool, id: i64) {
     let db = db.clone();
     let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let conn = db
-            .write()
-            .map_err(|e| anyhow::anyhow!("db write: {}", e))?;
+        let conn = db.write().map_err(|e| anyhow::anyhow!("db write: {}", e))?;
         let n = conn.execute(
             "UPDATE services SET runtime_pid = NULL, endpoint_url = NULL, \
              updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
@@ -1543,9 +1528,7 @@ async fn update_progress_detached(db: &DbPool, id: i64, msg: Option<&str>) {
     let db = db.clone();
     let msg_owned = msg.map(|s| s.to_string());
     let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let conn = db
-            .write()
-            .map_err(|e| anyhow::anyhow!("db write: {}", e))?;
+        let conn = db.write().map_err(|e| anyhow::anyhow!("db write: {}", e))?;
         services_repo::update_progress_message(&conn, id, msg_owned.as_deref())?;
         Ok(())
     })
@@ -1556,9 +1539,7 @@ async fn update_status_detached(db: &DbPool, id: i64, status: ServiceStatus, err
     let db = db.clone();
     let err_owned = err.map(|s| s.to_string());
     let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let conn = db
-            .write()
-            .map_err(|e| anyhow::anyhow!("db write: {}", e))?;
+        let conn = db.write().map_err(|e| anyhow::anyhow!("db write: {}", e))?;
         services_repo::update_status(&conn, id, status)?;
         if let Some(msg) = err_owned {
             services_repo::update_health(&conn, id, false, Some(&msg))?;
@@ -2463,7 +2444,8 @@ mod tests {
             updated_at: "2026-01-01 00:00:00".into(),
             request_time_parameters: Default::default(),
             gpu_selection: String::new(),
-        };
+                    cluster_deployment_id: String::new(),
+};
         registry.replace_node("peerB".into(), vec![remote_svc]);
 
         sup.reconcile_handles().await;

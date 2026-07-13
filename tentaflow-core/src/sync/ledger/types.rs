@@ -627,21 +627,15 @@ pub trait SyncLedgerStore: Send + Sync {
     /// the store holds it: a full operation OR a redacted placeholder. Pull-serving
     /// uses this so a relay can forward a position it itself holds only redacted,
     /// preserving chain density instead of leaving a gap the requester loops on.
-    fn get_node_chain_entries(
-        &self,
-        query: NodeLogQuery,
-    ) -> LedgerResult<Vec<NodeChainEntry>>;
+    fn get_node_chain_entries(&self, query: NodeLogQuery) -> LedgerResult<Vec<NodeChainEntry>>;
     fn get_operation(&self, op_id: OperationId) -> LedgerResult<SyncOperation>;
     /// The `op_id` we actually recorded at `(node_id, node_seq)` on the per-node
     /// chain axis, or `None` if that position was compacted away or never seen.
     /// Equivocation detection compares this against the incoming op's `op_id`:
     /// because ops are content-addressed, an op forged at an already-known seq has
     /// a DIFFERENT op_id, which a by-op_id lookup would miss entirely.
-    fn get_node_log_entry(
-        &self,
-        node_id: &str,
-        node_seq: u64,
-    ) -> LedgerResult<Option<OperationId>>;
+    fn get_node_log_entry(&self, node_id: &str, node_seq: u64)
+        -> LedgerResult<Option<OperationId>>;
     /// The lowest `node_seq` for `node_id` whose operation row is still present
     /// (not compacted away) AND carries the current baseline epoch, i.e. the
     /// earliest position this node can RELAY to a peer — an op kept under an
@@ -810,10 +804,7 @@ pub const CORE_PARTITION_PREFIX: &str = "core/";
 /// the input set is already Byzantine (equivocation), which the chain validators
 /// reject upstream. The HLC is used ONLY for last-writer-wins value resolution in
 /// the materializer (`incoming_hlc_wins`), never for leaf ordering.
-pub fn partition_materialization_order(
-    a: &SyncOperation,
-    b: &SyncOperation,
-) -> std::cmp::Ordering {
+pub fn partition_materialization_order(a: &SyncOperation, b: &SyncOperation) -> std::cmp::Ordering {
     a.body
         .actor_node_id
         .cmp(&b.body.actor_node_id)

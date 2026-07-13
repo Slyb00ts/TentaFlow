@@ -25,9 +25,10 @@ use std::sync::OnceLock;
 use base64::Engine;
 use regex::Regex;
 use tentaflow_sdk_spec::{
-    FrameUrlInput, GetStreamOut, PurgeOut, RecordingGetUrlInput, RecordingRefInput,
-    RecordingSaveSegmentInput, RecordingSaveSnapshotInput, RecordingStatsInput, SaveRecordingOut,
-    StatsOut, StatsPerCamera, StatsTotals, UrlOut,
+    FrameUrlInput, GetStreamOut, PurgeOut, RecordingGetUrlInput, RecordingListInput,
+    RecordingListItem, RecordingListOut, RecordingRefInput, RecordingSaveSegmentInput,
+    RecordingSaveSnapshotInput, RecordingStatsInput, SaveRecordingOut, StatsOut, StatsPerCamera,
+    StatsTotals, UrlOut,
 };
 use tracing::warn;
 
@@ -37,8 +38,9 @@ use super::{audit_log_with_risk, check_permission, get_memory, AddonState, WasmC
 use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
 use crate::db::repository::{
-    get_camera_for_addon, get_recording_for_addon, insert_recording, recording_stats_for_addon,
-    soft_delete_recording, RecordingStatsAggregate,
+    get_camera_for_addon, get_recording_for_addon, insert_recording, list_recordings_for_addon,
+    recording_stats_for_addon, soft_delete_recording, RecordingListFilters,
+    RecordingStatsAggregate,
 };
 use crate::services::frame_storage::RawFrameRef;
 #[cfg(feature = "camera")]
@@ -575,6 +577,93 @@ pub fn recording_stats_v1(
 }
 
 // =============================================================================
+// Host function: recording_list_v1
+// =============================================================================
+
+/// Hard cap on the number of recordings a single list call returns, regardless
+/// of the requested `limit`, so a dashboard browse never streams an unbounded
+/// catalog through the CBOR output buffer.
+const RECORDING_LIST_MAX: u32 = 500;
+
+pub fn recording_list_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    input_ptr: i32,
+    input_len: i32,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return AbiError::Operation.as_i32(),
+    };
+    if !check_permission(caller.data(), PERM_RECORDING_READ, None) {
+        audit(
+            caller.data(),
+            "recording.list",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+    // Empty payload is OK — `RecordingListInput` defaults to "all cameras". A
+    // negative length is always a protocol error, never "no filter".
+    if input_len < 0 {
+        audit(
+            caller.data(),
+            "recording.list",
+            None,
+            RiskClass::B,
+            "error",
+            Some("invalid_input_len"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+    let input: RecordingListInput = if input_len == 0 {
+        RecordingListInput::default()
+    } else {
+        match read_input_cbor(
+            &memory,
+            &caller,
+            input_ptr,
+            input_len,
+            PayloadKind::ServiceCall,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                audit(
+                    caller.data(),
+                    "recording.list",
+                    None,
+                    RiskClass::B,
+                    "error",
+                    Some(if e == AbiError::PayloadTooLarge {
+                        "payload_too_large"
+                    } else {
+                        "invalid_payload"
+                    }),
+                );
+                return e.as_i32();
+            }
+        }
+    };
+    match list_core(caller.data(), &input) {
+        CoreResult::Ok(out) => write_cbor_capped(
+            &memory,
+            &mut caller,
+            &out,
+            out_ptr,
+            out_cap,
+            out_len_ptr,
+            PayloadKind::ServiceCall,
+        ),
+        CoreResult::Err(code) => code,
+    }
+}
+
+// =============================================================================
 // Host function: frame_url_v1
 // =============================================================================
 
@@ -778,6 +867,11 @@ fn save_snapshot_core(
         &saved.hash_sha256,
         &retention_class,
         state.org_id.as_deref(),
+        None,
+        None,
+        None,
+        None,
+        None,
     ) {
         warn!("recording.save_snapshot insert_recording failed (compensating purge): {e}");
         let _ = run_async(purge_recording(&saved.file_path));
@@ -930,6 +1024,11 @@ fn save_segment_core(
         &saved.hash_sha256,
         &retention_class,
         state.org_id.as_deref(),
+        None,
+        None,
+        None,
+        None,
+        None,
     ) {
         warn!("recording.save_segment insert_recording failed (compensating purge): {e}");
         let _ = run_async(purge_recording(&saved.file_path));
@@ -1268,6 +1367,66 @@ fn stats_core(state: &AddonState, input: &RecordingStatsInput) -> CoreResult<Sta
         },
         per_camera,
     })
+}
+
+fn list_core(state: &AddonState, input: &RecordingListInput) -> CoreResult<RecordingListOut> {
+    // Only the per-vehicle event clips (`kind = "segment"`) are browsable; the
+    // requested limit is clamped to a hard ceiling (0 also means "use ceiling").
+    let limit = if input.limit == 0 {
+        RECORDING_LIST_MAX
+    } else {
+        input.limit.min(RECORDING_LIST_MAX)
+    };
+    // Date filters arrive as unix MILLISECONDS on the wire; `created_at` is unix
+    // SECONDS, so divide (floor `from`, ceil `to` conceptually — floor is fine as
+    // the wire value is a day boundary from the picker, seconds resolution).
+    let created_from = input.date_from.map(|ms| ms / 1000);
+    let created_to = input.date_to.map(|ms| ms / 1000);
+    let filters = RecordingListFilters {
+        kind: Some("segment"),
+        camera_id: input.camera_id.as_deref(),
+        created_from,
+        created_to,
+        plate: input.plate.as_deref(),
+        adr: input.adr.as_deref(),
+    };
+    let rows = match list_recordings_for_addon(
+        &state.db,
+        &state.addon_id,
+        state.org_id.as_deref(),
+        &filters,
+        limit,
+    ) {
+        Ok(r) => r,
+        Err(_) => {
+            audit(
+                state,
+                "recording.list",
+                None,
+                RiskClass::B,
+                "error",
+                Some("db_error"),
+            );
+            return CoreResult::Err(AbiError::Operation.as_i32());
+        }
+    };
+    let items: Vec<RecordingListItem> = rows
+        .into_iter()
+        .map(|r| RecordingListItem {
+            recording_ref: r.recording_ref,
+            camera_id: r.camera_id,
+            created_at: r.created_at,
+            duration_ms: r.duration_ms,
+            file_size_bytes: r.file_size_bytes,
+            event_meta: r.event_meta,
+            plate_text: r.plate_text,
+            adr_text: r.adr_text,
+            plate_thumb_ref: r.plate_thumb_ref,
+            adr_thumb_ref: r.adr_thumb_ref,
+        })
+        .collect();
+    audit(state, "recording.list", None, RiskClass::B, "ok", None);
+    CoreResult::Ok(RecordingListOut { items })
 }
 
 fn frame_url_core(state: &AddonState, input: &FrameUrlInput) -> CoreResult<UrlOut> {

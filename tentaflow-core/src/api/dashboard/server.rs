@@ -684,6 +684,46 @@ fn check_signed_url_rate_limit(
     }
 }
 
+/// Charge the strict invalid-signed-token limiter after an HMAC token FAILED
+/// verification on `/frames` or `/recordings`. Returns:
+///   * `None`  → the strict bucket still had budget; caller serves the normal
+///     401/403 (with its own already-emitted audit).
+///   * `Some(resp)` → the strict bucket is exhausted; caller returns this 429
+///     (with the `rate_limit_denied` audit) INSTEAD of the 401/403, bounding
+///     both forged-token throughput and the audit-INSERT cost per IP.
+///
+/// Valid requests from a logged-in user never reach this path, so they are
+/// never throttled beyond the generous pre-verify ceiling.
+fn charge_invalid_signed_token(
+    db: &DbPool,
+    ip: &str,
+    user_agent: Option<&str>,
+    endpoint: &str,
+) -> Option<Response<DashboardBody>> {
+    use crate::api::rate_limit::{invalid_signed_token_limiter, RateLimitResult};
+    match invalid_signed_token_limiter().check(ip) {
+        RateLimitResult::Allow => None,
+        RateLimitResult::IpLimit {
+            retry_after_secs, ..
+        } => Some(build_rate_limit_response(
+            db,
+            ip,
+            user_agent,
+            endpoint,
+            retry_after_secs,
+            false,
+        )),
+        RateLimitResult::GlobalLimit { retry_after_secs } => Some(build_rate_limit_response(
+            db,
+            ip,
+            user_agent,
+            endpoint,
+            retry_after_secs,
+            true,
+        )),
+    }
+}
+
 /// Bearer token for the `/models/*` endpoints, extracted before the request
 /// is dropped (the streaming body handler must not hold `req`).
 fn models_bearer_token(headers: &hyper::HeaderMap) -> Option<String> {
@@ -715,7 +755,9 @@ fn resolve_models_auth(
     audit_ref: &str,
     ctx: crate::api::model_bundle::RequestContext<'_>,
 ) -> std::result::Result<ModelsAuth, Response<DashboardBody>> {
-    use crate::api::model_bundle::{audit_api_key_rejected, resolve_bearer_api_key, BearerAuthResult};
+    use crate::api::model_bundle::{
+        audit_api_key_rejected, resolve_bearer_api_key, BearerAuthResult,
+    };
     let json_error = |status: StatusCode, body: &'static str| {
         Response::builder()
             .status(status)
@@ -1476,7 +1518,29 @@ pub async fn handle_request(
                     .body(Either::Left(Full::new(Bytes::from(body))))
                     .unwrap());
             }
-            FrameOutcome::Denied(_) | FrameOutcome::NotFound => {
+            FrameOutcome::Denied(_) => {
+                // Token verification FAILED (forged / expired / scope mismatch).
+                // Charge the strict invalid-token bucket: if it is exhausted for
+                // this IP, return 429 instead of 403 to bound forged-token spam
+                // and its audit cost. `handle_frame_url` already emitted the
+                // per-outcome "denied" audit above.
+                if let Some(resp) =
+                    charge_invalid_signed_token(&db, &client_ip, user_agent.as_deref(), "/frames")
+                {
+                    return Ok(resp);
+                }
+                return Ok(Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from_static(
+                        b"{\"error\":\"frame_denied\"}",
+                    ))))
+                    .unwrap());
+            }
+            FrameOutcome::NotFound => {
+                // Valid token pointing at an evicted/unknown frame — NOT a
+                // verification failure, so it must not charge the strict bucket
+                // (a logged-in user hitting a stale thumbnail is legitimate).
                 return Ok(Response::builder()
                     .status(status)
                     .header("Content-Type", "application/json")
@@ -1577,9 +1641,31 @@ pub async fn handle_request(
                     .body(Either::Left(Full::new(Bytes::from(body))))
                     .unwrap());
             }
-            RecordingOutcome::Denied(_)
-            | RecordingOutcome::NotFound
-            | RecordingOutcome::InternalError(_) => {
+            RecordingOutcome::Denied(_) => {
+                // Token verification FAILED (forged / expired / scope mismatch).
+                // Charge the strict invalid-token bucket: exhausted → 429 instead
+                // of 403, bounding forged-token spam and its audit cost.
+                // `handle_recording_url` already emitted the "denied" audit above.
+                if let Some(resp) = charge_invalid_signed_token(
+                    &db,
+                    &client_ip,
+                    user_agent.as_deref(),
+                    "/recordings",
+                ) {
+                    return Ok(resp);
+                }
+                return Ok(Response::builder()
+                    .status(auth_status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from_static(
+                        b"{\"error\":\"recording_denied\"}",
+                    ))))
+                    .unwrap());
+            }
+            RecordingOutcome::NotFound | RecordingOutcome::InternalError(_) => {
+                // Valid token, but the row is purged (404) or a DB/internal
+                // failure (500). Neither is a token-verify failure, so the
+                // strict invalid-token bucket must not be charged.
                 return Ok(Response::builder()
                     .status(auth_status)
                     .header("Content-Type", "application/json")
@@ -1600,7 +1686,9 @@ pub async fn handle_request(
         && path.starts_with("/models/manifest/")
         && path.len() > "/models/manifest/".len()
     {
-        use crate::api::model_bundle::{handle_manifest, BundleAuth, ManifestOutcome, RequestContext};
+        use crate::api::model_bundle::{
+            handle_manifest, BundleAuth, ManifestOutcome, RequestContext,
+        };
         if let Err(resp) = reject_unauth_get_body(req.headers()) {
             return Ok(resp);
         }
@@ -1631,7 +1719,9 @@ pub async fn handle_request(
             }
             Ok(ModelsAuth::ApiKey(uid)) => {
                 key_storage = uid;
-                BundleAuth::ApiKey { key_uid: &key_storage }
+                BundleAuth::ApiKey {
+                    key_uid: &key_storage,
+                }
             }
             Err(resp) => return Ok(resp),
         };
@@ -1671,7 +1761,9 @@ pub async fn handle_request(
     // derived from a manifest token OR the same Bearer API key that fetched
     // the manifest. Bodies stream in chunks (weights reach ~126 MB) through
     // the same StreamBody slot SSE uses.
-    if method == Method::GET && path.starts_with("/models/file/") && path.len() > "/models/file/".len()
+    if method == Method::GET
+        && path.starts_with("/models/file/")
+        && path.len() > "/models/file/".len()
     {
         use crate::api::model_bundle::{
             file_stream, handle_file, BundleAuth, FileOutcome, RequestContext,
@@ -1687,7 +1779,9 @@ pub async fn handle_request(
         let bearer_token = models_bearer_token(req.headers());
         drop(req);
         let rest = path.strip_prefix("/models/file/").unwrap_or("");
-        let Some((bundle_ref, name)) = rest.split_once('/').filter(|(b, n)| !b.is_empty() && !n.is_empty())
+        let Some((bundle_ref, name)) = rest
+            .split_once('/')
+            .filter(|(b, n)| !b.is_empty() && !n.is_empty())
         else {
             return Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
@@ -1717,7 +1811,9 @@ pub async fn handle_request(
             }
             Ok(ModelsAuth::ApiKey(uid)) => {
                 key_storage = uid;
-                BundleAuth::ApiKey { key_uid: &key_storage }
+                BundleAuth::ApiKey {
+                    key_uid: &key_storage,
+                }
             }
             Err(resp) => return Ok(resp),
         };

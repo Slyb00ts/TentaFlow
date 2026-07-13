@@ -173,11 +173,9 @@ fn build_subscriptions(flows: &[(String, String)]) -> Vec<Subscription> {
                 continue;
             }
         };
-        let Some(entry) = def
-            .nodes
-            .iter()
-            .find(|n| n.node_type == crate::flow_engine::node_adapters::on_subagent_complete::NODE_TYPE)
-        else {
+        let Some(entry) = def.nodes.iter().find(|n| {
+            n.node_type == crate::flow_engine::node_adapters::on_subagent_complete::NODE_TYPE
+        }) else {
             continue;
         };
         match CompletionFilter::from_config(&entry.config) {
@@ -526,7 +524,10 @@ mod tests {
         // A completion of a DIFFERENT agent must not fire the a1-filtered flow.
         let event = finished_run(&pool, "a2", "nope");
         r.handle(event).await;
-        assert!(calls.lock().unwrap().is_empty(), "non-matching agent dispatched");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "non-matching agent dispatched"
+        );
     }
 
     #[tokio::test]
@@ -534,7 +535,11 @@ mod tests {
         let pool = db();
         seed_agent(&pool, "a1", "worker");
         // Flow only reacts to failures.
-        seed_event_flow(&pool, "react", json!({"agent_id": "a1", "match_status": "failed"}));
+        seed_event_flow(
+            &pool,
+            "react",
+            json!({"agent_id": "a1", "match_status": "failed"}),
+        );
         let calls = Arc::new(Mutex::new(Vec::new()));
         let (tx, _rx) = mpsc::unbounded_channel();
         let spy = Arc::new(SpyDispatch {
@@ -546,7 +551,10 @@ mod tests {
         // A COMPLETED run does not match a failed-only filter.
         let event = finished_run(&pool, "a1", "ok");
         r.handle(event).await;
-        assert!(calls.lock().unwrap().is_empty(), "status mismatch dispatched");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "status mismatch dispatched"
+        );
     }
 
     #[tokio::test]
@@ -565,7 +573,11 @@ mod tests {
         let event = finished_run(&pool, "a1", "once");
         r.handle(event.clone()).await;
         r.handle(event).await; // same run id again
-        assert_eq!(calls.lock().unwrap().len(), 1, "duplicate event re-dispatched");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "duplicate event re-dispatched"
+        );
     }
 
     /// End-to-end through the broadcast channel + the spawned task: a

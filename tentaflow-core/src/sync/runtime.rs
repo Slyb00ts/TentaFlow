@@ -1118,7 +1118,10 @@ impl SyncRuntime {
         if entries.is_empty() {
             // Backlog fully acknowledged/drained: drop any stale retry deadline so
             // the next freshly queued op is not gated behind it.
-            self.push_state.retry_after_ms.lock().remove(target.as_str());
+            self.push_state
+                .retry_after_ms
+                .lock()
+                .remove(target.as_str());
             return Ok(None);
         }
         let mut pending = Vec::with_capacity(entries.len());
@@ -1162,7 +1165,10 @@ impl SyncRuntime {
         if operations.is_empty() {
             // Everything in-scope was revoked (acked-as-skip) or reaped; no payload
             // and no obligation left, so clear the deadline.
-            self.push_state.retry_after_ms.lock().remove(target.as_str());
+            self.push_state
+                .retry_after_ms
+                .lock()
+                .remove(target.as_str());
             return Ok(None);
         }
 
@@ -1258,10 +1264,7 @@ impl SyncRuntime {
     /// tick instead of waiting out a previously-set retry deadline. Called from
     /// the outbox enqueue paths.
     fn reset_push_backoff(&self, target_node_id: &str) {
-        self.push_state
-            .retry_after_ms
-            .lock()
-            .remove(target_node_id);
+        self.push_state.retry_after_ms.lock().remove(target_node_id);
     }
 
     /// Re-enqueues already-minted operations to receivers that gained access AFTER
@@ -5893,7 +5896,11 @@ mod tests {
             let source = make_runtime(131);
             let receiver = make_runtime(132);
             let addon_id = "sync-runtime-backoff";
-            seed_authority_target(&source.runtime.db, addon_id, &receiver.runtime.local_node_id);
+            seed_authority_target(
+                &source.runtime.db,
+                addon_id,
+                &receiver.runtime.local_node_id,
+            );
             open_contacts_table(addon_id);
             let target = SyncTarget::new(receiver.runtime.local_node_id.clone()).expect("target");
 
@@ -10206,7 +10213,8 @@ mod tests {
         access_level: Option<&str>,
         hlc: HybridLogicalTimestamp,
     ) -> crate::sync::core_capture::CoreWriteCapture {
-        let rid = crate::sync::resource_id::composite_resource_id(&["model", "gpt-4o", "user", "u1"]);
+        let rid =
+            crate::sync::resource_id::composite_resource_id(&["model", "gpt-4o", "user", "u1"]);
         let mut fields = BTreeMap::new();
         fields.insert(
             "resource_type".to_string(),
@@ -10300,7 +10308,10 @@ mod tests {
             .expect("seed pepper on B");
             let recovered = crate::db::repository::get_or_create_api_key_pepper(&db_b, &cipher)
                 .expect("read pepper on B");
-            assert_eq!(recovered, pepper, "B must use the org pepper, not a fresh one");
+            assert_eq!(
+                recovered, pepper,
+                "B must use the org pepper, not a fresh one"
+            );
 
             let found = crate::db::repository::verify_api_key(&db_b, &verifier)
                 .expect("verify")
@@ -10371,7 +10382,11 @@ mod tests {
 
             let allow_op = signed_flow_op(
                 &node_a,
-                perm_capture(SqlWriteAction::Insert, Some("allow"), hlc_at(1_000, 0, "node-a")),
+                perm_capture(
+                    SqlWriteAction::Insert,
+                    Some("allow"),
+                    hlc_at(1_000, 0, "node-a"),
+                ),
             );
             let clear_op = signed_flow_op(
                 &node_a,
@@ -10428,8 +10443,8 @@ mod tests {
 
             let db2 = make_db();
             crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &newer).unwrap();
-            let stale =
-                crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &older).unwrap();
+            let stale = crate::sync::core_materializer::apply_core_operation(&db2, &cipher, &older)
+                .unwrap();
             assert_eq!(stale, 0, "older active=true dropped by LWW");
 
             assert_eq!(api_key_active(&db1, "uid-3"), Some(false));

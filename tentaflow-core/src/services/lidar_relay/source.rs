@@ -77,7 +77,10 @@ impl std::fmt::Debug for RemoteLidarStreamSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemoteLidarStreamSource")
             .field("stream_id", &self.stream_id)
-            .field("latest_frame_len", &self.latest_frame.lock().as_ref().map(|b| b.len()))
+            .field(
+                "latest_frame_len",
+                &self.latest_frame.lock().as_ref().map(|b| b.len()),
+            )
             .field("terminal", &self.terminal.load(Ordering::Acquire))
             .finish()
     }
@@ -158,7 +161,10 @@ async fn spawn_relay(
     robot_id: String,
     org_id: String,
 ) {
-    let mut stream = match iroh.lidar_stream_request(&owner_node, &robot_id, &org_id).await {
+    let mut stream = match iroh
+        .lidar_stream_request(&owner_node, &robot_id, &org_id)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             tracing::debug!(

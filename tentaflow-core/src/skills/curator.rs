@@ -14,9 +14,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::api::openai::types::{
-    ChatCompletionRequest, ContentPart, Message, MessageContent,
-};
+use crate::api::openai::types::{ChatCompletionRequest, ContentPart, Message, MessageContent};
 use crate::db::{models::DbSkill, repository, DbPool};
 use crate::routing::router::Router;
 
@@ -180,7 +178,9 @@ fn collect_candidates(pool: &DbPool) -> Result<Vec<ReviewSkill>> {
     review.sort_by(|a, b| {
         let a_key = a.stale_days.unwrap_or(i64::MAX);
         let b_key = b.stale_days.unwrap_or(i64::MAX);
-        b_key.cmp(&a_key).then_with(|| a.use_count.cmp(&b.use_count))
+        b_key
+            .cmp(&a_key)
+            .then_with(|| a.use_count.cmp(&b.use_count))
     });
     review.truncate(MAX_REVIEW_SKILLS);
     Ok(review)
@@ -266,7 +266,9 @@ fn parse_proposal(raw: &str, candidates: &[ReviewSkill]) -> Result<CuratorPropos
     let mut actions = Vec::new();
     for mut action in parsed.actions {
         // Keep only ids that reference a live candidate.
-        action.skill_ids.retain(|id| by_id.contains_key(id.as_str()));
+        action
+            .skill_ids
+            .retain(|id| by_id.contains_key(id.as_str()));
         if action.skill_ids.is_empty() {
             continue;
         }
@@ -531,13 +533,15 @@ pub fn apply_proposal(
                 }
                 // Create the umbrella skill (if it doesn't already exist), then
                 // archive the cluster members folded under it.
-                let umbrella_id =
-                    ensure_umbrella(pool, umbrella_name, action, actor_user_id)?;
+                let umbrella_id = ensure_umbrella(pool, umbrella_name, action, actor_user_id)?;
                 mutated += 1;
                 audit(
                     "skill.curator_umbrella",
                     Some(&format!("skill:{umbrella_id}")),
-                    Some(&format!("created umbrella {umbrella_name}: {}", action.rationale)),
+                    Some(&format!(
+                        "created umbrella {umbrella_name}: {}",
+                        action.rationale
+                    )),
                 );
                 for id in &action.skill_ids {
                     if archive_skill(pool, id, actor_user_id)? {
@@ -685,14 +689,22 @@ pub fn rollback_snapshot(
     for row in &rows {
         if row.existed {
             // Restore the captured pre-apply state in place.
-            let (Some(name), Some(description), Some(content), Some(tags_json), Some(source), Some(status)) = (
+            let (
+                Some(name),
+                Some(description),
+                Some(content),
+                Some(tags_json),
+                Some(source),
+                Some(status),
+            ) = (
                 row.name.as_deref(),
                 row.description.as_deref(),
                 row.content.as_deref(),
                 row.tags_json.as_deref(),
                 row.source.as_deref(),
                 row.status.as_deref(),
-            ) else {
+            )
+            else {
                 continue;
             };
             let params = crate::db::models::SkillParams {
@@ -793,7 +805,9 @@ pub async fn router_complete(router: &Router, model: &str, prompt: String) -> Re
 /// Resolves the configured curator interval in hours from settings. Returns
 /// `None` when unset / empty / non-positive (manual-only — the default).
 fn resolve_interval_hours(pool: &DbPool) -> Option<u64> {
-    let raw = repository::get_setting(pool, CURATOR_INTERVAL_SETTING).ok().flatten()?;
+    let raw = repository::get_setting(pool, CURATOR_INTERVAL_SETTING)
+        .ok()
+        .flatten()?;
     let hours: u64 = raw.trim().parse().ok()?;
     (hours > 0).then_some(hours)
 }
@@ -833,7 +847,9 @@ pub fn start_curator_schedule_task(pool: DbPool, router: std::sync::Arc<Router>)
             match outcome {
                 Ok(o) => {
                     if o.proposal.actions.is_empty() {
-                        tracing::debug!("skills curator: scheduled report found nothing to propose");
+                        tracing::debug!(
+                            "skills curator: scheduled report found nothing to propose"
+                        );
                     } else {
                         tracing::info!(
                             "skills curator: scheduled report proposed {} action(s), snapshot {}",
@@ -883,7 +899,11 @@ mod tests {
                 tags_json: "[\"alpha\"]",
                 category: None,
                 source,
-                source_ref: if source == "addon" { Some("addon-x") } else { None },
+                source_ref: if source == "addon" {
+                    Some("addon-x")
+                } else {
+                    None
+                },
                 status: "active",
                 created_by: None,
                 actor_user_id: None,
@@ -896,7 +916,9 @@ mod tests {
         |_, _, _| {}
     }
 
-    fn mock_reply(json: &str) -> impl FnOnce(String) -> futures::future::BoxFuture<'static, Result<String>> {
+    fn mock_reply(
+        json: &str,
+    ) -> impl FnOnce(String) -> futures::future::BoxFuture<'static, Result<String>> {
         let owned = json.to_string();
         move |_prompt| Box::pin(async move { Ok(owned) })
     }
@@ -913,8 +935,8 @@ mod tests {
         assert_eq!(outcome.proposal.actions.len(), 1);
         assert_eq!(outcome.proposal.actions[0].action, CuratorActionKind::Merge);
         // Snapshot persisted with both touched skills.
-        let rows = repository::list_curator_snapshot_rows(&pool, &outcome.snapshot_id)
-            .expect("rows");
+        let rows =
+            repository::list_curator_snapshot_rows(&pool, &outcome.snapshot_id).expect("rows");
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.existed));
     }
@@ -944,7 +966,10 @@ mod tests {
             .await
             .expect("review");
         assert_eq!(outcome.proposal.actions.len(), 1);
-        assert_eq!(outcome.proposal.actions[0].action, CuratorActionKind::Archive);
+        assert_eq!(
+            outcome.proposal.actions[0].action,
+            CuratorActionKind::Archive
+        );
     }
 
     #[tokio::test]

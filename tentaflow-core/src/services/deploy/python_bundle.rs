@@ -28,7 +28,6 @@ use crate::services::ports::PortAllocator;
 use crate::services::transport::Transport;
 use crate::services_repo::services::{self as services_repo, DeployMethod, ServiceStatus};
 
-
 /// Wstrzykuje `HF_TOKEN` do env procesu silnika z tokenu rozwiazanego per-node
 /// w `deploy()` (secure setting), NIGDY z `user_config` — sekret nie moze trafic
 /// do config_json. Symetria z docker (`vllm_deploy_env`): native bez tego leci do

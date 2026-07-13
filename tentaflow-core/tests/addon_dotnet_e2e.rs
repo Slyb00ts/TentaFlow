@@ -272,7 +272,11 @@ fn dotnet_addon_storage_roundtrip() {
         serde_json::json!({"key": "dotnet_key", "value": "dotnet_value"}),
     );
     assert_eq!(response["ok"], true, "test_storage: {:?}", response);
-    assert_eq!(response["data"]["match"], true, "storage mismatch: {:?}", response);
+    assert_eq!(
+        response["data"]["match"], true,
+        "storage mismatch: {:?}",
+        response
+    );
     assert_eq!(response["data"]["read"], "dotnet_value");
 }
 
@@ -328,7 +332,9 @@ fn call_on_panel_open(
     let alloc = instance
         .get_typed_func::<i32, i32>(&mut *store, "alloc")
         .expect("alloc");
-    let ptr = alloc.call(&mut *store, bytes.len() as i32).expect("alloc panel_id");
+    let ptr = alloc
+        .call(&mut *store, bytes.len() as i32)
+        .expect("alloc panel_id");
     let memory = instance.get_memory(&mut *store, "memory").expect("memory");
     memory.data_mut(&mut *store)[ptr as usize..ptr as usize + bytes.len()].copy_from_slice(bytes);
 
@@ -504,10 +510,18 @@ fn dotnet_addon_instantiates_under_wasmi_mobile_shim() {
     // Minimal `tentaflow` host stubs matching the module's import signatures.
     type Caller<'a> = runtime_wasmi::WasmCaller<'a, AddonState>;
     linker
-        .func_wrap("tentaflow", "log_info", |_c: Caller<'_>, _p: i32, _n: i32| -> i32 { 0 })
+        .func_wrap(
+            "tentaflow",
+            "log_info",
+            |_c: Caller<'_>, _p: i32, _n: i32| -> i32 { 0 },
+        )
         .expect("log_info");
     linker
-        .func_wrap("tentaflow", "log_error", |_c: Caller<'_>, _p: i32, _n: i32| -> i32 { 0 })
+        .func_wrap(
+            "tentaflow",
+            "log_error",
+            |_c: Caller<'_>, _p: i32, _n: i32| -> i32 { 0 },
+        )
         .expect("log_error");
     linker
         .func_wrap(
@@ -547,13 +561,16 @@ fn dotnet_addon_instantiates_under_wasmi_mobile_shim() {
     let init = instance
         .get_typed_func::<(), ()>(&store, "_initialize")
         .expect("brak eksportu _initialize");
-    init.call(&mut store, ()).expect("_initialize trap under wasmi");
+    init.call(&mut store, ())
+        .expect("_initialize trap under wasmi");
 
     let on_start = instance
         .get_typed_func::<(), i32>(&store, "tentaflow_on_start")
         .expect("brak eksportu tentaflow_on_start");
     assert_eq!(
-        on_start.call(&mut store, ()).expect("on_start trap under wasmi"),
+        on_start
+            .call(&mut store, ())
+            .expect("on_start trap under wasmi"),
         0,
         "tentaflow_on_start powinno zwrocic 0 pod wasmi"
     );

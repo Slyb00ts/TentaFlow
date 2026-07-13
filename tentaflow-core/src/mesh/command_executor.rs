@@ -92,9 +92,7 @@ impl MeshCommandExecutor {
             local_node_id,
             data_dir,
             service_actions: AsyncRwLock::new(None),
-            robot_idem: std::sync::Mutex::new(
-                crate::mesh::robot_control::IdempotencyCache::new(),
-            ),
+            robot_idem: std::sync::Mutex::new(crate::mesh::robot_control::IdempotencyCache::new()),
             robot_exec_locks: dashmap::DashMap::new(),
         }
     }
@@ -390,7 +388,8 @@ impl MeshCommandExecutor {
                 .await
             }
             MeshCommandType::ServiceDeployDistributed { spec } => {
-                self.handle_service_deploy_distributed(from_node_id, spec).await
+                self.handle_service_deploy_distributed(from_node_id, spec)
+                    .await
             }
             MeshCommandType::ServiceStopDistributed {
                 deployment_cluster_id,
@@ -479,7 +478,10 @@ impl MeshCommandExecutor {
                 seq,
                 total,
                 data_b64,
-            } => self.handle_ml_dataset_chunk(dataset_hash, seq, total, data_b64).await,
+            } => {
+                self.handle_ml_dataset_chunk(dataset_hash, seq, total, data_b64)
+                    .await
+            }
             MeshCommandType::MlDetect {
                 checkpoint_path,
                 class_names_json,
@@ -487,20 +489,32 @@ impl MeshCommandExecutor {
                 threshold,
                 image_b64,
             } => {
-                self.handle_ml_detect(checkpoint_path, class_names_json, variant, threshold, image_b64)
-                    .await
+                self.handle_ml_detect(
+                    checkpoint_path,
+                    class_names_json,
+                    variant,
+                    threshold,
+                    image_b64,
+                )
+                .await
             }
-            MeshCommandType::MlExport { export_id, spec_json } => {
-                match crate::ml_studio::export_llm::mesh_export_start(&export_id, &spec_json).await {
+            MeshCommandType::MlExport {
+                export_id,
+                spec_json,
+            } => {
+                match crate::ml_studio::export_llm::mesh_export_start(&export_id, &spec_json).await
+                {
                     Ok(()) => CommandResponse::ok(MeshCommandResponsePayload::Empty),
                     Err(e) => CommandResponse::fail(format!("mesh export start: {}", e)),
                 }
             }
             MeshCommandType::MlExportStatus { export_id } => {
                 match crate::ml_studio::export_llm::mesh_export_status(&export_id).await {
-                    Ok(status_json) => CommandResponse::ok(
-                        MeshCommandResponsePayload::MlExportStatusResult { status_json },
-                    ),
+                    Ok(status_json) => {
+                        CommandResponse::ok(MeshCommandResponsePayload::MlExportStatusResult {
+                            status_json,
+                        })
+                    }
                     Err(e) => CommandResponse::fail(format!("mesh export status: {}", e)),
                 }
             }
@@ -512,7 +526,10 @@ impl MeshCommandExecutor {
             MeshCommandType::MlArtifactPushTo {
                 src_path,
                 target_node_id,
-            } => self.handle_ml_artifact_push_to(src_path, target_node_id).await,
+            } => {
+                self.handle_ml_artifact_push_to(src_path, target_node_id)
+                    .await
+            }
             MeshCommandType::RobotControl { request_cbor } => {
                 self.handle_robot_control(from_node_id, request_cbor).await
             }
@@ -587,12 +604,12 @@ impl MeshCommandExecutor {
         )
         .await
         {
-            Ok(target_path) => CommandResponse::ok(
-                MeshCommandResponsePayload::MlArtifactPushResult {
+            Ok(target_path) => {
+                CommandResponse::ok(MeshCommandResponsePayload::MlArtifactPushResult {
                     target_path,
                     error: None,
-                },
-            ),
+                })
+            }
             Err(e) => CommandResponse::ok(MeshCommandResponsePayload::MlArtifactPushResult {
                 target_path: String::new(),
                 error: Some(e.to_string()),
@@ -775,8 +792,13 @@ impl MeshCommandExecutor {
         let Some(ctx) = self.service_action_ctx().await else {
             return CommandResponse::fail("service action context not configured");
         };
-        match crate::ml_studio::infer::run_local_chat(&ctx.router, &model_name, &message, max_tokens)
-            .await
+        match crate::ml_studio::infer::run_local_chat(
+            &ctx.router,
+            &model_name,
+            &message,
+            max_tokens,
+        )
+        .await
         {
             Ok(answer) => CommandResponse::ok(MeshCommandResponsePayload::MlChatResult {
                 answer,
@@ -800,8 +822,7 @@ impl MeshCommandExecutor {
         threshold: f64,
         image_b64: String,
     ) -> CommandResponse {
-        let class_names: Vec<String> =
-            serde_json::from_str(&class_names_json).unwrap_or_default();
+        let class_names: Vec<String> = serde_json::from_str(&class_names_json).unwrap_or_default();
         match crate::ml_studio::train_recognition::run_detect(
             checkpoint_path,
             class_names,
@@ -844,7 +865,9 @@ impl MeshCommandExecutor {
             &data_b64,
         ) {
             Ok(have_already) => {
-                CommandResponse::ok(MeshCommandResponsePayload::MlDatasetChunkResult { have_already })
+                CommandResponse::ok(MeshCommandResponsePayload::MlDatasetChunkResult {
+                    have_already,
+                })
             }
             Err(e) => CommandResponse::fail(format!("mesh dataset chunk: {}", e)),
         }
@@ -862,7 +885,8 @@ impl MeshCommandExecutor {
         let res = if kind == "llm" {
             crate::ml_studio::train_llm::mesh_train_start_llm(&run_id, &spec_json).await
         } else if kind == "classifier" {
-            crate::ml_studio::train_classifier::mesh_train_start_classifier(&run_id, &spec_json).await
+            crate::ml_studio::train_classifier::mesh_train_start_classifier(&run_id, &spec_json)
+                .await
         } else {
             crate::ml_studio::train_recognition::mesh_train_start(&run_id, &spec_json).await
         };
@@ -921,8 +945,7 @@ impl MeshCommandExecutor {
 
     /// Owner side of a forwarded subscription OAuth poll.
     async fn handle_oauth_poll(&self, flow_id: String) -> CommandResponse {
-        let (status, account_label, error) =
-            crate::services::backend::codex_oauth::poll(&flow_id);
+        let (status, account_label, error) = crate::services::backend::codex_oauth::poll(&flow_id);
         CommandResponse::ok(MeshCommandResponsePayload::OauthPollResult {
             status,
             account_label,
@@ -984,9 +1007,9 @@ impl MeshCommandExecutor {
         let respond = |resp: RobotControlResponse| -> CommandResponse {
             let mut buf = Vec::new();
             match ciborium::ser::into_writer(&resp, &mut buf) {
-                Ok(()) => CommandResponse::ok(
-                    MeshCommandResponsePayload::RobotControlResult { result_cbor: buf },
-                ),
+                Ok(()) => CommandResponse::ok(MeshCommandResponsePayload::RobotControlResult {
+                    result_cbor: buf,
+                }),
                 Err(e) => CommandResponse::fail(format!("encode robot control response: {e}")),
             }
         };
@@ -1643,8 +1666,7 @@ impl MeshCommandExecutor {
                     .and_then(|v| v.as_str())
                     .map(String::from)
                 {
-                    if let Some(blob) =
-                        crate::services::backend::codex_oauth::take_tokens(&flow_id)
+                    if let Some(blob) = crate::services::backend::codex_oauth::take_tokens(&flow_id)
                     {
                         obj.insert("api_key".to_string(), serde_json::Value::String(blob));
                     }
@@ -1908,13 +1930,18 @@ impl MeshCommandExecutor {
         if let Err(e) = crate::services::deploy::distributed::preflight_member(&spec).await {
             return CommandResponse::fail(e);
         }
-        let config_json = match crate::services::deploy::distributed::build_member_config_json(&spec)
-        {
-            Ok(c) => c,
-            Err(e) => return CommandResponse::fail(e),
-        };
+        let config_json =
+            match crate::services::deploy::distributed::build_member_config_json(&spec) {
+                Ok(c) => c,
+                Err(e) => return CommandResponse::fail(e),
+            };
         let resp = self
-            .handle_service_deploy_remote(requester_node_id, &spec.engine_id, "docker", &config_json)
+            .handle_service_deploy_remote(
+                requester_node_id,
+                &spec.engine_id,
+                "docker",
+                &config_json,
+            )
             .await;
         if !resp.ok {
             return resp;
@@ -1936,7 +1963,10 @@ impl MeshCommandExecutor {
     /// Teardown distributed-deploymentu NA TYM nodzie: usuwa kontener(y) po
     /// etykiecie `deployment_cluster_id` ORAZ kasuje wiersze serwisow niosace ten
     /// id (head + workery), broadcastujac usuniecie do reszty mesh. Idempotentne.
-    async fn handle_service_stop_distributed(&self, deployment_cluster_id: &str) -> CommandResponse {
+    async fn handle_service_stop_distributed(
+        &self,
+        deployment_cluster_id: &str,
+    ) -> CommandResponse {
         let actions = match self.service_action_ctx().await {
             Some(c) => c,
             None => return CommandResponse::fail("service action context not configured"),

@@ -33,8 +33,7 @@ const TRUNCATION_MARKER: &str = "\n…[truncated]…\n";
 
 /// Human-wait budget for a permission grant card (§3.13 B). A grant has no
 /// model-supplied timeout (unlike ask_user), so it uses the shared default.
-const DEFAULT_PERMISSION_TIMEOUT: Duration =
-    Duration::from_secs(DEFAULT_INTERACTION_TIMEOUT_SECS);
+const DEFAULT_PERMISSION_TIMEOUT: Duration = Duration::from_secs(DEFAULT_INTERACTION_TIMEOUT_SECS);
 
 /// Shapes a failed tool call into a recoverable `[TOOL_ERROR]`-style result the
 /// model can adapt to (mirrors the service's private helper).
@@ -190,7 +189,10 @@ impl ToolExecNodeAdapter {
             Some(CoreToolName::AgentWait) => manager.handle_agent_wait(caller, &args).await,
             Some(CoreToolName::AgentList) => manager.handle_agent_list(caller),
             Some(CoreToolName::AgentCancel) => manager.handle_agent_cancel(caller, &args),
-            _ => Err(anyhow!("tool '{}' is not a sub-agent control call", call.name)),
+            _ => Err(anyhow!(
+                "tool '{}' is not a sub-agent control call",
+                call.name
+            )),
         };
         match outcome {
             Ok(output) => ToolCallResult {
@@ -286,11 +288,13 @@ impl ToolExecNodeAdapter {
         if is_core_tool(&call.name) {
             let service = service.clone();
             let call_for_blocking = call.clone();
-            return tokio::task::spawn_blocking(move || run_core_sync(&service, &call_for_blocking))
-                .await
-                .unwrap_or_else(|e| {
-                    error_result(call, format!("core tool dispatch join failed: {e}"))
-                });
+            return tokio::task::spawn_blocking(move || {
+                run_core_sync(&service, &call_for_blocking)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                error_result(call, format!("core tool dispatch join failed: {e}"))
+            });
         }
 
         // Addon tools need a user principal.
@@ -325,8 +329,11 @@ impl ToolExecNodeAdapter {
                 }
                 // NotConfigured → raise a grant card and wait for a decision.
                 PermissionResult::NotConfigured => {
-                    let addon_id =
-                        call.name.split_once('.').map(|(a, _)| a).unwrap_or(&call.name);
+                    let addon_id = call
+                        .name
+                        .split_once('.')
+                        .map(|(a, _)| a)
+                        .unwrap_or(&call.name);
                     let (decision, waited) = crate::agents::run_permission_request(
                         &registry,
                         manager,
@@ -367,10 +374,7 @@ impl ToolExecNodeAdapter {
                                 false,
                                 Some(&user_id),
                             ) {
-                                return error_result(
-                                    call,
-                                    format!("failed to persist grant: {e}"),
-                                );
+                                return error_result(call, format!("failed to persist grant: {e}"));
                             }
                         }
                     }
@@ -480,8 +484,10 @@ impl NodeAdapter for ToolExecNodeAdapter {
             .clone()
             .ok_or_else(|| anyhow!("tool_exec: AgentService slot not wired"))?;
 
-        let max_result_chars = Self::config_usize(node, "max_result_chars", DEFAULT_MAX_RESULT_CHARS);
-        let max_tool_calls = Self::config_usize(node, "max_tool_calls_per_iteration", DEFAULT_MAX_TOOL_CALLS);
+        let max_result_chars =
+            Self::config_usize(node, "max_result_chars", DEFAULT_MAX_RESULT_CHARS);
+        let max_tool_calls =
+            Self::config_usize(node, "max_tool_calls_per_iteration", DEFAULT_MAX_TOOL_CALLS);
 
         let mut out: FlowEnvelope = (**envelope).clone();
         let mut calls = Self::last_assistant_tool_calls(envelope);
@@ -489,7 +495,8 @@ impl NodeAdapter for ToolExecNodeAdapter {
         // End detection: an assistant turn without tool calls is the final
         // response — signal the loop to stop (§1.1, §3.4).
         if calls.is_empty() {
-            out.meta.insert("harness_done".into(), serde_json::json!(true));
+            out.meta
+                .insert("harness_done".into(), serde_json::json!(true));
             out.meta.insert(
                 "harness_exit_reason".into(),
                 serde_json::json!("final_response"),
@@ -537,8 +544,7 @@ impl NodeAdapter for ToolExecNodeAdapter {
         let manager = crate::agents::agent_run_manager_global();
         let mut results: Vec<ToolCallResult> = Vec::with_capacity(calls.len());
 
-        let caller =
-            CallerRun::from_envelope(envelope, principal.clone(), ctx.session_id.clone());
+        let caller = CallerRun::from_envelope(envelope, principal.clone(), ctx.session_id.clone());
         // Parent chain for bubbling a child's question to the same principal
         // (§3.13 A): the dashboard sees the parent_run_id so the ask is visibly
         // attributed up the spawn tree.
@@ -560,10 +566,7 @@ impl NodeAdapter for ToolExecNodeAdapter {
             );
 
             let result = if !service.tool_allowed(&tools_json, &call.name) {
-                error_result(
-                    call,
-                    format!("tool '{}' not in agent allowlist", call.name),
-                )
+                error_result(call, format!("tool '{}' not in agent allowlist", call.name))
             } else if CoreToolName::from_public_name(&call.name)
                 .map(|c| c.is_ask_user())
                 .unwrap_or(false)
@@ -671,9 +674,8 @@ mod tests {
 
     fn service(pool: DbPool) -> AgentServiceSlot {
         let cipher = Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]));
-        let addon_manager = Arc::new(
-            crate::addon::AddonManager::new(pool.clone(), cipher).expect("addon manager"),
-        );
+        let addon_manager =
+            Arc::new(crate::addon::AddonManager::new(pool.clone(), cipher).expect("addon manager"));
         let svc = Arc::new(AgentService::new(pool, addon_manager));
         Arc::new(parking_lot::RwLock::new(Some(svc)))
     }
@@ -755,7 +757,9 @@ mod tests {
     async fn no_tool_calls_sets_harness_done() {
         let slot = service(db());
         let mut env = FlowEnvelope::empty();
-        env.context.messages.push(ChatMessage::assistant("final answer"));
+        env.context
+            .messages
+            .push(ChatMessage::assistant("final answer"));
         let ctx = stub_ctx();
 
         let out = ToolExecNodeAdapter::new(slot)
@@ -763,7 +767,10 @@ mod tests {
             .await
             .expect("execute");
 
-        assert_eq!(out.meta.get("harness_done").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            out.meta.get("harness_done").and_then(|v| v.as_bool()),
+            Some(true)
+        );
         assert_eq!(
             out.meta.get("harness_exit_reason").and_then(|v| v.as_str()),
             Some("final_response")
@@ -779,11 +786,13 @@ mod tests {
 
         let mut env = FlowEnvelope::empty();
         env.meta.insert("agent_id".into(), json!("agent-1"));
-        env.context.messages.push(assistant_with_calls(vec![LlmToolCall {
-            id: "call-1".into(),
-            name: "core.skill_view".into(),
-            arguments: r#"{"name":"do-thing"}"#.into(),
-        }]));
+        env.context
+            .messages
+            .push(assistant_with_calls(vec![LlmToolCall {
+                id: "call-1".into(),
+                name: "core.skill_view".into(),
+                arguments: r#"{"name":"do-thing"}"#.into(),
+            }]));
         let ctx = stub_ctx();
 
         let out = ToolExecNodeAdapter::new(slot)
@@ -815,11 +824,13 @@ mod tests {
 
         let mut env = FlowEnvelope::empty();
         env.meta.insert("agent_id".into(), json!("agent-2"));
-        env.context.messages.push(assistant_with_calls(vec![LlmToolCall {
-            id: "call-9".into(),
-            name: "memory.memory_store".into(),
-            arguments: "{}".into(),
-        }]));
+        env.context
+            .messages
+            .push(assistant_with_calls(vec![LlmToolCall {
+                id: "call-9".into(),
+                name: "memory.memory_store".into(),
+                arguments: "{}".into(),
+            }]));
         let mut ctx = stub_ctx();
         ctx.user_id = Some("u1".into());
 
@@ -868,15 +879,21 @@ mod tests {
 
         let mut env = FlowEnvelope::empty();
         env.meta.insert("agent_id".into(), json!("agent-3"));
-        env.context.messages.push(assistant_with_calls(vec![LlmToolCall {
-            id: "c".into(),
-            name: "core.skill_view".into(),
-            arguments: r#"{"name":"big"}"#.into(),
-        }]));
+        env.context
+            .messages
+            .push(assistant_with_calls(vec![LlmToolCall {
+                id: "c".into(),
+                name: "core.skill_view".into(),
+                arguments: r#"{"name":"big"}"#.into(),
+            }]));
         let ctx = stub_ctx();
 
         let out = ToolExecNodeAdapter::new(slot)
-            .execute(&node(json!({"max_result_chars": 2000})), &[input(env)], &ctx)
+            .execute(
+                &node(json!({"max_result_chars": 2000})),
+                &[input(env)],
+                &ctx,
+            )
             .await
             .expect("execute");
 
@@ -919,7 +936,10 @@ mod tests {
             );
         }
         // Content already within budget is returned verbatim.
-        assert_eq!(ToolExecNodeAdapter::truncate_middle_out("hi".into(), 3), "hi");
+        assert_eq!(
+            ToolExecNodeAdapter::truncate_middle_out("hi".into(), 3),
+            "hi"
+        );
     }
 
     #[tokio::test]
@@ -932,22 +952,29 @@ mod tests {
 
         let mut env = FlowEnvelope::empty();
         env.meta.insert("agent_id".into(), json!("agent-ask"));
-        env.context.messages.push(assistant_with_calls(vec![LlmToolCall {
-            id: "ask-1".into(),
-            name: "core.ask_user".into(),
-            arguments: r#"{"question":"proceed?","choices":["yes","no"]}"#.into(),
-        }]));
+        env.context
+            .messages
+            .push(assistant_with_calls(vec![LlmToolCall {
+                id: "ask-1".into(),
+                name: "core.ask_user".into(),
+                arguments: r#"{"question":"proceed?","choices":["yes","no"]}"#.into(),
+            }]));
         let ctx = stub_ctx();
 
         let adapter = ToolExecNodeAdapter::new(slot);
-        let exec = tokio::spawn(async move {
-            adapter.execute(&node(json!({})), &[input(env)], &ctx).await
-        });
+        let exec =
+            tokio::spawn(
+                async move { adapter.execute(&node(json!({})), &[input(env)], &ctx).await },
+            );
 
         // Resolve the single pending question.
         let reg = crate::agents::interaction_registry_global();
         let id = loop {
-            if let Some(p) = reg.list_for(true, &[]).iter().find(|p| p.prompt == "proceed?") {
+            if let Some(p) = reg
+                .list_for(true, &[])
+                .iter()
+                .find(|p| p.prompt == "proceed?")
+            {
                 break p.id.clone();
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -985,11 +1012,13 @@ mod tests {
 
         let mut env = FlowEnvelope::empty();
         env.meta.insert("agent_id".into(), json!("agent-noask"));
-        env.context.messages.push(assistant_with_calls(vec![LlmToolCall {
-            id: "ask-2".into(),
-            name: "core.ask_user".into(),
-            arguments: r#"{"question":"hi"}"#.into(),
-        }]));
+        env.context
+            .messages
+            .push(assistant_with_calls(vec![LlmToolCall {
+                id: "ask-2".into(),
+                name: "core.ask_user".into(),
+                arguments: r#"{"question":"hi"}"#.into(),
+            }]));
         let ctx = stub_ctx();
 
         let out = ToolExecNodeAdapter::new(slot)

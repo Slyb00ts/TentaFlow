@@ -108,8 +108,7 @@ impl NodeAdapter for CombineNodeAdapter {
                 variables: &inp.envelope.variables,
             })
             .collect();
-        out.variables =
-            merge_ordered(node, &format!("combine node '{}'", node.id), &sources)?;
+        out.variables = merge_ordered(node, &format!("combine node '{}'", node.id), &sources)?;
         Ok(out)
     }
 }
@@ -346,7 +345,10 @@ mod tests {
             .execute(&combine_node(None), &inputs, &stub_ctx())
             .await
             .unwrap();
-        assert_eq!(out.variables.get("k"), Some(&FlowValue::Text("same".into())));
+        assert_eq!(
+            out.variables.get("k"),
+            Some(&FlowValue::Text("same".into()))
+        );
     }
 
     #[tokio::test]
@@ -361,7 +363,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("conflicting values for variable 'k'"),
+            err.to_string()
+                .contains("conflicting values for variable 'k'"),
             "{err}"
         );
     }
@@ -418,7 +421,10 @@ mod tests {
             &[("k", FlowValue::Text("v".into()))],
         )];
         let node = combine_node_with_policy(serde_json::json!({"k": "merge_somehow"}));
-        let err = adapter.execute(&node, &inputs, &stub_ctx()).await.unwrap_err();
+        let err = adapter
+            .execute(&node, &inputs, &stub_ctx())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("unknown merge policy"), "{err}");
     }
 

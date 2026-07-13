@@ -52,7 +52,11 @@ const ENTITY_DENSITY_META_CAP: usize = 512;
 /// nadpisan. Fail-closed — kazda odmowa jest audytowana pod `action` i mapowana
 /// na kod ABI. Wspoldzielone przez `llm_generate` i `llm_generate_stream_start`,
 /// zeby semantyka autoryzacji nie rozjezdzala sie miedzy sciezkami.
-fn authorize_llm_call(state: &AddonState, action: &str, model_name: Option<&str>) -> Result<(), i32> {
+fn authorize_llm_call(
+    state: &AddonState,
+    action: &str,
+    model_name: Option<&str>,
+) -> Result<(), i32> {
     if !check_permission(state, "llm", None) {
         audit_log(state, action, Some("llm"), model_name, "denied", None);
         return Err(ABI_ERR_PERMISSION);
@@ -110,7 +114,14 @@ fn authorize_llm_call(state: &AddonState, action: &str, model_name: Option<&str>
     // Raw model override: gate on the per-model permission. Aliases skip
     // this — they passed the alias gate above.
     if !is_alias && !owns_model && !check_permission(state, "llm_model", Some(model)) {
-        audit_log(state, action, Some("llm_model"), Some(model), "denied", None);
+        audit_log(
+            state,
+            action,
+            Some("llm_model"),
+            Some(model),
+            "denied",
+            None,
+        );
         return Err(ABI_ERR_PERMISSION);
     }
 
@@ -137,7 +148,11 @@ fn build_flow_meta(
             );
         }
     }
-    if let Some(k) = opts.get("top_k").and_then(|v| v.as_u64()).filter(|n| *n > 0) {
+    if let Some(k) = opts
+        .get("top_k")
+        .and_then(|v| v.as_u64())
+        .filter(|n| *n > 0)
+    {
         flow_meta.insert("top_k".to_string(), serde_json::Value::from(k));
     }
     // Toggle opcjonalnego grafu: addon RAG wysyla `graph_enabled` (bool) przy ask,
@@ -158,8 +173,12 @@ fn build_flow_meta(
         let pairs: Vec<serde_json::Value> = arr
             .iter()
             .filter(|e| {
-                e.get("alias").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
-                    && e.get("canonical").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+                e.get("alias")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty())
+                    && e.get("canonical")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| !s.is_empty())
             })
             .take(ENTITY_ALIASES_META_CAP)
             .map(|e| {
@@ -170,7 +189,10 @@ fn build_flow_meta(
             })
             .collect();
         if !pairs.is_empty() {
-            flow_meta.insert("entity_aliases".to_string(), serde_json::Value::Array(pairs));
+            flow_meta.insert(
+                "entity_aliases".to_string(),
+                serde_json::Value::Array(pairs),
+            );
         }
     }
     // MemGraphRAG eq. 19 — Information Density seedow grafu (retrieval-side). Addon RAG
@@ -182,14 +204,23 @@ fn build_flow_meta(
         let entries: Vec<serde_json::Value> = arr
             .iter()
             .filter_map(|e| {
-                let id = e.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty())?;
-                let d = e.get("density").and_then(|v| v.as_f64()).filter(|x| x.is_finite())?;
+                let id = e
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())?;
+                let d = e
+                    .get("density")
+                    .and_then(|v| v.as_f64())
+                    .filter(|x| x.is_finite())?;
                 Some(serde_json::json!({ "id": id, "density": d.clamp(0.0, 1.0) }))
             })
             .take(ENTITY_DENSITY_META_CAP)
             .collect();
         if !entries.is_empty() {
-            flow_meta.insert("entity_density".to_string(), serde_json::Value::Array(entries));
+            flow_meta.insert(
+                "entity_density".to_string(),
+                serde_json::Value::Array(entries),
+            );
         }
     }
     flow_meta
@@ -365,7 +396,8 @@ pub fn llm_generate(
         };
 
         let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(router.route_embeddings_for_user(request, None))
+            tokio::runtime::Handle::current()
+                .block_on(router.route_embeddings_for_user(request, None))
         });
 
         let route_result = match result {
@@ -994,7 +1026,10 @@ pub fn llm_generate_stream_start(
                                 }
                                 if let Some(text) = &choice.delta.content {
                                     if !text.is_empty()
-                                        && tx.send(LlmStreamEvent::Chunk(text.clone())).await.is_err()
+                                        && tx
+                                            .send(LlmStreamEvent::Chunk(text.clone()))
+                                            .await
+                                            .is_err()
                                     {
                                         // Konsument porzucil strumien (cancel /
                                         // reap / unload) — drop strumienia
@@ -1189,15 +1224,16 @@ pub fn llm_generate_stream_next(
 /// ABI:
 /// - callback_id: ID strumienia z llm_generate_stream_start
 /// - Zwraca: AbiError (0 = OK, StreamNotFound gdy slot nie istnieje)
-pub fn llm_generate_stream_cancel(
-    caller: WasmCaller<'_, AddonState>,
-    callback_id: i32,
-) -> i32 {
+pub fn llm_generate_stream_cancel(caller: WasmCaller<'_, AddonState>, callback_id: i32) -> i32 {
     if callback_id <= 0 {
         return AbiError::Operation.as_i32();
     }
     let addon_id = caller.data().addon_id.clone();
-    if llm_streams().lock().remove(&(addon_id, callback_id)).is_some() {
+    if llm_streams()
+        .lock()
+        .remove(&(addon_id, callback_id))
+        .is_some()
+    {
         audit_log(
             caller.data(),
             "llm.generate_stream_cancel",
@@ -1343,7 +1379,11 @@ mod tests {
         assert!(ids.iter().all(|id| *id > 0));
         cleanup_addon_streams(&addon);
         assert_eq!(
-            llm_streams().lock().keys().filter(|(aid, _)| *aid == addon).count(),
+            llm_streams()
+                .lock()
+                .keys()
+                .filter(|(aid, _)| *aid == addon)
+                .count(),
             0,
             "cleanup_addon_streams musi usunac wszystkie sloty addonu"
         );
@@ -1378,9 +1418,15 @@ mod tests {
         flag.store(true, Ordering::Release);
         {
             let _g = InUseGuard::new(flag.clone());
-            assert!(flag.load(Ordering::Acquire), "flaga trzymana w trakcie zycia guarda");
+            assert!(
+                flag.load(Ordering::Acquire),
+                "flaga trzymana w trakcie zycia guarda"
+            );
         }
-        assert!(!flag.load(Ordering::Acquire), "drop guarda musi wyczyscic in_use");
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "drop guarda musi wyczyscic in_use"
+        );
 
         // Sciezka paniki: rozwijanie stosu przez guard i tak czysci flage.
         let flag2 = Arc::new(AtomicBool::new(false));
@@ -1427,9 +1473,15 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<LlmStreamEvent>(16);
         tx.send(LlmStreamEvent::Chunk("Hel".into())).await.unwrap();
         tx.send(LlmStreamEvent::Chunk("lo ".into())).await.unwrap();
-        tx.send(LlmStreamEvent::Chunk("world".into())).await.unwrap();
+        tx.send(LlmStreamEvent::Chunk("world".into()))
+            .await
+            .unwrap();
         let out = drain_stream_batch(&mut rx, Duration::from_millis(500)).await;
-        assert_eq!(out.chunks, vec!["Hel", "lo ", "world"], "batch = cala kolejka, nie 1 token");
+        assert_eq!(
+            out.chunks,
+            vec!["Hel", "lo ", "world"],
+            "batch = cala kolejka, nie 1 token"
+        );
         assert!(!out.finished);
         assert!(out.error.is_none());
     }
@@ -1437,7 +1489,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn drain_batch_reports_done_with_finish_reason() {
         let (tx, mut rx) = mpsc::channel::<LlmStreamEvent>(16);
-        tx.send(LlmStreamEvent::Chunk("koniec".into())).await.unwrap();
+        tx.send(LlmStreamEvent::Chunk("koniec".into()))
+            .await
+            .unwrap();
         tx.send(LlmStreamEvent::Done {
             finish_reason: Some("length".into()),
         })
@@ -1457,7 +1511,10 @@ mod tests {
         let out = drain_stream_batch(&mut rx, Duration::from_millis(50)).await;
         assert!(start.elapsed() >= Duration::from_millis(50));
         assert!(out.chunks.is_empty());
-        assert!(!out.finished, "timeout to NIE koniec strumienia — addon polluje dalej");
+        assert!(
+            !out.finished,
+            "timeout to NIE koniec strumienia — addon polluje dalej"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1479,6 +1536,9 @@ mod tests {
         let out = drain_stream_batch(&mut rx, Duration::from_millis(500)).await;
         assert!(out.finished);
         assert_eq!(out.finish_reason.as_deref(), Some("error"));
-        assert!(out.error.is_some(), "abort pompy bez Done/Error musi byc widoczny dla addonu");
+        assert!(
+            out.error.is_some(),
+            "abort pompy bez Done/Error musi byc widoczny dla addonu"
+        );
     }
 }

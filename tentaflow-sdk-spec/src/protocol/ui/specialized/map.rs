@@ -2,6 +2,7 @@
 // File: protocol/ui/specialized/map.rs — MapView (catalog §8 0x0606)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::StatePath;
 use super::super::component::{Component, FieldMap};
 use super::super::inline::DimensionToken;
@@ -10,11 +11,19 @@ use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 /// Geographic map (catalog §8 0x0606).
@@ -40,11 +49,17 @@ impl MapView {
         e.push((0, encode_to_value(&self.center_path)?));
         e.push((1, encode_to_value(&self.zoom_path)?));
         e.push((2, encode_to_value(&self.tile_provider)?));
-        if let Some(v) = &self.tile_server_url { e.push((3, encode_to_value(v)?)); }
+        if let Some(v) = &self.tile_server_url {
+            e.push((3, encode_to_value(v)?));
+        }
         e.push((4, encode_to_value(&self.height)?));
         e.push((5, encode_to_value(&self.markers_path)?));
-        if let Some(v) = &self.polygons_path { e.push((6, encode_to_value(v)?)); }
-        if let Some(v) = &self.heatmap_path { e.push((7, encode_to_value(v)?)); }
+        if let Some(v) = &self.polygons_path {
+            e.push((6, encode_to_value(v)?));
+        }
+        if let Some(v) = &self.heatmap_path {
+            e.push((7, encode_to_value(v)?));
+        }
         e.push((8, encode_to_value(&self.interactive)?));
         e.push((9, encode_to_value(&self.show_attribution)?));
         Ok(component(Self::TAG, id, e))
@@ -53,11 +68,16 @@ impl MapView {
     pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
         ensure_tag(c.tag, Self::TAG, "MapView")?;
         ensure_no_duplicate_keys("MapView", &c.fields.0)?;
-        let mut center_path = None; let mut zoom_path = None;
-        let mut tile_provider = None; let mut tile_server_url = None;
-        let mut height = None; let mut markers_path = None;
-        let mut polygons_path = None; let mut heatmap_path = None;
-        let mut interactive = None; let mut show_attribution = None;
+        let mut center_path = None;
+        let mut zoom_path = None;
+        let mut tile_provider = None;
+        let mut tile_server_url = None;
+        let mut height = None;
+        let mut markers_path = None;
+        let mut polygons_path = None;
+        let mut heatmap_path = None;
+        let mut interactive = None;
+        let mut show_attribution = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => center_path = Some(decode_from_value(v)?),
@@ -76,13 +96,16 @@ impl MapView {
         Ok(MapView {
             center_path: center_path.ok_or_else(|| missing_field("MapView", "center_path"))?,
             zoom_path: zoom_path.ok_or_else(|| missing_field("MapView", "zoom_path"))?,
-            tile_provider: tile_provider.ok_or_else(|| missing_field("MapView", "tile_provider"))?,
+            tile_provider: tile_provider
+                .ok_or_else(|| missing_field("MapView", "tile_provider"))?,
             tile_server_url,
             height: height.ok_or_else(|| missing_field("MapView", "height"))?,
             markers_path: markers_path.ok_or_else(|| missing_field("MapView", "markers_path"))?,
-            polygons_path, heatmap_path,
+            polygons_path,
+            heatmap_path,
             interactive: interactive.ok_or_else(|| missing_field("MapView", "interactive"))?,
-            show_attribution: show_attribution.ok_or_else(|| missing_field("MapView", "show_attribution"))?,
+            show_attribution: show_attribution
+                .ok_or_else(|| missing_field("MapView", "show_attribution"))?,
         })
     }
 }

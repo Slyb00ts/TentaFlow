@@ -78,7 +78,9 @@ pub fn clear_artifact_progress(key: &str) {
 
 /// Katalog, do którego węzeł docelowy rozpakowuje odebrane artefakty.
 fn artifact_dest_root() -> PathBuf {
-    crate::paths::cache_dir().join("ml-studio").join("mesh-artifacts")
+    crate::paths::cache_dir()
+        .join("ml-studio")
+        .join("mesh-artifacts")
 }
 
 /// Katalog temp-plików transferu (zip po stronie nadawcy i odbiorcy). Osobny od

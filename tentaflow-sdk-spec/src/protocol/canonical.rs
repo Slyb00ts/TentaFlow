@@ -94,7 +94,11 @@ impl std::error::Error for CanonicalError {}
 /// docs. `Ok(())` means the payload is canonical; any defect yields
 /// `Err(CanonicalError)`.
 pub fn validate_canonical(bytes: &[u8]) -> Result<(), CanonicalError> {
-    let mut cursor = Cursor { bytes, pos: 0, depth: 0 };
+    let mut cursor = Cursor {
+        bytes,
+        pos: 0,
+        depth: 0,
+    };
     cursor.read_item()?;
     if cursor.pos != bytes.len() {
         return Err(CanonicalError {
@@ -117,14 +121,11 @@ struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     fn peek_at(&self, offset: usize) -> Result<u8, CanonicalError> {
-        self.bytes
-            .get(offset)
-            .copied()
-            .ok_or(CanonicalError {
-                kind: CanonicalErrorKind::TruncatedInput,
-                byte_offset: offset,
-                message: "input ended unexpectedly",
-            })
+        self.bytes.get(offset).copied().ok_or(CanonicalError {
+            kind: CanonicalErrorKind::TruncatedInput,
+            byte_offset: offset,
+            message: "input ended unexpectedly",
+        })
     }
 
     fn read_u8(&mut self) -> Result<u8, CanonicalError> {
@@ -224,7 +225,8 @@ impl<'a> Cursor<'a> {
                                 return Err(CanonicalError {
                                     kind: CanonicalErrorKind::NonCanonicalKeyOrder,
                                     byte_offset: key_start,
-                                    message: "map keys must be in strictly increasing bytewise order",
+                                    message:
+                                        "map keys must be in strictly increasing bytewise order",
                                 })
                             }
                         }
@@ -301,7 +303,8 @@ impl<'a> Cursor<'a> {
                         return Err(CanonicalError {
                             kind: CanonicalErrorKind::InvalidMajorType,
                             byte_offset: start,
-                            message: "unsupported simple value (catalog uses only false/true/null + f64)",
+                            message:
+                                "unsupported simple value (catalog uses only false/true/null + f64)",
                         });
                     }
                 }
@@ -432,8 +435,7 @@ mod tests {
     #[test]
     fn rejects_noncanonical_4byte_unsigned() {
         // 0x1A 0x00 0x00 0x01 0x00 — value 256 should fit in 2-byte form.
-        let err =
-            validate_canonical(&[0x1A, 0x00, 0x00, 0x01, 0x00]).unwrap_err();
+        let err = validate_canonical(&[0x1A, 0x00, 0x00, 0x01, 0x00]).unwrap_err();
         assert_eq!(err.kind, CanonicalErrorKind::NonCanonicalIntegerWidth);
     }
 
@@ -542,22 +544,14 @@ mod tests {
     #[test]
     fn accepts_canonical_map_with_tstr_keys() {
         // {"a": 1, "b": 2}
-        let bytes = vec![
-            0xA2,
-            0x61, b'a', 0x01,
-            0x61, b'b', 0x02,
-        ];
+        let bytes = vec![0xA2, 0x61, b'a', 0x01, 0x61, b'b', 0x02];
         assert!(validate_canonical(&bytes).is_ok());
     }
 
     #[test]
     fn rejects_non_canonical_tstr_key_order() {
         // {"b": 1, "a": 2} — descending order.
-        let bytes = vec![
-            0xA2,
-            0x61, b'b', 0x01,
-            0x61, b'a', 0x02,
-        ];
+        let bytes = vec![0xA2, 0x61, b'b', 0x01, 0x61, b'a', 0x02];
         let err = validate_canonical(&bytes).unwrap_err();
         assert_eq!(err.kind, CanonicalErrorKind::NonCanonicalKeyOrder);
     }
@@ -594,8 +588,7 @@ mod tests {
     #[test]
     fn rejects_noncanonical_tstr_length() {
         // 0x78 0x05 + 5 bytes = tstr of length 5 with non-canonical width.
-        let err =
-            validate_canonical(&[0x78, 0x05, b'h', b'e', b'l', b'l', b'o']).unwrap_err();
+        let err = validate_canonical(&[0x78, 0x05, b'h', b'e', b'l', b'l', b'o']).unwrap_err();
         assert_eq!(err.kind, CanonicalErrorKind::NonCanonicalIntegerWidth);
     }
 
@@ -619,8 +612,7 @@ mod tests {
             0xA1, // map(1)
             0x61, b'k', // "k"
             0x83, // array(3)
-            0x01, 0x02,
-            0x61, b'v',
+            0x01, 0x02, 0x61, b'v',
         ];
         assert!(validate_canonical(&bytes).is_ok());
     }
@@ -655,7 +647,10 @@ mod tests {
         // We use bytewise.
         let key_100: &[u8] = &[0x18, 0x64];
         let key_neg1: &[u8] = &[0x20];
-        assert_eq!(canonical_key_cmp(key_100, key_neg1), core::cmp::Ordering::Less);
+        assert_eq!(
+            canonical_key_cmp(key_100, key_neg1),
+            core::cmp::Ordering::Less
+        );
     }
 
     #[test]

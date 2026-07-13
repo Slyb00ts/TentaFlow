@@ -82,7 +82,10 @@ impl EmbedChunksNodeAdapter {
         }
         let mut out = Vec::with_capacity(items.len());
         for (i, item) in items.iter().enumerate() {
-            let index = item.get("index").and_then(|v| v.as_u64()).unwrap_or(i as u64);
+            let index = item
+                .get("index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(i as u64);
             let text = item
                 .get("text")
                 .and_then(|v| v.as_str())
@@ -289,14 +292,21 @@ mod tests {
         assert_eq!(emb0[0].as_f64(), Some(0.0));
         // Drugi chunk dostaje swój wektor (i!=0) — dowód że nie nadpisujemy.
         assert_eq!(chunks[1]["embedding"][0].as_f64(), Some(1.0));
-        assert_eq!(out.meta.get("embedded_chunks").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(
+            out.meta.get("embedded_chunks").and_then(|v| v.as_u64()),
+            Some(2)
+        );
     }
 
     #[tokio::test]
     async fn rejects_non_json_payload() {
         let ctx = stub_ctx();
         let err = EmbedChunksNodeAdapter::new()
-            .execute(&node(json!({})), &[input(FlowValue::Text("nope".into()))], &ctx)
+            .execute(
+                &node(json!({})),
+                &[input(FlowValue::Text("nope".into()))],
+                &ctx,
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("musi być Json"), "{err}");

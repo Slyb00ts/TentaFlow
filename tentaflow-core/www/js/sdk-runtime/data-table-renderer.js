@@ -24,7 +24,7 @@ const TEXT_ALIGNS = new Set(['start', 'center', 'end', 'justify']);
 const COLUMN_RENDERS = new Set([
   'text', 'number', 'currency', 'percent', 'bytes',
   'date', 'time', 'datetime', 'relative',
-  'badge', 'chip', 'tag', 'avatar', 'avatar_group', 'icon',
+  'badge', 'chip', 'tag', 'avatar', 'avatar_group', 'image', 'icon',
   'stat', 'trend', 'progress', 'rating', 'actions', 'link', 'custom',
 ]);
 const COLUMN_WIDTH_KINDS = new Set(['auto', 'min_content', 'max_content', 'px', 'fr']);
@@ -482,6 +482,8 @@ function renderTable(component, ctx) {
       tfCol.setAttribute('align', 'num');
     } else if (col.render === 'chip' || col.render === 'badge' || col.render === 'tag') {
       tfCol.setAttribute('renderer', 'chip');
+    } else if (col.render === 'image') {
+      tfCol.setAttribute('renderer', 'img');
     } else {
       tfCol.setAttribute('renderer', 'text');
     }

@@ -169,13 +169,22 @@ impl AliasResolver {
 
         let mut candidates = Vec::new();
         let mut dropped_no_live = false;
-        self.expand_into(req, snapshot, entry, ctx, &mut candidates, &mut dropped_no_live)?;
+        self.expand_into(
+            req,
+            snapshot,
+            entry,
+            ctx,
+            &mut candidates,
+            &mut dropped_no_live,
+        )?;
 
         if candidates.is_empty() {
             // Capabilities pasowały, ale każda instancja odpadła przez brak
             // żywego handle'a — komunikat o surface/modality byłby mylący.
             if dropped_no_live {
-                return Err(ResolveError::NoLiveInstance(req.requested_model.to_string()));
+                return Err(ResolveError::NoLiveInstance(
+                    req.requested_model.to_string(),
+                ));
             }
             return Err(ResolveError::CapabilityUnsupported {
                 requested: req.requested_model.to_string(),
@@ -289,7 +298,8 @@ impl AliasResolver {
     ) -> Result<(), ResolveError> {
         match lookup_entry(snapshot, primary_target) {
             Some(primary) => {
-                if let Err(e) = self.expand_into(req, snapshot, primary, ctx, out, dropped_no_live) {
+                if let Err(e) = self.expand_into(req, snapshot, primary, ctx, out, dropped_no_live)
+                {
                     tracing::trace!(
                         alias = alias_id,
                         primary = primary_target,
@@ -350,9 +360,8 @@ impl AliasResolver {
             // must NEVER collapse to a Local match — `"" == ""` would route a
             // remote-owned model to a local supervisor port (127.0.0.1:5000)
             // that means nothing to us. Fail safe to MeshForward instead.
-            let is_local = !local_id.is_empty()
-                && !inst.node_id.is_empty()
-                && inst.node_id == local_id;
+            let is_local =
+                !local_id.is_empty() && !inst.node_id.is_empty() && inst.node_id == local_id;
             if is_local {
                 if let Some(handle) = self.handles.get(&inst.node_id, inst.service_id) {
                     out.push(ResolvedExecutionTarget::Local {
@@ -542,7 +551,13 @@ mod tests {
     /// brak `endpoint_url`.
     #[test]
     fn alias_falls_back_to_embedded_local_target() {
-        let primary = service_entry("big-model", "peer-a", vec![ServiceSurface::Chat], vec![], vec![]);
+        let primary = service_entry(
+            "big-model",
+            "peer-a",
+            vec![ServiceSurface::Chat],
+            vec![],
+            vec![],
+        );
         let fallback =
             service_entry_with_service_id("small-model", "local", 9, vec![ServiceSurface::Chat]);
         let alias_entry = alias(
@@ -572,7 +587,10 @@ mod tests {
                 model_name, handle, ..
             } => {
                 assert_eq!(model_name, "small-model");
-                assert_eq!(handle.endpoint_signature(), "embedded:test-engine:small-model");
+                assert_eq!(
+                    handle.endpoint_signature(),
+                    "embedded:test-engine:small-model"
+                );
             }
             other => panic!("expected embedded Local fallback, got {:?}", other),
         }
@@ -919,7 +937,13 @@ mod tests {
             ),
             // Fallback lives on a peer → emitted as a MeshForward candidate
             // (always live, no local handle needed).
-            service_entry("live-fallback", "peer-x", vec![ServiceSurface::Chat], vec![], vec![]),
+            service_entry(
+                "live-fallback",
+                "peer-x",
+                vec![ServiceSurface::Chat],
+                vec![],
+                vec![],
+            ),
         ];
         let snap = snapshot(entries);
         let resolver = resolver_for("local");

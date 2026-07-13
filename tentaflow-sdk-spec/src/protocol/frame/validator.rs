@@ -247,9 +247,7 @@ fn validate_anonymous_kind_restriction(envelope: &Envelope) -> Result<(), FrameE
         return Ok(());
     }
     // Anonymous is permitted ONLY on (channel=Control, kind=Hello) per §11.3.
-    if envelope.channel != channels::CONTROL
-        || envelope.kind != channels::KIND_CONTROL_HELLO
-    {
+    if envelope.channel != channels::CONTROL || envelope.kind != channels::KIND_CONTROL_HELLO {
         return Err(FrameError::new(
             FrameErrorCode::PermissionDenied,
             format!(
@@ -436,10 +434,7 @@ fn validate_auth_invariants(envelope: &Envelope) -> Result<(), FrameError> {
                 )
                 .with_path("envelope.auth.session_id"));
             }
-            if auth.subject_id.is_some()
-                || auth.signature.is_some()
-                || auth.epoch.is_some()
-            {
+            if auth.subject_id.is_some() || auth.signature.is_some() || auth.epoch.is_some() {
                 return Err(FrameError::new(
                     FrameErrorCode::BodyValidationFailed,
                     "validate_auth_invariants: ApiKey auth MUST NOT carry subject_id, signature, or epoch",

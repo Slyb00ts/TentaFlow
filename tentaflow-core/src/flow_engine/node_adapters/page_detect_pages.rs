@@ -75,11 +75,10 @@ impl NodeAdapter for PageDetectPagesNodeAdapter {
 
         let mut out_pages: Vec<serde_json::Value> = Vec::with_capacity(pages.len());
         for page in pages {
-            let image = ctx
-                .blobs
-                .get(&page.blob_ref)
-                .await
-                .map_err(|e| anyhow!("page_detect_pages: pobranie strony {}: {e}", page.index))?;
+            let image =
+                ctx.blobs.get(&page.blob_ref).await.map_err(|e| {
+                    anyhow!("page_detect_pages: pobranie strony {}: {e}", page.index)
+                })?;
             if image.is_empty() {
                 return Err(anyhow!(
                     "page_detect_pages: pusty obraz strony {}",
@@ -90,7 +89,12 @@ impl NodeAdapter for PageDetectPagesNodeAdapter {
                 .documents
                 .infer(&model, &image, &page.blob_ref.mime, TASK)
                 .await
-                .map_err(|e| anyhow!("page_detect_pages: detektor zawiódł (strona {}): {e}", page.index))?;
+                .map_err(|e| {
+                    anyhow!(
+                        "page_detect_pages: detektor zawiódł (strona {}): {e}",
+                        page.index
+                    )
+                })?;
             let blocks: Vec<serde_json::Value> =
                 result.regions.iter().map(Self::region_to_block).collect();
             out_pages.push(serde_json::json!({
@@ -165,7 +169,10 @@ mod tests {
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0]["index"].as_u64(), Some(0));
         assert!(pages[0]["blocks"].as_array().is_some());
-        assert_eq!(out.meta.get("detected_pages").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(
+            out.meta.get("detected_pages").and_then(|v| v.as_u64()),
+            Some(2)
+        );
     }
 
     #[tokio::test]

@@ -98,8 +98,11 @@ impl Csr {
     /// nadal liczy się do `edge_count` snapshotu).
     pub fn from_edges(ids: Vec<String>, triples: &[(String, String, f64)]) -> Csr {
         let n = ids.len();
-        let index: HashMap<&str, usize> =
-            ids.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+        let index: HashMap<&str, usize> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), i))
+            .collect();
 
         let mut degree = vec![0usize; n];
         let mut edges: Vec<(usize, usize, f64)> = Vec::with_capacity(triples.len());

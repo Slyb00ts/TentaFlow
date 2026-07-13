@@ -307,7 +307,13 @@ mod tests {
     #[test]
     fn twin_gets_second_subnet_same_host_octet() {
         let roce = vec![
-            iface("enP2p1s0f0np0", "roceP2p1s0f0", Some("10.10.10.24"), 1500, "switch:abc"),
+            iface(
+                "enP2p1s0f0np0",
+                "roceP2p1s0f0",
+                Some("10.10.10.24"),
+                1500,
+                "switch:abc",
+            ),
             iface("enp1s0f0np0", "rocep1s0f0", None, 1500, "switch:abc"),
         ];
         let res = plan_cluster(&[member("n24", "10.10.10.24", roce)], 9000, &[]);
@@ -324,8 +330,20 @@ mod tests {
     #[test]
     fn idempotent_when_twin_already_configured() {
         let roce = vec![
-            iface("enP2p1s0f0np0", "roceP2p1s0f0", Some("10.10.10.25"), 9000, "switch:z"),
-            iface("enp1s0f0np0", "rocep1s0f0", Some("10.10.11.25"), 9000, "switch:z"),
+            iface(
+                "enP2p1s0f0np0",
+                "roceP2p1s0f0",
+                Some("10.10.10.25"),
+                9000,
+                "switch:z",
+            ),
+            iface(
+                "enp1s0f0np0",
+                "rocep1s0f0",
+                Some("10.10.11.25"),
+                9000,
+                "switch:z",
+            ),
         ];
         let res = plan_cluster(&[member("n25", "10.10.10.25", roce)], 9000, &[]);
         let plan = ok_plan(res, "n25");
@@ -338,9 +356,18 @@ mod tests {
     #[test]
     fn matches_primary_on_secondary_address() {
         // Interconnect IP is a SECONDARY address on the netdev (P2-2).
-        let mut prim = iface("enP2p1s0f0np0", "roceP2p1s0f0", Some("10.0.0.1"), 1500, "switch:s");
+        let mut prim = iface(
+            "enP2p1s0f0np0",
+            "roceP2p1s0f0",
+            Some("10.0.0.1"),
+            1500,
+            "switch:s",
+        );
         prim.ipv4_aliases = vec!["10.10.10.24".to_string()];
-        let roce = vec![prim, iface("enp1s0f0np0", "rocep1s0f0", None, 1500, "switch:s")];
+        let roce = vec![
+            prim,
+            iface("enp1s0f0np0", "rocep1s0f0", None, 1500, "switch:s"),
+        ];
         let res = plan_cluster(&[member("n", "10.10.10.24", roce)], 9000, &[]);
         let plan = ok_plan(res, "n");
         assert_eq!(plan.socket_ifname, "enP2p1s0f0np0");
@@ -351,8 +378,20 @@ mod tests {
     fn does_not_clobber_unrelated_active_rdma_iface() {
         // Second RoCE iface in the SAME group already carries a different address.
         let roce = vec![
-            iface("enP2p1s0f0np0", "roceP2p1s0f0", Some("10.10.10.24"), 1500, "switch:s"),
-            iface("enp1s0f0np0", "rocep1s0f0", Some("192.168.50.7"), 1500, "switch:s"),
+            iface(
+                "enP2p1s0f0np0",
+                "roceP2p1s0f0",
+                Some("10.10.10.24"),
+                1500,
+                "switch:s",
+            ),
+            iface(
+                "enp1s0f0np0",
+                "rocep1s0f0",
+                Some("192.168.50.7"),
+                1500,
+                "switch:s",
+            ),
         ];
         let res = plan_cluster(&[member("n", "10.10.10.24", roce)], 9000, &[]);
         let err = res.into_iter().next().unwrap().1.unwrap_err();
@@ -364,7 +403,13 @@ mod tests {
         // A spare unconfigured RoCE port in a DIFFERENT physical group must not be
         // treated as the twin (P1-1). Here the only same-group twin is missing.
         let roce = vec![
-            iface("enP2p1s0f0np0", "roceP2p1s0f0", Some("10.10.10.24"), 1500, "switch:A"),
+            iface(
+                "enP2p1s0f0np0",
+                "roceP2p1s0f0",
+                Some("10.10.10.24"),
+                1500,
+                "switch:A",
+            ),
             iface("enp9s0f0np0", "rocep9s0f0", None, 1500, "switch:B"),
         ];
         let res = plan_cluster(&[member("n", "10.10.10.24", roce)], 9000, &[]);
@@ -375,7 +420,13 @@ mod tests {
     #[test]
     fn rejects_third_octet_wraparound() {
         let roce = vec![
-            iface("enP2p1s0f0np0", "roceP2p1s0f0", Some("10.10.255.24"), 1500, "switch:s"),
+            iface(
+                "enP2p1s0f0np0",
+                "roceP2p1s0f0",
+                Some("10.10.255.24"),
+                1500,
+                "switch:s",
+            ),
             iface("enp1s0f0np0", "rocep1s0f0", None, 1500, "switch:s"),
         ];
         let res = plan_cluster(&[member("n", "10.10.255.24", roce)], 9000, &[]);
@@ -386,7 +437,13 @@ mod tests {
     #[test]
     fn rejects_host_octet_zero_or_broadcast() {
         let roce = vec![
-            iface("enP2p1s0f0np0", "roceP2p1s0f0", Some("10.10.10.255"), 1500, "switch:s"),
+            iface(
+                "enP2p1s0f0np0",
+                "roceP2p1s0f0",
+                Some("10.10.10.255"),
+                1500,
+                "switch:s",
+            ),
             iface("enp1s0f0np0", "rocep1s0f0", None, 1500, "switch:s"),
         ];
         let res = plan_cluster(&[member("n", "10.10.10.255", roce)], 9000, &[]);
@@ -401,7 +458,13 @@ mod tests {
             "A",
             "10.10.10.24",
             vec![
-                iface("enP2p1s0f0np0", "roceA0", Some("10.10.10.24"), 1500, "switch:a"),
+                iface(
+                    "enP2p1s0f0np0",
+                    "roceA0",
+                    Some("10.10.10.24"),
+                    1500,
+                    "switch:a",
+                ),
                 iface("enp1s0f0np0", "roceA1", None, 1500, "switch:a"),
             ],
         );
@@ -409,7 +472,13 @@ mod tests {
             "B",
             "10.10.11.24",
             vec![
-                iface("enP2p1s0f0np0", "roceB0", Some("10.10.11.24"), 1500, "switch:b"),
+                iface(
+                    "enP2p1s0f0np0",
+                    "roceB0",
+                    Some("10.10.11.24"),
+                    1500,
+                    "switch:b",
+                ),
                 iface("enp1s0f0np0", "roceB1", None, 1500, "switch:b"),
             ],
         );
@@ -424,7 +493,13 @@ mod tests {
             "n24",
             "10.10.10.24",
             vec![
-                iface("enP2p1s0f0np0", "roceP2p1s0f0", Some("10.10.10.24"), 1500, "switch:a"),
+                iface(
+                    "enP2p1s0f0np0",
+                    "roceP2p1s0f0",
+                    Some("10.10.10.24"),
+                    1500,
+                    "switch:a",
+                ),
                 iface("enp1s0f0np0", "rocep1s0f0", None, 1500, "switch:a"),
             ],
         );
@@ -432,12 +507,21 @@ mod tests {
             "n25",
             "10.10.10.25",
             vec![
-                iface("enP2p1s0f0np0", "roceP2p1s0f0", Some("10.10.10.25"), 1500, "switch:b"),
+                iface(
+                    "enP2p1s0f0np0",
+                    "roceP2p1s0f0",
+                    Some("10.10.10.25"),
+                    1500,
+                    "switch:b",
+                ),
                 iface("enp1s0f0np0", "rocep1s0f0", None, 1500, "switch:b"),
             ],
         );
         let res = plan_cluster(&[n24, n25], 9000, &[]);
-        assert_eq!(ok_plan(res.clone(), "n24").interfaces[1].ipv4, "10.10.11.24");
+        assert_eq!(
+            ok_plan(res.clone(), "n24").interfaces[1].ipv4,
+            "10.10.11.24"
+        );
         assert_eq!(ok_plan(res, "n25").interfaces[1].ipv4, "10.10.11.25");
     }
 

@@ -258,9 +258,10 @@ impl Stream for ComplianceAuditStream {
                         // Usage-tail wymuszony wewnętrznie dla token accountingu:
                         // gdy klient nie prosił o include_usage, nie przepuszczamy
                         // tego tail-chunku (nie niesie treści) dalej.
-                        let content_free = chunk.choices.iter().all(|c| {
-                            c.delta.content.is_none() && c.delta.tool_calls.is_none()
-                        });
+                        let content_free = chunk
+                            .choices
+                            .iter()
+                            .all(|c| c.delta.content.is_none() && c.delta.tool_calls.is_none());
                         if !self.emit_usage_to_client && content_free {
                             continue;
                         }
@@ -755,20 +756,20 @@ impl Router {
             let need_usage = include_usage || compliance_event.is_some();
             let mut direct_req = request.clone();
             if need_usage {
-                direct_req.stream_options =
-                    Some(crate::api::openai::types::StreamOptions { include_usage: true });
+                direct_req.stream_options = Some(crate::api::openai::types::StreamOptions {
+                    include_usage: true,
+                });
             }
             let mut exec_ctx =
                 crate::services::runtime::context::ExecutionContext::new(user.clone());
             match executor.stream_chat(direct_req, &mut exec_ctx).await {
                 Ok(stream) => {
-                    let filtered: Pin<
-                        Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>,
-                    > = if let Some(event) = compliance_event {
-                        Box::pin(ComplianceAuditStream::new(stream, event, include_usage))
-                    } else {
-                        stream
-                    };
+                    let filtered: Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>> =
+                        if let Some(event) = compliance_event {
+                            Box::pin(ComplianceAuditStream::new(stream, event, include_usage))
+                        } else {
+                            stream
+                        };
                     let metadata = crate::routing::RouteMetadata {
                         served_by_node: exec_ctx
                             .route_metadata
@@ -827,11 +828,7 @@ impl Router {
                 }
                 ChatFlowSelector::FlowId(flow_id) => {
                     dispatcher
-                        .dispatch_by_flow_id_streaming(
-                            flow_id.clone(),
-                            initial_stream,
-                            meta_stream,
-                        )
+                        .dispatch_by_flow_id_streaming(flow_id.clone(), initial_stream, meta_stream)
                         .await
                 }
             };
@@ -848,11 +845,8 @@ impl Router {
                     // jest aktywne, wymuszamy wewnętrzny usage-tail; ComplianceAuditStream
                     // go zbierze i — jeśli klient nie prosił — nie przepuszcza dalej.
                     let need_usage = include_usage || compliance_event.is_some();
-                    let chunk_stream = envelope_stream_to_chunk_stream(
-                        stream_exec,
-                        model_for_stream,
-                        need_usage,
-                    );
+                    let chunk_stream =
+                        envelope_stream_to_chunk_stream(stream_exec, model_for_stream, need_usage);
                     // PII cleaning istnieje wyłącznie jako opcjonalny
                     // `pii_filter` node w jawnym user-defined flow (PII jest
                     // opt-in); direct execution i wire layer nie filtrują.

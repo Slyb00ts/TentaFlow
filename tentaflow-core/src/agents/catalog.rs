@@ -212,7 +212,10 @@ mod tests {
 
     #[test]
     fn resolve_exact_entry_excludes_sibling_tool() {
-        let tools = vec![tool("memory", "memory_store"), tool("memory", "memory_recall")];
+        let tools = vec![
+            tool("memory", "memory_store"),
+            tool("memory", "memory_recall"),
+        ];
         let principal = AgentPrincipal::user("u1");
         let json = r#"["memory.memory_store"]"#;
         let specs = ToolCatalog::resolve(json, &principal, &tools, false, |_| true);

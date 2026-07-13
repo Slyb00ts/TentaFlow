@@ -55,7 +55,11 @@ fn disk_etag(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(bytes);
-    h.finalize().iter().take(8).map(|b| format!("{:02x}", b)).collect()
+    h.finalize()
+        .iter()
+        .take(8)
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 /// Zwraca (status, content_type, body_bytes, etag) dla podanej sciezki HTTP.

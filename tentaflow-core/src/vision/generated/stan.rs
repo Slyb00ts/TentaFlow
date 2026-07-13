@@ -1,15 +1,14 @@
 // Generated from ONNX ".runtime/cache/ml-training-artifacts/classifier/stan-deploy/model.onnx" by burn-onnx
-use burn::prelude::*;
+use burn::nn::conv::Conv2d;
+use burn::nn::conv::Conv2dConfig;
 use burn::nn::Linear;
 use burn::nn::LinearConfig;
 use burn::nn::LinearLayout;
 use burn::nn::PaddingConfig2d;
-use burn::nn::conv::Conv2d;
-use burn::nn::conv::Conv2dConfig;
+use burn::prelude::*;
 use burn::tensor::Bytes;
 use burn_store::BurnpackStore;
 use burn_store::ModuleSnapshot;
-
 
 #[derive(Module, Debug)]
 pub struct Model<B: Backend> {
@@ -65,7 +64,6 @@ pub struct Model<B: Backend> {
     device: B::Device,
 }
 
-
 extern crate std;
 
 impl<B: Backend> Default for Model<B> {
@@ -79,7 +77,9 @@ impl<B: Backend> Model<B> {
     pub fn from_file<P: AsRef<std::path::Path>>(file: P, device: &B::Device) -> Self {
         let mut model = Self::new(device);
         let mut store = BurnpackStore::from_file(file);
-        model.load_from(&mut store).expect("Failed to load burnpack file");
+        model
+            .load_from(&mut store)
+            .expect("Failed to load burnpack file");
         model
     }
 
@@ -89,7 +89,9 @@ impl<B: Backend> Model<B> {
     pub fn from_bytes(bytes: Bytes, device: &B::Device) -> Self {
         let mut model = Self::new(device);
         let mut store = BurnpackStore::from_bytes(Some(bytes));
-        model.load_from(&mut store).expect("Failed to load burnpack bytes");
+        model
+            .load_from(&mut store)
+            .expect("Failed to load burnpack bytes");
         model
     }
 }

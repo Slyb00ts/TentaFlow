@@ -21,8 +21,7 @@ use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     MessageBody, ProtocolError, RobotActionMeta, RobotActionParam, RobotBatterySnapshot,
     RobotCameraShareResponse, RobotControlResponse, RobotEntry, RobotGeoAnchorResponse,
-    RobotImuSnapshot, RobotLidarStatus, RobotTelemetrySnapshot, RobotsListResponse,
-    RobotsPayload,
+    RobotImuSnapshot, RobotLidarStatus, RobotTelemetrySnapshot, RobotsListResponse, RobotsPayload,
 };
 use tentaflow_sdk_spec::POSE_STATE_GLOBAL;
 use tentaflow_slam::GeoAnchor;
@@ -107,9 +106,7 @@ fn to_lidar(l: crate::mesh::robot_dispatch::RobotLidarSnapshot) -> RobotLidarSta
 /// Project the mesh-layer `RobotTelemetrySnapshot` onto the protocol wire type
 /// (two distinct types over the same shape — the mesh struct is the registry's
 /// own, the protocol struct is the wire contract).
-fn to_telemetry(
-    t: crate::mesh::robot_dispatch::RobotTelemetrySnapshot,
-) -> RobotTelemetrySnapshot {
+fn to_telemetry(t: crate::mesh::robot_dispatch::RobotTelemetrySnapshot) -> RobotTelemetrySnapshot {
     RobotTelemetrySnapshot {
         mode: t.mode,
         gait_type: t.gait_type,
@@ -156,10 +153,7 @@ fn reject_tag(reason: &RejectReason) -> &'static str {
 #[handler(variant = "RobotsListRequest", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
-pub fn robots_list(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
+pub fn robots_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     match req {
         MessageBody::RobotsBody(RobotsPayload::ListRequest(_)) => {}
         _ => return Err(ProtocolError::bad_request("expected RobotsListRequest")),
@@ -244,7 +238,10 @@ pub async fn robots_control(
     let wire = match resp {
         Some(r) => RobotControlResponse {
             ok: r.ok,
-            rejected: r.rejected.as_ref().map(|reason| reject_tag(reason).to_string()),
+            rejected: r
+                .rejected
+                .as_ref()
+                .map(|reason| reject_tag(reason).to_string()),
             error: r.error,
             // Read-only actions (lidar_frame/status) return their JSON payload here.
             result: r.result_json,
@@ -257,7 +254,9 @@ pub async fn robots_control(
             result: None,
         },
     };
-    Ok(MessageBody::RobotsBody(RobotsPayload::ControlResponse(wire)))
+    Ok(MessageBody::RobotsBody(RobotsPayload::ControlResponse(
+        wire,
+    )))
 }
 
 #[handler(variant = "RobotCameraShareRequest", since = (1, 0))]
@@ -269,7 +268,11 @@ pub fn robots_camera_share(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::RobotsBody(RobotsPayload::CameraShareRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected RobotCameraShareRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected RobotCameraShareRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     let db = &ctx.state.db;
@@ -314,7 +317,9 @@ pub fn robots_camera_share(
         &payload.camera_id,
         &org.user_id,
     );
-    Ok(MessageBody::RobotsBody(RobotsPayload::CameraShareResponse(resp)))
+    Ok(MessageBody::RobotsBody(RobotsPayload::CameraShareResponse(
+        resp,
+    )))
 }
 
 /// Permission gating geo-anchor read/write — the SAME grant the LiDAR/scene streams
@@ -358,9 +363,11 @@ fn geo_anchor_response(robot_id: &str) -> RobotGeoAnchorResponse {
     // a clear (the manager also re-emits the pose on anchor change, so this is belt +
     // suspenders).
     let (pose_lat, pose_lon, pose_alt) = match mgr.latest_pose(robot_id) {
-        Some(p) if anchor.is_some() && p.state == POSE_STATE_GLOBAL => {
-            (Some(p.position[0]), Some(p.position[1]), Some(p.position[2]))
-        }
+        Some(p) if anchor.is_some() && p.state == POSE_STATE_GLOBAL => (
+            Some(p.position[0]),
+            Some(p.position[1]),
+            Some(p.position[2]),
+        ),
         _ => (None, None, None),
     };
     RobotGeoAnchorResponse {
@@ -438,7 +445,11 @@ pub fn robots_geo_anchor_set(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::RobotsBody(RobotsPayload::GeoAnchorSetRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected RobotGeoAnchorSetRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected RobotGeoAnchorSetRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     if !org.has(PERM_ROBOT_TELEMETRY) {
@@ -461,7 +472,9 @@ pub fn robots_geo_anchor_set(
                 return Ok(MessageBody::RobotsBody(RobotsPayload::GeoAnchorResponse(
                     RobotGeoAnchorResponse {
                         ok: false,
-                        error: Some("invalid anchor (lat/lon out of range or non-finite)".to_string()),
+                        error: Some(
+                            "invalid anchor (lat/lon out of range or non-finite)".to_string(),
+                        ),
                         anchored: mgr.geo_anchor(&payload.robot_id).is_some(),
                         lat: None,
                         lon: None,
@@ -496,7 +509,11 @@ pub fn robots_geo_anchor_get(
 ) -> Result<MessageBody, ProtocolError> {
     let payload = match req {
         MessageBody::RobotsBody(RobotsPayload::GeoAnchorGetRequest(p)) => p,
-        _ => return Err(ProtocolError::bad_request("expected RobotGeoAnchorGetRequest")),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected RobotGeoAnchorGetRequest",
+            ))
+        }
     };
     let org = require_org(ctx)?;
     if !org.has(PERM_ROBOT_TELEMETRY) {

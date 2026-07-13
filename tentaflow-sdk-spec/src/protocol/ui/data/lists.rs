@@ -2,21 +2,28 @@
 // File: protocol/ui/data/lists.rs — BulletList/Timeline (catalog §4)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::BindRef;
 use super::super::component::{Component, FieldMap};
 use super::super::inline::TimelineItem;
-use super::super::tokens::{
-    BulletListVariant, Density, TimelineOrientation, Tone,
-};
+use super::super::tokens::{BulletListVariant, Density, TimelineOrientation, Tone};
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -38,7 +45,9 @@ impl BulletList {
         let mut entries: Vec<(u8, Value)> = Vec::with_capacity(4);
         entries.push((0, encode_to_value(&self.items)?));
         entries.push((1, encode_to_value(&self.variant)?));
-        if let Some(t) = &self.tone { entries.push((2, encode_to_value(t)?)); }
+        if let Some(t) = &self.tone {
+            entries.push((2, encode_to_value(t)?));
+        }
         entries.push((3, encode_to_value(&self.density)?));
         Ok(component(Self::TAG, id, entries))
     }
@@ -121,4 +130,3 @@ impl Timeline {
         })
     }
 }
-

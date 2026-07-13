@@ -309,7 +309,11 @@ fn mtime_unix_secs(meta: &std::fs::Metadata) -> u64 {
         .unwrap_or(0)
 }
 
-async fn cached_sha256(name: &str, path: &Path, meta: &std::fs::Metadata) -> std::io::Result<String> {
+async fn cached_sha256(
+    name: &str,
+    path: &Path,
+    meta: &std::fs::Metadata,
+) -> std::io::Result<String> {
     let mtime = mtime_unix_secs(meta);
     let size = meta.len();
     if let Some((m, s, hash)) = hash_cache().lock().get(name) {
@@ -351,7 +355,9 @@ pub struct RequestContext<'a> {
 #[derive(Debug)]
 pub enum ManifestOutcome {
     /// Serialized manifest JSON, ready for a 200 response.
-    Ok { body: String },
+    Ok {
+        body: String,
+    },
     BadRequest(&'static str),
     Denied(SignedUrlError),
     /// API-key caller without an `allow` scope on this bundle.
@@ -398,7 +404,10 @@ impl ManifestOutcome {
 pub enum FileOutcome {
     /// Token verified + file opened (O_NOFOLLOW) + fstat'ed. The HTTP layer
     /// streams the already-open handle — no path re-open, no TOCTOU window.
-    Ok { file: tokio::fs::File, size: u64 },
+    Ok {
+        file: tokio::fs::File,
+        size: u64,
+    },
     BadRequest(&'static str),
     Denied(SignedUrlError),
     /// API-key caller without an `allow` scope on this bundle.
@@ -946,8 +955,13 @@ mod tests {
     fn per_file_token_derives_and_rejects_cross_file_replay() {
         let iss = issuer();
         let manifest = iss.issue(BUNDLE_REF_ALL.to_string(), 3600).expect("issue");
-        let url = mint_file_url(&iss, BUNDLE_REF_ALL, "rfdetr-base.bpk", manifest.expiry_unix_ms)
-            .expect("mint file url");
+        let url = mint_file_url(
+            &iss,
+            BUNDLE_REF_ALL,
+            "rfdetr-base.bpk",
+            manifest.expiry_unix_ms,
+        )
+        .expect("mint file url");
         assert!(url.starts_with("/models/file/vision-all/rfdetr-base.bpk?"));
         let q = query_from_url(&url);
         let expected_ref = "vision-all/rfdetr-base.bpk";

@@ -942,7 +942,8 @@ mod tests {
                 updated_at: String::new(),
                 request_time_parameters: Default::default(),
             gpu_selection: String::new(),
-            }],
+                            cluster_deployment_id: String::new(),
+}],
         );
 
         let provider = CatalogProvider::new();
@@ -1019,7 +1020,8 @@ mod tests {
                 updated_at: String::new(),
                 request_time_parameters: Default::default(),
             gpu_selection: String::new(),
-            }],
+                            cluster_deployment_id: String::new(),
+}],
         );
 
         let provider = CatalogProvider::new();
@@ -1082,7 +1084,8 @@ mod tests {
             updated_at: String::new(),
             request_time_parameters: Default::default(),
             gpu_selection: String::new(),
-        };
+                    cluster_deployment_id: String::new(),
+};
         registry.replace_local(
             local_node.clone(),
             vec![
@@ -1243,7 +1246,8 @@ mod tests {
             updated_at: String::new(),
             request_time_parameters: Default::default(),
             gpu_selection: String::new(),
-        }
+                    cluster_deployment_id: String::new(),
+}
     }
 
     /// External cloud provider (openai) z presetem o `id != repo`

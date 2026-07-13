@@ -47,10 +47,8 @@ pub fn should_compress(body_len: usize) -> bool {
 /// bytes when AEAD is NOT in use (e.g. plaintext channels under TLS).
 pub fn compress_body(plaintext: &[u8]) -> Result<Vec<u8>, FrameError> {
     let info = FrameInfo::new().content_checksum(true);
-    let mut encoder = FrameEncoder::with_frame_info(
-        info,
-        Vec::with_capacity(plaintext.len() / 2 + 64),
-    );
+    let mut encoder =
+        FrameEncoder::with_frame_info(info, Vec::with_capacity(plaintext.len() / 2 + 64));
     encoder.write_all(plaintext).map_err(|e| {
         FrameError::new(
             FrameErrorCode::DecompressionFailed,

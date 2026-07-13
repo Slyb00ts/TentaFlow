@@ -39,9 +39,9 @@ use super::credentials::credentials_cipher;
 use super::error::{CameraIngestError, Result};
 use super::fakefile::{FrameCounters, FrameMailbox};
 use super::rtsp::{
-    build_appsink, build_raw_leaky_queue, install_branch_input_base_pts_probe,
-    transcoder_key_int_max, wire_mp4_appsink, Mp4BranchState, RtspPipelineHandles,
-    detach_mp4_branch,
+    attach_detect_branch, build_appsink, build_decode_tee, build_raw_leaky_queue,
+    detach_mp4_branch, install_branch_input_base_pts_probe, transcoder_key_int_max,
+    wire_mp4_appsink, Mp4BranchState, RtspPipelineHandles,
 };
 use super::session::CameraConfig;
 use super::stream_publisher::Mp4StreamPublisher;
@@ -97,19 +97,37 @@ pub(super) fn build_mjpeg_pipeline(
     url: &str,
     creds: Option<&(String, String)>,
     timeout_secs: u32,
+    gpu_resize: bool,
     mailbox: Arc<FrameMailbox>,
     counters: Arc<FrameCounters>,
 ) -> Result<RtspPipelineHandles> {
     let pipeline = gst::Pipeline::new();
 
-    // Źródło HTTP. `is-live=true` — strumień na żywo (bez seek, timestamps od
-    // zegara). `retries=0` — retry zarządzamy na poziomie sesji (ten sam
+    // Źródło HTTP. `is-live=true` — strumień na żywo (bez seek). `do-timestamp=true`
+    // — souphttpsrc stempluje KAŻDY bufor running-time'em zegara pipeline'u JUŻ na
+    // surowym strumieniu JPEG (przed multipartdemux/jpegparse). Bez tego surowe
+    // bufory nie niosą PTS: `install_branch_input_base_pts_probe` stoi na wejściu
+    // gałęzi B (przed jpegdec) i bez PTS nigdy nie ustala `mux_base_pts_ns` →
+    // serwer wysyła `base_pts_ns=null` → overlay nie ma osi mediów i NIE rysuje
+    // boxów. (Gałąź A miała PTS tylko dlatego, że jpegdec syntetyzuje je z
+    // framerate — niespójne i skaczące względem gałęzi B.) Z `do-timestamp` obie
+    // gałęzie dzielą jedną, monotoniczną oś czasu detekcji.
+    // `retries=0` — retry zarządzamy na poziomie sesji (ten sam
     // backoff co RTSP), wewnętrzny retry souphttpsrc tylko by go maskował.
+    // `ssl-strict=false` — kamery IP (Axis, Hikvision, Dahua) serwują MJPEG
+    // po https z self-signed certem; domyślna walidacja zrywa strumień
+    // ("streaming stopped, reason error (-5)") mimo że test połączenia
+    // przechodzi. Ten sam udokumentowany trade-off co `tls-validation-flags=0`
+    // w build_rtspsrc i AcceptAnyServerCert w probe RTSPS: kamera to zasób
+    // jawnie zarejestrowany przez admina na zaufanym segmencie LAN, a TLS
+    // nadal szyfruje transport (w tym Basic/Digest creds).
     let src = gst::ElementFactory::make("souphttpsrc")
         .property("location", url)
         .property("is-live", true)
+        .property("do-timestamp", true)
         .property("timeout", timeout_secs)
         .property("retries", 0i32)
+        .property("ssl-strict", false)
         .build()
         .map_err(|e| CameraIngestError::PipelineBuild(format!("souphttpsrc: {e}")))?;
     if let Some((user, pass)) = creds {
@@ -164,7 +182,16 @@ pub(super) fn build_mjpeg_pipeline(
         .map_err(|e| CameraIngestError::PipelineBuild(format!("capsfilter: {e}")))?;
     // Wspólny appsink RTSP/MJPEG — ten sam callback ramki (LatestFrame,
     // pts_ns, FrameStorage, StreamingBus).
-    let appsink = build_appsink(camera_id, mailbox, counters)?;
+    let appsink = build_appsink(camera_id, mailbox.clone(), counters)?;
+
+    // Opcjonalny tee GPU-resize ZA jpegdec (surowe wideo w pamięci hosta): jpegdec
+    // dekoduje na CPU (brak nvjpegdec), ale skalowanie 4K→560 nadal idzie na GPU —
+    // zdejmuje ~4 ms resize'u z detektora. Gałąź crops zostaje bez zmian.
+    let decode_tee = if gpu_resize {
+        Some(build_decode_tee("tee_decode")?)
+    } else {
+        None
+    };
 
     pipeline
         .add_many([
@@ -180,6 +207,11 @@ pub(super) fn build_mjpeg_pipeline(
             &appsink,
         ])
         .map_err(|e| CameraIngestError::PipelineBuild(format!("add_many mjpeg: {e}")))?;
+    if let Some(t) = &decode_tee {
+        pipeline.add_many([t]).map_err(|e| {
+            CameraIngestError::PipelineBuild(format!("add_many tee_decode mjpeg: {e}"))
+        })?;
+    }
 
     // Segmenty statyczne: src → demux oraz jpegparse → tee → queue_a → ogon
     // gałęzi A. Segment demux → jpegparse jest dynamiczny (pad-added niżej).
@@ -196,7 +228,28 @@ pub(super) fn build_mjpeg_pipeline(
     tee_src_a
         .link(&queue_a_sink)
         .map_err(|e| CameraIngestError::PipelineBuild(format!("tee → queue_a: {e:?}")))?;
-    gst::Element::link_many([&queue_a, &jpegdec, &queue_dec, &convert, &capsfilter, &appsink])
+    // Gałąź A: queue_a → jpegdec, potem albo wprost do queue_dec (crops), albo
+    // przez tee_decode rozgałęziający na crops + detect.
+    gst::Element::link(&queue_a, &jpegdec)
+        .map_err(|e| CameraIngestError::PipelineBuild(format!("queue_a → jpegdec: {e}")))?;
+    if let Some(t) = &decode_tee {
+        gst::Element::link(&jpegdec, t)
+            .map_err(|e| CameraIngestError::PipelineBuild(format!("jpegdec → tee_decode: {e}")))?;
+        let tee_crops = t.request_pad_simple("src_%u").ok_or_else(|| {
+            CameraIngestError::PipelineBuild("tee_decode src_%u (crops) request failed".into())
+        })?;
+        let queue_dec_sink = queue_dec
+            .static_pad("sink")
+            .ok_or_else(|| CameraIngestError::PipelineBuild("queue_dec sink pad missing".into()))?;
+        tee_crops.link(&queue_dec_sink).map_err(|e| {
+            CameraIngestError::PipelineBuild(format!("tee_decode → queue_dec: {e:?}"))
+        })?;
+        attach_detect_branch(&pipeline, t, mailbox)?;
+    } else {
+        gst::Element::link(&jpegdec, &queue_dec)
+            .map_err(|e| CameraIngestError::PipelineBuild(format!("jpegdec → queue_dec: {e}")))?;
+    }
+    gst::Element::link_many([&queue_dec, &convert, &capsfilter, &appsink])
         .map_err(|e| CameraIngestError::PipelineBuild(format!("link_many tail: {e}")))?;
 
     // multipartdemux tworzy pad per część multipart — kamera MJPEG serwuje
@@ -235,7 +288,13 @@ pub(super) fn build_mjpeg_pipeline(
     });
 
     tracing::info!("mjpeg: pipeline zbudowany (souphttpsrc → multipartdemux → jpegparse → tee)");
-    Ok(RtspPipelineHandles { pipeline, tee })
+    // MJPEG decodes to RGB crops (no NV12 path), so no on-demand RGB branch.
+    Ok(RtspPipelineHandles {
+        pipeline,
+        tee,
+        decode_tee: None,
+        decode_tee_is_cuda: false,
+    })
 }
 
 /// Dowiesza gałąź B (fMP4/MSE) do działającego pipeline'u MJPEG. Przeglądarka
@@ -327,8 +386,12 @@ pub(super) fn attach_mp4_branch_mjpeg(
         .map_err(|e| format!("appsink_b build: {e}"))?;
 
     // Kolejność linkowania: convert → [videoscale → capsfilter 720p] → enc.
-    let mut elements: Vec<gst::Element> =
-        vec![queue_b.clone(), jpegdec.clone(), queue_dec.clone(), convert.clone()];
+    let mut elements: Vec<gst::Element> = vec![
+        queue_b.clone(),
+        jpegdec.clone(),
+        queue_dec.clone(),
+        convert.clone(),
+    ];
     if let Some((scale, filter)) = &scaler {
         elements.push(scale.clone());
         elements.push(filter.clone());
@@ -343,8 +406,7 @@ pub(super) fn attach_mp4_branch_mjpeg(
     let queue_b_sink = queue_b
         .static_pad("sink")
         .ok_or_else(|| "queue_b sink pad missing".to_string())?;
-    gst::Element::link_many(&element_refs)
-        .map_err(|e| format!("link branch B: {e}"))?;
+    gst::Element::link_many(&element_refs).map_err(|e| format!("link branch B: {e}"))?;
 
     wire_mp4_appsink(&sink, publisher)?;
 
@@ -406,7 +468,13 @@ mod tests {
 
     #[test]
     fn validate_mjpeg_url_rejects_other_schemes() {
-        for bad in ["", "rtsp://cam/stream", "http://", "https://", "cam.local/mjpg"] {
+        for bad in [
+            "",
+            "rtsp://cam/stream",
+            "http://",
+            "https://",
+            "cam.local/mjpg",
+        ] {
             assert!(validate_mjpeg_url(bad).is_err(), "should reject: {bad}");
         }
     }

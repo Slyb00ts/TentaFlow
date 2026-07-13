@@ -24,7 +24,10 @@ impl fmt::Display for ResizeError {
         match self {
             ResizeError::ZeroDimension => write!(f, "resize: wymiar zerowy"),
             ResizeError::BufferSizeMismatch { expected, got } => {
-                write!(f, "resize: zly rozmiar bufora (oczekiwano {expected}, jest {got})")
+                write!(
+                    f,
+                    "resize: zly rozmiar bufora (oczekiwano {expected}, jest {got})"
+                )
             }
             ResizeError::DimensionOverflow => write!(f, "resize: overflow wymiarow"),
         }
@@ -84,7 +87,11 @@ impl AxisPlan {
             w_right.push(wr);
         }
 
-        AxisPlan { left, right, w_right }
+        AxisPlan {
+            left,
+            right,
+            w_right,
+        }
     }
 }
 
@@ -173,9 +180,12 @@ fn horizontal_row_scalar(src_row: &[u8], dst_w: u32, x_plan: &AxisPlan, dst_row:
         let wl = WEIGHT_ONE - wr;
 
         // Rozwiniete 3 kanaly. `+ (WEIGHT_ONE/2)` to zaokraglenie do najblizszego.
-        let r = (src_row[li] as i32 * wl + src_row[ri] as i32 * wr + (WEIGHT_ONE / 2)) >> WEIGHT_SHIFT;
-        let g = (src_row[li + 1] as i32 * wl + src_row[ri + 1] as i32 * wr + (WEIGHT_ONE / 2)) >> WEIGHT_SHIFT;
-        let b = (src_row[li + 2] as i32 * wl + src_row[ri + 2] as i32 * wr + (WEIGHT_ONE / 2)) >> WEIGHT_SHIFT;
+        let r =
+            (src_row[li] as i32 * wl + src_row[ri] as i32 * wr + (WEIGHT_ONE / 2)) >> WEIGHT_SHIFT;
+        let g = (src_row[li + 1] as i32 * wl + src_row[ri + 1] as i32 * wr + (WEIGHT_ONE / 2))
+            >> WEIGHT_SHIFT;
+        let b = (src_row[li + 2] as i32 * wl + src_row[ri + 2] as i32 * wr + (WEIGHT_ONE / 2))
+            >> WEIGHT_SHIFT;
 
         let o = d * 3;
         dst_row[o] = r as u8;
@@ -187,13 +197,7 @@ fn horizontal_row_scalar(src_row: &[u8], dst_w: u32, x_plan: &AxisPlan, dst_row:
 /// Przebieg pionowy: dla kazdego wiersza docelowego miesza dwa wiersze
 /// zrodlowe (tmp) wg `y_plan`. Tu wlasnie miesza sie CALE wiersze naraz —
 /// idealne dla SIMD (ten sam skalar wagi na 32 bajty).
-fn vertical_pass(
-    tmp: &[u8],
-    dst_w: u32,
-    dst_h: u32,
-    y_plan: &AxisPlan,
-    out: &mut [u8],
-) {
+fn vertical_pass(tmp: &[u8], dst_w: u32, dst_h: u32, y_plan: &AxisPlan, out: &mut [u8]) {
     let row_stride = dst_w as usize * 3;
 
     for d in 0..dst_h as usize {
@@ -390,7 +394,9 @@ mod tests {
 
     fn random_image(w: u32, h: u32, seed: u64) -> Vec<u8> {
         let mut rng = Rng(seed | 1);
-        (0..(w as usize * h as usize * 3)).map(|_| rng.byte()).collect()
+        (0..(w as usize * h as usize * 3))
+            .map(|_| rng.byte())
+            .collect()
     }
 
     /// Skalarna referencja: oba przebiegi wymuszone skalarnie.
@@ -414,7 +420,10 @@ mod tests {
             let bot = yp.right[d] as usize;
             let wb = yp.w_right[d];
             let wt = WEIGHT_ONE - wb;
-            let (a, b) = (&tmp[top * drs..top * drs + drs], &tmp[bot * drs..bot * drs + drs]);
+            let (a, b) = (
+                &tmp[top * drs..top * drs + drs],
+                &tmp[bot * drs..bot * drs + drs],
+            );
             blend_rows_scalar(a, b, wt, wb, &mut out[d * drs..d * drs + drs]);
         }
         out
@@ -497,7 +506,10 @@ mod tests {
     #[test]
     fn rejects_bad_input() {
         let src = vec![0u8; 10];
-        assert_eq!(resize_rgb(&src, 0, 5, 2, 2), Err(ResizeError::ZeroDimension));
+        assert_eq!(
+            resize_rgb(&src, 0, 5, 2, 2),
+            Err(ResizeError::ZeroDimension)
+        );
         assert!(matches!(
             resize_rgb(&src, 4, 4, 2, 2),
             Err(ResizeError::BufferSizeMismatch { .. })

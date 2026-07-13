@@ -54,13 +54,10 @@ impl<C> Encode<C> for CborMap {
 }
 
 impl<'b, C> Decode<'b, C> for CborMap {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut entries = Vec::with_capacity(len as usize);
         for _ in 0..len {
             let k = d.str()?.to_string();
@@ -189,13 +186,10 @@ impl<C> Encode<C> for ResumeStatus {
 }
 
 impl<'b, C> Decode<'b, C> for ResumeStatus {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut mode: Option<ResumeMode> = None;
         let mut next_msg_id: Option<u64> = None;
@@ -226,8 +220,8 @@ impl<'b, C> Decode<'b, C> for ResumeStatus {
                 }
             }
         }
-        let kind = kind
-            .ok_or_else(|| minicbor::decode::Error::message("ResumeStatus missing kind"))?;
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("ResumeStatus missing kind"))?;
         match kind.as_str() {
             "fresh" => {
                 if mode.is_some() || next_msg_id.is_some() || reason.is_some() {
@@ -248,9 +242,7 @@ impl<'b, C> Decode<'b, C> for ResumeStatus {
                         minicbor::decode::Error::message("ResumeStatus.resumed missing mode")
                     })?,
                     next_msg_id: next_msg_id.ok_or_else(|| {
-                        minicbor::decode::Error::message(
-                            "ResumeStatus.resumed missing next_msg_id",
-                        )
+                        minicbor::decode::Error::message("ResumeStatus.resumed missing next_msg_id")
                     })?,
                 })
             }
@@ -409,13 +401,10 @@ impl<C> Encode<C> for RejectReason {
 }
 
 impl<'b, C> Decode<'b, C> for RejectReason {
-    fn decode(
-        d: &mut Decoder<'b>,
-        _ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut supported: Option<Vec<u16>> = None;
         let mut method: Option<String> = None;
@@ -453,8 +442,8 @@ impl<'b, C> Decode<'b, C> for RejectReason {
                 }
             }
         }
-        let kind = kind
-            .ok_or_else(|| minicbor::decode::Error::message("RejectReason missing kind"))?;
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("RejectReason missing kind"))?;
         let no_extras = |sup: &Option<Vec<u16>>,
                          meth: &Option<String>,
                          cap: &Option<String>|
@@ -572,13 +561,10 @@ impl<C> Encode<C> for Heartbeat {
 }
 
 impl<'b, C> Decode<'b, C> for Heartbeat {
-    fn decode(
-        d: &mut Decoder<'b>,
-        _ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         if len != 0 {
             return Err(minicbor::decode::Error::message(
                 "Heartbeat payload must be empty map",
@@ -656,13 +642,10 @@ impl<C> Encode<C> for RateLimitScope {
 }
 
 impl<'b, C> Decode<'b, C> for RateLimitScope {
-    fn decode(
-        d: &mut Decoder<'b>,
-        _ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, _ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut channel: Option<u8> = None;
         let mut action_id: Option<String> = None;
@@ -688,8 +671,8 @@ impl<'b, C> Decode<'b, C> for RateLimitScope {
                 }
             }
         }
-        let kind = kind
-            .ok_or_else(|| minicbor::decode::Error::message("RateLimitScope missing kind"))?;
+        let kind =
+            kind.ok_or_else(|| minicbor::decode::Error::message("RateLimitScope missing kind"))?;
         match kind.as_str() {
             "global" => {
                 if channel.is_some() || action_id.is_some() {
@@ -707,9 +690,7 @@ impl<'b, C> Decode<'b, C> for RateLimitScope {
                 }
                 Ok(RateLimitScope::Channel {
                     channel: channel.ok_or_else(|| {
-                        minicbor::decode::Error::message(
-                            "RateLimitScope.channel missing channel",
-                        )
+                        minicbor::decode::Error::message("RateLimitScope.channel missing channel")
                     })?,
                 })
             }
@@ -721,9 +702,7 @@ impl<'b, C> Decode<'b, C> for RateLimitScope {
                 }
                 Ok(RateLimitScope::Action {
                     action_id: action_id.ok_or_else(|| {
-                        minicbor::decode::Error::message(
-                            "RateLimitScope.action missing action_id",
-                        )
+                        minicbor::decode::Error::message("RateLimitScope.action missing action_id")
                     })?,
                 })
             }
@@ -910,22 +889,18 @@ impl<C> Encode<C> for ControlPayload {
 }
 
 impl<'b, C> Decode<'b, C> for ControlPayload {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.array()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length array forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .array()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length array forbidden"))?;
         if len != 2 {
             return Err(minicbor::decode::Error::message(
                 "Envelope payload tuple MUST be [tag, body]",
             ));
         }
         let tag_raw = d.u16()?;
-        let tag = ControlTag::from_u16(tag_raw).ok_or_else(|| {
-            minicbor::decode::Error::message("unknown control-channel tag")
-        })?;
+        let tag = ControlTag::from_u16(tag_raw)
+            .ok_or_else(|| minicbor::decode::Error::message("unknown control-channel tag"))?;
         Ok(match tag {
             ControlTag::Hello => Self::Hello(ProtocolHello::decode(d, ctx)?),
             ControlTag::Welcome => Self::Welcome(ProtocolWelcome::decode(d, ctx)?),
@@ -935,9 +910,7 @@ impl<'b, C> Decode<'b, C> for ControlPayload {
             ControlTag::CapabilityRevoked => {
                 Self::CapabilityRevoked(CapabilityRevoked::decode(d, ctx)?)
             }
-            ControlTag::RateLimitUpdate => {
-                Self::RateLimitUpdate(RateLimitUpdate::decode(d, ctx)?)
-            }
+            ControlTag::RateLimitUpdate => Self::RateLimitUpdate(RateLimitUpdate::decode(d, ctx)?),
             ControlTag::CreditGrant => Self::CreditGrant(CreditGrant::decode(d, ctx)?),
             ControlTag::Backpressure => Self::Backpressure(Backpressure::decode(d, ctx)?),
             ControlTag::QueueDepth => Self::QueueDepth(QueueDepth::decode(d, ctx)?),
@@ -993,10 +966,7 @@ mod tests {
                     name: "compression_zstd".into(),
                     version: 1,
                     hash: None,
-                    params: Some(CborMap(vec![(
-                        "level".into(),
-                        Value::U64(7),
-                    )])),
+                    params: Some(CborMap(vec![("level".into(), Value::U64(7))])),
                 },
             ],
             auth: AuthContext {
@@ -1147,7 +1117,10 @@ mod tests {
             .u64(1)
             .unwrap();
         let res: Result<ResumeStatus, _> = minicbor::decode(&buf);
-        assert!(res.is_err(), "extra fields must be rejected for fresh variant");
+        assert!(
+            res.is_err(),
+            "extra fields must be rejected for fresh variant"
+        );
     }
 
     #[test]

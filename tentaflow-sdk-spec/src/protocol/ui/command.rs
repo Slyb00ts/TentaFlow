@@ -18,17 +18,27 @@ fn is_valid_download_filename(s: &str) -> bool {
     if s.is_empty() || s.len() > 128 {
         return false;
     }
-    s.bytes().all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+    s.bytes()
+        .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
 }
 
 /// Side-effect requested by the addon. Renderer executes synchronously when
 /// possible (per §6.6 docs).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
-    ShowModal { slot_id: String },
-    HideModal { slot_id: String },
-    ShowDrawer { slot_id: String, side: DrawerSide },
-    HideDrawer { slot_id: String },
+    ShowModal {
+        slot_id: String,
+    },
+    HideModal {
+        slot_id: String,
+    },
+    ShowDrawer {
+        slot_id: String,
+        side: DrawerSide,
+    },
+    HideDrawer {
+        slot_id: String,
+    },
     Toast {
         tone: Tone,
         title: String,
@@ -49,17 +59,23 @@ pub enum Command {
         url: String,
         target: NavigateTarget,
     },
-    Focus { component_id: String },
+    Focus {
+        component_id: String,
+    },
     Scroll {
         component_id: String,
         behavior: ScrollBehavior,
     },
-    Copy { value: String },
+    Copy {
+        value: String,
+    },
     Download {
         signed_url_ref: String,
         filename: String,
     },
-    SetTitle { value: String },
+    SetTitle {
+        value: String,
+    },
     Confirm {
         title: String,
         message: String,
@@ -69,12 +85,16 @@ pub enum Command {
         on_confirm_action: Option<String>,
         on_confirm_params: Option<CborMap>,
     },
-    ResetForm { component_id: String },
+    ResetForm {
+        component_id: String,
+    },
     SetFormFieldValue {
         component_id: String,
         value: Value,
     },
-    DismissToasts { tag: Option<String> },
+    DismissToasts {
+        tag: Option<String>,
+    },
 }
 
 impl<C> Encode<C> for Command {
@@ -293,7 +313,10 @@ impl<C> Encode<C> for Command {
                 e.str("kind")?.str("reset_form")?;
                 e.str("component_id")?.str(component_id)?;
             }
-            Command::SetFormFieldValue { component_id, value } => {
+            Command::SetFormFieldValue {
+                component_id,
+                value,
+            } => {
                 // Keys: kind(0x64..), value(0x65..), component_id(0x6c..).
                 e.map(3)?;
                 e.str("kind")?.str("set_form_field_value")?;
@@ -318,13 +341,10 @@ impl<C> Encode<C> for Command {
 }
 
 impl<'b, C> Decode<'b, C> for Command {
-    fn decode(
-        d: &mut Decoder<'b>,
-        ctx: &mut C,
-    ) -> Result<Self, minicbor::decode::Error> {
-        let len = d.map()?.ok_or_else(|| {
-            minicbor::decode::Error::message("indefinite-length map forbidden")
-        })?;
+    fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, minicbor::decode::Error> {
+        let len = d
+            .map()?
+            .ok_or_else(|| minicbor::decode::Error::message("indefinite-length map forbidden"))?;
         let mut kind: Option<String> = None;
         let mut slot_id: Option<String> = None;
         let mut side: Option<DrawerSide> = None;
@@ -391,8 +411,7 @@ impl<'b, C> Decode<'b, C> for Command {
                 }
             }
         }
-        let kind =
-            kind.ok_or_else(|| minicbor::decode::Error::message("Command missing kind"))?;
+        let kind = kind.ok_or_else(|| minicbor::decode::Error::message("Command missing kind"))?;
         // Per-variant whitelist check + variant construction.
         // To avoid an N×M boolean matrix we use a closure that asserts a tight
         // set of expected fields.
@@ -400,32 +419,32 @@ impl<'b, C> Decode<'b, C> for Command {
         // Length is asserted statically so a short array would fail to compile.
         const FIELD_COUNT: usize = 26;
         let present: [bool; FIELD_COUNT] = [
-            slot_id.is_some(),       //  0
-            side.is_some(),          //  1
-            tone.is_some(),          //  2
-            title.is_some(),         //  3
-            body.is_some(),          //  4
-            duration_ms.is_some(),   //  5
-            action_label.is_some(),  //  6
-            action_id.is_some(),     //  7
-            panel_id.is_some(),      //  8
-            deep_link.is_some(),     //  9
-            addon_id.is_some(),      // 10
-            url.is_some(),           // 11
-            target.is_some(),        // 12
-            component_id.is_some(),  // 13
-            behavior.is_some(),      // 14
-            copy_value.is_some(),    // 15
-            signed_url_ref.is_some(),// 16
-            filename.is_some(),      // 17
-            value.is_some(),         // 18
-            message.is_some(),       // 19
-            confirm_label.is_some(), // 20
-            cancel_label.is_some(),  // 21
-            destructive.is_some(),   // 22
-            on_confirm_action.is_some(),  // 23
-            on_confirm_params.is_some(),  // 24
-            tag.is_some(),           // 25
+            slot_id.is_some(),           //  0
+            side.is_some(),              //  1
+            tone.is_some(),              //  2
+            title.is_some(),             //  3
+            body.is_some(),              //  4
+            duration_ms.is_some(),       //  5
+            action_label.is_some(),      //  6
+            action_id.is_some(),         //  7
+            panel_id.is_some(),          //  8
+            deep_link.is_some(),         //  9
+            addon_id.is_some(),          // 10
+            url.is_some(),               // 11
+            target.is_some(),            // 12
+            component_id.is_some(),      // 13
+            behavior.is_some(),          // 14
+            copy_value.is_some(),        // 15
+            signed_url_ref.is_some(),    // 16
+            filename.is_some(),          // 17
+            value.is_some(),             // 18
+            message.is_some(),           // 19
+            confirm_label.is_some(),     // 20
+            cancel_label.is_some(),      // 21
+            destructive.is_some(),       // 22
+            on_confirm_action.is_some(), // 23
+            on_confirm_params.is_some(), // 24
+            tag.is_some(),               // 25
         ];
         let want_only = |allowed: &[bool; FIELD_COUNT]| -> Result<(), minicbor::decode::Error> {
             for i in 0..FIELD_COUNT {
@@ -501,12 +520,10 @@ impl<'b, C> Decode<'b, C> for Command {
                     false, false, false,
                 ])?;
                 Ok(Command::Toast {
-                    tone: tone.ok_or_else(|| {
-                        minicbor::decode::Error::message("toast missing tone")
-                    })?,
-                    title: title.ok_or_else(|| {
-                        minicbor::decode::Error::message("toast missing title")
-                    })?,
+                    tone: tone
+                        .ok_or_else(|| minicbor::decode::Error::message("toast missing tone"))?,
+                    title: title
+                        .ok_or_else(|| minicbor::decode::Error::message("toast missing title"))?,
                     body,
                     duration_ms,
                     action_label,
@@ -596,9 +613,8 @@ impl<'b, C> Decode<'b, C> for Command {
                     false, false, false, false,
                 ])?;
                 Ok(Command::Copy {
-                    value: copy_value.ok_or_else(|| {
-                        minicbor::decode::Error::message("copy missing value")
-                    })?,
+                    value: copy_value
+                        .ok_or_else(|| minicbor::decode::Error::message("copy missing value"))?,
                 })
             }
             "download" => {
@@ -607,9 +623,8 @@ impl<'b, C> Decode<'b, C> for Command {
                     false, false, false, false, false, true, true, false, false, false, false,
                     false, false, false, false,
                 ])?;
-                let filename = filename.ok_or_else(|| {
-                    minicbor::decode::Error::message("download missing filename")
-                })?;
+                let filename = filename
+                    .ok_or_else(|| minicbor::decode::Error::message("download missing filename"))?;
                 if !is_valid_download_filename(&filename) {
                     return Err(minicbor::decode::Error::message(
                         "download.filename must match [a-zA-Z0-9._-]+, length 1..=128",
@@ -637,13 +652,12 @@ impl<'b, C> Decode<'b, C> for Command {
             "confirm" => {
                 want_only(&[
                     false, false, false, true, false, false, false, false, false, false, false,
-                    false, false, false, false, false, false, false, false, true, true, true,
-                    true, true, true, false,
+                    false, false, false, false, false, false, false, false, true, true, true, true,
+                    true, true, false,
                 ])?;
                 Ok(Command::Confirm {
-                    title: title.ok_or_else(|| {
-                        minicbor::decode::Error::message("confirm missing title")
-                    })?,
+                    title: title
+                        .ok_or_else(|| minicbor::decode::Error::message("confirm missing title"))?,
                     message: message.ok_or_else(|| {
                         minicbor::decode::Error::message("confirm missing message")
                     })?,
@@ -720,13 +734,19 @@ mod tests {
 
     #[test]
     fn all_simple_commands_roundtrip() {
-        rt(Command::ShowModal { slot_id: "m".into() });
-        rt(Command::HideModal { slot_id: "m".into() });
+        rt(Command::ShowModal {
+            slot_id: "m".into(),
+        });
+        rt(Command::HideModal {
+            slot_id: "m".into(),
+        });
         rt(Command::ShowDrawer {
             slot_id: "d".into(),
             side: DrawerSide::Right,
         });
-        rt(Command::HideDrawer { slot_id: "d".into() });
+        rt(Command::HideDrawer {
+            slot_id: "d".into(),
+        });
         rt(Command::Navigate {
             panel_id: "main".into(),
             deep_link: Some("/x".into()),

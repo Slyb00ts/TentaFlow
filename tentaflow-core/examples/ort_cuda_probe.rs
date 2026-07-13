@@ -13,7 +13,7 @@
 use std::time::Instant;
 
 use ndarray::Array4;
-use ort::ep::{ExecutionProvider, CUDA, TensorRT};
+use ort::ep::{ExecutionProvider, TensorRT, CUDA};
 use ort::session::Session;
 use ort::value::Value;
 
@@ -42,7 +42,9 @@ fn main() -> anyhow::Result<()> {
         ((seed >> 40) as f32 / 8_388_608.0) - 1.0
     });
 
-    let model_path = std::env::args().nth(1).unwrap_or_else(|| MODEL_PATH.to_string());
+    let model_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| MODEL_PATH.to_string());
     println!("Model: {model_path}");
     if let Some(p) = std::env::var_os("ORT_DYLIB_PATH") {
         println!("ORT_DYLIB_PATH: {}", p.to_string_lossy());
@@ -128,10 +130,7 @@ fn build_session(model_path: &str, try_trt: bool) -> anyhow::Result<(Session, &'
 
 /// Probuje zarejestrowac provider (`error_on_failure` => twarde niepowodzenie
 /// zamiast cichego fallbacku) i skomitowac sesje z modelu.
-fn try_commit(
-    model_path: &str,
-    ep: ort::ep::ExecutionProviderDispatch,
-) -> anyhow::Result<Session> {
+fn try_commit(model_path: &str, ep: ort::ep::ExecutionProviderDispatch) -> anyhow::Result<Session> {
     let mut builder = Session::builder()?
         .with_execution_providers([ep])
         .map_err(|e| anyhow::anyhow!("rejestracja EP nieudana: {e}"))?;

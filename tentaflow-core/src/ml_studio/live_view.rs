@@ -51,7 +51,10 @@ pub fn clear_local_job(run_id: &str) {
 
 /// Zwraca `(base, job_id)` lokalnego jobu, jeśli zarejestrowany.
 pub fn local_job(run_id: &str) -> Option<(String, String)> {
-    local_jobs().lock().ok().and_then(|m| m.get(run_id).cloned())
+    local_jobs()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(run_id).cloned())
 }
 
 /// Parsuje pola live-view z surowej odpowiedzi `/status` serwisu treningowego.

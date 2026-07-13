@@ -2,6 +2,7 @@
 // File: protocol/ui/data/progress.rs — ProgressBar/RatingDisplay/Diff (catalog §4)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::{BindRef, StatePath};
 use super::super::component::{Component, FieldMap};
 use super::super::tokens::{
@@ -12,11 +13,19 @@ use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -50,7 +59,9 @@ impl ProgressBar {
         e.push((2, encode_to_value(&self.variant)?));
         e.push((3, encode_to_value(&self.tone)?));
         e.push((4, encode_to_value(&self.show_label)?));
-        if let Some(l) = &self.label { e.push((5, encode_to_value(l)?)); }
+        if let Some(l) = &self.label {
+            e.push((5, encode_to_value(l)?));
+        }
         e.push((6, encode_to_value(&self.size)?));
         // Wire-compat: emit key 7 ONLY for the non-default vertical orientation.
         if matches!(self.orientation, Some(ProgressOrientation::Vertical)) {
@@ -176,7 +187,9 @@ impl Diff {
         e.push((0, encode_to_value(&self.before_path)?));
         e.push((1, encode_to_value(&self.after_path)?));
         e.push((2, encode_to_value(&self.variant)?));
-        if let Some(l) = &self.language { e.push((3, encode_to_value(l)?)); }
+        if let Some(l) = &self.language {
+            e.push((3, encode_to_value(l)?));
+        }
         e.push((4, encode_to_value(&self.word_wrap)?));
         e.push((5, encode_to_value(&self.show_line_numbers)?));
         Ok(component(Self::TAG, id, e))
@@ -208,7 +221,8 @@ impl Diff {
             variant: variant.ok_or_else(|| missing_field("Diff", "variant"))?,
             language,
             word_wrap: word_wrap.ok_or_else(|| missing_field("Diff", "word_wrap"))?,
-            show_line_numbers: show_line_numbers.ok_or_else(|| missing_field("Diff", "show_line_numbers"))?,
+            show_line_numbers: show_line_numbers
+                .ok_or_else(|| missing_field("Diff", "show_line_numbers"))?,
         })
     }
 }

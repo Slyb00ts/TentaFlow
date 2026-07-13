@@ -352,7 +352,9 @@ impl StreamProducerAdapter for LlmNodeAdapter {
             .stream_chat(request)
             .await
             .map_err(|e| anyhow!("stream_chat failed: {e}"))?;
-        Ok(adapter_stream.map(|res| res.map(EnvelopeDelta::Llm)).boxed())
+        Ok(adapter_stream
+            .map(|res| res.map(EnvelopeDelta::Llm))
+            .boxed())
     }
 }
 
@@ -470,7 +472,10 @@ mod tests {
         );
         env.meta.insert("loop_final_pass".into(), json!(true));
         let req = LlmNodeAdapter::build_llm_request(&node(json!({})), &env, &stub_ctx()).unwrap();
-        assert!(req.tools.is_empty(), "final pass must drop tools (grace summary)");
+        assert!(
+            req.tools.is_empty(),
+            "final pass must drop tools (grace summary)"
+        );
         assert!(req.tool_choice.is_none());
     }
 

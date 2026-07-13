@@ -463,6 +463,9 @@ string_enum! {
         Tag = "tag",
         Avatar = "avatar",
         AvatarGroup = "avatar_group",
+        // Image: cell value is an image URL rendered as a fixed-size `<img>`
+        // (object-fit contain); empty value → a muted em-dash placeholder.
+        Image = "image",
         Icon = "icon",
         Stat = "stat",
         Trend = "trend",

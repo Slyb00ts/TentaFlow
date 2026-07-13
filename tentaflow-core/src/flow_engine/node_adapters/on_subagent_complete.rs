@@ -183,8 +183,7 @@ mod tests {
     #[tokio::test]
     async fn emits_clone_of_seeded_envelope() {
         let mut env = FlowEnvelope::with_payload(FlowValue::Text("child result".into()));
-        env.meta
-            .insert("child_run_id".into(), json!("run-9"));
+        env.meta.insert("child_run_id".into(), json!("run-9"));
         let ctx = stub_ctx_with_initial(env);
         let out = OnSubagentCompleteNodeAdapter::new()
             .execute(&node(), &[], &ctx)

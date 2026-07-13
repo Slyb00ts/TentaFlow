@@ -672,9 +672,15 @@ mod tests {
     #[test]
     fn system_prompt_defaults_to_const_when_absent() {
         let n = node(json!({}));
-        assert_eq!(AgentRouterNodeAdapter::system_prompt(&n), ROUTER_SYSTEM_PROMPT);
+        assert_eq!(
+            AgentRouterNodeAdapter::system_prompt(&n),
+            ROUTER_SYSTEM_PROMPT
+        );
         let n = node(json!({"system_prompt": ""}));
-        assert_eq!(AgentRouterNodeAdapter::system_prompt(&n), ROUTER_SYSTEM_PROMPT);
+        assert_eq!(
+            AgentRouterNodeAdapter::system_prompt(&n),
+            ROUTER_SYSTEM_PROMPT
+        );
     }
 
     /// A configured `system_prompt` overrides the default and reaches the model.

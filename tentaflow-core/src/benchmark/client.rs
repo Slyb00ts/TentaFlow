@@ -143,7 +143,9 @@ impl BenchClient {
             // chain-of-thought models stream reasoning_content before content.
             let has_content = chunk["choices"].as_array().is_some_and(|choices| {
                 choices.iter().any(|c| {
-                    c["delta"]["content"].as_str().is_some_and(|s| !s.is_empty())
+                    c["delta"]["content"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty())
                         || c["delta"]["reasoning_content"]
                             .as_str()
                             .is_some_and(|s| !s.is_empty())
@@ -230,8 +232,12 @@ impl BenchClient {
                     }
                 }
                 "content_block_delta" => {
-                    let has_text = event["delta"]["text"].as_str().is_some_and(|s| !s.is_empty())
-                        || event["delta"]["thinking"].as_str().is_some_and(|s| !s.is_empty());
+                    let has_text = event["delta"]["text"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty())
+                        || event["delta"]["thinking"]
+                            .as_str()
+                            .is_some_and(|s| !s.is_empty());
                     if has_text {
                         let now = Instant::now();
                         if obs.first_token_at.is_none() {

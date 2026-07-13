@@ -22,7 +22,12 @@ use super::HandlerContext;
 /// inline (block_in_place would panic there).
 pub(crate) fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current() {
-        Ok(h) if matches!(h.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread) => {
+        Ok(h)
+            if matches!(
+                h.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) =>
+        {
             tokio::task::block_in_place(f)
         }
         _ => f(),
@@ -209,14 +214,10 @@ fn handle_panel_open(
                         if !has_export {
                             let sl = ctx.state.ui_sessions.get_or_create(ctx.connection_id);
                             let mut session = sl.lock();
-                            if !session.is_shell_registered(
-                                &panel_open.addon_id,
-                                &panel_open.panel_id,
-                            ) {
-                                session.close_panel(
-                                    &panel_open.addon_id,
-                                    &panel_open.panel_id,
-                                );
+                            if !session
+                                .is_shell_registered(&panel_open.addon_id, &panel_open.panel_id)
+                            {
+                                session.close_panel(&panel_open.addon_id, &panel_open.panel_id);
                                 return Err(ProtocolError::internal(format!(
                                     "addon '{}' opened panel '{}' but rendered no shell",
                                     panel_open.addon_id, panel_open.panel_id
@@ -806,7 +807,10 @@ mod tests {
         // params nioslo wlasne pole (field) — wstrzykniety epoch nie nadpisuje go.
         let params = CborMap(vec![("field".into(), SV::Text("chat_question".into()))]);
         let out = action_params_with_epoch(&params, 7);
-        assert_eq!(out.get("field").and_then(|v| v.as_str()), Some("chat_question"));
+        assert_eq!(
+            out.get("field").and_then(|v| v.as_str()),
+            Some("chat_question")
+        );
         assert_eq!(
             out.get("__panel_epoch").and_then(|v| v.as_u64()),
             Some(7),
@@ -815,7 +819,10 @@ mod tests {
 
         // Pusty params: addon i tak dostaje epoch.
         let empty = action_params_with_epoch(&CborMap(vec![]), 42);
-        assert_eq!(empty.get("__panel_epoch").and_then(|v| v.as_u64()), Some(42));
+        assert_eq!(
+            empty.get("__panel_epoch").and_then(|v| v.as_u64()),
+            Some(42)
+        );
     }
 
     #[test]

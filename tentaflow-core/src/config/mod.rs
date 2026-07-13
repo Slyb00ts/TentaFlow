@@ -77,6 +77,362 @@ pub struct NodeConfig {
     /// Metryki zuzycia tokenow + egzekwowanie limitow (sekcja `[token_metrics]`).
     #[serde(default)]
     pub token_metrics: TokenMetricsConfig,
+
+    /// Multi-process vision worker sharding (sekcja `[vision]`).
+    #[serde(default)]
+    pub vision: VisionConfig,
+}
+
+// =============================================================================
+// Konfiguracja vision workers (sekcja [vision])
+// =============================================================================
+
+/// Vision / camera-CV runtime configuration (docs/VISION_WORKER_SHARDING.md
+/// for the worker fleet). The config TOML is the ONLY operator mechanism for
+/// every knob here — there are deliberately NO environment variables. Every
+/// default matches the historical behavior, so a node without a `[vision]`
+/// section behaves exactly as before. The parsed section is frozen process-wide
+/// via `vision::settings::init` at startup; vision worker processes receive it
+/// as a serialized CLI argument from the spawning supervisor.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VisionConfig {
+    /// Vision worker processes spawned per GPU in the vision GPU set. `0`
+    /// (default) disables the worker fleet entirely: no processes are spawned
+    /// and no link socket is bound.
+    #[serde(default)]
+    pub workers_per_gpu: usize,
+
+    /// CUDA device set the vision session pools spread across. Grammar:
+    /// empty (default) → device `[0]`; a bare count `"2"` → devices `[0, 1]`;
+    /// an explicit comma list `"0,2,3"` → exactly those device ids.
+    #[serde(default)]
+    pub gpus: String,
+
+    /// RF-DETR detector session-pool size (each session ≈2.6 GB VRAM).
+    #[serde(default = "default_vision_sessions")]
+    pub detector_sessions: usize,
+
+    /// State-classifier (nalepka-stan) session-pool size.
+    #[serde(default = "default_vision_sessions")]
+    pub stan_sessions: usize,
+
+    /// Plate-OCR session-pool size.
+    #[serde(default = "default_vision_sessions")]
+    pub plate_sessions: usize,
+
+    /// ADR-OCR session-pool size.
+    #[serde(default = "default_vision_sessions")]
+    pub adr_sessions: usize,
+
+    /// ort session-pool size for the parallel YOLOv8 vehicle detector. The model
+    /// is tiny (~tens of MB per session) and only produces coarse vehicle boxes,
+    /// so a small pool (default 2) is plenty. `0` falls back to that default.
+    #[serde(default = "default_vehicle_sessions")]
+    pub vehicle_sessions: usize,
+
+    /// PP-OCRv5 fallback OCR session-pool size (shared by det/rec/cls heads).
+    #[serde(default = "default_ppocr_sessions")]
+    pub ppocr_sessions: usize,
+
+    /// Max resident dynamic `onnx-cv` registry models (LRU eviction).
+    #[serde(default = "default_vision_sessions")]
+    pub onnx_cv_max_models: usize,
+
+    /// Session-pool size per resident `onnx-cv` registry model.
+    #[serde(default = "default_one")]
+    pub onnx_cv_sessions_per_model: usize,
+
+    /// TensorRT shape-profile optimization batch for the fixed camera-CV
+    /// engines. `None` keeps each model's built-in default (detector 8,
+    /// classifier/plate 8). Changing it forces a TRT engine rebuild on load.
+    #[serde(default)]
+    pub opt_batch: Option<usize>,
+
+    /// TensorRT shape-profile max batch. `None` keeps each model's built-in
+    /// default (detector = opt, classifier/plate = max(opt, 16)).
+    #[serde(default)]
+    pub max_batch: Option<usize>,
+
+    /// Concurrent detect forwards K. `None` (default) follows
+    /// `detector_sessions` — N pooled sessions pipeline N batched forwards.
+    #[serde(default)]
+    pub inflight: Option<usize>,
+
+    /// Cross-camera inference-batcher flush window in microseconds.
+    #[serde(default = "default_batch_window_us")]
+    pub batch_window_us: u64,
+
+    /// Max cameras whose cold enrichment runs concurrently (1..=1024).
+    #[serde(default = "default_cold_workers")]
+    pub cold_workers: usize,
+
+    /// Run the small OCR/classifier CRNN heads in TensorRT FP16. Default OFF —
+    /// fp16 rounding corrupts character reads; ON only for A/B measurement.
+    #[serde(default)]
+    pub ocr_fp16: bool,
+
+    /// Per-session TensorRT workspace cap in MiB (clamped 128..=8192). The TRT
+    /// 10.x default (0 = all free VRAM) makes pooled sessions unusable at N>1.
+    #[serde(default = "default_trt_workspace_mib")]
+    pub trt_workspace_mib: usize,
+
+    /// Capture + replay the TRT forward as one CUDA Graph. Opt-in: graph
+    /// capture requires stable shapes per session; mixed batches can regress.
+    #[serde(default)]
+    pub trt_cuda_graph: bool,
+
+    /// Zero-copy DETECT branch: feed the NVDEC device surface straight to the
+    /// detector (no download/re-upload round-trip). Opt-in.
+    #[serde(default)]
+    pub zerocopy_detect: bool,
+
+    /// Zero-copy CROPS path: enrichment cuts crops off the device surface
+    /// instead of downloading the full frame to host every stream frame. Opt-in.
+    #[serde(default)]
+    pub zerocopy_crops: bool,
+
+    /// Trust that `gst_memory_map(GST_MAP_CUDA)` already synced the decode
+    /// surface and skip the `cudaDeviceSynchronize` barrier (lower latency;
+    /// enable only once confirmed on the target GStreamer build).
+    #[serde(default)]
+    pub zerocopy_map_sync: bool,
+
+    /// Verify the zero-copy DETECT preprocess against the download path on the
+    /// first few frames (correctness gate; logged, never fatal).
+    #[serde(default)]
+    pub zerocopy_verify: bool,
+
+    /// Verify the zero-copy CROPS path against host crops on the first few
+    /// crops (correctness gate; logged, never fatal).
+    #[serde(default)]
+    pub zerocopy_crops_verify: bool,
+
+    /// GPU-resident NV12 detect path for NVDEC ingest. Default ON; `false`
+    /// forces the NVDEC + CPU-convert path (detector reads an RGB frame).
+    #[serde(default = "default_true")]
+    pub nv12_detect: bool,
+
+    /// GPU scaling branch for the detect frame (cudascale). Default ON;
+    /// `false` forces the CPU resize path.
+    #[serde(default = "default_true")]
+    pub gpu_resize: bool,
+
+    /// When set, OCR calls dump their raw/rectified crops + model-input
+    /// tensors as PNGs into this directory. `None` (default) disables dumps.
+    #[serde(default)]
+    pub ocr_dump_dir: Option<std::path::PathBuf>,
+
+    /// Perspective-deskew plate crops before OCR. Default ON; `false` keeps
+    /// the plain bilinear-stretch path (A/B toggle).
+    #[serde(default = "default_true")]
+    pub ocr_deskew: bool,
+
+    /// Content-trim each ADR placard row before the 32×128 resize. Default ON.
+    #[serde(default = "default_true")]
+    pub adr_row_trim: bool,
+
+    /// Placard orientations tried by ADR OCR (1 = upright only, up to 4 =
+    /// full 0/90/180/270 rotation search). Stationary cameras see placards
+    /// upright, so extra rotations are usually wasted forwards.
+    #[serde(default = "default_one")]
+    pub adr_orientations: usize,
+
+    /// Minimum mean OCR confidence (0..1) the WINNING plate read must reach
+    /// before a plate is reported. The plate OCR's `decode_logits_scored`
+    /// returns the mean softmax probability of the chosen character across the
+    /// non-pad slots: a genuine sharp plate scores ~0.8-0.99, while an occluded
+    /// or blurry plate produces low-probability argmaxes (~0.3-0.6). Below this
+    /// floor the plate is reported as "unreadable" (`None`) instead of a
+    /// fabricated guess. Default 0.5 keeps genuine reads while rejecting the
+    /// low-evidence misreads that a naive count vote used to surface.
+    #[serde(default = "default_plate_min_confidence")]
+    pub plate_min_confidence: f32,
+
+    /// Minimum vote AGREEMENT (winner_weight / total_weight, 0..1) before a
+    /// plate is reported. Each frame's read is weighted by its OCR confidence;
+    /// a plate whose reads disagree frame-to-frame (occlusion/blur produces
+    /// several different low-confidence strings) never lets one variant reach a
+    /// clear majority of the weight and is reported "unreadable". A single
+    /// confident read has agreement 1.0, so one strong frame still passes.
+    /// Default 0.5.
+    #[serde(default = "default_plate_min_agreement")]
+    pub plate_min_agreement: f32,
+
+    /// Minimum mean OCR confidence (0..1) the winning ADR code must reach. The
+    /// ADR CRNN's CTC decode reports the mean softmax-max over the selected
+    /// steps (same 0..1 scale as the plate OCR). The UN number already passes
+    /// the `snap_adr` catalog snap before it can vote, so this floor is a
+    /// secondary guard and defaults lower (0.35) than the plate floor.
+    #[serde(default = "default_adr_min_confidence")]
+    pub adr_min_confidence: f32,
+
+    /// Minimum vote agreement before an ADR code is reported (same math as
+    /// `plate_min_agreement`). Default 0.5.
+    #[serde(default = "default_adr_min_agreement")]
+    pub adr_min_agreement: f32,
+
+    /// One-shot depth-calibration capture: dump the metric depth map + pose +
+    /// lidar cloud to `/tmp/tf_calib/` for the offline `depth_calib` example.
+    #[serde(default)]
+    pub calib_dump: bool,
+
+    /// Extra seconds (past the camera's connect timeout) an RTSP ingest path
+    /// waits for FIRST frames before degrading to the next rung (NVDEC → CPU
+    /// convert → CPU decode). Cameras recovering from RTSP-session stress can
+    /// take tens of seconds to start delivering, and too small a window makes a
+    /// perfectly healthy GPU path fall back to software decode for the whole
+    /// session.
+    #[serde(default = "default_warmup_extra_secs")]
+    pub warmup_extra_secs: u32,
+
+    /// Per-vehicle event recording: whenever detections appear on a camera
+    /// (scene non-empty), record fMP4 passthrough video until the scene stays
+    /// empty for `event_stop_hysteresis_secs`. Default ON per operator request;
+    /// it only ever engages on cameras that actually publish detections (i.e.
+    /// have a resolvable analysis pipeline), so nodes without CV are unaffected.
+    #[serde(default = "default_true")]
+    pub event_recording: bool,
+
+    /// Seconds the scene must stay empty (no detections) before an event
+    /// recording is finalized. A new detection inside the window extends the
+    /// same recording.
+    #[serde(default = "default_event_stop_hysteresis_secs")]
+    pub event_stop_hysteresis_secs: u64,
+
+    /// Seconds of video kept in a per-camera rolling buffer while idle and
+    /// prepended to each event recording (the vehicle is visible BEFORE the
+    /// first detection lands). `0` disables the buffer — the recording then
+    /// starts at the first fragment after the trigger. Non-zero keeps the
+    /// camera's passthrough mux branch attached permanently (cheap: no
+    /// transcode, ~`preroll × bitrate` bytes of RAM per camera).
+    #[serde(default = "default_event_preroll_secs")]
+    pub event_preroll_secs: u64,
+
+    /// Upper bound for one event recording file. A scene that never empties
+    /// (busy gate, stuck detection) rotates to a fresh file at this boundary
+    /// instead of growing one unbounded mp4; no video is lost across the cut.
+    #[serde(default = "default_event_max_duration_secs")]
+    pub event_max_duration_secs: u64,
+
+    /// RTSP lower transport for `rtsp://` cameras (GstRTSPLowerTrans flags
+    /// string). Default `"udp+udp-mcast+tcp"` (UDP preferred). Interleaved
+    /// `"tcp"` was tried as a fix for UDP media dying silently across routed
+    /// networks, but rtspsrc pushes interleaved RTP synchronously from its
+    /// connection task and our tee chain's startup backpressure left the socket
+    /// unread (Recv-Q grew, session never came online) — measured on the live
+    /// camera. Until that is made compatible on a bench, UDP stays the default
+    /// and the 10 s mid-session stall watchdog covers silent UDP death.
+    /// `rtsps://` URLs always use `"tcp+tls"` regardless.
+    #[serde(default = "default_rtsp_protocols")]
+    pub rtsp_protocols: String,
+}
+
+fn default_warmup_extra_secs() -> u32 {
+    20
+}
+
+fn default_rtsp_protocols() -> String {
+    "udp+udp-mcast+tcp".to_string()
+}
+
+impl Default for VisionConfig {
+    fn default() -> Self {
+        Self {
+            workers_per_gpu: 0,
+            gpus: String::new(),
+            detector_sessions: default_vision_sessions(),
+            stan_sessions: default_vision_sessions(),
+            plate_sessions: default_vision_sessions(),
+            adr_sessions: default_vision_sessions(),
+            vehicle_sessions: default_vehicle_sessions(),
+            ppocr_sessions: default_ppocr_sessions(),
+            onnx_cv_max_models: default_vision_sessions(),
+            onnx_cv_sessions_per_model: default_one(),
+            opt_batch: None,
+            max_batch: None,
+            inflight: None,
+            batch_window_us: default_batch_window_us(),
+            cold_workers: default_cold_workers(),
+            ocr_fp16: false,
+            trt_workspace_mib: default_trt_workspace_mib(),
+            trt_cuda_graph: false,
+            zerocopy_detect: false,
+            zerocopy_crops: false,
+            zerocopy_map_sync: false,
+            zerocopy_verify: false,
+            zerocopy_crops_verify: false,
+            nv12_detect: default_true(),
+            gpu_resize: default_true(),
+            ocr_dump_dir: None,
+            ocr_deskew: default_true(),
+            adr_row_trim: default_true(),
+            adr_orientations: default_one(),
+            plate_min_confidence: default_plate_min_confidence(),
+            plate_min_agreement: default_plate_min_agreement(),
+            adr_min_confidence: default_adr_min_confidence(),
+            adr_min_agreement: default_adr_min_agreement(),
+            calib_dump: false,
+            warmup_extra_secs: default_warmup_extra_secs(),
+            event_recording: default_true(),
+            event_stop_hysteresis_secs: default_event_stop_hysteresis_secs(),
+            event_preroll_secs: default_event_preroll_secs(),
+            event_max_duration_secs: default_event_max_duration_secs(),
+            rtsp_protocols: default_rtsp_protocols(),
+        }
+    }
+}
+
+fn default_event_stop_hysteresis_secs() -> u64 {
+    10
+}
+fn default_event_preroll_secs() -> u64 {
+    5
+}
+fn default_event_max_duration_secs() -> u64 {
+    3600
+}
+
+fn default_vision_sessions() -> usize {
+    4
+}
+
+fn default_vehicle_sessions() -> usize {
+    2
+}
+fn default_ppocr_sessions() -> usize {
+    2
+}
+fn default_one() -> usize {
+    1
+}
+fn default_batch_window_us() -> u64 {
+    2000
+}
+// Gate defaults are 0.0 = OFF: report the format-validated, confidence-weighted
+// winner, never suppress. Enabling the suppression (a real "unreadable" for
+// occluded plates) needs two things first: (1) fix the cold-stage output paths
+// that leave `tekst_conf: None` (which collapses the vote confidence to 0 and
+// would reject even a crystal-clear plate — observed as "Rejestracja: —" on a
+// perfectly readable WPL1YR8), and (2) calibrate the thresholds against real
+// measured confidence/agreement values. Format validation (waliduj_tablice_pl)
+// still runs and blocks garbage like "M88901" regardless of these thresholds.
+fn default_plate_min_confidence() -> f32 {
+    0.0
+}
+fn default_plate_min_agreement() -> f32 {
+    0.0
+}
+fn default_adr_min_confidence() -> f32 {
+    0.0
+}
+fn default_adr_min_agreement() -> f32 {
+    0.0
+}
+fn default_cold_workers() -> usize {
+    64
+}
+fn default_trt_workspace_mib() -> usize {
+    1024
 }
 
 // =============================================================================
@@ -990,6 +1346,7 @@ impl Default for NodeConfig {
             inference: None,
             services_runtime: ServicesRuntimeConfig::default(),
             token_metrics: TokenMetricsConfig::default(),
+            vision: VisionConfig::default(),
         }
     }
 }
@@ -1003,5 +1360,42 @@ impl Default for MonitoringConfig {
             tracing_enabled: false,
             tracing_endpoint: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod vision_config_tests {
+    use super::*;
+
+    /// An absent `[vision]` section must yield exactly `VisionConfig::default()`
+    /// — the serde field defaults and the manual `Default` impl share the same
+    /// default fns, so a node without the section keeps today's behavior.
+    #[test]
+    fn absent_vision_section_equals_default() {
+        let parsed: VisionConfig = toml::from_str("").expect("empty [vision] parses");
+        let default = VisionConfig::default();
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            serde_json::to_value(&default).unwrap()
+        );
+    }
+
+    /// The default config file written on first boot must serialize cleanly
+    /// with the extended `[vision]` section (Option fields skipped by TOML) and
+    /// survive a JSON round-trip — the supervisor hands the section to vision
+    /// workers as `--vision-config` JSON.
+    #[test]
+    fn vision_config_serializes_to_toml_and_json() {
+        let toml_str = NodeConfig::default()
+            .to_toml_string()
+            .expect("default config serializes");
+        assert!(toml_str.contains("[vision]"));
+
+        let json = serde_json::to_string(&VisionConfig::default()).expect("to json");
+        let back: VisionConfig = serde_json::from_str(&json).expect("from json");
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(&VisionConfig::default()).unwrap()
+        );
     }
 }

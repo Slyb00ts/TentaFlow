@@ -20,12 +20,7 @@ const MIN_CROP_EDGE: u32 = 8;
 /// (`[x, y, w, h]` in `0..=1`). Clamps to frame bounds; returns `None` when the
 /// clamped crop is smaller than [`MIN_CROP_EDGE`] on either edge (nothing worth
 /// running a model on). `frame` must be exactly `frame_w * frame_h * 3` bytes.
-pub fn crop_detection(
-    frame: &[u8],
-    frame_w: u32,
-    frame_h: u32,
-    bbox: [f32; 4],
-) -> Option<RgbCrop> {
+pub fn crop_detection(frame: &[u8], frame_w: u32, frame_h: u32, bbox: [f32; 4]) -> Option<RgbCrop> {
     let fw = frame_w as f32;
     let fh = frame_h as f32;
     let x0 = (bbox[0] * fw).round().clamp(0.0, fw) as u32;

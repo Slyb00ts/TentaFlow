@@ -240,7 +240,8 @@ impl SlamSceneManager {
         // safe because no geometry has accumulated yet (pose-first leaves the map
         // empty), so nothing is lost. The frame header is authoritative for a
         // pre-fused sensor; without this the map would dedup on the wrong grid.
-        if (slam.resolution - resolution).abs() > 1e-6 && slam.service.scene_voxel_map().is_empty() {
+        if (slam.resolution - resolution).abs() > 1e-6 && slam.service.scene_voxel_map().is_empty()
+        {
             let prev_pose = slam.last_pose;
             let had_pose = slam.has_pose;
             let prev_us = slam.last_frame_us;
@@ -306,7 +307,12 @@ impl SlamSceneManager {
         // Append to the timestamped history (monotonic by recv time); cap to ~the last
         // few seconds so `scene_pose_at` can look up the pose at a delayed frame's
         // capture time. Drop out-of-order/duplicate stamps to keep it sorted.
-        if slam.pose_hist.back().map(|&(t, _)| timestamp_us > t).unwrap_or(true) {
+        if slam
+            .pose_hist
+            .back()
+            .map(|&(t, _)| timestamp_us > t)
+            .unwrap_or(true)
+        {
             slam.pose_hist.push_back((timestamp_us, pose));
             while slam.pose_hist.len() > POSE_HIST_MAX {
                 slam.pose_hist.pop_front();
@@ -434,7 +440,10 @@ impl SlamSceneManager {
 
     /// All pinned anchors `(robot_id, anchor)` — the set the persistence layer writes.
     pub fn all_anchors(&self) -> Vec<(String, GeoAnchor)> {
-        self.anchors.iter().map(|e| (e.key().clone(), *e.value())).collect()
+        self.anchors
+            .iter()
+            .map(|e| (e.key().clone(), *e.value()))
+            .collect()
     }
 
     /// Latest map change-generation for a robot (0 if unknown). Lets the scene push
@@ -491,7 +500,11 @@ mod tests {
         // Pre-fused source re-sends its whole map; this frame keeps both + adds one → 3.
         mgr.on_lidar_frame(
             id,
-            &frame(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], 0.05, 2),
+            &frame(
+                &[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+                0.05,
+                2,
+            ),
         );
         assert_eq!(mgr.cell_count(id), 3);
         let snap = mgr.snapshot(id).unwrap();
@@ -502,7 +515,11 @@ mod tests {
         // A later frame that DROPS cells removes them — the map mirrors the latest frame,
         // never an accumulation of stale geometry.
         mgr.on_lidar_frame(id, &frame(&[[2.0, 0.0, 0.0]], 0.05, 3));
-        assert_eq!(mgr.cell_count(id), 1, "dropped cells disappear, no stale buildup");
+        assert_eq!(
+            mgr.cell_count(id),
+            1,
+            "dropped cells disappear, no stale buildup"
+        );
     }
 
     #[test]
@@ -541,7 +558,10 @@ mod tests {
         // geometry lost; the map was empty), and accumulation uses the new grid.
         mgr.on_lidar_frame(id, &frame(&[[0.0, 0.0, 0.0], [0.04, 0.0, 0.0]], 0.10, 1));
         let snap = mgr.snapshot(id).unwrap();
-        assert!((snap.resolution - 0.10).abs() < 1e-6, "grid upgraded to sensor resolution");
+        assert!(
+            (snap.resolution - 0.10).abs() < 1e-6,
+            "grid upgraded to sensor resolution"
+        );
         // [0,0,0] and [0.04,0,0] share one cell on the 0.10 grid (both round to 0) but
         // would be two cells on the stale 0.05 grid — so a single cell proves the upgrade.
         assert_eq!(mgr.cell_count(id), 1, "dedup uses the upgraded 0.10 grid");

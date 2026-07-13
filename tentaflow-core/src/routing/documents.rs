@@ -46,10 +46,15 @@ impl Router {
             ..ExecutionContext::default()
         };
 
-        let response = match executor.execute_document_infer(request, &mut exec_ctx).await {
+        let response = match executor
+            .execute_document_infer(request, &mut exec_ctx)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
-                return Err(crate::routing::embeddings::executor_err_to_core(e, &payload.model).into())
+                return Err(
+                    crate::routing::embeddings::executor_err_to_core(e, &payload.model).into(),
+                )
             }
         };
 

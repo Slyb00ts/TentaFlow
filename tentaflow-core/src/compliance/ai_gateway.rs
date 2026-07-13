@@ -13,11 +13,11 @@ use crate::api::openai::types::{
 use crate::auth::acl::UserContext;
 use crate::db::DbPool;
 
+use super::audit_worker;
 use super::models::{
     AiEventStatus, AiPayloadKind, ComplianceRiskClass, NewAiEvent, NewAiPayload, NewAiToolCall,
     ToolCallStatus,
 };
-use super::audit_worker;
 use super::repository::{
     add_ai_payload, add_ai_tool_call, default_ai_legal_basis_id, finish_ai_event, start_ai_event,
 };
@@ -291,9 +291,7 @@ impl AiGateway {
             }
 
             let used = match crate::db::repository::global_usage_for_quota(
-                &self.db,
-                quota,
-                period_key,
+                &self.db, quota, period_key,
             ) {
                 Ok(used) => used,
                 Err(err) => {
@@ -320,8 +318,7 @@ impl AiGateway {
         execution: &ToolExecution<'_>,
     ) -> Result<Option<String>> {
         let conn = self.db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
-        let Some(event_id) =
-            super::repository::latest_ai_event_id_for_run(&conn, agent_run_id)?
+        let Some(event_id) = super::repository::latest_ai_event_id_for_run(&conn, agent_run_id)?
         else {
             return Ok(None);
         };
@@ -395,7 +392,8 @@ impl AiEventHandle {
     pub fn finish_success(&self, response: &ChatCompletionResponse) -> Result<()> {
         let response_text = chat_response_text(response);
         let usage = response.usage.clone();
-        let tool_calls: Vec<ToolCall> = response_tool_calls(response).into_iter().cloned().collect();
+        let tool_calls: Vec<ToolCall> =
+            response_tool_calls(response).into_iter().cloned().collect();
         self.finish_stream_success(&response_text, usage.as_ref(), &tool_calls)
     }
 

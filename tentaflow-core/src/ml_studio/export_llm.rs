@@ -161,9 +161,7 @@ fn merge_export_state(
 fn resolve_endpoint() -> anyhow::Result<String> {
     let pool = crate::db::global_pool()
         .ok_or_else(|| anyhow::anyhow!("core service registry unavailable"))?;
-    let conn = pool
-        .read()
-        .map_err(|_| anyhow::anyhow!("core db read"))?;
+    let conn = pool.read().map_err(|_| anyhow::anyhow!("core db read"))?;
     let svcs = services_repo::services::list_by_category(&conn, "training", Some("ml-training"))?;
     let svc = svcs.into_iter().next().ok_or_else(|| {
         anyhow::anyhow!("Serwis ml-training niedostępny — uruchom go w Serwisach")
@@ -242,13 +240,17 @@ static MESH_EXPORTS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
 > = std::sync::OnceLock::new();
 
-fn mesh_exports() -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, String)>> {
+fn mesh_exports() -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, String)>>
+{
     MESH_EXPORTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// B-side: czy `export_id` to eksport zlecony tu przez mesh (router statusu).
 pub fn is_mesh_export(export_id: &str) -> bool {
-    mesh_exports().lock().map(|m| m.contains_key(export_id)).unwrap_or(false)
+    mesh_exports()
+        .lock()
+        .map(|m| m.contains_key(export_id))
+        .unwrap_or(false)
 }
 
 /// B-side (odbiorca `MlExport`): startuje eksport GGUF na LOKALNYM ml-training wg
@@ -258,15 +260,23 @@ pub async fn mesh_export_start(export_id: &str, spec_json: &str) -> anyhow::Resu
     // Fail-closed walidacja export_id (przychodzi od peera) — [A-Za-z0-9._-], ≤128.
     if export_id.is_empty()
         || export_id.len() > 128
-        || !export_id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        || !export_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
     {
         anyhow::bail!("invalid export_id");
     }
-    let spec: Value = serde_json::from_str(spec_json)
-        .map_err(|e| anyhow::anyhow!("spec_json invalid: {}", e))?;
-    let adapter_path = spec.get("adapter_path").and_then(|v| v.as_str()).unwrap_or("");
+    let spec: Value =
+        serde_json::from_str(spec_json).map_err(|e| anyhow::anyhow!("spec_json invalid: {}", e))?;
+    let adapter_path = spec
+        .get("adapter_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if adapter_path.is_empty() || !std::path::Path::new(adapter_path).is_dir() {
-        anyhow::bail!("adapter eksportu niedostępny na tym węźle: {}", adapter_path);
+        anyhow::bail!(
+            "adapter eksportu niedostępny na tym węźle: {}",
+            adapter_path
+        );
     }
     let endpoint = resolve_endpoint()?;
     let base = endpoint.trim_end_matches('/').to_string();
@@ -324,12 +334,24 @@ pub fn spawn_ft_export_mesh(
 ) {
     tokio::spawn(async move {
         if let Err(err) = run_export_mesh(
-            &iroh, &target, &model_id, &base_model, &adapter_path, &outtype, &current_metrics_json,
+            &iroh,
+            &target,
+            &model_id,
+            &base_model,
+            &adapter_path,
+            &outtype,
+            &current_metrics_json,
         )
         .await
         {
             tracing::warn!(model_id = %model_id, error = %err, "mesh GGUF export failed");
-            let merged = merge_export_state(&current_metrics_json, "failed", None, None, Some(&err.to_string()));
+            let merged = merge_export_state(
+                &current_metrics_json,
+                "failed",
+                None,
+                None,
+                Some(&err.to_string()),
+            );
             let _ = repository::update_model_metrics(&model_id, &merged);
         }
     });
@@ -355,25 +377,45 @@ async fn run_export_mesh(
     })
     .to_string();
     let start = iroh
-        .send_command_and_wait(target, MeshCommandType::MlExport { export_id: export_id.clone(), spec_json: spec }, 30)
+        .send_command_and_wait(
+            target,
+            MeshCommandType::MlExport {
+                export_id: export_id.clone(),
+                spec_json: spec,
+            },
+            30,
+        )
         .await?;
     if !start.ok {
-        anyhow::bail!(start.error.unwrap_or_else(|| "remote export start failed".into()));
+        anyhow::bail!(start
+            .error
+            .unwrap_or_else(|| "remote export start failed".into()));
     }
     let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
     loop {
         if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("mesh GGUF export timed out after {}s", JOB_TIMEOUT.as_secs());
+            anyhow::bail!(
+                "mesh GGUF export timed out after {}s",
+                JOB_TIMEOUT.as_secs()
+            );
         }
         tokio::time::sleep(POLL_INTERVAL).await;
         let resp = iroh
-            .send_command_and_wait(target, MeshCommandType::MlExportStatus { export_id: export_id.clone() }, 30)
+            .send_command_and_wait(
+                target,
+                MeshCommandType::MlExportStatus {
+                    export_id: export_id.clone(),
+                },
+                30,
+            )
             .await?;
         let status_json = match resp.payload {
             MeshCommandResponsePayload::MlExportStatusResult { status_json } => status_json,
             _ => {
                 if !resp.ok {
-                    anyhow::bail!(resp.error.unwrap_or_else(|| "mesh export status failed".into()));
+                    anyhow::bail!(resp
+                        .error
+                        .unwrap_or_else(|| "mesh export status failed".into()));
                 }
                 continue;
             }
@@ -386,7 +428,13 @@ async fn run_export_mesh(
                 let gguf_path = st
                     .gguf_path
                     .ok_or_else(|| anyhow::anyhow!("export succeeded bez gguf_path"))?;
-                let merged = merge_export_state(current_metrics_json, "succeeded", Some(&gguf_path), st.size_bytes, None);
+                let merged = merge_export_state(
+                    current_metrics_json,
+                    "succeeded",
+                    Some(&gguf_path),
+                    st.size_bytes,
+                    None,
+                );
                 repository::update_model_metrics(model_id, &merged)?;
                 return Ok(());
             }

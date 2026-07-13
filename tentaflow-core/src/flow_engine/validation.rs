@@ -677,7 +677,10 @@ fn validate_loop_regions(def: &FlowDefinition) -> Result<(), FlowValidationError
     let mut members: BTreeMap<&str, HashSet<&str>> = BTreeMap::new();
     for node in &def.nodes {
         if let Some(region_id) = node.region.as_deref() {
-            members.entry(region_id).or_default().insert(node.id.as_str());
+            members
+                .entry(region_id)
+                .or_default()
+                .insert(node.id.as_str());
         }
     }
     if members.is_empty() {
@@ -732,9 +735,7 @@ fn validate_loop_regions(def: &FlowDefinition) -> Result<(), FlowValidationError
             if from_in == to_in {
                 // Wholly inside or wholly outside. A wholly-inside edge must not
                 // join two different regions' members.
-                if from_in
-                    && region_of.get(edge.from.as_str()) != region_of.get(edge.to.as_str())
-                {
+                if from_in && region_of.get(edge.from.as_str()) != region_of.get(edge.to.as_str()) {
                     return Err(FlowValidationError::InvalidLoopRegion {
                         region_id: region_id.to_string(),
                         detail: "an internal edge connects nodes of different regions".to_string(),

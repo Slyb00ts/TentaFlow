@@ -19,16 +19,32 @@ pub const RESUMESTATUS_UNION: UnionMeta = UnionMeta {
             rust_name: "Resumed",
             wire_kind: "resumed",
             fields: &[
-                FieldMeta { key: 0, name: "mode", wire: "Enum<ResumeMode>", required: true, default: None },
-                FieldMeta { key: 1, name: "next_msg_id", wire: "u64", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "mode",
+                    wire: "Enum<ResumeMode>",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "next_msg_id",
+                    wire: "u64",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "Rejected",
             wire_kind: "rejected",
-            fields: &[
-                FieldMeta { key: 0, name: "reason", wire: "tstr", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "reason",
+                wire: "tstr",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -40,16 +56,24 @@ pub const REJECTREASON_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "VersionMismatch",
             wire_kind: "version_mismatch",
-            fields: &[
-                FieldMeta { key: 0, name: "supported", wire: "Array<u16>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "supported",
+                wire: "Array<u16>",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "AuthRequired",
             wire_kind: "auth_required",
-            fields: &[
-                FieldMeta { key: 0, name: "method", wire: "tstr", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "method",
+                wire: "tstr",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "AuthInvalid",
@@ -69,9 +93,13 @@ pub const REJECTREASON_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "CapabilityRequired",
             wire_kind: "capability_required",
-            fields: &[
-                FieldMeta { key: 0, name: "capability", wire: "tstr", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "capability",
+                wire: "tstr",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "RateLimited",
@@ -103,16 +131,24 @@ pub const RATELIMITSCOPE_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Channel",
             wire_kind: "channel",
-            fields: &[
-                FieldMeta { key: 0, name: "channel", wire: "u8", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "channel",
+                wire: "u8",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Action",
             wire_kind: "action",
-            fields: &[
-                FieldMeta { key: 0, name: "action_id", wire: "tstr", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "action_id",
+                wire: "tstr",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -130,45 +166,93 @@ pub const ACTIONSTATUS_UNION: UnionMeta = UnionMeta {
             rust_name: "Rejected",
             wire_kind: "rejected",
             fields: &[
-                FieldMeta { key: 0, name: "reason", wire: "tstr", required: true, default: None },
-                FieldMeta { key: 1, name: "error_code", wire: "u16", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "reason",
+                    wire: "tstr",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "error_code",
+                    wire: "u16",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "PermissionDenied",
             wire_kind: "permission_denied",
-            fields: &[
-                FieldMeta { key: 0, name: "required_permission", wire: "tstr", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "required_permission",
+                wire: "tstr",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "RateLimited",
             wire_kind: "rate_limited",
-            fields: &[
-                FieldMeta { key: 0, name: "retry_after_ms", wire: "u32", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "retry_after_ms",
+                wire: "u32",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "ValidationFailed",
             wire_kind: "validation_failed",
-            fields: &[
-                FieldMeta { key: 0, name: "field_errors", wire: "Array<Inline<FieldError>>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "field_errors",
+                wire: "Array<Inline<FieldError>>",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Error",
             wire_kind: "error",
             fields: &[
-                FieldMeta { key: 0, name: "error_code", wire: "u16", required: true, default: None },
-                FieldMeta { key: 1, name: "message", wire: "tstr", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "error_code",
+                    wire: "u16",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "message",
+                    wire: "tstr",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "Redirected",
             wire_kind: "redirected",
             fields: &[
-                FieldMeta { key: 0, name: "to_action_id", wire: "tstr", required: true, default: None },
-                FieldMeta { key: 1, name: "params", wire: "Array<Inline<ParamEntry>>", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "to_action_id",
+                    wire: "tstr",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "params",
+                    wire: "Array<Inline<ParamEntry>>",
+                    required: true,
+                    default: None,
+                },
             ],
         },
     ],
@@ -181,16 +265,24 @@ pub const PATHSEGMENT_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Key",
             wire_kind: "key",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "tstr", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "tstr",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Index",
             wire_kind: "index",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "u32", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "u32",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -202,16 +294,24 @@ pub const BINDREF_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Literal",
             wire_kind: "literal",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "Value", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "Value",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Bound",
             wire_kind: "bound",
-            fields: &[
-                FieldMeta { key: 0, name: "path", wire: "StatePath", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "path",
+                wire: "StatePath",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -224,50 +324,126 @@ pub const BINDSPEC_UNION: UnionMeta = UnionMeta {
             rust_name: "Text",
             wire_kind: "text",
             fields: &[
-                FieldMeta { key: 0, name: "path", wire: "StatePath", required: true, default: None },
-                FieldMeta { key: 1, name: "format", wire: "Option<Inline<ValueFormat>>", required: false, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "path",
+                    wire: "StatePath",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "format",
+                    wire: "Option<Inline<ValueFormat>>",
+                    required: false,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "Attr",
             wire_kind: "attr",
             fields: &[
-                FieldMeta { key: 0, name: "name", wire: "tstr", required: true, default: None },
-                FieldMeta { key: 1, name: "path", wire: "StatePath", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "name",
+                    wire: "tstr",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "path",
+                    wire: "StatePath",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "ClassToggle",
             wire_kind: "class_toggle",
             fields: &[
-                FieldMeta { key: 0, name: "class_name", wire: "tstr", required: true, default: None },
-                FieldMeta { key: 1, name: "path", wire: "StatePath", required: true, default: None },
-                FieldMeta { key: 2, name: "negate", wire: "bool", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "class_name",
+                    wire: "tstr",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "path",
+                    wire: "StatePath",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 2,
+                    name: "negate",
+                    wire: "bool",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "Show",
             wire_kind: "show",
             fields: &[
-                FieldMeta { key: 0, name: "path", wire: "StatePath", required: true, default: None },
-                FieldMeta { key: 1, name: "negate", wire: "bool", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "path",
+                    wire: "StatePath",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "negate",
+                    wire: "bool",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "List",
             wire_kind: "list",
             fields: &[
-                FieldMeta { key: 0, name: "path", wire: "StatePath", required: true, default: None },
-                FieldMeta { key: 1, name: "item_template_id", wire: "tstr", required: true, default: None },
-                FieldMeta { key: 2, name: "key_field", wire: "Option<tstr>", required: false, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "path",
+                    wire: "StatePath",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "item_template_id",
+                    wire: "tstr",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 2,
+                    name: "key_field",
+                    wire: "Option<tstr>",
+                    required: false,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "TwoWay",
             wire_kind: "two_way",
-            fields: &[
-                FieldMeta { key: 0, name: "path", wire: "StatePath", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "path",
+                wire: "StatePath",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -279,32 +455,72 @@ pub const FORMVALIDATOR_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "AllRequired",
             wire_kind: "all_required",
-            fields: &[
-                FieldMeta { key: 0, name: "field_ids", wire: "Array<tstr>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "field_ids",
+                wire: "Array<tstr>",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "AnyRequired",
             wire_kind: "any_required",
             fields: &[
-                FieldMeta { key: 0, name: "field_ids", wire: "Array<tstr>", required: true, default: None },
-                FieldMeta { key: 1, name: "error_message", wire: "BindRef", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "field_ids",
+                    wire: "Array<tstr>",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "error_message",
+                    wire: "BindRef",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "Match",
             wire_kind: "match",
             fields: &[
-                FieldMeta { key: 0, name: "field_a", wire: "tstr", required: true, default: None },
-                FieldMeta { key: 1, name: "field_b", wire: "tstr", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "field_a",
+                    wire: "tstr",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "field_b",
+                    wire: "tstr",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "Custom",
             wire_kind: "custom",
             fields: &[
-                FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
-                FieldMeta { key: 1, name: "params", wire: "Option<CborMap>", required: false, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "id",
+                    wire: "tstr",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "params",
+                    wire: "Option<CborMap>",
+                    required: false,
+                    default: None,
+                },
             ],
         },
     ],
@@ -327,9 +543,13 @@ pub const FAILUREPOLICY_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Custom",
             wire_kind: "custom",
-            fields: &[
-                FieldMeta { key: 0, name: "action", wire: "Inline<LocalAction>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "action",
+                wire: "Inline<LocalAction>",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -341,124 +561,268 @@ pub const LOCALACTION_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "ShowModal",
             wire_kind: "show_modal",
-            fields: &[
-                FieldMeta { key: 0, name: "slot_id", wire: "tstr", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "slot_id",
+                wire: "tstr",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "HideModal",
             wire_kind: "hide_modal",
-            fields: &[
-                FieldMeta { key: 0, name: "slot_id", wire: "tstr", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "slot_id",
+                wire: "tstr",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "ToggleSlot",
             wire_kind: "toggle_slot",
-            fields: &[
-                FieldMeta { key: 0, name: "slot_id", wire: "tstr", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "slot_id",
+                wire: "tstr",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "SetState",
             wire_kind: "set_state",
             fields: &[
-                FieldMeta { key: 0, name: "path", wire: "StatePath", required: true, default: None },
-                FieldMeta { key: 1, name: "value", wire: "Value", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "path",
+                    wire: "StatePath",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "value",
+                    wire: "Value",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "DeleteState",
             wire_kind: "delete_state",
-            fields: &[
-                FieldMeta { key: 0, name: "path", wire: "StatePath", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "path",
+                wire: "StatePath",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Toggle",
             wire_kind: "toggle",
-            fields: &[
-                FieldMeta { key: 0, name: "path", wire: "StatePath", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "path",
+                wire: "StatePath",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Increment",
             wire_kind: "increment",
             fields: &[
-                FieldMeta { key: 0, name: "path", wire: "StatePath", required: true, default: None },
-                FieldMeta { key: 1, name: "delta", wire: "i64", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "path",
+                    wire: "StatePath",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "delta",
+                    wire: "i64",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "Navigate",
             wire_kind: "navigate",
-            fields: &[
-                FieldMeta { key: 0, name: "panel_id", wire: "tstr", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "panel_id",
+                wire: "tstr",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Focus",
             wire_kind: "focus",
-            fields: &[
-                FieldMeta { key: 0, name: "component_id", wire: "tstr", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "component_id",
+                wire: "tstr",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Scroll",
             wire_kind: "scroll",
             fields: &[
-                FieldMeta { key: 0, name: "component_id", wire: "tstr", required: true, default: None },
-                FieldMeta { key: 1, name: "behavior", wire: "Enum<ScrollBehavior>", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "component_id",
+                    wire: "tstr",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "behavior",
+                    wire: "Enum<ScrollBehavior>",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "Copy",
             wire_kind: "copy",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "tstr", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "tstr",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Confirm",
             wire_kind: "confirm",
             fields: &[
-                FieldMeta { key: 0, name: "title", wire: "tstr", required: true, default: None },
-                FieldMeta { key: 1, name: "message", wire: "tstr", required: true, default: None },
-                FieldMeta { key: 2, name: "destructive", wire: "bool", required: true, default: None },
-                FieldMeta { key: 3, name: "then", wire: "Inline<Handler>", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "title",
+                    wire: "tstr",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "message",
+                    wire: "tstr",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 2,
+                    name: "destructive",
+                    wire: "bool",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 3,
+                    name: "then",
+                    wire: "Inline<Handler>",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "Validate",
             wire_kind: "validate",
             fields: &[
-                FieldMeta { key: 0, name: "field_component_id", wire: "tstr", required: true, default: None },
-                FieldMeta { key: 1, name: "rules", wire: "Array<Inline<ValidationRule>>", required: true, default: None },
-                FieldMeta { key: 2, name: "on_invalid", wire: "Inline<LocalAction>", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "field_component_id",
+                    wire: "tstr",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "rules",
+                    wire: "Array<Inline<ValidationRule>>",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 2,
+                    name: "on_invalid",
+                    wire: "Inline<LocalAction>",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "Debounce",
             wire_kind: "debounce",
             fields: &[
-                FieldMeta { key: 0, name: "ms", wire: "u32", required: true, default: None },
-                FieldMeta { key: 1, name: "then", wire: "Inline<Handler>", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "ms",
+                    wire: "u32",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "then",
+                    wire: "Inline<Handler>",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "Sequence",
             wire_kind: "sequence",
-            fields: &[
-                FieldMeta { key: 0, name: "steps", wire: "Array<Inline<Handler>>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "steps",
+                wire: "Array<Inline<Handler>>",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Conditional",
             wire_kind: "conditional",
             fields: &[
-                FieldMeta { key: 0, name: "when", wire: "Inline<StateCondition>", required: true, default: None },
-                FieldMeta { key: 1, name: "then", wire: "Inline<Handler>", required: true, default: None },
-                FieldMeta { key: 2, name: "else_branch", wire: "Option<Inline<Handler>>", required: false, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "when",
+                    wire: "Inline<StateCondition>",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "then",
+                    wire: "Inline<Handler>",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 2,
+                    name: "else_branch",
+                    wire: "Option<Inline<Handler>>",
+                    required: false,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
@@ -476,28 +840,80 @@ pub const HANDLER_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Local",
             wire_kind: "local",
-            fields: &[
-                FieldMeta { key: 0, name: "action", wire: "Inline<LocalAction>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "action",
+                wire: "Inline<LocalAction>",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Backend",
             wire_kind: "backend",
             fields: &[
-                FieldMeta { key: 0, name: "action_id", wire: "tstr", required: true, default: None },
-                FieldMeta { key: 1, name: "params", wire: "CborMap", required: true, default: None },
-                FieldMeta { key: 2, name: "optimistic", wire: "Option<Array<Inline<PatchOp>>>", required: false, default: None },
-                FieldMeta { key: 3, name: "on_failure", wire: "Inline<FailurePolicy>", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "action_id",
+                    wire: "tstr",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "params",
+                    wire: "CborMap",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 2,
+                    name: "optimistic",
+                    wire: "Option<Array<Inline<PatchOp>>>",
+                    required: false,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 3,
+                    name: "on_failure",
+                    wire: "Inline<FailurePolicy>",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "Both",
             wire_kind: "both",
             fields: &[
-                FieldMeta { key: 0, name: "action_id", wire: "tstr", required: true, default: None },
-                FieldMeta { key: 1, name: "params", wire: "CborMap", required: true, default: None },
-                FieldMeta { key: 2, name: "optimistic", wire: "Array<Inline<PatchOp>>", required: true, default: None },
-                FieldMeta { key: 3, name: "on_failure", wire: "Inline<FailurePolicy>", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "action_id",
+                    wire: "tstr",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "params",
+                    wire: "CborMap",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 2,
+                    name: "optimistic",
+                    wire: "Array<Inline<PatchOp>>",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 3,
+                    name: "on_failure",
+                    wire: "Inline<FailurePolicy>",
+                    required: true,
+                    default: None,
+                },
             ],
         },
     ],
@@ -511,18 +927,54 @@ pub const ICONREF_UNION: UnionMeta = UnionMeta {
             rust_name: "Named",
             wire_kind: "named",
             fields: &[
-                FieldMeta { key: 0, name: "name", wire: "Enum<IconName>", required: true, default: None },
-                FieldMeta { key: 1, name: "size", wire: "Option<Enum<IconSize>>", required: false, default: None },
-                FieldMeta { key: 2, name: "tone", wire: "Option<Enum<Tone>>", required: false, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "name",
+                    wire: "Enum<IconName>",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "size",
+                    wire: "Option<Enum<IconSize>>",
+                    required: false,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 2,
+                    name: "tone",
+                    wire: "Option<Enum<Tone>>",
+                    required: false,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "Asset",
             wire_kind: "asset",
             fields: &[
-                FieldMeta { key: 0, name: "ref_", wire: "tstr", required: true, default: None },
-                FieldMeta { key: 1, name: "size_px", wire: "Option<u16>", required: false, default: None },
-                FieldMeta { key: 2, name: "alt", wire: "Option<tstr>", required: false, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "ref_",
+                    wire: "tstr",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "size_px",
+                    wire: "Option<u16>",
+                    required: false,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 2,
+                    name: "alt",
+                    wire: "Option<tstr>",
+                    required: false,
+                    default: None,
+                },
             ],
         },
     ],
@@ -535,23 +987,35 @@ pub const AVATARREF_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Image",
             wire_kind: "image",
-            fields: &[
-                FieldMeta { key: 0, name: "ref_", wire: "tstr", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "ref_",
+                wire: "tstr",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Initials",
             wire_kind: "initials",
-            fields: &[
-                FieldMeta { key: 0, name: "initials", wire: "tstr", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "initials",
+                wire: "tstr",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Icon",
             wire_kind: "icon",
-            fields: &[
-                FieldMeta { key: 0, name: "icon", wire: "Inline<IconRef>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "icon",
+                wire: "Inline<IconRef>",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -563,30 +1027,46 @@ pub const SELECTVALUE_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Text",
             wire_kind: "tstr",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "tstr", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "tstr",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "UInt",
             wire_kind: "u32",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "u32", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "u32",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Int",
             wire_kind: "i32",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "i32", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "i32",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Bool",
             wire_kind: "bool",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "bool", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "bool",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -613,44 +1093,68 @@ pub const DIMENSIONTOKEN_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Px",
             wire_kind: "px",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "u32", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "u32",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Vh",
             wire_kind: "vh",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "u8", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "u8",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Vw",
             wire_kind: "vw",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "u8", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "u8",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Fr",
             wire_kind: "fr",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "u8", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "u8",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Percent",
             wire_kind: "percent",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "u8", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "u8",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Spacing",
             wire_kind: "spacing",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "Enum<Spacing>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "Enum<Spacing>",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -702,9 +1206,13 @@ pub const ASPECTRATIO_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Custom",
             wire_kind: "custom",
-            fields: &[
-                FieldMeta { key: 0, name: "ratio", wire: "f64", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "ratio",
+                wire: "f64",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -731,16 +1239,24 @@ pub const TABLECOLUMNWIDTH_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Px",
             wire_kind: "px",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "u32", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "u32",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Fr",
             wire_kind: "fr",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "u8", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "u8",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -753,27 +1269,73 @@ pub const HEATMAPSCALE_UNION: UnionMeta = UnionMeta {
             rust_name: "Linear",
             wire_kind: "linear",
             fields: &[
-                FieldMeta { key: 0, name: "min", wire: "f64", required: true, default: None },
-                FieldMeta { key: 1, name: "max", wire: "f64", required: true, default: None },
-                FieldMeta { key: 2, name: "color_from", wire: "Enum<Tone>", required: true, default: None },
-                FieldMeta { key: 3, name: "color_to", wire: "Enum<Tone>", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "min",
+                    wire: "f64",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "max",
+                    wire: "f64",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 2,
+                    name: "color_from",
+                    wire: "Enum<Tone>",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 3,
+                    name: "color_to",
+                    wire: "Enum<Tone>",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "Logarithmic",
             wire_kind: "logarithmic",
             fields: &[
-                FieldMeta { key: 0, name: "min", wire: "f64", required: true, default: None },
-                FieldMeta { key: 1, name: "max", wire: "f64", required: true, default: None },
-                FieldMeta { key: 2, name: "base", wire: "f64", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "min",
+                    wire: "f64",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "max",
+                    wire: "f64",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 2,
+                    name: "base",
+                    wire: "f64",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "Categorical",
             wire_kind: "categorical",
-            fields: &[
-                FieldMeta { key: 0, name: "buckets", wire: "Array<Inline<HeatmapBucket>>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "buckets",
+                wire: "Array<Inline<HeatmapBucket>>",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -815,9 +1377,13 @@ pub const DATEPRESETRESOLVE_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Custom",
             wire_kind: "custom",
-            fields: &[
-                FieldMeta { key: 0, name: "offset_days", wire: "i32", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "offset_days",
+                wire: "i32",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -849,9 +1415,13 @@ pub const BORDERTOKEN_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Accent",
             wire_kind: "accent",
-            fields: &[
-                FieldMeta { key: 0, name: "tone", wire: "Enum<Tone>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "tone",
+                wire: "Enum<Tone>",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -863,16 +1433,24 @@ pub const SPACEVALUE_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Token",
             wire_kind: "token",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "Enum<Spacing>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "Enum<Spacing>",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Px",
             wire_kind: "px",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "u16", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "u16",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -884,16 +1462,24 @@ pub const RADIUSVALUE_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Token",
             wire_kind: "token",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "Enum<RadiusToken>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "Enum<RadiusToken>",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Px",
             wire_kind: "px",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "u16", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "u16",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -905,16 +1491,24 @@ pub const CONTAINERWIDTH_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Token",
             wire_kind: "token",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "Enum<Breakpoint>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "Enum<Breakpoint>",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Px",
             wire_kind: "px",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "u16", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "u16",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -931,16 +1525,24 @@ pub const SPLITSIZE_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Px",
             wire_kind: "px",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "u32", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "u32",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Percent",
             wire_kind: "percent",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "f64", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "f64",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -972,16 +1574,24 @@ pub const GRIDCOL_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Fr",
             wire_kind: "fr",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "u8", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "u8",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Px",
             wire_kind: "px",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "u32", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "u32",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -993,16 +1603,24 @@ pub const GRIDTRACK_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Equal",
             wire_kind: "equal",
-            fields: &[
-                FieldMeta { key: 0, name: "count", wire: "u8", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "count",
+                wire: "u8",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Explicit",
             wire_kind: "explicit",
-            fields: &[
-                FieldMeta { key: 0, name: "cols", wire: "Array<Inline<GridCol>>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "cols",
+                wire: "Array<Inline<GridCol>>",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -1014,9 +1632,13 @@ pub const PATCHOPKIND_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Set",
             wire_kind: "set",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "Value", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "Value",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Delete",
@@ -1026,45 +1648,77 @@ pub const PATCHOPKIND_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "AppendArray",
             wire_kind: "append_array",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "Value", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "Value",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "PrependArray",
             wire_kind: "prepend_array",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "Value", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "Value",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "InsertArray",
             wire_kind: "insert_array",
             fields: &[
-                FieldMeta { key: 0, name: "index", wire: "u32", required: true, default: None },
-                FieldMeta { key: 1, name: "value", wire: "Value", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "index",
+                    wire: "u32",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "value",
+                    wire: "Value",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "RemoveArray",
             wire_kind: "remove_array",
-            fields: &[
-                FieldMeta { key: 0, name: "index", wire: "u32", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "index",
+                wire: "u32",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "MergeMap",
             wire_kind: "merge_map",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "CborMap", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "CborMap",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Increment",
             wire_kind: "increment",
-            fields: &[
-                FieldMeta { key: 0, name: "delta", wire: "i64", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "delta",
+                wire: "i64",
+                required: true,
+                default: None,
+            }],
         },
     ],
 };
@@ -1081,37 +1735,57 @@ pub const VALIDATIONRULE_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "MinLength",
             wire_kind: "min_length",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "u16", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "u16",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "MaxLength",
             wire_kind: "max_length",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "u16", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "u16",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Min",
             wire_kind: "min",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "f64", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "f64",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Max",
             wire_kind: "max",
-            fields: &[
-                FieldMeta { key: 0, name: "value", wire: "f64", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "value",
+                wire: "f64",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Pattern",
             wire_kind: "pattern",
-            fields: &[
-                FieldMeta { key: 0, name: "regex", wire: "tstr", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "regex",
+                wire: "tstr",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Email",
@@ -1121,9 +1795,13 @@ pub const VALIDATIONRULE_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Url",
             wire_kind: "url",
-            fields: &[
-                FieldMeta { key: 0, name: "schemes", wire: "Array<tstr>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "schemes",
+                wire: "Array<tstr>",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Iban",
@@ -1133,9 +1811,13 @@ pub const VALIDATIONRULE_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "Phone",
             wire_kind: "phone",
-            fields: &[
-                FieldMeta { key: 0, name: "region", wire: "Option<tstr>", required: false, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "region",
+                wire: "Option<tstr>",
+                required: false,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Uuid",
@@ -1146,16 +1828,40 @@ pub const VALIDATIONRULE_UNION: UnionMeta = UnionMeta {
             rust_name: "DateRange",
             wire_kind: "date_range",
             fields: &[
-                FieldMeta { key: 0, name: "min", wire: "Option<tstr>", required: false, default: None },
-                FieldMeta { key: 1, name: "max", wire: "Option<tstr>", required: false, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "min",
+                    wire: "Option<tstr>",
+                    required: false,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "max",
+                    wire: "Option<tstr>",
+                    required: false,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "Custom",
             wire_kind: "custom",
             fields: &[
-                FieldMeta { key: 0, name: "id", wire: "tstr", required: true, default: None },
-                FieldMeta { key: 1, name: "params", wire: "Option<CborMap>", required: false, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "id",
+                    wire: "tstr",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "params",
+                    wire: "Option<CborMap>",
+                    required: false,
+                    default: None,
+                },
             ],
         },
     ],
@@ -1168,31 +1874,63 @@ pub const STATECONDITION_UNION: UnionMeta = UnionMeta {
         VariantMeta {
             rust_name: "IsTruthy",
             wire_kind: "is_truthy",
-            fields: &[
-                FieldMeta { key: 0, name: "path", wire: "StatePath", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "path",
+                wire: "StatePath",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "IsFalsy",
             wire_kind: "is_falsy",
-            fields: &[
-                FieldMeta { key: 0, name: "path", wire: "StatePath", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "path",
+                wire: "StatePath",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Equals",
             wire_kind: "equals",
             fields: &[
-                FieldMeta { key: 0, name: "path", wire: "StatePath", required: true, default: None },
-                FieldMeta { key: 1, name: "value", wire: "Value", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "path",
+                    wire: "StatePath",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "value",
+                    wire: "Value",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "NotEquals",
             wire_kind: "not_equals",
             fields: &[
-                FieldMeta { key: 0, name: "path", wire: "StatePath", required: true, default: None },
-                FieldMeta { key: 1, name: "value", wire: "Value", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "path",
+                    wire: "StatePath",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "value",
+                    wire: "Value",
+                    required: true,
+                    default: None,
+                },
             ],
         },
     ],
@@ -1206,58 +1944,98 @@ pub const VALUEFORMAT_UNION: UnionMeta = UnionMeta {
             rust_name: "Number",
             wire_kind: "number",
             fields: &[
-                FieldMeta { key: 0, name: "decimals", wire: "u8", required: true, default: None },
-                FieldMeta { key: 1, name: "thousands_sep", wire: "bool", required: true, default: None },
+                FieldMeta {
+                    key: 0,
+                    name: "decimals",
+                    wire: "u8",
+                    required: true,
+                    default: None,
+                },
+                FieldMeta {
+                    key: 1,
+                    name: "thousands_sep",
+                    wire: "bool",
+                    required: true,
+                    default: None,
+                },
             ],
         },
         VariantMeta {
             rust_name: "Currency",
             wire_kind: "currency",
-            fields: &[
-                FieldMeta { key: 0, name: "code", wire: "tstr", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "code",
+                wire: "tstr",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Percent",
             wire_kind: "percent",
-            fields: &[
-                FieldMeta { key: 0, name: "decimals", wire: "u8", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "decimals",
+                wire: "u8",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Bytes",
             wire_kind: "bytes",
-            fields: &[
-                FieldMeta { key: 0, name: "base", wire: "Enum<BytesBase>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "base",
+                wire: "Enum<BytesBase>",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Duration",
             wire_kind: "duration",
-            fields: &[
-                FieldMeta { key: 0, name: "style", wire: "Enum<DurationStyle>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "style",
+                wire: "Enum<DurationStyle>",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Date",
             wire_kind: "date",
-            fields: &[
-                FieldMeta { key: 0, name: "style", wire: "Enum<DateStyle>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "style",
+                wire: "Enum<DateStyle>",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Time",
             wire_kind: "time",
-            fields: &[
-                FieldMeta { key: 0, name: "style", wire: "Enum<TimeStyle>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "style",
+                wire: "Enum<TimeStyle>",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "DateTime",
             wire_kind: "datetime",
-            fields: &[
-                FieldMeta { key: 0, name: "style", wire: "Enum<DateTimeStyle>", required: true, default: None },
-            ],
+            fields: &[FieldMeta {
+                key: 0,
+                name: "style",
+                wire: "Enum<DateTimeStyle>",
+                required: true,
+                default: None,
+            }],
         },
         VariantMeta {
             rust_name: "Relative",

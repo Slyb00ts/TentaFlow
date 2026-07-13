@@ -37,8 +37,12 @@ use futures::StreamExt;
 use serde_json::json;
 
 use tentaflow_core::agents::{AgentService, AgentServiceSlot};
-use tentaflow_core::db::{init as db_init, models::AgentParams, models::SkillParams, repository, DbPool};
+use tentaflow_core::db::seed::agent_run_flow_json;
+use tentaflow_core::db::{
+    init as db_init, models::AgentParams, models::SkillParams, repository, DbPool,
+};
 use tentaflow_core::flow_engine::cache::CompiledFlow;
+use tentaflow_core::flow_engine::dispatchers::{LlmDispatcher, LlmRequest, LlmResponse};
 use tentaflow_core::flow_engine::dispatchers_impl::ConversationHistoryImpl;
 use tentaflow_core::flow_engine::envelope::{
     ChatRole, FinishReason, FlowEnvelope, FlowValue, LlmStreamChunk, LlmToolCall, TokenUsage,
@@ -51,9 +55,7 @@ use tentaflow_core::flow_engine::node_adapters::{
     CompactContextNodeAdapter, ConversationHistoryNodeAdapter, LlmNodeAdapter, OutputNodeAdapter,
     PersistTurnNodeAdapter, ToolExecNodeAdapter, TriggerNodeAdapter,
 };
-use tentaflow_core::flow_engine::dispatchers::{LlmDispatcher, LlmRequest, LlmResponse};
 use tentaflow_core::flow_engine::validation::validate;
-use tentaflow_core::db::seed::agent_run_flow_json;
 
 // -----------------------------------------------------------------------------
 // Layer 1 — the seeded single graph compiles and validates.
@@ -94,12 +96,8 @@ fn seeded_agent_run_graph_validates_and_compiles_with_region() {
     validate(&def, &reg).expect("seeded Agent Run must pass R1–R11");
 
     // Compile resolves the single inline loop region.
-    let compiled = CompiledFlow::from_json(
-        "00000000-0000-4000-8000-000000000012",
-        &json,
-        &reg,
-    )
-    .expect("seeded Agent Run must compile");
+    let compiled = CompiledFlow::from_json("00000000-0000-4000-8000-000000000012", &json, &reg)
+        .expect("seeded Agent Run must compile");
 
     assert_eq!(compiled.regions.len(), 1, "exactly one inline loop region");
     let region = &compiled.regions[0];
@@ -109,7 +107,10 @@ fn seeded_agent_run_graph_validates_and_compiles_with_region() {
     // (loop_back source + edge to persist_turn).
     let entry_def = compiled.execution_order[region.entry_pos];
     let exit_def = compiled.execution_order[region.exit_pos];
-    assert_eq!(compiled.definition.nodes[entry_def].node_type, "compact_context");
+    assert_eq!(
+        compiled.definition.nodes[entry_def].node_type,
+        "compact_context"
+    );
     assert_eq!(compiled.definition.nodes[exit_def].node_type, "tool_exec");
 
     // The region body is exactly the three marked nodes.
@@ -225,8 +226,9 @@ fn test_db() -> DbPool {
 
 fn service_slot(pool: DbPool) -> AgentServiceSlot {
     let cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(&[0u8; 32]));
-    let addon_manager =
-        Arc::new(tentaflow_core::addon::AddonManager::new(pool.clone(), cipher).expect("addon mgr"));
+    let addon_manager = Arc::new(
+        tentaflow_core::addon::AddonManager::new(pool.clone(), cipher).expect("addon mgr"),
+    );
     let svc = Arc::new(AgentService::new(pool, addon_manager));
     Arc::new(parking_lot::RwLock::new(Some(svc)))
 }
@@ -322,9 +324,13 @@ async fn region_runs_two_iterations_persists_turn_and_stops_structurally() {
     initial
         .context
         .messages
-        .push(tentaflow_core::flow_engine::envelope::ChatMessage::user("do the thing"));
+        .push(tentaflow_core::flow_engine::envelope::ChatMessage::user(
+            "do the thing",
+        ));
     initial.meta.insert("agent_id".into(), json!("agent-1"));
-    initial.meta.insert("model".into(), json!("scripted-test-model"));
+    initial
+        .meta
+        .insert("model".into(), json!("scripted-test-model"));
     initial.meta.insert(
         "harness_tools".into(),
         json!([{
@@ -392,8 +398,15 @@ async fn region_runs_two_iterations_persists_turn_and_stops_structurally() {
         .iter()
         .filter(|m| m.role == ChatRole::Assistant)
         .collect();
-    assert!(assistants[0].tool_calls.as_ref().is_some_and(|c| !c.is_empty()));
-    assert!(assistants[1].tool_calls.as_ref().map(|c| c.is_empty()).unwrap_or(true));
+    assert!(assistants[0]
+        .tool_calls
+        .as_ref()
+        .is_some_and(|c| !c.is_empty()));
+    assert!(assistants[1]
+        .tool_calls
+        .as_ref()
+        .map(|c| c.is_empty())
+        .unwrap_or(true));
     assert_eq!(assistants[1].text(), Some("final answer"));
 
     // The tool message carries the real core.skill_view output (proves a real
@@ -467,14 +480,12 @@ impl LlmDispatcher for ScriptedStreamingLlm {
                     ..Default::default()
                 },
                 LlmStreamChunk {
-                    tool_calls: vec![
-                        ToolCallDelta {
-                            index: 0,
-                            id: Some("call-1".into()),
-                            function_name: Some("core.skill_view".into()),
-                            arguments_delta: Some(r#"{"name":"do-thing"}"#.into()),
-                        },
-                    ],
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("call-1".into()),
+                        function_name: Some("core.skill_view".into()),
+                        arguments_delta: Some(r#"{"name":"do-thing"}"#.into()),
+                    }],
                     finish_reason: Some(FinishReason::ToolCalls),
                     ..Default::default()
                 },
@@ -567,9 +578,13 @@ async fn region_streams_tokens_live_persists_turn_and_stops_structurally() {
     initial
         .context
         .messages
-        .push(tentaflow_core::flow_engine::envelope::ChatMessage::user("do the thing"));
+        .push(tentaflow_core::flow_engine::envelope::ChatMessage::user(
+            "do the thing",
+        ));
     initial.meta.insert("agent_id".into(), json!("agent-1"));
-    initial.meta.insert("model".into(), json!("scripted-test-model"));
+    initial
+        .meta
+        .insert("model".into(), json!("scripted-test-model"));
     initial.meta.insert(
         "harness_tools".into(),
         json!([{
@@ -635,7 +650,11 @@ async fn region_streams_tokens_live_persists_turn_and_stops_structurally() {
     );
 
     // The scripted llm streamed exactly twice (turn 1 tool call + turn 2 final).
-    assert_eq!(llm.calls.load(Ordering::SeqCst), 2, "region must run 2 iterations");
+    assert_eq!(
+        llm.calls.load(Ordering::SeqCst),
+        2,
+        "region must run 2 iterations"
+    );
 
     // The outcome carries the fully accumulated turn:
     // user → assistant+tool_calls → tool → assistant(final).

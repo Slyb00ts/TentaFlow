@@ -159,7 +159,10 @@ fn target_to_wire(rec: BenchmarkTargetRecord) -> TargetWire {
     }
 }
 
-fn benchmark_to_wire(record: BenchmarkRecord, targets: Vec<BenchmarkTargetRecord>) -> BenchmarkWire {
+fn benchmark_to_wire(
+    record: BenchmarkRecord,
+    targets: Vec<BenchmarkTargetRecord>,
+) -> BenchmarkWire {
     BenchmarkWire {
         id: record.id,
         name: record.name,
@@ -268,9 +271,15 @@ macro_rules! register_benchmark_variant {
     };
 }
 
-register_benchmark_variant!("BenchmarkListRequest", "tentaflow_ws_handler_benchmark_list");
+register_benchmark_variant!(
+    "BenchmarkListRequest",
+    "tentaflow_ws_handler_benchmark_list"
+);
 register_benchmark_variant!("BenchmarkGetRequest", "tentaflow_ws_handler_benchmark_get");
-register_benchmark_variant!("BenchmarkSaveRequest", "tentaflow_ws_handler_benchmark_save");
+register_benchmark_variant!(
+    "BenchmarkSaveRequest",
+    "tentaflow_ws_handler_benchmark_save"
+);
 register_benchmark_variant!(
     "BenchmarkDeleteRequest",
     "tentaflow_ws_handler_benchmark_delete"
@@ -302,8 +311,8 @@ register_benchmark_variant!(
 
 fn list_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let items = repository::list_benchmarks(&ctx.state.db, &org.org_id)
-        .map_err(|e| db_error("list", e))?;
+    let items =
+        repository::list_benchmarks(&ctx.state.db, &org.org_id).map_err(|e| db_error("list", e))?;
     let benchmarks = items.into_iter().map(item_to_wire).collect();
     Ok(MessageBody::BenchmarkBody(BenchmarkPayload::ListResponse {
         benchmarks,
@@ -539,11 +548,12 @@ fn list_runs_v1(ctx: &HandlerContext, benchmark_id: &str) -> Result<MessageBody,
 
 fn recent_runs_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let runs = repository::list_recent_benchmark_runs(&ctx.state.db, &org.org_id, RECENT_RUNS_LIMIT)
-        .map_err(|e| db_error("recent_runs", e))?
-        .iter()
-        .map(|(run, name)| run_to_wire(run, Some(name.clone())))
-        .collect();
+    let runs =
+        repository::list_recent_benchmark_runs(&ctx.state.db, &org.org_id, RECENT_RUNS_LIMIT)
+            .map_err(|e| db_error("recent_runs", e))?
+            .iter()
+            .map(|(run, name)| run_to_wire(run, Some(name.clone())))
+            .collect();
     Ok(MessageBody::BenchmarkBody(
         BenchmarkPayload::RecentRunsResponse { runs },
     ))

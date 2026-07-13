@@ -160,8 +160,34 @@ impl StreamingBus {
     }
 
     pub fn unsubscribe(&self, camera_id: &str, stream_id: &StreamId) {
+        let mut empty = false;
         if let Some(mut entries) = self.inner.get_mut(camera_id) {
             entries.retain(|e| &e.stream_id != stream_id);
+            empty = entries.is_empty();
+        }
+        // Drop the now-empty key so `list_subscribers` and the DashMap key
+        // count are exact. `remove_if` guards against a concurrent subscribe
+        // that repopulated the Vec between the guard release and here.
+        if empty {
+            self.inner.remove_if(camera_id, |_, v| v.is_empty());
+        }
+    }
+
+    /// Removes subscribers whose receiver has been dropped (`tx.is_closed()`),
+    /// then drops the key if it became empty. This decouples liveness from
+    /// frame flow: `broadcast`'s prune only runs while frames are published
+    /// AND `try_send` observes `Closed`, so an idle camera with a stale
+    /// subscriber would otherwise never shrink — keeping the on-demand RGB
+    /// convert branch alive long after the viewer disconnected. Called from
+    /// `list_subscribers` so the RTSP session tick sees an accurate live set.
+    fn prune_dead(&self, camera_id: &str) {
+        let mut empty = false;
+        if let Some(mut entries) = self.inner.get_mut(camera_id) {
+            entries.retain(|e| !e.tx.is_closed());
+            empty = entries.is_empty();
+        }
+        if empty {
+            self.inner.remove_if(camera_id, |_, v| v.is_empty());
         }
     }
 
@@ -236,6 +262,9 @@ impl StreamingBus {
     }
 
     pub fn list_subscribers(&self, camera_id: &str) -> Vec<StreamId> {
+        // Prune dropped receivers first so a leaked-but-dead subscriber never
+        // reports as live and keeps an on-demand convert branch running.
+        self.prune_dead(camera_id);
         self.inner
             .get(camera_id)
             .map(|v| v.iter().map(|e| e.stream_id.clone()).collect())
@@ -427,5 +456,51 @@ mod tests {
         bus.broadcast("cam1", RawFrameRef::new(), mk_meta("cam1"));
         let remaining = bus.list_subscribers("cam1");
         assert!(!remaining.contains(&sid));
+    }
+
+    #[tokio::test]
+    async fn test_list_subscribers_prunes_dropped_without_broadcast() {
+        let bus = StreamingBus::new();
+        let sub = bus.subscribe("cam1", StreamFilter::default());
+        let sid = sub.stream_id.clone();
+        assert_eq!(bus.list_subscribers("cam1"), vec![sid]);
+        // Viewer disconnects: the receiver drops. No frames flow afterwards
+        // (idle camera), so ONLY the is_closed prune can reflect the death.
+        drop(sub);
+        assert!(
+            bus.list_subscribers("cam1").is_empty(),
+            "dead subscriber must be pruned without a broadcast"
+        );
+        // The empty key is removed, so the map is truly empty.
+        assert!(bus.inner.get("cam1").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_subscribers_prunes_only_dead_entry() {
+        let bus = StreamingBus::new();
+        let live = bus.subscribe("cam1", StreamFilter::default());
+        let dead = bus.subscribe("cam1", StreamFilter::default());
+        let live_id = live.stream_id.clone();
+        let dead_id = dead.stream_id.clone();
+        drop(dead);
+        let remaining = bus.list_subscribers("cam1");
+        assert_eq!(remaining, vec![live_id]);
+        assert!(!remaining.contains(&dead_id));
+        // Keep `live` alive until after the assertion.
+        drop(live);
+    }
+
+    #[tokio::test]
+    async fn test_double_unsubscribe_no_panic() {
+        let bus = StreamingBus::new();
+        let sub = bus.subscribe("cam1", StreamFilter::default());
+        let sid = sub.stream_id.clone();
+        bus.unsubscribe("cam1", &sid);
+        // Second unsubscribe on the same id is a no-op, not a panic.
+        bus.unsubscribe("cam1", &sid);
+        // Unknown camera is also fine.
+        bus.unsubscribe("ghost", &sid);
+        assert!(bus.list_subscribers("cam1").is_empty());
+        assert!(bus.inner.get("cam1").is_none());
     }
 }

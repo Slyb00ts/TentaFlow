@@ -452,16 +452,12 @@ impl AddonStateStore {
                             Some(v) => v,
                             None => return Err(StateStoreError::AddonQuotaExceeded),
                         };
-                        let post_bytes = match projected_bytes(
-                            bytes_now,
-                            old_size.unwrap_or(0),
-                            new_size,
-                        ) {
-                            Some(v) => v,
-                            None => return Err(StateStoreError::AddonQuotaExceeded),
-                        };
-                        if post_entries > MAX_ENTRIES_PER_ADDON
-                            || post_bytes > MAX_BYTES_PER_ADDON
+                        let post_bytes =
+                            match projected_bytes(bytes_now, old_size.unwrap_or(0), new_size) {
+                                Some(v) => v,
+                                None => return Err(StateStoreError::AddonQuotaExceeded),
+                            };
+                        if post_entries > MAX_ENTRIES_PER_ADDON || post_bytes > MAX_BYTES_PER_ADDON
                         {
                             return Err(StateStoreError::AddonQuotaExceeded);
                         }
@@ -553,8 +549,8 @@ impl AddonStateStore {
         loop {
             let entries_now = entry_count.load(Ordering::Relaxed);
             let bytes_now = byte_count.load(Ordering::Relaxed);
-            let fits_entries = entries_now.saturating_add(incoming_entry_delta)
-                <= MAX_ENTRIES_PER_ADDON;
+            let fits_entries =
+                entries_now.saturating_add(incoming_entry_delta) <= MAX_ENTRIES_PER_ADDON;
             // Projected bytes after the write, accounting for the replaced old
             // value: a shrinking replace can already fit without eviction.
             let fits_bytes = match projected_bytes(bytes_now, old_size, new_size) {
@@ -993,9 +989,12 @@ mod tests {
     #[test]
     fn list_with_and_without_prefix() {
         let s = store();
-        s.set("a", "robot:1", b"x".to_vec(), Tier::Ephemeral).unwrap();
-        s.set("a", "robot:2", b"yy".to_vec(), Tier::Durable).unwrap();
-        s.set("a", "user:1", b"zzz".to_vec(), Tier::Ephemeral).unwrap();
+        s.set("a", "robot:1", b"x".to_vec(), Tier::Ephemeral)
+            .unwrap();
+        s.set("a", "robot:2", b"yy".to_vec(), Tier::Durable)
+            .unwrap();
+        s.set("a", "user:1", b"zzz".to_vec(), Tier::Ephemeral)
+            .unwrap();
 
         let all = s.list("a", None);
         assert_eq!(all.len(), 3);
@@ -1016,8 +1015,10 @@ mod tests {
     #[test]
     fn per_addon_isolation() {
         let s = store();
-        s.set("addon_a", "k", b"A".to_vec(), Tier::Ephemeral).unwrap();
-        s.set("addon_b", "k", b"B".to_vec(), Tier::Ephemeral).unwrap();
+        s.set("addon_a", "k", b"A".to_vec(), Tier::Ephemeral)
+            .unwrap();
+        s.set("addon_b", "k", b"B".to_vec(), Tier::Ephemeral)
+            .unwrap();
 
         assert_eq!(s.get("addon_a", "k"), Some(b"A".to_vec()));
         assert_eq!(s.get("addon_b", "k"), Some(b"B".to_vec()));
@@ -1060,7 +1061,7 @@ mod tests {
         // per-addon byte cap (32 MiB). Write with increasing timestamps so the
         // oldest are evicted first.
         let chunk = vec![0u8; MAX_VALUE_BYTES]; // 1 MiB each
-        // 40 entries * ~1 MiB = ~40 MiB > 32 MiB cap → eviction kicks in.
+                                                // 40 entries * ~1 MiB = ~40 MiB > 32 MiB cap → eviction kicks in.
         for i in 0..40 {
             // Distinct keys; sleep 1ms to guarantee strictly increasing
             // updated_at_ms so eviction order is deterministic.
@@ -1084,7 +1085,7 @@ mod tests {
     fn durable_overflow_rejects_new_allows_replace() {
         let s = store();
         let chunk = vec![0u8; MAX_VALUE_BYTES]; // 1 MiB
-        // Fill durable up to / over the byte cap.
+                                                // Fill durable up to / over the byte cap.
         let mut i = 0;
         loop {
             let key = format!("d{i:03}");
@@ -1210,8 +1211,7 @@ mod tests {
                 barrier.wait();
                 for i in 0..writes_per_thread {
                     let key = format!("k{i}");
-                    s.set(&addon, &key, vec![0u8; 8], Tier::Ephemeral)
-                        .unwrap();
+                    s.set(&addon, &key, vec![0u8; 8], Tier::Ephemeral).unwrap();
                     // Read back something we just wrote.
                     assert!(s.get(&addon, &key).is_some());
                 }
@@ -1251,8 +1251,7 @@ mod tests {
                 for i in 0..keys_per_thread {
                     // Disjoint key namespaces per thread → deterministic count.
                     let key = format!("t{t}_k{i}");
-                    s.set("shared", &key, vec![1u8; 4], Tier::Durable)
-                        .unwrap();
+                    s.set("shared", &key, vec![1u8; 4], Tier::Durable).unwrap();
                 }
             }));
         }
@@ -1305,7 +1304,7 @@ mod tests {
     fn ephemeral_rejected_when_only_durable_fills_cap() {
         let s = store();
         let chunk = vec![0u8; MAX_VALUE_BYTES]; // 1 MiB
-        // Fill durable up to the byte cap.
+                                                // Fill durable up to the byte cap.
         let mut i = 0;
         loop {
             let key = format!("d{i:03}");
@@ -1380,7 +1379,7 @@ mod tests {
     fn load_durable_stops_at_byte_cap() {
         let s = store();
         let chunk = vec![0u8; MAX_VALUE_BYTES]; // 1 MiB each
-        // Offer ~40 MiB of durable entries; the 32 MiB cap must truncate.
+                                                // Offer ~40 MiB of durable entries; the 32 MiB cap must truncate.
         let entries: Vec<(String, Vec<u8>)> = (0..40)
             .map(|i| (format!("k{i:03}"), chunk.clone()))
             .collect();
@@ -1563,7 +1562,8 @@ mod tests {
             writer.join().unwrap();
             // After both joined, do a definitive write and read it back: this
             // must always be visible (no detached-shard swallow).
-            s.set("race", "final", b"f".to_vec(), Tier::Durable).unwrap();
+            s.set("race", "final", b"f".to_vec(), Tier::Durable)
+                .unwrap();
             assert_eq!(
                 s.get("race", "final"),
                 Some(b"f".to_vec()),
@@ -1579,7 +1579,7 @@ mod tests {
     fn shrinking_replace_near_cap_evicts_nothing() {
         let s = store();
         let big = vec![0u8; MAX_VALUE_BYTES]; // 1 MiB
-        // Fill close to the byte cap with ephemeral 1 MiB values (leave room).
+                                              // Fill close to the byte cap with ephemeral 1 MiB values (leave room).
         let fill = (MAX_BYTES_PER_ADDON / MAX_VALUE_BYTES) - 1;
         for i in 0..fill {
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -1661,9 +1661,12 @@ mod tests {
     #[test]
     fn list_bounded_respects_prefix() {
         let s = store();
-        s.set("a", "robot:1", b"x".to_vec(), Tier::Ephemeral).unwrap();
-        s.set("a", "robot:2", b"y".to_vec(), Tier::Ephemeral).unwrap();
-        s.set("a", "user:1", b"z".to_vec(), Tier::Ephemeral).unwrap();
+        s.set("a", "robot:1", b"x".to_vec(), Tier::Ephemeral)
+            .unwrap();
+        s.set("a", "robot:2", b"y".to_vec(), Tier::Ephemeral)
+            .unwrap();
+        s.set("a", "user:1", b"z".to_vec(), Tier::Ephemeral)
+            .unwrap();
         let (entries, truncated) = s.list_bounded("a", Some("robot:"), 1000, 1024 * 1024);
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|(k, _, _)| k.starts_with("robot:")));

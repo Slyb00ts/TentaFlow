@@ -39,7 +39,7 @@ const RESOLUTION: usize = 560;
 const BATCHES: [usize; 3] = [1, 8, 16];
 /// Env selecting the session-pool sizes the concurrency bench probes (comma
 /// list, e.g. `"1,2,4,8"`). With the per-session TensorRT workspace capped
-/// (`TENTAFLOW_TRT_WORKSPACE_MB`, default 1 GiB) each RF-DETR session costs only
+/// (`[vision] trt_workspace_mib`, default 1 GiB) each RF-DETR session costs only
 /// ~2.1 GB VRAM, so 8+ sessions co-reside on a free 24 GB 4090; aggregate
 /// throughput plateaus around N=4 (compute-bound: ~214 / 287 / 312 / 310 img/s
 /// at N=1/2/4/8). The default `"1,2"` stays conservative so the whole bench
@@ -52,7 +52,11 @@ const DEFAULT_CONCURRENCY: &str = "1,2";
 /// every level is `>= 1`.
 fn concurrency_levels() -> Vec<usize> {
     let raw = std::env::var(CONCURRENCY_ENV).unwrap_or_default();
-    let source = if raw.trim().is_empty() { DEFAULT_CONCURRENCY } else { raw.as_str() };
+    let source = if raw.trim().is_empty() {
+        DEFAULT_CONCURRENCY
+    } else {
+        raw.as_str()
+    };
     let mut levels: Vec<usize> = Vec::new();
     for tok in source.split(',') {
         if let Ok(n) = tok.trim().parse::<usize>() {
@@ -130,9 +134,7 @@ fn bench_cpu_vs_trt(c: &mut Criterion) {
     }
 
     // FP32 CPU baseline: default session builder = CPU EP only.
-    match ort::session::Session::builder()
-        .and_then(|mut b| b.commit_from_file(&model_path))
-    {
+    match ort::session::Session::builder().and_then(|mut b| b.commit_from_file(&model_path)) {
         Ok(mut session) => bench_session(c, "rfdetr_fp32_cpu", &mut session),
         Err(e) => {
             eprintln!("onnx_cv_trt: skipping CPU bench — session build failed: {e}");
@@ -158,7 +160,7 @@ fn bench_cpu_vs_trt(c: &mut Criterion) {
         height: RESOLUTION as u32,
         width: RESOLUTION as u32,
     };
-    match ort_common::build_ort_session(&model_path, &trt_cache, Some(&profile), 0) {
+    match ort_common::build_ort_session(&model_path, &trt_cache, Some(&profile), 0, true) {
         Ok(mut session) => bench_session(c, "rfdetr_fp16_trt", &mut session),
         Err(e) => eprintln!("onnx_cv_trt: skipping TRT bench — session build failed: {e}"),
     }
@@ -208,9 +210,7 @@ fn bench_concurrent_sessions(c: &mut Criterion) {
     }
     use ort::ep::ExecutionProvider;
     if !ort::ep::TensorRT::default().is_available().unwrap_or(false) {
-        eprintln!(
-            "onnx_cv_concurrency: skipping — TensorRT EP not available in this runtime"
-        );
+        eprintln!("onnx_cv_concurrency: skipping — TensorRT EP not available in this runtime");
         return;
     }
 
@@ -241,7 +241,7 @@ fn bench_concurrent_sessions(c: &mut Criterion) {
         width: RESOLUTION as u32,
     };
     let build = || -> ort::session::Session {
-        ort_common::build_ort_session_from_memory(&model_bytes, &trt_cache, Some(&profile), 0)
+        ort_common::build_ort_session_from_memory(&model_bytes, &trt_cache, Some(&profile), 0, true)
             .expect("build session")
     };
 
@@ -290,7 +290,10 @@ fn bench_concurrent_sessions(c: &mut Criterion) {
                     })
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().expect("thread")).collect()
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("thread"))
+                .collect()
         });
         for (i, out) in &results {
             assert_eq!(
@@ -336,7 +339,9 @@ fn bench_concurrent_sessions(c: &mut Criterion) {
                     if stop.load(std::sync::atomic::Ordering::Acquire) {
                         break;
                     }
-                    let out = s.run(ort::inputs! { name => value_ref }).expect("session.run");
+                    let out = s
+                        .run(ort::inputs! { name => value_ref })
+                        .expect("session.run");
                     drop(out);
                     done.wait();
                 });

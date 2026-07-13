@@ -116,7 +116,9 @@ async fn run_generation(
     let max_tokens = req.max_tokens.unwrap_or(768);
 
     // 1. Zbierz pytania.
-    set_progress(dataset_id, |p| p.status = "generating_questions".to_string());
+    set_progress(dataset_id, |p| {
+        p.status = "generating_questions".to_string()
+    });
     let questions = match req.question_source.as_str() {
         "import" => gather_questions_import(user_id, req)?,
         "generate" => gather_questions_generated(router, req, max_tokens).await?,
@@ -148,12 +150,16 @@ async fn run_generation(
             Some(instr) if !instr.trim().is_empty() => format!("{}\n\n{}", instr.trim(), question),
             _ => question.clone(),
         };
-        let answer =
-            crate::ml_studio::infer::run_local_chat(router, &req.teacher_model, &ans_prompt, max_tokens)
-                .await
-                .map_err(|e| anyhow::anyhow!("teacher '{}': {e:#}", req.teacher_model))?
-                .trim()
-                .to_string();
+        let answer = crate::ml_studio::infer::run_local_chat(
+            router,
+            &req.teacher_model,
+            &ans_prompt,
+            max_tokens,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("teacher '{}': {e:#}", req.teacher_model))?
+        .trim()
+        .to_string();
 
         // DPO: ODRZUCONA (gorsza) odpowiedź ze słabszego modelu (fallback: teacher z
         // instrukcją „odpowiedz gorzej"). Preferencja chosen>rejected uczy DPO.
@@ -177,9 +183,10 @@ async fn run_generation(
             // meta-instrukcją „gorzej" — inaczej chosen/rejected/prompt byłyby
             // niespójne (rejected bez answer_instruction, prompt bez instrukcji).
             let rej_prompt = format!("{}\n\n{}", rej_instr, ans_prompt);
-            let r = crate::ml_studio::infer::run_local_chat(router, rej_model, &rej_prompt, max_tokens)
-                .await
-                .map_err(|e| anyhow::anyhow!("rejected model '{}': {e:#}", rej_model))?;
+            let r =
+                crate::ml_studio::infer::run_local_chat(router, rej_model, &rej_prompt, max_tokens)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("rejected model '{}': {e:#}", rej_model))?;
             Some(r.trim().to_string())
         } else {
             None
@@ -219,7 +226,12 @@ async fn run_generation(
         jsonl.push_str(&serde_json::to_string(&line)?);
         jsonl.push('\n');
     }
-    super::repository::update_dataset_data(user_id, dataset_id, pairs.len() as u64, jsonl.as_bytes())?;
+    super::repository::update_dataset_data(
+        user_id,
+        dataset_id,
+        pairs.len() as u64,
+        jsonl.as_bytes(),
+    )?;
 
     set_progress(dataset_id, |p| p.status = "completed".to_string());
     Ok(())
@@ -251,9 +263,9 @@ fn gather_questions_import(
             .iter()
             .position(|h| !field.is_empty() && h.eq_ignore_ascii_case(field))
             .or_else(|| {
-                headers
-                    .iter()
-                    .position(|h| h.eq_ignore_ascii_case("question") || h.eq_ignore_ascii_case("prompt"))
+                headers.iter().position(|h| {
+                    h.eq_ignore_ascii_case("question") || h.eq_ignore_ascii_case("prompt")
+                })
             })
             .unwrap_or(0);
         let mut out = Vec::new();
@@ -328,7 +340,9 @@ async fn gather_questions_generated(
         .lines()
         .map(|l| {
             l.trim()
-                .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')' || c == '-')
+                .trim_start_matches(|c: char| {
+                    c.is_ascii_digit() || c == '.' || c == ')' || c == '-'
+                })
                 .trim()
                 .to_string()
         })

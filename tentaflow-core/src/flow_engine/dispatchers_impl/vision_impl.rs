@@ -81,7 +81,9 @@ async fn ocr_via_executor(
     let mut ctx = runtime_ctx(req.caller_addon_id);
     match executor.execute_camera_cv(cv_req, &mut ctx).await {
         Ok(CameraCvResult::Text { tekst }) => Ok(tekst),
-        Ok(_) => Err(anyhow!("vision ocr: nieoczekiwany wariant wyniku camera-cv")),
+        Ok(_) => Err(anyhow!(
+            "vision ocr: nieoczekiwany wariant wyniku camera-cv"
+        )),
         Err(e) => Err(anyhow!("vision ocr: {e}")),
     }
 }

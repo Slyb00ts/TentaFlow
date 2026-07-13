@@ -435,9 +435,11 @@ fn wire_wasi_preview1(linker: &mut WasmLinker<AddonState>) {
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_prestat_dir_name",
-            |_caller: WasmCaller<'_, AddonState>, _fd: i32, _path_ptr: i32, _path_len: i32| -> i32 {
-                WASI_ERRNO_BADF
-            },
+            |_caller: WasmCaller<'_, AddonState>,
+             _fd: i32,
+             _path_ptr: i32,
+             _path_len: i32|
+             -> i32 { WASI_ERRNO_BADF },
         )
         .expect("define wasi_snapshot_preview1::fd_prestat_dir_name");
 

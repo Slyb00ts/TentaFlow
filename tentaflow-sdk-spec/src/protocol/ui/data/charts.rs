@@ -2,6 +2,7 @@
 // File: protocol/ui/data/charts.rs — Sparkline/LineChart/BarChart/AreaChart/PieChart/StackedBar (catalog §4)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::{BindRef, StatePath};
 use super::super::component::{Component, FieldMap};
 use super::super::inline::{ChartAxis, ChartLegend, ChartSeries, ChartTooltip, StackSegment};
@@ -12,11 +13,19 @@ use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -406,7 +415,8 @@ impl StackedBar {
             segments: segments.unwrap_or_default(),
             total: total.ok_or_else(|| missing_field("StackedBar", "total"))?,
             show_legend: show_legend.ok_or_else(|| missing_field("StackedBar", "show_legend"))?,
-            show_percentages: show_percentages.ok_or_else(|| missing_field("StackedBar", "show_percentages"))?,
+            show_percentages: show_percentages
+                .ok_or_else(|| missing_field("StackedBar", "show_percentages"))?,
             height_px: height_px.ok_or_else(|| missing_field("StackedBar", "height_px"))?,
         })
     }

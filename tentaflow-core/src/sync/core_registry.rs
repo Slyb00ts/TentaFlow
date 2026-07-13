@@ -581,8 +581,7 @@ mod tests {
         // Both metrics tables ARE core sync resources (mesh-wide replication):
         // rollup is single-writer-per-row, pricing is LWW.
         assert_eq!(
-            descriptor_for_table("model_metrics_rollup")
-                .map(|descriptor| descriptor.resource_type),
+            descriptor_for_table("model_metrics_rollup").map(|descriptor| descriptor.resource_type),
             Some("core.model_metrics_rollup")
         );
         assert_eq!(

@@ -2,22 +2,28 @@
 // File: protocol/ui/data/labels.rs — Badge/Chip/Tag (catalog §4)
 // =============================================================================
 
+use super::super::super::value::Value;
 use super::super::bind::BindRef;
 use super::super::component::{Component, FieldMap};
 use super::super::inline::{AvatarRef, IconRef};
-use super::super::tokens::{
-    BadgeVariant,
-    ChipVariant, TagSize, Tone,
-};
+use super::super::tokens::{BadgeVariant, ChipVariant, TagSize, Tone};
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
 };
-use super::super::super::value::Value;
 
 #[inline]
 fn component(tag: u16, id: impl Into<String>, fields: Vec<(u8, Value)>) -> Component {
-    Component { tag, id: id.into(), fields: FieldMap(fields), handlers: None, bind: None, a11y: None, visibility: None, test_id: None }
+    Component {
+        tag,
+        id: id.into(),
+        fields: FieldMap(fields),
+        handlers: None,
+        bind: None,
+        a11y: None,
+        visibility: None,
+        test_id: None,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -43,8 +49,12 @@ impl Badge {
         entries.push((0, encode_to_value(&self.variant)?));
         entries.push((1, encode_to_value(&self.tone)?));
         entries.push((2, encode_to_value(&self.label)?));
-        if let Some(i) = &self.icon { entries.push((3, encode_to_value(i)?)); }
-        if let Some(c) = &self.count { entries.push((4, encode_to_value(c)?)); }
+        if let Some(i) = &self.icon {
+            entries.push((3, encode_to_value(i)?));
+        }
+        if let Some(c) = &self.count {
+            entries.push((4, encode_to_value(c)?));
+        }
         entries.push((5, encode_to_value(&self.max)?));
         entries.push((6, encode_to_value(&self.pulse)?));
         Ok(component(Self::TAG, id, entries))
@@ -76,7 +86,8 @@ impl Badge {
             variant: variant.ok_or_else(|| missing_field("Badge", "variant"))?,
             tone: tone.ok_or_else(|| missing_field("Badge", "tone"))?,
             label: label.ok_or_else(|| missing_field("Badge", "label"))?,
-            icon, count,
+            icon,
+            count,
             max: max.ok_or_else(|| missing_field("Badge", "max"))?,
             pulse: pulse.ok_or_else(|| missing_field("Badge", "pulse"))?,
         })
@@ -109,11 +120,19 @@ impl Chip {
         entries.push((0, encode_to_value(&self.variant)?));
         entries.push((1, encode_to_value(&self.tone)?));
         entries.push((2, encode_to_value(&self.label)?));
-        if let Some(i) = &self.icon { entries.push((3, encode_to_value(i)?)); }
-        if let Some(a) = &self.avatar { entries.push((4, encode_to_value(a)?)); }
-        if let Some(s) = &self.selected { entries.push((5, encode_to_value(s)?)); }
+        if let Some(i) = &self.icon {
+            entries.push((3, encode_to_value(i)?));
+        }
+        if let Some(a) = &self.avatar {
+            entries.push((4, encode_to_value(a)?));
+        }
+        if let Some(s) = &self.selected {
+            entries.push((5, encode_to_value(s)?));
+        }
         entries.push((6, encode_to_value(&self.removable)?));
-        if let Some(d) = &self.dot { entries.push((7, encode_to_value(d)?)); }
+        if let Some(d) = &self.dot {
+            entries.push((7, encode_to_value(d)?));
+        }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -145,7 +164,9 @@ impl Chip {
             variant: variant.ok_or_else(|| missing_field("Chip", "variant"))?,
             tone: tone.ok_or_else(|| missing_field("Chip", "tone"))?,
             label: label.ok_or_else(|| missing_field("Chip", "label"))?,
-            icon, avatar, selected,
+            icon,
+            avatar,
+            selected,
             removable: removable.ok_or_else(|| missing_field("Chip", "removable"))?,
             dot,
         })
@@ -195,4 +216,3 @@ impl Tag {
         })
     }
 }
-

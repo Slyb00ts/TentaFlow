@@ -128,7 +128,10 @@ mod tests {
             .execute(&node(json!({"seconds": 0.05})), &[input(env)], &stub_ctx())
             .await
             .expect("execute");
-        assert!(started.elapsed() >= Duration::from_millis(40), "did not sleep");
+        assert!(
+            started.elapsed() >= Duration::from_millis(40),
+            "did not sleep"
+        );
         assert_eq!(out.payload.as_text(), Some("carry"));
     }
 

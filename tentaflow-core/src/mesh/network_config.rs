@@ -212,11 +212,7 @@ fn validate_ipv4(ip: &str) -> Result<()> {
 /// Buduje komende zmieniajaca TYLKO MTU interfejsu, bez dotykania adresacji IP.
 /// Na Linuksie uzywamy `ip link set` (runtime) niezaleznie od managera — to
 /// najprostsza droga, ktora nie nadpisuje istniejacej konfiguracji IP karty.
-fn build_mtu_only_command(
-    manager: &NetworkManager,
-    interface: &str,
-    mtu: u32,
-) -> Result<String> {
+fn build_mtu_only_command(manager: &NetworkManager, interface: &str, mtu: u32) -> Result<String> {
     match manager {
         NetworkManager::NetworkManager
         | NetworkManager::SystemdNetworkd

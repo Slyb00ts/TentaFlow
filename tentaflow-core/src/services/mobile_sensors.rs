@@ -41,7 +41,9 @@ pub struct MobileSensorQueue {
 
 impl MobileSensorQueue {
     fn new() -> Self {
-        Self { q: Mutex::new(VecDeque::new()) }
+        Self {
+            q: Mutex::new(VecDeque::new()),
+        }
     }
 
     pub fn global() -> &'static MobileSensorQueue {
