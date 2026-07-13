@@ -5524,6 +5524,12 @@ fn recording_meta_vehicles(meta: &Option<JsonValue>) -> Vec<VehicleReads> {
                 event_meta_winner_text(item.get("texts").and_then(|t| t.get("tablica_adr")))
             });
         let stany = recording_stany_map(item.get("stany"));
+        // Read-less buckets (a background car YOLO boxed but with no plate/ADR/
+        // sticker read) carry no information for the "Odczyty" column — skip them
+        // so the panel lists only trucks that actually read something.
+        if plate.trim().is_empty() && adr.trim().is_empty() && stany.trim().is_empty() {
+            continue;
+        }
         out.push(VehicleReads {
             vehicle_id,
             plate,

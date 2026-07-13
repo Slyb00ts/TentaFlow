@@ -208,6 +208,11 @@ pub struct DetectionsWire {
     pub ts_ms: u64,
     pub pts_ns: Option<u64>,
     pub proc_ms: u32,
+    /// FAZA 2 (cold) marker — carried across the worker link so the core-side
+    /// event recorder buckets only vehicle-stamped, enriched frames (see
+    /// `detection_bus::DetectionsMessage::enriched`).
+    #[serde(default)]
+    pub enriched: bool,
     pub items: Vec<Detection>,
 }
 
@@ -611,6 +616,7 @@ mod tests {
                 ts_ms: 1_700_000_000_123,
                 pts_ns: Some(42_000_000),
                 proc_ms: 17,
+                enriched: true,
                 items: vec![Detection {
                     klasa: "tablica_adr".into(),
                     bbox: [0.1, 0.2, 0.3, 0.4],

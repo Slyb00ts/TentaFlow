@@ -440,6 +440,37 @@ impl VehicleMeta {
             .map(|(klasa, votes)| (klasa.clone(), Self::winner(votes)))
             .collect()
     }
+
+    /// Folds another bucket's tallies into this one — consolidating track-fragment
+    /// buckets that resolve to the SAME physical truck (see [`EventMeta::consolidated`]).
+    fn merge_from(&mut self, other: &VehicleMeta) {
+        for (k, c) in &other.classes {
+            *self.classes.entry(k.clone()).or_insert(0) += c;
+        }
+        for (k, votes) in &other.texts {
+            let dst = self.texts.entry(k.clone()).or_default();
+            for (t, v) in votes {
+                let e = dst.entry(t.clone()).or_default();
+                e.count += v.count;
+                e.weight += v.weight;
+                e.conf_sum += v.conf_sum;
+            }
+        }
+        for (label, states) in &other.stany {
+            let dst = self.stany.entry(label.clone()).or_default();
+            for (st, c) in states {
+                *dst.entry(st.clone()).or_insert(0) += c;
+            }
+        }
+        self.tracks.extend(other.tracks.iter().copied());
+        self.frames += other.frames;
+        for (k, (r, c)) in &other.best_thumb {
+            let better = self.best_thumb.get(k).map(|(_, cc)| c > cc).unwrap_or(true);
+            if better {
+                self.best_thumb.insert(k.clone(), (r.clone(), *c));
+            }
+        }
+    }
 }
 
 impl EventMeta {
@@ -464,25 +495,54 @@ impl EventMeta {
         }
     }
 
-    /// The PRIMARY vehicle: the one with the most detection frames (ties → the
-    /// smallest `vehicle_id` for determinism). Its plate/ADR/thumb feed the
-    /// scalar DB columns so the panel row + search stay working with NO
-    /// migration. `vehicle_id = 0` (unassigned) only wins when it is the ONLY
-    /// bucket — a real (non-zero) vehicle always outranks the unassigned bucket
-    /// at equal frames, so a single truck with an unassigned stray still reports
-    /// the truck. `None` for an empty event.
-    fn primary(&self) -> Option<(u32, &VehicleMeta)> {
-        self.vehicles
-            .iter()
+    /// Consolidates track-fragment buckets into physical trucks. A truck on a
+    /// busy weighbridge is re-acquired by the IOU tracker many times (occlusion,
+    /// leaving/re-entering the frame), so ONE truck fragments across dozens of
+    /// `vehicle_id`s. Buckets that resolve to the SAME plate — or, when plate-less,
+    /// the same ADR read — are the same truck and are merged. Two DIFFERENT trucks
+    /// side by side keep distinct plates, so they never merge. Read-less buckets
+    /// (spurious background-vehicle boxes, or the unassigned `0` bucket) stay
+    /// separate. Keyed by the smallest source `vehicle_id` of each group (stable).
+    fn consolidated(&self) -> BTreeMap<u32, VehicleMeta> {
+        // Resolved identity ("P:<plate>" / "A:<adr>") → representative id. Read-less
+        // buckets have no identity and are never merged.
+        let mut by_identity: BTreeMap<String, u32> = BTreeMap::new();
+        let mut out: BTreeMap<u32, VehicleMeta> = BTreeMap::new();
+        for (id, vm) in &self.vehicles {
+            let (plate, adr) = vm.winner_texts();
+            let identity = match (plate, adr) {
+                (Some(p), _) => Some(format!("P:{p}")),
+                (None, Some(a)) => Some(format!("A:{a}")),
+                (None, None) => None,
+            };
+            let rep = match identity {
+                // BTreeMap iterates ascending, so the first fragment of an identity
+                // fixes the smallest id as its representative.
+                Some(key) => *by_identity.entry(key).or_insert(*id),
+                None => *id,
+            };
+            out.entry(rep).or_default().merge_from(vm);
+        }
+        out
+    }
+
+    /// The PRIMARY vehicle (post-consolidation): the physical truck with the most
+    /// detection frames (ties → smallest id). Its plate/ADR/thumb feed the scalar
+    /// DB columns so the panel row + search stay working with NO migration.
+    /// `vehicle_id = 0` (unassigned) only wins when it is the ONLY bucket — a real
+    /// (non-zero) vehicle always outranks it at equal frames. `None` for an empty
+    /// event.
+    fn primary(&self) -> Option<(u32, VehicleMeta)> {
+        self.consolidated()
+            .into_iter()
             .max_by(|(ida, a), (idb, b)| {
                 a.frames
                     .cmp(&b.frames)
                     // A non-zero vehicle beats the unassigned (0) bucket at a tie.
-                    .then_with(|| (**ida != 0).cmp(&(**idb != 0)))
+                    .then_with(|| (*ida != 0).cmp(&(*idb != 0)))
                     // Then the smaller id (stable).
                     .then_with(|| idb.cmp(ida))
             })
-            .map(|(id, vm)| (*id, vm))
     }
 
     /// Scalar plate/ADR winner columns = the PRIMARY vehicle's (one-truck events
@@ -493,9 +553,13 @@ impl EventMeta {
             .unwrap_or((None, None))
     }
 
-    /// Scalar event thumbnail = the PRIMARY vehicle's photo.
+    /// Scalar event thumbnail = the PRIMARY vehicle's photo, falling back to ANY
+    /// vehicle that captured one so a recording ALWAYS has a list thumbnail (the
+    /// scene-throttled capture may land on a non-primary bucket).
     fn event_thumb(&self) -> Option<String> {
-        self.primary().and_then(|(_, vm)| vm.event_thumb())
+        self.primary()
+            .and_then(|(_, vm)| vm.event_thumb())
+            .or_else(|| self.consolidated().values().find_map(|vm| vm.event_thumb()))
     }
 
     /// Serialize the summary for one finalized file. Keeps the historical
@@ -506,13 +570,16 @@ impl EventMeta {
     /// panel renders. `start/stop` are wall clock (unix ms) of the FILE, `part`
     /// numbers files within one long event.
     fn to_json(&self, start_ts_ms: u64, stop_ts_ms: u64, preroll_ms: u64, part: u32) -> String {
+        // Consolidate track fragments into physical trucks BEFORE serializing, so
+        // the panel shows one entry per real truck (not one per re-acquisition).
+        let vehicles_map = self.consolidated();
         // Top-level aggregate (union across vehicles) — back-compat shape.
         let mut classes: BTreeMap<String, u64> = BTreeMap::new();
         let mut texts_merged: BTreeMap<String, BTreeMap<String, TextVote>> = BTreeMap::new();
         let mut stany_merged: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
         let mut tracks: BTreeSet<u32> = BTreeSet::new();
         let mut frames = 0u64;
-        for vm in self.vehicles.values() {
+        for vm in vehicles_map.values() {
             for (k, c) in &vm.classes {
                 *classes.entry(k.clone()).or_insert(0) += c;
             }
@@ -548,10 +615,9 @@ impl EventMeta {
             })
             .collect();
 
-        // Per-vehicle breakdown — one object per truck (unassigned bucket 0
-        // included for completeness; the panel prefers non-zero vehicles).
-        let vehicles: Vec<serde_json::Value> = self
-            .vehicles
+        // Per-vehicle breakdown — one object per CONSOLIDATED truck (unassigned
+        // bucket 0 included for completeness; the panel prefers non-zero vehicles).
+        let vehicles: Vec<serde_json::Value> = vehicles_map
             .iter()
             .map(|(id, vm)| {
                 let (plate, adr) = vm.winner_texts();
@@ -1095,7 +1161,14 @@ async fn handle_detections(
         *start_blocked_until = None;
     }
     let started = sm.on_presence(now);
-    meta.absorb(&msg.items);
+    // Presence (start/keep recording) fires on EVERY frame — a truck must trigger
+    // recording immediately via the hot FAZA 1 stream. But vehicle bucketing only
+    // folds ENRICHED (FAZA 2) frames: those alone carry the final `vehicle_id`
+    // association + OCR/stan. Bucketing the hot stream would flood `vehicle_id = 0`
+    // with every-frame, unstamped detections.
+    if msg.enriched {
+        meta.absorb(&msg.items);
+    }
     if !started {
         return;
     }
@@ -1348,6 +1421,58 @@ mod tests {
         assert_eq!(adr.as_deref(), Some("30/1202"));
     }
 
+    /// Track fragmentation: the IOU tracker re-acquires one physical truck under
+    /// several `vehicle_id`s over a long event. Buckets that resolve to the SAME
+    /// plate MUST consolidate into ONE panel entry (else the panel shows dozens of
+    /// "Pojazd N" for one truck). A different plate stays separate.
+    #[test]
+    fn event_meta_same_plate_fragments_consolidate() {
+        let mut meta = EventMeta::default();
+        // Same truck, plate WZ12345, re-acquired as vehicle_id 5, 9, 40 across the
+        // event (each with its own ADR reads of the same load).
+        for vid in [5u32, 9, 40] {
+            for _ in 0..4 {
+                meta.absorb(&[
+                    det_veh(CLASS_PLATE, Some("WZ12345"), vid, vid),
+                    det_veh(CLASS_ADR, Some("30/1202"), vid + 1, vid),
+                ]);
+            }
+        }
+        // A genuinely different truck, plate DIFF999, once.
+        meta.absorb(&[det_veh(CLASS_PLATE, Some("DIFF999"), 77, 77)]);
+        // A read-less background car (only a vehicle box) — never a panel entry.
+        meta.absorb(&[det_veh("vehicle", None, 88, 88)]);
+
+        let v: serde_json::Value =
+            serde_json::from_str(&meta.to_json(0, 0, 0, 0)).expect("valid json");
+        let vehicles = v["vehicles"].as_array().expect("vehicles array");
+        // WZ12345 (merged from 5/9/40) + DIFF999 + the read-less 88 bucket = 3
+        // consolidated buckets; the three WZ fragments collapsed to one.
+        let plates: Vec<&str> = vehicles
+            .iter()
+            .filter_map(|x| x["plate"].as_str())
+            .collect();
+        assert!(plates.contains(&"WZ12345"), "merged plate present");
+        assert!(plates.contains(&"DIFF999"), "distinct plate kept");
+        assert_eq!(
+            plates.iter().filter(|p| **p == "WZ12345").count(),
+            1,
+            "the same-plate fragments collapse to a single entry"
+        );
+        // The merged truck keyed by its smallest source id (5), 12 detection frames.
+        let merged = vehicles
+            .iter()
+            .find(|x| x["plate"] == "WZ12345")
+            .expect("merged truck");
+        assert_eq!(merged["vehicle_id"], 5, "keyed by smallest source id");
+        assert_eq!(merged["detection_frames"], 12, "4+4+4 frames summed");
+
+        // Scalar columns = the PRIMARY (merged WZ12345, most frames).
+        let (plate, adr) = meta.winner_texts();
+        assert_eq!(plate.as_deref(), Some("WZ12345"));
+        assert_eq!(adr.as_deref(), Some("30/1202"));
+    }
+
     /// A single-vehicle event must keep the scalar columns byte-identical to the
     /// old single-bag output (no migration): one bucket → primary = that bucket.
     #[test]
@@ -1577,6 +1702,26 @@ mod tests {
         assert_eq!(other.event_thumb().as_deref(), Some("snap_x"));
 
         assert_eq!(EventMeta::default().event_thumb(), None);
+    }
+
+    /// A photo must ALWAYS be present: when the PRIMARY truck (most frames) never
+    /// captured a thumbnail but ANOTHER vehicle did, the scalar event thumbnail
+    /// falls back to that vehicle's photo instead of returning `None`.
+    #[test]
+    fn event_thumb_falls_back_to_non_primary_vehicle() {
+        let mut meta = EventMeta::default();
+        // Primary truck (vehicle 1): 3 frames, plate WPRIM11, but NO thumbnail.
+        for _ in 0..3 {
+            meta.absorb(&[det_veh(CLASS_PLATE, Some("WPRIM11"), 10, 1)]);
+        }
+        // Secondary vehicle (vehicle 2): 1 frame, no read, but a scene thumbnail.
+        let mut d = det_veh("vehicle", None, 20, 2);
+        d.tekst_thumb_ref = Some("snap_scene".to_string());
+        meta.absorb(&[d]);
+
+        // Primary is vehicle 1 (more frames) and has no thumb → fall back to
+        // vehicle 2's scene photo rather than None.
+        assert_eq!(meta.event_thumb().as_deref(), Some("snap_scene"));
     }
 
     /// Sticker-state aggregation: each `<label> <state>` frame votes for the

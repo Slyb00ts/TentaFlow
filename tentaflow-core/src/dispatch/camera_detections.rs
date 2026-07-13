@@ -306,6 +306,7 @@ mod tests {
             ts_ms: 1_700_000_000_123,
             pts_ns: Some(1_234_567_890),
             proc_ms: 42,
+            enriched: true,
             items: vec![
                 Detection {
                     klasa: "tablica_adr".into(),
@@ -361,6 +362,7 @@ mod tests {
             0,
             None,
             0,
+            true,
             vec![Detection {
                 klasa: "termometr".into(),
                 bbox: [0.1, 0.1, 0.2, 0.2],
@@ -392,6 +394,7 @@ mod tests {
                 0,
                 None,
                 0,
+                false,
                 vec![Detection {
                     klasa: "nalepka_9".into(),
                     bbox: [0.0, 0.0, 0.1, 0.1],

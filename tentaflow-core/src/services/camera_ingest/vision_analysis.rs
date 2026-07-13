@@ -1967,6 +1967,10 @@ fn finalize_job(mut job: FrameJob, cold: &mpsc::Sender<DetectionEvent>) {
         job.captured_ms,
         job.pts_ns,
         job.detect_ms_total,
+        // FAZA 1: hot overlay only — signs are NOT yet stamped with `vehicle_id`
+        // and enrichment is cache-only, so the event recorder must NOT bucket
+        // these (they would flood the unassigned `vehicle_id = 0` bucket).
+        false,
         overlay,
     );
     // Pusty zestaw nie wymaga wzbogacenia: FAZA 1 juz wyczyscila overlay. Sam
@@ -2368,7 +2372,7 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
                 detect_ms,
                 pipeline,
                 mut stage_dets,
-                vehicles,
+                mut vehicles,
             } = ev;
             let bytes = frame.len();
             // RAII: releases this camera's in-flight slot + bytes on drop — including
@@ -2388,7 +2392,7 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
                 &frame_format,
                 &pipeline,
                 &mut stage_dets,
-                &vehicles,
+                &mut vehicles,
             )
             .await;
             let enrich_ms = enrich_start.elapsed().as_millis() as u32;
@@ -2400,7 +2404,6 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
                 .iter()
                 .flat_map(|(_, d)| d.iter().cloned())
                 .collect();
-            let mut vehicles = vehicles;
             for v in vehicles.iter_mut() {
                 v.vehicle_id = v.track_id;
             }
@@ -2410,6 +2413,9 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
                 captured_ms,
                 pts_ns,
                 proc_ms,
+                // FAZA 2: signs now carry final `vehicle_id` + OCR/stan enrichment —
+                // this is the ONLY publish the event recorder buckets per vehicle.
+                true,
                 merged.clone(),
             );
             if !merged.is_empty() {
@@ -2627,6 +2633,9 @@ fn publish_flow_detections(
         captured_ms,
         pts_ns,
         proc_ms,
+        // Flow overlay: OCR-enriched but NOT vehicle-stamped (the flow engine has
+        // no vehicle association), so it feeds the overlay only — never bucketing.
+        false,
         enriched.unwrap_or(original),
     );
 }
@@ -3267,7 +3276,7 @@ async fn run_cold_stages(
     frame_format: &super::fakefile::DetectFrameFormat,
     pipeline: &CvPipeline,
     stage_dets: &mut [(String, Vec<Detection>)],
-    vehicles: &[Detection],
+    vehicles: &mut [Detection],
 ) {
     let Some(executor) = runtime_executor() else {
         warn_throttled(
@@ -3517,6 +3526,36 @@ async fn run_cold_stages(
     // track_id (hot path) and their reads (this cold pass), stamp each sign/plate
     // with the vehicle it sits on so the recorder can group per truck.
     stamp_vehicle_ids(stage_dets, &vehicle_boxes(vehicles));
+
+    // GUARANTEE a photo for EVERY event: the read-driven thumbnail above only
+    // fires inside an OCR stage, so a truck whose plate/ADR is never read (or one
+    // that shows only stickers) would get no picture. If no detection captured a
+    // thumbnail this frame, snapshot the whole scene once (per-camera throttled)
+    // and attach it to the largest vehicle box — else the first sign — so the
+    // recorder always promotes a list thumbnail.
+    let any_thumb = stage_dets
+        .iter()
+        .flat_map(|(_, d)| d.iter())
+        .any(|d| d.tekst_thumb_ref.is_some());
+    if !any_thumb && scene_thumb_should_capture(camera_id) {
+        if let Some(rgb) = cold_full_rgb(frame, frame_device, w, h, frame_format) {
+            if let Some(thumb_ref) = save_event_thumbnail(camera_id, &rgb, w, h).await {
+                let vbox_area = |d: &Detection| (d.bbox[2].max(0.0)) * (d.bbox[3].max(0.0));
+                if let Some(v) = vehicles
+                    .iter_mut()
+                    .max_by(|a, b| vbox_area(a).total_cmp(&vbox_area(b)))
+                {
+                    v.tekst_thumb_ref = Some(thumb_ref);
+                } else if let Some(d) = stage_dets
+                    .iter_mut()
+                    .flat_map(|(_, d)| d.iter_mut())
+                    .next()
+                {
+                    d.tekst_thumb_ref = Some(thumb_ref);
+                }
+            }
+        }
+    }
 }
 
 /// Maps published vehicle detections to the `[VehicleBox]` association inputs,

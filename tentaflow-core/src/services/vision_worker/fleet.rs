@@ -305,6 +305,7 @@ impl WorkerFleet {
                         f.ts_ms,
                         f.pts_ns,
                         f.proc_ms,
+                        f.enriched,
                         f.items,
                     );
                 }

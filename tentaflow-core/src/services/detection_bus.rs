@@ -109,6 +109,13 @@ pub struct DetectionsMessage {
     /// Czas CALOSCI obrobki klatki w ms (detekcja + OCR + klasyfikacja stanu).
     /// Klient pokazuje go jako badge. 0 gdy nieznany (np. surowa ramka FAZY 1).
     pub proc_ms: u32,
+    /// True tylko dla ramki FAZY 2 (cold): detekcje niosa ostateczne `vehicle_id`
+    /// (asocjacja znak→pojazd) ORAZ wzbogacenie OCR/stan. FAZA 1 (hot overlay) i
+    /// ramki flow/stub maja `false` — overlay je rysuje, ale event recorder ich
+    /// NIE bucketuje (inaczej co-klatkowe, niezstampowane detekcje zalewaja
+    /// bucket `vehicle_id = 0`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub enriched: bool,
     pub items: Vec<Detection>,
 }
 
@@ -118,6 +125,7 @@ impl DetectionsMessage {
         ts_ms: u64,
         pts_ns: Option<u64>,
         proc_ms: u32,
+        enriched: bool,
         items: Vec<Detection>,
     ) -> Self {
         Self {
@@ -126,6 +134,7 @@ impl DetectionsMessage {
             ts_ms,
             pts_ns,
             proc_ms,
+            enriched,
             items,
         }
     }
@@ -184,6 +193,7 @@ pub fn publish_detections(
     ts_ms: u64,
     pts_ns: Option<u64>,
     proc_ms: u32,
+    enriched: bool,
     items: Vec<Detection>,
 ) {
     // Per-vehicle event recording rides the same bus: the hook lazily spawns a
@@ -192,7 +202,7 @@ pub fn publish_detections(
     // the first vehicle of the day.
     #[cfg(feature = "camera")]
     crate::services::event_recorder::on_detections_published(camera_id);
-    let msg = DetectionsMessage::new(camera_id.to_string(), ts_ms, pts_ns, proc_ms, items);
+    let msg = DetectionsMessage::new(camera_id.to_string(), ts_ms, pts_ns, proc_ms, enriched, items);
     // `send` zwraca Err tylko gdy nie ma zadnych odbiorcow — ignorujemy.
     let _ = detection_bus().sender(camera_id).send(msg);
 }
@@ -292,7 +302,7 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            publish_detections(&camera_id, ts_ms, None, 0, items);
+            publish_detections(&camera_id, ts_ms, None, 0, false, items);
         }
     })
 }
@@ -312,6 +322,7 @@ mod tests {
             0,
             None,
             0,
+            false,
             vec![
                 Detection {
                     klasa: "tablica_adr".to_string(),
@@ -387,6 +398,7 @@ mod tests {
             0,
             None,
             0,
+            false,
             vec![Detection {
                 klasa: "termometr".to_string(),
                 bbox: [0.1, 0.1, 0.2, 0.2],
@@ -415,6 +427,7 @@ mod tests {
             0,
             None,
             0,
+            false,
             vec![Detection {
                 klasa: "nalepka_9".to_string(),
                 bbox: [0.0, 0.0, 0.1, 0.1],

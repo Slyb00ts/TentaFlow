@@ -243,6 +243,7 @@ impl WorkerCameraRuntime {
                                 ts_ms: msg.ts_ms,
                                 pts_ns: msg.pts_ns,
                                 proc_ms: msg.proc_ms,
+                                enriched: msg.enriched,
                                 items: msg.items,
                             };
                             pending.lock().insert(camera_id_owned.clone(), wire);
