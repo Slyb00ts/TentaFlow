@@ -18,44 +18,45 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use serde_json::{self, json, Value as JsonValue};
-use tentaflow_sdk_spec::{
-    Component, SlotContent, SlotDecl, PanelShell, UiPayload,
-    SlotDefault, SlotSemantics, CachePolicy, SlotVisibility, StateEntry,
-    StatePatch, HandlerMap, Handler, FailurePolicy,
-    Value, PathSegment, StatePath, PatchOp, PatchOpKind,
+use tentaflow_sdk_spec::protocol::camera::{
+    CameraAddInput, CameraAddOutput, CameraCvPipelineDeleteOut, CameraCvPipelineIdInput,
+    CameraCvPipelineOut, CameraCvPipelineSaveInput, CameraCvPipelineSaveOut,
+    CameraCvPipelineSummary, CameraCvPipelinesOut, CameraDiscoverOut, CameraIdInput,
+    CameraRemoveOut, CameraTestConnectionInput, CameraTestConnectionOut, DiscoveredCameraOut,
+    LocalCameraDeviceOut, LocalCameraDevicesOut, CAMERA_DEFAULT_ANALYSIS_FPS,
 };
 use tentaflow_sdk_spec::protocol::control::CborMap;
 use tentaflow_sdk_spec::protocol::recording::{
     RecordingGetUrlInput, RecordingListInput, RecordingListItem, RecordingListOut, UrlOut,
 };
-use tentaflow_sdk_spec::protocol::camera::{
-    CameraAddInput, CameraAddOutput, CameraCvPipelineDeleteOut, CameraCvPipelineIdInput,
-    CameraCvPipelineOut, CameraCvPipelineSaveInput, CameraCvPipelineSaveOut,
-    CameraCvPipelineSummary, CameraCvPipelinesOut, CameraDiscoverOut, CameraIdInput,
-    CameraRemoveOut, CameraTestConnectionInput, CameraTestConnectionOut,
-    DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
-    CAMERA_DEFAULT_ANALYSIS_FPS,
-};
 use tentaflow_sdk_spec::protocol::ui::{
-    bind::BindRef,
     a11y::Accessibility,
-    layout::{Stack, Flex, Grid, Card, SectionCard, Divider},
-    layout::nav::NavTabs as NavTabsStruct,
-    data::{Text as TextComp, Heading as HeadingComp, Badge as BadgeComp, Chip as ChipComp,
-           KeyValue as KvComp, StatCard as StatCardComp, Avatar as AvatarComp,
-           Sparkline as SparklineComp, Heatmap as HeatmapComp,
-           ProgressBar as ProgressBarComp},
+    actions::{
+        Button as ButtonComp, FilterChips as FilterChipsComp, IconButton as IconButtonComp,
+        Link as LinkComp,
+    },
+    bind::BindRef,
     data::charts::StackedBar as StackedBarComp,
     data::tables::Table as TableComp,
-    actions::{Button as ButtonComp, IconButton as IconButtonComp, Link as LinkComp,
-              FilterChips as FilterChipsComp},
-    feedback::{Alert as AlertComp, Spinner as SpinnerComp, GateScreen as GateScreenComp},
+    data::{
+        Avatar as AvatarComp, Badge as BadgeComp, Chip as ChipComp, Heading as HeadingComp,
+        Heatmap as HeatmapComp, KeyValue as KvComp, ProgressBar as ProgressBarComp,
+        Sparkline as SparklineComp, StatCard as StatCardComp, Text as TextComp,
+    },
     feedback::overlays::Modal as ModalComp,
+    feedback::{Alert as AlertComp, GateScreen as GateScreenComp, Spinner as SpinnerComp},
+    icon_name::IconName,
+    inline::*,
+    layout::nav::NavTabs as NavTabsStruct,
+    layout::{Card, Divider, Flex, Grid, SectionCard, Stack},
     molecules::EmptyState as EmptyStateComp,
     specialized::StepProgress as StepProgressComp,
     tokens::*,
-    inline::*,
-    icon_name::IconName,
+};
+use tentaflow_sdk_spec::{
+    CachePolicy, Component, FailurePolicy, Handler, HandlerMap, PanelShell, PatchOp, PatchOpKind,
+    PathSegment, SlotContent, SlotDecl, SlotDefault, SlotSemantics, SlotVisibility, StateEntry,
+    StatePatch, StatePath, UiPayload, Value,
 };
 
 // =============================================================================
@@ -68,94 +69,135 @@ extern "C" {
     fn store_get(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32) -> i32;
     fn store_set(key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32) -> i32;
     fn event_publish(
-        event_type_ptr: i32, event_type_len: i32,
-        payload_ptr: i32, payload_len: i32,
+        event_type_ptr: i32,
+        event_type_len: i32,
+        payload_ptr: i32,
+        payload_len: i32,
     ) -> i32;
     fn ui_notify(
-        title_ptr: i32, title_len: i32,
-        body_ptr: i32, body_len: i32,
-        level_ptr: i32, level_len: i32,
+        title_ptr: i32,
+        title_len: i32,
+        body_ptr: i32,
+        body_len: i32,
+        level_ptr: i32,
+        level_len: i32,
     ) -> i32;
     fn log_info(msg_ptr: i32, msg_len: i32) -> i32;
     fn log_warn(msg_ptr: i32, msg_len: i32) -> i32;
     fn log_error(msg_ptr: i32, msg_len: i32) -> i32;
     fn camera_add_v1(
-        input_ptr: i32, input_len: i32,
-        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+        input_ptr: i32,
+        input_len: i32,
+        out_ptr: i32,
+        out_cap: i32,
+        out_len_ptr: i32,
     ) -> i32;
     fn camera_remove_v1(
-        input_ptr: i32, input_len: i32,
-        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+        input_ptr: i32,
+        input_len: i32,
+        out_ptr: i32,
+        out_cap: i32,
+        out_len_ptr: i32,
     ) -> i32;
     fn camera_get_v1(
-        input_ptr: i32, input_len: i32,
-        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+        input_ptr: i32,
+        input_len: i32,
+        out_ptr: i32,
+        out_cap: i32,
+        out_len_ptr: i32,
     ) -> i32;
     fn camera_update_v1(
-        input_ptr: i32, input_len: i32,
-        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+        input_ptr: i32,
+        input_len: i32,
+        out_ptr: i32,
+        out_cap: i32,
+        out_len_ptr: i32,
     ) -> i32;
     fn camera_list_accessible_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_analysis_flows_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_cv_pipelines_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_cv_pipeline_get_v1(
-        input_ptr: i32, input_len: i32,
-        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+        input_ptr: i32,
+        input_len: i32,
+        out_ptr: i32,
+        out_cap: i32,
+        out_len_ptr: i32,
     ) -> i32;
     fn camera_cv_pipeline_save_v1(
-        input_ptr: i32, input_len: i32,
-        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+        input_ptr: i32,
+        input_len: i32,
+        out_ptr: i32,
+        out_cap: i32,
+        out_len_ptr: i32,
     ) -> i32;
     fn camera_cv_pipeline_delete_v1(
-        input_ptr: i32, input_len: i32,
-        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+        input_ptr: i32,
+        input_len: i32,
+        out_ptr: i32,
+        out_cap: i32,
+        out_len_ptr: i32,
     ) -> i32;
     fn camera_discover_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_local_devices_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_test_connection_v1(
-        input_ptr: i32, input_len: i32,
-        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+        input_ptr: i32,
+        input_len: i32,
+        out_ptr: i32,
+        out_cap: i32,
+        out_len_ptr: i32,
     ) -> i32;
     fn vector_upsert_v1(
-        input_ptr: i32, input_len: i32,
-        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+        input_ptr: i32,
+        input_len: i32,
+        out_ptr: i32,
+        out_cap: i32,
+        out_len_ptr: i32,
     ) -> i32;
     fn vector_search_v1(
-        input_ptr: i32, input_len: i32,
-        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+        input_ptr: i32,
+        input_len: i32,
+        out_ptr: i32,
+        out_cap: i32,
+        out_len_ptr: i32,
     ) -> i32;
     fn llm_generate(
-        prompt_ptr: i32, prompt_len: i32,
-        model_ptr: i32, model_len: i32,
-        options_ptr: i32, options_len: i32,
-        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+        prompt_ptr: i32,
+        prompt_len: i32,
+        model_ptr: i32,
+        model_len: i32,
+        options_ptr: i32,
+        options_len: i32,
+        out_ptr: i32,
+        out_cap: i32,
+        out_len_ptr: i32,
     ) -> i32;
     fn alias_list_available_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn recording_list_v1(
-        input_ptr: i32, input_len: i32,
-        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+        input_ptr: i32,
+        input_len: i32,
+        out_ptr: i32,
+        out_cap: i32,
+        out_len_ptr: i32,
     ) -> i32;
     fn recording_get_url_v1(
-        input_ptr: i32, input_len: i32,
-        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+        input_ptr: i32,
+        input_len: i32,
+        out_ptr: i32,
+        out_cap: i32,
+        out_len_ptr: i32,
     ) -> i32;
     fn event_subscribe(
-        event_type_ptr: i32, event_type_len: i32,
-        filter_json_ptr: i32, filter_json_len: i32,
+        event_type_ptr: i32,
+        event_type_len: i32,
+        filter_json_ptr: i32,
+        filter_json_len: i32,
     ) -> i32;
 }
 
 /// Subscribes the addon to a system event type so its `on_event` is invoked for
 /// each matching event. No filter (pass 0/0). Needs the `events` permission.
 fn subscribe_event(event_type: &str) -> i32 {
-    unsafe {
-        event_subscribe(
-            event_type.as_ptr() as i32,
-            event_type.len() as i32,
-            0,
-            0,
-        )
-    }
+    unsafe { event_subscribe(event_type.as_ptr() as i32, event_type.len() as i32, 0, 0) }
 }
 
 /// Event type the camera_alert flow node emits on an alarm verdict.
@@ -168,13 +210,19 @@ const CAMERA_ALARM_EVENT: &str = "camera.alarm";
 mod log {
     use super::*;
     pub fn info(msg: &str) {
-        unsafe { log_info(msg.as_ptr() as i32, msg.len() as i32); }
+        unsafe {
+            log_info(msg.as_ptr() as i32, msg.len() as i32);
+        }
     }
     pub fn warn(msg: &str) {
-        unsafe { log_warn(msg.as_ptr() as i32, msg.len() as i32); }
+        unsafe {
+            log_warn(msg.as_ptr() as i32, msg.len() as i32);
+        }
     }
     pub fn error(msg: &str) {
-        unsafe { log_error(msg.as_ptr() as i32, msg.len() as i32); }
+        unsafe {
+            log_error(msg.as_ptr() as i32, msg.len() as i32);
+        }
     }
 }
 
@@ -182,9 +230,12 @@ fn notify(title: &str, body: &str) {
     let level = "info";
     unsafe {
         ui_notify(
-            title.as_ptr() as i32, title.len() as i32,
-            body.as_ptr() as i32, body.len() as i32,
-            level.as_ptr() as i32, level.len() as i32,
+            title.as_ptr() as i32,
+            title.len() as i32,
+            body.as_ptr() as i32,
+            body.len() as i32,
+            level.as_ptr() as i32,
+            level.len() as i32,
         );
     }
 }
@@ -283,9 +334,7 @@ where
 /// Decodes the CBOR response of a host function with the read-only
 /// `(out_ptr, out_cap, out_len_ptr)` ABI shape (`camera_discover` /
 /// `camera_local_devices`).
-fn call_cbor_out<O>(
-    host_fn: unsafe extern "C" fn(i32, i32, i32) -> i32,
-) -> Result<O, AbiError>
+fn call_cbor_out<O>(host_fn: unsafe extern "C" fn(i32, i32, i32) -> i32) -> Result<O, AbiError>
 where
     O: for<'b> minicbor::Decode<'b, ()>,
 {
@@ -326,8 +375,7 @@ fn host_camera_analysis_flows() -> Result<Vec<(String, String)>, AbiError> {
 /// the `url` is redacted host-side — live view goes through the dashboard stream
 /// keyed by `camera_id`, so the url is not needed for display or streaming.
 fn host_list_accessible_cameras() -> Result<Vec<tentaflow_sdk_spec::CameraInfoOut>, AbiError> {
-    let out: tentaflow_sdk_spec::CameraListOut =
-        call_cbor_out(camera_list_accessible_v1)?;
+    let out: tentaflow_sdk_spec::CameraListOut = call_cbor_out(camera_list_accessible_v1)?;
     Ok(out.camera)
 }
 
@@ -483,14 +531,28 @@ fn parse_available_alias(v: &JsonValue) -> Option<AvailableAlias> {
     let methods = v
         .get("methods")
         .and_then(|m| m.as_array())
-        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     Some(AvailableAlias {
         alias_id,
-        target_model: v.get("target_model").and_then(|x| x.as_str()).map(String::from),
+        target_model: v
+            .get("target_model")
+            .and_then(|x| x.as_str())
+            .map(String::from),
         methods,
-        grant_status: v.get("grant_status").and_then(|x| x.as_str()).unwrap_or("pending").to_string(),
-        visibility: v.get("visibility").and_then(|x| x.as_str()).map(String::from),
+        grant_status: v
+            .get("grant_status")
+            .and_then(|x| x.as_str())
+            .unwrap_or("pending")
+            .to_string(),
+        visibility: v
+            .get("visibility")
+            .and_then(|x| x.as_str())
+            .map(String::from),
         active: v.get("active").and_then(|x| x.as_bool()).unwrap_or(false),
         required: v.get("required").and_then(|x| x.as_bool()).unwrap_or(false),
     })
@@ -501,7 +563,11 @@ fn parse_available_alias(v: &JsonValue) -> Option<AvailableAlias> {
 /// UI can show an honest assignment surface rather than a hardcoded list.
 fn alias_list_available() -> Result<Vec<AvailableAlias>, AbiError> {
     let resp = call_json_out_value(alias_list_available_v1)?;
-    let arr = resp.get("aliases").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+    let arr = resp
+        .get("aliases")
+        .and_then(|a| a.as_array())
+        .cloned()
+        .unwrap_or_default();
     Ok(arr.iter().filter_map(parse_available_alias).collect())
 }
 
@@ -510,7 +576,9 @@ fn camera_add(spec: CameraAddInput) -> Result<CameraAddOutput, AbiError> {
 }
 
 fn camera_remove(id: &str) -> Result<(), AbiError> {
-    let input = CameraIdInput { camera_id: id.to_string() };
+    let input = CameraIdInput {
+        camera_id: id.to_string(),
+    };
     let _: CameraRemoveOut = call_cbor_in_out(&input, camera_remove_v1)?;
     Ok(())
 }
@@ -526,7 +594,10 @@ fn camera_local_devices() -> Result<Vec<LocalCameraDeviceOut>, AbiError> {
 }
 
 fn camera_test_connection(vendor: &str, url: &str) -> Result<CameraTestConnectionOut, AbiError> {
-    let input = CameraTestConnectionInput { vendor: vendor.to_string(), url: url.to_string() };
+    let input = CameraTestConnectionInput {
+        vendor: vendor.to_string(),
+        url: url.to_string(),
+    };
     call_cbor_in_out(&input, camera_test_connection_v1)
 }
 
@@ -601,22 +672,25 @@ fn install_panic_hook() {
     if INSTALLED.swap(true, Ordering::Relaxed) {
         return;
     }
-    std::panic::set_hook(alloc::boxed::Box::new(|info: &std::panic::PanicHookInfo| {
-        let location = info
-            .location()
-            .map(|l| alloc::format!("{}:{}", l.file(), l.line()))
-            .unwrap_or_else(|| "<unknown>".into());
-        let message = info
-            .payload()
-            .downcast_ref::<&str>()
-            .map(|s| (*s).to_string())
-            .or_else(|| info.payload().downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "<non-string panic payload>".into());
-        log::error(&alloc::format!(
-            "TentaVision PANIC at {}: {}",
-            location, message
-        ));
-    }));
+    std::panic::set_hook(alloc::boxed::Box::new(
+        |info: &std::panic::PanicHookInfo| {
+            let location = info
+                .location()
+                .map(|l| alloc::format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "<unknown>".into());
+            let message = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".into());
+            log::error(&alloc::format!(
+                "TentaVision PANIC at {}: {}",
+                location,
+                message
+            ));
+        },
+    ));
 }
 
 fn next_id() -> String {
@@ -660,7 +734,11 @@ fn send_slot_content(slot_id: &str, fragment: Component) {
 /// fragment renders. Used to seed the reactive wizard's initial state into the
 /// store the moment the `add_camera_body` fragment is delivered, so bound
 /// visibility flags resolve correctly on first paint.
-fn send_slot_content_with_overlay(slot_id: &str, fragment: Component, overlay: Option<Vec<StateEntry>>) {
+fn send_slot_content_with_overlay(
+    slot_id: &str,
+    fragment: Component,
+    overlay: Option<Vec<StateEntry>>,
+) {
     let epoch = PANEL_EPOCH.load(Ordering::Relaxed);
     let payload = UiPayload::SlotContent(SlotContent {
         addon_id: ADDON_ID.into(),
@@ -748,7 +826,11 @@ fn with_a11y_label(mut component: Component, label: &str) -> Component {
 }
 
 fn icon_named(name: IconName) -> IconRef {
-    IconRef::Named { name, size: None, tone: None }
+    IconRef::Named {
+        name,
+        size: None,
+        tone: None,
+    }
 }
 
 fn parse_tone(s: &str) -> Tone {
@@ -828,7 +910,9 @@ fn text(content: &str) -> Component {
         max_lines: None,
         format: None,
         streaming: None,
-    }.into_component(next_id()).expect("Text")
+    }
+    .into_component(next_id())
+    .expect("Text")
 }
 
 fn text_styled(content: &str, style: &str) -> Component {
@@ -854,7 +938,9 @@ fn text_styled(content: &str, style: &str) -> Component {
         max_lines: None,
         format: None,
         streaming: None,
-    }.into_component(next_id()).expect("Text")
+    }
+    .into_component(next_id())
+    .expect("Text")
 }
 
 /// Text whose content tracks a store key reactively (used for the live
@@ -869,7 +955,9 @@ fn text_bound(key: &str) -> Component {
         max_lines: None,
         format: None,
         streaming: None,
-    }.into_component(next_id()).expect("Text")
+    }
+    .into_component(next_id())
+    .expect("Text")
 }
 
 fn text_colored(content: &str, style: &str, color: &str) -> Component {
@@ -887,7 +975,9 @@ fn text_colored(content: &str, style: &str, color: &str) -> Component {
         max_lines: None,
         format: None,
         streaming: None,
-    }.into_component(next_id()).expect("Text")
+    }
+    .into_component(next_id())
+    .expect("Text")
 }
 
 fn heading(level: u8, content: &str) -> Component {
@@ -896,7 +986,9 @@ fn heading(level: u8, content: &str) -> Component {
         level,
         tone: None,
         align: None,
-    }.into_component(next_id()).expect("Heading")
+    }
+    .into_component(next_id())
+    .expect("Heading")
 }
 
 fn badge(label: &str, variant: &str) -> Component {
@@ -921,7 +1013,9 @@ fn badge(label: &str, variant: &str) -> Component {
         count: None,
         max: 99,
         pulse: false,
-    }.into_component(next_id()).expect("Badge")
+    }
+    .into_component(next_id())
+    .expect("Badge")
 }
 
 fn chip(label: &str, _variant: &str) -> Component {
@@ -934,7 +1028,9 @@ fn chip(label: &str, _variant: &str) -> Component {
         selected: None,
         removable: false,
         dot: None,
-    }.into_component(next_id()).expect("Chip")
+    }
+    .into_component(next_id())
+    .expect("Chip")
 }
 
 fn chip_with_icon(label: &str, _variant: &str, icon: &str) -> Component {
@@ -947,7 +1043,9 @@ fn chip_with_icon(label: &str, _variant: &str, icon: &str) -> Component {
         selected: None,
         removable: false,
         dot: None,
-    }.into_component(next_id()).expect("Chip")
+    }
+    .into_component(next_id())
+    .expect("Chip")
 }
 
 fn chip_toned(label: &str, tone_str: &str) -> Component {
@@ -960,7 +1058,9 @@ fn chip_toned(label: &str, tone_str: &str) -> Component {
         selected: None,
         removable: false,
         dot: None,
-    }.into_component(next_id()).expect("Chip")
+    }
+    .into_component(next_id())
+    .expect("Chip")
 }
 
 fn chip_toned_icon(label: &str, tone_str: &str, icon: &str) -> Component {
@@ -973,10 +1073,18 @@ fn chip_toned_icon(label: &str, tone_str: &str, icon: &str) -> Component {
         selected: None,
         removable: false,
         dot: None,
-    }.into_component(next_id()).expect("Chip")
+    }
+    .into_component(next_id())
+    .expect("Chip")
 }
 
-fn stat_card(value: &str, label: &str, sublabel: Option<&str>, icon: Option<&str>, accent: Option<&str>) -> Component {
+fn stat_card(
+    value: &str,
+    label: &str,
+    sublabel: Option<&str>,
+    icon: Option<&str>,
+    accent: Option<&str>,
+) -> Component {
     let tone = accent.map(parse_tone).unwrap_or(Tone::Neutral);
     StatCardComp {
         label: lit(label),
@@ -992,7 +1100,9 @@ fn stat_card(value: &str, label: &str, sublabel: Option<&str>, icon: Option<&str
         }),
         accent: Some(tone),
         clickable: false,
-    }.into_component(next_id()).expect("StatCard")
+    }
+    .into_component(next_id())
+    .expect("StatCard")
 }
 
 fn button(label: &str, action: &str, variant: &str) -> Component {
@@ -1007,7 +1117,9 @@ fn button(label: &str, action: &str, variant: &str) -> Component {
         disabled: None,
         loading: None,
         density: Density::Default,
-    }.into_component(next_id()).expect("Button");
+    }
+    .into_component(next_id())
+    .expect("Button");
     c.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Click,
         Handler::Backend {
@@ -1032,7 +1144,9 @@ fn button_with_icon(label: &str, action: &str, variant: &str, icon: &str) -> Com
         disabled: None,
         loading: None,
         density: Density::Default,
-    }.into_component(next_id()).expect("Button");
+    }
+    .into_component(next_id())
+    .expect("Button");
     c.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Click,
         Handler::Backend {
@@ -1057,7 +1171,9 @@ fn button_with_params(label: &str, action: &str, variant: &str, params: CborMap)
         disabled: None,
         loading: None,
         density: Density::Default,
-    }.into_component(next_id()).expect("Button");
+    }
+    .into_component(next_id())
+    .expect("Button");
     c.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Click,
         Handler::Backend {
@@ -1079,7 +1195,9 @@ fn icon_button(icon: &str, action: &str, variant: &str) -> Component {
         aria_label: icon.into(),
         disabled: None,
         loading: None,
-    }.into_component(next_id()).expect("IconButton");
+    }
+    .into_component(next_id())
+    .expect("IconButton");
     c.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Click,
         Handler::Backend {
@@ -1099,7 +1217,9 @@ fn link(label: &str, panel_id: &str) -> Component {
         tone: Tone::Primary,
         leading_icon: None,
         trailing_icon: None,
-    }.into_component(next_id()).expect("Link");
+    }
+    .into_component(next_id())
+    .expect("Link");
     c.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Click,
         Handler::Backend {
@@ -1130,7 +1250,9 @@ fn card(title: Option<&str>, children: Vec<Component>) -> Component {
             background: BackgroundToken::None,
             accent: None,
             style: None,
-        }.into_component(next_id()).expect("SectionCard")
+        }
+        .into_component(next_id())
+        .expect("SectionCard")
     } else {
         Card {
             variant: CardVariant::Outlined,
@@ -1145,7 +1267,9 @@ fn card(title: Option<&str>, children: Vec<Component>) -> Component {
             interactive: false,
             clickable: false,
             style: None,
-        }.into_component(next_id()).expect("Card")
+        }
+        .into_component(next_id())
+        .expect("Card")
     }
 }
 
@@ -1153,7 +1277,12 @@ fn card_with_icon(title: &str, _icon: &str, children: Vec<Component>) -> Compone
     card_with_icon_action(title, _icon, None, children)
 }
 
-fn card_with_icon_action(title: &str, _icon: &str, action_label: Option<&str>, children: Vec<Component>) -> Component {
+fn card_with_icon_action(
+    title: &str,
+    _icon: &str,
+    action_label: Option<&str>,
+    children: Vec<Component>,
+) -> Component {
     let header_actions = match action_label {
         Some(label) => vec![ButtonComp {
             variant: ButtonVariant::Ghost,
@@ -1166,7 +1295,9 @@ fn card_with_icon_action(title: &str, _icon: &str, action_label: Option<&str>, c
             disabled: None,
             loading: None,
             density: Density::Default,
-        }.into_component(next_id()).expect("Button")],
+        }
+        .into_component(next_id())
+        .expect("Button")],
         None => vec![],
     };
     SectionCard {
@@ -1185,7 +1316,9 @@ fn card_with_icon_action(title: &str, _icon: &str, action_label: Option<&str>, c
         background: BackgroundToken::None,
         accent: None,
         style: None,
-    }.into_component(next_id()).expect("SectionCard")
+    }
+    .into_component(next_id())
+    .expect("SectionCard")
 }
 
 fn stack_v(children: Vec<Component>) -> Component {
@@ -1197,7 +1330,9 @@ fn stack_v(children: Vec<Component>) -> Component {
         justify: None,
         style: None,
         responsive: None,
-    }.into_component(next_id()).expect("Stack")
+    }
+    .into_component(next_id())
+    .expect("Stack")
 }
 
 fn stack_h(children: Vec<Component>) -> Component {
@@ -1213,7 +1348,9 @@ fn stack_h(children: Vec<Component>) -> Component {
         radius: None,
         style: None,
         responsive: None,
-    }.into_component(next_id()).expect("Flex")
+    }
+    .into_component(next_id())
+    .expect("Flex")
 }
 
 fn stack_h_gap(gap: &str, children: Vec<Component>) -> Component {
@@ -1229,7 +1366,9 @@ fn stack_h_gap(gap: &str, children: Vec<Component>) -> Component {
         radius: None,
         style: None,
         responsive: None,
-    }.into_component(next_id()).expect("Flex")
+    }
+    .into_component(next_id())
+    .expect("Flex")
 }
 
 fn stack_v_gap(gap: &str, children: Vec<Component>) -> Component {
@@ -1241,21 +1380,28 @@ fn stack_v_gap(gap: &str, children: Vec<Component>) -> Component {
         justify: None,
         style: None,
         responsive: None,
-    }.into_component(next_id()).expect("Stack")
+    }
+    .into_component(next_id())
+    .expect("Stack")
 }
 
 fn grid(columns: u32, children: Vec<Component>) -> Component {
-    let grid_children: Vec<GridChild> = children.into_iter().map(|c| GridChild {
-        component: c,
-        col_span: 1,
-        row_span: 1,
-        col_start: None,
-        row_start: None,
-        align_self: None,
-        justify_self: None,
-    }).collect();
+    let grid_children: Vec<GridChild> = children
+        .into_iter()
+        .map(|c| GridChild {
+            component: c,
+            col_span: 1,
+            row_span: 1,
+            col_start: None,
+            row_start: None,
+            align_self: None,
+            justify_self: None,
+        })
+        .collect();
     Grid {
-        columns: GridTrack::Equal { count: columns as u8 },
+        columns: GridTrack::Equal {
+            count: columns as u8,
+        },
         gap: Spacing::Md,
         row_gap: None,
         column_gap: None,
@@ -1263,7 +1409,9 @@ fn grid(columns: u32, children: Vec<Component>) -> Component {
         padding: None,
         align_items: None,
         style: None,
-    }.into_component(next_id()).expect("Grid")
+    }
+    .into_component(next_id())
+    .expect("Grid")
 }
 
 fn divider() -> Component {
@@ -1272,29 +1420,35 @@ fn divider() -> Component {
         variant: DividerVariant::Default,
         spacing: Spacing::Md,
         label: None,
-    }.into_component(next_id()).expect("Divider")
+    }
+    .into_component(next_id())
+    .expect("Divider")
 }
 
 fn table(columns: Vec<Value>, _rows: Vec<Value>) -> Component {
-    let table_cols: Vec<TableColumn> = columns.iter().enumerate().map(|(i, v)| {
-        let header_text = match v {
-            Value::Text(s) => s.clone(),
-            _ => alloc::format!("col{}", i),
-        };
-        let col_id = header_text.to_ascii_lowercase().replace(' ', "_");
-        TableColumn {
-            id: col_id.clone(),
-            header: lit(&header_text),
-            field_path: vec![PathSegment::Key(col_id)],
-            width: TableColumnWidth::Auto,
-            render: ColumnRender::Text,
-            format: None,
-            align: None,
-            sortable: false,
-            hidden_by_default: false,
-            sticky_left: false,
-        }
-    }).collect();
+    let table_cols: Vec<TableColumn> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let header_text = match v {
+                Value::Text(s) => s.clone(),
+                _ => alloc::format!("col{}", i),
+            };
+            let col_id = header_text.to_ascii_lowercase().replace(' ', "_");
+            TableColumn {
+                id: col_id.clone(),
+                header: lit(&header_text),
+                field_path: vec![PathSegment::Key(col_id)],
+                width: TableColumnWidth::Auto,
+                render: ColumnRender::Text,
+                format: None,
+                align: None,
+                sortable: false,
+                hidden_by_default: false,
+                sticky_left: false,
+            }
+        })
+        .collect();
     TableComp {
         columns: table_cols,
         rows_path: StatePath::new(vec![PathSegment::Key("rows".into())]),
@@ -1314,7 +1468,9 @@ fn table(columns: Vec<Value>, _rows: Vec<Value>) -> Component {
         virtualize: false,
         row_expandable: false,
         expanded_row_template_id: None,
-    }.into_component(next_id()).expect("Table")
+    }
+    .into_component(next_id())
+    .expect("Table")
 }
 
 fn avatar(initials: &str, size: &str) -> Component {
@@ -1326,12 +1482,16 @@ fn avatar(initials: &str, size: &str) -> Component {
         _ => AvatarSize::Md,
     };
     AvatarComp {
-        source: AvatarRef::Initials { initials: initials.into() },
+        source: AvatarRef::Initials {
+            initials: initials.into(),
+        },
         size: sz,
         shape: AvatarShape::Circle,
         status: None,
         tone: None,
-    }.into_component(next_id()).expect("Avatar")
+    }
+    .into_component(next_id())
+    .expect("Avatar")
 }
 
 fn empty_state(title: &str, message: Option<&str>, icon: Option<&str>) -> Component {
@@ -1342,7 +1502,8 @@ fn empty_state(title: &str, message: Option<&str>, icon: Option<&str>) -> Compon
         primary_action: None,
         secondary_action: None,
         variant: EmptyStateVariant::Default,
-    }.into_component(next_id());
+    }
+    .into_component(next_id());
     // EmptyState sits on hot wizard/empty-list render paths. A validation
     // failure here must degrade to a readable text node, never trap the whole
     // on_request and corrupt guest memory; the real reason is logged so the
@@ -1350,7 +1511,10 @@ fn empty_state(title: &str, message: Option<&str>, icon: Option<&str>) -> Compon
     match built {
         Ok(c) => c,
         Err(e) => {
-            log::error(&alloc::format!("TentaVision: EmptyState into_component failed: {:?}", e));
+            log::error(&alloc::format!(
+                "TentaVision: EmptyState into_component failed: {:?}",
+                e
+            ));
             text(title)
         }
     }
@@ -1369,7 +1533,9 @@ fn spinner(size: &str) -> Component {
         tone: Tone::Neutral,
         label: None,
         variant: SpinnerVariant::Default,
-    }.into_component(next_id()).expect("Spinner")
+    }
+    .into_component(next_id())
+    .expect("Spinner")
 }
 
 fn alert(message: &str, tone: &str) -> Component {
@@ -1381,7 +1547,9 @@ fn alert(message: &str, tone: &str) -> Component {
         message: lit(message),
         actions: None,
         dismissible: false,
-    }.into_component(next_id()).expect("Alert")
+    }
+    .into_component(next_id())
+    .expect("Alert")
 }
 
 /// Alert whose message tracks a store key reactively. Visibility is toggled by
@@ -1396,11 +1564,14 @@ fn alert_bound(message_key: &str, tone: &str) -> Component {
         message: bound(message_key),
         actions: None,
         dismissible: false,
-    }.into_component(next_id()).expect("Alert")
+    }
+    .into_component(next_id())
+    .expect("Alert")
 }
 
 fn progress_bar(value: f64, max: f64) -> Component {
     ProgressBarComp {
+        orientation: None,
         value: BindRef::Literal(Value::F64(value)),
         max,
         variant: ProgressVariant::Default,
@@ -1408,35 +1579,56 @@ fn progress_bar(value: f64, max: f64) -> Component {
         show_label: false,
         label: None,
         size: ProgressSize::Md,
-    }.into_component(next_id()).expect("ProgressBar")
+    }
+    .into_component(next_id())
+    .expect("ProgressBar")
 }
 
 fn key_value(items: Vec<(&str, &str)>) -> Component {
-    let kv_items: Vec<KvItem> = items.into_iter().map(|(k, v)| KvItem {
-        label: lit(k),
-        value: lit(v),
-        hint: None,
-        icon: None,
-        action_id: None,
-        format: None,
-    }).collect();
+    let kv_items: Vec<KvItem> = items
+        .into_iter()
+        .map(|(k, v)| KvItem {
+            label: lit(k),
+            value: lit(v),
+            hint: None,
+            icon: None,
+            action_id: None,
+            format: None,
+        })
+        .collect();
     KvComp {
         items: kv_items,
         density: Density::Default,
         layout: KvLayout::Horizontal,
         label_width: None,
-    }.into_component(next_id()).expect("KeyValue")
+    }
+    .into_component(next_id())
+    .expect("KeyValue")
 }
 
-fn heatmap(_rows: u32, _cols: u32, _values: Vec<Vec<f64>>, row_labels: Vec<&str>, col_labels: Vec<&str>) -> Component {
-    let hm_rows: Vec<HeatmapRow> = row_labels.into_iter().enumerate().map(|(i, label)| HeatmapRow {
-        id: alloc::format!("r{}", i),
-        label: lit(label),
-    }).collect();
-    let hm_cols: Vec<HeatmapColumn> = col_labels.into_iter().enumerate().map(|(i, label)| HeatmapColumn {
-        id: alloc::format!("c{}", i),
-        label: lit(label),
-    }).collect();
+fn heatmap(
+    _rows: u32,
+    _cols: u32,
+    _values: Vec<Vec<f64>>,
+    row_labels: Vec<&str>,
+    col_labels: Vec<&str>,
+) -> Component {
+    let hm_rows: Vec<HeatmapRow> = row_labels
+        .into_iter()
+        .enumerate()
+        .map(|(i, label)| HeatmapRow {
+            id: alloc::format!("r{}", i),
+            label: lit(label),
+        })
+        .collect();
+    let hm_cols: Vec<HeatmapColumn> = col_labels
+        .into_iter()
+        .enumerate()
+        .map(|(i, label)| HeatmapColumn {
+            id: alloc::format!("c{}", i),
+            label: lit(label),
+        })
+        .collect();
     HeatmapComp {
         rows: hm_rows,
         columns: hm_cols,
@@ -1450,7 +1642,9 @@ fn heatmap(_rows: u32, _cols: u32, _values: Vec<Vec<f64>>, row_labels: Vec<&str>
         legend_position: HeatmapLegendPosition::TopRight,
         cell_size_px: 24,
         tooltip: true,
-    }.into_component(next_id()).expect("Heatmap")
+    }
+    .into_component(next_id())
+    .expect("Heatmap")
 }
 
 fn nav_tabs(items: Vec<NavTab>, active_id: &str) -> Component {
@@ -1459,7 +1653,9 @@ fn nav_tabs(items: Vec<NavTab>, active_id: &str) -> Component {
         active_id: lit(active_id),
         variant: NavTabsVariant::Default,
         scroll_overflow: false,
-    }.into_component(next_id()).expect("NavTabs")
+    }
+    .into_component(next_id())
+    .expect("NavTabs")
 }
 
 fn input(label: &str, placeholder: &str, field_id: &str) -> Component {
@@ -1485,7 +1681,9 @@ fn input(label: &str, placeholder: &str, field_id: &str) -> Component {
         error: None,
         size: InputSize::Md,
         variant: None,
-    }.into_component(field_id).expect("Input")
+    }
+    .into_component(field_id)
+    .expect("Input")
 }
 
 fn number_input(label: &str, placeholder: &str, field_id: &str) -> Component {
@@ -1511,7 +1709,9 @@ fn number_input(label: &str, placeholder: &str, field_id: &str) -> Component {
         error: None,
         size: InputSize::Md,
         variant: None,
-    }.into_component(field_id).expect("Input")
+    }
+    .into_component(field_id)
+    .expect("Input")
 }
 
 fn select(label: &str, options: Vec<SelectOption>, field_id: &str) -> Component {
@@ -1527,7 +1727,9 @@ fn select(label: &str, options: Vec<SelectOption>, field_id: &str) -> Component 
         disabled: None,
         size: InputSize::Md,
         groups: None,
-    }.into_component(field_id).expect("Select")
+    }
+    .into_component(field_id)
+    .expect("Select")
 }
 
 /// Text input that mirrors its value into backend wizard state on every change
@@ -1538,9 +1740,17 @@ fn wizard_input(label: &str, placeholder: &str, field: &str, password: bool) -> 
     // An empty placeholder literal (`Some(Text("")))`) is meaningless and some
     // optional credential fields pass "" — encode it as absent rather than a
     // zero-length literal so the field stays canonical.
-    let placeholder_ref = if placeholder.is_empty() { None } else { Some(lit(placeholder)) };
+    let placeholder_ref = if placeholder.is_empty() {
+        None
+    } else {
+        Some(lit(placeholder))
+    };
     let mut comp = Input {
-        r#type: if password { InputType::Password } else { InputType::Text },
+        r#type: if password {
+            InputType::Password
+        } else {
+            InputType::Text
+        },
         bind_path: StatePath::new(vec![PathSegment::Key(field.into())]),
         placeholder: placeholder_ref,
         label: Some(lit(label)),
@@ -1560,7 +1770,9 @@ fn wizard_input(label: &str, placeholder: &str, field: &str, password: bool) -> 
         error: None,
         size: InputSize::Md,
         variant: None,
-    }.into_component(field).expect("Input");
+    }
+    .into_component(field)
+    .expect("Input");
     // Backend wizard state is the source of truth for validation (resolve_target
     // on Next/Test/Submit), so every keystroke must commit. Using `Input` rather
     // than `Change` avoids the lost-update race where the user types and clicks
@@ -1594,7 +1806,9 @@ fn wizard_select(label: &str, options: Vec<SelectOption>, field: &str) -> Compon
         disabled: None,
         size: InputSize::Md,
         groups: None,
-    }.into_component(field).expect("Select");
+    }
+    .into_component(field)
+    .expect("Select");
     let mut params = CborMap::default();
     params.0.push(("field".into(), Value::Text(field.into())));
     comp.handlers = Some(HandlerMap(vec![(
@@ -1619,7 +1833,9 @@ fn toggle(label: &str, field_id: &str) -> Component {
         tone: Tone::Primary,
         disabled: None,
         label_position: TogglePosition::Trailing,
-    }.into_component(field_id).expect("Toggle")
+    }
+    .into_component(field_id)
+    .expect("Toggle")
 }
 
 /// Single-handle slider bound to `field_id`, showing its current value. Used by
@@ -1636,7 +1852,9 @@ fn slider(label: &str, field_id: &str, min: f64, max: f64, step: f64) -> Compone
         format: None,
         marks: None,
         tone: Tone::Primary,
-    }.into_component(field_id).expect("Slider")
+    }
+    .into_component(field_id)
+    .expect("Slider")
 }
 
 fn filter_chips(items: Vec<FilterChipDef>, _active: &str) -> Component {
@@ -1645,7 +1863,9 @@ fn filter_chips(items: Vec<FilterChipDef>, _active: &str) -> Component {
         selected_ids: StatePath::new(vec![PathSegment::Key("filter_active".into())]),
         mode: FilterChipsMode::Single,
         clearable: true,
-    }.into_component(next_id()).expect("FilterChips")
+    }
+    .into_component(next_id())
+    .expect("FilterChips")
 }
 
 fn mono_block(content: &str) -> Component {
@@ -1655,7 +1875,9 @@ fn mono_block(content: &str) -> Component {
         max_height_px: None,
         word_wrap: true,
         copyable: true,
-    }.into_component(next_id()).expect("MonoBlock")
+    }
+    .into_component(next_id())
+    .expect("MonoBlock")
 }
 
 fn gate_screen(title: &str, message: &str, icon: &str) -> Component {
@@ -1665,7 +1887,9 @@ fn gate_screen(title: &str, message: &str, icon: &str) -> Component {
         message: lit(message),
         actions: vec![],
         variant: GateVariant::PermissionDenied,
-    }.into_component(next_id()).expect("GateScreen")
+    }
+    .into_component(next_id())
+    .expect("GateScreen")
 }
 
 fn step_progress(steps: Vec<StepDef>, _current_id: &str) -> Component {
@@ -1674,7 +1898,9 @@ fn step_progress(steps: Vec<StepDef>, _current_id: &str) -> Component {
         current_id_path: StatePath::new(vec![PathSegment::Key("onboarding_step".into())]),
         variant: StepProgressVariant::Horizontal,
         clickable_completed: false,
-    }.into_component(next_id()).expect("StepProgress")
+    }
+    .into_component(next_id())
+    .expect("StepProgress")
 }
 
 fn sparkline(_points: Vec<f64>) -> Component {
@@ -1685,7 +1911,9 @@ fn sparkline(_points: Vec<f64>) -> Component {
         width_px: 120,
         height_px: 32,
         show_min_max: false,
-    }.into_component(next_id()).expect("Sparkline")
+    }
+    .into_component(next_id())
+    .expect("Sparkline")
 }
 
 // =============================================================================
@@ -1865,15 +2093,25 @@ struct AuditState {
 impl AuditState {
     const fn new() -> Self {
         Self {
-            date_preset: String::new(), users: Vec::new(), actions: Vec::new(),
-            risk_class: String::new(), result: String::new(), query: String::new(),
-            expanded_id: None, cursor: None, retention_editing: None,
+            date_preset: String::new(),
+            users: Vec::new(),
+            actions: Vec::new(),
+            risk_class: String::new(),
+            result: String::new(),
+            query: String::new(),
+            expanded_id: None,
+            cursor: None,
+            retention_editing: None,
             retention_draft: String::new(),
         }
     }
     fn clear_filters(&mut self) {
-        self.date_preset.clear(); self.users.clear(); self.actions.clear();
-        self.risk_class.clear(); self.result.clear(); self.query.clear();
+        self.date_preset.clear();
+        self.users.clear();
+        self.actions.clear();
+        self.risk_class.clear();
+        self.result.clear();
+        self.query.clear();
         self.cursor = None;
     }
 }
@@ -1941,7 +2179,10 @@ impl SettingsState {
     }
     /// Returns the pending edit for `key`, if any.
     fn edit(&self, key: &str) -> Option<&str> {
-        self.edits.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+        self.edits
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
     }
     fn clear_edits(&mut self) {
         self.edits.clear();
@@ -1952,7 +2193,11 @@ impl SettingsState {
 // from (and written to) the persisted settings table, so the gate's open/closed
 // verdict survives panel reopen and process restart.
 struct ReidState;
-impl ReidState { const fn new() -> Self { Self } }
+impl ReidState {
+    const fn new() -> Self {
+        Self
+    }
+}
 
 /// Models tab UI state. `form_visible` shows the add/edit model form; the
 /// `form_*` fields are mirrored from the bound inputs so submit stays
@@ -2004,8 +2249,16 @@ impl ModelsState {
     fn load_for_edit(&mut self, m: &db::ModelRow) {
         self.editing_id = Some(m.id.clone());
         self.form_name = m.name.clone();
-        self.form_runtime = if m.runtime.is_empty() { "tensorrt".into() } else { m.runtime.clone() };
-        self.form_status = if m.status.is_empty() { "active".into() } else { m.status.clone() };
+        self.form_runtime = if m.runtime.is_empty() {
+            "tensorrt".into()
+        } else {
+            m.runtime.clone()
+        };
+        self.form_status = if m.status.is_empty() {
+            "active".into()
+        } else {
+            m.status.clone()
+        };
         self.form_vram = alloc::format!("{}", m.vram_mb);
         self.form_version = m.version.clone();
     }
@@ -2104,7 +2357,11 @@ impl ProfilesState {
     }
 
     fn category_or_all(&self) -> &str {
-        if self.category.is_empty() { "all" } else { &self.category }
+        if self.category.is_empty() {
+            "all"
+        } else {
+            &self.category
+        }
     }
 
     /// Resets the builder form to a clean "create" draft.
@@ -2123,9 +2380,21 @@ impl ProfilesState {
     fn load_for_edit(&mut self, p: &db::ProfileRow, camera_ids: Vec<String>) {
         self.editing_id = Some(p.id.clone());
         self.name = p.name.clone();
-        self.flow_id = if p.flow_id.is_empty() { "tv-realtime-adr".into() } else { p.flow_id.clone() };
-        self.risk_class = if p.risk_class.is_empty() { "A".into() } else { p.risk_class.clone() };
-        self.schedule = if p.schedule.is_empty() { "24/7".into() } else { p.schedule.clone() };
+        self.flow_id = if p.flow_id.is_empty() {
+            "tv-realtime-adr".into()
+        } else {
+            p.flow_id.clone()
+        };
+        self.risk_class = if p.risk_class.is_empty() {
+            "A".into()
+        } else {
+            p.risk_class.clone()
+        };
+        self.schedule = if p.schedule.is_empty() {
+            "24/7".into()
+        } else {
+            p.schedule.clone()
+        };
         self.cameras = camera_ids;
     }
 
@@ -2158,8 +2427,20 @@ impl AlarmsState {
             sound_muted: false,
         }
     }
-    fn severity_or_all(&self) -> &str { if self.severity_filter.is_empty() { "all" } else { &self.severity_filter } }
-    fn status_or_open(&self) -> &str { if self.status_view.is_empty() { "open" } else { &self.status_view } }
+    fn severity_or_all(&self) -> &str {
+        if self.severity_filter.is_empty() {
+            "all"
+        } else {
+            &self.severity_filter
+        }
+    }
+    fn status_or_open(&self) -> &str {
+        if self.status_view.is_empty() {
+            "open"
+        } else {
+            &self.status_view
+        }
+    }
 }
 
 /// One resolved search hit shown as a result card: the alarm row plus the raw
@@ -2199,7 +2480,10 @@ struct SearchState {
 }
 impl SearchState {
     const fn new() -> Self {
-        Self { submitted_mode: String::new(), outcome: SearchOutcome::Empty }
+        Self {
+            submitted_mode: String::new(),
+            outcome: SearchOutcome::Empty,
+        }
     }
     fn clear_all(&mut self) {
         self.submitted_mode.clear();
@@ -2211,7 +2495,13 @@ impl SearchState {
 /// branch of the add-camera wizard. `vendor()` maps each type to the stable
 /// TentaFlow vendor string the `camera_add` host function expects.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SourceType { Onvif, Rtsp, Mjpeg, Usb, File }
+enum SourceType {
+    Onvif,
+    Rtsp,
+    Mjpeg,
+    Usb,
+    File,
+}
 
 impl SourceType {
     fn from_str(s: &str) -> Option<Self> {
@@ -2225,17 +2515,33 @@ impl SourceType {
         }
     }
     fn as_str(self) -> &'static str {
-        match self { Self::Onvif => "onvif", Self::Rtsp => "rtsp", Self::Mjpeg => "mjpeg", Self::Usb => "usb", Self::File => "file" }
+        match self {
+            Self::Onvif => "onvif",
+            Self::Rtsp => "rtsp",
+            Self::Mjpeg => "mjpeg",
+            Self::Usb => "usb",
+            Self::File => "file",
+        }
     }
     fn vendor(self) -> &'static str {
         // USB enumeration reports `v4l2` on Linux; the local-device list carries
         // the authoritative vendor, but the manual-path fallback uses this.
-        match self { Self::Onvif => "onvif", Self::Rtsp => "rtsp", Self::Mjpeg => "mjpeg", Self::Usb => "v4l2", Self::File => "fake_file" }
+        match self {
+            Self::Onvif => "onvif",
+            Self::Rtsp => "rtsp",
+            Self::Mjpeg => "mjpeg",
+            Self::Usb => "v4l2",
+            Self::File => "fake_file",
+        }
     }
 }
 
 /// One locally enumerated USB/v4l2 device offered in the wizard's device select.
-struct LocalDevice { device_path: String, label: String, vendor: String }
+struct LocalDevice {
+    device_path: String,
+    label: String,
+    vendor: String,
+}
 
 /// Working state of the source-type-driven "Add camera" wizard. Each per-type
 /// field is committed to the backend on input change (`wizard-field-change`) so
@@ -2273,17 +2579,33 @@ struct DiscoverState {
     profile: String,
     error_message: Option<String>,
 }
-struct DiscoveredCam { vendor: String, url: String, suggested_name: String, profile_token: Option<String> }
+struct DiscoveredCam {
+    vendor: String,
+    url: String,
+    suggested_name: String,
+    profile_token: Option<String>,
+}
 impl DiscoverState {
     const fn new() -> Self {
         Self {
             source_type: None,
-            scanning: false, cameras: Vec::new(), selected_index: None,
-            usb_devices: Vec::new(), usb_loaded: false, usb_device_path: String::new(),
-            onvif_url: String::new(), rtsp_url: String::new(), mjpeg_url: String::new(), file_path: String::new(),
-            cred_user: String::new(), cred_pass: String::new(),
-            test_result: None, testing: false,
-            name: String::new(), retention: String::new(), fps: String::new(),
+            scanning: false,
+            cameras: Vec::new(),
+            selected_index: None,
+            usb_devices: Vec::new(),
+            usb_loaded: false,
+            usb_device_path: String::new(),
+            onvif_url: String::new(),
+            rtsp_url: String::new(),
+            mjpeg_url: String::new(),
+            file_path: String::new(),
+            cred_user: String::new(),
+            cred_pass: String::new(),
+            test_result: None,
+            testing: false,
+            name: String::new(),
+            retention: String::new(),
+            fps: String::new(),
             analysis_fps: String::new(),
             profile: String::new(),
             error_message: None,
@@ -2300,7 +2622,11 @@ impl DiscoverState {
             Some(SourceType::Onvif) => {
                 if let Some(i) = self.selected_index {
                     if let Some(cam) = self.cameras.get(i) {
-                        return Ok((cam.vendor.clone(), cam.url.clone(), cam.profile_token.clone()));
+                        return Ok((
+                            cam.vendor.clone(),
+                            cam.url.clone(),
+                            cam.profile_token.clone(),
+                        ));
                     }
                 }
                 let url = self.onvif_url.trim();
@@ -2339,7 +2665,9 @@ impl DiscoverState {
                 if path.is_empty() {
                     return Err("Wybierz lub podaj ścieżkę urządzenia (np. /dev/video0).");
                 }
-                let vendor = self.usb_devices.iter()
+                let vendor = self
+                    .usb_devices
+                    .iter()
                     .find(|d| d.device_path == path)
                     .map(|d| d.vendor.clone())
                     .unwrap_or_else(|| SourceType::Usb.vendor().to_string());
@@ -2356,14 +2684,27 @@ impl DiscoverState {
         }
     }
     fn retention_or_default(&self) -> &str {
-        if self.retention.is_empty() { "C" } else { &self.retention }
+        if self.retention.is_empty() {
+            "C"
+        } else {
+            &self.retention
+        }
     }
     fn profile_or_default(&self) -> &str {
         let p = self.profile.trim();
-        if p.is_empty() { "default" } else { p }
+        if p.is_empty() {
+            "default"
+        } else {
+            p
+        }
     }
     fn fps_value(&self) -> u32 {
-        self.fps.trim().parse::<u32>().ok().filter(|f| *f >= 1 && *f <= 60).unwrap_or(15)
+        self.fps
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|f| *f >= 1 && *f <= 60)
+            .unwrap_or(15)
     }
     /// AI analysis FPS for the chosen camera. `0` = unlimited (native cadence);
     /// any out-of-ladder value falls back to the spec default (10).
@@ -2390,7 +2731,9 @@ impl PanelState {
     const fn new() -> Self {
         Self {
             current_panel: String::new(),
-            add_form_visible: false, wizard_step: 0, cameras_filter: String::new(),
+            add_form_visible: false,
+            wizard_step: 0,
+            cameras_filter: String::new(),
             camera_pending_remove: None,
             camera_flow_edit: None,
             camera_pipeline_edit: None,
@@ -2401,16 +2744,25 @@ impl PanelState {
             recordings_plate_query: String::new(),
             recordings_adr_query: String::new(),
             cv_pipelines: CvPipelinesState::new(),
-            error_message: None, success_message: None,
-            discover: DiscoverState::new(), profiles: ProfilesState::new(),
-            alarms: AlarmsState::new(), search: SearchState::new(),
-            reid: ReidState::new(), models: ModelsState::new(),
-            zones: ZonesState::new(), audit: AuditState::new(),
-            evidence: EvidenceState::new(), settings: SettingsState::new(),
+            error_message: None,
+            success_message: None,
+            discover: DiscoverState::new(),
+            profiles: ProfilesState::new(),
+            alarms: AlarmsState::new(),
+            search: SearchState::new(),
+            reid: ReidState::new(),
+            models: ModelsState::new(),
+            zones: ZonesState::new(),
+            audit: AuditState::new(),
+            evidence: EvidenceState::new(),
+            settings: SettingsState::new(),
             onboarding: OnboardingState::new(),
         }
     }
-    fn clear_messages(&mut self) { self.error_message = None; self.success_message = None; }
+    fn clear_messages(&mut self) {
+        self.error_message = None;
+        self.success_message = None;
+    }
 }
 
 static STATE: Mutex<PanelState> = Mutex::new(PanelState::new());
@@ -2437,13 +2789,22 @@ static PENDING_RULE_ROWS: Mutex<Option<Value>> = Mutex::new(None);
 static PENDING_EVIDENCE_ROWS: Mutex<Option<Value>> = Mutex::new(None);
 static PENDING_RECIPIENT_ROWS: Mutex<Option<Value>> = Mutex::new(None);
 
-fn with_state<F, R>(f: F) -> R where F: FnOnce(&mut PanelState) -> R {
-    let mut guard = match STATE.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+fn with_state<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut PanelState) -> R,
+{
+    let mut guard = match STATE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
     f(&mut guard)
 }
 
 fn set_current_panel(panel: &str) {
-    with_state(|s| { s.current_panel.clear(); s.current_panel.push_str(panel); });
+    with_state(|s| {
+        s.current_panel.clear();
+        s.current_panel.push_str(panel);
+    });
 }
 
 // =============================================================================
@@ -2464,7 +2825,9 @@ pub extern "C" fn dealloc(ptr: i32, size: i32) {
 }
 
 #[no_mangle]
-pub extern "C" fn on_install() -> i32 { 0 }
+pub extern "C" fn on_install() -> i32 {
+    0
+}
 
 #[no_mangle]
 pub extern "C" fn on_start() -> i32 {
@@ -2489,9 +2852,7 @@ pub extern "C" fn on_stop() -> i32 {
 
 #[no_mangle]
 pub extern "C" fn on_event(input_ptr: i32, input_len: i32) -> i32 {
-    let bytes = unsafe {
-        core::slice::from_raw_parts(input_ptr as *const u8, input_len as usize)
-    };
+    let bytes = unsafe { core::slice::from_raw_parts(input_ptr as *const u8, input_len as usize) };
     let event: JsonValue = match serde_json::from_slice(bytes) {
         Ok(v) => v,
         Err(_) => return 0,
@@ -2506,17 +2867,33 @@ pub extern "C" fn on_event(input_ptr: i32, input_len: i32) -> i32 {
 /// row in the addon's alarms table. Best-effort: a malformed payload or DB error
 /// is logged, not fatal (the event bus must not be wedged by one bad alarm).
 fn handle_camera_alarm_event(payload: &JsonValue) {
-    let camera_id = payload.get("camera_id").and_then(|v| v.as_str()).unwrap_or("");
+    let camera_id = payload
+        .get("camera_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if camera_id.is_empty() {
         log::warn("TentaVision: camera.alarm bez camera_id — pomijam");
         return;
     }
-    let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("Alarm ADR");
-    let severity = payload.get("severity").and_then(|v| v.as_str()).unwrap_or("high");
+    let reason = payload
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Alarm ADR");
+    let severity = payload
+        .get("severity")
+        .and_then(|v| v.as_str())
+        .unwrap_or("high");
     let ts = db::now_secs();
     match db::insert_alarm(camera_id, severity, "adr", reason, ts) {
-        Ok(id) => log::info(&alloc::format!("TentaVision: alarm {} zapisany dla {}", id, camera_id)),
-        Err(e) => log::error(&alloc::format!("TentaVision: zapis alarmu nieudany: {}", abi_message(e))),
+        Ok(id) => log::info(&alloc::format!(
+            "TentaVision: alarm {} zapisany dla {}",
+            id,
+            camera_id
+        )),
+        Err(e) => log::error(&alloc::format!(
+            "TentaVision: zapis alarmu nieudany: {}",
+            abi_message(e)
+        )),
     }
 }
 
@@ -2527,13 +2904,21 @@ pub extern "C" fn on_panel_open(panel_id_ptr: i32, panel_id_len: i32, epoch: i64
     install_panic_hook();
     let panel_id = read_guest_string(panel_id_ptr, panel_id_len);
     PANEL_EPOCH.store(epoch as u64, core::sync::atomic::Ordering::Relaxed);
-    log::info(&alloc::format!("TentaVision: on_panel_open panel='{}' epoch={}", panel_id, epoch));
+    log::info(&alloc::format!(
+        "TentaVision: on_panel_open panel='{}' epoch={}",
+        panel_id,
+        epoch
+    ));
     // A fresh panel open starts a new view context; carrying a transient
     // success/error banner over from the previous session would surface stale
     // toasts (e.g. "Kamera dodana") on an unrelated tab.
     with_state(|s| s.clear_messages());
     send_initial_shell();
-    let target = if panel_id.is_empty() { "overview" } else { &panel_id };
+    let target = if panel_id.is_empty() {
+        "overview"
+    } else {
+        &panel_id
+    };
     render_panel(target);
     0
 }
@@ -2541,15 +2926,20 @@ pub extern "C" fn on_panel_open(panel_id_ptr: i32, panel_id_len: i32, epoch: i64
 /// Wasm ABI: on_request(input_ptr, input_len, out_ptr, out_cap, out_len_ptr) -> i32
 #[no_mangle]
 pub extern "C" fn on_request(
-    input_ptr: i32, input_len: i32,
-    out_ptr: i32, out_cap: i32,
+    input_ptr: i32,
+    input_len: i32,
+    out_ptr: i32,
+    out_cap: i32,
     out_len_ptr: i32,
 ) -> i32 {
     let input_json = read_guest_string(input_ptr, input_len);
     let request: JsonValue = match serde_json::from_str(&input_json) {
         Ok(v) => v,
         Err(e) => {
-            log::error(&alloc::format!("TentaVision: invalid on_request JSON: {}", e));
+            log::error(&alloc::format!(
+                "TentaVision: invalid on_request JSON: {}",
+                e
+            ));
             return 1;
         }
     };
@@ -2585,7 +2975,9 @@ pub extern "C" fn on_request(
 
     let response_str = response.to_string();
     let written = write_guest_string(out_ptr, out_cap, &response_str);
-    if written < 0 { return 2; }
+    if written < 0 {
+        return 2;
+    }
     unsafe {
         let p = out_len_ptr as *mut i32;
         *p = response_str.len() as i32;
@@ -2598,7 +2990,9 @@ pub extern "C" fn on_request(
 // =============================================================================
 
 fn read_guest_string(ptr: i32, len: i32) -> String {
-    if len <= 0 { return String::new(); }
+    if len <= 0 {
+        return String::new();
+    }
     unsafe {
         let slice = core::slice::from_raw_parts(ptr as *const u8, len as usize);
         String::from_utf8_lossy(slice).into_owned()
@@ -2607,7 +3001,9 @@ fn read_guest_string(ptr: i32, len: i32) -> String {
 
 fn write_guest_string(ptr: i32, cap: i32, s: &str) -> i32 {
     let bytes = s.as_bytes();
-    if bytes.len() > cap as usize { return -1; }
+    if bytes.len() > cap as usize {
+        return -1;
+    }
     unsafe {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
     }
@@ -2754,13 +3150,21 @@ fn render_panel(panel_id: &str) {
         if with_state(|s| s.cv_pipelines.manager_visible && s.cv_pipelines.editor_visible) {
             entries.extend(pipeline_editor_overlay());
         }
-        let overlay = if entries.is_empty() { None } else { Some(entries) };
+        let overlay = if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
+        };
         send_slot_content_with_overlay("content", content, overlay);
     } else if panel_id == "recordings" {
         // Seed the recordings Table rows into the content slot's state_overlay so
         // it mounts populated (same mechanism as the cameras Table).
         let mut entries: Vec<StateEntry> = Vec::new();
-        if let Some(rows) = PENDING_RECORDING_ROWS.lock().ok().and_then(|mut g| g.take()) {
+        if let Some(rows) = PENDING_RECORDING_ROWS
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+        {
             entries.push(StateEntry {
                 path: StatePath::new(vec![PathSegment::Key("recordings_rows".into())]),
                 value: rows,
@@ -2788,7 +3192,11 @@ fn render_panel(panel_id: &str) {
                 value: Value::Text(val),
             });
         }
-        let overlay = if entries.is_empty() { None } else { Some(entries) };
+        let overlay = if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
+        };
         send_slot_content_with_overlay("content", content, overlay);
     } else if panel_id == "profiles" {
         let mut entries: Vec<StateEntry> = Vec::new();
@@ -2803,7 +3211,11 @@ fn render_panel(panel_id: &str) {
         if with_state(|s| s.profiles.builder_visible) {
             entries.extend(profile_builder_overlay());
         }
-        let overlay = if entries.is_empty() { None } else { Some(entries) };
+        let overlay = if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
+        };
         send_slot_content_with_overlay("content", content, overlay);
     } else if panel_id == "models" {
         let mut entries: Vec<StateEntry> = Vec::new();
@@ -2859,18 +3271,23 @@ fn render_panel(panel_id: &str) {
     } else if panel_id == "audit" {
         // Seed the audit filter search box and, when a retention card is being
         // edited, its bound number input so both mount with the current values.
-        let (query, editing, draft) = with_state(|s| (
-            s.audit.query.clone(),
-            s.audit.retention_editing.clone(),
-            s.audit.retention_draft.clone(),
-        ));
+        let (query, editing, draft) = with_state(|s| {
+            (
+                s.audit.query.clone(),
+                s.audit.retention_editing.clone(),
+                s.audit.retention_draft.clone(),
+            )
+        });
         let mut entries = vec![StateEntry {
             path: StatePath::new(vec![PathSegment::Key("audit_search".into())]),
             value: Value::Text(query),
         }];
         if let Some(class) = editing {
             entries.push(StateEntry {
-                path: StatePath::new(vec![PathSegment::Key(alloc::format!("retention_input_{}", class.to_lowercase()))]),
+                path: StatePath::new(vec![PathSegment::Key(alloc::format!(
+                    "retention_input_{}",
+                    class.to_lowercase()
+                ))]),
                 value: Value::Text(draft),
             });
         }
@@ -2885,7 +3302,11 @@ fn render_panel(panel_id: &str) {
                 value: rows,
             });
         }
-        if let Some(rows) = PENDING_RECIPIENT_ROWS.lock().ok().and_then(|mut g| g.take()) {
+        if let Some(rows) = PENDING_RECIPIENT_ROWS
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+        {
             entries.push(StateEntry {
                 path: StatePath::new(vec![PathSegment::Key("recipients_rows".into())]),
                 value: rows,
@@ -2939,7 +3360,11 @@ fn render_panel(panel_id: &str) {
     if panel_id == "cameras" && with_state(|s| s.add_form_visible) {
         // Seed the full wizard store state alongside the body so the bound
         // visibility flags, StepProgress and inputs resolve on first paint.
-        send_slot_content_with_overlay("add_camera_body", build_add_camera_body(), Some(wizard_full_overlay()));
+        send_slot_content_with_overlay(
+            "add_camera_body",
+            build_add_camera_body(),
+            Some(wizard_full_overlay()),
+        );
         send_slot_content("add_camera_footer", build_add_camera_footer());
     }
 
@@ -2948,7 +3373,10 @@ fn render_panel(panel_id: &str) {
     // Modal's dynamic slot container already exists.
     if panel_id == "recordings" {
         if let Some(rec_ref) = with_state(|s| s.recording_playing.clone()) {
-            send_slot_content("recording_player_body", build_recording_player_body(&rec_ref));
+            send_slot_content(
+                "recording_player_body",
+                build_recording_player_body(&rec_ref),
+            );
         }
     }
 }
@@ -2970,13 +3398,20 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
                 .to_string();
             with_state(|s| {
                 s.clear_messages();
-                s.recording_playing = if rec_ref.is_empty() { None } else { Some(rec_ref) };
+                s.recording_playing = if rec_ref.is_empty() {
+                    None
+                } else {
+                    Some(rec_ref)
+                };
             });
             render_panel("recordings");
             json!({"ok":true})
         }
         "recordings-close" => {
-            with_state(|s| { s.recording_playing = None; s.clear_messages(); });
+            with_state(|s| {
+                s.recording_playing = None;
+                s.clear_messages();
+            });
             render_panel("recordings");
             json!({"ok":true})
         }
@@ -3022,48 +3457,217 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
             render_panel("recordings");
             json!({"ok":true})
         }
-        "recordings-refresh" => { render_panel("recordings"); json!({"ok":true}) }
+        "recordings-refresh" => {
+            render_panel("recordings");
+            json!({"ok":true})
+        }
         "camera-add-show" => handle_camera_add_show(),
-        "camera-add-cancel" => { with_state(|s| { s.add_form_visible = false; s.wizard_step = 0; s.discover.reset(); s.clear_messages(); }); render_panel("cameras"); json!({"ok":true}) }
+        "camera-add-cancel" => {
+            with_state(|s| {
+                s.add_form_visible = false;
+                s.wizard_step = 0;
+                s.discover.reset();
+                s.clear_messages();
+            });
+            render_panel("cameras");
+            json!({"ok":true})
+        }
         "wizard-source-select" => handle_wizard_source_select(params),
         "wizard-field-change" => handle_wizard_field_change(params),
         "wizard-test" => handle_wizard_test(),
         "wizard-next" => handle_wizard_next(),
         "wizard-prev" => handle_wizard_prev(),
-        "cameras-filter-change" => { let v = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("chipId").and_then(|x| x.as_str())).unwrap_or("all").to_string(); with_state(|s| { s.cameras_filter = if v == "all" { String::new() } else { v }; }); json!({"ok":true}) }
+        "cameras-filter-change" => {
+            let v = params
+                .get("value")
+                .and_then(|x| x.as_str())
+                .or_else(|| params.get("chipId").and_then(|x| x.as_str()))
+                .unwrap_or("all")
+                .to_string();
+            with_state(|s| {
+                s.cameras_filter = if v == "all" { String::new() } else { v };
+            });
+            json!({"ok":true})
+        }
         "camera-add-submit" => handle_camera_add_submit(params),
-        "camera-row-select" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("camera_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.camera_pending_remove = if id.is_empty() { None } else { Some(id) }; }); json!({"ok":true}) }
-        "camera-remove-cancel" => { with_state(|s| { s.camera_pending_remove = None; s.clear_messages(); }); json!({"ok":true}) }
+        "camera-row-select" => {
+            let id = params
+                .get("row_id")
+                .and_then(|x| x.as_str())
+                .or_else(|| params.get("camera_id").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            with_state(|s| {
+                s.clear_messages();
+                s.camera_pending_remove = if id.is_empty() { None } else { Some(id) };
+            });
+            json!({"ok":true})
+        }
+        "camera-remove-cancel" => {
+            with_state(|s| {
+                s.camera_pending_remove = None;
+                s.clear_messages();
+            });
+            json!({"ok":true})
+        }
         "camera-remove" => handle_camera_remove(params),
-        "camera-flow-edit" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("camera_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.camera_pending_remove = None; s.camera_flow_edit = if id.is_empty() { None } else { Some(id) }; }); render_panel("cameras"); json!({"ok":true}) }
-        "camera-flow-cancel" => { with_state(|s| { s.camera_flow_edit = None; s.clear_messages(); }); render_panel("cameras"); json!({"ok":true}) }
+        "camera-flow-edit" => {
+            let id = params
+                .get("row_id")
+                .and_then(|x| x.as_str())
+                .or_else(|| params.get("camera_id").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            with_state(|s| {
+                s.clear_messages();
+                s.camera_pending_remove = None;
+                s.camera_flow_edit = if id.is_empty() { None } else { Some(id) };
+            });
+            render_panel("cameras");
+            json!({"ok":true})
+        }
+        "camera-flow-cancel" => {
+            with_state(|s| {
+                s.camera_flow_edit = None;
+                s.clear_messages();
+            });
+            render_panel("cameras");
+            json!({"ok":true})
+        }
         "camera-flow-change" => handle_camera_flow_change(params),
-        "camera-pipeline-edit" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("camera_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.camera_pending_remove = None; s.camera_flow_edit = None; s.camera_pipeline_edit = if id.is_empty() { None } else { Some(id) }; }); render_panel("cameras"); json!({"ok":true}) }
-        "camera-pipeline-cancel" => { with_state(|s| { s.camera_pipeline_edit = None; s.clear_messages(); }); render_panel("cameras"); json!({"ok":true}) }
+        "camera-pipeline-edit" => {
+            let id = params
+                .get("row_id")
+                .and_then(|x| x.as_str())
+                .or_else(|| params.get("camera_id").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            with_state(|s| {
+                s.clear_messages();
+                s.camera_pending_remove = None;
+                s.camera_flow_edit = None;
+                s.camera_pipeline_edit = if id.is_empty() { None } else { Some(id) };
+            });
+            render_panel("cameras");
+            json!({"ok":true})
+        }
+        "camera-pipeline-cancel" => {
+            with_state(|s| {
+                s.camera_pipeline_edit = None;
+                s.clear_messages();
+            });
+            render_panel("cameras");
+            json!({"ok":true})
+        }
         "camera-pipeline-change" => handle_camera_pipeline_change(params),
-        "pipeline-manager-show" => { with_state(|s| { s.clear_messages(); s.cv_pipelines.manager_visible = true; s.cv_pipelines.pending_remove = None; }); render_panel("cameras"); json!({"ok":true}) }
-        "pipeline-manager-close" => { with_state(|s| { s.cv_pipelines.manager_visible = false; s.cv_pipelines.pending_remove = None; s.cv_pipelines.close_editor(); s.clear_messages(); }); render_panel("cameras"); json!({"ok":true}) }
-        "pipeline-new" => { with_state(|s| { s.clear_messages(); s.cv_pipelines.editor_visible = true; s.cv_pipelines.editing_id = None; s.cv_pipelines.pending_remove = None; s.cv_pipelines.name = "Nowy pipeline".to_string(); s.cv_pipelines.stages = vec![StageDraft::new_detect()]; }); render_panel("cameras"); json!({"ok":true}) }
+        "pipeline-manager-show" => {
+            with_state(|s| {
+                s.clear_messages();
+                s.cv_pipelines.manager_visible = true;
+                s.cv_pipelines.pending_remove = None;
+            });
+            render_panel("cameras");
+            json!({"ok":true})
+        }
+        "pipeline-manager-close" => {
+            with_state(|s| {
+                s.cv_pipelines.manager_visible = false;
+                s.cv_pipelines.pending_remove = None;
+                s.cv_pipelines.close_editor();
+                s.clear_messages();
+            });
+            render_panel("cameras");
+            json!({"ok":true})
+        }
+        "pipeline-new" => {
+            with_state(|s| {
+                s.clear_messages();
+                s.cv_pipelines.editor_visible = true;
+                s.cv_pipelines.editing_id = None;
+                s.cv_pipelines.pending_remove = None;
+                s.cv_pipelines.name = "Nowy pipeline".to_string();
+                s.cv_pipelines.stages = vec![StageDraft::new_detect()];
+            });
+            render_panel("cameras");
+            json!({"ok":true})
+        }
         "pipeline-edit" => handle_pipeline_edit(params),
         "pipeline-duplicate" => handle_pipeline_duplicate(params),
-        "pipeline-row-remove" => { let id = params.get("pipeline_id").and_then(|x| x.as_str()).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.cv_pipelines.pending_remove = if id.is_empty() { None } else { Some(id) }; }); render_panel("cameras"); json!({"ok":true}) }
-        "pipeline-remove-cancel" => { with_state(|s| { s.cv_pipelines.pending_remove = None; s.clear_messages(); }); render_panel("cameras"); json!({"ok":true}) }
+        "pipeline-row-remove" => {
+            let id = params
+                .get("pipeline_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            with_state(|s| {
+                s.clear_messages();
+                s.cv_pipelines.pending_remove = if id.is_empty() { None } else { Some(id) };
+            });
+            render_panel("cameras");
+            json!({"ok":true})
+        }
+        "pipeline-remove-cancel" => {
+            with_state(|s| {
+                s.cv_pipelines.pending_remove = None;
+                s.clear_messages();
+            });
+            render_panel("cameras");
+            json!({"ok":true})
+        }
         "pipeline-remove" => handle_pipeline_remove(params),
-        "pipeline-name-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); with_state(|s| s.cv_pipelines.name = v); json!({"ok":true}) }
+        "pipeline-name-change" => {
+            let v = params
+                .get("value")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            with_state(|s| s.cv_pipelines.name = v);
+            json!({"ok":true})
+        }
         "pipeline-stage-field-change" => handle_pipeline_stage_field_change(params),
         "pipeline-stage-toggle" => handle_pipeline_stage_toggle(params),
         "pipeline-stage-add" => handle_pipeline_stage_add(),
-        "pipeline-stage-remove" => { let index: Option<usize> = params.get("index").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()); if let Some(i) = index { with_state(|s| { if i < s.cv_pipelines.stages.len() { s.cv_pipelines.stages.remove(i); } }); } render_panel("cameras"); json!({"ok":true}) }
+        "pipeline-stage-remove" => {
+            let index: Option<usize> = params
+                .get("index")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok());
+            if let Some(i) = index {
+                with_state(|s| {
+                    if i < s.cv_pipelines.stages.len() {
+                        s.cv_pipelines.stages.remove(i);
+                    }
+                });
+            }
+            render_panel("cameras");
+            json!({"ok":true})
+        }
         "pipeline-save" => handle_pipeline_save(),
-        "pipeline-editor-cancel" => { with_state(|s| { s.cv_pipelines.close_editor(); s.clear_messages(); }); render_panel("cameras"); json!({"ok":true}) }
+        "pipeline-editor-cancel" => {
+            with_state(|s| {
+                s.cv_pipelines.close_editor();
+                s.clear_messages();
+            });
+            render_panel("cameras");
+            json!({"ok":true})
+        }
         "discover-scan" => handle_discover_scan(),
         "discover-select" => handle_discover_select(params),
         "cameras-refresh" => handle_camera_refresh_status(),
-        "overview-refresh" => { with_state(|s| s.clear_messages()); json!({"ok":true}) }
+        "overview-refresh" => {
+            with_state(|s| s.clear_messages());
+            json!({"ok":true})
+        }
         "live-grid-change" => {
             // The segmented control commits its picked layout to settings so the
             // choice survives panel reopen; only the four allowed sizes persist.
-            let v = params.get("value").and_then(|x| x.as_str())
+            let v = params
+                .get("value")
+                .and_then(|x| x.as_str())
                 .or_else(|| params.get("chipId").and_then(|x| x.as_str()))
                 .unwrap_or("")
                 .trim()
@@ -3083,31 +3687,146 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
             json!({"ok":true})
         }
         "panel-navigate" => {
-            let target = params.get("panel_id")
+            let target = params
+                .get("panel_id")
                 .or_else(|| params.get("item_id"))
-                .and_then(|v| v.as_str()).unwrap_or("overview").to_string();
+                .and_then(|v| v.as_str())
+                .unwrap_or("overview")
+                .to_string();
             render_panel(&target);
             json!({"ok":true, "panel_id": target})
         }
-        "profiles-filter-change" => { let v = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("chipId").and_then(|x| x.as_str())).unwrap_or("all").to_string(); with_state(|s| { s.profiles.category = if v == "all" { String::new() } else { v }; }); json!({"ok":true}) }
-        "profile-add-show" => { with_state(|s| { s.clear_messages(); s.profiles.builder_visible = true; s.profiles.pending_remove = None; s.profiles.reset_form(); }); render_panel("profiles"); json!({"ok":true}) }
-        "profile-builder-cancel" => { with_state(|s| { s.profiles.builder_visible = false; s.profiles.editing_id = None; s.clear_messages(); }); render_panel("profiles"); json!({"ok":true}) }
+        "profiles-filter-change" => {
+            let v = params
+                .get("value")
+                .and_then(|x| x.as_str())
+                .or_else(|| params.get("chipId").and_then(|x| x.as_str()))
+                .unwrap_or("all")
+                .to_string();
+            with_state(|s| {
+                s.profiles.category = if v == "all" { String::new() } else { v };
+            });
+            json!({"ok":true})
+        }
+        "profile-add-show" => {
+            with_state(|s| {
+                s.clear_messages();
+                s.profiles.builder_visible = true;
+                s.profiles.pending_remove = None;
+                s.profiles.reset_form();
+            });
+            render_panel("profiles");
+            json!({"ok":true})
+        }
+        "profile-builder-cancel" => {
+            with_state(|s| {
+                s.profiles.builder_visible = false;
+                s.profiles.editing_id = None;
+                s.clear_messages();
+            });
+            render_panel("profiles");
+            json!({"ok":true})
+        }
         "profile-field-change" => handle_profile_field_change(params),
-        "profile-camera-toggle" => { let id = params.get("camera_id").and_then(|x| x.as_str()).or_else(|| params.get("row_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); if !id.is_empty() { with_state(|s| s.profiles.toggle_camera(&id)); } render_panel("profiles"); json!({"ok":true}) }
+        "profile-camera-toggle" => {
+            let id = params
+                .get("camera_id")
+                .and_then(|x| x.as_str())
+                .or_else(|| params.get("row_id").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !id.is_empty() {
+                with_state(|s| s.profiles.toggle_camera(&id));
+            }
+            render_panel("profiles");
+            json!({"ok":true})
+        }
         "profile-add-submit" => handle_profile_add_submit(),
         "profile-edit" => handle_profile_edit(params),
         "profile-toggle-enabled" => handle_profile_toggle_enabled(params),
-        "profile-row-select" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("profile_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.profiles.pending_remove = if id.is_empty() { None } else { Some(id) }; }); render_panel("profiles"); json!({"ok":true}) }
-        "profile-remove-cancel" => { with_state(|s| { s.profiles.pending_remove = None; s.clear_messages(); }); render_panel("profiles"); json!({"ok":true}) }
+        "profile-row-select" => {
+            let id = params
+                .get("row_id")
+                .and_then(|x| x.as_str())
+                .or_else(|| params.get("profile_id").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            with_state(|s| {
+                s.clear_messages();
+                s.profiles.pending_remove = if id.is_empty() { None } else { Some(id) };
+            });
+            render_panel("profiles");
+            json!({"ok":true})
+        }
+        "profile-remove-cancel" => {
+            with_state(|s| {
+                s.profiles.pending_remove = None;
+                s.clear_messages();
+            });
+            render_panel("profiles");
+            json!({"ok":true})
+        }
         "profile-remove" => handle_profile_remove(params),
-        "alarm-select" => { let id = params.get("alarm_id").and_then(|x| x.as_str()).or_else(|| params.get("rowId").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.clear_messages(); s.alarms.selected_id = if id.is_empty() { None } else { Some(id) }; s.alarms.note.clear(); }); render_panel("alarms"); json!({"ok":true}) }
-        "alarm-status-view" => { let v = params.get("view").and_then(|x| x.as_str()).unwrap_or("open").to_string(); with_state(|s| { s.alarms.status_view = if v == "open" { String::new() } else { v }; }); render_panel("alarms"); json!({"ok":true}) }
-        "alarm-filter-severity" => { let v = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("chipId").and_then(|x| x.as_str())).unwrap_or("all").to_string(); with_state(|s| { s.alarms.severity_filter = if v == "all" { String::new() } else { v }; }); render_panel("alarms"); json!({"ok":true}) }
-        "alarm-note-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); with_state(|s| s.alarms.note = v); json!({"ok":true}) }
+        "alarm-select" => {
+            let id = params
+                .get("alarm_id")
+                .and_then(|x| x.as_str())
+                .or_else(|| params.get("rowId").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .to_string();
+            with_state(|s| {
+                s.clear_messages();
+                s.alarms.selected_id = if id.is_empty() { None } else { Some(id) };
+                s.alarms.note.clear();
+            });
+            render_panel("alarms");
+            json!({"ok":true})
+        }
+        "alarm-status-view" => {
+            let v = params
+                .get("view")
+                .and_then(|x| x.as_str())
+                .unwrap_or("open")
+                .to_string();
+            with_state(|s| {
+                s.alarms.status_view = if v == "open" { String::new() } else { v };
+            });
+            render_panel("alarms");
+            json!({"ok":true})
+        }
+        "alarm-filter-severity" => {
+            let v = params
+                .get("value")
+                .and_then(|x| x.as_str())
+                .or_else(|| params.get("chipId").and_then(|x| x.as_str()))
+                .unwrap_or("all")
+                .to_string();
+            with_state(|s| {
+                s.alarms.severity_filter = if v == "all" { String::new() } else { v };
+            });
+            render_panel("alarms");
+            json!({"ok":true})
+        }
+        "alarm-note-change" => {
+            let v = params
+                .get("value")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            with_state(|s| s.alarms.note = v);
+            json!({"ok":true})
+        }
         "alarm-decide" => handle_alarm_decide(params),
         "alarm-acknowledge-all" => handle_alarm_acknowledge_all(),
         "alarm-simulate" => handle_alarm_simulate(),
-        "alarm-mute-sound" => { with_state(|s| { s.alarms.sound_muted = !s.alarms.sound_muted; }); json!({"ok":true}) }
+        "alarm-mute-sound" => {
+            with_state(|s| {
+                s.alarms.sound_muted = !s.alarms.sound_muted;
+            });
+            json!({"ok":true})
+        }
         "search-mode-change" => handle_search_mode_change(params),
         "search-field-change" => handle_search_field_change(params),
         "search-submit" => handle_search_submit(params),
@@ -3117,61 +3836,402 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
         "reid-flag-set" => handle_reid_flag_set(params),
         "reid-legalgrant-request" => handle_reid_legalgrant_request(),
         "reid-query" => handle_reid_query(),
-        "model-row-expand" => { let id = params.get("id").and_then(|x| x.as_str()).or_else(|| params.get("rowId").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.models.expanded_id = if id.is_empty() || s.models.expanded_id.as_deref() == Some(id.as_str()) { None } else { Some(id) }; }); json!({"ok":true}) }
-        "model-add-show" => { with_state(|s| { s.clear_messages(); s.models.form_visible = true; s.models.pending_remove = None; s.models.budget_editing = false; s.models.reset_form(); }); render_panel("models"); json!({"ok":true}) }
-        "model-form-cancel" => { with_state(|s| { s.models.form_visible = false; s.models.editing_id = None; s.clear_messages(); }); render_panel("models"); json!({"ok":true}) }
+        "model-row-expand" => {
+            let id = params
+                .get("id")
+                .and_then(|x| x.as_str())
+                .or_else(|| params.get("rowId").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .to_string();
+            with_state(|s| {
+                s.models.expanded_id =
+                    if id.is_empty() || s.models.expanded_id.as_deref() == Some(id.as_str()) {
+                        None
+                    } else {
+                        Some(id)
+                    };
+            });
+            json!({"ok":true})
+        }
+        "model-add-show" => {
+            with_state(|s| {
+                s.clear_messages();
+                s.models.form_visible = true;
+                s.models.pending_remove = None;
+                s.models.budget_editing = false;
+                s.models.reset_form();
+            });
+            render_panel("models");
+            json!({"ok":true})
+        }
+        "model-form-cancel" => {
+            with_state(|s| {
+                s.models.form_visible = false;
+                s.models.editing_id = None;
+                s.clear_messages();
+            });
+            render_panel("models");
+            json!({"ok":true})
+        }
         "model-field-change" => handle_model_field_change(params),
         "model-add-submit" => handle_model_add_submit(),
         "model-edit" => handle_model_edit(params),
-        "model-row-select" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("model_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.models.pending_remove = if id.is_empty() { None } else { Some(id) }; }); render_panel("models"); json!({"ok":true}) }
-        "model-remove-cancel" => { with_state(|s| { s.models.pending_remove = None; s.clear_messages(); }); render_panel("models"); json!({"ok":true}) }
+        "model-row-select" => {
+            let id = params
+                .get("row_id")
+                .and_then(|x| x.as_str())
+                .or_else(|| params.get("model_id").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            with_state(|s| {
+                s.clear_messages();
+                s.models.pending_remove = if id.is_empty() { None } else { Some(id) };
+            });
+            render_panel("models");
+            json!({"ok":true})
+        }
+        "model-remove-cancel" => {
+            with_state(|s| {
+                s.models.pending_remove = None;
+                s.clear_messages();
+            });
+            render_panel("models");
+            json!({"ok":true})
+        }
         "model-remove" => handle_model_remove(params),
         "model-rollback" => handle_model_rollback(params),
-        "model-benchmark" | "model-upload-onnx" => { with_state(|s| { s.clear_messages(); s.success_message = Some("Ta operacja wymaga uruchomionego runtime inferencji (brak backendu).".into()); }); render_panel("models"); json!({"ok":true,"noop":true}) }
-        "model-budget-edit" => { with_state(|s| { s.clear_messages(); s.models.budget_editing = true; s.models.form_visible = false; s.models.budget_draft = alloc::format!("{}", db::get_setting_i64("vram_budget_mb", DEFAULT_VRAM_BUDGET_MB)); }); render_panel("models"); json!({"ok":true}) }
-        "model-budget-cancel" => { with_state(|s| { s.models.budget_editing = false; s.clear_messages(); }); render_panel("models"); json!({"ok":true}) }
-        "model-budget-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); with_state(|s| s.models.budget_draft = v); json!({"ok":true}) }
+        "model-benchmark" | "model-upload-onnx" => {
+            with_state(|s| {
+                s.clear_messages();
+                s.success_message = Some(
+                    "Ta operacja wymaga uruchomionego runtime inferencji (brak backendu).".into(),
+                );
+            });
+            render_panel("models");
+            json!({"ok":true,"noop":true})
+        }
+        "model-budget-edit" => {
+            with_state(|s| {
+                s.clear_messages();
+                s.models.budget_editing = true;
+                s.models.form_visible = false;
+                s.models.budget_draft = alloc::format!(
+                    "{}",
+                    db::get_setting_i64("vram_budget_mb", DEFAULT_VRAM_BUDGET_MB)
+                );
+            });
+            render_panel("models");
+            json!({"ok":true})
+        }
+        "model-budget-cancel" => {
+            with_state(|s| {
+                s.models.budget_editing = false;
+                s.clear_messages();
+            });
+            render_panel("models");
+            json!({"ok":true})
+        }
+        "model-budget-change" => {
+            let v = params
+                .get("value")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            with_state(|s| s.models.budget_draft = v);
+            json!({"ok":true})
+        }
         "model-budget-save" => handle_model_budget_save(),
-        "zone-select-camera" => { let id = params.get("value").and_then(|x| x.as_str()).or_else(|| params.get("camera_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.zones.selected_camera_id = if id.is_empty() { None } else { Some(id) }; s.zones.zone_form_visible = false; s.zones.rule_form_visible = false; s.zones.zone_pending_remove = None; }); render_panel("zones"); json!({"ok":true}) }
-        "zone-add-start" => { with_state(|s| { s.clear_messages(); s.zones.zone_form_visible = true; s.zones.rule_form_visible = false; s.zones.zone_pending_remove = None; s.zones.reset_zone_form(); }); render_panel("zones"); json!({"ok":true}) }
-        "zone-form-cancel" => { with_state(|s| { s.zones.zone_form_visible = false; s.clear_messages(); }); render_panel("zones"); json!({"ok":true}) }
+        "zone-select-camera" => {
+            let id = params
+                .get("value")
+                .and_then(|x| x.as_str())
+                .or_else(|| params.get("camera_id").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            with_state(|s| {
+                s.clear_messages();
+                s.zones.selected_camera_id = if id.is_empty() { None } else { Some(id) };
+                s.zones.zone_form_visible = false;
+                s.zones.rule_form_visible = false;
+                s.zones.zone_pending_remove = None;
+            });
+            render_panel("zones");
+            json!({"ok":true})
+        }
+        "zone-add-start" => {
+            with_state(|s| {
+                s.clear_messages();
+                s.zones.zone_form_visible = true;
+                s.zones.rule_form_visible = false;
+                s.zones.zone_pending_remove = None;
+                s.zones.reset_zone_form();
+            });
+            render_panel("zones");
+            json!({"ok":true})
+        }
+        "zone-form-cancel" => {
+            with_state(|s| {
+                s.zones.zone_form_visible = false;
+                s.clear_messages();
+            });
+            render_panel("zones");
+            json!({"ok":true})
+        }
         "zone-field-change" => handle_zone_field_change(params),
         "zone-add-submit" => handle_zone_add_submit(),
-        "zone-row-select" => { let id = params.get("row_id").and_then(|x| x.as_str()).or_else(|| params.get("zone_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.zones.zone_pending_remove = if id.is_empty() { None } else { Some(id) }; }); render_panel("zones"); json!({"ok":true}) }
-        "zone-remove-cancel" => { with_state(|s| { s.zones.zone_pending_remove = None; s.clear_messages(); }); render_panel("zones"); json!({"ok":true}) }
+        "zone-row-select" => {
+            let id = params
+                .get("row_id")
+                .and_then(|x| x.as_str())
+                .or_else(|| params.get("zone_id").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            with_state(|s| {
+                s.clear_messages();
+                s.zones.zone_pending_remove = if id.is_empty() { None } else { Some(id) };
+            });
+            render_panel("zones");
+            json!({"ok":true})
+        }
+        "zone-remove-cancel" => {
+            with_state(|s| {
+                s.zones.zone_pending_remove = None;
+                s.clear_messages();
+            });
+            render_panel("zones");
+            json!({"ok":true})
+        }
         "zone-remove" => handle_zone_remove(params),
         "schedule-cell-toggle" => handle_schedule_cell_toggle(params),
-        "rule-add-start" => { with_state(|s| { s.clear_messages(); s.zones.rule_form_visible = true; s.zones.zone_form_visible = false; s.zones.reset_rule_form(); }); render_panel("zones"); json!({"ok":true}) }
-        "rule-form-cancel" => { with_state(|s| { s.zones.rule_form_visible = false; s.clear_messages(); }); render_panel("zones"); json!({"ok":true}) }
+        "rule-add-start" => {
+            with_state(|s| {
+                s.clear_messages();
+                s.zones.rule_form_visible = true;
+                s.zones.zone_form_visible = false;
+                s.zones.reset_rule_form();
+            });
+            render_panel("zones");
+            json!({"ok":true})
+        }
+        "rule-form-cancel" => {
+            with_state(|s| {
+                s.zones.rule_form_visible = false;
+                s.clear_messages();
+            });
+            render_panel("zones");
+            json!({"ok":true})
+        }
         "rule-field-change" => handle_rule_field_change(params),
         "rule-add-submit" => handle_rule_add_submit(),
         "rule-row-select" => handle_rule_remove(params),
-        "audit-filter-change" => { with_state(|s| { let id = params.get("id").and_then(|x| x.as_str()).unwrap_or(""); match id { "date_preset" => s.audit.date_preset = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(), "query" => s.audit.query = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(), _ => {} } }); render_panel("audit"); json!({"ok":true}) }
-        "audit-clear-filters" => { with_state(|s| s.audit.clear_filters()); render_panel("audit"); json!({"ok":true}) }
-        "audit-row-expand" => { let id = params.get("id").and_then(|x| x.as_str()).or_else(|| params.get("rowId").and_then(|x| x.as_str())).unwrap_or("").to_string(); with_state(|s| { s.audit.expanded_id = if id.is_empty() || s.audit.expanded_id.as_deref() == Some(id.as_str()) { None } else { Some(id) }; }); render_panel("audit"); json!({"ok":true}) }
+        "audit-filter-change" => {
+            with_state(|s| {
+                let id = params.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                match id {
+                    "date_preset" => {
+                        s.audit.date_preset = params
+                            .get("value")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    }
+                    "query" => {
+                        s.audit.query = params
+                            .get("value")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    }
+                    _ => {}
+                }
+            });
+            render_panel("audit");
+            json!({"ok":true})
+        }
+        "audit-clear-filters" => {
+            with_state(|s| s.audit.clear_filters());
+            render_panel("audit");
+            json!({"ok":true})
+        }
+        "audit-row-expand" => {
+            let id = params
+                .get("id")
+                .and_then(|x| x.as_str())
+                .or_else(|| params.get("rowId").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .to_string();
+            with_state(|s| {
+                s.audit.expanded_id =
+                    if id.is_empty() || s.audit.expanded_id.as_deref() == Some(id.as_str()) {
+                        None
+                    } else {
+                        Some(id)
+                    };
+            });
+            render_panel("audit");
+            json!({"ok":true})
+        }
         "audit-retention-edit" => handle_audit_retention_edit(params),
-        "audit-retention-cancel" => { with_state(|s| { s.audit.retention_editing = None; s.clear_messages(); }); render_panel("audit"); json!({"ok":true}) }
-        "audit-retention-change" => { let v = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); with_state(|s| s.audit.retention_draft = v); json!({"ok":true}) }
+        "audit-retention-cancel" => {
+            with_state(|s| {
+                s.audit.retention_editing = None;
+                s.clear_messages();
+            });
+            render_panel("audit");
+            json!({"ok":true})
+        }
+        "audit-retention-change" => {
+            let v = params
+                .get("value")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            with_state(|s| s.audit.retention_draft = v);
+            json!({"ok":true})
+        }
         "audit-retention-save" => handle_audit_retention_save(params),
-        "audit-doc-generate" => { let kind = params.get("kind").and_then(|x| x.as_str()).unwrap_or("dokument").to_string(); with_state(|s| { s.clear_messages(); s.success_message = Some(alloc::format!("Generowanie dokumentu '{}' zostanie podłączone do backendu zgodności.", kind.to_uppercase())); }); render_panel("audit"); json!({"ok":true}) }
-        "evidence-new" => { with_state(|s| { s.clear_messages(); s.evidence.package_form_visible = true; s.evidence.recipient_form_visible = false; s.evidence.pending_remove = None; s.evidence.reset_package_form(); }); render_panel("evidence"); json!({"ok":true}) }
-        "evidence-form-cancel" => { with_state(|s| { s.evidence.package_form_visible = false; s.clear_messages(); }); render_panel("evidence"); json!({"ok":true}) }
+        "audit-doc-generate" => {
+            let kind = params
+                .get("kind")
+                .and_then(|x| x.as_str())
+                .unwrap_or("dokument")
+                .to_string();
+            with_state(|s| {
+                s.clear_messages();
+                s.success_message = Some(alloc::format!(
+                    "Generowanie dokumentu '{}' zostanie podłączone do backendu zgodności.",
+                    kind.to_uppercase()
+                ));
+            });
+            render_panel("audit");
+            json!({"ok":true})
+        }
+        "evidence-new" => {
+            with_state(|s| {
+                s.clear_messages();
+                s.evidence.package_form_visible = true;
+                s.evidence.recipient_form_visible = false;
+                s.evidence.pending_remove = None;
+                s.evidence.reset_package_form();
+            });
+            render_panel("evidence");
+            json!({"ok":true})
+        }
+        "evidence-form-cancel" => {
+            with_state(|s| {
+                s.evidence.package_form_visible = false;
+                s.clear_messages();
+            });
+            render_panel("evidence");
+            json!({"ok":true})
+        }
         "evidence-field-change" => handle_evidence_field_change(params),
         "evidence-create" => handle_evidence_create(),
-        "evidence-row-select" => { let id = params.get("evidence_id").and_then(|x| x.as_str()).or_else(|| params.get("row_id").and_then(|x| x.as_str())).unwrap_or("").trim().to_string(); with_state(|s| { s.clear_messages(); s.evidence.pending_remove = if id.is_empty() { None } else { Some(id) }; }); render_panel("evidence"); json!({"ok":true}) }
-        "evidence-remove-cancel" => { with_state(|s| { s.evidence.pending_remove = None; s.clear_messages(); }); render_panel("evidence"); json!({"ok":true}) }
+        "evidence-row-select" => {
+            let id = params
+                .get("evidence_id")
+                .and_then(|x| x.as_str())
+                .or_else(|| params.get("row_id").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            with_state(|s| {
+                s.clear_messages();
+                s.evidence.pending_remove = if id.is_empty() { None } else { Some(id) };
+            });
+            render_panel("evidence");
+            json!({"ok":true})
+        }
+        "evidence-remove-cancel" => {
+            with_state(|s| {
+                s.evidence.pending_remove = None;
+                s.clear_messages();
+            });
+            render_panel("evidence");
+            json!({"ok":true})
+        }
         "evidence-remove" => handle_evidence_remove(params),
-        "evidence-download" | "evidence-verify" | "evidence-sign" => { with_state(|s| { s.clear_messages(); s.success_message = Some("Podpis HSM/TSA wymaga skonfigurowanego modułu — brak backendu.".into()); }); render_panel("evidence"); json!({"ok":true,"noop":true}) }
-        "evidence-recipient-add-show" => { with_state(|s| { s.clear_messages(); s.evidence.recipient_form_visible = true; s.evidence.package_form_visible = false; s.evidence.pending_remove = None; s.evidence.reset_recipient_form(); }); render_panel("evidence"); json!({"ok":true}) }
-        "evidence-recipient-cancel" => { with_state(|s| { s.evidence.recipient_form_visible = false; s.clear_messages(); }); render_panel("evidence"); json!({"ok":true}) }
+        "evidence-download" | "evidence-verify" | "evidence-sign" => {
+            with_state(|s| {
+                s.clear_messages();
+                s.success_message =
+                    Some("Podpis HSM/TSA wymaga skonfigurowanego modułu — brak backendu.".into());
+            });
+            render_panel("evidence");
+            json!({"ok":true,"noop":true})
+        }
+        "evidence-recipient-add-show" => {
+            with_state(|s| {
+                s.clear_messages();
+                s.evidence.recipient_form_visible = true;
+                s.evidence.package_form_visible = false;
+                s.evidence.pending_remove = None;
+                s.evidence.reset_recipient_form();
+            });
+            render_panel("evidence");
+            json!({"ok":true})
+        }
+        "evidence-recipient-cancel" => {
+            with_state(|s| {
+                s.evidence.recipient_form_visible = false;
+                s.clear_messages();
+            });
+            render_panel("evidence");
+            json!({"ok":true})
+        }
         "evidence-recipient-field-change" => handle_evidence_recipient_field_change(params),
         "evidence-recipient-add" => handle_evidence_recipient_add(),
         "evidence-recipient-remove" => handle_evidence_recipient_remove(params),
-        "settings-field-change" => { let key = params.get("key").and_then(|x| x.as_str()).unwrap_or("").to_string(); let value = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string(); if !key.is_empty() { with_state(|s| s.settings.set_edit(&key, value)); } json!({"ok":true}) }
-        "settings-toggle-change" => { let key = params.get("key").and_then(|x| x.as_str()).unwrap_or("").to_string(); let on = params.get("value").and_then(|x| x.as_bool()).or_else(|| params.get("checked").and_then(|x| x.as_bool())).unwrap_or(false); if !key.is_empty() { with_state(|s| s.settings.set_edit(&key, if on { "1".into() } else { "0".into() })); } json!({"ok":true}) }
+        "settings-field-change" => {
+            let key = params
+                .get("key")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let value = params
+                .get("value")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !key.is_empty() {
+                with_state(|s| s.settings.set_edit(&key, value));
+            }
+            json!({"ok":true})
+        }
+        "settings-toggle-change" => {
+            let key = params
+                .get("key")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let on = params
+                .get("value")
+                .and_then(|x| x.as_bool())
+                .or_else(|| params.get("checked").and_then(|x| x.as_bool()))
+                .unwrap_or(false);
+            if !key.is_empty() {
+                with_state(|s| {
+                    s.settings
+                        .set_edit(&key, if on { "1".into() } else { "0".into() })
+                });
+            }
+            json!({"ok":true})
+        }
         "settings-save" => handle_settings_save(),
         "onboarding-next" => handle_onboarding_next(),
-        "onboarding-prev" => { with_state(|s| { s.clear_messages(); if s.onboarding.step > 0 { s.onboarding.step -= 1; } }); render_panel("onboarding"); json!({"ok":true}) }
+        "onboarding-prev" => {
+            with_state(|s| {
+                s.clear_messages();
+                if s.onboarding.step > 0 {
+                    s.onboarding.step -= 1;
+                }
+            });
+            render_panel("onboarding");
+            json!({"ok":true})
+        }
         "onboarding-pick-role" => handle_onboarding_pick("role", params),
         "onboarding-pick-legal" => handle_onboarding_pick("legal", params),
         "onboarding-pick-presets" => handle_onboarding_pick("presets", params),
@@ -3194,14 +4254,24 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
 /// body and footer fragments exactly once, seeding all wizard store keys via the
 /// body's `state_overlay`. Every later interaction mutates the store, not the DOM.
 fn handle_camera_add_show() -> JsonValue {
-    with_state(|s| { s.add_form_visible = true; s.wizard_step = 0; s.discover.reset(); s.clear_messages(); });
+    with_state(|s| {
+        s.add_form_visible = true;
+        s.wizard_step = 0;
+        s.discover.reset();
+        s.clear_messages();
+    });
     // Enumerate USB devices up front so the device Select can carry real options.
     let devices = camera_local_devices();
     with_state(|s| {
         s.discover.usb_loaded = true;
         if let Ok(list) = devices {
-            s.discover.usb_devices = list.into_iter()
-                .map(|d| LocalDevice { device_path: d.device_path, label: d.label, vendor: d.vendor })
+            s.discover.usb_devices = list
+                .into_iter()
+                .map(|d| LocalDevice {
+                    device_path: d.device_path,
+                    label: d.label,
+                    vendor: d.vendor,
+                })
                 .collect();
         }
     });
@@ -3213,7 +4283,9 @@ fn handle_camera_add_show() -> JsonValue {
 /// footer flags and clears any error. No fragment is re-sent.
 fn handle_wizard_prev() -> JsonValue {
     let step = with_state(|s| {
-        if s.wizard_step > 0 { s.wizard_step -= 1; }
+        if s.wizard_step > 0 {
+            s.wizard_step -= 1;
+        }
         s.error_message = None;
         s.wizard_step
     });
@@ -3230,7 +4302,9 @@ fn handle_wizard_prev() -> JsonValue {
 /// the RadioCardGroup highlight follows `wiz_src` and the config blocks toggle
 /// via `wiz_is_*` without rebuilding the body.
 fn handle_wizard_source_select(params: &JsonValue) -> JsonValue {
-    let raw = params.get("source_type").and_then(|v| v.as_str())
+    let raw = params
+        .get("source_type")
+        .and_then(|v| v.as_str())
         .or_else(|| params.get("value").and_then(|v| v.as_str()))
         .unwrap_or("");
     let t = match SourceType::from_str(raw) {
@@ -3258,7 +4332,13 @@ fn handle_wizard_source_select(params: &JsonValue) -> JsonValue {
     if changed {
         // Mirror the per-type field reset into the bound store keys so any
         // previously typed value disappears from the inputs as well.
-        for key in ["onvif_url", "rtsp_url", "mjpeg_url", "usb_device_path", "file_path"] {
+        for key in [
+            "onvif_url",
+            "rtsp_url",
+            "mjpeg_url",
+            "usb_device_path",
+            "file_path",
+        ] {
             pairs.push((key.into(), Value::Text(String::new())));
         }
         pairs.extend(wizard_test_pairs(&DiscoverState::new()));
@@ -3276,23 +4356,25 @@ fn handle_wizard_source_select(params: &JsonValue) -> JsonValue {
 /// backend state for step-3 testing and submit validation.
 fn handle_wizard_field_change(params: &JsonValue) -> JsonValue {
     let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("");
-    let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    with_state(|s| {
-        match field {
-            "onvif_url" => s.discover.onvif_url = value,
-            "rtsp_url" => s.discover.rtsp_url = value,
-            "mjpeg_url" => s.discover.mjpeg_url = value,
-            "usb_device_path" => s.discover.usb_device_path = value,
-            "file_path" => s.discover.file_path = value,
-            "cred_user" => s.discover.cred_user = value,
-            "cred_pass" => s.discover.cred_pass = value,
-            "name" => s.discover.name = value,
-            "retention" => s.discover.retention = value,
-            "fps" => s.discover.fps = value,
-            "analysis_fps" => s.discover.analysis_fps = value,
-            "profile" => s.discover.profile = value,
-            _ => {}
-        }
+    let value = params
+        .get("value")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    with_state(|s| match field {
+        "onvif_url" => s.discover.onvif_url = value,
+        "rtsp_url" => s.discover.rtsp_url = value,
+        "mjpeg_url" => s.discover.mjpeg_url = value,
+        "usb_device_path" => s.discover.usb_device_path = value,
+        "file_path" => s.discover.file_path = value,
+        "cred_user" => s.discover.cred_user = value,
+        "cred_pass" => s.discover.cred_pass = value,
+        "name" => s.discover.name = value,
+        "retention" => s.discover.retention = value,
+        "fps" => s.discover.fps = value,
+        "analysis_fps" => s.discover.analysis_fps = value,
+        "profile" => s.discover.profile = value,
+        _ => {}
     });
     json!({"ok":true})
 }
@@ -3301,7 +4383,12 @@ fn handle_wizard_field_change(params: &JsonValue) -> JsonValue {
 /// and patches the step-3 result flags + text. Never fabricates success. Pure
 /// `StatePatch`: the test block visibility and message follow the store.
 fn handle_wizard_test() -> JsonValue {
-    let target = with_state(|s| { s.discover.testing = true; s.discover.test_result = None; s.error_message = None; s.discover.resolve_target() });
+    let target = with_state(|s| {
+        s.discover.testing = true;
+        s.discover.test_result = None;
+        s.error_message = None;
+        s.discover.resolve_target()
+    });
     // Emit the spinner state as its own patch BEFORE the blocking probe so the
     // client paints the "testing" block; otherwise the only patch would arrive
     // after the probe returns and the spinner would never be seen.
@@ -3348,7 +4435,10 @@ fn handle_wizard_next() -> JsonValue {
                 send_state_patches(wizard_error_pairs(Some("Wybierz typ źródła kamery.")));
                 return json!({"ok":false,"error":"no source type"});
             }
-            with_state(|s| { s.wizard_step = 1; s.error_message = None; });
+            with_state(|s| {
+                s.wizard_step = 1;
+                s.error_message = None;
+            });
             advance_patch(1);
             json!({"ok":true})
         }
@@ -3356,14 +4446,21 @@ fn handle_wizard_next() -> JsonValue {
             let resolved = with_state(|s| s.discover.resolve_target());
             match resolved {
                 Ok(_) => {
-                    with_state(|s| { s.wizard_step = 2; s.discover.test_result = None; s.error_message = None; });
+                    with_state(|s| {
+                        s.wizard_step = 2;
+                        s.discover.test_result = None;
+                        s.error_message = None;
+                    });
                     let mut pairs = wizard_step_pairs(2);
                     pairs.extend(wizard_error_pairs(None));
                     pairs.extend(with_state(|s| wizard_test_pairs(&s.discover)));
                     send_state_patches(pairs);
                     json!({"ok":true})
                 }
-                Err(msg) => { send_state_patches(wizard_error_pairs(Some(msg))); json!({"ok":false,"error":"invalid target"}) }
+                Err(msg) => {
+                    send_state_patches(wizard_error_pairs(Some(msg)));
+                    json!({"ok":false,"error":"invalid target"})
+                }
             }
         }
         2 => {
@@ -3380,7 +4477,10 @@ fn handle_wizard_next() -> JsonValue {
                 }
                 None
             });
-            with_state(|s| { s.wizard_step = 3; s.error_message = None; });
+            with_state(|s| {
+                s.wizard_step = 3;
+                s.error_message = None;
+            });
             let mut pairs = wizard_step_pairs(3);
             pairs.extend(wizard_error_pairs(None));
             if let Some(name) = prefill_name {
@@ -3404,22 +4504,27 @@ fn advance_patch(step: u8) {
 /// (`wiz_error` + `wiz_has_error`) so it is visible inside the open modal, since
 /// the wizard no longer re-renders the body on each action.
 fn submit_fail(msg: &str, err_code: &str) -> JsonValue {
-    with_state(|s| { s.error_message = Some(msg.to_string()); });
+    with_state(|s| {
+        s.error_message = Some(msg.to_string());
+    });
     send_state_patches(wizard_error_pairs(Some(msg)));
     json!({"ok":false,"error":err_code})
 }
 
 fn handle_camera_add_submit(_params: &JsonValue) -> JsonValue {
-    let (target, name, fps, analysis_fps, profile, source_type, cred_user, cred_pass) = with_state(|s| (
-        s.discover.resolve_target(),
-        s.discover.name.trim().to_string(),
-        s.discover.fps_value(),
-        s.discover.analysis_fps_value(),
-        s.discover.profile_or_default().to_string(),
-        s.discover.source_type,
-        s.discover.cred_user.trim().to_string(),
-        s.discover.cred_pass.trim().to_string(),
-    ));
+    let (target, name, fps, analysis_fps, profile, source_type, cred_user, cred_pass) =
+        with_state(|s| {
+            (
+                s.discover.resolve_target(),
+                s.discover.name.trim().to_string(),
+                s.discover.fps_value(),
+                s.discover.analysis_fps_value(),
+                s.discover.profile_or_default().to_string(),
+                s.discover.source_type,
+                s.discover.cred_user.trim().to_string(),
+                s.discover.cred_pass.trim().to_string(),
+            )
+        });
     with_state(|s| s.clear_messages());
 
     if name.is_empty() || name.chars().count() > 60 {
@@ -3454,10 +4559,15 @@ fn handle_camera_add_submit(_params: &JsonValue) -> JsonValue {
     };
     let added = match camera_add(input) {
         Ok(o) => o,
-        Err(e) => return submit_fail(
-            &alloc::format!("Nie udało się uruchomić kamery w rdzeniu: {}", abi_message(e)),
-            &alloc::format!("{}", e),
-        ),
+        Err(e) => {
+            return submit_fail(
+                &alloc::format!(
+                    "Nie udało się uruchomić kamery w rdzeniu: {}",
+                    abi_message(e)
+                ),
+                &alloc::format!("{}", e),
+            )
+        }
     };
 
     // The cameras list reads from the addon DB; persist the row under the core id
@@ -3483,11 +4593,18 @@ fn handle_camera_add_submit(_params: &JsonValue) -> JsonValue {
     };
     match db::insert_camera_with_id(&added.camera_id, &new_cam) {
         Ok(()) => {
-            with_state(|s| { s.add_form_visible = false; s.discover.reset(); s.success_message = Some(alloc::format!("Kamera dodana ({}).", added.camera_id)); });
+            with_state(|s| {
+                s.add_form_visible = false;
+                s.discover.reset();
+                s.success_message = Some(alloc::format!("Kamera dodana ({}).", added.camera_id));
+            });
             render_panel("cameras");
             json!({"ok":true,"camera_id":added.camera_id})
         }
-        Err(e) => submit_fail(&alloc::format!("Błąd zapisu: {}", abi_message(e)), &alloc::format!("{}", e)),
+        Err(e) => submit_fail(
+            &alloc::format!("Błąd zapisu: {}", abi_message(e)),
+            &alloc::format!("{}", e),
+        ),
     }
 }
 
@@ -3514,7 +4631,12 @@ fn handle_camera_refresh_status() -> JsonValue {
     let cameras = match db::list_cameras() {
         Ok(c) => c,
         Err(e) => {
-            with_state(|s| { s.error_message = Some(alloc::format!("Nie udało się pobrać kamer: {}", abi_message(e))); });
+            with_state(|s| {
+                s.error_message = Some(alloc::format!(
+                    "Nie udało się pobrać kamer: {}",
+                    abi_message(e)
+                ));
+            });
             render_panel("cameras");
             return json!({"ok":false,"error":alloc::format!("{}",e)});
         }
@@ -3562,7 +4684,9 @@ fn handle_camera_refresh_status() -> JsonValue {
                 };
                 let _ = db::delete_camera(&c.id);
                 let _ = db::insert_camera_with_id(&added.camera_id, &rekeyed);
-                if probed == "online" { online += 1; }
+                if probed == "online" {
+                    online += 1;
+                }
                 continue;
             }
             // Core registration failed (e.g. needs credentials) — keep the row,
@@ -3573,17 +4697,35 @@ fn handle_camera_refresh_status() -> JsonValue {
             _ => "offline",
         };
         let _ = db::set_camera_status(&c.id, status);
-        if status == "online" { online += 1; }
+        if status == "online" {
+            online += 1;
+        }
     }
-    with_state(|s| { s.success_message = Some(alloc::format!("Odświeżono status: {}/{} online.", online, total)); });
+    with_state(|s| {
+        s.success_message = Some(alloc::format!(
+            "Odświeżono status: {}/{} online.",
+            online,
+            total
+        ));
+    });
     render_panel("cameras");
     json!({"ok":true,"online":online,"total":total})
 }
 
 fn handle_camera_remove(params: &JsonValue) -> JsonValue {
-    let camera_id = params.get("camera_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let camera_id = params
+        .get("camera_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     with_state(|s| s.clear_messages());
-    if camera_id.is_empty() { with_state(|s| { s.error_message = Some("Wybierz kamerę do usunięcia.".to_string()); }); return json!({"ok":false,"error":"empty camera_id"}); }
+    if camera_id.is_empty() {
+        with_state(|s| {
+            s.error_message = Some("Wybierz kamerę do usunięcia.".to_string());
+        });
+        return json!({"ok":false,"error":"empty camera_id"});
+    }
     // Remove from the CORE first — this soft-deletes the platform row and
     // tears down the ingest pipeline. Deleting only the addon-local row would
     // orphan the core camera: gone from the list, but the supervisor keeps
@@ -3592,13 +4734,29 @@ fn handle_camera_remove(params: &JsonValue) -> JsonValue {
     match camera_remove(&camera_id) {
         Ok(()) | Err(AbiError::NotFound) => {}
         Err(e) => {
-            with_state(|s| { s.error_message = Some(alloc::format!("Błąd usuwania z rdzenia: {}", abi_message(e))); });
+            with_state(|s| {
+                s.error_message = Some(alloc::format!(
+                    "Błąd usuwania z rdzenia: {}",
+                    abi_message(e)
+                ));
+            });
             return json!({"ok":false,"error":alloc::format!("{}",e)});
         }
     }
     match db::delete_camera(&camera_id) {
-        Ok(_) => { with_state(|s| { s.camera_pending_remove = None; s.success_message = Some("Kamera usunięta.".to_string()); }); json!({"ok":true}) }
-        Err(e) => { with_state(|s| { s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e))); }); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+        Ok(_) => {
+            with_state(|s| {
+                s.camera_pending_remove = None;
+                s.success_message = Some("Kamera usunięta.".to_string());
+            });
+            json!({"ok":true})
+        }
+        Err(e) => {
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e)));
+            });
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
     }
 }
 
@@ -3606,14 +4764,30 @@ fn handle_camera_remove(params: &JsonValue) -> JsonValue {
 /// (handler param) + `value` (chosen flow id; empty = clear). Assignment +
 /// validation (flow exists/active) happen in the core `camera_update_v1` host fn.
 fn handle_camera_flow_change(params: &JsonValue) -> JsonValue {
-    let camera_id = params.get("camera_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let camera_id = params
+        .get("camera_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let value = params
+        .get("value")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     with_state(|s| s.clear_messages());
     if camera_id.is_empty() {
-        with_state(|s| { s.error_message = Some("Brak kamery do przypisania flow.".to_string()); });
+        with_state(|s| {
+            s.error_message = Some("Brak kamery do przypisania flow.".to_string());
+        });
         return json!({"ok":false,"error":"empty camera_id"});
     }
-    let flow = if value.is_empty() { None } else { Some(value.as_str()) };
+    let flow = if value.is_empty() {
+        None
+    } else {
+        Some(value.as_str())
+    };
     match host_camera_set_flow(&camera_id, flow) {
         Ok(_) => {
             with_state(|s| {
@@ -3628,7 +4802,12 @@ fn handle_camera_flow_change(params: &JsonValue) -> JsonValue {
             json!({"ok":true})
         }
         Err(e) => {
-            with_state(|s| { s.error_message = Some(alloc::format!("Nie udało się przypisać flow: {}", abi_message(e))); });
+            with_state(|s| {
+                s.error_message = Some(alloc::format!(
+                    "Nie udało się przypisać flow: {}",
+                    abi_message(e)
+                ));
+            });
             render_panel("cameras");
             json!({"ok":false,"error":alloc::format!("{}",e)})
         }
@@ -3655,7 +4834,10 @@ fn stage_draft_from_json(v: &JsonValue) -> StageDraft {
         .and_then(|x| x.as_str().map(String::from))
         .unwrap_or_default();
     let input = v.get("input").cloned().unwrap_or(JsonValue::Null);
-    let kind = input.get("kind").and_then(|x| x.as_str()).unwrap_or("frame");
+    let kind = input
+        .get("kind")
+        .and_then(|x| x.as_str())
+        .unwrap_or("frame");
     let (fps, parent, classes) = if kind == "frame" {
         let fps = input
             .get("fps")
@@ -3664,11 +4846,20 @@ fn stage_draft_from_json(v: &JsonValue) -> StageDraft {
             .unwrap_or_default();
         (fps, String::new(), String::new())
     } else {
-        let parent = input.get("stage_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let parent = input
+            .get("stage_id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
         let classes = input
             .get("classes")
             .and_then(|c| c.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
             .unwrap_or_default();
         (String::new(), parent, classes)
     };
@@ -3679,7 +4870,11 @@ fn stage_draft_from_json(v: &JsonValue) -> StageDraft {
         .unwrap_or_default();
     let op = {
         let op = text("op");
-        if op.is_empty() { "detect".to_string() } else { op }
+        if op.is_empty() {
+            "detect".to_string()
+        } else {
+            op
+        }
     };
     StageDraft {
         stage_id: text("stage_id"),
@@ -3748,9 +4943,12 @@ fn pipeline_json_from_draft(stages: &[StageDraft]) -> Result<String, String> {
         obj.insert("input".into(), JsonValue::Object(input));
         if st.op == "detect" && !st.threshold.trim().is_empty() {
             // Tolerate the Polish decimal comma in the threshold input.
-            let t: f64 = st.threshold.trim().replace(',', ".").parse().map_err(|_| {
-                alloc::format!("etap '{}': próg musi być liczbą 0–1", stage_id)
-            })?;
+            let t: f64 = st
+                .threshold
+                .trim()
+                .replace(',', ".")
+                .parse()
+                .map_err(|_| alloc::format!("etap '{}': próg musi być liczbą 0–1", stage_id))?;
             obj.insert("threshold".into(), json!(t));
         }
         let mut params = st.params.clone();
@@ -3767,8 +4965,12 @@ fn pipeline_json_from_draft(stages: &[StageDraft]) -> Result<String, String> {
             obj.insert("params".into(), JsonValue::Object(params));
         }
         match st.op.as_str() {
-            "classify" => { obj.insert("output".into(), json!("stan")); }
-            "ocr" => { obj.insert("output".into(), json!("tekst")); }
+            "classify" => {
+                obj.insert("output".into(), json!("stan"));
+            }
+            "ocr" => {
+                obj.insert("output".into(), json!("tekst"));
+            }
             _ => {}
         }
         out.push(JsonValue::Object(obj));
@@ -3779,21 +4981,40 @@ fn pipeline_json_from_draft(stages: &[StageDraft]) -> Result<String, String> {
 
 /// First detect stage id of the draft — the default parent for new crop stages.
 fn first_detect_stage_id(stages: &[StageDraft]) -> Option<String> {
-    stages.iter().find(|s| s.op == "detect").map(|s| s.stage_id.clone())
+    stages
+        .iter()
+        .find(|s| s.op == "detect")
+        .map(|s| s.stage_id.clone())
 }
 
 /// Commits the CV-pipeline pick for a camera. The Select sends `camera_id`
 /// (handler param) + `value` (pipeline id; empty = clear → default pipeline).
 /// Existence validation happens in the core `camera_update_v1` host fn.
 fn handle_camera_pipeline_change(params: &JsonValue) -> JsonValue {
-    let camera_id = params.get("camera_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let camera_id = params
+        .get("camera_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let value = params
+        .get("value")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     with_state(|s| s.clear_messages());
     if camera_id.is_empty() {
-        with_state(|s| { s.error_message = Some("Brak kamery do przypisania pipeline'u.".to_string()); });
+        with_state(|s| {
+            s.error_message = Some("Brak kamery do przypisania pipeline'u.".to_string());
+        });
         return json!({"ok":false,"error":"empty camera_id"});
     }
-    let pipeline = if value.is_empty() { None } else { Some(value.as_str()) };
+    let pipeline = if value.is_empty() {
+        None
+    } else {
+        Some(value.as_str())
+    };
     match host_camera_set_cv_pipeline(&camera_id, pipeline) {
         Ok(_) => {
             with_state(|s| {
@@ -3808,7 +5029,12 @@ fn handle_camera_pipeline_change(params: &JsonValue) -> JsonValue {
             json!({"ok":true})
         }
         Err(e) => {
-            with_state(|s| { s.error_message = Some(alloc::format!("Nie udało się przypisać pipeline'u: {}", abi_message(e))); });
+            with_state(|s| {
+                s.error_message = Some(alloc::format!(
+                    "Nie udało się przypisać pipeline'u: {}",
+                    abi_message(e)
+                ));
+            });
             render_panel("cameras");
             json!({"ok":false,"error":alloc::format!("{}",e)})
         }
@@ -3817,7 +5043,12 @@ fn handle_camera_pipeline_change(params: &JsonValue) -> JsonValue {
 
 /// Opens the stage editor for an existing pipeline (fetched from core).
 fn handle_pipeline_edit(params: &JsonValue) -> JsonValue {
-    let id = params.get("pipeline_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let id = params
+        .get("pipeline_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     with_state(|s| s.clear_messages());
     if id.is_empty() {
         return json!({"ok":false,"error":"empty pipeline_id"});
@@ -3836,13 +5067,21 @@ fn handle_pipeline_edit(params: &JsonValue) -> JsonValue {
                 json!({"ok":true})
             }
             Err(e) => {
-                with_state(|s| { s.error_message = Some(alloc::format!("Nie udało się wczytać pipeline'u: {}", e)); });
+                with_state(|s| {
+                    s.error_message =
+                        Some(alloc::format!("Nie udało się wczytać pipeline'u: {}", e));
+                });
                 render_panel("cameras");
                 json!({"ok":false,"error":e})
             }
         },
         Err(e) => {
-            with_state(|s| { s.error_message = Some(alloc::format!("Nie udało się pobrać pipeline'u: {}", abi_message(e))); });
+            with_state(|s| {
+                s.error_message = Some(alloc::format!(
+                    "Nie udało się pobrać pipeline'u: {}",
+                    abi_message(e)
+                ));
+            });
             render_panel("cameras");
             json!({"ok":false,"error":alloc::format!("{}",e)})
         }
@@ -3852,7 +5091,12 @@ fn handle_pipeline_edit(params: &JsonValue) -> JsonValue {
 /// Opens the stage editor with a copy of an existing pipeline (saved as a new
 /// row on Zapisz — `editing_id = None` makes the host mint a fresh id).
 fn handle_pipeline_duplicate(params: &JsonValue) -> JsonValue {
-    let id = params.get("pipeline_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let id = params
+        .get("pipeline_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     with_state(|s| s.clear_messages());
     if id.is_empty() {
         return json!({"ok":false,"error":"empty pipeline_id"});
@@ -3871,13 +5115,21 @@ fn handle_pipeline_duplicate(params: &JsonValue) -> JsonValue {
                 json!({"ok":true})
             }
             Err(e) => {
-                with_state(|s| { s.error_message = Some(alloc::format!("Nie udało się wczytać pipeline'u: {}", e)); });
+                with_state(|s| {
+                    s.error_message =
+                        Some(alloc::format!("Nie udało się wczytać pipeline'u: {}", e));
+                });
                 render_panel("cameras");
                 json!({"ok":false,"error":e})
             }
         },
         Err(e) => {
-            with_state(|s| { s.error_message = Some(alloc::format!("Nie udało się pobrać pipeline'u: {}", abi_message(e))); });
+            with_state(|s| {
+                s.error_message = Some(alloc::format!(
+                    "Nie udało się pobrać pipeline'u: {}",
+                    abi_message(e)
+                ));
+            });
             render_panel("cameras");
             json!({"ok":false,"error":alloc::format!("{}",e)})
         }
@@ -3887,7 +5139,12 @@ fn handle_pipeline_duplicate(params: &JsonValue) -> JsonValue {
 /// Deletes a pipeline after the confirmation bar. Host refusals (default
 /// pipeline, still assigned to a camera) carry a readable message.
 fn handle_pipeline_remove(params: &JsonValue) -> JsonValue {
-    let id = params.get("pipeline_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let id = params
+        .get("pipeline_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     with_state(|s| s.clear_messages());
     if id.is_empty() {
         return json!({"ok":false,"error":"empty pipeline_id"});
@@ -3911,7 +5168,12 @@ fn handle_pipeline_remove(params: &JsonValue) -> JsonValue {
             json!({"ok":false,"error":reason})
         }
         Err(e) => {
-            with_state(|s| { s.error_message = Some(alloc::format!("Błąd usuwania pipeline'u: {}", abi_message(e))); });
+            with_state(|s| {
+                s.error_message = Some(alloc::format!(
+                    "Błąd usuwania pipeline'u: {}",
+                    abi_message(e)
+                ));
+            });
             render_panel("cameras");
             json!({"ok":false,"error":alloc::format!("{}",e)})
         }
@@ -3927,16 +5189,30 @@ fn handle_pipeline_remove(params: &JsonValue) -> JsonValue {
 /// source-stage options of crop stages, `classes` feeds the chips preview.
 /// Plain numeric/model fields do not re-render.
 fn handle_pipeline_stage_field_change(params: &JsonValue) -> JsonValue {
-    let index: usize = match params.get("index").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()) {
+    let index: usize = match params
+        .get("index")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+    {
         Some(i) => i,
         None => return json!({"ok":false,"error":"missing index"}),
     };
-    let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let field = params
+        .get("field")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let value = params
+        .get("value")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let rerender = matches!(field.as_str(), "op" | "parent" | "stage_id" | "classes");
     let applied = with_state(|s| {
         let default_parent = first_detect_stage_id(&s.cv_pipelines.stages).unwrap_or_default();
-        let Some(st) = s.cv_pipelines.stages.get_mut(index) else { return false; };
+        let Some(st) = s.cv_pipelines.stages.get_mut(index) else {
+            return false;
+        };
         match field.as_str() {
             "stage_id" => st.stage_id = value.clone(),
             "op" => {
@@ -3968,11 +5244,17 @@ fn handle_pipeline_stage_field_change(params: &JsonValue) -> JsonValue {
 
 /// Flips a stage's enabled toggle in the backend draft.
 fn handle_pipeline_stage_toggle(params: &JsonValue) -> JsonValue {
-    let index: usize = match params.get("index").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()) {
+    let index: usize = match params
+        .get("index")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+    {
         Some(i) => i,
         None => return json!({"ok":false,"error":"missing index"}),
     };
-    let on = params.get("value").and_then(|v| v.as_bool())
+    let on = params
+        .get("value")
+        .and_then(|v| v.as_bool())
         .or_else(|| params.get("checked").and_then(|v| v.as_bool()))
         .unwrap_or(false);
     with_state(|s| {
@@ -4006,20 +5288,26 @@ fn handle_pipeline_stage_add() -> JsonValue {
 /// shown in the panel; the editor stays open with the draft intact.
 fn handle_pipeline_save() -> JsonValue {
     with_state(|s| s.clear_messages());
-    let (editing_id, name, json_result) = with_state(|s| (
-        s.cv_pipelines.editing_id.clone(),
-        s.cv_pipelines.name.trim().to_string(),
-        pipeline_json_from_draft(&s.cv_pipelines.stages),
-    ));
+    let (editing_id, name, json_result) = with_state(|s| {
+        (
+            s.cv_pipelines.editing_id.clone(),
+            s.cv_pipelines.name.trim().to_string(),
+            pipeline_json_from_draft(&s.cv_pipelines.stages),
+        )
+    });
     if name.is_empty() {
-        with_state(|s| { s.error_message = Some("Podaj nazwę pipeline'u.".to_string()); });
+        with_state(|s| {
+            s.error_message = Some("Podaj nazwę pipeline'u.".to_string());
+        });
         render_panel("cameras");
         return json!({"ok":false,"error":"empty name"});
     }
     let pipeline_json = match json_result {
         Ok(j) => j,
         Err(e) => {
-            with_state(|s| { s.error_message = Some(alloc::format!("Nie można zapisać: {}", e)); });
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Nie można zapisać: {}", e));
+            });
             render_panel("cameras");
             return json!({"ok":false,"error":e});
         }
@@ -4035,14 +5323,21 @@ fn handle_pipeline_save() -> JsonValue {
                 json!({"ok":true})
             }
             None => {
-                let reason = out.error.unwrap_or_else(|| "walidacja odrzucona".to_string());
-                with_state(|s| { s.error_message = Some(alloc::format!("Pipeline odrzucony: {}", reason)); });
+                let reason = out
+                    .error
+                    .unwrap_or_else(|| "walidacja odrzucona".to_string());
+                with_state(|s| {
+                    s.error_message = Some(alloc::format!("Pipeline odrzucony: {}", reason));
+                });
                 render_panel("cameras");
                 json!({"ok":false,"error":reason})
             }
         },
         Err(e) => {
-            with_state(|s| { s.error_message = Some(alloc::format!("Błąd zapisu pipeline'u: {}", abi_message(e))); });
+            with_state(|s| {
+                s.error_message =
+                    Some(alloc::format!("Błąd zapisu pipeline'u: {}", abi_message(e)));
+            });
             render_panel("cameras");
             json!({"ok":false,"error":alloc::format!("{}",e)})
         }
@@ -4059,15 +5354,42 @@ fn handle_pipeline_save() -> JsonValue {
 /// select fields carry a string.
 fn handle_profile_field_change(params: &JsonValue) -> JsonValue {
     let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("");
-    let value_str = params.get("value").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let value_str = params
+        .get("value")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let value_num = params.get("value").and_then(|v| v.as_f64());
     with_state(|s| match field {
-        "profile_name" => { if let Some(v) = value_str { s.profiles.name = v; } }
-        "profile_flow_id" => { if let Some(v) = value_str { s.profiles.flow_id = v; } }
-        "profile_risk_class" => { if let Some(v) = value_str { s.profiles.risk_class = v; } }
-        "profile_schedule" => { if let Some(v) = value_str { s.profiles.schedule = v; } }
-        "profile_fps" => { if let Some(v) = value_num { s.profiles.fps = v; } }
-        "profile_min_conf" => { if let Some(v) = value_num { s.profiles.min_confidence = v; } }
+        "profile_name" => {
+            if let Some(v) = value_str {
+                s.profiles.name = v;
+            }
+        }
+        "profile_flow_id" => {
+            if let Some(v) = value_str {
+                s.profiles.flow_id = v;
+            }
+        }
+        "profile_risk_class" => {
+            if let Some(v) = value_str {
+                s.profiles.risk_class = v;
+            }
+        }
+        "profile_schedule" => {
+            if let Some(v) = value_str {
+                s.profiles.schedule = v;
+            }
+        }
+        "profile_fps" => {
+            if let Some(v) = value_num {
+                s.profiles.fps = v;
+            }
+        }
+        "profile_min_conf" => {
+            if let Some(v) = value_num {
+                s.profiles.min_confidence = v;
+            }
+        }
         _ => {}
     });
     json!({"ok":true})
@@ -4075,14 +5397,16 @@ fn handle_profile_field_change(params: &JsonValue) -> JsonValue {
 
 /// Creates a new profile (or updates the one under edit) from the builder form.
 fn handle_profile_add_submit() -> JsonValue {
-    let (editing_id, name, flow_id, risk_class, schedule, cameras) = with_state(|s| (
-        s.profiles.editing_id.clone(),
-        s.profiles.name.trim().to_string(),
-        s.profiles.flow_id.trim().to_string(),
-        s.profiles.risk_class.trim().to_string(),
-        s.profiles.schedule.trim().to_string(),
-        s.profiles.cameras.clone(),
-    ));
+    let (editing_id, name, flow_id, risk_class, schedule, cameras) = with_state(|s| {
+        (
+            s.profiles.editing_id.clone(),
+            s.profiles.name.trim().to_string(),
+            s.profiles.flow_id.trim().to_string(),
+            s.profiles.risk_class.trim().to_string(),
+            s.profiles.schedule.trim().to_string(),
+            s.profiles.cameras.clone(),
+        )
+    });
     with_state(|s| s.clear_messages());
 
     if name.is_empty() || name.chars().count() > 60 {
@@ -4136,7 +5460,9 @@ fn handle_profile_add_submit() -> JsonValue {
             json!({"ok":true,"profile_id":id})
         }
         Err(e) => {
-            with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu profilu: {}", abi_message(e))));
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd zapisu profilu: {}", abi_message(e)))
+            });
             render_panel("profiles");
             json!({"ok":false,"error":alloc::format!("{}",e)})
         }
@@ -4145,9 +5471,13 @@ fn handle_profile_add_submit() -> JsonValue {
 
 /// Opens the builder pre-filled with the selected profile's persisted values.
 fn handle_profile_edit(params: &JsonValue) -> JsonValue {
-    let id = params.get("row_id").and_then(|v| v.as_str())
+    let id = params
+        .get("row_id")
+        .and_then(|v| v.as_str())
         .or_else(|| params.get("profile_id").and_then(|v| v.as_str()))
-        .unwrap_or("").trim().to_string();
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if id.is_empty() {
         return json!({"ok":false,"error":"empty profile_id"});
     }
@@ -4163,17 +5493,29 @@ fn handle_profile_edit(params: &JsonValue) -> JsonValue {
             render_panel("profiles");
             json!({"ok":true})
         }
-        Ok(None) => { with_state(|s| s.error_message = Some("Profil nie istnieje.".into())); render_panel("profiles"); json!({"ok":false,"error":"not found"}) }
-        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e)))); render_panel("profiles"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+        Ok(None) => {
+            with_state(|s| s.error_message = Some("Profil nie istnieje.".into()));
+            render_panel("profiles");
+            json!({"ok":false,"error":"not found"})
+        }
+        Err(e) => {
+            with_state(|s| s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e))));
+            render_panel("profiles");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
     }
 }
 
 /// Flips the selected profile's enabled flag (drives the Dashboard "Aktywne
 /// detektory" KPI, which counts profiles WHERE enabled = 1).
 fn handle_profile_toggle_enabled(params: &JsonValue) -> JsonValue {
-    let id = params.get("row_id").and_then(|v| v.as_str())
+    let id = params
+        .get("row_id")
+        .and_then(|v| v.as_str())
         .or_else(|| params.get("profile_id").and_then(|v| v.as_str()))
-        .unwrap_or("").trim().to_string();
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if id.is_empty() {
         return json!({"ok":false,"error":"empty profile_id"});
     }
@@ -4183,28 +5525,66 @@ fn handle_profile_toggle_enabled(params: &JsonValue) -> JsonValue {
             let next = !row.enabled;
             match db::toggle_profile(&id, next) {
                 Ok(_) => {
-                    with_state(|s| s.success_message = Some(if next { "Profil włączony.".into() } else { "Profil wyłączony.".into() }));
+                    with_state(|s| {
+                        s.success_message = Some(if next {
+                            "Profil włączony.".into()
+                        } else {
+                            "Profil wyłączony.".into()
+                        })
+                    });
                     render_panel("profiles");
                     json!({"ok":true,"enabled":next})
                 }
-                Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e)))); render_panel("profiles"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+                Err(e) => {
+                    with_state(|s| {
+                        s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e)))
+                    });
+                    render_panel("profiles");
+                    json!({"ok":false,"error":alloc::format!("{}",e)})
+                }
             }
         }
-        Ok(None) => { with_state(|s| s.error_message = Some("Profil nie istnieje.".into())); render_panel("profiles"); json!({"ok":false,"error":"not found"}) }
-        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e)))); render_panel("profiles"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+        Ok(None) => {
+            with_state(|s| s.error_message = Some("Profil nie istnieje.".into()));
+            render_panel("profiles");
+            json!({"ok":false,"error":"not found"})
+        }
+        Err(e) => {
+            with_state(|s| s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e))));
+            render_panel("profiles");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
     }
 }
 
 fn handle_profile_remove(params: &JsonValue) -> JsonValue {
-    let id = params.get("profile_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let id = params
+        .get("profile_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     with_state(|s| s.clear_messages());
     if id.is_empty() {
         with_state(|s| s.error_message = Some("Wybierz profil do usunięcia.".into()));
         return json!({"ok":false,"error":"empty profile_id"});
     }
     match db::delete_profile(&id) {
-        Ok(_) => { with_state(|s| { s.profiles.pending_remove = None; s.success_message = Some("Profil usunięty.".into()); }); render_panel("profiles"); json!({"ok":true}) }
-        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e)))); render_panel("profiles"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+        Ok(_) => {
+            with_state(|s| {
+                s.profiles.pending_remove = None;
+                s.success_message = Some("Profil usunięty.".into());
+            });
+            render_panel("profiles");
+            json!({"ok":true})
+        }
+        Err(e) => {
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e)))
+            });
+            render_panel("profiles");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
     }
 }
 
@@ -4226,7 +5606,10 @@ const MODEL_ACTOR: &str = "administrator";
 /// stays authoritative even though the value also lives in the store.
 fn handle_model_field_change(params: &JsonValue) -> JsonValue {
     let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("");
-    let value = params.get("value").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let value = params
+        .get("value")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     if let Some(v) = value {
         with_state(|s| match field {
             "model_name" => s.models.form_name = v,
@@ -4244,14 +5627,16 @@ fn handle_model_field_change(params: &JsonValue) -> JsonValue {
 /// (model_change) with before/after JSON snapshots, then re-renders the panel so
 /// the table + VRAM budget bar reflect the change.
 fn handle_model_add_submit() -> JsonValue {
-    let (editing_id, name, runtime, status, vram_str, version) = with_state(|s| (
-        s.models.editing_id.clone(),
-        s.models.form_name.trim().to_string(),
-        s.models.form_runtime.trim().to_string(),
-        s.models.form_status.trim().to_string(),
-        s.models.form_vram.trim().to_string(),
-        s.models.form_version.trim().to_string(),
-    ));
+    let (editing_id, name, runtime, status, vram_str, version) = with_state(|s| {
+        (
+            s.models.editing_id.clone(),
+            s.models.form_name.trim().to_string(),
+            s.models.form_runtime.trim().to_string(),
+            s.models.form_status.trim().to_string(),
+            s.models.form_vram.trim().to_string(),
+            s.models.form_version.trim().to_string(),
+        )
+    });
     with_state(|s| s.clear_messages());
 
     if name.is_empty() || name.chars().count() > 80 {
@@ -4262,7 +5647,9 @@ fn handle_model_add_submit() -> JsonValue {
     let vram_mb = match vram_str.parse::<i64>() {
         Ok(v) if v >= 0 => v,
         _ => {
-            with_state(|s| s.error_message = Some("VRAM musi być liczbą całkowitą ≥ 0 (MB).".into()));
+            with_state(|s| {
+                s.error_message = Some("VRAM musi być liczbą całkowitą ≥ 0 (MB).".into())
+            });
             render_panel("models");
             return json!({"ok":false,"error":"invalid vram"});
         }
@@ -4287,13 +5674,28 @@ fn handle_model_add_submit() -> JsonValue {
             Err(e) => (Err(e), String::new()),
         },
         None => {
-            let new_model = db::NewModel { name: name.clone(), runtime, status, vram_mb, version };
+            let new_model = db::NewModel {
+                name: name.clone(),
+                runtime,
+                status,
+                vram_mb,
+                version,
+            };
             let outcome = db::insert_model(&new_model).and_then(|id| {
-                db::get_model(&id).map(|m| (id.clone(), m.unwrap_or_else(|| db::ModelRow {
-                    id, name: name.clone(), runtime: new_model.runtime.clone(),
-                    status: new_model.status.clone(), vram_mb, version: new_model.version.clone(),
-                    created_at: 0,
-                })))
+                db::get_model(&id).map(|m| {
+                    (
+                        id.clone(),
+                        m.unwrap_or_else(|| db::ModelRow {
+                            id,
+                            name: name.clone(),
+                            runtime: new_model.runtime.clone(),
+                            status: new_model.status.clone(),
+                            vram_mb,
+                            version: new_model.version.clone(),
+                            created_at: 0,
+                        }),
+                    )
+                })
             });
             (outcome, "null".into())
         }
@@ -4301,7 +5703,13 @@ fn handle_model_add_submit() -> JsonValue {
 
     match result {
         Ok((id, row)) => {
-            let _ = db::insert_audit(MODEL_ACTOR, "model_change", &id, &before_json, &model_audit_json(&row));
+            let _ = db::insert_audit(
+                MODEL_ACTOR,
+                "model_change",
+                &id,
+                &before_json,
+                &model_audit_json(&row),
+            );
             with_state(|s| {
                 s.models.form_visible = false;
                 s.models.editing_id = None;
@@ -4311,7 +5719,9 @@ fn handle_model_add_submit() -> JsonValue {
             json!({"ok":true,"model_id":id})
         }
         Err(e) => {
-            with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu modelu: {}", abi_message(e))));
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd zapisu modelu: {}", abi_message(e)))
+            });
             render_panel("models");
             json!({"ok":false,"error":alloc::format!("{}",e)})
         }
@@ -4321,7 +5731,9 @@ fn handle_model_add_submit() -> JsonValue {
 /// Opens the form pre-filled with the selected model's persisted values.
 fn handle_model_edit(params: &JsonValue) -> JsonValue {
     let id = model_id_param(params);
-    if id.is_empty() { return json!({"ok":false,"error":"empty model_id"}); }
+    if id.is_empty() {
+        return json!({"ok":false,"error":"empty model_id"});
+    }
     match db::get_model(&id) {
         Ok(Some(row)) => {
             with_state(|s| {
@@ -4334,8 +5746,16 @@ fn handle_model_edit(params: &JsonValue) -> JsonValue {
             render_panel("models");
             json!({"ok":true})
         }
-        Ok(None) => { with_state(|s| s.error_message = Some("Model nie istnieje.".into())); render_panel("models"); json!({"ok":false,"error":"not found"}) }
-        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e)))); render_panel("models"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+        Ok(None) => {
+            with_state(|s| s.error_message = Some("Model nie istnieje.".into()));
+            render_panel("models");
+            json!({"ok":false,"error":"not found"})
+        }
+        Err(e) => {
+            with_state(|s| s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e))));
+            render_panel("models");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
     }
 }
 
@@ -4348,15 +5768,28 @@ fn handle_model_remove(params: &JsonValue) -> JsonValue {
         with_state(|s| s.error_message = Some("Wybierz model do usunięcia.".into()));
         return json!({"ok":false,"error":"empty model_id"});
     }
-    let before = db::get_model(&id).ok().flatten().map(|m| model_audit_json(&m)).unwrap_or_else(|| "null".into());
+    let before = db::get_model(&id)
+        .ok()
+        .flatten()
+        .map(|m| model_audit_json(&m))
+        .unwrap_or_else(|| "null".into());
     match db::delete_model(&id) {
         Ok(_) => {
             let _ = db::insert_audit(MODEL_ACTOR, "model_change", &id, &before, "null");
-            with_state(|s| { s.models.pending_remove = None; s.success_message = Some("Model usunięty.".into()); });
+            with_state(|s| {
+                s.models.pending_remove = None;
+                s.success_message = Some("Model usunięty.".into());
+            });
             render_panel("models");
             json!({"ok":true})
         }
-        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e)))); render_panel("models"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+        Err(e) => {
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e)))
+            });
+            render_panel("models");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
     }
 }
 
@@ -4366,7 +5799,9 @@ fn handle_model_remove(params: &JsonValue) -> JsonValue {
 fn handle_model_rollback(params: &JsonValue) -> JsonValue {
     let id = model_id_param(params);
     with_state(|s| s.clear_messages());
-    if id.is_empty() { return json!({"ok":false,"error":"empty model_id"}); }
+    if id.is_empty() {
+        return json!({"ok":false,"error":"empty model_id"});
+    }
     match db::get_model(&id) {
         Ok(Some(mut row)) => {
             let before = model_audit_json(&row);
@@ -4377,16 +5812,41 @@ fn handle_model_rollback(params: &JsonValue) -> JsonValue {
             };
             match db::update_model(&row) {
                 Ok(_) => {
-                    let _ = db::insert_audit(MODEL_ACTOR, "model_change", &id, &before, &model_audit_json(&row));
-                    with_state(|s| s.success_message = Some(alloc::format!("Wersja modelu oznaczona do rollbacku ({}).", row.version)));
+                    let _ = db::insert_audit(
+                        MODEL_ACTOR,
+                        "model_change",
+                        &id,
+                        &before,
+                        &model_audit_json(&row),
+                    );
+                    with_state(|s| {
+                        s.success_message = Some(alloc::format!(
+                            "Wersja modelu oznaczona do rollbacku ({}).",
+                            row.version
+                        ))
+                    });
                     render_panel("models");
                     json!({"ok":true})
                 }
-                Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e)))); render_panel("models"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+                Err(e) => {
+                    with_state(|s| {
+                        s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e)))
+                    });
+                    render_panel("models");
+                    json!({"ok":false,"error":alloc::format!("{}",e)})
+                }
             }
         }
-        Ok(None) => { with_state(|s| s.error_message = Some("Model nie istnieje.".into())); render_panel("models"); json!({"ok":false,"error":"not found"}) }
-        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e)))); render_panel("models"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+        Ok(None) => {
+            with_state(|s| s.error_message = Some("Model nie istnieje.".into()));
+            render_panel("models");
+            json!({"ok":false,"error":"not found"})
+        }
+        Err(e) => {
+            with_state(|s| s.error_message = Some(alloc::format!("Błąd: {}", abi_message(e))));
+            render_panel("models");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
     }
 }
 
@@ -4397,26 +5857,41 @@ fn handle_model_budget_save() -> JsonValue {
     let budget = match draft.parse::<i64>() {
         Ok(v) if v > 0 => v,
         _ => {
-            with_state(|s| s.error_message = Some("Budżet VRAM musi być liczbą całkowitą > 0 (MB).".into()));
+            with_state(|s| {
+                s.error_message = Some("Budżet VRAM musi być liczbą całkowitą > 0 (MB).".into())
+            });
             render_panel("models");
             return json!({"ok":false,"error":"invalid budget"});
         }
     };
     match db::set_setting("vram_budget_mb", &alloc::format!("{}", budget)) {
         Ok(_) => {
-            with_state(|s| { s.models.budget_editing = false; s.success_message = Some(alloc::format!("Budżet VRAM ustawiony na {} MB.", budget)); });
+            with_state(|s| {
+                s.models.budget_editing = false;
+                s.success_message = Some(alloc::format!("Budżet VRAM ustawiony na {} MB.", budget));
+            });
             render_panel("models");
             json!({"ok":true,"budget":budget})
         }
-        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu budżetu: {}", abi_message(e)))); render_panel("models"); json!({"ok":false,"error":alloc::format!("{}",e)}) }
+        Err(e) => {
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd zapisu budżetu: {}", abi_message(e)))
+            });
+            render_panel("models");
+            json!({"ok":false,"error":alloc::format!("{}",e)})
+        }
     }
 }
 
 /// Pulls the model id from action params (row_id or model_id).
 fn model_id_param(params: &JsonValue) -> String {
-    params.get("row_id").and_then(|v| v.as_str())
+    params
+        .get("row_id")
+        .and_then(|v| v.as_str())
         .or_else(|| params.get("model_id").and_then(|v| v.as_str()))
-        .unwrap_or("").trim().to_string()
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 /// Compact JSON snapshot of a model row for the audit before/after fields.
@@ -4424,7 +5899,8 @@ fn model_audit_json(m: &db::ModelRow) -> String {
     json!({
         "id": m.id, "name": m.name, "runtime": m.runtime, "status": m.status,
         "vram_mb": m.vram_mb, "version": m.version,
-    }).to_string()
+    })
+    .to_string()
 }
 
 // =============================================================================
@@ -4439,15 +5915,28 @@ const ALARM_OPERATOR: &str = "operator I linii";
 /// + decision time, writes a hash-chained audit-log entry (before/after status),
 /// then re-renders so the feed and detail reflect the decision.
 fn handle_alarm_decide(params: &JsonValue) -> JsonValue {
-    let id = params.get("alarm_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let decision = params.get("decision").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let id = params
+        .get("alarm_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let decision = params
+        .get("decision")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     with_state(|s| s.clear_messages());
     if id.is_empty() || !matches!(decision.as_str(), "confirmed" | "dismissed" | "escalated") {
         with_state(|s| s.error_message = Some("Nieprawidłowa decyzja alarmu.".into()));
         return json!({"ok":false,"error":"bad decision"});
     }
     // Capture the prior status so the audit trail records the real transition.
-    let before = db::get_alarm(&id).ok().flatten().map(|a| a.status).unwrap_or_default();
+    let before = db::get_alarm(&id)
+        .ok()
+        .flatten()
+        .map(|a| a.status)
+        .unwrap_or_default();
     match db::update_alarm_status(&id, &decision, ALARM_OPERATOR) {
         Ok(0) => {
             with_state(|s| s.error_message = Some("Alarm nie istnieje.".into()));
@@ -4456,16 +5945,30 @@ fn handle_alarm_decide(params: &JsonValue) -> JsonValue {
         }
         Ok(_) => {
             let note = with_state(|s| s.alarms.note.clone());
-            let after_json = serde_json::to_string(&json!({"status": decision, "note": note})).unwrap_or_default();
+            let after_json = serde_json::to_string(&json!({"status": decision, "note": note}))
+                .unwrap_or_default();
             let before_json = serde_json::to_string(&json!({"status": before})).unwrap_or_default();
             // Audit-log linkage: the future Audit tab reads this hash-chained row.
-            let _ = db::insert_audit(ALARM_OPERATOR, "alarm_decision", &id, &before_json, &after_json);
-            with_state(|s| s.success_message = Some(alloc::format!("Zapisano decyzję: {}.", alarm_status_long(&decision))));
+            let _ = db::insert_audit(
+                ALARM_OPERATOR,
+                "alarm_decision",
+                &id,
+                &before_json,
+                &after_json,
+            );
+            with_state(|s| {
+                s.success_message = Some(alloc::format!(
+                    "Zapisano decyzję: {}.",
+                    alarm_status_long(&decision)
+                ))
+            });
             render_panel("alarms");
             json!({"ok":true})
         }
         Err(e) => {
-            with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu decyzji: {}", abi_message(e))));
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd zapisu decyzji: {}", abi_message(e)))
+            });
             render_panel("alarms");
             json!({"ok":false,"error":alloc::format!("{}",e)})
         }
@@ -4491,7 +5994,9 @@ fn handle_settings_save() -> JsonValue {
     for (key, value) in &edits {
         if let Some(f) = settings_all_fields().find(|f| f.key == key) {
             if f.kind == SettingKind::Number && value.trim().parse::<i64>().is_err() {
-                with_state(|s| s.error_message = Some(alloc::format!("Pole '{}' wymaga liczby.", f.label)));
+                with_state(|s| {
+                    s.error_message = Some(alloc::format!("Pole '{}' wymaga liczby.", f.label))
+                });
                 render_panel("settings");
                 return json!({"ok":false,"error":"not a number"});
             }
@@ -4507,7 +6012,10 @@ fn handle_settings_save() -> JsonValue {
         match db::set_setting(key, value) {
             Ok(_) => changed.push((key.clone(), prev, value.clone())),
             Err(e) => {
-                with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu '{}': {}", key, abi_message(e))));
+                with_state(|s| {
+                    s.error_message =
+                        Some(alloc::format!("Błąd zapisu '{}': {}", key, abi_message(e)))
+                });
                 render_panel("settings");
                 return json!({"ok":false,"error":alloc::format!("{}",e)});
             }
@@ -4515,26 +6023,39 @@ fn handle_settings_save() -> JsonValue {
     }
 
     if changed.is_empty() {
-        with_state(|s| { s.settings.clear_edits(); s.success_message = Some("Ustawienia bez zmian.".into()); });
+        with_state(|s| {
+            s.settings.clear_edits();
+            s.success_message = Some("Ustawienia bez zmian.".into());
+        });
         render_panel("settings");
         return json!({"ok":true,"changed":0});
     }
 
     // One summary audit row. before/after carry per-key snapshots with secret
     // values redacted so the hash-chain never stores credentials in clear text.
-    let secret = |key: &str| settings_all_fields()
-        .find(|f| f.key == key)
-        .map(|f| f.kind == SettingKind::Secret)
-        .unwrap_or(false);
-    let redact = |key: &str, v: &str| -> JsonValue {
-        if v.is_empty() { json!("") }
-        else if secret(key) { json!("<redacted>") }
-        else { json!(v) }
+    let secret = |key: &str| {
+        settings_all_fields()
+            .find(|f| f.key == key)
+            .map(|f| f.kind == SettingKind::Secret)
+            .unwrap_or(false)
     };
-    let before: serde_json::Map<String, JsonValue> = changed.iter()
-        .map(|(k, prev, _)| (k.clone(), redact(k, prev))).collect();
-    let after: serde_json::Map<String, JsonValue> = changed.iter()
-        .map(|(k, _, next)| (k.clone(), redact(k, next))).collect();
+    let redact = |key: &str, v: &str| -> JsonValue {
+        if v.is_empty() {
+            json!("")
+        } else if secret(key) {
+            json!("<redacted>")
+        } else {
+            json!(v)
+        }
+    };
+    let before: serde_json::Map<String, JsonValue> = changed
+        .iter()
+        .map(|(k, prev, _)| (k.clone(), redact(k, prev)))
+        .collect();
+    let after: serde_json::Map<String, JsonValue> = changed
+        .iter()
+        .map(|(k, _, next)| (k.clone(), redact(k, next)))
+        .collect();
     let _ = db::insert_audit(
         ALARM_OPERATOR,
         "settings_change",
@@ -4553,12 +6074,24 @@ fn handle_settings_save() -> JsonValue {
 }
 
 fn handle_audit_retention_edit(params: &JsonValue) -> JsonValue {
-    let class = params.get("class").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
-    let default = RETENTION_DEFAULTS.iter().find(|(c, _, _)| *c == class).map(|(_, _, d)| *d).unwrap_or(183);
+    let class = params
+        .get("class")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_uppercase();
+    let default = RETENTION_DEFAULTS
+        .iter()
+        .find(|(c, _, _)| *c == class)
+        .map(|(_, _, d)| *d)
+        .unwrap_or(183);
     let current = retention_days(&class, default);
     with_state(|s| {
         s.clear_messages();
-        s.audit.retention_editing = if class.is_empty() { None } else { Some(class.clone()) };
+        s.audit.retention_editing = if class.is_empty() {
+            None
+        } else {
+            Some(class.clone())
+        };
         s.audit.retention_draft = alloc::format!("{}", current);
     });
     render_panel("audit");
@@ -4568,13 +6101,20 @@ fn handle_audit_retention_edit(params: &JsonValue) -> JsonValue {
 /// Persists a retention override (db::set_setting), enforcing the 183-day
 /// compliance floor for the audit log, then leaves edit mode.
 fn handle_audit_retention_save(params: &JsonValue) -> JsonValue {
-    let class = params.get("class").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
+    let class = params
+        .get("class")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_uppercase();
     with_state(|s| s.clear_messages());
     let draft = with_state(|s| s.audit.retention_draft.clone());
     let days: i64 = match draft.trim().parse() {
         Ok(d) if d >= 183 => d,
         Ok(_) => {
-            with_state(|s| s.error_message = Some("Retencja nie może być krótsza niż 183 dni (wymóg zgodności).".into()));
+            with_state(|s| {
+                s.error_message =
+                    Some("Retencja nie może być krótsza niż 183 dni (wymóg zgodności).".into())
+            });
             render_panel("audit");
             return json!({"ok":false,"error":"below floor"});
         }
@@ -4587,17 +6127,30 @@ fn handle_audit_retention_save(params: &JsonValue) -> JsonValue {
     match db::set_setting(&retention_setting_key(&class), &alloc::format!("{}", days)) {
         Ok(_) => {
             let before = serde_json::to_string(&json!({"class": class})).unwrap_or_default();
-            let after = serde_json::to_string(&json!({"class": class, "retention_days": days})).unwrap_or_default();
-            let _ = db::insert_audit(ALARM_OPERATOR, "retention_change", &retention_setting_key(&class), &before, &after);
+            let after = serde_json::to_string(&json!({"class": class, "retention_days": days}))
+                .unwrap_or_default();
+            let _ = db::insert_audit(
+                ALARM_OPERATOR,
+                "retention_change",
+                &retention_setting_key(&class),
+                &before,
+                &after,
+            );
             with_state(|s| {
                 s.audit.retention_editing = None;
-                s.success_message = Some(alloc::format!("Zapisano retencję klasy {}: {} dni.", class, days));
+                s.success_message = Some(alloc::format!(
+                    "Zapisano retencję klasy {}: {} dni.",
+                    class,
+                    days
+                ));
             });
             render_panel("audit");
             json!({"ok":true,"days":days})
         }
         Err(e) => {
-            with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu retencji: {}", abi_message(e))));
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd zapisu retencji: {}", abi_message(e)))
+            });
             render_panel("audit");
             json!({"ok":false,"error":alloc::format!("{}",e)})
         }
@@ -4613,7 +6166,9 @@ fn handle_alarm_acknowledge_all() -> JsonValue {
         if a.status == "new" {
             if db::update_alarm_status(&a.id, "acknowledged", ALARM_OPERATOR).unwrap_or(0) > 0 {
                 let _ = db::insert_audit(
-                    ALARM_OPERATOR, "alarm_decision", &a.id,
+                    ALARM_OPERATOR,
+                    "alarm_decision",
+                    &a.id,
                     &serde_json::to_string(&json!({"status": "new"})).unwrap_or_default(),
                     &serde_json::to_string(&json!({"status": "acknowledged"})).unwrap_or_default(),
                 );
@@ -4633,7 +6188,9 @@ fn handle_alarm_simulate() -> JsonValue {
     with_state(|s| s.clear_messages());
     let cameras = db::list_cameras().unwrap_or_default();
     let Some(cam) = cameras.first() else {
-        with_state(|s| s.error_message = Some("Dodaj najpierw kamerę, aby zasymulować alarm.".into()));
+        with_state(|s| {
+            s.error_message = Some("Dodaj najpierw kamerę, aby zasymulować alarm.".into())
+        });
         render_panel("alarms");
         return json!({"ok":false,"error":"no cameras"});
     };
@@ -4650,12 +6207,17 @@ fn handle_alarm_simulate() -> JsonValue {
             // if no embedding model is deployed, the alarm is still created and
             // the warning is logged (the Search tab's Reindex action backfills).
             index_alarm_by_id(&id);
-            with_state(|s| { s.alarms.selected_id = Some(id); s.success_message = Some("Zasymulowano alarm testowy.".into()); });
+            with_state(|s| {
+                s.alarms.selected_id = Some(id);
+                s.success_message = Some("Zasymulowano alarm testowy.".into());
+            });
             render_panel("alarms");
             json!({"ok":true})
         }
         Err(e) => {
-            with_state(|s| s.error_message = Some(alloc::format!("Błąd symulacji: {}", abi_message(e))));
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd symulacji: {}", abi_message(e)))
+            });
             render_panel("alarms");
             json!({"ok":false,"error":alloc::format!("{}",e)})
         }
@@ -4667,7 +6229,13 @@ fn handle_alarm_simulate() -> JsonValue {
 /// fragment — the only wizard action besides modal open that does. The
 /// discovery-section visibility flags are patched to match the new results.
 fn handle_discover_scan() -> JsonValue {
-    with_state(|s| { s.discover.scanning = true; s.discover.error_message = None; s.discover.cameras.clear(); s.discover.selected_index = None; s.error_message = None; });
+    with_state(|s| {
+        s.discover.scanning = true;
+        s.discover.error_message = None;
+        s.discover.cameras.clear();
+        s.discover.selected_index = None;
+        s.error_message = None;
+    });
     // Patch the scanning flag BEFORE the blocking discovery call so the scan
     // spinner becomes visible; the final fragment re-send below carries results.
     send_state_patches(with_state(|s| wizard_onvif_pairs(&s.discover)));
@@ -4675,12 +6243,20 @@ fn handle_discover_scan() -> JsonValue {
     with_state(|s| {
         s.discover.scanning = false;
         match result {
-            Ok(found) => { s.discover.cameras = found.iter().map(discovered_to_cam).collect(); }
-            Err(e) => { s.error_message = Some(alloc::format!("Błąd skanowania: {}", abi_message(e))); }
+            Ok(found) => {
+                s.discover.cameras = found.iter().map(discovered_to_cam).collect();
+            }
+            Err(e) => {
+                s.error_message = Some(alloc::format!("Błąd skanowania: {}", abi_message(e)));
+            }
         }
     });
     if with_state(|s| s.add_form_visible) {
-        send_slot_content_with_overlay("add_camera_body", build_add_camera_body(), Some(wizard_full_overlay()));
+        send_slot_content_with_overlay(
+            "add_camera_body",
+            build_add_camera_body(),
+            Some(wizard_full_overlay()),
+        );
     }
     json!({"ok":true})
 }
@@ -4701,11 +6277,18 @@ fn handle_discover_select(params: &JsonValue) -> JsonValue {
                 // resolved target and submit credentials use one consistent value.
                 s.discover.onvif_url = s.discover.cameras[i].url.clone();
             }
-            _ => { s.discover.selected_index = None; s.error_message = Some("Wybierz kamerę z listy.".to_string()); }
+            _ => {
+                s.discover.selected_index = None;
+                s.error_message = Some("Wybierz kamerę z listy.".to_string());
+            }
         }
     });
     if with_state(|s| s.add_form_visible) {
-        send_slot_content_with_overlay("add_camera_body", build_add_camera_body(), Some(wizard_full_overlay()));
+        send_slot_content_with_overlay(
+            "add_camera_body",
+            build_add_camera_body(),
+            Some(wizard_full_overlay()),
+        );
     }
     json!({"ok":true})
 }
@@ -4742,14 +6325,19 @@ fn build_credentials_b64(
         return Err("Podaj hasło kamery.");
     }
     let plain = alloc::format!("{user}:{pass}");
-    Ok(Some(
-        base64::engine::Engine::encode(&base64::engine::general_purpose::STANDARD, plain),
-    ))
+    Ok(Some(base64::engine::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        plain,
+    )))
 }
 
 fn is_valid_camera_id(id: &str) -> bool {
-    if id.len() != 40 || !id.starts_with("cam_") { return false; }
-    id.chars().skip(4).all(|c| c.is_ascii_hexdigit() || c == '-')
+    if id.len() != 40 || !id.starts_with("cam_") {
+        return false;
+    }
+    id.chars()
+        .skip(4)
+        .all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 /// Maps a host-discovered ONVIF device into the wizard's working representation.
@@ -4791,8 +6379,13 @@ fn suggested_name_for_discovered(d: &DiscoveredCameraOut) -> String {
 fn extract_host_port(url: &str) -> Option<(String, Option<u16>)> {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() { return None; }
-    let host_part = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    if authority.is_empty() {
+        return None;
+    }
+    let host_part = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
     if let Some(rest) = host_part.strip_prefix('[') {
         if let Some((host_inner, tail)) = rest.split_once(']') {
             let host = alloc::format!("[{}]", host_inner);
@@ -4802,7 +6395,9 @@ fn extract_host_port(url: &str) -> Option<(String, Option<u16>)> {
         return Some((host_part.to_string(), None));
     }
     if let Some((host, port)) = host_part.rsplit_once(':') {
-        if let Ok(p) = port.parse::<u16>() { return Some((host.to_string(), Some(p))); }
+        if let Ok(p) = port.parse::<u16>() {
+            return Some((host.to_string(), Some(p)));
+        }
     }
     Some((host_part.to_string(), None))
 }
@@ -4845,16 +6440,17 @@ fn build_nav_tab_items(_active: &str) -> Vec<NavTab> {
         ("settings", "Ustawienia", "settings"),
         ("onboarding", "Onboarding", "check"),
     ];
-    entries.iter().map(|(id, label, icon)| {
-        NavTab {
+    entries
+        .iter()
+        .map(|(id, label, icon)| NavTab {
             id: (*id).into(),
             label: lit(label),
             icon: Some(icon_named(parse_icon_name(icon))),
             badge: None,
             panel_id: Some((*id).into()),
             locked: false,
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 // =============================================================================
@@ -4885,31 +6481,72 @@ fn build_overview_content() -> Component {
     } else {
         "brak krytycznych".to_string()
     };
-    let alarms_tone = if critical_24h > 0 { "danger" } else { "success" };
+    let alarms_tone = if critical_24h > 0 {
+        "danger"
+    } else {
+        "success"
+    };
 
-    let kpi_row = grid(4, vec![
-        stat_card(&cam_val, "Aktywne kamery", Some(&cam_note), Some("cameras"),
-                  Some(if offline_cams > 0 { "warning" } else { "success" })),
-        stat_card(&alloc::format!("{}", active_detectors), "Aktywne detektory", None, Some("brain"), Some("accent")),
-        stat_card(&alloc::format!("{}", alarms_24h), "Alarmy 24h", Some(&alarms_note), Some("bell"), Some(alarms_tone)),
-        stat_card("68%", "GPU / latencja p95", Some("1.2 s"), Some("cpu"), Some("success")),
-    ]);
+    let kpi_row = grid(
+        4,
+        vec![
+            stat_card(
+                &cam_val,
+                "Aktywne kamery",
+                Some(&cam_note),
+                Some("cameras"),
+                Some(if offline_cams > 0 {
+                    "warning"
+                } else {
+                    "success"
+                }),
+            ),
+            stat_card(
+                &alloc::format!("{}", active_detectors),
+                "Aktywne detektory",
+                None,
+                Some("brain"),
+                Some("accent"),
+            ),
+            stat_card(
+                &alloc::format!("{}", alarms_24h),
+                "Alarmy 24h",
+                Some(&alarms_note),
+                Some("bell"),
+                Some(alarms_tone),
+            ),
+            stat_card(
+                "68%",
+                "GPU / latencja p95",
+                Some("1.2 s"),
+                Some("cpu"),
+                Some("success"),
+            ),
+        ],
+    );
 
     // Latest alarms — newest first, joined with the camera name.
     let recent = db::list_recent_alarms(6).unwrap_or_default();
     let alarms_body = if recent.is_empty() {
         // No outer card: empty_state sits straight inside the section card body.
-        empty_state("Brak alarmów", Some("Gdy analityka wykryje zdarzenie, pojawi się tutaj."), Some("bell"))
+        empty_state(
+            "Brak alarmów",
+            Some("Gdy analityka wykryje zdarzenie, pojawi się tutaj."),
+            Some("bell"),
+        )
     } else {
         let rows: Vec<Component> = recent.iter().map(build_alarm_card).collect();
         stack_v_gap("sm", rows)
     };
     let alarms_header_label = alloc::format!("Wszystkie {} >", alarms_24h);
-    let recent_alarms = card_with_icon_action("Ostatnie alarmy", "bell", Some(&alarms_header_label), vec![alarms_body]);
+    let recent_alarms = card_with_icon_action(
+        "Ostatnie alarmy",
+        "bell",
+        Some(&alarms_header_label),
+        vec![alarms_body],
+    );
 
-    let runtime = card_with_icon("Stan natywnego runtime", "cpu", vec![
-        build_runtime_table(),
-    ]);
+    let runtime = card_with_icon("Stan natywnego runtime", "cpu", vec![build_runtime_table()]);
 
     let two_col = grid(2, vec![recent_alarms, runtime]);
 
@@ -4950,7 +6587,6 @@ fn format_alarm_time(ts: i64) -> String {
     alloc::format!("{:02}:{:02}:{:02}", h, m, s)
 }
 
-
 fn build_alarm_card(a: &db::AlarmRow) -> Component {
     // Title: detector type + message, falling back to whichever is present.
     let title = if !a.kind.is_empty() && !a.message.is_empty() {
@@ -4972,11 +6608,14 @@ fn build_alarm_card(a: &db::AlarmRow) -> Component {
     let variant = alarm_severity_variant(&a.severity);
 
     let title_text = text_styled(&title, "body_strong");
-    let meta_row = stack_h_gap("sm", vec![
-        chip_with_icon(&camera_label, "category", "cameras"),
-        chip_with_icon(&format_alarm_time(a.ts), "category", "clock"),
-        badge(alarm_severity_label(&a.severity), variant),
-    ]);
+    let meta_row = stack_h_gap(
+        "sm",
+        vec![
+            chip_with_icon(&camera_label, "category", "cameras"),
+            chip_with_icon(&format_alarm_time(a.ts), "category", "clock"),
+            badge(alarm_severity_label(&a.severity), variant),
+        ],
+    );
     let center = stack_v_gap("xs", vec![title_text, meta_row]);
 
     let action = ButtonComp {
@@ -4990,7 +6629,9 @@ fn build_alarm_card(a: &db::AlarmRow) -> Component {
         disabled: None,
         loading: None,
         density: Density::Default,
-    }.into_component(next_id()).expect("Button");
+    }
+    .into_component(next_id())
+    .expect("Button");
 
     Flex {
         direction: FlexDirection::Row,
@@ -5004,7 +6645,9 @@ fn build_alarm_card(a: &db::AlarmRow) -> Component {
         radius: None,
         style: None,
         responsive: None,
-    }.into_component(next_id()).expect("Flex")
+    }
+    .into_component(next_id())
+    .expect("Flex")
 }
 
 fn build_runtime_kv_row(label: &str, value_children: Vec<Component>) -> Component {
@@ -5028,45 +6671,46 @@ fn build_runtime_kv_row(label: &str, value_children: Vec<Component>) -> Componen
                 radius: None,
                 style: None,
                 responsive: None,
-            }.into_component(next_id()).expect("Flex"),
+            }
+            .into_component(next_id())
+            .expect("Flex"),
         ],
         padding: None,
         background: None,
         radius: None,
         style: None,
         responsive: None,
-    }.into_component(next_id()).expect("Flex")
+    }
+    .into_component(next_id())
+    .expect("Flex")
 }
 
 fn build_runtime_table() -> Component {
-    stack_v_gap("sm", vec![
-        build_runtime_kv_row("Frame bus throughput", vec![
-            text("312 fps łącznie"),
-        ]),
-        build_runtime_kv_row("Queue depth (max)", vec![
-            text("12 (kam. C-04, tier 0)"),
-        ]),
-        build_runtime_kv_row("Drop rate 1h", vec![
-            chip_toned("0.4%", "success"),
-        ]),
-        build_runtime_kv_row("VRAM użycie", vec![
-            text("8.2 / 12 GB"),
-            chip_toned("tight", "warning"),
-        ]),
-        build_runtime_kv_row("Modele załadowane", vec![
-            text("6 (YOLO11m, PP-OCRv5, BoT-SORT…)"),
-        ]),
-        build_runtime_kv_row("Clock-sync dryf max", vec![
-            text("12 ms (PTP OK)"),
-        ]),
-        build_runtime_kv_row("Audit log → WORM", vec![
-            chip_toned("synced (5 min temu)", "success"),
-        ]),
-        build_runtime_kv_row("Eval harness (daily)", vec![
-            text("ostatnio 03:00"),
-            chip_toned("P/R w celu", "success"),
-        ]),
-    ])
+    stack_v_gap(
+        "sm",
+        vec![
+            build_runtime_kv_row("Frame bus throughput", vec![text("312 fps łącznie")]),
+            build_runtime_kv_row("Queue depth (max)", vec![text("12 (kam. C-04, tier 0)")]),
+            build_runtime_kv_row("Drop rate 1h", vec![chip_toned("0.4%", "success")]),
+            build_runtime_kv_row(
+                "VRAM użycie",
+                vec![text("8.2 / 12 GB"), chip_toned("tight", "warning")],
+            ),
+            build_runtime_kv_row(
+                "Modele załadowane",
+                vec![text("6 (YOLO11m, PP-OCRv5, BoT-SORT…)")],
+            ),
+            build_runtime_kv_row("Clock-sync dryf max", vec![text("12 ms (PTP OK)")]),
+            build_runtime_kv_row(
+                "Audit log → WORM",
+                vec![chip_toned("synced (5 min temu)", "success")],
+            ),
+            build_runtime_kv_row(
+                "Eval harness (daily)",
+                vec![text("ostatnio 03:00"), chip_toned("P/R w celu", "success")],
+            ),
+        ],
+    )
 }
 
 const HEATMAP_COLS: usize = 24;
@@ -5087,8 +6731,18 @@ fn build_activity_heatmap() -> Component {
     let cams = heatmap_camera_rows();
     let col_labels: Vec<&str> = (0..HEATMAP_COLS)
         .map(|h| match h {
-            0 => "0", 2 => "2", 4 => "4", 6 => "6", 8 => "8", 10 => "10",
-            12 => "12", 14 => "14", 16 => "16", 18 => "18", 20 => "20", 22 => "22",
+            0 => "0",
+            2 => "2",
+            4 => "4",
+            6 => "6",
+            8 => "8",
+            10 => "10",
+            12 => "12",
+            14 => "14",
+            16 => "16",
+            18 => "18",
+            20 => "20",
+            22 => "22",
             _ => "",
         })
         .collect();
@@ -5099,7 +6753,11 @@ fn build_activity_heatmap() -> Component {
         return card_with_icon(
             "Mapa cieplna aktywności · ostatnie 24h × kamera",
             "dashboard",
-            vec![empty_state("Brak danych aktywności", Some("Dodaj kamery, aby zbierać aktywność 24h."), Some("dashboard"))],
+            vec![empty_state(
+                "Brak danych aktywności",
+                Some("Dodaj kamery, aby zbierać aktywność 24h."),
+                Some("dashboard"),
+            )],
         );
     }
 
@@ -5108,9 +6766,17 @@ fn build_activity_heatmap() -> Component {
     // here is unused by the renderer (the helper ignores `_values`), so pass an
     // empty placeholder of the right shape.
     let values: Vec<Vec<f64>> = Vec::new();
-    card_with_icon("Mapa cieplna aktywności · ostatnie 24h × kamera", "dashboard", vec![
-        heatmap(cams.len() as u32, HEATMAP_COLS as u32, values, row_labels, col_labels),
-    ])
+    card_with_icon(
+        "Mapa cieplna aktywności · ostatnie 24h × kamera",
+        "dashboard",
+        vec![heatmap(
+            cams.len() as u32,
+            HEATMAP_COLS as u32,
+            values,
+            row_labels,
+            col_labels,
+        )],
+    )
 }
 
 /// Builds the `heatmap_cells` store value (`[{row_id, col_id, value}]`) from the
@@ -5124,8 +6790,11 @@ fn heatmap_cells_value() -> Value {
         return Value::Array(Vec::new());
     }
     let buckets = db::alarm_heatmap_last_24h().unwrap_or_default();
-    let row_index: alloc::collections::BTreeMap<&str, usize> =
-        cams.iter().enumerate().map(|(i, c)| (c.id.as_str(), i)).collect();
+    let row_index: alloc::collections::BTreeMap<&str, usize> = cams
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.id.as_str(), i))
+        .collect();
 
     // Dense count grid [row][hour], then normalize by the global max.
     let mut counts = alloc::vec![[0i64; HEATMAP_COLS]; cams.len()];
@@ -5144,8 +6813,14 @@ fn heatmap_cells_value() -> Value {
         for (h, &c) in row.iter().enumerate() {
             let value = (c as f64) / denom;
             cells.push(Value::Map(vec![
-                (Value::Text("row_id".into()), Value::Text(alloc::format!("r{}", r))),
-                (Value::Text("col_id".into()), Value::Text(alloc::format!("c{}", h))),
+                (
+                    Value::Text("row_id".into()),
+                    Value::Text(alloc::format!("r{}", r)),
+                ),
+                (
+                    Value::Text("col_id".into()),
+                    Value::Text(alloc::format!("c{}", h)),
+                ),
                 (Value::Text("value".into()), Value::F64(value)),
             ]));
         }
@@ -5156,9 +6831,15 @@ fn heatmap_cells_value() -> Value {
 fn build_messages_section() -> Component {
     let (err, succ) = with_state(|s| (s.error_message.clone(), s.success_message.clone()));
     let mut children = Vec::new();
-    if let Some(e) = err { children.push(alert(&e, "danger")); }
-    if let Some(s) = succ { children.push(alert(&s, "success")); }
-    if children.is_empty() { return divider(); }
+    if let Some(e) = err {
+        children.push(alert(&e, "danger"));
+    }
+    if let Some(s) = succ {
+        children.push(alert(&s, "success"));
+    }
+    if children.is_empty() {
+        return divider();
+    }
     stack_v_gap("sm", children)
 }
 
@@ -5192,18 +6873,23 @@ fn live_grid_columns(size: u32) -> u32 {
 /// so the chosen layout survives panel reopen / process restart.
 fn live_grid_selector(current: u32) -> Component {
     use tentaflow_sdk_spec::protocol::ui::actions::SegmentedControl;
-    let options: Vec<SegmentOption> = LIVE_GRID_SIZES.iter().map(|n| SegmentOption {
-        value: SelectValue::Text(alloc::format!("{}", n)),
-        label: Some(lit(&alloc::format!("{}", n))),
-        icon: None,
-        badge: None,
-    }).collect();
+    let options: Vec<SegmentOption> = LIVE_GRID_SIZES
+        .iter()
+        .map(|n| SegmentOption {
+            value: SelectValue::Text(alloc::format!("{}", n)),
+            label: Some(lit(&alloc::format!("{}", n))),
+            icon: None,
+            badge: None,
+        })
+        .collect();
     let mut comp = SegmentedControl {
         bind_path: StatePath::new(vec![PathSegment::Key("live_grid_size".into())]),
         options,
         size: SegmentSize::Md,
         full_width: false,
-    }.into_component("live_grid_size").expect("SegmentedControl");
+    }
+    .into_component("live_grid_size")
+    .expect("SegmentedControl");
     let _ = current;
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Change,
@@ -5280,11 +6966,14 @@ fn shared_camera_tile(c: &SharedCamera) -> Component {
         let label = alloc::format!("{} · {}", c.display_name, c.owner_addon_id);
         live_video_tile(&c.camera_id, &label, status_label)
     } else {
-        card(None, vec![empty_state(
-            &c.display_name,
-            Some("Offline — brak podglądu"),
-            Some("alert"),
-        )])
+        card(
+            None,
+            vec![empty_state(
+                &c.display_name,
+                Some("Offline — brak podglądu"),
+                Some("alert"),
+            )],
+        )
     }
 }
 
@@ -5303,11 +6992,14 @@ fn live_camera_tile(c: &db::CameraRow) -> Component {
         // badge nad mniejszym boxem wideo.
         live_video_tile(&c.id, &c.name, status_label)
     } else {
-        card(None, vec![empty_state(
-            &c.name,
-            Some("Offline — brak podglądu"),
-            Some("alert"),
-        )])
+        card(
+            None,
+            vec![empty_state(
+                &c.name,
+                Some("Offline — brak podglądu"),
+                Some("alert"),
+            )],
+        )
     }
 }
 
@@ -5341,7 +7033,10 @@ fn build_live_content() -> Component {
         Err(e) => {
             return stack_v(vec![
                 messages,
-                alert(&alloc::format!("Nie udało się pobrać kamer: {}", abi_message(e)), "critical"),
+                alert(
+                    &alloc::format!("Nie udało się pobrać kamer: {}", abi_message(e)),
+                    "critical",
+                ),
             ]);
         }
     };
@@ -5353,16 +7048,11 @@ fn build_live_content() -> Component {
     if cameras.is_empty() && shared.is_empty() {
         // Empty state with a CTA that navigates to the Cameras tab so the user
         // can add a camera before any tile can appear.
-        let cta = button_with_params(
-            "Dodaj kamerę",
-            "panel-navigate",
-            "primary",
-            {
-                let mut p = CborMap::default();
-                p.0.push(("panel_id".into(), Value::Text("cameras".into())));
-                p
-            },
-        );
+        let cta = button_with_params("Dodaj kamerę", "panel-navigate", "primary", {
+            let mut p = CborMap::default();
+            p.0.push(("panel_id".into(), Value::Text("cameras".into())));
+            p
+        });
         let empty = EmptyStateComp {
             icon: icon_named(parse_icon_name("video")),
             heading: lit("Brak kamer"),
@@ -5370,7 +7060,9 @@ fn build_live_content() -> Component {
             primary_action: Some(cta),
             secondary_action: None,
             variant: EmptyStateVariant::Default,
-        }.into_component(next_id()).expect("EmptyState");
+        }
+        .into_component(next_id())
+        .expect("EmptyState");
         return stack_v(vec![messages, empty]);
     }
 
@@ -5383,7 +7075,8 @@ fn build_live_content() -> Component {
     ]);
     // Owned cameras first, then shared cameras; the whole set is capped by the
     // chosen layout so the grid never exceeds its tile budget.
-    let mut tiles: Vec<Component> = cameras.iter()
+    let mut tiles: Vec<Component> = cameras
+        .iter()
         .take(size as usize)
         .map(live_camera_tile)
         .collect();
@@ -5422,7 +7115,10 @@ fn event_meta_winner_text(class_entry: Option<&JsonValue>) -> String {
     let max_vote = |m: &serde_json::Map<String, JsonValue>| -> Option<String> {
         let mut best: Option<(String, i64)> = None;
         for (k, v) in m {
-            if matches!(k.as_str(), "text" | "confidence" | "agreement" | "unreadable" | "votes") {
+            if matches!(
+                k.as_str(),
+                "text" | "confidence" | "agreement" | "unreadable" | "votes"
+            ) {
                 continue;
             }
             if let Some(c) = v.as_i64() {
@@ -5458,7 +7154,11 @@ fn event_meta_winner_text(class_entry: Option<&JsonValue>) -> String {
         // A bare string winner (defensive; not emitted today).
         JsonValue::String(s) => {
             let s = s.trim();
-            if s.is_empty() { "—".to_string() } else { s.to_string() }
+            if s.is_empty() {
+                "—".to_string()
+            } else {
+                s.to_string()
+            }
         }
         _ => "—".to_string(),
     }
@@ -5527,7 +7227,10 @@ fn recording_meta_vehicles(meta: &Option<JsonValue>) -> Vec<VehicleReads> {
     };
     let mut out: Vec<VehicleReads> = Vec::new();
     for item in items {
-        let vehicle_id = item.get("vehicle_id").and_then(JsonValue::as_u64).unwrap_or(0);
+        let vehicle_id = item
+            .get("vehicle_id")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0);
         if vehicle_id == 0 {
             // Unassigned bucket — signs outside any truck; not a per-truck block.
             continue;
@@ -5541,7 +7244,8 @@ fn recording_meta_vehicles(meta: &Option<JsonValue>) -> Vec<VehicleReads> {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| {
                 event_meta_winner_text(
-                    item.get("texts").and_then(|t| t.get("tablica_rejestracyjna")),
+                    item.get("texts")
+                        .and_then(|t| t.get("tablica_rejestracyjna")),
                 )
             });
         let adr = item
@@ -5705,20 +7409,39 @@ fn recording_table_row_value(item: &RecordingListItem, camera_name: &str) -> Val
     // populated by the recorder.
     let zdjecie = recording_thumb_url(&item.plate_thumb_ref);
     let entries: Vec<(Value, Value)> = vec![
-        (Value::Text("recording_ref".into()), Value::Text(item.recording_ref.clone())),
-        (Value::Text("czas".into()), Value::Text(format_alarm_datetime(item.created_at))),
-        (Value::Text("kamera".into()), Value::Text(camera_name.to_string())),
-        (Value::Text("czas_trwania".into()), Value::Text(format_duration_ms(item.duration_ms))),
+        (
+            Value::Text("recording_ref".into()),
+            Value::Text(item.recording_ref.clone()),
+        ),
+        (
+            Value::Text("czas".into()),
+            Value::Text(format_alarm_datetime(item.created_at)),
+        ),
+        (
+            Value::Text("kamera".into()),
+            Value::Text(camera_name.to_string()),
+        ),
+        (
+            Value::Text("czas_trwania".into()),
+            Value::Text(format_duration_ms(item.duration_ms)),
+        ),
         (Value::Text("zdjecie".into()), Value::Text(zdjecie)),
         (Value::Text("odczyty".into()), Value::Text(odczyty)),
-        (Value::Text("rozmiar".into()), Value::Text(format_size_mb(item.file_size_bytes))),
+        (
+            Value::Text("rozmiar".into()),
+            Value::Text(format_size_mb(item.file_size_bytes)),
+        ),
     ];
     Value::Map(entries)
 }
 
 /// Friendly camera name for an id, falling back to the id itself. Built once per
 /// render from the addon's owned + shared camera lists.
-fn recording_camera_name(camera_id: &str, owned: &[db::CameraRow], shared: &[SharedCamera]) -> String {
+fn recording_camera_name(
+    camera_id: &str,
+    owned: &[db::CameraRow],
+    shared: &[SharedCamera],
+) -> String {
     if let Some(c) = owned.iter().find(|c| c.id == camera_id) {
         if !c.name.trim().is_empty() {
             return c.name.clone();
@@ -5765,11 +7488,10 @@ fn build_recordings_table() -> Component {
         recording_table_column_render("odczyty", "Odczyty", ColumnRender::Text),
         recording_table_column("rozmiar", "Rozmiar"),
     ];
-    // The Table injects the row key (`recording_ref`) into the row-action params
-    // as both `row_id` and `recording_ref`, so "Odtwórz" dispatches
-    // `recordings-play` with the clicked recording's ref.
-    let play_action = button("Odtwórz", "recordings-play", "primary");
-    TableComp {
+    // Playback opens on DOUBLE-CLICKING a row (no side button/menu). The Table
+    // emits `row_double_click` carrying the row key (`recording_ref`) as `row_id`,
+    // which `recordings-play` reads to open the player modal.
+    let mut table = TableComp {
         columns,
         rows_path: StatePath::new(vec![PathSegment::Key("recordings_rows".into())]),
         row_key_field: "recording_ref".into(),
@@ -5783,12 +7505,24 @@ fn build_recordings_table() -> Component {
         sticky_columns: 0,
         pagination: None,
         empty_state: None,
-        row_actions: vec![play_action],
+        row_actions: vec![],
         bulk_actions: vec![],
         virtualize: false,
         row_expandable: false,
         expanded_row_template_id: None,
-    }.into_component(next_id()).expect("Table")
+    }
+    .into_component(next_id())
+    .expect("Table");
+    table.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::RowDoubleClick,
+        Handler::Backend {
+            action_id: "recordings-play".into(),
+            params: CborMap::default(),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    table
 }
 
 /// Modal shell for recording playback. Its body slot (`recording_player_body`)
@@ -5796,6 +7530,7 @@ fn build_recordings_table() -> Component {
 /// same `recordings-close` action as the body's close button.
 fn build_recording_player_modal() -> Component {
     let mut modal = ModalComp {
+        icon: None,
         title: lit("Odtwarzanie nagrania"),
         subtitle: None,
         body_slot: "recording_player_body".into(),
@@ -5804,7 +7539,9 @@ fn build_recording_player_modal() -> Component {
         dismissible: true,
         prevent_scroll: true,
         closable: true,
-    }.into_component(next_id()).expect("Modal");
+    }
+    .into_component(next_id())
+    .expect("Modal");
     modal.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Dismiss,
         Handler::Backend {
@@ -5847,19 +7584,24 @@ fn build_recording_player_body(recording_ref: &str) -> Component {
             muted: false,
             object_fit: ImageFit::Contain,
             poster_ref: None,
-        }.into_component(next_id()).expect("VideoStream")
+        }
+        .into_component(next_id())
+        .expect("VideoStream")
     };
 
     // Metadata pulled from the corresponding list row (parsed the same way):
     // the same combined reads as the list — Rejestracja / ADR / Nalepki.
     let (camera_label, when, plate, adr, stany) = recording_playing_meta(recording_ref);
-    let metadata = card(Some("Metadane zdarzenia"), vec![key_value(vec![
-        ("Kamera", camera_label.as_str()),
-        ("Czas", when.as_str()),
-        ("Rejestracja", plate.as_str()),
-        ("ADR", adr.as_str()),
-        ("Nalepki", stany.as_str()),
-    ])]);
+    let metadata = card(
+        Some("Metadane zdarzenia"),
+        vec![key_value(vec![
+            ("Kamera", camera_label.as_str()),
+            ("Czas", when.as_str()),
+            ("Rejestracja", plate.as_str()),
+            ("ADR", adr.as_str()),
+            ("Nalepki", stany.as_str()),
+        ])],
+    );
 
     stack_v(vec![
         player,
@@ -5968,6 +7710,7 @@ fn recordings_search_active() -> bool {
 fn recordings_search_input(label: &str, placeholder: &str, field: &str) -> Component {
     use tentaflow_sdk_spec::protocol::ui::form::Input;
     let mut comp = Input {
+        variant: None,
         r#type: InputType::Search,
         bind_path: StatePath::new(vec![PathSegment::Key(field.into())]),
         placeholder: Some(lit(placeholder)),
@@ -6011,6 +7754,7 @@ fn recordings_search_input(label: &str, placeholder: &str, field: &str) -> Compo
 fn recordings_date_input(label: &str, field: &str) -> Component {
     use tentaflow_sdk_spec::protocol::ui::form::Input;
     let mut comp = Input {
+        variant: None,
         // No dedicated Date InputType exists; Text keeps the field a real tf-input
         // while the `YYYY-MM-DD` value is validated by `parse_day_bound_ms`.
         r#type: InputType::Text,
@@ -6165,31 +7909,36 @@ fn build_cameras_content() -> Component {
     let mut children = vec![messages];
 
     // Header: heading + search + add button
-    let search_input = with_a11y_label({
-        use tentaflow_sdk_spec::protocol::ui::form::Input;
-        Input {
-            r#type: InputType::Search,
-            bind_path: StatePath::new(vec![PathSegment::Key("cameras_search".into())]),
-            placeholder: Some(lit("Szukaj po nazwie, IP, vendorze...")),
-            label: None,
-            hint: None,
-            leading_icon: Some(icon_named(parse_icon_name("search"))),
-            trailing_icon: None,
-            prefix: None,
-            suffix: None,
-            validators: vec![],
-            max_length: None,
-            min_length: None,
-            pattern: None,
-            autocomplete: None,
-            input_mode: None,
-            disabled: None,
-            readonly: None,
-            error: None,
-            size: InputSize::Md,
-            variant: None,
-        }.into_component("cameras_search").expect("Input")
-    }, "Szukaj kamer");
+    let search_input = with_a11y_label(
+        {
+            use tentaflow_sdk_spec::protocol::ui::form::Input;
+            Input {
+                r#type: InputType::Search,
+                bind_path: StatePath::new(vec![PathSegment::Key("cameras_search".into())]),
+                placeholder: Some(lit("Szukaj po nazwie, IP, vendorze...")),
+                label: None,
+                hint: None,
+                leading_icon: Some(icon_named(parse_icon_name("search"))),
+                trailing_icon: None,
+                prefix: None,
+                suffix: None,
+                validators: vec![],
+                max_length: None,
+                min_length: None,
+                pattern: None,
+                autocomplete: None,
+                input_mode: None,
+                disabled: None,
+                readonly: None,
+                error: None,
+                size: InputSize::Md,
+                variant: None,
+            }
+            .into_component("cameras_search")
+            .expect("Input")
+        },
+        "Szukaj kamer",
+    );
     let toolbar = stack_h(vec![
         heading(2, "Kamery"),
         search_input,
@@ -6203,7 +7952,10 @@ fn build_cameras_content() -> Component {
     let cameras = match list_result {
         Ok(c) => c,
         Err(e) => {
-            children.push(alert(&alloc::format!("Nie udało się pobrać kamer: {}", abi_message(e)), "critical"));
+            children.push(alert(
+                &alloc::format!("Nie udało się pobrać kamer: {}", abi_message(e)),
+                "critical",
+            ));
             return stack_v(children);
         }
     };
@@ -6217,10 +7969,34 @@ fn build_cameras_content() -> Component {
     let active_filter = if filter.is_empty() { "all" } else { &filter };
     let sub_tabs = filter_chips(
         vec![
-            FilterChipDef { id: "all".into(), label: lit(&alloc::format!("Wszystkie ({})", total)), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "online".into(), label: lit(&alloc::format!("Online ({})", online)), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "offline".into(), label: lit(&alloc::format!("Offline ({})", offline)), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "warnings".into(), label: lit(&alloc::format!("Ostrzeżenia ({})", warnings)), icon: None, badge: None, count_path: None },
+            FilterChipDef {
+                id: "all".into(),
+                label: lit(&alloc::format!("Wszystkie ({})", total)),
+                icon: None,
+                badge: None,
+                count_path: None,
+            },
+            FilterChipDef {
+                id: "online".into(),
+                label: lit(&alloc::format!("Online ({})", online)),
+                icon: None,
+                badge: None,
+                count_path: None,
+            },
+            FilterChipDef {
+                id: "offline".into(),
+                label: lit(&alloc::format!("Offline ({})", offline)),
+                icon: None,
+                badge: None,
+                count_path: None,
+            },
+            FilterChipDef {
+                id: "warnings".into(),
+                label: lit(&alloc::format!("Ostrzeżenia ({})", warnings)),
+                icon: None,
+                badge: None,
+                count_path: None,
+            },
         ],
         active_filter,
     );
@@ -6283,7 +8059,11 @@ fn build_cameras_content() -> Component {
         // No outer Outlined Card: the dashboard pushes its sections straight
         // into the stack, so wrapping these in card(None, ...) would draw a
         // double container (a stray white frame around the content).
-        children.push(empty_state("Brak kamer", Some("Dodaj kamerę aby rozpocząć monitorowanie."), Some("cameras")));
+        children.push(empty_state(
+            "Brak kamer",
+            Some("Dodaj kamerę aby rozpocząć monitorowanie."),
+            Some("cameras"),
+        ));
     } else {
         // Stash the filtered rows (read from SQLite) for render_panel to seed
         // into the content slot's state_overlay under the Table's rows_path, so
@@ -6308,13 +8088,25 @@ fn camera_row_has_warning(c: &db::CameraRow) -> bool {
 
 /// Renders the persisted address: ONVIF url if present, else RTSP url.
 fn camera_row_addr(c: &db::CameraRow) -> String {
-    let addr = if !c.onvif_url.trim().is_empty() { &c.onvif_url } else { &c.rtsp_url };
-    if addr.trim().is_empty() { "\u{2014}".to_string() } else { redact_url_for_display(addr) }
+    let addr = if !c.onvif_url.trim().is_empty() {
+        &c.onvif_url
+    } else {
+        &c.rtsp_url
+    };
+    if addr.trim().is_empty() {
+        "\u{2014}".to_string()
+    } else {
+        redact_url_for_display(addr)
+    }
 }
 
 /// FPS cell: configured target fps, or em-dash when 0.
 fn camera_row_fps(c: &db::CameraRow) -> String {
-    if c.fps > 0 { alloc::format!("{}", c.fps) } else { "\u{2014}".to_string() }
+    if c.fps > 0 {
+        alloc::format!("{}", c.fps)
+    } else {
+        "\u{2014}".to_string()
+    }
 }
 
 /// Human-readable AI analysis FPS for the cameras table. `0` reads as
@@ -6336,7 +8128,10 @@ fn camera_row_analysis_fps(c: &db::CameraRow) -> String {
 fn chip_cell(label: &str, status: &str) -> Value {
     Value::Map(vec![
         (Value::Text("label".into()), Value::Text(label.to_string())),
-        (Value::Text("status".into()), Value::Text(status.to_string())),
+        (
+            Value::Text("status".into()),
+            Value::Text(status.to_string()),
+        ),
     ])
 }
 
@@ -6350,8 +8145,16 @@ fn camera_status_cell(status: &str) -> Value {
 }
 
 fn camera_table_row_value(c: &db::CameraRow) -> Value {
-    let location = if c.location.trim().is_empty() { "\u{2014}".to_string() } else { c.location.clone() };
-    let detectors = if c.detectors.trim().is_empty() { "\u{2014}".to_string() } else { c.detectors.clone() };
+    let location = if c.location.trim().is_empty() {
+        "\u{2014}".to_string()
+    } else {
+        c.location.clone()
+    };
+    let detectors = if c.detectors.trim().is_empty() {
+        "\u{2014}".to_string()
+    } else {
+        c.detectors.clone()
+    };
     let entries: Vec<(Value, Value)> = vec![
         (Value::Text("camera_id".into()), Value::Text(c.id.clone())),
         (Value::Text("name".into()), Value::Text(c.name.clone())),
@@ -6360,7 +8163,10 @@ fn camera_table_row_value(c: &db::CameraRow) -> Value {
         (Value::Text("status".into()), camera_status_cell(&c.status)),
         (Value::Text("detectors".into()), Value::Text(detectors)),
         (Value::Text("fps".into()), Value::Text(camera_row_fps(c))),
-        (Value::Text("analysis_fps".into()), Value::Text(camera_row_analysis_fps(c))),
+        (
+            Value::Text("analysis_fps".into()),
+            Value::Text(camera_row_analysis_fps(c)),
+        ),
     ];
     Value::Map(entries)
 }
@@ -6424,7 +8230,9 @@ fn build_cameras_table() -> Component {
         virtualize: false,
         row_expandable: false,
         expanded_row_template_id: None,
-    }.into_component(next_id()).expect("Table")
+    }
+    .into_component(next_id())
+    .expect("Table")
 }
 
 /// Confirmation bar for deleting the selected camera. Usuń dispatches
@@ -6437,16 +8245,24 @@ fn build_camera_remove_confirm(camera_id: &str, cameras: &[db::CameraRow]) -> Co
         .unwrap_or(camera_id);
 
     let mut params = CborMap::default();
-    params.0.push(("camera_id".into(), Value::Text(camera_id.into())));
+    params
+        .0
+        .push(("camera_id".into(), Value::Text(camera_id.into())));
 
     let confirm_btn = button_with_params("Usuń", "camera-remove", "destructive", params);
     let cancel_btn = button("Anuluj", "camera-remove-cancel", "ghost");
 
-    card(None, vec![stack_v(vec![
-        text_styled(&alloc::format!("Usunąć kamerę \"{}\"?", name), "body_strong"),
-        text("Tej operacji nie można cofnąć."),
-        stack_h(vec![confirm_btn, cancel_btn]),
-    ])])
+    card(
+        None,
+        vec![stack_v(vec![
+            text_styled(
+                &alloc::format!("Usunąć kamerę \"{}\"?", name),
+                "body_strong",
+            ),
+            text("Tej operacji nie można cofnąć."),
+            stack_h(vec![confirm_btn, cancel_btn]),
+        ])],
+    )
 }
 
 /// Analysis-flow selector for the selected camera. The Select lists the active
@@ -6484,20 +8300,25 @@ fn build_camera_flow_config(camera_id: &str, cameras: &[db::CameraRow]) -> Compo
             }
         }
         Err(e) => {
-            return card(None, vec![stack_v(vec![
-                text_styled(&alloc::format!("Flow analizy — {}", name), "body_strong"),
-                alert(
-                    &alloc::format!("Nie udało się pobrać listy flow: {}", abi_message(e)),
-                    "critical",
-                ),
-                button("Zamknij", "camera-flow-cancel", "ghost"),
-            ])]);
+            return card(
+                None,
+                vec![stack_v(vec![
+                    text_styled(&alloc::format!("Flow analizy — {}", name), "body_strong"),
+                    alert(
+                        &alloc::format!("Nie udało się pobrać listy flow: {}", abi_message(e)),
+                        "critical",
+                    ),
+                    button("Zamknij", "camera-flow-cancel", "ghost"),
+                ])],
+            );
         }
     }
 
     let mut selector = select("Flow analizy", options, "camera_flow_select");
     let mut params = CborMap::default();
-    params.0.push(("camera_id".into(), Value::Text(camera_id.into())));
+    params
+        .0
+        .push(("camera_id".into(), Value::Text(camera_id.into())));
     selector.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Change,
         Handler::Backend {
@@ -6508,12 +8329,15 @@ fn build_camera_flow_config(camera_id: &str, cameras: &[db::CameraRow]) -> Compo
         },
     )]));
 
-    card(None, vec![stack_v(vec![
-        text_styled(&alloc::format!("Flow analizy — {}", name), "body_strong"),
-        text("Wybrany flow uruchamia się na każdej detekcji z tej kamery."),
-        selector,
-        button("Zamknij", "camera-flow-cancel", "ghost"),
-    ])])
+    card(
+        None,
+        vec![stack_v(vec![
+            text_styled(&alloc::format!("Flow analizy — {}", name), "body_strong"),
+            text("Wybrany flow uruchamia się na każdej detekcji z tej kamery."),
+            selector,
+            button("Zamknij", "camera-flow-cancel", "ghost"),
+        ])],
+    )
 }
 
 // =============================================================================
@@ -6563,20 +8387,31 @@ fn build_camera_pipeline_config(camera_id: &str, cameras: &[db::CameraRow]) -> C
             }
         }
         Err(e) => {
-            return card(None, vec![stack_v(vec![
-                text_styled(&alloc::format!("Pipeline analizy — {}", name), "body_strong"),
-                alert(
-                    &alloc::format!("Nie udało się pobrać listy pipeline'ów: {}", abi_message(e)),
-                    "critical",
-                ),
-                button("Zamknij", "camera-pipeline-cancel", "ghost"),
-            ])]);
+            return card(
+                None,
+                vec![stack_v(vec![
+                    text_styled(
+                        &alloc::format!("Pipeline analizy — {}", name),
+                        "body_strong",
+                    ),
+                    alert(
+                        &alloc::format!(
+                            "Nie udało się pobrać listy pipeline'ów: {}",
+                            abi_message(e)
+                        ),
+                        "critical",
+                    ),
+                    button("Zamknij", "camera-pipeline-cancel", "ghost"),
+                ])],
+            );
         }
     }
 
     let mut selector = select("Pipeline analizy", options, "camera_pipeline_select");
     let mut params = CborMap::default();
-    params.0.push(("camera_id".into(), Value::Text(camera_id.into())));
+    params
+        .0
+        .push(("camera_id".into(), Value::Text(camera_id.into())));
     selector.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Change,
         Handler::Backend {
@@ -6601,10 +8436,18 @@ fn build_camera_pipeline_config(camera_id: &str, cameras: &[db::CameraRow]) -> C
 /// Text input for one stage-editor field: bound to `key` in the store and
 /// mirrored into the backend draft per keystroke via
 /// `pipeline-stage-field-change` (tagged with the stage index + field name).
-fn pipeline_stage_input(label: &str, placeholder: &str, key: &str, index: usize, field: &str) -> Component {
+fn pipeline_stage_input(
+    label: &str,
+    placeholder: &str,
+    key: &str,
+    index: usize,
+    field: &str,
+) -> Component {
     let mut comp = input(label, placeholder, key);
     let mut params = CborMap::default();
-    params.0.push(("index".into(), Value::Text(alloc::format!("{}", index))));
+    params
+        .0
+        .push(("index".into(), Value::Text(alloc::format!("{}", index))));
     params.0.push(("field".into(), Value::Text(field.into())));
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Input,
@@ -6620,10 +8463,18 @@ fn pipeline_stage_input(label: &str, placeholder: &str, key: &str, index: usize,
 
 /// Select for one stage-editor field; commits the pick to the backend draft
 /// on change (same action + tagging as [`pipeline_stage_input`]).
-fn pipeline_stage_select(label: &str, options: Vec<SelectOption>, key: &str, index: usize, field: &str) -> Component {
+fn pipeline_stage_select(
+    label: &str,
+    options: Vec<SelectOption>,
+    key: &str,
+    index: usize,
+    field: &str,
+) -> Component {
     let mut comp = select(label, options, key);
     let mut params = CborMap::default();
-    params.0.push(("index".into(), Value::Text(alloc::format!("{}", index))));
+    params
+        .0
+        .push(("index".into(), Value::Text(alloc::format!("{}", index))));
     params.0.push(("field".into(), Value::Text(field.into())));
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Change,
@@ -6685,7 +8536,13 @@ fn build_pipeline_stage_card(
     let key = |suffix: &str| alloc::format!("cvp_s{}_{}", index, suffix);
     let mut fields: Vec<Component> = Vec::new();
 
-    fields.push(pipeline_stage_input("ID etapu", "np. detect", &key("id"), index, "stage_id"));
+    fields.push(pipeline_stage_input(
+        "ID etapu",
+        "np. detect",
+        &key("id"),
+        index,
+        "stage_id",
+    ));
     fields.push(pipeline_stage_select(
         "Operacja",
         vec![
@@ -6775,7 +8632,9 @@ fn build_pipeline_stage_card(
 
     let mut enabled_toggle = toggle("Etap włączony", &key("enabled"));
     let mut toggle_params = CborMap::default();
-    toggle_params.0.push(("index".into(), Value::Text(alloc::format!("{}", index))));
+    toggle_params
+        .0
+        .push(("index".into(), Value::Text(alloc::format!("{}", index))));
     enabled_toggle.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Change,
         Handler::Backend {
@@ -6786,24 +8645,41 @@ fn build_pipeline_stage_card(
         },
     )]));
     let mut remove_params = CborMap::default();
-    remove_params.0.push(("index".into(), Value::Text(alloc::format!("{}", index))));
+    remove_params
+        .0
+        .push(("index".into(), Value::Text(alloc::format!("{}", index))));
     fields.push(stack_h(vec![
         enabled_toggle,
-        button_with_params("Usuń etap", "pipeline-stage-remove", "destructive", remove_params),
+        button_with_params(
+            "Usuń etap",
+            "pipeline-stage-remove",
+            "destructive",
+            remove_params,
+        ),
     ]));
 
     card(
-        Some(&alloc::format!("Etap {} — {}", index + 1, if st.stage_id.trim().is_empty() { "(bez ID)" } else { st.stage_id.trim() })),
+        Some(&alloc::format!(
+            "Etap {} — {}",
+            index + 1,
+            if st.stage_id.trim().is_empty() {
+                "(bez ID)"
+            } else {
+                st.stage_id.trim()
+            }
+        )),
         vec![stack_v(fields)],
     )
 }
 
 /// The stage editor for the pipeline being created / edited.
 fn build_pipeline_editor() -> Component {
-    let (editing_id, stages) = with_state(|s| (
-        s.cv_pipelines.editing_id.clone(),
-        s.cv_pipelines.stages.clone(),
-    ));
+    let (editing_id, stages) = with_state(|s| {
+        (
+            s.cv_pipelines.editing_id.clone(),
+            s.cv_pipelines.stages.clone(),
+        )
+    });
     let aliases = alias_list_available().unwrap_or_default();
     let detect_ids: Vec<String> = stages
         .iter()
@@ -6829,9 +8705,11 @@ fn build_pipeline_editor() -> Component {
         children.push(build_pipeline_stage_card(i, st, &aliases, &detect_ids));
     }
 
-    children.push(stack_h(vec![
-        button("Dodaj etap", "pipeline-stage-add", "secondary"),
-    ]));
+    children.push(stack_h(vec![button(
+        "Dodaj etap",
+        "pipeline-stage-add",
+        "secondary",
+    )]));
     children.push(divider());
     children.push(stack_h(vec![
         button("Zapisz", "pipeline-save", "primary"),
@@ -6856,13 +8734,16 @@ fn build_pipeline_manager() -> Component {
     let pipelines = match host_cv_pipelines_list() {
         Ok(p) => p,
         Err(e) => {
-            return card(Some("Pipeline'y analizy CV"), vec![stack_v(vec![
-                alert(
-                    &alloc::format!("Nie udało się pobrać pipeline'ów: {}", abi_message(e)),
-                    "critical",
-                ),
-                button("Zamknij", "pipeline-manager-close", "ghost"),
-            ])]);
+            return card(
+                Some("Pipeline'y analizy CV"),
+                vec![stack_v(vec![
+                    alert(
+                        &alloc::format!("Nie udało się pobrać pipeline'ów: {}", abi_message(e)),
+                        "critical",
+                    ),
+                    button("Zamknij", "pipeline-manager-close", "ghost"),
+                ])],
+            );
         }
     };
 
@@ -6873,20 +8754,40 @@ fn build_pipeline_manager() -> Component {
     }
     for p in &pipelines {
         let mut params = CborMap::default();
-        params.0.push(("pipeline_id".into(), Value::Text(p.id.clone())));
+        params
+            .0
+            .push(("pipeline_id".into(), Value::Text(p.id.clone())));
         let mut row: Vec<Component> = vec![text_styled(&p.name, "body_strong")];
         if p.is_default {
             row.push(badge("domyślny", "info"));
         }
-        row.push(button_with_params("Edytuj", "pipeline-edit", "secondary", params.clone()));
-        row.push(button_with_params("Duplikuj", "pipeline-duplicate", "ghost", params.clone()));
+        row.push(button_with_params(
+            "Edytuj",
+            "pipeline-edit",
+            "secondary",
+            params.clone(),
+        ));
+        row.push(button_with_params(
+            "Duplikuj",
+            "pipeline-duplicate",
+            "ghost",
+            params.clone(),
+        ));
         if !p.is_default {
-            row.push(button_with_params("Usuń", "pipeline-row-remove", "destructive", params.clone()));
+            row.push(button_with_params(
+                "Usuń",
+                "pipeline-row-remove",
+                "destructive",
+                params.clone(),
+            ));
         }
         children.push(stack_h(row));
         if pending_remove.as_deref() == Some(p.id.as_str()) {
             children.push(stack_h(vec![
-                text_styled(&alloc::format!("Usunąć pipeline \"{}\"?", p.name), "body_strong"),
+                text_styled(
+                    &alloc::format!("Usunąć pipeline \"{}\"?", p.name),
+                    "body_strong",
+                ),
                 button_with_params("Usuń", "pipeline-remove", "destructive", params),
                 button("Anuluj", "pipeline-remove-cancel", "ghost"),
             ]));
@@ -6905,10 +8806,8 @@ fn build_pipeline_manager() -> Component {
 /// sent with the cameras content overlay so every control mounts showing the
 /// authoritative backend draft.
 fn pipeline_editor_overlay() -> Vec<StateEntry> {
-    let (name, stages) = with_state(|s| (
-        s.cv_pipelines.name.clone(),
-        s.cv_pipelines.stages.clone(),
-    ));
+    let (name, stages) =
+        with_state(|s| (s.cv_pipelines.name.clone(), s.cv_pipelines.stages.clone()));
     let mut pairs: Vec<(String, Value)> = vec![("cvp_name".into(), Value::Text(name))];
     for (i, st) in stages.iter().enumerate() {
         let key = |suffix: &str| alloc::format!("cvp_s{}_{}", i, suffix);
@@ -6921,7 +8820,11 @@ fn pipeline_editor_overlay() -> Vec<StateEntry> {
         pairs.push((key("classes"), Value::Text(st.classes.clone())));
         pairs.push((
             key("ocr_mode"),
-            Value::Text(if st.ocr_mode.trim().is_empty() { "generic".to_string() } else { st.ocr_mode.clone() }),
+            Value::Text(if st.ocr_mode.trim().is_empty() {
+                "generic".to_string()
+            } else {
+                st.ocr_mode.clone()
+            }),
         ));
         pairs.push((key("enabled"), Value::Bool(st.enabled)));
     }
@@ -6967,11 +8870,26 @@ fn wizard_source_pairs(src: Option<SourceType>) -> Vec<(String, Value)> {
     let s = src.map(SourceType::as_str).unwrap_or("");
     vec![
         ("wiz_src".into(), Value::Text(s.into())),
-        ("wiz_is_onvif".into(), Value::Bool(src == Some(SourceType::Onvif))),
-        ("wiz_is_rtsp".into(), Value::Bool(src == Some(SourceType::Rtsp))),
-        ("wiz_is_mjpeg".into(), Value::Bool(src == Some(SourceType::Mjpeg))),
-        ("wiz_is_usb".into(), Value::Bool(src == Some(SourceType::Usb))),
-        ("wiz_is_file".into(), Value::Bool(src == Some(SourceType::File))),
+        (
+            "wiz_is_onvif".into(),
+            Value::Bool(src == Some(SourceType::Onvif)),
+        ),
+        (
+            "wiz_is_rtsp".into(),
+            Value::Bool(src == Some(SourceType::Rtsp)),
+        ),
+        (
+            "wiz_is_mjpeg".into(),
+            Value::Bool(src == Some(SourceType::Mjpeg)),
+        ),
+        (
+            "wiz_is_usb".into(),
+            Value::Bool(src == Some(SourceType::Usb)),
+        ),
+        (
+            "wiz_is_file".into(),
+            Value::Bool(src == Some(SourceType::File)),
+        ),
     ]
 }
 
@@ -6981,8 +8899,14 @@ fn wizard_onvif_pairs(s: &DiscoverState) -> Vec<(String, Value)> {
     let count = s.cameras.len();
     vec![
         ("wiz_onvif_scanning".into(), Value::Bool(s.scanning)),
-        ("wiz_onvif_has_results".into(), Value::Bool(!s.scanning && count > 0)),
-        ("wiz_onvif_no_results".into(), Value::Bool(!s.scanning && count == 0)),
+        (
+            "wiz_onvif_has_results".into(),
+            Value::Bool(!s.scanning && count > 0),
+        ),
+        (
+            "wiz_onvif_no_results".into(),
+            Value::Bool(!s.scanning && count == 0),
+        ),
         (
             "wiz_onvif_count".into(),
             Value::Text(alloc::format!(
@@ -7000,8 +8924,17 @@ fn wizard_test_pairs(s: &DiscoverState) -> Vec<(String, Value)> {
     let (ok, err, text, idle) = match (&s.testing, &s.test_result) {
         (true, _) => (false, false, String::new(), false),
         (false, Some(Ok(m))) => {
-            let detail = if m.is_empty() { "Połączenie nawiązane.".to_string() } else { m.clone() };
-            (true, false, alloc::format!("Połączenie OK. {}", detail), false)
+            let detail = if m.is_empty() {
+                "Połączenie nawiązane.".to_string()
+            } else {
+                m.clone()
+            };
+            (
+                true,
+                false,
+                alloc::format!("Połączenie OK. {}", detail),
+                false,
+            )
         }
         (false, Some(Err(m))) => (false, true, m.clone(), false),
         (false, None) => (false, false, String::new(), true),
@@ -7020,7 +8953,10 @@ fn wizard_test_pairs(s: &DiscoverState) -> Vec<(String, Value)> {
 fn wizard_error_pairs(message: Option<&str>) -> Vec<(String, Value)> {
     vec![
         ("wiz_has_error".into(), Value::Bool(message.is_some())),
-        ("wiz_error".into(), Value::Text(message.unwrap_or("").into())),
+        (
+            "wiz_error".into(),
+            Value::Text(message.unwrap_or("").into()),
+        ),
     ]
 }
 
@@ -7030,7 +8966,13 @@ fn wizard_error_pairs(message: Option<&str>) -> Vec<(String, Value)> {
 /// scan/select re-send) so every bound visibility flag, the StepProgress and
 /// the field inputs resolve to the authoritative backend state on first paint.
 fn wizard_full_overlay() -> Vec<StateEntry> {
-    let (step, src, err) = with_state(|s| (s.wizard_step, s.discover.source_type, s.error_message.clone()));
+    let (step, src, err) = with_state(|s| {
+        (
+            s.wizard_step,
+            s.discover.source_type,
+            s.error_message.clone(),
+        )
+    });
     let mut pairs: Vec<(String, Value)> = Vec::new();
     pairs.extend(wizard_step_pairs(step));
     pairs.extend(wizard_source_pairs(src));
@@ -7039,27 +8981,35 @@ fn wizard_full_overlay() -> Vec<StateEntry> {
     pairs.extend(wizard_error_pairs(err.as_deref()));
     // Field bind paths reflect the committed backend values so the two-way-bound
     // inputs show the right text without any further round-trip.
-    let fields = with_state(|s| [
-        ("onvif_url", s.discover.onvif_url.clone()),
-        ("rtsp_url", s.discover.rtsp_url.clone()),
-        ("mjpeg_url", s.discover.mjpeg_url.clone()),
-        ("usb_device_path", s.discover.usb_device_path.clone()),
-        ("file_path", s.discover.file_path.clone()),
-        ("cred_user", s.discover.cred_user.clone()),
-        ("cred_pass", s.discover.cred_pass.clone()),
-        ("name", s.discover.name.clone()),
-        ("retention", s.discover.retention.clone()),
-        ("fps", s.discover.fps.clone()),
-    ]);
+    let fields = with_state(|s| {
+        [
+            ("onvif_url", s.discover.onvif_url.clone()),
+            ("rtsp_url", s.discover.rtsp_url.clone()),
+            ("mjpeg_url", s.discover.mjpeg_url.clone()),
+            ("usb_device_path", s.discover.usb_device_path.clone()),
+            ("file_path", s.discover.file_path.clone()),
+            ("cred_user", s.discover.cred_user.clone()),
+            ("cred_pass", s.discover.cred_pass.clone()),
+            ("name", s.discover.name.clone()),
+            ("retention", s.discover.retention.clone()),
+            ("fps", s.discover.fps.clone()),
+        ]
+    });
     for (key, value) in fields {
         pairs.push((key.into(), Value::Text(value)));
     }
     // Reflect the committed profile (defaulting to "default") so the select
     // shows the authoritative backend value rather than always resetting to it.
-    pairs.push(("profile".into(), Value::Text(with_state(|s| s.discover.profile_or_default().to_string()))));
+    pairs.push((
+        "profile".into(),
+        Value::Text(with_state(|s| s.discover.profile_or_default().to_string())),
+    ));
     // Reflect the committed analysis FPS (defaulting to "10") so the select
     // shows the authoritative backend value.
-    pairs.push(("analysis_fps".into(), Value::Text(with_state(|s| s.discover.analysis_fps_or_default()))));
+    pairs.push((
+        "analysis_fps".into(),
+        Value::Text(with_state(|s| s.discover.analysis_fps_or_default())),
+    ));
     pairs
         .into_iter()
         .map(|(key, value)| StateEntry {
@@ -7078,9 +9028,14 @@ fn wizard_full_overlay() -> Vec<StateEntry> {
 /// the dialog any way resets the wizard state.
 fn build_add_camera_modal() -> Component {
     let step = with_state(|s| s.wizard_step);
-    let title = alloc::format!("Dodaj kamerę \u{2014} krok {} z {}", step + 1, ADD_CAMERA_WIZARD_STEPS);
+    let title = alloc::format!(
+        "Dodaj kamerę \u{2014} krok {} z {}",
+        step + 1,
+        ADD_CAMERA_WIZARD_STEPS
+    );
 
     let mut modal = ModalComp {
+        icon: None,
         title: lit(&title),
         subtitle: None,
         body_slot: "add_camera_body".into(),
@@ -7089,7 +9044,9 @@ fn build_add_camera_modal() -> Component {
         dismissible: true,
         prevent_scroll: true,
         closable: true,
-    }.into_component(next_id()).expect("Modal");
+    }
+    .into_component(next_id())
+    .expect("Modal");
     modal.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Dismiss,
         Handler::Backend {
@@ -7126,17 +9083,23 @@ fn build_add_camera_body() -> Component {
 fn build_wizard_step_progress() -> Component {
     let step_labels = ["Typ źródła", "Konfiguracja", "Test połączenia", "Metadane"];
     StepProgressComp {
-        steps: step_labels.iter().enumerate().map(|(i, label)| StepDef {
-            id: wiz_step_id(i as u8),
-            label: lit(label),
-            optional: false,
-            status: None,
-            description: None,
-        }).collect(),
+        steps: step_labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| StepDef {
+                id: wiz_step_id(i as u8),
+                label: lit(label),
+                optional: false,
+                status: None,
+                description: None,
+            })
+            .collect(),
         current_id_path: StatePath::new(vec![PathSegment::Key("wiz_step".into())]),
         variant: StepProgressVariant::Horizontal,
         clickable_completed: false,
-    }.into_component(next_id()).expect("StepProgress")
+    }
+    .into_component(next_id())
+    .expect("StepProgress")
 }
 
 /// Builds the wizard navigation buttons for the `add_camera_footer` slot ONCE.
@@ -7145,10 +9108,16 @@ fn build_wizard_step_progress() -> Component {
 /// footer. The Next label is intentionally generic — the step number lives in
 /// the StepProgress, not the button text, so it needs no per-step patching.
 fn build_add_camera_footer() -> Component {
-    let back = with_visible(button_with_icon("Wstecz", "wizard-prev", "ghost", "info"), "wiz_show_back");
+    let back = with_visible(
+        button_with_icon("Wstecz", "wizard-prev", "ghost", "info"),
+        "wiz_show_back",
+    );
     let cancel = button("Anuluj", "camera-add-cancel", "ghost");
     let next = with_visible(button("Dalej", "wizard-next", "primary"), "wiz_show_next");
-    let finish = with_visible(button("Zakończ", "camera-add-submit", "primary"), "wiz_show_finish");
+    let finish = with_visible(
+        button("Zakończ", "camera-add-submit", "primary"),
+        "wiz_show_finish",
+    );
     stack_h(vec![back, cancel, next, finish])
 }
 
@@ -7179,7 +9148,9 @@ fn build_wizard_step_source_type() -> Component {
             value: SelectValue::Text(SourceType::Mjpeg.as_str().into()),
             icon: icon_named(parse_icon_name("video")),
             title: lit("MJPEG (HTTP)"),
-            description: Some(lit("Strumień multipart MJPEG po http:// lub https:// (np. Axis video.cgi).")),
+            description: Some(lit(
+                "Strumień multipart MJPEG po http:// lub https:// (np. Axis video.cgi).",
+            )),
             badge: None,
             disabled: false,
         },
@@ -7206,7 +9177,9 @@ fn build_wizard_step_source_type() -> Component {
         options,
         columns: 2,
         variant: RadioCardVariant::Default,
-    }.into_component(next_id()).expect("RadioCardGroup");
+    }
+    .into_component(next_id())
+    .expect("RadioCardGroup");
     group = with_a11y_label(group, "Typ źródła kamery");
     // The change carries the picked SelectValue as `{value, kind}` detail; the
     // backend reads `value` to branch step 2 and patch the per-type flags.
@@ -7248,29 +9221,52 @@ fn build_config_onvif() -> Component {
     let selected_idx = with_state(|s| s.discover.selected_index);
 
     let scan_spinner = with_visible(
-        stack_v(vec![spinner("md"), text("Skanowanie sieci (ONVIF WS-Discovery)...")]),
+        stack_v(vec![
+            spinner("md"),
+            text("Skanowanie sieci (ONVIF WS-Discovery)..."),
+        ]),
         "wiz_onvif_scanning",
     );
 
     let no_results = with_visible(
         stack_v(vec![
-            text("Zeskanuj sieć w poszukiwaniu kamer ONVIF lub podaj adres URL urządzenia ręcznie."),
-            stack_h(vec![button_with_icon("Skanuj sieć", "discover-scan", "primary", "search")]),
+            text(
+                "Zeskanuj sieć w poszukiwaniu kamer ONVIF lub podaj adres URL urządzenia ręcznie.",
+            ),
+            stack_h(vec![button_with_icon(
+                "Skanuj sieć",
+                "discover-scan",
+                "primary",
+                "search",
+            )]),
         ]),
         "wiz_onvif_no_results",
     );
 
-    let discovered = with_state(|s| s.discover.cameras.iter().enumerate()
-        .map(|(i, c)| (i, c.suggested_name.clone(), c.url.clone())).collect::<Vec<_>>());
+    let discovered = with_state(|s| {
+        s.discover
+            .cameras
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, c.suggested_name.clone(), c.url.clone()))
+            .collect::<Vec<_>>()
+    });
     let mut cam_rows: Vec<Component> = Vec::new();
     for (i, name, url) in &discovered {
         let is_sel = !scanning && selected_idx == Some(*i);
-        let row_content = stack_v_gap("xs", vec![
-            text_styled(name, "body_strong"),
-            text_styled(url, "caption"),
-        ]);
+        let row_content = stack_v_gap(
+            "xs",
+            vec![
+                text_styled(name, "body_strong"),
+                text_styled(url, "caption"),
+            ],
+        );
         let mut row_card = Card {
-            variant: if is_sel { CardVariant::Filled } else { CardVariant::Outlined },
+            variant: if is_sel {
+                CardVariant::Filled
+            } else {
+                CardVariant::Outlined
+            },
             padding: Spacing::Sm,
             gap: Spacing::Sm,
             radius: RadiusToken::Sm,
@@ -7282,7 +9278,9 @@ fn build_config_onvif() -> Component {
             interactive: true,
             clickable: true,
             style: None,
-        }.into_component(next_id()).expect("Card");
+        }
+        .into_component(next_id())
+        .expect("Card");
         let mut params = CborMap::default();
         params.0.push(("index".into(), Value::U64(*i as u64)));
         row_card.handlers = Some(HandlerMap(vec![(
@@ -7305,7 +9303,12 @@ fn build_config_onvif() -> Component {
         "wiz_onvif_has_results",
     );
 
-    let url_input = wizard_input("URL urządzenia ONVIF", "http://10.0.0.5/onvif/device_service", "onvif_url", false);
+    let url_input = wizard_input(
+        "URL urządzenia ONVIF",
+        "http://10.0.0.5/onvif/device_service",
+        "onvif_url",
+        false,
+    );
     let user_input = wizard_input("Użytkownik", "", "cred_user", false);
     let pass_input = wizard_input("Hasło", "", "cred_pass", true);
 
@@ -7320,7 +9323,12 @@ fn build_config_onvif() -> Component {
 }
 
 fn build_config_rtsp() -> Component {
-    let url_input = wizard_input("URL strumienia RTSP", "rtsp://host:554/stream", "rtsp_url", false);
+    let url_input = wizard_input(
+        "URL strumienia RTSP",
+        "rtsp://host:554/stream",
+        "rtsp_url",
+        false,
+    );
     let user_input = wizard_input("Użytkownik (opcjonalnie)", "", "cred_user", false);
     let pass_input = wizard_input("Hasło (opcjonalnie)", "", "cred_pass", true);
     stack_v(vec![
@@ -7334,11 +9342,18 @@ fn build_config_rtsp() -> Component {
 /// `/axis-cgi/mjpg/video.cgi`) + opcjonalne poświadczenia — host przekazuje je
 /// do souphttpsrc (`user-id`/`user-pw`), nie do URL-a.
 fn build_config_mjpeg() -> Component {
-    let url_input = wizard_input("URL strumienia MJPEG", "http://10.0.0.5/axis-cgi/mjpg/video.cgi", "mjpeg_url", false);
+    let url_input = wizard_input(
+        "URL strumienia MJPEG",
+        "http://10.0.0.5/axis-cgi/mjpg/video.cgi",
+        "mjpeg_url",
+        false,
+    );
     let user_input = wizard_input("Użytkownik (opcjonalnie)", "", "cred_user", false);
     let pass_input = wizard_input("Hasło (opcjonalnie)", "", "cred_pass", true);
     stack_v(vec![
-        text("Podaj adres strumienia MJPEG (multipart) po HTTP/HTTPS. Poświadczenia są opcjonalne."),
+        text(
+            "Podaj adres strumienia MJPEG (multipart) po HTTP/HTTPS. Poświadczenia są opcjonalne.",
+        ),
         url_input,
         grid(2, vec![user_input, pass_input]),
     ])
@@ -7350,28 +9365,47 @@ fn build_config_mjpeg() -> Component {
 /// the step is never a dead end when no device is detected. The device Select
 /// and the manual input both two-way bind `usb_device_path`.
 fn build_config_usb() -> Component {
-    let devices = with_state(|s| s.discover.usb_devices.iter()
-        .map(|d| (d.device_path.clone(), d.label.clone())).collect::<Vec<_>>());
+    let devices = with_state(|s| {
+        s.discover
+            .usb_devices
+            .iter()
+            .map(|d| (d.device_path.clone(), d.label.clone()))
+            .collect::<Vec<_>>()
+    });
 
     if devices.is_empty() {
         return stack_v(vec![
-            alert("Nie wykryto lokalnych urządzeń wideo (v4l2). Podaj ścieżkę ręcznie.", "info"),
-            wizard_input("Ścieżka urządzenia", "/dev/video0", "usb_device_path", false),
+            alert(
+                "Nie wykryto lokalnych urządzeń wideo (v4l2). Podaj ścieżkę ręcznie.",
+                "info",
+            ),
+            wizard_input(
+                "Ścieżka urządzenia",
+                "/dev/video0",
+                "usb_device_path",
+                false,
+            ),
         ]);
     }
 
-    let options: Vec<SelectOption> = devices.iter().map(|(path, label)| SelectOption {
-        value: SelectValue::Text(path.clone()),
-        label: lit(&alloc::format!("{} ({})", label, path)),
-        icon: None,
-        disabled: false,
-        group_id: None,
-        description: None,
-    }).collect();
+    let options: Vec<SelectOption> = devices
+        .iter()
+        .map(|(path, label)| SelectOption {
+            value: SelectValue::Text(path.clone()),
+            label: lit(&alloc::format!("{} ({})", label, path)),
+            icon: None,
+            disabled: false,
+            group_id: None,
+            description: None,
+        })
+        .collect();
     let device_select = wizard_select("Wykryte urządzenie", options, "usb_device_path");
 
     stack_v(vec![
-        text(&alloc::format!("Wykryto {} urządzeń lokalnych. Wybierz źródło wideo.", devices.len())),
+        text(&alloc::format!(
+            "Wykryto {} urządzeń lokalnych. Wybierz źródło wideo.",
+            devices.len()
+        )),
         device_select,
     ])
 }
@@ -7379,7 +9413,12 @@ fn build_config_usb() -> Component {
 fn build_config_file() -> Component {
     stack_v(vec![
         text("Podaj ścieżkę lokalnego pliku wideo używanego jako źródło testowe."),
-        wizard_input("Ścieżka pliku wideo", "/var/lib/tentaflow/sample.mp4", "file_path", false),
+        wizard_input(
+            "Ścieżka pliku wideo",
+            "/var/lib/tentaflow/sample.mp4",
+            "file_path",
+            false,
+        ),
     ])
 }
 
@@ -7389,24 +9428,39 @@ fn build_config_file() -> Component {
 /// test is a `StatePatch`, never a rebuild. No fabricated preview frame.
 fn build_wizard_step_test() -> Component {
     let testing_block = with_visible(
-        stack_v(vec![spinner("md"), text("Testowanie połączenia z kamerą...")]),
+        stack_v(vec![
+            spinner("md"),
+            text("Testowanie połączenia z kamerą..."),
+        ]),
         "wiz_testing",
     );
     let ok_block = with_visible(alert_bound("wiz_test_text", "success"), "wiz_test_ok");
     let err_block = with_visible(alert_bound("wiz_test_text", "critical"), "wiz_test_err");
     let idle_block = with_visible(
-        empty_state("Brak testu", Some("Uruchom test, aby sprawdzić połączenie z kamerą."), Some("info")),
+        empty_state(
+            "Brak testu",
+            Some("Uruchom test, aby sprawdzić połączenie z kamerą."),
+            Some("info"),
+        ),
         "wiz_test_idle",
     );
 
     stack_v(vec![
         text("Sprawdź połączenie ze źródłem przed dodaniem kamery."),
-        stack_h(vec![button_with_icon("Testuj połączenie", "wizard-test", "primary", "check")]),
+        stack_h(vec![button_with_icon(
+            "Testuj połączenie",
+            "wizard-test",
+            "primary",
+            "check",
+        )]),
         testing_block,
         ok_block,
         err_block,
         idle_block,
-        text_styled("Podgląd na żywo będzie dostępny po dodaniu kamery.", "caption"),
+        text_styled(
+            "Podgląd na żywo będzie dostępny po dodaniu kamery.",
+            "caption",
+        ),
     ])
 }
 
@@ -7415,27 +9469,116 @@ fn build_wizard_step_test() -> Component {
 /// step-2→3 transition via a `StatePatch`, not by rebuilding this fragment.
 fn build_wizard_step_metadata() -> Component {
     let name_input = wizard_input("Nazwa kamery", "np. Brama wjazdowa", "name", false);
-    let retention_select = wizard_select("Klasa retencji", vec![
-        SelectOption { value: SelectValue::Text("A".into()), label: lit("A — długa retencja"), icon: None, disabled: false, group_id: None, description: None },
-        SelectOption { value: SelectValue::Text("B".into()), label: lit("B — średnia retencja"), icon: None, disabled: false, group_id: None, description: None },
-        SelectOption { value: SelectValue::Text("C".into()), label: lit("C — krótka retencja"), icon: None, disabled: false, group_id: None, description: None },
-        SelectOption { value: SelectValue::Text("Unclassified".into()), label: lit("Niesklasyfikowana"), icon: None, disabled: false, group_id: None, description: None },
-    ], "retention");
+    let retention_select = wizard_select(
+        "Klasa retencji",
+        vec![
+            SelectOption {
+                value: SelectValue::Text("A".into()),
+                label: lit("A — długa retencja"),
+                icon: None,
+                disabled: false,
+                group_id: None,
+                description: None,
+            },
+            SelectOption {
+                value: SelectValue::Text("B".into()),
+                label: lit("B — średnia retencja"),
+                icon: None,
+                disabled: false,
+                group_id: None,
+                description: None,
+            },
+            SelectOption {
+                value: SelectValue::Text("C".into()),
+                label: lit("C — krótka retencja"),
+                icon: None,
+                disabled: false,
+                group_id: None,
+                description: None,
+            },
+            SelectOption {
+                value: SelectValue::Text("Unclassified".into()),
+                label: lit("Niesklasyfikowana"),
+                icon: None,
+                disabled: false,
+                group_id: None,
+                description: None,
+            },
+        ],
+        "retention",
+    );
     let fps_input = wizard_input("Docelowe FPS", "15", "fps", false);
-    let analysis_fps_select = wizard_select("FPS analizy AI", vec![
-        SelectOption { value: SelectValue::Text("1".into()), label: lit("1 / s"), icon: None, disabled: false, group_id: None, description: None },
-        SelectOption { value: SelectValue::Text("5".into()), label: lit("5 / s"), icon: None, disabled: false, group_id: None, description: None },
-        SelectOption { value: SelectValue::Text("10".into()), label: lit("10 / s"), icon: None, disabled: false, group_id: None, description: None },
-        SelectOption { value: SelectValue::Text("15".into()), label: lit("15 / s"), icon: None, disabled: false, group_id: None, description: None },
-        SelectOption { value: SelectValue::Text("0".into()), label: lit("Bez limitu"), icon: None, disabled: false, group_id: None, description: None },
-    ], "analysis_fps");
-    let profile_select = wizard_select("Profil analityczny", vec![
-        SelectOption { value: SelectValue::Text("default".into()), label: lit("default"), icon: None, disabled: false, group_id: None, description: None },
-    ], "profile");
+    let analysis_fps_select = wizard_select(
+        "FPS analizy AI",
+        vec![
+            SelectOption {
+                value: SelectValue::Text("1".into()),
+                label: lit("1 / s"),
+                icon: None,
+                disabled: false,
+                group_id: None,
+                description: None,
+            },
+            SelectOption {
+                value: SelectValue::Text("5".into()),
+                label: lit("5 / s"),
+                icon: None,
+                disabled: false,
+                group_id: None,
+                description: None,
+            },
+            SelectOption {
+                value: SelectValue::Text("10".into()),
+                label: lit("10 / s"),
+                icon: None,
+                disabled: false,
+                group_id: None,
+                description: None,
+            },
+            SelectOption {
+                value: SelectValue::Text("15".into()),
+                label: lit("15 / s"),
+                icon: None,
+                disabled: false,
+                group_id: None,
+                description: None,
+            },
+            SelectOption {
+                value: SelectValue::Text("0".into()),
+                label: lit("Bez limitu"),
+                icon: None,
+                disabled: false,
+                group_id: None,
+                description: None,
+            },
+        ],
+        "analysis_fps",
+    );
+    let profile_select = wizard_select(
+        "Profil analityczny",
+        vec![SelectOption {
+            value: SelectValue::Text("default".into()),
+            label: lit("default"),
+            icon: None,
+            disabled: false,
+            group_id: None,
+            description: None,
+        }],
+        "profile",
+    );
 
     stack_v(vec![
         text("Uzupełnij metadane kamery przed jej dodaniem."),
-        grid(2, vec![name_input, retention_select, fps_input, analysis_fps_select, profile_select]),
+        grid(
+            2,
+            vec![
+                name_input,
+                retention_select,
+                fps_input,
+                analysis_fps_select,
+                profile_select,
+            ],
+        ),
     ])
 }
 
@@ -7445,26 +9588,40 @@ fn build_wizard_step_metadata() -> Component {
 /// `db::update_alarm_status` + an audit-log entry.
 fn build_alarms_content() -> Component {
     let messages = build_messages_section();
-    let (severity, status_view, selected_id) = with_state(|s| (
-        s.alarms.severity_or_all().to_string(),
-        s.alarms.status_or_open().to_string(),
-        s.alarms.selected_id.clone(),
-    ));
+    let (severity, status_view, selected_id) = with_state(|s| {
+        (
+            s.alarms.severity_or_all().to_string(),
+            s.alarms.status_or_open().to_string(),
+            s.alarms.selected_id.clone(),
+        )
+    });
 
     // Header: title + live severity counts + the "simulate alarm" test button.
     let open_count = db::count_alarms(true, "").unwrap_or(0);
-    let crit_open = db::list_alarms("critical", "", true).map(|v| v.len()).unwrap_or(0);
+    let crit_open = db::list_alarms("critical", "", true)
+        .map(|v| v.len())
+        .unwrap_or(0);
     let header = stack_h(vec![
         heading(2, "Centrum alarmów"),
-        chip_toned(&alloc::format!("{} otwartych", open_count), if open_count > 0 { "warning" } else { "muted" }),
-        chip_toned(&alloc::format!("{} krytycznych", crit_open), if crit_open > 0 { "critical" } else { "muted" }),
+        chip_toned(
+            &alloc::format!("{} otwartych", open_count),
+            if open_count > 0 { "warning" } else { "muted" },
+        ),
+        chip_toned(
+            &alloc::format!("{} krytycznych", crit_open),
+            if crit_open > 0 { "critical" } else { "muted" },
+        ),
         button_with_icon("Symuluj alarm", "alarm-simulate", "primary", "bell"),
         button("Potwierdź wszystkie", "alarm-acknowledge-all", "secondary"),
     ]);
 
     // Feed query per view: open collapses new+acknowledged, closed lists decided
     // rows, all lists everything (no status constraint).
-    let sev = if severity == "all" { "" } else { severity.as_str() };
+    let sev = if severity == "all" {
+        ""
+    } else {
+        severity.as_str()
+    };
     let alarms = match status_view.as_str() {
         "closed" => list_closed_alarms(sev),
         "all" => db::list_alarms(sev, "", false),
@@ -7474,29 +9631,43 @@ fn build_alarms_content() -> Component {
     let alarms = match alarms {
         Ok(a) => a,
         Err(e) => {
-            return stack_v(vec![messages, header, alert(&alloc::format!("Nie udało się pobrać alarmów: {}", abi_message(e)), "critical")]);
+            return stack_v(vec![
+                messages,
+                header,
+                alert(
+                    &alloc::format!("Nie udało się pobrać alarmów: {}", abi_message(e)),
+                    "critical",
+                ),
+            ]);
         }
     };
 
     // LEFT — status tabs (counts) + severity chips + the card feed.
     let total_count = db::count_alarms(false, "").unwrap_or(0);
     let closed_count = (total_count - open_count).max(0);
-    let status_tabs = stack_h_gap("xs", vec![
-        alarm_status_tab("Niepotwierdzone", "open", &status_view, open_count),
-        alarm_status_tab("Wszystkie", "all", &status_view, total_count),
-        alarm_status_tab("Zamknięte", "closed", &status_view, closed_count),
-    ]);
-    let severity_chips = stack_h_gap("xs", vec![
-        alarm_severity_chip("Wszystkie", "all", &severity),
-        alarm_severity_chip("critical", "critical", &severity),
-        alarm_severity_chip("warning", "warning", &severity),
-        alarm_severity_chip("info", "info", &severity),
-    ]);
+    let status_tabs = stack_h_gap(
+        "xs",
+        vec![
+            alarm_status_tab("Niepotwierdzone", "open", &status_view, open_count),
+            alarm_status_tab("Wszystkie", "all", &status_view, total_count),
+            alarm_status_tab("Zamknięte", "closed", &status_view, closed_count),
+        ],
+    );
+    let severity_chips = stack_h_gap(
+        "xs",
+        vec![
+            alarm_severity_chip("Wszystkie", "all", &severity),
+            alarm_severity_chip("critical", "critical", &severity),
+            alarm_severity_chip("warning", "warning", &severity),
+            alarm_severity_chip("info", "info", &severity),
+        ],
+    );
 
     let feed_body = if alarms.is_empty() {
         empty_state("Brak alarmów", Some("Gdy analityka wykryje zdarzenie, pojawi się tutaj. Użyj przycisku Symuluj alarm do testu."), Some("bell"))
     } else {
-        let cards: Vec<Component> = alarms.iter()
+        let cards: Vec<Component> = alarms
+            .iter()
             .map(|a| build_alarm_feed_card(a, selected_id.as_deref() == Some(a.id.as_str())))
             .collect();
         stack_v_gap("sm", cards)
@@ -7504,13 +9675,19 @@ fn build_alarms_content() -> Component {
     let left = stack_v(vec![status_tabs, severity_chips, feed_body]);
 
     // RIGHT — detail panel for the selected alarm (or a prompt to pick one).
-    let detail = match selected_id.as_deref().and_then(|id| db::get_alarm(id).ok().flatten()) {
+    let detail = match selected_id
+        .as_deref()
+        .and_then(|id| db::get_alarm(id).ok().flatten())
+    {
         Some(a) => build_alarm_detail(&a),
-        None => card(None, vec![empty_state(
-            "Wybierz alarm",
-            Some("Kliknij kartę alarmu po lewej, aby zobaczyć klip, klatki i podjąć decyzję."),
-            Some("info"),
-        )]),
+        None => card(
+            None,
+            vec![empty_state(
+                "Wybierz alarm",
+                Some("Kliknij kartę alarmu po lewej, aby zobaczyć klip, klatki i podjąć decyzję."),
+                Some("info"),
+            )],
+        ),
     };
 
     let split = grid(2, vec![left, detail]);
@@ -7577,16 +9754,23 @@ fn build_alarm_feed_card(a: &db::AlarmRow, selected: bool) -> Component {
         "—".into()
     };
     let sev_tone = alarm_severity_tone(&a.severity);
-    let meta = stack_h_gap("xs", vec![
-        chip_with_icon(&camera_label, "category", "cameras"),
-        chip_with_icon(&format_alarm_time(a.ts), "category", "clock"),
-        chip_toned(&a.severity, sev_tone),
-        alarm_status_chip(&a.status),
-    ]);
+    let meta = stack_h_gap(
+        "xs",
+        vec![
+            chip_with_icon(&camera_label, "category", "cameras"),
+            chip_with_icon(&format_alarm_time(a.ts), "category", "clock"),
+            chip_toned(&a.severity, sev_tone),
+            alarm_status_chip(&a.status),
+        ],
+    );
     let body = stack_v_gap("xs", vec![text_styled(&title, "body_strong"), meta]);
 
     let mut row_card = Card {
-        variant: if selected { CardVariant::Filled } else { CardVariant::Outlined },
+        variant: if selected {
+            CardVariant::Filled
+        } else {
+            CardVariant::Outlined
+        },
         padding: Spacing::Sm,
         gap: Spacing::Sm,
         radius: RadiusToken::Md,
@@ -7598,9 +9782,13 @@ fn build_alarm_feed_card(a: &db::AlarmRow, selected: bool) -> Component {
         interactive: true,
         clickable: true,
         style: None,
-    }.into_component(next_id()).expect("Card");
+    }
+    .into_component(next_id())
+    .expect("Card");
     let mut params = CborMap::default();
-    params.0.push(("alarm_id".into(), Value::Text(a.id.clone())));
+    params
+        .0
+        .push(("alarm_id".into(), Value::Text(a.id.clone())));
     row_card.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Click,
         Handler::Backend {
@@ -7626,64 +9814,103 @@ fn alarm_severity_tone(severity: &str) -> &'static str {
 /// a frame timeline, a metadata table and the decision buttons + operator note.
 fn build_alarm_detail(a: &db::AlarmRow) -> Component {
     let sev_tone = alarm_severity_tone(&a.severity);
-    let camera_label = if !a.camera_name.is_empty() { a.camera_name.clone() } else { a.camera_id.clone() };
-    let title_kind = if a.kind.is_empty() { "Zdarzenie".to_string() } else { a.kind.clone() };
+    let camera_label = if !a.camera_name.is_empty() {
+        a.camera_name.clone()
+    } else {
+        a.camera_id.clone()
+    };
+    let title_kind = if a.kind.is_empty() {
+        "Zdarzenie".to_string()
+    } else {
+        a.kind.clone()
+    };
 
     let head = stack_h(vec![
         chip_toned(&title_kind, sev_tone),
-        text_styled(&alloc::format!("{} · {}", camera_label, format_alarm_time(a.ts)), "caption"),
+        text_styled(
+            &alloc::format!("{} · {}", camera_label, format_alarm_time(a.ts)),
+            "caption",
+        ),
         chip_toned(&alloc::format!("alarm {}", short_id(&a.id)), "muted"),
         alarm_status_chip(&a.status),
     ]);
 
     // 30 s clip placeholder + a 10-frame timeline (the event frame highlighted).
-    let clip = card(None, vec![
-        stack_h(vec![
-            chip_toned_icon("Klip 30 s · 0:00 / 0:30", "info", "video"),
-        ]),
-    ]);
-    let frame_labels = ["−2s", "−1s", "EVT", "+1s", "+2s", "+3s", "+4s", "+5s", "+6s", "+7s"];
-    let frames: Vec<Component> = frame_labels.iter()
+    let clip = card(
+        None,
+        vec![stack_h(vec![chip_toned_icon(
+            "Klip 30 s · 0:00 / 0:30",
+            "info",
+            "video",
+        )])],
+    );
+    let frame_labels = [
+        "−2s", "−1s", "EVT", "+1s", "+2s", "+3s", "+4s", "+5s", "+6s", "+7s",
+    ];
+    let frames: Vec<Component> = frame_labels
+        .iter()
         .map(|l| chip_toned(l, if *l == "EVT" { "primary" } else { "muted" }))
         .collect();
     let timeline = stack_h_gap("xs", frames);
 
     // Metadata table — straight from the persisted alarm row.
-    let metadata = card(Some("Metadane"), vec![
-        key_value(vec![
+    let metadata = card(
+        Some("Metadane"),
+        vec![key_value(vec![
             ("Detektor", &title_kind),
             ("Kamera", &camera_label),
             ("Poziom", a.severity.as_str()),
             ("Status", alarm_status_long(&a.status)),
             ("Zgłoszono", &format_alarm_datetime(a.ts)),
             ("Decyzja", &alarm_decision_note(a)),
-        ]),
-    ]);
+        ])],
+    );
 
     // Decision workflow — buttons persist status + audit, note carries forward.
     let mut confirm_p = CborMap::default();
-    confirm_p.0.push(("alarm_id".into(), Value::Text(a.id.clone())));
-    confirm_p.0.push(("decision".into(), Value::Text("confirmed".into())));
+    confirm_p
+        .0
+        .push(("alarm_id".into(), Value::Text(a.id.clone())));
+    confirm_p
+        .0
+        .push(("decision".into(), Value::Text("confirmed".into())));
     let mut dismiss_p = CborMap::default();
-    dismiss_p.0.push(("alarm_id".into(), Value::Text(a.id.clone())));
-    dismiss_p.0.push(("decision".into(), Value::Text("dismissed".into())));
+    dismiss_p
+        .0
+        .push(("alarm_id".into(), Value::Text(a.id.clone())));
+    dismiss_p
+        .0
+        .push(("decision".into(), Value::Text("dismissed".into())));
     let mut escalate_p = CborMap::default();
-    escalate_p.0.push(("alarm_id".into(), Value::Text(a.id.clone())));
-    escalate_p.0.push(("decision".into(), Value::Text("escalated".into())));
+    escalate_p
+        .0
+        .push(("alarm_id".into(), Value::Text(a.id.clone())));
+    escalate_p
+        .0
+        .push(("decision".into(), Value::Text("escalated".into())));
 
-    let decision_buttons = stack_h_gap("sm", vec![
-        button_with_params("Potwierdź", "alarm-decide", "primary", confirm_p),
-        button_with_params("Fałszywy", "alarm-decide", "destructive", dismiss_p),
-        button_with_params("Eskaluj", "alarm-decide", "secondary", escalate_p),
-    ]);
+    let decision_buttons = stack_h_gap(
+        "sm",
+        vec![
+            button_with_params("Potwierdź", "alarm-decide", "primary", confirm_p),
+            button_with_params("Fałszywy", "alarm-decide", "destructive", dismiss_p),
+            button_with_params("Eskaluj", "alarm-decide", "secondary", escalate_p),
+        ],
+    );
     let note = alarm_note_textarea();
-    let workflow = card(Some("Workflow"), vec![
-        text_styled("Decyzja operatora", "caption"),
-        decision_buttons,
-        note,
-    ]);
+    let workflow = card(
+        Some("Workflow"),
+        vec![
+            text_styled("Decyzja operatora", "caption"),
+            decision_buttons,
+            note,
+        ],
+    );
 
-    card(None, vec![head, clip, timeline, grid(2, vec![metadata, workflow])])
+    card(
+        None,
+        vec![head, clip, timeline, grid(2, vec![metadata, workflow])],
+    )
 }
 
 /// Operator-note textarea bound to the `alarm_note` store key.
@@ -7691,7 +9918,9 @@ fn alarm_note_textarea() -> Component {
     use tentaflow_sdk_spec::protocol::ui::form::Textarea;
     let mut comp = Textarea {
         bind_path: StatePath::new(vec![PathSegment::Key("alarm_note".into())]),
-        placeholder: Some(lit("np. dwie osoby, kłótnia w pobliżu wjazdu — wysłano patrol...")),
+        placeholder: Some(lit(
+            "np. dwie osoby, kłótnia w pobliżu wjazdu — wysłano patrol...",
+        )),
         label: Some(lit("Notatka operatora")),
         hint: None,
         validators: vec![],
@@ -7706,7 +9935,9 @@ fn alarm_note_textarea() -> Component {
         max_rows: Some(8),
         monospace: false,
         variant: None,
-    }.into_component("alarm_note").expect("Textarea");
+    }
+    .into_component("alarm_note")
+    .expect("Textarea");
     let mut params = CborMap::default();
     params.0.push(("field".into(), Value::Text("note".into())));
     comp.handlers = Some(HandlerMap(vec![(
@@ -7736,7 +9967,11 @@ fn alarm_decision_note(a: &db::AlarmRow) -> String {
     if a.decided_at == 0 && a.decided_by.is_empty() {
         return "—".into();
     }
-    let who = if a.decided_by.is_empty() { "operator".to_string() } else { a.decided_by.clone() };
+    let who = if a.decided_by.is_empty() {
+        "operator".to_string()
+    } else {
+        a.decided_by.clone()
+    };
     alloc::format!("{} · {}", who, format_alarm_datetime(a.decided_at))
 }
 
@@ -7753,7 +9988,14 @@ fn format_alarm_datetime(ts: i64) -> String {
     let days = ts / 86_400;
     let (y, m, d) = civil_from_days(days);
     let secs = ts.rem_euclid(86_400);
-    alloc::format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, secs / 3600, (secs % 3600) / 60)
+    alloc::format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        y,
+        m,
+        d,
+        secs / 3600,
+        (secs % 3600) / 60
+    )
 }
 
 /// Howard Hinnant's days→civil date algorithm (proleptic Gregorian, UTC).
@@ -7795,7 +10037,11 @@ fn alarm_ref_id(alarm_id: &str) -> u64 {
     }
     // ref_id 0 is a valid key but the bindings probe searches with a zero query
     // vector; keep alarm ids off 0 so the two never alias semantically.
-    if h == 0 { 1 } else { h }
+    if h == 0 {
+        1
+    } else {
+        h
+    }
 }
 
 /// Builds the text document embedded for an alarm. Concatenates the human-facing
@@ -7803,8 +10049,14 @@ fn alarm_ref_id(alarm_id: &str) -> u64 {
 fn alarm_doc(a: &db::AlarmRow) -> String {
     alloc::format!(
         "Kamera: {}. Typ: {}. Waga: {}. Zdarzenie: {}",
-        if a.camera_name.is_empty() { a.camera_id.as_str() } else { a.camera_name.as_str() },
-        a.kind, a.severity, a.message,
+        if a.camera_name.is_empty() {
+            a.camera_id.as_str()
+        } else {
+            a.camera_name.as_str()
+        },
+        a.kind,
+        a.severity,
+        a.message,
     )
 }
 
@@ -7816,7 +10068,8 @@ fn generate_embedding(text: &str, mode: &str) -> Result<Vec<f32>, String> {
         "query" => alloc::format!("Query: {}", text),
         _ => alloc::format!("Document: {}", text),
     };
-    let options = json!({"task": "embedding", "dimensions": EMBED_DIM, "adapter": "retrieval"}).to_string();
+    let options =
+        json!({"task": "embedding", "dimensions": EMBED_DIM, "adapter": "retrieval"}).to_string();
     let prompt_b = prefixed.as_bytes();
     let model_b = EMBED_MODEL.as_bytes();
     let opt_b = options.as_bytes();
@@ -7824,10 +10077,14 @@ fn generate_embedding(text: &str, mode: &str) -> Result<Vec<f32>, String> {
     let mut out_len: i32 = 0;
     let code = unsafe {
         llm_generate(
-            prompt_b.as_ptr() as i32, prompt_b.len() as i32,
-            model_b.as_ptr() as i32, model_b.len() as i32,
-            opt_b.as_ptr() as i32, opt_b.len() as i32,
-            buf.as_mut_ptr() as i32, EMBED_RESP_BUF as i32,
+            prompt_b.as_ptr() as i32,
+            prompt_b.len() as i32,
+            model_b.as_ptr() as i32,
+            model_b.len() as i32,
+            opt_b.as_ptr() as i32,
+            opt_b.len() as i32,
+            buf.as_mut_ptr() as i32,
+            EMBED_RESP_BUF as i32,
             &mut out_len as *mut i32 as i32,
         )
     };
@@ -7844,19 +10101,27 @@ fn generate_embedding(text: &str, mode: &str) -> Result<Vec<f32>, String> {
 /// Extracts the f32 vector from an llm_generate embedding response. Accepts a
 /// bare float array, or an object with `embedding` / `vector` / `data[0].embedding`.
 fn parse_embedding_response(resp: &str) -> Result<Vec<f32>, String> {
-    let parsed: JsonValue = serde_json::from_str(resp)
-        .map_err(|e| alloc::format!("parse embeddingu: {}", e))?;
-    let arr = parsed.as_array()
+    let parsed: JsonValue =
+        serde_json::from_str(resp).map_err(|e| alloc::format!("parse embeddingu: {}", e))?;
+    let arr = parsed
+        .as_array()
         .or_else(|| parsed.get("embedding").and_then(|v| v.as_array()))
         .or_else(|| parsed.get("vector").and_then(|v| v.as_array()))
-        .or_else(|| parsed.get("data").and_then(|d| d.as_array())
-            .and_then(|a| a.first())
-            .and_then(|f| f.get("embedding"))
-            .and_then(|v| v.as_array()));
+        .or_else(|| {
+            parsed
+                .get("data")
+                .and_then(|d| d.as_array())
+                .and_then(|a| a.first())
+                .and_then(|f| f.get("embedding"))
+                .and_then(|v| v.as_array())
+        });
     let arr = arr.ok_or_else(|| "brak wektora w odpowiedzi".to_string())?;
     let mut out = Vec::with_capacity(arr.len());
     for v in arr {
-        out.push(v.as_f64().ok_or_else(|| "element wektora nie jest liczbą".to_string())? as f32);
+        out.push(
+            v.as_f64()
+                .ok_or_else(|| "element wektora nie jest liczbą".to_string())? as f32,
+        );
     }
     if out.is_empty() {
         return Err("pusty wektor".into());
@@ -7890,7 +10155,10 @@ fn vector_upsert(ref_id: u64, vector: &[f32]) -> Result<u64, AbiError> {
 
 /// k-NN search over the events namespace. Returns hits (ref_id + score),
 /// closest first.
-fn vector_search(query: &[f32], k: u32) -> Result<Vec<tentaflow_sdk_spec::VectorSearchHit>, AbiError> {
+fn vector_search(
+    query: &[f32],
+    k: u32,
+) -> Result<Vec<tentaflow_sdk_spec::VectorSearchHit>, AbiError> {
     let input = tentaflow_sdk_spec::VectorSearchInput {
         namespace: EVENT_VECTOR_NS.into(),
         query_b64: encode_vector_b64(query),
@@ -7911,8 +10179,10 @@ fn index_alarm(a: &db::AlarmRow) -> Result<(), String> {
     let doc = alarm_doc(a);
     let vector = generate_embedding(&doc, "document")?;
     let ref_id = alarm_ref_id(&a.id);
-    vector_upsert(ref_id, &vector).map_err(|e| alloc::format!("vector_upsert: {}", abi_message(e)))?;
-    db::upsert_vector_ref(ref_id, &a.id, a.ts).map_err(|e| alloc::format!("vector_refs: {}", abi_message(e)))?;
+    vector_upsert(ref_id, &vector)
+        .map_err(|e| alloc::format!("vector_upsert: {}", abi_message(e)))?;
+    db::upsert_vector_ref(ref_id, &a.id, a.ts)
+        .map_err(|e| alloc::format!("vector_refs: {}", abi_message(e)))?;
     Ok(())
 }
 
@@ -7964,20 +10234,47 @@ const SEARCH_RECENTS_MAX: usize = 5;
 
 /// The four search modes from the m06 mockup. Order matches the mode selector.
 const SEARCH_MODES: [(&str, &str, &str, &str); 4] = [
-    ("text", "Tekst (semantyczne)", "text", "Embedding zdarzeń + vector store — opisz zdarzenie słowami"),
-    ("attribute", "Atrybut (formularz)", "tag", "Zapytanie SQL po wadze / typie / kamerze / czasie"),
-    ("image", "Podobieństwo (zdjęcie)", "image", "Wymaga pipeline'u wizyjnego (embedding klatek)"),
-    ("plate", "Tablica rejestracyjna", "car", "Wymaga silnika ANPR (LPRNet)"),
+    (
+        "text",
+        "Tekst (semantyczne)",
+        "text",
+        "Embedding zdarzeń + vector store — opisz zdarzenie słowami",
+    ),
+    (
+        "attribute",
+        "Atrybut (formularz)",
+        "tag",
+        "Zapytanie SQL po wadze / typie / kamerze / czasie",
+    ),
+    (
+        "image",
+        "Podobieństwo (zdjęcie)",
+        "image",
+        "Wymaga pipeline'u wizyjnego (embedding klatek)",
+    ),
+    (
+        "plate",
+        "Tablica rejestracyjna",
+        "car",
+        "Wymaga silnika ANPR (LPRNet)",
+    ),
 ];
 
 /// Normalizes a persisted/incoming mode to a known mode id, defaulting to text.
 fn search_mode_norm(raw: &str) -> &'static str {
-    SEARCH_MODES.iter().map(|m| m.0).find(|m| *m == raw).unwrap_or("text")
+    SEARCH_MODES
+        .iter()
+        .map(|m| m.0)
+        .find(|m| *m == raw)
+        .unwrap_or("text")
 }
 
 /// Current search mode read from settings (defaults to "text").
 fn search_mode() -> String {
-    let raw = db::get_setting(KEY_SEARCH_MODE).ok().flatten().unwrap_or_default();
+    let raw = db::get_setting(KEY_SEARCH_MODE)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     search_mode_norm(&raw).to_string()
 }
 
@@ -7988,7 +10285,10 @@ fn search_query_key(mode: &str) -> String {
 
 /// Last query text persisted for a mode (empty if none).
 fn search_last_query(mode: &str) -> String {
-    db::get_setting(&search_query_key(mode)).ok().flatten().unwrap_or_default()
+    db::get_setting(&search_query_key(mode))
+        .ok()
+        .flatten()
+        .unwrap_or_default()
 }
 
 /// Store key the per-mode query control binds to (one key per mode so switching
@@ -8000,12 +10300,25 @@ fn search_query_store_key(mode: &str) -> String {
 /// Recent searches are stored per mode as a JSON array under one settings key:
 /// `{ "text": ["..."], "attribute": [...] }`. Returns the list for one mode.
 fn search_recents(mode: &str) -> Vec<String> {
-    let raw = db::get_setting(KEY_SEARCH_RECENTS).ok().flatten().unwrap_or_default();
-    if raw.is_empty() { return Vec::new(); }
-    let parsed: JsonValue = match serde_json::from_str(&raw) { Ok(v) => v, Err(_) => return Vec::new() };
-    parsed.get(search_mode_norm(mode))
+    let raw = db::get_setting(KEY_SEARCH_RECENTS)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let parsed: JsonValue = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    parsed
+        .get(search_mode_norm(mode))
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -8014,19 +10327,34 @@ fn search_recents(mode: &str) -> Vec<String> {
 fn search_push_recent(mode: &str, query: &str) {
     let mode = search_mode_norm(mode);
     let q = query.trim();
-    if q.is_empty() { return; }
-    let raw = db::get_setting(KEY_SEARCH_RECENTS).ok().flatten().unwrap_or_default();
+    if q.is_empty() {
+        return;
+    }
+    let raw = db::get_setting(KEY_SEARCH_RECENTS)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let mut map: JsonValue = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
-    if !map.is_object() { map = json!({}); }
-    let mut list: Vec<String> = map.get(mode)
+    if !map.is_object() {
+        map = json!({});
+    }
+    let mut list: Vec<String> = map
+        .get(mode)
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
     list.retain(|x| x != q);
     list.insert(0, q.to_string());
     list.truncate(SEARCH_RECENTS_MAX);
     if let Some(obj) = map.as_object_mut() {
-        obj.insert(mode.to_string(), JsonValue::Array(list.into_iter().map(JsonValue::String).collect()));
+        obj.insert(
+            mode.to_string(),
+            JsonValue::Array(list.into_iter().map(JsonValue::String).collect()),
+        );
     }
     let _ = db::set_setting(KEY_SEARCH_RECENTS, &map.to_string());
 }
@@ -8036,13 +10364,19 @@ fn search_camera_options(cameras: &[db::CameraRow]) -> Vec<SelectOption> {
     let mut opts = vec![SelectOption {
         value: SelectValue::Text("all".into()),
         label: lit(&alloc::format!("Wszystkie kamery ({})", cameras.len())),
-        icon: None, disabled: false, group_id: None, description: None,
+        icon: None,
+        disabled: false,
+        group_id: None,
+        description: None,
     }];
     for c in cameras {
         opts.push(SelectOption {
             value: SelectValue::Text(c.id.clone()),
             label: lit(&c.name),
-            icon: None, disabled: false, group_id: None, description: None,
+            icon: None,
+            disabled: false,
+            group_id: None,
+            description: None,
         });
     }
     opts
@@ -8053,20 +10387,25 @@ fn search_camera_options(cameras: &[db::CameraRow]) -> Vec<SelectOption> {
 /// committed to settings via `search-mode-change` so it survives reopen.
 fn build_search_mode_selector() -> Component {
     use tentaflow_sdk_spec::protocol::ui::form::RadioCardGroup;
-    let options: Vec<RadioCardOption> = SEARCH_MODES.iter().map(|(id, title, icon, desc)| RadioCardOption {
-        value: SelectValue::Text((*id).into()),
-        icon: icon_named(parse_icon_name(icon)),
-        title: lit(title),
-        description: Some(lit(desc)),
-        badge: None,
-        disabled: false,
-    }).collect();
+    let options: Vec<RadioCardOption> = SEARCH_MODES
+        .iter()
+        .map(|(id, title, icon, desc)| RadioCardOption {
+            value: SelectValue::Text((*id).into()),
+            icon: icon_named(parse_icon_name(icon)),
+            title: lit(title),
+            description: Some(lit(desc)),
+            badge: None,
+            disabled: false,
+        })
+        .collect();
     let mut group = RadioCardGroup {
         bind_path: StatePath::new(vec![PathSegment::Key("search_mode".into())]),
         options,
         columns: 4,
         variant: RadioCardVariant::Default,
-    }.into_component("search_mode").expect("RadioCardGroup");
+    }
+    .into_component("search_mode")
+    .expect("RadioCardGroup");
     group = with_a11y_label(group, "Tryb wyszukiwania");
     group.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Change,
@@ -8087,18 +10426,31 @@ fn search_query_input(label: &str, placeholder: &str, mode: &str, multiline: boo
     let store_key = search_query_store_key(mode);
     let mut params = CborMap::default();
     params.0.push(("field".into(), Value::Text("query".into())));
-    params.0.push(("mode".into(), Value::Text(search_mode_norm(mode).into())));
+    params
+        .0
+        .push(("mode".into(), Value::Text(search_mode_norm(mode).into())));
     let mut comp = if multiline {
         use tentaflow_sdk_spec::protocol::ui::form::Textarea;
         Textarea {
             bind_path: StatePath::new(vec![PathSegment::Key(store_key.clone())]),
             placeholder: Some(lit(placeholder)),
             label: Some(lit(label)),
-            hint: None, validators: vec![], max_length: Some(500), min_length: None,
-            disabled: None, readonly: None, error: None, size: InputSize::Md,
-            rows: 2, autoresize: true, max_rows: Some(5), monospace: false,
+            hint: None,
+            validators: vec![],
+            max_length: Some(500),
+            min_length: None,
+            disabled: None,
+            readonly: None,
+            error: None,
+            size: InputSize::Md,
+            rows: 2,
+            autoresize: true,
+            max_rows: Some(5),
+            monospace: false,
             variant: None,
-        }.into_component(&store_key).expect("Textarea")
+        }
+        .into_component(&store_key)
+        .expect("Textarea")
     } else {
         use tentaflow_sdk_spec::protocol::ui::form::Input;
         Input {
@@ -8106,12 +10458,25 @@ fn search_query_input(label: &str, placeholder: &str, mode: &str, multiline: boo
             bind_path: StatePath::new(vec![PathSegment::Key(store_key.clone())]),
             placeholder: Some(lit(placeholder)),
             label: Some(lit(label)),
-            hint: None, leading_icon: Some(icon_named(parse_icon_name("search"))),
-            trailing_icon: None, prefix: None, suffix: None, validators: vec![],
-            max_length: None, min_length: None, pattern: None, autocomplete: None,
-            input_mode: None, disabled: None, readonly: None, error: None, size: InputSize::Md,
+            hint: None,
+            leading_icon: Some(icon_named(parse_icon_name("search"))),
+            trailing_icon: None,
+            prefix: None,
+            suffix: None,
+            validators: vec![],
+            max_length: None,
+            min_length: None,
+            pattern: None,
+            autocomplete: None,
+            input_mode: None,
+            disabled: None,
+            readonly: None,
+            error: None,
+            size: InputSize::Md,
             variant: None,
-        }.into_component(&store_key).expect("Input")
+        }
+        .into_component(&store_key)
+        .expect("Input")
     };
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Input,
@@ -8129,14 +10494,44 @@ fn search_query_input(label: &str, placeholder: &str, mode: &str, multiline: boo
 /// to settings on change. "all" = no severity constraint.
 fn search_attr_severity_select() -> Component {
     let options = vec![
-        SelectOption { value: SelectValue::Text("all".into()), label: lit("Każda waga"), icon: None, disabled: false, group_id: None, description: None },
-        SelectOption { value: SelectValue::Text("critical".into()), label: lit("Krytyczny"), icon: None, disabled: false, group_id: None, description: None },
-        SelectOption { value: SelectValue::Text("warning".into()), label: lit("Ostrzeżenie"), icon: None, disabled: false, group_id: None, description: None },
-        SelectOption { value: SelectValue::Text("info".into()), label: lit("Informacja"), icon: None, disabled: false, group_id: None, description: None },
+        SelectOption {
+            value: SelectValue::Text("all".into()),
+            label: lit("Każda waga"),
+            icon: None,
+            disabled: false,
+            group_id: None,
+            description: None,
+        },
+        SelectOption {
+            value: SelectValue::Text("critical".into()),
+            label: lit("Krytyczny"),
+            icon: None,
+            disabled: false,
+            group_id: None,
+            description: None,
+        },
+        SelectOption {
+            value: SelectValue::Text("warning".into()),
+            label: lit("Ostrzeżenie"),
+            icon: None,
+            disabled: false,
+            group_id: None,
+            description: None,
+        },
+        SelectOption {
+            value: SelectValue::Text("info".into()),
+            label: lit("Informacja"),
+            icon: None,
+            disabled: false,
+            group_id: None,
+            description: None,
+        },
     ];
     let mut comp = select("Waga", options, "search_attr_severity");
     let mut params = CborMap::default();
-    params.0.push(("field".into(), Value::Text("severity".into())));
+    params
+        .0
+        .push(("field".into(), Value::Text("severity".into())));
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Change,
         Handler::Backend {
@@ -8153,7 +10548,9 @@ fn search_attr_severity_select() -> Component {
 fn search_camera_select(cameras: &[db::CameraRow]) -> Component {
     let mut comp = select("Kamery", search_camera_options(cameras), "search_cameras");
     let mut params = CborMap::default();
-    params.0.push(("field".into(), Value::Text("cameras".into())));
+    params
+        .0
+        .push(("field".into(), Value::Text("cameras".into())));
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Change,
         Handler::Backend {
@@ -8175,12 +10572,25 @@ fn search_time_input(label: &str, store_key: &str, field: &str) -> Component {
         bind_path: StatePath::new(vec![PathSegment::Key(store_key.into())]),
         placeholder: Some(lit("RRRR-MM-DD GG:MM")),
         label: Some(lit(label)),
-        hint: None, leading_icon: Some(icon_named(parse_icon_name("calendar"))), trailing_icon: None, prefix: None, suffix: None,
-        validators: vec![], max_length: None, min_length: None, pattern: None,
-        autocomplete: None, input_mode: None, disabled: None, readonly: None, error: None,
+        hint: None,
+        leading_icon: Some(icon_named(parse_icon_name("calendar"))),
+        trailing_icon: None,
+        prefix: None,
+        suffix: None,
+        validators: vec![],
+        max_length: None,
+        min_length: None,
+        pattern: None,
+        autocomplete: None,
+        input_mode: None,
+        disabled: None,
+        readonly: None,
+        error: None,
         size: InputSize::Md,
         variant: None,
-    }.into_component(store_key).expect("Input");
+    }
+    .into_component(store_key)
+    .expect("Input");
     let mut params = CborMap::default();
     params.0.push(("field".into(), Value::Text(field.into())));
     comp.handlers = Some(HandlerMap(vec![(
@@ -8197,15 +10607,24 @@ fn search_time_input(label: &str, store_key: &str, field: &str) -> Component {
 
 /// The shared camera + time-range filter block reused by every mode's query form.
 fn build_search_filters(cameras: &[db::CameraRow]) -> Component {
-    card(Some("Filtry"), vec![
-        search_camera_select(cameras),
-        heading(4, "Zakres czasu"),
-        text_styled("Retencja klasy B = 14 dni — starsze klatki nie są indeksowane.", "caption"),
-        grid(2, vec![
-            search_time_input("Od", "search_time_from", "time_from"),
-            search_time_input("Do", "search_time_to", "time_to"),
-        ]),
-    ])
+    card(
+        Some("Filtry"),
+        vec![
+            search_camera_select(cameras),
+            heading(4, "Zakres czasu"),
+            text_styled(
+                "Retencja klasy B = 14 dni — starsze klatki nie są indeksowane.",
+                "caption",
+            ),
+            grid(
+                2,
+                vec![
+                    search_time_input("Od", "search_time_from", "time_from"),
+                    search_time_input("Do", "search_time_to", "time_to"),
+                ],
+            ),
+        ],
+    )
 }
 
 /// Per-mode query form. Each mode gets its own inputs faithful to the mockup;
@@ -8316,15 +10735,28 @@ fn build_search_results(outcome: &SearchOutcome, mode: &str) -> Component {
 fn build_search_result_card(h: &SearchHit, show_score: bool) -> Component {
     let a = &h.alarm;
     let header = stack_h(vec![
-        text_styled(if a.camera_name.is_empty() { a.camera_id.as_str() } else { a.camera_name.as_str() }, "body_strong"),
-        badge(alarm_severity_label(&a.severity), alarm_severity_variant(&a.severity)),
+        text_styled(
+            if a.camera_name.is_empty() {
+                a.camera_id.as_str()
+            } else {
+                a.camera_name.as_str()
+            },
+            "body_strong",
+        ),
+        badge(
+            alarm_severity_label(&a.severity),
+            alarm_severity_variant(&a.severity),
+        ),
         chip_with_icon(&format_alarm_time(a.ts), "category", "clock"),
     ]);
     let mut rows = vec![header, text_styled(&a.message, "body")];
     if show_score {
         // Cosine distance: lower = closer. Report similarity = 1 - distance.
         let sim = (1.0 - h.score).clamp(0.0, 1.0);
-        rows.push(chip_toned(&alloc::format!("podobieństwo {:.0}%", sim * 100.0), "info"));
+        rows.push(chip_toned(
+            &alloc::format!("podobieństwo {:.0}%", sim * 100.0),
+            "info",
+        ));
     }
     card(None, rows)
 }
@@ -8361,7 +10793,11 @@ fn build_search_content() -> Component {
     let cameras = db::list_cameras().unwrap_or_default();
     let mode = search_mode();
     let (outcome, submitted_mode) = with_state(|s| {
-        let m = if s.search.submitted_mode.is_empty() { mode.clone() } else { s.search.submitted_mode.clone() };
+        let m = if s.search.submitted_mode.is_empty() {
+            mode.clone()
+        } else {
+            s.search.submitted_mode.clone()
+        };
         (s.search.outcome.clone(), m)
     });
 
@@ -8381,7 +10817,12 @@ fn build_search_content() -> Component {
     let submit_row = stack_h(vec![
         button_with_icon("Szukaj", "search-submit", "primary", "search"),
         button("Wyczyść", "search-clear-all", "ghost"),
-        button_with_icon("Reindeksuj zdarzenia", "search-reindex", "secondary", "refresh"),
+        button_with_icon(
+            "Reindeksuj zdarzenia",
+            "search-reindex",
+            "secondary",
+            "refresh",
+        ),
     ]);
 
     let recents = build_search_recents(&mode);
@@ -8389,7 +10830,9 @@ fn build_search_content() -> Component {
     let rodo = build_search_rodo_note();
 
     stack_v(vec![
-        messages, header, subtitle,
+        messages,
+        header,
+        subtitle,
         mode_selector,
         query_form,
         filters,
@@ -8411,19 +10854,39 @@ fn search_overlay() -> Vec<StateEntry> {
         },
         StateEntry {
             path: StatePath::new(vec![PathSegment::Key("search_cameras".into())]),
-            value: Value::Text(db::get_setting(KEY_SEARCH_CAMERAS).ok().flatten().unwrap_or_else(|| "all".into())),
+            value: Value::Text(
+                db::get_setting(KEY_SEARCH_CAMERAS)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "all".into()),
+            ),
         },
         StateEntry {
             path: StatePath::new(vec![PathSegment::Key("search_time_from".into())]),
-            value: Value::Text(db::get_setting(KEY_SEARCH_FROM).ok().flatten().unwrap_or_default()),
+            value: Value::Text(
+                db::get_setting(KEY_SEARCH_FROM)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+            ),
         },
         StateEntry {
             path: StatePath::new(vec![PathSegment::Key("search_time_to".into())]),
-            value: Value::Text(db::get_setting(KEY_SEARCH_TO).ok().flatten().unwrap_or_default()),
+            value: Value::Text(
+                db::get_setting(KEY_SEARCH_TO)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+            ),
         },
         StateEntry {
             path: StatePath::new(vec![PathSegment::Key("search_attr_severity".into())]),
-            value: Value::Text(db::get_setting(KEY_SEARCH_ATTR_SEVERITY).ok().flatten().unwrap_or_else(|| "all".into())),
+            value: Value::Text(
+                db::get_setting(KEY_SEARCH_ATTR_SEVERITY)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "all".into()),
+            ),
         },
     ];
     // Seed the active mode's query control with its persisted last query.
@@ -8437,14 +10900,18 @@ fn search_overlay() -> Vec<StateEntry> {
 /// Persists the picked search mode to settings and re-renders so the per-mode
 /// query form and its last-query / recents swap in.
 fn handle_search_mode_change(params: &JsonValue) -> JsonValue {
-    let v = params.get("value").and_then(|x| x.as_str())
+    let v = params
+        .get("value")
+        .and_then(|x| x.as_str())
         .or_else(|| params.get("chipId").and_then(|x| x.as_str()))
         .unwrap_or("text");
     let mode = search_mode_norm(v);
     let _ = db::set_setting(KEY_SEARCH_MODE, mode);
     // Switching mode clears the last outcome so it doesn't show stale results
     // for the previous mode.
-    with_state(|s| { s.search.clear_all(); });
+    with_state(|s| {
+        s.search.clear_all();
+    });
     render_panel("search");
     json!({"ok":true, "mode": mode})
 }
@@ -8453,16 +10920,31 @@ fn handle_search_mode_change(params: &JsonValue) -> JsonValue {
 /// settings on each keystroke/change so it persists across reopen.
 fn handle_search_field_change(params: &JsonValue) -> JsonValue {
     let field = params.get("field").and_then(|x| x.as_str()).unwrap_or("");
-    let value = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let value = params
+        .get("value")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     match field {
         "query" => {
-            let mode = params.get("mode").and_then(|x| x.as_str()).unwrap_or("text");
+            let mode = params
+                .get("mode")
+                .and_then(|x| x.as_str())
+                .unwrap_or("text");
             let _ = db::set_setting(&search_query_key(mode), &value);
         }
-        "cameras" => { let _ = db::set_setting(KEY_SEARCH_CAMERAS, &value); }
-        "time_from" => { let _ = db::set_setting(KEY_SEARCH_FROM, &value); }
-        "time_to" => { let _ = db::set_setting(KEY_SEARCH_TO, &value); }
-        "severity" => { let _ = db::set_setting(KEY_SEARCH_ATTR_SEVERITY, &value); }
+        "cameras" => {
+            let _ = db::set_setting(KEY_SEARCH_CAMERAS, &value);
+        }
+        "time_from" => {
+            let _ = db::set_setting(KEY_SEARCH_FROM, &value);
+        }
+        "time_to" => {
+            let _ = db::set_setting(KEY_SEARCH_TO, &value);
+        }
+        "severity" => {
+            let _ = db::set_setting(KEY_SEARCH_ATTR_SEVERITY, &value);
+        }
         _ => {}
     }
     json!({"ok":true})
@@ -8483,14 +10965,42 @@ fn run_search(mode: &str, query: &str) -> SearchOutcome {
 /// Real structured SQL search over alarms: severity (settings), free-text type
 /// (LIKE on the alarm type/message), camera scope and time range from settings.
 fn run_attribute_search(query: &str) -> SearchOutcome {
-    let severity = db::get_setting(KEY_SEARCH_ATTR_SEVERITY).ok().flatten().unwrap_or_else(|| "all".into());
-    let severity = if severity == "all" { String::new() } else { severity };
-    let camera = db::get_setting(KEY_SEARCH_CAMERAS).ok().flatten().unwrap_or_else(|| "all".into());
-    let camera = if camera == "all" { String::new() } else { camera };
-    let from = parse_search_time(&db::get_setting(KEY_SEARCH_FROM).ok().flatten().unwrap_or_default());
-    let to = parse_search_time(&db::get_setting(KEY_SEARCH_TO).ok().flatten().unwrap_or_default());
+    let severity = db::get_setting(KEY_SEARCH_ATTR_SEVERITY)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "all".into());
+    let severity = if severity == "all" {
+        String::new()
+    } else {
+        severity
+    };
+    let camera = db::get_setting(KEY_SEARCH_CAMERAS)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "all".into());
+    let camera = if camera == "all" {
+        String::new()
+    } else {
+        camera
+    };
+    let from = parse_search_time(
+        &db::get_setting(KEY_SEARCH_FROM)
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+    );
+    let to = parse_search_time(
+        &db::get_setting(KEY_SEARCH_TO)
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+    );
     let rows = db::search_alarms(&severity, query.trim(), &camera, from, to).unwrap_or_default();
-    SearchOutcome::Results(rows.into_iter().map(|alarm| SearchHit { alarm, score: 0.0 }).collect())
+    SearchOutcome::Results(
+        rows.into_iter()
+            .map(|alarm| SearchHit { alarm, score: 0.0 })
+            .collect(),
+    )
 }
 
 /// Real semantic search: embed the query, k-NN over the events namespace,
@@ -8515,7 +11025,10 @@ fn run_semantic_search(query: &str) -> SearchOutcome {
     for h in hits {
         if let Ok(Some(alarm_id)) = db::alarm_id_for_ref(h.ref_id) {
             if let Ok(Some(alarm)) = db::get_alarm(&alarm_id) {
-                out.push(SearchHit { alarm, score: h.score });
+                out.push(SearchHit {
+                    alarm,
+                    score: h.score,
+                });
             }
         }
     }
@@ -8527,12 +11040,20 @@ fn run_semantic_search(query: &str) -> SearchOutcome {
 /// optional time; treats the input as UTC.
 fn parse_search_time(s: &str) -> i64 {
     let s = s.trim();
-    if s.is_empty() { return 0; }
+    if s.is_empty() {
+        return 0;
+    }
     let bytes: Vec<&str> = s.splitn(2, [' ', 'T']).collect();
     let date = bytes.first().copied().unwrap_or("");
     let dparts: Vec<&str> = date.split('-').collect();
-    if dparts.len() != 3 { return 0; }
-    let (y, mo, d) = match (dparts[0].parse::<i64>(), dparts[1].parse::<i64>(), dparts[2].parse::<i64>()) {
+    if dparts.len() != 3 {
+        return 0;
+    }
+    let (y, mo, d) = match (
+        dparts[0].parse::<i64>(),
+        dparts[1].parse::<i64>(),
+        dparts[2].parse::<i64>(),
+    ) {
         (Ok(y), Ok(mo), Ok(d)) if (1..=12).contains(&mo) && (1..=31).contains(&d) => (y, mo, d),
         _ => return 0,
     };
@@ -8562,13 +11083,19 @@ fn handle_search_submit(params: &JsonValue) -> JsonValue {
     let mode = search_mode();
     // The query control commits on keystroke, so the persisted value is
     // authoritative; a submit-time `value` (if the host sends one) overrides it.
-    let query = params.get("value").and_then(|x| x.as_str()).map(|s| s.to_string())
+    let query = params
+        .get("value")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| search_last_query(&mode));
     // Attribute mode can run on the structured fields alone (empty free text);
     // every other mode needs a query string.
     if query.trim().is_empty() && search_mode_norm(&mode) != "attribute" {
-        with_state(|s| { s.clear_messages(); s.error_message = Some("Wpisz zapytanie przed wyszukaniem.".into()); });
+        with_state(|s| {
+            s.clear_messages();
+            s.error_message = Some("Wpisz zapytanie przed wyszukaniem.".into());
+        });
         render_panel("search");
         return json!({"ok":false});
     }
@@ -8580,22 +11107,36 @@ fn handle_search_submit(params: &JsonValue) -> JsonValue {
     let after = json!({"mode": mode, "query": query}).to_string();
     let _ = db::insert_audit(SEARCH_ACTOR, "search_query", &mode, "", &after);
     let outcome = run_search(&mode, &query);
-    with_state(|s| { s.clear_messages(); s.search.submitted_mode = mode.clone(); s.search.outcome = outcome; });
+    with_state(|s| {
+        s.clear_messages();
+        s.search.submitted_mode = mode.clone();
+        s.search.outcome = outcome;
+    });
     render_panel("search");
     json!({"ok":true})
 }
 
 /// Re-runs a recent query: persists it as the current mode's query, then runs it.
 fn handle_search_recent_pick(params: &JsonValue) -> JsonValue {
-    let query = params.get("query").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    if query.is_empty() { return json!({"ok":false}); }
+    let query = params
+        .get("query")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    if query.is_empty() {
+        return json!({"ok":false});
+    }
     let mode = search_mode();
     let _ = db::set_setting(&search_query_key(&mode), &query);
     search_push_recent(&mode, &query);
     let after = json!({"mode": mode, "query": query}).to_string();
     let _ = db::insert_audit(SEARCH_ACTOR, "search_query", &mode, "", &after);
     let outcome = run_search(&mode, &query);
-    with_state(|s| { s.clear_messages(); s.search.submitted_mode = mode.clone(); s.search.outcome = outcome; });
+    with_state(|s| {
+        s.clear_messages();
+        s.search.submitted_mode = mode.clone();
+        s.search.outcome = outcome;
+    });
     render_panel("search");
     json!({"ok":true})
 }
@@ -8606,9 +11147,11 @@ fn handle_search_recent_pick(params: &JsonValue) -> JsonValue {
 fn handle_search_reindex() -> JsonValue {
     with_state(|s| s.clear_messages());
     if !embedding_model_available() {
-        with_state(|s| s.error_message = Some(
+        with_state(|s| {
+            s.error_message = Some(
             "Model embeddingów niedostępny — skonfiguruj go w Ustawieniach / deploy. Indeksowanie pominięte.".into()
-        ));
+        )
+        });
         render_panel("search");
         return json!({"ok":false, "error":"no embedding model"});
     }
@@ -8622,13 +11165,23 @@ fn handle_search_reindex() -> JsonValue {
         }
     }
     let _ = db::insert_audit(
-        SEARCH_ACTOR, "search_reindex", EVENT_VECTOR_NS,
-        "", &json!({"indexed": ok, "failed": failed}).to_string(),
+        SEARCH_ACTOR,
+        "search_reindex",
+        EVENT_VECTOR_NS,
+        "",
+        &json!({"indexed": ok, "failed": failed}).to_string(),
     );
-    with_state(|s| s.success_message = Some(alloc::format!(
-        "Zaindeksowano {} zdarzeń{}.", ok,
-        if failed > 0 { alloc::format!(" ({} błędów)", failed) } else { String::new() }
-    )));
+    with_state(|s| {
+        s.success_message = Some(alloc::format!(
+            "Zaindeksowano {} zdarzeń{}.",
+            ok,
+            if failed > 0 {
+                alloc::format!(" ({} błędów)", failed)
+            } else {
+                String::new()
+            }
+        ))
+    });
     render_panel("search");
     json!({"ok":true, "indexed": ok, "failed": failed})
 }
@@ -8639,7 +11192,10 @@ fn handle_search_reindex() -> JsonValue {
 fn handle_search_clear_all() -> JsonValue {
     let mode = search_mode();
     let _ = db::set_setting(&search_query_key(&mode), "");
-    with_state(|s| { s.clear_messages(); s.search.clear_all(); });
+    with_state(|s| {
+        s.clear_messages();
+        s.search.clear_all();
+    });
     render_panel("search");
     json!({"ok":true})
 }
@@ -8708,39 +11264,59 @@ fn risk_badge(risk_class: &str) -> Component {
         "C" => "danger",
         _ => "info",
     };
-    let label = if risk_class.is_empty() { "—" } else { risk_class };
-    chip_toned(label, match tone { "danger" => "critical", other => other })
+    let label = if risk_class.is_empty() {
+        "—"
+    } else {
+        risk_class
+    };
+    chip_toned(
+        label,
+        match tone {
+            "danger" => "critical",
+            other => other,
+        },
+    )
 }
 
 /// Available analytic Flows the profile can bind to. In the mockup this list is
 /// filtered to Flows that expose TentaVision vision capabilities; here it is a
 /// stable set the builder writes verbatim into `flow_id`.
 fn profile_flow_options() -> Vec<SelectOption> {
-    ["tv-realtime-adr", "tv-realtime-public", "tv-security-night", "tv-anpr", "tv-reid-historical"]
-        .iter()
-        .map(|f| SelectOption {
-            value: SelectValue::Text((*f).into()),
-            label: lit(f),
-            icon: None,
-            disabled: false,
-            group_id: None,
-            description: None,
-        })
-        .collect()
+    [
+        "tv-realtime-adr",
+        "tv-realtime-public",
+        "tv-security-night",
+        "tv-anpr",
+        "tv-reid-historical",
+    ]
+    .iter()
+    .map(|f| SelectOption {
+        value: SelectValue::Text((*f).into()),
+        label: lit(f),
+        icon: None,
+        disabled: false,
+        group_id: None,
+        description: None,
+    })
+    .collect()
 }
 
 fn profile_risk_options() -> Vec<SelectOption> {
-    [("A", "A — bezosobowe / długa retencja"), ("B", "B — średnie ryzyko"), ("C", "C — wrażliwe / krótka retencja")]
-        .iter()
-        .map(|(v, l)| SelectOption {
-            value: SelectValue::Text((*v).into()),
-            label: lit(l),
-            icon: None,
-            disabled: false,
-            group_id: None,
-            description: None,
-        })
-        .collect()
+    [
+        ("A", "A — bezosobowe / długa retencja"),
+        ("B", "B — średnie ryzyko"),
+        ("C", "C — wrażliwe / krótka retencja"),
+    ]
+    .iter()
+    .map(|(v, l)| SelectOption {
+        value: SelectValue::Text((*v).into()),
+        label: lit(l),
+        icon: None,
+        disabled: false,
+        group_id: None,
+        description: None,
+    })
+    .collect()
 }
 
 fn profile_schedule_options() -> Vec<SelectOption> {
@@ -8773,11 +11349,24 @@ fn build_profile_camera_assignment(cameras: &[db::CameraRow], assigned: &[String
         .map(|c| {
             let is_on = assigned.iter().any(|a| a == &c.id);
             let mut params = CborMap::default();
-            params.0.push(("camera_id".into(), Value::Text(c.id.clone())));
-            let label = if is_on { alloc::format!("✓ {}", c.name) } else { c.name.clone() };
+            params
+                .0
+                .push(("camera_id".into(), Value::Text(c.id.clone())));
+            let label = if is_on {
+                alloc::format!("✓ {}", c.name)
+            } else {
+                c.name.clone()
+            };
             let variant = if is_on { "primary" } else { "secondary" };
             let toggle_btn = button_with_params(&label, "profile-camera-toggle", variant, params);
-            let status = chip_toned(&c.status, if c.status == "online" { "success" } else { "warning" });
+            let status = chip_toned(
+                &c.status,
+                if c.status == "online" {
+                    "success"
+                } else {
+                    "warning"
+                },
+            );
             stack_h(vec![toggle_btn, status])
         })
         .collect();
@@ -8797,16 +11386,34 @@ fn profile_risk_cell(risk: &str) -> Value {
 }
 
 fn profile_table_row_value(p: &db::ProfileRow, camera_count: usize) -> Value {
-    let flow = if p.flow_id.is_empty() { "—".to_string() } else { p.flow_id.clone() };
-    let schedule = if p.schedule.is_empty() { "—".to_string() } else { p.schedule.clone() };
+    let flow = if p.flow_id.is_empty() {
+        "—".to_string()
+    } else {
+        p.flow_id.clone()
+    };
+    let schedule = if p.schedule.is_empty() {
+        "—".to_string()
+    } else {
+        p.schedule.clone()
+    };
     let entries: Vec<(Value, Value)> = vec![
         (Value::Text("profile_id".into()), Value::Text(p.id.clone())),
         (Value::Text("name".into()), Value::Text(p.name.clone())),
         (Value::Text("flow".into()), Value::Text(flow)),
         (Value::Text("risk".into()), profile_risk_cell(&p.risk_class)),
-        (Value::Text("cameras".into()), Value::Text(alloc::format!("{}", camera_count))),
+        (
+            Value::Text("cameras".into()),
+            Value::Text(alloc::format!("{}", camera_count)),
+        ),
         (Value::Text("schedule".into()), Value::Text(schedule)),
-        (Value::Text("enabled".into()), if p.enabled { chip_cell("TAK", "ok") } else { chip_cell("NIE", "muted") }),
+        (
+            Value::Text("enabled".into()),
+            if p.enabled {
+                chip_cell("TAK", "ok")
+            } else {
+                chip_cell("NIE", "muted")
+            },
+        ),
     ];
     Value::Map(entries)
 }
@@ -8861,7 +11468,9 @@ fn build_profiles_table() -> Component {
         virtualize: false,
         row_expandable: false,
         expanded_row_template_id: None,
-    }.into_component(next_id()).expect("Table")
+    }
+    .into_component(next_id())
+    .expect("Table")
 }
 
 /// Confirmation bar for deleting the selected profile.
@@ -8872,27 +11481,37 @@ fn build_profile_remove_confirm(profile_id: &str, profiles: &[db::ProfileRow]) -
         .map(|p| p.name.as_str())
         .unwrap_or(profile_id);
     let mut params = CborMap::default();
-    params.0.push(("profile_id".into(), Value::Text(profile_id.into())));
+    params
+        .0
+        .push(("profile_id".into(), Value::Text(profile_id.into())));
     let confirm_btn = button_with_params("Usuń", "profile-remove", "destructive", params);
     let cancel_btn = button("Anuluj", "profile-remove-cancel", "ghost");
-    card(None, vec![stack_v(vec![
-        text_styled(&alloc::format!("Usunąć profil \"{}\"?", name), "body_strong"),
-        text("Tej operacji nie można cofnąć."),
-        stack_h(vec![confirm_btn, cancel_btn]),
-    ])])
+    card(
+        None,
+        vec![stack_v(vec![
+            text_styled(
+                &alloc::format!("Usunąć profil \"{}\"?", name),
+                "body_strong",
+            ),
+            text("Tej operacji nie można cofnąć."),
+            stack_h(vec![confirm_btn, cancel_btn]),
+        ])],
+    )
 }
 
 /// The analytic-profile builder: left column (Flow + quick params), right column
 /// (profile config + camera assignment). Mirrors the m04 mockup's `.col-2`.
 fn build_profile_builder(cameras: &[db::CameraRow]) -> Component {
-    let (name, flow_id, risk_class, schedule, assigned, editing) = with_state(|s| (
-        s.profiles.name.clone(),
-        s.profiles.flow_id.clone(),
-        s.profiles.risk_class.clone(),
-        s.profiles.schedule.clone(),
-        s.profiles.cameras.clone(),
-        s.profiles.editing_id.is_some(),
-    ));
+    let (name, flow_id, risk_class, schedule, assigned, editing) = with_state(|s| {
+        (
+            s.profiles.name.clone(),
+            s.profiles.flow_id.clone(),
+            s.profiles.risk_class.clone(),
+            s.profiles.schedule.clone(),
+            s.profiles.cameras.clone(),
+            s.profiles.editing_id.is_some(),
+        )
+    });
 
     // LEFT: Flow assignment + quick params (overrides to Flow inputs).
     let left = card(Some("Flow przypisany do profilu"), vec![
@@ -8905,42 +11524,79 @@ fn build_profile_builder(cameras: &[db::CameraRow]) -> Component {
     ]);
 
     // RIGHT: profile config + camera assignment.
-    let right = card(Some("Konfiguracja profilu"), vec![
-        profile_input("Nazwa", "np. ADR-brama", "profile_name"),
-        profile_select("Klasa ryzyka", profile_risk_options(), "profile_risk_class"),
-        stack_h(vec![text("Aktualna klasa:"), risk_badge(&risk_class)]),
-        profile_select("Harmonogram", profile_schedule_options(), "profile_schedule"),
-        heading(4, "Kamery w profilu"),
-        build_profile_camera_assignment(cameras, &assigned),
-    ]);
+    let right = card(
+        Some("Konfiguracja profilu"),
+        vec![
+            profile_input("Nazwa", "np. ADR-brama", "profile_name"),
+            profile_select("Klasa ryzyka", profile_risk_options(), "profile_risk_class"),
+            stack_h(vec![text("Aktualna klasa:"), risk_badge(&risk_class)]),
+            profile_select(
+                "Harmonogram",
+                profile_schedule_options(),
+                "profile_schedule",
+            ),
+            heading(4, "Kamery w profilu"),
+            build_profile_camera_assignment(cameras, &assigned),
+        ],
+    );
 
     let _ = (name, flow_id, schedule);
 
-    let save_label = if editing { "Zapisz zmiany" } else { "Utwórz profil" };
+    let save_label = if editing {
+        "Zapisz zmiany"
+    } else {
+        "Utwórz profil"
+    };
     let actions = stack_h(vec![
         button(save_label, "profile-add-submit", "primary"),
         button("Anuluj", "profile-builder-cancel", "ghost"),
     ]);
 
-    card(None, vec![
-        grid(2, vec![left, right]),
-        actions,
-    ])
+    card(None, vec![grid(2, vec![left, right]), actions])
 }
 
 fn build_profiles_content() -> Component {
     let messages = build_messages_section();
     let list_result = db::list_profiles();
-    let (category, builder_visible) = with_state(|s| (s.profiles.category_or_all().to_string(), s.profiles.builder_visible));
+    let (category, builder_visible) = with_state(|s| {
+        (
+            s.profiles.category_or_all().to_string(),
+            s.profiles.builder_visible,
+        )
+    });
 
     let mut children = vec![messages];
 
     let chips = filter_chips(
         vec![
-            FilterChipDef { id: "all".into(), label: lit("Wszystkie"), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "A".into(), label: lit("Klasa A"), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "B".into(), label: lit("Klasa B"), icon: None, badge: None, count_path: None },
-            FilterChipDef { id: "C".into(), label: lit("Klasa C"), icon: None, badge: None, count_path: None },
+            FilterChipDef {
+                id: "all".into(),
+                label: lit("Wszystkie"),
+                icon: None,
+                badge: None,
+                count_path: None,
+            },
+            FilterChipDef {
+                id: "A".into(),
+                label: lit("Klasa A"),
+                icon: None,
+                badge: None,
+                count_path: None,
+            },
+            FilterChipDef {
+                id: "B".into(),
+                label: lit("Klasa B"),
+                icon: None,
+                badge: None,
+                count_path: None,
+            },
+            FilterChipDef {
+                id: "C".into(),
+                label: lit("Klasa C"),
+                icon: None,
+                badge: None,
+                count_path: None,
+            },
         ],
         &category,
     );
@@ -8955,7 +11611,10 @@ fn build_profiles_content() -> Component {
     let profiles = match list_result {
         Ok(p) => p,
         Err(e) => {
-            children.push(alert(&alloc::format!("Nie udało się pobrać profili: {}", abi_message(e)), "critical"));
+            children.push(alert(
+                &alloc::format!("Nie udało się pobrać profili: {}", abi_message(e)),
+                "critical",
+            ));
             return stack_v(children);
         }
     };
@@ -8976,7 +11635,11 @@ fn build_profiles_content() -> Component {
         }
     }
 
-    let active_filter = if category == "all" { "" } else { category.as_str() };
+    let active_filter = if category == "all" {
+        ""
+    } else {
+        category.as_str()
+    };
     let filtered: Vec<&db::ProfileRow> = profiles
         .iter()
         .filter(|p| active_filter.is_empty() || p.risk_class == active_filter)
@@ -9112,7 +11775,10 @@ fn reid_flag(key: &str) -> bool {
 
 /// The gate is OPEN only when every REQUIRED condition's flag is satisfied.
 fn reid_gate_open() -> bool {
-    REID_CONDITIONS.iter().filter(|c| c.required).all(|c| reid_flag(c.key))
+    REID_CONDITIONS
+        .iter()
+        .filter(|c| c.required)
+        .all(|c| reid_flag(c.key))
 }
 
 /// Renders one checklist row: a tone-coded status chip (done=ok, soft-pending=
@@ -9160,7 +11826,9 @@ fn reid_check_row(cond: &GateCondition) -> Component {
         interactive: false,
         clickable: false,
         style: None,
-    }.into_component(next_id()).expect("Card")
+    }
+    .into_component(next_id())
+    .expect("Card")
 }
 
 fn build_reid_content() -> Component {
@@ -9184,17 +11852,31 @@ fn build_reid_content() -> Component {
     // "requires runtime" notice.
     let query_btn = {
         let mut c = ButtonComp {
-            variant: if open { ButtonVariant::Primary } else { ButtonVariant::Secondary },
+            variant: if open {
+                ButtonVariant::Primary
+            } else {
+                ButtonVariant::Secondary
+            },
             tone: Tone::Neutral,
-            label: lit(if open { "Uruchom zapytanie Re-ID" } else { "Zapytanie zablokowane" }),
-            icon_leading: Some(icon_named(parse_icon_name(if open { "search" } else { "lock" }))),
+            label: lit(if open {
+                "Uruchom zapytanie Re-ID"
+            } else {
+                "Zapytanie zablokowane"
+            }),
+            icon_leading: Some(icon_named(parse_icon_name(if open {
+                "search"
+            } else {
+                "lock"
+            }))),
             icon_trailing: None,
             size: ButtonSize::Md,
             full_width: false,
             disabled: Some(BindRef::Literal(Value::Bool(!open))),
             loading: None,
             density: Density::Default,
-        }.into_component(next_id()).expect("Button");
+        }
+        .into_component(next_id())
+        .expect("Button");
         c.handlers = Some(HandlerMap(vec![(
             tentaflow_sdk_spec::EventKind::Click,
             Handler::Backend {
@@ -9239,7 +11921,10 @@ fn build_reid_content() -> Component {
     // Checklist of compliance preconditions, each showing its real persisted state.
     let mut checklist: Vec<Component> = REID_CONDITIONS.iter().map(reid_check_row).collect();
     let gate_summary = if open {
-        alert("Wszystkie warunki spełnione — runtime Re-ID jest odblokowany.", "success")
+        alert(
+            "Wszystkie warunki spełnione — runtime Re-ID jest odblokowany.",
+            "success",
+        )
     } else {
         alert("Moduł Re-ID jest zablokowany. Bez spełnienia poniższych warunków runtime fizycznie odrzuci każde zapytanie.", "danger")
     };
@@ -9248,7 +11933,9 @@ fn build_reid_content() -> Component {
 
     let gate_card = SectionCard {
         title: lit("Warunki uruchomienia (legal gate)"),
-        subtitle: Some(lit("Re-identyfikacja osób jest high-risk AI wg EU AI Act (Annex III).")),
+        subtitle: Some(lit(
+            "Re-identyfikacja osób jest high-risk AI wg EU AI Act (Annex III).",
+        )),
         header_actions: vec![],
         header_divider: true,
         body: card_body,
@@ -9262,7 +11949,9 @@ fn build_reid_content() -> Component {
         background: BackgroundToken::None,
         accent: Some(Tone::Critical),
         style: None,
-    }.into_component(next_id()).expect("SectionCard");
+    }
+    .into_component(next_id())
+    .expect("SectionCard");
 
     // Legal-reference box.
     let legal = card(Some("Podstawa prawna referencyjna"), vec![
@@ -9285,21 +11974,40 @@ fn reid_condition(key: &str) -> Option<&'static GateCondition> {
 /// Toggles a compliance flag (set to "1" if currently off, otherwise "0"),
 /// persisting it and writing an audit row recording the before/after value.
 fn handle_reid_flag_set(params: &JsonValue) -> JsonValue {
-    let key = params.get("key").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let key = params
+        .get("key")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     let cond = match reid_condition(&key) {
         Some(c) => c,
-        None => { with_state(|s| { s.clear_messages(); s.error_message = Some("Nieznany warunek gate.".into()); }); render_panel("reid"); return json!({"ok":false}); }
+        None => {
+            with_state(|s| {
+                s.clear_messages();
+                s.error_message = Some("Nieznany warunek gate.".into());
+            });
+            render_panel("reid");
+            return json!({"ok":false});
+        }
     };
     let before = reid_flag(&key);
     let after = !before;
     let after_val = if after { "1" } else { "0" };
     if let Err(e) = db::set_setting(&key, after_val) {
-        with_state(|s| { s.clear_messages(); s.error_message = Some(alloc::format!("Nie udało się zapisać warunku: {}", abi_message(e))); });
+        with_state(|s| {
+            s.clear_messages();
+            s.error_message = Some(alloc::format!(
+                "Nie udało się zapisać warunku: {}",
+                abi_message(e)
+            ));
+        });
         render_panel("reid");
         return json!({"ok":false});
     }
     let _ = db::insert_audit(
-        REID_ACTOR, "reid_gate_change", &key,
+        REID_ACTOR,
+        "reid_gate_change",
+        &key,
         if before { "\"1\"" } else { "\"0\"" },
         if after { "\"1\"" } else { "\"0\"" },
     );
@@ -9308,7 +12016,10 @@ fn handle_reid_flag_set(params: &JsonValue) -> JsonValue {
     } else {
         alloc::format!("Warunek cofnięty: {}", cond.label)
     };
-    with_state(|s| { s.clear_messages(); s.success_message = Some(msg); });
+    with_state(|s| {
+        s.clear_messages();
+        s.success_message = Some(msg);
+    });
     render_panel("reid");
     json!({"ok":true})
 }
@@ -9319,17 +12030,29 @@ fn handle_reid_legalgrant_request() -> JsonValue {
     let key = "reid_legalgrant_granted";
     let before = reid_flag(key);
     if before {
-        with_state(|s| { s.clear_messages(); s.success_message = Some("LegalGrant jest już aktywny.".into()); });
+        with_state(|s| {
+            s.clear_messages();
+            s.success_message = Some("LegalGrant jest już aktywny.".into());
+        });
         render_panel("reid");
         return json!({"ok":true});
     }
     if let Err(e) = db::set_setting(key, "1") {
-        with_state(|s| { s.clear_messages(); s.error_message = Some(alloc::format!("Nie udało się zapisać LegalGrant: {}", abi_message(e))); });
+        with_state(|s| {
+            s.clear_messages();
+            s.error_message = Some(alloc::format!(
+                "Nie udało się zapisać LegalGrant: {}",
+                abi_message(e)
+            ));
+        });
         render_panel("reid");
         return json!({"ok":false});
     }
     let _ = db::insert_audit(REID_ACTOR, "reid_gate_change", key, "\"0\"", "\"1\"");
-    with_state(|s| { s.clear_messages(); s.success_message = Some("LegalGrant został przyznany i zapisany.".into()); });
+    with_state(|s| {
+        s.clear_messages();
+        s.success_message = Some("LegalGrant został przyznany i zapisany.".into());
+    });
     render_panel("reid");
     json!({"ok":true})
 }
@@ -9338,11 +12061,17 @@ fn handle_reid_legalgrant_request() -> JsonValue {
 /// inference engine — this is an honest placeholder, not a faked search.
 fn handle_reid_query() -> JsonValue {
     if !reid_gate_open() {
-        with_state(|s| { s.clear_messages(); s.error_message = Some("Gate zablokowany — runtime odrzuca zapytanie.".into()); });
+        with_state(|s| {
+            s.clear_messages();
+            s.error_message = Some("Gate zablokowany — runtime odrzuca zapytanie.".into());
+        });
         render_panel("reid");
         return json!({"ok":false});
     }
-    with_state(|s| { s.clear_messages(); s.success_message = Some("Gate otwarty. Wykonanie zapytania Re-ID wymaga uruchomionego runtime/feature inferencji (brak backendu).".into()); });
+    with_state(|s| {
+        s.clear_messages();
+        s.success_message = Some("Gate otwarty. Wykonanie zapytania Re-ID wymaga uruchomionego runtime/feature inferencji (brak backendu).".into());
+    });
     render_panel("reid");
     json!({"ok":true,"noop":true})
 }
@@ -9350,14 +12079,20 @@ fn handle_reid_query() -> JsonValue {
 fn build_models_content() -> Component {
     let messages = build_messages_section();
     let list_result = db::list_models();
-    let (form_visible, budget_editing) = with_state(|s| (s.models.form_visible, s.models.budget_editing));
+    let (form_visible, budget_editing) =
+        with_state(|s| (s.models.form_visible, s.models.budget_editing));
 
     let mut children = vec![messages];
 
     let toolbar = stack_h(vec![
         heading(2, "Modele i runtime"),
         button_with_icon("Upload ONNX", "model-upload-onnx", "secondary", "upload"),
-        button_with_icon("Uruchom benchmark", "model-benchmark", "secondary", "activity"),
+        button_with_icon(
+            "Uruchom benchmark",
+            "model-benchmark",
+            "secondary",
+            "activity",
+        ),
         button_with_icon("Dodaj model", "model-add-show", "primary", "plus"),
     ]);
     children.push(toolbar);
@@ -9366,7 +12101,10 @@ fn build_models_content() -> Component {
     let models = match list_result {
         Ok(m) => m,
         Err(e) => {
-            children.push(alert(&alloc::format!("Nie udało się pobrać modeli: {}", abi_message(e)), "critical"));
+            children.push(alert(
+                &alloc::format!("Nie udało się pobrać modeli: {}", abi_message(e)),
+                "critical",
+            ));
             return stack_v(children);
         }
     };
@@ -9410,18 +12148,31 @@ fn build_models_content() -> Component {
 /// used segment turns critical and the header chip warns.
 fn build_vram_budget_card(models: &[db::ModelRow], editing: bool) -> Component {
     let budget = db::get_setting_i64("vram_budget_mb", DEFAULT_VRAM_BUDGET_MB).max(1);
-    let used = models.iter()
+    let used = models
+        .iter()
         .filter(|m| m.status == "active" || m.status == "loaded")
         .map(|m| m.vram_mb.max(0))
         .sum::<i64>();
     let free = (budget - used).max(0);
     let over = used > budget;
 
-    let used_tone = if over { "critical" } else if used * 4 >= budget * 3 { "warning" } else { "success" };
-    let header_chip = if over {
-        chip_toned(&alloc::format!("{} / {} MB · przekroczono", used, budget), "critical")
+    let used_tone = if over {
+        "critical"
+    } else if used * 4 >= budget * 3 {
+        "warning"
     } else {
-        chip_toned(&alloc::format!("{} / {} MB · wolne {} MB", used, budget, free), used_tone)
+        "success"
+    };
+    let header_chip = if over {
+        chip_toned(
+            &alloc::format!("{} / {} MB · przekroczono", used, budget),
+            "critical",
+        )
+    } else {
+        chip_toned(
+            &alloc::format!("{} / {} MB · wolne {} MB", used, budget, free),
+            used_tone,
+        )
     };
 
     // StackedBar segments resolve from literal BindRefs; total drives the scale.
@@ -9444,7 +12195,9 @@ fn build_vram_budget_card(models: &[db::ModelRow], editing: bool) -> Component {
         show_legend: true,
         show_percentages: true,
         height_px: 28,
-    }.into_component(next_id()).expect("StackedBar");
+    }
+    .into_component(next_id())
+    .expect("StackedBar");
 
     let mut card_children = vec![
         stack_h(vec![heading(4, "Budżet VRAM"), header_chip]),
@@ -9489,14 +12242,25 @@ fn model_budget_input() -> Component {
 /// backend, status, VRAM (MB) and version/hash.
 fn build_model_form() -> Component {
     let editing = with_state(|s| s.models.editing_id.is_some());
-    let fields = card(Some("Dane modelu"), vec![
-        model_input("Nazwa", "np. YOLO11m", "model_name"),
-        model_select("Runtime / backend", model_runtime_options(), "model_runtime"),
-        model_select("Status", model_status_options(), "model_status"),
-        model_number("VRAM (MB)", "np. 1700", "model_vram"),
-        model_input("Wersja / hash", "np. yolo11m-2026.04", "model_version"),
-    ]);
-    let save_label = if editing { "Zapisz zmiany" } else { "Zapisz model" };
+    let fields = card(
+        Some("Dane modelu"),
+        vec![
+            model_input("Nazwa", "np. YOLO11m", "model_name"),
+            model_select(
+                "Runtime / backend",
+                model_runtime_options(),
+                "model_runtime",
+            ),
+            model_select("Status", model_status_options(), "model_status"),
+            model_number("VRAM (MB)", "np. 1700", "model_vram"),
+            model_input("Wersja / hash", "np. yolo11m-2026.04", "model_version"),
+        ],
+    );
+    let save_label = if editing {
+        "Zapisz zmiany"
+    } else {
+        "Zapisz model"
+    };
     let actions = stack_h(vec![
         button(save_label, "model-add-submit", "primary"),
         button("Anuluj", "model-form-cancel", "ghost"),
@@ -9511,7 +12275,12 @@ fn model_input(label: &str, placeholder: &str, field: &str) -> Component {
     params.0.push(("field".into(), Value::Text(field.into())));
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Input,
-        Handler::Backend { action_id: "model-field-change".into(), params, optimistic: None, on_failure: FailurePolicy::Toast },
+        Handler::Backend {
+            action_id: "model-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
     )]));
     comp
 }
@@ -9523,7 +12292,12 @@ fn model_number(label: &str, placeholder: &str, field: &str) -> Component {
     params.0.push(("field".into(), Value::Text(field.into())));
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Input,
-        Handler::Backend { action_id: "model-field-change".into(), params, optimistic: None, on_failure: FailurePolicy::Toast },
+        Handler::Backend {
+            action_id: "model-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
     )]));
     comp
 }
@@ -9535,23 +12309,53 @@ fn model_select(label: &str, options: Vec<SelectOption>, field: &str) -> Compone
     params.0.push(("field".into(), Value::Text(field.into())));
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Change,
-        Handler::Backend { action_id: "model-field-change".into(), params, optimistic: None, on_failure: FailurePolicy::Toast },
+        Handler::Backend {
+            action_id: "model-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
     )]));
     comp
 }
 
 fn model_runtime_options() -> Vec<SelectOption> {
-    [("tensorrt", "TensorRT"), ("onnxruntime", "ONNX Runtime"), ("openvino", "OpenVINO"), ("torch", "PyTorch")]
-        .iter()
-        .map(|(v, l)| SelectOption { value: SelectValue::Text((*v).into()), label: lit(l), icon: None, disabled: false, group_id: None, description: None })
-        .collect()
+    [
+        ("tensorrt", "TensorRT"),
+        ("onnxruntime", "ONNX Runtime"),
+        ("openvino", "OpenVINO"),
+        ("torch", "PyTorch"),
+    ]
+    .iter()
+    .map(|(v, l)| SelectOption {
+        value: SelectValue::Text((*v).into()),
+        label: lit(l),
+        icon: None,
+        disabled: false,
+        group_id: None,
+        description: None,
+    })
+    .collect()
 }
 
 fn model_status_options() -> Vec<SelectOption> {
-    [("active", "active — w użyciu"), ("loaded", "loaded — w VRAM"), ("loading", "loading — ładowanie"), ("idle", "idle — bezczynny"), ("error", "error — błąd")]
-        .iter()
-        .map(|(v, l)| SelectOption { value: SelectValue::Text((*v).into()), label: lit(l), icon: None, disabled: false, group_id: None, description: None })
-        .collect()
+    [
+        ("active", "active — w użyciu"),
+        ("loaded", "loaded — w VRAM"),
+        ("loading", "loading — ładowanie"),
+        ("idle", "idle — bezczynny"),
+        ("error", "error — błąd"),
+    ]
+    .iter()
+    .map(|(v, l)| SelectOption {
+        value: SelectValue::Text((*v).into()),
+        label: lit(l),
+        icon: None,
+        disabled: false,
+        group_id: None,
+        description: None,
+    })
+    .collect()
 }
 
 /// Maps a persisted model status to a chip label + tone (mockup colors).
@@ -9566,14 +12370,25 @@ fn model_status_cell(status: &str) -> Value {
 }
 
 fn model_table_row_value(m: &db::ModelRow) -> Value {
-    let runtime = if m.runtime.trim().is_empty() { "\u{2014}".to_string() } else { m.runtime.clone() };
-    let version = if m.version.trim().is_empty() { "\u{2014}".to_string() } else { m.version.clone() };
+    let runtime = if m.runtime.trim().is_empty() {
+        "\u{2014}".to_string()
+    } else {
+        m.runtime.clone()
+    };
+    let version = if m.version.trim().is_empty() {
+        "\u{2014}".to_string()
+    } else {
+        m.version.clone()
+    };
     let entries: Vec<(Value, Value)> = vec![
         (Value::Text("model_id".into()), Value::Text(m.id.clone())),
         (Value::Text("name".into()), Value::Text(m.name.clone())),
         (Value::Text("runtime".into()), Value::Text(runtime)),
         (Value::Text("status".into()), model_status_cell(&m.status)),
-        (Value::Text("vram".into()), Value::Text(alloc::format!("{} MB", m.vram_mb))),
+        (
+            Value::Text("vram".into()),
+            Value::Text(alloc::format!("{} MB", m.vram_mb)),
+        ),
         (Value::Text("version".into()), Value::Text(version)),
     ];
     Value::Map(entries)
@@ -9628,21 +12443,32 @@ fn build_models_table() -> Component {
         virtualize: false,
         row_expandable: false,
         expanded_row_template_id: None,
-    }.into_component(next_id()).expect("Table")
+    }
+    .into_component(next_id())
+    .expect("Table")
 }
 
 /// Confirmation bar for deleting the selected model.
 fn build_model_remove_confirm(model_id: &str, models: &[db::ModelRow]) -> Component {
-    let name = models.iter().find(|m| m.id == model_id).map(|m| m.name.as_str()).unwrap_or(model_id);
+    let name = models
+        .iter()
+        .find(|m| m.id == model_id)
+        .map(|m| m.name.as_str())
+        .unwrap_or(model_id);
     let mut params = CborMap::default();
-    params.0.push(("model_id".into(), Value::Text(model_id.into())));
+    params
+        .0
+        .push(("model_id".into(), Value::Text(model_id.into())));
     let confirm_btn = button_with_params("Usuń", "model-remove", "destructive", params);
     let cancel_btn = button("Anuluj", "model-remove-cancel", "ghost");
-    card(None, vec![stack_v(vec![
-        text_styled(&alloc::format!("Usunąć model \"{}\"?", name), "body_strong"),
-        text("Tej operacji nie można cofnąć."),
-        stack_h(vec![confirm_btn, cancel_btn]),
-    ])])
+    card(
+        None,
+        vec![stack_v(vec![
+            text_styled(&alloc::format!("Usunąć model \"{}\"?", name), "body_strong"),
+            text("Tej operacji nie można cofnąć."),
+            stack_h(vec![confirm_btn, cancel_btn]),
+        ])],
+    )
 }
 
 /// Seeds the model form's bound store keys from backend state so the form mounts
@@ -9650,7 +12476,10 @@ fn build_model_remove_confirm(model_id: &str, models: &[db::ModelRow]) -> Compon
 fn models_form_overlay() -> Vec<StateEntry> {
     with_state(|s| {
         let m = &s.models;
-        let key = |k: &str, v: Value| StateEntry { path: StatePath::new(vec![PathSegment::Key(k.into())]), value: v };
+        let key = |k: &str, v: Value| StateEntry {
+            path: StatePath::new(vec![PathSegment::Key(k.into())]),
+            value: v,
+        };
         vec![
             key("model_name", Value::Text(m.form_name.clone())),
             key("model_runtime", Value::Text(m.form_runtime.clone())),
@@ -9667,11 +12496,18 @@ fn models_vram_overlay() -> Vec<StateEntry> {
     let budget = db::get_setting_i64("vram_budget_mb", DEFAULT_VRAM_BUDGET_MB).max(1);
     let used = db::used_vram_mb().unwrap_or(0).max(0);
     let free = (budget - used).max(0);
-    let key = |k: &str, v: f64| StateEntry { path: StatePath::new(vec![PathSegment::Key(k.into())]), value: Value::F64(v) };
+    let key = |k: &str, v: f64| StateEntry {
+        path: StatePath::new(vec![PathSegment::Key(k.into())]),
+        value: Value::F64(v),
+    };
     // The literal-bound StackedBar resolves these by value, so no keys are
     // strictly required; seeding keeps the overlay non-empty and future-proof.
     let _ = (used, free);
-    vec![key("vram_used_mb", used as f64), key("vram_free_mb", free as f64), key("vram_budget_mb_view", budget as f64)]
+    vec![
+        key("vram_used_mb", used as f64),
+        key("vram_free_mb", free as f64),
+        key("vram_budget_mb_view", budget as f64),
+    ]
 }
 
 /// Display label + chip tone for a zone kind, mirroring the mockup colors:
@@ -9694,10 +12530,23 @@ const SCHEDULE_BANDS: &[&str] = &["04–06", "06–12", "12–18", "18–22", "2
 /// Parses the persisted schedule JSON into a 5×7 grid of profile codes. Falls
 /// back to an all-off grid when absent or malformed.
 fn parse_schedule(json: Option<&str>) -> Vec<Vec<String>> {
-    let default = || (0..SCHEDULE_BANDS.len()).map(|_| (0..SCHEDULE_DAYS.len()).map(|_| String::new()).collect()).collect::<Vec<Vec<String>>>();
-    let raw = match json { Some(s) if !s.trim().is_empty() => s, _ => return default() };
-    let parsed: JsonValue = match serde_json::from_str(raw) { Ok(v) => v, Err(_) => return default() };
-    let rows = match parsed.as_array() { Some(r) => r, None => return default() };
+    let default = || {
+        (0..SCHEDULE_BANDS.len())
+            .map(|_| (0..SCHEDULE_DAYS.len()).map(|_| String::new()).collect())
+            .collect::<Vec<Vec<String>>>()
+    };
+    let raw = match json {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return default(),
+    };
+    let parsed: JsonValue = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return default(),
+    };
+    let rows = match parsed.as_array() {
+        Some(r) => r,
+        None => return default(),
+    };
     let mut grid = default();
     for (b, row) in rows.iter().take(SCHEDULE_BANDS.len()).enumerate() {
         if let Some(cols) = row.as_array() {
@@ -9715,32 +12564,45 @@ fn zone_camera_selector(cameras: &[db::CameraRow], selected: Option<&str>) -> Co
     let mut options: Vec<SelectOption> = vec![SelectOption {
         value: SelectValue::Text(String::new()),
         label: lit("— wybierz kamerę —"),
-        icon: None, disabled: false, group_id: None, description: None,
+        icon: None,
+        disabled: false,
+        group_id: None,
+        description: None,
     }];
     for c in cameras {
         options.push(SelectOption {
             value: SelectValue::Text(c.id.clone()),
             label: lit(&c.name),
-            icon: None, disabled: false, group_id: None, description: None,
+            icon: None,
+            disabled: false,
+            group_id: None,
+            description: None,
         });
     }
     let _ = selected;
     let mut comp = select("Kamera", options, "zone_camera_select");
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Change,
-        Handler::Backend { action_id: "zone-select-camera".into(), params: CborMap::default(), optimistic: None, on_failure: FailurePolicy::Toast },
+        Handler::Backend {
+            action_id: "zone-select-camera".into(),
+            params: CborMap::default(),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
     )]));
     comp
 }
 
 fn build_zones_content() -> Component {
     let messages = build_messages_section();
-    let (selected_camera, zone_form_visible, rule_form_visible, pending_remove) = with_state(|s| (
-        s.zones.selected_camera_id.clone(),
-        s.zones.zone_form_visible,
-        s.zones.rule_form_visible,
-        s.zones.zone_pending_remove.clone(),
-    ));
+    let (selected_camera, zone_form_visible, rule_form_visible, pending_remove) = with_state(|s| {
+        (
+            s.zones.selected_camera_id.clone(),
+            s.zones.zone_form_visible,
+            s.zones.rule_form_visible,
+            s.zones.zone_pending_remove.clone(),
+        )
+    });
 
     let cameras = db::list_cameras().unwrap_or_default();
 
@@ -9751,7 +12613,10 @@ fn build_zones_content() -> Component {
 
     let mut children = vec![messages, toolbar];
 
-    let camera = match selected_camera.as_deref().and_then(|id| cameras.iter().find(|c| c.id == id)) {
+    let camera = match selected_camera
+        .as_deref()
+        .and_then(|id| cameras.iter().find(|c| c.id == id))
+    {
         Some(c) => c,
         None => {
             children.push(empty_state(
@@ -9787,12 +12652,10 @@ fn build_zones_content() -> Component {
         ],
     );
 
-    let mut right_children = vec![
-        stack_h(vec![
-            heading(4, "Strefy na tej kamerze"),
-            button_with_icon("Nowa strefa", "zone-add-start", "primary", "plus"),
-        ]),
-    ];
+    let mut right_children = vec![stack_h(vec![
+        heading(4, "Strefy na tej kamerze"),
+        button_with_icon("Nowa strefa", "zone-add-start", "primary", "plus"),
+    ])];
     if zone_form_visible {
         right_children.push(build_zone_form());
     }
@@ -9804,10 +12667,16 @@ fn build_zones_content() -> Component {
         }
     }
     if zones.is_empty() {
-        right_children.push(empty_state("Brak stref", Some("Dodaj strefę include/exclude lub linię przekroczenia."), Some("zones")));
+        right_children.push(empty_state(
+            "Brak stref",
+            Some("Dodaj strefę include/exclude lub linię przekroczenia."),
+            Some("zones"),
+        ));
     } else {
         let rows: Vec<Value> = zones.iter().map(zone_table_row_value).collect();
-        if let Ok(mut g) = PENDING_ZONE_ROWS.lock() { *g = Some(Value::Array(rows)); }
+        if let Ok(mut g) = PENDING_ZONE_ROWS.lock() {
+            *g = Some(Value::Array(rows));
+        }
         right_children.push(build_zones_table());
     }
 
@@ -9823,13 +12692,18 @@ fn build_zones_content() -> Component {
 }
 
 fn zone_table_row_value(z: &db::ZoneRow) -> Value {
-    let verts = serde_json::from_str::<JsonValue>(&z.polygon).ok()
-        .and_then(|v| v.as_array().map(|a| a.len())).unwrap_or(0);
+    let verts = serde_json::from_str::<JsonValue>(&z.polygon)
+        .ok()
+        .and_then(|v| v.as_array().map(|a| a.len()))
+        .unwrap_or(0);
     Value::Map(vec![
         (Value::Text("zone_id".into()), Value::Text(z.id.clone())),
         (Value::Text("name".into()), Value::Text(z.name.clone())),
         (Value::Text("kind".into()), zone_kind_cell(&z.kind)),
-        (Value::Text("verts".into()), Value::Text(alloc::format!("{} pkt", verts))),
+        (
+            Value::Text("verts".into()),
+            Value::Text(alloc::format!("{} pkt", verts)),
+        ),
     ])
 }
 
@@ -9859,7 +12733,9 @@ fn build_zones_table() -> Component {
         virtualize: false,
         row_expandable: false,
         expanded_row_template_id: None,
-    }.into_component(next_id()).expect("Table")
+    }
+    .into_component(next_id())
+    .expect("Table")
 }
 
 /// Add-zone form: name, kind (include/exclude/line) and the polygon coordinates
@@ -9880,10 +12756,21 @@ fn build_zone_form() -> Component {
 }
 
 fn zone_kind_options() -> Vec<SelectOption> {
-    [("include", "include — obszar detekcji"), ("exclude", "exclude — obszar ignorowany"), ("line", "line — linia przekroczenia")]
-        .iter()
-        .map(|(v, l)| SelectOption { value: SelectValue::Text((*v).into()), label: lit(l), icon: None, disabled: false, group_id: None, description: None })
-        .collect()
+    [
+        ("include", "include — obszar detekcji"),
+        ("exclude", "exclude — obszar ignorowany"),
+        ("line", "line — linia przekroczenia"),
+    ]
+    .iter()
+    .map(|(v, l)| SelectOption {
+        value: SelectValue::Text((*v).into()),
+        label: lit(l),
+        icon: None,
+        disabled: false,
+        group_id: None,
+        description: None,
+    })
+    .collect()
 }
 
 fn zone_input(label: &str, placeholder: &str, field: &str) -> Component {
@@ -9892,7 +12779,12 @@ fn zone_input(label: &str, placeholder: &str, field: &str) -> Component {
     params.0.push(("field".into(), Value::Text(field.into())));
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Input,
-        Handler::Backend { action_id: "zone-field-change".into(), params, optimistic: None, on_failure: FailurePolicy::Toast },
+        Handler::Backend {
+            action_id: "zone-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
     )]));
     comp
 }
@@ -9903,21 +12795,38 @@ fn zone_select(label: &str, options: Vec<SelectOption>, field: &str) -> Componen
     params.0.push(("field".into(), Value::Text(field.into())));
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Change,
-        Handler::Backend { action_id: "zone-field-change".into(), params, optimistic: None, on_failure: FailurePolicy::Toast },
+        Handler::Backend {
+            action_id: "zone-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
     )]));
     comp
 }
 
 fn build_zone_remove_confirm(zone_id: &str, zones: &[db::ZoneRow]) -> Component {
-    let name = zones.iter().find(|z| z.id == zone_id).map(|z| z.name.as_str()).unwrap_or(zone_id);
+    let name = zones
+        .iter()
+        .find(|z| z.id == zone_id)
+        .map(|z| z.name.as_str())
+        .unwrap_or(zone_id);
     let mut params = CborMap::default();
-    params.0.push(("zone_id".into(), Value::Text(zone_id.into())));
+    params
+        .0
+        .push(("zone_id".into(), Value::Text(zone_id.into())));
     let confirm_btn = button_with_params("Usuń", "zone-remove", "destructive", params);
     let cancel_btn = button("Anuluj", "zone-remove-cancel", "ghost");
-    card(None, vec![stack_v(vec![
-        text_styled(&alloc::format!("Usunąć strefę \"{}\"?", name), "body_strong"),
-        stack_h(vec![confirm_btn, cancel_btn]),
-    ])])
+    card(
+        None,
+        vec![stack_v(vec![
+            text_styled(
+                &alloc::format!("Usunąć strefę \"{}\"?", name),
+                "body_strong",
+            ),
+            stack_h(vec![confirm_btn, cancel_btn]),
+        ])],
+    )
 }
 
 /// Weekly schedule grid (5 hour bands × 7 days). Each cell is a toned chip
@@ -9934,7 +12843,9 @@ fn build_schedule_card(camera_id: &str) -> Component {
 
     // Header row: empty corner + weekday labels.
     let mut header_cells = vec![text_styled("", "caption")];
-    for d in SCHEDULE_DAYS { header_cells.push(text_styled(d, "body_strong")); }
+    for d in SCHEDULE_DAYS {
+        header_cells.push(text_styled(d, "body_strong"));
+    }
     let mut grid_children: Vec<Component> = vec![grid(8, header_cells)];
 
     for (b, band) in SCHEDULE_BANDS.iter().enumerate() {
@@ -9947,8 +12858,12 @@ fn build_schedule_card(camera_id: &str) -> Component {
                 _ => ("—", "muted"),
             };
             let mut params = CborMap::default();
-            params.0.push(("band".into(), Value::Text(alloc::format!("{}", b))));
-            params.0.push(("day".into(), Value::Text(alloc::format!("{}", d))));
+            params
+                .0
+                .push(("band".into(), Value::Text(alloc::format!("{}", b))));
+            params
+                .0
+                .push(("day".into(), Value::Text(alloc::format!("{}", d))));
             // A toned chip-button so the cell shows its profile and is clickable.
             row_cells.push(schedule_cell_button(label, tone, params));
         }
@@ -9966,7 +12881,11 @@ fn build_schedule_card(camera_id: &str) -> Component {
 /// One schedule cell rendered as a small toned button so a click cycles the
 /// profile and the new grid is persisted.
 fn schedule_cell_button(label: &str, tone: &str, params: CborMap) -> Component {
-    let variant = match tone { "info" => "primary", "err" => "destructive", _ => "ghost" };
+    let variant = match tone {
+        "info" => "primary",
+        "err" => "destructive",
+        _ => "ghost",
+    };
     button_with_params(label, "schedule-cell-toggle", variant, params)
 }
 
@@ -9983,10 +12902,16 @@ fn build_rules_card(camera_id: &str, form_visible: bool) -> Component {
     }
 
     if rules.is_empty() {
-        children.push(empty_state("Brak reguł", Some("Dodaj regułę kompozytową łączącą detektory i strefy wyrażeniem AND/OR."), Some("zones")));
+        children.push(empty_state(
+            "Brak reguł",
+            Some("Dodaj regułę kompozytową łączącą detektory i strefy wyrażeniem AND/OR."),
+            Some("zones"),
+        ));
     } else {
         let rows: Vec<Value> = rules.iter().map(rule_table_row_value).collect();
-        if let Ok(mut g) = PENDING_RULE_ROWS.lock() { *g = Some(Value::Array(rows)); }
+        if let Ok(mut g) = PENDING_RULE_ROWS.lock() {
+            *g = Some(Value::Array(rows));
+        }
         children.push(build_rules_table());
     }
     card(None, children)
@@ -9995,15 +12920,44 @@ fn build_rules_card(camera_id: &str, form_visible: bool) -> Component {
 /// Decodes a rule row's JSON config (`{expr, action, enabled}`) for display.
 fn rule_table_row_value(r: &db::ZoneRow) -> Value {
     let cfg: JsonValue = serde_json::from_str(&r.polygon).unwrap_or(JsonValue::Null);
-    let expr = cfg.get("expr").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let action = cfg.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let expr = cfg
+        .get("expr")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let action = cfg
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let enabled = cfg.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
     Value::Map(vec![
         (Value::Text("rule_id".into()), Value::Text(r.id.clone())),
         (Value::Text("name".into()), Value::Text(r.name.clone())),
-        (Value::Text("expr".into()), Value::Text(if expr.is_empty() { "\u{2014}".into() } else { expr })),
-        (Value::Text("action".into()), Value::Text(if action.is_empty() { "\u{2014}".into() } else { action })),
-        (Value::Text("enabled".into()), if enabled { chip_cell("aktywna", "ok") } else { chip_cell("wyłączona", "muted") }),
+        (
+            Value::Text("expr".into()),
+            Value::Text(if expr.is_empty() {
+                "\u{2014}".into()
+            } else {
+                expr
+            }),
+        ),
+        (
+            Value::Text("action".into()),
+            Value::Text(if action.is_empty() {
+                "\u{2014}".into()
+            } else {
+                action
+            }),
+        ),
+        (
+            Value::Text("enabled".into()),
+            if enabled {
+                chip_cell("aktywna", "ok")
+            } else {
+                chip_cell("wyłączona", "muted")
+            },
+        ),
     ])
 }
 
@@ -10034,15 +12988,24 @@ fn build_rules_table() -> Component {
         virtualize: false,
         row_expandable: false,
         expanded_row_template_id: None,
-    }.into_component(next_id()).expect("Table")
+    }
+    .into_component(next_id())
+    .expect("Table")
 }
 
 fn build_rule_form() -> Component {
-    let fields = card(Some("Nowa reguła"), vec![
-        rule_input("Nazwa", "np. Bagaż + pusta strefa", "rule_name"),
-        rule_input("Wyrażenie", "D3.luggage(unowned>90s) AND zone.peron AND not zone.lawka", "rule_expr"),
-        rule_input("Akcja", "np. Alarm krytyczny + SMS", "rule_action"),
-    ]);
+    let fields = card(
+        Some("Nowa reguła"),
+        vec![
+            rule_input("Nazwa", "np. Bagaż + pusta strefa", "rule_name"),
+            rule_input(
+                "Wyrażenie",
+                "D3.luggage(unowned>90s) AND zone.peron AND not zone.lawka",
+                "rule_expr",
+            ),
+            rule_input("Akcja", "np. Alarm krytyczny + SMS", "rule_action"),
+        ],
+    );
     let actions = stack_h(vec![
         button("Zapisz regułę", "rule-add-submit", "primary"),
         button("Anuluj", "rule-form-cancel", "ghost"),
@@ -10056,7 +13019,12 @@ fn rule_input(label: &str, placeholder: &str, field: &str) -> Component {
     params.0.push(("field".into(), Value::Text(field.into())));
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Input,
-        Handler::Backend { action_id: "rule-field-change".into(), params, optimistic: None, on_failure: FailurePolicy::Toast },
+        Handler::Backend {
+            action_id: "rule-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
     )]));
     comp
 }
@@ -10066,10 +13034,14 @@ fn rule_input(label: &str, placeholder: &str, field: &str) -> Component {
 fn zones_overlay() -> Vec<StateEntry> {
     with_state(|s| {
         let z = &s.zones;
-        let key = |k: &str, v: Value| StateEntry { path: StatePath::new(vec![PathSegment::Key(k.into())]), value: v };
-        let mut entries = vec![
-            key("zone_camera_select", Value::Text(z.selected_camera_id.clone().unwrap_or_default())),
-        ];
+        let key = |k: &str, v: Value| StateEntry {
+            path: StatePath::new(vec![PathSegment::Key(k.into())]),
+            value: v,
+        };
+        let mut entries = vec![key(
+            "zone_camera_select",
+            Value::Text(z.selected_camera_id.clone().unwrap_or_default()),
+        )];
         if z.zone_form_visible {
             entries.push(key("zone_name", Value::Text(z.form_name.clone())));
             entries.push(key("zone_kind", Value::Text(z.form_kind.clone())));
@@ -10094,7 +13066,10 @@ fn zone_audit_json(z: &db::ZoneRow) -> String {
 
 fn handle_zone_field_change(params: &JsonValue) -> JsonValue {
     let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("");
-    let value = params.get("value").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let value = params
+        .get("value")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     if let Some(v) = value {
         with_state(|s| match field {
             "zone_name" => s.zones.form_name = v,
@@ -10110,82 +13085,179 @@ fn handle_zone_field_change(params: &JsonValue) -> JsonValue {
 /// `[x, y]` numeric pairs; line needs ≥2, include/exclude need ≥3), persists it
 /// and writes a `zone_change` audit entry.
 fn handle_zone_add_submit() -> JsonValue {
-    let (camera_id, name, kind, polygon) = with_state(|s| (
-        s.zones.selected_camera_id.clone(),
-        s.zones.form_name.trim().to_string(),
-        s.zones.form_kind.trim().to_string(),
-        s.zones.form_polygon.trim().to_string(),
-    ));
+    let (camera_id, name, kind, polygon) = with_state(|s| {
+        (
+            s.zones.selected_camera_id.clone(),
+            s.zones.form_name.trim().to_string(),
+            s.zones.form_kind.trim().to_string(),
+            s.zones.form_polygon.trim().to_string(),
+        )
+    });
     with_state(|s| s.clear_messages());
 
     let camera_id = match camera_id {
         Some(c) => c,
-        None => { with_state(|s| s.error_message = Some("Najpierw wybierz kamerę.".into())); render_panel("zones"); return json!({"ok":false}); }
+        None => {
+            with_state(|s| s.error_message = Some("Najpierw wybierz kamerę.".into()));
+            render_panel("zones");
+            return json!({"ok":false});
+        }
     };
     if name.is_empty() || name.chars().count() > 80 {
         with_state(|s| s.error_message = Some("Nazwa strefy musi mieć 1–80 znaków.".into()));
         render_panel("zones");
         return json!({"ok":false,"error":"invalid name"});
     }
-    let kind = if matches!(kind.as_str(), "include" | "exclude" | "line") { kind } else { "include".into() };
-    let pts = match serde_json::from_str::<JsonValue>(&polygon).ok().and_then(|v| v.as_array().cloned()) {
-        Some(a) => a,
-        None => { with_state(|s| s.error_message = Some("Wielokąt musi być tablicą JSON par [x,y].".into())); render_panel("zones"); return json!({"ok":false,"error":"invalid polygon"}); }
+    let kind = if matches!(kind.as_str(), "include" | "exclude" | "line") {
+        kind
+    } else {
+        "include".into()
     };
-    let valid_pts = pts.iter().all(|p| p.as_array().map(|c| c.len() == 2 && c.iter().all(|n| n.is_number())).unwrap_or(false));
+    let pts = match serde_json::from_str::<JsonValue>(&polygon)
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+    {
+        Some(a) => a,
+        None => {
+            with_state(|s| {
+                s.error_message = Some("Wielokąt musi być tablicą JSON par [x,y].".into())
+            });
+            render_panel("zones");
+            return json!({"ok":false,"error":"invalid polygon"});
+        }
+    };
+    let valid_pts = pts.iter().all(|p| {
+        p.as_array()
+            .map(|c| c.len() == 2 && c.iter().all(|n| n.is_number()))
+            .unwrap_or(false)
+    });
     let min_pts = if kind == "line" { 2 } else { 3 };
     if !valid_pts || pts.len() < min_pts {
-        with_state(|s| s.error_message = Some(alloc::format!("Wielokąt wymaga co najmniej {} prawidłowych punktów [x,y].", min_pts)));
+        with_state(|s| {
+            s.error_message = Some(alloc::format!(
+                "Wielokąt wymaga co najmniej {} prawidłowych punktów [x,y].",
+                min_pts
+            ))
+        });
         render_panel("zones");
         return json!({"ok":false,"error":"too few points"});
     }
-    let polygon_canon = serde_json::to_string(&JsonValue::Array(pts)).unwrap_or_else(|_| "[]".into());
+    let polygon_canon =
+        serde_json::to_string(&JsonValue::Array(pts)).unwrap_or_else(|_| "[]".into());
 
-    let new_zone = db::NewZone { camera_id: camera_id.clone(), name: name.clone(), kind: kind.clone(), polygon: polygon_canon.clone() };
+    let new_zone = db::NewZone {
+        camera_id: camera_id.clone(),
+        name: name.clone(),
+        kind: kind.clone(),
+        polygon: polygon_canon.clone(),
+    };
     match db::insert_zone(&new_zone) {
         Ok(id) => {
-            let after = db::get_zone(&id).ok().flatten().map(|z| zone_audit_json(&z)).unwrap_or_else(|| "null".into());
+            let after = db::get_zone(&id)
+                .ok()
+                .flatten()
+                .map(|z| zone_audit_json(&z))
+                .unwrap_or_else(|| "null".into());
             let _ = db::insert_audit(ZONE_ACTOR, "zone_change", &id, "null", &after);
-            with_state(|s| { s.zones.zone_form_visible = false; s.success_message = Some(alloc::format!("Strefa zapisana ({}).", id)); });
+            with_state(|s| {
+                s.zones.zone_form_visible = false;
+                s.success_message = Some(alloc::format!("Strefa zapisana ({}).", id));
+            });
             render_panel("zones");
             json!({"ok":true,"zone_id":id})
         }
-        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu strefy: {}", abi_message(e)))); render_panel("zones"); json!({"ok":false}) }
+        Err(e) => {
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd zapisu strefy: {}", abi_message(e)))
+            });
+            render_panel("zones");
+            json!({"ok":false})
+        }
     }
 }
 
 fn handle_zone_remove(params: &JsonValue) -> JsonValue {
-    let id = params.get("zone_id").and_then(|v| v.as_str()).or_else(|| params.get("row_id").and_then(|v| v.as_str())).unwrap_or("").trim().to_string();
+    let id = params
+        .get("zone_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| params.get("row_id").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
     with_state(|s| s.clear_messages());
-    if id.is_empty() { return json!({"ok":false,"error":"empty zone_id"}); }
-    let before = db::get_zone(&id).ok().flatten().map(|z| zone_audit_json(&z)).unwrap_or_else(|| "null".into());
+    if id.is_empty() {
+        return json!({"ok":false,"error":"empty zone_id"});
+    }
+    let before = db::get_zone(&id)
+        .ok()
+        .flatten()
+        .map(|z| zone_audit_json(&z))
+        .unwrap_or_else(|| "null".into());
     match db::delete_zone(&id) {
         Ok(_) => {
             let _ = db::insert_audit(ZONE_ACTOR, "zone_change", &id, &before, "null");
-            with_state(|s| { s.zones.zone_pending_remove = None; s.success_message = Some("Strefa usunięta.".into()); });
+            with_state(|s| {
+                s.zones.zone_pending_remove = None;
+                s.success_message = Some("Strefa usunięta.".into());
+            });
             render_panel("zones");
             json!({"ok":true})
         }
-        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e)))); render_panel("zones"); json!({"ok":false}) }
+        Err(e) => {
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e)))
+            });
+            render_panel("zones");
+            json!({"ok":false})
+        }
     }
 }
 
 /// Cycles one schedule cell off → day → night → off and persists the whole grid.
 fn handle_schedule_cell_toggle(params: &JsonValue) -> JsonValue {
-    let parse_idx = |k: &str| params.get(k).and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))).unwrap_or(-1);
+    let parse_idx = |k: &str| {
+        params
+            .get(k)
+            .and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+            })
+            .unwrap_or(-1)
+    };
     let band = parse_idx("band");
     let day = parse_idx("day");
-    let camera_id = match with_state(|s| s.zones.selected_camera_id.clone()) { Some(c) => c, None => return json!({"ok":false}) };
-    if band < 0 || day < 0 || band as usize >= SCHEDULE_BANDS.len() || day as usize >= SCHEDULE_DAYS.len() {
+    let camera_id = match with_state(|s| s.zones.selected_camera_id.clone()) {
+        Some(c) => c,
+        None => return json!({"ok":false}),
+    };
+    if band < 0
+        || day < 0
+        || band as usize >= SCHEDULE_BANDS.len()
+        || day as usize >= SCHEDULE_DAYS.len()
+    {
         return json!({"ok":false,"error":"out of range"});
     }
     let mut grid = parse_schedule(db::get_schedule(&camera_id).ok().flatten().as_deref());
     let cell = &mut grid[band as usize][day as usize];
-    *cell = match cell.as_str() { "" => "day".into(), "day" => "night".into(), _ => String::new() };
-    let json_grid: Vec<JsonValue> = grid.iter().map(|row| JsonValue::Array(row.iter().map(|c| JsonValue::String(c.clone())).collect())).collect();
-    let grid_str = serde_json::to_string(&JsonValue::Array(json_grid)).unwrap_or_else(|_| "[]".into());
+    *cell = match cell.as_str() {
+        "" => "day".into(),
+        "day" => "night".into(),
+        _ => String::new(),
+    };
+    let json_grid: Vec<JsonValue> = grid
+        .iter()
+        .map(|row| JsonValue::Array(row.iter().map(|c| JsonValue::String(c.clone())).collect()))
+        .collect();
+    let grid_str =
+        serde_json::to_string(&JsonValue::Array(json_grid)).unwrap_or_else(|_| "[]".into());
     if db::set_schedule(&camera_id, &grid_str).is_ok() {
-        let _ = db::insert_audit(ZONE_ACTOR, "zone_change", &alloc::format!("schedule:{}", camera_id), "", &grid_str);
+        let _ = db::insert_audit(
+            ZONE_ACTOR,
+            "zone_change",
+            &alloc::format!("schedule:{}", camera_id),
+            "",
+            &grid_str,
+        );
     }
     render_panel("zones");
     json!({"ok":true})
@@ -10193,7 +13265,10 @@ fn handle_schedule_cell_toggle(params: &JsonValue) -> JsonValue {
 
 fn handle_rule_field_change(params: &JsonValue) -> JsonValue {
     let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("");
-    let value = params.get("value").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let value = params
+        .get("value")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     if let Some(v) = value {
         with_state(|s| match field {
             "rule_name" => s.zones.rule_name = v,
@@ -10206,14 +13281,23 @@ fn handle_rule_field_change(params: &JsonValue) -> JsonValue {
 }
 
 fn handle_rule_add_submit() -> JsonValue {
-    let (camera_id, name, expr, action) = with_state(|s| (
-        s.zones.selected_camera_id.clone(),
-        s.zones.rule_name.trim().to_string(),
-        s.zones.rule_expr.trim().to_string(),
-        s.zones.rule_action.trim().to_string(),
-    ));
+    let (camera_id, name, expr, action) = with_state(|s| {
+        (
+            s.zones.selected_camera_id.clone(),
+            s.zones.rule_name.trim().to_string(),
+            s.zones.rule_expr.trim().to_string(),
+            s.zones.rule_action.trim().to_string(),
+        )
+    });
     with_state(|s| s.clear_messages());
-    let camera_id = match camera_id { Some(c) => c, None => { with_state(|s| s.error_message = Some("Najpierw wybierz kamerę.".into())); render_panel("zones"); return json!({"ok":false}); } };
+    let camera_id = match camera_id {
+        Some(c) => c,
+        None => {
+            with_state(|s| s.error_message = Some("Najpierw wybierz kamerę.".into()));
+            render_panel("zones");
+            return json!({"ok":false});
+        }
+    };
     if name.is_empty() || expr.is_empty() {
         with_state(|s| s.error_message = Some("Reguła wymaga nazwy i wyrażenia.".into()));
         render_panel("zones");
@@ -10223,19 +13307,40 @@ fn handle_rule_add_submit() -> JsonValue {
     match db::insert_rule(&camera_id, &name, &cfg) {
         Ok(id) => {
             let _ = db::insert_audit(ZONE_ACTOR, "zone_change", &id, "null", &cfg);
-            with_state(|s| { s.zones.rule_form_visible = false; s.success_message = Some("Reguła zapisana.".into()); });
+            with_state(|s| {
+                s.zones.rule_form_visible = false;
+                s.success_message = Some("Reguła zapisana.".into());
+            });
             render_panel("zones");
             json!({"ok":true,"rule_id":id})
         }
-        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu reguły: {}", abi_message(e)))); render_panel("zones"); json!({"ok":false}) }
+        Err(e) => {
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd zapisu reguły: {}", abi_message(e)))
+            });
+            render_panel("zones");
+            json!({"ok":false})
+        }
     }
 }
 
 fn handle_rule_remove(params: &JsonValue) -> JsonValue {
-    let id = params.get("row_id").and_then(|v| v.as_str()).or_else(|| params.get("rule_id").and_then(|v| v.as_str())).unwrap_or("").trim().to_string();
+    let id = params
+        .get("row_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| params.get("rule_id").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
     with_state(|s| s.clear_messages());
-    if id.is_empty() { return json!({"ok":false,"error":"empty rule_id"}); }
-    let before = db::get_zone(&id).ok().flatten().map(|z| z.polygon).unwrap_or_else(|| "null".into());
+    if id.is_empty() {
+        return json!({"ok":false,"error":"empty rule_id"});
+    }
+    let before = db::get_zone(&id)
+        .ok()
+        .flatten()
+        .map(|z| z.polygon)
+        .unwrap_or_else(|| "null".into());
     match db::delete_zone(&id) {
         Ok(_) => {
             let _ = db::insert_audit(ZONE_ACTOR, "zone_change", &id, &before, "null");
@@ -10243,7 +13348,13 @@ fn handle_rule_remove(params: &JsonValue) -> JsonValue {
             render_panel("zones");
             json!({"ok":true})
         }
-        Err(e) => { with_state(|s| s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e)))); render_panel("zones"); json!({"ok":false}) }
+        Err(e) => {
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd usuwania: {}", abi_message(e)))
+            });
+            render_panel("zones");
+            json!({"ok":false})
+        }
     }
 }
 
@@ -10269,11 +13380,13 @@ fn retention_days(class: &str, default: i64) -> i64 {
 
 fn build_audit_content() -> Component {
     let messages = build_messages_section();
-    let (query, expanded_id, editing) = with_state(|s| (
-        s.audit.query.clone(),
-        s.audit.expanded_id.clone(),
-        s.audit.retention_editing.clone(),
-    ));
+    let (query, expanded_id, editing) = with_state(|s| {
+        (
+            s.audit.query.clone(),
+            s.audit.expanded_id.clone(),
+            s.audit.retention_editing.clone(),
+        )
+    });
 
     // Header: title + live chain-integrity chip computed from real rows.
     let chain = db::verify_audit_chain();
@@ -10281,25 +13394,43 @@ fn build_audit_content() -> Component {
     let chain_chip = match &chain {
         Ok(c) if c.ok => chip_toned_icon("Łańcuch zweryfikowany", "success", "check"),
         Ok(c) => chip_toned_icon(
-            &alloc::format!("Łańcuch uszkodzony (#{} )", c.first_broken_index.map(|i| i + 1).unwrap_or(0)),
-            "critical", "alert",
+            &alloc::format!(
+                "Łańcuch uszkodzony (#{} )",
+                c.first_broken_index.map(|i| i + 1).unwrap_or(0)
+            ),
+            "critical",
+            "alert",
         ),
         Err(_) => chip_toned_icon("Weryfikacja niedostępna", "warning", "alert"),
     };
     let header = stack_h(vec![
         heading(2, "Audyt i RODO"),
-        chip_toned(&alloc::format!("{} wpisów", total), if total > 0 { "info" } else { "muted" }),
+        chip_toned(
+            &alloc::format!("{} wpisów", total),
+            if total > 0 { "info" } else { "muted" },
+        ),
         chain_chip,
     ]);
 
     // Retention-per-risk-class cards (real values from settings, with an inline
     // edit affordance that persists via db::set_setting).
-    let retention_cards: Vec<Component> = RETENTION_DEFAULTS.iter()
-        .map(|(class, label, default)| build_retention_card(class, label, retention_days(class, *default), editing.as_deref() == Some(*class)))
+    let retention_cards: Vec<Component> = RETENTION_DEFAULTS
+        .iter()
+        .map(|(class, label, default)| {
+            build_retention_card(
+                class,
+                label,
+                retention_days(class, *default),
+                editing.as_deref() == Some(*class),
+            )
+        })
         .collect();
     let mut retention_children = vec![heading(3, "Retencja per klasa ryzyka")];
     retention_children.push(grid(3, retention_cards));
-    retention_children.push(text_styled("Minimalna retencja logu audytu wymagana przez RODO/AI Act to 183 dni.", "caption"));
+    retention_children.push(text_styled(
+        "Minimalna retencja logu audytu wymagana przez RODO/AI Act to 183 dni.",
+        "caption",
+    ));
     let retention_section = card(None, retention_children);
 
     // Hash-chain log — real rows, newest first, with optional substring filter.
@@ -10311,7 +13442,8 @@ fn build_audit_content() -> Component {
             Some("shield"),
         )
     } else {
-        let rows: Vec<Component> = entries.iter()
+        let rows: Vec<Component> = entries
+            .iter()
             .map(|e| build_audit_row(e, expanded_id.as_deref() == Some(e.id.as_str())))
             .collect();
         stack_v_gap("xs", rows)
@@ -10319,7 +13451,11 @@ fn build_audit_content() -> Component {
     let mut log_children = vec![stack_h(vec![
         heading(3, "Hash-chain audit log (WORM)"),
         audit_search_input(),
-        if query.is_empty() { divider() } else { button("Wyczyść filtry", "audit-clear-filters", "ghost") },
+        if query.is_empty() {
+            divider()
+        } else {
+            button("Wyczyść filtry", "audit-clear-filters", "ghost")
+        },
     ])];
     log_children.push(log_body);
     log_children.push(text_styled(
@@ -10329,44 +13465,84 @@ fn build_audit_content() -> Component {
     let log_section = card(None, log_children);
 
     // Document generator (placeholders — render per mockup, no backend yet).
-    let doc_section = card(None, vec![
-        heading(3, "Generator dokumentów"),
-        grid(3, vec![
-            build_doc_card("DPIA", "Data Protection Impact Assessment", "Szablon RODO art. 35 — deployment, detektory, retencja.", "dpia"),
-            build_doc_card("FRIA", "Fundamental Rights Impact Assessment", "Szablon AI Act art. 27 — wymagany dla klasy C (high-risk).", "fria"),
-            build_doc_card("Klauzula informacyjna", "Tabliczka monitoring + AI", "PDF zgodny z wytycznymi UODO · PL/EN/UA.", "signage"),
-        ]),
-    ]);
+    let doc_section = card(
+        None,
+        vec![
+            heading(3, "Generator dokumentów"),
+            grid(
+                3,
+                vec![
+                    build_doc_card(
+                        "DPIA",
+                        "Data Protection Impact Assessment",
+                        "Szablon RODO art. 35 — deployment, detektory, retencja.",
+                        "dpia",
+                    ),
+                    build_doc_card(
+                        "FRIA",
+                        "Fundamental Rights Impact Assessment",
+                        "Szablon AI Act art. 27 — wymagany dla klasy C (high-risk).",
+                        "fria",
+                    ),
+                    build_doc_card(
+                        "Klauzula informacyjna",
+                        "Tabliczka monitoring + AI",
+                        "PDF zgodny z wytycznymi UODO · PL/EN/UA.",
+                        "signage",
+                    ),
+                ],
+            ),
+        ],
+    );
 
-    stack_v(vec![messages, header, retention_section, log_section, doc_section])
+    stack_v(vec![
+        messages,
+        header,
+        retention_section,
+        log_section,
+        doc_section,
+    ])
 }
 
 /// One retention card: class badge, label, day count, and either an "Edytuj"
 /// button or (when in edit mode) a bound number input + Zapisz/Anuluj.
 fn build_retention_card(class: &str, label: &str, days: i64, editing: bool) -> Component {
-    let tone = match class { "A" => "success", "B" => "warning", "C" => "critical", _ => "info" };
-    let head = stack_h_gap("xs", vec![
-        chip_toned(class, tone),
-        text_styled(label, "overline"),
-    ]);
+    let tone = match class {
+        "A" => "success",
+        "B" => "warning",
+        "C" => "critical",
+        _ => "info",
+    };
+    let head = stack_h_gap(
+        "xs",
+        vec![chip_toned(class, tone), text_styled(label, "overline")],
+    );
     let body: Component = if editing {
         let mut params = CborMap::default();
         params.0.push(("class".into(), Value::Text(class.into())));
         let save = button_with_params("Zapisz", "audit-retention-save", "primary", params);
         let mut cancel_params = CborMap::default();
-        cancel_params.0.push(("class".into(), Value::Text(class.into())));
+        cancel_params
+            .0
+            .push(("class".into(), Value::Text(class.into())));
         let cancel = button_with_params("Anuluj", "audit-retention-cancel", "ghost", cancel_params);
-        stack_v_gap("xs", vec![
-            retention_input(class),
-            stack_h_gap("xs", vec![save, cancel]),
-        ])
+        stack_v_gap(
+            "xs",
+            vec![
+                retention_input(class),
+                stack_h_gap("xs", vec![save, cancel]),
+            ],
+        )
     } else {
         let mut params = CborMap::default();
         params.0.push(("class".into(), Value::Text(class.into())));
-        stack_v_gap("xs", vec![
-            heading(2, &alloc::format!("{} dni", days)),
-            button_with_params("Edytuj", "audit-retention-edit", "ghost", params),
-        ])
+        stack_v_gap(
+            "xs",
+            vec![
+                heading(2, &alloc::format!("{} dni", days)),
+                button_with_params("Edytuj", "audit-retention-edit", "ghost", params),
+            ],
+        )
     };
     card(None, vec![head, body])
 }
@@ -10397,7 +13573,9 @@ fn retention_input(class: &str) -> Component {
         error: None,
         size: InputSize::Md,
         variant: None,
-    }.into_component(&key).expect("Input");
+    }
+    .into_component(&key)
+    .expect("Input");
     let mut params = CborMap::default();
     params.0.push(("class".into(), Value::Text(class.into())));
     comp.handlers = Some(HandlerMap(vec![(
@@ -10418,21 +13596,33 @@ fn retention_input(class: &str) -> Component {
 fn build_audit_row(e: &db::AuditRow, expanded: bool) -> Component {
     let action_chip = chip_toned(&e.action, audit_action_tone(&e.action));
     let mut expand_params = CborMap::default();
-    expand_params.0.push(("id".into(), Value::Text(e.id.clone())));
+    expand_params
+        .0
+        .push(("id".into(), Value::Text(e.id.clone())));
     let toggle = button_with_params(
         if expanded { "Zwiń" } else { "Szczegóły" },
         "audit-row-expand",
         "ghost",
         expand_params,
     );
-    let head = stack_h_gap("xs", vec![
-        text_styled(&format_alarm_datetime(e.ts), "mono"),
-        text_styled(if e.actor.is_empty() { "system" } else { &e.actor }, "body_strong"),
-        action_chip,
-        text_styled(&audit_target_label(e), "caption"),
-        text_styled(&truncate_hash(&e.hash), "mono"),
-        toggle,
-    ]);
+    let head = stack_h_gap(
+        "xs",
+        vec![
+            text_styled(&format_alarm_datetime(e.ts), "mono"),
+            text_styled(
+                if e.actor.is_empty() {
+                    "system"
+                } else {
+                    &e.actor
+                },
+                "body_strong",
+            ),
+            action_chip,
+            text_styled(&audit_target_label(e), "caption"),
+            text_styled(&truncate_hash(&e.hash), "mono"),
+            toggle,
+        ],
+    );
 
     let mut children = vec![head];
     if expanded {
@@ -10440,16 +13630,37 @@ fn build_audit_row(e: &db::AuditRow, expanded: bool) -> Component {
         children.push(key_value(vec![
             ("Cel", e.target.as_str()),
             ("Hash", e.hash.as_str()),
-            ("Poprzedni hash", if e.prev_hash.is_empty() { "(genesis)" } else { e.prev_hash.as_str() }),
+            (
+                "Poprzedni hash",
+                if e.prev_hash.is_empty() {
+                    "(genesis)"
+                } else {
+                    e.prev_hash.as_str()
+                },
+            ),
         ]));
         children.push(text_styled("Przed:", "overline"));
-        children.push(text_styled(if e.before.is_empty() { "—" } else { &e.before }, "code"));
+        children.push(text_styled(
+            if e.before.is_empty() {
+                "—"
+            } else {
+                &e.before
+            },
+            "code",
+        ));
         children.push(text_styled("Po:", "overline"));
-        children.push(text_styled(if e.after.is_empty() { "—" } else { &e.after }, "code"));
+        children.push(text_styled(
+            if e.after.is_empty() { "—" } else { &e.after },
+            "code",
+        ));
     }
 
     Card {
-        variant: if expanded { CardVariant::Filled } else { CardVariant::Outlined },
+        variant: if expanded {
+            CardVariant::Filled
+        } else {
+            CardVariant::Outlined
+        },
         padding: Spacing::Sm,
         gap: Spacing::Sm,
         radius: RadiusToken::Md,
@@ -10461,7 +13672,9 @@ fn build_audit_row(e: &db::AuditRow, expanded: bool) -> Component {
         interactive: false,
         clickable: false,
         style: None,
-    }.into_component(next_id()).expect("Card")
+    }
+    .into_component(next_id())
+    .expect("Card")
 }
 
 /// Action → chip tone. Decisions/grants are highlighted; purges/denials are red.
@@ -10520,7 +13733,9 @@ fn audit_search_input() -> Component {
         error: None,
         size: InputSize::Md,
         variant: None,
-    }.into_component("audit_search").expect("Input");
+    }
+    .into_component("audit_search")
+    .expect("Input");
     let mut params = CborMap::default();
     params.0.push(("id".into(), Value::Text("query".into())));
     comp.handlers = Some(HandlerMap(vec![(
@@ -10540,11 +13755,20 @@ fn audit_search_input() -> Component {
 fn build_doc_card(title: &str, subtitle: &str, desc: &str, kind: &str) -> Component {
     let mut params = CborMap::default();
     params.0.push(("kind".into(), Value::Text(kind.into())));
-    card(None, vec![
-        stack_h_gap("xs", vec![chip_toned_icon(title, "info", "shield"), text_styled(subtitle, "body_strong")]),
-        text_styled(desc, "caption"),
-        button_with_params("Generuj", "audit-doc-generate", "primary", params),
-    ])
+    card(
+        None,
+        vec![
+            stack_h_gap(
+                "xs",
+                vec![
+                    chip_toned_icon(title, "info", "shield"),
+                    text_styled(subtitle, "body_strong"),
+                ],
+            ),
+            text_styled(desc, "caption"),
+            button_with_params("Generuj", "audit-doc-generate", "primary", params),
+        ],
+    )
 }
 
 /// Actor attributed to evidence-export changes. No host identity fn exists in
@@ -10567,18 +13791,31 @@ struct EvidenceRecipient {
 /// Reads + decodes the persisted recipients list. A malformed/empty value yields
 /// an empty list rather than an error so the panel still renders.
 fn load_evidence_recipients() -> Vec<EvidenceRecipient> {
-    let raw = db::get_setting(EVIDENCE_RECIPIENTS_KEY).ok().flatten().unwrap_or_default();
+    let raw = db::get_setting(EVIDENCE_RECIPIENTS_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let parsed: JsonValue = serde_json::from_str(&raw).unwrap_or(JsonValue::Null);
     parsed
         .as_array()
         .map(|arr| {
             arr.iter()
                 .filter_map(|v| {
-                    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+                    let name = v
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
                     if name.is_empty() {
                         return None;
                     }
-                    let key = v.get("key").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+                    let key = v
+                        .get("key")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
                     Some(EvidenceRecipient { name, key })
                 })
                 .collect()
@@ -10609,20 +13846,41 @@ fn evidence_status_cell(signed_by: &str) -> Value {
 /// Maps an evidence package row to the bound Table row map.
 fn evidence_table_row_value(e: &db::EvidenceRow) -> Value {
     let incident = if e.alarm_message.trim().is_empty() {
-        if e.alarm_id.trim().is_empty() { "—".to_string() } else { short_id(&e.alarm_id) }
+        if e.alarm_id.trim().is_empty() {
+            "—".to_string()
+        } else {
+            short_id(&e.alarm_id)
+        }
     } else {
         e.alarm_message.clone()
     };
-    let camera = if e.camera_name.trim().is_empty() { "—".to_string() } else { e.camera_name.clone() };
-    let recipient = if e.signed_by.trim().is_empty() { "—".to_string() } else { e.signed_by.clone() };
+    let camera = if e.camera_name.trim().is_empty() {
+        "—".to_string()
+    } else {
+        e.camera_name.clone()
+    };
+    let recipient = if e.signed_by.trim().is_empty() {
+        "—".to_string()
+    } else {
+        e.signed_by.clone()
+    };
     let entries: Vec<(Value, Value)> = vec![
         (Value::Text("evidence_id".into()), Value::Text(e.id.clone())),
-        (Value::Text("package_ref".into()), Value::Text(e.package_ref.clone())),
+        (
+            Value::Text("package_ref".into()),
+            Value::Text(e.package_ref.clone()),
+        ),
         (Value::Text("incident".into()), Value::Text(incident)),
         (Value::Text("camera".into()), Value::Text(camera)),
-        (Value::Text("status".into()), evidence_status_cell(&e.signed_by)),
+        (
+            Value::Text("status".into()),
+            evidence_status_cell(&e.signed_by),
+        ),
         (Value::Text("recipient".into()), Value::Text(recipient)),
-        (Value::Text("created".into()), Value::Text(format_alarm_datetime(e.created_at))),
+        (
+            Value::Text("created".into()),
+            Value::Text(format_alarm_datetime(e.created_at)),
+        ),
     ];
     Value::Map(entries)
 }
@@ -10675,7 +13933,9 @@ fn build_evidence_table() -> Component {
         virtualize: false,
         row_expandable: false,
         expanded_row_template_id: None,
-    }.into_component(next_id()).expect("Table")
+    }
+    .into_component(next_id())
+    .expect("Table")
 }
 
 /// The authorized-recipients Table — rows seeded via PENDING_RECIPIENT_ROWS,
@@ -10706,14 +13966,23 @@ fn build_recipients_table() -> Component {
         virtualize: false,
         row_expandable: false,
         expanded_row_template_id: None,
-    }.into_component(next_id()).expect("Table")
+    }
+    .into_component(next_id())
+    .expect("Table")
 }
 
 /// Maps a recipient to the bound recipients-Table row map.
 fn recipient_table_row_value(r: &EvidenceRecipient) -> Value {
-    let key = if r.key.trim().is_empty() { "—".to_string() } else { r.key.clone() };
+    let key = if r.key.trim().is_empty() {
+        "—".to_string()
+    } else {
+        r.key.clone()
+    };
     let entries: Vec<(Value, Value)> = vec![
-        (Value::Text("recipient_name".into()), Value::Text(r.name.clone())),
+        (
+            Value::Text("recipient_name".into()),
+            Value::Text(r.name.clone()),
+        ),
         (Value::Text("name".into()), Value::Text(r.name.clone())),
         (Value::Text("key".into()), Value::Text(key)),
         (Value::Text("active".into()), chip_cell("aktywny", "ok")),
@@ -10728,7 +13997,12 @@ fn evidence_input(label: &str, placeholder: &str, field: &str) -> Component {
     params.0.push(("field".into(), Value::Text(field.into())));
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Input,
-        Handler::Backend { action_id: "evidence-recipient-field-change".into(), params, optimistic: None, on_failure: FailurePolicy::Toast },
+        Handler::Backend {
+            action_id: "evidence-recipient-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
     )]));
     comp
 }
@@ -10740,45 +14014,69 @@ fn evidence_select(label: &str, options: Vec<SelectOption>, field: &str) -> Comp
     params.0.push(("field".into(), Value::Text(field.into())));
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Change,
-        Handler::Backend { action_id: "evidence-field-change".into(), params, optimistic: None, on_failure: FailurePolicy::Toast },
+        Handler::Backend {
+            action_id: "evidence-field-change".into(),
+            params,
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
     )]));
     comp
 }
 
 /// The create-evidence-package form: pick a real source alarm + an authorized
 /// recipient, then create a persisted evidence record referencing the alarm.
-fn build_evidence_package_form(alarms: &[db::AlarmRow], recipients: &[EvidenceRecipient]) -> Component {
+fn build_evidence_package_form(
+    alarms: &[db::AlarmRow],
+    recipients: &[EvidenceRecipient],
+) -> Component {
     // Alarm options from the real alarm center — empty option first so the
     // operator must consciously pick a source incident.
     let mut alarm_opts: Vec<SelectOption> = vec![SelectOption {
         value: SelectValue::Text("".into()),
         label: lit("— wybierz alarm źródłowy —"),
-        icon: None, disabled: false, group_id: None, description: None,
+        icon: None,
+        disabled: false,
+        group_id: None,
+        description: None,
     }];
     for a in alarms {
         let label = if a.message.trim().is_empty() {
             alloc::format!("{} · {}", short_id(&a.id), a.severity)
         } else {
-            let cam = if a.camera_name.trim().is_empty() { String::new() } else { alloc::format!(" ({})", a.camera_name) };
+            let cam = if a.camera_name.trim().is_empty() {
+                String::new()
+            } else {
+                alloc::format!(" ({})", a.camera_name)
+            };
             alloc::format!("{}{} · {}", a.message, cam, format_alarm_datetime(a.ts))
         };
         alarm_opts.push(SelectOption {
             value: SelectValue::Text(a.id.clone()),
             label: lit(&label),
-            icon: None, disabled: false, group_id: None, description: None,
+            icon: None,
+            disabled: false,
+            group_id: None,
+            description: None,
         });
     }
 
     let mut recipient_opts: Vec<SelectOption> = vec![SelectOption {
         value: SelectValue::Text("".into()),
         label: lit("— odbiorca (opcjonalnie) —"),
-        icon: None, disabled: false, group_id: None, description: None,
+        icon: None,
+        disabled: false,
+        group_id: None,
+        description: None,
     }];
     for r in recipients {
         recipient_opts.push(SelectOption {
             value: SelectValue::Text(r.name.clone()),
             label: lit(&r.name),
-            icon: None, disabled: false, group_id: None, description: None,
+            icon: None,
+            disabled: false,
+            group_id: None,
+            description: None,
         });
     }
 
@@ -10803,10 +14101,21 @@ fn build_evidence_package_form(alarms: &[db::AlarmRow], recipients: &[EvidenceRe
 /// The add-recipient form: a display name + optional public-key fingerprint,
 /// persisted into the recipients settings list.
 fn build_recipient_form() -> Component {
-    let fields = card(Some("Nowy uprawniony odbiorca"), vec![
-        evidence_input("Organ", "np. Prokuratura Rejonowa Warszawa-Mokotów", "evidence_recipient_name"),
-        evidence_input("Klucz publiczny (opcjonalnie)", "np. PGP 4F2A...8E91", "evidence_recipient_key"),
-    ]);
+    let fields = card(
+        Some("Nowy uprawniony odbiorca"),
+        vec![
+            evidence_input(
+                "Organ",
+                "np. Prokuratura Rejonowa Warszawa-Mokotów",
+                "evidence_recipient_name",
+            ),
+            evidence_input(
+                "Klucz publiczny (opcjonalnie)",
+                "np. PGP 4F2A...8E91",
+                "evidence_recipient_key",
+            ),
+        ],
+    );
     let actions = stack_h(vec![
         button("Zapisz odbiorcę", "evidence-recipient-add", "primary"),
         button("Anuluj", "evidence-recipient-cancel", "ghost"),
@@ -10822,7 +14131,9 @@ fn build_evidence_remove_confirm(evidence_id: &str, packages: &[db::EvidenceRow]
         .map(|p| p.package_ref.clone())
         .unwrap_or_else(|| evidence_id.to_string());
     let mut params = CborMap::default();
-    params.0.push(("evidence_id".into(), Value::Text(evidence_id.into())));
+    params
+        .0
+        .push(("evidence_id".into(), Value::Text(evidence_id.into())));
     let confirm_btn = button_with_params("Usuń", "evidence-remove", "destructive", params);
     let cancel_btn = button("Anuluj", "evidence-remove-cancel", "ghost");
     card(None, vec![stack_v(vec![
@@ -10834,14 +14145,23 @@ fn build_evidence_remove_confirm(evidence_id: &str, packages: &[db::EvidenceRow]
 
 fn build_evidence_content() -> Component {
     let messages = build_messages_section();
-    let (package_form_visible, recipient_form_visible) =
-        with_state(|s| (s.evidence.package_form_visible, s.evidence.recipient_form_visible));
+    let (package_form_visible, recipient_form_visible) = with_state(|s| {
+        (
+            s.evidence.package_form_visible,
+            s.evidence.recipient_form_visible,
+        )
+    });
 
     let mut children = vec![messages];
 
     let toolbar = stack_h(vec![
         heading(2, "Eksport dowodowy"),
-        button_with_icon("Dodaj odbiorcę", "evidence-recipient-add-show", "secondary", "plus"),
+        button_with_icon(
+            "Dodaj odbiorcę",
+            "evidence-recipient-add-show",
+            "secondary",
+            "plus",
+        ),
         button_with_icon("Utwórz pakiet dowodowy", "evidence-new", "primary", "plus"),
     ]);
     children.push(toolbar);
@@ -10864,7 +14184,10 @@ fn build_evidence_content() -> Component {
     let packages = match db::list_evidence() {
         Ok(p) => p,
         Err(e) => {
-            children.push(alert(&alloc::format!("Nie udało się pobrać paczek dowodowych: {}", abi_message(e)), "critical"));
+            children.push(alert(
+                &alloc::format!("Nie udało się pobrać paczek dowodowych: {}", abi_message(e)),
+                "critical",
+            ));
             return stack_v(children);
         }
     };
@@ -10874,7 +14197,14 @@ fn build_evidence_content() -> Component {
     // Recipients section (left of the mockup grid).
     let mut recipients_children = vec![stack_h(vec![
         heading(3, "Uprawnieni odbiorcy"),
-        chip_toned(&alloc::format!("{}", recipients.len()), if recipients.is_empty() { "muted" } else { "info" }),
+        chip_toned(
+            &alloc::format!("{}", recipients.len()),
+            if recipients.is_empty() {
+                "muted"
+            } else {
+                "info"
+            },
+        ),
     ])];
     if recipient_form_visible {
         recipients_children.push(build_recipient_form());
@@ -10911,7 +14241,10 @@ fn build_evidence_content() -> Component {
     // Evidence package list.
     let mut packages_children = vec![stack_h(vec![
         heading(3, "Paczki dowodowe"),
-        chip_toned(&alloc::format!("{}", packages.len()), if packages.is_empty() { "muted" } else { "info" }),
+        chip_toned(
+            &alloc::format!("{}", packages.len()),
+            if packages.is_empty() { "muted" } else { "info" },
+        ),
     ])];
     if packages.is_empty() {
         packages_children.push(empty_state(
@@ -10936,12 +14269,21 @@ fn build_evidence_content() -> Component {
 fn evidence_overlay() -> Vec<StateEntry> {
     with_state(|s| {
         let e = &s.evidence;
-        let key = |k: &str, v: Value| StateEntry { path: StatePath::new(vec![PathSegment::Key(k.into())]), value: v };
+        let key = |k: &str, v: Value| StateEntry {
+            path: StatePath::new(vec![PathSegment::Key(k.into())]),
+            value: v,
+        };
         vec![
             key("evidence_alarm", Value::Text(e.form_alarm_id.clone())),
             key("evidence_recipient", Value::Text(e.form_recipient.clone())),
-            key("evidence_recipient_name", Value::Text(e.recipient_name.clone())),
-            key("evidence_recipient_key", Value::Text(e.recipient_key.clone())),
+            key(
+                "evidence_recipient_name",
+                Value::Text(e.recipient_name.clone()),
+            ),
+            key(
+                "evidence_recipient_key",
+                Value::Text(e.recipient_key.clone()),
+            ),
         ]
     })
 }
@@ -10949,7 +14291,10 @@ fn evidence_overlay() -> Vec<StateEntry> {
 /// Mirrors a create-package form field into backend state on change.
 fn handle_evidence_field_change(params: &JsonValue) -> JsonValue {
     let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("");
-    let value = params.get("value").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let value = params
+        .get("value")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     if let Some(v) = value {
         with_state(|s| match field {
             "evidence_alarm" => s.evidence.form_alarm_id = v,
@@ -10963,7 +14308,10 @@ fn handle_evidence_field_change(params: &JsonValue) -> JsonValue {
 /// Mirrors an add-recipient form field into backend state on change.
 fn handle_evidence_recipient_field_change(params: &JsonValue) -> JsonValue {
     let field = params.get("field").and_then(|v| v.as_str()).unwrap_or("");
-    let value = params.get("value").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let value = params
+        .get("value")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     if let Some(v) = value {
         with_state(|s| match field {
             "evidence_recipient_name" => s.evidence.recipient_name = v,
@@ -10977,14 +14325,18 @@ fn handle_evidence_recipient_field_change(params: &JsonValue) -> JsonValue {
 /// Creates a persisted evidence package referencing a real source alarm, writes
 /// a hash-chained audit entry (evidence_change), then re-renders the panel.
 fn handle_evidence_create() -> JsonValue {
-    let (alarm_id, recipient) = with_state(|s| (
-        s.evidence.form_alarm_id.trim().to_string(),
-        s.evidence.form_recipient.trim().to_string(),
-    ));
+    let (alarm_id, recipient) = with_state(|s| {
+        (
+            s.evidence.form_alarm_id.trim().to_string(),
+            s.evidence.form_recipient.trim().to_string(),
+        )
+    });
     with_state(|s| s.clear_messages());
 
     if alarm_id.is_empty() {
-        with_state(|s| s.error_message = Some("Wybierz alarm źródłowy dla paczki dowodowej.".into()));
+        with_state(|s| {
+            s.error_message = Some("Wybierz alarm źródłowy dla paczki dowodowej.".into())
+        });
         render_panel("evidence");
         return json!({"ok":false,"error":"no alarm"});
     }
@@ -10997,32 +14349,52 @@ fn handle_evidence_create() -> JsonValue {
             return json!({"ok":false,"error":"alarm not found"});
         }
         Err(e) => {
-            with_state(|s| s.error_message = Some(alloc::format!("Błąd odczytu alarmu: {}", abi_message(e))));
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd odczytu alarmu: {}", abi_message(e)))
+            });
             render_panel("evidence");
             return json!({"ok":false,"error":alloc::format!("{}",e)});
         }
     }
 
-    let new_evidence = db::NewEvidence { alarm_id: alarm_id.clone(), signed_by: recipient.clone() };
+    let new_evidence = db::NewEvidence {
+        alarm_id: alarm_id.clone(),
+        signed_by: recipient.clone(),
+    };
     match db::insert_evidence(&new_evidence) {
         Ok(id) => {
             let row = db::get_evidence(&id).ok().flatten();
-            let package_ref = row.as_ref().map(|r| r.package_ref.clone()).unwrap_or_else(|| id.clone());
+            let package_ref = row
+                .as_ref()
+                .map(|r| r.package_ref.clone())
+                .unwrap_or_else(|| id.clone());
             let after = json!({
                 "id": id, "package_ref": package_ref,
                 "alarm_id": alarm_id, "signed_by": recipient,
-            }).to_string();
-            let _ = db::insert_audit(EVIDENCE_ACTOR, "evidence_change", &package_ref, "null", &after);
+            })
+            .to_string();
+            let _ = db::insert_audit(
+                EVIDENCE_ACTOR,
+                "evidence_change",
+                &package_ref,
+                "null",
+                &after,
+            );
             with_state(|s| {
                 s.evidence.package_form_visible = false;
                 s.evidence.reset_package_form();
-                s.success_message = Some(alloc::format!("Pakiet dowodowy utworzony ({}).", package_ref));
+                s.success_message = Some(alloc::format!(
+                    "Pakiet dowodowy utworzony ({}).",
+                    package_ref
+                ));
             });
             render_panel("evidence");
             json!({"ok":true,"evidence_id":id})
         }
         Err(e) => {
-            with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu paczki: {}", abi_message(e))));
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd zapisu paczki: {}", abi_message(e)))
+            });
             render_panel("evidence");
             json!({"ok":false,"error":alloc::format!("{}",e)})
         }
@@ -11032,7 +14404,12 @@ fn handle_evidence_create() -> JsonValue {
 /// Deletes the selected evidence package, writing a hash-chained audit entry with
 /// the deleted row's metadata as the `before` snapshot.
 fn handle_evidence_remove(params: &JsonValue) -> JsonValue {
-    let id = params.get("evidence_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let id = params
+        .get("evidence_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     with_state(|s| s.clear_messages());
     if id.is_empty() {
         return json!({"ok":false,"error":"empty evidence_id"});
@@ -11044,27 +14421,42 @@ fn handle_evidence_remove(params: &JsonValue) -> JsonValue {
             json!({
                 "id": r.id, "package_ref": r.package_ref,
                 "alarm_id": r.alarm_id, "signed_by": r.signed_by,
-            }).to_string(),
+            })
+            .to_string(),
         ),
         None => (id.clone(), "null".into()),
     };
     match db::delete_evidence(&id) {
         Ok(n) if n > 0 => {
-            let _ = db::insert_audit(EVIDENCE_ACTOR, "evidence_change", &package_ref, &before, "null");
+            let _ = db::insert_audit(
+                EVIDENCE_ACTOR,
+                "evidence_change",
+                &package_ref,
+                &before,
+                "null",
+            );
             with_state(|s| {
                 s.evidence.pending_remove = None;
-                s.success_message = Some(alloc::format!("Paczka dowodowa usunięta ({}).", package_ref));
+                s.success_message = Some(alloc::format!(
+                    "Paczka dowodowa usunięta ({}).",
+                    package_ref
+                ));
             });
             render_panel("evidence");
             json!({"ok":true})
         }
         Ok(_) => {
-            with_state(|s| { s.evidence.pending_remove = None; s.error_message = Some("Paczka nie istnieje.".into()); });
+            with_state(|s| {
+                s.evidence.pending_remove = None;
+                s.error_message = Some("Paczka nie istnieje.".into());
+            });
             render_panel("evidence");
             json!({"ok":false,"error":"not found"})
         }
         Err(e) => {
-            with_state(|s| s.error_message = Some(alloc::format!("Błąd usuwania paczki: {}", abi_message(e))));
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd usuwania paczki: {}", abi_message(e)))
+            });
             render_panel("evidence");
             json!({"ok":false,"error":alloc::format!("{}",e)})
         }
@@ -11074,10 +14466,12 @@ fn handle_evidence_remove(params: &JsonValue) -> JsonValue {
 /// Adds a new authorized recipient to the persisted recipients list (dedup by
 /// name), writing a hash-chained audit entry.
 fn handle_evidence_recipient_add() -> JsonValue {
-    let (name, key) = with_state(|s| (
-        s.evidence.recipient_name.trim().to_string(),
-        s.evidence.recipient_key.trim().to_string(),
-    ));
+    let (name, key) = with_state(|s| {
+        (
+            s.evidence.recipient_name.trim().to_string(),
+            s.evidence.recipient_key.trim().to_string(),
+        )
+    });
     with_state(|s| s.clear_messages());
     if name.is_empty() || name.chars().count() > 120 {
         with_state(|s| s.error_message = Some("Nazwa organu musi mieć 1–120 znaków.".into()));
@@ -11085,15 +14479,27 @@ fn handle_evidence_recipient_add() -> JsonValue {
         return json!({"ok":false,"error":"invalid name"});
     }
     let mut recipients = load_evidence_recipients();
-    if recipients.iter().any(|r| r.name.eq_ignore_ascii_case(&name)) {
+    if recipients
+        .iter()
+        .any(|r| r.name.eq_ignore_ascii_case(&name))
+    {
         with_state(|s| s.error_message = Some("Taki odbiorca już istnieje.".into()));
         render_panel("evidence");
         return json!({"ok":false,"error":"duplicate"});
     }
-    recipients.push(EvidenceRecipient { name: name.clone(), key });
+    recipients.push(EvidenceRecipient {
+        name: name.clone(),
+        key,
+    });
     match save_evidence_recipients(&recipients) {
         Ok(()) => {
-            let _ = db::insert_audit(EVIDENCE_ACTOR, "evidence_change", &name, "null", &json!({"recipient": name}).to_string());
+            let _ = db::insert_audit(
+                EVIDENCE_ACTOR,
+                "evidence_change",
+                &name,
+                "null",
+                &json!({"recipient": name}).to_string(),
+            );
             with_state(|s| {
                 s.evidence.recipient_form_visible = false;
                 s.evidence.reset_recipient_form();
@@ -11103,7 +14509,9 @@ fn handle_evidence_recipient_add() -> JsonValue {
             json!({"ok":true})
         }
         Err(e) => {
-            with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu odbiorcy: {}", abi_message(e))));
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd zapisu odbiorcy: {}", abi_message(e)))
+            });
             render_panel("evidence");
             json!({"ok":false,"error":alloc::format!("{}",e)})
         }
@@ -11113,10 +14521,14 @@ fn handle_evidence_recipient_add() -> JsonValue {
 /// Removes an authorized recipient from the persisted list by name, writing a
 /// hash-chained audit entry.
 fn handle_evidence_recipient_remove(params: &JsonValue) -> JsonValue {
-    let name = params.get("recipient_name").and_then(|v| v.as_str())
+    let name = params
+        .get("recipient_name")
+        .and_then(|v| v.as_str())
         .or_else(|| params.get("row_id").and_then(|v| v.as_str()))
         .or_else(|| params.get("name").and_then(|v| v.as_str()))
-        .unwrap_or("").trim().to_string();
+        .unwrap_or("")
+        .trim()
+        .to_string();
     with_state(|s| s.clear_messages());
     if name.is_empty() {
         return json!({"ok":false,"error":"empty name"});
@@ -11131,13 +14543,23 @@ fn handle_evidence_recipient_remove(params: &JsonValue) -> JsonValue {
     }
     match save_evidence_recipients(&recipients) {
         Ok(()) => {
-            let _ = db::insert_audit(EVIDENCE_ACTOR, "evidence_change", &name, &json!({"recipient": name}).to_string(), "null");
-            with_state(|s| s.success_message = Some(alloc::format!("Usunięto odbiorcę: {}.", name)));
+            let _ = db::insert_audit(
+                EVIDENCE_ACTOR,
+                "evidence_change",
+                &name,
+                &json!({"recipient": name}).to_string(),
+                "null",
+            );
+            with_state(|s| {
+                s.success_message = Some(alloc::format!("Usunięto odbiorcę: {}.", name))
+            });
             render_panel("evidence");
             json!({"ok":true})
         }
         Err(e) => {
-            with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu odbiorców: {}", abi_message(e))));
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd zapisu odbiorców: {}", abi_message(e)))
+            });
             render_panel("evidence");
             json!({"ok":false,"error":alloc::format!("{}",e)})
         }
@@ -11167,12 +14589,34 @@ struct SettingField {
     options: &'static [(&'static str, &'static str)],
 }
 
-const fn sf(key: &'static str, label: &'static str, kind: SettingKind, default: &'static str) -> SettingField {
-    SettingField { key, label, kind, default, options: &[] }
+const fn sf(
+    key: &'static str,
+    label: &'static str,
+    kind: SettingKind,
+    default: &'static str,
+) -> SettingField {
+    SettingField {
+        key,
+        label,
+        kind,
+        default,
+        options: &[],
+    }
 }
 
-const fn sf_select(key: &'static str, label: &'static str, default: &'static str, options: &'static [(&'static str, &'static str)]) -> SettingField {
-    SettingField { key, label, kind: SettingKind::Select, default, options }
+const fn sf_select(
+    key: &'static str,
+    label: &'static str,
+    default: &'static str,
+    options: &'static [(&'static str, &'static str)],
+) -> SettingField {
+    SettingField {
+        key,
+        label,
+        kind: SettingKind::Select,
+        default,
+        options,
+    }
 }
 
 const INFERENCE_BACKENDS: &[(&str, &str)] = &[
@@ -11187,10 +14631,7 @@ const BACKPRESSURE_POLICIES: &[(&str, &str)] = &[
     ("block", "Blokuj producenta"),
 ];
 
-const HSM_DEVICES: &[(&str, &str)] = &[
-    ("yubihsm2", "Yubikey HSM2"),
-    ("softhsm", "SoftHSM (dev)"),
-];
+const HSM_DEVICES: &[(&str, &str)] = &[("yubihsm2", "Yubikey HSM2"), ("softhsm", "SoftHSM (dev)")];
 
 const ANCHORING_MODES: &[(&str, &str)] = &[
     ("disabled", "Wyłączone"),
@@ -11201,51 +14642,174 @@ const LEGAL_PROFILES: &[(&str, &str)] = &[
     ("commercial_private", "Komercja prywatna (D4 zablokowany)"),
     ("public_transport", "Transport publiczny — operator"),
     ("airport_station", "Lotnisko / dworzec — operator"),
-    ("authorized_services", "Służby uprawnione (wymaga manifestu)"),
+    (
+        "authorized_services",
+        "Służby uprawnione (wymaga manifestu)",
+    ),
 ];
 
 /// Storage & retention section.
 const STORAGE_FIELDS: &[SettingField] = &[
-    sf("storage_recordings_dir", "Lokalizacja nagrań", SettingKind::Text, "/mnt/tentavision/recordings"),
-    sf("storage_disk_limit", "Limit dyskowy", SettingKind::Text, "4 TB"),
-    sf("storage_vector_index_dir", "Lokalizacja indeksu wektorów", SettingKind::Text, "/mnt/tentavision/qdrant"),
-    sf("storage_worm_bucket", "WORM bucket (S3-immutable)", SettingKind::Text, "s3://tentavision-worm/audit"),
-    sf("storage_retention_a_days", "Retencja klasa A (dni)", SettingKind::Number, "30"),
-    sf("storage_retention_b_days", "Retencja klasa B (dni)", SettingKind::Number, "14"),
-    sf("storage_retention_c_days", "Retencja klasa C (dni)", SettingKind::Number, "7"),
+    sf(
+        "storage_recordings_dir",
+        "Lokalizacja nagrań",
+        SettingKind::Text,
+        "/mnt/tentavision/recordings",
+    ),
+    sf(
+        "storage_disk_limit",
+        "Limit dyskowy",
+        SettingKind::Text,
+        "4 TB",
+    ),
+    sf(
+        "storage_vector_index_dir",
+        "Lokalizacja indeksu wektorów",
+        SettingKind::Text,
+        "/mnt/tentavision/qdrant",
+    ),
+    sf(
+        "storage_worm_bucket",
+        "WORM bucket (S3-immutable)",
+        SettingKind::Text,
+        "s3://tentavision-worm/audit",
+    ),
+    sf(
+        "storage_retention_a_days",
+        "Retencja klasa A (dni)",
+        SettingKind::Number,
+        "30",
+    ),
+    sf(
+        "storage_retention_b_days",
+        "Retencja klasa B (dni)",
+        SettingKind::Number,
+        "14",
+    ),
+    sf(
+        "storage_retention_c_days",
+        "Retencja klasa C (dni)",
+        SettingKind::Number,
+        "7",
+    ),
 ];
 
 /// Inference runtime section.
 const RUNTIME_FIELDS: &[SettingField] = &[
     sf_select("runtime_backend", "Backend", "tensorrt", INFERENCE_BACKENDS),
-    sf("runtime_max_concurrent_models", "Maks. równoczesnych modeli", SettingKind::Number, "6"),
-    sf_select("runtime_backpressure", "Backpressure policy", "drop_frame", BACKPRESSURE_POLICIES),
-    sf("runtime_batch_size", "Rozmiar batcha", SettingKind::Number, "8"),
-    sf("runtime_warmup_enabled", "Model warmup (200 inferencji)", SettingKind::Toggle, "1"),
-    sf("runtime_hot_reload_enabled", "Hot reload (A/B shadow, rollback < 60s)", SettingKind::Toggle, "1"),
+    sf(
+        "runtime_max_concurrent_models",
+        "Maks. równoczesnych modeli",
+        SettingKind::Number,
+        "6",
+    ),
+    sf_select(
+        "runtime_backpressure",
+        "Backpressure policy",
+        "drop_frame",
+        BACKPRESSURE_POLICIES,
+    ),
+    sf(
+        "runtime_batch_size",
+        "Rozmiar batcha",
+        SettingKind::Number,
+        "8",
+    ),
+    sf(
+        "runtime_warmup_enabled",
+        "Model warmup (200 inferencji)",
+        SettingKind::Toggle,
+        "1",
+    ),
+    sf(
+        "runtime_hot_reload_enabled",
+        "Hot reload (A/B shadow, rollback < 60s)",
+        SettingKind::Toggle,
+        "1",
+    ),
 ];
 
 /// Notifications & integrations section.
 const NOTIFY_FIELDS: &[SettingField] = &[
-    sf("notify_webhook_enabled", "Webhook → flow-engine", SettingKind::Toggle, "1"),
-    sf("notify_webhook_url", "Webhook URL", SettingKind::Secret, "https://flow.tentaflow.local/hook/tentavision"),
-    sf("notify_sms_enabled", "SMS (Twilio)", SettingKind::Toggle, "0"),
+    sf(
+        "notify_webhook_enabled",
+        "Webhook → flow-engine",
+        SettingKind::Toggle,
+        "1",
+    ),
+    sf(
+        "notify_webhook_url",
+        "Webhook URL",
+        SettingKind::Secret,
+        "https://flow.tentaflow.local/hook/tentavision",
+    ),
+    sf(
+        "notify_sms_enabled",
+        "SMS (Twilio)",
+        SettingKind::Toggle,
+        "0",
+    ),
     sf("notify_sms_target", "SMS numer", SettingKind::Secret, ""),
-    sf("notify_email_enabled", "Email (alarmy krytyczne)", SettingKind::Toggle, "1"),
-    sf("notify_email_target", "Email odbiorcy", SettingKind::Text, "dyspozytor@depo-warszawa.pl"),
+    sf(
+        "notify_email_enabled",
+        "Email (alarmy krytyczne)",
+        SettingKind::Toggle,
+        "1",
+    ),
+    sf(
+        "notify_email_target",
+        "Email odbiorcy",
+        SettingKind::Text,
+        "dyspozytor@depo-warszawa.pl",
+    ),
     sf("notify_slack_enabled", "Slack", SettingKind::Toggle, "0"),
-    sf("notify_slack_channel", "Slack channel", SettingKind::Text, "#tentavision-alerts"),
-    sf("notify_webpush_enabled", "Web push (operator)", SettingKind::Toggle, "1"),
-    sf("notify_quiet_hours_enabled", "Wyciszanie nocne 22:00–06:00", SettingKind::Toggle, "0"),
+    sf(
+        "notify_slack_channel",
+        "Slack channel",
+        SettingKind::Text,
+        "#tentavision-alerts",
+    ),
+    sf(
+        "notify_webpush_enabled",
+        "Web push (operator)",
+        SettingKind::Toggle,
+        "1",
+    ),
+    sf(
+        "notify_quiet_hours_enabled",
+        "Wyciszanie nocne 22:00–06:00",
+        SettingKind::Toggle,
+        "0",
+    ),
 ];
 
 /// Licenses & keys section.
 const LICENSE_FIELDS: &[SettingField] = &[
-    sf("license_pro_key", "TentaVision Pro license", SettingKind::Secret, ""),
+    sf(
+        "license_pro_key",
+        "TentaVision Pro license",
+        SettingKind::Secret,
+        "",
+    ),
     sf_select("license_hsm_device", "HSM device", "softhsm", HSM_DEVICES),
-    sf("license_tsa_url", "TSA RFC 3161", SettingKind::Text, "https://freetsa.org/tsr"),
-    sf_select("license_anchoring", "Anchoring blockchain", "disabled", ANCHORING_MODES),
-    sf("license_vault_rotation_days", "Camera vault rotacja (dni)", SettingKind::Number, "90"),
+    sf(
+        "license_tsa_url",
+        "TSA RFC 3161",
+        SettingKind::Text,
+        "https://freetsa.org/tsr",
+    ),
+    sf_select(
+        "license_anchoring",
+        "Anchoring blockchain",
+        "disabled",
+        ANCHORING_MODES,
+    ),
+    sf(
+        "license_vault_rotation_days",
+        "Camera vault rotacja (dni)",
+        SettingKind::Number,
+        "90",
+    ),
 ];
 
 /// Returns the persisted value for a field, applying its pending edit (if the
@@ -11254,7 +14818,10 @@ fn setting_value(f: &SettingField) -> String {
     if let Some(v) = with_state(|s| s.settings.edit(f.key).map(|x| x.to_string())) {
         return v;
     }
-    db::get_setting(f.key).ok().flatten().unwrap_or_else(|| f.default.to_string())
+    db::get_setting(f.key)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| f.default.to_string())
 }
 
 /// Renders one settings field as the control matching its kind, bound to a store
@@ -11267,11 +14834,18 @@ fn settings_control(f: &SettingField) -> Component {
         SettingKind::Number => settings_number_input(f.label, &store_key, f.key),
         SettingKind::Toggle => settings_toggle(f.label, &store_key, f.key),
         SettingKind::Select => {
-            let opts: Vec<SelectOption> = f.options.iter().map(|(v, l)| SelectOption {
-                value: SelectValue::Text((*v).into()),
-                label: lit(l),
-                icon: None, disabled: false, group_id: None, description: None,
-            }).collect();
+            let opts: Vec<SelectOption> = f
+                .options
+                .iter()
+                .map(|(v, l)| SelectOption {
+                    value: SelectValue::Text((*v).into()),
+                    label: lit(l),
+                    icon: None,
+                    disabled: false,
+                    group_id: None,
+                    description: None,
+                })
+                .collect();
             settings_select(f.label, opts, &store_key, f.key)
         }
     }
@@ -11283,16 +14857,33 @@ fn settings_control(f: &SettingField) -> Component {
 fn settings_text_input(label: &str, store_key: &str, setting_key: &str, secret: bool) -> Component {
     use tentaflow_sdk_spec::protocol::ui::form::Input;
     let mut comp = Input {
-        r#type: if secret { InputType::Password } else { InputType::Text },
+        r#type: if secret {
+            InputType::Password
+        } else {
+            InputType::Text
+        },
         bind_path: StatePath::new(vec![PathSegment::Key(store_key.into())]),
         placeholder: None,
         label: Some(lit(label)),
-        hint: None, leading_icon: None, trailing_icon: None, prefix: None, suffix: None,
-        validators: vec![], max_length: None, min_length: None, pattern: None,
-        autocomplete: None, input_mode: None, disabled: None, readonly: None, error: None,
+        hint: None,
+        leading_icon: None,
+        trailing_icon: None,
+        prefix: None,
+        suffix: None,
+        validators: vec![],
+        max_length: None,
+        min_length: None,
+        pattern: None,
+        autocomplete: None,
+        input_mode: None,
+        disabled: None,
+        readonly: None,
+        error: None,
         size: InputSize::Md,
         variant: None,
-    }.into_component(store_key).expect("Input");
+    }
+    .into_component(store_key)
+    .expect("Input");
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Input,
         Handler::Backend {
@@ -11313,12 +14904,25 @@ fn settings_number_input(label: &str, store_key: &str, setting_key: &str) -> Com
         bind_path: StatePath::new(vec![PathSegment::Key(store_key.into())]),
         placeholder: None,
         label: Some(lit(label)),
-        hint: None, leading_icon: None, trailing_icon: None, prefix: None, suffix: None,
-        validators: vec![], max_length: None, min_length: None, pattern: None,
-        autocomplete: None, input_mode: None, disabled: None, readonly: None, error: None,
+        hint: None,
+        leading_icon: None,
+        trailing_icon: None,
+        prefix: None,
+        suffix: None,
+        validators: vec![],
+        max_length: None,
+        min_length: None,
+        pattern: None,
+        autocomplete: None,
+        input_mode: None,
+        disabled: None,
+        readonly: None,
+        error: None,
         size: InputSize::Md,
         variant: None,
-    }.into_component(store_key).expect("Input");
+    }
+    .into_component(store_key)
+    .expect("Input");
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Input,
         Handler::Backend {
@@ -11332,14 +14936,27 @@ fn settings_number_input(label: &str, store_key: &str, setting_key: &str) -> Com
 }
 
 /// Select committing the picked value to the edit buffer on change.
-fn settings_select(label: &str, options: Vec<SelectOption>, store_key: &str, setting_key: &str) -> Component {
+fn settings_select(
+    label: &str,
+    options: Vec<SelectOption>,
+    store_key: &str,
+    setting_key: &str,
+) -> Component {
     use tentaflow_sdk_spec::protocol::ui::form::Select;
     let mut comp = Select {
         bind_path: StatePath::new(vec![PathSegment::Key(store_key.into())]),
-        options, placeholder: None, label: Some(lit(label)),
-        searchable: false, clearable: false, virtualize: false,
-        disabled: None, size: InputSize::Md, groups: None,
-    }.into_component(store_key).expect("Select");
+        options,
+        placeholder: None,
+        label: Some(lit(label)),
+        searchable: false,
+        clearable: false,
+        virtualize: false,
+        disabled: None,
+        size: InputSize::Md,
+        groups: None,
+    }
+    .into_component(store_key)
+    .expect("Select");
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Change,
         Handler::Backend {
@@ -11358,9 +14975,14 @@ fn settings_toggle(label: &str, store_key: &str, setting_key: &str) -> Component
     let mut comp = Toggle {
         bind_path: StatePath::new(vec![PathSegment::Key(store_key.into())]),
         label: Some(lit(label)),
-        hint: None, size: ToggleSize::Md, tone: Tone::Primary, disabled: None,
+        hint: None,
+        size: ToggleSize::Md,
+        tone: Tone::Primary,
+        disabled: None,
         label_position: TogglePosition::Trailing,
-    }.into_component(store_key).expect("Toggle");
+    }
+    .into_component(store_key)
+    .expect("Toggle");
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Change,
         Handler::Backend {
@@ -11375,7 +14997,9 @@ fn settings_toggle(label: &str, store_key: &str, setting_key: &str) -> Component
 
 fn settings_key_params(setting_key: &str) -> CborMap {
     let mut params = CborMap::default();
-    params.0.push(("key".into(), Value::Text(setting_key.into())));
+    params
+        .0
+        .push(("key".into(), Value::Text(setting_key.into())));
     params
 }
 
@@ -11402,7 +15026,8 @@ fn settings_overlay() -> Vec<StateEntry> {
 
 /// All settings fields across every section, in render order.
 fn settings_all_fields() -> impl Iterator<Item = &'static SettingField> {
-    STORAGE_FIELDS.iter()
+    STORAGE_FIELDS
+        .iter()
         .chain(RUNTIME_FIELDS.iter())
         .chain(NOTIFY_FIELDS.iter())
         .chain(LICENSE_FIELDS.iter())
@@ -11410,9 +15035,12 @@ fn settings_all_fields() -> impl Iterator<Item = &'static SettingField> {
 }
 
 /// Legal/deployment profile section (single Select, AI-Act gated).
-const LEGAL_FIELDS: &[SettingField] = &[
-    sf_select("legal_profile", "Aktywny profil deployment", "commercial_private", LEGAL_PROFILES),
-];
+const LEGAL_FIELDS: &[SettingField] = &[sf_select(
+    "legal_profile",
+    "Aktywny profil deployment",
+    "commercial_private",
+    LEGAL_PROFILES,
+)];
 
 /// Builds one section card: a heading plus its fields rendered as controls.
 fn settings_section_card(title: &str, fields: &[SettingField]) -> Component {
@@ -11430,12 +15058,15 @@ fn build_settings_content() -> Component {
         chip_toned("konfiguracja per-deployment", "muted"),
     ]);
 
-    let grid_cards = grid(2, vec![
-        settings_section_card("Storage i retencja", STORAGE_FIELDS),
-        settings_section_card("Inference runtime", RUNTIME_FIELDS),
-        settings_section_card("Powiadomienia i integracje", NOTIFY_FIELDS),
-        settings_section_card("Licencje i klucze", LICENSE_FIELDS),
-    ]);
+    let grid_cards = grid(
+        2,
+        vec![
+            settings_section_card("Storage i retencja", STORAGE_FIELDS),
+            settings_section_card("Inference runtime", RUNTIME_FIELDS),
+            settings_section_card("Powiadomienia i integracje", NOTIFY_FIELDS),
+            settings_section_card("Licencje i klucze", LICENSE_FIELDS),
+        ],
+    );
 
     // Legal/AI-Act profile — distinct card with a guardrail note.
     let mut legal_children = vec![heading(3, "Profil prawny i AI Act")];
@@ -11466,43 +15097,97 @@ const ONBOARDING_ACTOR: &str = "administrator";
 
 /// Deployment roles offered in step 1. Each is (key, title, description, icon).
 const ONBOARDING_ROLES: &[(&str, &str, &str, &str)] = &[
-    ("depo", "Depo / baza taboru", "Zajezdnie, bazy autobusowe, place manewrowe. Detekcja wjazdu/wyjazdu, ANPR, strefy.", "truck"),
-    ("office", "Biuro / kampus", "Wejścia, recepcje, korytarze. Kontrola dostępu, liczenie osób (anonimowo).", "home"),
-    ("retail", "Retail / handel", "Sklepy, galerie, parkingi. Analiza ruchu, kolejki, strefy ryzyka.", "package"),
-    ("custom", "Custom / inne", "Konfiguracja własna — wszystkie detektory dostępne wg profilu prawnego.", "settings"),
+    (
+        "depo",
+        "Depo / baza taboru",
+        "Zajezdnie, bazy autobusowe, place manewrowe. Detekcja wjazdu/wyjazdu, ANPR, strefy.",
+        "truck",
+    ),
+    (
+        "office",
+        "Biuro / kampus",
+        "Wejścia, recepcje, korytarze. Kontrola dostępu, liczenie osób (anonimowo).",
+        "home",
+    ),
+    (
+        "retail",
+        "Retail / handel",
+        "Sklepy, galerie, parkingi. Analiza ruchu, kolejki, strefy ryzyka.",
+        "package",
+    ),
+    (
+        "custom",
+        "Custom / inne",
+        "Konfiguracja własna — wszystkie detektory dostępne wg profilu prawnego.",
+        "settings",
+    ),
 ];
 
 /// Detector presets offered in step 4. Each is (key, title, description).
 const ONBOARDING_PRESETS: &[(&str, &str, &str)] = &[
-    ("safety", "Bezpieczeństwo (D1+D3)", "Detekcja osób i pojazdów, strefy zakazane, alarmy obecności. Bez danych osobowych."),
-    ("traffic", "Ruch i ANPR (D1+D3+OCR)", "Detekcja, śledzenie, rozpoznawanie tablic. ANPR przez OCR alias."),
-    ("full", "Pełny (D1–D6 wg profilu)", "Wszystkie klasy detektorów dozwolone przez wybrany profil prawny."),
+    (
+        "safety",
+        "Bezpieczeństwo (D1+D3)",
+        "Detekcja osób i pojazdów, strefy zakazane, alarmy obecności. Bez danych osobowych.",
+    ),
+    (
+        "traffic",
+        "Ruch i ANPR (D1+D3+OCR)",
+        "Detekcja, śledzenie, rozpoznawanie tablic. ANPR przez OCR alias.",
+    ),
+    (
+        "full",
+        "Pełny (D1–D6 wg profilu)",
+        "Wszystkie klasy detektorów dozwolone przez wybrany profil prawny.",
+    ),
 ];
 
 /// Looks up the display title for a stored role key.
 fn onboarding_role_label(key: &str) -> &str {
-    ONBOARDING_ROLES.iter().find(|(k, ..)| *k == key).map(|(_, t, ..)| *t).unwrap_or("—")
+    ONBOARDING_ROLES
+        .iter()
+        .find(|(k, ..)| *k == key)
+        .map(|(_, t, ..)| *t)
+        .unwrap_or("—")
 }
 
 /// Looks up the display title for a stored legal-profile key (shared catalog).
 fn legal_profile_label(key: &str) -> &str {
-    LEGAL_PROFILES.iter().find(|(k, _)| *k == key).map(|(_, l)| *l).unwrap_or("—")
+    LEGAL_PROFILES
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, l)| *l)
+        .unwrap_or("—")
 }
 
 /// Looks up the display title for a stored preset key.
 fn onboarding_preset_label(key: &str) -> &str {
-    ONBOARDING_PRESETS.iter().find(|(k, ..)| *k == key).map(|(_, t, ..)| *t).unwrap_or("—")
+    ONBOARDING_PRESETS
+        .iter()
+        .find(|(k, ..)| *k == key)
+        .map(|(_, t, ..)| *t)
+        .unwrap_or("—")
 }
 
 /// True once the wizard has been finished (settings key `onboarding_completed`=1).
 fn onboarding_completed() -> bool {
-    db::get_setting(KEY_ONBOARDING_COMPLETED).ok().flatten().as_deref() == Some("1")
+    db::get_setting(KEY_ONBOARDING_COMPLETED)
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("1")
 }
 
 /// One selectable option card: title + description, with a primary "Wybierz"
 /// button (or a "Wybrane" success chip when it is the current selection). The
 /// select button carries the option key so the handler knows which was picked.
-fn onboarding_option_card(key: &str, title: &str, desc: &str, selected: bool, action: &str) -> Component {
+fn onboarding_option_card(
+    key: &str,
+    title: &str,
+    desc: &str,
+    selected: bool,
+    action: &str,
+) -> Component {
     let mut params = CborMap::default();
     params.0.push(("key".into(), Value::Text(key.into())));
     let action_row = if selected {
@@ -11510,11 +15195,21 @@ fn onboarding_option_card(key: &str, title: &str, desc: &str, selected: bool, ac
     } else {
         button_with_params("Wybierz", action, "secondary", params)
     };
-    card(None, vec![
-        stack_h(vec![text_styled(title, "body_strong"), if selected { chip_toned("✓", "success") } else { divider() }]),
-        text_styled(desc, "caption"),
-        action_row,
-    ])
+    card(
+        None,
+        vec![
+            stack_h(vec![
+                text_styled(title, "body_strong"),
+                if selected {
+                    chip_toned("✓", "success")
+                } else {
+                    divider()
+                },
+            ]),
+            text_styled(desc, "caption"),
+            action_row,
+        ],
+    )
 }
 
 /// Reactive text input for a wizard field, committing each keystroke to backend
@@ -11522,18 +15217,35 @@ fn onboarding_option_card(key: &str, title: &str, desc: &str, selected: bool, ac
 fn onboarding_input(label: &str, placeholder: &str, field: &str) -> Component {
     use tentaflow_sdk_spec::protocol::ui::form::Input;
     let store_key = alloc::format!("onb_{}", field);
-    let placeholder_ref = if placeholder.is_empty() { None } else { Some(lit(placeholder)) };
+    let placeholder_ref = if placeholder.is_empty() {
+        None
+    } else {
+        Some(lit(placeholder))
+    };
     let mut comp = Input {
         r#type: InputType::Text,
         bind_path: StatePath::new(vec![PathSegment::Key(store_key.clone())]),
         placeholder: placeholder_ref,
         label: Some(lit(label)),
-        hint: None, leading_icon: None, trailing_icon: None, prefix: None, suffix: None,
-        validators: vec![], max_length: None, min_length: None, pattern: None,
-        autocomplete: None, input_mode: None, disabled: None, readonly: None, error: None,
+        hint: None,
+        leading_icon: None,
+        trailing_icon: None,
+        prefix: None,
+        suffix: None,
+        validators: vec![],
+        max_length: None,
+        min_length: None,
+        pattern: None,
+        autocomplete: None,
+        input_mode: None,
+        disabled: None,
+        readonly: None,
+        error: None,
         size: InputSize::Md,
         variant: None,
-    }.into_component(&store_key).expect("Input");
+    }
+    .into_component(&store_key)
+    .expect("Input");
     let mut params = CborMap::default();
     params.0.push(("field".into(), Value::Text(field.into())));
     comp.handlers = Some(HandlerMap(vec![(
@@ -11551,10 +15263,21 @@ fn onboarding_input(label: &str, placeholder: &str, field: &str) -> Component {
 /// Seeds the camera-step inputs from backend onboarding state so they keep their
 /// typed values when the user steps back and forth.
 fn onboarding_overlay() -> Vec<StateEntry> {
-    let (name, url) = with_state(|s| (s.onboarding.camera_name.clone(), s.onboarding.camera_url.clone()));
+    let (name, url) = with_state(|s| {
+        (
+            s.onboarding.camera_name.clone(),
+            s.onboarding.camera_url.clone(),
+        )
+    });
     vec![
-        StateEntry { path: StatePath::new(vec![PathSegment::Key("onb_camera_name".into())]), value: Value::Text(name) },
-        StateEntry { path: StatePath::new(vec![PathSegment::Key("onb_camera_url".into())]), value: Value::Text(url) },
+        StateEntry {
+            path: StatePath::new(vec![PathSegment::Key("onb_camera_name".into())]),
+            value: Value::Text(name),
+        },
+        StateEntry {
+            path: StatePath::new(vec![PathSegment::Key("onb_camera_url".into())]),
+            value: Value::Text(url),
+        },
     ]
 }
 
@@ -11566,12 +15289,14 @@ fn build_onboarding_content() -> Component {
         return build_onboarding_summary(messages);
     }
 
-    let (step, role, legal, presets) = with_state(|s| (
-        s.onboarding.step,
-        s.onboarding.role.clone(),
-        s.onboarding.legal_profile.clone(),
-        s.onboarding.presets.clone(),
-    ));
+    let (step, role, legal, presets) = with_state(|s| {
+        (
+            s.onboarding.step,
+            s.onboarding.role.clone(),
+            s.onboarding.legal_profile.clone(),
+            s.onboarding.presets.clone(),
+        )
+    });
 
     let welcome = card(None, vec![
         heading(1, "Witaj w TentaVision"),
@@ -11579,10 +15304,34 @@ fn build_onboarding_content() -> Component {
     ]);
 
     let steps_data: Vec<StepDef> = vec![
-        StepDef { id: "step0".into(), label: lit("Rola wdrożenia"), optional: false, status: Some(lit(step_status(step, 0))), description: None },
-        StepDef { id: "step1".into(), label: lit("Profil prawny"), optional: false, status: Some(lit(step_status(step, 1))), description: None },
-        StepDef { id: "step2".into(), label: lit("Pierwsza kamera"), optional: false, status: Some(lit(step_status(step, 2))), description: None },
-        StepDef { id: "step3".into(), label: lit("Presety detektorów"), optional: false, status: Some(lit(step_status(step, 3))), description: None },
+        StepDef {
+            id: "step0".into(),
+            label: lit("Rola wdrożenia"),
+            optional: false,
+            status: Some(lit(step_status(step, 0))),
+            description: None,
+        },
+        StepDef {
+            id: "step1".into(),
+            label: lit("Profil prawny"),
+            optional: false,
+            status: Some(lit(step_status(step, 1))),
+            description: None,
+        },
+        StepDef {
+            id: "step2".into(),
+            label: lit("Pierwsza kamera"),
+            optional: false,
+            status: Some(lit(step_status(step, 2))),
+            description: None,
+        },
+        StepDef {
+            id: "step3".into(),
+            label: lit("Presety detektorów"),
+            optional: false,
+            status: Some(lit(step_status(step, 3))),
+            description: None,
+        },
     ];
     let current_step_id = alloc::format!("step{}", step);
     let progress = step_progress(steps_data, &current_step_id);
@@ -11599,7 +15348,13 @@ fn build_onboarding_content() -> Component {
 
 /// StepProgress status token for step `idx` given the active `step`.
 fn step_status(step: u8, idx: u8) -> &'static str {
-    if idx < step { "complete" } else if idx == step { "current" } else { "pending" }
+    if idx < step {
+        "complete"
+    } else if idx == step {
+        "current"
+    } else {
+        "pending"
+    }
 }
 
 /// Step 1 — deployment role selection.
@@ -11610,7 +15365,13 @@ fn build_onboarding_step_role(selected: Option<&str>) -> Component {
     ];
     let mut options = Vec::new();
     for (key, title, desc, _icon) in ONBOARDING_ROLES {
-        options.push(onboarding_option_card(key, title, desc, selected == Some(*key), "onboarding-pick-role"));
+        options.push(onboarding_option_card(
+            key,
+            title,
+            desc,
+            selected == Some(*key),
+            "onboarding-pick-role",
+        ));
     }
     children.push(grid(2, options));
     children.push(stack_h(vec![
@@ -11628,7 +15389,13 @@ fn build_onboarding_step_legal(selected: Option<&str>) -> Component {
     ];
     let mut options = Vec::new();
     for (key, label) in LEGAL_PROFILES {
-        options.push(onboarding_option_card(key, label, legal_profile_desc(key), selected == Some(*key), "onboarding-pick-legal"));
+        options.push(onboarding_option_card(
+            key,
+            label,
+            legal_profile_desc(key),
+            selected == Some(*key),
+            "onboarding-pick-legal",
+        ));
     }
     children.push(grid(2, options));
     children.push(stack_h(vec![
@@ -11671,7 +15438,13 @@ fn build_onboarding_step_presets(selected: Option<&str>) -> Component {
     ];
     let mut options = Vec::new();
     for (key, title, desc) in ONBOARDING_PRESETS {
-        options.push(onboarding_option_card(key, title, desc, selected == Some(*key), "onboarding-pick-presets"));
+        options.push(onboarding_option_card(
+            key,
+            title,
+            desc,
+            selected == Some(*key),
+            "onboarding-pick-presets",
+        ));
     }
     children.push(grid(2, options));
     children.push(stack_h(vec![
@@ -11684,11 +15457,27 @@ fn build_onboarding_step_presets(selected: Option<&str>) -> Component {
 /// Completed-state summary read entirely from persisted settings, with a restart
 /// action. Shown whenever `onboarding_completed`=1 (survives reopen / restart).
 fn build_onboarding_summary(messages: Component) -> Component {
-    let role = db::get_setting(KEY_ONBOARDING_ROLE).ok().flatten().unwrap_or_default();
-    let legal = db::get_setting("legal_profile").ok().flatten().unwrap_or_default();
-    let presets = db::get_setting(KEY_ONBOARDING_PRESETS).ok().flatten().unwrap_or_default();
-    let at = db::get_setting(KEY_ONBOARDING_COMPLETED_AT).ok().flatten().unwrap_or_default();
-    let when = if at.trim().is_empty() { "—".to_string() } else { format_alarm_datetime(at.trim().parse::<i64>().unwrap_or(0)) };
+    let role = db::get_setting(KEY_ONBOARDING_ROLE)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let legal = db::get_setting("legal_profile")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let presets = db::get_setting(KEY_ONBOARDING_PRESETS)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let at = db::get_setting(KEY_ONBOARDING_COMPLETED_AT)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let when = if at.trim().is_empty() {
+        "—".to_string()
+    } else {
+        format_alarm_datetime(at.trim().parse::<i64>().unwrap_or(0))
+    };
 
     let header = stack_h(vec![
         heading(2, "Konfiguracja zakończona"),
@@ -11717,7 +15506,11 @@ fn build_onboarding_summary(messages: Component) -> Component {
 /// Records an option pick (role / legal / presets) into the in-flight wizard
 /// state and re-renders so the chosen card shows "Wybrane".
 fn handle_onboarding_pick(kind: &str, params: &JsonValue) -> JsonValue {
-    let key = params.get("key").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let key = params
+        .get("key")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     if key.is_empty() {
         return json!({"ok": false, "error": "empty key"});
     }
@@ -11737,7 +15530,11 @@ fn handle_onboarding_pick(kind: &str, params: &JsonValue) -> JsonValue {
 /// Mirrors a first-camera input into wizard state on each keystroke.
 fn handle_onboarding_field_change(params: &JsonValue) -> JsonValue {
     let field = params.get("field").and_then(|x| x.as_str()).unwrap_or("");
-    let value = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let value = params
+        .get("value")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     with_state(|s| match field {
         "camera_name" => s.onboarding.camera_name = value,
         "camera_url" => s.onboarding.camera_url = value,
@@ -11755,11 +15552,19 @@ fn handle_onboarding_next() -> JsonValue {
         _ => None,
     });
     if let Some(msg) = blocked {
-        with_state(|s| { s.clear_messages(); s.error_message = Some(msg.into()); });
+        with_state(|s| {
+            s.clear_messages();
+            s.error_message = Some(msg.into());
+        });
         render_panel("onboarding");
         return json!({"ok": false});
     }
-    with_state(|s| { s.clear_messages(); if s.onboarding.step + 1 < ONBOARDING_STEPS { s.onboarding.step += 1; } });
+    with_state(|s| {
+        s.clear_messages();
+        if s.onboarding.step + 1 < ONBOARDING_STEPS {
+            s.onboarding.step += 1;
+        }
+    });
     render_panel("onboarding");
     json!({"ok": true})
 }
@@ -11767,13 +15572,15 @@ fn handle_onboarding_next() -> JsonValue {
 /// Commits every wizard outcome: settings (role, legal_profile, presets,
 /// completed flag + timestamp), a real first-camera row, and an audit entry.
 fn handle_onboarding_finish() -> JsonValue {
-    let (role, legal, presets, cam_name, cam_url) = with_state(|s| (
-        s.onboarding.role.clone(),
-        s.onboarding.legal_profile.clone(),
-        s.onboarding.presets.clone(),
-        s.onboarding.camera_name.trim().to_string(),
-        s.onboarding.camera_url.trim().to_string(),
-    ));
+    let (role, legal, presets, cam_name, cam_url) = with_state(|s| {
+        (
+            s.onboarding.role.clone(),
+            s.onboarding.legal_profile.clone(),
+            s.onboarding.presets.clone(),
+            s.onboarding.camera_name.trim().to_string(),
+            s.onboarding.camera_url.trim().to_string(),
+        )
+    });
     with_state(|s| s.clear_messages());
 
     let Some(role) = role else {
@@ -11789,7 +15596,10 @@ fn handle_onboarding_finish() -> JsonValue {
     let presets = presets.unwrap_or_else(|| "safety".to_string());
 
     if cam_name.is_empty() || cam_name.chars().count() > 60 {
-        with_state(|s| { s.onboarding.step = 2; s.error_message = Some("Nazwa kamery musi mieć 1–60 znaków.".into()); });
+        with_state(|s| {
+            s.onboarding.step = 2;
+            s.error_message = Some("Nazwa kamery musi mieć 1–60 znaków.".into());
+        });
         render_panel("onboarding");
         return json!({"ok": false});
     }
@@ -11803,7 +15613,9 @@ fn handle_onboarding_finish() -> JsonValue {
     ];
     for (k, v) in writes {
         if let Err(e) = db::set_setting(k, v) {
-            with_state(|s| s.error_message = Some(alloc::format!("Błąd zapisu ustawień: {}", abi_message(e))));
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Błąd zapisu ustawień: {}", abi_message(e)))
+            });
             render_panel("onboarding");
             return json!({"ok": false});
         }
@@ -11824,7 +15636,10 @@ fn handle_onboarding_finish() -> JsonValue {
     let cam_id = match db::insert_camera(&new_cam) {
         Ok(id) => id,
         Err(e) => {
-            with_state(|s| { s.onboarding.step = 2; s.error_message = Some(alloc::format!("Błąd dodawania kamery: {}", abi_message(e))); });
+            with_state(|s| {
+                s.onboarding.step = 2;
+                s.error_message = Some(alloc::format!("Błąd dodawania kamery: {}", abi_message(e)));
+            });
             render_panel("onboarding");
             return json!({"ok": false});
         }
@@ -11833,15 +15648,32 @@ fn handle_onboarding_finish() -> JsonValue {
     let ts = db::now_secs();
     let _ = db::set_setting(KEY_ONBOARDING_COMPLETED_AT, &alloc::format!("{}", ts));
     if let Err(e) = db::set_setting(KEY_ONBOARDING_COMPLETED, "1") {
-        with_state(|s| s.error_message = Some(alloc::format!("Błąd finalizacji: {}", abi_message(e))));
+        with_state(|s| {
+            s.error_message = Some(alloc::format!("Błąd finalizacji: {}", abi_message(e)))
+        });
         render_panel("onboarding");
         return json!({"ok": false});
     }
 
-    let after = alloc::format!("role={}; legal_profile={}; presets={}; camera={}", role, legal, presets, cam_id);
-    let _ = db::insert_audit(ONBOARDING_ACTOR, "onboarding_complete", "tentavision", "", &after);
+    let after = alloc::format!(
+        "role={}; legal_profile={}; presets={}; camera={}",
+        role,
+        legal,
+        presets,
+        cam_id
+    );
+    let _ = db::insert_audit(
+        ONBOARDING_ACTOR,
+        "onboarding_complete",
+        "tentavision",
+        "",
+        &after,
+    );
 
-    with_state(|s| { s.onboarding.reset(); s.success_message = Some("Konfiguracja zakończona. Pierwsza kamera dodana.".into()); });
+    with_state(|s| {
+        s.onboarding.reset();
+        s.success_message = Some("Konfiguracja zakończona. Pierwsza kamera dodana.".into());
+    });
     render_panel("onboarding");
     json!({"ok": true, "camera_id": cam_id})
 }
@@ -11854,7 +15686,10 @@ fn handle_onboarding_restart() -> JsonValue {
         render_panel("onboarding");
         return json!({"ok": false});
     }
-    with_state(|s| { s.onboarding.reset(); s.clear_messages(); });
+    with_state(|s| {
+        s.onboarding.reset();
+        s.clear_messages();
+    });
     render_panel("onboarding");
     json!({"ok": true})
 }
@@ -11878,12 +15713,48 @@ struct SlotDef {
 
 /// The 6 functional slots, each filtered by the capability `method` it requires.
 const SLOTS: &[SlotDef] = &[
-    SlotDef { id: "yolo", label: "Detekcja obiektów", method: "detect", canonical_alias: "tentavision-yolo", gated: false },
-    SlotDef { id: "ocr", label: "Rozpoznawanie tekstu (OCR)", method: "recognize", canonical_alias: "tentavision-ocr", gated: false },
-    SlotDef { id: "action", label: "Klasyfikacja akcji", method: "classify_window", canonical_alias: "tentavision-action", gated: false },
-    SlotDef { id: "vlm", label: "Model wizyjno-językowy", method: "caption", canonical_alias: "tentavision-vlm", gated: false },
-    SlotDef { id: "face-embed", label: "Embedding twarzy", method: "embed", canonical_alias: "tentavision-face-embed", gated: true },
-    SlotDef { id: "reid", label: "Re-identyfikacja osób", method: "match", canonical_alias: "tentavision-reid", gated: true },
+    SlotDef {
+        id: "yolo",
+        label: "Detekcja obiektów",
+        method: "detect",
+        canonical_alias: "tentavision-yolo",
+        gated: false,
+    },
+    SlotDef {
+        id: "ocr",
+        label: "Rozpoznawanie tekstu (OCR)",
+        method: "recognize",
+        canonical_alias: "tentavision-ocr",
+        gated: false,
+    },
+    SlotDef {
+        id: "action",
+        label: "Klasyfikacja akcji",
+        method: "classify_window",
+        canonical_alias: "tentavision-action",
+        gated: false,
+    },
+    SlotDef {
+        id: "vlm",
+        label: "Model wizyjno-językowy",
+        method: "caption",
+        canonical_alias: "tentavision-vlm",
+        gated: false,
+    },
+    SlotDef {
+        id: "face-embed",
+        label: "Embedding twarzy",
+        method: "embed",
+        canonical_alias: "tentavision-face-embed",
+        gated: true,
+    },
+    SlotDef {
+        id: "reid",
+        label: "Re-identyfikacja osób",
+        method: "match",
+        canonical_alias: "tentavision-reid",
+        gated: true,
+    },
 ];
 
 /// Store key holding the chosen target alias for a slot Select.
@@ -11933,7 +15804,10 @@ fn build_bindings_content() -> Component {
 
     let header = stack_h(vec![
         heading(2, "Powiązania i magazyn"),
-        chip_toned(&alloc::format!("{}/{} aliasów przyznanych", usable, available.len()), "success"),
+        chip_toned(
+            &alloc::format!("{}/{} aliasów przyznanych", usable, available.len()),
+            "success",
+        ),
         chip_toned("mapowanie wykonawcze addona", "muted"),
     ]);
 
@@ -11958,14 +15832,17 @@ fn build_bindings_content() -> Component {
 /// chip. Honest empty state when the grant system returned nothing.
 fn build_available_aliases_card(available: &[AvailableAlias]) -> Component {
     if available.is_empty() {
-        return card(None, vec![
-            heading(3, "Modele przyznane addonowi"),
-            empty_state(
-                "Brak przyznanych modeli",
-                Some("Poproś admina o grant w Services → Aliasy."),
-                Some("lock"),
-            ),
-        ]);
+        return card(
+            None,
+            vec![
+                heading(3, "Modele przyznane addonowi"),
+                empty_state(
+                    "Brak przyznanych modeli",
+                    Some("Poproś admina o grant w Services → Aliasy."),
+                    Some("lock"),
+                ),
+            ],
+        );
     }
     let mut rows = vec![heading(3, "Modele przyznane addonowi")];
     for a in available {
@@ -11976,26 +15853,39 @@ fn build_available_aliases_card(available: &[AvailableAlias]) -> Component {
 
 /// One discovery row: alias id + methods + resolved target + grant-status chip.
 fn build_available_alias_row(a: &AvailableAlias) -> Component {
-    let methods = if a.methods.is_empty() { "—".to_string() } else { a.methods.join(" · ") };
-    let target = a.target_model.clone().unwrap_or_else(|| "— nie ustawiony —".to_string());
+    let methods = if a.methods.is_empty() {
+        "—".to_string()
+    } else {
+        a.methods.join(" · ")
+    };
+    let target = a
+        .target_model
+        .clone()
+        .unwrap_or_else(|| "— nie ustawiony —".to_string());
     let visibility = a.visibility.clone().unwrap_or_else(|| "—".to_string());
-    let name_block = stack_v_gap("xxs", vec![
-        text_styled(&a.alias_id, "body_strong"),
-        text_styled(&methods, "caption"),
-    ]);
+    let name_block = stack_v_gap(
+        "xxs",
+        vec![
+            text_styled(&a.alias_id, "body_strong"),
+            text_styled(&methods, "caption"),
+        ],
+    );
     let detail = key_value(vec![
         ("Rozwiązuje na", target.as_str()),
         ("Widoczność", visibility.as_str()),
         ("Aktywny", if a.active { "tak" } else { "nie" }),
         ("Wymagany", if a.required { "tak" } else { "nie" }),
     ]);
-    card(None, vec![
-        stack_h(vec![
-            name_block,
-            chip_toned(&a.grant_status, a.status_tone()),
-        ]),
-        detail,
-    ])
+    card(
+        None,
+        vec![
+            stack_h(vec![
+                name_block,
+                chip_toned(&a.grant_status, a.status_tone()),
+            ]),
+            detail,
+        ],
+    )
 }
 
 /// Assignment card: one Select per functional slot, populated ONLY from granted
@@ -12022,19 +15912,33 @@ fn build_slot_assignment_card(available: &[AvailableAlias]) -> Component {
 /// aliases (or an honest per-slot empty note) + a gated marker.
 fn build_slot_row(slot: &SlotDef, available: &[AvailableAlias]) -> Component {
     let opts = slot_options(slot.method, available);
-    let name_block = stack_v_gap("xxs", vec![
-        text_styled(slot.label, "body_strong"),
-        text_styled(&alloc::format!("metoda: {}", slot.method), "caption"),
-    ]);
+    let name_block = stack_v_gap(
+        "xxs",
+        vec![
+            text_styled(slot.label, "body_strong"),
+            text_styled(&alloc::format!("metoda: {}", slot.method), "caption"),
+        ],
+    );
 
     let mut row_children = vec![name_block];
     if opts.is_empty() {
-        row_children.push(text_styled("Brak przyznanego modelu dla tej funkcji.", "caption"));
+        row_children.push(text_styled(
+            "Brak przyznanego modelu dla tej funkcji.",
+            "caption",
+        ));
     } else {
         let assigned = slot_assignment(slot, available);
         row_children.push(build_slot_select(slot, &opts, &assigned));
-        let tone = if assigned.trim().is_empty() { "warning" } else { "success" };
-        let label = if assigned.trim().is_empty() { "nieprzypisany" } else { "przypisany" };
+        let tone = if assigned.trim().is_empty() {
+            "warning"
+        } else {
+            "success"
+        };
+        let label = if assigned.trim().is_empty() {
+            "nieprzypisany"
+        } else {
+            "przypisany"
+        };
         row_children.push(chip_toned(label, tone));
     }
     if slot.gated {
@@ -12048,28 +15952,42 @@ fn build_slot_row(slot: &SlotDef, available: &[AvailableAlias]) -> Component {
 fn build_slot_select(slot: &SlotDef, opts: &[&AvailableAlias], assigned: &str) -> Component {
     use tentaflow_sdk_spec::protocol::ui::form::Select;
     let store_key = slot_store_key(slot.id);
-    let options: Vec<SelectOption> = opts.iter().map(|a| {
-        let label = match &a.target_model {
-            Some(t) if !t.is_empty() => alloc::format!("{} → {}", a.alias_id, t),
-            _ => a.alias_id.clone(),
-        };
-        SelectOption {
-            value: SelectValue::Text(a.alias_id.clone().into()),
-            label: lit(&label),
-            icon: None, disabled: false, group_id: None, description: None,
-        }
-    }).collect();
+    let options: Vec<SelectOption> = opts
+        .iter()
+        .map(|a| {
+            let label = match &a.target_model {
+                Some(t) if !t.is_empty() => alloc::format!("{} → {}", a.alias_id, t),
+                _ => a.alias_id.clone(),
+            };
+            SelectOption {
+                value: SelectValue::Text(a.alias_id.clone().into()),
+                label: lit(&label),
+                icon: None,
+                disabled: false,
+                group_id: None,
+                description: None,
+            }
+        })
+        .collect();
     let _ = assigned;
     let mut comp = Select {
         bind_path: StatePath::new(vec![PathSegment::Key(store_key.clone())]),
         options,
         placeholder: None,
         label: Some(lit("Model")),
-        searchable: false, clearable: false, virtualize: false,
-        disabled: None, size: InputSize::Md, groups: None,
-    }.into_component(&store_key).expect("Select");
+        searchable: false,
+        clearable: false,
+        virtualize: false,
+        disabled: None,
+        size: InputSize::Md,
+        groups: None,
+    }
+    .into_component(&store_key)
+    .expect("Select");
     let mut params = CborMap::default();
-    params.0.push(("slot_id".into(), Value::Text(slot.id.into())));
+    params
+        .0
+        .push(("slot_id".into(), Value::Text(slot.id.into())));
     comp.handlers = Some(HandlerMap(vec![(
         tentaflow_sdk_spec::EventKind::Change,
         Handler::Backend {
@@ -12087,7 +16005,13 @@ fn build_slot_select(slot: &SlotDef, opts: &[&AvailableAlias], assigned: &str) -
 fn build_storage_status_card() -> Component {
     // SQL: round-trip a trivial query through the host SQL bridge.
     let (sql_label, sql_tone, sql_sub) = match db::query("SELECT 1", &[]) {
-        Ok(rows) if rows.first().and_then(|r| r.first()).map(db::SqlValue::as_i64) == Some(1) => {
+        Ok(rows)
+            if rows
+                .first()
+                .and_then(|r| r.first())
+                .map(db::SqlValue::as_i64)
+                == Some(1) =>
+        {
             ("dostępny", "ok", "SQLite · per-addon baza")
         }
         Ok(_) => ("nieoczekiwana odpowiedź", "warn", "SQLite · per-addon baza"),
@@ -12120,12 +16044,19 @@ fn build_storage_status_card() -> Component {
     let (emb_label, emb_tone, emb_sub) = if embedding_model_available() {
         ("dostępny", "ok", "llm.generate · model embeddingów")
     } else {
-        ("niedostępny", "warn", "llm.generate · brak modelu embeddingów")
+        (
+            "niedostępny",
+            "warn",
+            "llm.generate · brak modelu embeddingów",
+        )
     };
 
     // Recording: report configured recordings dir from settings + the granted
     // recording.read permission.
-    let rec_dir = db::get_setting("storage_recordings_dir").ok().flatten().unwrap_or_default();
+    let rec_dir = db::get_setting("storage_recordings_dir")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let (rec_label, rec_tone, rec_sub) = if rec_dir.trim().is_empty() {
         ("nieskonfigurowane", "warn", "ustaw katalog w Ustawienia")
     } else {
@@ -12133,23 +16064,45 @@ fn build_storage_status_card() -> Component {
     };
 
     let cell = |title: &str, label: &str, tone: &str, sub: &str| -> Component {
-        card(None, vec![
-            text_styled(title, "overline"),
-            chip_toned(label, tone),
-            text_styled(sub, "caption"),
-        ])
+        card(
+            None,
+            vec![
+                text_styled(title, "overline"),
+                chip_toned(label, tone),
+                text_styled(sub, "caption"),
+            ],
+        )
     };
 
-    card(None, vec![
-        heading(3, "Storage — wbudowane API TentaFlow"),
-        grid(3, vec![
-            cell("KV store", kv_label, kv_tone, kv_sub),
-            cell("SQL · SQLite", sql_label, sql_tone, sql_sub),
-            cell("Vector store", vec_label, vec_tone, vec_sub),
-            cell("Embeddings", emb_label, emb_tone, emb_sub),
-            cell("Recording", rec_label, rec_tone, &alloc::format!("{}{}", rec_sub, if rec_dir.trim().is_empty() { String::new() } else { alloc::format!(" · {}", rec_dir) })),
-        ]),
-    ])
+    card(
+        None,
+        vec![
+            heading(3, "Storage — wbudowane API TentaFlow"),
+            grid(
+                3,
+                vec![
+                    cell("KV store", kv_label, kv_tone, kv_sub),
+                    cell("SQL · SQLite", sql_label, sql_tone, sql_sub),
+                    cell("Vector store", vec_label, vec_tone, vec_sub),
+                    cell("Embeddings", emb_label, emb_tone, emb_sub),
+                    cell(
+                        "Recording",
+                        rec_label,
+                        rec_tone,
+                        &alloc::format!(
+                            "{}{}",
+                            rec_sub,
+                            if rec_dir.trim().is_empty() {
+                                String::new()
+                            } else {
+                                alloc::format!(" · {}", rec_dir)
+                            }
+                        ),
+                    ),
+                ],
+            ),
+        ],
+    )
 }
 
 /// Seeds each slot Select's bound store key from the persisted assignment (or the
@@ -12157,18 +16110,21 @@ fn build_storage_status_card() -> Component {
 /// selected. Reads the real grant data once.
 fn bindings_overlay() -> Vec<StateEntry> {
     let available = alias_list_available().unwrap_or_default();
-    SLOTS.iter().filter_map(|slot| {
-        // Only seed a slot that actually has usable options — otherwise the
-        // Select is not rendered and the entry would be dead.
-        let opts = slot_options(slot.method, &available);
-        if opts.is_empty() {
-            return None;
-        }
-        Some(StateEntry {
-            path: StatePath::new(vec![PathSegment::Key(slot_store_key(slot.id))]),
-            value: Value::Text(slot_assignment(slot, &available)),
+    SLOTS
+        .iter()
+        .filter_map(|slot| {
+            // Only seed a slot that actually has usable options — otherwise the
+            // Select is not rendered and the entry would be dead.
+            let opts = slot_options(slot.method, &available);
+            if opts.is_empty() {
+                return None;
+            }
+            Some(StateEntry {
+                path: StatePath::new(vec![PathSegment::Key(slot_store_key(slot.id))]),
+                value: Value::Text(slot_assignment(slot, &available)),
+            })
         })
-    }).collect()
+        .collect()
 }
 
 /// Persists a new slot → alias assignment and records the before/after in the
@@ -12178,8 +16134,16 @@ fn bindings_overlay() -> Vec<StateEntry> {
 /// grant system — you cannot assign an alias you were not granted or whose
 /// methods do not match the slot.
 fn handle_binding_target_change(params: &JsonValue) -> JsonValue {
-    let slot_id = params.get("slot_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let value = params.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let slot_id = params
+        .get("slot_id")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let value = params
+        .get("value")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     let Some(slot) = SLOTS.iter().find(|s| s.id == slot_id) else {
         return json!({"ok": false});
     };
@@ -12187,7 +16151,9 @@ fn handle_binding_target_change(params: &JsonValue) -> JsonValue {
     let opts = slot_options(slot.method, &available);
     // Reject aliases outside the slot's granted, method-matching options.
     if !opts.iter().any(|a| a.alias_id == value) {
-        with_state(|s| s.error_message = Some("Wybrany model nie jest przyznany dla tej funkcji.".into()));
+        with_state(|s| {
+            s.error_message = Some("Wybrany model nie jest przyznany dla tej funkcji.".into())
+        });
         render_panel("bindings");
         return json!({"ok": false});
     }
@@ -12196,10 +16162,19 @@ fn handle_binding_target_change(params: &JsonValue) -> JsonValue {
     match db::set_setting(&key, &value) {
         Ok(_) => {
             let _ = db::insert_audit(BINDING_ACTOR, "binding_change", &slot_id, &before, &value);
-            with_state(|s| { s.clear_messages(); s.success_message = Some(alloc::format!("Funkcja {} → {} zapisana.", slot_id, value)); });
+            with_state(|s| {
+                s.clear_messages();
+                s.success_message =
+                    Some(alloc::format!("Funkcja {} → {} zapisana.", slot_id, value));
+            });
         }
         Err(e) => {
-            with_state(|s| s.error_message = Some(alloc::format!("Nie udało się zapisać mapowania: {}", abi_message(e))));
+            with_state(|s| {
+                s.error_message = Some(alloc::format!(
+                    "Nie udało się zapisać mapowania: {}",
+                    abi_message(e)
+                ))
+            });
         }
     }
     render_panel("bindings");

@@ -25,14 +25,22 @@ use crate::AbiError;
 #[link(wasm_import_module = "tentaflow")]
 extern "C" {
     fn sql_exec_v1(
-        query_ptr: i32, query_len: i32,
-        params_json_ptr: i32, params_json_len: i32,
-        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+        query_ptr: i32,
+        query_len: i32,
+        params_json_ptr: i32,
+        params_json_len: i32,
+        out_ptr: i32,
+        out_cap: i32,
+        out_len_ptr: i32,
     ) -> i32;
     fn sql_query_v1(
-        query_ptr: i32, query_len: i32,
-        params_json_ptr: i32, params_json_len: i32,
-        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+        query_ptr: i32,
+        query_len: i32,
+        params_json_ptr: i32,
+        params_json_len: i32,
+        out_ptr: i32,
+        out_cap: i32,
+        out_len_ptr: i32,
     ) -> i32;
 }
 
@@ -109,9 +117,12 @@ fn call_sql(
         let mut out_len: i32 = 0;
         let ret = unsafe {
             host_fn(
-                q.as_ptr() as i32, q.len() as i32,
-                p.as_ptr() as i32, p.len() as i32,
-                out.as_mut_ptr() as i32, out.len() as i32,
+                q.as_ptr() as i32,
+                q.len() as i32,
+                p.as_ptr() as i32,
+                p.len() as i32,
+                out.as_mut_ptr() as i32,
+                out.len() as i32,
                 &mut out_len as *mut i32 as i32,
             )
         };
@@ -132,14 +143,20 @@ fn call_sql(
 pub fn exec(query: &str, params: &[SqlValue]) -> Result<u64, AbiError> {
     let bytes = call_sql(sql_exec_v1, query, params)?;
     let v: JsonValue = serde_json::from_slice(&bytes).map_err(|_| AbiError::Operation)?;
-    Ok(v.get("rows_affected").and_then(JsonValue::as_u64).unwrap_or(0))
+    Ok(v.get("rows_affected")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0))
 }
 
 /// Runs a SELECT and decodes every row.
 pub fn query(query_str: &str, params: &[SqlValue]) -> Result<Vec<Row>, AbiError> {
     let bytes = call_sql(sql_query_v1, query_str, params)?;
     let v: JsonValue = serde_json::from_slice(&bytes).map_err(|_| AbiError::Operation)?;
-    let rows = v.get("rows").and_then(JsonValue::as_array).cloned().unwrap_or_default();
+    let rows = v
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .cloned()
+        .unwrap_or_default();
     Ok(rows
         .iter()
         .map(|row| {
@@ -171,7 +188,11 @@ pub fn generate_id(prefix: &str) -> String {
 /// rather than failing the insert).
 pub fn now_secs() -> i64 {
     match query("SELECT unixepoch()", &[]) {
-        Ok(rows) => rows.first().and_then(|r| r.first()).map(SqlValue::as_i64).unwrap_or(0),
+        Ok(rows) => rows
+            .first()
+            .and_then(|r| r.first())
+            .map(SqlValue::as_i64)
+            .unwrap_or(0),
         Err(_) => 0,
     }
 }
@@ -317,7 +338,10 @@ pub fn set_camera_status(id: &str, status: &str) -> Result<u64, AbiError> {
 
 /// Deletes a camera by id. Returns rows affected (0 if it did not exist).
 pub fn delete_camera(id: &str) -> Result<u64, AbiError> {
-    exec("DELETE FROM cameras WHERE id = ?1", &[SqlValue::Text(id.into())])
+    exec(
+        "DELETE FROM cameras WHERE id = ?1",
+        &[SqlValue::Text(id.into())],
+    )
 }
 
 // =============================================================================
@@ -441,7 +465,10 @@ pub fn toggle_profile(id: &str, enabled: bool) -> Result<u64, AbiError> {
 
 /// Deletes a profile by id. Returns rows affected (0 if it did not exist).
 pub fn delete_profile(id: &str) -> Result<u64, AbiError> {
-    exec("DELETE FROM profiles WHERE id = ?1", &[SqlValue::Text(id.into())])
+    exec(
+        "DELETE FROM profiles WHERE id = ?1",
+        &[SqlValue::Text(id.into())],
+    )
 }
 
 // =============================================================================
@@ -540,7 +567,10 @@ pub fn update_model(m: &ModelRow) -> Result<u64, AbiError> {
 
 /// Deletes a model by id. Returns rows affected (0 if it did not exist).
 pub fn delete_model(id: &str) -> Result<u64, AbiError> {
-    exec("DELETE FROM models WHERE id = ?1", &[SqlValue::Text(id.into())])
+    exec(
+        "DELETE FROM models WHERE id = ?1",
+        &[SqlValue::Text(id.into())],
+    )
 }
 
 /// Sum of VRAM (MB) over models that count toward the live budget — those whose
@@ -560,7 +590,11 @@ pub fn used_vram_mb() -> Result<i64, AbiError> {
 /// or 0 when the result set is empty.
 fn scalar_i64(sql: &str, params: &[SqlValue]) -> Result<i64, AbiError> {
     let rows = query(sql, params)?;
-    Ok(rows.first().and_then(|r| r.first()).map(SqlValue::as_i64).unwrap_or(0))
+    Ok(rows
+        .first()
+        .and_then(|r| r.first())
+        .map(SqlValue::as_i64)
+        .unwrap_or(0))
 }
 
 /// Total number of configured cameras.
@@ -625,8 +659,7 @@ pub fn list_recent_alarms(limit: i64) -> Result<Vec<AlarmRow>, AbiError> {
 
 /// Column list (with the camera-name join) shared by every alarm SELECT so the
 /// row decoder stays in lockstep with the query shape.
-const ALARM_COLS: &str =
-    "a.id, a.camera_id, COALESCE(c.name, ''), a.severity, a.type, a.message, \
+const ALARM_COLS: &str = "a.id, a.camera_id, COALESCE(c.name, ''), a.severity, a.type, a.message, \
      a.thumb_ref, a.ts, a.status, a.decided_by, a.decided_at";
 
 fn row_to_alarm(r: &Row) -> AlarmRow {
@@ -659,7 +692,11 @@ pub fn get_alarm(id: &str) -> Result<Option<AlarmRow>, AbiError> {
 /// Lists alarms (newest first) with optional severity and status filters. An
 /// empty filter string means "no constraint on that column"; `status_open`
 /// collapses the two undecided states (`new`/`acknowledged`) into one feed view.
-pub fn list_alarms(severity: &str, status: &str, status_open: bool) -> Result<Vec<AlarmRow>, AbiError> {
+pub fn list_alarms(
+    severity: &str,
+    status: &str,
+    status_open: bool,
+) -> Result<Vec<AlarmRow>, AbiError> {
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<SqlValue> = Vec::new();
     if !severity.is_empty() {
@@ -739,11 +776,17 @@ pub fn search_alarms(
 /// Number of alarms matching the open-feed view (undecided) or a concrete status.
 pub fn count_alarms(status_open: bool, status: &str) -> Result<i64, AbiError> {
     if status_open {
-        scalar_i64("SELECT COUNT(*) FROM alarms WHERE status IN ('new','acknowledged')", &[])
+        scalar_i64(
+            "SELECT COUNT(*) FROM alarms WHERE status IN ('new','acknowledged')",
+            &[],
+        )
     } else if status.is_empty() {
         scalar_i64("SELECT COUNT(*) FROM alarms", &[])
     } else {
-        scalar_i64("SELECT COUNT(*) FROM alarms WHERE status = ?1", &[SqlValue::Text(status.into())])
+        scalar_i64(
+            "SELECT COUNT(*) FROM alarms WHERE status = ?1",
+            &[SqlValue::Text(status.into())],
+        )
     }
 }
 
@@ -839,17 +882,18 @@ pub fn insert_audit(
 ) -> Result<String, AbiError> {
     let id = generate_id("aud");
     let ts = now_secs();
-    let prev_hash = query("SELECT hash FROM audit_log ORDER BY ts DESC, id DESC LIMIT 1", &[])?
-        .first()
-        .and_then(|r| r.first())
-        .map(SqlValue::as_str)
-        .unwrap_or("")
-        .to_string();
+    let prev_hash = query(
+        "SELECT hash FROM audit_log ORDER BY ts DESC, id DESC LIMIT 1",
+        &[],
+    )?
+    .first()
+    .and_then(|r| r.first())
+    .map(SqlValue::as_str)
+    .unwrap_or("")
+    .to_string();
     // Cheap, deterministic FNV-1a chain hash over prev_hash + payload. Not a
     // cryptographic digest, but enough to make silent row edits detectable.
-    let material = alloc::format!(
-        "{prev_hash}|{ts}|{actor}|{action}|{target}|{before}|{after}"
-    );
+    let material = alloc::format!("{prev_hash}|{ts}|{actor}|{action}|{target}|{before}|{after}");
     let hash = fnv1a_hex(material.as_bytes());
     exec(
         "INSERT INTO audit_log (id, ts, actor, action, target, before, after, hash, prev_hash) \
@@ -939,11 +983,17 @@ pub fn list_audit(
     let mut params: Vec<SqlValue> = Vec::new();
     if !actor.trim().is_empty() {
         clauses.push(alloc::format!("LOWER(actor) LIKE ?{}", params.len() + 1));
-        params.push(SqlValue::Text(alloc::format!("%{}%", actor.trim().to_lowercase())));
+        params.push(SqlValue::Text(alloc::format!(
+            "%{}%",
+            actor.trim().to_lowercase()
+        )));
     }
     if !action.trim().is_empty() {
         clauses.push(alloc::format!("LOWER(action) LIKE ?{}", params.len() + 1));
-        params.push(SqlValue::Text(alloc::format!("%{}%", action.trim().to_lowercase())));
+        params.push(SqlValue::Text(alloc::format!(
+            "%{}%",
+            action.trim().to_lowercase()
+        )));
     }
     if since > 0 {
         clauses.push(alloc::format!("ts >= ?{}", params.len() + 1));
@@ -1004,17 +1054,30 @@ pub fn verify_audit_chain() -> Result<ChainStatus, AbiError> {
     for (i, row) in rows.iter().enumerate() {
         let recomputed = fnv1a_hex(
             audit_hash_material(
-                &row.prev_hash, row.ts, &row.actor, &row.action, &row.target,
-                &row.before, &row.after,
+                &row.prev_hash,
+                row.ts,
+                &row.actor,
+                &row.action,
+                &row.target,
+                &row.before,
+                &row.after,
             )
             .as_bytes(),
         );
         if recomputed != row.hash || row.prev_hash != expected_prev {
-            return Ok(ChainStatus { ok: false, checked: rows.len() as i64, first_broken_index: Some(i as i64) });
+            return Ok(ChainStatus {
+                ok: false,
+                checked: rows.len() as i64,
+                first_broken_index: Some(i as i64),
+            });
         }
         expected_prev = row.hash.clone();
     }
-    Ok(ChainStatus { ok: true, checked: rows.len() as i64, first_broken_index: None })
+    Ok(ChainStatus {
+        ok: true,
+        checked: rows.len() as i64,
+        first_broken_index: None,
+    })
 }
 
 // =============================================================================
@@ -1115,7 +1178,10 @@ pub fn update_zone(z: &ZoneRow) -> Result<u64, AbiError> {
 
 /// Deletes a zone by id. Returns rows affected (0 if it did not exist).
 pub fn delete_zone(id: &str) -> Result<u64, AbiError> {
-    exec("DELETE FROM zones WHERE id = ?1", &[SqlValue::Text(id.into())])
+    exec(
+        "DELETE FROM zones WHERE id = ?1",
+        &[SqlValue::Text(id.into())],
+    )
 }
 
 // =============================================================================
@@ -1129,7 +1195,10 @@ pub fn delete_zone(id: &str) -> Result<u64, AbiError> {
 pub fn get_schedule(camera_id: &str) -> Result<Option<String>, AbiError> {
     let sql = "SELECT polygon FROM zones WHERE camera_id = ?1 AND kind = 'schedule' LIMIT 1";
     let rows = query(sql, &[SqlValue::Text(camera_id.into())])?;
-    Ok(rows.first().and_then(|r| r.first()).map(|v| v.as_str().to_string()))
+    Ok(rows
+        .first()
+        .and_then(|r| r.first())
+        .map(|v| v.as_str().to_string()))
 }
 
 /// Upserts the weekly schedule JSON for a camera. There is at most one
@@ -1140,7 +1209,11 @@ pub fn set_schedule(camera_id: &str, grid_json: &str) -> Result<(), AbiError> {
         "SELECT id FROM zones WHERE camera_id = ?1 AND kind = 'schedule' LIMIT 1",
         &[SqlValue::Text(camera_id.into())],
     )?;
-    if let Some(id) = existing.first().and_then(|r| r.first()).map(SqlValue::as_str) {
+    if let Some(id) = existing
+        .first()
+        .and_then(|r| r.first())
+        .map(SqlValue::as_str)
+    {
         exec(
             "UPDATE zones SET polygon = ?2 WHERE id = ?1",
             &[SqlValue::Text(id.into()), SqlValue::Text(grid_json.into())],
@@ -1226,8 +1299,7 @@ pub struct NewEvidence {
 
 /// Column list (with the alarm + camera join) shared by every evidence SELECT so
 /// the row decoder stays in lockstep with the query shape.
-const EVIDENCE_COLS: &str =
-    "e.id, e.alarm_id, e.package_ref, e.signed_by, e.created_at, \
+const EVIDENCE_COLS: &str = "e.id, e.alarm_id, e.package_ref, e.signed_by, e.created_at, \
      COALESCE(a.message, ''), COALESCE(c.name, ''), COALESCE(a.severity, '')";
 
 fn row_to_evidence(r: &Row) -> EvidenceRow {
@@ -1292,7 +1364,10 @@ pub fn insert_evidence(e: &NewEvidence) -> Result<String, AbiError> {
 
 /// Deletes an evidence package by id. Returns rows affected (0 if it did not exist).
 pub fn delete_evidence(id: &str) -> Result<u64, AbiError> {
-    exec("DELETE FROM evidence WHERE id = ?1", &[SqlValue::Text(id.into())])
+    exec(
+        "DELETE FROM evidence WHERE id = ?1",
+        &[SqlValue::Text(id.into())],
+    )
 }
 
 // =============================================================================
@@ -1306,7 +1381,11 @@ pub fn upsert_vector_ref(ref_id: u64, alarm_id: &str, ts: i64) -> Result<(), Abi
     exec(
         "INSERT INTO vector_refs (ref_id, alarm_id, ts) VALUES (?1, ?2, ?3) \
          ON CONFLICT(ref_id) DO UPDATE SET alarm_id = ?2, ts = ?3",
-        &[SqlValue::I64(ref_id as i64), SqlValue::Text(alarm_id.into()), SqlValue::I64(ts)],
+        &[
+            SqlValue::I64(ref_id as i64),
+            SqlValue::Text(alarm_id.into()),
+            SqlValue::I64(ts),
+        ],
     )?;
     Ok(())
 }
@@ -1314,8 +1393,14 @@ pub fn upsert_vector_ref(ref_id: u64, alarm_id: &str, ts: i64) -> Result<(), Abi
 /// Resolves a vector `ref_id` back to its alarm string id, or None when the
 /// mapping is unknown (e.g. an alarm deleted after indexing).
 pub fn alarm_id_for_ref(ref_id: u64) -> Result<Option<String>, AbiError> {
-    let rows = query("SELECT alarm_id FROM vector_refs WHERE ref_id = ?1", &[SqlValue::I64(ref_id as i64)])?;
-    Ok(rows.first().and_then(|r| r.first()).map(|v| v.as_str().to_string()))
+    let rows = query(
+        "SELECT alarm_id FROM vector_refs WHERE ref_id = ?1",
+        &[SqlValue::I64(ref_id as i64)],
+    )?;
+    Ok(rows
+        .first()
+        .and_then(|r| r.first())
+        .map(|v| v.as_str().to_string()))
 }
 
 /// Lists every alarm (newest first) for the reindex backfill. Reuses the alarm
@@ -1330,8 +1415,14 @@ pub fn list_all_alarms() -> Result<Vec<AlarmRow>, AbiError> {
 
 /// Reads a setting value by key, or None when it is absent.
 pub fn get_setting(key: &str) -> Result<Option<String>, AbiError> {
-    let rows = query("SELECT value FROM settings WHERE key = ?1", &[SqlValue::Text(key.into())])?;
-    Ok(rows.first().and_then(|r| r.first()).map(|v| v.as_str().to_string()))
+    let rows = query(
+        "SELECT value FROM settings WHERE key = ?1",
+        &[SqlValue::Text(key.into())],
+    )?;
+    Ok(rows
+        .first()
+        .and_then(|r| r.first())
+        .map(|v| v.as_str().to_string()))
 }
 
 /// Reads a setting as i64, falling back to `default` when absent or unparsable.
