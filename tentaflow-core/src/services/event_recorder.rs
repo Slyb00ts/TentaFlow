@@ -246,6 +246,11 @@ struct VehicleMeta {
     /// class → best (highest-confidence) full-frame thumbnail seen for that
     /// class: the snapshot ref plus the confidence that backs it.
     best_thumb: BTreeMap<String, (String, f32)>,
+    /// Running sum of detection box CENTER-X (0..1) and its count — the mean is
+    /// the bucket's horizontal position, used to cluster track fragments into
+    /// physical lanes (see [`EventMeta::consolidated`]).
+    cx_sum: f64,
+    cx_count: u64,
 }
 
 /// Aggregates every detection observed during one event, GROUPED BY vehicle.
@@ -262,6 +267,16 @@ struct EventMeta {
 const CLASS_PLATE: &str = "tablica_rejestracyjna";
 /// Detection class carrying ADR placard reads.
 const CLASS_ADR: &str = "tablica_adr";
+/// Detection class of a whole-vehicle box (YOLO vehicle detector). Mirrors
+/// `vision::detector_vehicle::VEHICLE_CLASS`, kept local so this always-compiled
+/// module needs no dependency on the feature-gated detector.
+const VEHICLE_CLASS: &str = "vehicle";
+
+/// Minimum horizontal gap (fraction of frame width) between two clusters of
+/// track fragments for them to count as TWO separate lanes/vehicles. Below this,
+/// all fragments are treated as ONE physical vehicle that moved/was re-acquired.
+/// Two adjacent entry lanes sit well apart; one truck's jitter stays under it.
+const LANE_SPLIT_GAP: f64 = 0.20;
 
 /// Splits a raw `stan` string into `(label, state)`. Sticker labels are emitted
 /// as `"<label> <state>"` (e.g. `"nalepka_3 czysta"`, `"znak_srodowiskowy
@@ -284,6 +299,10 @@ impl VehicleMeta {
     /// per-truck split only changed WHICH `VehicleMeta` a detection lands in.
     fn absorb_one(&mut self, d: &Detection) {
         *self.classes.entry(d.klasa.clone()).or_insert(0) += 1;
+        // Horizontal position of this detection (box center-x, 0..1) feeds the
+        // per-lane clustering that collapses one truck's track fragments.
+        self.cx_sum += (d.bbox[0] + d.bbox[2] * 0.5) as f64;
+        self.cx_count += 1;
         if let Some(t) = d.tekst.as_deref() {
             if !t.is_empty() {
                 // An executor-path read has no numeric score; treat it as a
@@ -333,6 +352,12 @@ impl VehicleMeta {
                 } else {
                     (sticker.to_string(), s.to_string())
                 };
+                // The plate and ADR placard are NOT stickers — they surface as
+                // their own Rejestracja/ADR columns, so their condition never
+                // pollutes the "Nalepki" list.
+                if label == CLASS_PLATE || label == CLASS_ADR {
+                    continue;
+                }
                 *self.stany.entry(label).or_default().entry(state).or_insert(0) += 1;
             }
         }
@@ -441,6 +466,16 @@ impl VehicleMeta {
             .collect()
     }
 
+    /// Mean horizontal position (box center-x, 0..1) of this bucket's detections.
+    /// `0.5` (frame center) when no positioned detection was seen.
+    fn mean_cx(&self) -> f64 {
+        if self.cx_count == 0 {
+            0.5
+        } else {
+            self.cx_sum / self.cx_count as f64
+        }
+    }
+
     /// Folds another bucket's tallies into this one — consolidating track-fragment
     /// buckets that resolve to the SAME physical truck (see [`EventMeta::consolidated`]).
     fn merge_from(&mut self, other: &VehicleMeta) {
@@ -464,6 +499,8 @@ impl VehicleMeta {
         }
         self.tracks.extend(other.tracks.iter().copied());
         self.frames += other.frames;
+        self.cx_sum += other.cx_sum;
+        self.cx_count += other.cx_count;
         for (k, (r, c)) in &other.best_thumb {
             let better = self.best_thumb.get(k).map(|(_, cc)| c > cc).unwrap_or(true);
             if better {
@@ -495,33 +532,57 @@ impl EventMeta {
         }
     }
 
-    /// Consolidates track-fragment buckets into physical trucks. A truck on a
-    /// busy weighbridge is re-acquired by the IOU tracker many times (occlusion,
-    /// leaving/re-entering the frame), so ONE truck fragments across dozens of
-    /// `vehicle_id`s. Buckets that resolve to the SAME plate — or, when plate-less,
-    /// the same ADR read — are the same truck and are merged. Two DIFFERENT trucks
-    /// side by side keep distinct plates, so they never merge. Read-less buckets
-    /// (spurious background-vehicle boxes, or the unassigned `0` bucket) stay
-    /// separate. Keyed by the smallest source `vehicle_id` of each group (stable).
+    /// Consolidates track-fragment buckets into PHYSICAL vehicles by LANE. One
+    /// truck driving in, stopping, and leaving is re-acquired by the IOU tracker
+    /// under dozens of `vehicle_id`s — but it stays in ITS lane, so all its
+    /// fragments share a horizontal position. The scene has at most two vehicles
+    /// (two adjacent entry lanes side by side), so we cluster buckets by mean
+    /// center-x into AT MOST TWO lanes: sort by position, split at the single
+    /// widest horizontal gap only when that gap exceeds [`LANE_SPLIT_GAP`] (two
+    /// distinct lanes), otherwise merge everything into one vehicle. This turns
+    /// "50 vehicles" back into the one (or two) real trucks. Each lane is keyed by
+    /// the smallest source `vehicle_id` it contains (stable, deterministic).
     fn consolidated(&self) -> BTreeMap<u32, VehicleMeta> {
-        // Resolved identity ("P:<plate>" / "A:<adr>") → representative id. Read-less
-        // buckets have no identity and are never merged.
-        let mut by_identity: BTreeMap<String, u32> = BTreeMap::new();
+        // (mean_cx, id) sorted left→right. Positionless buckets (no box seen) sit
+        // at 0.5 so they fold into whichever lane wins the center.
+        let mut ordered: Vec<(f64, u32)> = self
+            .vehicles
+            .iter()
+            .map(|(id, vm)| (vm.mean_cx(), *id))
+            .collect();
+        ordered.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        // Widest gap between adjacent positions = the boundary between two lanes.
+        let mut split_at = 0usize; // number of buckets left of the split
+        let mut widest = 0.0f64;
+        for i in 1..ordered.len() {
+            let gap = ordered[i].0 - ordered[i - 1].0;
+            if gap > widest {
+                widest = gap;
+                split_at = i;
+            }
+        }
+        let two_lanes = widest >= LANE_SPLIT_GAP;
+
         let mut out: BTreeMap<u32, VehicleMeta> = BTreeMap::new();
-        for (id, vm) in &self.vehicles {
-            let (plate, adr) = vm.winner_texts();
-            let identity = match (plate, adr) {
-                (Some(p), _) => Some(format!("P:{p}")),
-                (None, Some(a)) => Some(format!("A:{a}")),
-                (None, None) => None,
-            };
-            let rep = match identity {
-                // BTreeMap iterates ascending, so the first fragment of an identity
-                // fixes the smallest id as its representative.
-                Some(key) => *by_identity.entry(key).or_insert(*id),
-                None => *id,
-            };
-            out.entry(rep).or_default().merge_from(vm);
+        // Representative id per lane = the smallest id in that lane.
+        let lane_rep = |slice: &[(f64, u32)]| slice.iter().map(|(_, id)| *id).min().unwrap_or(0);
+        let (left, right) = if two_lanes {
+            ordered.split_at(split_at)
+        } else {
+            (&ordered[..], &[][..])
+        };
+        for lane in [left, right] {
+            if lane.is_empty() {
+                continue;
+            }
+            let rep = lane_rep(lane);
+            let dst = out.entry(rep).or_default();
+            for (_, id) in lane {
+                if let Some(vm) = self.vehicles.get(id) {
+                    dst.merge_from(vm);
+                }
+            }
         }
         out
     }
@@ -551,6 +612,20 @@ impl EventMeta {
         self.primary()
             .map(|(_, vm)| vm.winner_texts())
             .unwrap_or((None, None))
+    }
+
+    /// Whether this event captured anything worth keeping: at least one
+    /// consolidated vehicle with a plate/ADR/sticker read OR an actual vehicle
+    /// box. Events that triggered on transient noise and never enriched anything
+    /// (no vehicle, no sign) are DISCARDED instead of cataloged as empty clips.
+    fn has_content(&self) -> bool {
+        self.consolidated().values().any(|vm| {
+            let (plate, adr) = vm.winner_texts();
+            plate.is_some()
+                || adr.is_some()
+                || !vm.stany_winners().is_empty()
+                || vm.classes.contains_key(VEHICLE_CLASS)
+        })
     }
 
     /// Scalar event thumbnail = the PRIMARY vehicle's photo, falling back to ANY
@@ -1310,6 +1385,17 @@ async fn finalize_and_catalog(
     file: ActiveFile,
     meta: &EventMeta,
 ) {
+    // Never catalog an empty clip: an event that triggered on transient noise and
+    // never enriched a vehicle/sign is dropped (file deleted), so the recordings
+    // list only ever shows clips that actually contain a vehicle.
+    if !meta.has_content() {
+        file.discard().await;
+        debug!(
+            camera_id,
+            "[event_recorder] event had no vehicle content — clip discarded (not cataloged)"
+        );
+        return;
+    }
     match file.finalize().await {
         Ok(fin) => {
             let json = meta.to_json(
@@ -1384,34 +1470,45 @@ mod tests {
         d
     }
 
-    /// Two trucks in one event must NOT mix their plates/ADR: each vehicle_id
-    /// gets its own `VehicleMeta`, `vehicles[]` carries both, and the scalar
-    /// columns report the PRIMARY (most-frames) truck.
+    /// Like `det_veh` but placed at horizontal position `cx` (box center-x, 0..1)
+    /// so the lane-clustering consolidation can tell fragments apart by position.
+    fn det_veh_at(
+        klasa: &str,
+        tekst: Option<&str>,
+        track_id: u32,
+        vehicle_id: u32,
+        cx: f32,
+    ) -> Detection {
+        let mut d = det_veh(klasa, tekst, track_id, vehicle_id);
+        d.bbox = [(cx - 0.05).max(0.0), 0.1, 0.1, 0.2];
+        d
+    }
+
+    /// Two trucks on the two ADJACENT LANES (well apart horizontally) must NOT
+    /// mix their plates/ADR: lane clustering keeps them as two vehicles, and the
+    /// scalar columns report the PRIMARY (most-frames) truck.
     #[test]
     fn event_meta_two_trucks_do_not_mix() {
         let mut meta = EventMeta::default();
-        // Truck 1 (vehicle_id 1) — plate + ADR, seen in 3 frames.
+        // Truck 1 (left lane, cx≈0.25) — plate + ADR, seen in 3 frames.
         for _ in 0..3 {
             meta.absorb(&[
-                det_veh(CLASS_PLATE, Some("WGM11111"), 10, 1),
-                det_veh(CLASS_ADR, Some("30/1202"), 11, 1),
+                det_veh_at(CLASS_PLATE, Some("WGM11111"), 10, 1, 0.25),
+                det_veh_at(CLASS_ADR, Some("30/1202"), 11, 1, 0.25),
             ]);
         }
-        // Truck 2 (vehicle_id 2) — a DIFFERENT plate, seen in 1 frame.
-        meta.absorb(&[det_veh(CLASS_PLATE, Some("KR22222"), 20, 2)]);
+        // Truck 2 (right lane, cx≈0.75) — a DIFFERENT plate, seen in 1 frame.
+        meta.absorb(&[det_veh_at(CLASS_PLATE, Some("KR22222"), 20, 2, 0.75)]);
 
         let v: serde_json::Value =
             serde_json::from_str(&meta.to_json(0, 0, 0, 0)).expect("valid json");
         let vehicles = v["vehicles"].as_array().expect("vehicles array");
-        assert_eq!(vehicles.len(), 2, "two distinct trucks");
-        // Vehicle 1 owns WGM11111 + the ADR; vehicle 2 owns KR22222 and NO ADR.
-        let by_id = |id: u64| vehicles.iter().find(|x| x["vehicle_id"] == id).unwrap();
-        let t1 = by_id(1);
-        assert_eq!(t1["plate"], "WGM11111");
+        assert_eq!(vehicles.len(), 2, "two distinct lanes → two trucks");
+        // Left lane owns WGM11111 + the ADR; right lane owns KR22222 and NO ADR.
+        let t1 = vehicles.iter().find(|x| x["plate"] == "WGM11111").unwrap();
         assert_eq!(t1["adr"], "30/1202");
         assert_eq!(t1["detection_frames"], 3);
-        let t2 = by_id(2);
-        assert_eq!(t2["plate"], "KR22222");
+        let t2 = vehicles.iter().find(|x| x["plate"] == "KR22222").unwrap();
         assert!(t2["adr"].is_null(), "truck 2 has no ADR — not truck 1's");
         assert_eq!(t2["detection_frames"], 1);
 
@@ -1421,56 +1518,33 @@ mod tests {
         assert_eq!(adr.as_deref(), Some("30/1202"));
     }
 
-    /// Track fragmentation: the IOU tracker re-acquires one physical truck under
-    /// several `vehicle_id`s over a long event. Buckets that resolve to the SAME
-    /// plate MUST consolidate into ONE panel entry (else the panel shows dozens of
-    /// "Pojazd N" for one truck). A different plate stays separate.
+    /// Track fragmentation: ONE truck driving in / stopping / leaving is
+    /// re-acquired by the IOU tracker under dozens of `vehicle_id`s — but it stays
+    /// in its lane, so ALL fragments share a horizontal position and MUST collapse
+    /// to a single vehicle (else the panel shows "50 vehicles" for one truck).
     #[test]
-    fn event_meta_same_plate_fragments_consolidate() {
+    fn event_meta_one_truck_many_fragments_collapse_to_one() {
         let mut meta = EventMeta::default();
-        // Same truck, plate WZ12345, re-acquired as vehicle_id 5, 9, 40 across the
-        // event (each with its own ADR reads of the same load).
-        for vid in [5u32, 9, 40] {
-            for _ in 0..4 {
-                meta.absorb(&[
-                    det_veh(CLASS_PLATE, Some("WZ12345"), vid, vid),
-                    det_veh(CLASS_ADR, Some("30/1202"), vid + 1, vid),
-                ]);
-            }
+        // Same truck (left lane, cx≈0.3) re-acquired as MANY different vehicle_ids,
+        // reading its plate on only some fragments (the rest are bare boxes).
+        for vid in [5u32, 9, 40, 77, 103, 150, 201] {
+            meta.absorb(&[
+                det_veh_at("vehicle", None, vid, vid, 0.30),
+                det_veh_at(CLASS_PLATE, Some("WZ12345"), vid + 1, vid, 0.30),
+            ]);
         }
-        // A genuinely different truck, plate DIFF999, once.
-        meta.absorb(&[det_veh(CLASS_PLATE, Some("DIFF999"), 77, 77)]);
-        // A read-less background car (only a vehicle box) — never a panel entry.
-        meta.absorb(&[det_veh("vehicle", None, 88, 88)]);
+        // Plus a swarm of read-less fragments at the same position (occlusion jitter).
+        for vid in 300u32..320 {
+            meta.absorb(&[det_veh_at("vehicle", None, vid, vid, 0.31)]);
+        }
 
         let v: serde_json::Value =
             serde_json::from_str(&meta.to_json(0, 0, 0, 0)).expect("valid json");
         let vehicles = v["vehicles"].as_array().expect("vehicles array");
-        // WZ12345 (merged from 5/9/40) + DIFF999 + the read-less 88 bucket = 3
-        // consolidated buckets; the three WZ fragments collapsed to one.
-        let plates: Vec<&str> = vehicles
-            .iter()
-            .filter_map(|x| x["plate"].as_str())
-            .collect();
-        assert!(plates.contains(&"WZ12345"), "merged plate present");
-        assert!(plates.contains(&"DIFF999"), "distinct plate kept");
-        assert_eq!(
-            plates.iter().filter(|p| **p == "WZ12345").count(),
-            1,
-            "the same-plate fragments collapse to a single entry"
-        );
-        // The merged truck keyed by its smallest source id (5), 12 detection frames.
-        let merged = vehicles
-            .iter()
-            .find(|x| x["plate"] == "WZ12345")
-            .expect("merged truck");
-        assert_eq!(merged["vehicle_id"], 5, "keyed by smallest source id");
-        assert_eq!(merged["detection_frames"], 12, "4+4+4 frames summed");
-
-        // Scalar columns = the PRIMARY (merged WZ12345, most frames).
-        let (plate, adr) = meta.winner_texts();
+        assert_eq!(vehicles.len(), 1, "one lane → exactly one vehicle");
+        assert_eq!(vehicles[0]["plate"], "WZ12345");
+        let (plate, _) = meta.winner_texts();
         assert_eq!(plate.as_deref(), Some("WZ12345"));
-        assert_eq!(adr.as_deref(), Some("30/1202"));
     }
 
     /// A single-vehicle event must keep the scalar columns byte-identical to the
@@ -1710,18 +1784,38 @@ mod tests {
     #[test]
     fn event_thumb_falls_back_to_non_primary_vehicle() {
         let mut meta = EventMeta::default();
-        // Primary truck (vehicle 1): 3 frames, plate WPRIM11, but NO thumbnail.
+        // Primary truck (left lane, cx≈0.25): 3 frames, plate WPRIM11, NO thumbnail.
         for _ in 0..3 {
-            meta.absorb(&[det_veh(CLASS_PLATE, Some("WPRIM11"), 10, 1)]);
+            meta.absorb(&[det_veh_at(CLASS_PLATE, Some("WPRIM11"), 10, 1, 0.25)]);
         }
-        // Secondary vehicle (vehicle 2): 1 frame, no read, but a scene thumbnail.
-        let mut d = det_veh("vehicle", None, 20, 2);
+        // Secondary vehicle (right lane, cx≈0.75): 1 frame, no read, but a thumbnail.
+        let mut d = det_veh_at("vehicle", None, 20, 2, 0.75);
         d.tekst_thumb_ref = Some("snap_scene".to_string());
         meta.absorb(&[d]);
 
-        // Primary is vehicle 1 (more frames) and has no thumb → fall back to
-        // vehicle 2's scene photo rather than None.
+        // Primary is the left-lane truck (more frames) and has no thumb → fall back
+        // to the right-lane vehicle's scene photo rather than None.
         assert_eq!(meta.event_thumb().as_deref(), Some("snap_scene"));
+    }
+
+    /// An event that enriched NOTHING (no vehicle, no sign) must report no
+    /// content, so `finalize_and_catalog` discards it instead of cataloging an
+    /// empty clip. A single vehicle box (a real car) IS content.
+    #[test]
+    fn event_meta_empty_has_no_content() {
+        assert!(!EventMeta::default().has_content(), "nothing absorbed → empty");
+
+        let mut noise = EventMeta::default();
+        // A sign flash with no readable text and no vehicle box → still empty.
+        noise.absorb(&[det_veh("nalepka_3", None, 0, 0)]);
+        assert!(
+            !noise.has_content(),
+            "a read-less sign with no vehicle box is not content"
+        );
+
+        let mut car = EventMeta::default();
+        car.absorb(&[det_veh("vehicle", None, 7, 7)]);
+        assert!(car.has_content(), "a real vehicle box IS content");
     }
 
     /// Sticker-state aggregation: each `<label> <state>` frame votes for the
