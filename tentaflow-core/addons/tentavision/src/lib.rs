@@ -7099,8 +7099,12 @@ static PENDING_RECORDING_ROWS: Mutex<Option<Value>> = Mutex::new(None);
 /// TTL for a recording playback signed URL. Comfortably longer than a single
 /// clip so the player never loses the source mid-playback, still bounded.
 const RECORDING_URL_TTL_SECS: u64 = 3600;
-/// Max recordings pulled into the browse list at once.
-const RECORDING_LIST_LIMIT: u32 = 200;
+/// Max recordings pulled into the browse list at once. Every row now carries a
+/// thumbnail, and each thumbnail is a per-row signed-URL host call; 200 of those
+/// in one render exhausts the addon's wasm fuel budget (the render traps). 50 is
+/// a comfortable browse page well within budget — older clips are reached via the
+/// date/plate/ADR search filters, not by dumping the whole history at once.
+const RECORDING_LIST_LIMIT: u32 = 50;
 
 /// The winner plate/ADR text parsed out of one `event_meta.texts.<class>` entry.
 /// `event_meta` has drifted between two shapes over builds, so this handles
