@@ -18,6 +18,11 @@ def block_reduce_sum(val: Float32) -> Float32:
     var v = warp.sum(val)
     lane = thread_idx.x % WARP_SIZE
     wid = thread_idx.x // WARP_SIZE
+    # Callers chain reductions back-to-back (LayerNorm: mean, then variance)
+    # and this function reuses the same shared slots each call. Without an
+    # entry barrier, warp 0 of call N+1 overwrites the broadcast slot
+    # shared[0] while late warps of call N are still reading it.
+    barrier()
     if lane == 0:
         shared[wid] = v
     barrier()

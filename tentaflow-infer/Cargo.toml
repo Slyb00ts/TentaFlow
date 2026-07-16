@@ -1,7 +1,7 @@
 # ===== File: Cargo.toml — FORGE workspace manifest =====
 [workspace]
 resolver = "2"
-members = ["crates/forge-types", "crates/forge-hal", "crates/forge-kernels", "crates/forge-formats", "crates/forge-tokenize", "crates/forge-engine", "crates/forge-server", "crates/forge-cli"]
+members = ["crates/forge-types", "crates/forge-hal", "crates/forge-kernels", "crates/forge-formats", "crates/forge-tokenize", "crates/forge-engine", "crates/forge-whisper", "crates/forge-server", "crates/forge-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,6 +16,7 @@ forge-kernels = { path = "crates/forge-kernels" }
 forge-formats = { path = "crates/forge-formats" }
 forge-tokenize = { path = "crates/forge-tokenize" }
 forge-engine = { path = "crates/forge-engine" }
+forge-whisper = { path = "crates/forge-whisper" }
 forge-server = { path = "crates/forge-server" }
 cudarc = { version = "0.19.8", default-features = false, features = [
     "std",
@@ -44,6 +45,8 @@ futures = "0.3"
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
+rustfft = "6"
+hound = "3.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 [profile.release]

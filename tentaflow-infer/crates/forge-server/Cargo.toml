@@ -11,8 +11,9 @@ forge-hal.workspace = true
 forge-formats.workspace = true
 forge-tokenize.workspace = true
 forge-engine.workspace = true
+forge-whisper.workspace = true
 anyhow.workspace = true
-axum.workspace = true
+axum = { workspace = true, features = ["multipart"] }
 tokio.workspace = true
 tokio-stream.workspace = true
 serde.workspace = true

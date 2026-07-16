@@ -700,7 +700,15 @@ impl Device for CudaDevice {
         self.bind()?;
         unsafe {
             result::memcpy_htod_sync(dst.device_ptr() + dst_offset as u64, src)
-                .map_err(|e| cu_err("cuMemcpyHtoD", e))
+                .map_err(|e| cu_err("cuMemcpyHtoD", e))?;
+            // cuMemcpyHtoD from PAGEABLE memory returns once the source is
+            // staged; the DMA to the device is still in flight on the legacy
+            // default stream. Streams created by this HAL are NON_BLOCKING,
+            // so a kernel launched right after would NOT wait for that DMA
+            // and could read (or be overwritten by) a half-arrived buffer.
+            // Draining the legacy stream makes `write` truly synchronous.
+            result::stream::synchronize(std::ptr::null_mut())
+                .map_err(|e| cu_err("cuStreamSynchronize(legacy)", e))
         }
     }
 

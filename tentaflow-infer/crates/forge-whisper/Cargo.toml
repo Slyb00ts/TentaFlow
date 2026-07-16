@@ -1,0 +1,19 @@
+# ===== File: Cargo.toml — forge-whisper: Whisper STT engine (encoder-decoder over FORGE kernels) =====
+[package]
+name = "forge-whisper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-types.workspace = true
+forge-hal.workspace = true
+forge-kernels.workspace = true
+forge-formats.workspace = true
+forge-tokenize.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+rustfft.workspace = true
+hound.workspace = true

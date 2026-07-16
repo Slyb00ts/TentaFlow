@@ -53,6 +53,9 @@ enum Command {
         /// Tool-call output parser: hermes | llama3 | none (default: auto-detect).
         #[arg(long)]
         tool_call_parser: Option<String>,
+        /// Whisper HF snapshot directory enabling /v1/audio/transcriptions.
+        #[arg(long)]
+        whisper_model: Option<PathBuf>,
     },
     /// One-shot generation streamed to stdout.
     Run {
@@ -70,6 +73,16 @@ enum Command {
         /// VRAM weights-pool size in GiB (0 = automatic split of free VRAM).
         #[arg(long = "weights-pool-gb", default_value_t = 0.0)]
         weights_pool_gb: f64,
+    },
+    /// Transcribe a WAV file with a Whisper model.
+    Transcribe {
+        /// Whisper HF snapshot directory (safetensors + tokenizer + configs).
+        model_dir: PathBuf,
+        /// WAV file (PCM i16/i24/i32 or f32; resampled to 16 kHz mono).
+        wav_path: PathBuf,
+        /// Language code, e.g. pl | en | de (default: en).
+        #[arg(long)]
+        language: Option<String>,
     },
     /// Measure prefill and decode throughput.
     Bench {
@@ -103,6 +116,7 @@ fn main() -> Result<()> {
             kv_pages,
             weights_pool_gb,
             tool_call_parser,
+            whisper_model,
         } => cmd_serve(
             &model_path,
             bind,
@@ -113,6 +127,7 @@ fn main() -> Result<()> {
             kv_pages,
             weights_pool_gb,
             tool_call_parser,
+            whisper_model.as_deref(),
         ),
         Command::Run {
             model_path,
@@ -122,6 +137,11 @@ fn main() -> Result<()> {
             chat,
             weights_pool_gb,
         } => cmd_run(&model_path, &prompt, max_tokens, temperature, chat, weights_pool_gb),
+        Command::Transcribe {
+            model_dir,
+            wav_path,
+            language,
+        } => cmd_transcribe(&model_dir, &wav_path, language.as_deref()),
         Command::Bench {
             model_path,
             tokens,
@@ -190,6 +210,56 @@ fn load_auto(path: &Path, weights_pool_gb: f64) -> Result<LoadedModel> {
     load_model(dev, path, ModelConfig::default())
 }
 
+/// Load a Whisper model on its own CudaDevice with pools sized from the
+/// snapshot: safetensors bytes bound the f16 upload (most tensors are f32,
+/// halved on upload) and 1 GiB covers the persistent activation scratch.
+/// A separate device instance keeps Whisper's weights-pool allocations away
+/// from the LLM engine's pools.
+fn load_whisper(dir: &Path) -> Result<forge_server::SharedWhisper> {
+    let mut tensor_bytes: u64 = 0;
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry?;
+        if entry.path().extension().is_some_and(|e| e == "safetensors") {
+            tensor_bytes += entry.metadata()?.len();
+        }
+    }
+    if tensor_bytes == 0 {
+        bail!("no .safetensors files in {}", dir.display());
+    }
+    let device = CudaDevice::new(
+        0,
+        PoolSizes {
+            weights: tensor_bytes as usize + (1 << 30),
+            kv_cache: 4 << 20,
+            activations: 32 << 20,
+            kv_page_size: 256 << 10,
+        },
+    )
+    .context("create CUDA device for whisper")?;
+    let dev: Arc<dyn Device> = device;
+    let model = forge_whisper::WhisperModel::load(dev, dir)
+        .with_context(|| format!("load whisper model from {}", dir.display()))?;
+    Ok(Arc::new(tokio::sync::Mutex::new(model)))
+}
+
+fn cmd_transcribe(model_dir: &Path, wav_path: &Path, language: Option<&str>) -> Result<()> {
+    let t0 = Instant::now();
+    let whisper = load_whisper(model_dir)?;
+    eprintln!("whisper model loaded in {:.1}s", t0.elapsed().as_secs_f32());
+    let samples = forge_whisper::audio::load_wav(wav_path)
+        .with_context(|| format!("load {}", wav_path.display()))?;
+    let t1 = Instant::now();
+    let mut model = whisper.try_lock().expect("freshly created mutex");
+    let text = model.transcribe(&samples, language)?;
+    eprintln!(
+        "transcribed {:.1}s of audio in {:.2}s",
+        samples.len() as f32 / 16_000.0,
+        t1.elapsed().as_secs_f32()
+    );
+    println!("{text}");
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_serve(
     model_path: &Path,
@@ -201,6 +271,7 @@ fn cmd_serve(
     kv_pages: usize,
     weights_pool_gb: f64,
     tool_call_parser: Option<String>,
+    whisper_model: Option<&Path>,
 ) -> Result<()> {
     let max_active = usize::from(max_active);
     let t0 = Instant::now();
@@ -235,6 +306,20 @@ fn cmd_serve(
     tracing::info!("tool-call parser: {tool_parser:?}");
     let engine = spawn_engine(loaded.model, tokenizer.clone(), max_active, prefill_chunk);
 
+    let whisper = match whisper_model {
+        Some(dir) => {
+            let t = Instant::now();
+            let w = load_whisper(dir)?;
+            tracing::info!(
+                "whisper model {} loaded in {:.1}s",
+                dir.display(),
+                t.elapsed().as_secs_f32()
+            );
+            Some(w)
+        }
+        None => None,
+    };
+
     let cfg = ServerConfig {
         bind,
         model_id: model_id.unwrap_or_else(|| default_model_id(model_path)),
@@ -251,6 +336,7 @@ fn cmd_serve(
         max_context,
         max_active,
         tool_parser,
+        whisper,
     );
 
     tokio::runtime::Builder::new_multi_thread()

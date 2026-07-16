@@ -47,6 +47,18 @@ impl ApiError {
         }
     }
 
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            body: ApiErrorBody {
+                message: message.into(),
+                error_type: "invalid_request_error".into(),
+                code: Some("not_found".into()),
+            },
+            retry_after: None,
+        }
+    }
+
     pub fn unauthorized() -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,

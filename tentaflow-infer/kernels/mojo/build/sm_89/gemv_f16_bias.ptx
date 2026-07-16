@@ -73,6 +73,7 @@ $L__BB0_3:
 	shr.u64 	%rd10, %rd7, 5;
 	and.b64 	%rd11, %rd7, 31;
 	mov.b32 	%r21, src_reduce_block_reduce_sum6A6A6A6AoA6A6A_df2b80fe8948d602_$__global_alloc_0_$__gpu_shared_mem;
+	bar.sync 	0;
 	setp.ne.b64 	%p3, %rd11, 0;
 	@%p3 bra 	$L__BB0_5;
 	cvt.u32.u64 	%r22, %rd10;

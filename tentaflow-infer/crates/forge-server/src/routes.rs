@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Request, State};
+use axum::extract::{Multipart, Request, State};
 use axum::http::header;
 use axum::middleware::Next;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -13,6 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use forge_engine::generate::FinishReason;
 use forge_engine::server::{EngineEvent, EngineRequest};
+use forge_types::ForgeError;
 use forge_tokenize::{ChatMessage, ChatTemplateEngine};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -611,6 +612,76 @@ pub async fn completions(
         })
         .into_response(),
         Err(e) => e.into_response(),
+    }
+}
+
+/// POST /v1/audio/transcriptions — OpenAI-compatible speech-to-text.
+/// Multipart form: `file` (WAV bytes, required), `language` (optional ISO
+/// code), `model` (accepted for API compatibility; this server hosts exactly
+/// one Whisper model). Returns `{"text": "..."}`. 404 when the server was
+/// started without `--whisper-model`.
+pub async fn audio_transcriptions(
+    State(state): State<Arc<ServerState>>,
+    mut multipart: Multipart,
+) -> Response {
+    let Some(whisper) = state.whisper.clone() else {
+        return ApiError::not_found(
+            "no speech-to-text model is configured; start the server with --whisper-model",
+        )
+        .into_response();
+    };
+
+    let mut file: Option<Vec<u8>> = None;
+    let mut language: Option<String> = None;
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) => match field.name().unwrap_or("") {
+                "file" => match field.bytes().await {
+                    Ok(b) => file = Some(b.to_vec()),
+                    Err(e) => {
+                        return ApiError::invalid_request(format!("reading `file` part: {e}"))
+                            .into_response()
+                    }
+                },
+                "language" => match field.text().await {
+                    Ok(t) if !t.trim().is_empty() => language = Some(t.trim().to_string()),
+                    Ok(_) => {}
+                    Err(e) => {
+                        return ApiError::invalid_request(format!("reading `language` part: {e}"))
+                            .into_response()
+                    }
+                },
+                // `model`, `response_format`, `temperature`, … accepted and
+                // ignored: one model per server, JSON response only.
+                _ => {}
+            },
+            Ok(None) => break,
+            Err(e) => {
+                return ApiError::invalid_request(format!("malformed multipart body: {e}"))
+                    .into_response()
+            }
+        }
+    }
+    let Some(bytes) = file else {
+        return ApiError::invalid_request("missing `file` part").into_response();
+    };
+
+    // One transcription at a time: the owned guard rides into spawn_blocking
+    // so the GPU work never blocks a tokio worker.
+    let guard = whisper.lock_owned().await;
+    let joined = tokio::task::spawn_blocking(move || {
+        let mut model = guard;
+        let samples = forge_whisper::audio::decode_wav_bytes(&bytes)?;
+        model.transcribe(&samples, language.as_deref())
+    })
+    .await;
+    match joined {
+        Ok(Ok(text)) => Json(serde_json::json!({ "text": text })).into_response(),
+        Ok(Err(e @ (ForgeError::Format(_) | ForgeError::Unsupported(_)))) => {
+            ApiError::invalid_request(e.to_string()).into_response()
+        }
+        Ok(Err(e)) => ApiError::internal(format!("transcription failed: {e}")).into_response(),
+        Err(e) => ApiError::internal(format!("transcription task failed: {e}")).into_response(),
     }
 }
 

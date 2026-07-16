@@ -2,7 +2,8 @@
 // PLAN chunk 7 / SPEC §8.1 subset: /v1/chat/completions, /v1/completions,
 // /v1/models with SSE streaming and usage accounting, plus /healthz. The
 // engine's blocking event receivers are bridged to tokio; admission-control
-// rejections surface as 429 + Retry-After.
+// rejections surface as 429 + Retry-After. /v1/audio/transcriptions is served
+// when a Whisper model is configured (`forge serve --whisper-model`).
 
 pub mod api;
 pub mod error;
@@ -18,6 +19,10 @@ use axum::routing::{get, post};
 use axum::Router;
 use forge_engine::server::EngineHandle;
 use forge_tokenize::Tokenizer;
+
+/// Whisper STT shared across handlers; the mutex serializes transcriptions
+/// (single sequence per model, one at a time on the device).
+pub type SharedWhisper = Arc<tokio::sync::Mutex<forge_whisper::WhisperModel>>;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -47,6 +52,8 @@ pub struct ServerState {
     pub created: u64,
     /// Which tool-call syntax to parse out of this model's output.
     pub tool_parser: toolcall::ToolParserKind,
+    /// Optional Whisper STT model backing /v1/audio/transcriptions.
+    pub whisper: Option<SharedWhisper>,
 }
 
 impl ServerState {
@@ -61,6 +68,7 @@ impl ServerState {
         max_context: usize,
         max_active: usize,
         tool_parser: toolcall::ToolParserKind,
+        whisper: Option<SharedWhisper>,
     ) -> Arc<Self> {
         let queue_limit = max_active.saturating_mul(4).clamp(16, 256);
         Arc::new(Self {
@@ -80,6 +88,7 @@ impl ServerState {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             tool_parser,
+            whisper,
         })
     }
 }
@@ -89,6 +98,13 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
     let v1 = Router::new()
         .route("/chat/completions", post(routes::chat_completions))
         .route("/completions", post(routes::completions))
+        // Raised body limit: a 30 s stereo f32 WAV is well past axum's 2 MB
+        // default multipart cap.
+        .route(
+            "/audio/transcriptions",
+            post(routes::audio_transcriptions)
+                .layer(axum::extract::DefaultBodyLimit::max(64 << 20)),
+        )
         .route("/models", get(routes::list_models))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),

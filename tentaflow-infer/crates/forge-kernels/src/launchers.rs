@@ -454,6 +454,64 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// `gemv_f16` reading x at `x_byte_off` and writing y at `y_byte_off`.
+    /// Sequence-shaped callers (Whisper encoder) launch one GEMV per position
+    /// over the same stream instead of staging per-position copies.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_f16_at(
+        &self,
+        y: &DevBuffer,
+        y_byte_off: usize,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        x_byte_off: usize,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("gemv_f16")?;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf_at(y, y_byte_off)?
+            .buf(w)
+            .buf_at(x, x_byte_off)?
+            .scalar(cols as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// `gemv_f16_bias` reading x at `x_byte_off` and writing y at `y_byte_off`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_f16_bias_at(
+        &self,
+        y: &DevBuffer,
+        y_byte_off: usize,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        x_byte_off: usize,
+        bias: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("gemv_f16_bias")?;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf_at(y, y_byte_off)?
+            .buf(w)
+            .buf_at(x, x_byte_off)?
+            .buf(bias)
+            .scalar(cols as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// f16 GEMV with per-row bias: y = W·x + b.
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_f16_bias(
