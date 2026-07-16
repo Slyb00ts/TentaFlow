@@ -13,6 +13,8 @@ from std.gpu.host import DeviceContext
 from std.pathlib import Path
 from src.norm import rmsnorm_f16, rmsnorm_residual_f16
 from src.activation import silu_mul_f16
+from src.rope import rope_neox_f16
+from src.gemv import gemv_q8_0_f16, gemv_f16
 
 
 def _entry_from_ptx(ptx_path: Path) raises -> String:
@@ -66,6 +68,15 @@ def main() raises:
 
     _ = ctx.compile_function[silu_mul_f16, dump_asm=Path("silu_mul_f16.ptx")]()
     entries.append(_finalize(out_dir, "silu_mul_f16"))
+
+    _ = ctx.compile_function[rope_neox_f16, dump_asm=Path("rope_neox_f16.ptx")]()
+    entries.append(_finalize(out_dir, "rope_neox_f16"))
+
+    _ = ctx.compile_function[gemv_q8_0_f16, dump_asm=Path("gemv_q8_0_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q8_0_f16"))
+
+    _ = ctx.compile_function[gemv_f16, dump_asm=Path("gemv_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_f16"))
 
     var manifest = String('{\n  "arch": "') + arch + String('",\n  "kernels": {\n')
     for i in range(len(entries)):

@@ -7,7 +7,7 @@
 .address_size 64
 
 	// .globl	src_norm_rmsnorm_residual_f166A6A6A6AoA_7176c57e30c03d69
-// src_norm__block_reduce_sum_S6A6A6A6AoA6A6A_69ac6b2441faa275_$__global_alloc_0_$__gpu_shared_mem has been demoted
+// src_reduce_block_reduce_sum6A6A6A6AoA6A6A_df2b80fe8948d602_$__global_alloc_0_$__gpu_shared_mem has been demoted
 
 .visible .entry src_norm_rmsnorm_residual_f166A6A6A6AoA_7176c57e30c03d69(
 	.param .u64 .ptr .align 1 src_norm_rmsnorm_residual_f166A6A6A6AoA_7176c57e30c03d69_param_0,
@@ -23,7 +23,7 @@
 	.reg .b32 	%r<49>;
 	.reg .b64 	%rd<30>;
 	// demoted variable
-	.shared .align 4 .b8 src_norm__block_reduce_sum_S6A6A6A6AoA6A6A_69ac6b2441faa275_$__global_alloc_0_$__gpu_shared_mem[128];
+	.shared .align 4 .b8 src_reduce_block_reduce_sum6A6A6A6AoA6A6A_df2b80fe8948d602_$__global_alloc_0_$__gpu_shared_mem[128];
 	ld.param.b64 	%rd11, [src_norm_rmsnorm_residual_f166A6A6A6AoA_7176c57e30c03d69_param_4];
 	ld.param.b64 	%rd12, [src_norm_rmsnorm_residual_f166A6A6A6AoA_7176c57e30c03d69_param_0];
 	ld.param.b64 	%rd13, [src_norm_rmsnorm_residual_f166A6A6A6AoA_7176c57e30c03d69_param_1];
@@ -75,7 +75,7 @@ $L__BB0_3:
 	shfl.sync.bfly.b32 	%r21, %r20, 1, 31, -1;
 	shr.u64 	%rd7, %rd29, 5;
 	and.b64 	%rd8, %rd29, 31;
-	mov.b32 	%r24, src_norm__block_reduce_sum_S6A6A6A6AoA6A6A_69ac6b2441faa275_$__global_alloc_0_$__gpu_shared_mem;
+	mov.b32 	%r24, src_reduce_block_reduce_sum6A6A6A6AoA6A6A_df2b80fe8948d602_$__global_alloc_0_$__gpu_shared_mem;
 	setp.ne.b64 	%p3, %rd8, 0;
 	@%p3 bra 	$L__BB0_5;
 	cvt.u32.u64 	%r25, %rd7;
@@ -110,12 +110,12 @@ $L__BB0_8:
 	shfl.sync.bfly.b32 	%r38, %r37, 1, 31, -1;
 	@%p3 bra 	$L__BB0_10;
 	add.f32 	%r4, %r37, %r38;
-	st.shared.b32 	[src_norm__block_reduce_sum_S6A6A6A6AoA6A6A_69ac6b2441faa275_$__global_alloc_0_$__gpu_shared_mem], %r4;
+	st.shared.b32 	[src_reduce_block_reduce_sum6A6A6A6AoA6A6A_df2b80fe8948d602_$__global_alloc_0_$__gpu_shared_mem], %r4;
 $L__BB0_10:
 	bar.sync 	0;
 	@%p1 bra 	$L__BB0_13;
 	ld.param.b32 	%r6, [src_norm_rmsnorm_residual_f166A6A6A6AoA_7176c57e30c03d69_param_5];
-	ld.shared.b32 	%r39, [src_norm__block_reduce_sum_S6A6A6A6AoA6A6A_69ac6b2441faa275_$__global_alloc_0_$__gpu_shared_mem];
+	ld.shared.b32 	%r39, [src_reduce_block_reduce_sum6A6A6A6AoA6A6A_df2b80fe8948d602_$__global_alloc_0_$__gpu_shared_mem];
 	cvt.rn.f32.s64 	%r40, %rd11;
 	div.rn.f32 	%r41, %r39, %r40;
 	add.f32 	%r42, %r6, %r41;

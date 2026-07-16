@@ -5,37 +5,8 @@
 # result matches the CPU golden reference within f16 rounding only.
 
 from std.gpu import block_dim, block_idx, thread_idx
-from std.gpu.sync import barrier
-from std.gpu.primitives import warp
-from std.gpu.memory import AddressSpace
-from std.memory import stack_allocation
 from std.math import rsqrt
-
-comptime WARP_SIZE = 32
-comptime MAX_WARPS = 32
-
-
-def _block_reduce_sum(val: Float32) -> Float32:
-    # Two-level reduction: intra-warp shuffle sum, then first warp reduces the
-    # per-warp partials staged in shared memory. Returns the total to every
-    # thread via a shared broadcast slot.
-    shared = stack_allocation[MAX_WARPS, Float32, address_space = AddressSpace.SHARED]()
-    var v = warp.sum(val)
-    lane = thread_idx.x % WARP_SIZE
-    wid = thread_idx.x // WARP_SIZE
-    if lane == 0:
-        shared[wid] = v
-    barrier()
-    n_warps = (block_dim.x + WARP_SIZE - 1) // WARP_SIZE
-    if wid == 0:
-        var partial: Float32 = 0.0
-        if lane < n_warps:
-            partial = shared[lane]
-        partial = warp.sum(partial)
-        if lane == 0:
-            shared[0] = partial
-    barrier()
-    return shared[0]
+from src.reduce import block_reduce_sum
 
 
 def rmsnorm_f16(
@@ -56,7 +27,7 @@ def rmsnorm_f16(
         ss += v * v
         i += Int(block_dim.x)
 
-    total = _block_reduce_sum(ss)
+    total = block_reduce_sum(ss)
     inv = rsqrt(total / Float32(n_cols) + eps)
 
     i = Int(thread_idx.x)
@@ -89,7 +60,7 @@ def rmsnorm_residual_f16(
         ss += v * v
         i += Int(block_dim.x)
 
-    total = _block_reduce_sum(ss)
+    total = block_reduce_sum(ss)
     inv = rsqrt(total / Float32(n_cols) + eps)
 
     i = Int(thread_idx.x)
