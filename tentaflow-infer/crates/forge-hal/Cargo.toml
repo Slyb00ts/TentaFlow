@@ -1,0 +1,16 @@
+# ===== File: Cargo.toml — forge-hal: hardware abstraction layer (Device/Stream/Event traits + CUDA/CPU backends) =====
+[package]
+name = "forge-hal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["cuda"]
+cuda = ["dep:cudarc"]
+
+[dependencies]
+forge-types.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+cudarc = { workspace = true, optional = true }
