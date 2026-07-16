@@ -8,6 +8,7 @@ pub mod gguf_vocab;
 pub mod kv;
 pub mod model;
 pub mod sample;
+pub mod server;
 pub mod weights;
 
 pub use generate::{GenerateRequest, Generated, StreamEvent};
