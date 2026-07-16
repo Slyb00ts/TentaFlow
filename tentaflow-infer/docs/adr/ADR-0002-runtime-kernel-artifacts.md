@@ -19,7 +19,9 @@ Kernels arrive as AOT PTX (ADR-0001). The engine must start fast, support many
    PTX targeted at the exact `sm_XX` of supported arches when known; unknown
    arches fall back to the closest lower PTX target.
 4. Autotune results (variant choice per shape-bucket) persist in
-   `~/.cache/forge/autotune/<gpu-model>.json`, shipped defaults for known GPUs.
+   `~/.cache/forge/autotune/`, keyed by (gpu-model, driver version,
+   kernel-manifest hash) so artifact upgrades and `FORGE_KERNEL_DIR` overrides
+   never reuse stale tuning; shipped defaults for known GPUs.
 
 ## Consequences
 

@@ -36,14 +36,20 @@ pub enum QuantKind {
     IQ4XS,
     /// MXFP4 (OCP microscaling): FP4 e2m1 + shared E8M0 scale per 32.
     MXFP4,
-    /// NVFP4: FP4 e2m1 packed pairs + FP8-E4M3 scale per 16-element block
-    /// + one F32 tensor scale (compressed-tensors layout).
+    /// NVFP4 in compressed-tensors layout: FP4 e2m1 packed pairs in a separate
+    /// packed tensor + FP8-E4M3 scale per 16-element block + one F32 tensor
+    /// scale. Scales live in sibling tensors, so `block_bytes` covers packed
+    /// data only.
     NVFP4,
-    /// GPTQ INT4 with group scales/zeros.
-    Gptq4,
-    /// AWQ INT4 with group scales/zeros.
-    Awq4,
-    /// Per-tensor/per-channel FP8 (compressed-tensors "fp8" scheme).
+    /// NVFP4 in GGML/GGUF self-contained layout: 64-element block carrying
+    /// four FP8-E4M3 per-16 scales + 32 packed e2m1 bytes inline.
+    NVFP4Gguf,
+    /// GPTQ INT4 with group scales/zeros; group size is model metadata.
+    Gptq4 { group: u16 },
+    /// AWQ INT4 with group scales/zeros; group size is model metadata.
+    Awq4 { group: u16 },
+    /// Per-tensor/per-channel FP8 (compressed-tensors "fp8" scheme); scales in
+    /// sibling tensors.
     Fp8Dynamic,
 }
 
@@ -58,9 +64,11 @@ impl QuantKind {
             | QuantKind::Q5_1
             | QuantKind::Q8_0
             | QuantKind::Q8_1
+            | QuantKind::IQ4NL
             | QuantKind::MXFP4 => 32,
             QuantKind::NVFP4 => 16,
-            QuantKind::Gptq4 | QuantKind::Awq4 => 128,
+            QuantKind::NVFP4Gguf => 64,
+            QuantKind::Gptq4 { group } | QuantKind::Awq4 { group } => group as usize,
             _ => 256,
         }
     }
@@ -70,7 +78,8 @@ impl QuantKind {
     /// packed-data bytes only.
     pub const fn block_bytes(self) -> usize {
         match self {
-            QuantKind::None | QuantKind::Fp8Dynamic => 0,
+            QuantKind::None => 0,
+            QuantKind::Fp8Dynamic => 1,
             QuantKind::Q4_0 => 18,
             QuantKind::Q4_1 => 20,
             QuantKind::Q5_0 => 22,
@@ -94,7 +103,9 @@ impl QuantKind {
             QuantKind::IQ4XS => 136,
             QuantKind::MXFP4 => 17,
             QuantKind::NVFP4 => 8,
-            QuantKind::Gptq4 | QuantKind::Awq4 => 64,
+            QuantKind::NVFP4Gguf => 36,
+            // INT4 packed pairs: group/2 data bytes; scales/zeros are siblings.
+            QuantKind::Gptq4 { group } | QuantKind::Awq4 { group } => (group as usize) / 2,
         }
     }
 }

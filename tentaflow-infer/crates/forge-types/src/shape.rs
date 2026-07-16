@@ -16,8 +16,17 @@ impl Shape {
         self.0.len()
     }
 
+    /// Element count with overflow detection. Dimensions can come from
+    /// untrusted model headers, so wrapping multiplication must never drive an
+    /// allocation size.
+    pub fn checked_numel(&self) -> Option<usize> {
+        self.0.iter().try_fold(1usize, |acc, &d| acc.checked_mul(d))
+    }
+
+    /// Element count for shapes already validated by the format layer.
+    /// Panics (also in release) if the product overflows.
     pub fn numel(&self) -> usize {
-        self.0.iter().product()
+        self.checked_numel().expect("shape element count overflows usize")
     }
 
     pub fn dims(&self) -> &[usize] {
