@@ -66,7 +66,7 @@ impl KvCache {
 
     /// Ensure capacity for one more token; allocates a page on boundary.
     pub fn grow(&mut self, seq: &mut SeqKv) -> Result<()> {
-        if seq.len % self.cfg.page_size == 0 {
+        if seq.len.is_multiple_of(self.cfg.page_size) {
             if seq.pages.len() >= self.cfg.max_pages_per_seq {
                 return Err(ForgeError::Scheduler(format!(
                     "sequence exceeds max_pages_per_seq {}",
@@ -84,7 +84,7 @@ impl KvCache {
     }
 
     pub fn release(&mut self, seq: &mut SeqKv) {
-        self.free_pages.extend(seq.pages.drain(..));
+        self.free_pages.append(&mut seq.pages);
         seq.len = 0;
     }
 

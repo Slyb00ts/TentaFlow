@@ -1,0 +1,22 @@
+# ===== File: Cargo.toml — forge-cli: the `forge` command (serve / run / bench) =====
+[package]
+name = "forge-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "forge"
+path = "src/main.rs"
+
+[dependencies]
+forge-hal.workspace = true
+forge-engine.workspace = true
+forge-tokenize.workspace = true
+forge-server.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

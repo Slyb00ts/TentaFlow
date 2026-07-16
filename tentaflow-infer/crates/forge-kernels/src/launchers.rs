@@ -30,6 +30,7 @@ impl Kernels {
     }
 
     /// out[row] = rmsnorm(x[row]) * weight, f16, one block per row.
+    #[allow(clippy::too_many_arguments)]
     pub fn rmsnorm_f16(
         &self,
         out: &DevBuffer,
@@ -56,6 +57,7 @@ impl Kernels {
     }
 
     /// residual += x; out = rmsnorm(residual) * weight (fused, f16).
+    #[allow(clippy::too_many_arguments)]
     pub fn rmsnorm_residual_f16(
         &self,
         out: &DevBuffer,
@@ -139,7 +141,7 @@ impl Kernels {
         cols: usize,
         stream: &Stream,
     ) -> Result<()> {
-        if cols % 32 != 0 {
+        if !cols.is_multiple_of(32) {
             return Err(ForgeError::Kernel(format!(
                 "gemv_q8_0 requires cols % 32 == 0, got {cols}"
             )));
@@ -196,7 +198,7 @@ impl Kernels {
         inv_global_scale: f32,
         stream: &Stream,
     ) -> Result<()> {
-        if cols % 16 != 0 {
+        if !cols.is_multiple_of(16) {
             return Err(ForgeError::Kernel(format!(
                 "gemv_nvfp4 requires cols % 16 == 0, got {cols}"
             )));
@@ -275,7 +277,7 @@ impl Kernels {
         cols: usize,
         stream: &Stream,
     ) -> Result<()> {
-        if cols % 32 != 0 {
+        if !cols.is_multiple_of(32) {
             return Err(ForgeError::Kernel(format!(
                 "gemv_q8_0_out_f32 requires cols % 32 == 0, got {cols}"
             )));

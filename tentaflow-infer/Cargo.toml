@@ -1,7 +1,7 @@
 # ===== File: Cargo.toml — FORGE workspace manifest =====
 [workspace]
 resolver = "2"
-members = ["crates/forge-types", "crates/forge-hal", "crates/forge-kernels", "crates/forge-formats", "crates/forge-tokenize", "crates/forge-engine"]
+members = ["crates/forge-types", "crates/forge-hal", "crates/forge-kernels", "crates/forge-formats", "crates/forge-tokenize", "crates/forge-engine", "crates/forge-server", "crates/forge-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,6 +15,8 @@ forge-hal = { path = "crates/forge-hal" }
 forge-kernels = { path = "crates/forge-kernels" }
 forge-formats = { path = "crates/forge-formats" }
 forge-tokenize = { path = "crates/forge-tokenize" }
+forge-engine = { path = "crates/forge-engine" }
+forge-server = { path = "crates/forge-server" }
 cudarc = { version = "0.19.8", default-features = false, features = [
     "std",
     "driver",
@@ -34,6 +36,15 @@ minijinja-contrib = { version = "2.21", features = ["pycompat"] }
 chrono = "0.4"
 memmap2 = "0.9"
 ron = "0.8"
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tower = "0.5"
+futures = "0.3"
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 [profile.release]
 lto = "thin"
