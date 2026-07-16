@@ -102,6 +102,15 @@ Kernels (CUDA baseline, NVRTC):
   logits match CPU reference within tolerance on a fixed prompt.**
 
 ### Chunk 6 — continuous batching + chunked prefill + CUDA graphs
+Status: iteration-level scheduler with chunked prefill + KV-projection
+admission landed in `forge-engine::server` (sequences interleave per token;
+kernel-level batching pending). Measured on the 4090: fused GEMV kernels reach
+~140 GB/s of ~1000 GB/s peak (Bielik-7B-NVFP4 decodes at ~55 tok/s, batch 1).
+Naive SIMD-load vectorization REGRESSED both quant GEMVs (Q8_0 34-byte blocks
+are 2-byte aligned → wide loads scalarize; NVFP4 int32×8 decode adds register
+pressure) — the BW gap needs a decomposition change (warp-per-row × multi-row
+blocks, u16-based loads, shared-memory x staging) driven by the autotuner, not
+wider loads alone. `kernels/mojo/bench_gemv.mojo` is the measurement harness.
 - Iteration-level scheduler: decode batch + prefill chunks under a token budget;
   SLO dual queue (latency/throughput classes); admission control with KV
   projection (429 instead of OOM).
