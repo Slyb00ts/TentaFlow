@@ -12,6 +12,7 @@ forge-kernels.workspace = true
 forge-formats.workspace = true
 forge-tokenize.workspace = true
 serde.workspace = true
+tracing.workspace = true
 serde_json.workspace = true
 half.workspace = true
 bytemuck.workspace = true

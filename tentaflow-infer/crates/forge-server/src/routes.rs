@@ -630,6 +630,13 @@ pub async fn audio_transcriptions(
         )
         .into_response();
     };
+    // Admission before the body is read: every admitted request may hold a
+    // ≤64 MiB upload while transcriptions run one at a time, so excess load
+    // is rejected up front instead of buffered.
+    let Ok(_permit) = state.stt_slots.try_acquire() else {
+        return ApiError::overloaded("too many concurrent transcription requests")
+            .into_response();
+    };
 
     let mut file: Option<Vec<u8>> = None;
     let mut language: Option<String> = None;

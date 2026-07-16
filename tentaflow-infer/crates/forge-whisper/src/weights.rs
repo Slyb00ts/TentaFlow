@@ -43,6 +43,9 @@ pub struct WhisperGenerationConfig {
     pub suppress_tokens: Vec<u32>,
     #[serde(default)]
     pub begin_suppress_tokens: Vec<u32>,
+    /// `false` on English-only (.en) exports. Older exports omit the field;
+    /// the vocabulary size disambiguates then (51864 vs 51865+).
+    pub is_multilingual: Option<bool>,
 }
 
 pub struct Attention {

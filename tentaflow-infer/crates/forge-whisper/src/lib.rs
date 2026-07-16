@@ -73,7 +73,9 @@ pub struct WhisperModel {
     stream: Stream,
     scratch: Scratch,
     sot: u32,
-    transcribe_task: u32,
+    /// `Some` on multilingual checkpoints only; `None` marks an English-only
+    /// model prompted without language/task tokens.
+    transcribe_task: Option<u32>,
     no_timestamps: u32,
     suppress: Vec<u32>,
     begin_suppress: Vec<u32>,
@@ -92,7 +94,6 @@ impl WhisperModel {
             })
         };
         let sot = special("<|startoftranscript|>")?;
-        let transcribe_task = special("<|transcribe|>")?;
         let no_timestamps = special("<|notimestamps|>")?;
 
         let cfg = &weights.config;
@@ -141,6 +142,22 @@ impl WhisperModel {
         let stream = device.create_stream()?;
         let suppress = weights.generation.suppress_tokens.clone();
         let begin_suppress = weights.generation.begin_suppress_tokens.clone();
+
+        // English-only (.en) checkpoints are prompted [sot, notimestamps]
+        // with no language/task tokens. Their tokenizers still CONTAIN the
+        // language tokens, so token presence is not a valid signal; the
+        // generation config carries `is_multilingual` (older exports omit it,
+        // where the vocabulary size disambiguates: 51864 = English-only,
+        // 51865+ = multilingual).
+        let multilingual = weights
+            .generation
+            .is_multilingual
+            .unwrap_or(weights.config.vocab_size >= 51_865);
+        let transcribe_task = if multilingual {
+            Some(special("<|transcribe|>")?)
+        } else {
+            None
+        };
         Ok(Self {
             device,
             kernels,
@@ -172,11 +189,26 @@ impl WhisperModel {
         if samples_16k_mono.is_empty() {
             return Err(ForgeError::Format("whisper: empty audio".into()));
         }
-        let lang_token = self.language_token(language)?;
-        let features = mel::log_mel_spectrogram(samples_16k_mono);
+        let prompt: Vec<u32> = match self.transcribe_task {
+            Some(task) => vec![
+                self.sot,
+                self.language_token(language)?,
+                task,
+                self.no_timestamps,
+            ],
+            None => {
+                if let Some(lang) = language {
+                    tracing::warn!(
+                        "whisper: language {lang:?} ignored — English-only checkpoint"
+                    );
+                }
+                vec![self.sot, self.no_timestamps]
+            }
+        };
+        let features =
+            mel::log_mel_spectrogram(samples_16k_mono, self.weights.config.num_mel_bins);
         self.encode(&features)?;
 
-        let prompt = [self.sot, lang_token, self.transcribe_task, self.no_timestamps];
         let tokens = self.greedy_decode(&prompt)?;
         let text = self.tokenizer.decode(&tokens, true)?;
         Ok(text.trim().to_string())

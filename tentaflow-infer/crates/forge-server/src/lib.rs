@@ -54,6 +54,10 @@ pub struct ServerState {
     pub tool_parser: toolcall::ToolParserKind,
     /// Optional Whisper STT model backing /v1/audio/transcriptions.
     pub whisper: Option<SharedWhisper>,
+    /// Admission cap for transcription requests: each admitted request may
+    /// buffer a multi-MB upload while the single-sequence Whisper model works
+    /// through the queue, so unbounded concurrency would exhaust memory.
+    pub stt_slots: tokio::sync::Semaphore,
 }
 
 impl ServerState {
@@ -89,6 +93,7 @@ impl ServerState {
                 .unwrap_or(0),
             tool_parser,
             whisper,
+            stt_slots: tokio::sync::Semaphore::new(4),
         })
     }
 }
