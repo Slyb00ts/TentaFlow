@@ -12,6 +12,13 @@
     "gemv_nvfp4_f16": {"file": "gemv_nvfp4_f16.ptx", "entry": "src_nvfp4_gemv_nvfp4_f16_Poi6A6A6A6AoA6A6A_be51dad2b13205c0"},
     "gather_rows_f16": {"file": "gather_rows_f16.ptx", "entry": "src_misc_gather_rows_f16_Poi6A6A6A6AoA6A6A_7871a3a63b1cc76d"},
     "gemv_f16_out_f32": {"file": "gemv_f16_out_f32.ptx", "entry": "src_misc_gemv_f16_out_f32_Po6A6A6A6AoA6A6A_67177a21aaca209d"},
-    "gemv_q8_0_out_f32": {"file": "gemv_q8_0_out_f32.ptx", "entry": "src_misc_gemv_q8_0_out_f32_P6A6A6A6AoA6A6A_9387a298831a7da9"}
+    "gemv_q8_0_out_f32": {"file": "gemv_q8_0_out_f32.ptx", "entry": "src_misc_gemv_q8_0_out_f32_P6A6A6A6AoA6A6A_9387a298831a7da9"},
+    "layernorm_f16": {"file": "layernorm_f16.ptx", "entry": "src_layernorm_layernorm_f166A6A6A6AoA6A6A_18a9f55c73fdc885"},
+    "layernorm_residual_f16": {"file": "layernorm_residual_f16.ptx", "entry": "src_layernorm_layernorm_residu6A6A6A6A_951dceb194609a4e"},
+    "gelu_f16": {"file": "gelu_f16.ptx", "entry": "src_conv_gelu_f16_Pointer6A6A6A6AoA6A6AcB6A6A_809de0ef169c12fa"},
+    "conv1d_k3_f16": {"file": "conv1d_k3_f16.ptx", "entry": "src_conv_conv1d_k3_f16_Point6A6A6A6AoA6A6A_fe066fd3671b5646"},
+    "attn_full_f16_hd64": {"file": "attn_full_f16_hd64.ptx", "entry": "src_attn_full_attn_full_f166A6A6A6AcB6A6A_df6d899ea82db4b6"},
+    "attn_full_f16_hd128": {"file": "attn_full_f16_hd128.ptx", "entry": "src_attn_full_attn_full_f166A6A6A6AcB6A6A_373175aaa4d9fea7"},
+    "gemv_f16_bias": {"file": "gemv_f16_bias.ptx", "entry": "src_gemv_gemv_f16_bias_Point6A6A6A6AoA6A6A_7ee231cec5f75ada"}
   }
 }

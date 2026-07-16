@@ -296,6 +296,191 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// out[row] = layernorm(x[row]) * weight + bias.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layernorm_f16(
+        &self,
+        out: &DevBuffer,
+        x: &DevBuffer,
+        weight: &DevBuffer,
+        bias: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("layernorm_f16")?;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(x)
+            .buf(weight)
+            .buf(bias)
+            .scalar(cols as i64)
+            .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// residual += x; out = layernorm(residual) * weight + bias (fused).
+    #[allow(clippy::too_many_arguments)]
+    pub fn layernorm_residual_f16(
+        &self,
+        out: &DevBuffer,
+        residual_io: &DevBuffer,
+        x: &DevBuffer,
+        weight: &DevBuffer,
+        bias: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("layernorm_residual_f16")?;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(residual_io)
+            .buf(x)
+            .buf(weight)
+            .buf(bias)
+            .scalar(cols as i64)
+            .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Elementwise GELU (exact erf) over n f16 elements.
+    pub fn gelu_f16(
+        &self,
+        out: &DevBuffer,
+        x: &DevBuffer,
+        n: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("gelu_f16")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new().buf(out).buf(x).scalar(n as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// 1-D conv (kernel 3, pad 1) with fused optional GELU.
+    /// x: [in_ch, in_t]; weight: [out_ch, in_ch, 3]; out: [out_ch, out_t].
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_k3_f16(
+        &self,
+        out: &DevBuffer,
+        x: &DevBuffer,
+        weight: &DevBuffer,
+        bias: &DevBuffer,
+        in_ch: usize,
+        out_ch: usize,
+        in_t: usize,
+        out_t: usize,
+        stride: usize,
+        apply_gelu: bool,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("conv1d_k3_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((out_t as u32).div_ceil(128), out_ch as u32, 1),
+            block: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(x)
+            .buf(weight)
+            .buf(bias)
+            .scalar(in_ch as i64)
+            .scalar(in_t as i64)
+            .scalar(out_t as i64)
+            .scalar(stride as i64)
+            .scalar(if apply_gelu { 1i64 } else { 0i64 });
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Full (non-paged) attention over contiguous K/V; causal optional.
+    /// q/out: [n_q, n_q_heads, hd]; k/v: [n_kv, n_kv_heads, hd].
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_full_f16(
+        &self,
+        out: &DevBuffer,
+        q: &DevBuffer,
+        k_buf: &DevBuffer,
+        v_buf: &DevBuffer,
+        n_q: usize,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        n_kv: usize,
+        causal: bool,
+        q_offset: usize,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let name = match head_dim {
+            64 => "attn_full_f16_hd64",
+            128 => "attn_full_f16_hd128",
+            other => {
+                return Err(ForgeError::Unsupported(format!(
+                    "attn_full: head_dim {other} has no compiled specialization"
+                )))
+            }
+        };
+        let k = self.artifacts.get(name)?;
+        let cfg = LaunchConfig {
+            grid: (n_q as u32, n_q_heads as u32, 1),
+            block: (ATTN_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(q)
+            .buf(k_buf)
+            .buf(v_buf)
+            .scalar(n_q_heads as i64)
+            .scalar(n_kv_heads as i64)
+            .scalar(n_kv as i64)
+            .scalar(if causal { 1i64 } else { 0i64 })
+            .scalar(q_offset as i64)
+            .scalar(scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// f16 GEMV with per-row bias: y = W·x + b.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_f16_bias(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        bias: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("gemv_f16_bias")?;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(x)
+            .buf(bias)
+            .scalar(cols as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// Paged flash-decode attention. Layouts documented in attention.mojo.
     #[allow(clippy::too_many_arguments)]
     pub fn attn_decode_f16(

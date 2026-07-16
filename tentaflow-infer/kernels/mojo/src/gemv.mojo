@@ -44,6 +44,32 @@ def gemv_q8_0_f16(
         y[row] = Float16(total)
 
 
+def gemv_f16_bias(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[Float16, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    bias: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+):
+    """f16 GEMV with bias: y[row] = dot(w[row, :], x) + bias[row].
+
+    Whisper-class linears carry biases; the LLM path keeps the bias-free
+    variant below so it pays nothing for them.
+    """
+    row = Int(block_idx.x)
+    base = row * n_cols
+
+    var acc: Float32 = 0.0
+    var i = Int(thread_idx.x)
+    while i < n_cols:
+        acc += Float32(w[base + i]) * Float32(x[i])
+        i += Int(block_dim.x)
+
+    total = block_reduce_sum(acc)
+    if Int(thread_idx.x) == 0:
+        y[row] = Float16(total + Float32(bias[row]))
+
+
 def gemv_f16(
     y: UnsafePointer[Float16, MutAnyOrigin],
     w: UnsafePointer[Float16, MutAnyOrigin],

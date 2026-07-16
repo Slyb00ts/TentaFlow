@@ -18,6 +18,10 @@ from src.gemv import gemv_q8_0_f16, gemv_f16
 from src.attention import attn_decode_f16_hd64, attn_decode_f16_hd128
 from src.nvfp4 import gemv_nvfp4_f16
 from src.misc import gather_rows_f16, gemv_f16_out_f32, gemv_q8_0_out_f32
+from src.layernorm import layernorm_f16, layernorm_residual_f16
+from src.conv import gelu_f16, conv1d_k3_f16
+from src.attn_full import attn_full_f16_hd64, attn_full_f16_hd128
+from src.gemv import gemv_f16_bias
 
 
 def _entry_from_ptx(ptx_path: Path) raises -> String:
@@ -98,6 +102,27 @@ def main() raises:
 
     _ = ctx.compile_function[gemv_q8_0_out_f32, dump_asm=Path("gemv_q8_0_out_f32.ptx")]()
     entries.append(_finalize(out_dir, "gemv_q8_0_out_f32"))
+
+    _ = ctx.compile_function[layernorm_f16, dump_asm=Path("layernorm_f16.ptx")]()
+    entries.append(_finalize(out_dir, "layernorm_f16"))
+
+    _ = ctx.compile_function[layernorm_residual_f16, dump_asm=Path("layernorm_residual_f16.ptx")]()
+    entries.append(_finalize(out_dir, "layernorm_residual_f16"))
+
+    _ = ctx.compile_function[gelu_f16, dump_asm=Path("gelu_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gelu_f16"))
+
+    _ = ctx.compile_function[conv1d_k3_f16, dump_asm=Path("conv1d_k3_f16.ptx")]()
+    entries.append(_finalize(out_dir, "conv1d_k3_f16"))
+
+    _ = ctx.compile_function[attn_full_f16_hd64, dump_asm=Path("attn_full_f16_hd64.ptx")]()
+    entries.append(_finalize(out_dir, "attn_full_f16_hd64"))
+
+    _ = ctx.compile_function[attn_full_f16_hd128, dump_asm=Path("attn_full_f16_hd128.ptx")]()
+    entries.append(_finalize(out_dir, "attn_full_f16_hd128"))
+
+    _ = ctx.compile_function[gemv_f16_bias, dump_asm=Path("gemv_f16_bias.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_f16_bias"))
 
     var manifest = String('{\n  "arch": "') + arch + String('",\n  "kernels": {\n')
     for i in range(len(entries)):

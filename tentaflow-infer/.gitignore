@@ -3,3 +3,4 @@ kernels/mojo/.pixi/
 kernels/mojo/pixi.lock
 *.ptx-cache/
 .cache/
+test-models/

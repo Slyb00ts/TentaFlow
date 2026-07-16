@@ -60,6 +60,13 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gather_rows_f16",
     "gemv_f16_out_f32",
     "gemv_q8_0_out_f32",
+    "layernorm_f16",
+    "layernorm_residual_f16",
+    "gelu_f16",
+    "conv1d_k3_f16",
+    "attn_full_f16_hd64",
+    "attn_full_f16_hd128",
+    "gemv_f16_bias",
 ];
 
 /// Loaded modules + resolved kernel handles for one device.
