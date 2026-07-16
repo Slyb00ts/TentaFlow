@@ -188,9 +188,7 @@ fn strftime_now(fmt: String) -> std::result::Result<Value, JinjaError> {
         ));
     }
     let now = chrono::Local::now();
-    Ok(Value::from(
-        now.format_with_items(items.iter()).to_string(),
-    ))
+    Ok(Value::from(now.format_with_items(items.iter()).to_string()))
 }
 
 /// Python string methods used by real HF chat templates. Implemented here
@@ -342,16 +340,12 @@ fn split_args(args: &[Value]) -> std::result::Result<(Option<String>, Option<usi
     let sep = match args.first() {
         None => None,
         Some(v) if v.is_none() => None,
-        Some(v) => Some(
-            v.as_str()
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    JinjaError::new(
-                        ErrorKind::InvalidOperation,
-                        "split: separator must be a string",
-                    )
-                })?,
-        ),
+        Some(v) => Some(v.as_str().map(str::to_string).ok_or_else(|| {
+            JinjaError::new(
+                ErrorKind::InvalidOperation,
+                "split: separator must be a string",
+            )
+        })?),
     };
     let maxsplit = match args.get(1) {
         None => None,

@@ -26,7 +26,12 @@ impl StopMatcher {
     pub fn new(stops: impl IntoIterator<Item = String>) -> Self {
         let stops: Vec<String> = stops.into_iter().filter(|s| !s.is_empty()).collect();
         // A partial match can never be longer than the longest stop minus one byte.
-        let max_hold = stops.iter().map(|s| s.len()).max().unwrap_or(0).saturating_sub(1);
+        let max_hold = stops
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
         Self {
             stops,
             held: String::new(),
@@ -60,8 +65,7 @@ impl StopMatcher {
                 let better = match best {
                     None => true,
                     Some((best_pos, best_i)) => {
-                        pos < best_pos
-                            || (pos == best_pos && stop.len() > self.stops[best_i].len())
+                        pos < best_pos || (pos == best_pos && stop.len() > self.stops[best_i].len())
                     }
                 };
                 if better {
@@ -105,11 +109,7 @@ impl StopMatcher {
         // Scan candidate suffix starts from the longest possible partial match
         // forward; the first suffix that prefixes any stop is the holdback.
         let min_start = self.held.len().saturating_sub(self.max_hold);
-        for (start, _) in self
-            .held
-            .char_indices()
-            .skip_while(|(i, _)| *i < min_start)
-        {
+        for (start, _) in self.held.char_indices().skip_while(|(i, _)| *i < min_start) {
             let suffix = &self.held[start..];
             if self.stops.iter().any(|s| s.starts_with(suffix)) {
                 return start;
@@ -234,7 +234,9 @@ mod tests {
             let mut matched = None;
             let mut rest = text;
             while !rest.is_empty() && matched.is_none() {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let want = (seed >> 33) as usize % 5 + 1;
                 let cut = rest
                     .char_indices()

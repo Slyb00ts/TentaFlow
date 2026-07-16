@@ -163,11 +163,10 @@ fn split_then_byte_level(pattern: &str) -> Result<PreTokenizerWrapper> {
         .add_prefix_space(false)
         .trim_offsets(false)
         .use_regex(false);
-    Ok(tokenizers::pre_tokenizers::sequence::Sequence::new(vec![
-        split.into(),
-        byte_level.into(),
-    ])
-    .into())
+    Ok(
+        tokenizers::pre_tokenizers::sequence::Sequence::new(vec![split.into(), byte_level.into()])
+            .into(),
+    )
 }
 
 /// llama family: GGUF stores SPM pieces + scores but no merges. Rebuild BPE
@@ -202,10 +201,7 @@ fn build_spm(vocab: &GgufVocab) -> Result<tokenizers::Tokenizer> {
     }
     // Stable sort keeps the vocab-order tie-break from the loop above.
     scored_merges.sort_by(|a, b| b.2.total_cmp(&a.2));
-    let merges: Vec<(String, String)> = scored_merges
-        .into_iter()
-        .map(|(l, r, _)| (l, r))
-        .collect();
+    let merges: Vec<(String, String)> = scored_merges.into_iter().map(|(l, r, _)| (l, r)).collect();
 
     let unk_token = vocab
         .unk_id
@@ -276,13 +272,9 @@ fn attach_bos_processor(tokenizer: &mut tokenizers::Tokenizer, vocab: &GgufVocab
     let bos_id = vocab.bos_id.ok_or_else(|| {
         ForgeError::Tokenizer("GGUF vocab has add_bos=true but no bos_token_id".into())
     })?;
-    let bos_token = vocab
-        .tokens
-        .get(bos_id as usize)
-        .cloned()
-        .ok_or_else(|| {
-            ForgeError::Tokenizer(format!("GGUF bos_token_id {bos_id} out of vocab range"))
-        })?;
+    let bos_token = vocab.tokens.get(bos_id as usize).cloned().ok_or_else(|| {
+        ForgeError::Tokenizer(format!("GGUF bos_token_id {bos_id} out of vocab range"))
+    })?;
     let processor = TemplateProcessing::builder()
         .try_single(format!("{bos_token} $A"))
         .map_err(|e| ForgeError::Tokenizer(format!("failed to build bos template: {e}")))?

@@ -31,8 +31,9 @@ fn qwen_tokenizer() -> Option<Tokenizer> {
 /// map to themselves, the rest map to U+0100.. in order.
 fn gpt2_byte_alphabet() -> [char; 256] {
     let mut direct = [false; 256];
-    let printable =
-        (b'!' as usize..=b'~' as usize).chain(0xA1..=0xAC).chain(0xAE..=0xFF);
+    let printable = (b'!' as usize..=b'~' as usize)
+        .chain(0xA1..=0xAC)
+        .chain(0xAE..=0xFF);
     for b in printable {
         direct[b] = true;
     }
@@ -81,7 +82,11 @@ fn gguf_gpt2_bpe_merges_apply() {
     let vocab = byte_level_gguf_vocab(&["hi"], &["h i"]);
     let tok = Tokenizer::from_gguf_vocab(&vocab).expect("build gpt2 tokenizer");
     let ids = tok.encode("hi", false).expect("encode");
-    assert_eq!(ids, vec![256], "'h i' merge must produce the single 'hi' token");
+    assert_eq!(
+        ids,
+        vec![256],
+        "'h i' merge must produce the single 'hi' token"
+    );
     assert_eq!(tok.decode(&ids, false).unwrap(), "hi");
     assert_eq!(tok.token_to_piece(256).as_deref(), Some("hi"));
     assert_eq!(tok.token_to_id("hi"), Some(256));
@@ -92,7 +97,13 @@ fn gguf_gpt2_byte_level_roundtrip() {
     let vocab = byte_level_gguf_vocab(&[], &[]);
     let tok = Tokenizer::from_gguf_vocab(&vocab).expect("build gpt2 tokenizer");
     // Pure byte vocab: every input must roundtrip losslessly through bytes.
-    for text in ["hello world", "z\u{017C}\u{00F3}\u{0142}\u{0107}", "😀🌍", "你好", "a\nb\tc"] {
+    for text in [
+        "hello world",
+        "z\u{017C}\u{00F3}\u{0142}\u{0107}",
+        "😀🌍",
+        "你好",
+        "a\nb\tc",
+    ] {
         let ids = tok.encode(text, false).expect("encode");
         assert_eq!(tok.decode(&ids, false).unwrap(), text, "roundtrip {text:?}");
     }
@@ -120,8 +131,27 @@ fn gguf_gpt2_control_tokens_are_special() {
 fn spm_gguf_vocab() -> GgufVocab {
     // Merge-tree intermediates must exist in vocab for BPE reconstruction.
     let tokens = [
-        "<unk>", "<s>", "</s>", "\u{2581}", "h", "e", "l", "o", "w", "r", "d", "he", "hel",
-        "hell", "hello", "wo", "wor", "worl", "world", "\u{2581}hello", "\u{2581}world",
+        "<unk>",
+        "<s>",
+        "</s>",
+        "\u{2581}",
+        "h",
+        "e",
+        "l",
+        "o",
+        "w",
+        "r",
+        "d",
+        "he",
+        "hel",
+        "hell",
+        "hello",
+        "wo",
+        "wor",
+        "worl",
+        "world",
+        "\u{2581}hello",
+        "\u{2581}world",
     ];
     let mut token_types = vec![1; tokens.len()];
     token_types[0] = 2;
@@ -162,7 +192,10 @@ fn gguf_spm_without_scores_is_rejected() {
     let mut vocab = spm_gguf_vocab();
     vocab.scores.clear();
     let err = Tokenizer::from_gguf_vocab(&vocab).unwrap_err();
-    assert!(err.to_string().contains("scores"), "unexpected error: {err}");
+    assert!(
+        err.to_string().contains("scores"),
+        "unexpected error: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +250,10 @@ fn stream_decoder_truncated_scalar_flushes_replacement() {
     assert_eq!(dec.push(0xF0).unwrap(), "");
     assert_eq!(dec.push(0x9F).unwrap(), "");
     let tail = dec.finish().unwrap();
-    assert!(tail.contains('\u{FFFD}'), "truncated bytes must surface, got {tail:?}");
+    assert!(
+        tail.contains('\u{FFFD}'),
+        "truncated bytes must surface, got {tail:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +309,9 @@ fn qwen_config_template() -> Option<String> {
 
 #[test]
 fn qwen_template_three_messages_generation_prompt() {
-    let Some(dir) = qwen_snapshot_dir() else { return };
+    let Some(dir) = qwen_snapshot_dir() else {
+        return;
+    };
     let template = std::fs::read_to_string(dir.join("chat_template.jinja")).unwrap();
     let engine = ChatTemplateEngine::new();
     let messages = [
@@ -282,7 +320,14 @@ fn qwen_template_three_messages_generation_prompt() {
         ChatMessage::text("assistant", "4"),
     ];
     let out = engine
-        .render(&template, &messages, None, true, false, &serde_json::Map::new())
+        .render(
+            &template,
+            &messages,
+            None,
+            true,
+            false,
+            &serde_json::Map::new(),
+        )
         .expect("render qwen chat template");
     assert!(out.starts_with("<|im_start|>system\nYou are a terse assistant.<|im_end|>\n"));
     assert!(out.contains("<|im_start|>user\nWhat is 2+2?<|im_end|>\n"));
@@ -293,7 +338,9 @@ fn qwen_template_three_messages_generation_prompt() {
 
 #[test]
 fn qwen_template_with_tools() {
-    let Some(template) = qwen_config_template() else { return };
+    let Some(template) = qwen_config_template() else {
+        return;
+    };
     let engine = ChatTemplateEngine::new();
     let messages = [
         ChatMessage::text("system", "Use tools when helpful."),
@@ -312,7 +359,14 @@ fn qwen_template_with_tools() {
         }
     }]);
     let out = engine
-        .render(&template, &messages, Some(&tools), true, false, &serde_json::Map::new())
+        .render(
+            &template,
+            &messages,
+            Some(&tools),
+            true,
+            false,
+            &serde_json::Map::new(),
+        )
         .expect("render qwen template with tools");
     assert!(out.contains("<tools>"));
     assert!(out.contains("get_weather"));
@@ -322,7 +376,9 @@ fn qwen_template_with_tools() {
 
 #[test]
 fn qwen_template_multipart_content_and_tool_call() {
-    let Some(template) = qwen_config_template() else { return };
+    let Some(template) = qwen_config_template() else {
+        return;
+    };
     let engine = ChatTemplateEngine::new();
     let mut assistant = ChatMessage::text("assistant", "");
     assistant.tool_calls = Some(json!([{
@@ -337,7 +393,14 @@ fn qwen_template_multipart_content_and_tool_call() {
         ChatMessage::text("tool", "{\"temp_c\": 21}"),
     ];
     let out = engine
-        .render(&template, &messages, None, true, false, &serde_json::Map::new())
+        .render(
+            &template,
+            &messages,
+            None,
+            true,
+            false,
+            &serde_json::Map::new(),
+        )
         .expect("render with multipart content and tool call");
     assert!(out.contains("Weather in Warsaw?"));
     assert!(out.contains("<function=get_weather>"));
@@ -347,12 +410,21 @@ fn qwen_template_multipart_content_and_tool_call() {
 
 #[test]
 fn qwen_template_raise_exception_propagates() {
-    let Some(template) = qwen_config_template() else { return };
+    let Some(template) = qwen_config_template() else {
+        return;
+    };
     let engine = ChatTemplateEngine::new();
     // No user message → the template calls raise_exception.
     let messages = [ChatMessage::text("system", "sys only")];
     let err = engine
-        .render(&template, &messages, None, true, false, &serde_json::Map::new())
+        .render(
+            &template,
+            &messages,
+            None,
+            true,
+            false,
+            &serde_json::Map::new(),
+        )
         .unwrap_err();
     assert!(
         err.to_string().contains("No user query found"),
@@ -403,7 +475,8 @@ fn builtin_llama3_uses_bos_from_extra_vars() {
             &extra,
         )
         .unwrap();
-    assert!(out.starts_with("<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|>"));
+    assert!(out
+        .starts_with("<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|>"));
     assert!(out.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
 }
 
@@ -471,7 +544,8 @@ fn continue_and_generation_prompt_conflict() {
 #[test]
 fn pycompat_string_methods() {
     let engine = ChatTemplateEngine::new();
-    let template = "{{ ' a b '.strip() }}|{{ 'x,y,z'.split(',')[1] }}|{{ 'abc'.startswith('ab') }}|\
+    let template =
+        "{{ ' a b '.strip() }}|{{ 'x,y,z'.split(',')[1] }}|{{ 'abc'.startswith('ab') }}|\
 {{ 'abc'.endswith('bc') }}|{{ 'a-b-c'.replace('-', '+') }}|{{ 'hello world'.title() }}|\
 {{ 'xxay'.rstrip('yx') }}|{{ '\\nx\\n'.lstrip('\\n') }}|{{ 'a b  c'.split()|length }}";
     let out = engine
@@ -510,7 +584,10 @@ fn fuel_limit_stops_runaway_templates() {
             &serde_json::Map::new(),
         )
         .unwrap_err();
-    assert!(err.to_string().contains("render error"), "unexpected: {err}");
+    assert!(
+        err.to_string().contains("render error"),
+        "unexpected: {err}"
+    );
 }
 
 #[test]
@@ -526,7 +603,10 @@ fn template_resolution_priority() {
         resolve_chat_template(None, Some(cfg), Some(gguf), Some("chatml")).unwrap(),
         cfg
     );
-    assert_eq!(resolve_chat_template(None, None, Some(gguf), None).unwrap(), gguf);
+    assert_eq!(
+        resolve_chat_template(None, None, Some(gguf), None).unwrap(),
+        gguf
+    );
     assert_eq!(
         resolve_chat_template(None, None, None, Some("chatml")).unwrap(),
         builtin_chat_template("chatml").unwrap()

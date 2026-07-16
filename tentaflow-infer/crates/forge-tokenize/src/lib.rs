@@ -6,9 +6,7 @@ mod stop;
 mod stream;
 mod tokenizer;
 
-pub use chat::{
-    builtin_chat_template, resolve_chat_template, ChatMessage, ChatTemplateEngine,
-};
+pub use chat::{builtin_chat_template, resolve_chat_template, ChatMessage, ChatTemplateEngine};
 pub use gguf::GgufVocab;
 pub use stop::{StopMatcher, StopStep};
 pub use stream::StreamDecoder;
