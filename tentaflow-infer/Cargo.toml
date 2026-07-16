@@ -1,0 +1,27 @@
+# ===== File: Cargo.toml — FORGE workspace manifest =====
+[workspace]
+resolver = "2"
+members = ["crates/forge-types"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+forge-types = { path = "crates/forge-types" }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+half = { version = "2", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
