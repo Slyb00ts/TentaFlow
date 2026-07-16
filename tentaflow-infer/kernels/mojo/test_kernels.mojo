@@ -9,6 +9,7 @@ from src.norm import rmsnorm_f16
 from src.activation import silu_mul_f16
 from src.rope import rope_neox_f16
 from src.gemv import gemv_q8_0_f16, gemv_f16
+from src.attention import attn_decode_f16_hd64
 
 comptime ROWS = 4
 comptime COLS = 1024
@@ -198,5 +199,87 @@ def main() raises:
     print("gemv_f16 max_rel_err:", max_err)
     if max_err > 0.02:
         raise Error("gemv_f16 numeric check FAILED")
+
+    # --- paged flash-decode attention (GQA, non-contiguous pages) ---
+    comptime N_SEQS = 2
+    comptime NQH = 4
+    comptime NKVH = 2
+    comptime HD = 64
+    comptime PAGE = 16
+    comptime MAXP = 4
+    comptime NPAGES = 4
+    comptime SCALE: Float32 = 0.125
+
+    var qa = ctx.enqueue_create_buffer[DType.float16](N_SEQS * NQH * HD)
+    var oa = ctx.enqueue_create_buffer[DType.float16](N_SEQS * NQH * HD)
+    var kc = ctx.enqueue_create_buffer[DType.float16](NPAGES * NKVH * PAGE * HD)
+    var vc = ctx.enqueue_create_buffer[DType.float16](NPAGES * NKVH * PAGE * HD)
+    var pt = ctx.enqueue_create_buffer[DType.int32](N_SEQS * MAXP)
+    var sl = ctx.enqueue_create_buffer[DType.int32](N_SEQS)
+
+    # seq0: 5 tokens on page 3; seq1: 23 tokens on pages 1,0 — deliberately
+    # scattered to exercise the page indirection.
+    with pt.map_to_host() as pth, sl.map_to_host() as slh:
+        for i in range(N_SEQS * MAXP):
+            pth[i] = Int32(-1)
+        pth[0] = 3
+        pth[MAXP + 0] = 1
+        pth[MAXP + 1] = 0
+        slh[0] = 5
+        slh[1] = 23
+
+    with qa.map_to_host() as qh, kc.map_to_host() as kh, vc.map_to_host() as vh:
+        for i in range(N_SEQS * NQH * HD):
+            qh[i] = Float16(_fill(i) * 0.2)
+        for i in range(NPAGES * NKVH * PAGE * HD):
+            kh[i] = Float16(_fill(i + 3) * 0.2)
+            vh[i] = Float16(_fill(i + 11) * 0.2)
+
+    ctx.enqueue_function[attn_decode_f16_hd64](
+        oa.unsafe_ptr(), qa.unsafe_ptr(), kc.unsafe_ptr(), vc.unsafe_ptr(),
+        pt.unsafe_ptr(), sl.unsafe_ptr(), NQH, NKVH, PAGE, MAXP, SCALE,
+        grid_dim=(N_SEQS, NQH), block_dim=128,
+    )
+    ctx.synchronize()
+
+    # CPU reference with the same f16-rounded inputs.
+    max_err = 0.0
+    with oa.map_to_host() as oh:
+        for s in range(N_SEQS):
+            ctx_len = 5 if s == 0 else 23
+            for h in range(NQH):
+                kvh = h // (NQH // NKVH)
+                q_base = (s * NQH + h) * HD
+                var m_star: Float32 = -1e30
+                var scores = List[Float32]()
+                for p_i in range(ctx_len):
+                    pg = 3 if s == 0 else (1 if p_i < PAGE else 0)
+                    kv_base = ((pg * NKVH + kvh) * PAGE + (p_i % PAGE)) * HD
+                    var dot: Float32 = 0.0
+                    for e in range(HD):
+                        qf = Float32(Float16(_fill(q_base + e) * 0.2))
+                        kf = Float32(Float16(_fill(kv_base + e + 3) * 0.2))
+                        dot += qf * kf
+                    sc = dot * SCALE
+                    scores.append(sc)
+                    if sc > m_star:
+                        m_star = sc
+                var denom: Float32 = 0.0
+                for p_i in range(ctx_len):
+                    denom += exp(scores[p_i] - m_star)
+                for e in range(HD):
+                    var num: Float32 = 0.0
+                    for p_i in range(ctx_len):
+                        pg = 3 if s == 0 else (1 if p_i < PAGE else 0)
+                        kv_base = ((pg * NKVH + kvh) * PAGE + (p_i % PAGE)) * HD
+                        vf = Float32(Float16(_fill(kv_base + e + 11) * 0.2))
+                        num += exp(scores[p_i] - m_star) * vf
+                    expected = num / denom
+                    err = abs(Float32(oh[q_base + e]) - expected)
+                    if err > max_err:
+                        max_err = err
+    print("attn_decode max_err:", max_err)
+    if max_err > 0.01:
+        raise Error("attn_decode_f16 numeric check FAILED")
 
     print("ALL KERNEL CHECKS PASSED")

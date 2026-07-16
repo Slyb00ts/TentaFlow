@@ -6,6 +6,8 @@
     "silu_mul_f16": {"file": "silu_mul_f16.ptx", "entry": "src_activation_silu_mul_f166A6A6A6AoA6A6A_8f3bfdaf2463f415"},
     "rope_neox_f16": {"file": "rope_neox_f16.ptx", "entry": "src_rope_rope_neox_f16_Point6A6A6A6AoA6A6A_8a932abd69147e53"},
     "gemv_q8_0_f16": {"file": "gemv_q8_0_f16.ptx", "entry": "src_gemv_gemv_q8_0_f16_Point6A6A6A6AoA6A6A_5ed103878a4af790"},
-    "gemv_f16": {"file": "gemv_f16.ptx", "entry": "src_gemv_gemv_f16_Pointer6A6A6A6AoA6A6AcB6A6A_b81a80935b97c01f"}
+    "gemv_f16": {"file": "gemv_f16.ptx", "entry": "src_gemv_gemv_f16_Pointer6A6A6A6AoA6A6AcB6A6A_b81a80935b97c01f"},
+    "attn_decode_f16_hd64": {"file": "attn_decode_f16_hd64.ptx", "entry": "src_attention_attn_decode_f166A6A6A6AcB_15ddec5a64904745"},
+    "attn_decode_f16_hd128": {"file": "attn_decode_f16_hd128.ptx", "entry": "src_attention_attn_decode_f166A6A6A6AcB_b07585d6fbd868f3"}
   }
 }
