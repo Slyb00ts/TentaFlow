@@ -203,7 +203,10 @@ fn adaptive_disable_kicks_in_and_recovers() {
     }
     assert!(composer.stats()[0].sleeping);
     let (draft, segments) = composer.compose(&[0], 8);
-    assert!(draft.is_empty() && segments.is_empty(), "sleeping proposer skipped");
+    assert!(
+        draft.is_empty() && segments.is_empty(),
+        "sleeping proposer skipped"
+    );
 
     // Sleep is measured in committed tokens; after SLEEP_TOKENS it retries.
     for t in 0..super::stats::SLEEP_TOKENS {

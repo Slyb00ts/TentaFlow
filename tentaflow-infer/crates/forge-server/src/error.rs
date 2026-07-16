@@ -59,6 +59,18 @@ impl ApiError {
         }
     }
 
+    pub fn context_length_exceeded(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            body: ApiErrorBody {
+                message: message.into(),
+                error_type: "invalid_request_error".into(),
+                code: Some("context_length_exceeded".into()),
+            },
+            retry_after: None,
+        }
+    }
+
     pub fn overloaded(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -83,10 +95,13 @@ impl ApiError {
         }
     }
 
-    /// Map an engine-side error string to a transport status. KV-page
-    /// exhaustion is transient capacity pressure, not a request bug.
+    /// Map an engine-side error string to a transport status. "cache has N
+    /// total" / size overflow mean the request can NEVER fit (permanent →
+    /// 400); any other KV-page message is transient pressure (429).
     pub fn from_engine_error(message: &str) -> Self {
-        if message.contains("KV pages") {
+        if message.contains("KV pages, cache has") || message.contains("request size overflows") {
+            Self::context_length_exceeded(message.to_string())
+        } else if message.contains("KV pages") {
             Self::overloaded(message.to_string())
         } else {
             Self::internal(message.to_string())

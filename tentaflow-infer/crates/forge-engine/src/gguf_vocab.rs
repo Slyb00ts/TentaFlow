@@ -56,7 +56,11 @@ pub fn gguf_vocab(gguf: &Gguf) -> Result<GgufVocab> {
         eos_id: gguf.get_u32("tokenizer.ggml.eos_token_id"),
         pad_id: gguf.get_u32("tokenizer.ggml.padding_token_id"),
         unk_id: gguf.get_u32("tokenizer.ggml.unknown_token_id"),
-        add_bos: gguf.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(false),
-        add_eos: gguf.get_bool("tokenizer.ggml.add_eos_token").unwrap_or(false),
+        add_bos: gguf
+            .get_bool("tokenizer.ggml.add_bos_token")
+            .unwrap_or(false),
+        add_eos: gguf
+            .get_bool("tokenizer.ggml.add_eos_token")
+            .unwrap_or(false),
     })
 }

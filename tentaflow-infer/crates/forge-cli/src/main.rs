@@ -38,8 +38,8 @@ enum Command {
         #[arg(long)]
         api_key: Option<String>,
         /// Max concurrently decoding sequences.
-        #[arg(long, default_value_t = 8)]
-        max_active: usize,
+        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
+        max_active: u16,
         /// Prompt tokens one sequence may prefill per scheduler iteration.
         #[arg(long, default_value_t = 16)]
         prefill_chunk: usize,
@@ -172,11 +172,12 @@ fn cmd_serve(
     bind: SocketAddr,
     model_id: Option<String>,
     api_key: Option<String>,
-    max_active: usize,
+    max_active: u16,
     prefill_chunk: usize,
     kv_pages: usize,
     weights_pool_gb: f64,
 ) -> Result<()> {
+    let max_active = usize::from(max_active);
     let t0 = Instant::now();
     let (loaded, kv_pages) = load_for_serve(model_path, kv_pages, weights_pool_gb)?;
     tracing::info!(
@@ -191,6 +192,15 @@ fn cmd_serve(
     let template_vars = loaded.bundle.template_vars();
     let eos_ids = loaded.bundle.eos_ids.clone();
     let tokenizer = Arc::new(loaded.bundle.tokenizer);
+    // Per-request token budget: the engine caps a sequence at max_seq_len
+    // pages; the model itself caps positional embeddings.
+    let max_context = loaded
+        .model
+        .weights
+        .descriptor
+        .params
+        .max_position_embeddings
+        .min(ModelConfig::default().max_seq_len);
     let engine = spawn_engine(loaded.model, tokenizer.clone(), max_active, prefill_chunk);
 
     let cfg = ServerConfig {
@@ -205,6 +215,8 @@ fn cmd_serve(
         template_vars,
         eos_ids,
         loaded.chat_template,
+        max_context,
+        max_active,
     );
 
     tokio::runtime::Builder::new_multi_thread()
@@ -215,6 +227,11 @@ fn cmd_serve(
 
 /// Drive one engine request to completion, invoking `on_text` per emitted
 /// piece. Returns (generated_tokens, prompt_tokens, first_token_at, done_at).
+/// Token counts come from the engine's `Done` usage, not from counting text
+/// pieces. `first_token_at` is the first VISIBLE text event: the engine only
+/// emits `Token` for non-empty decoded pieces, so UTF-8/stop-holdback in the
+/// stream decoder can shift it a decode step or two past the true first
+/// sampled token.
 fn drain_request(
     engine: &EngineHandle,
     req: EngineRequest,
@@ -352,8 +369,10 @@ fn cmd_bench(model_path: &Path, tokens: usize, prompt_tokens: usize) -> Result<(
         |_| {},
     )?;
 
-    // The first token lands after the whole prompt is prefilled plus one
-    // decode step; decode rate uses the remaining tokens.
+    // Honest measurement note: "prefill" is submit → first visible token,
+    // which includes at least one decode step (and possibly a couple more if
+    // the decoder held back partial UTF-8); "decode" covers the remaining
+    // generated tokens as counted by the engine's usage numbers.
     let prefill_s = first_at.duration_since(submit_at).as_secs_f64();
     let decode_s = done_at.duration_since(first_at).as_secs_f64();
     let prefill_tps = prompt_len as f64 / prefill_s.max(1e-9);
@@ -366,5 +385,6 @@ fn cmd_bench(model_path: &Path, tokens: usize, prompt_tokens: usize) -> Result<(
         "| decode  | {:>6} | {decode_s:>7.3} | {decode_tps:>7.1} |",
         generated.saturating_sub(1)
     );
+    eprintln!("note: prefill is timed to the first visible token, so it includes >=1 decode step");
     Ok(())
 }

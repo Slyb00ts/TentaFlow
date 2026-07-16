@@ -92,30 +92,51 @@ pub async fn require_api_key(
     }
 }
 
-/// Forward the engine's blocking receiver onto a tokio channel. Dropping the
-/// returned receiver drops the std receiver, which the engine detects as a
-/// client hang-up and cancels the sequence.
+/// Forward the engine's blocking receiver onto a tokio channel. The loop
+/// polls with a timeout and watches the tokio sender: when the HTTP client
+/// disconnects while the request is still queued or prefilling (no events
+/// flowing yet), the std receiver is dropped promptly and the engine's
+/// send-failure path cancels the sequence. The semaphore permit rides along
+/// so a bridged request occupies exactly one admission slot until it ends.
 fn bridge_events(
     rx: std::sync::mpsc::Receiver<EngineEvent>,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> tokio::sync::mpsc::Receiver<EngineEvent> {
     let (tx, out) = tokio::sync::mpsc::channel(256);
     tokio::task::spawn_blocking(move || {
-        while let Ok(ev) = rx.recv() {
-            let terminal = matches!(ev, EngineEvent::Done { .. } | EngineEvent::Error(_));
-            if tx.blocking_send(ev).is_err() || terminal {
-                break;
+        let _permit = permit;
+        loop {
+            if tx.is_closed() {
+                return; // client hung up; dropping rx cancels the engine seq
+            }
+            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(ev) => {
+                    let terminal = matches!(ev, EngineEvent::Done { .. } | EngineEvent::Error(_));
+                    if tx.blocking_send(ev).is_err() || terminal {
+                        return;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             }
         }
     });
     out
 }
 
-/// Rendered chat prompt for a request, with multipart text parts flattened to
-/// plain strings so any HF template's `message['content'] + ...` works.
+/// Rendered chat prompt for a request. Multipart text parts are flattened to
+/// plain string content so any HF template's `message['content'] + ...`
+/// works; all other message fields (name, tool_calls, ...) pass through.
 fn render_chat_prompt(state: &ServerState, messages: &[ChatMessage]) -> Result<String, ApiError> {
     let flattened: Vec<ChatMessage> = messages
         .iter()
-        .map(|m| ChatMessage::text(m.role.clone(), m.text_content().unwrap_or_default()))
+        .map(|m| {
+            let mut m = m.clone();
+            m.content = Some(serde_json::Value::String(
+                m.text_content().unwrap_or_default(),
+            ));
+            m
+        })
         .collect();
     ChatTemplateEngine::new()
         .render(
@@ -129,26 +150,51 @@ fn render_chat_prompt(state: &ServerState, messages: &[ChatMessage]) -> Result<S
         .map_err(|e| ApiError::invalid_request(format!("chat template render failed: {e}")))
 }
 
-fn submit(
-    state: &ServerState,
-    prompt: &str,
-    spec: &GenerationSpec,
+enum GenInput {
+    Chat(Vec<ChatMessage>),
+    Text(String),
+}
+
+/// Admit one generation: take an admission slot (429 when the queue is
+/// full), then render/tokenize/submit on the blocking pool — template
+/// rendering and tokenization of large prompts must not stall the async
+/// workers.
+async fn start_generation(
+    state: &Arc<ServerState>,
+    input: GenInput,
+    spec: GenerationSpec,
 ) -> Result<tokio::sync::mpsc::Receiver<EngineEvent>, ApiError> {
-    let prompt_tokens = state
-        .tokenizer
-        .encode(prompt, true)
-        .map_err(|e| ApiError::internal(format!("tokenization failed: {e}")))?;
-    let rx = state
-        .engine
-        .submit(EngineRequest {
-            prompt_tokens,
-            max_tokens: spec.max_tokens,
-            sampling: spec.sampling.clone(),
-            stop: spec.stop.clone(),
-            eos_ids: state.eos_ids.clone(),
-        })
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(bridge_events(rx))
+    let permit = state
+        .slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::overloaded("too many concurrent requests, retry shortly"))?;
+
+    let st = state.clone();
+    let rx = tokio::task::spawn_blocking(move || {
+        let prompt = match &input {
+            GenInput::Chat(messages) => render_chat_prompt(&st, messages)?,
+            GenInput::Text(s) => s.clone(),
+        };
+        let prompt_tokens = st
+            .tokenizer
+            .encode(&prompt, true)
+            .map_err(|e| ApiError::internal(format!("tokenization failed: {e}")))?;
+        crate::api::check_context(prompt_tokens.len(), spec.max_tokens, st.max_context)?;
+        st.engine
+            .submit(EngineRequest {
+                prompt_tokens,
+                max_tokens: spec.max_tokens,
+                sampling: spec.sampling.clone(),
+                stop: spec.stop.clone(),
+                eos_ids: st.eos_ids.clone(),
+            })
+            .map_err(|e| ApiError::internal(e.to_string()))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("request preparation failed: {e}")))??;
+
+    Ok(bridge_events(rx, permit))
 }
 
 struct Collected {
@@ -221,7 +267,7 @@ fn sse_chunk(
     id: &str,
     created: u64,
     model: &str,
-    choice: serde_json::Value,
+    choices: Vec<serde_json::Value>,
     usage: Option<Usage>,
 ) -> Event {
     let mut body = serde_json::json!({
@@ -229,7 +275,7 @@ fn sse_chunk(
         "object": kind.object(),
         "created": created,
         "model": model,
-        "choices": [choice],
+        "choices": choices,
     });
     if let Some(u) = usage {
         body["usage"] = serde_json::to_value(u).expect("usage serializes");
@@ -239,12 +285,15 @@ fn sse_chunk(
 
 /// Run one generation as an SSE response. The first engine event is awaited
 /// before committing to a 200, so queue rejections still map to proper HTTP
-/// status codes (429 for KV-page pressure).
+/// status codes (429 for KV-page pressure). With `include_usage`
+/// (stream_options), usage arrives as a separate final chunk with an empty
+/// `choices` array, matching OpenAI's shape.
 async fn stream_response(
     state: Arc<ServerState>,
     mut rx: tokio::sync::mpsc::Receiver<EngineEvent>,
     kind: StreamKind,
     id: String,
+    include_usage: bool,
 ) -> Response {
     let first = match rx.recv().await {
         Some(EngineEvent::Error(msg)) => return ApiError::from_engine_error(&msg).into_response(),
@@ -272,7 +321,7 @@ async fn stream_response(
                 EngineEvent::Token { text, .. } => {
                     let choice = kind.choice(Some(&text), first_chunk, None);
                     first_chunk = false;
-                    let chunk = sse_chunk(kind, &id, created, &model, choice, None);
+                    let chunk = sse_chunk(kind, &id, created, &model, vec![choice], None);
                     if tx.send(Ok(chunk)).await.is_err() {
                         return; // client hung up; dropping rx cancels the engine seq
                     }
@@ -284,16 +333,22 @@ async fn stream_response(
                     prompt_tokens,
                 } => {
                     let choice = kind.choice(None, first_chunk, Some(finish_reason_str(reason)));
-                    let chunk = sse_chunk(
-                        kind,
-                        &id,
-                        created,
-                        &model,
-                        choice,
-                        Some(Usage::new(prompt_tokens, tokens)),
-                    );
+                    let chunk = sse_chunk(kind, &id, created, &model, vec![choice], None);
                     if tx.send(Ok(chunk)).await.is_err() {
                         return;
+                    }
+                    if include_usage {
+                        let usage_chunk = sse_chunk(
+                            kind,
+                            &id,
+                            created,
+                            &model,
+                            vec![],
+                            Some(Usage::new(prompt_tokens, tokens)),
+                        );
+                        if tx.send(Ok(usage_chunk)).await.is_err() {
+                            return;
+                        }
                     }
                     true
                 }
@@ -330,17 +385,21 @@ pub async fn chat_completions(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let prompt = match render_chat_prompt(&state, &req.messages) {
-        Ok(p) => p,
-        Err(e) => return e.into_response(),
-    };
-    let rx = match submit(&state, &prompt, &spec) {
+    let rx = match start_generation(&state, GenInput::Chat(req.messages), spec).await {
         Ok(rx) => rx,
         Err(e) => return e.into_response(),
     };
 
     if req.stream {
-        return stream_response(state, rx, StreamKind::Chat, new_id("chatcmpl")).await;
+        let include_usage = req.stream_options.is_some_and(|o| o.include_usage);
+        return stream_response(
+            state,
+            rx,
+            StreamKind::Chat,
+            new_id("chatcmpl"),
+            include_usage,
+        )
+        .await;
     }
 
     match collect_events(rx).await {
@@ -379,13 +438,14 @@ pub async fn completions(
         Ok(p) => p.to_string(),
         Err(e) => return e.into_response(),
     };
-    let rx = match submit(&state, &prompt, &spec) {
+    let rx = match start_generation(&state, GenInput::Text(prompt), spec).await {
         Ok(rx) => rx,
         Err(e) => return e.into_response(),
     };
 
     if req.stream {
-        return stream_response(state, rx, StreamKind::Text, new_id("cmpl")).await;
+        let include_usage = req.stream_options.is_some_and(|o| o.include_usage);
+        return stream_response(state, rx, StreamKind::Text, new_id("cmpl"), include_usage).await;
     }
 
     match collect_events(rx).await {

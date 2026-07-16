@@ -27,6 +27,13 @@ impl StopSpec {
     }
 }
 
+/// OpenAI `stream_options` — only `include_usage` is meaningful here.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -48,6 +55,8 @@ pub struct ChatCompletionRequest {
     pub stop: Option<StopSpec>,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
     #[serde(default)]
     pub seed: Option<u64>,
     #[serde(default)]
@@ -84,6 +93,8 @@ pub struct CompletionRequest {
     pub stop: Option<StopSpec>,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
     #[serde(default)]
     pub seed: Option<u64>,
     #[serde(default)]
@@ -176,6 +187,21 @@ fn generation_spec(
         max_tokens,
         stop: stop.map(StopSpec::into_vec).unwrap_or_default(),
     })
+}
+
+/// Reject requests whose token budget can never fit the model context.
+pub fn check_context(
+    prompt_len: usize,
+    max_tokens: usize,
+    max_context: usize,
+) -> Result<(), ApiError> {
+    match prompt_len.checked_add(max_tokens) {
+        Some(total) if total <= max_context => Ok(()),
+        _ => Err(ApiError::context_length_exceeded(format!(
+            "this model supports at most {max_context} context tokens; the request has \
+             {prompt_len} prompt tokens and asks for {max_tokens} completion tokens"
+        ))),
+    }
 }
 
 const CHAT_ROLES: &[&str] = &["system", "user", "assistant", "tool"];
@@ -414,6 +440,31 @@ mod tests {
             "logit_bias": {"5": -100}, "user": "abc"
         }));
         r.generation_spec().unwrap();
+    }
+
+    #[test]
+    fn context_budget_is_enforced() {
+        check_context(100, 100, 200).unwrap();
+        assert!(check_context(100, 101, 200).is_err());
+        // Overflow must reject, not wrap.
+        assert!(check_context(usize::MAX, usize::MAX, 8192).is_err());
+        let err = check_context(9000, 1024, 8192).unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.body.code.as_deref(), Some("context_length_exceeded"));
+    }
+
+    #[test]
+    fn stream_options_include_usage_parses() {
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "stream": true, "stream_options": {"include_usage": true}
+        }));
+        assert!(r.stream_options.unwrap().include_usage);
+
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": true
+        }));
+        assert!(r.stream_options.is_none());
     }
 
     #[test]

@@ -80,8 +80,7 @@ impl Model {
             },
         )?;
         let stream = device.create_stream()?;
-        let page_table_dev =
-            device.alloc(max_pages_per_seq * 4, MemKind::Device, Pool::Weights)?;
+        let page_table_dev = device.alloc(max_pages_per_seq * 4, MemKind::Device, Pool::Weights)?;
         let seq_len_dev = device.alloc(4, MemKind::Device, Pool::Weights)?;
         Ok(Model {
             device,
@@ -103,13 +102,7 @@ impl Model {
         self.kv.release(seq);
     }
 
-    fn gemv(
-        &self,
-        y: &DevBuffer,
-        w: &DevWeight,
-        x: &DevBuffer,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn gemv(&self, y: &DevBuffer, w: &DevWeight, x: &DevBuffer, stream: &Stream) -> Result<()> {
         match w {
             DevWeight::F16 { buf, rows, cols } => {
                 self.kernels.gemv_f16(y, buf, x, *rows, *cols, stream)
@@ -187,8 +180,7 @@ impl Model {
 
         let dev = self.device.as_ref();
         let stream = self.stream.clone();
-        let alloc =
-            |elems: usize| dev.alloc(elems * 2, MemKind::Device, Pool::Activations);
+        let alloc = |elems: usize| dev.alloc(elems * 2, MemKind::Device, Pool::Activations);
 
         // Activation set for this step; dropped before reset_activations.
         let h = alloc(hidden)?;
@@ -239,15 +231,45 @@ impl Model {
                 kernels.rmsnorm_f16(&k, &k, kn, p.n_kv_heads, p.head_dim, eps, &stream)?;
             }
 
-            kernels.rope_neox_f16(&q, &pos_dev, 1, p.n_heads, p.head_dim, p.rope_theta, &stream)?;
-            kernels.rope_neox_f16(&k, &pos_dev, 1, p.n_kv_heads, p.head_dim, p.rope_theta, &stream)?;
+            kernels.rope_neox_f16(
+                &q,
+                &pos_dev,
+                1,
+                p.n_heads,
+                p.head_dim,
+                p.rope_theta,
+                &stream,
+            )?;
+            kernels.rope_neox_f16(
+                &k,
+                &pos_dev,
+                1,
+                p.n_kv_heads,
+                p.head_dim,
+                p.rope_theta,
+                &stream,
+            )?;
 
             // Scatter this token's K/V rows into the paged cache.
             let row_bytes = p.head_dim * 2;
             for kvh in 0..p.n_kv_heads {
                 let dst_off = self.kv.token_offset(page, slot, kvh);
-                dev.copy(&k, kvh * row_bytes, &self.kv.k[l], dst_off, row_bytes, &stream)?;
-                dev.copy(&v, kvh * row_bytes, &self.kv.v[l], dst_off, row_bytes, &stream)?;
+                dev.copy(
+                    &k,
+                    kvh * row_bytes,
+                    &self.kv.k[l],
+                    dst_off,
+                    row_bytes,
+                    &stream,
+                )?;
+                dev.copy(
+                    &v,
+                    kvh * row_bytes,
+                    &self.kv.v[l],
+                    dst_off,
+                    row_bytes,
+                    &stream,
+                )?;
             }
 
             kernels.attn_decode_f16(
@@ -268,7 +290,16 @@ impl Model {
             )?;
 
             self.gemv(&o_out, &layer.attn_o, &attn_out, &stream)?;
-            kernels.rmsnorm_residual_f16(&x, &h, &o_out, &layer.ffn_norm, 1, hidden, eps, &stream)?;
+            kernels.rmsnorm_residual_f16(
+                &x,
+                &h,
+                &o_out,
+                &layer.ffn_norm,
+                1,
+                hidden,
+                eps,
+                &stream,
+            )?;
 
             self.gemv(&gate, &layer.ffn_gate, &x, &stream)?;
             self.gemv(&up, &layer.ffn_up, &x, &stream)?;
@@ -293,7 +324,9 @@ impl Model {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
-        drop((h, x, q, k, v, attn_out, o_out, gate, up, act, down, logits_dev, ids, pos_dev));
+        drop((
+            h, x, q, k, v, attn_out, o_out, gate, up, act, down, logits_dev, ids, pos_dev,
+        ));
         self.device.reset_activations()?;
 
         Ok(logits)

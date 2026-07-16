@@ -113,7 +113,10 @@ fn run(
         let mut emit = |s: String, on_event: &mut dyn FnMut(StreamEvent)| {
             if !s.is_empty() {
                 text.push_str(&s);
-                on_event(StreamEvent::Token { id: last_id, text: s });
+                on_event(StreamEvent::Token {
+                    id: last_id,
+                    text: s,
+                });
             }
         };
         let tail = decoder.finish()?;

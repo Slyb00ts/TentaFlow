@@ -26,8 +26,15 @@ pub struct EngineRequest {
 
 #[derive(Debug)]
 pub enum EngineEvent {
-    Token { id: u32, text: String },
-    Done { reason: FinishReason, tokens: usize, prompt_tokens: usize },
+    Token {
+        id: u32,
+        text: String,
+    },
+    Done {
+        reason: FinishReason,
+        tokens: usize,
+        prompt_tokens: usize,
+    },
     Error(String),
 }
 
@@ -122,18 +129,33 @@ fn worker<'t>(
         while active.len() < max_active {
             let Some(sub) = waiting.front() else { break };
             let page = model.kv.cfg.page_size;
-            let need_pages =
-                (sub.req.prompt_tokens.len() + sub.req.max_tokens).div_ceil(page);
-            if need_pages > model.kv.free_page_count() {
-                if active.is_empty() {
-                    let sub = waiting.pop_front().unwrap();
-                    let _ = sub.events.send(EngineEvent::Error(format!(
-                        "request needs {need_pages} KV pages, cache has {} total",
+            // A request that can never fit is rejected permanently; one that
+            // only exceeds the currently free pages waits for a slot. The
+            // error strings differ so the API layer can map them to 400 vs
+            // transient handling.
+            let need_pages = sub
+                .req
+                .prompt_tokens
+                .len()
+                .checked_add(sub.req.max_tokens)
+                .map(|total| total.div_ceil(page));
+            let permanently_too_large = match need_pages {
+                None => true,
+                Some(n) => n > model.kv.cfg.n_pages,
+            };
+            if permanently_too_large {
+                let sub = waiting.pop_front().unwrap();
+                let _ = sub.events.send(EngineEvent::Error(match need_pages {
+                    Some(n) => format!(
+                        "request needs {n} KV pages, cache has {} total",
                         model.kv.cfg.n_pages
-                    )));
-                    continue;
-                }
-                break; // retry when a sequence finishes
+                    ),
+                    None => "request size overflows: prompt_tokens + max_tokens".into(),
+                }));
+                continue;
+            }
+            if need_pages.unwrap() > model.kv.free_page_count() {
+                break; // transient KV pressure: retry when a sequence finishes
             }
             let sub = waiting.pop_front().unwrap();
             if sub.req.prompt_tokens.is_empty() {
@@ -186,7 +208,9 @@ fn worker<'t>(
 fn advance(model: &mut Model, a: &mut ActiveSeq<'_>, prefill_chunk: usize) -> Result<()> {
     if !a.pending_prompt.is_empty() {
         for _ in 0..prefill_chunk.max(1) {
-            let Some(t) = a.pending_prompt.pop_front() else { break };
+            let Some(t) = a.pending_prompt.pop_front() else {
+                break;
+            };
             let logits = model.step(&mut a.seq, t)?;
             if a.pending_prompt.is_empty() {
                 a.logits = Some(logits);
@@ -212,7 +236,10 @@ fn advance(model: &mut Model, a: &mut ActiveSeq<'_>, prefill_chunk: usize) -> Re
         let step = a.stops.push(&piece);
         if !step.emit.is_empty()
             && a.events
-                .send(EngineEvent::Token { id: next, text: step.emit })
+                .send(EngineEvent::Token {
+                    id: next,
+                    text: step.emit,
+                })
                 .is_err()
         {
             // Client hung up — cancel generation, free the slot.
@@ -242,9 +269,10 @@ fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason) -> Result<()> {
         if !tail.is_empty() {
             let step = a.stops.push(&tail);
             if !step.emit.is_empty() {
-                let _ = a
-                    .events
-                    .send(EngineEvent::Token { id: last_id, text: step.emit });
+                let _ = a.events.send(EngineEvent::Token {
+                    id: last_id,
+                    text: step.emit,
+                });
             }
             if step.matched.is_some() {
                 reason = FinishReason::Stop;
@@ -253,9 +281,10 @@ fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason) -> Result<()> {
         if reason != FinishReason::Stop {
             let rest = a.stops.finish();
             if !rest.is_empty() {
-                let _ = a
-                    .events
-                    .send(EngineEvent::Token { id: last_id, text: rest });
+                let _ = a.events.send(EngineEvent::Token {
+                    id: last_id,
+                    text: rest,
+                });
             }
         }
     }

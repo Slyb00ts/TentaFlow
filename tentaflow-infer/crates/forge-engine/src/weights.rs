@@ -17,9 +17,17 @@ use half::f16;
 /// A weight matrix on-device, tagged with how kernels must read it.
 pub enum DevWeight {
     /// f16 row-major [rows, cols].
-    F16 { buf: DevBuffer, rows: usize, cols: usize },
+    F16 {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
     /// GGML Q8_0 block stream for [rows, cols].
-    Q8_0 { buf: DevBuffer, rows: usize, cols: usize },
+    Q8_0 {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
     /// NVFP4 packed + FP8 scales (+ inverse global scale) for [rows, cols].
     NvFp4 {
         packed: DevBuffer,
@@ -188,7 +196,14 @@ fn upload_matrix(device: &dyn Device, src: &dyn TensorSource, name: &str) -> Res
     if let Some(nv) = src.fetch_nvfp4(name)? {
         // Validate on CPU once so a corrupt checkpoint fails at load, not as
         // garbage tokens at runtime.
-        nvfp4::dequantize_nvfp4(&nv.packed, &nv.scales, nv.global_scale, nv.rows, nv.cols, 16)?;
+        nvfp4::dequantize_nvfp4(
+            &nv.packed,
+            &nv.scales,
+            nv.global_scale,
+            nv.rows,
+            nv.cols,
+            16,
+        )?;
         return Ok(DevWeight::NvFp4 {
             packed: upload(device, &nv.packed)?,
             scales: upload(device, &nv.scales)?,
@@ -262,7 +277,11 @@ impl ModelWeights {
         Self::load(device.as_ref(), descriptor, &src)
     }
 
-    fn load(device: &dyn Device, descriptor: ModelDescriptor, src: &dyn TensorSource) -> Result<Self> {
+    fn load(
+        device: &dyn Device,
+        descriptor: ModelDescriptor,
+        src: &dyn TensorSource,
+    ) -> Result<Self> {
         let global = |role: WeightRole| -> Result<&String> {
             descriptor
                 .globals
@@ -363,9 +382,24 @@ impl ModelWeights {
             expect(&at("attn_k"), &layer.attn_k, kv_dim, p.hidden_size)?;
             expect(&at("attn_v"), &layer.attn_v, kv_dim, p.hidden_size)?;
             expect(&at("attn_o"), &layer.attn_o, p.hidden_size, q_dim)?;
-            expect(&at("ffn_gate"), &layer.ffn_gate, p.intermediate_size, p.hidden_size)?;
-            expect(&at("ffn_up"), &layer.ffn_up, p.intermediate_size, p.hidden_size)?;
-            expect(&at("ffn_down"), &layer.ffn_down, p.hidden_size, p.intermediate_size)?;
+            expect(
+                &at("ffn_gate"),
+                &layer.ffn_gate,
+                p.intermediate_size,
+                p.hidden_size,
+            )?;
+            expect(
+                &at("ffn_up"),
+                &layer.ffn_up,
+                p.intermediate_size,
+                p.hidden_size,
+            )?;
+            expect(
+                &at("ffn_down"),
+                &layer.ffn_down,
+                p.hidden_size,
+                p.intermediate_size,
+            )?;
             layers.push(layer);
         }
 

@@ -77,6 +77,8 @@ async fn chat_completions_end_to_end() {
         template_vars,
         eos_ids,
         chat_template,
+        4096,
+        4,
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -129,6 +131,21 @@ async fn chat_completions_end_to_end() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 
+    // Over-budget max_tokens → 400 context_length_exceeded.
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "bielik-7b-nvfp4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100000
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let err: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "context_length_exceeded");
+
     // Non-streaming chat completion.
     let resp = client
         .post(format!("{base}/v1/chat/completions"))
@@ -170,7 +187,8 @@ async fn chat_completions_end_to_end() {
             ],
             "temperature": 0.0,
             "max_tokens": 48,
-            "stream": true
+            "stream": true,
+            "stream_options": {"include_usage": true}
         }))
         .send()
         .await
@@ -199,12 +217,22 @@ async fn chat_completions_end_to_end() {
         }
         let chunk: serde_json::Value = serde_json::from_str(data).unwrap();
         assert_eq!(chunk["object"], "chat.completion.chunk");
+        if chunk["choices"].as_array().is_some_and(|c| c.is_empty()) {
+            // include_usage: usage arrives as a dedicated final chunk with
+            // an empty choices array; the finish chunk carries no usage.
+            usage_completion = chunk["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+            assert!(finish_reason.is_some(), "usage chunk must follow finish");
+            continue;
+        }
         if let Some(piece) = chunk["choices"][0]["delta"]["content"].as_str() {
             streamed.push_str(piece);
         }
         if let Some(f) = chunk["choices"][0]["finish_reason"].as_str() {
             finish_reason = Some(f.to_string());
-            usage_completion = chunk["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+            assert!(
+                chunk.get("usage").is_none(),
+                "finish chunk must not carry usage unless include_usage puts it in its own chunk"
+            );
         }
     }
     println!("streamed content: {streamed}");

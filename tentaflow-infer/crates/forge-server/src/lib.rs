@@ -32,12 +32,19 @@ pub struct ServerState {
     pub chat_template: String,
     pub template_vars: serde_json::Map<String, serde_json::Value>,
     pub eos_ids: Vec<u32>,
+    /// Hard token budget per request (prompt + completion).
+    pub max_context: usize,
+    /// Bounds concurrently bridged requests: each in-flight generation holds
+    /// one blocking-pool thread, so admission is capped at the engine's
+    /// active slots plus a small queue instead of the pool's global limit.
+    pub slots: Arc<tokio::sync::Semaphore>,
     pub model_id: String,
     pub api_key: Option<String>,
     pub created: u64,
 }
 
 impl ServerState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cfg: &ServerConfig,
         engine: EngineHandle,
@@ -45,13 +52,20 @@ impl ServerState {
         template_vars: serde_json::Map<String, serde_json::Value>,
         eos_ids: Vec<u32>,
         chat_template: String,
+        max_context: usize,
+        max_active: usize,
     ) -> Arc<Self> {
+        let queue_limit = max_active.saturating_mul(4).clamp(16, 256);
         Arc::new(Self {
             engine,
             tokenizer,
             chat_template,
             template_vars,
             eos_ids,
+            max_context,
+            slots: Arc::new(tokio::sync::Semaphore::new(
+                max_active.saturating_add(queue_limit),
+            )),
             model_id: cfg.model_id.clone(),
             api_key: cfg.api_key.clone(),
             created: std::time::SystemTime::now()

@@ -15,7 +15,9 @@ use forge_tokenize::Tokenizer;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let path = PathBuf::from(args.next().expect("model path"));
-    let prompt = args.next().unwrap_or_else(|| "The capital of France is".into());
+    let prompt = args
+        .next()
+        .unwrap_or_else(|| "The capital of France is".into());
     let max_tokens: usize = args.next().map(|s| s.parse().unwrap()).unwrap_or(48);
 
     let device = CudaDevice::new(
