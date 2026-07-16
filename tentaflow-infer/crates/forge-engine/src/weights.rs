@@ -88,6 +88,17 @@ trait TensorSource {
     fn fetch(&self, name: &str) -> Result<(Vec<u8>, DType, QuantKind, Vec<usize>)>;
     /// NVFP4 triple fetch; None when the tensor is not NVFP4-packed.
     fn fetch_nvfp4(&self, name: &str) -> Result<Option<NvFp4Host>>;
+    /// compressed-tensors FP8 ("float-quantized"): f8e4m3 weight + sibling
+    /// `<base>.weight_scale` (per-channel or per-tensor). None when absent.
+    fn fetch_fp8(&self, name: &str) -> Result<Option<Fp8Host>>;
+}
+
+struct Fp8Host {
+    weight: Vec<u8>,
+    /// One scale per output row, or a single tensor-wide scale.
+    scales: Vec<f32>,
+    rows: usize,
+    cols: usize,
 }
 
 struct NvFp4Host {
@@ -116,11 +127,17 @@ impl TensorSource for GgufSource<'_> {
     fn fetch_nvfp4(&self, _name: &str) -> Result<Option<NvFp4Host>> {
         Ok(None)
     }
+
+    fn fetch_fp8(&self, _name: &str) -> Result<Option<Fp8Host>> {
+        Ok(None)
+    }
 }
 
 struct StSource<'a> {
     st: &'a ShardedSafeTensors,
     scheme: Option<NvFp4Scheme>,
+    /// compressed-tensors "float-quantized" (FP8 weights + scale siblings).
+    fp8: bool,
 }
 
 impl TensorSource for StSource<'_> {
@@ -167,6 +184,58 @@ impl TensorSource for StSource<'_> {
             cols,
         }))
     }
+
+    fn fetch_fp8(&self, name: &str) -> Result<Option<Fp8Host>> {
+        if !self.fp8 {
+            return Ok(None);
+        }
+        let Some(t) = self.st.tensor(name) else {
+            return Ok(None);
+        };
+        if t.dtype != DType::F8E4M3 || t.shape.len() != 2 {
+            return Ok(None);
+        }
+        let base = name.strip_suffix(".weight").unwrap_or(name);
+        let scale_name = format!("{base}.weight_scale");
+        let Some(scale_t) = self.st.tensor(&scale_name) else {
+            return Err(ForgeError::Format(format!(
+                "{name}: fp8 weight without {scale_name}"
+            )));
+        };
+        let (rows, cols) = (t.shape[0], t.shape[1]);
+        let scale_n = scale_t.numel();
+        if scale_n != rows && scale_n != 1 {
+            return Err(ForgeError::Format(format!(
+                "{scale_name}: {scale_n} scales for {rows} rows (expect per-channel or per-tensor)"
+            )));
+        }
+        let scale_bytes = self.st.data(&scale_name)?;
+        let scales: Vec<f32> = match scale_t.dtype {
+            DType::F32 => scale_bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+            DType::BF16 => scale_bytes
+                .chunks_exact(2)
+                .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
+                .collect(),
+            DType::F16 => scale_bytes
+                .chunks_exact(2)
+                .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect(),
+            other => {
+                return Err(ForgeError::Unsupported(format!(
+                    "{scale_name}: scale dtype {other}"
+                )))
+            }
+        };
+        Ok(Some(Fp8Host {
+            weight: self.st.data(name)?.to_vec(),
+            scales,
+            rows,
+            cols,
+        }))
+    }
 }
 
 fn f32s_to_f16_bytes(vals: &[f32]) -> Vec<u8> {
@@ -193,6 +262,25 @@ fn upload_norm(device: &dyn Device, src: &dyn TensorSource, name: &str) -> Resul
 
 /// Upload a weight matrix in the most direct form a kernel can consume.
 fn upload_matrix(device: &dyn Device, src: &dyn TensorSource, name: &str) -> Result<DevWeight> {
+    if let Some(fp8) = src.fetch_fp8(name)? {
+        // v0 materializes FP8 as f16 (2 bytes/elem) — a fused f8 GEMV kernel
+        // halves that later without touching this loader contract.
+        let mut out = Vec::with_capacity(fp8.weight.len() * 2);
+        for (i, &b) in fp8.weight.iter().enumerate() {
+            let s = if fp8.scales.len() == 1 {
+                fp8.scales[0]
+            } else {
+                fp8.scales[i / fp8.cols]
+            };
+            let v = nvfp4::f8e4m3_to_f32(b) * s;
+            out.extend_from_slice(&f16::from_f32(v).to_le_bytes());
+        }
+        return Ok(DevWeight::F16 {
+            buf: upload(device, &out)?,
+            rows: fp8.rows,
+            cols: fp8.cols,
+        });
+    }
     if let Some(nv) = src.fetch_nvfp4(name)? {
         // Validate on CPU once so a corrupt checkpoint fails at load, not as
         // garbage tokens at runtime.
@@ -273,7 +361,13 @@ impl ModelWeights {
         let descriptor = ModelDescriptor::from_hf(&config)?;
         let st = ShardedSafeTensors::load_dir(dir)?;
         let scheme = NvFp4Scheme::detect(&config);
-        let src = StSource { st: &st, scheme };
+        let fp8 = config
+            .quantization_config
+            .as_ref()
+            .and_then(|qc| qc.get("format"))
+            .and_then(|f| f.as_str())
+            == Some("float-quantized");
+        let src = StSource { st: &st, scheme, fp8 };
         Self::load(device.as_ref(), descriptor, &src)
     }
 

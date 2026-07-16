@@ -63,6 +63,9 @@ enum Command {
         /// Wrap the prompt in the model's chat template as a user message.
         #[arg(long)]
         chat: bool,
+        /// VRAM weights-pool size in GiB (0 = automatic split of free VRAM).
+        #[arg(long = "weights-pool-gb", default_value_t = 0.0)]
+        weights_pool_gb: f64,
     },
     /// Measure prefill and decode throughput.
     Bench {
@@ -111,7 +114,8 @@ fn main() -> Result<()> {
             max_tokens,
             temperature,
             chat,
-        } => cmd_run(&model_path, &prompt, max_tokens, temperature, chat),
+            weights_pool_gb,
+        } => cmd_run(&model_path, &prompt, max_tokens, temperature, chat, weights_pool_gb),
         Command::Bench {
             model_path,
             tokens,
@@ -160,8 +164,22 @@ fn load_for_serve(
 }
 
 /// Load a model for one-shot commands, sizing pools from free VRAM.
-fn load_auto(path: &Path) -> Result<LoadedModel> {
-    let device = CudaDevice::with_default_pools(0).context("create CUDA device")?;
+fn load_auto(path: &Path, weights_pool_gb: f64) -> Result<LoadedModel> {
+    let device = if weights_pool_gb > 0.0 {
+        let weights = (weights_pool_gb * (1u64 << 30) as f64) as usize;
+        CudaDevice::new(
+            0,
+            PoolSizes {
+                weights,
+                kv_cache: 1 << 30,
+                activations: 1 << 30,
+                kv_page_size: 256 << 10,
+            },
+        )
+        .context("create CUDA device")?
+    } else {
+        CudaDevice::with_default_pools(0).context("create CUDA device")?
+    };
     let dev: Arc<dyn Device> = device;
     load_model(dev, path, ModelConfig::default())
 }
@@ -269,9 +287,10 @@ fn cmd_run(
     max_tokens: usize,
     temperature: f32,
     chat: bool,
+    weights_pool_gb: f64,
 ) -> Result<()> {
     let t0 = Instant::now();
-    let loaded = load_auto(model_path)?;
+    let loaded = load_auto(model_path, weights_pool_gb)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let prompt_text = if chat {
@@ -332,7 +351,7 @@ fn cmd_bench(model_path: &Path, tokens: usize, prompt_tokens: usize) -> Result<(
         bail!("--prompt-tokens must be at least 1");
     }
     let t0 = Instant::now();
-    let loaded = load_auto(model_path)?;
+    let loaded = load_auto(model_path, 0.0)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let tokenizer = Arc::new(loaded.bundle.tokenizer);
