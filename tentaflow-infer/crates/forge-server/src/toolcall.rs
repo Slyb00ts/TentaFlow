@@ -48,10 +48,13 @@ pub enum ToolParserKind {
 }
 
 impl ToolParserKind {
-    /// Resolve the parser for a served model: explicit config override first,
-    /// then the chat template's own markers, then the architecture family.
-    /// Mistral `[TOOL_CALLS]` output parsing is out of scope, so those
-    /// templates pass through unchanged.
+    /// Resolve the parser for a served model: explicit config override first
+    /// (unconditional), then auto-detection — but ONLY when the resolved
+    /// template actually references tools. A template that never renders
+    /// tool definitions means the model cannot see them, so parsing its
+    /// output for calls would misclassify ordinary JSON answers. Mistral
+    /// `[TOOL_CALLS]` output parsing is out of scope, so those templates
+    /// pass through unchanged.
     pub fn resolve(
         override_name: Option<&str>,
         arch: &str,
@@ -66,6 +69,9 @@ impl ToolParserKind {
                     "unknown tool_call_parser {other:?}; expected \"hermes\", \"llama3\" or \"none\""
                 )),
             };
+        }
+        if !chat_template.contains("tools") {
+            return Ok(Self::None);
         }
         if chat_template.contains("[TOOL_CALLS]") {
             return Ok(Self::None);
@@ -196,12 +202,23 @@ impl ToolCallParser for HermesParser {
 
 /// Llama-3.x built-in tool syntax: the ENTIRE assistant message is one JSON
 /// object `{"name": "...", "parameters": {...}}`. Anything else passes
-/// through. The whole output is buffered while it still looks like that
-/// object; the first non-`{` character switches to passthrough for good.
+/// through. Output is buffered only while it is still a valid prefix of a
+/// JSON object; the moment that becomes impossible (non-`{` start, or a
+/// syntax error before end-of-input) it flushes and passes through for good.
 #[derive(Default)]
 pub struct Llama3JsonParser {
     buf: String,
     passthrough: bool,
+}
+
+/// Can `buf` still grow into (or already be) one complete JSON value?
+/// serde's error category distinguishes "ran out of input" (still possible)
+/// from a syntax error mid-stream (impossible).
+fn json_still_possible(buf: &str) -> bool {
+    match serde_json::from_str::<serde::de::IgnoredAny>(buf) {
+        Ok(_) => true,
+        Err(e) => e.classify() == serde_json::error::Category::Eof,
+    }
 }
 
 impl ToolCallParser for Llama3JsonParser {
@@ -212,12 +229,15 @@ impl ToolCallParser for Llama3JsonParser {
             return step;
         }
         self.buf.push_str(text);
-        match self.buf.trim_start().chars().next() {
-            None | Some('{') => {}
-            Some(_) => {
-                self.passthrough = true;
-                step.text.push_str(&std::mem::take(&mut self.buf));
-            }
+        let trimmed = self.buf.trim_start();
+        let keep_buffering = match trimmed.chars().next() {
+            None => true,
+            Some('{') => json_still_possible(trimmed),
+            Some(_) => false,
+        };
+        if !keep_buffering {
+            self.passthrough = true;
+            step.text.push_str(&std::mem::take(&mut self.buf));
         }
         step
     }
@@ -469,6 +489,53 @@ mod tests {
     }
 
     #[test]
+    fn llama3_invalid_json_prefix_flushes_immediately() {
+        let mut p = OutputParser::new(ToolParserKind::Llama3Json);
+        // "{not" can never become valid JSON: it must flush on THIS push,
+        // not sit buffered until the end of the stream.
+        let step = p.push("{not");
+        assert_eq!(step.text, "{not");
+        // Everything afterwards streams straight through.
+        let step = p.push(" really json");
+        assert_eq!(step.text, " really json");
+        let step = p.finish();
+        assert!(step.text.is_empty() && step.calls.is_empty());
+    }
+
+    #[test]
+    fn llama3_incomplete_but_valid_prefix_keeps_buffering() {
+        let mut p = OutputParser::new(ToolParserKind::Llama3Json);
+        // Valid-so-far prefixes (mid-string, mid-object) must be held.
+        assert_eq!(p.push("{\"name"), ParseStep::default());
+        assert_eq!(p.push("\": \"f\", \"parameters\": {"), ParseStep::default());
+        let mut step = p.push("\"a\": 1}}");
+        step.merge(p.finish());
+        assert!(step.text.is_empty());
+        assert_eq!(step.calls.len(), 1);
+        assert_eq!(step.calls[0].name, "f");
+        assert_eq!(step.calls[0].arguments, "{\"a\":1}");
+    }
+
+    #[test]
+    fn llama3_complete_object_with_trailing_text_passes_through() {
+        let mut p = OutputParser::new(ToolParserKind::Llama3Json);
+        let mut text = String::new();
+        let mut calls = Vec::new();
+        // The trailing text makes the buffer invalid JSON, so the whole
+        // thing flushes as content on that push.
+        for piece in ["{\"name\": \"f\", \"parameters\": {}}", " and more prose"] {
+            let step = p.push(piece);
+            text.push_str(&step.text);
+            calls.extend(step.calls);
+        }
+        let step = p.finish();
+        text.push_str(&step.text);
+        calls.extend(step.calls);
+        assert!(calls.is_empty());
+        assert_eq!(text, "{\"name\": \"f\", \"parameters\": {}} and more prose");
+    }
+
+    #[test]
     fn think_block_streams_to_reasoning() {
         let mut p = OutputParser::new(ToolParserKind::Hermes);
         let mut content = String::new();
@@ -520,30 +587,46 @@ mod tests {
 
     #[test]
     fn parser_resolution_rules() {
+        // Explicit override is unconditional, even on a tool-less template.
         assert_eq!(
             ToolParserKind::resolve(Some("hermes"), "llama", "").unwrap(),
             ToolParserKind::Hermes
         );
+        assert_eq!(
+            ToolParserKind::resolve(Some("llama3"), "qwen3", "").unwrap(),
+            ToolParserKind::Llama3Json
+        );
         assert!(ToolParserKind::resolve(Some("bogus"), "qwen3", "").is_err());
+        // Auto-detection requires a template that actually references tools;
+        // otherwise the model never saw the definitions and plain JSON
+        // answers would be misclassified as calls.
         assert_eq!(
             ToolParserKind::resolve(None, "qwen3", "plain template").unwrap(),
-            ToolParserKind::Hermes
+            ToolParserKind::None
         );
         assert_eq!(
             ToolParserKind::resolve(None, "llama", "plain template").unwrap(),
+            ToolParserKind::None
+        );
+        assert_eq!(
+            ToolParserKind::resolve(None, "qwen3", "{% if tools %}...{% endif %}").unwrap(),
+            ToolParserKind::Hermes
+        );
+        assert_eq!(
+            ToolParserKind::resolve(None, "llama", "{% if tools %}...{% endif %}").unwrap(),
             ToolParserKind::Llama3Json
         );
         assert_eq!(
-            ToolParserKind::resolve(None, "mistral", "x [TOOL_CALLS] y").unwrap(),
+            ToolParserKind::resolve(None, "mistral", "{{ tools }} x [TOOL_CALLS] y").unwrap(),
             ToolParserKind::None
         );
         // Template markers beat family detection.
         assert_eq!(
-            ToolParserKind::resolve(None, "weird", "emit <tool_call> tags").unwrap(),
+            ToolParserKind::resolve(None, "weird", "{{ tools }} emit <tool_call> tags").unwrap(),
             ToolParserKind::Hermes
         );
         assert_eq!(
-            ToolParserKind::resolve(None, "gemma", "no tools here").unwrap(),
+            ToolParserKind::resolve(None, "gemma", "{% if tools %}{% endif %}").unwrap(),
             ToolParserKind::None
         );
     }

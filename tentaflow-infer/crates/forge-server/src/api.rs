@@ -233,7 +233,13 @@ impl ChatCompletionRequest {
                     m.role
                 )));
             }
-            if m.text_content().is_none() {
+            // Assistant turns replayed from a previous tool-call response
+            // legitimately carry content:null next to tool_calls.
+            let has_tool_calls = m
+                .tool_calls
+                .as_ref()
+                .is_some_and(|tc| tc.as_array().is_some_and(|a| !a.is_empty()));
+            if m.text_content().is_none() && !(m.role == "assistant" && has_tool_calls) {
                 return Err(ApiError::invalid_request(format!(
                     "messages[{i}].content must be a string or an array of text parts"
                 )));
@@ -257,10 +263,15 @@ impl ChatCompletionRequest {
     /// "required" and named function forcing need constrained decoding
     /// (SPEC §8.1.1) and are rejected honestly instead of being ignored.
     pub fn tool_mode(&self) -> Result<ToolMode, ApiError> {
-        let has_tools = self
-            .tools
-            .as_ref()
-            .is_some_and(|t| !t.as_array().is_some_and(|a| a.is_empty()));
+        let has_tools = match &self.tools {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Array(a)) => !a.is_empty(),
+            Some(_) => {
+                return Err(ApiError::invalid_request(
+                    "tools must be an array of tool definitions",
+                ))
+            }
+        };
         match &self.tool_choice {
             None => {}
             Some(serde_json::Value::String(s)) => match s.as_str() {
@@ -589,6 +600,61 @@ mod tests {
             r.tool_mode().unwrap_err().status,
             axum::http::StatusCode::BAD_REQUEST
         );
+    }
+
+    #[test]
+    fn tool_call_round_trip_messages_validate() {
+        // The follow-up request of a tool-calling exchange replays our own
+        // response: assistant with content:null + tool_calls, then the tool
+        // result. That must validate.
+        let r = chat_req(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Jaka jest pogoda w Krakowie?"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_0badc0de", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Kraków\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_0badc0de", "content": "12°C, słonecznie"}
+            ]
+        }));
+        r.generation_spec().unwrap();
+
+        // Content-less assistant WITHOUT tool calls is still rejected...
+        let r = chat_req(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "tool_calls": []}]
+        }));
+        assert!(r.generation_spec().is_err());
+        // ...and so is a content-less tool message even next to tool_calls.
+        let r = chat_req(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "tool", "tool_call_id": "call_1", "tool_calls": [{"x": 1}]}]
+        }));
+        assert!(r.generation_spec().is_err());
+    }
+
+    #[test]
+    fn tools_must_be_an_array() {
+        for bad in [
+            serde_json::json!({"type": "function"}),
+            serde_json::json!("get_weather"),
+            serde_json::json!(42),
+        ] {
+            let r = chat_req(serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "tools": bad
+            }));
+            let err = r.tool_mode().unwrap_err();
+            assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+            assert_eq!(err.body.error_type, "invalid_request_error");
+        }
+        // Explicit null is "no tools", not an error.
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "tools": null
+        }));
+        assert_eq!(r.tool_mode().unwrap(), ToolMode::None);
     }
 
     #[test]

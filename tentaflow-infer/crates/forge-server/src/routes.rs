@@ -142,7 +142,8 @@ fn bridge_events(
 /// plain string content so any HF template's `message['content'] + ...`
 /// works; all other message fields (name, tool_calls, ...) pass through.
 fn render_chat_prompt(
-    state: &ServerState,
+    chat_template: &str,
+    template_vars: &serde_json::Map<String, serde_json::Value>,
     messages: &[ChatMessage],
     tools: Option<&serde_json::Value>,
 ) -> Result<String, ApiError> {
@@ -150,6 +151,8 @@ fn render_chat_prompt(
         .iter()
         .map(|m| {
             let mut m = m.clone();
+            // Content-less assistant tool-call turns flatten to "" so
+            // templates that concatenate content never see undefined.
             m.content = Some(serde_json::Value::String(
                 m.text_content().unwrap_or_default(),
             ));
@@ -157,14 +160,7 @@ fn render_chat_prompt(
         })
         .collect();
     ChatTemplateEngine::new()
-        .render(
-            &state.chat_template,
-            &flattened,
-            tools,
-            true,
-            false,
-            &state.template_vars,
-        )
+        .render(chat_template, &flattened, tools, true, false, template_vars)
         .map_err(|e| ApiError::invalid_request(format!("chat template render failed: {e}")))
 }
 
@@ -191,7 +187,9 @@ async fn start_generation(
     let st = state.clone();
     let rx = tokio::task::spawn_blocking(move || {
         let prompt = match &input {
-            GenInput::Chat(messages, tools) => render_chat_prompt(&st, messages, tools.as_ref())?,
+            GenInput::Chat(messages, tools) => {
+                render_chat_prompt(&st.chat_template, &st.template_vars, messages, tools.as_ref())?
+            }
             GenInput::Text(s) => s.clone(),
         };
         let prompt_tokens = st
@@ -330,7 +328,9 @@ impl ChatStream {
     }
 
     fn finish_choice(&mut self, engine_reason: &'static str) -> serde_json::Value {
-        let reason = if self.any_calls {
+        // "length" must stay visible even when calls were parsed: a truncated
+        // sequence may have produced incomplete or missing calls.
+        let reason = if self.any_calls && engine_reason == "stop" {
             "tool_calls"
         } else {
             engine_reason
@@ -526,10 +526,11 @@ pub async fn chat_completions(
                     },
                 })
                 .collect();
-            let finish = if tool_calls.is_empty() {
-                c.finish
-            } else {
+            // "length" stays visible even with parsed calls (truncation).
+            let finish = if !tool_calls.is_empty() && c.finish == "stop" {
                 "tool_calls"
+            } else {
+                c.finish
             };
             // With tool calls, leftover inter-marker whitespace is noise:
             // trim it and null out an empty content, per the OpenAI shape.
@@ -610,5 +611,43 @@ pub async fn completions(
         })
         .into_response(),
         Err(e) => e.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_call_round_trip_renders() {
+        // A replayed tool-calling exchange (assistant content:null +
+        // tool_calls, then the tool result) must render through a
+        // tool-aware template without errors or undefined leaks.
+        let template = forge_tokenize::builtin_chat_template("qwen").unwrap();
+        let messages: Vec<ChatMessage> = serde_json::from_value(serde_json::json!([
+            {"role": "user", "content": "Jaka jest pogoda w Krakowie?"},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_0badc0de", "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"Kraków\"}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_0badc0de", "content": "12°C, słonecznie"}
+        ]))
+        .unwrap();
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}}
+        }]);
+
+        let out = render_chat_prompt(
+            template,
+            &serde_json::Map::new(),
+            &messages,
+            Some(&tools),
+        )
+        .unwrap();
+        assert!(out.contains("<tool_call>"), "assistant call missing: {out}");
+        assert!(out.contains("get_weather"));
+        assert!(out.contains("<tool_response>\n12°C, słonecznie"));
+        assert!(!out.contains("undefined"), "undefined leaked: {out}");
     }
 }
