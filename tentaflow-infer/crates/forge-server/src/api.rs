@@ -63,6 +63,21 @@ pub struct ChatCompletionRequest {
     pub n: Option<u32>,
     #[serde(default)]
     pub repetition_penalty: Option<f32>,
+    /// OpenAI tool definitions, passed verbatim to the chat template.
+    #[serde(default)]
+    pub tools: Option<serde_json::Value>,
+    /// "auto" (default), "none", or an unsupported forcing spec.
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+}
+
+/// How this request wants tool calling handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolMode {
+    /// Render tools into the template and parse tool calls from the output.
+    Auto,
+    /// Do not render tools and do not parse tool calls.
+    None,
 }
 
 /// `prompt` accepts a string or an array; only a single prompt is served.
@@ -237,6 +252,39 @@ impl ChatCompletionRequest {
             self.stop.clone(),
         )
     }
+
+    /// Validate `tool_choice`. Only "auto" and "none" are implemented;
+    /// "required" and named function forcing need constrained decoding
+    /// (SPEC §8.1.1) and are rejected honestly instead of being ignored.
+    pub fn tool_mode(&self) -> Result<ToolMode, ApiError> {
+        let has_tools = self
+            .tools
+            .as_ref()
+            .is_some_and(|t| !t.as_array().is_some_and(|a| a.is_empty()));
+        match &self.tool_choice {
+            None => {}
+            Some(serde_json::Value::String(s)) => match s.as_str() {
+                "auto" => {}
+                "none" => return Ok(ToolMode::None),
+                "required" => {
+                    return Err(ApiError::invalid_request(
+                        "tool_choice \"required\" is not implemented by this server",
+                    ))
+                }
+                other => {
+                    return Err(ApiError::invalid_request(format!(
+                        "tool_choice {other:?} is not one of \"auto\", \"none\""
+                    )))
+                }
+            },
+            Some(_) => {
+                return Err(ApiError::invalid_request(
+                    "named tool_choice forcing is not implemented by this server",
+                ))
+            }
+        }
+        Ok(if has_tools { ToolMode::Auto } else { ToolMode::None })
+    }
 }
 
 impl CompletionRequest {
@@ -291,10 +339,31 @@ impl Usage {
     }
 }
 
+/// OpenAI tool-call object on a response message.
+#[derive(Debug, Serialize)]
+pub struct ToolCallOut {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: &'static str,
+    pub function: FunctionCallOut,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FunctionCallOut {
+    pub name: String,
+    /// JSON-encoded arguments string, per the OpenAI wire shape.
+    pub arguments: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ChatResponseMessage {
     pub role: &'static str,
-    pub content: String,
+    /// `null` (not omitted) when the message is only tool calls.
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallOut>>,
 }
 
 #[derive(Debug, Serialize)]

@@ -22,6 +22,7 @@ from src.layernorm import layernorm_f16, layernorm_residual_f16
 from src.conv import gelu_f16, conv1d_k3_f16
 from src.attn_full import attn_full_f16_hd64, attn_full_f16_hd128
 from src.gemv import gemv_f16_bias
+from src.kv_append import kv_append_f16
 
 
 def _entry_from_ptx(ptx_path: Path) raises -> String:
@@ -123,6 +124,9 @@ def main() raises:
 
     _ = ctx.compile_function[gemv_f16_bias, dump_asm=Path("gemv_f16_bias.ptx")]()
     entries.append(_finalize(out_dir, "gemv_f16_bias"))
+
+    _ = ctx.compile_function[kv_append_f16, dump_asm=Path("kv_append_f16.ptx")]()
+    entries.append(_finalize(out_dir, "kv_append_f16"))
 
     var manifest = String('{\n  "arch": "') + arch + String('",\n  "kernels": {\n')
     for i in range(len(entries)):

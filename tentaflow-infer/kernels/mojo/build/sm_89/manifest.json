@@ -19,6 +19,7 @@
     "conv1d_k3_f16": {"file": "conv1d_k3_f16.ptx", "entry": "src_conv_conv1d_k3_f16_Point6A6A6A6AoA6A6A_fe066fd3671b5646"},
     "attn_full_f16_hd64": {"file": "attn_full_f16_hd64.ptx", "entry": "src_attn_full_attn_full_f166A6A6A6AcB6A6A_df6d899ea82db4b6"},
     "attn_full_f16_hd128": {"file": "attn_full_f16_hd128.ptx", "entry": "src_attn_full_attn_full_f166A6A6A6AcB6A6A_373175aaa4d9fea7"},
-    "gemv_f16_bias": {"file": "gemv_f16_bias.ptx", "entry": "src_gemv_gemv_f16_bias_Point6A6A6A6AoA6A6A_7ee231cec5f75ada"}
+    "gemv_f16_bias": {"file": "gemv_f16_bias.ptx", "entry": "src_gemv_gemv_f16_bias_Point6A6A6A6AoA6A6A_7ee231cec5f75ada"},
+    "kv_append_f16": {"file": "kv_append_f16.ptx", "entry": "src_kv_append_kv_append_f166A6A6A6AoA6A6A_4623a7bc4317c45a"}
   }
 }

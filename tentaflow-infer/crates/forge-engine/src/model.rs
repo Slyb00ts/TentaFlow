@@ -162,8 +162,6 @@ impl Model {
         }
 
         self.kv.grow(seq)?;
-        let page = seq.pages[pos / self.kv.cfg.page_size];
-        let slot = pos % self.kv.cfg.page_size;
 
         // Refresh the device-side paging state for the attention kernel.
         {
@@ -250,27 +248,20 @@ impl Model {
                 &stream,
             )?;
 
-            // Scatter this token's K/V rows into the paged cache.
-            let row_bytes = p.head_dim * 2;
-            for kvh in 0..p.n_kv_heads {
-                let dst_off = self.kv.token_offset(page, slot, kvh);
-                dev.copy(
-                    &k,
-                    kvh * row_bytes,
-                    &self.kv.k[l],
-                    dst_off,
-                    row_bytes,
-                    &stream,
-                )?;
-                dev.copy(
-                    &v,
-                    kvh * row_bytes,
-                    &self.kv.v[l],
-                    dst_off,
-                    row_bytes,
-                    &stream,
-                )?;
-            }
+            // Scatter this token's K/V rows into the paged cache (single
+            // launch, device-resident addressing — graph-capture ready).
+            kernels.kv_append_f16(
+                &self.kv.k[l],
+                &self.kv.v[l],
+                &k,
+                &v,
+                &self.page_table_dev,
+                &self.seq_len_dev,
+                p.n_kv_heads,
+                self.kv.cfg.page_size,
+                p.head_dim,
+                &stream,
+            )?;
 
             kernels.attn_decode_f16(
                 &attn_out,

@@ -18,10 +18,11 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::api::{
     ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatResponseMessage,
-    CompletionChoice, CompletionRequest, CompletionResponse, GenerationSpec, ModelEntry, ModelList,
-    Usage,
+    CompletionChoice, CompletionRequest, CompletionResponse, FunctionCallOut, GenerationSpec,
+    ModelEntry, ModelList, ToolCallOut, ToolMode, Usage,
 };
 use crate::error::ApiError;
+use crate::toolcall::{OutputParser, ParseStep, ToolParserKind};
 use crate::ServerState;
 
 fn now_unix() -> u64 {
@@ -41,6 +42,19 @@ fn new_id(prefix: &str) -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{prefix}-{t:x}{n:x}")
+}
+
+/// OpenAI-style tool-call ids: "call_" + 8 hex chars, unique per process.
+fn new_call_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    // Mix the counter into the high bits so consecutive ids differ even
+    // within one clock tick.
+    format!("call_{:08x}", (t ^ n.rotate_left(32)) as u32)
 }
 
 fn finish_reason_str(r: FinishReason) -> &'static str {
@@ -127,7 +141,11 @@ fn bridge_events(
 /// Rendered chat prompt for a request. Multipart text parts are flattened to
 /// plain string content so any HF template's `message['content'] + ...`
 /// works; all other message fields (name, tool_calls, ...) pass through.
-fn render_chat_prompt(state: &ServerState, messages: &[ChatMessage]) -> Result<String, ApiError> {
+fn render_chat_prompt(
+    state: &ServerState,
+    messages: &[ChatMessage],
+    tools: Option<&serde_json::Value>,
+) -> Result<String, ApiError> {
     let flattened: Vec<ChatMessage> = messages
         .iter()
         .map(|m| {
@@ -142,7 +160,7 @@ fn render_chat_prompt(state: &ServerState, messages: &[ChatMessage]) -> Result<S
         .render(
             &state.chat_template,
             &flattened,
-            None,
+            tools,
             true,
             false,
             &state.template_vars,
@@ -151,7 +169,7 @@ fn render_chat_prompt(state: &ServerState, messages: &[ChatMessage]) -> Result<S
 }
 
 enum GenInput {
-    Chat(Vec<ChatMessage>),
+    Chat(Vec<ChatMessage>, Option<serde_json::Value>),
     Text(String),
 }
 
@@ -173,7 +191,7 @@ async fn start_generation(
     let st = state.clone();
     let rx = tokio::task::spawn_blocking(move || {
         let prompt = match &input {
-            GenInput::Chat(messages) => render_chat_prompt(&st, messages)?,
+            GenInput::Chat(messages, tools) => render_chat_prompt(&st, messages, tools.as_ref())?,
             GenInput::Text(s) => s.clone(),
         };
         let prompt_tokens = st
@@ -242,23 +260,82 @@ impl StreamKind {
         }
     }
 
-    fn choice(self, text: Option<&str>, first: bool, finish: Option<&str>) -> serde_json::Value {
-        match self {
-            StreamKind::Chat => {
-                let mut delta = serde_json::Map::new();
-                // OpenAI emits the assistant role on the first delta only.
-                if first {
-                    delta.insert("role".into(), "assistant".into());
-                }
-                if let Some(t) = text {
-                    delta.insert("content".into(), t.into());
-                }
-                serde_json::json!({ "index": 0, "delta": delta, "finish_reason": finish })
-            }
-            StreamKind::Text => serde_json::json!({
-                "index": 0, "text": text.unwrap_or(""), "finish_reason": finish
-            }),
+    fn text_choice(self, text: Option<&str>, finish: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "index": 0, "text": text.unwrap_or(""), "finish_reason": finish
+        })
+    }
+}
+
+/// Per-response state of a streaming chat: the output parser plus the
+/// OpenAI delta conventions (role on the first delta only, tool-call
+/// indices, "tool_calls" finish reason once any call was emitted).
+struct ChatStream {
+    parser: OutputParser,
+    first: bool,
+    tool_index: u32,
+    any_calls: bool,
+}
+
+impl ChatStream {
+    fn new(kind: ToolParserKind) -> Self {
+        Self {
+            parser: OutputParser::new(kind),
+            first: true,
+            tool_index: 0,
+            any_calls: false,
         }
+    }
+
+    fn delta_choice(
+        &mut self,
+        mut delta: serde_json::Map<String, serde_json::Value>,
+        finish: Option<&str>,
+    ) -> serde_json::Value {
+        if self.first {
+            delta.insert("role".into(), "assistant".into());
+            self.first = false;
+        }
+        serde_json::json!({ "index": 0, "delta": delta, "finish_reason": finish })
+    }
+
+    /// One delta choice per surfaced item: reasoning, content, then each
+    /// completed tool call as a single full-function delta at its index.
+    fn choices_for(&mut self, step: ParseStep) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        if !step.reasoning.is_empty() {
+            let mut d = serde_json::Map::new();
+            d.insert("reasoning_content".into(), step.reasoning.into());
+            out.push(self.delta_choice(d, None));
+        }
+        if !step.text.is_empty() {
+            let mut d = serde_json::Map::new();
+            d.insert("content".into(), step.text.into());
+            out.push(self.delta_choice(d, None));
+        }
+        for call in step.calls {
+            let tc = serde_json::json!([{
+                "index": self.tool_index,
+                "id": new_call_id(),
+                "type": "function",
+                "function": { "name": call.name, "arguments": call.arguments },
+            }]);
+            self.tool_index += 1;
+            self.any_calls = true;
+            let mut d = serde_json::Map::new();
+            d.insert("tool_calls".into(), tc);
+            out.push(self.delta_choice(d, None));
+        }
+        out
+    }
+
+    fn finish_choice(&mut self, engine_reason: &'static str) -> serde_json::Value {
+        let reason = if self.any_calls {
+            "tool_calls"
+        } else {
+            engine_reason
+        };
+        self.delta_choice(serde_json::Map::new(), Some(reason))
     }
 }
 
@@ -294,6 +371,7 @@ async fn stream_response(
     kind: StreamKind,
     id: String,
     include_usage: bool,
+    chat: Option<ChatStream>,
 ) -> Response {
     let first = match rx.recv().await {
         Some(EngineEvent::Error(msg)) => return ApiError::from_engine_error(&msg).into_response(),
@@ -308,7 +386,7 @@ async fn stream_response(
     let (tx, out) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(256);
     tokio::spawn(async move {
         let mut pending = Some(first);
-        let mut first_chunk = true;
+        let mut chat = chat;
         loop {
             let ev = match pending.take() {
                 Some(ev) => ev,
@@ -319,11 +397,19 @@ async fn stream_response(
             };
             let done = match ev {
                 EngineEvent::Token { text, .. } => {
-                    let choice = kind.choice(Some(&text), first_chunk, None);
-                    first_chunk = false;
-                    let chunk = sse_chunk(kind, &id, created, &model, vec![choice], None);
-                    if tx.send(Ok(chunk)).await.is_err() {
-                        return; // client hung up; dropping rx cancels the engine seq
+                    let choices = match chat.as_mut() {
+                        Some(cs) => {
+                            let step = cs.parser.push(&text);
+                            cs.choices_for(step)
+                        }
+                        None => vec![kind.text_choice(Some(&text), None)],
+                    };
+                    // One delta per chunk, matching OpenAI's stream shape.
+                    for choice in choices {
+                        let chunk = sse_chunk(kind, &id, created, &model, vec![choice], None);
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            return; // client hung up; dropping rx cancels the engine seq
+                        }
                     }
                     false
                 }
@@ -332,10 +418,22 @@ async fn stream_response(
                     tokens,
                     prompt_tokens,
                 } => {
-                    let choice = kind.choice(None, first_chunk, Some(finish_reason_str(reason)));
-                    let chunk = sse_chunk(kind, &id, created, &model, vec![choice], None);
-                    if tx.send(Ok(chunk)).await.is_err() {
-                        return;
+                    let engine_reason = finish_reason_str(reason);
+                    let mut choices = Vec::new();
+                    match chat.as_mut() {
+                        Some(cs) => {
+                            // Flush held-back parser state before finishing.
+                            let step = cs.parser.finish();
+                            choices.extend(cs.choices_for(step));
+                            choices.push(cs.finish_choice(engine_reason));
+                        }
+                        None => choices.push(kind.text_choice(None, Some(engine_reason))),
+                    }
+                    for choice in choices {
+                        let chunk = sse_chunk(kind, &id, created, &model, vec![choice], None);
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            return;
+                        }
                     }
                     if include_usage {
                         let usage_chunk = sse_chunk(

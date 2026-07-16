@@ -88,15 +88,6 @@ impl KvCache {
         seq.len = 0;
     }
 
-    /// Byte offset of (page, slot) for one head-row write.
-    pub fn token_offset(&self, page: i32, slot: usize, kv_head: usize) -> usize {
-        let page_stride = self.cfg.n_kv_heads * self.cfg.page_size * self.cfg.head_dim;
-        ((page as usize) * page_stride
-            + kv_head * self.cfg.page_size * self.cfg.head_dim
-            + slot * self.cfg.head_dim)
-            * 2
-    }
-
     pub fn free_page_count(&self) -> usize {
         self.free_pages.len()
     }

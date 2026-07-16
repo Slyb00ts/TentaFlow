@@ -481,6 +481,42 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Scatter the current token's K/V rows ([n_kv_heads, head_dim]) into the
+    /// paged cache at position seq_len[0]-1 (device-resident addressing —
+    /// CUDA-graph-replay safe).
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_append_f16(
+        &self,
+        k_cache: &DevBuffer,
+        v_cache: &DevBuffer,
+        k_in: &DevBuffer,
+        v_in: &DevBuffer,
+        page_table: &DevBuffer,
+        seq_len: &DevBuffer,
+        n_kv_heads: usize,
+        page_size: usize,
+        head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("kv_append_f16")?;
+        let cfg = LaunchConfig {
+            grid: (n_kv_heads as u32, 1, 1),
+            block: ((head_dim as u32).clamp(32, 256), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(k_cache)
+            .buf(v_cache)
+            .buf(k_in)
+            .buf(v_in)
+            .buf(page_table)
+            .buf(seq_len)
+            .scalar(n_kv_heads as i64)
+            .scalar(page_size as i64)
+            .scalar(head_dim as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// Paged flash-decode attention. Layouts documented in attention.mojo.
     #[allow(clippy::too_many_arguments)]
     pub fn attn_decode_f16(
