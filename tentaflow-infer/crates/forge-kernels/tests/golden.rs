@@ -259,8 +259,8 @@ fn attn_decode_matches_reference() {
     dev.synchronize().unwrap();
 
     let got = download_f16(dev.as_ref(), &ob, n_seqs * n_q_heads * head_dim);
-    for s in 0..n_seqs {
-        let ctx_len = seq_lens[s] as usize;
+    for (s, &sl) in seq_lens.iter().enumerate() {
+        let ctx_len = sl as usize;
         for h in 0..n_q_heads {
             let kvh = h / (n_q_heads / n_kv_heads);
             let qb_off = (s * n_q_heads + h) * head_dim;
