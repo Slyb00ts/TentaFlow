@@ -274,12 +274,33 @@ impl ModelWeights {
         let (token_embd_f16, vocab, hidden) = upload_embedding(device, src, embd_name)?;
         let output_norm = upload_norm(device, src, global(WeightRole::OutputNorm)?)?;
 
-        let lm_head = if let Some(name) = descriptor.globals.get(&WeightRole::LmHead) {
-            upload_matrix(device, src, name)?
-        } else {
-            // Tied embeddings: reuse the f16 host conversion by fetching again
-            // as a matrix (upload_matrix handles quant → f16).
-            upload_matrix(device, src, embd_name)?
+        let lm_head_name = descriptor
+            .globals
+            .get(&WeightRole::LmHead)
+            .unwrap_or(embd_name);
+        let lm_head = match upload_matrix(device, src, lm_head_name)? {
+            // The logit head needs an f32-output kernel, which exists for f16
+            // and Q8_0 only — materialize an NVFP4 head as f16 instead of
+            // failing at first token.
+            DevWeight::NvFp4 { rows, cols, .. } => {
+                let nv = src.fetch_nvfp4(lm_head_name)?.ok_or_else(|| {
+                    ForgeError::Format(format!("{lm_head_name}: nvfp4 tensors vanished"))
+                })?;
+                let f32s = nvfp4::dequantize_nvfp4(
+                    &nv.packed,
+                    &nv.scales,
+                    nv.global_scale,
+                    rows,
+                    cols,
+                    16,
+                )?;
+                DevWeight::F16 {
+                    buf: upload(device, &f32s_to_f16_bytes(&f32s))?,
+                    rows,
+                    cols,
+                }
+            }
+            w => w,
         };
         if lm_head.rows() != vocab || lm_head.cols() != hidden {
             return Err(ForgeError::Format(format!(
@@ -288,6 +309,28 @@ impl ModelWeights {
                 lm_head.cols()
             )));
         }
+        if vocab != descriptor.params.vocab_size || hidden != descriptor.params.hidden_size {
+            return Err(ForgeError::Format(format!(
+                "embedding [{vocab}, {hidden}] does not match model config [{}, {}]",
+                descriptor.params.vocab_size, descriptor.params.hidden_size
+            )));
+        }
+
+        // Shape validation: activation buffers are sized from the descriptor,
+        // so any weight disagreeing with it would launch out-of-bounds GEMVs.
+        let p = &descriptor.params;
+        let q_dim = p.n_heads * p.head_dim;
+        let kv_dim = p.n_kv_heads * p.head_dim;
+        let expect = |what: &str, w: &DevWeight, rows: usize, cols: usize| -> Result<()> {
+            if w.rows() != rows || w.cols() != cols {
+                return Err(ForgeError::Format(format!(
+                    "{what}: shape [{}, {}] does not match model config [{rows}, {cols}]",
+                    w.rows(),
+                    w.cols()
+                )));
+            }
+            Ok(())
+        };
 
         let mut layers = Vec::with_capacity(descriptor.params.block_count);
         for (idx, layer_map) in descriptor.layers.iter().enumerate() {
@@ -296,7 +339,7 @@ impl ModelWeights {
                     .get(&role)
                     .ok_or_else(|| ForgeError::Format(format!("layer {idx}: missing {role:?}")))
             };
-            layers.push(LayerWeights {
+            let layer = LayerWeights {
                 attn_norm: upload_norm(device, src, name(WeightRole::AttnNorm)?)?,
                 ffn_norm: upload_norm(device, src, name(WeightRole::FfnNorm)?)?,
                 q_norm: match layer_map.get(&WeightRole::AttnQNorm) {
@@ -314,7 +357,16 @@ impl ModelWeights {
                 ffn_gate: upload_matrix(device, src, name(WeightRole::FfnGate)?)?,
                 ffn_up: upload_matrix(device, src, name(WeightRole::FfnUp)?)?,
                 ffn_down: upload_matrix(device, src, name(WeightRole::FfnDown)?)?,
-            });
+            };
+            let at = |what: &str| format!("layer {idx} {what}");
+            expect(&at("attn_q"), &layer.attn_q, q_dim, p.hidden_size)?;
+            expect(&at("attn_k"), &layer.attn_k, kv_dim, p.hidden_size)?;
+            expect(&at("attn_v"), &layer.attn_v, kv_dim, p.hidden_size)?;
+            expect(&at("attn_o"), &layer.attn_o, p.hidden_size, q_dim)?;
+            expect(&at("ffn_gate"), &layer.ffn_gate, p.intermediate_size, p.hidden_size)?;
+            expect(&at("ffn_up"), &layer.ffn_up, p.intermediate_size, p.hidden_size)?;
+            expect(&at("ffn_down"), &layer.ffn_down, p.hidden_size, p.intermediate_size)?;
+            layers.push(layer);
         }
 
         Ok(ModelWeights {

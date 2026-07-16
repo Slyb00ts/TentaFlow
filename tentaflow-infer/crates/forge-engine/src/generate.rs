@@ -105,18 +105,27 @@ fn run(
         logits = model.step(seq, next)?;
     }
 
-    // Flush the decoder tail unless a stop consumed the stream.
+    // Flush the decoder tail unless a stop consumed the stream. Flushed text
+    // goes through the same stop-matching and event path as live tokens so
+    // streaming clients see the full output and stops still terminate.
     if finish != FinishReason::Stop {
+        let last_id = tokens.last().copied().unwrap_or(0);
+        let mut emit = |s: String, on_event: &mut dyn FnMut(StreamEvent)| {
+            if !s.is_empty() {
+                text.push_str(&s);
+                on_event(StreamEvent::Token { id: last_id, text: s });
+            }
+        };
         let tail = decoder.finish()?;
         if !tail.is_empty() {
             let step = stops.push(&tail);
-            if !step.emit.is_empty() {
-                text.push_str(&step.emit);
+            emit(step.emit, on_event);
+            if step.matched.is_some() {
+                finish = FinishReason::Stop;
             }
         }
-        let rest = stops.finish();
-        if !rest.is_empty() {
-            text.push_str(&rest);
+        if finish != FinishReason::Stop {
+            emit(stops.finish(), on_event);
         }
     }
 

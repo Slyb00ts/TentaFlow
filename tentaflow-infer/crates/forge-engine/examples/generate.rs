@@ -80,6 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     })?;
     println!();
+    eprintln!("generated ids: {:?}", out.tokens);
     let dt = t1.elapsed().as_secs_f32();
     eprintln!(
         "\n{} prompt + {} generated in {:.2}s ({:.1} tok/s), finish={:?}",

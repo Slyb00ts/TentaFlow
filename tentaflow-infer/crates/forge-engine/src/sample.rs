@@ -50,7 +50,26 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    pub fn new(params: SamplingParams) -> Self {
+    pub fn new(mut params: SamplingParams) -> Self {
+        // Caller-supplied parameters are clamped into sane ranges so no
+        // combination can empty the candidate set or inject NaN.
+        if !params.temperature.is_finite() || params.temperature < 0.0 {
+            params.temperature = 1.0;
+        }
+        if !params.top_p.is_finite() {
+            params.top_p = 1.0;
+        }
+        params.top_p = params.top_p.clamp(0.0, 1.0);
+        if params.top_p == 0.0 {
+            params.top_p = 1.0;
+        }
+        if !params.min_p.is_finite() {
+            params.min_p = 0.0;
+        }
+        params.min_p = params.min_p.clamp(0.0, 1.0);
+        if !params.repetition_penalty.is_finite() || params.repetition_penalty <= 0.0 {
+            params.repetition_penalty = 1.0;
+        }
         let seed = params.seed.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -72,7 +91,10 @@ impl Sampler {
 
         let mut logits = logits.to_vec();
         if p.repetition_penalty != 1.0 {
-            for &t in recent {
+            // Penalize each distinct token once — repeated occurrences must
+            // not compound the penalty exponentially.
+            let distinct: std::collections::HashSet<u32> = recent.iter().copied().collect();
+            for t in distinct {
                 if let Some(l) = logits.get_mut(t as usize) {
                     *l = if *l > 0.0 {
                         *l / p.repetition_penalty
@@ -119,6 +141,15 @@ impl Sampler {
         if p.min_p > 0.0 {
             let floor = p.min_p * candidates[0].1;
             candidates.retain(|c| c.1 >= floor);
+            if candidates.is_empty() {
+                // Numerical edge (NaN probabilities): fall back to greedy.
+                return Ok(logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(i, _)| i as u32)
+                    .unwrap_or(0));
+            }
         }
 
         if p.top_p < 1.0 {
