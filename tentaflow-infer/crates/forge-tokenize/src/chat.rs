@@ -69,6 +69,46 @@ impl ChatMessage {
     }
 }
 
+// Fuel only bounds VM instructions, not memory: a single instruction like
+// `{{ "x" * 1000000000 }}` allocates gigabytes. Source, input and output
+// sizes are therefore capped explicitly as well.
+const MAX_TEMPLATE_SRC_BYTES: usize = 256 * 1024;
+const MAX_MESSAGES_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RENDER_BYTES: usize = 4 * 1024 * 1024;
+
+/// `io::Write` sink that rejects writes past a fixed byte budget, so a
+/// runaway template aborts mid-render instead of exhausting memory.
+struct BoundedWriter {
+    buf: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl BoundedWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for BoundedWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len().saturating_add(data.len()) > self.limit {
+            self.exceeded = true;
+            return Err(std::io::Error::other("chat template output limit exceeded"));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub struct ChatTemplateEngine {
     fuel: u64,
 }
@@ -104,6 +144,20 @@ impl ChatTemplateEngine {
                 "add_generation_prompt and continue_final_message are mutually exclusive".into(),
             ));
         }
+        if template_src.len() > MAX_TEMPLATE_SRC_BYTES {
+            return Err(ForgeError::Tokenizer(format!(
+                "chat template source too large: {} bytes (limit {MAX_TEMPLATE_SRC_BYTES})",
+                template_src.len()
+            )));
+        }
+        let messages_bytes = serde_json::to_vec(messages)
+            .map_err(|e| ForgeError::Tokenizer(format!("failed to serialize messages: {e}")))?
+            .len();
+        if messages_bytes > MAX_MESSAGES_BYTES {
+            return Err(ForgeError::Tokenizer(format!(
+                "chat messages too large: {messages_bytes} bytes (limit {MAX_MESSAGES_BYTES})"
+            )));
+        }
 
         let mut env = Environment::new();
         env.set_fuel(Some(self.fuel));
@@ -134,9 +188,21 @@ impl ChatTemplateEngine {
         );
 
         let template = env.get_template("chat").expect("template just added");
-        let mut rendered = template
-            .render(Value::from_serialize(&ctx))
-            .map_err(|e| ForgeError::Tokenizer(format!("chat template render error: {e:#}")))?;
+        let mut writer = BoundedWriter::new(MAX_RENDER_BYTES);
+        template
+            .render_captured_to(Value::from_serialize(&ctx), &mut writer)
+            .map_err(|e| {
+                if writer.exceeded {
+                    ForgeError::Tokenizer(format!(
+                        "chat template render error: output exceeds {MAX_RENDER_BYTES} bytes"
+                    ))
+                } else {
+                    ForgeError::Tokenizer(format!("chat template render error: {e:#}"))
+                }
+            })?;
+        // minijinja only writes template text, which is always valid UTF-8.
+        let mut rendered = String::from_utf8(writer.buf)
+            .map_err(|e| ForgeError::Tokenizer(format!("chat template render error: {e}")))?;
 
         if continue_final_message {
             rendered = truncate_after_final_message(rendered, messages)?;

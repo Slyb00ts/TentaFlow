@@ -4,6 +4,7 @@
 // top-k/top-p sampling on CPU, streaming generation with stop handling.
 
 pub mod generate;
+pub mod gguf_vocab;
 pub mod kv;
 pub mod model;
 pub mod sample;

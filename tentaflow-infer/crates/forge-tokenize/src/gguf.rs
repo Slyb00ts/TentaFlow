@@ -50,15 +50,101 @@ pub struct GgufVocab {
     pub unk_id: Option<u32>,
     /// `tokenizer.ggml.add_bos_token`.
     pub add_bos: bool,
+    /// `tokenizer.ggml.add_eos_token`.
+    pub add_eos: bool,
 }
 
-// GPT-2 pre-tokenization regex (used when `pre` is unrecognized or "gpt-2").
-const GPT2_PRE_RE: &str =
-    r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
-// Qwen2/Qwen3 pre-tokenization regex (matches the upstream tokenizer.json Split).
-const QWEN2_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-// Llama-3 pre-tokenization regex (digits grouped up to 3).
-const LLAMA3_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+// Pre-tokenization split regexes, ported byte-exactly from llama.cpp
+// `llm_tokenizer_bpe` (src/llama-vocab.cpp). Multi-entry lists are applied
+// sequentially: each regex further splits the pieces the previous one
+// produced, mirroring llama.cpp's `unicode_regex_split`. Where llama.cpp
+// carries the original tokenizer.json regex in a comment (it adapts `(?i:)`
+// for its own engine), the original is used here because fancy-regex
+// supports it directly.
+const PRE_GPT2: &[&str] =
+    &[r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"];
+const PRE_QWEN2: &[&str] = &[
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+];
+const PRE_LLAMA3: &[&str] = &[
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+];
+const PRE_DEFAULT: &[&str] = &[
+    "[\\p{P}\\$\\+<=>\\^~\\|]+",
+    "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)",
+    "\\p{N}+",
+    "[0-9][0-9][0-9]",
+];
+const PRE_FALCON: &[&str] = &[
+    "[\\p{P}\\$\\+<=>\\^~\\|`]+",
+    "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)",
+    "[0-9][0-9][0-9]",
+];
+const PRE_STARCODER: &[&str] = &[
+    "\\p{N}",
+    "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)",
+];
+const PRE_DEEPSEEK_LLM: &[&str] = &[
+    "[\r\n]",
+    // Cased-letters class from the deepseek tokenizer. Three Greek Extended
+    // range endpoints are written escaped: the llama.cpp source carries them
+    // NFC-normalized to lookalike singletons (U+1F7D→U+03CE, U+1FD3→U+0390,
+    // U+1FDB→U+038A), which makes the ranges descending — llama.cpp's engine
+    // tolerates that, fancy-regex correctly rejects it.
+    "\\s?[A-Za-zµÀ-ÖØ-öø-ƺƼ-ƿǄ-ʓʕ-ʯͰ-ͳͶͷͻ-ͽͿΆΈ-ΊΌΎ-ΡΣ-ϵϷ-ҁҊ-ԯԱ-ՖႠ-ჅᎠ-Ᏽᏸ-ᏽᲐ-ᲺᲽ-Ჿᴀ-ᴫᵫ-ᵷᵹ-ᶚḀ-ἕἘ-Ἕἠ-ὅὈ-Ὅὐ-ὗὙὛὝὟ-\u{1F7D}ᾀ-ᾴᾶ-ᾼιῂ-ῄῆ-ῌῐ-\u{1FD3}ῖ-\u{1FDB}ῠ-Ῥῲ-ῴῶ-ῼℂℇℊ-ℓℕℙ-ℝℤΩℨK-ℭℯ-ℴℹℼ-ℿⅅ-ⅉⅎↃↄⰀ-ⱻⱾ-ⳤⳫ-ⳮⳲⳳꙀ-ꙭꚀ-ꚛꜢ-ꝯꝱ-ꞇꞋ-ꞎꭰ-ꮿﬀ-ﬆﬓ-ﬗＡ-Ｚａ-ｚ𐐀-𐑏𐒰-𐓓𐓘-𐓻𐲀-𐲲𐳀-𐳲𑢠-𑣟𞤀-𞥃]+",
+    "\\s?[!-/:-~！-／：-～‘-‟　-。]+",
+    "\\s+$",
+    "[一-龥ࠀ-一가-퟿]+",
+    "\\p{N}+",
+];
+const PRE_DEEPSEEK_CODER: &[&str] = &[
+    "[\r\n]",
+    "\\s?\\p{L}+",
+    "\\s?\\p{P}+",
+    "[一-龥ࠀ-一가-퟿]+",
+    "\\p{N}",
+];
+const PRE_DEEPSEEK3: &[&str] = &[
+    "\\p{N}{1,3}",
+    "[一-龥぀-ゟ゠-ヿ]+",
+    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+",
+];
+const PRE_TEKKEN: &[&str] = &[
+    "[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+];
+const PRE_GPT4O: &[&str] = &[
+    "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+];
+
+/// Per-`tokenizer.ggml.pre` split regexes + BPE `ignore_merges` flag, mirroring
+/// llama.cpp's pre-tokenizer table (llama_vocab::impl::load, src/llama-vocab.cpp).
+/// Unknown pre schemes are an error: silently substituting another regex would
+/// produce wrong token ids.
+fn pre_spec(pre: &str) -> Result<(&'static [&'static str], bool)> {
+    match pre {
+        "" | "default" => Ok((PRE_DEFAULT, false)),
+        "gpt-2" | "phi-2" | "jina-es" | "jina-de" | "gigachat" | "jina-v2-es" | "jina-v2-de"
+        | "a.x-4.0" | "mellum" | "modern-bert" | "mpt" | "olmo" | "jais" | "trillion"
+        | "granite-docling" | "exaone4" => Ok((PRE_GPT2, false)),
+        "qwen2" | "deepseek-r1-qwen" | "kormo" | "f2llmv2" | "megrez" | "stablelm2"
+        | "hunyuan" => Ok((PRE_QWEN2, false)),
+        "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "pixtral"
+        | "midm-2.0" | "lfm2" | "jina-v5-nano" => Ok((PRE_LLAMA3, true)),
+        "dbrx" | "smaug-bpe" | "glm4" | "chatglm-bpe" => Ok((PRE_LLAMA3, false)),
+        "falcon" => Ok((PRE_FALCON, false)),
+        "starcoder" | "refact" | "command-r" | "smollm" | "codeshell" | "exaone"
+        | "minerva-7b" => Ok((PRE_STARCODER, false)),
+        "deepseek-llm" => Ok((PRE_DEEPSEEK_LLM, false)),
+        "deepseek-coder" => Ok((PRE_DEEPSEEK_CODER, false)),
+        "deepseek-v3" => Ok((PRE_DEEPSEEK3, false)),
+        "tekken" => Ok((PRE_TEKKEN, true)),
+        "gpt-4o" | "llama4" | "kanana2" | "talkie" => Ok((PRE_GPT4O, false)),
+        other => Err(ForgeError::Tokenizer(format!(
+            "unimplemented GGUF pre-tokenizer scheme {other:?}: refusing to substitute \
+             another split regex (would produce wrong token ids)"
+        ))),
+    }
+}
 
 impl Tokenizer {
     /// Build an in-memory HF tokenizer equivalent to the GGUF-embedded one.
@@ -83,8 +169,8 @@ impl Tokenizer {
             }
         };
         add_special_tokens(&mut inner, vocab)?;
-        if vocab.add_bos {
-            attach_bos_processor(&mut inner, vocab)?;
+        if vocab.add_bos || vocab.add_eos {
+            attach_bos_eos_processor(&mut inner, vocab)?;
         }
         Ok(Tokenizer::from_inner(
             inner,
@@ -117,9 +203,10 @@ fn build_gpt2(vocab: &GgufVocab) -> Result<tokenizers::Tokenizer> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // Newer BPE vocabs (qwen2, llama3) rely on "ignore_merges": a word that is
-    // already a full vocab entry is emitted directly without running merges.
-    let ignore_merges = matches!(vocab.pre.as_str(), "qwen2" | "llama-bpe" | "llama-v3");
+    // "ignore_merges" (a word already present in the vocab is emitted directly
+    // without running merges) is a per-pre property: llama-3-style vocabs and
+    // tekken enable it, qwen2 and the rest use the explicit merge table only.
+    let (split_regexes, ignore_merges) = pre_spec(vocab.pre.as_str())?;
     let model = BPE::builder()
         .vocab_and_merges(vocab_map, merges)
         .ignore_merges(ignore_merges)
@@ -130,19 +217,10 @@ fn build_gpt2(vocab: &GgufVocab) -> Result<tokenizers::Tokenizer> {
 
     let mut tokenizer = tokenizers::Tokenizer::new(model);
 
-    // The GPT-2 ByteLevel pre-tokenizer embeds its own split regex; qwen2 and
-    // llama3 use a different regex, so those run an explicit Split first and
+    // The GPT-2 ByteLevel pre-tokenizer embeds its own split regex; each pre
+    // scheme has its own regex list, so explicit Splits run first and
     // ByteLevel only does the byte→unicode alphabet mapping.
-    let pre: PreTokenizerWrapper = match vocab.pre.as_str() {
-        "qwen2" => split_then_byte_level(QWEN2_PRE_RE)?,
-        "llama-bpe" | "llama-v3" => split_then_byte_level(LLAMA3_PRE_RE)?,
-        "gpt-2" | "gpt2" | "default" | "" => split_then_byte_level(GPT2_PRE_RE)?,
-        // Unknown pre flavors degrade to the GPT-2 regex rather than failing:
-        // llama.cpp does the same and the byte-level alphabet keeps decoding
-        // lossless even if word boundaries differ slightly.
-        _ => split_then_byte_level(GPT2_PRE_RE)?,
-    };
-    tokenizer.with_pre_tokenizer(Some(pre));
+    tokenizer.with_pre_tokenizer(Some(splits_then_byte_level(split_regexes)?));
     tokenizer.with_decoder(Some(
         ByteLevel::default()
             .add_prefix_space(false)
@@ -152,21 +230,25 @@ fn build_gpt2(vocab: &GgufVocab) -> Result<tokenizers::Tokenizer> {
     Ok(tokenizer)
 }
 
-fn split_then_byte_level(pattern: &str) -> Result<PreTokenizerWrapper> {
-    let split = Split::new(
-        SplitPattern::Regex(pattern.to_string()),
-        SplitDelimiterBehavior::Isolated,
-        false,
-    )
-    .map_err(|e| ForgeError::Tokenizer(format!("invalid pre-tokenizer regex: {e}")))?;
-    let byte_level = ByteLevel::default()
-        .add_prefix_space(false)
-        .trim_offsets(false)
-        .use_regex(false);
-    Ok(
-        tokenizers::pre_tokenizers::sequence::Sequence::new(vec![split.into(), byte_level.into()])
+fn splits_then_byte_level(patterns: &[&str]) -> Result<PreTokenizerWrapper> {
+    let mut steps: Vec<PreTokenizerWrapper> = Vec::with_capacity(patterns.len() + 1);
+    for pattern in patterns {
+        let split = Split::new(
+            SplitPattern::Regex((*pattern).to_string()),
+            SplitDelimiterBehavior::Isolated,
+            false,
+        )
+        .map_err(|e| ForgeError::Tokenizer(format!("invalid pre-tokenizer regex: {e}")))?;
+        steps.push(split.into());
+    }
+    steps.push(
+        ByteLevel::default()
+            .add_prefix_space(false)
+            .trim_offsets(false)
+            .use_regex(false)
             .into(),
-    )
+    );
+    Ok(tokenizers::pre_tokenizers::sequence::Sequence::new(steps).into())
 }
 
 /// llama family: GGUF stores SPM pieces + scores but no merges. Rebuild BPE
@@ -268,21 +350,50 @@ fn add_special_tokens(tokenizer: &mut tokenizers::Tokenizer, vocab: &GgufVocab) 
     Ok(())
 }
 
-fn attach_bos_processor(tokenizer: &mut tokenizers::Tokenizer, vocab: &GgufVocab) -> Result<()> {
-    let bos_id = vocab.bos_id.ok_or_else(|| {
-        ForgeError::Tokenizer("GGUF vocab has add_bos=true but no bos_token_id".into())
+fn special_token(vocab: &GgufVocab, id: Option<u32>, which: &str) -> Result<(String, u32)> {
+    let id = id.ok_or_else(|| {
+        ForgeError::Tokenizer(format!(
+            "GGUF vocab has add_{which}=true but no {which}_token_id"
+        ))
     })?;
-    let bos_token = vocab.tokens.get(bos_id as usize).cloned().ok_or_else(|| {
-        ForgeError::Tokenizer(format!("GGUF bos_token_id {bos_id} out of vocab range"))
+    let token = vocab.tokens.get(id as usize).cloned().ok_or_else(|| {
+        ForgeError::Tokenizer(format!("GGUF {which}_token_id {id} out of vocab range"))
     })?;
+    Ok((token, id))
+}
+
+fn attach_bos_eos_processor(tokenizer: &mut tokenizers::Tokenizer, vocab: &GgufVocab) -> Result<()> {
+    let bos = if vocab.add_bos {
+        Some(special_token(vocab, vocab.bos_id, "bos")?)
+    } else {
+        None
+    };
+    let eos = if vocab.add_eos {
+        Some(special_token(vocab, vocab.eos_id, "eos")?)
+    } else {
+        None
+    };
+    let turn = |seq: &str| {
+        let mut parts = Vec::new();
+        if let Some((tok, _)) = &bos {
+            parts.push(tok.clone());
+        }
+        parts.push(seq.to_string());
+        if let Some((tok, _)) = &eos {
+            parts.push(tok.clone());
+        }
+        parts.join(" ")
+    };
+    let mut specials: Vec<(String, u32)> = bos.iter().chain(eos.iter()).cloned().collect();
+    specials.dedup();
     let processor = TemplateProcessing::builder()
-        .try_single(format!("{bos_token} $A"))
-        .map_err(|e| ForgeError::Tokenizer(format!("failed to build bos template: {e}")))?
-        .try_pair(format!("{bos_token} $A {bos_token} $B"))
-        .map_err(|e| ForgeError::Tokenizer(format!("failed to build bos pair template: {e}")))?
-        .special_tokens(vec![(bos_token, bos_id)])
+        .try_single(turn("$A"))
+        .map_err(|e| ForgeError::Tokenizer(format!("failed to build bos/eos template: {e}")))?
+        .try_pair(format!("{} {}", turn("$A"), turn("$B")))
+        .map_err(|e| ForgeError::Tokenizer(format!("failed to build bos/eos pair template: {e}")))?
+        .special_tokens(specials)
         .build()
-        .map_err(|e| ForgeError::Tokenizer(format!("failed to build bos processor: {e}")))?;
+        .map_err(|e| ForgeError::Tokenizer(format!("failed to build bos/eos processor: {e}")))?;
     tokenizer.with_post_processor(Some(processor));
     Ok(())
 }

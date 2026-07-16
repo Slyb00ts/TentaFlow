@@ -70,6 +70,7 @@ fn byte_level_gguf_vocab(extra_tokens: &[&str], merges: &[&str]) -> GgufVocab {
         pad_id: None,
         unk_id: None,
         add_bos: false,
+        add_eos: false,
     }
 }
 
@@ -124,6 +125,82 @@ fn gguf_gpt2_control_tokens_are_special() {
     assert_eq!(tok.decode(&[256], false).unwrap(), "<|end|>");
 }
 
+#[test]
+fn gguf_add_eos_appends_eos_token() {
+    let mut vocab = byte_level_gguf_vocab(&["<s>", "</s>"], &[]);
+    vocab.token_types[256] = 3;
+    vocab.token_types[257] = 3;
+    vocab.bos_id = Some(256);
+    vocab.eos_id = Some(257);
+    vocab.add_bos = true;
+    vocab.add_eos = true;
+    let tok = Tokenizer::from_gguf_vocab(&vocab).expect("build");
+    let ids = tok.encode("hi", true).unwrap();
+    assert_eq!(ids.first(), Some(&256), "add_bos must prepend <s>");
+    assert_eq!(ids.last(), Some(&257), "add_eos must append </s>");
+    // Without special tokens neither is added.
+    let ids = tok.encode("hi", false).unwrap();
+    assert!(!ids.contains(&256) && !ids.contains(&257));
+}
+
+#[test]
+fn gguf_add_eos_without_bos() {
+    let mut vocab = byte_level_gguf_vocab(&["</s>"], &[]);
+    vocab.token_types[256] = 3;
+    vocab.eos_id = Some(256);
+    vocab.add_eos = true;
+    let tok = Tokenizer::from_gguf_vocab(&vocab).expect("build");
+    let ids = tok.encode("hi", true).unwrap();
+    assert_eq!(ids.last(), Some(&256));
+    assert_eq!(ids.len(), 3, "h, i, </s>");
+}
+
+#[test]
+fn gguf_unknown_pre_scheme_is_rejected() {
+    let mut vocab = byte_level_gguf_vocab(&[], &[]);
+    vocab.pre = "some-future-scheme".into();
+    let err = Tokenizer::from_gguf_vocab(&vocab).unwrap_err();
+    assert!(
+        err.to_string().contains("some-future-scheme"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn gguf_supported_pre_schemes_build() {
+    // Every implemented pre scheme must produce a working tokenizer (this
+    // also proves each ported split regex compiles under fancy-regex).
+    for pre in [
+        "",
+        "default",
+        "gpt-2",
+        "qwen2",
+        "llama-bpe",
+        "llama3",
+        "tekken",
+        "falcon",
+        "deepseek-llm",
+        "deepseek-coder",
+        "deepseek-v3",
+        "command-r",
+        "starcoder",
+        "gpt-4o",
+        "glm4",
+    ] {
+        let mut vocab = byte_level_gguf_vocab(&[], &[]);
+        vocab.pre = pre.into();
+        let tok = Tokenizer::from_gguf_vocab(&vocab)
+            .unwrap_or_else(|e| panic!("pre {pre:?} failed to build: {e}"));
+        let text = "Hello, 世界 123!\n  x";
+        let ids = tok.encode(text, false).expect("encode");
+        assert_eq!(
+            tok.decode(&ids, false).unwrap(),
+            text,
+            "byte-level roundtrip for pre {pre:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GGUF llama/SPM reconstruction
 // ---------------------------------------------------------------------------
@@ -171,6 +248,7 @@ fn spm_gguf_vocab() -> GgufVocab {
         pad_id: None,
         unk_id: Some(0),
         add_bos: true,
+        add_eos: false,
     }
 }
 
@@ -254,6 +332,58 @@ fn stream_decoder_truncated_scalar_flushes_replacement() {
         tail.contains('\u{FFFD}'),
         "truncated bytes must surface, got {tail:?}"
     );
+}
+
+/// Byte-level piece encoding a literal string (each UTF-8 byte mapped through
+/// the GPT-2 byte alphabet).
+fn byte_level_piece(text: &str) -> String {
+    let alphabet = gpt2_byte_alphabet();
+    text.bytes().map(|b| alphabet[b as usize]).collect()
+}
+
+#[test]
+fn stream_decoder_emits_literal_replacement_char_token() {
+    // A token whose piece IS the replacement char (bytes EF BF BD) is real
+    // model output, not an incomplete tail — it must be emitted immediately.
+    let piece = byte_level_piece("\u{FFFD}");
+    let vocab = byte_level_gguf_vocab(&[&piece], &[]);
+    let tok = Tokenizer::from_gguf_vocab(&vocab).unwrap();
+    let mut dec = StreamDecoder::new(&tok, false);
+    assert_eq!(dec.push(b'a' as u32).unwrap(), "a");
+    assert_eq!(
+        dec.push(256).unwrap(),
+        "\u{FFFD}",
+        "literal U+FFFD token must not be held back"
+    );
+    assert_eq!(dec.push(b'b' as u32).unwrap(), "b");
+    assert_eq!(dec.finish().unwrap(), "");
+}
+
+#[test]
+fn stream_decoder_holds_genuinely_split_scalar_but_not_literal_fffd() {
+    let piece = byte_level_piece("\u{FFFD}");
+    let vocab = byte_level_gguf_vocab(&[&piece], &[]);
+    let tok = Tokenizer::from_gguf_vocab(&vocab).unwrap();
+    let mut dec = StreamDecoder::new(&tok, false);
+    // 😀 = F0 9F 98 80, fed byte by byte: held until the scalar completes.
+    assert_eq!(dec.push(0xF0).unwrap(), "");
+    assert_eq!(dec.push(0x9F).unwrap(), "");
+    assert_eq!(dec.push(0x98).unwrap(), "");
+    assert_eq!(dec.push(0x80).unwrap(), "😀");
+    // Immediately after, a literal U+FFFD token still flows through.
+    assert_eq!(dec.push(256).unwrap(), "\u{FFFD}");
+    assert_eq!(dec.finish().unwrap(), "");
+}
+
+#[test]
+fn stream_decoder_invalid_byte_is_not_held_forever() {
+    // A lone continuation byte can never become valid UTF-8 — emit, not hold.
+    let vocab = byte_level_gguf_vocab(&[], &[]);
+    let tok = Tokenizer::from_gguf_vocab(&vocab).unwrap();
+    let mut dec = StreamDecoder::new(&tok, false);
+    assert_eq!(dec.push(0x80).unwrap(), "\u{FFFD}");
+    assert_eq!(dec.push(b'x' as u32).unwrap(), "x");
+    assert_eq!(dec.finish().unwrap(), "");
 }
 
 // ---------------------------------------------------------------------------
@@ -586,6 +716,60 @@ fn fuel_limit_stops_runaway_templates() {
         .unwrap_err();
     assert!(
         err.to_string().contains("render error"),
+        "unexpected: {err}"
+    );
+}
+
+#[test]
+fn render_output_size_is_bounded() {
+    let engine = ChatTemplateEngine::new();
+    // A single VM instruction that allocates ~64 MB — fuel does not stop it,
+    // the bounded writer must.
+    let err = engine
+        .render(
+            "{{ 'x' * 67108864 }}",
+            &[],
+            None,
+            false,
+            false,
+            &serde_json::Map::new(),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("output exceeds"),
+        "unexpected: {err}"
+    );
+}
+
+#[test]
+fn template_source_size_is_bounded() {
+    let engine = ChatTemplateEngine::new();
+    let big = "x".repeat(300 * 1024);
+    let err = engine
+        .render(&big, &[], None, false, false, &serde_json::Map::new())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("source too large"),
+        "unexpected: {err}"
+    );
+}
+
+#[test]
+fn messages_input_size_is_bounded() {
+    let engine = ChatTemplateEngine::new();
+    let messages = [ChatMessage::text("user", "y".repeat(9 * 1024 * 1024))];
+    let err = engine
+        .render(
+            builtin_chat_template("chatml").unwrap(),
+            &messages,
+            None,
+            false,
+            false,
+            &serde_json::Map::new(),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("messages too large"),
         "unexpected: {err}"
     );
 }
