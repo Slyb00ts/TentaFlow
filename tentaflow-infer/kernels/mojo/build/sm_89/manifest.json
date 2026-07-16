@@ -8,6 +8,10 @@
     "gemv_q8_0_f16": {"file": "gemv_q8_0_f16.ptx", "entry": "src_gemv_gemv_q8_0_f16_Point6A6A6A6AoA6A6A_5ed103878a4af790"},
     "gemv_f16": {"file": "gemv_f16.ptx", "entry": "src_gemv_gemv_f16_Pointer6A6A6A6AoA6A6AcB6A6A_b81a80935b97c01f"},
     "attn_decode_f16_hd64": {"file": "attn_decode_f16_hd64.ptx", "entry": "src_attention_attn_decode_f166A6A6A6AcB_15ddec5a64904745"},
-    "attn_decode_f16_hd128": {"file": "attn_decode_f16_hd128.ptx", "entry": "src_attention_attn_decode_f166A6A6A6AcB_b07585d6fbd868f3"}
+    "attn_decode_f16_hd128": {"file": "attn_decode_f16_hd128.ptx", "entry": "src_attention_attn_decode_f166A6A6A6AcB_b07585d6fbd868f3"},
+    "gemv_nvfp4_f16": {"file": "gemv_nvfp4_f16.ptx", "entry": "src_nvfp4_gemv_nvfp4_f16_Poi6A6A6A6AoA6A6A_be51dad2b13205c0"},
+    "gather_rows_f16": {"file": "gather_rows_f16.ptx", "entry": "src_misc_gather_rows_f16_Poi6A6A6A6AoA6A6A_7871a3a63b1cc76d"},
+    "gemv_f16_out_f32": {"file": "gemv_f16_out_f32.ptx", "entry": "src_misc_gemv_f16_out_f32_Po6A6A6A6AoA6A6A_67177a21aaca209d"},
+    "gemv_q8_0_out_f32": {"file": "gemv_q8_0_out_f32.ptx", "entry": "src_misc_gemv_q8_0_out_f32_P6A6A6A6AoA6A6A_9387a298831a7da9"}
   }
 }

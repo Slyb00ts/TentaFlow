@@ -1,0 +1,18 @@
+# ===== File: Cargo.toml — forge-kernels: Mojo PTX artifact registry + typed launchers =====
+[package]
+name = "forge-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-types.workspace = true
+forge-hal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+forge-formats.workspace = true
+half.workspace = true
+bytemuck.workspace = true

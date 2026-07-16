@@ -1,0 +1,345 @@
+// ===== File: launchers.rs — typed launch wrappers over kernel artifacts =====
+// Argument order and meaning must mirror the Mojo kernel signatures exactly
+// (kernels/mojo/src/*.mojo). Mojo `Int` marshals as a 64-bit scalar slot,
+// `Float32` as f32.
+
+use std::sync::Arc;
+
+use forge_hal::{DevBuffer, Device, LaunchArgs, LaunchConfig, Stream};
+use forge_types::{ForgeError, Result};
+
+use crate::registry::KernelArtifacts;
+
+const BLOCK: u32 = 256;
+/// Warps per block in attn_decode (must not exceed MAX_WARPS in attention.mojo).
+const ATTN_BLOCK: u32 = 128;
+
+pub struct Kernels {
+    device: Arc<dyn Device>,
+    artifacts: KernelArtifacts,
+}
+
+impl Kernels {
+    pub fn load(device: Arc<dyn Device>) -> Result<Self> {
+        let artifacts = KernelArtifacts::load(device.as_ref())?;
+        Ok(Self { device, artifacts })
+    }
+
+    pub fn artifacts(&self) -> &KernelArtifacts {
+        &self.artifacts
+    }
+
+    /// out[row] = rmsnorm(x[row]) * weight, f16, one block per row.
+    pub fn rmsnorm_f16(
+        &self,
+        out: &DevBuffer,
+        x: &DevBuffer,
+        weight: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("rmsnorm_f16")?;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(x)
+            .buf(weight)
+            .scalar(cols as i64)
+            .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// residual += x; out = rmsnorm(residual) * weight (fused, f16).
+    pub fn rmsnorm_residual_f16(
+        &self,
+        out: &DevBuffer,
+        residual_io: &DevBuffer,
+        x: &DevBuffer,
+        weight: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("rmsnorm_residual_f16")?;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(residual_io)
+            .buf(x)
+            .buf(weight)
+            .scalar(cols as i64)
+            .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// out = silu(gate) * up over n f16 elements.
+    pub fn silu_mul_f16(
+        &self,
+        out: &DevBuffer,
+        gate: &DevBuffer,
+        up: &DevBuffer,
+        n: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("silu_mul_f16")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(gate)
+            .buf(up)
+            .scalar(n as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// In-place neox RoPE over [n_tokens, n_heads, head_dim] f16.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_neox_f16(
+        &self,
+        x_io: &DevBuffer,
+        positions: &DevBuffer,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        theta_base: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("rope_neox_f16")?;
+        let cfg = LaunchConfig {
+            grid: (n_tokens as u32, n_heads as u32, 1),
+            block: ((head_dim as u32 / 2).clamp(32, 256), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(x_io)
+            .buf(positions)
+            .scalar(n_heads as i64)
+            .scalar(head_dim as i64)
+            .scalar(theta_base);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// y = W·x with W in GGML Q8_0 blocks, x/y f16. One block per output row.
+    pub fn gemv_q8_0_f16(
+        &self,
+        y: &DevBuffer,
+        w_q8: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if cols % 32 != 0 {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q8_0 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q8_0_f16")?;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w_q8)
+            .buf(x)
+            .scalar(cols as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// y = W·x, all f16. One block per output row.
+    pub fn gemv_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("gemv_f16")?;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// y = W·x with W in NVFP4 (compressed-tensors) packed layout.
+    /// `inv_global_scale` = 1 / weight_global_scale.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_nvfp4_f16(
+        &self,
+        y: &DevBuffer,
+        packed: &DevBuffer,
+        scales: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        inv_global_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if cols % 16 != 0 {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_nvfp4 requires cols % 16 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_nvfp4_f16")?;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(packed)
+            .buf(scales)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(inv_global_scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// out[t] = table[ids[t]] — token embedding gather (f16 rows).
+    pub fn gather_rows_f16(
+        &self,
+        out: &DevBuffer,
+        table: &DevBuffer,
+        ids: &DevBuffer,
+        n_tokens: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("gather_rows_f16")?;
+        let cfg = LaunchConfig {
+            grid: (n_tokens as u32, 1, 1),
+            block: (BLOCK.min(cols as u32).max(32), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(table)
+            .buf(ids)
+            .scalar(cols as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV, f16 weights → f32 logits.
+    pub fn gemv_f16_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("gemv_f16_out_f32")?;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over Q8_0 weights (tied embeddings) → f32 logits.
+    pub fn gemv_q8_0_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w_q8: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if cols % 32 != 0 {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q8_0_out_f32 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q8_0_out_f32")?;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w_q8)
+            .buf(x)
+            .scalar(cols as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Paged flash-decode attention. Layouts documented in attention.mojo.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode_f16(
+        &self,
+        out: &DevBuffer,
+        q: &DevBuffer,
+        k_cache: &DevBuffer,
+        v_cache: &DevBuffer,
+        page_table: &DevBuffer,
+        seq_lens: &DevBuffer,
+        n_seqs: usize,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        max_pages: usize,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let name = match head_dim {
+            64 => "attn_decode_f16_hd64",
+            128 => "attn_decode_f16_hd128",
+            other => {
+                return Err(ForgeError::Unsupported(format!(
+                    "attn_decode: head_dim {other} has no compiled specialization"
+                )))
+            }
+        };
+        let k = self.artifacts.get(name)?;
+        let cfg = LaunchConfig {
+            grid: (n_seqs as u32, n_q_heads as u32, 1),
+            block: (ATTN_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(q)
+            .buf(k_cache)
+            .buf(v_cache)
+            .buf(page_table)
+            .buf(seq_lens)
+            .scalar(n_q_heads as i64)
+            .scalar(n_kv_heads as i64)
+            .scalar(page_size as i64)
+            .scalar(max_pages as i64)
+            .scalar(scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+}

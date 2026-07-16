@@ -248,6 +248,110 @@ fn graph_capture_and_replay() {
 }
 
 #[test]
+fn graph_survives_handle_drop_during_replay() {
+    let Some(dev) = device() else { return };
+    let stream = dev.create_stream().unwrap();
+    let module = dev.load_module(TEST_PTX).unwrap();
+    let scale2 = module.kernel("scale2").unwrap();
+
+    let n = 4096u32;
+    let x = dev
+        .alloc(n as usize * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    write_f32(&dev, &x, &vec![1.0f32; n as usize]);
+
+    let cfg = LaunchConfig::linear(n, 128);
+    dev.begin_capture(&stream).unwrap();
+    // Enough sequential work that the replay is still in flight when the
+    // ExecGraph handle drops below.
+    for _ in 0..64 {
+        dev.launch(&scale2, &cfg, &LaunchArgs::new().buf(&x).scalar(n), &stream)
+            .unwrap();
+    }
+    let graph = dev.end_capture(&stream).unwrap();
+
+    // Dropping the last handle right after launch must not free the retained
+    // buffers/kernels while the asynchronous replay still uses them.
+    dev.launch_graph(&graph, &stream).unwrap();
+    drop(graph);
+    stream.synchronize().unwrap();
+
+    let expected = 2.0f32.powi(64);
+    assert!(read_f32(&dev, &x, n as usize).iter().all(|&v| v == expected));
+    // Device-level synchronize prunes the pending-launch retention list.
+    dev.synchronize().unwrap();
+}
+
+#[test]
+fn kernel_and_graph_survive_module_drop() {
+    let Some(dev) = device() else { return };
+    let stream = dev.create_stream().unwrap();
+    let module = dev.load_module(TEST_PTX).unwrap();
+    let add3 = module.kernel("add3").unwrap();
+    // The kernel handle must pin the module image: unloading it would leave
+    // the CUfunction dangling.
+    drop(module);
+
+    let n = 256u32;
+    let x = dev
+        .alloc(n as usize * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    write_f32(&dev, &x, &vec![1.0f32; n as usize]);
+    let cfg = LaunchConfig::linear(n, 128);
+    dev.launch(&add3, &cfg, &LaunchArgs::new().buf(&x).scalar(n), &stream)
+        .unwrap();
+    stream.synchronize().unwrap();
+    assert!(read_f32(&dev, &x, n as usize).iter().all(|&v| v == 4.0));
+
+    // A captured graph must in turn pin the kernels (and thus modules) it
+    // references, so replay works after every direct handle is gone.
+    dev.begin_capture(&stream).unwrap();
+    dev.launch(&add3, &cfg, &LaunchArgs::new().buf(&x).scalar(n), &stream)
+        .unwrap();
+    let graph = dev.end_capture(&stream).unwrap();
+    drop(add3);
+    dev.launch_graph(&graph, &stream).unwrap();
+    stream.synchronize().unwrap();
+    assert!(read_f32(&dev, &x, n as usize).iter().all(|&v| v == 7.0));
+}
+
+#[test]
+fn bounds_check_rejects_offset_overflow() {
+    let Some(dev) = device() else { return };
+    let stream = dev.create_stream().unwrap();
+    let a = dev.alloc(64, MemKind::Device, Pool::KvCache).unwrap();
+    let b = dev.alloc(64, MemKind::Device, Pool::KvCache).unwrap();
+    // `offset + bytes` wrapping past usize::MAX must fail the bound, not
+    // slip through and issue an out-of-range CUDA copy.
+    assert!(dev.copy(&a, usize::MAX - 8, &b, 0, 64, &stream).is_err());
+    assert!(dev.copy(&a, 0, &b, usize::MAX - 8, 64, &stream).is_err());
+    assert!(dev.write(&[0u8; 16], &a, usize::MAX - 8).is_err());
+    let mut out = [0u8; 16];
+    assert!(dev.read(&a, usize::MAX - 8, &mut out).is_err());
+}
+
+#[test]
+fn cross_device_handles_rejected() {
+    let Some(dev) = device() else { return };
+    let Ok(other) = CudaDevice::new(1, TEST_POOLS) else {
+        eprintln!("skipping cross-device test: no second CUDA device");
+        return;
+    };
+    let stream = dev.create_stream().unwrap();
+    let local = dev.alloc(64, MemKind::Device, Pool::Weights).unwrap();
+    let foreign = other.alloc(64, MemKind::Device, Pool::Weights).unwrap();
+    let foreign_stream = other.create_stream().unwrap();
+    let foreign_event = other.create_event().unwrap();
+    // Same backend type, different device: the downcast passes but the
+    // owning-context check must reject the mix.
+    assert!(dev.copy(&foreign, 0, &local, 0, 64, &stream).is_err());
+    assert!(dev.copy(&local, 0, &local, 0, 64, &foreign_stream).is_err());
+    assert!(dev.write(&[0u8; 64], &foreign, 0).is_err());
+    assert!(dev.record_event(&foreign_event, &stream).is_err());
+    assert!(dev.begin_capture(&foreign_stream).is_err());
+}
+
+#[test]
 fn end_capture_without_begin_errors() {
     let Some(dev) = device() else { return };
     let stream = dev.create_stream().unwrap();

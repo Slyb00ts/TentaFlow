@@ -4,9 +4,9 @@
 // first use, the binary carries no hard link). VRAM is claimed once at device
 // construction into three logical pools (weights/KV/activations) and
 // sub-allocated by the arenas in `arena.rs`, so no cuMemAlloc happens in the
-// hot path. Graph capture piggybacks on stream capture; buffers referenced by
-// captured launches are retained by the resulting `ExecGraph` so replays can
-// never dereference freed VRAM.
+// hot path. Graph capture piggybacks on stream capture; buffers and kernels
+// referenced by captured launches are retained by the resulting `ExecGraph`
+// so replays can never dereference freed VRAM or unloaded module code.
 
 use std::any::Any;
 use std::ffi::{c_void, CString};
@@ -143,6 +143,16 @@ struct CudaBuffer {
     backing: Backing,
 }
 
+impl CudaBuffer {
+    fn ctx(&self) -> &Arc<CudaContext> {
+        match &self.backing {
+            Backing::Pooled { pool, .. } => &pool.ctx,
+            Backing::Pinned { ctx, .. } => ctx,
+            Backing::Managed { ctx, .. } => ctx,
+        }
+    }
+}
+
 // Raw pointers are uniquely owned; concurrent GPU access is stream-ordered by
 // the caller exactly as raw CUDA requires.
 unsafe impl Send for CudaBuffer {}
@@ -213,11 +223,22 @@ impl Drop for CudaBuffer {
 
 // --- Streams / events -----------------------------------------------------------
 
+/// Resources referenced by work recorded into a graph capture. Replay
+/// dereferences buffer addresses and jumps into kernel code, so the resulting
+/// graph must keep both alive: buffers pin their pool sub-ranges, kernels pin
+/// their module image (unloading a CUmodule frees the code a captured launch
+/// points at).
+#[derive(Default)]
+struct CaptureSet {
+    buffers: Vec<DevBuffer>,
+    kernels: Vec<KernelHandle>,
+}
+
 struct CudaStreamImpl {
     stream: Arc<CudaStream>,
     /// `Some` while this HAL is capturing a graph on the stream; collects
-    /// buffers referenced by captured launches so the graph can retain them.
-    capture_retained: Mutex<Option<Vec<DevBuffer>>>,
+    /// resources referenced by captured work so the graph can retain them.
+    capture_retained: Mutex<Option<CaptureSet>>,
 }
 
 impl StreamImpl for CudaStreamImpl {
@@ -254,27 +275,45 @@ impl EventImpl for CudaEventImpl {
 
 // --- Modules / kernels ----------------------------------------------------------
 
-struct CudaModuleImpl {
+/// Sole owner of a loaded CUmodule. Shared (`Arc`) between the `Module`
+/// handle and every `KernelHandle` resolved from it: a CUfunction is a
+/// pointer into the module image, so dropping the module while a kernel
+/// handle (or a captured graph referencing it) is alive would leave that
+/// function dangling.
+struct RawCudaModule {
     ctx: Arc<CudaContext>,
     module: sys::CUmodule,
 }
 
 // CUmodule handles are usable from any thread once the context is current.
-unsafe impl Send for CudaModuleImpl {}
-unsafe impl Sync for CudaModuleImpl {}
+unsafe impl Send for RawCudaModule {}
+unsafe impl Sync for RawCudaModule {}
+
+impl Drop for RawCudaModule {
+    fn drop(&mut self) {
+        let _ = self.ctx.bind_to_thread();
+        let _ = unsafe { result::module::unload(self.module) };
+    }
+}
+
+struct CudaModuleImpl {
+    raw: Arc<RawCudaModule>,
+}
 
 impl ModuleImpl for CudaModuleImpl {
     fn kernel(&self, name: &str) -> Result<KernelHandle> {
-        self.ctx
+        self.raw
+            .ctx
             .bind_to_thread()
             .map_err(|e| cu_err("bind context", e))?;
         let c_name = CString::new(name)
             .map_err(|_| ForgeError::Kernel(format!("kernel name contains NUL: {name:?}")))?;
-        let func = unsafe { result::module::get_function(self.module, c_name) }
+        let func = unsafe { result::module::get_function(self.raw.module, c_name) }
             .map_err(|e| cu_err(&format!("cuModuleGetFunction({name})"), e))?;
         Ok(KernelHandle::from_impl(Arc::new(CudaKernelImpl {
             func,
             name: name.to_string(),
+            module: self.raw.clone(),
         })))
     }
 
@@ -283,16 +322,11 @@ impl ModuleImpl for CudaModuleImpl {
     }
 }
 
-impl Drop for CudaModuleImpl {
-    fn drop(&mut self) {
-        let _ = self.ctx.bind_to_thread();
-        let _ = unsafe { result::module::unload(self.module) };
-    }
-}
-
 struct CudaKernelImpl {
     func: sys::CUfunction,
     name: String,
+    /// Keeps the module image loaded for as long as this function handle exists.
+    module: Arc<RawCudaModule>,
 }
 
 // CUfunction is a handle into the loaded module image; launches are guarded by
@@ -318,9 +352,9 @@ struct CudaGraphImpl {
     exec: sys::CUgraphExec,
     /// CUDA graph objects are not internally synchronized; serialize access.
     launch_lock: Mutex<()>,
-    /// Buffers referenced by captured launches; replay dereferences their
-    /// device addresses, so they must live as long as the graph.
-    _retained: Vec<DevBuffer>,
+    /// Buffers and kernels referenced by captured work; replay dereferences
+    /// their addresses/code, so they must live as long as the graph.
+    _retained: CaptureSet,
 }
 
 unsafe impl Send for CudaGraphImpl {}
@@ -342,12 +376,24 @@ impl Drop for CudaGraphImpl {
 
 // --- Device ---------------------------------------------------------------------
 
+/// A graph launch whose replay may still be in flight on the GPU. Holding the
+/// graph impl keeps its exec graph and retained buffers alive even if the
+/// caller drops the `ExecGraph` handle right after `launch_graph` — otherwise
+/// the retained pool ranges would be recycled while the replay still reads them.
+struct PendingGraphLaunch {
+    event: CudaEvent,
+    _graph: Arc<dyn GraphImpl>,
+}
+
 pub struct CudaDevice {
     ctx: Arc<CudaContext>,
     caps: DeviceCaps,
     weights: Arc<CudaPool>,
     kv_cache: Arc<CudaPool>,
     activations: Arc<CudaPool>,
+    /// Completed entries are pruned (non-blocking event query) on subsequent
+    /// graph launches and on `synchronize`.
+    pending_graph_launches: Mutex<Vec<PendingGraphLaunch>>,
 }
 
 impl CudaDevice {
@@ -382,6 +428,7 @@ impl CudaDevice {
             weights,
             kv_cache,
             activations,
+            pending_graph_launches: Mutex::new(Vec::new()),
         }))
     }
 
@@ -415,6 +462,20 @@ impl CudaDevice {
         self.ctx
             .bind_to_thread()
             .map_err(|e| cu_err("bind context", e))
+    }
+
+    /// Rejects handles whose owning context is a different physical device.
+    /// The `Any` downcast only proves the backend type; two `CudaDevice`s
+    /// would otherwise silently accept each other's streams/buffers.
+    fn check_same_device(&self, other: &Arc<CudaContext>, what: &str) -> Result<()> {
+        if other.ordinal() != self.ctx.ordinal() {
+            return Err(ForgeError::Device(format!(
+                "{what} belongs to CUDA device {} but was used on device {}",
+                other.ordinal(),
+                self.ctx.ordinal()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -473,16 +534,18 @@ fn detect_p2p(ctx: &Arc<CudaContext>) -> Result<bool> {
     Ok(false)
 }
 
+// Checked add: `offset + bytes` overflowing in release would pass the bound
+// and issue an out-of-range CUDA copy.
 fn bounds_check(buf: &DevBuffer, offset: usize, bytes: usize) -> Result<()> {
-    if offset + bytes > buf.len() {
-        return Err(ForgeError::Device(format!(
-            "range {}..{} exceeds buffer size {}",
+    match offset.checked_add(bytes) {
+        Some(end) if end <= buf.len() => Ok(()),
+        _ => Err(ForgeError::Device(format!(
+            "range at offset {} for {} byte(s) exceeds buffer size {}",
             offset,
-            offset + bytes,
+            bytes,
             buf.len()
-        )));
+        ))),
     }
-    Ok(())
 }
 
 impl Device for CudaDevice {
@@ -570,6 +633,8 @@ impl Device for CudaDevice {
     fn record_event(&self, event: &Event, stream: &Stream) -> Result<()> {
         let event = event.downcast::<CudaEventImpl>()?;
         let stream = stream.downcast::<CudaStreamImpl>()?;
+        self.check_same_device(event.event.context(), "Event")?;
+        self.check_same_device(stream.stream.context(), "Stream")?;
         event
             .event
             .record(&stream.stream)
@@ -579,6 +644,8 @@ impl Device for CudaDevice {
     fn wait_event(&self, stream: &Stream, event: &Event) -> Result<()> {
         let event = event.downcast::<CudaEventImpl>()?;
         let stream = stream.downcast::<CudaStreamImpl>()?;
+        self.check_same_device(event.event.context(), "Event")?;
+        self.check_same_device(stream.stream.context(), "Stream")?;
         stream
             .stream
             .wait(&event.event)
@@ -594,9 +661,10 @@ impl Device for CudaDevice {
         bytes: usize,
         stream: &Stream,
     ) -> Result<()> {
-        src.downcast::<CudaBuffer>()?;
-        dst.downcast::<CudaBuffer>()?;
+        self.check_same_device(src.downcast::<CudaBuffer>()?.ctx(), "source DevBuffer")?;
+        self.check_same_device(dst.downcast::<CudaBuffer>()?.ctx(), "destination DevBuffer")?;
         let stream_impl = stream.downcast::<CudaStreamImpl>()?;
+        self.check_same_device(stream_impl.stream.context(), "Stream")?;
         bounds_check(src, src_offset, bytes)?;
         bounds_check(dst, dst_offset, bytes)?;
         self.bind()?;
@@ -620,14 +688,14 @@ impl Device for CudaDevice {
             .expect("capture state poisoned")
             .as_mut()
         {
-            retained.push(src.clone());
-            retained.push(dst.clone());
+            retained.buffers.push(src.clone());
+            retained.buffers.push(dst.clone());
         }
         Ok(())
     }
 
     fn write(&self, src: &[u8], dst: &DevBuffer, dst_offset: usize) -> Result<()> {
-        dst.downcast::<CudaBuffer>()?;
+        self.check_same_device(dst.downcast::<CudaBuffer>()?.ctx(), "DevBuffer")?;
         bounds_check(dst, dst_offset, src.len())?;
         self.bind()?;
         unsafe {
@@ -637,7 +705,7 @@ impl Device for CudaDevice {
     }
 
     fn read(&self, src: &DevBuffer, src_offset: usize, dst: &mut [u8]) -> Result<()> {
-        src.downcast::<CudaBuffer>()?;
+        self.check_same_device(src.downcast::<CudaBuffer>()?.ctx(), "DevBuffer")?;
         bounds_check(src, src_offset, dst.len())?;
         self.bind()?;
         unsafe {
@@ -660,8 +728,10 @@ impl Device for CudaDevice {
         }
         .map_err(|e| cu_err("cuModuleLoadData", e))?;
         Ok(Module::from_impl(Arc::new(CudaModuleImpl {
-            ctx: self.ctx.clone(),
-            module,
+            raw: Arc::new(RawCudaModule {
+                ctx: self.ctx.clone(),
+                module,
+            }),
         })))
     }
 
@@ -674,6 +744,8 @@ impl Device for CudaDevice {
     ) -> Result<()> {
         let kernel_impl = kernel.downcast::<CudaKernelImpl>()?;
         let stream_impl = stream.downcast::<CudaStreamImpl>()?;
+        self.check_same_device(&kernel_impl.module.ctx, "KernelHandle")?;
+        self.check_same_device(stream_impl.stream.context(), "Stream")?;
         self.bind()?;
         // Kernel params are pointers to the (address-stable) 8-byte slots the
         // LaunchArgs builder collected; cuLaunchKernel copies the values out
@@ -700,7 +772,8 @@ impl Device for CudaDevice {
             .expect("capture state poisoned")
             .as_mut()
         {
-            retained.extend(args.retained().iter().cloned());
+            retained.buffers.extend(args.retained().iter().cloned());
+            retained.kernels.push(kernel.clone());
         }
         Ok(())
     }
@@ -708,11 +781,19 @@ impl Device for CudaDevice {
     fn synchronize(&self) -> Result<()> {
         self.ctx
             .synchronize()
-            .map_err(|e| cu_err("cuCtxSynchronize", e))
+            .map_err(|e| cu_err("cuCtxSynchronize", e))?;
+        // Everything submitted has completed, so no graph replay can still be
+        // reading its retained buffers.
+        self.pending_graph_launches
+            .lock()
+            .expect("pending graph launches poisoned")
+            .clear();
+        Ok(())
     }
 
     fn begin_capture(&self, stream: &Stream) -> Result<()> {
         let stream_impl = stream.downcast::<CudaStreamImpl>()?;
+        self.check_same_device(stream_impl.stream.context(), "Stream")?;
         let mut retained = stream_impl
             .capture_retained
             .lock()
@@ -728,12 +809,13 @@ impl Device for CudaDevice {
             .stream
             .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
             .map_err(|e| cu_err("cuStreamBeginCapture", e))?;
-        *retained = Some(Vec::new());
+        *retained = Some(CaptureSet::default());
         Ok(())
     }
 
     fn end_capture(&self, stream: &Stream) -> Result<ExecGraph> {
         let stream_impl = stream.downcast::<CudaStreamImpl>()?;
+        self.check_same_device(stream_impl.stream.context(), "Stream")?;
         let retained = stream_impl
             .capture_retained
             .lock()
@@ -772,10 +854,35 @@ impl Device for CudaDevice {
     fn launch_graph(&self, graph: &ExecGraph, stream: &Stream) -> Result<()> {
         let graph_impl = graph.downcast::<CudaGraphImpl>()?;
         let stream_impl = stream.downcast::<CudaStreamImpl>()?;
+        self.check_same_device(&graph_impl.ctx, "ExecGraph")?;
+        self.check_same_device(stream_impl.stream.context(), "Stream")?;
         self.bind()?;
-        let _guard = graph_impl.launch_lock.lock().expect("graph lock poisoned");
-        unsafe { result::graph::launch(graph_impl.exec, stream_impl.stream.cu_stream()) }
-            .map_err(|e| cu_err("cuGraphLaunch", e))
+        {
+            let _guard = graph_impl.launch_lock.lock().expect("graph lock poisoned");
+            unsafe { result::graph::launch(graph_impl.exec, stream_impl.stream.cu_stream()) }
+                .map_err(|e| cu_err("cuGraphLaunch", e))?;
+        }
+        // Replay is asynchronous: pin the graph impl (and thus its retained
+        // buffers/kernels) until this launch completes on the stream, so
+        // dropping the caller's ExecGraph handle right away cannot recycle
+        // memory the GPU is still reading. Pruning is a non-blocking query.
+        let event = self
+            .ctx
+            .new_event(None)
+            .map_err(|e| cu_err("cuEventCreate", e))?;
+        event
+            .record(&stream_impl.stream)
+            .map_err(|e| cu_err("cuEventRecord", e))?;
+        let mut pending = self
+            .pending_graph_launches
+            .lock()
+            .expect("pending graph launches poisoned");
+        pending.retain(|p| !p.event.is_complete());
+        pending.push(PendingGraphLaunch {
+            event,
+            _graph: graph.0.clone(),
+        });
+        Ok(())
     }
 
     fn reset_activations(&self) -> Result<u64> {

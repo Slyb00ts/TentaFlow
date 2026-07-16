@@ -138,16 +138,18 @@ fn host_total_memory() -> usize {
     }
 }
 
+// Checked add: `offset + bytes` overflowing in release would pass the bound
+// and feed an out-of-range offset into raw pointer arithmetic below.
 fn buffer_bounds_check(buf: &DevBuffer, offset: usize, bytes: usize) -> Result<()> {
-    if offset + bytes > buf.len() {
-        return Err(ForgeError::Device(format!(
-            "copy range {}..{} exceeds buffer size {}",
+    match offset.checked_add(bytes) {
+        Some(end) if end <= buf.len() => Ok(()),
+        _ => Err(ForgeError::Device(format!(
+            "copy range at offset {} for {} byte(s) exceeds buffer size {}",
             offset,
-            offset + bytes,
+            bytes,
             buf.len()
-        )));
+        ))),
     }
-    Ok(())
 }
 
 impl Device for CpuDevice {

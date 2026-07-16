@@ -58,6 +58,21 @@ fn copy_rejects_out_of_bounds() {
 }
 
 #[test]
+fn bounds_check_rejects_offset_overflow() {
+    let dev = CpuDevice::new();
+    let stream = dev.create_stream().unwrap();
+    let a = dev.alloc(64, MemKind::Device, Pool::KvCache).unwrap();
+    let b = dev.alloc(64, MemKind::Device, Pool::KvCache).unwrap();
+    // `offset + bytes` wrapping past usize::MAX must fail the bound, not
+    // slip through into raw pointer arithmetic.
+    assert!(dev.copy(&a, usize::MAX - 8, &b, 0, 64, &stream).is_err());
+    assert!(dev.copy(&a, 0, &b, usize::MAX - 8, 64, &stream).is_err());
+    assert!(dev.write(&[0u8; 16], &a, usize::MAX - 8).is_err());
+    let mut out = [0u8; 16];
+    assert!(dev.read(&a, usize::MAX - 8, &mut out).is_err());
+}
+
+#[test]
 fn events_are_immediately_complete() {
     let dev = CpuDevice::new();
     let stream = dev.create_stream().unwrap();

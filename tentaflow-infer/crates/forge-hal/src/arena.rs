@@ -12,8 +12,10 @@ use std::collections::BTreeMap;
 /// load instructions.
 pub(crate) const ALLOC_ALIGN: usize = 256;
 
-fn align_up(value: usize, align: usize) -> usize {
-    value.div_ceil(align) * align
+// Checked: near-usize::MAX requests must surface as OOM, not wrap around and
+// alias live allocations in release builds.
+fn align_up(value: usize, align: usize) -> Option<usize> {
+    value.checked_next_multiple_of(align)
 }
 
 /// Monotonic bump allocator for weights: individual frees are no-ops because
@@ -33,15 +35,15 @@ impl BumpArena {
     }
 
     pub(crate) fn alloc(&mut self, bytes: usize) -> Result<usize> {
-        let size = align_up(bytes.max(1), ALLOC_ALIGN);
-        if self.cursor + size > self.capacity {
-            return Err(ForgeError::OutOfMemory {
-                requested: size,
+        let end = align_up(bytes.max(1), ALLOC_ALIGN)
+            .and_then(|size| self.cursor.checked_add(size))
+            .filter(|&end| end <= self.capacity)
+            .ok_or(ForgeError::OutOfMemory {
+                requested: bytes,
                 available: self.capacity - self.cursor,
-            });
-        }
+            })?;
         let offset = self.cursor;
-        self.cursor += size;
+        self.cursor = end;
         Ok(offset)
     }
 }
@@ -79,7 +81,11 @@ impl SlabArena {
     /// First-fit allocation of `bytes` rounded up to whole pages. Returns the
     /// byte offset and the rounded size actually reserved.
     pub(crate) fn alloc(&mut self, bytes: usize) -> Result<(usize, usize)> {
-        let size = align_up(bytes.max(1), self.page_size);
+        let size =
+            align_up(bytes.max(1), self.page_size).ok_or(ForgeError::OutOfMemory {
+                requested: bytes,
+                available: self.free.values().copied().max().unwrap_or(0),
+            })?;
         let candidate = self
             .free
             .iter()
@@ -148,15 +154,15 @@ impl RingArena {
     /// wrapping before `reset` would overwrite data the current iteration
     /// still reads.
     pub(crate) fn alloc(&mut self, bytes: usize) -> Result<(usize, u64)> {
-        let size = align_up(bytes.max(1), ALLOC_ALIGN);
-        if self.cursor + size > self.capacity {
-            return Err(ForgeError::OutOfMemory {
-                requested: size,
+        let end = align_up(bytes.max(1), ALLOC_ALIGN)
+            .and_then(|size| self.cursor.checked_add(size))
+            .filter(|&end| end <= self.capacity)
+            .ok_or(ForgeError::OutOfMemory {
+                requested: bytes,
                 available: self.capacity - self.cursor,
-            });
-        }
+            })?;
         let offset = self.cursor;
-        self.cursor += size;
+        self.cursor = end;
         self.live += 1;
         Ok((offset, self.generation))
     }
@@ -259,6 +265,28 @@ mod tests {
         assert!(r.reset().is_err());
         r.on_drop(g2);
         assert!(r.reset().is_ok());
+    }
+
+    #[test]
+    fn near_max_requests_are_oom_not_overflow() {
+        // Sizes near usize::MAX used to wrap in align_up / cursor arithmetic
+        // in release builds, handing out an aliasing offset instead of OOM.
+        for bytes in [usize::MAX, usize::MAX - 1, usize::MAX - ALLOC_ALIGN + 1] {
+            let mut b = BumpArena::new(1024);
+            b.alloc(512).unwrap();
+            assert!(matches!(b.alloc(bytes), Err(ForgeError::OutOfMemory { .. })));
+            // The failed alloc must not have moved the cursor.
+            assert_eq!(b.alloc(256).unwrap(), 512);
+
+            let mut s = SlabArena::new(4096, 1024).unwrap();
+            assert!(matches!(s.alloc(bytes), Err(ForgeError::OutOfMemory { .. })));
+            assert_eq!(s.alloc(1024).unwrap().0, 0);
+
+            let mut r = RingArena::new(1024);
+            r.alloc(512).unwrap();
+            assert!(matches!(r.alloc(bytes), Err(ForgeError::OutOfMemory { .. })));
+            assert_eq!(r.alloc(256).unwrap().0, 512);
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # ===== File: Cargo.toml — FORGE workspace manifest =====
 [workspace]
 resolver = "2"
-members = ["crates/forge-types", "crates/forge-hal", "crates/forge-formats", "crates/forge-tokenize"]
+members = ["crates/forge-types", "crates/forge-hal", "crates/forge-kernels", "crates/forge-formats", "crates/forge-tokenize"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,9 @@ rust-version = "1.85"
 [workspace.dependencies]
 forge-types = { path = "crates/forge-types" }
 forge-hal = { path = "crates/forge-hal" }
+forge-kernels = { path = "crates/forge-kernels" }
+forge-formats = { path = "crates/forge-formats" }
+forge-tokenize = { path = "crates/forge-tokenize" }
 cudarc = { version = "0.19.8", default-features = false, features = [
     "std",
     "driver",
