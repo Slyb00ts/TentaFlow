@@ -6,6 +6,9 @@
 // wrap `Arc<dyn ...Impl>`; backends downcast them via `Any` and reject handles
 // created by a different backend instead of silently misbehaving.
 
+// Offset arenas are consumed by GPU backends only; the CPU backend allocates
+// per-buffer from the host allocator.
+#[cfg(feature = "cuda")]
 pub(crate) mod arena;
 pub mod cpu;
 #[cfg(feature = "cuda")]
@@ -136,11 +139,13 @@ impl LaunchArgs {
     /// Raw parameter-slot values; backends build the `void*[]` kernel-param
     /// array by taking the address of each slot (slots are address-stable for
     /// the borrow's duration since `&self` prevents reallocation).
-    pub(crate) fn slots(&self) -> &[u64] {
+    pub fn slots(&self) -> &[u64] {
         &self.slots
     }
 
-    pub(crate) fn retained(&self) -> &[DevBuffer] {
+    /// Buffers referenced by pointer arguments; backends capturing a graph
+    /// retain these so replays cannot dereference freed memory.
+    pub fn retained(&self) -> &[DevBuffer] {
         &self.retained
     }
 }
