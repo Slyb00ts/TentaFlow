@@ -8,6 +8,7 @@ pub mod api;
 pub mod error;
 pub mod routes;
 pub mod source;
+pub mod toolcall;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,6 +24,9 @@ pub struct ServerConfig {
     pub bind: SocketAddr,
     pub model_id: String,
     pub api_key: Option<String>,
+    /// Tool-call output syntax override: "hermes" | "llama3" | "none".
+    /// `None` auto-detects from the chat template and model architecture.
+    pub tool_call_parser: Option<String>,
 }
 
 /// Shared per-server state handed to every handler.
@@ -41,6 +45,8 @@ pub struct ServerState {
     pub model_id: String,
     pub api_key: Option<String>,
     pub created: u64,
+    /// Which tool-call syntax to parse out of this model's output.
+    pub tool_parser: toolcall::ToolParserKind,
 }
 
 impl ServerState {
@@ -54,6 +60,7 @@ impl ServerState {
         chat_template: String,
         max_context: usize,
         max_active: usize,
+        tool_parser: toolcall::ToolParserKind,
     ) -> Arc<Self> {
         let queue_limit = max_active.saturating_mul(4).clamp(16, 256);
         Arc::new(Self {
@@ -72,6 +79,7 @@ impl ServerState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            tool_parser,
         })
     }
 }

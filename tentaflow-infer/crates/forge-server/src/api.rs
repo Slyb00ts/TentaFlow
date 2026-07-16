@@ -537,6 +537,83 @@ mod tests {
     }
 
     #[test]
+    fn tool_choice_rules() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}}
+        }]);
+
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools
+        }));
+        assert_eq!(r.tool_mode().unwrap(), ToolMode::Auto);
+
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools, "tool_choice": "auto"
+        }));
+        assert_eq!(r.tool_mode().unwrap(), ToolMode::Auto);
+
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools, "tool_choice": "none"
+        }));
+        assert_eq!(r.tool_mode().unwrap(), ToolMode::None);
+
+        // No tools (or an empty list) means nothing to parse.
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(r.tool_mode().unwrap(), ToolMode::None);
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "tools": []
+        }));
+        assert_eq!(r.tool_mode().unwrap(), ToolMode::None);
+
+        // Forcing modes are honestly rejected, not silently ignored.
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools, "tool_choice": "required"
+        }));
+        assert_eq!(
+            r.tool_mode().unwrap_err().status,
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools,
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+        }));
+        assert_eq!(
+            r.tool_mode().unwrap_err().status,
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn tool_call_message_serializes_null_content() {
+        let msg = ChatResponseMessage {
+            role: "assistant",
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![ToolCallOut {
+                id: "call_0badc0de".into(),
+                call_type: "function",
+                function: FunctionCallOut {
+                    name: "get_weather".into(),
+                    arguments: "{\"city\":\"Kraków\"}".into(),
+                },
+            }]),
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert!(v.get("content").unwrap().is_null());
+        assert!(v.get("reasoning_content").is_none());
+        assert_eq!(v["tool_calls"][0]["type"], "function");
+        assert_eq!(v["tool_calls"][0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
     fn completions_prompt_and_echo_rules() {
         let r: CompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "m", "prompt": ["only one"]

@@ -483,7 +483,17 @@ pub async fn chat_completions(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let rx = match start_generation(&state, GenInput::Chat(req.messages), spec).await {
+    let tool_mode = match req.tool_mode() {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    // tool_choice "none" (or no tools at all): tools are neither rendered
+    // into the template nor parsed out of the output.
+    let (parser_kind, tools) = match tool_mode {
+        ToolMode::Auto => (state.tool_parser, req.tools.clone()),
+        ToolMode::None => (ToolParserKind::None, None),
+    };
+    let rx = match start_generation(&state, GenInput::Chat(req.messages, tools), spec).await {
         Ok(rx) => rx,
         Err(e) => return e.into_response(),
     };
@@ -496,27 +506,58 @@ pub async fn chat_completions(
             StreamKind::Chat,
             new_id("chatcmpl"),
             include_usage,
+            Some(ChatStream::new(parser_kind)),
         )
         .await;
     }
 
     match collect_events(rx).await {
-        Ok(c) => Json(ChatCompletionResponse {
-            id: new_id("chatcmpl"),
-            object: "chat.completion",
-            created: now_unix(),
-            model: state.model_id.clone(),
-            choices: vec![ChatChoice {
-                index: 0,
-                message: ChatResponseMessage {
-                    role: "assistant",
-                    content: c.text,
-                },
-                finish_reason: c.finish,
-            }],
-            usage: c.usage,
-        })
-        .into_response(),
+        Ok(c) => {
+            let step = OutputParser::new(parser_kind).parse_all(&c.text);
+            let tool_calls: Vec<ToolCallOut> = step
+                .calls
+                .into_iter()
+                .map(|call| ToolCallOut {
+                    id: new_call_id(),
+                    call_type: "function",
+                    function: FunctionCallOut {
+                        name: call.name,
+                        arguments: call.arguments,
+                    },
+                })
+                .collect();
+            let finish = if tool_calls.is_empty() {
+                c.finish
+            } else {
+                "tool_calls"
+            };
+            // With tool calls, leftover inter-marker whitespace is noise:
+            // trim it and null out an empty content, per the OpenAI shape.
+            let content = if tool_calls.is_empty() {
+                Some(step.text)
+            } else {
+                let trimmed = step.text.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            };
+            Json(ChatCompletionResponse {
+                id: new_id("chatcmpl"),
+                object: "chat.completion",
+                created: now_unix(),
+                model: state.model_id.clone(),
+                choices: vec![ChatChoice {
+                    index: 0,
+                    message: ChatResponseMessage {
+                        role: "assistant",
+                        content,
+                        reasoning_content: (!step.reasoning.is_empty()).then_some(step.reasoning),
+                        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                    },
+                    finish_reason: finish,
+                }],
+                usage: c.usage,
+            })
+            .into_response()
+        }
         Err(e) => e.into_response(),
     }
 }
@@ -543,7 +584,15 @@ pub async fn completions(
 
     if req.stream {
         let include_usage = req.stream_options.is_some_and(|o| o.include_usage);
-        return stream_response(state, rx, StreamKind::Text, new_id("cmpl"), include_usage).await;
+        return stream_response(
+            state,
+            rx,
+            StreamKind::Text,
+            new_id("cmpl"),
+            include_usage,
+            None,
+        )
+        .await;
     }
 
     match collect_events(rx).await {

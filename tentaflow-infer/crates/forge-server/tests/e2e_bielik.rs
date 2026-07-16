@@ -69,6 +69,7 @@ async fn chat_completions_end_to_end() {
         bind: "127.0.0.1:0".parse().unwrap(),
         model_id: "bielik-7b-nvfp4".into(),
         api_key: None,
+        tool_call_parser: None,
     };
     let state = ServerState::new(
         &cfg,
@@ -79,6 +80,7 @@ async fn chat_completions_end_to_end() {
         chat_template,
         4096,
         4,
+        forge_server::toolcall::ToolParserKind::None,
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

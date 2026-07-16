@@ -13,6 +13,7 @@ use forge_engine::server::{spawn_engine, EngineEvent, EngineHandle, EngineReques
 use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
 use forge_server::source::{kv_pool_bytes, load_model, read_descriptor, LoadedModel};
+use forge_server::toolcall::ToolParserKind;
 use forge_server::{ServerConfig, ServerState};
 use forge_tokenize::{ChatMessage, ChatTemplateEngine};
 
@@ -49,6 +50,9 @@ enum Command {
         /// Weights pool size in GiB.
         #[arg(long, default_value_t = 16.0)]
         weights_pool_gb: f64,
+        /// Tool-call output parser: hermes | llama3 | none (default: auto-detect).
+        #[arg(long)]
+        tool_call_parser: Option<String>,
     },
     /// One-shot generation streamed to stdout.
     Run {
@@ -98,6 +102,7 @@ fn main() -> Result<()> {
             prefill_chunk,
             kv_pages,
             weights_pool_gb,
+            tool_call_parser,
         } => cmd_serve(
             &model_path,
             bind,
@@ -107,6 +112,7 @@ fn main() -> Result<()> {
             prefill_chunk,
             kv_pages,
             weights_pool_gb,
+            tool_call_parser,
         ),
         Command::Run {
             model_path,
@@ -194,6 +200,7 @@ fn cmd_serve(
     prefill_chunk: usize,
     kv_pages: usize,
     weights_pool_gb: f64,
+    tool_call_parser: Option<String>,
 ) -> Result<()> {
     let max_active = usize::from(max_active);
     let t0 = Instant::now();
@@ -219,12 +226,20 @@ fn cmd_serve(
         .params
         .max_position_embeddings
         .min(ModelConfig::default().max_seq_len);
+    let tool_parser = ToolParserKind::resolve(
+        tool_call_parser.as_deref(),
+        &loaded.model.weights.descriptor.arch,
+        &loaded.chat_template,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    tracing::info!("tool-call parser: {tool_parser:?}");
     let engine = spawn_engine(loaded.model, tokenizer.clone(), max_active, prefill_chunk);
 
     let cfg = ServerConfig {
         bind,
         model_id: model_id.unwrap_or_else(|| default_model_id(model_path)),
         api_key,
+        tool_call_parser,
     };
     let state = ServerState::new(
         &cfg,
@@ -235,6 +250,7 @@ fn cmd_serve(
         loaded.chat_template,
         max_context,
         max_active,
+        tool_parser,
     );
 
     tokio::runtime::Builder::new_multi_thread()
