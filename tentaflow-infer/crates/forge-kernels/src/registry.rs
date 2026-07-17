@@ -72,6 +72,13 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemv_q8_0_out_f32_v2",
     "gemv_nvfp4_f16_v2",
     "gemv_f16_out_f32_v2",
+    "transpose_f16",
+    "gemm_q8_0_xt_f16",
+    "gemm_nvfp4_xt_f16",
+    "gemm_f16_xt_f16",
+    "kv_append_batch_f16",
+    "attn_prefill_f16_hd64",
+    "attn_prefill_f16_hd128",
 ];
 
 /// Loaded modules + resolved kernel handles for one device.

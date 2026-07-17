@@ -579,6 +579,233 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// xT[c, t] = x[t, c] — prefill activation transpose feeding the batched
+    /// GEMMs. `n_tokens` is the padded token stride the GEMMs consume.
+    pub fn transpose_f16(
+        &self,
+        out: &DevBuffer,
+        x: &DevBuffer,
+        n_tokens: usize,
+        n_cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("transpose_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((n_cols as u32).div_ceil(32), (n_tokens as u32).div_ceil(8), 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(x)
+            .scalar(n_tokens as i64)
+            .scalar(n_cols as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Prefill GEMM lanes load 4 tokens per 8-byte vector, so the transposed
+    /// activation stride must be padded to a multiple of 4 tokens.
+    fn check_gemm_tokens(n_tokens: usize) -> Result<()> {
+        if !n_tokens.is_multiple_of(4) {
+            return Err(ForgeError::Kernel(format!(
+                "prefill GEMM requires n_tokens % 4 == 0, got {n_tokens}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Y[t, row] = W·x[t] over Q8_0 weights and transposed f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q8_0_xt_f16(
+        &self,
+        y: &DevBuffer,
+        w_q8: &DevBuffer,
+        xt: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_q8_0 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        Self::check_gemm_tokens(n_tokens)?;
+        let k = self.artifacts.get("gemm_q8_0_xt_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), (n_tokens as u32).div_ceil(128), 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w_q8)
+            .buf(xt)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over NVFP4 weights and transposed f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_nvfp4_xt_f16(
+        &self,
+        y: &DevBuffer,
+        packed: &DevBuffer,
+        scales: &DevBuffer,
+        xt: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        inv_global_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(16) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_nvfp4 requires cols % 16 == 0, got {cols}"
+            )));
+        }
+        Self::check_gemm_tokens(n_tokens)?;
+        let k = self.artifacts.get("gemm_nvfp4_xt_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), (n_tokens as u32).div_ceil(128), 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(packed)
+            .buf(scales)
+            .buf(xt)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64)
+            .scalar(inv_global_scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t], all f16, transposed activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_xt_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        xt: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        // The kernel consumes the reduction dim in vectors of 8; a tail would
+        // be silently dropped, so reject it loudly instead.
+        if !cols.is_multiple_of(8) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_f16 requires cols % 8 == 0, got {cols}"
+            )));
+        }
+        Self::check_gemm_tokens(n_tokens)?;
+        let k = self.artifacts.get("gemm_f16_xt_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), (n_tokens as u32).div_ceil(128), 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(xt)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Scatter a prefill chunk's K/V rows ([n_tokens, n_kv_heads, head_dim])
+    /// into the paged cache at positions base_pos..base_pos+n_tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_append_batch_f16(
+        &self,
+        k_cache: &DevBuffer,
+        v_cache: &DevBuffer,
+        k_in: &DevBuffer,
+        v_in: &DevBuffer,
+        page_table: &DevBuffer,
+        base_pos: usize,
+        n_tokens: usize,
+        n_kv_heads: usize,
+        page_size: usize,
+        head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("kv_append_batch_f16")?;
+        let cfg = LaunchConfig {
+            grid: (n_tokens as u32, n_kv_heads as u32, 1),
+            block: ((head_dim as u32).clamp(32, 256), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(k_cache)
+            .buf(v_cache)
+            .buf(k_in)
+            .buf(v_in)
+            .buf(page_table)
+            .scalar(base_pos as i64)
+            .scalar(n_kv_heads as i64)
+            .scalar(page_size as i64)
+            .scalar(head_dim as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Causal prefill attention over the paged cache. Query token t attends
+    /// positions 0..base_pos+t, whose K/V must already be appended.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill_f16(
+        &self,
+        out: &DevBuffer,
+        q: &DevBuffer,
+        k_cache: &DevBuffer,
+        v_cache: &DevBuffer,
+        page_table: &DevBuffer,
+        base_pos: usize,
+        n_tokens: usize,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let name = match head_dim {
+            64 => "attn_prefill_f16_hd64",
+            128 => "attn_prefill_f16_hd128",
+            other => {
+                return Err(ForgeError::Unsupported(format!(
+                    "attn_prefill: head_dim {other} has no compiled specialization"
+                )))
+            }
+        };
+        let k = self.artifacts.get(name)?;
+        let cfg = LaunchConfig {
+            grid: (n_tokens as u32, n_q_heads as u32, 1),
+            block: (ATTN_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(q)
+            .buf(k_cache)
+            .buf(v_cache)
+            .buf(page_table)
+            .scalar(base_pos as i64)
+            .scalar(n_q_heads as i64)
+            .scalar(n_kv_heads as i64)
+            .scalar(page_size as i64)
+            .scalar(scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// Paged flash-decode attention. Layouts documented in attention.mojo.
     #[allow(clippy::too_many_arguments)]
     pub fn attn_decode_f16(

@@ -472,7 +472,8 @@ fn cmd_bench(model_path: &Path, tokens: usize, prompt_tokens: usize) -> Result<(
         .copied()
         .collect();
 
-    let engine = spawn_engine(loaded.model, tokenizer, 1, 16);
+    // Single-sequence bench: full-size prefill chunks, no ITL to protect.
+    let engine = spawn_engine(loaded.model, tokenizer, 1, 256);
     let submit_at = Instant::now();
     // No EOS ids: the benchmark must decode exactly `tokens` tokens.
     let (generated, prompt_len, first_at, done_at) = drain_request(
@@ -493,7 +494,8 @@ fn cmd_bench(model_path: &Path, tokens: usize, prompt_tokens: usize) -> Result<(
     // Honest measurement note: "prefill" is submit → first visible token,
     // which includes at least one decode step (and possibly a couple more if
     // the decoder held back partial UTF-8); "decode" covers the remaining
-    // generated tokens as counted by the engine's usage numbers.
+    // generated tokens as counted by the engine's usage numbers. Prefill runs
+    // through the batched chunked path (one chunk per scheduler iteration).
     let prefill_s = first_at.duration_since(submit_at).as_secs_f64();
     let decode_s = done_at.duration_since(first_at).as_secs_f64();
     let prefill_tps = prompt_len as f64 / prefill_s.max(1e-9);

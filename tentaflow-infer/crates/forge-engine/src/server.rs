@@ -13,7 +13,7 @@ use forge_types::{ForgeError, Result};
 
 use crate::generate::FinishReason;
 use crate::kv::SeqKv;
-use crate::model::Model;
+use crate::model::{Model, MAX_PREFILL_CHUNK};
 use crate::sample::{Sampler, SamplingParams};
 
 pub struct EngineRequest {
@@ -207,14 +207,15 @@ fn worker<'t>(
 /// Advance one sequence by one scheduler quantum. Sets `dead` on completion.
 fn advance(model: &mut Model, a: &mut ActiveSeq<'_>, prefill_chunk: usize) -> Result<()> {
     if !a.pending_prompt.is_empty() {
-        for _ in 0..prefill_chunk.max(1) {
-            let Some(t) = a.pending_prompt.pop_front() else {
-                break;
-            };
-            let logits = model.step(&mut a.seq, t)?;
-            if a.pending_prompt.is_empty() {
-                a.logits = Some(logits);
-            }
+        // Batched prefill: one quantum per iteration keeps decode ITL of the
+        // other sequences bounded; the 32-token floor keeps tiny configured
+        // quanta from wasting the batched kernels.
+        let quantum = prefill_chunk.clamp(32, MAX_PREFILL_CHUNK);
+        let take = quantum.min(a.pending_prompt.len());
+        let chunk: Vec<u32> = a.pending_prompt.drain(..take).collect();
+        let logits = model.prefill_chunk(&mut a.seq, &chunk)?;
+        if a.pending_prompt.is_empty() {
+            a.logits = Some(logits);
         }
         return Ok(());
     }

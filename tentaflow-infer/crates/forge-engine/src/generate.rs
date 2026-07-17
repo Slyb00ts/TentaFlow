@@ -64,11 +64,10 @@ fn run(
     let mut decoder = StreamDecoder::new(tokenizer, true);
     let mut stops = StopMatcher::new(req.stop.clone());
 
-    // Prefill: v0 pushes prompt tokens through the decode path one by one;
-    // only the last token's logits matter.
+    // Batched prefill; only the last chunk's logits matter.
     let mut logits = Vec::new();
-    for &t in &req.prompt_tokens {
-        logits = model.step(seq, t)?;
+    for chunk in req.prompt_tokens.chunks(crate::model::MAX_PREFILL_CHUNK) {
+        logits = model.prefill_chunk(seq, chunk)?;
     }
 
     let mut text = String::new();
