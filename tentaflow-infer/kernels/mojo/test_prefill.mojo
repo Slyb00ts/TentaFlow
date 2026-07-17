@@ -11,6 +11,33 @@ def _fill(i: Int) -> Float32:
     return Float32((i * 37 % 19) - 9) * 0.25
 
 
+def _e2m1_ref(code: Int) -> Float32:
+    comptime mags = SIMD[DType.float32, 8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+    v = mags[code & 7]
+    if code >= 8:
+        return -v
+    return v
+
+
+def _f8_ref(b: Int) -> Float32:
+    var sign: Float32 = 1.0
+    if b >= 128:
+        sign = -1.0
+    e = (b >> 3) & 0x0F
+    man = Float32(b & 0x07)
+    if e == 0:
+        return sign * man * (1.0 / 512.0)
+    var scale: Float32 = 1.0
+    var k = e - 7
+    while k > 0:
+        scale *= 2.0
+        k -= 1
+    while k < 0:
+        scale *= 0.5
+        k += 1
+    return sign * (1.0 + man / 8.0) * scale
+
+
 def main() raises:
     var ctx = DeviceContext()
     var max_err: Float32 = 0.0
@@ -43,7 +70,7 @@ def main() raises:
     )
     ctx.enqueue_function[gemm_q8_0_xt_f16](
         y.unsafe_ptr(), wq.unsafe_ptr(), xt.unsafe_ptr(), COLS, ROWS, T,
-        grid_dim=((ROWS + 7) // 8, (T + 127) // 128), block_dim=256,
+        grid_dim=((ROWS + 63) // 64, (T + 127) // 128), block_dim=256,
     )
     ctx.synchronize()
 
@@ -68,6 +95,89 @@ def main() raises:
     print("gemm_q8_0 max_rel_err:", max_err)
     if max_err > 0.02:
         raise Error("gemm_q8_0 FAILED")
+
+    # --- f16 GEMM vs CPU (row/token/k tails: 90 rows, 40 tokens, 136 cols) ---
+    comptime FROWS = 90
+    comptime FCOLS = 136
+    var xf = ctx.enqueue_create_buffer[DType.float16](T * FCOLS)
+    var xtf = ctx.enqueue_create_buffer[DType.float16](FCOLS * T)
+    var wf = ctx.enqueue_create_buffer[DType.float16](FROWS * FCOLS)
+    var yf = ctx.enqueue_create_buffer[DType.float16](T * FROWS)
+    with xf.map_to_host() as h:
+        for i in range(T * FCOLS):
+            h[i] = Float16(_fill(i) * 0.1)
+    with wf.map_to_host() as h:
+        for i in range(FROWS * FCOLS):
+            h[i] = Float16(_fill(i + 7) * 0.15)
+    ctx.enqueue_function[transpose_f16](
+        xtf.unsafe_ptr(), xf.unsafe_ptr(), T, FCOLS,
+        grid_dim=((FCOLS + 31) // 32, (T + 7) // 8), block_dim=256,
+    )
+    ctx.enqueue_function[gemm_f16_xt_f16](
+        yf.unsafe_ptr(), wf.unsafe_ptr(), xtf.unsafe_ptr(), FCOLS, FROWS, T,
+        grid_dim=((FROWS + 63) // 64, (T + 127) // 128), block_dim=256,
+    )
+    ctx.synchronize()
+    max_err = 0.0
+    with yf.map_to_host() as yh, xf.map_to_host() as xh, wf.map_to_host() as wh:
+        for t in range(T):
+            for r in range(FROWS):
+                var acc: Float32 = 0.0
+                for c in range(FCOLS):
+                    acc += Float32(wh[r * FCOLS + c]) * Float32(xh[t * FCOLS + c])
+                rel = abs(Float32(yh[t * FROWS + r]) - acc) / (abs(acc) + 1.0)
+                if rel > max_err:
+                    max_err = rel
+    print("gemm_f16 max_rel_err:", max_err)
+    if max_err > 0.02:
+        raise Error("gemm_f16 FAILED")
+
+    # --- nvfp4 GEMM vs CPU (112 cols exercises the 16-col group tail) ---
+    comptime NCOLS = 112
+    comptime IGS: Float32 = 0.75
+    var xnv = ctx.enqueue_create_buffer[DType.float16](T * NCOLS)
+    var xtn = ctx.enqueue_create_buffer[DType.float16](NCOLS * T)
+    var npk = ctx.enqueue_create_buffer[DType.uint8](FROWS * NCOLS // 2)
+    var nsc = ctx.enqueue_create_buffer[DType.uint8](FROWS * NCOLS // 16)
+    var ynv = ctx.enqueue_create_buffer[DType.float16](T * FROWS)
+    with xnv.map_to_host() as h:
+        for i in range(T * NCOLS):
+            h[i] = Float16(_fill(i) * 0.3)
+    with npk.map_to_host() as h:
+        for i in range(FROWS * NCOLS // 2):
+            h[i] = UInt8((i * 73 + 11) % 256)
+    with nsc.map_to_host() as h:
+        for i in range(FROWS * NCOLS // 16):
+            h[i] = UInt8((i * 29 + 40) % 100 + 8)
+    ctx.enqueue_function[transpose_f16](
+        xtn.unsafe_ptr(), xnv.unsafe_ptr(), T, NCOLS,
+        grid_dim=((NCOLS + 31) // 32, (T + 7) // 8), block_dim=256,
+    )
+    ctx.enqueue_function[gemm_nvfp4_xt_f16](
+        ynv.unsafe_ptr(), npk.unsafe_ptr(), nsc.unsafe_ptr(), xtn.unsafe_ptr(),
+        NCOLS, FROWS, T, IGS,
+        grid_dim=((FROWS + 63) // 64, (T + 127) // 128), block_dim=256,
+    )
+    ctx.synchronize()
+    max_err = 0.0
+    with ynv.map_to_host() as yh, xnv.map_to_host() as xh, npk.map_to_host() as ph, nsc.map_to_host() as sh:
+        for t in range(T):
+            for r in range(FROWS):
+                var acc: Float32 = 0.0
+                for g in range(NCOLS // 16):
+                    sref = _f8_ref(Int(sh[r * (NCOLS // 16) + g])) * IGS
+                    var dot: Float32 = 0.0
+                    for j in range(8):
+                        b = Int(ph[r * (NCOLS // 2) + g * 8 + j])
+                        dot += _e2m1_ref(b & 0x0F) * Float32(xh[t * NCOLS + g * 16 + 2 * j])
+                        dot += _e2m1_ref(b >> 4) * Float32(xh[t * NCOLS + g * 16 + 2 * j + 1])
+                    acc += sref * dot
+                rel = abs(Float32(yh[t * FROWS + r]) - acc) / (abs(acc) + 1.0)
+                if rel > max_err:
+                    max_err = rel
+    print("gemm_nvfp4 max_rel_err:", max_err)
+    if max_err > 0.02:
+        raise Error("gemm_nvfp4 FAILED")
 
     # --- kv_append_batch + attn_prefill vs reference ---
     comptime NKVH = 2
@@ -174,23 +284,51 @@ def main() raises:
     var bw = ctx.enqueue_create_buffer[DType.uint8](BR * (BC // 32) * 34)
     var bxt = ctx.enqueue_create_buffer[DType.float16](BC * BT)
     var by = ctx.enqueue_create_buffer[DType.float16](BT * BR)
-    for _ in range(2):
+    # Long warmup: the timing below is garbage unless the GPU reaches boost
+    # clocks first (idle RTX 4090 sits at ~210 MHz).
+    for _ in range(300):
         ctx.enqueue_function[gemm_q8_0_xt_f16](
             by.unsafe_ptr(), bw.unsafe_ptr(), bxt.unsafe_ptr(), BC, BR, BT,
-            grid_dim=((BR + 7) // 8, (BT + 127) // 128), block_dim=256,
+            grid_dim=((BR + 63) // 64, (BT + 127) // 128), block_dim=256,
         )
     ctx.synchronize()
     t0 = perf_counter_ns()
-    comptime ITERS = 10
+    comptime ITERS = 20
     for _ in range(ITERS):
         ctx.enqueue_function[gemm_q8_0_xt_f16](
             by.unsafe_ptr(), bw.unsafe_ptr(), bxt.unsafe_ptr(), BC, BR, BT,
-            grid_dim=((BR + 7) // 8, (BT + 127) // 128), block_dim=256,
+            grid_dim=((BR + 63) // 64, (BT + 127) // 128), block_dim=256,
         )
     ctx.synchronize()
     t1 = perf_counter_ns()
     ms = Float64(t1 - t0) / 1e6 / ITERS
     flops = 2.0 * Float64(BR) * Float64(BC) * Float64(BT)
     print("gemm_q8_0 11264x4096 T=256:", ms, "ms  ", flops / (ms / 1e3) / 1e12, "TFLOP/s")
+
+    var bwf = ctx.enqueue_create_buffer[DType.float16](BR * BC)
+    t0 = perf_counter_ns()
+    for _ in range(ITERS):
+        ctx.enqueue_function[gemm_f16_xt_f16](
+            by.unsafe_ptr(), bwf.unsafe_ptr(), bxt.unsafe_ptr(), BC, BR, BT,
+            grid_dim=((BR + 63) // 64, (BT + 127) // 128), block_dim=256,
+        )
+    ctx.synchronize()
+    t1 = perf_counter_ns()
+    ms = Float64(t1 - t0) / 1e6 / ITERS
+    print("gemm_f16 11264x4096 T=256:", ms, "ms  ", flops / (ms / 1e3) / 1e12, "TFLOP/s")
+
+    var bpk = ctx.enqueue_create_buffer[DType.uint8](BR * BC // 2)
+    var bsc = ctx.enqueue_create_buffer[DType.uint8](BR * BC // 16)
+    t0 = perf_counter_ns()
+    for _ in range(ITERS):
+        ctx.enqueue_function[gemm_nvfp4_xt_f16](
+            by.unsafe_ptr(), bpk.unsafe_ptr(), bsc.unsafe_ptr(), bxt.unsafe_ptr(),
+            BC, BR, BT, Float32(1.0),
+            grid_dim=((BR + 63) // 64, (BT + 127) // 128), block_dim=256,
+        )
+    ctx.synchronize()
+    t1 = perf_counter_ns()
+    ms = Float64(t1 - t0) / 1e6 / ITERS
+    print("gemm_nvfp4 11264x4096 T=256:", ms, "ms  ", flops / (ms / 1e3) / 1e12, "TFLOP/s")
 
     print("ALL PREFILL KERNEL CHECKS PASSED")

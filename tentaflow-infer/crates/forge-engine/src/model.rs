@@ -86,9 +86,9 @@ struct DecodeBufs {
 /// Persistent prefill scratch sized for MAX_PREFILL_CHUNK tokens. Activation
 /// matrices are [T, cols] row-major except `xt`, which holds the transposed
 /// [cols, T_pad] view the batched GEMMs consume. Rows T..T_pad of `xt` (and of
-/// the GEMM outputs) carry garbage by design: the prefill GEMM lanes read 4
-/// tokens per vector, so the token stride is padded to a multiple of 4 and
-/// outputs beyond the real token count are never read.
+/// the GEMM outputs) carry garbage by design: the prefill GEMMs stage tokens
+/// in 16-byte cp.async chunks, so the token stride is padded to a multiple of
+/// 8 and outputs beyond the real token count are never read.
 struct PrefillBufs {
     h: DevBuffer,
     x: DevBuffer,
@@ -390,7 +390,7 @@ impl Model {
             .write(bytemuck::cast_slice(&positions), &pb.positions, 0)?;
 
         // Padded token stride for the transposed activations (see PrefillBufs).
-        let t_pad = t.next_multiple_of(4);
+        let t_pad = t.next_multiple_of(8);
         let hidden = p.hidden_size;
         let inter = p.intermediate_size;
         let q_dim = p.n_heads * p.head_dim;

@@ -685,12 +685,12 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
-    /// Prefill GEMM lanes load 4 tokens per 8-byte vector, so the transposed
-    /// activation stride must be padded to a multiple of 4 tokens.
+    /// Prefill GEMMs stage activations with 16-byte cp.async chunks, so the
+    /// transposed activation stride must be padded to a multiple of 8 tokens.
     fn check_gemm_tokens(n_tokens: usize) -> Result<()> {
-        if !n_tokens.is_multiple_of(4) {
+        if !n_tokens.is_multiple_of(8) {
             return Err(ForgeError::Kernel(format!(
-                "prefill GEMM requires n_tokens % 4 == 0, got {n_tokens}"
+                "prefill GEMM requires n_tokens % 8 == 0, got {n_tokens}"
             )));
         }
         Ok(())
@@ -733,7 +733,7 @@ impl Kernels {
         Self::check_gemm_tokens(n_tokens)?;
         let k = self.artifacts.get("gemm_q8_0_xt_f16")?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(8), (n_tokens as u32).div_ceil(128), 1),
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(128), 1),
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -802,7 +802,7 @@ impl Kernels {
         Self::check_gemm_tokens(n_tokens)?;
         let k = self.artifacts.get("gemm_nvfp4_xt_f16")?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(8), (n_tokens as u32).div_ceil(128), 1),
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(128), 1),
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -858,7 +858,7 @@ impl Kernels {
         Self::check_gemm_tokens(n_tokens)?;
         let k = self.artifacts.get("gemm_f16_xt_f16")?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(8), (n_tokens as u32).div_ceil(128), 1),
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(128), 1),
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
