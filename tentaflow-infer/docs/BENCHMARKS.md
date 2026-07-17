@@ -50,3 +50,23 @@ docker run --rm --gpus all --device /dev/nvidia-uvm --device /dev/nvidiactl \
 ```
 (vLLM container on this host needs the explicit /dev/nvidia* device flags —
 nvidia-container-toolkit does not mount nvidia-uvm here.)
+
+## Update 2026-07-17 — GEMV v2 + CUDA-graph decode + batched prefill
+
+| Model | Metric | FORGE before | FORGE now | llama.cpp | vLLM |
+|---|---|---:|---:|---:|---:|
+| Qwen3-0.6B Q8_0 | decode | 247 | **~300** | 652 | ~490 (BF16) |
+| Qwen3-0.6B Q8_0 | prefill | 328 | **9 430** | 36 073 | — |
+| Bielik-7B NVFP4 | decode | 69 | **112** | n/a | ~165 (Marlin) |
+| Bielik-7B NVFP4 | prefill | 79 | **428** (1k prompt) | n/a | — |
+
+What landed: warp-per-row GEMV v2 with explicit `alignment=` vector loads
+(Q8_0 908 GB/s, NVFP4 649 GB/s, ~90 %/65 % of DRAM peak), whole-decode-step
+CUDA-graph replay, pinned-host staging, and batched prefill
+(transpose + broadcast-weight GEMM ~13 TFLOP/s + causal paged attn_prefill),
+bit-identical outputs vs the per-token path on all three weight formats.
+
+Remaining gap analysis: decode on the 0.6B is bounded by the ~200-kernel
+per-step floor (fusions: QKV/gate-up concat, norm+rope+append merge); 7B NVFP4
+decode by e2m1 decode ALU cost; prefill by the GEMM kernel (tensor-core/mma
+path is the next step to approach llama.cpp's 36k). All tracked in PLAN chunk 6.
