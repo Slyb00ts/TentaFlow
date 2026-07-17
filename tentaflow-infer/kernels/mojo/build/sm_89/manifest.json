@@ -34,6 +34,24 @@
     "kv_append_batch_f16": {"file": "kv_append_batch_f16.ptx", "entry": "src_prefill_kv_append_batch_f16A6A6A6A_e611c3651da54ac9"},
     "attn_prefill_f16_hd64": {"file": "attn_prefill_f16_hd64.ptx", "entry": "src_prefill_attn_prefill_f166A6A6A6AcB6A_965271a47adb93c4"},
     "attn_prefill_f16_hd128": {"file": "attn_prefill_f16_hd128.ptx", "entry": "src_prefill_attn_prefill_f166A6A6A6AcB6A_6d43c8d845138c88"},
-    "qkv_post_f16": {"file": "qkv_post_f16.ptx", "entry": "src_qkv_post_qkv_post_f16_Po6A6A6A6AoA6A6A_58d752da1d0c71ad"}
+    "qkv_post_f16": {"file": "qkv_post_f16.ptx", "entry": "src_qkv_post_qkv_post_f16_Po6A6A6A6AoA6A6A_58d752da1d0c71ad"},
+    "gemv_q4_k_f16_v2": {"file": "gemv_q4_k_f16_v2.ptx", "entry": "src_gemv2_gemv_q4_k_f16_v2_P6A6A6A6AoA6A6A_75507fe2e4e6dca7"},
+    "gemv_q4_k_out_f32_v2": {"file": "gemv_q4_k_out_f32_v2.ptx", "entry": "src_gemv2_gemv_q4_k_out_f32_v26A6A6A6A_236272e835d9bebb"},
+    "gemm_q4_k_f16": {"file": "gemm_q4_k_f16.ptx", "entry": "src_gemm_gemm_q4_k_impl_SIMD6A6A6A6AcB6A6A_6525713a9954104f"},
+    "gemm_q4_k_f16_bm64": {"file": "gemm_q4_k_f16_bm64.ptx", "entry": "src_gemm_gemm_q4_k_impl_SIMD6A6A6A6AcB6A6A_85e07354c0798172"},
+    "attn_decode_split_f16_hd64": {"file": "attn_decode_split_f16_hd64.ptx", "entry": "src_attention_attn_decode_spli6A6A6A6A_3435961ce07caab8"},
+    "attn_decode_split_f16_hd128": {"file": "attn_decode_split_f16_hd128.ptx", "entry": "src_attention_attn_decode_spli6A6A6A6A_c73123ec58f92ccc"},
+    "attn_decode_combine_f16_hd64": {"file": "attn_decode_combine_f16_hd64.ptx", "entry": "src_attention_attn_decode_comb6A6A6A6A_3d1ae64984dc1d10"},
+    "attn_decode_combine_f16_hd128": {"file": "attn_decode_combine_f16_hd128.ptx", "entry": "src_attention_attn_decode_comb6A6A6A6A_06bc92fa08f34cc1"},
+    "gemv_norm_q8_0_f16": {"file": "gemv_norm_q8_0_f16.ptx", "entry": "src_decode_fused_gemv_norm_q8_6A6A6A6A_9c4b6bc02b734da0"},
+    "gemv_norm_nvfp4_f16": {"file": "gemv_norm_nvfp4_f16.ptx", "entry": "src_decode_fused_gemv_norm_nvf6A6A6A6A_91126fe2d94d4c69"},
+    "gemv_norm_f16": {"file": "gemv_norm_f16.ptx", "entry": "src_decode_fused_gemv_norm_f166A6A6A6A_401974c799ad07c9"},
+    "gemv_norm_silu_q8_0_f16": {"file": "gemv_norm_silu_q8_0_f16.ptx", "entry": "src_decode_fused_gemv_norm_sil6A6A6A6A_95675671483b5f46"},
+    "gemv_norm_silu_nvfp4_f16": {"file": "gemv_norm_silu_nvfp4_f16.ptx", "entry": "src_decode_fused_gemv_norm_sil6A6A6A6A_62e2a4047071bfca"},
+    "gemv_norm_silu_f16": {"file": "gemv_norm_silu_f16.ptx", "entry": "src_decode_fused_gemv_norm_sil6A6A6A6A_7552dac4e61f9961"},
+    "gemv_residual_q8_0_f16": {"file": "gemv_residual_q8_0_f16.ptx", "entry": "src_decode_fused_gemv_residual6A6A6A6A_f84aadaa72b6a31c"},
+    "gemv_residual_nvfp4_f16": {"file": "gemv_residual_nvfp4_f16.ptx", "entry": "src_decode_fused_gemv_residual6A6A6A6A_39f61c92383bc606"},
+    "gemv_residual_f16": {"file": "gemv_residual_f16.ptx", "entry": "src_decode_fused_gemv_residual6A6A6A6A_0a9df7a79fa19730"},
+    "rmsnorm_h32_f16": {"file": "rmsnorm_h32_f16.ptx", "entry": "src_decode_fused_rmsnorm_h32_f6A6A6A6A_afeaf2c4402b7adf"}
   }
 }

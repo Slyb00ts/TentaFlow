@@ -943,6 +943,117 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// y = W·x with W in GGML Q4_K superblocks, x/y f16. Warp per row.
+    pub fn gemv_q4_k_f16(
+        &self,
+        y: &DevBuffer,
+        w_q4k: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) || cols > 32768 {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q4_k requires cols % 256 == 0 and cols <= 32768, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q4_k_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w_q4k)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over Q4_K weights → f32 logits.
+    pub fn gemv_q4_k_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w_q4k: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) || cols > 32768 {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q4_k_out_f32 requires cols % 256 == 0 and cols <= 32768, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q4_k_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w_q4k)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over Q4_K weights and row-major f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q4_k_f16(
+        &self,
+        y: &DevBuffer,
+        w_q4k: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_q4_k_f16_at(y, w_q4k, 0, x, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_q4_k_f16` over a row window of a fused weight matrix:
+    /// `w_byte_off` addresses the first superblock of the window's first row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q4_k_f16_at(
+        &self,
+        y: &DevBuffer,
+        w_q4k: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_q4_k requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_q4_k_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w_q4k, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// Paged flash-decode attention. Layouts documented in attention.mojo.
     #[allow(clippy::too_many_arguments)]
     pub fn attn_decode_f16(
@@ -989,6 +1100,501 @@ impl Kernels {
             .scalar(page_size as i64)
             .scalar(max_pages as i64)
             .scalar(scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Rows each warp computes in the norm-recomputing fused decode kernels.
+    /// Fewer blocks means fewer redundant per-block norm recomputes (h32/h/
+    /// norm-weight traffic), which pays off once the projection is tall
+    /// enough to keep the GPU busy anyway; per-row math is unchanged.
+    fn fused_rows_per_warp(rows: usize) -> usize {
+        (rows / 2048).clamp(1, 4)
+    }
+
+    /// Guard shared by the norm-recomputing fused decode kernels: the normed
+    /// x is staged in a MAX_HIDDEN-element shared array (decode_fused.mojo).
+    fn check_fused_hidden(cols: usize, quant_mult: usize, name: &str) -> Result<()> {
+        if cols > 8192 || !cols.is_multiple_of(quant_mult) {
+            return Err(ForgeError::Kernel(format!(
+                "{name} requires cols % {quant_mult} == 0 and cols <= 8192, got {cols}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Fused rmsnorm-recompute + Q8_0 GEMV (decode). ss_from_h16 selects the
+    /// sum-of-squares source: the f16 residual h (layer 0, straight from the
+    /// embedding gather) or the unrounded f32 mirror h32 (later layers).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_q8_0_f16(
+        &self,
+        y: &DevBuffer,
+        w_q8: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 32, "gemv_norm_q8_0")?;
+        let k = self.artifacts.get("gemv_norm_q8_0_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w_q8)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + NVFP4 GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_nvfp4_f16(
+        &self,
+        y: &DevBuffer,
+        packed: &DevBuffer,
+        scales: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        inv_global_scale: f32,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 16, "gemv_norm_nvfp4")?;
+        let k = self.artifacts.get("gemv_norm_nvfp4_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(packed)
+            .buf(scales)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(inv_global_scale)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + f16 GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 8, "gemv_norm_f16")?;
+        let k = self.artifacts.get("gemv_norm_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up Q8_0 GEMV + SiLU (decode FFN).
+    /// `w_q8` is the fused gate|up matrix (rows 0..inter gate, inter..2*inter
+    /// up); one launch writes act = silu(gate) * up.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_q8_0_f16(
+        &self,
+        act: &DevBuffer,
+        w_q8: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 32, "gemv_norm_silu_q8_0")?;
+        let k = self.artifacts.get("gemv_norm_silu_q8_0_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w_q8)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up NVFP4 GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_nvfp4_f16(
+        &self,
+        act: &DevBuffer,
+        packed: &DevBuffer,
+        scales: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        inv_global_scale: f32,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 16, "gemv_norm_silu_nvfp4")?;
+        let k = self.artifacts.get("gemv_norm_silu_nvfp4_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(packed)
+            .buf(scales)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(inv_global_scale)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up f16 GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_f16(
+        &self,
+        act: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 8, "gemv_norm_silu_f16")?;
+        let k = self.artifacts.get("gemv_norm_silu_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Q8_0 GEMV + residual add: h += f16(W·x) with rmsnorm_residual_f16's
+    /// rounding; the unrounded f32 sum lands in h32 for the next norm.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_q8_0_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w_q8: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_q8_0 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_q8_0_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w_q8)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// NVFP4 GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_nvfp4_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        packed: &DevBuffer,
+        scales: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        inv_global_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(16) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_nvfp4 requires cols % 16 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_nvfp4_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(packed)
+            .buf(scales)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(inv_global_scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// f16 GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(8) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_f16 requires cols % 8 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Final decode norm from the (h f16, h32 f32) residual pair: out =
+    /// rmsnorm(h) * weight with the sum-of-squares taken from h32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_h32_f16(
+        &self,
+        out: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        weight: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("rmsnorm_h32_f16")?;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(h)
+            .buf(h32)
+            .buf(weight)
+            .scalar(cols as i64)
+            .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Split-context flash-decode attention with the qkv_post stage fused in
+    /// as a per-block prologue (q/k RMSNorm + RoPE + paged k/v append). q/k/v
+    /// are sections of the raw QKV GEMV output addressed by byte offsets;
+    /// rotated q lives only in shared memory (the q section is never written
+    /// back). Unnormalized per-split partials land in `parts`
+    /// ([n_seqs, n_q_heads, n_splits, head_dim + 2] f32) for
+    /// attn_decode_combine_f16. n_splits == 1 is bit-exact vs attn_decode_f16.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode_split_f16(
+        &self,
+        parts: &DevBuffer,
+        q_in: &DevBuffer,
+        q_byte_off: usize,
+        k_in: &DevBuffer,
+        k_byte_off: usize,
+        v_in: &DevBuffer,
+        v_byte_off: usize,
+        q_norm: Option<&DevBuffer>,
+        k_norm: Option<&DevBuffer>,
+        k_cache: &DevBuffer,
+        v_cache: &DevBuffer,
+        page_table: &DevBuffer,
+        seq_lens: &DevBuffer,
+        positions: &DevBuffer,
+        n_seqs: usize,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        max_pages: usize,
+        n_splits: usize,
+        eps: f32,
+        theta_base: f32,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let name = match head_dim {
+            64 => "attn_decode_split_f16_hd64",
+            128 => "attn_decode_split_f16_hd128",
+            other => {
+                return Err(ForgeError::Unsupported(format!(
+                    "attn_decode_split: head_dim {other} has no compiled specialization"
+                )))
+            }
+        };
+        let k = self.artifacts.get(name)?;
+        let cfg = LaunchConfig {
+            grid: (n_seqs as u32, n_q_heads as u32, n_splits as u32),
+            block: (ATTN_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Absent norm weights are flagged off; the pointer slot still needs a
+        // valid device address, so q_in stands in (never dereferenced).
+        let args = LaunchArgs::new()
+            .buf(parts)
+            .buf_at(q_in, q_byte_off)?
+            .buf_at(k_in, k_byte_off)?
+            .buf_at(v_in, v_byte_off)?
+            .buf(q_norm.unwrap_or(q_in))
+            .buf(k_norm.unwrap_or(q_in))
+            .buf(k_cache)
+            .buf(v_cache)
+            .buf(page_table)
+            .buf(seq_lens)
+            .buf(positions)
+            .scalar(n_q_heads as i64)
+            .scalar(n_kv_heads as i64)
+            .scalar(page_size as i64)
+            .scalar(max_pages as i64)
+            .scalar(n_splits as i64)
+            .scalar(if q_norm.is_some() { 1i64 } else { 0i64 })
+            .scalar(if k_norm.is_some() { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(theta_base)
+            .scalar(scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Merge attn_decode_split_f16 partials into the final [n_seqs,
+    /// n_q_heads, head_dim] f16 output (one warp per head, split order).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode_combine_f16(
+        &self,
+        out: &DevBuffer,
+        parts: &DevBuffer,
+        n_seqs: usize,
+        n_q_heads: usize,
+        head_dim: usize,
+        n_splits: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let name = match head_dim {
+            64 => "attn_decode_combine_f16_hd64",
+            128 => "attn_decode_combine_f16_hd128",
+            other => {
+                return Err(ForgeError::Unsupported(format!(
+                    "attn_decode_combine: head_dim {other} has no compiled specialization"
+                )))
+            }
+        };
+        let k = self.artifacts.get(name)?;
+        let cfg = LaunchConfig {
+            grid: (n_seqs as u32, n_q_heads as u32, 1),
+            block: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(parts)
+            .scalar(n_q_heads as i64)
+            .scalar(n_splits as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 }

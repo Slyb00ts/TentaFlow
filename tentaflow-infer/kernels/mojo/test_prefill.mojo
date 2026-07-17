@@ -3,8 +3,9 @@
 from std.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 from std.math import exp
-from src.gemm import gemm_q8_0_f16, gemm_f16, gemm_nvfp4_f16
+from src.gemm import gemm_q8_0_f16, gemm_f16, gemm_nvfp4_f16, gemm_q4_k_f16
 from src.gemm import gemm_q8_0_f16_bm64, gemm_f16_bm64, gemm_nvfp4_f16_bm64
+from src.gemm import gemm_q4_k_f16_bm64
 from src.prefill import kv_append_batch_f16, attn_prefill_f16_hd64, QT
 
 
@@ -37,6 +38,16 @@ def _f8_ref(b: Int) -> Float32:
         scale *= 0.5
         k += 1
     return sign * (1.0 + man / 8.0) * scale
+
+
+def _gsm_ref(sm4: Int, s: Int, sp4: Int, j: Int) -> Tuple[Float32, Float32]:
+    # Independent CPU oracle for llama.cpp get_scale_min_k4:
+    # sm4 = scales[j-4] (ignored for j < 4), s = scales[j], sp4 = scales[j+4].
+    if j < 4:
+        return (Float32(s & 63), Float32(sp4 & 63))
+    sc = (sp4 & 0x0F) | ((sm4 >> 6) << 4)
+    mn = (sp4 >> 4) | ((s >> 6) << 4)
+    return (Float32(sc), Float32(mn))
 
 
 def main() raises:
@@ -104,6 +115,90 @@ def main() raises:
             if ya[i] != yb[i]:
                 raise Error("gemm_q8_0 bm64 mismatch")
     print("gemm_q8_0 bm64 bit-identical")
+
+    # --- q4_k GEMM vs CPU (24 rows, 40 tokens, 512 cols = 2 superblocks) ---
+    comptime KCOLS = 512
+    comptime KBL = KCOLS // 256
+    var xk = ctx.enqueue_create_buffer[DType.float16](T * KCOLS)
+    var wk = ctx.enqueue_create_buffer[DType.uint8](ROWS * KBL * 144)
+    var yk = ctx.enqueue_create_buffer[DType.float16](T * ROWS)
+    with xk.map_to_host() as h:
+        for i in range(T * KCOLS):
+            h[i] = Float16(_fill(i) * 0.1)
+    with wk.map_to_host() as h:
+        for r in range(ROWS):
+            for b in range(KBL):
+                off = (r * KBL + b) * 144
+                d = Float16(0.008 + Float32((r + b) % 7) * 0.004)
+                dmin = Float16(0.005 + Float32((r + 2 * b) % 5) * 0.003)
+                bits = d.to_bits()
+                h[off] = UInt8(bits & 0xFF)
+                h[off + 1] = UInt8((bits >> 8) & 0xFF)
+                bits = dmin.to_bits()
+                h[off + 2] = UInt8(bits & 0xFF)
+                h[off + 3] = UInt8((bits >> 8) & 0xFF)
+                for i in range(12):
+                    h[off + 4 + i] = UInt8((r * 53 + b * 19 + i * 41 + 7) % 256)
+                for i in range(128):
+                    h[off + 16 + i] = UInt8((r * 31 + b * 17 + i * 13) % 256)
+
+    ctx.enqueue_function[gemm_q4_k_f16](
+        yk.unsafe_ptr(), wk.unsafe_ptr(), xk.unsafe_ptr(), KCOLS, ROWS, T,
+        grid_dim=((ROWS + 63) // 64, (T + 127) // 128), block_dim=256,
+    )
+    ctx.synchronize()
+
+    max_err = 0.0
+    with yk.map_to_host() as yh, xk.map_to_host() as xh, wk.map_to_host() as wh:
+        for t in range(T):
+            for r in range(ROWS):
+                var acc: Float32 = 0.0
+                for b in range(KBL):
+                    off = (r * KBL + b) * 144
+                    dref = Float32(Float16(0.008 + Float32((r + b) % 7) * 0.004))
+                    mref = Float32(Float16(0.005 + Float32((r + 2 * b) % 5) * 0.003))
+                    for j64 in range(4):
+                        j1 = 2 * j64
+                        j2 = 2 * j64 + 1
+                        sc1, mn1 = _gsm_ref(
+                            Int(wh[off + j1]) if j1 >= 4 else 0,
+                            Int(wh[off + 4 + j1]),
+                            Int(wh[off + 8 + j1]),
+                            j1,
+                        )
+                        sc2, mn2 = _gsm_ref(
+                            Int(wh[off + j2]) if j2 >= 4 else 0,
+                            Int(wh[off + 4 + j2]),
+                            Int(wh[off + 8 + j2]),
+                            j2,
+                        )
+                        for i in range(32):
+                            qk = Int(wh[off + 16 + j64 * 32 + i])
+                            col_lo = b * 256 + j64 * 64 + i
+                            acc += (dref * sc1 * Float32(qk & 0x0F) - mref * mn1) * Float32(
+                                xh[t * KCOLS + col_lo]
+                            )
+                            acc += (dref * sc2 * Float32(qk >> 4) - mref * mn2) * Float32(
+                                xh[t * KCOLS + col_lo + 32]
+                            )
+                rel = abs(Float32(yh[t * ROWS + r]) - acc) / (abs(acc) + 1.0)
+                if rel > max_err:
+                    max_err = rel
+    print("gemm_q4_k max_rel_err:", max_err)
+    if max_err > 0.02:
+        raise Error("gemm_q4_k FAILED")
+
+    var yk64 = ctx.enqueue_create_buffer[DType.float16](T * ROWS)
+    ctx.enqueue_function[gemm_q4_k_f16_bm64](
+        yk64.unsafe_ptr(), wk.unsafe_ptr(), xk.unsafe_ptr(), KCOLS, ROWS, T,
+        grid_dim=((ROWS + 63) // 64, (T + 63) // 64), block_dim=128,
+    )
+    ctx.synchronize()
+    with yk.map_to_host() as ya, yk64.map_to_host() as yb:
+        for i in range(T * ROWS):
+            if ya[i] != yb[i]:
+                raise Error("gemm_q4_k bm64 mismatch")
+    print("gemm_q4_k bm64 bit-identical")
 
     # --- f16 GEMM vs CPU (row/token/k tails: 90 rows, 40 tokens, 136 cols) ---
     comptime FROWS = 90
@@ -340,6 +435,18 @@ def main() raises:
     t1 = perf_counter_ns()
     ms = Float64(t1 - t0) / 1e6 / ITERS
     print("gemm_f16 11264x4096 T=256:", ms, "ms  ", flops / (ms / 1e3) / 1e12, "TFLOP/s")
+
+    var bwk = ctx.enqueue_create_buffer[DType.uint8](BR * (BC // 256) * 144)
+    t0 = perf_counter_ns()
+    for _ in range(ITERS):
+        ctx.enqueue_function[gemm_q4_k_f16](
+            by.unsafe_ptr(), bwk.unsafe_ptr(), bx.unsafe_ptr(), BC, BR, BT,
+            grid_dim=((BR + 63) // 64, (BT + 127) // 128), block_dim=256,
+        )
+    ctx.synchronize()
+    t1 = perf_counter_ns()
+    ms = Float64(t1 - t0) / 1e6 / ITERS
+    print("gemm_q4_k 11264x4096 T=256:", ms, "ms  ", flops / (ms / 1e3) / 1e12, "TFLOP/s")
 
     var bpk = ctx.enqueue_create_buffer[DType.uint8](BR * BC // 2)
     var bsc = ctx.enqueue_create_buffer[DType.uint8](BR * BC // 16)

@@ -9,6 +9,7 @@ from src.norm import rmsnorm_f16
 from src.activation import silu_mul_f16
 from src.rope import rope_neox_f16
 from src.gemv import gemv_q8_0_f16, gemv_f16
+from src.gemv2 import gemv_q4_k_f16_v2, gemv_q4_k_out_f32_v2
 from src.attention import attn_decode_f16_hd64
 from src.kv_append import kv_append_f16
 from src.qkv_post import qkv_post_f16
@@ -21,6 +22,16 @@ comptime EPS: Float32 = 1e-6
 def _fill(i: Int) -> Float32:
     # Deterministic pseudo-data with sign changes and magnitude variation.
     return Float32((i * 37 % 19) - 9) * 0.25
+
+
+def _gsm_ref(sm4: Int, s: Int, sp4: Int, j: Int) -> Tuple[Float32, Float32]:
+    # Independent CPU oracle for llama.cpp get_scale_min_k4:
+    # sm4 = scales[j-4] (ignored for j < 4), s = scales[j], sp4 = scales[j+4].
+    if j < 4:
+        return (Float32(s & 63), Float32(sp4 & 63))
+    sc = (sp4 & 0x0F) | ((sm4 >> 6) << 4)
+    mn = (sp4 >> 4) | ((s >> 6) << 4)
+    return (Float32(sc), Float32(mn))
 
 
 def main() raises:
@@ -172,6 +183,93 @@ def main() raises:
     print("gemv_q8_0 max_rel_err:", max_err)
     if max_err > 0.02:
         raise Error("gemv_q8_0_f16 numeric check FAILED")
+
+    # --- gemv q4_k (v2, warp-per-row) ---
+    comptime ROWS_K = 17  # odd row count exercises the row guard
+    comptime COLS_K = 512  # two 256-element superblocks per row
+    comptime KBLOCKS = COLS_K // 256
+    var wk4 = ctx.enqueue_create_buffer[DType.uint8](ROWS_K * KBLOCKS * 144)
+    var xk = ctx.enqueue_create_buffer[DType.float16](COLS_K)
+    var yk = ctx.enqueue_create_buffer[DType.float16](ROWS_K)
+    var yk32 = ctx.enqueue_create_buffer[DType.float32](ROWS_K)
+    var expected_k = List[Float32]()
+    with wk4.map_to_host() as wh, xk.map_to_host() as xh:
+        for c in range(COLS_K):
+            xh[c] = Float16(_fill(c) * 0.1)
+        for r in range(ROWS_K):
+            var acc: Float32 = 0.0
+            for bl in range(KBLOCKS):
+                off = (r * KBLOCKS + bl) * 144
+                d = Float16(0.008 + Float32((r + bl) % 7) * 0.004)
+                dmin = Float16(0.005 + Float32((r + 2 * bl) % 5) * 0.003)
+                bits = d.to_bits()
+                wh[off] = UInt8(bits & 0xFF)
+                wh[off + 1] = UInt8((bits >> 8) & 0xFF)
+                bits = dmin.to_bits()
+                wh[off + 2] = UInt8(bits & 0xFF)
+                wh[off + 3] = UInt8((bits >> 8) & 0xFF)
+                # Arbitrary scale bytes exercise both get_scale_min_k4
+                # branches including the high 2 bits.
+                for i in range(12):
+                    wh[off + 4 + i] = UInt8((r * 53 + bl * 19 + i * 41 + 7) % 256)
+                for i in range(128):
+                    wh[off + 16 + i] = UInt8((r * 31 + bl * 17 + i * 13) % 256)
+                # CPU reference (dequant.rs dq_q4_k semantics).
+                for j64 in range(4):
+                    j1 = 2 * j64
+                    j2 = 2 * j64 + 1
+                    sc1, mn1 = _gsm_ref(
+                        Int(wh[off + j1]) if j1 >= 4 else 0,
+                        Int(wh[off + 4 + j1]),
+                        Int(wh[off + 8 + j1]),
+                        j1,
+                    )
+                    sc2, mn2 = _gsm_ref(
+                        Int(wh[off + j2]) if j2 >= 4 else 0,
+                        Int(wh[off + 4 + j2]),
+                        Int(wh[off + 8 + j2]),
+                        j2,
+                    )
+                    for i in range(32):
+                        qb = Int(wh[off + 16 + j64 * 32 + i])
+                        col_lo = bl * 256 + j64 * 64 + i
+                        col_hi = col_lo + 32
+                        xlo = Float32(Float16(_fill(col_lo) * 0.1))
+                        xhi = Float32(Float16(_fill(col_hi) * 0.1))
+                        acc += (Float32(d) * sc1 * Float32(qb & 0x0F) - Float32(dmin) * mn1) * xlo
+                        acc += (Float32(d) * sc2 * Float32(qb >> 4) - Float32(dmin) * mn2) * xhi
+            expected_k.append(acc)
+    ctx.enqueue_function[gemv_q4_k_f16_v2](
+        yk.unsafe_ptr(), wk4.unsafe_ptr(), xk.unsafe_ptr(), COLS_K, ROWS_K,
+        grid_dim=(ROWS_K + 7) // 8, block_dim=256,
+    )
+    ctx.enqueue_function[gemv_q4_k_out_f32_v2](
+        yk32.unsafe_ptr(), wk4.unsafe_ptr(), xk.unsafe_ptr(), COLS_K, ROWS_K,
+        grid_dim=(ROWS_K + 7) // 8, block_dim=256,
+    )
+    ctx.synchronize()
+
+    max_err = 0.0
+    with yk.map_to_host() as yh:
+        for r in range(ROWS_K):
+            err = abs(Float32(yh[r]) - expected_k[r])
+            rel = err / (abs(expected_k[r]) + 1.0)
+            if rel > max_err:
+                max_err = rel
+    print("gemv_q4_k max_rel_err:", max_err)
+    if max_err > 0.02:
+        raise Error("gemv_q4_k_f16_v2 numeric check FAILED")
+
+    max_err = 0.0
+    with yk32.map_to_host() as yh:
+        for r in range(ROWS_K):
+            err = abs(yh[r] - expected_k[r])
+            rel = err / (abs(expected_k[r]) + 1.0)
+            if rel > max_err:
+                max_err = rel
+    print("gemv_q4_k_out_f32 max_rel_err:", max_err)
+    if max_err > 0.02:
+        raise Error("gemv_q4_k_out_f32_v2 numeric check FAILED")
 
     # --- gemv f16 ---
     var wf = ctx.enqueue_create_buffer[DType.float16](ROWS_G * COLS_G)

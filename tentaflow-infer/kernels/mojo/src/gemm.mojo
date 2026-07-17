@@ -24,9 +24,9 @@ from std.gpu.memory import (
     async_copy_commit_group,
     async_copy_wait_group,
 )
-from std.memory import stack_allocation
+from std.memory import bitcast, stack_allocation
 from std.gpu.compute.mma import mma, ld_matrix
-from src.gemv2 import _e2m1x8, _f8e4m3s
+from src.gemv2 import _e2m1x8, _f8e4m3s, _q4k_scale_min
 
 comptime WARP = 32
 comptime BN = 64
@@ -327,6 +327,146 @@ def gemm_q8_0_impl[BM: Int, NW: Int](
     _store_tile(y, acc, t0, row0, warp_m, warp_n, group, tid4, n_rows, n_tokens)
 
 
+def gemm_q4_k_impl[BM: Int, NW: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    """Q4_K tensor-core GEMM. Grid (ceil(rows/64), ceil(T/BM)), block NW*32,
+    n_cols % 256 == 0 (whole 144-byte superblocks per row). Each 32-col stage
+    covers one 6-bit-scaled sub-block: nibbles are dequantized to f16 in
+    registers (prefetched a stage ahead) and staged to smem like Q8_0."""
+    comptime XTILE = BM * LDK
+    comptime NT = NW * WARP
+    comptime x_rpp = NT // 4
+    comptime w_passes = (BN * 4) // NT
+    comptime m_warps = BM // 32
+
+    tid = Int(thread_idx.x)
+    lane = tid % WARP
+    wid = tid // WARP
+    row0 = Int(block_idx.x) * BN
+    t0 = Int(block_idx.y) * BM
+
+    xs = stack_allocation[2 * XTILE, Float16, address_space = AddressSpace.SHARED]()
+    ws = stack_allocation[2 * WTILE, Float16, address_space = AddressSpace.SHARED]()
+
+    xrow = tid // 4
+    kc8 = (tid % 4) * 8
+    var xr0 = t0 + xrow
+    if xr0 > n_tokens - 1:
+        xr0 = n_tokens - 1
+    var xr1 = t0 + xrow + x_rpp
+    if xr1 > n_tokens - 1:
+        xr1 = n_tokens - 1
+    xsrc0 = (x + xr0 * n_cols + kc8).address_space_cast[AddressSpace.GLOBAL]()
+    xsrc1 = (x + xr1 * n_cols + kc8).address_space_cast[AddressSpace.GLOBAL]()
+    xdst0 = xs + xrow * LDK + kc8
+    xdst1 = xdst0 + x_rpp * LDK
+
+    # W staging: 4 threads per row, 8 nibbles each; one sub-block per stage.
+    part = tid % 4
+    blocks_per_row = n_cols // 256
+    var wbase = InlineArray[UnsafePointer[UInt8, MutAnyOrigin], w_passes](
+        uninitialized=True
+    )
+
+    comptime for wp in range(w_passes):
+        var wrow = row0 + tid // 4 + wp * (NT // 4)
+        if wrow > n_rows - 1:
+            wrow = n_rows - 1
+        wbase[wp] = w + wrow * blocks_per_row * 144
+    wdst = ws + (tid // 4) * LDW + part * 8
+
+    group = lane >> 2
+    tid4 = lane & 3
+    warp_m = (wid % m_warps) * 32
+    warp_n = (wid // m_warps) * 32
+    sub = lane // 8
+    lr = lane % 8
+    a_base = xs + (warp_m + (sub % 2) * 8 + lr) * LDK + (sub // 2) * 8
+    b_base = ws + (warp_n + lr) * LDW + (sub % 2) * 8
+
+    var acc = InlineArray[SIMD[DType.float32, 4], 8](fill=SIMD[DType.float32, 4](0.0))
+    n_stages = n_cols // BK
+
+    def fetch_w(
+        s: Int,
+        part: Int,
+        wbase: InlineArray[UnsafePointer[UInt8, MutAnyOrigin], w_passes],
+        mut dsc: InlineArray[Float32, w_passes],
+        mut dmn: InlineArray[Float32, w_passes],
+        mut qv: InlineArray[SIMD[DType.uint8, 8], w_passes],
+        mut high: InlineArray[Bool, w_passes],
+    ):
+        k0 = s * BK
+        boff = (k0 // 256) * 144
+        j = (k0 % 256) // 32
+        chunk = (k0 % 256) // 64
+        is_high = (k0 % 64) == 32
+
+        comptime for wp in range(w_passes):
+            hdr = (wbase[wp] + boff).load[width=16, alignment=16]()
+            dm = bitcast[DType.float16, 8](hdr)
+            sc, mn = _q4k_scale_min(hdr, j)
+            dsc[wp] = Float32(dm[0]) * sc
+            dmn[wp] = Float32(dm[1]) * mn
+            qv[wp] = (wbase[wp] + boff + 16 + chunk * 32 + part * 8).load[
+                width=8, alignment=8
+            ]()
+            high[wp] = is_high
+
+    _issue_x[BM, NW](0, n_cols, kc8, xsrc0, xsrc1, xdst0, xdst1)
+    async_copy_commit_group()
+    var dsc = InlineArray[Float32, w_passes](fill=0.0)
+    var dmn = InlineArray[Float32, w_passes](fill=0.0)
+    var qv = InlineArray[SIMD[DType.uint8, 8], w_passes](
+        fill=SIMD[DType.uint8, 8](0)
+    )
+    var high = InlineArray[Bool, w_passes](fill=False)
+    fetch_w(0, part, wbase, dsc, dmn, qv, high)
+
+    var s = 0
+    while s < n_stages:
+        if s + 1 < n_stages:
+            _issue_x[BM, NW](s + 1, n_cols, kc8, xsrc0, xsrc1, xdst0, xdst1)
+            async_copy_commit_group()
+
+        comptime for wp in range(w_passes):
+            var nib: SIMD[DType.uint8, 8]
+            if high[wp]:
+                nib = qv[wp] >> 4
+            else:
+                nib = qv[wp] & 0x0F
+            wv = nib.cast[DType.float16]() * Float16(dsc[wp]) - Float16(dmn[wp])
+            (wdst + (s % 2) * WTILE + wp * (NT // 4) * LDW).store[
+                width=8, alignment=16
+            ](wv)
+        if s + 1 < n_stages:
+            fetch_w(s + 1, part, wbase, dsc, dmn, qv, high)
+            async_copy_wait_group(1)
+        else:
+            async_copy_wait_group(0)
+        barrier()
+
+        buf = s % 2
+        comptime for k16 in range(BK // 16):
+            comptime kb = k16 * 16
+            a0 = ld_matrix[8](a_base + buf * XTILE + kb)
+            a1 = ld_matrix[8](a_base + buf * XTILE + kb + 16 * LDK)
+            comptime for ni in range(4):
+                b = ld_matrix[4](b_base + buf * WTILE + ni * 8 * LDW + kb)
+                mma(acc[ni], a0, b, acc[ni])
+                mma(acc[4 + ni], a1, b, acc[4 + ni])
+        barrier()
+        s += 1
+
+    _store_tile(y, acc, t0, row0, warp_m, warp_n, group, tid4, n_rows, n_tokens)
+
+
 def gemm_nvfp4_impl[BM: Int, NW: Int](
     y: UnsafePointer[Float16, MutAnyOrigin],
     packed: UnsafePointer[UInt8, MutAnyOrigin],
@@ -467,5 +607,7 @@ comptime gemm_f16 = gemm_f16_impl[128, 8]
 comptime gemm_f16_bm64 = gemm_f16_impl[64, 4]
 comptime gemm_q8_0_f16 = gemm_q8_0_impl[128, 8]
 comptime gemm_q8_0_f16_bm64 = gemm_q8_0_impl[64, 4]
+comptime gemm_q4_k_f16 = gemm_q4_k_impl[128, 8]
+comptime gemm_q4_k_f16_bm64 = gemm_q4_k_impl[64, 4]
 comptime gemm_nvfp4_f16 = gemm_nvfp4_impl[128, 8]
 comptime gemm_nvfp4_f16_bm64 = gemm_nvfp4_impl[64, 4]

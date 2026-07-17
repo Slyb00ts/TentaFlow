@@ -148,6 +148,117 @@ fn gemv_q8_0_matches_formats_dequant() {
     }
 }
 
+/// Deterministic Q4_K stream (144-byte superblocks) exercising both
+/// get_scale_min_k4 branches including the high 2 bits of every scale byte.
+fn build_q4k(rows: usize, cols: usize) -> Vec<u8> {
+    let blocks_per_row = cols / 256;
+    let mut wq = Vec::with_capacity(rows * blocks_per_row * 144);
+    for r in 0..rows {
+        for b in 0..blocks_per_row {
+            let d = f16::from_f32(0.008 + ((r + b) % 7) as f32 * 0.004);
+            let dmin = f16::from_f32(0.005 + ((r + 2 * b) % 5) as f32 * 0.003);
+            wq.extend_from_slice(&d.to_le_bytes());
+            wq.extend_from_slice(&dmin.to_le_bytes());
+            for i in 0..12 {
+                wq.push(((r * 53 + b * 19 + i * 41 + 7) % 256) as u8);
+            }
+            for i in 0..128 {
+                wq.push(((r * 31 + b * 17 + i * 13) % 256) as u8);
+            }
+        }
+    }
+    wq
+}
+
+#[test]
+fn gemv_q4_k_matches_formats_dequant() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    let (rows, cols) = (33usize, 512usize);
+    let wq = build_q4k(rows, cols);
+    let w_f32 =
+        forge_formats::dequant::dequantize_to_f32(DType::F32, QuantKind::Q4K, &wq, rows * cols)
+            .unwrap();
+
+    let x: Vec<f32> = (0..cols)
+        .map(|i| f16::from_f32(fill(i) * 0.1).to_f32())
+        .collect();
+    let xb = upload_f16(dev.as_ref(), &x);
+    let yb = upload_f16(dev.as_ref(), &vec![0.0; rows]);
+    let wb = dev.alloc(wq.len(), MemKind::Device, Pool::Weights).unwrap();
+    dev.write(&wq, &wb, 0).unwrap();
+
+    kernels
+        .gemv_q4_k_f16(&yb, &wb, &xb, rows, cols, &stream)
+        .unwrap();
+    dev.synchronize().unwrap();
+
+    let got = download_f16(dev.as_ref(), &yb, rows);
+    for r in 0..rows {
+        let want: f32 = (0..cols).map(|c| w_f32[r * cols + c] * x[c]).sum();
+        let rel = (got[r] - want).abs() / (want.abs() + 1.0);
+        assert!(rel < 0.02, "row {r}: got {} want {want}", got[r]);
+    }
+
+    // f32-logit variant over the same data.
+    let y32 = dev.alloc(rows * 4, MemKind::Device, Pool::Weights).unwrap();
+    kernels
+        .gemv_q4_k_out_f32(&y32, &wb, &xb, rows, cols, &stream)
+        .unwrap();
+    dev.synchronize().unwrap();
+    let mut bytes = vec![0u8; rows * 4];
+    dev.read(&y32, 0, &mut bytes).unwrap();
+    let got32: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    for r in 0..rows {
+        let want: f32 = (0..cols).map(|c| w_f32[r * cols + c] * x[c]).sum();
+        let rel = (got32[r] - want).abs() / (want.abs() + 1.0);
+        assert!(rel < 0.02, "row {r}: got {} want {want}", got32[r]);
+    }
+}
+
+#[test]
+fn gemm_q4_k_matches_formats_dequant() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    // Row/token tails on purpose (rows < 64, tokens not a tile multiple).
+    let (rows, cols, n_tokens) = (24usize, 512usize, 40usize);
+    let wq = build_q4k(rows, cols);
+    let w_f32 =
+        forge_formats::dequant::dequantize_to_f32(DType::F32, QuantKind::Q4K, &wq, rows * cols)
+            .unwrap();
+
+    let x: Vec<f32> = (0..n_tokens * cols)
+        .map(|i| f16::from_f32(fill(i) * 0.1).to_f32())
+        .collect();
+    let xb = upload_f16(dev.as_ref(), &x);
+    let yb = upload_f16(dev.as_ref(), &vec![0.0; n_tokens * rows]);
+    let wb = dev.alloc(wq.len(), MemKind::Device, Pool::Weights).unwrap();
+    dev.write(&wq, &wb, 0).unwrap();
+
+    kernels
+        .gemm_q4_k_f16(&yb, &wb, &xb, rows, cols, n_tokens, &stream)
+        .unwrap();
+    dev.synchronize().unwrap();
+
+    let got = download_f16(dev.as_ref(), &yb, n_tokens * rows);
+    for t in 0..n_tokens {
+        for r in 0..rows {
+            let want: f32 = (0..cols)
+                .map(|c| w_f32[r * cols + c] * x[t * cols + c])
+                .sum();
+            let rel = (got[t * rows + r] - want).abs() / (want.abs() + 1.0);
+            assert!(rel < 0.02, "t {t} row {r}: got {} want {want}", got[t * rows + r]);
+        }
+    }
+}
+
 #[test]
 fn gemv_nvfp4_matches_formats_dequant() {
     let Some(dev) = device() else { return };

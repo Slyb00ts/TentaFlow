@@ -28,6 +28,12 @@ pub enum DevWeight {
         rows: usize,
         cols: usize,
     },
+    /// GGML Q4_K superblock stream (144 bytes / 256 elements) for [rows, cols].
+    Q4K {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
     /// NVFP4 packed + FP8 scales (+ inverse global scale) for [rows, cols].
     NvFp4 {
         packed: DevBuffer,
@@ -43,6 +49,7 @@ impl DevWeight {
         match self {
             DevWeight::F16 { rows, .. }
             | DevWeight::Q8_0 { rows, .. }
+            | DevWeight::Q4K { rows, .. }
             | DevWeight::NvFp4 { rows, .. } => *rows,
         }
     }
@@ -51,6 +58,7 @@ impl DevWeight {
         match self {
             DevWeight::F16 { cols, .. }
             | DevWeight::Q8_0 { cols, .. }
+            | DevWeight::Q4K { cols, .. }
             | DevWeight::NvFp4 { cols, .. } => *cols,
         }
     }
@@ -293,6 +301,11 @@ enum HostWeight {
         rows: usize,
         cols: usize,
     },
+    Q4K {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
     NvFp4 {
         packed: Vec<u8>,
         scales: Vec<u8>,
@@ -307,6 +320,7 @@ impl HostWeight {
         match self {
             HostWeight::F16 { rows, .. }
             | HostWeight::Q8_0 { rows, .. }
+            | HostWeight::Q4K { rows, .. }
             | HostWeight::NvFp4 { rows, .. } => *rows,
         }
     }
@@ -315,6 +329,7 @@ impl HostWeight {
         match self {
             HostWeight::F16 { cols, .. }
             | HostWeight::Q8_0 { cols, .. }
+            | HostWeight::Q4K { cols, .. }
             | HostWeight::NvFp4 { cols, .. } => *cols,
         }
     }
@@ -369,6 +384,12 @@ fn fetch_matrix(src: &dyn TensorSource, name: &str) -> Result<HostWeight> {
     let (rows, cols) = (dims[0], dims[1]);
     match quant {
         QuantKind::Q8_0 => Ok(HostWeight::Q8_0 { data, rows, cols }),
+        // Whole 256-element superblocks per row keep every 144-byte block
+        // 16-byte aligned for the fused kernels' wide loads (Q4K_MAX_SEGS in
+        // gemv2.mojo bounds the shared x-sum staging).
+        QuantKind::Q4K if cols.is_multiple_of(256) && cols <= 32768 => {
+            Ok(HostWeight::Q4K { data, rows, cols })
+        }
         // Everything else goes through f32 → f16. This covers F16/F32/BF16
         // directly and any other GGML quant via the CPU reference dequant —
         // correctness first; fused kernels for more quants land per PLAN.
@@ -392,6 +413,11 @@ fn upload_weight(device: &dyn Device, w: HostWeight) -> Result<DevWeight> {
             cols,
         }),
         HostWeight::Q8_0 { data, rows, cols } => Ok(DevWeight::Q8_0 {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Q4K { data, rows, cols } => Ok(DevWeight::Q4K {
             buf: upload(device, &data)?,
             rows,
             cols,
@@ -427,6 +453,7 @@ fn fuse_rows(mut parts: Vec<HostWeight>) -> std::result::Result<HostWeight, Vec<
     match &parts[0] {
         HostWeight::F16 { .. } if parts.iter().all(|p| matches!(p, HostWeight::F16 { .. })) => {}
         HostWeight::Q8_0 { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q8_0 { .. })) => {}
+        HostWeight::Q4K { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q4K { .. })) => {}
         HostWeight::NvFp4 { global_scale, .. } => {
             let gs = global_scale.to_bits();
             let ok = parts.iter().all(
@@ -443,7 +470,8 @@ fn fuse_rows(mut parts: Vec<HostWeight>) -> std::result::Result<HostWeight, Vec<
     for p in parts {
         match (&mut fused, p) {
             (HostWeight::F16 { data, .. }, HostWeight::F16 { data: d, .. })
-            | (HostWeight::Q8_0 { data, .. }, HostWeight::Q8_0 { data: d, .. }) => {
+            | (HostWeight::Q8_0 { data, .. }, HostWeight::Q8_0 { data: d, .. })
+            | (HostWeight::Q4K { data, .. }, HostWeight::Q4K { data: d, .. }) => {
                 data.extend_from_slice(&d)
             }
             (
@@ -463,6 +491,7 @@ fn fuse_rows(mut parts: Vec<HostWeight>) -> std::result::Result<HostWeight, Vec<
     match &mut fused {
         HostWeight::F16 { rows: r, .. }
         | HostWeight::Q8_0 { rows: r, .. }
+        | HostWeight::Q4K { rows: r, .. }
         | HostWeight::NvFp4 { rows: r, .. } => *r = rows,
     }
     Ok(fused)

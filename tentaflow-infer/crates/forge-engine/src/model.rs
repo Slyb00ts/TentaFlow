@@ -20,6 +20,16 @@ use crate::weights::{DevWeight, GateUpWeights, ModelWeights, QkvWeights};
 /// prompts. Bounds the persistent prefill scratch allocation.
 pub const MAX_PREFILL_CHUNK: usize = 1024;
 
+/// Context splits for decode attention. Splitting shortens each warp's
+/// sequential online-softmax chain by this factor (decode runs one block per
+/// head — heavily latency-bound; 8 splits cut the attention kernel from
+/// ~24 us to ~7 us per layer on RTX 4090), at the cost of a regrouped
+/// softmax whose rounding differs slightly from the single-block order.
+/// Measured drift vs splits=1 over 16 greedy steps: logit max-abs-diff
+/// 0.087 (Bielik NVFP4) / 0.042 (Qwen3 Q8_0) with the argmax identical at
+/// every step. 1 reproduces the unsplit arithmetic bit-exactly.
+const ATTN_DECODE_SPLITS: usize = 8;
+
 /// Coarse per-phase wall-clock attribution for `prefill_chunk`, enabled by
 /// FORGE_PREFILL_TRACE=1. Every probe synchronizes the device, so absolute
 /// numbers are pessimistic (no inter-kernel overlap) — use the ratios.
@@ -120,6 +130,10 @@ pub struct Model {
 /// decode step CUDA-graph-replayable: only their contents change per token.
 struct DecodeBufs {
     h: DevBuffer,
+    /// Unrounded f32 mirror of the residual stream, written by the fused
+    /// gemv_residual kernels; the norm-recomputing kernels take their
+    /// sum-of-squares from it (rmsnorm_residual_f16's exact dataflow).
+    h32: DevBuffer,
     x: DevBuffer,
     /// Fused q|k|v output ([q_dim + 2*kv_dim]); q starts at offset 0, so the
     /// attention kernel reads it directly. Split-layer fallbacks use q/k/v.
@@ -128,6 +142,9 @@ struct DecodeBufs {
     k: DevBuffer,
     v: DevBuffer,
     attn_out: DevBuffer,
+    /// Split-attention partials: [n_heads, ATTN_DECODE_SPLITS, head_dim + 2]
+    /// f32 (unnormalized acc + running max + running sum per split).
+    attn_parts: DevBuffer,
     o_out: DevBuffer,
     /// Fused gate|up output ([2*inter]); split-layer fallbacks use gate/up.
     gate_up: DevBuffer,
@@ -214,12 +231,18 @@ impl Model {
         let alloc = |elems: usize| device.alloc(elems * 2, MemKind::Device, Pool::Activations);
         let bufs = DecodeBufs {
             h: alloc(hidden)?,
+            h32: device.alloc(hidden * 4, MemKind::Device, Pool::Activations)?,
             x: alloc(hidden)?,
             qkv: alloc(q_dim + 2 * kv_dim)?,
             q: alloc(q_dim)?,
             k: alloc(kv_dim)?,
             v: alloc(kv_dim)?,
             attn_out: alloc(q_dim)?,
+            attn_parts: device.alloc(
+                p.n_heads * ATTN_DECODE_SPLITS * (p.head_dim + 2) * 4,
+                MemKind::Device,
+                Pool::Activations,
+            )?,
             o_out: alloc(hidden)?,
             gate_up: alloc(2 * inter)?,
             gate: alloc(inter)?,
@@ -264,6 +287,9 @@ impl Model {
             DevWeight::Q8_0 { buf, rows, cols } => {
                 self.kernels.gemv_q8_0_f16(y, buf, x, *rows, *cols, stream)
             }
+            DevWeight::Q4K { buf, rows, cols } => {
+                self.kernels.gemv_q4_k_f16(y, buf, x, *rows, *cols, stream)
+            }
             DevWeight::NvFp4 {
                 packed,
                 scales,
@@ -283,6 +309,163 @@ impl Model {
         }
     }
 
+    /// True when `w` can be consumed by the fused decode kernels
+    /// (gemv_norm / gemv_norm_silu / gemv_residual format + column coverage).
+    fn fused_decode_weight_ok(w: &DevWeight) -> bool {
+        match w {
+            DevWeight::F16 { cols, .. } => cols.is_multiple_of(8),
+            DevWeight::Q8_0 { cols, .. } => cols.is_multiple_of(32),
+            DevWeight::NvFp4 { cols, .. } => cols.is_multiple_of(16),
+            DevWeight::Q4K { .. } => false,
+        }
+    }
+
+    /// The fused decode step needs every layer's QKV and gate|up projections
+    /// as fused matrices (the residual stream is carried as an (h, h32) pair
+    /// with no standalone normed-x buffer) and a hidden size that fits the
+    /// kernels' shared-memory staging. Anything else records the separate
+    /// per-kernel chain.
+    fn fused_decode_supported(&self) -> bool {
+        let p = &self.weights.descriptor.params;
+        if p.hidden_size > 8192 {
+            return false;
+        }
+        self.weights.layers.iter().all(|l| {
+            let qkv_ok = match &l.attn_qkv {
+                QkvWeights::Fused(w) => Self::fused_decode_weight_ok(w),
+                QkvWeights::Split { .. } => false,
+            };
+            let gate_up_ok = match &l.ffn_gate_up {
+                GateUpWeights::Fused(w) => Self::fused_decode_weight_ok(w),
+                GateUpWeights::Split { .. } => false,
+            };
+            qkv_ok
+                && gate_up_ok
+                && Self::fused_decode_weight_ok(&l.attn_o)
+                && Self::fused_decode_weight_ok(&l.ffn_down)
+        })
+    }
+
+    /// Fused rmsnorm-recompute + GEMV over the decode residual pair (h, h32).
+    fn gemv_norm(
+        &self,
+        y: &DevBuffer,
+        w: &DevWeight,
+        norm_w: &DevBuffer,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let b = &self.bufs;
+        match w {
+            DevWeight::F16 { buf, rows, cols } => self.kernels.gemv_norm_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Q8_0 { buf, rows, cols } => self.kernels.gemv_norm_q8_0_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::NvFp4 {
+                packed,
+                scales,
+                inv_global_scale,
+                rows,
+                cols,
+            } => self.kernels.gemv_norm_nvfp4_f16(
+                y,
+                packed,
+                scales,
+                &b.h,
+                &b.h32,
+                norm_w,
+                *rows,
+                *cols,
+                *inv_global_scale,
+                ss_from_h16,
+                eps,
+                stream,
+            ),
+            DevWeight::Q4K { .. } => Err(ForgeError::Unsupported(
+                "Q4_K has no fused gemv_norm decode kernel".into(),
+            )),
+        }
+    }
+
+    /// Fused rmsnorm-recompute + gate|up GEMV + SiLU. `w` is the fused
+    /// gate|up matrix; its row count is 2 * inter.
+    fn gemv_norm_silu(
+        &self,
+        act: &DevBuffer,
+        w: &DevWeight,
+        norm_w: &DevBuffer,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let b = &self.bufs;
+        match w {
+            DevWeight::F16 { buf, rows, cols } => self.kernels.gemv_norm_silu_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Q8_0 { buf, rows, cols } => self.kernels.gemv_norm_silu_q8_0_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::NvFp4 {
+                packed,
+                scales,
+                inv_global_scale,
+                rows,
+                cols,
+            } => self.kernels.gemv_norm_silu_nvfp4_f16(
+                act,
+                packed,
+                scales,
+                &b.h,
+                &b.h32,
+                norm_w,
+                rows / 2,
+                *cols,
+                *inv_global_scale,
+                eps,
+                stream,
+            ),
+            DevWeight::Q4K { .. } => Err(ForgeError::Unsupported(
+                "Q4_K has no fused gemv_norm_silu decode kernel".into(),
+            )),
+        }
+    }
+
+    /// GEMV + residual add into the decode residual pair (h, h32).
+    fn gemv_residual(&self, w: &DevWeight, x: &DevBuffer, stream: &Stream) -> Result<()> {
+        let b = &self.bufs;
+        match w {
+            DevWeight::F16 { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Q8_0 { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_q8_0_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::NvFp4 {
+                packed,
+                scales,
+                inv_global_scale,
+                rows,
+                cols,
+            } => self.kernels.gemv_residual_nvfp4_f16(
+                &b.h,
+                &b.h32,
+                packed,
+                scales,
+                x,
+                *rows,
+                *cols,
+                *inv_global_scale,
+                stream,
+            ),
+            DevWeight::Q4K { .. } => Err(ForgeError::Unsupported(
+                "Q4_K has no fused gemv_residual decode kernel".into(),
+            )),
+        }
+    }
+
     fn logits_gemv(&self, y_f32: &DevBuffer, x: &DevBuffer, stream: &Stream) -> Result<()> {
         match &self.weights.lm_head {
             DevWeight::F16 { buf, rows, cols } => self
@@ -291,6 +474,9 @@ impl Model {
             DevWeight::Q8_0 { buf, rows, cols } => self
                 .kernels
                 .gemv_q8_0_out_f32(y_f32, buf, x, *rows, *cols, stream),
+            DevWeight::Q4K { buf, rows, cols } => self
+                .kernels
+                .gemv_q4_k_out_f32(y_f32, buf, x, *rows, *cols, stream),
             DevWeight::NvFp4 { .. } => Err(ForgeError::Unsupported(
                 "NVFP4 lm_head has no f32-logit kernel yet".into(),
             )),
@@ -339,6 +525,16 @@ impl Model {
                 y,
                 buf,
                 row_off * (cols / 32) * 34,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Q4K { buf, cols, .. } => self.kernels.gemm_q4_k_f16_at(
+                y,
+                buf,
+                row_off * (cols / 256) * 144,
                 x,
                 n_rows,
                 *cols,
@@ -686,6 +882,9 @@ impl Model {
 
         self.device.begin_capture(stream)?;
         let record = || -> Result<()> {
+            if self.fused_decode_supported() {
+                return self.record_step_fused();
+            }
             kernels.gather_rows_f16(&b.h, &self.weights.token_embd_f16, &b.ids, 1, hidden, stream)?;
             kernels.rmsnorm_f16(&b.x, &b.h, &self.weights.layers[0].attn_norm, 1, hidden, eps, stream)?;
 
@@ -813,5 +1012,88 @@ impl Model {
                 Err(e)
             }
         }
+    }
+
+    /// Fused decode step: six launches per layer instead of nine. The
+    /// residual stream is carried as the (h f16, h32 f32) pair — every
+    /// norm-consuming kernel recomputes the RMSNorm per block from that pair
+    /// (bit-identical to the separate rmsnorm kernels, see decode_fused.mojo)
+    /// and attn_decode_split folds the whole qkv_post stage into the
+    /// attention prologue (the split/combine pair fills the GPU where one
+    /// block per head could not). Layer 0 sums squares from h directly (h32
+    /// is only materialized by the first gemv_residual of the step).
+    fn record_step_fused(&self) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let hidden = p.hidden_size;
+        let eps = p.rms_norm_eps;
+        let kernels = &self.kernels;
+        let stream = &self.stream;
+        let b = &self.bufs;
+        let scale = 1.0 / (p.head_dim as f32).sqrt();
+        let q_dim = p.n_heads * p.head_dim;
+        let kv_dim = p.n_kv_heads * p.head_dim;
+        let k_byte_off = q_dim * 2;
+        let v_byte_off = (q_dim + kv_dim) * 2;
+
+        kernels.gather_rows_f16(&b.h, &self.weights.token_embd_f16, &b.ids, 1, hidden, stream)?;
+
+        let n_layers = self.weights.layers.len();
+        for l in 0..n_layers {
+            let layer = &self.weights.layers[l];
+            let QkvWeights::Fused(w_qkv) = &layer.attn_qkv else {
+                return Err(ForgeError::Kernel(
+                    "fused decode step requires a fused qkv matrix".into(),
+                ));
+            };
+            let GateUpWeights::Fused(w_gate_up) = &layer.ffn_gate_up else {
+                return Err(ForgeError::Kernel(
+                    "fused decode step requires a fused gate|up matrix".into(),
+                ));
+            };
+
+            self.gemv_norm(&b.qkv, w_qkv, &layer.attn_norm, l == 0, eps, stream)?;
+            kernels.attn_decode_split_f16(
+                &b.attn_parts,
+                &b.qkv,
+                0,
+                &b.qkv,
+                k_byte_off,
+                &b.qkv,
+                v_byte_off,
+                layer.q_norm.as_ref(),
+                layer.k_norm.as_ref(),
+                &self.kv.k[l],
+                &self.kv.v[l],
+                &self.page_table_dev,
+                &self.seq_len_dev,
+                &b.pos,
+                1,
+                p.n_heads,
+                p.n_kv_heads,
+                p.head_dim,
+                self.kv.cfg.page_size,
+                self.max_pages_per_seq,
+                ATTN_DECODE_SPLITS,
+                eps,
+                p.rope_theta,
+                scale,
+                stream,
+            )?;
+            kernels.attn_decode_combine_f16(
+                &b.attn_out,
+                &b.attn_parts,
+                1,
+                p.n_heads,
+                p.head_dim,
+                ATTN_DECODE_SPLITS,
+                stream,
+            )?;
+            self.gemv_residual(&layer.attn_o, &b.attn_out, stream)?;
+            self.gemv_norm_silu(&b.act, w_gate_up, &layer.ffn_norm, eps, stream)?;
+            self.gemv_residual(&layer.ffn_down, &b.act, stream)?;
+        }
+
+        kernels.rmsnorm_h32_f16(&b.x, &b.h, &b.h32, &self.weights.output_norm, 1, hidden, eps, stream)?;
+        self.logits_gemv(&b.logits, &b.x, stream)
     }
 }
