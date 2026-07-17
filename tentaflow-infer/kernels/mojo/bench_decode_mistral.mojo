@@ -8,6 +8,10 @@ from src.gemv2 import gemv_q4_k_f16_v2, gemv_q6_k_f16_v2, gemv_q6_k_out_f32_v2
 from src.decode_fused import gemv_norm_q4_k_f16, gemv_norm_q6_k_f16
 from src.decode_fused import gemv_norm_silu_q4_k_f16
 from src.decode_fused import gemv_residual_q4_k_f16, gemv_residual_q6_k_f16
+from src.decode_dp4a import gemv_norm_q4_k_dp4a_f16, gemv_norm_q6_k_dp4a_f16
+from src.decode_dp4a import gemv_norm_silu_q4_k_dp4a_f16
+from src.decode_dp4a import gemv_residual_q4_k_dp4a_f16, gemv_residual_q6_k_dp4a_f16
+from src.decode_dp4a import gemv_q4_k_dp4a_f16, gemv_q6_k_dp4a_out_f32
 
 comptime HID = 4096
 comptime QDIM = 4096
@@ -151,3 +155,103 @@ def main() raises:
     ms = Float64(t1 - t0) / 1e6 / ITERS
     bts = Float64(VOCAB * (HID // 256) * 210)
     print("gemv_q6k_f32  32768x4096:", ms, "ms ", bts / (ms / 1e3) / 1e9, "GB/s")
+
+    # ---- dp4a (int8-activation) variants of the same launches ----
+    t0 = perf_counter_ns()
+    for _ in range(ITERS):
+        ctx.enqueue_function[gemv_norm_q4_k_dp4a_f16](
+            yq.unsafe_ptr(), wq4_q.unsafe_ptr(), h.unsafe_ptr(), h32.unsafe_ptr(),
+            nw.unsafe_ptr(), HID, QDIM, 0, EPS, 2,
+            grid_dim=(QDIM + 15) // 16, block_dim=256,
+        )
+    ctx.synchronize()
+    t1 = perf_counter_ns()
+    ms = Float64(t1 - t0) / 1e6 / ITERS
+    bts = Float64(QDIM * (HID // 256) * 144)
+    print("dp4a_norm_q4k 4096x4096:", ms, "ms ", bts / (ms / 1e3) / 1e9, "GB/s")
+
+    t0 = perf_counter_ns()
+    for _ in range(ITERS):
+        ctx.enqueue_function[gemv_q4_k_dp4a_f16](
+            yq.unsafe_ptr(), wq4_q.unsafe_ptr(), h.unsafe_ptr(), HID, QDIM,
+            grid_dim=(QDIM + 7) // 8, block_dim=256,
+        )
+    ctx.synchronize()
+    t1 = perf_counter_ns()
+    ms = Float64(t1 - t0) / 1e6 / ITERS
+    print("dp4a_q4k      4096x4096:", ms, "ms ", bts / (ms / 1e3) / 1e9, "GB/s")
+
+    t0 = perf_counter_ns()
+    for _ in range(ITERS):
+        ctx.enqueue_function[gemv_norm_q4_k_dp4a_f16](
+            ykv.unsafe_ptr(), wq4_kv.unsafe_ptr(), h.unsafe_ptr(), h32.unsafe_ptr(),
+            nw.unsafe_ptr(), HID, KVDIM, 0, EPS, 1,
+            grid_dim=(KVDIM + 7) // 8, block_dim=256,
+        )
+    ctx.synchronize()
+    t1 = perf_counter_ns()
+    ms = Float64(t1 - t0) / 1e6 / ITERS
+    bts = Float64(KVDIM * (HID // 256) * 144)
+    print("dp4a_norm_q4k 1024x4096:", ms, "ms ", bts / (ms / 1e3) / 1e9, "GB/s")
+
+    t0 = perf_counter_ns()
+    for _ in range(ITERS):
+        ctx.enqueue_function[gemv_norm_q6_k_dp4a_f16](
+            ykv.unsafe_ptr(), wq6_kv.unsafe_ptr(), h.unsafe_ptr(), h32.unsafe_ptr(),
+            nw.unsafe_ptr(), HID, KVDIM, 0, EPS, 1,
+            grid_dim=(KVDIM + 7) // 8, block_dim=256,
+        )
+    ctx.synchronize()
+    t1 = perf_counter_ns()
+    ms = Float64(t1 - t0) / 1e6 / ITERS
+    bts = Float64(KVDIM * (HID // 256) * 210)
+    print("dp4a_norm_q6k 1024x4096:", ms, "ms ", bts / (ms / 1e3) / 1e9, "GB/s")
+
+    t0 = perf_counter_ns()
+    for _ in range(ITERS):
+        ctx.enqueue_function[gemv_residual_q4_k_dp4a_f16](
+            h.unsafe_ptr(), h32.unsafe_ptr(), wq4_q.unsafe_ptr(), yq.unsafe_ptr(), QDIM, HID,
+            grid_dim=(HID + 7) // 8, block_dim=256,
+        )
+    ctx.synchronize()
+    t1 = perf_counter_ns()
+    ms = Float64(t1 - t0) / 1e6 / ITERS
+    bts = Float64(HID * (QDIM // 256) * 144)
+    print("dp4a_res_q4k  4096x4096:", ms, "ms ", bts / (ms / 1e3) / 1e9, "GB/s")
+
+    t0 = perf_counter_ns()
+    for _ in range(ITERS):
+        ctx.enqueue_function[gemv_norm_silu_q4_k_dp4a_f16](
+            act.unsafe_ptr(), wq4_gu.unsafe_ptr(), h.unsafe_ptr(), h32.unsafe_ptr(),
+            nw.unsafe_ptr(), HID, INTER, EPS, 7,
+            grid_dim=(INTER + 55) // 56, block_dim=256,
+        )
+    ctx.synchronize()
+    t1 = perf_counter_ns()
+    ms = Float64(t1 - t0) / 1e6 / ITERS
+    bts = Float64(2 * INTER * (HID // 256) * 144)
+    print("dp4a_silu_q4k 28672x4096:", ms, "ms ", bts / (ms / 1e3) / 1e9, "GB/s")
+
+    t0 = perf_counter_ns()
+    for _ in range(ITERS):
+        ctx.enqueue_function[gemv_residual_q6_k_dp4a_f16](
+            h.unsafe_ptr(), h32.unsafe_ptr(), wq6_down.unsafe_ptr(), x_inter.unsafe_ptr(), INTER, HID,
+            grid_dim=(HID + 7) // 8, block_dim=256,
+        )
+    ctx.synchronize()
+    t1 = perf_counter_ns()
+    ms = Float64(t1 - t0) / 1e6 / ITERS
+    bts = Float64(HID * (INTER // 256) * 210)
+    print("dp4a_res_q6k  4096x14336:", ms, "ms ", bts / (ms / 1e3) / 1e9, "GB/s")
+
+    t0 = perf_counter_ns()
+    for _ in range(ITERS):
+        ctx.enqueue_function[gemv_q6_k_dp4a_out_f32](
+            ylog.unsafe_ptr(), wq6_head.unsafe_ptr(), h.unsafe_ptr(), HID, VOCAB,
+            grid_dim=(VOCAB + 7) // 8, block_dim=256,
+        )
+    ctx.synchronize()
+    t1 = perf_counter_ns()
+    ms = Float64(t1 - t0) / 1e6 / ITERS
+    bts = Float64(VOCAB * (HID // 256) * 210)
+    print("dp4a_q6k_f32  32768x4096:", ms, "ms ", bts / (ms / 1e3) / 1e9, "GB/s")

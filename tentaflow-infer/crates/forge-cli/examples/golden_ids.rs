@@ -1,13 +1,16 @@
 // ===== File: golden_ids.rs — greedy token-id dump for bit-exactness gating =====
 // Usage: golden_ids <model> <prompt> <max_tokens> [prefill_chunk]
 // Drives Model::prefill_chunk + Model::step directly (no stream decoder, so
-// no ids are hidden by empty text pieces) and prints the greedy ids.
+// no ids are hidden by empty text pieces), then replays the same greedy
+// stream through the on-GPU sampler and fails on any divergence. Prints the
+// (identical) greedy ids.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use forge_engine::model::ModelConfig;
+use forge_engine::sample::{GpuSampler, SamplingParams};
 use forge_hal::cuda::CudaDevice;
 use forge_hal::Device;
 use forge_server::source::load_model;
@@ -56,6 +59,30 @@ fn main() -> Result<()> {
         ids.push(next);
     }
     model.release_seq(&mut seq);
+
+    // The GPU greedy sampler must reproduce the CPU argmax ids bit-exactly.
+    let params = SamplingParams {
+        temperature: 0.0,
+        ..SamplingParams::default()
+    };
+    let mut sampler = GpuSampler::new(params);
+    let mut seq = model.new_seq();
+    for chunk in prompt_tokens.chunks(prefill_chunk) {
+        model.prefill_chunk(&mut seq, chunk)?;
+    }
+    let mut gpu_ids = Vec::new();
+    let mut next = model.sample_last_logits(&mut sampler)?;
+    gpu_ids.push(next);
+    while gpu_ids.len() < max_tokens {
+        next = model.step_and_sample(&mut seq, next, &mut sampler)?;
+        gpu_ids.push(next);
+    }
+    model.release_seq(&mut seq);
+    if gpu_ids != ids {
+        bail!("GPU greedy sampling diverged from CPU argmax:\n  cpu: {ids:?}\n  gpu: {gpu_ids:?}");
+    }
+    eprintln!("gpu greedy path matches cpu argmax");
+
     let strs: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
     println!("[{}]", strs.join(", "));
     Ok(())

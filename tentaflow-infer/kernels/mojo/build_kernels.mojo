@@ -41,6 +41,64 @@ from src.decode_fused import rmsnorm_h32_f16
 from src.decode_fused import gemv_norm_q4_k_f16, gemv_norm_q6_k_f16
 from src.decode_fused import gemv_norm_silu_q4_k_f16, gemv_norm_silu_q6_k_f16
 from src.decode_fused import gemv_residual_q4_k_f16, gemv_residual_q6_k_f16
+from src.decode_dp4a import gemv_q8_0_dp4a_f16, gemv_q4_k_dp4a_f16, gemv_q4_k_dp4a_out_f32
+from src.decode_dp4a import gemv_norm_q8_0_dp4a_f16, gemv_norm_q4_k_dp4a_f16, gemv_norm_q6_k_dp4a_f16
+from src.decode_dp4a import gemv_norm_silu_q8_0_dp4a_f16, gemv_norm_silu_q4_k_dp4a_f16, gemv_norm_silu_q6_k_dp4a_f16
+from src.decode_dp4a import gemv_residual_q8_0_dp4a_f16, gemv_residual_q4_k_dp4a_f16
+from src.decode_dp4a import gemv_residual_q6_k_dp4a_f16, gemv_q6_k_dp4a_out_f32
+from src.gemv2 import gemv_q5_k_f16_v2, gemv_q5_k_out_f32_v2
+from src.gemm import gemm_q5_k_f16, gemm_q5_k_f16_bm64
+from src.decode_fused import gemv_norm_q5_k_f16, gemv_norm_silu_q5_k_f16, gemv_residual_q5_k_f16
+from src.gemv2 import gemv_q3_k_f16_v2, gemv_q3_k_out_f32_v2
+from src.gemm import gemm_q3_k_f16, gemm_q3_k_f16_bm64
+from src.decode_fused import gemv_norm_q3_k_f16, gemv_norm_silu_q3_k_f16, gemv_residual_q3_k_f16
+from src.gemv2 import gemv_q2_k_f16_v2, gemv_q2_k_out_f32_v2
+from src.gemm import gemm_q2_k_f16, gemm_q2_k_f16_bm64
+from src.decode_fused import gemv_norm_q2_k_f16, gemv_norm_silu_q2_k_f16, gemv_residual_q2_k_f16
+from src.gemv2 import gemv_q4_0_f16_v2, gemv_q4_0_out_f32_v2
+from src.gemm import gemm_q4_0_f16, gemm_q4_0_f16_bm64
+from src.decode_fused import gemv_norm_q4_0_f16, gemv_norm_silu_q4_0_f16, gemv_residual_q4_0_f16
+from src.gemv2 import gemv_q4_1_f16_v2, gemv_q4_1_out_f32_v2
+from src.gemm import gemm_q4_1_f16, gemm_q4_1_f16_bm64
+from src.decode_fused import gemv_norm_q4_1_f16, gemv_norm_silu_q4_1_f16, gemv_residual_q4_1_f16
+from src.gemv2 import gemv_q5_0_f16_v2, gemv_q5_0_out_f32_v2
+from src.gemm import gemm_q5_0_f16, gemm_q5_0_f16_bm64
+from src.decode_fused import gemv_norm_q5_0_f16, gemv_norm_silu_q5_0_f16, gemv_residual_q5_0_f16
+from src.gemv2 import gemv_q5_1_f16_v2, gemv_q5_1_out_f32_v2
+from src.gemm import gemm_q5_1_f16, gemm_q5_1_f16_bm64
+from src.decode_fused import gemv_norm_q5_1_f16, gemv_norm_silu_q5_1_f16, gemv_residual_q5_1_f16
+from src.gemv2 import gemv_iq4_nl_f16_v2, gemv_iq4_nl_out_f32_v2
+from src.gemv2 import gemv_iq4_xs_f16_v2, gemv_iq4_xs_out_f32_v2
+from src.gemv2 import gemv_mxfp4_f16_v2, gemv_mxfp4_out_f32_v2
+from src.gemm import gemm_iq4_nl_f16, gemm_iq4_nl_f16_bm64
+from src.gemm import gemm_iq4_xs_f16, gemm_iq4_xs_f16_bm64
+from src.gemm import gemm_mxfp4_gguf_f16, gemm_mxfp4_gguf_f16_bm64
+from src.decode_fused import gemv_norm_iq4_nl_f16, gemv_norm_silu_iq4_nl_f16, gemv_residual_iq4_nl_f16
+from src.decode_fused import gemv_norm_iq4_xs_f16, gemv_norm_silu_iq4_xs_f16, gemv_residual_iq4_xs_f16
+from src.decode_fused import gemv_norm_mxfp4_f16, gemv_norm_silu_mxfp4_f16, gemv_residual_mxfp4_f16
+from src.gemv2 import gemv_iq2_xs_f16_v2, gemv_iq2_xs_out_f32_v2
+from src.gemv2 import gemv_iq2_s_f16_v2, gemv_iq2_s_out_f32_v2
+from src.gemv2 import gemv_iq3_s_f16_v2, gemv_iq3_s_out_f32_v2
+from src.gemm import gemm_iq2_xs_f16, gemm_iq2_xs_f16_bm64
+from src.gemm import gemm_iq2_s_f16, gemm_iq2_s_f16_bm64
+from src.gemm import gemm_iq3_s_f16, gemm_iq3_s_f16_bm64
+from src.decode_fused import gemv_norm_iq2_xs_f16, gemv_norm_silu_iq2_xs_f16, gemv_residual_iq2_xs_f16
+from src.decode_fused import gemv_norm_iq2_s_f16, gemv_norm_silu_iq2_s_f16, gemv_residual_iq2_s_f16
+from src.decode_fused import gemv_norm_iq3_s_f16, gemv_norm_silu_iq3_s_f16, gemv_residual_iq3_s_f16
+from src.gemv2 import gemv_iq2_xxs_f16_v2, gemv_iq2_xxs_out_f32_v2
+from src.gemv2 import gemv_iq3_xxs_f16_v2, gemv_iq3_xxs_out_f32_v2
+from src.gemv2 import gemv_iq1_s_f16_v2, gemv_iq1_s_out_f32_v2
+from src.gemv2 import gemv_iq1_m_f16_v2, gemv_iq1_m_out_f32_v2
+from src.gemm import gemm_iq2_xxs_f16, gemm_iq2_xxs_f16_bm64
+from src.gemm import gemm_iq3_xxs_f16, gemm_iq3_xxs_f16_bm64
+from src.gemm import gemm_iq1_s_f16, gemm_iq1_s_f16_bm64
+from src.gemm import gemm_iq1_m_f16, gemm_iq1_m_f16_bm64
+from src.decode_fused import gemv_norm_iq2_xxs_f16, gemv_norm_silu_iq2_xxs_f16, gemv_residual_iq2_xxs_f16
+from src.decode_fused import gemv_norm_iq3_xxs_f16, gemv_norm_silu_iq3_xxs_f16, gemv_residual_iq3_xxs_f16
+from src.decode_fused import gemv_norm_iq1_s_f16, gemv_norm_silu_iq1_s_f16, gemv_residual_iq1_s_f16
+from src.decode_fused import gemv_norm_iq1_m_f16, gemv_norm_silu_iq1_m_f16, gemv_residual_iq1_m_f16
+from src.sampling import penalize_f32, argmax_partial_f32, argmax_final_f32
+from src.sampling import topk_partial_f32, topk_final_f32
 
 
 def _entry_from_ptx(ptx_path: Path) raises -> String:
@@ -271,6 +329,417 @@ def main() raises:
 
     _ = ctx.compile_function[gemv_residual_q6_k_f16, dump_asm=Path("gemv_residual_q6_k_f16.ptx")]()
     entries.append(_finalize(out_dir, "gemv_residual_q6_k_f16"))
+
+    _ = ctx.compile_function[gemv_q8_0_dp4a_f16, dump_asm=Path("gemv_q8_0_dp4a_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q8_0_dp4a_f16"))
+
+    _ = ctx.compile_function[gemv_q4_k_dp4a_f16, dump_asm=Path("gemv_q4_k_dp4a_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_f16"))
+
+    _ = ctx.compile_function[gemv_q4_k_dp4a_out_f32, dump_asm=Path("gemv_q4_k_dp4a_out_f32.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_out_f32"))
+
+    _ = ctx.compile_function[gemv_norm_q8_0_dp4a_f16, dump_asm=Path("gemv_norm_q8_0_dp4a_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_q8_0_dp4a_f16"))
+
+    _ = ctx.compile_function[gemv_norm_q4_k_dp4a_f16, dump_asm=Path("gemv_norm_q4_k_dp4a_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_q4_k_dp4a_f16"))
+
+    _ = ctx.compile_function[gemv_norm_q6_k_dp4a_f16, dump_asm=Path("gemv_norm_q6_k_dp4a_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_q6_k_dp4a_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_q8_0_dp4a_f16, dump_asm=Path("gemv_norm_silu_q8_0_dp4a_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_q8_0_dp4a_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_q4_k_dp4a_f16, dump_asm=Path("gemv_norm_silu_q4_k_dp4a_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_q4_k_dp4a_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_q6_k_dp4a_f16, dump_asm=Path("gemv_norm_silu_q6_k_dp4a_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_q6_k_dp4a_f16"))
+
+    _ = ctx.compile_function[gemv_residual_q8_0_dp4a_f16, dump_asm=Path("gemv_residual_q8_0_dp4a_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_q8_0_dp4a_f16"))
+
+    _ = ctx.compile_function[gemv_residual_q4_k_dp4a_f16, dump_asm=Path("gemv_residual_q4_k_dp4a_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_q4_k_dp4a_f16"))
+
+    _ = ctx.compile_function[gemv_residual_q6_k_dp4a_f16, dump_asm=Path("gemv_residual_q6_k_dp4a_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_q6_k_dp4a_f16"))
+
+    _ = ctx.compile_function[gemv_q6_k_dp4a_out_f32, dump_asm=Path("gemv_q6_k_dp4a_out_f32.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q6_k_dp4a_out_f32"))
+
+    _ = ctx.compile_function[penalize_f32, dump_asm=Path("penalize_f32.ptx")]()
+    entries.append(_finalize(out_dir, "penalize_f32"))
+
+    _ = ctx.compile_function[argmax_partial_f32, dump_asm=Path("argmax_partial_f32.ptx")]()
+    entries.append(_finalize(out_dir, "argmax_partial_f32"))
+
+    _ = ctx.compile_function[argmax_final_f32, dump_asm=Path("argmax_final_f32.ptx")]()
+    entries.append(_finalize(out_dir, "argmax_final_f32"))
+
+    _ = ctx.compile_function[topk_partial_f32, dump_asm=Path("topk_partial_f32.ptx")]()
+    entries.append(_finalize(out_dir, "topk_partial_f32"))
+
+    _ = ctx.compile_function[topk_final_f32, dump_asm=Path("topk_final_f32.ptx")]()
+    entries.append(_finalize(out_dir, "topk_final_f32"))
+
+    _ = ctx.compile_function[gemv_q5_k_f16_v2, dump_asm=Path("gemv_q5_k_f16_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q5_k_f16_v2"))
+
+    _ = ctx.compile_function[gemv_q5_k_out_f32_v2, dump_asm=Path("gemv_q5_k_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q5_k_out_f32_v2"))
+
+    _ = ctx.compile_function[gemv_q3_k_f16_v2, dump_asm=Path("gemv_q3_k_f16_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q3_k_f16_v2"))
+
+    _ = ctx.compile_function[gemv_q3_k_out_f32_v2, dump_asm=Path("gemv_q3_k_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q3_k_out_f32_v2"))
+
+    _ = ctx.compile_function[gemv_q2_k_f16_v2, dump_asm=Path("gemv_q2_k_f16_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q2_k_f16_v2"))
+
+    _ = ctx.compile_function[gemv_q2_k_out_f32_v2, dump_asm=Path("gemv_q2_k_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q2_k_out_f32_v2"))
+
+    _ = ctx.compile_function[gemv_q4_0_f16_v2, dump_asm=Path("gemv_q4_0_f16_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q4_0_f16_v2"))
+
+    _ = ctx.compile_function[gemv_q4_0_out_f32_v2, dump_asm=Path("gemv_q4_0_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q4_0_out_f32_v2"))
+
+    _ = ctx.compile_function[gemv_q4_1_f16_v2, dump_asm=Path("gemv_q4_1_f16_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q4_1_f16_v2"))
+
+    _ = ctx.compile_function[gemv_q4_1_out_f32_v2, dump_asm=Path("gemv_q4_1_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q4_1_out_f32_v2"))
+
+    _ = ctx.compile_function[gemv_q5_0_f16_v2, dump_asm=Path("gemv_q5_0_f16_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q5_0_f16_v2"))
+
+    _ = ctx.compile_function[gemv_q5_0_out_f32_v2, dump_asm=Path("gemv_q5_0_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q5_0_out_f32_v2"))
+
+    _ = ctx.compile_function[gemv_q5_1_f16_v2, dump_asm=Path("gemv_q5_1_f16_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q5_1_f16_v2"))
+
+    _ = ctx.compile_function[gemv_q5_1_out_f32_v2, dump_asm=Path("gemv_q5_1_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q5_1_out_f32_v2"))
+
+    _ = ctx.compile_function[gemm_q5_k_f16, dump_asm=Path("gemm_q5_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q5_k_f16"))
+
+    _ = ctx.compile_function[gemm_q5_k_f16_bm64, dump_asm=Path("gemm_q5_k_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q5_k_f16_bm64"))
+
+    _ = ctx.compile_function[gemm_q3_k_f16, dump_asm=Path("gemm_q3_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q3_k_f16"))
+
+    _ = ctx.compile_function[gemm_q3_k_f16_bm64, dump_asm=Path("gemm_q3_k_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q3_k_f16_bm64"))
+
+    _ = ctx.compile_function[gemm_q2_k_f16, dump_asm=Path("gemm_q2_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q2_k_f16"))
+
+    _ = ctx.compile_function[gemm_q2_k_f16_bm64, dump_asm=Path("gemm_q2_k_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q2_k_f16_bm64"))
+
+    _ = ctx.compile_function[gemm_q4_0_f16, dump_asm=Path("gemm_q4_0_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q4_0_f16"))
+
+    _ = ctx.compile_function[gemm_q4_0_f16_bm64, dump_asm=Path("gemm_q4_0_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q4_0_f16_bm64"))
+
+    _ = ctx.compile_function[gemm_q4_1_f16, dump_asm=Path("gemm_q4_1_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q4_1_f16"))
+
+    _ = ctx.compile_function[gemm_q4_1_f16_bm64, dump_asm=Path("gemm_q4_1_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q4_1_f16_bm64"))
+
+    _ = ctx.compile_function[gemm_q5_0_f16, dump_asm=Path("gemm_q5_0_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q5_0_f16"))
+
+    _ = ctx.compile_function[gemm_q5_0_f16_bm64, dump_asm=Path("gemm_q5_0_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q5_0_f16_bm64"))
+
+    _ = ctx.compile_function[gemm_q5_1_f16, dump_asm=Path("gemm_q5_1_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q5_1_f16"))
+
+    _ = ctx.compile_function[gemm_q5_1_f16_bm64, dump_asm=Path("gemm_q5_1_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q5_1_f16_bm64"))
+
+    _ = ctx.compile_function[gemv_norm_q5_k_f16, dump_asm=Path("gemv_norm_q5_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_q5_k_f16"))
+
+    _ = ctx.compile_function[gemv_norm_q3_k_f16, dump_asm=Path("gemv_norm_q3_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_q3_k_f16"))
+
+    _ = ctx.compile_function[gemv_norm_q2_k_f16, dump_asm=Path("gemv_norm_q2_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_q2_k_f16"))
+
+    _ = ctx.compile_function[gemv_norm_q4_0_f16, dump_asm=Path("gemv_norm_q4_0_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_q4_0_f16"))
+
+    _ = ctx.compile_function[gemv_norm_q4_1_f16, dump_asm=Path("gemv_norm_q4_1_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_q4_1_f16"))
+
+    _ = ctx.compile_function[gemv_norm_q5_0_f16, dump_asm=Path("gemv_norm_q5_0_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_q5_0_f16"))
+
+    _ = ctx.compile_function[gemv_norm_q5_1_f16, dump_asm=Path("gemv_norm_q5_1_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_q5_1_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_q5_k_f16, dump_asm=Path("gemv_norm_silu_q5_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_q5_k_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_q3_k_f16, dump_asm=Path("gemv_norm_silu_q3_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_q3_k_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_q2_k_f16, dump_asm=Path("gemv_norm_silu_q2_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_q2_k_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_q4_0_f16, dump_asm=Path("gemv_norm_silu_q4_0_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_q4_0_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_q4_1_f16, dump_asm=Path("gemv_norm_silu_q4_1_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_q4_1_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_q5_0_f16, dump_asm=Path("gemv_norm_silu_q5_0_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_q5_0_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_q5_1_f16, dump_asm=Path("gemv_norm_silu_q5_1_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_q5_1_f16"))
+
+    _ = ctx.compile_function[gemv_residual_q5_k_f16, dump_asm=Path("gemv_residual_q5_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_q5_k_f16"))
+
+    _ = ctx.compile_function[gemv_residual_q3_k_f16, dump_asm=Path("gemv_residual_q3_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_q3_k_f16"))
+
+    _ = ctx.compile_function[gemv_residual_q2_k_f16, dump_asm=Path("gemv_residual_q2_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_q2_k_f16"))
+
+    _ = ctx.compile_function[gemv_residual_q4_0_f16, dump_asm=Path("gemv_residual_q4_0_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_q4_0_f16"))
+
+    _ = ctx.compile_function[gemv_residual_q4_1_f16, dump_asm=Path("gemv_residual_q4_1_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_q4_1_f16"))
+
+    _ = ctx.compile_function[gemv_residual_q5_0_f16, dump_asm=Path("gemv_residual_q5_0_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_q5_0_f16"))
+
+    _ = ctx.compile_function[gemv_residual_q5_1_f16, dump_asm=Path("gemv_residual_q5_1_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_q5_1_f16"))
+
+    _ = ctx.compile_function[gemv_iq4_nl_f16_v2, dump_asm=Path("gemv_iq4_nl_f16_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_iq4_nl_f16_v2"))
+
+    _ = ctx.compile_function[gemv_iq4_nl_out_f32_v2, dump_asm=Path("gemv_iq4_nl_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_iq4_nl_out_f32_v2"))
+
+    _ = ctx.compile_function[gemm_iq4_nl_f16, dump_asm=Path("gemm_iq4_nl_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_iq4_nl_f16"))
+
+    _ = ctx.compile_function[gemm_iq4_nl_f16_bm64, dump_asm=Path("gemm_iq4_nl_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_iq4_nl_f16_bm64"))
+
+    _ = ctx.compile_function[gemv_norm_iq4_nl_f16, dump_asm=Path("gemv_norm_iq4_nl_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_iq4_nl_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_iq4_nl_f16, dump_asm=Path("gemv_norm_silu_iq4_nl_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_iq4_nl_f16"))
+
+    _ = ctx.compile_function[gemv_residual_iq4_nl_f16, dump_asm=Path("gemv_residual_iq4_nl_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_iq4_nl_f16"))
+
+    _ = ctx.compile_function[gemv_iq4_xs_f16_v2, dump_asm=Path("gemv_iq4_xs_f16_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_iq4_xs_f16_v2"))
+
+    _ = ctx.compile_function[gemv_iq4_xs_out_f32_v2, dump_asm=Path("gemv_iq4_xs_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_iq4_xs_out_f32_v2"))
+
+    _ = ctx.compile_function[gemm_iq4_xs_f16, dump_asm=Path("gemm_iq4_xs_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_iq4_xs_f16"))
+
+    _ = ctx.compile_function[gemm_iq4_xs_f16_bm64, dump_asm=Path("gemm_iq4_xs_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_iq4_xs_f16_bm64"))
+
+    _ = ctx.compile_function[gemv_norm_iq4_xs_f16, dump_asm=Path("gemv_norm_iq4_xs_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_iq4_xs_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_iq4_xs_f16, dump_asm=Path("gemv_norm_silu_iq4_xs_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_iq4_xs_f16"))
+
+    _ = ctx.compile_function[gemv_residual_iq4_xs_f16, dump_asm=Path("gemv_residual_iq4_xs_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_iq4_xs_f16"))
+
+    _ = ctx.compile_function[gemv_mxfp4_f16_v2, dump_asm=Path("gemv_mxfp4_f16_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_mxfp4_f16_v2"))
+
+    _ = ctx.compile_function[gemv_mxfp4_out_f32_v2, dump_asm=Path("gemv_mxfp4_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_mxfp4_out_f32_v2"))
+
+    _ = ctx.compile_function[gemm_mxfp4_gguf_f16, dump_asm=Path("gemm_mxfp4_gguf_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_mxfp4_gguf_f16"))
+
+    _ = ctx.compile_function[gemm_mxfp4_gguf_f16_bm64, dump_asm=Path("gemm_mxfp4_gguf_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_mxfp4_gguf_f16_bm64"))
+
+    _ = ctx.compile_function[gemv_norm_mxfp4_f16, dump_asm=Path("gemv_norm_mxfp4_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_mxfp4_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_mxfp4_f16, dump_asm=Path("gemv_norm_silu_mxfp4_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_mxfp4_f16"))
+
+    _ = ctx.compile_function[gemv_residual_mxfp4_f16, dump_asm=Path("gemv_residual_mxfp4_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_mxfp4_f16"))
+
+    _ = ctx.compile_function[gemv_iq2_xs_f16_v2, dump_asm=Path("gemv_iq2_xs_f16_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_iq2_xs_f16_v2"))
+
+    _ = ctx.compile_function[gemv_iq2_xs_out_f32_v2, dump_asm=Path("gemv_iq2_xs_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_iq2_xs_out_f32_v2"))
+
+    _ = ctx.compile_function[gemm_iq2_xs_f16, dump_asm=Path("gemm_iq2_xs_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_iq2_xs_f16"))
+
+    _ = ctx.compile_function[gemm_iq2_xs_f16_bm64, dump_asm=Path("gemm_iq2_xs_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_iq2_xs_f16_bm64"))
+
+    _ = ctx.compile_function[gemv_norm_iq2_xs_f16, dump_asm=Path("gemv_norm_iq2_xs_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_iq2_xs_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_iq2_xs_f16, dump_asm=Path("gemv_norm_silu_iq2_xs_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_iq2_xs_f16"))
+
+    _ = ctx.compile_function[gemv_residual_iq2_xs_f16, dump_asm=Path("gemv_residual_iq2_xs_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_iq2_xs_f16"))
+
+    _ = ctx.compile_function[gemv_iq2_s_f16_v2, dump_asm=Path("gemv_iq2_s_f16_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_iq2_s_f16_v2"))
+
+    _ = ctx.compile_function[gemv_iq2_s_out_f32_v2, dump_asm=Path("gemv_iq2_s_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_iq2_s_out_f32_v2"))
+
+    _ = ctx.compile_function[gemm_iq2_s_f16, dump_asm=Path("gemm_iq2_s_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_iq2_s_f16"))
+
+    _ = ctx.compile_function[gemm_iq2_s_f16_bm64, dump_asm=Path("gemm_iq2_s_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_iq2_s_f16_bm64"))
+
+    _ = ctx.compile_function[gemv_norm_iq2_s_f16, dump_asm=Path("gemv_norm_iq2_s_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_iq2_s_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_iq2_s_f16, dump_asm=Path("gemv_norm_silu_iq2_s_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_iq2_s_f16"))
+
+    _ = ctx.compile_function[gemv_residual_iq2_s_f16, dump_asm=Path("gemv_residual_iq2_s_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_iq2_s_f16"))
+
+    _ = ctx.compile_function[gemv_iq3_s_f16_v2, dump_asm=Path("gemv_iq3_s_f16_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_iq3_s_f16_v2"))
+
+    _ = ctx.compile_function[gemv_iq3_s_out_f32_v2, dump_asm=Path("gemv_iq3_s_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_iq3_s_out_f32_v2"))
+
+    _ = ctx.compile_function[gemm_iq3_s_f16, dump_asm=Path("gemm_iq3_s_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_iq3_s_f16"))
+
+    _ = ctx.compile_function[gemm_iq3_s_f16_bm64, dump_asm=Path("gemm_iq3_s_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_iq3_s_f16_bm64"))
+
+    _ = ctx.compile_function[gemv_norm_iq3_s_f16, dump_asm=Path("gemv_norm_iq3_s_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_iq3_s_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_iq3_s_f16, dump_asm=Path("gemv_norm_silu_iq3_s_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_iq3_s_f16"))
+
+    _ = ctx.compile_function[gemv_residual_iq3_s_f16, dump_asm=Path("gemv_residual_iq3_s_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_iq3_s_f16"))
+
+    _ = ctx.compile_function[gemv_iq2_xxs_f16_v2, dump_asm=Path("gemv_iq2_xxs_f16_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_iq2_xxs_f16_v2"))
+
+    _ = ctx.compile_function[gemv_iq2_xxs_out_f32_v2, dump_asm=Path("gemv_iq2_xxs_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_iq2_xxs_out_f32_v2"))
+
+    _ = ctx.compile_function[gemm_iq2_xxs_f16, dump_asm=Path("gemm_iq2_xxs_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_iq2_xxs_f16"))
+
+    _ = ctx.compile_function[gemm_iq2_xxs_f16_bm64, dump_asm=Path("gemm_iq2_xxs_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_iq2_xxs_f16_bm64"))
+
+    _ = ctx.compile_function[gemv_norm_iq2_xxs_f16, dump_asm=Path("gemv_norm_iq2_xxs_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_iq2_xxs_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_iq2_xxs_f16, dump_asm=Path("gemv_norm_silu_iq2_xxs_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_iq2_xxs_f16"))
+
+    _ = ctx.compile_function[gemv_residual_iq2_xxs_f16, dump_asm=Path("gemv_residual_iq2_xxs_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_iq2_xxs_f16"))
+
+    _ = ctx.compile_function[gemv_iq3_xxs_f16_v2, dump_asm=Path("gemv_iq3_xxs_f16_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_iq3_xxs_f16_v2"))
+
+    _ = ctx.compile_function[gemv_iq3_xxs_out_f32_v2, dump_asm=Path("gemv_iq3_xxs_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_iq3_xxs_out_f32_v2"))
+
+    _ = ctx.compile_function[gemm_iq3_xxs_f16, dump_asm=Path("gemm_iq3_xxs_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_iq3_xxs_f16"))
+
+    _ = ctx.compile_function[gemm_iq3_xxs_f16_bm64, dump_asm=Path("gemm_iq3_xxs_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_iq3_xxs_f16_bm64"))
+
+    _ = ctx.compile_function[gemv_norm_iq3_xxs_f16, dump_asm=Path("gemv_norm_iq3_xxs_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_iq3_xxs_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_iq3_xxs_f16, dump_asm=Path("gemv_norm_silu_iq3_xxs_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_iq3_xxs_f16"))
+
+    _ = ctx.compile_function[gemv_residual_iq3_xxs_f16, dump_asm=Path("gemv_residual_iq3_xxs_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_iq3_xxs_f16"))
+
+    _ = ctx.compile_function[gemv_iq1_s_f16_v2, dump_asm=Path("gemv_iq1_s_f16_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_iq1_s_f16_v2"))
+
+    _ = ctx.compile_function[gemv_iq1_s_out_f32_v2, dump_asm=Path("gemv_iq1_s_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_iq1_s_out_f32_v2"))
+
+    _ = ctx.compile_function[gemm_iq1_s_f16, dump_asm=Path("gemm_iq1_s_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_iq1_s_f16"))
+
+    _ = ctx.compile_function[gemm_iq1_s_f16_bm64, dump_asm=Path("gemm_iq1_s_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_iq1_s_f16_bm64"))
+
+    _ = ctx.compile_function[gemv_norm_iq1_s_f16, dump_asm=Path("gemv_norm_iq1_s_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_iq1_s_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_iq1_s_f16, dump_asm=Path("gemv_norm_silu_iq1_s_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_iq1_s_f16"))
+
+    _ = ctx.compile_function[gemv_residual_iq1_s_f16, dump_asm=Path("gemv_residual_iq1_s_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_iq1_s_f16"))
+
+    _ = ctx.compile_function[gemv_iq1_m_f16_v2, dump_asm=Path("gemv_iq1_m_f16_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_iq1_m_f16_v2"))
+
+    _ = ctx.compile_function[gemv_iq1_m_out_f32_v2, dump_asm=Path("gemv_iq1_m_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_iq1_m_out_f32_v2"))
+
+    _ = ctx.compile_function[gemm_iq1_m_f16, dump_asm=Path("gemm_iq1_m_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_iq1_m_f16"))
+
+    _ = ctx.compile_function[gemm_iq1_m_f16_bm64, dump_asm=Path("gemm_iq1_m_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_iq1_m_f16_bm64"))
+
+    _ = ctx.compile_function[gemv_norm_iq1_m_f16, dump_asm=Path("gemv_norm_iq1_m_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_iq1_m_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_iq1_m_f16, dump_asm=Path("gemv_norm_silu_iq1_m_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_iq1_m_f16"))
+
+    _ = ctx.compile_function[gemv_residual_iq1_m_f16, dump_asm=Path("gemv_residual_iq1_m_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_iq1_m_f16"))
 
     var manifest = String('{\n  "arch": "') + arch + String('",\n  "kernels": {\n')
     for i in range(len(entries)):

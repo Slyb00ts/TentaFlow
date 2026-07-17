@@ -14,6 +14,7 @@ use forge_kernels::Kernels;
 use forge_types::{ForgeError, MemKind, Result};
 
 use crate::kv::{KvCache, KvConfig, SeqKv};
+use crate::sample::{GpuSampler, SamplingParams};
 use crate::weights::{DevWeight, GateUpWeights, ModelWeights, QkvWeights};
 
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
@@ -161,6 +162,17 @@ struct DecodeBufs {
     pinned_pt: DevBuffer,
     /// Pinned-host landing buffer for logits (avoids pageable D2H).
     pinned_logits: DevBuffer,
+    /// Per-block partials of the sampling kernels ((f32, i32) pair arrays).
+    sample_vals: DevBuffer,
+    sample_idx: DevBuffer,
+    /// Sampling result: [token_id i32, logprob f32].
+    sample_out: DevBuffer,
+    /// Pinned-host landing buffer for the 8-byte sampling result.
+    pinned_sample: DevBuffer,
+    /// Device-resident distinct-token list for the repetition penalty.
+    penalty_ids: DevBuffer,
+    /// Pinned-host staging for `penalty_ids`.
+    pinned_penalty: DevBuffer,
 }
 
 /// Persistent prefill scratch sized for MAX_PREFILL_CHUNK tokens. Activation
@@ -255,6 +267,20 @@ impl Model {
             pinned_in: device.alloc(12, MemKind::PinnedHost, Pool::Activations)?,
             pinned_pt: device.alloc(max_pages_per_seq * 4, MemKind::PinnedHost, Pool::Activations)?,
             pinned_logits: device.alloc(p.vocab_size * 4, MemKind::PinnedHost, Pool::Activations)?,
+            sample_vals: device.alloc(
+                forge_kernels::SAMPLE_SCRATCH_PAIRS * 4,
+                MemKind::Device,
+                Pool::Activations,
+            )?,
+            sample_idx: device.alloc(
+                forge_kernels::SAMPLE_SCRATCH_PAIRS * 4,
+                MemKind::Device,
+                Pool::Activations,
+            )?,
+            sample_out: device.alloc(8, MemKind::Device, Pool::Activations)?,
+            pinned_sample: device.alloc(8, MemKind::PinnedHost, Pool::Activations)?,
+            penalty_ids: device.alloc(cfg.max_seq_len * 4, MemKind::Device, Pool::Activations)?,
+            pinned_penalty: device.alloc(cfg.max_seq_len * 4, MemKind::PinnedHost, Pool::Activations)?,
         };
         Ok(Model {
             device,
@@ -280,18 +306,82 @@ impl Model {
     }
 
     fn gemv(&self, y: &DevBuffer, w: &DevWeight, x: &DevBuffer, stream: &Stream) -> Result<()> {
+        // Q8_0/Q4_K take the int8-activation dp4a kernels (measured faster at
+        // every decode shape); columns beyond the kernels' shared staging
+        // bound keep the f16-x path. Q6_K stays on f16 x: its dot is already
+        // bandwidth-bound and the dp4a variant's extra shared usage costs
+        // occupancy (measured slower at the down-projection shape).
         match w {
             DevWeight::F16 { buf, rows, cols } => {
                 self.kernels.gemv_f16(y, buf, x, *rows, *cols, stream)
             }
             DevWeight::Q8_0 { buf, rows, cols } => {
-                self.kernels.gemv_q8_0_f16(y, buf, x, *rows, *cols, stream)
+                if *cols <= Kernels::DP4A_MAX_COLS {
+                    self.kernels.gemv_q8_0_dp4a_f16(y, buf, x, *rows, *cols, stream)
+                } else {
+                    self.kernels.gemv_q8_0_f16(y, buf, x, *rows, *cols, stream)
+                }
             }
             DevWeight::Q4K { buf, rows, cols } => {
-                self.kernels.gemv_q4_k_f16(y, buf, x, *rows, *cols, stream)
+                if *cols <= Kernels::DP4A_MAX_COLS {
+                    self.kernels.gemv_q4_k_dp4a_f16(y, buf, x, *rows, *cols, stream)
+                } else {
+                    self.kernels.gemv_q4_k_f16(y, buf, x, *rows, *cols, stream)
+                }
             }
             DevWeight::Q6K { buf, rows, cols } => {
                 self.kernels.gemv_q6_k_f16(y, buf, x, *rows, *cols, stream)
+            }
+            DevWeight::Q5K { buf, rows, cols } => {
+                self.kernels.gemv_q5_k_f16(y, buf, x, *rows, *cols, stream)
+            }
+            DevWeight::Q3K { buf, rows, cols } => {
+                self.kernels.gemv_q3_k_f16(y, buf, x, *rows, *cols, stream)
+            }
+            DevWeight::Q2K { buf, rows, cols } => {
+                self.kernels.gemv_q2_k_f16(y, buf, x, *rows, *cols, stream)
+            }
+            DevWeight::Q4_0 { buf, rows, cols } => {
+                self.kernels.gemv_q4_0_f16(y, buf, x, *rows, *cols, stream)
+            }
+            DevWeight::Q4_1 { buf, rows, cols } => {
+                self.kernels.gemv_q4_1_f16(y, buf, x, *rows, *cols, stream)
+            }
+            DevWeight::Q5_0 { buf, rows, cols } => {
+                self.kernels.gemv_q5_0_f16(y, buf, x, *rows, *cols, stream)
+            }
+            DevWeight::Q5_1 { buf, rows, cols } => {
+                self.kernels.gemv_q5_1_f16(y, buf, x, *rows, *cols, stream)
+            }
+            DevWeight::Iq4Nl { buf, rows, cols } => {
+                self.kernels.gemv_iq4_nl_f16(y, buf, x, *rows, *cols, stream)
+            }
+            DevWeight::Iq4Xs { buf, rows, cols } => {
+                self.kernels.gemv_iq4_xs_f16(y, buf, x, *rows, *cols, stream)
+            }
+            DevWeight::Mxfp4 { buf, rows, cols } => {
+                self.kernels.gemv_mxfp4_f16(y, buf, x, *rows, *cols, stream)
+            }
+            DevWeight::Iq2Xs { buf, rows, cols } => {
+                self.kernels.gemv_iq2_xs_f16(y, buf, x, *rows, *cols, stream)
+            }
+            DevWeight::Iq2S { buf, rows, cols } => {
+                self.kernels.gemv_iq2_s_f16(y, buf, x, *rows, *cols, stream)
+            }
+            DevWeight::Iq3S { buf, rows, cols } => {
+                self.kernels.gemv_iq3_s_f16(y, buf, x, *rows, *cols, stream)
+            }
+            DevWeight::Iq2Xxs { buf, rows, cols } => {
+                self.kernels.gemv_iq2_xxs_f16(y, buf, x, *rows, *cols, stream)
+            }
+            DevWeight::Iq3Xxs { buf, rows, cols } => {
+                self.kernels.gemv_iq3_xxs_f16(y, buf, x, *rows, *cols, stream)
+            }
+            DevWeight::Iq1S { buf, rows, cols } => {
+                self.kernels.gemv_iq1_s_f16(y, buf, x, *rows, *cols, stream)
+            }
+            DevWeight::Iq1M { buf, rows, cols } => {
+                self.kernels.gemv_iq1_m_f16(y, buf, x, *rows, *cols, stream)
             }
             DevWeight::NvFp4 {
                 packed,
@@ -323,6 +413,25 @@ impl Model {
             // (Q4K_MAX_SEGS in gemv2.mojo bounds cols at 32768).
             DevWeight::Q4K { cols, .. } => cols.is_multiple_of(256) && *cols <= 32768,
             DevWeight::Q6K { cols, .. } => cols.is_multiple_of(256),
+            // Q5_K shares Q4_K's 32-column x-sum staging bound; Q2_K stages
+            // 16-column sums with the same 32768 ceiling.
+            DevWeight::Q5K { cols, .. } => cols.is_multiple_of(256) && *cols <= 32768,
+            DevWeight::Q3K { cols, .. } => cols.is_multiple_of(256),
+            DevWeight::Q2K { cols, .. } => cols.is_multiple_of(256) && *cols <= 32768,
+            DevWeight::Q4_0 { cols, .. }
+            | DevWeight::Q4_1 { cols, .. }
+            | DevWeight::Q5_0 { cols, .. }
+            | DevWeight::Q5_1 { cols, .. }
+            | DevWeight::Iq4Nl { cols, .. }
+            | DevWeight::Mxfp4 { cols, .. } => cols.is_multiple_of(32),
+            DevWeight::Iq4Xs { cols, .. }
+            | DevWeight::Iq2Xs { cols, .. }
+            | DevWeight::Iq2S { cols, .. }
+            | DevWeight::Iq3S { cols, .. }
+            | DevWeight::Iq2Xxs { cols, .. }
+            | DevWeight::Iq3Xxs { cols, .. }
+            | DevWeight::Iq1S { cols, .. }
+            | DevWeight::Iq1M { cols, .. } => cols.is_multiple_of(256),
         }
     }
 
@@ -376,7 +485,7 @@ impl Model {
             DevWeight::F16 { buf, rows, cols } => self.kernels.gemv_norm_f16(
                 y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
             ),
-            DevWeight::Q8_0 { buf, rows, cols } => self.kernels.gemv_norm_q8_0_f16(
+            DevWeight::Q8_0 { buf, rows, cols } => self.kernels.gemv_norm_q8_0_dp4a_f16(
                 y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
             ),
             DevWeight::NvFp4 {
@@ -399,10 +508,61 @@ impl Model {
                 eps,
                 stream,
             ),
-            DevWeight::Q4K { buf, rows, cols } => self.kernels.gemv_norm_q4_k_f16(
+            DevWeight::Q4K { buf, rows, cols } => self.kernels.gemv_norm_q4_k_dp4a_f16(
                 y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
             ),
-            DevWeight::Q6K { buf, rows, cols } => self.kernels.gemv_norm_q6_k_f16(
+            DevWeight::Q6K { buf, rows, cols } => self.kernels.gemv_norm_q6_k_dp4a_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Q5K { buf, rows, cols } => self.kernels.gemv_norm_q5_k_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Q3K { buf, rows, cols } => self.kernels.gemv_norm_q3_k_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Q2K { buf, rows, cols } => self.kernels.gemv_norm_q2_k_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Q4_0 { buf, rows, cols } => self.kernels.gemv_norm_q4_0_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Q4_1 { buf, rows, cols } => self.kernels.gemv_norm_q4_1_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Q5_0 { buf, rows, cols } => self.kernels.gemv_norm_q5_0_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Q5_1 { buf, rows, cols } => self.kernels.gemv_norm_q5_1_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Iq4Nl { buf, rows, cols } => self.kernels.gemv_norm_iq4_nl_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Iq4Xs { buf, rows, cols } => self.kernels.gemv_norm_iq4_xs_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Mxfp4 { buf, rows, cols } => self.kernels.gemv_norm_mxfp4_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Iq2Xs { buf, rows, cols } => self.kernels.gemv_norm_iq2_xs_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Iq2S { buf, rows, cols } => self.kernels.gemv_norm_iq2_s_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Iq3S { buf, rows, cols } => self.kernels.gemv_norm_iq3_s_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Iq2Xxs { buf, rows, cols } => self.kernels.gemv_norm_iq2_xxs_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Iq3Xxs { buf, rows, cols } => self.kernels.gemv_norm_iq3_xxs_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Iq1S { buf, rows, cols } => self.kernels.gemv_norm_iq1_s_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Iq1M { buf, rows, cols } => self.kernels.gemv_norm_iq1_m_f16(
                 y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
             ),
         }
@@ -423,7 +583,7 @@ impl Model {
             DevWeight::F16 { buf, rows, cols } => self.kernels.gemv_norm_silu_f16(
                 act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
             ),
-            DevWeight::Q8_0 { buf, rows, cols } => self.kernels.gemv_norm_silu_q8_0_f16(
+            DevWeight::Q8_0 { buf, rows, cols } => self.kernels.gemv_norm_silu_q8_0_dp4a_f16(
                 act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
             ),
             DevWeight::NvFp4 {
@@ -445,10 +605,61 @@ impl Model {
                 eps,
                 stream,
             ),
-            DevWeight::Q4K { buf, rows, cols } => self.kernels.gemv_norm_silu_q4_k_f16(
+            DevWeight::Q4K { buf, rows, cols } => self.kernels.gemv_norm_silu_q4_k_dp4a_f16(
                 act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
             ),
-            DevWeight::Q6K { buf, rows, cols } => self.kernels.gemv_norm_silu_q6_k_f16(
+            DevWeight::Q6K { buf, rows, cols } => self.kernels.gemv_norm_silu_q6_k_dp4a_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Q5K { buf, rows, cols } => self.kernels.gemv_norm_silu_q5_k_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Q3K { buf, rows, cols } => self.kernels.gemv_norm_silu_q3_k_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Q2K { buf, rows, cols } => self.kernels.gemv_norm_silu_q2_k_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Q4_0 { buf, rows, cols } => self.kernels.gemv_norm_silu_q4_0_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Q4_1 { buf, rows, cols } => self.kernels.gemv_norm_silu_q4_1_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Q5_0 { buf, rows, cols } => self.kernels.gemv_norm_silu_q5_0_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Q5_1 { buf, rows, cols } => self.kernels.gemv_norm_silu_q5_1_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Iq4Nl { buf, rows, cols } => self.kernels.gemv_norm_silu_iq4_nl_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Iq4Xs { buf, rows, cols } => self.kernels.gemv_norm_silu_iq4_xs_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Mxfp4 { buf, rows, cols } => self.kernels.gemv_norm_silu_mxfp4_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Iq2Xs { buf, rows, cols } => self.kernels.gemv_norm_silu_iq2_xs_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Iq2S { buf, rows, cols } => self.kernels.gemv_norm_silu_iq2_s_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Iq3S { buf, rows, cols } => self.kernels.gemv_norm_silu_iq3_s_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Iq2Xxs { buf, rows, cols } => self.kernels.gemv_norm_silu_iq2_xxs_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Iq3Xxs { buf, rows, cols } => self.kernels.gemv_norm_silu_iq3_xxs_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Iq1S { buf, rows, cols } => self.kernels.gemv_norm_silu_iq1_s_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Iq1M { buf, rows, cols } => self.kernels.gemv_norm_silu_iq1_m_f16(
                 act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
             ),
         }
@@ -456,14 +667,24 @@ impl Model {
 
     /// GEMV + residual add into the decode residual pair (h, h32).
     fn gemv_residual(&self, w: &DevWeight, x: &DevBuffer, stream: &Stream) -> Result<()> {
+        // Same dp4a policy as `gemv`: Q8_0/Q4_K quantize x block-locally and
+        // dot with dp4a (wins at every decode shape), Q6_K keeps the f16-x
+        // kernel (already bandwidth-bound; dp4a's shared staging loses
+        // occupancy at the wide down-projection).
         let b = &self.bufs;
         match w {
             DevWeight::F16 { buf, rows, cols } => self
                 .kernels
                 .gemv_residual_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
-            DevWeight::Q8_0 { buf, rows, cols } => self
-                .kernels
-                .gemv_residual_q8_0_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Q8_0 { buf, rows, cols } => {
+                if *cols <= Kernels::DP4A_MAX_COLS {
+                    self.kernels
+                        .gemv_residual_q8_0_dp4a_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream)
+                } else {
+                    self.kernels
+                        .gemv_residual_q8_0_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream)
+                }
+            }
             DevWeight::NvFp4 {
                 packed,
                 scales,
@@ -481,12 +702,75 @@ impl Model {
                 *inv_global_scale,
                 stream,
             ),
-            DevWeight::Q4K { buf, rows, cols } => self
+            DevWeight::Q4K { buf, rows, cols } => {
+                if *cols <= Kernels::DP4A_MAX_COLS {
+                    self.kernels
+                        .gemv_residual_q4_k_dp4a_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream)
+                } else {
+                    self.kernels
+                        .gemv_residual_q4_k_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream)
+                }
+            }
+            DevWeight::Q6K { buf, rows, cols } => {
+                if *cols <= Kernels::DP4A_MAX_COLS {
+                    self.kernels
+                        .gemv_residual_q6_k_dp4a_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream)
+                } else {
+                    self.kernels
+                        .gemv_residual_q6_k_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream)
+                }
+            }
+            DevWeight::Q5K { buf, rows, cols } => self
                 .kernels
-                .gemv_residual_q4_k_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
-            DevWeight::Q6K { buf, rows, cols } => self
+                .gemv_residual_q5_k_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Q3K { buf, rows, cols } => self
                 .kernels
-                .gemv_residual_q6_k_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+                .gemv_residual_q3_k_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Q2K { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_q2_k_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Q4_0 { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_q4_0_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Q4_1 { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_q4_1_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Q5_0 { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_q5_0_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Q5_1 { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_q5_1_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Iq4Nl { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_iq4_nl_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Iq4Xs { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_iq4_xs_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Mxfp4 { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_mxfp4_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Iq2Xs { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_iq2_xs_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Iq2S { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_iq2_s_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Iq3S { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_iq3_s_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Iq2Xxs { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_iq2_xxs_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Iq3Xxs { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_iq3_xxs_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Iq1S { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_iq1_s_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Iq1M { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_iq1_m_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
         }
     }
 
@@ -498,12 +782,73 @@ impl Model {
             DevWeight::Q8_0 { buf, rows, cols } => self
                 .kernels
                 .gemv_q8_0_out_f32(y_f32, buf, x, *rows, *cols, stream),
-            DevWeight::Q4K { buf, rows, cols } => self
+            DevWeight::Q4K { buf, rows, cols } => {
+                if *cols <= Kernels::DP4A_MAX_COLS {
+                    self.kernels
+                        .gemv_q4_k_dp4a_out_f32(y_f32, buf, x, *rows, *cols, stream)
+                } else {
+                    self.kernels.gemv_q4_k_out_f32(y_f32, buf, x, *rows, *cols, stream)
+                }
+            }
+            DevWeight::Q6K { buf, rows, cols } => {
+                if *cols <= Kernels::DP4A_MAX_COLS {
+                    self.kernels
+                        .gemv_q6_k_dp4a_out_f32(y_f32, buf, x, *rows, *cols, stream)
+                } else {
+                    self.kernels.gemv_q6_k_out_f32(y_f32, buf, x, *rows, *cols, stream)
+                }
+            }
+            DevWeight::Q5K { buf, rows, cols } => self
                 .kernels
-                .gemv_q4_k_out_f32(y_f32, buf, x, *rows, *cols, stream),
-            DevWeight::Q6K { buf, rows, cols } => self
+                .gemv_q5_k_out_f32(y_f32, buf, x, *rows, *cols, stream),
+            DevWeight::Q3K { buf, rows, cols } => self
                 .kernels
-                .gemv_q6_k_out_f32(y_f32, buf, x, *rows, *cols, stream),
+                .gemv_q3_k_out_f32(y_f32, buf, x, *rows, *cols, stream),
+            DevWeight::Q2K { buf, rows, cols } => self
+                .kernels
+                .gemv_q2_k_out_f32(y_f32, buf, x, *rows, *cols, stream),
+            DevWeight::Q4_0 { buf, rows, cols } => self
+                .kernels
+                .gemv_q4_0_out_f32(y_f32, buf, x, *rows, *cols, stream),
+            DevWeight::Q4_1 { buf, rows, cols } => self
+                .kernels
+                .gemv_q4_1_out_f32(y_f32, buf, x, *rows, *cols, stream),
+            DevWeight::Q5_0 { buf, rows, cols } => self
+                .kernels
+                .gemv_q5_0_out_f32(y_f32, buf, x, *rows, *cols, stream),
+            DevWeight::Q5_1 { buf, rows, cols } => self
+                .kernels
+                .gemv_q5_1_out_f32(y_f32, buf, x, *rows, *cols, stream),
+            DevWeight::Iq4Nl { buf, rows, cols } => self
+                .kernels
+                .gemv_iq4_nl_out_f32(y_f32, buf, x, *rows, *cols, stream),
+            DevWeight::Iq4Xs { buf, rows, cols } => self
+                .kernels
+                .gemv_iq4_xs_out_f32(y_f32, buf, x, *rows, *cols, stream),
+            DevWeight::Mxfp4 { buf, rows, cols } => self
+                .kernels
+                .gemv_mxfp4_out_f32(y_f32, buf, x, *rows, *cols, stream),
+            DevWeight::Iq2Xs { buf, rows, cols } => self
+                .kernels
+                .gemv_iq2_xs_out_f32(y_f32, buf, x, *rows, *cols, stream),
+            DevWeight::Iq2S { buf, rows, cols } => self
+                .kernels
+                .gemv_iq2_s_out_f32(y_f32, buf, x, *rows, *cols, stream),
+            DevWeight::Iq3S { buf, rows, cols } => self
+                .kernels
+                .gemv_iq3_s_out_f32(y_f32, buf, x, *rows, *cols, stream),
+            DevWeight::Iq2Xxs { buf, rows, cols } => self
+                .kernels
+                .gemv_iq2_xxs_out_f32(y_f32, buf, x, *rows, *cols, stream),
+            DevWeight::Iq3Xxs { buf, rows, cols } => self
+                .kernels
+                .gemv_iq3_xxs_out_f32(y_f32, buf, x, *rows, *cols, stream),
+            DevWeight::Iq1S { buf, rows, cols } => self
+                .kernels
+                .gemv_iq1_s_out_f32(y_f32, buf, x, *rows, *cols, stream),
+            DevWeight::Iq1M { buf, rows, cols } => self
+                .kernels
+                .gemv_iq1_m_out_f32(y_f32, buf, x, *rows, *cols, stream),
             DevWeight::NvFp4 { .. } => Err(ForgeError::Unsupported(
                 "NVFP4 lm_head has no f32-logit kernel yet".into(),
             )),
@@ -572,6 +917,176 @@ impl Model {
                 y,
                 buf,
                 row_off * (cols / 256) * 210,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Q5K { buf, cols, .. } => self.kernels.gemm_q5_k_f16_at(
+                y,
+                buf,
+                row_off * (cols / 256) * 176,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Q3K { buf, cols, .. } => self.kernels.gemm_q3_k_f16_at(
+                y,
+                buf,
+                row_off * (cols / 256) * 110,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Q2K { buf, cols, .. } => self.kernels.gemm_q2_k_f16_at(
+                y,
+                buf,
+                row_off * (cols / 256) * 84,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Q4_0 { buf, cols, .. } => self.kernels.gemm_q4_0_f16_at(
+                y,
+                buf,
+                row_off * (cols / 32) * 18,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Q4_1 { buf, cols, .. } => self.kernels.gemm_q4_1_f16_at(
+                y,
+                buf,
+                row_off * (cols / 32) * 20,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Q5_0 { buf, cols, .. } => self.kernels.gemm_q5_0_f16_at(
+                y,
+                buf,
+                row_off * (cols / 32) * 22,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Q5_1 { buf, cols, .. } => self.kernels.gemm_q5_1_f16_at(
+                y,
+                buf,
+                row_off * (cols / 32) * 24,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Iq4Nl { buf, cols, .. } => self.kernels.gemm_iq4_nl_f16_at(
+                y,
+                buf,
+                row_off * (cols / 32) * 18,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Iq4Xs { buf, cols, .. } => self.kernels.gemm_iq4_xs_f16_at(
+                y,
+                buf,
+                row_off * (cols / 256) * 136,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Mxfp4 { buf, cols, .. } => self.kernels.gemm_mxfp4_f16_at(
+                y,
+                buf,
+                row_off * (cols / 32) * 17,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Iq2Xs { buf, cols, .. } => self.kernels.gemm_iq2_xs_f16_at(
+                y,
+                buf,
+                row_off * (cols / 256) * 74,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Iq2S { buf, cols, .. } => self.kernels.gemm_iq2_s_f16_at(
+                y,
+                buf,
+                row_off * (cols / 256) * 82,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Iq3S { buf, cols, .. } => self.kernels.gemm_iq3_s_f16_at(
+                y,
+                buf,
+                row_off * (cols / 256) * 110,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Iq2Xxs { buf, cols, .. } => self.kernels.gemm_iq2_xxs_f16_at(
+                y,
+                buf,
+                row_off * (cols / 256) * 66,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Iq3Xxs { buf, cols, .. } => self.kernels.gemm_iq3_xxs_f16_at(
+                y,
+                buf,
+                row_off * (cols / 256) * 98,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Iq1S { buf, cols, .. } => self.kernels.gemm_iq1_s_f16_at(
+                y,
+                buf,
+                row_off * (cols / 256) * 50,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Iq1M { buf, cols, .. } => self.kernels.gemm_iq1_m_f16_at(
+                y,
+                buf,
+                row_off * (cols / 256) * 56,
                 x,
                 n_rows,
                 *cols,
@@ -825,6 +1340,34 @@ impl Model {
     /// Run one token through the model, appending to `seq`, and return the
     /// f32 logits for the next-token distribution.
     pub fn step(&mut self, seq: &mut SeqKv, token_id: u32) -> Result<Vec<f32>> {
+        let vocab = self.weights.descriptor.params.vocab_size;
+        self.step_launch(seq, token_id)?;
+        // Land logits in pinned memory on the same stream, then one sync.
+        self.device.copy(
+            &self.bufs.logits,
+            0,
+            &self.bufs.pinned_logits,
+            0,
+            vocab * 4,
+            &self.stream,
+        )?;
+        self.device.synchronize()?;
+
+        let lp = self
+            .bufs
+            .pinned_logits
+            .host_ptr()
+            .expect("pinned buffer has host mapping") as *const f32;
+        let logits = unsafe { std::slice::from_raw_parts(lp, vocab) }.to_vec();
+
+        Ok(logits)
+    }
+
+    /// Enqueue one decode step (graph replay) on the model stream WITHOUT
+    /// downloading logits or synchronizing. The next-token logits are left
+    /// in the device logits buffer for either the pinned D2H (`step`) or the
+    /// on-GPU sampler (`step_and_sample`).
+    fn step_launch(&mut self, seq: &mut SeqKv, token_id: u32) -> Result<()> {
         let p = self.weights.descriptor.params.clone();
         let pos = seq.len;
 
@@ -888,26 +1431,118 @@ impl Model {
             self.decode_graph = Some(graph);
         }
         let graph = self.decode_graph.as_ref().expect("captured above").clone();
-        self.device.launch_graph(&graph, &self.stream)?;
-        // Land logits in pinned memory on the same stream, then one sync.
-        self.device.copy(
-            &self.bufs.logits,
-            0,
-            &self.bufs.pinned_logits,
-            0,
-            p.vocab_size * 4,
-            &self.stream,
-        )?;
+        self.device.launch_graph(&graph, &self.stream)
+    }
+
+    /// Whether requests with these sampling params can sample on the GPU:
+    /// greedy always fits; a categorical draw needs a bounded top-k and a
+    /// vocab within the kernel's merge capacity.
+    pub fn gpu_sampling_supported(&self, params: &SamplingParams) -> bool {
+        let vocab = self.weights.descriptor.params.vocab_size;
+        GpuSampler::compatible(params)
+            && (params.clone().sanitized().temperature <= 0.0
+                || vocab <= forge_kernels::SAMPLE_MAX_VOCAB)
+    }
+
+    /// Run one token through the model and sample its successor on the GPU;
+    /// only the 8-byte result crosses PCIe instead of the vocab-sized logits.
+    pub fn step_and_sample(
+        &mut self,
+        seq: &mut SeqKv,
+        token_id: u32,
+        sampler: &mut GpuSampler,
+    ) -> Result<u32> {
+        self.step_launch(seq, token_id)?;
+        self.sample_last_logits(sampler)
+    }
+
+    /// Sample from the logits currently resident in the device logits buffer
+    /// (valid right after `step_launch`/`step`/`prefill_chunk` — before any
+    /// other sequence runs). Launches ride the model stream, so this also
+    /// works back-to-back with an un-synced `step_launch`.
+    pub fn sample_last_logits(&mut self, sampler: &mut GpuSampler) -> Result<u32> {
+        let p = &self.weights.descriptor.params;
+        let b = &self.bufs;
+        let sp = sampler.params().clone();
+
+        let penalized = sampler.penalized();
+        if sp.repetition_penalty != 1.0 && !penalized.is_empty() {
+            if penalized.len() * 4 > b.pinned_penalty.len() {
+                return Err(ForgeError::Scheduler(format!(
+                    "penalty list {} exceeds staging capacity",
+                    penalized.len()
+                )));
+            }
+            let host = b
+                .pinned_penalty
+                .host_ptr()
+                .expect("pinned buffer has host mapping");
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    penalized.as_ptr() as *const u8,
+                    host,
+                    penalized.len() * 4,
+                );
+            }
+            self.device.copy(
+                &b.pinned_penalty,
+                0,
+                &b.penalty_ids,
+                0,
+                penalized.len() * 4,
+                &self.stream,
+            )?;
+            self.kernels.sample_penalize_f32(
+                &b.logits,
+                &b.penalty_ids,
+                penalized.len(),
+                sp.repetition_penalty,
+                &self.stream,
+            )?;
+        }
+
+        if sp.temperature <= 0.0 {
+            self.kernels.sample_argmax_f32(
+                &b.sample_out,
+                &b.sample_vals,
+                &b.sample_idx,
+                &b.logits,
+                p.vocab_size,
+                &self.stream,
+            )?;
+        } else {
+            let k = sp.top_k.min(p.vocab_size);
+            self.kernels.sample_topk_f32(
+                &b.sample_out,
+                &b.sample_vals,
+                &b.sample_idx,
+                &b.logits,
+                p.vocab_size,
+                k,
+                1.0 / sp.temperature,
+                sp.top_p,
+                sp.min_p,
+                sampler.seed(),
+                sampler.next_step(),
+                &self.stream,
+            )?;
+        }
+
+        self.device
+            .copy(&b.sample_out, 0, &b.pinned_sample, 0, 8, &self.stream)?;
         self.device.synchronize()?;
 
-        let lp = self
-            .bufs
-            .pinned_logits
+        let sp_host = b
+            .pinned_sample
             .host_ptr()
-            .expect("pinned buffer has host mapping") as *const f32;
-        let logits = unsafe { std::slice::from_raw_parts(lp, p.vocab_size) }.to_vec();
-
-        Ok(logits)
+            .expect("pinned buffer has host mapping") as *const i32;
+        let id = unsafe { *sp_host };
+        if id < 0 || id as usize >= p.vocab_size {
+            return Err(ForgeError::Kernel(format!(
+                "GPU sampler returned out-of-range token {id}"
+            )));
+        }
+        Ok(id as u32)
     }
 
     /// Record every launch of one decode step into a replayable graph.

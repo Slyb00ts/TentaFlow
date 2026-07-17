@@ -4,7 +4,7 @@ use forge_tokenize::{StopMatcher, StreamDecoder, Tokenizer};
 use forge_types::{ForgeError, Result};
 
 use crate::model::Model;
-use crate::sample::{Sampler, SamplingParams};
+use crate::sample::{GpuSampler, Sampler, SamplingParams};
 
 pub struct GenerateRequest {
     pub prompt_tokens: Vec<u32>,
@@ -53,6 +53,16 @@ pub fn generate(
     result
 }
 
+/// Where the next token comes from: the CPU sampler over downloaded logits,
+/// or the on-GPU sampler over device-resident logits (only the sampled id
+/// crosses PCIe). The GPU path is preferred whenever the params fit the
+/// sampling kernels; the CPU path remains for configs that need full logits
+/// on the host (unbounded top-k, future logprobs reporting).
+enum NextSource {
+    Cpu(Sampler),
+    Gpu(GpuSampler),
+}
+
 fn run(
     model: &mut Model,
     tokenizer: &Tokenizer,
@@ -60,7 +70,11 @@ fn run(
     seq: &mut crate::kv::SeqKv,
     on_event: &mut impl FnMut(StreamEvent),
 ) -> Result<Generated> {
-    let mut sampler = Sampler::new(req.sampling.clone());
+    let mut source = if model.gpu_sampling_supported(&req.sampling) {
+        NextSource::Gpu(GpuSampler::new(req.sampling.clone()))
+    } else {
+        NextSource::Cpu(Sampler::new(req.sampling.clone()))
+    };
     let mut decoder = StreamDecoder::new(tokenizer, true);
     let mut stops = StopMatcher::new(req.stop.clone());
 
@@ -74,8 +88,13 @@ fn run(
     let mut tokens = Vec::new();
     let mut finish = FinishReason::Length;
 
+    // First draw comes from the prefill logits (still resident on device for
+    // the GPU path); subsequent draws ride the decode step.
+    let mut next = match &mut source {
+        NextSource::Cpu(s) => s.sample(&logits, &tokens)?,
+        NextSource::Gpu(g) => model.sample_last_logits(g)?,
+    };
     for _ in 0..req.max_tokens {
-        let next = sampler.sample(&logits, &tokens)?;
         if req.eos_ids.contains(&next) {
             finish = FinishReason::Eos;
             break;
@@ -101,7 +120,16 @@ fn run(
         if tokens.len() == req.max_tokens {
             break;
         }
-        logits = model.step(seq, next)?;
+        next = match &mut source {
+            NextSource::Cpu(s) => {
+                logits = model.step(seq, next)?;
+                s.sample(&logits, &tokens)?
+            }
+            NextSource::Gpu(g) => {
+                g.note_token(next);
+                model.step_and_sample(seq, next, g)?
+            }
+        };
     }
 
     // Flush the decoder tail unless a stop consumed the stream. Flushed text

@@ -14,15 +14,66 @@ const BLOCK: u32 = 256;
 /// Warps per block in attn_decode (must not exceed MAX_WARPS in attention.mojo).
 const ATTN_BLOCK: u32 = 128;
 
+/// Per-block logits slice of the sampling kernels (SAMPLE_CHUNK in
+/// sampling.mojo — staged in shared memory by topk_partial_f32).
+const SAMPLE_CHUNK: usize = 4096;
+/// Largest top_k the GPU draw supports (MAX_TOPK in sampling.mojo).
+pub const SAMPLE_MAX_TOPK: usize = 64;
+/// Largest vocab the GPU top-k draw supports (MAX_SAMPLE_BLOCKS * CHUNK).
+pub const SAMPLE_MAX_VOCAB: usize = 64 * SAMPLE_CHUNK;
+/// Scratch capacity in (f32, i32) pairs both sampling paths share
+/// (top-k: MAX_SAMPLE_BLOCKS * MAX_TOPK partials; argmax: one per block).
+pub const SAMPLE_SCRATCH_PAIRS: usize = 64 * SAMPLE_MAX_TOPK;
+
 pub struct Kernels {
     device: Arc<dyn Device>,
     artifacts: KernelArtifacts,
+    /// Codebook grid tables for the IQ formats, uploaded once at load
+    /// (ggml iq2xs/iq2s/iq3s grids + ksigns; kernels take them as device
+    /// pointers — the constant-table trick llama.cpp's CUDA kernels use).
+    iq_tables: IqTables,
+}
+
+/// Device-resident ggml codebook tables (LE bytes of the u64/u32 grids).
+struct IqTables {
+    iq2xs_grid: DevBuffer,
+    iq2s_grid: DevBuffer,
+    iq3s_grid: DevBuffer,
+    iq2xxs_grid: DevBuffer,
+    iq3xxs_grid: DevBuffer,
+    iq1s_grid: DevBuffer,
+    ksigns: DevBuffer,
+}
+
+impl IqTables {
+    fn upload(device: &dyn Device) -> Result<Self> {
+        use forge_formats::iq_tables::{
+            IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS,
+        };
+        let up = |bytes: &[u8]| -> Result<DevBuffer> {
+            let buf = device.alloc(bytes.len(), forge_types::MemKind::Device, forge_hal::Pool::Weights)?;
+            device.write(bytes, &buf, 0)?;
+            Ok(buf)
+        };
+        let u64s = |t: &[u64]| -> Vec<u8> { t.iter().flat_map(|v| v.to_le_bytes()).collect() };
+        let u32s = |t: &[u32]| -> Vec<u8> { t.iter().flat_map(|v| v.to_le_bytes()).collect() };
+        Ok(Self {
+            iq2xs_grid: up(&u64s(&IQ2XS_GRID))?,
+            iq2s_grid: up(&u64s(&IQ2S_GRID))?,
+            iq3s_grid: up(&u32s(&IQ3S_GRID))?,
+            iq2xxs_grid: up(&u64s(&IQ2XXS_GRID))?,
+            iq3xxs_grid: up(&u32s(&IQ3XXS_GRID))?,
+            iq1s_grid: up(&u64s(&IQ1S_GRID))?,
+            ksigns: up(&KSIGNS_IQ2XS)?,
+        })
+    }
 }
 
 impl Kernels {
     pub fn load(device: Arc<dyn Device>) -> Result<Self> {
         let artifacts = KernelArtifacts::load(device.as_ref())?;
-        Ok(Self { device, artifacts })
+        let iq_tables = IqTables::upload(device.as_ref())?;
+        Ok(Self { device, artifacts, iq_tables })
     }
 
     pub fn artifacts(&self) -> &KernelArtifacts {
@@ -1918,6 +1969,4287 @@ impl Kernels {
             .buf(parts)
             .scalar(n_q_heads as i64)
             .scalar(n_splits as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Column bound of the dp4a kernels that quantize x from global memory
+    /// into shared int8 (plain + residual variants; X_MAX in decode_dp4a.mojo).
+    pub const DP4A_MAX_COLS: usize = 16384;
+
+
+    fn check_dp4a_cols(cols: usize, quant_mult: usize, name: &str) -> Result<()> {
+        if cols > Self::DP4A_MAX_COLS || !cols.is_multiple_of(quant_mult) {
+            return Err(ForgeError::Kernel(format!(
+                "{name} requires cols % {quant_mult} == 0 and cols <= {}, got {cols}",
+                Self::DP4A_MAX_COLS
+            )));
+        }
+        Ok(())
+    }
+
+    /// Q8_0 GEMV with int8-quantized activations (q8_1) and dp4a dots.
+    /// Not bit-exact vs gemv_q8_0_f16 (activation quantization rounding).
+    pub fn gemv_q8_0_dp4a_f16(
+        &self,
+        y: &DevBuffer,
+        w_q8: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_dp4a_cols(cols, 32, "gemv_q8_0_dp4a")?;
+        let k = self.artifacts.get("gemv_q8_0_dp4a_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w_q8)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Q4_K GEMV with int8-quantized activations (q8_1) and dp4a dots.
+    pub fn gemv_q4_k_dp4a_f16(
+        &self,
+        y: &DevBuffer,
+        w_q4k: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_dp4a_cols(cols, 256, "gemv_q4_k_dp4a")?;
+        let k = self.artifacts.get("gemv_q4_k_dp4a_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w_q4k)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Q4_K logit GEMV (f32 out) with dp4a dots.
+    pub fn gemv_q4_k_dp4a_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w_q4k: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_dp4a_cols(cols, 256, "gemv_q4_k_dp4a_out_f32")?;
+        let k = self.artifacts.get("gemv_q4_k_dp4a_out_f32")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w_q4k)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + Q8_0 dp4a GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_q8_0_dp4a_f16(
+        &self,
+        y: &DevBuffer,
+        w_q8: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 32, "gemv_norm_q8_0_dp4a")?;
+        let k = self.artifacts.get("gemv_norm_q8_0_dp4a_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w_q8)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + Q4_K dp4a GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_q4_k_dp4a_f16(
+        &self,
+        y: &DevBuffer,
+        w_q4k: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_q4_k_dp4a")?;
+        let k = self.artifacts.get("gemv_norm_q4_k_dp4a_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w_q4k)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + Q6_K dp4a GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_q6_k_dp4a_f16(
+        &self,
+        y: &DevBuffer,
+        w_q6k: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_q6_k_dp4a")?;
+        let k = self.artifacts.get("gemv_norm_q6_k_dp4a_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w_q6k)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up Q8_0 dp4a GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_q8_0_dp4a_f16(
+        &self,
+        act: &DevBuffer,
+        w_q8: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 32, "gemv_norm_silu_q8_0_dp4a")?;
+        let k = self.artifacts.get("gemv_norm_silu_q8_0_dp4a_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w_q8)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up Q4_K dp4a GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_q4_k_dp4a_f16(
+        &self,
+        act: &DevBuffer,
+        w_q4k: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_silu_q4_k_dp4a")?;
+        let k = self.artifacts.get("gemv_norm_silu_q4_k_dp4a_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w_q4k)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up Q6_K dp4a GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_q6_k_dp4a_f16(
+        &self,
+        act: &DevBuffer,
+        w_q6k: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_silu_q6_k_dp4a")?;
+        let k = self.artifacts.get("gemv_norm_silu_q6_k_dp4a_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w_q6k)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Q8_0 dp4a GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_q8_0_dp4a_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w_q8: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_dp4a_cols(cols, 32, "gemv_residual_q8_0_dp4a")?;
+        let k = self.artifacts.get("gemv_residual_q8_0_dp4a_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w_q8)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Q6_K dp4a GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_q6_k_dp4a_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w_q6k: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_dp4a_cols(cols, 256, "gemv_residual_q6_k_dp4a")?;
+        let k = self.artifacts.get("gemv_residual_q6_k_dp4a_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w_q6k)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Q6_K logit GEMV (f32 out) with dp4a dots.
+    pub fn gemv_q6_k_dp4a_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w_q6k: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_dp4a_cols(cols, 256, "gemv_q6_k_dp4a_out_f32")?;
+        let k = self.artifacts.get("gemv_q6_k_dp4a_out_f32")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w_q6k)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Q4_K dp4a GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_q4_k_dp4a_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w_q4k: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_dp4a_cols(cols, 256, "gemv_residual_q4_k_dp4a")?;
+        let k = self.artifacts.get("gemv_residual_q4_k_dp4a_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w_q4k)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// In-place repetition penalty over `n_ids` distinct token ids staged in
+    /// `ids` (i32). Callers must deduplicate: the kernel applies the penalty
+    /// once per listed id.
+    pub fn sample_penalize_f32(
+        &self,
+        logits: &DevBuffer,
+        ids: &DevBuffer,
+        n_ids: usize,
+        penalty: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("penalize_f32")?;
+        let cfg = LaunchConfig::linear(n_ids as u32, BLOCK);
+        let args = LaunchArgs::new()
+            .buf(logits)
+            .buf(ids)
+            .scalar(n_ids as i64)
+            .scalar(penalty);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Greedy argmax over f32 logits; the winning index lands in the first
+    /// 4 bytes of `out` (i32) and its logprob slot (f32, 0 for greedy) in the
+    /// next 4. Ties resolve to the lowest index like a sequential CPU scan.
+    /// `scratch_vals`/`scratch_idx` hold the per-block partials
+    /// (>= SAMPLE_SCRATCH_PAIRS entries each).
+    pub fn sample_argmax_f32(
+        &self,
+        out: &DevBuffer,
+        scratch_vals: &DevBuffer,
+        scratch_idx: &DevBuffer,
+        logits: &DevBuffer,
+        vocab: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let n_blocks = vocab.div_ceil(SAMPLE_CHUNK);
+        if n_blocks > SAMPLE_SCRATCH_PAIRS {
+            return Err(ForgeError::Unsupported(format!(
+                "sample_argmax: vocab {vocab} exceeds scratch capacity"
+            )));
+        }
+        let kp = self.artifacts.get("argmax_partial_f32")?;
+        let cfg = LaunchConfig {
+            grid: (n_blocks as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(logits)
+            .buf(scratch_vals)
+            .buf(scratch_idx)
+            .scalar(vocab as i64)
+            .scalar(SAMPLE_CHUNK as i64);
+        self.device.launch(kp, &cfg, &args, stream)?;
+
+        let kf = self.artifacts.get("argmax_final_f32")?;
+        let cfg = LaunchConfig {
+            grid: (1, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf_at(out, 4)?
+            .buf(scratch_vals)
+            .buf(scratch_idx)
+            .scalar(n_blocks as i64);
+        self.device.launch(kf, &cfg, &args, stream)
+    }
+
+    /// Categorical draw over f32 logits: top-k (k <= SAMPLE_MAX_TOPK)
+    /// selection, temperature softmax, min-p floor, top-p cut, then a
+    /// deterministic counter-hash draw on (seed, step). The sampled id (i32)
+    /// lands in the first 4 bytes of `out`, its top-k-softmax logprob (f32)
+    /// in the next 4.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_topk_f32(
+        &self,
+        out: &DevBuffer,
+        scratch_vals: &DevBuffer,
+        scratch_idx: &DevBuffer,
+        logits: &DevBuffer,
+        vocab: usize,
+        k: usize,
+        inv_t: f32,
+        top_p: f32,
+        min_p: f32,
+        seed: u64,
+        step: u64,
+        stream: &Stream,
+    ) -> Result<()> {
+        if k == 0 || k > SAMPLE_MAX_TOPK {
+            return Err(ForgeError::Unsupported(format!(
+                "sample_topk: k {k} outside 1..={SAMPLE_MAX_TOPK}"
+            )));
+        }
+        if vocab > SAMPLE_MAX_VOCAB {
+            return Err(ForgeError::Unsupported(format!(
+                "sample_topk: vocab {vocab} exceeds {SAMPLE_MAX_VOCAB}"
+            )));
+        }
+        let n_blocks = vocab.div_ceil(SAMPLE_CHUNK);
+        let kp = self.artifacts.get("topk_partial_f32")?;
+        let cfg = LaunchConfig {
+            grid: (n_blocks as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(logits)
+            .buf(scratch_vals)
+            .buf(scratch_idx)
+            .scalar(vocab as i64)
+            .scalar(SAMPLE_CHUNK as i64)
+            .scalar(k as i64);
+        self.device.launch(kp, &cfg, &args, stream)?;
+
+        let kf = self.artifacts.get("topk_final_f32")?;
+        let cfg = LaunchConfig {
+            grid: (1, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf_at(out, 4)?
+            .buf(scratch_vals)
+            .buf(scratch_idx)
+            .scalar((n_blocks * k) as i64)
+            .scalar(k as i64)
+            .scalar(inv_t)
+            .scalar(top_p)
+            .scalar(min_p)
+            .scalar(seed)
+            .scalar(step);
+        self.device.launch(kf, &cfg, &args, stream)
+    }
+
+    /// y = W·x with W in GGML Q5_K blocks, x/y f16. Warp per row.
+    pub fn gemv_q5_k_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) || cols > 32768 {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q5_k requires cols % 256 == 0 and cols <= 32768, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q5_k_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over Q5_K weights → f32 logits.
+    pub fn gemv_q5_k_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) || cols > 32768 {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q5_k_out_f32 requires cols % 256 == 0 and cols <= 32768, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q5_k_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over Q5_K weights and row-major f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q5_k_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_q5_k_f16_at(y, w, 0, x, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_q5_k_f16` over a row window of a fused weight matrix:
+    /// `w_byte_off` addresses the first block of the window's first row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q5_k_f16_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_q5_k requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_q5_k_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + Q5_K GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_q5_k_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_q5_k")?;
+        let k = self.artifacts.get("gemv_norm_q5_k_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up Q5_K GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_q5_k_f16(
+        &self,
+        act: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_silu_q5_k")?;
+        let k = self.artifacts.get("gemv_norm_silu_q5_k_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Q5_K GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_q5_k_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) || cols > 32768 {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_q5_k requires cols % 256 == 0 and cols <= 32768, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_q5_k_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// y = W·x with W in GGML Q3_K blocks, x/y f16. Warp per row.
+    pub fn gemv_q3_k_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q3_k requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q3_k_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over Q3_K weights → f32 logits.
+    pub fn gemv_q3_k_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q3_k_out_f32 requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q3_k_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over Q3_K weights and row-major f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q3_k_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_q3_k_f16_at(y, w, 0, x, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_q3_k_f16` over a row window of a fused weight matrix:
+    /// `w_byte_off` addresses the first block of the window's first row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q3_k_f16_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_q3_k requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_q3_k_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + Q3_K GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_q3_k_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_q3_k")?;
+        let k = self.artifacts.get("gemv_norm_q3_k_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up Q3_K GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_q3_k_f16(
+        &self,
+        act: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_silu_q3_k")?;
+        let k = self.artifacts.get("gemv_norm_silu_q3_k_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Q3_K GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_q3_k_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_q3_k requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_q3_k_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// y = W·x with W in GGML Q2_K blocks, x/y f16. Warp per row.
+    pub fn gemv_q2_k_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) || cols > 32768 {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q2_k requires cols % 256 == 0 and cols <= 32768, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q2_k_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over Q2_K weights → f32 logits.
+    pub fn gemv_q2_k_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) || cols > 32768 {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q2_k_out_f32 requires cols % 256 == 0 and cols <= 32768, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q2_k_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over Q2_K weights and row-major f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q2_k_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_q2_k_f16_at(y, w, 0, x, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_q2_k_f16` over a row window of a fused weight matrix:
+    /// `w_byte_off` addresses the first block of the window's first row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q2_k_f16_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_q2_k requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_q2_k_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + Q2_K GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_q2_k_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_q2_k")?;
+        let k = self.artifacts.get("gemv_norm_q2_k_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up Q2_K GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_q2_k_f16(
+        &self,
+        act: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_silu_q2_k")?;
+        let k = self.artifacts.get("gemv_norm_silu_q2_k_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Q2_K GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_q2_k_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) || cols > 32768 {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_q2_k requires cols % 256 == 0 and cols <= 32768, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_q2_k_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// y = W·x with W in GGML Q4_0 blocks, x/y f16. Warp per row.
+    pub fn gemv_q4_0_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q4_0 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q4_0_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over Q4_0 weights → f32 logits.
+    pub fn gemv_q4_0_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q4_0_out_f32 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q4_0_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over Q4_0 weights and row-major f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q4_0_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_q4_0_f16_at(y, w, 0, x, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_q4_0_f16` over a row window of a fused weight matrix:
+    /// `w_byte_off` addresses the first block of the window's first row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q4_0_f16_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_q4_0 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_q4_0_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + Q4_0 GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_q4_0_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 32, "gemv_norm_q4_0")?;
+        let k = self.artifacts.get("gemv_norm_q4_0_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up Q4_0 GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_q4_0_f16(
+        &self,
+        act: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 32, "gemv_norm_silu_q4_0")?;
+        let k = self.artifacts.get("gemv_norm_silu_q4_0_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Q4_0 GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_q4_0_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_q4_0 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_q4_0_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// y = W·x with W in GGML Q4_1 blocks, x/y f16. Warp per row.
+    pub fn gemv_q4_1_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q4_1 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q4_1_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over Q4_1 weights → f32 logits.
+    pub fn gemv_q4_1_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q4_1_out_f32 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q4_1_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over Q4_1 weights and row-major f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q4_1_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_q4_1_f16_at(y, w, 0, x, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_q4_1_f16` over a row window of a fused weight matrix:
+    /// `w_byte_off` addresses the first block of the window's first row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q4_1_f16_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_q4_1 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_q4_1_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + Q4_1 GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_q4_1_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 32, "gemv_norm_q4_1")?;
+        let k = self.artifacts.get("gemv_norm_q4_1_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up Q4_1 GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_q4_1_f16(
+        &self,
+        act: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 32, "gemv_norm_silu_q4_1")?;
+        let k = self.artifacts.get("gemv_norm_silu_q4_1_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Q4_1 GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_q4_1_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_q4_1 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_q4_1_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// y = W·x with W in GGML Q5_0 blocks, x/y f16. Warp per row.
+    pub fn gemv_q5_0_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q5_0 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q5_0_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over Q5_0 weights → f32 logits.
+    pub fn gemv_q5_0_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q5_0_out_f32 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q5_0_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over Q5_0 weights and row-major f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q5_0_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_q5_0_f16_at(y, w, 0, x, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_q5_0_f16` over a row window of a fused weight matrix:
+    /// `w_byte_off` addresses the first block of the window's first row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q5_0_f16_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_q5_0 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_q5_0_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + Q5_0 GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_q5_0_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 32, "gemv_norm_q5_0")?;
+        let k = self.artifacts.get("gemv_norm_q5_0_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up Q5_0 GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_q5_0_f16(
+        &self,
+        act: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 32, "gemv_norm_silu_q5_0")?;
+        let k = self.artifacts.get("gemv_norm_silu_q5_0_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Q5_0 GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_q5_0_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_q5_0 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_q5_0_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// y = W·x with W in GGML Q5_1 blocks, x/y f16. Warp per row.
+    pub fn gemv_q5_1_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q5_1 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q5_1_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over Q5_1 weights → f32 logits.
+    pub fn gemv_q5_1_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q5_1_out_f32 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q5_1_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over Q5_1 weights and row-major f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q5_1_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_q5_1_f16_at(y, w, 0, x, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_q5_1_f16` over a row window of a fused weight matrix:
+    /// `w_byte_off` addresses the first block of the window's first row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q5_1_f16_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_q5_1 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_q5_1_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + Q5_1 GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_q5_1_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 32, "gemv_norm_q5_1")?;
+        let k = self.artifacts.get("gemv_norm_q5_1_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up Q5_1 GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_q5_1_f16(
+        &self,
+        act: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 32, "gemv_norm_silu_q5_1")?;
+        let k = self.artifacts.get("gemv_norm_silu_q5_1_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Q5_1 GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_q5_1_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_q5_1 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_q5_1_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// y = W·x with W in GGML IQ4_NL blocks, x/y f16. Warp per row.
+    pub fn gemv_iq4_nl_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_iq4_nl requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_iq4_nl_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over IQ4_NL weights → f32 logits.
+    pub fn gemv_iq4_nl_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_iq4_nl_out_f32 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_iq4_nl_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over IQ4_NL weights and row-major f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iq4_nl_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_iq4_nl_f16_at(y, w, 0, x, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_iq4_nl_f16` over a row window of a fused weight matrix:
+    /// `w_byte_off` addresses the first block of the window's first row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iq4_nl_f16_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_iq4_nl requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_iq4_nl_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + IQ4_NL GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_iq4_nl_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 32, "gemv_norm_iq4_nl")?;
+        let k = self.artifacts.get("gemv_norm_iq4_nl_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up IQ4_NL GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_iq4_nl_f16(
+        &self,
+        act: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 32, "gemv_norm_silu_iq4_nl")?;
+        let k = self.artifacts.get("gemv_norm_silu_iq4_nl_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// IQ4_NL GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_iq4_nl_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_iq4_nl requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_iq4_nl_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// y = W·x with W in GGML IQ4_XS blocks, x/y f16. Warp per row.
+    pub fn gemv_iq4_xs_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_iq4_xs requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_iq4_xs_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over IQ4_XS weights → f32 logits.
+    pub fn gemv_iq4_xs_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_iq4_xs_out_f32 requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_iq4_xs_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over IQ4_XS weights and row-major f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iq4_xs_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_iq4_xs_f16_at(y, w, 0, x, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_iq4_xs_f16` over a row window of a fused weight matrix:
+    /// `w_byte_off` addresses the first block of the window's first row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iq4_xs_f16_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_iq4_xs requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_iq4_xs_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + IQ4_XS GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_iq4_xs_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_iq4_xs")?;
+        let k = self.artifacts.get("gemv_norm_iq4_xs_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up IQ4_XS GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_iq4_xs_f16(
+        &self,
+        act: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_silu_iq4_xs")?;
+        let k = self.artifacts.get("gemv_norm_silu_iq4_xs_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// IQ4_XS GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_iq4_xs_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_iq4_xs requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_iq4_xs_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// y = W·x with W in GGML MXFP4 blocks, x/y f16. Warp per row.
+    pub fn gemv_mxfp4_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_mxfp4 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_mxfp4_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over MXFP4 weights → f32 logits.
+    pub fn gemv_mxfp4_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_mxfp4_out_f32 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_mxfp4_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over MXFP4 weights and row-major f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mxfp4_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_mxfp4_f16_at(y, w, 0, x, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_mxfp4_f16` over a row window of a fused weight matrix:
+    /// `w_byte_off` addresses the first block of the window's first row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mxfp4_f16_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_mxfp4 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_mxfp4_gguf_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + MXFP4 GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_mxfp4_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 32, "gemv_norm_mxfp4")?;
+        let k = self.artifacts.get("gemv_norm_mxfp4_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up MXFP4 GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_mxfp4_f16(
+        &self,
+        act: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 32, "gemv_norm_silu_mxfp4")?;
+        let k = self.artifacts.get("gemv_norm_silu_mxfp4_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// MXFP4 GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_mxfp4_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_mxfp4 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_mxfp4_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// y = W·x with W in GGML IQ2_XS superblocks, x/y f16. Warp per row.
+    pub fn gemv_iq2_xs_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_iq2_xs requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_iq2_xs_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(&self.iq_tables.iq2xs_grid)
+            .buf(&self.iq_tables.ksigns)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over IQ2_XS weights → f32 logits.
+    pub fn gemv_iq2_xs_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_iq2_xs_out_f32 requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_iq2_xs_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(&self.iq_tables.iq2xs_grid)
+            .buf(&self.iq_tables.ksigns)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over IQ2_XS weights and row-major f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iq2_xs_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_iq2_xs_f16_at(y, w, 0, x, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_iq2_xs_f16` over a row window of a fused weight matrix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iq2_xs_f16_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_iq2_xs requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_iq2_xs_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(&self.iq_tables.iq2xs_grid)
+            .buf(&self.iq_tables.ksigns)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + IQ2_XS GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_iq2_xs_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_iq2_xs")?;
+        let k = self.artifacts.get("gemv_norm_iq2_xs_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(&self.iq_tables.iq2xs_grid)
+            .buf(&self.iq_tables.ksigns)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up IQ2_XS GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_iq2_xs_f16(
+        &self,
+        act: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_silu_iq2_xs")?;
+        let k = self.artifacts.get("gemv_norm_silu_iq2_xs_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w)
+            .buf(&self.iq_tables.iq2xs_grid)
+            .buf(&self.iq_tables.ksigns)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// IQ2_XS GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_iq2_xs_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_iq2_xs requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_iq2_xs_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w)
+            .buf(&self.iq_tables.iq2xs_grid)
+            .buf(&self.iq_tables.ksigns)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+    /// y = W·x with W in GGML IQ2_S superblocks, x/y f16. Warp per row.
+    pub fn gemv_iq2_s_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_iq2_s requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_iq2_s_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(&self.iq_tables.iq2s_grid)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over IQ2_S weights → f32 logits.
+    pub fn gemv_iq2_s_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_iq2_s_out_f32 requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_iq2_s_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(&self.iq_tables.iq2s_grid)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over IQ2_S weights and row-major f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iq2_s_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_iq2_s_f16_at(y, w, 0, x, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_iq2_s_f16` over a row window of a fused weight matrix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iq2_s_f16_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_iq2_s requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_iq2_s_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(&self.iq_tables.iq2s_grid)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + IQ2_S GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_iq2_s_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_iq2_s")?;
+        let k = self.artifacts.get("gemv_norm_iq2_s_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(&self.iq_tables.iq2s_grid)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up IQ2_S GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_iq2_s_f16(
+        &self,
+        act: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_silu_iq2_s")?;
+        let k = self.artifacts.get("gemv_norm_silu_iq2_s_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w)
+            .buf(&self.iq_tables.iq2s_grid)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// IQ2_S GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_iq2_s_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_iq2_s requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_iq2_s_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w)
+            .buf(&self.iq_tables.iq2s_grid)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+    /// y = W·x with W in GGML IQ3_S superblocks, x/y f16. Warp per row.
+    pub fn gemv_iq3_s_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_iq3_s requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_iq3_s_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(&self.iq_tables.iq3s_grid)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over IQ3_S weights → f32 logits.
+    pub fn gemv_iq3_s_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_iq3_s_out_f32 requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_iq3_s_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(&self.iq_tables.iq3s_grid)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over IQ3_S weights and row-major f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iq3_s_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_iq3_s_f16_at(y, w, 0, x, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_iq3_s_f16` over a row window of a fused weight matrix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iq3_s_f16_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_iq3_s requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_iq3_s_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(&self.iq_tables.iq3s_grid)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + IQ3_S GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_iq3_s_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_iq3_s")?;
+        let k = self.artifacts.get("gemv_norm_iq3_s_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(&self.iq_tables.iq3s_grid)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up IQ3_S GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_iq3_s_f16(
+        &self,
+        act: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_silu_iq3_s")?;
+        let k = self.artifacts.get("gemv_norm_silu_iq3_s_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w)
+            .buf(&self.iq_tables.iq3s_grid)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// IQ3_S GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_iq3_s_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_iq3_s requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_iq3_s_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w)
+            .buf(&self.iq_tables.iq3s_grid)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// y = W·x with W in GGML IQ2_XXS superblocks, x/y f16. Warp per row.
+    pub fn gemv_iq2_xxs_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_iq2_xxs requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_iq2_xxs_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(&self.iq_tables.iq2xxs_grid)
+            .buf(&self.iq_tables.ksigns)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over IQ2_XXS weights → f32 logits.
+    pub fn gemv_iq2_xxs_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_iq2_xxs_out_f32 requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_iq2_xxs_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(&self.iq_tables.iq2xxs_grid)
+            .buf(&self.iq_tables.ksigns)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over IQ2_XXS weights and row-major f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iq2_xxs_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_iq2_xxs_f16_at(y, w, 0, x, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_iq2_xxs_f16` over a row window of a fused weight matrix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iq2_xxs_f16_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_iq2_xxs requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_iq2_xxs_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(&self.iq_tables.iq2xxs_grid)
+            .buf(&self.iq_tables.ksigns)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + IQ2_XXS GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_iq2_xxs_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_iq2_xxs")?;
+        let k = self.artifacts.get("gemv_norm_iq2_xxs_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(&self.iq_tables.iq2xxs_grid)
+            .buf(&self.iq_tables.ksigns)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up IQ2_XXS GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_iq2_xxs_f16(
+        &self,
+        act: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_silu_iq2_xxs")?;
+        let k = self.artifacts.get("gemv_norm_silu_iq2_xxs_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w)
+            .buf(&self.iq_tables.iq2xxs_grid)
+            .buf(&self.iq_tables.ksigns)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// IQ2_XXS GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_iq2_xxs_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_iq2_xxs requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_iq2_xxs_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w)
+            .buf(&self.iq_tables.iq2xxs_grid)
+            .buf(&self.iq_tables.ksigns)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+    /// y = W·x with W in GGML IQ3_XXS superblocks, x/y f16. Warp per row.
+    pub fn gemv_iq3_xxs_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_iq3_xxs requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_iq3_xxs_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(&self.iq_tables.iq3xxs_grid)
+            .buf(&self.iq_tables.ksigns)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over IQ3_XXS weights → f32 logits.
+    pub fn gemv_iq3_xxs_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_iq3_xxs_out_f32 requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_iq3_xxs_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(&self.iq_tables.iq3xxs_grid)
+            .buf(&self.iq_tables.ksigns)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over IQ3_XXS weights and row-major f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iq3_xxs_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_iq3_xxs_f16_at(y, w, 0, x, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_iq3_xxs_f16` over a row window of a fused weight matrix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iq3_xxs_f16_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_iq3_xxs requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_iq3_xxs_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(&self.iq_tables.iq3xxs_grid)
+            .buf(&self.iq_tables.ksigns)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + IQ3_XXS GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_iq3_xxs_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_iq3_xxs")?;
+        let k = self.artifacts.get("gemv_norm_iq3_xxs_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(&self.iq_tables.iq3xxs_grid)
+            .buf(&self.iq_tables.ksigns)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up IQ3_XXS GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_iq3_xxs_f16(
+        &self,
+        act: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_silu_iq3_xxs")?;
+        let k = self.artifacts.get("gemv_norm_silu_iq3_xxs_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w)
+            .buf(&self.iq_tables.iq3xxs_grid)
+            .buf(&self.iq_tables.ksigns)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// IQ3_XXS GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_iq3_xxs_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_iq3_xxs requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_iq3_xxs_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w)
+            .buf(&self.iq_tables.iq3xxs_grid)
+            .buf(&self.iq_tables.ksigns)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+    /// y = W·x with W in GGML IQ1_S superblocks, x/y f16. Warp per row.
+    pub fn gemv_iq1_s_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_iq1_s requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_iq1_s_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(&self.iq_tables.iq1s_grid)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over IQ1_S weights → f32 logits.
+    pub fn gemv_iq1_s_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_iq1_s_out_f32 requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_iq1_s_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(&self.iq_tables.iq1s_grid)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over IQ1_S weights and row-major f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iq1_s_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_iq1_s_f16_at(y, w, 0, x, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_iq1_s_f16` over a row window of a fused weight matrix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iq1_s_f16_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_iq1_s requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_iq1_s_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(&self.iq_tables.iq1s_grid)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + IQ1_S GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_iq1_s_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_iq1_s")?;
+        let k = self.artifacts.get("gemv_norm_iq1_s_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(&self.iq_tables.iq1s_grid)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up IQ1_S GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_iq1_s_f16(
+        &self,
+        act: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_silu_iq1_s")?;
+        let k = self.artifacts.get("gemv_norm_silu_iq1_s_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w)
+            .buf(&self.iq_tables.iq1s_grid)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// IQ1_S GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_iq1_s_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_iq1_s requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_iq1_s_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w)
+            .buf(&self.iq_tables.iq1s_grid)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+    /// y = W·x with W in GGML IQ1_M superblocks, x/y f16. Warp per row.
+    pub fn gemv_iq1_m_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_iq1_m requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_iq1_m_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(&self.iq_tables.iq1s_grid)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Logit GEMV over IQ1_M weights → f32 logits.
+    pub fn gemv_iq1_m_out_f32(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_iq1_m_out_f32 requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_iq1_m_out_f32_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf(w)
+            .buf(&self.iq_tables.iq1s_grid)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Y[t, row] = W·x[t] over IQ1_M weights and row-major f16 activations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iq1_m_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_iq1_m_f16_at(y, w, 0, x, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_iq1_m_f16` over a row window of a fused weight matrix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iq1_m_f16_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_iq1_m requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_iq1_m_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w, w_byte_off)?
+            .buf(&self.iq_tables.iq1s_grid)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + IQ1_M GEMV (decode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_iq1_m_f16(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ss_from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_iq1_m")?;
+        let k = self.artifacts.get("gemv_norm_iq1_m_f16")?;
+        let rpw = Self::fused_rows_per_warp(rows);
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(&self.iq_tables.iq1s_grid)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(if ss_from_h16 { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused rmsnorm-recompute + gate|up IQ1_M GEMV + SiLU (decode FFN).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_norm_silu_iq1_m_f16(
+        &self,
+        act: &DevBuffer,
+        w: &DevBuffer,
+        h: &DevBuffer,
+        h32: &DevBuffer,
+        norm_w: &DevBuffer,
+        inter: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_fused_hidden(cols, 256, "gemv_norm_silu_iq1_m")?;
+        let k = self.artifacts.get("gemv_norm_silu_iq1_m_f16")?;
+        let rpw = Self::fused_rows_per_warp(inter);
+        let cfg = LaunchConfig {
+            grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(w)
+            .buf(&self.iq_tables.iq1s_grid)
+            .buf(h)
+            .buf(h32)
+            .buf(norm_w)
+            .scalar(cols as i64)
+            .scalar(inter as i64)
+            .scalar(eps)
+            .scalar(rpw as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// IQ1_M GEMV + residual add (see gemv_residual_q8_0_f16).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_residual_iq1_m_f16(
+        &self,
+        h_io: &DevBuffer,
+        h32: &DevBuffer,
+        w: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_residual_iq1_m requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_residual_iq1_m_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(h_io)
+            .buf(h32)
+            .buf(w)
+            .buf(&self.iq_tables.iq1s_grid)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 }

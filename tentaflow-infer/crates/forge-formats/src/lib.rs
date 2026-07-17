@@ -7,6 +7,7 @@
 
 pub mod arch;
 pub mod dequant;
+pub mod iq_tables;
 pub mod gguf;
 pub mod hf_config;
 pub mod nvfp4;

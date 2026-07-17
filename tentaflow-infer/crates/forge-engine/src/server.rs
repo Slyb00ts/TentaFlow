@@ -14,7 +14,7 @@ use forge_types::{ForgeError, Result};
 use crate::generate::FinishReason;
 use crate::kv::SeqKv;
 use crate::model::{Model, MAX_PREFILL_CHUNK};
-use crate::sample::{Sampler, SamplingParams};
+use crate::sample::{GpuSampler, Sampler, SamplingParams};
 
 pub struct EngineRequest {
     pub prompt_tokens: Vec<u32>,
@@ -60,9 +60,26 @@ impl EngineHandle {
     }
 }
 
+/// Per-sequence sampling strategy: GPU (only the sampled id leaves the
+/// device) whenever the params fit the sampling kernels, CPU otherwise
+/// (unbounded top-k, future logprobs reporting).
+enum SeqSampler {
+    Cpu(Sampler),
+    Gpu(GpuSampler),
+}
+
+/// The pending next-token state between scheduler iterations: the CPU path
+/// snapshots host logits and defers the draw; the GPU path draws immediately
+/// after its own step (the shared device logits buffer is overwritten by
+/// whichever sequence runs next), so it carries the drawn token instead.
+enum PendingNext {
+    Logits(Vec<f32>),
+    Token(u32),
+}
+
 struct ActiveSeq<'t> {
     seq: SeqKv,
-    sampler: Sampler,
+    sampler: SeqSampler,
     decoder: StreamDecoder<'t>,
     stops: StopMatcher,
     events: mpsc::Sender<EngineEvent>,
@@ -72,7 +89,7 @@ struct ActiveSeq<'t> {
     max_tokens: usize,
     eos_ids: Vec<u32>,
     prompt_len: usize,
-    logits: Option<Vec<f32>>,
+    next: Option<PendingNext>,
     /// Client hang-up detected; sequence is torn down at the next iteration.
     dead: bool,
 }
@@ -163,9 +180,14 @@ fn worker<'t>(
                 continue;
             }
             let prompt_len = sub.req.prompt_tokens.len();
+            let sampler = if model.gpu_sampling_supported(&sub.req.sampling) {
+                SeqSampler::Gpu(GpuSampler::new(sub.req.sampling.clone()))
+            } else {
+                SeqSampler::Cpu(Sampler::new(sub.req.sampling.clone()))
+            };
             active.push(ActiveSeq {
                 seq: model.new_seq(),
-                sampler: Sampler::new(sub.req.sampling.clone()),
+                sampler,
                 decoder: StreamDecoder::new(tokenizer, true),
                 stops: StopMatcher::new(sub.req.stop.clone()),
                 events: sub.events,
@@ -174,7 +196,7 @@ fn worker<'t>(
                 max_tokens: sub.req.max_tokens.max(1),
                 eos_ids: sub.req.eos_ids,
                 prompt_len,
-                logits: None,
+                next: None,
                 dead: false,
             });
         }
@@ -215,16 +237,31 @@ fn advance(model: &mut Model, a: &mut ActiveSeq<'_>, prefill_chunk: usize) -> Re
         let chunk: Vec<u32> = a.pending_prompt.drain(..take).collect();
         let logits = model.prefill_chunk(&mut a.seq, &chunk)?;
         if a.pending_prompt.is_empty() {
-            a.logits = Some(logits);
+            a.next = Some(match &mut a.sampler {
+                SeqSampler::Cpu(_) => PendingNext::Logits(logits),
+                // The prefill logits are still device-resident: draw now,
+                // before another sequence overwrites the shared buffer.
+                SeqSampler::Gpu(g) => PendingNext::Token(model.sample_last_logits(g)?),
+            });
         }
         return Ok(());
     }
 
-    let logits = a
-        .logits
+    let next = match a
+        .next
         .take()
-        .ok_or_else(|| ForgeError::Scheduler("missing logits state".into()))?;
-    let next = a.sampler.sample(&logits, &a.generated)?;
+        .ok_or_else(|| ForgeError::Scheduler("missing next-token state".into()))?
+    {
+        PendingNext::Logits(logits) => match &mut a.sampler {
+            SeqSampler::Cpu(s) => s.sample(&logits, &a.generated)?,
+            SeqSampler::Gpu(_) => {
+                return Err(ForgeError::Scheduler(
+                    "GPU-sampled sequence carried host logits".into(),
+                ))
+            }
+        },
+        PendingNext::Token(t) => t,
+    };
 
     if a.eos_ids.contains(&next) {
         finish(a, FinishReason::Eos)?;
@@ -258,7 +295,13 @@ fn advance(model: &mut Model, a: &mut ActiveSeq<'_>, prefill_chunk: usize) -> Re
         return Ok(());
     }
 
-    a.logits = Some(model.step(&mut a.seq, next)?);
+    a.next = Some(match &mut a.sampler {
+        SeqSampler::Cpu(_) => PendingNext::Logits(model.step(&mut a.seq, next)?),
+        SeqSampler::Gpu(g) => {
+            g.note_token(next);
+            PendingNext::Token(model.step_and_sample(&mut a.seq, next, g)?)
+        }
+    });
     Ok(())
 }
 

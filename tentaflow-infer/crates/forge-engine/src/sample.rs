@@ -27,6 +27,42 @@ impl Default for SamplingParams {
     }
 }
 
+impl SamplingParams {
+    /// Clamp caller-supplied parameters into sane ranges so no combination
+    /// can empty the candidate set or inject NaN. Both the CPU and GPU
+    /// samplers run on the sanitized form.
+    pub fn sanitized(mut self) -> Self {
+        if !self.temperature.is_finite() || self.temperature < 0.0 {
+            self.temperature = 1.0;
+        }
+        if !self.top_p.is_finite() {
+            self.top_p = 1.0;
+        }
+        self.top_p = self.top_p.clamp(0.0, 1.0);
+        if self.top_p == 0.0 {
+            self.top_p = 1.0;
+        }
+        if !self.min_p.is_finite() {
+            self.min_p = 0.0;
+        }
+        self.min_p = self.min_p.clamp(0.0, 1.0);
+        if !self.repetition_penalty.is_finite() || self.repetition_penalty <= 0.0 {
+            self.repetition_penalty = 1.0;
+        }
+        self
+    }
+
+    /// The seed both samplers stream from: caller-provided or time-derived.
+    pub fn resolve_seed(&self) -> u64 {
+        self.seed.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E3779B97F4A7C15)
+        })
+    }
+}
+
 /// xorshift64* — deterministic per-request stream, no rand dependency.
 pub struct Rng(u64);
 
@@ -50,32 +86,9 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    pub fn new(mut params: SamplingParams) -> Self {
-        // Caller-supplied parameters are clamped into sane ranges so no
-        // combination can empty the candidate set or inject NaN.
-        if !params.temperature.is_finite() || params.temperature < 0.0 {
-            params.temperature = 1.0;
-        }
-        if !params.top_p.is_finite() {
-            params.top_p = 1.0;
-        }
-        params.top_p = params.top_p.clamp(0.0, 1.0);
-        if params.top_p == 0.0 {
-            params.top_p = 1.0;
-        }
-        if !params.min_p.is_finite() {
-            params.min_p = 0.0;
-        }
-        params.min_p = params.min_p.clamp(0.0, 1.0);
-        if !params.repetition_penalty.is_finite() || params.repetition_penalty <= 0.0 {
-            params.repetition_penalty = 1.0;
-        }
-        let seed = params.seed.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0x9E3779B97F4A7C15)
-        });
+    pub fn new(params: SamplingParams) -> Self {
+        let params = params.sanitized();
+        let seed = params.resolve_seed();
         Sampler {
             params,
             rng: Rng::new(seed),
@@ -174,5 +187,71 @@ impl Sampler {
             }
         }
         Ok(candidates.last().expect("non-empty").0)
+    }
+}
+
+/// Per-sequence state for on-GPU sampling: the sanitized params, the
+/// deterministic (seed, step) counter the draw kernel hashes, and the
+/// distinct-token list feeding the repetition-penalty kernel. The logits
+/// themselves never leave the device — `Model::sample_last_logits` reads
+/// back only the 8-byte result.
+pub struct GpuSampler {
+    params: SamplingParams,
+    seed: u64,
+    step: u64,
+    /// Distinct generated token ids, i32 for direct device upload. Only
+    /// maintained when the penalty is active.
+    penalized: Vec<i32>,
+    seen: std::collections::HashSet<u32>,
+}
+
+impl GpuSampler {
+    /// Whether `params` (sanitized) fall inside what the GPU kernels
+    /// implement: greedy always; a categorical draw only for
+    /// 1..=SAMPLE_MAX_TOPK top-k (the kernel merges per-block top-k lists,
+    /// so an unbounded candidate set has no GPU form).
+    pub fn compatible(params: &SamplingParams) -> bool {
+        let p = params.clone().sanitized();
+        p.temperature <= 0.0 || (p.top_k >= 1 && p.top_k <= forge_kernels::SAMPLE_MAX_TOPK)
+    }
+
+    pub fn new(params: SamplingParams) -> Self {
+        let params = params.sanitized();
+        let seed = params.resolve_seed();
+        GpuSampler {
+            params,
+            seed,
+            step: 0,
+            penalized: Vec::new(),
+            seen: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Record a generated token for the repetition penalty (distinct ids
+    /// only — the penalty must not compound across repeats).
+    pub fn note_token(&mut self, id: u32) {
+        if self.params.repetition_penalty != 1.0 && self.seen.insert(id) {
+            self.penalized.push(id as i32);
+        }
+    }
+
+    pub fn params(&self) -> &SamplingParams {
+        &self.params
+    }
+
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// Distinct penalized ids, empty when the penalty is inactive.
+    pub fn penalized(&self) -> &[i32] {
+        &self.penalized
+    }
+
+    /// Current step counter; advances once per drawn token.
+    pub fn next_step(&mut self) -> u64 {
+        let s = self.step;
+        self.step += 1;
+        s
     }
 }

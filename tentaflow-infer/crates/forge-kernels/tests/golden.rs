@@ -511,3 +511,417 @@ fn attn_decode_matches_reference() {
         }
     }
 }
+
+// The dp4a GEMVs quantize activations to q8_1 (int8) before the dot, so
+// their tolerance vs the CPU dequant reference is wider than the f16-x
+// kernels': it covers the documented activation-quantization rounding, not
+// just accumulation order.
+#[test]
+fn gemv_q8_0_dp4a_matches_formats_dequant() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    let (rows, cols) = (33usize, 512usize);
+    let blocks_per_row = cols / 32;
+    let mut wq = Vec::with_capacity(rows * blocks_per_row * 34);
+    for r in 0..rows {
+        for b in 0..blocks_per_row {
+            let scale = f16::from_f32(0.015 + ((r + b) % 7) as f32 * 0.005);
+            wq.extend_from_slice(&scale.to_le_bytes());
+            for k in 0..32 {
+                wq.push((((r * 31 + b * 17 + k * 13) % 255) as i32 - 127) as i8 as u8);
+            }
+        }
+    }
+    let w_f32 =
+        forge_formats::dequant::dequantize_to_f32(DType::F32, QuantKind::Q8_0, &wq, rows * cols)
+            .unwrap();
+
+    let x: Vec<f32> = (0..cols)
+        .map(|i| f16::from_f32(fill(i) * 0.1).to_f32())
+        .collect();
+    let xb = upload_f16(dev.as_ref(), &x);
+    let yb = upload_f16(dev.as_ref(), &vec![0.0; rows]);
+    let wb = dev.alloc(wq.len(), MemKind::Device, Pool::Weights).unwrap();
+    dev.write(&wq, &wb, 0).unwrap();
+
+    kernels
+        .gemv_q8_0_dp4a_f16(&yb, &wb, &xb, rows, cols, &stream)
+        .unwrap();
+    dev.synchronize().unwrap();
+
+    let got = download_f16(dev.as_ref(), &yb, rows);
+    for r in 0..rows {
+        let want: f32 = (0..cols).map(|c| w_f32[r * cols + c] * x[c]).sum();
+        let rel = (got[r] - want).abs() / (want.abs() + 1.0);
+        assert!(rel < 0.03, "row {r}: got {} want {want}", got[r]);
+    }
+}
+
+#[test]
+fn gemv_q4_k_dp4a_matches_formats_dequant() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    let (rows, cols) = (33usize, 512usize);
+    let wq = build_q4k(rows, cols);
+    let w_f32 =
+        forge_formats::dequant::dequantize_to_f32(DType::F32, QuantKind::Q4K, &wq, rows * cols)
+            .unwrap();
+
+    let x: Vec<f32> = (0..cols)
+        .map(|i| f16::from_f32(fill(i) * 0.1).to_f32())
+        .collect();
+    let xb = upload_f16(dev.as_ref(), &x);
+    let yb = upload_f16(dev.as_ref(), &vec![0.0; rows]);
+    let wb = dev.alloc(wq.len(), MemKind::Device, Pool::Weights).unwrap();
+    dev.write(&wq, &wb, 0).unwrap();
+
+    kernels
+        .gemv_q4_k_dp4a_f16(&yb, &wb, &xb, rows, cols, &stream)
+        .unwrap();
+    dev.synchronize().unwrap();
+
+    let got = download_f16(dev.as_ref(), &yb, rows);
+    for r in 0..rows {
+        let want: f32 = (0..cols).map(|c| w_f32[r * cols + c] * x[c]).sum();
+        let rel = (got[r] - want).abs() / (want.abs() + 1.0);
+        assert!(rel < 0.03, "row {r}: got {} want {want}", got[r]);
+    }
+
+    // f32-logit variant over the same data must round to the f16 output.
+    let y32 = dev.alloc(rows * 4, MemKind::Device, Pool::Weights).unwrap();
+    kernels
+        .gemv_q4_k_dp4a_out_f32(&y32, &wb, &xb, rows, cols, &stream)
+        .unwrap();
+    dev.synchronize().unwrap();
+    let mut bytes = vec![0u8; rows * 4];
+    dev.read(&y32, 0, &mut bytes).unwrap();
+    let got32: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    for r in 0..rows {
+        assert_eq!(
+            f16::from_f32(got32[r]).to_f32(),
+            got[r],
+            "row {r}: f32 and f16 dp4a outputs diverge"
+        );
+    }
+}
+
+/// Deterministic quant streams for the extended formats: block headers get
+/// plausible small scales, everything else pseudo-random bytes — every scale
+/// branch / high-bit path gets exercised.
+fn build_quant(quant: QuantKind, rows: usize, cols: usize) -> Vec<u8> {
+    let bb = quant.block_bytes();
+    let be = quant.block_elems();
+    let blocks_per_row = cols / be;
+    let mut wq = Vec::with_capacity(rows * blocks_per_row * bb);
+    for r in 0..rows {
+        for b in 0..blocks_per_row {
+            let d = f16::from_f32(0.01 + ((r + b) % 7) as f32 * 0.005);
+            let dmin = f16::from_f32(0.006 + ((r + 2 * b) % 5) as f32 * 0.004);
+            let mut block: Vec<u8> = (0..bb)
+                .map(|i| ((r * 31 + b * 17 + i * 13 + 5) % 256) as u8)
+                .collect();
+            // Overwrite the f16 fields with sane magnitudes so the reference
+            // dot products stay in comparable range.
+            match quant {
+                QuantKind::Q5K | QuantKind::Q2K => {
+                    let (doff, moff) = if quant == QuantKind::Q5K { (0, 2) } else { (80, 82) };
+                    block[doff..doff + 2].copy_from_slice(&d.to_le_bytes());
+                    block[moff..moff + 2].copy_from_slice(&dmin.to_le_bytes());
+                }
+                QuantKind::Q3K => block[108..110].copy_from_slice(&d.to_le_bytes()),
+                QuantKind::Q4_0
+                | QuantKind::Q5_0
+                | QuantKind::IQ4NL
+                | QuantKind::IQ4XS
+                | QuantKind::IQ2XS
+                | QuantKind::IQ2S
+                | QuantKind::IQ3S
+                | QuantKind::IQ2XXS
+                | QuantKind::IQ3XXS
+                | QuantKind::IQ1S => {
+                    block[0..2].copy_from_slice(&d.to_le_bytes())
+                }
+                // E8M0 scale byte: keep exponents small (2^-9 .. 2^-3).
+                QuantKind::MXFP4 => block[0] = 118 + ((r + b) % 7) as u8,
+                // IQ1_M packs d in the top nibbles of the 4 scale words;
+                // force them to reassemble a small sane f16 (0x2400).
+                QuantKind::IQ1M => {
+                    block[49] &= 0x0F;
+                    block[51] &= 0x0F;
+                    block[53] = (block[53] & 0x0F) | 0x40;
+                    block[55] = (block[55] & 0x0F) | 0x20;
+                }
+                QuantKind::Q4_1 | QuantKind::Q5_1 => {
+                    block[0..2].copy_from_slice(&d.to_le_bytes());
+                    block[2..4].copy_from_slice(&dmin.to_le_bytes());
+                }
+                _ => unreachable!("unexpected format in build_quant"),
+            }
+            wq.extend_from_slice(&block);
+        }
+    }
+    wq
+}
+
+type GemvFn = fn(
+    &Kernels,
+    &DevBuffer,
+    &DevBuffer,
+    &DevBuffer,
+    usize,
+    usize,
+    &forge_hal::Stream,
+) -> forge_types::Result<()>;
+
+type GemmFn = fn(
+    &Kernels,
+    &DevBuffer,
+    &DevBuffer,
+    &DevBuffer,
+    usize,
+    usize,
+    usize,
+    &forge_hal::Stream,
+) -> forge_types::Result<()>;
+
+fn gemv_case(quant: QuantKind, gemv: GemvFn, out32: GemvFn) {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    let (rows, cols) = (33usize, 512usize);
+    let wq = build_quant(quant, rows, cols);
+    let w_f32 =
+        forge_formats::dequant::dequantize_to_f32(DType::F32, quant, &wq, rows * cols).unwrap();
+
+    let x: Vec<f32> = (0..cols)
+        .map(|i| f16::from_f32(fill(i) * 0.1).to_f32())
+        .collect();
+    let xb = upload_f16(dev.as_ref(), &x);
+    let yb = upload_f16(dev.as_ref(), &vec![0.0; rows]);
+    let wb = dev.alloc(wq.len(), MemKind::Device, Pool::Weights).unwrap();
+    dev.write(&wq, &wb, 0).unwrap();
+
+    gemv(&kernels, &yb, &wb, &xb, rows, cols, &stream).unwrap();
+    dev.synchronize().unwrap();
+    let got = download_f16(dev.as_ref(), &yb, rows);
+    for r in 0..rows {
+        let want: f32 = (0..cols).map(|c| w_f32[r * cols + c] * x[c]).sum();
+        let rel = (got[r] - want).abs() / (want.abs() + 1.0);
+        assert!(rel < 0.02, "{quant:?} row {r}: got {} want {want}", got[r]);
+    }
+
+    let y32 = dev.alloc(rows * 4, MemKind::Device, Pool::Weights).unwrap();
+    out32(&kernels, &y32, &wb, &xb, rows, cols, &stream).unwrap();
+    dev.synchronize().unwrap();
+    let mut bytes = vec![0u8; rows * 4];
+    dev.read(&y32, 0, &mut bytes).unwrap();
+    let got32: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    for r in 0..rows {
+        let want: f32 = (0..cols).map(|c| w_f32[r * cols + c] * x[c]).sum();
+        let rel = (got32[r] - want).abs() / (want.abs() + 1.0);
+        assert!(rel < 0.02, "{quant:?} f32 row {r}: got {} want {want}", got32[r]);
+    }
+}
+
+fn gemm_case(quant: QuantKind, gemm: GemmFn) {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    // Row/token tails on purpose (rows < 64, tokens not a tile multiple).
+    let (rows, cols, n_tokens) = (24usize, 512usize, 40usize);
+    let wq = build_quant(quant, rows, cols);
+    let w_f32 =
+        forge_formats::dequant::dequantize_to_f32(DType::F32, quant, &wq, rows * cols).unwrap();
+
+    let x: Vec<f32> = (0..n_tokens * cols)
+        .map(|i| f16::from_f32(fill(i) * 0.1).to_f32())
+        .collect();
+    let xb = upload_f16(dev.as_ref(), &x);
+    let yb = upload_f16(dev.as_ref(), &vec![0.0; n_tokens * rows]);
+    let wb = dev.alloc(wq.len(), MemKind::Device, Pool::Weights).unwrap();
+    dev.write(&wq, &wb, 0).unwrap();
+
+    gemm(&kernels, &yb, &wb, &xb, rows, cols, n_tokens, &stream).unwrap();
+    dev.synchronize().unwrap();
+
+    let got = download_f16(dev.as_ref(), &yb, n_tokens * rows);
+    for t in 0..n_tokens {
+        for r in 0..rows {
+            let want: f32 = (0..cols)
+                .map(|c| w_f32[r * cols + c] * x[t * cols + c])
+                .sum();
+            let rel = (got[t * rows + r] - want).abs() / (want.abs() + 1.0);
+            assert!(
+                rel < 0.02,
+                "{quant:?} t {t} row {r}: got {} want {want}",
+                got[t * rows + r]
+            );
+        }
+    }
+}
+
+macro_rules! quant_golden {
+    ($gemv_test:ident, $gemm_test:ident, $quant:expr, $gemv:ident, $out32:ident, $gemm:ident) => {
+        #[test]
+        fn $gemv_test() {
+            gemv_case($quant, Kernels::$gemv, Kernels::$out32);
+        }
+
+        #[test]
+        fn $gemm_test() {
+            gemm_case($quant, Kernels::$gemm);
+        }
+    };
+}
+
+quant_golden!(
+    gemv_q5_k_matches_formats_dequant,
+    gemm_q5_k_matches_formats_dequant,
+    QuantKind::Q5K,
+    gemv_q5_k_f16,
+    gemv_q5_k_out_f32,
+    gemm_q5_k_f16
+);
+quant_golden!(
+    gemv_q3_k_matches_formats_dequant,
+    gemm_q3_k_matches_formats_dequant,
+    QuantKind::Q3K,
+    gemv_q3_k_f16,
+    gemv_q3_k_out_f32,
+    gemm_q3_k_f16
+);
+quant_golden!(
+    gemv_q2_k_matches_formats_dequant,
+    gemm_q2_k_matches_formats_dequant,
+    QuantKind::Q2K,
+    gemv_q2_k_f16,
+    gemv_q2_k_out_f32,
+    gemm_q2_k_f16
+);
+quant_golden!(
+    gemv_q4_0_matches_formats_dequant,
+    gemm_q4_0_matches_formats_dequant,
+    QuantKind::Q4_0,
+    gemv_q4_0_f16,
+    gemv_q4_0_out_f32,
+    gemm_q4_0_f16
+);
+quant_golden!(
+    gemv_q4_1_matches_formats_dequant,
+    gemm_q4_1_matches_formats_dequant,
+    QuantKind::Q4_1,
+    gemv_q4_1_f16,
+    gemv_q4_1_out_f32,
+    gemm_q4_1_f16
+);
+quant_golden!(
+    gemv_q5_0_matches_formats_dequant,
+    gemm_q5_0_matches_formats_dequant,
+    QuantKind::Q5_0,
+    gemv_q5_0_f16,
+    gemv_q5_0_out_f32,
+    gemm_q5_0_f16
+);
+quant_golden!(
+    gemv_q5_1_matches_formats_dequant,
+    gemm_q5_1_matches_formats_dequant,
+    QuantKind::Q5_1,
+    gemv_q5_1_f16,
+    gemv_q5_1_out_f32,
+    gemm_q5_1_f16
+);
+
+quant_golden!(
+    gemv_iq4_nl_matches_formats_dequant,
+    gemm_iq4_nl_matches_formats_dequant,
+    QuantKind::IQ4NL,
+    gemv_iq4_nl_f16,
+    gemv_iq4_nl_out_f32,
+    gemm_iq4_nl_f16
+);
+quant_golden!(
+    gemv_iq4_xs_matches_formats_dequant,
+    gemm_iq4_xs_matches_formats_dequant,
+    QuantKind::IQ4XS,
+    gemv_iq4_xs_f16,
+    gemv_iq4_xs_out_f32,
+    gemm_iq4_xs_f16
+);
+quant_golden!(
+    gemv_mxfp4_gguf_matches_formats_dequant,
+    gemm_mxfp4_gguf_matches_formats_dequant,
+    QuantKind::MXFP4,
+    gemv_mxfp4_f16,
+    gemv_mxfp4_out_f32,
+    gemm_mxfp4_f16
+);
+
+quant_golden!(
+    gemv_iq2_xs_matches_formats_dequant,
+    gemm_iq2_xs_matches_formats_dequant,
+    QuantKind::IQ2XS,
+    gemv_iq2_xs_f16,
+    gemv_iq2_xs_out_f32,
+    gemm_iq2_xs_f16
+);
+quant_golden!(
+    gemv_iq2_s_matches_formats_dequant,
+    gemm_iq2_s_matches_formats_dequant,
+    QuantKind::IQ2S,
+    gemv_iq2_s_f16,
+    gemv_iq2_s_out_f32,
+    gemm_iq2_s_f16
+);
+quant_golden!(
+    gemv_iq3_s_matches_formats_dequant,
+    gemm_iq3_s_matches_formats_dequant,
+    QuantKind::IQ3S,
+    gemv_iq3_s_f16,
+    gemv_iq3_s_out_f32,
+    gemm_iq3_s_f16
+);
+
+quant_golden!(
+    gemv_iq2_xxs_matches_formats_dequant,
+    gemm_iq2_xxs_matches_formats_dequant,
+    QuantKind::IQ2XXS,
+    gemv_iq2_xxs_f16,
+    gemv_iq2_xxs_out_f32,
+    gemm_iq2_xxs_f16
+);
+quant_golden!(
+    gemv_iq3_xxs_matches_formats_dequant,
+    gemm_iq3_xxs_matches_formats_dequant,
+    QuantKind::IQ3XXS,
+    gemv_iq3_xxs_f16,
+    gemv_iq3_xxs_out_f32,
+    gemm_iq3_xxs_f16
+);
+quant_golden!(
+    gemv_iq1_s_matches_formats_dequant,
+    gemm_iq1_s_matches_formats_dequant,
+    QuantKind::IQ1S,
+    gemv_iq1_s_f16,
+    gemv_iq1_s_out_f32,
+    gemm_iq1_s_f16
+);
+quant_golden!(
+    gemv_iq1_m_matches_formats_dequant,
+    gemm_iq1_m_matches_formats_dequant,
+    QuantKind::IQ1M,
+    gemv_iq1_m_f16,
+    gemv_iq1_m_out_f32,
+    gemm_iq1_m_f16
+);

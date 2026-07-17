@@ -40,6 +40,108 @@ pub enum DevWeight {
         rows: usize,
         cols: usize,
     },
+    /// GGML Q5_K superblock stream (176 bytes / 256 elements) for [rows, cols].
+    Q5K {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
+    /// GGML Q3_K superblock stream (110 bytes / 256 elements) for [rows, cols].
+    Q3K {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
+    /// GGML Q2_K superblock stream (84 bytes / 256 elements) for [rows, cols].
+    Q2K {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
+    /// GGML Q4_0 block stream (18 bytes / 32 elements) for [rows, cols].
+    Q4_0 {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
+    /// GGML Q4_1 block stream (20 bytes / 32 elements) for [rows, cols].
+    Q4_1 {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
+    /// GGML Q5_0 block stream (22 bytes / 32 elements) for [rows, cols].
+    Q5_0 {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
+    /// GGML Q5_1 block stream (24 bytes / 32 elements) for [rows, cols].
+    Q5_1 {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
+    /// GGML IQ4_NL block stream (18 bytes / 32 elements) for [rows, cols].
+    Iq4Nl {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
+    /// GGML IQ4_XS superblock stream (136 bytes / 256 elements) for [rows, cols].
+    Iq4Xs {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
+    /// GGML MXFP4 block stream (17 bytes / 32 elements) for [rows, cols].
+    Mxfp4 {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
+    /// GGML IQ2_XS superblock stream (74 bytes / 256 elements) for [rows, cols].
+    Iq2Xs {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
+    /// GGML IQ2_S superblock stream (82 bytes / 256 elements) for [rows, cols].
+    Iq2S {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
+    /// GGML IQ3_S superblock stream (110 bytes / 256 elements) for [rows, cols].
+    Iq3S {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
+    /// GGML IQ2_XXS superblock stream (66 bytes / 256 elements) for [rows, cols].
+    Iq2Xxs {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
+    /// GGML IQ3_XXS superblock stream (98 bytes / 256 elements) for [rows, cols].
+    Iq3Xxs {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
+    /// GGML IQ1_S superblock stream (50 bytes / 256 elements) for [rows, cols].
+    Iq1S {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
+    /// GGML IQ1_M superblock stream (56 bytes / 256 elements) for [rows, cols].
+    Iq1M {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
     /// NVFP4 packed + FP8 scales (+ inverse global scale) for [rows, cols].
     NvFp4 {
         packed: DevBuffer,
@@ -57,6 +159,23 @@ impl DevWeight {
             | DevWeight::Q8_0 { rows, .. }
             | DevWeight::Q4K { rows, .. }
             | DevWeight::Q6K { rows, .. }
+            | DevWeight::Q5K { rows, .. }
+            | DevWeight::Q3K { rows, .. }
+            | DevWeight::Q2K { rows, .. }
+            | DevWeight::Q4_0 { rows, .. }
+            | DevWeight::Q4_1 { rows, .. }
+            | DevWeight::Q5_0 { rows, .. }
+            | DevWeight::Q5_1 { rows, .. }
+            | DevWeight::Iq4Nl { rows, .. }
+            | DevWeight::Iq4Xs { rows, .. }
+            | DevWeight::Mxfp4 { rows, .. }
+            | DevWeight::Iq2Xs { rows, .. }
+            | DevWeight::Iq2S { rows, .. }
+            | DevWeight::Iq3S { rows, .. }
+            | DevWeight::Iq2Xxs { rows, .. }
+            | DevWeight::Iq3Xxs { rows, .. }
+            | DevWeight::Iq1S { rows, .. }
+            | DevWeight::Iq1M { rows, .. }
             | DevWeight::NvFp4 { rows, .. } => *rows,
         }
     }
@@ -67,6 +186,23 @@ impl DevWeight {
             | DevWeight::Q8_0 { cols, .. }
             | DevWeight::Q4K { cols, .. }
             | DevWeight::Q6K { cols, .. }
+            | DevWeight::Q5K { cols, .. }
+            | DevWeight::Q3K { cols, .. }
+            | DevWeight::Q2K { cols, .. }
+            | DevWeight::Q4_0 { cols, .. }
+            | DevWeight::Q4_1 { cols, .. }
+            | DevWeight::Q5_0 { cols, .. }
+            | DevWeight::Q5_1 { cols, .. }
+            | DevWeight::Iq4Nl { cols, .. }
+            | DevWeight::Iq4Xs { cols, .. }
+            | DevWeight::Mxfp4 { cols, .. }
+            | DevWeight::Iq2Xs { cols, .. }
+            | DevWeight::Iq2S { cols, .. }
+            | DevWeight::Iq3S { cols, .. }
+            | DevWeight::Iq2Xxs { cols, .. }
+            | DevWeight::Iq3Xxs { cols, .. }
+            | DevWeight::Iq1S { cols, .. }
+            | DevWeight::Iq1M { cols, .. }
             | DevWeight::NvFp4 { cols, .. } => *cols,
         }
     }
@@ -324,6 +460,91 @@ enum HostWeight {
         rows: usize,
         cols: usize,
     },
+    Q5K {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
+    Q3K {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
+    Q2K {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
+    Q4_0 {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
+    Q4_1 {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
+    Q5_0 {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
+    Q5_1 {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
+    Iq4Nl {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
+    Iq4Xs {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
+    Mxfp4 {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
+    Iq2Xs {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
+    Iq2S {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
+    Iq3S {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
+    Iq2Xxs {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
+    Iq3Xxs {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
+    Iq1S {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
+    Iq1M {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
     NvFp4 {
         packed: Vec<u8>,
         scales: Vec<u8>,
@@ -340,6 +561,23 @@ impl HostWeight {
             | HostWeight::Q8_0 { rows, .. }
             | HostWeight::Q4K { rows, .. }
             | HostWeight::Q6K { rows, .. }
+            | HostWeight::Q5K { rows, .. }
+            | HostWeight::Q3K { rows, .. }
+            | HostWeight::Q2K { rows, .. }
+            | HostWeight::Q4_0 { rows, .. }
+            | HostWeight::Q4_1 { rows, .. }
+            | HostWeight::Q5_0 { rows, .. }
+            | HostWeight::Q5_1 { rows, .. }
+            | HostWeight::Iq4Nl { rows, .. }
+            | HostWeight::Iq4Xs { rows, .. }
+            | HostWeight::Mxfp4 { rows, .. }
+            | HostWeight::Iq2Xs { rows, .. }
+            | HostWeight::Iq2S { rows, .. }
+            | HostWeight::Iq3S { rows, .. }
+            | HostWeight::Iq2Xxs { rows, .. }
+            | HostWeight::Iq3Xxs { rows, .. }
+            | HostWeight::Iq1S { rows, .. }
+            | HostWeight::Iq1M { rows, .. }
             | HostWeight::NvFp4 { rows, .. } => *rows,
         }
     }
@@ -350,6 +588,23 @@ impl HostWeight {
             | HostWeight::Q8_0 { cols, .. }
             | HostWeight::Q4K { cols, .. }
             | HostWeight::Q6K { cols, .. }
+            | HostWeight::Q5K { cols, .. }
+            | HostWeight::Q3K { cols, .. }
+            | HostWeight::Q2K { cols, .. }
+            | HostWeight::Q4_0 { cols, .. }
+            | HostWeight::Q4_1 { cols, .. }
+            | HostWeight::Q5_0 { cols, .. }
+            | HostWeight::Q5_1 { cols, .. }
+            | HostWeight::Iq4Nl { cols, .. }
+            | HostWeight::Iq4Xs { cols, .. }
+            | HostWeight::Mxfp4 { cols, .. }
+            | HostWeight::Iq2Xs { cols, .. }
+            | HostWeight::Iq2S { cols, .. }
+            | HostWeight::Iq3S { cols, .. }
+            | HostWeight::Iq2Xxs { cols, .. }
+            | HostWeight::Iq3Xxs { cols, .. }
+            | HostWeight::Iq1S { cols, .. }
+            | HostWeight::Iq1M { cols, .. }
             | HostWeight::NvFp4 { cols, .. } => *cols,
         }
     }
@@ -413,10 +668,50 @@ fn fetch_matrix(src: &dyn TensorSource, name: &str) -> Result<HostWeight> {
         // Q6_K superblocks are only 2-byte aligned (210 bytes); the kernels
         // load them as u16 lanes, so only whole superblocks per row matter.
         QuantKind::Q6K if cols.is_multiple_of(256) => Ok(HostWeight::Q6K { data, rows, cols }),
+        // Q5_K shares Q4_K's 16-byte header and per-32-column x-sum staging
+        // (same shared-memory bound); Q2_K stages per-16-column sums with the
+        // same 32768-column ceiling; Q3_K has no x-sum staging.
+        QuantKind::Q5K if cols.is_multiple_of(256) && cols <= 32768 => {
+            Ok(HostWeight::Q5K { data, rows, cols })
+        }
+        QuantKind::Q3K if cols.is_multiple_of(256) => Ok(HostWeight::Q3K { data, rows, cols }),
+        QuantKind::Q2K if cols.is_multiple_of(256) && cols <= 32768 => {
+            Ok(HostWeight::Q2K { data, rows, cols })
+        }
+        // Legacy 32-element formats keep their storage quant on-device
+        // (whole blocks per row is guaranteed by the block structure).
+        QuantKind::Q4_0 => Ok(HostWeight::Q4_0 { data, rows, cols }),
+        QuantKind::Q4_1 => Ok(HostWeight::Q4_1 { data, rows, cols }),
+        QuantKind::Q5_0 => Ok(HostWeight::Q5_0 { data, rows, cols }),
+        QuantKind::Q5_1 => Ok(HostWeight::Q5_1 { data, rows, cols }),
+        QuantKind::IQ4NL => Ok(HostWeight::Iq4Nl { data, rows, cols }),
+        QuantKind::IQ4XS if cols.is_multiple_of(256) => {
+            Ok(HostWeight::Iq4Xs { data, rows, cols })
+        }
+        QuantKind::MXFP4 => Ok(HostWeight::Mxfp4 { data, rows, cols }),
+        QuantKind::IQ2XS if cols.is_multiple_of(256) => {
+            Ok(HostWeight::Iq2Xs { data, rows, cols })
+        }
+        QuantKind::IQ2S if cols.is_multiple_of(256) => Ok(HostWeight::Iq2S { data, rows, cols }),
+        QuantKind::IQ3S if cols.is_multiple_of(256) => Ok(HostWeight::Iq3S { data, rows, cols }),
+        QuantKind::IQ2XXS if cols.is_multiple_of(256) => {
+            Ok(HostWeight::Iq2Xxs { data, rows, cols })
+        }
+        QuantKind::IQ3XXS if cols.is_multiple_of(256) => {
+            Ok(HostWeight::Iq3Xxs { data, rows, cols })
+        }
+        QuantKind::IQ1S if cols.is_multiple_of(256) => Ok(HostWeight::Iq1S { data, rows, cols }),
+        QuantKind::IQ1M if cols.is_multiple_of(256) => Ok(HostWeight::Iq1M { data, rows, cols }),
         // Everything else goes through f32 → f16. This covers F16/F32/BF16
         // directly and any other GGML quant via the CPU reference dequant —
         // correctness first; fused kernels for more quants land per PLAN.
         _ => {
+            if quant != QuantKind::None {
+                tracing::warn!(
+                    "{name}: no native GPU kernels for {quant:?}, materializing as f16 \
+                     ({rows}x{cols}; doubles VRAM vs quantized storage)"
+                );
+            }
             let f32s = dequantize_to_f32(dtype, quant, &data, rows * cols)?;
             Ok(HostWeight::F16 {
                 data: f32s_to_f16_bytes(&f32s),
@@ -446,6 +741,91 @@ fn upload_weight(device: &dyn Device, w: HostWeight) -> Result<DevWeight> {
             cols,
         }),
         HostWeight::Q6K { data, rows, cols } => Ok(DevWeight::Q6K {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Q5K { data, rows, cols } => Ok(DevWeight::Q5K {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Q3K { data, rows, cols } => Ok(DevWeight::Q3K {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Q2K { data, rows, cols } => Ok(DevWeight::Q2K {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Q4_0 { data, rows, cols } => Ok(DevWeight::Q4_0 {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Q4_1 { data, rows, cols } => Ok(DevWeight::Q4_1 {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Q5_0 { data, rows, cols } => Ok(DevWeight::Q5_0 {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Q5_1 { data, rows, cols } => Ok(DevWeight::Q5_1 {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Iq4Nl { data, rows, cols } => Ok(DevWeight::Iq4Nl {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Iq4Xs { data, rows, cols } => Ok(DevWeight::Iq4Xs {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Mxfp4 { data, rows, cols } => Ok(DevWeight::Mxfp4 {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Iq2Xs { data, rows, cols } => Ok(DevWeight::Iq2Xs {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Iq2S { data, rows, cols } => Ok(DevWeight::Iq2S {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Iq3S { data, rows, cols } => Ok(DevWeight::Iq3S {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Iq2Xxs { data, rows, cols } => Ok(DevWeight::Iq2Xxs {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Iq3Xxs { data, rows, cols } => Ok(DevWeight::Iq3Xxs {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Iq1S { data, rows, cols } => Ok(DevWeight::Iq1S {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Iq1M { data, rows, cols } => Ok(DevWeight::Iq1M {
             buf: upload(device, &data)?,
             rows,
             cols,
@@ -483,6 +863,37 @@ fn fuse_rows(mut parts: Vec<HostWeight>) -> std::result::Result<HostWeight, Vec<
         HostWeight::Q8_0 { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q8_0 { .. })) => {}
         HostWeight::Q4K { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q4K { .. })) => {}
         HostWeight::Q6K { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q6K { .. })) => {}
+        HostWeight::Q5K { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q5K { .. })) => {}
+        HostWeight::Q3K { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q3K { .. })) => {}
+        HostWeight::Q2K { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q2K { .. })) => {}
+        HostWeight::Q4_0 { .. }
+            if parts.iter().all(|p| matches!(p, HostWeight::Q4_0 { .. })) => {}
+        HostWeight::Q4_1 { .. }
+            if parts.iter().all(|p| matches!(p, HostWeight::Q4_1 { .. })) => {}
+        HostWeight::Q5_0 { .. }
+            if parts.iter().all(|p| matches!(p, HostWeight::Q5_0 { .. })) => {}
+        HostWeight::Q5_1 { .. }
+            if parts.iter().all(|p| matches!(p, HostWeight::Q5_1 { .. })) => {}
+        HostWeight::Iq4Nl { .. }
+            if parts.iter().all(|p| matches!(p, HostWeight::Iq4Nl { .. })) => {}
+        HostWeight::Iq4Xs { .. }
+            if parts.iter().all(|p| matches!(p, HostWeight::Iq4Xs { .. })) => {}
+        HostWeight::Mxfp4 { .. }
+            if parts.iter().all(|p| matches!(p, HostWeight::Mxfp4 { .. })) => {}
+        HostWeight::Iq2Xs { .. }
+            if parts.iter().all(|p| matches!(p, HostWeight::Iq2Xs { .. })) => {}
+        HostWeight::Iq2S { .. }
+            if parts.iter().all(|p| matches!(p, HostWeight::Iq2S { .. })) => {}
+        HostWeight::Iq3S { .. }
+            if parts.iter().all(|p| matches!(p, HostWeight::Iq3S { .. })) => {}
+        HostWeight::Iq2Xxs { .. }
+            if parts.iter().all(|p| matches!(p, HostWeight::Iq2Xxs { .. })) => {}
+        HostWeight::Iq3Xxs { .. }
+            if parts.iter().all(|p| matches!(p, HostWeight::Iq3Xxs { .. })) => {}
+        HostWeight::Iq1S { .. }
+            if parts.iter().all(|p| matches!(p, HostWeight::Iq1S { .. })) => {}
+        HostWeight::Iq1M { .. }
+            if parts.iter().all(|p| matches!(p, HostWeight::Iq1M { .. })) => {}
         HostWeight::NvFp4 { global_scale, .. } => {
             let gs = global_scale.to_bits();
             let ok = parts.iter().all(
@@ -501,7 +912,24 @@ fn fuse_rows(mut parts: Vec<HostWeight>) -> std::result::Result<HostWeight, Vec<
             (HostWeight::F16 { data, .. }, HostWeight::F16 { data: d, .. })
             | (HostWeight::Q8_0 { data, .. }, HostWeight::Q8_0 { data: d, .. })
             | (HostWeight::Q4K { data, .. }, HostWeight::Q4K { data: d, .. })
-            | (HostWeight::Q6K { data, .. }, HostWeight::Q6K { data: d, .. }) => {
+            | (HostWeight::Q6K { data, .. }, HostWeight::Q6K { data: d, .. })
+            | (HostWeight::Q5K { data, .. }, HostWeight::Q5K { data: d, .. })
+            | (HostWeight::Q3K { data, .. }, HostWeight::Q3K { data: d, .. })
+            | (HostWeight::Q2K { data, .. }, HostWeight::Q2K { data: d, .. })
+            | (HostWeight::Q4_0 { data, .. }, HostWeight::Q4_0 { data: d, .. })
+            | (HostWeight::Q4_1 { data, .. }, HostWeight::Q4_1 { data: d, .. })
+            | (HostWeight::Q5_0 { data, .. }, HostWeight::Q5_0 { data: d, .. })
+            | (HostWeight::Q5_1 { data, .. }, HostWeight::Q5_1 { data: d, .. })
+            | (HostWeight::Iq4Nl { data, .. }, HostWeight::Iq4Nl { data: d, .. })
+            | (HostWeight::Iq4Xs { data, .. }, HostWeight::Iq4Xs { data: d, .. })
+            | (HostWeight::Mxfp4 { data, .. }, HostWeight::Mxfp4 { data: d, .. })
+            | (HostWeight::Iq2Xs { data, .. }, HostWeight::Iq2Xs { data: d, .. })
+            | (HostWeight::Iq2S { data, .. }, HostWeight::Iq2S { data: d, .. })
+            | (HostWeight::Iq3S { data, .. }, HostWeight::Iq3S { data: d, .. })
+            | (HostWeight::Iq2Xxs { data, .. }, HostWeight::Iq2Xxs { data: d, .. })
+            | (HostWeight::Iq3Xxs { data, .. }, HostWeight::Iq3Xxs { data: d, .. })
+            | (HostWeight::Iq1S { data, .. }, HostWeight::Iq1S { data: d, .. })
+            | (HostWeight::Iq1M { data, .. }, HostWeight::Iq1M { data: d, .. }) => {
                 data.extend_from_slice(&d)
             }
             (
@@ -523,6 +951,23 @@ fn fuse_rows(mut parts: Vec<HostWeight>) -> std::result::Result<HostWeight, Vec<
         | HostWeight::Q8_0 { rows: r, .. }
         | HostWeight::Q4K { rows: r, .. }
         | HostWeight::Q6K { rows: r, .. }
+        | HostWeight::Q5K { rows: r, .. }
+        | HostWeight::Q3K { rows: r, .. }
+        | HostWeight::Q2K { rows: r, .. }
+        | HostWeight::Q4_0 { rows: r, .. }
+        | HostWeight::Q4_1 { rows: r, .. }
+        | HostWeight::Q5_0 { rows: r, .. }
+        | HostWeight::Q5_1 { rows: r, .. }
+        | HostWeight::Iq4Nl { rows: r, .. }
+        | HostWeight::Iq4Xs { rows: r, .. }
+        | HostWeight::Mxfp4 { rows: r, .. }
+        | HostWeight::Iq2Xs { rows: r, .. }
+        | HostWeight::Iq2S { rows: r, .. }
+        | HostWeight::Iq3S { rows: r, .. }
+        | HostWeight::Iq2Xxs { rows: r, .. }
+        | HostWeight::Iq3Xxs { rows: r, .. }
+        | HostWeight::Iq1S { rows: r, .. }
+        | HostWeight::Iq1M { rows: r, .. }
         | HostWeight::NvFp4 { rows: r, .. } => *r = rows,
     }
     Ok(fused)
