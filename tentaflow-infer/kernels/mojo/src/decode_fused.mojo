@@ -26,6 +26,7 @@ from std.gpu.memory import AddressSpace
 from std.memory import bitcast, stack_allocation
 from std.math import rsqrt, exp
 from src.reduce import block_reduce_sum
+from src.kv_fp8 import _e4m3x2_to_f16x2
 from src.gemv2 import (
     _gemv_q4_k_row_acc,
     _gemv_q6_k_row_acc,
@@ -439,19 +440,6 @@ def _dot_q6k(
     return warp.sum(acc)
 
 
-def _f8e4m3s(b: UInt8) -> Float32:
-    var sign: Float32 = 1.0
-    if (b & 0x80) != 0:
-        sign = -1.0
-    e = Int((b >> 3) & 0x0F)
-    man = Float32(Int(b & 0x07))
-    if e == 0:
-        return sign * man * (1.0 / 512.0)
-    bits = UInt32(e - 7 + 127) << 23
-    scale = UnsafePointer(to=bits).bitcast[Float32]()[0]
-    return sign * (1.0 + man / 8.0) * scale
-
-
 def _dot_nvfp4(
     packed: UnsafePointer[UInt8, MutAnyOrigin],
     scales: UnsafePointer[UInt8, MutAnyOrigin],
@@ -472,7 +460,7 @@ def _dot_nvfp4(
     var acc: Float32 = 0.0
     var g = lane
     while g < groups:
-        s = _f8e4m3s(scales[scales_row + g]) * inv_global_scale
+        s = Float32(_e4m3x2_to_f16x2(scales[scales_row + g], 0)[0]) * inv_global_scale
         qv = (packed + packed_row + g * 8).load[width=8, alignment=8]()
         xv = (xs + g * 16).load[width=16, alignment=32]().cast[DType.float32]()
         x_even, x_odd = xv.deinterleave()
@@ -510,23 +498,28 @@ def _dot2_nvfp4(
     var acc_u: Float32 = 0.0
     var g = lane
     while g < groups:
-        sg = _f8e4m3s(scales[scales_g + g]) * inv_global_scale
-        su = _f8e4m3s(scales[scales_u + g]) * inv_global_scale
+        # Decode the gate|up scale byte PAIR in one hardware cvt (low half =
+        # gate, high half = up). e4m3 -> f16 is exact, so each half equals the
+        # single-row decode bit-for-bit.
+        sp = _e4m3x2_to_f16x2(scales[scales_g + g], scales[scales_u + g])
+        sg = Float32(sp[0]) * inv_global_scale
+        su = Float32(sp[1]) * inv_global_scale
         qg = (packed + packed_g + g * 8).load[width=8, alignment=8]()
         qu = (packed + packed_u + g * 8).load[width=8, alignment=8]()
         xv = (xs + g * 16).load[width=16, alignment=32]().cast[DType.float32]()
         x_even, x_odd = xv.deinterleave()
-        var lo_g = SIMD[DType.float32, 8]()
-        var hi_g = SIMD[DType.float32, 8]()
-        var lo_u = SIMD[DType.float32, 8]()
-        var hi_u = SIMD[DType.float32, 8]()
+        # One SIMD LUT-gather temp set, reused gate-then-up: halves the live
+        # f32x8 temporaries (4 -> 2), which lifts occupancy on the FP4 silu.
+        var lov = SIMD[DType.float32, 8]()
+        var hiv = SIMD[DType.float32, 8]()
         comptime for j in range(8):
-            lo_g[j] = lut[Int(qg[j] & 0x0F)]
-            hi_g[j] = lut[Int(qg[j] >> 4)]
-            lo_u[j] = lut[Int(qu[j] & 0x0F)]
-            hi_u[j] = lut[Int(qu[j] >> 4)]
-        acc_g += sg * ((lo_g * x_even).reduce_add() + (hi_g * x_odd).reduce_add())
-        acc_u += su * ((lo_u * x_even).reduce_add() + (hi_u * x_odd).reduce_add())
+            lov[j] = lut[Int(qg[j] & 0x0F)]
+            hiv[j] = lut[Int(qg[j] >> 4)]
+        acc_g += sg * ((lov * x_even).reduce_add() + (hiv * x_odd).reduce_add())
+        comptime for j in range(8):
+            lov[j] = lut[Int(qu[j] & 0x0F)]
+            hiv[j] = lut[Int(qu[j] >> 4)]
+        acc_u += su * ((lov * x_even).reduce_add() + (hiv * x_odd).reduce_add())
         g += WARP
     return SIMD[DType.float32, 2](warp.sum(acc_g), warp.sum(acc_u))
 
@@ -926,7 +919,7 @@ def gemv_residual_nvfp4_f16(
     var acc: Float32 = 0.0
     var g = lane
     while g < groups:
-        s = _f8e4m3s(scales[scales_row + g]) * inv_global_scale
+        s = Float32(_e4m3x2_to_f16x2(scales[scales_row + g], 0)[0]) * inv_global_scale
         qv = (packed + packed_row + g * 8).load[width=8, alignment=8]()
         xv = (x + g * 16).load[width=16, alignment=32]().cast[DType.float32]()
         x_even, x_odd = xv.deinterleave()

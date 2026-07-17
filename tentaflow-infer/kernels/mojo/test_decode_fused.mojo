@@ -96,16 +96,26 @@ def main() raises:
     var wnv_s = ctx.enqueue_create_buffer[DType.uint8](QROWS * NV_GROUPS)
     var wnv_ffn = ctx.enqueue_create_buffer[DType.uint8](2 * INTER * HID // 2)
     var wnv_ffn_s = ctx.enqueue_create_buffer[DType.uint8](2 * INTER * NV_GROUPS)
+    # e4m3 NaN codes 0x7F/0xFF (low 7 bits all set) would make the hardware
+    # cvt widen to NaN in BOTH the reference and the fused kernel, and a
+    # NaN-vs-NaN diff silently passes the max_err gate instead of proving
+    # bit-exactness. Real NVFP4 block scales are never NaN, so exclude them.
     with wnv.map_to_host() as p, wnv_s.map_to_host() as s:
         for i in range(QROWS * HID // 2):
             p[i] = UInt8((i * 29) % 256)
         for i in range(QROWS * NV_GROUPS):
-            s[i] = UInt8((i * 13) % 256)
+            sv = (i * 13) % 256
+            if (sv & 0x7F) == 0x7F:
+                sv -= 1
+            s[i] = UInt8(sv)
     with wnv_ffn.map_to_host() as p, wnv_ffn_s.map_to_host() as s:
         for i in range(2 * INTER * HID // 2):
             p[i] = UInt8((i * 41) % 256)
         for i in range(2 * INTER * NV_GROUPS):
-            s[i] = UInt8((i * 7) % 256)
+            sv = (i * 7) % 256
+            if (sv & 0x7F) == 0x7F:
+                sv -= 1
+            s[i] = UInt8(sv)
 
     var wf = ctx.enqueue_create_buffer[DType.float16](QROWS * HID)
     var wf_ffn = ctx.enqueue_create_buffer[DType.float16](2 * INTER * HID)

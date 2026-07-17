@@ -6,6 +6,7 @@
 
 from std.gpu import block_dim, block_idx, thread_idx
 from src.reduce import block_reduce_sum
+from src.kv_fp8 import _e4m3x2_to_f16x2
 
 comptime GROUP = 16  # NVFP4 block size (elements per FP8 scale)
 
@@ -34,19 +35,10 @@ def _e2m1(nibble: UInt8) -> Float32:
 
 
 def _f8e4m3(b: UInt8) -> Float32:
-    # FP8 E4M3FN: no infinities, 0x7F/0xFF are NaN (weights never contain
-    # them, so NaN passthrough via the normal path is acceptable here).
-    var sign: Float32 = 1.0
-    if (b & 0x80) != 0:
-        sign = -1.0
-    e = Int((b >> 3) & 0x0F)
-    man = Float32(Int(b & 0x07))
-    if e == 0:
-        return sign * man * (1.0 / 512.0)
-    # 2^(e-7) via exponent bit assembly avoids pow() in the inner loop.
-    bits = UInt32(e - 7 + 127) << 23
-    scale = UnsafePointer(to=bits).bitcast[Float32]()[0]
-    return sign * (1.0 + man / 8.0) * scale
+    # FP8 E4M3FN -> f32 via the exact sm_89 hardware pair cvt (single
+    # instruction vs ~15-op generic float8 emulation). 0x7F/0xFF widen to NaN;
+    # real NVFP4 block scales never contain them.
+    return Float32(_e4m3x2_to_f16x2(b, 0)[0])
 
 
 def gemv_nvfp4_f16(

@@ -10,6 +10,7 @@ from std.gpu.primitives import warp
 from std.gpu.sync import barrier
 from std.gpu.memory import AddressSpace
 from std.memory import bitcast, stack_allocation
+from src.kv_fp8 import _e4m3x2_to_f16x2
 
 comptime WARP = 32
 comptime ROWS_PER_BLOCK = 8
@@ -98,16 +99,10 @@ def _e2m1x8(codes: SIMD[DType.uint8, 8]) -> SIMD[DType.float32, 8]:
 
 
 def _f8e4m3s(b: UInt8) -> Float32:
-    var sign: Float32 = 1.0
-    if (b & 0x80) != 0:
-        sign = -1.0
-    e = Int((b >> 3) & 0x0F)
-    man = Float32(Int(b & 0x07))
-    if e == 0:
-        return sign * man * (1.0 / 512.0)
-    bits = UInt32(e - 7 + 127) << 23
-    scale = UnsafePointer(to=bits).bitcast[Float32]()[0]
-    return sign * (1.0 + man / 8.0) * scale
+    # e4m3 -> f16 is exact; the sm_89 hardware cvt is a single instruction vs
+    # the ~15-op generic float8 emulation. NaN codes 0x7F/0xFF widen to NaN
+    # (real NVFP4 block scales are never NaN).
+    return Float32(_e4m3x2_to_f16x2(b, 0)[0])
 
 
 def gemv_nvfp4_f16_v2(

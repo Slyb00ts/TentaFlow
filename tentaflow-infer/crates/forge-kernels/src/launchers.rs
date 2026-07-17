@@ -1551,7 +1551,11 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 16, "gemv_norm_silu_nvfp4")?;
         let k = self.artifacts.get("gemv_norm_silu_nvfp4_f16")?;
-        let rpw = Self::fused_rows_per_warp(inter);
+        // The NVFP4 gate|up dot is register-heavier than the Q4_K path, so the
+        // rows/warp sweet spot is lower: measured best at 3 on the Bielik
+        // inter=11264 shape (vs fused_rows_per_warp -> 5). This is scoped to
+        // the NVFP4 silu launcher, so Q4_K's inter=14336 rpw=7 is untouched.
+        let rpw = 3usize;
         let cfg = LaunchConfig {
             grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
