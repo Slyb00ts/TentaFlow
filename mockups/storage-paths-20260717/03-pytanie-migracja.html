@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: 03-pytanie-migracja.html
+     Opis: Pytanie po wyborze nowego katalogu — czy przenieść istniejące dane.
+           Diff ścieżek (stara → nowa), lista usług do wstrzymania, szacowany
+           czas. Przeniesienie danych (move), nie kopiowanie; bez restartu.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>Magazyn danych — pytanie o migrację</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute"><defs>
+  <symbol id="i-model" viewBox="0 0 24 24"><path d="M12 2 2 7l10 5 10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></symbol>
+  <symbol id="i-move" viewBox="0 0 24 24"><polyline points="5 9 2 12 5 15"/><polyline points="9 5 12 2 15 5"/><polyline points="15 19 12 22 9 19"/><polyline points="19 9 22 12 19 15"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="12" y1="2" x2="12" y2="22"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">03</span>
+    <h2>Pytanie o migrację danych</h2>
+    <div class="desc">Nowy katalog wybrany, w starym są dane. Trzy wyjścia: anuluj, przełącz bez przenoszenia, albo <strong>przenieś dane</strong> (move, nie kopia) — usługi zależne wstrzymane i wznowione bez restartu aplikacji.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="modal-backdrop" style="align-items:center; min-height:600px;">
+      <div class="tf-window" style="width:560px">
+        <div class="tf-window-titlebar">
+          <svg class="icon" style="color:var(--warning)"><use href="#i-warn"/></svg>Przenieść istniejące dane?
+          <span class="badge-pill" style="margin-left:8px">Modele · 186,2 GB</span>
+          <span class="close"><svg class="icon"><use href="#i-x"/></svg></span>
+        </div>
+        <div class="tf-window-body">
+
+          <div class="alert warn">
+            <svg class="icon"><use href="#i-warn"/></svg>
+            <div><strong>W obecnej lokalizacji jest 186,2 GB danych.</strong> Możesz je przenieść do nowego katalogu — to fizyczne <strong>przeniesienie</strong> (stara lokalizacja zostanie opróżniona), nie kopiowanie.</div>
+          </div>
+
+          <div class="path-diff">
+            <div class="row old"><span class="k">Z</span><span class="v">/home/critix/.tentaflow/models</span></div>
+            <div class="mid"><svg class="icon icon-sm"><use href="#i-down"/></svg>przeniesienie danych · ten sam wolumen = natychmiast, inny dysk = transfer</div>
+            <div class="row new"><span class="k">Do</span><span class="v">/mnt/storage/tentaflow-models</span></div>
+          </div>
+
+          <div class="section-card" style="margin-bottom:12px">
+            <h3><svg class="icon icon-sm"><use href="#i-clock"/></svg>Na czas migracji wstrzymamy</h3>
+            <div class="section-sub">Usługi korzystające z tego katalogu. Aktywne żądania poczekają w kolejce i dokończą się po wznowieniu.</div>
+            <table class="tbl">
+              <thead><tr><th>Usługa</th><th>Typ</th><th>Stan po migracji</th></tr></thead>
+              <tbody>
+                <tr><td class="strong">vLLM — Qwen3.6-27B</td><td>Docker · LLM</td><td><span class="status-pill warn">wstrzymana → wznowiona</span></td></tr>
+                <tr><td class="strong">llama.cpp — Bielik-11B</td><td>natywna · LLM</td><td><span class="status-pill warn">wstrzymana → wznowiona</span></td></tr>
+                <tr><td class="strong">Whisper STT</td><td>wbudowana · STT</td><td><span class="status-pill warn">wstrzymana → wznowiona</span></td></tr>
+                <tr><td class="strong">jina-embed</td><td>Docker · embeddings</td><td><span class="status-pill warn">wstrzymana → wznowiona</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="alert info" style="margin-bottom:6px">
+            <svg class="icon"><use href="#i-info"/></svg>
+            <div><strong>Bez restartu aplikacji.</strong> Szacowany czas: <strong>ok. 2 min</strong> (inny dysk, ~1,8 GB/s). Postęp zobaczysz na żywo — okno można ukryć, migracja dokończy się w tle.</div>
+          </div>
+        </div>
+        <div class="tf-window-footer">
+          <button class="btn btn-secondary">Anuluj</button>
+          <div class="spacer"></div>
+          <button class="btn btn-ghost">Przełącz bez przenoszenia</button>
+          <button class="btn btn-primary"><svg class="icon icon-sm"><use href="#i-move"/></svg>Przenieś dane</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+</body>
+</html>

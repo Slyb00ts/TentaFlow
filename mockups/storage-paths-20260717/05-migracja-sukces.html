@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: 05-migracja-sukces.html
+     Opis: Podsumowanie po migracji — statystyki (ile przeniesiono, czas, usługi
+           wznowione) + ekran ustawień w tle z już zaktualizowaną ścieżką
+           katalogu modeli (zielony akcent na wierszu).
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>Magazyn danych — migracja zakończona</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute"><defs>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-model" viewBox="0 0 24 24"><path d="M12 2 2 7l10 5 10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">05</span>
+    <h2>Migracja zakończona</h2>
+    <div class="desc">Podsumowanie: ile przeniesiono, ile trwało, ile usług wznowiono. Po zamknięciu — wiersz katalogu w ustawieniach pokazuje nową ścieżkę z zielonym akcentem.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="modal-backdrop" style="align-items:center; min-height:560px; flex-direction:column; gap:18px;">
+
+      <div class="tf-window" style="width:520px">
+        <div class="tf-window-titlebar">
+          <svg class="icon" style="color:var(--success)"><use href="#i-check"/></svg>Migracja zakończona
+          <span class="badge-pill" style="margin-left:8px">Modele</span>
+        </div>
+        <div class="tf-window-body">
+          <div class="done-hero">
+            <div class="ring"><svg class="icon"><use href="#i-check"/></svg></div>
+            <h2>Dane przeniesione pomyślnie</h2>
+            <p>Katalog modeli działa teraz z <span class="mono" style="color:var(--success)">/mnt/storage/tentaflow-models</span>.
+               Wszystkie usługi zostały wznowione i korzystają już z nowej lokalizacji.</p>
+          </div>
+          <div class="kpis" style="grid-template-columns:repeat(3,1fr); margin-bottom:8px;">
+            <div class="kpi"><div class="v">186,2 GB</div><div class="l">Przeniesiono</div></div>
+            <div class="kpi"><div class="v">1 min 47 s</div><div class="l">Czas migracji</div></div>
+            <div class="kpi"><div class="v" style="color:var(--success)">4 / 4</div><div class="l">Usługi wznowione</div></div>
+          </div>
+          <div class="alert success" style="margin-bottom:6px">
+            <svg class="icon"><use href="#i-check"/></svg>
+            <div>Stara lokalizacja została opróżniona. Wpis w dzienniku audytu: <span class="mono">storage.migrate models → /mnt/storage/tentaflow-models</span>.</div>
+          </div>
+        </div>
+        <div class="tf-window-footer">
+          <div class="spacer"></div>
+          <button class="btn btn-primary"><svg class="icon icon-sm"><use href="#i-check"/></svg>Gotowe</button>
+        </div>
+      </div>
+
+      <!-- Wiersz w ustawieniach po migracji (fragment ekranu 01) -->
+      <div style="width:560px; max-width:100%;">
+        <div class="section-card" style="margin-bottom:0">
+          <h3><svg class="icon icon-sm"><use href="#i-folder"/></svg>Po zamknięciu — wiersz w ustawieniach</h3>
+          <div class="pick-row migrated" style="margin-bottom:0">
+            <div class="r-ico"><svg class="icon"><use href="#i-model"/></svg></div>
+            <div class="r-info">
+              <div class="r-name">Modele <span class="badge-pill">186,2 GB</span> <span class="status-pill ok">zmigrowano dziś 14:32</span></div>
+              <div class="r-path">/mnt/storage/tentaflow-models</div>
+              <div class="r-meta">GGUF, cache HuggingFace, modele vision / audio / image-gen</div>
+            </div>
+            <div class="r-actions"><button class="btn btn-secondary btn-sm"><svg class="icon icon-sm"><use href="#i-folder"/></svg>Zmień katalog</button></div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+</body>
+</html>
