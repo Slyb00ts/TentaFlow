@@ -215,11 +215,17 @@ pub fn read_descriptor(path: &Path) -> Result<ModelDescriptor> {
 }
 
 /// Bytes the KV cache slabs of this model need for `kv_pages` pages of
-/// `kv_page_size` tokens, plus per-slab pool-granularity rounding headroom.
-pub fn kv_pool_bytes(desc: &ModelDescriptor, kv_page_size: usize, kv_pages: usize) -> usize {
+/// `kv_page_size` tokens of `kv_dtype` elements, plus per-slab
+/// pool-granularity rounding headroom.
+pub fn kv_pool_bytes(
+    desc: &ModelDescriptor,
+    kv_page_size: usize,
+    kv_pages: usize,
+    kv_dtype: forge_types::DType,
+) -> usize {
     let p = &desc.params;
-    // K and V per layer, fp16.
-    let slab = p.n_kv_heads * p.head_dim * kv_page_size * kv_pages * 2;
+    // K and V per layer.
+    let slab = p.n_kv_heads * p.head_dim * kv_page_size * kv_pages * kv_dtype.size();
     let slabs = p.block_count * 2;
     let granularity = forge_hal::cuda::PoolSizes::DEFAULT_KV_PAGE;
     slabs * (slab.div_ceil(granularity) * granularity) + 64 * (1 << 20)

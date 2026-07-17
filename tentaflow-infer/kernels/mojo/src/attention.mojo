@@ -12,6 +12,7 @@ from std.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from std.math import exp, rsqrt, cos, sin, pow
 from src.reduce import block_reduce_sum
+from src.kv_fp8 import kv_frag_f32
 
 comptime WARP_SIZE = 32
 comptime MAX_WARPS = 8
@@ -126,15 +127,15 @@ comptime attn_decode_f16_hd64 = attn_decode_f16[64]
 comptime attn_decode_f16_hd128 = attn_decode_f16[128]
 
 
-def attn_decode_split_f16[head_dim: Int](
+def attn_decode_split[head_dim: Int, kv_dtype: DType](
     parts: UnsafePointer[Float32, MutAnyOrigin],
     q_in: UnsafePointer[Float16, MutAnyOrigin],
     k_in: UnsafePointer[Float16, MutAnyOrigin],
     v_in: UnsafePointer[Float16, MutAnyOrigin],
     q_norm_w: UnsafePointer[Float16, MutAnyOrigin],
     k_norm_w: UnsafePointer[Float16, MutAnyOrigin],
-    k_cache: UnsafePointer[Float16, MutAnyOrigin],
-    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Scalar[kv_dtype], MutAnyOrigin],
+    v_cache: UnsafePointer[Scalar[kv_dtype], MutAnyOrigin],
     page_table: UnsafePointer[Int32, MutAnyOrigin],
     seq_lens: UnsafePointer[Int32, MutAnyOrigin],
     positions: UnsafePointer[Int32, MutAnyOrigin],
@@ -170,6 +171,12 @@ def attn_decode_split_f16[head_dim: Int](
     cache stores) reproduce qkv_post_f16's dataflow bit-exactly; the extra
     zero-valued warps in the block-level norm reductions add exact 0.0
     terms. Block: n_warps x 32 with block >= head_dim required.
+
+    kv_dtype = float8_e4m3fn stores the appended k/v as FP8: the value is
+    rounded to f16 first (mirroring the f16 cache dataflow), then cast per
+    value to e4m3 (RN, satfinite; no scale — e4m3's ±448 range covers
+    post-norm K/V). Cache reads widen e4m3 exactly, so the attention math is
+    bit-identical to the f16 kernel run on a dequantized cache.
     """
     comptime epl = head_dim // WARP_SIZE
     comptime half = head_dim // 2
@@ -237,10 +244,12 @@ def attn_decode_split_f16[head_dim: Int](
         staged_q[half + tid] = Float16(a * s + b * c)
         ak = Float32(staged_k[tid])
         bk = Float32(staged_k[half + tid])
-        k_cache[dst + tid] = Float16(ak * c - bk * s)
-        k_cache[dst + half + tid] = Float16(ak * s + bk * c)
+        k_cache[dst + tid] = Scalar[kv_dtype](Float32(Float16(ak * c - bk * s)))
+        k_cache[dst + half + tid] = Scalar[kv_dtype](
+            Float32(Float16(ak * s + bk * c))
+        )
     if tid < head_dim:
-        v_cache[dst + tid] = v_in[k_base + tid]
+        v_cache[dst + tid] = Scalar[kv_dtype](Float32(v_in[k_base + tid]))
     barrier()
 
     var q_frag = SIMD[DType.float32, epl](0.0)
@@ -269,10 +278,12 @@ def attn_decode_split_f16[head_dim: Int](
             pj = pos + j * n_warps
             page_j = Int(page_table[seq * max_pages + pj // page_size])
             base_j = ((page_j * n_kv_heads + kvh) * page_size + (pj % page_size)) * head_dim
+            kf_j = kv_frag_f32[kv_dtype, epl](k_cache, base_j, lane)
+            vf_j = kv_frag_f32[kv_dtype, epl](v_cache, base_j, lane)
 
             comptime for e in range(epl):
-                kf[j * epl + e] = Float32(k_cache[base_j + e * WARP_SIZE + lane])
-                vf[j * epl + e] = Float32(v_cache[base_j + e * WARP_SIZE + lane])
+                kf[j * epl + e] = kf_j[e]
+                vf[j * epl + e] = vf_j[e]
     while pos + (UNROLL - 1) * n_warps < end:
         var scores = SIMD[DType.float32, UNROLL](0.0)
 
@@ -296,10 +307,12 @@ def attn_decode_split_f16[head_dim: Int](
                 base_j = (
                     (page_j * n_kv_heads + kvh) * page_size + (pj % page_size)
                 ) * head_dim
+                kf2_j = kv_frag_f32[kv_dtype, epl](k_cache, base_j, lane)
+                vf2_j = kv_frag_f32[kv_dtype, epl](v_cache, base_j, lane)
 
                 comptime for e in range(epl):
-                    kf2[j * epl + e] = Float32(k_cache[base_j + e * WARP_SIZE + lane])
-                    vf2[j * epl + e] = Float32(v_cache[base_j + e * WARP_SIZE + lane])
+                    kf2[j * epl + e] = kf2_j[e]
+                    vf2[j * epl + e] = vf2_j[e]
 
         comptime for j in range(UNROLL):
             var m_new = m
@@ -320,11 +333,12 @@ def attn_decode_split_f16[head_dim: Int](
     while pos < end:
         page = Int(page_table[seq * max_pages + pos // page_size])
         kv_base = ((page * n_kv_heads + kvh) * page_size + (pos % page_size)) * head_dim
+        kfrag = kv_frag_f32[kv_dtype, epl](k_cache, kv_base, lane)
 
         var dot: Float32 = 0.0
 
         comptime for e in range(epl):
-            dot += q_frag[e] * Float32(k_cache[kv_base + e * WARP_SIZE + lane])
+            dot += q_frag[e] * kfrag[e]
         score = warp.sum(dot) * scale
 
         var m_new = m
@@ -333,9 +347,10 @@ def attn_decode_split_f16[head_dim: Int](
         factor = exp(m - m_new)
         p = exp(score - m_new)
         l = l * factor + p
+        vfrag = kv_frag_f32[kv_dtype, epl](v_cache, kv_base, lane)
 
         comptime for e in range(epl):
-            acc[e] = acc[e] * factor + p * Float32(v_cache[kv_base + e * WARP_SIZE + lane])
+            acc[e] = acc[e] * factor + p * vfrag[e]
         m = m_new
 
         pos += n_warps
@@ -377,8 +392,10 @@ def attn_decode_split_f16[head_dim: Int](
             parts[parts_base + head_dim + 1] = l_star
 
 
-comptime attn_decode_split_f16_hd64 = attn_decode_split_f16[64]
-comptime attn_decode_split_f16_hd128 = attn_decode_split_f16[128]
+comptime attn_decode_split_f16_hd64 = attn_decode_split[64, DType.float16]
+comptime attn_decode_split_f16_hd128 = attn_decode_split[128, DType.float16]
+comptime attn_decode_split_fp8_hd64 = attn_decode_split[64, DType.float8_e4m3fn]
+comptime attn_decode_split_fp8_hd128 = attn_decode_split[128, DType.float8_e4m3fn]
 
 
 def attn_decode_combine_f16[head_dim: Int](

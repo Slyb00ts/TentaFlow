@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use forge_hal::{DevBuffer, Device, LaunchArgs, LaunchConfig, Stream};
-use forge_types::{ForgeError, Result};
+use forge_types::{DType, ForgeError, Result};
 
 use crate::registry::KernelArtifacts;
 
@@ -907,10 +907,24 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Kernel-name suffix for a KV cache element type (F16 canonical, FP8
+    /// E4M3 per-value scale-free quantization).
+    fn kv_suffix(kv_dtype: DType, what: &str) -> Result<&'static str> {
+        match kv_dtype {
+            DType::F16 => Ok("f16"),
+            DType::F8E4M3 => Ok("fp8"),
+            other => Err(ForgeError::Unsupported(format!(
+                "{what}: no kernels for KV cache dtype {other}"
+            ))),
+        }
+    }
+
     /// Scatter a prefill chunk's K/V rows ([n_tokens, n_kv_heads, head_dim])
     /// into the paged cache at positions base_pos..base_pos+n_tokens.
+    /// `kv_dtype` selects the cache element type (f16 verbatim | fp8-e4m3
+    /// per-value cast).
     #[allow(clippy::too_many_arguments)]
-    pub fn kv_append_batch_f16(
+    pub fn kv_append_batch(
         &self,
         k_cache: &DevBuffer,
         v_cache: &DevBuffer,
@@ -922,9 +936,11 @@ impl Kernels {
         n_kv_heads: usize,
         page_size: usize,
         head_dim: usize,
+        kv_dtype: DType,
         stream: &Stream,
     ) -> Result<()> {
-        let k = self.artifacts.get("kv_append_batch_f16")?;
+        let suffix = Self::kv_suffix(kv_dtype, "kv_append_batch")?;
+        let k = self.artifacts.get(&format!("kv_append_batch_{suffix}"))?;
         let cfg = LaunchConfig {
             grid: (n_tokens as u32, n_kv_heads as u32, 1),
             block: ((head_dim as u32).clamp(32, 256), 1, 1),
@@ -945,8 +961,11 @@ impl Kernels {
 
     /// Causal prefill attention over the paged cache. Query token t attends
     /// positions 0..base_pos+t, whose K/V must already be appended.
+    /// `kv_dtype` selects the cache element type; the fp8 variant widens
+    /// e4m3 rows to f16 in shared memory (exact), so its math matches the
+    /// f16 kernel on a dequantized cache bit-for-bit.
     #[allow(clippy::too_many_arguments)]
-    pub fn attn_prefill_f16(
+    pub fn attn_prefill(
         &self,
         out: &DevBuffer,
         q: &DevBuffer,
@@ -959,19 +978,21 @@ impl Kernels {
         n_kv_heads: usize,
         head_dim: usize,
         page_size: usize,
+        kv_dtype: DType,
         scale: f32,
         stream: &Stream,
     ) -> Result<()> {
+        let suffix = Self::kv_suffix(kv_dtype, "attn_prefill")?;
         let name = match head_dim {
-            64 => "attn_prefill_f16_hd64",
-            128 => "attn_prefill_f16_hd128",
+            64 => format!("attn_prefill_{suffix}_hd64"),
+            128 => format!("attn_prefill_{suffix}_hd128"),
             other => {
                 return Err(ForgeError::Unsupported(format!(
                     "attn_prefill: head_dim {other} has no compiled specialization"
                 )))
             }
         };
-        let k = self.artifacts.get(name)?;
+        let k = self.artifacts.get(&name)?;
         // Kernel tiling contract (prefill.mojo QT): 16 queries per block,
         // block of 8 warps.
         let cfg = LaunchConfig {
@@ -1865,8 +1886,11 @@ impl Kernels {
     /// back). Unnormalized per-split partials land in `parts`
     /// ([n_seqs, n_q_heads, n_splits, head_dim + 2] f32) for
     /// attn_decode_combine_f16. n_splits == 1 is bit-exact vs attn_decode_f16.
+    /// `kv_dtype` selects the cache element type: the fp8 variant appends
+    /// e4m3(f16(rope(k)))/e4m3(v) and widens cache reads exactly, so its
+    /// math matches the f16 kernel on a dequantized cache bit-for-bit.
     #[allow(clippy::too_many_arguments)]
-    pub fn attn_decode_split_f16(
+    pub fn attn_decode_split(
         &self,
         parts: &DevBuffer,
         q_in: &DevBuffer,
@@ -1889,21 +1913,23 @@ impl Kernels {
         page_size: usize,
         max_pages: usize,
         n_splits: usize,
+        kv_dtype: DType,
         eps: f32,
         theta_base: f32,
         scale: f32,
         stream: &Stream,
     ) -> Result<()> {
+        let suffix = Self::kv_suffix(kv_dtype, "attn_decode_split")?;
         let name = match head_dim {
-            64 => "attn_decode_split_f16_hd64",
-            128 => "attn_decode_split_f16_hd128",
+            64 => format!("attn_decode_split_{suffix}_hd64"),
+            128 => format!("attn_decode_split_{suffix}_hd128"),
             other => {
                 return Err(ForgeError::Unsupported(format!(
                     "attn_decode_split: head_dim {other} has no compiled specialization"
                 )))
             }
         };
-        let k = self.artifacts.get(name)?;
+        let k = self.artifacts.get(&name)?;
         let cfg = LaunchConfig {
             grid: (n_seqs as u32, n_q_heads as u32, n_splits as u32),
             block: (ATTN_BLOCK, 1, 1),

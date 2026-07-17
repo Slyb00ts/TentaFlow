@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 forge-hal.workspace = true
+forge-types.workspace = true
 forge-engine.workspace = true
 forge-tokenize.workspace = true
 forge-server.workspace = true

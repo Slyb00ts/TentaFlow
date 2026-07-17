@@ -1,10 +1,11 @@
 // ===== File: kv.rs — paged KV cache (per-layer K/V page pools + page tables) =====
-// Layout per layer: [n_pages, n_kv_heads, page_size, head_dim] f16, matching
-// attn_decode_f16. v0 allocates one contiguous slab per layer and hands out
+// Layout per layer: [n_pages, n_kv_heads, page_size, head_dim] elements of
+// `dtype` (f16 canonical | fp8-e4m3, half the bytes/bandwidth), matching the
+// attention kernels. v0 allocates one contiguous slab per layer and hands out
 // logical pages; the HAL KvCache pool arena underneath keeps frees cheap.
 
 use forge_hal::{DevBuffer, Device, Pool};
-use forge_types::{ForgeError, MemKind, Result};
+use forge_types::{DType, ForgeError, MemKind, Result};
 
 pub struct KvConfig {
     pub n_layers: usize,
@@ -13,6 +14,9 @@ pub struct KvConfig {
     pub page_size: usize,
     pub n_pages: usize,
     pub max_pages_per_seq: usize,
+    /// Cache element type: F16 (canonical) or F8E4M3 (per-value scale-free
+    /// quantization; validated at model load).
+    pub dtype: DType,
 }
 
 pub struct KvCache {
@@ -35,7 +39,7 @@ impl KvCache {
         let bytes = cfg
             .n_pages
             .checked_mul(page_elems)
-            .and_then(|e| e.checked_mul(2))
+            .and_then(|e| e.checked_mul(cfg.dtype.size()))
             .ok_or_else(|| ForgeError::Scheduler("kv cache size overflow".into()))?;
         let mut k = Vec::with_capacity(cfg.n_layers);
         let mut v = Vec::with_capacity(cfg.n_layers);

@@ -31,8 +31,10 @@ from src.gemm import gemm_q8_0_f16_bm64, gemm_nvfp4_f16_bm64, gemm_f16_bm64
 from src.gemm import gemm_q4_k_f16, gemm_q4_k_f16_bm64
 from src.gemm import gemm_q6_k_f16, gemm_q6_k_f16_bm64
 from src.prefill import kv_append_batch_f16, attn_prefill_f16_hd64, attn_prefill_f16_hd128
+from src.prefill import kv_append_batch_fp8, attn_prefill_fp8_hd64, attn_prefill_fp8_hd128
 from src.qkv_post import qkv_post_f16
 from src.attention import attn_decode_split_f16_hd64, attn_decode_split_f16_hd128
+from src.attention import attn_decode_split_fp8_hd64, attn_decode_split_fp8_hd128
 from src.attention import attn_decode_combine_f16_hd64, attn_decode_combine_f16_hd128
 from src.decode_fused import gemv_norm_q8_0_f16, gemv_norm_nvfp4_f16, gemv_norm_f16
 from src.decode_fused import gemv_norm_silu_q8_0_f16, gemv_norm_silu_nvfp4_f16, gemv_norm_silu_f16
@@ -243,6 +245,15 @@ def main() raises:
     _ = ctx.compile_function[attn_prefill_f16_hd128, dump_asm=Path("attn_prefill_f16_hd128.ptx")]()
     entries.append(_finalize(out_dir, "attn_prefill_f16_hd128"))
 
+    _ = ctx.compile_function[kv_append_batch_fp8, dump_asm=Path("kv_append_batch_fp8.ptx")]()
+    entries.append(_finalize(out_dir, "kv_append_batch_fp8"))
+
+    _ = ctx.compile_function[attn_prefill_fp8_hd64, dump_asm=Path("attn_prefill_fp8_hd64.ptx")]()
+    entries.append(_finalize(out_dir, "attn_prefill_fp8_hd64"))
+
+    _ = ctx.compile_function[attn_prefill_fp8_hd128, dump_asm=Path("attn_prefill_fp8_hd128.ptx")]()
+    entries.append(_finalize(out_dir, "attn_prefill_fp8_hd128"))
+
     _ = ctx.compile_function[qkv_post_f16, dump_asm=Path("qkv_post_f16.ptx")]()
     entries.append(_finalize(out_dir, "qkv_post_f16"))
 
@@ -263,6 +274,12 @@ def main() raises:
 
     _ = ctx.compile_function[attn_decode_split_f16_hd128, dump_asm=Path("attn_decode_split_f16_hd128.ptx")]()
     entries.append(_finalize(out_dir, "attn_decode_split_f16_hd128"))
+
+    _ = ctx.compile_function[attn_decode_split_fp8_hd64, dump_asm=Path("attn_decode_split_fp8_hd64.ptx")]()
+    entries.append(_finalize(out_dir, "attn_decode_split_fp8_hd64"))
+
+    _ = ctx.compile_function[attn_decode_split_fp8_hd128, dump_asm=Path("attn_decode_split_fp8_hd128.ptx")]()
+    entries.append(_finalize(out_dir, "attn_decode_split_fp8_hd128"))
 
     _ = ctx.compile_function[attn_decode_combine_f16_hd64, dump_asm=Path("attn_decode_combine_f16_hd64.ptx")]()
     entries.append(_finalize(out_dir, "attn_decode_combine_f16_hd64"))

@@ -12,6 +12,7 @@ use forge_engine::sample::SamplingParams;
 use forge_engine::server::{spawn_engine, EngineEvent, EngineHandle, EngineRequest};
 use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
+use forge_types::DType;
 use forge_server::source::{kv_pool_bytes, load_model, read_descriptor, LoadedModel};
 use forge_server::toolcall::ToolParserKind;
 use forge_server::{ServerConfig, ServerState};
@@ -56,6 +57,9 @@ enum Command {
         /// Whisper HF snapshot directory enabling /v1/audio/transcriptions.
         #[arg(long)]
         whisper_model: Option<PathBuf>,
+        /// KV cache element type: f16 | fp8 (fp8 halves KV memory/bandwidth).
+        #[arg(long = "kv-cache", default_value = "f16")]
+        kv_cache: String,
     },
     /// One-shot generation streamed to stdout.
     Run {
@@ -73,6 +77,9 @@ enum Command {
         /// VRAM weights-pool size in GiB (0 = automatic split of free VRAM).
         #[arg(long = "weights-pool-gb", default_value_t = 0.0)]
         weights_pool_gb: f64,
+        /// KV cache element type: f16 | fp8 (fp8 halves KV memory/bandwidth).
+        #[arg(long = "kv-cache", default_value = "f16")]
+        kv_cache: String,
     },
     /// Transcribe a WAV file with a Whisper model.
     Transcribe {
@@ -94,6 +101,9 @@ enum Command {
         /// Prompt length in tokens.
         #[arg(long, default_value_t = 512)]
         prompt_tokens: usize,
+        /// KV cache element type: f16 | fp8 (fp8 halves KV memory/bandwidth).
+        #[arg(long = "kv-cache", default_value = "f16")]
+        kv_cache: String,
     },
 }
 
@@ -117,6 +127,7 @@ fn main() -> Result<()> {
             weights_pool_gb,
             tool_call_parser,
             whisper_model,
+            kv_cache,
         } => cmd_serve(
             &model_path,
             bind,
@@ -128,6 +139,7 @@ fn main() -> Result<()> {
             weights_pool_gb,
             tool_call_parser,
             whisper_model.as_deref(),
+            parse_kv_dtype(&kv_cache)?,
         ),
         Command::Run {
             model_path,
@@ -136,7 +148,16 @@ fn main() -> Result<()> {
             temperature,
             chat,
             weights_pool_gb,
-        } => cmd_run(&model_path, &prompt, max_tokens, temperature, chat, weights_pool_gb),
+            kv_cache,
+        } => cmd_run(
+            &model_path,
+            &prompt,
+            max_tokens,
+            temperature,
+            chat,
+            weights_pool_gb,
+            parse_kv_dtype(&kv_cache)?,
+        ),
         Command::Transcribe {
             model_dir,
             wav_path,
@@ -146,7 +167,16 @@ fn main() -> Result<()> {
             model_path,
             tokens,
             prompt_tokens,
-        } => cmd_bench(&model_path, tokens, prompt_tokens),
+            kv_cache,
+        } => cmd_bench(&model_path, tokens, prompt_tokens, parse_kv_dtype(&kv_cache)?),
+    }
+}
+
+fn parse_kv_dtype(s: &str) -> Result<DType> {
+    match s {
+        "f16" => Ok(DType::F16),
+        "fp8" => Ok(DType::F8E4M3),
+        other => bail!("unsupported --kv-cache '{other}' (expected f16 | fp8)"),
     }
 }
 
@@ -164,10 +194,11 @@ fn load_for_serve(
     path: &Path,
     kv_pages: usize,
     weights_pool_gb: f64,
+    kv_dtype: DType,
 ) -> Result<(LoadedModel, usize)> {
     let kv_page_size = ModelConfig::default().kv_page_size;
     let desc = read_descriptor(path)?;
-    let kv_pool = kv_pool_bytes(&desc, kv_page_size, kv_pages).max(1 << 30);
+    let kv_pool = kv_pool_bytes(&desc, kv_page_size, kv_pages, kv_dtype).max(1 << 30);
     let weights = (weights_pool_gb * (1u64 << 30) as f64) as usize;
     let device = CudaDevice::new(
         0,
@@ -183,6 +214,7 @@ fn load_for_serve(
     let cfg = ModelConfig {
         kv_page_size,
         kv_pages,
+        kv_dtype,
         ..ModelConfig::default()
     };
     let loaded = load_model(dev, path, cfg)?;
@@ -190,7 +222,7 @@ fn load_for_serve(
 }
 
 /// Load a model for one-shot commands, sizing pools from free VRAM.
-fn load_auto(path: &Path, weights_pool_gb: f64) -> Result<LoadedModel> {
+fn load_auto(path: &Path, weights_pool_gb: f64, kv_dtype: DType) -> Result<LoadedModel> {
     let device = if weights_pool_gb > 0.0 {
         let weights = (weights_pool_gb * (1u64 << 30) as f64) as usize;
         CudaDevice::new(
@@ -207,7 +239,14 @@ fn load_auto(path: &Path, weights_pool_gb: f64) -> Result<LoadedModel> {
         CudaDevice::with_default_pools(0).context("create CUDA device")?
     };
     let dev: Arc<dyn Device> = device;
-    load_model(dev, path, ModelConfig::default())
+    load_model(
+        dev,
+        path,
+        ModelConfig {
+            kv_dtype,
+            ..ModelConfig::default()
+        },
+    )
 }
 
 /// Load a Whisper model on its own CudaDevice with pools sized from the
@@ -272,10 +311,11 @@ fn cmd_serve(
     weights_pool_gb: f64,
     tool_call_parser: Option<String>,
     whisper_model: Option<&Path>,
+    kv_dtype: DType,
 ) -> Result<()> {
     let max_active = usize::from(max_active);
     let t0 = Instant::now();
-    let (loaded, kv_pages) = load_for_serve(model_path, kv_pages, weights_pool_gb)?;
+    let (loaded, kv_pages) = load_for_serve(model_path, kv_pages, weights_pool_gb, kv_dtype)?;
     tracing::info!(
         "loaded {} ({}) in {:.1}s: {} layers, kv_pages={}",
         model_path.display(),
@@ -390,9 +430,10 @@ fn cmd_run(
     temperature: f32,
     chat: bool,
     weights_pool_gb: f64,
+    kv_dtype: DType,
 ) -> Result<()> {
     let t0 = Instant::now();
-    let loaded = load_auto(model_path, weights_pool_gb)?;
+    let loaded = load_auto(model_path, weights_pool_gb, kv_dtype)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let prompt_text = if chat {
@@ -445,7 +486,7 @@ fn cmd_run(
     Ok(())
 }
 
-fn cmd_bench(model_path: &Path, tokens: usize, prompt_tokens: usize) -> Result<()> {
+fn cmd_bench(model_path: &Path, tokens: usize, prompt_tokens: usize, kv_dtype: DType) -> Result<()> {
     if tokens < 2 {
         bail!("--tokens must be at least 2 to measure decode throughput");
     }
@@ -453,7 +494,7 @@ fn cmd_bench(model_path: &Path, tokens: usize, prompt_tokens: usize) -> Result<(
         bail!("--prompt-tokens must be at least 1");
     }
     let t0 = Instant::now();
-    let loaded = load_auto(model_path, 0.0)?;
+    let loaded = load_auto(model_path, 0.0, kv_dtype)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let tokenizer = Arc::new(loaded.bundle.tokenizer);

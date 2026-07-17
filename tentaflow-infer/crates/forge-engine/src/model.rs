@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use forge_hal::{DevBuffer, Device, ExecGraph, Pool, Stream};
 use forge_kernels::Kernels;
-use forge_types::{ForgeError, MemKind, Result};
+use forge_types::{DType, ForgeError, MemKind, Result};
 
 use crate::kv::{KvCache, KvConfig, SeqKv};
 use crate::sample::{GpuSampler, SamplingParams};
@@ -98,6 +98,11 @@ pub struct ModelConfig {
     pub kv_page_size: usize,
     pub kv_pages: usize,
     pub max_seq_len: usize,
+    /// KV cache element type: F16 (default, bit-exact canonical path) or
+    /// F8E4M3 (halves KV memory + bandwidth; per-value scale-free e4m3 —
+    /// its ±448 range with 2^-9 denormals covers post-norm K/V magnitudes).
+    /// FP8 requires the fused decode path (validated at load).
+    pub kv_dtype: DType,
 }
 
 impl Default for ModelConfig {
@@ -106,6 +111,7 @@ impl Default for ModelConfig {
             kv_page_size: 32,
             kv_pages: 512,
             max_seq_len: 8192,
+            kv_dtype: DType::F16,
         }
     }
 }
@@ -217,6 +223,26 @@ impl Model {
                 p.head_dim
             )));
         }
+        match cfg.kv_dtype {
+            DType::F16 => {}
+            DType::F8E4M3 => {
+                // The non-fused decode chain (qkv_post + attn_decode) has no
+                // fp8 cache kernels; fp8 decode goes through attn_decode_split
+                // exclusively.
+                if !Self::fused_decode_supported(&weights) {
+                    return Err(ForgeError::Unsupported(
+                        "kv_dtype fp8 requires the fused decode path; this model's weight \
+                         formats fall back to the separate decode kernels"
+                            .into(),
+                    ));
+                }
+            }
+            other => {
+                return Err(ForgeError::Unsupported(format!(
+                    "kv_dtype {other} is not a supported KV cache element type (f16 | f8e4m3)"
+                )))
+            }
+        }
         let max_pages_per_seq = cfg.max_seq_len.div_ceil(cfg.kv_page_size);
         let kernels = Kernels::load(device.clone())?;
         let kv = KvCache::new(
@@ -228,6 +254,7 @@ impl Model {
                 page_size: cfg.kv_page_size,
                 n_pages: cfg.kv_pages,
                 max_pages_per_seq,
+                dtype: cfg.kv_dtype,
             },
         )?;
         let stream = device.create_stream()?;
@@ -435,19 +462,19 @@ impl Model {
         }
     }
 
-    /// The fused decode step needs every layer's gate|up projection as one
-    /// fused matrix (the residual stream is carried as an (h, h32) pair with
-    /// no standalone normed-x buffer) and a hidden size that fits the
-    /// kernels' shared-memory staging. QKV may stay split (mixed formats,
-    /// e.g. Q4_K q/k + Q6_K v): each projection then runs its own gemv_norm
-    /// launch — same per-row math, only the norm recompute is repeated.
-    /// Anything else records the separate per-kernel chain.
-    fn fused_decode_supported(&self) -> bool {
-        let p = &self.weights.descriptor.params;
+    /// The fused decode step carries the residual stream as an (h, h32)
+    /// pair with no standalone normed-x buffer and needs a hidden size that
+    /// fits the kernels' shared-memory staging. QKV and gate/up may stay
+    /// split (mixed formats, e.g. Q4_K q/k + Q6_K v, or Q5_K gate + Q6_K
+    /// up): each projection then runs its own gemv_norm launch — same
+    /// per-row math, only the norm recompute is repeated (gate/up adds an
+    /// elementwise silu_mul). Anything else records the separate chain.
+    fn fused_decode_supported(weights: &ModelWeights) -> bool {
+        let p = &weights.descriptor.params;
         if p.hidden_size > 8192 {
             return false;
         }
-        self.weights.layers.iter().all(|l| {
+        weights.layers.iter().all(|l| {
             let qkv_ok = match &l.attn_qkv {
                 QkvWeights::Fused(w) => Self::fused_decode_weight_ok(w),
                 QkvWeights::FusedQk { qk, v } => {
@@ -461,7 +488,12 @@ impl Model {
             };
             let gate_up_ok = match &l.ffn_gate_up {
                 GateUpWeights::Fused(w) => Self::fused_decode_weight_ok(w),
-                GateUpWeights::Split { .. } => false,
+                // Mixed-format gate/up (e.g. Q5_K gate + Q6_K up) stays in
+                // the fused chain: each projection runs its own gemv_norm
+                // and a silu_mul combines them (see record_step_fused).
+                GateUpWeights::Split { gate, up } => {
+                    Self::fused_decode_weight_ok(gate) && Self::fused_decode_weight_ok(up)
+                }
             };
             qkv_ok
                 && gate_up_ok
@@ -1250,7 +1282,7 @@ impl Model {
 
             // Causal attention reads the chunk's own K/V from the cache, so
             // the batch append must land before the attention launch.
-            kernels.kv_append_batch_f16(
+            kernels.kv_append_batch(
                 &self.kv.k[l],
                 &self.kv.v[l],
                 &pb.k,
@@ -1261,10 +1293,11 @@ impl Model {
                 p.n_kv_heads,
                 self.kv.cfg.page_size,
                 p.head_dim,
+                self.kv.cfg.dtype,
                 stream,
             )?;
             trace.mark(self.device.as_ref(), "kv_append");
-            kernels.attn_prefill_f16(
+            kernels.attn_prefill(
                 &pb.attn_out,
                 &pb.q,
                 &self.kv.k[l],
@@ -1276,6 +1309,7 @@ impl Model {
                 p.n_kv_heads,
                 p.head_dim,
                 self.kv.cfg.page_size,
+                self.kv.cfg.dtype,
                 scale,
                 stream,
             )?;
@@ -1559,7 +1593,7 @@ impl Model {
 
         self.device.begin_capture(stream)?;
         let record = || -> Result<()> {
-            if self.fused_decode_supported() {
+            if Self::fused_decode_supported(&self.weights) {
                 return self.record_step_fused();
             }
             kernels.gather_rows_f16(&b.h, &self.weights.token_embd_f16, &b.ids, 1, hidden, stream)?;
@@ -1748,11 +1782,6 @@ impl Model {
         let n_layers = self.weights.layers.len();
         for l in 0..n_layers {
             let layer = &self.weights.layers[l];
-            let GateUpWeights::Fused(w_gate_up) = &layer.ffn_gate_up else {
-                return Err(ForgeError::Kernel(
-                    "fused decode step requires a fused gate|up matrix".into(),
-                ));
-            };
 
             // Fused QKV projects with one gemv_norm into the fused buffer;
             // split layers (mixed formats) run one gemv_norm per projection —
@@ -1778,7 +1807,7 @@ impl Model {
                     (&b.q, 0usize, &b.k, 0usize, &b.v, 0usize)
                 }
             };
-            kernels.attn_decode_split_f16(
+            kernels.attn_decode_split(
                 &b.attn_parts,
                 q_buf,
                 q_off,
@@ -1800,6 +1829,7 @@ impl Model {
                 self.kv.cfg.page_size,
                 self.max_pages_per_seq,
                 ATTN_DECODE_SPLITS,
+                self.kv.cfg.dtype,
                 eps,
                 p.rope_theta,
                 scale,
@@ -1815,7 +1845,21 @@ impl Model {
                 stream,
             )?;
             self.gemv_residual(&layer.attn_o, &b.attn_out, stream)?;
-            self.gemv_norm_silu(&b.act, w_gate_up, &layer.ffn_norm, eps, stream)?;
+            match &layer.ffn_gate_up {
+                GateUpWeights::Fused(w) => {
+                    self.gemv_norm_silu(&b.act, w, &layer.ffn_norm, eps, stream)?;
+                }
+                GateUpWeights::Split { gate, up } => {
+                    // Mixed-format gate/up: two gemv_norm launches (same
+                    // per-row math as the fused silu kernels, the norm
+                    // recompute repeats) + the elementwise SwiGLU combine.
+                    // Rounding matches gemv_norm_silu: both projections are
+                    // stored as f16 before silu_mul reads them.
+                    self.gemv_norm(&b.gate, gate, &layer.ffn_norm, false, eps, stream)?;
+                    self.gemv_norm(&b.up, up, &layer.ffn_norm, false, eps, stream)?;
+                    kernels.silu_mul_f16(&b.act, &b.gate, &b.up, p.intermediate_size, stream)?;
+                }
+            }
             self.gemv_residual(&layer.ffn_down, &b.act, stream)?;
         }
 

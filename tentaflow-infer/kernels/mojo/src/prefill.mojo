@@ -6,15 +6,16 @@ from std.gpu.primitives import warp
 from std.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from std.math import exp
+from src.kv_fp8 import kv_row8_f16
 
 comptime WARP_SIZE = 32
 comptime MAX_WARPS = 8
 comptime NEG_INF: Float32 = -1e30
 
 
-def kv_append_batch_f16(
-    k_cache: UnsafePointer[Float16, MutAnyOrigin],
-    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+def kv_append_batch[kv_dtype: DType](
+    k_cache: UnsafePointer[Scalar[kv_dtype], MutAnyOrigin],
+    v_cache: UnsafePointer[Scalar[kv_dtype], MutAnyOrigin],
     k_in: UnsafePointer[Float16, MutAnyOrigin],
     v_in: UnsafePointer[Float16, MutAnyOrigin],
     page_table: UnsafePointer[Int32, MutAnyOrigin],
@@ -24,7 +25,10 @@ def kv_append_batch_f16(
     head_dim: Int,
 ):
     """Scatter T tokens' K/V ([T, n_kv_heads, head_dim]) at positions
-    base_pos..base_pos+T. Grid: (T, n_kv_heads)."""
+    base_pos..base_pos+T. Grid: (T, n_kv_heads). kv_dtype = float16 stores
+    the f16 rows verbatim; float8_e4m3fn casts per value (RN, satfinite) —
+    the scale-free e4m3 range (±448, min denormal 2^-9) covers post-norm
+    K/V magnitudes."""
     tok = Int(block_idx.x)
     kvh = Int(block_idx.y)
     pos = base_pos + tok
@@ -36,9 +40,13 @@ def kv_append_batch_f16(
 
     var i = Int(thread_idx.x)
     while i < head_dim:
-        k_cache[dst + i] = k_in[src + i]
-        v_cache[dst + i] = v_in[src + i]
+        k_cache[dst + i] = Scalar[kv_dtype](Float32(k_in[src + i]))
+        v_cache[dst + i] = Scalar[kv_dtype](Float32(v_in[src + i]))
         i += Int(block_dim.x)
+
+
+comptime kv_append_batch_f16 = kv_append_batch[DType.float16]
+comptime kv_append_batch_fp8 = kv_append_batch[DType.float8_e4m3fn]
 
 
 comptime QT = 16  # query tokens per block
@@ -46,11 +54,11 @@ comptime PT = WARP_SIZE  # cached positions per smem tile (one lane per position
 comptime QPW = QT // MAX_WARPS  # queries owned by one warp
 
 
-def attn_prefill_f16[head_dim: Int](
+def attn_prefill[head_dim: Int, kv_dtype: DType](
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
     q: UnsafePointer[Float16, MutAnyOrigin],
-    k_cache: UnsafePointer[Float16, MutAnyOrigin],
-    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Scalar[kv_dtype], MutAnyOrigin],
+    v_cache: UnsafePointer[Scalar[kv_dtype], MutAnyOrigin],
     page_table: UnsafePointer[Int32, MutAnyOrigin],
     base_pos: Int,
     n_q_heads: Int,
@@ -70,7 +78,12 @@ def attn_prefill_f16[head_dim: Int](
     row reads are bank-conflict-free), the softmax exp runs 32-wide, the
     online-softmax rescale happens once per TILE (not per position), and the
     P·V accumulation broadcasts p_j via warp shuffle with lanes splitting the
-    head dimension."""
+    head dimension.
+
+    kv_dtype = float8_e4m3fn reads an FP8 cache: rows are widened to f16 in
+    the shared-memory tiles (e4m3 values are exactly representable in f16),
+    so the attention arithmetic is bit-identical to the f16 kernel run on a
+    dequantized cache."""
     comptime epl = head_dim // WARP_SIZE
     comptime row_chunks = head_dim // 8
     comptime tile_chunks = PT * row_chunks
@@ -143,9 +156,9 @@ def attn_prefill_f16[head_dim: Int](
                 ) * head_dim + off * 8
                 (ks + row * head_dim + ((off ^ (row % row_chunks)) * 8)).store[
                     width=8, alignment=16
-                ]((k_cache + kv_base).load[width=8, alignment=16]())
+                ](kv_row8_f16[kv_dtype](k_cache + kv_base))
                 (vs + row * head_dim + off * 8).store[width=8, alignment=16](
-                    (v_cache + kv_base).load[width=8, alignment=16]()
+                    kv_row8_f16[kv_dtype](v_cache + kv_base)
                 )
         barrier()
 
@@ -203,5 +216,7 @@ def attn_prefill_f16[head_dim: Int](
             )
 
 
-comptime attn_prefill_f16_hd64 = attn_prefill_f16[64]
-comptime attn_prefill_f16_hd128 = attn_prefill_f16[128]
+comptime attn_prefill_f16_hd64 = attn_prefill[64, DType.float16]
+comptime attn_prefill_f16_hd128 = attn_prefill[128, DType.float16]
+comptime attn_prefill_fp8_hd64 = attn_prefill[64, DType.float8_e4m3fn]
+comptime attn_prefill_fp8_hd128 = attn_prefill[128, DType.float8_e4m3fn]

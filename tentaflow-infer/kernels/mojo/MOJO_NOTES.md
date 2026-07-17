@@ -75,6 +75,32 @@ Published tutorials mostly show pre-1.0 syntax — trust these notes over old do
   (ISETP/BSSY per load) starve the tensor pipe; clamp out-of-range
   tokens/rows instead of branching and zero-fill only the W k-tail.
 
+## FP8 (e4m3) — verified on sm_89
+- `DType.float8_e4m3fn` works end-to-end: buffers, kernel pointers, and
+  `Scalar[DType.float8_e4m3fn](f32)` casts (RN, satfinite ±448, denormals and
+  -0.0 correct — matches a bit-level RNE oracle for every f16 input).
+- BUT float8→float casts on the GPU lower to 64-bit bit-math EMULATION
+  (~15 extra instructions per value) — never put them in a hot loop. Use the
+  hardware pair conversion via inline PTX instead (src/kv_fp8.mojo):
+  `from std.sys import inlined_assembly` →
+  `inlined_assembly["cvt.rn.f16x2.e4m3x2 $0, $1;", UInt32, constraints="=r,h", has_side_effect=False](u16_pair)`
+  (low byte → low f16 half; e4m3→f16 is exact). `has_side_effect=False` lets
+  LLVM schedule loads across the asm.
+- Bit reinterpretation: `x.to_bits[DType.uint8]()` and
+  `from std.memory import bitcast` → `bitcast[DType.float16, 2](u32)`
+  (there is no `SIMD.from_bits` / member `bitcast` on scalars).
+- `comptime if cond:` works inside `def` for parameter-dependent codegen
+  (e.g. branching a kernel body on a `kv_dtype: DType` parameter).
+- Perf regime note: single-sequence decode attention is LATENCY-bound (heads
+  × splits blocks ≈ 1-2 per SM, never DRAM-saturated), so halving KV bytes
+  does not pay there — the pack+cvt chain costs more than the bandwidth
+  saves. Graph-replay profile (nsys, Bielik 32q/8kv hd128, ctx 2048):
+  attn_decode_split 23.0 us f16 vs 33.3 us fp8 per layer. Beware standalone
+  micro-benches at one layer's shape: the KV slab fits in Ada's 72 MB L2
+  after the first rep and can show the opposite sign. fp8's decode win needs
+  a memory-bound attention (large batch / much longer ctx); today its value
+  is 2x KV capacity at parity prefill.
+
 ## Files / OS
 - `import std.os as os` → `os.makedirs(String(path), exist_ok=True)`, `os.remove(...)`.
 - `from std.pathlib import Path` → `p.read_text()`, `p.write_text(s)`, `/` join.
