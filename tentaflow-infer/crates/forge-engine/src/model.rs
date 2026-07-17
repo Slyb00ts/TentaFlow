@@ -10,8 +10,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use forge_hal::{DevBuffer, Device, ExecGraph, Pool, Stream};
+use forge_formats::PoolingType;
 use forge_kernels::Kernels;
 use forge_types::{DType, ForgeError, MemKind, Result};
+use half::f16;
 
 use crate::kv::{KvCache, KvConfig, SeqKv};
 use crate::sample::{GpuSampler, SamplingParams};
@@ -112,6 +114,18 @@ impl Default for ModelConfig {
             kv_pages: 512,
             max_seq_len: 8192,
             kv_dtype: DType::F16,
+        }
+    }
+}
+
+/// L2-normalize a vector in place. A zero vector is left unchanged (no NaNs
+/// from dividing by a zero norm).
+pub fn l2_normalize(v: &mut [f32]) {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        let inv = 1.0 / norm;
+        for x in v.iter_mut() {
+            *x *= inv;
         }
     }
 }
@@ -1183,11 +1197,15 @@ impl Model {
         Ok(())
     }
 
-    /// Run a prompt chunk (≤ MAX_PREFILL_CHUNK tokens) through the model in
-    /// one batched pass, appending to `seq`, and return the last token's
-    /// logits. Not graph-captured: T varies per call and prefill launches are
-    /// large enough that launch overhead is immaterial.
-    pub fn prefill_chunk(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
+    /// Run a prompt chunk (≤ MAX_PREFILL_CHUNK tokens) through every
+    /// transformer block in one batched pass, appending K/V to `seq`. Leaves
+    /// the final-norm hidden states for the chunk's `t` tokens in
+    /// `prefill_bufs.x` as a `[t, hidden]` row-major f16 matrix and returns
+    /// `t`. The device is synchronized before returning (the stream is idle),
+    /// so callers may read `x` or launch further work. `prefill_chunk` maps
+    /// the last row through the lm_head for next-token logits; `embed` pools
+    /// the rows into a sentence vector.
+    fn prefill_forward(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<usize> {
         let p = self.weights.descriptor.params.clone();
         let t = tokens.len();
         if t == 0 {
@@ -1345,30 +1363,132 @@ impl Model {
             trace.mark(self.device.as_ref(), "norm_res2");
         }
 
+        // The stream is drained here so callers can read the hidden states or
+        // launch the logits/pool tail without an additional sync of their own.
+        self.device.synchronize()?;
+        trace.report(t);
+        Ok(t)
+    }
+
+    /// Run a prompt chunk (≤ MAX_PREFILL_CHUNK tokens) through the model in one
+    /// batched pass, appending to `seq`, and return the last token's logits.
+    /// Not graph-captured: T varies per call and prefill launches are large
+    /// enough that launch overhead is immaterial.
+    pub fn prefill_chunk(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
+        let t = self.prefill_forward(seq, tokens)?;
+        let hidden = self.weights.descriptor.params.hidden_size;
+        let vocab = self.weights.descriptor.params.vocab_size;
+        let stream = &self.stream;
+        let pb = self.prefill_bufs.as_ref().expect("prefill_forward allocated");
         // Only the last token's logits matter; route its hidden state through
         // the decode logits path (same GEMV + pinned landing).
         self.device
             .copy(&pb.x, (t - 1) * hidden * 2, &self.bufs.x, 0, hidden * 2, stream)?;
         self.logits_gemv(&self.bufs.logits, &self.bufs.x, stream)?;
-        self.device.copy(
-            &self.bufs.logits,
-            0,
-            &self.bufs.pinned_logits,
-            0,
-            p.vocab_size * 4,
-            stream,
-        )?;
+        self.device
+            .copy(&self.bufs.logits, 0, &self.bufs.pinned_logits, 0, vocab * 4, stream)?;
         self.device.synchronize()?;
-        trace.mark(self.device.as_ref(), "logits");
-        trace.report(t);
 
         let lp = self
             .bufs
             .pinned_logits
             .host_ptr()
             .expect("pinned buffer has host mapping") as *const f32;
-        let logits = unsafe { std::slice::from_raw_parts(lp, p.vocab_size) }.to_vec();
+        let logits = unsafe { std::slice::from_raw_parts(lp, vocab) }.to_vec();
         Ok(logits)
+    }
+
+    /// Pooling declared by this model's metadata, falling back to `Mean` for
+    /// models that declare none (the neutral choice for a generative model
+    /// asked to produce an embedding).
+    pub fn embedding_pooling(&self) -> PoolingType {
+        match self.weights.descriptor.params.pooling_type {
+            PoolingType::None => PoolingType::Mean,
+            other => other,
+        }
+    }
+
+    /// Encode `tokens` into a single sentence embedding. Runs the causal
+    /// forward pass over the whole sequence (chunked at MAX_PREFILL_CHUNK,
+    /// appending to a private KV sequence so later chunks attend to earlier
+    /// ones), pools the final-norm hidden states with `pooling`, and — when
+    /// `normalize` — L2-normalizes the result.
+    ///
+    /// The v0 arches (qwen3/llama/mistral) are decoder transformers, so the
+    /// pass is causal: `Last` pooling reads the final token (which has
+    /// attended to the whole sequence) and `Cls` the first. A bidirectional
+    /// encoder arch would need the non-causal attention path (`attn_full`,
+    /// already used by the Whisper encoder) wired in behind an arch flag; no
+    /// such arch is in the registry yet, so that path is intentionally absent.
+    pub fn embed(
+        &mut self,
+        tokens: &[u32],
+        pooling: PoolingType,
+        normalize: bool,
+    ) -> Result<Vec<f32>> {
+        if tokens.is_empty() {
+            return Err(ForgeError::Scheduler("empty embedding input".into()));
+        }
+        let hidden = self.weights.descriptor.params.hidden_size;
+        let mut seq = self.new_seq();
+        let out = self.embed_pooled(&mut seq, tokens, pooling, hidden);
+        self.release_seq(&mut seq);
+        let mut v = out?;
+        if normalize {
+            l2_normalize(&mut v);
+        }
+        Ok(v)
+    }
+
+    /// Forward + pool over a freshly grown sequence. Split out so `embed` can
+    /// always release the sequence even on a mid-chunk error.
+    fn embed_pooled(
+        &mut self,
+        seq: &mut SeqKv,
+        tokens: &[u32],
+        pooling: PoolingType,
+        hidden: usize,
+    ) -> Result<Vec<f32>> {
+        let mut sum = vec![0f32; hidden];
+        let mut last = vec![0f32; hidden];
+        let mut cls: Option<Vec<f32>> = None;
+        let mut total: usize = 0;
+        let mut scratch = vec![0u8; MAX_PREFILL_CHUNK * hidden * 2];
+        for chunk in tokens.chunks(MAX_PREFILL_CHUNK) {
+            let t = self.prefill_forward(seq, chunk)?;
+            let pb = self.prefill_bufs.as_ref().expect("prefill_forward allocated");
+            let bytes = &mut scratch[..t * hidden * 2];
+            self.device.read(&pb.x, 0, bytes)?;
+            let rows: &[f16] = bytemuck::cast_slice(bytes);
+            if cls.is_none() {
+                cls = Some(rows[..hidden].iter().map(|h| h.to_f32()).collect());
+            }
+            for ti in 0..t {
+                let row = &rows[ti * hidden..(ti + 1) * hidden];
+                match pooling {
+                    PoolingType::Mean | PoolingType::None => {
+                        for (s, h) in sum.iter_mut().zip(row) {
+                            *s += h.to_f32();
+                        }
+                    }
+                    PoolingType::Last => {
+                        for (dst, h) in last.iter_mut().zip(row) {
+                            *dst = h.to_f32();
+                        }
+                    }
+                    PoolingType::Cls => {}
+                }
+            }
+            total += t;
+        }
+        Ok(match pooling {
+            PoolingType::Mean | PoolingType::None => {
+                let inv = 1.0 / total as f32;
+                sum.iter().map(|s| s * inv).collect()
+            }
+            PoolingType::Last => last,
+            PoolingType::Cls => cls.expect("at least one chunk processed"),
+        })
     }
 
     /// Run one token through the model, appending to `seq`, and return the

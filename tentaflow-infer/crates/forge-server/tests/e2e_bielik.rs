@@ -83,6 +83,7 @@ async fn chat_completions_end_to_end() {
         4,
         forge_server::toolcall::ToolParserKind::None,
         None,
+        None,
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

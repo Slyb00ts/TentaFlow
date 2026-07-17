@@ -17,12 +17,34 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::routing::{get, post};
 use axum::Router;
+use forge_engine::model::Model;
 use forge_engine::server::EngineHandle;
+use forge_formats::PoolingType;
 use forge_tokenize::Tokenizer;
 
 /// Whisper STT shared across handlers; the mutex serializes transcriptions
 /// (single sequence per model, one at a time on the device).
 pub type SharedWhisper = Arc<tokio::sync::Mutex<forge_whisper::WhisperModel>>;
+
+/// Embedding model backing /v1/embeddings. Owns its own `Model` on a dedicated
+/// device (like Whisper), with a mutex serializing forward passes: one
+/// single-sequence pooled encode at a time on that device.
+pub struct EmbedModel {
+    pub model: tokio::sync::Mutex<Model>,
+    pub tokenizer: Arc<Tokenizer>,
+    pub pooling: PoolingType,
+    /// Whether to L2-normalize the pooled vector (sentence-transformers
+    /// `Normalize` module / default for retrieval embeddings).
+    pub normalize: bool,
+    /// Native embedding width (model hidden size).
+    pub dim: usize,
+    /// Hard token budget per input (model context ceiling).
+    pub max_context: usize,
+    /// Served id reported in the response `model` field.
+    pub model_id: String,
+}
+
+pub type SharedEmbed = Arc<EmbedModel>;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -58,6 +80,11 @@ pub struct ServerState {
     /// buffer a multi-MB upload while the single-sequence Whisper model works
     /// through the queue, so unbounded concurrency would exhaust memory.
     pub stt_slots: tokio::sync::Semaphore,
+    /// Optional embedding model backing /v1/embeddings.
+    pub embed: Option<SharedEmbed>,
+    /// Admission cap for embedding requests: each holds one blocking-pool
+    /// thread while the single-sequence embedding model works its batch.
+    pub embed_slots: tokio::sync::Semaphore,
 }
 
 impl ServerState {
@@ -73,6 +100,7 @@ impl ServerState {
         max_active: usize,
         tool_parser: toolcall::ToolParserKind,
         whisper: Option<SharedWhisper>,
+        embed: Option<SharedEmbed>,
     ) -> Arc<Self> {
         let queue_limit = max_active.saturating_mul(4).clamp(16, 256);
         Arc::new(Self {
@@ -94,6 +122,8 @@ impl ServerState {
             tool_parser,
             whisper,
             stt_slots: tokio::sync::Semaphore::new(4),
+            embed,
+            embed_slots: tokio::sync::Semaphore::new(4),
         })
     }
 }
@@ -110,6 +140,7 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
             post(routes::audio_transcriptions)
                 .layer(axum::extract::DefaultBodyLimit::max(64 << 20)),
         )
+        .route("/embeddings", post(routes::embeddings))
         .route("/models", get(routes::list_models))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),

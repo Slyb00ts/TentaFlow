@@ -18,9 +18,10 @@ use forge_tokenize::{ChatMessage, ChatTemplateEngine};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::api::{
-    ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatResponseMessage,
-    CompletionChoice, CompletionRequest, CompletionResponse, FunctionCallOut, GenerationSpec,
-    ModelEntry, ModelList, ToolCallOut, ToolMode, Usage,
+    base64_encode, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatResponseMessage,
+    CompletionChoice, CompletionRequest, CompletionResponse, EmbItem, EmbeddingData,
+    EmbeddingUsage, EmbeddingVec, EmbeddingsRequest, EmbeddingsResponse, EncodingFormat,
+    FunctionCallOut, GenerationSpec, ModelEntry, ModelList, ToolCallOut, ToolMode, Usage,
 };
 use crate::error::ApiError;
 use crate::toolcall::{OutputParser, ParseStep, ToolParserKind};
@@ -689,6 +690,132 @@ pub async fn audio_transcriptions(
         }
         Ok(Err(e)) => ApiError::internal(format!("transcription failed: {e}")).into_response(),
         Err(e) => ApiError::internal(format!("transcription task failed: {e}")).into_response(),
+    }
+}
+
+/// POST /v1/embeddings — OpenAI-compatible embeddings. Accepts a single
+/// string, a batch of strings, or pre-tokenized id array(s). Runs each input
+/// through the embedding model's pooled forward pass, applies optional
+/// Matryoshka truncation (`dimensions`) with renormalization, and returns
+/// float or base64 vectors. 404 when the server has no embedding model.
+pub async fn embeddings(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<EmbeddingsRequest>,
+) -> Response {
+    let Some(embed) = state.embed.clone() else {
+        return ApiError::not_found(
+            "no embedding model is configured; start the server with --embed-model",
+        )
+        .into_response();
+    };
+    let encoding = match req.encoding() {
+        Ok(e) => e,
+        Err(e) => return e.into_response(),
+    };
+    if let Some(0) = req.dimensions {
+        return ApiError::invalid_request("`dimensions` must be at least 1").into_response();
+    }
+    let dimensions = req.dimensions;
+    let items = req.input.into_items();
+    if items.is_empty() {
+        return ApiError::invalid_request("`input` must not be empty").into_response();
+    }
+
+    // One embedding batch at a time on this device; admit before the GPU work
+    // so excess load is rejected up front rather than queued unbounded.
+    let Ok(_permit) = state.embed_slots.try_acquire() else {
+        return ApiError::overloaded("too many concurrent embedding requests").into_response();
+    };
+
+    let model_id = embed.model_id.clone();
+    let joined = tokio::task::spawn_blocking(move || -> Result<(Vec<Vec<f32>>, usize), ApiError> {
+        // Tokenize (or accept caller ids) and bound each input before any GPU
+        // work, so an over-length item fails fast without partial compute.
+        let mut token_sets: Vec<Vec<u32>> = Vec::with_capacity(items.len());
+        let mut prompt_tokens = 0usize;
+        for item in items {
+            let ids = match item {
+                EmbItem::Text(s) => embed
+                    .tokenizer
+                    .encode(&s, true)
+                    .map_err(|e| ApiError::internal(format!("tokenization failed: {e}")))?,
+                EmbItem::Tokens(ids) => ids,
+            };
+            if ids.is_empty() {
+                return Err(ApiError::invalid_request(
+                    "an `input` item produced zero tokens",
+                ));
+            }
+            if ids.len() > embed.max_context {
+                return Err(ApiError::context_length_exceeded(format!(
+                    "input has {} tokens, over the embedding model limit of {}",
+                    ids.len(),
+                    embed.max_context
+                )));
+            }
+            prompt_tokens += ids.len();
+            token_sets.push(ids);
+        }
+
+        let mut model = embed.model.blocking_lock();
+        let mut vecs = Vec::with_capacity(token_sets.len());
+        for ids in &token_sets {
+            let mut v = model
+                .embed(ids, embed.pooling, embed.normalize)
+                .map_err(|e| ApiError::internal(format!("embedding failed: {e}")))?;
+            // Matryoshka: keep the leading `dimensions` components; the
+            // prefixes of these models are trained to stay meaningful, and a
+            // normalized model needs a renormalize after truncation.
+            if let Some(d) = dimensions {
+                if d < v.len() {
+                    v.truncate(d);
+                    if embed.normalize {
+                        forge_engine::model::l2_normalize(&mut v);
+                    }
+                }
+            }
+            vecs.push(v);
+        }
+        Ok((vecs, prompt_tokens))
+    })
+    .await;
+
+    match joined {
+        Ok(Ok((vecs, prompt_tokens))) => {
+            let data = vecs
+                .into_iter()
+                .enumerate()
+                .map(|(index, v)| {
+                    let embedding = match encoding {
+                        EncodingFormat::Float => EmbeddingVec::Float(v),
+                        EncodingFormat::Base64 => {
+                            let mut bytes = Vec::with_capacity(v.len() * 4);
+                            for f in &v {
+                                bytes.extend_from_slice(&f.to_le_bytes());
+                            }
+                            EmbeddingVec::Base64(base64_encode(&bytes))
+                        }
+                    };
+                    EmbeddingData {
+                        object: "embedding",
+                        embedding,
+                        index,
+                    }
+                })
+                .collect();
+            Json(EmbeddingsResponse {
+                object: "list",
+                data,
+                model: model_id,
+                usage: EmbeddingUsage {
+                    prompt_tokens,
+                    total_tokens: prompt_tokens,
+                },
+            })
+            .into_response()
+        }
+        Ok(Err(e)) => e.into_response(),
+        Err(e) => ApiError::internal(format!("embedding task failed: {e}")).into_response(),
     }
 }
 

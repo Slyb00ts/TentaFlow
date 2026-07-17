@@ -19,6 +19,30 @@ fn fmt_err(msg: impl Into<String>) -> ForgeError {
     ForgeError::Format(msg.into())
 }
 
+/// Sequence-pooling strategy for embedding models. Mirrors llama.cpp's
+/// `<arch>.pooling_type` enum (0 = none, 1 = mean, 2 = cls, 3 = last); `None`
+/// marks a plain generative model with no pooling declared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolingType {
+    None,
+    Mean,
+    Cls,
+    Last,
+}
+
+impl PoolingType {
+    /// Map the GGUF `<arch>.pooling_type` integer to a variant. Unknown values
+    /// (e.g. 4 = rank, not an embedding pooler) degrade to `None`.
+    fn from_gguf_u32(v: u32) -> Self {
+        match v {
+            1 => PoolingType::Mean,
+            2 => PoolingType::Cls,
+            3 => PoolingType::Last,
+            _ => PoolingType::None,
+        }
+    }
+}
+
 /// Semantic role of a weight tensor in the transformer graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 pub enum WeightRole {
@@ -95,6 +119,9 @@ pub struct Hyperparams {
     pub rms_norm_eps: f32,
     pub max_position_embeddings: usize,
     pub tie_word_embeddings: bool,
+    /// Sequence pooling declared by the model (embedding models only); `None`
+    /// for generative models.
+    pub pooling_type: PoolingType,
 }
 
 /// Architecture + hyperparams + fully resolved weight-name map.
@@ -187,6 +214,10 @@ impl ModelDescriptor {
         }
         // Missing output.weight means the lm_head shares the embedding matrix.
         let tie_word_embeddings = !globals.contains_key(&WeightRole::LmHead);
+        let pooling_type = gguf
+            .get_u32(&key("pooling_type"))
+            .map(PoolingType::from_gguf_u32)
+            .unwrap_or(PoolingType::None);
 
         Ok(ModelDescriptor {
             arch: spec.name.clone(),
@@ -202,6 +233,7 @@ impl ModelDescriptor {
                 rms_norm_eps,
                 max_position_embeddings,
                 tie_word_embeddings,
+                pooling_type,
             },
             globals,
             layers,
@@ -258,6 +290,9 @@ impl ModelDescriptor {
                 rms_norm_eps: config.rms_norm_eps,
                 max_position_embeddings: config.max_position_embeddings,
                 tie_word_embeddings: config.tie_word_embeddings,
+                // HF config.json carries no pooling; sentence-transformers keeps
+                // it in a `1_Pooling/config.json` sidecar the loader overrides.
+                pooling_type: PoolingType::None,
             },
             globals,
             layers,
@@ -340,6 +375,29 @@ mod tests {
         assert_eq!(desc.arch, "qwen3");
         assert!(!desc.globals.contains_key(&WeightRole::LmHead));
         assert!(desc.layers[0].contains_key(&WeightRole::AttnKNorm));
+    }
+
+    #[test]
+    fn pooling_type_maps_gguf_enum() {
+        assert_eq!(PoolingType::from_gguf_u32(0), PoolingType::None);
+        assert_eq!(PoolingType::from_gguf_u32(1), PoolingType::Mean);
+        assert_eq!(PoolingType::from_gguf_u32(2), PoolingType::Cls);
+        assert_eq!(PoolingType::from_gguf_u32(3), PoolingType::Last);
+        // 4 = rank (reranker head), not an embedding pooler.
+        assert_eq!(PoolingType::from_gguf_u32(4), PoolingType::None);
+    }
+
+    #[test]
+    fn from_hf_has_no_pooling() {
+        let cfg: HfConfig = serde_json::from_str(
+            r#"{"architectures":["Qwen3ForCausalLM"],"hidden_size":1024,
+                "num_hidden_layers":1,"num_attention_heads":16,
+                "num_key_value_heads":8,"intermediate_size":3072,
+                "vocab_size":151936,"max_position_embeddings":40960}"#,
+        )
+        .unwrap();
+        let desc = ModelDescriptor::from_hf(&cfg).unwrap();
+        assert_eq!(desc.params.pooling_type, PoolingType::None);
     }
 
     #[test]

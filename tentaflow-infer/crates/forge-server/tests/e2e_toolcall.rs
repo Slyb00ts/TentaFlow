@@ -128,6 +128,7 @@ async fn qwen3_tool_calls_end_to_end() {
         2,
         tool_parser,
         None,
+        None,
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

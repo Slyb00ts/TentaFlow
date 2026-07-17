@@ -411,6 +411,128 @@ pub struct CompletionResponse {
     pub usage: Usage,
 }
 
+// ---- Embeddings ----
+
+/// OpenAI `/v1/embeddings` `input`: one string, a batch of strings, a single
+/// pre-tokenized id array, or a batch of id arrays. `untagged` tries the
+/// variants top-down; token arrays never parse as strings, so the ordering is
+/// unambiguous (string batch, then id-array batch, then single id array).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    Text(String),
+    Texts(Vec<String>),
+    TokenBatches(Vec<Vec<u32>>),
+    Tokens(Vec<u32>),
+}
+
+/// One resolved embedding input: raw text still to tokenize, or ids supplied
+/// directly by the caller.
+#[derive(Debug, Clone)]
+pub enum EmbItem {
+    Text(String),
+    Tokens(Vec<u32>),
+}
+
+impl EmbeddingInput {
+    pub fn into_items(self) -> Vec<EmbItem> {
+        match self {
+            EmbeddingInput::Text(s) => vec![EmbItem::Text(s)],
+            EmbeddingInput::Texts(v) => v.into_iter().map(EmbItem::Text).collect(),
+            EmbeddingInput::Tokens(ids) => vec![EmbItem::Tokens(ids)],
+            EmbeddingInput::TokenBatches(b) => b.into_iter().map(EmbItem::Tokens).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingsRequest {
+    pub model: String,
+    pub input: EmbeddingInput,
+    /// "float" (default) or "base64" (little-endian f32 bytes, base64 string).
+    #[serde(default)]
+    pub encoding_format: Option<String>,
+    /// Matryoshka truncation: keep the first `dimensions` components and
+    /// renormalize. Ignored when ≥ the model's native width.
+    #[serde(default)]
+    pub dimensions: Option<usize>,
+}
+
+/// Per-request wire format for each vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodingFormat {
+    Float,
+    Base64,
+}
+
+impl EmbeddingsRequest {
+    pub fn encoding(&self) -> Result<EncodingFormat, ApiError> {
+        match self.encoding_format.as_deref() {
+            None | Some("float") => Ok(EncodingFormat::Float),
+            Some("base64") => Ok(EncodingFormat::Base64),
+            Some(other) => Err(ApiError::invalid_request(format!(
+                "unsupported encoding_format '{other}' (expected float | base64)"
+            ))),
+        }
+    }
+}
+
+/// Either a raw float vector or its base64 encoding, chosen by the request.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum EmbeddingVec {
+    Float(Vec<f32>),
+    Base64(String),
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingData {
+    pub object: &'static str,
+    pub embedding: EmbeddingVec,
+    pub index: usize,
+}
+
+/// Embeddings usage: no completion tokens, unlike chat.
+#[derive(Debug, Serialize)]
+pub struct EmbeddingUsage {
+    pub prompt_tokens: usize,
+    pub total_tokens: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingsResponse {
+    pub object: &'static str,
+    pub data: Vec<EmbeddingData>,
+    pub model: String,
+    pub usage: EmbeddingUsage,
+}
+
+/// Standard-alphabet base64 (with padding), used for `encoding_format:
+/// "base64"` vector bodies.
+pub fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[(n >> 18) as usize & 0x3f] as char);
+        out.push(T[(n >> 12) as usize & 0x3f] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 0x3f] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 0x3f] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 #[derive(Debug, Serialize)]
 pub struct ModelEntry {
     pub id: String,
@@ -431,6 +553,52 @@ mod tests {
 
     fn chat_req(json: serde_json::Value) -> ChatCompletionRequest {
         serde_json::from_value(json).unwrap()
+    }
+
+    fn embed_req(json: serde_json::Value) -> EmbeddingsRequest {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn embedding_input_variants_parse_unambiguously() {
+        // Single string.
+        let r = embed_req(serde_json::json!({"model": "m", "input": "hello"}));
+        assert!(matches!(r.input.into_items().as_slice(), [EmbItem::Text(s)] if s == "hello"));
+        // String batch.
+        let r = embed_req(serde_json::json!({"model": "m", "input": ["a", "b"]}));
+        assert_eq!(r.input.into_items().len(), 2);
+        // Single pre-tokenized id array.
+        let r = embed_req(serde_json::json!({"model": "m", "input": [1, 2, 3]}));
+        assert!(matches!(r.input.into_items().as_slice(), [EmbItem::Tokens(ids)] if ids == &[1, 2, 3]));
+        // Batch of id arrays.
+        let r = embed_req(serde_json::json!({"model": "m", "input": [[1, 2], [3]]}));
+        let items = r.input.into_items();
+        assert_eq!(items.len(), 2);
+        assert!(matches!(&items[0], EmbItem::Tokens(ids) if ids == &[1, 2]));
+    }
+
+    #[test]
+    fn encoding_format_defaults_and_rejects() {
+        let r = embed_req(serde_json::json!({"model": "m", "input": "x"}));
+        assert_eq!(r.encoding().unwrap(), EncodingFormat::Float);
+        let r = embed_req(
+            serde_json::json!({"model": "m", "input": "x", "encoding_format": "base64"}),
+        );
+        assert_eq!(r.encoding().unwrap(), EncodingFormat::Base64);
+        let r = embed_req(
+            serde_json::json!({"model": "m", "input": "x", "encoding_format": "yaml"}),
+        );
+        assert!(r.encoding().is_err());
+    }
+
+    #[test]
+    fn base64_matches_reference_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
     }
 
     #[test]

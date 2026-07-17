@@ -13,7 +13,7 @@ pub mod hf_config;
 pub mod nvfp4;
 pub mod safetensors;
 
-pub use arch::{ArchSpec, Hyperparams, ModelDescriptor, WeightRole};
+pub use arch::{ArchSpec, Hyperparams, ModelDescriptor, PoolingType, WeightRole};
 pub use dequant::dequantize_to_f32;
 pub use gguf::{Gguf, GgufTensor, MetaValue};
 pub use hf_config::HfConfig;

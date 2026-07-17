@@ -10,12 +10,15 @@ use clap::{Parser, Subcommand};
 use forge_engine::model::ModelConfig;
 use forge_engine::sample::SamplingParams;
 use forge_engine::server::{spawn_engine, EngineEvent, EngineHandle, EngineRequest};
+use forge_formats::PoolingType;
 use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
 use forge_types::DType;
-use forge_server::source::{kv_pool_bytes, load_model, read_descriptor, LoadedModel};
+use forge_server::source::{
+    kv_pool_bytes, load_model, read_descriptor, resolve_normalize, resolve_pooling, LoadedModel,
+};
 use forge_server::toolcall::ToolParserKind;
-use forge_server::{ServerConfig, ServerState};
+use forge_server::{EmbedModel, ServerConfig, ServerState, SharedEmbed};
 use forge_tokenize::{ChatMessage, ChatTemplateEngine};
 
 #[derive(Parser)]
@@ -57,9 +60,29 @@ enum Command {
         /// Whisper HF snapshot directory enabling /v1/audio/transcriptions.
         #[arg(long)]
         whisper_model: Option<PathBuf>,
+        /// GGUF file or HF snapshot enabling /v1/embeddings. When omitted and
+        /// the served model is itself an embedding model, that model is reused.
+        #[arg(long)]
+        embed_model: Option<PathBuf>,
         /// KV cache element type: f16 | fp8 (fp8 halves KV memory/bandwidth).
         #[arg(long = "kv-cache", default_value = "f16")]
         kv_cache: String,
+    },
+    /// Print an embedding vector for one text (dims + L2 norm + first values).
+    Embed {
+        /// GGUF file or HF snapshot directory of an embedding model.
+        model_path: PathBuf,
+        /// Text to embed.
+        text: String,
+        /// Pooling override: mean | cls | last (default: model metadata).
+        #[arg(long)]
+        pooling: Option<String>,
+        /// Matryoshka truncation: keep the first N dimensions and renormalize.
+        #[arg(long)]
+        dimensions: Option<usize>,
+        /// VRAM weights-pool size in GiB (0 = automatic split of free VRAM).
+        #[arg(long = "weights-pool-gb", default_value_t = 0.0)]
+        weights_pool_gb: f64,
     },
     /// One-shot generation streamed to stdout.
     Run {
@@ -127,6 +150,7 @@ fn main() -> Result<()> {
             weights_pool_gb,
             tool_call_parser,
             whisper_model,
+            embed_model,
             kv_cache,
         } => cmd_serve(
             &model_path,
@@ -139,7 +163,21 @@ fn main() -> Result<()> {
             weights_pool_gb,
             tool_call_parser,
             whisper_model.as_deref(),
+            embed_model.as_deref(),
             parse_kv_dtype(&kv_cache)?,
+        ),
+        Command::Embed {
+            model_path,
+            text,
+            pooling,
+            dimensions,
+            weights_pool_gb,
+        } => cmd_embed(
+            &model_path,
+            &text,
+            pooling.as_deref(),
+            dimensions,
+            weights_pool_gb,
         ),
         Command::Run {
             model_path,
@@ -281,6 +319,93 @@ fn load_whisper(dir: &Path) -> Result<forge_server::SharedWhisper> {
     Ok(Arc::new(tokio::sync::Mutex::new(model)))
 }
 
+fn parse_pooling(s: &str) -> Result<PoolingType> {
+    match s {
+        "mean" => Ok(PoolingType::Mean),
+        "cls" => Ok(PoolingType::Cls),
+        "last" => Ok(PoolingType::Last),
+        other => bail!("unsupported --pooling '{other}' (expected mean | cls | last)"),
+    }
+}
+
+/// Load an embedding model on its own CudaDevice (like Whisper), resolving its
+/// pooling and normalization from metadata. A `None` pooling degrades to mean.
+/// Pools auto-size from free VRAM (the model loads after the chat engine has
+/// already taken its own device pool).
+fn load_embed(path: &Path, model_id: String) -> Result<SharedEmbed> {
+    let device = CudaDevice::with_default_pools(0)
+        .context("create CUDA device for embedding model")?;
+    let dev: Arc<dyn Device> = device;
+    let loaded = load_model(dev, path, ModelConfig::default())
+        .with_context(|| format!("load embedding model from {}", path.display()))?;
+    let params = &loaded.model.weights.descriptor.params;
+    let dim = params.hidden_size;
+    let max_context = params
+        .max_position_embeddings
+        .min(ModelConfig::default().max_seq_len);
+    let pooling = match resolve_pooling(path, &loaded.model.weights.descriptor) {
+        PoolingType::None => PoolingType::Mean,
+        other => other,
+    };
+    let normalize = resolve_normalize(path);
+    let tokenizer = Arc::new(loaded.bundle.tokenizer);
+    Ok(Arc::new(EmbedModel {
+        model: tokio::sync::Mutex::new(loaded.model),
+        tokenizer,
+        pooling,
+        normalize,
+        dim,
+        max_context,
+        model_id,
+    }))
+}
+
+fn cmd_embed(
+    model_path: &Path,
+    text: &str,
+    pooling_override: Option<&str>,
+    dimensions: Option<usize>,
+    weights_pool_gb: f64,
+) -> Result<()> {
+    let t0 = Instant::now();
+    let loaded = load_auto(model_path, weights_pool_gb, DType::F16)?;
+    eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
+
+    let pooling = match pooling_override {
+        Some(s) => parse_pooling(s)?,
+        None => match resolve_pooling(model_path, &loaded.model.weights.descriptor) {
+            PoolingType::None => PoolingType::Mean,
+            other => other,
+        },
+    };
+    let normalize = resolve_normalize(model_path);
+    let tokenizer = loaded.bundle.tokenizer;
+    let ids = tokenizer
+        .encode(text, true)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut model = loaded.model;
+    let mut v = model
+        .embed(&ids, pooling, normalize)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(d) = dimensions {
+        if d < v.len() {
+            v.truncate(d);
+            if normalize {
+                forge_engine::model::l2_normalize(&mut v);
+            }
+        }
+    }
+    let l2 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    eprintln!(
+        "tokens={} pooling={pooling:?} normalize={normalize} dim={} l2={l2:.6}",
+        ids.len(),
+        v.len()
+    );
+    let head: Vec<String> = v.iter().take(8).map(|x| format!("{x:.5}")).collect();
+    println!("[{}, ...]", head.join(", "));
+    Ok(())
+}
+
 fn cmd_transcribe(model_dir: &Path, wav_path: &Path, language: Option<&str>) -> Result<()> {
     let t0 = Instant::now();
     let whisper = load_whisper(model_dir)?;
@@ -311,6 +436,7 @@ fn cmd_serve(
     weights_pool_gb: f64,
     tool_call_parser: Option<String>,
     whisper_model: Option<&Path>,
+    embed_model: Option<&Path>,
     kv_dtype: DType,
 ) -> Result<()> {
     let max_active = usize::from(max_active);
@@ -344,6 +470,11 @@ fn cmd_serve(
     )
     .map_err(|e| anyhow::anyhow!(e))?;
     tracing::info!("tool-call parser: {tool_parser:?}");
+    let served_id = model_id.unwrap_or_else(|| default_model_id(model_path));
+    // Detect whether the served model is itself an embedding model before its
+    // weights move into the engine worker.
+    let served_is_embed =
+        resolve_pooling(model_path, &loaded.model.weights.descriptor) != PoolingType::None;
     let engine = spawn_engine(loaded.model, tokenizer.clone(), max_active, prefill_chunk);
 
     let whisper = match whisper_model {
@@ -360,9 +491,38 @@ fn cmd_serve(
         None => None,
     };
 
+    // Embedding model: an explicit --embed-model, else the served model when
+    // it is itself an embedding model (loaded a second time on its own device).
+    let embed = match embed_model {
+        Some(path) => {
+            let t = Instant::now();
+            let e = load_embed(path, default_model_id(path))?;
+            tracing::info!(
+                "embedding model {} loaded in {:.1}s (dim={}, pooling={:?})",
+                path.display(),
+                t.elapsed().as_secs_f32(),
+                e.dim,
+                e.pooling
+            );
+            Some(e)
+        }
+        None if served_is_embed => {
+            let t = Instant::now();
+            let e = load_embed(model_path, served_id.clone())?;
+            tracing::info!(
+                "served model is an embedding model; /v1/embeddings enabled in {:.1}s (dim={}, pooling={:?})",
+                t.elapsed().as_secs_f32(),
+                e.dim,
+                e.pooling
+            );
+            Some(e)
+        }
+        None => None,
+    };
+
     let cfg = ServerConfig {
         bind,
-        model_id: model_id.unwrap_or_else(|| default_model_id(model_path)),
+        model_id: served_id,
         api_key,
         tool_call_parser,
     };
@@ -377,6 +537,7 @@ fn cmd_serve(
         max_active,
         tool_parser,
         whisper,
+        embed,
     );
 
     tokio::runtime::Builder::new_multi_thread()

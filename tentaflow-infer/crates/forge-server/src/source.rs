@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use forge_engine::model::{Model, ModelConfig};
-use forge_formats::{Gguf, HfConfig, ModelDescriptor};
+use forge_formats::{Gguf, HfConfig, ModelDescriptor, PoolingType};
 use forge_hal::Device;
 use forge_tokenize::{resolve_chat_template, Tokenizer};
 
@@ -229,6 +229,56 @@ pub fn kv_pool_bytes(
     let slabs = p.block_count * 2;
     let granularity = forge_hal::cuda::PoolSizes::DEFAULT_KV_PAGE;
     slabs * (slab.div_ceil(granularity) * granularity) + 64 * (1 << 20)
+}
+
+/// Resolve the sequence pooling for an embedding model path. GGUF carries
+/// `<arch>.pooling_type` in the descriptor; a sentence-transformers HF
+/// snapshot keeps it in `1_Pooling/config.json`. Falls back to the
+/// descriptor's value (which is `None` for HF dirs) when the sidecar is
+/// absent; the engine then defaults `None` to mean pooling.
+pub fn resolve_pooling(path: &Path, desc: &ModelDescriptor) -> PoolingType {
+    if path.is_dir() {
+        read_pooling_dir(path).unwrap_or(desc.params.pooling_type)
+    } else {
+        desc.params.pooling_type
+    }
+}
+
+fn read_pooling_dir(dir: &Path) -> Option<PoolingType> {
+    let cfg: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("1_Pooling").join("config.json")).ok()?)
+            .ok()?;
+    let flag = |k: &str| cfg.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+    if flag("pooling_mode_lasttoken") {
+        Some(PoolingType::Last)
+    } else if flag("pooling_mode_cls_token") {
+        Some(PoolingType::Cls)
+    } else if flag("pooling_mode_mean_tokens") {
+        Some(PoolingType::Mean)
+    } else {
+        None
+    }
+}
+
+/// Whether the model's pooled vector should be L2-normalized. HF
+/// sentence-transformers snapshots declare this with a `Normalize` module in
+/// `modules.json`; GGUF embedding models (and dirs without the sidecar)
+/// default to normalized, the convention for retrieval embeddings.
+pub fn resolve_normalize(path: &Path) -> bool {
+    if !path.is_dir() {
+        return true;
+    }
+    match std::fs::read(path.join("modules.json")) {
+        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(serde_json::Value::Array(modules)) => modules.iter().any(|m| {
+                m.get("type")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|t| t.contains("Normalize"))
+            }),
+            _ => true,
+        },
+        Err(_) => true,
+    }
 }
 
 /// Everything the server needs from a model path, ready to hand to
