@@ -24,8 +24,10 @@ from src.attn_full import attn_full_f16_hd64, attn_full_f16_hd128
 from src.gemv import gemv_f16_bias
 from src.kv_append import kv_append_f16
 from src.gemv2 import gemv_q8_0_f16_v2, gemv_q8_0_out_f32_v2, gemv_nvfp4_f16_v2, gemv_f16_out_f32_v2
-from src.gemm import transpose_f16, gemm_q8_0_xt_f16, gemm_nvfp4_xt_f16, gemm_f16_xt_f16
+from src.gemm import gemm_q8_0_f16, gemm_nvfp4_f16, gemm_f16
+from src.gemm import gemm_q8_0_f16_bm64, gemm_nvfp4_f16_bm64, gemm_f16_bm64
 from src.prefill import kv_append_batch_f16, attn_prefill_f16_hd64, attn_prefill_f16_hd128
+from src.qkv_post import qkv_post_f16
 
 
 def _entry_from_ptx(ptx_path: Path) raises -> String:
@@ -143,17 +145,23 @@ def main() raises:
     _ = ctx.compile_function[gemv_f16_out_f32_v2, dump_asm=Path("gemv_f16_out_f32_v2.ptx")]()
     entries.append(_finalize(out_dir, "gemv_f16_out_f32_v2"))
 
-    _ = ctx.compile_function[transpose_f16, dump_asm=Path("transpose_f16.ptx")]()
-    entries.append(_finalize(out_dir, "transpose_f16"))
+    _ = ctx.compile_function[gemm_q8_0_f16, dump_asm=Path("gemm_q8_0_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_f16"))
 
-    _ = ctx.compile_function[gemm_q8_0_xt_f16, dump_asm=Path("gemm_q8_0_xt_f16.ptx")]()
-    entries.append(_finalize(out_dir, "gemm_q8_0_xt_f16"))
+    _ = ctx.compile_function[gemm_nvfp4_f16, dump_asm=Path("gemm_nvfp4_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_f16"))
 
-    _ = ctx.compile_function[gemm_nvfp4_xt_f16, dump_asm=Path("gemm_nvfp4_xt_f16.ptx")]()
-    entries.append(_finalize(out_dir, "gemm_nvfp4_xt_f16"))
+    _ = ctx.compile_function[gemm_f16, dump_asm=Path("gemm_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_f16"))
 
-    _ = ctx.compile_function[gemm_f16_xt_f16, dump_asm=Path("gemm_f16_xt_f16.ptx")]()
-    entries.append(_finalize(out_dir, "gemm_f16_xt_f16"))
+    _ = ctx.compile_function[gemm_q8_0_f16_bm64, dump_asm=Path("gemm_q8_0_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_f16_bm64"))
+
+    _ = ctx.compile_function[gemm_nvfp4_f16_bm64, dump_asm=Path("gemm_nvfp4_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_nvfp4_f16_bm64"))
+
+    _ = ctx.compile_function[gemm_f16_bm64, dump_asm=Path("gemm_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_f16_bm64"))
 
     _ = ctx.compile_function[kv_append_batch_f16, dump_asm=Path("kv_append_batch_f16.ptx")]()
     entries.append(_finalize(out_dir, "kv_append_batch_f16"))
@@ -163,6 +171,9 @@ def main() raises:
 
     _ = ctx.compile_function[attn_prefill_f16_hd128, dump_asm=Path("attn_prefill_f16_hd128.ptx")]()
     entries.append(_finalize(out_dir, "attn_prefill_f16_hd128"))
+
+    _ = ctx.compile_function[qkv_post_f16, dump_asm=Path("qkv_post_f16.ptx")]()
+    entries.append(_finalize(out_dir, "qkv_post_f16"))
 
     var manifest = String('{\n  "arch": "') + arch + String('",\n  "kernels": {\n')
     for i in range(len(entries)):

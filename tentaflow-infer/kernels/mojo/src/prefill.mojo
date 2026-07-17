@@ -41,6 +41,11 @@ def kv_append_batch_f16(
         i += Int(block_dim.x)
 
 
+comptime QT = 16  # query tokens per block
+comptime PT = WARP_SIZE  # cached positions per smem tile (one lane per position)
+comptime QPW = QT // MAX_WARPS  # queries owned by one warp
+
+
 def attn_prefill_f16[head_dim: Int](
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
     q: UnsafePointer[Float16, MutAnyOrigin],
@@ -52,87 +57,150 @@ def attn_prefill_f16[head_dim: Int](
     n_kv_heads: Int,
     page_size: Int,
     scale: Float32,
+    n_tokens: Int,
 ):
     """Causal attention for a prefill chunk over the paged cache.
 
     q/out: [T, n_q_heads, head_dim]; query token tok attends positions
-    0..base_pos+tok (its K/V must already be in the cache). Grid: (T, heads).
-    """
+    0..base_pos+tok (its K/V must already be in the cache).
+    Grid: (ceil(T/QT), heads), block 256. K/V stream through shared-memory
+    tiles of PT positions, so each cache byte is fetched once per QT queries
+    instead of once per query. Each warp owns QPW queries; per tile, lane j
+    scores position j (K rows XOR-swizzled per 16-byte chunk so lane-strided
+    row reads are bank-conflict-free), the softmax exp runs 32-wide, the
+    online-softmax rescale happens once per TILE (not per position), and the
+    P·V accumulation broadcasts p_j via warp shuffle with lanes splitting the
+    head dimension."""
     comptime epl = head_dim // WARP_SIZE
+    comptime row_chunks = head_dim // 8
+    comptime tile_chunks = PT * row_chunks
+    comptime block_threads = MAX_WARPS * WARP_SIZE
+    comptime chunks_per_thread = tile_chunks // block_threads
+    comptime q_chunks = QT * row_chunks
 
-    tok = Int(block_idx.x)
+    tok0 = Int(block_idx.x) * QT
     qh = Int(block_idx.y)
     kvh = qh // (n_q_heads // n_kv_heads)
-    lane = Int(thread_idx.x) % WARP_SIZE
-    wid = Int(thread_idx.x) // WARP_SIZE
-    n_warps = Int(block_dim.x) // WARP_SIZE
-    ctx_len = base_pos + tok + 1
+    tid = Int(thread_idx.x)
+    lane = tid % WARP_SIZE
+    wid = tid // WARP_SIZE
 
-    q_base = (tok * n_q_heads + qh) * head_dim
-    var q_frag = SIMD[DType.float32, epl](0.0)
-
-    comptime for e in range(epl):
-        q_frag[e] = Float32(q[q_base + e * WARP_SIZE + lane])
-
-    var m: Float32 = NEG_INF
-    var l: Float32 = 0.0
-    var acc = SIMD[DType.float32, epl](0.0)
-
-    var pos = wid
-    while pos < ctx_len:
-        page = Int(page_table[pos // page_size])
-        kv_base = ((page * n_kv_heads + kvh) * page_size + (pos % page_size)) * head_dim
-
-        var dot: Float32 = 0.0
-
-        comptime for e in range(epl):
-            dot += q_frag[e] * Float32(k_cache[kv_base + e * WARP_SIZE + lane])
-        score = warp.sum(dot) * scale
-
-        var m_new = m
-        if score > m_new:
-            m_new = score
-        factor = exp(m - m_new)
-        p = exp(score - m_new)
-        l = l * factor + p
-
-        comptime for e in range(epl):
-            acc[e] = acc[e] * factor + p * Float32(v_cache[kv_base + e * WARP_SIZE + lane])
-        m = m_new
-
-        pos += n_warps
-
-    shared_m = stack_allocation[MAX_WARPS, Float32, address_space = AddressSpace.SHARED]()
-    shared_l = stack_allocation[MAX_WARPS, Float32, address_space = AddressSpace.SHARED]()
-    shared_acc = stack_allocation[
-        MAX_WARPS * head_dim, Float32, address_space = AddressSpace.SHARED
+    qs = stack_allocation[
+        QT * head_dim, Float16, address_space = AddressSpace.SHARED
+    ]()
+    ks = stack_allocation[
+        PT * head_dim, Float16, address_space = AddressSpace.SHARED
+    ]()
+    vs = stack_allocation[
+        PT * head_dim, Float16, address_space = AddressSpace.SHARED
     ]()
 
-    if lane == 0:
-        shared_m[wid] = m
-        shared_l[wid] = l
+    # Stage the block's Q tile once; rows are read chunk-broadcast (all lanes
+    # of a warp hit the same address), so no swizzle is needed. Out-of-range
+    # token rows duplicate the last row — their queries are masked off below.
+    comptime for it in range((q_chunks + block_threads - 1) // block_threads):
+        c = tid + it * block_threads
+        if c < q_chunks:
+            row = c // row_chunks
+            off = (c % row_chunks) * 8
+            var tq = tok0 + row
+            if tq > n_tokens - 1:
+                tq = n_tokens - 1
+            (qs + row * head_dim + off).store[width=8, alignment=16](
+                (q + (tq * n_q_heads + qh) * head_dim + off).load[
+                    width=8, alignment=16
+                ]()
+            )
 
-    comptime for e in range(epl):
-        shared_acc[wid * head_dim + e * WARP_SIZE + lane] = acc[e]
-    barrier()
+    var m = InlineArray[Float32, QPW](fill=NEG_INF)
+    var l = InlineArray[Float32, QPW](fill=0.0)
+    var acc = InlineArray[SIMD[DType.float32, epl], QPW](
+        fill=SIMD[DType.float32, epl](0.0)
+    )
 
-    if wid == 0:
-        var m_star: Float32 = NEG_INF
-        for w in range(n_warps):
-            if shared_m[w] > m_star:
-                m_star = shared_m[w]
-        var l_star: Float32 = 0.0
-        var out_frag = SIMD[DType.float32, epl](0.0)
-        for w in range(n_warps):
-            f = exp(shared_m[w] - m_star)
-            l_star += shared_l[w] * f
+    # Highest position any query in this block attends.
+    var tok_hi = tok0 + QT
+    if tok_hi > n_tokens:
+        tok_hi = n_tokens
+    max_abs = base_pos + tok_hi - 1
 
-            comptime for e in range(epl):
-                out_frag[e] += shared_acc[w * head_dim + e * WARP_SIZE + lane] * f
-        inv_l = 1.0 / l_star
+    var pos0 = 0
+    while pos0 <= max_abs:
+        var n_valid = max_abs + 1 - pos0
+        if n_valid > PT:
+            n_valid = PT
+        barrier()
 
-        comptime for e in range(epl):
-            out_ptr[q_base + e * WARP_SIZE + lane] = Float16(out_frag[e] * inv_l)
+        comptime for it in range(chunks_per_thread):
+            c = tid + it * block_threads
+            row = c // row_chunks
+            off = c % row_chunks
+            if row < n_valid:
+                pos = pos0 + row
+                page = Int(page_table[pos // page_size])
+                kv_base = (
+                    (page * n_kv_heads + kvh) * page_size + pos % page_size
+                ) * head_dim + off * 8
+                (ks + row * head_dim + ((off ^ (row % row_chunks)) * 8)).store[
+                    width=8, alignment=16
+                ]((k_cache + kv_base).load[width=8, alignment=16]())
+                (vs + row * head_dim + off * 8).store[width=8, alignment=16](
+                    (v_cache + kv_base).load[width=8, alignment=16]()
+                )
+        barrier()
+
+        comptime for i in range(QPW):
+            tq = tok0 + wid * QPW + i
+            var h = base_pos + tq - pos0 + 1
+            if tq >= n_tokens:
+                h = 0
+            if h > n_valid:
+                h = n_valid
+            if h > 0:
+                # Lane `lane` scores position pos0+lane against query i.
+                var dotv = SIMD[DType.float32, 8](0.0)
+
+                comptime for c in range(row_chunks):
+                    kv8 = (
+                        ks
+                        + lane * head_dim
+                        + ((c ^ (lane % row_chunks)) * 8)
+                    ).load[width=8, alignment=16]().cast[DType.float32]()
+                    qv8 = (
+                        qs + (wid * QPW + i) * head_dim + c * 8
+                    ).load[width=8, alignment=16]().cast[DType.float32]()
+                    dotv += qv8 * kv8
+                var score = dotv.reduce_add() * scale
+                if lane >= h:
+                    score = NEG_INF
+                mtile = warp.max(score)
+                if mtile > m[i]:
+                    rescale = exp(m[i] - mtile)
+                    l[i] *= rescale
+                    acc[i] = acc[i] * rescale
+                    m[i] = mtile
+                p = exp(score - m[i])
+                l[i] += warp.sum(p)
+
+                var jj = 0
+                while jj < h:
+                    pj = warp.shuffle_idx(p, UInt32(jj))
+                    vfj = (vs + jj * head_dim + lane * epl).load[
+                        width=epl, alignment = epl * 2
+                    ]().cast[DType.float32]()
+                    acc[i] += vfj * pj
+                    jj += 1
+
+        pos0 += PT
+
+    comptime for i in range(QPW):
+        tq = tok0 + wid * QPW + i
+        if tq < n_tokens:
+            q_base = (tq * n_q_heads + qh) * head_dim
+            inv_l = 1.0 / l[i]
+            (out_ptr + q_base + lane * epl).store[width=epl](
+                (acc[i] * inv_l).cast[DType.float16]()
+            )
 
 
 comptime attn_prefill_f16_hd64 = attn_prefill_f16[64]

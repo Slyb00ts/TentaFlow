@@ -41,24 +41,6 @@ impl Kernels {
         eps: f32,
         stream: &Stream,
     ) -> Result<()> {
-        self.rmsnorm_f16_at(out, 0, x, 0, weight, rows, cols, eps, stream)
-    }
-
-    /// `rmsnorm_f16` reading x and writing out at byte offsets — normalizes a
-    /// row section of a fused QKV activation buffer in place.
-    #[allow(clippy::too_many_arguments)]
-    pub fn rmsnorm_f16_at(
-        &self,
-        out: &DevBuffer,
-        out_byte_off: usize,
-        x: &DevBuffer,
-        x_byte_off: usize,
-        weight: &DevBuffer,
-        rows: usize,
-        cols: usize,
-        eps: f32,
-        stream: &Stream,
-    ) -> Result<()> {
         let k = self.artifacts.get("rmsnorm_f16")?;
         let cfg = LaunchConfig {
             grid: (rows as u32, 1, 1),
@@ -66,8 +48,8 @@ impl Kernels {
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
-            .buf_at(out, out_byte_off)?
-            .buf_at(x, x_byte_off)?
+            .buf(out)
+            .buf(x)
             .buf(weight)
             .scalar(cols as i64)
             .scalar(eps);
@@ -156,24 +138,6 @@ impl Kernels {
         theta_base: f32,
         stream: &Stream,
     ) -> Result<()> {
-        self.rope_neox_f16_at(x_io, 0, positions, n_tokens, n_heads, head_dim, theta_base, stream)
-    }
-
-    /// `rope_neox_f16` rotating a section of a fused QKV buffer at a byte
-    /// offset (the K rows behind the Q rows). Only valid for n_tokens == 1
-    /// sections: multi-token fused layouts interleave q|k|v per token.
-    #[allow(clippy::too_many_arguments)]
-    pub fn rope_neox_f16_at(
-        &self,
-        x_io: &DevBuffer,
-        x_byte_off: usize,
-        positions: &DevBuffer,
-        n_tokens: usize,
-        n_heads: usize,
-        head_dim: usize,
-        theta_base: f32,
-        stream: &Stream,
-    ) -> Result<()> {
         let k = self.artifacts.get("rope_neox_f16")?;
         let cfg = LaunchConfig {
             grid: (n_tokens as u32, n_heads as u32, 1),
@@ -181,7 +145,7 @@ impl Kernels {
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
-            .buf_at(x_io, x_byte_off)?
+            .buf(x_io)
             .buf(positions)
             .scalar(n_heads as i64)
             .scalar(head_dim as i64)
@@ -618,30 +582,6 @@ impl Kernels {
         head_dim: usize,
         stream: &Stream,
     ) -> Result<()> {
-        self.kv_append_f16_at(
-            k_cache, v_cache, k_in, 0, v_in, 0, page_table, seq_len, n_kv_heads, page_size,
-            head_dim, stream,
-        )
-    }
-
-    /// `kv_append_f16` reading K and V rows at byte offsets — appends the K/V
-    /// sections of a fused q|k|v activation buffer.
-    #[allow(clippy::too_many_arguments)]
-    pub fn kv_append_f16_at(
-        &self,
-        k_cache: &DevBuffer,
-        v_cache: &DevBuffer,
-        k_in: &DevBuffer,
-        k_byte_off: usize,
-        v_in: &DevBuffer,
-        v_byte_off: usize,
-        page_table: &DevBuffer,
-        seq_len: &DevBuffer,
-        n_kv_heads: usize,
-        page_size: usize,
-        head_dim: usize,
-        stream: &Stream,
-    ) -> Result<()> {
         let k = self.artifacts.get("kv_append_f16")?;
         let cfg = LaunchConfig {
             grid: (n_kv_heads as u32, 1, 1),
@@ -651,8 +591,8 @@ impl Kernels {
         let args = LaunchArgs::new()
             .buf(k_cache)
             .buf(v_cache)
-            .buf_at(k_in, k_byte_off)?
-            .buf_at(v_in, v_byte_off)?
+            .buf(k_in)
+            .buf(v_in)
             .buf(page_table)
             .buf(seq_len)
             .scalar(n_kv_heads as i64)
@@ -661,65 +601,42 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
-    /// xT[c, t] = x[t, c] — prefill activation transpose feeding the batched
-    /// GEMMs. `n_tokens` is the padded token stride the GEMMs consume.
-    pub fn transpose_f16(
-        &self,
-        out: &DevBuffer,
-        x: &DevBuffer,
-        n_tokens: usize,
-        n_cols: usize,
-        stream: &Stream,
-    ) -> Result<()> {
-        let k = self.artifacts.get("transpose_f16")?;
-        let cfg = LaunchConfig {
-            grid: ((n_cols as u32).div_ceil(32), (n_tokens as u32).div_ceil(8), 1),
-            block: (BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let args = LaunchArgs::new()
-            .buf(out)
-            .buf(x)
-            .scalar(n_tokens as i64)
-            .scalar(n_cols as i64);
-        self.device.launch(k, &cfg, &args, stream)
-    }
-
-    /// Prefill GEMMs stage activations with 16-byte cp.async chunks, so the
-    /// transposed activation stride must be padded to a multiple of 8 tokens.
-    fn check_gemm_tokens(n_tokens: usize) -> Result<()> {
-        if !n_tokens.is_multiple_of(8) {
-            return Err(ForgeError::Kernel(format!(
-                "prefill GEMM requires n_tokens % 8 == 0, got {n_tokens}"
-            )));
+    /// Pick the prefill GEMM tile for a (rows, n_tokens) shape. The BM=64
+    /// instantiation doubles the token-block count, which wins everywhere
+    /// except very tall matrices at short chunks where the BM=128 grid is
+    /// already saturated (measured on RTX 4090, kernels/mojo benches).
+    fn gemm_tile(rows: usize, n_tokens: usize) -> (&'static str, u32, u32) {
+        if rows >= 8192 && n_tokens <= 256 {
+            ("", 256, 128)
+        } else {
+            ("_bm64", 128, 64)
         }
-        Ok(())
     }
 
-    /// Y[t, row] = W·x[t] over Q8_0 weights and transposed f16 activations.
+    /// Y[t, row] = W·x[t] over Q8_0 weights and row-major f16 activations.
     #[allow(clippy::too_many_arguments)]
-    pub fn gemm_q8_0_xt_f16(
+    pub fn gemm_q8_0_f16(
         &self,
         y: &DevBuffer,
         w_q8: &DevBuffer,
-        xt: &DevBuffer,
+        x: &DevBuffer,
         rows: usize,
         cols: usize,
         n_tokens: usize,
         stream: &Stream,
     ) -> Result<()> {
-        self.gemm_q8_0_xt_f16_at(y, w_q8, 0, xt, rows, cols, n_tokens, stream)
+        self.gemm_q8_0_f16_at(y, w_q8, 0, x, rows, cols, n_tokens, stream)
     }
 
-    /// `gemm_q8_0_xt_f16` over a row window of a fused weight matrix:
+    /// `gemm_q8_0_f16` over a row window of a fused weight matrix:
     /// `w_byte_off` addresses the first block of the window's first row.
     #[allow(clippy::too_many_arguments)]
-    pub fn gemm_q8_0_xt_f16_at(
+    pub fn gemm_q8_0_f16_at(
         &self,
         y: &DevBuffer,
         w_q8: &DevBuffer,
         w_byte_off: usize,
-        xt: &DevBuffer,
+        x: &DevBuffer,
         rows: usize,
         cols: usize,
         n_tokens: usize,
@@ -730,44 +647,44 @@ impl Kernels {
                 "gemm_q8_0 requires cols % 32 == 0, got {cols}"
             )));
         }
-        Self::check_gemm_tokens(n_tokens)?;
-        let k = self.artifacts.get("gemm_q8_0_xt_f16")?;
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_q8_0_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(128), 1),
-            block: (BLOCK, 1, 1),
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
             .buf(y)
             .buf_at(w_q8, w_byte_off)?
-            .buf(xt)
+            .buf(x)
             .scalar(cols as i64)
             .scalar(rows as i64)
             .scalar(n_tokens as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 
-    /// Y[t, row] = W·x[t] over NVFP4 weights and transposed f16 activations.
+    /// Y[t, row] = W·x[t] over NVFP4 weights and row-major f16 activations.
     #[allow(clippy::too_many_arguments)]
-    pub fn gemm_nvfp4_xt_f16(
+    pub fn gemm_nvfp4_f16(
         &self,
         y: &DevBuffer,
         packed: &DevBuffer,
         scales: &DevBuffer,
-        xt: &DevBuffer,
+        x: &DevBuffer,
         rows: usize,
         cols: usize,
         n_tokens: usize,
         inv_global_scale: f32,
         stream: &Stream,
     ) -> Result<()> {
-        self.gemm_nvfp4_xt_f16_at(
+        self.gemm_nvfp4_f16_at(
             y,
             packed,
             0,
             scales,
             0,
-            xt,
+            x,
             rows,
             cols,
             n_tokens,
@@ -776,18 +693,18 @@ impl Kernels {
         )
     }
 
-    /// `gemm_nvfp4_xt_f16` over a row window of a fused weight matrix; packed
+    /// `gemm_nvfp4_f16` over a row window of a fused weight matrix; packed
     /// nibbles and FP8 block scales are separate streams, so the window needs
     /// a byte offset into each.
     #[allow(clippy::too_many_arguments)]
-    pub fn gemm_nvfp4_xt_f16_at(
+    pub fn gemm_nvfp4_f16_at(
         &self,
         y: &DevBuffer,
         packed: &DevBuffer,
         packed_byte_off: usize,
         scales: &DevBuffer,
         scales_byte_off: usize,
-        xt: &DevBuffer,
+        x: &DevBuffer,
         rows: usize,
         cols: usize,
         n_tokens: usize,
@@ -799,18 +716,18 @@ impl Kernels {
                 "gemm_nvfp4 requires cols % 16 == 0, got {cols}"
             )));
         }
-        Self::check_gemm_tokens(n_tokens)?;
-        let k = self.artifacts.get("gemm_nvfp4_xt_f16")?;
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_nvfp4_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(128), 1),
-            block: (BLOCK, 1, 1),
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
             .buf(y)
             .buf_at(packed, packed_byte_off)?
             .buf_at(scales, scales_byte_off)?
-            .buf(xt)
+            .buf(x)
             .scalar(cols as i64)
             .scalar(rows as i64)
             .scalar(n_tokens as i64)
@@ -818,31 +735,31 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
-    /// Y[t, row] = W·x[t], all f16, transposed activations.
+    /// Y[t, row] = W·x[t], all f16, row-major activations.
     #[allow(clippy::too_many_arguments)]
-    pub fn gemm_f16_xt_f16(
+    pub fn gemm_f16(
         &self,
         y: &DevBuffer,
         w: &DevBuffer,
-        xt: &DevBuffer,
+        x: &DevBuffer,
         rows: usize,
         cols: usize,
         n_tokens: usize,
         stream: &Stream,
     ) -> Result<()> {
-        self.gemm_f16_xt_f16_at(y, w, 0, xt, rows, cols, n_tokens, stream)
+        self.gemm_f16_at(y, w, 0, x, rows, cols, n_tokens, stream)
     }
 
-    /// `gemm_f16_xt_f16` over a row window of a fused weight matrix. The
-    /// kernel's 16-byte weight loads require `w_byte_off % 16 == 0`, which
+    /// `gemm_f16` over a row window of a fused weight matrix. The kernel's
+    /// 16-byte weight loads require `w_byte_off % 16 == 0`, which
     /// row-aligned offsets satisfy for any cols % 8 == 0.
     #[allow(clippy::too_many_arguments)]
-    pub fn gemm_f16_xt_f16_at(
+    pub fn gemm_f16_at(
         &self,
         y: &DevBuffer,
         w: &DevBuffer,
         w_byte_off: usize,
-        xt: &DevBuffer,
+        x: &DevBuffer,
         rows: usize,
         cols: usize,
         n_tokens: usize,
@@ -855,20 +772,87 @@ impl Kernels {
                 "gemm_f16 requires cols % 8 == 0, got {cols}"
             )));
         }
-        Self::check_gemm_tokens(n_tokens)?;
-        let k = self.artifacts.get("gemm_f16_xt_f16")?;
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_f16{suffix}"))?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(128), 1),
-            block: (BLOCK, 1, 1),
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
             .buf(y)
             .buf_at(w, w_byte_off)?
-            .buf(xt)
+            .buf(x)
             .scalar(cols as i64)
             .scalar(rows as i64)
             .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused decode QKV post-processing: optional per-head q/k RMSNorm, neox
+    /// RoPE on q and k, and the paged-cache k/v append in ONE launch. q/k/v
+    /// are [heads, head_dim] rows addressed by byte offsets (sections of a
+    /// fused qkv buffer or separate buffers). Position and page id come from
+    /// device buffers — CUDA-graph-replay safe. Bit-exact vs the separate
+    /// rmsnorm/rope/kv_append chain (verified in test_kernels.mojo).
+    #[allow(clippy::too_many_arguments)]
+    pub fn qkv_post_f16(
+        &self,
+        q_io: &DevBuffer,
+        q_byte_off: usize,
+        k_in: &DevBuffer,
+        k_byte_off: usize,
+        v_in: &DevBuffer,
+        v_byte_off: usize,
+        q_norm: Option<&DevBuffer>,
+        k_norm: Option<&DevBuffer>,
+        k_cache: &DevBuffer,
+        v_cache: &DevBuffer,
+        positions: &DevBuffer,
+        page_table: &DevBuffer,
+        seq_len: &DevBuffer,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        eps: f32,
+        theta_base: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        // One element per thread: block = head_dim (MAX_HEAD_DIM in
+        // qkv_post.mojo bounds the shared staging array).
+        if head_dim > 256 || !head_dim.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "qkv_post requires head_dim % 32 == 0 and head_dim <= 256, got {head_dim}"
+            )));
+        }
+        let k = self.artifacts.get("qkv_post_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((n_heads + n_kv_heads) as u32, 1, 1),
+            block: (head_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Absent norm weights are flagged off; the pointer slot still needs a
+        // valid device address, so q_io stands in (never dereferenced).
+        let args = LaunchArgs::new()
+            .buf_at(q_io, q_byte_off)?
+            .buf_at(k_in, k_byte_off)?
+            .buf_at(v_in, v_byte_off)?
+            .buf(q_norm.unwrap_or(q_io))
+            .buf(k_norm.unwrap_or(q_io))
+            .buf(k_cache)
+            .buf(v_cache)
+            .buf(positions)
+            .buf(page_table)
+            .buf(seq_len)
+            .scalar(n_heads as i64)
+            .scalar(n_kv_heads as i64)
+            .scalar(head_dim as i64)
+            .scalar(page_size as i64)
+            .scalar(if q_norm.is_some() { 1i64 } else { 0i64 })
+            .scalar(if k_norm.is_some() { 1i64 } else { 0i64 })
+            .scalar(eps)
+            .scalar(theta_base);
         self.device.launch(k, &cfg, &args, stream)
     }
 
@@ -937,9 +921,11 @@ impl Kernels {
             }
         };
         let k = self.artifacts.get(name)?;
+        // Kernel tiling contract (prefill.mojo QT): 16 queries per block,
+        // block of 8 warps.
         let cfg = LaunchConfig {
-            grid: (n_tokens as u32, n_q_heads as u32, 1),
-            block: (ATTN_BLOCK, 1, 1),
+            grid: ((n_tokens as u32).div_ceil(16), n_q_heads as u32, 1),
+            block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
@@ -952,7 +938,8 @@ impl Kernels {
             .scalar(n_q_heads as i64)
             .scalar(n_kv_heads as i64)
             .scalar(page_size as i64)
-            .scalar(scale);
+            .scalar(scale)
+            .scalar(n_tokens as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 

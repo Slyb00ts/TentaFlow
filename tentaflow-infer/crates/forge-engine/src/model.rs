@@ -18,7 +18,70 @@ use crate::weights::{DevWeight, GateUpWeights, ModelWeights, QkvWeights};
 
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
 /// prompts. Bounds the persistent prefill scratch allocation.
-pub const MAX_PREFILL_CHUNK: usize = 256;
+pub const MAX_PREFILL_CHUNK: usize = 1024;
+
+/// Coarse per-phase wall-clock attribution for `prefill_chunk`, enabled by
+/// FORGE_PREFILL_TRACE=1. Every probe synchronizes the device, so absolute
+/// numbers are pessimistic (no inter-kernel overlap) — use the ratios.
+struct PrefillTrace {
+    enabled: bool,
+    names: Vec<&'static str>,
+    totals: Vec<std::time::Duration>,
+    last: std::time::Instant,
+}
+
+impl PrefillTrace {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var("FORGE_PREFILL_TRACE").is_ok_and(|v| v == "1"),
+            names: Vec::new(),
+            totals: Vec::new(),
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn start(&mut self, device: &dyn Device) {
+        if self.enabled {
+            let _ = device.synchronize();
+            self.last = std::time::Instant::now();
+        }
+    }
+
+    fn mark(&mut self, device: &dyn Device, name: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        let _ = device.synchronize();
+        let now = std::time::Instant::now();
+        let dt = now - self.last;
+        self.last = now;
+        match self.names.iter().position(|n| *n == name) {
+            Some(i) => self.totals[i] += dt,
+            None => {
+                self.names.push(name);
+                self.totals.push(dt);
+            }
+        }
+    }
+
+    fn report(&self, n_tokens: usize) {
+        if !self.enabled {
+            return;
+        }
+        let total: std::time::Duration = self.totals.iter().sum();
+        eprintln!("prefill_chunk trace (T={n_tokens}, total {total:?}):");
+        let mut order: Vec<usize> = (0..self.names.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(self.totals[i]));
+        for i in order {
+            eprintln!(
+                "  {:<16} {:>10.3?} ({:>5.1}%)",
+                self.names[i],
+                self.totals[i],
+                self.totals[i].as_secs_f64() / total.as_secs_f64() * 100.0
+            );
+        }
+    }
+}
 
 pub struct ModelConfig {
     pub kv_page_size: usize,
@@ -84,15 +147,11 @@ struct DecodeBufs {
 }
 
 /// Persistent prefill scratch sized for MAX_PREFILL_CHUNK tokens. Activation
-/// matrices are [T, cols] row-major except `xt`, which holds the transposed
-/// [cols, T_pad] view the batched GEMMs consume. Rows T..T_pad of `xt` (and of
-/// the GEMM outputs) carry garbage by design: the prefill GEMMs stage tokens
-/// in 16-byte cp.async chunks, so the token stride is padded to a multiple of
-/// 8 and outputs beyond the real token count are never read.
+/// matrices are [T, cols] row-major; the batched GEMMs consume them directly
+/// (token/column tails are clamped inside the kernels).
 struct PrefillBufs {
     h: DevBuffer,
     x: DevBuffer,
-    xt: DevBuffer,
     q: DevBuffer,
     k: DevBuffer,
     v: DevBuffer,
@@ -238,17 +297,16 @@ impl Model {
         }
     }
 
-    /// Batched GEMM over transposed activations; `n_tokens` is the padded
-    /// token stride (multiple of 4).
-    fn gemm_xt(
+    /// Batched GEMM over row-major activations x[t][col].
+    fn gemm(
         &self,
         y: &DevBuffer,
         w: &DevWeight,
-        xt: &DevBuffer,
+        x: &DevBuffer,
         n_tokens: usize,
         stream: &Stream,
     ) -> Result<()> {
-        self.gemm_xt_rows(y, w, xt, n_tokens, 0, w.rows(), stream)
+        self.gemm_rows(y, w, x, n_tokens, 0, w.rows(), stream)
     }
 
     /// Batched GEMM over a row window of `w`: y = W[row_off..row_off+n_rows]·x.
@@ -256,32 +314,32 @@ impl Model {
     /// for NVFP4, scale) streams — this is how prefill reads the q/k/v and
     /// gate/up sections out of a fused matrix without storing them twice.
     #[allow(clippy::too_many_arguments)]
-    fn gemm_xt_rows(
+    fn gemm_rows(
         &self,
         y: &DevBuffer,
         w: &DevWeight,
-        xt: &DevBuffer,
+        x: &DevBuffer,
         n_tokens: usize,
         row_off: usize,
         n_rows: usize,
         stream: &Stream,
     ) -> Result<()> {
         match w {
-            DevWeight::F16 { buf, cols, .. } => self.kernels.gemm_f16_xt_f16_at(
+            DevWeight::F16 { buf, cols, .. } => self.kernels.gemm_f16_at(
                 y,
                 buf,
                 row_off * cols * 2,
-                xt,
+                x,
                 n_rows,
                 *cols,
                 n_tokens,
                 stream,
             ),
-            DevWeight::Q8_0 { buf, cols, .. } => self.kernels.gemm_q8_0_xt_f16_at(
+            DevWeight::Q8_0 { buf, cols, .. } => self.kernels.gemm_q8_0_f16_at(
                 y,
                 buf,
                 row_off * (cols / 32) * 34,
-                xt,
+                x,
                 n_rows,
                 *cols,
                 n_tokens,
@@ -293,13 +351,13 @@ impl Model {
                 inv_global_scale,
                 cols,
                 ..
-            } => self.kernels.gemm_nvfp4_xt_f16_at(
+            } => self.kernels.gemm_nvfp4_f16_at(
                 y,
                 packed,
                 row_off * (cols / 2),
                 scales,
                 row_off * (cols / 16),
-                xt,
+                x,
                 n_rows,
                 *cols,
                 n_tokens,
@@ -326,7 +384,6 @@ impl Model {
         self.prefill_bufs = Some(PrefillBufs {
             h: alloc(t_max * hidden)?,
             x: alloc(t_max * hidden)?,
-            xt: alloc(t_max * hidden.max(q_dim).max(inter))?,
             q: alloc(t_max * q_dim)?,
             k: alloc(t_max * kv_dim)?,
             v: alloc(t_max * kv_dim)?,
@@ -389,8 +446,6 @@ impl Model {
         self.device
             .write(bytemuck::cast_slice(&positions), &pb.positions, 0)?;
 
-        // Padded token stride for the transposed activations (see PrefillBufs).
-        let t_pad = t.next_multiple_of(8);
         let hidden = p.hidden_size;
         let inter = p.intermediate_size;
         let q_dim = p.n_heads * p.head_dim;
@@ -400,30 +455,34 @@ impl Model {
         let kernels = &self.kernels;
         let stream = &self.stream;
 
+        let mut trace = PrefillTrace::new();
+        trace.start(self.device.as_ref());
+
         kernels.gather_rows_f16(&pb.h, &self.weights.token_embd_f16, &pb.ids, t, hidden, stream)?;
         kernels.rmsnorm_f16(&pb.x, &pb.h, &self.weights.layers[0].attn_norm, t, hidden, eps, stream)?;
+        trace.mark(self.device.as_ref(), "embed");
 
         let n_layers = self.weights.layers.len();
         for l in 0..n_layers {
             let layer = &self.weights.layers[l];
 
-            kernels.transpose_f16(&pb.xt, &pb.x, t_pad, hidden, stream)?;
             // Prefill outputs must stay [T, dim] contiguous per projection
             // (attention/rope/append index (t*heads+h)*head_dim), so a fused
             // matrix is consumed as three row-window GEMMs into separate
             // buffers — same weight bytes, no second copy in VRAM.
             match &layer.attn_qkv {
                 QkvWeights::Fused(w) => {
-                    self.gemm_xt_rows(&pb.q, w, &pb.xt, t_pad, 0, q_dim, stream)?;
-                    self.gemm_xt_rows(&pb.k, w, &pb.xt, t_pad, q_dim, kv_dim, stream)?;
-                    self.gemm_xt_rows(&pb.v, w, &pb.xt, t_pad, q_dim + kv_dim, kv_dim, stream)?;
+                    self.gemm_rows(&pb.q, w, &pb.x, t, 0, q_dim, stream)?;
+                    self.gemm_rows(&pb.k, w, &pb.x, t, q_dim, kv_dim, stream)?;
+                    self.gemm_rows(&pb.v, w, &pb.x, t, q_dim + kv_dim, kv_dim, stream)?;
                 }
                 QkvWeights::Split { q, k, v } => {
-                    self.gemm_xt(&pb.q, q, &pb.xt, t_pad, stream)?;
-                    self.gemm_xt(&pb.k, k, &pb.xt, t_pad, stream)?;
-                    self.gemm_xt(&pb.v, v, &pb.xt, t_pad, stream)?;
+                    self.gemm(&pb.q, q, &pb.x, t, stream)?;
+                    self.gemm(&pb.k, k, &pb.x, t, stream)?;
+                    self.gemm(&pb.v, v, &pb.x, t, stream)?;
                 }
             }
+            trace.mark(self.device.as_ref(), "gemm_qkv");
 
             if let Some(qn) = &layer.q_norm {
                 kernels.rmsnorm_f16(&pb.q, &pb.q, qn, t * p.n_heads, p.head_dim, eps, stream)?;
@@ -434,6 +493,7 @@ impl Model {
 
             kernels.rope_neox_f16(&pb.q, &pb.positions, t, p.n_heads, p.head_dim, p.rope_theta, stream)?;
             kernels.rope_neox_f16(&pb.k, &pb.positions, t, p.n_kv_heads, p.head_dim, p.rope_theta, stream)?;
+            trace.mark(self.device.as_ref(), "norm_rope");
 
             // Causal attention reads the chunk's own K/V from the cache, so
             // the batch append must land before the attention launch.
@@ -450,6 +510,7 @@ impl Model {
                 p.head_dim,
                 stream,
             )?;
+            trace.mark(self.device.as_ref(), "kv_append");
             kernels.attn_prefill_f16(
                 &pb.attn_out,
                 &pb.q,
@@ -465,25 +526,28 @@ impl Model {
                 scale,
                 stream,
             )?;
+            trace.mark(self.device.as_ref(), "attn");
 
-            kernels.transpose_f16(&pb.xt, &pb.attn_out, t_pad, q_dim, stream)?;
-            self.gemm_xt(&pb.o_out, &layer.attn_o, &pb.xt, t_pad, stream)?;
+            self.gemm(&pb.o_out, &layer.attn_o, &pb.attn_out, t, stream)?;
+            trace.mark(self.device.as_ref(), "gemm_o");
             kernels.rmsnorm_residual_f16(&pb.x, &pb.h, &pb.o_out, &layer.ffn_norm, t, hidden, eps, stream)?;
+            trace.mark(self.device.as_ref(), "norm_res");
 
-            kernels.transpose_f16(&pb.xt, &pb.x, t_pad, hidden, stream)?;
             match &layer.ffn_gate_up {
                 GateUpWeights::Fused(w) => {
-                    self.gemm_xt_rows(&pb.gate, w, &pb.xt, t_pad, 0, inter, stream)?;
-                    self.gemm_xt_rows(&pb.up, w, &pb.xt, t_pad, inter, inter, stream)?;
+                    self.gemm_rows(&pb.gate, w, &pb.x, t, 0, inter, stream)?;
+                    self.gemm_rows(&pb.up, w, &pb.x, t, inter, inter, stream)?;
                 }
                 GateUpWeights::Split { gate, up } => {
-                    self.gemm_xt(&pb.gate, gate, &pb.xt, t_pad, stream)?;
-                    self.gemm_xt(&pb.up, up, &pb.xt, t_pad, stream)?;
+                    self.gemm(&pb.gate, gate, &pb.x, t, stream)?;
+                    self.gemm(&pb.up, up, &pb.x, t, stream)?;
                 }
             }
+            trace.mark(self.device.as_ref(), "gemm_gateup");
             kernels.silu_mul_f16(&pb.act, &pb.gate, &pb.up, t * inter, stream)?;
-            kernels.transpose_f16(&pb.xt, &pb.act, t_pad, inter, stream)?;
-            self.gemm_xt(&pb.down, &layer.ffn_down, &pb.xt, t_pad, stream)?;
+            trace.mark(self.device.as_ref(), "silu");
+            self.gemm(&pb.down, &layer.ffn_down, &pb.act, t, stream)?;
+            trace.mark(self.device.as_ref(), "gemm_down");
 
             let next_norm = if l + 1 < n_layers {
                 &self.weights.layers[l + 1].attn_norm
@@ -491,6 +555,7 @@ impl Model {
                 &self.weights.output_norm
             };
             kernels.rmsnorm_residual_f16(&pb.x, &pb.h, &pb.down, next_norm, t, hidden, eps, stream)?;
+            trace.mark(self.device.as_ref(), "norm_res2");
         }
 
         // Only the last token's logits matter; route its hidden state through
@@ -507,6 +572,8 @@ impl Model {
             stream,
         )?;
         self.device.synchronize()?;
+        trace.mark(self.device.as_ref(), "logits");
+        trace.report(t);
 
         let lp = self
             .bufs
@@ -633,33 +700,35 @@ impl Model {
             for l in 0..n_layers {
                 let layer = &self.weights.layers[l];
 
-                // Fused layers project q|k|v with ONE GEMV into one buffer;
-                // the section kernels resolve q/k/v via host-computed byte
-                // offsets (per-head norms and RoPE stay in place, safe: each
-                // thread's read/write partitions match).
+                // Fused layers project q|k|v with ONE GEMV into one buffer,
+                // then qkv_post fuses the whole q/k-norm + RoPE + kv-append
+                // stretch into a second single launch (sections resolved via
+                // host-computed byte offsets; rotated K lands directly in the
+                // cache, so the K section of b.qkv is left un-rotated —
+                // nothing reads it after this point).
                 let q_buf = match &layer.attn_qkv {
                     QkvWeights::Fused(w) => {
                         self.gemv(&b.qkv, w, &b.x, stream)?;
-                        if let Some(qn) = &layer.q_norm {
-                            kernels.rmsnorm_f16(&b.qkv, &b.qkv, qn, p.n_heads, p.head_dim, eps, stream)?;
-                        }
-                        if let Some(kn) = &layer.k_norm {
-                            kernels.rmsnorm_f16_at(&b.qkv, k_byte_off, &b.qkv, k_byte_off, kn, p.n_kv_heads, p.head_dim, eps, stream)?;
-                        }
-                        kernels.rope_neox_f16(&b.qkv, &b.pos, 1, p.n_heads, p.head_dim, p.rope_theta, stream)?;
-                        kernels.rope_neox_f16_at(&b.qkv, k_byte_off, &b.pos, 1, p.n_kv_heads, p.head_dim, p.rope_theta, stream)?;
-                        kernels.kv_append_f16_at(
-                            &self.kv.k[l],
-                            &self.kv.v[l],
+                        kernels.qkv_post_f16(
+                            &b.qkv,
+                            0,
                             &b.qkv,
                             k_byte_off,
                             &b.qkv,
                             v_byte_off,
+                            layer.q_norm.as_ref(),
+                            layer.k_norm.as_ref(),
+                            &self.kv.k[l],
+                            &self.kv.v[l],
+                            &b.pos,
                             &self.page_table_dev,
                             &self.seq_len_dev,
+                            p.n_heads,
                             p.n_kv_heads,
-                            self.kv.cfg.page_size,
                             p.head_dim,
+                            self.kv.cfg.page_size,
+                            eps,
+                            p.rope_theta,
                             stream,
                         )?;
                         &b.qkv

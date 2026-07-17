@@ -473,7 +473,7 @@ fn cmd_bench(model_path: &Path, tokens: usize, prompt_tokens: usize) -> Result<(
         .collect();
 
     // Single-sequence bench: full-size prefill chunks, no ITL to protect.
-    let engine = spawn_engine(loaded.model, tokenizer, 1, 256);
+    let engine = spawn_engine(loaded.model, tokenizer, 1, forge_engine::model::MAX_PREFILL_CHUNK);
     let submit_at = Instant::now();
     // No EOS ids: the benchmark must decode exactly `tokens` tokens.
     let (generated, prompt_len, first_at, done_at) = drain_request(

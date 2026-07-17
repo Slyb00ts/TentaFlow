@@ -10,6 +10,8 @@ from src.activation import silu_mul_f16
 from src.rope import rope_neox_f16
 from src.gemv import gemv_q8_0_f16, gemv_f16
 from src.attention import attn_decode_f16_hd64
+from src.kv_append import kv_append_f16
+from src.qkv_post import qkv_post_f16
 
 comptime ROWS = 4
 comptime COLS = 1024
@@ -281,5 +283,128 @@ def main() raises:
     print("attn_decode max_err:", max_err)
     if max_err > 0.01:
         raise Error("attn_decode_f16 numeric check FAILED")
+
+    # --- fused qkv_post vs the separate-kernel reference (bit-exact) ---
+    # Reference = rmsnorm_f16(q), rmsnorm_f16(k), rope(q), rope(k),
+    # kv_append_f16; fused = one qkv_post_f16 launch. Both norm variants.
+    comptime PQH = 4
+    comptime PKVH = 2
+    comptime PHD = 128
+    comptime PPAGE = 16
+    comptime PNPAGES = 3
+    comptime PEPS: Float32 = 1e-6
+    comptime PTHETA: Float32 = 1000000.0
+    comptime PSEQ = 21  # current token at position 20 -> page_table[1]
+
+    var pq_in = ctx.enqueue_create_buffer[DType.float16](PQH * PHD)
+    var pk_in = ctx.enqueue_create_buffer[DType.float16](PKVH * PHD)
+    var pq_ref = ctx.enqueue_create_buffer[DType.float16](PQH * PHD)
+    var pk_ref = ctx.enqueue_create_buffer[DType.float16](PKVH * PHD)
+    var pv_ref = ctx.enqueue_create_buffer[DType.float16](PKVH * PHD)
+    var pq_fus = ctx.enqueue_create_buffer[DType.float16](PQH * PHD)
+    var pk_fus = ctx.enqueue_create_buffer[DType.float16](PKVH * PHD)
+    var pv_fus = ctx.enqueue_create_buffer[DType.float16](PKVH * PHD)
+    var pqw = ctx.enqueue_create_buffer[DType.float16](PHD)
+    var pkw = ctx.enqueue_create_buffer[DType.float16](PHD)
+    var pkc_ref = ctx.enqueue_create_buffer[DType.float16](PNPAGES * PKVH * PPAGE * PHD)
+    var pvc_ref = ctx.enqueue_create_buffer[DType.float16](PNPAGES * PKVH * PPAGE * PHD)
+    var pkc_fus = ctx.enqueue_create_buffer[DType.float16](PNPAGES * PKVH * PPAGE * PHD)
+    var pvc_fus = ctx.enqueue_create_buffer[DType.float16](PNPAGES * PKVH * PPAGE * PHD)
+    var ppt = ctx.enqueue_create_buffer[DType.int32](PNPAGES)
+    var pslen = ctx.enqueue_create_buffer[DType.int32](1)
+    var ppos = ctx.enqueue_create_buffer[DType.int32](1)
+
+    with ppt.map_to_host() as h:
+        h[0] = 2
+        h[1] = 1
+        h[2] = 0
+    with pslen.map_to_host() as h:
+        h[0] = Int32(PSEQ)
+    with ppos.map_to_host() as h:
+        h[0] = Int32(PSEQ - 1)
+    with pqw.map_to_host() as qwh, pkw.map_to_host() as kwh:
+        for i in range(PHD):
+            qwh[i] = Float16(0.9 + Float32(i % 5) * 0.06)
+            kwh[i] = Float16(1.1 - Float32(i % 7) * 0.04)
+
+    for norm_case in range(2):
+        with pq_in.map_to_host() as src, pq_ref.map_to_host() as a, pq_fus.map_to_host() as bq:
+            for i in range(PQH * PHD):
+                src[i] = Float16(_fill(i) * 0.3)
+                a[i] = src[i]
+                bq[i] = src[i]
+        with pk_in.map_to_host() as src, pk_ref.map_to_host() as a, pk_fus.map_to_host() as bk:
+            for i in range(PKVH * PHD):
+                src[i] = Float16(_fill(i + 5) * 0.3)
+                a[i] = src[i]
+                bk[i] = src[i]
+        with pv_ref.map_to_host() as a, pv_fus.map_to_host() as bv:
+            for i in range(PKVH * PHD):
+                a[i] = Float16(_fill(i + 9) * 0.3)
+                bv[i] = a[i]
+        with pkc_ref.map_to_host() as a, pkc_fus.map_to_host() as bc:
+            for i in range(PNPAGES * PKVH * PPAGE * PHD):
+                a[i] = Float16(0.0)
+                bc[i] = Float16(0.0)
+        with pvc_ref.map_to_host() as a, pvc_fus.map_to_host() as bc:
+            for i in range(PNPAGES * PKVH * PPAGE * PHD):
+                a[i] = Float16(0.0)
+                bc[i] = Float16(0.0)
+
+        # Reference chain (the exact launch geometry launchers.rs uses).
+        if norm_case == 1:
+            ctx.enqueue_function[rmsnorm_f16](
+                pq_ref.unsafe_ptr(), pq_in.unsafe_ptr(), pqw.unsafe_ptr(), PHD, PEPS,
+                grid_dim=PQH, block_dim=256,
+            )
+            ctx.enqueue_function[rmsnorm_f16](
+                pk_ref.unsafe_ptr(), pk_in.unsafe_ptr(), pkw.unsafe_ptr(), PHD, PEPS,
+                grid_dim=PKVH, block_dim=256,
+            )
+        ctx.enqueue_function[rope_neox_f16](
+            pq_ref.unsafe_ptr(), ppos.unsafe_ptr(), PQH, PHD, PTHETA,
+            grid_dim=(1, PQH), block_dim=PHD // 2,
+        )
+        ctx.enqueue_function[rope_neox_f16](
+            pk_ref.unsafe_ptr(), ppos.unsafe_ptr(), PKVH, PHD, PTHETA,
+            grid_dim=(1, PKVH), block_dim=PHD // 2,
+        )
+        ctx.enqueue_function[kv_append_f16](
+            pkc_ref.unsafe_ptr(), pvc_ref.unsafe_ptr(),
+            pk_ref.unsafe_ptr(), pv_ref.unsafe_ptr(),
+            ppt.unsafe_ptr(), pslen.unsafe_ptr(), PKVH, PPAGE, PHD,
+            grid_dim=PKVH, block_dim=PHD,
+        )
+
+        # Fused launch.
+        ctx.enqueue_function[qkv_post_f16](
+            pq_fus.unsafe_ptr(), pk_fus.unsafe_ptr(), pv_fus.unsafe_ptr(),
+            pqw.unsafe_ptr(), pkw.unsafe_ptr(),
+            pkc_fus.unsafe_ptr(), pvc_fus.unsafe_ptr(),
+            ppos.unsafe_ptr(), ppt.unsafe_ptr(), pslen.unsafe_ptr(),
+            PQH, PKVH, PHD, PPAGE, norm_case, norm_case, PEPS, PTHETA,
+            grid_dim=PQH + PKVH, block_dim=PHD,
+        )
+        ctx.synchronize()
+
+        max_err = 0.0
+        with pq_ref.map_to_host() as a, pq_fus.map_to_host() as bq:
+            for i in range(PQH * PHD):
+                err = abs(Float32(a[i]) - Float32(bq[i]))
+                if err > max_err:
+                    max_err = err
+        with pkc_ref.map_to_host() as a, pkc_fus.map_to_host() as bc:
+            for i in range(PNPAGES * PKVH * PPAGE * PHD):
+                err = abs(Float32(a[i]) - Float32(bc[i]))
+                if err > max_err:
+                    max_err = err
+        with pvc_ref.map_to_host() as a, pvc_fus.map_to_host() as bc:
+            for i in range(PNPAGES * PKVH * PPAGE * PHD):
+                err = abs(Float32(a[i]) - Float32(bc[i]))
+                if err > max_err:
+                    max_err = err
+        print("qkv_post norm =", norm_case, "max_err vs separate kernels:", max_err)
+        if max_err > 0.0:
+            raise Error("qkv_post_f16 is not bit-exact vs the separate kernels")
 
     print("ALL KERNEL CHECKS PASSED")
