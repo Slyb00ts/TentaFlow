@@ -20,6 +20,17 @@
     "attn_full_f16_hd64": {"file": "attn_full_f16_hd64.ptx", "entry": "src_attn_full_attn_full_f166A6A6A6AcB6A6A_df6d899ea82db4b6"},
     "attn_full_f16_hd128": {"file": "attn_full_f16_hd128.ptx", "entry": "src_attn_full_attn_full_f166A6A6A6AcB6A6A_373175aaa4d9fea7"},
     "gemv_f16_bias": {"file": "gemv_f16_bias.ptx", "entry": "src_gemv_gemv_f16_bias_Point6A6A6A6AoA6A6A_7ee231cec5f75ada"},
-    "kv_append_f16": {"file": "kv_append_f16.ptx", "entry": "src_kv_append_kv_append_f166A6A6A6AoA6A6A_4623a7bc4317c45a"}
+    "kv_append_f16": {"file": "kv_append_f16.ptx", "entry": "src_kv_append_kv_append_f166A6A6A6AoA6A6A_4623a7bc4317c45a"},
+    "gemv_q8_0_f16_v2": {"file": "gemv_q8_0_f16_v2.ptx", "entry": "src_gemv2_gemv_q8_0_f16_v2_P6A6A6A6AoA6A6A_1cfa768f79f1b948"},
+    "gemv_q8_0_out_f32_v2": {"file": "gemv_q8_0_out_f32_v2.ptx", "entry": "src_gemv2_gemv_q8_0_out_f32_v26A6A6A6A_5b14307badf886b1"},
+    "gemv_nvfp4_f16_v2": {"file": "gemv_nvfp4_f16_v2.ptx", "entry": "src_gemv2_gemv_nvfp4_f16_v26A6A6A6AoA6A6A_6c5a3ba7be5cf28d"},
+    "gemv_f16_out_f32_v2": {"file": "gemv_f16_out_f32_v2.ptx", "entry": "src_gemv2_gemv_f16_out_f32_v26A6A6A6AoA_d4ace030b0e25d05"},
+    "transpose_f16": {"file": "transpose_f16.ptx", "entry": "src_gemm_transpose_f16_Point6A6A6A6AoA6A6A_a3809d842850fe51"},
+    "gemm_q8_0_xt_f16": {"file": "gemm_q8_0_xt_f16.ptx", "entry": "src_gemm_gemm_q8_0_xt_f16_Po6A6A6A6AoA6A6A_7a1a2a17b7b658e2"},
+    "gemm_nvfp4_xt_f16": {"file": "gemm_nvfp4_xt_f16.ptx", "entry": "src_gemm_gemm_nvfp4_xt_f16_P6A6A6A6AoA6A6A_dc77065fdcfcde3c"},
+    "gemm_f16_xt_f16": {"file": "gemm_f16_xt_f16.ptx", "entry": "src_gemm_gemm_f16_xt_f16_Poi6A6A6A6AoA6A6A_3d2c1169ef87db08"},
+    "kv_append_batch_f16": {"file": "kv_append_batch_f16.ptx", "entry": "src_prefill_kv_append_batch_f16A6A6A6A_e611c3651da54ac9"},
+    "attn_prefill_f16_hd64": {"file": "attn_prefill_f16_hd64.ptx", "entry": "src_prefill_attn_prefill_f166A6A6A6AcB6A_aef61e56bab90150"},
+    "attn_prefill_f16_hd128": {"file": "attn_prefill_f16_hd128.ptx", "entry": "src_prefill_attn_prefill_f166A6A6A6AcB6A_40a7a45b39f3fed2"}
   }
 }

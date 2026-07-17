@@ -146,9 +146,9 @@ impl Kernels {
                 "gemv_q8_0 requires cols % 32 == 0, got {cols}"
             )));
         }
-        let k = self.artifacts.get("gemv_q8_0_f16")?;
+        let k = self.artifacts.get("gemv_q8_0_f16_v2")?;
         let cfg = LaunchConfig {
-            grid: (rows as u32, 1, 1),
+            grid: ((rows as u32).div_ceil(8), 1, 1),
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -156,7 +156,8 @@ impl Kernels {
             .buf(y)
             .buf(w_q8)
             .buf(x)
-            .scalar(cols as i64);
+            .scalar(cols as i64)
+            .scalar(rows as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 
@@ -203,9 +204,9 @@ impl Kernels {
                 "gemv_nvfp4 requires cols % 16 == 0, got {cols}"
             )));
         }
-        let k = self.artifacts.get("gemv_nvfp4_f16")?;
+        let k = self.artifacts.get("gemv_nvfp4_f16_v2")?;
         let cfg = LaunchConfig {
-            grid: (rows as u32, 1, 1),
+            grid: ((rows as u32).div_ceil(8), 1, 1),
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -215,6 +216,7 @@ impl Kernels {
             .buf(scales)
             .buf(x)
             .scalar(cols as i64)
+            .scalar(rows as i64)
             .scalar(inv_global_scale);
         self.device.launch(k, &cfg, &args, stream)
     }
@@ -253,9 +255,9 @@ impl Kernels {
         cols: usize,
         stream: &Stream,
     ) -> Result<()> {
-        let k = self.artifacts.get("gemv_f16_out_f32")?;
+        let k = self.artifacts.get("gemv_f16_out_f32_v2")?;
         let cfg = LaunchConfig {
-            grid: (rows as u32, 1, 1),
+            grid: ((rows as u32).div_ceil(8), 1, 1),
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -263,7 +265,8 @@ impl Kernels {
             .buf(y_f32)
             .buf(w)
             .buf(x)
-            .scalar(cols as i64);
+            .scalar(cols as i64)
+            .scalar(rows as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 
@@ -282,9 +285,9 @@ impl Kernels {
                 "gemv_q8_0_out_f32 requires cols % 32 == 0, got {cols}"
             )));
         }
-        let k = self.artifacts.get("gemv_q8_0_out_f32")?;
+        let k = self.artifacts.get("gemv_q8_0_out_f32_v2")?;
         let cfg = LaunchConfig {
-            grid: (rows as u32, 1, 1),
+            grid: ((rows as u32).div_ceil(8), 1, 1),
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -292,7 +295,8 @@ impl Kernels {
             .buf(y_f32)
             .buf(w_q8)
             .buf(x)
-            .scalar(cols as i64);
+            .scalar(cols as i64)
+            .scalar(rows as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 

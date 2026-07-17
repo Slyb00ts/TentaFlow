@@ -63,6 +63,12 @@ struct DecodeBufs {
     logits: DevBuffer,
     ids: DevBuffer,
     pos: DevBuffer,
+    /// Pinned-host staging: [token_id, pos, seq_len] i32 triple.
+    pinned_in: DevBuffer,
+    /// Pinned-host mirror of the page table (async H2D on page boundary).
+    pinned_pt: DevBuffer,
+    /// Pinned-host landing buffer for logits (avoids pageable D2H).
+    pinned_logits: DevBuffer,
 }
 
 impl Model {
@@ -127,6 +133,9 @@ impl Model {
             logits: device.alloc(p.vocab_size * 4, MemKind::Device, Pool::Activations)?,
             ids: device.alloc(4, MemKind::Device, Pool::Activations)?,
             pos: device.alloc(4, MemKind::Device, Pool::Activations)?,
+            pinned_in: device.alloc(12, MemKind::PinnedHost, Pool::Activations)?,
+            pinned_pt: device.alloc(max_pages_per_seq * 4, MemKind::PinnedHost, Pool::Activations)?,
+            pinned_logits: device.alloc(p.vocab_size * 4, MemKind::PinnedHost, Pool::Activations)?,
         };
         Ok(Model {
             device,
@@ -204,27 +213,53 @@ impl Model {
             )));
         }
 
+        let page_boundary = seq.len.is_multiple_of(self.kv.cfg.page_size);
         self.kv.grow(seq)?;
 
-        // Refresh the device-side paging state for the attention kernel.
-        {
+        // Stage [token, pos, seq_len] in pinned memory and push them with
+        // async copies on the compute stream — pinned H2D avoids the pageable
+        // legacy-stream drain that plain write() must perform.
+        let host = self
+            .bufs
+            .pinned_in
+            .host_ptr()
+            .expect("pinned buffer has host mapping");
+        unsafe {
+            let vals = [token_id as i32, pos as i32, (pos + 1) as i32];
+            std::ptr::copy_nonoverlapping(vals.as_ptr() as *const u8, host, 12);
+        }
+        self.device
+            .copy(&self.bufs.pinned_in, 0, &self.bufs.ids, 0, 4, &self.stream)?;
+        self.device
+            .copy(&self.bufs.pinned_in, 4, &self.bufs.pos, 0, 4, &self.stream)?;
+        self.device
+            .copy(&self.bufs.pinned_in, 8, &self.seq_len_dev, 0, 4, &self.stream)?;
+
+        // The page table only changes when a page is appended.
+        if page_boundary {
+            let pt_host = self
+                .bufs
+                .pinned_pt
+                .host_ptr()
+                .expect("pinned buffer has host mapping");
             let mut pt = vec![-1i32; self.max_pages_per_seq];
             pt[..seq.pages.len()].copy_from_slice(&seq.pages);
-            self.device
-                .write(bytemuck::cast_slice(&pt), &self.page_table_dev, 0)?;
-            self.device.write(
-                bytemuck::cast_slice(&[(pos + 1) as i32]),
-                &self.seq_len_dev,
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    pt.as_ptr() as *const u8,
+                    pt_host,
+                    self.max_pages_per_seq * 4,
+                );
+            }
+            self.device.copy(
+                &self.bufs.pinned_pt,
                 0,
+                &self.page_table_dev,
+                0,
+                self.max_pages_per_seq * 4,
+                &self.stream,
             )?;
         }
-
-        // Refresh device-resident inputs; the recorded launch sequence reads
-        // everything it needs from these buffers.
-        self.device
-            .write(bytemuck::cast_slice(&[token_id as i32]), &self.bufs.ids, 0)?;
-        self.device
-            .write(bytemuck::cast_slice(&[pos as i32]), &self.bufs.pos, 0)?;
 
         if self.decode_graph.is_none() {
             let graph = self.capture_step()?;
@@ -232,14 +267,23 @@ impl Model {
         }
         let graph = self.decode_graph.as_ref().expect("captured above").clone();
         self.device.launch_graph(&graph, &self.stream)?;
+        // Land logits in pinned memory on the same stream, then one sync.
+        self.device.copy(
+            &self.bufs.logits,
+            0,
+            &self.bufs.pinned_logits,
+            0,
+            p.vocab_size * 4,
+            &self.stream,
+        )?;
         self.device.synchronize()?;
 
-        let mut bytes = vec![0u8; p.vocab_size * 4];
-        self.device.read(&self.bufs.logits, 0, &mut bytes)?;
-        let logits: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let lp = self
+            .bufs
+            .pinned_logits
+            .host_ptr()
+            .expect("pinned buffer has host mapping") as *const f32;
+        let logits = unsafe { std::slice::from_raw_parts(lp, p.vocab_size) }.to_vec();
 
         Ok(logits)
     }
