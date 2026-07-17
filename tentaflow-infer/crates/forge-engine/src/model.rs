@@ -108,7 +108,10 @@ impl Model {
         let q_dim = p.n_heads * p.head_dim;
         let kv_dim = p.n_kv_heads * p.head_dim;
         let inter = p.intermediate_size;
-        let alloc = |elems: usize| device.alloc(elems * 2, MemKind::Device, Pool::Weights);
+        // Persistent decode scratch lives in the activation pool: it is the
+        // pool provisioned for exactly this purpose, and nothing else uses it
+        // on the LLM path anymore (the ring never needs to wrap).
+        let alloc = |elems: usize| device.alloc(elems * 2, MemKind::Device, Pool::Activations);
         let bufs = DecodeBufs {
             h: alloc(hidden)?,
             x: alloc(hidden)?,
@@ -121,9 +124,9 @@ impl Model {
             up: alloc(inter)?,
             act: alloc(inter)?,
             down: alloc(hidden)?,
-            logits: device.alloc(p.vocab_size * 4, MemKind::Device, Pool::Weights)?,
-            ids: device.alloc(4, MemKind::Device, Pool::Weights)?,
-            pos: device.alloc(4, MemKind::Device, Pool::Weights)?,
+            logits: device.alloc(p.vocab_size * 4, MemKind::Device, Pool::Activations)?,
+            ids: device.alloc(4, MemKind::Device, Pool::Activations)?,
+            pos: device.alloc(4, MemKind::Device, Pool::Activations)?,
         };
         Ok(Model {
             device,
