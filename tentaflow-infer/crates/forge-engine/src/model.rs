@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use forge_hal::{DevBuffer, Device, Pool, Stream};
+use forge_hal::{DevBuffer, Device, ExecGraph, Pool, Stream};
 use forge_kernels::Kernels;
 use forge_types::{ForgeError, MemKind, Result};
 
@@ -41,6 +41,28 @@ pub struct Model {
     page_table_dev: DevBuffer,
     seq_len_dev: DevBuffer,
     max_pages_per_seq: usize,
+    bufs: DecodeBufs,
+    /// Captured decode step; replayed per token (inputs are device-resident).
+    decode_graph: Option<ExecGraph>,
+}
+
+/// Persistent per-step activation buffers. Fixed addresses are what makes the
+/// decode step CUDA-graph-replayable: only their contents change per token.
+struct DecodeBufs {
+    h: DevBuffer,
+    x: DevBuffer,
+    q: DevBuffer,
+    k: DevBuffer,
+    v: DevBuffer,
+    attn_out: DevBuffer,
+    o_out: DevBuffer,
+    gate: DevBuffer,
+    up: DevBuffer,
+    act: DevBuffer,
+    down: DevBuffer,
+    logits: DevBuffer,
+    ids: DevBuffer,
+    pos: DevBuffer,
 }
 
 impl Model {
@@ -82,6 +104,27 @@ impl Model {
         let stream = device.create_stream()?;
         let page_table_dev = device.alloc(max_pages_per_seq * 4, MemKind::Device, Pool::Weights)?;
         let seq_len_dev = device.alloc(4, MemKind::Device, Pool::Weights)?;
+        let hidden = p.hidden_size;
+        let q_dim = p.n_heads * p.head_dim;
+        let kv_dim = p.n_kv_heads * p.head_dim;
+        let inter = p.intermediate_size;
+        let alloc = |elems: usize| device.alloc(elems * 2, MemKind::Device, Pool::Weights);
+        let bufs = DecodeBufs {
+            h: alloc(hidden)?,
+            x: alloc(hidden)?,
+            q: alloc(q_dim)?,
+            k: alloc(kv_dim)?,
+            v: alloc(kv_dim)?,
+            attn_out: alloc(q_dim)?,
+            o_out: alloc(hidden)?,
+            gate: alloc(inter)?,
+            up: alloc(inter)?,
+            act: alloc(inter)?,
+            down: alloc(hidden)?,
+            logits: device.alloc(p.vocab_size * 4, MemKind::Device, Pool::Weights)?,
+            ids: device.alloc(4, MemKind::Device, Pool::Weights)?,
+            pos: device.alloc(4, MemKind::Device, Pool::Weights)?,
+        };
         Ok(Model {
             device,
             kernels,
@@ -91,6 +134,8 @@ impl Model {
             page_table_dev,
             seq_len_dev,
             max_pages_per_seq,
+            bufs,
+            decode_graph: None,
         })
     }
 
@@ -147,11 +192,6 @@ impl Model {
     /// f32 logits for the next-token distribution.
     pub fn step(&mut self, seq: &mut SeqKv, token_id: u32) -> Result<Vec<f32>> {
         let p = self.weights.descriptor.params.clone();
-        let hidden = p.hidden_size;
-        let q_dim = p.n_heads * p.head_dim;
-        let kv_dim = p.n_kv_heads * p.head_dim;
-        let inter = p.intermediate_size;
-        let eps = p.rms_norm_eps;
         let pos = seq.len;
 
         if pos >= p.max_position_embeddings {
@@ -176,150 +216,125 @@ impl Model {
             )?;
         }
 
-        let dev = self.device.as_ref();
-        let stream = self.stream.clone();
-        let alloc = |elems: usize| dev.alloc(elems * 2, MemKind::Device, Pool::Activations);
+        // Refresh device-resident inputs; the recorded launch sequence reads
+        // everything it needs from these buffers.
+        self.device
+            .write(bytemuck::cast_slice(&[token_id as i32]), &self.bufs.ids, 0)?;
+        self.device
+            .write(bytemuck::cast_slice(&[pos as i32]), &self.bufs.pos, 0)?;
 
-        // Activation set for this step; dropped before reset_activations.
-        let h = alloc(hidden)?;
-        let x = alloc(hidden)?;
-        let q = alloc(q_dim)?;
-        let k = alloc(kv_dim)?;
-        let v = alloc(kv_dim)?;
-        let attn_out = alloc(q_dim)?;
-        let o_out = alloc(hidden)?;
-        let gate = alloc(inter)?;
-        let up = alloc(inter)?;
-        let act = alloc(inter)?;
-        let down = alloc(hidden)?;
-        let logits_dev = dev.alloc(p.vocab_size * 4, MemKind::Device, Pool::Activations)?;
-        let ids = dev.alloc(4, MemKind::Device, Pool::Activations)?;
-        let pos_dev = dev.alloc(4, MemKind::Device, Pool::Activations)?;
-
-        dev.write(bytemuck::cast_slice(&[token_id as i32]), &ids, 0)?;
-        dev.write(bytemuck::cast_slice(&[pos as i32]), &pos_dev, 0)?;
-
-        let kernels = &self.kernels;
-        kernels.gather_rows_f16(&h, &self.weights.token_embd_f16, &ids, 1, hidden, &stream)?;
-        kernels.rmsnorm_f16(
-            &x,
-            &h,
-            &self.weights.layers[0].attn_norm,
-            1,
-            hidden,
-            eps,
-            &stream,
-        )?;
-
-        let scale = 1.0 / (p.head_dim as f32).sqrt();
-        let n_layers = self.weights.layers.len();
-        for l in 0..n_layers {
-            let layer = &self.weights.layers[l];
-
-            self.gemv(&q, &layer.attn_q, &x, &stream)?;
-            self.gemv(&k, &layer.attn_k, &x, &stream)?;
-            self.gemv(&v, &layer.attn_v, &x, &stream)?;
-
-            // Per-head QK norms (qwen3): rows = heads, cols = head_dim,
-            // safe in place because each thread's read/write partitions match.
-            if let Some(qn) = &layer.q_norm {
-                kernels.rmsnorm_f16(&q, &q, qn, p.n_heads, p.head_dim, eps, &stream)?;
-            }
-            if let Some(kn) = &layer.k_norm {
-                kernels.rmsnorm_f16(&k, &k, kn, p.n_kv_heads, p.head_dim, eps, &stream)?;
-            }
-
-            kernels.rope_neox_f16(
-                &q,
-                &pos_dev,
-                1,
-                p.n_heads,
-                p.head_dim,
-                p.rope_theta,
-                &stream,
-            )?;
-            kernels.rope_neox_f16(
-                &k,
-                &pos_dev,
-                1,
-                p.n_kv_heads,
-                p.head_dim,
-                p.rope_theta,
-                &stream,
-            )?;
-
-            // Scatter this token's K/V rows into the paged cache (single
-            // launch, device-resident addressing — graph-capture ready).
-            kernels.kv_append_f16(
-                &self.kv.k[l],
-                &self.kv.v[l],
-                &k,
-                &v,
-                &self.page_table_dev,
-                &self.seq_len_dev,
-                p.n_kv_heads,
-                self.kv.cfg.page_size,
-                p.head_dim,
-                &stream,
-            )?;
-
-            kernels.attn_decode_f16(
-                &attn_out,
-                &q,
-                &self.kv.k[l],
-                &self.kv.v[l],
-                &self.page_table_dev,
-                &self.seq_len_dev,
-                1,
-                p.n_heads,
-                p.n_kv_heads,
-                p.head_dim,
-                self.kv.cfg.page_size,
-                self.max_pages_per_seq,
-                scale,
-                &stream,
-            )?;
-
-            self.gemv(&o_out, &layer.attn_o, &attn_out, &stream)?;
-            kernels.rmsnorm_residual_f16(
-                &x,
-                &h,
-                &o_out,
-                &layer.ffn_norm,
-                1,
-                hidden,
-                eps,
-                &stream,
-            )?;
-
-            self.gemv(&gate, &layer.ffn_gate, &x, &stream)?;
-            self.gemv(&up, &layer.ffn_up, &x, &stream)?;
-            kernels.silu_mul_f16(&act, &gate, &up, inter, &stream)?;
-            self.gemv(&down, &layer.ffn_down, &act, &stream)?;
-
-            let next_norm = if l + 1 < n_layers {
-                &self.weights.layers[l + 1].attn_norm
-            } else {
-                &self.weights.output_norm
-            };
-            kernels.rmsnorm_residual_f16(&x, &h, &down, next_norm, 1, hidden, eps, &stream)?;
+        if self.decode_graph.is_none() {
+            let graph = self.capture_step()?;
+            self.decode_graph = Some(graph);
         }
-
-        self.logits_gemv(&logits_dev, &x, &stream)?;
-        dev.synchronize()?;
+        let graph = self.decode_graph.as_ref().expect("captured above").clone();
+        self.device.launch_graph(&graph, &self.stream)?;
+        self.device.synchronize()?;
 
         let mut bytes = vec![0u8; p.vocab_size * 4];
-        dev.read(&logits_dev, 0, &mut bytes)?;
+        self.device.read(&self.bufs.logits, 0, &mut bytes)?;
         let logits: Vec<f32> = bytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
-        drop((
-            h, x, q, k, v, attn_out, o_out, gate, up, act, down, logits_dev, ids, pos_dev,
-        ));
-        self.device.reset_activations()?;
-
         Ok(logits)
+    }
+
+    /// Record every launch of one decode step into a replayable graph.
+    /// Stream capture does not execute the work, so buffer contents during
+    /// capture are irrelevant — only addresses and launch geometry matter.
+    fn capture_step(&self) -> Result<ExecGraph> {
+        let p = &self.weights.descriptor.params;
+        let hidden = p.hidden_size;
+        let inter = p.intermediate_size;
+        let eps = p.rms_norm_eps;
+        let kernels = &self.kernels;
+        let stream = &self.stream;
+        let b = &self.bufs;
+
+        self.device.begin_capture(stream)?;
+        let record = || -> Result<()> {
+            kernels.gather_rows_f16(&b.h, &self.weights.token_embd_f16, &b.ids, 1, hidden, stream)?;
+            kernels.rmsnorm_f16(&b.x, &b.h, &self.weights.layers[0].attn_norm, 1, hidden, eps, stream)?;
+
+            let scale = 1.0 / (p.head_dim as f32).sqrt();
+            let n_layers = self.weights.layers.len();
+            for l in 0..n_layers {
+                let layer = &self.weights.layers[l];
+
+                self.gemv(&b.q, &layer.attn_q, &b.x, stream)?;
+                self.gemv(&b.k, &layer.attn_k, &b.x, stream)?;
+                self.gemv(&b.v, &layer.attn_v, &b.x, stream)?;
+
+                // Per-head QK norms (qwen3); in-place is safe: each thread's
+                // read/write partitions match.
+                if let Some(qn) = &layer.q_norm {
+                    kernels.rmsnorm_f16(&b.q, &b.q, qn, p.n_heads, p.head_dim, eps, stream)?;
+                }
+                if let Some(kn) = &layer.k_norm {
+                    kernels.rmsnorm_f16(&b.k, &b.k, kn, p.n_kv_heads, p.head_dim, eps, stream)?;
+                }
+
+                kernels.rope_neox_f16(&b.q, &b.pos, 1, p.n_heads, p.head_dim, p.rope_theta, stream)?;
+                kernels.rope_neox_f16(&b.k, &b.pos, 1, p.n_kv_heads, p.head_dim, p.rope_theta, stream)?;
+
+                kernels.kv_append_f16(
+                    &self.kv.k[l],
+                    &self.kv.v[l],
+                    &b.k,
+                    &b.v,
+                    &self.page_table_dev,
+                    &self.seq_len_dev,
+                    p.n_kv_heads,
+                    self.kv.cfg.page_size,
+                    p.head_dim,
+                    stream,
+                )?;
+
+                kernels.attn_decode_f16(
+                    &b.attn_out,
+                    &b.q,
+                    &self.kv.k[l],
+                    &self.kv.v[l],
+                    &self.page_table_dev,
+                    &self.seq_len_dev,
+                    1,
+                    p.n_heads,
+                    p.n_kv_heads,
+                    p.head_dim,
+                    self.kv.cfg.page_size,
+                    self.max_pages_per_seq,
+                    scale,
+                    stream,
+                )?;
+
+                self.gemv(&b.o_out, &layer.attn_o, &b.attn_out, stream)?;
+                kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.o_out, &layer.ffn_norm, 1, hidden, eps, stream)?;
+
+                self.gemv(&b.gate, &layer.ffn_gate, &b.x, stream)?;
+                self.gemv(&b.up, &layer.ffn_up, &b.x, stream)?;
+                kernels.silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
+                self.gemv(&b.down, &layer.ffn_down, &b.act, stream)?;
+
+                let next_norm = if l + 1 < n_layers {
+                    &self.weights.layers[l + 1].attn_norm
+                } else {
+                    &self.weights.output_norm
+                };
+                kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.down, next_norm, 1, hidden, eps, stream)?;
+            }
+
+            self.logits_gemv(&b.logits, &b.x, stream)
+        };
+        let recorded = record();
+        match recorded {
+            Ok(()) => self.device.end_capture(stream),
+            Err(e) => {
+                // Abort the capture so the stream is usable again.
+                let _ = self.device.end_capture(stream);
+                Err(e)
+            }
+        }
     }
 }
