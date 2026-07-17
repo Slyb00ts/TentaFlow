@@ -14,7 +14,7 @@ use forge_kernels::Kernels;
 use forge_types::{ForgeError, MemKind, Result};
 
 use crate::kv::{KvCache, KvConfig, SeqKv};
-use crate::weights::{DevWeight, ModelWeights};
+use crate::weights::{DevWeight, GateUpWeights, ModelWeights, QkvWeights};
 
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
 /// prompts. Bounds the persistent prefill scratch allocation.
@@ -58,11 +58,16 @@ pub struct Model {
 struct DecodeBufs {
     h: DevBuffer,
     x: DevBuffer,
+    /// Fused q|k|v output ([q_dim + 2*kv_dim]); q starts at offset 0, so the
+    /// attention kernel reads it directly. Split-layer fallbacks use q/k/v.
+    qkv: DevBuffer,
     q: DevBuffer,
     k: DevBuffer,
     v: DevBuffer,
     attn_out: DevBuffer,
     o_out: DevBuffer,
+    /// Fused gate|up output ([2*inter]); split-layer fallbacks use gate/up.
+    gate_up: DevBuffer,
     gate: DevBuffer,
     up: DevBuffer,
     act: DevBuffer,
@@ -151,11 +156,13 @@ impl Model {
         let bufs = DecodeBufs {
             h: alloc(hidden)?,
             x: alloc(hidden)?,
+            qkv: alloc(q_dim + 2 * kv_dim)?,
             q: alloc(q_dim)?,
             k: alloc(kv_dim)?,
             v: alloc(kv_dim)?,
             attn_out: alloc(q_dim)?,
             o_out: alloc(hidden)?,
+            gate_up: alloc(2 * inter)?,
             gate: alloc(inter)?,
             up: alloc(inter)?,
             act: alloc(inter)?,
@@ -241,25 +248,59 @@ impl Model {
         n_tokens: usize,
         stream: &Stream,
     ) -> Result<()> {
+        self.gemm_xt_rows(y, w, xt, n_tokens, 0, w.rows(), stream)
+    }
+
+    /// Batched GEMM over a row window of `w`: y = W[row_off..row_off+n_rows]·x.
+    /// Row offsets translate to per-format byte offsets into the weight (and,
+    /// for NVFP4, scale) streams — this is how prefill reads the q/k/v and
+    /// gate/up sections out of a fused matrix without storing them twice.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_xt_rows(
+        &self,
+        y: &DevBuffer,
+        w: &DevWeight,
+        xt: &DevBuffer,
+        n_tokens: usize,
+        row_off: usize,
+        n_rows: usize,
+        stream: &Stream,
+    ) -> Result<()> {
         match w {
-            DevWeight::F16 { buf, rows, cols } => self
-                .kernels
-                .gemm_f16_xt_f16(y, buf, xt, *rows, *cols, n_tokens, stream),
-            DevWeight::Q8_0 { buf, rows, cols } => self
-                .kernels
-                .gemm_q8_0_xt_f16(y, buf, xt, *rows, *cols, n_tokens, stream),
+            DevWeight::F16 { buf, cols, .. } => self.kernels.gemm_f16_xt_f16_at(
+                y,
+                buf,
+                row_off * cols * 2,
+                xt,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Q8_0 { buf, cols, .. } => self.kernels.gemm_q8_0_xt_f16_at(
+                y,
+                buf,
+                row_off * (cols / 32) * 34,
+                xt,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
             DevWeight::NvFp4 {
                 packed,
                 scales,
                 inv_global_scale,
-                rows,
                 cols,
-            } => self.kernels.gemm_nvfp4_xt_f16(
+                ..
+            } => self.kernels.gemm_nvfp4_xt_f16_at(
                 y,
                 packed,
+                row_off * (cols / 2),
                 scales,
+                row_off * (cols / 16),
                 xt,
-                *rows,
+                n_rows,
                 *cols,
                 n_tokens,
                 *inv_global_scale,
@@ -353,6 +394,7 @@ impl Model {
         let hidden = p.hidden_size;
         let inter = p.intermediate_size;
         let q_dim = p.n_heads * p.head_dim;
+        let kv_dim = p.n_kv_heads * p.head_dim;
         let eps = p.rms_norm_eps;
         let scale = 1.0 / (p.head_dim as f32).sqrt();
         let kernels = &self.kernels;
@@ -366,9 +408,22 @@ impl Model {
             let layer = &self.weights.layers[l];
 
             kernels.transpose_f16(&pb.xt, &pb.x, t_pad, hidden, stream)?;
-            self.gemm_xt(&pb.q, &layer.attn_q, &pb.xt, t_pad, stream)?;
-            self.gemm_xt(&pb.k, &layer.attn_k, &pb.xt, t_pad, stream)?;
-            self.gemm_xt(&pb.v, &layer.attn_v, &pb.xt, t_pad, stream)?;
+            // Prefill outputs must stay [T, dim] contiguous per projection
+            // (attention/rope/append index (t*heads+h)*head_dim), so a fused
+            // matrix is consumed as three row-window GEMMs into separate
+            // buffers — same weight bytes, no second copy in VRAM.
+            match &layer.attn_qkv {
+                QkvWeights::Fused(w) => {
+                    self.gemm_xt_rows(&pb.q, w, &pb.xt, t_pad, 0, q_dim, stream)?;
+                    self.gemm_xt_rows(&pb.k, w, &pb.xt, t_pad, q_dim, kv_dim, stream)?;
+                    self.gemm_xt_rows(&pb.v, w, &pb.xt, t_pad, q_dim + kv_dim, kv_dim, stream)?;
+                }
+                QkvWeights::Split { q, k, v } => {
+                    self.gemm_xt(&pb.q, q, &pb.xt, t_pad, stream)?;
+                    self.gemm_xt(&pb.k, k, &pb.xt, t_pad, stream)?;
+                    self.gemm_xt(&pb.v, v, &pb.xt, t_pad, stream)?;
+                }
+            }
 
             if let Some(qn) = &layer.q_norm {
                 kernels.rmsnorm_f16(&pb.q, &pb.q, qn, t * p.n_heads, p.head_dim, eps, stream)?;
@@ -416,8 +471,16 @@ impl Model {
             kernels.rmsnorm_residual_f16(&pb.x, &pb.h, &pb.o_out, &layer.ffn_norm, t, hidden, eps, stream)?;
 
             kernels.transpose_f16(&pb.xt, &pb.x, t_pad, hidden, stream)?;
-            self.gemm_xt(&pb.gate, &layer.ffn_gate, &pb.xt, t_pad, stream)?;
-            self.gemm_xt(&pb.up, &layer.ffn_up, &pb.xt, t_pad, stream)?;
+            match &layer.ffn_gate_up {
+                GateUpWeights::Fused(w) => {
+                    self.gemm_xt_rows(&pb.gate, w, &pb.xt, t_pad, 0, inter, stream)?;
+                    self.gemm_xt_rows(&pb.up, w, &pb.xt, t_pad, inter, inter, stream)?;
+                }
+                GateUpWeights::Split { gate, up } => {
+                    self.gemm_xt(&pb.gate, gate, &pb.xt, t_pad, stream)?;
+                    self.gemm_xt(&pb.up, up, &pb.xt, t_pad, stream)?;
+                }
+            }
             kernels.silu_mul_f16(&pb.act, &pb.gate, &pb.up, t * inter, stream)?;
             kernels.transpose_f16(&pb.xt, &pb.act, t_pad, inter, stream)?;
             self.gemm_xt(&pb.down, &layer.ffn_down, &pb.xt, t_pad, stream)?;
@@ -560,42 +623,78 @@ impl Model {
             kernels.rmsnorm_f16(&b.x, &b.h, &self.weights.layers[0].attn_norm, 1, hidden, eps, stream)?;
 
             let scale = 1.0 / (p.head_dim as f32).sqrt();
+            // Byte offsets of the K and V sections inside the fused q|k|v
+            // decode buffer (q occupies rows 0..q_dim, so its offset is 0).
+            let q_dim = p.n_heads * p.head_dim;
+            let kv_dim = p.n_kv_heads * p.head_dim;
+            let k_byte_off = q_dim * 2;
+            let v_byte_off = (q_dim + kv_dim) * 2;
             let n_layers = self.weights.layers.len();
             for l in 0..n_layers {
                 let layer = &self.weights.layers[l];
 
-                self.gemv(&b.q, &layer.attn_q, &b.x, stream)?;
-                self.gemv(&b.k, &layer.attn_k, &b.x, stream)?;
-                self.gemv(&b.v, &layer.attn_v, &b.x, stream)?;
-
-                // Per-head QK norms (qwen3); in-place is safe: each thread's
-                // read/write partitions match.
-                if let Some(qn) = &layer.q_norm {
-                    kernels.rmsnorm_f16(&b.q, &b.q, qn, p.n_heads, p.head_dim, eps, stream)?;
-                }
-                if let Some(kn) = &layer.k_norm {
-                    kernels.rmsnorm_f16(&b.k, &b.k, kn, p.n_kv_heads, p.head_dim, eps, stream)?;
-                }
-
-                kernels.rope_neox_f16(&b.q, &b.pos, 1, p.n_heads, p.head_dim, p.rope_theta, stream)?;
-                kernels.rope_neox_f16(&b.k, &b.pos, 1, p.n_kv_heads, p.head_dim, p.rope_theta, stream)?;
-
-                kernels.kv_append_f16(
-                    &self.kv.k[l],
-                    &self.kv.v[l],
-                    &b.k,
-                    &b.v,
-                    &self.page_table_dev,
-                    &self.seq_len_dev,
-                    p.n_kv_heads,
-                    self.kv.cfg.page_size,
-                    p.head_dim,
-                    stream,
-                )?;
+                // Fused layers project q|k|v with ONE GEMV into one buffer;
+                // the section kernels resolve q/k/v via host-computed byte
+                // offsets (per-head norms and RoPE stay in place, safe: each
+                // thread's read/write partitions match).
+                let q_buf = match &layer.attn_qkv {
+                    QkvWeights::Fused(w) => {
+                        self.gemv(&b.qkv, w, &b.x, stream)?;
+                        if let Some(qn) = &layer.q_norm {
+                            kernels.rmsnorm_f16(&b.qkv, &b.qkv, qn, p.n_heads, p.head_dim, eps, stream)?;
+                        }
+                        if let Some(kn) = &layer.k_norm {
+                            kernels.rmsnorm_f16_at(&b.qkv, k_byte_off, &b.qkv, k_byte_off, kn, p.n_kv_heads, p.head_dim, eps, stream)?;
+                        }
+                        kernels.rope_neox_f16(&b.qkv, &b.pos, 1, p.n_heads, p.head_dim, p.rope_theta, stream)?;
+                        kernels.rope_neox_f16_at(&b.qkv, k_byte_off, &b.pos, 1, p.n_kv_heads, p.head_dim, p.rope_theta, stream)?;
+                        kernels.kv_append_f16_at(
+                            &self.kv.k[l],
+                            &self.kv.v[l],
+                            &b.qkv,
+                            k_byte_off,
+                            &b.qkv,
+                            v_byte_off,
+                            &self.page_table_dev,
+                            &self.seq_len_dev,
+                            p.n_kv_heads,
+                            self.kv.cfg.page_size,
+                            p.head_dim,
+                            stream,
+                        )?;
+                        &b.qkv
+                    }
+                    QkvWeights::Split { q, k, v } => {
+                        self.gemv(&b.q, q, &b.x, stream)?;
+                        self.gemv(&b.k, k, &b.x, stream)?;
+                        self.gemv(&b.v, v, &b.x, stream)?;
+                        if let Some(qn) = &layer.q_norm {
+                            kernels.rmsnorm_f16(&b.q, &b.q, qn, p.n_heads, p.head_dim, eps, stream)?;
+                        }
+                        if let Some(kn) = &layer.k_norm {
+                            kernels.rmsnorm_f16(&b.k, &b.k, kn, p.n_kv_heads, p.head_dim, eps, stream)?;
+                        }
+                        kernels.rope_neox_f16(&b.q, &b.pos, 1, p.n_heads, p.head_dim, p.rope_theta, stream)?;
+                        kernels.rope_neox_f16(&b.k, &b.pos, 1, p.n_kv_heads, p.head_dim, p.rope_theta, stream)?;
+                        kernels.kv_append_f16(
+                            &self.kv.k[l],
+                            &self.kv.v[l],
+                            &b.k,
+                            &b.v,
+                            &self.page_table_dev,
+                            &self.seq_len_dev,
+                            p.n_kv_heads,
+                            self.kv.cfg.page_size,
+                            p.head_dim,
+                            stream,
+                        )?;
+                        &b.q
+                    }
+                };
 
                 kernels.attn_decode_f16(
                     &b.attn_out,
-                    &b.q,
+                    q_buf,
                     &self.kv.k[l],
                     &self.kv.v[l],
                     &self.page_table_dev,
@@ -613,9 +712,17 @@ impl Model {
                 self.gemv(&b.o_out, &layer.attn_o, &b.attn_out, stream)?;
                 kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.o_out, &layer.ffn_norm, 1, hidden, eps, stream)?;
 
-                self.gemv(&b.gate, &layer.ffn_gate, &b.x, stream)?;
-                self.gemv(&b.up, &layer.ffn_up, &b.x, stream)?;
-                kernels.silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
+                match &layer.ffn_gate_up {
+                    GateUpWeights::Fused(w) => {
+                        self.gemv(&b.gate_up, w, &b.x, stream)?;
+                        kernels.silu_mul_f16_at(&b.act, &b.gate_up, 0, inter * 2, inter, stream)?;
+                    }
+                    GateUpWeights::Split { gate, up } => {
+                        self.gemv(&b.gate, gate, &b.x, stream)?;
+                        self.gemv(&b.up, up, &b.x, stream)?;
+                        kernels.silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
+                    }
+                }
                 self.gemv(&b.down, &layer.ffn_down, &b.act, stream)?;
 
                 let next_norm = if l + 1 < n_layers {

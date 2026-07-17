@@ -57,6 +57,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         p.head_dim,
         p.vocab_size
     );
+    eprintln!(
+        "fused layers: qkv {}/{} gate_up {}/{}",
+        model.weights.fused_qkv_layers,
+        p.block_count,
+        model.weights.fused_gate_up_layers,
+        p.block_count
+    );
 
     let prompt_tokens = tokenizer.encode(&prompt, true)?;
     eprintln!("prompt tokens: {prompt_tokens:?}");

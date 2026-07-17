@@ -41,6 +41,24 @@ impl Kernels {
         eps: f32,
         stream: &Stream,
     ) -> Result<()> {
+        self.rmsnorm_f16_at(out, 0, x, 0, weight, rows, cols, eps, stream)
+    }
+
+    /// `rmsnorm_f16` reading x and writing out at byte offsets — normalizes a
+    /// row section of a fused QKV activation buffer in place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_f16_at(
+        &self,
+        out: &DevBuffer,
+        out_byte_off: usize,
+        x: &DevBuffer,
+        x_byte_off: usize,
+        weight: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
         let k = self.artifacts.get("rmsnorm_f16")?;
         let cfg = LaunchConfig {
             grid: (rows as u32, 1, 1),
@@ -48,8 +66,8 @@ impl Kernels {
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
-            .buf(out)
-            .buf(x)
+            .buf_at(out, out_byte_off)?
+            .buf_at(x, x_byte_off)?
             .buf(weight)
             .scalar(cols as i64)
             .scalar(eps);
@@ -104,11 +122,51 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// `silu_mul_f16` where gate and up are sections of one fused gate|up
+    /// buffer, addressed by byte offsets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn silu_mul_f16_at(
+        &self,
+        out: &DevBuffer,
+        gate_up: &DevBuffer,
+        gate_byte_off: usize,
+        up_byte_off: usize,
+        n: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("silu_mul_f16")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf_at(gate_up, gate_byte_off)?
+            .buf_at(gate_up, up_byte_off)?
+            .scalar(n as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// In-place neox RoPE over [n_tokens, n_heads, head_dim] f16.
     #[allow(clippy::too_many_arguments)]
     pub fn rope_neox_f16(
         &self,
         x_io: &DevBuffer,
+        positions: &DevBuffer,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        theta_base: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.rope_neox_f16_at(x_io, 0, positions, n_tokens, n_heads, head_dim, theta_base, stream)
+    }
+
+    /// `rope_neox_f16` rotating a section of a fused QKV buffer at a byte
+    /// offset (the K rows behind the Q rows). Only valid for n_tokens == 1
+    /// sections: multi-token fused layouts interleave q|k|v per token.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_neox_f16_at(
+        &self,
+        x_io: &DevBuffer,
+        x_byte_off: usize,
         positions: &DevBuffer,
         n_tokens: usize,
         n_heads: usize,
@@ -123,7 +181,7 @@ impl Kernels {
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
-            .buf(x_io)
+            .buf_at(x_io, x_byte_off)?
             .buf(positions)
             .scalar(n_heads as i64)
             .scalar(head_dim as i64)
@@ -560,6 +618,30 @@ impl Kernels {
         head_dim: usize,
         stream: &Stream,
     ) -> Result<()> {
+        self.kv_append_f16_at(
+            k_cache, v_cache, k_in, 0, v_in, 0, page_table, seq_len, n_kv_heads, page_size,
+            head_dim, stream,
+        )
+    }
+
+    /// `kv_append_f16` reading K and V rows at byte offsets — appends the K/V
+    /// sections of a fused q|k|v activation buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_append_f16_at(
+        &self,
+        k_cache: &DevBuffer,
+        v_cache: &DevBuffer,
+        k_in: &DevBuffer,
+        k_byte_off: usize,
+        v_in: &DevBuffer,
+        v_byte_off: usize,
+        page_table: &DevBuffer,
+        seq_len: &DevBuffer,
+        n_kv_heads: usize,
+        page_size: usize,
+        head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
         let k = self.artifacts.get("kv_append_f16")?;
         let cfg = LaunchConfig {
             grid: (n_kv_heads as u32, 1, 1),
@@ -569,8 +651,8 @@ impl Kernels {
         let args = LaunchArgs::new()
             .buf(k_cache)
             .buf(v_cache)
-            .buf(k_in)
-            .buf(v_in)
+            .buf_at(k_in, k_byte_off)?
+            .buf_at(v_in, v_byte_off)?
             .buf(page_table)
             .buf(seq_len)
             .scalar(n_kv_heads as i64)
@@ -626,6 +708,23 @@ impl Kernels {
         n_tokens: usize,
         stream: &Stream,
     ) -> Result<()> {
+        self.gemm_q8_0_xt_f16_at(y, w_q8, 0, xt, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_q8_0_xt_f16` over a row window of a fused weight matrix:
+    /// `w_byte_off` addresses the first block of the window's first row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q8_0_xt_f16_at(
+        &self,
+        y: &DevBuffer,
+        w_q8: &DevBuffer,
+        w_byte_off: usize,
+        xt: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
         if !cols.is_multiple_of(32) {
             return Err(ForgeError::Kernel(format!(
                 "gemm_q8_0 requires cols % 32 == 0, got {cols}"
@@ -640,7 +739,7 @@ impl Kernels {
         };
         let args = LaunchArgs::new()
             .buf(y)
-            .buf(w_q8)
+            .buf_at(w_q8, w_byte_off)?
             .buf(xt)
             .scalar(cols as i64)
             .scalar(rows as i64)
@@ -662,6 +761,39 @@ impl Kernels {
         inv_global_scale: f32,
         stream: &Stream,
     ) -> Result<()> {
+        self.gemm_nvfp4_xt_f16_at(
+            y,
+            packed,
+            0,
+            scales,
+            0,
+            xt,
+            rows,
+            cols,
+            n_tokens,
+            inv_global_scale,
+            stream,
+        )
+    }
+
+    /// `gemm_nvfp4_xt_f16` over a row window of a fused weight matrix; packed
+    /// nibbles and FP8 block scales are separate streams, so the window needs
+    /// a byte offset into each.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_nvfp4_xt_f16_at(
+        &self,
+        y: &DevBuffer,
+        packed: &DevBuffer,
+        packed_byte_off: usize,
+        scales: &DevBuffer,
+        scales_byte_off: usize,
+        xt: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        inv_global_scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
         if !cols.is_multiple_of(16) {
             return Err(ForgeError::Kernel(format!(
                 "gemm_nvfp4 requires cols % 16 == 0, got {cols}"
@@ -676,8 +808,8 @@ impl Kernels {
         };
         let args = LaunchArgs::new()
             .buf(y)
-            .buf(packed)
-            .buf(scales)
+            .buf_at(packed, packed_byte_off)?
+            .buf_at(scales, scales_byte_off)?
             .buf(xt)
             .scalar(cols as i64)
             .scalar(rows as i64)
@@ -692,6 +824,24 @@ impl Kernels {
         &self,
         y: &DevBuffer,
         w: &DevBuffer,
+        xt: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_f16_xt_f16_at(y, w, 0, xt, rows, cols, n_tokens, stream)
+    }
+
+    /// `gemm_f16_xt_f16` over a row window of a fused weight matrix. The
+    /// kernel's 16-byte weight loads require `w_byte_off % 16 == 0`, which
+    /// row-aligned offsets satisfy for any cols % 8 == 0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_xt_f16_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
         xt: &DevBuffer,
         rows: usize,
         cols: usize,
@@ -714,7 +864,7 @@ impl Kernels {
         };
         let args = LaunchArgs::new()
             .buf(y)
-            .buf(w)
+            .buf_at(w, w_byte_off)?
             .buf(xt)
             .scalar(cols as i64)
             .scalar(rows as i64)

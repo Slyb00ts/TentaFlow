@@ -70,3 +70,23 @@ Remaining gap analysis: decode on the 0.6B is bounded by the ~200-kernel
 per-step floor (fusions: QKV/gate-up concat, norm+rope+append merge); 7B NVFP4
 decode by e2m1 decode ALU cost; prefill by the GEMM kernel (tensor-core/mma
 path is the next step to approach llama.cpp's 36k). All tracked in PLAN chunk 6.
+
+## Update 2026-07-17 — QKV / gate-up weight fusion (decode launch-floor cut)
+
+Q/K/V (and gate/up) matrices are row-concatenated host-side at load into one
+matrix per layer when they share a storage format (NVFP4 additionally requires
+identical tensor global scales — rescaling FP8 block scales would break
+bit-exactness). Decode drops from 7 to 4 GEMV launches per layer; the section
+kernels (k-norm, rope-k, kv-append, silu-mul) address the fused activation
+buffer by byte offset. Prefill reads q/k/v and gate/up as row-window GEMMs out
+of the same fused matrix (no second weight copy in VRAM). All three formats
+fuse on the test models (Bielik NVFP4 40/40 layers, Qwen3 Q8_0 28/28,
+TinyLlama F16 22/22); outputs are bit-identical to the unfused path.
+
+| Model | Decode before | Decode after |
+|---|---:|---:|
+| Qwen3-0.6B Q8_0 (256/256) | 302.1 | **314.8** (+4.2 %) |
+| Bielik-7B NVFP4 (128/128) | 112.2 | **117.5** (+4.7 %) |
+
+Before/after measured on the same tree (same GEMV kernels), fusion isolated
+via stash. Prefill moves within noise (11.2k→11.5k / 259→264 tok/s).

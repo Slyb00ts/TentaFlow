@@ -56,6 +56,24 @@ impl DevWeight {
     }
 }
 
+/// Q/K/V projections: one row-concatenated matrix when the three share a
+/// storage format (single GEMV/GEMM launch, single copy in VRAM), separate
+/// matrices otherwise. Fused row order is q, then k, then v.
+pub enum QkvWeights {
+    Fused(DevWeight),
+    Split {
+        q: DevWeight,
+        k: DevWeight,
+        v: DevWeight,
+    },
+}
+
+/// SwiGLU gate/up projections; fused row order is gate, then up.
+pub enum GateUpWeights {
+    Fused(DevWeight),
+    Split { gate: DevWeight, up: DevWeight },
+}
+
 /// Per-layer weight set (roles resolved by the arch registry).
 pub struct LayerWeights {
     pub attn_norm: DevBuffer,
@@ -63,12 +81,9 @@ pub struct LayerWeights {
     /// Optional per-head QK norms (qwen3); f16 vectors of head_dim.
     pub q_norm: Option<DevBuffer>,
     pub k_norm: Option<DevBuffer>,
-    pub attn_q: DevWeight,
-    pub attn_k: DevWeight,
-    pub attn_v: DevWeight,
+    pub attn_qkv: QkvWeights,
     pub attn_o: DevWeight,
-    pub ffn_gate: DevWeight,
-    pub ffn_up: DevWeight,
+    pub ffn_gate_up: GateUpWeights,
     pub ffn_down: DevWeight,
 }
 
@@ -81,6 +96,10 @@ pub struct ModelWeights {
     /// same host data (kept simple; dedup is a later optimization).
     pub lm_head: DevWeight,
     pub layers: Vec<LayerWeights>,
+    /// Layers whose Q/K/V (resp. gate/up) landed as one fused matrix — the
+    /// rest fell back to split storage (format or NVFP4 global-scale mismatch).
+    pub fused_qkv_layers: usize,
+    pub fused_gate_up_layers: usize,
 }
 
 /// Source-agnostic host-side tensor fetch: (bytes, dtype, quant, dims).
@@ -260,8 +279,49 @@ fn upload_norm(device: &dyn Device, src: &dyn TensorSource, name: &str) -> Resul
     upload(device, &f32s_to_f16_bytes(&f32s))
 }
 
-/// Upload a weight matrix in the most direct form a kernel can consume.
-fn upload_matrix(device: &dyn Device, src: &dyn TensorSource, name: &str) -> Result<DevWeight> {
+/// A weight matrix still on the host, in the exact byte layout the fused
+/// kernels consume. Kept host-side long enough to row-concatenate sibling
+/// projections (QKV, gate/up) before the single upload.
+enum HostWeight {
+    F16 {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
+    Q8_0 {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
+    NvFp4 {
+        packed: Vec<u8>,
+        scales: Vec<u8>,
+        global_scale: f32,
+        rows: usize,
+        cols: usize,
+    },
+}
+
+impl HostWeight {
+    fn rows(&self) -> usize {
+        match self {
+            HostWeight::F16 { rows, .. }
+            | HostWeight::Q8_0 { rows, .. }
+            | HostWeight::NvFp4 { rows, .. } => *rows,
+        }
+    }
+
+    fn cols(&self) -> usize {
+        match self {
+            HostWeight::F16 { cols, .. }
+            | HostWeight::Q8_0 { cols, .. }
+            | HostWeight::NvFp4 { cols, .. } => *cols,
+        }
+    }
+}
+
+/// Fetch a weight matrix in the most direct form a kernel can consume.
+fn fetch_matrix(src: &dyn TensorSource, name: &str) -> Result<HostWeight> {
     if let Some(fp8) = src.fetch_fp8(name)? {
         // v0 materializes FP8 as f16 (2 bytes/elem) — a fused f8 GEMV kernel
         // halves that later without touching this loader contract.
@@ -275,8 +335,8 @@ fn upload_matrix(device: &dyn Device, src: &dyn TensorSource, name: &str) -> Res
             let v = nvfp4::f8e4m3_to_f32(b) * s;
             out.extend_from_slice(&f16::from_f32(v).to_le_bytes());
         }
-        return Ok(DevWeight::F16 {
-            buf: upload(device, &out)?,
+        return Ok(HostWeight::F16 {
+            data: out,
             rows: fp8.rows,
             cols: fp8.cols,
         });
@@ -292,10 +352,10 @@ fn upload_matrix(device: &dyn Device, src: &dyn TensorSource, name: &str) -> Res
             nv.cols,
             16,
         )?;
-        return Ok(DevWeight::NvFp4 {
-            packed: upload(device, &nv.packed)?,
-            scales: upload(device, &nv.scales)?,
-            inv_global_scale: 1.0 / nv.global_scale,
+        return Ok(HostWeight::NvFp4 {
+            packed: nv.packed,
+            scales: nv.scales,
+            global_scale: nv.global_scale,
             rows: nv.rows,
             cols: nv.cols,
         });
@@ -308,23 +368,104 @@ fn upload_matrix(device: &dyn Device, src: &dyn TensorSource, name: &str) -> Res
     }
     let (rows, cols) = (dims[0], dims[1]);
     match quant {
-        QuantKind::Q8_0 => Ok(DevWeight::Q8_0 {
-            buf: upload(device, &data)?,
-            rows,
-            cols,
-        }),
+        QuantKind::Q8_0 => Ok(HostWeight::Q8_0 { data, rows, cols }),
         // Everything else goes through f32 → f16. This covers F16/F32/BF16
         // directly and any other GGML quant via the CPU reference dequant —
         // correctness first; fused kernels for more quants land per PLAN.
         _ => {
             let f32s = dequantize_to_f32(dtype, quant, &data, rows * cols)?;
-            Ok(DevWeight::F16 {
-                buf: upload(device, &f32s_to_f16_bytes(&f32s))?,
+            Ok(HostWeight::F16 {
+                data: f32s_to_f16_bytes(&f32s),
                 rows,
                 cols,
             })
         }
     }
+}
+
+/// Upload a host matrix as-is.
+fn upload_weight(device: &dyn Device, w: HostWeight) -> Result<DevWeight> {
+    match w {
+        HostWeight::F16 { data, rows, cols } => Ok(DevWeight::F16 {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Q8_0 { data, rows, cols } => Ok(DevWeight::Q8_0 {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::NvFp4 {
+            packed,
+            scales,
+            global_scale,
+            rows,
+            cols,
+        } => Ok(DevWeight::NvFp4 {
+            packed: upload(device, &packed)?,
+            scales: upload(device, &scales)?,
+            inv_global_scale: 1.0 / global_scale,
+            rows,
+            cols,
+        }),
+    }
+}
+
+/// Row-concatenate projection matrices into one [Σrows, cols] matrix. Every
+/// supported format stores rows as independent contiguous byte runs (f16
+/// elements, Q8_0 34-byte blocks, NVFP4 packed nibbles + FP8 scale bytes),
+/// so fusion is a plain byte concat of each stream. Returns None when the
+/// parts differ in format, or — for NVFP4 — in the tensor-wide global scale:
+/// rescaling FP8 block scales to a common global would round and break
+/// bit-exactness vs the unfused path, so such layers stay split.
+fn fuse_rows(mut parts: Vec<HostWeight>) -> std::result::Result<HostWeight, Vec<HostWeight>> {
+    let cols = parts[0].cols();
+    if parts.iter().any(|p| p.cols() != cols) {
+        return Err(parts);
+    }
+    match &parts[0] {
+        HostWeight::F16 { .. } if parts.iter().all(|p| matches!(p, HostWeight::F16 { .. })) => {}
+        HostWeight::Q8_0 { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q8_0 { .. })) => {}
+        HostWeight::NvFp4 { global_scale, .. } => {
+            let gs = global_scale.to_bits();
+            let ok = parts.iter().all(
+                |p| matches!(p, HostWeight::NvFp4 { global_scale, .. } if global_scale.to_bits() == gs),
+            );
+            if !ok {
+                return Err(parts);
+            }
+        }
+        _ => return Err(parts),
+    }
+    let rows = parts.iter().map(|p| p.rows()).sum();
+    let mut fused = parts.remove(0);
+    for p in parts {
+        match (&mut fused, p) {
+            (HostWeight::F16 { data, .. }, HostWeight::F16 { data: d, .. })
+            | (HostWeight::Q8_0 { data, .. }, HostWeight::Q8_0 { data: d, .. }) => {
+                data.extend_from_slice(&d)
+            }
+            (
+                HostWeight::NvFp4 { packed, scales, .. },
+                HostWeight::NvFp4 {
+                    packed: p2,
+                    scales: s2,
+                    ..
+                },
+            ) => {
+                packed.extend_from_slice(&p2);
+                scales.extend_from_slice(&s2);
+            }
+            _ => unreachable!("format equality checked above"),
+        }
+    }
+    match &mut fused {
+        HostWeight::F16 { rows: r, .. }
+        | HostWeight::Q8_0 { rows: r, .. }
+        | HostWeight::NvFp4 { rows: r, .. } => *r = rows,
+    }
+    Ok(fused)
 }
 
 /// Upload the embedding table as f16 regardless of storage quant.
@@ -391,29 +532,25 @@ impl ModelWeights {
             .globals
             .get(&WeightRole::LmHead)
             .unwrap_or(embd_name);
-        let lm_head = match upload_matrix(device, src, lm_head_name)? {
+        let lm_head = match fetch_matrix(src, lm_head_name)? {
             // The logit head needs an f32-output kernel, which exists for f16
             // and Q8_0 only — materialize an NVFP4 head as f16 instead of
             // failing at first token.
-            DevWeight::NvFp4 { rows, cols, .. } => {
-                let nv = src.fetch_nvfp4(lm_head_name)?.ok_or_else(|| {
-                    ForgeError::Format(format!("{lm_head_name}: nvfp4 tensors vanished"))
-                })?;
-                let f32s = nvfp4::dequantize_nvfp4(
-                    &nv.packed,
-                    &nv.scales,
-                    nv.global_scale,
-                    rows,
-                    cols,
-                    16,
-                )?;
+            HostWeight::NvFp4 {
+                packed,
+                scales,
+                global_scale,
+                rows,
+                cols,
+            } => {
+                let f32s = nvfp4::dequantize_nvfp4(&packed, &scales, global_scale, rows, cols, 16)?;
                 DevWeight::F16 {
                     buf: upload(device, &f32s_to_f16_bytes(&f32s))?,
                     rows,
                     cols,
                 }
             }
-            w => w,
+            w => upload_weight(device, w)?,
         };
         if lm_head.rows() != vocab || lm_head.cols() != hidden {
             return Err(ForgeError::Format(format!(
@@ -431,10 +568,11 @@ impl ModelWeights {
 
         // Shape validation: activation buffers are sized from the descriptor,
         // so any weight disagreeing with it would launch out-of-bounds GEMVs.
+        // Validated host-side, before fusion hides the per-projection shapes.
         let p = &descriptor.params;
         let q_dim = p.n_heads * p.head_dim;
         let kv_dim = p.n_kv_heads * p.head_dim;
-        let expect = |what: &str, w: &DevWeight, rows: usize, cols: usize| -> Result<()> {
+        let expect = |what: &str, w: &HostWeight, rows: usize, cols: usize| -> Result<()> {
             if w.rows() != rows || w.cols() != cols {
                 return Err(ForgeError::Format(format!(
                     "{what}: shape [{}, {}] does not match model config [{rows}, {cols}]",
@@ -446,13 +584,64 @@ impl ModelWeights {
         };
 
         let mut layers = Vec::with_capacity(descriptor.params.block_count);
+        let mut fused_qkv_layers = 0usize;
+        let mut fused_gate_up_layers = 0usize;
         for (idx, layer_map) in descriptor.layers.iter().enumerate() {
             let name = |role: WeightRole| -> Result<&String> {
                 layer_map
                     .get(&role)
                     .ok_or_else(|| ForgeError::Format(format!("layer {idx}: missing {role:?}")))
             };
-            let layer = LayerWeights {
+            let at = |what: &str| format!("layer {idx} {what}");
+
+            let q = fetch_matrix(src, name(WeightRole::AttnQ)?)?;
+            let k = fetch_matrix(src, name(WeightRole::AttnK)?)?;
+            let v = fetch_matrix(src, name(WeightRole::AttnV)?)?;
+            expect(&at("attn_q"), &q, q_dim, p.hidden_size)?;
+            expect(&at("attn_k"), &k, kv_dim, p.hidden_size)?;
+            expect(&at("attn_v"), &v, kv_dim, p.hidden_size)?;
+            let attn_qkv = match fuse_rows(vec![q, k, v]) {
+                Ok(fused) => {
+                    fused_qkv_layers += 1;
+                    QkvWeights::Fused(upload_weight(device, fused)?)
+                }
+                Err(mut parts) => {
+                    let v = parts.pop().expect("three parts");
+                    let k = parts.pop().expect("three parts");
+                    let q = parts.pop().expect("three parts");
+                    QkvWeights::Split {
+                        q: upload_weight(device, q)?,
+                        k: upload_weight(device, k)?,
+                        v: upload_weight(device, v)?,
+                    }
+                }
+            };
+
+            let gate = fetch_matrix(src, name(WeightRole::FfnGate)?)?;
+            let up = fetch_matrix(src, name(WeightRole::FfnUp)?)?;
+            expect(&at("ffn_gate"), &gate, p.intermediate_size, p.hidden_size)?;
+            expect(&at("ffn_up"), &up, p.intermediate_size, p.hidden_size)?;
+            let ffn_gate_up = match fuse_rows(vec![gate, up]) {
+                Ok(fused) => {
+                    fused_gate_up_layers += 1;
+                    GateUpWeights::Fused(upload_weight(device, fused)?)
+                }
+                Err(mut parts) => {
+                    let up = parts.pop().expect("two parts");
+                    let gate = parts.pop().expect("two parts");
+                    GateUpWeights::Split {
+                        gate: upload_weight(device, gate)?,
+                        up: upload_weight(device, up)?,
+                    }
+                }
+            };
+
+            let attn_o = fetch_matrix(src, name(WeightRole::AttnO)?)?;
+            expect(&at("attn_o"), &attn_o, p.hidden_size, q_dim)?;
+            let ffn_down = fetch_matrix(src, name(WeightRole::FfnDown)?)?;
+            expect(&at("ffn_down"), &ffn_down, p.hidden_size, p.intermediate_size)?;
+
+            layers.push(LayerWeights {
                 attn_norm: upload_norm(device, src, name(WeightRole::AttnNorm)?)?,
                 ffn_norm: upload_norm(device, src, name(WeightRole::FfnNorm)?)?,
                 q_norm: match layer_map.get(&WeightRole::AttnQNorm) {
@@ -463,38 +652,11 @@ impl ModelWeights {
                     Some(n) => Some(upload_norm(device, src, n)?),
                     None => None,
                 },
-                attn_q: upload_matrix(device, src, name(WeightRole::AttnQ)?)?,
-                attn_k: upload_matrix(device, src, name(WeightRole::AttnK)?)?,
-                attn_v: upload_matrix(device, src, name(WeightRole::AttnV)?)?,
-                attn_o: upload_matrix(device, src, name(WeightRole::AttnO)?)?,
-                ffn_gate: upload_matrix(device, src, name(WeightRole::FfnGate)?)?,
-                ffn_up: upload_matrix(device, src, name(WeightRole::FfnUp)?)?,
-                ffn_down: upload_matrix(device, src, name(WeightRole::FfnDown)?)?,
-            };
-            let at = |what: &str| format!("layer {idx} {what}");
-            expect(&at("attn_q"), &layer.attn_q, q_dim, p.hidden_size)?;
-            expect(&at("attn_k"), &layer.attn_k, kv_dim, p.hidden_size)?;
-            expect(&at("attn_v"), &layer.attn_v, kv_dim, p.hidden_size)?;
-            expect(&at("attn_o"), &layer.attn_o, p.hidden_size, q_dim)?;
-            expect(
-                &at("ffn_gate"),
-                &layer.ffn_gate,
-                p.intermediate_size,
-                p.hidden_size,
-            )?;
-            expect(
-                &at("ffn_up"),
-                &layer.ffn_up,
-                p.intermediate_size,
-                p.hidden_size,
-            )?;
-            expect(
-                &at("ffn_down"),
-                &layer.ffn_down,
-                p.hidden_size,
-                p.intermediate_size,
-            )?;
-            layers.push(layer);
+                attn_qkv,
+                attn_o: upload_weight(device, attn_o)?,
+                ffn_gate_up,
+                ffn_down: upload_weight(device, ffn_down)?,
+            });
         }
 
         Ok(ModelWeights {
@@ -503,6 +665,8 @@ impl ModelWeights {
             output_norm,
             lm_head,
             layers,
+            fused_qkv_layers,
+            fused_gate_up_layers,
         })
     }
 
@@ -513,6 +677,14 @@ impl ModelWeights {
         m.insert(
             "layers".into(),
             self.descriptor.params.block_count.to_string(),
+        );
+        m.insert(
+            "fused_qkv_layers".into(),
+            self.fused_qkv_layers.to_string(),
+        );
+        m.insert(
+            "fused_gate_up_layers".into(),
+            self.fused_gate_up_layers.to_string(),
         );
         m
     }
