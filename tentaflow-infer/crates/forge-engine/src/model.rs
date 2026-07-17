@@ -290,6 +290,9 @@ impl Model {
             DevWeight::Q4K { buf, rows, cols } => {
                 self.kernels.gemv_q4_k_f16(y, buf, x, *rows, *cols, stream)
             }
+            DevWeight::Q6K { buf, rows, cols } => {
+                self.kernels.gemv_q6_k_f16(y, buf, x, *rows, *cols, stream)
+            }
             DevWeight::NvFp4 {
                 packed,
                 scales,
@@ -316,15 +319,20 @@ impl Model {
             DevWeight::F16 { cols, .. } => cols.is_multiple_of(8),
             DevWeight::Q8_0 { cols, .. } => cols.is_multiple_of(32),
             DevWeight::NvFp4 { cols, .. } => cols.is_multiple_of(16),
-            DevWeight::Q4K { .. } => false,
+            // Q4_K stages per-32-column x sums in shared memory
+            // (Q4K_MAX_SEGS in gemv2.mojo bounds cols at 32768).
+            DevWeight::Q4K { cols, .. } => cols.is_multiple_of(256) && *cols <= 32768,
+            DevWeight::Q6K { cols, .. } => cols.is_multiple_of(256),
         }
     }
 
-    /// The fused decode step needs every layer's QKV and gate|up projections
-    /// as fused matrices (the residual stream is carried as an (h, h32) pair
-    /// with no standalone normed-x buffer) and a hidden size that fits the
-    /// kernels' shared-memory staging. Anything else records the separate
-    /// per-kernel chain.
+    /// The fused decode step needs every layer's gate|up projection as one
+    /// fused matrix (the residual stream is carried as an (h, h32) pair with
+    /// no standalone normed-x buffer) and a hidden size that fits the
+    /// kernels' shared-memory staging. QKV may stay split (mixed formats,
+    /// e.g. Q4_K q/k + Q6_K v): each projection then runs its own gemv_norm
+    /// launch — same per-row math, only the norm recompute is repeated.
+    /// Anything else records the separate per-kernel chain.
     fn fused_decode_supported(&self) -> bool {
         let p = &self.weights.descriptor.params;
         if p.hidden_size > 8192 {
@@ -333,7 +341,14 @@ impl Model {
         self.weights.layers.iter().all(|l| {
             let qkv_ok = match &l.attn_qkv {
                 QkvWeights::Fused(w) => Self::fused_decode_weight_ok(w),
-                QkvWeights::Split { .. } => false,
+                QkvWeights::FusedQk { qk, v } => {
+                    Self::fused_decode_weight_ok(qk) && Self::fused_decode_weight_ok(v)
+                }
+                QkvWeights::Split { q, k, v } => {
+                    Self::fused_decode_weight_ok(q)
+                        && Self::fused_decode_weight_ok(k)
+                        && Self::fused_decode_weight_ok(v)
+                }
             };
             let gate_up_ok = match &l.ffn_gate_up {
                 GateUpWeights::Fused(w) => Self::fused_decode_weight_ok(w),
@@ -384,9 +399,12 @@ impl Model {
                 eps,
                 stream,
             ),
-            DevWeight::Q4K { .. } => Err(ForgeError::Unsupported(
-                "Q4_K has no fused gemv_norm decode kernel".into(),
-            )),
+            DevWeight::Q4K { buf, rows, cols } => self.kernels.gemv_norm_q4_k_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
+            DevWeight::Q6K { buf, rows, cols } => self.kernels.gemv_norm_q6_k_f16(
+                y, buf, &b.h, &b.h32, norm_w, *rows, *cols, ss_from_h16, eps, stream,
+            ),
         }
     }
 
@@ -427,9 +445,12 @@ impl Model {
                 eps,
                 stream,
             ),
-            DevWeight::Q4K { .. } => Err(ForgeError::Unsupported(
-                "Q4_K has no fused gemv_norm_silu decode kernel".into(),
-            )),
+            DevWeight::Q4K { buf, rows, cols } => self.kernels.gemv_norm_silu_q4_k_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
+            DevWeight::Q6K { buf, rows, cols } => self.kernels.gemv_norm_silu_q6_k_f16(
+                act, buf, &b.h, &b.h32, norm_w, rows / 2, *cols, eps, stream,
+            ),
         }
     }
 
@@ -460,9 +481,12 @@ impl Model {
                 *inv_global_scale,
                 stream,
             ),
-            DevWeight::Q4K { .. } => Err(ForgeError::Unsupported(
-                "Q4_K has no fused gemv_residual decode kernel".into(),
-            )),
+            DevWeight::Q4K { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_q4_k_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
+            DevWeight::Q6K { buf, rows, cols } => self
+                .kernels
+                .gemv_residual_q6_k_f16(&b.h, &b.h32, buf, x, *rows, *cols, stream),
         }
     }
 
@@ -477,6 +501,9 @@ impl Model {
             DevWeight::Q4K { buf, rows, cols } => self
                 .kernels
                 .gemv_q4_k_out_f32(y_f32, buf, x, *rows, *cols, stream),
+            DevWeight::Q6K { buf, rows, cols } => self
+                .kernels
+                .gemv_q6_k_out_f32(y_f32, buf, x, *rows, *cols, stream),
             DevWeight::NvFp4 { .. } => Err(ForgeError::Unsupported(
                 "NVFP4 lm_head has no f32-logit kernel yet".into(),
             )),
@@ -535,6 +562,16 @@ impl Model {
                 y,
                 buf,
                 row_off * (cols / 256) * 144,
+                x,
+                n_rows,
+                *cols,
+                n_tokens,
+                stream,
+            ),
+            DevWeight::Q6K { buf, cols, .. } => self.kernels.gemm_q6_k_f16_at(
+                y,
+                buf,
+                row_off * (cols / 256) * 210,
                 x,
                 n_rows,
                 *cols,
@@ -671,6 +708,11 @@ impl Model {
                     self.gemm_rows(&pb.q, w, &pb.x, t, 0, q_dim, stream)?;
                     self.gemm_rows(&pb.k, w, &pb.x, t, q_dim, kv_dim, stream)?;
                     self.gemm_rows(&pb.v, w, &pb.x, t, q_dim + kv_dim, kv_dim, stream)?;
+                }
+                QkvWeights::FusedQk { qk, v } => {
+                    self.gemm_rows(&pb.q, qk, &pb.x, t, 0, q_dim, stream)?;
+                    self.gemm_rows(&pb.k, qk, &pb.x, t, q_dim, kv_dim, stream)?;
+                    self.gemm(&pb.v, v, &pb.x, t, stream)?;
                 }
                 QkvWeights::Split { q, k, v } => {
                     self.gemm(&pb.q, q, &pb.x, t, stream)?;
@@ -932,6 +974,37 @@ impl Model {
                         )?;
                         &b.qkv
                     }
+                    QkvWeights::FusedQk { qk, v } => {
+                        // q|k land at the front of b.qkv (same section
+                        // offsets as the fully fused layout); v is projected
+                        // into its own buffer and handed to qkv_post by
+                        // pointer.
+                        self.gemv(&b.qkv, qk, &b.x, stream)?;
+                        self.gemv(&b.v, v, &b.x, stream)?;
+                        kernels.qkv_post_f16(
+                            &b.qkv,
+                            0,
+                            &b.qkv,
+                            k_byte_off,
+                            &b.v,
+                            0,
+                            layer.q_norm.as_ref(),
+                            layer.k_norm.as_ref(),
+                            &self.kv.k[l],
+                            &self.kv.v[l],
+                            &b.pos,
+                            &self.page_table_dev,
+                            &self.seq_len_dev,
+                            p.n_heads,
+                            p.n_kv_heads,
+                            p.head_dim,
+                            self.kv.cfg.page_size,
+                            eps,
+                            p.rope_theta,
+                            stream,
+                        )?;
+                        &b.qkv
+                    }
                     QkvWeights::Split { q, k, v } => {
                         self.gemv(&b.q, q, &b.x, stream)?;
                         self.gemv(&b.k, k, &b.x, stream)?;
@@ -1040,26 +1113,44 @@ impl Model {
         let n_layers = self.weights.layers.len();
         for l in 0..n_layers {
             let layer = &self.weights.layers[l];
-            let QkvWeights::Fused(w_qkv) = &layer.attn_qkv else {
-                return Err(ForgeError::Kernel(
-                    "fused decode step requires a fused qkv matrix".into(),
-                ));
-            };
             let GateUpWeights::Fused(w_gate_up) = &layer.ffn_gate_up else {
                 return Err(ForgeError::Kernel(
                     "fused decode step requires a fused gate|up matrix".into(),
                 ));
             };
 
-            self.gemv_norm(&b.qkv, w_qkv, &layer.attn_norm, l == 0, eps, stream)?;
+            // Fused QKV projects with one gemv_norm into the fused buffer;
+            // split layers (mixed formats) run one gemv_norm per projection —
+            // per-row math is identical, only the block-level norm recompute
+            // repeats. Both feed attn_decode_split via buffer + byte offset.
+            let (q_buf, q_off, k_buf, k_off, v_buf, v_off) = match &layer.attn_qkv {
+                QkvWeights::Fused(w_qkv) => {
+                    self.gemv_norm(&b.qkv, w_qkv, &layer.attn_norm, l == 0, eps, stream)?;
+                    (&b.qkv, 0usize, &b.qkv, k_byte_off, &b.qkv, v_byte_off)
+                }
+                QkvWeights::FusedQk { qk, v } => {
+                    // The fused q|k rows land at the front of b.qkv, exactly
+                    // where the Fused layout puts them; v goes to its own
+                    // buffer.
+                    self.gemv_norm(&b.qkv, qk, &layer.attn_norm, l == 0, eps, stream)?;
+                    self.gemv_norm(&b.v, v, &layer.attn_norm, l == 0, eps, stream)?;
+                    (&b.qkv, 0usize, &b.qkv, k_byte_off, &b.v, 0usize)
+                }
+                QkvWeights::Split { q, k, v } => {
+                    self.gemv_norm(&b.q, q, &layer.attn_norm, l == 0, eps, stream)?;
+                    self.gemv_norm(&b.k, k, &layer.attn_norm, l == 0, eps, stream)?;
+                    self.gemv_norm(&b.v, v, &layer.attn_norm, l == 0, eps, stream)?;
+                    (&b.q, 0usize, &b.k, 0usize, &b.v, 0usize)
+                }
+            };
             kernels.attn_decode_split_f16(
                 &b.attn_parts,
-                &b.qkv,
-                0,
-                &b.qkv,
-                k_byte_off,
-                &b.qkv,
-                v_byte_off,
+                q_buf,
+                q_off,
+                k_buf,
+                k_off,
+                v_buf,
+                v_off,
                 layer.q_norm.as_ref(),
                 layer.k_norm.as_ref(),
                 &self.kv.k[l],

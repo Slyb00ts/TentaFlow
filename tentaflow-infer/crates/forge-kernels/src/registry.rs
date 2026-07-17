@@ -100,6 +100,16 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemv_residual_nvfp4_f16",
     "gemv_residual_f16",
     "rmsnorm_h32_f16",
+    "gemv_q6_k_f16_v2",
+    "gemv_q6_k_out_f32_v2",
+    "gemm_q6_k_f16",
+    "gemm_q6_k_f16_bm64",
+    "gemv_norm_q4_k_f16",
+    "gemv_norm_q6_k_f16",
+    "gemv_norm_silu_q4_k_f16",
+    "gemv_norm_silu_q6_k_f16",
+    "gemv_residual_q4_k_f16",
+    "gemv_residual_q6_k_f16",
 ];
 
 /// Loaded modules + resolved kernel handles for one device.

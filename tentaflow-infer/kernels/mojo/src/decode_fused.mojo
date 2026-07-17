@@ -26,6 +26,13 @@ from std.gpu.memory import AddressSpace
 from std.memory import bitcast, stack_allocation
 from std.math import rsqrt, exp
 from src.reduce import block_reduce_sum
+from src.gemv2 import (
+    _gemv_q4_k_row_acc,
+    _gemv_q6_k_row_acc,
+    _q4k_fill_xsum,
+    _q4k_scale_min,
+    Q4K_MAX_SEGS,
+)
 
 comptime WARP = 32
 comptime ROWS_PER_BLOCK = 8
@@ -174,6 +181,234 @@ def _dot2_f16(
         acc_u += (wu * xv).reduce_add()
         i += stride
     return SIMD[DType.float32, 2](warp.sum(acc_g), warp.sum(acc_u))
+
+
+def _q4k_fill_xsum_shared(
+    xs: UnsafePointer[
+        Float16, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    xsum: UnsafePointer[
+        Float32, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    n_cols: Int,
+    tid: Int,
+):
+    """Per-32-column x segment sums, staged from the SHARED normed x (same
+    loads and reduction as _q4k_fill_xsum over global x, so the sums are
+    bit-identical to what the separate-kernel chain computes)."""
+    segs = n_cols // 32
+    var s = tid
+    while s < segs:
+        xv = (xs + s * 32).load[width=32, alignment=64]().cast[DType.float32]()
+        xsum[s] = xv.reduce_add()
+        s += 256
+    barrier()
+
+
+def _dot_q4k(
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    row: Int,
+    xs: UnsafePointer[
+        Float16, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    xsum: UnsafePointer[
+        Float32, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    lut: UnsafePointer[
+        Float32, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    n_cols: Int,
+    lane: Int,
+) -> Float32:
+    # Warp-cooperative Q4_K row dot against shared x; identical accumulation
+    # order to _gemv_q4_k_row_acc (gemv2.mojo), only the x address space
+    # differs.
+    blocks_per_row = n_cols // 256
+    row_base = row * blocks_per_row * 144
+    halves = blocks_per_row * 2
+
+    var acc: Float32 = 0.0
+    var min_acc: Float32 = 0.0
+    var c = lane
+    while c < halves:
+        b = c // 2
+        q = (c % 2) * 2
+        off = row_base + b * 144
+        hdr = (w + off).load[width=16, alignment=16]()
+        dm = bitcast[DType.float16, 8](hdr)
+        d = Float32(dm[0])
+        dmin = Float32(dm[1])
+
+        comptime for qq in range(2):
+            sc1, mn1 = _q4k_scale_min(hdr, 2 * (q + qq))
+            sc2, mn2 = _q4k_scale_min(hdr, 2 * (q + qq) + 1)
+            qv = (w + off + 16 + (q + qq) * 32).load[width=32, alignment=16]()
+            col = (c * 2 + qq) * 64
+            var dot0 = SIMD[DType.float32, 8](0.0)
+            var dot1 = SIMD[DType.float32, 8](0.0)
+            comptime for k in range(4):
+                q8 = qv.slice[8, offset = k * 8]()
+                var lov = SIMD[DType.float32, 8]()
+                var hiv = SIMD[DType.float32, 8]()
+                comptime for j in range(8):
+                    lov[j] = lut[Int(q8[j] & 0x0F)]
+                    hiv[j] = lut[Int(q8[j] >> 4)]
+                x0 = (xs + col + k * 8).load[width=8, alignment=16]().cast[DType.float32]()
+                x1 = (xs + col + 32 + k * 8).load[width=8, alignment=16]().cast[DType.float32]()
+                dot0 += lov * x0
+                dot1 += hiv * x1
+            acc += dot0.reduce_add() * (d * sc1) + dot1.reduce_add() * (d * sc2)
+            seg = (c * 2 + qq) * 2
+            min_acc += dmin * (mn1 * xsum[seg] + mn2 * xsum[seg + 1])
+        c += WARP
+    return warp.sum(acc - min_acc)
+
+
+def _dot2_q4k(
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    row_g: Int,
+    row_u: Int,
+    xs: UnsafePointer[
+        Float16, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    xsum: UnsafePointer[
+        Float32, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    lut: UnsafePointer[
+        Float32, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    n_cols: Int,
+    lane: Int,
+) -> SIMD[DType.float32, 2]:
+    # Two-row Q4_K dot with interleaved loads (the gate/up pair of a SwiGLU
+    # FFN): per-row accumulation order matches _dot_q4k exactly, but the two
+    # rows' header/nibble loads overlap in the memory pipeline instead of
+    # running as two sequential latency-bound passes (440 -> ~630 GB/s on the
+    # 28672x4096 Mistral gate|up shape at rows_per_warp 7-8, RTX 4090; a
+    # 2-warp team split was measured slower — the per-iteration block
+    # barriers and doubled norm recompute cost more than the extra
+    # parallelism buys).
+    blocks_per_row = n_cols // 256
+    base_g = row_g * blocks_per_row * 144
+    base_u = row_u * blocks_per_row * 144
+    halves = blocks_per_row * 2
+
+    var acc_g: Float32 = 0.0
+    var min_g: Float32 = 0.0
+    var acc_u: Float32 = 0.0
+    var min_u: Float32 = 0.0
+    var c = lane
+    while c < halves:
+        b = c // 2
+        q = (c % 2) * 2
+        off_g = base_g + b * 144
+        off_u = base_u + b * 144
+        hdr_g = (w + off_g).load[width=16, alignment=16]()
+        hdr_u = (w + off_u).load[width=16, alignment=16]()
+        dm_g = bitcast[DType.float16, 8](hdr_g)
+        dm_u = bitcast[DType.float16, 8](hdr_u)
+        d_g = Float32(dm_g[0])
+        dmin_g = Float32(dm_g[1])
+        d_u = Float32(dm_u[0])
+        dmin_u = Float32(dm_u[1])
+
+        comptime for qq in range(2):
+            sc1g, mn1g = _q4k_scale_min(hdr_g, 2 * (q + qq))
+            sc2g, mn2g = _q4k_scale_min(hdr_g, 2 * (q + qq) + 1)
+            sc1u, mn1u = _q4k_scale_min(hdr_u, 2 * (q + qq))
+            sc2u, mn2u = _q4k_scale_min(hdr_u, 2 * (q + qq) + 1)
+            qv_g = (w + off_g + 16 + (q + qq) * 32).load[width=32, alignment=16]()
+            qv_u = (w + off_u + 16 + (q + qq) * 32).load[width=32, alignment=16]()
+            col = (c * 2 + qq) * 64
+            var dot0g = SIMD[DType.float32, 8](0.0)
+            var dot1g = SIMD[DType.float32, 8](0.0)
+            var dot0u = SIMD[DType.float32, 8](0.0)
+            var dot1u = SIMD[DType.float32, 8](0.0)
+            comptime for k in range(4):
+                q8g = qv_g.slice[8, offset = k * 8]()
+                q8u = qv_u.slice[8, offset = k * 8]()
+                var lo_g = SIMD[DType.float32, 8]()
+                var hi_g = SIMD[DType.float32, 8]()
+                var lo_u = SIMD[DType.float32, 8]()
+                var hi_u = SIMD[DType.float32, 8]()
+                comptime for j in range(8):
+                    lo_g[j] = lut[Int(q8g[j] & 0x0F)]
+                    hi_g[j] = lut[Int(q8g[j] >> 4)]
+                    lo_u[j] = lut[Int(q8u[j] & 0x0F)]
+                    hi_u[j] = lut[Int(q8u[j] >> 4)]
+                x0 = (xs + col + k * 8).load[width=8, alignment=16]().cast[DType.float32]()
+                x1 = (xs + col + 32 + k * 8).load[width=8, alignment=16]().cast[DType.float32]()
+                dot0g += lo_g * x0
+                dot1g += hi_g * x1
+                dot0u += lo_u * x0
+                dot1u += hi_u * x1
+            acc_g += dot0g.reduce_add() * (d_g * sc1g) + dot1g.reduce_add() * (d_g * sc2g)
+            acc_u += dot0u.reduce_add() * (d_u * sc1u) + dot1u.reduce_add() * (d_u * sc2u)
+            seg = (c * 2 + qq) * 2
+            min_g += dmin_g * (mn1g * xsum[seg] + mn2g * xsum[seg + 1])
+            min_u += dmin_u * (mn1u * xsum[seg] + mn2u * xsum[seg + 1])
+        c += WARP
+    return SIMD[DType.float32, 2](warp.sum(acc_g - min_g), warp.sum(acc_u - min_u))
+
+
+def _dot_q6k(
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    row: Int,
+    xs: UnsafePointer[
+        Float16, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    n_cols: Int,
+    lane: Int,
+) -> Float32:
+    # Warp-cooperative Q6_K row dot against shared x; identical accumulation
+    # order to _gemv_q6_k_row_acc (gemv2.mojo).
+    blocks_per_row = n_cols // 256
+    row_base = row * blocks_per_row * 210
+    halves = blocks_per_row * 2
+
+    var acc: Float32 = 0.0
+    var c = lane
+    while c < halves:
+        b = c // 2
+        n = c % 2
+        off = row_base + b * 210
+        d = Float32((w + off + 208).bitcast[Float16]()[0])
+        sc16 = (w + off + 192 + n * 8).bitcast[UInt16]().load[width=4]()
+        sc = bitcast[DType.int8, 8](sc16).cast[DType.float32]()
+        ql16a = (w + off + n * 64).bitcast[UInt16]().load[width=16]()
+        ql16b = (w + off + n * 64 + 32).bitcast[UInt16]().load[width=16]()
+        qh16 = (w + off + 128 + n * 32).bitcast[UInt16]().load[width=16]()
+        ql_a = bitcast[DType.uint8, 32](ql16a)
+        ql_b = bitcast[DType.uint8, 32](ql16b)
+        qh = bitcast[DType.uint8, 32](qh16)
+
+        col = c * 128
+        x1 = (xs + col).load[width=32, alignment=64]().cast[DType.float32]()
+        x2 = (xs + col + 32).load[width=32, alignment=64]().cast[DType.float32]()
+        x3 = (xs + col + 64).load[width=32, alignment=64]().cast[DType.float32]()
+        x4 = (xs + col + 96).load[width=32, alignment=64]().cast[DType.float32]()
+
+        q1 = (((ql_a & 0x0F) | ((qh & 3) << 4)).cast[DType.int32]() - 32).cast[DType.float32]()
+        q2 = (((ql_b & 0x0F) | (((qh >> 2) & 3) << 4)).cast[DType.int32]() - 32).cast[DType.float32]()
+        q3 = (((ql_a >> 4) | (((qh >> 4) & 3) << 4)).cast[DType.int32]() - 32).cast[DType.float32]()
+        q4 = (((ql_b >> 4) | ((qh >> 6) << 4)).cast[DType.int32]() - 32).cast[DType.float32]()
+
+        p1 = q1 * x1
+        p2 = q2 * x2
+        p3 = q3 * x3
+        p4 = q4 * x4
+        var blk: Float32 = 0.0
+        blk += sc[0] * p1.slice[16, offset=0]().reduce_add()
+        blk += sc[1] * p1.slice[16, offset=16]().reduce_add()
+        blk += sc[2] * p2.slice[16, offset=0]().reduce_add()
+        blk += sc[3] * p2.slice[16, offset=16]().reduce_add()
+        blk += sc[4] * p3.slice[16, offset=0]().reduce_add()
+        blk += sc[5] * p3.slice[16, offset=16]().reduce_add()
+        blk += sc[6] * p4.slice[16, offset=0]().reduce_add()
+        blk += sc[7] * p4.slice[16, offset=16]().reduce_add()
+        acc += d * blk
+        c += WARP
+    return warp.sum(acc)
 
 
 def _f8e4m3s(b: UInt8) -> Float32:
@@ -350,6 +585,68 @@ def gemv_norm_nvfp4_f16(
                 y[row] = Float16(total)
 
 
+def gemv_norm_q4_k_f16(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    h: UnsafePointer[Float16, MutAnyOrigin],
+    h32: UnsafePointer[Float32, MutAnyOrigin],
+    norm_w: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    ss_from_h16: Int,
+    eps: Float32,
+    rows_per_warp: Int,
+):
+    xs = stack_allocation[
+        MAX_HIDDEN, Float16, alignment=64, address_space = AddressSpace.SHARED
+    ]()
+    xsum = stack_allocation[
+        Q4K_MAX_SEGS, Float32, address_space = AddressSpace.SHARED
+    ]()
+    lut = stack_allocation[16, Float32, address_space = AddressSpace.SHARED]()
+    tid = Int(thread_idx.x)
+    if tid < 16:
+        lut[tid] = Float32(tid)
+    _norm_x_to_shared(xs, h, h32, norm_w, n_cols, ss_from_h16, eps)
+    barrier()
+    _q4k_fill_xsum_shared(xs, xsum, n_cols, tid)
+    lane = tid % WARP
+    wid = tid // WARP
+    for i in range(rows_per_warp):
+        row = (Int(block_idx.x) * rows_per_warp + i) * ROWS_PER_BLOCK + wid
+        if row < n_rows:
+            total = _dot_q4k(w, row, xs, xsum, lut, n_cols, lane)
+            if lane == 0:
+                y[row] = Float16(total)
+
+
+def gemv_norm_q6_k_f16(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    h: UnsafePointer[Float16, MutAnyOrigin],
+    h32: UnsafePointer[Float32, MutAnyOrigin],
+    norm_w: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    ss_from_h16: Int,
+    eps: Float32,
+    rows_per_warp: Int,
+):
+    xs = stack_allocation[
+        MAX_HIDDEN, Float16, alignment=64, address_space = AddressSpace.SHARED
+    ]()
+    _norm_x_to_shared(xs, h, h32, norm_w, n_cols, ss_from_h16, eps)
+    barrier()
+    lane = Int(thread_idx.x) % WARP
+    wid = Int(thread_idx.x) // WARP
+    for i in range(rows_per_warp):
+        row = (Int(block_idx.x) * rows_per_warp + i) * ROWS_PER_BLOCK + wid
+        if row < n_rows:
+            total = _dot_q6k(w, row, xs, n_cols, lane)
+            if lane == 0:
+                y[row] = Float16(total)
+
+
 def gemv_norm_f16(
     y: UnsafePointer[Float16, MutAnyOrigin],
     w: UnsafePointer[Float16, MutAnyOrigin],
@@ -444,6 +741,69 @@ def gemv_norm_silu_nvfp4_f16(
             if lane == 0:
                 g = Float32(Float16(gu[0]))
                 act[row] = Float16(g / (1.0 + exp(-g)) * Float32(Float16(gu[1])))
+
+
+def gemv_norm_silu_q4_k_f16(
+    act: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    h: UnsafePointer[Float16, MutAnyOrigin],
+    h32: UnsafePointer[Float32, MutAnyOrigin],
+    norm_w: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    inter: Int,
+    eps: Float32,
+    rows_per_warp: Int,
+):
+    xs = stack_allocation[
+        MAX_HIDDEN, Float16, alignment=64, address_space = AddressSpace.SHARED
+    ]()
+    xsum = stack_allocation[
+        Q4K_MAX_SEGS, Float32, address_space = AddressSpace.SHARED
+    ]()
+    lut = stack_allocation[16, Float32, address_space = AddressSpace.SHARED]()
+    tid = Int(thread_idx.x)
+    if tid < 16:
+        lut[tid] = Float32(tid)
+    _norm_x_to_shared(xs, h, h32, norm_w, n_cols, 0, eps)
+    barrier()
+    _q4k_fill_xsum_shared(xs, xsum, n_cols, tid)
+    lane = tid % WARP
+    wid = tid // WARP
+    for i in range(rows_per_warp):
+        row = (Int(block_idx.x) * rows_per_warp + i) * ROWS_PER_BLOCK + wid
+        if row < inter:
+            gu = _dot2_q4k(w, row, inter + row, xs, xsum, lut, n_cols, lane)
+            if lane == 0:
+                g = Float32(Float16(gu[0]))
+                act[row] = Float16(g / (1.0 + exp(-g)) * Float32(Float16(gu[1])))
+
+
+def gemv_norm_silu_q6_k_f16(
+    act: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    h: UnsafePointer[Float16, MutAnyOrigin],
+    h32: UnsafePointer[Float32, MutAnyOrigin],
+    norm_w: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    inter: Int,
+    eps: Float32,
+    rows_per_warp: Int,
+):
+    xs = stack_allocation[
+        MAX_HIDDEN, Float16, alignment=64, address_space = AddressSpace.SHARED
+    ]()
+    _norm_x_to_shared(xs, h, h32, norm_w, n_cols, 0, eps)
+    barrier()
+    lane = Int(thread_idx.x) % WARP
+    wid = Int(thread_idx.x) // WARP
+    for i in range(rows_per_warp):
+        row = (Int(block_idx.x) * rows_per_warp + i) * ROWS_PER_BLOCK + wid
+        if row < inter:
+            gt = _dot_q6k(w, row, xs, n_cols, lane)
+            ut = _dot_q6k(w, inter + row, xs, n_cols, lane)
+            if lane == 0:
+                g = Float32(Float16(gt))
+                act[row] = Float16(g / (1.0 + exp(-g)) * Float32(Float16(ut)))
 
 
 def gemv_norm_silu_f16(
@@ -550,6 +910,56 @@ def gemv_residual_nvfp4_f16(
         acc += s * ((lov * x_even).reduce_add() + (hiv * x_odd).reduce_add())
         g += WARP
     total = warp.sum(acc)
+    if lane == 0:
+        v = Float32(h_io[row]) + Float32(Float16(total))
+        h_io[row] = Float16(v)
+        h32[row] = v
+
+
+def gemv_residual_q4_k_f16(
+    h_io: UnsafePointer[Float16, MutAnyOrigin],
+    h32: UnsafePointer[Float32, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    # x is global (the producing kernel materialized it); the xsum/lut staging
+    # runs block-wide BEFORE the row guard so its barrier stays uniform.
+    xsum = stack_allocation[
+        Q4K_MAX_SEGS, Float32, address_space = AddressSpace.SHARED
+    ]()
+    lut = stack_allocation[16, Float32, address_space = AddressSpace.SHARED]()
+    tid = Int(thread_idx.x)
+    if tid < 16:
+        lut[tid] = Float32(tid)
+    _q4k_fill_xsum(x, xsum, n_cols, tid)
+    lane = tid % WARP
+    wid = tid // WARP
+    row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    if row >= n_rows:
+        return
+    total = warp.sum(_gemv_q4_k_row_acc(w, x, xsum, lut, n_cols, row, lane))
+    if lane == 0:
+        v = Float32(h_io[row]) + Float32(Float16(total))
+        h_io[row] = Float16(v)
+        h32[row] = v
+
+
+def gemv_residual_q6_k_f16(
+    h_io: UnsafePointer[Float16, MutAnyOrigin],
+    h32: UnsafePointer[Float32, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    lane = Int(thread_idx.x) % WARP
+    wid = Int(thread_idx.x) // WARP
+    row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    if row >= n_rows:
+        return
+    total = warp.sum(_gemv_q6_k_row_acc(w, x, n_cols, row, lane))
     if lane == 0:
         v = Float32(h_io[row]) + Float32(Float16(total))
         h_io[row] = Float16(v)

@@ -3,6 +3,7 @@ from std.time import perf_counter_ns
 from src.nvfp4 import gemv_nvfp4_f16
 from src.gemv import gemv_q8_0_f16, gemv_f16
 from src.gemv2 import gemv_q8_0_f16_v2, gemv_nvfp4_f16_v2, gemv_f16_v2, gemv_q4_k_f16_v2
+from src.gemv2 import gemv_q6_k_f16_v2
 
 def main() raises:
     var ctx = DeviceContext()
@@ -78,6 +79,20 @@ def main() raises:
     ms = Float64(t1 - t0) / 1e6 / ITERS
     bytes_read = Float64(ROWSQ) * Float64(COLS // 256) * 144.0
     print("q4_k gemv v2:", ms, "ms  ", bytes_read / (ms / 1e3) / 1e9, "GB/s")
+
+    # q6_k v2 (same 300-launch warmup)
+    var wk6 = ctx.enqueue_create_buffer[DType.uint8](ROWSQ * (COLS // 256) * 210)
+    for _ in range(300):
+        ctx.enqueue_function[gemv_q6_k_f16_v2](y.unsafe_ptr(), wk6.unsafe_ptr(), x.unsafe_ptr(), COLS, ROWSQ, grid_dim=(ROWSQ + 7) // 8, block_dim=256)
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    for _ in range(ITERS):
+        ctx.enqueue_function[gemv_q6_k_f16_v2](y.unsafe_ptr(), wk6.unsafe_ptr(), x.unsafe_ptr(), COLS, ROWSQ, grid_dim=(ROWSQ + 7) // 8, block_dim=256)
+    ctx.synchronize()
+    t1 = perf_counter_ns()
+    ms = Float64(t1 - t0) / 1e6 / ITERS
+    bytes_read = Float64(ROWSQ) * Float64(COLS // 256) * 210.0
+    print("q6_k gemv v2:", ms, "ms  ", bytes_read / (ms / 1e3) / 1e9, "GB/s")
 
     # f16 v1 vs v2 (lm_head shape: 151936 x 1024 mimicked by 32000x4096)
     var wf = ctx.enqueue_create_buffer[DType.float16](ROWSQ * COLS)

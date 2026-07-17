@@ -34,6 +34,12 @@ pub enum DevWeight {
         rows: usize,
         cols: usize,
     },
+    /// GGML Q6_K superblock stream (210 bytes / 256 elements) for [rows, cols].
+    Q6K {
+        buf: DevBuffer,
+        rows: usize,
+        cols: usize,
+    },
     /// NVFP4 packed + FP8 scales (+ inverse global scale) for [rows, cols].
     NvFp4 {
         packed: DevBuffer,
@@ -50,6 +56,7 @@ impl DevWeight {
             DevWeight::F16 { rows, .. }
             | DevWeight::Q8_0 { rows, .. }
             | DevWeight::Q4K { rows, .. }
+            | DevWeight::Q6K { rows, .. }
             | DevWeight::NvFp4 { rows, .. } => *rows,
         }
     }
@@ -59,16 +66,20 @@ impl DevWeight {
             DevWeight::F16 { cols, .. }
             | DevWeight::Q8_0 { cols, .. }
             | DevWeight::Q4K { cols, .. }
+            | DevWeight::Q6K { cols, .. }
             | DevWeight::NvFp4 { cols, .. } => *cols,
         }
     }
 }
 
 /// Q/K/V projections: one row-concatenated matrix when the three share a
-/// storage format (single GEMV/GEMM launch, single copy in VRAM), separate
-/// matrices otherwise. Fused row order is q, then k, then v.
+/// storage format (single GEMV/GEMM launch, single copy in VRAM). When only
+/// v differs (Q4_K_M stores attn_v as Q6_K), q and k still fuse into one
+/// matrix and v stays separate — two launches instead of three. Fused row
+/// order is q, then k, then v.
 pub enum QkvWeights {
     Fused(DevWeight),
+    FusedQk { qk: DevWeight, v: DevWeight },
     Split {
         q: DevWeight,
         k: DevWeight,
@@ -105,8 +116,10 @@ pub struct ModelWeights {
     pub lm_head: DevWeight,
     pub layers: Vec<LayerWeights>,
     /// Layers whose Q/K/V (resp. gate/up) landed as one fused matrix — the
-    /// rest fell back to split storage (format or NVFP4 global-scale mismatch).
+    /// rest fell back to q|k fusion with separate v, or fully split storage
+    /// (format or NVFP4 global-scale mismatch).
     pub fused_qkv_layers: usize,
+    pub fused_qk_layers: usize,
     pub fused_gate_up_layers: usize,
 }
 
@@ -306,6 +319,11 @@ enum HostWeight {
         rows: usize,
         cols: usize,
     },
+    Q6K {
+        data: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    },
     NvFp4 {
         packed: Vec<u8>,
         scales: Vec<u8>,
@@ -321,6 +339,7 @@ impl HostWeight {
             HostWeight::F16 { rows, .. }
             | HostWeight::Q8_0 { rows, .. }
             | HostWeight::Q4K { rows, .. }
+            | HostWeight::Q6K { rows, .. }
             | HostWeight::NvFp4 { rows, .. } => *rows,
         }
     }
@@ -330,6 +349,7 @@ impl HostWeight {
             HostWeight::F16 { cols, .. }
             | HostWeight::Q8_0 { cols, .. }
             | HostWeight::Q4K { cols, .. }
+            | HostWeight::Q6K { cols, .. }
             | HostWeight::NvFp4 { cols, .. } => *cols,
         }
     }
@@ -390,6 +410,9 @@ fn fetch_matrix(src: &dyn TensorSource, name: &str) -> Result<HostWeight> {
         QuantKind::Q4K if cols.is_multiple_of(256) && cols <= 32768 => {
             Ok(HostWeight::Q4K { data, rows, cols })
         }
+        // Q6_K superblocks are only 2-byte aligned (210 bytes); the kernels
+        // load them as u16 lanes, so only whole superblocks per row matter.
+        QuantKind::Q6K if cols.is_multiple_of(256) => Ok(HostWeight::Q6K { data, rows, cols }),
         // Everything else goes through f32 → f16. This covers F16/F32/BF16
         // directly and any other GGML quant via the CPU reference dequant —
         // correctness first; fused kernels for more quants land per PLAN.
@@ -418,6 +441,11 @@ fn upload_weight(device: &dyn Device, w: HostWeight) -> Result<DevWeight> {
             cols,
         }),
         HostWeight::Q4K { data, rows, cols } => Ok(DevWeight::Q4K {
+            buf: upload(device, &data)?,
+            rows,
+            cols,
+        }),
+        HostWeight::Q6K { data, rows, cols } => Ok(DevWeight::Q6K {
             buf: upload(device, &data)?,
             rows,
             cols,
@@ -454,6 +482,7 @@ fn fuse_rows(mut parts: Vec<HostWeight>) -> std::result::Result<HostWeight, Vec<
         HostWeight::F16 { .. } if parts.iter().all(|p| matches!(p, HostWeight::F16 { .. })) => {}
         HostWeight::Q8_0 { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q8_0 { .. })) => {}
         HostWeight::Q4K { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q4K { .. })) => {}
+        HostWeight::Q6K { .. } if parts.iter().all(|p| matches!(p, HostWeight::Q6K { .. })) => {}
         HostWeight::NvFp4 { global_scale, .. } => {
             let gs = global_scale.to_bits();
             let ok = parts.iter().all(
@@ -471,7 +500,8 @@ fn fuse_rows(mut parts: Vec<HostWeight>) -> std::result::Result<HostWeight, Vec<
         match (&mut fused, p) {
             (HostWeight::F16 { data, .. }, HostWeight::F16 { data: d, .. })
             | (HostWeight::Q8_0 { data, .. }, HostWeight::Q8_0 { data: d, .. })
-            | (HostWeight::Q4K { data, .. }, HostWeight::Q4K { data: d, .. }) => {
+            | (HostWeight::Q4K { data, .. }, HostWeight::Q4K { data: d, .. })
+            | (HostWeight::Q6K { data, .. }, HostWeight::Q6K { data: d, .. }) => {
                 data.extend_from_slice(&d)
             }
             (
@@ -492,6 +522,7 @@ fn fuse_rows(mut parts: Vec<HostWeight>) -> std::result::Result<HostWeight, Vec<
         HostWeight::F16 { rows: r, .. }
         | HostWeight::Q8_0 { rows: r, .. }
         | HostWeight::Q4K { rows: r, .. }
+        | HostWeight::Q6K { rows: r, .. }
         | HostWeight::NvFp4 { rows: r, .. } => *r = rows,
     }
     Ok(fused)
@@ -614,6 +645,7 @@ impl ModelWeights {
 
         let mut layers = Vec::with_capacity(descriptor.params.block_count);
         let mut fused_qkv_layers = 0usize;
+        let mut fused_qk_layers = 0usize;
         let mut fused_gate_up_layers = 0usize;
         for (idx, layer_map) in descriptor.layers.iter().enumerate() {
             let name = |role: WeightRole| -> Result<&String> {
@@ -638,10 +670,23 @@ impl ModelWeights {
                     let v = parts.pop().expect("three parts");
                     let k = parts.pop().expect("three parts");
                     let q = parts.pop().expect("three parts");
-                    QkvWeights::Split {
-                        q: upload_weight(device, q)?,
-                        k: upload_weight(device, k)?,
-                        v: upload_weight(device, v)?,
+                    match fuse_rows(vec![q, k]) {
+                        Ok(qk) => {
+                            fused_qk_layers += 1;
+                            QkvWeights::FusedQk {
+                                qk: upload_weight(device, qk)?,
+                                v: upload_weight(device, v)?,
+                            }
+                        }
+                        Err(mut qk_parts) => {
+                            let k = qk_parts.pop().expect("two parts");
+                            let q = qk_parts.pop().expect("two parts");
+                            QkvWeights::Split {
+                                q: upload_weight(device, q)?,
+                                k: upload_weight(device, k)?,
+                                v: upload_weight(device, v)?,
+                            }
+                        }
                     }
                 }
             };
@@ -695,6 +740,7 @@ impl ModelWeights {
             lm_head,
             layers,
             fused_qkv_layers,
+            fused_qk_layers,
             fused_gate_up_layers,
         })
     }
@@ -710,6 +756,10 @@ impl ModelWeights {
         m.insert(
             "fused_qkv_layers".into(),
             self.fused_qkv_layers.to_string(),
+        );
+        m.insert(
+            "fused_qk_layers".into(),
+            self.fused_qk_layers.to_string(),
         );
         m.insert(
             "fused_gate_up_layers".into(),

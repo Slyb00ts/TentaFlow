@@ -10,6 +10,7 @@ from src.activation import silu_mul_f16
 from src.rope import rope_neox_f16
 from src.gemv import gemv_q8_0_f16, gemv_f16
 from src.gemv2 import gemv_q4_k_f16_v2, gemv_q4_k_out_f32_v2
+from src.gemv2 import gemv_q6_k_f16_v2, gemv_q6_k_out_f32_v2
 from src.attention import attn_decode_f16_hd64
 from src.kv_append import kv_append_f16
 from src.qkv_post import qkv_post_f16
@@ -270,6 +271,83 @@ def main() raises:
     print("gemv_q4_k_out_f32 max_rel_err:", max_err)
     if max_err > 0.02:
         raise Error("gemv_q4_k_out_f32_v2 numeric check FAILED")
+
+    # --- gemv q6_k (v2, warp-per-row) ---
+    # 210-byte superblocks (ql/qh/scales/d); CPU reference follows
+    # dequant.rs dq_q6_k exactly.
+    var wk6 = ctx.enqueue_create_buffer[DType.uint8](ROWS_K * KBLOCKS * 210)
+    var yk6 = ctx.enqueue_create_buffer[DType.float16](ROWS_K)
+    var yk6_32 = ctx.enqueue_create_buffer[DType.float32](ROWS_K)
+    var expected_k6 = List[Float32]()
+    with wk6.map_to_host() as wh, xk.map_to_host() as xh:
+        for r in range(ROWS_K):
+            var acc: Float32 = 0.0
+            for bl in range(KBLOCKS):
+                off = (r * KBLOCKS + bl) * 210
+                d = Float16(0.006 + Float32((r + bl) % 7) * 0.003)
+                for i in range(128):
+                    wh[off + i] = UInt8((r * 37 + bl * 23 + i * 11) % 256)
+                for i in range(64):
+                    wh[off + 128 + i] = UInt8((r * 29 + bl * 13 + i * 7) % 256)
+                for i in range(16):
+                    wh[off + 192 + i] = UInt8((r * 41 + bl * 31 + i * 17 + 5) % 256)
+                bits = d.to_bits()
+                wh[off + 208] = UInt8(bits & 0xFF)
+                wh[off + 209] = UInt8((bits >> 8) & 0xFF)
+                # dq_q6_k reference: two 128-halves of 4 interleaved quadrants.
+                for n2 in range(2):
+                    for l in range(32):
+                        is_ = l // 16
+                        ql_l = Int(wh[off + n2 * 64 + l])
+                        ql_h = Int(wh[off + n2 * 64 + l + 32])
+                        qh_b = Int(wh[off + 128 + n2 * 32 + l])
+                        var sc8 = InlineArray[Float32, 8](uninitialized=True)
+                        for si in range(8):
+                            var sv = Int(wh[off + 192 + n2 * 8 + si])
+                            if sv > 127:
+                                sv -= 256
+                            sc8[si] = Float32(sv)
+                        q1 = Float32(((ql_l & 0x0F) | ((qh_b & 3) << 4)) - 32)
+                        q2 = Float32(((ql_h & 0x0F) | (((qh_b >> 2) & 3) << 4)) - 32)
+                        q3 = Float32(((ql_l >> 4) | (((qh_b >> 4) & 3) << 4)) - 32)
+                        q4 = Float32(((ql_h >> 4) | (((qh_b >> 6) & 3) << 4)) - 32)
+                        base_col = bl * 256 + n2 * 128
+                        acc += Float32(d) * sc8[is_] * q1 * Float32(xh[base_col + l])
+                        acc += Float32(d) * sc8[2 + is_] * q2 * Float32(xh[base_col + l + 32])
+                        acc += Float32(d) * sc8[4 + is_] * q3 * Float32(xh[base_col + l + 64])
+                        acc += Float32(d) * sc8[6 + is_] * q4 * Float32(xh[base_col + l + 96])
+            expected_k6.append(acc)
+    ctx.enqueue_function[gemv_q6_k_f16_v2](
+        yk6.unsafe_ptr(), wk6.unsafe_ptr(), xk.unsafe_ptr(), COLS_K, ROWS_K,
+        grid_dim=(ROWS_K + 7) // 8, block_dim=256,
+    )
+    ctx.enqueue_function[gemv_q6_k_out_f32_v2](
+        yk6_32.unsafe_ptr(), wk6.unsafe_ptr(), xk.unsafe_ptr(), COLS_K, ROWS_K,
+        grid_dim=(ROWS_K + 7) // 8, block_dim=256,
+    )
+    ctx.synchronize()
+
+    max_err = 0.0
+    with yk6.map_to_host() as yh:
+        for r in range(ROWS_K):
+            err = abs(Float32(yh[r]) - expected_k6[r])
+            rel = err / (abs(expected_k6[r]) + 1.0)
+            if rel > max_err:
+                max_err = rel
+    print("gemv_q6_k max_rel_err:", max_err)
+    if max_err > 0.02:
+        raise Error("gemv_q6_k_f16_v2 numeric check FAILED")
+
+    max_err = 0.0
+    with yk6_32.map_to_host() as yh:
+        for r in range(ROWS_K):
+            err = abs(yh[r] - expected_k6[r])
+            rel = err / (abs(expected_k6[r]) + 1.0)
+            if rel > max_err:
+                max_err = rel
+    print("gemv_q6_k_out_f32 max_rel_err:", max_err)
+    if max_err > 0.02:
+        raise Error("gemv_q6_k_out_f32_v2 numeric check FAILED")
 
     # --- gemv f16 ---
     var wf = ctx.enqueue_create_buffer[DType.float16](ROWS_G * COLS_G)

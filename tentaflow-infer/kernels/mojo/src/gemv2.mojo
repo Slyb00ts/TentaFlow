@@ -330,6 +330,109 @@ def gemv_q4_k_out_f32_v2(
         y[row] = total
 
 
+def _gemv_q6_k_row_acc(
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    row: Int,
+    lane: Int,
+) -> Float32:
+    """Per-lane partial dot product for one Q6_K row (210-byte superblock:
+    ql[128] low nibbles, qh[64] 2-bit highs, 16 int8 scales, d f16; value =
+    d * sc * ((ql | qh<<4) - 32), dequant.rs dq_q6_k semantics).
+
+    Work unit is a 128-element half of a 256-element superblock: lanes stride
+    halves so 4096-column rows keep all 32 lanes busy. The 210-byte block is
+    only 2-byte aligned, so ql/qh/scales load as u16 lanes and reinterpret
+    (same trade as gemv_q8_0). Values decode arithmetically — 6-bit codes have
+    no compact LUT and the I2F converts overlap the loads.
+    """
+    blocks_per_row = n_cols // 256
+    row_base = row * blocks_per_row * 210
+    halves = blocks_per_row * 2
+
+    var acc: Float32 = 0.0
+    var c = lane
+    while c < halves:
+        b = c // 2
+        n = c % 2
+        off = row_base + b * 210
+        d = Float32((w + off + 208).bitcast[Float16]()[0])
+        sc16 = (w + off + 192 + n * 8).bitcast[UInt16]().load[width=4]()
+        sc = bitcast[DType.int8, 8](sc16).cast[DType.float32]()
+        ql16a = (w + off + n * 64).bitcast[UInt16]().load[width=16]()
+        ql16b = (w + off + n * 64 + 32).bitcast[UInt16]().load[width=16]()
+        qh16 = (w + off + 128 + n * 32).bitcast[UInt16]().load[width=16]()
+        ql_a = bitcast[DType.uint8, 32](ql16a)
+        ql_b = bitcast[DType.uint8, 32](ql16b)
+        qh = bitcast[DType.uint8, 32](qh16)
+
+        col = c * 128
+        x1 = (x + col).load[width=32, alignment=64]().cast[DType.float32]()
+        x2 = (x + col + 32).load[width=32, alignment=64]().cast[DType.float32]()
+        x3 = (x + col + 64).load[width=32, alignment=64]().cast[DType.float32]()
+        x4 = (x + col + 96).load[width=32, alignment=64]().cast[DType.float32]()
+
+        q1 = (((ql_a & 0x0F) | ((qh & 3) << 4)).cast[DType.int32]() - 32).cast[DType.float32]()
+        q2 = (((ql_b & 0x0F) | (((qh >> 2) & 3) << 4)).cast[DType.int32]() - 32).cast[DType.float32]()
+        q3 = (((ql_a >> 4) | (((qh >> 4) & 3) << 4)).cast[DType.int32]() - 32).cast[DType.float32]()
+        q4 = (((ql_b >> 4) | ((qh >> 6) << 4)).cast[DType.int32]() - 32).cast[DType.float32]()
+
+        p1 = q1 * x1
+        p2 = q2 * x2
+        p3 = q3 * x3
+        p4 = q4 * x4
+        var blk: Float32 = 0.0
+        blk += sc[0] * p1.slice[16, offset=0]().reduce_add()
+        blk += sc[1] * p1.slice[16, offset=16]().reduce_add()
+        blk += sc[2] * p2.slice[16, offset=0]().reduce_add()
+        blk += sc[3] * p2.slice[16, offset=16]().reduce_add()
+        blk += sc[4] * p3.slice[16, offset=0]().reduce_add()
+        blk += sc[5] * p3.slice[16, offset=16]().reduce_add()
+        blk += sc[6] * p4.slice[16, offset=0]().reduce_add()
+        blk += sc[7] * p4.slice[16, offset=16]().reduce_add()
+        acc += d * blk
+        c += WARP
+    return acc
+
+
+def gemv_q6_k_f16_v2(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    """Q6_K GEMV, one warp per row. Grid.x = ceil(n_rows / 8), block = 256,
+    n_cols % 256 == 0 (whole superblocks per row)."""
+    lane = Int(thread_idx.x) % WARP
+    wid = Int(thread_idx.x) // WARP
+    row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    if row >= n_rows:
+        return
+    total = warp.sum(_gemv_q6_k_row_acc(w, x, n_cols, row, lane))
+    if lane == 0:
+        y[row] = Float16(total)
+
+
+def gemv_q6_k_out_f32_v2(
+    y: UnsafePointer[Float32, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    """Q6_K logit GEMV (f32 out), warp-per-row."""
+    lane = Int(thread_idx.x) % WARP
+    wid = Int(thread_idx.x) // WARP
+    row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    if row >= n_rows:
+        return
+    total = warp.sum(_gemv_q6_k_row_acc(w, x, n_cols, row, lane))
+    if lane == 0:
+        y[row] = total
+
+
 def gemv_f16_v2(
     y: UnsafePointer[Float16, MutAnyOrigin],
     w: UnsafePointer[Float16, MutAnyOrigin],

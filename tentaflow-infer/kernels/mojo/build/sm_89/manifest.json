@@ -52,6 +52,16 @@
     "gemv_residual_q8_0_f16": {"file": "gemv_residual_q8_0_f16.ptx", "entry": "src_decode_fused_gemv_residual6A6A6A6A_f84aadaa72b6a31c"},
     "gemv_residual_nvfp4_f16": {"file": "gemv_residual_nvfp4_f16.ptx", "entry": "src_decode_fused_gemv_residual6A6A6A6A_39f61c92383bc606"},
     "gemv_residual_f16": {"file": "gemv_residual_f16.ptx", "entry": "src_decode_fused_gemv_residual6A6A6A6A_0a9df7a79fa19730"},
-    "rmsnorm_h32_f16": {"file": "rmsnorm_h32_f16.ptx", "entry": "src_decode_fused_rmsnorm_h32_f6A6A6A6A_afeaf2c4402b7adf"}
+    "rmsnorm_h32_f16": {"file": "rmsnorm_h32_f16.ptx", "entry": "src_decode_fused_rmsnorm_h32_f6A6A6A6A_afeaf2c4402b7adf"},
+    "gemv_q6_k_f16_v2": {"file": "gemv_q6_k_f16_v2.ptx", "entry": "src_gemv2_gemv_q6_k_f16_v2_P6A6A6A6AoA6A6A_11bdfb413b930cb5"},
+    "gemv_q6_k_out_f32_v2": {"file": "gemv_q6_k_out_f32_v2.ptx", "entry": "src_gemv2_gemv_q6_k_out_f32_v26A6A6A6A_5a3694ae234ec813"},
+    "gemm_q6_k_f16": {"file": "gemm_q6_k_f16.ptx", "entry": "src_gemm_gemm_q6_k_impl_SIMD6A6A6A6AcB6A6A_d7d91c126d77cf39"},
+    "gemm_q6_k_f16_bm64": {"file": "gemm_q6_k_f16_bm64.ptx", "entry": "src_gemm_gemm_q6_k_impl_SIMD6A6A6A6AcB6A6A_2c3e22aef69163fc"},
+    "gemv_norm_q4_k_f16": {"file": "gemv_norm_q4_k_f16.ptx", "entry": "src_decode_fused_gemv_norm_q4_6A6A6A6A_75dc46968908c9e3"},
+    "gemv_norm_q6_k_f16": {"file": "gemv_norm_q6_k_f16.ptx", "entry": "src_decode_fused_gemv_norm_q6_6A6A6A6A_6a800882ee8a7168"},
+    "gemv_norm_silu_q4_k_f16": {"file": "gemv_norm_silu_q4_k_f16.ptx", "entry": "src_decode_fused_gemv_norm_sil6A6A6A6A_9a418e26c41372df"},
+    "gemv_norm_silu_q6_k_f16": {"file": "gemv_norm_silu_q6_k_f16.ptx", "entry": "src_decode_fused_gemv_norm_sil6A6A6A6A_f4df30bc08b6f7c6"},
+    "gemv_residual_q4_k_f16": {"file": "gemv_residual_q4_k_f16.ptx", "entry": "src_decode_fused_gemv_residual6A6A6A6A_67d3603b10363f9e"},
+    "gemv_residual_q6_k_f16": {"file": "gemv_residual_q6_k_f16.ptx", "entry": "src_decode_fused_gemv_residual6A6A6A6A_c9258724502e5c75"}
   }
 }

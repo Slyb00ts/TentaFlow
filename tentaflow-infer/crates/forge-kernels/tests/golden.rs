@@ -259,6 +259,112 @@ fn gemm_q4_k_matches_formats_dequant() {
     }
 }
 
+/// Deterministic Q6_K stream (210-byte superblocks: ql[128], qh[64],
+/// 16 int8 scales, d f16) exercising every qh shift and both nibble halves.
+fn build_q6k(rows: usize, cols: usize) -> Vec<u8> {
+    let blocks_per_row = cols / 256;
+    let mut wq = Vec::with_capacity(rows * blocks_per_row * 210);
+    for r in 0..rows {
+        for b in 0..blocks_per_row {
+            for i in 0..208 {
+                wq.push(((r * 37 + b * 23 + i * 11 + 5) % 256) as u8);
+            }
+            let d = f16::from_f32(0.006 + ((r + b) % 7) as f32 * 0.003);
+            wq.extend_from_slice(&d.to_le_bytes());
+        }
+    }
+    wq
+}
+
+#[test]
+fn gemv_q6_k_matches_formats_dequant() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    let (rows, cols) = (33usize, 512usize);
+    let wq = build_q6k(rows, cols);
+    let w_f32 =
+        forge_formats::dequant::dequantize_to_f32(DType::F32, QuantKind::Q6K, &wq, rows * cols)
+            .unwrap();
+
+    let x: Vec<f32> = (0..cols)
+        .map(|i| f16::from_f32(fill(i) * 0.1).to_f32())
+        .collect();
+    let xb = upload_f16(dev.as_ref(), &x);
+    let yb = upload_f16(dev.as_ref(), &vec![0.0; rows]);
+    let wb = dev.alloc(wq.len(), MemKind::Device, Pool::Weights).unwrap();
+    dev.write(&wq, &wb, 0).unwrap();
+
+    kernels
+        .gemv_q6_k_f16(&yb, &wb, &xb, rows, cols, &stream)
+        .unwrap();
+    dev.synchronize().unwrap();
+
+    let got = download_f16(dev.as_ref(), &yb, rows);
+    for r in 0..rows {
+        let want: f32 = (0..cols).map(|c| w_f32[r * cols + c] * x[c]).sum();
+        let rel = (got[r] - want).abs() / (want.abs() + 1.0);
+        assert!(rel < 0.02, "row {r}: got {} want {want}", got[r]);
+    }
+
+    // f32-logit variant over the same data.
+    let y32 = dev.alloc(rows * 4, MemKind::Device, Pool::Weights).unwrap();
+    kernels
+        .gemv_q6_k_out_f32(&y32, &wb, &xb, rows, cols, &stream)
+        .unwrap();
+    dev.synchronize().unwrap();
+    let mut bytes = vec![0u8; rows * 4];
+    dev.read(&y32, 0, &mut bytes).unwrap();
+    let got32: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    for r in 0..rows {
+        let want: f32 = (0..cols).map(|c| w_f32[r * cols + c] * x[c]).sum();
+        let rel = (got32[r] - want).abs() / (want.abs() + 1.0);
+        assert!(rel < 0.02, "row {r}: got {} want {want}", got32[r]);
+    }
+}
+
+#[test]
+fn gemm_q6_k_matches_formats_dequant() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    // Row/token tails on purpose (rows < 64, tokens not a tile multiple).
+    let (rows, cols, n_tokens) = (24usize, 512usize, 40usize);
+    let wq = build_q6k(rows, cols);
+    let w_f32 =
+        forge_formats::dequant::dequantize_to_f32(DType::F32, QuantKind::Q6K, &wq, rows * cols)
+            .unwrap();
+
+    let x: Vec<f32> = (0..n_tokens * cols)
+        .map(|i| f16::from_f32(fill(i) * 0.1).to_f32())
+        .collect();
+    let xb = upload_f16(dev.as_ref(), &x);
+    let yb = upload_f16(dev.as_ref(), &vec![0.0; n_tokens * rows]);
+    let wb = dev.alloc(wq.len(), MemKind::Device, Pool::Weights).unwrap();
+    dev.write(&wq, &wb, 0).unwrap();
+
+    kernels
+        .gemm_q6_k_f16(&yb, &wb, &xb, rows, cols, n_tokens, &stream)
+        .unwrap();
+    dev.synchronize().unwrap();
+
+    let got = download_f16(dev.as_ref(), &yb, n_tokens * rows);
+    for t in 0..n_tokens {
+        for r in 0..rows {
+            let want: f32 = (0..cols)
+                .map(|c| w_f32[r * cols + c] * x[t * cols + c])
+                .sum();
+            let rel = (got[t * rows + r] - want).abs() / (want.abs() + 1.0);
+            assert!(rel < 0.02, "t {t} row {r}: got {} want {want}", got[t * rows + r]);
+        }
+    }
+}
+
 #[test]
 fn gemv_nvfp4_matches_formats_dequant() {
     let Some(dev) = device() else { return };

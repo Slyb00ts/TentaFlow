@@ -13,6 +13,7 @@ from std.gpu.host import DeviceContext
 from src.norm import rmsnorm_f16, rmsnorm_residual_f16
 from src.activation import silu_mul_f16
 from src.gemv2 import gemv_q8_0_f16_v2, gemv_nvfp4_f16_v2, gemv_f16_v2
+from src.gemv2 import gemv_q4_k_f16_v2, gemv_q6_k_f16_v2
 from src.qkv_post import qkv_post_f16
 from src.attention import attn_decode_f16_hd64, attn_decode_f16_hd128
 from src.attention import attn_decode_split_f16_hd64, attn_decode_split_f16_hd128
@@ -20,6 +21,9 @@ from src.attention import attn_decode_combine_f16_hd64, attn_decode_combine_f16_
 from src.decode_fused import gemv_norm_q8_0_f16, gemv_norm_nvfp4_f16, gemv_norm_f16
 from src.decode_fused import gemv_norm_silu_q8_0_f16, gemv_norm_silu_nvfp4_f16, gemv_norm_silu_f16
 from src.decode_fused import gemv_residual_q8_0_f16, gemv_residual_nvfp4_f16, gemv_residual_f16
+from src.decode_fused import gemv_norm_q4_k_f16, gemv_norm_q6_k_f16
+from src.decode_fused import gemv_norm_silu_q4_k_f16, gemv_norm_silu_q6_k_f16
+from src.decode_fused import gemv_residual_q4_k_f16, gemv_residual_q6_k_f16
 from src.decode_fused import rmsnorm_h32_f16
 
 comptime HID = 1024
@@ -112,6 +116,59 @@ def main() raises:
         for i in range(2 * INTER * HID):
             wh[i] = Float16(_fill(i + 7) * 0.05)
 
+    # Q4_K / Q6_K streams (HID = 1024 -> 4 superblocks per row); arbitrary
+    # bytes exercise both get_scale_min_k4 branches / all qh shifts.
+    comptime K4_BPR = HID // 256
+    var wq4 = ctx.enqueue_create_buffer[DType.uint8](QROWS * K4_BPR * 144)
+    var wq4_ffn = ctx.enqueue_create_buffer[DType.uint8](2 * INTER * K4_BPR * 144)
+    with wq4.map_to_host() as wh:
+        for i in range(QROWS * K4_BPR * 144):
+            wh[i] = UInt8((i * 53 + 7) % 256)
+    with wq4_ffn.map_to_host() as wh:
+        for i in range(2 * INTER * K4_BPR * 144):
+            wh[i] = UInt8((i * 47 + 11) % 256)
+    # Superblock d/dmin bytes land wherever the pattern puts them; clamp the
+    # two f16 header fields to small magnitudes so dots stay finite.
+    with wq4.map_to_host() as wh:
+        for r in range(QROWS * K4_BPR):
+            d = Float16(0.008 + Float32(r % 7) * 0.004)
+            dmin = Float16(0.005 + Float32(r % 5) * 0.003)
+            bits = d.to_bits()
+            wh[r * 144] = UInt8(bits & 0xFF)
+            wh[r * 144 + 1] = UInt8((bits >> 8) & 0xFF)
+            bits = dmin.to_bits()
+            wh[r * 144 + 2] = UInt8(bits & 0xFF)
+            wh[r * 144 + 3] = UInt8((bits >> 8) & 0xFF)
+    with wq4_ffn.map_to_host() as wh:
+        for r in range(2 * INTER * K4_BPR):
+            d = Float16(0.008 + Float32(r % 5) * 0.004)
+            dmin = Float16(0.005 + Float32(r % 7) * 0.003)
+            bits = d.to_bits()
+            wh[r * 144] = UInt8(bits & 0xFF)
+            wh[r * 144 + 1] = UInt8((bits >> 8) & 0xFF)
+            bits = dmin.to_bits()
+            wh[r * 144 + 2] = UInt8(bits & 0xFF)
+            wh[r * 144 + 3] = UInt8((bits >> 8) & 0xFF)
+
+    var wq6 = ctx.enqueue_create_buffer[DType.uint8](QROWS * K4_BPR * 210)
+    var wq6_ffn = ctx.enqueue_create_buffer[DType.uint8](2 * INTER * K4_BPR * 210)
+    with wq6.map_to_host() as wh:
+        for i in range(QROWS * K4_BPR * 210):
+            wh[i] = UInt8((i * 37 + 3) % 256)
+        for r in range(QROWS * K4_BPR):
+            d = Float16(0.006 + Float32(r % 7) * 0.003)
+            bits = d.to_bits()
+            wh[r * 210 + 208] = UInt8(bits & 0xFF)
+            wh[r * 210 + 209] = UInt8((bits >> 8) & 0xFF)
+    with wq6_ffn.map_to_host() as wh:
+        for i in range(2 * INTER * K4_BPR * 210):
+            wh[i] = UInt8((i * 43 + 9) % 256)
+        for r in range(2 * INTER * K4_BPR):
+            d = Float16(0.006 + Float32(r % 5) * 0.003)
+            bits = d.to_bits()
+            wh[r * 210 + 208] = UInt8(bits & 0xFF)
+            wh[r * 210 + 209] = UInt8((bits >> 8) & 0xFF)
+
     var y_ref = ctx.enqueue_create_buffer[DType.float16](QROWS)
     var y_fus = ctx.enqueue_create_buffer[DType.float16](QROWS)
     var max_err: Float32 = 0.0
@@ -127,7 +184,7 @@ def main() raises:
             ctx.synchronize()
 
         for rpw in range(1, 3):
-          for fmt in range(3):
+          for fmt in range(5):
             if fmt == 0:
                 ctx.enqueue_function[gemv_q8_0_f16_v2](
                     y_ref.unsafe_ptr(), wq8.unsafe_ptr(), x_ref.unsafe_ptr(), HID, QROWS,
@@ -135,6 +192,26 @@ def main() raises:
                 )
                 ctx.enqueue_function[gemv_norm_q8_0_f16](
                     y_fus.unsafe_ptr(), wq8.unsafe_ptr(), resid.unsafe_ptr(),
+                    h32.unsafe_ptr(), nw.unsafe_ptr(), HID, QROWS, ss_case, EPS, rpw,
+                    grid_dim=(QROWS + 8 * rpw - 1) // (8 * rpw), block_dim=256,
+                )
+            elif fmt == 3:
+                ctx.enqueue_function[gemv_q4_k_f16_v2](
+                    y_ref.unsafe_ptr(), wq4.unsafe_ptr(), x_ref.unsafe_ptr(), HID, QROWS,
+                    grid_dim=(QROWS + 7) // 8, block_dim=256,
+                )
+                ctx.enqueue_function[gemv_norm_q4_k_f16](
+                    y_fus.unsafe_ptr(), wq4.unsafe_ptr(), resid.unsafe_ptr(),
+                    h32.unsafe_ptr(), nw.unsafe_ptr(), HID, QROWS, ss_case, EPS, rpw,
+                    grid_dim=(QROWS + 8 * rpw - 1) // (8 * rpw), block_dim=256,
+                )
+            elif fmt == 4:
+                ctx.enqueue_function[gemv_q6_k_f16_v2](
+                    y_ref.unsafe_ptr(), wq6.unsafe_ptr(), x_ref.unsafe_ptr(), HID, QROWS,
+                    grid_dim=(QROWS + 7) // 8, block_dim=256,
+                )
+                ctx.enqueue_function[gemv_norm_q6_k_f16](
+                    y_fus.unsafe_ptr(), wq6.unsafe_ptr(), resid.unsafe_ptr(),
                     h32.unsafe_ptr(), nw.unsafe_ptr(), HID, QROWS, ss_case, EPS, rpw,
                     grid_dim=(QROWS + 8 * rpw - 1) // (8 * rpw), block_dim=256,
                 )
@@ -186,10 +263,20 @@ def main() raises:
     var act_ref = ctx.enqueue_create_buffer[DType.float16](INTER)
     var act_fus = ctx.enqueue_create_buffer[DType.float16](INTER)
     for rpw in range(1, 3):
-      for fmt in range(3):
+      for fmt in range(5):
         if fmt == 0:
             ctx.enqueue_function[gemv_q8_0_f16_v2](
                 gu_ref.unsafe_ptr(), wq8_ffn.unsafe_ptr(), x_ref.unsafe_ptr(), HID, 2 * INTER,
+                grid_dim=(2 * INTER + 7) // 8, block_dim=256,
+            )
+        elif fmt == 3:
+            ctx.enqueue_function[gemv_q4_k_f16_v2](
+                gu_ref.unsafe_ptr(), wq4_ffn.unsafe_ptr(), x_ref.unsafe_ptr(), HID, 2 * INTER,
+                grid_dim=(2 * INTER + 7) // 8, block_dim=256,
+            )
+        elif fmt == 4:
+            ctx.enqueue_function[gemv_q6_k_f16_v2](
+                gu_ref.unsafe_ptr(), wq6_ffn.unsafe_ptr(), x_ref.unsafe_ptr(), HID, 2 * INTER,
                 grid_dim=(2 * INTER + 7) // 8, block_dim=256,
             )
         elif fmt == 1:
@@ -216,6 +303,18 @@ def main() raises:
         if fmt == 0:
             ctx.enqueue_function[gemv_norm_silu_q8_0_f16](
                 act_fus.unsafe_ptr(), wq8_ffn.unsafe_ptr(), resid.unsafe_ptr(),
+                h32.unsafe_ptr(), nw.unsafe_ptr(), HID, INTER, EPS, rpw,
+                grid_dim=(INTER + 8 * rpw - 1) // (8 * rpw), block_dim=256,
+            )
+        elif fmt == 3:
+            ctx.enqueue_function[gemv_norm_silu_q4_k_f16](
+                act_fus.unsafe_ptr(), wq4_ffn.unsafe_ptr(), resid.unsafe_ptr(),
+                h32.unsafe_ptr(), nw.unsafe_ptr(), HID, INTER, EPS, rpw,
+                grid_dim=(INTER + 8 * rpw - 1) // (8 * rpw), block_dim=256,
+            )
+        elif fmt == 4:
+            ctx.enqueue_function[gemv_norm_silu_q6_k_f16](
+                act_fus.unsafe_ptr(), wq6_ffn.unsafe_ptr(), resid.unsafe_ptr(),
                 h32.unsafe_ptr(), nw.unsafe_ptr(), HID, INTER, EPS, rpw,
                 grid_dim=(INTER + 8 * rpw - 1) // (8 * rpw), block_dim=256,
             )
@@ -251,10 +350,20 @@ def main() raises:
     with hr_init.map_to_host() as hh:
         for i in range(QROWS):
             hh[i] = Float16(_fill(i + 13) * 0.2)
-    for fmt in range(3):
+    for fmt in range(5):
         if fmt == 0:
             ctx.enqueue_function[gemv_q8_0_f16_v2](
                 y_ref.unsafe_ptr(), wq8.unsafe_ptr(), x_ref.unsafe_ptr(), HID, QROWS,
+                grid_dim=(QROWS + 7) // 8, block_dim=256,
+            )
+        elif fmt == 3:
+            ctx.enqueue_function[gemv_q4_k_f16_v2](
+                y_ref.unsafe_ptr(), wq4.unsafe_ptr(), x_ref.unsafe_ptr(), HID, QROWS,
+                grid_dim=(QROWS + 7) // 8, block_dim=256,
+            )
+        elif fmt == 4:
+            ctx.enqueue_function[gemv_q6_k_f16_v2](
+                y_ref.unsafe_ptr(), wq6.unsafe_ptr(), x_ref.unsafe_ptr(), HID, QROWS,
                 grid_dim=(QROWS + 7) // 8, block_dim=256,
             )
         elif fmt == 1:
@@ -275,6 +384,18 @@ def main() raises:
         if fmt == 0:
             ctx.enqueue_function[gemv_residual_q8_0_f16](
                 hr_io.unsafe_ptr(), hr32.unsafe_ptr(), wq8.unsafe_ptr(),
+                x_ref.unsafe_ptr(), HID, QROWS,
+                grid_dim=(QROWS + 7) // 8, block_dim=256,
+            )
+        elif fmt == 3:
+            ctx.enqueue_function[gemv_residual_q4_k_f16](
+                hr_io.unsafe_ptr(), hr32.unsafe_ptr(), wq4.unsafe_ptr(),
+                x_ref.unsafe_ptr(), HID, QROWS,
+                grid_dim=(QROWS + 7) // 8, block_dim=256,
+            )
+        elif fmt == 4:
+            ctx.enqueue_function[gemv_residual_q6_k_f16](
+                hr_io.unsafe_ptr(), hr32.unsafe_ptr(), wq6.unsafe_ptr(),
                 x_ref.unsafe_ptr(), HID, QROWS,
                 grid_dim=(QROWS + 7) // 8, block_dim=256,
             )

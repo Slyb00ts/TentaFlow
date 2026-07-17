@@ -6,6 +6,7 @@ from std.math import exp
 from src.gemm import gemm_q8_0_f16, gemm_f16, gemm_nvfp4_f16, gemm_q4_k_f16
 from src.gemm import gemm_q8_0_f16_bm64, gemm_f16_bm64, gemm_nvfp4_f16_bm64
 from src.gemm import gemm_q4_k_f16_bm64
+from src.gemm import gemm_q6_k_f16, gemm_q6_k_f16_bm64
 from src.prefill import kv_append_batch_f16, attn_prefill_f16_hd64, QT
 
 
@@ -199,6 +200,75 @@ def main() raises:
             if ya[i] != yb[i]:
                 raise Error("gemm_q4_k bm64 mismatch")
     print("gemm_q4_k bm64 bit-identical")
+
+    # --- q6_k GEMM vs CPU (24 rows, 40 tokens, 512 cols = 2 superblocks) ---
+    var wk6 = ctx.enqueue_create_buffer[DType.uint8](ROWS * KBL * 210)
+    var yk6 = ctx.enqueue_create_buffer[DType.float16](T * ROWS)
+    with wk6.map_to_host() as h:
+        for r in range(ROWS):
+            for b in range(KBL):
+                off = (r * KBL + b) * 210
+                for i in range(208):
+                    h[off + i] = UInt8((r * 37 + b * 23 + i * 11 + 5) % 256)
+                d = Float16(0.006 + Float32((r + b) % 7) * 0.003)
+                bits = d.to_bits()
+                h[off + 208] = UInt8(bits & 0xFF)
+                h[off + 209] = UInt8((bits >> 8) & 0xFF)
+
+    ctx.enqueue_function[gemm_q6_k_f16](
+        yk6.unsafe_ptr(), wk6.unsafe_ptr(), xk.unsafe_ptr(), KCOLS, ROWS, T,
+        grid_dim=((ROWS + 63) // 64, (T + 127) // 128), block_dim=256,
+    )
+    ctx.synchronize()
+
+    max_err = 0.0
+    with yk6.map_to_host() as yh, xk.map_to_host() as xh, wk6.map_to_host() as wh:
+        for t in range(T):
+            for r in range(ROWS):
+                var acc: Float32 = 0.0
+                for b in range(KBL):
+                    off = (r * KBL + b) * 210
+                    dref = Float32(Float16(0.006 + Float32((r + b) % 7) * 0.003))
+                    # dq_q6_k reference: two 128-halves of 4 quadrants.
+                    for n2 in range(2):
+                        for l in range(32):
+                            is_ = l // 16
+                            ql_l = Int(wh[off + n2 * 64 + l])
+                            ql_h = Int(wh[off + n2 * 64 + l + 32])
+                            qh_b = Int(wh[off + 128 + n2 * 32 + l])
+                            var sc8 = InlineArray[Float32, 8](uninitialized=True)
+                            for si in range(8):
+                                var sv = Int(wh[off + 192 + n2 * 8 + si])
+                                if sv > 127:
+                                    sv -= 256
+                                sc8[si] = Float32(sv)
+                            q1 = Float32(((ql_l & 0x0F) | ((qh_b & 3) << 4)) - 32)
+                            q2 = Float32(((ql_h & 0x0F) | (((qh_b >> 2) & 3) << 4)) - 32)
+                            q3 = Float32(((ql_l >> 4) | (((qh_b >> 4) & 3) << 4)) - 32)
+                            q4 = Float32(((ql_h >> 4) | (((qh_b >> 6) & 3) << 4)) - 32)
+                            base_col = t * KCOLS + b * 256 + n2 * 128
+                            acc += dref * sc8[is_] * q1 * Float32(xh[base_col + l])
+                            acc += dref * sc8[2 + is_] * q2 * Float32(xh[base_col + l + 32])
+                            acc += dref * sc8[4 + is_] * q3 * Float32(xh[base_col + l + 64])
+                            acc += dref * sc8[6 + is_] * q4 * Float32(xh[base_col + l + 96])
+                rel = abs(Float32(yh[t * ROWS + r]) - acc) / (abs(acc) + 1.0)
+                if rel > max_err:
+                    max_err = rel
+    print("gemm_q6_k max_rel_err:", max_err)
+    if max_err > 0.02:
+        raise Error("gemm_q6_k FAILED")
+
+    var yk6_64 = ctx.enqueue_create_buffer[DType.float16](T * ROWS)
+    ctx.enqueue_function[gemm_q6_k_f16_bm64](
+        yk6_64.unsafe_ptr(), wk6.unsafe_ptr(), xk.unsafe_ptr(), KCOLS, ROWS, T,
+        grid_dim=((ROWS + 63) // 64, (T + 63) // 64), block_dim=128,
+    )
+    ctx.synchronize()
+    with yk6.map_to_host() as ya, yk6_64.map_to_host() as yb:
+        for i in range(T * ROWS):
+            if ya[i] != yb[i]:
+                raise Error("gemm_q6_k bm64 mismatch")
+    print("gemm_q6_k bm64 bit-identical")
 
     # --- f16 GEMM vs CPU (row/token/k tails: 90 rows, 40 tokens, 136 cols) ---
     comptime FROWS = 90

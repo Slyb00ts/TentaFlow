@@ -25,9 +25,11 @@ from src.gemv import gemv_f16_bias
 from src.kv_append import kv_append_f16
 from src.gemv2 import gemv_q8_0_f16_v2, gemv_q8_0_out_f32_v2, gemv_nvfp4_f16_v2, gemv_f16_out_f32_v2
 from src.gemv2 import gemv_q4_k_f16_v2, gemv_q4_k_out_f32_v2
+from src.gemv2 import gemv_q6_k_f16_v2, gemv_q6_k_out_f32_v2
 from src.gemm import gemm_q8_0_f16, gemm_nvfp4_f16, gemm_f16
 from src.gemm import gemm_q8_0_f16_bm64, gemm_nvfp4_f16_bm64, gemm_f16_bm64
 from src.gemm import gemm_q4_k_f16, gemm_q4_k_f16_bm64
+from src.gemm import gemm_q6_k_f16, gemm_q6_k_f16_bm64
 from src.prefill import kv_append_batch_f16, attn_prefill_f16_hd64, attn_prefill_f16_hd128
 from src.qkv_post import qkv_post_f16
 from src.attention import attn_decode_split_f16_hd64, attn_decode_split_f16_hd128
@@ -36,6 +38,9 @@ from src.decode_fused import gemv_norm_q8_0_f16, gemv_norm_nvfp4_f16, gemv_norm_
 from src.decode_fused import gemv_norm_silu_q8_0_f16, gemv_norm_silu_nvfp4_f16, gemv_norm_silu_f16
 from src.decode_fused import gemv_residual_q8_0_f16, gemv_residual_nvfp4_f16, gemv_residual_f16
 from src.decode_fused import rmsnorm_h32_f16
+from src.decode_fused import gemv_norm_q4_k_f16, gemv_norm_q6_k_f16
+from src.decode_fused import gemv_norm_silu_q4_k_f16, gemv_norm_silu_q6_k_f16
+from src.decode_fused import gemv_residual_q4_k_f16, gemv_residual_q6_k_f16
 
 
 def _entry_from_ptx(ptx_path: Path) raises -> String:
@@ -236,6 +241,36 @@ def main() raises:
 
     _ = ctx.compile_function[rmsnorm_h32_f16, dump_asm=Path("rmsnorm_h32_f16.ptx")]()
     entries.append(_finalize(out_dir, "rmsnorm_h32_f16"))
+
+    _ = ctx.compile_function[gemv_q6_k_f16_v2, dump_asm=Path("gemv_q6_k_f16_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q6_k_f16_v2"))
+
+    _ = ctx.compile_function[gemv_q6_k_out_f32_v2, dump_asm=Path("gemv_q6_k_out_f32_v2.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q6_k_out_f32_v2"))
+
+    _ = ctx.compile_function[gemm_q6_k_f16, dump_asm=Path("gemm_q6_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q6_k_f16"))
+
+    _ = ctx.compile_function[gemm_q6_k_f16_bm64, dump_asm=Path("gemm_q6_k_f16_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q6_k_f16_bm64"))
+
+    _ = ctx.compile_function[gemv_norm_q4_k_f16, dump_asm=Path("gemv_norm_q4_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_q4_k_f16"))
+
+    _ = ctx.compile_function[gemv_norm_q6_k_f16, dump_asm=Path("gemv_norm_q6_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_q6_k_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_q4_k_f16, dump_asm=Path("gemv_norm_silu_q4_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_q4_k_f16"))
+
+    _ = ctx.compile_function[gemv_norm_silu_q6_k_f16, dump_asm=Path("gemv_norm_silu_q6_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_norm_silu_q6_k_f16"))
+
+    _ = ctx.compile_function[gemv_residual_q4_k_f16, dump_asm=Path("gemv_residual_q4_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_q4_k_f16"))
+
+    _ = ctx.compile_function[gemv_residual_q6_k_f16, dump_asm=Path("gemv_residual_q6_k_f16.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_residual_q6_k_f16"))
 
     var manifest = String('{\n  "arch": "') + arch + String('",\n  "kernels": {\n')
     for i in range(len(entries)):
