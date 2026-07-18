@@ -277,6 +277,8 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemv_norm_iq1_m_f16",
     "gemv_norm_silu_iq1_m_f16",
     "gemv_residual_iq1_m_f16",
+    "moe_router_f16",
+    "moe_scale_add_f16",
 ];
 
 /// Loaded modules + resolved kernel handles for one device.

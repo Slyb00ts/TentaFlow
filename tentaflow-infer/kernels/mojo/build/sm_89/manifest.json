@@ -111,6 +111,8 @@
     "penalize_batched_f32": {"file": "penalize_batched_f32.ptx", "entry": "src_sampling_penalize_batched_6A6A6A6A_54cd1faa6b5c1f15"},
     "argmax_batched_f32": {"file": "argmax_batched_f32.ptx", "entry": "src_sampling_argmax_batched_f36A6A6A6A_6235ea989779b294"},
     "topk_batched_f32": {"file": "topk_batched_f32.ptx", "entry": "src_sampling_topk_batched_f326A6A6A6AoA_b81809c47c210f9b"},
+    "moe_router_f16": {"file": "moe_router_f16.ptx", "entry": "src_moe_moe_router_f16_Point6A6A6A6AoA6A6A_3a6f89b08b39ed3c"},
+    "moe_scale_add_f16": {"file": "moe_scale_add_f16.ptx", "entry": "src_moe_moe_scale_add_f16_Po6A6A6A6AoA6A6A_52fc5cb61a879394"},
     "gemv_q5_k_f16_v2": {"file": "gemv_q5_k_f16_v2.ptx", "entry": "src_gemv2_gemv_q5_k_f16_v2_P6A6A6A6AoA6A6A_3e0fac0c1a20cd3a"},
     "gemv_q5_k_out_f32_v2": {"file": "gemv_q5_k_out_f32_v2.ptx", "entry": "src_gemv2_gemv_q5_k_out_f32_v26A6A6A6A_99ea8d899590867c"},
     "gemv_q3_k_f16_v2": {"file": "gemv_q3_k_f16_v2.ptx", "entry": "src_gemv2_gemv_q3_k_f16_v2_P6A6A6A6AoA6A6A_f4ee8872798489e9"},

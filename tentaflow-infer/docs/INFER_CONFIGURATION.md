@@ -266,9 +266,30 @@ Uwaga metodyczna: prefill mierzony do pierwszego WIDOCZNEGO tokenu (zawiera
 - **safetensors + HF config** — BF16/F16/F32; compressed-tensors
   `nvfp4-pack-quantized` (NVFP4, programowy FP4) i `float-quantized`
   (FP8 → f16 przy ładowaniu); sharding przez `model.safetensors.index.json`.
-- Architektury: qwen3, llama, mistral (rejestr deklaratywny w forge-formats);
-  Whisper (osobny silnik); modele embeddingowe (pooling z metadanych).
+- Architektury: qwen3, llama, mistral, **olmoe** (MoE), **qwen3moe** (MoE)
+  (rejestr deklaratywny w forge-formats); Whisper (osobny silnik); modele
+  embeddingowe (pooling z metadanych).
 - head_dim: 64 i 128 (specjalizacje attention); inne → jasny błąd.
+
+## MoE (Mixture-of-Experts)
+
+- Wykrywane automatycznie z metadanych GGUF (`<arch>.expert_count > 0`):
+  liczba ekspertów, top-k (`expert_used_count`), szerokość eksperta
+  (`expert_feed_forward_length`), renormalizacja wag (`expert_weights_norm`),
+  opcjonalny shared expert (`expert_shared_feed_forward_length`). Router to
+  `ffn_gate_inp`, eksperci to stackowane `ffn_{gate,up,down}_exps`.
+- Bez flag — działa jak zwykły model (`forge run olmoe.gguf "…" -n 24 --temp 0`).
+- Routing zgodny z HF: softmax po WSZYSTKICH ekspertach → top-k → opcjonalny
+  renorm. Obsługiwane QK-norm: pełny wektor (OLMoE) i per-head (qwen3moe).
+- Ograniczenia MoE (v1, correctness-first): tylko KV `f16` (bez fp8/rot), bez
+  KV-tieringu, tylko single-stream decode (batched/`--max-active`>1 → jawny
+  Unsupported). Prefill przetwarza całą paczkę naraz; decode jeden token/krok
+  (wybór ekspertów zależny od danych → brak CUDA-graph). Perf-follow-up:
+  grouped-GEMM permute/unpermute i batched-MoE decode.
+- Warstwy MTP/NextN (`nextn_predict_layers`) są pomijane w podstawowej generacji.
+- Hybrydy SSM+MoE (np. `qwen35moe` = Qwen3.6-35B-A3B, z warstwami Gated-DeltaNet)
+  są NIEWSPIERANE — wymagają kerneli skanu SSM (osobny projekt); ładowanie zwraca
+  jasny błąd „unsupported arch", nie generuje śmieci.
 
 ## Ograniczenia znane (uczciwie)
 
@@ -282,4 +303,6 @@ Uwaga metodyczna: prefill mierzony do pierwszego WIDOCZNEGO tokenu (zawiera
   2048 tokenów; długie prompty składaj z kawałków (patrz
   `examples/kv_tier_longctx.rs`).
 - ONNX: niewspierany (planowany). TTS: brak silnika (planowany).
+- MoE: tylko single-stream decode + KV f16 (patrz sekcja MoE); hybrydy SSM+MoE
+  (Qwen3.6 `qwen35moe`) niewspierane.
 - `logprobs`/`n>1` w API: jeszcze nie.

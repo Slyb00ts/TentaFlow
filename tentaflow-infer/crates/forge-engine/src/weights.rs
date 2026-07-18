@@ -229,6 +229,40 @@ pub enum GateUpWeights {
     Split { gate: DevWeight, up: DevWeight },
 }
 
+/// A plain (dense) SwiGLU feed-forward block.
+pub struct DenseFfn {
+    pub gate_up: GateUpWeights,
+    pub down: DevWeight,
+}
+
+/// A Mixture-of-Experts feed-forward block: a router plus stacked expert
+/// projections (indexed per selected expert on the decode/prefill paths) and an
+/// optional always-on shared expert.
+pub struct MoeFfn {
+    /// Router `ffn_gate_inp`, f16 [n_experts, hidden]; produces per-expert
+    /// logits fed to the top-k softmax.
+    pub router: DevWeight,
+    /// Stacked expert gate/up projections, [n_experts*moe_inter, hidden].
+    pub gate_exps: DevWeight,
+    pub up_exps: DevWeight,
+    /// Stacked expert down projection, [n_experts*hidden, moe_inter].
+    pub down_exps: DevWeight,
+    /// Shared always-on expert (Qwen-MoE / DeepSeek), added to every token.
+    pub shared: Option<DenseFfn>,
+    pub n_experts: usize,
+    pub n_experts_used: usize,
+    pub moe_inter: usize,
+    /// Renormalize the top-k routing weights to sum 1.
+    pub norm_topk: bool,
+}
+
+/// Feed-forward block: dense SwiGLU or routed Mixture-of-Experts. The MoE
+/// variant is boxed — it is far larger than the dense one and rare per model.
+pub enum LayerFfn {
+    Dense(DenseFfn),
+    Moe(Box<MoeFfn>),
+}
+
 /// Per-layer weight set (roles resolved by the arch registry).
 pub struct LayerWeights {
     pub attn_norm: DevBuffer,
@@ -238,8 +272,21 @@ pub struct LayerWeights {
     pub k_norm: Option<DevBuffer>,
     pub attn_qkv: QkvWeights,
     pub attn_o: DevWeight,
-    pub ffn_gate_up: GateUpWeights,
-    pub ffn_down: DevWeight,
+    pub ffn: LayerFfn,
+}
+
+impl LayerWeights {
+    /// Dense FFN parts, or an error on a MoE layer — the dense decode/prefill
+    /// paths (fused, rot, batched, separate) never run on a MoE model, which
+    /// takes the dedicated routed path instead.
+    pub fn dense_ffn(&self) -> Result<&DenseFfn> {
+        match &self.ffn {
+            LayerFfn::Dense(d) => Ok(d),
+            LayerFfn::Moe(_) => Err(ForgeError::Unsupported(
+                "MoE layer reached a dense FFN code path".into(),
+            )),
+        }
+    }
 }
 
 pub struct ModelWeights {
@@ -657,6 +704,21 @@ fn fetch_matrix(src: &dyn TensorSource, name: &str) -> Result<HostWeight> {
         )));
     }
     let (rows, cols) = (dims[0], dims[1]);
+    quant_host_weight(name, data, dtype, quant, rows, cols)
+}
+
+/// Map a [rows, cols] block stream in storage quant `quant` to the on-device
+/// HostWeight variant the fused kernels consume, dequantizing to f16 for any
+/// format without a native GPU kernel. Shared by the plain 2D matrix path and
+/// the flattened MoE expert-stack path.
+fn quant_host_weight(
+    name: &str,
+    data: Vec<u8>,
+    dtype: DType,
+    quant: QuantKind,
+    rows: usize,
+    cols: usize,
+) -> Result<HostWeight> {
     match quant {
         QuantKind::Q8_0 => Ok(HostWeight::Q8_0 { data, rows, cols }),
         // Whole 256-element superblocks per row keep every 144-byte block
@@ -720,6 +782,24 @@ fn fetch_matrix(src: &dyn TensorSource, name: &str) -> Result<HostWeight> {
             })
         }
     }
+}
+
+/// Fetch a stacked MoE expert tensor `[n_expert, a, b]` (quantized) and flatten
+/// it to a single `[n_expert*a, b]` matrix. GGUF stores experts contiguously in
+/// expert-major order, so the flattened byte stream IS a row-major matrix whose
+/// expert `e` occupies rows `e*a .. e*a+a`; the per-expert GEMV then reads it
+/// with a plain row-offset (byte offset `e*a` rows into the block stream).
+fn fetch_expert_stack(src: &dyn TensorSource, name: &str) -> Result<HostWeight> {
+    let (data, dtype, quant, dims) = src.fetch(name)?;
+    if dims.len() != 3 {
+        return Err(ForgeError::Format(format!(
+            "{name}: expected stacked expert tensor [n_expert, inter, hidden], got {dims:?}"
+        )));
+    }
+    // GGUF dims are innermost-first and `fetch` already reversed them, so
+    // dims = [n_expert, a, b].
+    let (n_expert, a, b) = (dims[0], dims[1], dims[2]);
+    quant_host_weight(name, data, dtype, quant, n_expert * a, b)
 }
 
 /// Upload a host matrix as-is.
@@ -1136,29 +1216,117 @@ impl ModelWeights {
                 }
             };
 
-            let gate = fetch_matrix(src, name(WeightRole::FfnGate)?)?;
-            let up = fetch_matrix(src, name(WeightRole::FfnUp)?)?;
-            expect(&at("ffn_gate"), &gate, p.intermediate_size, p.hidden_size)?;
-            expect(&at("ffn_up"), &up, p.intermediate_size, p.hidden_size)?;
-            let ffn_gate_up = match fuse_rows(vec![gate, up]) {
-                Ok(fused) => {
-                    fused_gate_up_layers += 1;
-                    GateUpWeights::Fused(upload_weight(device, fused)?)
-                }
-                Err(mut parts) => {
-                    let up = parts.pop().expect("two parts");
-                    let gate = parts.pop().expect("two parts");
-                    GateUpWeights::Split {
-                        gate: upload_weight(device, gate)?,
-                        up: upload_weight(device, up)?,
-                    }
-                }
-            };
-
             let attn_o = fetch_matrix(src, name(WeightRole::AttnO)?)?;
             expect(&at("attn_o"), &attn_o, p.hidden_size, q_dim)?;
-            let ffn_down = fetch_matrix(src, name(WeightRole::FfnDown)?)?;
-            expect(&at("ffn_down"), &ffn_down, p.hidden_size, p.intermediate_size)?;
+
+            let ffn = match &p.moe {
+                None => {
+                    let gate = fetch_matrix(src, name(WeightRole::FfnGate)?)?;
+                    let up = fetch_matrix(src, name(WeightRole::FfnUp)?)?;
+                    expect(&at("ffn_gate"), &gate, p.intermediate_size, p.hidden_size)?;
+                    expect(&at("ffn_up"), &up, p.intermediate_size, p.hidden_size)?;
+                    let gate_up = match fuse_rows(vec![gate, up]) {
+                        Ok(fused) => {
+                            fused_gate_up_layers += 1;
+                            GateUpWeights::Fused(upload_weight(device, fused)?)
+                        }
+                        Err(mut parts) => {
+                            let up = parts.pop().expect("two parts");
+                            let gate = parts.pop().expect("two parts");
+                            GateUpWeights::Split {
+                                gate: upload_weight(device, gate)?,
+                                up: upload_weight(device, up)?,
+                            }
+                        }
+                    };
+                    let down = fetch_matrix(src, name(WeightRole::FfnDown)?)?;
+                    expect(&at("ffn_down"), &down, p.hidden_size, p.intermediate_size)?;
+                    LayerFfn::Dense(DenseFfn {
+                        gate_up,
+                        down: upload_weight(device, down)?,
+                    })
+                }
+                Some(moe) => {
+                    let router = fetch_matrix(src, name(WeightRole::FfnGateInp)?)?;
+                    expect(&at("ffn_gate_inp"), &router, moe.n_experts, p.hidden_size)?;
+                    let router = match router {
+                        // The router kernel reads f16 weights; the loader
+                        // materializes the (typically f32) gate as f16 already,
+                        // so a non-f16 result would be a format surprise.
+                        HostWeight::F16 { .. } => upload_weight(device, router)?,
+                        other => {
+                            return Err(ForgeError::Unsupported(format!(
+                                "layer {idx} ffn_gate_inp must be f16-materializable, got {:?}",
+                                std::mem::discriminant(&other)
+                            )))
+                        }
+                    };
+                    let gate_exps = fetch_expert_stack(src, name(WeightRole::FfnGateExps)?)?;
+                    let up_exps = fetch_expert_stack(src, name(WeightRole::FfnUpExps)?)?;
+                    let down_exps = fetch_expert_stack(src, name(WeightRole::FfnDownExps)?)?;
+                    expect(
+                        &at("ffn_gate_exps"),
+                        &gate_exps,
+                        moe.n_experts * moe.moe_intermediate_size,
+                        p.hidden_size,
+                    )?;
+                    expect(
+                        &at("ffn_up_exps"),
+                        &up_exps,
+                        moe.n_experts * moe.moe_intermediate_size,
+                        p.hidden_size,
+                    )?;
+                    expect(
+                        &at("ffn_down_exps"),
+                        &down_exps,
+                        moe.n_experts * p.hidden_size,
+                        moe.moe_intermediate_size,
+                    )?;
+                    // Optional shared expert (all roles present together).
+                    let shared = match (
+                        layer_map.get(&WeightRole::FfnGateShExp),
+                        layer_map.get(&WeightRole::FfnUpShExp),
+                        layer_map.get(&WeightRole::FfnDownShExp),
+                    ) {
+                        (Some(gn), Some(un), Some(dn)) => {
+                            let si = moe.shared_intermediate_size;
+                            let gate = fetch_matrix(src, gn)?;
+                            let up = fetch_matrix(src, un)?;
+                            let down = fetch_matrix(src, dn)?;
+                            expect(&at("ffn_gate_shexp"), &gate, si, p.hidden_size)?;
+                            expect(&at("ffn_up_shexp"), &up, si, p.hidden_size)?;
+                            expect(&at("ffn_down_shexp"), &down, p.hidden_size, si)?;
+                            let gate_up = match fuse_rows(vec![gate, up]) {
+                                Ok(fused) => GateUpWeights::Fused(upload_weight(device, fused)?),
+                                Err(mut parts) => {
+                                    let up = parts.pop().expect("two parts");
+                                    let gate = parts.pop().expect("two parts");
+                                    GateUpWeights::Split {
+                                        gate: upload_weight(device, gate)?,
+                                        up: upload_weight(device, up)?,
+                                    }
+                                }
+                            };
+                            Some(DenseFfn {
+                                gate_up,
+                                down: upload_weight(device, down)?,
+                            })
+                        }
+                        _ => None,
+                    };
+                    LayerFfn::Moe(Box::new(MoeFfn {
+                        router,
+                        gate_exps: upload_weight(device, gate_exps)?,
+                        up_exps: upload_weight(device, up_exps)?,
+                        down_exps: upload_weight(device, down_exps)?,
+                        shared,
+                        n_experts: moe.n_experts,
+                        n_experts_used: moe.n_experts_used,
+                        moe_inter: moe.moe_intermediate_size,
+                        norm_topk: moe.norm_topk_prob,
+                    }))
+                }
+            };
 
             layers.push(LayerWeights {
                 attn_norm: upload_norm(device, src, name(WeightRole::AttnNorm)?)?,
@@ -1173,8 +1341,7 @@ impl ModelWeights {
                 },
                 attn_qkv,
                 attn_o: upload_weight(device, attn_o)?,
-                ffn_gate_up,
-                ffn_down: upload_weight(device, ffn_down)?,
+                ffn,
             });
         }
 
@@ -1190,10 +1357,23 @@ impl ModelWeights {
         })
     }
 
+    /// Whether this model uses routed Mixture-of-Experts FFN blocks.
+    pub fn is_moe(&self) -> bool {
+        self.descriptor.params.moe.is_some()
+    }
+
     /// Weight-role → tensor-name map used for diagnostics.
     pub fn describe(&self) -> HashMap<String, String> {
         let mut m = HashMap::new();
         m.insert("arch".into(), self.descriptor.arch.clone());
+        if let Some(moe) = &self.descriptor.params.moe {
+            m.insert("moe_experts".into(), moe.n_experts.to_string());
+            m.insert("moe_experts_used".into(), moe.n_experts_used.to_string());
+            m.insert(
+                "moe_intermediate_size".into(),
+                moe.moe_intermediate_size.to_string(),
+            );
+        }
         m.insert(
             "layers".into(),
             self.descriptor.params.block_count.to_string(),

@@ -60,6 +60,18 @@ pub enum WeightRole {
     FfnNorm,
     OutputNorm,
     LmHead,
+    /// MoE router (`ffn_gate_inp`): logits over experts, [n_expert, hidden].
+    FfnGateInp,
+    /// MoE stacked expert projections ([n_expert, inter, hidden] resp.
+    /// [n_expert, hidden, inter], quantized) — indexed per selected expert.
+    FfnGateExps,
+    FfnUpExps,
+    FfnDownExps,
+    /// Optional always-on shared expert (Qwen-MoE / DeepSeek), a dense FFN
+    /// added to every token on top of the routed experts.
+    FfnGateShExp,
+    FfnUpShExp,
+    FfnDownShExp,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,6 +103,8 @@ const ARCH_SOURCES: &[&str] = &[
     include_str!("../arch/qwen3.ron"),
     include_str!("../arch/llama.ron"),
     include_str!("../arch/mistral.ron"),
+    include_str!("../arch/olmoe.ron"),
+    include_str!("../arch/qwen3moe.ron"),
 ];
 
 /// Embedded specs are compile-time assets of this crate, so a parse failure
@@ -103,6 +117,22 @@ pub fn registry() -> &'static [ArchSpec] {
             .map(|src| ron::from_str(src).expect("embedded arch spec must parse"))
             .collect()
     })
+}
+
+/// Mixture-of-Experts routing parameters (present only for MoE architectures).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MoeParams {
+    /// Total experts per MoE layer (`<arch>.expert_count`).
+    pub n_experts: usize,
+    /// Experts activated per token / top-k (`<arch>.expert_used_count`).
+    pub n_experts_used: usize,
+    /// Per-expert FFN hidden size (`<arch>.expert_feed_forward_length`).
+    pub moe_intermediate_size: usize,
+    /// Renormalize the top-k routing weights to sum 1 after selection
+    /// (`<arch>.expert_weights_norm`). OLMoE = false, Qwen-MoE = true.
+    pub norm_topk_prob: bool,
+    /// Shared always-on expert FFN hidden size (0 = no shared expert).
+    pub shared_intermediate_size: usize,
 }
 
 /// Unified model hyperparameters sourced from GGUF metadata or HF config.
@@ -122,6 +152,13 @@ pub struct Hyperparams {
     /// Sequence pooling declared by the model (embedding models only); `None`
     /// for generative models.
     pub pooling_type: PoolingType,
+    /// MoE routing parameters when the architecture is Mixture-of-Experts;
+    /// `None` for a dense FFN model.
+    pub moe: Option<MoeParams>,
+    /// QK-norm is applied over the whole projection (`n_heads * head_dim`) once
+    /// per token rather than per-head over `head_dim`. OLMoE normalizes the full
+    /// query/key vector; Qwen3 normalizes each head. `false` when no QK-norm.
+    pub qk_norm_over_hidden: bool,
 }
 
 /// Architecture + hyperparams + fully resolved weight-name map.
@@ -158,7 +195,14 @@ impl ModelDescriptor {
                 .map(|v| v as usize)
                 .ok_or_else(|| fmt_err(format!("gguf: missing metadata key {}", key(suffix))))
         };
-        let block_count = req_u("block_count")?;
+        // Multi-token-prediction (MTP / NextN) speculation heads are the final
+        // `nextn_predict_layers` blocks; they are not part of the autoregressive
+        // main forward, so drop them from the transformer stack (basic decode
+        // never runs them and they carry non-standard tensors).
+        let nextn = gguf
+            .get_u64(&key("nextn_predict_layers"))
+            .unwrap_or(0) as usize;
+        let block_count = req_u("block_count")?.saturating_sub(nextn);
         let hidden_size = req_u("embedding_length")?;
         let n_heads = req_u("attention.head_count")?;
         let n_kv_heads = gguf
@@ -219,6 +263,55 @@ impl ModelDescriptor {
             .map(PoolingType::from_gguf_u32)
             .unwrap_or(PoolingType::None);
 
+        // Mixture-of-Experts: the presence of a positive expert_count promotes
+        // the FFN block to routed experts (the `ffn_*_exps` stacked tensors were
+        // resolved above as the FfnGateExps/UpExps/DownExps roles).
+        let n_experts = gguf.get_u64(&key("expert_count")).unwrap_or(0) as usize;
+        let moe = if n_experts > 0 {
+            let n_experts_used = gguf
+                .get_u64(&key("expert_used_count"))
+                .map(|v| v as usize)
+                .ok_or_else(|| fmt_err(format!("gguf: MoE model missing {}", key("expert_used_count"))))?;
+            let moe_intermediate_size = gguf
+                .get_u64(&key("expert_feed_forward_length"))
+                .map(|v| v as usize)
+                .unwrap_or(intermediate_size);
+            let norm_topk_prob = gguf.get_bool(&key("expert_weights_norm")).unwrap_or(false);
+            let shared_intermediate_size = gguf
+                .get_u64(&key("expert_shared_feed_forward_length"))
+                .map(|v| v as usize)
+                .unwrap_or(0);
+            Some(MoeParams {
+                n_experts,
+                n_experts_used,
+                moe_intermediate_size,
+                norm_topk_prob,
+                shared_intermediate_size,
+            })
+        } else {
+            None
+        };
+
+        // QK-norm granularity: OLMoE normalizes the whole q/k projection, so its
+        // attn_q_norm vector spans n_heads*head_dim; Qwen3 normalizes per head,
+        // so its vector spans head_dim. Read the resolved tensor's element count.
+        let qk_norm_over_hidden = layers
+            .first()
+            .and_then(|m| m.get(&WeightRole::AttnQNorm))
+            .and_then(|n| gguf.tensor(n))
+            .map(|t| {
+                let numel: usize = t.dims.iter().map(|&d| d as usize).product();
+                numel != head_dim
+            })
+            .unwrap_or(false);
+
+        // The MoE expert scratch is sized from intermediate_size, so fold the
+        // expert (and any shared-expert) FFN width into it for a MoE model.
+        let intermediate_size = match &moe {
+            Some(m) => m.moe_intermediate_size.max(m.shared_intermediate_size),
+            None => intermediate_size,
+        };
+
         Ok(ModelDescriptor {
             arch: spec.name.clone(),
             params: Hyperparams {
@@ -234,6 +327,8 @@ impl ModelDescriptor {
                 max_position_embeddings,
                 tie_word_embeddings,
                 pooling_type,
+                moe,
+                qk_norm_over_hidden,
             },
             globals,
             layers,
@@ -293,6 +388,10 @@ impl ModelDescriptor {
                 // HF config.json carries no pooling; sentence-transformers keeps
                 // it in a `1_Pooling/config.json` sidecar the loader overrides.
                 pooling_type: PoolingType::None,
+                // Safetensors MoE loading is not wired yet; the GGUF path is the
+                // supported entry for Mixture-of-Experts models.
+                moe: None,
+                qk_norm_over_hidden: false,
             },
             globals,
             layers,
@@ -307,10 +406,18 @@ mod tests {
     #[test]
     fn all_embedded_specs_parse() {
         let specs = registry();
-        assert_eq!(specs.len(), 3);
+        assert_eq!(specs.len(), 5);
         assert_eq!(specs[0].name, "qwen3");
         assert_eq!(specs[1].name, "llama");
         assert_eq!(specs[2].name, "mistral");
+        assert_eq!(specs[3].name, "olmoe");
+        assert_eq!(specs[4].name, "qwen3moe");
+        // The MoE specs carry the router + stacked-expert roles.
+        assert!(specs[3].roles.iter().any(|r| r.role == WeightRole::FfnGateInp));
+        assert!(specs[3].roles.iter().any(|r| r.role == WeightRole::FfnGateExps));
+        assert!(specs[3].roles.iter().any(|r| r.role == WeightRole::FfnDownExps));
+        // MoE FFN replaces the dense gate/up/down entirely.
+        assert!(!specs[3].roles.iter().any(|r| r.role == WeightRole::FfnGate));
         // qwen3 has QK-norm roles, llama does not.
         assert!(specs[0]
             .roles
@@ -398,6 +505,37 @@ mod tests {
         .unwrap();
         let desc = ModelDescriptor::from_hf(&cfg).unwrap();
         assert_eq!(desc.params.pooling_type, PoolingType::None);
+    }
+
+    /// Detect OLMoE from the real GGUF and assert its MoE metadata. Skipped
+    /// cleanly when the test model has not been downloaded.
+    #[test]
+    fn detect_olmoe_moe_metadata() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-models/gguf/olmoe-1b-7b.gguf"
+        );
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skipping: {path} not present");
+            return;
+        }
+        let gguf = Gguf::open(path).expect("open olmoe gguf");
+        let desc = ModelDescriptor::detect(&gguf).expect("detect olmoe");
+        assert_eq!(desc.arch, "olmoe");
+        let moe = desc.params.moe.as_ref().expect("olmoe is MoE");
+        assert_eq!(moe.n_experts, 64, "OLMoE has 64 experts");
+        assert_eq!(moe.n_experts_used, 8, "OLMoE routes top-8");
+        assert_eq!(moe.shared_intermediate_size, 0, "OLMoE has no shared expert");
+        // OLMoE normalizes the full query/key vector, not per head.
+        assert!(desc.params.qk_norm_over_hidden);
+        // Every layer resolved the router + three stacked expert tensors.
+        for layer in &desc.layers {
+            assert!(layer.contains_key(&WeightRole::FfnGateInp));
+            assert!(layer.contains_key(&WeightRole::FfnGateExps));
+            assert!(layer.contains_key(&WeightRole::FfnUpExps));
+            assert!(layer.contains_key(&WeightRole::FfnDownExps));
+            assert!(!layer.contains_key(&WeightRole::FfnGate));
+        }
     }
 
     #[test]

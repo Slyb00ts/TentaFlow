@@ -19,7 +19,7 @@ use half::f16;
 use crate::kv::{KvCache, KvConfig, KvQuant, SeqKv};
 use crate::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use crate::tier::{KvTierConfig, TierManager, STAGE_SLOTS};
-use crate::weights::{DevWeight, GateUpWeights, ModelWeights, QkvWeights};
+use crate::weights::{DevWeight, GateUpWeights, LayerFfn, MoeFfn, ModelWeights, QkvWeights};
 
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
 /// prompts. Bounds the persistent prefill scratch allocation.
@@ -174,6 +174,8 @@ pub struct Model {
     /// (0 = none/stale). Spills, restores and batched growth invalidate it,
     /// forcing a re-upload on the next single-stream step.
     pt_seq: u64,
+    /// MoE scratch; `Some` only for Mixture-of-Experts models.
+    moe_bufs: Option<MoeBufs>,
 }
 
 /// Attention source for the shared decode chains: the paged VRAM cache (fast
@@ -324,6 +326,22 @@ struct BatchBufs {
     pinned_out: DevBuffer,
 }
 
+/// MoE scratch (allocated only for Mixture-of-Experts models). The router
+/// output is sized for a full prefill chunk; decode uses the first row.
+struct MoeBufs {
+    /// Selected expert ids, i32 [MAX_PREFILL_CHUNK * top_k].
+    ids: DevBuffer,
+    /// Routing weights, f32 [MAX_PREFILL_CHUNK * top_k].
+    weights: DevBuffer,
+    pinned_ids: DevBuffer,
+    pinned_weights: DevBuffer,
+    /// One token's FFN-normed hidden, f16 [hidden] — prefill copies a row here
+    /// so the per-expert GEMV reads a contiguous single-token activation.
+    xrow: DevBuffer,
+    /// One expert's down-projection output, f16 [hidden].
+    tmp: DevBuffer,
+}
+
 impl Model {
     pub fn load_gguf(device: Arc<dyn Device>, path: &Path, cfg: ModelConfig) -> Result<Self> {
         let weights = ModelWeights::load_gguf(&device, path)?;
@@ -346,6 +364,21 @@ impl Model {
                 "head_dim {} has no attention specialization",
                 p.head_dim
             )));
+        }
+        if weights.is_moe() {
+            // The routed decode path is a dedicated, non-graph-captured chain
+            // over the f16 paged cache; low-bit KV modes and tiering are tracked
+            // follow-ups (they need the fused decode kernels MoE bypasses).
+            if !matches!(cfg.kv_quant, KvQuant::F16) {
+                return Err(ForgeError::Unsupported(
+                    "MoE models currently support only the f16 KV cache".into(),
+                ));
+            }
+            if cfg.kv_tier.enabled() {
+                return Err(ForgeError::Unsupported(
+                    "MoE models do not support KV tiering yet".into(),
+                ));
+            }
         }
         match cfg.kv_quant {
             KvQuant::F16 => {}
@@ -472,6 +505,21 @@ impl Model {
             penalty_ids: device.alloc(cfg.max_seq_len * 4, MemKind::Device, Pool::Activations)?,
             pinned_penalty: device.alloc(cfg.max_seq_len * 4, MemKind::PinnedHost, Pool::Activations)?,
         };
+        let moe_bufs = match &weights.descriptor.params.moe {
+            Some(m) => {
+                let top_k = m.n_experts_used;
+                let idw = MAX_PREFILL_CHUNK * top_k;
+                Some(MoeBufs {
+                    ids: device.alloc(idw * 4, MemKind::Device, Pool::Activations)?,
+                    weights: device.alloc(idw * 4, MemKind::Device, Pool::Activations)?,
+                    pinned_ids: device.alloc(idw * 4, MemKind::PinnedHost, Pool::Activations)?,
+                    pinned_weights: device.alloc(idw * 4, MemKind::PinnedHost, Pool::Activations)?,
+                    xrow: device.alloc(hidden * 2, MemKind::Device, Pool::Activations)?,
+                    tmp: device.alloc(hidden * 2, MemKind::Device, Pool::Activations)?,
+                })
+            }
+            None => None,
+        };
         Ok(Model {
             device,
             kernels,
@@ -491,6 +539,7 @@ impl Model {
             tier,
             tier_bufs,
             pt_seq: 0,
+            moe_bufs,
         })
     }
 
@@ -782,6 +831,11 @@ impl Model {
             return false;
         }
         weights.layers.iter().all(|l| {
+            // Routed MoE FFN has no fused single-GEMV decode kernel; MoE models
+            // take the dedicated routed path (never this fused chain).
+            let LayerFfn::Dense(dffn) = &l.ffn else {
+                return false;
+            };
             let qkv_ok = match &l.attn_qkv {
                 QkvWeights::Fused(w) => Self::fused_decode_weight_ok(w),
                 QkvWeights::FusedQk { qk, v } => {
@@ -793,7 +847,7 @@ impl Model {
                         && Self::fused_decode_weight_ok(v)
                 }
             };
-            let gate_up_ok = match &l.ffn_gate_up {
+            let gate_up_ok = match &dffn.gate_up {
                 GateUpWeights::Fused(w) => Self::fused_decode_weight_ok(w),
                 // Mixed-format gate/up (e.g. Q5_K gate + Q6_K up) stays in
                 // the fused chain: each projection runs its own gemv_norm
@@ -805,7 +859,7 @@ impl Model {
             qkv_ok
                 && gate_up_ok
                 && Self::fused_decode_weight_ok(&l.attn_o)
-                && Self::fused_decode_weight_ok(&l.ffn_down)
+                && Self::fused_decode_weight_ok(&dffn.down)
         })
     }
 
@@ -1604,11 +1658,23 @@ impl Model {
             }
             trace.mark(self.device.as_ref(), "gemm_qkv");
 
+            // QK-norm granularity: OLMoE normalizes the whole q/k projection
+            // once per token (rows = t), Qwen3 normalizes per head (rows =
+            // t*n_heads). Dense non-OLMoE arches keep the per-head form
+            // bit-for-bit (qk_norm_over_hidden == false).
             if let Some(qn) = &layer.q_norm {
-                kernels.rmsnorm_f16(&pb.q, &pb.q, qn, t * p.n_heads, p.head_dim, eps, stream)?;
+                if p.qk_norm_over_hidden {
+                    kernels.rmsnorm_f16(&pb.q, &pb.q, qn, t, q_dim, eps, stream)?;
+                } else {
+                    kernels.rmsnorm_f16(&pb.q, &pb.q, qn, t * p.n_heads, p.head_dim, eps, stream)?;
+                }
             }
             if let Some(kn) = &layer.k_norm {
-                kernels.rmsnorm_f16(&pb.k, &pb.k, kn, t * p.n_kv_heads, p.head_dim, eps, stream)?;
+                if p.qk_norm_over_hidden {
+                    kernels.rmsnorm_f16(&pb.k, &pb.k, kn, t, kv_dim, eps, stream)?;
+                } else {
+                    kernels.rmsnorm_f16(&pb.k, &pb.k, kn, t * p.n_kv_heads, p.head_dim, eps, stream)?;
+                }
             }
 
             kernels.rope_neox_f16(&pb.q, &pb.positions, t, p.n_heads, p.head_dim, p.rope_theta, stream)?;
@@ -1761,21 +1827,30 @@ impl Model {
             kernels.rmsnorm_residual_f16(&pb.x, &pb.h, &pb.o_out, &layer.ffn_norm, t, hidden, eps, stream)?;
             trace.mark(self.device.as_ref(), "norm_res");
 
-            match &layer.ffn_gate_up {
-                GateUpWeights::Fused(w) => {
-                    self.gemm_rows(&pb.gate, w, &pb.x, t, 0, inter, stream)?;
-                    self.gemm_rows(&pb.up, w, &pb.x, t, inter, inter, stream)?;
+            match &layer.ffn {
+                LayerFfn::Dense(dffn) => {
+                    match &dffn.gate_up {
+                        GateUpWeights::Fused(w) => {
+                            self.gemm_rows(&pb.gate, w, &pb.x, t, 0, inter, stream)?;
+                            self.gemm_rows(&pb.up, w, &pb.x, t, inter, inter, stream)?;
+                        }
+                        GateUpWeights::Split { gate, up } => {
+                            self.gemm(&pb.gate, gate, &pb.x, t, stream)?;
+                            self.gemm(&pb.up, up, &pb.x, t, stream)?;
+                        }
+                    }
+                    trace.mark(self.device.as_ref(), "gemm_gateup");
+                    kernels.silu_mul_f16(&pb.act, &pb.gate, &pb.up, t * inter, stream)?;
+                    trace.mark(self.device.as_ref(), "silu");
+                    self.gemm(&pb.down, &dffn.down, &pb.act, t, stream)?;
+                    trace.mark(self.device.as_ref(), "gemm_down");
                 }
-                GateUpWeights::Split { gate, up } => {
-                    self.gemm(&pb.gate, gate, &pb.x, t, stream)?;
-                    self.gemm(&pb.up, up, &pb.x, t, stream)?;
+                LayerFfn::Moe(moe) => {
+                    // Per-token routed experts written into pb.down [t, hidden].
+                    self.moe_prefill_ffn(moe, t, hidden, stream)?;
+                    trace.mark(self.device.as_ref(), "moe_ffn");
                 }
             }
-            trace.mark(self.device.as_ref(), "gemm_gateup");
-            kernels.silu_mul_f16(&pb.act, &pb.gate, &pb.up, t * inter, stream)?;
-            trace.mark(self.device.as_ref(), "silu");
-            self.gemm(&pb.down, &layer.ffn_down, &pb.act, t, stream)?;
-            trace.mark(self.device.as_ref(), "gemm_down");
 
             let next_norm = if l + 1 < n_layers {
                 &self.weights.layers[l + 1].attn_norm
@@ -1982,6 +2057,13 @@ impl Model {
         // tier restores rewrote this sequence's pages.
         if page_boundary || self.pt_seq != seq.id {
             self.upload_page_table(seq)?;
+        }
+
+        // Routed MoE decode reads the per-token top-k experts back to the host
+        // to launch the indexed expert GEMVs, so it cannot be graph-captured;
+        // it runs the explicit chain each step over the f16 paged cache.
+        if self.weights.is_moe() {
+            return self.run_step_moe();
         }
 
         // Rot decode commits the current token into the packed store + ring and
@@ -2256,7 +2338,7 @@ impl Model {
             self.gemv(&b.o_out, &layer.attn_o, &b.attn_out, stream)?;
             kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.o_out, &layer.ffn_norm, 1, hidden, eps, stream)?;
 
-            match &layer.ffn_gate_up {
+            match &layer.dense_ffn()?.gate_up {
                 GateUpWeights::Fused(w) => {
                     self.gemv(&b.gate_up, w, &b.x, stream)?;
                     kernels.silu_mul_f16_at(&b.act, &b.gate_up, 0, inter * 2, inter, stream)?;
@@ -2267,7 +2349,7 @@ impl Model {
                     kernels.silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
                 }
             }
-            self.gemv(&b.down, &layer.ffn_down, &b.act, stream)?;
+            self.gemv(&b.down, &layer.dense_ffn()?.down, &b.act, stream)?;
 
             let next_norm = if l + 1 < n_layers {
                 &self.weights.layers[l + 1].attn_norm
@@ -2581,7 +2663,7 @@ impl Model {
                 self.gemv(&b.o_out, &layer.attn_o, &b.attn_out, stream)?;
                 kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.o_out, &layer.ffn_norm, 1, hidden, eps, stream)?;
 
-                match &layer.ffn_gate_up {
+                match &layer.dense_ffn()?.gate_up {
                     GateUpWeights::Fused(w) => {
                         self.gemv(&b.gate_up, w, &b.x, stream)?;
                         kernels.silu_mul_f16_at(&b.act, &b.gate_up, 0, inter * 2, inter, stream)?;
@@ -2592,7 +2674,7 @@ impl Model {
                         kernels.silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
                     }
                 }
-                self.gemv(&b.down, &layer.ffn_down, &b.act, stream)?;
+                self.gemv(&b.down, &layer.dense_ffn()?.down, &b.act, stream)?;
 
                 let next_norm = if l + 1 < n_layers {
                     &self.weights.layers[l + 1].attn_norm
@@ -2604,6 +2686,286 @@ impl Model {
 
             self.logits_gemv(&b.logits, &b.x, stream)
         }
+    }
+
+    /// One decode step for a Mixture-of-Experts model (single token, paged f16
+    /// cache). Attention mirrors the explicit separate chain but applies the
+    /// model's QK-norm granularity (per-head for Qwen3-MoE, whole-vector for
+    /// OLMoE); the FFN is replaced by `moe_decode_ffn`. Never graph-captured:
+    /// the routed experts are chosen per token from a host readback.
+    fn run_step_moe(&self) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let hidden = p.hidden_size;
+        let eps = p.rms_norm_eps;
+        let kernels = &self.kernels;
+        let stream = &self.stream;
+        let b = &self.bufs;
+        let scale = 1.0 / (p.head_dim as f32).sqrt();
+        let q_dim = p.n_heads * p.head_dim;
+        let kv_dim = p.n_kv_heads * p.head_dim;
+
+        kernels.gather_rows_f16(&b.h, &self.weights.token_embd_f16, &b.ids, 1, hidden, stream)?;
+        kernels.rmsnorm_f16(&b.x, &b.h, &self.weights.layers[0].attn_norm, 1, hidden, eps, stream)?;
+
+        let n_layers = self.weights.layers.len();
+        for l in 0..n_layers {
+            let layer = &self.weights.layers[l];
+
+            // Project q/k/v into the separate b.q/b.k/b.v buffers regardless of
+            // weight fusion (a fused matrix is read as three row-window GEMVs).
+            match &layer.attn_qkv {
+                QkvWeights::Fused(w) => {
+                    self.gemm_rows(&b.q, w, &b.x, 1, 0, q_dim, stream)?;
+                    self.gemm_rows(&b.k, w, &b.x, 1, q_dim, kv_dim, stream)?;
+                    self.gemm_rows(&b.v, w, &b.x, 1, q_dim + kv_dim, kv_dim, stream)?;
+                }
+                QkvWeights::FusedQk { qk, v } => {
+                    self.gemm_rows(&b.q, qk, &b.x, 1, 0, q_dim, stream)?;
+                    self.gemm_rows(&b.k, qk, &b.x, 1, q_dim, kv_dim, stream)?;
+                    self.gemv(&b.v, v, &b.x, stream)?;
+                }
+                QkvWeights::Split { q, k, v } => {
+                    self.gemv(&b.q, q, &b.x, stream)?;
+                    self.gemv(&b.k, k, &b.x, stream)?;
+                    self.gemv(&b.v, v, &b.x, stream)?;
+                }
+            }
+
+            if let Some(qn) = &layer.q_norm {
+                if p.qk_norm_over_hidden {
+                    kernels.rmsnorm_f16(&b.q, &b.q, qn, 1, q_dim, eps, stream)?;
+                } else {
+                    kernels.rmsnorm_f16(&b.q, &b.q, qn, p.n_heads, p.head_dim, eps, stream)?;
+                }
+            }
+            if let Some(kn) = &layer.k_norm {
+                if p.qk_norm_over_hidden {
+                    kernels.rmsnorm_f16(&b.k, &b.k, kn, 1, kv_dim, eps, stream)?;
+                } else {
+                    kernels.rmsnorm_f16(&b.k, &b.k, kn, p.n_kv_heads, p.head_dim, eps, stream)?;
+                }
+            }
+            kernels.rope_neox_f16(&b.q, &b.pos, 1, p.n_heads, p.head_dim, p.rope_theta, stream)?;
+            kernels.rope_neox_f16(&b.k, &b.pos, 1, p.n_kv_heads, p.head_dim, p.rope_theta, stream)?;
+            kernels.kv_append_f16(
+                &self.kv.k[l],
+                &self.kv.v[l],
+                &b.k,
+                &b.v,
+                &self.page_table_dev,
+                &self.seq_len_dev,
+                p.n_kv_heads,
+                self.kv.cfg.page_size,
+                p.head_dim,
+                stream,
+            )?;
+            kernels.attn_decode_f16(
+                &b.attn_out,
+                &b.q,
+                &self.kv.k[l],
+                &self.kv.v[l],
+                &self.page_table_dev,
+                &self.seq_len_dev,
+                1,
+                p.n_heads,
+                p.n_kv_heads,
+                p.head_dim,
+                self.kv.cfg.page_size,
+                self.max_pages_per_seq,
+                scale,
+                stream,
+            )?;
+
+            self.gemv(&b.o_out, &layer.attn_o, &b.attn_out, stream)?;
+            kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.o_out, &layer.ffn_norm, 1, hidden, eps, stream)?;
+
+            match &layer.ffn {
+                LayerFfn::Moe(moe) => self.moe_decode_ffn(moe, hidden, stream)?,
+                LayerFfn::Dense(_) => {
+                    return Err(ForgeError::Unsupported(
+                        "dense layer inside a MoE forward pass".into(),
+                    ))
+                }
+            }
+
+            let next_norm = if l + 1 < n_layers {
+                &self.weights.layers[l + 1].attn_norm
+            } else {
+                &self.weights.output_norm
+            };
+            kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.down, next_norm, 1, hidden, eps, stream)?;
+        }
+
+        self.logits_gemv(&b.logits, &b.x, stream)
+    }
+
+    /// Apply the routed experts for one token: `b.x` holds the FFN-normed
+    /// input, `b.down` receives the weighted sum of the selected experts'
+    /// SwiGLU outputs (plus the shared expert if present). The top-k experts
+    /// are read back to the host to index the stacked expert weights.
+    fn moe_decode_ffn(&self, moe: &MoeFfn, hidden: usize, stream: &Stream) -> Result<()> {
+        let b = &self.bufs;
+        let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
+        let inter = moe.moe_inter;
+        let k = moe.n_experts_used;
+        let DevWeight::F16 { buf: router_buf, .. } = &moe.router else {
+            return Err(ForgeError::Unsupported("MoE router must be f16".into()));
+        };
+        self.kernels.moe_router_f16(
+            &mb.ids,
+            &mb.weights,
+            &b.x,
+            router_buf,
+            1,
+            hidden,
+            moe.n_experts,
+            k,
+            moe.norm_topk,
+            stream,
+        )?;
+        self.device.copy(&mb.ids, 0, &mb.pinned_ids, 0, k * 4, stream)?;
+        self.device
+            .copy(&mb.weights, 0, &mb.pinned_weights, 0, k * 4, stream)?;
+        self.device.synchronize()?;
+        let ids = unsafe {
+            std::slice::from_raw_parts(
+                mb.pinned_ids.host_ptr().expect("pinned host mapping") as *const i32,
+                k,
+            )
+        };
+        let weights = unsafe {
+            std::slice::from_raw_parts(
+                mb.pinned_weights.host_ptr().expect("pinned host mapping") as *const f32,
+                k,
+            )
+        };
+        self.moe_experts_accumulate(moe, &b.x, &b.down, 0, inter, hidden, ids, weights, stream)
+    }
+
+    /// Run each selected expert's SwiGLU over the single-token activation
+    /// `x_in` (contiguous [hidden] at offset 0) and accumulate
+    /// `weight * expert_out` into `out` at byte offset `out_off`. Reuses the
+    /// quant GEMV machinery indexed by expert row-offset; the shared expert (if
+    /// any) is folded in last. Scratch (`b.gate/up/act`, `mb.tmp`) is
+    /// single-token sized, so this serves both the decode and prefill loops.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts_accumulate(
+        &self,
+        moe: &MoeFfn,
+        x_in: &DevBuffer,
+        out: &DevBuffer,
+        out_off: usize,
+        inter: usize,
+        hidden: usize,
+        ids: &[i32],
+        weights: &[f32],
+        stream: &Stream,
+    ) -> Result<()> {
+        let b = &self.bufs;
+        let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
+        // A single-token GEMV over an expert = a row window of the stacked
+        // expert matrix, i.e. gemm_rows at the expert row-offset (rows-per-
+        // expert = inter for gate/up, hidden for down).
+        for (j, (&e, &wt)) in ids.iter().zip(weights).enumerate() {
+            let e = e as usize;
+            if e >= moe.n_experts {
+                return Err(ForgeError::Kernel(format!(
+                    "router selected out-of-range expert {e}"
+                )));
+            }
+            self.gemm_rows(&b.gate, &moe.gate_exps, x_in, 1, e * inter, inter, stream)?;
+            self.gemm_rows(&b.up, &moe.up_exps, x_in, 1, e * inter, inter, stream)?;
+            self.kernels.silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
+            self.gemm_rows(&mb.tmp, &moe.down_exps, &b.act, 1, e * hidden, hidden, stream)?;
+            self.kernels
+                .moe_scale_add_f16(out, out_off, &mb.tmp, 0, hidden, wt, j == 0, stream)?;
+        }
+        // Shared always-on expert: a dense SwiGLU added on top (weight 1.0).
+        if let Some(sh) = &moe.shared {
+            // Shared expert down is [hidden, shared_inter], so cols = its width.
+            let sh_inter = sh.down.cols();
+            match &sh.gate_up {
+                GateUpWeights::Fused(w) => {
+                    self.gemm_rows(&b.gate, w, x_in, 1, 0, sh_inter, stream)?;
+                    self.gemm_rows(&b.up, w, x_in, 1, sh_inter, sh_inter, stream)?;
+                }
+                GateUpWeights::Split { gate, up } => {
+                    self.gemm(&b.gate, gate, x_in, 1, stream)?;
+                    self.gemm(&b.up, up, x_in, 1, stream)?;
+                }
+            }
+            self.kernels.silu_mul_f16(&b.act, &b.gate, &b.up, sh_inter, stream)?;
+            self.gemm(&mb.tmp, &sh.down, &b.act, 1, stream)?;
+            self.kernels
+                .moe_scale_add_f16(out, out_off, &mb.tmp, 0, hidden, 1.0, false, stream)?;
+        }
+        Ok(())
+    }
+
+    /// Routed experts for a prefill chunk: route all `t` tokens at once, then
+    /// apply each token's top-k experts, writing `[t, hidden]` into `pb.down`.
+    /// Correctness-first per-token loop (grouped-GEMM permute/unpermute is a
+    /// tracked perf follow-up); the router readback is one sync per layer.
+    fn moe_prefill_ffn(
+        &self,
+        moe: &MoeFfn,
+        t: usize,
+        hidden: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
+        let pb = self.prefill_bufs.as_ref().expect("prefill bufs allocated");
+        let inter = moe.moe_inter;
+        let k = moe.n_experts_used;
+        let DevWeight::F16 { buf: router_buf, .. } = &moe.router else {
+            return Err(ForgeError::Unsupported("MoE router must be f16".into()));
+        };
+        self.kernels.moe_router_f16(
+            &mb.ids,
+            &mb.weights,
+            &pb.x,
+            router_buf,
+            t,
+            hidden,
+            moe.n_experts,
+            k,
+            moe.norm_topk,
+            stream,
+        )?;
+        self.device.copy(&mb.ids, 0, &mb.pinned_ids, 0, t * k * 4, stream)?;
+        self.device
+            .copy(&mb.weights, 0, &mb.pinned_weights, 0, t * k * 4, stream)?;
+        self.device.synchronize()?;
+        let ids = unsafe {
+            std::slice::from_raw_parts(
+                mb.pinned_ids.host_ptr().expect("pinned host mapping") as *const i32,
+                t * k,
+            )
+        };
+        let weights = unsafe {
+            std::slice::from_raw_parts(
+                mb.pinned_weights.host_ptr().expect("pinned host mapping") as *const f32,
+                t * k,
+            )
+        };
+        for ti in 0..t {
+            // Copy this token's normed hidden into a contiguous scratch row so
+            // the single-token expert GEMVs read from offset 0.
+            self.device
+                .copy(&pb.x, ti * hidden * 2, &mb.xrow, 0, hidden * 2, stream)?;
+            self.moe_experts_accumulate(
+                moe,
+                &mb.xrow,
+                &pb.down,
+                ti * hidden * 2,
+                inter,
+                hidden,
+                &ids[ti * k..(ti + 1) * k],
+                &weights[ti * k..(ti + 1) * k],
+                stream,
+            )?;
+        }
+        Ok(())
     }
 
     /// Fused decode step: six launches per layer instead of nine. The
@@ -2778,7 +3140,7 @@ impl Model {
                 self.device.record_event(&tb.slots[s].free, stream)?;
             }
             self.gemv_residual(&layer.attn_o, &b.attn_out, stream)?;
-            match &layer.ffn_gate_up {
+            match &layer.dense_ffn()?.gate_up {
                 GateUpWeights::Fused(w) => {
                     self.gemv_norm_silu(&b.act, w, &layer.ffn_norm, eps, stream)?;
                 }
@@ -2793,7 +3155,7 @@ impl Model {
                     kernels.silu_mul_f16(&b.act, &b.gate, &b.up, p.intermediate_size, stream)?;
                 }
             }
-            self.gemv_residual(&layer.ffn_down, &b.act, stream)?;
+            self.gemv_residual(&layer.dense_ffn()?.down, &b.act, stream)?;
         }
 
         kernels.rmsnorm_h32_f16(&b.x, &b.h, &b.h32, &self.weights.output_norm, 1, hidden, eps, stream)?;
@@ -3047,7 +3409,7 @@ impl Model {
             self.gemm(&bb.o_out, &layer.attn_o, &bb.attn_out, n, stream)?;
             kernels.rmsnorm_residual_f16(&bb.x, &bb.h, &bb.o_out, &layer.ffn_norm, n, hidden, eps, stream)?;
 
-            match &layer.ffn_gate_up {
+            match &layer.dense_ffn()?.gate_up {
                 GateUpWeights::Fused(w) => {
                     self.gemm_rows(&bb.gate, w, &bb.x, n, 0, inter, stream)?;
                     self.gemm_rows(&bb.up, w, &bb.x, n, inter, inter, stream)?;
@@ -3058,7 +3420,7 @@ impl Model {
                 }
             }
             kernels.silu_mul_f16(&bb.act, &bb.gate, &bb.up, n * inter, stream)?;
-            self.gemm(&bb.down, &layer.ffn_down, &bb.act, n, stream)?;
+            self.gemm(&bb.down, &layer.dense_ffn()?.down, &bb.act, n, stream)?;
 
             let next_norm = if l + 1 < n_layers {
                 &self.weights.layers[l + 1].attn_norm
@@ -3113,6 +3475,14 @@ impl Model {
                 "rotational KV (rot4/rot3) supports single-stream decode only; \
                  disable batching for this model"
                     .into(),
+            ));
+        }
+        // MoE routing chooses experts per token from a host readback, so the
+        // batched forward cannot be graph-captured; MoE decodes one sequence at
+        // a time (batched grouped-GEMM MoE is a tracked follow-up).
+        if self.weights.is_moe() {
+            return Err(ForgeError::Unsupported(
+                "MoE models support single-stream decode only; disable batching".into(),
             ));
         }
         // Batched growth appends pages without refreshing the single-stream

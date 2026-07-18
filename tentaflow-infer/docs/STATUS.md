@@ -23,7 +23,8 @@ Ostatnia aktualizacja: 2026-07-18.
   streaming detok UTF-8, stop-holdback
 - ✅ **Kernele Mojo** (AOT→PTX): rmsnorm/layernorm, rope, silu, fused dequant
   GEMV+GEMM (wszystkie quanty + dp4a int8 + mma tensor-core), paged flash
-  attention (decode split-K + prefill, GQA), conv1d/gelu (Whisper), sampling GPU
+  attention (decode split-K + prefill, GQA), conv1d/gelu (Whisper), sampling GPU,
+  MoE router (softmax→top-k→renorm) + scale-add akumulacja ekspertów
 - ✅ **Silnik LLM**: forward, paged KV, fused decode chain, batched continuous
   decode (36× throughput), chunked prefill, admission control, CUDA-graph per bucket
 - ✅ **Drabinka kwantyzacji KV**: f16 → fp8 → rot4 → rot3 (TurboQuant)
@@ -45,8 +46,9 @@ Ostatnia aktualizacja: 2026-07-18.
   adaptive-disable) ISTNIEJE, ale NIE jest wpięty w pętlę decode — brak draft
   model / MTP / EAGLE proposerów i tree-verification w silniku. To rusztowanie,
   nie działająca akceleracja.
-- 🟡 **§4.2 Rejestr architektur**: qwen3, llama, mistral. Brak: DeepSeek (MLA),
-  Gemma (sliding-window), Phi, Mixtral/MoE, Qwen-MoE, hybrydy Mamba.
+- 🟡 **§4.2 Rejestr architektur**: qwen3, llama, mistral, olmoe (MoE), qwen3moe
+  (MoE). Brak: DeepSeek (MLA), Gemma (sliding-window), Phi, hybrydy SSM/Mamba
+  (qwen35moe = Qwen3.6 hybrid SSM+MoE wymaga kerneli Gated-DeltaNet — poza MoE).
 - 🟡 **§9.2 Odporność**: admission ✅; brak respawn workera po crashu, health
   per-GPU, pełnego graceful drain.
 - 🟡 **§8.3 Operacyjność**: /healthz ✅; brak metryk Prometheus/OTel, hot reload.
@@ -74,7 +76,14 @@ Ostatnia aktualizacja: 2026-07-18.
 - ❌ **§4.3 Video** (rozumienie + DiT)
 - ❌ **§4.3 Reranking** (cross-encoder)
 - ❌ **§4.3 Multimodal input** (vision encoder → embeddingi)
-- ❌ **MoE**: brak fused MoE dispatch/combine → modele MoE nie działają
+- 🟡 **§4.4 MoE**: routed Mixture-of-Experts DZIAŁA (OLMoE-1B-7B e2e, spójny
+  tekst). Router GPU (softmax-over-all → top-k → opcjonalny renorm, test vs CPU),
+  per-token pętla ekspertów przez indeksowane quant-GEMV (offset bajtowy w
+  stackowanym tensorze `ffn_*_exps`), akumulacja `moe_scale_add`. Wspiera
+  full-vector QK-norm (OLMoE) i per-head (qwen3moe), shared experts (design).
+  Decode single-stream (bez CUDA-graph — wybór ekspertów zależny od danych) +
+  prefill batched. TODO (perf): grouped-GEMM permute/unpermute zamiast pętli,
+  batched-MoE decode, KV low-bit/tiering dla MoE.
 - ❌ **§4.4 MLA** (DeepSeek), **sliding-window + sinks**, **linear/SSM** (Mamba)
 - ❌ **ONNX** (import grafu → IR; parakeet/silero/depth z .runtime)
 
