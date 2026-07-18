@@ -8,11 +8,12 @@ use forge_hal::{DevBuffer, Device, Pool};
 use forge_types::{DType, ForgeError, MemKind, Result};
 
 /// KV cache storage mode. F16/Fp8 store the cache verbatim in that element type
-/// (bit-exact canonical paths). Rot stores older tokens as a Walsh-Hadamard
+/// (bit-exact canonical paths). Rot stores the full history as a Walsh-Hadamard
 /// rotated + low-bit (3/4-bit) packed region with a per-(token,head) f16 scale
-/// (TurboQuant-class; SPEC.md §5.5). The rot modes keep an f16 slab too so the
-/// proven prefill attention runs bit-exact and the low-bit copy is committed
-/// right after append; decode attention reads the packed region directly.
+/// (TurboQuant-class; SPEC.md §5.5), plus a small residual ring keeping the
+/// most-recent `residual_window` tokens at rotated f16 fidelity. There is NO
+/// full-context f16 slab: total rot KV ≈ packed(all) + f16(window) ≈ 0.5 B/elem,
+/// ~3.9× (rot4) / ~5× (rot3) less than the f16 cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvQuant {
     F16,
@@ -20,9 +21,8 @@ pub enum KvQuant {
     Rot {
         /// 3 or 4.
         bits: u8,
-        /// Most-recent tokens kept at f16 fidelity (config knob; SPEC default
-        /// 128). Reported by the engine; the correctness-first phase quantizes
-        /// the whole cached region, so this bounds the reported target only.
+        /// Most-recent tokens kept at rotated f16 fidelity in the residual ring
+        /// (SPEC default 128); older tokens are served from the low-bit store.
         residual_window: usize,
         /// Context length past which a sequence switches to the rotational
         /// store (SPEC default 4096 — rotation overhead loses below it).
@@ -31,8 +31,8 @@ pub enum KvQuant {
 }
 
 impl KvQuant {
-    /// Element type of the f16/fp8 slab this mode allocates. Rot keeps an f16
-    /// slab (prefill runs on it bit-exact); its low-bit region is separate.
+    /// Element type of the f16/fp8 cache. Rot has no f16 slab; this is the
+    /// element type of its residual ring (f16) for sizing only.
     pub fn slab_dtype(self) -> DType {
         match self {
             KvQuant::Fp8 => DType::F8E4M3,
@@ -47,6 +47,17 @@ impl KvQuant {
     pub fn bits(self) -> Option<u8> {
         match self {
             KvQuant::Rot { bits, .. } => Some(bits),
+            _ => None,
+        }
+    }
+
+    /// Residual-window ring depth in tokens (rot only), clamped to at least 1
+    /// so `pos % ring_slots` is well-defined in the kernels.
+    pub fn ring_slots(self) -> Option<usize> {
+        match self {
+            KvQuant::Rot {
+                residual_window, ..
+            } => Some(residual_window.max(1)),
             _ => None,
         }
     }
@@ -77,13 +88,16 @@ impl KvConfig {
 
 pub struct KvCache {
     pub cfg: KvConfig,
-    /// K/V slabs, one pair per layer.
+    /// K/V storage, one pair per layer. F16/Fp8: the full paged slab
+    /// ([n_pages, n_kv_heads, page_size, head_dim]). Rot: the small residual
+    /// ring ([ring_slots, n_kv_heads, head_dim] f16, rotated), indexed by
+    /// `pos % ring_slots` — NO full-context slab.
     pub k: Vec<DevBuffer>,
     pub v: Vec<DevBuffer>,
     /// Rotational low-bit region (rot modes only; empty otherwise): densely
     /// packed 3/4-bit codes and per-(token,head) f16 amax scales, one pair of
-    /// buffers per layer, addressed exactly like the f16 slab
-    /// ([n_pages, n_kv_heads, page_size, ·]).
+    /// buffers per layer, addressed like the paged f16 slab would be
+    /// ([n_pages, n_kv_heads, page_size, ·]) — the full history for reclaim.
     pub k_packed: Vec<DevBuffer>,
     pub v_packed: Vec<DevBuffer>,
     pub k_scale: Vec<DevBuffer>,
@@ -101,19 +115,29 @@ impl KvCache {
     pub fn new(device: &dyn Device, cfg: KvConfig) -> Result<Self> {
         let page_elems = cfg.n_kv_heads * cfg.page_size * cfg.head_dim;
         let slots = cfg.n_pages * cfg.n_kv_heads * cfg.page_size;
-        let bytes = cfg
-            .n_pages
-            .checked_mul(page_elems)
-            .and_then(|e| e.checked_mul(cfg.dtype().size()))
-            .ok_or_else(|| ForgeError::Scheduler("kv cache size overflow".into()))?;
+        // Rot allocates only the residual ring here (the full history lives in
+        // the low-bit packed region below); f16/fp8 allocate the full paged
+        // slab. `ring_slots` reuses the same page/head/head_dim element layout
+        // but with `ring_slots` slots instead of `n_pages * page_size`.
+        let kv_bytes = if let Some(ring_slots) = cfg.quant.ring_slots() {
+            ring_slots
+                .checked_mul(cfg.n_kv_heads * cfg.head_dim)
+                .and_then(|e| e.checked_mul(cfg.dtype().size()))
+                .ok_or_else(|| ForgeError::Scheduler("kv ring size overflow".into()))?
+        } else {
+            cfg.n_pages
+                .checked_mul(page_elems)
+                .and_then(|e| e.checked_mul(cfg.dtype().size()))
+                .ok_or_else(|| ForgeError::Scheduler("kv cache size overflow".into()))?
+        };
         let mut k = Vec::with_capacity(cfg.n_layers);
         let mut v = Vec::with_capacity(cfg.n_layers);
-        // The per-layer slabs are static for the model lifetime — paging is a
+        // The per-layer buffers are static for the model lifetime — paging is a
         // logical overlay managed here — so they come from the bump (Weights)
         // pool; the HAL KvCache slab arena serves fixed-size page churn only.
         for _ in 0..cfg.n_layers {
-            k.push(device.alloc(bytes, MemKind::Device, Pool::Weights)?);
-            v.push(device.alloc(bytes, MemKind::Device, Pool::Weights)?);
+            k.push(device.alloc(kv_bytes, MemKind::Device, Pool::Weights)?);
+            v.push(device.alloc(kv_bytes, MemKind::Device, Pool::Weights)?);
         }
         // Rotational low-bit region: packed codes (u8) + f16 scales per slot.
         let mut k_packed = Vec::new();

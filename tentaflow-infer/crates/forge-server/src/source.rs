@@ -214,11 +214,12 @@ pub fn read_descriptor(path: &Path) -> Result<ModelDescriptor> {
     }
 }
 
-/// Bytes the KV cache slabs of this model need for `kv_pages` pages of
-/// `kv_page_size` tokens in storage mode `quant`, plus per-slab
-/// pool-granularity rounding headroom. Rot modes keep the f16 slab (prefill
-/// runs on it bit-exact) AND the packed low-bit region + f16 scales, so both
-/// are reserved.
+/// Bytes the KV cache of this model needs for `kv_pages` pages of
+/// `kv_page_size` tokens in storage mode `quant`, plus per-buffer
+/// pool-granularity rounding headroom. F16/Fp8 reserve the full paged slab.
+/// Rot reserves the full-history packed low-bit region + f16 scales plus a
+/// small residual ring (`residual_window` tokens at f16) — NOT a full f16 slab,
+/// so its KV footprint is ~3.9× (rot4) / ~5× (rot3) below f16.
 pub fn kv_pool_bytes(
     desc: &ModelDescriptor,
     kv_page_size: usize,
@@ -229,13 +230,17 @@ pub fn kv_pool_bytes(
     let slots = p.n_kv_heads * kv_page_size * kv_pages;
     let granularity = forge_hal::cuda::PoolSizes::DEFAULT_KV_PAGE;
     let round = |b: usize| b.div_ceil(granularity) * granularity;
-    // K and V f16/fp8 slab per layer.
-    let slab = slots * p.head_dim * quant.slab_dtype().size();
-    let mut per_layer_pair = 2 * round(slab);
-    // Rot: packed low-bit codes (u8) + f16 scales, K and V per layer.
-    if let Some(pb) = quant.packed_bytes(p.head_dim) {
-        per_layer_pair += 2 * round(slots * pb) + 2 * round(slots * 2);
-    }
+    let per_layer_pair = if let Some(pb) = quant.packed_bytes(p.head_dim) {
+        // Rot: residual ring (f16) + packed low-bit codes (u8) + f16 scales,
+        // K and V per layer. No full-context f16 slab.
+        let ring_slots = quant.ring_slots().unwrap_or(1);
+        let ring = ring_slots * p.n_kv_heads * p.head_dim * quant.slab_dtype().size();
+        2 * round(ring) + 2 * round(slots * pb) + 2 * round(slots * 2)
+    } else {
+        // K and V f16/fp8 slab per layer.
+        let slab = slots * p.head_dim * quant.slab_dtype().size();
+        2 * round(slab)
+    };
     p.block_count * per_layer_pair + 64 * (1 << 20)
 }
 

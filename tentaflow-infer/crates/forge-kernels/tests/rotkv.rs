@@ -94,10 +94,14 @@ fn run_bits(kernels: &Kernels, dev: &dyn Device, bits: u8) -> f64 {
         )
         .unwrap();
     let scale = 1.0 / (HD as f32).sqrt();
+    // ring_slots = 0 exercises the packed-only path (dummy ring buffers are
+    // never dereferenced), locking the low-bit decode math on its own.
+    let k_ring = dev.alloc(HD * 2, MemKind::Device, Pool::Weights).unwrap();
+    let v_ring = dev.alloc(HD * 2, MemKind::Device, Pool::Weights).unwrap();
     kernels
         .attn_decode_rot(
-            &out, &q_buf, 0, &k_packed, &v_packed, &k_scale, &v_scale, &pt, &seq_lens, 1, 1, 1, HD,
-            PAGE, NPAGES, bits, scale, &stream,
+            &out, &q_buf, 0, &k_packed, &v_packed, &k_scale, &v_scale, &k_ring, &v_ring, &pt,
+            &seq_lens, 1, 1, 1, HD, PAGE, NPAGES, 0, bits, scale, &stream,
         )
         .unwrap();
     dev.synchronize().unwrap();

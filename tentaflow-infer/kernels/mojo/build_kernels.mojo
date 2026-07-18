@@ -107,6 +107,8 @@ from src.rotkv import kv_pack_rot_from_cache_hd64_b4, kv_pack_rot_from_cache_hd6
 from src.rotkv import kv_pack_rot_from_cache_hd128_b4, kv_pack_rot_from_cache_hd128_b3
 from src.rotkv import attn_decode_rot_hd64_b4, attn_decode_rot_hd64_b3
 from src.rotkv import attn_decode_rot_hd128_b4, attn_decode_rot_hd128_b3
+from src.rotkv import attn_prefill_rot_hd64_b4, attn_prefill_rot_hd64_b3
+from src.rotkv import attn_prefill_rot_hd128_b4, attn_prefill_rot_hd128_b3
 from src.sampling import penalize_f32, argmax_partial_f32, argmax_final_f32
 from src.sampling import topk_partial_f32, topk_final_f32
 from src.sampling import penalize_batched_f32, argmax_batched_f32, topk_batched_f32
@@ -442,6 +444,18 @@ def main() raises:
 
     _ = ctx.compile_function[attn_decode_rot_hd128_b3, dump_asm=Path("attn_decode_rot_hd128_b3.ptx")]()
     entries.append(_finalize(out_dir, "attn_decode_rot_hd128_b3"))
+
+    _ = ctx.compile_function[attn_prefill_rot_hd64_b4, dump_asm=Path("attn_prefill_rot_hd64_b4.ptx")]()
+    entries.append(_finalize(out_dir, "attn_prefill_rot_hd64_b4"))
+
+    _ = ctx.compile_function[attn_prefill_rot_hd64_b3, dump_asm=Path("attn_prefill_rot_hd64_b3.ptx")]()
+    entries.append(_finalize(out_dir, "attn_prefill_rot_hd64_b3"))
+
+    _ = ctx.compile_function[attn_prefill_rot_hd128_b4, dump_asm=Path("attn_prefill_rot_hd128_b4.ptx")]()
+    entries.append(_finalize(out_dir, "attn_prefill_rot_hd128_b4"))
+
+    _ = ctx.compile_function[attn_prefill_rot_hd128_b3, dump_asm=Path("attn_prefill_rot_hd128_b3.ptx")]()
+    entries.append(_finalize(out_dir, "attn_prefill_rot_hd128_b3"))
 
     _ = ctx.compile_function[penalize_f32, dump_asm=Path("penalize_f32.ptx")]()
     entries.append(_finalize(out_dir, "penalize_f32"))

@@ -107,6 +107,35 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// `rmsnorm_f16` over a section of a fused buffer, addressed by byte offset
+    /// (in/out share the slice). Used by the rot decode path to normalize the
+    /// q/k slices of a fused qkv buffer in place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_f16_at(
+        &self,
+        io: &DevBuffer,
+        byte_off: usize,
+        weight: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("rmsnorm_f16")?;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf_at(io, byte_off)?
+            .buf_at(io, byte_off)?
+            .buf(weight)
+            .scalar(cols as i64)
+            .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// residual += x; out = rmsnorm(residual) * weight (fused, f16).
     #[allow(clippy::too_many_arguments)]
     pub fn rmsnorm_residual_f16(
@@ -197,6 +226,36 @@ impl Kernels {
         };
         let args = LaunchArgs::new()
             .buf(x_io)
+            .buf(positions)
+            .scalar(n_heads as i64)
+            .scalar(head_dim as i64)
+            .scalar(theta_base);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// `rope_neox_f16` over a section of a fused buffer, addressed by byte
+    /// offset. Used by the rot decode path to rope the q/k slices of a fused
+    /// qkv buffer in place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_neox_f16_at(
+        &self,
+        x_io: &DevBuffer,
+        byte_off: usize,
+        positions: &DevBuffer,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        theta_base: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("rope_neox_f16")?;
+        let cfg = LaunchConfig {
+            grid: (n_tokens as u32, n_heads as u32, 1),
+            block: ((head_dim as u32 / 2).clamp(32, 256), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf_at(x_io, byte_off)?
             .buf(positions)
             .scalar(n_heads as i64)
             .scalar(head_dim as i64)
@@ -2212,9 +2271,64 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
-    /// Rotational low-bit decode attention: reads the packed 3/4-bit K/V store,
-    /// rotates q once, scores in rotated space ((R·q)·(R·k) = q·k), and
-    /// inverse-rotates the V accumulator once per head. One warp per (seq,head).
+    /// Rotate+quant+pack a batch of T linear (rope'd) K/V rows
+    /// ([n_tokens, n_kv_heads, head_dim] f16) into the paged rotational store at
+    /// positions base_pos..base_pos+T, writing the rotated f16 vectors into the
+    /// residual ring at `pos % ring_slots` (the recent-window fidelity copy the
+    /// decode attention reads directly). Grid (T, n_kv_heads).
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_pack_rot(
+        &self,
+        k_packed: &DevBuffer,
+        v_packed: &DevBuffer,
+        k_scale: &DevBuffer,
+        v_scale: &DevBuffer,
+        k_ring: &DevBuffer,
+        v_ring: &DevBuffer,
+        k_in: &DevBuffer,
+        k_in_byte_off: usize,
+        v_in: &DevBuffer,
+        v_in_byte_off: usize,
+        page_table: &DevBuffer,
+        base_pos: usize,
+        n_tokens: usize,
+        n_kv_heads: usize,
+        page_size: usize,
+        head_dim: usize,
+        ring_slots: usize,
+        bits: u8,
+        stream: &Stream,
+    ) -> Result<()> {
+        let name = Self::rot_kernel_name("kv_pack_rot", head_dim, bits)?;
+        let k = self.artifacts.get(&name)?;
+        let cfg = LaunchConfig {
+            grid: (n_tokens as u32, n_kv_heads as u32, 1),
+            block: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(k_packed)
+            .buf(v_packed)
+            .buf(k_scale)
+            .buf(v_scale)
+            .buf(k_ring)
+            .buf(v_ring)
+            .buf_at(k_in, k_in_byte_off)?
+            .buf_at(v_in, v_in_byte_off)?
+            .buf(page_table)
+            .scalar(base_pos as i64)
+            .scalar(n_kv_heads as i64)
+            .scalar(page_size as i64)
+            .scalar(ring_slots as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Rotational low-bit decode attention over the dual-region store: reads the
+    /// residual f16 ring for the recent `ring_slots` positions (rotated f16, no
+    /// unpack) and the packed 3/4-bit store for everything older. Rotates q once,
+    /// scores in rotated space ((R·q)·k_rot = q·k), and inverse-rotates the V
+    /// accumulator once per head. `ring_slots == 0` degrades to packed-only.
+    /// One warp per (seq,head).
     #[allow(clippy::too_many_arguments)]
     pub fn attn_decode_rot(
         &self,
@@ -2225,6 +2339,8 @@ impl Kernels {
         v_packed: &DevBuffer,
         k_scale: &DevBuffer,
         v_scale: &DevBuffer,
+        k_ring: &DevBuffer,
+        v_ring: &DevBuffer,
         page_table: &DevBuffer,
         seq_lens: &DevBuffer,
         n_seqs: usize,
@@ -2233,6 +2349,7 @@ impl Kernels {
         head_dim: usize,
         page_size: usize,
         max_pages: usize,
+        ring_slots: usize,
         bits: u8,
         scale: f32,
         stream: &Stream,
@@ -2251,12 +2368,62 @@ impl Kernels {
             .buf(v_packed)
             .buf(k_scale)
             .buf(v_scale)
+            .buf(k_ring)
+            .buf(v_ring)
             .buf(page_table)
             .buf(seq_lens)
             .scalar(n_q_heads as i64)
             .scalar(n_kv_heads as i64)
             .scalar(page_size as i64)
             .scalar(max_pages as i64)
+            .scalar(ring_slots as i64)
+            .scalar(scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Rotational low-bit causal prefill attention over the packed store: query
+    /// token t attends positions 0..base_pos+t. Packed-only (the residual ring's
+    /// recent window would be overwritten within a chunk). Grid (T, n_q_heads),
+    /// one warp per (token, head).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill_rot(
+        &self,
+        out: &DevBuffer,
+        q: &DevBuffer,
+        k_packed: &DevBuffer,
+        v_packed: &DevBuffer,
+        k_scale: &DevBuffer,
+        v_scale: &DevBuffer,
+        page_table: &DevBuffer,
+        base_pos: usize,
+        n_tokens: usize,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        bits: u8,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let name = Self::rot_kernel_name("attn_prefill_rot", head_dim, bits)?;
+        let k = self.artifacts.get(&name)?;
+        let cfg = LaunchConfig {
+            grid: (n_tokens as u32, n_q_heads as u32, 1),
+            block: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(q)
+            .buf(k_packed)
+            .buf(v_packed)
+            .buf(k_scale)
+            .buf(v_scale)
+            .buf(page_table)
+            .scalar(base_pos as i64)
+            .scalar(n_q_heads as i64)
+            .scalar(n_kv_heads as i64)
+            .scalar(page_size as i64)
             .scalar(scale);
         self.device.launch(k, &cfg, &args, stream)
     }

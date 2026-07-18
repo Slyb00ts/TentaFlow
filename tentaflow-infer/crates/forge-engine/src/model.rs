@@ -1363,62 +1363,93 @@ impl Model {
             kernels.rope_neox_f16(&pb.k, &pb.positions, t, p.n_kv_heads, p.head_dim, p.rope_theta, stream)?;
             trace.mark(self.device.as_ref(), "norm_rope");
 
-            // Causal attention reads the chunk's own K/V from the cache, so
-            // the batch append must land before the attention launch.
-            kernels.kv_append_batch(
-                &self.kv.k[l],
-                &self.kv.v[l],
-                &pb.k,
-                &pb.v,
-                &self.page_table_dev,
-                base_pos,
-                t,
-                p.n_kv_heads,
-                self.kv.cfg.page_size,
-                p.head_dim,
-                self.kv.cfg.dtype(),
-                stream,
-            )?;
-            trace.mark(self.device.as_ref(), "kv_append");
-            kernels.attn_prefill(
-                &pb.attn_out,
-                &pb.q,
-                &self.kv.k[l],
-                &self.kv.v[l],
-                &self.page_table_dev,
-                base_pos,
-                t,
-                p.n_heads,
-                p.n_kv_heads,
-                p.head_dim,
-                self.kv.cfg.page_size,
-                self.kv.cfg.dtype(),
-                scale,
-                stream,
-            )?;
-            trace.mark(self.device.as_ref(), "attn");
-
-            // Rot modes: commit the chunk's just-appended f16 K/V into the
-            // low-bit rotational store (decode reads it directly). Prefill
-            // attention above already ran on the bit-exact f16 slab.
             if let KvQuant::Rot { bits, .. } = self.kv.cfg.quant {
-                kernels.kv_pack_rot_from_cache(
+                // Rot: rotate+quant the chunk's rope'd K/V (linear pb.k/pb.v)
+                // straight into the full-history packed store + residual ring —
+                // no f16 slab. Packing must land before the attention launch,
+                // which reads the packed store causally.
+                let ring_slots = self
+                    .kv
+                    .cfg
+                    .quant
+                    .ring_slots()
+                    .expect("rot mode has ring_slots");
+                kernels.kv_pack_rot(
                     &self.kv.k_packed[l],
                     &self.kv.v_packed[l],
                     &self.kv.k_scale[l],
                     &self.kv.v_scale[l],
                     &self.kv.k[l],
                     &self.kv.v[l],
+                    &pb.k,
+                    0,
+                    &pb.v,
+                    0,
                     &self.page_table_dev,
                     base_pos,
                     t,
                     p.n_kv_heads,
                     self.kv.cfg.page_size,
                     p.head_dim,
+                    ring_slots,
                     bits,
                     stream,
                 )?;
                 trace.mark(self.device.as_ref(), "kv_pack_rot");
+                kernels.attn_prefill_rot(
+                    &pb.attn_out,
+                    &pb.q,
+                    &self.kv.k_packed[l],
+                    &self.kv.v_packed[l],
+                    &self.kv.k_scale[l],
+                    &self.kv.v_scale[l],
+                    &self.page_table_dev,
+                    base_pos,
+                    t,
+                    p.n_heads,
+                    p.n_kv_heads,
+                    p.head_dim,
+                    self.kv.cfg.page_size,
+                    bits,
+                    scale,
+                    stream,
+                )?;
+                trace.mark(self.device.as_ref(), "attn");
+            } else {
+                // Causal attention reads the chunk's own K/V from the cache, so
+                // the batch append must land before the attention launch.
+                kernels.kv_append_batch(
+                    &self.kv.k[l],
+                    &self.kv.v[l],
+                    &pb.k,
+                    &pb.v,
+                    &self.page_table_dev,
+                    base_pos,
+                    t,
+                    p.n_kv_heads,
+                    self.kv.cfg.page_size,
+                    p.head_dim,
+                    self.kv.cfg.dtype(),
+                    stream,
+                )?;
+                trace.mark(self.device.as_ref(), "kv_append");
+                kernels.attn_prefill(
+                    &pb.attn_out,
+                    &pb.q,
+                    &self.kv.k[l],
+                    &self.kv.v[l],
+                    &self.page_table_dev,
+                    base_pos,
+                    t,
+                    p.n_heads,
+                    p.n_kv_heads,
+                    p.head_dim,
+                    self.kv.cfg.page_size,
+                    self.kv.cfg.dtype(),
+                    scale,
+                    stream,
+                )?;
+                trace.mark(self.device.as_ref(), "attn");
             }
 
             self.gemm(&pb.o_out, &layer.attn_o, &pb.attn_out, t, stream)?;
@@ -1707,32 +1738,55 @@ impl Model {
         kernels.gather_rows_f16(&b.h, &self.weights.token_embd_f16, &b.ids, 1, hidden, stream)?;
         kernels.rmsnorm_f16(&b.x, &b.h, &self.weights.layers[0].attn_norm, 1, hidden, eps, stream)?;
 
+        let ring_slots = self
+            .kv
+            .cfg
+            .quant
+            .ring_slots()
+            .expect("rot mode has ring_slots");
         let n_layers = self.weights.layers.len();
         for l in 0..n_layers {
             let layer = &self.weights.layers[l];
-            let q_buf = match &layer.attn_qkv {
+            // Produce the rope'd q (attention query) plus the rope'd K/V as
+            // LINEAR buffers so the pack kernel rotates them into the packed
+            // store + residual ring. No paged f16 append (there is no f16 slab).
+            // Returned tuple: (q_buf, q_off, k_src, k_off, v_src, v_off).
+            let (q_buf, q_off, k_src, k_off, v_src, v_off): (
+                &DevBuffer,
+                usize,
+                &DevBuffer,
+                usize,
+                &DevBuffer,
+                usize,
+            ) = match &layer.attn_qkv {
                 QkvWeights::Fused(w) => {
                     self.gemv(&b.qkv, w, &b.x, stream)?;
-                    kernels.qkv_post_f16(
-                        &b.qkv, 0, &b.qkv, k_byte_off, &b.qkv, v_byte_off,
-                        layer.q_norm.as_ref(), layer.k_norm.as_ref(),
-                        &self.kv.k[l], &self.kv.v[l], &b.pos, &self.page_table_dev,
-                        &self.seq_len_dev, p.n_heads, p.n_kv_heads, p.head_dim,
-                        self.kv.cfg.page_size, eps, p.rope_theta, stream,
-                    )?;
-                    &b.qkv
+                    if let Some(qn) = &layer.q_norm {
+                        kernels.rmsnorm_f16_at(&b.qkv, 0, qn, p.n_heads, p.head_dim, eps, stream)?;
+                    }
+                    if let Some(kn) = &layer.k_norm {
+                        kernels.rmsnorm_f16_at(
+                            &b.qkv, k_byte_off, kn, p.n_kv_heads, p.head_dim, eps, stream,
+                        )?;
+                    }
+                    kernels.rope_neox_f16_at(&b.qkv, 0, &b.pos, 1, p.n_heads, p.head_dim, p.rope_theta, stream)?;
+                    kernels.rope_neox_f16_at(&b.qkv, k_byte_off, &b.pos, 1, p.n_kv_heads, p.head_dim, p.rope_theta, stream)?;
+                    (&b.qkv, 0, &b.qkv, k_byte_off, &b.qkv, v_byte_off)
                 }
                 QkvWeights::FusedQk { qk, v } => {
                     self.gemv(&b.qkv, qk, &b.x, stream)?;
                     self.gemv(&b.v, v, &b.x, stream)?;
-                    kernels.qkv_post_f16(
-                        &b.qkv, 0, &b.qkv, k_byte_off, &b.v, 0,
-                        layer.q_norm.as_ref(), layer.k_norm.as_ref(),
-                        &self.kv.k[l], &self.kv.v[l], &b.pos, &self.page_table_dev,
-                        &self.seq_len_dev, p.n_heads, p.n_kv_heads, p.head_dim,
-                        self.kv.cfg.page_size, eps, p.rope_theta, stream,
-                    )?;
-                    &b.qkv
+                    if let Some(qn) = &layer.q_norm {
+                        kernels.rmsnorm_f16_at(&b.qkv, 0, qn, p.n_heads, p.head_dim, eps, stream)?;
+                    }
+                    if let Some(kn) = &layer.k_norm {
+                        kernels.rmsnorm_f16_at(
+                            &b.qkv, k_byte_off, kn, p.n_kv_heads, p.head_dim, eps, stream,
+                        )?;
+                    }
+                    kernels.rope_neox_f16_at(&b.qkv, 0, &b.pos, 1, p.n_heads, p.head_dim, p.rope_theta, stream)?;
+                    kernels.rope_neox_f16_at(&b.qkv, k_byte_off, &b.pos, 1, p.n_kv_heads, p.head_dim, p.rope_theta, stream)?;
+                    (&b.qkv, 0, &b.qkv, k_byte_off, &b.v, 0)
                 }
                 QkvWeights::Split { q, k, v } => {
                     self.gemv(&b.q, q, &b.x, stream)?;
@@ -1746,29 +1800,29 @@ impl Model {
                     }
                     kernels.rope_neox_f16(&b.q, &b.pos, 1, p.n_heads, p.head_dim, p.rope_theta, stream)?;
                     kernels.rope_neox_f16(&b.k, &b.pos, 1, p.n_kv_heads, p.head_dim, p.rope_theta, stream)?;
-                    kernels.kv_append_f16(
-                        &self.kv.k[l], &self.kv.v[l], &b.k, &b.v, &self.page_table_dev,
-                        &self.seq_len_dev, p.n_kv_heads, self.kv.cfg.page_size, p.head_dim, stream,
-                    )?;
-                    &b.q
+                    (&b.q, 0, &b.k, 0, &b.v, 0)
                 }
             };
 
-            // Commit the appended token into the packed low-bit store, then
-            // attend over it. q_buf's q head occupies the first q_dim elements.
-            kernels.kv_pack_rot_from_cache(
+            // Rotate+quant the token into the packed store + residual ring, then
+            // attend over the dual region (ring for the recent window, packed
+            // for older). q_buf's q head occupies head_dim*n_heads at q_off.
+            kernels.kv_pack_rot(
                 &self.kv.k_packed[l], &self.kv.v_packed[l],
                 &self.kv.k_scale[l], &self.kv.v_scale[l],
-                &self.kv.k[l], &self.kv.v[l], &self.page_table_dev,
-                base_pos, 1, p.n_kv_heads, self.kv.cfg.page_size, p.head_dim, bits, stream,
+                &self.kv.k[l], &self.kv.v[l],
+                k_src, k_off, v_src, v_off,
+                &self.page_table_dev,
+                base_pos, 1, p.n_kv_heads, self.kv.cfg.page_size, p.head_dim, ring_slots, bits, stream,
             )?;
             kernels.attn_decode_rot(
-                &b.attn_out, q_buf, 0,
+                &b.attn_out, q_buf, q_off,
                 &self.kv.k_packed[l], &self.kv.v_packed[l],
                 &self.kv.k_scale[l], &self.kv.v_scale[l],
+                &self.kv.k[l], &self.kv.v[l],
                 &self.page_table_dev, &self.seq_len_dev,
                 1, p.n_heads, p.n_kv_heads, p.head_dim,
-                self.kv.cfg.page_size, self.max_pages_per_seq, bits, scale, stream,
+                self.kv.cfg.page_size, self.max_pages_per_seq, ring_slots, bits, scale, stream,
             )?;
 
             self.gemv(&b.o_out, &layer.attn_o, &b.attn_out, stream)?;
