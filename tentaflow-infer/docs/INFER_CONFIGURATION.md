@@ -96,6 +96,35 @@ Zakres v2 (dawne ograniczenia v1 — usunięte):
   extenty (exact-size free list) — rośnie do szczytowego working setu, nie
   monotonicznie; znika przy wyjściu.
 
+### KVFlash: stały mały gorący budżet VRAM (serve / run / bench)
+
+Tryb Luce-KVFlash: **ślad KV w VRAM jest stałą, małą gorącą pulą niezależnie
+od długości kontekstu**, a wszystko poza nią żyje w RAM/NVMe. Kontekst
+pojedynczej sekwencji jest ograniczony przez RAM+dysk, nie przez VRAM — pula
+VRAM nie rośnie z kontekstem. To nadbudówka konfiguracyjna nad tieringiem: gdy
+`--kv-hot-pages` jest ustawione, **nadpisuje** domyślne sizowanie
+`kv_pages = pełne okno kontekstu`, przez co VRAM pozostaje stały gdy kontekst
+rośnie.
+
+| Flaga | Domyślnie | Opis |
+|---|---|---|
+| `--kv-hot-pages <N>` | `0` | Ustala gorącą pulę KV w VRAM na dokładnie N stron (32 tokeny/strona) niezależnie od `--ctx`; reszta okna strumieniuje przez tier. `0` = dzisiejsze zachowanie (pula VRAM na pełne okno). Wymaga `--kv-tier ram\|nvme` — bez tieru nie ma dokąd wypchnąć nadmiaru (jasny błąd). Musi pokryć co najmniej minimalną rezydencję silnika (jeden chunk prefillu + gorący ogon, `min_resident_pages` = 37 stron przy page_size=32); niższa wartość to jasny błąd zamiast zakleszczenia. |
+| `--kvflash` | `false` | Skrót: włącza tier `nvme` + małą domyślną gorącą pulę (`256` stron = 8k tokenów gorące), jeśli użytkownik nie ustawił `--kv-tier` / `--kv-hot-pages` jawnie. Komponuje się z `--kv-tier-dir` / `--kv-tier-ram-gb`. |
+
+Przykłady:
+```bash
+# 2k-tokenowa gorąca pula VRAM (64 strony), reszta na NVMe; VRAM KV stały
+forge run <bielik> "<prompt>" -n 400 --kvflash --kv-hot-pages 64
+# serve z 2k gorącym budżetem admituje request > 2k tokenów (streamed decode)
+forge serve <bielik> --kvflash --kv-hot-pages 64
+```
+
+Zweryfikowane na Bielik-7B-NVFP4 (RTX 4090): przy `--kv-hot-pages 64` (pula
+VRAM 2k tokenów) kontekst rosnący ponad 2k tokenów kończy się poprawnie, pula
+KV w VRAM pozostaje stała (log sizowania puli / region KV `nvidia-smi`), a
+needle zasadzony wcześnie jest odtworzony po tym, jak gorąca pula wykręciła
+się w całości (spill przez granicę + restore).
+
 ---
 
 ## KV cache — drabinka kwantyzacji (serve / run / bench)
@@ -188,7 +217,7 @@ mono), `language` (np. `pl`; ignorowane dla modeli `.en`).
 | `-n, --max-tokens <N>` | `256` | Limit generacji. |
 | `--temp <F>` | `0.7` | Temperatura (`0` = greedy). |
 | `--chat` | off | Opakowuje prompt w szablon czatu modelu (user message, add_generation_prompt). |
-| + `--ctx`, `--weights-pool-gb`, `--kv-pages`, `--kv-cache`, `--kv-residual-window`, `--kv-activate-at`, `--kv-tier*` | jw. | Jak w sekcjach wyżej. |
+| + `--ctx`, `--weights-pool-gb`, `--kv-pages`, `--kv-cache`, `--kv-residual-window`, `--kv-activate-at`, `--kv-tier*`, `--kv-hot-pages`, `--kvflash` | jw. | Jak w sekcjach wyżej. |
 
 ## forge bench
 

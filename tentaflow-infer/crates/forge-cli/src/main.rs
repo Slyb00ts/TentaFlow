@@ -99,6 +99,18 @@ enum Command {
         /// of the pool.
         #[arg(long = "kv-tier-watermark", default_value_t = 0.10)]
         kv_tier_watermark: f64,
+        /// KVFlash: fix the VRAM hot KV pool to N pages (32 tokens each)
+        /// regardless of --ctx, streaming the rest of the context via the
+        /// tier. VRAM stays constant as context grows. Requires --kv-tier
+        /// ram|nvme. 0 = full-context VRAM pool (default behavior).
+        #[arg(long = "kv-hot-pages", default_value_t = 0)]
+        kv_hot_pages: usize,
+        /// KVFlash shorthand: enable the NVMe tier and a small default hot
+        /// pool (256 pages = 8k tokens) unless --kv-tier / --kv-hot-pages are
+        /// set explicitly, so a single sequence's context is bounded by
+        /// RAM+disk, not VRAM.
+        #[arg(long = "kvflash", default_value_t = false)]
+        kvflash: bool,
     },
     /// Print an embedding vector for one text (dims + L2 norm + first values).
     Embed {
@@ -165,6 +177,17 @@ enum Command {
         /// of the pool.
         #[arg(long = "kv-tier-watermark", default_value_t = 0.10)]
         kv_tier_watermark: f64,
+        /// KVFlash: fix the VRAM hot KV pool to N pages (32 tokens each)
+        /// regardless of --ctx, streaming the rest of the context via the
+        /// tier. VRAM stays constant as context grows. Requires --kv-tier
+        /// ram|nvme. 0 = full-context VRAM pool (default behavior).
+        #[arg(long = "kv-hot-pages", default_value_t = 0)]
+        kv_hot_pages: usize,
+        /// KVFlash shorthand: enable the NVMe tier and a small default hot
+        /// pool (256 pages = 8k tokens) unless --kv-tier / --kv-hot-pages are
+        /// set explicitly.
+        #[arg(long = "kvflash", default_value_t = false)]
+        kvflash: bool,
     },
     /// Transcribe a WAV file with a Whisper model.
     Transcribe {
@@ -216,6 +239,16 @@ enum Command {
         /// of the pool.
         #[arg(long = "kv-tier-watermark", default_value_t = 0.10)]
         kv_tier_watermark: f64,
+        /// KVFlash: fix the VRAM hot KV pool to N pages (32 tokens each)
+        /// regardless of --ctx, streaming the rest of the context via the
+        /// tier. Requires --kv-tier ram|nvme. 0 = full-context VRAM pool.
+        #[arg(long = "kv-hot-pages", default_value_t = 0)]
+        kv_hot_pages: usize,
+        /// KVFlash shorthand: enable the NVMe tier and a small default hot
+        /// pool (256 pages = 8k tokens) unless --kv-tier / --kv-hot-pages are
+        /// set explicitly.
+        #[arg(long = "kvflash", default_value_t = false)]
+        kvflash: bool,
     },
 }
 
@@ -249,23 +282,36 @@ fn main() -> Result<()> {
             kv_tier_ram_gb,
             kv_tier_watermark,
             ctx,
-        } => cmd_serve(
-            &model_path,
-            bind,
-            model_id,
-            api_key,
-            max_active,
-            batch_min,
-            prefill_chunk,
-            kv_pages,
-            weights_pool_gb,
-            tool_call_parser,
-            whisper_model.as_deref(),
-            embed_model.as_deref(),
-            parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
-            parse_kv_tier(&kv_tier, kv_tier_dir, kv_tier_ram_gb, kv_tier_watermark)?,
-            ctx,
-        ),
+            kv_hot_pages,
+            kvflash,
+        } => {
+            let (hot_pages, tier) = resolve_kvflash(
+                kvflash,
+                kv_hot_pages,
+                &kv_tier,
+                kv_tier_dir,
+                kv_tier_ram_gb,
+                kv_tier_watermark,
+            )?;
+            cmd_serve(
+                &model_path,
+                bind,
+                model_id,
+                api_key,
+                max_active,
+                batch_min,
+                prefill_chunk,
+                kv_pages,
+                weights_pool_gb,
+                tool_call_parser,
+                whisper_model.as_deref(),
+                embed_model.as_deref(),
+                parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
+                tier,
+                ctx,
+                hot_pages,
+            )
+        }
         Command::Embed {
             model_path,
             text,
@@ -295,18 +341,31 @@ fn main() -> Result<()> {
             kv_tier_dir,
             kv_tier_ram_gb,
             kv_tier_watermark,
-        } => cmd_run(
-            &model_path,
-            &prompt,
-            max_tokens,
-            temperature,
-            chat,
-            weights_pool_gb,
-            parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
-            parse_kv_tier(&kv_tier, kv_tier_dir, kv_tier_ram_gb, kv_tier_watermark)?,
-            ctx,
-            kv_pages,
-        ),
+            kv_hot_pages,
+            kvflash,
+        } => {
+            let (hot_pages, tier) = resolve_kvflash(
+                kvflash,
+                kv_hot_pages,
+                &kv_tier,
+                kv_tier_dir,
+                kv_tier_ram_gb,
+                kv_tier_watermark,
+            )?;
+            cmd_run(
+                &model_path,
+                &prompt,
+                max_tokens,
+                temperature,
+                chat,
+                weights_pool_gb,
+                parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
+                tier,
+                ctx,
+                kv_pages,
+                hot_pages,
+            )
+        }
         Command::Transcribe {
             model_dir,
             wav_path,
@@ -325,15 +384,28 @@ fn main() -> Result<()> {
             kv_tier_dir,
             kv_tier_ram_gb,
             kv_tier_watermark,
-        } => cmd_bench(
-            &model_path,
-            tokens,
-            prompt_tokens,
-            parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
-            parse_kv_tier(&kv_tier, kv_tier_dir, kv_tier_ram_gb, kv_tier_watermark)?,
-            ctx,
-            kv_pages,
-        ),
+            kv_hot_pages,
+            kvflash,
+        } => {
+            let (hot_pages, tier) = resolve_kvflash(
+                kvflash,
+                kv_hot_pages,
+                &kv_tier,
+                kv_tier_dir,
+                kv_tier_ram_gb,
+                kv_tier_watermark,
+            )?;
+            cmd_bench(
+                &model_path,
+                tokens,
+                prompt_tokens,
+                parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
+                tier,
+                ctx,
+                kv_pages,
+                hot_pages,
+            )
+        }
     }
 }
 
@@ -373,6 +445,54 @@ fn parse_kv_tier(
     })
 }
 
+/// KVFlash default hot pool when `--kvflash` is given without an explicit
+/// `--kv-hot-pages`: 256 pages × 32 tokens = 8k tokens kept in VRAM, the rest
+/// of the context streaming from RAM/NVMe.
+const KVFLASH_DEFAULT_HOT_PAGES: usize = 256;
+
+/// Resolve the KVFlash hot-pool + tier settings shared by serve/run/bench.
+/// `--kvflash` is shorthand: enable the NVMe tier and a small default hot pool
+/// unless the user set `--kv-tier` / `--kv-hot-pages` explicitly. Returns the
+/// effective hot-page count (0 = full-context VRAM pool, today's behavior) and
+/// the parsed tier config. A fixed hot pool needs somewhere to spill the rest
+/// of the context, so a non-zero hot pool without a tier is a hard error.
+fn resolve_kvflash(
+    kvflash: bool,
+    kv_hot_pages: usize,
+    tier_mode: &str,
+    tier_dir: Option<PathBuf>,
+    tier_ram_gb: f64,
+    tier_watermark: f64,
+) -> Result<(usize, KvTierConfig)> {
+    let tier_mode = if kvflash && tier_mode == "off" {
+        "nvme"
+    } else {
+        tier_mode
+    };
+    let hot_pages = if kvflash && kv_hot_pages == 0 {
+        KVFLASH_DEFAULT_HOT_PAGES
+    } else {
+        kv_hot_pages
+    };
+    let tier = parse_kv_tier(tier_mode, tier_dir, tier_ram_gb, tier_watermark)?;
+    if hot_pages > 0 {
+        if !tier.enabled() {
+            bail!(
+                "--kv-hot-pages requires --kv-tier ram|nvme (a fixed VRAM hot pool needs a \
+                 tier to spill the rest of the context to; use --kvflash for the NVMe default)"
+            );
+        }
+        let floor = forge_engine::tier::min_resident_pages(ModelConfig::default().kv_page_size);
+        if hot_pages < floor {
+            bail!(
+                "--kv-hot-pages {hot_pages} is below the engine minimum residency of {floor} \
+                 pages (one prefill chunk + hot tail); raise it so a sequence never deadlocks"
+            );
+        }
+    }
+    Ok((hot_pages, tier))
+}
+
 /// VRAM bytes of the streamed-tier staging (two full-context single-layer
 /// slabs); lives in the weights pool alongside the KV slabs.
 fn tier_stage_bytes(
@@ -402,15 +522,20 @@ fn load_for_serve(
     kv_quant: KvQuant,
     kv_tier: KvTierConfig,
     ctx: usize,
+    hot_pages: usize,
 ) -> Result<(LoadedModel, usize, usize)> {
     let kv_page_size = ModelConfig::default().kv_page_size;
     let desc = read_descriptor(path)?;
     // Without tiering the shared KV pool must hold at least one full-context
     // sequence; with tiering the pool is only the hot working set and the
-    // rest of the window spills to RAM/NVMe.
+    // rest of the window spills to RAM/NVMe. KVFlash (`hot_pages > 0`) fixes
+    // the VRAM pool to exactly that many pages regardless of --ctx, so VRAM
+    // stays constant as the context grows.
     let (max_seq_len, ctx_pages) =
         resolve_ctx(desc.params.max_position_embeddings, ctx, kv_page_size);
-    let kv_pages = if kv_tier.enabled() {
+    let kv_pages = if hot_pages > 0 {
+        hot_pages
+    } else if kv_tier.enabled() {
         kv_pages.min(ctx_pages)
     } else {
         kv_pages.max(ctx_pages)
@@ -473,6 +598,7 @@ fn load_auto(
     kv_tier: KvTierConfig,
     ctx: usize,
     kv_pages_flag: usize,
+    hot_pages: usize,
 ) -> Result<LoadedModel> {
     // Read hyperparameters before loading weights so the KV cache is sized for
     // the requested context up front (its slabs are allocated during load).
@@ -480,9 +606,12 @@ fn load_auto(
     let page_size = ModelConfig::default().kv_page_size;
     let (max_seq_len, ctx_pages) =
         resolve_ctx(desc.params.max_position_embeddings, ctx, page_size);
-    // 0 = a pool covering the whole context (today's behavior); an explicit
-    // count caps the hot VRAM working set (useful with --kv-tier).
-    let kv_pages = if kv_pages_flag > 0 {
+    // KVFlash (`hot_pages > 0`) fixes the VRAM pool to a constant page count
+    // regardless of --ctx; else 0 = a pool covering the whole context (today's
+    // behavior) and an explicit --kv-pages caps the hot VRAM working set.
+    let kv_pages = if hot_pages > 0 {
+        hot_pages
+    } else if kv_pages_flag > 0 {
         kv_pages_flag.min(ctx_pages)
     } else {
         ctx_pages
@@ -618,6 +747,7 @@ fn cmd_embed(
         KvTierConfig::default(),
         8192,
         0,
+        0,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
@@ -691,11 +821,12 @@ fn cmd_serve(
     kv_quant: KvQuant,
     kv_tier: KvTierConfig,
     ctx: usize,
+    hot_pages: usize,
 ) -> Result<()> {
     let max_active = usize::from(max_active);
     let t0 = Instant::now();
     let (loaded, kv_pages, max_seq_len) =
-        load_for_serve(model_path, kv_pages, weights_pool_gb, kv_quant, kv_tier, ctx)?;
+        load_for_serve(model_path, kv_pages, weights_pool_gb, kv_quant, kv_tier, ctx, hot_pages)?;
     tracing::info!(
         "loaded {} ({}) in {:.1}s: {} layers, kv_pages={}",
         model_path.display(),
@@ -852,9 +983,10 @@ fn cmd_run(
     kv_tier: KvTierConfig,
     ctx: usize,
     kv_pages: usize,
+    hot_pages: usize,
 ) -> Result<()> {
     let t0 = Instant::now();
-    let loaded = load_auto(model_path, weights_pool_gb, kv_quant, kv_tier, ctx, kv_pages)?;
+    let loaded = load_auto(model_path, weights_pool_gb, kv_quant, kv_tier, ctx, kv_pages, hot_pages)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let prompt_text = if chat {
@@ -916,6 +1048,7 @@ fn cmd_bench(
     kv_tier: KvTierConfig,
     ctx: usize,
     kv_pages: usize,
+    hot_pages: usize,
 ) -> Result<()> {
     if tokens < 2 {
         bail!("--tokens must be at least 2 to measure decode throughput");
@@ -924,7 +1057,7 @@ fn cmd_bench(
         bail!("--prompt-tokens must be at least 1");
     }
     let t0 = Instant::now();
-    let loaded = load_auto(model_path, 0.0, kv_quant, kv_tier, ctx, kv_pages)?;
+    let loaded = load_auto(model_path, 0.0, kv_quant, kv_tier, ctx, kv_pages, hot_pages)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let tokenizer = Arc::new(loaded.bundle.tokenizer);
