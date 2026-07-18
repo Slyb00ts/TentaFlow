@@ -31,8 +31,15 @@ impl Tokenizer {
     /// wires them from tokenizer_config.json / GGUF metadata via
     /// [`Tokenizer::set_special_ids`].
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        let inner = tokenizers::Tokenizer::from_file(path.as_ref())
+        let mut inner = tokenizers::Tokenizer::from_file(path.as_ref())
             .map_err(|e| ForgeError::Tokenizer(format!("failed to load tokenizer.json: {e}")))?;
+        // Some checkpoints ship tokenizer.json with a baked-in truncation
+        // (e.g. Bielik: max_length 2048), which would silently clip long
+        // prompts. Context limits are the engine's job, never the tokenizer's.
+        inner
+            .with_truncation(None)
+            .map_err(|e| ForgeError::Tokenizer(format!("failed to clear truncation: {e}")))?;
+        inner.with_padding(None);
         Ok(Self {
             inner,
             bos_id: None,

@@ -798,3 +798,23 @@ fn template_resolution_priority() {
     assert!(resolve_chat_template(None, None, None, Some("nope")).is_err());
     assert!(resolve_chat_template(None, None, None, None).is_err());
 }
+
+// Some checkpoints ship tokenizer.json with baked-in truncation (Bielik:
+// max_length 2048). from_file must strip it — context limits belong to the
+// engine, and silent prompt clipping corrupts long requests.
+#[test]
+fn from_file_strips_baked_in_truncation() {
+    let path = "/home/critix/repos/rust/TentaFlow/.runtime/models/models--TentaFlow--Bielik-PL-Minitron-7B-NVFP4/snapshots/831550e879fd7d700e3f6d79dffc14373deda3a7/tokenizer.json";
+    if !std::path::Path::new(path).exists() {
+        eprintln!("skipping: Bielik tokenizer not present");
+        return;
+    }
+    let t = forge_tokenize::Tokenizer::from_file(path).unwrap();
+    let long = "słowo testowe ".repeat(2000);
+    let ids = t.encode(&long, true).unwrap();
+    assert!(
+        ids.len() > 4000,
+        "truncation not stripped: got {} tokens",
+        ids.len()
+    );
+}
