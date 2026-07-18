@@ -19,7 +19,10 @@ use half::f16;
 use crate::kv::{KvCache, KvConfig, KvQuant, SeqKv};
 use crate::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use crate::tier::{KvTierConfig, TierManager, STAGE_SLOTS};
-use crate::weights::{DevWeight, GateUpWeights, LayerFfn, MoeFfn, ModelWeights, QkvWeights};
+use crate::weights::{
+    AttnWeights, DeltaNetWeights, DevWeight, GateUpWeights, LayerFfn, LayerMixer, MoeFfn,
+    ModelWeights, QkvWeights,
+};
 
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
 /// prompts. Bounds the persistent prefill scratch allocation.
@@ -176,6 +179,62 @@ pub struct Model {
     pt_seq: u64,
     /// MoE scratch; `Some` only for Mixture-of-Experts models.
     moe_bufs: Option<MoeBufs>,
+    /// Per-layer Gated-DeltaNet recurrent state (hybrid `qwen35moe` only):
+    /// `Some` for DeltaNet layers, `None` for attention layers. Persistent for
+    /// the model lifetime (single active sequence at a time on the hybrid
+    /// path), zeroed at each sequence start (`pos == 0`).
+    ssm: Vec<Option<SsmState>>,
+    /// Gated-attention + DeltaNet single-token scratch; allocated lazily for a
+    /// hybrid model on the first hybrid forward.
+    hybrid_bufs: Option<HybridBufs>,
+    /// FORGE_HYBRID_DEBUG=1: dump per-layer residual-stream norms.
+    hybrid_debug: bool,
+}
+
+/// One DeltaNet layer's resident recurrent state for the active sequence.
+struct SsmState {
+    /// Causal conv window `[conv_dim, d_conv-1]` f16 (oldest sample first).
+    conv: DevBuffer,
+    /// Recurrent state matrices `[n_v_heads, d_state, d_state]` f32.
+    state: DevBuffer,
+}
+
+/// Single-token scratch for the hybrid (gated-attention + DeltaNet) forward.
+/// Buffers that exceed the standard decode scratch widths (the gated Q
+/// projection is `2*n_heads*head_dim`, the conv stream `conv_dim`) live here.
+struct HybridBufs {
+    /// Gated Q projection output `[2*n_heads*head_dim]` f16.
+    q_full: DevBuffer,
+    /// De-interleaved query `[n_heads*head_dim]` f16.
+    qc: DevBuffer,
+    /// De-interleaved output gate `[n_heads*head_dim]` f16.
+    gatec: DevBuffer,
+    /// Gated attention output `[n_heads*head_dim]` f16 (attn ⊙ sigmoid(gate)).
+    gated: DevBuffer,
+    /// DeltaNet in-projection conv stream `[conv_dim]` f16.
+    qkv_mixed: DevBuffer,
+    /// DeltaNet output gate `z` `[value_dim]` f16.
+    z: DevBuffer,
+    /// Conv + SiLU output `[conv_dim]` f16.
+    conv_out: DevBuffer,
+    /// Per-head-split conv q/k `[key_dim]` and their repeat to `[value_dim]`.
+    q16: DevBuffer,
+    k16: DevBuffer,
+    q16src: DevBuffer,
+    k16src: DevBuffer,
+    q32: DevBuffer,
+    k32: DevBuffer,
+    /// Conv value heads `[value_dim]` f16.
+    vtok: DevBuffer,
+    /// Raw alpha / beta projections `[n_v_heads]` f16.
+    alpha: DevBuffer,
+    beta_raw: DevBuffer,
+    /// Per-head log-decay `g` and write-gate `beta` `[n_v_heads]` f32.
+    g: DevBuffer,
+    beta_f: DevBuffer,
+    /// DeltaNet recurrence output + gated-RMSNorm output `[value_dim]` f16.
+    o: DevBuffer,
+    normed: DevBuffer,
 }
 
 /// Attention source for the shared decode chains: the paged VRAM cache (fast
@@ -359,7 +418,9 @@ impl Model {
 
     fn finish(device: Arc<dyn Device>, weights: ModelWeights, cfg: ModelConfig) -> Result<Self> {
         let p = &weights.descriptor.params;
-        if p.head_dim != 64 && p.head_dim != 128 {
+        // head_dim 256 has an f16-only attention specialization (qwen35moe
+        // gated attention layers); the hybrid arch always uses the f16 cache.
+        if p.head_dim != 64 && p.head_dim != 128 && p.head_dim != 256 {
             return Err(ForgeError::Unsupported(format!(
                 "head_dim {} has no attention specialization",
                 p.head_dim
@@ -520,6 +581,27 @@ impl Model {
             }
             None => None,
         };
+        // Gated-DeltaNet recurrent state, one entry per DeltaNet layer (hybrid
+        // arch only). Allocated once and reused; zeroed at each sequence start.
+        let ssm = match &weights.descriptor.params.ssm {
+            Some(sp) => {
+                let conv_bytes = sp.conv_dim() * (sp.d_conv - 1) * 2;
+                let state_bytes = sp.n_v_heads() * sp.d_state * sp.d_state * 4;
+                weights
+                    .descriptor
+                    .layer_kinds
+                    .iter()
+                    .map(|k| match k {
+                        forge_formats::LayerKind::DeltaNet => Ok(Some(SsmState {
+                            conv: device.alloc(conv_bytes, MemKind::Device, Pool::Weights)?,
+                            state: device.alloc(state_bytes, MemKind::Device, Pool::Weights)?,
+                        })),
+                        forge_formats::LayerKind::Attention => Ok(None),
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+            None => Vec::new(),
+        };
         Ok(Model {
             device,
             kernels,
@@ -540,6 +622,9 @@ impl Model {
             tier_bufs,
             pt_seq: 0,
             moe_bufs,
+            ssm,
+            hybrid_bufs: None,
+            hybrid_debug: std::env::var("FORGE_HYBRID_DEBUG").is_ok_and(|v| v == "1"),
         })
     }
 
@@ -836,7 +921,7 @@ impl Model {
             let LayerFfn::Dense(dffn) = &l.ffn else {
                 return false;
             };
-            let qkv_ok = match &l.attn_qkv {
+            let qkv_ok = match &l.attn().attn_qkv {
                 QkvWeights::Fused(w) => Self::fused_decode_weight_ok(w),
                 QkvWeights::FusedQk { qk, v } => {
                     Self::fused_decode_weight_ok(qk) && Self::fused_decode_weight_ok(v)
@@ -858,7 +943,7 @@ impl Model {
             };
             qkv_ok
                 && gate_up_ok
-                && Self::fused_decode_weight_ok(&l.attn_o)
+                && Self::fused_decode_weight_ok(&l.attn().attn_o)
                 && Self::fused_decode_weight_ok(&dffn.down)
         })
     }
@@ -1639,7 +1724,7 @@ impl Model {
             // (attention/rope/append index (t*heads+h)*head_dim), so a fused
             // matrix is consumed as three row-window GEMMs into separate
             // buffers — same weight bytes, no second copy in VRAM.
-            match &layer.attn_qkv {
+            match &layer.attn().attn_qkv {
                 QkvWeights::Fused(w) => {
                     self.gemm_rows(&pb.q, w, &pb.x, t, 0, q_dim, stream)?;
                     self.gemm_rows(&pb.k, w, &pb.x, t, q_dim, kv_dim, stream)?;
@@ -1662,14 +1747,14 @@ impl Model {
             // once per token (rows = t), Qwen3 normalizes per head (rows =
             // t*n_heads). Dense non-OLMoE arches keep the per-head form
             // bit-for-bit (qk_norm_over_hidden == false).
-            if let Some(qn) = &layer.q_norm {
+            if let Some(qn) = &layer.attn().q_norm {
                 if p.qk_norm_over_hidden {
                     kernels.rmsnorm_f16(&pb.q, &pb.q, qn, t, q_dim, eps, stream)?;
                 } else {
                     kernels.rmsnorm_f16(&pb.q, &pb.q, qn, t * p.n_heads, p.head_dim, eps, stream)?;
                 }
             }
-            if let Some(kn) = &layer.k_norm {
+            if let Some(kn) = &layer.attn().k_norm {
                 if p.qk_norm_over_hidden {
                     kernels.rmsnorm_f16(&pb.k, &pb.k, kn, t, kv_dim, eps, stream)?;
                 } else {
@@ -1822,7 +1907,7 @@ impl Model {
                 trace.mark(self.device.as_ref(), "attn");
             }
 
-            self.gemm(&pb.o_out, &layer.attn_o, &pb.attn_out, t, stream)?;
+            self.gemm(&pb.o_out, &layer.attn().attn_o, &pb.attn_out, t, stream)?;
             trace.mark(self.device.as_ref(), "gemm_o");
             kernels.rmsnorm_residual_f16(&pb.x, &pb.h, &pb.o_out, &layer.ffn_norm, t, hidden, eps, stream)?;
             trace.mark(self.device.as_ref(), "norm_res");
@@ -1877,6 +1962,9 @@ impl Model {
     /// Not graph-captured: T varies per call and prefill launches are large
     /// enough that launch overhead is immaterial.
     pub fn prefill_chunk(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
+        if self.is_hybrid() {
+            return self.prefill_hybrid(seq, tokens);
+        }
         let t = self.prefill_forward(seq, tokens)?;
         let hidden = self.weights.descriptor.params.hidden_size;
         let vocab = self.weights.descriptor.params.vocab_size;
@@ -2059,6 +2147,16 @@ impl Model {
             self.upload_page_table(seq)?;
         }
 
+        // Hybrid attention/DeltaNet decode: per-token recurrent scan with a
+        // resident SSM state, not graph-capturable (host readbacks per layer).
+        if self.is_hybrid() {
+            self.ensure_hybrid_bufs()?;
+            if pos == 0 {
+                self.zero_ssm()?;
+            }
+            return self.hybrid_forward_token(token_id, true);
+        }
+
         // Routed MoE decode reads the per-token top-k experts back to the host
         // to launch the indexed expert GEMVs, so it cannot be graph-captured;
         // it runs the explicit chain each step over the f16 paged cache.
@@ -2239,13 +2337,13 @@ impl Model {
                 usize,
                 &DevBuffer,
                 usize,
-            ) = match &layer.attn_qkv {
+            ) = match &layer.attn().attn_qkv {
                 QkvWeights::Fused(w) => {
                     self.gemv(&b.qkv, w, &b.x, stream)?;
-                    if let Some(qn) = &layer.q_norm {
+                    if let Some(qn) = &layer.attn().q_norm {
                         kernels.rmsnorm_f16_at(&b.qkv, 0, qn, p.n_heads, p.head_dim, eps, stream)?;
                     }
-                    if let Some(kn) = &layer.k_norm {
+                    if let Some(kn) = &layer.attn().k_norm {
                         kernels.rmsnorm_f16_at(
                             &b.qkv, k_byte_off, kn, p.n_kv_heads, p.head_dim, eps, stream,
                         )?;
@@ -2257,10 +2355,10 @@ impl Model {
                 QkvWeights::FusedQk { qk, v } => {
                     self.gemv(&b.qkv, qk, &b.x, stream)?;
                     self.gemv(&b.v, v, &b.x, stream)?;
-                    if let Some(qn) = &layer.q_norm {
+                    if let Some(qn) = &layer.attn().q_norm {
                         kernels.rmsnorm_f16_at(&b.qkv, 0, qn, p.n_heads, p.head_dim, eps, stream)?;
                     }
-                    if let Some(kn) = &layer.k_norm {
+                    if let Some(kn) = &layer.attn().k_norm {
                         kernels.rmsnorm_f16_at(
                             &b.qkv, k_byte_off, kn, p.n_kv_heads, p.head_dim, eps, stream,
                         )?;
@@ -2273,10 +2371,10 @@ impl Model {
                     self.gemv(&b.q, q, &b.x, stream)?;
                     self.gemv(&b.k, k, &b.x, stream)?;
                     self.gemv(&b.v, v, &b.x, stream)?;
-                    if let Some(qn) = &layer.q_norm {
+                    if let Some(qn) = &layer.attn().q_norm {
                         kernels.rmsnorm_f16(&b.q, &b.q, qn, p.n_heads, p.head_dim, eps, stream)?;
                     }
-                    if let Some(kn) = &layer.k_norm {
+                    if let Some(kn) = &layer.attn().k_norm {
                         kernels.rmsnorm_f16(&b.k, &b.k, kn, p.n_kv_heads, p.head_dim, eps, stream)?;
                     }
                     kernels.rope_neox_f16(&b.q, &b.pos, 1, p.n_heads, p.head_dim, p.rope_theta, stream)?;
@@ -2335,7 +2433,7 @@ impl Model {
                 1, p.n_heads, p.head_dim, ATTN_DECODE_SPLITS, stream,
             )?;
 
-            self.gemv(&b.o_out, &layer.attn_o, &b.attn_out, stream)?;
+            self.gemv(&b.o_out, &layer.attn().attn_o, &b.attn_out, stream)?;
             kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.o_out, &layer.ffn_norm, 1, hidden, eps, stream)?;
 
             match &layer.dense_ffn()?.gate_up {
@@ -2528,7 +2626,7 @@ impl Model {
                 // host-computed byte offsets; rotated K lands directly in the
                 // cache, so the K section of b.qkv is left un-rotated —
                 // nothing reads it after this point).
-                let q_buf = match &layer.attn_qkv {
+                let q_buf = match &layer.attn().attn_qkv {
                     QkvWeights::Fused(w) => {
                         self.gemv(&b.qkv, w, &b.x, stream)?;
                         kernels.qkv_post_f16(
@@ -2538,8 +2636,8 @@ impl Model {
                             k_byte_off,
                             &b.qkv,
                             v_byte_off,
-                            layer.q_norm.as_ref(),
-                            layer.k_norm.as_ref(),
+                            layer.attn().q_norm.as_ref(),
+                            layer.attn().k_norm.as_ref(),
                             &self.kv.k[l],
                             &self.kv.v[l],
                             &b.pos,
@@ -2569,8 +2667,8 @@ impl Model {
                             k_byte_off,
                             &b.v,
                             0,
-                            layer.q_norm.as_ref(),
-                            layer.k_norm.as_ref(),
+                            layer.attn().q_norm.as_ref(),
+                            layer.attn().k_norm.as_ref(),
                             &self.kv.k[l],
                             &self.kv.v[l],
                             &b.pos,
@@ -2590,10 +2688,10 @@ impl Model {
                         self.gemv(&b.q, q, &b.x, stream)?;
                         self.gemv(&b.k, k, &b.x, stream)?;
                         self.gemv(&b.v, v, &b.x, stream)?;
-                        if let Some(qn) = &layer.q_norm {
+                        if let Some(qn) = &layer.attn().q_norm {
                             kernels.rmsnorm_f16(&b.q, &b.q, qn, p.n_heads, p.head_dim, eps, stream)?;
                         }
-                        if let Some(kn) = &layer.k_norm {
+                        if let Some(kn) = &layer.attn().k_norm {
                             kernels.rmsnorm_f16(&b.k, &b.k, kn, p.n_kv_heads, p.head_dim, eps, stream)?;
                         }
                         kernels.rope_neox_f16(&b.q, &b.pos, 1, p.n_heads, p.head_dim, p.rope_theta, stream)?;
@@ -2660,7 +2758,7 @@ impl Model {
                     }
                 }
 
-                self.gemv(&b.o_out, &layer.attn_o, &b.attn_out, stream)?;
+                self.gemv(&b.o_out, &layer.attn().attn_o, &b.attn_out, stream)?;
                 kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.o_out, &layer.ffn_norm, 1, hidden, eps, stream)?;
 
                 match &layer.dense_ffn()?.gate_up {
@@ -2713,7 +2811,7 @@ impl Model {
 
             // Project q/k/v into the separate b.q/b.k/b.v buffers regardless of
             // weight fusion (a fused matrix is read as three row-window GEMVs).
-            match &layer.attn_qkv {
+            match &layer.attn().attn_qkv {
                 QkvWeights::Fused(w) => {
                     self.gemm_rows(&b.q, w, &b.x, 1, 0, q_dim, stream)?;
                     self.gemm_rows(&b.k, w, &b.x, 1, q_dim, kv_dim, stream)?;
@@ -2731,14 +2829,14 @@ impl Model {
                 }
             }
 
-            if let Some(qn) = &layer.q_norm {
+            if let Some(qn) = &layer.attn().q_norm {
                 if p.qk_norm_over_hidden {
                     kernels.rmsnorm_f16(&b.q, &b.q, qn, 1, q_dim, eps, stream)?;
                 } else {
                     kernels.rmsnorm_f16(&b.q, &b.q, qn, p.n_heads, p.head_dim, eps, stream)?;
                 }
             }
-            if let Some(kn) = &layer.k_norm {
+            if let Some(kn) = &layer.attn().k_norm {
                 if p.qk_norm_over_hidden {
                     kernels.rmsnorm_f16(&b.k, &b.k, kn, 1, kv_dim, eps, stream)?;
                 } else {
@@ -2776,7 +2874,7 @@ impl Model {
                 stream,
             )?;
 
-            self.gemv(&b.o_out, &layer.attn_o, &b.attn_out, stream)?;
+            self.gemv(&b.o_out, &layer.attn().attn_o, &b.attn_out, stream)?;
             kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.o_out, &layer.ffn_norm, 1, hidden, eps, stream)?;
 
             match &layer.ffn {
@@ -2839,7 +2937,35 @@ impl Model {
                 k,
             )
         };
-        self.moe_experts_accumulate(moe, &b.x, &b.down, 0, inter, hidden, ids, weights, stream)
+        let shared_scale = self.shared_gate_scale(moe, &b.x, stream)?;
+        self.moe_experts_accumulate(
+            moe,
+            &b.x,
+            &b.down,
+            0,
+            inter,
+            hidden,
+            ids,
+            weights,
+            shared_scale,
+            stream,
+        )
+    }
+
+    /// Per-token sigmoid gate for the shared expert (`ffn_gate_inp_shexp · x`);
+    /// 1.0 when the arch declares no shared-expert gate (OLMoE / Qwen3-MoE).
+    /// One GEMV + a blocking readback (the router path already synchronizes).
+    fn shared_gate_scale(&self, moe: &MoeFfn, x_in: &DevBuffer, stream: &Stream) -> Result<f32> {
+        let Some(sg) = &moe.shared_gate else {
+            return Ok(1.0);
+        };
+        let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
+        self.gemv(&mb.tmp, sg, x_in, stream)?;
+        let mut bytes = [0u8; 2];
+        self.device.synchronize()?;
+        self.device.read(&mb.tmp, 0, &mut bytes)?;
+        let logit = f16::from_le_bytes(bytes).to_f32();
+        Ok(1.0 / (1.0 + (-logit).exp()))
     }
 
     /// Run each selected expert's SwiGLU over the single-token activation
@@ -2859,6 +2985,7 @@ impl Model {
         hidden: usize,
         ids: &[i32],
         weights: &[f32],
+        shared_scale: f32,
         stream: &Stream,
     ) -> Result<()> {
         let b = &self.bufs;
@@ -2880,7 +3007,9 @@ impl Model {
             self.kernels
                 .moe_scale_add_f16(out, out_off, &mb.tmp, 0, hidden, wt, j == 0, stream)?;
         }
-        // Shared always-on expert: a dense SwiGLU added on top (weight 1.0).
+        // Shared always-on expert: a dense SwiGLU added on top, scaled by the
+        // per-token sigmoid gate (`shared_scale`; 1.0 when the arch has no
+        // shared-expert gate).
         if let Some(sh) = &moe.shared {
             // Shared expert down is [hidden, shared_inter], so cols = its width.
             let sh_inter = sh.down.cols();
@@ -2897,7 +3026,7 @@ impl Model {
             self.kernels.silu_mul_f16(&b.act, &b.gate, &b.up, sh_inter, stream)?;
             self.gemm(&mb.tmp, &sh.down, &b.act, 1, stream)?;
             self.kernels
-                .moe_scale_add_f16(out, out_off, &mb.tmp, 0, hidden, 1.0, false, stream)?;
+                .moe_scale_add_f16(out, out_off, &mb.tmp, 0, hidden, shared_scale, false, stream)?;
         }
         Ok(())
     }
@@ -2962,10 +3091,381 @@ impl Model {
                 hidden,
                 &ids[ti * k..(ti + 1) * k],
                 &weights[ti * k..(ti + 1) * k],
+                1.0,
                 stream,
             )?;
         }
         Ok(())
+    }
+
+    /// Whether this is the hybrid attention/Gated-DeltaNet MoE arch (qwen35moe).
+    fn is_hybrid(&self) -> bool {
+        self.weights.descriptor.params.ssm.is_some()
+    }
+
+    /// NEOX partial-rotary width for the hybrid attention layers: M-RoPE over
+    /// text positions rotates the first `2*Σ sections` dims of each head.
+    fn hybrid_n_rot(&self) -> usize {
+        let p = &self.weights.descriptor.params;
+        p.rope_sections
+            .map(|s| s.iter().sum::<u32>() as usize * 2)
+            .unwrap_or(p.head_dim)
+    }
+
+    /// Allocate the hybrid single-token scratch (gated-attention de-interleave +
+    /// DeltaNet conv/recurrence buffers) on first use.
+    fn ensure_hybrid_bufs(&mut self) -> Result<()> {
+        if self.hybrid_bufs.is_some() {
+            return Ok(());
+        }
+        let p = &self.weights.descriptor.params;
+        let ssm = p.ssm.clone().expect("hybrid model has ssm params");
+        let q_dim = p.n_heads * p.head_dim;
+        let q_full = q_dim * 2;
+        let conv_dim = ssm.conv_dim();
+        let value_dim = ssm.value_dim();
+        let key_dim = ssm.key_dim();
+        let nv = ssm.n_v_heads();
+        let device = self.device.clone();
+        let a16 = |elems: usize| device.alloc(elems * 2, MemKind::Device, Pool::Activations);
+        let a32 = |elems: usize| device.alloc(elems * 4, MemKind::Device, Pool::Activations);
+        self.hybrid_bufs = Some(HybridBufs {
+            q_full: a16(q_full)?,
+            qc: a16(q_dim)?,
+            gatec: a16(q_dim)?,
+            gated: a16(q_dim)?,
+            qkv_mixed: a16(conv_dim)?,
+            z: a16(value_dim)?,
+            conv_out: a16(conv_dim)?,
+            q16: a16(key_dim)?,
+            k16: a16(key_dim)?,
+            q16src: a16(key_dim)?,
+            k16src: a16(key_dim)?,
+            q32: a16(value_dim)?,
+            k32: a16(value_dim)?,
+            vtok: a16(value_dim)?,
+            alpha: a16(nv)?,
+            beta_raw: a16(nv)?,
+            g: a32(nv)?,
+            beta_f: a32(nv)?,
+            o: a16(value_dim)?,
+            normed: a16(value_dim)?,
+        });
+        Ok(())
+    }
+
+    /// Zero every DeltaNet layer's recurrent state (conv window + state matrix)
+    /// at the start of a new sequence.
+    fn zero_ssm(&self) -> Result<()> {
+        let Some(ssm) = &self.weights.descriptor.params.ssm else {
+            return Ok(());
+        };
+        let conv_bytes = ssm.conv_dim() * (ssm.d_conv - 1) * 2;
+        let state_bytes = ssm.n_v_heads() * ssm.d_state * ssm.d_state * 4;
+        let zc = vec![0u8; conv_bytes];
+        let zs = vec![0u8; state_bytes];
+        for s in self.ssm.iter().flatten() {
+            self.device.write(&zc, &s.conv, 0)?;
+            self.device.write(&zs, &s.state, 0)?;
+        }
+        Ok(())
+    }
+
+    /// One token through the hybrid (gated-attention / Gated-DeltaNet + MoE)
+    /// stack. Mirrors `run_step_moe`'s residual/norm skeleton, dispatching the
+    /// token mixer by layer kind and folding in the gated shared expert. Inputs
+    /// (`b.ids`/`b.pos`/`seq_len_dev`/page table) must be uploaded by the
+    /// caller; the next-token logits land in `b.logits` when `want_logits`.
+    fn hybrid_forward_token(&self, token_id: u32, want_logits: bool) -> Result<()> {
+        let p = self.weights.descriptor.params.clone();
+        let hidden = p.hidden_size;
+        let eps = p.rms_norm_eps;
+        let kernels = &self.kernels;
+        let stream = &self.stream;
+        let b = &self.bufs;
+        let n_layers = self.weights.layers.len();
+
+        // Host-side embedding gather: copy this token's f16 row to the device
+        // residual buffer (the table lives in host RAM to keep VRAM for weights).
+        // `write` drains only the legacy stream, so the previous token's tail
+        // (which still writes `b.h` on the non-blocking compute stream) must be
+        // drained first or the two races on `b.h`.
+        self.device.synchronize()?;
+        let host = self
+            .weights
+            .token_embd_host
+            .as_ref()
+            .expect("hybrid model has host embedding");
+        let base = token_id as usize * hidden;
+        let row = host.get(base..base + hidden).ok_or_else(|| {
+            ForgeError::Scheduler(format!("token id {token_id} out of embedding range"))
+        })?;
+        self.device.write(bytemuck::cast_slice(row), &b.h, 0)?;
+        kernels.rmsnorm_f16(&b.x, &b.h, &self.weights.layers[0].attn_norm, 1, hidden, eps, stream)?;
+
+        for l in 0..n_layers {
+            let layer = &self.weights.layers[l];
+            match &layer.mixer {
+                LayerMixer::Attention(a) => self.hybrid_attn_mixer(l, a)?,
+                LayerMixer::DeltaNet(d) => self.hybrid_delta_mixer(l, d)?,
+            }
+            // Residual add (mixer output) + post-attention norm for the FFN.
+            kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.o_out, &layer.ffn_norm, 1, hidden, eps, stream)?;
+            match &layer.ffn {
+                LayerFfn::Moe(moe) => self.moe_decode_ffn(moe, hidden, stream)?,
+                LayerFfn::Dense(_) => {
+                    return Err(ForgeError::Unsupported(
+                        "dense FFN inside the hybrid MoE forward".into(),
+                    ))
+                }
+            }
+            let next_norm = if l + 1 < n_layers {
+                &self.weights.layers[l + 1].attn_norm
+            } else {
+                &self.weights.output_norm
+            };
+            kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.down, next_norm, 1, hidden, eps, stream)?;
+
+            if self.hybrid_debug {
+                self.device.synchronize()?;
+                let mut hb = vec![0u8; hidden * 2];
+                self.device.read(&b.h, 0, &mut hb)?;
+                let hf: &[f16] = bytemuck::cast_slice(&hb);
+                let norm: f32 = hf.iter().map(|v| v.to_f32().powi(2)).sum::<f32>().sqrt();
+                let kind = if matches!(layer.mixer, LayerMixer::DeltaNet(_)) {
+                    "delta"
+                } else {
+                    "attn"
+                };
+                eprintln!("  layer {l:2} [{kind}] ||h|| = {norm:.4}");
+            }
+        }
+
+        if want_logits {
+            self.logits_gemv(&b.logits, &b.x, stream)?;
+        }
+        Ok(())
+    }
+
+    /// Gated softmax-attention mixer for one hybrid layer. `b.x` is the
+    /// pre-attention normed input; the mixer output lands in `b.o_out`. The Q
+    /// projection is gated (`[q, gate]` interleaved per head), so q/gate are
+    /// de-interleaved, per-head QK-norm + partial RoPE applied, causal decode
+    /// attention run, then `out = attn ⊙ sigmoid(gate)` before the O projection.
+    fn hybrid_attn_mixer(&self, l: usize, a: &AttnWeights) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let head_dim = p.head_dim;
+        let n_heads = p.n_heads;
+        let n_kv = p.n_kv_heads;
+        let q_dim = n_heads * head_dim;
+        let eps = p.rms_norm_eps;
+        let theta = p.rope_theta;
+        let n_rot = self.hybrid_n_rot();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let kernels = &self.kernels;
+        let stream = &self.stream;
+        let b = &self.bufs;
+        let hb = self.hybrid_bufs.as_ref().expect("hybrid bufs allocated");
+        let (wq, wk, wv) = match &a.attn_qkv {
+            QkvWeights::Split { q, k, v } => (q, k, v),
+            _ => {
+                return Err(ForgeError::Unsupported(
+                    "hybrid attention expects split q/k/v weights".into(),
+                ))
+            }
+        };
+        // Gated Q projection [2*q_dim], then de-interleave per head: q at
+        // h*2*head_dim, gate at h*2*head_dim + head_dim.
+        self.gemv(&hb.q_full, wq, &b.x, stream)?;
+        for h in 0..n_heads {
+            let src = (h * 2 * head_dim) * 2;
+            let dst = (h * head_dim) * 2;
+            self.device
+                .copy(&hb.q_full, src, &hb.qc, dst, head_dim * 2, stream)?;
+            self.device
+                .copy(&hb.q_full, src + head_dim * 2, &hb.gatec, dst, head_dim * 2, stream)?;
+        }
+        if let Some(qn) = &a.q_norm {
+            kernels.rmsnorm_f16(&hb.qc, &hb.qc, qn, n_heads, head_dim, eps, stream)?;
+        }
+        self.gemv(&b.k, wk, &b.x, stream)?;
+        self.gemv(&b.v, wv, &b.x, stream)?;
+        if let Some(kn) = &a.k_norm {
+            kernels.rmsnorm_f16(&b.k, &b.k, kn, n_kv, head_dim, eps, stream)?;
+        }
+        kernels.rope_neox_partial_f16(&hb.qc, &b.pos, 1, n_heads, head_dim, n_rot, theta, stream)?;
+        kernels.rope_neox_partial_f16(&b.k, &b.pos, 1, n_kv, head_dim, n_rot, theta, stream)?;
+        kernels.kv_append_f16(
+            &self.kv.k[l],
+            &self.kv.v[l],
+            &b.k,
+            &b.v,
+            &self.page_table_dev,
+            &self.seq_len_dev,
+            n_kv,
+            self.kv.cfg.page_size,
+            head_dim,
+            stream,
+        )?;
+        kernels.attn_decode_f16(
+            &b.attn_out,
+            &hb.qc,
+            &self.kv.k[l],
+            &self.kv.v[l],
+            &self.page_table_dev,
+            &self.seq_len_dev,
+            1,
+            n_heads,
+            n_kv,
+            head_dim,
+            self.kv.cfg.page_size,
+            self.max_pages_per_seq,
+            scale,
+            stream,
+        )?;
+        // Output gate: out = attn ⊙ sigmoid(gate). No elementwise sigmoid-mul
+        // kernel exists, so a bounded host round-trip applies the gate (the MoE
+        // FFN already synchronizes each layer, so this adds no extra sync class).
+        let mut ha = vec![0u8; q_dim * 2];
+        let mut hg = vec![0u8; q_dim * 2];
+        self.device.synchronize()?;
+        self.device.read(&b.attn_out, 0, &mut ha)?;
+        self.device.read(&hb.gatec, 0, &mut hg)?;
+        let af: &[f16] = bytemuck::cast_slice(&ha);
+        let gf: &[f16] = bytemuck::cast_slice(&hg);
+        let mut out = vec![0u8; q_dim * 2];
+        {
+            let of: &mut [f16] = bytemuck::cast_slice_mut(&mut out);
+            for i in 0..q_dim {
+                let s = 1.0 / (1.0 + (-gf[i].to_f32()).exp());
+                of[i] = f16::from_f32(af[i].to_f32() * s);
+            }
+        }
+        self.device.write(&out, &hb.gated, 0)?;
+        self.gemv(&b.o_out, &a.attn_o, &hb.gated, stream)?;
+        Ok(())
+    }
+
+    /// Gated-DeltaNet linear-attention mixer for one hybrid layer. `b.x` is the
+    /// pre-attention normed input; the mixer output lands in `b.o_out`. Advances
+    /// this layer's resident conv window + recurrent state by one token.
+    fn hybrid_delta_mixer(&self, l: usize, d: &DeltaNetWeights) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let ssm = p.ssm.as_ref().expect("hybrid has ssm params");
+        let eps = p.rms_norm_eps;
+        let conv_dim = ssm.conv_dim();
+        let d_conv = ssm.d_conv;
+        let key_dim = ssm.key_dim();
+        let value_dim = ssm.value_dim();
+        let d_state = ssm.d_state;
+        let n_k = ssm.n_k_heads();
+        let n_v = ssm.n_v_heads();
+        let rep = n_v / n_k;
+        let kernels = &self.kernels;
+        let stream = &self.stream;
+        let b = &self.bufs;
+        let hb = self.hybrid_bufs.as_ref().expect("hybrid bufs allocated");
+        let st = self.ssm[l].as_ref().expect("DeltaNet layer has ssm state");
+
+        // Input projections: mixed q|k|v conv stream, output gate z, and the
+        // per-head decay/write-gate projections.
+        self.gemv(&hb.qkv_mixed, &d.in_proj, &b.x, stream)?;
+        self.gemv(&hb.z, &d.gate_proj, &b.x, stream)?;
+        self.gemv(&hb.alpha, &d.alpha_proj, &b.x, stream)?;
+        self.gemv(&hb.beta_raw, &d.beta_proj, &b.x, stream)?;
+
+        // Causal depthwise conv + SiLU (advances the conv window in place).
+        kernels.deltanet_conv_silu_f16(
+            &hb.conv_out,
+            &st.conv,
+            &hb.qkv_mixed,
+            &d.conv1d,
+            conv_dim,
+            d_conv,
+            stream,
+        )?;
+        // Split conv output into q/k (key_dim each) and v (value_dim).
+        self.device.copy(&hb.conv_out, 0, &hb.q16src, 0, key_dim * 2, stream)?;
+        self.device
+            .copy(&hb.conv_out, key_dim * 2, &hb.k16src, 0, key_dim * 2, stream)?;
+        self.device
+            .copy(&hb.conv_out, 2 * key_dim * 2, &hb.vtok, 0, value_dim * 2, stream)?;
+        // Per-head L2 norm on the key-head q/k (n_k heads over d_state).
+        kernels.l2norm_heads_f16(&hb.q16, &hb.q16src, n_k, d_state, eps, stream)?;
+        kernels.l2norm_heads_f16(&hb.k16, &hb.k16src, n_k, d_state, eps, stream)?;
+        // Expand key-heads to value-heads. llama.cpp's qwen35moe graph uses
+        // `ggml_repeat` (block-tiled: v-head j uses k-head j % n_k), and this
+        // build runs that non-fused path (fused GDN is disabled for Qwen3.6),
+        // so the key block is tiled `rep` times: [k0..k15, k0..k15].
+        let key_bytes = n_k * d_state * 2;
+        for r in 0..rep {
+            self.device
+                .copy(&hb.q16, 0, &hb.q32, r * key_bytes, key_bytes, stream)?;
+            self.device
+                .copy(&hb.k16, 0, &hb.k32, r * key_bytes, key_bytes, stream)?;
+        }
+        // Per-head log-decay g = softplus(alpha + dt_bias)·a and beta gate.
+        kernels.deltanet_log_decay_f32(&hb.g, &hb.alpha, &d.dt_bias, &d.a, n_v, stream)?;
+        kernels.deltanet_beta_sigmoid_f32(&hb.beta_f, &hb.beta_raw, n_v, stream)?;
+        // Rank-1 gated-delta recurrence (advances the state matrix in place).
+        kernels.deltanet_gated_step_f16(
+            &hb.o, &st.state, &hb.q32, &hb.k32, &hb.vtok, &hb.g, &hb.beta_f, n_v, d_state, stream,
+        )?;
+        // Output gated RMSNorm then the value-dim → hidden out projection.
+        kernels.deltanet_gated_rmsnorm_f16(
+            &hb.normed, &hb.o, &hb.z, &d.ssm_norm, n_v, d_state, eps, stream,
+        )?;
+        self.gemv(&b.o_out, &d.out_proj, &hb.normed, stream)?;
+        Ok(())
+    }
+
+    /// Prefill a prompt chunk for the hybrid arch as a sequential per-token
+    /// recurrent scan (the DeltaNet state carries token-to-token). Returns the
+    /// last token's next-token logits.
+    fn prefill_hybrid(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.ensure_hybrid_bufs()?;
+        let p = self.weights.descriptor.params.clone();
+        let vocab = p.vocab_size;
+        let page_size = self.kv.cfg.page_size;
+        let mut last_logits = Vec::new();
+        for (i, &tok) in tokens.iter().enumerate() {
+            let pos = seq.len;
+            if pos == 0 {
+                self.zero_ssm()?;
+            }
+            if pos >= p.max_position_embeddings {
+                return Err(ForgeError::Scheduler(format!(
+                    "position {pos} exceeds model context {}",
+                    p.max_position_embeddings
+                )));
+            }
+            let page_boundary = seq.len.is_multiple_of(page_size);
+            self.kv.grow(seq)?;
+            self.upload_decode_inputs(tok, pos)?;
+            if page_boundary || self.pt_seq != seq.id {
+                self.upload_page_table(seq)?;
+            }
+            let want = i + 1 == tokens.len();
+            self.hybrid_forward_token(tok, want)?;
+            if want {
+                self.device.copy(
+                    &self.bufs.logits,
+                    0,
+                    &self.bufs.pinned_logits,
+                    0,
+                    vocab * 4,
+                    &self.stream,
+                )?;
+                self.device.synchronize()?;
+                let lp = self
+                    .bufs
+                    .pinned_logits
+                    .host_ptr()
+                    .expect("pinned buffer has host mapping") as *const f32;
+                last_logits = unsafe { std::slice::from_raw_parts(lp, vocab) }.to_vec();
+            }
+        }
+        Ok(last_logits)
     }
 
     /// Fused decode step: six launches per layer instead of nine. The
@@ -3019,7 +3519,7 @@ impl Model {
             // split layers (mixed formats) run one gemv_norm per projection —
             // per-row math is identical, only the block-level norm recompute
             // repeats. Both feed attn_decode_split via buffer + byte offset.
-            let (q_buf, q_off, k_buf, k_off, v_buf, v_off) = match &layer.attn_qkv {
+            let (q_buf, q_off, k_buf, k_off, v_buf, v_off) = match &layer.attn().attn_qkv {
                 QkvWeights::Fused(w_qkv) => {
                     self.gemv_norm(&b.qkv, w_qkv, &layer.attn_norm, l == 0, eps, stream)?;
                     (&b.qkv, 0usize, &b.qkv, k_byte_off, &b.qkv, v_byte_off)
@@ -3049,8 +3549,8 @@ impl Model {
                         k_off,
                         v_buf,
                         v_off,
-                        layer.q_norm.as_ref(),
-                        layer.k_norm.as_ref(),
+                        layer.attn().q_norm.as_ref(),
+                        layer.attn().k_norm.as_ref(),
                         &self.kv.k[l],
                         &self.kv.v[l],
                         &self.page_table_dev,
@@ -3092,8 +3592,8 @@ impl Model {
                         k_off,
                         v_buf,
                         v_off,
-                        layer.q_norm.as_ref(),
-                        layer.k_norm.as_ref(),
+                        layer.attn().q_norm.as_ref(),
+                        layer.attn().k_norm.as_ref(),
                         &tb.slots[s].stage[0],
                         &tb.slots[s].stage[1],
                         &tb.identity_pt,
@@ -3139,7 +3639,7 @@ impl Model {
                     .copy(&tb.slots[s].stage[1], lp * rb, &self.kv.v[l], phys * rb, rb, stream)?;
                 self.device.record_event(&tb.slots[s].free, stream)?;
             }
-            self.gemv_residual(&layer.attn_o, &b.attn_out, stream)?;
+            self.gemv_residual(&layer.attn().attn_o, &b.attn_out, stream)?;
             match &layer.dense_ffn()?.gate_up {
                 GateUpWeights::Fused(w) => {
                     self.gemv_norm_silu(&b.act, w, &layer.ffn_norm, eps, stream)?;
@@ -3287,7 +3787,7 @@ impl Model {
             let layer = &self.weights.layers[l];
             // Raw q/k/v projections (no norm/rope here — attn_decode_split folds
             // the q/k-norm + RoPE + paged append into its per-seq prologue).
-            match &layer.attn_qkv {
+            match &layer.attn().attn_qkv {
                 QkvWeights::Fused(w) => {
                     self.gemm_rows(&bb.q, w, &bb.x, n, 0, q_dim, stream)?;
                     self.gemm_rows(&bb.k, w, &bb.x, n, q_dim, kv_dim, stream)?;
@@ -3313,8 +3813,8 @@ impl Model {
                     0,
                     &bb.v,
                     0,
-                    layer.q_norm.as_ref(),
-                    layer.k_norm.as_ref(),
+                    layer.attn().q_norm.as_ref(),
+                    layer.attn().k_norm.as_ref(),
                     &self.kv.k[l],
                     &self.kv.v[l],
                     &bb.page_table,
@@ -3367,8 +3867,8 @@ impl Model {
                     lane * kv_dim * 2,
                     &bb.v,
                     lane * kv_dim * 2,
-                    layer.q_norm.as_ref(),
-                    layer.k_norm.as_ref(),
+                    layer.attn().q_norm.as_ref(),
+                    layer.attn().k_norm.as_ref(),
                     &slot.stage[0],
                     &slot.stage[1],
                     &tb.identity_pt,
@@ -3406,7 +3906,7 @@ impl Model {
                 self.device
                     .copy(&slot.stage[1], lp * rb, &self.kv.v[l], phys * rb, rb, stream)?;
             }
-            self.gemm(&bb.o_out, &layer.attn_o, &bb.attn_out, n, stream)?;
+            self.gemm(&bb.o_out, &layer.attn().attn_o, &bb.attn_out, n, stream)?;
             kernels.rmsnorm_residual_f16(&bb.x, &bb.h, &bb.o_out, &layer.ffn_norm, n, hidden, eps, stream)?;
 
             match &layer.dense_ffn()?.gate_up {

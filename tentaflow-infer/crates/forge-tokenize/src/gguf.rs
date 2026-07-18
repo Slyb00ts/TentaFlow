@@ -66,6 +66,12 @@ const PRE_GPT2: &[&str] =
 const PRE_QWEN2: &[&str] = &[
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 ];
+// Qwen3.5/3.6 (qwen35moe): like PRE_QWEN2 but the letter classes include
+// combining marks (\p{M}), so scripts with separate marks split identically to
+// upstream.
+const PRE_QWEN35: &[&str] = &[
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+];
 const PRE_LLAMA3: &[&str] = &[
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 ];
@@ -128,6 +134,7 @@ fn pre_spec(pre: &str) -> Result<(&'static [&'static str], bool)> {
         | "granite-docling" | "exaone4" => Ok((PRE_GPT2, false)),
         "qwen2" | "deepseek-r1-qwen" | "kormo" | "f2llmv2" | "megrez" | "stablelm2"
         | "hunyuan" => Ok((PRE_QWEN2, false)),
+        "qwen35" => Ok((PRE_QWEN35, false)),
         "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "pixtral"
         | "midm-2.0" | "lfm2" | "jina-v5-nano" => Ok((PRE_LLAMA3, true)),
         "dbrx" | "smaug-bpe" | "glm4" | "chatglm-bpe" => Ok((PRE_LLAMA3, false)),

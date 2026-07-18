@@ -267,11 +267,11 @@ Uwaga metodyczna: prefill mierzony do pierwszego WIDOCZNEGO tokenu (zawiera
   `nvfp4-pack-quantized` (NVFP4, programowy FP4) i `float-quantized`
   (FP8 → f16 przy ładowaniu); sharding przez `model.safetensors.index.json`.
 - Architektury: qwen3, llama, mistral, **olmoe** (MoE), **qwen3moe** (MoE),
-  **qwen35moe** (hybrid SSM+MoE — tylko detekcja/rejestr, patrz sekcja MoE)
+  **qwen35moe** (hybrid SSM+MoE — działa E2E, patrz sekcja qwen35moe)
   (rejestr deklaratywny w forge-formats); Whisper (osobny silnik); modele
   embeddingowe (pooling z metadanych).
-- head_dim: 64 i 128 (specjalizacje attention generacji); inne (np. 256 w
-  qwen35moe) → jasny błąd, do czasu kerneli hd256.
+- head_dim: 64, 128 (specjalizacje attention generacji) i 256 (tylko f16 KV,
+  warstwy atencji qwen35moe).
 
 ## MoE (Mixture-of-Experts)
 
@@ -290,7 +290,31 @@ Uwaga metodyczna: prefill mierzony do pierwszego WIDOCZNEGO tokenu (zawiera
   grouped-GEMM permute/unpermute i batched-MoE decode.
 - Warstwy MTP/NextN (`nextn_predict_layers`) są pomijane w podstawowej generacji.
 
-### qwen35moe (Qwen3.6-35B-A3B, hybrid SSM+MoE) — W TOKU
+### qwen35moe (Qwen3.6-35B-A3B, hybrid SSM+MoE) — DZIAŁA E2E
+
+`forge run test-models/gguf/qwen36-moe.gguf "The capital of France is" -n 32
+--temp 0 --weights-pool-gb 20 --ctx 4096` → „The capital of France is Paris."
+(spójny angielski). W trybie `--chat` (model myślący) strumień greedy jest
+identyczny co do znaku z `llama-cli`. Decode ~17 tok/s na RTX 4090 (ścieżka
+correctness-first — host round-tripy per warstwa, bez grafu/wsadu; llama.cpp
+~194 tok/s — optymalizacja to follow-up).
+
+- **Loader** (`weights.rs::load_hybrid`): per-`LayerKind`; warstwa DeltaNet
+  ładuje in-proj (`attn_qkv`)/conv1d (f16)/`ssm_dt`+`ssm_a` (f16)/beta+alpha
+  proj/`ssm_norm`/out-proj; atencja — bramkowane Q (split, bez fuzji) + QK-norm;
+  MoE z bramką shared expert (`ffn_gate_inp_shexp`). Tabela embeddingów trzymana
+  host-side (gather per token) — 22 GB kwantowanych wag mieści się w VRAM 24 GB.
+- **Stan SSM** (`Model.ssm`): rezydentny stan `[n_v_heads, d_state, d_state]` f32
+  + okno conv `[conv_dim, d_conv-1]` f16 per warstwa DeltaNet; zerowany na starcie
+  sekwencji, jedna aktywna sekwencja SSM naraz.
+- **Forward** (`hybrid_forward_token`): dispatch per-`LayerKind`; bramkowana
+  atencja hd256 (deinterleave q/gate → QK-norm → partial M-RoPE `n_rot=64` →
+  paged decode → `attn ⊙ σ(gate)` → o-proj), DeltaNet (conv+SiLU → split →
+  L2-norm → repeat 16→32 blokowo jak `ggml_repeat` → gated step → gated-RMSNorm →
+  out-proj), MoE + bramkowany shared expert. Prefill = sekwencyjny scan
+  rekurencyjny; decode = 1 token/krok. Ograniczenia jak MoE (KV f16, single-stream).
+
+### qwen35moe — szczegóły rejestru/kerneli
 
 - **Rejestr architektury** jest wpięty (`forge-formats`): detekcja z GGUF,
   reguła warstw hybrydowych (`(idx+1)%full_attention_interval==0` → pełna
@@ -313,12 +337,6 @@ Uwaga metodyczna: prefill mierzony do pierwszego WIDOCZNEGO tokenu (zawiera
   `rope_neox_partial_f16`. PTX + manifest przebudowane, typowane launchery +
   registry w `forge-kernels` (build + clippy czyste). Test numeryczny vs
   `deltanet.rs` (`test_deltanet.mojo`) przechodzi w tolerancji f16.
-- **Nie generuje jeszcze**: brak stanu SSM w `SeqKv` (alokacja/lifecycle
-  rezydentnego stanu) i hybrydowego forwardu per-`LayerKind` w silniku
-  (`model.rs`) + per-`LayerKind` loader w `weights.rs` (warstwy DeltaNet ładują
-  in-proj/conv/A_log/dt/beta/alpha/norm/out; atencja — bramkowane Q + QK-norm).
-  `forge run qwen36-moe.gguf …` kończy się jasnym błędem ładowania (warstwy
-  DeltaNet nie mają tensorów attn_q/k/v) — NIE generuje śmieci.
 
 ## Ograniczenia znane (uczciwie)
 
@@ -332,7 +350,8 @@ Uwaga metodyczna: prefill mierzony do pierwszego WIDOCZNEGO tokenu (zawiera
   2048 tokenów; długie prompty składaj z kawałków (patrz
   `examples/kv_tier_longctx.rs`).
 - ONNX: niewspierany (planowany). TTS: brak silnika (planowany).
-- MoE: tylko single-stream decode + KV f16 (patrz sekcja MoE); hybrydy SSM+MoE
-  (Qwen3.6 `qwen35moe`) — rejestr + referencja CPU są, generacja jeszcze nie
-  (brak kerneli Gated-DeltaNet + hd256 attention; patrz sekcja qwen35moe).
+- MoE: tylko single-stream decode + KV f16 (patrz sekcja MoE). Hybrydy SSM+MoE
+  (Qwen3.6 `qwen35moe`) generują E2E, ale ścieżka jest correctness-first
+  (~17 tok/s, host round-tripy per warstwa, bez grafu/wsadu — patrz sekcja
+  qwen35moe); jedna aktywna sekwencja SSM naraz.
 - `logprobs`/`n>1` w API: jeszcze nie.

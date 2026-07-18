@@ -47,8 +47,14 @@ Ostatnia aktualizacja: 2026-07-18.
   model / MTP / EAGLE proposerów i tree-verification w silniku. To rusztowanie,
   nie działająca akceleracja.
 - 🟡 **§4.2 Rejestr architektur**: qwen3, llama, mistral, olmoe (MoE), qwen3moe
-  (MoE). Brak: DeepSeek (MLA), Gemma (sliding-window), Phi.
-- 🟡 **§4.2 qwen35moe (Qwen3.6-35B-A3B hybrid SSM+MoE)** — rozpoczęte:
+  (MoE), qwen35moe (hybrid SSM+MoE, ✅ E2E — patrz niżej). Brak: DeepSeek (MLA),
+  Gemma (sliding-window), Phi.
+- ✅ **§4.2 qwen35moe (Qwen3.6-35B-A3B hybrid SSM+MoE)** — DZIAŁA E2E:
+  generuje spójny tekst na RTX 4090, `forge run … "The capital of France is"`
+  → „The capital of France is Paris.", a w trybie `--chat` strumień tokenów
+  jest identyczny co do znaku z `llama-cli` (thinking model, pełna zgodność
+  greedy). Decode ~17 tok/s (ścieżka korektnościowa, bez grafu/wsadu — patrz
+  niżej; llama.cpp ~194 tok/s). Podskładniki:
   - ✅ **Rejestr architektury** (`forge-formats/arch.rs::build_qwen35moe` +
     `arch/qwen35moe.ron`): wykrywanie z GGUF, reguła warstw hybrydowych
     (`(idx+1)%full_attention_interval==0` → atencja, reszta → Gated-DeltaNet;
@@ -74,13 +80,31 @@ Ostatnia aktualizacja: 2026-07-18.
     (`kernels/mojo/test_deltanet.mojo`): conv 7.7e-5, l2norm 5.9e-5, delta_step
     1.2e-4 / state 2.4e-7, gated_rmsnorm 4.8e-4, log_decay 9.2e-8, beta 3.0e-8 —
     wszystko w tolerancji f16.
-  - ❌ **Stan SSM w KV** (`SeqKv`): rezydentny bufor stanu `[n_v_heads, d_state,
-    d_state]` + `[conv_dim, d_conv-1]` per warstwa DeltaNet, obok paged KV dla
-    warstw atencji. (Launchery kerneli gotowe, brak alokacji/lifecycle w silniku.)
-  - ❌ **Forward hybrydowy w silniku**: dispatch per-`LayerKind`, bramkowana
-    atencja hd256, ścieżka DeltaNet (conv+scan+gated norm), MoE z shared expert
-    w tej ścieżce, prefill sekwencyjny + decode. Cel bramki: spójny tekst
-    zgodny z llama.cpp (~194 tok/s referencyjnie na RTX 4090).
+  - ✅ **Stan SSM w silniku** (`Model.ssm`): rezydentny bufor stanu
+    `[n_v_heads, d_state, d_state]` f32 + okno conv `[conv_dim, d_conv-1]` f16 per
+    warstwa DeltaNet, alokowany raz (pula Weights), zerowany na starcie sekwencji
+    (`pos==0`). Persistent/nie-paged (jedna aktywna sekwencja SSM naraz — zgodnie
+    z jednostrumieniową ścieżką MoE decode). Warstwy atencji używają paged KV.
+  - ✅ **Wagi hybrydowe** (`weights.rs::load_hybrid`): `LayerMixer::{Attention,
+    DeltaNet}`, atencja z bramkowanym Q (szerokość `2·n_heads·head_dim`, split,
+    bez fuzji), zestaw DeltaNet (in-proj/conv1d f16/dt-bias+A f16/beta+alpha proj/
+    ssm-norm/out-proj), MoE z bramką shared expert (`ffn_gate_inp_shexp`). Tabela
+    embeddingów trzymana host-side (gather per token), by 22 GB kwantowanych wag
+    zmieściło się w VRAM 24 GB (`--weights-pool-gb 20`).
+  - ✅ **Forward hybrydowy w silniku** (`model.rs::hybrid_forward_token` +
+    `hybrid_attn_mixer`/`hybrid_delta_mixer`): dispatch per-`LayerKind`, bramkowana
+    atencja hd256 (deinterleave q/gate → QK-norm per głowa → partial M-RoPE
+    n_rot=64 → paged decode → `attn ⊙ σ(gate)` → o-proj), ścieżka DeltaNet
+    (in-proj → conv+SiLU → split q/k/v → L2-norm → repeat 16→32 blokowo jak
+    `ggml_repeat` → log-decay/beta → gated step → gated-RMSNorm → out-proj), MoE
+    z bramkowanym shared expertem. Prefill = sekwencyjny scan rekurencyjny po
+    tokenach promptu; decode = jeden token/krok. Bramka osiągnięta: spójny tekst +
+    pełna zgodność greedy z `llama-cli`.
+  - 🟡 **Wydajność ścieżki hybrydowej**: korektność najpierw — host round-tripy
+    per warstwa (gather embed, bramka atencji, router MoE), brak grafu CUDA i
+    wsadu, DeltaNet skanowany per token wieloma małymi `device.copy`. ~17 tok/s
+    (llama.cpp ~194). Optymalizacja (kernel sigmoid-mul bramki, wsadowy prefill,
+    graf decode, mniej sync-ów) to follow-up.
 - 🟡 **§9.2 Odporność**: admission ✅; brak respawn workera po crashu, health
   per-GPU, pełnego graceful drain.
 - 🟡 **§8.3 Operacyjność**: /healthz ✅; brak metryk Prometheus/OTel, hot reload.

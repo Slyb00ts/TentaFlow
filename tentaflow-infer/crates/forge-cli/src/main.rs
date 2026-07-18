@@ -616,30 +616,31 @@ fn load_auto(
     } else {
         ctx_pages
     };
-    let kv_pool = kv_pool_bytes(&desc, page_size, kv_pages, kv_quant).max(1 << 30);
     let stage = if kv_tier.enabled() {
         tier_stage_bytes(&desc, page_size, ctx_pages, kv_quant)
     } else {
         0
     };
 
-    // Activations pool holds decode scratch + persistent decode buffers.
+    // Activations pool holds decode scratch + persistent decode buffers. The
+    // engine's paged KV slabs and (hybrid) SSM state allocate from the WEIGHTS
+    // pool, not the HAL kv_cache pool — that pool is unused by the LLM engine,
+    // so it is kept minimal (otherwise a full 1 GiB kv_cache arena is claimed
+    // but never used, needlessly starving the weights pool).
     let activations = 1usize << 30;
+    let hal_kv = 4usize << 20;
     let weights = if weights_pool_gb > 0.0 {
         (weights_pool_gb * (1u64 << 30) as f64) as usize + stage
     } else {
-        // Give the KV cache its computed budget first, then the rest (minus a
-        // safety margin) to weights, so a long context never starves the KV
-        // arena the way a fixed 60/30/10 split could.
         let free = CudaDevice::free_vram(0).context("query free VRAM")?;
-        free.saturating_sub(kv_pool + activations + (512 << 20))
+        free.saturating_sub(activations + hal_kv + (512 << 20))
             .max(1 << 30)
     };
     let device = CudaDevice::new(
         0,
         PoolSizes {
             weights,
-            kv_cache: kv_pool,
+            kv_cache: hal_kv,
             activations,
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
         },

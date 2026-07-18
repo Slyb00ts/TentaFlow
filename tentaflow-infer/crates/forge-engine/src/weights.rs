@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use forge_formats::nvfp4::{self, NvFp4Scheme, NvFp4TensorNames};
 use forge_formats::safetensors::ShardedSafeTensors;
-use forge_formats::{dequantize_to_f32, Gguf, HfConfig, ModelDescriptor, WeightRole};
+use forge_formats::{dequantize_to_f32, Gguf, HfConfig, LayerKind, ModelDescriptor, WeightRole};
 use forge_hal::{DevBuffer, Device, Pool};
 use forge_types::{DType, ForgeError, MemKind, QuantKind, Result};
 use half::f16;
@@ -249,11 +249,39 @@ pub struct MoeFfn {
     pub down_exps: DevWeight,
     /// Shared always-on expert (Qwen-MoE / DeepSeek), added to every token.
     pub shared: Option<DenseFfn>,
+    /// Per-token sigmoid gate on the shared expert (qwen35moe
+    /// `ffn_gate_inp_shexp`, f16 [1, hidden] → one logit per token). `None`
+    /// = the shared expert is added ungated (weight 1.0).
+    pub shared_gate: Option<DevWeight>,
     pub n_experts: usize,
     pub n_experts_used: usize,
     pub moe_inter: usize,
     /// Renormalize the top-k routing weights to sum 1.
     pub norm_topk: bool,
+}
+
+/// Gated-DeltaNet (linear-attention) layer weights (qwen35moe hybrid stack).
+/// Tensor roles mirror `qwen35moe.cpp build_layer_attn_linear`.
+pub struct DeltaNetWeights {
+    /// `wqkv` in-projection producing the mixed q|k|v conv stream
+    /// ([conv_dim, hidden]).
+    pub in_proj: DevWeight,
+    /// `wqkv_gate` producing the output gate `z` ([value_dim, hidden]).
+    pub gate_proj: DevWeight,
+    /// Depthwise causal conv weight, f16 flattened `ssm_conv1d {d_conv, conv_dim}`.
+    pub conv1d: DevBuffer,
+    /// Time-step bias added before softplus, f16 [n_v_heads].
+    pub dt_bias: DevBuffer,
+    /// Log-decay scale `-exp(A_log)`, f16 [n_v_heads].
+    pub a: DevBuffer,
+    /// Per-head write-gate projection ([n_v_heads, hidden]).
+    pub beta_proj: DevWeight,
+    /// Per-head decay projection ([n_v_heads, hidden]).
+    pub alpha_proj: DevWeight,
+    /// Output gated-RMSNorm weight over head_v_dim, f16 [d_state].
+    pub ssm_norm: DevBuffer,
+    /// Output projection ([hidden, value_dim]).
+    pub out_proj: DevWeight,
 }
 
 /// Feed-forward block: dense SwiGLU or routed Mixture-of-Experts. The MoE
@@ -263,19 +291,44 @@ pub enum LayerFfn {
     Moe(Box<MoeFfn>),
 }
 
-/// Per-layer weight set (roles resolved by the arch registry).
-pub struct LayerWeights {
-    pub attn_norm: DevBuffer,
-    pub ffn_norm: DevBuffer,
+/// Softmax self-attention weights for one layer.
+pub struct AttnWeights {
     /// Optional per-head QK norms (qwen3); f16 vectors of head_dim.
     pub q_norm: Option<DevBuffer>,
     pub k_norm: Option<DevBuffer>,
     pub attn_qkv: QkvWeights,
     pub attn_o: DevWeight,
+}
+
+/// The token-mixing sublayer of a transformer block: standard softmax
+/// attention, or (qwen35moe hybrid) Gated-DeltaNet linear attention. Non-hybrid
+/// architectures are all `Attention`.
+pub enum LayerMixer {
+    Attention(Box<AttnWeights>),
+    DeltaNet(Box<DeltaNetWeights>),
+}
+
+/// Per-layer weight set (roles resolved by the arch registry).
+pub struct LayerWeights {
+    pub attn_norm: DevBuffer,
+    pub ffn_norm: DevBuffer,
+    pub mixer: LayerMixer,
     pub ffn: LayerFfn,
 }
 
 impl LayerWeights {
+    /// Attention sub-weights. The generic decode/prefill paths only run on
+    /// all-attention (non-hybrid) models, so this never hits a DeltaNet layer;
+    /// the hybrid paths dispatch on `mixer` directly.
+    pub fn attn(&self) -> &AttnWeights {
+        match &self.mixer {
+            LayerMixer::Attention(a) => a,
+            LayerMixer::DeltaNet(_) => {
+                unreachable!("attention path reached a DeltaNet layer")
+            }
+        }
+    }
+
     /// Dense FFN parts, or an error on a MoE layer — the dense decode/prefill
     /// paths (fused, rot, batched, separate) never run on a MoE model, which
     /// takes the dedicated routed path instead.
@@ -293,6 +346,11 @@ pub struct ModelWeights {
     pub descriptor: ModelDescriptor,
     /// Token embedding table, always f16 [vocab, hidden] (gather kernel input).
     pub token_embd_f16: DevBuffer,
+    /// Host-resident f16 embedding table [vocab*hidden] for the hybrid arch:
+    /// its per-token gather runs on the host (one 4 KiB row/token), so the
+    /// full ~1 GiB table need not occupy VRAM (`token_embd_f16` is then a small
+    /// placeholder). `None` for models that gather on-device.
+    pub token_embd_host: Option<Vec<f16>>,
     pub output_norm: DevBuffer,
     /// LM head. For tied embeddings this is a separate f16 view built from the
     /// same host data (kept simple; dedup is a later optimization).
@@ -481,6 +539,23 @@ fn upload_norm(device: &dyn Device, src: &dyn TensorSource, name: &str) -> Resul
     let numel = dims.iter().product();
     let f32s = dequantize_to_f32(dtype, quant, &data, numel)?;
     upload(device, &f32s_to_f16_bytes(&f32s))
+}
+
+/// Load a 1-D tensor as a single-row f16 GEMV weight (`rows = 1`, `cols = n`).
+/// Used for the qwen35moe shared-expert sigmoid gate (`ffn_gate_inp_shexp`).
+fn load_vector_weight(
+    device: &dyn Device,
+    src: &dyn TensorSource,
+    name: &str,
+) -> Result<DevWeight> {
+    let (data, dtype, quant, dims) = src.fetch(name)?;
+    let numel: usize = dims.iter().product();
+    let f32s = dequantize_to_f32(dtype, quant, &data, numel)?;
+    Ok(DevWeight::F16 {
+        buf: upload(device, &f32s_to_f16_bytes(&f32s))?,
+        rows: 1,
+        cols: numel,
+    })
 }
 
 /// A weight matrix still on the host, in the exact byte layout the fused
@@ -1053,6 +1128,24 @@ fn fuse_rows(mut parts: Vec<HostWeight>) -> std::result::Result<HostWeight, Vec<
     Ok(fused)
 }
 
+/// Fetch the embedding table as a host-resident f16 vector (row-major
+/// [vocab*hidden]); returns `(table, vocab, hidden)`.
+fn fetch_embedding_host(
+    src: &dyn TensorSource,
+    name: &str,
+) -> Result<(Vec<f16>, usize, usize)> {
+    let (data, dtype, quant, dims) = src.fetch(name)?;
+    if dims.len() != 2 {
+        return Err(ForgeError::Format(format!(
+            "{name}: expected matrix, got {dims:?}"
+        )));
+    }
+    let (rows, cols) = (dims[0], dims[1]);
+    let f32s = dequantize_to_f32(dtype, quant, &data, rows * cols)?;
+    let f16s = f32s.iter().map(|&v| f16::from_f32(v)).collect();
+    Ok((f16s, rows, cols))
+}
+
 /// Upload the embedding table as f16 regardless of storage quant.
 fn upload_embedding(
     device: &dyn Device,
@@ -1102,6 +1195,12 @@ impl ModelWeights {
         descriptor: ModelDescriptor,
         src: &dyn TensorSource,
     ) -> Result<Self> {
+        // Hybrid attention/DeltaNet arches (qwen35moe) have per-layer weight
+        // sets that differ by kind and a gated attention Q projection the
+        // generic shape checks would reject; they take a dedicated loader.
+        if descriptor.params.ssm.is_some() {
+            return Self::load_hybrid(device, descriptor, src);
+        }
         let global = |role: WeightRole| -> Result<&String> {
             descriptor
                 .globals
@@ -1320,6 +1419,7 @@ impl ModelWeights {
                         up_exps: upload_weight(device, up_exps)?,
                         down_exps: upload_weight(device, down_exps)?,
                         shared,
+                        shared_gate: None,
                         n_experts: moe.n_experts,
                         n_experts_used: moe.n_experts_used,
                         moe_inter: moe.moe_intermediate_size,
@@ -1331,16 +1431,18 @@ impl ModelWeights {
             layers.push(LayerWeights {
                 attn_norm: upload_norm(device, src, name(WeightRole::AttnNorm)?)?,
                 ffn_norm: upload_norm(device, src, name(WeightRole::FfnNorm)?)?,
-                q_norm: match layer_map.get(&WeightRole::AttnQNorm) {
-                    Some(n) => Some(upload_norm(device, src, n)?),
-                    None => None,
-                },
-                k_norm: match layer_map.get(&WeightRole::AttnKNorm) {
-                    Some(n) => Some(upload_norm(device, src, n)?),
-                    None => None,
-                },
-                attn_qkv,
-                attn_o: upload_weight(device, attn_o)?,
+                mixer: LayerMixer::Attention(Box::new(AttnWeights {
+                    q_norm: match layer_map.get(&WeightRole::AttnQNorm) {
+                        Some(n) => Some(upload_norm(device, src, n)?),
+                        None => None,
+                    },
+                    k_norm: match layer_map.get(&WeightRole::AttnKNorm) {
+                        Some(n) => Some(upload_norm(device, src, n)?),
+                        None => None,
+                    },
+                    attn_qkv,
+                    attn_o: upload_weight(device, attn_o)?,
+                })),
                 ffn,
             });
         }
@@ -1348,12 +1450,161 @@ impl ModelWeights {
         Ok(ModelWeights {
             descriptor,
             token_embd_f16,
+            token_embd_host: None,
             output_norm,
             lm_head,
             layers,
             fused_qkv_layers,
             fused_qk_layers,
             fused_gate_up_layers,
+        })
+    }
+
+    /// Load the qwen35moe hybrid stack: interleaved gated-attention and
+    /// Gated-DeltaNet layers, each with a routed + gated-shared MoE FFN. The
+    /// attention Q projection is gated (width `2*n_heads*head_dim`) so it is
+    /// stored split (no q/k/v fusion); DeltaNet layers carry the SSM weight set.
+    fn load_hybrid(
+        device: &dyn Device,
+        descriptor: ModelDescriptor,
+        src: &dyn TensorSource,
+    ) -> Result<Self> {
+        let global = |role: WeightRole| -> Result<&String> {
+            descriptor
+                .globals
+                .get(&role)
+                .ok_or_else(|| ForgeError::Format(format!("missing global weight {role:?}")))
+        };
+        let embd_name = global(WeightRole::TokenEmbd)?;
+        // The embedding table (~1 GiB f16) stays on the host so the 22 GB of
+        // quantized weights fit VRAM; the gather runs host-side per token.
+        let (host_embed, vocab, hidden) = fetch_embedding_host(src, embd_name)?;
+        let token_embd_f16 = upload(device, &vec![0u8; hidden * 2])?;
+        let output_norm = upload_norm(device, src, global(WeightRole::OutputNorm)?)?;
+        let lm_head_name = descriptor
+            .globals
+            .get(&WeightRole::LmHead)
+            .unwrap_or(embd_name);
+        let lm_head = match fetch_matrix(src, lm_head_name)? {
+            HostWeight::NvFp4 {
+                packed,
+                scales,
+                global_scale,
+                rows,
+                cols,
+            } => {
+                let f32s = nvfp4::dequantize_nvfp4(&packed, &scales, global_scale, rows, cols, 16)?;
+                DevWeight::F16 {
+                    buf: upload(device, &f32s_to_f16_bytes(&f32s))?,
+                    rows,
+                    cols,
+                }
+            }
+            w => upload_weight(device, w)?,
+        };
+        if vocab != descriptor.params.vocab_size || hidden != descriptor.params.hidden_size {
+            return Err(ForgeError::Format(format!(
+                "embedding [{vocab}, {hidden}] does not match model config [{}, {}]",
+                descriptor.params.vocab_size, descriptor.params.hidden_size
+            )));
+        }
+
+        let p = &descriptor.params;
+        let moe = p.moe.clone().expect("hybrid model is MoE");
+
+        let mut layers = Vec::with_capacity(p.block_count);
+        for (idx, layer_map) in descriptor.layers.iter().enumerate() {
+            let name = |role: WeightRole| -> Result<&String> {
+                layer_map
+                    .get(&role)
+                    .ok_or_else(|| ForgeError::Format(format!("layer {idx}: missing {role:?}")))
+            };
+
+            let mixer = match descriptor.layer_kinds[idx] {
+                LayerKind::Attention => {
+                    let q = upload_weight(device, fetch_matrix(src, name(WeightRole::AttnQ)?)?)?;
+                    let k = upload_weight(device, fetch_matrix(src, name(WeightRole::AttnK)?)?)?;
+                    let v = upload_weight(device, fetch_matrix(src, name(WeightRole::AttnV)?)?)?;
+                    let attn_o =
+                        upload_weight(device, fetch_matrix(src, name(WeightRole::AttnO)?)?)?;
+                    LayerMixer::Attention(Box::new(AttnWeights {
+                        q_norm: Some(upload_norm(device, src, name(WeightRole::AttnQNorm)?)?),
+                        k_norm: Some(upload_norm(device, src, name(WeightRole::AttnKNorm)?)?),
+                        attn_qkv: QkvWeights::Split { q, k, v },
+                        attn_o,
+                    }))
+                }
+                LayerKind::DeltaNet => LayerMixer::DeltaNet(Box::new(DeltaNetWeights {
+                    in_proj: upload_weight(device, fetch_matrix(src, name(WeightRole::SsmInProj)?)?)?,
+                    gate_proj: upload_weight(device, fetch_matrix(src, name(WeightRole::SsmGate)?)?)?,
+                    conv1d: upload_norm(device, src, name(WeightRole::SsmConv1d)?)?,
+                    dt_bias: upload_norm(device, src, name(WeightRole::SsmDt)?)?,
+                    a: upload_norm(device, src, name(WeightRole::SsmA)?)?,
+                    beta_proj: upload_weight(device, fetch_matrix(src, name(WeightRole::SsmBeta)?)?)?,
+                    alpha_proj: upload_weight(
+                        device,
+                        fetch_matrix(src, name(WeightRole::SsmAlpha)?)?,
+                    )?,
+                    ssm_norm: upload_norm(device, src, name(WeightRole::SsmNorm)?)?,
+                    out_proj: upload_weight(device, fetch_matrix(src, name(WeightRole::SsmOut)?)?)?,
+                })),
+            };
+
+            // Routed experts + always-on gated shared expert (every layer).
+            let router = match fetch_matrix(src, name(WeightRole::FfnGateInp)?)? {
+                r @ HostWeight::F16 { .. } => upload_weight(device, r)?,
+                other => {
+                    return Err(ForgeError::Unsupported(format!(
+                        "layer {idx} ffn_gate_inp must be f16-materializable, got {:?}",
+                        std::mem::discriminant(&other)
+                    )))
+                }
+            };
+            let gate_exps = fetch_expert_stack(src, name(WeightRole::FfnGateExps)?)?;
+            let up_exps = fetch_expert_stack(src, name(WeightRole::FfnUpExps)?)?;
+            let down_exps = fetch_expert_stack(src, name(WeightRole::FfnDownExps)?)?;
+            let sh_gate = upload_weight(device, fetch_matrix(src, name(WeightRole::FfnGateShExp)?)?)?;
+            let sh_up = upload_weight(device, fetch_matrix(src, name(WeightRole::FfnUpShExp)?)?)?;
+            let sh_down = upload_weight(device, fetch_matrix(src, name(WeightRole::FfnDownShExp)?)?)?;
+            let shared_gate = load_vector_weight(device, src, name(WeightRole::FfnGateInpShExp)?)?;
+
+            let ffn = LayerFfn::Moe(Box::new(MoeFfn {
+                router,
+                gate_exps: upload_weight(device, gate_exps)?,
+                up_exps: upload_weight(device, up_exps)?,
+                down_exps: upload_weight(device, down_exps)?,
+                shared: Some(DenseFfn {
+                    gate_up: GateUpWeights::Split {
+                        gate: sh_gate,
+                        up: sh_up,
+                    },
+                    down: sh_down,
+                }),
+                shared_gate: Some(shared_gate),
+                n_experts: moe.n_experts,
+                n_experts_used: moe.n_experts_used,
+                moe_inter: moe.moe_intermediate_size,
+                norm_topk: moe.norm_topk_prob,
+            }));
+
+            layers.push(LayerWeights {
+                attn_norm: upload_norm(device, src, name(WeightRole::AttnNorm)?)?,
+                ffn_norm: upload_norm(device, src, name(WeightRole::FfnNorm)?)?,
+                mixer,
+                ffn,
+            });
+        }
+
+        Ok(ModelWeights {
+            descriptor,
+            token_embd_f16,
+            token_embd_host: Some(host_embed),
+            output_norm,
+            lm_head,
+            layers,
+            fused_qkv_layers: 0,
+            fused_qk_layers: 0,
+            fused_gate_up_layers: 0,
         })
     }
 
