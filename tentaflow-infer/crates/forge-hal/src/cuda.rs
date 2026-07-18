@@ -450,6 +450,17 @@ impl CudaDevice {
             .map_err(|e| cu_err("cuMemGetInfo", e))
     }
 
+    /// Free VRAM in bytes without retaining a device — for sizing pools before
+    /// the arenas (which grab their whole budget up front) are created.
+    pub fn free_vram(ordinal: usize) -> Result<usize> {
+        let ctx = CudaContext::new(ordinal)
+            .map_err(|e| cu_err(&format!("CudaContext::new({ordinal})"), e))?;
+        let (free, _total) = ctx
+            .mem_get_info()
+            .map_err(|e| cu_err("cuMemGetInfo", e))?;
+        Ok(free)
+    }
+
     fn pool(&self, pool: Pool) -> &Arc<CudaPool> {
         match pool {
             Pool::Weights => &self.weights,

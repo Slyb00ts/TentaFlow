@@ -103,6 +103,10 @@ enum Command {
         /// KV cache element type: f16 | fp8 (fp8 halves KV memory/bandwidth).
         #[arg(long = "kv-cache", default_value = "f16")]
         kv_cache: String,
+        /// Max context length (0 = the model's own max, capped at 32768). The
+        /// KV cache is sized for this; a request cannot exceed it.
+        #[arg(long = "ctx", default_value_t = 0)]
+        ctx: usize,
     },
     /// Transcribe a WAV file with a Whisper model.
     Transcribe {
@@ -187,6 +191,7 @@ fn main() -> Result<()> {
             chat,
             weights_pool_gb,
             kv_cache,
+            ctx,
         } => cmd_run(
             &model_path,
             &prompt,
@@ -195,6 +200,7 @@ fn main() -> Result<()> {
             chat,
             weights_pool_gb,
             parse_kv_dtype(&kv_cache)?,
+            ctx,
         ),
         Command::Transcribe {
             model_dir,
@@ -260,29 +266,66 @@ fn load_for_serve(
 }
 
 /// Load a model for one-shot commands, sizing pools from free VRAM.
-fn load_auto(path: &Path, weights_pool_gb: f64, kv_dtype: DType) -> Result<LoadedModel> {
-    let device = if weights_pool_gb > 0.0 {
-        let weights = (weights_pool_gb * (1u64 << 30) as f64) as usize;
-        CudaDevice::new(
-            0,
-            PoolSizes {
-                weights,
-                kv_cache: 1 << 30,
-                activations: 1 << 30,
-                kv_page_size: 256 << 10,
-            },
-        )
-        .context("create CUDA device")?
+/// Resolve the usable context length and the KV page count that covers it.
+/// `requested == 0` means "the model's own maximum"; either way it is capped
+/// at `CTX_CEILING` so a default run never tries to reserve an absurd KV pool.
+const CTX_CEILING: usize = 32_768;
+
+fn resolve_ctx(max_position_embeddings: usize, requested: usize, page_size: usize) -> (usize, usize) {
+    let model_max = max_position_embeddings.max(page_size);
+    let target = if requested == 0 {
+        model_max.min(CTX_CEILING)
     } else {
-        CudaDevice::with_default_pools(0).context("create CUDA device")?
+        requested.min(model_max)
     };
+    (target, target.div_ceil(page_size))
+}
+
+fn load_auto(
+    path: &Path,
+    weights_pool_gb: f64,
+    kv_dtype: DType,
+    ctx: usize,
+) -> Result<LoadedModel> {
+    // Read hyperparameters before loading weights so the KV cache is sized for
+    // the requested context up front (its slabs are allocated during load).
+    let desc = read_descriptor(path)?;
+    let page_size = ModelConfig::default().kv_page_size;
+    let (max_seq_len, kv_pages) =
+        resolve_ctx(desc.params.max_position_embeddings, ctx, page_size);
+    let kv_pool = kv_pool_bytes(&desc, page_size, kv_pages, kv_dtype).max(1 << 30);
+
+    // Activations pool holds decode scratch + persistent decode buffers.
+    let activations = 1usize << 30;
+    let weights = if weights_pool_gb > 0.0 {
+        (weights_pool_gb * (1u64 << 30) as f64) as usize
+    } else {
+        // Give the KV cache its computed budget first, then the rest (minus a
+        // safety margin) to weights, so a long context never starves the KV
+        // arena the way a fixed 60/30/10 split could.
+        let free = CudaDevice::free_vram(0).context("query free VRAM")?;
+        free.saturating_sub(kv_pool + activations + (512 << 20))
+            .max(1 << 30)
+    };
+    let device = CudaDevice::new(
+        0,
+        PoolSizes {
+            weights,
+            kv_cache: kv_pool,
+            activations,
+            kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
+        },
+    )
+    .context("create CUDA device")?;
     let dev: Arc<dyn Device> = device;
     load_model(
         dev,
         path,
         ModelConfig {
             kv_dtype,
-            ..ModelConfig::default()
+            kv_page_size: page_size,
+            kv_pages,
+            max_seq_len,
         },
     )
 }
@@ -368,7 +411,7 @@ fn cmd_embed(
     weights_pool_gb: f64,
 ) -> Result<()> {
     let t0 = Instant::now();
-    let loaded = load_auto(model_path, weights_pool_gb, DType::F16)?;
+    let loaded = load_auto(model_path, weights_pool_gb, DType::F16, 8192)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let pooling = match pooling_override {
@@ -584,6 +627,7 @@ fn drain_request(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_run(
     model_path: &Path,
     prompt: &str,
@@ -592,9 +636,10 @@ fn cmd_run(
     chat: bool,
     weights_pool_gb: f64,
     kv_dtype: DType,
+    ctx: usize,
 ) -> Result<()> {
     let t0 = Instant::now();
-    let loaded = load_auto(model_path, weights_pool_gb, kv_dtype)?;
+    let loaded = load_auto(model_path, weights_pool_gb, kv_dtype, ctx)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let prompt_text = if chat {
@@ -655,7 +700,7 @@ fn cmd_bench(model_path: &Path, tokens: usize, prompt_tokens: usize, kv_dtype: D
         bail!("--prompt-tokens must be at least 1");
     }
     let t0 = Instant::now();
-    let loaded = load_auto(model_path, 0.0, kv_dtype)?;
+    let loaded = load_auto(model_path, 0.0, kv_dtype, 0)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let tokenizer = Arc::new(loaded.bundle.tokenizer);
