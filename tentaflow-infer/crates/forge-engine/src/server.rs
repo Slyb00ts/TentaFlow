@@ -34,6 +34,8 @@ pub enum EngineEvent {
         reason: FinishReason,
         tokens: usize,
         prompt_tokens: usize,
+        /// Prompt tokens served from the prefix cache (SPEC §5.2 prefix hit).
+        cache_read_tokens: usize,
     },
     Error(String),
 }
@@ -89,6 +91,9 @@ struct ActiveSeq<'t> {
     max_tokens: usize,
     eos_ids: Vec<u32>,
     prompt_len: usize,
+    /// Prompt tokens served from the prefix cache (SPEC §5.2), reported in the
+    /// completion usage as `cached_tokens`.
+    cache_read: usize,
     next: Option<PendingNext>,
     /// Client hang-up detected; sequence is torn down at the next iteration.
     dead: bool,
@@ -208,14 +213,20 @@ fn worker<'t>(
                 }));
                 continue;
             }
+            // A prefix-cache hit (SPEC §5.2) shrinks the pages this request must
+            // prefill: the shared prefix is already resident. The projection
+            // uses a read-only match; the actual borrow happens once the
+            // sequence exists. Admission counts reclaimable cached pages as
+            // available, so a full-but-reclaimable cache never blocks work.
+            let cache_read_pages = model.prefix_match_len(&sub.req.prompt_tokens) / page;
             let admit_floor = if model.tier_enabled() {
                 need_pages
                     .unwrap()
                     .min(crate::tier::min_resident_pages(page))
             } else {
-                need_pages.unwrap()
+                need_pages.unwrap().saturating_sub(cache_read_pages)
             };
-            if admit_floor > model.kv.free_page_count() {
+            if admit_floor > model.available_pages() {
                 break; // transient KV pressure: retry when a sequence finishes
             }
             let sub = waiting.pop_front().unwrap();
@@ -223,23 +234,30 @@ fn worker<'t>(
                 let _ = sub.events.send(EngineEvent::Error("empty prompt".into()));
                 continue;
             }
-            let prompt_len = sub.req.prompt_tokens.len();
+            let prompt = sub.req.prompt_tokens;
+            let prompt_len = prompt.len();
             let sampler = if model.gpu_sampling_supported(&sub.req.sampling) {
                 SeqSampler::Gpu(GpuSampler::new(sub.req.sampling.clone()))
             } else {
                 SeqSampler::Cpu(Sampler::new(sub.req.sampling.clone()))
             };
+            // Borrow the longest cached prefix (pins shared pages); only the
+            // divergent suffix stays to prefill.
+            let mut seq = model.new_seq();
+            let cache_read = model.acquire_prefix(&mut seq, &prompt);
+            let pending_prompt: VecDeque<u32> = prompt[cache_read..].iter().copied().collect();
             active.push(ActiveSeq {
-                seq: model.new_seq(),
+                seq,
                 sampler,
                 decoder: StreamDecoder::new(tokenizer, true),
                 stops: StopMatcher::new(sub.req.stop.clone()),
                 events: sub.events,
-                pending_prompt: sub.req.prompt_tokens.into(),
+                pending_prompt,
                 generated: Vec::new(),
                 max_tokens: sub.req.max_tokens.max(1),
                 eos_ids: sub.req.eos_ids,
                 prompt_len,
+                cache_read,
                 next: None,
                 dead: false,
             });
@@ -559,6 +577,7 @@ fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason) -> Result<()> {
         reason,
         tokens: a.generated.len(),
         prompt_tokens: a.prompt_len,
+        cache_read_tokens: a.cache_read,
     });
     a.dead = true;
     Ok(())

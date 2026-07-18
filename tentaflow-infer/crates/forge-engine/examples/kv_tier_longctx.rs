@@ -73,6 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ram_budget_bytes: (ram_gb * (1u64 << 30) as f64) as usize,
             watermark: 0.10,
         },
+        prefix_cache: false,
     };
     // The engine's paged KV slabs + (hybrid) SSM state allocate from the
     // WEIGHTS pool, not the HAL kv_cache pool, so keep the latter tiny (a full

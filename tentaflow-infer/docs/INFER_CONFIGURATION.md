@@ -169,7 +169,66 @@ jawny błąd Unsupported — tracked follow-up).
 
 Admission control: żądanie, którego prompt+max_tokens nie mieści się w stronach
 KV, dostaje natychmiast 429 (przejściowy brak) albo 400 `context_length_exceeded`
-(trwałe przekroczenie `--ctx`), nigdy OOM w połowie generacji.
+(trwałe przekroczenie `--ctx`), nigdy OOM w połowie generacji. Trafienie w
+prefix-cache (niżej) zmniejsza projekcję stron przy przyjęciu, a strony
+odzyskiwalne z cache liczą się jako dostępne — pełny-ale-odzyskiwalny cache nigdy
+nie blokuje przyjęcia żądania, które by się zmieściło.
+
+---
+
+## Radix prefix cache: dedup współdzielonych prefiksów KV (serve / run / bench)
+
+`PrefixCache` (SPEC §5.2, `forge-engine/src/prefix.rs`): drzewo radix indeksowane
+sekwencją token-id, które dedupuje współdzielone prefiksy KV (system-prompty,
+few-shot, kolejne tury czatu). Nowe żądanie PRZED prefillem przechodzi drzewo,
+dopasowując tokeny promptu do zapamiętanych prefiksów; strony najdłuższego
+pasującego prefiksu są WSPÓŁDZIELONE (refcount, read-only), a prefillowany jest
+tylko rozbieżny ogon. Po zakończeniu sekwencja DONUJE swoje własne, świeżo
+zprefillowane pełne strony z powrotem do drzewa, przedłużając wspólny prefiks dla
+kolejnych żądań.
+
+**Poprawność (twarda):** bajty KV to deterministyczna funkcja prefiksu tokenów
+ORAZ ścieżki kerneli prefillu. Cache trzyma WYŁĄCZNIE strony zbudowane przez
+prefill, więc pożyczony prefiks jest bajt-w-bajt identyczny z tym, co
+zprefillowałoby żądanie bez trafienia — drugie żądanie ze wspólnym prefiksem daje
+DOKŁADNIE te same tokeny co bez cache. Współdzielenie jest na granularności
+CAŁYCH stron (32 tokeny), więc borrower nigdy nie pisze do współdzielonej strony
+(strony KV są append-only, a pierwszy zapis trafia w nową stronę na granicy) — nie
+ma potrzeby copy-on-write częściowej strony granicznej.
+
+**Eviction:** gdy wolnych stron brakuje, wyrzucane są liście drzewa z refcount 0
+w kolejności LRU, a ich strony wracają na stos wolnych. Strony wskazywane przez
+aktywne sekwencje (refcount > 0 lub przodek żywej pożyczki) nigdy nie są
+wyrzucane. Reclaim jest wołany przed wzrostem prefillu/decode, więc trafienie w
+cache nigdy nie zagłodzi puli.
+
+| Flaga | Domyślnie | Opis |
+|---|---|---|
+| `--prefix-cache <M>` | `on` | `on` \| `off`. `on` = dedup współdzielonych prefiksów KV; **ścisła optymalizacja** — włącza się tylko gdy nic nie psuje. `off` = bajt-w-bajt dzisiejsze zachowanie (zero akwizycji/donacji). |
+
+Zakres i komponowanie:
+
+- Aktywny tylko dla **verbatim KV `f16`/`fp8`, bez tieringu, arch nie-hybrydowa**.
+  Z `--kv-tier`/`--kvflash` (spill przepisuje/przenosi strony), trybami `rot4`/
+  `rot3` (residual ring indeksowany pozycją, nie stroną) i arch hybrydową
+  `qwen35moe` (rezydentny stan SSM nie żyje w stronach KV) cache jest CICHO
+  nieaktywny — zachowanie bit-identyczne z dzisiejszym. MoE gęste (`f16`) i modele
+  dense są wspierane.
+- Usage API zwraca `prompt_tokens_details.cached_tokens` = długość trafionego
+  prefiksu (pomijana gdy 0). To pole `cache_read_tokens` ze SPEC §8.1.2.
+
+Zweryfikowane (RTX 4090, qwen3-0.6b-q8_0, `tests/prefix_cache.rs`):
+
+- **Współdzielony prefiks bit-identyczny + pominięty prefill:** dwa żądania z tym
+  samym prefiksem 2048 tokenów (greedy) — drugie raportuje `cache_read=2016`
+  (63 pełne strony), a prefill spada z **68.8 ms (cold, ~29.8k tok/s) do 14.8 ms
+  (hit) = 4.7× szybciej**; wygenerowane id są identyczne co do bitu z przebiegiem
+  cold ORAZ z przebiegiem `--prefix-cache off`.
+- **Multi-turn:** tura 2 (prompt = tura 1 + rozszerzenie) reużywa strony KV tury 1
+  (`cache_read=128`), poprawnie i szybciej; wynik identyczny z przebiegiem od
+  zera bez cache.
+- Golden NVFP4 (Bielik-7B, `tests/batched_bielik.rs`, `--prefix-cache off`)
+  reprodukuje dokładne id — ścieżka OFF jest bit-identyczna z dzisiejszą.
 
 ---
 
@@ -204,6 +263,10 @@ Endpointy: `/v1/chat/completions`, `/v1/completions`, `/v1/models`,
 | `max_tokens` / `max_completion_tokens` | — | Walidowane względem `--ctx`: prompt+max_tokens ≤ ctx, inaczej 400 `context_length_exceeded`. |
 | `stop` | — | String lub tablica; holdback bez wycieków częściowych dopasowań. |
 | `stream` | false | SSE; `stream_options.include_usage` → osobny finalny chunk z usage. |
+
+Usage: `usage.prompt_tokens_details.cached_tokens` raportuje prefiks promptu
+obsłużony z radix prefix-cache (SPEC §5.2; pomijane gdy 0) — patrz sekcja
+„Radix prefix cache".
 | `tools` / `tool_choice` | — | `tools` musi być tablicą; `tool_choice`: `auto`/`none` (`required`/named → 400 not_implemented). Odpowiedź: `tool_calls[]`, `finish_reason:"tool_calls"`. |
 | `n` | 1 | `n>1` → 400 (na razie). |
 
@@ -267,7 +330,7 @@ forge run /tmp/qwen/Qwen3-0.6B-Q8_0.gguf "Hi" -n 4
 | `-n, --max-tokens <N>` | `256` | Limit generacji. |
 | `--temp <F>` | `0.7` | Temperatura (`0` = greedy). |
 | `--chat` | off | Opakowuje prompt w szablon czatu modelu (user message, add_generation_prompt). |
-| + `--ctx`, `--weights-pool-gb`, `--kv-pages`, `--kv-cache`, `--kv-residual-window`, `--kv-activate-at`, `--kv-tier*`, `--kv-hot-pages`, `--kvflash` | jw. | Jak w sekcjach wyżej. |
+| + `--ctx`, `--weights-pool-gb`, `--kv-pages`, `--kv-cache`, `--kv-residual-window`, `--kv-activate-at`, `--kv-tier*`, `--kv-hot-pages`, `--kvflash`, `--prefix-cache` | jw. | Jak w sekcjach wyżej. |
 
 ## forge bench
 
@@ -275,7 +338,7 @@ forge run /tmp/qwen/Qwen3-0.6B-Q8_0.gguf "Hi" -n 4
 |---|---|---|
 | `--tokens <N>` | `128` | Tokeny decode do zmierzenia. |
 | `--prompt-tokens <N>` | `512` | Długość promptu (prefill). |
-| + `--ctx`, `--kv-pages`, `--kv-cache`, `--kv-residual-window`, `--kv-activate-at`, `--kv-tier*` | jw. | |
+| + `--ctx`, `--kv-pages`, `--kv-cache`, `--kv-residual-window`, `--kv-activate-at`, `--kv-tier*`, `--prefix-cache` | jw. | |
 
 Uwaga metodyczna: prefill mierzony do pierwszego WIDOCZNEGO tokenu (zawiera
 ≥1 krok decode); bezczynna 4090 siedzi na ~210 MHz — porównuj rozgrzane przebiegi.

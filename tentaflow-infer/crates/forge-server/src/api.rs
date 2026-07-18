@@ -338,14 +338,29 @@ pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
+    /// OpenAI-compatible cache accounting: `cached_tokens` reports the prompt
+    /// prefix served from the radix KV cache (SPEC §5.2). Omitted when zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: usize,
 }
 
 impl Usage {
     pub fn new(prompt_tokens: usize, completion_tokens: usize) -> Self {
+        Self::with_cache(prompt_tokens, completion_tokens, 0)
+    }
+
+    pub fn with_cache(prompt_tokens: usize, completion_tokens: usize, cached_tokens: usize) -> Self {
         Self {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens_details: (cached_tokens > 0)
+                .then_some(PromptTokensDetails { cached_tokens }),
         }
     }
 }

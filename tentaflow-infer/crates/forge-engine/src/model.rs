@@ -114,6 +114,11 @@ pub struct ModelConfig {
     /// stream them back per layer, unlocking contexts beyond the VRAM pool.
     /// Off (default) = today's VRAM-only behavior; f16/fp8 caches only.
     pub kv_tier: KvTierConfig,
+    /// Radix-tree prefix caching (SPEC §5.2): dedup shared KV prefixes across
+    /// sequences so a request sharing a prefix skips re-prefilling it. `true`
+    /// (default) engages only when it is a strict optimization — F16/Fp8 KV,
+    /// no tiering, non-hybrid arch; otherwise silently inactive.
+    pub prefix_cache: bool,
 }
 
 impl Default for ModelConfig {
@@ -124,6 +129,7 @@ impl Default for ModelConfig {
             max_seq_len: 8192,
             kv_quant: KvQuant::F16,
             kv_tier: KvTierConfig::default(),
+            prefix_cache: true,
         }
     }
 }
@@ -189,6 +195,11 @@ pub struct Model {
     hybrid_bufs: Option<HybridBufs>,
     /// FORGE_HYBRID_DEBUG=1: dump per-layer residual-stream norms.
     hybrid_debug: bool,
+    /// Radix-tree prefix cache (SPEC §5.2); `None` = inactive (disabled by
+    /// config, or ineligible: tiering / rot / hybrid arch). When active, admitted
+    /// sequences borrow shared prefix pages before prefill and donate their own
+    /// prefilled pages on completion.
+    prefix_cache: Option<crate::prefix::PrefixCache>,
 }
 
 /// One DeltaNet layer's resident recurrent state for the active sequence.
@@ -629,6 +640,19 @@ impl Model {
             }
             None => Vec::new(),
         };
+        // Prefix caching is a strict optimization: engage only where a borrowed
+        // prefix page is byte-identical to a fresh prefill and never mutated.
+        // That means the verbatim F16/Fp8 paged cache with no tiering (tiering
+        // spills/rewrites pages), no rotational store (position-indexed residual
+        // ring, not per-page) and no hybrid arch (recurrent SSM state is not in
+        // KV pages). Otherwise the cache stays inactive and behavior is
+        // bit-for-bit unchanged.
+        let prefix_eligible = cfg.prefix_cache
+            && !cfg.kv_tier.enabled()
+            && matches!(cfg.kv_quant, KvQuant::F16 | KvQuant::Fp8)
+            && weights.descriptor.params.ssm.is_none();
+        let prefix_cache =
+            prefix_eligible.then(|| crate::prefix::PrefixCache::new(cfg.kv_page_size));
         Ok(Model {
             device,
             kernels,
@@ -652,6 +676,7 @@ impl Model {
             ssm,
             hybrid_bufs: None,
             hybrid_debug: std::env::var("FORGE_HYBRID_DEBUG").is_ok_and(|v| v == "1"),
+            prefix_cache,
         })
     }
 
@@ -663,11 +688,141 @@ impl Model {
         if let Some(t) = &mut self.tier {
             t.drop_seq(seq);
         }
+        if self.prefix_cache.is_some() {
+            self.finalize_prefix(seq);
+        }
         self.kv.release(seq);
     }
 
     pub fn tier_enabled(&self) -> bool {
         self.tier.is_some()
+    }
+
+    /// Whether the radix prefix cache is active for this model.
+    pub fn prefix_enabled(&self) -> bool {
+        self.prefix_cache.is_some()
+    }
+
+    /// Longest cached-prefix length (tokens) servable for `prompt`, leaving at
+    /// least one token to prefill (so the sequence still produces logits). Used
+    /// by admission to project the reduced page demand; no state change.
+    pub fn prefix_match_len(&self, prompt: &[u32]) -> usize {
+        match &self.prefix_cache {
+            Some(pc) if prompt.len() > self.kv.cfg.page_size => {
+                pc.match_len(prompt, prompt.len() - 1)
+            }
+            _ => 0,
+        }
+    }
+
+    /// Borrow the longest cached prefix of `prompt` into `seq` (SPEC §5.2):
+    /// shared pages are attached read-only, `seq.len`/`tokens`/`prefilled_len`
+    /// advance to the shared boundary, and the divergent suffix is left to
+    /// prefill. Returns the number of prompt tokens served from cache
+    /// (`cache_read_tokens`). At least one token is always left to prefill.
+    pub fn acquire_prefix(&mut self, seq: &mut SeqKv, prompt: &[u32]) -> usize {
+        let ps = self.kv.cfg.page_size;
+        let Some(pc) = self.prefix_cache.as_mut() else {
+            return 0;
+        };
+        if prompt.len() <= ps {
+            return 0;
+        }
+        let (pages, node, shared) = pc.acquire(prompt, prompt.len() - 1);
+        if shared == 0 {
+            return 0;
+        }
+        seq.pages = pages;
+        seq.shared_pages = seq.pages.len();
+        seq.prefix_node = node;
+        seq.len = shared;
+        // Keep `tokens` page-aligned with `pages` so the completion-time
+        // donation indexes shared + private pages uniformly. The borrowed prefix
+        // is prefill-built (bit-identical), so it counts toward `prefilled_len`.
+        seq.tokens = prompt[..shared].to_vec();
+        seq.prefilled_len = shared;
+        // The single-stream decode path re-uploads the page table when a
+        // different sequence's pages were resident; a borrow rewrites the table.
+        self.pt_seq = 0;
+        shared
+    }
+
+    /// Donate a completing sequence's freshly-prefilled complete pages back into
+    /// the radix tree and release its borrow. Leading shared/donated pages are
+    /// drained from `seq.pages` so the subsequent `kv.release` frees only the
+    /// sequence's remaining private (partial + decode) pages.
+    fn finalize_prefix(&mut self, seq: &mut SeqKv) {
+        let ps = self.kv.cfg.page_size;
+        let Some(node) = seq.prefix_node.take() else {
+            // No borrow — but the sequence may still have prefilled a brand-new
+            // prefix worth caching (cache miss). Donate from the root.
+            let n_full = seq.prefilled_len / ps;
+            if n_full == 0 {
+                return;
+            }
+            let (dups, consumed) = {
+                let pc = self.prefix_cache.as_mut().expect("prefix path");
+                pc.donate(crate::prefix::ROOT, 0, n_full, &seq.tokens, &seq.pages)
+            };
+            for p in dups {
+                self.kv.push_free(p);
+            }
+            seq.pages.drain(0..consumed.min(seq.pages.len()));
+            seq.shared_pages = 0;
+            return;
+        };
+        let n_full = seq.prefilled_len / ps;
+        let (dups, consumed) = {
+            let pc = self.prefix_cache.as_mut().expect("prefix path");
+            let r = pc.donate(node, seq.shared_pages, n_full, &seq.tokens, &seq.pages);
+            pc.release(node);
+            r
+        };
+        for p in dups {
+            self.kv.push_free(p);
+        }
+        seq.pages.drain(0..consumed.min(seq.pages.len()));
+        seq.shared_pages = 0;
+    }
+
+    /// Reclaim up to `need` KV pages from the prefix cache (evicting refcount-0
+    /// LRU prefixes) onto the free stack. No-op when the cache is inactive or
+    /// already empty of evictable pages. Returns the number of pages freed.
+    fn reclaim_prefix_pages(&mut self, need: usize) -> usize {
+        let Some(pc) = self.prefix_cache.as_mut() else {
+            return 0;
+        };
+        let freed = pc.evict(need);
+        let n = freed.len();
+        for p in freed {
+            self.kv.push_free(p);
+        }
+        n
+    }
+
+    /// Ensure at least `need` free KV pages, evicting cached prefixes if the
+    /// free stack is short. Called before prefill/decode growth so a cache hit
+    /// never starves the pool.
+    fn ensure_free_pages(&mut self, need: usize) {
+        if self.prefix_cache.is_none() {
+            return;
+        }
+        let free = self.kv.free_page_count();
+        if free < need {
+            self.reclaim_prefix_pages(need - free);
+        }
+    }
+
+    /// Pages the engine can still hand out for a new request: the free stack
+    /// plus everything the prefix cache can evict. Admission uses this so a
+    /// reclaimable cache never blocks otherwise-fittable work.
+    pub fn available_pages(&self) -> usize {
+        self.kv.free_page_count()
+            + self
+                .prefix_cache
+                .as_ref()
+                .map(|pc| pc.evictable_pages())
+                .unwrap_or(0)
     }
 
     /// Largest per-request KV demand (in pages) the engine can hold: the VRAM
@@ -1715,17 +1870,24 @@ impl Model {
             )));
         }
         self.tier_ensure_capacity(seq, t)?;
-        let tier_t0 = if self.tier.is_some() {
-            // Retain the tokens (recompute path) and note whether the history
-            // is still purely prefill-built (bit-identically recomputable).
+        // Record tokens + prefilled_len for the tier recompute path AND the
+        // prefix cache (which donates prefill-built pages into the radix tree on
+        // completion). Both need the token ids retained and the still-purely-
+        // prefill span tracked; with neither active this stays a no-op and
+        // behavior is bit-for-bit unchanged.
+        if self.tier.is_some() || self.prefix_cache.is_some() {
             if seq.tokens.len() == seq.prefilled_len {
                 seq.prefilled_len += t;
             }
             seq.tokens.extend_from_slice(tokens);
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+        }
+        let tier_t0 = self.tier.is_some().then(std::time::Instant::now);
+        // Free pool space for the pages this chunk will grow into by evicting
+        // cached prefixes (no-op unless the prefix cache is active and short).
+        let new_pages = (seq.len + t)
+            .div_ceil(self.kv.cfg.page_size)
+            .saturating_sub(seq.pages.len());
+        self.ensure_free_pages(new_pages);
         self.ensure_prefill_bufs()?;
         for _ in 0..t {
             self.kv.grow(seq)?;
@@ -2195,6 +2357,12 @@ impl Model {
         }
 
         let page_boundary = seq.len.is_multiple_of(self.kv.cfg.page_size);
+        if page_boundary {
+            // A new page is about to be allocated; reclaim a cached prefix page
+            // if the free stack is empty so decode growth never starves behind
+            // the prefix cache (no-op when the cache is inactive/empty).
+            self.ensure_free_pages(1);
+        }
         self.kv.grow(seq)?;
         self.upload_decode_inputs(token_id, pos)?;
 
@@ -4147,6 +4315,10 @@ impl Model {
                 self.batch_cap
             )));
         }
+
+        // Reclaim cached prefix pages if the free stack cannot cover a boundary
+        // page for every lane (no-op when the prefix cache is inactive/empty).
+        self.ensure_free_pages(b);
 
         // Grow each sequence by one token and gather its position/page table
         // in lane order. Streamed lanes' page tables keep -1 for spilled

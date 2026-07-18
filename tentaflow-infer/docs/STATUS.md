@@ -155,7 +155,18 @@ Ostatnia aktualizacja: 2026-07-18.
 - ❌ **ONNX** (import grafu → IR; parakeet/silero/depth z .runtime)
 
 ### KV / cache zaawansowane
-- ❌ **§5.2 Radix-tree prefix caching** (dedup system-promptów/multi-turn) — duże
+- ✅ **§5.2 Radix-tree prefix caching** (dedup system-promptów/few-shot/multi-turn):
+  drzewo radix na granularności strony (`forge-engine/src/prefix.rs`), pożyczka
+  najdłuższego wspólnego prefiksu (refcount, read-only) przed prefillem + donacja
+  własnych prefill-stron po zakończeniu; LRU eviction refcount-0 liści; admission
+  liczy trafienie i strony odzyskiwalne. Aktywny dla verbatim `f16`/`fp8` bez
+  tieringu i arch nie-hybrydowej (`--prefix-cache on|off`, default on). Usage
+  `prompt_tokens_details.cached_tokens`. Współdzielenie CAŁYCH stron → borrower
+  nigdy nie pisze do współdzielonej strony (bez CoW granicznej strony). Dowód
+  (RTX 4090, qwen3-0.6b): wspólny prefiks 2048 tok. → `cache_read=2016`, prefill
+  68.8→14.8 ms (**4.7×**), id bit-identyczne z cold ORAZ z `off`; multi-turn
+  reużywa KV poprzedniej tury; golden Bielik NVFP4 z `off` bez zmian
+  (`tests/prefix_cache.rs`, `prefix::tests`).
 - ❌ **§5.2 Copy-on-write KV** (beam/n-best), MLA latent cache
 - ❌ **§5.4A Expert streaming** (tiering wag MoE, Colibri) — czeka na MoE
 - ❌ **§5.4B Trwałe sesje KV** (opt-in persystencja między turami)

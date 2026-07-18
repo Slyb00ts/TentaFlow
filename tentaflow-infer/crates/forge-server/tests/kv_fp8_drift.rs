@@ -120,6 +120,7 @@ fn run_pass_ids(
             max_seq_len: 4096,
             kv_quant,
             kv_tier: Default::default(),
+            prefix_cache: false,
         },
     )
     .expect("load model");

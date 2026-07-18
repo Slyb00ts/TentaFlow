@@ -232,11 +232,12 @@ async fn collect_events(
                 reason,
                 tokens,
                 prompt_tokens,
+                cache_read_tokens,
             } => {
                 return Ok(Collected {
                     text,
                     finish: finish_reason_str(reason),
-                    usage: Usage::new(prompt_tokens, tokens),
+                    usage: Usage::with_cache(prompt_tokens, tokens, cache_read_tokens),
                 })
             }
             EngineEvent::Error(msg) => return Err(ApiError::from_engine_error(&msg)),
@@ -419,6 +420,7 @@ async fn stream_response(
                     reason,
                     tokens,
                     prompt_tokens,
+                    cache_read_tokens,
                 } => {
                     let engine_reason = finish_reason_str(reason);
                     let mut choices = Vec::new();
@@ -444,7 +446,7 @@ async fn stream_response(
                             created,
                             &model,
                             vec![],
-                            Some(Usage::new(prompt_tokens, tokens)),
+                            Some(Usage::with_cache(prompt_tokens, tokens, cache_read_tokens)),
                         );
                         if tx.send(Ok(usage_chunk)).await.is_err() {
                             return;

@@ -131,6 +131,12 @@ enum Command {
         /// RAM+disk, not VRAM.
         #[arg(long = "kvflash", default_value_t = false)]
         kvflash: bool,
+        /// Radix-tree prefix caching (SPEC §5.2): on | off. Dedups shared KV
+        /// prefixes (system prompts, few-shot, multi-turn) so a request sharing
+        /// a prefix skips re-prefilling it. Strict optimization; auto-inactive
+        /// with tiering / rot KV / hybrid arch.
+        #[arg(long = "prefix-cache", default_value = "on")]
+        prefix_cache: String,
     },
     /// Print an embedding vector for one text (dims + L2 norm + first values).
     Embed {
@@ -208,6 +214,9 @@ enum Command {
         /// set explicitly.
         #[arg(long = "kvflash", default_value_t = false)]
         kvflash: bool,
+        /// Radix-tree prefix caching (SPEC §5.2): on | off (see `forge serve`).
+        #[arg(long = "prefix-cache", default_value = "on")]
+        prefix_cache: String,
     },
     /// Transcribe a WAV file with a Whisper model.
     Transcribe {
@@ -269,6 +278,9 @@ enum Command {
         /// set explicitly.
         #[arg(long = "kvflash", default_value_t = false)]
         kvflash: bool,
+        /// Radix-tree prefix caching (SPEC §5.2): on | off (see `forge serve`).
+        #[arg(long = "prefix-cache", default_value = "on")]
+        prefix_cache: String,
     },
 }
 
@@ -311,6 +323,7 @@ fn main() -> Result<()> {
             ctx,
             kv_hot_pages,
             kvflash,
+            prefix_cache,
         } => {
             let (hot_pages, tier) = resolve_kvflash(
                 kvflash,
@@ -337,6 +350,7 @@ fn main() -> Result<()> {
                 tier,
                 ctx,
                 hot_pages,
+                parse_prefix_cache(&prefix_cache)?,
             )
         }
         Command::Embed {
@@ -370,6 +384,7 @@ fn main() -> Result<()> {
             kv_tier_watermark,
             kv_hot_pages,
             kvflash,
+            prefix_cache,
         } => {
             let (hot_pages, tier) = resolve_kvflash(
                 kvflash,
@@ -391,6 +406,7 @@ fn main() -> Result<()> {
                 ctx,
                 kv_pages,
                 hot_pages,
+                parse_prefix_cache(&prefix_cache)?,
             )
         }
         Command::Transcribe {
@@ -413,6 +429,7 @@ fn main() -> Result<()> {
             kv_tier_watermark,
             kv_hot_pages,
             kvflash,
+            prefix_cache,
         } => {
             let (hot_pages, tier) = resolve_kvflash(
                 kvflash,
@@ -431,6 +448,7 @@ fn main() -> Result<()> {
                 ctx,
                 kv_pages,
                 hot_pages,
+                parse_prefix_cache(&prefix_cache)?,
             )
         }
     }
@@ -463,6 +481,14 @@ fn parse_kv_quant(s: &str, residual_window: usize, activate_at: usize) -> Result
         "rot4" => Ok(KvQuant::Rot { bits: 4, residual_window, activate_at }),
         "rot3" => Ok(KvQuant::Rot { bits: 3, residual_window, activate_at }),
         other => bail!("unsupported --kv-cache '{other}' (expected f16 | fp8 | rot4 | rot3)"),
+    }
+}
+
+fn parse_prefix_cache(s: &str) -> Result<bool> {
+    match s {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        other => bail!("unsupported --prefix-cache '{other}' (expected on | off)"),
     }
 }
 
@@ -562,6 +588,7 @@ fn default_model_id(path: &Path) -> String {
 /// Load a model for the fixed-pool `serve` layout: weights sized by flag,
 /// KV pool sized for exactly `kv_pages` pages of this model (floored at
 /// 1 GiB), 1 GiB activations.
+#[allow(clippy::too_many_arguments)]
 fn load_for_serve(
     path: &Path,
     kv_pages: usize,
@@ -570,6 +597,7 @@ fn load_for_serve(
     kv_tier: KvTierConfig,
     ctx: usize,
     hot_pages: usize,
+    prefix_cache: bool,
 ) -> Result<(LoadedModel, usize, usize)> {
     let kv_page_size = ModelConfig::default().kv_page_size;
     let desc = read_descriptor(path)?;
@@ -618,6 +646,7 @@ fn load_for_serve(
         kv_quant,
         kv_tier,
         max_seq_len,
+        prefix_cache,
     };
     let loaded = load_model(dev, path, cfg)?;
     Ok((loaded, kv_pages, max_seq_len))
@@ -638,6 +667,7 @@ fn resolve_ctx(max_position_embeddings: usize, requested: usize, page_size: usiz
     (target, target.div_ceil(page_size))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_auto(
     path: &Path,
     weights_pool_gb: f64,
@@ -646,6 +676,7 @@ fn load_auto(
     ctx: usize,
     kv_pages_flag: usize,
     hot_pages: usize,
+    prefix_cache: bool,
 ) -> Result<LoadedModel> {
     // Read hyperparameters before loading weights so the KV cache is sized for
     // the requested context up front (its slabs are allocated during load).
@@ -703,6 +734,7 @@ fn load_auto(
             kv_page_size: page_size,
             kv_pages,
             max_seq_len,
+            prefix_cache,
         },
     )
 }
@@ -796,6 +828,7 @@ fn cmd_embed(
         8192,
         0,
         0,
+        false,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
@@ -870,11 +903,20 @@ fn cmd_serve(
     kv_tier: KvTierConfig,
     ctx: usize,
     hot_pages: usize,
+    prefix_cache: bool,
 ) -> Result<()> {
     let max_active = usize::from(max_active);
     let t0 = Instant::now();
-    let (loaded, kv_pages, max_seq_len) =
-        load_for_serve(model_path, kv_pages, weights_pool_gb, kv_quant, kv_tier, ctx, hot_pages)?;
+    let (loaded, kv_pages, max_seq_len) = load_for_serve(
+        model_path,
+        kv_pages,
+        weights_pool_gb,
+        kv_quant,
+        kv_tier,
+        ctx,
+        hot_pages,
+        prefix_cache,
+    )?;
     tracing::info!(
         "loaded {} ({}) in {:.1}s: {} layers, kv_pages={}",
         model_path.display(),
@@ -1032,9 +1074,19 @@ fn cmd_run(
     ctx: usize,
     kv_pages: usize,
     hot_pages: usize,
+    prefix_cache: bool,
 ) -> Result<()> {
     let t0 = Instant::now();
-    let loaded = load_auto(model_path, weights_pool_gb, kv_quant, kv_tier, ctx, kv_pages, hot_pages)?;
+    let loaded = load_auto(
+        model_path,
+        weights_pool_gb,
+        kv_quant,
+        kv_tier,
+        ctx,
+        kv_pages,
+        hot_pages,
+        prefix_cache,
+    )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let prompt_text = if chat {
@@ -1097,6 +1149,7 @@ fn cmd_bench(
     ctx: usize,
     kv_pages: usize,
     hot_pages: usize,
+    prefix_cache: bool,
 ) -> Result<()> {
     if tokens < 2 {
         bail!("--tokens must be at least 2 to measure decode throughput");
@@ -1105,7 +1158,7 @@ fn cmd_bench(
         bail!("--prompt-tokens must be at least 1");
     }
     let t0 = Instant::now();
-    let loaded = load_auto(model_path, 0.0, kv_quant, kv_tier, ctx, kv_pages, hot_pages)?;
+    let loaded = load_auto(model_path, 0.0, kv_quant, kv_tier, ctx, kv_pages, hot_pages, prefix_cache)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let tokenizer = Arc::new(loaded.bundle.tokenizer);

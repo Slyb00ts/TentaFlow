@@ -149,6 +149,13 @@ pub struct SeqKv {
     /// Prefix of `tokens` appended via prefill (bit-identically recomputable
     /// by re-prefilling; decode-appended KV is transfer-restored only).
     pub prefilled_len: usize,
+    /// Leading `pages` entries borrowed from the radix prefix cache (SPEC §5.2):
+    /// shared, read-only, and NOT freed on release — the cache owns them. The
+    /// rest of `pages` is private to this sequence.
+    pub shared_pages: usize,
+    /// Prefix-cache node whose borrow this sequence holds (deepest matched
+    /// prefix), released and extended on completion. `None` = no borrow.
+    pub prefix_node: Option<crate::prefix::NodeId>,
 }
 
 impl SeqKv {
@@ -249,6 +256,8 @@ impl KvCache {
             spilled: Vec::new(),
             tokens: Vec::new(),
             prefilled_len: 0,
+            shared_pages: 0,
+            prefix_node: None,
         }
     }
 
@@ -280,6 +289,8 @@ impl KvCache {
         seq.spilled.clear();
         seq.tokens.clear();
         seq.prefilled_len = 0;
+        seq.shared_pages = 0;
+        seq.prefix_node = None;
     }
 
     pub fn free_page_count(&self) -> usize {

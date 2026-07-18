@@ -115,7 +115,13 @@ wider loads alone. `kernels/mojo/bench_gemv.mojo` is the measurement harness.
   SLO dual queue (latency/throughput classes); admission control with KV
   projection (429 instead of OOM).
 - Batch-bucket CUDA graph capture for decode steps (1,2,4,...,64).
-- Radix-tree prefix cache with copy-on-write pages.
+- Radix-tree prefix cache ✅ (`forge-engine/src/prefix.rs`, SPEC §5.2): page-
+  granular tree, borrow longest shared prefix before prefill + donate own prefill
+  pages on completion, LRU eviction of refcount-0 leaves, `--prefix-cache on|off`,
+  `cached_tokens` in usage. Whole-page sharing (borrowers never write a shared
+  page) makes partial-boundary CoW unnecessary. Proof on the 4090: shared 2048-tok
+  prefix → cache_read 2016, prefill 4.7× faster, bit-identical to cold and to OFF;
+  multi-turn reuse; Bielik NVFP4 golden ids unchanged with OFF (`tests/prefix_cache.rs`).
 - Bench harness: tok/s prefill/decode vs llama.cpp on the same GGUF.
 
 ### Chunk 7 — forge-server: OpenAI API + CLI

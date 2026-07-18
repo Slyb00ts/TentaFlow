@@ -85,6 +85,7 @@ async fn qwen3_tool_calls_end_to_end() {
                     max_seq_len: 4096,
                     kv_quant: forge_engine::kv::KvQuant::F16,
                     kv_tier: Default::default(),
+                    prefix_cache: false,
                 },
             )
             .expect("load model");
