@@ -123,11 +123,13 @@ Ostatnia aktualizacja: 2026-07-18.
     tokenów gorące) → ~6k tokenów KV atencji spilnięte na NVMe, igła odzyskana,
     ids bit-identyczne z full-VRAM, VRAM stały; `--kvflash --kv-hot-pages 64`
     bez OOM na modelu 20 GB. Nie-hybrydowe MoE (OLMoE/qwen3moe) nadal bez tieru.
-  - 🟡 **Wydajność ścieżki hybrydowej**: korektność najpierw — host round-tripy
-    per warstwa (gather embed, bramka atencji, router MoE), brak grafu CUDA i
-    wsadu, DeltaNet skanowany per token wieloma małymi `device.copy`. ~17 tok/s
-    (llama.cpp ~194). Optymalizacja (kernel sigmoid-mul bramki, wsadowy prefill,
-    graf decode, mniej sync-ów) to follow-up.
+  - 🟡 **Wydajność ścieżki hybrydowej**: korektność najpierw. Router MoE +
+    bramka shared-expert NIE robią już host round-tripu (device-side grouped
+    dispatch `_gidx`, patrz §4.4) — per-warstwa MoE decode jest teraz bez
+    `synchronize` (poza warstwami z fallback-kwantem Q8_0). Zostają: host gather
+    embed per token, DeltaNet skanowany per token wieloma małymi `device.copy`,
+    brak grafu CUDA i wsadu. Optymalizacja (graf decode hybrydy, wsadowy prefill)
+    to follow-up.
 - 🟡 **§9.2 Odporność**: admission ✅; brak respawn workera po crashu, health
   per-GPU, pełnego graceful drain.
 - 🟡 **§8.3 Operacyjność**: /healthz ✅; brak metryk Prometheus/OTel, hot reload.
@@ -157,13 +159,30 @@ Ostatnia aktualizacja: 2026-07-18.
 - ❌ **§4.3 Multimodal input** (vision encoder → embeddingi)
 - 🟡 **§4.4 MoE**: routed Mixture-of-Experts DZIAŁA (OLMoE-1B-7B e2e, spójny
   tekst). Router GPU (softmax-over-all → top-k → opcjonalny renorm, test vs CPU),
-  per-token pętla ekspertów przez indeksowane quant-GEMV (offset bajtowy w
-  stackowanym tensorze `ffn_*_exps`), akumulacja `moe_scale_add`. Wspiera
-  full-vector QK-norm (OLMoE) i per-head (qwen3moe), shared experts (design).
-  Decode single-stream (bez CUDA-graph — wybór ekspertów zależny od danych) +
-  prefill batched. KV-tiering: ✅ dla hybrydy qwen35moe (warstwy atencji), ❌ dla
-  nie-hybrydowego MoE (brak staged-attention decode). TODO (perf): grouped-GEMM
-  permute/unpermute zamiast pętli, batched-MoE decode, KV low-bit dla MoE.
+  akumulacja `moe_scale_add`. Wspiera full-vector QK-norm (OLMoE) i per-head
+  (qwen3moe), shared experts z bramką sigmoid (qwen35moe).
+  - **Device-side grouped expert dispatch (decode)**: wybrane przez router
+    ids/wagi ZOSTAJĄ na GPU i sterują GEMV-ami ekspertów przez kernele `_gidx`
+    (`gemv_q4_k_dp4a_f16_gidx`, `gemv_q6_k_f16_gidx`, `moe_scale_add_gidx_f16`,
+    `moe_sigmoid_f16_to_f32`) — offset wiersza eksperta `ids[j]*rows_per_expert`
+    czytany W KERNELU, waga `weights[j]` też. **ZERO `device.synchronize()` w
+    ścieżce decode per warstwa** (dawniej: readback ids/wag + sync KAŻDĄ warstwę,
+    serializujący decode). Bramka shared-expert liczy sigmoid na GPU zamiast
+    host-readbacku. Bit-identyczne z dawną ścieżką (OLMoE i qwen35moe: greedy
+    output token-for-token identyczny before/after). Kwanty bez wariantu `_gidx`
+    (np. Q8_0 down w qwen35moe blk.40/41) wpadają w fallback z readbackiem —
+    poprawność zachowana, tylko te warstwy synchronizują.
+  - **CUDA-graph**: nie-hybrydowe MoE w pełni `_gidx` (OLMoE, qwen3moe) jest teraz
+    graf-capturowane (`decode_moe_graph`) — statyczna sekwencja launchy sterowana
+    danymi na urządzeniu. Model z fallback-kwantem lub hybryda qwen35moe (host
+    round-tripy DeltaNet) idą ścieżką per-step.
+  - Pomiar RTX 4090 (single stream, temp 0, decode tok/s, before→after):
+    OLMoE-1B-7B 146→157 (+7%, głównie z grafu), qwen35moe-35B-A3B 50.3→51.4
+    (+2.2%; hybryda GPU-bound, sam brak sync daje mało, graf jej nie obejmuje).
+  - Prefill: nadal per-token pętla z readbackiem (poprawność-first). KV-tiering:
+    ✅ dla hybrydy qwen35moe (warstwy atencji), ❌ dla nie-hybrydowego MoE.
+    TODO (perf): grouped-GEMM permute/unpermute, batched-MoE decode, graf dla
+    ścieżki hybrydowej, KV low-bit dla MoE.
 - ❌ **§4.4 MLA** (DeepSeek), **sliding-window + sinks**, **linear/SSM** (Mamba)
 - ❌ **ONNX** (import grafu → IR; parakeet/silero/depth z .runtime)
 

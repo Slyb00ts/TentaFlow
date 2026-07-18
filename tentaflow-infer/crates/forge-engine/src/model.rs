@@ -170,6 +170,9 @@ pub struct Model {
     verify_bufs: Option<VerifyBufs>,
     /// Captured decode step; replayed per token (inputs are device-resident).
     decode_graph: Option<ExecGraph>,
+    /// Captured non-hybrid MoE decode step (fully device-side grouped expert
+    /// dispatch — no host readback), replayed per token like `decode_graph`.
+    decode_moe_graph: Option<ExecGraph>,
     /// Captured rotational (rot4/rot3) decode step; replayed per token. The
     /// pack kernel reads the token position from `bufs.pos`, so the whole
     /// dual-region chain is position-independent and graph-capturable.
@@ -438,8 +441,12 @@ struct MoeBufs {
     /// One expert's down-projection output, f16 [hidden].
     tmp: DevBuffer,
     /// Pinned-host landing for the shared-expert gate logit (f16), read back in
-    /// the same sync as the router top-k.
+    /// the same sync as the router top-k (fallback readback path only).
     pinned_shared: DevBuffer,
+    /// Device-resident shared-expert sigmoid gate scale (f32, one element). The
+    /// device dispatch path computes it on-GPU so folding the shared expert
+    /// needs no host round-trip.
+    shared_scale: DevBuffer,
 }
 
 impl Model {
@@ -638,6 +645,14 @@ impl Model {
                     xrow: device.alloc(hidden * 2, MemKind::Device, Pool::Activations)?,
                     tmp: device.alloc(hidden * 2, MemKind::Device, Pool::Activations)?,
                     pinned_shared: device.alloc(2, MemKind::PinnedHost, Pool::Activations)?,
+                    shared_scale: {
+                        // Seed 1.0 so a shared expert without a per-token gate
+                        // (no shared_gate) folds in unscaled; the device sigmoid
+                        // kernel overwrites this each layer when a gate exists.
+                        let sc = device.alloc(4, MemKind::Device, Pool::Activations)?;
+                        device.write(&1.0f32.to_le_bytes(), &sc, 0)?;
+                        sc
+                    },
                 })
             }
             None => None,
@@ -689,6 +704,7 @@ impl Model {
             prefill_bufs: None,
             verify_bufs: None,
             decode_graph: None,
+            decode_moe_graph: None,
             decode_rot_graph: None,
             batch_bufs: None,
             batch_graphs: HashMap::new(),
@@ -1830,6 +1846,55 @@ impl Model {
         }
     }
 
+    /// Whether `w` is a routed-expert stack the device-side grouped dispatch can
+    /// index without a host readback: the dp4a Q4_K path (cols within the dp4a
+    /// bound) and the warp-per-row Q6_K path have `_gidx` kernels that read the
+    /// expert row offset on-device. Other quants keep the host-readback loop.
+    fn expert_stack_gidx(w: &DevWeight) -> bool {
+        matches!(
+            w,
+            DevWeight::Q4K { cols, .. } if *cols <= Kernels::DP4A_MAX_COLS
+        ) || matches!(w, DevWeight::Q6K { .. })
+    }
+
+    /// True when every routed-expert projection of `moe` supports the
+    /// device-indexed dispatch (so the whole layer runs with zero host readback).
+    fn moe_gidx_capable(moe: &MoeFfn) -> bool {
+        Self::expert_stack_gidx(&moe.gate_exps)
+            && Self::expert_stack_gidx(&moe.up_exps)
+            && Self::expert_stack_gidx(&moe.down_exps)
+    }
+
+    /// Single-token GEMV over the expert selected on-device by `ids[sel]`: the
+    /// device analog of `gemv_rows`, reading the expert row offset
+    /// (`ids[sel] * rows_per_expert`) inside the kernel. Bit-identical to
+    /// `gemv_rows(y, w, x, ids[sel]*rows_per_expert, n_rows, ..)`. Only the
+    /// quants `expert_stack_gidx` accepts reach here.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_rows_gidx(
+        &self,
+        y: &DevBuffer,
+        w: &DevWeight,
+        x: &DevBuffer,
+        ids: &DevBuffer,
+        sel: usize,
+        rows_per_expert: usize,
+        n_rows: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        match w {
+            DevWeight::Q4K { buf, cols, .. } if *cols <= Kernels::DP4A_MAX_COLS => self
+                .kernels
+                .gemv_q4_k_dp4a_f16_gidx(y, buf, x, n_rows, *cols, ids, sel, rows_per_expert, stream),
+            DevWeight::Q6K { buf, cols, .. } => self
+                .kernels
+                .gemv_q6_k_f16_gidx(y, buf, x, n_rows, *cols, ids, sel, rows_per_expert, stream),
+            _ => Err(ForgeError::Unsupported(
+                "gemv_rows_gidx called for a non-gidx expert quant".into(),
+            )),
+        }
+    }
+
     fn ensure_prefill_bufs(&mut self) -> Result<()> {
         if self.prefill_bufs.is_some() {
             return Ok(());
@@ -2407,10 +2472,24 @@ impl Model {
             return self.hybrid_forward_token(token_id, true, AttnSrc::Paged);
         }
 
-        // Routed MoE decode reads the per-token top-k experts back to the host
-        // to launch the indexed expert GEMVs, so it cannot be graph-captured;
-        // it runs the explicit chain each step over the f16 paged cache.
+        // Routed MoE decode: the device-side grouped expert dispatch keeps the
+        // router selection on-device (no host readback), so a fully-gidx model
+        // records into a replayable graph like the dense path. A model with a
+        // fallback expert quant (e.g. Q8_0) still reads back per layer and runs
+        // the explicit chain each step.
         if self.weights.is_moe() {
+            if self.moe_fully_gidx() {
+                if self.decode_moe_graph.is_none() {
+                    let graph = self.capture_step_moe()?;
+                    self.decode_moe_graph = Some(graph);
+                }
+                let graph = self
+                    .decode_moe_graph
+                    .as_ref()
+                    .expect("captured above")
+                    .clone();
+                return self.device.launch_graph(&graph, &self.stream);
+            }
             return self.run_step_moe();
         }
 
@@ -2964,6 +3043,33 @@ impl Model {
         }
     }
 
+    /// Whether every routed-MoE layer supports the device-side grouped dispatch
+    /// (no host readback anywhere in the forward), so `run_step_moe` records
+    /// cleanly into a replayable graph. False if any layer has a fallback quant
+    /// (e.g. Q8_0 experts) that still needs a per-layer router readback.
+    fn moe_fully_gidx(&self) -> bool {
+        self.weights.layers.iter().all(|l| match &l.ffn {
+            LayerFfn::Moe(moe) => Self::moe_gidx_capable(moe),
+            LayerFfn::Dense(_) => true,
+        })
+    }
+
+    /// Record the non-hybrid MoE decode step into a replayable graph. Only valid
+    /// when `moe_fully_gidx()`: the expert dispatch reads the router selection on
+    /// device (no readback), and all per-token inputs (token id, position, page
+    /// table, seq len) come from device buffers refreshed before each replay.
+    fn capture_step_moe(&self) -> Result<ExecGraph> {
+        self.device.begin_capture(&self.stream)?;
+        let recorded = self.run_step_moe();
+        match recorded {
+            Ok(()) => self.device.end_capture(&self.stream),
+            Err(e) => {
+                let _ = self.device.end_capture(&self.stream);
+                Err(e)
+            }
+        }
+    }
+
     /// One decode step of the non-fused (separate-kernel) chain: explicit
     /// rmsnorm → qkv GEMVs → qkv_post (norm/rope/paged append) → attention →
     /// ffn. `src` selects the attention's K/V source: the paged cache
@@ -3162,8 +3268,9 @@ impl Model {
     /// One decode step for a Mixture-of-Experts model (single token, paged f16
     /// cache). Attention mirrors the explicit separate chain but applies the
     /// model's QK-norm granularity (per-head for Qwen3-MoE, whole-vector for
-    /// OLMoE); the FFN is replaced by `moe_decode_ffn`. Never graph-captured:
-    /// the routed experts are chosen per token from a host readback.
+    /// OLMoE); the FFN is replaced by `moe_decode_ffn`. Graph-captured when the
+    /// model is fully gidx-capable (the routed experts are dispatched entirely
+    /// on device); a fallback expert quant falls back to per-step launches.
     fn run_step_moe(&self) -> Result<()> {
         let p = &self.weights.descriptor.params;
         let hidden = p.hidden_size;
@@ -3282,6 +3389,36 @@ impl Model {
         let DevWeight::F16 { buf: router_buf, .. } = &moe.router else {
             return Err(ForgeError::Unsupported("MoE router must be f16".into()));
         };
+
+        // Device-side grouped dispatch: the router's selected ids/weights stay
+        // ON the device and drive the expert GEMVs + accumulate through the
+        // `_gidx` kernels, so the whole per-layer FFN runs as queued stream work
+        // with ZERO host readback / synchronize. The expert count `k` is a fixed
+        // model constant (not data-dependent), so the launch sequence is static.
+        if Self::moe_gidx_capable(moe) {
+            if let Some(sg) = &moe.shared_gate {
+                self.gemv(&mb.tmp, sg, &b.x, stream)?;
+                self.kernels
+                    .moe_sigmoid_f16_to_f32(&mb.shared_scale, &mb.tmp, stream)?;
+            }
+            self.kernels.moe_router_f16(
+                &mb.ids,
+                &mb.weights,
+                &b.x,
+                router_buf,
+                1,
+                hidden,
+                moe.n_experts,
+                k,
+                moe.norm_topk,
+                stream,
+            )?;
+            return self.moe_experts_accumulate_device(moe, &b.x, &b.down, 0, inter, hidden, k, stream);
+        }
+
+        // Fallback (expert quant without a `_gidx` kernel, e.g. Q8_0 down
+        // projections): route on device but read the top-k selection back to
+        // the host to launch the byte-offset expert GEMVs — one sync per layer.
         // Enqueue the shared-expert gate GEMV (when the arch has one) BEFORE the
         // router readback so its logit rides the SAME single sync as the top-k,
         // rather than forcing a second per-layer host round-trip.
@@ -3339,6 +3476,69 @@ impl Model {
             shared_scale,
             stream,
         )
+    }
+
+    /// Device-side grouped expert dispatch for a single decode token: identical
+    /// SwiGLU math to `moe_experts_accumulate`, but every routed expert's row
+    /// window and routing weight are read ON DEVICE from `mb.ids`/`mb.weights`
+    /// through the `_gidx` kernels — no host readback, no `synchronize`. The
+    /// loop over `k` is over a fixed model constant, so the launch sequence is
+    /// static and stream-ordered. The shared expert (row offset 0, host-known)
+    /// reuses the ordinary GEMVs and folds in with the device-resident sigmoid
+    /// gate scale. Bit-identical to the readback path for the routed experts;
+    /// the only difference is the shared-gate sigmoid is computed on-GPU.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts_accumulate_device(
+        &self,
+        moe: &MoeFfn,
+        x_in: &DevBuffer,
+        out: &DevBuffer,
+        out_off: usize,
+        inter: usize,
+        hidden: usize,
+        k: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let b = &self.bufs;
+        let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
+        for j in 0..k {
+            self.gemv_rows_gidx(&b.gate, &moe.gate_exps, x_in, &mb.ids, j, inter, inter, stream)?;
+            self.gemv_rows_gidx(&b.up, &moe.up_exps, x_in, &mb.ids, j, inter, inter, stream)?;
+            self.kernels.silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
+            self.gemv_rows_gidx(&mb.tmp, &moe.down_exps, &b.act, &mb.ids, j, hidden, hidden, stream)?;
+            self.kernels
+                .moe_scale_add_gidx_f16(out, out_off, &mb.tmp, 0, hidden, &mb.weights, j, j == 0, stream)?;
+        }
+        if let Some(sh) = &moe.shared {
+            let sh_inter = sh.down.cols();
+            match &sh.gate_up {
+                GateUpWeights::Fused(w) => {
+                    self.gemv_rows(&b.gate, w, x_in, 0, sh_inter, stream)?;
+                    self.gemv_rows(&b.up, w, x_in, sh_inter, sh_inter, stream)?;
+                }
+                GateUpWeights::Split { gate, up } => {
+                    self.gemv_rows(&b.gate, gate, x_in, 0, gate.rows(), stream)?;
+                    self.gemv_rows(&b.up, up, x_in, 0, up.rows(), stream)?;
+                }
+            }
+            self.kernels.silu_mul_f16(&b.act, &b.gate, &b.up, sh_inter, stream)?;
+            self.gemv_rows(&mb.tmp, &sh.down, &b.act, 0, sh.down.rows(), stream)?;
+            // mb.shared_scale holds this layer's device sigmoid gate scale when
+            // the arch has a shared gate; for a gate-less shared expert it stays
+            // at the 1.0 seeded once at load, so no per-layer write is needed.
+            self.kernels.moe_scale_add_gidx_f16(
+                out,
+                out_off,
+                &mb.tmp,
+                0,
+                hidden,
+                &mb.shared_scale,
+                0,
+                false,
+                stream,
+            )?;
+        }
+        Ok(())
     }
 
     /// Run each selected expert's SwiGLU over the single-token activation

@@ -1665,6 +1665,46 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Routed-MoE Q6_K expert GEMV whose expert row window is read ON DEVICE
+    /// from `ids[sel]` (no host readback). Writes the per-expert `[rows]` output
+    /// at `y[0..]`; global weight row = `ids[sel] * rows_per_expert + local_row`,
+    /// bit-identical to `gemv_q6_k_f16_at` at that expert's byte offset.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q6_k_f16_gidx(
+        &self,
+        y: &DevBuffer,
+        w_q6k: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ids: &DevBuffer,
+        sel: usize,
+        rows_per_expert: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q6_k_f16_gidx requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q6_k_f16_gidx")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w_q6k)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .buf(ids)
+            .scalar(sel as i64)
+            .scalar(rows_per_expert as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// Logit GEMV over Q6_K weights → f32 logits.
     pub fn gemv_q6_k_out_f32(
         &self,
@@ -2867,6 +2907,43 @@ impl Kernels {
             .buf(x)
             .scalar(cols as i64)
             .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Routed-MoE Q4_K expert GEMV whose expert row window is read ON DEVICE
+    /// from `ids[sel]` (no host readback of the router selection). Writes the
+    /// per-expert `[rows]` output at `y[0..]`; the global weight row is
+    /// `ids[sel] * rows_per_expert + local_row`, so the result is bit-identical
+    /// to `gemv_q4_k_dp4a_f16_at` at byte offset `ids[sel]*rows_per_expert`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q4_k_dp4a_f16_gidx(
+        &self,
+        y: &DevBuffer,
+        w_q4k: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ids: &DevBuffer,
+        sel: usize,
+        rows_per_expert: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_dp4a_cols(cols, 256, "gemv_q4_k_dp4a_f16_gidx")?;
+        let k = self.artifacts.get("gemv_q4_k_dp4a_f16_gidx")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w_q4k)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .buf(ids)
+            .scalar(sel as i64)
+            .scalar(rows_per_expert as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 
@@ -7155,6 +7232,50 @@ impl Kernels {
             .scalar(n as i64)
             .scalar(scale)
             .scalar(init as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Like `moe_scale_add_f16` but the router weight is read ON DEVICE from
+    /// `weights[sel]`, so no host readback of the routing weights is needed.
+    /// For the shared expert, pass its device-resident sigmoid gate scale as
+    /// `weights` with `sel = 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_scale_add_gidx_f16(
+        &self,
+        acc: &DevBuffer,
+        acc_off: usize,
+        src: &DevBuffer,
+        src_off: usize,
+        n: usize,
+        weights: &DevBuffer,
+        sel: usize,
+        init: bool,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("moe_scale_add_gidx_f16")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new()
+            .buf_at(acc, acc_off)?
+            .buf_at(src, src_off)?
+            .scalar(n as i64)
+            .buf(weights)
+            .scalar(sel as i64)
+            .scalar(init as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// `out[0] = sigmoid(in[0])`: turns the shared-expert gate logit (f16) into
+    /// a device-resident f32 scale so `moe_scale_add_gidx_f16` can fold the
+    /// shared expert without a per-layer host round-trip.
+    pub fn moe_sigmoid_f16_to_f32(
+        &self,
+        out: &DevBuffer,
+        input: &DevBuffer,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("moe_sigmoid_f16_to_f32")?;
+        let cfg = LaunchConfig::linear(1, BLOCK);
+        let args = LaunchArgs::new().buf(out).buf(input);
         self.device.launch(k, &cfg, &args, stream)
     }
 }

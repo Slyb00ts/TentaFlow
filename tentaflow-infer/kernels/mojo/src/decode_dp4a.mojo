@@ -615,6 +615,41 @@ def gemv_q4_k_dp4a_f16(
         y[row] = Float16(total)
 
 
+def gemv_q4_k_dp4a_f16_gidx(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    sel: Int,
+    rows_per_expert: Int,
+):
+    """Routed-MoE Q4_K expert GEMV: identical dp4a math to gemv_q4_k_dp4a_f16,
+    but the expert row window is read ON DEVICE from `ids[sel]` (no host
+    readback of the router selection). The global weight row is
+    `ids[sel] * rows_per_expert + local_row`; `y[local_row]` is written, so the
+    result is bit-identical to launching gemv_q4_k_dp4a_f16 against the same
+    expert's byte-offset row window."""
+    tid = Int(thread_idx.x)
+    xq = stack_allocation[
+        X_MAX, Int8, alignment=64, address_space = AddressSpace.SHARED
+    ]()
+    xds = stack_allocation[
+        XDS_MAX, Float32, address_space = AddressSpace.SHARED
+    ]()
+    _stage_quant_global(x, xq, xds, n_cols, tid)
+    lane = tid % WARP
+    wid = tid // WARP
+    lrow = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    if lrow >= n_rows:
+        return
+    grow = Int(ids[sel]) * rows_per_expert + lrow
+    total = _dot_q4k_i8(w, grow, xq, xds, n_cols, lane)
+    if lane == 0:
+        y[lrow] = Float16(total)
+
+
 def gemv_q4_k_dp4a_out_f32(
     y: UnsafePointer[Float32, MutAnyOrigin],
     w: UnsafePointer[UInt8, MutAnyOrigin],

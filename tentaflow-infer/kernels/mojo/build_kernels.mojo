@@ -34,7 +34,7 @@ from src.gemv import gemv_f16_bias
 from src.kv_append import kv_append_f16
 from src.gemv2 import gemv_q8_0_f16_v2, gemv_q8_0_out_f32_v2, gemv_nvfp4_f16_v2, gemv_f16_out_f32_v2
 from src.gemv2 import gemv_q4_k_f16_v2, gemv_q4_k_out_f32_v2
-from src.gemv2 import gemv_q6_k_f16_v2, gemv_q6_k_out_f32_v2
+from src.gemv2 import gemv_q6_k_f16_v2, gemv_q6_k_out_f32_v2, gemv_q6_k_f16_gidx
 from src.gemm import gemm_q8_0_f16, gemm_nvfp4_f16, gemm_f16
 from src.gemm import gemm_q8_0_f16_bm64, gemm_nvfp4_f16_bm64, gemm_f16_bm64
 from src.gemm import gemm_f16_out_f32, gemm_f16_out_f32_bm64
@@ -54,7 +54,7 @@ from src.decode_fused import rmsnorm_h32_f16
 from src.decode_fused import gemv_norm_q4_k_f16, gemv_norm_q6_k_f16
 from src.decode_fused import gemv_norm_silu_q4_k_f16, gemv_norm_silu_q6_k_f16
 from src.decode_fused import gemv_residual_q4_k_f16, gemv_residual_q6_k_f16
-from src.decode_dp4a import gemv_q8_0_dp4a_f16, gemv_q4_k_dp4a_f16, gemv_q4_k_dp4a_out_f32
+from src.decode_dp4a import gemv_q8_0_dp4a_f16, gemv_q4_k_dp4a_f16, gemv_q4_k_dp4a_out_f32, gemv_q4_k_dp4a_f16_gidx
 from src.decode_dp4a import gemv_norm_q8_0_dp4a_f16, gemv_norm_q4_k_dp4a_f16, gemv_norm_q6_k_dp4a_f16
 from src.decode_dp4a import gemv_norm_silu_q8_0_dp4a_f16, gemv_norm_silu_q4_k_dp4a_f16, gemv_norm_silu_q6_k_dp4a_f16
 from src.decode_dp4a import gemv_residual_q8_0_dp4a_f16, gemv_residual_q4_k_dp4a_f16
@@ -122,7 +122,7 @@ from src.rotkv import attn_prefill_rot_hd128_b4, attn_prefill_rot_hd128_b3
 from src.sampling import penalize_f32, argmax_partial_f32, argmax_final_f32
 from src.sampling import topk_partial_f32, topk_final_f32
 from src.sampling import penalize_batched_f32, argmax_batched_f32, topk_batched_f32
-from src.moe import moe_router_f16, moe_scale_add_f16
+from src.moe import moe_router_f16, moe_scale_add_f16, moe_scale_add_gidx_f16, moe_sigmoid_f16_to_f32
 
 
 def _entry_from_ptx(ptx_path: Path) raises -> String:
@@ -423,6 +423,12 @@ def main() raises:
     _ = ctx.compile_function[gemv_q4_k_dp4a_out_f32, dump_asm=Path("gemv_q4_k_dp4a_out_f32.ptx")]()
     entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_out_f32"))
 
+    _ = ctx.compile_function[gemv_q4_k_dp4a_f16_gidx, dump_asm=Path("gemv_q4_k_dp4a_f16_gidx.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_f16_gidx"))
+
+    _ = ctx.compile_function[gemv_q6_k_f16_gidx, dump_asm=Path("gemv_q6_k_f16_gidx.ptx")]()
+    entries.append(_finalize(out_dir, "gemv_q6_k_f16_gidx"))
+
     _ = ctx.compile_function[gemv_norm_q8_0_dp4a_f16, dump_asm=Path("gemv_norm_q8_0_dp4a_f16.ptx")]()
     entries.append(_finalize(out_dir, "gemv_norm_q8_0_dp4a_f16"))
 
@@ -536,6 +542,12 @@ def main() raises:
 
     _ = ctx.compile_function[moe_scale_add_f16, dump_asm=Path("moe_scale_add_f16.ptx")]()
     entries.append(_finalize(out_dir, "moe_scale_add_f16"))
+
+    _ = ctx.compile_function[moe_scale_add_gidx_f16, dump_asm=Path("moe_scale_add_gidx_f16.ptx")]()
+    entries.append(_finalize(out_dir, "moe_scale_add_gidx_f16"))
+
+    _ = ctx.compile_function[moe_sigmoid_f16_to_f32, dump_asm=Path("moe_sigmoid_f16_to_f32.ptx")]()
+    entries.append(_finalize(out_dir, "moe_sigmoid_f16_to_f32"))
 
     _ = ctx.compile_function[gemv_q5_k_f16_v2, dump_asm=Path("gemv_q5_k_f16_v2.ptx")]()
     entries.append(_finalize(out_dir, "gemv_q5_k_f16_v2"))

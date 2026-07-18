@@ -122,6 +122,7 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "rmsnorm_h32_f16",
     "gemv_q6_k_f16_v2",
     "gemv_q6_k_out_f32_v2",
+    "gemv_q6_k_f16_gidx",
     "gemm_q6_k_f16",
     "gemm_q6_k_f16_bm64",
     "gemv_norm_q4_k_f16",
@@ -133,6 +134,7 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemv_q8_0_dp4a_f16",
     "gemv_q4_k_dp4a_f16",
     "gemv_q4_k_dp4a_out_f32",
+    "gemv_q4_k_dp4a_f16_gidx",
     "gemv_norm_q8_0_dp4a_f16",
     "gemv_norm_q4_k_dp4a_f16",
     "gemv_norm_q6_k_dp4a_f16",
@@ -290,6 +292,8 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemv_residual_iq1_m_f16",
     "moe_router_f16",
     "moe_scale_add_f16",
+    "moe_scale_add_gidx_f16",
+    "moe_sigmoid_f16_to_f32",
 ];
 
 /// Loaded modules + resolved kernel handles for one device.

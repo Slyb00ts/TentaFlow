@@ -136,3 +136,38 @@ def moe_scale_add_f16(
             acc_ptr[i] = Float16(s)
         else:
             acc_ptr[i] = Float16(Float32(acc_ptr[i]) + s)
+
+
+def moe_scale_add_gidx_f16(
+    acc_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    src_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    n: Int,
+    weights_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    sel: Int,
+    init: Int,
+):
+    """acc += weights_ptr[sel] * src over n f16 elements (init != 0 overwrites).
+
+    Identical to moe_scale_add_f16 but the router weight is read ON DEVICE from
+    `weights_ptr[sel]`, so folding a routed expert's output needs no host
+    readback of the selection weights. For the shared expert, `weights_ptr`
+    points at the device-resident sigmoid gate scale (sel = 0)."""
+    i = Int(global_idx.x)
+    if i < n:
+        s = weights_ptr[sel] * Float32(src_ptr[i])
+        if init != 0:
+            acc_ptr[i] = Float16(s)
+        else:
+            acc_ptr[i] = Float16(Float32(acc_ptr[i]) + s)
+
+
+def moe_sigmoid_f16_to_f32(
+    out_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    in_ptr: UnsafePointer[Float16, MutAnyOrigin],
+):
+    """out[0] = sigmoid(in[0]); the shared-expert gate logit (f16, produced by
+    its gate GEMV) becomes a device-resident f32 scale so moe_scale_add_gidx can
+    fold the shared expert without a per-layer host round-trip. Single thread."""
+    if Int(global_idx.x) == 0:
+        logit = Float32(in_ptr[0])
+        out_ptr[0] = 1.0 / (1.0 + exp(-logit))
