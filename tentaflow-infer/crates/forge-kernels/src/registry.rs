@@ -51,6 +51,8 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "rmsnorm_f16",
     "rmsnorm_residual_f16",
     "silu_mul_f16",
+    "sigmoid_mul_f16",
+    "deinterleave_gate_f16",
     "rope_neox_f16",
     "rope_neox_partial_f16",
     "gemv_q8_0_f16",

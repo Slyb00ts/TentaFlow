@@ -206,6 +206,47 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// out = a * sigmoid(gate) over n f16 elements (attention output gate).
+    pub fn sigmoid_mul_f16(
+        &self,
+        out: &DevBuffer,
+        a: &DevBuffer,
+        gate: &DevBuffer,
+        n: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("sigmoid_mul_f16")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(a)
+            .buf(gate)
+            .scalar(n as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// De-interleave a gated Q projection [n_heads, 2*head_dim] into query and
+    /// gate halves (each [n_heads, head_dim]). `n = n_heads * head_dim`.
+    pub fn deinterleave_gate_f16(
+        &self,
+        qc: &DevBuffer,
+        gatec: &DevBuffer,
+        q_full: &DevBuffer,
+        head_dim: usize,
+        n: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("deinterleave_gate_f16")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new()
+            .buf(qc)
+            .buf(gatec)
+            .buf(q_full)
+            .scalar(head_dim as i64)
+            .scalar(n as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// In-place neox RoPE over [n_tokens, n_heads, head_dim] f16.
     #[allow(clippy::too_many_arguments)]
     pub fn rope_neox_f16(
@@ -1589,6 +1630,41 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// `gemv_q6_k_f16` over a row window of `w_q6k` (`w_byte_off` addresses the
+    /// window's first row). One block per 8 output rows — used for the routed
+    /// MoE down-projection so a single-token expert GEMV saturates the SMs
+    /// instead of a 64-token GEMM tile with one live column.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q6_k_f16_at(
+        &self,
+        y: &DevBuffer,
+        w_q6k: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemv_q6_k requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let k = self.artifacts.get("gemv_q6_k_f16_v2")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w_q6k, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// Logit GEMV over Q6_K weights → f32 logits.
     pub fn gemv_q6_k_out_f32(
         &self,
@@ -2757,6 +2833,37 @@ impl Kernels {
         let args = LaunchArgs::new()
             .buf(y)
             .buf(w_q4k)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// `gemv_q4_k_dp4a_f16` over a row window of `w_q4k` (`w_byte_off` addresses
+    /// the window's first row). Used for the routed MoE gate/up projections so a
+    /// single-token expert GEMV launches per-row blocks instead of a starved
+    /// 64-token GEMM tile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q4_k_dp4a_f16_at(
+        &self,
+        y: &DevBuffer,
+        w_q4k: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_dp4a_cols(cols, 256, "gemv_q4_k_dp4a")?;
+        let k = self.artifacts.get("gemv_q4_k_dp4a_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w_q4k, w_byte_off)?
             .buf(x)
             .scalar(cols as i64)
             .scalar(rows as i64);

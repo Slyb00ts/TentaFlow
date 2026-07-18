@@ -12,7 +12,7 @@ import std.os as os
 from std.gpu.host import DeviceContext
 from std.pathlib import Path
 from src.norm import rmsnorm_f16, rmsnorm_residual_f16
-from src.activation import silu_mul_f16
+from src.activation import silu_mul_f16, sigmoid_mul_f16, deinterleave_gate_f16
 from src.rope import rope_neox_f16
 from src.gemv import gemv_q8_0_f16, gemv_f16
 from src.attention import attn_decode_f16_hd64, attn_decode_f16_hd128, attn_decode_f16_hd256
@@ -176,6 +176,12 @@ def main() raises:
 
     _ = ctx.compile_function[silu_mul_f16, dump_asm=Path("silu_mul_f16.ptx")]()
     entries.append(_finalize(out_dir, "silu_mul_f16"))
+
+    _ = ctx.compile_function[sigmoid_mul_f16, dump_asm=Path("sigmoid_mul_f16.ptx")]()
+    entries.append(_finalize(out_dir, "sigmoid_mul_f16"))
+
+    _ = ctx.compile_function[deinterleave_gate_f16, dump_asm=Path("deinterleave_gate_f16.ptx")]()
+    entries.append(_finalize(out_dir, "deinterleave_gate_f16"))
 
     _ = ctx.compile_function[rope_neox_f16, dump_asm=Path("rope_neox_f16.ptx")]()
     entries.append(_finalize(out_dir, "rope_neox_f16"))

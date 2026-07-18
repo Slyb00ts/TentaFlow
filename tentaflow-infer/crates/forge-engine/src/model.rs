@@ -235,6 +235,10 @@ struct HybridBufs {
     /// DeltaNet recurrence output + gated-RMSNorm output `[value_dim]` f16.
     o: DevBuffer,
     normed: DevBuffer,
+    /// Pinned-host staging for the per-token embedding row `[hidden]` f16, so
+    /// the host gather lands via an async H2D on the compute stream (no
+    /// per-token blocking legacy-stream drain).
+    pinned_embed: DevBuffer,
 }
 
 /// Attention source for the shared decode chains: the paged VRAM cache (fast
@@ -399,6 +403,9 @@ struct MoeBufs {
     xrow: DevBuffer,
     /// One expert's down-projection output, f16 [hidden].
     tmp: DevBuffer,
+    /// Pinned-host landing for the shared-expert gate logit (f16), read back in
+    /// the same sync as the router top-k.
+    pinned_shared: DevBuffer,
 }
 
 impl Model {
@@ -577,6 +584,7 @@ impl Model {
                     pinned_weights: device.alloc(idw * 4, MemKind::PinnedHost, Pool::Activations)?,
                     xrow: device.alloc(hidden * 2, MemKind::Device, Pool::Activations)?,
                     tmp: device.alloc(hidden * 2, MemKind::Device, Pool::Activations)?,
+                    pinned_shared: device.alloc(2, MemKind::PinnedHost, Pool::Activations)?,
                 })
             }
             None => None,
@@ -1590,6 +1598,33 @@ impl Model {
                 *inv_global_scale,
                 stream,
             ),
+        }
+    }
+
+    /// Single-token GEMV over a row window of `w` (`y = W[row_off..+n_rows]·x`).
+    /// The routed-MoE expert path uses this instead of the batched `gemm_rows`:
+    /// a decode step feeds one token, and the GEMM tile (BM=64) then launches
+    /// only `n_rows/64` blocks — far too few to saturate the SMs, so the GPU
+    /// stays at idle clocks. The per-row GEMV kernels launch `n_rows/8` blocks
+    /// (8 experts queued back-to-back per layer keep the device busy enough to
+    /// boost). Formats without an offset GEMV variant fall back to the tile.
+    fn gemv_rows(
+        &self,
+        y: &DevBuffer,
+        w: &DevWeight,
+        x: &DevBuffer,
+        row_off: usize,
+        n_rows: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        match w {
+            DevWeight::Q4K { buf, cols, .. } if *cols <= Kernels::DP4A_MAX_COLS => self
+                .kernels
+                .gemv_q4_k_dp4a_f16_at(y, buf, row_off * (cols / 256) * 144, x, n_rows, *cols, stream),
+            DevWeight::Q6K { buf, cols, .. } => self
+                .kernels
+                .gemv_q6_k_f16_at(y, buf, row_off * (cols / 256) * 210, x, n_rows, *cols, stream),
+            _ => self.gemm_rows(y, w, x, 1, row_off, n_rows, stream),
         }
     }
 
@@ -2909,6 +2944,13 @@ impl Model {
         let DevWeight::F16 { buf: router_buf, .. } = &moe.router else {
             return Err(ForgeError::Unsupported("MoE router must be f16".into()));
         };
+        // Enqueue the shared-expert gate GEMV (when the arch has one) BEFORE the
+        // router readback so its logit rides the SAME single sync as the top-k,
+        // rather than forcing a second per-layer host round-trip.
+        if let Some(sg) = &moe.shared_gate {
+            self.gemv(&mb.tmp, sg, &b.x, stream)?;
+            self.device.copy(&mb.tmp, 0, &mb.pinned_shared, 0, 2, stream)?;
+        }
         self.kernels.moe_router_f16(
             &mb.ids,
             &mb.weights,
@@ -2937,7 +2979,16 @@ impl Model {
                 k,
             )
         };
-        let shared_scale = self.shared_gate_scale(moe, &b.x, stream)?;
+        // Per-token sigmoid gate for the shared expert (`ffn_gate_inp_shexp · x`);
+        // 1.0 when the arch declares no shared-expert gate (OLMoE / Qwen3-MoE).
+        let shared_scale = if moe.shared_gate.is_some() {
+            let sp = mb.pinned_shared.host_ptr().expect("pinned host mapping");
+            let bytes = unsafe { *(sp as *const [u8; 2]) };
+            let logit = f16::from_le_bytes(bytes).to_f32();
+            1.0 / (1.0 + (-logit).exp())
+        } else {
+            1.0
+        };
         self.moe_experts_accumulate(
             moe,
             &b.x,
@@ -2950,22 +3001,6 @@ impl Model {
             shared_scale,
             stream,
         )
-    }
-
-    /// Per-token sigmoid gate for the shared expert (`ffn_gate_inp_shexp · x`);
-    /// 1.0 when the arch declares no shared-expert gate (OLMoE / Qwen3-MoE).
-    /// One GEMV + a blocking readback (the router path already synchronizes).
-    fn shared_gate_scale(&self, moe: &MoeFfn, x_in: &DevBuffer, stream: &Stream) -> Result<f32> {
-        let Some(sg) = &moe.shared_gate else {
-            return Ok(1.0);
-        };
-        let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
-        self.gemv(&mb.tmp, sg, x_in, stream)?;
-        let mut bytes = [0u8; 2];
-        self.device.synchronize()?;
-        self.device.read(&mb.tmp, 0, &mut bytes)?;
-        let logit = f16::from_le_bytes(bytes).to_f32();
-        Ok(1.0 / (1.0 + (-logit).exp()))
     }
 
     /// Run each selected expert's SwiGLU over the single-token activation
@@ -3000,10 +3035,10 @@ impl Model {
                     "router selected out-of-range expert {e}"
                 )));
             }
-            self.gemm_rows(&b.gate, &moe.gate_exps, x_in, 1, e * inter, inter, stream)?;
-            self.gemm_rows(&b.up, &moe.up_exps, x_in, 1, e * inter, inter, stream)?;
+            self.gemv_rows(&b.gate, &moe.gate_exps, x_in, e * inter, inter, stream)?;
+            self.gemv_rows(&b.up, &moe.up_exps, x_in, e * inter, inter, stream)?;
             self.kernels.silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
-            self.gemm_rows(&mb.tmp, &moe.down_exps, &b.act, 1, e * hidden, hidden, stream)?;
+            self.gemv_rows(&mb.tmp, &moe.down_exps, &b.act, e * hidden, hidden, stream)?;
             self.kernels
                 .moe_scale_add_f16(out, out_off, &mb.tmp, 0, hidden, wt, j == 0, stream)?;
         }
@@ -3015,16 +3050,16 @@ impl Model {
             let sh_inter = sh.down.cols();
             match &sh.gate_up {
                 GateUpWeights::Fused(w) => {
-                    self.gemm_rows(&b.gate, w, x_in, 1, 0, sh_inter, stream)?;
-                    self.gemm_rows(&b.up, w, x_in, 1, sh_inter, sh_inter, stream)?;
+                    self.gemv_rows(&b.gate, w, x_in, 0, sh_inter, stream)?;
+                    self.gemv_rows(&b.up, w, x_in, sh_inter, sh_inter, stream)?;
                 }
                 GateUpWeights::Split { gate, up } => {
-                    self.gemm(&b.gate, gate, x_in, 1, stream)?;
-                    self.gemm(&b.up, up, x_in, 1, stream)?;
+                    self.gemv_rows(&b.gate, gate, x_in, 0, gate.rows(), stream)?;
+                    self.gemv_rows(&b.up, up, x_in, 0, up.rows(), stream)?;
                 }
             }
             self.kernels.silu_mul_f16(&b.act, &b.gate, &b.up, sh_inter, stream)?;
-            self.gemm(&mb.tmp, &sh.down, &b.act, 1, stream)?;
+            self.gemv_rows(&mb.tmp, &sh.down, &b.act, 0, sh.down.rows(), stream)?;
             self.kernels
                 .moe_scale_add_f16(out, out_off, &mb.tmp, 0, hidden, shared_scale, false, stream)?;
         }
@@ -3150,6 +3185,11 @@ impl Model {
             beta_f: a32(nv)?,
             o: a16(value_dim)?,
             normed: a16(value_dim)?,
+            pinned_embed: device.alloc(
+                p.hidden_size * 2,
+                MemKind::PinnedHost,
+                Pool::Activations,
+            )?,
         });
         Ok(())
     }
@@ -3185,12 +3225,11 @@ impl Model {
         let b = &self.bufs;
         let n_layers = self.weights.layers.len();
 
-        // Host-side embedding gather: copy this token's f16 row to the device
-        // residual buffer (the table lives in host RAM to keep VRAM for weights).
-        // `write` drains only the legacy stream, so the previous token's tail
-        // (which still writes `b.h` on the non-blocking compute stream) must be
-        // drained first or the two races on `b.h`.
-        self.device.synchronize()?;
+        // Host-side embedding gather: stage this token's f16 row in pinned host
+        // memory and push it to the device residual buffer with an async H2D on
+        // the compute stream (the table lives in host RAM to keep VRAM for
+        // weights). Stream ordering serializes this after the previous token's
+        // tail, so no blocking sync is needed to avoid a race on `b.h`.
         let host = self
             .weights
             .token_embd_host
@@ -3200,7 +3239,16 @@ impl Model {
         let row = host.get(base..base + hidden).ok_or_else(|| {
             ForgeError::Scheduler(format!("token id {token_id} out of embedding range"))
         })?;
-        self.device.write(bytemuck::cast_slice(row), &b.h, 0)?;
+        let hb = self.hybrid_bufs.as_ref().expect("hybrid bufs allocated");
+        let dst = hb
+            .pinned_embed
+            .host_ptr()
+            .expect("pinned buffer has host mapping");
+        unsafe {
+            std::ptr::copy_nonoverlapping(row.as_ptr() as *const u8, dst, hidden * 2);
+        }
+        self.device
+            .copy(&hb.pinned_embed, 0, &b.h, 0, hidden * 2, stream)?;
         kernels.rmsnorm_f16(&b.x, &b.h, &self.weights.layers[0].attn_norm, 1, hidden, eps, stream)?;
 
         for l in 0..n_layers {
@@ -3277,14 +3325,7 @@ impl Model {
         // Gated Q projection [2*q_dim], then de-interleave per head: q at
         // h*2*head_dim, gate at h*2*head_dim + head_dim.
         self.gemv(&hb.q_full, wq, &b.x, stream)?;
-        for h in 0..n_heads {
-            let src = (h * 2 * head_dim) * 2;
-            let dst = (h * head_dim) * 2;
-            self.device
-                .copy(&hb.q_full, src, &hb.qc, dst, head_dim * 2, stream)?;
-            self.device
-                .copy(&hb.q_full, src + head_dim * 2, &hb.gatec, dst, head_dim * 2, stream)?;
-        }
+        kernels.deinterleave_gate_f16(&hb.qc, &hb.gatec, &hb.q_full, head_dim, q_dim, stream)?;
         if let Some(qn) = &a.q_norm {
             kernels.rmsnorm_f16(&hb.qc, &hb.qc, qn, n_heads, head_dim, eps, stream)?;
         }
@@ -3323,25 +3364,9 @@ impl Model {
             scale,
             stream,
         )?;
-        // Output gate: out = attn ⊙ sigmoid(gate). No elementwise sigmoid-mul
-        // kernel exists, so a bounded host round-trip applies the gate (the MoE
-        // FFN already synchronizes each layer, so this adds no extra sync class).
-        let mut ha = vec![0u8; q_dim * 2];
-        let mut hg = vec![0u8; q_dim * 2];
-        self.device.synchronize()?;
-        self.device.read(&b.attn_out, 0, &mut ha)?;
-        self.device.read(&hb.gatec, 0, &mut hg)?;
-        let af: &[f16] = bytemuck::cast_slice(&ha);
-        let gf: &[f16] = bytemuck::cast_slice(&hg);
-        let mut out = vec![0u8; q_dim * 2];
-        {
-            let of: &mut [f16] = bytemuck::cast_slice_mut(&mut out);
-            for i in 0..q_dim {
-                let s = 1.0 / (1.0 + (-gf[i].to_f32()).exp());
-                of[i] = f16::from_f32(af[i].to_f32() * s);
-            }
-        }
-        self.device.write(&out, &hb.gated, 0)?;
+        // Output gate: out = attn ⊙ sigmoid(gate), applied on-device so the
+        // whole mixer stays on the compute stream (no per-layer host sync).
+        kernels.sigmoid_mul_f16(&hb.gated, &b.attn_out, &hb.gatec, q_dim, stream)?;
         self.gemv(&b.o_out, &a.attn_o, &hb.gated, stream)?;
         Ok(())
     }
