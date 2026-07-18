@@ -6,6 +6,7 @@
 // `ForgeError::Format` — never panics.
 
 pub mod arch;
+pub mod deltanet;
 pub mod dequant;
 pub mod iq_tables;
 pub mod gguf;
@@ -13,7 +14,10 @@ pub mod hf_config;
 pub mod nvfp4;
 pub mod safetensors;
 
-pub use arch::{ArchSpec, Hyperparams, ModelDescriptor, PoolingType, WeightRole};
+pub use arch::{
+    ArchSpec, Hyperparams, LayerKind, ModelDescriptor, MoeParams, PoolingType, SsmParams,
+    WeightRole,
+};
 pub use dequant::dequantize_to_f32;
 pub use gguf::{Gguf, GgufTensor, MetaValue};
 pub use hf_config::HfConfig;

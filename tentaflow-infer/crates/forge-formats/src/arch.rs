@@ -72,6 +72,83 @@ pub enum WeightRole {
     FfnGateShExp,
     FfnUpShExp,
     FfnDownShExp,
+    /// Per-token sigmoid gate on the shared-expert output (qwen35moe): a
+    /// [hidden] vector producing one logit per token (`ffn_gate_inp_shexp`).
+    FfnGateInpShExp,
+    /// Gated-DeltaNet (linear-attention) in-projection producing the mixed
+    /// q|k|v stream (`attn_qkv`, [hidden, key_dim*2+value_dim]).
+    SsmInProj,
+    /// Gated-DeltaNet output gate `z` projection (`attn_gate`, [hidden, value_dim]).
+    SsmGate,
+    /// Depthwise causal conv over the mixed q|k|v stream (`ssm_conv1d`,
+    /// [d_conv, conv_dim]).
+    SsmConv1d,
+    /// DeltaNet time-step bias added before softplus (`ssm_dt.bias`, [dt_rank]).
+    SsmDt,
+    /// DeltaNet log-decay scale `-exp(A_log)` (`ssm_a`, [dt_rank]).
+    SsmA,
+    /// DeltaNet per-head beta projection (`ssm_beta`, [hidden, n_v_heads]).
+    SsmBeta,
+    /// DeltaNet per-head alpha (decay) projection (`ssm_alpha`, [hidden, n_v_heads]).
+    SsmAlpha,
+    /// DeltaNet output gated-RMSNorm weight over head_v_dim (`ssm_norm`, [head_v_dim]).
+    SsmNorm,
+    /// DeltaNet output projection (`ssm_out`, [value_dim, hidden]).
+    SsmOut,
+}
+
+/// Per-layer computation kind in a hybrid (attention + linear-attention) stack.
+/// Non-hybrid architectures are all-`Attention`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerKind {
+    /// Standard softmax self-attention (paged KV), optionally output-gated.
+    Attention,
+    /// Gated-DeltaNet linear attention: causal conv + recurrent state scan.
+    DeltaNet,
+}
+
+/// Gated-DeltaNet / SSM hyperparameters (hybrid architectures only). Head
+/// counts are derived: `n_k_heads = n_group`, `n_v_heads = dt_rank`, and both
+/// key and value head dimensions equal `d_state`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SsmParams {
+    /// Causal depthwise conv kernel width (`ssm.conv_kernel`, e.g. 4).
+    pub d_conv: usize,
+    /// Total value width across all v-heads (`ssm.inner_size`, e.g. 4096).
+    pub d_inner: usize,
+    /// Per-head state dimension = key/value head dim (`ssm.state_size`, e.g. 128).
+    pub d_state: usize,
+    /// DeltaNet value-head count / time-step rank (`ssm.time_step_rank`, e.g. 32).
+    pub dt_rank: usize,
+    /// DeltaNet key-head count (`ssm.group_count`, e.g. 16).
+    pub n_group: usize,
+}
+
+impl SsmParams {
+    /// Key-head count (== `n_group`).
+    pub fn n_k_heads(&self) -> usize {
+        self.n_group
+    }
+    /// Value-head count (== `dt_rank`).
+    pub fn n_v_heads(&self) -> usize {
+        self.dt_rank
+    }
+    /// Per-head key/value dimension (== `d_state`).
+    pub fn head_dim(&self) -> usize {
+        self.d_state
+    }
+    /// Total key width across key-heads (`d_state * n_group`).
+    pub fn key_dim(&self) -> usize {
+        self.d_state * self.n_group
+    }
+    /// Total value width across value-heads (`d_state * dt_rank == d_inner`).
+    pub fn value_dim(&self) -> usize {
+        self.d_state * self.dt_rank
+    }
+    /// Channel count of the mixed q|k|v conv stream (`key_dim*2 + value_dim`).
+    pub fn conv_dim(&self) -> usize {
+        self.key_dim() * 2 + self.value_dim()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -105,6 +182,7 @@ const ARCH_SOURCES: &[&str] = &[
     include_str!("../arch/mistral.ron"),
     include_str!("../arch/olmoe.ron"),
     include_str!("../arch/qwen3moe.ron"),
+    include_str!("../arch/qwen35moe.ron"),
 ];
 
 /// Embedded specs are compile-time assets of this crate, so a parse failure
@@ -159,6 +237,21 @@ pub struct Hyperparams {
     /// per token rather than per-head over `head_dim`. OLMoE normalizes the full
     /// query/key vector; Qwen3 normalizes each head. `false` when no QK-norm.
     pub qk_norm_over_hidden: bool,
+    /// Gated-DeltaNet / SSM parameters for hybrid architectures (`qwen35moe`);
+    /// `None` for pure-attention models.
+    pub ssm: Option<SsmParams>,
+    /// M-RoPE dimension sections (`rope.dimension_sections`, hybrid Qwen);
+    /// `None` for standard RoPE. For text-only positions M-RoPE reduces to
+    /// NEOX partial rotary over the first `sum(sections)*2` dims.
+    pub rope_sections: Option<[u32; 4]>,
+    /// Every `full_attention_interval`-th layer is full attention, the rest
+    /// Gated-DeltaNet (hybrid only; 0 when not hybrid). The concrete per-layer
+    /// split lives in `ModelDescriptor::layer_kinds`.
+    pub full_attention_interval: usize,
+    /// The attention Q projection also emits a per-head sigmoid output gate
+    /// (qwen35moe): `wq` has width `head_dim * n_heads * 2` and the second half
+    /// gates the attention output. `false` for ungated attention.
+    pub attn_gated: bool,
 }
 
 /// Architecture + hyperparams + fully resolved weight-name map.
@@ -170,6 +263,9 @@ pub struct ModelDescriptor {
     pub globals: HashMap<WeightRole, String>,
     /// Per-layer role → tensor name, index = layer.
     pub layers: Vec<HashMap<WeightRole, String>>,
+    /// Per-layer computation kind. All `Attention` for non-hybrid models;
+    /// interleaved `Attention`/`DeltaNet` for `qwen35moe`. Index = layer.
+    pub layer_kinds: Vec<LayerKind>,
 }
 
 fn expand(template: &str, layer: usize) -> String {
@@ -188,6 +284,10 @@ impl ModelDescriptor {
             .ok_or_else(|| {
                 ForgeError::Unsupported(format!("no architecture spec for gguf arch '{arch}'"))
             })?;
+
+        if arch == "qwen35moe" {
+            return build_qwen35moe(gguf, spec);
+        }
 
         let key = |suffix: &str| format!("{arch}.{suffix}");
         let req_u = |suffix: &str| {
@@ -329,9 +429,14 @@ impl ModelDescriptor {
                 pooling_type,
                 moe,
                 qk_norm_over_hidden,
+                ssm: None,
+                rope_sections: None,
+                full_attention_interval: 0,
+                attn_gated: false,
             },
             globals,
             layers,
+            layer_kinds: vec![LayerKind::Attention; block_count],
         })
     }
 
@@ -392,11 +497,218 @@ impl ModelDescriptor {
                 // supported entry for Mixture-of-Experts models.
                 moe: None,
                 qk_norm_over_hidden: false,
+                ssm: None,
+                rope_sections: None,
+                full_attention_interval: 0,
+                attn_gated: false,
             },
             globals,
             layers,
+            layer_kinds: vec![LayerKind::Attention; block_count],
         })
     }
+}
+
+/// Build the descriptor for the Qwen3.5/3.6 hybrid MoE (`qwen35moe`): an
+/// interleaved stack of full-attention and Gated-DeltaNet layers with routed
+/// experts + a gated shared expert. Every `full_attention_interval`-th layer
+/// (`(idx+1) % interval == 0`) is attention; the rest are DeltaNet. The final
+/// `nextn_predict_layers` blocks are MTP/NextN speculation heads and are
+/// dropped from the autoregressive stack (basic decode never runs them).
+fn build_qwen35moe(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> {
+    let key = |suffix: &str| format!("qwen35moe.{suffix}");
+    let req_u = |suffix: &str| {
+        gguf.get_u64(&key(suffix))
+            .map(|v| v as usize)
+            .ok_or_else(|| fmt_err(format!("gguf: missing metadata key {}", key(suffix))))
+    };
+
+    let block_count_all = req_u("block_count")?;
+    let nextn = gguf.get_u64(&key("nextn_predict_layers")).unwrap_or(0) as usize;
+    let block_count = block_count_all.saturating_sub(nextn);
+    let hidden_size = req_u("embedding_length")?;
+    let n_heads = req_u("attention.head_count")?;
+    let n_kv_heads = gguf
+        .get_u64(&key("attention.head_count_kv"))
+        .map(|v| v as usize)
+        .unwrap_or(n_heads);
+    // Attention head dim is the explicit key length (256 here), independent of
+    // hidden/n_heads (q width = n_heads * head_dim can exceed hidden_size).
+    let head_dim = req_u("attention.key_length")?;
+    // Pure-MoE model: only per-expert / shared FFN widths are declared, no
+    // dense feed_forward_length. Fall back to the expert width.
+    let feed_forward_length = gguf
+        .get_u64(&key("feed_forward_length"))
+        .map(|v| v as usize)
+        .unwrap_or(0);
+    let max_position_embeddings = req_u("context_length")?;
+    let rope_theta = gguf.get_f32(&key("rope.freq_base")).unwrap_or(10_000.0);
+    let rms_norm_eps = gguf
+        .get_f32(&key("attention.layer_norm_rms_epsilon"))
+        .unwrap_or(1e-5);
+
+    let full_attention_interval = gguf
+        .get_u64(&key("full_attention_interval"))
+        .map(|v| v as usize)
+        .unwrap_or(4)
+        .max(1);
+
+    let ssm = SsmParams {
+        d_conv: req_u("ssm.conv_kernel")?,
+        d_inner: req_u("ssm.inner_size")?,
+        d_state: req_u("ssm.state_size")?,
+        dt_rank: req_u("ssm.time_step_rank")?,
+        n_group: req_u("ssm.group_count")?,
+    };
+
+    let rope_sections = gguf
+        .get_array(&key("rope.dimension_sections"))
+        .and_then(|a| {
+            let v: Vec<u32> = a.iter().filter_map(|e| e.as_u64().map(|x| x as u32)).collect();
+            if v.len() >= 4 {
+                Some([v[0], v[1], v[2], v[3]])
+            } else {
+                None
+            }
+        });
+
+    // Routed experts + always-on gated shared expert.
+    let n_experts = req_u("expert_count")?;
+    let n_experts_used = req_u("expert_used_count")?;
+    let moe_intermediate_size = gguf
+        .get_u64(&key("expert_feed_forward_length"))
+        .map(|v| v as usize)
+        .unwrap_or(feed_forward_length);
+    let shared_intermediate_size = gguf
+        .get_u64(&key("expert_shared_feed_forward_length"))
+        .map(|v| v as usize)
+        .unwrap_or(0);
+    let moe = Some(MoeParams {
+        n_experts,
+        n_experts_used,
+        moe_intermediate_size,
+        // qwen35moe renormalizes the top-k softmax weights (build_moe_ffn
+        // norm_w = true in the reference graph).
+        norm_topk_prob: true,
+        shared_intermediate_size,
+    });
+
+    let vocab_size = gguf
+        .tensor("token_embd.weight")
+        .and_then(|t| t.dims.get(1))
+        .map(|&v| v as usize)
+        .or_else(|| gguf.get_array("tokenizer.ggml.tokens").map(|a| a.len()))
+        .ok_or_else(|| fmt_err("gguf: cannot determine vocab size"))?;
+
+    let mut globals = HashMap::new();
+    for role in [WeightRole::TokenEmbd, WeightRole::OutputNorm] {
+        let name = spec
+            .roles
+            .iter()
+            .find(|r| r.role == role)
+            .map(|r| r.gguf.clone())
+            .ok_or_else(|| fmt_err(format!("qwen35moe spec missing global role {role:?}")))?;
+        if gguf.tensor(&name).is_none() {
+            return Err(fmt_err(format!("qwen35moe: missing global tensor '{name}'")));
+        }
+        globals.insert(role, name);
+    }
+    // Untied LM head: present as output.weight, else tie to the embedding.
+    let tie_word_embeddings = gguf.tensor("output.weight").is_none();
+    if !tie_word_embeddings {
+        globals.insert(WeightRole::LmHead, "output.weight".into());
+    }
+
+    // Common per-layer roles shared by both attention and DeltaNet layers.
+    let insert = |m: &mut HashMap<WeightRole, String>, role: WeightRole, name: String| -> Result<()> {
+        if gguf.tensor(&name).is_none() {
+            return Err(fmt_err(format!("qwen35moe: missing tensor '{name}'")));
+        }
+        m.insert(role, name);
+        Ok(())
+    };
+
+    let mut layers: Vec<HashMap<WeightRole, String>> = Vec::with_capacity(block_count);
+    let mut layer_kinds = Vec::with_capacity(block_count);
+    for il in 0..block_count {
+        let kind = if (il + 1) % full_attention_interval == 0 {
+            LayerKind::Attention
+        } else {
+            LayerKind::DeltaNet
+        };
+        let mut m = HashMap::new();
+        insert(&mut m, WeightRole::AttnNorm, format!("blk.{il}.attn_norm.weight"))?;
+        // Post-attention norm feeds the MoE FFN (GGUF: post_attention_norm).
+        insert(&mut m, WeightRole::FfnNorm, format!("blk.{il}.post_attention_norm.weight"))?;
+
+        match kind {
+            LayerKind::Attention => {
+                // Q projection is gated: width = head_dim * n_heads * 2.
+                insert(&mut m, WeightRole::AttnQ, format!("blk.{il}.attn_q.weight"))?;
+                insert(&mut m, WeightRole::AttnK, format!("blk.{il}.attn_k.weight"))?;
+                insert(&mut m, WeightRole::AttnV, format!("blk.{il}.attn_v.weight"))?;
+                insert(&mut m, WeightRole::AttnO, format!("blk.{il}.attn_output.weight"))?;
+                insert(&mut m, WeightRole::AttnQNorm, format!("blk.{il}.attn_q_norm.weight"))?;
+                insert(&mut m, WeightRole::AttnKNorm, format!("blk.{il}.attn_k_norm.weight"))?;
+            }
+            LayerKind::DeltaNet => {
+                insert(&mut m, WeightRole::SsmInProj, format!("blk.{il}.attn_qkv.weight"))?;
+                insert(&mut m, WeightRole::SsmGate, format!("blk.{il}.attn_gate.weight"))?;
+                insert(&mut m, WeightRole::SsmConv1d, format!("blk.{il}.ssm_conv1d.weight"))?;
+                insert(&mut m, WeightRole::SsmDt, format!("blk.{il}.ssm_dt.bias"))?;
+                insert(&mut m, WeightRole::SsmA, format!("blk.{il}.ssm_a"))?;
+                insert(&mut m, WeightRole::SsmBeta, format!("blk.{il}.ssm_beta.weight"))?;
+                insert(&mut m, WeightRole::SsmAlpha, format!("blk.{il}.ssm_alpha.weight"))?;
+                insert(&mut m, WeightRole::SsmNorm, format!("blk.{il}.ssm_norm.weight"))?;
+                insert(&mut m, WeightRole::SsmOut, format!("blk.{il}.ssm_out.weight"))?;
+            }
+        }
+
+        // Routed experts + gated shared expert (present on every trunk layer).
+        insert(&mut m, WeightRole::FfnGateInp, format!("blk.{il}.ffn_gate_inp.weight"))?;
+        insert(&mut m, WeightRole::FfnGateExps, format!("blk.{il}.ffn_gate_exps.weight"))?;
+        insert(&mut m, WeightRole::FfnUpExps, format!("blk.{il}.ffn_up_exps.weight"))?;
+        insert(&mut m, WeightRole::FfnDownExps, format!("blk.{il}.ffn_down_exps.weight"))?;
+        insert(&mut m, WeightRole::FfnGateShExp, format!("blk.{il}.ffn_gate_shexp.weight"))?;
+        insert(&mut m, WeightRole::FfnUpShExp, format!("blk.{il}.ffn_up_shexp.weight"))?;
+        insert(&mut m, WeightRole::FfnDownShExp, format!("blk.{il}.ffn_down_shexp.weight"))?;
+        insert(&mut m, WeightRole::FfnGateInpShExp, format!("blk.{il}.ffn_gate_inp_shexp.weight"))?;
+
+        layers.push(m);
+        layer_kinds.push(kind);
+    }
+
+    // The MoE expert scratch is sized from intermediate_size; fold the expert
+    // and shared-expert FFN widths into it.
+    let intermediate_size = moe_intermediate_size.max(shared_intermediate_size);
+
+    Ok(ModelDescriptor {
+        arch: spec.name.clone(),
+        params: Hyperparams {
+            block_count,
+            hidden_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            intermediate_size,
+            vocab_size,
+            rope_theta,
+            rms_norm_eps,
+            max_position_embeddings,
+            tie_word_embeddings,
+            pooling_type: PoolingType::None,
+            moe,
+            // qwen35moe attention normalizes each head over head_dim.
+            qk_norm_over_hidden: false,
+            ssm: Some(ssm),
+            rope_sections,
+            full_attention_interval,
+            attn_gated: true,
+        },
+        globals,
+        layers,
+        layer_kinds,
+    })
 }
 
 #[cfg(test)]
@@ -406,12 +718,13 @@ mod tests {
     #[test]
     fn all_embedded_specs_parse() {
         let specs = registry();
-        assert_eq!(specs.len(), 5);
+        assert_eq!(specs.len(), 6);
         assert_eq!(specs[0].name, "qwen3");
         assert_eq!(specs[1].name, "llama");
         assert_eq!(specs[2].name, "mistral");
         assert_eq!(specs[3].name, "olmoe");
         assert_eq!(specs[4].name, "qwen3moe");
+        assert_eq!(specs[5].name, "qwen35moe");
         // The MoE specs carry the router + stacked-expert roles.
         assert!(specs[3].roles.iter().any(|r| r.role == WeightRole::FfnGateInp));
         assert!(specs[3].roles.iter().any(|r| r.role == WeightRole::FfnGateExps));
@@ -535,6 +848,84 @@ mod tests {
             assert!(layer.contains_key(&WeightRole::FfnUpExps));
             assert!(layer.contains_key(&WeightRole::FfnDownExps));
             assert!(!layer.contains_key(&WeightRole::FfnGate));
+        }
+    }
+
+    /// Detect the Qwen3.6-35B-A3B hybrid MoE from the real GGUF and assert the
+    /// interleaved attention/DeltaNet split, SSM params, M-RoPE sections, shared
+    /// expert and MTP drop. Skipped cleanly when the model is not present.
+    #[test]
+    fn detect_qwen35moe_hybrid_metadata() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-models/gguf/qwen36-moe.gguf"
+        );
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skipping: {path} not present");
+            return;
+        }
+        let gguf = Gguf::open(path).expect("open qwen36 gguf");
+        let desc = ModelDescriptor::detect(&gguf).expect("detect qwen35moe");
+        assert_eq!(desc.arch, "qwen35moe");
+        // 41 blocks total, 1 MTP head dropped → 40 trunk layers.
+        assert_eq!(desc.params.block_count, 40);
+        assert_eq!(desc.layer_kinds.len(), 40);
+        assert_eq!(desc.params.hidden_size, 2048);
+        assert_eq!(desc.params.n_heads, 16);
+        assert_eq!(desc.params.n_kv_heads, 2);
+        assert_eq!(desc.params.head_dim, 256);
+        assert_eq!(desc.params.full_attention_interval, 4);
+        assert!((desc.params.rope_theta - 1.0e7).abs() < 1.0);
+        assert_eq!(desc.params.rope_sections, Some([11, 11, 10, 0]));
+        assert!(desc.params.attn_gated);
+
+        // Hybrid rule: (idx+1) % 4 == 0 → attention, else DeltaNet.
+        for (il, &kind) in desc.layer_kinds.iter().enumerate() {
+            let want = if (il + 1) % 4 == 0 {
+                LayerKind::Attention
+            } else {
+                LayerKind::DeltaNet
+            };
+            assert_eq!(kind, want, "layer {il} kind");
+        }
+        // Layers 0,1,2 are DeltaNet; layer 3 is attention.
+        assert_eq!(desc.layer_kinds[0], LayerKind::DeltaNet);
+        assert_eq!(desc.layer_kinds[3], LayerKind::Attention);
+
+        let ssm = desc.params.ssm.as_ref().expect("qwen35moe has SSM params");
+        assert_eq!(ssm.d_conv, 4);
+        assert_eq!(ssm.d_inner, 4096);
+        assert_eq!(ssm.d_state, 128);
+        assert_eq!(ssm.dt_rank, 32);
+        assert_eq!(ssm.n_group, 16);
+        assert_eq!(ssm.n_k_heads(), 16);
+        assert_eq!(ssm.n_v_heads(), 32);
+        assert_eq!(ssm.key_dim(), 2048);
+        assert_eq!(ssm.value_dim(), 4096);
+        assert_eq!(ssm.conv_dim(), 8192);
+
+        let moe = desc.params.moe.as_ref().expect("qwen35moe is MoE");
+        assert_eq!(moe.n_experts, 256);
+        assert_eq!(moe.n_experts_used, 8);
+        assert_eq!(moe.moe_intermediate_size, 512);
+        assert_eq!(moe.shared_intermediate_size, 512);
+
+        // DeltaNet layer 0 resolved its SSM tensors, not attention Q/K/V.
+        let l0 = &desc.layers[0];
+        assert!(l0.contains_key(&WeightRole::SsmInProj));
+        assert!(l0.contains_key(&WeightRole::SsmConv1d));
+        assert!(l0.contains_key(&WeightRole::SsmOut));
+        assert!(l0.contains_key(&WeightRole::FfnGateInpShExp));
+        assert!(!l0.contains_key(&WeightRole::AttnQ));
+        // Attention layer 3 resolved Q/K/V + QK-norm, not SSM tensors.
+        let l3 = &desc.layers[3];
+        assert!(l3.contains_key(&WeightRole::AttnQ));
+        assert!(l3.contains_key(&WeightRole::AttnQNorm));
+        assert!(!l3.contains_key(&WeightRole::SsmInProj));
+        // Every trunk layer carries routed + shared expert weights.
+        for m in &desc.layers {
+            assert!(m.contains_key(&WeightRole::FfnGateExps));
+            assert!(m.contains_key(&WeightRole::FfnDownShExp));
         }
     }
 

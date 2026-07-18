@@ -47,8 +47,30 @@ Ostatnia aktualizacja: 2026-07-18.
   model / MTP / EAGLE proposerów i tree-verification w silniku. To rusztowanie,
   nie działająca akceleracja.
 - 🟡 **§4.2 Rejestr architektur**: qwen3, llama, mistral, olmoe (MoE), qwen3moe
-  (MoE). Brak: DeepSeek (MLA), Gemma (sliding-window), Phi, hybrydy SSM/Mamba
-  (qwen35moe = Qwen3.6 hybrid SSM+MoE wymaga kerneli Gated-DeltaNet — poza MoE).
+  (MoE). Brak: DeepSeek (MLA), Gemma (sliding-window), Phi.
+- 🟡 **§4.2 qwen35moe (Qwen3.6-35B-A3B hybrid SSM+MoE)** — rozpoczęte:
+  - ✅ **Rejestr architektury** (`forge-formats/arch.rs::build_qwen35moe` +
+    `arch/qwen35moe.ron`): wykrywanie z GGUF, reguła warstw hybrydowych
+    (`(idx+1)%full_attention_interval==0` → atencja, reszta → Gated-DeltaNet;
+    dla 40 warstw atencja na 3,7,…,39), parsowanie `ssm.*`, sekcje M-RoPE
+    `[11,11,10,0]`, shared expert + jego bramka, głowa MTP/NextN (warstwa 40)
+    pomijana. Typy `LayerKind`, `SsmParams`, pola `Hyperparams.{ssm,rope_sections,
+    full_attention_interval,attn_gated}`, `ModelDescriptor.layer_kinds`. Test
+    `detect_qwen35moe_hybrid_metadata` waliduje na realnym GGUF.
+  - ✅ **Referencja CPU Gated-DeltaNet** (`forge-formats/deltanet.rs`): causal
+    conv1d (dowolne K) + reguła delta z bramkowaniem (autoregresyjny krok,
+    dokładny port `delta-net-base.cpp`) + gated-RMSNorm + log-decay/softplus +
+    L2-norm; testy numeryczne. To oracle dla kernela Mojo i silnika.
+  - ❌ **Kernele Mojo**: hd256 flash-attention (decode split + prefill + combine,
+    obecnie tylko hd64/hd128), depthwise conv1d_k4, recurrent Gated-DeltaNet scan,
+    gated-RMSNorm, partial M-RoPE dla hd256. Wymaga PTX rebuild + launchery + golden.
+  - ❌ **Stan SSM w KV** (`SeqKv`): rezydentny bufor stanu `[n_v_heads, d_state,
+    d_state]` + `[conv_dim, d_conv-1]` per warstwa DeltaNet, obok paged KV dla
+    warstw atencji.
+  - ❌ **Forward hybrydowy w silniku**: dispatch per-`LayerKind`, bramkowana
+    atencja hd256, ścieżka DeltaNet (conv+scan+gated norm), MoE z shared expert
+    w tej ścieżce, prefill sekwencyjny + decode. Cel bramki: spójny tekst
+    zgodny z llama.cpp (~194 tok/s referencyjnie na RTX 4090).
 - 🟡 **§9.2 Odporność**: admission ✅; brak respawn workera po crashu, health
   per-GPU, pełnego graceful drain.
 - 🟡 **§8.3 Operacyjność**: /healthz ✅; brak metryk Prometheus/OTel, hot reload.

@@ -266,10 +266,12 @@ Uwaga metodyczna: prefill mierzony do pierwszego WIDOCZNEGO tokenu (zawiera
 - **safetensors + HF config** — BF16/F16/F32; compressed-tensors
   `nvfp4-pack-quantized` (NVFP4, programowy FP4) i `float-quantized`
   (FP8 → f16 przy ładowaniu); sharding przez `model.safetensors.index.json`.
-- Architektury: qwen3, llama, mistral, **olmoe** (MoE), **qwen3moe** (MoE)
+- Architektury: qwen3, llama, mistral, **olmoe** (MoE), **qwen3moe** (MoE),
+  **qwen35moe** (hybrid SSM+MoE — tylko detekcja/rejestr, patrz sekcja MoE)
   (rejestr deklaratywny w forge-formats); Whisper (osobny silnik); modele
   embeddingowe (pooling z metadanych).
-- head_dim: 64 i 128 (specjalizacje attention); inne → jasny błąd.
+- head_dim: 64 i 128 (specjalizacje attention generacji); inne (np. 256 w
+  qwen35moe) → jasny błąd, do czasu kerneli hd256.
 
 ## MoE (Mixture-of-Experts)
 
@@ -287,9 +289,26 @@ Uwaga metodyczna: prefill mierzony do pierwszego WIDOCZNEGO tokenu (zawiera
   (wybór ekspertów zależny od danych → brak CUDA-graph). Perf-follow-up:
   grouped-GEMM permute/unpermute i batched-MoE decode.
 - Warstwy MTP/NextN (`nextn_predict_layers`) są pomijane w podstawowej generacji.
-- Hybrydy SSM+MoE (np. `qwen35moe` = Qwen3.6-35B-A3B, z warstwami Gated-DeltaNet)
-  są NIEWSPIERANE — wymagają kerneli skanu SSM (osobny projekt); ładowanie zwraca
-  jasny błąd „unsupported arch", nie generuje śmieci.
+
+### qwen35moe (Qwen3.6-35B-A3B, hybrid SSM+MoE) — W TOKU
+
+- **Rejestr architektury** jest wpięty (`forge-formats`): detekcja z GGUF,
+  reguła warstw hybrydowych (`(idx+1)%full_attention_interval==0` → pełna
+  atencja, reszta → Gated-DeltaNet; interval 4 → atencja na warstwach 3,7,…,39
+  z 40 warstw trunku), parsowanie `ssm.*` (`conv_kernel=4`, `inner_size=4096`,
+  `state_size=128`, `time_step_rank=32`, `group_count=16`), sekcje M-RoPE
+  `[11,11,10,0]` (dla pozycji tekstowych M-RoPE redukuje się do NEOX partial
+  rotary po pierwszych 64 wymiarach), shared expert (256 ekspertów, top-8 +
+  gated shared, `expert_feed_forward_length=512`) i pomijanie głowy MTP
+  (warstwa 40). Atencja: `head_dim=256`, bramkowane wyjście Q (`wq` szerokości
+  `head_dim*n_heads*2`), per-head QK-norm.
+- **Referencja CPU Gated-DeltaNet** (`forge-formats::deltanet`): causal conv1d,
+  reguła delta z bramkowaniem (krok autoregresyjny), gated-RMSNorm — numeryczne
+  oracle dla przyszłego kernela/silnika.
+- **Nie generuje jeszcze**: brak kerneli Mojo (hd256 attention, conv1d_k4,
+  recurrent scan, gated norm), stanu SSM w `SeqKv` i hybrydowego forwardu w
+  silniku. `forge run qwen36-moe.gguf …` kończy się jasnym błędem ładowania
+  (warstwy DeltaNet nie mają tensorów attn_q/k/v) — NIE generuje śmieci.
 
 ## Ograniczenia znane (uczciwie)
 
@@ -304,5 +323,6 @@ Uwaga metodyczna: prefill mierzony do pierwszego WIDOCZNEGO tokenu (zawiera
   `examples/kv_tier_longctx.rs`).
 - ONNX: niewspierany (planowany). TTS: brak silnika (planowany).
 - MoE: tylko single-stream decode + KV f16 (patrz sekcja MoE); hybrydy SSM+MoE
-  (Qwen3.6 `qwen35moe`) niewspierane.
+  (Qwen3.6 `qwen35moe`) — rejestr + referencja CPU są, generacja jeszcze nie
+  (brak kerneli Gated-DeltaNet + hd256 attention; patrz sekcja qwen35moe).
 - `logprobs`/`n>1` w API: jeszcze nie.
