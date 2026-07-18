@@ -155,3 +155,5 @@ refactor. Gate reviews: end of each chunk ≥5.
 2. Golden numerics vs CPU reference (tolerance per dtype).
 3. codex review of the diff (gpt-5.6-sol) — findings fixed before next chunk.
 4. No stubs/TODO/placeholder code (repo rule).
+5. Every new/changed user-facing parameter (CLI flag, API field, env var) is
+   documented in `docs/INFER_CONFIGURATION.md` IN THE SAME COMMIT.
