@@ -52,7 +52,7 @@ enum Command {
         /// at least one full `--ctx` window if smaller.
         #[arg(long, default_value_t = 512)]
         kv_pages: usize,
-        /// Max context length per request (0 = model max, capped at 32768).
+        /// Max context length per request in tokens (0 = the model's maximum).
         #[arg(long = "ctx", default_value_t = 0)]
         ctx: usize,
         /// Weights pool size in GiB.
@@ -107,8 +107,8 @@ enum Command {
         /// KV cache element type: f16 | fp8 (fp8 halves KV memory/bandwidth).
         #[arg(long = "kv-cache", default_value = "f16")]
         kv_cache: String,
-        /// Max context length (0 = the model's own max, capped at 32768). The
-        /// KV cache is sized for this; a request cannot exceed it.
+        /// Max context length in tokens (0 = the model's own maximum). Any
+        /// value is honored; the KV cache is sized to fit it (VRAM permitting).
         #[arg(long = "ctx", default_value_t = 0)]
         ctx: usize,
     },
@@ -285,16 +285,15 @@ fn load_for_serve(
 
 /// Load a model for one-shot commands, sizing pools from free VRAM.
 /// Resolve the usable context length and the KV page count that covers it.
-/// `requested == 0` means "the model's own maximum"; either way it is capped
-/// at `CTX_CEILING` so a default run never tries to reserve an absurd KV pool.
-const CTX_CEILING: usize = 32_768;
-
+/// `requested == 0` defaults to the model's own maximum; a non-zero request is
+/// honored as-is (down to a single page, up to the model's positional limit).
+/// Whether the resulting KV pool fits VRAM is decided later by pool sizing.
 fn resolve_ctx(max_position_embeddings: usize, requested: usize, page_size: usize) -> (usize, usize) {
     let model_max = max_position_embeddings.max(page_size);
     let target = if requested == 0 {
-        model_max.min(CTX_CEILING)
+        model_max
     } else {
-        requested.min(model_max)
+        requested.min(model_max).max(1)
     };
     (target, target.div_ceil(page_size))
 }
