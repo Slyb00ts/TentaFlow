@@ -120,4 +120,29 @@ impl Tokenizer {
     pub fn inner(&self) -> &tokenizers::Tokenizer {
         &self.inner
     }
+
+    /// Per-token raw output bytes for the whole vocabulary, indexed by token
+    /// id. `None` marks special/added tokens (chat markers, EOS, control) that
+    /// contribute no grammar bytes — constrained decoding masks those out.
+    /// Used to drive the byte-level grammar engine (SPEC §8.1.2).
+    pub fn token_byte_table(&self) -> Vec<Option<Vec<u8>>> {
+        let mode = crate::rawbytes::detect_raw_byte_mode(self);
+        let added = self.inner.get_added_vocabulary();
+        let n = self.vocab_size();
+        let mut table = Vec::with_capacity(n);
+        for id in 0..n as u32 {
+            let entry = match self.inner.id_to_token(id) {
+                Some(piece) => {
+                    if added.is_special_token(&piece) {
+                        None
+                    } else {
+                        crate::rawbytes::piece_raw_bytes(mode, &piece)
+                    }
+                }
+                None => None,
+            };
+            table.push(entry);
+        }
+        table
+    }
 }

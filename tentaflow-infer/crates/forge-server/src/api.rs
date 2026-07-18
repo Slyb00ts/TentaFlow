@@ -66,9 +66,28 @@ pub struct ChatCompletionRequest {
     /// OpenAI tool definitions, passed verbatim to the chat template.
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
-    /// "auto" (default), "none", or an unsupported forcing spec.
+    /// "auto" (default), "none", "required", or a named function forcing spec.
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// OpenAI `response_format`: `{"type":"text"}` (default),
+    /// `{"type":"json_object"}` (any valid JSON) or
+    /// `{"type":"json_schema","json_schema":{"schema":{...}}}`
+    /// (schema-constrained). Non-standard extensions:
+    /// `{"type":"regex","regex":"..."}` and `{"type":"grammar","grammar":"..."}`.
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
+    /// GBNF/EBNF grammar passthrough (non-standard; constrains the output).
+    #[serde(default)]
+    pub grammar: Option<String>,
+}
+
+/// A tool the model must call (from `tool_choice` "required" / named).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolForcing {
+    /// Any one of the request's tools.
+    Any,
+    /// One named function.
+    Named(String),
 }
 
 /// How this request wants tool calling handled.
@@ -259,42 +278,93 @@ impl ChatCompletionRequest {
         )
     }
 
-    /// Validate `tool_choice`. Only "auto" and "none" are implemented;
-    /// "required" and named function forcing need constrained decoding
-    /// (SPEC §8.1.1) and are rejected honestly instead of being ignored.
+    /// Whether tools are rendered into the template and parsed out of the
+    /// output. "required" and named forcing both render+parse (like "auto");
+    /// the forcing itself is applied via constrained decoding — see
+    /// [`ChatCompletionRequest::tool_forcing`].
     pub fn tool_mode(&self) -> Result<ToolMode, ApiError> {
-        let has_tools = match &self.tools {
-            None | Some(serde_json::Value::Null) => false,
-            Some(serde_json::Value::Array(a)) => !a.is_empty(),
-            Some(_) => {
-                return Err(ApiError::invalid_request(
-                    "tools must be an array of tool definitions",
-                ))
-            }
-        };
+        let has_tools = self.has_tools()?;
         match &self.tool_choice {
             None => {}
             Some(serde_json::Value::String(s)) => match s.as_str() {
-                "auto" => {}
+                "auto" | "required" => {}
                 "none" => return Ok(ToolMode::None),
-                "required" => {
-                    return Err(ApiError::invalid_request(
-                        "tool_choice \"required\" is not implemented by this server",
-                    ))
-                }
                 other => {
                     return Err(ApiError::invalid_request(format!(
-                        "tool_choice {other:?} is not one of \"auto\", \"none\""
+                        "tool_choice {other:?} is not one of \"auto\", \"none\", \"required\""
                     )))
                 }
             },
+            // A named-function forcing object renders + parses like "auto".
+            Some(serde_json::Value::Object(_)) => {}
             Some(_) => {
                 return Err(ApiError::invalid_request(
-                    "named tool_choice forcing is not implemented by this server",
+                    "tool_choice must be a string or a function-forcing object",
                 ))
             }
         }
         Ok(if has_tools { ToolMode::Auto } else { ToolMode::None })
+    }
+
+    fn has_tools(&self) -> Result<bool, ApiError> {
+        match &self.tools {
+            None | Some(serde_json::Value::Null) => Ok(false),
+            Some(serde_json::Value::Array(a)) => Ok(!a.is_empty()),
+            Some(_) => Err(ApiError::invalid_request(
+                "tools must be an array of tool definitions",
+            )),
+        }
+    }
+
+    /// Resolve `tool_choice` "required" / named forcing (SPEC §8.1.1): the
+    /// model is constrained to emit a valid call. `None` = no forcing.
+    pub fn tool_forcing(&self) -> Result<Option<ToolForcing>, ApiError> {
+        if !self.has_tools()? {
+            // "required" with no tools is a client error; "auto"/"none" fine.
+            if matches!(&self.tool_choice, Some(serde_json::Value::String(s)) if s == "required")
+                || matches!(&self.tool_choice, Some(serde_json::Value::Object(_)))
+            {
+                return Err(ApiError::invalid_request(
+                    "tool_choice forcing requires a non-empty `tools` array",
+                ));
+            }
+            return Ok(None);
+        }
+        match &self.tool_choice {
+            Some(serde_json::Value::String(s)) if s == "required" => Ok(Some(ToolForcing::Any)),
+            Some(serde_json::Value::Object(o)) => {
+                let name = o
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .ok_or_else(|| {
+                        ApiError::invalid_request(
+                            "named tool_choice must be {\"type\":\"function\",\"function\":{\"name\":...}}",
+                        )
+                    })?;
+                Ok(Some(ToolForcing::Named(name.to_string())))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The `(name, parameters-schema)` pairs of this request's function tools.
+    pub fn tool_definitions(&self) -> Vec<(String, serde_json::Value)> {
+        let Some(serde_json::Value::Array(tools)) = &self.tools else {
+            return Vec::new();
+        };
+        tools
+            .iter()
+            .filter_map(|t| {
+                let f = t.get("function")?;
+                let name = f.get("name")?.as_str()?.to_string();
+                let params = f
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+                Some((name, params))
+            })
+            .collect()
     }
 }
 
@@ -765,22 +835,33 @@ mod tests {
         }));
         assert_eq!(r.tool_mode().unwrap(), ToolMode::None);
 
-        // Forcing modes are honestly rejected, not silently ignored.
+        // Forcing modes now render + parse like "auto" (the forcing itself is
+        // applied via constrained decoding).
         let r = chat_req(serde_json::json!({
             "model": "m", "messages": [{"role": "user", "content": "hi"}],
             "tools": tools, "tool_choice": "required"
         }));
-        assert_eq!(
-            r.tool_mode().unwrap_err().status,
-            axum::http::StatusCode::BAD_REQUEST
-        );
+        assert_eq!(r.tool_mode().unwrap(), ToolMode::Auto);
+        assert_eq!(r.tool_forcing().unwrap(), Some(ToolForcing::Any));
+
         let r = chat_req(serde_json::json!({
             "model": "m", "messages": [{"role": "user", "content": "hi"}],
             "tools": tools,
             "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
         }));
+        assert_eq!(r.tool_mode().unwrap(), ToolMode::Auto);
         assert_eq!(
-            r.tool_mode().unwrap_err().status,
+            r.tool_forcing().unwrap(),
+            Some(ToolForcing::Named("get_weather".into()))
+        );
+
+        // "required" with no tools is a client error.
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "required"
+        }));
+        assert_eq!(
+            r.tool_forcing().unwrap_err().status,
             axum::http::StatusCode::BAD_REQUEST
         );
     }

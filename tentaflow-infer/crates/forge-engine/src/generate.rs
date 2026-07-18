@@ -13,6 +13,10 @@ pub struct GenerateRequest {
     pub stop: Vec<String>,
     /// EOS ids terminate generation silently (not emitted).
     pub eos_ids: Vec<u32>,
+    /// Constrained decoding (SPEC §8.1.2): when set, a per-step logit mask
+    /// forces the output to conform to the grammar. Forces the CPU sampler
+    /// (full logits on the host) so the mask applies before selection.
+    pub grammar: Option<forge_grammar::GrammarProgram>,
 }
 
 #[derive(Debug)]
@@ -70,7 +74,11 @@ fn run(
     seq: &mut crate::kv::SeqKv,
     on_event: &mut impl FnMut(StreamEvent),
 ) -> Result<Generated> {
-    let mut source = if model.gpu_sampling_supported(&req.sampling) {
+    // Constrained decoding runs on the CPU sampler: the mask must apply to the
+    // full host logits before selection. Unconstrained requests keep the GPU
+    // sampler whenever the params fit its kernels (path byte-identical).
+    let mut matcher = req.grammar.as_ref().map(|g| g.matcher());
+    let mut source = if matcher.is_none() && model.gpu_sampling_supported(&req.sampling) {
         NextSource::Gpu(GpuSampler::new(req.sampling.clone()))
     } else {
         NextSource::Cpu(Sampler::new(req.sampling.clone()))
@@ -91,9 +99,17 @@ fn run(
     // First draw comes from the prefill logits (still resident on device for
     // the GPU path); subsequent draws ride the decode step.
     let mut next = match &mut source {
-        NextSource::Cpu(s) => s.sample(&logits, &tokens)?,
+        NextSource::Cpu(s) => {
+            if let Some(m) = &matcher {
+                m.apply_mask(&mut logits);
+            }
+            s.sample(&logits, &tokens)?
+        }
         NextSource::Gpu(g) => model.sample_last_logits(g)?,
     };
+    if let Some(m) = &mut matcher {
+        m.accept_token(next);
+    }
     for _ in 0..req.max_tokens {
         if req.eos_ids.contains(&next) {
             finish = FinishReason::Eos;
@@ -123,6 +139,9 @@ fn run(
         next = match &mut source {
             NextSource::Cpu(s) => {
                 logits = model.step(seq, next)?;
+                if let Some(m) = &matcher {
+                    m.apply_mask(&mut logits);
+                }
                 s.sample(&logits, &tokens)?
             }
             NextSource::Gpu(g) => {
@@ -130,6 +149,9 @@ fn run(
                 model.step_and_sample(seq, next, g)?
             }
         };
+        if let Some(m) = &mut matcher {
+            m.accept_token(next);
+        }
     }
 
     // Flush the decoder tail unless a stop consumed the stream. Flushed text

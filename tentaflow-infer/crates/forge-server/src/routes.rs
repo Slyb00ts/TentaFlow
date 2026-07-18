@@ -179,6 +179,7 @@ async fn start_generation(
     state: &Arc<ServerState>,
     input: GenInput,
     spec: GenerationSpec,
+    grammar: Option<forge_grammar::GrammarProgram>,
 ) -> Result<tokio::sync::mpsc::Receiver<EngineEvent>, ApiError> {
     let permit = state
         .slots
@@ -206,6 +207,7 @@ async fn start_generation(
                 sampling: spec.sampling.clone(),
                 stop: spec.stop.clone(),
                 eos_ids: st.eos_ids.clone(),
+                grammar,
             })
             .map_err(|e| ApiError::internal(e.to_string()))
     })
@@ -497,7 +499,14 @@ pub async fn chat_completions(
         ToolMode::Auto => (state.tool_parser, req.tools.clone()),
         ToolMode::None => (ToolParserKind::None, None),
     };
-    let rx = match start_generation(&state, GenInput::Chat(req.messages, tools), spec).await {
+    // Constrained decoding (SPEC §8.1.2): response_format / grammar / forced
+    // tool_choice compile to a grammar the sampler must obey.
+    let grammar = match state.grammar.resolve(&req, parser_kind) {
+        Ok(g) => g,
+        Err(e) => return e.into_response(),
+    };
+    let rx = match start_generation(&state, GenInput::Chat(req.messages, tools), spec, grammar).await
+    {
         Ok(rx) => rx,
         Err(e) => return e.into_response(),
     };
@@ -582,7 +591,7 @@ pub async fn completions(
         Ok(p) => p.to_string(),
         Err(e) => return e.into_response(),
     };
-    let rx = match start_generation(&state, GenInput::Text(prompt), spec).await {
+    let rx = match start_generation(&state, GenInput::Text(prompt), spec, None).await {
         Ok(rx) => rx,
         Err(e) => return e.into_response(),
     };

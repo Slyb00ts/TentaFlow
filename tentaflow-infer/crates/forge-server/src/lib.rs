@@ -7,6 +7,7 @@
 
 pub mod api;
 pub mod error;
+pub mod grammar;
 pub mod routes;
 pub mod source;
 pub mod toolcall;
@@ -74,6 +75,9 @@ pub struct ServerState {
     pub created: u64,
     /// Which tool-call syntax to parse out of this model's output.
     pub tool_parser: toolcall::ToolParserKind,
+    /// Constrained-decoding engine (SPEC §8.1.2): compiles `response_format` /
+    /// `tool_choice` / `grammar` into shared automata + the vocab byte table.
+    pub grammar: grammar::GrammarEngine,
     /// Optional Whisper STT model backing /v1/audio/transcriptions.
     pub whisper: Option<SharedWhisper>,
     /// Admission cap for transcription requests: each admitted request may
@@ -103,6 +107,7 @@ impl ServerState {
         embed: Option<SharedEmbed>,
     ) -> Arc<Self> {
         let queue_limit = max_active.saturating_mul(4).clamp(16, 256);
+        let grammar = grammar::GrammarEngine::new(&tokenizer, &eos_ids);
         Arc::new(Self {
             engine,
             tokenizer,
@@ -120,6 +125,7 @@ impl ServerState {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             tool_parser,
+            grammar,
             whisper,
             stt_slots: tokio::sync::Semaphore::new(4),
             embed,

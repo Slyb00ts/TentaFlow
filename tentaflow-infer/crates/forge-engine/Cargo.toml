@@ -11,6 +11,7 @@ forge-hal.workspace = true
 forge-kernels.workspace = true
 forge-formats.workspace = true
 forge-tokenize.workspace = true
+forge-grammar.workspace = true
 half.workspace = true
 bytemuck.workspace = true
 tracing.workspace = true

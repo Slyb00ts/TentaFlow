@@ -8,25 +8,10 @@
 // incomplete sequence. Decoding a window (not single ids) also keeps
 // context-sensitive decoders correct (SPM `▁` strip, Fuse, ByteFallback).
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
-
 use forge_types::Result;
 
+use crate::rawbytes::{piece_raw_bytes, RawByteMode};
 use crate::tokenizer::Tokenizer;
-
-/// How raw bytes are reconstructed from vocab pieces, to tell a genuinely
-/// generated U+FFFD apart from an incomplete multi-byte tail.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RawByteMode {
-    /// GPT-2 byte-level alphabet: every piece char maps back to one byte.
-    ByteLevel,
-    /// SPM byte fallback: `<0xXX>` pieces are single bytes, other pieces are
-    /// text with `▁` for spaces.
-    ByteFallback,
-    /// Unrecognized decoder: raw bytes unavailable, hold back conservatively.
-    Unknown,
-}
 
 pub struct StreamDecoder<'t> {
     tokenizer: &'t Tokenizer,
@@ -45,7 +30,7 @@ impl<'t> StreamDecoder<'t> {
         Self {
             tokenizer,
             skip_special_tokens,
-            raw_mode: detect_raw_byte_mode(tokenizer),
+            raw_mode: crate::rawbytes::detect_raw_byte_mode(tokenizer),
             ids: Vec::new(),
             prefix_offset: 0,
             read_offset: 0,
@@ -119,24 +104,7 @@ impl<'t> StreamDecoder<'t> {
             if self.skip_special_tokens && added.is_special_token(&piece) {
                 continue;
             }
-            match self.raw_mode {
-                RawByteMode::ByteLevel => {
-                    let mut utf8 = [0u8; 4];
-                    for c in piece.chars() {
-                        match byte_level_char_to_byte(c) {
-                            Some(b) => bytes.push(b),
-                            // Added tokens (chat markers etc.) are stored as
-                            // plain text, not in the byte-level alphabet.
-                            None => bytes.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes()),
-                        }
-                    }
-                }
-                RawByteMode::ByteFallback => match parse_byte_fallback_piece(&piece) {
-                    Some(b) => bytes.push(b),
-                    None => bytes.extend_from_slice(piece.replace('▁', " ").as_bytes()),
-                },
-                RawByteMode::Unknown => unreachable!(),
-            }
+            bytes.extend(piece_raw_bytes(self.raw_mode, &piece)?);
         }
         Some(bytes)
     }
@@ -157,55 +125,3 @@ fn ends_with_incomplete_utf8(mut bytes: &[u8]) -> bool {
     }
 }
 
-/// Classify the tokenizer's decoder to pick the piece→bytes strategy. The
-/// decoder wrappers keep their internals private, so the serialized form
-/// (stable `"type"` tags) is inspected instead.
-fn detect_raw_byte_mode(tokenizer: &Tokenizer) -> RawByteMode {
-    let Some(decoder) = tokenizer.inner().get_decoder() else {
-        return RawByteMode::Unknown;
-    };
-    let Ok(json) = serde_json::to_string(decoder) else {
-        return RawByteMode::Unknown;
-    };
-    if json.contains("\"type\":\"ByteLevel\"") {
-        RawByteMode::ByteLevel
-    } else if json.contains("\"type\":\"ByteFallback\"") {
-        RawByteMode::ByteFallback
-    } else {
-        RawByteMode::Unknown
-    }
-}
-
-/// SPM byte-fallback piece `<0xXX>` → byte value.
-fn parse_byte_fallback_piece(piece: &str) -> Option<u8> {
-    let hex = piece.strip_prefix("<0x")?.strip_suffix('>')?;
-    if hex.len() != 2 {
-        return None;
-    }
-    u8::from_str_radix(hex, 16).ok()
-}
-
-/// Inverse of the GPT-2 byte→unicode alphabet: printable latin bytes map to
-/// themselves, the remaining 68 bytes map to U+0100.. in byte order.
-fn byte_level_char_to_byte(c: char) -> Option<u8> {
-    static TABLE: OnceLock<HashMap<char, u8>> = OnceLock::new();
-    let table = TABLE.get_or_init(|| {
-        let printable = |b: u32| {
-            (0x21..=0x7E).contains(&b) || (0xA1..=0xAC).contains(&b) || (0xAE..=0xFF).contains(&b)
-        };
-        let mut map = HashMap::with_capacity(256);
-        let mut n = 0u32;
-        for b in 0u32..256 {
-            let c = if printable(b) {
-                char::from_u32(b).unwrap()
-            } else {
-                let c = char::from_u32(256 + n).unwrap();
-                n += 1;
-                c
-            };
-            map.insert(c, b as u8);
-        }
-        map
-    });
-    table.get(&c).copied()
-}

@@ -173,7 +173,21 @@ Ostatnia aktualizacja: 2026-07-18.
 - ❌ **§5.3 GDS/cuFile**, hot-swap modeli, **multi-LoRA** (S-LoRA)
 
 ### API / serwowanie
-- ❌ **§8.1.2 Constrained decoding** (JSON-schema / regex / EBNF grammar mask) — duże
+- ✅ **§8.1.2 Constrained decoding** (JSON-schema / regex / EBNF-GBNF) — `forge-grammar`:
+  jeden byte-level automat (llama.cpp-kompatybilne GBNF; JSON Schema i regex → ten
+  sam automat), per-sekwencja `GrammarMatcher` liczy maskę logitów (token dozwolony
+  ⇔ jego bajty utrzymują gramatykę spełnialną, z obsługą fragmentów UTF-8 /
+  byte-fallback), maska ustawia `-inf` PRZED próbkowaniem (greedy i stochastyczne).
+  Cache masek per stan + prefiltr pierwszego bajtu. Wpięte w API: `response_format`
+  `{json_object|json_schema|regex|grammar}`, GBNF passthrough (`grammar`),
+  `tool_choice` `required`/named → gramatyka wymuszająca poprawne wywołanie (znosi
+  dawne 400). Ścieżka nieograniczona bit-identyczna (golden Bielik NVFP4 bez zmian).
+  Dowód (RTX 4090, qwen3-0.6b Q8_0, `tests/e2e_constrained.rs`): JSON-schema
+  `{name,age}` 5/5 promptów (w tym adversarialne) = 100% poprawnego JSON pasującego
+  do schematu; regex daty `\d{4}-\d{2}-\d{2}` = 100%; `tool_choice required` =
+  poprawne wywołanie 3/3. Koszt: ~48 tok/s constrained vs ~800 tok/s unconstrained
+  (CPU sampler + skan słownika; v1 correctness-first). Ograniczenia subsetu JSON
+  Schema — patrz INFER_CONFIGURATION.md.
 - ❌ **§8.1.2 Prompt caching** jako kontrakt API (cache_control/prompt_cache_key)
 - ❌ **§8.1.2** logit_bias, min_tokens, n/best-of, **logprobs**, echo
 - ❌ **§8.1 Anthropic API** (/v1/messages), images endpoint
@@ -202,7 +216,6 @@ Ostatnia aktualizacja: 2026-07-18.
 | MoE (kernele + expert streaming) | duży | odblokowuje DeepSeek/Mixtral/Qwen-MoE |
 | Modalności TTS/T2I/Video | duży (każda) | osobne silniki |
 | ONNX loader | duży | import opset 17+ subset |
-| Constrained decoding (grammar) | średni | JSON/regex/EBNF → automat → maska GPU |
 | Radix prefix cache | średni | duży zysk dla multi-turn |
 | FORGE-RPC / Realtime / Batch API | średni (każdy) | |
 | Spekulacja wpięta w decode | średni | framework już jest |
@@ -210,5 +223,5 @@ Ostatnia aktualizacja: 2026-07-18.
 
 Wniosek: rdzeń jednokartowego LLM/STT/embeddings jest mocny i produkcyjny,
 ale to ~1/3 zakresu spec. Największe brakujące dźwignie wartości: multivendor
-HAL, MoE, radix prefix cache, constrained decoding, ONNX. Największe "całe
+HAL, MoE, radix prefix cache, ONNX. Największe "całe
 pillary": multivendor i multi-node.

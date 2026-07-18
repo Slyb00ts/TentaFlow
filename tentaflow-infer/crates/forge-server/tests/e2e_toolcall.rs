@@ -160,19 +160,30 @@ async fn qwen3_tool_calls_end_to_end() {
         }
     }]);
 
-    // tool_choice "required" is not implemented and must fail honestly.
+    // tool_choice "required" (SPEC §8.1.1): constrained decoding forces a
+    // syntactically valid tool call every time.
     let resp = client
         .post(format!("{base}/v1/chat/completions"))
         .json(&serde_json::json!({
             "model": "qwen3-0.6b",
             "messages": [{"role": "user", "content": "hi"}],
             "tools": tools,
-            "tool_choice": "required"
+            "tool_choice": "required",
+            "temperature": 0.0,
+            "max_tokens": 256
         }))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400);
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let forced = &body["choices"][0]["message"]["tool_calls"];
+    let forced = forced.as_array().expect("forced tool_calls array");
+    assert!(!forced.is_empty(), "required must yield a tool call: {body}");
+    assert_eq!(forced[0]["function"]["name"], "get_weather");
+    let forced_args = forced[0]["function"]["arguments"].as_str().unwrap();
+    let _: serde_json::Value =
+        serde_json::from_str(forced_args).expect("forced arguments must be valid JSON");
 
     // Non-streaming tool call.
     let resp = client

@@ -18,6 +18,8 @@ pub enum ForgeError {
     Unsupported(String),
     #[error("tokenizer error: {0}")]
     Tokenizer(String),
+    #[error("grammar error: {0}")]
+    Grammar(String),
     #[error("scheduler error: {0}")]
     Scheduler(String),
     #[error("io error: {0}")]

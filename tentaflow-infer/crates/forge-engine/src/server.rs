@@ -22,6 +22,10 @@ pub struct EngineRequest {
     pub sampling: SamplingParams,
     pub stop: Vec<String>,
     pub eos_ids: Vec<u32>,
+    /// Constrained decoding (SPEC §8.1.2): when set, the sequence samples on
+    /// the CPU with a per-step grammar logit mask, so its output can only
+    /// conform to the grammar.
+    pub grammar: Option<forge_grammar::GrammarProgram>,
 }
 
 #[derive(Debug)]
@@ -90,6 +94,8 @@ struct ActiveSeq<'t> {
     generated: Vec<u32>,
     max_tokens: usize,
     eos_ids: Vec<u32>,
+    /// Live grammar state for constrained decoding; `None` = unconstrained.
+    matcher: Option<forge_grammar::GrammarMatcher>,
     prompt_len: usize,
     /// Prompt tokens served from the prefix cache (SPEC §5.2), reported in the
     /// completion usage as `cached_tokens`.
@@ -236,7 +242,11 @@ fn worker<'t>(
             }
             let prompt = sub.req.prompt_tokens;
             let prompt_len = prompt.len();
-            let sampler = if model.gpu_sampling_supported(&sub.req.sampling) {
+            // Constrained requests must sample on the CPU (the grammar mask
+            // needs the full host logits before selection); unconstrained
+            // requests keep the GPU sampler whenever it fits.
+            let matcher = sub.req.grammar.as_ref().map(|g| g.matcher());
+            let sampler = if matcher.is_none() && model.gpu_sampling_supported(&sub.req.sampling) {
                 SeqSampler::Gpu(GpuSampler::new(sub.req.sampling.clone()))
             } else {
                 SeqSampler::Cpu(Sampler::new(sub.req.sampling.clone()))
@@ -256,6 +266,7 @@ fn worker<'t>(
                 generated: Vec::new(),
                 max_tokens: sub.req.max_tokens.max(1),
                 eos_ids: sub.req.eos_ids,
+                matcher,
                 prompt_len,
                 cache_read,
                 next: None,
@@ -400,8 +411,16 @@ fn advance(model: &mut Model, a: &mut ActiveSeq<'_>, prefill_chunk: usize) -> Re
         .take()
         .ok_or_else(|| ForgeError::Scheduler("missing next-token state".into()))?
     {
-        PendingNext::Logits(logits) => match &mut a.sampler {
-            SeqSampler::Cpu(s) => s.sample(&logits, &a.generated)?,
+        PendingNext::Logits(mut logits) => match &mut a.sampler {
+            SeqSampler::Cpu(s) => {
+                // Constrained decoding: forbid every non-conforming token
+                // before selection so the sampled id always advances the
+                // grammar.
+                if let Some(m) = &a.matcher {
+                    m.apply_mask(&mut logits);
+                }
+                s.sample(&logits, &a.generated)?
+            }
             SeqSampler::Gpu(_) => {
                 return Err(ForgeError::Scheduler(
                     "GPU-sampled sequence carried host logits".into(),
@@ -410,6 +429,9 @@ fn advance(model: &mut Model, a: &mut ActiveSeq<'_>, prefill_chunk: usize) -> Re
         },
         PendingNext::Token(t) => t,
     };
+    if let Some(m) = &mut a.matcher {
+        m.accept_token(next);
+    }
 
     if let StepOutcome::Finished = emit_token(a, next)? {
         return Ok(());

@@ -267,11 +267,59 @@ Endpointy: `/v1/chat/completions`, `/v1/completions`, `/v1/models`,
 Usage: `usage.prompt_tokens_details.cached_tokens` raportuje prefiks promptu
 obsłużony z radix prefix-cache (SPEC §5.2; pomijane gdy 0) — patrz sekcja
 „Radix prefix cache".
-| `tools` / `tool_choice` | — | `tools` musi być tablicą; `tool_choice`: `auto`/`none` (`required`/named → 400 not_implemented). Odpowiedź: `tool_calls[]`, `finish_reason:"tool_calls"`. |
+| `tools` / `tool_choice` | — | `tools` musi być tablicą; `tool_choice`: `auto`/`none`/`required`/named. `required`/named wymuszają poprawne wywołanie przez constrained decoding (patrz niżej). Odpowiedź: `tool_calls[]`, `finish_reason:"tool_calls"`. |
+| `response_format` | — | Constrained decoding — patrz niżej. |
+| `grammar` | — | Passthrough gramatyki GBNF/EBNF (root `root`). Constrained decoding. |
 | `n` | 1 | `n>1` → 400 (na razie). |
 
 Myślenie (`<think>…</think>`, np. Qwen3) jest ekstrahowane do
 `reasoning_content` (nie liczy się jako content).
+
+### Constrained decoding (SPEC §8.1.2)
+
+Silnik może fizycznie NIE wygenerować wyjścia łamiącego gramatykę: na każdym
+kroku dekodowania maska logitów ustawia `-inf` każdemu tokenowi, którego bajty
+nie utrzymują gramatyki spełnialną, PRZED próbkowaniem (działa dla greedy i
+stochastycznego). Trzy front-endy kompilują się do jednego byte-level automatu
+(`forge-grammar`):
+
+- **`response_format: {"type":"json_object"}`** — dowolny poprawny JSON.
+- **`response_format: {"type":"json_schema","json_schema":{"schema":{…}}}`** —
+  JSON zgodny ze schematem.
+- **`response_format: {"type":"regex","regex":"…"}`** — całe wyjście pasuje do
+  regexa (rozszerzenie poza OpenAI).
+- **`response_format: {"type":"grammar","grammar":"…"}`** lub top-level
+  **`grammar`** — gramatyka GBNF/EBNF (kompatybilna z llama.cpp; root `root`).
+- **`tool_choice: "required"`** / **`{"type":"function","function":{"name":…}}`**
+  — model MUSI wyemitować poprawne wywołanie: parametry narzędzia (JSON Schema)
+  są kompilowane do gramatyki owiniętej w składnię tool-call modelu (obecnie
+  Hermes/Qwen; inne parsery → 400). Parser i tak dekoduje wynik do `tool_calls[]`.
+
+Automaty są prekompilowane i cache'owane per napis gramatyki; maski dozwolonych
+tokenów są cache'owane per stan parsera + prefiltr pierwszego bajtu.
+
+Obsługiwany subset **JSON Schema**: `object` (`properties`, `required`,
+zagnieżdżenia), `array` (`items` — bez formy krotkowej), `string`
+(+ `pattern` przez konwerter regex — alfabet wzorca nie może wymagać
+escapowania JSON), `integer`, `number`, `boolean`, `null`, `enum`, `const`.
+Niewspierane (świadomie): `anyOf`/`oneOf`/`allOf`/`$ref`, krotkowe `items`,
+`additionalProperties:false` NIE jest osobno egzekwowane (nienazwane klucze po
+prostu nie są generowane), a własność bez jawnej listy `required` jest
+traktowana jak wymagana (ograniczenie wymusza kanoniczną, zgodną ze schematem
+postać, nie akceptując dowolnej kolejności). Wewnętrzny „insignificant
+whitespace" to co najwyżej jeden opcjonalny znak (nieograniczone `*` pozwoliłoby
+greedy modelowi zawiesić się na spacjach).
+
+**Regex** (subset): literały, `.`, klasy `[...]` (zakresy/negacja +
+`\d \w \s \D \W \S`), grupy `(...)`/`(?:...)`, alternacja `|`, kwantyfikatory
+`* + ? {n} {n,} {n,m}` (leniwe `?`/`+` akceptowane i ignorowane), kotwice `^`/`$`
+akceptowane i ignorowane. Bez backreferencji/lookaround/nazwanych grup.
+
+**Wydajność**: ścieżka constrained wymusza CPU sampler (maska potrzebuje pełnych
+logitów na hoście) i skan słownika per krok — v1 stawia na poprawność, nie
+prędkość. Pomiar (RTX 4090, qwen3-0.6b Q8_0): ~48 tok/s constrained vs ~800 tok/s
+unconstrained. Ścieżka bez ograniczeń jest bit-identyczna (golden Bielik NVFP4
+bez zmian).
 
 `POST /v1/embeddings`: `input` (string/tablica/tokeny), `encoding_format`
 (`float`|`base64`), `dimensions` (trunkacja Matryoshka + renormalizacja).

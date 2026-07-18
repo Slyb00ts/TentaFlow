@@ -2,6 +2,7 @@
 
 mod chat;
 mod gguf;
+mod rawbytes;
 mod stop;
 mod stream;
 mod tokenizer;
