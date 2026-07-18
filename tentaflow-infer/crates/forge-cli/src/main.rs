@@ -48,9 +48,13 @@ enum Command {
         /// Prompt tokens one sequence may prefill per scheduler iteration.
         #[arg(long, default_value_t = 16)]
         prefill_chunk: usize,
-        /// KV cache pages (32 tokens each) shared by all sequences.
+        /// KV cache pages (32 tokens each) shared by all sequences. Raised to
+        /// at least one full `--ctx` window if smaller.
         #[arg(long, default_value_t = 512)]
         kv_pages: usize,
+        /// Max context length per request (0 = model max, capped at 32768).
+        #[arg(long = "ctx", default_value_t = 0)]
+        ctx: usize,
         /// Weights pool size in GiB.
         #[arg(long, default_value_t = 16.0)]
         weights_pool_gb: f64,
@@ -156,6 +160,7 @@ fn main() -> Result<()> {
             whisper_model,
             embed_model,
             kv_cache,
+            ctx,
         } => cmd_serve(
             &model_path,
             bind,
@@ -169,6 +174,7 @@ fn main() -> Result<()> {
             whisper_model.as_deref(),
             embed_model.as_deref(),
             parse_kv_dtype(&kv_cache)?,
+            ctx,
         ),
         Command::Embed {
             model_path,
@@ -239,11 +245,23 @@ fn load_for_serve(
     kv_pages: usize,
     weights_pool_gb: f64,
     kv_dtype: DType,
-) -> Result<(LoadedModel, usize)> {
+    ctx: usize,
+) -> Result<(LoadedModel, usize, usize)> {
     let kv_page_size = ModelConfig::default().kv_page_size;
     let desc = read_descriptor(path)?;
+    // The shared KV pool must hold at least one full-context sequence.
+    let (max_seq_len, ctx_pages) =
+        resolve_ctx(desc.params.max_position_embeddings, ctx, kv_page_size);
+    let kv_pages = kv_pages.max(ctx_pages);
     let kv_pool = kv_pool_bytes(&desc, kv_page_size, kv_pages, kv_dtype).max(1 << 30);
-    let weights = (weights_pool_gb * (1u64 << 30) as f64) as usize;
+    let activations = 1usize << 30;
+    // Clamp the requested weights pool so weights + KV + activations always fit
+    // free VRAM — a large --ctx grows KV and must not OOM the pool arenas.
+    let free = CudaDevice::free_vram(0).context("query free VRAM")?;
+    let weights_budget = free.saturating_sub(kv_pool + activations + (512 << 20));
+    let weights = ((weights_pool_gb * (1u64 << 30) as f64) as usize)
+        .min(weights_budget)
+        .max(1 << 30);
     let device = CudaDevice::new(
         0,
         PoolSizes {
@@ -259,10 +277,10 @@ fn load_for_serve(
         kv_page_size,
         kv_pages,
         kv_dtype,
-        ..ModelConfig::default()
+        max_seq_len,
     };
     let loaded = load_model(dev, path, cfg)?;
-    Ok((loaded, kv_pages))
+    Ok((loaded, kv_pages, max_seq_len))
 }
 
 /// Load a model for one-shot commands, sizing pools from free VRAM.
@@ -481,10 +499,12 @@ fn cmd_serve(
     whisper_model: Option<&Path>,
     embed_model: Option<&Path>,
     kv_dtype: DType,
+    ctx: usize,
 ) -> Result<()> {
     let max_active = usize::from(max_active);
     let t0 = Instant::now();
-    let (loaded, kv_pages) = load_for_serve(model_path, kv_pages, weights_pool_gb, kv_dtype)?;
+    let (loaded, kv_pages, max_seq_len) =
+        load_for_serve(model_path, kv_pages, weights_pool_gb, kv_dtype, ctx)?;
     tracing::info!(
         "loaded {} ({}) in {:.1}s: {} layers, kv_pages={}",
         model_path.display(),
@@ -499,13 +519,9 @@ fn cmd_serve(
     let tokenizer = Arc::new(loaded.bundle.tokenizer);
     // Per-request token budget: the engine caps a sequence at max_seq_len
     // pages; the model itself caps positional embeddings.
-    let max_context = loaded
-        .model
-        .weights
-        .descriptor
-        .params
-        .max_position_embeddings
-        .min(ModelConfig::default().max_seq_len);
+    // The engine caps a sequence at the configured context; the model's own
+    // positional limit is already folded into max_seq_len by resolve_ctx.
+    let max_context = max_seq_len;
     let tool_parser = ToolParserKind::resolve(
         tool_call_parser.as_deref(),
         &loaded.model.weights.descriptor.arch,
