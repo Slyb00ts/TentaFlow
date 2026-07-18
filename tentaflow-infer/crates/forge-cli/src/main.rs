@@ -45,6 +45,10 @@ enum Command {
         /// Max concurrently decoding sequences.
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
         max_active: u16,
+        /// Minimum simultaneously-decoding sequences before the batched forward
+        /// path engages (below it the tuned fused single-seq path is faster).
+        #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u16).range(2..))]
+        batch_min: u16,
         /// Prompt tokens one sequence may prefill per scheduler iteration.
         #[arg(long, default_value_t = 16)]
         prefill_chunk: usize,
@@ -153,6 +157,7 @@ fn main() -> Result<()> {
             model_id,
             api_key,
             max_active,
+            batch_min,
             prefill_chunk,
             kv_pages,
             weights_pool_gb,
@@ -167,6 +172,7 @@ fn main() -> Result<()> {
             model_id,
             api_key,
             max_active,
+            batch_min,
             prefill_chunk,
             kv_pages,
             weights_pool_gb,
@@ -491,6 +497,7 @@ fn cmd_serve(
     model_id: Option<String>,
     api_key: Option<String>,
     max_active: u16,
+    batch_min: u16,
     prefill_chunk: usize,
     kv_pages: usize,
     weights_pool_gb: f64,
@@ -533,7 +540,13 @@ fn cmd_serve(
     // weights move into the engine worker.
     let served_is_embed =
         resolve_pooling(model_path, &loaded.model.weights.descriptor) != PoolingType::None;
-    let engine = spawn_engine(loaded.model, tokenizer.clone(), max_active, prefill_chunk);
+    let engine = forge_engine::server::spawn_engine_batched(
+        loaded.model,
+        tokenizer.clone(),
+        max_active,
+        prefill_chunk,
+        batch_min as usize,
+    );
 
     let whisper = match whisper_model {
         Some(dir) => {

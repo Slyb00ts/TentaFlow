@@ -6,6 +6,7 @@
 // adds the previous sublayer's output and produces the next sublayer's
 // normed input.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -16,7 +17,7 @@ use forge_types::{DType, ForgeError, MemKind, Result};
 use half::f16;
 
 use crate::kv::{KvCache, KvConfig, SeqKv};
-use crate::sample::{GpuSampler, SamplingParams};
+use crate::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use crate::weights::{DevWeight, GateUpWeights, ModelWeights, QkvWeights};
 
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
@@ -145,6 +146,14 @@ pub struct Model {
     prefill_bufs: Option<PrefillBufs>,
     /// Captured decode step; replayed per token (inputs are device-resident).
     decode_graph: Option<ExecGraph>,
+    /// Continuous-batching decode scratch (sized for `batch_cap` sequences),
+    /// allocated on the first `ensure_batch`.
+    batch_bufs: Option<BatchBufs>,
+    /// Per-bucket captured batched forward+logits graphs (bucket = padded
+    /// batch size). Replayed for any live batch that rounds up to the bucket.
+    batch_graphs: HashMap<usize, ExecGraph>,
+    /// Largest batch the scratch is provisioned for (0 until `ensure_batch`).
+    batch_cap: usize,
 }
 
 /// Persistent per-step activation buffers. Fixed addresses are what makes the
@@ -212,6 +221,54 @@ struct PrefillBufs {
     down: DevBuffer,
     ids: DevBuffer,
     positions: DevBuffer,
+}
+
+/// Persistent continuous-batching decode scratch sized for `cap` sequences.
+/// Activation matrices are `[cap, cols]` row-major (the batched GEMM/attention
+/// kernels consume them directly, one row per active sequence). Per-step inputs
+/// (ids/positions/seq_lens/page_table) and per-seq sampling params live in
+/// device buffers refreshed by one async H2D per replay, so the forward+logits
+/// path is CUDA-graph-replayable per batch-size bucket.
+struct BatchBufs {
+    cap: usize,
+    h: DevBuffer,
+    x: DevBuffer,
+    q: DevBuffer,
+    k: DevBuffer,
+    v: DevBuffer,
+    attn_parts: DevBuffer,
+    attn_out: DevBuffer,
+    o_out: DevBuffer,
+    gate: DevBuffer,
+    up: DevBuffer,
+    act: DevBuffer,
+    down: DevBuffer,
+    logits: DevBuffer,
+    ids: DevBuffer,
+    positions: DevBuffer,
+    seq_lens: DevBuffer,
+    page_table: DevBuffer,
+    /// Pinned staging: [ids | positions | seq_lens], i32, cap each.
+    pinned_meta: DevBuffer,
+    pinned_pt: DevBuffer,
+    /// Per-seq sampling params (device + pinned staging).
+    samp_k: DevBuffer,
+    samp_inv_t: DevBuffer,
+    samp_top_p: DevBuffer,
+    samp_min_p: DevBuffer,
+    samp_seed: DevBuffer,
+    samp_step: DevBuffer,
+    pinned_samp: DevBuffer,
+    /// Repetition-penalty staging: flat distinct-id list, prefix offsets,
+    /// per-seq penalty.
+    pen_ids: DevBuffer,
+    pen_offsets: DevBuffer,
+    pen_vals: DevBuffer,
+    pinned_pen_ids: DevBuffer,
+    pinned_pen_offsets: DevBuffer,
+    pinned_pen_vals: DevBuffer,
+    out_ids: DevBuffer,
+    pinned_out: DevBuffer,
 }
 
 impl Model {
@@ -335,6 +392,9 @@ impl Model {
             bufs,
             prefill_bufs: None,
             decode_graph: None,
+            batch_bufs: None,
+            batch_graphs: HashMap::new(),
+            batch_cap: 0,
         })
     }
 
@@ -1985,5 +2045,419 @@ impl Model {
 
         kernels.rmsnorm_h32_f16(&b.x, &b.h, &b.h32, &self.weights.output_norm, 1, hidden, eps, stream)?;
         self.logits_gemv(&b.logits, &b.x, stream)
+    }
+
+    /// Batched logit head: y[b, vocab] f32 = lm_head · x[b, hidden]. The head
+    /// is always f16 or Q8_0 (NVFP4 heads are materialized as f16 at load), so
+    /// the two batched f32-output GEMMs cover every model.
+    fn logits_gemm(&self, y_f32: &DevBuffer, x: &DevBuffer, n_tokens: usize, stream: &Stream) -> Result<()> {
+        match &self.weights.lm_head {
+            DevWeight::F16 { buf, rows, cols } => self
+                .kernels
+                .gemm_f16_out_f32_at(y_f32, buf, 0, x, *rows, *cols, n_tokens, stream),
+            DevWeight::Q8_0 { buf, rows, cols } => self
+                .kernels
+                .gemm_q8_0_out_f32_at(y_f32, buf, 0, x, *rows, *cols, n_tokens, stream),
+            _ => Err(ForgeError::Unsupported(
+                "batched logits head must be f16 or q8_0".into(),
+            )),
+        }
+    }
+
+    /// Smallest captured bucket >= `n`: a power of two, capped at `batch_cap`.
+    /// A live batch replays the smallest bucket that holds it (dead lanes pad
+    /// up to the bucket and are never sampled).
+    fn bucket_for(&self, n: usize) -> usize {
+        let mut s = 1;
+        while s < n {
+            s *= 2;
+        }
+        s.min(self.batch_cap).max(1)
+    }
+
+    /// Provision the continuous-batching decode scratch for up to `cap`
+    /// sequences. Idempotent; a larger `cap` than a previous call reallocates.
+    pub fn ensure_batch(&mut self, cap: usize) -> Result<()> {
+        let cap = cap.max(1);
+        if self.batch_bufs.as_ref().is_some_and(|b| b.cap >= cap) {
+            return Ok(());
+        }
+        let p = &self.weights.descriptor.params;
+        let hidden = p.hidden_size;
+        let q_dim = p.n_heads * p.head_dim;
+        let kv_dim = p.n_kv_heads * p.head_dim;
+        let inter = p.intermediate_size;
+        let vocab = p.vocab_size;
+        let mpp = self.max_pages_per_seq;
+        let max_seq = self.kv.cfg.max_pages_per_seq * self.kv.cfg.page_size;
+        let dev = &self.device;
+        let f16 = |elems: usize| dev.alloc(elems * 2, MemKind::Device, Pool::Activations);
+        let f32b = |elems: usize| dev.alloc(elems * 4, MemKind::Device, Pool::Activations);
+        let pin = |bytes: usize| dev.alloc(bytes, MemKind::PinnedHost, Pool::Activations);
+        self.batch_bufs = Some(BatchBufs {
+            cap,
+            h: f16(cap * hidden)?,
+            x: f16(cap * hidden)?,
+            q: f16(cap * q_dim)?,
+            k: f16(cap * kv_dim)?,
+            v: f16(cap * kv_dim)?,
+            attn_parts: f32b(cap * p.n_heads * ATTN_DECODE_SPLITS * (p.head_dim + 2))?,
+            attn_out: f16(cap * q_dim)?,
+            o_out: f16(cap * hidden)?,
+            gate: f16(cap * inter)?,
+            up: f16(cap * inter)?,
+            act: f16(cap * inter)?,
+            down: f16(cap * hidden)?,
+            logits: f32b(cap * vocab)?,
+            ids: f32b(cap)?,
+            positions: f32b(cap)?,
+            seq_lens: f32b(cap)?,
+            page_table: f32b(cap * mpp)?,
+            pinned_meta: pin(cap * 3 * 4)?,
+            pinned_pt: pin(cap * mpp * 4)?,
+            samp_k: f32b(cap)?,
+            samp_inv_t: f32b(cap)?,
+            samp_top_p: f32b(cap)?,
+            samp_min_p: f32b(cap)?,
+            samp_seed: dev.alloc(cap * 8, MemKind::Device, Pool::Activations)?,
+            samp_step: dev.alloc(cap * 8, MemKind::Device, Pool::Activations)?,
+            pinned_samp: pin(cap * (4 * 4 + 2 * 8))?,
+            pen_ids: f32b(cap * max_seq)?,
+            pen_offsets: f32b(cap + 1)?,
+            pen_vals: f32b(cap)?,
+            pinned_pen_ids: pin(cap * max_seq * 4)?,
+            pinned_pen_offsets: pin((cap + 1) * 4)?,
+            pinned_pen_vals: pin(cap * 4)?,
+            out_ids: f32b(cap)?,
+            pinned_out: pin(cap * 4)?,
+        });
+        // Fresh scratch invalidates any graph captured against the old buffers.
+        self.batch_graphs.clear();
+        self.batch_cap = cap;
+        Ok(())
+    }
+
+    /// Record one batched forward + logit head over `n` rows into the model
+    /// stream (no sampling — that runs param-dependent, outside the graph).
+    /// Mirrors the prefill dataflow (rmsnorm rows=n, batched GEMM projections,
+    /// row-batched silu/residual) but swaps causal prefill attention for the
+    /// per-sequence paged flash-decode (attn_decode_split over n_seqs=n).
+    fn record_batch_forward(&self, n: usize) -> Result<()> {
+        let p = self.weights.descriptor.params.clone();
+        let hidden = p.hidden_size;
+        let inter = p.intermediate_size;
+        let q_dim = p.n_heads * p.head_dim;
+        let kv_dim = p.n_kv_heads * p.head_dim;
+        let eps = p.rms_norm_eps;
+        let scale = 1.0 / (p.head_dim as f32).sqrt();
+        let kernels = &self.kernels;
+        let stream = &self.stream;
+        let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
+        let n_layers = self.weights.layers.len();
+
+        kernels.gather_rows_f16(&bb.h, &self.weights.token_embd_f16, &bb.ids, n, hidden, stream)?;
+        kernels.rmsnorm_f16(&bb.x, &bb.h, &self.weights.layers[0].attn_norm, n, hidden, eps, stream)?;
+
+        for l in 0..n_layers {
+            let layer = &self.weights.layers[l];
+            // Raw q/k/v projections (no norm/rope here — attn_decode_split folds
+            // the q/k-norm + RoPE + paged append into its per-seq prologue).
+            match &layer.attn_qkv {
+                QkvWeights::Fused(w) => {
+                    self.gemm_rows(&bb.q, w, &bb.x, n, 0, q_dim, stream)?;
+                    self.gemm_rows(&bb.k, w, &bb.x, n, q_dim, kv_dim, stream)?;
+                    self.gemm_rows(&bb.v, w, &bb.x, n, q_dim + kv_dim, kv_dim, stream)?;
+                }
+                QkvWeights::FusedQk { qk, v } => {
+                    self.gemm_rows(&bb.q, qk, &bb.x, n, 0, q_dim, stream)?;
+                    self.gemm_rows(&bb.k, qk, &bb.x, n, q_dim, kv_dim, stream)?;
+                    self.gemm(&bb.v, v, &bb.x, n, stream)?;
+                }
+                QkvWeights::Split { q, k, v } => {
+                    self.gemm(&bb.q, q, &bb.x, n, stream)?;
+                    self.gemm(&bb.k, k, &bb.x, n, stream)?;
+                    self.gemm(&bb.v, v, &bb.x, n, stream)?;
+                }
+            }
+            kernels.attn_decode_split(
+                &bb.attn_parts,
+                &bb.q,
+                0,
+                &bb.k,
+                0,
+                &bb.v,
+                0,
+                layer.q_norm.as_ref(),
+                layer.k_norm.as_ref(),
+                &self.kv.k[l],
+                &self.kv.v[l],
+                &bb.page_table,
+                &bb.seq_lens,
+                &bb.positions,
+                n,
+                p.n_heads,
+                p.n_kv_heads,
+                p.head_dim,
+                self.kv.cfg.page_size,
+                self.max_pages_per_seq,
+                ATTN_DECODE_SPLITS,
+                self.kv.cfg.dtype,
+                eps,
+                p.rope_theta,
+                scale,
+                stream,
+            )?;
+            kernels.attn_decode_combine_f16(
+                &bb.attn_out,
+                &bb.attn_parts,
+                n,
+                p.n_heads,
+                p.head_dim,
+                ATTN_DECODE_SPLITS,
+                stream,
+            )?;
+            self.gemm(&bb.o_out, &layer.attn_o, &bb.attn_out, n, stream)?;
+            kernels.rmsnorm_residual_f16(&bb.x, &bb.h, &bb.o_out, &layer.ffn_norm, n, hidden, eps, stream)?;
+
+            match &layer.ffn_gate_up {
+                GateUpWeights::Fused(w) => {
+                    self.gemm_rows(&bb.gate, w, &bb.x, n, 0, inter, stream)?;
+                    self.gemm_rows(&bb.up, w, &bb.x, n, inter, inter, stream)?;
+                }
+                GateUpWeights::Split { gate, up } => {
+                    self.gemm(&bb.gate, gate, &bb.x, n, stream)?;
+                    self.gemm(&bb.up, up, &bb.x, n, stream)?;
+                }
+            }
+            kernels.silu_mul_f16(&bb.act, &bb.gate, &bb.up, n * inter, stream)?;
+            self.gemm(&bb.down, &layer.ffn_down, &bb.act, n, stream)?;
+
+            let next_norm = if l + 1 < n_layers {
+                &self.weights.layers[l + 1].attn_norm
+            } else {
+                &self.weights.output_norm
+            };
+            kernels.rmsnorm_residual_f16(&bb.x, &bb.h, &bb.down, next_norm, n, hidden, eps, stream)?;
+        }
+
+        self.logits_gemm(&bb.logits, &bb.x, n, stream)
+    }
+
+    /// Capture `record_batch_forward(bucket)` into a replayable graph.
+    fn capture_batch_forward(&self, bucket: usize) -> Result<ExecGraph> {
+        self.device.begin_capture(&self.stream)?;
+        match self.record_batch_forward(bucket) {
+            Ok(()) => self.device.end_capture(&self.stream),
+            Err(e) => {
+                let _ = self.device.end_capture(&self.stream);
+                Err(e)
+            }
+        }
+    }
+
+    /// Run one batched decode step: advance every sequence in `seqs` by its
+    /// input token in `tokens`, sampling each successor on the GPU with its own
+    /// params. Returns the `B` next-token ids. The forward+logit head replays a
+    /// per-bucket CUDA graph (dead lanes padded to the bucket, never sampled);
+    /// sampling runs after the replay so per-seq params (and the greedy/top-k
+    /// mix) need no re-capture.
+    pub fn batched_decode(
+        &mut self,
+        seqs: &mut [&mut SeqKv],
+        tokens: &[u32],
+        params: &[SeqSampleParams],
+    ) -> Result<Vec<u32>> {
+        let b = seqs.len();
+        if b == 0 {
+            return Ok(Vec::new());
+        }
+        if tokens.len() != b || params.len() != b {
+            return Err(ForgeError::Scheduler(
+                "batched_decode: seqs/tokens/params length mismatch".into(),
+            ));
+        }
+        self.ensure_batch(b)?;
+        let p = self.weights.descriptor.params.clone();
+        let bucket = self.bucket_for(b);
+        if b > self.batch_cap {
+            return Err(ForgeError::Scheduler(format!(
+                "batch {b} exceeds provisioned cap {}",
+                self.batch_cap
+            )));
+        }
+
+        // Grow each sequence by one token and gather its position/page table.
+        let mpp = self.max_pages_per_seq;
+        let mut meta = vec![0i32; bucket * 3]; // [ids | positions | seq_lens]
+        let mut pt = vec![-1i32; bucket * mpp];
+        for (i, seq) in seqs.iter_mut().enumerate() {
+            let pos = seq.len;
+            if pos >= p.max_position_embeddings {
+                return Err(ForgeError::Scheduler(format!(
+                    "position {pos} exceeds model context {}",
+                    p.max_position_embeddings
+                )));
+            }
+            self.kv.grow(seq)?;
+            meta[i] = tokens[i] as i32;
+            meta[bucket + i] = pos as i32;
+            meta[2 * bucket + i] = (pos + 1) as i32;
+            pt[i * mpp..i * mpp + seq.pages.len()].copy_from_slice(&seq.pages);
+        }
+        // Dead lanes replay sequence 0's inputs so they compute harmlessly.
+        let lane0_pt: Vec<i32> = pt[..mpp].to_vec();
+        for i in b..bucket {
+            meta[i] = meta[0];
+            meta[bucket + i] = meta[bucket];
+            meta[2 * bucket + i] = meta[2 * bucket];
+            pt[i * mpp..i * mpp + mpp].copy_from_slice(&lane0_pt);
+        }
+
+        let bb = self.batch_bufs.as_ref().expect("provisioned above");
+        // Upload meta (ids/positions/seq_lens) and the page table via pinned H2D.
+        let meta_host = bb.pinned_meta.host_ptr().expect("pinned mapping");
+        unsafe {
+            std::ptr::copy_nonoverlapping(meta.as_ptr() as *const u8, meta_host, bucket * 3 * 4);
+        }
+        self.device.copy(&bb.pinned_meta, 0, &bb.ids, 0, bucket * 4, &self.stream)?;
+        self.device
+            .copy(&bb.pinned_meta, bucket * 4, &bb.positions, 0, bucket * 4, &self.stream)?;
+        self.device
+            .copy(&bb.pinned_meta, 2 * bucket * 4, &bb.seq_lens, 0, bucket * 4, &self.stream)?;
+        let pt_host = bb.pinned_pt.host_ptr().expect("pinned mapping");
+        unsafe {
+            std::ptr::copy_nonoverlapping(pt.as_ptr() as *const u8, pt_host, bucket * mpp * 4);
+        }
+        self.device
+            .copy(&bb.pinned_pt, 0, &bb.page_table, 0, bucket * mpp * 4, &self.stream)?;
+
+        // Replay the bucket's forward+logits graph (capture on first use).
+        if !self.batch_graphs.contains_key(&bucket) {
+            let g = self.capture_batch_forward(bucket)?;
+            self.batch_graphs.insert(bucket, g);
+        }
+        let graph = self.batch_graphs.get(&bucket).expect("captured").clone();
+        self.device.launch_graph(&graph, &self.stream)?;
+
+        // Sample the B live rows on the GPU (outside the graph so the per-seq
+        // param mix is free). Greedy-only batches take the argmax fast path.
+        self.batch_sample(b, params)?;
+
+        let bb = self.batch_bufs.as_ref().expect("provisioned");
+        self.device.copy(&bb.out_ids, 0, &bb.pinned_out, 0, b * 4, &self.stream)?;
+        self.device.synchronize()?;
+        let op = bb.pinned_out.host_ptr().expect("pinned mapping") as *const i32;
+        let ids = unsafe { std::slice::from_raw_parts(op, b) };
+        let mut out = Vec::with_capacity(b);
+        for (i, &id) in ids.iter().enumerate() {
+            if id < 0 || id as usize >= p.vocab_size {
+                return Err(ForgeError::Kernel(format!(
+                    "batched sampler returned out-of-range token {id} for seq {i}"
+                )));
+            }
+            out.push(id as u32);
+        }
+        Ok(out)
+    }
+
+    /// GPU sampling over the `b` live logit rows currently in `batch_bufs`.
+    fn batch_sample(&mut self, b: usize, params: &[SeqSampleParams]) -> Result<()> {
+        let vocab = self.weights.descriptor.params.vocab_size;
+        let bb = self.batch_bufs.as_ref().expect("provisioned");
+        let stream = &self.stream;
+
+        // Repetition penalty (skipped when no sequence has one active).
+        let any_penalty = params.iter().any(|p| p.penalty != 1.0 && !p.penalty_ids.is_empty());
+        if any_penalty {
+            let mut ids_flat: Vec<i32> = Vec::new();
+            let mut offsets: Vec<i32> = Vec::with_capacity(b + 1);
+            let mut vals: Vec<f32> = Vec::with_capacity(b);
+            offsets.push(0);
+            for p in params.iter() {
+                if p.penalty != 1.0 {
+                    ids_flat.extend_from_slice(&p.penalty_ids);
+                }
+                offsets.push(ids_flat.len() as i32);
+                vals.push(if p.penalty_ids.is_empty() { 1.0 } else { p.penalty });
+            }
+            if ids_flat.len() * 4 > bb.pinned_pen_ids.len() {
+                return Err(ForgeError::Scheduler("penalty id staging overflow".into()));
+            }
+            Self::stage(&self.device, &bb.pinned_pen_ids, &bb.pen_ids, bytemuck::cast_slice(&ids_flat), stream)?;
+            Self::stage(&self.device, &bb.pinned_pen_offsets, &bb.pen_offsets, bytemuck::cast_slice(&offsets), stream)?;
+            Self::stage(&self.device, &bb.pinned_pen_vals, &bb.pen_vals, bytemuck::cast_slice(&vals), stream)?;
+            self.kernels
+                .sample_batched_penalize_f32(&bb.logits, vocab, &bb.pen_ids, &bb.pen_offsets, &bb.pen_vals, b, stream)?;
+        }
+
+        if params.iter().all(|p| p.greedy) {
+            self.kernels
+                .sample_batched_argmax_f32(&bb.out_ids, &bb.logits, b, vocab, stream)?;
+            return Ok(());
+        }
+
+        // Mixed / sampled batch: per-seq top-k (k = 1 lanes reproduce argmax).
+        let mut ks = Vec::with_capacity(b);
+        let mut inv_t = Vec::with_capacity(b);
+        let mut top_p = Vec::with_capacity(b);
+        let mut min_p = Vec::with_capacity(b);
+        let mut seed = Vec::with_capacity(b);
+        let mut step = Vec::with_capacity(b);
+        for p in params.iter() {
+            ks.push(p.k);
+            inv_t.push(p.inv_t);
+            top_p.push(p.top_p);
+            min_p.push(p.min_p);
+            seed.push(p.seed);
+            step.push(p.step);
+        }
+        // Params staged into one pinned block, then copied per array.
+        let host = bb.pinned_samp.host_ptr().expect("pinned mapping");
+        let mut off = 0usize;
+        let put = |bytes: &[u8], off: &mut usize| unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), host.add(*off), bytes.len());
+            *off += bytes.len();
+        };
+        put(bytemuck::cast_slice(&ks), &mut off);
+        put(bytemuck::cast_slice(&inv_t), &mut off);
+        put(bytemuck::cast_slice(&top_p), &mut off);
+        put(bytemuck::cast_slice(&min_p), &mut off);
+        put(bytemuck::cast_slice(&seed), &mut off);
+        put(bytemuck::cast_slice(&step), &mut off);
+        let mut o = 0usize;
+        self.device.copy(&bb.pinned_samp, o, &bb.samp_k, 0, b * 4, stream)?;
+        o += b * 4;
+        self.device.copy(&bb.pinned_samp, o, &bb.samp_inv_t, 0, b * 4, stream)?;
+        o += b * 4;
+        self.device.copy(&bb.pinned_samp, o, &bb.samp_top_p, 0, b * 4, stream)?;
+        o += b * 4;
+        self.device.copy(&bb.pinned_samp, o, &bb.samp_min_p, 0, b * 4, stream)?;
+        o += b * 4;
+        self.device.copy(&bb.pinned_samp, o, &bb.samp_seed, 0, b * 8, stream)?;
+        o += b * 8;
+        self.device.copy(&bb.pinned_samp, o, &bb.samp_step, 0, b * 8, stream)?;
+        self.kernels.sample_batched_topk_f32(
+            &bb.out_ids,
+            &bb.logits,
+            b,
+            vocab,
+            &bb.samp_k,
+            &bb.samp_inv_t,
+            &bb.samp_top_p,
+            &bb.samp_min_p,
+            &bb.samp_seed,
+            &bb.samp_step,
+            stream,
+        )
+    }
+
+    /// Copy `bytes` into a pinned staging buffer and enqueue the H2D to its
+    /// device buffer on `stream`.
+    fn stage(device: &Arc<dyn Device>, pinned: &DevBuffer, dev: &DevBuffer, bytes: &[u8], stream: &Stream) -> Result<()> {
+        let host = pinned.host_ptr().expect("pinned mapping");
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), host, bytes.len());
+        }
+        device.copy(pinned, 0, dev, 0, bytes.len(), stream)
     }
 }

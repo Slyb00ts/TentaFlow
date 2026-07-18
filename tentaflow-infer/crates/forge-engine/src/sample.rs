@@ -254,4 +254,50 @@ impl GpuSampler {
         self.step += 1;
         s
     }
+
+    /// Snapshot this sequence's params for one batched decode step, advancing
+    /// the deterministic draw counter exactly like `sample_last_logits`.
+    /// Greedy (temperature <= 0) collapses to `k = 1`, which the batched
+    /// top-k kernel resolves to the argmax (ties to the lowest id) — bit-exact
+    /// against the single-row greedy sampler.
+    pub fn batch_params(&mut self, vocab: usize) -> SeqSampleParams {
+        let p = &self.params;
+        let greedy = p.temperature <= 0.0;
+        let step = self.step;
+        self.step += 1;
+        SeqSampleParams {
+            greedy,
+            k: if greedy {
+                1
+            } else {
+                p.top_k.clamp(1, vocab) as i32
+            },
+            inv_t: if greedy { 1.0 } else { 1.0 / p.temperature },
+            top_p: p.top_p,
+            min_p: p.min_p,
+            seed: self.seed,
+            step,
+            penalty: p.repetition_penalty,
+            penalty_ids: if p.repetition_penalty != 1.0 {
+                self.penalized.clone()
+            } else {
+                Vec::new()
+            },
+        }
+    }
+}
+
+/// One sequence's sampling parameters for a batched decode step, flattened for
+/// upload into the per-seq GPU sampler param arrays.
+#[derive(Debug, Clone)]
+pub struct SeqSampleParams {
+    pub greedy: bool,
+    pub k: i32,
+    pub inv_t: f32,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub seed: u64,
+    pub step: u64,
+    pub penalty: f32,
+    pub penalty_ids: Vec<i32>,
 }

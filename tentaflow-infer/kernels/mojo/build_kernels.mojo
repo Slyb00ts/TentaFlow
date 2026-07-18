@@ -28,6 +28,8 @@ from src.gemv2 import gemv_q4_k_f16_v2, gemv_q4_k_out_f32_v2
 from src.gemv2 import gemv_q6_k_f16_v2, gemv_q6_k_out_f32_v2
 from src.gemm import gemm_q8_0_f16, gemm_nvfp4_f16, gemm_f16
 from src.gemm import gemm_q8_0_f16_bm64, gemm_nvfp4_f16_bm64, gemm_f16_bm64
+from src.gemm import gemm_f16_out_f32, gemm_f16_out_f32_bm64
+from src.gemm import gemm_q8_0_out_f32, gemm_q8_0_out_f32_bm64
 from src.gemm import gemm_q4_k_f16, gemm_q4_k_f16_bm64
 from src.gemm import gemm_q6_k_f16, gemm_q6_k_f16_bm64
 from src.prefill import kv_append_batch_f16, attn_prefill_f16_hd64, attn_prefill_f16_hd128
@@ -101,6 +103,7 @@ from src.decode_fused import gemv_norm_iq1_s_f16, gemv_norm_silu_iq1_s_f16, gemv
 from src.decode_fused import gemv_norm_iq1_m_f16, gemv_norm_silu_iq1_m_f16, gemv_residual_iq1_m_f16
 from src.sampling import penalize_f32, argmax_partial_f32, argmax_final_f32
 from src.sampling import topk_partial_f32, topk_final_f32
+from src.sampling import penalize_batched_f32, argmax_batched_f32, topk_batched_f32
 
 
 def _entry_from_ptx(ptx_path: Path) raises -> String:
@@ -235,6 +238,18 @@ def main() raises:
 
     _ = ctx.compile_function[gemm_f16_bm64, dump_asm=Path("gemm_f16_bm64.ptx")]()
     entries.append(_finalize(out_dir, "gemm_f16_bm64"))
+
+    _ = ctx.compile_function[gemm_f16_out_f32, dump_asm=Path("gemm_f16_out_f32.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_f16_out_f32"))
+
+    _ = ctx.compile_function[gemm_f16_out_f32_bm64, dump_asm=Path("gemm_f16_out_f32_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_f16_out_f32_bm64"))
+
+    _ = ctx.compile_function[gemm_q8_0_out_f32, dump_asm=Path("gemm_q8_0_out_f32.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_out_f32"))
+
+    _ = ctx.compile_function[gemm_q8_0_out_f32_bm64, dump_asm=Path("gemm_q8_0_out_f32_bm64.ptx")]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_out_f32_bm64"))
 
     _ = ctx.compile_function[kv_append_batch_f16, dump_asm=Path("kv_append_batch_f16.ptx")]()
     entries.append(_finalize(out_dir, "kv_append_batch_f16"))
@@ -400,6 +415,15 @@ def main() raises:
 
     _ = ctx.compile_function[topk_final_f32, dump_asm=Path("topk_final_f32.ptx")]()
     entries.append(_finalize(out_dir, "topk_final_f32"))
+
+    _ = ctx.compile_function[penalize_batched_f32, dump_asm=Path("penalize_batched_f32.ptx")]()
+    entries.append(_finalize(out_dir, "penalize_batched_f32"))
+
+    _ = ctx.compile_function[argmax_batched_f32, dump_asm=Path("argmax_batched_f32.ptx")]()
+    entries.append(_finalize(out_dir, "argmax_batched_f32"))
+
+    _ = ctx.compile_function[topk_batched_f32, dump_asm=Path("topk_batched_f32.ptx")]()
+    entries.append(_finalize(out_dir, "topk_batched_f32"))
 
     _ = ctx.compile_function[gemv_q5_k_f16_v2, dump_asm=Path("gemv_q5_k_f16_v2.ptx")]()
     entries.append(_finalize(out_dir, "gemv_q5_k_f16_v2"))

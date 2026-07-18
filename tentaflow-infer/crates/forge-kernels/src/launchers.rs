@@ -840,6 +840,173 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// f16 GEMM emitting f32 outputs over a row window of `w` (batched logit
+    /// head). Same grid/tiling as `gemm_f16_at`; the f32 store preserves the
+    /// mma accumulator precision so batched logits match the single-row
+    /// gemv_*_out_f32 path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_out_f32_at(
+        &self,
+        y_f32: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(8) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_f16_out_f32 requires cols % 8 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_f16_out_f32{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf_at(w, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Q8_0 GEMM emitting f32 outputs (batched logit head).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q8_0_out_f32_at(
+        &self,
+        y_f32: &DevBuffer,
+        w_q8: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_q8_0_out_f32 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
+        let k = self.artifacts.get(&format!("gemm_q8_0_out_f32{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y_f32)
+            .buf_at(w_q8, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Batched greedy argmax over `logits` ([n_seqs, vocab] f32): one block per
+    /// sequence, ties to the lowest id. `out_ids` receives n_seqs i32 token ids.
+    pub fn sample_batched_argmax_f32(
+        &self,
+        out_ids: &DevBuffer,
+        logits: &DevBuffer,
+        n_seqs: usize,
+        vocab: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("argmax_batched_f32")?;
+        let cfg = LaunchConfig {
+            grid: (n_seqs as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out_ids)
+            .buf(logits)
+            .scalar(vocab as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Batched categorical draw over `logits` ([n_seqs, vocab] f32) with
+    /// per-seq params (k / inv_temp / top_p / min_p / seed / step arrays, each
+    /// n_seqs long). `out_ids` receives n_seqs i32 token ids. `logits` is
+    /// mutated (top-k masking) — valid because it is regenerated every step.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_batched_topk_f32(
+        &self,
+        out_ids: &DevBuffer,
+        logits: &DevBuffer,
+        n_seqs: usize,
+        vocab: usize,
+        k_arr: &DevBuffer,
+        inv_t_arr: &DevBuffer,
+        top_p_arr: &DevBuffer,
+        min_p_arr: &DevBuffer,
+        seed_arr: &DevBuffer,
+        step_arr: &DevBuffer,
+        stream: &Stream,
+    ) -> Result<()> {
+        if vocab > SAMPLE_MAX_VOCAB {
+            return Err(ForgeError::Unsupported(format!(
+                "sample_batched_topk: vocab {vocab} exceeds {SAMPLE_MAX_VOCAB}"
+            )));
+        }
+        let k = self.artifacts.get("topk_batched_f32")?;
+        let cfg = LaunchConfig {
+            grid: (n_seqs as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out_ids)
+            .buf(logits)
+            .scalar(vocab as i64)
+            .buf(k_arr)
+            .buf(inv_t_arr)
+            .buf(top_p_arr)
+            .buf(min_p_arr)
+            .buf(seed_arr)
+            .buf(step_arr);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Batched in-place repetition penalty. `offsets` is n_seqs+1 i32 prefix
+    /// sums into the flat `ids` list; `penalties` is n_seqs f32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_batched_penalize_f32(
+        &self,
+        logits: &DevBuffer,
+        vocab: usize,
+        ids: &DevBuffer,
+        offsets: &DevBuffer,
+        penalties: &DevBuffer,
+        n_seqs: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("penalize_batched_f32")?;
+        let cfg = LaunchConfig {
+            grid: (n_seqs as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(logits)
+            .scalar(vocab as i64)
+            .buf(ids)
+            .buf(offsets)
+            .buf(penalties);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// Fused decode QKV post-processing: optional per-head q/k RMSNorm, neox
     /// RoPE on q and k, and the paged-cache k/v append in ONE launch. q/k/v
     /// are [heads, head_dim] rows addressed by byte offsets (sections of a

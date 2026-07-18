@@ -2550,6 +2550,271 @@ def gemm_iq1_m_impl[BM: Int, NW: Int](
     _store_tile(y, acc, t0, row0, warp_m, warp_n, group, tid4, n_rows, n_tokens)
 
 
+def _store_tile_f32(
+    y: UnsafePointer[Float32, MutAnyOrigin],
+    acc: InlineArray[SIMD[DType.float32, 4], 8],
+    t0: Int,
+    row0: Int,
+    warp_m: Int,
+    warp_n: Int,
+    group: Int,
+    tid4: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    """`_store_tile` writing f32 logits verbatim from the mma accumulator (no
+    f16 rounding), so batched logits keep the same precision as the single-row
+    gemv_*_out_f32 path."""
+    comptime for mi in range(2):
+        comptime for ni in range(4):
+            d = acc[mi * 4 + ni]
+            t = t0 + warp_m + mi * 16 + group
+            r = row0 + warp_n + ni * 8 + tid4 * 2
+            if t < n_tokens and r < n_rows:
+                y[t * n_rows + r] = d[0]
+                if r + 1 < n_rows:
+                    y[t * n_rows + r + 1] = d[1]
+            if t + 8 < n_tokens and r < n_rows:
+                y[(t + 8) * n_rows + r] = d[2]
+                if r + 1 < n_rows:
+                    y[(t + 8) * n_rows + r + 1] = d[3]
+
+
+def gemm_f16_out_f32_impl[BM: Int, NW: Int](
+    y: UnsafePointer[Float32, MutAnyOrigin],
+    w: UnsafePointer[Float16, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    """f16 tensor-core GEMM emitting f32 outputs (batched logit head). Same
+    tiling/dataflow as gemm_f16_impl; only the store keeps f32."""
+    comptime XTILE = BM * LDK
+    comptime NT = NW * WARP
+    comptime x_rpp = NT // 4
+    comptime w_passes = (BN * 4) // NT
+    comptime m_warps = BM // 32
+
+    tid = Int(thread_idx.x)
+    lane = tid % WARP
+    wid = tid // WARP
+    row0 = Int(block_idx.x) * BN
+    t0 = Int(block_idx.y) * BM
+
+    xs = stack_allocation[2 * XTILE, Float16, address_space = AddressSpace.SHARED]()
+    ws = stack_allocation[2 * WTILE, Float16, address_space = AddressSpace.SHARED]()
+
+    xrow = tid // 4
+    kc8 = (tid % 4) * 8
+    var xr0 = t0 + xrow
+    if xr0 > n_tokens - 1:
+        xr0 = n_tokens - 1
+    var xr1 = t0 + xrow + x_rpp
+    if xr1 > n_tokens - 1:
+        xr1 = n_tokens - 1
+    xsrc0 = (x + xr0 * n_cols + kc8).address_space_cast[AddressSpace.GLOBAL]()
+    xsrc1 = (x + xr1 * n_cols + kc8).address_space_cast[AddressSpace.GLOBAL]()
+    xdst0 = xs + xrow * LDK + kc8
+    xdst1 = xdst0 + x_rpp * LDK
+
+    wk = (tid % 4) * 8
+    var wsrc = InlineArray[
+        UnsafePointer[Float16, MutAnyOrigin, address_space = AddressSpace.GLOBAL],
+        w_passes,
+    ](uninitialized=True)
+
+    comptime for wp in range(w_passes):
+        var wn = row0 + tid // 4 + wp * (NT // 4)
+        if wn > n_rows - 1:
+            wn = n_rows - 1
+        wsrc[wp] = (w + wn * n_cols + wk).address_space_cast[AddressSpace.GLOBAL]()
+    wdst = ws + (tid // 4) * LDW + wk
+
+    group = lane >> 2
+    tid4 = lane & 3
+    warp_m = (wid % m_warps) * 32
+    warp_n = (wid // m_warps) * 32
+    sub = lane // 8
+    lr = lane % 8
+    a_base = xs + (warp_m + (sub % 2) * 8 + lr) * LDK + (sub // 2) * 8
+    b_base = ws + (warp_n + lr) * LDW + (sub % 2) * 8
+
+    var acc = InlineArray[SIMD[DType.float32, 4], 8](fill=SIMD[DType.float32, 4](0.0))
+    n_stages = (n_cols + BK - 1) // BK
+
+    def issue_w(
+        s: Int,
+        n_cols: Int,
+        wk: Int,
+        wsrc: InlineArray[
+            UnsafePointer[
+                Float16, MutAnyOrigin, address_space = AddressSpace.GLOBAL
+            ],
+            w_passes,
+        ],
+        wdst: UnsafePointer[
+            Float16, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+        ],
+    ):
+        k0 = s * BK
+
+        comptime for wp in range(w_passes):
+            if k0 + wk + 8 <= n_cols:
+                async_copy[16](
+                    wsrc[wp] + k0,
+                    wdst + (s % 2) * WTILE + wp * (NT // 4) * LDW,
+                )
+            else:
+                (wdst + (s % 2) * WTILE + wp * (NT // 4) * LDW).store[
+                    width=8, alignment=16
+                ](SIMD[DType.float16, 8](0.0))
+
+    _issue_x[BM, NW](0, n_cols, kc8, xsrc0, xsrc1, xdst0, xdst1)
+    issue_w(0, n_cols, wk, wsrc, wdst)
+    async_copy_commit_group()
+
+    var s = 0
+    while s < n_stages:
+        if s + 1 < n_stages:
+            _issue_x[BM, NW](s + 1, n_cols, kc8, xsrc0, xsrc1, xdst0, xdst1)
+            issue_w(s + 1, n_cols, wk, wsrc, wdst)
+            async_copy_commit_group()
+            async_copy_wait_group(1)
+        else:
+            async_copy_wait_group(0)
+        barrier()
+
+        buf = s % 2
+        comptime for k16 in range(BK // 16):
+            comptime kb = k16 * 16
+            a0 = ld_matrix[8](a_base + buf * XTILE + kb)
+            a1 = ld_matrix[8](a_base + buf * XTILE + kb + 16 * LDK)
+            comptime for ni in range(4):
+                b = ld_matrix[4](b_base + buf * WTILE + ni * 8 * LDW + kb)
+                mma(acc[ni], a0, b, acc[ni])
+                mma(acc[4 + ni], a1, b, acc[4 + ni])
+        barrier()
+        s += 1
+
+    _store_tile_f32(y, acc, t0, row0, warp_m, warp_n, group, tid4, n_rows, n_tokens)
+
+
+def gemm_q8_0_out_f32_impl[BM: Int, NW: Int](
+    y: UnsafePointer[Float32, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    """Q8_0 tensor-core GEMM emitting f32 outputs (batched logit head). Same
+    dataflow as gemm_q8_0_impl; only the store keeps f32."""
+    comptime XTILE = BM * LDK
+    comptime NT = NW * WARP
+    comptime x_rpp = NT // 4
+    comptime w_passes = (BN * 4) // NT
+    comptime m_warps = BM // 32
+
+    tid = Int(thread_idx.x)
+    lane = tid % WARP
+    wid = tid // WARP
+    row0 = Int(block_idx.x) * BN
+    t0 = Int(block_idx.y) * BM
+
+    xs = stack_allocation[2 * XTILE, Float16, address_space = AddressSpace.SHARED]()
+    ws = stack_allocation[2 * WTILE, Float16, address_space = AddressSpace.SHARED]()
+
+    xrow = tid // 4
+    kc8 = (tid % 4) * 8
+    var xr0 = t0 + xrow
+    if xr0 > n_tokens - 1:
+        xr0 = n_tokens - 1
+    var xr1 = t0 + xrow + x_rpp
+    if xr1 > n_tokens - 1:
+        xr1 = n_tokens - 1
+    xsrc0 = (x + xr0 * n_cols + kc8).address_space_cast[AddressSpace.GLOBAL]()
+    xsrc1 = (x + xr1 * n_cols + kc8).address_space_cast[AddressSpace.GLOBAL]()
+    xdst0 = xs + xrow * LDK + kc8
+    xdst1 = xdst0 + x_rpp * LDK
+
+    part = tid % 4
+    blocks_per_row = n_cols // 32
+    var wbase = InlineArray[UnsafePointer[UInt8, MutAnyOrigin], w_passes](
+        uninitialized=True
+    )
+
+    comptime for wp in range(w_passes):
+        var wrow = row0 + tid // 4 + wp * (NT // 4)
+        if wrow > n_rows - 1:
+            wrow = n_rows - 1
+        wbase[wp] = w + wrow * blocks_per_row * 34
+    wdst = ws + (tid // 4) * LDW + part * 8
+
+    group = lane >> 2
+    tid4 = lane & 3
+    warp_m = (wid % m_warps) * 32
+    warp_n = (wid // m_warps) * 32
+    sub = lane // 8
+    lr = lane % 8
+    a_base = xs + (warp_m + (sub % 2) * 8 + lr) * LDK + (sub // 2) * 8
+    b_base = ws + (warp_n + lr) * LDW + (sub % 2) * 8
+
+    var acc = InlineArray[SIMD[DType.float32, 4], 8](fill=SIMD[DType.float32, 4](0.0))
+    n_stages = n_cols // BK
+
+    _issue_x[BM, NW](0, n_cols, kc8, xsrc0, xsrc1, xdst0, xdst1)
+    async_copy_commit_group()
+    var scale = InlineArray[Float16, w_passes](uninitialized=True)
+    var qv = InlineArray[SIMD[DType.uint8, 8], w_passes](uninitialized=True)
+
+    comptime for wp in range(w_passes):
+        scale[wp] = Float16((wbase[wp]).bitcast[Float16]()[0])
+        qv[wp] = (wbase[wp] + 2 + part * 8).load[width=8, alignment=2]()
+
+    var s = 0
+    while s < n_stages:
+        if s + 1 < n_stages:
+            _issue_x[BM, NW](s + 1, n_cols, kc8, xsrc0, xsrc1, xdst0, xdst1)
+            async_copy_commit_group()
+
+        comptime for wp in range(w_passes):
+            wv = qv[wp].cast[DType.int8]().cast[DType.float16]() * scale[wp]
+            (wdst + (s % 2) * WTILE + wp * (NT // 4) * LDW).store[
+                width=8, alignment=16
+            ](wv)
+        if s + 1 < n_stages:
+            off = (s + 1) * 34
+
+            comptime for wp in range(w_passes):
+                scale[wp] = Float16((wbase[wp] + off).bitcast[Float16]()[0])
+                qv[wp] = (wbase[wp] + off + 2 + part * 8).load[
+                    width=8, alignment=2
+                ]()
+            async_copy_wait_group(1)
+        else:
+            async_copy_wait_group(0)
+        barrier()
+
+        buf = s % 2
+        comptime for k16 in range(BK // 16):
+            comptime kb = k16 * 16
+            a0 = ld_matrix[8](a_base + buf * XTILE + kb)
+            a1 = ld_matrix[8](a_base + buf * XTILE + kb + 16 * LDK)
+            comptime for ni in range(4):
+                b = ld_matrix[4](b_base + buf * WTILE + ni * 8 * LDW + kb)
+                mma(acc[ni], a0, b, acc[ni])
+                mma(acc[4 + ni], a1, b, acc[4 + ni])
+        barrier()
+        s += 1
+
+    _store_tile_f32(y, acc, t0, row0, warp_m, warp_n, group, tid4, n_rows, n_tokens)
+
+
+comptime gemm_f16_out_f32 = gemm_f16_out_f32_impl[128, 8]
+comptime gemm_f16_out_f32_bm64 = gemm_f16_out_f32_impl[64, 4]
+comptime gemm_q8_0_out_f32 = gemm_q8_0_out_f32_impl[128, 8]
+comptime gemm_q8_0_out_f32_bm64 = gemm_q8_0_out_f32_impl[64, 4]
 comptime gemm_f16 = gemm_f16_impl[128, 8]
 comptime gemm_f16_bm64 = gemm_f16_impl[64, 4]
 comptime gemm_q8_0_f16 = gemm_q8_0_impl[128, 8]

@@ -280,3 +280,154 @@ def topk_final_f32(
             break
     out_id[0] = topi[chosen]
     out_lp[0] = log(topv[chosen])
+
+
+def penalize_batched_f32(
+    logits: UnsafePointer[Float32, MutAnyOrigin],
+    vocab: Int,
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    offsets: UnsafePointer[Int32, MutAnyOrigin],
+    penalties: UnsafePointer[Float32, MutAnyOrigin],
+):
+    """Batched in-place repetition penalty. One block per sequence; the
+    sequence's distinct token ids live in ids[offsets[seq] .. offsets[seq+1]]
+    and each row of `logits` ([n_seqs, vocab]) is penalized with penalties[seq].
+    Same per-id rule as penalize_f32 (positive divide, non-positive multiply)."""
+    seq = Int(block_idx.x)
+    base = seq * vocab
+    start = Int(offsets[seq])
+    end = Int(offsets[seq + 1])
+    pen = penalties[seq]
+    bd = Int(block_dim.x)
+    var i = start + Int(thread_idx.x)
+    while i < end:
+        t = Int(ids[i])
+        l = logits[base + t]
+        if l > 0.0:
+            logits[base + t] = l / pen
+        else:
+            logits[base + t] = l * pen
+        i += bd
+
+
+def argmax_batched_f32(
+    out_ids: UnsafePointer[Int32, MutAnyOrigin],
+    logits: UnsafePointer[Float32, MutAnyOrigin],
+    vocab: Int,
+):
+    """Batched greedy argmax over `logits` ([n_seqs, vocab]). One block per
+    sequence scans its whole row; ties resolve to the lowest index, matching
+    the single-row argmax_partial/argmax_final pair. Grid.x = n_seqs, block
+    SAMPLE_BLOCK. out_ids[seq] receives the winning token id."""
+    seq = Int(block_idx.x)
+    base = seq * vocab
+    tid = Int(thread_idx.x)
+    bd = Int(block_dim.x)
+    var bv = NEG_INF
+    var bi = 0x7FFFFFFF
+    var i = tid
+    while i < vocab:
+        v = logits[base + i]
+        if v > bv or (v == bv and i < bi):
+            bv = v
+            bi = i
+        i += bd
+    (_, mi) = _block_argmax(bv, bi)
+    if tid == 0:
+        out_ids[seq] = Int32(mi)
+
+
+def topk_batched_f32(
+    out_ids: UnsafePointer[Int32, MutAnyOrigin],
+    logits: UnsafePointer[Float32, MutAnyOrigin],
+    vocab: Int,
+    k_arr: UnsafePointer[Int32, MutAnyOrigin],
+    inv_t_arr: UnsafePointer[Float32, MutAnyOrigin],
+    top_p_arr: UnsafePointer[Float32, MutAnyOrigin],
+    min_p_arr: UnsafePointer[Float32, MutAnyOrigin],
+    seed_arr: UnsafePointer[UInt64, MutAnyOrigin],
+    step_arr: UnsafePointer[UInt64, MutAnyOrigin],
+):
+    """Batched categorical draw over `logits` ([n_seqs, vocab]) with per-seq
+    params. One block per sequence extracts its top-k by k rounds of
+    full-row block-argmax with in-place NEG_INF masking (the logits buffer is
+    regenerated every step), then thread 0 replays the exact softmax /
+    min-p / top-p / counter-hash pipeline of topk_final_f32. Value ties
+    resolve to the lowest token id, so the survivors and their order match the
+    single-row two-pass path bit-for-bit. Grid.x = n_seqs, block SAMPLE_BLOCK."""
+    topv = stack_allocation[MAX_TOPK, Float32, address_space = AddressSpace.SHARED]()
+    topi = stack_allocation[MAX_TOPK, Int32, address_space = AddressSpace.SHARED]()
+    seq = Int(block_idx.x)
+    base = seq * vocab
+    tid = Int(thread_idx.x)
+    bd = Int(block_dim.x)
+    k = Int(k_arr[seq])
+    if k > MAX_TOPK:
+        k = MAX_TOPK
+    if k > vocab:
+        k = vocab
+
+    for r in range(k):
+        var bv = NEG_INF
+        var bi = 0x7FFFFFFF
+        var i = tid
+        while i < vocab:
+            v = logits[base + i]
+            if v > bv or (v == bv and i < bi):
+                bv = v
+                bi = i
+            i += bd
+        (mv, mi) = _block_argmax(bv, bi)
+        if tid == 0:
+            topv[r] = mv
+            topi[r] = Int32(mi)
+            logits[base + mi] = NEG_INF
+        barrier()
+
+    if tid != 0:
+        return
+
+    inv_t = inv_t_arr[seq]
+    top_p = top_p_arr[seq]
+    min_p = min_p_arr[seq]
+    m = topv[0] * inv_t
+    var total: Float32 = 0.0
+    for j in range(k):
+        p = exp(topv[j] * inv_t - m)
+        topv[j] = p
+        total += p
+    for j in range(k):
+        topv[j] /= total
+
+    var n_c = k
+    if min_p > 0.0:
+        floor = min_p * topv[0]
+        var keep = 0
+        while keep < k and topv[keep] >= floor:
+            keep += 1
+        if keep == 0:
+            out_ids[seq] = topi[0]
+            return
+        n_c = keep
+
+    if top_p < 1.0:
+        var cum: Float32 = 0.0
+        var cut = n_c
+        for j in range(n_c):
+            cum += topv[j]
+            if cum >= top_p:
+                cut = j + 1
+                break
+        n_c = cut
+
+    var remaining: Float32 = 0.0
+    for j in range(n_c):
+        remaining += topv[j]
+    var r = _rand_u01(seed_arr[seq], step_arr[seq]) * remaining
+    var chosen = n_c - 1
+    for j in range(n_c):
+        r -= topv[j]
+        if r <= 0.0:
+            chosen = j
+            break
+    out_ids[seq] = topi[chosen]

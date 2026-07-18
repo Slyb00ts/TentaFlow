@@ -14,7 +14,7 @@ use forge_types::{ForgeError, Result};
 use crate::generate::FinishReason;
 use crate::kv::SeqKv;
 use crate::model::{Model, MAX_PREFILL_CHUNK};
-use crate::sample::{GpuSampler, Sampler, SamplingParams};
+use crate::sample::{GpuSampler, Sampler, SamplingParams, SeqSampleParams};
 
 pub struct EngineRequest {
     pub prompt_tokens: Vec<u32>,
@@ -98,15 +98,44 @@ struct ActiveSeq<'t> {
 /// one sequence may prefill per scheduler iteration, protecting decode ITL of
 /// the other active sequences (chunked prefill).
 pub fn spawn_engine(
-    mut model: Model,
+    model: Model,
     tokenizer: Arc<Tokenizer>,
     max_active: usize,
     prefill_chunk: usize,
 ) -> EngineHandle {
+    spawn_engine_batched(model, tokenizer, max_active, prefill_chunk, default_batch_min())
+}
+
+/// Default minimum decode concurrency before the batched forward path engages
+/// (env override `FORGE_BATCH_MIN`). Below this many simultaneously-decoding
+/// sequences the scheduler serializes the tuned fused single-seq path (faster
+/// at low concurrency); at/above it the batched pass amortizes its flat
+/// per-step cost across the batch.
+fn default_batch_min() -> usize {
+    // Measured crossover on the RTX 4090 (qwen3-0.6b-q8_0 and Bielik-7B-NVFP4):
+    // the batched aggregate throughput overtakes serialized fused decoding at
+    // ~12 concurrent sequences (both are bound by the fixed GEMM token-tile
+    // cost, so per-step time is nearly flat in the batch size). Default just
+    // past that so the batched path only engages when it wins.
+    std::env::var("FORGE_BATCH_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v >= 2)
+        .unwrap_or(12)
+}
+
+/// `spawn_engine` with an explicit batched-path engagement threshold.
+pub fn spawn_engine_batched(
+    mut model: Model,
+    tokenizer: Arc<Tokenizer>,
+    max_active: usize,
+    prefill_chunk: usize,
+    batch_min: usize,
+) -> EngineHandle {
     let (tx, rx) = mpsc::channel::<Submission>();
     std::thread::Builder::new()
         .name("forge-engine-worker".into())
-        .spawn(move || worker(&mut model, &tokenizer, &rx, max_active, prefill_chunk))
+        .spawn(move || worker(&mut model, &tokenizer, &rx, max_active, prefill_chunk, batch_min))
         .expect("spawn engine worker");
     EngineHandle { tx }
 }
@@ -117,9 +146,15 @@ fn worker<'t>(
     rx: &mpsc::Receiver<Submission>,
     max_active: usize,
     prefill_chunk: usize,
+    batch_min: usize,
 ) {
     let mut active: Vec<ActiveSeq<'t>> = Vec::new();
     let mut waiting: VecDeque<Submission> = VecDeque::new();
+
+    // Provision the batched-decode scratch + graph buckets for the full active
+    // width once. A failure here (VRAM pressure) is surfaced per-request by the
+    // per-batch re-ensure inside `batched_decode`.
+    let _ = model.ensure_batch(max_active);
 
     loop {
         // Drain the submission queue without blocking while work is active;
@@ -201,18 +236,25 @@ fn worker<'t>(
             });
         }
 
-        // One scheduler iteration: each active sequence advances — prefill
-        // sequences by up to `prefill_chunk` tokens, decode sequences by one.
+        // One scheduler iteration. Prefilling sequences and any CPU-sampled
+        // decode sequence advance individually (chunked prefill / one token);
+        // every GPU-sampled decode sequence runs through ONE batched forward
+        // pass (`batch_gpu_decode`) — the continuous-batching throughput path.
         for a in active.iter_mut() {
             if a.dead {
                 continue;
             }
-            let r = advance(model, a, prefill_chunk);
-            if let Err(e) = r {
+            let gpu = matches!(a.sampler, SeqSampler::Gpu(_));
+            let decoding = a.pending_prompt.is_empty();
+            if gpu && decoding {
+                continue; // handled by the batch below
+            }
+            if let Err(e) = advance(model, a, prefill_chunk) {
                 let _ = a.events.send(EngineEvent::Error(e.to_string()));
                 a.dead = true;
             }
         }
+        batch_gpu_decode(model, &mut active, batch_min);
 
         // Tear down finished/dead sequences and release their pages.
         active.retain_mut(|a| {
@@ -226,10 +268,56 @@ fn worker<'t>(
     }
 }
 
-/// Advance one sequence by one scheduler quantum. Sets `dead` on completion.
+/// Whether emitting a token finished the sequence (stop/eos/length/client
+/// hang-up) or it should keep decoding.
+enum StepOutcome {
+    Continue,
+    Finished,
+}
+
+/// Emit one sampled token through the decoder + stop matcher and apply the
+/// termination checks (eos, stop string, max tokens, client hang-up). Shared
+/// by the per-sequence (`advance`) and batched (`batch_gpu_decode`) paths.
+fn emit_token(a: &mut ActiveSeq<'_>, next: u32) -> Result<StepOutcome> {
+    if a.eos_ids.contains(&next) {
+        finish(a, FinishReason::Eos)?;
+        return Ok(StepOutcome::Finished);
+    }
+    a.generated.push(next);
+
+    let piece = a.decoder.push(next)?;
+    if !piece.is_empty() {
+        let step = a.stops.push(&piece);
+        if !step.emit.is_empty()
+            && a.events
+                .send(EngineEvent::Token {
+                    id: next,
+                    text: step.emit,
+                })
+                .is_err()
+        {
+            // Client hung up — cancel generation, free the slot.
+            a.dead = true;
+            return Ok(StepOutcome::Finished);
+        }
+        if step.matched.is_some() {
+            finish(a, FinishReason::Stop)?;
+            return Ok(StepOutcome::Finished);
+        }
+    }
+
+    if a.generated.len() >= a.max_tokens {
+        finish(a, FinishReason::Length)?;
+        return Ok(StepOutcome::Finished);
+    }
+    Ok(StepOutcome::Continue)
+}
+
+/// Advance one sequence by one scheduler quantum (prefill chunk or a single
+/// CPU-sampled decode step). GPU-sampled decode goes through the batched path.
 fn advance(model: &mut Model, a: &mut ActiveSeq<'_>, prefill_chunk: usize) -> Result<()> {
     if !a.pending_prompt.is_empty() {
-        // Batched prefill: one quantum per iteration keeps decode ITL of the
+        // Chunked prefill: one quantum per iteration keeps decode ITL of the
         // other sequences bounded; the 32-token floor keeps tiny configured
         // quanta from wasting the batched kernels.
         let quantum = prefill_chunk.clamp(32, MAX_PREFILL_CHUNK);
@@ -247,6 +335,7 @@ fn advance(model: &mut Model, a: &mut ActiveSeq<'_>, prefill_chunk: usize) -> Re
         return Ok(());
     }
 
+    // CPU-sampled decode (GPU decode is batched elsewhere).
     let next = match a
         .next
         .take()
@@ -263,35 +352,7 @@ fn advance(model: &mut Model, a: &mut ActiveSeq<'_>, prefill_chunk: usize) -> Re
         PendingNext::Token(t) => t,
     };
 
-    if a.eos_ids.contains(&next) {
-        finish(a, FinishReason::Eos)?;
-        return Ok(());
-    }
-    a.generated.push(next);
-
-    let piece = a.decoder.push(next)?;
-    if !piece.is_empty() {
-        let step = a.stops.push(&piece);
-        if !step.emit.is_empty()
-            && a.events
-                .send(EngineEvent::Token {
-                    id: next,
-                    text: step.emit,
-                })
-                .is_err()
-        {
-            // Client hung up — cancel generation, free the slot.
-            a.dead = true;
-            return Ok(());
-        }
-        if step.matched.is_some() {
-            finish(a, FinishReason::Stop)?;
-            return Ok(());
-        }
-    }
-
-    if a.generated.len() >= a.max_tokens {
-        finish(a, FinishReason::Length)?;
+    if let StepOutcome::Finished = emit_token(a, next)? {
         return Ok(());
     }
 
@@ -303,6 +364,122 @@ fn advance(model: &mut Model, a: &mut ActiveSeq<'_>, prefill_chunk: usize) -> Re
         }
     });
     Ok(())
+}
+
+/// Run every GPU-sampled decode sequence through one batched forward pass.
+/// Each sequence's current token is emitted and termination-checked first;
+/// survivors are fed together into `Model::batched_decode`, which samples all
+/// their successors on the GPU in one launch set.
+fn batch_gpu_decode(model: &mut Model, active: &mut [ActiveSeq<'_>], batch_min: usize) {
+    let vocab = model.weights.descriptor.params.vocab_size;
+
+    // Phase 1: emit each ready sequence's pending token; collect the indices of
+    // survivors that still need to be fed one more token.
+    let mut feed_idx: Vec<usize> = Vec::new();
+    for (i, a) in active.iter_mut().enumerate() {
+        if a.dead || !a.pending_prompt.is_empty() {
+            continue;
+        }
+        if !matches!(a.sampler, SeqSampler::Gpu(_)) {
+            continue;
+        }
+        let next = match a.next.take() {
+            Some(PendingNext::Token(t)) => t,
+            Some(PendingNext::Logits(_)) => {
+                let _ = a
+                    .events
+                    .send(EngineEvent::Error("GPU sequence carried host logits".into()));
+                a.dead = true;
+                continue;
+            }
+            None => continue,
+        };
+        match emit_token(a, next) {
+            Ok(StepOutcome::Continue) => feed_idx.push(i),
+            Ok(StepOutcome::Finished) => {}
+            Err(e) => {
+                let _ = a.events.send(EngineEvent::Error(e.to_string()));
+                a.dead = true;
+            }
+        }
+    }
+    if feed_idx.is_empty() {
+        return;
+    }
+
+    // Below `batch_min` sequences, the tuned fused single-seq decode path
+    // (6 launches/layer, graphed) run once per survivor is faster than the
+    // tensor-core batched pass, whose per-step cost is nearly flat in the batch
+    // size (the GEMMs process a fixed token tile). Serializing them here keeps
+    // single-stream and low-concurrency latency from regressing; the batched
+    // path engages once the flat cost amortizes across enough sequences.
+    if feed_idx.len() < batch_min.max(2) {
+        for &i in &feed_idx {
+            let a = &mut active[i];
+            let fed = *a.generated.last().expect("emit_token pushed the fed token");
+            let SeqSampler::Gpu(g) = &mut a.sampler else {
+                unreachable!("feed set is GPU-only")
+            };
+            g.note_token(fed);
+            match model.step_and_sample(&mut a.seq, fed, g) {
+                Ok(t) => a.next = Some(PendingNext::Token(t)),
+                Err(e) => {
+                    let _ = a.events.send(EngineEvent::Error(e.to_string()));
+                    a.dead = true;
+                }
+            }
+        }
+        return;
+    }
+
+    // Phase 2: gather the batch. Disjoint field borrows let one pass hand the
+    // KV handle to the model while snapshotting each sampler's params.
+    let mut seqs: Vec<&mut SeqKv> = Vec::with_capacity(feed_idx.len());
+    let mut tokens: Vec<u32> = Vec::with_capacity(feed_idx.len());
+    let mut params: Vec<SeqSampleParams> = Vec::with_capacity(feed_idx.len());
+    let mut fi = 0usize;
+    for (i, a) in active.iter_mut().enumerate() {
+        if fi >= feed_idx.len() || feed_idx[fi] != i {
+            continue;
+        }
+        fi += 1;
+        let fed = *a.generated.last().expect("emit_token pushed the fed token");
+        let seq = &mut a.seq;
+        let SeqSampler::Gpu(g) = &mut a.sampler else {
+            unreachable!("feed set is GPU-only")
+        };
+        g.note_token(fed);
+        params.push(g.batch_params(vocab));
+        tokens.push(fed);
+        seqs.push(seq);
+    }
+
+    let results = match model.batched_decode(&mut seqs, &tokens, &params) {
+        Ok(r) => r,
+        Err(e) => {
+            drop(seqs);
+            let msg = e.to_string();
+            let mut ri = 0usize;
+            for (i, a) in active.iter_mut().enumerate() {
+                if ri < feed_idx.len() && feed_idx[ri] == i {
+                    ri += 1;
+                    let _ = a.events.send(EngineEvent::Error(msg.clone()));
+                    a.dead = true;
+                }
+            }
+            return;
+        }
+    };
+    drop(seqs);
+
+    // Phase 3: stash each successor as the next iteration's pending token.
+    let mut ri = 0usize;
+    for (i, a) in active.iter_mut().enumerate() {
+        if ri < feed_idx.len() && feed_idx[ri] == i {
+            a.next = Some(PendingNext::Token(results[ri]));
+            ri += 1;
+        }
+    }
 }
 
 fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason) -> Result<()> {
