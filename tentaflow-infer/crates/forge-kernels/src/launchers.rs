@@ -2169,6 +2169,113 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Commit T tokens already resident in the paged f16 K/V cache
+    /// (positions base_pos..base_pos+T) into the rotational low-bit store
+    /// (rotquant.mojo: WHT rotate + 3/4-bit pack + per-(token,head) f16 scale).
+    /// Grid (T, n_kv_heads); one thread per (token, head) vector.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_pack_rot_from_cache(
+        &self,
+        k_packed: &DevBuffer,
+        v_packed: &DevBuffer,
+        k_scale: &DevBuffer,
+        v_scale: &DevBuffer,
+        k_cache: &DevBuffer,
+        v_cache: &DevBuffer,
+        page_table: &DevBuffer,
+        base_pos: usize,
+        n_tokens: usize,
+        n_kv_heads: usize,
+        page_size: usize,
+        head_dim: usize,
+        bits: u8,
+        stream: &Stream,
+    ) -> Result<()> {
+        let name = Self::rot_kernel_name("kv_pack_rot_from_cache", head_dim, bits)?;
+        let k = self.artifacts.get(&name)?;
+        let cfg = LaunchConfig {
+            grid: (n_tokens as u32, n_kv_heads as u32, 1),
+            block: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(k_packed)
+            .buf(v_packed)
+            .buf(k_scale)
+            .buf(v_scale)
+            .buf(k_cache)
+            .buf(v_cache)
+            .buf(page_table)
+            .scalar(base_pos as i64)
+            .scalar(n_kv_heads as i64)
+            .scalar(page_size as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Rotational low-bit decode attention: reads the packed 3/4-bit K/V store,
+    /// rotates q once, scores in rotated space ((R·q)·(R·k) = q·k), and
+    /// inverse-rotates the V accumulator once per head. One warp per (seq,head).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode_rot(
+        &self,
+        out: &DevBuffer,
+        q: &DevBuffer,
+        q_byte_off: usize,
+        k_packed: &DevBuffer,
+        v_packed: &DevBuffer,
+        k_scale: &DevBuffer,
+        v_scale: &DevBuffer,
+        page_table: &DevBuffer,
+        seq_lens: &DevBuffer,
+        n_seqs: usize,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        max_pages: usize,
+        bits: u8,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let name = Self::rot_kernel_name("attn_decode_rot", head_dim, bits)?;
+        let k = self.artifacts.get(&name)?;
+        let cfg = LaunchConfig {
+            grid: (n_seqs as u32, n_q_heads as u32, 1),
+            block: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf_at(q, q_byte_off)?
+            .buf(k_packed)
+            .buf(v_packed)
+            .buf(k_scale)
+            .buf(v_scale)
+            .buf(page_table)
+            .buf(seq_lens)
+            .scalar(n_q_heads as i64)
+            .scalar(n_kv_heads as i64)
+            .scalar(page_size as i64)
+            .scalar(max_pages as i64)
+            .scalar(scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Kernel name for a rotational specialization: `<base>_hd{64,128}_b{3,4}`.
+    fn rot_kernel_name(base: &str, head_dim: usize, bits: u8) -> Result<String> {
+        if bits != 3 && bits != 4 {
+            return Err(ForgeError::Unsupported(format!(
+                "rotational KV supports 3 or 4 bits, got {bits}"
+            )));
+        }
+        match head_dim {
+            64 | 128 => Ok(format!("{base}_hd{head_dim}_b{bits}")),
+            other => Err(ForgeError::Unsupported(format!(
+                "rotational KV: head_dim {other} has no compiled specialization"
+            ))),
+        }
+    }
+
     /// Column bound of the dp4a kernels that quantize x from global memory
     /// into shared int8 (plain + residual variants; X_MAX in decode_dp4a.mojo).
     pub const DP4A_MAX_COLS: usize = 16384;

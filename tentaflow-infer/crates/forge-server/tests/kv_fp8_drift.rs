@@ -94,12 +94,17 @@ fn run_pass_ids(
     kv_pages: usize,
 ) -> (Vec<u32>, Vec<Vec<f32>>, Fp8CacheStats) {
     let kv_page_size = 32;
+    let kv_quant = if kv_dtype == DType::F8E4M3 {
+        forge_engine::kv::KvQuant::Fp8
+    } else {
+        forge_engine::kv::KvQuant::F16
+    };
     let desc = read_descriptor(path).expect("read model descriptor");
     let device = CudaDevice::new(
         0,
         PoolSizes {
             weights: 8 << 30,
-            kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, kv_dtype).max(1 << 30),
+            kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, kv_quant).max(1 << 30),
             activations: 1 << 30,
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
         },
@@ -113,7 +118,7 @@ fn run_pass_ids(
             kv_page_size,
             kv_pages,
             max_seq_len: 4096,
-            kv_dtype,
+            kv_quant,
         },
     )
     .expect("load model");

@@ -101,6 +101,12 @@ from src.decode_fused import gemv_norm_iq2_xxs_f16, gemv_norm_silu_iq2_xxs_f16, 
 from src.decode_fused import gemv_norm_iq3_xxs_f16, gemv_norm_silu_iq3_xxs_f16, gemv_residual_iq3_xxs_f16
 from src.decode_fused import gemv_norm_iq1_s_f16, gemv_norm_silu_iq1_s_f16, gemv_residual_iq1_s_f16
 from src.decode_fused import gemv_norm_iq1_m_f16, gemv_norm_silu_iq1_m_f16, gemv_residual_iq1_m_f16
+from src.rotkv import kv_pack_rot_hd64_b4, kv_pack_rot_hd64_b3
+from src.rotkv import kv_pack_rot_hd128_b4, kv_pack_rot_hd128_b3
+from src.rotkv import kv_pack_rot_from_cache_hd64_b4, kv_pack_rot_from_cache_hd64_b3
+from src.rotkv import kv_pack_rot_from_cache_hd128_b4, kv_pack_rot_from_cache_hd128_b3
+from src.rotkv import attn_decode_rot_hd64_b4, attn_decode_rot_hd64_b3
+from src.rotkv import attn_decode_rot_hd128_b4, attn_decode_rot_hd128_b3
 from src.sampling import penalize_f32, argmax_partial_f32, argmax_final_f32
 from src.sampling import topk_partial_f32, topk_final_f32
 from src.sampling import penalize_batched_f32, argmax_batched_f32, topk_batched_f32
@@ -400,6 +406,42 @@ def main() raises:
 
     _ = ctx.compile_function[gemv_q6_k_dp4a_out_f32, dump_asm=Path("gemv_q6_k_dp4a_out_f32.ptx")]()
     entries.append(_finalize(out_dir, "gemv_q6_k_dp4a_out_f32"))
+
+    _ = ctx.compile_function[kv_pack_rot_hd64_b4, dump_asm=Path("kv_pack_rot_hd64_b4.ptx")]()
+    entries.append(_finalize(out_dir, "kv_pack_rot_hd64_b4"))
+
+    _ = ctx.compile_function[kv_pack_rot_hd64_b3, dump_asm=Path("kv_pack_rot_hd64_b3.ptx")]()
+    entries.append(_finalize(out_dir, "kv_pack_rot_hd64_b3"))
+
+    _ = ctx.compile_function[kv_pack_rot_hd128_b4, dump_asm=Path("kv_pack_rot_hd128_b4.ptx")]()
+    entries.append(_finalize(out_dir, "kv_pack_rot_hd128_b4"))
+
+    _ = ctx.compile_function[kv_pack_rot_hd128_b3, dump_asm=Path("kv_pack_rot_hd128_b3.ptx")]()
+    entries.append(_finalize(out_dir, "kv_pack_rot_hd128_b3"))
+
+    _ = ctx.compile_function[kv_pack_rot_from_cache_hd64_b4, dump_asm=Path("kv_pack_rot_from_cache_hd64_b4.ptx")]()
+    entries.append(_finalize(out_dir, "kv_pack_rot_from_cache_hd64_b4"))
+
+    _ = ctx.compile_function[kv_pack_rot_from_cache_hd64_b3, dump_asm=Path("kv_pack_rot_from_cache_hd64_b3.ptx")]()
+    entries.append(_finalize(out_dir, "kv_pack_rot_from_cache_hd64_b3"))
+
+    _ = ctx.compile_function[kv_pack_rot_from_cache_hd128_b4, dump_asm=Path("kv_pack_rot_from_cache_hd128_b4.ptx")]()
+    entries.append(_finalize(out_dir, "kv_pack_rot_from_cache_hd128_b4"))
+
+    _ = ctx.compile_function[kv_pack_rot_from_cache_hd128_b3, dump_asm=Path("kv_pack_rot_from_cache_hd128_b3.ptx")]()
+    entries.append(_finalize(out_dir, "kv_pack_rot_from_cache_hd128_b3"))
+
+    _ = ctx.compile_function[attn_decode_rot_hd64_b4, dump_asm=Path("attn_decode_rot_hd64_b4.ptx")]()
+    entries.append(_finalize(out_dir, "attn_decode_rot_hd64_b4"))
+
+    _ = ctx.compile_function[attn_decode_rot_hd64_b3, dump_asm=Path("attn_decode_rot_hd64_b3.ptx")]()
+    entries.append(_finalize(out_dir, "attn_decode_rot_hd64_b3"))
+
+    _ = ctx.compile_function[attn_decode_rot_hd128_b4, dump_asm=Path("attn_decode_rot_hd128_b4.ptx")]()
+    entries.append(_finalize(out_dir, "attn_decode_rot_hd128_b4"))
+
+    _ = ctx.compile_function[attn_decode_rot_hd128_b3, dump_asm=Path("attn_decode_rot_hd128_b3.ptx")]()
+    entries.append(_finalize(out_dir, "attn_decode_rot_hd128_b3"))
 
     _ = ctx.compile_function[penalize_f32, dump_asm=Path("penalize_f32.ptx")]()
     entries.append(_finalize(out_dir, "penalize_f32"))

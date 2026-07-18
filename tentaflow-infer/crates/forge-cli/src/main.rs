@@ -7,13 +7,13 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use forge_engine::kv::KvQuant;
 use forge_engine::model::ModelConfig;
 use forge_engine::sample::SamplingParams;
 use forge_engine::server::{spawn_engine, EngineEvent, EngineHandle, EngineRequest};
 use forge_formats::PoolingType;
 use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
-use forge_types::DType;
 use forge_server::source::{
     kv_pool_bytes, load_model, read_descriptor, resolve_normalize, resolve_pooling, LoadedModel,
 };
@@ -72,9 +72,17 @@ enum Command {
         /// the served model is itself an embedding model, that model is reused.
         #[arg(long)]
         embed_model: Option<PathBuf>,
-        /// KV cache element type: f16 | fp8 (fp8 halves KV memory/bandwidth).
+        /// KV cache mode: f16 | fp8 | rot4 | rot3 (fp8 halves KV bytes; rot4/rot3
+        /// are rotational low-bit — rot4 recommended, rot3 lossier).
         #[arg(long = "kv-cache", default_value = "f16")]
         kv_cache: String,
+        /// Rot modes: most-recent tokens kept at f16 fidelity (SPEC default 128).
+        #[arg(long = "kv-residual-window", default_value_t = 128)]
+        kv_residual_window: usize,
+        /// Rot modes: context length past which a sequence uses the rotational
+        /// store (SPEC default 4096).
+        #[arg(long = "kv-activate-at", default_value_t = 4096)]
+        kv_activate_at: usize,
     },
     /// Print an embedding vector for one text (dims + L2 norm + first values).
     Embed {
@@ -108,9 +116,17 @@ enum Command {
         /// VRAM weights-pool size in GiB (0 = automatic split of free VRAM).
         #[arg(long = "weights-pool-gb", default_value_t = 0.0)]
         weights_pool_gb: f64,
-        /// KV cache element type: f16 | fp8 (fp8 halves KV memory/bandwidth).
+        /// KV cache mode: f16 | fp8 | rot4 | rot3 (fp8 halves KV bytes; rot4/rot3
+        /// are rotational low-bit — rot4 recommended, rot3 lossier).
         #[arg(long = "kv-cache", default_value = "f16")]
         kv_cache: String,
+        /// Rot modes: most-recent tokens kept at f16 fidelity (SPEC default 128).
+        #[arg(long = "kv-residual-window", default_value_t = 128)]
+        kv_residual_window: usize,
+        /// Rot modes: context length past which a sequence uses the rotational
+        /// store (SPEC default 4096).
+        #[arg(long = "kv-activate-at", default_value_t = 4096)]
+        kv_activate_at: usize,
         /// Max context length in tokens (0 = the model's own maximum). Any
         /// value is honored; the KV cache is sized to fit it (VRAM permitting).
         #[arg(long = "ctx", default_value_t = 0)]
@@ -136,9 +152,17 @@ enum Command {
         /// Prompt length in tokens.
         #[arg(long, default_value_t = 512)]
         prompt_tokens: usize,
-        /// KV cache element type: f16 | fp8 (fp8 halves KV memory/bandwidth).
+        /// KV cache mode: f16 | fp8 | rot4 | rot3 (fp8 halves KV bytes; rot4/rot3
+        /// are rotational low-bit — rot4 recommended, rot3 lossier).
         #[arg(long = "kv-cache", default_value = "f16")]
         kv_cache: String,
+        /// Rot modes: most-recent tokens kept at f16 fidelity (SPEC default 128).
+        #[arg(long = "kv-residual-window", default_value_t = 128)]
+        kv_residual_window: usize,
+        /// Rot modes: context length past which a sequence uses the rotational
+        /// store (SPEC default 4096).
+        #[arg(long = "kv-activate-at", default_value_t = 4096)]
+        kv_activate_at: usize,
     },
 }
 
@@ -165,6 +189,8 @@ fn main() -> Result<()> {
             whisper_model,
             embed_model,
             kv_cache,
+            kv_residual_window,
+            kv_activate_at,
             ctx,
         } => cmd_serve(
             &model_path,
@@ -179,7 +205,7 @@ fn main() -> Result<()> {
             tool_call_parser,
             whisper_model.as_deref(),
             embed_model.as_deref(),
-            parse_kv_dtype(&kv_cache)?,
+            parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
             ctx,
         ),
         Command::Embed {
@@ -203,6 +229,8 @@ fn main() -> Result<()> {
             chat,
             weights_pool_gb,
             kv_cache,
+            kv_residual_window,
+            kv_activate_at,
             ctx,
         } => cmd_run(
             &model_path,
@@ -211,7 +239,7 @@ fn main() -> Result<()> {
             temperature,
             chat,
             weights_pool_gb,
-            parse_kv_dtype(&kv_cache)?,
+            parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
             ctx,
         ),
         Command::Transcribe {
@@ -224,15 +252,24 @@ fn main() -> Result<()> {
             tokens,
             prompt_tokens,
             kv_cache,
-        } => cmd_bench(&model_path, tokens, prompt_tokens, parse_kv_dtype(&kv_cache)?),
+            kv_residual_window,
+            kv_activate_at,
+        } => cmd_bench(
+            &model_path,
+            tokens,
+            prompt_tokens,
+            parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
+        ),
     }
 }
 
-fn parse_kv_dtype(s: &str) -> Result<DType> {
+fn parse_kv_quant(s: &str, residual_window: usize, activate_at: usize) -> Result<KvQuant> {
     match s {
-        "f16" => Ok(DType::F16),
-        "fp8" => Ok(DType::F8E4M3),
-        other => bail!("unsupported --kv-cache '{other}' (expected f16 | fp8)"),
+        "f16" => Ok(KvQuant::F16),
+        "fp8" => Ok(KvQuant::Fp8),
+        "rot4" => Ok(KvQuant::Rot { bits: 4, residual_window, activate_at }),
+        "rot3" => Ok(KvQuant::Rot { bits: 3, residual_window, activate_at }),
+        other => bail!("unsupported --kv-cache '{other}' (expected f16 | fp8 | rot4 | rot3)"),
     }
 }
 
@@ -250,7 +287,7 @@ fn load_for_serve(
     path: &Path,
     kv_pages: usize,
     weights_pool_gb: f64,
-    kv_dtype: DType,
+    kv_quant: KvQuant,
     ctx: usize,
 ) -> Result<(LoadedModel, usize, usize)> {
     let kv_page_size = ModelConfig::default().kv_page_size;
@@ -259,7 +296,7 @@ fn load_for_serve(
     let (max_seq_len, ctx_pages) =
         resolve_ctx(desc.params.max_position_embeddings, ctx, kv_page_size);
     let kv_pages = kv_pages.max(ctx_pages);
-    let kv_pool = kv_pool_bytes(&desc, kv_page_size, kv_pages, kv_dtype).max(1 << 30);
+    let kv_pool = kv_pool_bytes(&desc, kv_page_size, kv_pages, kv_quant).max(1 << 30);
     let activations = 1usize << 30;
     // Clamp the requested weights pool so weights + KV + activations always fit
     // free VRAM — a large --ctx grows KV and must not OOM the pool arenas.
@@ -282,7 +319,7 @@ fn load_for_serve(
     let cfg = ModelConfig {
         kv_page_size,
         kv_pages,
-        kv_dtype,
+        kv_quant,
         max_seq_len,
     };
     let loaded = load_model(dev, path, cfg)?;
@@ -307,7 +344,7 @@ fn resolve_ctx(max_position_embeddings: usize, requested: usize, page_size: usiz
 fn load_auto(
     path: &Path,
     weights_pool_gb: f64,
-    kv_dtype: DType,
+    kv_quant: KvQuant,
     ctx: usize,
 ) -> Result<LoadedModel> {
     // Read hyperparameters before loading weights so the KV cache is sized for
@@ -316,7 +353,7 @@ fn load_auto(
     let page_size = ModelConfig::default().kv_page_size;
     let (max_seq_len, kv_pages) =
         resolve_ctx(desc.params.max_position_embeddings, ctx, page_size);
-    let kv_pool = kv_pool_bytes(&desc, page_size, kv_pages, kv_dtype).max(1 << 30);
+    let kv_pool = kv_pool_bytes(&desc, page_size, kv_pages, kv_quant).max(1 << 30);
 
     // Activations pool holds decode scratch + persistent decode buffers.
     let activations = 1usize << 30;
@@ -345,7 +382,7 @@ fn load_auto(
         dev,
         path,
         ModelConfig {
-            kv_dtype,
+            kv_quant,
             kv_page_size: page_size,
             kv_pages,
             max_seq_len,
@@ -434,7 +471,7 @@ fn cmd_embed(
     weights_pool_gb: f64,
 ) -> Result<()> {
     let t0 = Instant::now();
-    let loaded = load_auto(model_path, weights_pool_gb, DType::F16, 8192)?;
+    let loaded = load_auto(model_path, weights_pool_gb, KvQuant::F16, 8192)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let pooling = match pooling_override {
@@ -504,13 +541,13 @@ fn cmd_serve(
     tool_call_parser: Option<String>,
     whisper_model: Option<&Path>,
     embed_model: Option<&Path>,
-    kv_dtype: DType,
+    kv_quant: KvQuant,
     ctx: usize,
 ) -> Result<()> {
     let max_active = usize::from(max_active);
     let t0 = Instant::now();
     let (loaded, kv_pages, max_seq_len) =
-        load_for_serve(model_path, kv_pages, weights_pool_gb, kv_dtype, ctx)?;
+        load_for_serve(model_path, kv_pages, weights_pool_gb, kv_quant, ctx)?;
     tracing::info!(
         "loaded {} ({}) in {:.1}s: {} layers, kv_pages={}",
         model_path.display(),
@@ -663,11 +700,11 @@ fn cmd_run(
     temperature: f32,
     chat: bool,
     weights_pool_gb: f64,
-    kv_dtype: DType,
+    kv_quant: KvQuant,
     ctx: usize,
 ) -> Result<()> {
     let t0 = Instant::now();
-    let loaded = load_auto(model_path, weights_pool_gb, kv_dtype, ctx)?;
+    let loaded = load_auto(model_path, weights_pool_gb, kv_quant, ctx)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let prompt_text = if chat {
@@ -720,7 +757,7 @@ fn cmd_run(
     Ok(())
 }
 
-fn cmd_bench(model_path: &Path, tokens: usize, prompt_tokens: usize, kv_dtype: DType) -> Result<()> {
+fn cmd_bench(model_path: &Path, tokens: usize, prompt_tokens: usize, kv_quant: KvQuant) -> Result<()> {
     if tokens < 2 {
         bail!("--tokens must be at least 2 to measure decode throughput");
     }
@@ -728,7 +765,7 @@ fn cmd_bench(model_path: &Path, tokens: usize, prompt_tokens: usize, kv_dtype: D
         bail!("--prompt-tokens must be at least 1");
     }
     let t0 = Instant::now();
-    let loaded = load_auto(model_path, 0.0, kv_dtype, 0)?;
+    let loaded = load_auto(model_path, 0.0, kv_quant, 0)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let tokenizer = Arc::new(loaded.bundle.tokenizer);

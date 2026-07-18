@@ -215,20 +215,28 @@ pub fn read_descriptor(path: &Path) -> Result<ModelDescriptor> {
 }
 
 /// Bytes the KV cache slabs of this model need for `kv_pages` pages of
-/// `kv_page_size` tokens of `kv_dtype` elements, plus per-slab
-/// pool-granularity rounding headroom.
+/// `kv_page_size` tokens in storage mode `quant`, plus per-slab
+/// pool-granularity rounding headroom. Rot modes keep the f16 slab (prefill
+/// runs on it bit-exact) AND the packed low-bit region + f16 scales, so both
+/// are reserved.
 pub fn kv_pool_bytes(
     desc: &ModelDescriptor,
     kv_page_size: usize,
     kv_pages: usize,
-    kv_dtype: forge_types::DType,
+    quant: forge_engine::kv::KvQuant,
 ) -> usize {
     let p = &desc.params;
-    // K and V per layer.
-    let slab = p.n_kv_heads * p.head_dim * kv_page_size * kv_pages * kv_dtype.size();
-    let slabs = p.block_count * 2;
+    let slots = p.n_kv_heads * kv_page_size * kv_pages;
     let granularity = forge_hal::cuda::PoolSizes::DEFAULT_KV_PAGE;
-    slabs * (slab.div_ceil(granularity) * granularity) + 64 * (1 << 20)
+    let round = |b: usize| b.div_ceil(granularity) * granularity;
+    // K and V f16/fp8 slab per layer.
+    let slab = slots * p.head_dim * quant.slab_dtype().size();
+    let mut per_layer_pair = 2 * round(slab);
+    // Rot: packed low-bit codes (u8) + f16 scales, K and V per layer.
+    if let Some(pb) = quant.packed_bytes(p.head_dim) {
+        per_layer_pair += 2 * round(slots * pb) + 2 * round(slots * 2);
+    }
+    p.block_count * per_layer_pair + 64 * (1 << 20)
 }
 
 /// Resolve the sequence pooling for an embedding model path. GGUF carries

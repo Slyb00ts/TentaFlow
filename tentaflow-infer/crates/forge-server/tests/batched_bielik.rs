@@ -14,7 +14,6 @@ use forge_engine::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
 use forge_server::source::{kv_pool_bytes, load_model, read_descriptor};
-use forge_types::DType;
 
 const BIELIK_DIR: &str = "/home/critix/repos/rust/TentaFlow/.runtime/models/models--TentaFlow--Bielik-PL-Minitron-7B-NVFP4/snapshots/831550e879fd7d700e3f6d79dffc14373deda3a7";
 
@@ -61,7 +60,7 @@ fn batched_reproduces_golden() {
         0,
         PoolSizes {
             weights: 8 << 30,
-            kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, DType::F16).max(1 << 30),
+            kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, forge_engine::kv::KvQuant::F16).max(1 << 30),
             activations: 2 << 30,
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
         },
@@ -75,7 +74,7 @@ fn batched_reproduces_golden() {
             kv_page_size,
             kv_pages,
             max_seq_len: 4096,
-            kv_dtype: DType::F16,
+            kv_quant: forge_engine::kv::KvQuant::F16,
         },
     )
     .expect("load model");

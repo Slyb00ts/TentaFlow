@@ -69,7 +69,7 @@ async fn qwen3_tool_calls_end_to_end() {
                 0,
                 PoolSizes {
                     weights: 3 << 30,
-                    kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, forge_types::DType::F16),
+                    kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, forge_engine::kv::KvQuant::F16),
                     activations: 1 << 30,
                     kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
                 },
@@ -83,7 +83,7 @@ async fn qwen3_tool_calls_end_to_end() {
                     kv_page_size,
                     kv_pages,
                     max_seq_len: 4096,
-                    kv_dtype: forge_types::DType::F16,
+                    kv_quant: forge_engine::kv::KvQuant::F16,
                 },
             )
             .expect("load model");

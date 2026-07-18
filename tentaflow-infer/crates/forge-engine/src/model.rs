@@ -13,10 +13,10 @@ use std::sync::Arc;
 use forge_hal::{DevBuffer, Device, ExecGraph, Pool, Stream};
 use forge_formats::PoolingType;
 use forge_kernels::Kernels;
-use forge_types::{DType, ForgeError, MemKind, Result};
+use forge_types::{ForgeError, MemKind, Result};
 use half::f16;
 
-use crate::kv::{KvCache, KvConfig, SeqKv};
+use crate::kv::{KvCache, KvConfig, KvQuant, SeqKv};
 use crate::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use crate::weights::{DevWeight, GateUpWeights, ModelWeights, QkvWeights};
 
@@ -101,11 +101,11 @@ pub struct ModelConfig {
     pub kv_page_size: usize,
     pub kv_pages: usize,
     pub max_seq_len: usize,
-    /// KV cache element type: F16 (default, bit-exact canonical path) or
-    /// F8E4M3 (halves KV memory + bandwidth; per-value scale-free e4m3 —
-    /// its ±448 range with 2^-9 denormals covers post-norm K/V magnitudes).
-    /// FP8 requires the fused decode path (validated at load).
-    pub kv_dtype: DType,
+    /// KV cache storage mode. F16 (default, bit-exact canonical path), Fp8
+    /// (halves KV memory + bandwidth; per-value scale-free e4m3, fused decode
+    /// only), or Rot{bits} (TurboQuant-class rotational 3/4-bit; single-stream
+    /// decode path). Validated at load.
+    pub kv_quant: KvQuant,
 }
 
 impl Default for ModelConfig {
@@ -114,7 +114,7 @@ impl Default for ModelConfig {
             kv_page_size: 32,
             kv_pages: 512,
             max_seq_len: 8192,
-            kv_dtype: DType::F16,
+            kv_quant: KvQuant::F16,
         }
     }
 }
@@ -294,9 +294,9 @@ impl Model {
                 p.head_dim
             )));
         }
-        match cfg.kv_dtype {
-            DType::F16 => {}
-            DType::F8E4M3 => {
+        match cfg.kv_quant {
+            KvQuant::F16 => {}
+            KvQuant::Fp8 => {
                 // The non-fused decode chain (qkv_post + attn_decode) has no
                 // fp8 cache kernels; fp8 decode goes through attn_decode_split
                 // exclusively.
@@ -308,10 +308,15 @@ impl Model {
                     ));
                 }
             }
-            other => {
-                return Err(ForgeError::Unsupported(format!(
-                    "kv_dtype {other} is not a supported KV cache element type (f16 | f8e4m3)"
-                )))
+            KvQuant::Rot { bits, .. } => {
+                if bits != 3 && bits != 4 {
+                    return Err(ForgeError::Unsupported(format!(
+                        "rotational KV supports 3 or 4 bits, got {bits}"
+                    )));
+                }
+                // Rot decode reads the packed store through attn_decode_rot;
+                // prefill stays on the bit-exact f16 slab. Only head_dim 64/128
+                // have compiled specializations (already checked above).
             }
         }
         let max_pages_per_seq = cfg.max_seq_len.div_ceil(cfg.kv_page_size);
@@ -325,7 +330,7 @@ impl Model {
                 page_size: cfg.kv_page_size,
                 n_pages: cfg.kv_pages,
                 max_pages_per_seq,
-                dtype: cfg.kv_dtype,
+                quant: cfg.kv_quant,
             },
         )?;
         let stream = device.create_stream()?;
@@ -1371,7 +1376,7 @@ impl Model {
                 p.n_kv_heads,
                 self.kv.cfg.page_size,
                 p.head_dim,
-                self.kv.cfg.dtype,
+                self.kv.cfg.dtype(),
                 stream,
             )?;
             trace.mark(self.device.as_ref(), "kv_append");
@@ -1387,11 +1392,34 @@ impl Model {
                 p.n_kv_heads,
                 p.head_dim,
                 self.kv.cfg.page_size,
-                self.kv.cfg.dtype,
+                self.kv.cfg.dtype(),
                 scale,
                 stream,
             )?;
             trace.mark(self.device.as_ref(), "attn");
+
+            // Rot modes: commit the chunk's just-appended f16 K/V into the
+            // low-bit rotational store (decode reads it directly). Prefill
+            // attention above already ran on the bit-exact f16 slab.
+            if let KvQuant::Rot { bits, .. } = self.kv.cfg.quant {
+                kernels.kv_pack_rot_from_cache(
+                    &self.kv.k_packed[l],
+                    &self.kv.v_packed[l],
+                    &self.kv.k_scale[l],
+                    &self.kv.v_scale[l],
+                    &self.kv.k[l],
+                    &self.kv.v[l],
+                    &self.page_table_dev,
+                    base_pos,
+                    t,
+                    p.n_kv_heads,
+                    self.kv.cfg.page_size,
+                    p.head_dim,
+                    bits,
+                    stream,
+                )?;
+                trace.mark(self.device.as_ref(), "kv_pack_rot");
+            }
 
             self.gemm(&pb.o_out, &layer.attn_o, &pb.attn_out, t, stream)?;
             trace.mark(self.device.as_ref(), "gemm_o");
@@ -1640,12 +1668,134 @@ impl Model {
             )?;
         }
 
+        // Rot decode reads the packed low-bit store through attn_decode_rot and
+        // commits the current token with a host-known position, so it runs
+        // directly on the stream (not through the position-baked decode graph).
+        if self.kv.cfg.quant.is_rot() {
+            return self.run_decode_rot(pos);
+        }
+
         if self.decode_graph.is_none() {
             let graph = self.capture_step()?;
             self.decode_graph = Some(graph);
         }
         let graph = self.decode_graph.as_ref().expect("captured above").clone();
         self.device.launch_graph(&graph, &self.stream)
+    }
+
+    /// One decode step for the rotational KV modes. Mirrors the non-fused
+    /// decode chain (explicit rmsnorm → qkv → norm/rope → paged f16 append)
+    /// but commits the appended token into the packed low-bit store and reads
+    /// it back through attn_decode_rot (rotate q once, score in rotated space,
+    /// inverse-rotate the V accumulator). Runs directly on the stream; the
+    /// current position `base_pos` is a host value, so no CUDA-graph capture.
+    fn run_decode_rot(&self, base_pos: usize) -> Result<()> {
+        let p = self.weights.descriptor.params.clone();
+        let hidden = p.hidden_size;
+        let inter = p.intermediate_size;
+        let eps = p.rms_norm_eps;
+        let kernels = &self.kernels;
+        let stream = &self.stream;
+        let b = &self.bufs;
+        let scale = 1.0 / (p.head_dim as f32).sqrt();
+        let q_dim = p.n_heads * p.head_dim;
+        let kv_dim = p.n_kv_heads * p.head_dim;
+        let k_byte_off = q_dim * 2;
+        let v_byte_off = (q_dim + kv_dim) * 2;
+        let bits = self.kv.cfg.quant.bits().expect("rot mode has bits");
+
+        kernels.gather_rows_f16(&b.h, &self.weights.token_embd_f16, &b.ids, 1, hidden, stream)?;
+        kernels.rmsnorm_f16(&b.x, &b.h, &self.weights.layers[0].attn_norm, 1, hidden, eps, stream)?;
+
+        let n_layers = self.weights.layers.len();
+        for l in 0..n_layers {
+            let layer = &self.weights.layers[l];
+            let q_buf = match &layer.attn_qkv {
+                QkvWeights::Fused(w) => {
+                    self.gemv(&b.qkv, w, &b.x, stream)?;
+                    kernels.qkv_post_f16(
+                        &b.qkv, 0, &b.qkv, k_byte_off, &b.qkv, v_byte_off,
+                        layer.q_norm.as_ref(), layer.k_norm.as_ref(),
+                        &self.kv.k[l], &self.kv.v[l], &b.pos, &self.page_table_dev,
+                        &self.seq_len_dev, p.n_heads, p.n_kv_heads, p.head_dim,
+                        self.kv.cfg.page_size, eps, p.rope_theta, stream,
+                    )?;
+                    &b.qkv
+                }
+                QkvWeights::FusedQk { qk, v } => {
+                    self.gemv(&b.qkv, qk, &b.x, stream)?;
+                    self.gemv(&b.v, v, &b.x, stream)?;
+                    kernels.qkv_post_f16(
+                        &b.qkv, 0, &b.qkv, k_byte_off, &b.v, 0,
+                        layer.q_norm.as_ref(), layer.k_norm.as_ref(),
+                        &self.kv.k[l], &self.kv.v[l], &b.pos, &self.page_table_dev,
+                        &self.seq_len_dev, p.n_heads, p.n_kv_heads, p.head_dim,
+                        self.kv.cfg.page_size, eps, p.rope_theta, stream,
+                    )?;
+                    &b.qkv
+                }
+                QkvWeights::Split { q, k, v } => {
+                    self.gemv(&b.q, q, &b.x, stream)?;
+                    self.gemv(&b.k, k, &b.x, stream)?;
+                    self.gemv(&b.v, v, &b.x, stream)?;
+                    if let Some(qn) = &layer.q_norm {
+                        kernels.rmsnorm_f16(&b.q, &b.q, qn, p.n_heads, p.head_dim, eps, stream)?;
+                    }
+                    if let Some(kn) = &layer.k_norm {
+                        kernels.rmsnorm_f16(&b.k, &b.k, kn, p.n_kv_heads, p.head_dim, eps, stream)?;
+                    }
+                    kernels.rope_neox_f16(&b.q, &b.pos, 1, p.n_heads, p.head_dim, p.rope_theta, stream)?;
+                    kernels.rope_neox_f16(&b.k, &b.pos, 1, p.n_kv_heads, p.head_dim, p.rope_theta, stream)?;
+                    kernels.kv_append_f16(
+                        &self.kv.k[l], &self.kv.v[l], &b.k, &b.v, &self.page_table_dev,
+                        &self.seq_len_dev, p.n_kv_heads, self.kv.cfg.page_size, p.head_dim, stream,
+                    )?;
+                    &b.q
+                }
+            };
+
+            // Commit the appended token into the packed low-bit store, then
+            // attend over it. q_buf's q head occupies the first q_dim elements.
+            kernels.kv_pack_rot_from_cache(
+                &self.kv.k_packed[l], &self.kv.v_packed[l],
+                &self.kv.k_scale[l], &self.kv.v_scale[l],
+                &self.kv.k[l], &self.kv.v[l], &self.page_table_dev,
+                base_pos, 1, p.n_kv_heads, self.kv.cfg.page_size, p.head_dim, bits, stream,
+            )?;
+            kernels.attn_decode_rot(
+                &b.attn_out, q_buf, 0,
+                &self.kv.k_packed[l], &self.kv.v_packed[l],
+                &self.kv.k_scale[l], &self.kv.v_scale[l],
+                &self.page_table_dev, &self.seq_len_dev,
+                1, p.n_heads, p.n_kv_heads, p.head_dim,
+                self.kv.cfg.page_size, self.max_pages_per_seq, bits, scale, stream,
+            )?;
+
+            self.gemv(&b.o_out, &layer.attn_o, &b.attn_out, stream)?;
+            kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.o_out, &layer.ffn_norm, 1, hidden, eps, stream)?;
+
+            match &layer.ffn_gate_up {
+                GateUpWeights::Fused(w) => {
+                    self.gemv(&b.gate_up, w, &b.x, stream)?;
+                    kernels.silu_mul_f16_at(&b.act, &b.gate_up, 0, inter * 2, inter, stream)?;
+                }
+                GateUpWeights::Split { gate, up } => {
+                    self.gemv(&b.gate, gate, &b.x, stream)?;
+                    self.gemv(&b.up, up, &b.x, stream)?;
+                    kernels.silu_mul_f16(&b.act, &b.gate, &b.up, inter, stream)?;
+                }
+            }
+            self.gemv(&b.down, &layer.ffn_down, &b.act, stream)?;
+
+            let next_norm = if l + 1 < n_layers {
+                &self.weights.layers[l + 1].attn_norm
+            } else {
+                &self.weights.output_norm
+            };
+            kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.down, next_norm, 1, hidden, eps, stream)?;
+        }
+
+        self.logits_gemv(&b.logits, &b.x, stream)
     }
 
     /// Whether requests with these sampling params can sample on the GPU:
@@ -2009,7 +2159,7 @@ impl Model {
                 self.kv.cfg.page_size,
                 self.max_pages_per_seq,
                 ATTN_DECODE_SPLITS,
-                self.kv.cfg.dtype,
+                self.kv.cfg.dtype(),
                 eps,
                 p.rope_theta,
                 scale,
@@ -2201,7 +2351,7 @@ impl Model {
                 self.kv.cfg.page_size,
                 self.max_pages_per_seq,
                 ATTN_DECODE_SPLITS,
-                self.kv.cfg.dtype,
+                self.kv.cfg.dtype(),
                 eps,
                 p.rope_theta,
                 scale,
@@ -2274,6 +2424,17 @@ impl Model {
         if tokens.len() != b || params.len() != b {
             return Err(ForgeError::Scheduler(
                 "batched_decode: seqs/tokens/params length mismatch".into(),
+            ));
+        }
+        // Rot modes commit each appended token into the packed low-bit store on
+        // the single-stream decode path only; the batched path would append to
+        // the f16 slab without packing, leaving the packed store stale. Refuse
+        // rather than read a stale store. (Batched rot decode is a follow-up.)
+        if self.kv.cfg.quant.is_rot() {
+            return Err(ForgeError::Unsupported(
+                "rotational KV (rot4/rot3) supports single-stream decode only; \
+                 disable batching for this model"
+                    .into(),
             ));
         }
         self.ensure_batch(b)?;
