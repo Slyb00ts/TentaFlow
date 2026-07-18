@@ -13,6 +13,7 @@ use forge_types::{ForgeError, Result};
 
 use crate::generate::FinishReason;
 use crate::kv::SeqKv;
+use crate::metrics::{EngineMetrics, SeqTiming};
 use crate::model::{Model, MAX_PREFILL_CHUNK, MAX_SPEC_DRAFT};
 use crate::sample::{
     apply_logit_bias, compute_logprob, suppress_eos, GpuSampler, Sampler, SamplingParams,
@@ -110,6 +111,7 @@ struct Submission {
 #[derive(Clone)]
 pub struct EngineHandle {
     tx: mpsc::Sender<Submission>,
+    metrics: Arc<EngineMetrics>,
 }
 
 impl EngineHandle {
@@ -120,6 +122,12 @@ impl EngineHandle {
             .send(Submission { req, events: etx })
             .map_err(|_| ForgeError::Scheduler("engine worker stopped".into()))?;
         Ok(erx)
+    }
+
+    /// Live observability counters/gauges/histograms (SPEC §8.3), shared with
+    /// the worker thread. Read-only for callers.
+    pub fn metrics(&self) -> &Arc<EngineMetrics> {
+        &self.metrics
     }
 }
 
@@ -178,6 +186,11 @@ struct ActiveSeq<'t> {
     /// Draft tokens accepted across all verifications (excludes correction/bonus
     /// tokens, which every forward also produces).
     spec_accepted: u64,
+    /// TTFT / inter-token / decode-tps timing feeding the metrics histograms.
+    timing: SeqTiming,
+    /// Set once `finish` has emitted `Done`; distinguishes a clean completion
+    /// from an errored / hung-up teardown for the requests_errored counter.
+    finished_cleanly: bool,
 }
 
 /// Spawn the GPU worker thread. `prefill_chunk` bounds how many prompt tokens
@@ -245,6 +258,8 @@ pub fn spawn_engine_batched(
         );
     }
     let (tx, rx) = mpsc::channel::<Submission>();
+    let metrics = Arc::new(EngineMetrics::new());
+    let worker_metrics = metrics.clone();
     std::thread::Builder::new()
         .name("forge-engine-worker".into())
         .spawn(move || {
@@ -256,10 +271,11 @@ pub fn spawn_engine_batched(
                 prefill_chunk,
                 batch_min,
                 spec,
+                &worker_metrics,
             )
         })
         .expect("spawn engine worker");
-    EngineHandle { tx }
+    EngineHandle { tx, metrics }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -271,9 +287,12 @@ fn worker<'t>(
     prefill_chunk: usize,
     batch_min: usize,
     spec: SpeculativeConfig,
+    metrics: &EngineMetrics,
 ) {
     let mut active: Vec<ActiveSeq<'t>> = Vec::new();
     let mut waiting: VecDeque<Submission> = VecDeque::new();
+    // Total KV pages is fixed at startup; export it once as a gauge baseline.
+    EngineMetrics::set(&metrics.kv_pages_total, model.kv.cfg.n_pages as u64);
 
     // Provision the batched-decode scratch + graph buckets for the full active
     // width once. A failure here (VRAM pressure) is surfaced per-request by the
@@ -330,6 +349,7 @@ fn worker<'t>(
                     ),
                     None => "request size overflows: prompt_tokens + max_tokens".into(),
                 }));
+                EngineMetrics::inc(&metrics.requests_errored);
                 continue;
             }
             // A prefix-cache hit (SPEC §5.2) shrinks the pages this request must
@@ -351,6 +371,7 @@ fn worker<'t>(
             let sub = waiting.pop_front().unwrap();
             if sub.req.prompt_tokens.is_empty() {
                 let _ = sub.events.send(EngineEvent::Error("empty prompt".into()));
+                EngineMetrics::inc(&metrics.requests_errored);
                 continue;
             }
             let prompt = sub.req.prompt_tokens;
@@ -416,8 +437,21 @@ fn worker<'t>(
                 spec_budget,
                 spec_forwards: 0,
                 spec_accepted: 0,
+                timing: SeqTiming::new(),
+                finished_cleanly: false,
             });
+            EngineMetrics::inc(&metrics.requests_started);
         }
+
+        // Gauges reflect the worker's current view each iteration: how many
+        // sequences decode/prefill, how deep the admission queue is, and how
+        // many KV pages are off the free stack (held by seqs + prefix tree).
+        EngineMetrics::set(&metrics.active_sequences, active.len() as u64);
+        EngineMetrics::set(&metrics.queued_sequences, waiting.len() as u64);
+        EngineMetrics::set(
+            &metrics.kv_pages_used,
+            (model.kv.cfg.n_pages.saturating_sub(model.kv.free_page_count())) as u64,
+        );
 
         // Cross-sequence tier balance: before the iteration touches the pool,
         // spill the globally coldest pages (across all active sequences) so
@@ -463,17 +497,24 @@ fn worker<'t>(
             if gpu && decoding {
                 continue; // handled by the batch below
             }
-            if let Err(e) = advance(model, a, prefill_chunk) {
+            if let Err(e) = advance(model, a, prefill_chunk, metrics) {
                 let _ = a.events.send(EngineEvent::Error(e.to_string()));
                 a.dead = true;
             }
         }
-        batch_gpu_decode(model, &mut active, batch_min);
+        batch_gpu_decode(model, &mut active, batch_min, metrics);
 
         // Tear down finished/dead sequences and release their pages (and any
         // tier chunks they spilled).
         active.retain_mut(|a| {
             if a.dead {
+                // A dead sequence that never reached `finish` (engine error,
+                // batched-decode failure, or client hang-up) is an errored
+                // outcome for the counter; clean completions already counted in
+                // `finish`.
+                if !a.finished_cleanly {
+                    EngineMetrics::inc(&metrics.requests_errored);
+                }
                 model.release_seq(&mut a.seq);
                 false
             } else {
@@ -497,12 +538,15 @@ fn emit_token(
     a: &mut ActiveSeq<'_>,
     next: u32,
     logprob: Option<TokenLogprob>,
+    metrics: &EngineMetrics,
 ) -> Result<StepOutcome> {
     if a.eos_ids.contains(&next) {
-        finish(a, FinishReason::Eos)?;
+        finish(a, FinishReason::Eos, metrics)?;
         return Ok(StepOutcome::Finished);
     }
     a.generated.push(next);
+    // A produced token: feeds TTFT (first) or the inter-token gap (later).
+    a.timing.record_token(metrics);
 
     let piece = a.decoder.push(next)?;
     let mut emit_text = String::new();
@@ -529,12 +573,12 @@ fn emit_token(
         return Ok(StepOutcome::Finished);
     }
     if matched {
-        finish(a, FinishReason::Stop)?;
+        finish(a, FinishReason::Stop, metrics)?;
         return Ok(StepOutcome::Finished);
     }
 
     if a.generated.len() >= a.max_tokens {
-        finish(a, FinishReason::Length)?;
+        finish(a, FinishReason::Length, metrics)?;
         return Ok(StepOutcome::Finished);
     }
     Ok(StepOutcome::Continue)
@@ -542,7 +586,12 @@ fn emit_token(
 
 /// Advance one sequence by one scheduler quantum (prefill chunk or a single
 /// CPU-sampled decode step). GPU-sampled decode goes through the batched path.
-fn advance(model: &mut Model, a: &mut ActiveSeq<'_>, prefill_chunk: usize) -> Result<()> {
+fn advance(
+    model: &mut Model,
+    a: &mut ActiveSeq<'_>,
+    prefill_chunk: usize,
+    metrics: &EngineMetrics,
+) -> Result<()> {
     if !a.pending_prompt.is_empty() {
         // Chunked prefill: one quantum per iteration keeps decode ITL of the
         // other sequences bounded; the 32-token floor keeps tiny configured
@@ -602,7 +651,7 @@ fn advance(model: &mut Model, a: &mut ActiveSeq<'_>, prefill_chunk: usize) -> Re
         m.accept_token(next);
     }
 
-    if let StepOutcome::Finished = emit_token(a, next, logprob)? {
+    if let StepOutcome::Finished = emit_token(a, next, logprob, metrics)? {
         return Ok(());
     }
 
@@ -620,7 +669,12 @@ fn advance(model: &mut Model, a: &mut ActiveSeq<'_>, prefill_chunk: usize) -> Re
 /// Each sequence's current token is emitted and termination-checked first;
 /// survivors are fed together into `Model::batched_decode`, which samples all
 /// their successors on the GPU in one launch set.
-fn batch_gpu_decode(model: &mut Model, active: &mut [ActiveSeq<'_>], batch_min: usize) {
+fn batch_gpu_decode(
+    model: &mut Model,
+    active: &mut [ActiveSeq<'_>],
+    batch_min: usize,
+    metrics: &EngineMetrics,
+) {
     let vocab = model.weights.descriptor.params.vocab_size;
 
     // Phase 1: emit each ready sequence's pending token; collect the indices of
@@ -644,13 +698,13 @@ fn batch_gpu_decode(model: &mut Model, active: &mut [ActiveSeq<'_>], batch_min: 
             }
             None => continue,
         };
-        match emit_token(a, next, None) {
+        match emit_token(a, next, None, metrics) {
             // A speculative sequence runs its own draft/verify step here and
             // never joins the batched (or serial fallback) feed set — the n-gram
             // path is a single-sequence latency win, disabled under batch load.
             Ok(StepOutcome::Continue) => {
                 if a.spec.is_some() {
-                    speculative_step(model, a);
+                    speculative_step(model, a, metrics);
                 } else {
                     feed_idx.push(i);
                 }
@@ -753,7 +807,7 @@ fn serial_step(model: &mut Model, a: &mut ActiveSeq<'_>) {
 /// stashed as the next pending token. An empty draft (no suffix match) falls
 /// back to a single fused greedy step, identical to `serial_step`. Output is
 /// token-for-token identical to non-speculative greedy decode.
-fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>) {
+fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>, metrics: &EngineMetrics) {
     let fed = *a.generated.last().expect("emit_token pushed the fed token");
     let budget = a.spec_budget;
     let draft = {
@@ -810,7 +864,7 @@ fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>) {
     // / hang-up here finishes the sequence (KV is already rolled back to the
     // accepted prefix) — exactly what sequential decode would have produced.
     for &tok in &draft[..accepted] {
-        match emit_token(a, tok, None) {
+        match emit_token(a, tok, None, metrics) {
             Ok(StepOutcome::Continue) => {}
             Ok(StepOutcome::Finished) => return,
             Err(e) => {
@@ -828,7 +882,7 @@ fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>) {
     a.next = Some(PendingNext::Token(correction));
 }
 
-fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason) -> Result<()> {
+fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason, metrics: &EngineMetrics) -> Result<()> {
     // Flush held text through the same stop/event path as live tokens.
     if reason != FinishReason::Stop {
         let last_id = a.generated.last().copied().unwrap_or(0);
@@ -875,6 +929,17 @@ fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason) -> Result<()> {
             );
         }
     }
+    // Terminal accounting (SPEC §8.3): a finished request contributes its
+    // prompt/generated/cache-read token totals, speculation acceptance and its
+    // decode throughput. `finish` runs exactly once per sequence (it sets
+    // `dead`), so no double counting.
+    EngineMetrics::inc(&metrics.requests_finished);
+    EngineMetrics::add(&metrics.prompt_tokens_total, a.prompt_len as u64);
+    EngineMetrics::add(&metrics.generated_tokens_total, a.generated.len() as u64);
+    EngineMetrics::add(&metrics.cache_read_tokens_total, a.cache_read as u64);
+    EngineMetrics::add(&metrics.spec_forwards_total, a.spec_forwards);
+    EngineMetrics::add(&metrics.spec_accepted_total, a.spec_accepted);
+    a.timing.record_decode_tps(metrics);
     let _ = a.events.send(EngineEvent::Done {
         reason,
         tokens: a.generated.len(),
@@ -882,5 +947,6 @@ fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason) -> Result<()> {
         cache_read_tokens: a.cache_read,
     });
     a.dead = true;
+    a.finished_cleanly = true;
     Ok(())
 }

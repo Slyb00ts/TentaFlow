@@ -5,9 +5,11 @@
 // rejections surface as 429 + Retry-After. /v1/audio/transcriptions is served
 // when a Whisper model is configured (`forge serve --whisper-model`).
 
+pub mod anthropic;
 pub mod api;
 pub mod error;
 pub mod grammar;
+pub mod metrics;
 pub mod routes;
 pub mod source;
 pub mod toolcall;
@@ -89,6 +91,9 @@ pub struct ServerState {
     /// Admission cap for embedding requests: each holds one blocking-pool
     /// thread while the single-sequence embedding model works its batch.
     pub embed_slots: tokio::sync::Semaphore,
+    /// HTTP-level request counts (route + status) for /metrics; the engine's
+    /// own counters/gauges/histograms are read live via `engine.metrics()`.
+    pub http_metrics: metrics::HttpMetrics,
 }
 
 impl ServerState {
@@ -130,15 +135,19 @@ impl ServerState {
             stt_slots: tokio::sync::Semaphore::new(4),
             embed,
             embed_slots: tokio::sync::Semaphore::new(4),
+            http_metrics: metrics::HttpMetrics::default(),
         })
     }
 }
 
-/// Full application router. /healthz stays outside the API-key gate.
+/// Full application router. /healthz and /metrics stay outside the API-key gate
+/// (standard health-check + Prometheus scrape reachability).
 pub fn build_router(state: Arc<ServerState>) -> Router {
     let v1 = Router::new()
         .route("/chat/completions", post(routes::chat_completions))
         .route("/completions", post(routes::completions))
+        // Anthropic-compatible Messages API (SPEC §8.1).
+        .route("/messages", post(anthropic::messages))
         // Raised body limit: a 30 s stereo f32 WAV is well past axum's 2 MB
         // default multipart cap.
         .route(
@@ -155,6 +164,13 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .nest("/v1", v1)
         .route("/healthz", get(routes::healthz))
+        .route("/metrics", get(routes::metrics_endpoint))
+        // Records route + status for every request into HttpMetrics, applied to
+        // the whole router (including /healthz and /metrics scrapes).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            routes::record_http_metrics,
+        ))
         .with_state(state)
 }
 

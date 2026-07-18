@@ -18,6 +18,7 @@ forge run         # jednorazowa generacja do stdout (streaming)
 forge bench       # pomiar prefill/decode tok/s
 forge embed       # wektor embeddingu dla tekstu
 forge transcribe  # transkrypcja WAV (Whisper)
+forge onnx-run    # załaduj model ONNX, wypisz pokrycie opów, uruchom na GPU (VAD)
 ```
 
 Wspólny wzorzec: pierwszy argument pozycyjny to ścieżka modelu — plik `.gguf`
@@ -294,8 +295,69 @@ Zweryfikowane (RTX 4090, qwen3-0.6b-q8_0, `tests/e2e_speculative.rs`):
 | `--embed-model <PATH>` | brak | Model embeddingowy — włącza `POST /v1/embeddings`. Gdy pominięte, a serwowany model sam jest embeddingowy, jest reużywany. |
 | `--speculative <M>` | `off` | Dekodowanie spekulatywne (patrz sekcja wyżej): `off` \| `on` \| `ngram` \| `ngram:<k>`. Wymusza `--prefix-cache off`. |
 
-Endpointy: `/v1/chat/completions`, `/v1/completions`, `/v1/models`,
-`/v1/embeddings`, `/v1/audio/transcriptions`, `/healthz`.
+Endpointy: `/v1/chat/completions`, `/v1/completions`, `/v1/messages`
+(Anthropic), `/v1/models`, `/v1/embeddings`, `/v1/audio/transcriptions`,
+`/healthz`, `/metrics`.
+
+`/healthz` i `/metrics` są POZA bramką `--api-key` (standardowy health-check +
+scrape Prometheus). Reszta `/v1/*` jest za bramką gdy `--api-key` ustawione.
+
+---
+
+## Metryki Prometheus (`GET /metrics`, SPEC §8.3)
+
+Format text exposition 0.0.4 (`Content-Type: text/plain; version=0.0.4`).
+Wszystkie wartości pochodzą z realnego stanu silnika/HTTP (nic syntetycznego);
+wątek workera aktualizuje atomiki in-place, handler tylko czyta.
+
+| Metryka | Typ | Opis |
+|---|---|---|
+| `forge_http_requests_total{route,status}` | counter | Żądania HTTP wg szablonu trasy + kod statusu. |
+| `forge_engine_requests_started_total` | counter | Requesty przyjęte do aktywnego slotu. |
+| `forge_engine_requests_finished_total` | counter | Requesty zakończone (terminal Done). |
+| `forge_engine_requests_errored_total` | counter | Błąd silnika / odrzucenie admission / rozłączenie klienta. |
+| `forge_engine_prompt_tokens_total` | counter | Tokeny promptu (zakończone requesty). |
+| `forge_engine_generated_tokens_total` | counter | Tokeny wygenerowane (completion). |
+| `forge_engine_cache_read_tokens_total` | counter | Tokeny promptu z radix prefix-cache (§5.2). |
+| `forge_engine_speculative_forwards_total` | counter | Forwardy weryfikacji spekulacji (§6; 0 gdy off). |
+| `forge_engine_speculative_accepted_total` | counter | Zaakceptowane tokeny draftu. |
+| `forge_engine_active_sequences` | gauge | Sekwencje aktualnie dekodujące/prefillujące. |
+| `forge_engine_queued_sequences` | gauge | Głębokość kolejki admission (KV pressure). |
+| `forge_engine_kv_pages_total` / `_used` | gauge | Strony KV w puli VRAM: łącznie / zajęte. |
+| `forge_engine_ttft_seconds` | histogram | Time-to-first-token per request. |
+| `forge_engine_inter_token_seconds` | histogram | Latencja między tokenami per krok decode. |
+| `forge_engine_decode_tokens_per_second` | histogram | Przepustowość decode per request. |
+| `forge_build_info{model}` | gauge | Tożsamość serwowanego modelu (wartość 1). |
+
+Prefix-cache hit-rate liczysz jako `cache_read_tokens_total / prompt_tokens_total`;
+acceptance spekulacji jako `speculative_accepted_total / speculative_forwards_total`.
+
+---
+
+## API Anthropic Messages (`POST /v1/messages`, SPEC §8.1)
+
+Warstwa translacji nad tą samą ścieżką generacji co `/v1/chat/completions`.
+
+| Pole | Uwagi |
+|---|---|
+| `model` | Musi zgadzać się z `--model-id` (inaczej 404). |
+| `system` | String lub tablica bloków `{type:"text",text}` → prepend jako `system`. |
+| `messages` | `role` ∈ `{user,assistant}`; `content` string lub tablica bloków (tekst konkatenowany; bloki nie-tekstowe pomijane). |
+| `max_tokens` | WYMAGANE (budżet completion); brak/0 → 400. |
+| `stop_sequences` | Tablica stringów (holdback jak `stop`). |
+| `temperature` / `top_p` / `top_k` | Jak w OpenAI. |
+| `stream` | SSE Anthropic (patrz niżej). |
+
+Odpowiedź non-stream: `{id,type:"message",role:"assistant",model,
+content:[{type:"text",text}],stop_reason,stop_sequence,usage:{input_tokens,
+output_tokens}}`. Streaming: sekwencja eventów `message_start` →
+`content_block_start` → `content_block_delta{delta:{type:"text_delta",text}}` →
+`content_block_stop` → `message_delta{delta:{stop_reason}}` → `message_stop`.
+
+`stop_reason`: EOS→`end_turn`, limit `max_tokens`→`max_tokens`, dopasowana
+stop-sekwencja→`stop_sequence`. `<think>…</think>` zdejmowany (nie trafia do
+bloku tekstowego). Braki: bloki `tool_use`/`tool_result`, `thinking`,
+`/v1/messages/count_tokens`.
 
 ---
 
@@ -329,6 +391,13 @@ obsłużony z radix prefix-cache (SPEC §5.2; pomijane gdy 0) — patrz sekcja
 
 Usage przy `n>1`: `prompt_tokens` liczony raz, `completion_tokens` sumowany po
 wszystkich completions.
+
+`prompt` (completions, SPEC §8.5 batch): pojedynczy string, tablica stringów,
+pojedyncza tablica token-id, albo tablica tablic token-id. Batch prompta ×`n`
+completions submitowany JEST RAZEM (wszystkie `engine.submit` przed pierwszym
+`await`), więc scheduler łączy je w jeden decode-batch zamiast serializować.
+`choices[]` z bieżącym `index` prompt-major; `usage.prompt_tokens` liczy każdy
+prompt raz. Streaming odrzucany gdy `prompts × n > 1` (400).
 
 `logit_bias`/`min_tokens`/`logprobs` (oraz maska gramatyki) wymuszają sampler CPU
 (pełne logity na hoście); żądanie bez żadnej z tych funkcji zostaje na samplerze
@@ -469,11 +538,42 @@ Uwaga metodyczna: prefill mierzony do pierwszego WIDOCZNEGO tokenu (zawiera
 
 ---
 
+## forge onnx-run
+
+Ładuje model ONNX (subset opset 17+, `forge-onnx`), wypisuje opset, wejścia/
+wyjścia grafu oraz histogram typów operacji (łącznie z podgrafami `If`). Gdy
+model ma sygnaturę Silero VAD (wejścia `input`/`state`/`sr`), syntetyzuje jeden
+frame audio i uruchamia model na GPU (kernele Mojo f32), wypisując
+prawdopodobieństwo mowy oraz czas. Inne modele są tylko parsowane (uruchomienie
+wymaga wejść specyficznych dla modelu).
+
+```
+forge onnx-run .runtime/models/audio/silero_vad.onnx
+forge onnx-run silero_vad.onnx --signal zero
+forge onnx-run silero_vad.onnx --samples 512 --sr 16000 --signal sine
+```
+
+| Flaga | Domyślnie | Opis |
+|---|---|---|
+| `--samples <N>` | `512` | Liczba próbek w syntetycznym frame (16 kHz VAD oczekuje 512). |
+| `--sr <HZ>` | `16000` | Wartość wejścia `sr` przekazana do modelu. |
+| `--signal <S>` | `sine` | Sygnał testowy: `sine` (sin(i·0.1)·0.1), `zero`, `ones`. |
+
+Ciężka arytmetyka (Conv1d, LSTM, Relu/Sigmoid/Sqrt, Add, Pow, ReduceMean) liczy
+się na GPU; operacje kształtu/kontroli (Shape/Gather/Slice/Concat/Reshape/
+Transpose/Pad-reflect/Cast/Equal/Not/If) na hoście. Weryfikacja numeryczna: test
+`forge-onnx` `silero_vad_matches_onnxruntime` porównuje wynik z referencją
+onnxruntime (|Δ| ~1e-6, tol 1e-3). Model VAD można wskazać przez
+`FORGE_SILERO_VAD` (test integracyjny).
+
+---
+
 ## Zmienne środowiskowe
 
 | Zmienna | Opis |
 |---|---|
 | `FORGE_KERNEL_DIR` | Ścieżka do `kernels/mojo/build` — nadpisuje wbudowane artefakty PTX (iteracja nad kernelami bez rebuildu Rusta). |
+| `FORGE_SILERO_VAD` | Ścieżka do `silero_vad.onnx` dla testu integracyjnego `forge-onnx` (domyślnie lokalizacja w `.runtime`). |
 | `FORGE_BATCH_MIN` | Nadpisuje próg `--batch-min` (diagnostyka). |
 | `FORGE_PREFILL_TRACE=1` | Wypisuje czasy faz prefill_chunk (profilowanie). |
 | `HF_TOKEN` | Token HuggingFace dla `forge pull` (repo gated/prywatne), gdy brak `--token`. |

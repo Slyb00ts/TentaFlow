@@ -132,7 +132,18 @@ Ostatnia aktualizacja: 2026-07-18.
     to follow-up.
 - 🟡 **§9.2 Odporność**: admission ✅; brak respawn workera po crashu, health
   per-GPU, pełnego graceful drain.
-- 🟡 **§8.3 Operacyjność**: /healthz ✅; brak metryk Prometheus/OTel, hot reload.
+- 🟡 **§8.3 Operacyjność**: /healthz ✅; **metryki Prometheus ✅** (`GET /metrics`,
+  poza bramką API-key jak /healthz, format text 0.0.4); brak OTel, hot reload.
+  Eksport realnego stanu silnika (nic syntetycznego): liczniki requestów
+  (started/finished/errored), tokeny prompt/generated, `cache_read_tokens`
+  (trafienia prefix-cache §5.2), akceptacje spekulacji (§6), gauge active/queued
+  sekwencji i KV pages (total/used), histogramy TTFT / inter-token latency /
+  decode tok/s (per request), oraz `forge_http_requests_total{route,status}`.
+  Silnik trzyma `Arc<EngineMetrics>` (atomiki + histogramy bez locka), wątek
+  workera aktualizuje in-place, handler /metrics tylko czyta. Dowód:
+  `tests/e2e_api_surface.rs` (po generacji `requests_finished` i
+  `generated_tokens_total` rosną, histogram TTFT ma obserwacje, licznik HTTP
+  rejestruje /v1/messages).
 - 🟡 **§1.2 Cele wydajności**: część spełniona jednokartowo (decode ≥ vLLM na
   niektórych, prefill ≥ llama.cpp); cele multi-node (RoCE 88%) nieosiągalne bez §7.
 
@@ -184,7 +195,21 @@ Ostatnia aktualizacja: 2026-07-18.
     TODO (perf): grouped-GEMM permute/unpermute, batched-MoE decode, graf dla
     ścieżki hybrydowej, KV low-bit dla MoE.
 - ❌ **§4.4 MLA** (DeepSeek), **sliding-window + sinks**, **linear/SSM** (Mamba)
-- ❌ **ONNX** (import grafu → IR; parakeet/silero/depth z .runtime)
+- ✅ **ONNX** (import grafu → IR + wykonanie GPU; `forge-onnx`): własny parser
+  wire-format protobuf (ModelProto/GraphProto/NodeProto/AttributeProto/
+  TensorProto, bounds-checked — granica zaufania §9.5) → lekki typowany IR
+  (węzły, krawędzie po nazwach, inicjalizatory, podgrafy). Hybrydowy interpreter:
+  ciężka arytmetyka (Conv1d, LSTM, Relu/Sigmoid/Sqrt, Add, Pow, ReduceMean) na
+  GPU przez natywne kernele Mojo f32 (`onnx_ops.mojo`: conv1d_f32, lstm_f32,
+  relu/sigmoid/sqrt/add/pow/reduce_mean_f32); operacje kształtu/kontroli (Shape,
+  Gather, Slice, Concat, Reshape, Transpose, Pad-reflect, Cast, Equal, Not, If z
+  podgrafami sr/init-state) na hoście — jak w produkcyjnych runtime'ach ONNX.
+  **Bramka numeryczna (twarda):** Silero VAD (`silero_vad.onnx`, 25 typów op,
+  689 węzłów) uruchomiony na RTX 4090 — prob. mowy `forge` vs `onnxruntime`
+  (CPU EP, ten sam wejściowy frame): sine 0.2987515 vs 0.2987524, cisza
+  0.0442625 vs 0.0442627 (|Δ| ~1e-6 « tol 1e-3). CLI: `forge onnx-run`.
+  Depth-Anything-V2 / jina-embeddings ONNX: parser je czyta (więcej opów do
+  dodania w interpreterze — łatwo rozszerzalny przez `dispatch`).
 
 ### KV / cache zaawansowane
 - ✅ **§5.2 Radix-tree prefix caching** (dedup system-promptów/few-shot/multi-turn):
@@ -201,7 +226,21 @@ Ostatnia aktualizacja: 2026-07-18.
   (`tests/prefix_cache.rs`, `prefix::tests`).
 - ❌ **§5.2 Copy-on-write KV** (beam/n-best), MLA latent cache
 - ❌ **§5.4A Expert streaming** (tiering wag MoE, Colibri) — czeka na MoE
-- ❌ **§5.4B Trwałe sesje KV** (opt-in persystencja między turami)
+- ❌ **§5.4B Trwałe sesje KV** (jawne, klient-podane `session_id`) —
+  **świadoma decyzja: NIE implementujemy jawnego mechanizmu sesji teraz**, bo
+  byłby to redundantny, równoległy tor do już istniejącego radix prefix-cache
+  (§5.2), a to łamie regułę „bez duplikującej ścieżki". Uzasadnienie: realny
+  przypadek multi-turn chat (tura N = prefiks tur 1..N-1 + nowy user msg) jest
+  już pokryty — prefix-cache automatycznie POŻYCZA najdłuższy wspólny prefiks
+  KV, więc tura 2 raportuje `cached_tokens` obejmujące turę 1 (udowodnione:
+  „multi-turn reuse" w §5.2, `tests/prefix_cache.rs`). Jedyne co dołożyłby jawny
+  `session_id` to PINOWANIE prefiksu przeciw eksmisji — a eksmisja zachodzi tylko
+  pod presją KV i re-prefill jest poprawny (borrower produkuje bit-identyczny
+  wynik). Wpięcie jawnych sesji miałoby sens dopiero razem z §5.4B tieringiem
+  (persystencja KV na RAM/NVMe między turami rozłożonymi w czasie) i §9.3
+  izolacją per-tenant — wtedy `session_id` staje się uchwytem do przypiętego,
+  stieryzowanego prefiksu z TTL, a nie samodzielnym cache'em. Do tego czasu
+  prefix-cache jest jedyną, wystarczającą ścieżką reużycia KV.
 - ❌ **§5.3 GDS/cuFile**, hot-swap modeli, **multi-LoRA** (S-LoRA)
 
 ### API / serwowanie
@@ -241,10 +280,32 @@ Ostatnia aktualizacja: 2026-07-18.
     próbkowany przy temp 0, masa prawdopodob. top-N ≤ 1); `n=3` = 3 różne, deterministyczne
     completions. Testy jednostkowe: `sample.rs` (bias/min_tokens/log-softmax),
     `api.rs` (walidacja `n`/`logit_bias`/`min_tokens`/`logprobs`/`echo`).
-- ❌ **§8.1 Anthropic API** (/v1/messages), images endpoint
+- ✅ **§8.1 Anthropic API** (`POST /v1/messages`) — warstwa translacji nad TĄ
+  SAMĄ ścieżką generacji co `/v1/chat/completions` (żadnego równoległego
+  generate). Request Anthropic (`system` string/bloki, `messages` z content
+  string/blokami, `max_tokens`, `stop_sequences`, `temperature`/`top_p`/`top_k`,
+  `stream`) → `Vec<ChatMessage>` + `GenerationSpec` → `start_generation`.
+  Non-stream: `{id,type:"message",role:"assistant",content:[{type:"text",text}],
+  stop_reason,usage:{input_tokens,output_tokens}}`. Streaming: pełna sekwencja
+  SSE `message_start` → `content_block_start` → `content_block_delta{text_delta}`
+  → `content_block_stop` → `message_delta{stop_reason}` → `message_stop`.
+  Mapowanie `stop_reason`: EOS→`end_turn`, limit→`max_tokens`, stop-sekwencja→
+  `stop_sequence` (rozróżnienie `Eos` vs `Stop` z surowego `FinishReason`, bo
+  string OpenAI zwija oba do "stop"). `<think>` zdejmowany przez `OutputParser`.
+  Dowód: `tests/e2e_api_surface.rs` (non-stream + stream spójny tekst, poprawne
+  usage i trzy mapowania stop_reason). Braki: bloki `tool_use`/`tool_result`,
+  `thinking` bloki, `/v1/messages/count_tokens`. Images endpoint nadal ❌.
 - ❌ **§8.2 FORGE-RPC** (QUIC + CBOR, SDK Rust/Py/TS)
 - ❌ **§8.4 Realtime API** (voice-to-voice duplex, barge-in)
-- ❌ **§8.5 Batch / offline API** (joby JSONL)
+- 🟡 **§8.5 Batch / offline API**: `POST /v1/completions` przyjmuje `prompt` jako
+  tablicę stringów LUB tablicę tablic token-id (batch); każdy prompt × `n`
+  completions jest submitowany RAZEM (wszystkie `engine.submit` przed pierwszym
+  `await`), więc scheduler admituje je do jednego decode-batcha zamiast serializować.
+  `choices[]` z bieżącym `index` prompt-major, usage agreguje (prompt liczony raz
+  na prompt, completion tokeny sumowane). Streaming odrzucany gdy prompts×n > 1
+  (400). Dowód: `tests/e2e_api_surface.rs` — 4 prompty w jednym żądaniu → 4 spójne
+  choices w ~0.14 s (batched decode). Braki: asynchroniczne joby JSONL, kolejka
+  throughput per tenant.
 
 ### Produkcja
 - ❌ **§9.3 Multi-tenancy**: OIDC/JWT, kwoty/rate-limit, fair-share scheduler,
@@ -266,7 +327,7 @@ Ostatnia aktualizacja: 2026-07-18.
 | Graph IR + kompilator + autotuner | duży | zamienia ręczny forward |
 | MoE (kernele + expert streaming) | duży | odblokowuje DeepSeek/Mixtral/Qwen-MoE |
 | Modalności TTS/T2I/Video | duży (każda) | osobne silniki |
-| ONNX loader | duży | import opset 17+ subset |
+| ONNX loader | ✅ subset (`forge-onnx`) | Silero VAD e2e na GPU; dokładać opy per model |
 | Radix prefix cache | średni | duży zysk dla multi-turn |
 | FORGE-RPC / Realtime / Batch API | średni (każdy) | |
 | Spekulacja wpięta w decode | średni | framework już jest |
@@ -274,5 +335,5 @@ Ostatnia aktualizacja: 2026-07-18.
 
 Wniosek: rdzeń jednokartowego LLM/STT/embeddings jest mocny i produkcyjny,
 ale to ~1/3 zakresu spec. Największe brakujące dźwignie wartości: multivendor
-HAL, MoE, radix prefix cache, ONNX. Największe "całe
+HAL, MoE, radix prefix cache. Największe "całe
 pillary": multivendor i multi-node.

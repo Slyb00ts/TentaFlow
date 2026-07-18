@@ -122,12 +122,38 @@ pub enum ToolMode {
     None,
 }
 
-/// `prompt` accepts a string or an array; only a single prompt is served.
+/// `prompt` accepts a single string, a batch of strings, a single pre-tokenized
+/// id array, or a batch of id arrays (the OpenAI completions `prompt` shape).
+/// `untagged` tries the variants top-down; token arrays never parse as strings,
+/// so the ordering is unambiguous (string batch, then id-array batch, then a
+/// single id array).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum PromptSpec {
     One(String),
     Many(Vec<String>),
+    TokenBatches(Vec<Vec<u32>>),
+    Tokens(Vec<u32>),
+}
+
+/// One resolved completions prompt: raw text still to tokenize, or ids supplied
+/// directly by the caller.
+#[derive(Debug, Clone)]
+pub enum PromptItem {
+    Text(String),
+    Tokens(Vec<u32>),
+}
+
+impl PromptSpec {
+    /// Flatten the request `prompt` into one item per completion prompt.
+    pub fn into_items(self) -> Vec<PromptItem> {
+        match self {
+            PromptSpec::One(s) => vec![PromptItem::Text(s)],
+            PromptSpec::Many(v) => v.into_iter().map(PromptItem::Text).collect(),
+            PromptSpec::Tokens(ids) => vec![PromptItem::Tokens(ids)],
+            PromptSpec::TokenBatches(b) => b.into_iter().map(PromptItem::Tokens).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -514,17 +540,6 @@ impl CompletionRequest {
             max_tokens,
             stop,
         })
-    }
-
-    /// The single prompt string this server accepts.
-    pub fn single_prompt(&self) -> Result<&str, ApiError> {
-        match &self.prompt {
-            PromptSpec::One(s) => Ok(s),
-            PromptSpec::Many(v) if v.len() == 1 => Ok(&v[0]),
-            PromptSpec::Many(_) => Err(ApiError::invalid_request(
-                "prompt arrays with more than one entry are not supported",
-            )),
-        }
     }
 }
 
@@ -1199,21 +1214,41 @@ mod tests {
     }
 
     #[test]
-    fn completions_prompt_and_echo_rules() {
+    fn completions_prompt_variants_parse() {
+        // Single string.
         let r: CompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "m", "prompt": ["only one"]
+            "model": "m", "prompt": "only one"
         }))
         .unwrap();
-        assert_eq!(r.single_prompt().unwrap(), "only one");
+        assert!(matches!(r.prompt.clone().into_items().as_slice(),
+            [PromptItem::Text(s)] if s == "only one"));
         r.generation_spec().unwrap();
 
+        // Batch of strings → one item each.
         let r: CompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "m", "prompt": ["a", "b"]
         }))
         .unwrap();
-        assert!(r.single_prompt().is_err());
+        assert_eq!(r.prompt.into_items().len(), 2);
 
-        // echo is now supported (handled at the response layer).
+        // Single pre-tokenized id array.
+        let r: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": [1, 2, 3]
+        }))
+        .unwrap();
+        assert!(matches!(r.prompt.into_items().as_slice(),
+            [PromptItem::Tokens(ids)] if ids == &[1, 2, 3]));
+
+        // Batch of id arrays.
+        let r: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": [[1, 2], [3]]
+        }))
+        .unwrap();
+        let items = r.prompt.into_items();
+        assert_eq!(items.len(), 2);
+        assert!(matches!(&items[0], PromptItem::Tokens(ids) if ids == &[1, 2]));
+
+        // echo is supported (handled at the response layer).
         let r: CompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "m", "prompt": "p", "echo": true
         }))

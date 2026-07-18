@@ -41,7 +41,7 @@ fn now_unix() -> u64 {
 
 /// Monotonic completion ids; wall-clock prefix keeps them unique across
 /// restarts without a uuid dependency.
-fn new_id(prefix: &str) -> String {
+pub(crate) fn new_id(prefix: &str) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let t = SystemTime::now()
@@ -73,6 +73,43 @@ fn finish_reason_str(r: FinishReason) -> &'static str {
 
 pub async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// GET /metrics — Prometheus text exposition (SPEC §8.3). Served outside the
+/// API-key gate like /healthz. Renders the engine's live counters/gauges/
+/// histograms plus the per-route HTTP request counts.
+pub async fn metrics_endpoint(State(state): State<Arc<ServerState>>) -> Response {
+    let body = crate::metrics::render(
+        state.engine.metrics(),
+        &state.http_metrics,
+        &state.model_id,
+    );
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
+}
+
+/// Records the matched-route template + final status of every request into
+/// `HttpMetrics` after the handler runs. Uses the route template (not the raw
+/// path) so cardinality stays bounded.
+pub async fn record_http_metrics(
+    State(state): State<Arc<ServerState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    let resp = next.run(req).await;
+    state.http_metrics.record(&route, resp.status().as_u16());
+    resp
 }
 
 pub async fn list_models(State(state): State<Arc<ServerState>>) -> Json<ModelList> {
@@ -171,9 +208,11 @@ fn render_chat_prompt(
         .map_err(|e| ApiError::invalid_request(format!("chat template render failed: {e}")))
 }
 
-enum GenInput {
+pub(crate) enum GenInput {
     Chat(Vec<ChatMessage>, Option<serde_json::Value>),
     Text(String),
+    /// Pre-tokenized prompt (completions `prompt` given as token ids).
+    Tokens(Vec<u32>),
 }
 
 /// Derive a distinct-but-deterministic seed for completion `i` of an `n`-way
@@ -185,27 +224,36 @@ fn seed_for(base: Option<u64>, i: usize) -> Option<u64> {
     base.map(|s| s.wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)))
 }
 
-/// One admitted generation: the bridged event streams (one per completion) and
-/// the tokenized prompt (kept for `echo`).
-struct Generation {
-    streams: Vec<tokio::sync::mpsc::Receiver<EngineEvent>>,
-    prompt_tokens: Vec<u32>,
+/// The admitted streams + tokenized prompt for ONE input prompt: `spec.n`
+/// bridged event streams (one per completion) and the prompt tokens (kept for
+/// `echo`).
+pub(crate) struct InputGen {
+    pub(crate) streams: Vec<tokio::sync::mpsc::Receiver<EngineEvent>>,
+    pub(crate) prompt_tokens: Vec<u32>,
 }
 
-/// Admit `spec.n` completions: take that many admission slots (429 when the
-/// queue is full), then render/tokenize the shared prompt once and submit one
-/// engine request per completion on the blocking pool. Each completion samples
-/// from a distinct seed and shares the prompt prefix through the engine's radix
-/// prefix cache.
-async fn start_generation(
+/// One admitted generation across one or more input prompts.
+pub(crate) struct Generation {
+    pub(crate) per_input: Vec<InputGen>,
+}
+
+/// Admit `inputs.len() × spec.n` completions: take that many admission slots
+/// (429 when the queue is full), then render/tokenize each prompt once and
+/// submit one engine request per (prompt, completion). ALL requests are
+/// submitted before any is awaited, so the scheduler admits them into the same
+/// decode batch. Each completion samples from a distinct per-index seed and
+/// shares a prompt prefix through the engine's radix prefix cache.
+pub(crate) async fn start_generation(
     state: &Arc<ServerState>,
-    input: GenInput,
+    inputs: Vec<GenInput>,
     spec: GenerationSpec,
     grammar: Option<forge_grammar::GrammarProgram>,
 ) -> Result<Generation, ApiError> {
-    // One admission slot per completion; release everything on partial failure.
-    let mut permits = Vec::with_capacity(spec.n);
-    for _ in 0..spec.n {
+    let total = inputs.len().saturating_mul(spec.n);
+    // One admission slot per (prompt, completion); release everything on
+    // partial failure (the permits drop when this Vec drops on an error path).
+    let mut permits = Vec::with_capacity(total);
+    for _ in 0..total {
         match state.slots.clone().try_acquire_owned() {
             Ok(p) => permits.push(p),
             Err(_) => {
@@ -217,63 +265,91 @@ async fn start_generation(
     }
 
     let st = state.clone();
-    let (raw_streams, prompt_tokens) = tokio::task::spawn_blocking(move || {
-        let prompt = match &input {
-            GenInput::Chat(messages, tools) => {
-                render_chat_prompt(&st.chat_template, &st.template_vars, messages, tools.as_ref())?
+    let raw: Vec<(Vec<std::sync::mpsc::Receiver<EngineEvent>>, Vec<u32>)> =
+        tokio::task::spawn_blocking(move || {
+            let mut per_input = Vec::with_capacity(inputs.len());
+            for input in &inputs {
+                let prompt_tokens = match input {
+                    GenInput::Chat(messages, tools) => {
+                        let prompt = render_chat_prompt(
+                            &st.chat_template,
+                            &st.template_vars,
+                            messages,
+                            tools.as_ref(),
+                        )?;
+                        st.tokenizer
+                            .encode(&prompt, true)
+                            .map_err(|e| ApiError::internal(format!("tokenization failed: {e}")))?
+                    }
+                    GenInput::Text(s) => st
+                        .tokenizer
+                        .encode(s, true)
+                        .map_err(|e| ApiError::internal(format!("tokenization failed: {e}")))?,
+                    GenInput::Tokens(ids) => ids.clone(),
+                };
+                if prompt_tokens.is_empty() {
+                    return Err(ApiError::invalid_request("a prompt produced zero tokens"));
+                }
+                crate::api::check_context(prompt_tokens.len(), spec.max_tokens, st.max_context)?;
+                let mut streams = Vec::with_capacity(spec.n);
+                for i in 0..spec.n {
+                    let mut sampling = spec.sampling.clone();
+                    sampling.seed = seed_for(spec.sampling.seed, i);
+                    let rx = st
+                        .engine
+                        .submit(EngineRequest {
+                            prompt_tokens: prompt_tokens.clone(),
+                            max_tokens: spec.max_tokens,
+                            sampling,
+                            stop: spec.stop.clone(),
+                            eos_ids: st.eos_ids.clone(),
+                            grammar: grammar.clone(),
+                            logit_bias: spec.logit_bias.clone(),
+                            min_tokens: spec.min_tokens,
+                            logprobs: spec.logprobs,
+                        })
+                        .map_err(|e| ApiError::internal(e.to_string()))?;
+                    streams.push(rx);
+                }
+                per_input.push((streams, prompt_tokens));
             }
-            GenInput::Text(s) => s.clone(),
-        };
-        let prompt_tokens = st
-            .tokenizer
-            .encode(&prompt, true)
-            .map_err(|e| ApiError::internal(format!("tokenization failed: {e}")))?;
-        crate::api::check_context(prompt_tokens.len(), spec.max_tokens, st.max_context)?;
-        let mut streams = Vec::with_capacity(spec.n);
-        for i in 0..spec.n {
-            let mut sampling = spec.sampling.clone();
-            sampling.seed = seed_for(spec.sampling.seed, i);
-            let rx = st
-                .engine
-                .submit(EngineRequest {
-                    prompt_tokens: prompt_tokens.clone(),
-                    max_tokens: spec.max_tokens,
-                    sampling,
-                    stop: spec.stop.clone(),
-                    eos_ids: st.eos_ids.clone(),
-                    grammar: grammar.clone(),
-                    logit_bias: spec.logit_bias.clone(),
-                    min_tokens: spec.min_tokens,
-                    logprobs: spec.logprobs,
-                })
-                .map_err(|e| ApiError::internal(e.to_string()))?;
-            streams.push(rx);
-        }
-        Ok::<_, ApiError>((streams, prompt_tokens))
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("request preparation failed: {e}")))??;
+            Ok::<_, ApiError>(per_input)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("request preparation failed: {e}")))??;
 
-    let streams = raw_streams
+    // Bridge every raw std receiver onto tokio, handing each its admission
+    // permit (permits are consumed in submission order across all inputs).
+    let mut permits = permits.into_iter();
+    let per_input = raw
         .into_iter()
-        .zip(permits)
-        .map(|(rx, permit)| bridge_events(rx, permit))
+        .map(|(streams, prompt_tokens)| InputGen {
+            streams: streams
+                .into_iter()
+                .map(|rx| {
+                    let permit = permits.next().expect("one permit per submitted stream");
+                    bridge_events(rx, permit)
+                })
+                .collect(),
+            prompt_tokens,
+        })
         .collect();
-    Ok(Generation {
-        streams,
-        prompt_tokens,
-    })
+    Ok(Generation { per_input })
 }
 
-struct Collected {
-    text: String,
-    finish: &'static str,
-    usage: Usage,
+pub(crate) struct Collected {
+    pub(crate) text: String,
+    pub(crate) finish: &'static str,
+    /// Raw engine reason, so the Anthropic layer can distinguish EOS (end_turn)
+    /// from a matched stop sequence (stop_sequence) — the OpenAI `finish` string
+    /// collapses both to "stop".
+    pub(crate) finish_reason: FinishReason,
+    pub(crate) usage: Usage,
     /// Per-token log-probability reports (empty unless `logprobs` was set).
-    logprobs: Vec<forge_engine::sample::TokenLogprob>,
+    pub(crate) logprobs: Vec<forge_engine::sample::TokenLogprob>,
 }
 
-async fn collect_events(
+pub(crate) async fn collect_events(
     mut rx: tokio::sync::mpsc::Receiver<EngineEvent>,
 ) -> Result<Collected, ApiError> {
     let mut text = String::new();
@@ -299,6 +375,7 @@ async fn collect_events(
                 return Ok(Collected {
                     text,
                     finish: finish_reason_str(reason),
+                    finish_reason: reason,
                     usage: Usage::with_cache(prompt_tokens, tokens, cache_read_tokens),
                     logprobs,
                 })
@@ -653,13 +730,23 @@ pub async fn chat_completions(
         return ApiError::invalid_request("streaming is not supported with n > 1")
             .into_response();
     }
-    let gen = match start_generation(&state, GenInput::Chat(req.messages, tools), spec, grammar)
-        .await
+    let gen = match start_generation(
+        &state,
+        vec![GenInput::Chat(req.messages, tools)],
+        spec,
+        grammar,
+    )
+    .await
     {
         Ok(g) => g,
         Err(e) => return e.into_response(),
     };
-    let mut streams = gen.streams;
+    let mut streams = gen
+        .per_input
+        .into_iter()
+        .next()
+        .expect("single chat input yields one InputGen")
+        .streams;
 
     if req.stream {
         let rx = streams.pop().expect("n >= 1 yields at least one stream");
@@ -760,16 +847,34 @@ pub async fn completions(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let prompt = match req.single_prompt() {
-        Ok(p) => p.to_string(),
-        Err(e) => return e.into_response(),
-    };
+    let items = req.prompt.clone().into_items();
+    if items.is_empty() {
+        return ApiError::invalid_request("`prompt` must not be empty").into_response();
+    }
     let echo = spec.echo;
-    let echo_prompt = prompt.clone();
+    // Per-input echo text (the prompt itself): a raw string prepends verbatim; a
+    // pre-tokenized prompt decodes back through the tokenizer.
+    let echo_texts: Vec<String> = if echo {
+        items
+            .iter()
+            .map(|it| match it {
+                crate::api::PromptItem::Text(s) => s.clone(),
+                crate::api::PromptItem::Tokens(ids) => {
+                    state.tokenizer.decode(ids, false).unwrap_or_default()
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let want_logprobs = spec.logprobs.is_some();
-    if req.stream && spec.n > 1 {
-        return ApiError::invalid_request("streaming is not supported with n > 1")
-            .into_response();
+    // Total completions across all prompts; streaming only supports exactly one.
+    let total_completions = items.len().saturating_mul(spec.n);
+    if req.stream && total_completions > 1 {
+        return ApiError::invalid_request(
+            "streaming is not supported with multiple prompts or n > 1",
+        )
+        .into_response();
     }
     // echo/logprobs reshape the response body, so they only apply to the
     // buffered (non-streaming) path; a streaming request keeps the raw deltas.
@@ -779,15 +884,25 @@ pub async fn completions(
         )
         .into_response();
     }
-    let gen = match start_generation(&state, GenInput::Text(prompt), spec, None).await {
+    let inputs: Vec<GenInput> = items
+        .into_iter()
+        .map(|it| match it {
+            crate::api::PromptItem::Text(s) => GenInput::Text(s),
+            crate::api::PromptItem::Tokens(ids) => GenInput::Tokens(ids),
+        })
+        .collect();
+    let gen = match start_generation(&state, inputs, spec, None).await {
         Ok(g) => g,
         Err(e) => return e.into_response(),
     };
-    let mut streams = gen.streams;
-    let prompt_tokens_ids = gen.prompt_tokens;
 
     if req.stream {
-        let rx = streams.pop().expect("n >= 1 yields at least one stream");
+        let rx = gen
+            .per_input
+            .into_iter()
+            .next()
+            .and_then(|ig| ig.streams.into_iter().next())
+            .expect("single completion yields one stream");
         let include_usage = req.stream_options.is_some_and(|o| o.include_usage);
         return stream_response(
             state.clone(),
@@ -800,45 +915,52 @@ pub async fn completions(
         .await;
     }
 
-    let mut collected = Vec::with_capacity(streams.len());
-    for rx in streams {
-        match collect_events(rx).await {
-            Ok(c) => collected.push(c),
-            Err(e) => return e.into_response(),
-        }
-    }
-
-    let mut choices = Vec::with_capacity(collected.len());
+    // Collect every completion, prompt-major then completion-index, so batched
+    // `choices[]` carry a stable running index across all prompts.
+    let mut choices = Vec::with_capacity(gen.per_input.len() * 2);
     let mut prompt_tokens = 0usize;
     let mut cached_tokens = 0usize;
     let mut completion_tokens = 0usize;
-    for (index, c) in collected.into_iter().enumerate() {
-        prompt_tokens = c.usage.prompt_tokens;
-        cached_tokens = c
-            .usage
-            .prompt_tokens_details
-            .as_ref()
-            .map(|d| d.cached_tokens)
-            .unwrap_or(0);
-        completion_tokens += c.usage.completion_tokens;
-        let logprobs = want_logprobs.then(|| {
-            completion_logprobs(
-                &state.tokenizer,
-                echo.then_some(prompt_tokens_ids.as_slice()),
-                &c.logprobs,
-            )
-        });
-        let text = if echo {
-            format!("{echo_prompt}{}", c.text)
-        } else {
-            c.text
-        };
-        choices.push(CompletionChoice {
-            index: index as u32,
-            text,
-            logprobs,
-            finish_reason: c.finish,
-        });
+    let mut index = 0u32;
+    for (input_idx, ig) in gen.per_input.into_iter().enumerate() {
+        let prompt_ids = ig.prompt_tokens;
+        for (comp_idx, rx) in ig.streams.into_iter().enumerate() {
+            let c = match collect_events(rx).await {
+                Ok(c) => c,
+                Err(e) => return e.into_response(),
+            };
+            // Each prompt's tokens count once (its n completions share the same
+            // prompt); completion tokens aggregate across everything.
+            if comp_idx == 0 {
+                prompt_tokens += c.usage.prompt_tokens;
+                cached_tokens += c
+                    .usage
+                    .prompt_tokens_details
+                    .as_ref()
+                    .map(|d| d.cached_tokens)
+                    .unwrap_or(0);
+            }
+            completion_tokens += c.usage.completion_tokens;
+            let logprobs = want_logprobs.then(|| {
+                completion_logprobs(
+                    &state.tokenizer,
+                    echo.then_some(prompt_ids.as_slice()),
+                    &c.logprobs,
+                )
+            });
+            let text = if echo {
+                format!("{}{}", echo_texts[input_idx], c.text)
+            } else {
+                c.text
+            };
+            choices.push(CompletionChoice {
+                index,
+                text,
+                logprobs,
+                finish_reason: c.finish,
+            });
+            index += 1;
+        }
     }
 
     Json(CompletionResponse {
