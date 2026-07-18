@@ -4,11 +4,18 @@
 // consumes. Unknown request fields (frequency_penalty, presence_penalty,
 // logit_bias, ...) are accepted and ignored by serde's default behavior.
 
+use std::collections::{BTreeMap, HashMap};
+
 use forge_engine::sample::SamplingParams;
 use forge_tokenize::ChatMessage;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
+
+/// Largest `n` (parallel completions) one request may ask for.
+const MAX_N: u32 = 128;
+/// Largest `top_logprobs` / completions `logprobs` count accepted.
+const MAX_TOP_LOGPROBS: usize = 20;
 
 /// `stop` accepts a single string or an array of strings.
 #[derive(Debug, Clone, Deserialize)]
@@ -63,6 +70,22 @@ pub struct ChatCompletionRequest {
     pub n: Option<u32>,
     #[serde(default)]
     pub repetition_penalty: Option<f32>,
+    /// `logit_bias` (SPEC §8.1.2): `{token_id: bias}` with string keys, bias in
+    /// [-100, 100]. ±100 ≈ hard force/ban.
+    #[serde(default)]
+    pub logit_bias: Option<HashMap<String, f32>>,
+    /// `min_tokens` (non-standard extension): floor on generated tokens; EOS is
+    /// suppressed until reached.
+    #[serde(default)]
+    pub min_tokens: Option<usize>,
+    /// `logprobs` (SPEC §8.1.2): when `true`, each output token carries its
+    /// log-probability (and up to `top_logprobs` alternatives).
+    #[serde(default)]
+    pub logprobs: Option<bool>,
+    /// Number of most-likely alternatives to report per token (0..=20). Requires
+    /// `logprobs = true`.
+    #[serde(default)]
+    pub top_logprobs: Option<usize>,
     /// OpenAI tool definitions, passed verbatim to the chat template.
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
@@ -137,6 +160,16 @@ pub struct CompletionRequest {
     pub echo: Option<bool>,
     #[serde(default)]
     pub repetition_penalty: Option<f32>,
+    /// `logit_bias` (SPEC §8.1.2): `{token_id: bias}`, bias in [-100, 100].
+    #[serde(default)]
+    pub logit_bias: Option<HashMap<String, f32>>,
+    /// `min_tokens` (non-standard extension): EOS suppressed until reached.
+    #[serde(default)]
+    pub min_tokens: Option<usize>,
+    /// `logprobs` (SPEC §8.1.2): number of top alternatives to report per token
+    /// (0..=20); `0` reports only each token's own log-probability.
+    #[serde(default)]
+    pub logprobs: Option<usize>,
 }
 
 /// Engine-facing generation parameters extracted from a validated request.
@@ -145,6 +178,17 @@ pub struct GenerationSpec {
     pub sampling: SamplingParams,
     pub max_tokens: usize,
     pub stop: Vec<String>,
+    /// Number of independent completions to generate (`n`, ≥ 1).
+    pub n: usize,
+    /// `logit_bias` as `(token_id, bias)` pairs, sorted by id for determinism.
+    pub logit_bias: Vec<(u32, f32)>,
+    /// EOS floor (`min_tokens`); `0` = disabled.
+    pub min_tokens: usize,
+    /// `logprobs`: `Some(top_n)` to report per-token log-probabilities with
+    /// `top_n` alternatives; `None` to omit.
+    pub logprobs: Option<usize>,
+    /// `echo` (completions): prepend the prompt to the response.
+    pub echo: bool,
 }
 
 // Requests without max_tokens still need a bound: the engine's admission
@@ -152,9 +196,11 @@ pub struct GenerationSpec {
 // starve the queue.
 const DEFAULT_MAX_TOKENS: usize = 1024;
 
+/// Common sampling core shared by both endpoints: validate the sampling knobs
+/// and resolve `max_tokens`/`stop`. The per-endpoint extras (`n`, `logit_bias`,
+/// `min_tokens`, `logprobs`, `echo`) are layered on by each request's builder.
 #[allow(clippy::too_many_arguments)]
-fn generation_spec(
-    n: Option<u32>,
+fn sampling_core(
     temperature: Option<f32>,
     top_p: Option<f32>,
     top_k: Option<usize>,
@@ -164,17 +210,7 @@ fn generation_spec(
     max_tokens: Option<usize>,
     max_completion_tokens: Option<usize>,
     stop: Option<StopSpec>,
-) -> Result<GenerationSpec, ApiError> {
-    if let Some(n) = n {
-        if n == 0 {
-            return Err(ApiError::invalid_request("n must be at least 1"));
-        }
-        if n > 1 {
-            return Err(ApiError::invalid_request(
-                "n > 1 is not supported by this server",
-            ));
-        }
-    }
+) -> Result<(SamplingParams, usize, Vec<String>), ApiError> {
     let mut sampling = SamplingParams::default();
     if let Some(t) = temperature {
         if !t.is_finite() || t < 0.0 {
@@ -216,11 +252,59 @@ fn generation_spec(
         return Err(ApiError::invalid_request("max_tokens must be at least 1"));
     }
 
-    Ok(GenerationSpec {
+    Ok((
         sampling,
         max_tokens,
-        stop: stop.map(StopSpec::into_vec).unwrap_or_default(),
-    })
+        stop.map(StopSpec::into_vec).unwrap_or_default(),
+    ))
+}
+
+/// Validate `n` (number of parallel completions): default 1, at least 1, at
+/// most `MAX_N`.
+fn resolve_n(n: Option<u32>) -> Result<usize, ApiError> {
+    match n {
+        None => Ok(1),
+        Some(0) => Err(ApiError::invalid_request("n must be at least 1")),
+        Some(v) if v > MAX_N => Err(ApiError::invalid_request(format!(
+            "n must be at most {MAX_N}"
+        ))),
+        Some(v) => Ok(v as usize),
+    }
+}
+
+/// Parse an OpenAI `logit_bias` map (string token-id keys → bias) into sorted
+/// `(id, bias)` pairs. Biases must be finite and within [-100, 100]. Sorted by
+/// id so the engine sees a deterministic order regardless of map iteration.
+fn parse_logit_bias(map: &Option<HashMap<String, f32>>) -> Result<Vec<(u32, f32)>, ApiError> {
+    let Some(m) = map else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(m.len());
+    for (k, &v) in m {
+        let id: u32 = k.parse().map_err(|_| {
+            ApiError::invalid_request(format!("logit_bias key {k:?} is not a token id"))
+        })?;
+        if !v.is_finite() || !(-100.0..=100.0).contains(&v) {
+            return Err(ApiError::invalid_request(
+                "logit_bias values must be finite and in [-100, 100]",
+            ));
+        }
+        out.push((id, v));
+    }
+    out.sort_unstable_by_key(|&(id, _)| id);
+    Ok(out)
+}
+
+/// Validate `min_tokens`: `None`/`0` disables it; it must not exceed
+/// `max_tokens` (the sequence can never produce more than that).
+fn resolve_min_tokens(min_tokens: Option<usize>, max_tokens: usize) -> Result<usize, ApiError> {
+    match min_tokens {
+        None | Some(0) => Ok(0),
+        Some(m) if m > max_tokens => Err(ApiError::invalid_request(format!(
+            "min_tokens ({m}) must not exceed max_tokens ({max_tokens})"
+        ))),
+        Some(m) => Ok(m),
+    }
 }
 
 /// Reject requests whose token budget can never fit the model context.
@@ -264,8 +348,7 @@ impl ChatCompletionRequest {
                 )));
             }
         }
-        generation_spec(
-            self.n,
+        let (sampling, max_tokens, stop) = sampling_core(
             self.temperature,
             self.top_p,
             self.top_k,
@@ -275,7 +358,38 @@ impl ChatCompletionRequest {
             self.max_tokens,
             self.max_completion_tokens,
             self.stop.clone(),
-        )
+        )?;
+        // `logprobs` is a bool for chat; `top_logprobs` selects the alternative
+        // count and requires `logprobs = true`.
+        let logprobs = match self.logprobs {
+            Some(true) => {
+                let n = self.top_logprobs.unwrap_or(0);
+                if n > MAX_TOP_LOGPROBS {
+                    return Err(ApiError::invalid_request(format!(
+                        "top_logprobs must be in [0, {MAX_TOP_LOGPROBS}]"
+                    )));
+                }
+                Some(n)
+            }
+            _ => {
+                if self.top_logprobs.is_some() {
+                    return Err(ApiError::invalid_request(
+                        "top_logprobs requires logprobs = true",
+                    ));
+                }
+                None
+            }
+        };
+        Ok(GenerationSpec {
+            sampling,
+            n: resolve_n(self.n)?,
+            logit_bias: parse_logit_bias(&self.logit_bias)?,
+            min_tokens: resolve_min_tokens(self.min_tokens, max_tokens)?,
+            logprobs,
+            echo: false,
+            max_tokens,
+            stop,
+        })
     }
 
     /// Whether tools are rendered into the template and parsed out of the
@@ -370,13 +484,7 @@ impl ChatCompletionRequest {
 
 impl CompletionRequest {
     pub fn generation_spec(&self) -> Result<GenerationSpec, ApiError> {
-        if self.echo == Some(true) {
-            return Err(ApiError::invalid_request(
-                "echo is not supported by this server",
-            ));
-        }
-        generation_spec(
-            self.n,
+        let (sampling, max_tokens, stop) = sampling_core(
             self.temperature,
             self.top_p,
             self.top_k,
@@ -386,7 +494,26 @@ impl CompletionRequest {
             self.max_tokens,
             self.max_completion_tokens,
             self.stop.clone(),
-        )
+        )?;
+        let logprobs = match self.logprobs {
+            None => None,
+            Some(n) if n > MAX_TOP_LOGPROBS => {
+                return Err(ApiError::invalid_request(format!(
+                    "logprobs must be in [0, {MAX_TOP_LOGPROBS}]"
+                )))
+            }
+            Some(n) => Some(n),
+        };
+        Ok(GenerationSpec {
+            sampling,
+            n: resolve_n(self.n)?,
+            logit_bias: parse_logit_bias(&self.logit_bias)?,
+            min_tokens: resolve_min_tokens(self.min_tokens, max_tokens)?,
+            logprobs,
+            echo: self.echo.unwrap_or(false),
+            max_tokens,
+            stop,
+        })
     }
 
     /// The single prompt string this server accepts.
@@ -462,10 +589,35 @@ pub struct ChatResponseMessage {
     pub tool_calls: Option<Vec<ToolCallOut>>,
 }
 
+/// One alternative in a token's `top_logprobs` list.
+#[derive(Debug, Serialize)]
+pub struct TopLogprobEntry {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Vec<u8>,
+}
+
+/// One chat output token's log-probability entry (OpenAI `logprobs.content[]`).
+#[derive(Debug, Serialize)]
+pub struct ChatLogprobEntry {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Vec<u8>,
+    pub top_logprobs: Vec<TopLogprobEntry>,
+}
+
+/// Chat `logprobs` object: one entry per surfaced output token.
+#[derive(Debug, Serialize)]
+pub struct ChatLogprobs {
+    pub content: Vec<ChatLogprobEntry>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ChatChoice {
     pub index: u32,
     pub message: ChatResponseMessage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChatLogprobs>,
     pub finish_reason: &'static str,
 }
 
@@ -479,10 +631,23 @@ pub struct ChatCompletionResponse {
     pub usage: Usage,
 }
 
+/// Completions `logprobs` object (OpenAI legacy shape): parallel arrays over
+/// the emitted tokens. `token_logprobs[i]` is `null` for a position without a
+/// conditional log-probability (the first echoed prompt token).
+#[derive(Debug, Serialize)]
+pub struct CompletionLogprobs {
+    pub tokens: Vec<String>,
+    pub token_logprobs: Vec<Option<f32>>,
+    pub top_logprobs: Vec<BTreeMap<String, f32>>,
+    pub text_offset: Vec<usize>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CompletionChoice {
     pub index: u32,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<CompletionLogprobs>,
     pub finish_reason: &'static str,
 }
 
@@ -721,12 +886,102 @@ mod tests {
     }
 
     #[test]
-    fn n_greater_than_one_is_rejected() {
+    fn n_is_accepted_and_bounded() {
+        // n > 1 is now supported.
         let r = chat_req(serde_json::json!({
-            "model": "m", "messages": [{"role": "user", "content": "hi"}], "n": 2
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "n": 3
         }));
-        let err = r.generation_spec().unwrap_err();
-        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(r.generation_spec().unwrap().n, 3);
+
+        // Default is a single completion.
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(r.generation_spec().unwrap().n, 1);
+
+        // 0 and over-cap are rejected.
+        for bad in [0u32, MAX_N + 1] {
+            let r = chat_req(serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}], "n": bad
+            }));
+            assert_eq!(
+                r.generation_spec().unwrap_err().status,
+                axum::http::StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    #[test]
+    fn logit_bias_parses_and_validates() {
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "logit_bias": {"5": -100, "2": 12.5}
+        }));
+        // Sorted by token id for deterministic engine ordering.
+        assert_eq!(
+            r.generation_spec().unwrap().logit_bias,
+            vec![(2u32, 12.5), (5u32, -100.0)]
+        );
+
+        // Out-of-range bias is rejected.
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "logit_bias": {"5": 250}
+        }));
+        assert!(r.generation_spec().is_err());
+
+        // Non-integer key is rejected.
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "logit_bias": {"cat": 1.0}
+        }));
+        assert!(r.generation_spec().is_err());
+    }
+
+    #[test]
+    fn min_tokens_is_bounded_by_max_tokens() {
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "min_tokens": 20, "max_tokens": 64
+        }));
+        assert_eq!(r.generation_spec().unwrap().min_tokens, 20);
+
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "min_tokens": 100, "max_tokens": 64
+        }));
+        assert!(r.generation_spec().is_err());
+    }
+
+    #[test]
+    fn chat_logprobs_rules() {
+        // logprobs=true, top_logprobs=5 -> Some(5).
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": true, "top_logprobs": 5
+        }));
+        assert_eq!(r.generation_spec().unwrap().logprobs, Some(5));
+
+        // logprobs=true without top_logprobs -> Some(0).
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": true
+        }));
+        assert_eq!(r.generation_spec().unwrap().logprobs, Some(0));
+
+        // top_logprobs without logprobs=true is an error.
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "top_logprobs": 3
+        }));
+        assert!(r.generation_spec().is_err());
+
+        // Over-cap top_logprobs is an error.
+        let r = chat_req(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": true, "top_logprobs": 999
+        }));
+        assert!(r.generation_spec().is_err());
     }
 
     #[test]
@@ -958,10 +1213,18 @@ mod tests {
         .unwrap();
         assert!(r.single_prompt().is_err());
 
+        // echo is now supported (handled at the response layer).
         let r: CompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "m", "prompt": "p", "echo": true
         }))
         .unwrap();
-        assert!(r.generation_spec().is_err());
+        assert!(r.generation_spec().unwrap().echo);
+
+        // Completions logprobs is a count.
+        let r: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": "p", "logprobs": 3
+        }))
+        .unwrap();
+        assert_eq!(r.generation_spec().unwrap().logprobs, Some(3));
     }
 }

@@ -63,6 +63,82 @@ impl SamplingParams {
     }
 }
 
+/// Per-token log-probability report (SPEC §8.1.2 `logprobs`/`top_logprobs`):
+/// the sampled token's id + log-probability, plus the top-N alternatives at
+/// that position (id, log-probability), ordered most-probable first. Computed
+/// on the host from the full logits the CPU sampler already holds.
+#[derive(Debug, Clone)]
+pub struct TokenLogprob {
+    pub token: u32,
+    pub logprob: f32,
+    pub top: Vec<(u32, f32)>,
+}
+
+/// Add caller-supplied `logit_bias` (`{token_id: bias}`, bias in [-100, 100];
+/// ±100 ≈ hard force/ban) to the raw logits before selection. Out-of-range ids
+/// are ignored. Applied only on the CPU sampler path (full host logits).
+pub fn apply_logit_bias(logits: &mut [f32], bias: &[(u32, f32)]) {
+    for &(id, b) in bias {
+        if let Some(l) = logits.get_mut(id as usize) {
+            *l += b;
+        }
+    }
+}
+
+/// Suppress every end-of-sequence id (force its logit to -inf) so the sequence
+/// cannot terminate before it has produced `min_tokens` tokens (SPEC §8.1.2
+/// `min_tokens`). No-op once the floor is reached.
+pub fn suppress_eos(logits: &mut [f32], eos_ids: &[u32], generated: usize, min_tokens: usize) {
+    if generated >= min_tokens {
+        return;
+    }
+    for &e in eos_ids {
+        if let Some(l) = logits.get_mut(e as usize) {
+            *l = f32::NEG_INFINITY;
+        }
+    }
+}
+
+/// Log-softmax the full logits and report the `sampled` token's log-probability
+/// plus the `top_n` most-probable tokens (each as `(id, logprob)`), ordered
+/// most-probable first. Numerically stable via the max-shifted log-sum-exp; a
+/// -inf logit (e.g. grammar/`min_tokens`-masked) maps to a -inf log-probability.
+pub fn compute_logprob(logits: &[f32], sampled: u32, top_n: usize) -> TokenLogprob {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = if max.is_finite() {
+        logits.iter().map(|&l| (l - max).exp()).sum()
+    } else {
+        0.0
+    };
+    // log-sum-exp; guards the degenerate all -inf case (sum == 0 → lse -inf).
+    let lse = if sum > 0.0 { max + sum.ln() } else { f32::NEG_INFINITY };
+    let lp = |l: f32| l - lse;
+
+    let sampled_lp = logits
+        .get(sampled as usize)
+        .map(|&l| lp(l))
+        .unwrap_or(f32::NEG_INFINITY);
+
+    let mut top = Vec::new();
+    if top_n > 0 && !logits.is_empty() {
+        let mut idx: Vec<(u32, f32)> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| (i as u32, l))
+            .collect();
+        let k = top_n.min(idx.len());
+        idx.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
+        idx.truncate(k);
+        idx.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        top = idx.into_iter().map(|(i, l)| (i, lp(l))).collect();
+    }
+    TokenLogprob {
+        token: sampled,
+        logprob: sampled_lp,
+        top,
+    }
+}
+
 /// xorshift64* — deterministic per-request stream, no rand dependency.
 pub struct Rng(u64);
 
@@ -300,4 +376,93 @@ pub struct SeqSampleParams {
     pub step: u64,
     pub penalty: f32,
     pub penalty_ids: Vec<i32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argmax(logits: &[f32]) -> u32 {
+        logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i as u32)
+            .unwrap()
+    }
+
+    #[test]
+    fn logit_bias_forces_and_bans_tokens() {
+        let base = [1.0f32, 2.0, 0.5, 3.0];
+        // Greedy pick without bias is token 3.
+        assert_eq!(argmax(&base), 3);
+
+        // A +100 bias forces an otherwise-unlikely token.
+        let mut l = base;
+        apply_logit_bias(&mut l, &[(2, 100.0)]);
+        assert_eq!(argmax(&l), 2);
+
+        // A -100 bias bans the natural argmax; the runner-up wins.
+        let mut l = base;
+        apply_logit_bias(&mut l, &[(3, -100.0)]);
+        assert_eq!(argmax(&l), 1);
+
+        // Out-of-range ids are ignored (no panic, no effect).
+        let mut l = base;
+        apply_logit_bias(&mut l, &[(999, 100.0)]);
+        assert_eq!(l, base);
+    }
+
+    #[test]
+    fn min_tokens_suppresses_eos_until_floor() {
+        let eos = [2u32, 3];
+        // Below the floor, every eos logit is forced to -inf.
+        let mut l = [1.0f32, 0.0, 5.0, 4.0];
+        suppress_eos(&mut l, &eos, 1, 20);
+        assert_eq!(l[2], f32::NEG_INFINITY);
+        assert_eq!(l[3], f32::NEG_INFINITY);
+        // Non-eos logits are untouched, so the argmax is now a non-eos token.
+        assert_eq!(argmax(&l), 0);
+
+        // At/above the floor it is a no-op.
+        let mut l = [1.0f32, 0.0, 5.0, 4.0];
+        suppress_eos(&mut l, &eos, 20, 20);
+        assert_eq!(argmax(&l), 2);
+    }
+
+    #[test]
+    fn logprob_is_log_softmax_and_top1_equals_argmax() {
+        let logits = [2.0f32, 1.0, 0.0, -1.0];
+        let sampled = argmax(&logits); // 0
+        let lp = compute_logprob(&logits, sampled, 3);
+        assert_eq!(lp.token, 0);
+
+        // Reference log-softmax of the sampled token.
+        let max = 2.0f32;
+        let sum: f32 = logits.iter().map(|&l| (l - max).exp()).sum();
+        let lse = max + sum.ln();
+        assert!((lp.logprob - (logits[0] - lse)).abs() < 1e-5);
+
+        // All log-probabilities are <= 0 and the exp-sum over the full vocab is 1.
+        assert!(lp.logprob <= 0.0);
+        let total: f32 = logits.iter().map(|&l| (l - lse).exp()).sum();
+        assert!((total - 1.0).abs() < 1e-4);
+
+        // top is ordered most-probable first and its head equals the argmax.
+        assert_eq!(lp.top.len(), 3);
+        assert_eq!(lp.top[0].0, 0);
+        assert!(lp.top[0].1 >= lp.top[1].1);
+        assert!(lp.top[1].1 >= lp.top[2].1);
+        // The sampled token's logprob matches its entry in the top list.
+        assert!((lp.top[0].1 - lp.logprob).abs() < 1e-6);
+    }
+
+    #[test]
+    fn logprob_zero_top_still_reports_sampled() {
+        let logits = [0.5f32, 2.5, 1.0];
+        let lp = compute_logprob(&logits, 1, 0);
+        assert_eq!(lp.token, 1);
+        assert!(lp.top.is_empty());
+        assert!(lp.logprob <= 0.0);
+    }
 }

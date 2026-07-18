@@ -189,7 +189,26 @@ Ostatnia aktualizacja: 2026-07-18.
   (CPU sampler + skan słownika; v1 correctness-first). Ograniczenia subsetu JSON
   Schema — patrz INFER_CONFIGURATION.md.
 - ❌ **§8.1.2 Prompt caching** jako kontrakt API (cache_control/prompt_cache_key)
-- ❌ **§8.1.2** logit_bias, min_tokens, n/best-of, **logprobs**, echo
+- ✅ **§8.1.2 Kompletność API generacji** — `logit_bias`, `min_tokens`, `logprobs`/
+  `top_logprobs`, `echo`, `n` (wiele completions):
+  - `logit_bias` (`{token_id: bias}`, [-100, 100]; ±100 ≈ twardy force/ban) — dodawany do
+    logitów PRZED próbkowaniem; `min_tokens` — tłumi wszystkie EOS (logit → -inf) aż
+    sekwencja wyprodukuje próg; `logprobs` — log-softmax na hoście, per-token log-prob +
+    top-N alternatyw (chat `logprobs`+`top_logprobs`, completions `logprobs:N`, kształt
+    OpenAI z `bytes`); `echo` (completions) — doklejenie promptu (tokeny promptu w
+    `logprobs` z `null`). Każda z tych funkcji wymusza sampler CPU (pełne logity na
+    hoście, jak maska gramatyki); żądanie bez żadnej z nich zostaje na samplerze GPU —
+    ścieżka bit-identyczna (golden Bielik NVFP4 `batched_bielik` bez zmian).
+  - `n` — n niezależnych completions per żądanie (osobne sekwencje, ziarna
+    `seed+i·φ`; dzielą prefiks promptu przez radix prefix-cache), zwracane jako
+    `choices[0..n]`; non-streaming (streaming przy `n>1` = 400, tak samo `echo`/`logprobs`
+    w streamie completions). Zniesiono dawne `n>1 → 400`.
+  - Dowód (RTX 4090, qwen3-0.6b Q8_0, `tests/e2e_generation.rs`): `logit_bias` +100 na
+    " London" → "London", -100 na " Paris" → " located"; `min_tokens` 20 → 99 tokenów;
+    `echo` dokleja prompt; `logprobs` 8 poprawnych wpisów (wartości ≤0, top-1 = token
+    próbkowany przy temp 0, masa prawdopodob. top-N ≤ 1); `n=3` = 3 różne, deterministyczne
+    completions. Testy jednostkowe: `sample.rs` (bias/min_tokens/log-softmax),
+    `api.rs` (walidacja `n`/`logit_bias`/`min_tokens`/`logprobs`/`echo`).
 - ❌ **§8.1 Anthropic API** (/v1/messages), images endpoint
 - ❌ **§8.2 FORGE-RPC** (QUIC + CBOR, SDK Rust/Py/TS)
 - ❌ **§8.4 Realtime API** (voice-to-voice duplex, barge-in)

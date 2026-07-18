@@ -14,8 +14,12 @@ use forge_types::{ForgeError, Result};
 use crate::generate::FinishReason;
 use crate::kv::SeqKv;
 use crate::model::{Model, MAX_PREFILL_CHUNK};
-use crate::sample::{GpuSampler, Sampler, SamplingParams, SeqSampleParams};
+use crate::sample::{
+    apply_logit_bias, compute_logprob, suppress_eos, GpuSampler, Sampler, SamplingParams,
+    SeqSampleParams, TokenLogprob,
+};
 
+#[derive(Default)]
 pub struct EngineRequest {
     pub prompt_tokens: Vec<u32>,
     pub max_tokens: usize,
@@ -26,6 +30,15 @@ pub struct EngineRequest {
     /// the CPU with a per-step grammar logit mask, so its output can only
     /// conform to the grammar.
     pub grammar: Option<forge_grammar::GrammarProgram>,
+    /// `logit_bias` (SPEC §8.1.2): additive bias per token id on the host
+    /// logits. Non-empty forces the CPU sampler.
+    pub logit_bias: Vec<(u32, f32)>,
+    /// `min_tokens` (SPEC §8.1.2): suppress every EOS id until this many tokens
+    /// are produced. Non-zero forces the CPU sampler.
+    pub min_tokens: usize,
+    /// `logprobs`/`top_logprobs` (SPEC §8.1.2): report each token's
+    /// log-probability plus this many top alternatives. Forces the CPU sampler.
+    pub logprobs: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -33,6 +46,9 @@ pub enum EngineEvent {
     Token {
         id: u32,
         text: String,
+        /// Per-token log-probability report (SPEC §8.1.2), present only when
+        /// the request asked for `logprobs`.
+        logprob: Option<TokenLogprob>,
     },
     Done {
         reason: FinishReason,
@@ -94,6 +110,13 @@ struct ActiveSeq<'t> {
     generated: Vec<u32>,
     max_tokens: usize,
     eos_ids: Vec<u32>,
+    /// `logit_bias` applied to the host logits before selection (CPU path).
+    logit_bias: Vec<(u32, f32)>,
+    /// EOS floor: suppress EOS until this many tokens are produced (CPU path).
+    min_tokens: usize,
+    /// When set, each token carries a `logprobs` report with this many top
+    /// alternatives (CPU path).
+    logprobs: Option<usize>,
     /// Live grammar state for constrained decoding; `None` = unconstrained.
     matcher: Option<forge_grammar::GrammarMatcher>,
     prompt_len: usize,
@@ -242,11 +265,16 @@ fn worker<'t>(
             }
             let prompt = sub.req.prompt_tokens;
             let prompt_len = prompt.len();
-            // Constrained requests must sample on the CPU (the grammar mask
-            // needs the full host logits before selection); unconstrained
-            // requests keep the GPU sampler whenever it fits.
+            // The CPU sampler runs whenever the request needs the full host
+            // logits before selection: the grammar mask, `logit_bias`,
+            // `min_tokens` (EOS suppression) or `logprobs` (host log-softmax).
+            // Otherwise the GPU sampler is kept whenever it fits.
             let matcher = sub.req.grammar.as_ref().map(|g| g.matcher());
-            let sampler = if matcher.is_none() && model.gpu_sampling_supported(&sub.req.sampling) {
+            let host_logits = matcher.is_some()
+                || !sub.req.logit_bias.is_empty()
+                || sub.req.min_tokens > 0
+                || sub.req.logprobs.is_some();
+            let sampler = if !host_logits && model.gpu_sampling_supported(&sub.req.sampling) {
                 SeqSampler::Gpu(GpuSampler::new(sub.req.sampling.clone()))
             } else {
                 SeqSampler::Cpu(Sampler::new(sub.req.sampling.clone()))
@@ -266,6 +294,9 @@ fn worker<'t>(
                 generated: Vec::new(),
                 max_tokens: sub.req.max_tokens.max(1),
                 eos_ids: sub.req.eos_ids,
+                logit_bias: sub.req.logit_bias,
+                min_tokens: sub.req.min_tokens,
+                logprobs: sub.req.logprobs,
                 matcher,
                 prompt_len,
                 cache_read,
@@ -348,7 +379,11 @@ enum StepOutcome {
 /// Emit one sampled token through the decoder + stop matcher and apply the
 /// termination checks (eos, stop string, max tokens, client hang-up). Shared
 /// by the per-sequence (`advance`) and batched (`batch_gpu_decode`) paths.
-fn emit_token(a: &mut ActiveSeq<'_>, next: u32) -> Result<StepOutcome> {
+fn emit_token(
+    a: &mut ActiveSeq<'_>,
+    next: u32,
+    logprob: Option<TokenLogprob>,
+) -> Result<StepOutcome> {
     if a.eos_ids.contains(&next) {
         finish(a, FinishReason::Eos)?;
         return Ok(StepOutcome::Finished);
@@ -356,24 +391,32 @@ fn emit_token(a: &mut ActiveSeq<'_>, next: u32) -> Result<StepOutcome> {
     a.generated.push(next);
 
     let piece = a.decoder.push(next)?;
+    let mut emit_text = String::new();
+    let mut matched = false;
     if !piece.is_empty() {
         let step = a.stops.push(&piece);
-        if !step.emit.is_empty()
-            && a.events
-                .send(EngineEvent::Token {
-                    id: next,
-                    text: step.emit,
-                })
-                .is_err()
-        {
-            // Client hung up — cancel generation, free the slot.
-            a.dead = true;
-            return Ok(StepOutcome::Finished);
-        }
-        if step.matched.is_some() {
-            finish(a, FinishReason::Stop)?;
-            return Ok(StepOutcome::Finished);
-        }
+        emit_text = step.emit;
+        matched = step.matched.is_some();
+    }
+    // Send a token event when there is text to surface or a per-token
+    // `logprobs` report to deliver (the latter must reach the client even for
+    // a token whose byte-level piece is still buffered by the decoder).
+    if (!emit_text.is_empty() || logprob.is_some())
+        && a.events
+            .send(EngineEvent::Token {
+                id: next,
+                text: emit_text,
+                logprob,
+            })
+            .is_err()
+    {
+        // Client hung up — cancel generation, free the slot.
+        a.dead = true;
+        return Ok(StepOutcome::Finished);
+    }
+    if matched {
+        finish(a, FinishReason::Stop)?;
+        return Ok(StepOutcome::Finished);
     }
 
     if a.generated.len() >= a.max_tokens {
@@ -406,20 +449,24 @@ fn advance(model: &mut Model, a: &mut ActiveSeq<'_>, prefill_chunk: usize) -> Re
     }
 
     // CPU-sampled decode (GPU decode is batched elsewhere).
-    let next = match a
+    let (next, logprob) = match a
         .next
         .take()
         .ok_or_else(|| ForgeError::Scheduler("missing next-token state".into()))?
     {
         PendingNext::Logits(mut logits) => match &mut a.sampler {
             SeqSampler::Cpu(s) => {
-                // Constrained decoding: forbid every non-conforming token
-                // before selection so the sampled id always advances the
-                // grammar.
+                // Apply `logit_bias`, suppress EOS below `min_tokens`, then the
+                // grammar mask — every non-conforming token forbidden before
+                // selection so the sampled id always advances the constraints.
+                apply_logit_bias(&mut logits, &a.logit_bias);
+                suppress_eos(&mut logits, &a.eos_ids, a.generated.len(), a.min_tokens);
                 if let Some(m) = &a.matcher {
                     m.apply_mask(&mut logits);
                 }
-                s.sample(&logits, &a.generated)?
+                let id = s.sample(&logits, &a.generated)?;
+                let lp = a.logprobs.map(|n| compute_logprob(&logits, id, n));
+                (id, lp)
             }
             SeqSampler::Gpu(_) => {
                 return Err(ForgeError::Scheduler(
@@ -427,13 +474,13 @@ fn advance(model: &mut Model, a: &mut ActiveSeq<'_>, prefill_chunk: usize) -> Re
                 ))
             }
         },
-        PendingNext::Token(t) => t,
+        PendingNext::Token(t) => (t, None),
     };
     if let Some(m) = &mut a.matcher {
         m.accept_token(next);
     }
 
-    if let StepOutcome::Finished = emit_token(a, next)? {
+    if let StepOutcome::Finished = emit_token(a, next, logprob)? {
         return Ok(());
     }
 
@@ -475,7 +522,7 @@ fn batch_gpu_decode(model: &mut Model, active: &mut [ActiveSeq<'_>], batch_min: 
             }
             None => continue,
         };
-        match emit_token(a, next) {
+        match emit_token(a, next, None) {
             Ok(StepOutcome::Continue) => feed_idx.push(i),
             Ok(StepOutcome::Finished) => {}
             Err(e) => {
@@ -579,6 +626,7 @@ fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason) -> Result<()> {
                 let _ = a.events.send(EngineEvent::Token {
                     id: last_id,
                     text: step.emit,
+                    logprob: None,
                 });
             }
             if step.matched.is_some() {
@@ -591,6 +639,7 @@ fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason) -> Result<()> {
                 let _ = a.events.send(EngineEvent::Token {
                     id: last_id,
                     text: rest,
+                    logprob: None,
                 });
             }
         }

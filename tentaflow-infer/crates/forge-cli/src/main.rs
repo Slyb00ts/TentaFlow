@@ -1124,6 +1124,7 @@ fn cmd_run(
             stop: vec![],
             eos_ids,
             grammar: None,
+            ..Default::default()
         },
         |piece| {
             use std::io::Write;
@@ -1194,6 +1195,7 @@ fn cmd_bench(
             stop: vec![],
             eos_ids: vec![],
             grammar: None,
+            ..Default::default()
         },
         |_| {},
     )?;

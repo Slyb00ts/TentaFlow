@@ -79,6 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stop: vec![],
         eos_ids,
         grammar: None,
+        ..Default::default()
     };
 
     let t1 = std::time::Instant::now();

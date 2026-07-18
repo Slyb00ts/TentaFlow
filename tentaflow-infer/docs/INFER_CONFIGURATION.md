@@ -270,7 +270,18 @@ obsłużony z radix prefix-cache (SPEC §5.2; pomijane gdy 0) — patrz sekcja
 | `tools` / `tool_choice` | — | `tools` musi być tablicą; `tool_choice`: `auto`/`none`/`required`/named. `required`/named wymuszają poprawne wywołanie przez constrained decoding (patrz niżej). Odpowiedź: `tool_calls[]`, `finish_reason:"tool_calls"`. |
 | `response_format` | — | Constrained decoding — patrz niżej. |
 | `grammar` | — | Passthrough gramatyki GBNF/EBNF (root `root`). Constrained decoding. |
-| `n` | 1 | `n>1` → 400 (na razie). |
+| `logit_bias` | — | `{token_id: bias}` (klucze-stringi), bias w [-100, 100]; ±100 ≈ twardy force/ban. Dodawany do logitów PRZED próbkowaniem. Wymusza sampler CPU. |
+| `min_tokens` | 0 | Dolny próg wygenerowanych tokenów: wszystkie EOS tłumione (logit → -inf) aż do progu. Musi być ≤ `max_tokens`. Wymusza sampler CPU. |
+| `logprobs` | — | Chat: `true` + `top_logprobs:N` (0..20) → `choices[].logprobs.content[]` (token, `logprob`, `bytes`, `top_logprobs[]`). Completions: `logprobs:N` (0..20) → legacy `{tokens, token_logprobs, top_logprobs, text_offset}`. Log-softmax na hoście; przy temp 0 top-1 = token próbkowany. Wymusza sampler CPU. Tylko non-streaming. |
+| `echo` (completions) | false | Dokleja prompt do odpowiedzi; z `logprobs` tokeny promptu dostają `token_logprobs=null`. Tylko non-streaming. |
+| `n` | 1 | Liczba niezależnych completions (1..128). Osobne ziarna (`seed+i·φ`), dzielą prefiks promptu przez radix prefix-cache; `choices[0..n]`. Non-streaming (streaming przy `n>1` = 400). |
+
+Usage przy `n>1`: `prompt_tokens` liczony raz, `completion_tokens` sumowany po
+wszystkich completions.
+
+`logit_bias`/`min_tokens`/`logprobs` (oraz maska gramatyki) wymuszają sampler CPU
+(pełne logity na hoście); żądanie bez żadnej z tych funkcji zostaje na samplerze
+GPU — ścieżka bit-identyczna (golden Bielik NVFP4 bez zmian).
 
 Myślenie (`<think>…</think>`, np. Qwen3) jest ekstrahowane do
 `reasoning_content` (nie liczy się jako content).
@@ -535,4 +546,7 @@ correctness-first — host round-tripy per warstwa, bez grafu/wsadu; llama.cpp
   (Qwen3.6 `qwen35moe`) generują E2E, ale ścieżka jest correctness-first
   (~17 tok/s, host round-tripy per warstwa, bez grafu/wsadu — patrz sekcja
   qwen35moe); jedna aktywna sekwencja SSM naraz.
-- `logprobs`/`n>1` w API: jeszcze nie.
+- `logprobs`/`echo`/`n>1`: obsługiwane tylko na ścieżce non-streaming (streaming
+  przy `n>1` lub completions z `echo`/`logprobs` = 400). Streaming chat NIE dokłada
+  `logprobs` do delt (parser reorganizuje tekst — token↔delta nie są 1:1). Prompt-token
+  logprobs przy `echo` mają `null` (pozycje prefill nie są punktowane osobno).

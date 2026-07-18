@@ -129,7 +129,9 @@ wider loads alone. `kernels/mojo/bench_gemv.mojo` is the measurement harness.
   (embedding GGUF already in .runtime), SSE streaming, usage accounting.
 - Tool-call parser registry (Hermes/Qwen `<tool_call>`, Llama-3 JSON) —
   streaming incremental; `reasoning_content` extraction (`<think>`).
-- logit_bias, min_tokens, n/best-of (CoW KV), seed, stop, logprobs.
+- logit_bias, min_tokens, n (multiple completions; shared prompt prefix via radix
+  cache), seed, stop, logprobs/top_logprobs, echo — DONE (`tests/e2e_generation.rs`;
+  feature-gated CPU sampler, no-feature GPU path bit-identical, Bielik golden unchanged).
 - forge-cli: `serve`, `run` (interactive), `bench`, `pull` (HF Hub).
 
 ### Chunk 8 — speculation framework (composable proposers)
