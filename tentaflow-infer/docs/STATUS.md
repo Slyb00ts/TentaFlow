@@ -1,0 +1,125 @@
+# FORGE — Status realizacji vs SPEC
+
+Uczciwa inwentaryzacja tego, co jest zrobione, częściowe i nietknięte, mapowana
+na sekcje `docs/SPEC.md`. **Reguła utrzymania: aktualizuj ten plik gdy domykasz
+lub zaczynasz element (w tym samym commicie).**
+
+Skala: SPEC to plan na ~30-45 inż. × 14 mies. (7 streamów). Zrobiony jest
+najtrudniejszy RDZEŃ jednokartowy (kernele, silnik, KV, batching, kwantyzacja)
+— produkcyjnej jakości, bramkowany testami. Poniżej reszta.
+
+Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
+
+Ostatnia aktualizacja: 2026-07-18.
+
+---
+
+## Zrobione (rdzeń, jednokartowy NVIDIA, produkcyjny)
+
+- ✅ **HAL CUDA** (cudarc): areny VRAM, streamy/eventy, CUDA graphs, pinned copy
+- ✅ **Formaty**: GGUF v2/v3 (WSZYSTKIE kwantyzacje natywnie w VRAM: Q2-Q8_K,
+  Q4/5_0/1, IQ1-IQ4, MXFP4), safetensors (NVFP4, FP8, BF16, sharding)
+- ✅ **Tokenizery + chat templating**: HF + GGUF-BPE, minijinja HF-compat,
+  streaming detok UTF-8, stop-holdback
+- ✅ **Kernele Mojo** (AOT→PTX): rmsnorm/layernorm, rope, silu, fused dequant
+  GEMV+GEMM (wszystkie quanty + dp4a int8 + mma tensor-core), paged flash
+  attention (decode split-K + prefill, GQA), conv1d/gelu (Whisper), sampling GPU
+- ✅ **Silnik LLM**: forward, paged KV, fused decode chain, batched continuous
+  decode (36× throughput), chunked prefill, admission control, CUDA-graph per bucket
+- ✅ **Drabinka kwantyzacji KV**: f16 → fp8 → rot4 → rot3 (TurboQuant)
+- ✅ **Tiering KV**: VRAM→RAM→NVMe, chunki 4-16MB, cross-seq eviction, overlap
+  restore, streamed-in-batch, KVFlash (stały VRAM)
+- ✅ **Długi kontekst**: `--ctx` do max modelu (1M osiągalny przez tiering)
+- ✅ **Serwer OpenAI**: chat/completions, completions, embeddings,
+  audio/transcriptions, models, healthz; SSE; tool calling (hermes/llama3);
+  reasoning_content; admission 429/400
+- ✅ **Modalności**: LLM, STT (własny Whisper), Embeddings (pooling, Matryoshka)
+- ✅ **Sampling**: temp/top-k/top-p/min-p/penalty/seed na GPU
+- ✅ **GPU sampling** (logity nie schodzą na CPU)
+
+---
+
+## Częściowe
+
+- 🟡 **§6 Spekulacja**: framework (Proposer trait, NgramProposer, kaskada,
+  adaptive-disable) ISTNIEJE, ale NIE jest wpięty w pętlę decode — brak draft
+  model / MTP / EAGLE proposerów i tree-verification w silniku. To rusztowanie,
+  nie działająca akceleracja.
+- 🟡 **§4.2 Rejestr architektur**: qwen3, llama, mistral. Brak: DeepSeek (MLA),
+  Gemma (sliding-window), Phi, Mixtral/MoE, Qwen-MoE, hybrydy Mamba.
+- 🟡 **§9.2 Odporność**: admission ✅; brak respawn workera po crashu, health
+  per-GPU, pełnego graceful drain.
+- 🟡 **§8.3 Operacyjność**: /healthz ✅; brak metryk Prometheus/OTel, hot reload.
+- 🟡 **§1.2 Cele wydajności**: część spełniona jednokartowo (decode ≥ vLLM na
+  niektórych, prefill ≥ llama.cpp); cele multi-node (RoCE 88%) nieosiągalne bez §7.
+
+---
+
+## Nietknięte (duże filary)
+
+### Sprzęt / skala
+- ❌ **§3 HAL multivendor**: TYLKO CUDA. Brak ROCm/HIP (AMD), Metal (Apple),
+  Level Zero (Intel), CPU-compute. To rdzeń obietnicy "uniwersalny" — 0%.
+- ❌ **§3.3 Komunikatory**: NCCL/RCCL/oneCCL/ForgeCCL — 0%.
+- ❌ **§7 Równoległość**: TP / PP / EP / multi-node / disaggregation — 0%.
+  Silnik jest ściśle jednokartowy.
+
+### Kompilator / IR
+- ❌ **§4.1 Graph IR + kompilator**: brak deklaratywnego op-grafu, passów
+  (fuzja, layout planning), autotunera. Forward jest ręcznie napisany.
+
+### Modalności i modele
+- ❌ **§4.3 TTS** (silnik LM+vocoder)
+- ❌ **§4.3 T2I / diffusion** (SDXL/Flux, scheduler krokowy)
+- ❌ **§4.3 Video** (rozumienie + DiT)
+- ❌ **§4.3 Reranking** (cross-encoder)
+- ❌ **§4.3 Multimodal input** (vision encoder → embeddingi)
+- ❌ **MoE**: brak fused MoE dispatch/combine → modele MoE nie działają
+- ❌ **§4.4 MLA** (DeepSeek), **sliding-window + sinks**, **linear/SSM** (Mamba)
+- ❌ **ONNX** (import grafu → IR; parakeet/silero/depth z .runtime)
+
+### KV / cache zaawansowane
+- ❌ **§5.2 Radix-tree prefix caching** (dedup system-promptów/multi-turn) — duże
+- ❌ **§5.2 Copy-on-write KV** (beam/n-best), MLA latent cache
+- ❌ **§5.4A Expert streaming** (tiering wag MoE, Colibri) — czeka na MoE
+- ❌ **§5.4B Trwałe sesje KV** (opt-in persystencja między turami)
+- ❌ **§5.3 GDS/cuFile**, hot-swap modeli, **multi-LoRA** (S-LoRA)
+
+### API / serwowanie
+- ❌ **§8.1.2 Constrained decoding** (JSON-schema / regex / EBNF grammar mask) — duże
+- ❌ **§8.1.2 Prompt caching** jako kontrakt API (cache_control/prompt_cache_key)
+- ❌ **§8.1.2** logit_bias, min_tokens, n/best-of, **logprobs**, echo
+- ❌ **§8.1 Anthropic API** (/v1/messages), images endpoint
+- ❌ **§8.2 FORGE-RPC** (QUIC + CBOR, SDK Rust/Py/TS)
+- ❌ **§8.4 Realtime API** (voice-to-voice duplex, barge-in)
+- ❌ **§8.5 Batch / offline API** (joby JSONL)
+
+### Produkcja
+- ❌ **§9.3 Multi-tenancy**: OIDC/JWT, kwoty/rate-limit, fair-share scheduler,
+  izolacja prefix-cache per tenant
+- ❌ **§9.4 forge pull** (HF Hub download), **auto-planner**, **forge convert** (kwantyzator)
+- ❌ **§9.5 Dystrybucja**: obrazy OCI, pakiet pip, podpisy artefaktów, SBOM, fuzzing
+- ❌ **§10 Bramki jakości CI**: lm-eval-harness, PPL gate, nightly benchmark farm
+
+---
+
+## Ocena skali pozostałej pracy (zgrubnie)
+
+| Obszar | Rozmiar | Uwaga |
+|---|---|---|
+| Multivendor HAL (ROCm/Metal/Intel) | bardzo duży | rdzeń "uniwersalności"; osobny backend + rekompilacja kerneli Mojo per target |
+| Multi-node TP/PP/EP + ForgeCCL | bardzo duży | cały pillar §7 |
+| Graph IR + kompilator + autotuner | duży | zamienia ręczny forward |
+| MoE (kernele + expert streaming) | duży | odblokowuje DeepSeek/Mixtral/Qwen-MoE |
+| Modalności TTS/T2I/Video | duży (każda) | osobne silniki |
+| ONNX loader | duży | import opset 17+ subset |
+| Constrained decoding (grammar) | średni | JSON/regex/EBNF → automat → maska GPU |
+| Radix prefix cache | średni | duży zysk dla multi-turn |
+| FORGE-RPC / Realtime / Batch API | średni (każdy) | |
+| Spekulacja wpięta w decode | średni | framework już jest |
+| forge pull/convert, metryki, multi-tenancy | średni (łącznie) | produkcja |
+
+Wniosek: rdzeń jednokartowego LLM/STT/embeddings jest mocny i produkcyjny,
+ale to ~1/3 zakresu spec. Największe brakujące dźwignie wartości: multivendor
+HAL, MoE, radix prefix cache, constrained decoding, ONNX. Największe "całe
+pillary": multivendor i multi-node.
