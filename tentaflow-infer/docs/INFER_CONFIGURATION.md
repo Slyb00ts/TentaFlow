@@ -40,8 +40,8 @@ Wewnętrzne (ModelConfig, niewystawione jako flagi): `kv_page_size=32` tokeny/st
 ## KV tiering: VRAM → pinned RAM → NVMe (serve / run / bench)
 
 `TierManager` (SPEC §5.4B, `forge-engine/src/tier.rs`): zimne strony KV są
-spillowane z VRAM w **chunkach 4–16 MB** per (sekwencja × wszystkie warstwy)
-do przypiętego RAM-u, a po przekroczeniu budżetu RAM — do append-only pliku
+spillowane z VRAM w **chunkach 4–16 MB** per (sekwencja × warstwy zarządzane
+przez tier) do przypiętego RAM-u, a po przekroczeniu budżetu RAM — do append-only pliku
 NVMe (FIFO demote, zapis sekwencyjny; żadnych małych losowych I/O na dysk).
 Sekwencja, której spilled KV nie mieści się z powrotem w VRAM, dekoduje przez
 ścieżkę STRUMIENIOWANĄ: per warstwa staging slab dostaje PEŁNY kontekst tej
@@ -51,6 +51,13 @@ tieringu (bajty KV są przenoszone, nie transformowane; te same kernele w tej
 samej kolejności) — udowodnione testami `forge-engine/tests/kv_tier.rs` i na
 Bielik-7B-NVFP4 (8k kontekstu na budżecie VRAM 2k tokenów, needle-recall przez
 granicę spillu, identyczne id tokenów greedy).
+
+`TierManager` zarządza tylko WYBRANYMI warstwami: dla modeli gęstych/rot to
+wszystkie warstwy (`layer_kinds` jest w całości `Attention` → zero zmian
+zachowania), a dla hybrydy `qwen35moe` — tylko ~10 warstw atencji (30 warstw
+DeltaNet trzyma rezydentny stan SSM, nigdy nie paged). Chunki pakują te warstwy
+po ich pozycji w liście (indeks „kompaktowy"), więc hybrydowy chunk niesie ~10
+warstw atencji zamiast 41 — patrz sekcja qwen35moe.
 
 | Flaga | Domyślnie | Opis |
 |---|---|---|
@@ -283,11 +290,13 @@ Uwaga metodyczna: prefill mierzony do pierwszego WIDOCZNEGO tokenu (zawiera
 - Bez flag — działa jak zwykły model (`forge run olmoe.gguf "…" -n 24 --temp 0`).
 - Routing zgodny z HF: softmax po WSZYSTKICH ekspertach → top-k → opcjonalny
   renorm. Obsługiwane QK-norm: pełny wektor (OLMoE) i per-head (qwen3moe).
-- Ograniczenia MoE (v1, correctness-first): tylko KV `f16` (bez fp8/rot), bez
-  KV-tieringu, tylko single-stream decode (batched/`--max-active`>1 → jawny
-  Unsupported). Prefill przetwarza całą paczkę naraz; decode jeden token/krok
-  (wybór ekspertów zależny od danych → brak CUDA-graph). Perf-follow-up:
-  grouped-GEMM permute/unpermute i batched-MoE decode.
+- Ograniczenia MoE (v1, correctness-first): tylko KV `f16` (bez fp8/rot),
+  KV-tiering tylko dla hybrydy `qwen35moe` (patrz niżej — nie-hybrydowe MoE:
+  OLMoE/qwen3moe → jawny Unsupported, bo brak ścieżki staged-attention decode),
+  tylko single-stream decode (batched/`--max-active`>1 → jawny Unsupported).
+  Prefill przetwarza całą paczkę naraz; decode jeden token/krok (wybór ekspertów
+  zależny od danych → brak CUDA-graph). Perf-follow-up: grouped-GEMM
+  permute/unpermute i batched-MoE decode.
 - Warstwy MTP/NextN (`nextn_predict_layers`) są pomijane w podstawowej generacji.
 
 ### qwen35moe (Qwen3.6-35B-A3B, hybrid SSM+MoE) — DZIAŁA E2E
@@ -313,6 +322,23 @@ correctness-first — host round-tripy per warstwa, bez grafu/wsadu; llama.cpp
   L2-norm → repeat 16→32 blokowo jak `ggml_repeat` → gated step → gated-RMSNorm →
   out-proj), MoE + bramkowany shared expert. Prefill = sekwencyjny scan
   rekurencyjny; decode = 1 token/krok. Ograniczenia jak MoE (KV f16, single-stream).
+- **KV-tiering / KVFlash DZIAŁA** (jedyne MoE, które tieruje). Kluczowy fakt
+  architektoniczny: z 41 warstw tylko ~10 to ATENCJA (paged KV) — 30 warstw
+  DeltaNet trzyma rezydentny stan SSM, który NIGDY nie jest paged/spillowany.
+  `TierManager` dostaje listę indeksów warstw atencji (`layer_kinds` filtrowane po
+  `Attention`) i pakuje chunki tylko z tych ~10 warstw (kompaktowy indeks warstwy),
+  więc ślad KV tieringu jest ~4× mniejszy niż dla modelu czysto-atencyjnego.
+  `hybrid_attn_mixer` przyjmuje `AttnSrc`: `Paged` (rezydentny paged KV) albo
+  `Staged` (pełny kontekst warstwy strumieniowany ze slabów tieru — te same
+  kernele/kolejność, więc tokeny greedy są bit-identyczne z przebiegiem bez tieru).
+  Prefill (`prefill_hybrid`) i decode (`step_streamed`) są tier-świadome:
+  `tier_ensure_capacity` spilluje najzimniejsze strony atencji przed `kv.grow`, a
+  gdy sekwencja ma spilnięte strony, atencja idzie przez staged path. Stan SSM
+  advansuje niezmiennie (rezydentny). Dowód: prompt 8k z igłą, `--kv-tier nvme
+  --kv-pages 64` (2048 tokenów gorące) → ~6k tokenów KV atencji spilnięte na NVMe,
+  igła odzyskana, ids bit-identyczne z przebiegiem full-VRAM bez tieru, VRAM stały.
+  Uruchomienie: `forge run qwen36-moe.gguf "…" -n 24 --temp 0 --weights-pool-gb 20
+  --ctx 4096 --kvflash --kv-hot-pages 64`.
 
 ### qwen35moe — szczegóły rejestru/kerneli
 

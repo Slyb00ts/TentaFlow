@@ -107,7 +107,15 @@ struct Chunk {
 pub struct TierManager {
     cfg: KvTierConfig,
     device: Arc<dyn Device>,
-    n_layers: usize,
+    /// Global indices of the layers whose KV is spilled/restored/staged. Dense
+    /// and rotational models list every layer (`0..n_layers`); the hybrid
+    /// `qwen35moe` path lists ONLY its attention layers — the DeltaNet layers
+    /// keep a resident recurrent state that is never paged. Chunks pack these
+    /// layers by their position in this list (the "compact" index), so a
+    /// hybrid chunk holds ~10 attention layers, not all 41.
+    layers: Vec<usize>,
+    /// Reverse map: global layer index → compact chunk position.
+    layer_slot: HashMap<usize, usize>,
     /// Bytes of ONE page of each spillable region of one layer
     /// (KvConfig::tier_region_bytes order).
     region_bytes: Vec<usize>,
@@ -169,7 +177,7 @@ impl TierManager {
     pub fn new(
         cfg: KvTierConfig,
         device: Arc<dyn Device>,
-        n_layers: usize,
+        layers: Vec<usize>,
         region_bytes: Vec<usize>,
     ) -> Result<Self> {
         let layer_bytes: usize = region_bytes.iter().sum();
@@ -179,7 +187,9 @@ impl TierManager {
             region_prefix.push(acc);
             acc += rb;
         }
-        let per_page = n_layers * layer_bytes;
+        let layer_slot: HashMap<usize, usize> =
+            layers.iter().enumerate().map(|(ci, &l)| (l, ci)).collect();
+        let per_page = layers.len() * layer_bytes;
         let mut chunk_pages = (TARGET_CHUNK_BYTES / per_page.max(1)).max(1);
         if chunk_pages * per_page > MAX_CHUNK_BYTES {
             chunk_pages = (MAX_CHUNK_BYTES / per_page.max(1)).max(1);
@@ -211,8 +221,9 @@ impl TierManager {
             (None, 0, None, None)
         };
         tracing::info!(
-            "kv tiering on: mode={:?} regions={} chunk={} pages ({:.1} MiB) ram_budget={:.1} GiB watermark={:.0}%",
+            "kv tiering on: mode={:?} layers={} regions={} chunk={} pages ({:.1} MiB) ram_budget={:.1} GiB watermark={:.0}%",
             cfg.mode,
+            layers.len(),
             region_bytes.len(),
             chunk_pages,
             (chunk_pages * per_page) as f64 / (1 << 20) as f64,
@@ -224,7 +235,8 @@ impl TierManager {
         Ok(Self {
             cfg,
             device,
-            n_layers,
+            layers,
+            layer_slot,
             region_bytes,
             region_prefix,
             layer_bytes,
@@ -322,13 +334,13 @@ impl TierManager {
         n: usize,
         stream: &Stream,
     ) -> Result<()> {
-        let bytes = self.n_layers * self.layer_bytes * n;
+        let bytes = self.layers.len() * self.layer_bytes * n;
         let pinned = self
             .device
             .alloc(bytes, MemKind::PinnedHost, Pool::Activations)?;
         let t0 = Instant::now();
-        for l in 0..self.n_layers {
-            let base = self.layer_off(l, n);
+        for (ci, &l) in self.layers.iter().enumerate() {
+            let base = self.layer_off(ci, n);
             let regions = kv.tier_layer_regions(l);
             for (r, buf) in regions.iter().enumerate() {
                 let rb = self.region_bytes[r];
@@ -524,8 +536,8 @@ impl TierManager {
                 })?;
                 seq.pages[r.first_page + i] = phys;
             }
-            for l in 0..self.n_layers {
-                let base = self.layer_off(l, n);
+            for (ci, &l) in self.layers.iter().enumerate() {
+                let base = self.layer_off(ci, n);
                 let regions = kv.tier_layer_regions(l);
                 for (reg, buf) in regions.iter().enumerate() {
                     let rb = self.region_bytes[reg];
@@ -618,6 +630,11 @@ impl TierManager {
         slot: usize,
         stream: &Stream,
     ) -> Result<()> {
+        // Chunks pack managed layers by their compact position; a global layer
+        // index maps to that position (attention-only for the hybrid path).
+        let ci = *self.layer_slot.get(&l).ok_or_else(|| {
+            ForgeError::Scheduler(format!("kv tier stage_layer: layer {l} is not tier-managed"))
+        })?;
         let mut any_cold = false;
         let mut cursor = 0usize;
         let mut bytes = 0usize;
@@ -626,7 +643,7 @@ impl TierManager {
                 ForgeError::Scheduler("kv tier chunk missing during streaming".into())
             })?;
             let n = chunk.pages;
-            let base = self.layer_off(l, n);
+            let base = self.layer_off(ci, n);
             bytes += self.layer_bytes * n;
             match &chunk.loc {
                 ChunkLoc::Ram(buf) => {

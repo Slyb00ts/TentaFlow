@@ -100,6 +100,16 @@ Ostatnia aktualizacja: 2026-07-18.
     z bramkowanym shared expertem. Prefill = sekwencyjny scan rekurencyjny po
     tokenach promptu; decode = jeden token/krok. Bramka osiągnięta: spójny tekst +
     pełna zgodność greedy z `llama-cli`.
+  - ✅ **KV-tiering / KVFlash dla hybrydy** (`hybrid_attn_mixer` z `AttnSrc`,
+    `prefill_hybrid`/`step_streamed` tier-świadome): z 41 warstw tylko ~10 to
+    atencja (paged KV) — `TierManager` dostaje listę warstw atencji i pakuje
+    chunki wyłącznie z nich (indeks kompaktowy), 30 warstw DeltaNet trzyma
+    rezydentny stan SSM (nigdy nie paged). Spilled atencja strumieniowana per
+    warstwa (staged path, te same kernele → bit-identyczność z przebiegiem bez
+    tieru). Dowód: prompt 8k z igłą, `--kv-tier nvme --kv-pages 64` (2048
+    tokenów gorące) → ~6k tokenów KV atencji spilnięte na NVMe, igła odzyskana,
+    ids bit-identyczne z full-VRAM, VRAM stały; `--kvflash --kv-hot-pages 64`
+    bez OOM na modelu 20 GB. Nie-hybrydowe MoE (OLMoE/qwen3moe) nadal bez tieru.
   - 🟡 **Wydajność ścieżki hybrydowej**: korektność najpierw — host round-tripy
     per warstwa (gather embed, bramka atencji, router MoE), brak grafu CUDA i
     wsadu, DeltaNet skanowany per token wieloma małymi `device.copy`. ~17 tok/s
@@ -138,8 +148,9 @@ Ostatnia aktualizacja: 2026-07-18.
   stackowanym tensorze `ffn_*_exps`), akumulacja `moe_scale_add`. Wspiera
   full-vector QK-norm (OLMoE) i per-head (qwen3moe), shared experts (design).
   Decode single-stream (bez CUDA-graph — wybór ekspertów zależny od danych) +
-  prefill batched. TODO (perf): grouped-GEMM permute/unpermute zamiast pętli,
-  batched-MoE decode, KV low-bit/tiering dla MoE.
+  prefill batched. KV-tiering: ✅ dla hybrydy qwen35moe (warstwy atencji), ❌ dla
+  nie-hybrydowego MoE (brak staged-attention decode). TODO (perf): grouped-GEMM
+  permute/unpermute zamiast pętli, batched-MoE decode, KV low-bit dla MoE.
 - ❌ **§4.4 MLA** (DeepSeek), **sliding-window + sinks**, **linear/SSM** (Mamba)
 - ❌ **ONNX** (import grafu → IR; parakeet/silero/depth z .runtime)
 

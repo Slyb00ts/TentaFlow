@@ -36,10 +36,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut decode = 16usize;
     let mut needle = false;
     let mut prompt_text: Option<String> = None;
+    let mut weights_gb = 12.0f64;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--ctx" => ctx = args.next().unwrap().parse()?,
             "--kv-pages" => kv_pages = args.next().unwrap().parse()?,
+            "--weights-gb" => weights_gb = args.next().unwrap().parse()?,
             "--tier" => {
                 tier_mode = match args.next().unwrap().as_str() {
                     "off" => KvTierMode::Off,
@@ -72,12 +74,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             watermark: 0.10,
         },
     };
+    // The engine's paged KV slabs + (hybrid) SSM state allocate from the
+    // WEIGHTS pool, not the HAL kv_cache pool, so keep the latter tiny (a full
+    // multi-GiB kv_cache arena would needlessly starve the weights pool on a
+    // 20 GB model). Size weights from --weights-gb for large models.
     let device = CudaDevice::new(
         0,
         PoolSizes {
-            weights: 12 << 30,
-            kv_cache: 4 << 30,
-            activations: 1 << 30,
+            weights: (weights_gb * (1u64 << 30) as f64) as usize,
+            kv_cache: 4 << 20,
+            activations: 512 << 20,
             kv_page_size: 256 << 10,
         },
     )?;

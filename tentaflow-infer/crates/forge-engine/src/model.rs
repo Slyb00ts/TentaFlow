@@ -442,9 +442,16 @@ impl Model {
                     "MoE models currently support only the f16 KV cache".into(),
                 ));
             }
-            if cfg.kv_tier.enabled() {
+            // The hybrid `qwen35moe` arch (attention + Gated-DeltaNet MoE) DOES
+            // tier: only its ~10 attention layers hold a paged KV cache, and
+            // that cache spills/restores/streams through the same tier manager
+            // as the dense path. The DeltaNet layers keep a small resident
+            // recurrent state that is never paged. Non-hybrid MoE (OLMoE,
+            // Qwen3-MoE) still lacks a staged-attention decode chain.
+            let hybrid = weights.descriptor.params.ssm.is_some();
+            if cfg.kv_tier.enabled() && !hybrid {
                 return Err(ForgeError::Unsupported(
-                    "MoE models do not support KV tiering yet".into(),
+                    "non-hybrid MoE models do not support KV tiering yet".into(),
                 ));
             }
         }
@@ -507,10 +514,22 @@ impl Model {
             let identity: Vec<i32> = (0..max_pages_per_seq as i32).collect();
             let identity_pt = device.alloc(max_pages_per_seq * 4, MemKind::Device, Pool::Weights)?;
             device.write(bytemuck::cast_slice(&identity), &identity_pt, 0)?;
+            // Tier only the attention layers: for a dense/rot model that is
+            // every layer (`layer_kinds` is all-Attention, so behavior is
+            // unchanged), for the hybrid arch it is the ~10 attention layers
+            // (the DeltaNet layers keep a resident recurrent state, never paged).
+            let tier_layers: Vec<usize> = weights
+                .descriptor
+                .layer_kinds
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| matches!(k, forge_formats::LayerKind::Attention))
+                .map(|(i, _)| i)
+                .collect();
             let tm = TierManager::new(
                 cfg.kv_tier.clone(),
                 device.clone(),
-                p.block_count,
+                tier_layers,
                 region_bytes.clone(),
             )?;
             (
@@ -776,7 +795,11 @@ impl Model {
         self.kv.release(seq);
         self.pt_seq = 0;
         for chunk in toks.chunks(MAX_PREFILL_CHUNK) {
-            self.prefill_forward(seq, chunk)?;
+            if self.is_hybrid() {
+                self.prefill_hybrid(seq, chunk)?;
+            } else {
+                self.prefill_forward(seq, chunk)?;
+            }
         }
         Ok(())
     }
@@ -2189,7 +2212,7 @@ impl Model {
             if pos == 0 {
                 self.zero_ssm()?;
             }
-            return self.hybrid_forward_token(token_id, true);
+            return self.hybrid_forward_token(token_id, true, AttnSrc::Paged);
         }
 
         // Routed MoE decode reads the per-token top-k experts back to the host
@@ -2291,6 +2314,15 @@ impl Model {
             .as_mut()
             .expect("streamed path requires tiering")
             .prepare_streaming(seq)?;
+        // Hybrid decode: the per-token recurrent forward runs each attention
+        // layer over the tier staging slabs (its full context), while the
+        // resident DeltaNet state advances untouched. kv_append needs the
+        // device page table for the resident tail write.
+        if self.is_hybrid() {
+            self.ensure_hybrid_bufs()?;
+            self.upload_page_table(seq)?;
+            return self.hybrid_forward_token(token_id, true, AttnSrc::Staged(seq));
+        }
         if self.kv.cfg.quant.is_rot() {
             // kv_pack_rot commits the token into the canonical packed store
             // through the device page table (tail pages are resident), so the
@@ -3216,7 +3248,7 @@ impl Model {
     /// token mixer by layer kind and folding in the gated shared expert. Inputs
     /// (`b.ids`/`b.pos`/`seq_len_dev`/page table) must be uploaded by the
     /// caller; the next-token logits land in `b.logits` when `want_logits`.
-    fn hybrid_forward_token(&self, token_id: u32, want_logits: bool) -> Result<()> {
+    fn hybrid_forward_token(&self, token_id: u32, want_logits: bool, src: AttnSrc) -> Result<()> {
         let p = self.weights.descriptor.params.clone();
         let hidden = p.hidden_size;
         let eps = p.rms_norm_eps;
@@ -3254,7 +3286,7 @@ impl Model {
         for l in 0..n_layers {
             let layer = &self.weights.layers[l];
             match &layer.mixer {
-                LayerMixer::Attention(a) => self.hybrid_attn_mixer(l, a)?,
+                LayerMixer::Attention(a) => self.hybrid_attn_mixer(l, a, &src)?,
                 LayerMixer::DeltaNet(d) => self.hybrid_delta_mixer(l, d)?,
             }
             // Residual add (mixer output) + post-attention norm for the FFN.
@@ -3300,7 +3332,7 @@ impl Model {
     /// projection is gated (`[q, gate]` interleaved per head), so q/gate are
     /// de-interleaved, per-head QK-norm + partial RoPE applied, causal decode
     /// attention run, then `out = attn ⊙ sigmoid(gate)` before the O projection.
-    fn hybrid_attn_mixer(&self, l: usize, a: &AttnWeights) -> Result<()> {
+    fn hybrid_attn_mixer(&self, l: usize, a: &AttnWeights, src: &AttnSrc) -> Result<()> {
         let p = &self.weights.descriptor.params;
         let head_dim = p.head_dim;
         let n_heads = p.n_heads;
@@ -3348,22 +3380,55 @@ impl Model {
             head_dim,
             stream,
         )?;
-        kernels.attn_decode_f16(
-            &b.attn_out,
-            &hb.qc,
-            &self.kv.k[l],
-            &self.kv.v[l],
-            &self.page_table_dev,
-            &self.seq_len_dev,
-            1,
-            n_heads,
-            n_kv,
-            head_dim,
-            self.kv.cfg.page_size,
-            self.max_pages_per_seq,
-            scale,
-            stream,
-        )?;
+        match src {
+            AttnSrc::Paged => {
+                kernels.attn_decode_f16(
+                    &b.attn_out,
+                    &hb.qc,
+                    &self.kv.k[l],
+                    &self.kv.v[l],
+                    &self.page_table_dev,
+                    &self.seq_len_dev,
+                    1,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    self.kv.cfg.page_size,
+                    self.max_pages_per_seq,
+                    scale,
+                    stream,
+                )?;
+            }
+            AttnSrc::Staged(seq) => {
+                // Spilled sequence: kv_append above committed this token into
+                // the resident tail of the canonical paged slab; staging then
+                // materializes the FULL context for this attention layer (cold
+                // pages streamed from RAM/NVMe, resident pages copied D2D) and
+                // attention runs over it via the identity page table. Same
+                // kernel + order as the paged path, so greedy tokens are
+                // bit-identical to an untiered run.
+                let tier = self.tier.as_ref().expect("staged attention requires tiering");
+                let tb = self.tier_bufs.as_ref().expect("tier staging allocated");
+                let slot = &tb.slots[0];
+                tier.stage_layer(&self.kv, seq, l, &slot.stage, 0, stream)?;
+                kernels.attn_decode_f16(
+                    &b.attn_out,
+                    &hb.qc,
+                    &slot.stage[0],
+                    &slot.stage[1],
+                    &tb.identity_pt,
+                    &self.seq_len_dev,
+                    1,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    self.kv.cfg.page_size,
+                    self.max_pages_per_seq,
+                    scale,
+                    stream,
+                )?;
+            }
+        }
         // Output gate: out = attn ⊙ sigmoid(gate), applied on-device so the
         // whole mixer stays on the compute stream (no per-layer host sync).
         kernels.sigmoid_mul_f16(&hb.gated, &b.attn_out, &hb.gatec, q_dim, stream)?;
@@ -3446,12 +3511,16 @@ impl Model {
 
     /// Prefill a prompt chunk for the hybrid arch as a sequential per-token
     /// recurrent scan (the DeltaNet state carries token-to-token). Returns the
-    /// last token's next-token logits.
+    /// last token's next-token logits. Tier-aware: each token first spills the
+    /// coldest attention KV if the hot pool is full, so a long prompt beyond the
+    /// VRAM pool prefills by streaming older attention KV back per layer while
+    /// the resident DeltaNet state advances untouched.
     fn prefill_hybrid(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
         self.ensure_hybrid_bufs()?;
         let p = self.weights.descriptor.params.clone();
         let vocab = p.vocab_size;
         let page_size = self.kv.cfg.page_size;
+        let tier_t0 = self.tier.is_some().then(std::time::Instant::now);
         let mut last_logits = Vec::new();
         for (i, &tok) in tokens.iter().enumerate() {
             let pos = seq.len;
@@ -3464,14 +3533,34 @@ impl Model {
                     p.max_position_embeddings
                 )));
             }
+            // Free VRAM pages for this token before growing; may spill the
+            // coldest attention KV to RAM/NVMe. Retain the tokens (recompute
+            // path) and track the still-purely-prefilled prefix.
+            self.tier_ensure_capacity(seq, 1)?;
+            if self.tier.is_some() {
+                if seq.tokens.len() == seq.prefilled_len {
+                    seq.prefilled_len += 1;
+                }
+                seq.tokens.push(tok);
+            }
+            let staged = self.tier.is_some() && !seq.spilled.is_empty();
             let page_boundary = seq.len.is_multiple_of(page_size);
             self.kv.grow(seq)?;
             self.upload_decode_inputs(tok, pos)?;
-            if page_boundary || self.pt_seq != seq.id {
-                self.upload_page_table(seq)?;
-            }
             let want = i + 1 == tokens.len();
-            self.hybrid_forward_token(tok, want)?;
+            if staged {
+                self.tier
+                    .as_mut()
+                    .expect("staged implies tiering")
+                    .prepare_streaming(seq)?;
+                self.upload_page_table(seq)?;
+                self.hybrid_forward_token(tok, want, AttnSrc::Staged(seq))?;
+            } else {
+                if page_boundary || self.pt_seq != seq.id {
+                    self.upload_page_table(seq)?;
+                }
+                self.hybrid_forward_token(tok, want, AttnSrc::Paged)?;
+            }
             if want {
                 self.device.copy(
                     &self.bufs.logits,
@@ -3488,6 +3577,13 @@ impl Model {
                     .host_ptr()
                     .expect("pinned buffer has host mapping") as *const f32;
                 last_logits = unsafe { std::slice::from_raw_parts(lp, vocab) }.to_vec();
+            }
+        }
+        // Feed the measured prefill rate into the tier's transfer-vs-recompute
+        // estimate (bit-identical recompute is eligible only for prefill KV).
+        if let (Some(t0), Some(tier)) = (tier_t0, self.tier.as_ref()) {
+            if !tokens.is_empty() {
+                tier.note_prefill(tokens.len(), t0.elapsed().as_secs_f64());
             }
         }
         Ok(last_logits)
