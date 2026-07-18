@@ -119,6 +119,7 @@ fn run_pass_ids(
             kv_pages,
             max_seq_len: 4096,
             kv_quant,
+            kv_tier: Default::default(),
         },
     )
     .expect("load model");

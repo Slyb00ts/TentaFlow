@@ -47,6 +47,7 @@ async fn chat_completions_end_to_end() {
                 kv_pages,
                 max_seq_len: 4096,
                 kv_quant: forge_engine::kv::KvQuant::F16,
+                kv_tier: Default::default(),
             },
         )
         .expect("load model");

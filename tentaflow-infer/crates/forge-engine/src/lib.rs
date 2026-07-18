@@ -10,6 +10,7 @@ pub mod model;
 pub mod sample;
 pub mod server;
 pub mod speculation;
+pub mod tier;
 pub mod weights;
 
 pub use generate::{GenerateRequest, Generated, StreamEvent};

@@ -30,9 +30,64 @@ LUB katalog snapshotu HF (safetensors + config.json + tokenizer.json).
 |---|---|---|
 | `--ctx <N>` | `0` | Maksymalna długość kontekstu w tokenach. `0` = maksimum modelu (`max_position_embeddings`). Dowolna wartość jest honorowana (256, 200000, …) do limitu modelu; KV cache jest sizowany pod tę wartość — o tym, czy się zmieści, decyduje VRAM. |
 | `--weights-pool-gb <F>` | serve: `16`; run/bench/embed: `0` | Rozmiar puli VRAM na wagi w GiB. `0` = automatyczny podział wolnego VRAM (KV dostaje swój wyliczony budżet najpierw, reszta minus margines idzie na wagi). W serve wartość jest przycinana, żeby wagi+KV+aktywacje zawsze mieściły się w wolnym VRAM. |
-| `--kv-pages <N>` (serve) | `512` | Liczba stron KV cache (32 tokeny/strona) współdzielonych przez wszystkie sekwencje. Automatycznie podnoszona do co najmniej jednego pełnego okna `--ctx`. Budżet ponad okno = współbieżne sekwencje. |
+| `--kv-pages <N>` (serve) | `512` | Liczba stron KV cache (32 tokeny/strona) współdzielonych przez wszystkie sekwencje. Bez tieringu automatycznie podnoszona do co najmniej jednego pełnego okna `--ctx` (budżet ponad okno = współbieżne sekwencje). Z `--kv-tier` przeciwnie: to jest GORĄCY budżet VRAM (przycinany do okna), a reszta kontekstu spilluje do RAM/NVMe. |
+| `--kv-pages <N>` (run / bench) | `0` | `0` = pula na pełne okno `--ctx` (dzisiejsze zachowanie). Jawna wartość ogranicza gorący working set VRAM — użyteczne z `--kv-tier`. |
 
 Wewnętrzne (ModelConfig, niewystawione jako flagi): `kv_page_size=32` tokeny/strona.
+
+---
+
+## KV tiering: VRAM → pinned RAM → NVMe (serve / run / bench)
+
+`TierManager` (SPEC §5.4B, `forge-engine/src/tier.rs`): zimne strony KV są
+spillowane z VRAM w **chunkach 4–16 MB** per (sekwencja × wszystkie warstwy)
+do przypiętego RAM-u, a po przekroczeniu budżetu RAM — do append-only pliku
+NVMe (FIFO demote, zapis sekwencyjny; żadnych małych losowych I/O na dysk).
+Sekwencja, której spilled KV nie mieści się z powrotem w VRAM, dekoduje przez
+ścieżkę STRUMIENIOWANĄ: per warstwa staging slab dostaje PEŁNY kontekst tej
+warstwy (chunki z RAM/pliku + strony rezydentne D2D) i attention działa na
+identity page table. Wynik jest **bitowo identyczny** z przebiegiem bez
+tieringu (bajty KV są przenoszone, nie transformowane; te same kernele w tej
+samej kolejności) — udowodnione testami `forge-engine/tests/kv_tier.rs` i na
+Bielik-7B-NVFP4 (8k kontekstu na budżecie VRAM 2k tokenów, needle-recall przez
+granicę spillu, identyczne id tokenów greedy).
+
+| Flaga | Domyślnie | Opis |
+|---|---|---|
+| `--kv-tier <M>` | `off` | `off` \| `ram` \| `nvme`. `off` = dzisiejsze zachowanie (zero zmian). `ram` = spill do pinned RAM (twardy błąd po wyczerpaniu budżetu). `nvme` = RAM jako warm cache + append-only plik jako cold tier. |
+| `--kv-tier-dir <PATH>` | temp dir | Katalog pliku spillu (`nvme`). Domyślnie `$TMPDIR/forge-kv-tier-<pid>`, usuwany przy zamknięciu. |
+| `--kv-tier-ram-gb <F>` | `8` | Budżet pinned RAM na warm chunki (GiB). |
+| `--kv-tier-watermark <F>` | `0.10` | Rezerwa wolnych stron VRAM: spill proaktywny gdy free/total spada poniżej; restore tylko gdy zmieści się BEZ naruszenia rezerwy (anty-thrash). |
+
+Zasady i zmierzone charakterystyki (Bielik-7B-NVFP4, RTX 4090, PCIe 4.0):
+
+- **Hot path bez spillu: zerowa kara.** Decode 154.2 tok/s z tieringiem ON
+  (bez presji) i OFF — identycznie; graf CUDA decode nietknięty.
+- **Streamed decode** (kontekst 8k na 2k-tokenowym VRAM): ~8.6 tok/s (ram) /
+  ~8.1 tok/s (nvme) vs 113 tok/s bez tieringu — koszt to ~0.7 GB transferu KV
+  na token przez PCIe. Prefill 8k: 1984 tok/s vs 2321 bez tieringu.
+- **Pasma (EMA z realnych transferów):** spill D2H ~11 GB/s, restore ~4.5-4.8
+  GB/s, zapis pliku ~5 GB/s (buforowany; odczyty wspiera page cache OS).
+- **Transfer-vs-recompute:** każdy restore loguje decyzję (`kv tier
+  decision:`) z estymatami z mierzonych pasm; recompute (pełny re-prefill
+  z zachowanych tokenów) wybierany tylko gdy wygrywa czasowo I historia jest
+  czysto prefillowa (KV pisane przez decode nie jest bitowo odtwarzalne
+  re-prefillem — wtedy zawsze transfer).
+- **Hot tail:** ostatnie 4 strony (128 tokenów) sekwencji nigdy nie są
+  spillowane (decode zawsze czyta ogon; append idzie do strony rezydentnej).
+
+Ograniczenia v1 (uczciwie):
+- Tryby `rot4`/`rot3` + `--kv-tier` → jawny błąd Unsupported (packed store
+  nie jest tierowany). `f16` i `fp8` są wspierane.
+- Eviction wybiera zimny prefiks BIEŻĄCEJ (rosnącej) sekwencji; cross-sequence
+  eviction bezczynnych sekwencji — follow-up (admission control i tak
+  ogranicza łączny popyt w serve).
+- Sekwencja w trybie strumieniowanym nie wchodzi do batched decode (scheduler
+  kieruje ją na ścieżkę single-stream); wraca do batcha po pełnym restore.
+- Restore strumieniowy jest blokujący (v1 correctness-first); overlap
+  warstwa-po-warstwie na osobnym streamie transferowym — optymalizacja
+  follow-up. Plik spillu jest append-only (miejsce nie jest odzyskiwane w
+  trakcie życia procesu; plik znika przy wyjściu).
 
 ---
 
@@ -126,7 +181,7 @@ mono), `language` (np. `pl`; ignorowane dla modeli `.en`).
 | `-n, --max-tokens <N>` | `256` | Limit generacji. |
 | `--temp <F>` | `0.7` | Temperatura (`0` = greedy). |
 | `--chat` | off | Opakowuje prompt w szablon czatu modelu (user message, add_generation_prompt). |
-| + `--ctx`, `--weights-pool-gb`, `--kv-cache`, `--kv-residual-window`, `--kv-activate-at` | jw. | Jak w sekcjach wyżej. |
+| + `--ctx`, `--weights-pool-gb`, `--kv-pages`, `--kv-cache`, `--kv-residual-window`, `--kv-activate-at`, `--kv-tier*` | jw. | Jak w sekcjach wyżej. |
 
 ## forge bench
 
@@ -134,7 +189,7 @@ mono), `language` (np. `pl`; ignorowane dla modeli `.en`).
 |---|---|---|
 | `--tokens <N>` | `128` | Tokeny decode do zmierzenia. |
 | `--prompt-tokens <N>` | `512` | Długość promptu (prefill). |
-| + `--kv-cache`, `--kv-residual-window`, `--kv-activate-at` | jw. | |
+| + `--ctx`, `--kv-pages`, `--kv-cache`, `--kv-residual-window`, `--kv-activate-at`, `--kv-tier*` | jw. | |
 
 Uwaga metodyczna: prefill mierzony do pierwszego WIDOCZNEGO tokenu (zawiera
 ≥1 krok decode); bezczynna 4090 siedzi na ~210 MHz — porównuj rozgrzane przebiegi.
@@ -183,7 +238,13 @@ Uwaga metodyczna: prefill mierzony do pierwszego WIDOCZNEGO tokenu (zawiera
 
 - Tryby rot (`rot4`/`rot3`) KV: tylko single-stream decode (batched → jawny
   Unsupported); decode ~1.5× wolniejszy od f16 — wartość to pamięć/max-ctx.
-- Kontekst ~1M: konfiguracja go nie blokuje, ale fizycznie wymaga KV
-  offloadu do RAM/SSD (TierManager ze SPEC §5.4 — nie zbudowany).
+  Rot nie łączy się też z `--kv-tier` (jawny błąd).
+- Kontekst ponad VRAM wymaga `--kv-tier ram|nvme` (sekcja KV tiering wyżej);
+  prędkość streamed decode ogranicza PCIe (~0.7 GB KV na token przy 8k na
+  modelu 7B f16-KV — rośnie liniowo z głębokością).
+- Tokenizer HF (`tokenizer.json`) jest używany z wbudowanymi ustawieniami
+  truncation modelu — np. snapshot Bielika przycina pojedyncze `encode` do
+  2048 tokenów; długie prompty składaj z kawałków (patrz
+  `examples/kv_tier_longctx.rs`).
 - ONNX: niewspierany (planowany). TTS: brak silnika (planowany).
 - `logprobs`/`n>1` w API: jeszcze nie.

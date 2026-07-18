@@ -177,7 +177,9 @@ fn worker<'t>(
             return;
         }
 
-        // Admission: KV projection — prompt + max_tokens must fit in pages.
+        // Admission: KV projection — prompt + max_tokens must fit in pages
+        // (the VRAM pool, or the tier-extended context window when tiering
+        // is on — a tiered sequence only needs its hot working set resident).
         while active.len() < max_active {
             let Some(sub) = waiting.front() else { break };
             let page = model.kv.cfg.page_size;
@@ -191,22 +193,29 @@ fn worker<'t>(
                 .len()
                 .checked_add(sub.req.max_tokens)
                 .map(|total| total.div_ceil(page));
+            let capacity = model.max_request_pages();
             let permanently_too_large = match need_pages {
                 None => true,
-                Some(n) => n > model.kv.cfg.n_pages,
+                Some(n) => n > capacity,
             };
             if permanently_too_large {
                 let sub = waiting.pop_front().unwrap();
                 let _ = sub.events.send(EngineEvent::Error(match need_pages {
                     Some(n) => format!(
-                        "request needs {n} KV pages, cache has {} total",
-                        model.kv.cfg.n_pages
+                        "request needs {n} KV pages, cache has {capacity} total"
                     ),
                     None => "request size overflows: prompt_tokens + max_tokens".into(),
                 }));
                 continue;
             }
-            if need_pages.unwrap() > model.kv.free_page_count() {
+            let admit_floor = if model.tier_enabled() {
+                need_pages
+                    .unwrap()
+                    .min(crate::tier::min_resident_pages(page))
+            } else {
+                need_pages.unwrap()
+            };
+            if admit_floor > model.kv.free_page_count() {
                 break; // transient KV pressure: retry when a sequence finishes
             }
             let sub = waiting.pop_front().unwrap();
@@ -256,10 +265,11 @@ fn worker<'t>(
         }
         batch_gpu_decode(model, &mut active, batch_min);
 
-        // Tear down finished/dead sequences and release their pages.
+        // Tear down finished/dead sequences and release their pages (and any
+        // tier chunks they spilled).
         active.retain_mut(|a| {
             if a.dead {
-                model.kv.release(&mut a.seq);
+                model.release_seq(&mut a.seq);
                 false
             } else {
                 true
@@ -407,6 +417,19 @@ fn batch_gpu_decode(model: &mut Model, active: &mut [ActiveSeq<'_>], batch_min: 
         return;
     }
 
+    // Sequences whose spilled KV exceeds free VRAM decode through the model's
+    // streamed single-stream path — they cannot join the batched page-table
+    // forward, whose attention requires full residency.
+    let (stream_idx, feed_idx): (Vec<usize>, Vec<usize>) = feed_idx
+        .into_iter()
+        .partition(|&i| model.seq_needs_streaming(&active[i].seq));
+    for &i in &stream_idx {
+        serial_step(model, &mut active[i]);
+    }
+    if feed_idx.is_empty() {
+        return;
+    }
+
     // Below `batch_min` sequences, the tuned fused single-seq decode path
     // (6 launches/layer, graphed) run once per survivor is faster than the
     // tensor-core batched pass, whose per-step cost is nearly flat in the batch
@@ -415,19 +438,7 @@ fn batch_gpu_decode(model: &mut Model, active: &mut [ActiveSeq<'_>], batch_min: 
     // path engages once the flat cost amortizes across enough sequences.
     if feed_idx.len() < batch_min.max(2) {
         for &i in &feed_idx {
-            let a = &mut active[i];
-            let fed = *a.generated.last().expect("emit_token pushed the fed token");
-            let SeqSampler::Gpu(g) = &mut a.sampler else {
-                unreachable!("feed set is GPU-only")
-            };
-            g.note_token(fed);
-            match model.step_and_sample(&mut a.seq, fed, g) {
-                Ok(t) => a.next = Some(PendingNext::Token(t)),
-                Err(e) => {
-                    let _ = a.events.send(EngineEvent::Error(e.to_string()));
-                    a.dead = true;
-                }
-            }
+            serial_step(model, &mut active[i]);
         }
         return;
     }
@@ -478,6 +489,23 @@ fn batch_gpu_decode(model: &mut Model, active: &mut [ActiveSeq<'_>], batch_min: 
         if ri < feed_idx.len() && feed_idx[ri] == i {
             a.next = Some(PendingNext::Token(results[ri]));
             ri += 1;
+        }
+    }
+}
+
+/// Advance one GPU-sampled decode sequence by a single fused (or streamed)
+/// step, stashing its successor as the next iteration's pending token.
+fn serial_step(model: &mut Model, a: &mut ActiveSeq<'_>) {
+    let fed = *a.generated.last().expect("emit_token pushed the fed token");
+    let SeqSampler::Gpu(g) = &mut a.sampler else {
+        unreachable!("feed set is GPU-only")
+    };
+    g.note_token(fed);
+    match model.step_and_sample(&mut a.seq, fed, g) {
+        Ok(t) => a.next = Some(PendingNext::Token(t)),
+        Err(e) => {
+            let _ = a.events.send(EngineEvent::Error(e.to_string()));
+            a.dead = true;
         }
     }
 }

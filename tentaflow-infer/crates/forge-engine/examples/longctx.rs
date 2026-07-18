@@ -30,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         kv_pages,
         max_seq_len: target + 64,
         kv_quant: if kv_fp8 { forge_engine::kv::KvQuant::Fp8 } else { forge_engine::kv::KvQuant::F16 },
+        kv_tier: Default::default(),
     };
 
     let device = CudaDevice::new(

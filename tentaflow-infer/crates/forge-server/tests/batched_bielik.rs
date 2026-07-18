@@ -75,6 +75,7 @@ fn batched_reproduces_golden() {
             kv_pages,
             max_seq_len: 4096,
             kv_quant: forge_engine::kv::KvQuant::F16,
+            kv_tier: Default::default(),
         },
     )
     .expect("load model");

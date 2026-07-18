@@ -105,10 +105,45 @@ pub struct KvCache {
     free_pages: Vec<i32>,
 }
 
+/// A contiguous run of logical pages spilled to a tier chunk (tier.rs). The
+/// spilled region is always the oldest prefix of the sequence, so ranges are
+/// contiguous from logical page 0 upward.
+pub struct SpilledRange {
+    pub first_page: usize,
+    pub n_pages: usize,
+    /// TierManager chunk id holding the pages' K/V bytes for every layer.
+    pub chunk: u64,
+}
+
 /// One sequence's view of the cache: its page table (host mirror) and length.
+/// With tiering, `pages` entries of spilled pages are -1 and `spilled` maps
+/// them to tier chunks; `tokens` retains the token ids (recompute path).
 pub struct SeqKv {
+    /// Process-unique id; the model tracks which sequence's page table is
+    /// currently uploaded to the device.
+    pub id: u64,
     pub pages: Vec<i32>,
     pub len: usize,
+    pub spilled: Vec<SpilledRange>,
+    /// Token ids appended so far (recorded only when tiering is enabled).
+    pub tokens: Vec<u32>,
+    /// Prefix of `tokens` appended via prefill (bit-identically recomputable
+    /// by re-prefilling; decode-appended KV is transfer-restored only).
+    pub prefilled_len: usize,
+}
+
+impl SeqKv {
+    /// First logical page still resident (everything below is spilled).
+    pub fn resident_frontier(&self) -> usize {
+        self.spilled
+            .last()
+            .map(|r| r.first_page + r.n_pages)
+            .unwrap_or(0)
+    }
+
+    pub fn spilled_page_count(&self) -> usize {
+        self.spilled.iter().map(|r| r.n_pages).sum()
+    }
 }
 
 impl KvCache {
@@ -172,9 +207,14 @@ impl KvCache {
     }
 
     pub fn new_seq(&self) -> SeqKv {
+        static NEXT_SEQ_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         SeqKv {
+            id: NEXT_SEQ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             pages: Vec::new(),
             len: 0,
+            spilled: Vec::new(),
+            tokens: Vec::new(),
+            prefilled_len: 0,
         }
     }
 
@@ -198,11 +238,25 @@ impl KvCache {
     }
 
     pub fn release(&mut self, seq: &mut SeqKv) {
-        self.free_pages.append(&mut seq.pages);
+        // Spilled entries are -1 (their bytes live in tier chunks, dropped by
+        // the tier manager) and must not enter the free-page stack.
+        self.free_pages
+            .extend(seq.pages.drain(..).filter(|&p| p >= 0));
         seq.len = 0;
+        seq.spilled.clear();
+        seq.tokens.clear();
+        seq.prefilled_len = 0;
     }
 
     pub fn free_page_count(&self) -> usize {
         self.free_pages.len()
+    }
+
+    pub(crate) fn pop_free(&mut self) -> Option<i32> {
+        self.free_pages.pop()
+    }
+
+    pub(crate) fn push_free(&mut self, page: i32) {
+        self.free_pages.push(page);
     }
 }

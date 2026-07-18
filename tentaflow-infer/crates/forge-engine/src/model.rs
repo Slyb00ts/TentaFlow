@@ -18,6 +18,7 @@ use half::f16;
 
 use crate::kv::{KvCache, KvConfig, KvQuant, SeqKv};
 use crate::sample::{GpuSampler, SamplingParams, SeqSampleParams};
+use crate::tier::{KvTierConfig, TierManager};
 use crate::weights::{DevWeight, GateUpWeights, ModelWeights, QkvWeights};
 
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
@@ -106,6 +107,10 @@ pub struct ModelConfig {
     /// only), or Rot{bits} (TurboQuant-class rotational 3/4-bit; single-stream
     /// decode path). Validated at load.
     pub kv_quant: KvQuant,
+    /// KV tiering (SPEC §5.4B): spill cold pages to pinned RAM / NVMe and
+    /// stream them back per layer, unlocking contexts beyond the VRAM pool.
+    /// Off (default) = today's VRAM-only behavior; f16/fp8 caches only.
+    pub kv_tier: KvTierConfig,
 }
 
 impl Default for ModelConfig {
@@ -115,6 +120,7 @@ impl Default for ModelConfig {
             kv_pages: 512,
             max_seq_len: 8192,
             kv_quant: KvQuant::F16,
+            kv_tier: KvTierConfig::default(),
         }
     }
 }
@@ -158,6 +164,33 @@ pub struct Model {
     batch_graphs: HashMap<usize, ExecGraph>,
     /// Largest batch the scratch is provisioned for (0 until `ensure_batch`).
     batch_cap: usize,
+    /// KV tier manager (SPEC §5.4B); `None` = tiering off (VRAM-only paging,
+    /// bit-for-bit today's behavior).
+    tier: Option<TierManager>,
+    /// Streamed-attention staging: full-context K/V slabs for ONE layer plus
+    /// an identity page table (staging page index == logical page index).
+    tier_bufs: Option<TierBufs>,
+    /// Sequence whose page table currently occupies `page_table_dev`
+    /// (0 = none/stale). Spills, restores and batched growth invalidate it,
+    /// forcing a re-upload on the next single-stream step.
+    pt_seq: u64,
+}
+
+/// Attention source for the shared decode chains: the paged VRAM cache (fast
+/// path, graph-capturable) or the tier staging slabs carrying the sequence's
+/// full context per layer (streamed path, never captured).
+enum AttnSrc<'a> {
+    Paged,
+    Staged(&'a SeqKv),
+}
+
+/// VRAM staging for the streamed tier path (allocated only with tiering on).
+struct TierBufs {
+    stage_k: DevBuffer,
+    stage_v: DevBuffer,
+    identity_pt: DevBuffer,
+    /// Bytes of one page of one layer's K (or V) region in the cache dtype.
+    page_bytes: usize,
 }
 
 /// Persistent per-step activation buffers. Fixed addresses are what makes the
@@ -340,6 +373,39 @@ impl Model {
         let stream = device.create_stream()?;
         let page_table_dev = device.alloc(max_pages_per_seq * 4, MemKind::Device, Pool::Weights)?;
         let seq_len_dev = device.alloc(4, MemKind::Device, Pool::Weights)?;
+        let (tier, tier_bufs) = if cfg.kv_tier.enabled() {
+            if cfg.kv_quant.is_rot() {
+                return Err(ForgeError::Unsupported(
+                    "kv tiering (--kv-tier) supports the f16/fp8 KV caches; rotational \
+                     modes keep their packed store un-tiered"
+                        .into(),
+                ));
+            }
+            let page_bytes = p.n_kv_heads * cfg.kv_page_size * p.head_dim * kv.cfg.dtype().size();
+            let stage_bytes = max_pages_per_seq * page_bytes;
+            let stage_k = device.alloc(stage_bytes, MemKind::Device, Pool::Weights)?;
+            let stage_v = device.alloc(stage_bytes, MemKind::Device, Pool::Weights)?;
+            let identity: Vec<i32> = (0..max_pages_per_seq as i32).collect();
+            let identity_pt = device.alloc(max_pages_per_seq * 4, MemKind::Device, Pool::Weights)?;
+            device.write(bytemuck::cast_slice(&identity), &identity_pt, 0)?;
+            let tm = TierManager::new(
+                cfg.kv_tier.clone(),
+                device.clone(),
+                p.block_count,
+                page_bytes,
+            )?;
+            (
+                Some(tm),
+                Some(TierBufs {
+                    stage_k,
+                    stage_v,
+                    identity_pt,
+                    page_bytes,
+                }),
+            )
+        } else {
+            (None, None)
+        };
         let hidden = p.hidden_size;
         let q_dim = p.n_heads * p.head_dim;
         let kv_dim = p.n_kv_heads * p.head_dim;
@@ -405,6 +471,9 @@ impl Model {
             batch_bufs: None,
             batch_graphs: HashMap::new(),
             batch_cap: 0,
+            tier,
+            tier_bufs,
+            pt_seq: 0,
         })
     }
 
@@ -413,7 +482,114 @@ impl Model {
     }
 
     pub fn release_seq(&mut self, seq: &mut SeqKv) {
+        if let Some(t) = &mut self.tier {
+            t.drop_seq(seq);
+        }
         self.kv.release(seq);
+    }
+
+    pub fn tier_enabled(&self) -> bool {
+        self.tier.is_some()
+    }
+
+    /// Largest per-request KV demand (in pages) the engine can hold: the VRAM
+    /// pool when tiering is off, the full context window when tiers extend it.
+    pub fn max_request_pages(&self) -> usize {
+        if self.tier.is_some() {
+            self.max_pages_per_seq
+        } else {
+            self.kv.cfg.n_pages
+        }
+    }
+
+    /// Whether `seq`'s spilled pages can be restored without dropping the pool
+    /// below the watermark reserve — restoring tighter than that would only
+    /// thrash (the next step's capacity check would spill the pages again).
+    fn tier_can_restore(&self, seq: &SeqKv) -> bool {
+        let Some(tier) = &self.tier else { return false };
+        seq.spilled_page_count() + tier.reserve_pages(self.kv.cfg.n_pages)
+            <= self.kv.free_page_count()
+    }
+
+    /// True when `seq` has spilled KV that cannot be restored into free VRAM
+    /// pages — such a sequence decodes via the streamed single-stream path
+    /// and cannot join a batched forward.
+    pub fn seq_needs_streaming(&self, seq: &SeqKv) -> bool {
+        self.tier.is_some() && !seq.spilled.is_empty() && !self.tier_can_restore(seq)
+    }
+
+    /// Spill this sequence's coldest pages until the pool can absorb
+    /// `new_tokens` more tokens plus the watermark reserve. No-op with
+    /// tiering off (the pool then errors on exhaustion, as before).
+    fn tier_ensure_capacity(&mut self, seq: &mut SeqKv, new_tokens: usize) -> Result<()> {
+        let Some(tier) = &mut self.tier else {
+            return Ok(());
+        };
+        let ps = self.kv.cfg.page_size;
+        let need = (seq.len + new_tokens)
+            .div_ceil(ps)
+            .saturating_sub(seq.pages.len());
+        let reserve = tier.reserve_pages(self.kv.cfg.n_pages);
+        let free = self.kv.free_page_count();
+        if free >= need + reserve {
+            return Ok(());
+        }
+        let deficit = need + reserve - free;
+        let spilled = tier.spill(&mut self.kv, seq, deficit, &self.stream)?;
+        if spilled > 0 {
+            self.pt_seq = 0;
+        }
+        Ok(())
+    }
+
+    /// Transfer-vs-recompute rule (SPEC §5.4): restore spilled chunks when the
+    /// estimated transfer time beats re-prefilling the history. Recompute is
+    /// only bit-identical for a purely prefilled history (decode writes its
+    /// K/V through different kernels), so decode-extended sequences always
+    /// transfer. Every decision is logged with the measured estimates.
+    fn tier_restore_or_recompute(&mut self, seq: &mut SeqKv) -> Result<()> {
+        let tier = self.tier.as_ref().expect("caller checked tiering");
+        let (bytes, t_transfer) = tier.restore_cost(seq);
+        let recompute_ok = seq.prefilled_len == seq.tokens.len() && !seq.tokens.is_empty();
+        let t_recompute = tier.recompute_cost(seq.len);
+        let use_recompute = recompute_ok && t_recompute < t_transfer;
+        tracing::info!(
+            "kv tier decision: seq {} transfer {:.1} MiB ≈ {:.1} ms vs recompute {} tok ≈ {:.1} ms → {}{}",
+            seq.id,
+            bytes as f64 / (1 << 20) as f64,
+            t_transfer * 1e3,
+            seq.len,
+            t_recompute * 1e3,
+            if use_recompute { "recompute" } else { "transfer" },
+            if recompute_ok {
+                ""
+            } else {
+                " (recompute ineligible: decode-written KV)"
+            },
+        );
+        if use_recompute {
+            self.recompute_seq(seq)
+        } else {
+            let tier = self.tier.as_mut().expect("checked above");
+            tier.restore_all(&mut self.kv, seq, &self.stream)?;
+            self.pt_seq = 0;
+            Ok(())
+        }
+    }
+
+    /// Rebuild `seq`'s KV from its retained tokens by re-prefilling from
+    /// scratch, dropping all tier chunks first (recompute preemption).
+    fn recompute_seq(&mut self, seq: &mut SeqKv) -> Result<()> {
+        let toks = std::mem::take(&mut seq.tokens);
+        if let Some(t) = &mut self.tier {
+            t.drop_seq(seq);
+        }
+        self.kv.release(seq);
+        self.pt_seq = 0;
+        for chunk in toks.chunks(MAX_PREFILL_CHUNK) {
+            self.prefill_forward(seq, chunk)?;
+        }
+        Ok(())
     }
 
     fn gemv(&self, y: &DevBuffer, w: &DevWeight, x: &DevBuffer, stream: &Stream) -> Result<()> {
@@ -1294,6 +1470,18 @@ impl Model {
                 p.max_position_embeddings
             )));
         }
+        self.tier_ensure_capacity(seq, t)?;
+        let tier_t0 = if self.tier.is_some() {
+            // Retain the tokens (recompute path) and note whether the history
+            // is still purely prefill-built (bit-identically recomputable).
+            if seq.tokens.len() == seq.prefilled_len {
+                seq.prefilled_len += t;
+            }
+            seq.tokens.extend_from_slice(tokens);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         self.ensure_prefill_bufs()?;
         for _ in 0..t {
             self.kv.grow(seq)?;
@@ -1307,6 +1495,19 @@ impl Model {
         pt[..seq.pages.len()].copy_from_slice(&seq.pages);
         self.device
             .write(bytemuck::cast_slice(&pt), &self.page_table_dev, 0)?;
+        self.pt_seq = seq.id;
+        // Spilled sequences run each layer's attention over the staging slabs
+        // (full context streamed in from the tiers); resident sequences read
+        // the paged cache directly. Spilled page-table entries are -1 — only
+        // the append (which touches resident tail pages) may consult them.
+        let streamed = !seq.spilled.is_empty();
+        if streamed {
+            self.tier
+                .as_mut()
+                .expect("spilled pages imply tiering")
+                .prepare_streaming(seq)?;
+        }
+        let mut cold_pending = false;
         let pb = self.prefill_bufs.as_ref().expect("allocated above");
         let ids: Vec<i32> = tokens.iter().map(|&id| id as i32).collect();
         self.device.write(bytemuck::cast_slice(&ids), &pb.ids, 0)?;
@@ -1438,22 +1639,50 @@ impl Model {
                     stream,
                 )?;
                 trace.mark(self.device.as_ref(), "kv_append");
-                kernels.attn_prefill(
-                    &pb.attn_out,
-                    &pb.q,
-                    &self.kv.k[l],
-                    &self.kv.v[l],
-                    &self.page_table_dev,
-                    base_pos,
-                    t,
-                    p.n_heads,
-                    p.n_kv_heads,
-                    p.head_dim,
-                    self.kv.cfg.page_size,
-                    self.kv.cfg.dtype(),
-                    scale,
-                    stream,
-                )?;
+                if streamed {
+                    let tier = self.tier.as_ref().expect("streamed prefill requires tiering");
+                    let tb = self.tier_bufs.as_ref().expect("tier staging allocated");
+                    if cold_pending {
+                        // The pinned scratch is about to be rewritten with this
+                        // layer's cold bytes; drain the previous layer's H2D.
+                        self.device.synchronize()?;
+                    }
+                    cold_pending =
+                        tier.stage_layer(&self.kv, seq, l, &tb.stage_k, &tb.stage_v, stream)?;
+                    kernels.attn_prefill(
+                        &pb.attn_out,
+                        &pb.q,
+                        &tb.stage_k,
+                        &tb.stage_v,
+                        &tb.identity_pt,
+                        base_pos,
+                        t,
+                        p.n_heads,
+                        p.n_kv_heads,
+                        p.head_dim,
+                        self.kv.cfg.page_size,
+                        self.kv.cfg.dtype(),
+                        scale,
+                        stream,
+                    )?;
+                } else {
+                    kernels.attn_prefill(
+                        &pb.attn_out,
+                        &pb.q,
+                        &self.kv.k[l],
+                        &self.kv.v[l],
+                        &self.page_table_dev,
+                        base_pos,
+                        t,
+                        p.n_heads,
+                        p.n_kv_heads,
+                        p.head_dim,
+                        self.kv.cfg.page_size,
+                        self.kv.cfg.dtype(),
+                        scale,
+                        stream,
+                    )?;
+                }
                 trace.mark(self.device.as_ref(), "attn");
             }
 
@@ -1490,6 +1719,10 @@ impl Model {
         // The stream is drained here so callers can read the hidden states or
         // launch the logits/pool tail without an additional sync of their own.
         self.device.synchronize()?;
+        if let (Some(tier), Some(t0)) = (&self.tier, tier_t0) {
+            // Measured prefill rate feeds the transfer-vs-recompute estimate.
+            tier.note_prefill(t, t0.elapsed().as_secs_f64());
+        }
         trace.report(t);
         Ok(t)
     }
@@ -1656,52 +1889,29 @@ impl Model {
             )));
         }
 
+        self.tier_ensure_capacity(seq, 1)?;
+        if self.tier.is_some() {
+            if !seq.spilled.is_empty() {
+                if self.tier_can_restore(seq) {
+                    // The whole sequence fits again with the watermark reserve
+                    // intact: bring it back and take the graphed fast path.
+                    self.tier_restore_or_recompute(seq)?;
+                } else {
+                    return self.step_streamed(seq, token_id);
+                }
+            }
+            seq.tokens.push(token_id);
+        }
+
         let page_boundary = seq.len.is_multiple_of(self.kv.cfg.page_size);
         self.kv.grow(seq)?;
+        self.upload_decode_inputs(token_id, pos)?;
 
-        // Stage [token, pos, seq_len] in pinned memory and push them with
-        // async copies on the compute stream — pinned H2D avoids the pageable
-        // legacy-stream drain that plain write() must perform.
-        let host = self
-            .bufs
-            .pinned_in
-            .host_ptr()
-            .expect("pinned buffer has host mapping");
-        unsafe {
-            let vals = [token_id as i32, pos as i32, (pos + 1) as i32];
-            std::ptr::copy_nonoverlapping(vals.as_ptr() as *const u8, host, 12);
-        }
-        self.device
-            .copy(&self.bufs.pinned_in, 0, &self.bufs.ids, 0, 4, &self.stream)?;
-        self.device
-            .copy(&self.bufs.pinned_in, 4, &self.bufs.pos, 0, 4, &self.stream)?;
-        self.device
-            .copy(&self.bufs.pinned_in, 8, &self.seq_len_dev, 0, 4, &self.stream)?;
-
-        // The page table only changes when a page is appended.
-        if page_boundary {
-            let pt_host = self
-                .bufs
-                .pinned_pt
-                .host_ptr()
-                .expect("pinned buffer has host mapping");
-            let mut pt = vec![-1i32; self.max_pages_per_seq];
-            pt[..seq.pages.len()].copy_from_slice(&seq.pages);
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    pt.as_ptr() as *const u8,
-                    pt_host,
-                    self.max_pages_per_seq * 4,
-                );
-            }
-            self.device.copy(
-                &self.bufs.pinned_pt,
-                0,
-                &self.page_table_dev,
-                0,
-                self.max_pages_per_seq * 4,
-                &self.stream,
-            )?;
+        // The page table changes when a page is appended — and goes stale when
+        // another sequence used the single-stream path, or batched growth /
+        // tier restores rewrote this sequence's pages.
+        if page_boundary || self.pt_seq != seq.id {
+            self.upload_page_table(seq)?;
         }
 
         // Rot decode commits the current token into the packed store + ring and
@@ -1727,6 +1937,83 @@ impl Model {
         }
         let graph = self.decode_graph.as_ref().expect("captured above").clone();
         self.device.launch_graph(&graph, &self.stream)
+    }
+
+    /// Stage [token, pos, seq_len] in pinned memory and push them with async
+    /// copies on the compute stream — pinned H2D avoids the pageable
+    /// legacy-stream drain that plain write() must perform.
+    fn upload_decode_inputs(&self, token_id: u32, pos: usize) -> Result<()> {
+        let host = self
+            .bufs
+            .pinned_in
+            .host_ptr()
+            .expect("pinned buffer has host mapping");
+        unsafe {
+            let vals = [token_id as i32, pos as i32, (pos + 1) as i32];
+            std::ptr::copy_nonoverlapping(vals.as_ptr() as *const u8, host, 12);
+        }
+        self.device
+            .copy(&self.bufs.pinned_in, 0, &self.bufs.ids, 0, 4, &self.stream)?;
+        self.device
+            .copy(&self.bufs.pinned_in, 4, &self.bufs.pos, 0, 4, &self.stream)?;
+        self.device
+            .copy(&self.bufs.pinned_in, 8, &self.seq_len_dev, 0, 4, &self.stream)?;
+        Ok(())
+    }
+
+    /// Upload `seq`'s page table (pinned staging + async H2D) and mark it as
+    /// the one resident in `page_table_dev`.
+    fn upload_page_table(&mut self, seq: &SeqKv) -> Result<()> {
+        let pt_host = self
+            .bufs
+            .pinned_pt
+            .host_ptr()
+            .expect("pinned buffer has host mapping");
+        let mut pt = vec![-1i32; self.max_pages_per_seq];
+        pt[..seq.pages.len()].copy_from_slice(&seq.pages);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                pt.as_ptr() as *const u8,
+                pt_host,
+                self.max_pages_per_seq * 4,
+            );
+        }
+        self.device.copy(
+            &self.bufs.pinned_pt,
+            0,
+            &self.page_table_dev,
+            0,
+            self.max_pages_per_seq * 4,
+            &self.stream,
+        )?;
+        self.pt_seq = seq.id;
+        Ok(())
+    }
+
+    /// One decode step for a sequence whose spilled KV cannot be restored into
+    /// VRAM: the canonical paged slabs keep the resident tail while each
+    /// layer's attention runs over the staging slabs holding the FULL context
+    /// for that layer (spilled chunks streamed in from RAM/NVMe, resident
+    /// pages copied D2D). Never graph-captured; the kernels and their order
+    /// match the resident chains exactly, so greedy tokens are bit-identical
+    /// to an untiered run.
+    fn step_streamed(&mut self, seq: &mut SeqKv, token_id: u32) -> Result<()> {
+        let pos = seq.len;
+        seq.tokens.push(token_id);
+        self.kv.grow(seq)?;
+        self.upload_decode_inputs(token_id, pos)?;
+        self.tier
+            .as_mut()
+            .expect("streamed path requires tiering")
+            .prepare_streaming(seq)?;
+        if Self::fused_decode_supported(&self.weights) {
+            self.run_step_fused(AttnSrc::Staged(seq))
+        } else {
+            // The separate chain's qkv_post / kv_append write the new token
+            // into the canonical paged slab through the device page table.
+            self.upload_page_table(seq)?;
+            self.run_step_separate(AttnSrc::Staged(seq))
+        }
     }
 
     /// Capture the rotational decode step into a replayable graph. The recorded
@@ -2004,6 +2291,28 @@ impl Model {
     /// Stream capture does not execute the work, so buffer contents during
     /// capture are irrelevant — only addresses and launch geometry matter.
     fn capture_step(&self) -> Result<ExecGraph> {
+        self.device.begin_capture(&self.stream)?;
+        let recorded = if Self::fused_decode_supported(&self.weights) {
+            self.run_step_fused(AttnSrc::Paged)
+        } else {
+            self.run_step_separate(AttnSrc::Paged)
+        };
+        match recorded {
+            Ok(()) => self.device.end_capture(&self.stream),
+            Err(e) => {
+                // Abort the capture so the stream is usable again.
+                let _ = self.device.end_capture(&self.stream);
+                Err(e)
+            }
+        }
+    }
+
+    /// One decode step of the non-fused (separate-kernel) chain: explicit
+    /// rmsnorm → qkv GEMVs → qkv_post (norm/rope/paged append) → attention →
+    /// ffn. `src` selects the attention's K/V source: the paged cache
+    /// (recorded into the replayable graph) or the tier staging slabs holding
+    /// the sequence's full context per layer (streamed path, never captured).
+    fn run_step_separate(&self, src: AttnSrc) -> Result<()> {
         let p = &self.weights.descriptor.params;
         let hidden = p.hidden_size;
         let inter = p.intermediate_size;
@@ -2011,12 +2320,9 @@ impl Model {
         let kernels = &self.kernels;
         let stream = &self.stream;
         let b = &self.bufs;
+        let mut cold_pending = false;
 
-        self.device.begin_capture(stream)?;
-        let record = || -> Result<()> {
-            if Self::fused_decode_supported(&self.weights) {
-                return self.record_step_fused();
-            }
+        {
             kernels.gather_rows_f16(&b.h, &self.weights.token_embd_f16, &b.ids, 1, hidden, stream)?;
             kernels.rmsnorm_f16(&b.x, &b.h, &self.weights.layers[0].attn_norm, 1, hidden, eps, stream)?;
 
@@ -2123,22 +2429,54 @@ impl Model {
                     }
                 };
 
-                kernels.attn_decode_f16(
-                    &b.attn_out,
-                    q_buf,
-                    &self.kv.k[l],
-                    &self.kv.v[l],
-                    &self.page_table_dev,
-                    &self.seq_len_dev,
-                    1,
-                    p.n_heads,
-                    p.n_kv_heads,
-                    p.head_dim,
-                    self.kv.cfg.page_size,
-                    self.max_pages_per_seq,
-                    scale,
-                    stream,
-                )?;
+                match &src {
+                    AttnSrc::Paged => {
+                        kernels.attn_decode_f16(
+                            &b.attn_out,
+                            q_buf,
+                            &self.kv.k[l],
+                            &self.kv.v[l],
+                            &self.page_table_dev,
+                            &self.seq_len_dev,
+                            1,
+                            p.n_heads,
+                            p.n_kv_heads,
+                            p.head_dim,
+                            self.kv.cfg.page_size,
+                            self.max_pages_per_seq,
+                            scale,
+                            stream,
+                        )?;
+                    }
+                    AttnSrc::Staged(seq) => {
+                        // qkv_post / kv_append above already committed the new
+                        // token to the canonical paged slab; staging picks it
+                        // up through the resident-page D2D copies.
+                        let tier = self.tier.as_ref().expect("staged attention requires tiering");
+                        let tb = self.tier_bufs.as_ref().expect("tier staging allocated");
+                        if cold_pending {
+                            self.device.synchronize()?;
+                        }
+                        cold_pending =
+                            tier.stage_layer(&self.kv, seq, l, &tb.stage_k, &tb.stage_v, stream)?;
+                        kernels.attn_decode_f16(
+                            &b.attn_out,
+                            q_buf,
+                            &tb.stage_k,
+                            &tb.stage_v,
+                            &tb.identity_pt,
+                            &self.seq_len_dev,
+                            1,
+                            p.n_heads,
+                            p.n_kv_heads,
+                            p.head_dim,
+                            self.kv.cfg.page_size,
+                            self.max_pages_per_seq,
+                            scale,
+                            stream,
+                        )?;
+                    }
+                }
 
                 self.gemv(&b.o_out, &layer.attn_o, &b.attn_out, stream)?;
                 kernels.rmsnorm_residual_f16(&b.x, &b.h, &b.o_out, &layer.ffn_norm, 1, hidden, eps, stream)?;
@@ -2165,15 +2503,6 @@ impl Model {
             }
 
             self.logits_gemv(&b.logits, &b.x, stream)
-        };
-        let recorded = record();
-        match recorded {
-            Ok(()) => self.device.end_capture(stream),
-            Err(e) => {
-                // Abort the capture so the stream is usable again.
-                let _ = self.device.end_capture(stream);
-                Err(e)
-            }
         }
     }
 
@@ -2185,7 +2514,13 @@ impl Model {
     /// attention prologue (the split/combine pair fills the GPU where one
     /// block per head could not). Layer 0 sums squares from h directly (h32
     /// is only materialized by the first gemv_residual of the step).
-    fn record_step_fused(&self) -> Result<()> {
+    ///
+    /// `src` selects the attention's K/V home: the paged cache (recorded into
+    /// the replayable decode graph) or the tier staging slabs carrying the
+    /// sequence's full context per layer (streamed path, never captured). On
+    /// the staged path attn_decode_split appends the new token INTO staging
+    /// and the tail page is mirrored back to the canonical paged slab.
+    fn run_step_fused(&self, src: AttnSrc) -> Result<()> {
         let p = &self.weights.descriptor.params;
         let hidden = p.hidden_size;
         let eps = p.rms_norm_eps;
@@ -2197,6 +2532,7 @@ impl Model {
         let kv_dim = p.n_kv_heads * p.head_dim;
         let k_byte_off = q_dim * 2;
         let v_byte_off = (q_dim + kv_dim) * 2;
+        let mut cold_pending = false;
 
         kernels.gather_rows_f16(&b.h, &self.weights.token_embd_f16, &b.ids, 1, hidden, stream)?;
 
@@ -2228,34 +2564,75 @@ impl Model {
                     (&b.q, 0usize, &b.k, 0usize, &b.v, 0usize)
                 }
             };
-            kernels.attn_decode_split(
-                &b.attn_parts,
-                q_buf,
-                q_off,
-                k_buf,
-                k_off,
-                v_buf,
-                v_off,
-                layer.q_norm.as_ref(),
-                layer.k_norm.as_ref(),
-                &self.kv.k[l],
-                &self.kv.v[l],
-                &self.page_table_dev,
-                &self.seq_len_dev,
-                &b.pos,
-                1,
-                p.n_heads,
-                p.n_kv_heads,
-                p.head_dim,
-                self.kv.cfg.page_size,
-                self.max_pages_per_seq,
-                ATTN_DECODE_SPLITS,
-                self.kv.cfg.dtype(),
-                eps,
-                p.rope_theta,
-                scale,
-                stream,
-            )?;
+            match &src {
+                AttnSrc::Paged => {
+                    kernels.attn_decode_split(
+                        &b.attn_parts,
+                        q_buf,
+                        q_off,
+                        k_buf,
+                        k_off,
+                        v_buf,
+                        v_off,
+                        layer.q_norm.as_ref(),
+                        layer.k_norm.as_ref(),
+                        &self.kv.k[l],
+                        &self.kv.v[l],
+                        &self.page_table_dev,
+                        &self.seq_len_dev,
+                        &b.pos,
+                        1,
+                        p.n_heads,
+                        p.n_kv_heads,
+                        p.head_dim,
+                        self.kv.cfg.page_size,
+                        self.max_pages_per_seq,
+                        ATTN_DECODE_SPLITS,
+                        self.kv.cfg.dtype(),
+                        eps,
+                        p.rope_theta,
+                        scale,
+                        stream,
+                    )?;
+                }
+                AttnSrc::Staged(seq) => {
+                    let tier = self.tier.as_ref().expect("staged attention requires tiering");
+                    let tb = self.tier_bufs.as_ref().expect("tier staging allocated");
+                    if cold_pending {
+                        self.device.synchronize()?;
+                    }
+                    cold_pending =
+                        tier.stage_layer(&self.kv, seq, l, &tb.stage_k, &tb.stage_v, stream)?;
+                    kernels.attn_decode_split(
+                        &b.attn_parts,
+                        q_buf,
+                        q_off,
+                        k_buf,
+                        k_off,
+                        v_buf,
+                        v_off,
+                        layer.q_norm.as_ref(),
+                        layer.k_norm.as_ref(),
+                        &tb.stage_k,
+                        &tb.stage_v,
+                        &tb.identity_pt,
+                        &self.seq_len_dev,
+                        &b.pos,
+                        1,
+                        p.n_heads,
+                        p.n_kv_heads,
+                        p.head_dim,
+                        self.kv.cfg.page_size,
+                        self.max_pages_per_seq,
+                        ATTN_DECODE_SPLITS,
+                        self.kv.cfg.dtype(),
+                        eps,
+                        p.rope_theta,
+                        scale,
+                        stream,
+                    )?;
+                }
+            }
             kernels.attn_decode_combine_f16(
                 &b.attn_out,
                 &b.attn_parts,
@@ -2265,6 +2642,19 @@ impl Model {
                 ATTN_DECODE_SPLITS,
                 stream,
             )?;
+            if let AttnSrc::Staged(seq) = &src {
+                // The kernel appended this token's rope'd K/V into the staging
+                // tail page; mirror that page back into the canonical paged
+                // cache so future steps (and spills) see it.
+                let tb = self.tier_bufs.as_ref().expect("tier staging allocated");
+                let pb = tb.page_bytes;
+                let lp = seq.pages.len() - 1;
+                let phys = seq.pages[lp] as usize;
+                self.device
+                    .copy(&tb.stage_k, lp * pb, &self.kv.k[l], phys * pb, pb, stream)?;
+                self.device
+                    .copy(&tb.stage_v, lp * pb, &self.kv.v[l], phys * pb, pb, stream)?;
+            }
             self.gemv_residual(&layer.attn_o, &b.attn_out, stream)?;
             match &layer.ffn_gate_up {
                 GateUpWeights::Fused(w) => {
@@ -2527,6 +2917,33 @@ impl Model {
                  disable batching for this model"
                     .into(),
             ));
+        }
+        // Batched growth appends pages without refreshing the single-stream
+        // page table; invalidate it so the next single-stream step re-uploads.
+        self.pt_seq = 0;
+        if self.tier.is_some() {
+            // The batched forward reads every sequence's pages through its
+            // per-seq page table: spilled sequences must be fully resident.
+            // Ones that cannot fit take the streamed single-stream path (the
+            // scheduler routes them there before batching).
+            for (i, seq) in seqs.iter_mut().enumerate() {
+                if seq.spilled.is_empty() {
+                    continue;
+                }
+                if seq.spilled_page_count() <= self.kv.free_page_count() {
+                    // Plain fits-check (no reserve): the batched path has no
+                    // streamed alternative and admission bounds total demand.
+                    self.tier_restore_or_recompute(seq)?;
+                } else {
+                    return Err(ForgeError::Scheduler(format!(
+                        "batched decode requires resident KV; sequence {i} must take \
+                         the streamed single-stream path"
+                    )));
+                }
+            }
+            for (seq, &tok) in seqs.iter_mut().zip(tokens) {
+                seq.tokens.push(tok);
+            }
         }
         self.ensure_batch(b)?;
         let p = self.weights.descriptor.params.clone();

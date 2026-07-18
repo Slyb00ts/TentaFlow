@@ -9,6 +9,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use forge_engine::kv::KvQuant;
 use forge_engine::model::ModelConfig;
+use forge_engine::tier::{KvTierConfig, KvTierMode};
 use forge_engine::sample::SamplingParams;
 use forge_engine::server::{spawn_engine, EngineEvent, EngineHandle, EngineRequest};
 use forge_formats::PoolingType;
@@ -83,6 +84,21 @@ enum Command {
         /// store (SPEC default 4096).
         #[arg(long = "kv-activate-at", default_value_t = 4096)]
         kv_activate_at: usize,
+        /// KV tiering: off | ram | nvme. Spills cold KV pages to pinned RAM
+        /// (and NVMe) in 4-16 MB chunks, unlocking contexts beyond VRAM.
+        #[arg(long = "kv-tier", default_value = "off")]
+        kv_tier: String,
+        /// NVMe spill directory (--kv-tier nvme). Default: a per-process
+        /// directory under the system temp dir, removed on exit.
+        #[arg(long = "kv-tier-dir")]
+        kv_tier_dir: Option<PathBuf>,
+        /// Pinned host RAM budget for warm KV chunks, in GiB.
+        #[arg(long = "kv-tier-ram-gb", default_value_t = 8.0)]
+        kv_tier_ram_gb: f64,
+        /// Spill proactively when free VRAM KV pages fall below this fraction
+        /// of the pool.
+        #[arg(long = "kv-tier-watermark", default_value_t = 0.10)]
+        kv_tier_watermark: f64,
     },
     /// Print an embedding vector for one text (dims + L2 norm + first values).
     Embed {
@@ -131,6 +147,24 @@ enum Command {
         /// value is honored; the KV cache is sized to fit it (VRAM permitting).
         #[arg(long = "ctx", default_value_t = 0)]
         ctx: usize,
+        /// VRAM KV pages (32 tokens each; 0 = enough for the full --ctx
+        /// window). With --kv-tier, a smaller pool caps the hot working set
+        /// and the rest of the context spills to RAM/NVMe.
+        #[arg(long = "kv-pages", default_value_t = 0)]
+        kv_pages: usize,
+        /// KV tiering: off | ram | nvme (see `forge serve --help`).
+        #[arg(long = "kv-tier", default_value = "off")]
+        kv_tier: String,
+        /// NVMe spill directory (--kv-tier nvme).
+        #[arg(long = "kv-tier-dir")]
+        kv_tier_dir: Option<PathBuf>,
+        /// Pinned host RAM budget for warm KV chunks, in GiB.
+        #[arg(long = "kv-tier-ram-gb", default_value_t = 8.0)]
+        kv_tier_ram_gb: f64,
+        /// Spill proactively when free VRAM KV pages fall below this fraction
+        /// of the pool.
+        #[arg(long = "kv-tier-watermark", default_value_t = 0.10)]
+        kv_tier_watermark: f64,
     },
     /// Transcribe a WAV file with a Whisper model.
     Transcribe {
@@ -163,6 +197,25 @@ enum Command {
         /// store (SPEC default 4096).
         #[arg(long = "kv-activate-at", default_value_t = 4096)]
         kv_activate_at: usize,
+        /// Max context length in tokens (0 = the model's own maximum).
+        #[arg(long = "ctx", default_value_t = 0)]
+        ctx: usize,
+        /// VRAM KV pages (32 tokens each; 0 = enough for the full context).
+        #[arg(long = "kv-pages", default_value_t = 0)]
+        kv_pages: usize,
+        /// KV tiering: off | ram | nvme (see `forge serve --help`).
+        #[arg(long = "kv-tier", default_value = "off")]
+        kv_tier: String,
+        /// NVMe spill directory (--kv-tier nvme).
+        #[arg(long = "kv-tier-dir")]
+        kv_tier_dir: Option<PathBuf>,
+        /// Pinned host RAM budget for warm KV chunks, in GiB.
+        #[arg(long = "kv-tier-ram-gb", default_value_t = 8.0)]
+        kv_tier_ram_gb: f64,
+        /// Spill proactively when free VRAM KV pages fall below this fraction
+        /// of the pool.
+        #[arg(long = "kv-tier-watermark", default_value_t = 0.10)]
+        kv_tier_watermark: f64,
     },
 }
 
@@ -191,6 +244,10 @@ fn main() -> Result<()> {
             kv_cache,
             kv_residual_window,
             kv_activate_at,
+            kv_tier,
+            kv_tier_dir,
+            kv_tier_ram_gb,
+            kv_tier_watermark,
             ctx,
         } => cmd_serve(
             &model_path,
@@ -206,6 +263,7 @@ fn main() -> Result<()> {
             whisper_model.as_deref(),
             embed_model.as_deref(),
             parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
+            parse_kv_tier(&kv_tier, kv_tier_dir, kv_tier_ram_gb, kv_tier_watermark)?,
             ctx,
         ),
         Command::Embed {
@@ -232,6 +290,11 @@ fn main() -> Result<()> {
             kv_residual_window,
             kv_activate_at,
             ctx,
+            kv_pages,
+            kv_tier,
+            kv_tier_dir,
+            kv_tier_ram_gb,
+            kv_tier_watermark,
         } => cmd_run(
             &model_path,
             &prompt,
@@ -240,7 +303,9 @@ fn main() -> Result<()> {
             chat,
             weights_pool_gb,
             parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
+            parse_kv_tier(&kv_tier, kv_tier_dir, kv_tier_ram_gb, kv_tier_watermark)?,
             ctx,
+            kv_pages,
         ),
         Command::Transcribe {
             model_dir,
@@ -254,11 +319,20 @@ fn main() -> Result<()> {
             kv_cache,
             kv_residual_window,
             kv_activate_at,
+            ctx,
+            kv_pages,
+            kv_tier,
+            kv_tier_dir,
+            kv_tier_ram_gb,
+            kv_tier_watermark,
         } => cmd_bench(
             &model_path,
             tokens,
             prompt_tokens,
             parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
+            parse_kv_tier(&kv_tier, kv_tier_dir, kv_tier_ram_gb, kv_tier_watermark)?,
+            ctx,
+            kv_pages,
         ),
     }
 }
@@ -271,6 +345,44 @@ fn parse_kv_quant(s: &str, residual_window: usize, activate_at: usize) -> Result
         "rot3" => Ok(KvQuant::Rot { bits: 3, residual_window, activate_at }),
         other => bail!("unsupported --kv-cache '{other}' (expected f16 | fp8 | rot4 | rot3)"),
     }
+}
+
+fn parse_kv_tier(
+    mode: &str,
+    dir: Option<PathBuf>,
+    ram_gb: f64,
+    watermark: f64,
+) -> Result<KvTierConfig> {
+    let mode = match mode {
+        "off" => KvTierMode::Off,
+        "ram" => KvTierMode::Ram,
+        "nvme" => KvTierMode::Nvme,
+        other => bail!("unsupported --kv-tier '{other}' (expected off | ram | nvme)"),
+    };
+    if !(0.0..1.0).contains(&watermark) {
+        bail!("--kv-tier-watermark must be in [0, 1), got {watermark}");
+    }
+    if ram_gb <= 0.0 {
+        bail!("--kv-tier-ram-gb must be positive, got {ram_gb}");
+    }
+    Ok(KvTierConfig {
+        mode,
+        dir,
+        ram_budget_bytes: (ram_gb * (1u64 << 30) as f64) as usize,
+        watermark,
+    })
+}
+
+/// VRAM bytes of the streamed-tier staging (two full-context single-layer
+/// slabs); lives in the weights pool alongside the KV slabs.
+fn tier_stage_bytes(
+    desc: &forge_formats::ModelDescriptor,
+    kv_page_size: usize,
+    ctx_pages: usize,
+    quant: KvQuant,
+) -> usize {
+    2 * ctx_pages * desc.params.n_kv_heads * kv_page_size * desc.params.head_dim
+        * quant.slab_dtype().size()
 }
 
 fn default_model_id(path: &Path) -> String {
@@ -288,21 +400,33 @@ fn load_for_serve(
     kv_pages: usize,
     weights_pool_gb: f64,
     kv_quant: KvQuant,
+    kv_tier: KvTierConfig,
     ctx: usize,
 ) -> Result<(LoadedModel, usize, usize)> {
     let kv_page_size = ModelConfig::default().kv_page_size;
     let desc = read_descriptor(path)?;
-    // The shared KV pool must hold at least one full-context sequence.
+    // Without tiering the shared KV pool must hold at least one full-context
+    // sequence; with tiering the pool is only the hot working set and the
+    // rest of the window spills to RAM/NVMe.
     let (max_seq_len, ctx_pages) =
         resolve_ctx(desc.params.max_position_embeddings, ctx, kv_page_size);
-    let kv_pages = kv_pages.max(ctx_pages);
+    let kv_pages = if kv_tier.enabled() {
+        kv_pages.min(ctx_pages)
+    } else {
+        kv_pages.max(ctx_pages)
+    };
     let kv_pool = kv_pool_bytes(&desc, kv_page_size, kv_pages, kv_quant).max(1 << 30);
+    let stage = if kv_tier.enabled() {
+        tier_stage_bytes(&desc, kv_page_size, ctx_pages, kv_quant)
+    } else {
+        0
+    };
     let activations = 1usize << 30;
     // Clamp the requested weights pool so weights + KV + activations always fit
     // free VRAM — a large --ctx grows KV and must not OOM the pool arenas.
     let free = CudaDevice::free_vram(0).context("query free VRAM")?;
     let weights_budget = free.saturating_sub(kv_pool + activations + (512 << 20));
-    let weights = ((weights_pool_gb * (1u64 << 30) as f64) as usize)
+    let weights = ((weights_pool_gb * (1u64 << 30) as f64) as usize + stage)
         .min(weights_budget)
         .max(1 << 30);
     let device = CudaDevice::new(
@@ -320,6 +444,7 @@ fn load_for_serve(
         kv_page_size,
         kv_pages,
         kv_quant,
+        kv_tier,
         max_seq_len,
     };
     let loaded = load_model(dev, path, cfg)?;
@@ -345,20 +470,34 @@ fn load_auto(
     path: &Path,
     weights_pool_gb: f64,
     kv_quant: KvQuant,
+    kv_tier: KvTierConfig,
     ctx: usize,
+    kv_pages_flag: usize,
 ) -> Result<LoadedModel> {
     // Read hyperparameters before loading weights so the KV cache is sized for
     // the requested context up front (its slabs are allocated during load).
     let desc = read_descriptor(path)?;
     let page_size = ModelConfig::default().kv_page_size;
-    let (max_seq_len, kv_pages) =
+    let (max_seq_len, ctx_pages) =
         resolve_ctx(desc.params.max_position_embeddings, ctx, page_size);
+    // 0 = a pool covering the whole context (today's behavior); an explicit
+    // count caps the hot VRAM working set (useful with --kv-tier).
+    let kv_pages = if kv_pages_flag > 0 {
+        kv_pages_flag.min(ctx_pages)
+    } else {
+        ctx_pages
+    };
     let kv_pool = kv_pool_bytes(&desc, page_size, kv_pages, kv_quant).max(1 << 30);
+    let stage = if kv_tier.enabled() {
+        tier_stage_bytes(&desc, page_size, ctx_pages, kv_quant)
+    } else {
+        0
+    };
 
     // Activations pool holds decode scratch + persistent decode buffers.
     let activations = 1usize << 30;
     let weights = if weights_pool_gb > 0.0 {
-        (weights_pool_gb * (1u64 << 30) as f64) as usize
+        (weights_pool_gb * (1u64 << 30) as f64) as usize + stage
     } else {
         // Give the KV cache its computed budget first, then the rest (minus a
         // safety margin) to weights, so a long context never starves the KV
@@ -383,6 +522,7 @@ fn load_auto(
         path,
         ModelConfig {
             kv_quant,
+            kv_tier,
             kv_page_size: page_size,
             kv_pages,
             max_seq_len,
@@ -471,7 +611,14 @@ fn cmd_embed(
     weights_pool_gb: f64,
 ) -> Result<()> {
     let t0 = Instant::now();
-    let loaded = load_auto(model_path, weights_pool_gb, KvQuant::F16, 8192)?;
+    let loaded = load_auto(
+        model_path,
+        weights_pool_gb,
+        KvQuant::F16,
+        KvTierConfig::default(),
+        8192,
+        0,
+    )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let pooling = match pooling_override {
@@ -542,12 +689,13 @@ fn cmd_serve(
     whisper_model: Option<&Path>,
     embed_model: Option<&Path>,
     kv_quant: KvQuant,
+    kv_tier: KvTierConfig,
     ctx: usize,
 ) -> Result<()> {
     let max_active = usize::from(max_active);
     let t0 = Instant::now();
     let (loaded, kv_pages, max_seq_len) =
-        load_for_serve(model_path, kv_pages, weights_pool_gb, kv_quant, ctx)?;
+        load_for_serve(model_path, kv_pages, weights_pool_gb, kv_quant, kv_tier, ctx)?;
     tracing::info!(
         "loaded {} ({}) in {:.1}s: {} layers, kv_pages={}",
         model_path.display(),
@@ -701,10 +849,12 @@ fn cmd_run(
     chat: bool,
     weights_pool_gb: f64,
     kv_quant: KvQuant,
+    kv_tier: KvTierConfig,
     ctx: usize,
+    kv_pages: usize,
 ) -> Result<()> {
     let t0 = Instant::now();
-    let loaded = load_auto(model_path, weights_pool_gb, kv_quant, ctx)?;
+    let loaded = load_auto(model_path, weights_pool_gb, kv_quant, kv_tier, ctx, kv_pages)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let prompt_text = if chat {
@@ -757,7 +907,16 @@ fn cmd_run(
     Ok(())
 }
 
-fn cmd_bench(model_path: &Path, tokens: usize, prompt_tokens: usize, kv_quant: KvQuant) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn cmd_bench(
+    model_path: &Path,
+    tokens: usize,
+    prompt_tokens: usize,
+    kv_quant: KvQuant,
+    kv_tier: KvTierConfig,
+    ctx: usize,
+    kv_pages: usize,
+) -> Result<()> {
     if tokens < 2 {
         bail!("--tokens must be at least 2 to measure decode throughput");
     }
@@ -765,7 +924,7 @@ fn cmd_bench(model_path: &Path, tokens: usize, prompt_tokens: usize, kv_quant: K
         bail!("--prompt-tokens must be at least 1");
     }
     let t0 = Instant::now();
-    let loaded = load_auto(model_path, 0.0, kv_quant, 0)?;
+    let loaded = load_auto(model_path, 0.0, kv_quant, kv_tier, ctx, kv_pages)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let tokenizer = Arc::new(loaded.bundle.tokenizer);
