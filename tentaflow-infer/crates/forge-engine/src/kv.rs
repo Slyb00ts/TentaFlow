@@ -280,6 +280,32 @@ impl KvCache {
         Ok(())
     }
 
+    /// Truncate a sequence back to `new_len` tokens, freeing any tail pages the
+    /// shorter length no longer needs (speculative rollback: rejected draft
+    /// positions are discarded). Pages are freed from the tail only, so a
+    /// borrowed prefix's shared pages are never touched. The device page table
+    /// still lists the freed slots beyond `new_len`; the next step re-uploads it
+    /// (callers invalidate `pt_seq`), and attention never reads past `seq.len`.
+    pub fn rollback(&mut self, seq: &mut SeqKv, new_len: usize) {
+        debug_assert!(new_len <= seq.len, "rollback target beyond current len");
+        let needed = if new_len == 0 {
+            0
+        } else {
+            new_len.div_ceil(self.cfg.page_size)
+        };
+        debug_assert!(
+            needed >= seq.shared_pages,
+            "rollback must not drop borrowed shared pages"
+        );
+        while seq.pages.len() > needed {
+            let page = seq.pages.pop().expect("pages non-empty while above needed");
+            if page >= 0 {
+                self.free_pages.push(page);
+            }
+        }
+        seq.len = new_len;
+    }
+
     pub fn release(&mut self, seq: &mut SeqKv) {
         // Spilled entries are -1 (their bytes live in tier chunks, dropped by
         // the tier manager) and must not enter the free-page stack.

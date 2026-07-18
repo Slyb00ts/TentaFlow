@@ -13,7 +13,7 @@ use forge_engine::kv::KvQuant;
 use forge_engine::model::ModelConfig;
 use forge_engine::tier::{KvTierConfig, KvTierMode};
 use forge_engine::sample::SamplingParams;
-use forge_engine::server::{spawn_engine, EngineEvent, EngineHandle, EngineRequest};
+use forge_engine::server::{EngineEvent, EngineHandle, EngineRequest, SpeculativeConfig};
 use forge_formats::PoolingType;
 use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
@@ -137,6 +137,13 @@ enum Command {
         /// with tiering / rot KV / hybrid arch.
         #[arg(long = "prefix-cache", default_value = "on")]
         prefix_cache: String,
+        /// Speculative decoding (SPEC §6): off | on | ngram | ngram:<k>. `on`
+        /// enables the self-drafting n-gram proposer (draft budget 8) for
+        /// greedy, penalty-free requests on the dense F16 paged-KV path; output
+        /// stays identical to non-speculative decode. Forces `--prefix-cache
+        /// off` when enabled. `off` = today's decode loop, byte-for-byte.
+        #[arg(long = "speculative", default_value = "off")]
+        speculative: String,
     },
     /// Print an embedding vector for one text (dims + L2 norm + first values).
     Embed {
@@ -217,6 +224,10 @@ enum Command {
         /// Radix-tree prefix caching (SPEC §5.2): on | off (see `forge serve`).
         #[arg(long = "prefix-cache", default_value = "on")]
         prefix_cache: String,
+        /// Speculative decoding (SPEC §6): off | on | ngram | ngram:<k> (see
+        /// `forge serve`). Forces `--prefix-cache off` when enabled.
+        #[arg(long = "speculative", default_value = "off")]
+        speculative: String,
     },
     /// Transcribe a WAV file with a Whisper model.
     Transcribe {
@@ -281,6 +292,10 @@ enum Command {
         /// Radix-tree prefix caching (SPEC §5.2): on | off (see `forge serve`).
         #[arg(long = "prefix-cache", default_value = "on")]
         prefix_cache: String,
+        /// Speculative decoding (SPEC §6): off | on | ngram | ngram:<k> (see
+        /// `forge serve`). Forces `--prefix-cache off` when enabled.
+        #[arg(long = "speculative", default_value = "off")]
+        speculative: String,
     },
 }
 
@@ -324,6 +339,7 @@ fn main() -> Result<()> {
             kv_hot_pages,
             kvflash,
             prefix_cache,
+            speculative,
         } => {
             let (hot_pages, tier) = resolve_kvflash(
                 kvflash,
@@ -351,6 +367,7 @@ fn main() -> Result<()> {
                 ctx,
                 hot_pages,
                 parse_prefix_cache(&prefix_cache)?,
+                parse_speculative(&speculative)?,
             )
         }
         Command::Embed {
@@ -385,6 +402,7 @@ fn main() -> Result<()> {
             kv_hot_pages,
             kvflash,
             prefix_cache,
+            speculative,
         } => {
             let (hot_pages, tier) = resolve_kvflash(
                 kvflash,
@@ -407,6 +425,7 @@ fn main() -> Result<()> {
                 kv_pages,
                 hot_pages,
                 parse_prefix_cache(&prefix_cache)?,
+                parse_speculative(&speculative)?,
             )
         }
         Command::Transcribe {
@@ -430,6 +449,7 @@ fn main() -> Result<()> {
             kv_hot_pages,
             kvflash,
             prefix_cache,
+            speculative,
         } => {
             let (hot_pages, tier) = resolve_kvflash(
                 kvflash,
@@ -449,6 +469,7 @@ fn main() -> Result<()> {
                 kv_pages,
                 hot_pages,
                 parse_prefix_cache(&prefix_cache)?,
+                parse_speculative(&speculative)?,
             )
         }
     }
@@ -481,6 +502,31 @@ fn parse_kv_quant(s: &str, residual_window: usize, activate_at: usize) -> Result
         "rot4" => Ok(KvQuant::Rot { bits: 4, residual_window, activate_at }),
         "rot3" => Ok(KvQuant::Rot { bits: 3, residual_window, activate_at }),
         other => bail!("unsupported --kv-cache '{other}' (expected f16 | fp8 | rot4 | rot3)"),
+    }
+}
+
+/// Parse `--speculative`: `off` | `on` | `ngram` | `ngram:<k>`. `on`/`ngram`
+/// use the default draft budget; `ngram:<k>` sets it explicitly.
+fn parse_speculative(s: &str) -> Result<SpeculativeConfig> {
+    // The verify forward runs the ungraphed prefill path, so a long draft
+    // (amortizing its per-op launch overhead over many accepted tokens) is what
+    // makes it a net win; 16 measured best on qwen3-0.6b.
+    const DEFAULT_DRAFT: usize = 16;
+    match s {
+        "off" => Ok(SpeculativeConfig::off()),
+        "on" | "ngram" => Ok(SpeculativeConfig::ngram(DEFAULT_DRAFT)),
+        other => match other.strip_prefix("ngram:") {
+            Some(k) => {
+                let k: usize = k
+                    .parse()
+                    .with_context(|| format!("invalid draft budget in --speculative '{other}'"))?;
+                if k == 0 {
+                    bail!("--speculative draft budget must be >= 1");
+                }
+                Ok(SpeculativeConfig::ngram(k))
+            }
+            None => bail!("unsupported --speculative '{other}' (expected off | on | ngram | ngram:<k>)"),
+        },
     }
 }
 
@@ -904,8 +950,16 @@ fn cmd_serve(
     ctx: usize,
     hot_pages: usize,
     prefix_cache: bool,
+    spec: SpeculativeConfig,
 ) -> Result<()> {
     let max_active = usize::from(max_active);
+    // Speculation appends + rolls back draft KV on the plain paged cache; the
+    // radix prefix cache donates/borrows pages and is mutually exclusive with
+    // it, so enabling speculation forces prefix caching off.
+    let prefix_cache = prefix_cache && !spec.enabled;
+    if spec.enabled {
+        tracing::info!("speculative decoding enabled; prefix cache disabled");
+    }
     let t0 = Instant::now();
     let (loaded, kv_pages, max_seq_len) = load_for_serve(
         model_path,
@@ -952,6 +1006,7 @@ fn cmd_serve(
         max_active,
         prefill_chunk,
         batch_min as usize,
+        spec,
     );
 
     let whisper = match whisper_model {
@@ -1075,8 +1130,12 @@ fn cmd_run(
     kv_pages: usize,
     hot_pages: usize,
     prefix_cache: bool,
+    spec: SpeculativeConfig,
 ) -> Result<()> {
     let t0 = Instant::now();
+    // Speculation is mutually exclusive with the radix prefix cache (both manage
+    // paged KV ownership); enabling it forces prefix caching off.
+    let prefix_cache = prefix_cache && !spec.enabled;
     let loaded = load_auto(
         model_path,
         weights_pool_gb,
@@ -1109,7 +1168,7 @@ fn cmd_run(
     let prompt_tokens = tokenizer
         .encode(&prompt_text, true)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let engine = spawn_engine(loaded.model, tokenizer, 1, 16);
+    let engine = forge_engine::server::spawn_engine_batched(loaded.model, tokenizer, 1, 16, 12, spec);
 
     let submit_at = Instant::now();
     let (generated, prompt_len, _first, done_at) = drain_request(
@@ -1152,6 +1211,7 @@ fn cmd_bench(
     kv_pages: usize,
     hot_pages: usize,
     prefix_cache: bool,
+    spec: SpeculativeConfig,
 ) -> Result<()> {
     if tokens < 2 {
         bail!("--tokens must be at least 2 to measure decode throughput");
@@ -1160,6 +1220,7 @@ fn cmd_bench(
         bail!("--prompt-tokens must be at least 1");
     }
     let t0 = Instant::now();
+    let prefix_cache = prefix_cache && !spec.enabled;
     let loaded = load_auto(model_path, 0.0, kv_quant, kv_tier, ctx, kv_pages, hot_pages, prefix_cache)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
@@ -1180,7 +1241,14 @@ fn cmd_bench(
         .collect();
 
     // Single-sequence bench: full-size prefill chunks, no ITL to protect.
-    let engine = spawn_engine(loaded.model, tokenizer, 1, forge_engine::model::MAX_PREFILL_CHUNK);
+    let engine = forge_engine::server::spawn_engine_batched(
+        loaded.model,
+        tokenizer,
+        1,
+        forge_engine::model::MAX_PREFILL_CHUNK,
+        12,
+        spec,
+    );
     let submit_at = Instant::now();
     // No EOS ids: the benchmark must decode exactly `tokens` tokens.
     let (generated, prompt_len, first_at, done_at) = drain_request(

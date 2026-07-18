@@ -42,10 +42,23 @@ Ostatnia aktualizacja: 2026-07-18.
 
 ## Częściowe
 
-- 🟡 **§6 Spekulacja**: framework (Proposer trait, NgramProposer, kaskada,
-  adaptive-disable) ISTNIEJE, ale NIE jest wpięty w pętlę decode — brak draft
-  model / MTP / EAGLE proposerów i tree-verification w silniku. To rusztowanie,
-  nie działająca akceleracja.
+- ✅ **§6 Spekulacja (linear n-gram) WPIĘTA w decode loop**: NgramProposer
+  drafuje k tokenów z własnej historii sekwencji, silnik weryfikuje je JEDNYM
+  forwardem (mini-prefill nad pozycjami draftu → `sample_batched_argmax_f32`
+  per pozycja), akceptuje najdłuższy zgodny prefiks, a odrzucone pozycje KV są
+  wycofywane (`KvCache::rollback`, obsługa granic stron). Wynik przy temp==0 jest
+  **identyczny co do tokena** z dekodowaniem bez spekulacji tam, gdzie argmax jest
+  jednoznaczny (dowód E2E: powtarzalny prompt na qwen3-0.6b — spec ON == spec OFF,
+  ~1.5x szybciej, 16 akceptowanych/forward = 17 tok/forward; `forge run … --speculative on`).
+  Kaskada + per-proposer acceptance stats + adaptive-disable (usypianie przy braku
+  zysku) wpięte. Bramka: tylko greedy (temp==0, bez repetition penalty / host-logit
+  features) na gęstej ścieżce F16 paged-KV (bez tieru / prefix-cache / hybrid / MoE);
+  inne żądania cicho spadają do zwykłego dekodowania. Weryfikacja idzie NIEGRAFOWANĄ
+  ścieżką prefill, więc na małym modelu opłaca się dopiero dla długich draftów
+  (gate `MIN_VERIFY_DRAFT`); dla ordinary prose spekulacja nie regresuje (fallback
+  na pojedynczy graf-krok). Domyślnie WYŁĄCZONA (`--speculative off` = bajt-w-bajt
+  dzisiejsza pętla). Braki: draft-model / MTP / EAGLE proposery, tree-verification
+  (spec-sampling) i spekulacja stochastyczna (temp>0) — na razie tylko greedy-exact.
 - 🟡 **§4.2 Rejestr architektur**: qwen3, llama, mistral, olmoe (MoE), qwen3moe
   (MoE), qwen35moe (hybrid SSM+MoE, ✅ E2E — patrz niżej). Brak: DeepSeek (MLA),
   Gemma (sliding-window), Phi.

@@ -232,6 +232,56 @@ Zweryfikowane (RTX 4090, qwen3-0.6b-q8_0, `tests/prefix_cache.rs`):
 
 ---
 
+## Dekodowanie spekulatywne (SPEC §6)
+
+Samodrafujący proposer n-gram + wspólna weryfikacja jednym forwardem. Na każdym
+kroku greedy proposer szuka najdłuższego dopasowania sufiksu w WŁASNEJ historii
+sekwencji (prompt + wygenerowane) i drafuje kontynuację; silnik weryfikuje cały
+draft JEDNYM przebiegiem (mini-prefill nad pozycjami draftu), akceptuje najdłuższy
+prefiks, którego token równa się argmaxowi modelu na poprzedniej pozycji, a
+odrzucone pozycje KV wycofuje (`KvCache::rollback`). Jeden forward daje 1..=k+1
+tokenów, **identycznych co do tokena** z dekodowaniem sekwencyjnym tam, gdzie
+argmax jest jednoznaczny — akcelerator dokładnego dekodowania, nie przybliżenie.
+
+| Flaga | Domyślnie | Opis |
+|---|---|---|
+| `--speculative <M>` | `off` | `off` \| `on` \| `ngram` \| `ngram:<k>`. `on`/`ngram` = proposer n-gram z budżetem draftu 16; `ngram:<k>` ustawia budżet (1..16). `off` = bajt-w-bajt dzisiejsza pętla decode. |
+
+Zakres i komponowanie:
+
+- Włącza się TYLKO dla żądań **greedy** (`temperature == 0`, bez repetition
+  penalty i bez host-logit features: grammar / `logit_bias` / `min_tokens` /
+  `logprobs`) na **gęstej ścieżce F16 paged-KV** (bez `--kv-tier`/`--kvflash`,
+  bez `rot4`/`rot3`, nie-hybrid, nie-MoE, głowica `lm_head` f16/q8_0). Pozostałe
+  żądania CICHO spadają do zwykłego dekodowania — wynik bez zmian.
+- **Wymusza `--prefix-cache off`** (obie funkcje zarządzają własnością stron KV;
+  weryfikacja dopisuje i wycofuje draftowe strony na gołej puli).
+- Spekulacja stochastyczna (`temp > 0`) NIE jest zaimplementowana w v1 — tylko
+  greedy-exact. Statystyki akceptacji per-proposer i adaptive-disable (usypianie
+  proposera, gdy szacowany zysk < 1.05 w oknie) są aktywne.
+- Weryfikacja idzie NIEGRAFOWANĄ ścieżką prefill, więc na małym modelu opłaca się
+  dopiero dla długich draftów (gate `MIN_VERIFY_DRAFT`): krótkie drafty (typowe dla
+  zwykłej prozy) spadają na tani graf-krok pojedynczego tokena, więc ruch
+  nie-powtarzalny nie regresuje. Zysk rośnie z długością akceptowanych serii i z
+  rozmiarem modelu (decode compute/bandwidth-bound).
+- Raport na końcu sekwencji (log `INFO`): liczba forwardów weryfikacji,
+  akceptowane tokeny draftu, akceptacja/krok, tok/forward i migawka statystyk
+  proposera.
+
+Zweryfikowane (RTX 4090, qwen3-0.6b-q8_0, `tests/e2e_speculative.rs`):
+
+- **Powtarzalny prompt (`--speculative on`) == `off` co do tokena**, ~1.45–1.6×
+  szybciej; `forge run … --speculative on` na powtarzalnym ciągu: 64 tokeny w 4
+  forwardach weryfikacji = **16 akceptowanych/krok, 17 tok/forward**.
+- **Prompt zwykły**: akceptacja ≈ 0, wynik identyczny, brak regresji (fallback na
+  pojedynczy graf-krok; ~0.88× to koszt taniego proposera per krok).
+- Golden NVFP4 (Bielik-7B, `--speculative off`) reprodukuje dokładne id — ścieżka
+  OFF jest bit-identyczna z dzisiejszą.
+- Rollback stron KV: jednostkowy `tests/kv_rollback.rs`; `verify_greedy`
+  (długość akceptowanego prefiksu): `speculation::tests`.
+
+---
+
 ## Serwer HTTP (serve)
 
 | Flaga | Domyślnie | Opis |
@@ -242,6 +292,7 @@ Zweryfikowane (RTX 4090, qwen3-0.6b-q8_0, `tests/prefix_cache.rs`):
 | `--tool-call-parser <P>` | auto | Parser tool-calli z wyjścia modelu: `hermes` \| `llama3` \| `none`. Auto-detekcja: szablon zawierający `<tool_call>` → hermes; llama-arch z tool-aware szablonem → llama3; szablon bez `tools` → none. |
 | `--whisper-model <DIR>` | brak | Katalog HF Whispera — włącza `POST /v1/audio/transcriptions` (osobny device/mutex; 4 równoległe uploady, nadmiar → 429). |
 | `--embed-model <PATH>` | brak | Model embeddingowy — włącza `POST /v1/embeddings`. Gdy pominięte, a serwowany model sam jest embeddingowy, jest reużywany. |
+| `--speculative <M>` | `off` | Dekodowanie spekulatywne (patrz sekcja wyżej): `off` \| `on` \| `ngram` \| `ngram:<k>`. Wymusza `--prefix-cache off`. |
 
 Endpointy: `/v1/chat/completions`, `/v1/completions`, `/v1/models`,
 `/v1/embeddings`, `/v1/audio/transcriptions`, `/healthz`.
@@ -389,7 +440,7 @@ forge run /tmp/qwen/Qwen3-0.6B-Q8_0.gguf "Hi" -n 4
 | `-n, --max-tokens <N>` | `256` | Limit generacji. |
 | `--temp <F>` | `0.7` | Temperatura (`0` = greedy). |
 | `--chat` | off | Opakowuje prompt w szablon czatu modelu (user message, add_generation_prompt). |
-| + `--ctx`, `--weights-pool-gb`, `--kv-pages`, `--kv-cache`, `--kv-residual-window`, `--kv-activate-at`, `--kv-tier*`, `--kv-hot-pages`, `--kvflash`, `--prefix-cache` | jw. | Jak w sekcjach wyżej. |
+| + `--ctx`, `--weights-pool-gb`, `--kv-pages`, `--kv-cache`, `--kv-residual-window`, `--kv-activate-at`, `--kv-tier*`, `--kv-hot-pages`, `--kvflash`, `--prefix-cache`, `--speculative` | jw. | Jak w sekcjach wyżej. |
 
 ## forge bench
 
@@ -397,7 +448,7 @@ forge run /tmp/qwen/Qwen3-0.6B-Q8_0.gguf "Hi" -n 4
 |---|---|---|
 | `--tokens <N>` | `128` | Tokeny decode do zmierzenia. |
 | `--prompt-tokens <N>` | `512` | Długość promptu (prefill). |
-| + `--ctx`, `--kv-pages`, `--kv-cache`, `--kv-residual-window`, `--kv-activate-at`, `--kv-tier*`, `--prefix-cache` | jw. | |
+| + `--ctx`, `--kv-pages`, `--kv-cache`, `--kv-residual-window`, `--kv-activate-at`, `--kv-tier*`, `--prefix-cache`, `--speculative` | jw. | |
 
 Uwaga metodyczna: prefill mierzony do pierwszego WIDOCZNEGO tokenu (zawiera
 ≥1 krok decode); bezczynna 4090 siedzi na ~210 MHz — porównuj rozgrzane przebiegi.

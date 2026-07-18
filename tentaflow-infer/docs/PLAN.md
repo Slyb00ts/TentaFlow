@@ -140,6 +140,15 @@ wider loads alone. `kernels/mojo/bench_gemv.mojo` is the measurement harness.
   acceptance stats per proposer; adaptive disable.
 - MTP/EAGLE/draft-model slots defined, implemented when a target model with
   MTP head is in scope (Qwen3.6-class).
+- ✅ **Linear n-gram path WIRED into the engine decode loop**: greedy sequences
+  draft k tokens, one verify forward (mini-prefill + per-position GPU argmax)
+  accepts the longest matching prefix, rejected KV rolled back
+  (`KvCache::rollback`). Greedy-exact (spec ON == OFF token-for-token where
+  argmax is unambiguous), gated to dense F16 paged-KV, default off
+  (`--speculative on|off|ngram:<k>`). Proof: `tests/e2e_speculative.rs`
+  (qwen3-0.6b repetitive == exact, ~1.5×; ordinary no-regression),
+  `tests/kv_rollback.rs`. TODO: tree verification (spec-sampling), MTP/EAGLE
+  proposers, stochastic (temp>0) speculative sampling.
 
 ### Chunk 9+ — later phases (tracked, not this milestone)
 KV quant ladder (FP8→INT8→NVFP4-KV→rotational 3-bit), TierManager (expert

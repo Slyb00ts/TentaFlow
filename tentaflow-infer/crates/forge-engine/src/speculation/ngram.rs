@@ -32,13 +32,26 @@ pub struct NgramProposer {
     /// Only grams with a known follower are indexed, so every hit yields at
     /// least one draft token.
     maps: [HashMap<GramKey, Vec<u32>>; MAX_GRAM],
+    /// Shortest gram allowed to seed a draft. A higher floor ignores weak
+    /// 1-/2-gram coincidences (ubiquitous in ordinary prose, where they draft
+    /// noise the verifier rejects) and only speculates on longer, genuinely
+    /// recurring context — repeated/structured/code/RAG text. `new()` keeps the
+    /// permissive floor of 1.
+    min_gram: usize,
 }
 
 impl NgramProposer {
     pub fn new() -> Self {
+        Self::with_min_gram(1)
+    }
+
+    /// Proposer that only drafts from a match of at least `min_gram` tokens
+    /// (clamped to `1..=MAX_GRAM`).
+    pub fn with_min_gram(min_gram: usize) -> Self {
         Self {
             history: Vec::new(),
             maps: Default::default(),
+            min_gram: min_gram.clamp(1, MAX_GRAM),
         }
     }
 
@@ -71,7 +84,7 @@ impl Proposer for NgramProposer {
         if budget == 0 || ctx_tokens.is_empty() {
             return Vec::new();
         }
-        for n in (1..=MAX_GRAM).rev() {
+        for n in (self.min_gram..=MAX_GRAM).rev() {
             if ctx_tokens.len() < n {
                 continue;
             }

@@ -13,11 +13,52 @@ use forge_types::{ForgeError, Result};
 
 use crate::generate::FinishReason;
 use crate::kv::SeqKv;
-use crate::model::{Model, MAX_PREFILL_CHUNK};
+use crate::model::{Model, MAX_PREFILL_CHUNK, MAX_SPEC_DRAFT};
 use crate::sample::{
     apply_logit_bias, compute_logprob, suppress_eos, GpuSampler, Sampler, SamplingParams,
     SeqSampleParams, TokenLogprob,
 };
+use crate::speculation::{CascadeComposer, NgramProposer, SpeculativeState};
+
+/// Shortest draft that is worth a verify forward (SPEC §6). The verify runs the
+/// ungraphed prefill path, so on a launch-bound small model it only wins when it
+/// can replace several graphed decode steps; shorter drafts fall back to the
+/// plain single-token step. Long enough that ordinary prose (only short
+/// coincidental drafts) never verifies, low enough that genuine recurring
+/// context (which drafts to the full budget) always does.
+const MIN_VERIFY_DRAFT: usize = 8;
+
+/// Speculative decoding configuration (SPEC §6). `enabled` off = today's decode
+/// loop, byte-for-byte. When on, greedy sequences on the standard dense
+/// paged-KV path draft `draft_tokens` continuation tokens per step with an
+/// n-gram proposer and verify them in one forward; output stays identical to
+/// non-speculative greedy decode. Requests that are not greedy, use a
+/// repetition penalty, need host logits (grammar / logit_bias / min_tokens /
+/// logprobs), or run on an ineligible model silently fall back to plain decode.
+#[derive(Clone, Copy, Debug)]
+pub struct SpeculativeConfig {
+    pub enabled: bool,
+    /// Draft length per step (n-gram budget), clamped to `MAX_SPEC_DRAFT`.
+    pub draft_tokens: usize,
+}
+
+impl SpeculativeConfig {
+    pub fn off() -> Self {
+        Self {
+            enabled: false,
+            draft_tokens: 0,
+        }
+    }
+
+    /// N-gram speculation with a `draft_tokens` budget (clamped to
+    /// `1..=MAX_SPEC_DRAFT`).
+    pub fn ngram(draft_tokens: usize) -> Self {
+        Self {
+            enabled: true,
+            draft_tokens: draft_tokens.clamp(1, MAX_SPEC_DRAFT),
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct EngineRequest {
@@ -126,6 +167,17 @@ struct ActiveSeq<'t> {
     next: Option<PendingNext>,
     /// Client hang-up detected; sequence is torn down at the next iteration.
     dead: bool,
+    /// Speculative-decode state (SPEC §6): `Some` only for an eligible greedy
+    /// sequence with speculation enabled. Holds the n-gram proposer's history
+    /// index and per-proposer acceptance stats; drives draft/verify/commit.
+    spec: Option<SpeculativeState>,
+    /// Draft budget per speculative step (0 when `spec` is `None`).
+    spec_budget: usize,
+    /// Verification forwards run for this sequence (each yields 1..=k+1 tokens).
+    spec_forwards: u64,
+    /// Draft tokens accepted across all verifications (excludes correction/bonus
+    /// tokens, which every forward also produces).
+    spec_accepted: u64,
 }
 
 /// Spawn the GPU worker thread. `prefill_chunk` bounds how many prompt tokens
@@ -137,7 +189,14 @@ pub fn spawn_engine(
     max_active: usize,
     prefill_chunk: usize,
 ) -> EngineHandle {
-    spawn_engine_batched(model, tokenizer, max_active, prefill_chunk, default_batch_min())
+    spawn_engine_batched(
+        model,
+        tokenizer,
+        max_active,
+        prefill_chunk,
+        default_batch_min(),
+        SpeculativeConfig::off(),
+    )
 }
 
 /// Default minimum decode concurrency before the batched forward path engages
@@ -165,15 +224,45 @@ pub fn spawn_engine_batched(
     max_active: usize,
     prefill_chunk: usize,
     batch_min: usize,
+    spec: SpeculativeConfig,
 ) -> EngineHandle {
+    // Speculation needs the standard dense paged-KV path; log once if the model
+    // is ineligible so an operator who asked for it is not left guessing.
+    let spec = if spec.enabled && !model.speculation_eligible() {
+        tracing::warn!(
+            "speculative decoding requested but this model/config is ineligible \
+             (needs dense F16 paged KV, no tier, no prefix cache, f16/q8_0 head); \
+             running without speculation"
+        );
+        SpeculativeConfig::off()
+    } else {
+        spec
+    };
+    if spec.enabled {
+        tracing::info!(
+            "speculative decoding: n-gram proposer, draft budget {}",
+            spec.draft_tokens
+        );
+    }
     let (tx, rx) = mpsc::channel::<Submission>();
     std::thread::Builder::new()
         .name("forge-engine-worker".into())
-        .spawn(move || worker(&mut model, &tokenizer, &rx, max_active, prefill_chunk, batch_min))
+        .spawn(move || {
+            worker(
+                &mut model,
+                &tokenizer,
+                &rx,
+                max_active,
+                prefill_chunk,
+                batch_min,
+                spec,
+            )
+        })
         .expect("spawn engine worker");
     EngineHandle { tx }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker<'t>(
     model: &mut Model,
     tokenizer: &'t Tokenizer,
@@ -181,6 +270,7 @@ fn worker<'t>(
     max_active: usize,
     prefill_chunk: usize,
     batch_min: usize,
+    spec: SpeculativeConfig,
 ) {
     let mut active: Vec<ActiveSeq<'t>> = Vec::new();
     let mut waiting: VecDeque<Submission> = VecDeque::new();
@@ -284,6 +374,26 @@ fn worker<'t>(
             let mut seq = model.new_seq();
             let cache_read = model.acquire_prefix(&mut seq, &prompt);
             let pending_prompt: VecDeque<u32> = prompt[cache_read..].iter().copied().collect();
+            // Speculative decoding engages only for a greedy, penalty-free,
+            // GPU-sampled sequence (the n-gram verifier reproduces greedy argmax
+            // exactly; a repetition penalty or host-logit feature would diverge).
+            // The proposer indexes the whole prompt so repeated/structured
+            // prefixes draft immediately.
+            let greedy = matches!(sampler, SeqSampler::Gpu(_))
+                && sub.req.sampling.clone().sanitized().temperature <= 0.0
+                && sub.req.sampling.repetition_penalty == 1.0;
+            let (spec_state, spec_budget) = if spec.enabled && greedy {
+                // A 3-gram floor keeps ordinary prose (where short-gram
+                // coincidences abound) on the plain decode path and only
+                // speculates on genuinely recurring context.
+                let composer =
+                    CascadeComposer::new(vec![Box::new(NgramProposer::with_min_gram(3))]);
+                let mut st = SpeculativeState::new(composer);
+                st.observe_all(&prompt);
+                (Some(st), spec.draft_tokens)
+            } else {
+                (None, 0)
+            };
             active.push(ActiveSeq {
                 seq,
                 sampler,
@@ -302,6 +412,10 @@ fn worker<'t>(
                 cache_read,
                 next: None,
                 dead: false,
+                spec: spec_state,
+                spec_budget,
+                spec_forwards: 0,
+                spec_accepted: 0,
             });
         }
 
@@ -442,7 +556,15 @@ fn advance(model: &mut Model, a: &mut ActiveSeq<'_>, prefill_chunk: usize) -> Re
                 SeqSampler::Cpu(_) => PendingNext::Logits(logits),
                 // The prefill logits are still device-resident: draw now,
                 // before another sequence overwrites the shared buffer.
-                SeqSampler::Gpu(g) => PendingNext::Token(model.sample_last_logits(g)?),
+                SeqSampler::Gpu(g) => {
+                    let t = model.sample_last_logits(g)?;
+                    // Keep the proposer's history in lock-step: the first token
+                    // is confirmed here, before it is ever used as a draft base.
+                    if let Some(s) = &mut a.spec {
+                        s.observe(t);
+                    }
+                    PendingNext::Token(t)
+                }
             });
         }
         return Ok(());
@@ -523,7 +645,16 @@ fn batch_gpu_decode(model: &mut Model, active: &mut [ActiveSeq<'_>], batch_min: 
             None => continue,
         };
         match emit_token(a, next, None) {
-            Ok(StepOutcome::Continue) => feed_idx.push(i),
+            // A speculative sequence runs its own draft/verify step here and
+            // never joins the batched (or serial fallback) feed set — the n-gram
+            // path is a single-sequence latency win, disabled under batch load.
+            Ok(StepOutcome::Continue) => {
+                if a.spec.is_some() {
+                    speculative_step(model, a);
+                } else {
+                    feed_idx.push(i);
+                }
+            }
             Ok(StepOutcome::Finished) => {}
             Err(e) => {
                 let _ = a.events.send(EngineEvent::Error(e.to_string()));
@@ -615,6 +746,88 @@ fn serial_step(model: &mut Model, a: &mut ActiveSeq<'_>) {
     }
 }
 
+/// One speculative decode step for a greedy, eligible sequence (SPEC §6). The
+/// just-emitted token is the draft base `fed`; the n-gram proposer drafts a
+/// continuation from the sequence's own history, ONE verify forward checks it,
+/// accepted drafts are emitted as output and the correction/bonus token is
+/// stashed as the next pending token. An empty draft (no suffix match) falls
+/// back to a single fused greedy step, identical to `serial_step`. Output is
+/// token-for-token identical to non-speculative greedy decode.
+fn speculative_step(model: &mut Model, a: &mut ActiveSeq<'_>) {
+    let fed = *a.generated.last().expect("emit_token pushed the fed token");
+    let budget = a.spec_budget;
+    let draft = {
+        let s = a.spec.as_mut().expect("speculative_step on a spec sequence");
+        s.draft(budget)
+    };
+
+    // A verify forward runs the ungraphed prefill path; on a small model each
+    // graphed single-token decode step is so cheap that a verify only pays off
+    // when it can replace several of them. Verifying a short draft would lose
+    // (its wasted rejections cost more than the few decodes it could save), so a
+    // draft below the gate falls back to the plain graphed step — this is what
+    // keeps ordinary prose (which only ever yields short coincidental drafts)
+    // from regressing.
+    if draft.len() < MIN_VERIFY_DRAFT.min(budget) {
+        // Short or absent draft — plain single-token greedy step (the
+        // `serial_step` path), then record the confirmed token in the history.
+        let SeqSampler::Gpu(g) = &mut a.sampler else {
+            unreachable!("spec sequences are GPU-sampled")
+        };
+        g.note_token(fed);
+        match model.step_and_sample(&mut a.seq, fed, g) {
+            Ok(t) => {
+                if let Some(s) = &mut a.spec {
+                    s.observe(t);
+                }
+                a.next = Some(PendingNext::Token(t));
+            }
+            Err(e) => {
+                let _ = a.events.send(EngineEvent::Error(e.to_string()));
+                a.dead = true;
+            }
+        }
+        return;
+    }
+
+    let (accepted, correction) = match model.verify_greedy_draft(&mut a.seq, fed, &draft) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = a.events.send(EngineEvent::Error(e.to_string()));
+            a.dead = true;
+            return;
+        }
+    };
+    a.spec_forwards += 1;
+    a.spec_accepted += accepted as u64;
+    // Acceptance feedback: advances the proposer's own history over the accepted
+    // drafts and updates the adaptive-disable stats (SPEC §6 sleep-on-no-gain).
+    if let Some(s) = &mut a.spec {
+        s.commit(&draft, accepted);
+    }
+
+    // Emit accepted drafts as generated output, in order. A stop / eos / length
+    // / hang-up here finishes the sequence (KV is already rolled back to the
+    // accepted prefix) — exactly what sequential decode would have produced.
+    for &tok in &draft[..accepted] {
+        match emit_token(a, tok, None) {
+            Ok(StepOutcome::Continue) => {}
+            Ok(StepOutcome::Finished) => return,
+            Err(e) => {
+                let _ = a.events.send(EngineEvent::Error(e.to_string()));
+                a.dead = true;
+                return;
+            }
+        }
+    }
+    // The correction/bonus token is confirmed but not yet resident in KV (the
+    // next iteration feeds it); record it in the proposer history now.
+    if let Some(s) = &mut a.spec {
+        s.observe(correction);
+    }
+    a.next = Some(PendingNext::Token(correction));
+}
+
 fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason) -> Result<()> {
     // Flush held text through the same stop/event path as live tokens.
     if reason != FinishReason::Stop {
@@ -642,6 +855,24 @@ fn finish(a: &mut ActiveSeq<'_>, mut reason: FinishReason) -> Result<()> {
                     logprob: None,
                 });
             }
+        }
+    }
+    // Speculation report (SPEC §6): tokens produced per verify forward and the
+    // effective decode speedup (each forward also yields one correction/bonus
+    // token, so a forward emits `1 + accepted` tokens).
+    if let Some(s) = &a.spec {
+        if a.spec_forwards > 0 {
+            let forwards = a.spec_forwards as f64;
+            let tokens_from_spec = forwards + a.spec_accepted as f64;
+            tracing::info!(
+                "speculation: {} verify forwards, {} accepted draft tokens \
+                 ({:.2} accepted/step, {:.2}x tokens/forward); proposer stats {:?}",
+                a.spec_forwards,
+                a.spec_accepted,
+                a.spec_accepted as f64 / forwards,
+                tokens_from_spec / forwards,
+                s.stats(),
+            );
         }
     }
     let _ = a.events.send(EngineEvent::Done {

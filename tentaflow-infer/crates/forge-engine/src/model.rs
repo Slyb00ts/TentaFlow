@@ -28,6 +28,11 @@ use crate::weights::{
 /// prompts. Bounds the persistent prefill scratch allocation.
 pub const MAX_PREFILL_CHUNK: usize = 1024;
 
+/// Largest speculative draft (tokens) a single verification forward accepts
+/// (SPEC §6). One verify runs `fed + draft` = up to `MAX_SPEC_DRAFT + 1` query
+/// positions, bounding the [T, vocab] verify-logit scratch.
+pub const MAX_SPEC_DRAFT: usize = 16;
+
 /// Context splits for decode attention. Splitting shortens each warp's
 /// sequential online-softmax chain by this factor (decode runs one block per
 /// head — heavily latency-bound; 8 splits cut the attention kernel from
@@ -159,6 +164,10 @@ pub struct Model {
     bufs: DecodeBufs,
     /// Batched-prefill scratch; allocated lazily on the first prefill_chunk.
     prefill_bufs: Option<PrefillBufs>,
+    /// Speculative-verification logit scratch (SPEC §6): the [T, vocab] f32
+    /// logits of one draft-verification forward. Allocated lazily on the first
+    /// `verify_greedy_draft`; `None` until speculation runs.
+    verify_bufs: Option<VerifyBufs>,
     /// Captured decode step; replayed per token (inputs are device-resident).
     decode_graph: Option<ExecGraph>,
     /// Captured rotational (rot4/rot3) decode step; replayed per token. The
@@ -350,6 +359,20 @@ struct PrefillBufs {
     down: DevBuffer,
     ids: DevBuffer,
     positions: DevBuffer,
+}
+
+/// Speculative-verification scratch (SPEC §6): the [cap, vocab] f32 logits of
+/// one draft-verification forward (one row per query position: the fed token
+/// plus each draft token) plus the per-row greedy argmax, sized for `cap` =
+/// MAX_SPEC_DRAFT + 1 positions. The argmax runs on the GPU so only `cap` token
+/// ids cross PCIe, never the [cap, vocab] logits.
+struct VerifyBufs {
+    cap: usize,
+    logits: DevBuffer,
+    /// Per-row argmax token ids (i32, `cap` long), device-side.
+    ids: DevBuffer,
+    /// Pinned-host landing for `ids`.
+    pinned_ids: DevBuffer,
 }
 
 /// Persistent continuous-batching decode scratch sized for `cap` sequences.
@@ -664,6 +687,7 @@ impl Model {
             max_pages_per_seq,
             bufs,
             prefill_bufs: None,
+            verify_bufs: None,
             decode_graph: None,
             decode_rot_graph: None,
             batch_bufs: None,
@@ -2804,6 +2828,120 @@ impl Model {
             )));
         }
         Ok(id as u32)
+    }
+
+    /// Whether this model can run the linear speculative-decode path (SPEC §6):
+    /// the standard dense paged-KV forward only. Hybrid SSM (recurrent state not
+    /// in KV pages), routed MoE (no multi-token verify chain here), non-F16 KV,
+    /// KV tiering and the radix prefix cache are all excluded — the verify
+    /// forward appends draft K/V and rolls it back, which is only bit-clean and
+    /// side-effect-free on the plain F16 cache with no tier/prefix bookkeeping.
+    /// The batched verify logits also require an f16/q8_0 lm head.
+    pub fn speculation_eligible(&self) -> bool {
+        !self.is_hybrid()
+            && !self.weights.is_moe()
+            && matches!(self.kv.cfg.quant, KvQuant::F16)
+            && self.tier.is_none()
+            && self.prefix_cache.is_none()
+            && matches!(
+                self.weights.lm_head,
+                DevWeight::F16 { .. } | DevWeight::Q8_0 { .. }
+            )
+    }
+
+    /// Provision the verify-logit scratch for `cap` query positions (idempotent;
+    /// grows on a larger `cap`).
+    fn ensure_verify_bufs(&mut self, cap: usize) -> Result<()> {
+        if self.verify_bufs.as_ref().is_some_and(|b| b.cap >= cap) {
+            return Ok(());
+        }
+        let vocab = self.weights.descriptor.params.vocab_size;
+        self.verify_bufs = Some(VerifyBufs {
+            cap,
+            logits: self
+                .device
+                .alloc(cap * vocab * 4, MemKind::Device, Pool::Activations)?,
+            ids: self.device.alloc(cap * 4, MemKind::Device, Pool::Activations)?,
+            pinned_ids: self
+                .device
+                .alloc(cap * 4, MemKind::PinnedHost, Pool::Activations)?,
+        });
+        Ok(())
+    }
+
+    /// Verify one greedy speculative draft in a single forward (SPEC §6, linear
+    /// path). Runs the model over `[fed, draft…]` as a mini-prefill chunk
+    /// appended after the current position, greedy-argmaxes the logits at every
+    /// query position, and accepts the longest draft prefix whose token equals
+    /// the model's own argmax at the preceding position. The rejected draft
+    /// positions' K/V are rolled back, leaving `fed` + the accepted drafts
+    /// resident. Returns `(accepted, correction)`: the number of accepted draft
+    /// tokens and the model's argmax token at the first unaccepted position
+    /// (the correction when `accepted < draft.len()`, else the bonus token).
+    /// Caller must ensure `speculation_eligible()` and a greedy sampler, so the
+    /// accepted + correction tokens are exactly the greedy-decode output.
+    pub fn verify_greedy_draft(
+        &mut self,
+        seq: &mut SeqKv,
+        fed: u32,
+        draft: &[u32],
+    ) -> Result<(usize, u32)> {
+        debug_assert!(!draft.is_empty(), "verify called with an empty draft");
+        debug_assert!(draft.len() <= MAX_SPEC_DRAFT, "draft exceeds MAX_SPEC_DRAFT");
+        let vocab = self.weights.descriptor.params.vocab_size;
+        let t = draft.len() + 1;
+        self.ensure_verify_bufs(t)?;
+
+        let base = seq.len;
+        let mut batch = Vec::with_capacity(t);
+        batch.push(fed);
+        batch.extend_from_slice(draft);
+        // Mini-prefill: appends the fed token + draft K/V at positions
+        // base..base+t and leaves the [T, hidden] final normed hidden in the
+        // prefill scratch. Eligibility guarantees no tier/prefix bookkeeping, so
+        // this only grows the F16 cache (rolled back below).
+        self.prefill_forward(seq, &batch)?;
+
+        let stream = &self.stream;
+        let vb = self.verify_bufs.as_ref().expect("ensured above");
+        let pb = self.prefill_bufs.as_ref().expect("prefill_forward allocated");
+        // [T, vocab] logits, then one greedy argmax per row on the GPU (ties to
+        // the lowest id, matching the decode sampler); only T ids come back.
+        self.logits_gemm(&vb.logits, &pb.x, t, stream)?;
+        self.kernels
+            .sample_batched_argmax_f32(&vb.ids, &vb.logits, t, vocab, stream)?;
+        self.device
+            .copy(&vb.ids, 0, &vb.pinned_ids, 0, t * 4, stream)?;
+        self.device.synchronize()?;
+
+        let ptr = vb
+            .pinned_ids
+            .host_ptr()
+            .expect("pinned buffer has host mapping") as *const i32;
+        let argmax = unsafe { std::slice::from_raw_parts(ptr, t) };
+
+        // Position i's argmax is the model's own token for position base+i+1.
+        // Accept draft[i] while it matches; the first miss (or the bonus row
+        // when every draft is accepted) yields the correction token.
+        let mut accepted = 0usize;
+        let mut correction = 0u32;
+        for i in 0..t {
+            let am = argmax[i] as u32;
+            if i < draft.len() && am == draft[i] {
+                accepted += 1;
+            } else {
+                correction = am;
+                break;
+            }
+        }
+
+        // Keep fed + accepted drafts (accepted+1 positions from `base`); discard
+        // the rejected draft positions' K/V. The correction/bonus token is fed
+        // by the next step, so it is intentionally NOT resident yet.
+        self.kv.rollback(seq, base + accepted + 1);
+        // The device page table now lists freed tail slots; force a re-upload.
+        self.pt_seq = 0;
+        Ok((accepted, correction))
     }
 
     /// Record every launch of one decode step into a replayable graph.
