@@ -218,5 +218,6 @@ def attn_prefill[head_dim: Int, kv_dtype: DType](
 
 comptime attn_prefill_f16_hd64 = attn_prefill[64, DType.float16]
 comptime attn_prefill_f16_hd128 = attn_prefill[128, DType.float16]
+comptime attn_prefill_f16_hd256 = attn_prefill[256, DType.float16]
 comptime attn_prefill_fp8_hd64 = attn_prefill[64, DType.float8_e4m3fn]
 comptime attn_prefill_fp8_hd128 = attn_prefill[128, DType.float8_e4m3fn]

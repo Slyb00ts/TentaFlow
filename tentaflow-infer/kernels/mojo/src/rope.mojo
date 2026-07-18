@@ -36,3 +36,37 @@ def rope_neox_f16(
         x_io[base + j] = Float16(a * c - b * s)
         x_io[base + half + j] = Float16(a * s + b * c)
         j += Int(block_dim.x)
+
+
+def rope_neox_partial_f16(
+    x_io: UnsafePointer[Float16, MutAnyOrigin],
+    positions: UnsafePointer[Int32, MutAnyOrigin],
+    n_heads: Int,
+    head_dim: Int,
+    n_rot: Int,
+    theta_base: Float32,
+):
+    """Partial NEOX rotary: rotate only the first `n_rot` dims of each head,
+    pass the rest through unchanged. qwen35moe attention applies M-RoPE with
+    sections [11,11,10,0] (sum·2 = n_rot = 64) over head_dim 256; for text-only
+    positions M-RoPE reduces to this NEOX partial rotary. Pair (j, j+n_rot/2)
+    with inv_freq_j = theta_base^(-2j/n_rot). Layout matches rope_neox_f16
+    ([n_tokens, n_heads, head_dim]); grid.x = tokens, grid.y = heads.
+    """
+    token = Int(block_idx.x)
+    head = Int(block_idx.y)
+    half = n_rot // 2
+    base = (token * n_heads + head) * head_dim
+    pos = Float32(positions[token])
+
+    var j = Int(thread_idx.x)
+    while j < half:
+        freq = pow(theta_base, Float32(-2 * j) / Float32(n_rot))
+        angle = pos * freq
+        c = cos(angle)
+        s = sin(angle)
+        a = Float32(x_io[base + j])
+        b = Float32(x_io[base + half + j])
+        x_io[base + j] = Float16(a * c - b * s)
+        x_io[base + half + j] = Float16(a * s + b * c)
+        j += Int(block_dim.x)

@@ -263,6 +263,210 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Partial NEOX rotary: rotate only the first `n_rot` dims of each head
+    /// (qwen35moe M-RoPE reduces to this for text positions). Layout matches
+    /// `rope_neox_f16` ([n_tokens, n_heads, head_dim], in place).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_neox_partial_f16(
+        &self,
+        x_io: &DevBuffer,
+        positions: &DevBuffer,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_rot: usize,
+        theta_base: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("rope_neox_partial_f16")?;
+        let cfg = LaunchConfig {
+            grid: (n_tokens as u32, n_heads as u32, 1),
+            block: ((n_rot as u32 / 2).clamp(32, 256), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(x_io)
+            .buf(positions)
+            .scalar(n_heads as i64)
+            .scalar(head_dim as i64)
+            .scalar(n_rot as i64)
+            .scalar(theta_base);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Depthwise causal conv (width `d_conv`) + SiLU, one DeltaNet decode step.
+    /// `win_io` [conv_dim, d_conv-1] (oldest first) is advanced in place;
+    /// `weight` is ggml ssm_conv1d {d_conv, conv_dim} flattened. Grid-stride
+    /// over channels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_conv_silu_f16(
+        &self,
+        out: &DevBuffer,
+        win_io: &DevBuffer,
+        x_new: &DevBuffer,
+        weight: &DevBuffer,
+        conv_dim: usize,
+        d_conv: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("deltanet_conv_silu_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((conv_dim as u32).div_ceil(256).min(256), 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(win_io)
+            .buf(x_new)
+            .buf(weight)
+            .scalar(conv_dim as i64)
+            .scalar(d_conv as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Per-head L2 normalization (out = x / sqrt(Σx² + eps)); one block per
+    /// head, block covers `d_state`. Used on the DeltaNet conv q/k heads.
+    pub fn l2norm_heads_f16(
+        &self,
+        out: &DevBuffer,
+        x_in: &DevBuffer,
+        n_heads: usize,
+        d_state: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("l2norm_heads_f16")?;
+        let cfg = LaunchConfig {
+            grid: (n_heads as u32, 1, 1),
+            block: ((d_state as u32).clamp(32, 1024), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(x_in)
+            .scalar(d_state as i64)
+            .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// One Gated-DeltaNet recurrence step per value-head (grid = n_v_heads,
+    /// block = d_state). `state_io` [n_v_heads, d_state, d_state] f32 is
+    /// updated in place; q/k must already be L2-normed and repeated to
+    /// n_v_heads. `g`/`beta` are the per-head log-decay / write gate (f32).
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_gated_step_f16(
+        &self,
+        out: &DevBuffer,
+        state_io: &DevBuffer,
+        q: &DevBuffer,
+        k: &DevBuffer,
+        v: &DevBuffer,
+        g: &DevBuffer,
+        beta: &DevBuffer,
+        n_v_heads: usize,
+        d_state: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if d_state > 1024 {
+            return Err(ForgeError::Kernel(format!(
+                "deltanet_gated_step: d_state {d_state} exceeds shared staging (1024)"
+            )));
+        }
+        let k_art = self.artifacts.get("deltanet_gated_step_f16")?;
+        let cfg = LaunchConfig {
+            grid: (n_v_heads as u32, 1, 1),
+            block: (d_state as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(state_io)
+            .buf(q)
+            .buf(k)
+            .buf(v)
+            .buf(g)
+            .buf(beta)
+            .scalar(d_state as i64);
+        self.device.launch(k_art, &cfg, &args, stream)
+    }
+
+    /// Output gated RMSNorm per value-head: out = rmsnorm(o, weight)·silu(z).
+    /// One block per head, block covers `d_state`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_gated_rmsnorm_f16(
+        &self,
+        out: &DevBuffer,
+        o_in: &DevBuffer,
+        z_in: &DevBuffer,
+        weight: &DevBuffer,
+        n_v_heads: usize,
+        d_state: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("deltanet_gated_rmsnorm_f16")?;
+        let cfg = LaunchConfig {
+            grid: (n_v_heads as u32, 1, 1),
+            block: ((d_state as u32).clamp(32, 1024), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(o_in)
+            .buf(z_in)
+            .buf(weight)
+            .scalar(d_state as i64)
+            .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Per-head DeltaNet log-decay g = softplus(alpha + dt_bias)·a (f32 out).
+    pub fn deltanet_log_decay_f32(
+        &self,
+        g_out: &DevBuffer,
+        alpha_in: &DevBuffer,
+        dt_bias: &DevBuffer,
+        a_scale: &DevBuffer,
+        n_v_heads: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("deltanet_log_decay_f32")?;
+        let cfg = LaunchConfig {
+            grid: ((n_v_heads as u32).div_ceil(256), 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(g_out)
+            .buf(alpha_in)
+            .buf(dt_bias)
+            .buf(a_scale)
+            .scalar(n_v_heads as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Per-head DeltaNet write gate beta = sigmoid(beta_proj) (f32 out).
+    pub fn deltanet_beta_sigmoid_f32(
+        &self,
+        beta_out: &DevBuffer,
+        beta_in: &DevBuffer,
+        n_v_heads: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("deltanet_beta_sigmoid_f32")?;
+        let cfg = LaunchConfig {
+            grid: ((n_v_heads as u32).div_ceil(256), 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(beta_out)
+            .buf(beta_in)
+            .scalar(n_v_heads as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// y = W·x with W in GGML Q8_0 blocks, x/y f16. One block per output row.
     pub fn gemv_q8_0_f16(
         &self,
@@ -1209,10 +1413,13 @@ impl Kernels {
         stream: &Stream,
     ) -> Result<()> {
         let suffix = Self::kv_suffix(kv_dtype, "attn_prefill")?;
-        let name = match head_dim {
-            64 => format!("attn_prefill_{suffix}_hd64"),
-            128 => format!("attn_prefill_{suffix}_hd128"),
-            other => {
+        let name = match (head_dim, kv_dtype) {
+            (64, _) => format!("attn_prefill_{suffix}_hd64"),
+            (128, _) => format!("attn_prefill_{suffix}_hd128"),
+            // Only the f16 cache has an hd256 specialization (qwen35moe
+            // attention layers); fp8/rot hd256 is not compiled.
+            (256, DType::F16) => format!("attn_prefill_{suffix}_hd256"),
+            (other, _) => {
                 return Err(ForgeError::Unsupported(format!(
                     "attn_prefill: head_dim {other} has no compiled specialization"
                 )))
@@ -1485,6 +1692,7 @@ impl Kernels {
         let name = match head_dim {
             64 => "attn_decode_f16_hd64",
             128 => "attn_decode_f16_hd128",
+            256 => "attn_decode_f16_hd256",
             other => {
                 return Err(ForgeError::Unsupported(format!(
                     "attn_decode: head_dim {other} has no compiled specialization"

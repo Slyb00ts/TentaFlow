@@ -304,11 +304,21 @@ Uwaga metodyczna: prefill mierzony do pierwszego WIDOCZNEGO tokenu (zawiera
   `head_dim*n_heads*2`), per-head QK-norm.
 - **Referencja CPU Gated-DeltaNet** (`forge-formats::deltanet`): causal conv1d,
   reguła delta z bramkowaniem (krok autoregresyjny), gated-RMSNorm — numeryczne
-  oracle dla przyszłego kernela/silnika.
-- **Nie generuje jeszcze**: brak kerneli Mojo (hd256 attention, conv1d_k4,
-  recurrent scan, gated norm), stanu SSM w `SeqKv` i hybrydowego forwardu w
-  silniku. `forge run qwen36-moe.gguf …` kończy się jasnym błędem ładowania
-  (warstwy DeltaNet nie mają tensorów attn_q/k/v) — NIE generuje śmieci.
+  oracle dla kernela/silnika.
+- **Kernele Mojo GOTOWE i zwalidowane** (`kernels/mojo/src/deltanet.mojo`,
+  hd256 w `attention.mojo`/`prefill.mojo`, partial M-RoPE w `rope.mojo`):
+  `deltanet_conv_silu_f16`, `l2norm_heads_f16`, `deltanet_gated_step_f16`,
+  `deltanet_gated_rmsnorm_f16`, `deltanet_log_decay_f32`,
+  `deltanet_beta_sigmoid_f32`, `attn_decode_f16_hd256`, `attn_prefill_f16_hd256`,
+  `rope_neox_partial_f16`. PTX + manifest przebudowane, typowane launchery +
+  registry w `forge-kernels` (build + clippy czyste). Test numeryczny vs
+  `deltanet.rs` (`test_deltanet.mojo`) przechodzi w tolerancji f16.
+- **Nie generuje jeszcze**: brak stanu SSM w `SeqKv` (alokacja/lifecycle
+  rezydentnego stanu) i hybrydowego forwardu per-`LayerKind` w silniku
+  (`model.rs`) + per-`LayerKind` loader w `weights.rs` (warstwy DeltaNet ładują
+  in-proj/conv/A_log/dt/beta/alpha/norm/out; atencja — bramkowane Q + QK-norm).
+  `forge run qwen36-moe.gguf …` kończy się jasnym błędem ładowania (warstwy
+  DeltaNet nie mają tensorów attn_q/k/v) — NIE generuje śmieci.
 
 ## Ograniczenia znane (uczciwie)
 

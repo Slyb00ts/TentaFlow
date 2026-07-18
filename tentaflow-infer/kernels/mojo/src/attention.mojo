@@ -125,6 +125,10 @@ def attn_decode_f16[head_dim: Int](
 
 comptime attn_decode_f16_hd64 = attn_decode_f16[64]
 comptime attn_decode_f16_hd128 = attn_decode_f16[128]
+# qwen35moe full-attention layers use head_dim 256 (n_embd_head_k). RoPE, QK
+# norm and the paged append run as separate launches for this arch, so the
+# plain (non-fused) decode/prefill specializations are the ones wired in.
+comptime attn_decode_f16_hd256 = attn_decode_f16[256]
 
 
 def attn_decode_split[head_dim: Int, kv_dtype: DType](

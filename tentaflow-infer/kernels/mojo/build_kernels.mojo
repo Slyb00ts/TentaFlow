@@ -15,7 +15,16 @@ from src.norm import rmsnorm_f16, rmsnorm_residual_f16
 from src.activation import silu_mul_f16
 from src.rope import rope_neox_f16
 from src.gemv import gemv_q8_0_f16, gemv_f16
-from src.attention import attn_decode_f16_hd64, attn_decode_f16_hd128
+from src.attention import attn_decode_f16_hd64, attn_decode_f16_hd128, attn_decode_f16_hd256
+from src.rope import rope_neox_partial_f16
+from src.deltanet import (
+    deltanet_conv_silu_f16,
+    l2norm_heads_f16,
+    deltanet_gated_step_f16,
+    deltanet_gated_rmsnorm_f16,
+    deltanet_log_decay_f32,
+    deltanet_beta_sigmoid_f32,
+)
 from src.nvfp4 import gemv_nvfp4_f16
 from src.misc import gather_rows_f16, gemv_f16_out_f32, gemv_q8_0_out_f32
 from src.layernorm import layernorm_f16, layernorm_residual_f16
@@ -32,7 +41,7 @@ from src.gemm import gemm_f16_out_f32, gemm_f16_out_f32_bm64
 from src.gemm import gemm_q8_0_out_f32, gemm_q8_0_out_f32_bm64
 from src.gemm import gemm_q4_k_f16, gemm_q4_k_f16_bm64
 from src.gemm import gemm_q6_k_f16, gemm_q6_k_f16_bm64
-from src.prefill import kv_append_batch_f16, attn_prefill_f16_hd64, attn_prefill_f16_hd128
+from src.prefill import kv_append_batch_f16, attn_prefill_f16_hd64, attn_prefill_f16_hd128, attn_prefill_f16_hd256
 from src.prefill import kv_append_batch_fp8, attn_prefill_fp8_hd64, attn_prefill_fp8_hd128
 from src.qkv_post import qkv_post_f16
 from src.attention import attn_decode_split_f16_hd64, attn_decode_split_f16_hd128
@@ -183,6 +192,30 @@ def main() raises:
     _ = ctx.compile_function[attn_decode_f16_hd128, dump_asm=Path("attn_decode_f16_hd128.ptx")]()
     entries.append(_finalize(out_dir, "attn_decode_f16_hd128"))
 
+    _ = ctx.compile_function[attn_decode_f16_hd256, dump_asm=Path("attn_decode_f16_hd256.ptx")]()
+    entries.append(_finalize(out_dir, "attn_decode_f16_hd256"))
+
+    _ = ctx.compile_function[rope_neox_partial_f16, dump_asm=Path("rope_neox_partial_f16.ptx")]()
+    entries.append(_finalize(out_dir, "rope_neox_partial_f16"))
+
+    _ = ctx.compile_function[deltanet_conv_silu_f16, dump_asm=Path("deltanet_conv_silu_f16.ptx")]()
+    entries.append(_finalize(out_dir, "deltanet_conv_silu_f16"))
+
+    _ = ctx.compile_function[l2norm_heads_f16, dump_asm=Path("l2norm_heads_f16.ptx")]()
+    entries.append(_finalize(out_dir, "l2norm_heads_f16"))
+
+    _ = ctx.compile_function[deltanet_gated_step_f16, dump_asm=Path("deltanet_gated_step_f16.ptx")]()
+    entries.append(_finalize(out_dir, "deltanet_gated_step_f16"))
+
+    _ = ctx.compile_function[deltanet_gated_rmsnorm_f16, dump_asm=Path("deltanet_gated_rmsnorm_f16.ptx")]()
+    entries.append(_finalize(out_dir, "deltanet_gated_rmsnorm_f16"))
+
+    _ = ctx.compile_function[deltanet_log_decay_f32, dump_asm=Path("deltanet_log_decay_f32.ptx")]()
+    entries.append(_finalize(out_dir, "deltanet_log_decay_f32"))
+
+    _ = ctx.compile_function[deltanet_beta_sigmoid_f32, dump_asm=Path("deltanet_beta_sigmoid_f32.ptx")]()
+    entries.append(_finalize(out_dir, "deltanet_beta_sigmoid_f32"))
+
     _ = ctx.compile_function[gemv_nvfp4_f16, dump_asm=Path("gemv_nvfp4_f16.ptx")]()
     entries.append(_finalize(out_dir, "gemv_nvfp4_f16"))
 
@@ -269,6 +302,9 @@ def main() raises:
 
     _ = ctx.compile_function[attn_prefill_f16_hd128, dump_asm=Path("attn_prefill_f16_hd128.ptx")]()
     entries.append(_finalize(out_dir, "attn_prefill_f16_hd128"))
+
+    _ = ctx.compile_function[attn_prefill_f16_hd256, dump_asm=Path("attn_prefill_f16_hd256.ptx")]()
+    entries.append(_finalize(out_dir, "attn_prefill_f16_hd256"))
 
     _ = ctx.compile_function[kv_append_batch_fp8, dump_asm=Path("kv_append_batch_fp8.ptx")]()
     entries.append(_finalize(out_dir, "kv_append_batch_fp8"))

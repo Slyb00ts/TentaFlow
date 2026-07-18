@@ -61,12 +61,22 @@ Ostatnia aktualizacja: 2026-07-18.
     conv1d (dowolne K) + reguła delta z bramkowaniem (autoregresyjny krok,
     dokładny port `delta-net-base.cpp`) + gated-RMSNorm + log-decay/softplus +
     L2-norm; testy numeryczne. To oracle dla kernela Mojo i silnika.
-  - ❌ **Kernele Mojo**: hd256 flash-attention (decode split + prefill + combine,
-    obecnie tylko hd64/hd128), depthwise conv1d_k4, recurrent Gated-DeltaNet scan,
-    gated-RMSNorm, partial M-RoPE dla hd256. Wymaga PTX rebuild + launchery + golden.
+  - ✅ **Kernele Mojo** (`kernels/mojo/src/deltanet.mojo` + hd256 w
+    `attention.mojo`/`prefill.mojo` + partial M-RoPE w `rope.mojo`): depthwise
+    `deltanet_conv_silu_f16` (causal conv1d_k4 + SiLU, okno w miejscu),
+    `l2norm_heads_f16` (L2-norm per głowa), `deltanet_gated_step_f16` (rekurencyjny
+    scan Gated-DeltaNet per v-head, stan `[n_v_heads, d_state, d_state]` f32 w
+    miejscu), `deltanet_gated_rmsnorm_f16`, `deltanet_log_decay_f32` (softplus·a),
+    `deltanet_beta_sigmoid_f32`, `attn_decode_f16_hd256` + `attn_prefill_f16_hd256`,
+    `rope_neox_partial_f16` (rotacja tylko pierwszych `n_rot=64` wymiarów). PTX +
+    manifest przebudowane; launchery + wpisy w `forge-kernels` (registry.rs,
+    launchers.rs), build + clippy czyste. Testy numeryczne vs `deltanet.rs`
+    (`kernels/mojo/test_deltanet.mojo`): conv 7.7e-5, l2norm 5.9e-5, delta_step
+    1.2e-4 / state 2.4e-7, gated_rmsnorm 4.8e-4, log_decay 9.2e-8, beta 3.0e-8 —
+    wszystko w tolerancji f16.
   - ❌ **Stan SSM w KV** (`SeqKv`): rezydentny bufor stanu `[n_v_heads, d_state,
     d_state]` + `[conv_dim, d_conv-1]` per warstwa DeltaNet, obok paged KV dla
-    warstw atencji.
+    warstw atencji. (Launchery kerneli gotowe, brak alokacji/lifecycle w silniku.)
   - ❌ **Forward hybrydowy w silniku**: dispatch per-`LayerKind`, bramkowana
     atencja hd256, ścieżka DeltaNet (conv+scan+gated norm), MoE z shared expert
     w tej ścieżce, prefill sekwencyjny + decode. Cel bramki: spójny tekst
