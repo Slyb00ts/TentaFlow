@@ -12,6 +12,7 @@ Ostatnia aktualizacja: 2026-07-18.
 ## Komendy
 
 ```
+forge pull        # pobranie modelu z HuggingFace Hub (GGUF lub snapshot)
 forge serve       # serwer HTTP z OpenAI-compatible API
 forge run         # jednorazowa generacja do stdout (streaming)
 forge bench       # pomiar prefill/decode tok/s
@@ -217,6 +218,48 @@ mono), `language` (np. `pl`; ignorowane dla modeli `.en`).
 
 ---
 
+## forge pull
+
+Pobiera model z HuggingFace Hub i wypisuje na stdout finalną ścieżkę do podania
+do `forge run` / `forge serve` (reszta logów idzie na stderr, więc ścieżkę można
+podstawić w skrypcie).
+
+```
+forge pull <repo> [--file <name>] [--revision <rev>] [--token <hf_token>] [--dir <dest>]
+```
+
+| Flaga | Domyślnie | Opis |
+|---|---|---|
+| `<repo>` (pozycyjny) | — | Repo HF, np. `Qwen/Qwen3-0.6B-GGUF` albo `bartowski/...`. |
+| `--file <name>` | auto | Konkretny plik GGUF (nazwa lub pełna ścieżka w repo, case-insensitive). Wymagany, gdy repo ma wiele kwantyzacji i brak domyślnego `Q4_K_M`. Nieużywany dla snapshotów safetensors. |
+| `--revision <rev>` | `main` | Gałąź, tag lub commit git. |
+| `--token <hf_token>` | `HF_TOKEN` | Token do repo gated/prywatnych (`Authorization: Bearer`). Gdy pominięty, brany z env `HF_TOKEN`. |
+| `--dir <dest>` | cache XDG | Katalog docelowy. Domyślnie `$XDG_CACHE_HOME/forge/hub/<repo>` (lub `~/.cache/...`). Dla snapshotu pliki układane jak checkout HF (config.json + tokenizer.json + `*.safetensors`), tak że loader czyta je wprost. |
+
+Zachowanie:
+
+- **Repo GGUF** → pobiera jeden plik. Jeden GGUF w repo = brany automatycznie;
+  wiele = wybierany domyślny `Q4_K_M` (z komunikatem) albo wymagany `--file`
+  (błąd listuje dostępne kwantyzacje z rozmiarami).
+- **Snapshot safetensors** → pobiera `config.json`, `tokenizer.json`,
+  `tokenizer_config.json`, `generation_config.json`, `*.safetensors` (+ index dla
+  shardowanych), szablon czatu i pozostałe metadane tokenizera. Repo bez
+  `.safetensors`/`.gguf` lub bez `config.json` jest odrzucane.
+- **Resume**: przerwane pobranie wznawia się z `<plik>.part` przez HTTP Range
+  (`bytes=N-`); serwer ignorujący Range (200 zamiast 206) → restart od zera.
+  Postęp (MB / MB, %, MB/s) leci na stderr.
+- **Integralność**: pliki LFS weryfikowane po sha256 (`lfs.oid`), pozostałe po
+  długości bajtowej. Zapis atomowy: `.part` → `rename` dopiero po weryfikacji.
+- **Auth**: `401` → podpowiedź o `--token`/`HF_TOKEN`; `403` → podpowiedź o
+  akceptacji licencji gated na stronie repo.
+
+Przykład (pobierz i uruchom):
+
+```
+forge pull Qwen/Qwen3-0.6B-GGUF --file Qwen3-0.6B-Q8_0.gguf --dir /tmp/qwen
+forge run /tmp/qwen/Qwen3-0.6B-Q8_0.gguf "Hi" -n 4
+```
+
 ## forge run
 
 | Flaga | Domyślnie | Opis |
@@ -260,6 +303,7 @@ Uwaga metodyczna: prefill mierzony do pierwszego WIDOCZNEGO tokenu (zawiera
 | `FORGE_KERNEL_DIR` | Ścieżka do `kernels/mojo/build` — nadpisuje wbudowane artefakty PTX (iteracja nad kernelami bez rebuildu Rusta). |
 | `FORGE_BATCH_MIN` | Nadpisuje próg `--batch-min` (diagnostyka). |
 | `FORGE_PREFILL_TRACE=1` | Wypisuje czasy faz prefill_chunk (profilowanie). |
+| `HF_TOKEN` | Token HuggingFace dla `forge pull` (repo gated/prywatne), gdy brak `--token`. |
 | `RUST_LOG` | Standardowy filtr tracing (`info` domyślnie, na stderr). |
 
 ---

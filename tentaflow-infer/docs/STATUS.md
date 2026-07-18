@@ -173,7 +173,9 @@ Ostatnia aktualizacja: 2026-07-18.
 ### Produkcja
 - ❌ **§9.3 Multi-tenancy**: OIDC/JWT, kwoty/rate-limit, fair-share scheduler,
   izolacja prefix-cache per tenant
-- ❌ **§9.4 forge pull** (HF Hub download), **auto-planner**, **forge convert** (kwantyzator)
+- ✅ **§9.4 forge pull** (HF Hub download: GGUF + snapshot safetensors, gated
+  `--token`/`HF_TOKEN`, resume przez HTTP Range, weryfikacja sha256/rozmiaru,
+  zapis atomowy `.part`); ❌ **auto-planner**, ❌ **forge convert** (kwantyzator)
 - ❌ **§9.5 Dystrybucja**: obrazy OCI, pakiet pip, podpisy artefaktów, SBOM, fuzzing
 - ❌ **§10 Bramki jakości CI**: lm-eval-harness, PPL gate, nightly benchmark farm
 

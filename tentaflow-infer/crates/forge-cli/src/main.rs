@@ -1,5 +1,7 @@
 // ===== File: main.rs — `forge` CLI: serve an OpenAI API, run one-shot generation, benchmark =====
 
+mod hf;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,6 +33,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Download a model from the HuggingFace Hub (GGUF file or safetensors snapshot).
+    Pull {
+        /// HF repo id, e.g. `Qwen/Qwen3-0.6B-GGUF` or `bartowski/...`.
+        repo: String,
+        /// Specific GGUF file to fetch (required when a repo has multiple quants
+        /// and no Q4_K_M default). Ignored for safetensors snapshots.
+        #[arg(long)]
+        file: Option<String>,
+        /// Git revision (branch, tag, or commit).
+        #[arg(long, default_value = "main")]
+        revision: String,
+        /// HuggingFace token for gated/private repos (else uses HF_TOKEN).
+        #[arg(long)]
+        token: Option<String>,
+        /// Destination directory (default: XDG cache under forge/hub/<repo>).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
     /// Serve an OpenAI-compatible HTTP API for one model.
     Serve {
         /// GGUF file or HF snapshot directory.
@@ -261,6 +281,13 @@ fn main() -> Result<()> {
         .init();
 
     match Cli::parse().command {
+        Command::Pull {
+            repo,
+            file,
+            revision,
+            token,
+            dir,
+        } => cmd_pull(repo, file, revision, token, dir),
         Command::Serve {
             model_path,
             bind,
@@ -407,6 +434,26 @@ fn main() -> Result<()> {
             )
         }
     }
+}
+
+/// Download a model from the HuggingFace Hub and print the path to pass to
+/// `forge run` / `forge serve`. Runs the async downloader on a lightweight
+/// current-thread runtime (no GPU / engine needed).
+fn cmd_pull(
+    repo: String,
+    file: Option<String>,
+    revision: String,
+    token: Option<String>,
+    dir: Option<PathBuf>,
+) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build download runtime")?;
+    let path = rt.block_on(hf::pull(repo, file, revision, token, dir))?;
+    eprintln!("done. run it with:");
+    println!("{}", path.display());
+    Ok(())
 }
 
 fn parse_kv_quant(s: &str, residual_window: usize, activate_at: usize) -> Result<KvQuant> {
