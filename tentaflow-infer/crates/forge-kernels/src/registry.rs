@@ -144,6 +144,8 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "attn_decode_rot_hd64_b3",
     "attn_decode_rot_hd128_b4",
     "attn_decode_rot_hd128_b3",
+    "attn_decode_combine_rot_hd64",
+    "attn_decode_combine_rot_hd128",
     "attn_prefill_rot_hd64_b4",
     "attn_prefill_rot_hd64_b3",
     "attn_prefill_rot_hd128_b4",

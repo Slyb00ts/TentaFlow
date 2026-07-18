@@ -2273,9 +2273,11 @@ impl Kernels {
 
     /// Rotate+quant+pack a batch of T linear (rope'd) K/V rows
     /// ([n_tokens, n_kv_heads, head_dim] f16) into the paged rotational store at
-    /// positions base_pos..base_pos+T, writing the rotated f16 vectors into the
-    /// residual ring at `pos % ring_slots` (the recent-window fidelity copy the
-    /// decode attention reads directly). Grid (T, n_kv_heads).
+    /// the absolute positions in `positions` ([T] i32, one per token), writing
+    /// the rotated f16 vectors into the residual ring at `pos % ring_slots` (the
+    /// recent-window fidelity copy the decode attention reads directly). Reading
+    /// the position from a device buffer keeps decode launches graph-capturable.
+    /// Grid (T, n_kv_heads).
     #[allow(clippy::too_many_arguments)]
     pub fn kv_pack_rot(
         &self,
@@ -2290,7 +2292,7 @@ impl Kernels {
         v_in: &DevBuffer,
         v_in_byte_off: usize,
         page_table: &DevBuffer,
-        base_pos: usize,
+        positions: &DevBuffer,
         n_tokens: usize,
         n_kv_heads: usize,
         page_size: usize,
@@ -2316,23 +2318,26 @@ impl Kernels {
             .buf_at(k_in, k_in_byte_off)?
             .buf_at(v_in, v_in_byte_off)?
             .buf(page_table)
-            .scalar(base_pos as i64)
+            .buf(positions)
             .scalar(n_kv_heads as i64)
             .scalar(page_size as i64)
             .scalar(ring_slots as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 
-    /// Rotational low-bit decode attention over the dual-region store: reads the
-    /// residual f16 ring for the recent `ring_slots` positions (rotated f16, no
-    /// unpack) and the packed 3/4-bit store for everything older. Rotates q once,
-    /// scores in rotated space ((R·q)·k_rot = q·k), and inverse-rotates the V
-    /// accumulator once per head. `ring_slots == 0` degrades to packed-only.
-    /// One warp per (seq,head).
+    /// Split-K rotational low-bit decode attention over the dual-region store:
+    /// reads the residual f16 ring for the recent `ring_slots` positions (rotated
+    /// f16, no unpack) and the packed 3/4-bit store for everything older. Rotates
+    /// q once (block-cooperative WHT), scores in rotated space
+    /// ((R·q)·k_rot = q·k), and writes each (seq, head, split) an UNNORMALIZED
+    /// rotated partial to `parts` ([n_seqs, n_q_heads, n_splits, head_dim + 2]
+    /// f32). `attn_decode_combine_rot` merges the splits and inverse-rotates.
+    /// `ring_slots == 0` degrades to packed-only. Grid (n_seqs, n_q_heads,
+    /// n_splits); block ATTN_BLOCK.
     #[allow(clippy::too_many_arguments)]
     pub fn attn_decode_rot(
         &self,
-        out: &DevBuffer,
+        parts: &DevBuffer,
         q: &DevBuffer,
         q_byte_off: usize,
         k_packed: &DevBuffer,
@@ -2349,6 +2354,7 @@ impl Kernels {
         head_dim: usize,
         page_size: usize,
         max_pages: usize,
+        n_splits: usize,
         ring_slots: usize,
         bits: u8,
         scale: f32,
@@ -2357,12 +2363,12 @@ impl Kernels {
         let name = Self::rot_kernel_name("attn_decode_rot", head_dim, bits)?;
         let k = self.artifacts.get(&name)?;
         let cfg = LaunchConfig {
-            grid: (n_seqs as u32, n_q_heads as u32, 1),
-            block: (32, 1, 1),
+            grid: (n_seqs as u32, n_q_heads as u32, n_splits as u32),
+            block: (ATTN_BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
-            .buf(out)
+            .buf(parts)
             .buf_at(q, q_byte_off)?
             .buf(k_packed)
             .buf(v_packed)
@@ -2376,8 +2382,46 @@ impl Kernels {
             .scalar(n_kv_heads as i64)
             .scalar(page_size as i64)
             .scalar(max_pages as i64)
+            .scalar(n_splits as i64)
             .scalar(ring_slots as i64)
             .scalar(scale);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Merge attn_decode_rot's per-split rotated partials into the final
+    /// [n_seqs, n_q_heads, head_dim] f16 output and inverse-rotate once per head
+    /// (one warp per head, split order). Head_dim {64,128}.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode_combine_rot(
+        &self,
+        out: &DevBuffer,
+        parts: &DevBuffer,
+        n_seqs: usize,
+        n_q_heads: usize,
+        head_dim: usize,
+        n_splits: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let name = match head_dim {
+            64 => "attn_decode_combine_rot_hd64",
+            128 => "attn_decode_combine_rot_hd128",
+            other => {
+                return Err(ForgeError::Unsupported(format!(
+                    "attn_decode_combine_rot: head_dim {other} has no compiled specialization"
+                )))
+            }
+        };
+        let k = self.artifacts.get(name)?;
+        let cfg = LaunchConfig {
+            grid: (n_seqs as u32, n_q_heads as u32, 1),
+            block: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(parts)
+            .scalar(n_q_heads as i64)
+            .scalar(n_splits as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
 

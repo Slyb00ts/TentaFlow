@@ -146,6 +146,10 @@ pub struct Model {
     prefill_bufs: Option<PrefillBufs>,
     /// Captured decode step; replayed per token (inputs are device-resident).
     decode_graph: Option<ExecGraph>,
+    /// Captured rotational (rot4/rot3) decode step; replayed per token. The
+    /// pack kernel reads the token position from `bufs.pos`, so the whole
+    /// dual-region chain is position-independent and graph-capturable.
+    decode_rot_graph: Option<ExecGraph>,
     /// Continuous-batching decode scratch (sized for `batch_cap` sequences),
     /// allocated on the first `ensure_batch`.
     batch_bufs: Option<BatchBufs>,
@@ -397,6 +401,7 @@ impl Model {
             bufs,
             prefill_bufs: None,
             decode_graph: None,
+            decode_rot_graph: None,
             batch_bufs: None,
             batch_graphs: HashMap::new(),
             batch_cap: 0,
@@ -1386,7 +1391,7 @@ impl Model {
                     &pb.v,
                     0,
                     &self.page_table_dev,
-                    base_pos,
+                    &pb.positions,
                     t,
                     p.n_kv_heads,
                     self.kv.cfg.page_size,
@@ -1699,11 +1704,21 @@ impl Model {
             )?;
         }
 
-        // Rot decode reads the packed low-bit store through attn_decode_rot and
-        // commits the current token with a host-known position, so it runs
-        // directly on the stream (not through the position-baked decode graph).
+        // Rot decode commits the current token into the packed store + ring and
+        // reads it back through the split-K attn_decode_rot. The pack kernel
+        // takes the token position from `bufs.pos` (device-resident), so the
+        // chain is position-independent and captured once like the f16 path.
         if self.kv.cfg.quant.is_rot() {
-            return self.run_decode_rot(pos);
+            if self.decode_rot_graph.is_none() {
+                let graph = self.capture_decode_rot()?;
+                self.decode_rot_graph = Some(graph);
+            }
+            let graph = self
+                .decode_rot_graph
+                .as_ref()
+                .expect("captured above")
+                .clone();
+            return self.device.launch_graph(&graph, &self.stream);
         }
 
         if self.decode_graph.is_none() {
@@ -1714,13 +1729,30 @@ impl Model {
         self.device.launch_graph(&graph, &self.stream)
     }
 
+    /// Capture the rotational decode step into a replayable graph. The recorded
+    /// launches read all per-step inputs (token id, position, seq len, page
+    /// table) from device buffers refreshed before each replay, so one capture
+    /// serves every token.
+    fn capture_decode_rot(&self) -> Result<ExecGraph> {
+        self.device.begin_capture(&self.stream)?;
+        let recorded = self.record_decode_rot();
+        match recorded {
+            Ok(()) => self.device.end_capture(&self.stream),
+            Err(e) => {
+                let _ = self.device.end_capture(&self.stream);
+                Err(e)
+            }
+        }
+    }
+
     /// One decode step for the rotational KV modes. Mirrors the non-fused
-    /// decode chain (explicit rmsnorm → qkv → norm/rope → paged f16 append)
-    /// but commits the appended token into the packed low-bit store and reads
-    /// it back through attn_decode_rot (rotate q once, score in rotated space,
-    /// inverse-rotate the V accumulator). Runs directly on the stream; the
-    /// current position `base_pos` is a host value, so no CUDA-graph capture.
-    fn run_decode_rot(&self, base_pos: usize) -> Result<()> {
+    /// decode chain (explicit rmsnorm → qkv → norm/rope) but commits the
+    /// appended token into the packed low-bit store + residual ring and reads
+    /// it back through the split-K attn_decode_rot / attn_decode_combine_rot
+    /// pair (rotate q once, score in rotated space, inverse-rotate the V
+    /// accumulator). The pack kernel takes the position from `bufs.pos`, so this
+    /// records cleanly into a CUDA graph.
+    fn record_decode_rot(&self) -> Result<()> {
         let p = self.weights.descriptor.params.clone();
         let hidden = p.hidden_size;
         let inter = p.intermediate_size;
@@ -1813,16 +1845,21 @@ impl Model {
                 &self.kv.k[l], &self.kv.v[l],
                 k_src, k_off, v_src, v_off,
                 &self.page_table_dev,
-                base_pos, 1, p.n_kv_heads, self.kv.cfg.page_size, p.head_dim, ring_slots, bits, stream,
+                &self.bufs.pos, 1, p.n_kv_heads, self.kv.cfg.page_size, p.head_dim, ring_slots, bits, stream,
             )?;
             kernels.attn_decode_rot(
-                &b.attn_out, q_buf, q_off,
+                &b.attn_parts, q_buf, q_off,
                 &self.kv.k_packed[l], &self.kv.v_packed[l],
                 &self.kv.k_scale[l], &self.kv.v_scale[l],
                 &self.kv.k[l], &self.kv.v[l],
                 &self.page_table_dev, &self.seq_len_dev,
                 1, p.n_heads, p.n_kv_heads, p.head_dim,
-                self.kv.cfg.page_size, self.max_pages_per_seq, ring_slots, bits, scale, stream,
+                self.kv.cfg.page_size, self.max_pages_per_seq,
+                ATTN_DECODE_SPLITS, ring_slots, bits, scale, stream,
+            )?;
+            kernels.attn_decode_combine_rot(
+                &b.attn_out, &b.attn_parts,
+                1, p.n_heads, p.head_dim, ATTN_DECODE_SPLITS, stream,
             )?;
 
             self.gemv(&b.o_out, &layer.attn_o, &b.attn_out, stream)?;

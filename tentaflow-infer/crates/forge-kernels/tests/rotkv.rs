@@ -98,11 +98,18 @@ fn run_bits(kernels: &Kernels, dev: &dyn Device, bits: u8) -> f64 {
     // never dereferenced), locking the low-bit decode math on its own.
     let k_ring = dev.alloc(HD * 2, MemKind::Device, Pool::Weights).unwrap();
     let v_ring = dev.alloc(HD * 2, MemKind::Device, Pool::Weights).unwrap();
+    const N_SPLITS: usize = 4;
+    let parts = dev
+        .alloc(N_SPLITS * (HD + 2) * 4, MemKind::Device, Pool::Weights)
+        .unwrap();
     kernels
         .attn_decode_rot(
-            &out, &q_buf, 0, &k_packed, &v_packed, &k_scale, &v_scale, &k_ring, &v_ring, &pt,
-            &seq_lens, 1, 1, 1, HD, PAGE, NPAGES, 0, bits, scale, &stream,
+            &parts, &q_buf, 0, &k_packed, &v_packed, &k_scale, &v_scale, &k_ring, &v_ring, &pt,
+            &seq_lens, 1, 1, 1, HD, PAGE, NPAGES, N_SPLITS, 0, bits, scale, &stream,
         )
+        .unwrap();
+    kernels
+        .attn_decode_combine_rot(&out, &parts, 1, 1, HD, N_SPLITS, &stream)
         .unwrap();
     dev.synchronize().unwrap();
 

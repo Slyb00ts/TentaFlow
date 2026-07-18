@@ -10,10 +10,11 @@
 from std.gpu.host import DeviceContext
 from std.math import sqrt, log, cos, pi, exp
 from src.rotkv import (
-    kv_pack_rot_hd128_b4,
-    kv_pack_rot_hd128_b3,
+    kv_pack_rot_from_cache_hd128_b4,
+    kv_pack_rot_from_cache_hd128_b3,
     attn_decode_rot_hd128_b4,
     attn_decode_rot_hd128_b3,
+    attn_decode_combine_rot_hd128,
 )
 
 comptime D = 128
@@ -22,6 +23,8 @@ comptime PAGE = 32
 comptime NPAGES = N // PAGE
 comptime NQH = 2           # GQA: 2 query heads share 1 kv head
 comptime NKVH = 1
+comptime NSPLITS = 8       # split-K context chunks (grid.z)
+comptime BLOCK = 128       # 4 warps per (seq, head, split) block
 
 
 def _lcg(mut state: UInt64) -> Float64:
@@ -74,21 +77,31 @@ def main() raises:
     comptime PB4 = (D * 4) // 8
     comptime PB3 = (D * 3) // 8
 
+    # Dummy residual ring (ring_slots = 0 => never read; packed-only path).
+    var k_ring = ctx.enqueue_create_buffer[DType.float16](D)
+    var v_ring = ctx.enqueue_create_buffer[DType.float16](D)
+
     # --- rot4 ---
     var k4 = ctx.enqueue_create_buffer[DType.uint8](NPAGES * NKVH * PAGE * PB4)
     var v4 = ctx.enqueue_create_buffer[DType.uint8](NPAGES * NKVH * PAGE * PB4)
     var ks4 = ctx.enqueue_create_buffer[DType.float16](NPAGES * NKVH * PAGE)
     var vs4 = ctx.enqueue_create_buffer[DType.float16](NPAGES * NKVH * PAGE)
+    var parts4 = ctx.enqueue_create_buffer[DType.float32](NQH * NSPLITS * (D + 2))
     var o4 = ctx.enqueue_create_buffer[DType.float16](NQH * D)
-    ctx.enqueue_function[kv_pack_rot_hd128_b4](
+    ctx.enqueue_function[kv_pack_rot_from_cache_hd128_b4](
         k4.unsafe_ptr(), v4.unsafe_ptr(), ks4.unsafe_ptr(), vs4.unsafe_ptr(),
         k_in.unsafe_ptr(), v_in.unsafe_ptr(), page_table.unsafe_ptr(),
         0, NKVH, PAGE, grid_dim=(N, NKVH), block_dim=1,
     )
     ctx.enqueue_function[attn_decode_rot_hd128_b4](
-        o4.unsafe_ptr(), q.unsafe_ptr(), k4.unsafe_ptr(), v4.unsafe_ptr(),
-        ks4.unsafe_ptr(), vs4.unsafe_ptr(), page_table.unsafe_ptr(),
-        seq_lens.unsafe_ptr(), NQH, NKVH, PAGE, NPAGES, scale,
+        parts4.unsafe_ptr(), q.unsafe_ptr(), k4.unsafe_ptr(), v4.unsafe_ptr(),
+        ks4.unsafe_ptr(), vs4.unsafe_ptr(), k_ring.unsafe_ptr(), v_ring.unsafe_ptr(),
+        page_table.unsafe_ptr(), seq_lens.unsafe_ptr(),
+        NQH, NKVH, PAGE, NPAGES, NSPLITS, 0, scale,
+        grid_dim=(1, NQH, NSPLITS), block_dim=BLOCK,
+    )
+    ctx.enqueue_function[attn_decode_combine_rot_hd128](
+        o4.unsafe_ptr(), parts4.unsafe_ptr(), NQH, NSPLITS,
         grid_dim=(1, NQH), block_dim=32,
     )
 
@@ -97,16 +110,22 @@ def main() raises:
     var v3 = ctx.enqueue_create_buffer[DType.uint8](NPAGES * NKVH * PAGE * PB3)
     var ks3 = ctx.enqueue_create_buffer[DType.float16](NPAGES * NKVH * PAGE)
     var vs3 = ctx.enqueue_create_buffer[DType.float16](NPAGES * NKVH * PAGE)
+    var parts3 = ctx.enqueue_create_buffer[DType.float32](NQH * NSPLITS * (D + 2))
     var o3 = ctx.enqueue_create_buffer[DType.float16](NQH * D)
-    ctx.enqueue_function[kv_pack_rot_hd128_b3](
+    ctx.enqueue_function[kv_pack_rot_from_cache_hd128_b3](
         k3.unsafe_ptr(), v3.unsafe_ptr(), ks3.unsafe_ptr(), vs3.unsafe_ptr(),
         k_in.unsafe_ptr(), v_in.unsafe_ptr(), page_table.unsafe_ptr(),
         0, NKVH, PAGE, grid_dim=(N, NKVH), block_dim=1,
     )
     ctx.enqueue_function[attn_decode_rot_hd128_b3](
-        o3.unsafe_ptr(), q.unsafe_ptr(), k3.unsafe_ptr(), v3.unsafe_ptr(),
-        ks3.unsafe_ptr(), vs3.unsafe_ptr(), page_table.unsafe_ptr(),
-        seq_lens.unsafe_ptr(), NQH, NKVH, PAGE, NPAGES, scale,
+        parts3.unsafe_ptr(), q.unsafe_ptr(), k3.unsafe_ptr(), v3.unsafe_ptr(),
+        ks3.unsafe_ptr(), vs3.unsafe_ptr(), k_ring.unsafe_ptr(), v_ring.unsafe_ptr(),
+        page_table.unsafe_ptr(), seq_lens.unsafe_ptr(),
+        NQH, NKVH, PAGE, NPAGES, NSPLITS, 0, scale,
+        grid_dim=(1, NQH, NSPLITS), block_dim=BLOCK,
+    )
+    ctx.enqueue_function[attn_decode_combine_rot_hd128](
+        o3.unsafe_ptr(), parts3.unsafe_ptr(), NQH, NSPLITS,
         grid_dim=(1, NQH), block_dim=32,
     )
     ctx.synchronize()
