@@ -29,24 +29,94 @@
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
-/// Runtime nadpisania lokalizacji instalacji sterowane z Ustawien
-/// (`models_dir`, `containers_dir`, `cache_dir`). `None` = uzyj domyslnej
-/// sciezki pod `tentaflow_home()`. Trzymane jako node-local — te klucze NIE
-/// sa synchronizowane miedzy nodami (rozne dyski na roznych maszynach).
-struct PathOverrides {
-    models: Option<PathBuf>,
-    containers: Option<PathBuf>,
-    cache: Option<PathBuf>,
+/// Kategorie katalogow danych sterowane z Ustawien → Magazyn danych.
+/// Kazda kategoria ma klucz ustawienia (`*_dir`), domyslna lokalizacje pod
+/// `tentaflow_home()` i flage czy da sie ja migrowac na zywo. `Data` (SQLite)
+/// i `Sync` (ledger Fjall) trzymaja otwarte uchwyty w globalnych OnceLockach —
+/// ich zmiana jest zapisywana jako pending i aplikowana przy nastepnym starcie
+/// (przed otwarciem bazy / ledgera).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(usize)]
+pub enum StorageCategory {
+    Models = 0,
+    Containers = 1,
+    Cache = 2,
+    Blobs = 3,
+    Recordings = 4,
+    AddonData = 5,
+    Keys = 6,
+    Sync = 7,
+    Data = 8,
 }
 
-/// `RwLock::new` i `None` sa const, wiec static inicjalizuje sie bez OnceLock.
-/// Override czytane przy KAZDYM wywolaniu paths (tani read-lock) — celowo nie
-/// cache'owane w OnceLock, zeby zmiana ustawienia dzialala natychmiast.
-static PATH_OVERRIDES: RwLock<PathOverrides> = RwLock::new(PathOverrides {
-    models: None,
-    containers: None,
-    cache: None,
-});
+pub const STORAGE_CATEGORY_COUNT: usize = 9;
+
+pub const ALL_STORAGE_CATEGORIES: [StorageCategory; STORAGE_CATEGORY_COUNT] = [
+    StorageCategory::Models,
+    StorageCategory::Containers,
+    StorageCategory::Cache,
+    StorageCategory::Blobs,
+    StorageCategory::Recordings,
+    StorageCategory::AddonData,
+    StorageCategory::Keys,
+    StorageCategory::Sync,
+    StorageCategory::Data,
+];
+
+impl StorageCategory {
+    /// Klucz ustawienia w tabeli `settings` (kategorie live) albo w pliku
+    /// `storage-paths.conf` (Data/Sync — patrz `boot_override`). Node-local,
+    /// nigdy nie synchronizowany przez mesh.
+    pub fn setting_key(self) -> &'static str {
+        match self {
+            StorageCategory::Models => "models_dir",
+            StorageCategory::Containers => "containers_dir",
+            StorageCategory::Cache => "cache_dir",
+            StorageCategory::Blobs => "blobs_dir",
+            StorageCategory::Recordings => "recordings_dir",
+            StorageCategory::AddonData => "addons_data_dir",
+            StorageCategory::Keys => "keys_dir",
+            StorageCategory::Sync => "sync_dir",
+            StorageCategory::Data => "data_dir",
+        }
+    }
+
+    pub fn from_setting_key(key: &str) -> Option<Self> {
+        ALL_STORAGE_CATEGORIES
+            .iter()
+            .copied()
+            .find(|c| c.setting_key() == key)
+    }
+
+    /// Domyslna lokalizacja pod wspolnym rootem.
+    pub fn default_dir(self) -> PathBuf {
+        let home = tentaflow_home();
+        match self {
+            StorageCategory::Models => home.join("models"),
+            StorageCategory::Containers => home.join("containers"),
+            StorageCategory::Cache => home.join("cache"),
+            StorageCategory::Blobs => home.join("blobs"),
+            StorageCategory::Recordings => home.join("recordings"),
+            StorageCategory::AddonData => home.join("orgs"),
+            StorageCategory::Keys => home.join("keys"),
+            StorageCategory::Sync => home.join("sync"),
+            StorageCategory::Data => home.join("data"),
+        }
+    }
+
+    /// Czy dane tej kategorii da sie przeniesc bez restartu (uchwyty da sie
+    /// zamknac / sa per-wywolanie). Data i Sync wymagaja restartu — sa trzymane
+    /// w globalnych OnceLockach bez API zamkniecia.
+    pub fn live_migratable(self) -> bool {
+        !matches!(self, StorageCategory::Data | StorageCategory::Sync)
+    }
+}
+
+/// `RwLock::new` i tablica `None` sa const, wiec static inicjalizuje sie bez
+/// OnceLock. Override czytane przy KAZDYM wywolaniu paths (tani read-lock) —
+/// celowo nie cache'owane, zeby zmiana ustawienia dzialala natychmiast.
+static PATH_OVERRIDES: RwLock<[Option<PathBuf>; STORAGE_CATEGORY_COUNT]> =
+    RwLock::new([None, None, None, None, None, None, None, None, None]);
 
 /// Zamienia opcjonalny string ustawienia na sciezke: pusty/bialy → None
 /// (uzyj domyslnej), niepusty → `Some(PathBuf)`.
@@ -60,31 +130,258 @@ fn override_path(value: Option<String>) -> Option<PathBuf> {
     })
 }
 
-/// Ustawia runtime nadpisania lokalizacji. Wolane przy starcie po wczytaniu
-/// ustawien z bazy oraz na zywo po zapisie ustawienia w `settings_update`.
-pub fn set_path_overrides(
-    models: Option<String>,
-    containers: Option<String>,
-    cache: Option<String>,
-) {
+/// Ustawia pojedynczy runtime override. Wolane na zywo po zapisie ustawienia
+/// oraz przez migracje magazynu po przeniesieniu danych.
+pub fn set_category_override(category: StorageCategory, value: Option<String>) {
     let mut guard = PATH_OVERRIDES
         .write()
         .expect("PATH_OVERRIDES write lock zatruty");
-    guard.models = override_path(models);
-    guard.containers = override_path(containers);
-    guard.cache = override_path(cache);
+    guard[category as usize] = override_path(value);
 }
 
-/// Getter aktualnych nadpisan (UI / debug).
-pub fn path_overrides() -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
-    let guard = PATH_OVERRIDES
+/// Laduje wszystkie override'y na raz (start aplikacji): `get` zwraca wartosc
+/// ustawienia dla klucza kategorii. Data/Sync sa dociagane z pliku
+/// `storage-paths.conf`, bo ich wartosc musi byc znana PRZED otwarciem bazy.
+pub fn load_path_overrides(get: impl Fn(&str) -> Option<String>) {
+    let boot = boot_overrides();
+    let mut guard = PATH_OVERRIDES
+        .write()
+        .expect("PATH_OVERRIDES write lock zatruty");
+    for cat in ALL_STORAGE_CATEGORIES {
+        let value = if cat.live_migratable() {
+            get(cat.setting_key())
+        } else {
+            boot.get(cat.setting_key()).cloned()
+        };
+        guard[cat as usize] = override_path(value);
+    }
+}
+
+/// Aktualny katalog kategorii: override z ustawien albo domyslny.
+pub fn category_dir(category: StorageCategory) -> PathBuf {
+    if let Some(over) = PATH_OVERRIDES
         .read()
-        .expect("PATH_OVERRIDES read lock zatruty");
-    (
-        guard.models.clone(),
-        guard.containers.clone(),
-        guard.cache.clone(),
-    )
+        .expect("PATH_OVERRIDES read lock zatruty")[category as usize]
+        .clone()
+    {
+        return over;
+    }
+    category.default_dir()
+}
+
+/// Aktualny override kategorii (None = domyslna lokalizacja).
+pub fn category_override(category: StorageCategory) -> Option<PathBuf> {
+    PATH_OVERRIDES
+        .read()
+        .expect("PATH_OVERRIDES read lock zatruty")[category as usize]
+        .clone()
+}
+
+// ---------------------------------------------------------------------------
+// Data/Sync: konfiguracja plikowa + migracja przy starcie
+//
+// Wartosc `data_dir` nie moze lezec w bazie (baza lezy w `data_dir` — cykl),
+// a `sync_dir` musi byc znane przed inicjalizacja SyncRuntime. Oba klucze
+// zyja w prostym pliku `<tentaflow_home>/storage-paths.conf` (`klucz=wartosc`
+// po linii). Zadanie przeniesienia zapisuje sie do
+// `<tentaflow_home>/storage-migration-pending.conf`; `apply_pending_boot_
+// migrations()` (wolane w main PRZED db::init) wykonuje move i aktualizuje
+// conf.
+// ---------------------------------------------------------------------------
+
+fn storage_paths_conf() -> PathBuf {
+    tentaflow_home().join("storage-paths.conf")
+}
+
+fn pending_migrations_conf() -> PathBuf {
+    tentaflow_home().join("storage-migration-pending.conf")
+}
+
+fn read_conf(path: &Path) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    if let Ok(raw) = std::fs::read_to_string(path) {
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                map.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+    }
+    map
+}
+
+fn write_conf(path: &Path, map: &std::collections::HashMap<String, String>) -> std::io::Result<()> {
+    if map.is_empty() {
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+    let body: String = keys
+        .into_iter()
+        .map(|k| format!("{}={}\n", k, map[k]))
+        .collect();
+    std::fs::write(path, body)
+}
+
+fn boot_overrides() -> std::collections::HashMap<String, String> {
+    read_conf(&storage_paths_conf())
+}
+
+/// Zapisuje zadanie przeniesienia kategorii restartowej (Data/Sync) do
+/// wykonania przy nastepnym starcie.
+pub fn schedule_boot_migration(category: StorageCategory, new_path: &str) -> std::io::Result<()> {
+    let conf = pending_migrations_conf();
+    let mut map = read_conf(&conf);
+    map.insert(category.setting_key().to_string(), new_path.to_string());
+    write_conf(&conf, &map)
+}
+
+/// Zaplanowana (jeszcze nie wykonana) migracja kategorii, jesli istnieje.
+pub fn pending_boot_migration(category: StorageCategory) -> Option<String> {
+    read_conf(&pending_migrations_conf())
+        .remove(category.setting_key())
+}
+
+/// Wartosc override kategorii restartowej zapisana w storage-paths.conf
+/// (moze roznic sie od aktywnej — zmiana bez przenoszenia danych czeka na
+/// restart).
+pub fn boot_override_value(category: StorageCategory) -> Option<String> {
+    boot_overrides().get(category.setting_key()).cloned()
+}
+
+/// Zapisuje override kategorii restartowej do storage-paths.conf (bez
+/// przenoszenia danych — nowa sciezka obowiazuje od nastepnego startu).
+pub fn set_boot_override(
+    category: StorageCategory,
+    value: Option<&str>,
+) -> std::io::Result<()> {
+    let conf_path = storage_paths_conf();
+    let mut map = read_conf(&conf_path);
+    match value {
+        Some(v) if !v.trim().is_empty() => {
+            map.insert(category.setting_key().to_string(), v.trim().to_string());
+        }
+        _ => {
+            map.remove(category.setting_key());
+        }
+    }
+    write_conf(&conf_path, &map)
+}
+
+/// Wykonuje zaplanowane przeniesienia Data/Sync. MUSI byc wolane w main
+/// PRZED `db::init` i przed startem SyncRuntime — wtedy zadne uchwyty nie sa
+/// jeszcze otwarte i katalog da sie bezpiecznie przeniesc. Bledny wpis jest
+/// logowany i porzucany (stara lokalizacja zostaje aktywna).
+pub fn apply_pending_boot_migrations() {
+    let pending_path = pending_migrations_conf();
+    let pending = read_conf(&pending_path);
+    if pending.is_empty() {
+        return;
+    }
+    let mut conf = boot_overrides();
+    for (key, new_path) in &pending {
+        let Some(cat) = StorageCategory::from_setting_key(key) else {
+            eprintln!("tentaflow: pending storage migration: nieznana kategoria '{}'", key);
+            continue;
+        };
+        let src = category_dir_from_conf(cat, &conf);
+        let dst = PathBuf::from(new_path);
+        match move_dir_contents(&src, &dst) {
+            Ok(()) => {
+                if dst == cat.default_dir() {
+                    conf.remove(key);
+                } else {
+                    conf.insert(key.clone(), new_path.clone());
+                }
+                eprintln!(
+                    "tentaflow: storage migration {}: {} -> {}",
+                    key,
+                    src.display(),
+                    dst.display()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "tentaflow: storage migration {} FAILED ({} -> {}): {} — zostaje stara lokalizacja",
+                    key,
+                    src.display(),
+                    dst.display(),
+                    e
+                );
+            }
+        }
+    }
+    if let Err(e) = write_conf(&storage_paths_conf(), &conf) {
+        eprintln!("tentaflow: zapis storage-paths.conf nieudany: {}", e);
+        return;
+    }
+    if let Err(e) = std::fs::remove_file(&pending_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("tentaflow: usuniecie pending conf nieudane: {}", e);
+        }
+    }
+}
+
+fn category_dir_from_conf(
+    cat: StorageCategory,
+    conf: &std::collections::HashMap<String, String>,
+) -> PathBuf {
+    conf.get(cat.setting_key())
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cat.default_dir())
+}
+
+/// Przenosi zawartosc katalogu `src` do `dst`: `rename` gdy ten sam system
+/// plikow, inaczej rekurencyjna kopia + usuniecie zrodla. `src` nieistniejacy
+/// = no-op (katalog powstanie na zadanie). Publiczne — uzywane tez przez
+/// migracje live w storage_admin.
+pub fn move_dir_contents(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if src == dst {
+        return Ok(());
+    }
+    if !src.exists() {
+        std::fs::create_dir_all(dst)?;
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Pusty katalog docelowy (np. swiezo utworzony w pickerze) usuwamy, zeby
+    // szybki `rename` na tym samym systemie plikow byl mozliwy.
+    if dst.is_dir() && std::fs::read_dir(dst).map(|mut d| d.next().is_none()).unwrap_or(false) {
+        let _ = std::fs::remove_dir(dst);
+    }
+    if !dst.exists() {
+        match std::fs::rename(src, dst) {
+            Ok(()) => return Ok(()),
+            // EXDEV (inny system plikow) → kopia ponizej.
+            Err(e) if e.raw_os_error() == Some(libc_exdev()) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    copy_dir_recursive(src, dst)?;
+    std::fs::remove_dir_all(src)
+}
+
+/// `libc::EXDEV` bez zaleznosci od libc: 18 na Linux/macOS/BSD, 17 na Windows
+/// (ERROR_NOT_SAME_DEVICE mapowane przez std na raw 17).
+fn libc_exdev() -> i32 {
+    #[cfg(windows)]
+    {
+        17
+    }
+    #[cfg(not(windows))]
+    {
+        18
+    }
 }
 
 /// Directory where TentaFlow keeps persistent runtime data (SQLite, HMAC
@@ -215,6 +512,44 @@ fn migrate_legacy_runtime_into(dest: &Path) {
     }
 }
 
+/// Jednorazowa naprawa historycznego rozjazdu: addony (`orgs/`), nagrania
+/// (`recordings/`) i blob-y (`blobs/`) byly zapisywane na sztywno pod
+/// `~/.tentaflow` z pominieciem `tentaflow_home()`. W checkout'cie repo
+/// (`.runtime/`) oznaczalo to dane w dwoch miejscach. Przy starcie przenosimy
+/// stare katalogi pod wspolny root, o ile cel jeszcze nie istnieje (uzytkownik
+/// ktory juz zmigrowal recznie nie jest nadpisywany). Best-effort.
+fn migrate_legacy_home_layout() {
+    let Some(legacy_root) = dirs_home_tentaflow() else {
+        return;
+    };
+    if legacy_root == tentaflow_home() {
+        return;
+    }
+    for (child, dst) in [
+        ("orgs", orgs_dir()),
+        ("recordings", recordings_dir()),
+        ("blobs", blobs_dir()),
+    ] {
+        let src = legacy_root.join(child);
+        if !src.is_dir() || dst.exists() {
+            continue;
+        }
+        match move_dir_contents(&src, &dst) {
+            Ok(()) => eprintln!(
+                "tentaflow: legacy layout migration {} -> {}",
+                src.display(),
+                dst.display()
+            ),
+            Err(e) => eprintln!(
+                "tentaflow: legacy layout migration {} -> {} failed: {}",
+                src.display(),
+                dst.display(),
+                e
+            ),
+        }
+    }
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -249,15 +584,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// get HF_HOME/TORCH_HOME pointed at it. The same Bielik-11B pulled by
 /// Docker vLLM and native vLLM lives as one physical copy here.
 pub fn models_root() -> PathBuf {
-    if let Some(over) = PATH_OVERRIDES
-        .read()
-        .expect("PATH_OVERRIDES read lock zatruty")
-        .models
-        .clone()
-    {
-        return over;
-    }
-    tentaflow_home().join("models")
+    category_dir(StorageCategory::Models)
 }
 
 /// Value for HF_HOME, HUGGINGFACE_HUB_CACHE, TRANSFORMERS_CACHE. HF creates
@@ -340,20 +667,42 @@ pub fn containers_root() -> PathBuf {
 /// go na inny dysk; inaczej `tentaflow_home()/containers`. `containers_root()`
 /// (rozpakowany bundle) lezy w jego podkatalogu `tentaflow-containers/`.
 pub fn containers_install_root() -> PathBuf {
-    if let Some(over) = PATH_OVERRIDES
-        .read()
-        .expect("PATH_OVERRIDES read lock zatruty")
-        .containers
-        .clone()
-    {
-        return over;
-    }
-    tentaflow_home().join("containers")
+    category_dir(StorageCategory::Containers)
 }
 
-/// Persistent application data (sqlite database, runtime state).
+/// Persistent application data (sqlite database, runtime state). Override
+/// (`data_dir` w storage-paths.conf) aplikowany wylacznie przy starcie —
+/// otwarta baza nie wedruje w trakcie dzialania.
 pub fn data_dir() -> PathBuf {
-    tentaflow_home().join("data")
+    category_dir(StorageCategory::Data)
+}
+
+/// Katalog blob-store (audio z flow, nagrania rozmow). Per-wywolanie — brak
+/// trzymanych uchwytow, wiec kategoria migruje sie na zywo.
+pub fn blobs_dir() -> PathBuf {
+    category_dir(StorageCategory::Blobs)
+}
+
+/// Katalog nagran kamer (`<recordings>/<camera_id>/{snapshots,segments}`).
+pub fn recordings_dir() -> PathBuf {
+    category_dir(StorageCategory::Recordings)
+}
+
+/// Root danych addonow per organizacja
+/// (`<orgs>/<org_id>/addons/<addon_id>/{data.db,vectors,graph,documents}`).
+pub fn orgs_dir() -> PathBuf {
+    category_dir(StorageCategory::AddonData)
+}
+
+/// Katalog kluczy HMAC (`<keys>/<name>.key`).
+pub fn keys_dir() -> PathBuf {
+    category_dir(StorageCategory::Keys)
+}
+
+/// Katalog stanu synchronizacji (`<sync>/ledger` — Fjall). Override aplikowany
+/// przy starcie (ledger trzyma otwarty keyspace przez caly czas zycia procesu).
+pub fn sync_dir() -> PathBuf {
+    category_dir(StorageCategory::Sync)
 }
 
 /// Default sqlite database path.
@@ -377,15 +726,7 @@ pub fn cache_dir() -> PathBuf {
     if let Ok(v) = std::env::var("TENTAFLOW_CACHE_DIR") {
         return PathBuf::from(v);
     }
-    if let Some(over) = PATH_OVERRIDES
-        .read()
-        .expect("PATH_OVERRIDES read lock zatruty")
-        .cache
-        .clone()
-    {
-        return over;
-    }
-    tentaflow_home().join("cache")
+    category_dir(StorageCategory::Cache)
 }
 
 /// Katalog na artefakty treningu ML Studio (adaptery LoRA, scalone modele,
@@ -403,11 +744,10 @@ pub fn ml_artifacts_dir() -> PathBuf {
 /// elsewhere under `<home>/` are preserved.
 pub fn ensure_app_dirs() -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
-    let home = tentaflow_home().to_path_buf();
-    // data/ ZOSTAJE pod tentaflow_home — baza nie wedruje miedzy dyskami.
-    std::fs::create_dir_all(home.join("data"))?;
-    // models/, cache/, containers/ respektuja runtime override (nowe lokalizacje
-    // powstaja po ustawieniu modeli_dir/containers_dir/cache_dir).
+    migrate_legacy_home_layout();
+    std::fs::create_dir_all(data_dir())?;
+    // Wszystkie kategorie respektuja runtime override (nowe lokalizacje
+    // powstaja po zapisaniu `*_dir` w Ustawieniach → Magazyn danych).
     let models = models_root();
     std::fs::create_dir_all(&models)?;
     std::fs::create_dir_all(models.join("torch"))?;
@@ -415,6 +755,11 @@ pub fn ensure_app_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(models.join("audio"))?;
     std::fs::create_dir_all(cache_dir())?;
     std::fs::create_dir_all(vllm_cache_dir())?;
+    std::fs::create_dir_all(blobs_dir())?;
+    std::fs::create_dir_all(recordings_dir())?;
+    std::fs::create_dir_all(orgs_dir())?;
+    std::fs::create_dir_all(keys_dir())?;
+    std::fs::create_dir_all(sync_dir())?;
 
     let containers_parent = containers_install_root();
     std::fs::create_dir_all(&containers_parent)?;
@@ -476,12 +821,12 @@ mod tests {
         let _guard = OVERRIDE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().to_string_lossy().to_string();
-        set_path_overrides(Some(target), None, None);
+        set_category_override(StorageCategory::Models, Some(target));
         assert_eq!(models_root(), tmp.path());
         // Pusty string traktowany jak brak override.
-        set_path_overrides(Some("   ".to_string()), None, None);
+        set_category_override(StorageCategory::Models, Some("   ".to_string()));
         assert_eq!(models_root(), tentaflow_home().join("models"));
-        set_path_overrides(None, None, None);
+        set_category_override(StorageCategory::Models, None);
         assert_eq!(models_root(), tentaflow_home().join("models"));
     }
 

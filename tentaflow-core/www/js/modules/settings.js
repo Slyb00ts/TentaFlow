@@ -19,6 +19,11 @@ import { I18n } from '/js/i18n.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import { renderMeshTab, bindMeshTab } from '/js/modules/settings-network.js';
+import {
+  loadStorageOverview,
+  renderStorageTab as renderStorageDataTab,
+  bindStorageTab as bindStorageDataTab,
+} from '/js/modules/settings-storage.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-input.js';
@@ -59,7 +64,6 @@ let registries = [];
 let syncConflicts = [];
 let syncConflictsStatus = 'open';
 let syncConflictsAddonId = 'contacts';
-let storageReport = null;
 const CONFIGURED_SECRET_MASK = '••••••••••••';
 
 const SSO_TYPES = [
@@ -92,7 +96,7 @@ const SettingsScreen = {
         <tf-tab id="tls" icon="mesh-admin">${escapeHtml(I18n.t('settings.tab_tls'))}</tf-tab>
         <tf-tab id="mesh" icon="network">${escapeHtml(I18n.t('settings.tab_mesh'))}</tf-tab>
         <tf-tab id="sync" icon="refresh">Sync</tf-tab>
-        <tf-tab id="storage" icon="database">Storage</tf-tab>
+        <tf-tab id="storage" icon="database">${escapeHtml(I18n.t('settings.tab_storage') || 'Magazyn danych')}</tf-tab>
         <tf-tab id="external" icon="key">${escapeHtml(I18n.t('settings.tab_external_access') || 'Dostępy zewnętrzne')}</tf-tab>
       </tf-tabs>
 
@@ -111,7 +115,6 @@ const SettingsScreen = {
     ssoProviders = [];
     registries = [];
     syncConflicts = [];
-    storageReport = null;
   },
 };
 
@@ -200,7 +203,7 @@ function renderTab() {
       });
       break;
     case 'sync': host.innerHTML = renderSyncTab(); bindSyncTab(); void loadSyncConflicts(); break;
-    case 'storage': host.innerHTML = renderStorageTab(); bindStorageTab(); void loadStorageReport(); break;
+    case 'storage': void loadStorageDataTab(); break;
     case 'external': host.innerHTML = renderExternalAccessTab(); bindExternalAccessTab(); break;
   }
 }
@@ -350,205 +353,22 @@ async function resolveSyncConflict(operationId, resolution) {
 }
 
 // ==========================================================================
-// Zakladka: Storage
+// Zakladka: Magazyn danych (settings-storage.js)
 // ==========================================================================
 
-function renderStorageTab() {
-  const report = storageReport;
-  const level = String(report?.level || 'unknown').toLowerCase();
-  const total = numberField(report, 'totalBytes', 'total_bytes');
-  const available = numberField(report, 'availableBytes', 'available_bytes');
-  const freePercentBps = numberField(report, 'freePercentBps', 'free_percent_bps');
-  const freeLabel = Number.isFinite(freePercentBps) ? `${(freePercentBps / 100).toFixed(2)}%` : '—';
-  const used = Number.isFinite(total) && Number.isFinite(available) ? Math.max(0, total - available) : null;
-  const root = report?.root || '';
-  const blockBytes = numberField(report, 'largeBlobBlockBytes', 'large_blob_block_bytes');
-
-  return `
-    <div class="card">
-      <div class="card-header">
-        <h3>Storage</h3>
-        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-          ${storageLevelChip(level)}
-          <tf-button variant="ghost" size="sm" icon="refresh" id="storage-refresh">Odśwież</tf-button>
-        </div>
-      </div>
-      <div class="card-body">
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:16px;">
-          ${storageMetric('Wolne', freeLabel)}
-          ${storageMetric('Dostępne', formatBytes(available))}
-          ${storageMetric('Użyte', formatBytes(used))}
-          ${storageMetric('Łącznie', formatBytes(total))}
-          ${storageMetric('Blokada blobów', level === 'critical' ? `>${formatBytes(blockBytes)}` : 'nieaktywna')}
-        </div>
-        <div style="margin:0 0 12px;" class="muted">
-          <code>${escapeHtml(root || 'TENTAFLOW_HOME')}</code>
-        </div>
-        <tf-table id="storage-paths-table" sortable>
-          <tf-column key="label" label="Obszar" sortable></tf-column>
-          <tf-column key="bytes" label="Rozmiar" sortable></tf-column>
-          <tf-column key="path" label="Ścieżka" renderer="html"></tf-column>
-        </tf-table>
-      </div>
-    </div>
-
-    ${renderInstallLocationsCard(root)}
-  `;
-}
-
-// Karta konfigurowalnych lokalizacji instalacji (modele AI, kontenery, cache).
-// Klucze settings sa per-wezel — backend waliduje sciezke i stosuje ja na zywo.
-function renderInstallLocationsCard(root) {
-  // Korzen z raportu storage uzywamy do podpowiedzi domyslnych sciezek; gdy go
-  // brak, dajemy generyczny opis "<home>".
-  const base = (root || '').replace(/\/+$/, '') || '<home>';
-  const fields = [
-    {
-      key: 'models_dir',
-      label: 'Katalog modeli AI',
-      placeholder: `domyślnie: ${base}/models`,
-    },
-    {
-      key: 'containers_dir',
-      label: 'Katalog kontenerów / bundli',
-      placeholder: `domyślnie: ${base}/containers`,
-    },
-    {
-      key: 'cache_dir',
-      label: 'Katalog cache (venv, vLLM)',
-      placeholder: `domyślnie: ${base}/cache`,
-    },
-  ];
-
-  const rows = fields.map((f) => `
-    <div class="form-row">
-      <tf-input
-        id="install-${escapeAttr(f.key)}"
-        data-install-key="${escapeAttr(f.key)}"
-        label="${escapeAttr(f.label)}"
-        value="${escapeAttr(getSetting(f.key, ''))}"
-        placeholder="${escapeAttr(f.placeholder)}"
-      ></tf-input>
-    </div>
-  `).join('');
-
-  return `
-    <div class="card" style="margin-top:16px;">
-      <div class="card-header">
-        <h3>Lokalizacje instalacji</h3>
-      </div>
-      <div class="card-body">
-        <p class="form-hint" style="margin:0 0 16px;">
-          Gdzie TentaFlow instaluje modele AI, kontenery/bundle i cache. Zmiana dotyczy
-          NOWYCH pobrań/instalacji — istniejące pliki pozostają w starej lokalizacji.
-          Ustawienie jest per-węzeł (nie synchronizuje się w meshu).
-        </p>
-        ${rows}
-        <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
-          ${sprite('info')}
-          <span class="form-hint" style="margin:0;">
-            Wskaż katalog na szybkim/dużym dysku lub współdzielonym NAS. Wymaga uprawnień
-            zapisu — błędna ścieżka zostanie odrzucona.
-          </span>
-        </div>
-        <div style="margin-top:16px;">
-          <tf-button variant="primary" icon="check" id="install-paths-save">Zapisz ścieżki</tf-button>
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-function bindStorageTab() {
-  byId('storage-refresh')?.addEventListener('click', loadStorageReport);
-  bindInstallLocations();
-  renderStoragePathsTable();
-}
-
-// Zapis trzech sciezek instalacji jednym przyciskiem. Backend waliduje kazda
-// sciezke i stosuje ja na zywo, wiec po sukcesie odswiezamy raport (rozmiary
-// i sciezki obszarow moga sie zmienic).
-function bindInstallLocations() {
-  byId('install-paths-save')?.addEventListener('click', async () => {
-    const keys = ['models_dir', 'containers_dir', 'cache_dir'];
-    const values = keys.map((key) => {
-      const value = byId(`install-${key}`)?.value?.trim() || '';
-      return { key, value };
-    });
-
-    // Ostrzezenie klienta: niepusta sciezka powinna byc bezwzgledna (zaczynac
-    // sie od "/"). Pozwalamy zapisac — backend i tak waliduje i moze odrzucic.
-    const relative = values.find((v) => v.value && !v.value.startsWith('/'));
-    if (relative) {
-      toast(`Ścieżka "${relative.value}" nie jest bezwzględna (nie zaczyna się od "/").`, 'warning');
-    }
-
-    try {
-      for (const { key, value } of values) {
-        await saveSettingKey(key, value);
-      }
-      toast('Zapisano lokalizacje instalacji', 'success');
-      await loadStorageReport();
-    } catch (err) {
-      toast(err.message, 'error');
-    }
-  });
-}
-
-async function loadStorageReport() {
-  try {
-    storageReport = await ApiBinary.one('syncStorageReportRequest');
-    renderStorageSummary();
-    renderStoragePathsTable();
-  } catch (err) {
-    storageReport = null;
-    renderStorageSummary();
-    renderStoragePathsTable();
-    toast(`Storage: ${err.message}`, 'error');
-  }
-}
-
-function renderStorageSummary() {
-  if (currentTab !== 'storage') return;
+// Laduje overview (kategorie + dysk) i renderuje zakladke; reload odswieza.
+async function loadStorageDataTab() {
   const host = byId('settings-tab-body');
-  if (!host) return;
-  host.innerHTML = renderStorageTab();
-  bindStorageTab();
-}
-
-function renderStoragePathsTable() {
-  const table = byId('storage-paths-table');
-  if (!table) return;
-  const paths = Array.isArray(storageReport?.paths) ? storageReport.paths : [];
-  table.rows = paths.map((row) => ({
-    label: row.label || '',
-    bytes: formatBytes(Number(row.bytes || 0)),
-    path: `<code>${escapeHtml(row.path || '')}</code>`,
-  }));
-}
-
-function storageMetric(label, value) {
-  return `
-    <div style="border:1px solid var(--border);border-radius:8px;padding:12px;background:var(--panel);min-width:0;">
-      <div class="muted" style="font-size:12px;margin-bottom:6px;">${escapeHtml(label)}</div>
-      <div style="font-size:18px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(value)}</div>
-    </div>
-  `;
-}
-
-function storageLevelChip(level) {
-  const status = level === 'critical' || level === 'warning'
-    ? 'warn'
-    : level === 'ok'
-      ? 'ok'
-      : 'info';
-  return `<tf-chip status="${status}">${escapeHtml(level || 'unknown')}</tf-chip>`;
-}
-
-function numberField(obj, camelKey, snakeKey) {
-  const raw = obj?.[camelKey] ?? obj?.[snakeKey];
-  const value = Number(raw);
-  return Number.isFinite(value) ? value : null;
+  if (!host || currentTab !== 'storage') return;
+  host.innerHTML = renderStorageDataTab(null);
+  try {
+    const overview = await loadStorageOverview();
+    if (currentTab !== 'storage') return;
+    host.innerHTML = renderStorageDataTab(overview);
+    bindStorageDataTab(loadStorageDataTab);
+  } catch (err) {
+    host.innerHTML = `<div class="empty-big" style="padding:24px;color:var(--danger);">${escapeHtml(err.message || String(err))}</div>`;
+  }
 }
 
 // ==========================================================================

@@ -95,6 +95,11 @@ fn registry() -> &'static DashMap<(String, String), AddonDbPool> {
 ///
 /// Bezpieczenstwo: oba identyfikatory walidowane przez `addon_db_path` → `validate_addon_id`.
 pub fn open_addon_db(org_id: &str, addon_id: &str) -> Result<AddonDbPool, AbiError> {
+    if addon_storage_frozen() {
+        // Migracja katalogu danych addonow w toku — pliki wlasnie sa
+        // przenoszone; otwarcie poola trzymaloby uchwyt na starej sciezce.
+        return Err(AbiError::Operation);
+    }
     let key = (org_id.to_string(), addon_id.to_string());
     if let Some(existing) = registry().get(&key) {
         return Ok(existing.clone());
@@ -199,10 +204,31 @@ pub fn close_addon_db(org_id: &str, addon_id: &str) {
 /// brak pool → blad konfiguracji (addon nie zadeklarowal [storage] sql=true
 /// lub install fail).
 pub fn get_addon_pool(org_id: &str, addon_id: &str) -> Option<AddonDbPool> {
+    if addon_storage_frozen() {
+        return None;
+    }
     registry()
         .get(&(org_id.to_string(), addon_id.to_string()))
         .map(|p| p.clone())
 }
+
+/// Zamraza dostep do per-addon SQLite na czas migracji katalogu danych
+/// addonow (Ustawienia → Magazyn danych). Przy `frozen=true` wszystkie poole
+/// sa zrzucane z rejestru — polaczenia zamykaja sie gdy ostatnie uchwyty
+/// opadna, a nowe otwarcia sa odrzucane do odmrozenia.
+pub fn set_addon_storage_frozen(frozen: bool) {
+    ADDON_STORAGE_FROZEN.store(frozen, std::sync::atomic::Ordering::SeqCst);
+    if frozen {
+        registry().clear();
+    }
+}
+
+fn addon_storage_frozen() -> bool {
+    ADDON_STORAGE_FROZEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+static ADDON_STORAGE_FROZEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 // =============================================================================
 // Testy

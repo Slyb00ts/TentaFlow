@@ -183,8 +183,9 @@ impl GraphManager {
         self.clock.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// `<root>/<org>/<addon>/graph/<collection>.cozo` (override) albo
-    /// `<HOME>/.tentaflow/orgs/<org>/addons/<addon>/graph/<collection>.cozo`.
+    /// `<root>/<org>/<addon>/graph/<collection>.cozo` (override testowy) albo
+    /// `<orgs_dir>/<org>/addons/<addon>/graph/<collection>.cozo` — root przez
+    /// `paths::orgs_dir()` (respektuje `addons_data_dir` z Ustawien).
     fn file_path_for(&self, org_id: &str, addon_id: &str, collection: &str) -> Result<PathBuf> {
         if let Some(root) = &self.root_override {
             Ok(root
@@ -193,13 +194,7 @@ impl GraphManager {
                 .join("graph")
                 .join(format!("{collection}.cozo")))
         } else {
-            let home = dirs::home_dir().ok_or_else(|| GraphError::Io {
-                path: None,
-                source: std::io::Error::new(std::io::ErrorKind::NotFound, "HOME not set"),
-            })?;
-            Ok(home
-                .join(".tentaflow")
-                .join("orgs")
+            Ok(crate::paths::orgs_dir()
                 .join(org_id)
                 .join("addons")
                 .join(addon_id)
@@ -1390,6 +1385,24 @@ impl GraphManager {
             // potem zdejmij z mapy. Odwrotna kolejność otwierała okno na re-open
             // przeterminowanego Arc „obok" świeżego wpisu (double-open na ten sam
             // plik). Pod tą kolejnością stale-Arc widzi Removed i re-fetchuje.
+            self.mark_removed(&entry);
+            self.collections
+                .remove_if(&key, |_, v| Arc::ptr_eq(v, &entry));
+        }
+    }
+
+    /// Zamyka WSZYSTKIE otwarte backendy (migracja katalogu danych addonów —
+    /// sled trzyma otwarte pliki, które muszą zostać zwolnione przed
+    /// przeniesieniem katalogu). Ta sama kolejność `mark_removed` → `remove_if`
+    /// co w `invalidate_addon`; dane na dysku zostają, następny dostęp otwiera
+    /// plik z nowej lokalizacji (`file_path_for` liczy ścieżkę na żądanie).
+    pub fn invalidate_all(&self) {
+        let entries: Vec<(GraphKey, Arc<GraphEntry>)> = self
+            .collections
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        for (key, entry) in entries {
             self.mark_removed(&entry);
             self.collections
                 .remove_if(&key, |_, v| Arc::ptr_eq(v, &entry));

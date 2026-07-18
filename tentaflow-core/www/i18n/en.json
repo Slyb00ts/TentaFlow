@@ -721,6 +721,7 @@
     "tab_oauth": "OAuth",
     "tab_tls": "TLS",
     "tab_mesh": "Mesh & Network",
+    "tab_storage": "Data Storage",
     "tab_external_access": "External Access",
     "general_title": "Global settings",
     "general_hint": "Raw key–value pairs from DB. Changes apply immediately. Special sections (TLS, OAuth, external access) are handled in dedicated tabs.",

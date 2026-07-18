@@ -2257,18 +2257,24 @@ pub fn settings_update(
         }
     };
 
-    // Konfigurowalne lokalizacje instalacji — node-local, walidowane i
-    // stosowane na zywo po zapisie.
-    const PATH_SETTING_KEYS: [&str; 3] = ["models_dir", "containers_dir", "cache_dir"];
-    let touches_path_settings = payload
+    // Konfigurowalne lokalizacje katalogow danych — node-local, walidowane i
+    // stosowane na zywo po zapisie. Klucze restartowe (data_dir/sync_dir) NIE
+    // ida ta droga — obsluguje je storage_admin (plik conf + pending move).
+    let touched_categories: Vec<crate::paths::StorageCategory> = payload
         .entries
         .iter()
-        .any(|e| PATH_SETTING_KEYS.contains(&e.key.as_str()));
+        .filter_map(|e| crate::paths::StorageCategory::from_setting_key(&e.key))
+        .collect();
+    if touched_categories.iter().any(|c| !c.live_migratable()) {
+        return Err(ProtocolError::bad_request(
+            "data_dir/sync_dir zmienia sie przez Magazyn danych (StorageMigrateRequest), nie przez settings",
+        ));
+    }
 
     // Walidacja PRZED zapisem: niepusta sciezka musi byc tworzalna. Inaczej
     // odrzucamy caly request, zeby nie zapisac nieuzywalnej lokalizacji.
     for entry in &payload.entries {
-        if PATH_SETTING_KEYS.contains(&entry.key.as_str()) {
+        if crate::paths::StorageCategory::from_setting_key(&entry.key).is_some() {
             let trimmed = entry.value.trim();
             if !trimmed.is_empty() {
                 if let Err(e) = std::fs::create_dir_all(trimmed) {
@@ -2308,19 +2314,15 @@ pub fn settings_update(
         }
     }
 
-    // Zastosuj nowe lokalizacje na zywo: odczytaj aktualne 3 wartosci z bazy,
+    // Zastosuj nowe lokalizacje na zywo: odczytaj zapisane wartosci z bazy,
     // ustaw override i utworz nowe katalogi (idempotentne).
-    if touches_path_settings {
-        let models = repository::get_setting(&ctx.state.db, "models_dir")
-            .ok()
-            .flatten();
-        let containers = repository::get_setting(&ctx.state.db, "containers_dir")
-            .ok()
-            .flatten();
-        let cache = repository::get_setting(&ctx.state.db, "cache_dir")
-            .ok()
-            .flatten();
-        crate::paths::set_path_overrides(models, containers, cache);
+    if !touched_categories.is_empty() {
+        for cat in &touched_categories {
+            let value = repository::get_setting(&ctx.state.db, cat.setting_key())
+                .ok()
+                .flatten();
+            crate::paths::set_category_override(*cat, value);
+        }
         let _ = crate::paths::ensure_app_dirs();
     }
 

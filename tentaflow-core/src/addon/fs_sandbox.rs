@@ -59,26 +59,21 @@ pub fn validate_addon_id(addon_id: &str) -> Result<(), AbiError> {
 // Lokalizacja katalogu danych
 // =============================================================================
 
-/// F2 P1.b — root for per-org addon sandboxes: `~/.tentaflow/orgs/<org_id>/addons/`.
+/// F2 P1.b — root for per-org addon sandboxes: `<orgs_dir>/<org_id>/addons/`.
 ///
 /// `org_id` is validated with the same path-safety regex as `addon_id`. Pre-F2
 /// installs live at the legacy `~/.tentaflow/addons/<addon_id>/` location; the
 /// boot-time migration `lifecycle::migrate_addon_dirs_to_org_default` moves
 /// those trees to the new layout, so by the time runtime sees `addon_data_dir`
-/// every existing addon has been re-homed under `org-default`.
+/// every existing addon has been re-homed under `org-default`. Root idzie
+/// przez `paths::orgs_dir()` — respektuje `addons_data_dir` z Ustawien i
+/// wspolny `tentaflow_home()` (koniec rozjazdu `~/.tentaflow` vs `.runtime`).
 fn addons_root(org_id: &str) -> Result<PathBuf, AbiError> {
     validate_addon_id(org_id)?;
-    // `dirs::home_dir()` zwraca None na headless srodowiskach bez HOME — w
-    // takiej sytuacji zwracamy Operation (nie panikujemy).
-    let home = dirs::home_dir().ok_or(AbiError::Operation)?;
-    Ok(home
-        .join(".tentaflow")
-        .join("orgs")
-        .join(org_id)
-        .join("addons"))
+    Ok(crate::paths::orgs_dir().join(org_id).join("addons"))
 }
 
-/// Zwraca per-addon katalog danych `~/.tentaflow/orgs/<org_id>/addons/<addon_id>/`.
+/// Zwraca per-addon katalog danych `<orgs_dir>/<org_id>/addons/<addon_id>/`.
 /// Tworzy katalog (idempotent) wraz z hierarchia jesli nie istnieje.
 /// Na Unixach ustawia uprawnienia 0700 (tylko wlasciciel).
 pub fn addon_data_dir(org_id: &str, addon_id: &str) -> Result<PathBuf, AbiError> {

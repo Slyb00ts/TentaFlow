@@ -54,27 +54,45 @@ pub trait BlobStore: Send + Sync {
 /// Audio/video to GB — SQLite BLOB ma write perf issues > 1MB, fs page cache
 /// for free, GC = `rm -rf orphans`, backup = `rsync`.
 pub struct FileBlobStore {
-    root: PathBuf,
+    /// `Some` = korzen przypiety na sztywno (testy). `None` = korzen liczony
+    /// PRZY KAZDEJ operacji z `paths::blobs_dir()`, dzieki czemu zmiana
+    /// `blobs_dir` w Ustawieniach → Magazyn danych dziala na zywo bez
+    /// przebudowy routera (store nie trzyma uchwytow miedzy wywolaniami).
+    fixed_root: Option<PathBuf>,
     sync_db: Option<crate::db::DbPool>,
 }
 
 impl FileBlobStore {
     pub fn new(root: PathBuf) -> Self {
         Self {
-            root,
+            fixed_root: Some(root),
             sync_db: None,
+        }
+    }
+
+    /// Store z korzeniem sterowanym Ustawieniami (`paths::blobs_dir()`).
+    pub fn with_settings_root(db: Option<crate::db::DbPool>) -> Self {
+        Self {
+            fixed_root: None,
+            sync_db: db,
         }
     }
 
     pub fn with_sync(root: PathBuf, db: crate::db::DbPool) -> Self {
         Self {
-            root,
+            fixed_root: Some(root),
             sync_db: Some(db),
         }
     }
 
+    fn root(&self) -> PathBuf {
+        self.fixed_root
+            .clone()
+            .unwrap_or_else(crate::paths::blobs_dir)
+    }
+
     fn sharded_path(&self, sha256: &str) -> PathBuf {
-        let mut path = self.root.clone();
+        let mut path = self.root();
         path.push(&sha256[0..2]);
         path.push(&sha256[2..4]);
         path.push(format!("{sha256}.bin"));
@@ -209,7 +227,7 @@ impl BlobStore for FileBlobStore {
         // NotFound, caller (TTS adapter) potraktuje jako transient błąd.
         // Refcount/orphan registry wraz z multi-process scenariuszami
         // wraca w stage 3.
-        let root = self.root.clone();
+        let root = self.root();
         let cutoff = std::time::SystemTime::now()
             .checked_sub(retention)
             .unwrap_or(std::time::UNIX_EPOCH);
