@@ -239,6 +239,21 @@ enum Command {
         #[arg(long)]
         language: Option<String>,
     },
+    /// Load an ONNX model, print its op coverage, and (for Silero VAD) run it
+    /// on the GPU for a synthesized audio frame.
+    OnnxRun {
+        /// ONNX model file (opset 17+ subset).
+        model_path: PathBuf,
+        /// Samples in the synthesized frame (Silero VAD 16 kHz expects 512).
+        #[arg(long, default_value_t = 512)]
+        samples: usize,
+        /// Sample rate passed to the model's `sr` input.
+        #[arg(long, default_value_t = 16000)]
+        sr: i64,
+        /// Test signal for the frame: sine | zero | ones.
+        #[arg(long, default_value = "sine")]
+        signal: String,
+    },
     /// Measure prefill and decode throughput.
     Bench {
         /// GGUF file or HF snapshot directory.
@@ -433,6 +448,12 @@ fn main() -> Result<()> {
             wav_path,
             language,
         } => cmd_transcribe(&model_dir, &wav_path, language.as_deref()),
+        Command::OnnxRun {
+            model_path,
+            samples,
+            sr,
+            signal,
+        } => cmd_onnx_run(&model_path, samples, sr, &signal),
         Command::Bench {
             model_path,
             tokens,
@@ -928,6 +949,82 @@ fn cmd_transcribe(model_dir: &Path, wav_path: &Path, language: Option<&str>) -> 
         t1.elapsed().as_secs_f32()
     );
     println!("{text}");
+    Ok(())
+}
+
+/// Load an ONNX model, print its op coverage, and smoke-run it on the GPU.
+/// Silero VAD (inputs `input`/`state`/`sr`) is executed end-to-end and its
+/// speech probability printed; other models report their parsed graph only,
+/// since running them needs model-specific inputs.
+fn cmd_onnx_run(model_path: &Path, samples: usize, sr: i64, signal: &str) -> Result<()> {
+    let model = forge_onnx::load_model(model_path)
+        .with_context(|| format!("parse {}", model_path.display()))?;
+    let hist = forge_onnx::op_histogram(&model);
+    let total: usize = hist.values().sum();
+    println!("model: {}", model_path.display());
+    if let Some((_, v)) = model.opset_import.iter().find(|(d, _)| d.is_empty()) {
+        println!("opset (default domain): {v}");
+    }
+    println!("graph inputs : {:?}", model.graph.input);
+    println!("graph outputs: {:?}", model.graph.output);
+    println!("op types ({total} nodes across graph + subgraphs):");
+    for (op, n) in &hist {
+        println!("  {op:<16} {n}");
+    }
+
+    let inputs = &model.graph.input;
+    let is_vad = ["input", "state", "sr"].iter().all(|n| inputs.iter().any(|i| i == n));
+    if !is_vad {
+        println!(
+            "\nparsed {} nodes; no Silero VAD input signature (input/state/sr) — \
+             pass such a model to run it on the GPU.",
+            model.graph.node.len()
+        );
+        return Ok(());
+    }
+
+    let frame: Vec<f32> = (0..samples)
+        .map(|i| match signal {
+            "zero" => 0.0,
+            "ones" => 1.0,
+            _ => (i as f32 * 0.1).sin() * 0.1,
+        })
+        .collect();
+
+    let device = CudaDevice::new(
+        0,
+        PoolSizes {
+            weights: 64 << 20,
+            kv_cache: 4 << 20,
+            activations: 256 << 20,
+            kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
+        },
+    )
+    .context("create CUDA device")?;
+    let dev: Arc<dyn Device> = device;
+    let session = forge_onnx::load_session(dev, model_path)?;
+
+    let mut named = std::collections::HashMap::new();
+    named.insert("input".to_string(), forge_onnx::Tensor::from_f32(vec![1, samples], frame));
+    named.insert(
+        "state".to_string(),
+        forge_onnx::Tensor::from_f32(vec![2, 1, 128], vec![0.0; 256]),
+    );
+    named.insert("sr".to_string(), forge_onnx::Tensor::scalar_i64(sr));
+
+    let t0 = Instant::now();
+    let out = session.run(named).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let dt = t0.elapsed();
+    let prob = out
+        .get("output")
+        .context("model has no `output` tensor")?
+        .to_f32_vec()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!(
+        "\nSilero VAD ({signal}, {samples} samples @ {sr} Hz): speech probability = {:.6}  ({:.2} ms)",
+        prob.first().copied().unwrap_or(f32::NAN),
+        dt.as_secs_f64() * 1e3
+    );
     Ok(())
 }
 

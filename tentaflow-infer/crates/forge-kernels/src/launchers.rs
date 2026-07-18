@@ -7278,4 +7278,172 @@ impl Kernels {
         let args = LaunchArgs::new().buf(out).buf(input);
         self.device.launch(k, &cfg, &args, stream)
     }
+
+    // --- ONNX subset f32 ops (forge-onnx interpreter) -----------------------
+
+    /// General 1-D convolution (group=1, dilation=1), all f32. `x` [in_ch, in_t],
+    /// `w` [out_ch, in_ch, ksize], optional `bias` [out_ch], `out` [out_ch, out_t].
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_f32(
+        &self,
+        out: &DevBuffer,
+        x: &DevBuffer,
+        w: &DevBuffer,
+        bias: Option<&DevBuffer>,
+        in_ch: usize,
+        in_t: usize,
+        out_ch: usize,
+        out_t: usize,
+        ksize: usize,
+        stride: usize,
+        pad: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("conv1d_f32")?;
+        let cfg = LaunchConfig {
+            grid: ((out_t as u32).div_ceil(BLOCK), out_ch as u32, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // Absent bias still needs a valid device pointer (never read); `out`
+        // stands in, mirroring the qkv_post launcher convention.
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(x)
+            .buf(w)
+            .buf(bias.unwrap_or(out))
+            .scalar(in_ch as i64)
+            .scalar(in_t as i64)
+            .scalar(out_ch as i64)
+            .scalar(out_t as i64)
+            .scalar(ksize as i64)
+            .scalar(stride as i64)
+            .scalar(pad as i64)
+            .scalar(if bias.is_some() { 1i64 } else { 0i64 });
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// out = max(x, 0) over n f32 elements.
+    pub fn relu_f32(&self, out: &DevBuffer, x: &DevBuffer, n: usize, stream: &Stream) -> Result<()> {
+        let k = self.artifacts.get("relu_f32")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new().buf(out).buf(x).scalar(n as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// out = sigmoid(x) over n f32 elements.
+    pub fn sigmoid_f32(&self, out: &DevBuffer, x: &DevBuffer, n: usize, stream: &Stream) -> Result<()> {
+        let k = self.artifacts.get("sigmoid_f32")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new().buf(out).buf(x).scalar(n as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// out = a + b, same shape, n f32 elements (broadcasting done host-side).
+    pub fn add_f32(
+        &self,
+        out: &DevBuffer,
+        a: &DevBuffer,
+        b: &DevBuffer,
+        n: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("add_f32")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new().buf(out).buf(a).buf(b).scalar(n as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// out = x^e (elementwise, scalar exponent) over n f32 elements.
+    pub fn pow_f32(
+        &self,
+        out: &DevBuffer,
+        x: &DevBuffer,
+        e: f32,
+        n: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("pow_f32")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new().buf(out).buf(x).scalar(e).scalar(n as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// out = sqrt(x) over n f32 elements.
+    pub fn sqrt_f32(&self, out: &DevBuffer, x: &DevBuffer, n: usize, stream: &Stream) -> Result<()> {
+        let k = self.artifacts.get("sqrt_f32")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new().buf(out).buf(x).scalar(n as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// out[o, i] = mean over the reduced axis of x viewed as [outer, axis, inner].
+    pub fn reduce_mean_f32(
+        &self,
+        out: &DevBuffer,
+        x: &DevBuffer,
+        outer: usize,
+        axis: usize,
+        inner: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("reduce_mean_f32")?;
+        let cfg = LaunchConfig::linear((outer * inner) as u32, BLOCK);
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(x)
+            .scalar(outer as i64)
+            .scalar(axis as i64)
+            .scalar(inner as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Single-direction, batch-1 ONNX LSTM (gate order i,o,f,c). Shapes are
+    /// direction/batch-squeezed by the caller: `x` [seq, input], `w` [4h, input],
+    /// `r` [4h, hidden], `b` [8h], `h0`/`c0` [hidden]; `y` [seq, hidden],
+    /// `yh`/`yc` [hidden].
+    #[allow(clippy::too_many_arguments)]
+    pub fn lstm_f32(
+        &self,
+        y: &DevBuffer,
+        yh: &DevBuffer,
+        yc: &DevBuffer,
+        x: &DevBuffer,
+        w: &DevBuffer,
+        r: &DevBuffer,
+        b: &DevBuffer,
+        h0: &DevBuffer,
+        c0: &DevBuffer,
+        seq: usize,
+        input_size: usize,
+        hidden: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        // Shared recurrent state is sized for LSTM_MAX_HIDDEN = 512 in the kernel.
+        if hidden > 512 {
+            return Err(ForgeError::Kernel(format!(
+                "lstm_f32: hidden {hidden} exceeds shared-state capacity (512)"
+            )));
+        }
+        let k = self.artifacts.get("lstm_f32")?;
+        let cfg = LaunchConfig {
+            grid: (1, 1, 1),
+            block: (hidden as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(yh)
+            .buf(yc)
+            .buf(x)
+            .buf(w)
+            .buf(r)
+            .buf(b)
+            .buf(h0)
+            .buf(c0)
+            .scalar(seq as i64)
+            .scalar(input_size as i64)
+            .scalar(hidden as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
 }

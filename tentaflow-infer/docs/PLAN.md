@@ -72,6 +72,15 @@ cache instead of build-time nvcc).
   (day-1: qwen3, llama, bielik/mistral-class).
 - Tests: parse `.runtime/model.gguf` (310 tensors), parse Bielik-1.5B-NVFP4,
   dequant golden vs f32 references.
+- ONNX loader (SPEC §4.1, opset 17+ subset) ✅ `forge-onnx`: own protobuf
+  wire-format parser → typed graph IR (nodes/edges/initializers/subgraphs) +
+  hybrid CPU/GPU interpreter. Heavy ops (Conv1d, LSTM, Relu/Sigmoid/Sqrt, Add,
+  Pow, ReduceMean) run as native Mojo f32 kernels (`onnx_ops.mojo`); shape/
+  control ops (Shape/Gather/Slice/Concat/Reshape/Transpose/Pad/Cast/Equal/Not/If
+  with sr + state-init subgraphs) on host. **Gate #5 (numeric):** Silero VAD
+  (`silero_vad.onnx`) on the RTX 4090 matches onnxruntime within |Δ|~1e-6 (tol
+  1e-3) — sine 0.2987515 vs 0.2987524, silence 0.0442625 vs 0.0442627. CLI:
+  `forge onnx-run`. Depth/embeddings ONNX parse; add ops per model via `dispatch`.
 
 ### Chunk 3 — forge-tokenize + chat templating
 - HF `tokenizers` for tokenizer.json models; GGUF-embedded (gpt2/BPE + merges)

@@ -246,6 +246,14 @@
     "gemm_iq1_m_f16_bm64": {"file": "gemm_iq1_m_f16_bm64.ptx", "entry": "src_gemm_gemm_iq1_m_impl_SIM6A6A6A6AcB6A6A_99f3e5693d00b39c"},
     "gemv_norm_iq1_m_f16": {"file": "gemv_norm_iq1_m_f16.ptx", "entry": "src_decode_fused_gemv_norm_iq16A6A6A6A_1c87605e99b173bd"},
     "gemv_norm_silu_iq1_m_f16": {"file": "gemv_norm_silu_iq1_m_f16.ptx", "entry": "src_decode_fused_gemv_norm_sil6A6A6A6A_61428697ddb5ce13"},
-    "gemv_residual_iq1_m_f16": {"file": "gemv_residual_iq1_m_f16.ptx", "entry": "src_decode_fused_gemv_residual6A6A6A6A_a1222286972b8771"}
+    "gemv_residual_iq1_m_f16": {"file": "gemv_residual_iq1_m_f16.ptx", "entry": "src_decode_fused_gemv_residual6A6A6A6A_a1222286972b8771"},
+    "conv1d_f32": {"file": "conv1d_f32.ptx", "entry": "src_onnx_ops_conv1d_f32_Poin6A6A6A6AoA6A6A_6a7a801c0ca73288"},
+    "relu_f32": {"file": "relu_f32.ptx", "entry": "src_onnx_ops_relu_f32_Pointe6A6A6A6AoA6A6A_3aade3dca30963bd"},
+    "sigmoid_f32": {"file": "sigmoid_f32.ptx", "entry": "src_onnx_ops_sigmoid_f32_Poi6A6A6A6AoA6A6A_e59f3e802948401e"},
+    "add_f32": {"file": "add_f32.ptx", "entry": "src_onnx_ops_add_f32_Pointer6A6A6A6AoA6A6A_255674d20f814f4e"},
+    "pow_f32": {"file": "pow_f32.ptx", "entry": "src_onnx_ops_pow_f32_Pointer6A6A6A6AoA6A6A_51cdf3247d8a4cad"},
+    "sqrt_f32": {"file": "sqrt_f32.ptx", "entry": "src_onnx_ops_sqrt_f32_Pointe6A6A6A6AoA6A6A_4b921393b1627585"},
+    "reduce_mean_f32": {"file": "reduce_mean_f32.ptx", "entry": "src_onnx_ops_reduce_mean_f326A6A6A6AoA6A_1b2618fbd65bcb7a"},
+    "lstm_f32": {"file": "lstm_f32.ptx", "entry": "src_onnx_ops_lstm_f32_Pointe6A6A6A6AoA6A6A_6fd07fbec67c7fd4"}
   }
 }

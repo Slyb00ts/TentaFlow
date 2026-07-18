@@ -17,6 +17,7 @@ forge-engine.workspace = true
 forge-tokenize.workspace = true
 forge-server.workspace = true
 forge-whisper.workspace = true
+forge-onnx.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

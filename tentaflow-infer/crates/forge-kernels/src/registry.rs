@@ -294,6 +294,14 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "moe_scale_add_f16",
     "moe_scale_add_gidx_f16",
     "moe_sigmoid_f16_to_f32",
+    "conv1d_f32",
+    "relu_f32",
+    "sigmoid_f32",
+    "add_f32",
+    "pow_f32",
+    "sqrt_f32",
+    "reduce_mean_f32",
+    "lstm_f32",
 ];
 
 /// Loaded modules + resolved kernel handles for one device.

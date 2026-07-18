@@ -123,6 +123,16 @@ from src.sampling import penalize_f32, argmax_partial_f32, argmax_final_f32
 from src.sampling import topk_partial_f32, topk_final_f32
 from src.sampling import penalize_batched_f32, argmax_batched_f32, topk_batched_f32
 from src.moe import moe_router_f16, moe_scale_add_f16, moe_scale_add_gidx_f16, moe_sigmoid_f16_to_f32
+from src.onnx_ops import (
+    conv1d_f32,
+    relu_f32,
+    sigmoid_f32,
+    add_f32,
+    pow_f32,
+    sqrt_f32,
+    reduce_mean_f32,
+    lstm_f32,
+)
 
 
 def _entry_from_ptx(ptx_path: Path) raises -> String:
@@ -905,6 +915,30 @@ def main() raises:
 
     _ = ctx.compile_function[gemv_residual_iq1_m_f16, dump_asm=Path("gemv_residual_iq1_m_f16.ptx")]()
     entries.append(_finalize(out_dir, "gemv_residual_iq1_m_f16"))
+
+    _ = ctx.compile_function[conv1d_f32, dump_asm=Path("conv1d_f32.ptx")]()
+    entries.append(_finalize(out_dir, "conv1d_f32"))
+
+    _ = ctx.compile_function[relu_f32, dump_asm=Path("relu_f32.ptx")]()
+    entries.append(_finalize(out_dir, "relu_f32"))
+
+    _ = ctx.compile_function[sigmoid_f32, dump_asm=Path("sigmoid_f32.ptx")]()
+    entries.append(_finalize(out_dir, "sigmoid_f32"))
+
+    _ = ctx.compile_function[add_f32, dump_asm=Path("add_f32.ptx")]()
+    entries.append(_finalize(out_dir, "add_f32"))
+
+    _ = ctx.compile_function[pow_f32, dump_asm=Path("pow_f32.ptx")]()
+    entries.append(_finalize(out_dir, "pow_f32"))
+
+    _ = ctx.compile_function[sqrt_f32, dump_asm=Path("sqrt_f32.ptx")]()
+    entries.append(_finalize(out_dir, "sqrt_f32"))
+
+    _ = ctx.compile_function[reduce_mean_f32, dump_asm=Path("reduce_mean_f32.ptx")]()
+    entries.append(_finalize(out_dir, "reduce_mean_f32"))
+
+    _ = ctx.compile_function[lstm_f32, dump_asm=Path("lstm_f32.ptx")]()
+    entries.append(_finalize(out_dir, "lstm_f32"))
 
     var manifest = String('{\n  "arch": "') + arch + String('",\n  "kernels": {\n')
     for i in range(len(entries)):

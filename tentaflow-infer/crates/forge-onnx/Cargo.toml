@@ -1,0 +1,16 @@
+# ===== File: Cargo.toml — forge-onnx: ONNX graph loader + hybrid CPU/GPU executor =====
+[package]
+name = "forge-onnx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+forge-types = { workspace = true }
+forge-hal = { workspace = true }
+forge-kernels = { workspace = true }
+half = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
