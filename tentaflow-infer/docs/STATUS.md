@@ -320,20 +320,30 @@ Ostatnia aktualizacja: 2026-07-18.
 
 ## Ocena skali pozostałej pracy (zgrubnie)
 
-| Obszar | Rozmiar | Uwaga |
-|---|---|---|
-| Multivendor HAL (ROCm/Metal/Intel) | bardzo duży | rdzeń "uniwersalności"; osobny backend + rekompilacja kerneli Mojo per target |
-| Multi-node TP/PP/EP + ForgeCCL | bardzo duży | cały pillar §7 |
-| Graph IR + kompilator + autotuner | duży | zamienia ręczny forward |
-| MoE (kernele + expert streaming) | duży | odblokowuje DeepSeek/Mixtral/Qwen-MoE |
-| Modalności TTS/T2I/Video | duży (każda) | osobne silniki |
-| ONNX loader | ✅ subset (`forge-onnx`) | Silero VAD e2e na GPU; dokładać opy per model |
-| Radix prefix cache | średni | duży zysk dla multi-turn |
-| FORGE-RPC / Realtime / Batch API | średni (każdy) | |
-| Spekulacja wpięta w decode | średni | framework już jest |
-| forge pull/convert, metryki, multi-tenancy | średni (łącznie) | produkcja |
+Pozostała praca dzieli się na dwie kategorie: (a) **wymaga sprzętu / modeli,
+których nie ma na tej maszynie** — nie budujemy tego na ślepo, bo bez walidacji
+byłby to stub łamiący regułę „zero zaślepek"; (b) rozszerzenia budowalne
+jednokartowo, ale poza obecnym zakresem. Backlog walidowalny na pojedynczym
+RTX 4090 (Ada) jest w praktyce wyczerpany — pozycje ✅ niżej wylądowały i mają
+twarde bramki (golden bit-identyczność, e2e, numeryka vs referencja).
 
-Wniosek: rdzeń jednokartowego LLM/STT/embeddings jest mocny i produkcyjny,
-ale to ~1/3 zakresu spec. Największe brakujące dźwignie wartości: multivendor
-HAL, MoE, radix prefix cache. Największe "całe
-pillary": multivendor i multi-node.
+| Obszar | Rozmiar | Blokada / status |
+|---|---|---|
+| Multivendor HAL (ROCm/Metal/Intel) | bardzo duży | **brak sprzętu** — potrzeba realnego GPU AMD/Intel/Apple; osobny backend + rekompilacja kerneli Mojo per target, niewalidowalne tutaj |
+| Multi-node TP/PP/EP + ForgeCCL | bardzo duży | **brak fabric/wielu węzłów** — cały pillar §7, niewalidowalny na jednej karcie |
+| Modalności TTS/T2I/Video | duży (każda) | **brak zaseedowanych modeli** — osobne silniki (LM+vocoder / scheduler dyfuzji / DiT); brak checkpointów w `.runtime` |
+| Graph IR + kompilator + autotuner | duży | budowalne, poza zakresem — zamienia ręczny forward (ONNX `forge-onnx` to jego zalążek) |
+| Expert streaming wag MoE (§5.4A, Colibri) | średni | budowalne — tiering wag ekspertów, follow-up do device-side dispatch |
+| FORGE-RPC / Realtime / multi-tenancy | średni (każdy) | budowalne, produkcyjne rozszerzenia |
+
+Zrobione w tej rundzie (wszystko z twardą bramką, jednokartowo): radix prefix
+cache ✅, constrained decoding ✅, kompletność API generacji ✅, spekulacja n-gram
+wpięta w decode ✅, device-side dispatch MoE + graf decode ✅, ONNX loader
+(`forge-onnx`, Silero VAD vs onnxruntime) ✅, metryki Prometheus + Anthropic
+`/v1/messages` + batch completions ✅.
+
+Wniosek: rdzeń jednokartowego LLM/STT/embeddings/MoE/ONNX jest mocny,
+produkcyjny i bit-dokładny. To wciąż ~1/3 zakresu spec, ale pozostała 2/3 to
+niemal w całości „całe pillary" wymagające **innego sprzętu** (multivendor,
+multi-node) lub **modeli, których tu nie ma** (TTS/T2I/Video) — świadomie
+nie budowane jako stub, do domknięcia na docelowym sprzęcie z realną walidacją.
