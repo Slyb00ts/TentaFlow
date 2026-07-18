@@ -84,6 +84,25 @@ impl KvConfig {
     pub fn dtype(&self) -> DType {
         self.quant.slab_dtype()
     }
+
+    /// Bytes of ONE page of each tier-spillable region of one layer, in the
+    /// order `KvCache::tier_layer_regions` returns the buffers. F16/Fp8 spill
+    /// the paged K and V slabs; rot spills the paged packed store + scales
+    /// (the residual ring is a small global overlay and never spills).
+    pub fn tier_region_bytes(&self) -> Vec<usize> {
+        let slots = self.n_kv_heads * self.page_size;
+        match self.quant.packed_bytes(self.head_dim) {
+            Some(pb) => {
+                let packed = slots * pb;
+                let scale = slots * 2;
+                vec![packed, packed, scale, scale]
+            }
+            None => {
+                let page = slots * self.head_dim * self.dtype().size();
+                vec![page, page]
+            }
+        }
+    }
 }
 
 pub struct KvCache {
@@ -204,6 +223,21 @@ impl KvCache {
             v_scale,
             free_pages,
         })
+    }
+
+    /// Per-layer buffers the tier manager spills, in the region order of
+    /// `KvConfig::tier_region_bytes`.
+    pub fn tier_layer_regions(&self, l: usize) -> Vec<&DevBuffer> {
+        if self.cfg.quant.is_rot() {
+            vec![
+                &self.k_packed[l],
+                &self.v_packed[l],
+                &self.k_scale[l],
+                &self.v_scale[l],
+            ]
+        } else {
+            vec![&self.k[l], &self.v[l]]
+        }
     }
 
     pub fn new_seq(&self) -> SeqKv {

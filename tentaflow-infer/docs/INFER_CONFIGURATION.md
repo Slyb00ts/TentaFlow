@@ -76,18 +76,25 @@ Zasady i zmierzone charakterystyki (Bielik-7B-NVFP4, RTX 4090, PCIe 4.0):
 - **Hot tail:** ostatnie 4 strony (128 tokenów) sekwencji nigdy nie są
   spillowane (decode zawsze czyta ogon; append idzie do strony rezydentnej).
 
-Ograniczenia v1 (uczciwie):
-- Tryby `rot4`/`rot3` + `--kv-tier` → jawny błąd Unsupported (packed store
-  nie jest tierowany). `f16` i `fp8` są wspierane.
-- Eviction wybiera zimny prefiks BIEŻĄCEJ (rosnącej) sekwencji; cross-sequence
-  eviction bezczynnych sekwencji — follow-up (admission control i tak
-  ogranicza łączny popyt w serve).
-- Sekwencja w trybie strumieniowanym nie wchodzi do batched decode (scheduler
-  kieruje ją na ścieżkę single-stream); wraca do batcha po pełnym restore.
-- Restore strumieniowy jest blokujący (v1 correctness-first); overlap
-  warstwa-po-warstwie na osobnym streamie transferowym — optymalizacja
-  follow-up. Plik spillu jest append-only (miejsce nie jest odzyskiwane w
-  trakcie życia procesu; plik znika przy wyjściu).
+Zakres v2 (dawne ograniczenia v1 — usunięte):
+- Tryby `rot4`/`rot3` współpracują z `--kv-tier`: spillowane są paged regiony
+  packed + skale (ring rezydualny zostaje w VRAM), a streamed attention czyta
+  packed store przez staging za identity page table. `f16`/`fp8` bez zmian.
+- Eviction jest cross-sequence: scheduler co iterację balansuje pulę i
+  spilluje globalnie najzimniejsze prefiksy WSZYSTKICH aktywnych sekwencji
+  (największy zimny prefiks pierwszy), więc długi request nie czeka na zimną
+  historię sąsiadów.
+- Sekwencja strumieniowana WCHODZI do batched decode: streamed lanes idą na
+  koniec batcha, GEMM-y liczą pełny batch, attention rezydentnych lane'ów to
+  jeden launch, a streamed lane attenduje po stagingu swojego pełnego
+  kontekstu. Mixed batch nie jest graf-capturowany; czysto rezydentny batch
+  zostaje na grafach per bucket.
+- Restore strumieniowy fused decode overlapuje warstwa-po-warstwie: staging
+  warstwy l+1 jedzie osobnym streamem transferowym (ping-pong 2 sloty
+  stagingu + eventy) podczas attention warstwy l; pełny restore overlapuje
+  odczyt pliku z H2D (2 pinned scratche). Plik spillu reużywa zwolnione
+  extenty (exact-size free list) — rośnie do szczytowego working setu, nie
+  monotonicznie; znika przy wyjściu.
 
 ---
 
@@ -238,7 +245,6 @@ Uwaga metodyczna: prefill mierzony do pierwszego WIDOCZNEGO tokenu (zawiera
 
 - Tryby rot (`rot4`/`rot3`) KV: tylko single-stream decode (batched → jawny
   Unsupported); decode ~1.5× wolniejszy od f16 — wartość to pamięć/max-ctx.
-  Rot nie łączy się też z `--kv-tier` (jawny błąd).
 - Kontekst ponad VRAM wymaga `--kv-tier ram|nvme` (sekcja KV tiering wyżej);
   prędkość streamed decode ogranicza PCIe (~0.7 GB KV na token przy 8k na
   modelu 7B f16-KV — rośnie liniowo z głębokością).

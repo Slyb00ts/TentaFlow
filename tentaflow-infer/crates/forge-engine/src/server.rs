@@ -245,6 +245,37 @@ fn worker<'t>(
             });
         }
 
+        // Cross-sequence tier balance: before the iteration touches the pool,
+        // spill the globally coldest pages (across all active sequences) so
+        // the upcoming prefill quanta and decode appends fit with the
+        // watermark reserve intact — one long-context request no longer
+        // stalls behind neighbors' cold history.
+        if model.tier_enabled() {
+            let page = model.kv.cfg.page_size;
+            let quantum = prefill_chunk.clamp(32, MAX_PREFILL_CHUNK);
+            let upcoming_pages: usize = active
+                .iter()
+                .filter(|a| !a.dead)
+                .map(|a| {
+                    if a.pending_prompt.is_empty() {
+                        1
+                    } else {
+                        quantum.min(a.pending_prompt.len()).div_ceil(page) + 1
+                    }
+                })
+                .sum();
+            let mut seqs: Vec<&mut SeqKv> = active
+                .iter_mut()
+                .filter(|a| !a.dead)
+                .map(|a| &mut a.seq)
+                .collect();
+            if let Err(e) = model.tier_balance(&mut seqs, upcoming_pages) {
+                // Balance failure (e.g. RAM-tier budget exhausted) surfaces
+                // per-request when the affected sequence next grows.
+                tracing::warn!("kv tier balance failed: {e}");
+            }
+        }
+
         // One scheduler iteration. Prefilling sequences and any CPU-sampled
         // decode sequence advance individually (chunked prefill / one token);
         // every GPU-sampled decode sequence runs through ONE batched forward
@@ -412,19 +443,6 @@ fn batch_gpu_decode(model: &mut Model, active: &mut [ActiveSeq<'_>], batch_min: 
                 a.dead = true;
             }
         }
-    }
-    if feed_idx.is_empty() {
-        return;
-    }
-
-    // Sequences whose spilled KV exceeds free VRAM decode through the model's
-    // streamed single-stream path — they cannot join the batched page-table
-    // forward, whose attention requires full residency.
-    let (stream_idx, feed_idx): (Vec<usize>, Vec<usize>) = feed_idx
-        .into_iter()
-        .partition(|&i| model.seq_needs_streaming(&active[i].seq));
-    for &i in &stream_idx {
-        serial_step(model, &mut active[i]);
     }
     if feed_idx.is_empty() {
         return;
