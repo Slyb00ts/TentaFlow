@@ -1,3 +1,43 @@
 # Manifest serwisu Jina Embeddings v5 (MLX) — wbudowany silnik embeddingow dla
 # Apple Silicon (macOS/iOS). Runtime embedded przez MLX (feature
 # inference-mlx, ta sama sciezka co nemotron-embed-mlx); brak
+# kontekstu docker / python-bundle. Repo `-mlx` Jina niosa bazowe wagi + adapter
+# per-task (retrieval / text-matching), 1024d, last-token pooling. Wariant
+# CUDA/ROCm: `jina-embed`; lekki CPU/telefon: `jina-embed-gguf`.
+# Licencja CC-BY-NC-4.0 (niekomercyjna).
+
+[engine]
+id = "jina-embed-mlx"
+category = "embeddings"
+name = "Jina Embeddings v5 (MLX)"
+description_pl = "Embeddingi tekstu Jina v5 (Qwen3-0.6B, 1024d) na Apple Silicon przez MLX. Wbudowany silnik dla macOS/iOS. Warianty per-task: retrieval / text-matching."
+description_en = "Jina v5 text embeddings (Qwen3-0.6B, 1024d) on Apple Silicon via MLX. Embedded engine for macOS/iOS. Per-task variants: retrieval / text-matching."
+homepage = "https://huggingface.co/jinaai/jina-embeddings-v5-text-small-retrieval-mlx"
+license = "cc-by-nc-4.0"
+icon = "mlx"
+default_port = 8080
+api = "openai-compatible"
+version = "v5"
+service_surfaces = ["embeddings"]
+input_modalities = ["text"]
+output_modalities = ["embedding"]
+
+[deploy.native]
+platforms = ["macos", "ios"]
+runtime = "embedded"
+feature_flag = "inference-mlx"
+
+# Repo MLX niesie warianty wag full/8bit/4bit (model-4bit.safetensors) — wybieramy
+# 4bit (quantization) dla najmniejszego sladu na Apple Silicon.
+[[model_preset]]
+id = "jina-v5-text-small-retrieval-mlx"
+display_name = "Jina v5 Text Small — Retrieval (MLX 4-bit)"
+repo = "jinaai/jina-embeddings-v5-text-small-retrieval-mlx"
+quantization = "int4"
+recommended = true
+
+[[model_preset]]
+id = "jina-v5-text-small-text-matching-mlx"
+display_name = "Jina v5 Text Small — Text Matching (MLX 4-bit)"
+repo = "jinaai/jina-embeddings-v5-text-small-text-matching-mlx"
+quantization = "int4"
