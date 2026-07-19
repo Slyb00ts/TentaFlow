@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use forge_formats::nvfp4::{self, NvFp4Scheme, NvFp4TensorNames};
 use forge_formats::safetensors::ShardedSafeTensors;
+use forge_formats::w4a8::{w4a8_pack, W4A8_GROUP};
 use forge_formats::{dequantize_to_f32, Gguf, HfConfig, LayerKind, ModelDescriptor, WeightRole};
 use forge_hal::{DevBuffer, Device, Pool};
 use forge_types::{DType, ForgeError, MemKind, QuantKind, Result};
@@ -208,6 +209,39 @@ impl DevWeight {
     }
 }
 
+/// One QServe-packed W4A8 projection (int4 weights + per-group int8 secondary
+/// scale/zero + per-channel f16 primary scale). Non-default prefill GEMM
+/// (`FORGE_GEMM=w4a8`); the original Q4_K weight is kept alongside for decode +
+/// the logit head, so this is an ADDITIONAL store, not a replacement.
+pub struct W4A8Weight {
+    pub qweight: DevBuffer,
+    pub s2_scales: DevBuffer,
+    pub s2_zeros: DevBuffer,
+    pub s1_scales: DevBuffer,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+/// W4A8 packs of every prefill projection in one dense layer. Each is its OWN
+/// logical matrix (q/k/v and gate/up are NOT fused): QServe interleaves weights
+/// and transposes per-group scales `[K/G][N]`, so a fused-row window would be a
+/// non-contiguous column slice — splitting at load avoids any windowing.
+pub struct W4A8Layer {
+    pub q: W4A8Weight,
+    pub k: W4A8Weight,
+    pub v: W4A8Weight,
+    pub attn_o: W4A8Weight,
+    pub gate: W4A8Weight,
+    pub up: W4A8Weight,
+    pub down: W4A8Weight,
+}
+
+/// Whether the W4A8 prefill GEMM is selected (`FORGE_GEMM=w4a8`). Default and
+/// any other value keep the committed CUDA MMQ Q4_K path.
+pub fn w4a8_enabled() -> bool {
+    std::env::var("FORGE_GEMM").ok().as_deref() == Some("w4a8")
+}
+
 /// Q/K/V projections: one row-concatenated matrix when the three share a
 /// storage format (single GEMV/GEMM launch, single copy in VRAM). When only
 /// v differs (Q4_K_M stores attn_v as Q6_K), q and k still fuse into one
@@ -362,6 +396,9 @@ pub struct ModelWeights {
     pub fused_qkv_layers: usize,
     pub fused_qk_layers: usize,
     pub fused_gate_up_layers: usize,
+    /// Per-layer W4A8 packs for the prefill GEMM when `FORGE_GEMM=w4a8`, else
+    /// `None`. Dense models only; the decode/logit paths keep the Q4_K weights.
+    pub w4a8: Option<Vec<W4A8Layer>>,
 }
 
 /// Source-agnostic host-side tensor fetch: (bytes, dtype, quant, dims).
@@ -1001,6 +1038,44 @@ fn upload_weight(device: &dyn Device, w: HostWeight) -> Result<DevWeight> {
     }
 }
 
+/// Requant a projection tensor to a QServe W4A8 pack and upload it. Re-fetches
+/// the raw tensor and dequantizes to f32 (so Q4_K storage costs ~10% extra
+/// relL2, folded on top of the original quant — the honest W4A8 quality cost),
+/// then `w4a8_pack` produces the interleaved buffers `dense_kernel0` reads.
+fn pack_w4a8_weight(
+    device: &dyn Device,
+    src: &dyn TensorSource,
+    name: &str,
+) -> Result<W4A8Weight> {
+    let (data, dtype, quant, dims) = src.fetch(name)?;
+    if dims.len() != 2 {
+        return Err(ForgeError::Format(format!(
+            "{name}: expected matrix for W4A8, got {dims:?}"
+        )));
+    }
+    let (rows, cols) = (dims[0], dims[1]);
+    if !rows.is_multiple_of(64) || !cols.is_multiple_of(128) {
+        return Err(ForgeError::Unsupported(format!(
+            "W4A8 needs rows % 64 == 0 && cols % 128 == 0, {name} is [{rows}, {cols}]"
+        )));
+    }
+    let f32s = dequantize_to_f32(dtype, quant, &data, rows * cols)?;
+    let packed = w4a8_pack(&f32s, rows, cols, W4A8_GROUP);
+    let s1_bytes: Vec<u8> = packed
+        .s1_scales
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    Ok(W4A8Weight {
+        qweight: upload(device, &packed.qweight)?,
+        s2_scales: upload(device, &packed.s2_scales)?,
+        s2_zeros: upload(device, &packed.s2_zeros)?,
+        s1_scales: upload(device, &s1_bytes)?,
+        rows,
+        cols,
+    })
+}
+
 /// Row-concatenate projection matrices into one [Σrows, cols] matrix. Every
 /// supported format stores rows as independent contiguous byte runs (f16
 /// elements, Q8_0 34-byte blocks, NVFP4 packed nibbles + FP8 scale bytes),
@@ -1199,6 +1274,11 @@ impl ModelWeights {
         // sets that differ by kind and a gated attention Q projection the
         // generic shape checks would reject; they take a dedicated loader.
         if descriptor.params.ssm.is_some() {
+            if w4a8_enabled() {
+                return Err(ForgeError::Unsupported(
+                    "FORGE_GEMM=w4a8 supports dense (non-hybrid) models only".into(),
+                ));
+            }
             return Self::load_hybrid(device, descriptor, src);
         }
         let global = |role: WeightRole| -> Result<&String> {
@@ -1266,6 +1346,18 @@ impl ModelWeights {
             }
             Ok(())
         };
+
+        // W4A8 requant is dense-only (per-logical-projection packs; the routed
+        // MoE / hybrid stacks have no dense prefill projection set). Fail loudly
+        // rather than silently falling back to Q4_K when the flag can't apply.
+        let want_w4a8 = w4a8_enabled();
+        if want_w4a8 && p.moe.is_some() {
+            return Err(ForgeError::Unsupported(
+                "FORGE_GEMM=w4a8 supports dense (non-MoE) models only".into(),
+            ));
+        }
+        let mut w4a8_layers: Option<Vec<W4A8Layer>> =
+            want_w4a8.then(|| Vec::with_capacity(descriptor.params.block_count));
 
         let mut layers = Vec::with_capacity(descriptor.params.block_count);
         let mut fused_qkv_layers = 0usize;
@@ -1428,6 +1520,18 @@ impl ModelWeights {
                 }
             };
 
+            if let Some(w4a8) = w4a8_layers.as_mut() {
+                w4a8.push(W4A8Layer {
+                    q: pack_w4a8_weight(device, src, name(WeightRole::AttnQ)?)?,
+                    k: pack_w4a8_weight(device, src, name(WeightRole::AttnK)?)?,
+                    v: pack_w4a8_weight(device, src, name(WeightRole::AttnV)?)?,
+                    attn_o: pack_w4a8_weight(device, src, name(WeightRole::AttnO)?)?,
+                    gate: pack_w4a8_weight(device, src, name(WeightRole::FfnGate)?)?,
+                    up: pack_w4a8_weight(device, src, name(WeightRole::FfnUp)?)?,
+                    down: pack_w4a8_weight(device, src, name(WeightRole::FfnDown)?)?,
+                });
+            }
+
             layers.push(LayerWeights {
                 attn_norm: upload_norm(device, src, name(WeightRole::AttnNorm)?)?,
                 ffn_norm: upload_norm(device, src, name(WeightRole::FfnNorm)?)?,
@@ -1457,6 +1561,7 @@ impl ModelWeights {
             fused_qkv_layers,
             fused_qk_layers,
             fused_gate_up_layers,
+            w4a8: w4a8_layers,
         })
     }
 
@@ -1605,6 +1710,7 @@ impl ModelWeights {
             fused_qkv_layers: 0,
             fused_qk_layers: 0,
             fused_gate_up_layers: 0,
+            w4a8: None,
         })
     }
 

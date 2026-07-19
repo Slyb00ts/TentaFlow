@@ -559,3 +559,45 @@ stanie się choćby opcją non-default. Projekcja bez zmian: sam W4A8 GEMM → p
 0.80×** llama.cpp 12032; reszta luki to narzut nie-GEMM FORGE (~0.205 s vs 0.065 s) — cel fuzji
 Phase 2. llama.cpp baseline nie odtworzony niezależnie w tej sesji (build `scratch/bench` skasowany);
 użyto committed, potwierdzonego przez maintainera **12032**.
+
+## W4A8 routing zintegrowany e2e (2026-07-19) — DZIAŁA, ale QUALITY-FAIL → zostaje non-default
+
+Ostatni krok wykonany: W4A8 jest wpięty w prefill forward pass i mierzony e2e.
+Committed CUDA MMQ pozostaje **domyślną** ścieżką Q4_K; W4A8 wybierany tylko przez
+`FORGE_GEMM=w4a8`. Decode + Q8_0 + NVFP4 nietknięte.
+
+**Jak rozwiązano bloker fused-weight:** wariant (a) — **requant per-logiczna-macierz
+przy load**. Gdy `FORGE_GEMM=w4a8` i model jest dense, każda projekcja (q, k, v, o,
+gate, up, down) jest osobno dequantowana Q4_K→f32 i pakowana `w4a8_pack` do WŁASNEGO
+zestawu buforów (`weights.rs::pack_w4a8_weight`, `W4A8Layer`), więc transponowane
+scale/zero `[K/G][N]` nie wymagają żadnego okienkowania. Wagi Q4_K zostają w VRAM dla
+decode + głowy logitów (W4A8 to store DODATKOWY, ~+4 GiB). Routing: `model.rs`
+prefill_chunk, `self.gemm_w4a8(...)` dla q/k/v/o/gate/up/down gdy `weights.w4a8`=Some.
+
+**Kernel act-quant:** `forge_w4a8_quant_act_pertoken` (dodany do `w4a8_gemm.cu`,
+zarejestrowany jako `w4a8_quant_act`) — per-token symetryczny int8 + skala f16,
+1 blok/token, block-reduce amax. Launcher `Kernels::gemm_w4a8` robi quant→GEMM na
+jednym stream. Grow-only scratch `W4A8ActScratch`.
+
+**Gate'y (surowe liczby w `docs/BENCH_COMPARISON.md`):**
+- Gate 1 build + `clippy --release --workspace`: zielone.
+- Gate 2 NVFP4 Bielik golden: **bit-exact 1 i 4 lanes** (nietknięte).
+- Gate 3 KOHERENCJA: **FAIL** — W4A8 produkuje bełkot na wszystkich 4 promptach
+  ("Question: Question: …", "Qurbananas", "QGraphicsView::paintEvent"). Committed
+  Q4_K spójny i faktograficzny. Przyczyna (oczekiwana): naiwny per-token int8
+  act-quant BEZ SmoothQuant → outliery aktywacji rozwalają skalę per-token. Requant
+  wagi Q4_K→W4A8 dokłada ~10% relL2, ale dominującym czynnikiem jest brak smoothingu
+  aktywacji. NLL proxy: Q4_K mean NLL 3.53; strona W4A8 nieuchwycona (długi `serve`
+  jest SIGURG-ubijany w tym harnessie) — sygnał jakościowy i tak jednoznaczny.
+- Gate 4 PERF (4090 idle/cool, `-fa 1` llama.cpp potwierdzony: pp4096 **11955**):
+  W4A8 pp4096 **5812** (1.52× nad committed 3825; **0.49×** llama.cpp), pp8192 **4109**
+  (1.40×), pp512 **2937** (0.95×, mały kształt regresuje). Decode niezmieniony (±0.2%).
+  In-engine GEMM: **161 → 39 ms/chunk = 4.1×** (lepiej niż 2× microbench), ALE e2e
+  tylko 1.4–1.5× bo prefill jest teraz **non-GEMM-bound** (attention ~70% chunku).
+  Projekcja ~9650 (0.80×) NIE ziściła się: zakładała że GEMM dominuje; realnie luka
+  do llama.cpp to jego **fused flash-attention**, nie GEMM.
+
+**Pozostała luka (żeby W4A8 był użyteczny):** offline per-channel activation
+smoothing (SmoothQuant) przy pakowaniu + odpowiadająca skala w quantizerze; dopiero
+wtedy koherencja może przejść. Osobno: fuzja attention/norm/quant (Phase-2) żeby e2e
+prefill przekroczył ~0.5× llama.cpp. Committed default bez zmian.

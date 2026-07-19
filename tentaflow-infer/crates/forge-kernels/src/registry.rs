@@ -82,6 +82,7 @@ const CUDA_W4A8_ENTRIES: &[(&str, &str)] = &[
     ("w4a8_gemm_m64_ksm", "forge_w4a8_gemm_m64_ksm"),
     ("w4a8_gemm_m64_klg", "forge_w4a8_gemm_m64_klg"),
     ("w4a8_gemm_m32", "forge_w4a8_gemm_m32"),
+    ("w4a8_quant_act", "forge_w4a8_quant_act_pertoken"),
 ];
 
 const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![

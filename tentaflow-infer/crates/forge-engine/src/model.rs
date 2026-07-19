@@ -21,7 +21,7 @@ use crate::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use crate::tier::{KvTierConfig, TierManager, STAGE_SLOTS};
 use crate::weights::{
     AttnWeights, DeltaNetWeights, DevWeight, GateUpWeights, LayerFfn, LayerMixer, MoeFfn,
-    ModelWeights, QkvWeights,
+    ModelWeights, QkvWeights, W4A8Weight,
 };
 
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
@@ -1571,6 +1571,30 @@ impl Model {
         self.gemm_rows(y, w, x, n_tokens, 0, w.rows(), stream)
     }
 
+    /// W4A8 prefill projection GEMM (per-token int8 activation quant + int4xint8
+    /// GEMM). Each W4A8 weight is a standalone logical matrix, so no windowing.
+    fn gemm_w4a8(
+        &self,
+        y: &DevBuffer,
+        w: &W4A8Weight,
+        x: &DevBuffer,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.kernels.gemm_w4a8(
+            y,
+            &w.qweight,
+            &w.s2_zeros,
+            &w.s2_scales,
+            &w.s1_scales,
+            x,
+            w.rows,
+            w.cols,
+            n_tokens,
+            stream,
+        )
+    }
+
     /// Batched GEMM over a row window of `w`: y = W[row_off..row_off+n_rows]·x.
     /// Row offsets translate to per-format byte offsets into the weight (and,
     /// for NVFP4, scale) streams — this is how prefill reads the q/k/v and
@@ -2036,25 +2060,36 @@ impl Model {
         for l in 0..n_layers {
             let layer = &self.weights.layers[l];
 
+            // W4A8 prefill (non-default): each projection is its own logical
+            // pack, so q/k/v are three standalone GEMMs. The Q4_K weights stay
+            // loaded for decode + the logit head.
+            let w4a8_layer = self.weights.w4a8.as_ref().map(|v| &v[l]);
+
             // Prefill outputs must stay [T, dim] contiguous per projection
             // (attention/rope/append index (t*heads+h)*head_dim), so a fused
             // matrix is consumed as three row-window GEMMs into separate
             // buffers — same weight bytes, no second copy in VRAM.
-            match &layer.attn().attn_qkv {
-                QkvWeights::Fused(w) => {
-                    self.gemm_rows(&pb.q, w, &pb.x, t, 0, q_dim, stream)?;
-                    self.gemm_rows(&pb.k, w, &pb.x, t, q_dim, kv_dim, stream)?;
-                    self.gemm_rows(&pb.v, w, &pb.x, t, q_dim + kv_dim, kv_dim, stream)?;
-                }
-                QkvWeights::FusedQk { qk, v } => {
-                    self.gemm_rows(&pb.q, qk, &pb.x, t, 0, q_dim, stream)?;
-                    self.gemm_rows(&pb.k, qk, &pb.x, t, q_dim, kv_dim, stream)?;
-                    self.gemm(&pb.v, v, &pb.x, t, stream)?;
-                }
-                QkvWeights::Split { q, k, v } => {
-                    self.gemm(&pb.q, q, &pb.x, t, stream)?;
-                    self.gemm(&pb.k, k, &pb.x, t, stream)?;
-                    self.gemm(&pb.v, v, &pb.x, t, stream)?;
+            if let Some(wl) = w4a8_layer {
+                self.gemm_w4a8(&pb.q, &wl.q, &pb.x, t, stream)?;
+                self.gemm_w4a8(&pb.k, &wl.k, &pb.x, t, stream)?;
+                self.gemm_w4a8(&pb.v, &wl.v, &pb.x, t, stream)?;
+            } else {
+                match &layer.attn().attn_qkv {
+                    QkvWeights::Fused(w) => {
+                        self.gemm_rows(&pb.q, w, &pb.x, t, 0, q_dim, stream)?;
+                        self.gemm_rows(&pb.k, w, &pb.x, t, q_dim, kv_dim, stream)?;
+                        self.gemm_rows(&pb.v, w, &pb.x, t, q_dim + kv_dim, kv_dim, stream)?;
+                    }
+                    QkvWeights::FusedQk { qk, v } => {
+                        self.gemm_rows(&pb.q, qk, &pb.x, t, 0, q_dim, stream)?;
+                        self.gemm_rows(&pb.k, qk, &pb.x, t, q_dim, kv_dim, stream)?;
+                        self.gemm(&pb.v, v, &pb.x, t, stream)?;
+                    }
+                    QkvWeights::Split { q, k, v } => {
+                        self.gemm(&pb.q, q, &pb.x, t, stream)?;
+                        self.gemm(&pb.k, k, &pb.x, t, stream)?;
+                        self.gemm(&pb.v, v, &pb.x, t, stream)?;
+                    }
                 }
             }
             trace.mark(self.device.as_ref(), "gemm_qkv");
@@ -2223,27 +2258,40 @@ impl Model {
                 trace.mark(self.device.as_ref(), "attn");
             }
 
-            self.gemm(&pb.o_out, &layer.attn().attn_o, &pb.attn_out, t, stream)?;
+            if let Some(wl) = w4a8_layer {
+                self.gemm_w4a8(&pb.o_out, &wl.attn_o, &pb.attn_out, t, stream)?;
+            } else {
+                self.gemm(&pb.o_out, &layer.attn().attn_o, &pb.attn_out, t, stream)?;
+            }
             trace.mark(self.device.as_ref(), "gemm_o");
             kernels.rmsnorm_residual_f16(&pb.x, &pb.h, &pb.o_out, &layer.ffn_norm, t, hidden, eps, stream)?;
             trace.mark(self.device.as_ref(), "norm_res");
 
             match &layer.ffn {
                 LayerFfn::Dense(dffn) => {
-                    match &dffn.gate_up {
-                        GateUpWeights::Fused(w) => {
-                            self.gemm_rows(&pb.gate, w, &pb.x, t, 0, inter, stream)?;
-                            self.gemm_rows(&pb.up, w, &pb.x, t, inter, inter, stream)?;
-                        }
-                        GateUpWeights::Split { gate, up } => {
-                            self.gemm(&pb.gate, gate, &pb.x, t, stream)?;
-                            self.gemm(&pb.up, up, &pb.x, t, stream)?;
+                    if let Some(wl) = w4a8_layer {
+                        self.gemm_w4a8(&pb.gate, &wl.gate, &pb.x, t, stream)?;
+                        self.gemm_w4a8(&pb.up, &wl.up, &pb.x, t, stream)?;
+                    } else {
+                        match &dffn.gate_up {
+                            GateUpWeights::Fused(w) => {
+                                self.gemm_rows(&pb.gate, w, &pb.x, t, 0, inter, stream)?;
+                                self.gemm_rows(&pb.up, w, &pb.x, t, inter, inter, stream)?;
+                            }
+                            GateUpWeights::Split { gate, up } => {
+                                self.gemm(&pb.gate, gate, &pb.x, t, stream)?;
+                                self.gemm(&pb.up, up, &pb.x, t, stream)?;
+                            }
                         }
                     }
                     trace.mark(self.device.as_ref(), "gemm_gateup");
                     kernels.silu_mul_f16(&pb.act, &pb.gate, &pb.up, t * inter, stream)?;
                     trace.mark(self.device.as_ref(), "silu");
-                    self.gemm(&pb.down, &dffn.down, &pb.act, t, stream)?;
+                    if let Some(wl) = w4a8_layer {
+                        self.gemm_w4a8(&pb.down, &wl.down, &pb.act, t, stream)?;
+                    } else {
+                        self.gemm(&pb.down, &dffn.down, &pb.act, t, stream)?;
+                    }
                     trace.mark(self.device.as_ref(), "gemm_down");
                 }
                 LayerFfn::Moe(moe) => {

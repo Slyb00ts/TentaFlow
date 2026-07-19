@@ -647,6 +647,49 @@ __device__ void dense_kernel0(int8_t *__restrict__ A, int8_t *__restrict__ B,
 }
 
 
+// ---- Per-token symmetric int8 activation quantizer for the W4A8 GEMM. Produces
+// the int8 codes A[M][K] and per-token fp16 scale as[M] that dense_kernel0
+// consumes (scale = amax/127 rounded to fp16; a_i8 = round(x/scale), clamped to
+// [-127,127]). One block per token row; the block reduces amax over K. Mirrors
+// the CPU `quant_act` reference in forge-kernels' cuda_w4a8 test byte-for-byte. ----
+extern "C" __global__ void forge_w4a8_quant_act_pertoken(
+    const half* __restrict__ x, int8_t* __restrict__ a_i8,
+    half* __restrict__ ascales, int M, int64_t K)
+{
+  int row = blockIdx.x;
+  if (row >= M) return;
+  const half* xr = x + (int64_t)row * K;
+  int8_t* ar = a_i8 + (int64_t)row * K;
+  float amax = 0.f;
+  for (int i = threadIdx.x; i < K; i += blockDim.x)
+    amax = fmaxf(amax, fabsf(__half2float(xr[i])));
+  for (int o = 16; o > 0; o >>= 1)
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffff, amax, o));
+  __shared__ float red[32];
+  int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+  if (lane == 0) red[wid] = amax;
+  __syncthreads();
+  int nwarps = (blockDim.x + 31) >> 5;
+  if (wid == 0) {
+    amax = (lane < nwarps) ? red[lane] : 0.f;
+    for (int o = 16; o > 0; o >>= 1)
+      amax = fmaxf(amax, __shfl_down_sync(0xffffffff, amax, o));
+    if (lane == 0) red[0] = amax;
+  }
+  __syncthreads();
+  // fp16-round the scale so the codes match the QServe packer's fp16 primary
+  // scale convention (the CPU golden uses an f16 activation scale too).
+  float s = red[0] > 0.f ? red[0] / 127.f : 1.f;
+  half sh = __float2half(s);
+  float inv = 1.f / __half2float(sh);
+  if (threadIdx.x == 0) ascales[row] = sh;
+  for (int i = threadIdx.x; i < K; i += blockDim.x) {
+    float q = rintf(__half2float(xr[i]) * inv);
+    q = fmaxf(-127.f, fminf(127.f, q));
+    ar[i] = (int8_t)(int)q;
+  }
+}
+
 // ---- FORGE extern-C entry points (one per QServe CTA config). The Rust launcher
 // (forge-kernels) computes grid/block/dynamic-smem exactly as QServe's host
 // KERNEL_LAUNCH_CODE. All configs use <= 48 KB smem so no cudaFuncSetAttribute

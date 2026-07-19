@@ -46,6 +46,11 @@ pub struct Kernels {
     /// (f32 [T,K/32]) here, then every weight-row block reads int8 X directly
     /// instead of re-quantizing f16 X per block. Sized to the largest (T*K) seen.
     prequant: Mutex<PrequantScratch>,
+    /// Grow-only per-token int8 activation scratch for the W4A8 GEMM: `x` is
+    /// quantized ONCE into `a_i8` (int8 [T,K]) + `ascales` (f16 [T]) by
+    /// `w4a8_quant_act`, then `w4a8_gemm` reads them directly. Non-default path
+    /// (FORGE_GEMM=w4a8); separate from the q8_1 `prequant` (different layout).
+    w4a8_act: Mutex<W4A8ActScratch>,
 }
 
 /// Device-resident q8_1 activation scratch shared by the i8mma GEMM launches.
@@ -58,6 +63,17 @@ struct PrequantScratch {
     cap_codes: usize,
     /// Current f32 capacity (elements) of `xd`/`xsm`.
     cap_blocks: usize,
+}
+
+/// Device-resident per-token int8 activation scratch for the W4A8 GEMM.
+#[derive(Default)]
+struct W4A8ActScratch {
+    a_i8: Option<DevBuffer>,
+    ascales: Option<DevBuffer>,
+    /// Current int8-code capacity (elements) of `a_i8`.
+    cap_codes: usize,
+    /// Current token capacity of `ascales`.
+    cap_tokens: usize,
 }
 
 /// Device-resident ggml codebook tables (LE bytes of the u64/u32 grids).
@@ -104,6 +120,7 @@ impl Kernels {
             artifacts,
             iq_tables,
             prequant: Mutex::new(PrequantScratch::default()),
+            w4a8_act: Mutex::new(W4A8ActScratch::default()),
         })
     }
 
@@ -1882,6 +1899,64 @@ impl Kernels {
             .scalar(rows as i64)
             .scalar(cols as i64);
         self.device.launch(gk, &cfg, &args, stream)
+    }
+
+    /// Per-token int8 activation quant + W4A8 GEMM in one call: quantizes the
+    /// f16 activation `x` [n_tokens, cols] to symmetric int8 codes + per-token
+    /// f16 scale (QServe layout) into grow-only scratch, then runs the int4-
+    /// weight x int8-activation GEMM. `y` is f16 [n_tokens, rows]. Both launches
+    /// share `stream` (no explicit sync). Non-default (FORGE_GEMM=w4a8).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_w4a8(
+        &self,
+        y: &DevBuffer,
+        qweight: &DevBuffer,
+        s2_zeros: &DevBuffer,
+        s2_scales: &DevBuffer,
+        wscales: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let need_codes = n_tokens * cols;
+        let mut sc = self.w4a8_act.lock().expect("w4a8 act scratch poisoned");
+        if sc.cap_codes < need_codes {
+            sc.a_i8 = Some(
+                self.device
+                    .alloc(need_codes, MemKind::Device, Pool::Activations)?,
+            );
+            sc.cap_codes = need_codes;
+        }
+        if sc.cap_tokens < n_tokens {
+            sc.ascales = Some(
+                self.device
+                    .alloc(n_tokens * 2, MemKind::Device, Pool::Activations)?,
+            );
+            sc.cap_tokens = n_tokens;
+        }
+        let a_i8 = sc.a_i8.as_ref().expect("a_i8 allocated");
+        let ascales = sc.ascales.as_ref().expect("ascales allocated");
+
+        let qk = self.artifacts.get("w4a8_quant_act")?;
+        let block = (cols as u32).clamp(32, 1024);
+        let qcfg = LaunchConfig {
+            grid: (n_tokens as u32, 1, 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let qargs = LaunchArgs::new()
+            .buf(x)
+            .buf(a_i8)
+            .buf(ascales)
+            .scalar(n_tokens as i64)
+            .scalar(cols as i64);
+        self.device.launch(qk, &qcfg, &qargs, stream)?;
+
+        self.w4a8_gemm(
+            y, a_i8, qweight, s2_zeros, s2_scales, wscales, ascales, n_tokens, rows, cols, stream,
+        )
     }
 
     /// `gemm_q4_k_f16` over a row window of a fused weight matrix:

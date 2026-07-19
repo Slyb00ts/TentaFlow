@@ -95,6 +95,63 @@ about half of llama.cpp's heavily-tuned MMQ (208 TOPS measured in CODEGEN_PROOF
 Exp 2), and FORGE still un-fuses attention/quant/norm — Phase-2 fusion work, not
 this one GEMM.
 
+**W4A8 (int4-weight × int8-activation) prefill GEMM — wired e2e, non-default
+(`FORGE_GEMM=w4a8`), QUALITY-FAILED so it stays opt-in.** The QServe
+`dense_kernel0` (kernels/cuda/w4a8_gemm.cu, HAL-verified relL2 2e-4) is now
+routed into the dense prefill forward pass: at load, each LOGICAL projection
+(q, k, v, o, gate, up, down) is requantized Q4_K→f32→W4A8 into its OWN pack
+(weights + `[K/G][N]` transposed scales/zeros), so the fused-weight blocker is
+solved by per-matrix splitting (no windowing). A per-token int8 activation
+quantizer (`forge_w4a8_quant_act_pertoken`, added to the same cubin) feeds each
+GEMM. The Q4_K weights stay resident for decode + the logit head (W4A8 is an
+ADDITIONAL store, ~+4 GiB VRAM). Decode + Q8_0 + NVFP4 untouched.
+
+Same-card A/B (RTX 4090 idle/cool: 43 °C, 210 MHz at rest), Mistral-7B Q4_K_M,
+`--prefix-cache off`, `FORGE_GEMM` default (committed CUDA MMQ) vs `=w4a8`.
+llama.cpp reconfirmed this session on the idle GPU (`llama-bench -ngl 99 -fa 1`,
+build 112c781): pp512 **12616**, pp4096 **11955**, pp8192 **11030** (matches the
+committed ~12032; `scratch/bench` is gone but `~/llama.cpp/build` is present):
+
+| P / T | CUDA MMQ (default) | W4A8 | e2e ratio | vs llama.cpp | decode |
+|-------|--------------------|------|-----------|--------------|--------|
+| 512 / 128   | 3085 | **2937** | 0.95× | 0.23× (12616) | 174 (=) |
+| 4096 / 2048 | 3825 | **5812** | 1.52× | 0.49× (11955) | 146 (=) |
+| 8192 / 1024 | 2928 | **4109** | 1.40× | 0.37× (11030) | 130 (=) |
+
+In-engine GEMM time (FORGE_PREFILL_TRACE, steady 1024-tok chunk, sum of
+gemm_qkv+o+gateup+down): **161 ms → 39 ms = 4.1× faster GEMM** — better than the
+2.0× microbench. But e2e prefill only gains 1.40–1.52×: once the GEMM is 4× the
+prefill is **non-GEMM (attention/rope/norm/kv) bound** — that work is now ~70 % of
+the W4A8 chunk and is bit-identical between paths (decode is unchanged to ±0.2 %).
+The projected ~9650 (0.80×) did NOT materialize: the projection assumed the GEMM
+dominated; measured, the remaining gap to llama.cpp is its **fused
+flash-attention**, not the GEMM. Small 512-prefill regresses slightly (W4A8 CTA
+underfills at M=512 and the tiny GEMM is dwarfed by fixed non-GEMM cost).
+
+**QUALITY: FAILED — W4A8 output is incoherent, so it is NOT a default.** Greedy
+(`--temp 0`, 32 tok), CUDA MMQ vs W4A8 on the same prompts:
+
+| Prompt | CUDA MMQ (default) | W4A8 |
+|--------|--------------------|------|
+| "The capital of France is" | "a city … on the Seine River, in north-central France, … political, economic, cultural … center" | "a country that Question: Question: Question: …" |
+| "Water boils at a temperature of" | "100°C. The boiling point of water is 100°C…" | "a temperature. QuiqiQuiQGraphicsView::paintEvent…" |
+| "The first president of the United States was" | "George Washington, who served two terms … from 1789…" | "a collection of Qurbananas, Quranic acidic acid…" |
+| "The chemical symbol for gold is" | "Au, which stands for gold. Gold is a precious metal…" | "a substance that Question: Question: Question: …" |
+
+Root cause is expected and is the honest cost of the naive path: per-token
+symmetric int8 activation quant with NO SmoothQuant/channel-smoothing lets
+transformer activation outliers dominate the per-token scale, collapsing the
+in-distribution range — the accuracy problem QServe solves upstream with offline
+activation smoothing/rotation that FORGE does not yet apply. The weight requant
+Q4_K→W4A8 adds ~10 % relL2 on top; the activation-outlier loss is the dominant
+factor. (Teacher-forced NLL proxy over a fixed passage gave Q4_K mean NLL 3.53;
+the W4A8 side could not be captured this session — the long-running `serve`
+process is SIGURG-killed in this harness — but the qualitative collapse is
+decisive.) **To make W4A8 usable: add offline per-channel activation smoothing
+(SmoothQuant-style) at pack time + a matching activation scale in the quantizer.**
+Until then W4A8 remains selectable but non-default; the committed CUDA MMQ stays
+the Q4_K default.
+
 VRAM (single-stream, observed peak incl. ~1.1 GiB desktop baseline):
 - **FORGE**: ~23.6 GiB peak — dominated by a pre-reserved full-context KV arena
   (`--kv-pages 0` = full ctx); weights themselves are ~4.1 GiB.
