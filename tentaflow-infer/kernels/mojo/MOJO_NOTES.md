@@ -231,6 +231,36 @@ Published tutorials mostly show pre-1.0 syntax — trust these notes over old do
     **2246 → 2343 (+4 %)**; 512 stays committed; decode (gemv, untouched)
     bit-unchanged ~146. The remaining ~4× gap to llama.cpp is still GEMM
     mma-issue efficiency at this 35%-of-ceiling wall, not X traffic.
+  - **Read llama.cpp's MMQ source and replicated its scheme — the gap is Mojo
+    codegen, NOT algorithm (2026-07-19).** Studied `scratch/bench/llama.cpp`
+    `mmq{.cuh,-vec-dot.cuh,-load-tiles.cuh}`, `mma.cuh`, `mmq-config-ampere.cuh`
+    (build `571d0d5`). Their Ada Q4_K/Q8_0 MMQ: `mma.sync.m16n8k32.s8.s8.s32`
+    (== our `_mma_s8`), tile I=128 rows × J=128 tokens, **8 warps (256 thr)**,
+    occupancy=1, **64 f32 acc/thread** (rows_per_warp=32, ntx=2, J/(ntx*8) j-tiles),
+    smem row-major + pad (NO exotic repack on the NV mma path), per-32-block
+    `sum += C*dA*dB` scaling, B via plain `load_generic` (comment: "faster than
+    load_ldmatrix"), plus **stream-K** K-splitting with a fixup reduction. Design
+    point is IDENTICAL to ours except (a) 8w×64acc vs our 16w×32acc, (b) stream-K.
+    Replicated (a) directly — our kernel is already `[BM,BN,NW,FMT]`-parametrized so
+    `[128,128,8]` IS their 8-warp/64-acc shape (`llt`): measured **~7% SLOWER**
+    (T=2048 61 vs `_big` 66 TOPS) — fewer warps/higher ILP loses on this codegen.
+    Also tried a full mma-burst (preload all B, MT×NT mma back-to-back, deferred
+    f32-epilogue burst): **bit-identical TOPS to the interleaved loop** (65.98 vs
+    65.97) — ptxas already overlaps the epilogue; SASS shows `.reuse` flags, the
+    I2FP/FFMA epilogue interleaved into the IMMA stream, 127 regs, 0 spills. BN=256
+    (only remaining X-traffic lever) **can't launch** — 64acc×512thr > 65536 regs
+    (`LAUNCH_OUT_OF_RESOURCES`). Verified NOT DRAM-bound: correct traffic for
+    14336/4096/2048 ≈ 1.03 GB → ~1.0 ms at 1 TB/s vs actual 3.65 ms → IMMA-issue
+    bound. **Conclusion: same MMQ design nvcc/ptxas schedules to ~92% of the mma
+    ceiling (169 TOPS), Mojo's backend reaches 36% (66 TOPS); no source-level
+    restructuring (this round + all prior) moves it.** All experiments REVERTED
+    (tree byte-identical to HEAD); committed `_big`-gated kernel retained. Honest
+    numbers this machine: FORGE Mistral-7B Q4_K prefill 512 **1857**, 4096 **3032**,
+    8192 **2473** tok/s (decode 146–175); Qwen Q8_0 4096 **19493** (decode 496);
+    llama.cpp pp4096 **12018** → **~4.0× behind** at 4096. Genuinely untried levers
+    both hit the same register wall or are outside our control: stream-K (global
+    fixup+atomics, kernel+launcher rewrite) and a Mojo compiler mma/LDS dual-issue
+    scheduling fix.
 
 ## FP8 (e4m3) — verified on sm_89
 - `DType.float8_e4m3fn` works end-to-end: buffers, kernel pointers, and

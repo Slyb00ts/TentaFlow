@@ -366,3 +366,125 @@ halve the X re-read traffic** (X is re-read `ceil(N/64)` times — the dominant 
 **larger per-warp register tiles** for a higher mma:load-byte ratio (needs 2-pass W staging and
 a full bit-exact reval of the MMQ path). That is a multi-day kernel rewrite, not a low-risk pass;
 it was not attempted here rather than ship a regression or an unverified stub.
+
+---
+
+## 2026-07-19 — Reading llama.cpp's MMQ source and replicating its scheme (Phase 1 + 2)
+
+Prior tuning was black-box. This round READ llama.cpp's open-source MMQ kernel
+(`scratch/bench/llama.cpp/ggml/src/ggml-cuda/{mmq.cuh,mmq-vec-dot.cuh,mmq-load-tiles.cuh,
+mma.cuh,mmq-config-ampere.cuh}`, build `571d0d5`) to find the structural reason for
+65 (ours) vs ~169 TOPS (theirs), then tried to replicate it in `gemm_i8mma_impl`.
+
+### Phase 1 — llama.cpp Q4_K / Q8_0 MMQ scheme (as read from source)
+
+**mma instruction (Ada, `mma.cuh`):** identical to ours — `mma.sync.aligned.m16n8k32.row.col.
+s32.s8.s8.s32`, A tile `<16,8,int>` = 4×b32 (16 s8), B tile `<8,8,int>` = 2×b32 (8 s8),
+C/D `<16,8,int>` = 4×s32. Turing path also has a 2×`m8n8k16` fallback; Ada uses the m16n8k32.
+This is exactly our `_mma_s8`.
+
+**Tile config (`mmq-config-ampere.cuh`, used for Ada = cc 8.9):** for BOTH Q4_K and Q8_0:
+`nthreads=256` (**8 warps**), `occupancy=1` (target **1 CTA/SM**), `I=128` (weight rows/block),
+`J` = up to `128` (tokens/block), `K_vram=MMQ_ITER_K=256`, `stream_k=true`. Q4_K uses the Q8_1
+sram layout, Q8_0 the Q8_0 layout. `rows_per_warp = (J>=48 && J%16==0) ? 32 : 16` → 32 for J=128.
+
+**Warp→tile mapping (`mmq-vec-dot.cuh` `vec_dot_q8_0_q8_1_mma`, non-AMD `#else`):**
+`tile_C=<16,8,int>` (ne=4). `ntx = rows_per_warp/16 = 2` minitiles/warp in the I(row) direction.
+`i0 = (threadIdx.y/ntx)*rows_per_warp` → 8 warps / ntx(2) = 4 row-bands of 32 rows; the 2 warps
+in a band split J. The j-loop `for j0 in 0..J step ntx*8` × ntx n-tiles → each warp holds
+`J/(ntx*8) * ntx * tile_C::ne`. For J=128: **64 f32 accumulators per thread** (32 rows × 64 cols
+per warp ÷ 32 lanes). A fragments (`A[ntx][MMQ_TILE_NE_K/QI8_0]`) and dA scales are pre-loaded
+into registers ONCE per 32-K block; **B is loaded with `load_generic` (plain int loads) —
+the source comment says "faster than load_ldmatrix"**; scale applied per 32-block
+`sum += C.x[l]*dA*dB` (Q8_0) / with the 6-bit sub-scale + `dmin*Σq` min-correction (Q4_K).
+
+**load_tiles (`mmq-load-tiles.cuh`):** Q8_0 and Q4_K store the int8 codes into smem **row-major
+with a `+pad` stride** (`x_qs[i*sram_stride + k]`); NO exotic pre-repack for conflict-free
+ldmatrix on the NV mma path — the `+4`/`+I` padding in `tile_x_sizes` is the only conflict
+avoidance. Scales/mins go to a separate `x_df`/`x_dm` smem region. So the smem layout is
+essentially what our kernel already uses.
+
+**k-loop / pipeline (`mmq.cuh` `mul_mat_q_process_tile`):** `load_tiles` fills the full x-tile,
+then a double-buffered tile_y with a **4-`__syncthreads` per 64-K** cadence (load y-half A, sync,
+vec_dot(0), sync, load y-half B, sync, vec_dot(32), sync). Plain register-staged global→smem
+copies (no cp.async in this build's mainloop). **stream-K** splits the K dimension across CTAs
+with a `tmp_fixup` reduction pass so all SMs stay busy when the M×N tile grid is small.
+
+### Point-by-point DIFF vs our `gemm_i8mma_impl`
+
+| aspect | llama.cpp (Ada) | ours (committed `_big` = `[128,128,16]`) |
+|---|---|---|
+| mma instruction | m16n8k32.s8.s8.s32 | **same** |
+| tile M(tok)×N(row) | 128×128 (J×I) | 128×128 |
+| warps / block | **8** (256 thr) | 16 (512 thr) |
+| f32 acc / thread | **64** | 32 |
+| CTAs/SM (occupancy) | 1 | 1 |
+| smem x/w layout | row-major + pad | row-major + pad (**same**) |
+| weight repack | none (NV mma path) | none (**same**) |
+| per-block scaling | I2F + FMA per element | I2F + FMA per element (**same**) |
+| B fragment load | `load_generic` (plain LDS) | `ld_matrix` (LDSM) |
+| K work-split | **stream-K + fixup** | one CTA does full K |
+
+The design point is essentially IDENTICAL (tile, mma, scaling, smem, no repack). The only real
+structural differences are (a) 8 warps × 64-acc/thread vs our 16 × 32, (b) stream-K, (c) B via
+plain loads vs ldmatrix.
+
+### Phase 2 — replicating each difference (all measured, isolated `bench_gemm_i8mma.mojo`)
+
+Our kernel is already parametrized `[BM,BN,NW,FMT]`, so llama.cpp's exact register shape is just
+`[128,128,8]` (8 warps → M_WARPS=4, N_WARPS=2, NT_PER_WARP=8 → **64 f32 acc/thread**, matching
+their layout). Q4_K, RTX 4090, INT8 TOPS (higher = better):
+
+| shape (N/K/T) | committed `_big` (16w, 32acc) | `llt` = llama shape (8w, 64acc) | mma-burst (deferred epilogue) |
+|---|--:|--:|--:|
+| 14336/4096/512  | 62.0 | 57.6 | 62.3 |
+| 4096/14336/512  | 61.8 | 57.9 | 61.9 |
+| 14336/4096/2048 | **66.0** | 61.0 | 66.0 |
+| 4096/14336/2048 | 65.4 | 60.4 | 65.4 |
+
+- **Matching llama.cpp's 8-warp / 64-acc register tile (`llt`) is ~7% SLOWER**, not faster.
+  Fewer warps at higher per-thread ILP loses to more warps at 32-acc on this Mojo codegen.
+- **mma-burst** (preload ALL B fragments, issue MT×NT mma back-to-back, then a fully deferred
+  f32-epilogue burst) is **bit-for-bit the same TOPS as the committed interleaved loop**
+  (65.98 vs 65.97 @ T=2048). ptxas already schedules the epilogue over the mma; the ordering
+  is not the bottleneck. SASS (`cuobjdump -sass`) confirms: IMMAs carry `.reuse` operand flags
+  and the I2FP/FFMA epilogue is already interleaved into the mma stream; 127 regs, **0 spills**,
+  1 CTA/SM.
+- **BN=256** (the only remaining X-re-read-traffic lever, X is re-read `ceil(N/BN)×`) **cannot
+  launch**: 64-acc/thread × 512 threads exceeds the 65536-reg/block limit →
+  `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`. BN is register-capped at 128.
+
+**Is it bandwidth-bound?** No. Correct traffic for 14336/4096/2048: W = 14336·4096·(144/256) =
+33.4 MB read once; X = 2048·4096 int8 = 8.4 MB re-read `ceil(14336/128)=112×` = 940 MB; out =
+59 MB → ~1.03 GB total. At the 4090's ~1 TB/s that is ~1.0 ms, but the kernel takes 3.65 ms →
+**compute/issue-bound, not DRAM-bound** (X also largely fits the 72 MB L2). So the wall is
+IMMA-issue efficiency: 66 TOPS = 36% of the 184-TOPS pure-mma microbench ceiling, 20% of the
+330-TOPS hw peak.
+
+### llama.cpp reconfirmed on current machine state
+
+```
+$ ./build/bin/llama-bench -m .../mistral-7b-q4_k_m.gguf -ngl 99 -p 4096 -n 128
+| llama 7B Q4_K - Medium | 4.07 GiB | 7.25 B | CUDA | 99 | pp4096 | 12018.02 ± 108.73 |
+| llama 7B Q4_K - Medium | 4.07 GiB | 7.25 B | CUDA | 99 |  tg128 |   182.53 ±   0.28 |
+```
+
+### Outcome — nothing shipped, committed kernel retained
+
+Every Phase-2 change (`llt`, mma-burst, BN=256) either regressed or was flat/uncompilable, so
+none beats the committed `_big`-gated kernel. Per the "never ship slower than committed" bar, all
+experiments were **reverted**; the working tree is byte-identical to `HEAD` for the kernel.
+
+**Honest remaining gap:** FORGE prefill ~2827 tok/s (committed, gated `_big`) vs llama.cpp 12018
+@ pp4096 = **~4.25× behind**, driven by the Q4_K int8-mma GEMM sitting at 66 TOPS (36% of its own
+mma ceiling) vs llama.cpp's ~169 (92%). The cause is now pinned precisely: it is **NOT** the
+algorithm (tile, mma, per-block scaling, smem layout, and register-tile shape were all read from
+their source and are identical or reproducible), and **NOT** DRAM bandwidth (measured ~3.5×
+under the roofline). It is **IMMA-issue efficiency of the Mojo-emitted inner loop** — the exact
+same MMQ design that nvcc/ptxas schedules to 92% of the mma ceiling, Mojo's backend schedules to
+36%, and no source-level restructuring (warp count, register-tile size, mma/epilogue ordering,
+barrier count, ldmatrix pairing — this round and the four prior) moves it. The two genuinely
+untried levers both carry the same register-pressure wall that already blocks BN=256:
+**stream-K** (needs a global fixup/reduction buffer + atomics, a real kernel+launcher rewrite)
+and a Mojo-compiler improvement to the mma/LDS dual-issue schedule (outside our control). Both
+are out of scope for a low-risk pass and neither is guaranteed to close a 36%→92% backend gap.

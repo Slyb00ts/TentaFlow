@@ -73,6 +73,24 @@ Ostatnia aktualizacja: 2026-07-19.
     kernel z repo zachowany. Jedyny pozostały lever to przepisanie architektury
     (BN=128 by o połowę ściąć re-read X, większe kafle rejestrowe) —
     `docs/BENCH_COMPARISON.md`.
+  - ℹ️ **Studium źródeł MMQ llama.cpp + replikacja schematu (2026-07-19): luka to
+    codegen Mojo, NIE algorytm — nic nie wdrożono.** Przeczytany kernel MMQ
+    llama.cpp (`mmq{.cuh,-vec-dot,-load-tiles}`, `mma.cuh`, config ampere, build
+    `571d0d5`): ich Ada Q4_K/Q8_0 MMQ = `mma.sync.m16n8k32.s8.s8.s32` (== nasz
+    `_mma_s8`), kafel I=128×J=128, **8 warpów**, occupancy=1, **64 f32 acc/wątek**,
+    smem row-major+pad (BEZ egzotycznego repacku na ścieżce mma NV), skalowanie
+    per-blok-32, B przez `load_generic`, plus **stream-K**. Punkt projektowy
+    IDENTYCZNY z naszym poza (a) 8w×64acc vs 16w×32acc, (b) stream-K. Zreplikowano
+    (a) wprost (`[128,128,8]` = ich kształt): **~7 % WOLNIEJ** (T=2048 61 vs 66).
+    mma-burst (preload B, MT×NT mma pod rząd, epilog odroczony): **TOPS bit-
+    identyczny** (65.98 vs 65.97). BN=256: **nie startuje** (64acc×512thr > 65536
+    rej). Nie DRAM-bound (ruch ~1.03 GB → ~1 ms vs 3.65 ms realne → issue-bound).
+    **Ten sam projekt MMQ ptxas z nvcc skaluje do ~92 % sufitu mma (169 TOPS),
+    backend Mojo do 36 % (66 TOPS).** Wszystko cofnięte (drzewo == HEAD). Liczby
+    tej maszyny: FORGE prefill 512 **1857**, 4096 **3032**, 8192 **2473** tok/s
+    (decode 146–175); Qwen Q8_0 4096 **19493**; llama.cpp pp4096 **12018** →
+    **~4.0× za**. Nietknięte levery (oba za ścianą rejestrów / poza nami): stream-K
+    i poprawka schedulera mma/LDS w kompilatorze Mojo.
 - ✅ **Silnik LLM**: forward, paged KV, fused decode chain, batched continuous
   decode (36× throughput), chunked prefill, admission control, CUDA-graph per bucket
 - ✅ **Drabinka kwantyzacji KV**: f16 → fp8 → rot4 → rot3 (TurboQuant)
