@@ -292,3 +292,66 @@ on 1 and 4 lanes.
   two k-stages per barrier to keep the tensor pipe busier. Medium risk, needs bit-exact reval.
 - **Fused flash-attention-style prefill** and/or **persistent single-megakernel** — the real
   llama.cpp-parity path, explicitly out of scope for a low-risk pass.
+
+---
+
+## GEMM ILP / barrier pass (2026-07-19) — every lever measured, NOTHING shipped (all no-op or regression)
+
+Goal was 2–3× on the int8 tensor-core MMQ prefill GEMM (81% of prefill, ~57 of 184 s8-mma
+TOPS ≈ 31% of ceiling). Each variant was verified bit-identical (integer mma is exact — the
+i8mma output matched the committed kernel to the last bit; `test_gemm_i8mma.mojo` rel err
+unchanged at 4.6e-4, bm64 bit-identical) and timed with the fixed `bench_gemm_i8mma.mojo`
+microbench (the committed one was stale — wrong 6-arg signature, didn't compile; rewritten to
+the pre-quant path + INT8-TOPS report) plus `forge bench` end-to-end.
+
+**Isolated GEMM microbench (Q4_K, i8mma bm128, RTX 4090, TOPS):**
+
+| variant | T=128 | T=512 (N14336 K4096) | T=2048 |
+|---|--:|--:|--:|
+| committed baseline | 28.8 | 57.1 | 58.0 |
+| +separate mma-issue from f32 epilogue (lever 3) | 30.8 | 57.1 | 58.2 |
+| +2 k-stages/barrier (CK=2, lever 1) | 33.1 | 57.1 | 58.9 |
+| +unroll the CK stage loop (cross-stage sched) | 37.0 | 57.2 | 58.5 |
+| +paired B `ld_matrix.x4` (2 n-tiles/load, halves B loads, lever 5) | 37.9 | 57.2 | 58.8 |
+| diagnostic: strip q4_k min-correction epilogue | — | 57.3 | 58.9 |
+
+**Reading of the data — the large-T prefill regime is at a hardware wall, not a software one:**
+- Separating mma from the epilogue: **neutral** at large T. The compiler already schedules the
+  8 independent per-stage mma; there was no RAW stall to remove.
+- 2 k-stages/barrier (448→224 barriers at K=14336): **+15% at T=128, flat (±1%) at T≥512.**
+  Barrier count is NOT the large-T cost.
+- Stripping the entire q4_k per-block min-correction epilogue: **57.1→57.3, i.e. free** — the
+  f32 scale epilogue is fully hidden in the tensor pipe's shadow, so it is not the bottleneck.
+- Halving the B `ld_matrix` count (2 n-tiles per `ld_matrix.x4`): **neutral at large T.** Not
+  ldmatrix-issue bound either.
+- TOPS is **constant across T=512→2048 (57→59)** and immune to barrier / epilogue / ldmatrix
+  reductions — the signature of a throughput/bandwidth wall for THIS tile shape, not a
+  latency/issue-rate bound the ILP levers could relieve. ~31% of the 184-TOPS ceiling is where
+  this MMQ tiling saturates.
+
+**End-to-end (`forge bench`, `--prefix-cache off`) — the combined CK=2 + unroll + paired-B
+kernel REGRESSES and is otherwise flat, so it was reverted:**
+
+| shape (P/T) | committed | CK2+unroll+pairedB | Δ |
+|---|--:|--:|--:|
+| Mistral-7B Q4_K 512/128   | 2346 (2340–2521 over 4 runs) | 1754 | **−25%** |
+| Mistral-7B Q4_K 4096/2048 | 2818 | 2800 | −0.7% (noise) |
+| Mistral-7B Q4_K 8192/1024 | 2339 | 2357 | +0.8% (noise) |
+| Qwen3-0.6B Q8_0 4096/512  | 19470 | 19706 | +1.2% (noise) |
+
+Decode bit-unchanged (uses the dp4a GEMV): Mistral 146.2, Qwen 496 tok/s.
+
+The 512-prompt regression is the tell: multi-stage buffering doubles the smem (15→30 KB) and
+the register prefetch state, which drops the kernel below 2 CTAs/SM. That is invisible at the
+saturated large-T wall (bandwidth/throughput-bound) but expensive for the many short GEMMs of a
+512-prefill — reaffirming `MOJO_NOTES.md`: this kernel is occupancy-sensitive and cannot afford
+more per-thread state (the same reason `.maxnreg` regressed). **Reverted to the committed kernel.**
+
+**Conclusion:** the four instruction-level levers (issue-reorder, barrier-cut, ldmatrix-cut,
+epilogue) cannot move large-T prefill because it is not issue/latency bound at that shape — it
+sits at a ~57-TOPS tiling/bandwidth wall. The only remaining real lever for the 4.3× gap is the
+architectural rewrite the notes already flag as high-risk/out-of-scope: **BN=128 rows/block to
+halve the X re-read traffic** (X is re-read `ceil(N/64)` times — the dominant byte stream), plus
+**larger per-warp register tiles** for a higher mma:load-byte ratio (needs 2-pass W staging and
+a full bit-exact reval of the MMQ path). That is a multi-day kernel rewrite, not a low-risk pass;
+it was not attempted here rather than ship a regression or an unverified stub.

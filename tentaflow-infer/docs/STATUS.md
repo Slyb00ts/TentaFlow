@@ -47,6 +47,22 @@ Ostatnia aktualizacja: 2026-07-19.
     (1024→2048) = neutralne. Nic nie wdrożono. Realna praca na lukę 4.3×: Q6_K
     down-proj przez int8-mma (~+5 %), redukcja `barrier()` per 32 kol, fused
     flash-attn prefill / megakernel (przyszłe pasy) — `docs/BENCH_COMPARISON.md`.
+  - ℹ️ **Pas ILP/barier i8mma (2026-07-19): każdy lever zmierzony, NIC nie
+    wdrożono (no-op lub regresja).** Zaimplementowane bit-identycznie (mma int
+    jest dokładne): (1) rozdział wydania mma od epilogu f32, (2) 2 k-stage'y na
+    `barrier()` (`CK=2`, 448→224 barier), (3) unroll pętli CK, (4) parowane B
+    `ld_matrix.x4` (2 n-tile/instrukcja, połowa ldmatrix B). Mikrobench Q4_K
+    bm128: wszystkie pomagają TYLKO przy małym T (T=128 28.8→37.9 TOPS), płasko
+    ±1 % przy T≥512 (57→59 TOPS ≈ 31 % sufitu 184). Diagnostyka: usunięcie CAŁEGO
+    epilogu min-korekcji q4_k jest darmowe (57.1→57.3) — epilog f32 jest w pełni
+    ukryty. TOPS stały T=512→2048 i odporny na cięcia barier/epilogu/ldmatrix →
+    duże-T to ściana przepustowości/pasma dla tego kształtu kafla, nie limit
+    issue/latency. E2e łączny kernel płaski przy 4096/8192 i **regresuje Mistral
+    512 prefill −25 %** (2346→1754): dodatkowy smem/rejestry spycha poniżej
+    2 CTA/SM (ta sama wrażliwość na occupancy co `.maxnreg`). Wszystko cofnięte,
+    kernel z repo zachowany. Jedyny pozostały lever to przepisanie architektury
+    (BN=128 by o połowę ściąć re-read X, większe kafle rejestrowe) —
+    `docs/BENCH_COMPARISON.md`.
 - ✅ **Silnik LLM**: forward, paged KV, fused decode chain, batched continuous
   decode (36× throughput), chunked prefill, admission control, CUDA-graph per bucket
 - ✅ **Drabinka kwantyzacji KV**: f16 → fp8 → rot4 → rot3 (TurboQuant)

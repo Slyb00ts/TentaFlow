@@ -174,6 +174,28 @@ Published tutorials mostly show pre-1.0 syntax — trust these notes over old do
     no-ops. The remaining real levers: (a) Q6_K down-proj via int8-mma (`FMT==2`;
     care: Q6_K has 16-wide scale sub-blocks vs mma k=32 → two scales per stage),
     (b) fewer `barrier()` (2 k-stages/barrier), (c) fused/persistent prefill.
+  - **Barrier / ILP / ldmatrix levers all measured — NONE move large-T prefill
+    (2026-07-19).** Implemented and verified bit-identical (integer mma is exact):
+    (1) separate mma-issue from the f32 epilogue, (2) 2 k-stages/barrier `CK=2`
+    (448→224 barriers, doubled smem 15→30 KB + register prefetch), (3) unroll the
+    CK stage loop for cross-stage scheduling, (4) paired B `ld_matrix.x4` loading
+    2 n-tiles/instruction (halves B ldmatrix). Isolated microbench (Q4_K bm128):
+    all four help ONLY small T (T=128 28.8→37.9 TOPS) and are **flat within ±1%
+    at T≥512** (57→59 TOPS = the same ~31% of the 184-TOPS ceiling). Diagnostic:
+    deleting the ENTIRE q4_k min-correction epilogue is free (57.1→57.3) — the f32
+    epilogue is fully hidden. TOPS is constant across T=512→2048 and immune to
+    barrier/epilogue/ldmatrix cuts → large-T is at a throughput/bandwidth WALL for
+    this tile shape, not issue/latency bound. End-to-end the combined kernel is
+    flat at 4096/8192 and **REGRESSES Mistral 512 prefill −25%** (2346→1754): the
+    extra smem/regs drop it below 2 CTAs/SM, invisible at the large-T wall but
+    costly for the many short GEMMs of a 512-prefill (same occupancy sensitivity
+    as the `.maxnreg` finding). **All reverted; committed kernel kept.** The only
+    lever left for the 4.3× gap is architectural: BN=128 rows/block to halve the
+    dominant X re-read traffic (X re-read `ceil(N/64)` times) + larger per-warp
+    register tiles for a higher mma:load-byte ratio (needs 2-pass W staging + full
+    bit-exact reval) — a multi-day rewrite, not a low-risk pass.
+    `bench_gemm_i8mma.mojo` was stale (wrong 6-arg signature, didn't compile);
+    rewritten to the pre-quant path + INT8-TOPS report.
 
 ## FP8 (e4m3) — verified on sm_89
 - `DType.float8_e4m3fn` works end-to-end: buffers, kernel pointers, and
