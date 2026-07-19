@@ -168,6 +168,303 @@ __device__ __forceinline__ void forge_mmq_body(
                                        stride_row_x, ncols_y, stride_col_dst);         \
     }
 
+// ---------------------------------------------------------------------------
+// Stream-K process_tile: the same ggml K-reduction loop as forge_mmq_body, but
+// parameterized by the [kb0_start, kb0_stop) K-range a stream-K block owns and a
+// `fixup` flag. All-but-the-last partial of a tile write to the f16 dst via
+// forge_mmq_write_back_f16 (same f16 epilogue as the dense path); the boundary
+// partial writes its float accumulators to the per-block fixup buffer with
+// ggml's verbatim `mmq_write_back_mma`, to be summed later by the fixup kernel.
+// Byte-identical compute to mul_mat_q_process_tile (mmq.cuh) — only dst dtype and
+// the non-fixup write-back differ.
+// ---------------------------------------------------------------------------
+template <ggml_type type, int mmq_x, bool need_check, bool fixup>
+__device__ __forceinline__ void forge_mmq_process_tile(
+        const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
+        const int * __restrict__ ids_dst, __half * __restrict__ dst, float * __restrict__ tmp_fixup,
+        const int stride_row_x, const int ncols_y, const int stride_col_dst,
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+    constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
+    constexpr int              nwarps     = mmq_get_nwarps_device();
+    constexpr int              qk         = ggml_cuda_type_traits<type>::qk;
+    constexpr int              mmq_y      = get_mmq_y_device();
+    constexpr load_tiles_mmq_t load_tiles = mmq_type_traits<mmq_x, mmq_y, need_check, type>::load_tiles;
+    constexpr vec_dot_mmq_t    vec_dot    = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_mma;
+
+    extern __shared__ int data_mul_mat_q[];
+    int * tile_y = data_mul_mat_q + mmq_x;
+    int * tile_x = tile_y + GGML_PAD(mmq_x*MMQ_TILE_Y_K, nwarps*warp_size);
+
+    constexpr int ne_block        = 4 * QK8_1;
+    constexpr int sz              = sizeof(block_q8_1_mmq) / sizeof(int);
+    constexpr int ITER_K          = get_iter_k(type);
+    constexpr int blocks_per_iter = ITER_K / qk;
+
+    float sum[mmq_x*mmq_y / (nwarps*warp_size)] = {0.0f};
+
+    for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+        {
+            const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+#pragma unroll
+            for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                tile_y[l] = by0[l];
+            }
+        }
+        __syncthreads();
+        vec_dot(tile_x, tile_y, sum, 0);
+        __syncthreads();
+        {
+            const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+#pragma unroll
+            for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                tile_y[l] = by0[l];
+            }
+        }
+        __syncthreads();
+        vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+        __syncthreads();
+    }
+
+    if (fixup) {
+        mmq_write_back_mma<type, mmq_x, mmq_y, need_check>(
+            sum, ids_dst, tmp_fixup + blockIdx.x*(mmq_x*mmq_y), mmq_y, mmq_y, mmq_x);
+    } else {
+        forge_mmq_write_back_f16<mmq_x, mmq_y, need_check>(
+            sum, ids_dst, dst, stride_col_dst, tile_x_max_i, tile_y_max_j);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stream-K GEMM driver (dense, single channel/sample, no MoE). A copy of ggml's
+// `mul_mat_q` stream-K branch (mmq.cuh, __CUDA_ARCH__ >= VOLTA) specialized to
+// nchannels_y == nsamples_y == 1 and ids_dst == nullptr, so the ntx/nty tile grid
+// is balanced across exactly gridDim.x == nsm blocks. Each block walks a
+// contiguous slice of the flattened (tile_row, tile_col, k_block) iteration space;
+// full-tile spans write f16 dst directly, the trailing partial writes to the fixup
+// buffer. ncols_max == ncols_dst for the dense case.
+// ---------------------------------------------------------------------------
+template <ggml_type type, int mmq_x, bool need_check>
+__device__ __forceinline__ void forge_mmq_stream_k_body(
+        const char * __restrict__ x, const int * __restrict__ y, __half * __restrict__ dst,
+        float * __restrict__ tmp_fixup,
+        const int ncols_x, const int nrows_x, const int ncols_dst,
+        const int stride_row_x, const int ncols_y, const int stride_col_dst) {
+    constexpr int nwarps    = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
+    constexpr int mmq_y     = get_mmq_y_device();
+
+    const int ncols_max = ncols_dst;
+    const int ntx = (ncols_max + mmq_x - 1) / mmq_x;
+    const int nty = (nrows_x   + mmq_y - 1) / mmq_y;
+
+    extern __shared__ int ids_dst_shared[];
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
+        const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+        if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
+            break;
+        }
+        ids_dst_shared[j] = j;
+    }
+    __syncthreads();
+
+    constexpr int ITER_K          = get_iter_k(type);
+    const     int64_t blocks_per_ne00 = ncols_x / qk;
+    constexpr int     blocks_per_iter = ITER_K / qk;
+
+    int64_t kbc      = (int64_t) blockIdx.x     *ntx*nty*blocks_per_ne00 / gridDim.x;
+    int64_t kbc_stop = (int64_t)(blockIdx.x + 1)*ntx*nty*blocks_per_ne00 / gridDim.x;
+
+    kbc      -= (kbc      % blocks_per_ne00) % blocks_per_iter;
+    kbc_stop -= (kbc_stop % blocks_per_ne00) % blocks_per_iter;
+
+    int kb0_start = kbc % blocks_per_ne00;
+    int kb0_stop  = min(blocks_per_ne00, kb0_start + kbc_stop - kbc);
+    while (kbc < kbc_stop && kb0_stop == blocks_per_ne00) {
+        int tmp = kbc;
+        const int it = tmp / (ntx*blocks_per_ne00);
+        tmp -= it * (ntx*blocks_per_ne00);
+        const int jt = tmp / blocks_per_ne00;
+
+        const int offset_y   = jt*mmq_x * (sizeof(block_q8_1_mmq)/sizeof(int));
+        const int offset_dst = jt*mmq_x*stride_col_dst + it*mmq_y;
+
+        const int tile_x_max_i = nrows_x   - it*mmq_y - 1;
+        const int tile_y_max_j = ncols_dst - jt*mmq_x - 1;
+
+        const int offset_x = it*mmq_y*stride_row_x;
+
+        forge_mmq_process_tile<type, mmq_x, need_check, false>(
+            x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup,
+            stride_row_x, ncols_y, stride_col_dst, tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+
+        kbc += blocks_per_ne00;
+        kbc -= kbc % blocks_per_ne00;
+
+        kb0_start = 0;
+        kb0_stop  = min(blocks_per_ne00, kbc_stop - kbc);
+    }
+
+    if (kbc >= kbc_stop) {
+        return;
+    }
+
+    int tmp = kbc;
+    const int it = tmp / (ntx*blocks_per_ne00);
+    tmp -= it * (ntx*blocks_per_ne00);
+    const int jt = tmp / blocks_per_ne00;
+
+    const int offset_y   = jt*mmq_x * (sizeof(block_q8_1_mmq)/sizeof(int));
+    const int offset_dst = jt*mmq_x*stride_col_dst + it*mmq_y;
+
+    const int tile_x_max_i = nrows_x   - it*mmq_y - 1;
+    const int tile_y_max_j = ncols_dst - jt*mmq_x - 1;
+
+    const int offset_x = it*mmq_y*stride_row_x;
+
+    forge_mmq_process_tile<type, mmq_x, need_check, true>(
+        x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup,
+        stride_row_x, ncols_y, stride_col_dst, tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+}
+
+// ---------------------------------------------------------------------------
+// Stream-K fixup reduction (dense). A copy of ggml's `mul_mat_q_stream_k_fixup`
+// (mmq.cuh) for the ids_dst == nullptr, single channel/sample case, with the f16
+// destination: the partial tiles that neighbouring blocks parked in the fixup
+// buffer are summed into the boundary tile that the owning block already wrote to
+// dst. The accumulate is a half read-modify-write (f16 += float); within q8_1
+// tolerance since each dst element receives at most one fixup add.
+// ---------------------------------------------------------------------------
+template <ggml_type type, int mmq_x, bool need_check>
+__device__ __forceinline__ void forge_mmq_stream_k_fixup_body(
+        __half * __restrict__ dst, const float * __restrict__ tmp_last_tile,
+        const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_col_dst) {
+    constexpr int     mmq_y           = get_mmq_y_device();
+    constexpr int     qk              = ggml_cuda_type_traits<type>::qk;
+    constexpr int     ITER_K          = get_iter_k(type);
+
+    constexpr int     blocks_per_iter = ITER_K / qk;
+    const     int64_t blocks_per_ne00 = ncols_x / qk;
+
+    constexpr int nwarps    = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    float sum[mmq_x*mmq_y / (nwarps*warp_size)] = {0.0f};
+
+    const int ncols_max = ncols_dst;
+    const int ntx  = (ncols_max + mmq_x - 1) / mmq_x;
+    const int nty  = (nrows_x   + mmq_y - 1) / mmq_y;
+
+    const int bidx0 = blockIdx.x;
+
+    int64_t kbc0      = (int64_t) bidx0     *ntx*nty*blocks_per_ne00 / gridDim.x;
+    int64_t kbc0_stop = (int64_t)(bidx0 + 1)*ntx*nty*blocks_per_ne00 / gridDim.x;
+
+    kbc0      -= (kbc0      % blocks_per_ne00) % blocks_per_iter;
+    kbc0_stop -= (kbc0_stop % blocks_per_ne00) % blocks_per_iter;
+
+    const bool did_not_have_any_data   = kbc0 == kbc0_stop;
+    const bool wrote_beginning_of_tile = kbc0 % blocks_per_ne00 == 0;
+    const bool did_not_write_last      = kbc0/blocks_per_ne00 == kbc0_stop/blocks_per_ne00 && kbc0_stop % blocks_per_ne00 != 0;
+    if (did_not_have_any_data || wrote_beginning_of_tile || did_not_write_last) {
+        return;
+    }
+
+    bool any_fixup = false;
+
+    int64_t bidx = bidx0 - 1;
+    int64_t kbc_stop = kbc0;
+    while(true) {
+        int64_t kbc = bidx*ntx*nty*blocks_per_ne00 / gridDim.x;
+        kbc -= (kbc % blocks_per_ne00) % blocks_per_iter;
+
+        if (kbc == kbc_stop) {
+            bidx--;
+            kbc_stop = kbc;
+            continue;
+        }
+
+        any_fixup = true;
+
+#pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+
+#pragma unroll
+            for (int i0 = 0; i0 < mmq_y; i0 += warp_size) {
+                const int i = i0 + threadIdx.x;
+
+                sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size] += tmp_last_tile[bidx*(mmq_x*mmq_y) + j*mmq_y + i];
+            }
+        }
+
+        if (kbc % blocks_per_ne00 == 0 || kbc/blocks_per_ne00 < kbc0/blocks_per_ne00) {
+            break;
+        }
+        bidx--;
+        kbc_stop = kbc;
+    }
+
+    if (!any_fixup) {
+        return;
+    }
+
+    int tmp = kbc0;
+    const int it = tmp / (ntx*blocks_per_ne00);
+    tmp -= it * (ntx*blocks_per_ne00);
+    const int jt = tmp / blocks_per_ne00;
+
+    const int offset_dst = jt*mmq_x*stride_col_dst + it*mmq_y;
+    dst += offset_dst;
+
+    const int i_max = nrows_x   - it*mmq_y - 1;
+    const int j_max = ncols_dst - jt*mmq_x - 1;
+
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += nwarps) {
+        const int j = j0 + threadIdx.y;
+
+        if (j > j_max) {
+            return;
+        }
+
+#pragma unroll
+        for (int i0 = 0; i0 < mmq_y; i0 += warp_size) {
+            const int i = i0 + threadIdx.x;
+
+            if (need_check && i > i_max) {
+                continue;
+            }
+
+            const int idx = j*stride_col_dst + i;
+            dst[idx] = __float2half(__half2float(dst[idx]) + sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size]);
+        }
+    }
+}
+
+#define FORGE_MMQ_SK_ENTRY(NAME, TYPE, MMQX, NC)                                          \
+    extern "C" __global__ void __launch_bounds__(MMQ_NWARPS*32, 1) NAME(                  \
+            const char * x, const int * y, __half * dst, float * fixup,                   \
+            const int ncols_x, const int nrows_x, const int ncols_dst,                    \
+            const int stride_row_x, const int ncols_y, const int stride_col_dst) {        \
+        forge_mmq_stream_k_body<TYPE, MMQX, NC>(x, y, dst, fixup, ncols_x, nrows_x,       \
+                                                ncols_dst, stride_row_x, ncols_y,         \
+                                                stride_col_dst);                          \
+    }
+
+#define FORGE_MMQ_FIX_ENTRY(NAME, TYPE, MMQX, NC)                                         \
+    extern "C" __global__ void __launch_bounds__(MMQ_NWARPS*32, 1) NAME(                  \
+            __half * dst, const float * fixup,                                            \
+            const int ncols_x, const int nrows_x, const int ncols_dst,                    \
+            const int stride_col_dst) {                                                   \
+        forge_mmq_stream_k_fixup_body<TYPE, MMQX, NC>(dst, fixup, ncols_x, nrows_x,       \
+                                                      ncols_dst, stride_col_dst);         \
+    }
+
 // One entry per (weight type, mmq_x, need_check). ggml's `mul_mat_q_case` picks
 // the smallest mmq_x (multiple of its granularity, smem <= smpbo) minimizing
 // ceil(tokens/mmq_x); the Rust launcher replicates that choice (identical smem
@@ -179,6 +476,18 @@ __device__ __forceinline__ void forge_mmq_body(
 #define FORGE_MMQ_Q6K_PAIR(MMQX)                                              \
     FORGE_MMQ_ENTRY(forge_mmq_q6k_x##MMQX##_nc, GGML_TYPE_Q6_K, MMQX, false)  \
     FORGE_MMQ_ENTRY(forge_mmq_q6k_x##MMQX##_c,  GGML_TYPE_Q6_K, MMQX, true)
+
+// Stream-K driver + fixup entries, one set per (weight type, mmq_x, need_check).
+#define FORGE_MMQ_SK_Q4K_PAIR(MMQX)                                                    \
+    FORGE_MMQ_SK_ENTRY(forge_mmq_sk_q4k_x##MMQX##_nc, GGML_TYPE_Q4_K, MMQX, false)     \
+    FORGE_MMQ_SK_ENTRY(forge_mmq_sk_q4k_x##MMQX##_c,  GGML_TYPE_Q4_K, MMQX, true)      \
+    FORGE_MMQ_FIX_ENTRY(forge_mmq_fix_q4k_x##MMQX##_nc, GGML_TYPE_Q4_K, MMQX, false)   \
+    FORGE_MMQ_FIX_ENTRY(forge_mmq_fix_q4k_x##MMQX##_c,  GGML_TYPE_Q4_K, MMQX, true)
+#define FORGE_MMQ_SK_Q6K_PAIR(MMQX)                                                    \
+    FORGE_MMQ_SK_ENTRY(forge_mmq_sk_q6k_x##MMQX##_nc, GGML_TYPE_Q6_K, MMQX, false)     \
+    FORGE_MMQ_SK_ENTRY(forge_mmq_sk_q6k_x##MMQX##_c,  GGML_TYPE_Q6_K, MMQX, true)      \
+    FORGE_MMQ_FIX_ENTRY(forge_mmq_fix_q6k_x##MMQX##_nc, GGML_TYPE_Q6_K, MMQX, false)   \
+    FORGE_MMQ_FIX_ENTRY(forge_mmq_fix_q6k_x##MMQX##_c,  GGML_TYPE_Q6_K, MMQX, true)
 
 FORGE_MMQ_Q4K_PAIR(8)
 FORGE_MMQ_Q4K_PAIR(16)
@@ -213,6 +522,40 @@ FORGE_MMQ_Q6K_PAIR(104)
 FORGE_MMQ_Q6K_PAIR(112)
 FORGE_MMQ_Q6K_PAIR(120)
 FORGE_MMQ_Q6K_PAIR(128)
+
+FORGE_MMQ_SK_Q4K_PAIR(8)
+FORGE_MMQ_SK_Q4K_PAIR(16)
+FORGE_MMQ_SK_Q4K_PAIR(24)
+FORGE_MMQ_SK_Q4K_PAIR(32)
+FORGE_MMQ_SK_Q4K_PAIR(40)
+FORGE_MMQ_SK_Q4K_PAIR(48)
+FORGE_MMQ_SK_Q4K_PAIR(56)
+FORGE_MMQ_SK_Q4K_PAIR(64)
+FORGE_MMQ_SK_Q4K_PAIR(72)
+FORGE_MMQ_SK_Q4K_PAIR(80)
+FORGE_MMQ_SK_Q4K_PAIR(88)
+FORGE_MMQ_SK_Q4K_PAIR(96)
+FORGE_MMQ_SK_Q4K_PAIR(104)
+FORGE_MMQ_SK_Q4K_PAIR(112)
+FORGE_MMQ_SK_Q4K_PAIR(120)
+FORGE_MMQ_SK_Q4K_PAIR(128)
+
+FORGE_MMQ_SK_Q6K_PAIR(8)
+FORGE_MMQ_SK_Q6K_PAIR(16)
+FORGE_MMQ_SK_Q6K_PAIR(24)
+FORGE_MMQ_SK_Q6K_PAIR(32)
+FORGE_MMQ_SK_Q6K_PAIR(40)
+FORGE_MMQ_SK_Q6K_PAIR(48)
+FORGE_MMQ_SK_Q6K_PAIR(56)
+FORGE_MMQ_SK_Q6K_PAIR(64)
+FORGE_MMQ_SK_Q6K_PAIR(72)
+FORGE_MMQ_SK_Q6K_PAIR(80)
+FORGE_MMQ_SK_Q6K_PAIR(88)
+FORGE_MMQ_SK_Q6K_PAIR(96)
+FORGE_MMQ_SK_Q6K_PAIR(104)
+FORGE_MMQ_SK_Q6K_PAIR(112)
+FORGE_MMQ_SK_Q6K_PAIR(120)
+FORGE_MMQ_SK_Q6K_PAIR(128)
 
 // ---------------------------------------------------------------------------
 // Activation quant: f16 X [token][K] -> block_q8_1_mmq. Faithful copy of ggml's

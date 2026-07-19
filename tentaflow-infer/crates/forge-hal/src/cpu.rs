@@ -104,6 +104,7 @@ impl CpuDevice {
                 max_shared_mem_per_block: 0,
                 max_threads_per_block: 1,
                 warp_size: 1,
+                sm_count: 0,
                 fp8_native: false,
                 fp4_native: false,
                 bf16_native: false,

@@ -99,6 +99,11 @@ struct MmqScratch {
     /// into the caller's output, so no f32 output scratch is needed.
     q8: Option<DevBuffer>,
     cap_q8_bytes: usize,
+    /// Stream-K partial-tile buffer (`nsm * mmq_x * mmq_y` f32). Grow-only. The
+    /// stream-K GEMM parks boundary-tile partials here; `mul_mat_q_stream_k_fixup`
+    /// sums them back into the f16 dst.
+    fixup: Option<DevBuffer>,
+    cap_fixup_bytes: usize,
 }
 
 /// Device-resident ggml codebook tables (LE bytes of the u64/u32 grids).
@@ -1769,14 +1774,17 @@ impl Kernels {
     }
 
     /// Vendored llama.cpp `mul_mat_q` tensor-core GEMM (kernels/cuda/mmq_q4k.cu),
-    /// shared by the Q4_K and Q6_K prefill paths. Two launches on `stream`:
+    /// shared by the Q4_K and Q6_K prefill paths, launched in ggml's **stream-K**
+    /// work-partitioning mode (arXiv:2301.03598) — the way ggml balances MMQ tiles
+    /// across all SMs for these FFN shapes. Three launches on `stream`:
     /// (1) f16 activation → `block_q8_1_mmq` (`quant_key`: DS4 for Q4_K, D4 for
-    /// Q6_K), (2) the MMQ GEMM writing f16 straight into `y` (the f32→f16 convert
-    /// is folded into the kernel epilogue). `gemm_prefix` selects the weight-type
-    /// entry family (`mmq_q4k` / `mmq_q6k`). `w_byte_off` addresses the first
-    /// GGUF superblock of the row window. Layout/grid/smem replicate ggml's
-    /// `ggml_cuda_mul_mat_q` + `launch_mul_mat_q` for the dense 2-D case
-    /// (identical smem for both types — MMQ_MMA_TILE_X_K == 76).
+    /// Q6_K), (2) the stream-K MMQ GEMM (grid = one block per SM) writing f16
+    /// straight into `y` and parking boundary-tile partials in the fixup buffer,
+    /// (3) `mul_mat_q_stream_k_fixup` summing those partials back into `y`.
+    /// `gemm_prefix` selects the weight-type entry family (`mmq_q4k` / `mmq_q6k`).
+    /// `w_byte_off` addresses the first GGUF superblock of the row window. Grid /
+    /// tile count / fixup buffer replicate ggml's `launch_mul_mat_q` stream-K path
+    /// for the dense 2-D case (nsm from the device, ncols_max == n_tokens).
     #[allow(clippy::too_many_arguments)]
     fn gemm_mmq_at(
         &self,
@@ -1794,22 +1802,39 @@ impl Kernels {
         // block_q8_1_mmq = 144 B / 128 activation cols; ggml pads K to 512.
         const QMMQ: usize = 144;
         const MATRIX_ROW_PADDING: usize = 512;
+        const MMQ_Y: usize = 128; // get_mmq_y on Ada.
         let k_pad = cols.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
         // ggml over-allocates get_mmq_x_max (128) extra blocks past the tile.
         let q8_bytes = (k_pad / 128) * n_tokens * QMMQ + 128 * QMMQ;
 
         let (mmq_x, need_check, smem) = Self::mmq_kk_config(rows, n_tokens);
-        let gemm_key =
-            format!("{gemm_prefix}_x{mmq_x}_{}", if need_check { "c" } else { "nc" });
-        let gk = self.artifacts.get(&gemm_key)?;
+        let nc = if need_check { "c" } else { "nc" };
+        // gemm_prefix is `mmq_q4k`/`mmq_q6k`; stream-K + fixup families share the
+        // weight-type token (`q4k`/`q6k`).
+        let ty = gemm_prefix.strip_prefix("mmq_").unwrap_or(gemm_prefix);
+        let sk_key = format!("mmq_sk_{ty}_x{mmq_x}_{nc}");
+        let fix_key = format!("mmq_fix_{ty}_x{mmq_x}_{nc}");
+        let sk = self.artifacts.get(&sk_key)?;
+        let fk = self.artifacts.get(&fix_key)?;
         let qk = self.artifacts.get(quant_key)?;
+
+        // Stream-K grid = one CUDA block per SM; the fixup buffer holds one
+        // (mmq_x * mmq_y) f32 partial tile per block.
+        let nsm = self.device.caps().sm_count.max(1) as usize;
+        let fixup_bytes = nsm * mmq_x * MMQ_Y * std::mem::size_of::<f32>();
 
         let mut sc = self.mmq.lock().expect("mmq scratch poisoned");
         if sc.cap_q8_bytes < q8_bytes {
             sc.q8 = Some(self.device.alloc(q8_bytes, MemKind::Device, Pool::Activations)?);
             sc.cap_q8_bytes = q8_bytes;
         }
+        if sc.cap_fixup_bytes < fixup_bytes {
+            sc.fixup =
+                Some(self.device.alloc(fixup_bytes, MemKind::Device, Pool::Activations)?);
+            sc.cap_fixup_bytes = fixup_bytes;
+        }
         let q8 = sc.q8.as_ref().expect("q8 allocated");
+        let fixup = sc.fixup.as_ref().expect("fixup allocated");
 
         // (1) f16 activation [n_tokens, cols] → block_q8_1_mmq. ne00=cols,
         // s01=cols (contiguous rows), ne0=k_pad, ne1=n_tokens. Padding lanes
@@ -1828,16 +1853,12 @@ impl Kernels {
             .scalar(n_tokens as i64);
         self.device.launch(qk, &qcfg, &qargs, stream)?;
 
-        // (2) MMQ GEMM writing f16 directly into y. grid(ceil(rows/128),
-        // ceil(n_tokens/mmq_x), 1), block(32, MMQ_NWARPS=8, 1), dynamic smem =
-        // `smem` (HAL raises the opt-in limit when > 48 KB). stride_row_x =
-        // blocks-per-row = cols/256; stride_col_dst = rows (y is [token][row]).
+        // (2) Stream-K MMQ GEMM writing f16 directly into y. grid(nsm, 1, 1),
+        // block(32, MMQ_NWARPS=8, 1), dynamic smem = `smem` (HAL raises the opt-in
+        // limit when > 48 KB). stride_row_x = blocks-per-row = cols/256;
+        // stride_col_dst = rows (y is [token][row]).
         let gcfg = LaunchConfig {
-            grid: (
-                (rows as u32).div_ceil(128),
-                (n_tokens as u32).div_ceil(mmq_x as u32),
-                1,
-            ),
+            grid: (nsm as u32, 1, 1),
             block: (32, 8, 1),
             shared_mem_bytes: smem,
         };
@@ -1845,13 +1866,30 @@ impl Kernels {
             .buf_at(w, w_byte_off)?
             .buf(q8)
             .buf(y)
+            .buf(fixup)
             .scalar(cols as i64)
             .scalar(rows as i64)
             .scalar(n_tokens as i64)
             .scalar((cols / 256) as i64)
             .scalar(n_tokens as i64)
             .scalar(rows as i64);
-        self.device.launch(gk, &gcfg, &gargs, stream)
+        self.device.launch(sk, &gcfg, &gargs, stream)?;
+
+        // (3) Fixup reduction: sum the parked partials into the boundary tiles of
+        // y. Same grid/block, no dynamic smem. Blocks with no fixup work early-out.
+        let fcfg = LaunchConfig {
+            grid: (nsm as u32, 1, 1),
+            block: (32, 8, 1),
+            shared_mem_bytes: 0,
+        };
+        let fargs = LaunchArgs::new()
+            .buf(y)
+            .buf(fixup)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64)
+            .scalar(rows as i64);
+        self.device.launch(fk, &fcfg, &fargs, stream)
     }
 
     /// Replicates ggml's `mul_mat_q_case` mmq_x pick for the RTX 4090 (Ada,

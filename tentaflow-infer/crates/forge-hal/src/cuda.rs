@@ -506,6 +506,8 @@ fn detect_caps(ctx: &Arc<CudaContext>) -> Result<DeviceCaps> {
     let max_threads_per_block =
         attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)? as u32;
     let warp_size = attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_WARP_SIZE)? as u32;
+    let sm_count =
+        attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32;
     let supports_p2p = detect_p2p(ctx)?;
     Ok(DeviceCaps {
         name,
@@ -515,6 +517,7 @@ fn detect_caps(ctx: &Arc<CudaContext>) -> Result<DeviceCaps> {
         max_shared_mem_per_block,
         max_threads_per_block,
         warp_size,
+        sm_count,
         // FP8 matmul is native from Ada (sm_89); FP4 tensor cores from
         // Blackwell (sm_100). Below those, NVFP4/FP8 take the software
         // fused-dequant path.

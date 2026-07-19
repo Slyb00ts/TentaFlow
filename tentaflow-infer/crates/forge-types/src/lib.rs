@@ -23,6 +23,9 @@ pub struct DeviceCaps {
     pub max_shared_mem_per_block: usize,
     pub max_threads_per_block: u32,
     pub warp_size: u32,
+    /// Streaming-multiprocessor count. Drives the stream-K MMQ grid (one CUDA
+    /// block per SM). 0 on hosts that do not expose it (CPU backend).
+    pub sm_count: u32,
     /// Native FP8 (E4M3/E5M2) matrix pipeline available.
     pub fp8_native: bool,
     /// Native FP4 tensor cores (NVIDIA Blackwell+). Absent => NVFP4 uses the

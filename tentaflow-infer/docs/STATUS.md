@@ -102,6 +102,35 @@ Ostatnia aktualizacja: 2026-07-19.
     6327→**7753**; dekod bez zmian (146.2/130.5). nsys: znika `forge_f32_to_f16`
     i Mojo Q6_K prefill GEMM; Q6_K MMQ 10%, quant-d4 <1%. Bielik NVFP4 golden
     bit-w-bit (1 i 4 pasy).
+  - ✅ **MMQ prefill Q4_K + Q6_K → stream-K (DOMYŚLNE, 2026-07-19)** — ta sama
+    ścieżka jądra/kwantu, bez zmiany jakości (koherentne). Zamiast dense
+    conventional-tiling wrappera włączono PRAWDZIWĄ ścieżkę **stream-K** ggml
+    (arXiv:2301.03598): kopie `mul_mat_q` (branch VOLTA+) i `mul_mat_q_stream_k_fixup`
+    z `mmq.cuh`, wyspecjalizowane do dense (1 kanał/sample, `ids_dst==null`), z
+    dst f16 (`forge_mmq_process_tile`/`forge_mmq_stream_k_body`/
+    `forge_mmq_stream_k_fixup_body` w `mmq_q4k.cu`; compute bajt-identyczny, tylko
+    dtype dst + epilog f16). Siatka = **1 blok/SM** (`nsm` z HAL:
+    `CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT` → `DeviceCaps.sm_count`); bufor
+    partiali `MmqScratch.fixup` (`nsm*mmq_x*mmq_y` f32, grow-only). Launcher
+    `gemm_mmq_at` odpala quant → stream-K GEMM (f16 wprost) → fixup reduction
+    (f16 += float na kaflach granicznych). Cel: stream-K balansuje kafle po
+    wymiarze K na WSZYSTKICH SM-ach, likwidując straty częściowej fali gdy
+    `ntiles % nsm != 0` (dokładnie kształt FFN up/gate — 55% prefillu wg nsys).
+    Izolowany GEMM (RTX 4090, `scratch/mmq_probe/tops_sk.cu`, dense→stream-K):
+    FFN up/gate N=14336 K=4096 T=512 132.9→**152.4 TOPS (1.15×)**, T=2048
+    132.8→**143.4 (1.08×)**, T=4096 243.6→241.7 (0.99× = wash, kafle dzielą się
+    równo na 128 SM); FFN down N=4096 K=14336 T=512 254.5→260.2 (1.02×); attn
+    N=4096 K=4096 płasko (~1.0×). Narzut fixup **~0.7%** czasu stream-K GEMM
+    (nsys; bloki bez pracy robią early-out). Poprawność: stream-K vs dense relL2
+    **≤2.6e-4** (f16 round-off na kaflach granicznych), stream-K vs CPU golden
+    **~3.8e-3** (`scratch/mmq_probe/sk_harness.cu`), Q6_K in-suite golden
+    `gemm_q6_k_mmq_prefill_matches_formats_dequant` PASS, coherence Mistral Q4_K
+    "Paris, France…" token-close z dense. nsys prefill (pp4096): stream-K Q4_K
+    **54%** + Q6_K **10%** = 64% MMQ, fixup <1%. Whole-model pp4096 ~wash
+    (8000–8890, było 7956–8466 — przy T=4096 kafle dzielą się równo, więc zysk
+    jest przy mniejszych/częściowo-falowych prefillach, nie na headline'ie
+    pp4096); dekod nietknięty (`n_tokens<64` = gemv/i8mma, nie MMQ). Bielik NVFP4
+    golden bit-w-bit (1 i 4 pasy). `FORGE_GEMM=cuda|mojo|w4a8` fallbacki działają.
   - ✅ **Tensor-core flash-attention prefill (`FORGE_ATTN=fa`, 2026-07-19)** —
     `kernels/cuda/fattn_prefill.cu` (2. wyjątek ADR-0001, ten sam cubin path co
     `gemm_i8mma`). Zastępuje skalarny/SIMD `attn_prefill` (Mojo, `dotv += qv8*kv8`)
