@@ -14,14 +14,24 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 // Domyslna wysokosc tile'a w px gdy atrybut nie ustawiony.
 const DEFAULT_HEIGHT_PX = 320;
 
-// Po `subscriber_lagged` server konczy strumien — natychmiast probojemy
-// resubscribe z mala przerwa zeby UI nie migalo bez powodu.
-const LAG_RESUBSCRIBE_DELAY_MS = 1000;
+// Backoff kolejnych prob resubscribe po zerwaniu strumienia (lag / pad
+// transportu / zamkniecie zrodla). Pierwsza proba szybko (UI nie miga bez
+// powodu), kolejne coraz rzadziej; ostatnia wartosc powtarzana az do sukcesu.
+const RESUBSCRIBE_BACKOFF_MS = [1000, 2000, 5000];
 
-// Maksymalny zakres bufora w sekundach. Powyzej tej wartosci trimujemy
-// stary fragment przez SourceBuffer.remove() zeby uniknac QuotaExceededError
-// na dlugo zyjacych tile'ach.
-const KEEP_WINDOW_SECS = 30;
+// Watchdog "subskrybowano, ale zero danych": jesli po wyslaniu SubscribeRequest
+// przez ten czas nie przyjdzie ZADEN StreamFrame (nawet init segment), traktujemy
+// subskrypcje jak nieudana — pelny reset pipeline'u + retry z backoffem. Lapie
+// kazdy przypadek cichej smierci (np. SubscribeResponse bez danych, zawieszony
+// handler po stronie serwera).
+const NO_DATA_WATCHDOG_MS = 6000;
+
+// Twardy limit dlugosci kolejki appendow do SourceBuffera. Gdy dekoder nie
+// nadaza (karta w tle, wolny sprzet), WebSocket dalej dostarcza chunki i
+// kolejka roslaby bez granic. Pojedynczych chunkow fMP4 NIE wolno dropowac
+// (dziura psuje strumien), wiec po przekroczeniu limitu robimy czysty restart
+// pipeline'u + resubscribe. 200 fragmentow po ~200 ms = ~40 s zaleglosci.
+const MAX_APPEND_QUEUE = 200;
 
 class TfVideoStream extends HTMLElement {
   static get observedAttributes() {
@@ -42,15 +52,40 @@ class TfVideoStream extends HTMLElement {
     this._subscriptionUnsub = null;
     this._activeStreamId = null;
     this._resubscribeTimer = null;
+    // Licznik prob resubscribe (indeks do RESUBSCRIBE_BACKOFF_MS) — zerowany
+    // po udanym SubscribeResponse. Unsub listenera lifecycle WS ('open') —
+    // pozwala wznowic subskrypcje natychmiast po powrocie transportu zamiast
+    // czekac na kolejny tick backoffu.
+    this._resubscribeAttempt = 0;
+    this._lifecycleUnsub = null;
+    // Timer watchdoga no-data: uzbrajany przy kazdym subscribe, rozbrajany
+    // pierwszym StreamFrame. Po NO_DATA_WATCHDOG_MS bez danych — reset + retry.
+    this._noDataWatchdog = null;
     this._disposed = false;
     // CorrelationId aktywnej subskrypcji — potrzebny zeby wyslac
     // StreamCloseRequest na tym samym id co oryginalny SubscribeRequest.
     this._activeCorrelationId = null;
+    // Baza media-timeline (ns) z StreamSubscribeResponse — offset, ktory nakladka
+    // detekcji odejmuje od `pts_ns` ramek, by kotwiczyc overlay na klatce wideo.
+    // null gdy strumien nie ma wspolnej osi z detekcjami (LiDAR/audio/relay).
+    this._basePtsNs = null;
+  }
+
+  // Udostepnia baze media-time (ns) dla nakladki detekcji. Nakladka czyta ten
+  // getter przez `mediaBasePtsProvider` co klatke — sledzi zmiane przy resubscribe.
+  get mediaBasePtsNs() {
+    return this._basePtsNs;
   }
 
   connectedCallback() {
     this._disposed = false;
     if (!this._video) this._build();
+    // Po realnym detach (_stopSubscription) listener dblclick zostaje zdjety —
+    // przy ponownym podlaczeniu (bez _build) wpinamy go z powrotem.
+    if (!this._onDblClick) {
+      this._onDblClick = () => this._toggleFullscreen();
+      this.addEventListener('dblclick', this._onDblClick);
+    }
     this._applyAttributes();
     // The SDK reconciler can rip this element out of the DOM and re-insert it in
     // the same tick (disconnect→connect churn). If a deferred stop is pending
@@ -110,6 +145,12 @@ class TfVideoStream extends HTMLElement {
     this._video.playsInline = true;
     this._video.setAttribute('playsinline', '');
 
+    // Podwojny klik -> fullscreen tej kamery. Fullscreen bierzemy na kontenerze
+    // kafelka (rodzic hosta), zeby nakladka detekcji <canvas> — dolaczana jako
+    // rodzenstwo w tym samym kontenerze — pozostala widoczna na pelnym ekranie.
+    this._onDblClick = () => this._toggleFullscreen();
+    this.addEventListener('dblclick', this._onDblClick);
+
     this._labelEl = document.createElement('div');
     this._labelEl.className = 'label';
     this._labelEl.hidden = true;
@@ -136,6 +177,23 @@ class TfVideoStream extends HTMLElement {
     this.style.setProperty('--tf-video-stream-height', `${height}px`);
   }
 
+  // Przelacza fullscreen dla kafelka kamery. Wchodzimy na kontenerze kafelka
+  // (rodzic hosta) — obejmuje on <video> i nakladke detekcji. Ponowny dblclick
+  // (lub Esc obslugiwany natywnie przez przegladarke) wychodzi z fullscreena.
+  _toggleFullscreen() {
+    const container = this.parentElement || this;
+    const active = document.fullscreenElement;
+    if (active && (active === container || active === this || active.contains(this))) {
+      if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+      return;
+    }
+    if (typeof container.requestFullscreen === 'function') {
+      container.requestFullscreen().catch((e) => {
+        console.warn('[tf-video-stream] fullscreen failed:', e?.message ?? e);
+      });
+    }
+  }
+
   _setStatus(text) {
     if (!this._statusEl) return;
     if (typeof text === 'string' && text.length > 0) {
@@ -157,6 +215,9 @@ class TfVideoStream extends HTMLElement {
       return;
     }
     this._activeStreamId = streamId;
+    // `_basePtsNs` celowo NIE jest zerowane — poprzednia baza obowiazuje do
+    // nadejscia nowej z StreamSubscribeResponse, dzieki czemu nakladka detekcji
+    // nie traci osi media-time na czas rekonektu.
     this._setStatus('Łączenie ze strumieniem…');
 
     const mediaSource = new MediaSource();
@@ -186,9 +247,14 @@ class TfVideoStream extends HTMLElement {
     this._subscriptionUnsub = () => {
       pending.disposed = true;
     };
+    this._armNoDataWatchdog();
+    // Atrybut `preview` na elemencie wybiera wariant podgladu 720p/~1,5 Mbit/s
+    // (kafelki Live view) zamiast pelnej jakosci zrodla — oszczedza pasmo WAN
+    // i nie glodzi WebSocketu detekcji na tym samym laczu.
+    const preview = this.hasAttribute('preview');
     ApiBinary.subscribe(
       'streamSubscribeRequest',
-      { streamId },
+      { streamId, preview },
       {
         onChunk: (body) => this._onSubscriptionChunk(body),
         onEnd: (body) => this._onSubscriptionEnd(body),
@@ -215,6 +281,10 @@ class TfVideoStream extends HTMLElement {
       .catch((err) => {
         console.warn('[tf-video-stream] subscribe failed:', err?.message ?? err);
         this._setStatus('Nie udało się otworzyć strumienia.');
+        // Subskrypcja nie doszla do skutku (np. WS w trakcie reconnectu) —
+        // sprzatnij pipeline i probuj ponownie z backoffem, az sie uda.
+        this._resetMediaPipeline();
+        this._scheduleResubscribe();
       });
   }
 
@@ -222,11 +292,17 @@ class TfVideoStream extends HTMLElement {
     if (this._disposed) return;
     if (!body || typeof body !== 'object') return;
     if (body.variant === 'StreamSubscribeResponse') {
+      this._resubscribeAttempt = 0;
       this._mime = String(body.mime_type ?? body.mimeType ?? '');
+      const base = body.base_pts_ns ?? body.basePtsNs;
+      this._basePtsNs = base == null ? null : (typeof base === 'bigint' ? Number(base) : Number(base));
+      if (!Number.isFinite(this._basePtsNs)) this._basePtsNs = null;
       this._tryCreateSourceBuffer();
       return;
     }
     if (body.variant === 'StreamFrame') {
+      // Dane plyna — subskrypcja zyje, watchdog no-data nie jest juz potrzebny.
+      this._clearNoDataWatchdog();
       const data = body.data;
       if (!(data instanceof Uint8Array) || data.byteLength === 0) return;
       // Kopia bytow — wasm pamiec moze byc reuse'owana po powrocie do
@@ -241,28 +317,61 @@ class TfVideoStream extends HTMLElement {
   _onSubscriptionEnd(body) {
     if (this._disposed) return;
     const reason = String(body?.reason ?? '');
-    if (reason === 'subscriber_lagged') {
-      console.warn('[tf-video-stream] subscriber lagged, resubscribing');
-      this._resetMediaPipeline();
-      this._scheduleResubscribe();
+    if (reason === 'client_request') {
+      // Spowodowane wlasnym close() — bez komunikatu i bez wznawiania.
       return;
     }
-    if (reason === 'source_unregistered') {
-      this._setStatus('Strumień zakończony.');
-      return;
-    }
-    if (reason === 'client_request' || reason === '') {
-      // Spowodowane wlasnym close() — bez komunikatu.
-      return;
-    }
-    this._setStatus(`Strumień zakończony: ${reason}`);
+    // KAZDY inny koniec strumienia wymaga pelnego restartu pipeline'u +
+    // resubscribe z backoffem:
+    //   subscriber_lagged   — serwer ubil subskrypcje (klient nie nadazal),
+    //   transport_closed    — syntetyczny koniec po padzie WS,
+    //   source_unregistered — zrodlo zniklo (np. restart kamery),
+    //   body Error (bez `reason`) — np. `stream_not_registered`, gdy resubscribe
+    //     trafil w moment ZANIM kamera wrocila po restarcie; ciche porzucenie tu
+    //     zostawialo kafelek martwy na zawsze mimo powrotu zrodla.
+    // Wlasne zamkniecia nigdy tu nie trafiaja — unsubscribe zdejmuje listener
+    // przed wyslaniem StreamCloseRequest, wiec pusty `reason` to zawsze serwer.
+    const detail =
+      body?.variant === 'Error'
+        ? `error: ${body?.message ?? body?.code ?? 'unknown'}`
+        : reason || 'brak powodu';
+    console.warn(`[tf-video-stream] strumien zerwany (${detail}), resubscribe`);
+    this._resetMediaPipeline();
+    this._scheduleResubscribe();
   }
 
   _onSubscriptionError(err) {
     if (this._disposed) return;
     const message = err?.message ?? String(err ?? '');
-    console.warn('[tf-video-stream] protocol error:', message);
-    this._setStatus('Błąd strumienia.');
+    console.warn('[tf-video-stream] protocol error:', message, '— resubscribe');
+    // Blad protokolu konczy strumien po stronie serwera (IS_ERROR|IS_STREAM_END)
+    // — bez restartu kafelek zostalby martwy. Reset + retry z backoffem.
+    this._resetMediaPipeline();
+    this._scheduleResubscribe();
+  }
+
+  // Uzbraja watchdog no-data: subscribe wyslany, ale przez NO_DATA_WATCHDOG_MS
+  // nie przyszedl zaden StreamFrame (nawet init segment) — traktuj jak porazke
+  // subskrypcji: pelny reset + retry z backoffem. Zabezpiecza kazda przyczyne
+  // cichej smierci (SubscribeResponse bez danych, zgubiony init, martwy stream).
+  _armNoDataWatchdog() {
+    this._clearNoDataWatchdog();
+    this._noDataWatchdog = setTimeout(() => {
+      this._noDataWatchdog = null;
+      if (this._disposed || !this.isConnected) return;
+      console.warn(
+        `[tf-video-stream] watchdog: brak danych ${NO_DATA_WATCHDOG_MS}ms po subscribe, resubscribe`,
+      );
+      this._resetMediaPipeline();
+      this._scheduleResubscribe();
+    }, NO_DATA_WATCHDOG_MS);
+  }
+
+  _clearNoDataWatchdog() {
+    if (this._noDataWatchdog != null) {
+      clearTimeout(this._noDataWatchdog);
+      this._noDataWatchdog = null;
+    }
   }
 
   _tryCreateSourceBuffer() {
@@ -296,6 +405,14 @@ class TfVideoStream extends HTMLElement {
   }
 
   _enqueueAppend(bytes) {
+    // Dekoder trwale nie nadaza za dostarczaniem — dalsze kolejkowanie tylko
+    // puchnie w pamieci, a dropniecie chunka zepsuloby strumien fMP4.
+    if (this._appendQueue.length >= MAX_APPEND_QUEUE) {
+      console.warn('[tf-video-stream] append queue overflow — restart pipeline');
+      this._resetMediaPipeline();
+      this._scheduleResubscribe();
+      return;
+    }
     this._appendQueue.push(bytes);
     this._drainAppendQueue();
   }
@@ -357,22 +474,39 @@ class TfVideoStream extends HTMLElement {
     // ~3-4ms). It only needs to cover a couple of fMP4 fragments so the decoder
     // never starves between fragments. With a clean continuous server timeline
     // (h264timestamper + param-only AUs dropped) a small cushion suffices.
-    const TARGET_LATENCY_SECS = 0.1;
-    // Upper bound on drift before snapping back to TARGET. Without this, every
-    // brief decoder stall left the playhead permanently further behind (latency
-    // grew and never recovered, since the only correction fired at KEEP_WINDOW).
-    const MAX_LATENCY_SECS = 0.16;
+    // Poduszka 0.5 s = 2-3 fragmenty fMP4 przy kadencji 200 ms — mniejsza
+    // wartosc glodzi dekoder miedzy fragmentami (waiting→append→playing).
+    const TARGET_LATENCY_SECS = 0.5;
+    // Twarda granica dryfu — powyzej NIE czekamy, tylko przeskakujemy na
+    // live-edge (bufor odjechal za daleko po dluzszym stallu / karcie w tle).
+    const HARD_SNAP_SECS = 1.5;
+    // Histereza lekkiego przyspieszenia (catch-up bez skokow): wlaczamy
+    // playbackRate>1 gdy playhead za daleko za live-edge, wracamy do 1.0 po
+    // dogonieniu. Oba progi WIEKSZE od poduszki (inaczej wieczny catch-up),
+    // zakres < HARD_SNAP zeby najpierw probowac plynnie.
+    const CATCHUP_ON_SECS = 0.9;
+    const CATCHUP_OFF_SECS = 0.6;
+    const CATCHUP_RATE = 1.05;
     // Only build the initial cushion before first play: wait until enough is
     // buffered so playback starts with room ahead rather than at the edge.
     if (v.paused && end - start < TARGET_LATENCY_SECS && v.currentTime <= start) {
       return;
     }
-    if (v.currentTime < start || end - v.currentTime > MAX_LATENCY_SECS) {
+    const behind = end - v.currentTime;
+    if (v.currentTime < start || behind > HARD_SNAP_SECS) {
+      // Przeskok na live-edge — bez czekania na plynne nadgonienie.
       try {
         v.currentTime = Math.max(start, end - TARGET_LATENCY_SECS);
       } catch (e) {
         // Not seekable yet — retry on the next updateend.
       }
+      if (v.playbackRate !== 1.0) v.playbackRate = 1.0;
+    } else if (behind > CATCHUP_ON_SECS) {
+      // Lekkie przyspieszenie, zeby plynnie dogonic live-edge bez skoku.
+      if (v.playbackRate !== CATCHUP_RATE) v.playbackRate = CATCHUP_RATE;
+    } else if (behind <= CATCHUP_OFF_SECS && v.playbackRate !== 1.0) {
+      // Dogonione — powrot do normalnej predkosci.
+      v.playbackRate = 1.0;
     }
     if (v.paused) {
       const pr = v.play();
@@ -394,13 +528,31 @@ class TfVideoStream extends HTMLElement {
     }
     if (ranges.length === 0) return;
     const start = ranges.start(0);
-    const end = ranges.end(ranges.length - 1);
-    if (end - start <= KEEP_WINDOW_SECS) return;
-    const removeUntil = end - KEEP_WINDOW_SECS;
+    // Trzymamy ~6 s historii przed playheadem. Per spec MSE (Coded Frame
+    // Removal) usuniecie keyframe'a kasuje tez wszystkie zalezne ramki az do
+    // nastepnego random access pointa — ciecie blizej playheadu przy dlugim
+    // GOP-ie (brak kolejnego keyframe'a w buforze) oproznialoby CALY bufor
+    // (stall + hard-snap co interwal keyframe). 6 s pokrywa GOP do ~4-5 s
+    // z marginesem; pamiec ~1 MB przy 720p@1.5Mbps. Przycinamy regularnie
+    // (na kazdym updateend), a nie dopiero przy 30 s okna.
+    const v = this._video;
+    const ct = v ? v.currentTime : 0;
+    const removeUntil = ct - 6;
+    if (!(removeUntil > start + 0.1)) return;
     try {
       this._sourceBuffer.remove(start, removeUntil);
     } catch (e) {
       console.warn('[tf-video-stream] remove(buffered) failed:', e?.message);
+      return;
+    }
+    // Bufor niepusty przed remove nie ma prawa stac sie pusty — jesli sie
+    // oproznil, ciecie zahaczylo o keyframe otwierajacy biezacy GOP.
+    try {
+      if (this._sourceBuffer.buffered.length === 0) {
+        console.warn('[tf-video-stream] trim emptied the buffer (GOP keyframe removed?)');
+      }
+    } catch (e) {
+      /* ignore */
     }
   }
 
@@ -421,10 +573,13 @@ class TfVideoStream extends HTMLElement {
   }
 
   _resetMediaPipeline() {
+    this._clearNoDataWatchdog();
     this._appendQueue.length = 0;
     this._appending = false;
     this._sourceBuffer = null;
     this._mime = null;
+    // `_basePtsNs` zostaje — nowa wartosc przyjdzie w StreamSubscribeResponse
+    // kolejnej subskrypcji; do tego czasu nakladka detekcji uzywa starej osi.
     this._mediaSourceReady = false;
     if (this._mediaSource) {
       try {
@@ -460,11 +615,31 @@ class TfVideoStream extends HTMLElement {
     if (this._disposed) return;
     if (this._resubscribeTimer != null) return;
     this._setStatus('Łączenie ponownie…');
+    const delay =
+      RESUBSCRIBE_BACKOFF_MS[Math.min(this._resubscribeAttempt, RESUBSCRIBE_BACKOFF_MS.length - 1)];
+    this._resubscribeAttempt += 1;
     this._resubscribeTimer = setTimeout(() => {
       this._resubscribeTimer = null;
       if (this._disposed || !this.isConnected) return;
       this._startSubscription();
-    }, LAG_RESUBSCRIBE_DELAY_MS);
+    }, delay);
+    // Gdy WS lezy, nie czekaj slepo na tick backoffu — jednorazowy listener
+    // lifecycle 'open' wznawia subskrypcje od razu po powrocie transportu.
+    if (!ApiBinary.isConnected() && !this._lifecycleUnsub) {
+      this._lifecycleUnsub = ApiBinary.onLifecycle((ev) => {
+        if (ev.type !== 'open') return;
+        if (this._lifecycleUnsub) {
+          this._lifecycleUnsub();
+          this._lifecycleUnsub = null;
+        }
+        if (this._disposed || !this.isConnected) return;
+        if (this._resubscribeTimer != null) {
+          clearTimeout(this._resubscribeTimer);
+          this._resubscribeTimer = null;
+        }
+        this._startSubscription();
+      });
+    }
   }
 
   _stopSubscription(_reason) {
@@ -476,6 +651,11 @@ class TfVideoStream extends HTMLElement {
       clearTimeout(this._resubscribeTimer);
       this._resubscribeTimer = null;
     }
+    if (this._lifecycleUnsub) {
+      this._lifecycleUnsub();
+      this._lifecycleUnsub = null;
+    }
+    this._resubscribeAttempt = 0;
     // ApiBinary.subscribe usuwa server-side state przez StreamEnd; bezposrednio
     // zamykajac listener prosto unsubscribe'ujemy. Serwer wykryje rozlaczony
     // socket lub klient moze opcjonalnie wyslac StreamCloseRequest — robimy
@@ -498,6 +678,15 @@ class TfVideoStream extends HTMLElement {
     }
     this._resetMediaPipeline();
     this._activeStreamId = null;
+    // Cleanup listenera fullscreena i wyjscie z fullscreena gdy kafelek znika.
+    if (this._onDblClick) {
+      this.removeEventListener('dblclick', this._onDblClick);
+      this._onDblClick = null;
+    }
+    const active = document.fullscreenElement;
+    if (active && (active === this || active.contains(this)) && document.exitFullscreen) {
+      document.exitFullscreen().catch(() => {});
+    }
   }
 }
 

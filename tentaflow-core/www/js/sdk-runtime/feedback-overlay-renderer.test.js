@@ -68,11 +68,12 @@ function setup() {
 function modalFields({
   title = LIT('Modal Title'), subtitle = null, bodySlot = 'body-1',
   footerSlot = null, size = 'md', dismissible = false,
-  preventScroll = false, closable = false,
+  preventScroll = false, closable = false, icon = null,
 } = {}) {
   const f = [[0, title], [2, bodySlot], [4, size], [5, dismissible], [6, preventScroll], [7, closable]];
   if (subtitle != null) f.push([1, subtitle]);
   if (footerSlot != null) f.push([3, footerSlot]);
+  if (icon != null) f.push([8, icon]);
   return f;
 }
 
@@ -120,6 +121,29 @@ test('Modal renders body slot with data-slot-id inside tf-modal body', () => {
   document.body.appendChild(el);
   const slotEl = el.querySelector('.tf-modal-body [data-slot-id="modal-body"]');
   assert(slotEl != null);
+});
+
+test('Modal renders header icon before the title when Modal.icon set', () => {
+  setup();
+  const engine = makeEngine(makeStore());
+  const icon = { kind: 'named', name: 'share', size: null, tone: null };
+  const el = engine.render(comp(MODAL_TAG, modalFields({ icon })));
+  document.body.appendChild(el);
+  const header = el.querySelector('.tf-modal-header');
+  const iconEl = header.querySelector('.tf-modal-title-icon');
+  assert(iconEl != null, 'header icon rendered');
+  // Icon precedes the title in DOM order.
+  const kids = [...header.children];
+  const titleEl = header.querySelector('.tf-modal-title');
+  assert(kids.indexOf(iconEl) < kids.indexOf(titleEl), 'icon must come before the title');
+});
+
+test('Modal without icon has no header icon', () => {
+  setup();
+  const engine = makeEngine(makeStore());
+  const el = engine.render(comp(MODAL_TAG, modalFields()));
+  document.body.appendChild(el);
+  assert(el.querySelector('.tf-modal-title-icon') == null);
 });
 
 test('Modal renders footer slot when provided', () => {

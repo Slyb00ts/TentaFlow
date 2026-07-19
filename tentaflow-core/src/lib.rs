@@ -9,6 +9,7 @@
 extern crate self as tentaflow_core;
 
 pub mod audio_models;
+pub mod benchmark;
 pub mod compliance;
 pub mod config;
 pub mod crypto;

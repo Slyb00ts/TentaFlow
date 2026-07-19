@@ -941,6 +941,7 @@ mod tests {
                 created_at: String::new(),
                 updated_at: String::new(),
                 request_time_parameters: Default::default(),
+            gpu_selection: String::new(),
             }],
         );
 
@@ -1017,6 +1018,7 @@ mod tests {
                 created_at: String::new(),
                 updated_at: String::new(),
                 request_time_parameters: Default::default(),
+            gpu_selection: String::new(),
             }],
         );
 
@@ -1079,6 +1081,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             request_time_parameters: Default::default(),
+            gpu_selection: String::new(),
         };
         registry.replace_local(
             local_node.clone(),
@@ -1239,6 +1242,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             request_time_parameters: Default::default(),
+            gpu_selection: String::new(),
         }
     }
 

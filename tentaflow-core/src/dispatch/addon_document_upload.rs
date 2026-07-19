@@ -128,8 +128,36 @@ pub fn addon_document_upload_chunk(
 
     // Sanity sesji: tylko user session (nie API key / mesh) — panel UI istnieje
     // wyłącznie dla użytkownika.
-    if !matches!(ctx.session, SessionAuth::UserSession { .. }) {
-        return Err(ProtocolError::new(ProtocolErrorCode::AuthRequired, "user session required"));
+    let user_id = match &ctx.session {
+        SessionAuth::UserSession { user_id, .. } => uuid::Uuid::from_bytes(*user_id).to_string(),
+        _ => {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::AuthRequired,
+                "user session required",
+            ))
+        }
+    };
+
+    // Przechwyt mikrofonu (komponent AudioCapture) wymaga uprawnienia
+    // `audio.capture`. Bramkujemy na ZAUFANYM markerze źródła `source ==
+    // "audio_capture"` ustawianym WYŁĄCZNIE przez renderer AudioCapture, a NIE na
+    // stringu MIME dostarczanym przez klienta. Gdyby gate ufał MIME, ten sam
+    // kanał document-upload przenoszący nagranie mikrofonu z `mime =
+    // "application/octet-stream"` ominąłby bramkę. Marker jest niepodrabialny
+    // przez guest addon: addon nie kontroluje wywołania kanału upload (robi to
+    // zaufany renderer per typ komponentu). Zwykły upload plików (FileInput) ma
+    // `source` puste i NIE wymaga tego uprawnienia — wybór pliku audio to nie
+    // przechwycenie mikrofonu. Gate PRZED dotknięciem store (fail-closed).
+    if payload.source == tentaflow_protocol::UPLOAD_SOURCE_AUDIO_CAPTURE
+        && !addon_mgr
+            .permission_checker()
+            .check(&payload.addon_id, &user_id, "audio.capture", None)
+            .is_granted()
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "addon lacks 'audio.capture' permission for microphone capture",
+        ));
     }
 
     // Limit `document_storage_mb` z globalnej DB (jeden punkt prawdy z host-fn).
@@ -143,6 +171,11 @@ pub fn addon_document_upload_chunk(
     let seq = payload.seq;
     let total_chunks = payload.total_chunks;
     let bytes = payload.bytes.clone();
+    // Provenance trafia do rejestru dokumentów: `source` (zaufany marker
+    // kanału, patrz gate wyżej) + user sesji jako uploader. Dla nagrań
+    // mikrofonu store egzekwuje potem uploader==caller w get/delete/list.
+    let source = payload.source.clone();
+    let uploader = user_id.clone();
     let outcome = run_blocking(move || {
         accept_upload_chunk_host(
             &org_id,
@@ -153,6 +186,8 @@ pub fn addon_document_upload_chunk(
             total_chunks,
             &bytes,
             limit_mb,
+            &source,
+            &uploader,
         )
     })
     .map_err(|(reason, err)| map_store_err(reason, err))?;

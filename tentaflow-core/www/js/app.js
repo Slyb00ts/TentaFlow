@@ -19,6 +19,7 @@ import { I18n, SUPPORTED_LANGS } from '/js/i18n.js';
 import '/js/components/index.js';
 import '/js/lib/block-zoom.js';
 import * as ConnectionOverlay from '/js/modules/connection-overlay.js';
+import * as UpdateOverlay from '/js/modules/update-overlay.js';
 import * as SystemEvents from '/js/modules/system-events.js';
 import { initTransport } from '/js/protocol/api-binary-shim.js';
 
@@ -45,7 +46,6 @@ import AppsHomeScreen from '/js/modules/apps-home.js';
 import ProfileScreen from '/js/modules/profile.js';
 import SettingsUserScreen from '/js/modules/settings-user.js';
 import TranslateScreen from '/js/modules/translate.js';
-import NotesScreen from '/js/modules/notes.js';
 import MeetingScreen from '/js/modules/meeting.js';
 import MeetingLiveScreen from '/js/modules/meeting-live.js';
 import PoseScreen from '/js/modules/pose.js';
@@ -56,6 +56,8 @@ import ProfilingSessionsScreen from '/js/modules/profiling-sessions-screen.js';
 import LegalScreen from '/js/modules/legal/index.js';
 import SchedulerScreen from '/js/modules/scheduler.js';
 import TokenUsageScreen from '/js/modules/token-usage.js';
+import ModelMetricsScreen from '/js/modules/model-metrics.js';
+import BenchmarkStudioScreen from '/js/modules/benchmark-studio.js';
 import MlStudioScreen from '/js/modules/ml-studio.js';
 import RobotsScreen from '/js/modules/robots.js';
 import RolesCatalogScreen from '/js/modules/roles_catalog.js';
@@ -133,7 +135,6 @@ const ADMIN_NAV = [
     items: [
       { id: 'agents', labelKey: 'nav.agents', icon: 'brain' },
       { id: 'skills', labelKey: 'nav.skills', icon: 'sparkle' },
-      { id: 'ml-studio', labelKey: 'nav.ml_studio', icon: 'brain' },
       { id: 'robots', labelKey: 'nav.robots', icon: 'cpu' },
     ],
   },
@@ -154,6 +155,8 @@ const ADMIN_NAV = [
       { id: 'roles-catalog', labelKey: 'nav.roles_catalog', icon: 'key' },
       { id: 'audit', labelKey: 'nav.audit', icon: 'audit' },
       { id: 'token-usage', labelKey: 'nav.token_usage', icon: 'trend' },
+      { id: 'model-metrics', labelKey: 'nav.model_metrics', icon: 'trend' },
+      { id: 'benchmark-studio', labelKey: 'nav.benchmark_studio', icon: 'trend' },
       { id: 'legal', labelKey: 'nav.legal', icon: 'audit' },
       { id: 'profiling-sessions', labelKey: 'nav.profiling_sessions', icon: 'trend' },
     ],
@@ -168,11 +171,7 @@ const USER_NAV = [
     items: [
       { id: 'apps-home', labelKey: 'nav.apps_home', icon: 'apps' },
       { id: 'chat', labelKey: 'nav.chat', icon: 'chat' },
-      // ML Studio jest narzedziem zaawansowanym — widoczne tylko dla Power User
-      // i Admin (wymog §11.2). Gate realizuje filtr `requiresPowerUser` w paint().
-      { id: 'ml-studio', labelKey: 'nav.ml_studio', icon: 'brain', requiresPowerUser: true },
       { id: 'images', labelKey: 'nav.images', icon: 'image', badge: 'soon' },
-      { id: 'notes', labelKey: 'nav.notes', icon: 'mic' },
       { id: 'meeting', labelKey: 'nav.meeting', icon: 'meeting' },
       { id: 'pose', labelKey: 'nav.pose', icon: 'image' },
       { id: 'translate', labelKey: 'nav.translate', icon: 'globe' },
@@ -194,6 +193,7 @@ async function bootstrap() {
   // Overlay init przed otwarciem WS — zeby wszystkie lifecycle events byly
   // przechwycone od pierwszej chwili.
   ConnectionOverlay.init();
+  UpdateOverlay.init();
 
   // Otworz WS natychmiast (anonymous jesli brak JWT). Serwer akceptuje i
   // pozwala tylko na authLogin + schema + heartbeat przed zalogowaniem.
@@ -220,15 +220,16 @@ async function bootstrap() {
   // auto-submitem. Sesja uzytkownika musi byc zalogowana.
   handlePairDeepLink();
 
-  // Service Worker registration — offline cache shell + install prompt.
-  // Chrome odrzuca SW na self-signed HTTPS z SSL cert error. TentaFlow
-  // defaultowo generuje self-signed, wiec rejestrujemy tylko na zaufanych
-  // originach: localhost (zawsze secure) albo gdy cert jest zaufany w OS
-  // (wykrywamy heurystycznie przez brak 'file:' + localhost hostname).
-  const host = window.location.hostname;
-  const isLocalhost = host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
-  if ('serviceWorker' in navigator && window.location.protocol === 'https:' && isLocalhost) {
-    navigator.serviceWorker.register('/sw.js').catch((e) => {
+  // Service Worker registration — precache calego frontu + offline shell.
+  // Wymaga secure context (https albo localhost). Chrome odrzuca SW na
+  // self-signed HTTPS z cert error — to jest zlapane w .catch (SW to tylko
+  // optymalizacja; wykrywanie nieaktualnego frontu i tak dziala przez handshake
+  // WS niezaleznie od SW). Na zaufanym certcie/localhost SW sie zarejestruje.
+  if ('serviceWorker' in navigator && window.isSecureContext) {
+    // updateViaCache:'none' — sw.js ORAZ jego importScripts (sw-version.js) sa
+    // przy sprawdzaniu update'u pobierane z sieci, nie z HTTP cache, wiec zmiana
+    // build-hasha jest zawsze wykryta.
+    navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' }).catch((e) => {
       console.debug('[app] SW register failed:', e?.message);
     });
   }
@@ -288,15 +289,7 @@ async function renderApp() {
 
   function paint() {
     // Admin sees their admin nav plus the user-facing apps appended — admin is a superset of user.
-    const rawNav = isAdmin ? [...ADMIN_NAV, ...USER_NAV] : USER_NAV;
-    // Gate pozycji wymagajacych roli: `requiresPowerUser` widoczne tylko dla
-    // Power User i Admin. Filtrujemy itemy, sekcje pomijamy gdy zostaja puste.
-    const nav = rawNav
-      .map((section) => ({
-        ...section,
-        items: section.items.filter((it) => !it.requiresPowerUser || isPowerUser),
-      }))
-      .filter((section) => section.items.length > 0);
+    const nav = isAdmin ? [...ADMIN_NAV, ...USER_NAV] : USER_NAV;
     const userClass = isAdmin ? 'admin' : isPowerUser ? 'power' : 'user';
     const roleLabel = I18n.t(
       isAdmin ? 'role.administrator' : isPowerUser ? 'users.role_power' : 'role.user',
@@ -518,6 +511,8 @@ async function renderApp() {
   Router.register('flow-builder', FlowBuilderScreen);
   Router.register('scheduler', SchedulerScreen);
   Router.register('token-usage', TokenUsageScreen);
+  Router.register('model-metrics', ModelMetricsScreen);
+  Router.register('benchmark-studio', BenchmarkStudioScreen);
   Router.register('ml-studio', MlStudioScreen);
   Router.register('robots', RobotsScreen);
   Router.register('skills', SkillsScreen);
@@ -538,7 +533,6 @@ async function renderApp() {
   Router.register('apps-home', AppsHomeScreen);
   Router.register('profile', ProfileScreen);
   Router.register('settings-user', SettingsUserScreen);
-  Router.register('notes', NotesScreen);
   // Apps whose binary handlers are not yet wired — honest placeholder, not a stub feature.
   Router.register('images',         makeComingSoonScreen('images',    'image'));
   Router.register('meeting', MeetingScreen);

@@ -64,7 +64,7 @@ function makeSlotContainer(slotName, slotId) {
 // =============================================================================
 
 export const MODAL_TAG = 0x0509;
-const MODAL_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7]);
+const MODAL_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8]);
 const MODAL_SIZES = new Set(['xs', 'sm', 'md', 'lg', 'xl', 'fullscreen']);
 
 function renderModal(component, ctx) {
@@ -84,6 +84,7 @@ function renderModal(component, ctx) {
   const dismissible = requireBool(ctx.readField(component.fields, 5), 'Modal.dismissible');
   const preventScroll = requireBool(ctx.readField(component.fields, 6), 'Modal.prevent_scroll');
   const closable = requireBool(ctx.readField(component.fields, 7), 'Modal.closable');
+  const iconRaw = ctx.readField(component.fields, 8);
 
   const el = document.createElement('tf-modal');
   el.setAttribute('variant', 'modal');
@@ -94,6 +95,15 @@ function renderModal(component, ctx) {
 
   bindAttribute(el, 'title', titleBind, ctx);
   if (subtitleBind != null) bindAttribute(el, 'subtitle', subtitleBind, ctx);
+
+  // Optional header icon: a slotted child tf-modal moves into the header
+  // before the title (mockup n03 share dialog).
+  if (iconRaw != null) {
+    const iconEl = renderIcon(iconRaw, 'Modal.icon');
+    iconEl.setAttribute('slot', 'title-icon');
+    iconEl.classList.add('tf-modal-title-icon');
+    el.appendChild(iconEl);
+  }
 
   el.appendChild(makeSlotContainer('body', bodySlot));
   if (footerSlot != null) el.appendChild(makeSlotContainer('footer', footerSlot));

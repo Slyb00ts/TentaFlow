@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TentaFlow — Notatki · Szukanie hybrydowe (N5)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .addon-shell { padding: 24px 32px 28px; min-height: 860px; display: flex; flex-direction: column; }
+
+  /* ----- Top bar ----- */
+  .addon-topbar { display: flex; align-items: center; gap: 20px; margin-bottom: 22px; }
+  .addon-title { font-size: 22px; font-weight: 700; display: flex; align-items: center; gap: 12px; }
+  .addon-title .t-ico {
+    width: 36px; height: 36px; border-radius: 10px; background: var(--gradient-accent);
+    display: flex; align-items: center; justify-content: center; color: white;
+    box-shadow: 0 0 14px rgba(99,102,241,.45), 0 0 28px rgba(99,102,241,.22);
+  }
+  .addon-title .t-ico .icon { width: 19px; height: 19px; }
+
+  .mode-switch {
+    position: relative; display: inline-flex; padding: 4px; gap: 0;
+    background: var(--bg-input); border: 1px solid var(--border); border-radius: 12px;
+  }
+  .mode-switch .pill {
+    position: absolute; top: 4px; left: 4px; width: 112px; height: calc(100% - 8px);
+    border-radius: 9px; background: var(--gradient-accent);
+    box-shadow: 0 0 14px rgba(99,102,241,.5), 0 0 32px rgba(99,102,241,.22);
+    transform: translateX(224px);
+    transition: transform 0.38s cubic-bezier(0.34,1.56,0.64,1);
+  }
+  .mode-switch button {
+    position: relative; z-index: 1; width: 112px; padding: 8px 0;
+    background: transparent; border: 0; cursor: pointer;
+    font: inherit; font-size: 13px; font-weight: 700; color: var(--text-3);
+    display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+    transition: color 0.2s;
+  }
+  .mode-switch button.active { color: white; }
+  .mode-switch button .icon { width: 15px; height: 15px; }
+
+  .model-pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 6px 13px; border-radius: 18px;
+    background: var(--bg-card); border: 1px solid var(--border);
+    font-size: 12px; font-weight: 700; color: var(--text-2);
+  }
+  .model-pill .m-dot {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--success); flex-shrink: 0;
+    animation: pulse-green 2.2s cubic-bezier(0.32,0.72,0,1) infinite;
+  }
+  @keyframes pulse-green {
+    0%   { box-shadow: 0 0 0 0 rgba(34,197,94,0.5); }
+    70%  { box-shadow: 0 0 0 6px rgba(34,197,94,0); }
+    100% { box-shadow: 0 0 0 0 rgba(34,197,94,0); }
+  }
+
+  /* ----- Big search ----- */
+  .search-hero { margin-bottom: 14px; animation: blur-in 0.4s cubic-bezier(0.34,1.56,0.64,1) both; }
+  .big-search {
+    display: flex; align-items: center; gap: 12px; height: 52px; padding: 0 18px;
+    background: var(--bg-input); border: 1px solid var(--accent-1); border-radius: 14px;
+    box-shadow: 0 0 0 3px var(--accent-glow), 0 0 22px rgba(99,102,241,.22), 0 0 60px rgba(99,102,241,.08);
+  }
+  .big-search .icon-lead { width: 19px; height: 19px; color: var(--accent-2); }
+  .big-search input {
+    flex: 1; background: transparent; border: 0; outline: none;
+    font: inherit; font-size: 15.5px; font-weight: 600; color: var(--text);
+  }
+  .big-search .kbd {
+    flex-shrink: 0; font-size: 11px; font-weight: 700; color: var(--text-3);
+    font-family: ui-monospace, 'JetBrains Mono', monospace;
+    background: var(--bg-3); border: 1px solid var(--border); border-bottom-width: 2px;
+    padding: 3px 9px; border-radius: 6px;
+  }
+  .search-filters { display: flex; align-items: center; gap: 7px; margin-top: 10px; flex-wrap: wrap; }
+  .search-filters .sep-v { width: 1px; height: 16px; background: var(--border); margin: 0 4px; }
+
+  @keyframes blur-in {
+    from { opacity: 0; transform: translateY(22px) scale(0.95); filter: blur(6px); }
+    to   { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+  }
+
+  /* ----- Layout: results + right rail ----- */
+  .results-layout { display: grid; grid-template-columns: 1fr 300px; gap: 16px; flex: 1; align-items: start; }
+
+  /* ----- Answer card ----- */
+  .answer-card {
+    background: var(--bg-2); border: 1px solid rgba(99,102,241,0.4); border-radius: var(--radius-lg);
+    padding: 16px 18px; margin-bottom: 14px; position: relative; overflow: hidden;
+    box-shadow: 0 0 18px rgba(99,102,241,.14), 0 0 60px rgba(99,102,241,.07);
+    animation: blur-in 0.45s cubic-bezier(0.34,1.56,0.64,1) 0.08s both;
+  }
+  .answer-head { display: flex; align-items: center; gap: 9px; margin-bottom: 10px; }
+  .answer-head .a-title {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em;
+    font-weight: 700; color: var(--accent-2); display: flex; align-items: center; gap: 8px;
+  }
+  .answer-head .a-title .icon { width: 14px; height: 14px; }
+  .streaming-chip {
+    margin-left: auto; display: inline-flex; align-items: center; gap: 7px;
+    font-size: 10.5px; font-weight: 700; color: var(--accent-2);
+    background: rgba(99,102,241,0.12); border: 1px solid rgba(99,102,241,0.3);
+    padding: 3px 10px; border-radius: 10px;
+  }
+  .streaming-chip .s-dot {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--accent-2);
+    animation: pulse-ring-sm 1.8s cubic-bezier(0.32,0.72,0,1) infinite;
+  }
+  @keyframes pulse-ring-sm {
+    0%   { box-shadow: 0 0 0 0 rgba(167,139,250,0.55); }
+    70%  { box-shadow: 0 0 0 7px rgba(167,139,250,0); }
+    100% { box-shadow: 0 0 0 0 rgba(167,139,250,0); }
+  }
+  .answer-body { font-size: 14px; line-height: 1.8; color: var(--text); }
+  .answer-body .cite {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 17px; height: 17px; padding: 0 4px; margin: 0 2px; vertical-align: 2px;
+    font-size: 10px; font-weight: 800; border-radius: 5px; cursor: pointer;
+    background: rgba(99,102,241,0.16); border: 1px solid rgba(99,102,241,0.4); color: var(--accent-2);
+    transition: all 0.15s;
+  }
+  .answer-body .cite:hover { background: rgba(99,102,241,0.3); box-shadow: 0 0 8px rgba(99,102,241,.4); }
+  .answer-body .streamed {
+    background: linear-gradient(100deg, var(--text) 40%, #c7cdf0 50%, var(--text) 60%);
+    background-size: 240% 100%; -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent;
+    animation: shimmer 2.4s linear infinite;
+  }
+  @keyframes shimmer { from { background-position: 130% 0; } to { background-position: -110% 0; } }
+  .caret {
+    display: inline-block; width: 2.5px; height: 17px; margin-left: 3px; vertical-align: text-bottom;
+    background: var(--accent-2); border-radius: 2px;
+    box-shadow: 0 0 8px rgba(167,139,250,.8);
+    animation: caret-blink 1s step-end infinite;
+  }
+  @keyframes caret-blink { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
+  .answer-sources {
+    display: flex; align-items: center; gap: 8px; margin-top: 12px; padding-top: 11px;
+    border-top: 1px solid var(--border); flex-wrap: wrap;
+  }
+  .answer-sources .src-label { font-size: 11px; font-weight: 700; color: var(--text-3); }
+  .mini-cite {
+    display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px 3px 6px;
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px;
+    font-size: 11px; font-weight: 600; color: var(--text-2); cursor: pointer; transition: all 0.15s;
+  }
+  .mini-cite:hover { border-color: var(--accent-1); color: var(--text); box-shadow: 0 0 10px rgba(99,102,241,.22); }
+  .mini-cite .n {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 16px; height: 16px; border-radius: 5px; font-size: 9.5px; font-weight: 800;
+    background: rgba(99,102,241,0.16); color: var(--accent-2);
+  }
+
+  /* ----- Result cards ----- */
+  .result-card {
+    display: grid; grid-template-columns: 1fr auto; gap: 16px;
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-lg);
+    padding: 14px 16px; margin-bottom: 10px; cursor: pointer;
+    transition: border-color 0.18s, box-shadow 0.18s, transform 0.18s;
+    animation: blur-in 0.4s cubic-bezier(0.34,1.56,0.64,1) both;
+  }
+  .result-card:nth-of-type(2) { animation-delay: 0.14s; }
+  .result-card:nth-of-type(3) { animation-delay: 0.20s; }
+  .result-card:nth-of-type(4) { animation-delay: 0.26s; }
+  .result-card:nth-of-type(5) { animation-delay: 0.32s; }
+  .result-card:hover {
+    border-color: var(--accent-1); transform: translateY(-2px);
+    box-shadow: 0 0 16px rgba(99,102,241,.2), 0 0 44px rgba(99,102,241,.08);
+  }
+  .result-card .r-title { font-size: 14.5px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+  .result-card .r-title .icon { width: 15px; height: 15px; color: var(--accent-2); }
+  .result-card .r-snippet { font-size: 12.5px; color: var(--text-2); line-height: 1.65; margin-top: 6px; }
+  .result-card .r-snippet b { color: var(--text); font-weight: 800; background: rgba(167,139,250,0.14); padding: 0 3px; border-radius: 4px; }
+  .result-card .r-meta { display: flex; align-items: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; font-size: 11.5px; color: var(--text-3); }
+  .result-card .r-meta span { display: inline-flex; align-items: center; gap: 5px; }
+  .result-card .r-meta .icon { width: 12px; height: 12px; }
+
+  .scope-badge {
+    display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: 10px;
+    font-size: 10px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase;
+  }
+  .scope-badge .icon { width: 10.5px; height: 10.5px; }
+  .scope-badge.mine  { background: rgba(34,197,94,0.12); color: var(--success); border: 1px solid rgba(34,197,94,0.3); }
+  .scope-badge.group { background: rgba(96,165,250,0.12); color: var(--info); border: 1px solid rgba(96,165,250,0.3); }
+  .scope-badge.org   { background: rgba(245,158,11,0.12); color: var(--warning); border: 1px solid rgba(245,158,11,0.3); }
+
+  /* score column */
+  .r-score { display: flex; align-items: center; gap: 12px; align-self: center; }
+  .score-viz { display: flex; flex-direction: column; align-items: center; gap: 5px; }
+  .score-bar {
+    width: 6px; height: 46px; border-radius: 4px; background: var(--bg-3);
+    position: relative; overflow: hidden;
+  }
+  .score-bar > span {
+    position: absolute; bottom: 0; left: 0; right: 0; border-radius: 4px;
+    height: var(--score);
+    background: var(--gradient-accent); box-shadow: 0 0 10px rgba(99,102,241,.5);
+    animation: bar-grow 0.8s cubic-bezier(0.34,1.56,0.64,1) 0.4s both;
+  }
+  @keyframes bar-grow { from { height: 0; } }
+  .score-viz .pct { font-size: 12.5px; font-weight: 800; font-variant-numeric: tabular-nums; color: var(--text); }
+  .method-badge {
+    display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 10px;
+    font-size: 10.5px; font-weight: 700; white-space: nowrap;
+  }
+  .method-badge .icon { width: 11px; height: 11px; }
+  .method-badge.vector { background: rgba(167,139,250,0.12); color: var(--accent-2); border: 1px solid rgba(167,139,250,0.35); }
+  .method-badge.graph  { background: rgba(96,165,250,0.12); color: var(--info); border: 1px solid rgba(96,165,250,0.35); }
+
+  /* graph path breadcrumb */
+  .graph-path {
+    display: flex; align-items: center; gap: 6px; margin-top: 10px; flex-wrap: wrap;
+    font-size: 11px;
+  }
+  .graph-path .gp-node {
+    display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 9px;
+    background: var(--bg-card); border: 1px solid var(--border); color: var(--text-2); font-weight: 700;
+  }
+  .graph-path .gp-node .icon { width: 11px; height: 11px; color: var(--info); }
+  .graph-path .gp-node.entity { border-color: rgba(96,165,250,0.4); color: var(--info); background: rgba(96,165,250,0.08); }
+  .graph-path .gp-arrow { color: var(--text-3); display: inline-flex; }
+  .graph-path .gp-arrow .icon { width: 12px; height: 12px; }
+
+  /* ----- Right rail ----- */
+  .right-rail { display: flex; flex-direction: column; gap: 14px; }
+  .rail-card {
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-lg);
+    padding: 15px 16px;
+    animation: blur-in 0.45s cubic-bezier(0.34,1.56,0.64,1) 0.2s both;
+  }
+  .rail-card:last-child { animation-delay: 0.28s; }
+  .rail-card h4 {
+    font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700;
+    color: var(--accent-2); margin-bottom: 12px; display: flex; align-items: center; gap: 7px;
+  }
+  .rail-card h4 .icon { width: 13.5px; height: 13.5px; }
+  .entity-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .entity-chip {
+    display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 12px;
+    background: var(--bg-card); border: 1px solid var(--border); cursor: pointer;
+    font-size: 11.5px; font-weight: 700; color: var(--text-2); transition: all 0.15s;
+  }
+  .entity-chip:hover { border-color: var(--border-hover); color: var(--text); transform: translateY(-1px); }
+  .entity-chip .e-dot { width: 7px; height: 7px; border-radius: 50%; box-shadow: 0 0 7px currentColor; }
+  .entity-chip .e-dot.person  { background: #60a5fa; color: #60a5fa; }
+  .entity-chip .e-dot.project { background: #a78bfa; color: #a78bfa; }
+  .entity-chip .e-dot.company { background: #22c55e; color: #22c55e; }
+  .entity-chip .e-dot.topic   { background: #f59e0b; color: #f59e0b; }
+  .entity-chip .e-cnt { font-size: 10px; font-weight: 800; color: var(--text-3); background: var(--bg-3); padding: 0 5px; border-radius: 7px; }
+
+  .narrow-item {
+    display: flex; align-items: flex-start; gap: 9px; padding: 9px 11px; margin-bottom: 6px;
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
+    cursor: pointer; font-size: 12px; line-height: 1.5; color: var(--text-2);
+    transition: all 0.15s;
+  }
+  .narrow-item:last-child { margin-bottom: 0; }
+  .narrow-item:hover {
+    border-color: var(--accent-1); color: var(--text);
+    box-shadow: 0 0 12px rgba(99,102,241,.18); transform: translateY(-1px);
+  }
+  .narrow-item .icon { width: 13px; height: 13px; color: var(--info); margin-top: 2px; }
+  .narrow-item b { color: var(--text); font-weight: 700; }
+
+  /* ----- RWD: tablet ----- */
+  @media (max-width: 1080px) {
+    .results-layout { grid-template-columns: 1fr; }
+    .right-rail { display: grid; grid-template-columns: 1fr 1fr; align-items: start; }
+  }
+  @media (max-width: 900px) {
+    .screen-header { flex-wrap: wrap; }
+    .screen-header .desc { margin-left: 0; max-width: 100%; text-align: left; flex-basis: 100%; }
+    .addon-topbar { flex-wrap: wrap; gap: 12px 16px; }
+  }
+  @media (max-width: 700px) {
+    .intro .rules { grid-template-columns: 1fr; }
+    .right-rail { grid-template-columns: 1fr; }
+  }
+
+  /* ----- RWD: telefon ----- */
+  @media (max-width: 600px) {
+    .intro, .screen { padding: 0 14px; }
+    .addon-shell { padding: 16px 12px 22px; }
+    .addon-topbar .ml-auto { margin-left: 0; }
+    .mode-switch { width: 100%; }
+    .mode-switch button { width: auto; flex: 1; padding: 12px 0; }
+    .mode-switch .pill { width: calc((100% - 8px) / 3); transform: translateX(200%); }
+    .big-search { height: 48px; padding: 0 14px; gap: 10px; }
+    .big-search input { font-size: 14px; min-width: 0; }
+    .search-filters {
+      flex-wrap: nowrap; overflow-x: auto; padding-bottom: 4px;
+      scrollbar-width: none; -webkit-overflow-scrolling: touch;
+    }
+    .search-filters::-webkit-scrollbar { display: none; }
+    .search-filters .filter-chip { flex-shrink: 0; white-space: nowrap; }
+    .search-filters .sep-v { flex-shrink: 0; }
+    .result-card { grid-template-columns: 1fr; gap: 12px; }
+    .r-score { width: 100%; gap: 10px; }
+    .r-score .score-viz { flex-direction: row; flex: 1; gap: 9px; order: -1; }
+    .score-bar { width: auto; flex: 1; height: 6px; }
+    .score-bar > span {
+      top: 0; bottom: 0; right: auto; height: auto; width: var(--score);
+      animation-name: bar-grow-w;
+    }
+  }
+  @keyframes bar-grow-w { from { width: 0; } }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-note" viewBox="0 0 24 24"><path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="13" y2="17"/></symbol>
+  <symbol id="i-graph" viewBox="0 0 24 24"><circle cx="5" cy="6" r="2.5"/><circle cx="19" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><line x1="6.8" y1="7.8" x2="10.4" y2="16"/><line x1="17.2" y1="7.8" x2="13.6" y2="16"/><line x1="7.5" y1="6" x2="16.5" y2="6"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3v18M3 12h18" transform="rotate(45 12 12)"/><path d="M12 3v18M3 12h18"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-building" viewBox="0 0 24 24"><rect x="4" y="2" width="16" height="20" rx="1"/><line x1="9" y1="7" x2="10" y2="7"/><line x1="14" y1="7" x2="15" y2="7"/><line x1="9" y1="11" x2="10" y2="11"/><line x1="14" y1="11" x2="15" y2="11"/><path d="M9 22v-4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v4"/></symbol>
+  <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+  <symbol id="i-vector" viewBox="0 0 24 24"><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="16" cy="17" r="2.5"/><line x1="7.8" y1="16.2" x2="16.2" y2="7.8"/><line x1="8.4" y1="17.7" x2="13.5" y2="17.2"/></symbol>
+  <symbol id="i-hops" viewBox="0 0 24 24"><circle cx="4.5" cy="12" r="2.5"/><circle cx="19.5" cy="12" r="2.5"/><path d="M7 12c2-6 8-6 10 0"/></symbol>
+  <symbol id="i-arrow-r" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></symbol>
+  <symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+  <symbol id="i-tag" viewBox="0 0 24 24"><path d="M20.59 13.41 12 22 2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><circle cx="7" cy="7" r="1.5"/></symbol>
+  <symbol id="i-branch" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+</defs></svg>
+
+<div class="intro">
+  <h1>Notatki — szukanie hybrydowe (N5)</h1>
+  <p class="lead">Tryb „Szukaj" addonu Notatki: jedno pytanie w języku naturalnym, a pod spodem dwa silniki naraz — podobieństwo wektorowe po embeddingach i wędrówka po grafie powiązań (encje, projekty, spotkania). Na górze streamowana odpowiedź LLM z cytowaniami, niżej ranking wyników z widocznym score i metodą trafienia, a prawa kolumna pozwala zawęzić wyniki przez encje i krawędzie grafu.</p>
+  <div class="rules">
+    <div class="rule">
+      <h3><svg class="icon"><use href="#i-vector"/></svg>Wektory + graf razem</h3>
+      <p>RRF łączy podobieństwo semantyczne z trafieniami po krawędziach grafu. Każdy wynik pokazuje skąd przyszedł: „wektorowo" albo „graf · 2 skoki" z pełną ścieżką dojścia.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon"><use href="#i-sparkle"/></svg>Odpowiedź, nie tylko lista</h3>
+      <p>LLM streamuje syntezę z cytowaniami [1][2] zakotwiczonymi w konkretnych notatkach — caret i shimmer pokazują generację na żywo, a kliknięcie cytatu skacze do źródła.</p>
+    </div>
+    <div class="rule">
+      <h3><svg class="icon"><use href="#i-shield"/></svg>ACL przed rankingiem</h3>
+      <p>Wyniki filtrowane po dostępach zanim cokolwiek zobaczysz — do rankingu i do kontekstu LLM wchodzą wyłącznie notatki, do których masz odczyt: własne, grupowe albo organizacyjne.</p>
+    </div>
+  </div>
+</div>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">N5</span>
+    <h2>Szukanie hybrydowe</h2>
+    <div class="desc">Stan „w trakcie odpowiedzi": zapytanie o ustalenia z kontrahentem Firma Sp. z o.o., synteza streamuje się z Bielika, pod spodem 4 wyniki z score i metodą trafienia, po prawej encje i zawężanie przez graf.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="addon-shell">
+
+      <div class="addon-topbar">
+        <div class="addon-title">
+          <span class="t-ico"><svg class="icon"><use href="#i-note"/></svg></span>
+          Notatki
+        </div>
+        <div class="mode-switch">
+          <span class="pill"></span>
+          <button><svg class="icon"><use href="#i-note"/></svg>Notatki</button>
+          <button><svg class="icon"><use href="#i-graph"/></svg>Graf</button>
+          <button class="active"><svg class="icon"><use href="#i-search"/></svg>Szukaj</button>
+        </div>
+        <div class="ml-auto">
+          <span class="model-pill"><span class="m-dot"></span>Bielik 4.5B · llama.cpp</span>
+        </div>
+      </div>
+
+      <div class="search-hero">
+        <div class="big-search">
+          <svg class="icon icon-lead"><use href="#i-search"/></svg>
+          <input type="text" value="co ustaliliśmy z Firma Sp. z o.o. w sprawie pipeline'u?" spellcheck="false">
+          <span class="kbd">⏎</span>
+        </div>
+        <div class="search-filters">
+          <span class="filter-chip active"><svg class="icon"><use href="#i-filter"/></svg>Wszystkie zakresy</span>
+          <span class="filter-chip"><svg class="icon"><use href="#i-user"/></svg>Moje</span>
+          <span class="filter-chip"><svg class="icon"><use href="#i-users"/></svg>Grupa</span>
+          <span class="filter-chip"><svg class="icon"><use href="#i-building"/></svg>Organizacja</span>
+          <span class="sep-v"></span>
+          <span class="filter-chip"><svg class="icon"><use href="#i-calendar"/></svg>Ostatnie 90 dni</span>
+        </div>
+      </div>
+
+      <div class="results-layout">
+        <div class="results-main">
+
+          <div class="answer-card">
+            <div class="answer-head">
+              <span class="a-title"><svg class="icon"><use href="#i-sparkle"/></svg>Odpowiedź</span>
+              <span class="streaming-chip"><span class="s-dot"></span>streaming · Bielik 4.5B</span>
+            </div>
+            <div class="answer-body">
+              Z Firma Sp. z o.o. ustalono, że migracja pipeline'u wdrożeniowego na nowy klaster startuje <b>21 lipca</b>, a czas wydania ma spaść z czterech godzin do około dwudziestu minut<span class="cite">1</span>. Marta Wiśniewska przygotowuje plan rollbacku dla usług inferencyjnych, a zespół R&amp;D przejmuje monitoring pierwszego tygodnia po przełączeniu<span class="cite">1</span><span class="cite">2</span>. <span class="streamed">Otwarta pozostaje decyzja o retencji artefaktów buildów — na spotkaniu 12 czerwca padła propozycja 30 dni, ale QA zgłosiło potrzebę</span><span class="caret"></span>
+            </div>
+            <div class="answer-sources">
+              <span class="src-label">Źródła:</span>
+              <span class="mini-cite"><span class="n">1</span>Spotkanie z Firma Sp. z o.o. — pipeline wdrożeniowy</span>
+              <span class="mini-cite"><span class="n">2</span>Plan rollbacku usług inferencyjnych</span>
+            </div>
+          </div>
+
+          <div class="result-card">
+            <div>
+              <div class="r-title"><svg class="icon"><use href="#i-note"/></svg>Spotkanie z Firma Sp. z o.o. — pipeline wdrożeniowy</div>
+              <div class="r-snippet">Ustaliliśmy, że migracja <b>pipeline'u</b> wdrożeniowego na nowy klaster rusza od 21 lipca. Marta przygotuje plan rollbacku dla usług inferencyjnych, a zespół R&amp;D przejmie monitoring…</div>
+              <div class="r-meta">
+                <span class="scope-badge mine"><svg class="icon"><use href="#i-user"/></svg>Moje</span>
+                <span><svg class="icon"><use href="#i-calendar"/></svg>2 lip 2026</span>
+                <span><svg class="icon"><use href="#i-user"/></svg>Piotr Jarocki</span>
+              </div>
+            </div>
+            <div class="r-score">
+              <span class="method-badge vector"><svg class="icon"><use href="#i-vector"/></svg>wektorowo</span>
+              <span class="score-viz"><span class="score-bar"><span style="--score:92%"></span></span><span class="pct">92%</span></span>
+            </div>
+          </div>
+
+          <div class="result-card">
+            <div>
+              <div class="r-title"><svg class="icon"><use href="#i-note"/></svg>Plan rollbacku usług inferencyjnych</div>
+              <div class="r-snippet">Rollback <b>pipeline'u</b> obejmuje trzy etapy: zamrożenie deploymentów, przywrócenie poprzedniego obrazu klastra i weryfikację health-checków. Za całość odpowiada Marta Wiśniewska…</div>
+              <div class="r-meta">
+                <span class="scope-badge group"><svg class="icon"><use href="#i-users"/></svg>Grupa · Zespół R&amp;D</span>
+                <span><svg class="icon"><use href="#i-calendar"/></svg>28 cze 2026</span>
+                <span><svg class="icon"><use href="#i-user"/></svg>Marta Wiśniewska</span>
+              </div>
+            </div>
+            <div class="r-score">
+              <span class="method-badge vector"><svg class="icon"><use href="#i-vector"/></svg>wektorowo</span>
+              <span class="score-viz"><span class="score-bar"><span style="--score:87%"></span></span><span class="pct">87%</span></span>
+            </div>
+          </div>
+
+          <div class="result-card">
+            <div>
+              <div class="r-title"><svg class="icon"><use href="#i-note"/></svg>Notatka ze spotkania 12.06 — retencja artefaktów</div>
+              <div class="r-snippet">Propozycja retencji artefaktów buildów: <b>30 dni</b>. QA zgłasza, że testy regresyjne czasem sięgają po starsze buildy — do <b>ustalenia</b> z <b>Firma Sp. z o.o.</b> przed migracją produkcji…</div>
+              <div class="r-meta">
+                <span class="scope-badge group"><svg class="icon"><use href="#i-users"/></svg>Grupa · Zespół R&amp;D</span>
+                <span><svg class="icon"><use href="#i-calendar"/></svg>12 cze 2026</span>
+                <span><svg class="icon"><use href="#i-user"/></svg>Tomasz Zieliński</span>
+              </div>
+              <div class="graph-path">
+                <span class="gp-node"><svg class="icon"><use href="#i-note"/></svg>Notatka</span>
+                <span class="gp-arrow"><svg class="icon"><use href="#i-arrow-r"/></svg></span>
+                <span class="gp-node entity"><svg class="icon"><use href="#i-building"/></svg>Firma Sp. z o.o.</span>
+                <span class="gp-arrow"><svg class="icon"><use href="#i-arrow-r"/></svg></span>
+                <span class="gp-node"><svg class="icon"><use href="#i-note"/></svg>Spotkanie 12.06</span>
+              </div>
+            </div>
+            <div class="r-score">
+              <span class="method-badge graph"><svg class="icon"><use href="#i-hops"/></svg>graf · 2 skoki</span>
+              <span class="score-viz"><span class="score-bar"><span style="--score:74%"></span></span><span class="pct">74%</span></span>
+            </div>
+          </div>
+
+          <div class="result-card">
+            <div>
+              <div class="r-title"><svg class="icon"><use href="#i-note"/></svg>Testy obciążeniowe przed migracją produkcji</div>
+              <div class="r-snippet">Harmonogram testów obciążeniowych nowego <b>pipeline'u</b>: scenariusze na staging od 14 lipca, cel — 500 równoległych wdrożeń bez degradacji czasu odpowiedzi API…</div>
+              <div class="r-meta">
+                <span class="scope-badge org"><svg class="icon"><use href="#i-building"/></svg>Organizacja</span>
+                <span><svg class="icon"><use href="#i-calendar"/></svg>30 cze 2026</span>
+                <span><svg class="icon"><use href="#i-user"/></svg>Anna Nowicka</span>
+              </div>
+            </div>
+            <div class="r-score">
+              <span class="method-badge vector"><svg class="icon"><use href="#i-vector"/></svg>wektorowo</span>
+              <span class="score-viz"><span class="score-bar"><span style="--score:68%"></span></span><span class="pct">68%</span></span>
+            </div>
+          </div>
+
+        </div>
+
+        <aside class="right-rail">
+          <div class="rail-card">
+            <h4><svg class="icon"><use href="#i-tag"/></svg>Encje w wynikach</h4>
+            <div class="entity-chips">
+              <span class="entity-chip"><span class="e-dot company"></span>Firma Sp. z o.o.<span class="e-cnt">4</span></span>
+              <span class="entity-chip"><span class="e-dot person"></span>Marta Wiśniewska<span class="e-cnt">2</span></span>
+              <span class="entity-chip"><span class="e-dot person"></span>Tomasz Zieliński<span class="e-cnt">1</span></span>
+              <span class="entity-chip"><span class="e-dot company"></span>Euvic<span class="e-cnt">1</span></span>
+              <span class="entity-chip"><span class="e-dot topic"></span>pipeline wdrożeniowy<span class="e-cnt">3</span></span>
+              <span class="entity-chip"><span class="e-dot topic"></span>retencja artefaktów<span class="e-cnt">1</span></span>
+            </div>
+          </div>
+          <div class="rail-card">
+            <h4><svg class="icon"><use href="#i-branch"/></svg>Zawęź przez graf</h4>
+            <div class="narrow-item"><svg class="icon"><use href="#i-hops"/></svg><span>tylko notatki połączone z: <b>Firma Sp. z o.o.</b></span></div>
+            <div class="narrow-item"><svg class="icon"><use href="#i-hops"/></svg><span>tylko notatki połączone z: <b>Marta Wiśniewska</b></span></div>
+            <div class="narrow-item"><svg class="icon"><use href="#i-hops"/></svg><span>w promieniu 1 skoku od: <b>Spotkanie 12.06</b></span></div>
+          </div>
+        </aside>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

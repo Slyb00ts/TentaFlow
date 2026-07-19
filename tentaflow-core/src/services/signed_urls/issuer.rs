@@ -31,6 +31,9 @@ pub enum UrlScope {
     Recording,
     /// RODO/GDPR legal documents (F2 P8.c) — PDF artifacts in `legal_documents`.
     LegalUrl,
+    /// Vision model-bundle distribution between TentaFlow instances —
+    /// `/models/manifest/<bundle_ref>` + `/models/file/<bundle_ref>/<name>`.
+    ModelBundle,
 }
 
 impl UrlScope {
@@ -39,6 +42,7 @@ impl UrlScope {
             Self::FrameUrl => "frame",
             Self::Recording => "recording",
             Self::LegalUrl => "legal",
+            Self::ModelBundle => "model_bundle",
         }
     }
 
@@ -50,6 +54,7 @@ impl UrlScope {
             Self::FrameUrl => 5,
             Self::Recording => 60,
             Self::LegalUrl => 60,
+            Self::ModelBundle => 300,
         }
     }
 
@@ -58,6 +63,10 @@ impl UrlScope {
             Self::FrameUrl => 600,
             Self::Recording => 3600,
             Self::LegalUrl => 3600,
+            // Bundle links are admin-generated deliberately and the payload is
+            // large (a 126 MB ONNX over a slow WAN) — a week-long ceiling lets
+            // a link survive an overnight transfer window.
+            Self::ModelBundle => 7 * 24 * 3600,
         }
     }
 
@@ -69,6 +78,7 @@ impl UrlScope {
             Self::FrameUrl => "frame_url",
             Self::Recording => "recording_url",
             Self::LegalUrl => "legal_url",
+            Self::ModelBundle => "model_bundle_url",
         }
     }
 }
@@ -213,6 +223,41 @@ impl SignedUrlIssuer {
         })
     }
 
+    /// Like `issue`, but pins the token to an absolute expiry instead of a TTL.
+    /// Used to derive per-file tokens whose lifetime must not outlive the
+    /// manifest token they were minted from. The expiry must be in the future
+    /// and within `now + max_ttl` — a caller cannot use this to escape the
+    /// scope's ceiling.
+    pub fn issue_with_expiry(
+        &self,
+        ref_id: String,
+        expiry_unix_ms: u64,
+    ) -> Result<SignedUrl, SignedUrlError> {
+        let now = now_unix_ms();
+        if expiry_unix_ms <= now {
+            return Err(SignedUrlError::Expired);
+        }
+        let remaining_secs = (expiry_unix_ms - now) / 1000;
+        let max = self.scope.max_ttl_secs();
+        if remaining_secs > max {
+            return Err(SignedUrlError::TtlOutOfRange(remaining_secs, 0, max));
+        }
+        if ref_id.is_empty() || ref_id.len() > 256 {
+            return Err(SignedUrlError::RefInvalid);
+        }
+        let payload = format!("{}:{}:{}", self.scope.as_str(), ref_id, expiry_unix_ms);
+        let sig = {
+            let state = self.keys.read();
+            hmac_sign(&state.current, payload.as_bytes())
+        };
+        let token_b64 = B64.encode(sig);
+        Ok(SignedUrl {
+            ref_id,
+            expiry_unix_ms,
+            token_b64,
+        })
+    }
+
     /// Multi-use verify. Does NOT mark the token consumed — callers may verify
     /// the same `(ref_id, expiry_unix_ms, token_b64)` triple as many times as
     /// they like until `expiry_unix_ms` passes.
@@ -262,6 +307,7 @@ impl SignedUrlIssuer {
             UrlScope::FrameUrl => crate::services::mesh_keys::KeyScope::FrameUrl,
             UrlScope::Recording => crate::services::mesh_keys::KeyScope::RecordingUrl,
             UrlScope::LegalUrl => crate::services::mesh_keys::KeyScope::LegalUrl,
+            UrlScope::ModelBundle => crate::services::mesh_keys::KeyScope::ModelBundleUrl,
         };
         for peer_key in crate::services::mesh_keys::mesh_key_pool().verify_keys_for(scope) {
             let expected = hmac_sign(&peer_key, payload.as_bytes());

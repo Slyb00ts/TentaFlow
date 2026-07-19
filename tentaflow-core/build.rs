@@ -29,6 +29,12 @@ fn main() {
     // MUSI byc przed generate_wwwroot_embed zeby wynikowe pliki trafily do embed.
     build_voxel_wasm_bindings();
 
+    // Wygeneruj asset-manifest.js + sw-version.js + staly ASSET_BUILD_HASH z
+    // SHA-256 calego frontu. MUSI byc PO wygenerowaniu wasm glue i
+    // services-manifest.js (zeby wliczyc ich tresc) i PRZED wwwroot_embed
+    // (zeby wynikowe pliki trafily do embed).
+    generate_asset_manifest(&out_dir_env);
+
     // Generuj wwwroot_embed.rs — pliki statyczne wbudowane w binarie
     // (po wygenerowaniu services-manifest.js, zeby trafil do embed).
     generate_wwwroot_embed(&out_dir_env);
@@ -67,10 +73,33 @@ fn main() {
             if !addon_dir.is_dir() {
                 continue;
             }
-            if !addon_dir.join("Cargo.toml").exists() {
+            let manifest_path = addon_dir.join("manifest.toml");
+            if !manifest_path.exists() {
                 continue;
             }
-            if !addon_dir.join("manifest.toml").exists() {
+
+            // The manifest `runtime` field is the source of truth for which
+            // toolchain builds the addon (must match language_adapter.rs):
+            // "dotnet" → dotnet publish, everything else (wasmtime/wasmi, or
+            // unset) → cargo. Gating on the manifest — not on which project
+            // file happens to exist — keeps the build path aligned with the
+            // adapter the host will select at load time.
+            let runtime = read_manifest_runtime(&manifest_path);
+            let is_dotnet = runtime.as_deref() == Some("dotnet");
+            let csproj = if is_dotnet {
+                find_csproj(&addon_dir)
+            } else {
+                None
+            };
+            let is_rust = !is_dotnet && addon_dir.join("Cargo.toml").exists();
+            if is_dotnet && csproj.is_none() {
+                println!(
+                    "cargo:warning=Addon '{}' — manifest runtime=\"dotnet\" ale brak pliku .csproj, pomijam",
+                    addon_dir.file_name().unwrap().to_string_lossy()
+                );
+                continue;
+            }
+            if !is_rust && !is_dotnet {
                 continue;
             }
 
@@ -86,15 +115,25 @@ fn main() {
                     println!("cargo:rerun-if-changed={}", src_entry.display());
                 }
             }
-            println!(
-                "cargo:rerun-if-changed={}",
-                addon_dir.join("Cargo.toml").display()
-            );
+            if is_rust {
+                println!(
+                    "cargo:rerun-if-changed={}",
+                    addon_dir.join("Cargo.toml").display()
+                );
+            }
+            if let Some(csproj_path) = &csproj {
+                println!("cargo:rerun-if-changed={}", csproj_path.display());
+                for cs in list_cs_sources(&addon_dir) {
+                    println!("cargo:rerun-if-changed={}", cs.display());
+                }
+            }
             println!(
                 "cargo:rerun-if-changed={}",
                 addon_dir.join("manifest.toml").display()
             );
-            println!("cargo:rerun-if-changed={}", addon_dir.join("src").display());
+            if src_dir.is_dir() {
+                println!("cargo:rerun-if-changed={}", src_dir.display());
+            }
             if addon_dir.join("migrations").exists() {
                 println!(
                     "cargo:rerun-if-changed={}",
@@ -112,6 +151,43 @@ fn main() {
                 "cargo:warning=Addon '{}' — rozpoczynam budowanie WASM",
                 addon_name
             );
+
+            if is_dotnet {
+                // Addon .NET (NativeAOT-LLVM) — dotnet publish do wasm32-wasip1.
+                let wasm_path = match build_dotnet_addon(&addon_dir, &addon_name) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                if let Err(bad_imports) = validate_wasm_imports(&wasm_path) {
+                    panic!(
+                        "\n\nAddon '{}' — WASM import namespace error!\n\
+                         The following imports use the \"env\" module instead of \"tentaflow\":\n\
+                         {}\n",
+                        addon_name, bad_imports
+                    );
+                }
+                let bundle_addon_dir = bundle_dir.join(&addon_name);
+                std::fs::create_dir_all(&bundle_addon_dir).unwrap();
+                std::fs::copy(&wasm_path, bundle_addon_dir.join("addon.wasm")).unwrap();
+                std::fs::copy(
+                    addon_dir.join("manifest.toml"),
+                    bundle_addon_dir.join("manifest.toml"),
+                )
+                .unwrap();
+                for file in &["SKILL.md", "DESCRIPTION.md", "blocks.json", "icon.png"] {
+                    let src = addon_dir.join(file);
+                    if src.exists() {
+                        std::fs::copy(&src, bundle_addon_dir.join(file)).ok();
+                    }
+                }
+                copy_dir_flat(&addon_dir.join("migrations"), &bundle_addon_dir.join("migrations"));
+                copy_dir_flat(&addon_dir.join("flows"), &bundle_addon_dir.join("flows"));
+                bundled_addons.push(BundledAddonInfo {
+                    name: addon_name,
+                    bundle_path: bundle_addon_dir,
+                });
+                continue;
+            }
 
             if !has_wasm_target {
                 println!(
@@ -368,6 +444,211 @@ fn shared_addon_wasm_target() -> PathBuf {
 }
 
 // =============================================================================
+// Addony .NET — dotnet publish (NativeAOT-LLVM) do wasm32-wasip1
+// =============================================================================
+
+/// Odczytuje `runtime = "..."` z sekcji `[addon]` manifestu. Zwraca None gdy
+/// pole nie istnieje. Parser jest liniowy (jak reszta build.rs) i czyta tylko
+/// dopoki jest w sekcji [addon], zeby nie zlapac `runtime` z innej sekcji.
+fn read_manifest_runtime(manifest_path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(manifest_path).ok()?;
+    let mut in_addon = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_addon = trimmed == "[addon]";
+            continue;
+        }
+        if in_addon && trimmed.starts_with("runtime") {
+            if let Some(val) = extract_toml_string_value(trimmed) {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+/// Znajduje plik .csproj w katalogu addonu (poziom root).
+fn find_csproj(addon_dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(addon_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e == "csproj").unwrap_or(false) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Zbiera pliki .cs addonu (rekursywnie, pomijajac bin/ i obj/).
+fn list_cs_sources(addon_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![addon_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if name != "bin" && name != "obj" {
+                    stack.push(path);
+                }
+            } else if path.extension().map(|e| e == "cs").unwrap_or(false) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Zwraca sciezke do WASI SDK: env WASI_SDK_PATH albo auto-detekcja w cache
+/// natywnym TentaFlow (katalog `wasi-sdk-*` w TENTAFLOW_NATIVE_CACHE).
+fn resolve_wasi_sdk() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("WASI_SDK_PATH") {
+        let path = PathBuf::from(p);
+        if path.join("share/wasi-sysroot").exists() {
+            return Some(path);
+        }
+    }
+    let cache_root = std::env::var("TENTAFLOW_NATIVE_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let base = std::env::var("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache")
+                });
+            base.join("tentaflow-native-libs")
+        });
+    let entries = std::fs::read_dir(&cache_root).ok()?;
+    let mut candidates: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with("wasi-sdk-"))
+                    .unwrap_or(false)
+                && p.join("share/wasi-sysroot").exists()
+        })
+        .collect();
+    candidates.sort();
+    candidates.pop()
+}
+
+/// Buduje addon .NET przez `dotnet publish -r wasi-wasm` (NativeAOT-LLVM,
+/// bare module wasip1 przez IlcLlvmTarget + LinkerFlavor z Directory.Build.rsp
+/// addonu). Zwraca sciezke do wynikowego .wasm albo None (skip z warningiem) —
+/// jak Rustowa sciezka przy braku targetu wasm32-wasip1.
+fn build_dotnet_addon(addon_dir: &Path, addon_name: &str) -> Option<PathBuf> {
+    let dotnet_ok = Command::new("dotnet")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !dotnet_ok {
+        println!(
+            "cargo:warning=Addon '{}' — pomijam: brak dotnet SDK w PATH \
+             (zainstaluj .NET 10 SDK aby budowac addony C#)",
+            addon_name
+        );
+        return None;
+    }
+
+    let Some(wasi_sdk) = resolve_wasi_sdk() else {
+        println!(
+            "cargo:warning=Addon '{}' — pomijam: brak WASI SDK \
+             (ustaw WASI_SDK_PATH albo rozpakuj wasi-sdk-25+ do \
+             ~/.cache/tentaflow-native-libs/)",
+            addon_name
+        );
+        return None;
+    };
+
+    let status = Command::new("dotnet")
+        .args(["publish", "-c", "Release", "-r", "wasi-wasm"])
+        .current_dir(addon_dir)
+        .env("WASI_SDK_PATH", &wasi_sdk)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            println!(
+                "cargo:warning=Addon '{}' — blad dotnet publish (kod: {}), pomijam",
+                addon_name, s
+            );
+            return None;
+        }
+        Err(e) => {
+            println!(
+                "cargo:warning=Addon '{}' — nie udalo sie uruchomic dotnet: {}, pomijam",
+                addon_name, e
+            );
+            return None;
+        }
+    }
+
+    // Wynik: bin/Release/net*/wasi-wasm/publish/<Assembly>.wasm — bierzemy
+    // jedyny plik .wasm z katalogu publish.
+    let release_dir = addon_dir.join("bin/Release");
+    let mut wasm_files: Vec<PathBuf> = Vec::new();
+    if let Ok(tfms) = std::fs::read_dir(&release_dir) {
+        for tfm in tfms.flatten() {
+            let publish = tfm.path().join("wasi-wasm/publish");
+            if let Ok(files) = std::fs::read_dir(&publish) {
+                for f in files.flatten() {
+                    let p = f.path();
+                    if p.extension().map(|e| e == "wasm").unwrap_or(false) {
+                        wasm_files.push(p);
+                    }
+                }
+            }
+        }
+    }
+    match wasm_files.len() {
+        1 => {
+            println!(
+                "cargo:warning=Addon '{}' — kompilacja WASM (.NET) zakonczona pomyslnie",
+                addon_name
+            );
+            wasm_files.pop()
+        }
+        0 => {
+            println!(
+                "cargo:warning=Addon '{}' — dotnet publish nie wytworzyl pliku .wasm, pomijam",
+                addon_name
+            );
+            None
+        }
+        n => {
+            println!(
+                "cargo:warning=Addon '{}' — znaleziono {} plikow .wasm w publish, pomijam",
+                addon_name, n
+            );
+            None
+        }
+    }
+}
+
+/// Kopiuje pliki (plasko) z katalogu zrodlowego do docelowego, jesli istnieje.
+fn copy_dir_flat(src: &Path, dest: &Path) {
+    if !src.exists() {
+        return;
+    }
+    std::fs::create_dir_all(dest).unwrap();
+    if let Ok(entries) = std::fs::read_dir(src) {
+        for e in entries.flatten() {
+            std::fs::copy(e.path(), dest.join(e.file_name())).ok();
+        }
+    }
+}
+
+// =============================================================================
 // Odczyt nazwy crate z Cargo.toml addonu
 // =============================================================================
 
@@ -570,11 +851,12 @@ fn escape_path(path: &Path) -> String {
 /// dla kazdego pliku. Rejestruje rerun-if-changed na kazdym pliku zeby cargo
 /// automatycznie rekompilowalo po zmianie jakiegokolwiek zasobu www.
 fn generate_wwwroot_embed(out_dir: &Path) {
+    use sha2::{Digest, Sha256};
     let wwwroot = Path::new("www");
     if !wwwroot.exists() {
         // Brak www — generuj pusta funkcje lookup
         let code =
-            "fn wwwroot_lookup(_path: &str) -> Option<(&'static str, &'static [u8])> { None }\n";
+            "fn wwwroot_lookup(_path: &str) -> Option<(&'static str, &'static [u8], &'static str)> { None }\n";
         std::fs::write(out_dir.join("wwwroot_embed.rs"), code).unwrap();
         return;
     }
@@ -604,15 +886,23 @@ fn generate_wwwroot_embed(out_dir: &Path) {
 
     code.push_str("\n");
 
-    // Generuj funkcje lookup
-    code.push_str("fn wwwroot_lookup(path: &str) -> Option<(&'static str, &'static [u8])> {\n");
+    // Generuj funkcje lookup — trzeci element to ETag (per-plik SHA-256, 16 hex).
+    // Serwer uzywa go do warunkowych GET (If-None-Match -> 304), wiec caching w
+    // przegladarce dziala ZAWSZE, niezaleznie od service workera/certa.
+    code.push_str(
+        "fn wwwroot_lookup(path: &str) -> Option<(&'static str, &'static [u8], &'static str)> {\n",
+    );
     code.push_str("    match path {\n");
 
-    for (i, (rel_path, _)) in files.iter().enumerate() {
+    for (i, (rel_path, abs_path)) in files.iter().enumerate() {
         let mime = guess_mime(rel_path);
+        let bytes = std::fs::read(abs_path).unwrap_or_default();
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        let etag: String = h.finalize().iter().take(8).map(|b| format!("{:02x}", b)).collect();
         code.push_str(&format!(
-            "        \"{}\" => Some((\"{}\", WWWROOT_FILE_{})),\n",
-            rel_path, mime, i
+            "        \"{}\" => Some((\"{}\", WWWROOT_FILE_{}, \"{}\")),\n",
+            rel_path, mime, i, etag
         ));
     }
 
@@ -621,6 +911,95 @@ fn generate_wwwroot_embed(out_dir: &Path) {
     code.push_str("}\n");
 
     std::fs::write(out_dir.join("wwwroot_embed.rs"), code).unwrap();
+}
+
+/// Zapisuje plik tylko gdy tresc sie zmienila — bez tego przepisywanie
+/// identycznej tresci bije mtime i wpada w petle rebuildu (rerun-if-changed=www).
+fn write_if_changed(path: &Path, content: &str) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if existing == content {
+            return;
+        }
+    }
+    std::fs::write(path, content).unwrap();
+}
+
+/// Skanuje www/ i liczy zbiorczy SHA-256 calego frontu (ASSET_BUILD_HASH).
+/// Generuje trzy artefakty z tego samego hasha:
+///   - www/js/generated/asset-manifest.js — lista wszystkich zasobow +
+///     ASSET_BUILD_HASH (browser: precache w service workerze + porownanie
+///     w handshake WS),
+///   - www/js/generated/sw-version.js — importScripts w service workerze; zmiana
+///     hasha zmienia bajty importu => browser wykrywa update SW i przecacheowuje,
+///   - $OUT_DIR/asset_build_hash.rs — staly Rust wysylany w MetaSchemaVersionAck.
+/// Dzieki temu KAZDA zmiana frontu (JS/CSS/wasm glue/panel addona) wywoluje
+/// odswiezenie cache i wykrycie nieaktualnego frontu przy (re)connect WS.
+fn generate_asset_manifest(out_dir: &Path) {
+    use sha2::{Digest, Sha256};
+
+    let wwwroot = Path::new("www");
+    // Pliki generowane w tym kroku wykluczamy z hasha (self-reference) —
+    // inaczej ich wlasna tresc zmienialaby hash w nieskonczonosc.
+    const SELF: &[&str] = &[
+        "js/generated/asset-manifest.js",
+        "js/generated/sw-version.js",
+    ];
+
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    if wwwroot.exists() {
+        collect_wwwroot_files(wwwroot, wwwroot, &mut files);
+    }
+    // Deterministyczna kolejnosc — hash niezalezny od kolejnosci read_dir.
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut agg = Sha256::new();
+    let mut list: Vec<String> = Vec::new();
+    for (rel, abs) in &files {
+        if SELF.contains(&rel.as_str()) {
+            continue;
+        }
+        let bytes = std::fs::read(abs).unwrap_or_default();
+        let mut fh = Sha256::new();
+        fh.update(&bytes);
+        let digest = fh.finalize();
+        agg.update(rel.as_bytes());
+        agg.update([0u8]);
+        agg.update(digest);
+        list.push(format!("/{}", rel));
+    }
+    let full: String = agg.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+    let hash = &full[..16];
+
+    let mut js = String::new();
+    js.push_str("// Auto-generated by build.rs — NIE EDYTUJ RECZNIE\n");
+    js.push_str(&format!("export const ASSET_BUILD_HASH = \"{}\";\n", hash));
+    js.push_str("export const ASSET_MANIFEST = [\n");
+    for p in &list {
+        js.push_str(&format!("  {:?},\n", p));
+    }
+    js.push_str("];\n");
+    write_if_changed(&wwwroot.join("js/generated/asset-manifest.js"), &js);
+
+    // Classic worker importScripts — service worker nie moze importowac ESM,
+    // wiec hash i pelna lista sa tu jako globalne (self.__ASSET_*).
+    let mut sw = String::new();
+    sw.push_str("// Auto-generated by build.rs — NIE EDYTUJ RECZNIE\n");
+    sw.push_str(&format!("self.__ASSET_BUILD_HASH = {:?};\n", hash));
+    sw.push_str("self.__ASSET_MANIFEST = [\n");
+    for p in &list {
+        sw.push_str(&format!("  {:?},\n", p));
+    }
+    sw.push_str("];\n");
+    write_if_changed(&wwwroot.join("js/generated/sw-version.js"), &sw);
+
+    std::fs::write(
+        out_dir.join("asset_build_hash.rs"),
+        format!("pub const ASSET_BUILD_HASH: &str = {:?};\n", hash),
+    )
+    .unwrap();
 }
 
 /// Rekurencyjnie zbiera pliki z katalogu www.
@@ -907,6 +1286,13 @@ mod services_manifest_build {
         /// Tri-state DGX Spark gate. Mirror of runtime `Engine.dgx_spark`.
         #[serde(default)]
         pub dgx_spark: Option<bool>,
+        /// Mirror of runtime `Engine.cluster_capable` — carried through so the
+        /// GUI deploy wizard can offer the engine for cluster targets.
+        #[serde(default)]
+        pub cluster_capable: Option<bool>,
+        /// Mirror of runtime `Engine.cluster_launch` ("ray" default / "vllm-mp").
+        #[serde(default)]
+        pub cluster_launch: Option<String>,
         pub default_port: u16,
         pub api: ApiKind,
         pub version: String,
@@ -919,6 +1305,11 @@ mod services_manifest_build {
         pub input_modalities: Option<Vec<String>>,
         #[serde(default)]
         pub output_modalities: Option<Vec<String>>,
+        /// Mirror runtime `Engine.backend` — `"vllm"` for every vLLM-served
+        /// engine. Must be carried through to the generated manifest so the GUI
+        /// (deploy wizard + service editor) can gate the VRAM calculator on it.
+        #[serde(default)]
+        pub backend: Option<String>,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -1091,6 +1482,19 @@ mod services_manifest_build {
         /// Mirror `ModelPreset::checkpoint_file` z `services/manifest/types.rs`.
         #[serde(default)]
         pub checkpoint_file: Option<String>,
+        /// Warianty kwantyzacji tego samego modelu — kazdy to inne repo HF pod
+        /// wybrana kwantyzacje. `repo`/`quantization` na preset = wariant „standard".
+        /// Wizard pokazuje je jako wybor przy kalkulatorze i podmienia repo.
+        #[serde(default, rename = "quant_variant")]
+        pub quant_variants: Vec<QuantVariant>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct QuantVariant {
+        pub quantization: String,
+        pub repo: String,
+        #[serde(default)]
+        pub display_name: Option<String>,
     }
 
     // Single source of truth for the three wire-string allow-lists is
@@ -1868,7 +2272,10 @@ fn write_generated(out_dir: &Path, json: &str) {
 }
 
 fn write_js_module(path: &Path, json_pretty: &str) {
-    let now = chrono_now_iso();
+    // Bez wall-clock timestampu — tresc musi byc DETERMINISTYCZNA, bo wchodzi do
+    // ASSET_BUILD_HASH (build.rs generate_asset_manifest). Zmienny timestamp
+    // powodowalby nowy hash przy KAZDYM buildzie backendu i falszywy komunikat
+    // "nowa wersja" mimo braku zmian frontu.
     let content = format!(
         "// =============================================================================\n\
          // Plik: services-manifest.js\n\
@@ -1877,9 +2284,8 @@ fn write_js_module(path: &Path, json_pretty: &str) {
          // =============================================================================\n\
          \n\
          export const SCHEMA_VERSION = 2;\n\
-         export const GENERATED_AT = \"{}\";\n\
          export const SERVICES = {};\n",
-        now, json_pretty
+        json_pretty
     );
     if let Err(e) = std::fs::write(path, content) {
         println!(
@@ -1960,6 +2366,10 @@ fn build_protocol_wasm_bindings() {
         "cargo:rerun-if-changed={}/Cargo.toml",
         protocol_dir.display()
     );
+    // The glue's decode is schema-driven (component/inline wire metadata comes
+    // from tentaflow-sdk-spec), so a spec change must regenerate wasm_glue too —
+    // otherwise new fields decode against stale metadata.
+    rerun_if_changed_recursive(Path::new("../tentaflow-sdk-spec/src"));
 
     // Sprawdz wasm32-unknown-unknown target
     if !check_wasm_browser_target() {

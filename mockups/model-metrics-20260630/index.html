@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>Statystyki modeli — Mockupy v1</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+<div class="index-page">
+  <h1>Statystyki modeli AI</h1>
+  <p class="subtitle">Pełna analityka użycia i wydajności modeli w sieci mesh TentaFlow — ile tokenów zużył każdy user i grupa, ile wyprodukował każdy model i node, jaka jest wydajność (TTFT, tok/s, latencja) każdego serwisu na każdym nodzie. Dane agregowane po mesh: z dowolnego node'a widać całą sieć. Mockupy v1.</p>
+
+  <div class="intro" style="margin:0 0 28px;padding:0;">
+    <div class="rules">
+      <div class="rule">
+        <h3>Mesh-wide z każdego node'a</h3>
+        <p>Godzinowy <code>model_metrics_rollup</code> jest replikowany jak <code>token_usage_daily</code> (single-writer-per-row). Każdy node sumuje całą sieć z lokalnego SQLite — zero forwardowania zapytań. Histogramy są addytywne, więc percentyle (p50/p90/p99) liczone są poprawnie mesh-wide.</p>
+      </div>
+      <div class="rule">
+        <h3>Trzy cele analizy</h3>
+        <p>Rozliczanie <strong>userów i grup</strong> (tokeny → koszt zł), rozliczanie <strong>sprzętu</strong> (produkcja, GPU-godziny, throughput, obłożenie nodów), oraz <strong>administracja/ops</strong> (TTFT, decode tok/s, latencja, error rate, porównanie model×node×backend).</p>
+      </div>
+      <div class="rule">
+        <h3>Źródło prawdy metryk</h3>
+        <p>TTFT i tok/s pochodzą z silnika (llama.cpp <code>StreamToken</code>) lub z odpowiedzi serwisu (vLLM <code>usage</code>) — nie z wall-clocku Core. Queue oddzielony od prefillu. To samo źródło zasila footer w czacie (koniec przekłamanych liczb).</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="index-grid">
+    <a class="index-card" href="m01-overview.html"><div class="id">M1</div><h3>Przegląd globalny</h3><p>KPI mesh-wide: total tokenów, zapytania, TTFT p50/p90/p99, decode tok/s, error %, koszt. Wykres tokenów w czasie, top modele / userzy / nody.</p></a>
+    <a class="index-card" href="m02-users-groups.html"><div class="id">M2</div><h3>Użytkownicy i grupy</h3><p>Rozliczanie userów: tokeny, zapytania, audio, obrazy, koszt zł, quota. Rollup na grupy. Drill-down jednego usera (per-model + trend).</p></a>
+    <a class="index-card" href="m03-models.html"><div class="id">M3</div><h3>Modele</h3><p>Produkcja i wydajność per-model. Porównanie tego samego modelu na różnych nodach i backendach (rig24 vLLM vs rig25 vLLM vs mac MLX).</p></a>
+    <a class="index-card" href="m04-nodes-services.html"><div class="id">M4</div><h3>Nody i serwisy</h3><p>Per node: produkcja tokenów, GPU-godziny, throughput sustained/peak, obłożenie. Per serwis na nodzie: TTFT, decode tok/s, error, status.</p></a>
+    <a class="index-card" href="m05-requests.html"><div class="id">M5</div><h3>Eksplorator zapytań</h3><p>Drill-down request-level: filtry + tabela zapytań (TTFT, decode, e2e, status). Rozwijany timeline jednego zapytania: admission→prefill→decode.</p></a>
+    <a class="index-card" href="m06-billing.html"><div class="id">M6</div><h3>Rozliczenia i koszty</h3><p>Wg userów / grup / sprzętu. Koszty zł, GPU-godziny, udziały %. Edytowalny cennik modeli. Eksport CSV/PDF, zakres dat.</p></a>
+  </div>
+</div>
+</body>
+</html>

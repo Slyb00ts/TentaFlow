@@ -133,6 +133,22 @@ test('Card variant=elevated defaults shadow=subtle', () => {
   assert(el.classList.contains('tf-card--shadow-subtle'));
 });
 
+test('Card accepts shadow=accent_glow', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(CARD_TAG, [
+      [0, 'filled'],
+      [4, 'accent_glow'],
+      [5, BORDER_NONE],
+      [6, 'subtle'],
+      [9, false],
+      [10, false],
+    ])
+  );
+  assert(el.classList.contains('tf-card--shadow-accent_glow'));
+});
+
 test('Card clickable=true sets role=button and tabindex', () => {
   setup();
   const engine = makeEngine();

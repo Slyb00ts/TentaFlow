@@ -280,6 +280,20 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<ServiceRow>> {
         .context("get services")?)
 }
 
+/// Zwraca `id` serwisu o danym `active_deploy_id` (klucz jest unikalny per
+/// deploy — placeholder cluster-deployu nosi `deployment_cluster_id`). `None`
+/// gdy wiersz juz nie istnieje (np. po usunieciu).
+pub fn find_id_by_active_deploy_id(conn: &Connection, deploy_id: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM services WHERE active_deploy_id = ?1 LIMIT 1",
+            params![deploy_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .context("find services by active_deploy_id")?)
+}
+
 /// Lists services with status = 'running'.
 pub fn list_alive(conn: &Connection) -> Result<Vec<ServiceRow>> {
     let sql = format!(

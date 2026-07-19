@@ -119,10 +119,12 @@ impl StreamHub {
                 } else {
                     entry.init_segment.clone()
                 };
+                let base_pts_ns = entry.source.base_pts_ns();
                 return Ok(SubscriptionHandle::new(
                     stream_id.to_string(),
                     mime,
                     init,
+                    base_pts_ns,
                     receiver,
                     token,
                 ));
@@ -159,10 +161,12 @@ impl StreamHub {
                 } else {
                     entry.init_segment.clone()
                 };
+                let base_pts_ns = entry.source.base_pts_ns();
                 return Ok(SubscriptionHandle::new(
                     stream_id.to_string(),
                     mime,
                     init,
+                    base_pts_ns,
                     receiver,
                     token,
                 ));
@@ -226,11 +230,13 @@ impl StreamHub {
         let receiver = broadcaster.subscribe();
         let mime = entry.source.mime_type().to_string();
         let init = entry.init_segment.clone();
+        let base_pts_ns = entry.source.base_pts_ns();
         let token = SubscriberToken::new(Arc::clone(self), stream_id.to_string());
         Ok(SubscriptionHandle::new(
             stream_id.to_string(),
             mime,
             init,
+            base_pts_ns,
             receiver,
             token,
         ))

@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>Benchmark Studio — Mockupy v1</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+<div class="index-page">
+  <h1>Benchmark Studio</h1>
+  <p class="subtitle">Benchmarki wydajności modeli LLM przez API — jak <code>llama-bench</code>, ale dla całych serwisów w mesh TentaFlow i zewnętrznych API. User zakłada benchmark, wybiera targety (nasze serwisy + zewnętrzne endpointy), wybiera testy, uruchamia i ogląda wyniki: tabele mean&nbsp;±&nbsp;σ, wykresy, porównania historycznych runów. Mockupy v1.</p>
+
+  <div class="intro" style="margin:0 0 28px;padding:0;">
+    <div class="rules">
+      <div class="rule">
+        <h3>Targety = serwisy i API</h3>
+        <p>Benchmark odpala te same testy przeciw wielu targetom naraz: serwisy z mesh (vLLM, llama.cpp — wybierane checkboxem z listy) oraz zewnętrzne API (OpenAI-compatible, Anthropic) dodawane ręcznie: host, port, klucz, model.</p>
+      </div>
+      <div class="rule">
+        <h3>Metryki jak llama-bench</h3>
+        <p>TTFT (ms), prefill tok/s, decode tok/s, total ms, latencje p50/p90/p99, throughput przy N równoległych, error rate, stabilność w czasie. Każdy wynik to <strong>mean&nbsp;±&nbsp;σ z N powtórzeń</strong> — nie pojedynczy pomiar. Bez kosztów.</p>
+      </div>
+      <div class="rule">
+        <h3>Historia i regresje</h3>
+        <p>Każdy run zapisany w historii. Porównanie Run&nbsp;A vs Run&nbsp;B (np. przed/po update silnika) z tabelą delt Δ% i automatyczną sekcją „Regresje" — spadek decode tok/s przy ctx 32k widać od razu.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="index-grid">
+    <a class="index-card" href="m01-lista.html"><div class="id">M1</div><h3>Lista benchmarków</h3><p>Karty benchmarków: targety, testy, ostatni run (status + data), mini-sparkline trendu decode tok/s. Sekcja „Ostatnie runy" z historią.</p></a>
+    <a class="index-card" href="m02-kreator-targety.html"><div class="id">M2</div><h3>Kreator — targety (1/2)</h3><p>Nazwa benchmarku + wybór targetów: serwisy z mesh (checkbox, model, node, silnik, status) i zewnętrzne API (typ, host, port, klucz, model).</p></a>
+    <a class="index-card" href="m03-kreator-testy.html"><div class="id">M3</div><h3>Kreator — testy (2/2)</h3><p>Karty testów z toggle i parametrami: latencja pojedyncza, sweep równoległości, sweep kontekstu, sustained load. Estymacja czasu i „Uruchom".</p></a>
+    <a class="index-card" href="m04-run-live.html"><div class="id">M4</div><h3>Run w toku</h3><p>Progress całości, macierz statusów target×test (done/running/pending), live log monospace, częściowa tabela wyników rosnąca na żywo.</p></a>
+    <a class="index-card" href="m05-wyniki.html"><div class="id">M5</div><h3>Wyniki runu</h3><p>Tabela à la llama-bench (mean±σ, p50/p90/p99, err%), wykresy: decode per równoległość, degradacja vs kontekst, latencje, timeline stabilności.</p></a>
+    <a class="index-card" href="m06-porownanie.html"><div class="id">M6</div><h3>Porównanie runów</h3><p>Run A vs Run B (np. gemma-4 przed/po update silnika): tabela delt Δ% zielony/czerwony, słupki A-vs-B, sekcja „Regresje" z chipami ostrzeżeń.</p></a>
+  </div>
+</div>
+</body>
+</html>

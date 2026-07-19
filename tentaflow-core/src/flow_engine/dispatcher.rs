@@ -35,7 +35,10 @@ use crate::flow_engine::dispatchers_impl::{
 use crate::flow_engine::envelope::{
     AudioStreamChunk, EnvelopeDelta, FlowEnvelope, FlowExecutionOutcome, FlowValue, LlmStreamChunk,
 };
-use crate::flow_engine::executor::{execute_blocking, execute_streaming, StreamingExecution};
+use crate::flow_engine::executor::{
+    execute_blocking, execute_direct_blocking, execute_direct_streaming, execute_streaming,
+    StreamingExecution,
+};
 use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, NodeAdapter, UsageSink};
 use crate::flow_engine::node_adapters::{
     AgentContextNodeAdapter, AgentNodeAdapter, AgentRouterNodeAdapter, AskUserNodeAdapter,
@@ -64,7 +67,7 @@ use crate::flow_engine::node_adapters::{
 };
 use crate::flow_engine::resolver;
 use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
-use crate::flow_engine::synthetic;
+use crate::flow_engine::types::FlowNode;
 use crate::services::runtime::quic_handle::ServiceManager;
 
 /// Globalny cap na CAŁY flow to już TYLKO backstop anty-zawieszeniowy (nie
@@ -78,7 +81,7 @@ const FLOW_BACKSTOP_SECS: u64 = 3600;
 /// - `Denied` → 404 model_not_found (plan v1.5: nie ujawniamy istnienia
 ///   modelu klientom bez ACL).
 /// - `CompileFailed` → 500 z msg ("user-defined flow nie kompiluje się").
-/// - `Unsupported` → 500 z msg ("synthetic builder nie wspiera service_type").
+/// - `Unsupported` → 500 z msg ("brak capability dla service_type").
 /// - `Internal` → 500 (runtime err / timeout / inne).
 #[derive(Debug, thiserror::Error)]
 pub enum DispatchError {
@@ -86,7 +89,7 @@ pub enum DispatchError {
     Denied { flow_id: String },
     #[error("flow {flow_id} compile failed: {msg}")]
     CompileFailed { flow_id: String, msg: String },
-    #[error("synthetic dispatch unsupported for service_type='{service_type}', model='{model}'")]
+    #[error("direct dispatch unsupported for service_type='{service_type}', model='{model}'")]
     Unsupported { service_type: String, model: String },
     #[error("flow dispatch internal: {0}")]
     Internal(String),
@@ -98,15 +101,16 @@ impl From<anyhow::Error> for DispatchError {
     }
 }
 
-/// Wynik resolve_cached — rozróżnia 3 stany żeby caller wiedział czy aktywować
-/// synthetic fallback (NotFound) czy zwrócić błąd kompilacji (CompileFailed).
+/// Wynik resolve_cached — rozróżnia 3 stany żeby caller wiedział czy wykonać
+/// model bezpośrednio (NotFound) czy zwrócić błąd kompilacji (CompileFailed).
 enum ResolvedFlow {
     Found(Arc<CachedFlow>),
-    /// Resolver nie znalazł user-defined flow dla danego (model, kind, modality).
-    /// Caller buduje synthetic ad-hoc flow (Universal Flow Gateway).
+    /// Resolver nie znalazł jawnego flow dla danego (model, kind, modality).
+    /// Caller wykonuje model BEZPOŚREDNIO na executorze (bez flow engine,
+    /// bez pii_filter) — jedna capability: llm/vision_llm/tts/stt/embeddings.
     NotFound,
     /// User-defined flow istnieje ale compile failed. Cache'owane jako None
-    /// żeby nie próbować ponownie do invalidate. Synthetic NIE aktywuje się
+    /// żeby nie próbować ponownie do invalidate. Direct NIE aktywuje się
     /// (admin chciał konkretny flow — niech go naprawi).
     CompileFailed,
 }
@@ -343,8 +347,8 @@ impl FlowDispatcher {
         let tts: Arc<dyn TtsDispatcher> =
             Arc::new(TtsDispatcherImpl::new(runtime_slot.clone(), ctx_blobs.clone()));
         let stt: Arc<dyn SttDispatcher> =
-            Arc::new(SttDispatcherImpl::new(runtime_slot, ctx_blobs.clone()));
-        let vision: Arc<dyn VisionDispatcher> = Arc::new(VisionDispatcherImpl::new());
+            Arc::new(SttDispatcherImpl::new(runtime_slot.clone(), ctx_blobs.clone()));
+        let vision: Arc<dyn VisionDispatcher> = Arc::new(VisionDispatcherImpl::new(runtime_slot));
 
         // RAG E1.0 — współdzielony proces-szeroki rejestr przestrzeni wektorowych.
         // Te same backendy co host functions addona (jeden katalog w procesie),
@@ -533,12 +537,10 @@ impl FlowDispatcher {
                     .map_err(DispatchError::from)
             }
             ResolvedFlow::NotFound => {
-                // Universal Flow Gateway — synthetic ad-hoc fallback.
-                let compiled =
-                    self.compile_synthetic_blocking(service_type, model_name, modality)?;
-                self.run_blocking(compiled, initial, meta)
+                // Brak jawnego flow — model wykonywany BEZPOŚREDNIO na
+                // executorze (jedna capability, bez flow engine, bez pii_filter).
+                self.run_direct_blocking(service_type, model_name, modality, initial, meta)
                     .await
-                    .map_err(DispatchError::from)
             }
             ResolvedFlow::CompileFailed => Err(DispatchError::CompileFailed {
                 flow_id: String::new(),
@@ -719,40 +721,6 @@ impl FlowDispatcher {
         Ok(stream_exec)
     }
 
-    /// Streaming wariant z WYMUSZONYM synthetic flow — pomija resolver
-    /// (binding modelu / default flow z DB). Używany przez UI czatu gdy user
-    /// wybrał opcję "Default Chat" (syntetyczny trigger→llm→pii_filter→output).
-    pub async fn dispatch_synthetic_streaming(
-        &self,
-        model_name: &str,
-        service_type: &str,
-        initial: FlowEnvelope,
-        meta: FlowRequestMeta,
-    ) -> std::result::Result<StreamingExecution, DispatchError> {
-        let modality = derive_modality(&initial);
-        let compiled = self.compile_synthetic_streaming(service_type, model_name, modality)?;
-        if !compiled.is_streaming {
-            // Vision synthetic flow jest blocking-only — wykonaj blocking
-            // i opakuj jako single-chunk stream.
-            let outcome = self
-                .run_blocking(compiled, initial, meta)
-                .await
-                .map_err(DispatchError::from)?;
-            return Ok(wrap_blocking_as_stream(outcome, self.blobs()));
-        }
-        let ctx = self.ctx_factory.make_context(&meta);
-        let stream_exec = execute_streaming(
-            self.db.clone(),
-            compiled,
-            initial,
-            ctx,
-            self.registry.clone(),
-        )
-        .await
-        .map_err(DispatchError::from)?;
-        Ok(stream_exec)
-    }
-
     pub async fn try_dispatch_streaming(
         &self,
         model_name: &str,
@@ -785,19 +753,32 @@ impl FlowDispatcher {
                 cached.compiled.clone()
             }
             ResolvedFlow::NotFound => {
-                let synth =
-                    self.compile_synthetic_streaming(service_type, model_name, modality)?;
-                if !synth.is_streaming {
-                    // Vision synthetic flow jest blocking-only — wykonaj blocking
-                    // i opakuj jako single-chunk stream (jak user-defined blocking
-                    // flow powyżej).
-                    let outcome = self
-                        .run_blocking(synth, initial, meta)
-                        .await
-                        .map_err(DispatchError::from)?;
-                    return Ok(wrap_blocking_as_stream(outcome, self.blobs()));
+                // Brak jawnego flow — model wykonywany BEZPOŚREDNIO. Tylko `llm`
+                // (chat text) streamuje natywnie; vision/tts/stt/embeddings są
+                // blocking-only, więc wykonują się blocking i opakowują w
+                // single-chunk stream (parytet z user-defined blocking flow).
+                let node = direct_node(service_type, model_name, modality)?;
+                if node.node_type == "llm" {
+                    let ctx = self.ctx_factory.make_context(&meta);
+                    return execute_direct_streaming(
+                        self.db.clone(),
+                        node,
+                        initial,
+                        ctx,
+                        self.registry.clone(),
+                    )
+                    .await
+                    .map_err(DispatchError::from);
                 }
-                synth
+                // Blocking-only capability: idź przez `run_direct_blocking` żeby
+                // objąć backstop (FLOW_BACKSTOP_SECS) + cancel_token — goły
+                // `execute_direct_blocking` mógłby zawisnąć w nieskończoność, gdy
+                // backend stalluje przed wyprodukowaniem single-chunku (i trzymać
+                // otwarty top-level stream compliance event do końca awaita).
+                let outcome = self
+                    .run_direct_blocking(service_type, model_name, modality, initial, meta)
+                    .await?;
+                return Ok(wrap_blocking_as_stream(outcome, self.blobs()));
             }
             ResolvedFlow::CompileFailed => {
                 return Err(DispatchError::CompileFailed {
@@ -917,84 +898,80 @@ impl FlowDispatcher {
         }
     }
 
-    /// Buduje (lub pobiera z synthetic slot cache'a) compiled synthetic blocking
-    /// flow dla pary (service_type, model). Zwraca None gdy service_type nie jest
-    /// wspierany (np. niestandardowa wartość jak "image" — Universal Gateway w v1
-    /// pokrywa chat/tts/stt/embeddings).
-    fn compile_synthetic_blocking(
+    /// Direct (flow-less) blocking execution dla pary (service_type, model):
+    /// model uruchamiany BEZPOŚREDNIO na executorze przez pojedynczą capability
+    /// (llm/vision_llm/tts/stt/embeddings) — bez trigger/output wrappera, bez
+    /// pii_filter. Backstop timeout jak w `run_blocking` łapie zawieszony
+    /// backend; `meta.deadline`/`cancel_token` działają niezależnie w dispatcherze
+    /// capability.
+    async fn run_direct_blocking(
         &self,
         service_type: &str,
         model: &str,
         modality: &str,
-    ) -> std::result::Result<Arc<CompiledFlow>, DispatchError> {
-        self.compile_synthetic_inner(service_type, model, modality, false)
-    }
-
-    fn compile_synthetic_streaming(
-        &self,
-        service_type: &str,
-        model: &str,
-        modality: &str,
-    ) -> std::result::Result<Arc<CompiledFlow>, DispatchError> {
-        self.compile_synthetic_inner(service_type, model, modality, true)
-    }
-
-    /// Stage 3d-0b-final P2#2: rozdziela `Unsupported` (service_type bez
-    /// synthetic buildera) od `CompileFailed` (synthetic def istnieje ale
-    /// kompilacja flow nie przechodzi). Caller dostaje dokładną przyczynę
-    /// w error type.
-    fn compile_synthetic_inner(
-        &self,
-        service_type: &str,
-        model: &str,
-        modality: &str,
-        streaming: bool,
-    ) -> std::result::Result<Arc<CompiledFlow>, DispatchError> {
-        // Image-modality chat: vision_llm konsumuje obraz i zwraca tekst. Adapter
-        // jest blocking-only (brak streaming wariantu), więc nawet na ścieżce
-        // streaming budujemy blocking flow — caller opakowuje outcome w
-        // single-chunk stream.
-        let is_vision = service_type == "chat" && modality == "image";
-        let kind = match (service_type, streaming) {
-            ("chat", _) if is_vision => "vision",
-            ("chat", false) => "chat",
-            ("chat", true) => "chat_stream",
-            ("tts", _) => "tts",
-            ("stt", _) => "stt",
-            ("embeddings", _) => "embeddings",
-            _ => {
-                return Err(DispatchError::Unsupported {
-                    service_type: service_type.to_string(),
-                    model: model.to_string(),
-                });
+        initial: FlowEnvelope,
+        meta: FlowRequestMeta,
+    ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
+        let node = direct_node(service_type, model, modality)?;
+        let node_type = node.node_type.clone();
+        let ctx = self.ctx_factory.make_context(&meta);
+        match timeout(
+            Duration::from_secs(FLOW_BACKSTOP_SECS),
+            execute_direct_blocking(node, initial, ctx, self.registry.clone()),
+        )
+        .await
+        {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(e)) => {
+                warn!(model, node_type, "Blad direct execution: {e}");
+                Err(DispatchError::from(e))
             }
-        };
-        let synth_key = format!("{}:{}", kind, model);
-        if let Some(hit) = self.cache.synthetic_get(&synth_key) {
-            return Ok(hit);
+            Err(_) => {
+                warn!(
+                    model,
+                    node_type, "Backstop direct execution po {FLOW_BACKSTOP_SECS}s"
+                );
+                Err(DispatchError::Internal(format!(
+                    "direct '{node_type}' backstop timeout after {FLOW_BACKSTOP_SECS}s"
+                )))
+            }
         }
-        let definition = match kind {
-            "vision" => synthetic::synthetic_vision(model),
-            "chat" => synthetic::synthetic_chat(model),
-            "chat_stream" => synthetic::synthetic_chat_stream(model),
-            "tts" => synthetic::synthetic_tts(model),
-            "stt" => synthetic::synthetic_stt(model),
-            "embeddings" => synthetic::synthetic_embeddings(model),
-            _ => unreachable!("kind matched powyżej"),
-        };
-        let compiled = match CompiledFlow::compile("", definition, &self.registry) {
-            Ok(c) => Arc::new(c),
-            Err(e) => {
-                warn!(kind, model, "synthetic compile failed: {e}");
-                return Err(DispatchError::CompileFailed {
-                    flow_id: String::new(),
-                    msg: format!("synthetic '{kind}' compile: {e}"),
-                });
-            }
-        };
-        self.cache.synthetic_set(&synth_key, compiled.clone());
-        Ok(compiled)
     }
+}
+
+/// Buduje węzeł capability dla direct (flow-less) wykonania pary
+/// `model:service_type:modality`. Odwzorowuje capability którą wykonywał usunięty
+/// synthetic flow (llm / vision_llm / tts / stt / embeddings), ale węzeł jest
+/// uruchamiany bezpośrednio na executorze — bez trigger/output i bez pii_filter.
+/// Nieznany `service_type` → `Unsupported`.
+fn direct_node(
+    service_type: &str,
+    model: &str,
+    modality: &str,
+) -> std::result::Result<FlowNode, DispatchError> {
+    // Image-modality chat: vision_llm konsumuje obraz i zwraca tekst (blocking).
+    let is_vision = service_type == "chat" && modality == "image";
+    let node_type = match service_type {
+        "chat" if is_vision => "vision_llm",
+        "chat" => "llm",
+        "tts" => "tts",
+        "stt" => "stt",
+        "embeddings" => "embeddings",
+        _ => {
+            return Err(DispatchError::Unsupported {
+                service_type: service_type.to_string(),
+                model: model.to_string(),
+            });
+        }
+    };
+    Ok(FlowNode {
+        id: format!("direct_{node_type}"),
+        node_type: node_type.to_string(),
+        config: serde_json::json!({ "model": model }),
+        position: None,
+        label: None,
+        region: None,
+    })
 }
 
 /// Etap 3b: derive request modality z initial envelope payload — vision
@@ -1265,7 +1242,11 @@ mod tests {
             documents: Arc::new(StubDocuments),
             stt: Arc::new(StubStt),
             tts: Arc::new(StubTts),
-            vision: Arc::new(crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new()),
+            // Pusty slot executora — stub factory testów idzie ścieżką fallback
+            // (bezpośrednie singletony) w VisionDispatcherImpl.
+            vision: Arc::new(crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new(
+                Arc::new(parking_lot::RwLock::new(None)),
+            )),
             prompts: Arc::new(StubPrompts),
             memory: Arc::new(StubMemory),
             history: Arc::new(StubHistory),

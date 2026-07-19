@@ -71,6 +71,41 @@ export function _clearComponentRendererRegistry() {
 }
 
 // =============================================================================
+// Responsive stylesheet — one shared, content-deduplicated <style> for the
+// `@container` rules generated from ResponsiveRule declarations. Rules are
+// keyed by a stable hash of their content, so the same declaration on many
+// containers (or across re-renders) is injected exactly once. Scoped to the
+// `addon` query container that every `.addon-app-shell` establishes.
+// =============================================================================
+
+let _responsiveStyleEl = null;
+const _responsiveInjectedHashes = new Set();
+
+/// Injects the generated `@container` CSS for `hash` once. Subsequent calls with
+/// the same hash are no-ops (dedup on content). Called by the layout container
+/// renderers via `ctx` after they set `data-responsive="<hash>"` on the element.
+export function injectResponsiveCss(hash, cssText) {
+  if (_responsiveInjectedHashes.has(hash)) return;
+  _responsiveInjectedHashes.add(hash);
+  if (!_responsiveStyleEl) {
+    _responsiveStyleEl = document.createElement('style');
+    _responsiveStyleEl.setAttribute('data-sdk-responsive', '');
+    (document.head || document.documentElement).appendChild(_responsiveStyleEl);
+  }
+  _responsiveStyleEl.appendChild(document.createTextNode(cssText));
+}
+
+/// Test helper — drops the shared responsive stylesheet and the dedup set so a
+/// fresh test run starts clean. Production never calls this.
+export function _clearResponsiveStyles() {
+  if (_responsiveStyleEl && _responsiveStyleEl.parentNode) {
+    _responsiveStyleEl.parentNode.removeChild(_responsiveStyleEl);
+  }
+  _responsiveStyleEl = null;
+  _responsiveInjectedHashes.clear();
+}
+
+// =============================================================================
 // ComponentRenderer
 // =============================================================================
 
@@ -419,10 +454,34 @@ function readField(fields, key) {
 // =============================================================================
 
 function applyCommonAttributes(element, component, ctx) {
-  if (component.id) element.setAttribute('data-component-id', component.id);
+  if (component.id) {
+    element.setAttribute('data-component-id', component.id);
+    applyFontScale(element, component.id, ctx);
+  }
   if (component.test_id) element.setAttribute('data-testid', component.test_id);
   applyAccessibility(element, component.a11y, ctx);
   applyVisibility(element, component.visibility, ctx);
+}
+
+// Generic reactive font-size scaling: a component whose id is `fontscale-<key>`
+// binds its inline `font-size` (in px) to that numeric state value, so an addon
+// can offer user-controlled text sizing (e.g. viewer A−/A+) without a bespoke
+// component. Keyed on `id` (not `test_id`) because the UI CBOR decoder does not
+// carry test_id through to the JS render tree. Not translator-specific.
+function applyFontScale(element, id, ctx) {
+  if (typeof id !== 'string' || !id.startsWith('fontscale-')) return;
+  const key = id.slice('fontscale-'.length);
+  if (!key || !ctx.store) return;
+  const path = [{ kind: 'key', value: key }];
+  const apply = () => {
+    const raw = ctx.store.read(path);
+    const n = typeof raw === 'bigint' ? Number(raw) : raw;
+    if (typeof n === 'number' && Number.isFinite(n) && n > 0) {
+      element.style.fontSize = `${n}px`;
+    }
+  };
+  apply();
+  ctx.registerCleanup(ctx.store.subscribe(path, apply));
 }
 
 function applyAccessibility(element, a11y, ctx) {

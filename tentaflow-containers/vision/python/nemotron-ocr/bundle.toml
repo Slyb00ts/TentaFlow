@@ -33,7 +33,10 @@ platforms = ["linux-x86_64", "windows-x86_64"]
 [[install_variants]]
 backend = "cuda"
 extra_index = "https://download.pytorch.org/whl/cu130"
-extras = ["torch==2.11.0", "torchvision==0.26.0", "pillow>=12", "shapely", "pandas", "scikit-learn", "numpy", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart", "hatchling", "setuptools"]
+# ninja: backend kompilacji torch.utils.cpp_extension dla rozszerzenia C++/CUDA
+# nemotron-ocr (beam_decode + quad_nms). Bez niego cpp_extension spada na wolny,
+# szeregowy distutils. Dostarczamy go z PyPI (binarka trafia do venv/bin na PATH).
+extras = ["torch==2.11.0", "torchvision==0.26.0", "pillow>=12", "shapely", "pandas", "scikit-learn", "numpy", "fastapi==0.115.6", "uvicorn==0.34.0", "python-multipart", "hatchling", "setuptools", "ninja"]
 extras_no_build_isolation = ["nemotron-ocr @ git+https://huggingface.co/nvidia/nemotron-ocr-v1#subdirectory=nemotron-ocr"]
 # GIT_LFS_SKIP_SMUDGE: klon repo HF bez wag .pth (LFS) — wagi pobiera pipeline
 # w runtime. TORCH_CUDA_ARCH_LIST NIE jest tu ustawiany na sztywno: rozszerzenie
@@ -41,5 +44,10 @@ extras_no_build_isolation = ["nemotron-ocr @ git+https://huggingface.co/nvidia/n
 # (python_venv.rs) wstrzykuje DOKLADNY arch pod wykryte GPU hosta, wiec kazdy host
 # kompiluje kernel pod swoja realna karte (Ampere 8.6 .. Blackwell 10.3) — bez
 # fat-binary i bez wariantow per-arch.
-env = { GIT_LFS_SKIP_SMUDGE = "1" }
-install_hint = "CUDA_VISIBLE_DEVICES=0; wymaga nvcc (toolkit CUDA) na hoscie"
+# CC/CXX=gcc/g++: relokowalny python (python-build-standalone) ma w sysconfig
+# zaszyty clang, wiec torch.cpp_extension domyslnie kompiluje rozszerzenie clangiem.
+# beam_decode.cpp uzywa `-fopenmp`/`<omp.h>`, a clang BEZ libomp-dev nie ma omp.h
+# (`fatal error: 'omp.h' file not found`) — gcc na Linuksie ma OpenMP w komplecie.
+# Wymuszamy g++, zeby native deploy nie wymagal recznej instalacji libomp-dev.
+env = { GIT_LFS_SKIP_SMUDGE = "1", CC = "gcc", CXX = "g++" }
+install_hint = "CUDA_VISIBLE_DEVICES=0; wymaga nvcc (toolkit CUDA) + gcc/g++ na hoscie"

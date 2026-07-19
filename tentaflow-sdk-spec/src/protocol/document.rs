@@ -139,6 +139,10 @@ pub struct DocumentMeta {
     pub sha256: String,
     #[n(4)]
     pub created_at: String,
+    /// Zaufany marker kanału uploadu (np. `audio_capture` z renderera
+    /// AudioCapture); pusty/None dla zwykłych uploadów i put-ów addonu.
+    #[n(5)]
+    pub source: Option<String>,
 }
 
 /// Output `document_list_v1` — lista dokumentów scoped do (org, instancja).
@@ -226,6 +230,7 @@ mod tests {
                 size_bytes: 1_500_000,
                 sha256: "deadbeef".into(),
                 created_at: "2026-06-21T10:00:00Z".into(),
+                source: Some("audio_capture".into()),
             }],
         });
     }

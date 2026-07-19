@@ -51,7 +51,6 @@ const RENDERER_NOT_IMPLEMENTED: &[u16] = &[
     0x0603, // WGPUSurface
     0x0701, // PermissionMatrix
     0x0702, // NetworkRuleEditor
-    0x0703, // RelationGraph
     0x0704, // AlarmFeed
     0x0705, // WeeklyScheduleGrid
     0x0706, // AccessMatrix
@@ -113,6 +112,7 @@ pub fn section_stack(tab: &str, section_header: &str) -> Component {
             wrap: None,
             max_lines: None,
             format: None,
+            streaming: None,
         }
         .into_component(format!("cat-{}-hdr-{}", tab, ctr))
         .expect("Text caption encode");
@@ -133,6 +133,7 @@ pub fn section_stack(tab: &str, section_header: &str) -> Component {
             wrap: None,
             max_lines: None,
             format: None,
+            streaming: None,
         }
         .into_component(format!("cat-{}-hidden-note", tab))
         .expect("Text hidden-note encode");
@@ -144,6 +145,9 @@ pub fn section_stack(tab: &str, section_header: &str) -> Component {
         align: FlexAlign::Stretch,
         children,
         padding: Some(Spacing::Md),
+        justify: None,
+        style: None,
+        responsive: None,
     }
     .into_component(format!("catalog-{}", tab))
     .expect("Stack encode")
@@ -210,6 +214,7 @@ fn text_leaf(content: &str, ctr: &mut u64) -> Component {
         wrap: None,
         max_lines: None,
         format: None,
+        streaming: None,
     }
     .into_component(format!("demo-leaf-{}", ctr))
     .expect("Text leaf encode")
@@ -368,6 +373,7 @@ fn chart_sample(tag: u16, ctr: &mut u64) -> Option<Component> {
             show_label: true,
             label: None,
             size: ProgressSize::Md,
+            orientation: None,
         }
         .into_component(id("progressbar"))
         .expect("ProgressBar sample encode"),

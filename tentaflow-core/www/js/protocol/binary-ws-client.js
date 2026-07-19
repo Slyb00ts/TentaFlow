@@ -18,6 +18,22 @@ const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
 let GLOBAL_NEXT_SEQUENCE = 1n;
 
+// Zbakowany w tym buildzie hash frontu (build.rs -> asset-manifest.js). Ladowany
+// leniwie i cache'owany — modul ESM i tak jest cache'owany przez przegladarke.
+// Zwraca null gdy manifestu brak (np. front bez zbudowanego manifestu), co
+// bezpiecznie wylacza porownanie.
+let _localAssetHash;
+async function loadLocalAssetHash() {
+  if (_localAssetHash !== undefined) return _localAssetHash;
+  try {
+    const m = await import('../generated/asset-manifest.js');
+    _localAssetHash = m.ASSET_BUILD_HASH ?? null;
+  } catch {
+    _localAssetHash = null;
+  }
+  return _localAssetHash;
+}
+
 export class BinaryWsClient {
   /**
    * @param {string} url — WebSocket URL (`ws://` / `wss://`)
@@ -58,6 +74,11 @@ export class BinaryWsClient {
     this.onReconnectScheduled = opts.onReconnectScheduled ?? noop;
     this.onReconnectAttempt = opts.onReconnectAttempt ?? noop;
     this.onDisconnected = opts.onDisconnected ?? noop;
+    // onUpdateAvailable({ required, current, server }) — handshake wykryl, ze
+    // front nie zgadza sie z backendem. required=true => twardy mismatch
+    // protokolu (stary wasm) i trzeba reload; required=false => tylko zmiana
+    // zasobow (JS/CSS/panel), reload opcjonalny.
+    this.onUpdateAvailable = opts.onUpdateAvailable ?? noop;
     // P2c FIX: lista listenerow dla unsolicited frame (kazda screen moze
     // dodac swoj). Stare onUnsolicited (single) zachowane jako shortcut.
     this._unsolicitedListeners = [];
@@ -220,6 +241,7 @@ export class BinaryWsClient {
     this.connected = false;
     this._stopHeartbeat();
     this._rejectAllPending(new Error(`transport closed: ${info?.reason ?? 'unknown'}`));
+    this._endAllSubscriptions('transport_closed');
     if (this._transportUnsub) this._transportUnsub();
     if (this._transportCloseUnsub) this._transportCloseUnsub();
     this.transport = null;
@@ -379,9 +401,28 @@ export class BinaryWsClient {
     await this.transport.send(frame);
     const { body } = await resultPromise;
     if (body.variant !== 'MetaSchemaVersionAck' || !body.accepted) {
+      // Twardy mismatch protokolu — wasm/kodek jest nieaktualny wzgledem
+      // backendu. Front MUSI sie przeladowac; zglos to zanim rzucimy.
+      try {
+        this.onUpdateAvailable({
+          required: true,
+          current: schemaVersion(),
+          server: body?.serverVersion,
+        });
+      } catch { /* ignore */ }
       throw new Error(
         `schema version mismatch: client=${schemaVersion()} server=${body.serverVersion}`,
       );
+    }
+    // Miekki sygnal: protokol zgodny, ale zasoby frontu (JS/CSS/panel addona)
+    // rozne od serwera => zaproponuj reload. Sprawdzane przy KAZDYM (re)connect,
+    // wiec restart+aktualizacja backendu jest wykryta natychmiast po reconnect.
+    const localHash = await loadLocalAssetHash();
+    const serverHash = body.assetBuildHash;
+    if (localHash && serverHash && localHash !== serverHash) {
+      try {
+        this.onUpdateAvailable({ required: false, current: localHash, server: serverHash });
+      } catch { /* ignore */ }
     }
   }
 
@@ -398,6 +439,16 @@ export class BinaryWsClient {
     const correlationKey = envelope.correlationId.toString();
 
     if (envelope.isError) {
+      // Blad subskrypcji streamu (serwer sle IS_ERROR|IS_STREAM_END, np.
+      // "stream subscribe failed") musi trafic do handlera subskrypcji —
+      // wczesniej wpadal do onProtocolError, a subskrybent (wideo/detekcje)
+      // nigdy nie dostawal zadnego callbacku i wisial martwy bez retry.
+      const sub = this.subscribers.get(correlationKey);
+      if (sub) {
+        this.subscribers.delete(correlationKey);
+        sub({ envelope, body });
+        return;
+      }
       const pending = this.pending.get(correlationKey);
       if (pending) {
         this.pending.delete(correlationKey);
@@ -455,6 +506,36 @@ export class BinaryWsClient {
   _rejectAllPending(err) {
     for (const { reject } of this.pending.values()) reject(err);
     this.pending.clear();
+  }
+
+  /**
+   * Dostarcza wszystkim aktywnym subskrypcjom syntetyczny StreamEnd po padzie
+   * transportu. Serwer trzyma subskrypcje per-socket — po reconnect stare
+   * correlation_id sa martwe, wiec bez tego handlery streamow (wideo/detekcje)
+   * nigdy nie dostalyby konca strumienia i wisialyby zamrozone. Format frame'u
+   * zgodny z prawdziwym terminalem: envelope.isStreamEnd=true + body z `reason`
+   * (jak StreamClosedPayload z serwera).
+   */
+  _endAllSubscriptions(reason) {
+    if (this.subscribers.size === 0) return;
+    const entries = [...this.subscribers.entries()];
+    this.subscribers.clear();
+    for (const [correlationKey, handler] of entries) {
+      try {
+        handler({
+          envelope: {
+            correlationId: correlationKey,
+            isError: false,
+            isStreamChunk: false,
+            isStreamEnd: true,
+          },
+          body: { variant: 'StreamClosed', stream_id: '', reason },
+        });
+      } catch (err) {
+        console.error('[ws] subscriber end handler threw:', err);
+      }
+    }
+    console.warn(`[ws] zamknieto ${entries.length} subskrypcji (${reason})`);
   }
 
   _scheduleReconnect(reason) {

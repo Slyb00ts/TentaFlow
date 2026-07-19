@@ -2,7 +2,7 @@
 // File: examples/cv_bench.rs — camera-CV pipeline latency + fleet-capacity bench
 // =============================================================================
 //
-// Answers two operational questions for the Orlen PoC:
+// Answers two operational questions for the ADR PoC:
 //   1. How long does one frame's analysis really take? (detector + state + OCR)
 //   2. How many cameras can one GPU sustain at a target FPS?
 //
@@ -110,9 +110,9 @@ fn main() -> anyhow::Result<()> {
         args.fw, args.fh, args.iters, args.warmup, args.dets, args.plates
     );
 
-    let mut detector = RfDetrDetector::load()?;
-    let mut classifier = StateClassifier::load()?;
-    let mut ocr = PlateOcr::load()?;
+    let detector = RfDetrDetector::load()?;
+    let classifier = StateClassifier::load()?;
+    let ocr = PlateOcr::load()?;
     println!("models loaded.\n");
 
     // Synthetic source frame + crops (content-independent timing).
@@ -132,13 +132,13 @@ fn main() -> anyhow::Result<()> {
             (0..n).map(|_| (frame.as_slice(), args.fw, args.fh)).collect();
         // One probe call: if it fails (e.g. CUDA OOM at large batch), skip this
         // batch size and stop growing rather than aborting the whole bench.
-        if let Err(e) = detector.detect_batch(&frames) {
+        if let Err(e) = detector.detect_batch(&frames, None) {
             println!("{:>6}  (skipped: {})", n, e);
             break;
         }
         let iters = if n >= 16 { args.iters / 2 + 1 } else { args.iters };
         let (med, _min, _max) = time_ms(args.warmup.max(2), iters.max(3), || {
-            detector.detect_batch(&frames).expect("detect_batch");
+            detector.detect_batch(&frames, None).expect("detect_batch");
         });
         let ms_img = med / n as f64;
         let img_s = 1000.0 / ms_img;

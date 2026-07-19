@@ -22,13 +22,12 @@ impl Router {
     /// for internal callers (addons, reverse mesh, translate) that bypass
     /// ACL by design.
     ///
-    /// Dispatch (stage 3d Universal Flow Gateway):
+    /// Dispatch:
     /// 1. Model-level ACL when a user is attached.
-    /// 2. FlowDispatcher::try_dispatch — user-defined flow (gdy admin
-    ///    skonfigurował) albo synthetic ad-hoc flow `trigger → llm(model)
-    ///    → output` (auto-fallback). Każdy chat request przechodzi przez
-    ///    flow_engine; backend dispatch idzie przez LlmDispatcherImpl →
-    ///    executor.execute_chat.
+    /// 2. Czysty model / alias→model → bezpośrednie wykonanie na backendzie
+    ///    (bez flow). Flow published as a model / alias→flow → FlowDispatcher:
+    ///    jawny user-defined flow, a gdy go brak — model wykonywany bezpośrednio
+    ///    (LlmDispatcherImpl → executor.execute_chat, bez pii_filter).
     pub async fn route_chat_completion(
         &self,
         request: ChatCompletionRequest,
@@ -132,6 +131,73 @@ impl Router {
             None
         };
 
+        // === DIRECT MODEL: raw model → backend bez flow ===
+        // A plain model name is answered by the backend directly (no synthetic
+        // /default flow, no PII buffering). Only a Flow published as a model
+        // (or an alias resolving to one) routes through the flow engine below.
+        let route_via_flow = model_resolves_to_flow(&self.catalog_snapshot(), &request.model);
+        if !route_via_flow {
+            let executor = match self.executor() {
+                Some(e) => e,
+                None => {
+                    if let Some(event) = compliance_event.as_ref() {
+                        let _ = event.finish_failed("runtime_executor_not_wired");
+                    }
+                    return Err(CoreError::InternalError {
+                        message: "runtime executor not wired — direct model dispatch unavailable"
+                            .to_string(),
+                        source: None,
+                    }
+                    .into());
+                }
+            };
+            let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(user);
+            match executor.execute_chat(request.clone(), &mut exec_ctx).await {
+                Ok(response) => {
+                    let usage = response.usage.as_ref().map(|u| {
+                        crate::routing::middleware::TokenUsageMetadata {
+                            prompt_tokens: u.prompt_tokens as u64,
+                            completion_tokens: u.completion_tokens as u64,
+                            total_tokens: u.total_tokens as u64,
+                        }
+                    });
+                    let finish_reason = response
+                        .choices
+                        .first()
+                        .and_then(|c| c.finish_reason.clone());
+                    if let Some(event) = compliance_event.as_ref() {
+                        event
+                            .finish_success(&response)
+                            .map_err(|e| CoreError::InternalError {
+                                message: "compliance AI audit finish failed".to_string(),
+                                source: Some(e),
+                            })?;
+                    }
+                    let metadata = crate::routing::RouteMetadata {
+                        served_by_node: exec_ctx
+                            .route_metadata
+                            .served_by_node
+                            .clone()
+                            .unwrap_or_else(crate::mesh::node_info_collector::local_hostname),
+                        backend_type: "direct".to_string(),
+                        strategy_used: "direct".to_string(),
+                        fallbacks_tried: exec_ctx.route_metadata.fallbacks_tried,
+                        hop_count: 0,
+                        latency_ms: None,
+                        usage,
+                        finish_reason,
+                    };
+                    return Ok(crate::routing::RouteResult { response, metadata });
+                }
+                Err(e) => {
+                    if let Some(event) = compliance_event.as_ref() {
+                        let _ = event.finish_failed(&e.to_string());
+                    }
+                    return Err(executor_error_to_core(e, &request.model).into());
+                }
+            }
+        }
+
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
             let blobs = dispatcher.blobs();
@@ -219,10 +285,8 @@ impl Router {
             }
         }
 
-        // Stage 3d-0b-final: brak flow_dispatcher (DB-less router) → 500.
-        // Plan v1.5 wymaga że KAŻDY chat request przechodzi przez flow_engine
-        // (synthetic albo user-defined). Direct executor.execute_chat fallback
-        // wycięty.
+        // Brak flow_dispatcher (DB-less router) i model klasyfikowany jako flow
+        // → 500 (plain models obsłużone wyżej ścieżką direct).
         if let Some(event) = compliance_event.as_ref() {
             if let Err(audit_error) = event.finish_failed("flow_dispatcher_not_wired") {
                 tracing::warn!(
@@ -487,12 +551,67 @@ pub(crate) fn catalog_target_accepts_audio(
     false
 }
 
+/// Whether the requested `model` id names a Flow published as a model
+/// (`CatalogEntryKind::Flow`) and therefore MUST execute through the flow
+/// engine, vs a raw service model that is answered by a direct backend call.
+///
+/// Design (2026-07): a client requesting a plain model name gets the model
+/// directly (no synthetic/default flow, no PII buffering, lowest latency);
+/// a client requesting a flow's published name gets the flow. An alias is
+/// resolved to its primary target and classified by that target's kind, so
+/// `alias → flow` routes through the flow engine while `alias → model`
+/// stays direct. Unknown ids (internal callers that bypass the catalog)
+/// default to direct — the executor resolves or returns a typed error.
+pub(crate) fn model_resolves_to_flow(
+    snapshot: &crate::services::catalog::CatalogSnapshot,
+    model: &str,
+) -> bool {
+    use crate::services::catalog::CatalogEntryKind;
+    // One alias hop is enough — aliases target models/flows, not other
+    // aliases — but a small depth guard keeps a misconfigured chain from
+    // looping.
+    let mut current = model;
+    for _ in 0..4 {
+        let Some(entry) = snapshot.entries.iter().find(|e| e.id == current) else {
+            return false;
+        };
+        match &entry.kind {
+            CatalogEntryKind::Flow { .. } => return true,
+            CatalogEntryKind::ServiceModel { .. } => return false,
+            CatalogEntryKind::Alias { target, .. } => {
+                current = target;
+            }
+        }
+    }
+    false
+}
+
 /// Konwertuje wynik flow engine na standardowy ChatCompletionResponse.
 pub(crate) fn flow_outcome_to_chat_response(
     outcome: FlowExecutionOutcome,
     model: &str,
 ) -> ChatCompletionResponse {
     converter::flow_outcome_to_chat_response(&outcome, model)
+}
+
+/// Maps an `ExecutorError` from the direct (no-flow) backend path onto a
+/// `CoreError`. Resolve failures become `ModelNotFound` so `/v1` keeps its
+/// "never reveal whether a model exists" 404 contract; everything else is a
+/// backend/internal failure (500).
+pub(crate) fn executor_error_to_core(
+    e: crate::services::runtime::executor::ExecutorError,
+    model: &str,
+) -> CoreError {
+    use crate::services::runtime::executor::ExecutorError;
+    match e {
+        ExecutorError::Resolve(_) => CoreError::ModelNotFound {
+            model_name: model.to_string(),
+        },
+        other => CoreError::InternalError {
+            message: format!("direct backend dispatch failed: {other}"),
+            source: None,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -628,5 +747,117 @@ mod audio_policy_tests {
         };
         let snap = snapshot_with(vec![primary, fallback, alias]);
         assert!(!catalog_target_accepts_audio(&snap, "txt-only"));
+    }
+}
+
+/// Discriminator used by the mesh reverse chat handler
+/// (`mesh::inference_proxy::dispatch_reverse_stream_request`) to decide whether
+/// a forwarded model runs raw on the executor or through the flow engine.
+/// A raw service model MUST classify as "not a flow" so the forwarding node's
+/// flow is not silently re-applied on the serving node (no is_default "Default
+/// Chat" fallback, no hidden PII redaction). A model published from a flow MUST
+/// classify as "flow" so it still executes as the flow it represents.
+#[cfg(test)]
+mod mesh_reverse_flow_discriminator_tests {
+    use super::*;
+    use crate::services::catalog::{
+        CatalogEntry, CatalogEntryKind, CatalogSnapshot, InputModality, OutputModality,
+        ServiceSurface, Strategy,
+    };
+    use std::sync::Arc;
+
+    fn snapshot_with(entries: Vec<CatalogEntry>) -> CatalogSnapshot {
+        CatalogSnapshot {
+            entries: Arc::from(entries.into_boxed_slice()),
+            version: 1,
+        }
+    }
+
+    fn service_model(id: &str) -> CatalogEntry {
+        CatalogEntry {
+            id: id.into(),
+            kind: CatalogEntryKind::ServiceModel { instances: vec![] },
+            service_surfaces: vec![ServiceSurface::Chat],
+            input_modalities: vec![InputModality::Text],
+            output_modalities: vec![OutputModality::Text],
+            diagnostic: None,
+        }
+    }
+
+    fn published_flow(id: &str, flow_id: &str) -> CatalogEntry {
+        CatalogEntry {
+            id: id.into(),
+            kind: CatalogEntryKind::Flow {
+                flow_id: flow_id.into(),
+                published_name: id.into(),
+            },
+            service_surfaces: vec![ServiceSurface::Chat],
+            input_modalities: vec![InputModality::Text],
+            output_modalities: vec![OutputModality::Text],
+            diagnostic: None,
+        }
+    }
+
+    /// Raw service model forwarded over the mesh → direct executor path (no
+    /// flow, no Default Chat, no PII). This is the core of the fix: even when
+    /// the serving node has a default chat flow, a forwarded raw model must NOT
+    /// resolve to a flow here.
+    #[test]
+    fn forwarded_raw_model_is_not_a_flow() {
+        let snap = snapshot_with(vec![service_model("deepseek")]);
+        assert!(!model_resolves_to_flow(&snap, "deepseek"));
+    }
+
+    /// Model published from a flow → flow engine path preserved.
+    #[test]
+    fn forwarded_published_flow_is_a_flow() {
+        let snap = snapshot_with(vec![published_flow("my-agent", "flow-123")]);
+        assert!(model_resolves_to_flow(&snap, "my-agent"));
+    }
+
+    /// Alias that ultimately targets a raw model stays direct.
+    #[test]
+    fn forwarded_alias_to_model_is_not_a_flow() {
+        let alias = CatalogEntry {
+            id: "chat".into(),
+            kind: CatalogEntryKind::Alias {
+                target: "deepseek".into(),
+                fallback_targets: vec![],
+                strategy: Strategy::FirstAvailable,
+            },
+            service_surfaces: vec![ServiceSurface::Chat],
+            input_modalities: vec![InputModality::Text],
+            output_modalities: vec![OutputModality::Text],
+            diagnostic: None,
+        };
+        let snap = snapshot_with(vec![alias, service_model("deepseek")]);
+        assert!(!model_resolves_to_flow(&snap, "chat"));
+    }
+
+    /// Alias that targets a published flow routes through the flow engine.
+    #[test]
+    fn forwarded_alias_to_flow_is_a_flow() {
+        let alias = CatalogEntry {
+            id: "assistant".into(),
+            kind: CatalogEntryKind::Alias {
+                target: "my-agent".into(),
+                fallback_targets: vec![],
+                strategy: Strategy::FirstAvailable,
+            },
+            service_surfaces: vec![ServiceSurface::Chat],
+            input_modalities: vec![InputModality::Text],
+            output_modalities: vec![OutputModality::Text],
+            diagnostic: None,
+        };
+        let snap = snapshot_with(vec![alias, published_flow("my-agent", "flow-123")]);
+        assert!(model_resolves_to_flow(&snap, "assistant"));
+    }
+
+    /// Unknown model id (not in the serving node's catalog) defaults to direct
+    /// dispatch — never silently wrapped in the local default flow.
+    #[test]
+    fn forwarded_unknown_model_is_not_a_flow() {
+        let snap = snapshot_with(vec![]);
+        assert!(!model_resolves_to_flow(&snap, "ghost"));
     }
 }

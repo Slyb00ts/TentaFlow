@@ -5,10 +5,16 @@
 //       wasmi jest interpreterem — wolniejszy niz Wasmtime ale dziala wszedzie.
 // =============================================================================
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tracing::info;
 
-use crate::addon::{AddonState, DEFAULT_FUEL_LIMIT, DEFAULT_MEMORY_LIMIT_BYTES};
+use crate::addon::AddonState;
+// `create_store` (fuel + memory limiter) is mobile-only: it references
+// `AddonState::store_limits`, a field that exists only on iOS/Android. The
+// Desktop `wasmi-runtime-test` build compiles this module to exercise the WASI
+// shim but constructs its `Store` directly, so these constants are unused there.
+#[cfg(any(target_os = "ios", target_os = "android"))]
+use crate::addon::DEFAULT_FUEL_LIMIT;
 
 // =============================================================================
 // Type aliasy — ujednolicone nazwy dla obu backendow
@@ -66,7 +72,9 @@ pub fn compile_module(engine: &WasmEngine, wasm_bytes: &[u8]) -> Result<WasmModu
 // Tworzenie Store z limiterami
 // =============================================================================
 
-/// Tworzy nowy Store z limitem paliwa i limitem pamieci
+/// Tworzy nowy Store z limitem paliwa i limitem pamieci.
+/// Mobile-only: uses `AddonState::store_limits` (a field gated to iOS/Android).
+#[cfg(any(target_os = "ios", target_os = "android"))]
 pub fn create_store(engine: &WasmEngine, state: AddonState) -> Result<WasmStore<AddonState>> {
     let memory_limit = state.memory_limit;
     let mut store = WasmStore::new(engine, state);
@@ -379,6 +387,108 @@ fn wire_wasi_preview1(linker: &mut WasmLinker<AddonState>) {
             },
         )
         .expect("define wasi_snapshot_preview1::clock_time_get");
+
+    // The remaining preview1 symbols below are imported by .NET NativeAOT (and
+    // any C stdlib-based) reactor modules because their libc references the full
+    // fd/poll surface, even though a TentaFlow addon opens no preopens and never
+    // touches a real filesystem — all addon IO flows through the `tentaflow`
+    // host namespace. With no preopened directories, the correct preview1 answer
+    // for every fd operation is EBADF ("bad file descriptor"): the guest libc
+    // treats stdio as a sink (handled by fd_write above) and simply gets "no
+    // such fd" for anything it probes. These are legal minimal implementations
+    // for a no-filesystem sandbox, not fake successes.
+
+    // fd_close(fd) -> errno. Closing a descriptor we never opened is a no-op.
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_close",
+            |_caller: WasmCaller<'_, AddonState>, _fd: i32| -> i32 { WASI_ERRNO_SUCCESS },
+        )
+        .expect("define wasi_snapshot_preview1::fd_close");
+
+    // fd_fdstat_get(fd, stat_ptr) -> errno. No real fds exist to describe.
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_fdstat_get",
+            |_caller: WasmCaller<'_, AddonState>, _fd: i32, _stat_ptr: i32| -> i32 {
+                WASI_ERRNO_BADF
+            },
+        )
+        .expect("define wasi_snapshot_preview1::fd_fdstat_get");
+
+    // fd_prestat_get(fd, prestat_ptr) -> errno. EBADF here is how libc learns
+    // there are no preopened directories and stops enumerating them.
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_prestat_get",
+            |_caller: WasmCaller<'_, AddonState>, _fd: i32, _prestat_ptr: i32| -> i32 {
+                WASI_ERRNO_BADF
+            },
+        )
+        .expect("define wasi_snapshot_preview1::fd_prestat_get");
+
+    // fd_prestat_dir_name(fd, path_ptr, path_len) -> errno. No preopens to name.
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_prestat_dir_name",
+            |_caller: WasmCaller<'_, AddonState>, _fd: i32, _path_ptr: i32, _path_len: i32| -> i32 {
+                WASI_ERRNO_BADF
+            },
+        )
+        .expect("define wasi_snapshot_preview1::fd_prestat_dir_name");
+
+    // fd_seek(fd, offset, whence, newoffset_ptr) -> errno. Nothing is seekable.
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_seek",
+            |_caller: WasmCaller<'_, AddonState>,
+             _fd: i32,
+             _offset: i64,
+             _whence: i32,
+             _newoffset_ptr: i32|
+             -> i32 { WASI_ERRNO_BADF },
+        )
+        .expect("define wasi_snapshot_preview1::fd_seek");
+
+    // poll_oneoff(in, out, nsubscriptions, nevents_ptr) -> errno. There are no
+    // real fds or timers to wait on, so we report zero ready events. Reactor
+    // lifecycle paths never block on this; it is only linked because libc
+    // references it.
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "poll_oneoff",
+            |mut caller: WasmCaller<'_, AddonState>,
+             _in_ptr: i32,
+             _out_ptr: i32,
+             _nsubscriptions: i32,
+             nevents_ptr: i32|
+             -> i32 {
+                let memory = match get_memory(&mut caller) {
+                    Some(m) => m,
+                    None => return WASI_ERRNO_INVAL,
+                };
+                if write_le_u32_at(&memory, &mut caller, nevents_ptr, 0).is_none() {
+                    return WASI_ERRNO_INVAL;
+                }
+                WASI_ERRNO_SUCCESS
+            },
+        )
+        .expect("define wasi_snapshot_preview1::poll_oneoff");
+
+    // sched_yield() -> errno. Single-threaded interpreter; yielding is a no-op.
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "sched_yield",
+            |_caller: WasmCaller<'_, AddonState>| -> i32 { WASI_ERRNO_SUCCESS },
+        )
+        .expect("define wasi_snapshot_preview1::sched_yield");
 }
 
 /// Instancjacja modulu WASM w podanym store.

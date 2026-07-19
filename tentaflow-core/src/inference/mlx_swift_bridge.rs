@@ -131,6 +131,81 @@ pub extern "C" fn tentaflow_register_mlx_swift_embed(embed_fn: EmbedFn) {
     tracing::info!("Swift MLX embed callback zarejestrowany");
 }
 
+/// Callback rerankera — `query` + `docs_json` (JSON array stringow) -> malloc'owany
+/// bufor `out_len` floatow (score per dokument, kolejnosc wejsciowa). Rejestrowany
+/// osobno (nie kazdy dylib ma `MLXBridge_rerank`). Model rerankera (Qwen3 + projector)
+/// ladowany ta sama sciezka co embedder (`load_embedder_model`).
+type RerankFn = extern "C" fn(
+    query: *const c_char,
+    docs_json: *const c_char,
+    out_len: *mut i32,
+    context: *mut c_void,
+) -> *mut f32;
+
+struct SwiftRerankCallback {
+    rerank_fn: RerankFn,
+}
+unsafe impl Send for SwiftRerankCallback {}
+unsafe impl Sync for SwiftRerankCallback {}
+static SWIFT_RERANK: OnceLock<SwiftRerankCallback> = OnceLock::new();
+
+/// Rejestruje callback rerankera MLX. Wolane z `mlx_swift_init.rs` gdy dylib
+/// eksponuje `MLXBridge_rerank`.
+#[no_mangle]
+pub extern "C" fn tentaflow_register_mlx_swift_rerank(rerank_fn: RerankFn) {
+    let _ = SWIFT_RERANK.set(SwiftRerankCallback { rerank_fn });
+    tracing::info!("Swift MLX rerank callback zarejestrowany");
+}
+
+/// Liczy score'y rerankera in-process (embedded MLX): cross-encoder query vs docs.
+/// Zwraca `relevance_score` per dokument W KOLEJNOSCI WEJSCIOWEJ (sortowanie robi
+/// caller). Reuzywa model zaladowany przez `load_embedder_model` (Qwen3 reranker).
+pub async fn rerank(query: &str, documents: &[String]) -> Result<Vec<f32>> {
+    let cb = SWIFT_RERANK.get().context(
+        "Swift MLX rerank callback nie zostal zarejestrowany (stary libMLXBridge.dylib?)",
+    )?;
+    let callbacks = get_callbacks()?;
+    let rerank_fn = cb.rerank_fn;
+    let ctx = SendPtr::from_raw(callbacks.context);
+    let query = query.to_string();
+    let docs_json = serde_json::to_string(documents).context("serializacja docs do rerank")?;
+    let expected = documents.len();
+
+    // Swift blokuje — na dedykowanym watku.
+    let scores = tokio::task::spawn_blocking(move || -> Result<Vec<f32>> {
+        let c_query = to_cstring(&query);
+        let c_docs = to_cstring(&docs_json);
+        let mut len: i32 = 0;
+        let ptr = rerank_fn(
+            c_query.as_ptr(),
+            c_docs.as_ptr(),
+            &mut len as *mut i32,
+            ctx.as_ptr(),
+        );
+        if ptr.is_null() || len <= 0 {
+            anyhow::bail!("Swift MLX: rerank zwrocil pusty wynik");
+        }
+        // SAFETY: Swift zaalokowal `len` floatow przez malloc; kopiujemy i zwalniamy.
+        let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+        let vec = slice.to_vec();
+        unsafe {
+            libc_free(ptr as *mut c_void);
+        }
+        Ok(vec)
+    })
+    .await
+    .context("Blad watku rerank")??;
+
+    if scores.len() != expected {
+        anyhow::bail!(
+            "Swift MLX rerank: zwrocono {} score'ow, oczekiwano {}",
+            scores.len(),
+            expected
+        );
+    }
+    Ok(scores)
+}
+
 /// Callback: zaladuj model embeddingow (wymusza sciezke EmbedderModelFactory
 /// niezaleznie od `1_Pooling`). Zwraca 0=OK, <0=blad.
 type LoadEmbedderFn = extern "C" fn(model_path: *const c_char, context: *mut c_void) -> i32;
@@ -263,6 +338,8 @@ extern "C" fn rust_token_callback(
         error: None,
         prefill_tps,
         completion_tps,
+        // MLX nie eksponuje granicy faz dla TTFT — konsument liczy wall-clock.
+        ttft_ms: 0,
     });
 }
 
@@ -538,6 +615,7 @@ impl InferenceEngine for MlxSwiftEngine {
                     completion_tokens: 0,
                     prefill_tps: 0.0,
                     completion_tps: 0.0,
+                    ttft_ms: 0,
                 });
             }
 

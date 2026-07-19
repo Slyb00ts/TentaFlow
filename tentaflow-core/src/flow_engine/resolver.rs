@@ -21,14 +21,30 @@ use tracing::debug;
 ///    = "text"`. Vision request (`request_modality = "image"`) bez bindingu
 ///    zwraca `None`; default flows są zakładowo text-only bo `vision_llm` node
 ///    wymaga R8 input_port_type=Image.
-/// 3. None — `FlowDispatcher` aktywuje synthetic ad-hoc flow (Universal Flow
-///    Gateway, stage 3d). Zero direct executor fallback po stage 3d-0b-final.
+/// 3. None — brak jawnego flow: `FlowDispatcher` wykonuje model BEZPOŚREDNIO na
+///    executorze (pojedyncza capability, bez flow engine, bez pii_filter).
 pub fn resolve_flow(
     pool: &DbPool,
     model_name: &str,
     service_type: &str,
     request_modality: &str,
 ) -> Result<Option<DbFlow>> {
+    // Highest priority: the model name IS a flow's published name (flow-as-model).
+    // A client requesting a published flow by its exact name must run THAT flow,
+    // not fall through to a `flow_model_bindings` pattern or the default flow.
+    // Without this a published flow was only reachable via the default-for-
+    // service-type flow's llm node, which then tried to resolve the flow name as
+    // a model (→ unimplemented Flow-target stream, `flow_stream` cutover).
+    if let Some(flow) = repository::get_flow_by_published_model_name(pool, model_name)? {
+        debug!(
+            model = model_name,
+            flow_id = flow.id,
+            flow_name = %flow.name,
+            "Resolved flow via published_model_name (flow-as-model)"
+        );
+        return Ok(Some(flow));
+    }
+
     if let Some(flow) = repository::get_flow_for_model(pool, model_name)? {
         debug!(
             model = model_name,

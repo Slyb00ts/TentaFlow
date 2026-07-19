@@ -266,6 +266,11 @@ pub enum ModelPayload {
     /// (screenshot przez CDP, snapshot DOM). Router adresuje bota przez
     /// `ServiceManager::get_quic_llm_client("meeting-bot-{session_id}")`.
     Browser(BrowserPayload),
+
+    /// CameraCv - operacje computer vision na klatkach z kamer (detekcja,
+    /// klasyfikacja stanu, OCR). Klatki przesyłane binarnie w CBOR
+    /// (`serde_bytes`), bez base64.
+    CameraCv(CameraCvPayload),
 }
 
 /// Operacje inspekcji uruchomionej strony przeglądarki w kontenerze bota.
@@ -594,6 +599,99 @@ pub struct DocumentInferPayload {
     /// Zadanie detekcji: "page_elements" | "table_structure" |
     /// "graphic_elements" | "ocr".
     pub task: String,
+}
+
+// ============================================================================
+// CAMERA CV PAYLOAD
+// ============================================================================
+
+/// Payload dla typed surface `CameraCv` — operacje computer vision na
+/// klatkach z kamer (detekcja obiektów, klasyfikacja stanu, OCR).
+///
+/// Klatki (`CvFrame::data`) używają `serde_bytes` → CBOR koduje je jako
+/// byte-string (bulk copy), a nie array-of-integers — analogicznie do
+/// `DocumentInferPayload::image_bytes`.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct CameraCvPayload {
+    /// Nazwa modelu/serwisu CV (klucz katalogu, ACL po nim).
+    pub model: String,
+
+    /// Operacja do wykonania na klatkach.
+    pub op: CameraCvOp,
+}
+
+/// Operacja computer vision wykonywana przez serwis CameraCv.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub enum CameraCvOp {
+    /// Detekcja obiektów na batchu klatek (≤8 klatek na request).
+    /// `threshold` nadpisuje próg score detektora; `None` = domyślny próg
+    /// modelu. `#[serde(default)]` trzyma dekodowanie starych ramek CBOR
+    /// (bez pola), a `skip_serializing_if` — enkodowanie dla starych peerów.
+    Detect {
+        frames: Vec<CvFrame>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        threshold: Option<f32>,
+    },
+
+    /// Klasyfikacja stanu na wyciętym fragmencie klatki (crop).
+    ClassifyState { crop: CvFrame },
+
+    /// OCR na wyciętym fragmencie klatki (crop) w zadanym trybie.
+    Ocr { crop: CvFrame, mode: CvOcrMode },
+}
+
+/// Pojedyncza klatka obrazu przesyłana binarnie przez CBOR.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct CvFrame {
+    /// Surowe bajty klatki (zgodnie z `encoding`).
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+
+    /// Szerokość klatki w pikselach.
+    pub width: u32,
+
+    /// Wysokość klatki w pikselach.
+    pub height: u32,
+
+    /// Format zakodowania bajtów w `data`.
+    pub encoding: CvFrameEncoding,
+}
+
+/// Format bajtów klatki w `CvFrame::data`.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub enum CvFrameEncoding {
+    /// Surowe piksele RGB, 3 bajty na piksel, row-major.
+    Rgb24,
+
+    /// Skompresowany strumień JPEG.
+    Jpeg,
+}
+
+/// Tryb OCR dla operacji `CameraCvOp::Ocr`.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub enum CvOcrMode {
+    /// Odczyt tablicy rejestracyjnej.
+    Plate,
+
+    /// Odczyt tablicy ADR (przewóz materiałów niebezpiecznych).
+    Adr,
+
+    /// Ogólny odczyt tekstu.
+    Generic,
+}
+
+/// Pojedyncza detekcja obiektu na klatce.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct CvDetection {
+    /// Nazwa wykrytej klasy obiektu.
+    pub klasa: String,
+
+    /// Bounding box znormalizowany [x, y, w, h] w zakresie 0..1
+    /// względem klatki źródłowej (format RF-DETR, bez konwersji na piksele).
+    pub bbox: [f32; 4],
+
+    /// Pewność detekcji (0.0 - 1.0).
+    pub score: f32,
 }
 
 // ============================================================================
@@ -1614,6 +1712,22 @@ pub enum ModelResult {
 
     /// Error
     Error(ErrorInfo),
+
+    /// CameraCv - wynik operacji computer vision (detekcje, etykiety, tekst).
+    CameraCv(CameraCvResult),
+}
+
+/// Wynik operacji `CameraCvPayload` — odpowiedź serwisu computer vision.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub enum CameraCvResult {
+    /// Detekcje obiektów — po jednej liście na klatkę z batcha `Detect`.
+    Detections { per_frame: Vec<Vec<CvDetection>> },
+
+    /// Etykiety stanu z klasyfikacji `ClassifyState`.
+    Labels { stan: Vec<String> },
+
+    /// Odczytany tekst z operacji `Ocr` (None gdy nic nie rozpoznano).
+    Text { tekst: Option<String> },
 }
 
 /// Wynik operacji browser wykonanej przez teams-bot.
@@ -3732,6 +3846,161 @@ mod meeting_event_tests {
         match decoded.chunk {
             StreamChunkType::TextDelta(s) => assert_eq!(s, "Hello world"),
             _ => panic!("expected TextDelta"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod camera_cv_tests {
+    use super::*;
+
+    // Roundtrip ModelRequest z CameraCv(Detect) przez CBOR — batch 2 klatek
+    // Rgb24. Bajty klatek muszą przeżyć roundtrip binarnie (serde_bytes),
+    // bez konwersji na array-of-integers.
+    #[test]
+    fn cbor_roundtrip_camera_cv_detect_request() {
+        let frame_a: Vec<u8> = vec![0x00, 0x7F, 0xFF, 0x10, 0x20, 0x30];
+        let frame_b: Vec<u8> = (0..=255).collect();
+
+        let request = ModelRequest {
+            request_id: "req-cv-1".to_string(),
+            payload: ModelPayload::CameraCv(CameraCvPayload {
+                model: "rf-detr-nano".to_string(),
+                op: CameraCvOp::Detect {
+                    frames: vec![
+                        CvFrame {
+                            data: frame_a.clone(),
+                            width: 1,
+                            height: 2,
+                            encoding: CvFrameEncoding::Rgb24,
+                        },
+                        CvFrame {
+                            data: frame_b.clone(),
+                            width: 16,
+                            height: 16,
+                            encoding: CvFrameEncoding::Rgb24,
+                        },
+                    ],
+                    threshold: Some(0.35),
+                },
+            }),
+            stream: false,
+            metadata: None,
+            session_id: None,
+        };
+
+        let bytes = crate::cbor::encode(&request).expect("encode");
+        let decoded: ModelRequest =
+            crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
+
+        match decoded.payload {
+            ModelPayload::CameraCv(p) => {
+                assert_eq!(p.model, "rf-detr-nano");
+                match p.op {
+                    CameraCvOp::Detect { frames, threshold } => {
+                        assert_eq!(threshold, Some(0.35));
+                        assert_eq!(frames.len(), 2);
+                        assert_eq!(frames[0].data.len(), frame_a.len());
+                        assert_eq!(frames[0].data, frame_a);
+                        assert_eq!(frames[0].width, 1);
+                        assert_eq!(frames[0].height, 2);
+                        assert!(matches!(frames[0].encoding, CvFrameEncoding::Rgb24));
+                        assert_eq!(frames[1].data.len(), frame_b.len());
+                        assert_eq!(frames[1].data, frame_b);
+                        assert_eq!(frames[1].width, 16);
+                        assert_eq!(frames[1].height, 16);
+                        assert!(matches!(frames[1].encoding, CvFrameEncoding::Rgb24));
+                    }
+                    _ => panic!("expected Detect"),
+                }
+            }
+            _ => panic!("expected CameraCv variant"),
+        }
+    }
+
+    // Ramka `Detect` bez pola `threshold` (stary peer / skip_serializing_if)
+    // dekoduje się do `threshold: None` — kontrakt zgodności wstecznej.
+    #[test]
+    fn cbor_detect_without_threshold_decodes_to_none() {
+        let op = CameraCvOp::Detect {
+            frames: Vec::new(),
+            threshold: None,
+        };
+        let bytes = crate::cbor::encode(&op).expect("encode");
+        let decoded: CameraCvOp = crate::cbor::decode(&bytes).expect("decode");
+        match decoded {
+            CameraCvOp::Detect { frames, threshold } => {
+                assert!(frames.is_empty());
+                assert_eq!(threshold, None);
+            }
+            _ => panic!("expected Detect"),
+        }
+    }
+
+    // Literalna ramka CBOR w STARYM formacie drutu (sprzed pola `threshold`):
+    // {"Detect": {"frames": []}} zakodowane recznie bajt po bajcie, wiec test
+    // nie jest samoodnosny (nie uzywa dzisiejszego enkodera). Stary peer
+    // wysylajacy Detect bez `threshold` musi dekodowac sie do `None`.
+    #[test]
+    fn cbor_legacy_detect_frame_without_threshold_field_decodes() {
+        let legacy: &[u8] = &[
+            0xa1, // map(1)
+            0x66, b'D', b'e', b't', b'e', b'c', b't', // text(6) "Detect"
+            0xa1, // map(1)
+            0x66, b'f', b'r', b'a', b'm', b'e', b's', // text(6) "frames"
+            0x80, // array(0)
+        ];
+        let decoded: CameraCvOp = crate::cbor::decode(legacy).expect("legacy frame decodes");
+        match decoded {
+            CameraCvOp::Detect { frames, threshold } => {
+                assert!(frames.is_empty());
+                assert_eq!(threshold, None);
+            }
+            _ => panic!("expected Detect"),
+        }
+    }
+
+    // Roundtrip ModelResult::CameraCv(Detections) przez CBOR — per_frame
+    // z różną liczbą detekcji na klatkę.
+    #[test]
+    fn cbor_roundtrip_camera_cv_detections_result() {
+        let response = ModelResponse {
+            request_id: "req-cv-2".to_string(),
+            result: ModelResult::CameraCv(CameraCvResult::Detections {
+                per_frame: vec![
+                    vec![
+                        CvDetection {
+                            klasa: "cysterna".to_string(),
+                            bbox: [10.0, 20.0, 110.0, 220.0],
+                            score: 0.93,
+                        },
+                        CvDetection {
+                            klasa: "tablica_adr".to_string(),
+                            bbox: [50.5, 60.5, 80.0, 90.0],
+                            score: 0.71,
+                        },
+                    ],
+                    vec![],
+                ],
+            }),
+            metrics: None,
+        };
+
+        let bytes = crate::cbor::encode(&response).expect("encode");
+        let decoded: ModelResponse =
+            crate::cbor::decode::<ModelResponse>(&bytes).expect("decode");
+
+        match decoded.result {
+            ModelResult::CameraCv(CameraCvResult::Detections { per_frame }) => {
+                assert_eq!(per_frame.len(), 2);
+                assert_eq!(per_frame[0].len(), 2);
+                assert_eq!(per_frame[0][0].klasa, "cysterna");
+                assert_eq!(per_frame[0][0].bbox, [10.0, 20.0, 110.0, 220.0]);
+                assert!((per_frame[0][0].score - 0.93).abs() < f32::EPSILON);
+                assert_eq!(per_frame[0][1].klasa, "tablica_adr");
+                assert!(per_frame[1].is_empty());
+            }
+            _ => panic!("expected CameraCv Detections"),
         }
     }
 }

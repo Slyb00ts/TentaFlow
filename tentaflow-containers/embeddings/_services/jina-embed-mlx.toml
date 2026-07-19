@@ -1,6 +1,6 @@
 # Manifest serwisu Jina Embeddings v5 (MLX) — wbudowany silnik embeddingow dla
 # Apple Silicon (macOS/iOS). Runtime embedded przez MLX (feature
-# inference-mlx-embeddings, ta sama sciezka co nemotron-embed-mlx); brak
+# inference-mlx, ta sama sciezka co nemotron-embed-mlx); brak
 # kontekstu docker / python-bundle. Repo `-mlx` Jina niosa bazowe wagi + adapter
 # per-task (retrieval / text-matching), 1024d, last-token pooling. Wariant
 # CUDA/ROCm: `jina-embed`; lekki CPU/telefon: `jina-embed-gguf`.
@@ -25,7 +25,7 @@ output_modalities = ["embedding"]
 [deploy.native]
 platforms = ["macos", "ios"]
 runtime = "embedded"
-feature_flag = "inference-mlx-embeddings"
+feature_flag = "inference-mlx"
 
 # Repo MLX niesie warianty wag full/8bit/4bit (model-4bit.safetensors) — wybieramy
 # 4bit (quantization) dla najmniejszego sladu na Apple Silicon.

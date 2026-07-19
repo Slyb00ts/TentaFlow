@@ -1,0 +1,42 @@
+# =============================================================================
+# Plik: bundle.toml
+# Opis: Native Python bundle natywnego serwera treningowego klasyfikatora obrazu
+#       (timm). server.py uruchamiany przez uvicorn na :8203.
+# Przykład: TentaFlow startuje server.py, a Core wysyła POST /train (COCO → cropy).
+# =============================================================================
+
+[bundle]
+engine = "classifier-training"
+description = "Image classifier training server (COCO crops → timm fine-tune → ONNX)"
+python_version = "3.12"
+# Zależności pinowane w pyproject. `pypi_package` to identity-package bundla
+# (timm); torch z wariantu CUDA przez install_variants.extra_index.
+source = "pypi"
+pypi_package = "timm==1.0.19"
+
+[launch]
+command = "uvicorn"
+args = [
+    "--app-dir", "${BUNDLE_DIR}",
+    "server:app",
+    "--host", "127.0.0.1",
+    "--port", "${PORT:-8203}",
+]
+internal_port = 8203
+
+[requires]
+gpu_memory_gb = 8
+disk_gb = 20
+platforms = ["linux-x86_64"]
+
+# torch z kołami CUDA 13.0 (wsparcie Blackwell/B300; PyPI domyślnie serwuje
+# wariant CPU). Brak GPU → wariant `cpu` (klasyfikator trenuje sensownie także
+# na CPU dla małych zbiorów, choć wolniej).
+[[install_variants]]
+backend = "cuda"
+extra_index = "https://download.pytorch.org/whl/cu130"
+extras = []
+
+[[install_variants]]
+backend = "cpu"
+extras = []

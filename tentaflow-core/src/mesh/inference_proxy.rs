@@ -360,6 +360,39 @@ pub async fn dispatch_reverse_request(
             }
         }
 
+        // CameraCv (typed surface, operacje CV na klatkach z kamer) — peer bez
+        // lokalnego modelu CV forwarduje klatki w CameraCvPayload (serde_bytes,
+        // mesh hop binarny). Wykonujemy przez executor z hop_count na limicie
+        // (jak ramię Completion) — resolver trafi Local(Embedded) na tym węźle,
+        // a ewentualna próba re-forwardu pada na hop-limit zamiast krążyć A→B→A.
+        ModelPayload::CameraCv(ref cv_payload) => {
+            let Some(executor) = router.executor() else {
+                return make_error_response(
+                    request_id,
+                    "router executor not wired for mesh-reverse camera-cv",
+                );
+            };
+            match build_camera_cv_request(cv_payload) {
+                Ok(cv_request) => {
+                    let mut exec_ctx = crate::services::runtime::context::ExecutionContext {
+                        hop_count: crate::services::runtime::context::MAX_HOP_COUNT,
+                        ..crate::services::runtime::context::ExecutionContext::default()
+                    };
+                    match executor.execute_camera_cv(cv_request, &mut exec_ctx).await {
+                        Ok(result) => ModelResponse {
+                            request_id,
+                            result: ModelResult::CameraCv(result),
+                            metrics: None,
+                        },
+                        Err(e) => {
+                            make_error_response(request_id, &format!("Blad camera-cv: {}", e))
+                        }
+                    }
+                }
+                Err(e) => make_error_response(request_id, &e),
+            }
+        }
+
         _ => make_error_response(
             request_id,
             &format!(
@@ -424,6 +457,123 @@ fn build_chat_request(
     })
 }
 
+/// Buduje lokalny `CameraCvRequest` z mesh-owego `CameraCvPayload`.
+/// Klatki Rgb24 przechodzą wprost do `Arc<[u8]>` (jedna kopia z bufora CBOR);
+/// Jpeg jest dekodowany do RGB24 crate'em `image` — wymiary bierzemy z
+/// dekodera, nie z pól payloadu.
+fn build_camera_cv_request(
+    payload: &tentaflow_protocol::CameraCvPayload,
+) -> std::result::Result<crate::services::runtime::local_cv::CameraCvRequest, String> {
+    use crate::services::runtime::local_cv::{CameraCvOpLocal, CameraCvRequest};
+    use tentaflow_protocol::CameraCvOp;
+
+    let op = match &payload.op {
+        CameraCvOp::Detect { frames, threshold } => CameraCvOpLocal::Detect {
+            frames: frames
+                .iter()
+                .map(decode_cv_frame)
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            threshold: *threshold,
+        },
+        CameraCvOp::ClassifyState { crop } => CameraCvOpLocal::ClassifyState {
+            crop: decode_cv_frame(crop)?,
+        },
+        CameraCvOp::Ocr { crop, mode } => CameraCvOpLocal::Ocr {
+            crop: decode_cv_frame(crop)?,
+            mode: mode.clone(),
+        },
+    };
+
+    Ok(CameraCvRequest {
+        model: payload.model.clone(),
+        op,
+    })
+}
+
+/// Twardy limit rozmiaru pojedynczej zdekodowanej klatki RGB przychodzącej
+/// z mesh: 1080p RGB to ~6.2 MB, więc 32 MiB to bezpieczny sufit dla
+/// pojedynczej ramki — większe wymiary to błędny lub złośliwy payload.
+const MAX_CV_RGB_BYTES: usize = 32 * 1024 * 1024;
+
+/// Liczy rozmiar bufora RGB24 (`width * height * 3`) dla klatki z mesh —
+/// to granica zdalnego inputu, więc odrzuca wymiary zerowe, przepełnienie
+/// mnożenia (`checked_mul`) i przekroczenie `MAX_CV_RGB_BYTES`.
+fn checked_cv_rgb_bytes(width: u32, height: u32) -> std::result::Result<usize, String> {
+    if width == 0 || height == 0 {
+        return Err(format!(
+            "camera-cv: klatka o zerowym wymiarze {}x{}",
+            width, height
+        ));
+    }
+    let bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|px| px.checked_mul(3))
+        .ok_or_else(|| {
+            format!(
+                "camera-cv: wymiary klatki {}x{} przepelniaja usize",
+                width, height
+            )
+        })?;
+    if bytes > MAX_CV_RGB_BYTES {
+        return Err(format!(
+            "camera-cv: klatka {}x{} ({} bajtow RGB) przekracza limit {} bajtow",
+            width, height, bytes, MAX_CV_RGB_BYTES
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Dekoduje pojedynczą klatkę mesh (`CvFrame`) do lokalnego wariantu RGB24.
+/// Rgb24 waliduje rozmiar bufora (`width * height * 3`); Jpeg najpierw
+/// sprawdza wymiary z nagłówka (ochrona przed decompression bomb), potem
+/// dekompresuje strumień do surowych pikseli RGB. Obie ścieżki podlegają
+/// limitowi `MAX_CV_RGB_BYTES`.
+fn decode_cv_frame(
+    frame: &tentaflow_protocol::CvFrame,
+) -> std::result::Result<crate::services::runtime::local_cv::CvFrameLocal, String> {
+    use crate::services::runtime::local_cv::CvFrameLocal;
+    use tentaflow_protocol::CvFrameEncoding;
+
+    match frame.encoding {
+        CvFrameEncoding::Rgb24 => {
+            let expected = checked_cv_rgb_bytes(frame.width, frame.height)?;
+            if frame.data.len() != expected {
+                return Err(format!(
+                    "camera-cv: klatka Rgb24 {}x{} wymaga {} bajtow, otrzymano {}",
+                    frame.width,
+                    frame.height,
+                    expected,
+                    frame.data.len()
+                ));
+            }
+            Ok(CvFrameLocal {
+                data: std::sync::Arc::from(frame.data.as_slice()),
+                width: frame.width,
+                height: frame.height,
+            })
+        }
+        CvFrameEncoding::Jpeg => {
+            // Wymiary z samego nagłówka JPEG, bez dekodowania pikseli —
+            // limit rozmiaru musi zadziałać ZANIM zaalokujemy bufor RGB.
+            let (header_w, header_h) = image::ImageReader::new(std::io::Cursor::new(&frame.data))
+                .with_guessed_format()
+                .map_err(|e| format!("camera-cv: odczyt naglowka JPEG nieudany: {}", e))?
+                .into_dimensions()
+                .map_err(|e| format!("camera-cv: wymiary z naglowka JPEG nieudane: {}", e))?;
+            checked_cv_rgb_bytes(header_w, header_h)?;
+            let img = image::load_from_memory_with_format(&frame.data, image::ImageFormat::Jpeg)
+                .map_err(|e| format!("camera-cv: dekodowanie JPEG nieudane: {}", e))?
+                .to_rgb8();
+            let (width, height) = img.dimensions();
+            Ok(CvFrameLocal {
+                data: std::sync::Arc::from(img.into_raw()),
+                width,
+                height,
+            })
+        }
+    }
+}
+
 pub async fn dispatch_reverse_stream_request(
     router: &Router,
     request: tentaflow_protocol::ModelRequest,
@@ -460,7 +610,7 @@ pub async fn dispatch_reverse_stream_request(
         target: "mesh::reverse",
         request_id = %request_id,
         model = %completion_payload.model,
-        "mesh reverse chat stream start (synthetic dispatch)"
+        "mesh reverse chat stream start"
     );
     let mut chat_request = match build_chat_request(completion_payload) {
         Ok(req) => req,
@@ -481,40 +631,92 @@ pub async fn dispatch_reverse_stream_request(
     };
     chat_request.stream = true;
 
-    // Mesh reverse stream = the INITIATOR's flow already ran (its llm node
-    // forwarded a raw model call here). Re-entering flow dispatch (`Auto`:
-    // model binding > default flow > synthetic) executes the owner's flow a
-    // second time on top of it — doubled prompts/PII/memory, a voice flow's
-    // TTS pushes Audio deltas into the chat bridge ("flow misconfig" abort),
-    // and a default flow can silently swap the model. Mirrors the
-    // EXEMPT-MESH-INBOUND direct-executor rule of the non-streaming branch.
-    let route_result = match router
-        .route_chat_completion_stream(
-            chat_request,
-            None,
-            None,
-            crate::routing::streaming::ChatFlowSelector::Synthetic,
-        )
-        .await
-    {
-        Ok(result) => result,
-        Err(e) => {
+    // Mesh reverse stream = the INITIATOR's flow already ran; its llm node
+    // forwarded a model call here. A RAW model MUST stream straight from the
+    // backend on this node — no flow re-entry, no is_default "Default Chat"
+    // fallback, no hidden PII redaction (all of which live only inside the
+    // flow-engine path of route_chat_completion_stream). The forwarding node
+    // owns the flow; this node provides raw model compute only. Only a model
+    // that IS an explicit published flow on this node runs as a flow — the
+    // forwarded name resolves to that flow's definition, which is what the model
+    // means. `model_resolves_to_flow` is true ONLY for an explicit Flow catalog
+    // entry, never for the is_default fallback, so it is the exact raw-vs-flow
+    // discriminator. Mirrors the direct-executor rule of the non-streaming
+    // Completion branch (`executor.execute_chat`).
+    let model_name = chat_request.model.clone();
+    let mut stream: std::pin::Pin<
+        Box<
+            dyn futures::Stream<
+                    Item = crate::error::Result<crate::api::openai::types::ChatCompletionChunk>,
+                > + Send,
+        >,
+    > = if crate::routing::chat::model_resolves_to_flow(&router.catalog_snapshot(), &model_name) {
+        // Published flow-as-model: execute THAT flow on this node.
+        match router
+            .route_chat_completion_stream(
+                chat_request,
+                None,
+                None,
+                crate::routing::streaming::ChatFlowSelector::Auto,
+            )
+            .await
+        {
+            Ok(result) => result.response,
+            Err(e) => {
+                send_stream_chunk_bytes(
+                    &tx,
+                    ModelStreamChunk {
+                        request_id,
+                        chunk: StreamChunkType::Error(ErrorInfo {
+                            error_type: ErrorType::InternalError,
+                            message: format!("route_chat_completion_stream: {}", e),
+                            details: None,
+                        }),
+                    },
+                );
+                return;
+            }
+        }
+    } else {
+        // Raw model: direct executor stream. `hop_count = MAX_HOP_COUNT` is the
+        // same A→B→A re-forward guard the non-streaming branch applies.
+        let Some(executor) = router.executor() else {
             send_stream_chunk_bytes(
                 &tx,
                 ModelStreamChunk {
                     request_id,
                     chunk: StreamChunkType::Error(ErrorInfo {
                         error_type: ErrorType::InternalError,
-                        message: format!("route_chat_completion_stream: {}", e),
+                        message: "router executor not wired for mesh-reverse chat stream"
+                            .to_string(),
                         details: None,
                     }),
                 },
             );
             return;
+        };
+        let mut exec_ctx = crate::services::runtime::context::ExecutionContext {
+            hop_count: crate::services::runtime::context::MAX_HOP_COUNT,
+            ..crate::services::runtime::context::ExecutionContext::default()
+        };
+        match executor.stream_chat(chat_request, &mut exec_ctx).await {
+            Ok(s) => s,
+            Err(e) => {
+                send_stream_chunk_bytes(
+                    &tx,
+                    ModelStreamChunk {
+                        request_id,
+                        chunk: StreamChunkType::Error(ErrorInfo {
+                            error_type: ErrorType::InternalError,
+                            message: format!("mesh reverse direct stream: {}", e),
+                            details: None,
+                        }),
+                    },
+                );
+                return;
+            }
         }
     };
-
-    let mut stream = route_result.response;
     let mut errored = false;
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
@@ -940,6 +1142,158 @@ mod tests {
             }
             other => panic!("expected Text content, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_camera_cv_request_rgb24_zachowuje_bajty() {
+        // Klatka Rgb24 przechodzi do wariantu lokalnego bez modyfikacji danych
+        let data: Vec<u8> = (0..12).collect(); // 2x2 piksele RGB
+        let payload = CameraCvPayload {
+            model: "rfdetr-adr".to_string(),
+            op: CameraCvOp::Detect {
+                frames: vec![CvFrame {
+                    data: data.clone(),
+                    width: 2,
+                    height: 2,
+                    encoding: CvFrameEncoding::Rgb24,
+                }],
+                threshold: Some(0.6),
+            },
+        };
+
+        let req = build_camera_cv_request(&payload).expect("Rgb24 powinno przejsc");
+        assert_eq!(req.model, "rfdetr-adr");
+        match req.op {
+            crate::services::runtime::local_cv::CameraCvOpLocal::Detect { frames, threshold } => {
+                assert_eq!(threshold, Some(0.6));
+                assert_eq!(frames.len(), 1);
+                assert_eq!(&frames[0].data[..], data.as_slice());
+                assert_eq!(frames[0].width, 2);
+                assert_eq!(frames[0].height, 2);
+            }
+            _ => panic!("Oczekiwano CameraCvOpLocal::Detect"),
+        }
+    }
+
+    #[test]
+    fn build_camera_cv_request_rgb24_zly_rozmiar_zwraca_blad() {
+        // Bufor krotszy niz width*height*3 → walidacja odrzuca klatke
+        let payload = CameraCvPayload {
+            model: "rfdetr-adr".to_string(),
+            op: CameraCvOp::ClassifyState {
+                crop: CvFrame {
+                    data: vec![0u8; 5],
+                    width: 2,
+                    height: 2,
+                    encoding: CvFrameEncoding::Rgb24,
+                },
+            },
+        };
+
+        let err = build_camera_cv_request(&payload).unwrap_err();
+        assert!(err.contains("Rgb24"), "blad powinien wskazywac Rgb24: {err}");
+    }
+
+    #[test]
+    fn build_camera_cv_request_jpeg_niepoprawny_zwraca_blad() {
+        // Uszkodzony strumien JPEG → dekoder image zglasza blad
+        let payload = CameraCvPayload {
+            model: "plate-ocr".to_string(),
+            op: CameraCvOp::Ocr {
+                crop: CvFrame {
+                    data: vec![1, 2, 3, 4],
+                    width: 1,
+                    height: 1,
+                    encoding: CvFrameEncoding::Jpeg,
+                },
+                mode: CvOcrMode::Plate,
+            },
+        };
+
+        let err = build_camera_cv_request(&payload).unwrap_err();
+        assert!(err.contains("JPEG"), "blad powinien wskazywac JPEG: {err}");
+    }
+
+    #[test]
+    fn build_camera_cv_request_jpeg_dekoduje_do_rgb24() {
+        // Poprawny JPEG (4x4, jednolity kolor) dekoduje sie do surowych pikseli
+        // RGB o wymiarach z dekodera
+        let mut jpeg_buf = Vec::new();
+        {
+            use image::ImageEncoder;
+            let pixels = vec![128u8; 4 * 4 * 3];
+            let encoder =
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, 90);
+            encoder
+                .write_image(&pixels, 4, 4, image::ExtendedColorType::Rgb8)
+                .expect("kodowanie JPEG w tescie");
+        }
+
+        let payload = CameraCvPayload {
+            model: "nalepka-stan".to_string(),
+            op: CameraCvOp::ClassifyState {
+                crop: CvFrame {
+                    data: jpeg_buf,
+                    width: 4,
+                    height: 4,
+                    encoding: CvFrameEncoding::Jpeg,
+                },
+            },
+        };
+
+        let req = build_camera_cv_request(&payload).expect("JPEG powinien sie zdekodowac");
+        match req.op {
+            crate::services::runtime::local_cv::CameraCvOpLocal::ClassifyState { crop } => {
+                assert_eq!(crop.width, 4);
+                assert_eq!(crop.height, 4);
+                assert_eq!(crop.data.len(), 4 * 4 * 3);
+            }
+            _ => panic!("Oczekiwano CameraCvOpLocal::ClassifyState"),
+        }
+    }
+
+    #[test]
+    fn checked_cv_rgb_bytes_waliduje_wymiary() {
+        // Poprawne wymiary → dokladny rozmiar bufora RGB
+        assert_eq!(checked_cv_rgb_bytes(2, 2), Ok(12));
+        assert_eq!(checked_cv_rgb_bytes(1920, 1080), Ok(1920 * 1080 * 3));
+
+        // Wymiary zerowe → odrzucone
+        assert!(checked_cv_rgb_bytes(0, 100).is_err());
+        assert!(checked_cv_rgb_bytes(100, 0).is_err());
+
+        // Przepelnienie mnozenia (u32::MAX * u32::MAX * 3) → odrzucone
+        assert!(checked_cv_rgb_bytes(u32::MAX, u32::MAX).is_err());
+
+        // Tuz ponad limit 32 MiB → odrzucone; tuz pod limitem → OK
+        // 3400x3300*3 = 33 660 000 > 33 554 432 (32 MiB)
+        let err = checked_cv_rgb_bytes(3400, 3300).unwrap_err();
+        assert!(err.contains("przekracza limit"), "blad limitu: {err}");
+        assert!(checked_cv_rgb_bytes(3300, 3300).is_ok());
+    }
+
+    #[test]
+    fn decode_cv_frame_jpeg_ponad_limit_odrzucony_z_naglowka() {
+        // JPEG o wymiarach przekraczajacych MAX_CV_RGB_BYTES musi zostac
+        // odrzucony na podstawie naglowka — przed pelnym dekodowaniem
+        let mut jpeg_buf = Vec::new();
+        {
+            use image::ImageEncoder;
+            let pixels = vec![128u8; 3400 * 3300 * 3];
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, 30);
+            encoder
+                .write_image(&pixels, 3400, 3300, image::ExtendedColorType::Rgb8)
+                .expect("kodowanie JPEG w tescie");
+        }
+
+        let frame = CvFrame {
+            data: jpeg_buf,
+            width: 3400,
+            height: 3300,
+            encoding: CvFrameEncoding::Jpeg,
+        };
+        let err = decode_cv_frame(&frame).unwrap_err();
+        assert!(err.contains("przekracza limit"), "blad limitu: {err}");
     }
 
     #[test]

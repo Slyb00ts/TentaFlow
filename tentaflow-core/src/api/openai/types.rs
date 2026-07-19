@@ -455,6 +455,8 @@ pub struct GenPerf {
     pub prefill_tps: f32,
     /// Predkosc dekodowania: (completion_tokens-1) / (end - first_token).
     pub decode_tps: f32,
+    /// Calkowity czas odpowiedzi w ms (dispatch -> ostatni token).
+    pub total_ms: u32,
 }
 
 /// Streaming options (Etap 3a). Dziś jedyne pole to `include_usage` —
@@ -473,10 +475,18 @@ pub struct StreamOptions {
 /// Ostatni chunk: `data: [DONE]\n\n`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionChunk {
+    // Header fields are tolerant of non-conforming backends: some vLLM builds
+    // (e.g. NVFP4 + speculative draft) omit `id`/`object`/`created`/`model` on
+    // streaming chunks, and a missing key must not abort the whole stream.
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub object: String, // "chat.completion.chunk"
+    #[serde(default)]
     pub created: u64,
+    #[serde(default)]
     pub model: String,
+    #[serde(default)]
     pub choices: Vec<ChunkChoice>,
 
     #[serde(skip_serializing_if = "Option::is_none")]

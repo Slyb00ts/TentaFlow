@@ -30,6 +30,11 @@ pub mod ui {
     pub use tentaflow_ui_schema::*;
 }
 
+/// Typed UI catalog v1 (`ui_render_cbor` wire): generated re-exports of the
+/// `tentaflow-sdk-spec` component/enum/inline/union catalog plus the panel /
+/// slot / state message client and handler builders.
+pub mod ui_v1;
+
 // =============================================================================
 // AbiError — kanoniczne kody bledow ABI dla F1a host functions
 // =============================================================================
@@ -460,6 +465,19 @@ extern "C" {
     ) -> i32;
     fn camera_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
     fn camera_analysis_flows_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn camera_cv_pipelines_list_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn camera_cv_pipeline_get_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_cv_pipeline_save_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn camera_cv_pipeline_delete_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
     fn camera_get_v1(
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
@@ -489,6 +507,35 @@ extern "C" {
         input_ptr: i32, input_len: i32,
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
+
+    /// LLM streaming API — start zwraca callback_id (>0) albo ujemny kod bledu;
+    /// next to CBOR `LlmStreamNextInput` → `LlmStreamNextOutput` (batch
+    /// fragmentow); cancel zwalnia slot + anuluje generacje.
+    fn llm_generate_stream_start(
+        prompt_ptr: i32, prompt_len: i32,
+        model_ptr: i32, model_len: i32,
+        options_ptr: i32, options_len: i32,
+    ) -> i32;
+    fn llm_generate_stream_next(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn llm_generate_stream_cancel(callback_id: i32) -> i32;
+
+    /// STT API — CBOR `SttTranscribeInput` (audio inline, max 25 MiB) →
+    /// `SttTranscribeOutput`. Wymaga uprawnienia "stt".
+    fn stt_transcribe_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
+    /// Directory API — read-only CBOR views of the caller org's users,
+    /// groups, RBAC roles and the org itself (`tentaflow-sdk-spec::directory`
+    /// shapes). Output-only ABI; requires the "directory.read" permission.
+    fn directory_users_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn directory_groups_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn directory_roles_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
+    fn directory_org_v1(out_ptr: i32, out_cap: i32, out_len_ptr: i32) -> i32;
 
     /// Streaming API (F1a M1.W7) — frame bus + PickupToken. Frame bytes are
     /// NOT inlined in `stream_next` output; the addon receives `frame_ref`
@@ -789,10 +836,25 @@ fn call_host_log(
 // Wysokopoziomowe wrappery — LLM
 // =============================================================================
 
-/// Generuje tekst przez LLM dostepny w Core.
+/// Generuje tekst przez LLM dostepny w Core (domyslny model, bez opcji).
 /// Wymaga uprawnienia "llm" w manifescie addonu.
 pub fn generate(prompt: &str) -> Result<String, String> {
+    generate_with_options(prompt, None, None)
+}
+
+/// Generuje tekst przez LLM z jawnym modelem i opcjami JSON. `options` to opaque
+/// JSON forwardowany do hosta; obsluguje m.in. `temperature`, `max_tokens`, `top_p`
+/// oraz `system` (string) — niepusty `system` daje request `[system, user]` zamiast
+/// samego `[user]`. Wymaga uprawnienia "llm".
+pub fn generate_with_options(
+    prompt: &str,
+    model: Option<&str>,
+    options: Option<&serde_json::Value>,
+) -> Result<String, String> {
     let prompt_bytes = prompt.as_bytes();
+    let model_bytes = model.map(str::as_bytes);
+    let options_str = options.map(|o| o.to_string());
+    let options_bytes = options_str.as_deref().map(str::as_bytes);
     let mut buffer = vec![0u8; RESPONSE_BUFFER_SIZE];
     let mut out_len: i32 = 0;
 
@@ -800,8 +862,10 @@ pub fn generate(prompt: &str) -> Result<String, String> {
         llm_generate(
             prompt_bytes.as_ptr() as i32,
             prompt_bytes.len() as i32,
-            0, 0,   // model_ptr, model_len — domyslny model
-            0, 0,   // options_ptr, options_len — domyslne opcje
+            model_bytes.map_or(0, |b| b.as_ptr() as i32),
+            model_bytes.map_or(0, |b| b.len() as i32),
+            options_bytes.map_or(0, |b| b.as_ptr() as i32),
+            options_bytes.map_or(0, |b| b.len() as i32),
             buffer.as_mut_ptr() as i32,
             RESPONSE_BUFFER_SIZE as i32,
             &mut out_len as *mut i32 as i32,
@@ -817,6 +881,298 @@ pub fn generate(prompt: &str) -> Result<String, String> {
     }
 
     Ok(String::from_utf8_lossy(&buffer[..out_len as usize]).to_string())
+}
+
+// =============================================================================
+// Wysokopoziomowe wrappery — LLM streaming
+// =============================================================================
+
+/// Uchwyt aktywnego strumienia LLM. Drop bez `cancel()` zostawia strumien
+/// hostowi — zostanie zreapowany po 60 s bezczynnosci, ale jawny `cancel()`
+/// zwalnia zasoby natychmiast.
+#[derive(Debug)]
+pub struct LlmStream {
+    callback_id: i32,
+    finished: bool,
+}
+
+/// Partia fragmentow strumienia zwrocona przez [`LlmStream::next_batch`].
+#[derive(Debug, Clone)]
+pub struct LlmStreamBatch {
+    /// Kolejne delty tekstu w kolejnosci generacji. Pusta lista przy
+    /// `finished == false` oznacza timeout oczekiwania — polluj dalej.
+    pub chunks: Vec<String>,
+    /// Strumien zakonczony — uchwyt jest po tym niewazny.
+    pub finished: bool,
+    /// Powod zakonczenia (`stop`, `length`, `error`, ...) na ostatniej partii.
+    pub finish_reason: Option<String>,
+    /// Blad generacji (gdy `finish_reason == "error"`).
+    pub error: Option<String>,
+}
+
+/// Mapuje ujemne kody zwracane przez `llm_generate_stream_start` na AbiError.
+/// Start uzywa historycznych kodow ABI_ERR_* (-1 permission, -4 rate limit)
+/// oraz zanegowanego `AbiError::QuotaExceeded` (-11) dla kwoty strumieni.
+fn map_stream_start_error(rc: i32) -> AbiError {
+    match rc {
+        -1 => AbiError::Permission,
+        -4 | -11 => AbiError::QuotaExceeded,
+        _ => AbiError::Operation,
+    }
+}
+
+/// Rozpoczyna strumieniowe generowanie tekstu przez LLM.
+/// Wymaga uprawnienia "llm" (oraz "llm_model" dla surowego nadpisania modelu).
+/// Max 4 rownolegle strumienie per addon.
+pub fn generate_stream_start(
+    prompt: &str,
+    model: Option<&str>,
+    options: Option<&serde_json::Value>,
+) -> Result<LlmStream, AbiError> {
+    let prompt_bytes = prompt.as_bytes();
+    let model_bytes = model.map(str::as_bytes);
+    let options_str = options.map(|o| o.to_string());
+    let options_bytes = options_str.as_deref().map(str::as_bytes);
+
+    let rc = unsafe {
+        llm_generate_stream_start(
+            prompt_bytes.as_ptr() as i32,
+            prompt_bytes.len() as i32,
+            model_bytes.map_or(0, |b| b.as_ptr() as i32),
+            model_bytes.map_or(0, |b| b.len() as i32),
+            options_bytes.map_or(0, |b| b.as_ptr() as i32),
+            options_bytes.map_or(0, |b| b.len() as i32),
+        )
+    };
+    if rc <= 0 {
+        return Err(map_stream_start_error(rc));
+    }
+    Ok(LlmStream {
+        callback_id: rc,
+        finished: false,
+    })
+}
+
+impl LlmStream {
+    /// Pobiera kolejna partie fragmentow. `timeout_ms` dotyczy PIERWSZEGO
+    /// fragmentu partii (host clampuje do 30 s); wszystko co juz czeka w
+    /// kolejce hosta wraca w jednej partii. Po `finished == true` kolejne
+    /// wywolania zwracaja `StreamNotFound`.
+    pub fn next_batch(&mut self, timeout_ms: u64) -> Result<LlmStreamBatch, AbiError> {
+        if self.finished {
+            return Err(AbiError::StreamClosed);
+        }
+        let input = tentaflow_sdk_spec::LlmStreamNextInput {
+            callback_id: self.callback_id,
+            timeout_ms,
+        };
+        let payload = encode_cbor_input(&input)?;
+        let bytes = call_sql_with_one_input_capped(
+            llm_generate_stream_next,
+            &payload,
+            MAX_OUT_CAP,
+        )?;
+        let out: tentaflow_sdk_spec::LlmStreamNextOutput = decode_cbor(&bytes)?;
+        if out.finished {
+            self.finished = true;
+        }
+        Ok(LlmStreamBatch {
+            chunks: out.chunks,
+            finished: out.finished,
+            finish_reason: out.finish_reason,
+            error: out.error,
+        })
+    }
+
+    /// Anuluje strumien i natychmiast zwalnia zasoby hosta.
+    pub fn cancel(mut self) -> Result<(), AbiError> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        let rc = unsafe { llm_generate_stream_cancel(self.callback_id) };
+        match AbiError::from_i32(rc) {
+            AbiError::Ok => Ok(()),
+            e => Err(e),
+        }
+    }
+}
+
+impl Drop for LlmStream {
+    fn drop(&mut self) {
+        // Best-effort: porzucony `LlmStream` (bez `cancel()`) zwalnia slot hosta
+        // od razu. Guest Drop NIE jest gwarantowany przy wycieku pamieci, dlatego
+        // host ma dodatkowo background-sweeper reapujacy bezczynne strumienie —
+        // ten Drop jest szybka sciezka, sweeper twardym backstopem.
+        if !self.finished {
+            unsafe { llm_generate_stream_cancel(self.callback_id) };
+        }
+    }
+}
+
+// =============================================================================
+// Wysokopoziomowe wrappery — STT
+// =============================================================================
+
+/// Parametry transkrypcji dla [`stt_transcribe`].
+#[derive(Debug, Clone, Default)]
+pub struct SttTranscribeOptions {
+    /// Czestotliwosc probkowania (informacyjnie, np. 16000).
+    pub sample_rate: Option<u32>,
+    /// Nazwa modelu STT; brak = domyslny lokalny silnik (whisper).
+    pub model: Option<String>,
+    /// Kod jezyka ISO-639-1 (np. "pl") — pomija auto-detekcje.
+    pub language: Option<String>,
+    /// Prompt kontekstowy dla modelu.
+    pub prompt: Option<String>,
+}
+
+/// Wynik transkrypcji.
+#[derive(Debug, Clone)]
+pub struct SttTranscription {
+    pub text: String,
+    pub detected_language: Option<String>,
+    pub duration_ms: Option<u64>,
+}
+
+/// Transkrybuje audio (WAV/Opus/MP3, max 25 MiB) przez skonfigurowana
+/// sciezke STT Core (ta sama co node stt flow engine).
+/// Wymaga uprawnienia "stt" w manifescie addonu.
+/// Twardy limit rozmiaru audio (25 MiB) — lustro `PayloadKind::AudioInline` w
+/// hoscie. Sprawdzany PRZED alokacja/serializacja, zeby wielki bufor nie byl
+/// kopiowany tylko po to, by host go odrzucil.
+const MAX_STT_AUDIO_BYTES: usize = 25 * 1024 * 1024;
+
+pub fn stt_transcribe(
+    audio: &[u8],
+    mime: &str,
+    options: &SttTranscribeOptions,
+) -> Result<SttTranscription, AbiError> {
+    // Wczesne odrzucenie: nie kopiuj + nie koduj CBOR bufora, ktory i tak
+    // przekracza limit hosta.
+    if audio.len() > MAX_STT_AUDIO_BYTES {
+        return Err(AbiError::PayloadTooLarge);
+    }
+    let input = tentaflow_sdk_spec::SttTranscribeInput {
+        audio: audio.to_vec(),
+        mime: mime.to_string(),
+        sample_rate: options.sample_rate,
+        model: options.model.clone(),
+        language: options.language.clone(),
+        prompt: options.prompt.clone(),
+    };
+    let payload = encode_cbor_input(&input)?;
+    let bytes = call_sql_with_one_input_capped(stt_transcribe_v1, &payload, MAX_OUT_CAP)?;
+    let out: tentaflow_sdk_spec::SttTranscribeOutput = decode_cbor(&bytes)?;
+    Ok(SttTranscription {
+        text: out.text,
+        detected_language: out.detected_language,
+        duration_ms: out.duration_ms,
+    })
+}
+
+// =============================================================================
+// High-level wrappers — Directory (org users / groups / roles)
+// =============================================================================
+
+/// One active user of the caller's organization. `groups` carries group IDs.
+#[derive(Debug, Clone)]
+pub struct DirectoryUser {
+    pub id: String,
+    pub username: String,
+    pub display_name: String,
+    pub email: Option<String>,
+    pub groups: Vec<String>,
+    pub is_active: bool,
+    /// Organization RBAC role (`user` | `power_user` | `admin`).
+    pub role: String,
+}
+
+/// One user group; `member_count` counts only active users of the caller's org.
+#[derive(Debug, Clone)]
+pub struct DirectoryGroup {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub member_count: u64,
+}
+
+/// One RBAC role (preseed + custom). Permission lists are host-side only.
+#[derive(Debug, Clone)]
+pub struct DirectoryRole {
+    pub role_id: String,
+    pub name: String,
+}
+
+/// The caller's organization.
+#[derive(Debug, Clone)]
+pub struct DirectoryOrg {
+    pub org_id: String,
+    pub name: String,
+    pub slug: String,
+}
+
+/// Lists the active users of the caller's organization (id, username,
+/// display name, e-mail, group IDs). Requires the "directory.read" permission.
+pub fn directory_users() -> Result<Vec<DirectoryUser>, AbiError> {
+    let bytes = call_host_no_input(directory_users_v1)?;
+    let out: tentaflow_sdk_spec::DirectoryUsersOutput = decode_cbor(&bytes)?;
+    Ok(out
+        .users
+        .into_iter()
+        .map(|u| DirectoryUser {
+            id: u.id,
+            username: u.username,
+            display_name: u.display_name,
+            email: u.email,
+            groups: u.groups,
+            is_active: u.is_active,
+            role: u.role,
+        })
+        .collect())
+}
+
+/// Lists user groups with member counts scoped to the caller's organization.
+/// Requires the "directory.read" permission.
+pub fn directory_groups() -> Result<Vec<DirectoryGroup>, AbiError> {
+    let bytes = call_host_no_input(directory_groups_v1)?;
+    let out: tentaflow_sdk_spec::DirectoryGroupsOutput = decode_cbor(&bytes)?;
+    Ok(out
+        .groups
+        .into_iter()
+        .map(|g| DirectoryGroup {
+            id: g.id,
+            name: g.name,
+            description: g.description,
+            member_count: g.member_count,
+        })
+        .collect())
+}
+
+/// Lists RBAC roles (role_id + name). Requires the "directory.read" permission.
+pub fn directory_roles() -> Result<Vec<DirectoryRole>, AbiError> {
+    let bytes = call_host_no_input(directory_roles_v1)?;
+    let out: tentaflow_sdk_spec::DirectoryRolesOutput = decode_cbor(&bytes)?;
+    Ok(out
+        .roles
+        .into_iter()
+        .map(|r| DirectoryRole {
+            role_id: r.role_id,
+            name: r.name,
+        })
+        .collect())
+}
+
+/// Returns the caller's organization (org_id, name, slug). Requires the
+/// "directory.read" permission. `NotFound` when the org row does not exist.
+pub fn directory_org() -> Result<DirectoryOrg, AbiError> {
+    let bytes = call_host_no_input(directory_org_v1)?;
+    let out: tentaflow_sdk_spec::DirectoryOrgOutput = decode_cbor(&bytes)?;
+    Ok(DirectoryOrg {
+        org_id: out.org_id,
+        name: out.name,
+        slug: out.slug,
+    })
 }
 
 // =============================================================================
@@ -2343,6 +2699,8 @@ pub struct CameraInfo {
     pub profile: String,
     /// Per-camera analysis Flow id (None/empty = none assigned).
     pub analysis_flow_id: Option<String>,
+    /// Per-camera CV pipeline id (None/empty = the default pipeline).
+    pub cv_pipeline_id: Option<String>,
 }
 
 impl From<tentaflow_sdk_spec::CameraInfoOut> for CameraInfo {
@@ -2362,6 +2720,7 @@ impl From<tentaflow_sdk_spec::CameraInfoOut> for CameraInfo {
             retention_class: o.retention_class,
             profile: o.profile,
             analysis_flow_id: o.analysis_flow_id,
+            cv_pipeline_id: o.cv_pipeline_id,
         }
     }
 }
@@ -2382,6 +2741,10 @@ pub struct CameraUpdateSpec {
     /// Per-camera analysis Flow id. `None` keeps current; `Some("")` clears it;
     /// `Some(id)` assigns (host validates the flow exists and is active).
     pub analysis_flow_id: Option<String>,
+    /// Per-camera CV pipeline id. Same tri-state as `analysis_flow_id`:
+    /// `None` keeps current, `Some("")` clears (back to the default pipeline),
+    /// `Some(id)` assigns (host validates the pipeline exists).
+    pub cv_pipeline_id: Option<String>,
 }
 
 /// One assignable camera-analysis flow (id + display name) from
@@ -2390,6 +2753,45 @@ pub struct CameraUpdateSpec {
 pub struct CameraAnalysisFlow {
     pub id: String,
     pub name: String,
+}
+
+/// One camera CV pipeline summary from [`camera_cv_pipelines_list`], for the
+/// per-camera pipeline picker and the pipeline manager list.
+#[derive(Debug, Clone)]
+pub struct CameraCvPipelineSummary {
+    pub id: String,
+    pub name: String,
+    /// Seed-owned default pipeline — cannot be deleted; cameras without an
+    /// explicit assignment resolve to it.
+    pub is_default: bool,
+    pub updated_at: i64,
+}
+
+/// One full pipeline (JSON body included) from [`camera_cv_pipeline_get`].
+#[derive(Debug, Clone)]
+pub struct CameraCvPipeline {
+    pub id: String,
+    pub name: String,
+    /// `{"stages":[...]}` per the core `cv_pipeline::CvPipeline` schema.
+    pub pipeline_json: String,
+}
+
+/// Outcome of [`camera_cv_pipeline_save`]. A host-side validation failure
+/// (structure or unknown model alias) is NOT an ABI error — it comes back as
+/// `id = None` + a human-readable `error` for the UI to display verbatim.
+#[derive(Debug, Clone)]
+pub struct CameraCvPipelineSaveResult {
+    pub id: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Outcome of [`camera_cv_pipeline_delete`]. A refused delete (default
+/// pipeline, still referenced by a camera) comes back as `deleted = false`
+/// + a human-readable `error`.
+#[derive(Debug, Clone)]
+pub struct CameraCvPipelineDeleteResult {
+    pub deleted: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2537,6 +2939,73 @@ pub fn camera_analysis_flows() -> Result<Vec<CameraAnalysisFlow>, AbiError> {
         .collect())
 }
 
+/// Lists every camera CV pipeline (summaries only — the JSON body is fetched
+/// per-pipeline via [`camera_cv_pipeline_get`]). Read-only; needs `cameras.read`.
+pub fn camera_cv_pipelines_list() -> Result<Vec<CameraCvPipelineSummary>, AbiError> {
+    let bytes = call_host_no_input(camera_cv_pipelines_list_v1)?;
+    let resp: tentaflow_sdk_spec::CameraCvPipelinesOut = decode_cbor(&bytes)?;
+    Ok(resp
+        .pipelines
+        .into_iter()
+        .map(|p| CameraCvPipelineSummary {
+            id: p.id,
+            name: p.name,
+            is_default: p.is_default,
+            updated_at: p.updated_at,
+        })
+        .collect())
+}
+
+/// Fetches one pipeline with its full JSON body. Needs `cameras.read`.
+pub fn camera_cv_pipeline_get(id: &str) -> Result<CameraCvPipeline, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::CameraCvPipelineIdInput {
+        id: id.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(camera_cv_pipeline_get_v1, &payload)?;
+    let out: tentaflow_sdk_spec::CameraCvPipelineOut = decode_cbor(&bytes)?;
+    Ok(CameraCvPipeline {
+        id: out.id,
+        name: out.name,
+        pipeline_json: out.pipeline_json,
+    })
+}
+
+/// Creates (`id = None` → host mints a fresh uuid) or updates a pipeline.
+/// The host validates structure + model-alias existence; a rejected pipeline
+/// returns `Ok` with the readable error in the result. Needs `cameras.write`.
+pub fn camera_cv_pipeline_save(
+    id: Option<&str>,
+    name: &str,
+    pipeline_json: &str,
+) -> Result<CameraCvPipelineSaveResult, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::CameraCvPipelineSaveInput {
+        id: id.map(|s| s.to_string()),
+        name: name.to_string(),
+        pipeline_json: pipeline_json.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(camera_cv_pipeline_save_v1, &payload)?;
+    let out: tentaflow_sdk_spec::CameraCvPipelineSaveOut = decode_cbor(&bytes)?;
+    Ok(CameraCvPipelineSaveResult {
+        id: out.id,
+        error: out.error,
+    })
+}
+
+/// Deletes a pipeline. Refusals (default pipeline, still assigned to a
+/// camera) return `Ok` with `deleted = false` + the readable reason.
+/// Needs `cameras.write`.
+pub fn camera_cv_pipeline_delete(id: &str) -> Result<CameraCvPipelineDeleteResult, AbiError> {
+    let payload = encode_cbor_input(&tentaflow_sdk_spec::CameraCvPipelineIdInput {
+        id: id.to_string(),
+    })?;
+    let bytes = call_sql_with_one_input(camera_cv_pipeline_delete_v1, &payload)?;
+    let out: tentaflow_sdk_spec::CameraCvPipelineDeleteOut = decode_cbor(&bytes)?;
+    Ok(CameraCvPipelineDeleteResult {
+        deleted: out.deleted,
+        error: out.error,
+    })
+}
+
 /// Pobiera pojedynczy `CameraInfo`. Zwraca `NotFound` gdy kamera nie istnieje
 /// lub nalezy do innego addona (kanalu bocznego nie ma — nie da sie wnioskowac
 /// o istnieniu cudzych camera_id).
@@ -2561,6 +3030,7 @@ pub fn camera_update(spec: &CameraUpdateSpec) -> Result<CameraInfo, AbiError> {
         retention_class: spec.retention_class.clone(),
         profile: spec.profile.clone(),
         analysis_flow_id: spec.analysis_flow_id.clone(),
+        cv_pipeline_id: spec.cv_pipeline_id.clone(),
     })?;
     let bytes = call_sql_with_one_input(camera_update_v1, &payload)?;
     let out: tentaflow_sdk_spec::CameraInfoOut = decode_cbor(&bytes)?;
@@ -2719,6 +3189,7 @@ pub fn camera_discover() -> Result<Vec<CameraInfo>, AbiError> {
             retention_class: String::new(),
             profile: String::new(),
             analysis_flow_id: None,
+            cv_pipeline_id: None,
         })
         .collect())
 }

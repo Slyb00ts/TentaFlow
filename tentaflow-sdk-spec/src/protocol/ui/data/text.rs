@@ -33,13 +33,17 @@ pub struct Text {
     pub wrap: Option<TextWrap>,
     pub max_lines: Option<u8>,
     pub format: Option<ValueFormat>,
+    /// When set, the renderer treats `content` as an in-progress stream driven by
+    /// this bind and shows a semantic streaming caret; addon declares this
+    /// intent instead of animating a cursor with its own CSS.
+    pub streaming: Option<BindRef>,
 }
 
 impl Text {
     pub const TAG: u16 = 0x0201;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(7);
+        let mut entries: Vec<(u8, Value)> = Vec::with_capacity(8);
         entries.push((0, encode_to_value(&self.content)?));
         entries.push((1, encode_to_value(&self.style)?));
         if let Some(t) = &self.tone { entries.push((2, encode_to_value(t)?)); }
@@ -47,6 +51,7 @@ impl Text {
         if let Some(w) = &self.wrap { entries.push((4, encode_to_value(w)?)); }
         if let Some(m) = &self.max_lines { entries.push((5, encode_to_value(m)?)); }
         if let Some(f) = &self.format { entries.push((6, encode_to_value(f)?)); }
+        if let Some(s) = &self.streaming { entries.push((7, encode_to_value(s)?)); }
         Ok(component(Self::TAG, id, entries))
     }
 
@@ -60,6 +65,7 @@ impl Text {
         let mut wrap = None;
         let mut max_lines = None;
         let mut format = None;
+        let mut streaming = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => content = Some(decode_from_value(v)?),
@@ -69,13 +75,14 @@ impl Text {
                 4 => wrap = Some(decode_from_value(v)?),
                 5 => max_lines = Some(decode_from_value(v)?),
                 6 => format = Some(decode_from_value(v)?),
+                7 => streaming = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("Text", *other)),
             }
         }
         Ok(Text {
             content: content.ok_or_else(|| missing_field("Text", "content"))?,
             style: style.ok_or_else(|| missing_field("Text", "style"))?,
-            tone, align, wrap, max_lines, format,
+            tone, align, wrap, max_lines, format, streaming,
         })
     }
 }

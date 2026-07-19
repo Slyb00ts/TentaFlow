@@ -56,6 +56,18 @@ pub struct Engine {
     /// `None`        — no constraint.
     #[serde(default)]
     pub dgx_spark: Option<bool>,
+    /// `Some(true)` when the engine supports multi-node tensor-parallel deploy
+    /// across a cluster. The unified deploy wizard offers it as a cluster target.
+    #[serde(default)]
+    pub cluster_capable: Option<bool>,
+    /// Multi-node launch mode for cluster deploy. `None`/"ray" = Ray GCS on the
+    /// head + `vllm serve --distributed-executor-backend ray` exec'd on the head
+    /// once every worker joined. "vllm-mp" = vLLM native multi-node
+    /// (`--nnodes/--node-rank/--master-addr/--master-port`, headless workers,
+    /// worker-first ordering; the head's serve binds the torch TCPStore master
+    /// last) — required by runtimes without Ray, e.g. `vllm-dspark`.
+    #[serde(default)]
+    pub cluster_launch: Option<String>,
     pub default_port: u16,
     pub api: ApiKind,
     pub version: String,
@@ -74,6 +86,36 @@ pub struct Engine {
     /// "image"]`). Same fallback rules as the input list.
     #[serde(default)]
     pub output_modalities: Option<Vec<String>>,
+    /// Inference backend that actually serves this engine, when it is a shared
+    /// runtime rather than a bespoke server. `"vllm"` marks every vLLM-served
+    /// engine — generative LLMs AND the embed/rerank/VL pooling models — so a
+    /// single flag (not a hand-maintained id list) drives both the
+    /// `--gpu-memory-utilization` injection and the VRAM calculator/slider in the
+    /// deploy wizard. `None` = bespoke server (whisper, sherpa, custom HTTP).
+    #[serde(default)]
+    pub backend: Option<String>,
+}
+
+impl Engine {
+    /// True when this engine is served by CUDA vLLM and therefore accepts the
+    /// `--gpu-memory-utilization` budget. Excludes the Metal variant: vLLM on
+    /// Apple has no CUDA memory budget to set.
+    pub fn is_cuda_vllm(&self) -> bool {
+        is_cuda_vllm_backend(self.backend.as_deref(), &self.id)
+    }
+
+    /// True for any vLLM-served engine regardless of accelerator — drives the
+    /// GUI VRAM calculator/slider (Metal included; the calculator is informational
+    /// there even though the CUDA memory flag does not apply).
+    pub fn is_vllm(&self) -> bool {
+        self.backend.as_deref() == Some("vllm")
+    }
+}
+
+/// Pure rule behind [`Engine::is_cuda_vllm`], split out so it can be unit-tested
+/// without constructing a full `Engine`.
+pub(crate) fn is_cuda_vllm_backend(backend: Option<&str>, id: &str) -> bool {
+    backend == Some("vllm") && !id.ends_with("-metal")
 }
 
 /// Pojedynczy parametr silnika — wizard renderuje formularz na podstawie
@@ -438,6 +480,13 @@ pub struct DockerDeploy {
     /// Tag obrazu dostaje sufiks arch, wiec obrazy roznych arch nie koliduja.
     #[serde(default)]
     pub arch_variants: HashMap<String, DockerArchVariant>,
+    /// Silnik uruchamia llama-server z GGUF zamontowanym jako pojedynczy plik
+    /// `/data/models/model.gguf` (entrypoint pada gdy pliku brak). Przy deployu
+    /// Core pobiera GGUF presetu na host (cache modeli, idempotentnie) i montuje
+    /// go do kontenera + ustawia `MODEL_PATH`. Bez tego llama-server nie ma czego
+    /// zaladowac (odpowiednik ComfyUI `checkpoint_file`).
+    #[serde(default)]
+    pub gguf_model_mount: bool,
 }
 
 /// Build-args specyficzne dla jednej architektury GPU (sekcja
@@ -593,6 +642,21 @@ pub struct ModelPreset {
     /// montuje go do kontenerowego katalogu checkpointow.
     #[serde(default)]
     pub checkpoint_file: Option<String>,
+    /// Warianty kwantyzacji tego samego modelu (`[[model_preset.quant_variant]]`):
+    /// kazdy mapuje kwantyzacje na osobne repo HF. `repo`/`quantization` presetu =
+    /// wariant „standard". Wizard renderuje je jako wybor przy kalkulatorze VRAM i
+    /// podmienia `payload.model` na repo wybranego wariantu (+ przelicza wagi).
+    #[serde(default, rename = "quant_variant")]
+    pub quant_variants: Vec<QuantVariant>,
+}
+
+/// Jeden wariant kwantyzacji presetu — kwantyzacja + repo HF pod nia.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuantVariant {
+    pub quantization: String,
+    pub repo: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 /// vLLM self-quantization knobs for a `[[model_preset]]`. When `quantize` is
@@ -608,4 +672,19 @@ pub struct VllmPreset {
     /// Quantize the `speculator_repo` draft model to this scheme.
     #[serde(default)]
     pub quantize_draft: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_cuda_vllm_backend;
+
+    #[test]
+    fn cuda_vllm_backend_matches_vllm_except_metal() {
+        assert!(is_cuda_vllm_backend(Some("vllm"), "vllm"));
+        assert!(is_cuda_vllm_backend(Some("vllm"), "vllm-spark"));
+        assert!(is_cuda_vllm_backend(Some("vllm"), "nemotron-embed-vl"));
+        assert!(!is_cuda_vllm_backend(Some("vllm"), "vllm-metal"));
+        assert!(!is_cuda_vllm_backend(None, "whisper"));
+        assert!(!is_cuda_vllm_backend(Some("sherpa"), "sherpa-onnx"));
+    }
 }

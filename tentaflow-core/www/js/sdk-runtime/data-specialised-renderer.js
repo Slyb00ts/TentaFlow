@@ -229,11 +229,16 @@ export function parseDimensionToken(raw, ctx) {
   const VALUE_KINDS = { px: 'px', vh: 'vh', vw: 'vw', fr: 'fr', percent: '%', spacing: null };
   if (kind in VALUE_KINDS) {
     if (keys.length !== 2 || !('value' in raw)) throw new TypeError(`${ctx}: kind=${kind} requires exactly {kind, value}`);
-    const v = raw.value;
+    const raw_v = raw.value;
     if (kind === 'spacing') {
-      if (!SPACING_TOKENS.has(v)) throw new TypeError(`${ctx}: invalid spacing token '${v}'`);
-      return `var(--tf-space-${v})`;
+      if (!SPACING_TOKENS.has(raw_v)) throw new TypeError(`${ctx}: invalid spacing token '${raw_v}'`);
+      return `var(--tf-space-${raw_v})`;
     }
+    // CBOR decodes an unsigned dimension value as BigInt; normalize to Number
+    // in the safe u32 range so px/vh/vw/fr/% tokens accept it uniformly.
+    const v = typeof raw_v === 'bigint' && raw_v >= 0n && raw_v <= 0xFFFFFFFFn
+      ? Number(raw_v)
+      : raw_v;
     if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v !== Math.floor(v)) {
       throw new TypeError(`${ctx}: value for kind=${kind} must be non-negative integer`);
     }

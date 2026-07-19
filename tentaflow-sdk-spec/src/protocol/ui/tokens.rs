@@ -89,6 +89,7 @@ string_enum! {
         Body = "body",
         BodyStrong = "body_strong",
         Caption = "caption",
+        CaptionStrong = "caption_strong",
         Overline = "overline",
         Code = "code",
         Mono = "mono",
@@ -138,6 +139,29 @@ string_enum! {
         Medium = "medium",
         Elevated = "elevated",
         Floating = "floating",
+        AccentGlow = "accent_glow",
+    }
+}
+
+string_enum! {
+    /// Split divider rendering (catalog §3 0x0105). `handle` is the default
+    /// draggable bar; `line` renders a hairline (still draggable when
+    /// `resizable`); `none` hides the divider and separates the panes with a
+    /// standard gap instead.
+    pub enum SplitDivider {
+        Handle = "handle",
+        Line = "line",
+        None = "none",
+    }
+}
+
+string_enum! {
+    /// Text-field visual variant (catalog §5 0x0301/0x0302). `outlined` is the
+    /// default framed field; `ghost` drops border/background/padding so the
+    /// control blends into surrounding content (e.g. inline title editing).
+    pub enum InputVariant {
+        Outlined = "outlined",
+        Ghost = "ghost",
     }
 }
 
@@ -267,6 +291,21 @@ mod tests {
     fn navigate_target_wire_strings_match_doc() {
         assert_eq!(NavigateTarget::NewTab.as_str(), "new_tab");
         assert_eq!(NavigateTarget::SystemBrowser.as_str(), "system_browser");
+    }
+
+    #[test]
+    fn shadow_token_roundtrip_all_variants() {
+        for v in [
+            ShadowToken::None,
+            ShadowToken::Subtle,
+            ShadowToken::Medium,
+            ShadowToken::Elevated,
+            ShadowToken::Floating,
+            ShadowToken::AccentGlow,
+        ] {
+            roundtrip(v);
+        }
+        assert_eq!(ShadowToken::AccentGlow.as_str(), "accent_glow");
     }
 }
 
@@ -798,6 +837,16 @@ string_enum! {
 }
 
 string_enum! {
+    /// `ProgressBar` fill orientation (catalog §4 0x021D). `Horizontal` is the
+    /// default (fill grows left→right); `Vertical` is a narrow column whose
+    /// fill grows bottom→top, used by ranked-score columns.
+    pub enum ProgressOrientation {
+        Horizontal = "horizontal",
+        Vertical = "vertical",
+    }
+}
+
+string_enum! {
     /// `RatingDisplay` visual variant (catalog §4 0x021E).
     pub enum RatingVariant {
         Stars = "stars",
@@ -1274,6 +1323,25 @@ string_enum! {
 }
 
 string_enum! {
+    /// `AudioCapture.mode` (catalog §8 0x0612).
+    pub enum AudioCaptureMode {
+        PushToTalk = "push_to_talk",
+        Vad = "vad",
+    }
+}
+
+string_enum! {
+    /// `AudioCapture.variant` (catalog §8 0x0612). `standalone` is the vertical
+    /// column (waves framing the mic, label + status below); `docked` is the
+    /// horizontal strip for recording docks (mic on the left, one waveform on
+    /// the right, no idle label — status only when non-empty).
+    pub enum AudioCaptureVariant {
+        Standalone = "standalone",
+        Docked = "docked",
+    }
+}
+
+string_enum! {
     /// `FpsCounter.variant` (catalog §8 0x060E).
     pub enum FpsVariant {
         Minimal = "minimal",
@@ -1342,6 +1410,39 @@ string_enum! {
         StrictOrigin = "strict-origin",
         StrictOriginWhenCrossOrigin = "strict-origin-when-cross-origin",
         UnsafeUrl = "unsafe-url",
+    }
+}
+
+string_enum! {
+    /// Semantic border color token for `BorderSide` (catalog §1.5 BoxStyle).
+    /// Renderer maps to theme CSS vars (`--tf-border`, `--tf-accent-1`, …).
+    pub enum BorderColor {
+        Default = "default",
+        Hover = "hover",
+        Accent = "accent",
+        Success = "success",
+        Warning = "warning",
+        Danger = "danger",
+        Transparent = "transparent",
+    }
+}
+
+string_enum! {
+    /// Border line style for `BorderSide` (catalog §1.5 BoxStyle).
+    pub enum BorderLineStyle {
+        Solid = "solid",
+        Dashed = "dashed",
+        None = "none",
+    }
+}
+
+string_enum! {
+    /// CSS overflow behavior for `BoxStyle` (catalog §1.5).
+    pub enum Overflow {
+        Visible = "visible",
+        Hidden = "hidden",
+        Auto = "auto",
+        Scroll = "scroll",
     }
 }
 

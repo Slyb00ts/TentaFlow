@@ -176,6 +176,11 @@ pub struct StreamToken {
     // faz slotu. Ustawiane wyłącznie na tokenie finalnym; 0.0 = brak pomiaru.
     pub prefill_tps: f32,
     pub completion_tps: f32,
+    // Czas do pierwszego tokena (ms) mierzony w SILNIKU jako granica faz slotu:
+    // od startu requestu (przypisanie slotu) do przejścia w fazę dekodowania.
+    // To realny TTFT silnika, niezależny od buforowania kanału między silnikiem a
+    // konsumentem. Ustawiany wyłącznie na tokenie finalnym; 0 = brak pomiaru.
+    pub ttft_ms: u32,
 }
 
 // Strumień wyjściowy jednego requestu. Konsument odbiera tokeny w tempie własnym;
@@ -1533,6 +1538,7 @@ fn reject_job(
         prompt_tokens: 0,
         prefill_tps: 0.0,
         completion_tps: 0.0,
+        ttft_ms: 0,
     });
     inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
 }
@@ -1561,6 +1567,7 @@ fn emit_text_until(slot: &mut Slot, target: usize) {
                 prompt_tokens: 0,
                 prefill_tps: 0.0,
                 completion_tps: 0.0,
+                ttft_ms: 0,
             },
         );
     }
@@ -1760,6 +1767,10 @@ fn finish_slot(
     } else {
         0.0
     };
+    // TTFT silnika = czas fazy prefill (start requestu → pierwszy token dekodowania).
+    // To ta sama granica co prefill_secs, więc TTFT i prefill_tps są spójne i wolne od
+    // zniekształceń zegara ściennego konsumenta (queue, buforowanie kanału).
+    let ttft_ms = (prefill_secs * 1000.0).round() as u32;
     slot.pending.push_back(StreamToken {
         text: String::new(),
         is_final: true,
@@ -1769,6 +1780,7 @@ fn finish_slot(
         prompt_tokens: slot.prompt.len() as u32,
         prefill_tps,
         completion_tps,
+        ttft_ms,
     });
     flush_pending(slot, memory, inflight);
 }

@@ -1,0 +1,343 @@
+[addon]
+id = "notes"
+name = "Notatki"
+version = "0.4.0"
+description = "Notatki z lokalną analizą treści: lista, edytor z autozapisem, dyktowanie głosowe (STT przez alias notes-stt), granularne udostępnianie (osoby, grupy, organizacja), auto-graf powiązań (encje z LLM, podobieństwo semantyczne z embeddingów, sugestie scalania duplikatów encji), hybrydowe wyszukiwanie (wektory + graf, streamowana odpowiedź LLM) oraz bloki Flow Buildera i narzędzia LLM."
+category = "productivity"
+keywords = ["notes", "notatki", "graf", "encje", "wiedza", "dyktowanie"]
+author = "TentaFlow"
+license = "Apache-2.0"
+homepage = ""
+icon = "file-text"
+runtime = "wasmtime"
+platforms = ["linux", "macos", "windows", "ios", "android"]
+wasm_file = "addon.wasm"
+
+# --- Uprawnienia ---
+
+[[permission]]
+id = "ui"
+display_name = "Interfejs Notatek"
+description = "Renderuje panel Notatek (lista, edytor, powiazania) w launcherze TentaFlow."
+risk = "low"
+
+[[permission]]
+id = "sql.read"
+display_name = "Odczyt notatek"
+description = "Czyta notatki, tagi, udostepnienia, encje i powiazania z bazy addonu."
+risk = "medium"
+
+[[permission]]
+id = "sql.write"
+display_name = "Zapis notatek"
+description = "Tworzy i aktualizuje notatki, tagi, udostepnienia, encje i powiazania."
+risk = "medium"
+
+[[permission]]
+id = "state.read"
+display_name = "Odczyt stanu sesji"
+description = "Czyta ulotny stan sesji panelu (filtr zakresu, fraza wyszukiwania, aktywna notatka)."
+risk = "low"
+
+[[permission]]
+id = "state.write"
+display_name = "Zapis stanu sesji"
+description = "Zapisuje ulotny stan sesji panelu (filtr zakresu, fraza wyszukiwania, aktywna notatka)."
+risk = "low"
+
+[[permission]]
+id = "directory.read"
+display_name = "Katalog uzytkownikow"
+description = "Czyta uzytkownikow, grupy i organizacje, aby rozstrzygac dostep do udostepnionych notatek i pokazywac autorow."
+risk = "low"
+
+[[permission]]
+id = "user_info"
+display_name = "Tozsamosc uzytkownika"
+description = "Odczytuje tozsamosc biezacego uzytkownika, aby pokazac jego notatki i egzekwowac zakresy dostepu."
+risk = "low"
+
+[[permission]]
+id = "vector.read"
+display_name = "Wyszukiwanie wektorowe"
+description = "k-NN nad przestrzeniami 'notes' (podobienstwo notatek) i 'entities' (podobienstwo nazw encji)."
+risk = "low"
+
+[[permission]]
+id = "vector.write"
+display_name = "Zapis wektorow"
+description = "Upsert/delete wektorow chunkow notatek ('notes') i nazw encji ('entities')."
+risk = "medium"
+
+[[permission]]
+id = "graph.read"
+display_name = "Odczyt grafu powiazan"
+description = "Odczyt notatek i encji z kolekcji grafowej 'notes_kg'."
+risk = "low"
+
+[[permission]]
+id = "graph.write"
+display_name = "Zapis grafu powiazan"
+description = "Materializacja notatek, encji i krawedzi (mentions, similar_to) do 'notes_kg' przez outbox."
+risk = "medium"
+
+[[permission]]
+id = "llm.generate"
+display_name = "Ekstrakcja encji / embeddingi"
+description = "Wola model embeddingow (notes-embeddings) i LLM ekstrakcji encji (notes-llm) przez host."
+risk = "medium"
+
+[[permission]]
+id = "alias.read"
+display_name = "Odczyt aliasow modeli"
+description = "Sprawdza dostepnosc aliasow notes-llm / notes-embeddings przed analiza."
+risk = "low"
+
+[[permission]]
+id = "stt"
+display_name = "Transkrypcja mowy"
+description = "Zamienia nagrana wypowiedz na tekst przez model podpiety do aliasu notes-stt (tryb dyktowania notatki)."
+risk = "medium"
+
+[[permission]]
+id = "audio.capture"
+display_name = "Przechwytywanie mikrofonu"
+description = "Nagrywa wypowiedzi z mikrofonu w trybie dyktowania notatki."
+risk = "high"
+
+[[permission]]
+id = "document.read"
+display_name = "Odczyt nagran mikrofonu"
+description = "Czyta nagrana wypowiedz (WAV) ze schowka dokumentow, aby przekazac ja do transkrypcji STT."
+risk = "medium"
+
+[[permission]]
+id = "document.write"
+display_name = "Usuwanie nagran mikrofonu"
+description = "Kasuje nagranie WAV natychmiast po transkrypcji (retencja: nagrania glosu nie zalegaja w schowku dokumentow)."
+risk = "medium"
+
+[[permission]]
+id = "flow_blocks"
+display_name = "Bloki Flow Buildera"
+description = "Udostepnia wyszukiwanie, tworzenie, dopisywanie i powiazania notatek jako bloki flow (z ACL uzytkownika flow)."
+risk = "medium"
+
+# --- Aliasy modeli wystawiane przez addon ---
+# suggested_default jest pusty: swieza instalacja tworzy aliasy ODPIETE
+# (is_active=0), admin podpina modele recznie (Services -> Aliasy) — wzor rag.
+
+[[alias]]
+id = "notes-llm"
+display_name = "Notatki — ekstrakcja encji"
+methods = ["chat"]
+suggested_default = ""
+visibility = "private"
+
+[[alias]]
+id = "notes-embeddings"
+display_name = "Notatki — embeddingi"
+methods = ["embed"]
+suggested_default = ""
+visibility = "private"
+
+[[alias]]
+id = "notes-stt"
+display_name = "Notatki — dyktowanie (STT)"
+methods = ["stt"]
+suggested_default = ""
+visibility = "private"
+
+[[uses_alias]]
+id = "notes-llm"
+required = true
+reason = "Ekstrakcja encji (osoby, firmy, projekty, tematy) z tresci notatek."
+
+[[uses_alias]]
+id = "notes-embeddings"
+required = true
+reason = "Embeddingi chunkow notatek i nazw encji (podobienstwo semantyczne, scalanie duplikatow)."
+
+# Dyktowanie jest funkcja opcjonalna: bez podpietego aliasu przycisk mikrofonu
+# jest wylaczony z podpowiedzia konfiguracji, install nie jest blokowany.
+[[uses_alias]]
+id = "notes-stt"
+required = false
+reason = "Transkrypcja mowy w trybie dyktowania notatki."
+
+# --- Przestrzen wektorowa chunkow notatek ---
+# Wymiar deklaratywny (1024); realny wymiar bierze sie z DANYCH przy pierwszym
+# upsercie i jest seedowany do KV instancji (embed_dimensions) — wzor rag.
+
+[[vector_namespace]]
+name = "notes"
+dimensions = 1024
+distance = "cosine"
+data_class = "C"
+
+[[vector_namespace.fields]]
+name = "note_id"
+type = "str"
+indexed = true
+
+[[vector_namespace.fields]]
+name = "owner_id"
+type = "str"
+indexed = true
+
+[[vector_namespace.fields]]
+name = "chunk_index"
+type = "int"
+indexed = false
+
+# --- Przestrzen wektorowa nazw encji (kandydaci scalenia przez k-NN) ---
+
+[[vector_namespace]]
+name = "entities"
+dimensions = 1024
+distance = "cosine"
+data_class = "C"
+
+[[vector_namespace.fields]]
+name = "entity_id"
+type = "str"
+indexed = true
+
+[[vector_namespace.fields]]
+name = "entity_type"
+type = "str"
+indexed = true
+
+# --- Kolekcja grafowa: materializacja graph_outbox (SQLite = zrodlo prawdy) ---
+
+[[graph_collection]]
+name = "notes_kg"
+data_class = "C"
+
+[visibility]
+admin_only = false
+default_groups = []
+show_in_catalog = true
+
+[application]
+entry_panel = "main"
+title = "Notatki"
+icon = "file-text"
+description = "Notatki z auto-grafem powiazan i udostepnianiem."
+sort_order = 25
+
+[storage]
+sql = true
+sql_backends = ["sqlite"]
+sql_dialect = "sqlite"
+migrations_dir = "migrations"
+encryption = "none"
+scope = "org"
+
+[resources]
+memory_mb = 128
+# 200M jak rag: pipeline analizy (chunking + parsowanie JSON embeddingow/encji)
+# biegnie w wasm; same wywolania LLM/embed to host-fn i nie pala fuel.
+fuel_limit = 200000000
+storage_total_mb = 512
+llm_tokens_per_min = 200000
+
+[lifecycle]
+background = false
+auto_start = false
+
+# --- Narzedzia ---
+
+# Worker kolejki analizy — wolany przez Admin Scheduler (interval) ORAZ recznie.
+# Przetwarza do 5 notatek z analysis_queue (debounce 3 s od ostatniej edycji).
+[[tool]]
+id = "analyze_pending"
+display_name = "Analiza notatek w kolejce"
+description = "Przetwarza zalegle notatki z kolejki analizy (chunking, embeddingi, encje, powiazania). Batch do 5 notatek na wywolanie."
+keywords = ["notes", "analysis", "graph", "queue", "worker"]
+
+# --- Narzedzia LLM (tool-calling) — te same sciezki kodu co bloki flow ---
+
+[[tool]]
+id = "search_notes"
+display_name = "Szukaj w notatkach"
+description = "Hybrydowe wyszukiwanie w notatkach uzytkownika: podobienstwo semantyczne (embeddingi) polaczone z grafem powiazan (encje, linki). Zwraca tylko notatki dostepne dla uzytkownika."
+keywords = ["notes", "search", "notatki", "szukaj", "wiedza"]
+
+[[tool.parameter]]
+name = "query"
+param_type = "string"
+description = "Pytanie lub fraza wyszukiwania w jezyku naturalnym."
+required = true
+
+[[tool.parameter]]
+name = "scope"
+param_type = "string"
+description = "Zakres: all (domyslnie), mine, group albo org."
+required = false
+
+[[tool.parameter]]
+name = "limit"
+param_type = "number"
+description = "Maksymalna liczba wynikow (1-12, domyslnie 8)."
+required = false
+
+[[tool]]
+id = "create_note"
+display_name = "Utworz notatke"
+description = "Tworzy nowa notatke uzytkownika z tytulem, trescia i opcjonalnymi tagami. Notatka trafia do kolejki analizy auto-grafu."
+keywords = ["notes", "create", "notatka", "utworz"]
+
+[[tool.parameter]]
+name = "title"
+param_type = "string"
+description = "Tytul notatki."
+required = false
+
+[[tool.parameter]]
+name = "content"
+param_type = "string"
+description = "Tresc notatki (markdown)."
+required = true
+
+[[tool.parameter]]
+name = "tags"
+param_type = "array"
+description = "Lista tagow (opcjonalna, max 32)."
+required = false
+
+[[tool]]
+id = "append_note"
+display_name = "Dopisz do notatki"
+description = "Dopisuje tresc na koncu istniejacej notatki. Wymaga uprawnienia do edycji tej notatki."
+keywords = ["notes", "append", "notatka", "dopisz"]
+
+[[tool.parameter]]
+name = "note_id"
+param_type = "string"
+description = "Identyfikator notatki."
+required = true
+
+[[tool.parameter]]
+name = "content"
+param_type = "string"
+description = "Tresc do dopisania na koncu notatki."
+required = true
+
+[[tool]]
+id = "get_related_notes"
+display_name = "Powiazane notatki"
+description = "Zwraca notatki powiazane z podana notatka przez graf powiazan (glebokosc 1-2) oraz jej wykryte encje. Tylko notatki dostepne dla uzytkownika."
+keywords = ["notes", "related", "graf", "powiazania", "encje"]
+
+[[tool.parameter]]
+name = "note_id"
+param_type = "string"
+description = "Identyfikator notatki wyjsciowej."
+required = true
+
+[[tool.parameter]]
+name = "depth"
+param_type = "number"
+description = "Glebokosc grafu: 1 (bezposrednie) albo 2 (powiazania powiazan)."
+required = false

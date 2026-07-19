@@ -17,6 +17,8 @@ icon = "vision"
 default_port = 0
 api = "custom"
 version = "mnv4-2026"
+service_surfaces = ["camera_cv"]
+input_modalities = ["image"]
 
 [deploy.native]
 platforms = ["linux", "macos", "windows"]
@@ -26,5 +28,5 @@ feature_flag = "inference-vision-gpu"
 [[model_preset]]
 id = "nalepka-stan-mnv4"
 display_name = "Nalepka Stan (MobileNetV4, 5 klas)"
-repo = "https://models.tentaflow.local/orlen/nalepka-stan/v1"
+repo = "https://models.tentaflow.local/adr/nalepka-stan/v1"
 recommended = true

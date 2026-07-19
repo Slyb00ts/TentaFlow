@@ -40,9 +40,13 @@ const CatalogScreen = {
   render() {
     return `<div class="catalog-shell" id="catalog-root"></div>`;
   },
-  async mount() {
+  async mount(params) {
     await Manifest.init();
     await loadTargets();
+    // Prescoped target (np. "Wdróż model" ze strony klastra) — otwiera katalog
+    // od razu na wybranym targecie, z pominięciem target pickera. "Zmień" nadal
+    // działa, bo loadTargets zawsze wypełnia nodes/clusters.
+    if (params && params.target) target = params.target;
     renderRoot();
   },
   unmount() {
@@ -366,13 +370,22 @@ function renderProviderTab(provider) {
         ? I18n.t(`category.${cat}`)
         : cat.toUpperCase();
 
-      groupHtml += `
-        <h3 class="catalog-section-title">${escapeHtml(categoryLabel)} <span class="section-count">${cardCount}</span></h3>
-        <div class="catalog-grid">
-          ${engines.map((e) => renderEngineCard(e, targetOs, target)).join('')}
-          ${featured.map((f) => renderFeaturedCard(f.engine, f.preset, targetOs, target)).join('')}
-        </div>
+      const section = (label, count, cardsHtml) => `
+        <h3 class="catalog-section-title">${escapeHtml(label)} <span class="section-count">${count}</span></h3>
+        <div class="catalog-grid">${cardsHtml}</div>
       `;
+      const enginesHtml = engines.map((e) => renderEngineCard(e, targetOs, target)).join('');
+      const featuredHtml = featured.map((f) => renderFeaturedCard(f.engine, f.preset, targetOs, target)).join('');
+
+      if (cat === 'llm') {
+        // Rozdzial: same silniki (backendy vLLM/llama.cpp/MLX) -> "Silniki";
+        // prekonfigurowane presety modeli (Bielik, DeepSeek, Gemma-4) -> "Modele
+        // jezykowe". Presety i tak sa osobnymi kafelkami, wiec to naturalny podzial.
+        if (engines.length) groupHtml += section(I18n.t('category.engines'), engines.length, enginesHtml);
+        if (featured.length) groupHtml += section(categoryLabel, featured.length, featuredHtml);
+      } else {
+        groupHtml += section(categoryLabel, cardCount, enginesHtml + featuredHtml);
+      }
     }
     if (groupCount > 0) {
       html += `
@@ -471,7 +484,12 @@ function bindCards(host) {
     const presetId = btn?.dataset.presetId || card?.dataset.presetId || null;
     if (!engineId || !target) return;
     if (target.kind === 'cluster') {
-      toast(I18n.t('catalog.cluster_not_supported'), 'warning');
+      const service = Manifest.byId(engineId);
+      if (!Manifest.isClusterCapable(service)) {
+        toast(I18n.t('catalog.cluster_not_supported'), 'warning');
+        return;
+      }
+      openDeployWizard(engineId, { isCluster: true, clusterId: target.id, presetId });
       return;
     }
     openDeployWizard(engineId, { nodeId: target.id, hostOs: target.os, presetId });

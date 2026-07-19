@@ -52,6 +52,12 @@ let searchFilter = '';
 // audio. engineCache wypelniany raz przy mount() z ApiBinary modelListRequest.
 let faceHandle = null;
 let engineCache = { stt: [], tts: [] };
+// First chat-capable model id from the registry. Sent as `modelId` so a flow
+// whose llm node has NO pinned model (seeded "Default Chat" / "Agent Run")
+// resolves via envelope.meta['model']; flows WITH a pinned model ignore it
+// (the llm adapter prefers node config over meta). Empty when no chat model
+// exists — the flow then surfaces the honest "no model" error.
+let defaultChatModel = '';
 // Lista flow usera — tryb audio odpala wybrany flow po ID (z jego blokami).
 let flowCache = [];
 let escKeyHandler = null;
@@ -300,18 +306,21 @@ function renderPerfFooter(perf) {
   const decodeTps = Number(perf.decodeTps || 0);
   const ttftMs = Number(perf.ttftMs || 0);
   const prefillTps = Number(perf.prefillTps || 0);
-  if (!completionTokens && !decodeTps && !ttftMs && !prefillTps) return '';
+  const totalMs = Number(perf.totalMs || 0);
+  if (!completionTokens && !decodeTps && !ttftMs && !prefillTps && !totalMs) return '';
 
   const lblTok = escapeHtml(I18n.t('chat.perf_tokens') || 'tok');
   const lblDecode = escapeHtml(I18n.t('chat.perf_decode') || 'tok/s');
   const lblTtft = escapeHtml(I18n.t('chat.perf_ttft') || 'TTFT');
   const lblPrefill = escapeHtml(I18n.t('chat.perf_prefill') || 'prefill');
+  const lblTotal = escapeHtml(I18n.t('chat.perf_total') || 'łącznie');
 
   const parts = [];
   if (completionTokens) parts.push(`${completionTokens} ${lblTok}`);
   if (decodeTps) parts.push(`${Math.round(decodeTps)} ${lblDecode}`);
   if (ttftMs) parts.push(`${lblTtft} ${Math.round(ttftMs)} ms`);
   if (prefillTps) parts.push(`${lblPrefill} ${Math.round(prefillTps)} ${lblDecode}`);
+  if (totalMs) parts.push(`${lblTotal} ${(totalMs / 1000).toFixed(totalMs < 10000 ? 2 : 1)} s`);
 
   return `<div class="bubble-perf">${parts.join(' · ')}</div>`;
 }
@@ -856,7 +865,10 @@ function sendMessageInternal(text, opts = {}) {
   // Głosowe wypowiedzi idą osobno przez sendVoiceUtterance (FlowInvoke).
   ApiBinary.subscribe(
     'chatStreamRequest',
-    { modelId: '', userMessage: text, flowId },
+    // conv.id is the flow session id — lets conversation_history / memory nodes
+    // in the selected flow key off the conversation (Agent flows require it).
+    // defaultChatModel only fills flows whose llm node has no pinned model.
+    { modelId: defaultChatModel, userMessage: text, flowId, sessionId: conv.id },
     {
       onChunk: (body) => {
         if (body.variant === 'ChatStreamChunk') {
@@ -886,6 +898,7 @@ function sendMessageInternal(text, opts = {}) {
             ttftMs: Number(endBody.ttftMs ?? endBody.ttft_ms ?? 0),
             prefillTps: Number(endBody.prefillTps ?? endBody.prefill_tps ?? 0),
             decodeTps: Number(endBody.decodeTps ?? endBody.decode_tps ?? 0),
+            totalMs: Number(endBody.totalMs ?? endBody.total_ms ?? 0),
           };
         }
         conv.updatedAt = Date.now();
@@ -1419,9 +1432,12 @@ const ChatScreen = {
 
       engineCache.stt = list.filter((m) => catOf(m) === 'stt');
       engineCache.tts = list.filter((m) => catOf(m) === 'tts');
+      const chatModel = list.find((m) => catOf(m) === 'chat' || catOf(m) === 'llm');
+      defaultChatModel = chatModel ? String(chatModel.id || chatModel.name || '') : '';
     } catch {
       engineCache.stt = [];
       engineCache.tts = [];
+      defaultChatModel = '';
     }
 
     // Lista flow do pickera trybu audio (user wybiera swój flow z blokami).

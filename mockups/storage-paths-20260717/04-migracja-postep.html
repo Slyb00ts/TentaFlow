@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<!-- =============================================================================
+     Plik: 04-migracja-postep.html
+     Opis: Migracja na żywo — pionowa oś kroków (kropki 1:1 z wizard-step-dot
+           z kreatora deploy): wstrzymanie usług → przenoszenie z paskiem
+           postępu → przełączenie ścieżki → wznowienie. Animacja odtwarza się
+           automatycznie i można ją powtórzyć przyciskiem w stopce.
+     ============================================================================= -->
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>Magazyn danych — migracja w toku</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute"><defs>
+  <symbol id="i-move" viewBox="0 0 24 24"><polyline points="5 9 2 12 5 15"/><polyline points="9 5 12 2 15 5"/><polyline points="15 19 12 22 9 19"/><polyline points="19 9 22 12 19 15"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="12" y1="2" x2="12" y2="22"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+  <symbol id="i-spinner" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-6.22-8.56"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">04</span>
+    <h2>Migracja danych na żywo — bez restartu aplikacji</h2>
+    <div class="desc">Kroki jak w kreatorze deploy (te same kropki). Usługi zmieniają stan na pigułkach, przenoszenie ma pasek postępu z plikiem i prędkością. Animacja startuje sama.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="modal-backdrop" style="align-items:center; min-height:620px;">
+      <div class="tf-window" style="width:560px">
+        <div class="tf-window-titlebar">
+          <svg class="icon" style="color:var(--accent-2)"><use href="#i-move"/></svg><span id="migTitle">Migracja danych — Modele</span>
+          <span class="badge-pill mono" id="migEta" style="margin-left:8px">~2 min</span>
+        </div>
+        <div class="tf-window-body">
+
+          <div class="mig-steps" id="steps">
+            <div class="mig-step" data-step="0">
+              <div class="rail"><i></i></div>
+              <div class="wizard-step-dot">1</div>
+              <div class="binfo">
+                <div class="btitle">Wstrzymanie usług zależnych</div>
+                <div class="bsub">4 usługi korzystają z katalogu modeli</div>
+                <div class="svc-pills">
+                  <span class="status-pill muted" data-svc>vLLM — Qwen3.6-27B</span>
+                  <span class="status-pill muted" data-svc>llama.cpp — Bielik-11B</span>
+                  <span class="status-pill muted" data-svc>Whisper STT</span>
+                  <span class="status-pill muted" data-svc>jina-embed</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="mig-step" data-step="1">
+              <div class="rail"><i></i></div>
+              <div class="wizard-step-dot">2</div>
+              <div class="binfo">
+                <div class="btitle">Przenoszenie danych</div>
+                <div class="bsub"><span class="mono">186,2 GB</span> → <span class="mono">/mnt/storage/tentaflow-models</span></div>
+                <div class="prog" id="prog" style="display:none"><i id="progFill"></i></div>
+                <div class="prog-meta" id="progMeta" style="display:none">
+                  <span class="file" id="progFile">hub/models--Qwen--Qwen3.6-27B/model-00001.safetensors</span>
+                  <span><span class="pct" id="progPct">0%</span> · <span id="progSpeed">1,8 GB/s</span></span>
+                </div>
+              </div>
+            </div>
+
+            <div class="mig-step" data-step="2">
+              <div class="rail"><i></i></div>
+              <div class="wizard-step-dot">3</div>
+              <div class="binfo">
+                <div class="btitle">Przełączenie ścieżki i weryfikacja</div>
+                <div class="bsub">Aktualizacja konfiguracji węzła, kontrola kompletności plików, zwolnienie starej lokalizacji</div>
+              </div>
+            </div>
+
+            <div class="mig-step" data-step="3">
+              <div class="rail"><i></i></div>
+              <div class="wizard-step-dot">4</div>
+              <div class="binfo">
+                <div class="btitle">Wznowienie usług</div>
+                <div class="bsub">Usługi startują już na nowym katalogu</div>
+                <div class="svc-pills">
+                  <span class="status-pill muted" data-svc2>vLLM — Qwen3.6-27B</span>
+                  <span class="status-pill muted" data-svc2>llama.cpp — Bielik-11B</span>
+                  <span class="status-pill muted" data-svc2>Whisper STT</span>
+                  <span class="status-pill muted" data-svc2>jina-embed</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="alert info" style="margin:14px 0 6px">
+            <svg class="icon"><use href="#i-info"/></svg>
+            <div><strong>Aplikacja działa dalej</strong> — migracja odbywa się w tle, bez restartu. Okno można ukryć; postęp pozostaje widoczny na pasku statusu.</div>
+          </div>
+        </div>
+        <div class="tf-window-footer">
+          <button class="btn btn-secondary" id="btnReplay"><svg class="icon icon-sm"><use href="#i-refresh"/></svg>Odtwórz animację</button>
+          <div class="spacer"></div>
+          <button class="btn btn-ghost">Ukryj — kontynuuj w tle</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script>
+const steps = document.querySelectorAll('.mig-step');
+const svcs = document.querySelectorAll('[data-svc]');
+const svcs2 = document.querySelectorAll('[data-svc2]');
+const files = [
+  'hub/models--Qwen--Qwen3.6-27B/model-00001.safetensors',
+  'hub/models--Qwen--Qwen3.6-27B/model-00003.safetensors',
+  'huggingface/speakleash/Bielik-11B/bielik-q4_k_s.gguf',
+  'audio/silero_vad.onnx',
+  'vision/yolov8n.onnx',
+];
+let timers = [];
+
+function dot(step, state) {
+  const d = step.querySelector('.wizard-step-dot');
+  d.classList.remove('active', 'done');
+  if (state === 'active') { d.classList.add('active'); d.innerHTML = '<svg class="icon icon-sm spin-ico"><use href="#i-spinner"/></svg>'; }
+  else if (state === 'done') { d.classList.add('done'); d.innerHTML = '<svg class="icon icon-sm"><use href="#i-check"/></svg>'; }
+  else d.textContent = String(Number(step.dataset.step) + 1);
+  step.classList.remove('active', 'done');
+  if (state) step.classList.add(state);
+}
+
+function pill(el, cls, txt) { el.className = 'status-pill ' + cls; if (txt) el.dataset.state = txt; }
+
+function reset() {
+  timers.forEach(clearTimeout); timers = [];
+  steps.forEach(s => dot(s, null));
+  svcs.forEach(p => pill(p, 'muted'));
+  svcs2.forEach(p => pill(p, 'muted'));
+  document.getElementById('prog').style.display = 'none';
+  document.getElementById('progMeta').style.display = 'none';
+  document.getElementById('progFill').style.width = '0%';
+  document.getElementById('progPct').textContent = '0%';
+  document.getElementById('migTitle').textContent = 'Migracja danych — Modele';
+  document.getElementById('migEta').textContent = '~2 min';
+}
+
+function at(ms, fn) { timers.push(setTimeout(fn, ms)); }
+
+function run() {
+  reset();
+  dot(steps[0], 'active');
+  svcs.forEach((p, i) => at(400 + i * 350, () => pill(p, 'warn')));
+  at(2000, () => {
+    dot(steps[0], 'done'); dot(steps[1], 'active');
+    document.getElementById('prog').style.display = 'block';
+    document.getElementById('progMeta').style.display = 'flex';
+    let pct = 0;
+    const iv = setInterval(() => {
+      pct = Math.min(100, pct + 2 + Math.random() * 5);
+      document.getElementById('progFill').style.width = pct + '%';
+      document.getElementById('progPct').textContent = Math.floor(pct) + '%';
+      document.getElementById('progSpeed').textContent = (1.6 + Math.random() * 0.6).toFixed(1).replace('.', ',') + ' GB/s';
+      document.getElementById('progFile').textContent = files[Math.floor(pct / 100 * files.length) % files.length];
+      const left = Math.ceil((100 - pct) / 55 * 60);
+      document.getElementById('migEta').textContent = left > 0 ? '~' + left + ' s' : 'finisz';
+      if (pct >= 100) {
+        clearInterval(iv);
+        dot(steps[1], 'done'); dot(steps[2], 'active');
+        at(1300, () => {
+          dot(steps[2], 'done'); dot(steps[3], 'active');
+          svcs2.forEach((p, i) => at(300 + i * 350, () => pill(p, 'ok')));
+          at(1900, () => {
+            dot(steps[3], 'done');
+            document.getElementById('migTitle').textContent = 'Migracja zakończona';
+            document.getElementById('migEta').textContent = '1 min 47 s';
+          });
+        });
+      }
+    }, 120);
+    timers.push(iv);
+  });
+}
+
+document.getElementById('btnReplay').addEventListener('click', run);
+run();
+</script>
+</body>
+</html>

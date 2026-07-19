@@ -68,7 +68,7 @@ const BACKGROUND_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 /// Odswiezanie odbywa sie w tle co 5 minut oraz natychmiast po zmianie z UI.
 ///
 /// Hierarchia sprawdzania (trzystanowy grant_mode: allow/deny/inherit):
-/// 1. Admin bypass (user w grupie "admins")
+/// 1. Admin bypass (rola "admin"/flaga is_admin LUB grupa "admins")
 /// 2. User explicit: allow → Granted; deny → Denied; inherit → nastepny poziom
 /// 3. Group explicit: dowolna deny → Denied; dowolna allow → Granted; wszystkie inherit → nastepny
 /// 4. Default (addon_permission_defaults): allow → Granted; deny → Denied
@@ -119,7 +119,7 @@ impl PermissionChecker {
     ) -> PermissionResult {
         self.cache_lookups.fetch_add(1, Ordering::Relaxed);
 
-        // 1. Admin bypass — sprawdz z cache listy adminow
+        // 1. Admin bypass — cache adminow (rola admin/is_admin lub grupa admins)
         {
             let admins = self.admin_cache.load();
             if admins.iter().any(|a| a == user_id) {
@@ -158,6 +158,15 @@ impl PermissionChecker {
 
         // Brak wpisu per-user, per-group i default — deny-by-default
         PermissionResult::NotConfigured
+    }
+
+    /// True gdy `user_id` jest adminem (rola "admin"/is_admin lub grupa
+    /// "admins") — ta sama lista, ktorej `check` uzywa do admin bypass.
+    /// Pozwala host functions jawnie bramkowac
+    /// operacje admin-only (np. edycje wspoldzielonych zasobow org), zamiast
+    /// polegac wylacznie na per-user grantach uprawnienia.
+    pub fn is_admin(&self, user_id: &str) -> bool {
+        self.admin_cache.load().iter().any(|a| a == user_id)
     }
 
     /// Zaladuj WSZYSTKIE uprawnienia z DB do cache.
@@ -216,23 +225,6 @@ impl PermissionChecker {
         debug!("Cache uprawnien odswiezony dla addonu '{}'", addon_id);
     }
 
-    /// Odswierz liste adminow.
-    /// Wywolywane po zmianie przynaleznosci do grup.
-    pub fn refresh_admins(&self) {
-        let conn = match self.db.read() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("refresh_admins: nie mozna zablokowac DB: {}", e);
-                return;
-            }
-        };
-
-        let admins = Self::load_admins(&conn);
-        self.admin_cache.store(Arc::new(admins));
-
-        debug!("Cache listy adminow odswiezony");
-    }
-
     /// Uruchom background task odswiezajacy cache co 5 minut.
     /// Nie blokuje — dziala w tle jako tokio task.
     pub fn start_background_refresh(self: &Arc<Self>) {
@@ -267,12 +259,21 @@ impl PermissionChecker {
     // Metody prywatne — ladowanie z DB
     // =========================================================================
 
-    /// Laduje liste user_id adminow (uzytkownikow w grupie "admins")
+    /// Laduje liste user_id adminow z admin-bypass do uprawnien addonow.
+    /// Admin = kanoniczna definicja reszty core (`user_accounts.role='admin'`
+    /// lub flaga `is_admin`, patrz `dispatch::SessionAuthKind::Admin` i
+    /// `auth::acl::UserContext::is_admin`) LUB czlonkostwo w grupie `admins`.
+    /// UNION nie zaweza dotychczasowego dostepu grupowego — dodaje adminow po
+    /// roli, ktorzy wczesniej nie dostawali bypassu, mimo ze reszta systemu
+    /// traktowala ich jako adminow.
     fn load_admins(conn: &rusqlite::Connection) -> Vec<String> {
         let result = conn.prepare(
             "SELECT gm.user_id FROM group_members gm \
              JOIN user_groups g ON g.id = gm.group_id \
-             WHERE g.name = 'admins'",
+             WHERE g.name = 'admins' \
+             UNION \
+             SELECT id FROM user_accounts \
+             WHERE is_admin = 1 OR role = 'admin'",
         );
         let mut stmt = match result {
             Ok(s) => s,
@@ -1076,6 +1077,78 @@ platforms = []
             PermissionResult::Granted,
             "Admin powinien dostac Granted"
         );
+    }
+
+    #[test]
+    fn test_permission_checker_admin_bypass_by_role() {
+        // Admin po roli `user_accounts.role='admin'`, BEZ czlonkostwa w grupie
+        // 'admins' — dostaje bypass tak samo jak reszta core (SessionAuthKind).
+        let db = create_test_db();
+        let user_id = insert_test_user(&db, "role_admin_user");
+        {
+            let conn = db.write().unwrap();
+            conn.execute(
+                "UPDATE user_accounts SET role = 'admin' WHERE id = ?1",
+                rusqlite::params![user_id],
+            )
+            .expect("ustaw role admin");
+        }
+
+        let checker = PermissionChecker::new(db.clone());
+        checker.refresh_all();
+
+        assert_eq!(
+            checker.check("dowolny-addon", &user_id, "dowolne.uprawnienie", None),
+            PermissionResult::Granted,
+            "Admin po roli (spoza grupy 'admins') powinien dostac bypass"
+        );
+        assert!(
+            checker.is_admin(&user_id),
+            "is_admin musi tez uwzgledniac role admin"
+        );
+    }
+
+    #[test]
+    fn test_permission_checker_admin_bypass_by_is_admin_flag() {
+        // Flaga `is_admin=1` (rola moze zostac 'user') tez daje bypass — parytet
+        // z derywacja sesji w dashboard/server (`is_admin || role=='admin'`).
+        let db = create_test_db();
+        let user_id = insert_test_user(&db, "flag_admin_user");
+        {
+            let conn = db.write().unwrap();
+            conn.execute(
+                "UPDATE user_accounts SET is_admin = 1 WHERE id = ?1",
+                rusqlite::params![user_id],
+            )
+            .expect("ustaw is_admin");
+        }
+
+        let checker = PermissionChecker::new(db.clone());
+        checker.refresh_all();
+
+        assert_eq!(
+            checker.check("dowolny-addon", &user_id, "dowolne.uprawnienie", None),
+            PermissionResult::Granted,
+            "User z is_admin=1 powinien dostac bypass"
+        );
+    }
+
+    #[test]
+    fn test_permission_checker_non_admin_no_bypass() {
+        // Zwykly user (role='user', is_admin=0, poza grupa) NIE dostaje bypassu —
+        // fix nie moze rozszerzyc admina na wszystkich.
+        let db = create_test_db();
+        let user_id = insert_test_user(&db, "plain_user");
+
+        let checker = PermissionChecker::new(db.clone());
+        checker.refresh_all();
+
+        assert_eq!(
+            checker.check("dowolny-addon", &user_id, "dowolne.uprawnienie", None),
+            PermissionResult::NotConfigured,
+            "Zwykly user nie moze dostac admin bypass"
+        );
+        assert!(!checker.is_admin(&user_id));
     }
 
     #[test]

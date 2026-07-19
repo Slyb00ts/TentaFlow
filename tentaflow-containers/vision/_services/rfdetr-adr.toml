@@ -17,7 +17,7 @@ icon = "yolo"
 default_port = 0
 api = "custom"
 version = "base-2026"
-service_surfaces = ["documents"]
+service_surfaces = ["documents", "camera_cv"]
 input_modalities = ["image"]
 
 [deploy.native]
@@ -28,5 +28,5 @@ feature_flag = "inference-vision-gpu"
 [[model_preset]]
 id = "rfdetr-adr-base"
 display_name = "RF-DETR ADR (base, 17 klas)"
-repo = "https://models.tentaflow.local/orlen/rfdetr-adr/v1"
+repo = "https://models.tentaflow.local/adr/rfdetr-adr/v1"
 recommended = true

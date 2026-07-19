@@ -264,6 +264,17 @@ pub(crate) fn strip_hf_token(user_config: &serde_json::Value) -> serde_json::Val
 /// Config key holding a cloud external provider's API key (OpenAI, Anthropic, …).
 pub const API_KEY_CONFIG_KEY: &str = "api_key";
 
+/// Config key: manifest URL of another TentaFlow instance's `/models/manifest/…`
+/// endpoint (deploy wizard "Custom" bundle source). Per-deploy override that
+/// wins over the `vision_bundle_base_url` setting.
+pub const VISION_BUNDLE_URL_CONFIG_KEY: &str = "vision_bundle_url";
+
+/// Config key: API key authenticating the custom bundle manifest pull against
+/// an UNPAIRED instance. Encrypted at rest like `api_key` (see
+/// `encrypt_api_key_in_config`); the settings-level fallback is the secure
+/// setting of the same name.
+pub const VISION_BUNDLE_API_KEY_CONFIG_KEY: &str = "vision_bundle_api_key";
+
 /// Returns a copy of `user_config` with a plaintext `api_key` encrypted in place
 /// (`enc:…`). Unlike `hf_token` (which is stripped and resolved per-node from a
 /// secure setting), an external provider's key has no global setting to fall
@@ -277,19 +288,58 @@ pub fn encrypt_api_key_in_config(
 ) -> serde_json::Value {
     let mut out = user_config.clone();
     if let Some(map) = out.as_object_mut() {
-        if let Some(serde_json::Value::String(key)) = map.get(API_KEY_CONFIG_KEY) {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() && !trimmed.starts_with("enc:") {
-                if let Ok(encrypted) = settings_cipher.encrypt(trimmed) {
-                    map.insert(
-                        API_KEY_CONFIG_KEY.to_string(),
-                        serde_json::Value::String(encrypted),
-                    );
+        for config_key in [API_KEY_CONFIG_KEY, VISION_BUNDLE_API_KEY_CONFIG_KEY] {
+            if let Some(serde_json::Value::String(key)) = map.get(config_key) {
+                let trimmed = key.trim();
+                if !trimmed.is_empty() && !trimmed.starts_with("enc:") {
+                    if let Ok(encrypted) = settings_cipher.encrypt(trimmed) {
+                        map.insert(
+                            config_key.to_string(),
+                            serde_json::Value::String(encrypted),
+                        );
+                    }
                 }
             }
         }
     }
     out
+}
+
+/// Resolves the vision-bundle pull API key for an embedded camera-CV deploy:
+/// the per-deploy config value (decrypting the persisted `enc:` form with this
+/// node's cipher) wins over the org-wide secure setting
+/// `vision_bundle_api_key`. Returns `None` when neither is set — the pull then
+/// relies on a signed manifest URL or a public release dir.
+pub(crate) fn resolve_vision_bundle_api_key(
+    db: &DbPool,
+    settings_cipher: &crate::crypto::SettingsCipher,
+    user_config: &serde_json::Value,
+) -> Option<String> {
+    let from_config = user_config
+        .get(VISION_BUNDLE_API_KEY_CONFIG_KEY)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|raw| {
+            if raw.starts_with("enc:") {
+                settings_cipher.decrypt(raw).ok()
+            } else {
+                Some(raw.to_string())
+            }
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    from_config.or_else(|| {
+        crate::db::repository::get_setting_secure(
+            db,
+            VISION_BUNDLE_API_KEY_CONFIG_KEY,
+            settings_cipher,
+        )
+        .ok()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    })
 }
 
 pub fn create_deploy_job(
@@ -459,6 +509,7 @@ pub async fn deploy(
         DeployMethod::NativeEmbedded => Box::new(embedded::EmbeddedDeploy::new(
             manifest.clone(),
             user_config.clone(),
+            resolve_vision_bundle_api_key(db, settings_cipher, user_config),
             sink.clone(),
         )),
         DeployMethod::NativeBinary => Box::new(binary::BinaryDeploy::new(
@@ -631,7 +682,14 @@ pub async fn respawn(
 
     let mut strategy: Box<dyn DeployStrategy> = match deploy_method {
         DeployMethod::NativeEmbedded => {
-            Box::new(embedded::EmbeddedDeploy::new(manifest, user_config, None))
+            let vision_bundle_api_key =
+                resolve_vision_bundle_api_key(db, settings_cipher, &user_config);
+            Box::new(embedded::EmbeddedDeploy::new(
+                manifest,
+                user_config,
+                vision_bundle_api_key,
+                None,
+            ))
         }
         DeployMethod::NativeBinary => Box::new(binary::BinaryDeploy::new_with_port(
             manifest,
@@ -689,6 +747,18 @@ pub async fn stop_all_supervised(
     };
     let mut errors: Vec<(i64, String)> = Vec::new();
     for svc in services {
+        // Czlonek distributed-deploymentu (cluster TP): kontener zyje NIEZALEZNIE
+        // od procesu core (detached docker) i serwuje klaster razem z rankami na
+        // INNYCH nodach. Restart/shutdown core nie moze go zatrzymywac — cyklem
+        // zycia zarzadza wylacznie cluster deploy/stop.
+        if distributed::service_is_distributed_member(&svc.config_json) {
+            tracing::info!(
+                service_id = svc.id,
+                engine = %svc.engine_id,
+                "shutdown: pomijam czlonka distributed-deploymentu (kontener zostaje)"
+            );
+            continue;
+        }
         let id = svc.id;
         let engine_id = svc.engine_id.clone();
         if let Err(e) = stop(&svc, ports.clone()).await {
@@ -936,6 +1006,85 @@ async fn kill_listener_on_port(port: u16) {
     }
 }
 
+/// DELETE-time belt-and-suspenders. `stop()` only targets the row's recorded
+/// `runtime_pid`/`runtime_port`; after a prior non-graceful Core exit those drift
+/// or go stale, so the real runtime survives a delete and becomes an untraceable
+/// orphan (the observed ghost `tentaflow-<engine>-<port>` container / detached
+/// native process). This sweep kills EVERY runtime that belongs to `engine_id`,
+/// matched by the deterministic container name (`tentaflow-<engine>-<port>`) and
+/// native instance marker (`bundle-instances/<engine>/<engine>-<port>`), independent
+/// of DB tracking. `keep_ports` (ports of sibling rows of the same engine that are
+/// NOT being deleted) are skipped so a second live instance is not collaterally
+/// killed. Engine ids are matched with a trailing numeric port so deleting `vllm`
+/// never sweeps `vllm-spark`. Best-effort; all errors swallowed.
+pub async fn stop_engine_orphans(engine_id: &str, keep_ports: &[u16]) {
+    // Native: any process whose argv carries this engine's instance dir.
+    let marker = format!("bundle-instances/{}/", engine_id);
+    let inst_prefix = format!("{}-", engine_id);
+    if let Ok(out) = tokio::process::Command::new("ps")
+        .args(["-eo", "pid=,args="])
+        .output()
+        .await
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let line = line.trim_start();
+            let Some((pid_s, args)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            let Some(idx) = args.find(&marker) else { continue };
+            // Path segment right after the marker is `<engine>-<port>`.
+            let inst = args[idx + marker.len()..].split('/').next().unwrap_or("");
+            let port = inst.strip_prefix(&inst_prefix).and_then(|s| s.parse::<u16>().ok());
+            if let Some(p) = port {
+                if keep_ports.contains(&p) {
+                    continue;
+                }
+            }
+            if let Ok(pid) = pid_s.trim().parse::<u32>() {
+                let _ = crate::deploy::process_ctl::terminate(pid);
+            }
+        }
+    }
+
+    // Docker: any container named exactly `tentaflow-<engine>-<port>`.
+    #[cfg(feature = "docker")]
+    if let Ok(docker) = bollard::Docker::connect_with_local_defaults() {
+        let name_prefix = format!("tentaflow-{}-", engine_id);
+        if let Ok(o) = tokio::process::Command::new("docker")
+            .args(["ps", "-a", "--format", "{{.Names}}"])
+            .output()
+            .await
+        {
+            for name in String::from_utf8_lossy(&o.stdout).lines() {
+                let name = name.trim();
+                let Some(rest) = name.strip_prefix(&name_prefix) else {
+                    continue;
+                };
+                // Suffix must be ONLY the port digits — excludes `vllm-spark-*`
+                // when sweeping `vllm`.
+                if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
+                if let Ok(p) = rest.parse::<u16>() {
+                    if keep_ports.contains(&p) {
+                        continue;
+                    }
+                }
+                let _ = docker.stop_container(name, None).await;
+                let _ = docker
+                    .remove_container(
+                        name,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+            }
+        }
+    }
+}
+
 fn find_listener_pid(port: u16) -> Option<u32> {
     let out = std::process::Command::new("ss")
         .args(["-Hlntp", &format!("sport = :{}", port)])
@@ -1107,6 +1256,49 @@ fn build_placeholder_service(
         config_json: config_json.to_string(),
         active_deploy_id: deploy_id.to_string(),
         last_deploy_id: deploy_id.to_string(),
+        deployment_progress_pct: 0,
+        deployed_source_hash: String::new(),
+    }
+}
+
+/// Placeholder `services` row reprezentujacy CALY distributed (cluster TP)
+/// deploy jako POJEDYNCZY wpis na liscie serwisow — status `Deploying` od startu,
+/// potem `Running`/`Failed` sterowane wprost przez maszyne stanow deployu klastra
+/// (koordynator), a NIE przez supervisor.
+///
+/// Kluczowe wlasciwosci utrzymujace ten wiersz "inertnym" dla supervisora:
+///   * `pinned=false` — `auto_start_pinned` nigdy go nie respawnuje po `Failed`,
+///   * `transport=ExternalHttp` (`deploy_method=External`) — supervisor traktuje
+///     go jako serwis zewnetrzny: brak lokalnego procesu do spawnu, brak reguly
+///     "wymaga zarejestrowanego modelu", a nieudany health-probe sam sie leczy,
+///   * zero modeli — nie trafia do `unique_models`, wiec routing idzie WYLACZNIE
+///     przez realny per-node wpis head-a (ten placeholder jest tylko statusem).
+///
+/// `active_deploy_id` = `deployment_cluster_id` sluzy jako klucz dedup w
+/// `service_list`: per-node wpisy czlonkow (head + workery) sa ukrywane, a ten
+/// jeden placeholder zostaje jako spojny wpis deploying→running/failed.
+pub(crate) fn build_placeholder_for_cluster(
+    engine_id: &str,
+    served: &str,
+    endpoint_url: Option<String>,
+    deployment_cluster_id: &str,
+) -> NewService {
+    NewService {
+        engine_id: engine_id.to_string(),
+        category: "llm".to_string(),
+        display_name: format!("{served} (cluster TP)"),
+        deploy_method: DeployMethod::External,
+        transport: Transport::ExternalHttp,
+        status: ServiceStatus::Deploying,
+        pinned: false,
+        paused: false,
+        runtime_pid: None,
+        runtime_port: None,
+        sidecar_quic_port: None,
+        endpoint_url,
+        config_json: "{}".to_string(),
+        active_deploy_id: deployment_cluster_id.to_string(),
+        last_deploy_id: deployment_cluster_id.to_string(),
         deployment_progress_pct: 0,
         deployed_source_hash: String::new(),
     }
@@ -1494,6 +1686,15 @@ fn vllm_spec_method(method: &str) -> Option<&'static str> {
         "ngram" => Some("ngram"),
         "mtp" => Some("mtp"),
         "draft" | "draft_model" => Some("draft"),
+        // Metody z osobnym modelem/glowa draftujaca, ktore vLLM identyfikuje po
+        // polu `method` w --speculative-config: DSpark (DeepSeek V4, +57-85%),
+        // DFlash/PFlash, Eagle/Eagle3, Medusa. Wszystkie niosa `speculator_repo`.
+        "dspark" => Some("dspark"),
+        "dflash" => Some("dflash"),
+        "pflash" => Some("pflash"),
+        "eagle" => Some("eagle"),
+        "eagle3" => Some("eagle3"),
+        "medusa" => Some("medusa"),
         _ => None,
     }
 }
@@ -1534,6 +1735,38 @@ pub(crate) fn apply_engine_env(user_config: &serde_json::Value, env: &mut HashMa
 /// the AMD/ROCm equivalents). Without this the engine grabs card 0 / all cards
 /// regardless of the wizard's GPU selection. Runs AFTER `apply_engine_env`, so an
 /// explicit `engine_env.CUDA_VISIBLE_DEVICES` wins — we only fill the gap.
+/// Argi CLI wymagane dla KAZDEGO deployu `vllm-spark` (GB10, sm_121a). Sm_121
+/// nie ma instrukcji `tcgen05`, wiec torch.compile + CUDA-graph capture bywa
+/// niestabilne, a autotune FlashInfer sie sypie. `--enforce-eager` jest escape-
+/// hatchem (dziala wolniej, ale stabilnie) i oszczedza 13-20 GB na unified memory
+/// Sparka. Puste dla innych silnikow — cluster nie-Spark ich NIE dostaje.
+/// Jedno zrodlo prawdy dla single (docker/native) i cluster (distributed).
+pub(crate) fn spark_engine_args(engine_id: &str) -> Vec<String> {
+    if engine_id == "vllm-spark" {
+        vec![
+            "--enforce-eager".to_string(),
+            "--no-enable-flashinfer-autotune".to_string(),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Env wymagane dla `vllm-spark`: natywny CUTLASS fp4 generuje na sm_121 PTX
+/// ktory pada (brak tcgen05), wiec NVFP4 musi isc przez Marlin (dequant fp4→fp16).
+/// Te zmienne sa NO-OP dla modeli nie-fp4 (konsultowane tylko na sciezce nvfp4),
+/// wiec ustawiamy je bezwarunkowo dla kazdego Sparka — bez plumbingu kwantyzacji.
+pub(crate) fn spark_engine_env(engine_id: &str) -> Vec<(String, String)> {
+    if engine_id == "vllm-spark" {
+        vec![
+            ("VLLM_NVFP4_GEMM_BACKEND".to_string(), "marlin".to_string()),
+            ("VLLM_USE_FLASHINFER_MOE_FP4".to_string(), "0".to_string()),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
 pub(crate) fn apply_gpu_selection_env(
     user_config: &serde_json::Value,
     env: &mut HashMap<String, String>,
@@ -1656,12 +1889,42 @@ pub(crate) fn vllm_native_speculative_arg(
             let repo = preset.speculator_repo.as_ref()?;
             format!("{{\"model\":\"{repo}\",\"num_speculative_tokens\":{ntok}}}")
         }
-        _ => return None,
+        // DSpark / DFlash / PFlash / Eagle(3) / Medusa. Z osobnym drafterem
+        // (Gemma/Qwen: `speculator_repo`) → method + model. BEZ repo (np.
+        // DeepSeek-V4-*-DSpark ma glowe draftujaca WBUDOWANA w checkpoint,
+        // self-speculative jak MTP) → sama method.
+        other => match preset.speculator_repo.as_ref() {
+            Some(repo) => format!(
+                "{{\"method\":\"{other}\",\"model\":\"{repo}\",\"num_speculative_tokens\":{ntok}}}"
+            ),
+            None => format!("{{\"method\":\"{other}\",\"num_speculative_tokens\":{ntok}}}"),
+        },
     };
     // Flaga i JSON jako DWA osobne elementy argv. JSON nigdy nie przechodzi
     // przez shlex/xargs, wiec wewnetrzne cudzyslowy zostaja nietkniete i
     // vLLM dostaje poprawny `--speculative-config {"model":...}`.
     Some(vec!["--speculative-config".to_string(), json])
+}
+
+/// `--chat-template <abs>` dla rodziny gemma-4 (native python-bundle). Pip-owy
+/// vLLM nie niesie katalogu `examples/`, wiec `--chat-template
+/// examples/tool_chat_template_gemma4.jinja` z recepty vLLM padal ("path-like,
+/// but doesn't exist"). Wskazujemy zbundlowany w repo szablon ABSOLUTNA sciezka.
+/// GUARD `.exists()`: brak pliku => brak flagi => deploy nie pada (tool-calling
+/// zdegraduje do szablonu wbudowanego zamiast crashu).
+pub(crate) fn vllm_native_chat_template_arg(model_repo: &str) -> Option<Vec<String>> {
+    if !model_repo.to_lowercase().contains("gemma-4") {
+        return None;
+    }
+    let path = crate::paths::containers_root()
+        .join("llm/docker/_shared/chat_templates/tool_chat_template_gemma4.jinja");
+    if !path.exists() {
+        return None;
+    }
+    Some(vec![
+        "--chat-template".to_string(),
+        path.to_string_lossy().into_owned(),
+    ])
 }
 
 /// Builds the canonical base URL we persist as `services.endpoint_url` for
@@ -1735,6 +1998,7 @@ mod apply_parameters_deploy_tests {
     fn make_engine(id: &str) -> Engine {
         Engine {
             id: id.into(),
+            backend: None,
             category: Category::Llm,
             name: id.into(),
             description_pl: String::new(),
@@ -1748,6 +2012,8 @@ mod apply_parameters_deploy_tests {
             gpu_supported: None,
             default_port: 8000,
             dgx_spark: None,
+            cluster_capable: None,
+            cluster_launch: None,
             api: ApiKind::OpenaiCompatible,
             version: "0.1.0".into(),
             service_surfaces: None,
@@ -2017,6 +2283,7 @@ mod hf_token_gate_tests {
     ) -> Engine {
         Engine {
             id: "test".into(),
+            backend: None,
             category,
             name: "test".into(),
             description_pl: String::new(),
@@ -2030,6 +2297,8 @@ mod hf_token_gate_tests {
             gpu_supported: None,
             default_port: 8000,
             dgx_spark: None,
+            cluster_capable: None,
+            cluster_launch: None,
             api,
             version: "0.1.0".into(),
             service_surfaces: None,
@@ -2281,19 +2550,21 @@ pub(crate) fn query_cuda0_vram_mib() -> Option<(u64, u64)> {
 /// `min(0.92, 0.94 * free/total)` — leaves ~6% headroom for fragmentation,
 /// torch allocator slack, kernel JIT scratch. Returns `None` when nvidia-smi
 /// is unavailable (caller should keep the manifest default).
-pub(crate) fn auto_gpu_memory_utilization() -> Option<f64> {
+pub(crate) fn auto_gpu_memory_utilization(is_pooling: bool) -> Option<f64> {
     let (free_mib, total_mib) = query_cuda0_vram_mib()?;
     if total_mib == 0 {
         return None;
     }
     let free_ratio = free_mib as f64 / total_mib as f64;
-    // Cap 0.85 (nie 0.92): vLLM przy profilowaniu pamieci (zwlaszcza duzy
-    // max_model_len) przekracza ustawiony budzet o kilka % i alokuje peaki
-    // aktywacji ponad KV-cache; przy 0.92 brakowalo ~1.5GB zapasu -> CUDA OOM.
-    let ratio = (0.94 * free_ratio).min(0.85);
-    if ratio < 0.10 {
-        return Some(ratio);
-    }
+    // Pooling engines (embeddings / reranker) NIE maja autoregresyjnego KV-cache
+    // do wypelnienia — `--gpu-memory-utilization` to u nich gigantyczna, pusta
+    // rezerwacja. Na DGX (267 GiB) 0.85 = ~227 GiB pod model 1B: absurd, ktory na
+    // WSPOLDZIELONYM GPU przekracza wolna pamiec i vLLM ODMAWIA startu ("free <
+    // desired") -> "exited before readiness". Cap 0.30 (floor 0.15) trzyma im
+    // ciasny budzet, zeby kilka uslug zmiescilo sie na jednej karcie. Generatywne
+    // LLM zostaja przy 0.85 (peaki aktywacji ponad KV bez OOM).
+    let cap = if is_pooling { 0.30 } else { 0.85 };
+    let ratio = (0.94 * free_ratio).min(cap).max(0.15);
     let rounded = (ratio * 100.0).floor() / 100.0;
     Some(rounded)
 }
@@ -2565,10 +2836,6 @@ pub(crate) fn standard_engine_env() -> HashMap<String, String> {
     env
 }
 
-pub(crate) fn is_cuda_vllm_engine(engine_id: &str) -> bool {
-    matches!(engine_id, "vllm" | "vllm-spark")
-}
-
 pub(crate) fn strip_gpu_memory_utilization(raw: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let tokens: Vec<&str> = raw.split_whitespace().collect();
@@ -2670,6 +2937,7 @@ mod tests {
         ServiceManifest {
             engine: Engine {
                 id: id.to_string(),
+                backend: None,
                 category: Category::Llm,
                 name: id.to_string(),
                 description_pl: "".into(),
@@ -2683,6 +2951,8 @@ mod tests {
                 gpu_supported: None,
                 default_port: 8000,
                 dgx_spark: None,
+                cluster_capable: None,
+                cluster_launch: None,
                 api: ApiKind::OpenaiCompatible,
                 version: "0.0.1".into(),
                 service_surfaces: None,
@@ -2715,6 +2985,7 @@ mod tests {
                 speculator_num_tokens: None,
                 vllm: None,
                 checkpoint_file: None,
+                quant_variants: vec![],
             }],
             parameters: vec![],
             docker_source_hash: String::new(),

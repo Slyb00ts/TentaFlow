@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Benchmark Studio · Kreator: targety (M2)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .ext-card {
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 11px 14px; margin-bottom: 8px; display: flex; align-items: center; gap: 12px;
+  }
+  .ext-card .t-name { font-weight: 700; font-size: 13px; }
+  .ext-card .t-sub { font-size: 11px; color: var(--text-3); margin-top: 1px; }
+  .add-ext { border-top: 1px dashed var(--border); margin-top: 14px; padding-top: 14px; }
+  .wizard-foot {
+    display: flex; justify-content: space-between; align-items: center;
+    padding-top: 16px; border-top: 1px solid var(--border); margin-top: 4px;
+  }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+  <symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M2</span>
+    <h2>Kreator benchmarku — krok 1/2: targety</h2>
+    <div class="desc">Nazwa benchmarku + wybór targetów: serwisy LLM z mesh (checkbox z listy) oraz zewnętrzne API dodawane ręcznie (typ, host, port, klucz, model).</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Analityka</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-trend"/></svg>Statystyki modeli</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr · Admin</div><div class="role">Euvic · Zarząd</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Analityka</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Benchmark Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb current">Nowy benchmark</span>
+        </div>
+
+        <div class="stepper">
+          <span class="step active"><span class="n">1</span>Targety</span>
+          <span class="line"></span>
+          <span class="step"><span class="n">2</span>Testy</span>
+        </div>
+
+        <div class="section-card">
+          <h3><svg class="icon"><use href="#i-flask"/></svg>Benchmark</h3>
+          <div class="form-row">
+            <label>Nazwa benchmarku<div class="label-desc">Widoczna na liście i w historii runów</div></label>
+            <input class="input" value="LLM produkcyjne Q3" style="max-width:420px;">
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <div class="section-card">
+            <h3><svg class="icon"><use href="#i-server"/></svg>Z naszych serwisów</h3>
+            <div class="section-sub">Serwisy LLM widoczne w mesh — testowane przez wewnętrzny endpoint, bez klucza API.</div>
+
+            <div class="target-option checked">
+              <span class="cb"></span>
+              <div style="flex:1;">
+                <div class="t-name">gemma-4-31b</div>
+                <div class="t-sub">spark-cluster (rig24 + rig25, TP=2) · vLLM 0.10.0</div>
+              </div>
+              <span class="status-pill online">online</span>
+            </div>
+            <div class="target-option checked">
+              <span class="cb"></span>
+              <div style="flex:1;">
+                <div class="t-name">Qwen2.5-7B</div>
+                <div class="t-sub">rig24 · vLLM 0.10.0</div>
+              </div>
+              <span class="status-pill online">online</span>
+            </div>
+            <div class="target-option">
+              <span class="cb"></span>
+              <div style="flex:1;">
+                <div class="t-name">gpt-oss-20b</div>
+                <div class="t-sub">mac-studio · llama.cpp</div>
+              </div>
+              <span class="status-pill online">online</span>
+            </div>
+            <div class="target-option">
+              <span class="cb"></span>
+              <div style="flex:1;">
+                <div class="t-name">Qwen3.6-4B</div>
+                <div class="t-sub">phone-piotr · llama.cpp</div>
+              </div>
+              <span class="status-pill offline">offline</span>
+            </div>
+          </div>
+
+          <div class="section-card">
+            <h3><svg class="icon"><use href="#i-globe"/></svg>Zewnętrzne API</h3>
+            <div class="section-sub">Endpointy spoza mesh — testowane tym samym zestawem, wyniki wprost porównywalne.</div>
+
+            <div class="ext-card">
+              <svg class="icon" style="color:var(--info)"><use href="#i-globe"/></svg>
+              <div style="flex:1;">
+                <div class="t-name">claude-sonnet</div>
+                <div class="t-sub">Anthropic API · api.anthropic.com:443 · klucz: ••••••••</div>
+              </div>
+              <span class="chip info">zewnętrzny</span>
+              <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-trash"/></svg></button>
+            </div>
+
+            <div class="add-ext">
+              <div class="section-card-head" style="margin-bottom:10px;">
+                <div class="title">Dodaj zewnętrzny target</div>
+              </div>
+              <div class="field">
+                <label>Typ API</label>
+                <select class="select" style="max-width:260px;">
+                  <option>OpenAI API (chat/completions)</option>
+                  <option>Anthropic API (messages)</option>
+                </select>
+              </div>
+              <div class="flex gap-md">
+                <div class="field" style="flex:2;">
+                  <label>Adres IP / host</label>
+                  <input class="input mono" placeholder="np. 10.0.4.21 lub api.openai.com">
+                </div>
+                <div class="field" style="flex:1;">
+                  <label>Port</label>
+                  <input class="input mono" placeholder="8001">
+                </div>
+              </div>
+              <div class="field">
+                <label>API key <span class="text-3" style="font-weight:400;">(opcjonalny)</span></label>
+                <input class="input mono" type="password" placeholder="sk-...">
+              </div>
+              <div class="field">
+                <label>Nazwa modelu</label>
+                <input class="input mono" placeholder="np. gpt-4o-mini">
+                <span class="hint">Wartość pola <span class="mono">model</span> w żądaniach do endpointu</span>
+              </div>
+              <button class="btn btn-secondary"><svg class="icon"><use href="#i-plus"/></svg>Dodaj target</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="wizard-foot">
+          <button class="btn btn-ghost">Anuluj</button>
+          <div class="flex gap-md align-center">
+            <span class="text-2 text-sm">Wybrane targety: <strong>3</strong> (2 z mesh + 1 zewnętrzny)</span>
+            <button class="btn btn-primary btn-lg">Dalej → Testy</button>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

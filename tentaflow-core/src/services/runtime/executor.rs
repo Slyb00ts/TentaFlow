@@ -29,6 +29,9 @@ use crate::flow_engine::dispatcher::FlowDispatcher;
 use crate::services::catalog::{CatalogProvider, InputModality, OutputModality, ServiceSurface};
 use crate::services::handles_cache::BackendHandle;
 use crate::services::runtime::context::ExecutionContext;
+use crate::services::runtime::local_cv::{
+    CameraCvOpLocal, CameraCvRequest, CvFrameLocal, LocalCameraCvHandler,
+};
 use crate::services::runtime::resolver::{AliasResolver, ResolveError, ResolveRequest};
 use crate::services::runtime::strategy::{rank, StrategyState};
 use crate::services::runtime::target::ResolvedExecutionTarget;
@@ -278,6 +281,151 @@ impl ModelRuntimeExecutor {
         Ok(())
     }
 
+    /// Wspolne wymiary tozsamosci (writer + tenant + user) dla metryk modelu.
+    /// `node_id` to ZAWSZE lokalny wezel (single-writer per row — kazdy wezel
+    /// zapisuje wlasne wiersze). `org`/`user` z `ctx`, z sentinelami jak reszta
+    /// hot-path telemetrii (`org-default` / `__system__`).
+    fn metric_identity(&self, ctx: &ExecutionContext) -> (String, String, String) {
+        let node_id = self.resolver.local_node_id();
+        let org_id = ctx
+            .org_id
+            .as_deref()
+            .unwrap_or(crate::services::org::DEFAULT_ORG_ID)
+            .to_string();
+        let user_id = ctx
+            .user
+            .as_ref()
+            .map(|u| u.user_id.clone())
+            .unwrap_or_else(|| crate::db::repository::TOKEN_USAGE_SYSTEM_USER.to_string());
+        (node_id, org_id, user_id)
+    }
+
+    /// Metryki jednego OBSLUZONEGO LOKALNIE requestu (sukces). MeshForward i Flow
+    /// sa POMIJANE: MeshForward realnie wykonuje zdalny wezel (jego executor
+    /// zapisuje metryke pod swoim `node_id` — brak double-count na koordynatorze),
+    /// a Flow ma wlasne wpiecie z bogatszym `perf` z `FlowExecutionOutcome`.
+    fn record_served_metrics(
+        &self,
+        target: &ResolvedExecutionTarget,
+        ctx: &ExecutionContext,
+        modality: &str,
+        usage: Option<&crate::api::openai::types::Usage>,
+        perf: Option<&crate::api::openai::types::GenPerf>,
+        e2e_ms: Option<u32>,
+    ) {
+        let Some(db) = self.db.as_ref() else {
+            return;
+        };
+        if matches!(
+            target,
+            ResolvedExecutionTarget::MeshForward { .. } | ResolvedExecutionTarget::Flow { .. }
+        ) {
+            return;
+        }
+        let (node_id, org_id, user_id) = self.metric_identity(ctx);
+        let backend = target.telemetry_tag();
+        let model_id = target.requested_model();
+        let service_key = format!("{backend}/{model_id}");
+        let is_embedding = modality == "embedding";
+        let prompt_tokens = usage.map(|u| u.prompt_tokens as i64).unwrap_or(0);
+        let completion_tokens = usage.map(|u| u.completion_tokens as i64).unwrap_or(0);
+        let total_tokens = usage.map(|u| u.total_tokens as i64).unwrap_or(0);
+        let e2e_latency_ms = e2e_ms
+            .map(|v| v as i64)
+            .or_else(|| perf.map(|p| p.total_ms as i64))
+            .unwrap_or(0);
+        bump_model_metric_row(
+            db,
+            &ModelMetricInput {
+                node_id: &node_id,
+                org_id: &org_id,
+                user_id: &user_id,
+                model_id,
+                service_key: &service_key,
+                backend,
+                modality,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                embedding_tokens: if is_embedding { total_tokens } else { 0 },
+                e2e_latency_ms,
+                ttft_sample: perf.and_then(|p| (p.ttft_ms > 0).then_some(p.ttft_ms as i64)),
+                decode_tps_sample: perf
+                    .and_then(|p| (p.decode_tps > 0.0).then_some(p.decode_tps as f64)),
+                e2e_sample: (e2e_latency_ms > 0).then_some(e2e_latency_ms),
+                is_error: false,
+            },
+        );
+    }
+
+    /// Metryki zakonczonego-bledem requestu. Wolane RAZ, gdy `execute_*` zwraca
+    /// `Err` po wyczerpaniu wszystkich kandydatow (nie per-proba retry). `backend`
+    /// to tag ostatniego probowanego kandydata; brak tokenow/perf.
+    fn record_error_metrics(
+        &self,
+        ctx: &ExecutionContext,
+        model_id: &str,
+        backend: &str,
+        modality: &str,
+    ) {
+        let Some(db) = self.db.as_ref() else {
+            return;
+        };
+        let (node_id, org_id, user_id) = self.metric_identity(ctx);
+        let service_key = format!("{backend}/{model_id}");
+        bump_model_metric_row(
+            db,
+            &ModelMetricInput {
+                node_id: &node_id,
+                org_id: &org_id,
+                user_id: &user_id,
+                model_id,
+                service_key: &service_key,
+                backend,
+                modality,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                embedding_tokens: 0,
+                e2e_latency_ms: 0,
+                ttft_sample: None,
+                decode_tps_sample: None,
+                e2e_sample: None,
+                is_error: true,
+            },
+        );
+    }
+
+    /// Buduje lekki recorder metryk dla streamu (Local Http/Quic). Wymiary
+    /// klonowane do `String`, bo `ExternalPerfStream` drenuje w osobnym tasku bez
+    /// dostepu do `target`/`ctx`. `None` gdy brak db albo target nie jest lokalny.
+    fn stream_recorder(
+        &self,
+        target: &ResolvedExecutionTarget,
+        ctx: &ExecutionContext,
+    ) -> Option<StreamMetricsRecorder> {
+        let db = self.db.as_ref()?.clone();
+        if matches!(
+            target,
+            ResolvedExecutionTarget::MeshForward { .. } | ResolvedExecutionTarget::Flow { .. }
+        ) {
+            return None;
+        }
+        let (node_id, org_id, user_id) = self.metric_identity(ctx);
+        let backend = target.telemetry_tag();
+        let model_id = target.requested_model().to_string();
+        let service_key = format!("{backend}/{model_id}");
+        Some(StreamMetricsRecorder {
+            db,
+            node_id,
+            org_id,
+            user_id,
+            model_id,
+            service_key,
+            backend: backend.to_string(),
+        })
+    }
+
     /// Non-streaming chat completion. Resolves the requested model into a
     /// candidate list, ranks per alias strategy, and tries candidates in
     /// order. First success wins; aggregate failure surfaces the last
@@ -294,6 +442,8 @@ impl ModelRuntimeExecutor {
         request: ChatCompletionRequest,
         ctx: &mut ExecutionContext,
     ) -> Result<ChatCompletionResponse, ExecutorError> {
+        // Znacznik e2e (dispatch -> odpowiedz) dla metryk modelu.
+        let dispatch_at = std::time::Instant::now();
         let outcome = {
             let snapshot = self.catalog.snapshot();
             let req = self.build_chat_resolve_request(&request);
@@ -326,6 +476,15 @@ impl ModelRuntimeExecutor {
                         attempts,
                         target.telemetry_tag(),
                     );
+                    let e2e_ms = dispatch_at.elapsed().as_millis() as u32;
+                    self.record_served_metrics(
+                        &target,
+                        ctx,
+                        "chat",
+                        response.usage.as_ref(),
+                        None,
+                        Some(e2e_ms),
+                    );
                     return Ok(response);
                 }
                 Err(e) if e.aborts_fallback_chain() => {
@@ -357,6 +516,16 @@ impl ModelRuntimeExecutor {
             return Err(ExecutorError::TransportPendingCutover(kind));
         }
 
+        // Request zakonczony bledem po wyczerpaniu wszystkich kandydatow — jeden
+        // wpis error na koordynatorze (nie per-proba). Dla MeshForward NIE
+        // zapisujemy error: jesli zdalny wezel dostal request, sam zapisal swoj
+        // wiersz error pod swoim node_id (analogicznie do pomijania success dla
+        // MeshForward). Jesli zdalny byl NIEOSIAGALNY (request nigdy nie dotarl),
+        // error nie zostanie policzony nigdzie — akceptujemy to jako mniejsze zlo
+        // niz inflacja error-rate podwojnym liczeniem.
+        if last_kind != "mesh_forward" {
+            self.record_error_metrics(ctx, &request.model, last_kind, "chat");
+        }
         Err(ExecutorError::AllCandidatesFailed {
             target_kind: last_kind,
             attempts,
@@ -503,11 +672,20 @@ impl ModelRuntimeExecutor {
                     request.stream_options = Some(crate::api::openai::types::StreamOptions {
                         include_usage: true,
                     });
+                    // Zegar dispatchu sprzed wysłania HTTP — TTFT/total liczone od
+                    // realnego startu (wysłanie requestu + odbiór nagłówków), nie od
+                    // spawnu wrappera, który następuje już po `await`.
+                    let dispatch_at = std::time::Instant::now();
+                    let recorder = self.stream_recorder(target, ctx);
                     let stream = client
                         .chat_completion_stream(request)
                         .await
                         .map_err(|e| ExecutorError::Internal(e.to_string()))?;
-                    Ok(Box::pin(ExternalPerfStream::new(stream)))
+                    Ok(Box::pin(ExternalPerfStream::new(
+                        stream,
+                        dispatch_at,
+                        recorder,
+                    )))
                 }
                 BackendHandle::Quic(handle) => {
                     let quic_client = handle.get_client().await.ok_or_else(|| {
@@ -542,6 +720,10 @@ impl ModelRuntimeExecutor {
                         metadata: None,
                         session_id: None,
                     };
+                    // Zegar dispatchu sprzed wysłania QUIC — TTFT/total od realnego
+                    // startu requestu, nie od spawnu wrappera po `await`.
+                    let dispatch_at = std::time::Instant::now();
+                    let recorder = self.stream_recorder(target, ctx);
                     let quic_stream = quic_client
                         .send_request_stream(model_request)
                         .await
@@ -689,7 +871,11 @@ impl ModelRuntimeExecutor {
                             }
                         }
                     });
-                    Ok(Box::pin(ExternalPerfStream::new(Box::pin(stream))))
+                    Ok(Box::pin(ExternalPerfStream::new(
+                        Box::pin(stream),
+                        dispatch_at,
+                        recorder,
+                    )))
                 }
             },
             ResolvedExecutionTarget::MeshForward {
@@ -1098,6 +1284,10 @@ impl ModelRuntimeExecutor {
                 let outcome =
                     dispatch_result.map_err(|e| ExecutorError::Internal(e.to_string()))?;
 
+                // No flow-level metric row here: the flow's internal LLM node
+                // calls back into `ModelRuntimeExecutor::execute_chat`, which
+                // records the real per-model row with identical tokens+perf.
+                // Recording a `flow_engine` row too would double-count tokens.
                 Ok(crate::routing::chat::flow_outcome_to_chat_response(
                     outcome,
                     &request.model,
@@ -1287,6 +1477,7 @@ impl ModelRuntimeExecutor {
         request: EmbeddingRequest,
         ctx: &mut ExecutionContext,
     ) -> Result<EmbeddingResponse, ExecutorError> {
+        let dispatch_at = std::time::Instant::now();
         let outcome = {
             let snapshot = self.catalog.snapshot();
             // OpenAI `/v1/embeddings` is text-in / vector-out. Constrain the
@@ -1328,6 +1519,20 @@ impl ModelRuntimeExecutor {
                         attempts,
                         target.telemetry_tag(),
                     );
+                    let e2e_ms = dispatch_at.elapsed().as_millis() as u32;
+                    let usage = crate::api::openai::types::Usage {
+                        prompt_tokens: response.usage.prompt_tokens,
+                        completion_tokens: 0,
+                        total_tokens: response.usage.total_tokens,
+                    };
+                    self.record_served_metrics(
+                        &target,
+                        ctx,
+                        "embedding",
+                        Some(&usage),
+                        None,
+                        Some(e2e_ms),
+                    );
                     return Ok(response);
                 }
                 Err(e) if e.aborts_fallback_chain() => return Err(e),
@@ -1349,6 +1554,12 @@ impl ModelRuntimeExecutor {
             return Err(ExecutorError::TransportPendingCutover(kind));
         }
 
+        // MeshForward error jest zapisywany przez zdalny wezel pod jego node_id
+        // (jesli request dotarl); koordynator go pomija, zeby nie liczyc dwa razy.
+        // Zdalny nieosiagalny → error niepoliczony nigdzie (mniejsze zlo).
+        if last_kind != "mesh_forward" {
+            self.record_error_metrics(ctx, &request.model, last_kind, "embedding");
+        }
         Err(ExecutorError::AllCandidatesFailed {
             target_kind: last_kind,
             attempts,
@@ -1607,6 +1818,10 @@ impl ModelRuntimeExecutor {
                     EmbeddingInput::Single(_) => 1,
                     EmbeddingInput::Multiple(texts) => texts.len(),
                 };
+                // No flow-level metric row: the flow's internal embeddings node
+                // calls back into `ModelRuntimeExecutor::execute_embeddings`,
+                // which records the real per-model row with identical
+                // tokens+perf. A `flow_engine` row would double-count.
                 flow_outcome_to_embedding_response(outcome, &request, expected_count)
             }
         }
@@ -1712,9 +1927,7 @@ impl ModelRuntimeExecutor {
 
         match target {
             ResolvedExecutionTarget::Local { handle, .. } => match handle {
-                BackendHandle::Embedded { .. } => Err(ExecutorError::Internal(
-                    "embedded backend does not support reranking".into(),
-                )),
+                BackendHandle::Embedded { .. } => embedded_rerank(&request).await,
                 BackendHandle::Http(client) => client
                     .rerank_request(request)
                     .await
@@ -2079,6 +2292,132 @@ impl ModelRuntimeExecutor {
         }
     }
 
+    /// FAZA 2 — typed-surface `CameraCv`: operacje CV na klatkach z kamer
+    /// (detekcja / klasyfikacja stanu / OCR) przez executor. Lustro
+    /// `execute_document_infer`: resoluje żądany model przez
+    /// `ServiceSurface::CameraCv` (input Image), rankuje kandydatów per
+    /// alias-strategy i próbuje każdego aż któryś zadziała. Local → wyłącznie
+    /// embedded (zero-copy do procesowych singletonów CV); MeshForward →
+    /// `ModelPayload::CameraCv` (klatki binarnie, serde_bytes).
+    pub async fn execute_camera_cv(
+        &self,
+        request: CameraCvRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<tentaflow_protocol::CameraCvResult, ExecutorError> {
+        let outcome = {
+            let snapshot = self.catalog.snapshot();
+            let req = ResolveRequest {
+                requested_model: &request.model,
+                required_surface: ServiceSurface::CameraCv,
+                required_input_modalities: &[InputModality::Image],
+                required_output_modalities: &[],
+            };
+            self.resolver.resolve(&req, &snapshot, ctx)?
+        };
+
+        let state = self.strategy_state_for(&request.model);
+        let ranked = rank(&outcome.candidates, outcome.strategy, &state);
+
+        let mut last_err: Option<String> = None;
+        let mut attempts = 0usize;
+        let mut last_kind: &'static str = "unknown";
+        let mut deferred_cutover: Option<&'static str> = None;
+
+        for target in ranked {
+            attempts += 1;
+            last_kind = target.telemetry_tag();
+            match self
+                .dispatch_camera_cv(&target, request.clone(), ctx)
+                .await
+            {
+                Ok(response) => {
+                    ctx.route_metadata.served_by_node = served_by(&target);
+                    ctx.route_metadata.served_model = Some(target.requested_model().to_string());
+                    ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
+                    ctx.route_metadata.fallbacks_tried = (attempts - 1) as u32;
+                    note_fallback(
+                        &request.model,
+                        outcome.requested_is_alias,
+                        attempts,
+                        target.telemetry_tag(),
+                    );
+                    return Ok(response);
+                }
+                Err(e) if e.aborts_fallback_chain() => return Err(e),
+                Err(ExecutorError::TransportPendingCutover(kind)) => {
+                    deferred_cutover.get_or_insert(kind);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target_kind = target.telemetry_tag(),
+                        error = %e,
+                        "camera cv dispatch failed; trying next candidate"
+                    );
+                    last_err = Some(e.to_string());
+                }
+            }
+        }
+
+        if let Some(kind) = deferred_cutover {
+            return Err(ExecutorError::TransportPendingCutover(kind));
+        }
+
+        Err(ExecutorError::AllCandidatesFailed {
+            target_kind: last_kind,
+            attempts,
+            last_error: last_err.unwrap_or_else(|| "no candidates after rank".into()),
+        })
+    }
+
+    /// Per-target camera-cv dispatch — lustro `dispatch_document_infer_blocking`.
+    /// Embedded idzie zero-copy do `LocalCameraCvHandler` (dispatch po
+    /// `engine_id`); HTTP/QUIC są architektonicznie zakazane (surowe piksele
+    /// nie idą przez REST — jedyne transporty to embedded i mesh); MeshForward
+    /// buduje `ModelPayload::CameraCv` (tu jedyne kopiowanie klatek + downscale
+    /// klatek Detect do krawędzi detektora).
+    async fn dispatch_camera_cv(
+        &self,
+        target: &ResolvedExecutionTarget,
+        mut request: CameraCvRequest,
+        ctx: &mut ExecutionContext,
+    ) -> Result<tentaflow_protocol::CameraCvResult, ExecutorError> {
+        self.ensure_resident(target).await?;
+        if let ResolvedExecutionTarget::Local { model_name, .. } = target {
+            if request.model != *model_name {
+                request.model = model_name.clone();
+            }
+        }
+
+        match target {
+            ResolvedExecutionTarget::Local { handle, .. } => match handle {
+                BackendHandle::Embedded { engine_id, .. } => {
+                    // `request.model` carries the RESOLVED model name (set from
+                    // the Local target above) — the dynamic `onnx-cv` engine
+                    // needs it to pick the registry row; fixed engines ignore it.
+                    let CameraCvRequest { model, op } = request;
+                    LocalCameraCvHandler::execute(engine_id, &model, op)
+                        .await
+                        .map_err(ExecutorError::Internal)
+                }
+                BackendHandle::Http(_) | BackendHandle::Quic(_) => Err(ExecutorError::Internal(
+                    "camera-cv wspiera wyłącznie transport embedded/mesh".into(),
+                )),
+            },
+            ResolvedExecutionTarget::MeshForward {
+                node_id,
+                model_name,
+                ..
+            } => {
+                let model_request = camera_cv_model_request(model_name, request.op)?;
+                let response = self.forward_via_mesh(node_id, model_request, ctx).await?;
+                camera_cv_result_from_model(response.result)
+            }
+            ResolvedExecutionTarget::Flow { .. } => Err(ExecutorError::Internal(
+                "camera-cv has no flow-target surface".into(),
+            )),
+        }
+    }
+
     /// RAG E1.4 — ścieżka PDF: rasteryzuje dokument na obrazy stron (pdfium,
     /// bezwarunkowo), parsuje każdą stronę przez `execute_documents` (ten sam
     /// resolve→rank→failover co dla pojedynczego obrazu) i scala wyniki
@@ -2336,6 +2675,8 @@ impl ModelRuntimeExecutor {
     /// returns and reuse the request format as the wire-side hint.
     ///
     /// **ACL is the caller's responsibility.**
+    // TODO Chunk 2b: TTS/STT metrics need usage/duration plumbing (audio_ms,
+    // char count) before they can feed `model_metrics_rollup`.
     pub async fn execute_tts(
         &self,
         request: TTSRequest,
@@ -2702,6 +3043,8 @@ impl ModelRuntimeExecutor {
     /// `SttBackend(error)` zeby user zobaczyl klarowny blad.
     /// Gdy `model` jest pusty / brak kandydatow → fallback do default
     /// local whisper (zachowuje pre-existing UX dla single-engine node'u).
+    // TODO Chunk 2b: TTS/STT metrics need usage/duration plumbing (audio_ms,
+    // transcript tokens) before they can feed `model_metrics_rollup`.
     pub async fn execute_stt(
         &self,
         request: TranscriptionRequest,
@@ -3120,6 +3463,40 @@ fn rerank_model_request(request: &RerankRequest) -> tentaflow_protocol::ModelReq
     }
 }
 
+/// Embedded MLX reranker (jina-reranker-v3): liczy score'y in-process przez
+/// MLXBridge, zwraca posortowane malejąco (`top_n` honorowane). Poza feature
+/// `inference-mlx` embedded rerankera nie ma — błąd, żeby fallback chain szedł dalej.
+#[cfg(feature = "inference-mlx")]
+async fn embedded_rerank(request: &RerankRequest) -> Result<RerankResponse, ExecutorError> {
+    let scores = crate::inference::mlx_swift_bridge::rerank(&request.query, &request.documents)
+        .await
+        .map_err(|e| ExecutorError::Internal(format!("embedded MLX rerank: {e}")))?;
+    let mut results: Vec<RerankResultEntry> = scores
+        .into_iter()
+        .enumerate()
+        .map(|(index, relevance_score)| RerankResultEntry {
+            index,
+            relevance_score,
+        })
+        .collect();
+    results.sort_by(|a, b| {
+        b.relevance_score
+            .partial_cmp(&a.relevance_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if let Some(n) = request.top_n {
+        results.truncate(n as usize);
+    }
+    Ok(RerankResponse { results })
+}
+
+#[cfg(not(feature = "inference-mlx"))]
+async fn embedded_rerank(_request: &RerankRequest) -> Result<RerankResponse, ExecutorError> {
+    Err(ExecutorError::Internal(
+        "embedded backend does not support reranking".into(),
+    ))
+}
+
 /// Mapuje `ModelResult` (QUIC/mesh) na `RerankResponse`. Wynik z silnika niesie
 /// `index`/`relevance_score` — `document` ignorujemy (adapter ma własne teksty).
 fn rerank_result_to_response(
@@ -3181,6 +3558,99 @@ fn document_infer_result_to_response(
         ))),
         _ => Err(ExecutorError::Internal(
             "document infer returned unexpected result type".into(),
+        )),
+    }
+}
+
+/// FAZA 2 — krawędź wejścia detektora RF-DETR (stretch-resize 560×560). Klatki
+/// `Detect` większe niż ta krawędź są zmniejszane przed wysyłką przez mesh:
+/// detektor i tak przeskalowuje wejście, a batch 8 klatek 560×560 RGB24
+/// (~7.5 MB) mieści się w limicie ramki CBOR (16 MiB).
+const MESH_DETECT_EDGE: u32 = 560;
+
+/// FAZA 2 — kopiuje lokalną klatkę (`Arc`, zero-copy) do klatki drutu (`Vec`).
+fn camera_cv_frame_to_wire(frame: &CvFrameLocal) -> tentaflow_protocol::CvFrame {
+    tentaflow_protocol::CvFrame {
+        data: frame.data.to_vec(),
+        width: frame.width,
+        height: frame.height,
+        encoding: tentaflow_protocol::CvFrameEncoding::Rgb24,
+    }
+}
+
+/// FAZA 2 — klatka `Detect` na drut: większa niż [`MESH_DETECT_EDGE`] jest
+/// najpierw zmniejszana (bilinear) do 560×560, mniejsza leci bez zmian.
+fn camera_cv_detect_frame_to_wire(
+    frame: &CvFrameLocal,
+) -> Result<tentaflow_protocol::CvFrame, ExecutorError> {
+    if frame.width <= MESH_DETECT_EDGE && frame.height <= MESH_DETECT_EDGE {
+        return Ok(camera_cv_frame_to_wire(frame));
+    }
+    let data = crate::vision::resize::resize_rgb(
+        &frame.data,
+        frame.width,
+        frame.height,
+        MESH_DETECT_EDGE,
+        MESH_DETECT_EDGE,
+    )
+    .map_err(|e| ExecutorError::Internal(format!("camera-cv mesh resize: {}", e)))?;
+    Ok(tentaflow_protocol::CvFrame {
+        data,
+        width: MESH_DETECT_EDGE,
+        height: MESH_DETECT_EDGE,
+        encoding: tentaflow_protocol::CvFrameEncoding::Rgb24,
+    })
+}
+
+/// FAZA 2 — buduje `ModelRequest` (mesh) z lokalnej operacji CV. Tu następuje
+/// jedyne kopiowanie pikseli (`Arc` → `Vec`, serde_bytes → CBOR byte-string)
+/// oraz downscale klatek `Detect` do krawędzi detektora.
+fn camera_cv_model_request(
+    model: &str,
+    op: CameraCvOpLocal,
+) -> Result<tentaflow_protocol::ModelRequest, ExecutorError> {
+    use tentaflow_protocol::*;
+    let op = match op {
+        CameraCvOpLocal::Detect { frames, threshold } => CameraCvOp::Detect {
+            frames: frames
+                .iter()
+                .map(camera_cv_detect_frame_to_wire)
+                .collect::<Result<Vec<_>, _>>()?,
+            threshold,
+        },
+        CameraCvOpLocal::ClassifyState { crop } => CameraCvOp::ClassifyState {
+            crop: camera_cv_frame_to_wire(&crop),
+        },
+        CameraCvOpLocal::Ocr { crop, mode } => CameraCvOp::Ocr {
+            crop: camera_cv_frame_to_wire(&crop),
+            mode,
+        },
+    };
+    Ok(ModelRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        payload: ModelPayload::CameraCv(CameraCvPayload {
+            model: model.to_string(),
+            op,
+        }),
+        stream: false,
+        metadata: None,
+        session_id: None,
+    })
+}
+
+/// FAZA 2 — mapuje `ModelResult` (mesh) na wynik camera-cv.
+fn camera_cv_result_from_model(
+    result: tentaflow_protocol::ModelResult,
+) -> Result<tentaflow_protocol::CameraCvResult, ExecutorError> {
+    use tentaflow_protocol::ModelResult;
+    match result {
+        ModelResult::CameraCv(r) => Ok(r),
+        ModelResult::Error(err) => Err(ExecutorError::Internal(format!(
+            "camera cv error: {}",
+            err.message
+        ))),
+        _ => Err(ExecutorError::Internal(
+            "camera cv returned unexpected result type".into(),
         )),
     }
 }
@@ -3621,80 +4091,193 @@ pub(crate) fn flow_outcome_to_stt_response(
 /// stream'a) lub brak `final_metrics` zwraca `None` — chunk wtedy bez `usage`,
 /// klient z `include_usage=true` widzi brak (warn'em wpisany w
 /// `apply_include_usage_split`).
-/// Wall-clockowy pomiar perf dla strumieni z ZEWNĘTRZNYCH serwisów (Docker
-/// vLLM/sglang, natywny python-bundle przez HTTP, QUIC sidecar). Silniki
-/// embedded raportują perf zmierzony wewnątrz silnika; serwis zewnętrzny nie
-/// ujawnia swojego wewnętrznego czasu prefill, więc jedynym uczciwym sygnałem
-/// jest zegar ścienny w naszym proxy: czas od dispatchu, moment pierwszego
-/// chunku z treścią i liczba tokenów z finalnego usage. Perf doklejany jest do
-/// FINALNEGO chunku (tego, który niesie usage), żeby przeszedł istniejącą
-/// ścieżką (LlmStreamChunk.perf → FlowExecutionOutcome.perf → ChatStreamEnd).
+/// Pomiar perf dla strumieni z ZEWNĘTRZNYCH serwisów (Docker vLLM/sglang,
+/// natywny python-bundle przez HTTP, QUIC sidecar). Silniki embedded raportują
+/// perf zmierzony wewnątrz silnika; serwis zewnętrzny nie ujawnia swojego
+/// wewnętrznego czasu prefill, więc liczymy UCZCIWE wartości obserwowane po
+/// stronie klienta:
+///   - TTFT = zegar ścienny od dispatchu do PIERWSZEGO tokena z treścią. Dla
+///     zdalnego serwisu to realna latencja (zawiera sieć + kolejkę serwera) — nie
+///     zmyślamy wewnętrznego czasu prefill.
+///   - decode tok/s = REALNE `completion_tokens` (z usage) / okno pierwszy→ostatni
+///     token treści.
+///   - prefill tok/s = REALNE `prompt_tokens` (z usage) / TTFT — uczciwe
+///     przybliżenie przepustowości prefill: tokeny promptu przetworzone w oknie do
+///     pierwszego tokena.
+/// Gdy backend NIE zwraca realnych liczników w usage, NIE fabrykujemy ich z
+/// długości tekstu — pomijamy tok/s (0.0 → UI pokazuje brak zamiast bzdury).
+/// Perf doklejany jest do FINALNEGO chunku (tego, który niesie usage), żeby
+/// przeszedł istniejącą ścieżką (LlmStreamChunk.perf → FlowExecutionOutcome.perf
+/// → ChatStreamEnd).
 struct ExternalPerfStream {
-    inner: ExecutorChunkStream,
-    start: std::time::Instant,
-    first_token_at: Option<std::time::Instant>,
-    content_chunks: u32,
+    rx: tokio::sync::mpsc::Receiver<CoreResult<ChatCompletionChunk>>,
 }
 
 impl ExternalPerfStream {
-    fn new(inner: ExecutorChunkStream) -> Self {
-        Self {
-            inner,
-            start: std::time::Instant::now(),
-            first_token_at: None,
-            content_chunks: 0,
-        }
+    /// `start` to znacznik DISPATCHU (sprzed wysłania requestu HTTP/QUIC), nie
+    /// moment spawnu tego wrappera — inaczej TTFT/total gubiłyby czas wysłania
+    /// nagłówków i odbioru odpowiedzi serwera. Klient mierzy realną latencję.
+    fn new(
+        mut inner: ExecutorChunkStream,
+        start: std::time::Instant,
+        recorder: Option<StreamMetricsRecorder>,
+    ) -> Self {
+        // Bounded (wysoki cap): normalne odpowiedzi mieszczą się bez tarcia, a
+        // patologiczny zawieszony konsument dostaje backpressure zamiast OOM przy
+        // długiej generacji. Eager-drain dalej stempluje czasy przy przybyciu.
+        let (tx, rx) = tokio::sync::mpsc::channel(8192);
+        // Eager drain: czytamy SSE z serwisu tak szybko jak przychodzi i
+        // stemplujemy czasy TU (przybycie z vLLM), a nie przy poll konsumenta.
+        // Bez tego leniwy strumień + backpressure TCP od przeglądarki rozciąga
+        // okno dekodowania do tempa konsumpcji i decode tok/s spada ~4x poniżej
+        // realnego tempa silnika. Timestampy domknięte w tasku drenującym są
+        // niezależne od konsumenta, więc decode_tps odzwierciedla tempo generacji.
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut first_token_at: Option<std::time::Instant> = None;
+            let mut last_token_at: Option<std::time::Instant> = None;
+            // Exact-once: metryka (success ALBO error) zapisywana DOKLADNIE RAZ na
+            // strumien, nawet gdy backend wysle >1 chunk z usage.
+            let mut recorded = false;
+            loop {
+                tokio::select! {
+                    // Anti-hang: gdy konsument porzuci `rx`, kończymy nawet jeśli
+                    // upstream (vLLM) stalluje — zwalniamy strumień HTTP/QUIC, nie
+                    // wisimy w nieskończoność na `inner.next()`.
+                    _ = tx.closed() => break,
+                    item = inner.next() => {
+                        match item {
+                            Some(Ok(mut chunk)) => {
+                                // Reasoning tokens ARE decode work (GPU/energy), so
+                                // reasoning models (ds4, deepseek) that stream
+                                // `reasoning_content` before any visible `content` must
+                                // still mark TTFT / count as output — otherwise
+                                // first_token_at never fires and decode_tps degenerates
+                                // to 0 for an entire chain-of-thought.
+                                let has_content = chunk.choices.iter().any(|c| {
+                                    c.delta.content.as_deref().is_some_and(|s| !s.is_empty())
+                                        || c.delta
+                                            .reasoning_content
+                                            .as_deref()
+                                            .is_some_and(|s| !s.is_empty())
+                                });
+                                if has_content {
+                                    let now = std::time::Instant::now();
+                                    if first_token_at.is_none() {
+                                        first_token_at = Some(now);
+                                    }
+                                    // Okno dekodowania domykamy na OSTATNIM tokenie treści,
+                                    // nie na chunku usage (który dla vLLM/sglang przychodzi
+                                    // za treścią).
+                                    last_token_at = Some(now);
+                                }
+                                // Finalny chunk to ten, który niesie usage (vLLM/sglang
+                                // usage-tail albo QUIC Done z final_metrics) — wtedy
+                                // doklejamy perf.
+                                if chunk.usage.is_some() && chunk.perf.is_none() {
+                                    chunk.perf = Some(build_external_perf(
+                                        start,
+                                        first_token_at,
+                                        last_token_at,
+                                        chunk.usage.as_ref(),
+                                    ));
+                                    // Finalny chunk niesie usage + swiezo doklejony
+                                    // perf — jedyny punkt streamu gdzie oba wspolistnieja,
+                                    // wiec tu (raz) stemplujemy metryke modelu.
+                                    if !recorded {
+                                        if let Some(rec) = &recorder {
+                                            if let (Some(u), Some(p)) =
+                                                (chunk.usage.as_ref(), chunk.perf.as_ref())
+                                            {
+                                                rec.record(u, p);
+                                                recorded = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                if tx.send(Ok(chunk)).await.is_err() {
+                                    // Konsument odpadł → kończymy drenowanie (anti-hang).
+                                    break;
+                                }
+                            }
+                            Some(Err(e)) => {
+                                let _ = tx.send(Err(e)).await;
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+            // Strumien skonczyl sie bez finalnego chunku usage (upstream error,
+            // EOF bez usage-tail, albo drop konsumenta przez `tx.closed()`) —
+            // zapisz wiersz BLEDU raz, zeby error-rate lapal porzucone/blednie
+            // zakonczone strumienie. Guard `recorded` gwarantuje exact-once.
+            if !recorded {
+                if let Some(rec) = &recorder {
+                    rec.record_error();
+                }
+            }
+        });
+        Self { rx }
     }
+}
 
-    /// Buduje GenPerf z zegara ściennego. `prefill_tps` to ESTYMATA: nie znamy
-    /// wewnętrznego czasu prefill serwisu zewnętrznego, więc od TTFT odejmujemy
-    /// jeden krok dekodowania (`1/decode_tps`) jako przybliżenie czasu samego
-    /// prefill. Gdy się nie da — coarse fallback `prompt_tokens / ttft_secs`.
-    fn build_perf(
-        &self,
-        end: std::time::Instant,
-        usage: Option<&crate::api::openai::types::Usage>,
-    ) -> crate::api::openai::types::GenPerf {
-        let first_token_at = self.first_token_at.unwrap_or(end);
-        let ttft_secs = first_token_at.duration_since(self.start).as_secs_f32();
-        let ttft_ms = (ttft_secs * 1000.0).round() as u32;
+/// Buduje GenPerf z realnych liczników usage + zegara ściennego klienta.
+/// Każda metryka jest albo realna/uczciwie przybliżona, albo pominięta (0.0)
+/// gdy brak danych — żadnych fabrykowanych estymat. Timestampy są stemplowane
+/// w tasku drenującym (przybycie chunku z serwisu), więc decode tok/s mierzy
+/// tempo generacji vLLM, nie tempo konsumpcji przeglądarki.
+fn build_external_perf(
+    start: std::time::Instant,
+    first_token_at: Option<std::time::Instant>,
+    last_token_at: Option<std::time::Instant>,
+    usage: Option<&crate::api::openai::types::Usage>,
+) -> crate::api::openai::types::GenPerf {
+    // TTFT: czas od dispatchu do pierwszego tokena treści. Realna,
+    // klient-obserwowana latencja (sieć + kolejka + prefill serwera).
+    let ttft_ms = first_token_at
+        .map(|t| t.duration_since(start).as_millis() as u32)
+        .unwrap_or(0);
 
-        let prompt_tokens = usage.map(|u| u.prompt_tokens).unwrap_or(0);
-        let completion_tokens = usage
-            .map(|u| u.completion_tokens)
-            .filter(|&c| c > 0)
-            .unwrap_or(self.content_chunks);
+    // Tylko REALNE liczniki z usage. Brak usage → 0 (pomijamy tok/s), nie
+    // zgadujemy z liczby chunków/długości tekstu.
+    let prompt_tokens = usage.map(|u| u.prompt_tokens).unwrap_or(0);
+    let completion_tokens = usage.map(|u| u.completion_tokens).unwrap_or(0);
 
-        let decode_secs = end.duration_since(first_token_at).as_secs_f32();
-        let decode_tps = if completion_tokens > 1 && decode_secs > 0.0 {
-            (completion_tokens - 1) as f32 / decode_secs
-        } else {
-            0.0
-        };
-
-        let prefill_tps = if prompt_tokens == 0 {
-            0.0
-        } else if decode_tps > 0.0 {
-            let one_decode_step = 1.0 / decode_tps;
-            let prefill_secs = ttft_secs - one_decode_step;
-            if prefill_secs > 0.0 {
-                prompt_tokens as f32 / prefill_secs
-            } else if ttft_secs > 0.0 {
-                prompt_tokens as f32 / ttft_secs
+    // decode tok/s = (completion_tokens-1) / okno (pierwszy→ostatni token).
+    // Dla N tokenów jest N-1 interwałów między pierwszym a ostatnim, zgodnie z
+    // kontraktem GenPerf i local.rs (przy 1 tokenie decode_tps=0 — brak okna).
+    let decode_tps = match (first_token_at, last_token_at) {
+        (Some(first), Some(last)) if completion_tokens > 0 => {
+            let secs = last.duration_since(first).as_secs_f32();
+            if secs > 0.0 {
+                completion_tokens.saturating_sub(1) as f32 / secs
             } else {
                 0.0
             }
-        } else if ttft_secs > 0.0 {
-            prompt_tokens as f32 / ttft_secs
-        } else {
-            0.0
-        };
-
-        crate::api::openai::types::GenPerf {
-            ttft_ms,
-            prefill_tps,
-            decode_tps,
         }
+        _ => 0.0,
+    };
+
+    // prefill tok/s = realne prompt_tokens / TTFT (uczciwe przybliżenie).
+    let ttft_secs = (ttft_ms as f32) / 1000.0;
+    let prefill_tps = if prompt_tokens > 0 && ttft_secs > 0.0 {
+        prompt_tokens as f32 / ttft_secs
+    } else {
+        0.0
+    };
+
+    // total_ms: pełny czas od dispatchu do ostatniego tokena treści.
+    let total_ms = last_token_at
+        .map(|t| t.duration_since(start).as_millis() as u32)
+        .unwrap_or(0);
+
+    crate::api::openai::types::GenPerf {
+        ttft_ms,
+        prefill_tps,
+        decode_tps,
+        total_ms,
     }
 }
 
@@ -3705,37 +4288,7 @@ impl Stream for ExternalPerfStream {
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        use std::task::Poll;
-        match self.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(mut chunk))) => {
-                // Reasoning tokens ARE decode work (GPU/energy), so reasoning
-                // models (ds4, deepseek) that stream `reasoning_content` before
-                // any visible `content` must still mark TTFT / count as output —
-                // otherwise first_token_at never fires and decode_tps degenerates
-                // to 0 for an entire chain-of-thought.
-                let has_content = chunk.choices.iter().any(|c| {
-                    c.delta.content.as_deref().is_some_and(|s| !s.is_empty())
-                        || c.delta
-                            .reasoning_content
-                            .as_deref()
-                            .is_some_and(|s| !s.is_empty())
-                });
-                if has_content {
-                    if self.first_token_at.is_none() {
-                        self.first_token_at = Some(std::time::Instant::now());
-                    }
-                    self.content_chunks = self.content_chunks.saturating_add(1);
-                }
-                // Finalny chunk to ten, który niesie usage (vLLM/sglang usage-tail
-                // albo QUIC Done z final_metrics) — wtedy doklejamy perf.
-                if chunk.usage.is_some() && chunk.perf.is_none() {
-                    let perf = self.build_perf(std::time::Instant::now(), chunk.usage.as_ref());
-                    chunk.perf = Some(perf);
-                }
-                Poll::Ready(Some(Ok(chunk)))
-            }
-            other => other,
-        }
+        self.rx.poll_recv(cx)
     }
 }
 
@@ -3800,6 +4353,164 @@ fn served_by(target: &ResolvedExecutionTarget) -> Option<String> {
     }
 }
 
+use crate::db::repository::MODEL_METRICS_HISTOGRAM_VERSION;
+
+/// Znormalizowane wejscie jednego zapisu metryk modelu. Grupuje wymiary +
+/// liczniki w jeden argument, zeby `bump_model_metric_row` nie mial dziesiatek
+/// parametrow (clippy `too_many_arguments`). Wszystkie pola sa juz policzone
+/// przez callera — ta warstwa tylko mapuje na struktury repozytorium.
+struct ModelMetricInput<'a> {
+    node_id: &'a str,
+    org_id: &'a str,
+    user_id: &'a str,
+    model_id: &'a str,
+    service_key: &'a str,
+    backend: &'a str,
+    modality: &'a str,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    total_tokens: i64,
+    embedding_tokens: i64,
+    e2e_latency_ms: i64,
+    /// Proba do histogramu TTFT — `Some` tylko dla realnego pomiaru (>0).
+    ttft_sample: Option<i64>,
+    /// Proba do histogramu decode tok/s — `Some` tylko dla realnego pomiaru (>0).
+    decode_tps_sample: Option<f64>,
+    /// Proba do histogramu e2e — `Some` tylko dla realnego pomiaru (>0).
+    e2e_sample: Option<i64>,
+    is_error: bool,
+}
+
+/// Jeden punkt zapisu do `model_metrics_rollup`. Metryki nie moga wywrocic
+/// requestu — blad zapisu jest tylko logowany (`warn`). `hour_bucket` liczony
+/// tutaj (RFC3339 przyciety do godziny), zeby kazdy caller mial identyczny format.
+fn bump_model_metric_row(db: &crate::db::DbPool, input: &ModelMetricInput<'_>) {
+    let hour_bucket = chrono::Utc::now().format("%Y-%m-%dT%H:00:00Z").to_string();
+    let dims = crate::db::models::ModelMetricsDims {
+        node_id: input.node_id,
+        org_id: input.org_id,
+        user_id: input.user_id,
+        model_id: input.model_id,
+        service_key: input.service_key,
+        backend: input.backend,
+        modality: input.modality,
+        hour_bucket: &hour_bucket,
+        histogram_version: MODEL_METRICS_HISTOGRAM_VERSION,
+    };
+    let counters = crate::db::models::ModelMetricsCounters {
+        request_count: 1,
+        success_count: if input.is_error { 0 } else { 1 },
+        error_count: if input.is_error { 1 } else { 0 },
+    };
+    let tokens = crate::db::models::ModelMetricsTokens {
+        prompt_tokens: input.prompt_tokens,
+        completion_tokens: input.completion_tokens,
+        total_tokens: input.total_tokens,
+        embedding_tokens: input.embedding_tokens,
+        audio_ms: 0,
+        images: 0,
+    };
+    let times = crate::db::models::ModelMetricsTimes {
+        // prefill/decode sumy czasow swiadomie pominiete: GenPerf niesie tok/s,
+        // nie sekundy, a przeliczanie ich na czas byloby zgadywaniem. Histogramy
+        // ttft/decode_tps niosa realny obraz wydajnosci. queue_ms brak pomiaru.
+        prefill_secs: 0.0,
+        decode_secs: 0.0,
+        e2e_latency_ms: input.e2e_latency_ms,
+        queue_ms: 0,
+    };
+    let perf = crate::db::models::ModelMetricsPerfSamples {
+        ttft_ms: input.ttft_sample,
+        decode_tps: input.decode_tps_sample,
+        e2e_ms: input.e2e_sample,
+    };
+    if let Err(e) = crate::db::repository::bump_model_metrics_rollup(
+        db, &dims, &counters, &tokens, &times, &perf,
+    ) {
+        tracing::warn!(
+            model_id = input.model_id,
+            error = %e,
+            "model metrics rollup bump failed (metrics dropped, request unaffected)"
+        );
+    }
+}
+
+/// Lekki uchwyt do zapisu metryk ze strumienia. `ExternalPerfStream` drenuje
+/// chunki w osobnym tasku (bez `ctx`/`target`), wiec wymiary klonujemy do prostych
+/// `String` przy budowie streamu i stemplujemy metryke na finalnym chunku (tym,
+/// ktory niesie `usage` + doklejony `perf`). Modalnosc zawsze `chat` — to jedyna
+/// sciezka streamujaca przez ten wrapper.
+#[derive(Clone)]
+struct StreamMetricsRecorder {
+    db: crate::db::DbPool,
+    node_id: String,
+    org_id: String,
+    user_id: String,
+    model_id: String,
+    service_key: String,
+    backend: String,
+}
+
+impl StreamMetricsRecorder {
+    fn record(
+        &self,
+        usage: &crate::api::openai::types::Usage,
+        perf: &crate::api::openai::types::GenPerf,
+    ) {
+        let e2e_ms = perf.total_ms as i64;
+        bump_model_metric_row(
+            &self.db,
+            &ModelMetricInput {
+                node_id: &self.node_id,
+                org_id: &self.org_id,
+                user_id: &self.user_id,
+                model_id: &self.model_id,
+                service_key: &self.service_key,
+                backend: &self.backend,
+                modality: "chat",
+                prompt_tokens: usage.prompt_tokens as i64,
+                completion_tokens: usage.completion_tokens as i64,
+                total_tokens: usage.total_tokens as i64,
+                embedding_tokens: 0,
+                e2e_latency_ms: e2e_ms,
+                ttft_sample: (perf.ttft_ms > 0).then_some(perf.ttft_ms as i64),
+                decode_tps_sample: (perf.decode_tps > 0.0).then_some(perf.decode_tps as f64),
+                e2e_sample: (e2e_ms > 0).then_some(e2e_ms),
+                is_error: false,
+            },
+        );
+    }
+
+    /// Wiersz BLEDU dla strumienia, ktory zakonczyl sie bez finalnego chunku
+    /// usage: upstream error, EOF bez usage-tail, albo drop konsumenta
+    /// (`tx.closed()`). Bez tokenow/perf — liczy sie wylacznie do error-rate.
+    /// Rozroznienie "drop konsumenta" vs "blad backendu" jest tu niepewne, wiec
+    /// oba traktujemy jako error (lepsze niz gubienie porzuconych strumieni).
+    fn record_error(&self) {
+        bump_model_metric_row(
+            &self.db,
+            &ModelMetricInput {
+                node_id: &self.node_id,
+                org_id: &self.org_id,
+                user_id: &self.user_id,
+                model_id: &self.model_id,
+                service_key: &self.service_key,
+                backend: &self.backend,
+                modality: "chat",
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                embedding_tokens: 0,
+                e2e_latency_ms: 0,
+                ttft_sample: None,
+                decode_tps_sample: None,
+                e2e_sample: None,
+                is_error: true,
+            },
+        );
+    }
+}
+
 /// HF repo dla embedded TTS na podstawie `engine_id` + `model_name` (preset id
 /// z katalogu). Mapowanie preset→repo zyje w manifescie silnika; gdy go nie ma,
 /// `model_name` traktujemy jako bezposrednie repo (single-voice deploy).
@@ -3821,6 +4532,130 @@ fn resolve_embedded_tts_repo(engine_id: &str, model_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Chunk 2: `bump_model_metric_row` mapuje `ModelMetricInput` na wiersz
+    /// `model_metrics_rollup` — sprawdzamy wymiary (model/backend/service_key),
+    /// liczniki (sukces vs `is_error`), `embedding_tokens` dla modalnosci
+    /// embedding oraz bramkowanie histogramow (perf `None` → zero probek).
+    #[test]
+    fn bump_model_metric_row_maps_dims_counters_and_perf() {
+        let pool = crate::db::init(std::path::Path::new(":memory:")).expect("init test db");
+
+        // Sukces chat, brak perf → request+success policzone, histogramy nietkniete.
+        bump_model_metric_row(
+            &pool,
+            &ModelMetricInput {
+                node_id: "node-A",
+                org_id: crate::services::org::DEFAULT_ORG_ID,
+                user_id: "u1",
+                model_id: "qwen-chat",
+                service_key: "http/qwen-chat",
+                backend: "http",
+                modality: "chat",
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                embedding_tokens: 0,
+                e2e_latency_ms: 120,
+                ttft_sample: None,
+                decode_tps_sample: None,
+                e2e_sample: Some(120),
+                is_error: false,
+            },
+        );
+
+        let rows = crate::db::repository::list_model_metrics_rollup(
+            &pool,
+            crate::services::org::DEFAULT_ORG_ID,
+            &Default::default(),
+        )
+        .expect("list rollup");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.node_id, "node-A");
+        assert_eq!(row.model_id, "qwen-chat");
+        assert_eq!(row.backend, "http");
+        assert_eq!(row.service_key, "http/qwen-chat");
+        assert_eq!(row.modality, "chat");
+        assert_eq!(row.request_count, 1);
+        assert_eq!(row.success_count, 1);
+        assert_eq!(row.error_count, 0);
+        assert_eq!(row.total_tokens, 15);
+        assert_eq!(row.embedding_tokens, 0);
+        // perf None → brak probki w histogramach, ale e2e_sample Some → jeden e2e.
+        assert_eq!(row.ttft_sample_count, 0);
+        assert_eq!(row.decode_tps_sample_count, 0);
+        assert_eq!(row.e2e_sample_count, 1);
+
+        // Blad w tym samym kubelku wymiarow → error_count rosnie, success nie.
+        bump_model_metric_row(
+            &pool,
+            &ModelMetricInput {
+                node_id: "node-A",
+                org_id: crate::services::org::DEFAULT_ORG_ID,
+                user_id: "u1",
+                model_id: "qwen-chat",
+                service_key: "http/qwen-chat",
+                backend: "http",
+                modality: "chat",
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                embedding_tokens: 0,
+                e2e_latency_ms: 0,
+                ttft_sample: None,
+                decode_tps_sample: None,
+                e2e_sample: None,
+                is_error: true,
+            },
+        );
+        let row = &crate::db::repository::list_model_metrics_rollup(
+            &pool,
+            crate::services::org::DEFAULT_ORG_ID,
+            &Default::default(),
+        )
+        .expect("list rollup")[0];
+        assert_eq!(row.request_count, 2);
+        assert_eq!(row.success_count, 1);
+        assert_eq!(row.error_count, 1);
+
+        // Embedding: `embedding_tokens` == total_tokens dla modalnosci embedding
+        // (osobny kubelek — inny modality/model → nowy wiersz).
+        bump_model_metric_row(
+            &pool,
+            &ModelMetricInput {
+                node_id: "node-A",
+                org_id: crate::services::org::DEFAULT_ORG_ID,
+                user_id: "u1",
+                model_id: "bge-embed",
+                service_key: "embedded/bge-embed",
+                backend: "embedded",
+                modality: "embedding",
+                prompt_tokens: 8,
+                completion_tokens: 0,
+                total_tokens: 8,
+                embedding_tokens: 8,
+                e2e_latency_ms: 5,
+                ttft_sample: None,
+                decode_tps_sample: None,
+                e2e_sample: Some(5),
+                is_error: false,
+            },
+        );
+        let rows = crate::db::repository::list_model_metrics_rollup(
+            &pool,
+            crate::services::org::DEFAULT_ORG_ID,
+            &Default::default(),
+        )
+        .expect("list rollup");
+        let emb = rows
+            .iter()
+            .find(|r| r.model_id == "bge-embed")
+            .expect("embedding row present");
+        assert_eq!(emb.modality, "embedding");
+        assert_eq!(emb.embedding_tokens, 8);
+        assert_eq!(emb.total_tokens, 8);
+    }
 
     /// `aborts_fallback_chain` flags only the variants that no fallback
     /// candidate can fix. Everything else lets the executor try the
@@ -3879,6 +4714,100 @@ mod tests {
         // Kolejny aliasowy fallback inkrementuje dalej (do 2).
         note_fallback(alias, true, 3, "http");
         assert_eq!(alias_fallback_count(alias), 2);
+    }
+
+    /// Test regresyjny odsprzęgania pomiaru decode tok/s od tempa konsumpcji.
+    /// `ExternalPerfStream` stempluje first/last token w momencie PRZYBYCIA chunku
+    /// z serwisu (eager-drain task), więc decode_tps odzwierciedla tempo generacji
+    /// silnika, NIE tempo z jakim leniwy konsument (przeglądarka renderująca
+    /// markdown) odczytuje strumień. Symulujemy serwis emitujący ~200 tok/s i
+    /// konsumenta odczytującego ~40 tok/s — decode_tps MUSI być bliskie tempu
+    /// emisji. Gdyby okno dekodowania szło w tempie poll konsumenta (stary, zły
+    /// kod), decode_tps wyszłoby ~40. Multi-thread runtime jest KLUCZOWY: bez
+    /// równoległości eager-drain task nie biegłby naprawdę obok wolnego konsumenta.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn external_perf_decouples_decode_tps_from_slow_consumer() {
+        use crate::api::openai::types::{ChunkChoice, Delta, Usage};
+        use futures::StreamExt;
+        use std::time::{Duration, Instant};
+
+        fn content_chunk(text: &str) -> ChatCompletionChunk {
+            ChatCompletionChunk {
+                id: "test".into(),
+                object: "chat.completion.chunk".into(),
+                created: 0,
+                model: "test-model".into(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: Delta {
+                        role: None,
+                        content: Some(text.into()),
+                        reasoning_content: None,
+                        tool_calls: None,
+                    },
+                    finish_reason: None,
+                    logprobs: None,
+                }],
+                system_fingerprint: None,
+                audio: None,
+                detected_intent: None,
+                detected_tools: None,
+                transcribed_text: None,
+                speaker_id: None,
+                speaker_name: None,
+                usage: None,
+                perf: None,
+            }
+        }
+
+        // Serwis emituje 100 chunków treści po ~5ms (≈200 tok/s), potem chunk
+        // usage (bez treści, completion_tokens=100), na końcu bez perf.
+        let inner = async_stream::stream! {
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                yield Ok(content_chunk("x"));
+            }
+            let mut tail = content_chunk("");
+            tail.choices[0].delta.content = None;
+            tail.usage = Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 100,
+                total_tokens: 110,
+            });
+            yield Ok(tail);
+        };
+        let inner: ExecutorChunkStream = Box::pin(inner);
+
+        let mut stream = ExternalPerfStream::new(inner, Instant::now(), None);
+
+        // Wolny konsument: 25ms na token (≈40 tok/s) — gdyby pomiar szedł w jego
+        // tempie, decode_tps spadłoby ~5x poniżej realnego tempa silnika.
+        let mut captured_perf = None;
+        while let Some(item) = stream.next().await {
+            let chunk = item.expect("chunk powinien być Ok");
+            if chunk.perf.is_some() {
+                captured_perf = chunk.perf;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let perf = captured_perf.expect("finalny chunk z usage musi nieść perf");
+        eprintln!(
+            "external_perf: decode_tps={:.1} ttft_ms={} total_ms={}",
+            perf.decode_tps, perf.ttft_ms, perf.total_ms
+        );
+
+        // decode_tps odzwierciedla tempo emisji (~200/s), nie konsumpcji (~40/s).
+        // Próg 120 z zapasem na jitter timerów; gdyby okno szło w tempie
+        // konsumenta, wyszłoby ~40 i asercja by padła.
+        assert!(
+            perf.decode_tps > 120.0,
+            "decode_tps={} powinno odzwierciedlac tempo emisji ~200/s, nie konsumpcji ~40/s",
+            perf.decode_tps
+        );
+        // Sanity: pełne okno i TTFT są dodatnie.
+        assert!(perf.total_ms > 0, "total_ms powinno być dodatnie");
+        assert!(perf.ttft_ms > 0, "ttft_ms powinno być dodatnie");
     }
 
     // R3b.1: `dispatch_embeddings_blocking` per-target tests. Branches without
@@ -4215,6 +5144,188 @@ mod tests {
             .await
             .expect_err("flow without dispatcher should be a typed error");
         assert!(matches!(err, ExecutorError::FlowDispatcherUnavailable));
+    }
+
+    // FAZA 2: per-target `dispatch_camera_cv` tests. Embedded dispatchuje po
+    // `engine_id` (nieznany silnik → Internal, chain idzie dalej); HTTP jest
+    // architektonicznie zakazany; MeshForward bez mesh managera → pending
+    // cutover; Flow → Internal (brak flow-target surface).
+
+    fn make_cv_frame(w: u32, h: u32) -> CvFrameLocal {
+        CvFrameLocal {
+            data: vec![0u8; (w * h * 3) as usize].into(),
+            width: w,
+            height: h,
+        }
+    }
+
+    fn make_camera_cv_request(model: &str) -> CameraCvRequest {
+        CameraCvRequest {
+            model: model.to_string(),
+            op: CameraCvOpLocal::ClassifyState {
+                crop: make_cv_frame(64, 64),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn camera_cv_embedded_unknown_engine_is_internal() {
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::Local {
+            service_id: 1,
+            model_name: "cv-m".into(),
+            handle: BackendHandle::Embedded {
+                model_name: "cv-m".into(),
+                node_id: "local".into(),
+                engine_id: "test-engine".into(),
+            },
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_camera_cv(&target, make_camera_cv_request("cv-m"), &mut ctx)
+            .await
+            .expect_err("unknown embedded engine must error");
+        // Internal (nie abort) → failover próbuje kolejnych kandydatów.
+        assert!(matches!(err, ExecutorError::Internal(_)));
+        assert!(!err.aborts_fallback_chain());
+    }
+
+    #[tokio::test]
+    async fn camera_cv_http_transport_is_rejected() {
+        let backend = crate::config::ServiceBackend {
+            connection: crate::config::ConnectionType::OpenAIApi {
+                url: "http://127.0.0.1:1".into(),
+                api_key: Some(String::new()),
+                api_key_env: None,
+                extra_headers: Vec::new(),
+                custom_endpoint: None,
+                request_format: None,
+                tts_config: None,
+            },
+            max_concurrent: 1,
+            timeout_ms: 1_000,
+            weight: 1,
+            model_name_override: None,
+            health_check_path: None,
+        };
+        let client = crate::services::backend::client::BackendClient::new(backend, None)
+            .expect("test backend client");
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::Local {
+            service_id: 1,
+            model_name: "cv-m".into(),
+            handle: BackendHandle::Http(Arc::new(client)),
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_camera_cv(&target, make_camera_cv_request("cv-m"), &mut ctx)
+            .await
+            .expect_err("camera-cv over HTTP must be rejected");
+        assert!(matches!(err, ExecutorError::Internal(_)));
+        assert!(err.to_string().contains("embedded/mesh"));
+    }
+
+    #[tokio::test]
+    async fn camera_cv_mesh_forward_without_mesh_returns_pending_cutover() {
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::MeshForward {
+            node_id: "peer".into(),
+            service_id: 1,
+            model_name: "cv-m".into(),
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_camera_cv(&target, make_camera_cv_request("cv-m"), &mut ctx)
+            .await
+            .expect_err("mesh_forward without mesh manager should be pending cutover");
+        assert!(matches!(
+            err,
+            ExecutorError::TransportPendingCutover("mesh_forward")
+        ));
+    }
+
+    #[tokio::test]
+    async fn camera_cv_flow_target_is_internal() {
+        let exec = dummy_executor();
+        let target = ResolvedExecutionTarget::Flow {
+            flow_id: "1".to_string(),
+            published_name: "cv-flow".into(),
+        };
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .dispatch_camera_cv(&target, make_camera_cv_request("any"), &mut ctx)
+            .await
+            .expect_err("camera-cv has no flow-target surface");
+        assert!(matches!(err, ExecutorError::Internal(_)));
+    }
+
+    /// `execute_camera_cv` dla nieznanego modelu surface'uje błąd resolvera —
+    /// pusty katalog `dummy_executor` nie ma serwisu camera-cv.
+    #[tokio::test]
+    async fn execute_camera_cv_unknown_model_surfaces_resolve_error() {
+        let exec = dummy_executor();
+        let mut ctx = ExecutionContext::default();
+        let err = exec
+            .execute_camera_cv(make_camera_cv_request("no-such-cv"), &mut ctx)
+            .await
+            .expect_err("unknown camera-cv model must error, not panic");
+        assert!(matches!(err, ExecutorError::Resolve(_)));
+    }
+
+    /// Payload mesh dla `Detect`: klatka większa niż 560×560 jest zmniejszana
+    /// do krawędzi detektora (limit ramki CBOR 16 MiB), mniejsza leci bez zmian.
+    /// Klatki na drucie są RGB24 (`data.len() == w*h*3`).
+    #[test]
+    fn camera_cv_model_request_resizes_detect_frames_for_mesh() {
+        let frames = vec![make_cv_frame(1280, 720), make_cv_frame(320, 240)];
+        let req = camera_cv_model_request(
+            "rfdetr-adr-base",
+            CameraCvOpLocal::Detect {
+                frames,
+                threshold: Some(0.4),
+            },
+        )
+        .expect("mesh payload builds");
+        let tentaflow_protocol::ModelPayload::CameraCv(p) = req.payload else {
+            panic!("expected CameraCv payload");
+        };
+        assert_eq!(p.model, "rfdetr-adr-base");
+        let tentaflow_protocol::CameraCvOp::Detect { frames, threshold } = p.op else {
+            panic!("expected Detect op");
+        };
+        assert_eq!(threshold, Some(0.4));
+        assert_eq!(frames.len(), 2);
+        assert_eq!((frames[0].width, frames[0].height), (560, 560));
+        assert_eq!(frames[0].data.len(), 560 * 560 * 3);
+        assert!(matches!(
+            frames[0].encoding,
+            tentaflow_protocol::CvFrameEncoding::Rgb24
+        ));
+        assert_eq!((frames[1].width, frames[1].height), (320, 240));
+        assert_eq!(frames[1].data.len(), 320 * 240 * 3);
+    }
+
+    /// Payload mesh dla `Ocr`: crop NIE jest zmniejszany (downscale dotyczy
+    /// tylko klatek `Detect`), a tryb OCR jest zachowany.
+    #[test]
+    fn camera_cv_model_request_keeps_ocr_crop_and_mode() {
+        let req = camera_cv_model_request(
+            "plate-ocr-fast",
+            CameraCvOpLocal::Ocr {
+                crop: make_cv_frame(900, 300),
+                mode: tentaflow_protocol::CvOcrMode::Adr,
+            },
+        )
+        .expect("mesh payload builds");
+        let tentaflow_protocol::ModelPayload::CameraCv(p) = req.payload else {
+            panic!("expected CameraCv payload");
+        };
+        let tentaflow_protocol::CameraCvOp::Ocr { crop, mode } = p.op else {
+            panic!("expected Ocr op");
+        };
+        assert_eq!((crop.width, crop.height), (900, 300));
+        assert_eq!(crop.data.len(), 900 * 300 * 3);
+        assert!(matches!(mode, tentaflow_protocol::CvOcrMode::Adr));
     }
 
     /// RAG E1.4 — buduje `DocumentParseRequest` z realnym, minimalnym PDF

@@ -542,7 +542,418 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "cluster_members_rdma_gid_index",
             MigrationStep::Rust(cluster_members_add_gid_index),
         ),
+        (
+            101,
+            "cluster_deployments_dist_port",
+            MigrationStep::Rust(cluster_deployments_add_dist_port),
+        ),
+        (
+            102,
+            "model_metrics_rollup_table",
+            MigrationStep::Sql(MODEL_METRICS_ROLLUP_SCHEMA),
+        ),
+        (
+            103,
+            "model_pricing_table",
+            MigrationStep::Sql(MODEL_PRICING_SCHEMA),
+        ),
+        (
+            104,
+            "model_metrics_permissions",
+            MigrationStep::Rust(model_metrics_add_permissions),
+        ),
+        (
+            105,
+            "ensure_token_permissions",
+            MigrationStep::Rust(ensure_token_permissions),
+        ),
+        (
+            106,
+            "cameras_vendor_check_mjpeg",
+            MigrationStep::Rust(cameras_vendor_check_add_mjpeg),
+        ),
+        (
+            107,
+            "benchmark_studio_tables",
+            MigrationStep::Sql(BENCHMARK_STUDIO_SCHEMA),
+        ),
+        (
+            108,
+            "benchmark_permissions",
+            MigrationStep::Rust(benchmark_add_permissions),
+        ),
+        (
+            109,
+            "camera_cv_pipelines",
+            MigrationStep::Rust(create_camera_cv_pipelines),
+        ),
+        (
+            110,
+            "camera_cv_pipelines_org_scope",
+            MigrationStep::Rust(camera_cv_pipelines_add_org_scope),
+        ),
+        (
+            111,
+            "vision_models_registry",
+            MigrationStep::Rust(create_vision_models),
+        ),
+        (
+            112,
+            "drop_notes_table",
+            MigrationStep::Sql(DROP_NOTES_TABLE),
+        ),
+        (
+            113,
+            "strip_pii_from_default_chat_flow",
+            MigrationStep::Rust(strip_pii_from_default_chat_flow),
+        ),
     ]
+}
+
+// v112 — the built-in Notes screen was removed in favor of the notes addon
+// (which keeps its data in its own addon SQLite). The platform `notes` table
+// and its indexes are dead storage, so drop them.
+const DROP_NOTES_TABLE: &str = r#"
+DROP INDEX IF EXISTS idx_notes_user;
+DROP INDEX IF EXISTS idx_notes_user_updated;
+DROP TABLE IF EXISTS notes;
+"#;
+
+/// v111 — vision model registry for the configurable camera-CV pipeline.
+/// Rows describe dynamic ONNX models (trained in ML Studio or imported) that
+/// the generic `onnx-cv` embedded engine serves without recompiling. Bundled
+/// fixed engines (rfdetr-adr / nalepka-stan / plate-ocr / onnx-ocr / apple-ocr)
+/// are NOT seeded here — they keep resolving through their fixed engine ids.
+/// The CHECK admits op='embed' so a future op does not need a schema change,
+/// but registration rejects it until `CameraCvOp` grows an Embed variant.
+/// Idempotent (IF NOT EXISTS).
+fn create_vision_models(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS vision_models (
+            model_name TEXT PRIMARY KEY,
+            op TEXT NOT NULL CHECK(op IN ('detect','classify','ocr','embed')),
+            file_name TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            classes_json TEXT NOT NULL DEFAULT '[]',
+            preprocess_json TEXT NOT NULL DEFAULT '{}',
+            output_contract TEXT NOT NULL CHECK(output_contract IN ('rfdetr','softmax')),
+            source TEXT NOT NULL CHECK(source IN ('bundled','trained','imported')),
+            default_threshold REAL,
+            org_id TEXT NOT NULL DEFAULT 'org-default',
+            project_id TEXT,
+            source_model_id TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
+/// v110 — org scoping for camera CV pipelines. Adds `org_id` (defaulting
+/// existing rows to the single default org, same convention as other
+/// org-scoped tables) and replaces the global "one default pipeline" unique
+/// index with a per-org one, so every org resolves its own `is_default=1`
+/// row. Idempotent (column probe + IF NOT EXISTS).
+fn camera_cv_pipelines_add_org_scope(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "camera_cv_pipelines", "org_id")? {
+        conn.execute_batch(
+            "ALTER TABLE camera_cv_pipelines \
+             ADD COLUMN org_id TEXT NOT NULL DEFAULT 'org-default';",
+        )?;
+    }
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_camera_cv_pipelines_default;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_cv_pipelines_default_org
+            ON camera_cv_pipelines(org_id) WHERE is_default = 1;",
+    )?;
+    Ok(())
+}
+
+/// v109 — configurable camera CV pipelines. `camera_cv_pipelines` stores the
+/// stage graph as JSON (validated by `cv_pipeline::validate` on save);
+/// `is_default=1` marks the seed-owned fallback used by cameras without an
+/// explicit assignment. `cameras.cv_pipeline_id` is the per-camera pointer
+/// (NULL = default pipeline). Idempotent (IF NOT EXISTS + column probe).
+fn create_camera_cv_pipelines(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS camera_cv_pipelines (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            pipeline_json TEXT NOT NULL,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_cv_pipelines_default
+            ON camera_cv_pipelines(is_default) WHERE is_default = 1;",
+    )?;
+    if !column_exists(conn, "cameras", "cv_pipeline_id")? {
+        conn.execute_batch("ALTER TABLE cameras ADD COLUMN cv_pipeline_id TEXT NULL;")?;
+    }
+    Ok(())
+}
+
+// v108 — RBAC dla Benchmark Studio. Admin/DPO dostają odczyt i zapis (edycja
+// definicji, start i anulowanie runów), operator oraz viewer tylko odczyt.
+// Idempotentne przez `roles_add_permissions` (wzorzec jak `model_metrics_add_permissions`).
+fn benchmark_add_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(
+        conn,
+        &["org_admin", "dpo"],
+        &["benchmark.read", "benchmark.write"],
+    )?;
+    roles_add_permissions(conn, &["org_operator", "org_viewer"], &["benchmark.read"])?;
+    Ok(())
+}
+
+// v105 — backfill `tokens.*` grants. v87 (`token_metrics_add_permissions`) was added
+// after some databases had already migrated past version 87, so it never ran there and
+// admins ended up without `tokens.read` (PolicyDenied on the token usage screen). Re-run
+// the same grants at a fresh version; `roles_add_permissions` is idempotent, so fresh
+// installs (which already got v87) are a no-op.
+fn ensure_token_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(conn, &["org_admin", "dpo"], &["tokens.read", "tokens.write"])?;
+    roles_add_permissions(conn, &["org_operator", "org_viewer"], &["tokens.read"])?;
+    Ok(())
+}
+
+// v106 — dodaje vendor 'mjpeg' (kamery MJPEG po HTTP, multipart/x-mixed-replace)
+// do CHECK-a `cameras.vendor`. SQLite nie umie zmienić CHECK-a w miejscu, więc
+// tabela jest przebudowywana. W odróżnieniu od wcześniejszych rebuildów
+// (v48/v80 z zaszytym schematem) schemat bierzemy DYNAMICZNIE z sqlite_master —
+// po v80 kolejne migracje dokładały kolumny (analysis_*, depth_*) przez ALTER
+// TABLE, więc zaszyta lista kolumn groziłaby ich utratą. Podmieniamy wyłącznie
+// listę vendorów w CHECK-u, kopiujemy wiersze 1:1 (`INSERT ... SELECT *` —
+// identyczna kolejność kolumn po rebuildzie z tego samego SQL) i odtwarzamy
+// indeksy. Idempotentna: gdy CHECK zawiera już 'mjpeg', nic nie robi. Żadna
+// tabela nie ma FK na `cameras`, więc rebuild w transakcji runnera jest
+// bezpieczny bez żonglowania `PRAGMA foreign_keys`.
+fn cameras_vendor_check_add_mjpeg(conn: &Connection) -> Result<()> {
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cameras'",
+        [],
+        |row| row.get(0),
+    )?;
+    if sql.contains("'mjpeg'") {
+        return Ok(());
+    }
+    let old_list = "'fake_file', 'rtsp', 'onvif', 'local_camera', 'v4l2', 'webrtc'";
+    let new_list = "'fake_file', 'rtsp', 'onvif', 'local_camera', 'v4l2', 'webrtc', 'mjpeg'";
+    let patched = sql.replace(old_list, new_list);
+    if patched == sql {
+        anyhow::bail!(
+            "cameras_vendor_check_add_mjpeg: nie znaleziono oczekiwanej listy vendorów w CHECK — \
+             schemat tabeli cameras odbiega od v80"
+        );
+    }
+    // Pierwsze wystąpienie 'cameras' w SQL to nazwa tabeli (goła lub w
+    // cudzysłowie) — podmiana na 'cameras_new' daje poprawny CREATE w obu
+    // wariantach zapisu.
+    let create_new = patched.replacen("cameras", "cameras_new", 1);
+
+    conn.execute_batch("DROP TABLE IF EXISTS cameras_new;")?;
+    conn.execute_batch(&create_new)?;
+    conn.execute_batch(
+        r#"
+INSERT INTO cameras_new SELECT * FROM cameras;
+DROP TABLE cameras;
+ALTER TABLE cameras_new RENAME TO cameras;
+
+CREATE UNIQUE INDEX idx_cameras_camera_id_active ON cameras(camera_id) WHERE removed_at IS NULL;
+CREATE INDEX idx_cameras_owner ON cameras(owner_addon_id, removed_at);
+CREATE INDEX idx_cameras_status ON cameras(status, removed_at);
+CREATE INDEX idx_cameras_org_id ON cameras(org_id);
+"#,
+    )?;
+    Ok(())
+}
+
+// v104 — RBAC dla metryk modeli. Admin/DPO dostają odczyt i zapis cennika,
+// operator oraz viewer tylko odczyt. Idempotentne przez `roles_add_permissions`
+// (wzorzec jak `token_metrics_add_permissions`).
+fn model_metrics_add_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(
+        conn,
+        &["org_admin", "dpo"],
+        &["metrics.read", "metrics.write"],
+    )?;
+    roles_add_permissions(conn, &["org_operator", "org_viewer"], &["metrics.read"])?;
+    Ok(())
+}
+
+// v102 — mesh-wide hourly rollup of model performance and usage metrics. Like
+// `token_usage_daily` it is single-writer-per-row (the owning node accumulates
+// only its own `id` rows; a mesh-wide figure is the SUM across all node rows) yet
+// replicates so any node can render fleet metrics. `id` is a deterministic hash of
+// all dimensions + node_id so the same logical bucket minted on different nodes
+// never collides. Latency/throughput distributions are captured as fixed-edge
+// histograms with a per-histogram `sample_count` so a bucket sum of 0 (no samples)
+// is distinguishable from a genuine measured 0. `histogram_version` lets a future
+// edge change re-key rows instead of silently mixing incompatible bucketings.
+const MODEL_METRICS_ROLLUP_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS model_metrics_rollup (
+    id                     TEXT PRIMARY KEY,
+    node_id                TEXT NOT NULL,
+    org_id                 TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    user_id                TEXT NOT NULL,
+    model_id               TEXT NOT NULL,
+    service_key            TEXT NOT NULL,
+    backend                TEXT NOT NULL,
+    modality               TEXT NOT NULL,
+    hour_bucket            TEXT NOT NULL,
+    histogram_version      INTEGER NOT NULL DEFAULT 1,
+    request_count          INTEGER NOT NULL DEFAULT 0,
+    success_count          INTEGER NOT NULL DEFAULT 0,
+    error_count            INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens          INTEGER NOT NULL DEFAULT 0,
+    completion_tokens      INTEGER NOT NULL DEFAULT 0,
+    total_tokens           INTEGER NOT NULL DEFAULT 0,
+    embedding_tokens       INTEGER NOT NULL DEFAULT 0,
+    audio_ms               INTEGER NOT NULL DEFAULT 0,
+    images                 INTEGER NOT NULL DEFAULT 0,
+    prefill_secs_sum       REAL NOT NULL DEFAULT 0,
+    decode_secs_sum        REAL NOT NULL DEFAULT 0,
+    e2e_latency_ms_sum     INTEGER NOT NULL DEFAULT 0,
+    queue_ms_sum           INTEGER NOT NULL DEFAULT 0,
+    ttft_b0                INTEGER NOT NULL DEFAULT 0,
+    ttft_b1                INTEGER NOT NULL DEFAULT 0,
+    ttft_b2                INTEGER NOT NULL DEFAULT 0,
+    ttft_b3                INTEGER NOT NULL DEFAULT 0,
+    ttft_b4                INTEGER NOT NULL DEFAULT 0,
+    ttft_b5                INTEGER NOT NULL DEFAULT 0,
+    ttft_b6                INTEGER NOT NULL DEFAULT 0,
+    ttft_b7                INTEGER NOT NULL DEFAULT 0,
+    ttft_b8                INTEGER NOT NULL DEFAULT 0,
+    ttft_b9                INTEGER NOT NULL DEFAULT 0,
+    ttft_sample_count      INTEGER NOT NULL DEFAULT 0,
+    decode_tps_b0          INTEGER NOT NULL DEFAULT 0,
+    decode_tps_b1          INTEGER NOT NULL DEFAULT 0,
+    decode_tps_b2          INTEGER NOT NULL DEFAULT 0,
+    decode_tps_b3          INTEGER NOT NULL DEFAULT 0,
+    decode_tps_b4          INTEGER NOT NULL DEFAULT 0,
+    decode_tps_b5          INTEGER NOT NULL DEFAULT 0,
+    decode_tps_b6          INTEGER NOT NULL DEFAULT 0,
+    decode_tps_b7          INTEGER NOT NULL DEFAULT 0,
+    decode_tps_sample_count INTEGER NOT NULL DEFAULT 0,
+    e2e_b0                 INTEGER NOT NULL DEFAULT 0,
+    e2e_b1                 INTEGER NOT NULL DEFAULT 0,
+    e2e_b2                 INTEGER NOT NULL DEFAULT 0,
+    e2e_b3                 INTEGER NOT NULL DEFAULT 0,
+    e2e_b4                 INTEGER NOT NULL DEFAULT 0,
+    e2e_b5                 INTEGER NOT NULL DEFAULT 0,
+    e2e_b6                 INTEGER NOT NULL DEFAULT 0,
+    e2e_b7                 INTEGER NOT NULL DEFAULT 0,
+    e2e_b8                 INTEGER NOT NULL DEFAULT 0,
+    e2e_b9                 INTEGER NOT NULL DEFAULT 0,
+    e2e_sample_count       INTEGER NOT NULL DEFAULT 0,
+    updated_at             TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_model_metrics_model ON model_metrics_rollup(org_id, model_id, hour_bucket);
+CREATE INDEX IF NOT EXISTS idx_model_metrics_user ON model_metrics_rollup(org_id, user_id, hour_bucket);
+CREATE INDEX IF NOT EXISTS idx_model_metrics_node ON model_metrics_rollup(node_id);
+CREATE INDEX IF NOT EXISTS idx_model_metrics_updated ON model_metrics_rollup(updated_at);
+"#;
+
+// v103 — per-model pricing, admin edited and LWW replicated (like `token_quota`).
+// The primary key is a deterministic synthetic `id` (hash of org_id+model_id) so
+// the same logical row minted on different nodes never collides and, crucially,
+// two organizations pricing the same `model_id` stay isolated. `updated_at` is the
+// node-local watermark and is NOT synced; the HLC on the sync operation drives
+// last-writer-wins, so a stale concurrent edit never clobbers a newer one.
+const MODEL_PRICING_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS model_pricing (
+    id                 TEXT PRIMARY KEY,
+    org_id             TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    model_id           TEXT NOT NULL,
+    prompt_per_1k      REAL NOT NULL DEFAULT 0,
+    completion_per_1k  REAL NOT NULL DEFAULT 0,
+    audio_per_min      REAL NOT NULL DEFAULT 0,
+    image_each         REAL NOT NULL DEFAULT 0,
+    updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(org_id, model_id)
+);
+CREATE INDEX IF NOT EXISTS idx_model_pricing_org ON model_pricing(org_id);
+"#;
+
+// v107 — Benchmark Studio: user-defined API benchmarks (llama-bench-style) for
+// mesh services and external LLM APIs. `benchmark_results.target_id` has NO FK
+// on purpose: targets may be edited/replaced between runs while historical
+// results must stay intact, hence the `target_label` snapshot on each row.
+// External API keys land in `api_key_enc` encrypted with the settings cipher.
+const BENCHMARK_STUDIO_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS benchmarks (
+    id           TEXT PRIMARY KEY,
+    org_id       TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+    name         TEXT NOT NULL,
+    config_json  TEXT NOT NULL DEFAULT '{}',
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_benchmarks_org ON benchmarks(org_id);
+
+CREATE TABLE IF NOT EXISTS benchmark_targets (
+    id            TEXT PRIMARY KEY,
+    benchmark_id  TEXT NOT NULL REFERENCES benchmarks(id) ON DELETE CASCADE,
+    kind          TEXT NOT NULL CHECK (kind IN ('service','external')),
+    service_ref   TEXT,
+    api_type      TEXT NOT NULL DEFAULT 'openai' CHECK (api_type IN ('openai','anthropic')),
+    host          TEXT NOT NULL,
+    port          INTEGER NOT NULL DEFAULT 0,
+    api_key_enc   TEXT,
+    model         TEXT NOT NULL,
+    label         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_targets_benchmark ON benchmark_targets(benchmark_id);
+
+CREATE TABLE IF NOT EXISTS benchmark_runs (
+    id                TEXT PRIMARY KEY,
+    benchmark_id      TEXT NOT NULL REFERENCES benchmarks(id) ON DELETE CASCADE,
+    started_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at       TEXT,
+    status            TEXT NOT NULL DEFAULT 'running'
+                      CHECK (status IN ('running','success','failed','cancelled')),
+    error             TEXT,
+    engine_meta_json  TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_runs_benchmark ON benchmark_runs(benchmark_id, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS benchmark_results (
+    id                TEXT PRIMARY KEY,
+    run_id            TEXT NOT NULL REFERENCES benchmark_runs(id) ON DELETE CASCADE,
+    target_id         TEXT NOT NULL,
+    target_label      TEXT NOT NULL,
+    scenario          TEXT NOT NULL CHECK (scenario IN ('latency','throughput','context','sustained')),
+    variant_json      TEXT NOT NULL DEFAULT '{}',
+    ttft_ms_mean      REAL,
+    ttft_ms_sigma     REAL,
+    prefill_tps_mean  REAL,
+    prefill_tps_sigma REAL,
+    decode_tps_mean   REAL,
+    decode_tps_sigma  REAL,
+    total_ms_mean     REAL,
+    total_ms_sigma    REAL,
+    p50_ms            REAL,
+    p90_ms            REAL,
+    p99_ms            REAL,
+    requests          INTEGER NOT NULL DEFAULT 0,
+    errors            INTEGER NOT NULL DEFAULT 0,
+    samples_json      TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_results_run ON benchmark_results(run_id);
+"#;
+
+/// Persist the torch.distributed TCPStore master port (`VLLM_PORT`) leased from
+/// the coordinator's `PortAllocator` alongside the serve port, so a clean stop
+/// can release BOTH leases (serve `port` was already persisted; `dist_port` was
+/// not, leaking that lease on every successful teardown). Idempotent (column
+/// probe). Default 0 = legacy row predating allocation; stop skips releasing 0.
+fn cluster_deployments_add_dist_port(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "cluster_deployments", "dist_port")? {
+        conn.execute_batch(
+            "ALTER TABLE cluster_deployments ADD COLUMN dist_port INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
 }
 
 /// Per-member RoCEv2 GID index for `NCCL_IB_GID_INDEX` (D3). Default 3 — the
@@ -1143,6 +1554,39 @@ fn rewrite_agent_run_to_inline_region(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Stable id of the seeded "Default Chat" flow (mirrors `seed::DEFAULT_CHAT_FLOW_ID`).
+const DEFAULT_CHAT_FLOW_ID: &str = "00000000-0000-4000-8000-000000000010";
+
+/// Exact JSON of the previously-seeded "Default Chat" flow that carried a hidden
+/// `pii_filter` node (`trigger -> llm -> pii_filter -> output(stream)`). This is
+/// the byte-for-byte shape shipped to every already-seeded DB. Matched verbatim
+/// so the migration only rewrites the untouched seeded row — any admin edit
+/// (reordering, added node, whitespace) changes the string and is left alone.
+const DEFAULT_CHAT_FLOW_JSON_WITH_PII: &str = r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1","from_port":"text","data_type":"text"},{"from_node":"l1","to_node":"p1","from_port":"stream"},{"from_node":"p1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#;
+
+/// Removes the hidden `pii_filter` from the seeded default chat flow. The default
+/// flow resolves for every model without its own flow (like the removed synthetic
+/// flow), so silently redacting the query/context/response was a hidden default a
+/// user never configured. Rewrites the seeded `…010` row (is_default=1) to the
+/// clean `trigger -> llm -> output(stream)` pipeline IN PLACE, but ONLY when its
+/// stored JSON is exactly the seeded pii shape. Admin-edited flows and flows that
+/// deliberately include pii_filter differ from that literal and are untouched.
+/// Fresh installs already seed the clean shape, so this is a no-op there.
+/// `pii_filter` stays a first-class node users can add themselves in Flow Builder.
+fn strip_pii_from_default_chat_flow(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE flows SET flow_json = ?1, \
+         description = 'Streaming chat pipeline: trigger -> LLM -> output(stream).' \
+         WHERE id = ?2 AND is_default = 1 AND flow_json = ?3",
+        rusqlite::params![
+            crate::db::seed::DEFAULT_CHAT_FLOW_JSON,
+            DEFAULT_CHAT_FLOW_ID,
+            DEFAULT_CHAT_FLOW_JSON_WITH_PII,
+        ],
+    )?;
+    Ok(())
+}
+
 // Durable conversation history (source of truth; the in-memory cache is only a
 // read-through buffer). One row per chat turn message keeps the full structure
 // the cache used to drop — `tool_calls` (assistant), `tool_call_id`/`name`
@@ -1473,7 +1917,6 @@ fn child_remaps() -> Vec<ChildRemap> {
         f("addon_network_rules", "approved_by", UserAccounts),
         f("oauth_pending_states", "user_id", UserAccounts),
         f("user_oauth_accounts", "user_id", UserAccounts),
-        f("notes", "user_id", UserAccounts),
         f("meeting_settings", "user_id", UserAccounts),
         f("meeting_sessions", "owner_user_id", UserAccounts),
         f("deployments", "user_id", UserAccounts),
@@ -1721,6 +2164,13 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "polymorphic user|group id discriminated by key_type (NULL for 'general'), \
              not a single-table FK; born TEXT in v82 (rows wiped on the rebuild, \
              never held an INTEGER id)",
+        ),
+        t(
+            "model_metrics_rollup",
+            "user_id",
+            "metrics-rollup key born TEXT in v102 (post-flip, never held an INTEGER id); \
+             no declared user_accounts FK — synced rollup rows may reference an account \
+             a receiving node has not materialized yet (same rationale as token_usage_daily)",
         ),
         t(
             "token_usage_daily",
@@ -6563,7 +7013,6 @@ mod tests {
             INSERT INTO flow_versions (id, flow_id, version_num, flow_json, name) VALUES
                 (1, 5, 1, '{}', 'v1');
             INSERT INTO flow_executions (flow_id, status) VALUES (5, 'success');
-            INSERT INTO notes (user_id, title) VALUES (10, 'note');
             INSERT INTO api_keys (key_hash, key_prefix, name, owner_user_id)
                 VALUES ('kh', 'kp', 'k', 11);
             INSERT INTO addon_permissions (addon_id, subject_type, subject_id, permission_id)
@@ -6674,16 +7123,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(dangling_bindings, 0, "binding.flow_id must resolve");
-        let dangling_notes: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM notes n \
-                 LEFT JOIN user_accounts u ON u.id = n.user_id WHERE u.id IS NULL",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(dangling_notes, 0, "notes.user_id must resolve");
-
         // group_members both columns resolve.
         let dangling_members: i64 = conn
             .query_row(
@@ -7399,6 +7838,89 @@ mod tests {
             )
             .unwrap();
         assert_eq!(again, target);
+    }
+
+    /// v113 strips the hidden `pii_filter` from the seeded "Default Chat" flow:
+    /// the seeded-pii row is rewritten to the clean `trigger -> llm ->
+    /// output(stream)` pipeline, while an admin-customized flow that also
+    /// contains a pii_filter is left untouched (matched only against the exact
+    /// seeded literal).
+    #[test]
+    fn migration_v113_strips_pii_from_seeded_default_chat() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        // Reproduce an already-seeded DB: the canonical Default Chat row carrying
+        // the hidden pii_filter (the shape shipped before v113).
+        conn.execute(
+            "INSERT OR REPLACE INTO flows (id, name, description, service_type, flow_json, status, is_default) \
+             VALUES (?1, 'Default Chat', 'Streaming chat pipeline: trigger -> LLM -> pii_filter -> output(stream).', 'chat', ?2, 'active', 1)",
+            rusqlite::params![DEFAULT_CHAT_FLOW_ID, DEFAULT_CHAT_FLOW_JSON_WITH_PII],
+        )
+        .unwrap();
+
+        // A separate, admin-customized flow that deliberately keeps pii_filter.
+        let custom_id = uuid::Uuid::new_v4().to_string();
+        let custom_json = r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1","from_port":"text","data_type":"text"},{"from_node":"l1","to_node":"p1","from_port":"text"},{"from_node":"p1","to_node":"o1","from_port":"text","to_port":"text","data_type":"text"}]}"#;
+        conn.execute(
+            "INSERT INTO flows (id, name, description, service_type, flow_json, status, is_default) \
+             VALUES (?1, 'My PII Chat', 'custom', 'chat', ?2, 'active', 0)",
+            rusqlite::params![custom_id, custom_json],
+        )
+        .unwrap();
+
+        strip_pii_from_default_chat_flow(&conn).unwrap();
+
+        // (a) seeded Default Chat lost pii_filter and now streams llm -> output.
+        let (default_json, default_desc): (String, String) = conn
+            .query_row(
+                "SELECT flow_json, description FROM flows WHERE id = ?1",
+                rusqlite::params![DEFAULT_CHAT_FLOW_ID],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(default_json, crate::db::seed::DEFAULT_CHAT_FLOW_JSON);
+        assert!(!default_json.contains("pii_filter"), "pii_filter removed");
+        assert!(!default_desc.contains("pii_filter"), "description updated");
+        let parsed: serde_json::Value = serde_json::from_str(&default_json).unwrap();
+        let types: Vec<&str> = parsed["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, vec!["trigger", "llm", "output"]);
+        let edges = parsed["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 2);
+        // The llm -> output edge is the streaming shape (from stream, to text).
+        let has_stream_edge = edges.iter().any(|e| {
+            e["from_node"] == "l1"
+                && e["to_node"] == "o1"
+                && e["from_port"] == "stream"
+                && e["to_port"] == "text"
+        });
+        assert!(has_stream_edge, "llm -> output streaming edge preserved");
+
+        // (b) the admin-customized pii flow is untouched.
+        let custom_after: String = conn
+            .query_row(
+                "SELECT flow_json FROM flows WHERE id = ?1",
+                rusqlite::params![custom_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(custom_after, custom_json, "custom pii flow untouched");
+
+        // (c) idempotent re-run is a no-op (row no longer matches the pii literal).
+        strip_pii_from_default_chat_flow(&conn).unwrap();
+        let again: String = conn
+            .query_row(
+                "SELECT flow_json FROM flows WHERE id = ?1",
+                rusqlite::params![DEFAULT_CHAT_FLOW_ID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(again, crate::db::seed::DEFAULT_CHAT_FLOW_JSON);
     }
 
     /// A fresh `run(&conn)` (all migrations + nothing else) leaves the seeded

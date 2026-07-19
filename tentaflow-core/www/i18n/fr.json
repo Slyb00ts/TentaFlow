@@ -46,7 +46,6 @@
     "section_account": "Compte",
     "apps_home": "Toutes les applications",
     "images": "Images",
-    "notes": "Notes",
     "tts": "Synthèse vocale",
     "translate": "Traducteur",
     "search_app": "Rechercher",
@@ -54,7 +53,8 @@
     "prompts_user": "Invites",
     "profile": "Profil",
     "my_accounts": "Mes comptes",
-    "settings_user": "Paramètres"
+    "settings_user": "Paramètres",
+    "benchmark_studio": "Benchmark Studio"
   },
   "agents": {
     "title": "Agents",
@@ -1303,6 +1303,8 @@
     "dynamic_empty": "— no available {source} {category} —",
     "dynamic_stale": "{value} (unavailable)",
     "harness_default_hint": "Empty → built-in default",
+    "vision_alias_label": "CV service (alias)",
+    "vision_alias_hint": "CV service from the registry (surface camera_cv). Empty → default alias {default}.",
     "loop_region_section": "Loop region config",
     "harness": {
       "skills_template": "Skills index template",
@@ -1648,6 +1650,9 @@
     "col_actions": "Actions",
     "quick_add_allowed": "Ajouter aux autorisés",
     "quick_added_toast": "« {host} » ajouté à la liste des autorisés"
+  },
+  "addon": {
+    "disabled": "Désactivé"
   },
   "addon_toggle": {
     "enabling": "Activation…",
@@ -2281,10 +2286,10 @@
     "audio_recent_entries": "Recent entries",
     "audio_no_history": "No history yet",
     "audio_exit": "End conversation",
-    "audio_pipeline_pending": "Full voice conversation coming soon",
+    "audio_pipeline_pending": "Démarrez une conversation avec le micro",
     "audio_engine_missing": "No audio engine installed",
     "audio_no_engine": "No engine",
-    "audio_preview_hint": "Audio mode (preview) — assistant face with idle animation. Full voice conversation coming soon.",
+    "audio_preview_hint": "Mode audio — visage de l'assistant avec animation au repos. Appuyez sur le micro pour démarrer une conversation vocale.",
     "audio_start_mic": "Click to start the conversation",
     "audio_mic_denied": "Microphone access denied",
     "audio_no_mic": "No microphone found",
@@ -2543,6 +2548,12 @@
     "configureRuntime": "Configurer le runtime",
     "fromPreset": "Depuis preset",
     "searchHuggingface": "Rechercher sur HuggingFace",
+    "customBundle": "Personnalisé",
+    "customBundleUrl": "URL de manifeste d'une autre instance TentaFlow",
+    "customBundleUrlHint": "URL prête à coller depuis ML Studio → Modèles vision → Partager sur l'instance servante (contient /models/manifest/).",
+    "customBundleApiKey": "Clé API (Bearer)",
+    "customBundleApiKeyHint": "Clé API générale créée sur l'instance servante avec le scope model_bundle. Inutile avec une URL signée (?token=...).",
+    "customBundleUrlInvalid": "L’URL du manifeste doit contenir /models/manifest/.",
     "huggingfaceToken": "Token HuggingFace (optionnel)",
     "noPresets": "Aucun modèle recommandé — utiliser la recherche HuggingFace",
     "presetHint": "Sélectionner un modèle recommandé pour ce moteur",
@@ -2592,6 +2603,7 @@
     "gpu_list_hint": "GPU disponibles ({n})"
   },
   "category": {
+    "engines": "Moteurs",
     "llm": "Modèles de langage (LLM)",
     "stt": "Reconnaissance vocale (STT)",
     "tts": "Synthèse vocale (TTS)",
@@ -2817,13 +2829,13 @@
       "name": "Chat",
       "desc": "Discute avec un modèle local"
     },
+    "ml-studio": {
+      "name": "ML Studio",
+      "desc": "Annoter et entraîner des modèles de vision"
+    },
     "images": {
       "name": "Images",
       "desc": "Génère des images avec IA"
-    },
-    "notes": {
-      "name": "Notes",
-      "desc": "Dicte des notes vocales via STT"
     },
     "meeting": {
       "name": "Meeting Bot",
@@ -2854,7 +2866,6 @@
     "heading": "Pas encore disponible",
     "back": "Retour aux applis",
     "images": "La génération d’images nécessite un moteur image-gen (p. ex. Stable Diffusion, ComfyUI). Demande à ton administrateur de le déployer via le Catalogue de services.",
-    "notes": "Les notes vocales nécessitent un moteur STT (p. ex. Whisper) et un backend de stockage. Dans la feuille de route.",
     "meeting": "Meeting Bot nécessite l’addon teams-bot avec OAuth et un handler binaire pour les transcriptions. Dans la feuille de route.",
     "tts": "La synthèse vocale nécessite un moteur TTS déployé et un handler de synthèse. Les règles admin existent déjà ; le parcours utilisateur est dans la feuille de route.",
     "translate": "Traduire réutilisera le backend LLM du chat dès qu’un handler utilisateur dédié sera branché. Dans la feuille de route.",
@@ -2935,32 +2946,6 @@
     "error": "Échec de la traduction : {reason}",
     "model_info": "Traduit via {model} · {tokens} tokens",
     "swap": "Inverser les langues"
-  },
-  "notes": {
-    "page_title": "Notes",
-    "subtitle": "Notes personnelles rapides",
-    "count": "{n} notes",
-    "search_placeholder": "Rechercher des notes…",
-    "new_button": "Nouvelle note",
-    "empty_state": "Aucune note pour le moment. Cliquez sur « Nouvelle note ».",
-    "empty_editor": "Sélectionnez une note ou créez-en une nouvelle.",
-    "title_placeholder": "Sans titre",
-    "body_placeholder": "Commencez à écrire…",
-    "pin": "Épingler",
-    "unpin": "Désépingler",
-    "delete": "Supprimer",
-    "delete_confirm_title": "Supprimer la note ?",
-    "delete_confirm_body": "Cette note sera définitivement supprimée.",
-    "status": {
-      "saving": "Enregistrement…",
-      "saved": "Enregistré",
-      "error": "Erreur"
-    },
-    "relative_just_now": "à l'instant",
-    "relative_min_ago": "il y a {n} min",
-    "relative_hours_ago": "il y a {n} h",
-    "relative_days_ago": "il y a {n} j",
-    "word_count": "{n} mots"
   },
   "connection": {
     "title": "Connexion au serveur perdue",

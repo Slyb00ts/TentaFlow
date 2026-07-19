@@ -30,11 +30,13 @@ use tracing::warn;
 
 use tentaflow_sdk_spec::{
     CameraAddInput, CameraAddOutput, CameraAnalysisFlowOut, CameraAnalysisFlowsOut,
-    CameraCredentialsRotateInput, CameraCredentialsRotateOut, CameraDiscoverOut, CameraGrantInfo,
-    CameraGrantInput, CameraGrantListInput, CameraGrantListOut, CameraGrantOut, CameraHealthOut,
-    CameraIdInput, CameraInfoOut, CameraListOut, CameraRemoveOut, CameraRevokeInput,
-    CameraSnapshotOut, CameraTestConnectionInput, CameraTestConnectionOut, CameraUpdateInput,
-    DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
+    CameraCredentialsRotateInput, CameraCredentialsRotateOut, CameraCvPipelineDeleteOut,
+    CameraCvPipelineIdInput, CameraCvPipelineOut, CameraCvPipelineSaveInput,
+    CameraCvPipelineSaveOut, CameraCvPipelineSummary, CameraCvPipelinesOut, CameraDiscoverOut,
+    CameraGrantInfo, CameraGrantInput, CameraGrantListInput, CameraGrantListOut, CameraGrantOut,
+    CameraHealthOut, CameraIdInput, CameraInfoOut, CameraListOut, CameraRemoveOut,
+    CameraRevokeInput, CameraSnapshotOut, CameraTestConnectionInput, CameraTestConnectionOut,
+    CameraUpdateInput, DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
 };
 
 use super::abi_helpers::{enforce_payload_size, PayloadKind};
@@ -46,10 +48,12 @@ use super::{
 use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
 use crate::db::repository::{
-    can_read_camera, get_camera_for_addon, get_camera_in_org, grant_camera, insert_camera,
-    list_accessible_cameras, list_camera_grants, list_cameras_for_addon, revoke_camera_grant,
-    set_camera_credentials_encrypted, set_camera_onvif_resolved, soft_delete_camera, update_camera,
-    CameraPatch, CameraRow,
+    can_read_camera, delete_camera_cv_pipeline, get_camera_cv_pipeline, get_camera_for_addon,
+    get_camera_in_org, grant_camera, insert_camera, list_accessible_cameras,
+    list_addon_available_aliases, list_camera_cv_pipelines, list_camera_grants,
+    list_cameras_for_addon, revoke_camera_grant, save_camera_cv_pipeline,
+    set_camera_credentials_encrypted, set_camera_onvif_resolved, soft_delete_camera,
+    update_camera, CameraPatch, CameraRow, CvPipelineWriteError,
 };
 use crate::services::camera_ingest::{
     credentials::credentials_cipher, list_local_devices, start_supervisor, CameraConfig,
@@ -73,11 +77,11 @@ const PERM_CAMERAS_SNAPSHOT: &str = "cameras.snapshot";
 /// RTSP URI from the device-service URL and persists the derivation
 /// (`onvif_url` + `onvif_profile_token`) so a later credentials rotation
 /// can re-resolve without re-running discovery.
-const ADDABLE_VENDORS: &[&str] = &["fake_file", "rtsp", "onvif", "local_camera", "v4l2"];
+const ADDABLE_VENDORS: &[&str] = &["fake_file", "rtsp", "onvif", "local_camera", "v4l2", "mjpeg"];
 
 /// Vendors `camera_test_connection_v1` knows how to probe. ONVIF is included
 /// — we probe its device-service HTTP endpoint as a reachability check.
-const TESTABLE_VENDORS: &[&str] = &["fake_file", "rtsp", "onvif", "local_camera", "v4l2"];
+const TESTABLE_VENDORS: &[&str] = &["fake_file", "rtsp", "onvif", "local_camera", "v4l2", "mjpeg"];
 
 fn vendor_addable(v: &str) -> bool {
     ADDABLE_VENDORS.iter().any(|s| *s == v)
@@ -271,7 +275,7 @@ async fn hydrate_supervisor_from_db(sup: &Arc<CameraIngestSupervisor>) {
 /// the router begins releasing locks.
 pub async fn shutdown_camera_supervisor_global() {
     #[cfg(feature = "inference-vision-gpu")]
-    crate::services::camera_ingest::vision_analysis::drain();
+    crate::services::camera_ingest::vision_analysis::drain().await;
     crate::services::camera_ingest::depth_mapping::drain();
     if let Some(sup) = SUPERVISOR.get() {
         sup.drain().await;
@@ -561,7 +565,7 @@ pub fn camera_register_pushed_v1(
 #[cfg(feature = "camera")]
 pub async fn latest_frame_global(
     camera_id: &str,
-) -> Option<(std::sync::Arc<[u8]>, u32, u32, u64)> {
+) -> Option<(std::sync::Arc<[u8]>, u32, u32, u64, Option<u64>)> {
     let sup = SUPERVISOR.get()?;
     match sup.snapshot(camera_id).await {
         Ok(snap) => Some((
@@ -569,6 +573,7 @@ pub async fn latest_frame_global(
             snap.width,
             snap.height,
             snap.timestamp_unix_ms,
+            snap.pts_ns,
         )),
         Err(_) => None,
     }
@@ -650,6 +655,7 @@ async fn build_camera_info(sup: &CameraIngestSupervisor, row: CameraRow) -> Came
         analysis_flow_id: row.analysis_flow_id,
         owner_addon_id: None,
         access_level: None,
+        cv_pipeline_id: row.cv_pipeline_id,
     }
 }
 
@@ -852,6 +858,31 @@ async fn rtsp_test_connection(url: &str, timeout_secs: u64) -> Result<(), String
     } else {
         rtsp_options_exchange(tcp, &request_uri, dur).await
     }
+}
+
+/// Sonda osiągalności dla kamer MJPEG (HTTP multipart). Sprawdza samo
+/// połączenie TCP z hostem:portem URL-a (domyślnie 80/443) — bez żądania
+/// HTTP, żeby anonimowa sonda nie ruszała strumienia ani nie wymagała
+/// uwierzytelnienia. Poświadczenia z URL-a nie trafiają do komunikatów
+/// (`redact_url_in_text`).
+async fn mjpeg_test_connection(url: &str, timeout_secs: u64) -> Result<(), String> {
+    use crate::services::camera_ingest::rtsp::redact_url_in_text;
+    let parsed = url::Url::parse(url)
+        .map_err(|e| format!("invalid URL: {}", redact_url_in_text(&e.to_string())))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "missing host".to_string())?
+        .to_string();
+    let tls = parsed.scheme().eq_ignore_ascii_case("https");
+    let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
+    let redacted = redact_url_in_text(url);
+
+    let dur = Duration::from_secs(timeout_secs);
+    tokio::time::timeout(dur, tokio::net::TcpStream::connect((host.as_str(), port)))
+        .await
+        .map_err(|_| format!("connect timeout: {redacted}"))?
+        .map_err(|e| format!("tcp connect failed: {e}"))?;
+    Ok(())
 }
 
 /// Builds a rustls `TlsConnector` that accepts any server certificate. Used only
@@ -2229,6 +2260,7 @@ pub fn camera_get_v1(
             analysis_flow_id: row.analysis_flow_id,
             owner_addon_id: None,
             access_level: None,
+            cv_pipeline_id: row.cv_pipeline_id,
         },
     };
     info.owner_addon_id = Some(owner);
@@ -2306,6 +2338,588 @@ pub fn camera_analysis_flows_list_v1(
             .into_iter()
             .map(|(id, name)| CameraAnalysisFlowOut { id, name })
             .collect(),
+    };
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
+}
+
+/// Save/delete of camera CV pipelines is an org-admin operation: the rows are
+/// shared org-wide (and replicate mesh-wide), so beyond the `cameras.write`
+/// permission the calling USER must be in the "admins" group — the same list
+/// the RBAC checker's admin bypass consults. Calls without a user context
+/// pass only when explicitly marked as system calls (host authority), the
+/// same rule `check_permission` applies.
+fn cv_pipeline_admin_authorized(state: &AddonState) -> bool {
+    match state.user_id.as_deref() {
+        Some(user) => state.permission_checker.is_admin(user),
+        None => state.is_system_call,
+    }
+}
+
+/// P1 alias-grant gate for pipeline save: every model alias the pipeline
+/// references must be GRANTED to the calling addon (`granted` /
+/// `auto_granted`) — existence alone is not enough, otherwise a pipeline
+/// could route camera frames through an alias the admin never approved for
+/// this addon. Reuses the exact grant view `alias_list_available_v1` serves.
+/// Returns the readable refusal message naming the first ungranted alias.
+fn cv_pipeline_alias_grants_ok(
+    db: &crate::db::DbPool,
+    addon_id: &str,
+    pipeline_json: &str,
+) -> Result<Result<(), String>, ()> {
+    let parsed: crate::services::camera_ingest::cv_pipeline::CvPipeline =
+        match serde_json::from_str(pipeline_json) {
+            Ok(p) => p,
+            // Malformed JSON is a validation refusal, not a DB error — the
+            // repository would reject it with the same message anyway.
+            Err(e) => return Ok(Err(format!("invalid pipeline JSON: {e}"))),
+        };
+    let available = list_addon_available_aliases(db, addon_id).map_err(|_| ())?;
+    let granted: std::collections::HashSet<&str> = available
+        .iter()
+        .filter(|a| matches!(a.grant_status.as_str(), "granted" | "auto_granted"))
+        .map(|a| a.alias_id.as_str())
+        .collect();
+    for stage in &parsed.stages {
+        let alias = stage.model.trim();
+        if !granted.contains(alias) {
+            return Ok(Err(format!(
+                "model alias not granted to this addon: {alias}"
+            )));
+        }
+    }
+    Ok(Ok(()))
+}
+
+// =============================================================================
+// Host function: camera_cv_pipelines_list_v1
+// =============================================================================
+
+/// Lists every camera CV pipeline (`id`, `name`, `is_default`, `updated_at`)
+/// for the per-camera pipeline picker and the pipeline manager. Read-only,
+/// gated on `cameras.read`; the JSON body travels only through
+/// `camera_cv_pipeline_get_v1`.
+pub fn camera_cv_pipelines_list_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return AbiError::Operation.as_i32(),
+    };
+    if !check_permission(caller.data(), PERM_CAMERAS_READ, None) {
+        audit(
+            caller.data(),
+            "camera.cv_pipelines_list",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+    let db = caller.data().db.clone();
+    let pipelines = match list_camera_cv_pipelines(&db, caller.data().org_id.as_deref()) {
+        Ok(v) => v,
+        Err(_) => {
+            audit(
+                caller.data(),
+                "camera.cv_pipelines_list",
+                None,
+                RiskClass::B,
+                "error",
+                Some("db_error"),
+            );
+            return AbiError::Operation.as_i32();
+        }
+    };
+    let out = CameraCvPipelinesOut {
+        pipelines: pipelines
+            .into_iter()
+            .map(|(id, name, is_default, updated_at)| CameraCvPipelineSummary {
+                id,
+                name,
+                is_default,
+                updated_at,
+            })
+            .collect(),
+    };
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
+}
+
+// =============================================================================
+// Host function: camera_cv_pipeline_get_v1
+// =============================================================================
+
+/// Returns one pipeline (name + full JSON body) by id, for the pipeline
+/// editor. Read-only, gated on `cameras.read`.
+pub fn camera_cv_pipeline_get_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    input_ptr: i32,
+    input_len: i32,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return AbiError::Operation.as_i32(),
+    };
+    if !check_permission(caller.data(), PERM_CAMERAS_READ, None) {
+        audit(
+            caller.data(),
+            "camera.cv_pipeline_get",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+    let input: CameraCvPipelineIdInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "camera.cv_pipeline_get",
+                None,
+                RiskClass::B,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
+        }
+    };
+    if input.id.trim().is_empty() {
+        audit(
+            caller.data(),
+            "camera.cv_pipeline_get",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("pipeline_id_empty"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+    let db = caller.data().db.clone();
+    let row = match get_camera_cv_pipeline(&db, &input.id, caller.data().org_id.as_deref()) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            audit(
+                caller.data(),
+                "camera.cv_pipeline_get",
+                Some(&input.id),
+                RiskClass::B,
+                "denied",
+                Some("pipeline_not_found"),
+            );
+            return AbiError::NotFound.as_i32();
+        }
+        Err(_) => {
+            audit(
+                caller.data(),
+                "camera.cv_pipeline_get",
+                Some(&input.id),
+                RiskClass::B,
+                "error",
+                Some("db_error"),
+            );
+            return AbiError::Operation.as_i32();
+        }
+    };
+    let out = CameraCvPipelineOut {
+        id: input.id,
+        name: row.0,
+        pipeline_json: row.1,
+    };
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
+}
+
+// =============================================================================
+// Host function: camera_cv_pipeline_save_v1
+// =============================================================================
+
+/// Creates (`id = None` → fresh uuid) or updates a camera CV pipeline. The
+/// repository validates structure (`cv_pipeline::validate`) and alias
+/// existence (`validate_aliases`) inside the save transaction; a rejected
+/// pipeline comes back as `id = None` + the human-readable validator message
+/// so the addon can display the exact reason. Gated on `cameras.write` like
+/// the per-camera assignment path.
+pub fn camera_cv_pipeline_save_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    input_ptr: i32,
+    input_len: i32,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return AbiError::Operation.as_i32(),
+    };
+    if !check_permission(caller.data(), PERM_CAMERAS_WRITE, None) {
+        audit(
+            caller.data(),
+            "camera.cv_pipeline_save",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+    if !cv_pipeline_admin_authorized(caller.data()) {
+        audit(
+            caller.data(),
+            "camera.cv_pipeline_save",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("not_admin"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+    let input: CameraCvPipelineSaveInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "camera.cv_pipeline_save",
+                None,
+                RiskClass::A,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
+        }
+    };
+    let db = caller.data().db.clone();
+    let org_id = caller.data().org_id.clone();
+    let addon_id = caller.data().addon_id.clone();
+
+    if input.name.trim().is_empty() {
+        audit(
+            caller.data(),
+            "camera.cv_pipeline_save",
+            input.id.as_deref(),
+            RiskClass::A,
+            "denied",
+            Some("name_empty"),
+        );
+        let out = CameraCvPipelineSaveOut {
+            id: None,
+            error: Some("pipeline name must not be empty".to_string()),
+        };
+        return write_cbor_capped(
+            &memory,
+            &mut caller,
+            &out,
+            out_ptr,
+            out_cap,
+            out_len_ptr,
+            PayloadKind::ServiceCall,
+        );
+    }
+
+    // An explicit id is an edit — it must reference an existing row in the
+    // caller org. Creation never takes a caller-supplied id, so an addon
+    // cannot mint arbitrary pipeline ids (the host owns the uuid).
+    let id = match input.id.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(existing) => match get_camera_cv_pipeline(&db, existing, org_id.as_deref()) {
+            Ok(Some(_)) => existing.to_string(),
+            Ok(None) => {
+                audit(
+                    caller.data(),
+                    "camera.cv_pipeline_save",
+                    Some(existing),
+                    RiskClass::A,
+                    "denied",
+                    Some("pipeline_not_found"),
+                );
+                return AbiError::NotFound.as_i32();
+            }
+            Err(_) => {
+                audit(
+                    caller.data(),
+                    "camera.cv_pipeline_save",
+                    Some(existing),
+                    RiskClass::A,
+                    "error",
+                    Some("db_error"),
+                );
+                return AbiError::Operation.as_i32();
+            }
+        },
+        None => uuid::Uuid::new_v4().to_string(),
+    };
+
+    // Alias-grant gate (P1): a pipeline may only reference aliases GRANTED to
+    // the calling addon — before the repository even sees the payload.
+    match cv_pipeline_alias_grants_ok(&db, &addon_id, &input.pipeline_json) {
+        Ok(Ok(())) => {}
+        Ok(Err(reason)) => {
+            audit(
+                caller.data(),
+                "camera.cv_pipeline_save",
+                Some(&id),
+                RiskClass::A,
+                "denied",
+                Some("alias_not_granted_or_invalid_json"),
+            );
+            let out = CameraCvPipelineSaveOut {
+                id: None,
+                error: Some(reason),
+            };
+            return write_cbor_capped(
+                &memory,
+                &mut caller,
+                &out,
+                out_ptr,
+                out_cap,
+                out_len_ptr,
+                PayloadKind::ServiceCall,
+            );
+        }
+        Err(()) => {
+            audit(
+                caller.data(),
+                "camera.cv_pipeline_save",
+                Some(&id),
+                RiskClass::A,
+                "error",
+                Some("alias_grant_lookup_failed"),
+            );
+            return AbiError::Operation.as_i32();
+        }
+    }
+
+    let out = match save_camera_cv_pipeline(
+        &db,
+        &id,
+        input.name.trim(),
+        &input.pipeline_json,
+        org_id.as_deref(),
+    ) {
+        Ok(()) => {
+            audit(
+                caller.data(),
+                "camera.cv_pipeline_save",
+                Some(&id),
+                RiskClass::A,
+                "ok",
+                None,
+            );
+            CameraCvPipelineSaveOut {
+                id: Some(id),
+                error: None,
+            }
+        }
+        // Business/validation refusal → in-band readable error for the UI.
+        Err(CvPipelineWriteError::Refused(reason)) => {
+            audit(
+                caller.data(),
+                "camera.cv_pipeline_save",
+                Some(&id),
+                RiskClass::A,
+                "denied",
+                Some("invalid_pipeline"),
+            );
+            CameraCvPipelineSaveOut {
+                id: None,
+                error: Some(reason),
+            }
+        }
+        // Operational failure (SQL / sync capture / commit) → ABI error path.
+        Err(CvPipelineWriteError::Db(e)) => {
+            warn!("camera_cv_pipeline_save: db error for '{}': {e}", id);
+            audit(
+                caller.data(),
+                "camera.cv_pipeline_save",
+                Some(&id),
+                RiskClass::A,
+                "error",
+                Some("db_error"),
+            );
+            return AbiError::Operation.as_i32();
+        }
+    };
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
+}
+
+// =============================================================================
+// Host function: camera_cv_pipeline_delete_v1
+// =============================================================================
+
+/// Deletes a pipeline. Refusals (seed-owned default, still referenced by a
+/// live camera, missing row) come back as `deleted = false` + the readable
+/// repository message. Gated on `cameras.write`.
+pub fn camera_cv_pipeline_delete_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    input_ptr: i32,
+    input_len: i32,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return AbiError::Operation.as_i32(),
+    };
+    if !check_permission(caller.data(), PERM_CAMERAS_WRITE, None) {
+        audit(
+            caller.data(),
+            "camera.cv_pipeline_delete",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+    if !cv_pipeline_admin_authorized(caller.data()) {
+        audit(
+            caller.data(),
+            "camera.cv_pipeline_delete",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("not_admin"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+    let input: CameraCvPipelineIdInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "camera.cv_pipeline_delete",
+                None,
+                RiskClass::A,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
+        }
+    };
+    if input.id.trim().is_empty() {
+        audit(
+            caller.data(),
+            "camera.cv_pipeline_delete",
+            None,
+            RiskClass::A,
+            "denied",
+            Some("pipeline_id_empty"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+    let db = caller.data().db.clone();
+    let out = match delete_camera_cv_pipeline(&db, &input.id, caller.data().org_id.as_deref()) {
+        Ok(()) => {
+            audit(
+                caller.data(),
+                "camera.cv_pipeline_delete",
+                Some(&input.id),
+                RiskClass::A,
+                "ok",
+                None,
+            );
+            CameraCvPipelineDeleteOut {
+                deleted: true,
+                error: None,
+            }
+        }
+        // Business refusal (default pipeline / still assigned / not found) →
+        // in-band readable error for the UI.
+        Err(CvPipelineWriteError::Refused(reason)) => {
+            audit(
+                caller.data(),
+                "camera.cv_pipeline_delete",
+                Some(&input.id),
+                RiskClass::A,
+                "denied",
+                Some("refused_or_not_found"),
+            );
+            CameraCvPipelineDeleteOut {
+                deleted: false,
+                error: Some(reason),
+            }
+        }
+        // Operational failure (SQL / sync capture / commit) → ABI error path.
+        Err(CvPipelineWriteError::Db(e)) => {
+            warn!("camera_cv_pipeline_delete: db error for '{}': {e}", input.id);
+            audit(
+                caller.data(),
+                "camera.cv_pipeline_delete",
+                Some(&input.id),
+                RiskClass::A,
+                "error",
+                Some("db_error"),
+            );
+            return AbiError::Operation.as_i32();
+        }
     };
     write_cbor_capped(
         &memory,
@@ -2498,6 +3112,39 @@ pub fn camera_update_v1(
         }
     };
 
+    // Same tri-state semantics as `analysis_flow_id` for the CV pipeline: a
+    // non-empty id must reference an existing pipeline row in the caller org,
+    // empty clears the assignment (camera falls back to the default pipeline).
+    let cv_pipeline_id: Option<Option<String>> = match input.cv_pipeline_id.as_ref() {
+        None => None,
+        Some(s) if s.is_empty() => Some(None),
+        Some(id) => match get_camera_cv_pipeline(&db, id, caller.data().org_id.as_deref()) {
+            Ok(Some(_)) => Some(Some(id.clone())),
+            Ok(None) => {
+                audit(
+                    caller.data(),
+                    "camera.update",
+                    Some(&input.camera_id),
+                    RiskClass::A,
+                    "denied",
+                    Some("cv_pipeline_not_found"),
+                );
+                return AbiError::NotFound.as_i32();
+            }
+            Err(_) => {
+                audit(
+                    caller.data(),
+                    "camera.update",
+                    Some(&input.camera_id),
+                    RiskClass::A,
+                    "error",
+                    Some("cv_pipeline_lookup_failed"),
+                );
+                return AbiError::Operation.as_i32();
+            }
+        },
+    };
+
     match get_camera_for_addon(
         &db,
         &addon_id,
@@ -2554,6 +3201,9 @@ pub fn camera_update_v1(
     if analysis_flow_id.is_some() {
         diff.push("analysis_flow_id");
     }
+    if cv_pipeline_id.is_some() {
+        diff.push("cv_pipeline_id");
+    }
     let patch = CameraPatch {
         display_name: input.display_name.clone(),
         target_fps: input.target_fps.map(|v| v as i64),
@@ -2563,6 +3213,7 @@ pub fn camera_update_v1(
         retention_class: input.retention_class.clone(),
         profile: input.profile.clone(),
         analysis_flow_id,
+        cv_pipeline_id,
         depth_mapping_enabled: None,
         depth_robot_id: None,
         depth_camera_fov_deg: None,
@@ -2644,6 +3295,7 @@ pub fn camera_update_v1(
                 analysis_flow_id: row.analysis_flow_id,
                 owner_addon_id: None,
                 access_level: None,
+                cv_pipeline_id: row.cv_pipeline_id,
             }
         }
     });
@@ -3335,6 +3987,25 @@ pub fn camera_test_connection_v1(
                 }
             }
         }
+        "mjpeg" => {
+            if let Err(e) = crate::services::camera_ingest::mjpeg::validate_mjpeg_url(&input.url) {
+                CameraTestConnectionOut {
+                    ok: false,
+                    message: e.to_string(),
+                }
+            } else {
+                match run_async(mjpeg_test_connection(&input.url, 5)) {
+                    Ok(()) => CameraTestConnectionOut {
+                        ok: true,
+                        message: "mjpeg endpoint reachable (tcp connect)".to_string(),
+                    },
+                    Err(msg) => CameraTestConnectionOut {
+                        ok: false,
+                        message: msg,
+                    },
+                }
+            }
+        }
         "onvif" => match run_async(onvif_test_connection(&input.url, 5)) {
             Ok(note) => CameraTestConnectionOut {
                 ok: true,
@@ -3494,8 +4165,9 @@ pub fn camera_credentials_rotate_v1(
     };
     // Only vendors that carry user-info credentials accept rotation. fake_file
     // is local filesystem playback (no auth); other unknown vendors are
-    // rejected explicitly to avoid storing dead blobs against them.
-    if row.vendor != "rtsp" && row.vendor != "onvif" {
+    // rejected explicitly to avoid storing dead blobs against them. mjpeg
+    // uses the same `user:pass` blob (fed to souphttpsrc user-id/user-pw).
+    if row.vendor != "rtsp" && row.vendor != "onvif" && row.vendor != "mjpeg" {
         audit(
             caller.data(),
             "camera.credentials_rotate",

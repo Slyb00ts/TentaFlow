@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Benchmark Studio · Porównanie runów (M6)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .num-r { text-align: right; font-variant-numeric: tabular-nums; }
+  .run-select {
+    display: grid; grid-template-columns: 1fr auto 1fr; gap: 14px; align-items: center;
+    margin-bottom: 16px;
+  }
+  .run-select .vs {
+    font-size: 14px; font-weight: 800; color: var(--text-3);
+    width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: var(--bg-3); border: 1px solid var(--border);
+  }
+  .run-box {
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 14px 16px;
+  }
+  .run-box.a { border-top: 3px solid var(--accent-1); }
+  .run-box.b { border-top: 3px solid var(--accent-2); }
+  .run-box .rb-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 800; margin-bottom: 8px; }
+  .run-box.a .rb-label { color: var(--accent-1); }
+  .run-box.b .rb-label { color: var(--accent-2); }
+  .run-box .rb-meta { font-size: 11.5px; color: var(--text-3); margin-top: 8px; }
+  .regres-chips { display: flex; gap: 8px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+  <symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+  <symbol id="i-compare" viewBox="0 0 24 24"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M6</span>
+    <h2>Porównanie runów</h2>
+    <div class="desc">Run A vs Run B tego samego benchmarku (tu: gemma-4 przed/po update vLLM 0.9.2 → 0.10.0). Tabela delt Δ%, słupki A-vs-B i automatyczna sekcja „Regresje".</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Analityka</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-trend"/></svg>Statystyki modeli</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr · Admin</div><div class="role">Euvic · Zarząd</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Analityka</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Benchmark Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">gemma-4 tuning silnika</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb current">Porównanie runów</span>
+        </div>
+
+        <div class="run-select">
+          <div class="run-box a">
+            <div class="rb-label">Run A — baza</div>
+            <select class="select">
+              <option>#9 · 24.06.2026 21:15 · vLLM 0.9.2 (przed update)</option>
+              <option>#7 · 18.06.2026 20:02 · vLLM 0.9.2</option>
+              <option>#5 · 11.06.2026 19:44 · vLLM 0.9.1</option>
+            </select>
+            <div class="rb-meta">gemma-4-31b (spark-cluster TP=2) · 1 target × 2 testy · success · 19 min</div>
+          </div>
+          <div class="vs">VS</div>
+          <div class="run-box b">
+            <div class="rb-label">Run B — porównywany</div>
+            <select class="select">
+              <option>#12 · 01.07.2026 22:40 · vLLM 0.10.0 (po update)</option>
+              <option>#9 · 24.06.2026 21:15 · vLLM 0.9.2</option>
+            </select>
+            <div class="rb-meta">gemma-4-31b (spark-cluster TP=2) · 1 target × 2 testy · success · 18 min</div>
+          </div>
+        </div>
+
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon" style="color:var(--warning)"><use href="#i-alert"/></svg>Regresje</div>
+            <div class="hint">automatyczne wykrycie: pogorszenie &gt; 5% względem Run A</div>
+          </div>
+          <div class="regres-chips">
+            <span class="chip warning"><svg class="icon"><use href="#i-alert"/></svg>decode t/s @ ctx 32k: −18% ⚠</span>
+            <span class="chip warning"><svg class="icon"><use href="#i-alert"/></svg>TTFT @ ctx 32k: +16% ⚠</span>
+            <span class="chip success">pozostałe 8 metryk: poprawa lub bez zmian</span>
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <div class="section-card">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon" style="color:var(--accent-2)"><use href="#i-compare"/></svg>Tabela delt</div>
+              <div class="hint">zielony = lepiej w Run B · czerwony = gorzej</div>
+            </div>
+            <table class="tf-table results-table">
+              <thead>
+                <tr><th>Metryka</th><th class="num-r">Run A</th><th class="num-r">Run B</th><th class="num-r">Δ%</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>TTFT @ p512 <span class="text-3">(ms)</span></td><td class="num-r mono">420</td><td class="num-r mono">385</td><td class="num-r"><span class="delta-val better">−8.3%</span></td></tr>
+                <tr><td>Prefill <span class="text-3">(t/s)</span></td><td class="num-r mono">890</td><td class="num-r mono">1 020</td><td class="num-r"><span class="delta-val better">+14.6%</span></td></tr>
+                <tr><td>Decode @ c=1 <span class="text-3">(t/s)</span></td><td class="num-r mono">24.1</td><td class="num-r mono">26.3</td><td class="num-r"><span class="delta-val better">+9.1%</span></td></tr>
+                <tr><td>Latencja p50 <span class="text-3">(ms)</span></td><td class="num-r mono">5 720</td><td class="num-r mono">5 250</td><td class="num-r"><span class="delta-val better">−8.2%</span></td></tr>
+                <tr><td>Latencja p99 <span class="text-3">(ms)</span></td><td class="num-r mono">5 920</td><td class="num-r mono">5 610</td><td class="num-r"><span class="delta-val better">−5.2%</span></td></tr>
+                <tr><td>Decode @ ctx 2048 <span class="text-3">(t/s)</span></td><td class="num-r mono">23.8</td><td class="num-r mono">25.7</td><td class="num-r"><span class="delta-val better">+8.0%</span></td></tr>
+                <tr><td>Decode @ ctx 8192 <span class="text-3">(t/s)</span></td><td class="num-r mono">21.4</td><td class="num-r mono">22.1</td><td class="num-r"><span class="delta-val better">+3.3%</span></td></tr>
+                <tr><td>Decode @ ctx 32k <span class="text-3">(t/s)</span></td><td class="num-r mono">16.9</td><td class="num-r mono">13.9</td><td class="num-r"><span class="delta-val worse">−17.8%</span></td></tr>
+                <tr><td>TTFT @ ctx 32k <span class="text-3">(ms)</span></td><td class="num-r mono">9 800</td><td class="num-r mono">11 400</td><td class="num-r"><span class="delta-val worse">+16.3%</span></td></tr>
+                <tr><td>Error rate <span class="text-3">(%)</span></td><td class="num-r mono">0.0</td><td class="num-r mono">0.0</td><td class="num-r"><span class="delta-val neutral">0.0 pp</span></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="section-card">
+            <div class="section-card-head">
+              <div class="title">Decode t/s — A vs B per wariant testu</div>
+              <div class="hint">gemma-4-31b · g128 · czerwony słupek = regresja</div>
+            </div>
+            <div class="chart-legend" style="margin-bottom:10px;">
+              <span class="lg"><span class="sw" style="background:var(--accent-1)"></span>Run A (#9, vLLM 0.9.2)</span>
+              <span class="lg"><span class="sw" style="background:var(--accent-2)"></span>Run B (#12, vLLM 0.10.0)</span>
+              <span class="lg"><span class="sw" style="background:var(--danger)"></span>Run B — regresja</span>
+            </div>
+            <svg class="chart-svg" style="height:300px;" viewBox="0 0 960 300" preserveAspectRatio="none">
+              <g>
+                <line class="gridline" x1="40" y1="10"  x2="950" y2="10"/>
+                <line class="gridline" x1="40" y1="75"  x2="950" y2="75"/>
+                <line class="gridline" x1="40" y1="140" x2="950" y2="140"/>
+                <line class="gridline" x1="40" y1="205" x2="950" y2="205"/>
+                <line class="gridline" x1="40" y1="270" x2="950" y2="270"/>
+                <text x="36" y="13"  text-anchor="end">30</text>
+                <text x="36" y="78"  text-anchor="end">22</text>
+                <text x="36" y="143" text-anchor="end">15</text>
+                <text x="36" y="208" text-anchor="end">7</text>
+                <text x="36" y="273" text-anchor="end">0</text>
+              </g>
+              <!-- latencja c=1: A 24.1 / B 26.3 -->
+              <g>
+                <rect x="80"  y="61" width="52" height="209" fill="#6366f1"/>
+                <rect x="140" y="42" width="52" height="228" fill="#a78bfa"/>
+                <text x="136" y="286" text-anchor="middle">latencja c=1</text>
+              </g>
+              <!-- ctx 128: A 24.6 / B 26.8 -->
+              <g>
+                <rect x="260" y="57" width="52" height="213" fill="#6366f1"/>
+                <rect x="320" y="38" width="52" height="232" fill="#a78bfa"/>
+                <text x="316" y="286" text-anchor="middle">ctx 128</text>
+              </g>
+              <!-- ctx 2048: A 23.8 / B 25.7 -->
+              <g>
+                <rect x="440" y="64" width="52" height="206" fill="#6366f1"/>
+                <rect x="500" y="48" width="52" height="222" fill="#a78bfa"/>
+                <text x="496" y="286" text-anchor="middle">ctx 2 048</text>
+              </g>
+              <!-- ctx 8192: A 21.4 / B 22.1 -->
+              <g>
+                <rect x="620" y="85" width="52" height="185" fill="#6366f1"/>
+                <rect x="680" y="79" width="52" height="191" fill="#a78bfa"/>
+                <text x="676" y="286" text-anchor="middle">ctx 8 192</text>
+              </g>
+              <!-- ctx 32768: A 16.9 / B 13.9 (regresja) -->
+              <g>
+                <rect x="800" y="124" width="52" height="146" fill="#6366f1"/>
+                <rect x="860" y="150" width="52" height="120" fill="#ef4444"/>
+                <text x="856" y="286" text-anchor="middle">ctx 32 768</text>
+                <text x="886" y="142" text-anchor="middle" style="fill:var(--danger);font-weight:700;">−18%</text>
+              </g>
+            </svg>
+            <div class="text-3 text-xs mt-sm">Update silnika poprawia krótki i średni kontekst (+8–9% decode, +15% prefill), ale wyraźnie pogarsza długi kontekst — do wyjaśnienia przed wdrożeniem na produkcję.</div>
+          </div>
+        </div>
+
+        <div class="flex gap-md" style="justify-content:flex-end;">
+          <button class="btn btn-secondary"><svg class="icon"><use href="#i-download"/></svg>Eksport porównania CSV</button>
+          <button class="btn btn-primary">Otwórz pełne wyniki Run B</button>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

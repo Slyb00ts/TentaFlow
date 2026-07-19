@@ -3,7 +3,7 @@
 // Description: Pełny e2e (Playwright) cyklu ROZPOZNAWANIA (RF-DETR) w ML Studio
 //   przeciw ŻYWEJ instancji TentaFlow (https://localhost:8095, power1/power123).
 //   Klika UI jak realny użytkownik: login → nav ML Studio → kreator 4-krokowy
-//   (typ recognition „Orlen E2E", krok danych pominięty) → zakładka Dane:
+//   (typ recognition „ADR E2E", krok danych pominięty) → zakładka Dane:
 //   rejestracja datasetu COCO przez ŚCIEŻKĘ (/tmp/coco-mini) → zakładka Schemat:
 //   wybór datasetu, wariant nano, epochs=2, resolution=384, Uruchom trening →
 //   polling LIVE do „zakończony" (succeeded) z train loss + mAP@50 → zakładka
@@ -20,8 +20,8 @@ const BASE = 'https://localhost:8095';
 const SHOT = '/tmp/recog-e2e-shots';
 const COCO_PATH = '/tmp/coco-mini';
 const DETECT_IMG = '/tmp/detect-test.jpg';
-const PROJECT_NAME = `Orlen E2E ${Date.now()}`;
-const DATASET_NAME = 'Orlen mini';
+const PROJECT_NAME = `ADR E2E ${Date.now()}`;
+const DATASET_NAME = 'ADR mini';
 
 const results = [];
 function step(name, pass, note) {
@@ -136,14 +136,14 @@ async function shotCurrent(page, base, tag) {
       throw e;
     }
 
-    // ---- Krok 2: kreator 4-kroki → projekt recognition „Orlen E2E" ----
+    // ---- Krok 2: kreator 4-kroki → projekt recognition „ADR E2E" ----
     try {
       await page.locator('#ml-studio-new').click();
       // Krok 1: nazwa
       const nameInput = page.locator('#ml-studio-wiz-name input').first();
       await nameInput.waitFor({ state: 'visible', timeout: 15000 });
       await nameInput.fill(PROJECT_NAME);
-      await page.locator('#ml-studio-wiz-desc textarea').first().fill('e2e recognition: pełny cykl RF-DETR (Orlen)');
+      await page.locator('#ml-studio-wiz-desc textarea').first().fill('e2e recognition: pełny cykl RF-DETR (ADR)');
       await page.locator('#ml-studio-wiz-next').click();
 
       // Krok 2: typ projektu = recognition
@@ -177,11 +177,11 @@ async function shotCurrent(page, base, tag) {
       await shotBoth(page, '02-overview-recognition');
 
       if (outcome !== 'tabs' || !(await page.locator('#ml-studio-tabs').count())) {
-        step('2. Kreator → projekt recognition „Orlen E2E"', false,
+        step('2. Kreator → projekt recognition „ADR E2E"', false,
           `Backend odrzucił utworzenie projektu. Toast: "${toastTxt || '(brak)'}"`);
         throw new Error(`Tworzenie projektu nie powiodło się (toast="${toastTxt}")`);
       }
-      step('2. Kreator → projekt recognition „Orlen E2E"', true,
+      step('2. Kreator → projekt recognition „ADR E2E"', true,
         `Projekt "${PROJECT_NAME}" utworzony przez 4-krokowy kreator; typ=recognition; widok szczegółu otwarty`);
     } catch (e) {
       await shotBoth(page, '02-wizard-FAIL').catch(() => {});

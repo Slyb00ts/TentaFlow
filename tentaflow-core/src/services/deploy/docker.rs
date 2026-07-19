@@ -538,6 +538,9 @@ struct DistributedRuntime {
     /// Port OpenAI head-a (head nasluchuje; worker headless — port tylko do nazwy
     /// kontenera, bez bindu, bo i tak na innym nodzie).
     port: u16,
+    /// Port mastera torch.distributed (TCPStore) → `VLLM_PORT`. Przydzielony z tej
+    /// samej puli co serve, rozny od `port`, zeby vLLM nie kolidowal z domyslnym 8000.
+    dist_port: u16,
     deployment_cluster_id: String,
 }
 
@@ -546,6 +549,7 @@ fn parse_distributed(user_config: &serde_json::Value) -> Option<DistributedRunti
     let d = user_config.get(DISTRIBUTED_CONFIG_KEY)?;
     let role = d.get("role").and_then(|v| v.as_str())?.to_string();
     let port = d.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    let dist_port = d.get("dist_port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
     let deployment_cluster_id = d
         .get("deployment_cluster_id")
         .and_then(|v| v.as_str())
@@ -554,6 +558,7 @@ fn parse_distributed(user_config: &serde_json::Value) -> Option<DistributedRunti
     Some(DistributedRuntime {
         role,
         port,
+        dist_port,
         deployment_cluster_id,
     })
 }
@@ -618,6 +623,26 @@ mod backend {
             .await
             .map(|_| ())
             .map_err(|e| DeployError::Docker(format!("ping: {}", e)))
+    }
+
+    /// Picks the FIRST locally-present base image tag from `candidates`. Used by
+    /// the distributed vllm-spark thin-image build: the cienki obraz FROMs the
+    /// already-built from-source base. Returns a clear error when NONE exist — we
+    /// must never silently trigger a 20-40 min from-source rebuild.
+    pub(super) async fn resolve_existing_base_image(
+        docker: &Docker,
+        candidates: &[String],
+    ) -> DeployResult<String> {
+        for tag in candidates {
+            if image_exists(docker, tag).await? {
+                return Ok(tag.clone());
+            }
+        }
+        Err(DeployError::Docker(format!(
+            "bazowy obraz vLLM-Spark nie istnieje na tym nodzie (szukano: {}). \
+             Zbuduj go najpierw (deploy single-node vllm-spark), zanim uruchomisz deploy rozproszony.",
+            candidates.join(", ")
+        )))
     }
 
     /// Returns true when a tagged image is already present locally.
@@ -831,6 +856,13 @@ mod backend {
     pub(super) struct DistributedDockerOpts {
         pub shm_size_bytes: i64,
         pub working_dir: String,
+        /// Pelna komenda powloki (`cd /root && ray start ... && vllm serve ...`).
+        /// NADPISUJE entrypoint obrazu (`bash -c <cmd>`) zamiast polegac na tym, ze
+        /// bazowy entrypoint.sh uszanuje `ENGINE_LAUNCH_CMD` — baza na nodzie moze
+        /// byc STARSZA (bez tej obslugi) i wtedy odpalala domyslny single-node
+        /// `vllm serve` (TP=1), gubiac komende ray+TP. Override jest niezalezny od
+        /// wersji bazy.
+        pub entrypoint_cmd: String,
     }
 
     /// Creates and starts a container. Returns container id.
@@ -934,13 +966,31 @@ mod backend {
             }]);
             host_config.shm_size = Some(opts.shm_size_bytes);
         }
+        // Distributed: BYPASS the base entrypoint — run the ray+vllm command
+        // directly as `bash -c <cmd>`. `cmd`/`engine_args` are ignored (the full
+        // command, incl. TP size + ray, is baked into `entrypoint_cmd`).
+        let (entrypoint, final_cmd) = match &distributed {
+            Some(o) => (
+                Some(vec![
+                    "bash".to_string(),
+                    "-c".to_string(),
+                    o.entrypoint_cmd.clone(),
+                ]),
+                None,
+            ),
+            None => (
+                None,
+                if cmd.is_empty() {
+                    None
+                } else {
+                    Some(cmd.to_vec())
+                },
+            ),
+        };
         let body = ContainerCreateBody {
             image: Some(image.into()),
-            cmd: if cmd.is_empty() {
-                None
-            } else {
-                Some(cmd.to_vec())
-            },
+            entrypoint,
+            cmd: final_cmd,
             env: if env_vec.is_empty() {
                 None
             } else {
@@ -1028,6 +1078,11 @@ impl DeployStrategy for DockerDeploy {
 
         let docker = backend::connect().await?;
         backend::ping(&docker).await?;
+
+        // Distributed (multi-node TP) — wiedza potrzebna juz przy wyborze obrazu:
+        // distributed vllm-spark idzie na CIENKI obraz (ray/rdma na gotowej bazie
+        // from-source), zeby nie odpalac 20-40 min rebuildu przy kazdym deployu.
+        let distributed = parse_distributed(&self.user_config);
 
         // Walidacja: podkatalog silnika musi istniec (czytelny blad gdy context_path zly).
         let context_dir = crate::paths::containers_root().join(context_path);
@@ -1155,6 +1210,38 @@ impl DeployStrategy for DockerDeploy {
             Some(build_args)
         };
 
+        // Distributed vllm-spark: zamiast 20-40 min rebuildu vLLM ZE ZRODEL na
+        // kazdym deployu, budujemy CIENKA warstwe (ray + rdma-core) na JUZ
+        // ZBUDOWANEJ bazie from-source `tentaflow/vllm-spark:<ver>`. Cienki obraz
+        // `tentaflow/vllm-spark-ray:<ver>` powstaje w ~1-2 min (potem z cache).
+        // Baza MUSI istniec na nodzie — jej brak to czytelny blad (NIE cichy
+        // rebuild from-source). Inne silniki (np. `vllm` z PyPI) maja ray we
+        // wlasnym, szybkim Dockerfile i ida normalna sciezka.
+        let (image_tag, dockerfile_rel, build_args) =
+            if distributed.is_some() && self.manifest.engine.id == "vllm-spark" {
+                let base = backend::resolve_existing_base_image(
+                    &docker,
+                    &[
+                        // Tag z normalnego deployu bazy (ten sam co `image_tag` tutaj),
+                        image_tag.clone(),
+                        // Plaski tag (manualnie zbudowana baza / spike).
+                        format!("tentaflow/vllm-spark:{}", self.manifest.engine.version),
+                    ],
+                )
+                .await?;
+                let thin_tag =
+                    format!("tentaflow/vllm-spark-ray:{}", self.manifest.engine.version);
+                let mut ba: HashMap<String, String> = HashMap::new();
+                ba.insert("BASE_IMAGE".to_string(), base);
+                (
+                    thin_tag,
+                    "tentaflow-containers/llm/docker/vllm-spark-ray/Dockerfile".to_string(),
+                    Some(ba),
+                )
+            } else {
+                (image_tag, dockerfile_rel, build_args)
+            };
+
         // Build only when missing — repeated deploys reuse the cached image.
         if !backend::image_exists(&docker, &image_tag).await? {
             if let Some(s) = &self.log_sink {
@@ -1182,7 +1269,7 @@ impl DeployStrategy for DockerDeploy {
         // runs the OpenAI endpoint on `spec.port`; worker is headless (Embedded
         // transport, no model rows, no HTTP probe) — `port` is reused only to name
         // the container deterministically (different node, no collision).
-        let distributed = parse_distributed(&self.user_config);
+        // `distributed` rozpoznane wczesniej (przy wyborze obrazu).
         let is_worker = distributed
             .as_ref()
             .map(|d| d.role == "worker")
@@ -1236,8 +1323,38 @@ impl DeployStrategy for DockerDeploy {
         for (k, v) in param_app.env {
             env.insert(k, v);
         }
+        // DGX Spark: Marlin NVFP4 GEMM (CUTLASS fp4 pada na sm_121). No-op dla
+        // nie-fp4, wiec bezwarunkowo dla vllm-spark. Single-node docker.
+        for (k, v) in super::spark_engine_env(&self.manifest.engine.id) {
+            env.insert(k, v);
+        }
         env.insert("PORT".into(), internal_port.to_string());
-        env.insert("VLLM_PORT".into(), internal_port.to_string());
+        // Distributed: VLLM_PORT is the torch.distributed TCPStore master port and
+        // MUST differ from the serve API port — the manifest default (8000) is never
+        // allocated, so without this every member's vLLM would land on 8000 and
+        // collide (EADDRINUSE). Single-node keeps the manifest default. A distributed
+        // deploy with dist_port==0 means allocation never reached this node — refuse
+        // rather than silently falling back to 8000 (regression of the collision bug).
+        let vllm_port = if let Some(d) = &distributed {
+            if d.dist_port == 0 {
+                return Err(DeployError::PortAlloc(
+                    "distributed deploy: dist_port not allocated (0) — refusing to fall back to default 8000".into(),
+                ));
+            }
+            d.dist_port
+        } else {
+            internal_port
+        };
+        // Tryb vllm-mp dostaje master TCPStore JAWNIE przez `--master-port
+        // <dist_port>` w komendzie serve. Env VLLM_PORT NIE moze wtedy wskazywac
+        // tego samego portu: vLLM binduje VLLM_PORT dla wewnetrznego message queue
+        // PRZED torch.distributed init i rank0 dostaje EADDRINUSE na wlasnym
+        // master porcie. Bez env vLLM sam wybiera wolne porty wewnetrzne.
+        let vllm_mp = distributed.is_some()
+            && super::distributed::engine_is_vllm_mp(&self.manifest.engine.id);
+        if !vllm_mp {
+            env.insert("VLLM_PORT".into(), vllm_port.to_string());
+        }
         if let Some(model) = super::resolve_model_repo(&self.manifest, &self.user_config) {
             env.insert("MODEL".into(), model);
         }
@@ -1311,7 +1428,23 @@ impl DeployStrategy for DockerDeploy {
         {
             engine_args.extend(spec_args);
         }
-        if super::is_cuda_vllm_engine(&self.manifest.engine.id) {
+        // Chat template gemma-4 (tool-calling): sciezka W KONTENERZE — Dockerfile
+        // COPY-uje zbundlowany szablon do /app/chat_templates. Recepta vLLM
+        // podawala repo-relative `examples/...`, ktorego pip-owy vLLM nie ma.
+        if super::resolve_model_repo(&self.manifest, &self.user_config)
+            .map(|r| r.to_lowercase().contains("gemma-4"))
+            .unwrap_or(false)
+        {
+            engine_args.push("--chat-template".to_string());
+            engine_args
+                .push("/app/chat_templates/tool_chat_template_gemma4.jinja".to_string());
+        }
+        if self.manifest.engine.is_cuda_vllm() {
+            let is_pooling = matches!(
+                self.manifest.engine.category,
+                crate::services::manifest::Category::Embeddings
+                    | crate::services::manifest::Category::Reranker
+            );
             let user_explicit_ratio = self
                 .user_config
                 .get("gpu_memory_utilization")
@@ -1319,7 +1452,7 @@ impl DeployStrategy for DockerDeploy {
             let from_args = super::parse_gpu_memory_utilization_arg(&engine_args.join(" "));
             let ratio = user_explicit_ratio
                 .or(from_args)
-                .or_else(super::auto_gpu_memory_utilization);
+                .or_else(|| super::auto_gpu_memory_utilization(is_pooling));
             if let Some(ratio) = ratio {
                 engine_args.push("--gpu-memory-utilization".to_string());
                 engine_args.push(format!("{:.2}", ratio));
@@ -1328,20 +1461,19 @@ impl DeployStrategy for DockerDeploy {
                     s.info(&format!("[docker] gpu_memory_utilization={:.2}", ratio));
                 }
             }
-            if self.manifest.engine.id == "vllm-spark" {
-                // Spark wymaga wylaczenia flashinfer autotune; dedup last-wins
-                // skasuje ewentualny `--enable-...` z user args.
-                engine_args.push("--no-enable-flashinfer-autotune".to_string());
-                // GB10 ma pamiec ZUNIFIKOWANA (GPU == RAM). torch.compile + CUDA
-                // graphs alokuja pamiec POZA budzetem `--gpu-memory-utilization`,
-                // wiec 0.6 puchnie do ~100% calego poola. `--enforce-eager`
-                // wylacza compile/cudagraphs → vLLM trzyma sie budzetu.
-                engine_args.push("--enforce-eager".to_string());
-            }
+            // DGX Spark (sm_121a): eager + no-flashinfer-autotune. GB10 ma pamiec
+            // ZUNIFIKOWANA — compile/CUDA-graphs alokuja poza budzetem
+            // `--gpu-memory-utilization` i puchna do ~100% poola; eager tego unika.
+            // Jedno zrodlo prawdy z native/cluster (super::spark_engine_args).
+            engine_args.extend(super::spark_engine_args(&self.manifest.engine.id));
         }
         // Dedup last-wins (extra/user args wygrywaja nad bundle/manifest base).
         // entrypoint.sh dorzuca tylko AUTO_PARALLEL gdy brak TP/PP w tych argach.
-        let engine_args = crate::deploy::python_venv::dedup_cli_args_last_wins(engine_args);
+        let mut engine_args = crate::deploy::python_venv::dedup_cli_args_last_wins(engine_args);
+        // Ten sam gate co native: fp8 kv-cache pada na GPU bez fp8e4nv (Ampere).
+        // Kontener widzi karty hosta przez nvidia runtime, wiec host `collect()`
+        // = arch kontenera.
+        crate::deploy::python_venv::gate_fp8_kv_cache(&mut engine_args, None);
 
         let mut labels = HashMap::new();
         labels.insert(
@@ -1470,6 +1602,96 @@ impl DeployStrategy for DockerDeploy {
             }
         }
 
+        // Silniki llama-server (gguf_model_mount): entrypoint laduje pojedynczy
+        // GGUF z `/data/models/model.gguf` i pada gdy pliku brak. Pobieramy GGUF
+        // wybranego presetu na host cache modeli (juz zamontowany pod
+        // CONTAINER_MODELS_PATH) i wskazujemy `MODEL_PATH` na jego sciezke w
+        // kontenerze — bez osobnego binda. Odpowiednik ComfyUI `checkpoint_file`.
+        if docker_section.gguf_model_mount {
+            let repo = super::resolve_model_repo(&self.manifest, &self.user_config).ok_or_else(
+                || {
+                    DeployError::Manifest(
+                        "gguf_model_mount engine has no resolvable model repo".into(),
+                    )
+                },
+            )?;
+            let model_file = self
+                .user_config
+                .get("model_file")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let quantization = self
+                .user_config
+                .get("quantization")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    super::resolve_selected_preset(&self.manifest, &self.user_config)
+                        .and_then(|p| p.quantization.clone())
+                });
+            let selection = if let Some(file) = model_file.as_deref() {
+                if !crate::hub::model_store::valid_hf_relative_path(file) {
+                    return Err(DeployError::Manifest(format!(
+                        "invalid GGUF filename '{file}'"
+                    )));
+                }
+                crate::hub::model_store::ModelDownloadSelection::ExactFile(file.to_string())
+            } else if let Some(q) = quantization.as_deref() {
+                crate::hub::model_store::ModelDownloadSelection::GgufQuantization(q.to_string())
+            } else {
+                return Err(DeployError::Manifest(
+                    "gguf_model_mount deploy requires model_file or preset quantization".into(),
+                ));
+            };
+
+            if let Some(s) = &self.log_sink {
+                s.info(&format!("[docker] gguf model: ensuring {repo}"));
+            }
+            let store = crate::hub::model_store::ModelStore::new(crate::paths::models_root());
+            let (progress_tx, mut progress_rx) =
+                tokio::sync::mpsc::channel::<crate::hub::model_store::DownloadProgress>(128);
+            let progress_sink = self.log_sink.clone();
+            let progress_task = tokio::spawn(async move {
+                while let Some(p) = progress_rx.recv().await {
+                    if let Some(sink) = &progress_sink {
+                        sink.info(&format!(
+                            "[docker] gguf {} {:.1}% ({}/{} MB)",
+                            p.file_name,
+                            p.percent,
+                            p.bytes_downloaded / 1_048_576,
+                            p.bytes_total / 1_048_576
+                        ));
+                    }
+                }
+            });
+            let host_path = store
+                .download_model_selection(&repo, self.hf_token.as_deref(), progress_tx, selection)
+                .await
+                .map_err(|e| DeployError::Manifest(format!("download gguf {repo}: {e}")))?;
+            let _ = progress_task.await;
+
+            // Host cache lezy pod models_root() zamontowanym jako
+            // CONTAINER_MODELS_PATH, wiec wystarczy przelozyc sciezke.
+            let rel = host_path
+                .strip_prefix(crate::paths::models_root())
+                .map_err(|_| {
+                    DeployError::Manifest(format!(
+                        "gguf path {} is not under models_root",
+                        host_path.display()
+                    ))
+                })?;
+            let container_path = format!(
+                "{}/{}",
+                crate::paths::CONTAINER_MODELS_PATH,
+                rel.to_string_lossy()
+            );
+            env.insert("MODEL_PATH".into(), container_path);
+        }
+
         let gpu = resolve_gpu_selection(
             &self.user_config,
             self.manifest
@@ -1492,10 +1714,31 @@ impl DeployStrategy for DockerDeploy {
         }
 
         // Recipe shm-size: 16 GiB (default 64 MB → NCCL "No space left on device").
-        let distributed_opts = distributed.as_ref().map(|_| backend::DistributedDockerOpts {
-            shm_size_bytes: 16 * 1024 * 1024 * 1024,
-            working_dir: "/root".to_string(),
-        });
+        // The ray+vllm command (set as `launch_command_override` by the distributed
+        // config builder) becomes the container ENTRYPOINT — independent of the
+        // base image's entrypoint version.
+        let distributed_opts = match &distributed {
+            Some(_) => {
+                let cmd = self
+                    .user_config
+                    .get("launch_command_override")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        DeployError::Manifest(
+                            "distributed deploy bez launch_command_override (komenda ray+vllm)"
+                                .to_string(),
+                        )
+                    })?;
+                Some(backend::DistributedDockerOpts {
+                    shm_size_bytes: 16 * 1024 * 1024 * 1024,
+                    working_dir: "/root".to_string(),
+                    entrypoint_cmd: cmd.to_string(),
+                })
+            }
+            None => None,
+        };
         let id = backend::run(
             &docker,
             &image_tag,
@@ -1799,6 +2042,7 @@ mod tests {
         ServiceManifest {
             engine: Engine {
                 id: id.into(),
+                backend: None,
                 category: Category::Llm,
                 name: id.into(),
                 description_pl: "".into(),
@@ -1812,6 +2056,8 @@ mod tests {
                 gpu_supported: None,
                 default_port: 8000,
                 dgx_spark: None,
+                cluster_capable: None,
+                cluster_launch: None,
                 api: ApiKind::OpenaiCompatible,
                 version: "0".into(),
                 service_surfaces: None,

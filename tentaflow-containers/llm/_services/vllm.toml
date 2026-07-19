@@ -5,6 +5,7 @@
 
 [engine]
 id = "vllm"
+backend = "vllm"  # served by vLLM — drives gpu_memory_utilization + VRAM calculator
 category = "llm"
 name = "vLLM"
 description_pl = "Serwer LLM z PagedAttention i continuous batching. CUDA (Linux/Windows) albo ROCm (Linux)."
@@ -19,6 +20,9 @@ version = "0.23.0"
 # crashuja w FP8 / Mamba / NVFP4 kernelach. Spark dostaje osobny silnik
 # `vllm-spark` ktory buduje vllm 0.23.0 ze zrodel z TORCH_CUDA_ARCH_LIST=12.1a.
 dgx_spark = false
+# Multi-node tensor-parallel deploy supported — the unified deploy wizard offers
+# this engine when the deploy target is a cluster.
+cluster_capable = true
 
 [deploy.docker]
 context_path = "llm/docker/vllm"
@@ -68,6 +72,40 @@ speculator_method = "draft_model"
 speculator_num_tokens = 3
 featured = true
 
+# Gemma 4 NVFP4 + tools + self-speculative draft (google/*-it-assistant).
+# Prekonfigurowane turnkey bloczki: NVFP4 -> kv-cache fp8 (auto), gemma4
+# tool-call parser + chat template i --max-model-len auto wymusza Core dla
+# rodziny gemma-4 nvfp4 (deploy/recommend), speculative draft z tego bloku.
+[[model_preset]]
+id = "gemma-4-31b-it-nvfp4"
+display_name = "Gemma 4 31B IT (NVFP4 + tools + draft)"
+repo = "nvidia/Gemma-4-31B-IT-NVFP4"
+quantization = "nvfp4"
+speculator_repo = "google/gemma-4-31B-it-assistant"
+speculator_method = "draft_model"
+speculator_num_tokens = 4
+featured = true
+# Warianty kwantyzacji — wizard pokaze dropdown i podmieni repo HF pod wybor.
+# `repo` wyzej = domyslny (nvfp4). Kazdy wariant = inne repo tej samej rodziny.
+[[model_preset.quant_variant]]
+quantization = "nvfp4"
+repo = "nvidia/Gemma-4-31B-IT-NVFP4"
+display_name = "NVFP4 (Blackwell)"
+[[model_preset.quant_variant]]
+quantization = "bf16"
+repo = "google/gemma-4-31B-it"
+display_name = "standard (bf16)"
+
+[[model_preset]]
+id = "gemma-4-12b-it-nvfp4"
+display_name = "Gemma 4 12B IT (NVFP4 + tools + draft)"
+repo = "RedHatAI/gemma-4-12B-it-NVFP4"
+quantization = "nvfp4"
+speculator_repo = "google/gemma-4-12B-it-assistant"
+speculator_method = "draft_model"
+speculator_num_tokens = 4
+featured = true
+
 [[model_preset]]
 id = "nemotron-3-super-120b-a12b"
 display_name = "Nemotron 3 Super 120B A12B"
@@ -85,3 +123,28 @@ id = "nemotron-nano-12b-v2-vl"
 display_name = "Nemotron Nano 12B v2 VL (captioning)"
 repo = "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-FP8"
 quantization = "fp8"
+
+# DeepSeek V4 (Flash 284B/13B-act, Pro 1.6T/49B-act) — MoE + DSA long-context (1M).
+# Warianty -DSpark maja glowe draftujaca WBUDOWANA w checkpoint (self-speculative,
+# ~1.2-1.4x vs stock MTP, lossless), wiec speculator BEZ osobnego repo. Turnkey
+# max-perf: Core auto-dokłada fp8 kv-cache (model_type deepseek_v4), --block-size 256
+# i --enable-expert-parallel (MoE na multi-GPU). --data-parallel-size zalezy od
+# liczby kart → recepta vLLM / extra-args. Datacenter Blackwell/Hopper LUB cluster
+# 4-8x DGX Spark przez RDMA 200Gbit (Flash sie mie sci; Pro 1.6T nie na 8 Sparkach).
+[[model_preset]]
+id = "deepseek-v4-flash-dspark"
+display_name = "DeepSeek V4 Flash (DSpark, MoE, 1M ctx)"
+repo = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
+quantization = "fp8"
+speculator_method = "dspark"
+speculator_num_tokens = 4
+featured = true
+
+[[model_preset]]
+id = "deepseek-v4-pro-dspark"
+display_name = "DeepSeek V4 Pro (DSpark, 1.6T MoE, 1M ctx)"
+repo = "deepseek-ai/DeepSeek-V4-Pro-DSpark"
+quantization = "fp8"
+speculator_method = "dspark"
+speculator_num_tokens = 4
+featured = true

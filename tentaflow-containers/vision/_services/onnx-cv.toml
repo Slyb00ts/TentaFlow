@@ -1,0 +1,35 @@
+# =============================================================================
+# Plik: onnx-cv.toml
+# Opis: Manifest generycznego silnika ONNX dla dynamicznych modeli wizyjnych
+#       z rejestru `vision_models` (wytrenowanych w ML Studio lub
+#       zaimportowanych). Embedded: sesje ONNX Runtime ladowane leniwie przez
+#       `vision::onnx_cv` przy pierwszym uzyciu modelu w pipeline kamery.
+#
+#       Serwis NIE jest deployowany recznie: Core materializuje wiersz
+#       `services` + `model_registry` automatycznie (reconciler
+#       `services::onnx_cv_service`), gdy rejestr `vision_models` ma modele z
+#       plikiem ONNX obecnym na dysku tego wezla. Manifest istnieje po to, by
+#       katalog nadal surfaces `camera_cv` dla kazdej dynamicznej nazwy modelu
+#       (per-model service_surfaces licza sie z manifestu silnika).
+# =============================================================================
+
+[engine]
+id = "onnx-cv"
+category = "vision"
+resource_kind = "ai"
+name = "ONNX CV (modele dynamiczne)"
+description_pl = "Generyczny silnik ONNX Runtime dla modeli wizyjnych zarejestrowanych w rejestrze (detekcja RF-DETR, klasyfikacja softmax). Modele publikuje ML Studio — bez rekompilacji."
+description_en = "Generic ONNX Runtime engine for registry-published vision models (RF-DETR detection, softmax classification). Models come from ML Studio — no recompilation."
+homepage = "https://onnxruntime.ai"
+license = "MIT"
+icon = "vision"
+default_port = 0
+api = "custom"
+version = "1.0.0"
+service_surfaces = ["camera_cv"]
+input_modalities = ["image"]
+
+[deploy.native]
+platforms = ["linux", "macos", "windows"]
+runtime = "embedded"
+feature_flag = "inference-supertonic"

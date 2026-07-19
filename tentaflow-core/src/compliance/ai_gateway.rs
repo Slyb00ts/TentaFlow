@@ -17,6 +17,7 @@ use super::models::{
     AiEventStatus, AiPayloadKind, ComplianceRiskClass, NewAiEvent, NewAiPayload, NewAiToolCall,
     ToolCallStatus,
 };
+use super::audit_worker;
 use super::repository::{
     add_ai_payload, add_ai_tool_call, default_ai_legal_basis_id, finish_ai_event, start_ai_event,
 };
@@ -143,45 +144,68 @@ impl AiGateway {
 
         self.enforce_token_quota(&org_id, &user_id_owned, &model_id_owned)?;
 
-        let conn = self.db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
+        // Mint the ids in-memory so the handle is usable immediately even when
+        // the write is deferred to the async audit worker. A session/root event
+        // with no inbound correlation key anchors the turn on its own request_id
+        // (§3.4).
+        let event_id = uuid::Uuid::new_v4().to_string();
         let request_id = uuid::Uuid::new_v4().to_string();
-        // A session/root event with no inbound correlation key anchors the turn:
-        // it correlates to its own request_id, which routing then propagates so
-        // the flow's per-call events copy it (§3.4).
         let correlation_id = context
-            .and_then(|c| c.correlation_id.as_deref())
-            .unwrap_or(request_id.as_str());
+            .and_then(|c| c.correlation_id.clone())
+            .unwrap_or_else(|| request_id.clone());
         let legal_basis_id = default_ai_legal_basis_id(&org_id);
-        let event_id = start_ai_event(
-            &conn,
-            &NewAiEvent {
-                org_id: &org_id,
-                user_id: user.map(|u| u.user_id.as_str()),
-                node_id: &self.node_id,
-                addon_id: context.and_then(|c| c.addon_id.as_deref()),
-                instance_id: context.and_then(|c| c.instance_id.as_deref()),
-                flow_id: context.and_then(|c| c.flow_id.as_deref()),
-                flow_node_id: context.and_then(|c| c.flow_node_id.as_deref()),
-                agent_id: context.and_then(|c| c.agent_id.as_deref()),
-                agent_run_id: context.and_then(|c| c.agent_run_id.as_deref()),
-                request_id: &request_id,
-                correlation_id: Some(correlation_id),
-                model_id: &request.model,
-                backend: "chat",
-                risk_class: ComplianceRiskClass::High,
-                legal_basis_id: Some(&legal_basis_id),
-            },
-        )?;
-        add_ai_payload(
-            &conn,
-            &NewAiPayload {
-                event_id: &event_id,
-                payload_kind: AiPayloadKind::Prompt,
-                content_text: &chat_request_prompt_text(request),
-                content_redacted: false,
-                token_count: None,
-            },
-        )?;
+        let prompt_text = chat_request_prompt_text(request);
+
+        // Owned captures for the write (inline in sync mode, worker in async).
+        let db = self.db.clone();
+        let w_event_id = event_id.clone();
+        let w_request_id = request_id.clone();
+        let w_org_id = org_id.clone();
+        let w_node_id = self.node_id.clone();
+        let w_user_id = user.map(|u| u.user_id.to_string());
+        let w_addon = context.and_then(|c| c.addon_id.clone());
+        let w_instance = context.and_then(|c| c.instance_id.clone());
+        let w_flow = context.and_then(|c| c.flow_id.clone());
+        let w_flow_node = context.and_then(|c| c.flow_node_id.clone());
+        let w_agent = context.and_then(|c| c.agent_id.clone());
+        let w_agent_run = context.and_then(|c| c.agent_run_id.clone());
+        let w_model = request.model.clone();
+        dispatch_write(move || {
+            let conn = db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
+            start_ai_event(
+                &conn,
+                &w_event_id,
+                &NewAiEvent {
+                    org_id: &w_org_id,
+                    user_id: w_user_id.as_deref(),
+                    node_id: &w_node_id,
+                    addon_id: w_addon.as_deref(),
+                    instance_id: w_instance.as_deref(),
+                    flow_id: w_flow.as_deref(),
+                    flow_node_id: w_flow_node.as_deref(),
+                    agent_id: w_agent.as_deref(),
+                    agent_run_id: w_agent_run.as_deref(),
+                    request_id: &w_request_id,
+                    correlation_id: Some(&correlation_id),
+                    model_id: &w_model,
+                    backend: "chat",
+                    risk_class: ComplianceRiskClass::High,
+                    legal_basis_id: Some(&legal_basis_id),
+                },
+            )?;
+            add_ai_payload(
+                &conn,
+                &NewAiPayload {
+                    event_id: &w_event_id,
+                    payload_kind: AiPayloadKind::Prompt,
+                    content_text: &prompt_text,
+                    content_redacted: false,
+                    token_count: None,
+                },
+            )?;
+            Ok(())
+        })?;
+
         Ok(AiEventHandle {
             db: self.db.clone(),
             event_id,
@@ -338,38 +362,6 @@ impl AiEventHandle {
         &self.request_id
     }
 
-    /// Dolicza zuzycie tokenow do dziennego licznika tego wezla. Brak usage =
-    /// nic do policzenia (pomijamy). Blad bumpu nigdy nie psuje odpowiedzi —
-    /// metryki sa best-effort.
-    fn bump_usage(&self, usage: Option<&Usage>) {
-        if !self.quota_enabled {
-            return;
-        }
-        let Some(usage) = usage else {
-            return;
-        };
-        // Empty model_id = a flow/session-level event with no resolved model
-        // (the dashboard chat selects a FLOW, not a model). Per-node LLM events
-        // inside the flow own attribution under the real model, so bumping here
-        // would both mis-attribute to "" AND double-count the node's tokens.
-        if self.model_id.trim().is_empty() {
-            return;
-        }
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        if let Err(err) = crate::db::repository::bump_token_usage(
-            &self.db,
-            &self.node_id,
-            &self.org_id,
-            &self.user_id,
-            &self.model_id,
-            &today,
-            i64::from(usage.prompt_tokens),
-            i64::from(usage.completion_tokens),
-        ) {
-            tracing::warn!(error = %err, "zliczenie zuzycia tokenow nieudane");
-        }
-    }
-
     /// Records the result of one executed tool call into
     /// `compliance_ai_tool_calls`. Called by the tool loop right after the
     /// tool returns — pairs the model-issued call id with the real status,
@@ -401,64 +393,28 @@ impl AiEventHandle {
     }
 
     pub fn finish_success(&self, response: &ChatCompletionResponse) -> Result<()> {
-        // Zliczanie tokenow poza write-lockiem: bump_token_usage bierze wlasny
-        // writer lock (acquire), nieaktualny tu trzymany guard zakleszczylby DB.
-        self.bump_usage(response.usage.as_ref());
-        let conn = self.db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
         let response_text = chat_response_text(response);
-        add_ai_payload(
-            &conn,
-            &NewAiPayload {
-                event_id: &self.event_id,
-                payload_kind: AiPayloadKind::Response,
-                content_text: &response_text,
-                content_redacted: false,
-                token_count: response
-                    .usage
-                    .as_ref()
-                    .map(|u| i64::from(u.completion_tokens)),
-            },
-        )?;
-        for call in response_tool_calls(response) {
-            add_ai_tool_call(
-                &conn,
-                &NewAiToolCall {
-                    event_id: &self.event_id,
-                    llm_tool_call_id: Some(&call.id),
-                    addon_id: None,
-                    tool_name: &call.function.name,
-                    input_text: &call.function.arguments,
-                    output_text: "",
-                    // The model only REQUESTED this call here; the execution
-                    // outcome lands via `record_tool_execution`. A row marked
-                    // Success for a never-run tool would be a false record.
-                    status: ToolCallStatus::Running,
-                    error_message: None,
-                    started_at: None,
-                },
-            )?;
-        }
-        let audit_log_id = insert_ai_audit_row(&conn, &self.event_id, "success", None)?;
-        finish_ai_event(
-            &conn,
-            &self.event_id,
-            AiEventStatus::Success,
-            Some(audit_log_id),
-            None,
-        )
+        let usage = response.usage.clone();
+        let tool_calls: Vec<ToolCall> = response_tool_calls(response).into_iter().cloned().collect();
+        self.finish_stream_success(&response_text, usage.as_ref(), &tool_calls)
     }
 
     pub fn finish_failed(&self, error_message: &str) -> Result<()> {
-        let conn = self.db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
-        let audit_log_id =
-            insert_ai_audit_row(&conn, &self.event_id, "error", Some(error_message))?;
-        finish_ai_event(
-            &conn,
-            &self.event_id,
-            AiEventStatus::Failed,
-            Some(audit_log_id),
-            Some(error_message),
-        )
+        let db = self.db.clone();
+        let event_id = self.event_id.clone();
+        let error_message = error_message.to_string();
+        dispatch_write(move || {
+            let conn = db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
+            let audit_log_id =
+                insert_ai_audit_row(&conn, &event_id, "error", Some(&error_message))?;
+            finish_ai_event(
+                &conn,
+                &event_id,
+                AiEventStatus::Failed,
+                Some(audit_log_id),
+                Some(&error_message),
+            )
+        })
     }
 
     pub fn finish_stream_success(
@@ -467,44 +423,67 @@ impl AiEventHandle {
         usage: Option<&Usage>,
         tool_calls: &[ToolCall],
     ) -> Result<()> {
-        self.bump_usage(usage);
-        let conn = self.db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
-        add_ai_payload(
-            &conn,
-            &NewAiPayload {
-                event_id: &self.event_id,
-                payload_kind: AiPayloadKind::Response,
-                content_text: response_text,
-                content_redacted: false,
-                token_count: usage.map(|u| i64::from(u.completion_tokens)),
-            },
-        )?;
-        for call in tool_calls {
-            add_ai_tool_call(
+        let db = self.db.clone();
+        let event_id = self.event_id.clone();
+        let node_id = self.node_id.clone();
+        let org_id = self.org_id.clone();
+        let user_id = self.user_id.clone();
+        let model_id = self.model_id.clone();
+        let quota_enabled = self.quota_enabled;
+        let response_text = response_text.to_string();
+        let usage = usage.cloned();
+        let tool_calls = tool_calls.to_vec();
+        dispatch_write(move || {
+            // Token accounting takes its own short writer lock inside
+            // bump_token_usage, so it must run BEFORE we hold `conn` here.
+            bump_token_usage_for(
+                &db,
+                quota_enabled,
+                &node_id,
+                &org_id,
+                &user_id,
+                &model_id,
+                usage.as_ref(),
+            );
+            let conn = db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
+            add_ai_payload(
                 &conn,
-                &NewAiToolCall {
-                    event_id: &self.event_id,
-                    llm_tool_call_id: Some(&call.id),
-                    addon_id: None,
-                    tool_name: &call.function.name,
-                    input_text: &call.function.arguments,
-                    output_text: "",
-                    // Request-only row — see `finish_success`: execution
-                    // outcome is recorded separately, never assumed here.
-                    status: ToolCallStatus::Running,
-                    error_message: None,
-                    started_at: None,
+                &NewAiPayload {
+                    event_id: &event_id,
+                    payload_kind: AiPayloadKind::Response,
+                    content_text: &response_text,
+                    content_redacted: false,
+                    token_count: usage.as_ref().map(|u| i64::from(u.completion_tokens)),
                 },
             )?;
-        }
-        let audit_log_id = insert_ai_audit_row(&conn, &self.event_id, "success", None)?;
-        finish_ai_event(
-            &conn,
-            &self.event_id,
-            AiEventStatus::Success,
-            Some(audit_log_id),
-            None,
-        )
+            for call in &tool_calls {
+                add_ai_tool_call(
+                    &conn,
+                    &NewAiToolCall {
+                        event_id: &event_id,
+                        llm_tool_call_id: Some(&call.id),
+                        addon_id: None,
+                        tool_name: &call.function.name,
+                        input_text: &call.function.arguments,
+                        output_text: "",
+                        // Request-only row: the model REQUESTED this call; the
+                        // execution outcome is recorded separately via
+                        // `record_tool_execution`, never assumed Success here.
+                        status: ToolCallStatus::Running,
+                        error_message: None,
+                        started_at: None,
+                    },
+                )?;
+            }
+            let audit_log_id = insert_ai_audit_row(&conn, &event_id, "success", None)?;
+            finish_ai_event(
+                &conn,
+                &event_id,
+                AiEventStatus::Success,
+                Some(audit_log_id),
+                None,
+            )
+        })
     }
 }
 
@@ -588,6 +567,60 @@ fn response_tool_calls(response: &ChatCompletionResponse) -> Vec<&ToolCall> {
         .filter_map(|choice| choice.message.tool_calls.as_ref())
         .flat_map(|calls| calls.iter())
         .collect()
+}
+
+/// Runs an audit write either inline (sync mode — the error propagates to the
+/// caller, preserving the "prompt persisted before dispatch" guarantee) or on
+/// the async worker (default — the error is logged, never blocks the request).
+fn dispatch_write(work: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
+    if audit_worker::audit_async_enabled() {
+        audit_worker::submit(Box::new(move || {
+            if let Err(e) = work() {
+                tracing::warn!(error = %e, "async AI audit write failed");
+            }
+        }));
+        Ok(())
+    } else {
+        work()
+    }
+}
+
+/// Token-usage accounting for one finished call. Extracted from the old
+/// `AiEventHandle::bump_usage` method so it can run inside a deferred write
+/// closure. No-op when quota is disabled, usage is absent, or the event has no
+/// resolved model (a flow/session-level row — per-node LLM events own the
+/// attribution, so bumping here would mis-attribute and double-count).
+fn bump_token_usage_for(
+    db: &DbPool,
+    quota_enabled: bool,
+    node_id: &str,
+    org_id: &str,
+    user_id: &str,
+    model_id: &str,
+    usage: Option<&Usage>,
+) {
+    if !quota_enabled {
+        return;
+    }
+    let Some(usage) = usage else {
+        return;
+    };
+    if model_id.trim().is_empty() {
+        return;
+    }
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    if let Err(err) = crate::db::repository::bump_token_usage(
+        db,
+        node_id,
+        org_id,
+        user_id,
+        model_id,
+        &today,
+        i64::from(usage.prompt_tokens),
+        i64::from(usage.completion_tokens),
+    ) {
+        tracing::warn!(error = %err, "zliczenie zuzycia tokenow nieudane");
+    }
 }
 
 fn insert_ai_audit_row(

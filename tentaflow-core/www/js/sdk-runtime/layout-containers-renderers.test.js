@@ -9,6 +9,7 @@ import { StateStore } from './state-store.js';
 import {
   ComponentRenderer,
   _clearComponentRendererRegistry,
+  _clearResponsiveStyles,
 } from './component-renderer.js';
 import { registerLayoutAtomicRenderers, SPACER_TAG, DIVIDER_TAG } from './layout-atomic-renderers.js';
 import {
@@ -18,6 +19,7 @@ import {
   STACK_TAG,
   CLUSTER_TAG,
   SPLIT_TAG,
+  BOX_TAG,
 } from './layout-containers-renderers.js';
 import { bootstrapSdkRuntime } from './bootstrap.js';
 
@@ -82,9 +84,15 @@ function comp(tag, fields, extra = {}) {
 }
 function setup() {
   _clearComponentRendererRegistry();
+  _clearResponsiveStyles();
   registerLayoutAtomicRenderers();
   registerLayoutContainersRenderers();
   document.body.innerHTML = '';
+}
+
+function injectedResponsiveCss() {
+  const el = document.head.querySelector('style[data-sdk-responsive]');
+  return el ? el.textContent : '';
 }
 
 // ============================================================================
@@ -490,6 +498,8 @@ test('Split horizontal renders panes, divider and percent basis', () => {
   const el = engine.render(comp(SPLIT_TAG, splitFields()));
   assert(el.classList.contains('tf-split'));
   assert(el.classList.contains('tf-split--horizontal'));
+  // Absent divider field → the default draggable handle.
+  assert(el.classList.contains('tf-split--divider-handle'));
   assert(!el.classList.contains('tf-split--resizable'));
   assertEq(el.children.length, 3);
   const [primary, divider, secondary] = el.children;
@@ -538,6 +548,21 @@ test('Split accepts BigInt min/max/px from wire decoder', () => {
   assertEq(primary.style.maxWidth, '400px');
 });
 
+test('Split grow=true fills the flex parent, absent/false keeps content sizing', () => {
+  setup();
+  const engine = makeEngine();
+  const grown = engine.render(comp(SPLIT_TAG, splitFields().concat([[9, true]])));
+  assertEq(grown.style.flexGrow, '1');
+  // Basis stays auto (content-driven) so a stacked split keeps its height.
+  assertEq(grown.style.flexBasis, '');
+  const plain = engine.render(comp(SPLIT_TAG, splitFields()));
+  assertEq(plain.style.flexGrow, '');
+  assertEq(plain.style.flexBasis, '');
+  const explicitOff = engine.render(comp(SPLIT_TAG, splitFields().concat([[9, false]])));
+  assertEq(explicitOff.style.flexGrow, '');
+  assertEq(explicitOff.style.flexBasis, '');
+});
+
 test('Split validation rejects malformed fields', () => {
   setup();
   const engine = makeEngine();
@@ -550,7 +575,10 @@ test('Split validation rejects malformed fields', () => {
     splitFields({ 2: 700 }),                                 // min_primary > max_primary
     splitFields({ 4: undefined }),                           // missing resizable
     splitFields({ 5: '' }),                                  // empty primary_slot
-    splitFields().concat([[7, 'x']]),                        // unknown field key
+    splitFields({ 7: 'x' }),                                 // unknown Breakpoint
+    splitFields({ 8: 'x' }),                                 // unknown SplitDivider
+    splitFields().concat([[9, 'x']]),                        // grow must be bool
+    splitFields().concat([[10, 'x']]),                       // unknown field key
   ];
   for (const fields of cases) {
     assertThrows(() => engine.render(comp(SPLIT_TAG, fields)));
@@ -578,6 +606,29 @@ test('Split resizable drag clamps flex-basis to min/max', () => {
   assertEq(primary.style.flexBasis, '100px');
 });
 
+test('Split divider "line" keeps resize, "none" hides divider and disables it', () => {
+  setup();
+  const engine = makeEngine();
+
+  const line = engine.render(comp(SPLIT_TAG, splitFields({ 4: true, 8: 'line' })));
+  assert(line.classList.contains('tf-split--divider-line'));
+  assert(line.classList.contains('tf-split--resizable'));
+  const [linePrimary, lineDivider] = line.children;
+  lineDivider.dispatchEvent(new MouseEvent('pointerdown', { clientX: 0, bubbles: true }));
+  document.dispatchEvent(new MouseEvent('pointermove', { clientX: 300 }));
+  assertEq(linePrimary.style.flexBasis, '300px');
+  document.dispatchEvent(new MouseEvent('pointerup', {}));
+
+  // divider:none has no drag hit-area, so resizable is force-disabled.
+  const none = engine.render(comp(SPLIT_TAG, splitFields({ 4: true, 8: 'none' })));
+  assert(none.classList.contains('tf-split--divider-none'));
+  assert(!none.classList.contains('tf-split--resizable'));
+  const [nonePrimary, noneDivider] = none.children;
+  noneDivider.dispatchEvent(new MouseEvent('pointerdown', { clientX: 0, bubbles: true }));
+  document.dispatchEvent(new MouseEvent('pointermove', { clientX: 300 }));
+  assertEq(nonePrimary.style.flexBasis, '30%');
+});
+
 test('Split destroy removes document drag listeners', () => {
   setup();
   const engine = makeEngine();
@@ -590,6 +641,53 @@ test('Split destroy removes document drag listeners', () => {
   document.dispatchEvent(new MouseEvent('pointermove', { clientX: 550 }));
   // Listeners are unhooked on destroy — basis stays frozen.
   assertEq(primary.style.flexBasis, '300px');
+});
+
+test('Split without collapse_below injects no collapse rule', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(SPLIT_TAG, splitFields()));
+  assertEq(el.getAttribute('data-split-collapse'), null);
+  assertEq(injectedResponsiveCss(), '');
+});
+
+test('Split collapse_below stacks horizontal panes below the breakpoint', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(SPLIT_TAG, splitFields({ 7: 'sm' })));
+  const hash = el.getAttribute('data-split-collapse');
+  assert(hash, 'expected data-split-collapse attribute');
+  const css = injectedResponsiveCss();
+  // Breakpoint sm → 768px container query.
+  assert(css.includes('@container addon (max-width: 768px)'), css);
+  assert(css.includes(`[data-split-collapse="${hash}"]{flex-direction:column !important}`), css);
+  assert(css.includes('> .tf-split__pane{flex-basis:auto !important'), css);
+  assert(css.includes('> .tf-split__pane--primary{max-height:45vh !important}'), css);
+  assert(css.includes('> .tf-split__divider{display:none !important}'), css);
+});
+
+test('Split collapse_below on vertical split only hides the divider', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(SPLIT_TAG, splitFields({ 0: 'vertical', 1: { kind: 'px', value: 240 }, 7: 'md' }))
+  );
+  assert(el.getAttribute('data-split-collapse'));
+  const css = injectedResponsiveCss();
+  assert(css.includes('@container addon (max-width: 1024px)'), css);
+  assert(css.includes('> .tf-split__divider{display:none !important}'), css);
+  assert(!css.includes('flex-direction:column'), css);
+  assert(!css.includes('max-height:45vh'), css);
+});
+
+test('Split collapse rules dedup across identical declarations', () => {
+  setup();
+  const engine = makeEngine();
+  const a = engine.render(comp(SPLIT_TAG, splitFields({ 7: 'sm' })));
+  const b = engine.render(comp(SPLIT_TAG, splitFields({ 7: 'sm' })));
+  assertEq(a.getAttribute('data-split-collapse'), b.getAttribute('data-split-collapse'));
+  const css = injectedResponsiveCss();
+  assertEq(css.split('@container').length - 1, 1);
 });
 
 // ============================================================================
@@ -643,6 +741,196 @@ test('destroy on Flex root unhooks bound child subscriptions', () => {
 });
 
 // ============================================================================
+// BoxStyle (spec §1.5) — shared container styling
+// ============================================================================
+
+// BoxStyle FieldMap: 0=margin, 1=padding, 2=border, 3=background, 4=radius,
+// 5=width, 6=height, 7=min_width, 8=min_height, 9=max_width, 10=max_height,
+// 11=overflow_x, 12=overflow_y.
+function tokenSpace(t) { return { kind: 'token', value: t }; }
+function pxSpace(v) { return { kind: 'px', value: v }; }
+
+test('Flex applies BoxStyle margins/paddings/border/background/radius', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(FLEX_TAG, [
+      [0, 'row'], [1, 'sm'], [2, 'start'], [3, 'center'], [4, 'no_wrap'],
+      [9, [
+        [0, [[0, tokenSpace('md')], [2, tokenSpace('md')]]],           // margin y
+        [1, [[1, pxSpace(12)], [3, pxSpace(12)]]],                     // padding x px
+        [2, [[2, [[0, 2], [1, 'accent'], [2, 'dashed']]]]],            // border bottom
+        [3, 'subtle'],                                                 // background
+        [4, [[0, tokenSpace('lg')], [1, tokenSpace('lg')]]],           // radius top
+        [5, { kind: 'full' }],                                         // width
+        [10, { kind: 'px', value: 480 }],                              // max_height
+        [12, 'auto'],                                                  // overflow_y
+      ]],
+    ])
+  );
+  assertEq(el.style.marginTop, 'var(--tf-space-md)');
+  assertEq(el.style.marginBottom, 'var(--tf-space-md)');
+  assertEq(el.style.marginLeft, '');
+  assertEq(el.style.paddingRight, '12px');
+  assertEq(el.style.paddingLeft, '12px');
+  assertEq(el.style.borderBottomWidth, '2px');
+  assertEq(el.style.borderBottomStyle, 'dashed');
+  assertEq(el.style.borderBottomColor, 'var(--tf-accent-1)');
+  assertEq(el.style.borderTopStyle, '');
+  assertEq(el.style.background, 'var(--tf-bg-subtle)');
+  assertEq(el.style.borderTopLeftRadius, 'var(--tf-radius-lg)');
+  assertEq(el.style.borderTopRightRadius, 'var(--tf-radius-lg)');
+  assertEq(el.style.width, '100%');
+  assertEq(el.style.maxHeight, '480px');
+  assertEq(el.style.overflowY, 'auto');
+});
+
+test('BoxStyle rejects unknown keys, bad tokens and out-of-range px', () => {
+  setup();
+  const engine = makeEngine();
+  const flexWithStyle = (style) =>
+    comp(FLEX_TAG, [
+      [0, 'row'], [1, 'sm'], [2, 'start'], [3, 'center'], [4, 'no_wrap'],
+      [9, style],
+    ]);
+  // Unknown BoxStyle key 13.
+  assertThrows(() => engine.render(flexWithStyle([[13, 'x']])));
+  // Unknown Spacing token in margin.
+  assertThrows(() => engine.render(flexWithStyle([[0, [[0, tokenSpace('gigantic')]]]])));
+  // Px out of u16 range.
+  assertThrows(() => engine.render(flexWithStyle([[1, [[0, pxSpace(70000)]]]])));
+  // Unknown BorderColor.
+  assertThrows(() => engine.render(flexWithStyle([[2, [[0, [[0, 1], [1, 'magenta'], [2, 'solid']]]]]])));
+  // Unknown overflow token.
+  assertThrows(() => engine.render(flexWithStyle([[11, 'wrap']])));
+});
+
+test('BoxStyle rejects duplicate keys in nested FieldMaps', () => {
+  setup();
+  const engine = makeEngine();
+  const flexWithStyle = (style) =>
+    comp(FLEX_TAG, [
+      [0, 'row'], [1, 'sm'], [2, 'start'], [3, 'center'], [4, 'no_wrap'],
+      [9, style],
+    ]);
+  // Duplicate BoxStyle key (padding twice).
+  assertThrows(() => engine.render(flexWithStyle([
+    [1, [[0, pxSpace(4)]]],
+    [1, [[0, pxSpace(8)]]],
+  ])));
+  // Duplicate edge inside EdgeValues (margin.top twice — first-wins forbidden).
+  assertThrows(() => engine.render(flexWithStyle([
+    [0, [[0, pxSpace(4)], [0, pxSpace(8)]]],
+  ])));
+  // Duplicate side inside BorderEdges.
+  assertThrows(() => engine.render(flexWithStyle([
+    [2, [[0, [[0, 1], [1, 'default'], [2, 'solid']]], [0, [[0, 3], [1, 'danger'], [2, 'solid']]]]],
+  ])));
+  // Duplicate field inside BorderSide (width_px twice).
+  assertThrows(() => engine.render(flexWithStyle([
+    [2, [[0, [[0, 1], [0, 2], [1, 'default'], [2, 'solid']]]]],
+  ])));
+  // Duplicate corner inside CornerValues.
+  assertThrows(() => engine.render(flexWithStyle([
+    [4, [[0, tokenSpace('md')], [0, tokenSpace('lg')]]],
+  ])));
+});
+
+test('BorderLineStyle none maps to border none', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(FLEX_TAG, [
+      [0, 'row'], [1, 'sm'], [2, 'start'], [3, 'center'], [4, 'no_wrap'],
+      [9, [[2, [[0, [[0, 1], [1, 'default'], [2, 'none']]]]]]],
+    ])
+  );
+  assertEq(el.style.borderTopStyle, 'none');
+  assertEq(el.style.borderTopWidth, '');
+});
+
+test('Grid and Stack accept BoxStyle field', () => {
+  setup();
+  const engine = makeEngine();
+  const grid = engine.render(
+    comp(GRID_TAG, [
+      [0, { kind: 'equal', count: 2 }],
+      [1, 'md'],
+      [4, []],
+      [7, [[1, [[0, pxSpace(8)]]]]],
+    ])
+  );
+  assertEq(grid.style.paddingTop, '8px');
+  const stack = engine.render(
+    comp(STACK_TAG, [
+      [5, [[0, [[3, tokenSpace('xl')]]]]],
+    ])
+  );
+  assertEq(stack.style.marginLeft, 'var(--tf-space-xl)');
+});
+
+// ============================================================================
+// Box (0x0115) — style(6), direction(7), gap(8), align(9), justify(10)
+// ============================================================================
+
+test('Box renders flex behavior + BoxStyle', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(BOX_TAG, [
+      [5, []],
+      [6, [[2, [[0, [[0, 1], [1, 'default'], [2, 'solid']]], [1, [[0, 1], [1, 'default'], [2, 'solid']]], [2, [[0, 1], [1, 'default'], [2, 'solid']]], [3, [[0, 1], [1, 'default'], [2, 'solid']]]]]]],
+      [7, 'column'],
+      [8, 'sm'],
+      [9, 'center'],
+      [10, 'space_between'],
+    ])
+  );
+  assert(el.classList.contains('tf-box'));
+  assertEq(el.style.display, 'flex');
+  assertEq(el.style.flexDirection, 'column');
+  assertEq(el.style.gap, 'var(--tf-space-sm)');
+  assertEq(el.style.alignItems, 'center');
+  assertEq(el.style.justifyContent, 'space-between');
+  assertEq(el.style.borderTopWidth, '1px');
+  assertEq(el.style.borderTopStyle, 'solid');
+  assertEq(el.style.borderTopColor, 'var(--tf-border)');
+  assertEq(el.style.borderLeftStyle, 'solid');
+});
+
+test('Box grow=true → flex-grow 1 + flex-basis 0 (equal fill)', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(BOX_TAG, [[1, true], [5, []]]));
+  assertEq(el.style.flexGrow, '1');
+  // happy-dom normalizes `0` → `0px`; both are the same zero flex-basis.
+  assert(el.style.flexBasis === '0' || el.style.flexBasis === '0px',
+    `flex-basis should be zero, got ${el.style.flexBasis}`);
+});
+
+test('Box grow absent → no flex-grow/basis', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(BOX_TAG, [[5, []]]));
+  assertEq(el.style.flexGrow, '');
+  assertEq(el.style.flexBasis, '');
+});
+
+test('Box without flex fields stays a plain div', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(BOX_TAG, [[5, []]]));
+  assertEq(el.style.display, '');
+});
+
+test('Box rejects invalid direction and unknown field key', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() => engine.render(comp(BOX_TAG, [[7, 'diagonal']])));
+  assertThrows(() => engine.render(comp(BOX_TAG, [[11, 'x']])));
+});
+
+// ============================================================================
 // Bootstrap
 // ============================================================================
 
@@ -659,6 +947,161 @@ test('bootstrap registers atomic + containers renderers idempotentnie', () => {
       [0, 'row'], [1, 'sm'], [2, 'start'], [3, 'center'], [4, 'no_wrap'],
     ])
   );
+});
+
+// ============================================================================
+// BoxStyle.shadow (key 13)
+// ============================================================================
+
+test('BoxStyle shadow=elevated → box-shadow token', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(FLEX_TAG, [
+      [0, 'row'], [2, 'start'], [3, 'stretch'], [4, 'no_wrap'],
+      [9, [[13, 'elevated']]],
+    ])
+  );
+  assertEq(el.style.boxShadow, 'var(--tf-shadow-lg)');
+});
+
+test('BoxStyle shadow=accent_glow → accent halo token', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(BOX_TAG, [[6, [[13, 'accent_glow']]]])
+  );
+  assertEq(el.style.boxShadow, 'var(--tf-glow-accent)');
+});
+
+test('BoxStyle shadow=none → none', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(BOX_TAG, [[6, [[13, 'none']]]]));
+  assertEq(el.style.boxShadow, 'none');
+});
+
+test('BoxStyle unknown shadow token rejected', () => {
+  setup();
+  const engine = makeEngine();
+  assertThrows(() => engine.render(comp(BOX_TAG, [[6, [[13, 'glow']]]])));
+});
+
+// ============================================================================
+// ResponsiveRule (Flex key 10 / Stack key 6 / Box key 11)
+// ============================================================================
+
+test('Flex responsive → data-responsive + injected @container rule', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(
+    comp(FLEX_TAG, [
+      [0, 'row'], [2, 'start'], [3, 'stretch'], [4, 'no_wrap'],
+      [5, []],
+      // one rule: at Px(680) stack column with lg gap
+      [10, [[[0, { kind: 'px', value: 680 }], [1, 'column'], [2, 'lg']]]],
+    ])
+  );
+  const hash = el.getAttribute('data-responsive');
+  assert(hash && /^[0-9a-f]{8}$/.test(hash), 'stable 8-hex hash on data-responsive');
+  const css = injectedResponsiveCss();
+  assert(css.includes('@container addon (max-width: 680px)'), 'container query at 680px');
+  assert(css.includes(`[data-responsive="${hash}"]`), 'scoped by hash selector');
+  assert(css.includes('flex-direction:column !important'), 'direction override with !important');
+  assert(css.includes('gap:var(--tf-space-lg) !important'), 'gap override with !important');
+});
+
+test('Responsive width override emits width + neutralizes min/max-width', () => {
+  setup();
+  const engine = makeEngine();
+  engine.render(
+    comp(BOX_TAG, [
+      [0, { kind: 'px', value: 280 }],
+      [5, []],
+      [11, [[[0, { kind: 'px', value: 900 }], [9, { kind: 'full' }]]]],
+    ])
+  );
+  const css = injectedResponsiveCss();
+  assert(css.includes('width:100% !important'), 'width full → 100%');
+  assert(css.includes('min-width:0 !important'), 'min-width reset');
+  assert(css.includes('max-width:none !important'), 'max-width reset');
+});
+
+test('Responsive Breakpoint token maps to px scale', () => {
+  setup();
+  const engine = makeEngine();
+  engine.render(
+    comp(STACK_TAG, [
+      [2, []],
+      [6, [[[0, { kind: 'token', value: 'md' }], [1, 'column']]]],
+    ])
+  );
+  assert(injectedResponsiveCss().includes('(max-width: 1024px)'), 'md → 1024px');
+});
+
+test('Responsive order + hidden target the element itself', () => {
+  setup();
+  const engine = makeEngine();
+  engine.render(
+    comp(BOX_TAG, [
+      [11, [[[0, { kind: 'px', value: 460 }], [7, 2], [8, true]]]],
+    ])
+  );
+  const css = injectedResponsiveCss();
+  assert(css.includes('order:2 !important'), 'order override with !important');
+  assert(css.includes('display:none !important'), 'hidden → display:none with !important');
+});
+
+test('Responsive emits smaller max_width LAST so it wins the cascade', () => {
+  setup();
+  const engine = makeEngine();
+  // Author order deliberately narrow-first; the emitted CSS must still put the
+  // wider (680) block before the narrower (460) one.
+  engine.render(comp(FLEX_TAG, [
+    [0, 'row'], [2, 'start'], [3, 'stretch'], [4, 'no_wrap'], [5, []],
+    [10, [
+      [[0, { kind: 'px', value: 460 }], [2, 'sm']],
+      [[0, { kind: 'px', value: 680 }], [2, 'lg']],
+    ]],
+  ]));
+  const css = injectedResponsiveCss();
+  const i680 = css.indexOf('(max-width: 680px)');
+  const i460 = css.indexOf('(max-width: 460px)');
+  assert(i680 !== -1 && i460 !== -1, 'both breakpoints emitted');
+  assert(i680 < i460, '680px block precedes 460px block so 460 overrides');
+});
+
+test('Responsive rules deduped by content hash (no duplicate injection)', () => {
+  setup();
+  const engine = makeEngine();
+  const rule = [[[0, { kind: 'px', value: 680 }], [1, 'column']]];
+  engine.render(comp(FLEX_TAG, [[0, 'row'], [2, 'start'], [3, 'stretch'], [4, 'no_wrap'], [5, []], [10, rule]]));
+  engine.render(comp(FLEX_TAG, [[0, 'row'], [2, 'start'], [3, 'stretch'], [4, 'no_wrap'], [5, []], [10, rule]]));
+  const css = injectedResponsiveCss();
+  const occurrences = css.split('@container addon (max-width: 680px)').length - 1;
+  assertEq(occurrences, 1);
+});
+
+test('Responsive padding EdgeValues → padding longhands', () => {
+  setup();
+  const engine = makeEngine();
+  engine.render(
+    comp(BOX_TAG, [
+      [11, [[[0, { kind: 'px', value: 460 }],
+        [5, [[0, { kind: 'token', value: 'sm' }], [2, { kind: 'px', value: 12 }]]]]]],
+    ])
+  );
+  const css = injectedResponsiveCss();
+  assert(css.includes('padding-top:var(--tf-space-sm) !important'), 'top from token');
+  assert(css.includes('padding-bottom:12px !important'), 'bottom from px');
+});
+
+test('Responsive empty array is a no-op', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(BOX_TAG, [[11, []]]));
+  assert(!el.hasAttribute('data-responsive'), 'no attribute for empty rules');
+  assertEq(injectedResponsiveCss(), '');
 });
 
 // ---- report ----

@@ -317,6 +317,17 @@ function renderFileInput(component, ctx) {
   // stara sekwencja musi widzieć przerwanie nawet gdy ruszyła już nowa.
   let activeUpload = null;
 
+  // Signature (name:size list) of the selection currently being uploaded.
+  // tf-file-input fires `change` twice per pick (its own event + the bubbled
+  // native <input> change), so onChange runs twice for ONE selection; without
+  // this guard the second run aborts the upload the first one started and the
+  // multi-file pick silently truncates to whatever raced through first.
+  let activeSig = null;
+  const fileSig = (files) =>
+    files && files.length
+      ? Array.from(files).map((f) => `${f.name}:${f.size}`).join('|')
+      : '';
+
   // Generyczny chunked upload JEDNEGO pliku do document store addona. Czytamy
   // PER FRAGMENT (`file.slice(start, end).arrayBuffer()`) — nigdy nie buforujemy
   // całego pliku w RAM, więc upload setek MiB nie wywala karty (anty-OOM). Każdy
@@ -428,9 +439,14 @@ function renderFileInput(component, ctx) {
     activeUpload = token;
     for (const f of arr) {
       if (token.aborted) return;
-      const ok = await uploadOne(f, token);
-      if (!ok) return;
+      // A single file's failure must NOT drop the remaining files — bulk document
+      // uploads are independent. uploadOne already emitted `upload_error` for the
+      // failed one; keep going so the rest still upload.
+      await uploadOne(f, token);
     }
+    // Sequence finished cleanly: clear the signature so re-picking the same
+    // files later is treated as a fresh, legitimate upload.
+    if (!token.aborted) activeSig = null;
   };
 
   // tf-file-input emits a bubbling 'change' with detail {files}. Block the
@@ -439,10 +455,6 @@ function renderFileInput(component, ctx) {
   // After a valid pick the host performs the chunked upload (upload_* events).
   const onChange = (e) => {
     e.stopImmediatePropagation();
-    // Nowy wybór plików abortuje trwającą sekwencję (uploadFiles też to robi, ale
-    // ustawiamy tu od razu, gdyby walidacja odrzuciła nowy wybór — stary upload
-    // i tak musi paść, bo użytkownik zmienił intencję).
-    if (activeUpload) activeUpload.aborted = true;
     // Fallback źródła plików: realny wybór (drop / setInputFiles / niektóre
     // przeglądarki) potrafi dostarczyć `change` z pustym `detail.files`, choć
     // natywny `<input>` tf-file-input ma już wypełnione `files`. Bez tego
@@ -460,11 +472,19 @@ function renderFileInput(component, ctx) {
       (target && typeof target.querySelector === 'function'
         ? (target.querySelector('input[type=file]') || {}).files
         : null);
+    // Duplicate `change` for the SAME selection (tf-file-input fires twice):
+    // ignore it so it doesn't abort the in-flight upload started by the first.
+    const sig = fileSig(files);
+    if (sig && sig === activeSig && activeUpload && !activeUpload.aborted) return;
+    // Genuinely new selection: abort any in-flight sequence (user changed intent).
+    if (activeUpload) activeUpload.aborted = true;
+    activeSig = sig || null;
     const validated = validateAndEmit(files);
     if (validated && validated.length > 0) {
       void uploadFiles(validated);
       return;
     }
+    activeSig = null;
     // Gdy walidacja niczego nie zwróciła z POWODU braku plików (a nie odrzucenia
     // przez accept/rozmiar — tam leci osobny `reject`), nie wolno zamilknąć:
     // emitujemy `upload_error`, żeby użytkownik / Playwright zobaczyli porażkę

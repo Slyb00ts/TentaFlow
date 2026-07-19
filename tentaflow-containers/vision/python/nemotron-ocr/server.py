@@ -59,6 +59,10 @@ def _require_cuda() -> None:
 
 
 _LOAD_LOCK = threading.Lock()
+# Serializes GPU inference across the threadpool that FastAPI uses for the sync
+# `/v1/infer` handler — the pipeline is a single shared instance, so concurrent
+# forward passes from different threads would race on one model / CUDA stream.
+_INFER_LOCK = threading.Lock()
 
 
 def _ensure_pipeline() -> None:
@@ -184,8 +188,14 @@ def health() -> dict:
     return {"status": "ok", "model": "nvidia/nemotron-ocr-v1", "loaded": _state["pipeline"] is not None}
 
 
+# SYNC handler on purpose: FastAPI runs `def` (non-async) path operations in a
+# worker thread, so the blocking GPU inference does NOT occupy the event loop.
+# An `async def` here ran the multi-second pipeline ON the loop, so `/health`
+# stopped answering during inference and Core's supervisor health-probe timed out
+# and respawned the engine MID-REQUEST — surfacing to callers as
+# "error sending request to /v1/infer". Keep it sync; serialize GPU with the lock.
 @app.post("/v1/infer")
-async def infer(req: InferRequest) -> dict:
+def infer(req: InferRequest) -> dict:
     if not req.input:
         raise HTTPException(status_code=400, detail="Pole 'input' nie moze byc puste.")
     poziomy = _resolve_merge_levels(req)
@@ -196,7 +206,8 @@ async def infer(req: InferRequest) -> dict:
         raw = _decode_data_url(wejscie.url)
         suma_bajtow += len(raw)
         obraz = _decode_image(raw)
-        detekcje = _run_ocr(obraz, poziom)
+        with _INFER_LOCK:
+            detekcje = _run_ocr(obraz, poziom)
         data.append({"index": indeks, "text_detections": detekcje})
 
     return {

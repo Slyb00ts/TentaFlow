@@ -52,8 +52,7 @@ use tentaflow_protocol::{
         MeshPairingConfirmRequest, MeshPairingRejectRequest, MeshPairingStartRequest,
         MeshTrustRetrustRequest, MeshTrustRevokeRequest, MessageBody, ModelAliasCreateRequest,
         ModelAliasDeleteRequest, ModelAliasUpdateRequest, ModelInstallRequest,
-        MyOAuthAccountsListRequest, NoteCreateRequest, NoteDeleteRequest, NoteDetailRequest,
-        NoteSetPinnedRequest, NoteUpdateRequest, NotesListRequest, NotesRequest, NotesResponse,
+        MyOAuthAccountsListRequest,
         ProtocolError, ProtocolErrorCode, ServiceManifestDeployRequest, SettingEntry,
         SettingsUpdateRequest, SsoProviderCreateRequest, SsoProviderDeleteRequest,
         TranslateRequest, TtsRule,
@@ -395,6 +394,7 @@ pub fn encode_chat_stream_request_simple(
     model_id: String,
     user_message: String,
     flow_id: Option<String>,
+    session_id: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ChatStreamRequestBody(ChatStreamRequest {
         model_id,
@@ -405,6 +405,7 @@ pub fn encode_chat_stream_request_simple(
         temperature: None,
         max_tokens: None,
         flow_id,
+        session_id,
     }))
     .map_err(|e| JsError::new(&e))
 }
@@ -619,6 +620,15 @@ pub fn encode_cluster_deploy_request(
     config_json: Option<String>,
     gcs_timeout_secs: Option<u32>,
     ready_timeout_secs: Option<u32>,
+    // Appended last so existing positional JS calls stay valid (undefined → None
+    // → backend default 600 s build budget).
+    build_timeout_secs: Option<u32>,
+    // Optional per-model pricing captured at deploy time (persisted for the
+    // served model). Appended last so older positional JS calls stay valid.
+    prompt_per_1k: Option<f64>,
+    completion_per_1k: Option<f64>,
+    audio_per_min: Option<f64>,
+    image_each: Option<f64>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ClusterDeployRequestBody(ClusterDeployRequest {
         cluster_id,
@@ -631,8 +641,13 @@ pub fn encode_cluster_deploy_request(
         port,
         gpus_per_node,
         config_json,
+        build_timeout_secs,
         gcs_timeout_secs,
         ready_timeout_secs,
+        prompt_per_1k,
+        completion_per_1k,
+        audio_per_min,
+        image_each,
     }))
     .map_err(|e| JsError::new(&e))
 }
@@ -1732,6 +1747,179 @@ pub fn encode_token_coordinator_status_request() -> Result<Vec<u8>, JsError> {
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeModelMetricsSummaryRequest)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_model_metrics_summary_request(
+    period: String,
+    period_key: String,
+    group_by: String,
+    filter_model: Option<String>,
+    filter_node: Option<String>,
+    filter_service: Option<String>,
+    filter_backend: Option<String>,
+    filter_modality: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ModelMetricsBody(
+        tentaflow_protocol::ModelMetricsPayload::SummaryRequest {
+            period,
+            period_key,
+            group_by,
+            filter: tentaflow_protocol::ModelMetricsFilterWire {
+                model: filter_model,
+                node: filter_node,
+                service: filter_service,
+                backend: filter_backend,
+                modality: filter_modality,
+            },
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeModelMetricsNodeServiceRequest)]
+pub fn encode_model_metrics_node_service_request(
+    period: String,
+    period_key: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ModelMetricsBody(
+        tentaflow_protocol::ModelMetricsPayload::NodeServiceRequest { period, period_key },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeModelMetricsPricingGet)]
+pub fn encode_model_metrics_pricing_get() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ModelMetricsBody(
+        tentaflow_protocol::ModelMetricsPayload::PricingGet,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeModelMetricsPricingSet)]
+pub fn encode_model_metrics_pricing_set(
+    model_id: String,
+    prompt_per_1k: f64,
+    completion_per_1k: f64,
+    audio_per_min: f64,
+    image_each: f64,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ModelMetricsBody(
+        tentaflow_protocol::ModelMetricsPayload::PricingSet {
+            model_id,
+            prompt_per_1k,
+            completion_per_1k,
+            audio_per_min,
+            image_each,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+// ----- Benchmark Studio -----
+
+#[wasm_bindgen(js_name = encodeBenchmarkListRequest)]
+pub fn encode_benchmark_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::ListRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBenchmarkGetRequest)]
+pub fn encode_benchmark_get_request(id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::GetRequest { id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// `targets_json` to JSON-owa tablica obiektów TargetInputWire (id, kind,
+/// service_ref, api_type, host, port, api_key?, model, label). `api_key` obecny
+/// tylko gdy użytkownik wpisał nowy sekret — nie wraca w odczycie.
+#[wasm_bindgen(js_name = encodeBenchmarkSaveRequest)]
+pub fn encode_benchmark_save_request(
+    id: Option<String>,
+    name: String,
+    config_json: String,
+    targets_json: String,
+) -> Result<Vec<u8>, JsError> {
+    let targets: Vec<tentaflow_protocol::TargetInputWire> = serde_json::from_str(&targets_json)
+        .map_err(|e| JsError::new(&format!("invalid targets_json: {e}")))?;
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::SaveRequest {
+            id,
+            name,
+            config_json,
+            targets,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBenchmarkDeleteRequest)]
+pub fn encode_benchmark_delete_request(id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::DeleteRequest { id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBenchmarkStartRunRequest)]
+pub fn encode_benchmark_start_run_request(benchmark_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::StartRunRequest { benchmark_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBenchmarkRunStatusRequest)]
+pub fn encode_benchmark_run_status_request(run_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::RunStatusRequest { run_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBenchmarkRunResultsRequest)]
+pub fn encode_benchmark_run_results_request(run_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::RunResultsRequest { run_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBenchmarkListRunsRequest)]
+pub fn encode_benchmark_list_runs_request(benchmark_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::ListRunsRequest { benchmark_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBenchmarkRecentRunsRequest)]
+pub fn encode_benchmark_recent_runs_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::RecentRunsRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBenchmarkCancelRunRequest)]
+pub fn encode_benchmark_cancel_run_request(run_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::CancelRunRequest { run_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeBenchmarkRunStreamRequest)]
+pub fn encode_benchmark_run_stream_request(run_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BenchmarkBody(
+        tentaflow_protocol::BenchmarkPayload::RunStreamRequest { run_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioProjectsListRequest)]
 pub fn encode_ml_studio_projects_list_request() -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
@@ -1904,6 +2092,7 @@ pub fn encode_addon_document_upload_chunk_request(
     mime: String,
     seq: u32,
     total_chunks: u32,
+    source: String,
     bytes: Vec<u8>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::AddonDocumentBody(
@@ -1914,6 +2103,7 @@ pub fn encode_addon_document_upload_chunk_request(
             mime,
             seq,
             total_chunks,
+            source,
             bytes,
         }),
     ))
@@ -2031,6 +2221,16 @@ pub fn encode_ml_studio_training_runs_list_request(
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeMlStudioJobsOverviewRequest)]
+pub fn encode_ml_studio_jobs_overview_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::JobsOverviewRequest(
+            tentaflow_protocol::MlStudioJobsOverviewRequest {},
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioModelsListRequest)]
 pub fn encode_ml_studio_models_list_request(project_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
@@ -2113,6 +2313,102 @@ pub fn encode_ml_studio_ft_train_start_request(
                 num_gpus: if num_gpus == 0 { None } else { Some(num_gpus) },
                 dist,
             },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioDistillGenerateRequest)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_ml_studio_distill_generate_request(
+    project_id: String,
+    dataset_name: String,
+    question_source: String,
+    source_dataset_id: Option<String>,
+    question_field: Option<String>,
+    generate_prompt: Option<String>,
+    question_model: Option<String>,
+    num_questions: u32,
+    teacher_model: String,
+    answer_instruction: Option<String>,
+    temperature: f64,
+    max_tokens: u32,
+    objective: Option<String>,
+    rejected_model: Option<String>,
+    rejected_instruction: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::DistillGenerateRequest(
+            tentaflow_protocol::MlStudioDistillGenerateRequest {
+                project_id,
+                dataset_name,
+                question_source,
+                source_dataset_id: source_dataset_id.filter(|s| !s.is_empty()),
+                question_field: question_field.filter(|s| !s.is_empty()),
+                generate_prompt: generate_prompt.filter(|s| !s.is_empty()),
+                question_model: question_model.filter(|s| !s.is_empty()),
+                num_questions: if num_questions == 0 {
+                    None
+                } else {
+                    Some(num_questions)
+                },
+                teacher_model,
+                answer_instruction: answer_instruction.filter(|s| !s.is_empty()),
+                temperature: if temperature > 0.0 {
+                    Some(temperature as f32)
+                } else {
+                    None
+                },
+                max_tokens: if max_tokens == 0 {
+                    None
+                } else {
+                    Some(max_tokens)
+                },
+                objective: objective.filter(|s| !s.is_empty()),
+                rejected_model: rejected_model.filter(|s| !s.is_empty()),
+                rejected_instruction: rejected_instruction.filter(|s| !s.is_empty()),
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioDistillGenerateStatusRequest)]
+pub fn encode_ml_studio_distill_generate_status_request(
+    dataset_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::DistillGenerateStatusRequest(
+            tentaflow_protocol::MlStudioDistillGenerateStatusRequest { dataset_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioDatasetRowsRequest)]
+pub fn encode_ml_studio_dataset_rows_request(
+    dataset_id: String,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::DatasetRowsRequest(
+            tentaflow_protocol::MlStudioDatasetRowsRequest {
+                dataset_id,
+                limit: if limit == 0 { None } else { Some(limit) },
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioDatasetRowsSaveRequest)]
+pub fn encode_ml_studio_dataset_rows_save_request(
+    dataset_id: String,
+    rows: Vec<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::DatasetRowsSaveRequest(
+            tentaflow_protocol::MlStudioDatasetRowsSaveRequest { dataset_id, rows },
         ),
     ))
     .map_err(|e| JsError::new(&e))
@@ -2226,6 +2522,55 @@ pub fn encode_ml_studio_recog_train_status_request(run_id: String) -> Result<Vec
     encode_body_inner(&MessageBody::MlStudioBody(
         tentaflow_protocol::MlStudioPayload::RecogTrainStatusRequest(
             tentaflow_protocol::MlStudioRecogTrainStatusRequest { run_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioClassifierTrainStartRequest)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_ml_studio_classifier_train_start_request(
+    project_id: String,
+    dataset_id: String,
+    attribute: String,
+    source_class: String,
+    variant: String,
+    values: Vec<String>,
+    epochs: i32,
+    batch_size: i32,
+    learning_rate: f32,
+    image_size: i32,
+    freeze_backbone: bool,
+    target_node_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ClassifierTrainStartRequest(
+            tentaflow_protocol::MlStudioClassifierTrainStartRequest {
+                project_id,
+                dataset_id,
+                attribute,
+                source_class,
+                variant,
+                values,
+                hyperparams: tentaflow_protocol::MlStudioClassifierHyperparams {
+                    epochs,
+                    batch_size,
+                    learning_rate,
+                    image_size,
+                    freeze_backbone,
+                },
+                target_node_id,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioGenericTrainStatusRequest)]
+pub fn encode_ml_studio_generic_train_status_request(run_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::GenericTrainStatusRequest(
+            tentaflow_protocol::MlStudioGenericTrainStatusRequest { run_id },
         ),
     ))
     .map_err(|e| JsError::new(&e))
@@ -2367,6 +2712,86 @@ pub fn encode_ml_studio_service_models_list_request(
     encode_body_inner(&MessageBody::MlStudioBody(
         tentaflow_protocol::MlStudioPayload::ServiceModelsListRequest(
             tentaflow_protocol::MlStudioServiceModelsListRequest { capability },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioVisionModelPublishRequest)]
+pub fn encode_ml_studio_vision_model_publish_request(
+    model_id: String,
+    model_name: String,
+    op: String,
+    threshold: Option<f64>,
+    alias: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::VisionModelPublishRequest(
+            tentaflow_protocol::MlStudioVisionModelPublishRequest {
+                model_id,
+                model_name,
+                op,
+                threshold,
+                alias,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioVisionModelsListRequest)]
+pub fn encode_ml_studio_vision_models_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::VisionModelsListRequest(
+            tentaflow_protocol::MlStudioVisionModelsListRequest {},
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeVisionImportFetchManifestRequest)]
+pub fn encode_vision_import_fetch_manifest_request(
+    manifest_url: String,
+    api_key: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::VisionImportBody(
+        tentaflow_protocol::VisionImportPayload::FetchManifestRequest(
+            tentaflow_protocol::VisionImportFetchManifestRequest {
+                manifest_url,
+                api_key,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeVisionImportModelRequest)]
+pub fn encode_vision_import_model_request(
+    manifest_url: String,
+    api_key: String,
+    model_name: String,
+    alias: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::VisionImportBody(
+        tentaflow_protocol::VisionImportPayload::ImportRequest(
+            tentaflow_protocol::VisionImportModelRequest {
+                manifest_url,
+                api_key,
+                model_name,
+                alias,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioVisionModelDeleteRequest)]
+pub fn encode_ml_studio_vision_model_delete_request(
+    model_name: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::VisionModelDeleteRequest(
+            tentaflow_protocol::MlStudioVisionModelDeleteRequest { model_name },
         ),
     ))
     .map_err(|e| JsError::new(&e))
@@ -3223,77 +3648,6 @@ pub fn encode_prompt_detail_request(prompt_id: String) -> Result<Vec<u8>, JsErro
     encode_body_inner(&MessageBody::PromptDetailRequest { prompt_id }).map_err(|e| JsError::new(&e))
 }
 
-// --- Notes ----------------------------------------------------------------
-
-/// NotesRequest::List — empty inner struct.
-#[wasm_bindgen(js_name = encodeNotesListRequest)]
-pub fn encode_notes_list_request() -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::NotesRequestBody(NotesRequest::List(
-        NotesListRequest {},
-    )))
-    .map_err(|e| JsError::new(&e))
-}
-
-/// NotesRequest::Detail { note_id }.
-#[wasm_bindgen(js_name = encodeNoteDetailRequest)]
-pub fn encode_note_detail_request(note_id: f64) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::NotesRequestBody(NotesRequest::Detail(
-        NoteDetailRequest {
-            note_id: note_id as i64,
-        },
-    )))
-    .map_err(|e| JsError::new(&e))
-}
-
-/// NotesRequest::Create { title, body }.
-#[wasm_bindgen(js_name = encodeNoteCreateRequest)]
-pub fn encode_note_create_request(title: String, body: String) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::NotesRequestBody(NotesRequest::Create(
-        NoteCreateRequest { title, body },
-    )))
-    .map_err(|e| JsError::new(&e))
-}
-
-/// NotesRequest::Update { note_id, title, body }.
-#[wasm_bindgen(js_name = encodeNoteUpdateRequest)]
-pub fn encode_note_update_request(
-    note_id: f64,
-    title: String,
-    body: String,
-) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::NotesRequestBody(NotesRequest::Update(
-        NoteUpdateRequest {
-            note_id: note_id as i64,
-            title,
-            body,
-        },
-    )))
-    .map_err(|e| JsError::new(&e))
-}
-
-/// NotesRequest::SetPinned { note_id, pinned }.
-#[wasm_bindgen(js_name = encodeNoteSetPinnedRequest)]
-pub fn encode_note_set_pinned_request(note_id: f64, pinned: bool) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::NotesRequestBody(NotesRequest::SetPinned(
-        NoteSetPinnedRequest {
-            note_id: note_id as i64,
-            pinned,
-        },
-    )))
-    .map_err(|e| JsError::new(&e))
-}
-
-/// NotesRequest::Delete { note_id }.
-#[wasm_bindgen(js_name = encodeNoteDeleteRequest)]
-pub fn encode_note_delete_request(note_id: f64) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::NotesRequestBody(NotesRequest::Delete(
-        NoteDeleteRequest {
-            note_id: note_id as i64,
-        },
-    )))
-    .map_err(|e| JsError::new(&e))
-}
-
 // --- Meeting Bot ----------------------------------------------------------
 
 use tentaflow_protocol::{
@@ -3910,6 +4264,426 @@ fn access_transition_to_js(t: &tentaflow_protocol::AccessTransition) -> JsValue 
     o.into()
 }
 
+/// Buduje jeden wiersz summary (JS object) z `ModelMetricsRowWire`. Wspoldzielony
+/// przez `rows` i `grandTotal`, zeby oba mialy identyczny ksztalt (klucze
+/// camelCase + snake_case, percentyle number|null).
+fn model_metrics_summary_row_to_js(
+    r: &tentaflow_protocol::ModelMetricsRowWire,
+) -> js_sys::Object {
+    let item = js_sys::Object::new();
+    set(&item, "key", r.key.clone().into());
+    set(&item, "promptTokens", (r.prompt_tokens as f64).into());
+    set(&item, "prompt_tokens", (r.prompt_tokens as f64).into());
+    set(&item, "completionTokens", (r.completion_tokens as f64).into());
+    set(&item, "completion_tokens", (r.completion_tokens as f64).into());
+    set(&item, "totalTokens", (r.total_tokens as f64).into());
+    set(&item, "total_tokens", (r.total_tokens as f64).into());
+    set(&item, "embeddingTokens", (r.embedding_tokens as f64).into());
+    set(&item, "embedding_tokens", (r.embedding_tokens as f64).into());
+    set(&item, "audioMs", (r.audio_ms as f64).into());
+    set(&item, "audio_ms", (r.audio_ms as f64).into());
+    set(&item, "images", (r.images as f64).into());
+    set(&item, "requestCount", (r.request_count as f64).into());
+    set(&item, "request_count", (r.request_count as f64).into());
+    set(&item, "successCount", (r.success_count as f64).into());
+    set(&item, "success_count", (r.success_count as f64).into());
+    set(&item, "errorCount", (r.error_count as f64).into());
+    set(&item, "error_count", (r.error_count as f64).into());
+    set(&item, "cost", r.cost.into());
+    set(&item, "missingPricing", r.missing_pricing.into());
+    set(&item, "missing_pricing", r.missing_pricing.into());
+    set(&item, "errorRate", r.error_rate.into());
+    set(&item, "error_rate", r.error_rate.into());
+    set(&item, "ttftP50", opt_f64_to_js(r.ttft_p50));
+    set(&item, "ttft_p50", opt_f64_to_js(r.ttft_p50));
+    set(&item, "ttftP90", opt_f64_to_js(r.ttft_p90));
+    set(&item, "ttft_p90", opt_f64_to_js(r.ttft_p90));
+    set(&item, "ttftP99", opt_f64_to_js(r.ttft_p99));
+    set(&item, "ttft_p99", opt_f64_to_js(r.ttft_p99));
+    set(&item, "decodeP50", opt_f64_to_js(r.decode_p50));
+    set(&item, "decode_p50", opt_f64_to_js(r.decode_p50));
+    set(&item, "decodeP90", opt_f64_to_js(r.decode_p90));
+    set(&item, "decode_p90", opt_f64_to_js(r.decode_p90));
+    set(&item, "decodeP99", opt_f64_to_js(r.decode_p99));
+    set(&item, "decode_p99", opt_f64_to_js(r.decode_p99));
+    set(&item, "e2eP50", opt_f64_to_js(r.e2e_p50));
+    set(&item, "e2e_p50", opt_f64_to_js(r.e2e_p50));
+    set(&item, "e2eP90", opt_f64_to_js(r.e2e_p90));
+    set(&item, "e2e_p90", opt_f64_to_js(r.e2e_p90));
+    set(&item, "e2eP99", opt_f64_to_js(r.e2e_p99));
+    set(&item, "e2e_p99", opt_f64_to_js(r.e2e_p99));
+    item
+}
+
+/// Decode helper for `MessageBody::ModelMetricsBody`. Response variants become
+/// per-row JS objects; percentyle jako number|null (brak próbek = null). Klucze
+/// emitowane w camelCase i snake_case, jak w torze token_usage.
+fn decode_model_metrics_payload(
+    obj: &js_sys::Object,
+    payload: tentaflow_protocol::ModelMetricsPayload,
+) {
+    use tentaflow_protocol::ModelMetricsPayload as MP;
+    match payload {
+        MP::SummaryRequest { .. } => set(obj, "variant", "ModelMetricsSummaryRequest".into()),
+        MP::NodeServiceRequest { .. } => {
+            set(obj, "variant", "ModelMetricsNodeServiceRequest".into())
+        }
+        MP::PricingGet => set(obj, "variant", "ModelMetricsPricingGet".into()),
+        MP::PricingSet { .. } => set(obj, "variant", "ModelMetricsPricingSet".into()),
+        MP::SummaryResponse { rows, grand_total } => {
+            set(obj, "variant", "ModelMetricsSummaryResponse".into());
+            let arr = js_sys::Array::new();
+            for r in &rows {
+                arr.push(&model_metrics_summary_row_to_js(r));
+            }
+            set(obj, "rows", arr.into());
+            match grand_total {
+                Some(r) => set(obj, "grandTotal", model_metrics_summary_row_to_js(&r).into()),
+                None => set(obj, "grandTotal", JsValue::NULL),
+            }
+        }
+        MP::NodeServiceResponse { rows } => {
+            set(obj, "variant", "ModelMetricsNodeServiceResponse".into());
+            let arr = js_sys::Array::new();
+            for r in rows {
+                let item = js_sys::Object::new();
+                set(&item, "nodeId", r.node_id.clone().into());
+                set(&item, "node_id", r.node_id.into());
+                set(&item, "serviceKey", r.service_key.clone().into());
+                set(&item, "service_key", r.service_key.into());
+                set(&item, "backend", r.backend.into());
+                set(&item, "modelId", r.model_id.clone().into());
+                set(&item, "model_id", r.model_id.into());
+                set(&item, "promptTokens", (r.prompt_tokens as f64).into());
+                set(&item, "prompt_tokens", (r.prompt_tokens as f64).into());
+                set(&item, "completionTokens", (r.completion_tokens as f64).into());
+                set(&item, "completion_tokens", (r.completion_tokens as f64).into());
+                set(&item, "totalTokens", (r.total_tokens as f64).into());
+                set(&item, "total_tokens", (r.total_tokens as f64).into());
+                set(&item, "requestCount", (r.request_count as f64).into());
+                set(&item, "request_count", (r.request_count as f64).into());
+                set(&item, "successCount", (r.success_count as f64).into());
+                set(&item, "success_count", (r.success_count as f64).into());
+                set(&item, "errorCount", (r.error_count as f64).into());
+                set(&item, "error_count", (r.error_count as f64).into());
+                set(&item, "errorRate", r.error_rate.into());
+                set(&item, "error_rate", r.error_rate.into());
+                set(&item, "ttftP50", opt_f64_to_js(r.ttft_p50));
+                set(&item, "ttft_p50", opt_f64_to_js(r.ttft_p50));
+                set(&item, "ttftP90", opt_f64_to_js(r.ttft_p90));
+                set(&item, "ttft_p90", opt_f64_to_js(r.ttft_p90));
+                set(&item, "ttftP99", opt_f64_to_js(r.ttft_p99));
+                set(&item, "ttft_p99", opt_f64_to_js(r.ttft_p99));
+                set(&item, "decodeP50", opt_f64_to_js(r.decode_p50));
+                set(&item, "decode_p50", opt_f64_to_js(r.decode_p50));
+                set(&item, "decodeP90", opt_f64_to_js(r.decode_p90));
+                set(&item, "decode_p90", opt_f64_to_js(r.decode_p90));
+                set(&item, "decodeP99", opt_f64_to_js(r.decode_p99));
+                set(&item, "decode_p99", opt_f64_to_js(r.decode_p99));
+                arr.push(&item);
+            }
+            set(obj, "rows", arr.into());
+        }
+        MP::PricingList { rows } => {
+            set(obj, "variant", "ModelMetricsPricingList".into());
+            let arr = js_sys::Array::new();
+            for r in rows {
+                let item = js_sys::Object::new();
+                set(&item, "modelId", r.model_id.clone().into());
+                set(&item, "model_id", r.model_id.into());
+                set(&item, "promptPer1k", r.prompt_per_1k.into());
+                set(&item, "prompt_per_1k", r.prompt_per_1k.into());
+                set(&item, "completionPer1k", r.completion_per_1k.into());
+                set(&item, "completion_per_1k", r.completion_per_1k.into());
+                set(&item, "audioPerMin", r.audio_per_min.into());
+                set(&item, "audio_per_min", r.audio_per_min.into());
+                set(&item, "imageEach", r.image_each.into());
+                set(&item, "image_each", r.image_each.into());
+                set(&item, "updatedAt", r.updated_at.clone().into());
+                set(&item, "updated_at", r.updated_at.into());
+                arr.push(&item);
+            }
+            set(obj, "rows", arr.into());
+        }
+        MP::PricingSetResult { ok, error } => {
+            set(obj, "variant", "ModelMetricsPricingSetResult".into());
+            set(obj, "ok", ok.into());
+            match error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+        }
+    }
+}
+
+fn benchmark_run_summary_to_js(r: &tentaflow_protocol::RunSummaryWire) -> JsValue {
+    let item = js_sys::Object::new();
+    set(&item, "id", r.id.clone().into());
+    set(&item, "benchmarkId", r.benchmark_id.clone().into());
+    set(&item, "benchmark_id", r.benchmark_id.clone().into());
+    match &r.benchmark_name {
+        Some(n) => {
+            set(&item, "benchmarkName", n.clone().into());
+            set(&item, "benchmark_name", n.clone().into());
+        }
+        None => {
+            set(&item, "benchmarkName", JsValue::NULL);
+            set(&item, "benchmark_name", JsValue::NULL);
+        }
+    }
+    set(&item, "startedAt", r.started_at.clone().into());
+    set(&item, "started_at", r.started_at.clone().into());
+    match &r.finished_at {
+        Some(f) => {
+            set(&item, "finishedAt", f.clone().into());
+            set(&item, "finished_at", f.clone().into());
+        }
+        None => {
+            set(&item, "finishedAt", JsValue::NULL);
+            set(&item, "finished_at", JsValue::NULL);
+        }
+    }
+    set(&item, "status", r.status.clone().into());
+    match &r.error {
+        Some(e) => set(&item, "error", e.clone().into()),
+        None => set(&item, "error", JsValue::NULL),
+    }
+    item.into()
+}
+
+fn benchmark_target_to_js(t: &tentaflow_protocol::TargetWire) -> JsValue {
+    let item = js_sys::Object::new();
+    set(&item, "id", t.id.clone().into());
+    set(&item, "kind", t.kind.clone().into());
+    match &t.service_ref {
+        Some(s) => {
+            set(&item, "serviceRef", s.clone().into());
+            set(&item, "service_ref", s.clone().into());
+        }
+        None => {
+            set(&item, "serviceRef", JsValue::NULL);
+            set(&item, "service_ref", JsValue::NULL);
+        }
+    }
+    set(&item, "apiType", t.api_type.clone().into());
+    set(&item, "api_type", t.api_type.clone().into());
+    set(&item, "host", t.host.clone().into());
+    set(&item, "port", (t.port as f64).into());
+    set(&item, "hasKey", t.has_key.into());
+    set(&item, "has_key", t.has_key.into());
+    set(&item, "model", t.model.clone().into());
+    set(&item, "label", t.label.clone().into());
+    item.into()
+}
+
+fn benchmark_result_row_to_js(r: &tentaflow_protocol::ResultRowWire) -> JsValue {
+    let item = js_sys::Object::new();
+    set(&item, "targetId", r.target_id.clone().into());
+    set(&item, "target_id", r.target_id.clone().into());
+    set(&item, "targetLabel", r.target_label.clone().into());
+    set(&item, "target_label", r.target_label.clone().into());
+    set(&item, "scenario", r.scenario.clone().into());
+    set(&item, "variantJson", r.variant_json.clone().into());
+    set(&item, "variant_json", r.variant_json.clone().into());
+    set(&item, "ttftMsMean", opt_f64_to_js(r.ttft_ms_mean));
+    set(&item, "ttft_ms_mean", opt_f64_to_js(r.ttft_ms_mean));
+    set(&item, "ttftMsSigma", opt_f64_to_js(r.ttft_ms_sigma));
+    set(&item, "ttft_ms_sigma", opt_f64_to_js(r.ttft_ms_sigma));
+    set(&item, "prefillTpsMean", opt_f64_to_js(r.prefill_tps_mean));
+    set(&item, "prefill_tps_mean", opt_f64_to_js(r.prefill_tps_mean));
+    set(&item, "prefillTpsSigma", opt_f64_to_js(r.prefill_tps_sigma));
+    set(&item, "prefill_tps_sigma", opt_f64_to_js(r.prefill_tps_sigma));
+    set(&item, "decodeTpsMean", opt_f64_to_js(r.decode_tps_mean));
+    set(&item, "decode_tps_mean", opt_f64_to_js(r.decode_tps_mean));
+    set(&item, "decodeTpsSigma", opt_f64_to_js(r.decode_tps_sigma));
+    set(&item, "decode_tps_sigma", opt_f64_to_js(r.decode_tps_sigma));
+    set(&item, "totalMsMean", opt_f64_to_js(r.total_ms_mean));
+    set(&item, "total_ms_mean", opt_f64_to_js(r.total_ms_mean));
+    set(&item, "totalMsSigma", opt_f64_to_js(r.total_ms_sigma));
+    set(&item, "total_ms_sigma", opt_f64_to_js(r.total_ms_sigma));
+    set(&item, "p50Ms", opt_f64_to_js(r.p50_ms));
+    set(&item, "p50_ms", opt_f64_to_js(r.p50_ms));
+    set(&item, "p90Ms", opt_f64_to_js(r.p90_ms));
+    set(&item, "p90_ms", opt_f64_to_js(r.p90_ms));
+    set(&item, "p99Ms", opt_f64_to_js(r.p99_ms));
+    set(&item, "p99_ms", opt_f64_to_js(r.p99_ms));
+    set(&item, "requests", (r.requests as f64).into());
+    set(&item, "errors", (r.errors as f64).into());
+    set(&item, "samplesJson", r.samples_json.clone().into());
+    set(&item, "samples_json", r.samples_json.clone().into());
+    item.into()
+}
+
+/// Decode helper for `MessageBody::BenchmarkBody`. Response i stream chunki
+/// stają się obiektami JS z kluczami camelCase i snake_case. Sekrety (api_key)
+/// nigdy nie występują — target niesie tylko `hasKey`.
+fn decode_benchmark_payload(obj: &js_sys::Object, payload: tentaflow_protocol::BenchmarkPayload) {
+    use tentaflow_protocol::BenchmarkPayload as BP;
+    match payload {
+        BP::ListRequest => set(obj, "variant", "BenchmarkListRequest".into()),
+        BP::GetRequest { .. } => set(obj, "variant", "BenchmarkGetRequest".into()),
+        BP::SaveRequest { .. } => set(obj, "variant", "BenchmarkSaveRequest".into()),
+        BP::DeleteRequest { .. } => set(obj, "variant", "BenchmarkDeleteRequest".into()),
+        BP::StartRunRequest { .. } => set(obj, "variant", "BenchmarkStartRunRequest".into()),
+        BP::RunStatusRequest { .. } => set(obj, "variant", "BenchmarkRunStatusRequest".into()),
+        BP::RunResultsRequest { .. } => set(obj, "variant", "BenchmarkRunResultsRequest".into()),
+        BP::ListRunsRequest { .. } => set(obj, "variant", "BenchmarkListRunsRequest".into()),
+        BP::RecentRunsRequest => set(obj, "variant", "BenchmarkRecentRunsRequest".into()),
+        BP::CancelRunRequest { .. } => set(obj, "variant", "BenchmarkCancelRunRequest".into()),
+        BP::RunStreamRequest { .. } => set(obj, "variant", "BenchmarkRunStreamRequest".into()),
+        BP::ListResponse { benchmarks } => {
+            set(obj, "variant", "BenchmarkListResponse".into());
+            let arr = js_sys::Array::new();
+            for b in &benchmarks {
+                let item = js_sys::Object::new();
+                set(&item, "id", b.id.clone().into());
+                set(&item, "name", b.name.clone().into());
+                set(&item, "targetCount", (b.target_count as f64).into());
+                set(&item, "target_count", (b.target_count as f64).into());
+                set(&item, "testCount", (b.test_count as f64).into());
+                set(&item, "test_count", (b.test_count as f64).into());
+                let models = js_sys::Array::new();
+                for m in &b.models {
+                    models.push(&JsValue::from_str(m));
+                }
+                set(&item, "models", models.into());
+                match &b.last_run {
+                    Some(r) => {
+                        set(&item, "lastRun", benchmark_run_summary_to_js(r));
+                        set(&item, "last_run", benchmark_run_summary_to_js(r));
+                    }
+                    None => {
+                        set(&item, "lastRun", JsValue::NULL);
+                        set(&item, "last_run", JsValue::NULL);
+                    }
+                }
+                arr.push(&item);
+            }
+            set(obj, "benchmarks", arr.into());
+        }
+        BP::GetResponse { benchmark } => {
+            set(obj, "variant", "BenchmarkGetResponse".into());
+            let item = js_sys::Object::new();
+            set(&item, "id", benchmark.id.clone().into());
+            set(&item, "name", benchmark.name.clone().into());
+            set(&item, "configJson", benchmark.config_json.clone().into());
+            set(&item, "config_json", benchmark.config_json.clone().into());
+            set(&item, "createdAt", benchmark.created_at.clone().into());
+            set(&item, "created_at", benchmark.created_at.clone().into());
+            set(&item, "updatedAt", benchmark.updated_at.clone().into());
+            set(&item, "updated_at", benchmark.updated_at.clone().into());
+            let targets = js_sys::Array::new();
+            for t in &benchmark.targets {
+                targets.push(&benchmark_target_to_js(t));
+            }
+            set(&item, "targets", targets.into());
+            set(obj, "benchmark", item.into());
+        }
+        BP::SaveResponse { id } => {
+            set(obj, "variant", "BenchmarkSaveResponse".into());
+            set(obj, "id", id.into());
+        }
+        BP::DeleteResult { ok } => {
+            set(obj, "variant", "BenchmarkDeleteResult".into());
+            set(obj, "ok", ok.into());
+        }
+        BP::StartRunResponse { run_id } => {
+            set(obj, "variant", "BenchmarkStartRunResponse".into());
+            set(obj, "runId", run_id.clone().into());
+            set(obj, "run_id", run_id.into());
+        }
+        BP::RunStatusResponse {
+            run_id,
+            status,
+            error,
+            started_at,
+            finished_at,
+        } => {
+            set(obj, "variant", "BenchmarkRunStatusResponse".into());
+            set(obj, "runId", run_id.clone().into());
+            set(obj, "run_id", run_id.into());
+            set(obj, "status", status.into());
+            match error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+            set(obj, "startedAt", started_at.clone().into());
+            set(obj, "started_at", started_at.into());
+            match finished_at {
+                Some(f) => {
+                    set(obj, "finishedAt", f.clone().into());
+                    set(obj, "finished_at", f.into());
+                }
+                None => {
+                    set(obj, "finishedAt", JsValue::NULL);
+                    set(obj, "finished_at", JsValue::NULL);
+                }
+            }
+        }
+        BP::RunResultsResponse { results } => {
+            set(obj, "variant", "BenchmarkRunResultsResponse".into());
+            let arr = js_sys::Array::new();
+            for r in &results {
+                arr.push(&benchmark_result_row_to_js(r));
+            }
+            set(obj, "results", arr.into());
+        }
+        BP::ListRunsResponse { runs } => {
+            set(obj, "variant", "BenchmarkListRunsResponse".into());
+            let arr = js_sys::Array::new();
+            for r in &runs {
+                arr.push(&benchmark_run_summary_to_js(r));
+            }
+            set(obj, "runs", arr.into());
+        }
+        BP::RecentRunsResponse { runs } => {
+            set(obj, "variant", "BenchmarkRecentRunsResponse".into());
+            let arr = js_sys::Array::new();
+            for r in &runs {
+                arr.push(&benchmark_run_summary_to_js(r));
+            }
+            set(obj, "runs", arr.into());
+        }
+        BP::CancelRunResult { ok } => {
+            set(obj, "variant", "BenchmarkCancelRunResult".into());
+            set(obj, "ok", ok.into());
+        }
+        BP::RunStreamChunk {
+            run_id,
+            kind,
+            phase,
+            line,
+            progress_pct,
+            ts_ms,
+        } => {
+            set(obj, "variant", "BenchmarkRunStreamChunk".into());
+            set(obj, "runId", run_id.clone().into());
+            set(obj, "run_id", run_id.into());
+            set(obj, "kind", kind.into());
+            set(obj, "phase", phase.into());
+            set(obj, "line", line.into());
+            set(obj, "progressPct", (progress_pct as f64).into());
+            set(obj, "progress_pct", (progress_pct as f64).into());
+            set(obj, "tsMs", (ts_ms as f64).into());
+            set(obj, "ts_ms", (ts_ms as f64).into());
+        }
+        BP::RunStreamEnd {
+            run_id,
+            status,
+            error,
+        } => {
+            set(obj, "variant", "BenchmarkRunStreamEnd".into());
+            set(obj, "runId", run_id.clone().into());
+            set(obj, "run_id", run_id.into());
+            set(obj, "status", status.into());
+            match error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+        }
+    }
+}
+
 /// Decode helper for `MessageBody::ServiceBody` (Krok N2). Splits the inner
 /// `ServicePayload` enum into per-variant JS objects with snake_case fields
 /// matching the Rust struct names. Both camelCase and snake_case keys are
@@ -3991,6 +4765,14 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
                 set(&item, "updated_at", s.updated_at.into());
                 set(&item, "updateAvailable", s.update_available.into());
                 set(&item, "update_available", s.update_available.into());
+                set(&item, "gpuSelection", s.gpu_selection.clone().into());
+                set(&item, "gpu_selection", s.gpu_selection.into());
+                set(
+                    &item,
+                    "clusterDeploymentId",
+                    s.cluster_deployment_id.clone().into(),
+                );
+                set(&item, "cluster_deployment_id", s.cluster_deployment_id.into());
 
                 let models = js_sys::Array::new();
                 for m in s.models {
@@ -4257,10 +5039,12 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::MetaSchemaVersionAck {
             server_version,
             accepted,
+            asset_build_hash,
         } => {
             set(&obj, "variant", "MetaSchemaVersionAck".into());
             set(&obj, "serverVersion", (server_version as u32).into());
             set(&obj, "accepted", accepted.into());
+            set(&obj, "assetBuildHash", asset_build_hash.as_str().into());
         }
         MessageBody::MetaHeartbeat { sent_at_epoch } => {
             set(&obj, "variant", "MetaHeartbeat".into());
@@ -4510,6 +5294,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "prefill_tps", (end.prefill_tps as f64).into());
             set(&obj, "decodeTps", (end.decode_tps as f64).into());
             set(&obj, "decode_tps", (end.decode_tps as f64).into());
+            set(&obj, "totalMs", (end.total_ms as f64).into());
+            set(&obj, "total_ms", (end.total_ms as f64).into());
         }
         MessageBody::FlowInvokeRequestBody(_) => {
             // Serwer nie odsyła requestu do klienta; arm dla wyczerpalności.
@@ -4768,6 +5554,12 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&item, "createdAtEpoch", f.created_at_epoch.into());
                 set(&item, "updatedAtEpoch", f.updated_at_epoch.into());
                 set(&item, "enabled", f.enabled.into());
+                set(&item, "isDefault", f.is_default.into());
+                set(&item, "is_default", f.is_default.into());
+                if let Some(pmn) = f.published_model_name {
+                    set(&item, "publishedModelName", pmn.clone().into());
+                    set(&item, "published_model_name", pmn.into());
+                }
                 arr.push(&item.into());
             }
             set(&obj, "flows", arr.into());
@@ -5572,6 +6364,88 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "leases", arr.into());
             }
         },
+        MessageBody::ModelMetricsBody(payload) => decode_model_metrics_payload(&obj, payload),
+        MessageBody::BenchmarkBody(payload) => decode_benchmark_payload(&obj, payload),
+        MessageBody::VisionImportBody(payload) => match payload {
+            tentaflow_protocol::VisionImportPayload::FetchManifestRequest(req) => {
+                set(&obj, "variant", "VisionImportFetchManifestRequest".into());
+                set(&obj, "manifestUrl", req.manifest_url.clone().into());
+                set(&obj, "manifest_url", req.manifest_url.into());
+                set(&obj, "apiKey", req.api_key.clone().into());
+                set(&obj, "api_key", req.api_key.into());
+            }
+            tentaflow_protocol::VisionImportPayload::FetchManifestResponse(resp) => {
+                set(&obj, "variant", "VisionImportFetchManifestResponse".into());
+                set(&obj, "bundle", resp.bundle.into());
+                let files = js_sys::Array::new();
+                for f in &resp.files {
+                    let e = js_sys::Object::new();
+                    set(&e, "name", f.name.clone().into());
+                    set(&e, "size", (f.size as f64).into());
+                    set(&e, "sha256", f.sha256.clone().into());
+                    files.push(&e);
+                }
+                set(&obj, "files", files.into());
+                match resp.model {
+                    Some(m) => {
+                        let mo = js_sys::Object::new();
+                        set(&mo, "modelName", m.model_name.clone().into());
+                        set(&mo, "model_name", m.model_name.into());
+                        set(&mo, "op", m.op.into());
+                        set(&mo, "fileName", m.file_name.clone().into());
+                        set(&mo, "file_name", m.file_name.into());
+                        let classes = js_sys::Array::new();
+                        for c in &m.classes {
+                            classes.push(&JsValue::from_str(c));
+                        }
+                        set(&mo, "classes", classes.into());
+                        set(&mo, "outputContract", m.output_contract.clone().into());
+                        set(&mo, "output_contract", m.output_contract.into());
+                        match m.default_threshold {
+                            Some(t) => set(&mo, "defaultThreshold", t.into()),
+                            None => set(&mo, "defaultThreshold", JsValue::NULL),
+                        }
+                        set(&obj, "model", mo.into());
+                    }
+                    None => set(&obj, "model", JsValue::NULL),
+                }
+                match resp.error {
+                    Some(e) => set(&obj, "error", e.into()),
+                    None => set(&obj, "error", JsValue::NULL),
+                }
+            }
+            tentaflow_protocol::VisionImportPayload::ImportRequest(req) => {
+                set(&obj, "variant", "VisionImportModelRequest".into());
+                set(&obj, "manifestUrl", req.manifest_url.clone().into());
+                set(&obj, "manifest_url", req.manifest_url.into());
+                set(&obj, "apiKey", req.api_key.clone().into());
+                set(&obj, "api_key", req.api_key.into());
+                set(&obj, "modelName", req.model_name.clone().into());
+                set(&obj, "model_name", req.model_name.into());
+                match req.alias {
+                    Some(a) => set(&obj, "alias", a.into()),
+                    None => set(&obj, "alias", JsValue::NULL),
+                }
+            }
+            tentaflow_protocol::VisionImportPayload::ImportResponse(resp) => {
+                set(&obj, "variant", "VisionImportModelResponse".into());
+                set(&obj, "ok", resp.ok.into());
+                match resp.imported_model_name {
+                    Some(n) => {
+                        set(&obj, "importedModelName", n.clone().into());
+                        set(&obj, "imported_model_name", n.into());
+                    }
+                    None => {
+                        set(&obj, "importedModelName", JsValue::NULL);
+                        set(&obj, "imported_model_name", JsValue::NULL);
+                    }
+                }
+                match resp.error {
+                    Some(e) => set(&obj, "error", e.into()),
+                    None => set(&obj, "error", JsValue::NULL),
+                }
+            }
+        },
         MessageBody::SkillsBody(payload) => match payload {
             tentaflow_protocol::SkillsPayload::ListRequest(req) => {
                 set(&obj, "variant", "SkillsListRequest".into());
@@ -6046,66 +6920,6 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "variables", vars.into());
             set(&obj, "updatedAtEpoch", d.updated_at_epoch.into());
         }
-        MessageBody::NotesRequestBody(_) => {
-            set(&obj, "variant", "NotesRequest".into());
-        }
-        MessageBody::NotesResponseBody(r) => match r {
-            NotesResponse::List(resp) => {
-                set(&obj, "variant", "NotesListResponse".into());
-                let arr = js_sys::Array::new();
-                for n in resp.notes {
-                    let item = js_sys::Object::new();
-                    set(&item, "id", n.id.clone().into());
-                    set(&item, "title", n.title.into());
-                    set(&item, "bodyPreview", n.body_preview.clone().into());
-                    set(&item, "body_preview", n.body_preview.into());
-                    set(&item, "pinned", n.pinned.into());
-                    set(&item, "createdAtEpoch", n.created_at_epoch.clone().into());
-                    set(
-                        &item,
-                        "created_at_epoch",
-                        n.created_at_epoch.clone().into(),
-                    );
-                    set(&item, "updatedAtEpoch", n.updated_at_epoch.clone().into());
-                    set(
-                        &item,
-                        "updated_at_epoch",
-                        n.updated_at_epoch.clone().into(),
-                    );
-                    arr.push(&item.into());
-                }
-                set(&obj, "notes", arr.into());
-            }
-            NotesResponse::Detail(d) => {
-                set(&obj, "variant", "NoteDetailResponse".into());
-                set(&obj, "id", d.id.clone().into());
-                set(&obj, "title", d.title.into());
-                set(&obj, "body", d.body.into());
-                set(&obj, "pinned", d.pinned.into());
-                set(&obj, "createdAtEpoch", d.created_at_epoch.clone().into());
-                set(&obj, "created_at_epoch", d.created_at_epoch.clone().into());
-                set(&obj, "updatedAtEpoch", d.updated_at_epoch.clone().into());
-                set(&obj, "updated_at_epoch", d.updated_at_epoch.clone().into());
-            }
-            NotesResponse::Create(c) => {
-                set(&obj, "variant", "NoteCreateResponse".into());
-                set(&obj, "id", c.id.clone().into());
-            }
-            NotesResponse::Update(u) => {
-                set(&obj, "variant", "NoteUpdateResponse".into());
-                set(&obj, "ok", u.ok.into());
-                set(&obj, "updatedAtEpoch", u.updated_at_epoch.clone().into());
-                set(&obj, "updated_at_epoch", u.updated_at_epoch.clone().into());
-            }
-            NotesResponse::SetPinned(p) => {
-                set(&obj, "variant", "NoteSetPinnedResponse".into());
-                set(&obj, "ok", p.ok.into());
-            }
-            NotesResponse::Delete(d) => {
-                set(&obj, "variant", "NoteDeleteResponse".into());
-                set(&obj, "ok", d.ok.into());
-            }
-        },
         MessageBody::RegistryListRequest => {
             set(&obj, "variant", "RegistryListRequest".into());
         }
@@ -8033,6 +8847,14 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "camera_id", frame.camera_id.into());
                 set(&obj, "tsMs", (frame.ts_ms as f64).into());
                 set(&obj, "ts_ms", (frame.ts_ms as f64).into());
+                // PTS klatki w osi czasu mediów (ns) — wspólny zegar z init
+                // segmentem MSE, kotwiczy overlay na dokładnej klatce wideo.
+                set_optional_u64(&obj, "pts_ns", frame.pts_ns);
+                set_optional_u64(&obj, "ptsNs", frame.pts_ns);
+                // Całkowity czas obróbki klatki (ms): detekcja + OCR + stan.
+                // Klient renderuje jako badge opóźnienia.
+                set(&obj, "proc_ms", (frame.proc_ms as f64).into());
+                set(&obj, "procMs", (frame.proc_ms as f64).into());
                 let items = js_sys::Array::new();
                 for det in frame.items {
                     let item = js_sys::Object::new();
@@ -8052,6 +8874,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         Some(t) => set(&item, "tekst", t.into()),
                         None => set(&item, "tekst", JsValue::NULL),
                     }
+                    // Stabilne id trackingu oraz prędkość środka boksu
+                    // (jednostki znormalizowane/s) dla ekstrapolacji overlayu.
+                    set(&item, "track_id", (det.track_id as f64).into());
+                    set(&item, "vx", (det.vx as f64).into());
+                    set(&item, "vy", (det.vy as f64).into());
                     items.push(&item.into());
                 }
                 set(&obj, "items", items.into());
@@ -8161,6 +8988,10 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "mimeType", resp.mime_type.into());
                 set(&obj, "has_init_segment", resp.has_init_segment.into());
                 set(&obj, "hasInitSegment", resp.has_init_segment.into());
+                // Bazowy PTS osi czasu mediów — frontend odejmuje go od pts_ns
+                // detekcji, aby zakotwiczyć overlay na właściwej klatce wideo.
+                set_optional_u64(&obj, "base_pts_ns", resp.base_pts_ns);
+                set_optional_u64(&obj, "basePtsNs", resp.base_pts_ns);
             }
             tentaflow_protocol::StreamPayload::Frame(frame) => {
                 set(&obj, "variant", "StreamFrame".into());
@@ -8433,6 +9264,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "seq", req.seq.into());
             set(&obj, "totalChunks", req.total_chunks.into());
             set(&obj, "total_chunks", req.total_chunks.into());
+            set(&obj, "source", req.source.into());
         }
         MessageBody::AddonDocumentBody(AddonDocumentPayload::UploadChunkResponse(resp)) => {
             set(&obj, "variant", "AddonDocumentUploadChunkResponse".into());
@@ -8940,8 +9772,12 @@ fn ml_studio_detail_to_js(d: &tentaflow_protocol::MlStudioProjectDetail) -> js_s
     set(&item, "owner_user_id", d.owner_user_id.clone().into());
     set(&item, "orgId", d.org_id.clone().into());
     set(&item, "org_id", d.org_id.clone().into());
+    set(&item, "datasetCount", d.dataset_count.into());
+    set(&item, "dataset_count", d.dataset_count.into());
     set(&item, "modelCount", d.model_count.into());
     set(&item, "model_count", d.model_count.into());
+    set(&item, "trainingCount", d.training_count.into());
+    set(&item, "training_count", d.training_count.into());
     set(&item, "createdAt", d.created_at.clone().into());
     set(&item, "created_at", d.created_at.clone().into());
     set(&item, "updatedAt", d.updated_at.clone().into());
@@ -8986,6 +9822,46 @@ fn ml_studio_grant_to_js(g: &tentaflow_protocol::MlStudioResourceGrant) -> js_sy
     set(&item, "granted_by", g.granted_by.clone().into());
     set(&item, "createdAt", g.created_at.clone().into());
     set(&item, "created_at", g.created_at.clone().into());
+    item
+}
+
+/// Mapuje statystyki GPU na obiekt JS (camelCase + snake_case).
+fn ml_studio_gpu_stats_to_js(g: &tentaflow_protocol::GpuStats) -> js_sys::Object {
+    let item = js_sys::Object::new();
+    set(&item, "name", g.name.clone().into());
+    set(&item, "memUsedMb", (g.mem_used_mb as f64).into());
+    set(&item, "mem_used_mb", (g.mem_used_mb as f64).into());
+    set(&item, "memTotalMb", (g.mem_total_mb as f64).into());
+    set(&item, "mem_total_mb", (g.mem_total_mb as f64).into());
+    set(&item, "utilPct", (g.util_pct as f64).into());
+    set(&item, "util_pct", (g.util_pct as f64).into());
+    item
+}
+
+/// Mapuje jeden aktywny job treningowy (panel jobów) na obiekt JS.
+fn ml_studio_job_info_to_js(j: &tentaflow_protocol::TrainingJobInfo) -> js_sys::Object {
+    let item = js_sys::Object::new();
+    set(&item, "runId", j.run_id.clone().into());
+    set(&item, "run_id", j.run_id.clone().into());
+    set(&item, "projectId", j.project_id.clone().into());
+    set(&item, "project_id", j.project_id.clone().into());
+    set(&item, "projectName", j.project_name.clone().into());
+    set(&item, "project_name", j.project_name.clone().into());
+    set(&item, "kind", j.kind.clone().into());
+    set(&item, "variant", j.variant.clone().into());
+    set(&item, "status", j.status.clone().into());
+    set(&item, "epoch", (j.epoch as f64).into());
+    set(&item, "totalEpochs", (j.total_epochs as f64).into());
+    set(&item, "total_epochs", (j.total_epochs as f64).into());
+    set(&item, "etaS", (j.eta_s as f64).into());
+    set(&item, "eta_s", (j.eta_s as f64).into());
+    set(&item, "elapsedS", (j.elapsed_s as f64).into());
+    set(&item, "elapsed_s", (j.elapsed_s as f64).into());
+    set(&item, "gpuMemMb", (j.gpu_mem_mb as f64).into());
+    set(&item, "gpu_mem_mb", (j.gpu_mem_mb as f64).into());
+    set(&item, "stage", j.stage.clone().into());
+    set(&item, "startedAt", j.started_at.clone().into());
+    set(&item, "started_at", j.started_at.clone().into());
     item
 }
 
@@ -9366,6 +10242,18 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             }
             set(obj, "runs", arr.into());
         }
+        tentaflow_protocol::MlStudioPayload::JobsOverviewRequest(_req) => {
+            set(obj, "variant", "MlStudioJobsOverviewRequest".into());
+        }
+        tentaflow_protocol::MlStudioPayload::JobsOverviewResponse(resp) => {
+            set(obj, "variant", "MlStudioJobsOverviewResponse".into());
+            let arr = js_sys::Array::new();
+            for j in &resp.jobs {
+                arr.push(&ml_studio_job_info_to_js(j));
+            }
+            set(obj, "jobs", arr.into());
+            set(obj, "gpu", ml_studio_gpu_stats_to_js(&resp.gpu).into());
+        }
         tentaflow_protocol::MlStudioPayload::ModelsListRequest(req) => {
             set(obj, "variant", "MlStudioModelsListRequest".into());
             set(obj, "projectId", req.project_id.clone().into());
@@ -9410,6 +10298,83 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "runId", resp.run_id.clone().into());
             set(obj, "run_id", resp.run_id.into());
             set(obj, "status", resp.status.into());
+        }
+        tentaflow_protocol::MlStudioPayload::DistillGenerateRequest(_) => {
+            set(obj, "variant", "MlStudioDistillGenerateRequest".into());
+        }
+        tentaflow_protocol::MlStudioPayload::DistillGenerateResponse(resp) => {
+            set(obj, "variant", "MlStudioDistillGenerateResponse".into());
+            set(obj, "datasetId", resp.dataset_id.clone().into());
+            set(obj, "dataset_id", resp.dataset_id.into());
+            set(obj, "status", resp.status.into());
+        }
+        tentaflow_protocol::MlStudioPayload::DistillGenerateStatusRequest(req) => {
+            set(obj, "variant", "MlStudioDistillGenerateStatusRequest".into());
+            set(obj, "datasetId", req.dataset_id.clone().into());
+            set(obj, "dataset_id", req.dataset_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::DistillGenerateStatusResponse(resp) => {
+            set(obj, "variant", "MlStudioDistillGenerateStatusResponse".into());
+            set(obj, "status", resp.status.into());
+            set(obj, "total", (resp.total as f64).into());
+            set(obj, "done", (resp.done as f64).into());
+            if let Some(err) = resp.error {
+                set(obj, "error", err.into());
+            }
+            let arr = js_sys::Array::new();
+            for pair in &resp.samples {
+                let o = js_sys::Object::new();
+                set(&o, "question", pair.question.clone().into());
+                set(&o, "answer", pair.answer.clone().into());
+                set(
+                    &o,
+                    "rejected",
+                    pair.rejected.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+                );
+                arr.push(&JsValue::from(o));
+            }
+            set(obj, "samples", arr.into());
+        }
+        tentaflow_protocol::MlStudioPayload::DatasetRowsRequest(req) => {
+            set(obj, "variant", "MlStudioDatasetRowsRequest".into());
+            set(obj, "datasetId", req.dataset_id.clone().into());
+            set(obj, "dataset_id", req.dataset_id.into());
+            set(obj, "limit", req.limit.unwrap_or(0).into());
+        }
+        tentaflow_protocol::MlStudioPayload::DatasetRowsSaveRequest(req) => {
+            set(obj, "variant", "MlStudioDatasetRowsSaveRequest".into());
+            set(obj, "datasetId", req.dataset_id.clone().into());
+            set(obj, "dataset_id", req.dataset_id.into());
+            let arr = js_sys::Array::new();
+            for r in req.rows {
+                arr.push(&JsValue::from(r));
+            }
+            set(obj, "rows", arr.into());
+        }
+        tentaflow_protocol::MlStudioPayload::DatasetRowsResponse(resp) => {
+            set(obj, "variant", "MlStudioDatasetRowsResponse".into());
+            set(obj, "datasetId", resp.dataset_id.clone().into());
+            set(obj, "dataset_id", resp.dataset_id.into());
+            set(obj, "kind", resp.kind.into());
+            set(obj, "total", resp.total.into());
+            let arr = js_sys::Array::new();
+            for r in resp.rows {
+                arr.push(&JsValue::from(r));
+            }
+            set(obj, "rows", arr.into());
+            set(
+                obj,
+                "meta",
+                resp.meta.map(JsValue::from).unwrap_or(JsValue::NULL),
+            );
+            set(obj, "pending", resp.pending.into());
+        }
+        tentaflow_protocol::MlStudioPayload::DatasetRowsSaveResponse(resp) => {
+            set(obj, "variant", "MlStudioDatasetRowsSaveResponse".into());
+            set(obj, "datasetId", resp.dataset_id.clone().into());
+            set(obj, "dataset_id", resp.dataset_id.into());
+            set(obj, "rowCount", resp.row_count.into());
+            set(obj, "row_count", resp.row_count.into());
         }
         tentaflow_protocol::MlStudioPayload::FtTrainStatusRequest(req) => {
             set(obj, "variant", "MlStudioFtTrainStatusRequest".into());
@@ -9583,6 +10548,69 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "sync_bytes_total", (resp.sync_bytes_total as f64).into());
             set(obj, "syncRateBps", (resp.sync_rate_bps as f64).into());
             set(obj, "sync_rate_bps", (resp.sync_rate_bps as f64).into());
+            set(obj, "etaS", (resp.eta_s as f64).into());
+            set(obj, "eta_s", (resp.eta_s as f64).into());
+            set(obj, "elapsedS", (resp.elapsed_s as f64).into());
+            set(obj, "elapsed_s", (resp.elapsed_s as f64).into());
+            set(obj, "gpuMemMb", (resp.gpu_mem_mb as f64).into());
+            set(obj, "gpu_mem_mb", (resp.gpu_mem_mb as f64).into());
+            set(obj, "stage", resp.stage.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ClassifierTrainStartRequest(req) => {
+            set(obj, "variant", "MlStudioClassifierTrainStartRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+            set(obj, "datasetId", req.dataset_id.clone().into());
+            set(obj, "dataset_id", req.dataset_id.into());
+            set(obj, "attribute", req.attribute.into());
+            set(obj, "sourceClass", req.source_class.clone().into());
+            set(obj, "source_class", req.source_class.into());
+            set(obj, "variant_name", req.variant.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ClassifierTrainStartResponse(resp) => {
+            set(obj, "variant", "MlStudioClassifierTrainStartResponse".into());
+            set(obj, "runId", resp.run_id.clone().into());
+            set(obj, "run_id", resp.run_id.into());
+            set(obj, "status", resp.status.into());
+        }
+        tentaflow_protocol::MlStudioPayload::GenericTrainStatusRequest(req) => {
+            set(obj, "variant", "MlStudioGenericTrainStatusRequest".into());
+            set(obj, "runId", req.run_id.clone().into());
+            set(obj, "run_id", req.run_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::GenericTrainStatusResponse(resp) => {
+            set(obj, "variant", "MlStudioGenericTrainStatusResponse".into());
+            set(obj, "runId", resp.run_id.clone().into());
+            set(obj, "run_id", resp.run_id.into());
+            set(obj, "status", resp.status.into());
+            set(obj, "epoch", (resp.epoch as f64).into());
+            set(obj, "totalEpochs", (resp.total_epochs as f64).into());
+            set(obj, "total_epochs", (resp.total_epochs as f64).into());
+            set(obj, "curve", ml_studio_generic_curve_to_js(&resp.curve).into());
+            set(obj, "error", resp.error.into());
+            match resp.sync_phase {
+                Some(p) => {
+                    set(obj, "syncPhase", p.clone().into());
+                    set(obj, "sync_phase", p.into());
+                }
+                None => {
+                    set(obj, "syncPhase", JsValue::NULL);
+                    set(obj, "sync_phase", JsValue::NULL);
+                }
+            }
+            set(obj, "syncBytesSent", (resp.sync_bytes_sent as f64).into());
+            set(obj, "sync_bytes_sent", (resp.sync_bytes_sent as f64).into());
+            set(obj, "syncBytesTotal", (resp.sync_bytes_total as f64).into());
+            set(obj, "sync_bytes_total", (resp.sync_bytes_total as f64).into());
+            set(obj, "syncRateBps", (resp.sync_rate_bps as f64).into());
+            set(obj, "sync_rate_bps", (resp.sync_rate_bps as f64).into());
+            set(obj, "etaS", (resp.eta_s as f64).into());
+            set(obj, "eta_s", (resp.eta_s as f64).into());
+            set(obj, "elapsedS", (resp.elapsed_s as f64).into());
+            set(obj, "elapsed_s", (resp.elapsed_s as f64).into());
+            set(obj, "gpuMemMb", (resp.gpu_mem_mb as f64).into());
+            set(obj, "gpu_mem_mb", (resp.gpu_mem_mb as f64).into());
+            set(obj, "stage", resp.stage.into());
         }
         tentaflow_protocol::MlStudioPayload::RecogDatasetRegisterRequest(req) => {
             set(obj, "variant", "MlStudioRecogDatasetRegisterRequest".into());
@@ -9841,6 +10869,73 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "modelsJson", resp.models_json.clone().into());
             set(obj, "models_json", resp.models_json.into());
         }
+        tentaflow_protocol::MlStudioPayload::VisionModelPublishRequest(req) => {
+            set(obj, "variant", "MlStudioVisionModelPublishRequest".into());
+            set(obj, "modelId", req.model_id.clone().into());
+            set(obj, "model_id", req.model_id.into());
+            set(obj, "modelName", req.model_name.clone().into());
+            set(obj, "model_name", req.model_name.into());
+            set(obj, "op", req.op.into());
+            match req.threshold {
+                Some(t) => set(obj, "threshold", t.into()),
+                None => set(obj, "threshold", JsValue::NULL),
+            }
+            match req.alias {
+                Some(a) => set(obj, "alias", a.into()),
+                None => set(obj, "alias", JsValue::NULL),
+            }
+        }
+        tentaflow_protocol::MlStudioPayload::VisionModelPublishResponse(resp) => {
+            set(obj, "variant", "MlStudioVisionModelPublishResponse".into());
+            set(obj, "ok", resp.ok.into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+        }
+        tentaflow_protocol::MlStudioPayload::VisionModelsListRequest(_) => {
+            set(obj, "variant", "MlStudioVisionModelsListRequest".into());
+        }
+        tentaflow_protocol::MlStudioPayload::VisionModelsListResponse(resp) => {
+            set(obj, "variant", "MlStudioVisionModelsListResponse".into());
+            let arr = js_sys::Array::new();
+            for m in &resp.models {
+                let entry = js_sys::Object::new();
+                set(&entry, "modelName", m.model_name.clone().into());
+                set(&entry, "model_name", m.model_name.clone().into());
+                set(&entry, "op", m.op.clone().into());
+                set(&entry, "fileName", m.file_name.clone().into());
+                set(&entry, "file_name", m.file_name.clone().into());
+                set(&entry, "sha256", m.sha256.clone().into());
+                let classes = js_sys::Array::new();
+                for c in &m.classes {
+                    classes.push(&JsValue::from_str(c));
+                }
+                set(&entry, "classes", classes.into());
+                set(&entry, "source", m.source.clone().into());
+                match m.default_threshold {
+                    Some(t) => set(&entry, "defaultThreshold", t.into()),
+                    None => set(&entry, "defaultThreshold", JsValue::NULL),
+                }
+                set(&entry, "createdAt", (m.created_at as f64).into());
+                set(&entry, "created_at", (m.created_at as f64).into());
+                arr.push(&entry);
+            }
+            set(obj, "models", arr.into());
+        }
+        tentaflow_protocol::MlStudioPayload::VisionModelDeleteRequest(req) => {
+            set(obj, "variant", "MlStudioVisionModelDeleteRequest".into());
+            set(obj, "modelName", req.model_name.clone().into());
+            set(obj, "model_name", req.model_name.into());
+        }
+        tentaflow_protocol::MlStudioPayload::VisionModelDeleteResponse(resp) => {
+            set(obj, "variant", "MlStudioVisionModelDeleteResponse".into());
+            set(obj, "ok", resp.ok.into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+        }
     }
 }
 
@@ -9855,6 +10950,23 @@ fn ml_studio_recog_curve_to_js(
         set(&item, "trainLoss", opt_f64_to_js(p.train_loss));
         set(&item, "train_loss", opt_f64_to_js(p.train_loss));
         set(&item, "map50", opt_f64_to_js(p.map50));
+        arr.push(&item);
+    }
+    arr
+}
+
+/// Mapuje generyczną krzywą treningu (punkty {epoch, metric_name, value}) na
+/// tablicę JS. Używana przez status klasyfikatora atrybutu i inne tory generyczne.
+fn ml_studio_generic_curve_to_js(
+    points: &[tentaflow_protocol::GenericMetricPoint],
+) -> js_sys::Array {
+    let arr = js_sys::Array::new();
+    for p in points {
+        let item = js_sys::Object::new();
+        set(&item, "epoch", (p.epoch as f64).into());
+        set(&item, "metricName", p.metric_name.clone().into());
+        set(&item, "metric_name", p.metric_name.clone().into());
+        set(&item, "value", (p.value as f64).into());
         arr.push(&item);
     }
     arr
@@ -13380,12 +14492,14 @@ pub fn encode_compliance_ai_events_list_request(
 /// MessageBody::StreamBody(SubscribeRequest) — subscribe this connection to a
 /// hub-registered stream. The server first answers with a SubscribeResponse
 /// (mime + has_init_segment), then pushes a sequence of Frame chunks on the
-/// same correlation id, terminating with a single Closed payload.
+/// same correlation id, terminating with a single Closed payload. `preview`
+/// wybiera wariant podglądu 720p/~1,5 Mbit/s dla strumieni `camera:` (kafelki
+/// Live view); `false` = pełna jakość źródła.
 #[wasm_bindgen(js_name = encodeStreamSubscribeRequest)]
-pub fn encode_stream_subscribe_request(stream_id: String) -> Result<Vec<u8>, JsError> {
+pub fn encode_stream_subscribe_request(stream_id: String, preview: bool) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::StreamBody(
         tentaflow_protocol::StreamPayload::SubscribeRequest(
-            tentaflow_protocol::StreamSubscribeRequest { stream_id },
+            tentaflow_protocol::StreamSubscribeRequest { stream_id, preview },
         ),
     ))
     .map_err(|e| JsError::new(&e))
@@ -14366,6 +15480,15 @@ fn value_to_js_with_wire(
     wire: &str,
 ) -> Result<JsValue, String> {
     use tentaflow_sdk_spec::protocol::value::Value;
+    // A present field carries no `Option` on the wire, but its declared wire
+    // type still does (e.g. `Option<Array<Inline<ResponsiveRule>>>`). Strip the
+    // outer `Option<…>` so the `Array<…>` / `Inline<…>` matching below sees the
+    // real container type; without this an optional list-of-inline decodes its
+    // elements as plain objects instead of FieldMaps.
+    let wire = wire
+        .strip_prefix("Option<")
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(wire);
     match v {
         // Bytes with a Component wire → decode child Component.
         // Without wire context bytes stay as Uint8Array (no speculative decode).

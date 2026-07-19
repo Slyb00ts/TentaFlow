@@ -32,7 +32,7 @@ icon = "vision"
 default_port = 0
 api = "custom"
 version = "pp-ocrv5"
-service_surfaces = ["documents"]
+service_surfaces = ["documents", "camera_cv"]
 input_modalities = ["image"]
 output_modalities = ["text"]
 

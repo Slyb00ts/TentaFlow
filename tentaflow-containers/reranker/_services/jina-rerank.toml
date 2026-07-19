@@ -11,6 +11,7 @@
 
 [engine]
 id = "jina-rerank"
+backend = "vllm"  # served by vLLM — drives gpu_memory_utilization + VRAM calculator
 provider = "tentaflow"
 category = "reranker"
 name = "Jina Reranker v3"

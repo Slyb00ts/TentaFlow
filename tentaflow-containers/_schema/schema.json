@@ -221,6 +221,20 @@
               "description": "Schemat kwantyzacji modelu draftu (speculator_repo). Te same wartosci co `quantize`."
             }
           }
+        },
+        "quant_variant": {
+          "type": "array",
+          "description": "Warianty kwantyzacji tego samego modelu (TOML: [[model_preset.quant_variant]]). Kazdy mapuje kwantyzacje na osobne repo HF; wizard pokazuje je jako wybor przy kalkulatorze i podmienia repo. `repo`/`quantization` presetu = wariant standard.",
+          "items": {
+            "type": "object",
+            "required": ["quantization", "repo"],
+            "additionalProperties": false,
+            "properties": {
+              "quantization": { "type": "string", "minLength": 1 },
+              "repo": { "type": "string", "minLength": 1 },
+              "display_name": { "type": "string" }
+            }
+          }
         }
       }
     }

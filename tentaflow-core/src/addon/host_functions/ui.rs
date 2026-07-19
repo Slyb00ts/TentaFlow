@@ -589,8 +589,59 @@ fn extract_action_ids_from_value(
                     actions.insert(action_id);
                 }
             }
+
+            extract_component_declared_actions(entries, actions);
         }
         _ => {}
+    }
+}
+
+/// Registers action_ids carried as DECLARATIVE component fields instead of a
+/// HandlerMap (`AudioCapture.action_id`, `SearchBox.on_search_action_id`,
+/// `FileInput.upload_action_id`, …). The renderer emits these actions itself,
+/// so they must count as declared or the dispatcher rejects the round-trip.
+/// The catalog schema is the single source of which fields carry actions.
+fn extract_component_declared_actions(
+    entries: &[(
+        tentaflow_sdk_spec::protocol::value::Value,
+        tentaflow_sdk_spec::protocol::value::Value,
+    )],
+    actions: &mut HashSet<String>,
+) {
+    use tentaflow_sdk_spec::protocol::value::Value;
+
+    // Component envelope shape: {0: tag(u16), 1: id, 2: fields(map<u8,Value>)}.
+    let mut tag: Option<u16> = None;
+    let mut fields: Option<&Vec<(Value, Value)>> = None;
+    for (k, v) in entries {
+        match (k, v) {
+            (Value::U64(0), Value::U64(t)) => tag = u16::try_from(*t).ok(),
+            (Value::U64(2), Value::Map(m)) => fields = Some(m),
+            _ => {}
+        }
+    }
+    let (Some(tag), Some(fields)) = (tag, fields) else {
+        return;
+    };
+    let Some(meta) = tentaflow_sdk_spec::protocol::ui::schema::ALL_COMPONENTS
+        .iter()
+        .find(|c| c.tag == tag)
+    else {
+        return;
+    };
+    for field_meta in meta.fields {
+        if !field_meta.name.ends_with("action_id") {
+            continue;
+        }
+        let declared = fields.iter().find_map(|(k, v)| match (k, v) {
+            (Value::U64(key), Value::Text(action_id)) if *key == u64::from(field_meta.key) => {
+                Some(action_id.clone())
+            }
+            _ => None,
+        });
+        if let Some(action_id) = declared {
+            actions.insert(action_id);
+        }
     }
 }
 
@@ -1024,6 +1075,47 @@ mod tests {
 
         assert!(session
             .validate_action("tentavision", "overview", "panel-navigate")
+            .is_ok());
+    }
+
+    #[test]
+    fn panel_shell_registration_declares_component_action_fields() {
+        // AudioCapture carries its action as a declarative field (no
+        // HandlerMap) — the renderer emits it itself, so registration must
+        // pick it up from the catalog schema or the dispatch rejects it.
+        let capture = tentaflow_sdk_spec::AudioCapture {
+            action_id: "dictation_utterance".into(),
+            mode: tentaflow_sdk_spec::AudioCaptureMode::Vad,
+            silence_ms: None,
+            min_speech_ms: None,
+            language_hint: None,
+            recording_path: None,
+            disabled: None,
+            active_path: None,
+            variant: None,
+        }
+        .into_component("mic")
+        .unwrap();
+        let mut layout = empty_comp();
+        layout.fields = FieldMap(vec![(2, encode_to_value(&vec![capture]).unwrap())]);
+        let shell = UiPayload::PanelShell(PanelShell {
+            addon_id: "notes".into(),
+            panel_id: "main".into(),
+            panel_epoch: 1,
+            layout,
+            slots: vec![],
+            initial_state: vec![],
+            initial_commands: vec![],
+        });
+
+        let bytes = encode_payload(&shell);
+        let mut session = crate::addon::ui_session::SessionState::new();
+        session.open_panel("notes", "main").unwrap();
+
+        handle_panel_shell_registration(&bytes, &mut session, "notes").unwrap();
+
+        assert!(session
+            .validate_action("notes", "main", "dictation_utterance")
             .is_ok());
     }
 

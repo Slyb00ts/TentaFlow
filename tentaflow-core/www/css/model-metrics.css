@@ -1,0 +1,159 @@
+/* =============================================================================
+   Plik: css/model-metrics.css
+   Opis: Style ekranu analityki metryk modeli (KPI grid, wykres SVG tokenów,
+         paski udziału, karty nodów). mm- prefix, semantyczne zmienne motywu.
+   ============================================================================= */
+
+.mm-filters {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.mm-filters .mm-fl {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--text-3);
+  font-weight: 700;
+}
+.mm-filters .mm-spacer { flex: 1; }
+
+.mm-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-2);
+  padding: 11px 16px;
+  margin-bottom: 16px;
+}
+.mm-banner strong { color: var(--text); }
+.mm-banner .mm-nodes { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+
+.mm-kpis {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.mm-chart-card { margin-bottom: 16px; }
+.mm-chart-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.mm-chart-title {
+  font-size: 13px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mm-legend {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+.mm-legend .mm-lg { display: inline-flex; align-items: center; gap: 6px; }
+.mm-legend .mm-sw { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+.mm-chart-svg { width: 100%; height: 220px; display: block; }
+.mm-chart-svg text { fill: var(--text-3); font-size: 9px; }
+.mm-chart-svg .mm-gridline { stroke: var(--border); stroke-width: 1; }
+
+.mm-grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.mm-grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+
+.mm-tbl-title {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--accent-2);
+  font-weight: 700;
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mm-ent { display: flex; flex-direction: column; gap: 1px; }
+.mm-ent .mm-nm { font-weight: 600; }
+.mm-ent .mm-sub { font-size: 10.5px; color: var(--text-3); }
+
+.mm-share-bar {
+  position: relative;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--bg-3);
+  margin-top: 5px;
+  overflow: hidden;
+  min-width: 60px;
+}
+.mm-share-bar > span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 3px;
+  background: var(--gradient-accent);
+}
+.mm-share-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 0;
+}
+.mm-share-row .mm-lbl { min-width: 180px; display: flex; align-items: center; gap: 8px; }
+.mm-share-row .mm-share-bar { flex: 1; }
+.mm-share-row .mm-pct { min-width: 52px; text-align: right; font-variant-numeric: tabular-nums; color: var(--text-2); }
+
+.mm-num { text-align: right; font-variant-numeric: tabular-nums; }
+.mm-mono { font-variant-numeric: tabular-nums; }
+.mm-muted { color: var(--text-3); }
+.mm-missing { color: var(--warning, #f59e0b); font-size: 11.5px; }
+
+.mm-node-card { margin-bottom: 16px; }
+.mm-node-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.mm-node-head .mm-node-name {
+  font-size: 15px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mm-node-head .mm-spacer { flex: 1; }
+.mm-node-kpis {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.mm-empty { color: var(--text-3); padding: 24px; text-align: center; }
+.mm-note {
+  font-size: 12px;
+  color: var(--text-2);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.mm-tab-actions { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+
+@media (max-width: 960px) {
+  .mm-kpis { grid-template-columns: repeat(2, 1fr); }
+  .mm-grid-3, .mm-grid-2, .mm-node-kpis { grid-template-columns: 1fr; }
+}

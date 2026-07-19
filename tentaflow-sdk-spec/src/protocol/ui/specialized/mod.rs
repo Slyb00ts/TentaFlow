@@ -20,7 +20,7 @@ pub use gallery::{Carousel, ImageGallery, PdfViewer};
 pub use iframe::IFrame;
 pub use log::VirtualizedLog;
 pub use map::MapView;
-pub use media::{Audio, LiveCameraTile, VideoStream};
+pub use media::{Audio, AudioCapture, LiveCameraTile, VideoStream};
 pub use telemetry::{FpsCounter, Stopwatch};
 pub use text_io::{CodeEditor, Terminal};
 pub use wizard::StepProgress;
@@ -32,7 +32,9 @@ mod tests {
     use crate::protocol::ui::component::{Component, FieldMap};
     use crate::protocol::ui::inline::{AspectRatio, DimensionToken, StepDef};
     use crate::protocol::ui::tokens::{
-        AudioControls, AudioVariant, CarouselGestures, CodeEditorTheme, Density, FpsVariant,
+        AudioCaptureMode, AudioCaptureVariant, AudioControls, AudioVariant, CarouselGestures,
+        CodeEditorTheme, Density,
+        FpsVariant,
         IFrameReferrerPolicy, IFrameSandbox, ImageFit, LogLevel, LogVariant, PdfZoomMode, Spacing,
         StepProgressVariant, StopwatchVariant, TerminalTheme, TileProvider, Tone, VideoControls,
     };
@@ -86,6 +88,39 @@ mod tests {
             autoplay: false, r#loop: true, variant: AudioVariant::Waveform,
         };
         rt(v, |m| m.into_component("au").unwrap(), Audio::try_from_component);
+    }
+
+    #[test]
+    fn audio_capture_roundtrip() {
+        let v = AudioCapture {
+            action_id: "utteranceCaptured".into(),
+            mode: AudioCaptureMode::Vad,
+            silence_ms: Some(800),
+            min_speech_ms: Some(200),
+            language_hint: Some("pl".into()),
+            recording_path: Some(p("recording")),
+            disabled: Some(BindRef::Literal(Value::Bool(false))),
+            active_path: Some(p("dictation.active")),
+            variant: Some(AudioCaptureVariant::Docked),
+        };
+        rt(v, |m| m.into_component("ac").unwrap(), AudioCapture::try_from_component);
+    }
+
+    #[test]
+    fn audio_capture_minimal_roundtrip() {
+        // Optional fields absent — decode must not require them.
+        let v = AudioCapture {
+            action_id: "utteranceCaptured".into(),
+            mode: AudioCaptureMode::PushToTalk,
+            silence_ms: None,
+            min_speech_ms: None,
+            language_hint: None,
+            recording_path: None,
+            disabled: None,
+            active_path: None,
+            variant: None,
+        };
+        rt(v, |m| m.into_component("ac2").unwrap(), AudioCapture::try_from_component);
     }
 
     #[test]

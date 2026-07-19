@@ -2848,39 +2848,81 @@ pub fn create_model_alias_with_chain_check(
     fallback_targets: Option<&str>,
     strategy: Option<&str>,
 ) -> Result<i64> {
-    let candidates = collect_chain_candidates(target_model, fallback_targets)?;
     let conn = acquire(pool)?;
     let tx = conn.unchecked_transaction()?;
+    let id = create_model_alias_with_chain_check_tx(&tx, alias, target_model, fallback_targets, strategy)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Tx-level body of [`create_model_alias_with_chain_check`] — shared with
+/// writers that must mutate an alias atomically WITH another row (vision
+/// model publish registers the model and its alias in one transaction).
+pub(crate) fn create_model_alias_with_chain_check_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias: &str,
+    target_model: &str,
+    fallback_targets: Option<&str>,
+    strategy: Option<&str>,
+) -> Result<i64> {
+    let candidates = collect_chain_candidates(target_model, fallback_targets)?;
     for name in &candidates {
         if name.is_empty() {
             continue;
         }
-        if alias_is_active_within_tx(&tx, name, None)? {
+        if alias_is_active_within_tx(tx, name, None)? {
             anyhow::bail!(
                 "'{}' is itself an active alias; aliases of aliases are not supported",
                 name
             );
         }
     }
-    if alias_is_inbound_target_within_tx(&tx, alias, None)? {
+    if alias_is_inbound_target_within_tx(tx, alias, None)? {
         anyhow::bail!(
             "alias '{}' is already used as a target/fallback by another active alias; \
              registering it would create a chain",
             alias
         );
     }
+    // Blank target = unbound alias: store it parked so the router skips it until
+    // an admin binds a model. A bound target inserts active.
+    let active = !target_model.trim().is_empty();
     tx.execute(
-        "INSERT INTO model_aliases (alias, target_model, fallback_targets, strategy) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![alias, target_model, fallback_targets, strategy.unwrap_or("first_available")],
+        "INSERT INTO model_aliases (alias, target_model, is_active, fallback_targets, strategy) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![alias, target_model, active, fallback_targets, strategy.unwrap_or("first_available")],
     )?;
-    let id = tx.last_insert_rowid();
-    tx.commit()?;
-    Ok(id)
+    Ok(tx.last_insert_rowid())
 }
 
 /// Atomic update — same rationale as the create variant.
 pub fn update_model_alias_with_chain_check(
     pool: &DbPool,
+    id: i64,
+    alias: &str,
+    target_model: &str,
+    is_active: bool,
+    fallback_targets: Option<&str>,
+    strategy: Option<&str>,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    update_model_alias_with_chain_check_tx(
+        &tx,
+        id,
+        alias,
+        target_model,
+        is_active,
+        fallback_targets,
+        strategy,
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Tx-level body of [`update_model_alias_with_chain_check`] — see the create
+/// variant for why writers may need to compose this into a larger transaction.
+pub(crate) fn update_model_alias_with_chain_check_tx(
+    tx: &rusqlite::Transaction<'_>,
     id: i64,
     alias: &str,
     target_model: &str,
@@ -2895,20 +2937,18 @@ pub fn update_model_alias_with_chain_check(
     } else {
         Vec::new()
     };
-    let conn = acquire(pool)?;
-    let tx = conn.unchecked_transaction()?;
     for name in &candidates {
         if name.is_empty() {
             continue;
         }
-        if alias_is_active_within_tx(&tx, name, Some(id))? {
+        if alias_is_active_within_tx(tx, name, Some(id))? {
             anyhow::bail!(
                 "'{}' is itself an active alias; aliases of aliases are not supported",
                 name
             );
         }
     }
-    if is_active && alias_is_inbound_target_within_tx(&tx, alias, Some(id))? {
+    if is_active && alias_is_inbound_target_within_tx(tx, alias, Some(id))? {
         anyhow::bail!(
             "alias '{}' is already used as a target/fallback by another active alias; \
              activating this row would create a chain",
@@ -2919,7 +2959,6 @@ pub fn update_model_alias_with_chain_check(
         "UPDATE model_aliases SET alias = ?2, target_model = ?3, is_active = ?4, fallback_targets = ?5, strategy = ?6 WHERE id = ?1",
         rusqlite::params![id, alias, target_model, is_active, fallback_targets, strategy.unwrap_or("first_available")],
     )?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -3180,19 +3219,25 @@ pub fn create_or_reactivate_model_alias_within_tx(
         }
     }
 
+    // Unbound aliases (blank effective target) stay parked: a manifest with an
+    // empty `suggested_default` registers the alias but leaves the admin to bind
+    // a model before the router will resolve it. `target_for_check` is the stored
+    // target on reactivation and the manifest default on first create, so an
+    // admin who cleared the binding keeps the alias parked across reinstalls.
+    let active = !target_for_check.trim().is_empty();
     let alias_id: i64;
     let change_type: &str;
     if let Some(id) = action_id {
         tx.execute(
-            "UPDATE model_aliases SET is_active = 1 WHERE id = ?1",
-            rusqlite::params![id],
+            "UPDATE model_aliases SET is_active = ?2 WHERE id = ?1",
+            rusqlite::params![id, active],
         )?;
         alias_id = id;
         change_type = "activate";
     } else {
         tx.execute(
-            "INSERT INTO model_aliases (alias, target_model, is_active, strategy) VALUES (?1, ?2, 1, ?3)",
-            rusqlite::params![alias, default_target_model, strategy],
+            "INSERT INTO model_aliases (alias, target_model, is_active, strategy) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![alias, default_target_model, active, strategy],
         )?;
         alias_id = tx.last_insert_rowid();
         change_type = "create";
@@ -3220,7 +3265,7 @@ pub fn create_or_reactivate_model_alias_within_tx(
     let after_snapshot = serde_json::json!({
         "alias": alias,
         "target_model": default_target_model,
-        "is_active": true,
+        "is_active": active,
         "owner_type": owner_type,
         "owner_id": stored_owner_id,
     })
@@ -3663,7 +3708,7 @@ pub fn list_cluster_members(pool: &DbPool, cluster_id: &str) -> Result<Vec<DbClu
 
 // --- Cluster distributed deployments (D3) ---
 
-const CLUSTER_DEPLOYMENT_COLS: &str = "deployment_cluster_id, cluster_id, engine_id, model, served_model_name, tp_size, head_node_id, port, endpoint_url, status, created_at, updated_at";
+const CLUSTER_DEPLOYMENT_COLS: &str = "deployment_cluster_id, cluster_id, engine_id, model, served_model_name, tp_size, head_node_id, port, endpoint_url, status, created_at, updated_at, dist_port";
 
 fn row_to_cluster_deployment(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbClusterDeployment> {
     Ok(DbClusterDeployment {
@@ -3679,6 +3724,7 @@ fn row_to_cluster_deployment(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbClus
         status: row.get(9)?,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
+        dist_port: row.get(12)?,
     })
 }
 
@@ -3694,13 +3740,13 @@ pub fn upsert_cluster_deployment(
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
     tx.execute(
-        "INSERT INTO cluster_deployments (deployment_cluster_id, cluster_id, engine_id, model, served_model_name, tp_size, head_node_id, port, endpoint_url, status) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+        "INSERT INTO cluster_deployments (deployment_cluster_id, cluster_id, engine_id, model, served_model_name, tp_size, head_node_id, port, endpoint_url, status, dist_port) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
          ON CONFLICT(deployment_cluster_id) DO UPDATE SET \
             cluster_id=excluded.cluster_id, engine_id=excluded.engine_id, model=excluded.model, \
             served_model_name=excluded.served_model_name, tp_size=excluded.tp_size, \
             head_node_id=excluded.head_node_id, port=excluded.port, endpoint_url=excluded.endpoint_url, \
-            status=excluded.status, updated_at=datetime('now')",
+            status=excluded.status, dist_port=excluded.dist_port, updated_at=datetime('now')",
         rusqlite::params![
             deployment.deployment_cluster_id,
             deployment.cluster_id,
@@ -3712,6 +3758,7 @@ pub fn upsert_cluster_deployment(
             deployment.port,
             deployment.endpoint_url,
             deployment.status,
+            deployment.dist_port,
         ],
     )?;
     tx.execute(
@@ -3726,6 +3773,51 @@ pub fn upsert_cluster_deployment(
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Dedup input dla `service_list`: dla WSZYSTKICH zywych (deploying/running)
+/// distributed-deploymentow zwraca (a) zbior `deployment_cluster_id` (klucz
+/// canonicznego placeholder-a koordynatora, ktory `active_deploy_id` na nim
+/// nosi) oraz (b) zbior trojek `(node_id, engine_id, serve_port)` czlonkow —
+/// per-node wpisy serwisow czlonkow (head + workery) sa po tym kluczu UKRYWANE
+/// z listy, zeby user widzial jeden spojny wpis klastra zamiast N kontenerow.
+/// Port pochodzi z `cluster_deployments.port` (serve_port headu), pod ktorym
+/// KAZDY czlonek uruchamia swoj kontener (`container_name(engine, serve_port)`),
+/// wiec runtime_port kazdego wpisu-czlonka == serve_port. Dolaczenie portu do
+/// klucza sprawia, ze standalone-serwis tego samego enginu na wezle-czlonku
+/// (inny, unikalny port) NIE jest bledna ukrywany. Uzywa wspoldzielonego `conn`
+/// (service_list trzyma read-guard — brak osobnego `acquire`, brak ryzyka
+/// zaklinowania puli).
+#[allow(clippy::type_complexity)]
+pub fn cluster_service_dedup_keys(
+    conn: &rusqlite::Connection,
+) -> Result<(
+    std::collections::HashSet<String>,
+    std::collections::HashSet<(String, String, u16)>,
+)> {
+    let mut deployment_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut member_keys: std::collections::HashSet<(String, String, u16)> =
+        std::collections::HashSet::new();
+    let mut stmt = conn.prepare_cached(
+        "SELECT cd.deployment_cluster_id, cd.engine_id, cd.port, m.node_id \
+         FROM cluster_deployments cd \
+         JOIN cluster_deployment_members m ON m.deployment_cluster_id = cd.deployment_cluster_id \
+         WHERE cd.status IN ('deploying','running')",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (deployment_cluster_id, engine_id, serve_port, node_id) = row?;
+        deployment_ids.insert(deployment_cluster_id);
+        member_keys.insert((node_id, engine_id, serve_port as u16));
+    }
+    Ok((deployment_ids, member_keys))
 }
 
 pub fn set_cluster_deployment_status(
@@ -3786,22 +3878,41 @@ pub fn delete_cluster_deployment(pool: &DbPool, deployment_cluster_id: &str) -> 
     Ok(())
 }
 
-/// First non-stopped distributed deployment of a cluster (`deploying`/`running`/
-/// `failed`). Used to reject a second deploy on the same cluster — a node has one
-/// GPU set, so two TP deployments would collide on GPU + host ports.
+/// First LIVE distributed deployment of a cluster (`deploying`/`running`). Used
+/// to reject a second deploy on the same cluster — a node has one GPU set, so two
+/// TP deployments would collide on GPU + host ports. A `failed` deployment is NOT
+/// live (it gets auto-cleared on redeploy), so it does not block.
 pub fn active_cluster_deployment(
     pool: &DbPool,
     cluster_id: &str,
 ) -> Result<Option<DbClusterDeployment>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM cluster_deployments WHERE cluster_id = ?1 AND status != 'stopped' ORDER BY created_at LIMIT 1",
+        "SELECT {} FROM cluster_deployments WHERE cluster_id = ?1 AND status IN ('deploying','running') ORDER BY created_at LIMIT 1",
         CLUSTER_DEPLOYMENT_COLS
     ))?;
     let res = stmt
         .query_row(rusqlite::params![cluster_id], row_to_cluster_deployment)
         .optional()?;
     Ok(res)
+}
+
+/// All `failed` distributed deployments of a cluster — cleared (best-effort
+/// teardown + delete) before a fresh deploy so a stale failed record never blocks
+/// a redeploy.
+pub fn failed_cluster_deployments(
+    pool: &DbPool,
+    cluster_id: &str,
+) -> Result<Vec<DbClusterDeployment>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM cluster_deployments WHERE cluster_id = ?1 AND status = 'failed' ORDER BY created_at",
+        CLUSTER_DEPLOYMENT_COLS
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![cluster_id], row_to_cluster_deployment)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Czlonkowie wszystkich klastrow — uzywane do budowy snapshotu konfiguracji
@@ -3994,6 +4105,25 @@ pub fn get_flow_id_by_published_model_name(
     Ok(id)
 }
 
+/// Resolve a flow by the exact `published_model_name` it is advertised under
+/// (a flow published as a model). Used by the flow resolver so a client that
+/// requests a flow's published name runs THAT flow directly, instead of
+/// falling through to the default-for-service-type flow. Only active flows.
+pub fn get_flow_by_published_model_name(
+    pool: &DbPool,
+    published_model_name: &str,
+) -> Result<Option<DbFlow>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM flows WHERE published_model_name = ?1 AND status = 'active' LIMIT 1",
+        FLOW_COLS
+    ))?;
+    let result = stmt
+        .query_row(rusqlite::params![published_model_name], row_to_flow)
+        .optional()?;
+    Ok(result)
+}
+
 fn field_string(value: &str) -> crate::sync::ledger::FieldValue {
     crate::sync::ledger::FieldValue::String(value.to_string())
 }
@@ -4008,6 +4138,12 @@ fn field_optional_i64(value: Option<i64>) -> crate::sync::ledger::FieldValue {
     value
         .map(crate::sync::ledger::FieldValue::I64)
         .unwrap_or(crate::sync::ledger::FieldValue::Null)
+}
+
+/// Encode a real (f64) as `FieldValue::Decimal` — an exact decimal string — so the
+/// wire carries the full precision instead of a lossy integer cast.
+fn field_f64(value: f64) -> crate::sync::ledger::FieldValue {
+    crate::sync::ledger::FieldValue::Decimal(value.to_string())
 }
 
 fn sync_resource_acl_core_id(
@@ -4115,6 +4251,25 @@ fn flow_binding_changed_fields(
         "priority".to_string(),
         crate::sync::ledger::FieldValue::I64(priority),
     );
+    fields
+}
+
+/// Replicated field set for a `camera_cv_pipelines` row. Timestamps are
+/// node-local (the materializer stamps its own), so only the content travels.
+fn camera_cv_pipeline_changed_fields(
+    name: &str,
+    pipeline_json: &str,
+    is_default: bool,
+    org_id: &str,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("name".to_string(), field_string(name));
+    fields.insert("pipeline_json".to_string(), field_string(pipeline_json));
+    fields.insert(
+        "is_default".to_string(),
+        crate::sync::ledger::FieldValue::Bool(is_default),
+    );
+    fields.insert("org_id".to_string(), field_string(org_id));
     fields
 }
 
@@ -5960,6 +6115,125 @@ pub fn reseed_core_state_from_current_rows(
                             &coordinator_node_id,
                             &expires_at,
                         ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::ModelMetricsRollup => {
+                let mut stmt =
+                    tx.prepare(&format!("SELECT {MODEL_METRICS_COLS} FROM model_metrics_rollup"))?;
+                let rows = stmt
+                    .query_map([], row_to_model_metrics_rollup)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for row in rows {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &row.org_id,
+                        row.id.clone(),
+                        Update,
+                        model_metrics_changed_fields(&row),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::ModelPricing => {
+                let mut stmt = tx.prepare(
+                    "SELECT id, model_id, org_id, prompt_per_1k, completion_per_1k, audio_per_min, \
+                            image_each FROM model_pricing",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, f64>(3)?,
+                            r.get::<_, f64>(4)?,
+                            r.get::<_, f64>(5)?,
+                            r.get::<_, f64>(6)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (
+                    id,
+                    model_id,
+                    org_id,
+                    prompt_per_1k,
+                    completion_per_1k,
+                    audio_per_min,
+                    image_each,
+                ) in rows
+                {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &org_id,
+                        id.clone(),
+                        Insert,
+                        model_pricing_changed_fields(&crate::db::models::NewModelPricing {
+                            model_id: &model_id,
+                            org_id: &org_id,
+                            prompt_per_1k,
+                            completion_per_1k,
+                            audio_per_min,
+                            image_each,
+                        }),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::CameraCvPipeline => {
+                let mut stmt = tx.prepare(
+                    "SELECT id, name, pipeline_json, is_default, org_id FROM camera_cv_pipelines",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, bool>(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (id, name, pipeline_json, is_default, org_id) in rows {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &org_id,
+                        id,
+                        Insert,
+                        camera_cv_pipeline_changed_fields(
+                            &name,
+                            &pipeline_json,
+                            is_default,
+                            &org_id,
+                        ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::VisionModel => {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT {VISION_MODEL_COLS} FROM vision_models"
+                ))?;
+                let rows = stmt
+                    .query_map([], map_vision_model_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for row in rows {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        &row.org_id,
+                        row.model_name.clone(),
+                        Insert,
+                        vision_model_changed_fields(&row),
                         None,
                     )?;
                     emitted += 1;
@@ -9923,6 +10197,561 @@ pub fn usage_summary(
     Ok(rows)
 }
 
+// --- Model metrics rollup ---
+
+// Histogram edges INCLUDE a leading 0 and a trailing ∞ sentinel. The bucket index
+// is the count of edges strictly less than the value, which for a non-negative
+// value yields exactly `edges.len()` buckets (0..=edges.len()-1):
+//   TTFT [ms]:   [0, 50, 100, 200, 400, 800, 1600, 3200, 6400, ∞]     → 10 buckets
+//   decode_tps:  [0, 10, 20, 40, 80, 160, 320, ∞]                     → 8 buckets
+//   e2e [ms]:    [0, 100, 250, 500, 1000, 2000, 4000, 8000, 16000, ∞] → 10 buckets
+pub const TTFT_MS_EDGES: [i64; 10] = [0, 50, 100, 200, 400, 800, 1600, 3200, 6400, i64::MAX];
+pub const DECODE_TPS_EDGES: [f64; 8] = [0.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0, f64::INFINITY];
+pub const E2E_MS_EDGES: [i64; 10] = [0, 100, 250, 500, 1000, 2000, 4000, 8000, 16000, i64::MAX];
+
+/// Wersja rozkladu kubelkow histogramow. Bump z ta sama wersja laczy sie w ten
+/// sam wiersz rollupu; agregacja percentyli sumuje kubelki TYLKO z wierszy o tej
+/// wersji (inne krawedzie = niesumowalny rozklad). Zmiana krawedzi TTFT/decode/e2e
+/// wymaga podbicia tej stalej.
+pub const MODEL_METRICS_HISTOGRAM_VERSION: i64 = 1;
+
+/// Bucket index for a value against ascending histogram edges: the number of
+/// edges strictly less than `value`. Edges must be ascending and include the
+/// leading 0 plus a trailing ∞ sentinel, so a non-negative value maps into
+/// `0..=edges.len()-1` (the ∞ sentinel is never counted).
+pub fn histogram_bucket_index<T: PartialOrd + Copy>(edges: &[T], value: T) -> usize {
+    edges.iter().filter(|&&edge| edge < value).count()
+}
+
+const MODEL_METRICS_COLS: &str = "id, node_id, org_id, user_id, model_id, service_key, backend, \
+    modality, hour_bucket, histogram_version, request_count, success_count, error_count, \
+    prompt_tokens, completion_tokens, total_tokens, embedding_tokens, audio_ms, images, \
+    prefill_secs_sum, decode_secs_sum, e2e_latency_ms_sum, queue_ms_sum, \
+    ttft_b0, ttft_b1, ttft_b2, ttft_b3, ttft_b4, ttft_b5, ttft_b6, ttft_b7, ttft_b8, ttft_b9, \
+    ttft_sample_count, \
+    decode_tps_b0, decode_tps_b1, decode_tps_b2, decode_tps_b3, decode_tps_b4, decode_tps_b5, \
+    decode_tps_b6, decode_tps_b7, decode_tps_sample_count, \
+    e2e_b0, e2e_b1, e2e_b2, e2e_b3, e2e_b4, e2e_b5, e2e_b6, e2e_b7, e2e_b8, e2e_b9, \
+    e2e_sample_count, updated_at";
+
+fn row_to_model_metrics_rollup(
+    r: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::db::models::DbModelMetricsRollup> {
+    Ok(crate::db::models::DbModelMetricsRollup {
+        id: r.get(0)?,
+        node_id: r.get(1)?,
+        org_id: r.get(2)?,
+        user_id: r.get(3)?,
+        model_id: r.get(4)?,
+        service_key: r.get(5)?,
+        backend: r.get(6)?,
+        modality: r.get(7)?,
+        hour_bucket: r.get(8)?,
+        histogram_version: r.get(9)?,
+        request_count: r.get(10)?,
+        success_count: r.get(11)?,
+        error_count: r.get(12)?,
+        prompt_tokens: r.get(13)?,
+        completion_tokens: r.get(14)?,
+        total_tokens: r.get(15)?,
+        embedding_tokens: r.get(16)?,
+        audio_ms: r.get(17)?,
+        images: r.get(18)?,
+        prefill_secs_sum: r.get(19)?,
+        decode_secs_sum: r.get(20)?,
+        e2e_latency_ms_sum: r.get(21)?,
+        queue_ms_sum: r.get(22)?,
+        ttft_buckets: [
+            r.get(23)?,
+            r.get(24)?,
+            r.get(25)?,
+            r.get(26)?,
+            r.get(27)?,
+            r.get(28)?,
+            r.get(29)?,
+            r.get(30)?,
+            r.get(31)?,
+            r.get(32)?,
+        ],
+        ttft_sample_count: r.get(33)?,
+        decode_tps_buckets: [
+            r.get(34)?,
+            r.get(35)?,
+            r.get(36)?,
+            r.get(37)?,
+            r.get(38)?,
+            r.get(39)?,
+            r.get(40)?,
+            r.get(41)?,
+        ],
+        decode_tps_sample_count: r.get(42)?,
+        e2e_buckets: [
+            r.get(43)?,
+            r.get(44)?,
+            r.get(45)?,
+            r.get(46)?,
+            r.get(47)?,
+            r.get(48)?,
+            r.get(49)?,
+            r.get(50)?,
+            r.get(51)?,
+            r.get(52)?,
+        ],
+        e2e_sample_count: r.get(53)?,
+        updated_at: r.get(54)?,
+    })
+}
+
+/// Deterministic rollup id: SHA-256 over all dimensions + node_id (length-prefixed
+/// so no field boundary can be forged) + `histogram_version`. The same logical
+/// bucket minted on different nodes therefore keeps a distinct `id` per node
+/// (single-writer-per-row), while a bucketing change re-keys rows instead of
+/// mixing incompatible histograms.
+fn model_metrics_id(dims: &crate::db::models::ModelMetricsDims<'_>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for field in [
+        dims.node_id,
+        dims.org_id,
+        dims.user_id,
+        dims.model_id,
+        dims.service_key,
+        dims.backend,
+        dims.modality,
+        dims.hour_bucket,
+    ] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    hasher.update(dims.histogram_version.to_le_bytes());
+    format!("mmr:{}", hex::encode(hasher.finalize()))
+}
+
+/// Replicated fields of a `model_metrics_rollup` row (everything but the
+/// node-local `updated_at` watermark). Mirrors `token_usage_changed_fields`.
+pub fn model_metrics_changed_fields(
+    row: &crate::db::models::DbModelMetricsRollup,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    use crate::sync::ledger::FieldValue;
+    let mut fields = BTreeMap::new();
+    fields.insert("node_id".to_string(), field_string(&row.node_id));
+    fields.insert("org_id".to_string(), field_string(&row.org_id));
+    fields.insert("user_id".to_string(), field_string(&row.user_id));
+    fields.insert("model_id".to_string(), field_string(&row.model_id));
+    fields.insert("service_key".to_string(), field_string(&row.service_key));
+    fields.insert("backend".to_string(), field_string(&row.backend));
+    fields.insert("modality".to_string(), field_string(&row.modality));
+    fields.insert("hour_bucket".to_string(), field_string(&row.hour_bucket));
+    fields.insert(
+        "histogram_version".to_string(),
+        FieldValue::I64(row.histogram_version),
+    );
+    fields.insert("request_count".to_string(), FieldValue::I64(row.request_count));
+    fields.insert("success_count".to_string(), FieldValue::I64(row.success_count));
+    fields.insert("error_count".to_string(), FieldValue::I64(row.error_count));
+    fields.insert("prompt_tokens".to_string(), FieldValue::I64(row.prompt_tokens));
+    fields.insert(
+        "completion_tokens".to_string(),
+        FieldValue::I64(row.completion_tokens),
+    );
+    fields.insert("total_tokens".to_string(), FieldValue::I64(row.total_tokens));
+    fields.insert(
+        "embedding_tokens".to_string(),
+        FieldValue::I64(row.embedding_tokens),
+    );
+    fields.insert("audio_ms".to_string(), FieldValue::I64(row.audio_ms));
+    fields.insert("images".to_string(), FieldValue::I64(row.images));
+    fields.insert(
+        "prefill_secs_sum".to_string(),
+        field_f64(row.prefill_secs_sum),
+    );
+    fields.insert("decode_secs_sum".to_string(), field_f64(row.decode_secs_sum));
+    fields.insert(
+        "e2e_latency_ms_sum".to_string(),
+        FieldValue::I64(row.e2e_latency_ms_sum),
+    );
+    fields.insert("queue_ms_sum".to_string(), FieldValue::I64(row.queue_ms_sum));
+    for (i, value) in row.ttft_buckets.iter().enumerate() {
+        fields.insert(format!("ttft_b{i}"), FieldValue::I64(*value));
+    }
+    fields.insert(
+        "ttft_sample_count".to_string(),
+        FieldValue::I64(row.ttft_sample_count),
+    );
+    for (i, value) in row.decode_tps_buckets.iter().enumerate() {
+        fields.insert(format!("decode_tps_b{i}"), FieldValue::I64(*value));
+    }
+    fields.insert(
+        "decode_tps_sample_count".to_string(),
+        FieldValue::I64(row.decode_tps_sample_count),
+    );
+    for (i, value) in row.e2e_buckets.iter().enumerate() {
+        fields.insert(format!("e2e_b{i}"), FieldValue::I64(*value));
+    }
+    fields.insert(
+        "e2e_sample_count".to_string(),
+        FieldValue::I64(row.e2e_sample_count),
+    );
+    fields
+}
+
+/// Local UPSERT of one model-metrics bucket. Hot path — NO capture (the flusher
+/// emits captures batched, exactly like `bump_token_usage`). Accumulates counters,
+/// tokens and time sums and increments the matching histogram bucket + its
+/// `sample_count` ONLY for measured samples (a `None` perf value leaves that
+/// histogram untouched, so a bucket sum of 0 means "no samples", not "measured 0").
+pub fn bump_model_metrics_rollup(
+    pool: &DbPool,
+    dims: &crate::db::models::ModelMetricsDims<'_>,
+    counters: &crate::db::models::ModelMetricsCounters,
+    tokens: &crate::db::models::ModelMetricsTokens,
+    times: &crate::db::models::ModelMetricsTimes,
+    perf: &crate::db::models::ModelMetricsPerfSamples,
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let id = model_metrics_id(dims);
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO model_metrics_rollup \
+         (id, node_id, org_id, user_id, model_id, service_key, backend, modality, hour_bucket, \
+          histogram_version, request_count, success_count, error_count, \
+          prompt_tokens, completion_tokens, total_tokens, embedding_tokens, audio_ms, images, \
+          prefill_secs_sum, decode_secs_sum, e2e_latency_ms_sum, queue_ms_sum, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
+          ?19, ?20, ?21, ?22, ?23, strftime('%Y-%m-%d %H:%M:%f','now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+         request_count = request_count + excluded.request_count, \
+         success_count = success_count + excluded.success_count, \
+         error_count = error_count + excluded.error_count, \
+         prompt_tokens = prompt_tokens + excluded.prompt_tokens, \
+         completion_tokens = completion_tokens + excluded.completion_tokens, \
+         total_tokens = total_tokens + excluded.total_tokens, \
+         embedding_tokens = embedding_tokens + excluded.embedding_tokens, \
+         audio_ms = audio_ms + excluded.audio_ms, \
+         images = images + excluded.images, \
+         prefill_secs_sum = prefill_secs_sum + excluded.prefill_secs_sum, \
+         decode_secs_sum = decode_secs_sum + excluded.decode_secs_sum, \
+         e2e_latency_ms_sum = e2e_latency_ms_sum + excluded.e2e_latency_ms_sum, \
+         queue_ms_sum = queue_ms_sum + excluded.queue_ms_sum, \
+         histogram_version = excluded.histogram_version, \
+         updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
+        rusqlite::params![
+            id,
+            dims.node_id,
+            dims.org_id,
+            dims.user_id,
+            dims.model_id,
+            dims.service_key,
+            dims.backend,
+            dims.modality,
+            dims.hour_bucket,
+            dims.histogram_version,
+            counters.request_count,
+            counters.success_count,
+            counters.error_count,
+            tokens.prompt_tokens,
+            tokens.completion_tokens,
+            tokens.total_tokens,
+            tokens.embedding_tokens,
+            tokens.audio_ms,
+            tokens.images,
+            times.prefill_secs,
+            times.decode_secs,
+            times.e2e_latency_ms,
+            times.queue_ms,
+        ],
+    )?;
+    if let Some(ttft) = perf.ttft_ms {
+        bump_histogram_bucket(&tx, &id, "ttft", histogram_bucket_index(&TTFT_MS_EDGES, ttft))?;
+    }
+    if let Some(tps) = perf.decode_tps {
+        bump_histogram_bucket(
+            &tx,
+            &id,
+            "decode_tps",
+            histogram_bucket_index(&DECODE_TPS_EDGES, tps),
+        )?;
+    }
+    if let Some(e2e) = perf.e2e_ms {
+        bump_histogram_bucket(&tx, &id, "e2e", histogram_bucket_index(&E2E_MS_EDGES, e2e))?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Increment one histogram bucket and its `sample_count`. `prefix` is a fixed
+/// literal and `idx` is bounded by the edge arrays, so the formatted column names
+/// are injection-safe.
+fn bump_histogram_bucket(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    prefix: &str,
+    idx: usize,
+) -> Result<()> {
+    let bucket_col = format!("{prefix}_b{idx}");
+    let sample_col = format!("{prefix}_sample_count");
+    tx.execute(
+        &format!(
+            "UPDATE model_metrics_rollup SET {bucket_col} = {bucket_col} + 1, \
+             {sample_col} = {sample_col} + 1 WHERE id = ?1"
+        ),
+        rusqlite::params![id],
+    )?;
+    Ok(())
+}
+
+/// Emit captures for THIS node's own rollup rows changed after `since_watermark`.
+/// The `node_id = self` filter is essential: replicas of other nodes' rows (received
+/// via sync) get a node-local `updated_at` at materialization time, so without it a
+/// node would re-publish foreign rows. All rows in one transaction. Returns the
+/// highest `updated_at` seen (or echoes `since_watermark` when empty). Mirrors
+/// `flush_token_usage_captures`.
+pub fn flush_model_metrics_captures(
+    pool: &DbPool,
+    self_node_id: &str,
+    since_watermark: &str,
+) -> Result<String> {
+    let mut conn = acquire(pool)?;
+    let rows: Vec<crate::db::models::DbModelMetricsRollup> = {
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {MODEL_METRICS_COLS} FROM model_metrics_rollup \
+             WHERE node_id = ?2 AND updated_at > ?1 ORDER BY updated_at"
+        ))?;
+        let collected = stmt
+            .query_map(
+                rusqlite::params![since_watermark, self_node_id],
+                row_to_model_metrics_rollup,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        collected
+    };
+
+    if rows.is_empty() {
+        return Ok(since_watermark.to_string());
+    }
+
+    let mut max_watermark = since_watermark.to_string();
+    let tx = conn.transaction()?;
+    for row in &rows {
+        record_core_capture_for_org_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::ModelMetricsRollup,
+            &row.org_id,
+            row.id.clone(),
+            crate::sync::runtime::SqlWriteAction::Update,
+            model_metrics_changed_fields(row),
+            None,
+        )?;
+        if row.updated_at > max_watermark {
+            max_watermark = row.updated_at.clone();
+        }
+    }
+    tx.commit()?;
+    Ok(max_watermark)
+}
+
+/// Rollup rows for an org, filtered for GUI aggregation (Chunk 3). Aggregation
+/// (per model/user/hour) is done by the caller over these rows.
+pub fn list_model_metrics_rollup(
+    pool: &DbPool,
+    org_id: &str,
+    filter: &crate::db::models::ModelMetricsFilter<'_>,
+) -> Result<Vec<crate::db::models::DbModelMetricsRollup>> {
+    let conn = acquire(pool)?;
+    let mut sql = format!("SELECT {MODEL_METRICS_COLS} FROM model_metrics_rollup WHERE org_id = ?1");
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(org_id.to_string())];
+    if let Some(model_id) = filter.model_id {
+        params.push(Box::new(model_id.to_string()));
+        sql.push_str(&format!(" AND model_id = ?{}", params.len()));
+    }
+    if let Some(user_id) = filter.user_id {
+        params.push(Box::new(user_id.to_string()));
+        sql.push_str(&format!(" AND user_id = ?{}", params.len()));
+    }
+    if let Some(hour_from) = filter.hour_from {
+        params.push(Box::new(hour_from.to_string()));
+        sql.push_str(&format!(" AND hour_bucket >= ?{}", params.len()));
+    }
+    if let Some(hour_to) = filter.hour_to {
+        params.push(Box::new(hour_to.to_string()));
+        sql.push_str(&format!(" AND hour_bucket <= ?{}", params.len()));
+    }
+    sql.push_str(" ORDER BY hour_bucket DESC");
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt
+        .query_map(param_refs.as_slice(), row_to_model_metrics_rollup)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Deterministic synthetic id for a pricing row, keyed per org+model so two
+/// organizations pricing the same `model_id` never collide (mirrors
+/// `token_quota_id`).
+fn model_pricing_id(org_id: &str, model_id: &str) -> String {
+    format!("pricing:{org_id}:{model_id}")
+}
+
+/// Replicated fields of a `model_pricing` row (everything but node-local
+/// `updated_at`). Mirrors `token_quota_changed_fields`.
+pub fn model_pricing_changed_fields(
+    params: &crate::db::models::NewModelPricing<'_>,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(params.org_id));
+    fields.insert("model_id".to_string(), field_string(params.model_id));
+    fields.insert("prompt_per_1k".to_string(), field_f64(params.prompt_per_1k));
+    fields.insert(
+        "completion_per_1k".to_string(),
+        field_f64(params.completion_per_1k),
+    );
+    fields.insert("audio_per_min".to_string(), field_f64(params.audio_per_min));
+    fields.insert("image_each".to_string(), field_f64(params.image_each));
+    fields
+}
+
+/// Upsert per-model pricing and record the sync capture (LWW), mirroring
+/// `create_token_quota`.
+pub fn upsert_model_pricing(
+    pool: &DbPool,
+    params: &crate::db::models::NewModelPricing<'_>,
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let id = model_pricing_id(params.org_id, params.model_id);
+    tx.execute(
+        "INSERT INTO model_pricing \
+         (id, org_id, model_id, prompt_per_1k, completion_per_1k, audio_per_min, image_each, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%Y-%m-%d %H:%M:%f','now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+         org_id = excluded.org_id, model_id = excluded.model_id, prompt_per_1k = excluded.prompt_per_1k, \
+         completion_per_1k = excluded.completion_per_1k, audio_per_min = excluded.audio_per_min, \
+         image_each = excluded.image_each, updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
+        rusqlite::params![
+            id,
+            params.org_id,
+            params.model_id,
+            params.prompt_per_1k,
+            params.completion_per_1k,
+            params.audio_per_min,
+            params.image_each,
+        ],
+    )?;
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::ModelPricing,
+        params.org_id,
+        id,
+        crate::sync::runtime::SqlWriteAction::Insert,
+        model_pricing_changed_fields(params),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Upsert pricing while MERGING with any existing row: a `None` field keeps the
+/// current stored value (or `0.0` when no row exists yet), so a partial edit that
+/// sets only e.g. `prompt_per_1k` never zeroes the other prices. Returns `false`
+/// without touching the DB when every field is `None` (nothing to persist — avoids
+/// creating an all-zero row that would hide `missing_pricing` in metrics).
+///
+/// Read-modify-write: for admin-edited pricing the tiny race between the read and
+/// the upsert is acceptable (single admin editing one model's prices).
+pub fn upsert_model_pricing_merge(
+    pool: &DbPool,
+    org_id: &str,
+    model_id: &str,
+    prompt_per_1k: Option<f64>,
+    completion_per_1k: Option<f64>,
+    audio_per_min: Option<f64>,
+    image_each: Option<f64>,
+) -> Result<bool> {
+    if prompt_per_1k.is_none()
+        && completion_per_1k.is_none()
+        && audio_per_min.is_none()
+        && image_each.is_none()
+    {
+        return Ok(false);
+    }
+    let existing = get_model_pricing(pool, org_id, model_id)?;
+    let (ep, ec, ea, ei) = existing
+        .map(|r| {
+            (
+                r.prompt_per_1k,
+                r.completion_per_1k,
+                r.audio_per_min,
+                r.image_each,
+            )
+        })
+        .unwrap_or((0.0, 0.0, 0.0, 0.0));
+    upsert_model_pricing(
+        pool,
+        &crate::db::models::NewModelPricing {
+            model_id,
+            org_id,
+            prompt_per_1k: prompt_per_1k.unwrap_or(ep),
+            completion_per_1k: completion_per_1k.unwrap_or(ec),
+            audio_per_min: audio_per_min.unwrap_or(ea),
+            image_each: image_each.unwrap_or(ei),
+        },
+    )?;
+    Ok(true)
+}
+
+/// Fetch pricing for one org's model, if present.
+pub fn get_model_pricing(
+    pool: &DbPool,
+    org_id: &str,
+    model_id: &str,
+) -> Result<Option<crate::db::models::DbModelPricing>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT model_id, org_id, prompt_per_1k, completion_per_1k, audio_per_min, image_each, \
+         updated_at FROM model_pricing WHERE org_id = ?1 AND model_id = ?2",
+    )?;
+    let row = stmt
+        .query_row(rusqlite::params![org_id, model_id], |r| {
+            Ok(crate::db::models::DbModelPricing {
+                model_id: r.get(0)?,
+                org_id: r.get(1)?,
+                prompt_per_1k: r.get(2)?,
+                completion_per_1k: r.get(3)?,
+                audio_per_min: r.get(4)?,
+                image_each: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        })
+        .optional()?;
+    Ok(row)
+}
+
+/// Wszystkie wiersze cennika dla organizacji (do listy w GUI).
+pub fn list_model_pricing(
+    pool: &DbPool,
+    org_id: &str,
+) -> Result<Vec<crate::db::models::DbModelPricing>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT model_id, org_id, prompt_per_1k, completion_per_1k, audio_per_min, image_each, \
+         updated_at FROM model_pricing WHERE org_id = ?1 ORDER BY model_id",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![org_id], |r| {
+            Ok(crate::db::models::DbModelPricing {
+                model_id: r.get(0)?,
+                org_id: r.get(1)?,
+                prompt_per_1k: r.get(2)?,
+                completion_per_1k: r.get(3)?,
+                audio_per_min: r.get(4)?,
+                image_each: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 // --- Fast Path Patterns ---
 
 const FAST_PATH_COLS: &str =
@@ -10706,6 +11535,21 @@ pub fn get_user_groups(pool: &DbPool, user_id: &str) -> Result<Vec<UserGroup>> {
                 created_at: row.get(3)?,
             })
         })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Mapa przynależności `user_id -> nazwa grupy` dla agregacji metryk po grupach.
+/// Użytkownik w wielu grupach pojawia się w wielu parach; użytkownik bez grupy
+/// nie występuje w wyniku (caller decyduje o placeholderze).
+pub fn list_group_memberships(pool: &DbPool) -> Result<Vec<(String, String)>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT gm.user_id, g.name \
+         FROM group_members gm JOIN user_groups g ON g.id = gm.group_id",
+    )?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -16607,129 +17451,6 @@ pub fn set_addon_network_config(
     Ok(())
 }
 
-// --- Notes (per-user notes app) ---
-
-/// Single note row from `notes` table. Epoch times converted from SQLite datetime strings.
-pub struct Note {
-    pub id: i64,
-    pub user_id: String,
-    pub title: String,
-    pub body: String,
-    pub pinned: bool,
-    pub created_at_epoch: i64,
-    pub updated_at_epoch: i64,
-}
-
-fn row_to_note(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
-    let pinned: i64 = row.get(4)?;
-    let created_at: String = row.get(5)?;
-    let updated_at: String = row.get(6)?;
-    Ok(Note {
-        id: row.get(0)?,
-        user_id: row.get(1)?,
-        title: row.get(2)?,
-        body: row.get(3)?,
-        pinned: pinned != 0,
-        created_at_epoch: parse_sqlite_datetime_epoch(&created_at),
-        updated_at_epoch: parse_sqlite_datetime_epoch(&updated_at),
-    })
-}
-
-fn parse_sqlite_datetime_epoch(s: &str) -> i64 {
-    // SQLite `datetime('now')` yields "YYYY-MM-DD HH:MM:SS" in UTC.
-    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-        .map(|ndt| ndt.and_utc().timestamp())
-        .unwrap_or(0)
-}
-
-const NOTE_COLS: &str = "id, user_id, title, body, pinned, created_at, updated_at";
-
-pub fn list_notes_for_user(pool: &DbPool, user_id: &str) -> Result<Vec<Note>> {
-    let conn = acquire(pool)?;
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM notes WHERE user_id = ?1 ORDER BY pinned DESC, updated_at DESC",
-        NOTE_COLS
-    ))?;
-    let rows = stmt
-        .query_map(rusqlite::params![user_id], row_to_note)?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
-}
-
-pub fn get_note(pool: &DbPool, note_id: i64, user_id: &str) -> Result<Option<Note>> {
-    let conn = acquire(pool)?;
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM notes WHERE id = ?1 AND user_id = ?2",
-        NOTE_COLS
-    ))?;
-    let result = stmt
-        .query_row(rusqlite::params![note_id, user_id], row_to_note)
-        .optional()?;
-    Ok(result)
-}
-
-pub fn create_note(pool: &DbPool, user_id: &str, title: &str, body: &str) -> Result<i64> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "INSERT INTO notes (user_id, title, body) VALUES (?1, ?2, ?3)",
-        rusqlite::params![user_id, title, body],
-    )?;
-    Ok(conn.last_insert_rowid())
-}
-
-pub fn update_note(
-    pool: &DbPool,
-    note_id: i64,
-    user_id: &str,
-    title: &str,
-    body: &str,
-) -> Result<()> {
-    let conn = acquire(pool)?;
-    let affected = conn.execute(
-        "UPDATE notes SET title = ?3, body = ?4, updated_at = datetime('now') \
-         WHERE id = ?1 AND user_id = ?2",
-        rusqlite::params![note_id, user_id, title, body],
-    )?;
-    if affected == 0 {
-        return Err(anyhow::anyhow!(
-            "note {} not found or not owned by user",
-            note_id
-        ));
-    }
-    Ok(())
-}
-
-pub fn set_note_pinned(pool: &DbPool, note_id: i64, user_id: &str, pinned: bool) -> Result<()> {
-    let conn = acquire(pool)?;
-    let affected = conn.execute(
-        "UPDATE notes SET pinned = ?3, updated_at = datetime('now') \
-         WHERE id = ?1 AND user_id = ?2",
-        rusqlite::params![note_id, user_id, if pinned { 1 } else { 0 }],
-    )?;
-    if affected == 0 {
-        return Err(anyhow::anyhow!(
-            "note {} not found or not owned by user",
-            note_id
-        ));
-    }
-    Ok(())
-}
-
-pub fn delete_note(pool: &DbPool, note_id: i64, user_id: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    let affected = conn.execute(
-        "DELETE FROM notes WHERE id = ?1 AND user_id = ?2",
-        rusqlite::params![note_id, user_id],
-    )?;
-    if affected == 0 {
-        return Err(anyhow::anyhow!(
-            "note {} not found or not owned by user",
-            note_id
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod alias_resolve_tests {
     use super::*;
@@ -18692,130 +19413,6 @@ mod declared_network_rules_tests {
     }
 }
 
-#[cfg(test)]
-mod notes_tests {
-    use super::*;
-    use std::path::Path;
-
-    fn setup_db() -> DbPool {
-        crate::db::init(Path::new(":memory:")).expect("cannot build test DB")
-    }
-
-    fn mk_user(db: &DbPool, name: &str) -> String {
-        create_user_account(db, name, "hash", name, &format!("{}@test", name))
-            .expect("create_user_account")
-    }
-
-    #[test]
-    fn test_create_and_list_notes_for_user() {
-        let db = setup_db();
-        let uid = mk_user(&db, "alice");
-        let a = create_note(&db, &uid, "first", "body A").unwrap();
-        let b = create_note(&db, &uid, "second", "body B").unwrap();
-        let rows = list_notes_for_user(&db, &uid).unwrap();
-        assert_eq!(rows.len(), 2);
-        // Newest first (both same-second timestamp — order by id desc is acceptable fallback).
-        let ids: Vec<i64> = rows.iter().map(|n| n.id).collect();
-        assert!(ids.contains(&a) && ids.contains(&b));
-        for n in &rows {
-            assert_eq!(n.user_id, uid);
-            assert!(!n.pinned);
-        }
-    }
-
-    #[test]
-    fn test_update_note_respects_user_ownership() {
-        let db = setup_db();
-        let alice = mk_user(&db, "alice");
-        let bob = mk_user(&db, "bob");
-        let note_id = create_note(&db, &alice, "t", "b").unwrap();
-
-        // Bob cannot update Alice's note.
-        let res = update_note(&db, note_id, &bob, "hacked", "hacked body");
-        assert!(res.is_err());
-
-        // Alice's note content stays intact.
-        let got = get_note(&db, note_id, &alice).unwrap().expect("present");
-        assert_eq!(got.title, "t");
-        assert_eq!(got.body, "b");
-    }
-
-    #[test]
-    fn test_delete_note_respects_user_ownership() {
-        let db = setup_db();
-        let alice = mk_user(&db, "alice");
-        let bob = mk_user(&db, "bob");
-        let note_id = create_note(&db, &alice, "t", "b").unwrap();
-
-        let res = delete_note(&db, note_id, &bob);
-        assert!(res.is_err(), "bob must not be able to delete alice's note");
-
-        // Still present for alice.
-        let got = get_note(&db, note_id, &alice).unwrap();
-        assert!(got.is_some());
-
-        // Alice can delete her own.
-        delete_note(&db, note_id, &alice).unwrap();
-        assert!(get_note(&db, note_id, &alice).unwrap().is_none());
-    }
-
-    #[test]
-    fn test_notes_sorted_pinned_first_then_updated_desc() {
-        let db = setup_db();
-        let uid = mk_user(&db, "alice");
-        let first = create_note(&db, &uid, "first", "x").unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        let second = create_note(&db, &uid, "second", "y").unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        let third = create_note(&db, &uid, "third", "z").unwrap();
-
-        // Without pinning: newest first.
-        let rows = list_notes_for_user(&db, &uid).unwrap();
-        assert_eq!(rows[0].id, third);
-        assert_eq!(rows[2].id, first);
-
-        // Pin the oldest — it must jump to the top.
-        set_note_pinned(&db, first, &uid, true).unwrap();
-        let rows = list_notes_for_user(&db, &uid).unwrap();
-        assert_eq!(rows[0].id, first, "pinned note sorts first");
-        assert!(rows[0].pinned);
-        // Remaining two are in updated_at DESC order.
-        assert_eq!(rows[1].id, third);
-        assert_eq!(rows[2].id, second);
-    }
-
-    #[test]
-    fn test_migration_46_idempotent() {
-        // Migrations are applied on init. Re-running run() on the same pool must
-        // not fail and must not duplicate the migration row.
-        let db = setup_db();
-        {
-            let conn = acquire(&db).unwrap();
-            crate::db::migrations::run(&conn).expect("re-run migrations");
-            crate::db::migrations::run(&conn).expect("re-run migrations again");
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM _migrations WHERE version = 1",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(count, 1, "initial schema must appear exactly once");
-            let tbl: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='notes'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(tbl, 1, "notes table must exist");
-        }
-        // And the table is usable.
-        let uid = mk_user(&db, "alice");
-        create_note(&db, &uid, "t", "b").unwrap();
-    }
-}
-
 // =============================================================================
 // Deployments (migration 48) — deploy lifecycle tracking with streaming log tail
 // =============================================================================
@@ -18874,6 +19471,37 @@ pub mod deployments {
             error_message: row.get(14)?,
             log_tail: row.get(15)?,
         })
+    }
+
+    /// Tworzy wiersz `deployments` (status `deploying`) dla deployu, ktory nie
+    /// przechodzi przez `services_repo` (np. cluster deploy). Dzieki temu
+    /// `deploymentStatusRequest` + log_bus (`append_log_line`/`set_status`/
+    /// `mark_finished`) maja na czym pracowac. `target_service_id` zostaje NULL —
+    /// cluster deploy nie ma pojedynczego wiersza `services`.
+    pub fn create(
+        pool: &DbPool,
+        deploy_id: &str,
+        engine_id: &str,
+        deploy_method: &str,
+        node_id: &str,
+        config_json: &str,
+    ) -> Result<()> {
+        let conn = pool.write().unwrap();
+        conn.execute(
+            "INSERT INTO deployments (deploy_id, engine_id, deploy_method, node_id, status, config_json)
+             VALUES (?1, ?2, ?3, ?4, 'deploying', ?5)",
+            params![deploy_id, engine_id, deploy_method, node_id, config_json],
+        )?;
+        Ok(())
+    }
+
+    /// Kasuje wiersz `deployments` po `deploy_id`. Uzywane przy transakcyjnym
+    /// abordzie deployu klastra, gdy krok po `create` (np. insert placeholdera
+    /// `services`) zawiedzie — wiersz `deployments` nie moze osierociec.
+    pub fn delete(pool: &DbPool, deploy_id: &str) -> Result<()> {
+        let conn = pool.write().unwrap();
+        conn.execute("DELETE FROM deployments WHERE deploy_id = ?1", params![deploy_id])?;
+        Ok(())
     }
 
     pub fn set_status(
@@ -20292,6 +20920,9 @@ pub struct CameraRow {
     /// Per-camera analysis Flow id (the cold path runs it on a detection
     /// event). `None` = no flow assigned → built-in enrichment.
     pub analysis_flow_id: Option<String>,
+    /// Per-camera CV pipeline id. `None` = the camera resolves to the
+    /// `is_default=1` pipeline (see [`resolve_camera_cv_pipeline`]).
+    pub cv_pipeline_id: Option<String>,
 }
 
 /// Patch payload for `update_camera`. `None` means "do not touch this column".
@@ -20310,6 +20941,9 @@ pub struct CameraPatch {
     /// Per-camera analysis Flow id. Tri-state: `None` = untouched,
     /// `Some(None)` = clear (NULL), `Some(Some(id))` = assign.
     pub analysis_flow_id: Option<Option<String>>,
+    /// Per-camera CV pipeline id. Tri-state like `analysis_flow_id`:
+    /// `Some(None)` clears (camera falls back to the org default pipeline).
+    pub cv_pipeline_id: Option<Option<String>>,
     pub depth_mapping_enabled: Option<bool>,
     /// Robot the depth point cloud is attributed to. Tri-state like
     /// `analysis_flow_id`: `Some(None)` clears the binding (disables mapping).
@@ -20349,6 +20983,7 @@ fn row_to_camera(row: &rusqlite::Row<'_>) -> rusqlite::Result<CameraRow> {
         metadata_supported: row.get::<_, i64>(20).map(|v| v != 0).unwrap_or(false),
         analysis_fps: row.get(21)?,
         analysis_flow_id: row.get(22)?,
+        cv_pipeline_id: row.get(23)?,
     })
 }
 
@@ -20357,7 +20992,8 @@ const CAMERA_SELECT_COLS: &str =
     "id, camera_id, owner_addon_id, display_name, vendor, url, profile, target_fps, \
      resolution_width, resolution_height, retention_class, status, status_message, \
      fps_actual, last_frame_at, created_at, updated_at, credentials_encrypted, \
-     onvif_url, onvif_profile_token, metadata_supported, analysis_fps, analysis_flow_id";
+     onvif_url, onvif_profile_token, metadata_supported, analysis_fps, analysis_flow_id, \
+     cv_pipeline_id";
 
 /// Inserts a new camera row owned by `owner_addon_id`. The supervisor session
 /// is started separately; on supervisor failure the caller must
@@ -21091,6 +21727,718 @@ pub fn list_camera_analysis_flows(pool: &DbPool) -> Result<Vec<(String, String)>
     Ok(rows)
 }
 
+// --- Camera CV pipelines ---
+
+/// Write outcome for camera CV pipeline save/delete. `Refused` carries a
+/// human-readable business/validation reason the host fn returns in-band to
+/// the addon (invalid JSON, validator rejection, default-delete, still
+/// assigned); `Db` is an operational failure the host fn maps to the standard
+/// `AbiError::Operation` path with an "error" audit outcome.
+#[derive(Debug)]
+pub enum CvPipelineWriteError {
+    Refused(String),
+    Db(anyhow::Error),
+}
+
+impl std::fmt::Display for CvPipelineWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(msg) => f.write_str(msg),
+            Self::Db(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<rusqlite::Error> for CvPipelineWriteError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Db(e.into())
+    }
+}
+
+impl From<anyhow::Error> for CvPipelineWriteError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Db(e)
+    }
+}
+
+/// Lists the caller org's camera CV pipelines as
+/// `(id, name, is_default, updated_at)`, ordered by name. Powers the pipeline
+/// picker; the JSON body is fetched per-pipeline via
+/// [`get_camera_cv_pipeline`].
+pub fn list_camera_cv_pipelines(
+    pool: &DbPool,
+    org_id: Option<&str>,
+) -> Result<Vec<(String, String, bool, i64)>> {
+    let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, name, is_default, updated_at FROM camera_cv_pipelines \
+         WHERE org_id = ?1 ORDER BY name ASC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![resolved_org], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, bool>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Returns one pipeline of the caller org as `(name, pipeline_json)`, or
+/// `None` when missing (or owned by another org — indistinguishable by
+/// design, so cross-org ids do not leak existence).
+pub fn get_camera_cv_pipeline(
+    pool: &DbPool,
+    id: &str,
+    org_id: Option<&str>,
+) -> Result<Option<(String, String)>> {
+    let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let row = conn
+        .query_row(
+            "SELECT name, pipeline_json FROM camera_cv_pipelines \
+             WHERE id = ?1 AND org_id = ?2",
+            rusqlite::params![id, resolved_org],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Upserts a pipeline in the caller org after structural validation
+/// (`cv_pipeline::validate`) and alias-existence validation against
+/// `model_aliases` (alias GRANT semantics are enforced by the host-fn layer).
+/// `is_default` is deliberately NOT writable here — the default flag is
+/// seed-owned, so an upsert preserves the existing flag (new rows get 0).
+/// The upsert is org-guarded: an id collision with another org's row changes
+/// nothing and is refused. Captures the write for mesh sync like flow saves.
+pub fn save_camera_cv_pipeline(
+    pool: &DbPool,
+    id: &str,
+    name: &str,
+    pipeline_json: &str,
+    org_id: Option<&str>,
+) -> std::result::Result<(), CvPipelineWriteError> {
+    if id.trim().is_empty() || name.trim().is_empty() {
+        return Err(CvPipelineWriteError::Refused(
+            "pipeline id and name must not be empty".to_string(),
+        ));
+    }
+    let parsed: crate::services::camera_ingest::cv_pipeline::CvPipeline =
+        serde_json::from_str(pipeline_json).map_err(|e| {
+            CvPipelineWriteError::Refused(format!("invalid pipeline JSON: {e}"))
+        })?;
+    crate::services::camera_ingest::cv_pipeline::validate(&parsed)
+        .map_err(|e| CvPipelineWriteError::Refused(format!("invalid pipeline: {e}")))?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let mut conn = acquire(pool).map_err(CvPipelineWriteError::Db)?;
+    let tx = conn.transaction()?;
+    crate::services::camera_ingest::cv_pipeline::validate_aliases(&tx, &parsed)
+        .map_err(|e| CvPipelineWriteError::Refused(format!("invalid pipeline: {e}")))?;
+    let now = chrono::Utc::now().timestamp();
+    let changed = tx.execute(
+        "INSERT INTO camera_cv_pipelines \
+         (id, name, pipeline_json, is_default, org_id, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, 0, ?4, ?5, ?5) \
+         ON CONFLICT(id) DO UPDATE SET \
+         name = excluded.name, pipeline_json = excluded.pipeline_json, \
+         updated_at = excluded.updated_at \
+         WHERE camera_cv_pipelines.org_id = excluded.org_id",
+        rusqlite::params![id, name, pipeline_json, resolved_org, now],
+    )?;
+    if changed == 0 {
+        return Err(CvPipelineWriteError::Refused(format!(
+            "pipeline not found: {id}"
+        )));
+    }
+    // The capture must carry the row's REAL default flag (preserved by the
+    // upsert), so a synced edit of the default pipeline keeps it default on
+    // every node.
+    let is_default: bool = tx.query_row(
+        "SELECT is_default FROM camera_cv_pipelines WHERE id = ?1",
+        rusqlite::params![id],
+        |r| r.get(0),
+    )?;
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::CameraCvPipeline,
+        resolved_org,
+        id.to_string(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        camera_cv_pipeline_changed_fields(name, pipeline_json, is_default, resolved_org),
+        None,
+    )
+    .map_err(CvPipelineWriteError::Db)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Deletes a pipeline of the caller org. Refused for the seed-owned default
+/// (`is_default=1`), while any live camera still references it, and for
+/// missing / cross-org ids. Captures the delete for mesh sync (tombstone,
+/// like flow deletes).
+pub fn delete_camera_cv_pipeline(
+    pool: &DbPool,
+    id: &str,
+    org_id: Option<&str>,
+) -> std::result::Result<(), CvPipelineWriteError> {
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let mut conn = acquire(pool).map_err(CvPipelineWriteError::Db)?;
+    let tx = conn.transaction()?;
+    let is_default: Option<bool> = tx
+        .query_row(
+            "SELECT is_default FROM camera_cv_pipelines WHERE id = ?1 AND org_id = ?2",
+            rusqlite::params![id, resolved_org],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(is_default) = is_default else {
+        return Err(CvPipelineWriteError::Refused(format!(
+            "pipeline not found: {id}"
+        )));
+    };
+    if is_default {
+        return Err(CvPipelineWriteError::Refused(
+            "the default pipeline cannot be deleted".to_string(),
+        ));
+    }
+    let referencing: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM cameras WHERE cv_pipeline_id = ?1 AND removed_at IS NULL",
+        rusqlite::params![id],
+        |r| r.get(0),
+    )?;
+    if referencing > 0 {
+        return Err(CvPipelineWriteError::Refused(format!(
+            "pipeline is assigned to {referencing} camera(s)"
+        )));
+    }
+    tx.execute(
+        "DELETE FROM camera_cv_pipelines WHERE id = ?1 AND org_id = ?2",
+        rusqlite::params![id, resolved_org],
+    )?;
+    let mut fields = BTreeMap::new();
+    fields.insert("id".to_string(), field_string(id));
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::CameraCvPipeline,
+        resolved_org,
+        id.to_string(),
+        crate::sync::runtime::SqlWriteAction::Delete,
+        fields,
+        None,
+    )
+    .map_err(CvPipelineWriteError::Db)?;
+    tx.commit()?;
+    Ok(())
+}
+
+// --- Vision model registry (dynamic camera-CV ONNX models) ---
+
+/// One `vision_models` row: a dynamic ONNX model (trained in ML Studio or
+/// imported) served by the generic `onnx-cv` embedded engine. Bundled fixed
+/// engines never appear here — they resolve through their fixed engine ids.
+#[derive(Debug, Clone)]
+pub struct VisionModelRow {
+    pub model_name: String,
+    pub op: String,
+    pub file_name: String,
+    pub sha256: String,
+    pub classes_json: String,
+    pub preprocess_json: String,
+    pub output_contract: String,
+    pub source: String,
+    pub default_threshold: Option<f64>,
+    pub org_id: String,
+    /// Provenance: ML Studio project the model was published from. `None` for
+    /// imported/synced rows — delete then falls back to admin-only.
+    pub project_id: Option<String>,
+    /// Provenance: ML Studio `models.model_id` the ONNX was exported from.
+    pub source_model_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+fn map_vision_model_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<VisionModelRow> {
+    Ok(VisionModelRow {
+        model_name: r.get(0)?,
+        op: r.get(1)?,
+        file_name: r.get(2)?,
+        sha256: r.get(3)?,
+        classes_json: r.get(4)?,
+        preprocess_json: r.get(5)?,
+        output_contract: r.get(6)?,
+        source: r.get(7)?,
+        default_threshold: r.get(8)?,
+        org_id: r.get(9)?,
+        project_id: r.get(10)?,
+        source_model_id: r.get(11)?,
+        created_at: r.get(12)?,
+        updated_at: r.get(13)?,
+    })
+}
+
+const VISION_MODEL_COLS: &str = "model_name, op, file_name, sha256, classes_json, \
+     preprocess_json, output_contract, source, default_threshold, org_id, \
+     project_id, source_model_id, created_at, updated_at";
+
+/// Registry model-name rule shared by the repository validator AND the ML
+/// Studio publish handler — the handler must validate BEFORE any filesystem
+/// work because the name becomes the on-disk file name.
+pub(crate) fn validate_vision_model_name(model_name: &str) -> std::result::Result<(), String> {
+    if model_name.is_empty() || model_name.len() > 128 {
+        return Err("model_name must be 1..=128 characters".into());
+    }
+    if !model_name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    {
+        return Err(format!("model_name '{model_name}' must match [a-z0-9-_]+"));
+    }
+    Ok(())
+}
+
+/// Structural validation shared by local registration and the sync
+/// materializer, so a hostile/buggy peer cannot land a row the runner would
+/// choke on (or a file name that escapes `vision_models_dir()`).
+///
+/// Registry v1 supports `detect`+`rfdetr` and `classify`+`softmax` only. The
+/// OCR contracts (plate/ppocr) stay on the fixed engines; `embed` is admitted
+/// by the table CHECK (future-proofing) but rejected here because
+/// `CameraCvOp` has no Embed variant yet.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_vision_model_fields(
+    model_name: &str,
+    op: &str,
+    file_name: &str,
+    sha256: &str,
+    classes_json: &str,
+    preprocess_json: &str,
+    output_contract: &str,
+    source: &str,
+) -> std::result::Result<(), String> {
+    validate_vision_model_name(model_name)?;
+    match (op, output_contract) {
+        ("detect", "rfdetr") | ("classify", "softmax") => {}
+        ("embed", _) => {
+            return Err("op 'embed' is not supported by camera pipelines yet".into());
+        }
+        ("ocr", _) => {
+            return Err(
+                "op 'ocr' stays on the fixed OCR engines (plate-ocr/onnx-ocr/apple-ocr)".into(),
+            );
+        }
+        (o, c) => {
+            return Err(format!(
+                "unsupported op/contract combination '{o}'/'{c}' \
+                 (supported: detect/rfdetr, classify/softmax)"
+            ));
+        }
+    }
+    if file_name.is_empty()
+        || file_name.contains('/')
+        || file_name.contains('\\')
+        || file_name.contains("..")
+        || file_name.starts_with('.')
+    {
+        return Err(format!(
+            "file_name '{file_name}' must be a plain file name without path separators"
+        ));
+    }
+    if !std::path::Path::new(file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("onnx"))
+    {
+        return Err(format!("file_name '{file_name}' must end in .onnx"));
+    }
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("sha256 must be 64 hex characters".into());
+    }
+    // Size caps: these blobs replicate mesh-wide and are parsed on every
+    // session load — bound them so a hostile peer cannot bloat the table.
+    if classes_json.len() > 64 * 1024 {
+        return Err("classes_json exceeds 64 KiB".into());
+    }
+    let classes: serde_json::Value =
+        serde_json::from_str(classes_json).map_err(|e| format!("classes_json invalid: {e}"))?;
+    let classes = classes
+        .as_array()
+        .ok_or_else(|| "classes_json must be a JSON array".to_string())?;
+    if classes.is_empty() {
+        return Err("classes_json must list at least one class".into());
+    }
+    if classes.len() > 512 {
+        return Err(format!(
+            "classes_json lists {} classes (max 512)",
+            classes.len()
+        ));
+    }
+    for class in classes {
+        let name = class
+            .as_str()
+            .ok_or_else(|| "classes_json entries must be strings".to_string())?;
+        if name.is_empty() || name.len() > 128 {
+            return Err("class names must be 1..=128 characters".into());
+        }
+    }
+    if preprocess_json.len() > 4 * 1024 {
+        return Err("preprocess_json exceeds 4 KiB".into());
+    }
+    let preprocess: serde_json::Value = serde_json::from_str(preprocess_json)
+        .map_err(|e| format!("preprocess_json invalid: {e}"))?;
+    let preprocess_obj = preprocess
+        .as_object()
+        .ok_or_else(|| "preprocess_json must be a JSON object".to_string())?;
+    let resolution = preprocess_obj
+        .get("resolution")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "preprocess_json requires an integer 'resolution'".to_string())?;
+    if !(32..=4096).contains(&resolution) {
+        return Err(format!(
+            "preprocess resolution {resolution} out of range (32..=4096)"
+        ));
+    }
+    if let Some(layout) = preprocess_obj.get("layout") {
+        if !layout
+            .as_str()
+            .is_some_and(|l| l.eq_ignore_ascii_case("nchw"))
+        {
+            return Err("preprocess layout must be 'nchw'".into());
+        }
+    }
+    if !matches!(source, "bundled" | "trained" | "imported") {
+        return Err(format!("unknown source '{source}'"));
+    }
+    Ok(())
+}
+
+/// Replicated field set for a `vision_models` row. Timestamps are node-local.
+fn vision_model_changed_fields(
+    row: &VisionModelRow,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    use crate::sync::ledger::FieldValue;
+    let mut fields = BTreeMap::new();
+    fields.insert("op".to_string(), field_string(&row.op));
+    fields.insert("file_name".to_string(), field_string(&row.file_name));
+    fields.insert("sha256".to_string(), field_string(&row.sha256));
+    fields.insert("classes_json".to_string(), field_string(&row.classes_json));
+    fields.insert(
+        "preprocess_json".to_string(),
+        field_string(&row.preprocess_json),
+    );
+    fields.insert(
+        "output_contract".to_string(),
+        field_string(&row.output_contract),
+    );
+    fields.insert("source".to_string(), field_string(&row.source));
+    fields.insert(
+        "default_threshold".to_string(),
+        match row.default_threshold {
+            Some(v) => FieldValue::Decimal(v.to_string()),
+            None => FieldValue::Null,
+        },
+    );
+    fields.insert("org_id".to_string(), field_string(&row.org_id));
+    fields.insert(
+        "project_id".to_string(),
+        field_optional_string(row.project_id.as_deref()),
+    );
+    fields.insert(
+        "source_model_id".to_string(),
+        field_optional_string(row.source_model_id.as_deref()),
+    );
+    fields
+}
+
+/// Lists every vision model regardless of org — used by the `onnx-cv`
+/// service reconciler, which advertises catalog entries for all servable
+/// models on this node (catalog model names are org-agnostic).
+pub fn list_vision_models_all(pool: &DbPool) -> Result<Vec<VisionModelRow>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {VISION_MODEL_COLS} FROM vision_models ORDER BY model_name ASC"
+    ))?;
+    let rows = stmt
+        .query_map([], map_vision_model_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Lists the caller org's vision models ordered by name.
+pub fn list_vision_models(pool: &DbPool, org_id: Option<&str>) -> Result<Vec<VisionModelRow>> {
+    let conn = acquire(pool)?;
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {VISION_MODEL_COLS} FROM vision_models WHERE org_id = ?1 ORDER BY model_name ASC"
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![resolved_org], map_vision_model_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Fetches one vision model by its globally-unique name, regardless of org.
+/// The execution path (camera engine → `onnx-cv` local handler) runs in
+/// system context and resolves purely by catalog model name, so it must not
+/// be org-filtered; org scoping applies to the admin CRUD surface only.
+pub fn get_vision_model(pool: &DbPool, model_name: &str) -> Result<Option<VisionModelRow>> {
+    let conn = acquire(pool)?;
+    let row = conn
+        .query_row(
+            &format!("SELECT {VISION_MODEL_COLS} FROM vision_models WHERE model_name = ?1"),
+            rusqlite::params![model_name],
+            map_vision_model_row,
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Upserts a vision model row after structural validation. Org-guarded like
+/// `save_camera_cv_pipeline`: a name collision with another org's row changes
+/// nothing and is refused. Captures the write for mesh sync (metadata only —
+/// the ONNX file itself never syncs).
+///
+/// `alias` (optional) is created/retargeted at the new model IN THE SAME
+/// transaction — a concurrent `delete_vision_model` therefore either sees
+/// both the row and the alias (delete refused) or neither, never an alias
+/// pointing at a deleted model. An existing alias keeps its strategy and
+/// fallback list; only the primary target moves.
+pub fn register_vision_model(
+    pool: &DbPool,
+    row: &VisionModelRow,
+    alias: Option<&str>,
+) -> std::result::Result<(), CvPipelineWriteError> {
+    validate_vision_model_fields(
+        &row.model_name,
+        &row.op,
+        &row.file_name,
+        &row.sha256,
+        &row.classes_json,
+        &row.preprocess_json,
+        &row.output_contract,
+        &row.source,
+    )
+    .map_err(CvPipelineWriteError::Refused)?;
+    let mut conn = acquire(pool).map_err(CvPipelineWriteError::Db)?;
+    let tx = conn.transaction()?;
+    let now = chrono::Utc::now().timestamp();
+    let changed = tx.execute(
+        "INSERT INTO vision_models \
+         (model_name, op, file_name, sha256, classes_json, preprocess_json, \
+          output_contract, source, default_threshold, org_id, project_id, \
+          source_model_id, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13) \
+         ON CONFLICT(model_name) DO UPDATE SET \
+         op = excluded.op, file_name = excluded.file_name, sha256 = excluded.sha256, \
+         classes_json = excluded.classes_json, preprocess_json = excluded.preprocess_json, \
+         output_contract = excluded.output_contract, source = excluded.source, \
+         default_threshold = excluded.default_threshold, \
+         project_id = excluded.project_id, source_model_id = excluded.source_model_id, \
+         updated_at = excluded.updated_at \
+         WHERE vision_models.org_id = excluded.org_id",
+        rusqlite::params![
+            row.model_name,
+            row.op,
+            row.file_name,
+            row.sha256,
+            row.classes_json,
+            row.preprocess_json,
+            row.output_contract,
+            row.source,
+            row.default_threshold,
+            row.org_id,
+            row.project_id,
+            row.source_model_id,
+            now,
+        ],
+    )?;
+    if changed == 0 {
+        return Err(CvPipelineWriteError::Refused(format!(
+            "vision model name already used by another org: {}",
+            row.model_name
+        )));
+    }
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::VisionModel,
+        &row.org_id,
+        row.model_name.clone(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        vision_model_changed_fields(row),
+        None,
+    )
+    .map_err(CvPipelineWriteError::Db)?;
+
+    if let Some(alias) = alias.map(str::trim).filter(|s| !s.is_empty()) {
+        let existing: Option<(i64, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT id, strategy, fallback_targets FROM model_aliases WHERE alias = ?1",
+                rusqlite::params![alias],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        match existing {
+            Some((id, strategy, fallback_targets)) => {
+                update_model_alias_with_chain_check_tx(
+                    &tx,
+                    id,
+                    alias,
+                    &row.model_name,
+                    true,
+                    fallback_targets.as_deref(),
+                    strategy.as_deref(),
+                )
+                .map_err(|e| CvPipelineWriteError::Refused(format!("alias update: {e:#}")))?;
+            }
+            None => {
+                // Same collision rule as `check_alias_collision`, evaluated in
+                // THIS transaction: an alias may not shadow a published flow.
+                let flow_owner: Option<String> = tx
+                    .query_row(
+                        "SELECT id FROM flows WHERE published_model_name = ?1 LIMIT 1",
+                        rusqlite::params![alias],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if flow_owner.is_some() {
+                    return Err(CvPipelineWriteError::Refused(format!(
+                        "alias '{alias}' collides with a published flow name"
+                    )));
+                }
+                create_model_alias_with_chain_check_tx(&tx, alias, &row.model_name, None, None)
+                    .map_err(|e| CvPipelineWriteError::Refused(format!("alias create: {e:#}")))?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Deletes a vision model of the caller org. Refused while any model alias
+/// still targets it (primary target or fallback), so pipelines referencing
+/// the alias never silently lose their backing model. Returns the deleted
+/// row so the caller can remove the ONNX file from disk.
+pub fn delete_vision_model(
+    pool: &DbPool,
+    model_name: &str,
+    org_id: Option<&str>,
+) -> std::result::Result<VisionModelRow, CvPipelineWriteError> {
+    let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
+    let mut conn = acquire(pool).map_err(CvPipelineWriteError::Db)?;
+    let tx = conn.transaction()?;
+    let row = tx
+        .query_row(
+            &format!(
+                "SELECT {VISION_MODEL_COLS} FROM vision_models \
+                 WHERE model_name = ?1 AND org_id = ?2"
+            ),
+            rusqlite::params![model_name, resolved_org],
+            map_vision_model_row,
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Err(CvPipelineWriteError::Refused(format!(
+            "vision model not found: {model_name}"
+        )));
+    };
+    // Aliases store the primary in `target_model` and fallbacks as a JSON
+    // array string; a JSON-quoted LIKE match covers the fallback list without
+    // parsing every row.
+    let referencing: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT alias FROM model_aliases \
+             WHERE target_model = ?1 \
+                OR (fallback_targets IS NOT NULL AND fallback_targets LIKE ?2)",
+        )?;
+        let quoted = format!("%\"{}\"%", model_name);
+        let rows = stmt
+            .query_map(rusqlite::params![model_name, quoted], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    if !referencing.is_empty() {
+        return Err(CvPipelineWriteError::Refused(format!(
+            "vision model is targeted by alias(es): {}",
+            referencing.join(", ")
+        )));
+    }
+    tx.execute(
+        "DELETE FROM vision_models WHERE model_name = ?1 AND org_id = ?2",
+        rusqlite::params![model_name, resolved_org],
+    )?;
+    let mut fields = BTreeMap::new();
+    fields.insert("model_name".to_string(), field_string(model_name));
+    // The materializer scopes the replicated delete by org — carry it.
+    fields.insert("org_id".to_string(), field_string(resolved_org));
+    record_core_capture_for_org_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::VisionModel,
+        resolved_org,
+        model_name.to_string(),
+        crate::sync::runtime::SqlWriteAction::Delete,
+        fields,
+        None,
+    )
+    .map_err(CvPipelineWriteError::Db)?;
+    tx.commit()?;
+    Ok(row)
+}
+
+/// Per-camera CV pipeline id. `None` (NULL or empty) = the camera uses the
+/// default pipeline (see [`resolve_camera_cv_pipeline`]).
+pub fn camera_cv_pipeline_id(pool: &DbPool, camera_id: &str) -> Result<Option<String>> {
+    let conn = acquire(pool)?;
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT cv_pipeline_id FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
+            rusqlite::params![camera_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(id.filter(|s| !s.is_empty()))
+}
+
+/// Resolves the pipeline a camera should run: the camera's `cv_pipeline_id`
+/// when set AND the row still exists in the camera's org, otherwise the
+/// camera org's `is_default=1` pipeline. `None` only when neither exists
+/// (no seed ran for that org and nothing assigned).
+pub fn resolve_camera_cv_pipeline(
+    pool: &DbPool,
+    camera_id: &str,
+) -> Result<Option<(String, String)>> {
+    let conn = acquire(pool)?;
+    let assigned = conn
+        .query_row(
+            "SELECT p.id, p.pipeline_json FROM cameras c \
+             JOIN camera_cv_pipelines p ON p.id = c.cv_pipeline_id AND p.org_id = c.org_id \
+             WHERE c.camera_id = ?1 AND c.removed_at IS NULL",
+            rusqlite::params![camera_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    if assigned.is_some() {
+        return Ok(assigned);
+    }
+    let default = conn
+        .query_row(
+            "SELECT p.id, p.pipeline_json FROM camera_cv_pipelines p \
+             JOIN cameras c ON c.org_id = p.org_id \
+             WHERE c.camera_id = ?1 AND c.removed_at IS NULL AND p.is_default = 1 \
+             ORDER BY p.id ASC LIMIT 1",
+            rusqlite::params![camera_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(default)
+}
+
 /// Applies a partial update. Returns `Ok(false)` if no row matched
 /// `(addon_id, camera_id, removed_at IS NULL)` — the caller maps that to
 /// `AbiError::NotFound`. `Ok(true)` covers both real diffs and idempotent
@@ -21141,6 +22489,12 @@ pub fn update_camera(
     if let Some(v) = patch.analysis_flow_id.as_ref() {
         // Tri-state: `Some(None)` clears (binds NULL), `Some(Some(id))` assigns.
         sets.push("analysis_flow_id = ?");
+        params.push(Box::new(v.clone()));
+    }
+    if let Some(v) = patch.cv_pipeline_id.as_ref() {
+        // Tri-state like analysis_flow_id — applied in the same UPDATE so a
+        // camera patch is atomic (no half-applied assignment on failure).
+        sets.push("cv_pipeline_id = ?");
         params.push(Box::new(v.clone()));
     }
     if let Some(v) = patch.depth_mapping_enabled {
@@ -24113,5 +25467,893 @@ mod token_metrics_tests {
         let by_model = usage_summary(&pool, DEFAULT_ORG_ID, "daily", "2026-06-21", "model").unwrap();
         let m1 = by_model.iter().find(|r| r.key == "m1").unwrap();
         assert_eq!(m1.total_tokens, 140);
+    }
+
+    fn metrics_dims() -> crate::db::models::ModelMetricsDims<'static> {
+        crate::db::models::ModelMetricsDims {
+            node_id: "A",
+            org_id: DEFAULT_ORG_ID,
+            user_id: "u1",
+            model_id: "m1",
+            service_key: "llamacpp/deploy-1/qwen",
+            backend: "cuda",
+            modality: "chat",
+            hour_bucket: "2026-06-21T10:00:00Z",
+            histogram_version: 1,
+        }
+    }
+
+    #[test]
+    fn histogram_bucket_index_maps_edges() {
+        // TTFT edges [0,50,100,200,400,800,1600,3200,6400,∞] → 10 buckets 0..=9.
+        assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 0), 0);
+        assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 1), 1);
+        assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 50), 1);
+        assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 51), 2);
+        assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 6400), 9);
+        assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 999_999), 9);
+        // decode_tps edges [0,10,...,320,∞] → 8 buckets 0..=7.
+        assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 0.0), 0);
+        assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 5.0), 1);
+        assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 320.0), 7);
+        assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 5000.0), 7);
+        // e2e edges → 10 buckets 0..=9.
+        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 0), 0);
+        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 250), 3);
+        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 16000), 9);
+    }
+
+    #[test]
+    fn bump_does_not_touch_buckets_when_perf_none() {
+        let pool = fresh_db();
+        let dims = metrics_dims();
+        let counters = crate::db::models::ModelMetricsCounters {
+            request_count: 1,
+            success_count: 1,
+            error_count: 0,
+        };
+        let tokens = crate::db::models::ModelMetricsTokens {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            ..Default::default()
+        };
+        let times = crate::db::models::ModelMetricsTimes::default();
+        // perf all None → histograms and sample counts must stay 0.
+        bump_model_metrics_rollup(
+            &pool,
+            &dims,
+            &counters,
+            &tokens,
+            &times,
+            &crate::db::models::ModelMetricsPerfSamples::default(),
+        )
+        .unwrap();
+
+        let rows =
+            list_model_metrics_rollup(&pool, DEFAULT_ORG_ID, &Default::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.request_count, 1);
+        assert_eq!(row.total_tokens, 15);
+        assert_eq!(row.ttft_sample_count, 0);
+        assert_eq!(row.decode_tps_sample_count, 0);
+        assert_eq!(row.e2e_sample_count, 0);
+        assert!(row.ttft_buckets.iter().all(|&b| b == 0));
+        assert!(row.decode_tps_buckets.iter().all(|&b| b == 0));
+        assert!(row.e2e_buckets.iter().all(|&b| b == 0));
+
+        // Second bump WITH a measured ttft → exactly one bucket + sample_count move.
+        bump_model_metrics_rollup(
+            &pool,
+            &dims,
+            &counters,
+            &tokens,
+            &times,
+            &crate::db::models::ModelMetricsPerfSamples {
+                ttft_ms: Some(51),
+                decode_tps: None,
+                e2e_ms: None,
+            },
+        )
+        .unwrap();
+        let row = &list_model_metrics_rollup(&pool, DEFAULT_ORG_ID, &Default::default()).unwrap()[0];
+        assert_eq!(row.request_count, 2);
+        assert_eq!(row.ttft_sample_count, 1);
+        assert_eq!(row.ttft_buckets[2], 1); // 51 → bucket 2
+        assert_eq!(row.ttft_buckets.iter().sum::<i64>(), 1);
+        assert_eq!(row.decode_tps_sample_count, 0);
+        assert_eq!(row.e2e_sample_count, 0);
+    }
+
+    #[test]
+    fn model_metrics_flusher_captures_only_own_node_rows() {
+        let pool = fresh_db();
+        let counters = crate::db::models::ModelMetricsCounters {
+            request_count: 1,
+            success_count: 1,
+            error_count: 0,
+        };
+        let tokens = crate::db::models::ModelMetricsTokens::default();
+        let times = crate::db::models::ModelMetricsTimes::default();
+        let perf = crate::db::models::ModelMetricsPerfSamples::default();
+        let mut dims_a = metrics_dims();
+        dims_a.node_id = "A";
+        let mut dims_b = metrics_dims();
+        dims_b.node_id = "B";
+        bump_model_metrics_rollup(&pool, &dims_a, &counters, &tokens, &times, &perf).unwrap();
+        bump_model_metrics_rollup(&pool, &dims_b, &counters, &tokens, &times, &perf).unwrap();
+        // Unknown node owns no rows → watermark unchanged.
+        assert_eq!(
+            flush_model_metrics_captures(&pool, "ZZZ", "").unwrap(),
+            "".to_string()
+        );
+        // Node A owns a row → watermark advances past "".
+        assert_ne!(flush_model_metrics_captures(&pool, "A", "").unwrap(), "");
+    }
+
+    #[test]
+    fn model_pricing_upsert_and_get_roundtrip() {
+        let pool = fresh_db();
+        upsert_model_pricing(
+            &pool,
+            &crate::db::models::NewModelPricing {
+                model_id: "m1",
+                org_id: DEFAULT_ORG_ID,
+                prompt_per_1k: 0.5,
+                completion_per_1k: 1.5,
+                audio_per_min: 0.1,
+                image_each: 0.04,
+            },
+        )
+        .unwrap();
+        let pricing = get_model_pricing(&pool, DEFAULT_ORG_ID, "m1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pricing.completion_per_1k, 1.5);
+        // Upsert again (LWW replace) with new value.
+        upsert_model_pricing(
+            &pool,
+            &crate::db::models::NewModelPricing {
+                model_id: "m1",
+                org_id: DEFAULT_ORG_ID,
+                prompt_per_1k: 0.9,
+                completion_per_1k: 2.0,
+                audio_per_min: 0.1,
+                image_each: 0.04,
+            },
+        )
+        .unwrap();
+        let pricing = get_model_pricing(&pool, DEFAULT_ORG_ID, "m1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pricing.prompt_per_1k, 0.9);
+        assert_eq!(pricing.completion_per_1k, 2.0);
+    }
+
+    #[test]
+    fn model_pricing_two_orgs_same_model_do_not_collide() {
+        let pool = fresh_db();
+        {
+            let conn = acquire(&pool).unwrap();
+            conn.execute(
+                "INSERT INTO organizations (org_id, name, slug, created_at) \
+                 VALUES ('org2', 'Org Two', 'org-two', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+        // Same model_id priced differently in two organizations.
+        upsert_model_pricing(
+            &pool,
+            &crate::db::models::NewModelPricing {
+                model_id: "gpt",
+                org_id: DEFAULT_ORG_ID,
+                prompt_per_1k: 1.0,
+                completion_per_1k: 2.0,
+                audio_per_min: 0.0,
+                image_each: 0.0,
+            },
+        )
+        .unwrap();
+        upsert_model_pricing(
+            &pool,
+            &crate::db::models::NewModelPricing {
+                model_id: "gpt",
+                org_id: "org2",
+                prompt_per_1k: 9.0,
+                completion_per_1k: 8.0,
+                audio_per_min: 0.0,
+                image_each: 0.0,
+            },
+        )
+        .unwrap();
+
+        // Each org keeps its own price; no cross-org clobber.
+        let default_org = get_model_pricing(&pool, DEFAULT_ORG_ID, "gpt")
+            .unwrap()
+            .unwrap();
+        let org2 = get_model_pricing(&pool, "org2", "gpt").unwrap().unwrap();
+        assert_eq!(default_org.prompt_per_1k, 1.0);
+        assert_eq!(default_org.completion_per_1k, 2.0);
+        assert_eq!(org2.prompt_per_1k, 9.0);
+        assert_eq!(org2.completion_per_1k, 8.0);
+
+        // Both rows physically coexist (distinct synthetic ids).
+        let count: i64 = acquire(&pool)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM model_pricing WHERE model_id = 'gpt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+}
+
+// =============================================================================
+// Benchmark Studio — benchmark definitions, targets, runs and results
+// =============================================================================
+
+use crate::benchmark::types::{
+    BenchmarkListItem, BenchmarkRecord, BenchmarkResultRecord, BenchmarkRunRecord,
+    BenchmarkTargetRecord, BenchmarkTargetUpsert,
+};
+
+/// Upserts a benchmark definition together with its full target set. Targets
+/// absent from `targets` are deleted; `api_key: None` keeps a stored key,
+/// `Some("")` clears it, `Some(key)` stores it encrypted with the settings
+/// cipher (secrets never hit the DB in plaintext).
+pub fn upsert_benchmark(
+    pool: &DbPool,
+    org_id: &str,
+    id: &str,
+    name: &str,
+    config_json: &str,
+    targets: &[BenchmarkTargetUpsert],
+    cipher: &crate::crypto::SettingsCipher,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    // Org-scope guard: ON CONFLICT(id) would otherwise silently reassign an
+    // existing benchmark owned by another org. Reject the cross-org upsert.
+    let existing_org: Option<String> = tx
+        .query_row(
+            "SELECT org_id FROM benchmarks WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(owner) = existing_org {
+        if owner != org_id {
+            anyhow::bail!("benchmark {id} belongs to another org");
+        }
+    }
+    tx.execute(
+        "INSERT INTO benchmarks (id, org_id, name, config_json)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(id) DO UPDATE SET
+             name = excluded.name,
+             config_json = excluded.config_json,
+             updated_at = datetime('now')",
+        rusqlite::params![id, org_id, name, config_json],
+    )?;
+
+    // Remove targets dropped by the caller; results keep their own label
+    // snapshot, so pruning here never breaks historical runs.
+    let kept_ids: Vec<&str> = targets.iter().map(|t| t.id.as_str()).collect();
+    if kept_ids.is_empty() {
+        tx.execute(
+            "DELETE FROM benchmark_targets WHERE benchmark_id = ?1",
+            rusqlite::params![id],
+        )?;
+    } else {
+        let placeholders = kept_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "DELETE FROM benchmark_targets WHERE benchmark_id = ?1 AND id NOT IN ({placeholders})"
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&id];
+        for kept in &kept_ids {
+            params.push(kept);
+        }
+        tx.execute(&sql, params.as_slice())?;
+    }
+
+    for target in targets {
+        // A target id already bound to a different benchmark must not be
+        // hijacked into this one via ON CONFLICT(id) reassigning benchmark_id.
+        let existing_bench: Option<String> = tx
+            .query_row(
+                "SELECT benchmark_id FROM benchmark_targets WHERE id = ?1",
+                rusqlite::params![target.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(owner_bench) = existing_bench {
+            if owner_bench != id {
+                anyhow::bail!("target {} belongs to another benchmark", target.id);
+            }
+        }
+        let api_key_enc: Option<String> = match target.api_key.as_deref() {
+            Some(key) if !key.is_empty() => Some(
+                cipher
+                    .encrypt(key)
+                    .map_err(|e| anyhow::anyhow!("encrypt benchmark api key: {e}"))?,
+            ),
+            _ => None,
+        };
+        // COALESCE keeps the stored key when the caller resends the target
+        // without re-entering the secret (listing returns it redacted).
+        tx.execute(
+            "INSERT INTO benchmark_targets
+                 (id, benchmark_id, kind, service_ref, api_type, host, port,
+                  api_key_enc, model, label)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET
+                 benchmark_id = excluded.benchmark_id,
+                 kind = excluded.kind,
+                 service_ref = excluded.service_ref,
+                 api_type = excluded.api_type,
+                 host = excluded.host,
+                 port = excluded.port,
+                 api_key_enc = COALESCE(excluded.api_key_enc, benchmark_targets.api_key_enc),
+                 model = excluded.model,
+                 label = excluded.label",
+            rusqlite::params![
+                target.id,
+                id,
+                target.kind,
+                target.service_ref,
+                target.api_type,
+                target.host,
+                target.port,
+                api_key_enc,
+                target.model,
+                target.label,
+            ],
+        )?;
+        if target.api_key.as_deref() == Some("") {
+            tx.execute(
+                "UPDATE benchmark_targets SET api_key_enc = NULL WHERE id = ?1",
+                rusqlite::params![target.id],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn read_benchmark_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BenchmarkRecord> {
+    Ok(BenchmarkRecord {
+        id: row.get(0)?,
+        org_id: row.get(1)?,
+        name: row.get(2)?,
+        config_json: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+fn read_benchmark_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BenchmarkRunRecord> {
+    Ok(BenchmarkRunRecord {
+        id: row.get(0)?,
+        benchmark_id: row.get(1)?,
+        started_at: row.get(2)?,
+        finished_at: row.get(3)?,
+        status: row.get(4)?,
+        error: row.get(5)?,
+        engine_meta_json: row.get(6)?,
+    })
+}
+
+/// Lists an org's benchmarks with target count and latest-run summary.
+pub fn list_benchmarks(pool: &DbPool, org_id: &str) -> Result<Vec<BenchmarkListItem>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT b.id, b.org_id, b.name, b.config_json, b.created_at, b.updated_at,
+                (SELECT COUNT(*) FROM benchmark_targets t WHERE t.benchmark_id = b.id)
+         FROM benchmarks b WHERE b.org_id = ?1 ORDER BY b.updated_at DESC",
+    )?;
+    let rows: Vec<(BenchmarkRecord, u32)> = stmt
+        .query_map(rusqlite::params![org_id], |row| {
+            Ok((read_benchmark_row(row)?, row.get::<_, i64>(6)? as u32))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+
+    let mut run_stmt = conn.prepare(
+        "SELECT id, benchmark_id, started_at, finished_at, status, error, engine_meta_json
+         FROM benchmark_runs WHERE benchmark_id = ?1
+         ORDER BY started_at DESC LIMIT 1",
+    )?;
+    // Etykiety modeli targetów w kolejnosci dodania — chip na karcie listy.
+    let mut model_stmt = conn.prepare(
+        "SELECT COALESCE(NULLIF(model, ''), label) FROM benchmark_targets
+         WHERE benchmark_id = ?1 ORDER BY rowid",
+    )?;
+    let mut items = Vec::with_capacity(rows.len());
+    for (record, target_count) in rows {
+        let last_run = run_stmt
+            .query_row(rusqlite::params![record.id], read_benchmark_run_row)
+            .optional()?;
+        let models: Vec<String> = model_stmt
+            .query_map(rusqlite::params![record.id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        items.push(BenchmarkListItem {
+            record,
+            target_count,
+            models,
+            last_run,
+        });
+    }
+    Ok(items)
+}
+
+/// Returns a benchmark definition together with its targets, or `None`.
+/// Target `api_key_enc` stays encrypted — the runner decrypts at execution.
+pub fn get_benchmark(
+    pool: &DbPool,
+    org_id: &str,
+    id: &str,
+) -> Result<Option<(BenchmarkRecord, Vec<BenchmarkTargetRecord>)>> {
+    let conn = acquire(pool)?;
+    let record = conn
+        .query_row(
+            "SELECT id, org_id, name, config_json, created_at, updated_at
+             FROM benchmarks WHERE id = ?1 AND org_id = ?2",
+            rusqlite::params![id, org_id],
+            read_benchmark_row,
+        )
+        .optional()?;
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    let mut stmt = conn.prepare(
+        "SELECT id, benchmark_id, kind, service_ref, api_type, host, port,
+                api_key_enc, model, label
+         FROM benchmark_targets WHERE benchmark_id = ?1 ORDER BY label",
+    )?;
+    let targets = stmt
+        .query_map(rusqlite::params![id], |row| {
+            Ok(BenchmarkTargetRecord {
+                id: row.get(0)?,
+                benchmark_id: row.get(1)?,
+                kind: row.get(2)?,
+                service_ref: row.get(3)?,
+                api_type: row.get(4)?,
+                host: row.get(5)?,
+                port: row.get::<_, i64>(6)? as u16,
+                api_key_enc: row.get(7)?,
+                model: row.get(8)?,
+                label: row.get(9)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(Some((record, targets)))
+}
+
+/// Deletes a benchmark (targets, runs and results cascade). Returns whether
+/// a row was actually removed.
+pub fn delete_benchmark(pool: &DbPool, org_id: &str, id: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let deleted = conn.execute(
+        "DELETE FROM benchmarks WHERE id = ?1 AND org_id = ?2",
+        rusqlite::params![id, org_id],
+    )?;
+    Ok(deleted > 0)
+}
+
+/// Opens a new run in 'running' state and returns its id. `engine_meta_json`
+/// snapshots version/env context for later run-to-run comparisons.
+pub fn create_benchmark_run(
+    pool: &DbPool,
+    benchmark_id: &str,
+    engine_meta_json: &str,
+) -> Result<String> {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO benchmark_runs (id, benchmark_id, engine_meta_json)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![run_id, benchmark_id, engine_meta_json],
+    )?;
+    Ok(run_id)
+}
+
+/// Closes a run with a terminal status ('success' | 'failed' | 'cancelled').
+pub fn finish_benchmark_run(
+    pool: &DbPool,
+    run_id: &str,
+    status: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE benchmark_runs
+         SET status = ?2, error = ?3, finished_at = datetime('now')
+         WHERE id = ?1",
+        rusqlite::params![run_id, status, error],
+    )?;
+    Ok(())
+}
+
+/// Single run lookup scoped to an org (via its parent benchmark). `None` when
+/// the run does not exist or belongs to another org.
+pub fn get_benchmark_run(
+    pool: &DbPool,
+    org_id: &str,
+    run_id: &str,
+) -> Result<Option<BenchmarkRunRecord>> {
+    let conn = acquire(pool)?;
+    conn.query_row(
+        "SELECT r.id, r.benchmark_id, r.started_at, r.finished_at, r.status, r.error,
+                r.engine_meta_json
+         FROM benchmark_runs r
+         JOIN benchmarks b ON b.id = r.benchmark_id
+         WHERE r.id = ?1 AND b.org_id = ?2",
+        rusqlite::params![run_id, org_id],
+        read_benchmark_run_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn insert_benchmark_result(pool: &DbPool, result: &BenchmarkResultRecord) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO benchmark_results
+             (id, run_id, target_id, target_label, scenario, variant_json,
+              ttft_ms_mean, ttft_ms_sigma, prefill_tps_mean, prefill_tps_sigma,
+              decode_tps_mean, decode_tps_sigma, total_ms_mean, total_ms_sigma,
+              p50_ms, p90_ms, p99_ms, requests, errors, samples_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+        rusqlite::params![
+            result.id,
+            result.run_id,
+            result.target_id,
+            result.target_label,
+            result.scenario,
+            result.variant_json,
+            result.ttft_ms_mean,
+            result.ttft_ms_sigma,
+            result.prefill_tps_mean,
+            result.prefill_tps_sigma,
+            result.decode_tps_mean,
+            result.decode_tps_sigma,
+            result.total_ms_mean,
+            result.total_ms_sigma,
+            result.p50_ms,
+            result.p90_ms,
+            result.p99_ms,
+            result.requests,
+            result.errors,
+            result.samples_json,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn list_benchmark_runs(
+    pool: &DbPool,
+    org_id: &str,
+    benchmark_id: &str,
+) -> Result<Vec<BenchmarkRunRecord>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT r.id, r.benchmark_id, r.started_at, r.finished_at, r.status, r.error,
+                r.engine_meta_json
+         FROM benchmark_runs r
+         JOIN benchmarks b ON b.id = r.benchmark_id
+         WHERE r.benchmark_id = ?1 AND b.org_id = ?2 ORDER BY r.started_at DESC",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![benchmark_id, org_id],
+        read_benchmark_run_row,
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+pub fn get_benchmark_run_results(
+    pool: &DbPool,
+    org_id: &str,
+    run_id: &str,
+) -> Result<Vec<BenchmarkResultRecord>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT res.id, res.run_id, res.target_id, res.target_label, res.scenario,
+                res.variant_json, res.ttft_ms_mean, res.ttft_ms_sigma,
+                res.prefill_tps_mean, res.prefill_tps_sigma, res.decode_tps_mean,
+                res.decode_tps_sigma, res.total_ms_mean, res.total_ms_sigma,
+                res.p50_ms, res.p90_ms, res.p99_ms, res.requests, res.errors,
+                res.samples_json
+         FROM benchmark_results res
+         JOIN benchmark_runs run ON run.id = res.run_id
+         JOIN benchmarks b ON b.id = run.benchmark_id
+         WHERE res.run_id = ?1 AND b.org_id = ?2
+         ORDER BY res.target_label, res.scenario, res.variant_json",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![run_id, org_id], |row| {
+        Ok(BenchmarkResultRecord {
+            id: row.get(0)?,
+            run_id: row.get(1)?,
+            target_id: row.get(2)?,
+            target_label: row.get(3)?,
+            scenario: row.get(4)?,
+            variant_json: row.get(5)?,
+            ttft_ms_mean: row.get(6)?,
+            ttft_ms_sigma: row.get(7)?,
+            prefill_tps_mean: row.get(8)?,
+            prefill_tps_sigma: row.get(9)?,
+            decode_tps_mean: row.get(10)?,
+            decode_tps_sigma: row.get(11)?,
+            total_ms_mean: row.get(12)?,
+            total_ms_sigma: row.get(13)?,
+            p50_ms: row.get(14)?,
+            p90_ms: row.get(15)?,
+            p99_ms: row.get(16)?,
+            requests: row.get::<_, i64>(17)? as u32,
+            errors: row.get::<_, i64>(18)? as u32,
+            samples_json: row.get(19)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Latest runs across all of an org's benchmarks, newest first, paired with
+/// the benchmark name for the dashboard's "recent runs" list.
+pub fn list_recent_benchmark_runs(
+    pool: &DbPool,
+    org_id: &str,
+    limit: u32,
+) -> Result<Vec<(BenchmarkRunRecord, String)>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT r.id, r.benchmark_id, r.started_at, r.finished_at, r.status, r.error,
+                r.engine_meta_json, b.name
+         FROM benchmark_runs r
+         JOIN benchmarks b ON b.id = r.benchmark_id
+         WHERE b.org_id = ?1
+         ORDER BY r.started_at DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![org_id, limit], |row| {
+        Ok((read_benchmark_run_row(row)?, row.get::<_, String>(7)?))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod vision_model_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn fresh_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("cannot build test DB")
+    }
+
+    fn valid_row(name: &str) -> VisionModelRow {
+        VisionModelRow {
+            model_name: name.to_string(),
+            op: "detect".to_string(),
+            file_name: format!("{name}.onnx"),
+            sha256: "a".repeat(64),
+            classes_json: r#"["tablica-adr","rejestracja"]"#.to_string(),
+            preprocess_json: r#"{"resolution":560}"#.to_string(),
+            output_contract: "rfdetr".to_string(),
+            source: "trained".to_string(),
+            default_threshold: Some(0.4),
+            org_id: crate::services::org::DEFAULT_ORG_ID.to_string(),
+            project_id: Some("proj-1".to_string()),
+            source_model_id: Some("mlmodel-1".to_string()),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn validate(row: &VisionModelRow) -> std::result::Result<(), String> {
+        validate_vision_model_fields(
+            &row.model_name,
+            &row.op,
+            &row.file_name,
+            &row.sha256,
+            &row.classes_json,
+            &row.preprocess_json,
+            &row.output_contract,
+            &row.source,
+        )
+    }
+
+    #[test]
+    fn validation_accepts_supported_contracts() {
+        assert!(validate(&valid_row("adr-v2")).is_ok());
+        let mut cls = valid_row("stan-v1");
+        cls.op = "classify".to_string();
+        cls.output_contract = "softmax".to_string();
+        assert!(validate(&cls).is_ok());
+    }
+
+    /// v1 supports detect/rfdetr and classify/softmax only; ocr stays on the
+    /// fixed engines and embed has no CameraCvOp variant yet.
+    #[test]
+    fn validation_rejects_unsupported_ops_and_contracts() {
+        let mut row = valid_row("m1");
+        row.op = "ocr".to_string();
+        assert!(validate(&row).unwrap_err().contains("ocr"));
+        row.op = "embed".to_string();
+        assert!(validate(&row).unwrap_err().contains("embed"));
+        row.op = "detect".to_string();
+        row.output_contract = "softmax".to_string();
+        assert!(validate(&row).is_err());
+        row.op = "classify".to_string();
+        row.output_contract = "rfdetr".to_string();
+        assert!(validate(&row).is_err());
+    }
+
+    /// file_name is joined onto vision_models_dir() — path traversal and
+    /// separators must be refused before anything touches the filesystem.
+    #[test]
+    fn validation_rejects_traversing_file_names() {
+        for bad in [
+            "../evil.onnx",
+            "sub/dir.onnx",
+            "..\\evil.onnx",
+            ".hidden.onnx",
+            "model.bin",
+            "",
+        ] {
+            let mut row = valid_row("m1");
+            row.file_name = bad.to_string();
+            assert!(validate(&row).is_err(), "file_name '{bad}' must be refused");
+        }
+    }
+
+    #[test]
+    fn validation_rejects_bad_names_hashes_and_json() {
+        let mut row = valid_row("m1");
+        row.model_name = "Bad Name!".to_string();
+        assert!(validate(&row).is_err());
+        let mut row = valid_row("m1");
+        row.sha256 = "zz".to_string();
+        assert!(validate(&row).is_err());
+        let mut row = valid_row("m1");
+        row.classes_json = "[]".to_string();
+        assert!(validate(&row).is_err());
+        let mut row = valid_row("m1");
+        row.preprocess_json = "not-json".to_string();
+        assert!(validate(&row).is_err());
+        let mut row = valid_row("m1");
+        row.source = "downloaded".to_string();
+        assert!(validate(&row).is_err());
+    }
+
+    #[test]
+    fn register_get_delete_round_trip() {
+        let db = fresh_db();
+        let row = valid_row("adr-v2");
+        register_vision_model(&db, &row, None).expect("register");
+        let got = get_vision_model(&db, "adr-v2").unwrap().expect("row exists");
+        assert_eq!(got.op, "detect");
+        assert_eq!(got.default_threshold, Some(0.4));
+        // Upsert updates in place (new hash), no duplicate row.
+        let mut updated = row.clone();
+        updated.sha256 = "b".repeat(64);
+        register_vision_model(&db, &updated, None).expect("upsert");
+        let rows = list_vision_models(&db, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sha256, "b".repeat(64));
+
+        let deleted = delete_vision_model(&db, "adr-v2", None).expect("delete");
+        assert_eq!(deleted.file_name, "adr-v2.onnx");
+        assert!(get_vision_model(&db, "adr-v2").unwrap().is_none());
+    }
+
+    /// P2-2 bounds: oversized class lists / blobs and out-of-range preprocess
+    /// values must be refused by the repository validator (single source of
+    /// truth for local registration AND the sync materializer).
+    #[test]
+    fn validation_enforces_size_and_range_bounds() {
+        let mut row = valid_row("m1");
+        let many: Vec<String> = (0..513).map(|i| format!("c{i}")).collect();
+        row.classes_json = serde_json::to_string(&many).unwrap();
+        assert!(validate(&row).unwrap_err().contains("max 512"));
+
+        let mut row = valid_row("m1");
+        row.classes_json = format!("[\"{}\"]", "x".repeat(200));
+        assert!(validate(&row).unwrap_err().contains("class names"));
+
+        let mut row = valid_row("m1");
+        row.preprocess_json = format!("{{\"resolution\":560,\"pad\":\"{}\"}}", "y".repeat(5000));
+        assert!(validate(&row).unwrap_err().contains("4 KiB"));
+
+        let mut row = valid_row("m1");
+        row.preprocess_json = r#"{"resolution":16}"#.to_string();
+        assert!(validate(&row).unwrap_err().contains("out of range"));
+
+        let mut row = valid_row("m1");
+        row.preprocess_json = r#"{"resolution":8192}"#.to_string();
+        assert!(validate(&row).unwrap_err().contains("out of range"));
+
+        let mut row = valid_row("m1");
+        row.preprocess_json = r#"{"resolution":560,"layout":"nhwc"}"#.to_string();
+        assert!(validate(&row).unwrap_err().contains("nchw"));
+
+        let mut row = valid_row("m1");
+        row.preprocess_json = r#"{"mean":[0.5,0.5,0.5]}"#.to_string();
+        assert!(validate(&row).unwrap_err().contains("resolution"));
+    }
+
+    /// P1-3: the publish alias is written in the SAME transaction as the
+    /// registry row — after register-with-alias the alias exists, targets the
+    /// model and blocks its deletion; retarget preserves strategy/fallbacks.
+    #[test]
+    fn register_with_alias_is_atomic_and_blocks_delete() {
+        let db = fresh_db();
+        register_vision_model(&db, &valid_row("adr-v2"), Some("pub-alias"))
+            .expect("register with alias");
+        let alias = list_model_aliases(&db)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.alias == "pub-alias")
+            .expect("alias created");
+        assert_eq!(alias.target_model, "adr-v2");
+        assert!(alias.is_active);
+
+        let err = delete_vision_model(&db, "adr-v2", None).unwrap_err();
+        assert!(err.to_string().contains("pub-alias"), "{err}");
+
+        // Retarget: publish a second model under the same alias; strategy and
+        // fallback list of the existing alias row must survive.
+        let conn = acquire(&db).unwrap();
+        conn.execute(
+            "UPDATE model_aliases SET strategy = 'round_robin' WHERE alias = 'pub-alias'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        register_vision_model(&db, &valid_row("adr-v3"), Some("pub-alias"))
+            .expect("retarget alias");
+        let alias = list_model_aliases(&db)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.alias == "pub-alias")
+            .unwrap();
+        assert_eq!(alias.target_model, "adr-v3");
+        assert_eq!(alias.strategy.as_deref(), Some("round_robin"));
+        // The old model is deletable again, the new one is blocked.
+        delete_vision_model(&db, "adr-v2", None).expect("old model deletable");
+        assert!(delete_vision_model(&db, "adr-v3", None).is_err());
+    }
+
+    /// Deleting a model still targeted by an alias (primary or fallback) must
+    /// be refused so pipelines referencing the alias keep a backing model.
+    #[test]
+    fn delete_refused_while_alias_targets_model() {
+        let db = fresh_db();
+        register_vision_model(&db, &valid_row("adr-v2"), None).expect("register");
+        crate::services::models::create_alias(&db, "test-vision-alias", "adr-v2", None, None)
+            .expect("alias");
+        let err = delete_vision_model(&db, "adr-v2", None).unwrap_err();
+        assert!(err.to_string().contains("test-vision-alias"), "{err}");
+
+        // Fallback reference blocks too.
+        register_vision_model(&db, &valid_row("stanik"), None).expect("register 2");
+        crate::services::models::create_alias(
+            &db,
+            "alias-fb",
+            "adr-v2",
+            None,
+            Some(r#"["stanik"]"#),
+        )
+        .expect("alias with fallback");
+        let err = delete_vision_model(&db, "stanik", None).unwrap_err();
+        assert!(err.to_string().contains("alias-fb"), "{err}");
     }
 }

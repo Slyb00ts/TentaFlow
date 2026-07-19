@@ -282,9 +282,14 @@ def _format_record(record: dict[str, Any], tokenizer) -> str:  # noqa: ANN001
             )
         return "\n".join(f"{m.get('role', '')}: {m.get('content', '')}" for m in messages)
 
-    if "prompt" in record and "response" in record:
-        prompt = record["prompt"]
-        response = record["response"]
+    # prompt+response ORAZ question+answer (format datasetu destylacji ML Studio) —
+    # oba mapuja sie na pare user/assistant (chat template gdy dostepny).
+    pr_keys = ("prompt", "response") if ("prompt" in record and "response" in record) else None
+    if pr_keys is None and "question" in record and "answer" in record:
+        pr_keys = ("question", "answer")
+    if pr_keys is not None:
+        prompt = record[pr_keys[0]]
+        response = record[pr_keys[1]]
         if getattr(tokenizer, "chat_template", None):
             return tokenizer.apply_chat_template(
                 [
@@ -297,7 +302,8 @@ def _format_record(record: dict[str, Any], tokenizer) -> str:  # noqa: ANN001
         return f"{prompt}\n{response}"
 
     raise ValueError(
-        "record must contain one of: 'text', 'prompt'+'response', or 'messages'"
+        "record must contain one of: 'text', 'prompt'+'response', "
+        "'question'+'answer', or 'messages'"
     )
 
 
@@ -487,8 +493,8 @@ def _run_dpo(req: TrainRequest, job_id: str) -> str:
 def _to_messages(record: dict[str, Any]) -> dict[str, Any]:
     """Mapuje rekord {prompt,response} na format konwersacyjny `messages`
     wymagany przez DataCollatorForChatML (GKD). Brak response → sama tura usera."""
-    prompt = record.get("prompt") or record.get("text") or ""
-    response = record.get("response") or record.get("completion") or ""
+    prompt = record.get("prompt") or record.get("question") or record.get("text") or ""
+    response = record.get("response") or record.get("answer") or record.get("completion") or ""
     messages = [{"role": "user", "content": prompt}]
     if response:
         messages.append({"role": "assistant", "content": response})

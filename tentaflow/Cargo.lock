@@ -5083,6 +5083,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "gstreamer-video"
+version = "0.25.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7907cb8a73edc98cf279e5de7370bb2c245b7bedf623ba8c7e59648cd4739133"
+dependencies = [
+ "cfg-if",
+ "futures-channel",
+ "glib",
+ "gstreamer",
+ "gstreamer-base",
+ "gstreamer-video-sys",
+ "libc",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "gstreamer-video-sys"
+version = "0.25.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94f6753d53c9a5e274f33441bee2c7dabef82edefb39605b75c834d24af89e7e"
+dependencies = [
+ "glib-sys",
+ "gobject-sys",
+ "gstreamer-base-sys",
+ "gstreamer-sys",
+ "libc",
+ "system-deps",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11561,6 +11591,7 @@ dependencies = [
  "ciborium",
  "core-foundation 0.10.1",
  "cozo",
+ "crossbeam-channel",
  "csv",
  "dashmap 6.2.1",
  "dirs 6.0.0",
@@ -11572,6 +11603,7 @@ dependencies = [
  "getrandom 0.4.3",
  "gstreamer",
  "gstreamer-app",
+ "gstreamer-video",
  "handlebars",
  "hex",
  "hf-hub",

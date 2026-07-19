@@ -44,7 +44,7 @@ pub(crate) fn dispatch_error_to_core(
             model,
         } => crate::error::CoreError::InternalError {
             message: format!(
-                "synthetic dispatch unsupported for service_type='{service_type}', model='{model}'"
+                "direct dispatch unsupported for service_type='{service_type}', model='{model}'"
             ),
             source: None,
         },

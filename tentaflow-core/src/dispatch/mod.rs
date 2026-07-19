@@ -26,6 +26,7 @@ pub type HandlerDispatchFn = for<'a> fn(&'a MessageBody, &'a HandlerContext) -> 
 pub mod addon_document_upload;
 pub mod addon_perm_broadcast;
 pub mod audit_broadcast;
+pub mod benchmark;
 #[cfg(feature = "camera")]
 pub mod camera_admin;
 #[cfg(feature = "camera")]
@@ -37,6 +38,7 @@ pub mod meeting_live_broadcast;
 pub mod mesh_write_handlers;
 pub mod metrics;
 pub mod ml_studio;
+pub mod model_metrics;
 pub mod recorder;
 pub mod resume_token;
 pub mod robots;
@@ -50,6 +52,7 @@ pub mod system_event_broadcast;
 pub mod token_usage;
 pub mod ui_cbor_broadcast;
 pub mod ui_channel;
+pub mod vision_import;
 
 pub use state::AppState;
 
@@ -318,6 +321,18 @@ fn is_sensitive_variant(body: &MessageBody) -> bool {
     if matches!(
         body,
         MessageBody::CameraAdminBody(tentaflow_protocol::CameraAdminPayload::FrameUrlResponse(_))
+    ) {
+        return true;
+    }
+    // VisionImportBody fetch/import requests carry a plaintext `api_key` used to
+    // pull a model bundle from an unpaired instance. With `TENTAFLOW_TRACE_WSS=1`
+    // an attacker reading trace logs could lift the key.
+    if matches!(
+        body,
+        MessageBody::VisionImportBody(
+            tentaflow_protocol::VisionImportPayload::FetchManifestRequest(_)
+                | tentaflow_protocol::VisionImportPayload::ImportRequest(_)
+        )
     ) {
         return true;
     }
@@ -615,6 +630,36 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MlStudioPayload::DatasetProfileResponse(_) => {
                 "MlStudioDatasetProfileResponse"
             }
+            tentaflow_protocol::MlStudioPayload::DatasetRowsRequest(_) => {
+                "MlStudioDatasetRowsRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetRowsResponse(_) => {
+                "MlStudioDatasetRowsResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetRowsSaveRequest(_) => {
+                "MlStudioDatasetRowsSaveRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::DatasetRowsSaveResponse(_) => {
+                "MlStudioDatasetRowsSaveResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::VisionModelPublishRequest(_) => {
+                "MlStudioVisionModelPublishRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::VisionModelPublishResponse(_) => {
+                "MlStudioVisionModelPublishResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::VisionModelsListRequest(_) => {
+                "MlStudioVisionModelsListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::VisionModelsListResponse(_) => {
+                "MlStudioVisionModelsListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::VisionModelDeleteRequest(_) => {
+                "MlStudioVisionModelDeleteRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::VisionModelDeleteResponse(_) => {
+                "MlStudioVisionModelDeleteResponse"
+            }
             tentaflow_protocol::MlStudioPayload::TabularTrainRequest(_) => {
                 "MlStudioTabularTrainRequest"
             }
@@ -651,6 +696,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MlStudioPayload::TrainingRunsListResponse(_) => {
                 "MlStudioTrainingRunsListResponse"
             }
+            tentaflow_protocol::MlStudioPayload::JobsOverviewRequest(_) => {
+                "MlStudioJobsOverviewRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::JobsOverviewResponse(_) => {
+                "MlStudioJobsOverviewResponse"
+            }
             tentaflow_protocol::MlStudioPayload::ModelsListRequest(_) => {
                 "MlStudioModelsListRequest"
             }
@@ -668,6 +719,18 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             }
             tentaflow_protocol::MlStudioPayload::FtTrainStartResponse(_) => {
                 "MlStudioFtTrainStartResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::DistillGenerateRequest(_) => {
+                "MlStudioDistillGenerateRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::DistillGenerateResponse(_) => {
+                "MlStudioDistillGenerateResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::DistillGenerateStatusRequest(_) => {
+                "MlStudioDistillGenerateStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::DistillGenerateStatusResponse(_) => {
+                "MlStudioDistillGenerateStatusResponse"
             }
             tentaflow_protocol::MlStudioPayload::FtTrainStatusRequest(_) => {
                 "MlStudioFtTrainStatusRequest"
@@ -698,6 +761,18 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             }
             tentaflow_protocol::MlStudioPayload::RecogTrainStatusResponse(_) => {
                 "MlStudioRecogTrainStatusResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ClassifierTrainStartRequest(_) => {
+                "MlStudioClassifierTrainStartRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ClassifierTrainStartResponse(_) => {
+                "MlStudioClassifierTrainStartResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::GenericTrainStatusRequest(_) => {
+                "MlStudioGenericTrainStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::GenericTrainStatusResponse(_) => {
+                "MlStudioGenericTrainStatusResponse"
             }
             tentaflow_protocol::MlStudioPayload::RecogDatasetRegisterRequest(_) => {
                 "MlStudioRecogDatasetRegisterRequest"
@@ -895,22 +970,6 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::PromptListResponse { .. } => "PromptListResponse",
         MessageBody::PromptDetailRequest { .. } => "PromptDetailRequest",
         MessageBody::PromptDetailResponse(_) => "PromptDetailResponse",
-        MessageBody::NotesRequestBody(r) => match r {
-            tentaflow_protocol::NotesRequest::List(_) => "NotesListRequest",
-            tentaflow_protocol::NotesRequest::Detail(_) => "NoteDetailRequest",
-            tentaflow_protocol::NotesRequest::Create(_) => "NoteCreateRequest",
-            tentaflow_protocol::NotesRequest::Update(_) => "NoteUpdateRequest",
-            tentaflow_protocol::NotesRequest::SetPinned(_) => "NoteSetPinnedRequest",
-            tentaflow_protocol::NotesRequest::Delete(_) => "NoteDeleteRequest",
-        },
-        MessageBody::NotesResponseBody(r) => match r {
-            tentaflow_protocol::NotesResponse::List(_) => "NotesListResponse",
-            tentaflow_protocol::NotesResponse::Detail(_) => "NoteDetailResponse",
-            tentaflow_protocol::NotesResponse::Create(_) => "NoteCreateResponse",
-            tentaflow_protocol::NotesResponse::Update(_) => "NoteUpdateResponse",
-            tentaflow_protocol::NotesResponse::SetPinned(_) => "NoteSetPinnedResponse",
-            tentaflow_protocol::NotesResponse::Delete(_) => "NoteDeleteResponse",
-        },
         MessageBody::DeploymentBody(p) => match p {
             tentaflow_protocol::DeploymentPayload::ReqStart(_) => "ServiceManifestDeployRequest",
             tentaflow_protocol::DeploymentPayload::ResStart(_) => "ServiceManifestDeployResponse",
@@ -1422,6 +1481,87 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             }
             tentaflow_protocol::TokenUsagePayload::CoordinatorStatusResponse { .. } => {
                 "TokenCoordinatorStatusResponse"
+            }
+        },
+        MessageBody::ModelMetricsBody(p) => match p {
+            tentaflow_protocol::ModelMetricsPayload::SummaryRequest { .. } => {
+                "ModelMetricsSummaryRequest"
+            }
+            tentaflow_protocol::ModelMetricsPayload::SummaryResponse { .. } => {
+                "ModelMetricsSummaryResponse"
+            }
+            tentaflow_protocol::ModelMetricsPayload::NodeServiceRequest { .. } => {
+                "ModelMetricsNodeServiceRequest"
+            }
+            tentaflow_protocol::ModelMetricsPayload::NodeServiceResponse { .. } => {
+                "ModelMetricsNodeServiceResponse"
+            }
+            tentaflow_protocol::ModelMetricsPayload::PricingGet => "ModelMetricsPricingGet",
+            tentaflow_protocol::ModelMetricsPayload::PricingList { .. } => "ModelMetricsPricingList",
+            tentaflow_protocol::ModelMetricsPayload::PricingSet { .. } => "ModelMetricsPricingSet",
+            tentaflow_protocol::ModelMetricsPayload::PricingSetResult { .. } => {
+                "ModelMetricsPricingSetResult"
+            }
+        },
+        MessageBody::BenchmarkBody(p) => match p {
+            tentaflow_protocol::BenchmarkPayload::ListRequest => "BenchmarkListRequest",
+            tentaflow_protocol::BenchmarkPayload::ListResponse { .. } => "BenchmarkListResponse",
+            tentaflow_protocol::BenchmarkPayload::GetRequest { .. } => "BenchmarkGetRequest",
+            tentaflow_protocol::BenchmarkPayload::GetResponse { .. } => "BenchmarkGetResponse",
+            tentaflow_protocol::BenchmarkPayload::SaveRequest { .. } => "BenchmarkSaveRequest",
+            tentaflow_protocol::BenchmarkPayload::SaveResponse { .. } => "BenchmarkSaveResponse",
+            tentaflow_protocol::BenchmarkPayload::DeleteRequest { .. } => "BenchmarkDeleteRequest",
+            tentaflow_protocol::BenchmarkPayload::DeleteResult { .. } => "BenchmarkDeleteResult",
+            tentaflow_protocol::BenchmarkPayload::StartRunRequest { .. } => {
+                "BenchmarkStartRunRequest"
+            }
+            tentaflow_protocol::BenchmarkPayload::StartRunResponse { .. } => {
+                "BenchmarkStartRunResponse"
+            }
+            tentaflow_protocol::BenchmarkPayload::RunStatusRequest { .. } => {
+                "BenchmarkRunStatusRequest"
+            }
+            tentaflow_protocol::BenchmarkPayload::RunStatusResponse { .. } => {
+                "BenchmarkRunStatusResponse"
+            }
+            tentaflow_protocol::BenchmarkPayload::RunResultsRequest { .. } => {
+                "BenchmarkRunResultsRequest"
+            }
+            tentaflow_protocol::BenchmarkPayload::RunResultsResponse { .. } => {
+                "BenchmarkRunResultsResponse"
+            }
+            tentaflow_protocol::BenchmarkPayload::ListRunsRequest { .. } => {
+                "BenchmarkListRunsRequest"
+            }
+            tentaflow_protocol::BenchmarkPayload::ListRunsResponse { .. } => {
+                "BenchmarkListRunsResponse"
+            }
+            tentaflow_protocol::BenchmarkPayload::RecentRunsRequest => "BenchmarkRecentRunsRequest",
+            tentaflow_protocol::BenchmarkPayload::RecentRunsResponse { .. } => {
+                "BenchmarkRecentRunsResponse"
+            }
+            tentaflow_protocol::BenchmarkPayload::CancelRunRequest { .. } => {
+                "BenchmarkCancelRunRequest"
+            }
+            tentaflow_protocol::BenchmarkPayload::CancelRunResult { .. } => {
+                "BenchmarkCancelRunResult"
+            }
+            tentaflow_protocol::BenchmarkPayload::RunStreamRequest { .. } => {
+                "BenchmarkRunStreamRequest"
+            }
+            tentaflow_protocol::BenchmarkPayload::RunStreamChunk { .. } => "BenchmarkRunStreamChunk",
+            tentaflow_protocol::BenchmarkPayload::RunStreamEnd { .. } => "BenchmarkRunStreamEnd",
+        },
+        MessageBody::VisionImportBody(p) => match p {
+            tentaflow_protocol::VisionImportPayload::FetchManifestRequest(_) => {
+                "VisionImportFetchManifestRequest"
+            }
+            tentaflow_protocol::VisionImportPayload::FetchManifestResponse(_) => {
+                "VisionImportFetchManifestResponse"
+            }
+            tentaflow_protocol::VisionImportPayload::ImportRequest(_) => "VisionImportModelRequest",
+            tentaflow_protocol::VisionImportPayload::ImportResponse(_) => {
+                "VisionImportModelResponse"
             }
         },
     }

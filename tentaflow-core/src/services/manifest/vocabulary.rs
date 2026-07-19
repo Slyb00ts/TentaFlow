@@ -15,6 +15,7 @@ pub const VALID_SERVICE_SURFACES: &[&str] = &[
     "documents",
     "agents",
     "depth",
+    "camera_cv",
 ];
 pub const VALID_INPUT_MODALITIES: &[&str] = &["text", "image", "audio"];
 pub const VALID_OUTPUT_MODALITIES: &[&str] = &["text", "audio", "embedding", "image"];

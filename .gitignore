@@ -22,6 +22,14 @@ bin/
 *.wasm
 plans/*
 
+# wasm-bindgen JS glue generowany przez tentaflow-core/build.rs (jak native-libs:
+# tylko zrodlo w repo, artefakt budowany lokalnie). Hashe shimow sa losowane per
+# build, wiec commitowanie tych plikow powodowalo konflikt na kazdym pull/rebase.
+tentaflow-core/www/js/voxel/voxel_glue.js
+tentaflow-core/www/js/protocol/wasm_glue.js
+tentaflow-core/www/js/protocol/wasm_glue.d.ts
+tentaflow-core/www/js/protocol/wasm_glue_bg.wasm.d.ts
+
 # Swift Package Manager + xcodebuild (mlx-swift bridge build outputs)
 .build/
 build-xcode/
@@ -209,8 +217,9 @@ vendor/crates/*/llama.cpp/
 /native-libs/*
 !/native-libs/README.md
 
-# Notatki robocze — nie wysylamy do remote
-notes/
+# Notatki robocze — nie wysylamy do remote (tylko katalog w korzeniu repo,
+# NIE tentaflow-core/addons/notes)
+/notes/
 
 # Codex CLI session state — lokalne
 .context/
@@ -222,3 +231,6 @@ tests/e2e/package-lock.json
 # Reference checkouts for harness analysis (not part of the project)
 hermes-agent/
 thirparty/
+
+# Poufne nagrania klienta — NIE commitować (tylko lokalnie do testow rtsp-sim)
+/tools/rtsp-sim/clips/

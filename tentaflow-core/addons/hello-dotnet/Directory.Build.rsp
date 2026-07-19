@@ -1,0 +1,2 @@
+-p:IlcLlvmTarget=wasm32-unknown-wasip1
+-p:LinkerFlavor=lld

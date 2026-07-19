@@ -1,10 +1,12 @@
 # =============================================================================
 # Plik: reranker/_services/jina-rerank-mlx.toml
-# Opis: Reranker jina-reranker-v3 (MLX) na Apple Silicon — python-bundle z
-#       serwerem /v1/rerank. server.py sciaga repo `jina-reranker-v3-mlx`
-#       (natywny port MLX, 100% zgodnosc score z oryginalem) i woła jego
-#       `MLXReranker`. Licencja CC-BY-NC-4.0 (niekomercyjna). iOS nie jest
-#       wspierany (python-bundle dziala na macOS).
+# Opis: Reranker jina-reranker-v3 (MLX) na Apple Silicon — EMBEDDED (in-process
+#       przez MLXBridge/mlx-swift, bez portu/pythona). Backbone Qwen3 ladowany
+#       przez load_embedder_model do osobnego rerankerContainer, projector.safetensors
+#       (linear1/linear2) ladowany osobno; score = cosine query<->docs. Serwuje
+#       surface Rerank in-process (rerank_forward + executor + resolver kieruja
+#       embedded handle do mlx_swift_bridge::rerank). Licencja CC-BY-NC-4.0
+#       (niekomercyjna). Dziala na macOS i iOS (mlx-swift).
 # =============================================================================
 
 [engine]
@@ -24,9 +26,9 @@ service_surfaces = ["rerank"]
 input_modalities = ["text"]
 
 [deploy.native]
-platforms = ["macos"]
-runtime = "python-bundle"
-bundle_path = "reranker/python/jina-rerank-mlx"
+platforms = ["macos", "ios"]
+runtime = "embedded"
+feature_flag = "inference-mlx"
 
 [[model_preset]]
 id = "jina-reranker-v3-mlx"

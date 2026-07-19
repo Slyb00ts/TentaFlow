@@ -229,6 +229,7 @@ pub const CARD_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 8, name: "children", wire: "Array<Component>", required: false, default: Some("default") },
         FieldMeta { key: 9, name: "interactive", wire: "bool", required: true, default: None },
         FieldMeta { key: 10, name: "clickable", wire: "bool", required: true, default: None },
+        FieldMeta { key: 11, name: "style", wire: "Option<Inline<BoxStyle>>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -252,6 +253,7 @@ pub const SECTIONCARD_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 11, name: "border", wire: "Inline<BorderToken>", required: true, default: None },
         FieldMeta { key: 12, name: "background", wire: "Enum<BackgroundToken>", required: true, default: None },
         FieldMeta { key: 13, name: "accent", wire: "Option<Enum<Tone>>", required: false, default: None },
+        FieldMeta { key: 14, name: "style", wire: "Option<Inline<BoxStyle>>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -295,6 +297,8 @@ pub const FLEX_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 6, name: "padding", wire: "Option<Enum<Spacing>>", required: false, default: None },
         FieldMeta { key: 7, name: "background", wire: "Option<Enum<BackgroundToken>>", required: false, default: None },
         FieldMeta { key: 8, name: "radius", wire: "Option<Enum<RadiusToken>>", required: false, default: None },
+        FieldMeta { key: 9, name: "style", wire: "Option<Inline<BoxStyle>>", required: false, default: None },
+        FieldMeta { key: 10, name: "responsive", wire: "Option<Array<Inline<ResponsiveRule>>>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -311,6 +315,7 @@ pub const GRID_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 4, name: "children", wire: "Array<Inline<GridChild>>", required: false, default: Some("default") },
         FieldMeta { key: 5, name: "padding", wire: "Option<Enum<Spacing>>", required: false, default: None },
         FieldMeta { key: 6, name: "align_items", wire: "Option<Enum<FlexAlign>>", required: false, default: None },
+        FieldMeta { key: 7, name: "style", wire: "Option<Inline<BoxStyle>>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -325,6 +330,8 @@ pub const STACK_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 2, name: "children", wire: "Array<Component>", required: false, default: Some("default") },
         FieldMeta { key: 3, name: "padding", wire: "Option<Enum<Spacing>>", required: false, default: None },
         FieldMeta { key: 4, name: "justify", wire: "Option<Enum<FlexJustify>>", required: false, default: None },
+        FieldMeta { key: 5, name: "style", wire: "Option<Inline<BoxStyle>>", required: false, default: None },
+        FieldMeta { key: 6, name: "responsive", wire: "Option<Array<Inline<ResponsiveRule>>>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -355,6 +362,9 @@ pub const SPLIT_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 4, name: "resizable", wire: "bool", required: true, default: None },
         FieldMeta { key: 5, name: "primary_slot", wire: "tstr", required: true, default: None },
         FieldMeta { key: 6, name: "secondary_slot", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 7, name: "collapse_below", wire: "Option<Enum<Breakpoint>>", required: false, default: None },
+        FieldMeta { key: 8, name: "divider", wire: "Option<Enum<SplitDivider>>", required: false, default: None },
+        FieldMeta { key: 9, name: "grow", wire: "Option<bool>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -386,6 +396,12 @@ pub const BOX_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 3, name: "padding", wire: "Option<Enum<Spacing>>", required: false, default: None },
         FieldMeta { key: 4, name: "margin", wire: "Option<Enum<Spacing>>", required: false, default: None },
         FieldMeta { key: 5, name: "children", wire: "Array<Component>", required: false, default: Some("default") },
+        FieldMeta { key: 6, name: "style", wire: "Option<Inline<BoxStyle>>", required: false, default: None },
+        FieldMeta { key: 7, name: "direction", wire: "Option<Enum<FlexDirection>>", required: false, default: None },
+        FieldMeta { key: 8, name: "gap", wire: "Option<Enum<Spacing>>", required: false, default: None },
+        FieldMeta { key: 9, name: "align", wire: "Option<Enum<FlexAlign>>", required: false, default: None },
+        FieldMeta { key: 10, name: "justify", wire: "Option<Enum<FlexJustify>>", required: false, default: None },
+        FieldMeta { key: 11, name: "responsive", wire: "Option<Array<Inline<ResponsiveRule>>>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -639,6 +655,7 @@ pub const CHIP_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 4, name: "avatar", wire: "Option<Inline<AvatarRef>>", required: false, default: None },
         FieldMeta { key: 5, name: "selected", wire: "Option<BindRef>", required: false, default: None },
         FieldMeta { key: 6, name: "removable", wire: "bool", required: true, default: None },
+        FieldMeta { key: 7, name: "dot", wire: "Option<Enum<Tone>>", required: false, default: None },
     ],
     handlers: &["click", "remove"],
 };
@@ -731,6 +748,7 @@ pub const PROGRESSBAR_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 4, name: "show_label", wire: "bool", required: true, default: None },
         FieldMeta { key: 5, name: "label", wire: "Option<BindRef>", required: false, default: None },
         FieldMeta { key: 6, name: "size", wire: "Enum<ProgressSize>", required: true, default: None },
+        FieldMeta { key: 7, name: "orientation", wire: "Option<Enum<ProgressOrientation>>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -945,6 +963,7 @@ pub const TEXT_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 4, name: "wrap", wire: "Option<Enum<TextWrap>>", required: false, default: None },
         FieldMeta { key: 5, name: "max_lines", wire: "Option<u8>", required: false, default: None },
         FieldMeta { key: 6, name: "format", wire: "Option<Inline<ValueFormat>>", required: false, default: None },
+        FieldMeta { key: 7, name: "streaming", wire: "Option<BindRef>", required: false, default: None },
     ],
     handlers: &[],
 };
@@ -1222,6 +1241,7 @@ pub const INPUT_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 16, name: "readonly", wire: "Option<BindRef>", required: false, default: None },
         FieldMeta { key: 17, name: "error", wire: "Option<BindRef>", required: false, default: None },
         FieldMeta { key: 18, name: "size", wire: "Enum<InputSize>", required: true, default: None },
+        FieldMeta { key: 19, name: "variant", wire: "Option<Enum<InputVariant>>", required: false, default: None },
     ],
     handlers: &["input", "change", "submit", "focus", "blur"],
 };
@@ -1246,6 +1266,7 @@ pub const TEXTAREA_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 12, name: "autoresize", wire: "bool", required: true, default: None },
         FieldMeta { key: 13, name: "max_rows", wire: "Option<u8>", required: false, default: None },
         FieldMeta { key: 14, name: "monospace", wire: "bool", required: true, default: None },
+        FieldMeta { key: 15, name: "variant", wire: "Option<Enum<InputVariant>>", required: false, default: None },
     ],
     handlers: &["input", "change", "focus", "blur"],
 };
@@ -1438,18 +1459,15 @@ pub const COMBOBOX_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 1, name: "options", wire: "Array<Inline<SelectOption>>", required: true, default: None },
         FieldMeta { key: 2, name: "placeholder", wire: "Option<BindRef>", required: false, default: None },
         FieldMeta { key: 3, name: "label", wire: "Option<BindRef>", required: false, default: None },
-        // §5 0x0305: searchable always true — the Rust encoder hardcodes it
-        // at key 4 and the JS renderer enforces it; later keys follow.
-        FieldMeta { key: 4, name: "searchable", wire: "bool", required: true, default: None },
-        FieldMeta { key: 5, name: "clearable", wire: "bool", required: true, default: None },
-        FieldMeta { key: 6, name: "virtualize", wire: "bool", required: true, default: None },
-        FieldMeta { key: 7, name: "disabled", wire: "Option<BindRef>", required: false, default: None },
-        FieldMeta { key: 8, name: "size", wire: "Enum<InputSize>", required: true, default: None },
-        FieldMeta { key: 9, name: "groups", wire: "Option<Array<Inline<SelectGroup>>>", required: false, default: None },
-        FieldMeta { key: 10, name: "free_input", wire: "bool", required: true, default: None },
-        FieldMeta { key: 11, name: "min_search_chars", wire: "u8", required: true, default: None },
-        FieldMeta { key: 12, name: "remote_search", wire: "bool", required: true, default: None },
-        FieldMeta { key: 13, name: "remote_action_id", wire: "Option<tstr>", required: false, default: None },
+        FieldMeta { key: 4, name: "clearable", wire: "bool", required: true, default: None },
+        FieldMeta { key: 5, name: "virtualize", wire: "bool", required: true, default: None },
+        FieldMeta { key: 6, name: "disabled", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 7, name: "size", wire: "Enum<InputSize>", required: true, default: None },
+        FieldMeta { key: 8, name: "groups", wire: "Option<Array<Inline<SelectGroup>>>", required: false, default: None },
+        FieldMeta { key: 9, name: "free_input", wire: "bool", required: true, default: None },
+        FieldMeta { key: 10, name: "min_search_chars", wire: "u8", required: true, default: None },
+        FieldMeta { key: 11, name: "remote_search", wire: "bool", required: true, default: None },
+        FieldMeta { key: 12, name: "remote_action_id", wire: "Option<tstr>", required: false, default: None },
     ],
     handlers: &["change", "input"],
 };
@@ -1862,6 +1880,7 @@ pub const MODAL_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 5, name: "dismissible", wire: "bool", required: true, default: None },
         FieldMeta { key: 6, name: "prevent_scroll", wire: "bool", required: true, default: None },
         FieldMeta { key: 7, name: "closable", wire: "bool", required: true, default: None },
+        FieldMeta { key: 8, name: "icon", wire: "Option<Inline<IconRef>>", required: false, default: None },
     ],
     handlers: &["close"],
 };
@@ -2056,6 +2075,24 @@ pub const AUDIO_SCHEMA: ComponentMeta = ComponentMeta {
         FieldMeta { key: 4, name: "variant", wire: "Enum<AudioVariant>", required: true, default: None },
     ],
     handlers: &["play", "pause", "ended"],
+};
+
+pub const AUDIOCAPTURE_SCHEMA: ComponentMeta = ComponentMeta {
+    tag: 0x0612,
+    name: "AudioCapture",
+    section: section::SPECIALIZED,
+    fields: &[
+        FieldMeta { key: 0, name: "action_id", wire: "tstr", required: true, default: None },
+        FieldMeta { key: 1, name: "mode", wire: "Enum<AudioCaptureMode>", required: true, default: None },
+        FieldMeta { key: 2, name: "silence_ms", wire: "Option<u16>", required: false, default: None },
+        FieldMeta { key: 3, name: "min_speech_ms", wire: "Option<u16>", required: false, default: None },
+        FieldMeta { key: 4, name: "language_hint", wire: "Option<tstr>", required: false, default: None },
+        FieldMeta { key: 5, name: "recording_path", wire: "Option<StatePath>", required: false, default: None },
+        FieldMeta { key: 6, name: "disabled", wire: "Option<BindRef>", required: false, default: None },
+        FieldMeta { key: 7, name: "active_path", wire: "Option<StatePath>", required: false, default: None },
+        FieldMeta { key: 8, name: "variant", wire: "Option<Enum<AudioCaptureVariant>>", required: false, default: None },
+    ],
+    handlers: &[],
 };
 
 pub const FPSCOUNTER_SCHEMA: ComponentMeta = ComponentMeta {
@@ -2269,6 +2306,7 @@ pub const ALL_COMPONENTS: &[&ComponentMeta] = &[
     &VIDEOSTREAM_SCHEMA,
     &LIVECAMERATILE_SCHEMA,
     &AUDIO_SCHEMA,
+    &AUDIOCAPTURE_SCHEMA,
     &FPSCOUNTER_SCHEMA,
     &STOPWATCH_SCHEMA,
     &CODEEDITOR_SCHEMA,
@@ -2360,6 +2398,7 @@ pub const TEXTSTYLE_ENUM: EnumMeta = EnumMeta {
         ("Body", "body"),
         ("BodyStrong", "body_strong"),
         ("Caption", "caption"),
+        ("CaptionStrong", "caption_strong"),
         ("Overline", "overline"),
         ("Code", "code"),
         ("Mono", "mono"),
@@ -2409,6 +2448,24 @@ pub const SHADOWTOKEN_ENUM: EnumMeta = EnumMeta {
         ("Medium", "medium"),
         ("Elevated", "elevated"),
         ("Floating", "floating"),
+        ("AccentGlow", "accent_glow"),
+    ],
+};
+
+pub const SPLITDIVIDER_ENUM: EnumMeta = EnumMeta {
+    name: "SplitDivider",
+    variants: &[
+        ("Handle", "handle"),
+        ("Line", "line"),
+        ("None", "none"),
+    ],
+};
+
+pub const INPUTVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "InputVariant",
+    variants: &[
+        ("Outlined", "outlined"),
+        ("Ghost", "ghost"),
     ],
 };
 
@@ -3015,6 +3072,14 @@ pub const PROGRESSSIZE_ENUM: EnumMeta = EnumMeta {
     ],
 };
 
+pub const PROGRESSORIENTATION_ENUM: EnumMeta = EnumMeta {
+    name: "ProgressOrientation",
+    variants: &[
+        ("Horizontal", "horizontal"),
+        ("Vertical", "vertical"),
+    ],
+};
+
 pub const RATINGVARIANT_ENUM: EnumMeta = EnumMeta {
     name: "RatingVariant",
     variants: &[
@@ -3491,6 +3556,22 @@ pub const AUDIOVARIANT_ENUM: EnumMeta = EnumMeta {
     ],
 };
 
+pub const AUDIOCAPTUREMODE_ENUM: EnumMeta = EnumMeta {
+    name: "AudioCaptureMode",
+    variants: &[
+        ("PushToTalk", "push_to_talk"),
+        ("Vad", "vad"),
+    ],
+};
+
+pub const AUDIOCAPTUREVARIANT_ENUM: EnumMeta = EnumMeta {
+    name: "AudioCaptureVariant",
+    variants: &[
+        ("Standalone", "standalone"),
+        ("Docked", "docked"),
+    ],
+};
+
 pub const FPSVARIANT_ENUM: EnumMeta = EnumMeta {
     name: "FpsVariant",
     variants: &[
@@ -3558,6 +3639,38 @@ pub const IFRAMEREFERRERPOLICY_ENUM: EnumMeta = EnumMeta {
         ("StrictOrigin", "strict-origin"),
         ("StrictOriginWhenCrossOrigin", "strict-origin-when-cross-origin"),
         ("UnsafeUrl", "unsafe-url"),
+    ],
+};
+
+pub const BORDERCOLOR_ENUM: EnumMeta = EnumMeta {
+    name: "BorderColor",
+    variants: &[
+        ("Default", "default"),
+        ("Hover", "hover"),
+        ("Accent", "accent"),
+        ("Success", "success"),
+        ("Warning", "warning"),
+        ("Danger", "danger"),
+        ("Transparent", "transparent"),
+    ],
+};
+
+pub const BORDERLINESTYLE_ENUM: EnumMeta = EnumMeta {
+    name: "BorderLineStyle",
+    variants: &[
+        ("Solid", "solid"),
+        ("Dashed", "dashed"),
+        ("None", "none"),
+    ],
+};
+
+pub const OVERFLOW_ENUM: EnumMeta = EnumMeta {
+    name: "Overflow",
+    variants: &[
+        ("Visible", "visible"),
+        ("Hidden", "hidden"),
+        ("Auto", "auto"),
+        ("Scroll", "scroll"),
     ],
 };
 
@@ -3835,6 +3948,8 @@ pub const ALL_ENUMS: &[&EnumMeta] = &[
     &TEXTWRAP_ENUM,
     &RADIUSTOKEN_ENUM,
     &SHADOWTOKEN_ENUM,
+    &SPLITDIVIDER_ENUM,
+    &INPUTVARIANT_ENUM,
     &BREAKPOINT_ENUM,
     &ICONSIZE_ENUM,
     &SCROLLBEHAVIOR_ENUM,
@@ -3894,6 +4009,7 @@ pub const ALL_ENUMS: &[&EnumMeta] = &[
     &GAUGEVARIANT_ENUM,
     &PROGRESSVARIANT_ENUM,
     &PROGRESSSIZE_ENUM,
+    &PROGRESSORIENTATION_ENUM,
     &RATINGVARIANT_ENUM,
     &RATINGPRECISION_ENUM,
     &DIFFVARIANT_ENUM,
@@ -3942,6 +4058,8 @@ pub const ALL_ENUMS: &[&EnumMeta] = &[
     &TERMINALTHEME_ENUM,
     &AUDIOCONTROLS_ENUM,
     &AUDIOVARIANT_ENUM,
+    &AUDIOCAPTUREMODE_ENUM,
+    &AUDIOCAPTUREVARIANT_ENUM,
     &FPSVARIANT_ENUM,
     &STOPWATCHVARIANT_ENUM,
     &CAROUSELGESTURES_ENUM,
@@ -3949,6 +4067,9 @@ pub const ALL_ENUMS: &[&EnumMeta] = &[
     &STEPPROGRESSVARIANT_ENUM,
     &IFRAMESANDBOX_ENUM,
     &IFRAMEREFERRERPOLICY_ENUM,
+    &BORDERCOLOR_ENUM,
+    &BORDERLINESTYLE_ENUM,
+    &OVERFLOW_ENUM,
     &LOGVARIANT_ENUM,
     &LOGLEVEL_ENUM,
     &BYTESBASE_ENUM,
@@ -4472,6 +4593,81 @@ pub const INLINECHIP_INLINE: InlineMeta = InlineMeta {
     ],
 };
 
+pub const BORDERSIDE_INLINE: InlineMeta = InlineMeta {
+    name: "BorderSide",
+    fields: &[
+        FieldMeta { key: 0, name: "width_px", wire: "u8", required: true, default: None },
+        FieldMeta { key: 1, name: "color", wire: "Enum<BorderColor>", required: true, default: None },
+        FieldMeta { key: 2, name: "style", wire: "Enum<BorderLineStyle>", required: true, default: None },
+    ],
+};
+
+pub const EDGEVALUES_INLINE: InlineMeta = InlineMeta {
+    name: "EdgeValues",
+    fields: &[
+        FieldMeta { key: 0, name: "top", wire: "Option<Inline<SpaceValue>>", required: false, default: None },
+        FieldMeta { key: 1, name: "right", wire: "Option<Inline<SpaceValue>>", required: false, default: None },
+        FieldMeta { key: 2, name: "bottom", wire: "Option<Inline<SpaceValue>>", required: false, default: None },
+        FieldMeta { key: 3, name: "left", wire: "Option<Inline<SpaceValue>>", required: false, default: None },
+    ],
+};
+
+pub const BORDEREDGES_INLINE: InlineMeta = InlineMeta {
+    name: "BorderEdges",
+    fields: &[
+        FieldMeta { key: 0, name: "top", wire: "Option<Inline<BorderSide>>", required: false, default: None },
+        FieldMeta { key: 1, name: "right", wire: "Option<Inline<BorderSide>>", required: false, default: None },
+        FieldMeta { key: 2, name: "bottom", wire: "Option<Inline<BorderSide>>", required: false, default: None },
+        FieldMeta { key: 3, name: "left", wire: "Option<Inline<BorderSide>>", required: false, default: None },
+    ],
+};
+
+pub const CORNERVALUES_INLINE: InlineMeta = InlineMeta {
+    name: "CornerValues",
+    fields: &[
+        FieldMeta { key: 0, name: "top_left", wire: "Option<Inline<RadiusValue>>", required: false, default: None },
+        FieldMeta { key: 1, name: "top_right", wire: "Option<Inline<RadiusValue>>", required: false, default: None },
+        FieldMeta { key: 2, name: "bottom_right", wire: "Option<Inline<RadiusValue>>", required: false, default: None },
+        FieldMeta { key: 3, name: "bottom_left", wire: "Option<Inline<RadiusValue>>", required: false, default: None },
+    ],
+};
+
+pub const BOXSTYLE_INLINE: InlineMeta = InlineMeta {
+    name: "BoxStyle",
+    fields: &[
+        FieldMeta { key: 0, name: "margin", wire: "Option<Inline<EdgeValues>>", required: false, default: None },
+        FieldMeta { key: 1, name: "padding", wire: "Option<Inline<EdgeValues>>", required: false, default: None },
+        FieldMeta { key: 2, name: "border", wire: "Option<Inline<BorderEdges>>", required: false, default: None },
+        FieldMeta { key: 3, name: "background", wire: "Option<Enum<BackgroundToken>>", required: false, default: None },
+        FieldMeta { key: 4, name: "radius", wire: "Option<Inline<CornerValues>>", required: false, default: None },
+        FieldMeta { key: 5, name: "width", wire: "Option<Inline<DimensionToken>>", required: false, default: None },
+        FieldMeta { key: 6, name: "height", wire: "Option<Inline<DimensionToken>>", required: false, default: None },
+        FieldMeta { key: 7, name: "min_width", wire: "Option<Inline<DimensionToken>>", required: false, default: None },
+        FieldMeta { key: 8, name: "min_height", wire: "Option<Inline<DimensionToken>>", required: false, default: None },
+        FieldMeta { key: 9, name: "max_width", wire: "Option<Inline<DimensionToken>>", required: false, default: None },
+        FieldMeta { key: 10, name: "max_height", wire: "Option<Inline<DimensionToken>>", required: false, default: None },
+        FieldMeta { key: 11, name: "overflow_x", wire: "Option<Enum<Overflow>>", required: false, default: None },
+        FieldMeta { key: 12, name: "overflow_y", wire: "Option<Enum<Overflow>>", required: false, default: None },
+        FieldMeta { key: 13, name: "shadow", wire: "Option<Enum<ShadowToken>>", required: false, default: None },
+    ],
+};
+
+pub const RESPONSIVERULE_INLINE: InlineMeta = InlineMeta {
+    name: "ResponsiveRule",
+    fields: &[
+        FieldMeta { key: 0, name: "max_width", wire: "Inline<ContainerWidth>", required: true, default: None },
+        FieldMeta { key: 1, name: "direction", wire: "Option<Enum<FlexDirection>>", required: false, default: None },
+        FieldMeta { key: 2, name: "gap", wire: "Option<Enum<Spacing>>", required: false, default: None },
+        FieldMeta { key: 3, name: "align", wire: "Option<Enum<FlexAlign>>", required: false, default: None },
+        FieldMeta { key: 4, name: "justify", wire: "Option<Enum<FlexJustify>>", required: false, default: None },
+        FieldMeta { key: 5, name: "padding", wire: "Option<Inline<EdgeValues>>", required: false, default: None },
+        FieldMeta { key: 6, name: "min_height", wire: "Option<Inline<DimensionToken>>", required: false, default: None },
+        FieldMeta { key: 7, name: "order", wire: "Option<i32>", required: false, default: None },
+        FieldMeta { key: 8, name: "hidden", wire: "Option<bool>", required: false, default: None },
+        FieldMeta { key: 9, name: "width", wire: "Option<Inline<DimensionToken>>", required: false, default: None },
+    ],
+};
+
 pub const LOGEVENT_INLINE: InlineMeta = InlineMeta {
     name: "LogEvent",
     fields: &[
@@ -4570,6 +4766,12 @@ pub const ALL_INLINE_STRUCTS: &[&InlineMeta] = &[
     &TABLECOLUMN_INLINE,
     &DATEPRESET_INLINE,
     &INLINECHIP_INLINE,
+    &BORDERSIDE_INLINE,
+    &EDGEVALUES_INLINE,
+    &BORDEREDGES_INLINE,
+    &CORNERVALUES_INLINE,
+    &BOXSTYLE_INLINE,
+    &RESPONSIVERULE_INLINE,
     &LOGEVENT_INLINE,
     &FORMFIELDVALUE_INLINE,
     &FIELDERROR_INLINE,

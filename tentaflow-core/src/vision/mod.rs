@@ -14,10 +14,19 @@
 //       miedzy requestami.
 // =============================================================================
 
+pub mod adr;
 pub mod camera_cv_models;
 pub mod nms;
+// Generyczny runner ONNX dla dynamicznych modeli z rejestru `vision_models`
+// (silnik `onnx-cv`) + wspoldzielona warstwa ort i postprocess RF-DETR.
+#[cfg(feature = "inference-supertonic")]
+pub mod onnx_cv;
+#[cfg(feature = "inference-supertonic")]
+pub mod ort_common;
 pub mod preprocessing;
 pub mod resize;
+#[cfg(any(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+pub mod rfdetr_post;
 
 // Vendored Burn models (build-time ONNX→Burn codegen; regenerate via
 // tools/burn-spike when the architecture changes). Each is its own module
@@ -63,6 +72,12 @@ pub mod paddle_ocr_mlx;
 // Na macOS/iOS OCR pokrywa apple_ocr (Vision), wiec tam modulu nie wlaczamy.
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub mod onnx_ocr;
+
+// Nasz wytrenowany czytnik numerów ADR (mały CRNN) przez tract-onnx. Główny
+// silnik trybu ADR; PP-OCRv5 (`onnx_ocr`) jest fallbackiem. Nie-Apple (na
+// macOS/iOS OCR pokrywa apple_ocr), jak `onnx_ocr`.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+pub mod adr_ocr;
 
 pub mod hsemotion;
 pub mod movenet;
@@ -139,7 +154,22 @@ pub trait PoseEstimator: Send + Sync {
 ///
 /// `crop_rgb` — tightly-packed RGB24 (`cw*ch*3`). `None` = nic nie odczytano.
 pub trait OcrRunner: Send + Sync {
-    fn read(&self, crop_rgb: &[u8], cw: u32, ch: u32) -> Result<Option<String>>;
+    /// Zwraca ODRĘBNE linie tekstu posortowane góra→dół (tak jak wewnętrzny
+    /// pipeline det→rec je sortuje). Baza dla `read` (konkatenacja) oraz dla
+    /// odczytu ADR (`adr::snap_adr_from_lines`, który potrzebuje dolnego wiersza
+    /// z numerem UN osobno). Pusty `Vec` = nic nie odczytano.
+    fn read_lines(&self, crop_rgb: &[u8], cw: u32, ch: u32) -> Result<Vec<String>>;
+
+    /// `crop_rgb` — tightly-packed RGB24 (`cw*ch*3`). `None` = nic nie odczytano.
+    /// Domyślnie łączy linie z [`read_lines`] spacjami.
+    fn read(&self, crop_rgb: &[u8], cw: u32, ch: u32) -> Result<Option<String>> {
+        let lines = self.read_lines(crop_rgb, cw, ch)?;
+        if lines.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(lines.join(" ")))
+        }
+    }
 }
 
 /// Globalny, nadpisywalny in-process OCR runner. Domyslnie `None` —
@@ -168,6 +198,21 @@ pub fn get_ocr_runner() -> Option<Arc<dyn OcrRunner>> {
 /// Usuwa globalny OCR runner (stop service / rollback deployu apple-ocr).
 pub fn clear_ocr_runner() {
     *ocr_runner_slot().write() = None;
+}
+
+/// Best-effort rejestracja wbudowanego OCR runnera dla camera-CV (tryb ADR),
+/// gdy żaden nie jest jeszcze ustawiony. Na nie-Apple próbuje PP-OCRv5
+/// (`onnx_ocr`) z bundla w `vision_models_dir()`; brak plików bundla = brak
+/// zmiany (odczyt ADR zwróci wtedy błąd „deploy ppocrv5-ocr"). NIE nadpisuje
+/// istniejącego runnera (np. Apple Vision albo już zdeployowanego onnx-ocr).
+pub fn ensure_camera_ocr_runner() {
+    if get_ocr_runner().is_some() {
+        return;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    if let Err(e) = onnx_ocr::register_as_ocr_runner() {
+        tracing::debug!("[vision] auto-rejestracja PP-OCRv5 dla ADR pominięta: {e:#}");
+    }
 }
 
 /// In-process parser dokumentow: obraz strony (PNG/JPEG) -> markdown ze

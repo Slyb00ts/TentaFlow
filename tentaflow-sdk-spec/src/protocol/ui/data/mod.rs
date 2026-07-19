@@ -70,6 +70,17 @@ mod tests {
             content: lit("hello"), style: TextStyle::Body,
             tone: Some(Tone::Primary), align: Some(TextAlign::Start),
             wrap: Some(TextWrap::Wrap), max_lines: Some(3), format: None,
+            streaming: Some(lit("stream_flag")),
+        };
+        rt(t, |m| m.into_component("t").unwrap(), Text::try_from_component);
+    }
+
+    #[test]
+    fn text_streaming_absent_roundtrip() {
+        let t = Text {
+            content: lit("hello"), style: TextStyle::Body,
+            tone: None, align: None, wrap: None, max_lines: None, format: None,
+            streaming: None,
         };
         rt(t, |m| m.into_component("t").unwrap(), Text::try_from_component);
     }
@@ -184,8 +195,16 @@ mod tests {
             variant: ChipVariant::Removable, tone: Tone::Info,
             label: lit("filter1"), icon: None, avatar: None,
             selected: None, removable: true,
+            dot: Some(Tone::Success),
         };
-        rt(ch, |m| m.into_component("ch").unwrap(), Chip::try_from_component);
+        rt(ch.clone(), |m| m.into_component("ch").unwrap(), Chip::try_from_component);
+
+        // dot is optional: None omitted from the wire (old decoders reject
+        // unknown key 7) and absent key 7 decodes back to None.
+        let legacy = Chip { dot: None, ..ch };
+        let c = legacy.clone().into_component("ch2").unwrap();
+        assert!(c.fields.0.iter().all(|(k, _)| *k != 7));
+        assert_eq!(Chip::try_from_component(&c).unwrap(), legacy);
     }
 
     #[test]
@@ -513,6 +532,7 @@ mod tests {
             show_label: true,
             label: Some(lit("50%")),
             size: ProgressSize::Lg,
+            orientation: None,
         };
         let c = p.clone().into_component("pb").unwrap();
         assert_eq!(ProgressBar::try_from_component(&c).unwrap(), p);
@@ -528,6 +548,7 @@ mod tests {
             tone: Tone::Primary,
             show_label: true, label: None,
             size: ProgressSize::Md,
+            orientation: None,
         };
         let mut c = p.into_component("pb").unwrap();
         c.fields.0.retain(|(k, _)| *k != 1);
@@ -671,6 +692,41 @@ mod tests {
         };
         let c = vh.clone().into_component("vh").unwrap();
         assert_eq!(VisuallyHidden::try_from_component(&c).unwrap(), vh);
+    }
+
+    #[test]
+    fn progress_bar_vertical_roundtrip() {
+        use crate::protocol::ui::tokens::{ProgressOrientation, ProgressSize, ProgressVariant};
+        let p = ProgressBar {
+            value: lit("score"),
+            max: 1.0,
+            variant: ProgressVariant::Default,
+            tone: Tone::Primary,
+            show_label: false,
+            label: None,
+            size: ProgressSize::Sm,
+            orientation: Some(ProgressOrientation::Vertical),
+        };
+        rt(p, |m| m.into_component("p").unwrap(), ProgressBar::try_from_component);
+    }
+
+    #[test]
+    fn progress_bar_orientation_absent_omits_key_and_decodes_none() {
+        use crate::protocol::ui::tokens::{ProgressSize, ProgressVariant};
+        let p = ProgressBar {
+            value: lit("score"),
+            max: 1.0,
+            variant: ProgressVariant::Default,
+            tone: Tone::Primary,
+            show_label: false,
+            label: None,
+            size: ProgressSize::Sm,
+            orientation: None,
+        };
+        let c = p.clone().into_component("p").unwrap();
+        // Key 7 must be absent so horizontal bars keep byte-identical payloads.
+        assert!(c.fields.0.iter().all(|(k, _)| *k != 7), "orientation key must be omitted");
+        assert_eq!(ProgressBar::try_from_component(&c).unwrap().orientation, None);
     }
 
     #[test]

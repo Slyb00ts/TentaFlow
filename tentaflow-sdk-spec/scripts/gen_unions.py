@@ -106,6 +106,8 @@ TAGGED_UNIONS = [
     ("HeatmapScale",      "src/protocol/ui/inline.rs"),
     ("DatePresetResolve", "src/protocol/ui/inline.rs"),
     ("BorderToken",       "src/protocol/ui/inline.rs"),
+    ("SpaceValue",        "src/protocol/ui/inline.rs"),
+    ("RadiusValue",       "src/protocol/ui/inline.rs"),
     ("SplitSize",         "src/protocol/ui/inline.rs"),
     ("GridCol",           "src/protocol/ui/inline.rs"),
     ("GridTrack",         "src/protocol/ui/inline.rs"),

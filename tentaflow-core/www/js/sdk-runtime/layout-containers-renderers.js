@@ -13,6 +13,7 @@
 import {
   registerComponentRenderer,
   lookupComponentRenderer,
+  injectResponsiveCss,
 } from './component-renderer.js';
 import { parseDimensionToken } from './data-specialised-renderer.js';
 
@@ -110,11 +111,18 @@ function assertOnlyKnownObjectKeys(obj, allowedKeys, ctx) {
 
 function assertOnlyKnownFieldMapKeys(fields, allowedKeys, ctx) {
   if (!Array.isArray(fields)) throw new TypeError(`${ctx}: expected FieldMap`);
+  // Mirror of Rust `ensure_no_duplicate_keys` — a duplicate key would
+  // silently resolve first-wins in readField, so reject it outright.
+  const seen = new Set();
   for (const entry of fields) {
     if (!Array.isArray(entry) || entry.length !== 2) throw new TypeError(`${ctx}: entry must be [u8, Value]`);
     if (!allowedKeys.has(entry[0])) {
       throw new TypeError(`${ctx}: unexpected key ${entry[0]}`);
     }
+    if (seen.has(entry[0])) {
+      throw new TypeError(`${ctx}: duplicate key ${entry[0]}`);
+    }
+    seen.add(entry[0]);
   }
 }
 
@@ -124,12 +132,368 @@ const MAX_GRID_COLS = 256;
 const MAX_GRID_PX = 100_000;
 
 // =============================================================================
+// BoxStyle (spec §1.5) — shared container styling (margin/padding/border/
+// background/radius/dimensions/overflow). Px values go to inline style
+// (controlled fields, not free CSS); tokens map to `var(--tf-*)` variables.
+// =============================================================================
+
+const OVERFLOWS = new Set(['visible', 'hidden', 'auto', 'scroll']);
+const BORDER_LINE_STYLES = new Set(['solid', 'dashed', 'none']);
+// BorderColor → theme CSS var. Mirror of Rust enum `BorderColor` in tokens.rs.
+const BORDER_COLOR_CSS = {
+  default: 'var(--tf-border)',
+  hover: 'var(--tf-border-hover)',
+  accent: 'var(--tf-accent-1)',
+  success: 'var(--tf-success)',
+  warning: 'var(--tf-warning)',
+  danger: 'var(--tf-danger)',
+  transparent: 'transparent',
+};
+
+function requireU16(value, ctx) {
+  if (typeof value === 'bigint') {
+    if (value < 0n || value > 0xFFFFn) {
+      throw new TypeError(`${ctx}: expected u16 (0..=65535), got ${value}`);
+    }
+    return Number(value);
+  }
+  if (!Number.isInteger(value) || value < 0 || value > 0xFFFF) {
+    throw new TypeError(`${ctx}: expected u16 (0..=65535), got ${value}`);
+  }
+  return value;
+}
+
+/// SpaceValue / RadiusValue: `{kind:"token", value:<tstr>}` | `{kind:"px", value:u16}`.
+/// `tokenSet` is the token whitelist, `cssVarPrefix` e.g. 'tf-space'.
+function spaceLikeToCss(raw, tokenSet, cssVarPrefix, ctx) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new TypeError(`${ctx}: expected {kind, value} object`);
+  }
+  assertOnlyKnownObjectKeys(raw, new Set(['kind', 'value']), ctx);
+  switch (raw.kind) {
+    case 'token': {
+      const t = requireEnum(raw.value, tokenSet, `${ctx}.token`);
+      return `var(--${cssVarPrefix}-${t})`;
+    }
+    case 'px': {
+      const v = requireU16(raw.value, `${ctx}.px.value`);
+      return `${v}px`;
+    }
+    default:
+      throw new TypeError(`${ctx}.kind must be 'token'/'px', got ${raw.kind}`);
+  }
+}
+
+// EdgeValues / BorderEdges edges and CornerValues corners are int-keyed
+// FieldMaps: 0=top/top_left, 1=right/top_right, 2=bottom/bottom_right,
+// 3=left/bottom_left. Mirror of Rust `#[cbor(map)]` in inline.rs.
+const EDGE_KEYS = new Set([0, 1, 2, 3]);
+
+function applyEdgeValues(el, raw, cssProp, ctx) {
+  assertOnlyKnownFieldMapKeys(raw, EDGE_KEYS, ctx);
+  const sides = ['Top', 'Right', 'Bottom', 'Left'];
+  for (let i = 0; i < 4; i += 1) {
+    const v = readFieldMap(raw, i);
+    if (v === undefined) continue;
+    el.style[`${cssProp}${sides[i]}`] =
+      spaceLikeToCss(v, SPACINGS, 'tf-space', `${ctx}.${sides[i].toLowerCase()}`);
+  }
+}
+
+// BorderSide: 0=width_px(u8), 1=color(BorderColor), 2=style(BorderLineStyle).
+const BORDER_SIDE_KEYS = new Set([0, 1, 2]);
+
+// Longhands instead of the `borderTop` shorthand — precise and independent
+// of shorthand-parser behavior in the test environment.
+function applyBorderSide(el, raw, side, ctx) {
+  if (!Array.isArray(raw)) throw new TypeError(`${ctx}: BorderSide must be FieldMap`);
+  assertOnlyKnownFieldMapKeys(raw, BORDER_SIDE_KEYS, ctx);
+  const width = requireU8(readFieldMap(raw, 0), `${ctx}.width_px`);
+  const colorToken = readFieldMap(raw, 1);
+  if (typeof colorToken !== 'string' || !(colorToken in BORDER_COLOR_CSS)) {
+    throw new TypeError(`${ctx}.color: unknown BorderColor ${JSON.stringify(colorToken)}`);
+  }
+  const style = requireEnum(readFieldMap(raw, 2), BORDER_LINE_STYLES, `${ctx}.style`);
+  if (style === 'none') {
+    el.style[`border${side}Style`] = 'none';
+    return;
+  }
+  el.style[`border${side}Width`] = `${width}px`;
+  el.style[`border${side}Style`] = style;
+  el.style[`border${side}Color`] = BORDER_COLOR_CSS[colorToken];
+}
+
+function applyBorderEdges(el, raw, ctx) {
+  assertOnlyKnownFieldMapKeys(raw, EDGE_KEYS, ctx);
+  const sides = ['Top', 'Right', 'Bottom', 'Left'];
+  for (let i = 0; i < 4; i += 1) {
+    const v = readFieldMap(raw, i);
+    if (v === undefined) continue;
+    applyBorderSide(el, v, sides[i], `${ctx}.${sides[i].toLowerCase()}`);
+  }
+}
+
+function applyCornerValues(el, raw, ctx) {
+  assertOnlyKnownFieldMapKeys(raw, EDGE_KEYS, ctx);
+  const corners = ['TopLeft', 'TopRight', 'BottomRight', 'BottomLeft'];
+  for (let i = 0; i < 4; i += 1) {
+    const v = readFieldMap(raw, i);
+    if (v === undefined) continue;
+    el.style[`border${corners[i]}Radius`] =
+      spaceLikeToCss(v, RADIUS_TOKENS, 'tf-radius', `${ctx}.${corners[i]}`);
+  }
+}
+
+/// Local reader for an int-keyed FieldMap (pair-array [[u8, Value], ...]) —
+/// like ctx.readField, but also usable for nested BoxStyle structures.
+function readFieldMap(fields, key) {
+  for (const [k, v] of fields) {
+    if (k === key) return v;
+  }
+  return undefined;
+}
+
+const BOX_STYLE_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+
+// ShadowToken (spec tokens.rs) → box-shadow. Elevation scale reuses the shared
+// theme shadow tokens; `accent_glow` maps to the accent halo (as used by the
+// translation output pane / live stage). `none` clears any inherited shadow.
+const SHADOW_TOKEN_CSS = {
+  none: 'none',
+  subtle: 'var(--tf-shadow-sm)',
+  medium: 'var(--tf-shadow)',
+  elevated: 'var(--tf-shadow-lg)',
+  floating: 'var(--tf-shadow-xl)',
+  accent_glow: 'var(--tf-glow-accent)',
+};
+
+/// Applies BoxStyle (spec §1.5) to an element. `raw` is an int-keyed FieldMap:
+/// 0=margin, 1=padding, 2=border, 3=background, 4=radius, 5=width, 6=height,
+/// 7=min_width, 8=min_height, 9=max_width, 10=max_height, 11=overflow_x,
+/// 12=overflow_y. Called AFTER the container token classes — inline style
+/// overrides classes per the CSS cascade.
+export function applyBoxStyle(el, raw, ctx) {
+  if (raw === undefined) return;
+  if (!Array.isArray(raw)) throw new TypeError(`${ctx}: BoxStyle must be FieldMap`);
+  assertOnlyKnownFieldMapKeys(raw, BOX_STYLE_KEYS, ctx);
+
+  const margin = readFieldMap(raw, 0);
+  if (margin !== undefined) applyEdgeValues(el, margin, 'margin', `${ctx}.margin`);
+  const padding = readFieldMap(raw, 1);
+  if (padding !== undefined) applyEdgeValues(el, padding, 'padding', `${ctx}.padding`);
+  const border = readFieldMap(raw, 2);
+  if (border !== undefined) applyBorderEdges(el, border, `${ctx}.border`);
+  const background = readFieldMap(raw, 3);
+  if (background !== undefined) {
+    const b = requireEnum(background, BACKGROUND_TOKENS, `${ctx}.background`);
+    el.style.background = `var(--tf-bg-${b})`;
+  }
+  const radius = readFieldMap(raw, 4);
+  if (radius !== undefined) applyCornerValues(el, radius, `${ctx}.radius`);
+
+  const dims = [
+    [5, 'width'], [6, 'height'], [7, 'minWidth'], [8, 'minHeight'],
+    [9, 'maxWidth'], [10, 'maxHeight'],
+  ];
+  for (const [key, prop] of dims) {
+    const v = readFieldMap(raw, key);
+    if (v === undefined) continue;
+    const t = parseDimensionToken(v, `${ctx}.${prop}`);
+    el.style[prop] = t === 'full' ? '100%' : t === 'fit_content' ? 'fit-content' : t;
+  }
+
+  const overflowX = readFieldMap(raw, 11);
+  if (overflowX !== undefined) {
+    el.style.overflowX = requireEnum(overflowX, OVERFLOWS, `${ctx}.overflow_x`);
+  }
+  const overflowY = readFieldMap(raw, 12);
+  if (overflowY !== undefined) {
+    el.style.overflowY = requireEnum(overflowY, OVERFLOWS, `${ctx}.overflow_y`);
+  }
+  const shadow = readFieldMap(raw, 13);
+  if (shadow !== undefined) {
+    if (typeof shadow !== 'string' || !(shadow in SHADOW_TOKEN_CSS)) {
+      throw new TypeError(`${ctx}.shadow: unknown ShadowToken ${JSON.stringify(shadow)}`);
+    }
+    el.style.boxShadow = SHADOW_TOKEN_CSS[shadow];
+  }
+}
+
+// =============================================================================
+// ResponsiveRule (spec inline.rs) — container-query driven layout adaptation.
+// A container declares a list of overrides keyed by a `max_width`; the renderer
+// generates `@container addon (max-width: Npx)` rules scoped by a stable
+// `data-responsive="<hash>"` attribute set on the element. No per-addon CSS —
+// the same declaration renders identically for every addon.
+// =============================================================================
+
+// Breakpoint token → px. Mirrors the mapping documented on `Breakpoint`
+// (tokens.rs): 640/768/1024/1280/1536/1920.
+const BREAKPOINT_PX = { xs: 640, sm: 768, md: 1024, lg: 1280, xl: 1536, xxl: 1920 };
+
+const RESPONSIVE_RULE_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+function requireI32(value, ctx) {
+  if (typeof value === 'bigint') {
+    if (value < -2147483648n || value > 2147483647n) {
+      throw new TypeError(`${ctx}: expected i32, got ${value}`);
+    }
+    return Number(value);
+  }
+  if (!Number.isInteger(value) || value < -2147483648 || value > 2147483647) {
+    throw new TypeError(`${ctx}: expected i32, got ${value}`);
+  }
+  return value;
+}
+
+/// FNV-1a 32-bit hex — a compact, stable content hash for the generated rules
+/// so identical declarations dedup to one injected `@container` block.
+function fnv1aHex(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i += 1) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+/// ContainerWidth `{kind:'token'|'px', value}` → px number. Token maps through
+/// the Breakpoint scale; px is taken verbatim (u16).
+function containerWidthToPx(raw, ctx) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new TypeError(`${ctx}: ContainerWidth must be {kind, value}`);
+  }
+  assertOnlyKnownObjectKeys(raw, new Set(['kind', 'value']), ctx);
+  switch (raw.kind) {
+    case 'token': {
+      if (typeof raw.value !== 'string' || !(raw.value in BREAKPOINT_PX)) {
+        throw new TypeError(`${ctx}.token: unknown Breakpoint ${JSON.stringify(raw.value)}`);
+      }
+      return BREAKPOINT_PX[raw.value];
+    }
+    case 'px':
+      return requireU16(raw.value, `${ctx}.px`);
+    default:
+      throw new TypeError(`${ctx}.kind must be 'token'/'px', got ${raw.kind}`);
+  }
+}
+
+/// Applies a container's `responsive: Vec<ResponsiveRule>` by generating scoped
+/// `@container addon` rules. `rulesRaw` is an Array of int-keyed FieldMaps:
+/// 0=max_width(ContainerWidth), 1=direction, 2=gap, 3=align, 4=justify,
+/// 5=padding(EdgeValues), 6=min_height(DimensionToken), 7=order(i32), 8=hidden,
+/// 9=width(DimensionToken).
+/// `direction`/`gap`/`align`/`justify`/`padding`/`min_height` retarget the
+/// container's own flex layout at that width; `order`/`hidden` reposition or
+/// hide the container within ITS parent (self-as-flex-child), so all fields
+/// target the same `[data-responsive]` element.
+export function applyResponsive(el, rulesRaw, ctx, name) {
+  if (rulesRaw === undefined || rulesRaw === null) return;
+  if (!Array.isArray(rulesRaw)) {
+    throw new TypeError(`${name}.responsive: expected Array<ResponsiveRule>`);
+  }
+  if (rulesRaw.length === 0) return;
+
+  const decls = [];
+  for (let i = 0; i < rulesRaw.length; i += 1) {
+    const rule = rulesRaw[i];
+    const rctx = `${name}.responsive[${i}]`;
+    if (!Array.isArray(rule)) throw new TypeError(`${rctx}: ResponsiveRule must be FieldMap`);
+    assertOnlyKnownFieldMapKeys(rule, RESPONSIVE_RULE_KEYS, rctx);
+    const maxWidthRaw = readFieldMap(rule, 0);
+    if (maxWidthRaw === undefined) throw new TypeError(`${rctx}.max_width is required`);
+    const maxPx = containerWidthToPx(maxWidthRaw, `${rctx}.max_width`);
+
+    const props = [];
+    const dir = readFieldMap(rule, 1);
+    if (dir !== undefined) {
+      props.push(['flex-direction', requireEnum(dir, FLEX_DIRECTIONS, `${rctx}.direction`).replace(/_/g, '-')]);
+    }
+    const gap = readFieldMap(rule, 2);
+    if (gap !== undefined) {
+      props.push(['gap', `var(--tf-space-${requireEnum(gap, SPACINGS, `${rctx}.gap`)})`]);
+    }
+    const align = readFieldMap(rule, 3);
+    if (align !== undefined) {
+      props.push(['align-items', flexAlignToCss(requireEnum(align, FLEX_ALIGNS, `${rctx}.align`))]);
+    }
+    const justify = readFieldMap(rule, 4);
+    if (justify !== undefined) {
+      props.push(['justify-content', flexJustifyToCss(requireEnum(justify, FLEX_JUSTIFIES, `${rctx}.justify`))]);
+    }
+    const padding = readFieldMap(rule, 5);
+    if (padding !== undefined) {
+      assertOnlyKnownFieldMapKeys(padding, EDGE_KEYS, `${rctx}.padding`);
+      const sides = [['top', 0], ['right', 1], ['bottom', 2], ['left', 3]];
+      for (const [sideName, k] of sides) {
+        const sv = readFieldMap(padding, k);
+        if (sv === undefined) continue;
+        props.push([`padding-${sideName}`, spaceLikeToCss(sv, SPACINGS, 'tf-space', `${rctx}.padding.${sideName}`)]);
+      }
+    }
+    const minHeight = readFieldMap(rule, 6);
+    if (minHeight !== undefined) {
+      const t = parseDimensionToken(minHeight, `${rctx}.min_height`);
+      props.push(['min-height', t === 'full' ? '100%' : t === 'fit_content' ? 'fit-content' : t]);
+    }
+    const order = readFieldMap(rule, 7);
+    if (order !== undefined) {
+      props.push(['order', String(requireI32(order, `${rctx}.order`))]);
+    }
+    const hidden = readFieldMap(rule, 8);
+    if (hidden !== undefined) {
+      if (typeof hidden !== 'boolean') throw new TypeError(`${rctx}.hidden: expected bool`);
+      if (hidden) props.push(['display', 'none']);
+    }
+    const width = readFieldMap(rule, 9);
+    if (width !== undefined) {
+      const t = parseDimensionToken(width, `${rctx}.width`);
+      props.push(['width', t === 'full' ? '100%' : t === 'fit_content' ? 'fit-content' : t]);
+      // Inline min/max-width (fixed side panel) must not survive the override.
+      props.push(['min-width', '0']);
+      props.push(['max-width', 'none']);
+    }
+    if (props.length === 0) continue; // max_width only — nothing to override
+    decls.push({ maxPx, props });
+  }
+  if (decls.length === 0) return;
+
+  // Hash from a canonical ascending order — deterministic and independent of
+  // author order, so identical declarations always dedup to one injection.
+  const ascending = [...decls].sort((a, b) => a.maxPx - b.maxPx);
+  const canonical = ascending
+    .map((d) => `${d.maxPx}{${d.props.map(([k, v]) => `${k}:${v}`).join(';')}}`)
+    .join('|');
+  const hash = fnv1aHex(canonical);
+  el.setAttribute('data-responsive', hash);
+
+  // Emit blocks in DESCENDING max_width order: at a narrow width several
+  // `@container (max-width: N)` blocks match at once, and equal-specificity
+  // rules resolve by source order (later wins). Putting the smaller breakpoint
+  // LAST lets it override the wider one for the same property.
+  //
+  // Every property is `!important`: the base layout is applied as INLINE style
+  // (e.g. `el.style.flexDirection`, `el.style.background`) by the container
+  // renderers, and inline style beats any stylesheet rule — including
+  // `@container` — without `!important`. This is the intended, deliberate
+  // responsive override of the deliberately-inline base.
+  const descending = [...decls].sort((a, b) => b.maxPx - a.maxPx);
+  const sel = `[data-responsive="${hash}"]`;
+  const cssText = `${descending
+    .map((d) => `@container addon (max-width: ${d.maxPx}px){${sel}{${d.props
+      .map(([k, v]) => `${k}:${v} !important`)
+      .join(';')}}}`)
+    .join('\n')}\n`;
+  injectResponsiveCss(hash, cssText);
+}
+
+// =============================================================================
 // Flex (0x0101)
 // =============================================================================
 
 export const FLEX_TAG = 0x0101;
 
-const FLEX_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+const FLEX_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
 function renderFlex(component, ctx) {
   assertOnlyKnownFields(component.fields, FLEX_FIELD_KEYS, 'Flex');
@@ -184,6 +548,8 @@ function renderFlex(component, ctx) {
   if (padding) el.classList.add(`tf-flex--padding-${padding}`);
   if (background) el.classList.add(`tf-flex--bg-${background}`);
   if (radius) el.classList.add(`tf-flex--radius-${radius}`);
+  applyBoxStyle(el, ctx.readField(component.fields, 9), 'Flex.style');
+  applyResponsive(el, ctx.readField(component.fields, 10), ctx, 'Flex');
 
   for (const childComponent of children) {
     const childEl = ctx.renderChild(childComponent);
@@ -198,7 +564,7 @@ function renderFlex(component, ctx) {
 
 export const GRID_TAG = 0x0102;
 
-const GRID_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6]);
+const GRID_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7]);
 
 function renderGrid(component, ctx) {
   assertOnlyKnownFields(component.fields, GRID_FIELD_KEYS, 'Grid');
@@ -243,6 +609,7 @@ function renderGrid(component, ctx) {
   // pokrywają arbitralnego trackingu kolumn. Trzymamy je w inline style
   // jako jedyną dozwoloną drogę; addon nie kontroluje raw CSS poza tym.
   el.style.gridTemplateColumns = columnsCss;
+  applyBoxStyle(el, ctx.readField(component.fields, 7), 'Grid.style');
 
   // GridChild: 0=component, 1=col_span(u8), 2=row_span(u8), 3=col_start(u8), 4=row_start(u8), 5=align_self, 6=justify_self
   const GRID_CHILD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6]);
@@ -379,7 +746,7 @@ function flexJustifyToCss(token) {
 
 export const STACK_TAG = 0x0103;
 
-const STACK_FIELD_KEYS = new Set([0, 1, 2, 3, 4]);
+const STACK_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6]);
 
 function renderStack(component, ctx) {
   assertOnlyKnownFields(component.fields, STACK_FIELD_KEYS, 'Stack');
@@ -409,6 +776,8 @@ function renderStack(component, ctx) {
   el.classList.add(`tf-stack--align-${align}`);
   if (padding) el.classList.add(`tf-stack--padding-${padding}`);
   if (justify) el.classList.add(`tf-stack--justify-${justify}`);
+  applyBoxStyle(el, ctx.readField(component.fields, 5), 'Stack.style');
+  applyResponsive(el, ctx.readField(component.fields, 6), ctx, 'Stack');
 
   for (const childComponent of children) {
     el.appendChild(ctx.renderChild(childComponent));
@@ -473,8 +842,10 @@ function renderCluster(component, ctx) {
 
 export const SPLIT_TAG = 0x0105;
 
-const SPLIT_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6]);
+const SPLIT_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
 const SPLIT_ORIENTATIONS = new Set(['horizontal', 'vertical']);
+const SPLIT_DIVIDERS = new Set(['handle', 'line', 'none']);
+const BREAKPOINTS = new Set(Object.keys(BREAKPOINT_PX));
 
 function requireBool(value, ctx) {
   if (typeof value !== 'boolean') {
@@ -547,12 +918,36 @@ export function renderSplit(component, ctx) {
     ctx.readField(component.fields, 6),
     'Split.secondary_slot'
   );
+  const collapseBelowRaw = ctx.readField(component.fields, 7);
+  const collapseBelow = collapseBelowRaw === undefined || collapseBelowRaw === null
+    ? null
+    : requireEnum(collapseBelowRaw, BREAKPOINTS, 'Split.collapse_below');
+  const dividerModeRaw = ctx.readField(component.fields, 8);
+  const dividerMode = dividerModeRaw === undefined || dividerModeRaw === null
+    ? 'handle'
+    : requireEnum(dividerModeRaw, SPLIT_DIVIDERS, 'Split.divider');
+  // A hidden divider has no drag hit-area, so `none` also disables resize.
+  const canResize = resizable && dividerMode !== 'none';
+  const growRaw = ctx.readField(component.fields, 9);
+  let grow = false;
+  if (growRaw !== undefined && growRaw !== null) {
+    if (typeof growRaw !== 'boolean') {
+      throw new TypeError(`Split.grow: expected bool, got ${typeof growRaw}`);
+    }
+    grow = growRaw;
+  }
 
   const horizontal = orientation === 'horizontal';
   const el = document.createElement('div');
   el.classList.add('tf-split');
   el.classList.add(`tf-split--${orientation}`);
-  if (resizable) el.classList.add('tf-split--resizable');
+  el.classList.add(`tf-split--divider-${dividerMode}`);
+  if (canResize) el.classList.add('tf-split--resizable');
+  // Self-as-flex-child (Split.grow): take the leftover space of the flex
+  // parent so the panes get a real height/width to fill. Basis stays `auto`
+  // (unlike Box.grow): a stacked/collapsed split must keep its content
+  // height when the parent shrinks to fit-content.
+  if (grow) el.style.flexGrow = '1';
 
   const primary = document.createElement('div');
   primary.classList.add('tf-split__pane', 'tf-split__pane--primary');
@@ -580,7 +975,37 @@ export function renderSplit(component, ctx) {
   secondary.classList.add('tf-split__pane', 'tf-split__pane--secondary');
   secondary.setAttribute('data-slot-id', secondarySlot);
 
-  if (resizable) {
+  if (collapseBelow !== null) {
+    // Container-query collapse: below the breakpoint the split stacks as a
+    // column (primary above secondary) and the divider disappears (no drag
+    // resize in stacked mode). The inline flex-basis/min/max sizing set above
+    // needs `!important` to lose to the stacked layout, mirroring
+    // applyResponsive's inline-vs-@container contract. A vertical split is
+    // already a column, so only the divider rule applies there.
+    const px = BREAKPOINT_PX[collapseBelow];
+    const decls = [];
+    if (horizontal) {
+      decls.push(`{flex-direction:column !important}`);
+      decls.push(
+        ` > .tf-split__pane{flex-basis:auto !important;min-width:0 !important;` +
+        `max-width:none !important;width:100% !important}`
+      );
+      // Cap the stacked primary like the global 720px fallback does, so a
+      // fixed-basis list pane cannot push the secondary pane off-screen.
+      decls.push(` > .tf-split__pane--primary{max-height:45vh !important}`);
+    }
+    decls.push(` > .tf-split__divider{display:none !important}`);
+    const canonical = `split-collapse:${orientation}:${px}`;
+    const hash = fnv1aHex(canonical);
+    el.setAttribute('data-split-collapse', hash);
+    const sel = `[data-split-collapse="${hash}"]`;
+    const cssText = `@container addon (max-width: ${px}px){${decls
+      .map((d) => `${sel}${d}`)
+      .join('')}}\n`;
+    injectResponsiveCss(hash, cssText);
+  }
+
+  if (canResize) {
     // Pointer-drag resize: move/up listeners live on document so the drag
     // survives the pointer leaving the divider; both are released via
     // ctx.registerCleanup when the element is destroyed.
@@ -630,7 +1055,7 @@ export function renderSplit(component, ctx) {
 
 export const BOX_TAG = 0x0115;
 
-const BOX_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5]);
+const BOX_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 
 // DimensionToken → CSS length. parseDimensionToken zwraca string-kind dla
 // wariantów jednostkowych (auto/full/fit_content) i gotowy CSS dla wartości.
@@ -673,14 +1098,49 @@ function renderBox(component, ctx) {
   );
   const childrenRaw = ctx.readField(component.fields, 5);
   const children = childrenRaw === undefined ? [] : requireArray(childrenRaw, 'Box.children');
+  // Keys 7-10: simple flex behavior for children — any of them enables
+  // display:flex (mirror of Rust Box.direction/gap/align/justify).
+  const direction = optionalEnum(
+    ctx.readField(component.fields, 7),
+    FLEX_DIRECTIONS,
+    'Box.direction'
+  );
+  const gap = optionalEnum(
+    ctx.readField(component.fields, 8),
+    SPACINGS,
+    'Box.gap'
+  );
+  const align = optionalEnum(
+    ctx.readField(component.fields, 9),
+    FLEX_ALIGNS,
+    'Box.align'
+  );
+  const justify = optionalEnum(
+    ctx.readField(component.fields, 10),
+    FLEX_JUSTIFIES,
+    'Box.justify'
+  );
 
   const el = document.createElement('div');
   el.classList.add('tf-box');
   if (widthCss != null) el.style.width = widthCss;
-  if (grow) el.style.flexGrow = '1';
+  // grow=true → `flex: 1 1 0` (grow + basis 0), not just flex-grow. With the
+  // default `flex-basis: auto`, siblings size from their content first, so two
+  // grow children with different content end up unequal. Basis 0 makes them
+  // split the free space equally regardless of content (design-system "fill").
+  if (grow) { el.style.flexGrow = '1'; el.style.flexBasis = '0'; }
   if (alignSelf) el.style.alignSelf = flexAlignToCss(alignSelf);
   if (padding) el.classList.add(`tf-box--padding-${padding}`);
   if (margin) el.classList.add(`tf-box--margin-${margin}`);
+  if (direction || gap || align || justify) {
+    el.style.display = 'flex';
+    el.style.flexDirection = direction ? direction.replace(/_/g, '-') : 'row';
+    if (gap) el.style.gap = `var(--tf-space-${gap})`;
+    if (align) el.style.alignItems = flexAlignToCss(align);
+    if (justify) el.style.justifyContent = flexJustifyToCss(justify);
+  }
+  applyBoxStyle(el, ctx.readField(component.fields, 6), 'Box.style');
+  applyResponsive(el, ctx.readField(component.fields, 11), ctx, 'Box');
 
   for (const childComponent of children) {
     el.appendChild(ctx.renderChild(childComponent));

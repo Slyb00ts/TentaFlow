@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Statystyki · Eksplorator zapytań (M5)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  /* Nuta o lokalności danych */
+  .note-card { display: flex; align-items: flex-start; gap: 10px; padding: 11px 14px; margin-bottom: 16px; font-size: 12px; color: var(--text-2); line-height: 1.5; }
+  .note-card .icon { width: 15px; height: 15px; color: var(--info); flex-shrink: 0; margin-top: 1px; }
+  .note-card strong { color: var(--text); font-weight: 600; }
+
+  /* Pasek filtrów */
+  .filterbar { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-bottom: 16px; }
+  .filterbar .search-box { min-width: 230px; }
+  .filterbar .select { min-width: 130px; }
+  .filterbar .ml-auto { margin-left: auto; }
+
+  /* Tabela zapytań */
+  .req-table td.num, .req-table th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .req-table .t-time { font-family: ui-monospace, 'JetBrains Mono', monospace; font-size: 11.5px; color: var(--text-2); }
+  .req-table tbody tr.req-row { cursor: pointer; }
+  .req-table tbody tr.req-row.open { background: var(--bg-card); }
+  .req-table tbody tr.req-row.open td { border-bottom-color: transparent; }
+  .req-table .caret { color: var(--text-3); display: inline-flex; width: 12px; }
+  .req-table tr.req-row.open .caret { color: var(--accent-2); }
+  .req-table tr.detail-row td { padding: 0; background: var(--bg-card); }
+  .req-table tr.detail-row .detail-wrap { padding: 4px 8px 14px; }
+  .u-dim { color: var(--text-3); }
+
+  /* Panel szczegółów */
+  .detail-grid { display: grid; grid-template-columns: 320px 1fr; gap: 14px; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; font-size: 12.5px; }
+  .kv dt { color: var(--text-3); }
+  .kv dd { margin: 0; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  /* Timeline faz */
+  .tl-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; }
+  .tl-head .total { font-size: 12px; color: var(--text-3); }
+  .tl-head .total b { color: var(--text); font-variant-numeric: tabular-nums; }
+  .tl-bar { display: flex; height: 30px; border-radius: 7px; overflow: hidden; border: 1px solid var(--border); }
+  .tl-seg { display: flex; align-items: center; justify-content: center; font-size: 10.5px; font-weight: 700; color: #fff; white-space: nowrap; position: relative; }
+  .tl-seg.queue   { background: rgba(245,158,11,0.85); min-width: 26px; }
+  .tl-seg.prefill { background: rgba(96,165,250,0.85); }
+  .tl-seg.decode  { background: var(--gradient-accent); }
+  .tl-axis { display: flex; margin-top: 7px; font-size: 10.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+  .tl-axis span { position: relative; }
+  .tl-marker { display: flex; align-items: center; gap: 7px; margin-top: 12px; font-size: 11.5px; color: var(--text-2); }
+  .tl-marker .pin { width: 9px; height: 9px; border-radius: 50%; background: var(--success); box-shadow: 0 0 7px var(--success); flex-shrink: 0; }
+  .tl-marker b { color: var(--text); font-variant-numeric: tabular-nums; }
+
+  /* Mini-KPI pod timeline */
+  .mini-kpis { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-top: 16px; }
+  .mini-kpi { background: var(--bg-3); border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px; }
+  .mini-kpi .l { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-3); }
+  .mini-kpi .v { font-size: 16px; font-weight: 800; margin-top: 3px; font-variant-numeric: tabular-nums; }
+  .mini-kpi .v .u { font-size: 11px; font-weight: 600; color: var(--text-2); }
+
+  .legend { display: flex; gap: 14px; margin-top: 14px; font-size: 11px; color: var(--text-3); }
+  .legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 5px; vertical-align: middle; }
+  .legend .q { background: rgba(245,158,11,0.85); }
+  .legend .p { background: rgba(96,165,250,0.85); }
+  .legend .d { background: var(--accent-1); }
+  .callout { margin-top: 14px; padding: 9px 12px; border-radius: 8px; background: var(--accent-glow); border: 1px solid var(--accent-1); font-size: 11.5px; color: var(--text-2); line-height: 1.5; }
+  .callout strong { color: var(--accent-2); }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-coins" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.66 3.58 3 8 3s8-1.34 8-3V6"/><path d="M4 12v6c0 1.66 3.58 3 8 3s8-1.34 8-3v-6"/></symbol>
+  <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 14a2 2 0 1 0 0-4 2 2 0 0 0 0 4z"/><path d="m13.4 12.6 4.6-4.6"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><line x1="6" y1="7" x2="6.01" y2="7"/><line x1="6" y1="17" x2="6.01" y2="17"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+  <symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M5</span>
+    <h2>Eksplorator zapytań</h2>
+    <div class="desc">Drill-down request-level: każde zapytanie z jego fazami (admission → prefill → 1. token → decode). Queue oddzielony od prefillu — koniec przekłamanych liczb z czatu.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Home</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-dashboard"/></svg>Dashboard</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-server"/></svg>Serwisy</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-trend"/></svg>Analityka</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-activity"/></svg>Statystyki modeli</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-coins"/></svg>Rozliczenia</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy i grupy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Audit Log</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr Jarocki</div><div class="role">Admin</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Statystyki</span><span class="sep">›</span><span class="crumb current">Zapytania</span>
+        </div>
+
+        <div class="note-card section-card">
+          <svg class="icon"><use href="#i-info"/></svg>
+          <div>Szczegóły pojedynczych zapytań są <strong>lokalne na nodzie-właścicielu</strong> (<code>compliance_ai_events</code>). Zapytania z innych nodów pobierane <strong>on-demand przez mesh</strong> — w przeciwieństwie do zagregowanego <code>model_metrics_rollup</code>, który każdy node ma w całości lokalnie.</div>
+        </div>
+
+        <div class="filterbar">
+          <div class="search-box">
+            <svg class="icon"><use href="#i-search"/></svg>
+            <input type="text" placeholder="Szukaj request_id / fragmentu promptu…">
+          </div>
+          <select class="select">
+            <option>Wszyscy użytkownicy</option>
+            <option>piotr</option><option>anna</option><option>marek</option>
+            <option>kasia</option><option>tomek</option><option>bot-meeting</option>
+          </select>
+          <select class="select">
+            <option>Wszystkie modele</option>
+            <option>Qwen3.6-27B</option><option>gpt-oss-120b</option>
+            <option>gpt-oss-20b</option><option>Qwen3.6-4B</option><option>bge-m3</option>
+          </select>
+          <select class="select">
+            <option>Wszystkie nody</option>
+            <option>rig24</option><option>rig25</option>
+            <option>mac-studio</option><option>phone-piotr</option>
+          </select>
+          <select class="select">
+            <option>Status: wszystkie</option>
+            <option>Sukces</option><option>Błąd</option>
+          </select>
+          <div class="segmented ml-auto">
+            <button>1h</button>
+            <button class="active">24h</button>
+            <button>7d</button>
+          </div>
+        </div>
+
+        <div class="section-card" style="padding:0;overflow:hidden;">
+          <table class="tf-table req-table">
+            <thead>
+              <tr>
+                <th style="width:18px"></th>
+                <th>Czas</th>
+                <th>Użytkownik</th>
+                <th>Model</th>
+                <th>Node</th>
+                <th>Serwis</th>
+                <th class="num">Prompt tok</th>
+                <th class="num">Compl tok</th>
+                <th class="num">TTFT (ms)</th>
+                <th class="num">Decode (tok/s)</th>
+                <th class="num">E2E (ms)</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="req-row">
+                <td><span class="caret">▸</span></td>
+                <td class="t-time">14:32:07</td>
+                <td>piotr</td><td>Qwen3.6-27B</td><td>rig25</td><td>vLLM</td>
+                <td class="num">1 024</td><td class="num">212</td><td class="num">280</td><td class="num">61</td><td class="num">3 940</td>
+                <td><span class="status-pill ok">sukces</span></td>
+              </tr>
+
+              <!-- WIERSZ ROZWINIĘTY -->
+              <tr class="req-row open">
+                <td><span class="caret">▾</span></td>
+                <td class="t-time">14:31:58</td>
+                <td>anna</td><td>Qwen3.6-27B</td><td>rig24</td><td>vLLM</td>
+                <td class="num">512</td><td class="num">84</td><td class="num">220</td><td class="num">58</td><td class="num">1 670</td>
+                <td><span class="status-pill ok">sukces</span></td>
+              </tr>
+              <tr class="detail-row">
+                <td colspan="12">
+                  <div class="detail-wrap">
+                    <div class="detail-grid">
+                      <!-- LEWA: metadane -->
+                      <div class="section-card">
+                        <div class="section-card-head"><span class="title"><svg class="icon" style="width:14px;height:14px"><use href="#i-info"/></svg>Metadane zapytania</span></div>
+                        <dl class="kv" style="margin-top:12px">
+                          <dt>request_id</dt><dd class="mono">a1f3-7c20-9e88</dd>
+                          <dt>Użytkownik</dt><dd>anna <span class="u-dim">· Dev</span></dd>
+                          <dt>Model</dt><dd>Qwen3.6-27B</dd>
+                          <dt>Node</dt><dd>rig24 <span class="u-dim">· DGX Spark GB10</span></dd>
+                          <dt>Serwis</dt><dd>vLLM <span class="u-dim">(TP)</span></dd>
+                          <dt>Backend</dt><dd>vLLM · CUDA</dd>
+                          <dt>Modalność</dt><dd>tekst → tekst</dd>
+                          <dt>Źródło metryk</dt><dd>vLLM <span class="mono">usage</span></dd>
+                        </dl>
+                      </div>
+
+                      <!-- PRAWA: timeline -->
+                      <div class="section-card">
+                        <div class="tl-head">
+                          <span class="title" style="font-size:13px;font-weight:700">Fazy zapytania</span>
+                          <span class="total">end-to-end <b>1 670 ms</b></span>
+                        </div>
+
+                        <div class="tl-bar">
+                          <div class="tl-seg queue"   style="flex:40 0 0">40</div>
+                          <div class="tl-seg prefill" style="flex:180 0 0">Prefill · 180 ms</div>
+                          <div class="tl-seg decode"  style="flex:1450 0 0">Decode · 1 450 ms</div>
+                        </div>
+                        <div class="tl-axis">
+                          <span style="flex:40 0 0">0</span>
+                          <span style="flex:180 0 0">40 ms</span>
+                          <span style="flex:1450 0 0">220 ms <span class="u-dim">(1. token = TTFT)</span></span>
+                          <span style="flex:0 0 auto">1 670 ms</span>
+                        </div>
+
+                        <div class="tl-marker">
+                          <span class="pin"></span>
+                          <span><b>Admission / queue</b> 40 ms — czas w kolejce slotów silnika, <b>zanim</b> ruszył prefill.</span>
+                        </div>
+                        <div class="tl-marker">
+                          <span class="pin" style="background:var(--info);box-shadow:0 0 7px var(--info)"></span>
+                          <span><b>Pierwszy token (TTFT) = 220 ms</b> — suma queue (40) + prefill (180). Liczona ze strumienia silnika, nie z wall-clocku Core.</span>
+                        </div>
+
+                        <div class="mini-kpis">
+                          <div class="mini-kpi"><div class="l">Prompt</div><div class="v">512 <span class="u">tok</span></div></div>
+                          <div class="mini-kpi"><div class="l">Completion</div><div class="v">84 <span class="u">tok</span></div></div>
+                          <div class="mini-kpi"><div class="l">Prefill</div><div class="v">1 240 <span class="u">tok/s</span></div></div>
+                          <div class="mini-kpi"><div class="l">Decode</div><div class="v">58 <span class="u">tok/s</span></div></div>
+                          <div class="mini-kpi"><div class="l">E2E</div><div class="v">1 670 <span class="u">ms</span></div></div>
+                        </div>
+
+                        <div class="legend">
+                          <span><i class="q"></i>Admission / queue</span>
+                          <span><i class="p"></i>Prefill</span>
+                          <span><i class="d"></i>Decode</span>
+                        </div>
+
+                        <div class="callout">
+                          <strong>Queue jest oddzielony od prefillu.</strong> W czacie TTFT raportował wcześniej całą wartość 220 ms jako „prefill", maskując 40 ms admission. Tu fazy są rozdzielone — wolny prefill (model) odróżnisz od zatkanej kolejki slotów (obciążenie).
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+
+              <tr class="req-row">
+                <td><span class="caret">▸</span></td>
+                <td class="t-time">14:31:44</td>
+                <td>marek</td><td>gpt-oss-120b</td><td>rig24</td><td>vLLM</td>
+                <td class="num">2 048</td><td class="num">320</td><td class="num">540</td><td class="num">47</td><td class="num">7 350</td>
+                <td><span class="status-pill ok">sukces</span></td>
+              </tr>
+              <tr class="req-row">
+                <td><span class="caret">▸</span></td>
+                <td class="t-time">14:31:30</td>
+                <td>kasia</td><td>Qwen3.6-4B</td><td>phone-piotr</td><td>llama.cpp</td>
+                <td class="num">256</td><td class="num u-dim">—</td><td class="num u-dim">—</td><td class="num u-dim">—</td><td class="num">30 000</td>
+                <td><span class="status-pill err">timeout</span></td>
+              </tr>
+              <tr class="req-row">
+                <td><span class="caret">▸</span></td>
+                <td class="t-time">14:31:01</td>
+                <td>bot-meeting</td><td>bge-m3</td><td>rig24</td><td>vLLM <span class="u-dim">(embed)</span></td>
+                <td class="num">480</td><td class="num u-dim">—</td><td class="num u-dim">—</td><td class="num u-dim">—</td><td class="num">95</td>
+                <td><span class="status-pill ok">sukces</span></td>
+              </tr>
+              <tr class="req-row">
+                <td><span class="caret">▸</span></td>
+                <td class="t-time">14:30:48</td>
+                <td>tomek</td><td>gpt-oss-20b</td><td>mac-studio</td><td>llama.cpp</td>
+                <td class="num">768</td><td class="num">156</td><td class="num">410</td><td class="num">39</td><td class="num">4 380</td>
+                <td><span class="status-pill ok">sukces</span></td>
+              </tr>
+              <tr class="req-row">
+                <td><span class="caret">▸</span></td>
+                <td class="t-time">14:30:33</td>
+                <td>anna</td><td>Qwen3.6-27B-Q4</td><td>mac-studio</td><td>MLX</td>
+                <td class="num">640</td><td class="num">98</td><td class="num">350</td><td class="num">44</td><td class="num">2 580</td>
+                <td><span class="status-pill ok">sukces</span></td>
+              </tr>
+              <tr class="req-row">
+                <td><span class="caret">▸</span></td>
+                <td class="t-time">14:30:19</td>
+                <td>piotr</td><td>gpt-oss-120b</td><td>rig24</td><td>vLLM</td>
+                <td class="num">1 536</td><td class="num">288</td><td class="num">510</td><td class="num">49</td><td class="num">6 390</td>
+                <td><span class="status-pill ok">sukces</span></td>
+              </tr>
+              <tr class="req-row">
+                <td><span class="caret">▸</span></td>
+                <td class="t-time">14:30:02</td>
+                <td>kasia</td><td>Qwen3.6-27B</td><td>rig25</td><td>vLLM</td>
+                <td class="num">384</td><td class="num">72</td><td class="num">240</td><td class="num">60</td><td class="num">1 450</td>
+                <td><span class="status-pill ok">sukces</span></td>
+              </tr>
+              <tr class="req-row">
+                <td><span class="caret">▸</span></td>
+                <td class="t-time">14:29:50</td>
+                <td>marek</td><td>Qwen3.6-4B</td><td>phone-piotr</td><td>llama.cpp</td>
+                <td class="num">200</td><td class="num">64</td><td class="num">680</td><td class="num">22</td><td class="num">3 590</td>
+                <td><span class="status-pill ok">sukces</span></td>
+              </tr>
+              <tr class="req-row">
+                <td><span class="caret">▸</span></td>
+                <td class="t-time">14:29:36</td>
+                <td>tomek</td><td>Qwen3.6-27B</td><td>rig24</td><td>vLLM</td>
+                <td class="num">900</td><td class="num u-dim">—</td><td class="num u-dim">—</td><td class="num u-dim">—</td><td class="num">1 200</td>
+                <td><span class="status-pill err">kontekst &gt; limit</span></td>
+              </tr>
+              <tr class="req-row">
+                <td><span class="caret">▸</span></td>
+                <td class="t-time">14:29:21</td>
+                <td>piotr</td><td>Qwen3.6-4B</td><td>phone-piotr</td><td>llama.cpp</td>
+                <td class="num">312</td><td class="num">88</td><td class="num">590</td><td class="num">24</td><td class="num">4 250</td>
+                <td><span class="status-pill ok">sukces</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div style="display:flex;align-items:center;gap:10px;margin-top:14px;font-size:11.5px;color:var(--text-3)">
+          <span>Pokazano 12 z 12 540 zapytań · zakres 24 h</span>
+          <span style="margin-left:auto;display:flex;gap:8px">
+            <button class="btn btn-sm">Poprzednie</button>
+            <button class="btn btn-sm">Następne</button>
+          </span>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

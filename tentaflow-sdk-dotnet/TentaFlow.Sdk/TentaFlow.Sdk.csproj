@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- ===== File: TentaFlow.Sdk.csproj — .NET addon SDK for TentaFlow WASM addons ===== -->
+  <!-- Compiled into the addon's wasm32-wasip1 module via NativeAOT-LLVM; the
+       library itself targets plain net10.0 so it can also be unit-tested on
+       the host. Components.g.cs is produced by tentaflow-sdk-gen
+       (scripts/gen-csharp.sh); the pre-build target regenerates it when the
+       file is missing and cargo is available. -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <IsTrimmable>true</IsTrimmable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>TentaFlow.Sdk</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="TentaFlow.Sdk.Tests" />
+  </ItemGroup>
+
+  <Target Name="RegenerateComponents"
+          BeforeTargets="BeforeCompile"
+          Condition="!Exists('$(MSBuildProjectDirectory)/Components.g.cs')">
+    <Exec Command="bash &quot;$(MSBuildProjectDirectory)/../../scripts/gen-csharp.sh&quot;"
+          Condition="'$(OS)' != 'Windows_NT'" />
+    <Error Text="Components.g.cs is missing — run scripts/gen-csharp.sh first"
+           Condition="!Exists('$(MSBuildProjectDirectory)/Components.g.cs')" />
+  </Target>
+
+</Project>

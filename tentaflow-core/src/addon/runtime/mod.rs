@@ -18,3 +18,14 @@ pub use runtime_wasmtime::*;
 mod runtime_wasmi;
 #[cfg(any(target_os = "ios", target_os = "android"))]
 pub use runtime_wasmi::*;
+
+// Exposed on Desktop ONLY for the wasmi WASI-shim regression test
+// (`tests/addon_dotnet_e2e.rs`), behind the `wasmi-runtime-test` feature.
+// It is a plain `pub mod` (NOT glob re-exported), so the Desktop runtime stays
+// wasmtime — this only makes the mobile shim reachable from a Desktop test that
+// proves a `wasm32-wasip1` .NET module instantiates under the wasmi interpreter.
+#[cfg(all(
+    feature = "wasmi-runtime-test",
+    not(any(target_os = "ios", target_os = "android"))
+))]
+pub mod runtime_wasmi;

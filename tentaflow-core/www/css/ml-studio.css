@@ -2082,6 +2082,47 @@
   line-height: 1.5;
 }
 
+/* Segmented control celu treningu (detekcja / klasyfikator / OCR). Reużywa
+   tokenów kart wariantu (.ml-studio-ft-axis-card) dla spójnego wyglądu. */
+.ml-studio-target-seg {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2, var(--surface-1));
+}
+
+.ml-studio-target-seg-btn {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-weight: 700;
+  padding: 6px 14px;
+  border-radius: calc(var(--radius) - 2px);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.ml-studio-target-seg-btn:hover:not([disabled]) {
+  border-color: var(--accent-1);
+  color: var(--text-1);
+}
+
+.ml-studio-target-seg-btn.selected {
+  background: var(--surface-1);
+  border-color: var(--accent-1);
+  box-shadow: 0 0 0 1px var(--accent-1);
+  color: var(--text-1);
+}
+
+.ml-studio-target-seg-btn[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .ml-studio-ft-method-card {
   flex-direction: column;
 }
@@ -2847,4 +2888,149 @@
   .ml-studio-attr-type-pick { grid-template-columns: repeat(2, 1fr); }
   .ml-studio-schema-config-grid, .ml-studio-schema-config-grid.two { grid-template-columns: 1fr; }
   .ml-studio-attr-detail { grid-template-columns: 1fr; }
+}
+
+/* =============================================================================
+   Widok LIVE — pasek meta (etap · epoka · czas · ETA · VRAM) pod paskiem postępu
+   ============================================================================= */
+.ml-studio-live-info {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.ml-studio-live-info-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-input, var(--surface-1));
+  font-size: 12px;
+}
+
+.ml-studio-live-info-item .icon {
+  width: 14px;
+  height: 14px;
+  color: var(--accent-2, var(--accent));
+}
+
+.ml-studio-live-info-lbl {
+  color: var(--text-3, var(--text-2));
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+.ml-studio-live-info-val {
+  color: var(--text-1);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* =============================================================================
+   Widok "Joby" — nagłówek GPU + tabela uruchomionych treningów
+   ============================================================================= */
+.ml-studio-jobs-gpu {
+  margin-bottom: 18px;
+}
+
+.ml-studio-gpu-card {
+  border: 1px solid var(--accent-1, var(--border));
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  background: linear-gradient(135deg, var(--accent-glow, rgba(99, 102, 241, 0.08)), transparent);
+}
+
+.ml-studio-gpu-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-1);
+}
+
+.ml-studio-gpu-head .icon {
+  color: var(--accent-2, var(--accent));
+}
+
+.ml-studio-gpu-name {
+  margin-right: auto;
+}
+
+.ml-studio-gpu-metric {
+  margin-bottom: 12px;
+}
+
+.ml-studio-gpu-metric:last-child {
+  margin-bottom: 0;
+}
+
+.ml-studio-gpu-metric-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 6px;
+}
+
+.ml-studio-gpu-metric-lbl {
+  font-size: 11px;
+  color: var(--text-3, var(--text-2));
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  font-weight: 700;
+}
+
+.ml-studio-gpu-metric-val {
+  font-size: 13px;
+  font-weight: 800;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+}
+
+.ml-studio-jobs-list tf-table {
+  cursor: pointer;
+}
+
+.ml-studio-job-project {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ml-studio-job-name {
+  font-weight: 700;
+  color: var(--text-1);
+}
+
+.ml-studio-job-stage {
+  font-size: 11px;
+  color: var(--text-3, var(--text-2));
+}
+
+.ml-studio-job-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 140px;
+}
+
+.ml-studio-job-progress tf-progress-bar {
+  flex: 1;
+}
+
+.ml-studio-job-progress-txt {
+  font-size: 11.5px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .ml-studio-job-progress { min-width: 0; }
 }

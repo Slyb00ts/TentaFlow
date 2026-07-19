@@ -25,6 +25,28 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const JOB_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Snapuje rozdzielczość treningu do najbliższej wielokrotności wymaganej przez
+/// backbone danego wariantu RF-DETR — bo serwis rfdetr-training waliduje ten
+/// warunek i odrzuca job z błędem `resolution ... not divisible by ...`.
+///
+/// - `base`/`large` używają backbone DINOv2 (patch_size 14 * num_windows 4 = 56),
+///   więc rozdzielczość musi być wielokrotnością **56** (np. 560, 616, 672).
+/// - `nano`/`small`/`medium` używają windowed attention (patch_size 16 * num_windows
+///   2 = 32), więc wystarczy wielokrotność **32** (np. 576).
+///
+/// Snap jest do NAJBLIŻSZEJ wielokrotności: dla base wejście 560 → 560 (już pasuje),
+/// a 576 → 560 (bo 576 leży bliżej 560 niż 616: |576-560|=16 < |576-616|=40).
+fn snap_resolution(resolution: u32, variant: &str) -> u32 {
+    let step: i64 = match variant {
+        "base" | "large" => 56,
+        _ => 32,
+    };
+    // Zaokrąglenie do najbliższej wielokrotności `step`, z dolnym limitem 224
+    // (najmniejsza sensowna rozdzielczość; jest wielokrotnością i 32, i 56).
+    let r = (resolution as i64).max(224);
+    (((r + step / 2) / step) * step) as u32
+}
+
 /// Startuje trening detekcji w tle. Run o `run_id` musi już istnieć (`running`).
 /// Błędy lądują w statusie runu (`failed`), nie są propagowane.
 #[allow(clippy::too_many_arguments)]
@@ -50,6 +72,8 @@ pub fn spawn_recog_training(
             tracing::warn!(run_id = %run_id, error = %err, "RF-DETR training failed");
             let _ = repository::update_training_run_status(&run_id, "failed");
         }
+        // Sprzątamy wpis live-view niezależnie od wyniku (job już nie żyje).
+        crate::ml_studio::live_view::clear_local_job(&run_id);
     });
 }
 
@@ -147,13 +171,9 @@ async fn run_training_against_dir(
     class_names: &[String],
 ) -> anyhow::Result<()> {
     let output_dir = format!("recog/{}/{}", project_id, run_id);
-    // RF-DETR's windowed attention requires the training resolution to be a multiple
-    // of 32 (patch_size 16 * num_windows 2). Snap any incoming value (e.g. the 560px
-    // inference default) to the nearest valid multiple so a clean train never fails.
-    let resolution = {
-        let r = (hyperparams.resolution as i64).max(224);
-        (((r + 16) / 32) * 32) as u32
-    };
+    // Snap rozdzielczości do wielokrotności wymaganej przez backbone danego wariantu
+    // (patrz `snap_resolution`), aby czysty trening nigdy nie padał na walidacji.
+    let resolution = snap_resolution(hyperparams.resolution, variant);
     let train_body = json!({
         "dataset_dir": dataset_dir.to_string_lossy(),
         "class_names": class_names,
@@ -174,6 +194,8 @@ async fn run_training_against_dir(
         let url = format!("{}/train", base);
         tokio::task::spawn_blocking(move || post_train(&url, train_body)).await??
     };
+    // Rejestracja do live-view: handlery mogą teraz odpytać serwis o postęp.
+    crate::ml_studio::live_view::register_local_job(run_id, &base, &job_id);
 
     let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
     let status_url = format!("{}/status/{}", base, job_id);
@@ -1109,6 +1131,96 @@ pub async fn run_detect(
     Ok((detections.to_string(), width, height))
 }
 
+/// Exports a trained RF-DETR checkpoint to ONNX through the local
+/// rfdetr-training service (POST /export → poll /export_status). Returns the
+/// service-local absolute `onnx_path`; the export also writes `classes.json`
+/// (`{classes, resolution}`) next to it. Both files are readable from Core
+/// because the training service is resolved on THIS node.
+pub async fn run_export(
+    checkpoint_path: String,
+    class_names: Vec<String>,
+    variant: String,
+    resolution: u32,
+    output_dir: String,
+) -> anyhow::Result<String> {
+    const EXPORT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+    const EXPORT_POLL: Duration = Duration::from_secs(3);
+
+    let endpoint = resolve_endpoint()?;
+    let base = endpoint.trim_end_matches('/').to_string();
+    let body = json!({
+        "checkpoint_path": checkpoint_path,
+        "class_names": class_names,
+        "variant": variant,
+        "resolution": resolution,
+        "output_dir": output_dir,
+    });
+    let start_url = format!("{base}/export");
+    let export_id: String = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        let http = http_agent();
+        let mut resp = http
+            .post(&start_url)
+            .send_json(&body)
+            .map_err(|e| anyhow::anyhow!("POST {} failed: {}", start_url, e))?;
+        let value: serde_json::Value = resp
+            .body_mut()
+            .read_json()
+            .map_err(|e| anyhow::anyhow!("decode /export response: {}", e))?;
+        value
+            .get("export_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("/export response without export_id"))
+    })
+    .await??;
+
+    let deadline = tokio::time::Instant::now() + EXPORT_TIMEOUT;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            // The training service exposes no export-cancel endpoint (only
+            // /train, /status, /export, /export_status, /detect) — the worker
+            // thread finishes on its own and releases its export slot; the
+            // caller cleans partial local output under the publish export dir.
+            anyhow::bail!(
+                "ONNX export timed out after {}s",
+                EXPORT_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(EXPORT_POLL).await;
+        let status_url = format!("{base}/export_status/{export_id}");
+        let value: serde_json::Value =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+                let http = http_agent();
+                let mut resp = http
+                    .get(&status_url)
+                    .call()
+                    .map_err(|e| anyhow::anyhow!("GET {} failed: {}", status_url, e))?;
+                resp.body_mut()
+                    .read_json()
+                    .map_err(|e| anyhow::anyhow!("decode /export_status response: {}", e))
+            })
+            .await??;
+        match value.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+            "running" => continue,
+            "succeeded" => {
+                return value
+                    .get("onnx_path")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow::anyhow!("export succeeded without onnx_path"));
+            }
+            "failed" => {
+                let msg = value
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("rfdetr-training export failed");
+                anyhow::bail!("ONNX export failed: {msg}");
+            }
+            other => anyhow::bail!("rfdetr-training unknown export status '{other}'"),
+        }
+    }
+}
+
 fn resolve_endpoint() -> anyhow::Result<String> {
     let pool = crate::db::global_pool()
         .ok_or_else(|| anyhow::anyhow!("core service registry unavailable"))?;
@@ -1177,4 +1289,32 @@ fn get_status(url: &str) -> anyhow::Result<StatusResponse> {
     resp.body_mut()
         .read_json()
         .map_err(|e| anyhow::anyhow!("decode /status response: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snap_resolution;
+
+    #[test]
+    fn snap_base_large_do_wielokrotnosci_56() {
+        // base/large: DINOv2 wymaga wielokrotności 56
+        assert_eq!(snap_resolution(560, "base"), 560); // już pasuje
+        assert_eq!(snap_resolution(576, "base"), 560); // 576 bliżej 560 niż 616
+        assert_eq!(snap_resolution(600, "large"), 616); // 600 bliżej 616 niż 560
+        assert_eq!(snap_resolution(640, "base"), 616); // 640 bliżej 616 niż 672
+    }
+
+    #[test]
+    fn snap_male_warianty_do_wielokrotnosci_32() {
+        // nano/small/medium: windowed attention wymaga wielokrotności 32
+        assert_eq!(snap_resolution(576, "small"), 576); // już pasuje
+        assert_eq!(snap_resolution(560, "nano"), 576); // 560 → najbliższa *32
+        assert_eq!(snap_resolution(600, "medium"), 608);
+    }
+
+    #[test]
+    fn snap_respektuje_dolny_limit() {
+        assert_eq!(snap_resolution(0, "base"), 224);
+        assert_eq!(snap_resolution(100, "small"), 224);
+    }
 }

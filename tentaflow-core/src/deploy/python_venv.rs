@@ -664,6 +664,26 @@ fn create_venv(python: &Path, venv: &Path, log: &LogSink) -> Result<()> {
     .context("tworzenie venv")
 }
 
+/// Per-template-dir build lock. Engines that share a bundle (the three YOLOX
+/// detectors: page-elements / graphic-elements / table-structure) resolve to the
+/// SAME template venv and deploy concurrently at boot. Without serialization they
+/// all run `remove_dir_all` + `python -m venv` + `install_deps` on the same dir
+/// at once: one wins, the others hit a half-built venv ("tworzenie venv exit 1"),
+/// fail, and only recover on a later respawn. All deploys live in this one Core
+/// process, so an in-process lock per template dir is enough — different templates
+/// never contend.
+fn template_build_lock(template_dir: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let map = LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .entry(template_dir.to_path_buf())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+        .clone()
+}
+
 fn prepare_template_env(
     cache: &Path,
     python: &Path,
@@ -679,6 +699,13 @@ fn prepare_template_env(
         .join(&spec.bundle.engine)
         .join(&template_id)
         .join("venv");
+
+    // Serialize the reuse-check + build for THIS template so concurrent deploys of
+    // engines sharing the bundle don't race on the same venv dir. Held through the
+    // whole build; a waiter that wakes after the winner finishes sees the
+    // completion marker below and reuses.
+    let build_lock = template_build_lock(&template_dir);
+    let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
 
     // Marker pisany dopiero po SUKCESIE install_deps + copy_bundle_files.
     // pyvenv.cfg powstaje na samym poczatku `python -m venv`, wiec gdy uv
@@ -1480,13 +1507,16 @@ fn pick_install_variant<'a>(
     // Tagi CUDA degraduja do ogolnego 'cuda', potem do dowolnego wariantu CUDA.
     if backend.starts_with("cuda") {
         if let Some(v) = variants.iter().find(|v| v.backend == "cuda") {
-            // Brak arch-specyficznego wariantu NIE jest problemem: deploy
-            // wstrzykuje dokladny TORCH_CUDA_ARCH_LIST pod wykryte GPU do
-            // ogolnego wariantu 'cuda' (inject_torch_cuda_arch), wiec kernele
-            // i tak kompiluja sie pod realna karte. Stad info!, nie warn!.
-            tracing::info!(
-                "brak arch-specyficznego wariantu '{}', uzywam ogolnego 'cuda' \
-                 (+ wstrzyniety TORCH_CUDA_ARCH_LIST pod wykryte GPU)",
+            // To ZAMIERZONA sciezka, nie fallback z powodu bledu: bundle vLLM
+            // celowo deklaruje JEDEN generyczny wariant 'cuda' (PyPI fat wheels
+            // sm80..sm120), a pod konkretna karte wstrzykujemy dokladny
+            // TORCH_CUDA_ARCH_LIST (inject_torch_cuda_arch), wiec custom-kernele
+            // i tak kompiluja sie pod realne GPU. Osobne bundle per-arch nie sa
+            // potrzebne. Log na debug!, zeby nie wygladal jak problem na kazdej
+            // karcie — deploy dziala poprawnie na Ampere/Ada/Hopper/Blackwell.
+            tracing::debug!(
+                "GPU arch '{}' -> generyczny bundle 'cuda' + TORCH_CUDA_ARCH_LIST \
+                 pod te karte (per-arch bundle nie jest potrzebny)",
                 backend
             );
             return Ok(Some(v));
@@ -1824,6 +1854,36 @@ pub(crate) fn build_engine_args(
     dedup_cli_args_last_wins(args)
 }
 
+/// Zdejmuje `--kv-cache-dtype fp8*` z argv gdy lokalne GPU nie ma sprzetowego
+/// fp8 E4M3 (`fp8e4nv`) — czyli Ampere/starsze. Recommend forsuje fp8 kv-cache
+/// domyslnie dla nvfp4/DeepSeek-V4, ale na karcie bez fp8 vLLM pada w torch.compile
+/// ("type fp8e4nv not supported in this architecture") i EngineCore nie startuje.
+/// Downgrade do `auto` (fp16/bf16 kv) — wagi nvfp4 nadal ida marlinem, kv w fp16.
+/// Detekcja arch: `GpuSnapshot::has_fp8_kv_hardware` (ada/hopper/blackwell/spark).
+pub(crate) fn gate_fp8_kv_cache(args: &mut Vec<String>, log: Option<&LogSink>) {
+    let Some(i) = args.iter().position(|a| a == "--kv-cache-dtype") else {
+        return;
+    };
+    let is_fp8 = args
+        .get(i + 1)
+        .map(|v| v.to_ascii_lowercase().starts_with("fp8"))
+        .unwrap_or(false);
+    if !is_fp8 {
+        return;
+    }
+    if crate::system_check::collect().gpu.has_fp8_kv_hardware() {
+        return;
+    }
+    // Usun flage + wartosc → vLLM uzyje domyslnego `auto`.
+    args.drain(i..=i + 1);
+    let msg = "[native] GPU bez sprzetowego fp8 (Ampere/starsze) — usuwam \
+               --kv-cache-dtype fp8, kv-cache w auto (fp16/bf16)";
+    if let Some(log) = log {
+        log(msg);
+    }
+    tracing::warn!("{msg}");
+}
+
 /// Czy token wyglada jak flaga CLI (`--flag` / `--flag=value` / `-f`).
 fn is_cli_flag(tok: &str) -> bool {
     tok.starts_with('-') && tok.len() > 1 && !tok.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
@@ -2076,7 +2136,9 @@ fn spawn_engine(
         c
     } else {
         let mut c = build_engine_command(&exe);
-        for arg in build_engine_args(spec, &req.env, &req.extra_args, &bundle_dir, venv) {
+        let mut engine_args = build_engine_args(spec, &req.env, &req.extra_args, &bundle_dir, venv);
+        gate_fp8_kv_cache(&mut engine_args, log);
+        for arg in engine_args {
             c.arg(arg);
         }
         c

@@ -38,6 +38,7 @@
   --tf-shadow-sm: 0 2px 6px rgba(0, 0, 0, 0.4);
   --tf-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
   --tf-shadow-lg: 0 24px 64px rgba(0, 0, 0, 0.7), 0 8px 24px rgba(99, 102, 241, 0.15);
+  --tf-shadow-xl: 0 40px 96px rgba(0, 0, 0, 0.78), 0 16px 40px rgba(99, 102, 241, 0.22);
 
   /* real glow halo — cztery warstwy rozmycia, bez ostrego pierscienia */
   --tf-glow-accent:
@@ -1214,6 +1215,11 @@ th.tf-table__sticky-col { box-shadow: 1px 0 0 0 var(--tf-border); }
   text-transform: uppercase;
   white-space: nowrap;
 }
+tf-chip[data-sdk-chip] .tf-chip { text-transform: none; letter-spacing: normal; }
+tf-chip[data-sdk-chip] .tf-chip.active {
+  background: var(--tf-accent-glow);
+  color: var(--tf-accent-2);
+}
 .tf-chip.ok   { background: rgba(34, 197, 94, 0.15);  color: #22c55e; }
 .tf-chip.warn { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
 .tf-chip.err  { background: rgba(239, 68, 68, 0.15);  color: #ef4444; }
@@ -1244,6 +1250,20 @@ th.tf-table__sticky-col { box-shadow: 1px 0 0 0 var(--tf-border); }
   background: currentColor;
   animation: tf-chip-pulse 2s ease-in-out infinite;
 }
+/* Neutral chip: plain framed pill (entity chips carry meaning in the dot). */
+.tf-chip.neutral {
+  background: var(--tf-bg-3, rgba(255, 255, 255, 0.04));
+  color: var(--tf-text-2);
+  border: 1px solid var(--tf-border);
+}
+/* Tone-colored dot independent of the chip status (dot-tone attribute). */
+.tf-chip-dot--tone-neutral  { color: var(--tf-text-3); }
+.tf-chip-dot--tone-muted    { color: var(--tf-text-3); }
+.tf-chip-dot--tone-primary  { color: #a78bfa; }
+.tf-chip-dot--tone-success  { color: #22c55e; }
+.tf-chip-dot--tone-warning  { color: #f59e0b; }
+.tf-chip-dot--tone-critical { color: #ef4444; }
+.tf-chip-dot--tone-info     { color: #60a5fa; }
 .tf-chip .tf-chip-icon {
   width: 12px;
   height: 12px;
@@ -2564,6 +2584,26 @@ tf-progress-bar { display: block; }
 .tf-progress-bar-fill.warning { background: linear-gradient(135deg, #f59e0b 0%, #fbbf24 100%); }
 .tf-progress-bar-fill.danger  { background: var(--tf-gradient-danger); }
 
+/* Vertical orientation: a narrow column whose fill rises from the bottom.
+   The track fills the wrapper height (host sets it via a fixed-height Box);
+   the width comes from the size token. */
+tf-progress-bar[orientation="vertical"] { height: 100%; }
+tf-progress-bar[orientation="vertical"] .tf-progress-bar-wrap { height: 100%; }
+.tf-progress-bar.vertical { width: 6px; height: 100%; }
+.tf-progress-bar.vertical.xs { width: 4px; }
+.tf-progress-bar.vertical.sm { width: 6px; }
+.tf-progress-bar.vertical.md { width: 8px; }
+.tf-progress-bar.vertical.lg { width: 14px; }
+.tf-progress-bar.vertical .tf-progress-bar-fill {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  width: 100%;
+  height: 0;
+  transition: height 0.4s var(--tf-spring-smooth);
+}
+
 .tf-progress-bar-fill::after {
   content: '';
   position: absolute;
@@ -2608,6 +2648,39 @@ tf-badge { display: inline-flex; vertical-align: middle; }
 .tf-badge.success { background: rgba(34, 197, 94, 0.18); color: var(--tf-success); }
 .tf-badge.warning { background: rgba(245, 158, 11, 0.18); color: var(--tf-warning); }
 .tf-badge.info    { background: rgba(96, 165, 250, 0.18); color: var(--tf-info); }
+
+/* Status-dot badge variants (BadgeVariant::Dot / ::Pulse). The dot follows the
+   badge tone (`color` carries the tone), so a Success badge shows a green dot
+   and a Critical badge a red one. `pulse` (Badge.pulse=true, or the Pulse
+   variant) adds a soft expanding halo — a "live" status indicator. */
+tf-badge[variant="dot"] .tf-badge {
+  min-width: 8px;
+  width: 8px;
+  height: 8px;
+  padding: 0;
+  border-radius: 50%;
+  font-size: 0;
+  background: currentColor;
+}
+tf-badge[variant="dot"] .tf-badge:hover { transform: none; }
+tf-badge[variant="pulse"] .tf-badge { gap: 6px; }
+tf-badge[variant="pulse"] .tf-badge::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+tf-badge[variant="pulse"] .tf-badge::before,
+tf-badge[variant="dot"][pulse] .tf-badge {
+  animation: tf-badge-pulse 2s var(--tf-spring-smooth) infinite;
+}
+@keyframes tf-badge-pulse {
+  0% { box-shadow: 0 0 0 0 currentColor; }
+  70% { box-shadow: 0 0 0 6px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
 
 /* =============================================================================
    tf-avatar
@@ -4323,6 +4396,15 @@ tf-modal {
   text-overflow: ellipsis;
 }
 
+.tf-modal-title-icon {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  margin-right: 9px;
+  color: var(--tf-accent-2, var(--tf-accent));
+}
+.tf-modal-title-icon svg { width: 100%; height: 100%; }
+
 .tf-modal-close {
   background: none;
   border: none;
@@ -4689,6 +4771,35 @@ tf-skeleton {
 .tf-split--horizontal > .tf-split__divider { width: 4px; cursor: col-resize; }
 .tf-split--vertical > .tf-split__divider { height: 4px; cursor: row-resize; }
 .tf-split--resizable > .tf-split__divider { touch-action: none; }
+/* Divider variants (Split.divider): "line" keeps an 8px drag hit-area but
+   paints only a centered hairline; "none" hides the divider entirely and
+   separates the panes with a standard gap instead. */
+.tf-split--divider-line > .tf-split__divider { background: transparent; }
+.tf-split--horizontal.tf-split--divider-line > .tf-split__divider {
+  width: 8px;
+  background: linear-gradient(to right, transparent calc(50% - 0.5px), var(--tf-border) calc(50% - 0.5px), var(--tf-border) calc(50% + 0.5px), transparent calc(50% + 0.5px));
+}
+.tf-split--vertical.tf-split--divider-line > .tf-split__divider {
+  height: 8px;
+  background: linear-gradient(to bottom, transparent calc(50% - 0.5px), var(--tf-border) calc(50% - 0.5px), var(--tf-border) calc(50% + 0.5px), transparent calc(50% + 0.5px));
+}
+.tf-split--divider-none { gap: var(--tf-space-md); }
+.tf-split--divider-none > .tf-split__divider { display: none; }
+
+/* Mobile: poziomy split (sidebar | workspace) nie mieści dwóch paneli na wąskim
+   ekranie — panele nachodzą i ściskają się. Stackujemy w pionie, pełną szerokością;
+   inline flex-basis/min-width/max-width (data-driven) nadpisujemy !important. */
+@media (max-width: 720px) {
+  .tf-split--horizontal { flex-direction: column; }
+  .tf-split--horizontal > .tf-split__pane {
+    flex-basis: auto !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    width: 100%;
+  }
+  .tf-split--horizontal > .tf-split__pane--primary { max-height: 45vh; }
+  .tf-split--horizontal > .tf-split__divider { display: none; }
+}
 
 /* ---------- tf-grid (0x0102) ---------- */
 .tf-grid { display: grid; min-width: 0; }
@@ -4880,6 +4991,7 @@ tf-skeleton {
 .tf-card--shadow-medium   { box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08); }
 .tf-card--shadow-elevated { box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12); }
 .tf-card--shadow-floating { box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18); }
+.tf-card--shadow-accent_glow { box-shadow: var(--tf-glow-accent); }
 .tf-card--bg-none    { background: var(--tf-bg-none); }
 .tf-card--bg-subtle  { background: var(--tf-bg-subtle); }
 .tf-card--bg-muted   { background: var(--tf-bg-muted); }
@@ -5378,8 +5490,11 @@ tf-skeleton {
   gap: var(--tf-space-sm);
   cursor: pointer;
 }
-.tf-toggle--label-leading  { flex-direction: row; }
-.tf-toggle--label-trailing { flex-direction: row-reverse; }
+/* DOM order already encodes the label position (renderer appends the label
+   before/after the control) — reversing here made BOTH variants render
+   label-first and the enum meaningless. */
+.tf-toggle--label-leading,
+.tf-toggle--label-trailing { flex-direction: row; }
 .tf-toggle__label { font: inherit; }
 .tf-toggle__hint  { font-size: 0.85em; color: var(--tf-text-3); }
 
@@ -6133,6 +6248,7 @@ tf-skeleton {
 .tf-text--style-body       { font-size: 1rem; }
 .tf-text--style-body_strong { font-size: 1rem; font-weight: 600; }
 .tf-text--style-caption    { font-size: 0.85em; color: var(--tf-text-3); }
+.tf-text--style-caption_strong { font-size: 0.85em; font-weight: 700; }
 .tf-text--style-overline   { font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.05em; }
 .tf-text--style-code       { font-family: var(--tf-font-mono, ui-monospace, monospace); font-size: 0.9em; }
 .tf-text--style-mono       { font-family: var(--tf-font-mono, ui-monospace, monospace); }
@@ -6357,6 +6473,21 @@ tf-skeleton {
 }
 .tf-avatar-source__img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .tf-avatar-source__initials { font-weight: 600; }
+
+/* Deterministic initials palette (B2): a person's initials hash to one bucket,
+   so the same person is always the same color. White glyphs on a gradient. */
+.tf-avatar-source--auto-0,
+.tf-avatar-source--auto-1,
+.tf-avatar-source--auto-2,
+.tf-avatar-source--auto-3,
+.tf-avatar-source--auto-4,
+.tf-avatar-source--auto-5 { color: #fff; }
+.tf-avatar-source--auto-0 { background: linear-gradient(135deg, #6366f1, #a78bfa); }
+.tf-avatar-source--auto-1 { background: linear-gradient(135deg, #0ea5e9, #6366f1); }
+.tf-avatar-source--auto-2 { background: linear-gradient(135deg, #f59e0b, #ef4444); }
+.tf-avatar-source--auto-3 { background: linear-gradient(135deg, #22c55e, #0ea5e9); }
+.tf-avatar-source--auto-4 { background: linear-gradient(135deg, #ec4899, #8b5cf6); }
+.tf-avatar-source--auto-5 { background: linear-gradient(135deg, #14b8a6, #22c55e); }
 .tf-avatar__status {
   position: absolute;
   bottom: 0;
@@ -6782,6 +6913,26 @@ tf-skeleton {
 .tf-pie-chart__legend-swatch--tone-muted    { background: var(--tf-text-3); }
 .tf-pie-chart__legend-label { flex: 1 1 auto; }
 .tf-pie-chart__legend-value { color: var(--tf-text-3); font-variant-numeric: tabular-nums; }
+
+/* =============================================================================
+   tf-relation-graph (RelationGraph 0x0703)
+   ============================================================================= */
+
+tf-relation-graph {
+  display: block;
+  width: 100%;
+  min-height: 320px;
+  /* Fills the leftover height when placed in a flex column (graph canvas
+     panes); inert in plain block flow. */
+  flex: 1 1 auto;
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-lg);
+  background:
+    radial-gradient(ellipse 70% 60% at 46% 46%, rgba(99, 102, 241, 0.09), transparent 70%),
+    var(--tf-bg);
+}
 
 /* =============================================================================
    tf-heatmap (Heatmap 0x021B) + tf-gauge (Gauge 0x021C) — chunk 3.3d-12
@@ -8226,23 +8377,97 @@ tf-skeleton {
 .tf-video-stream__video { display: block; width: 100%; height: 100%; }
 
 /* --- LiveCameraTile (0x0605) --- */
-.tf-live-camera { position: relative; display: inline-block; background: #000; overflow: hidden; }
-.tf-live-camera__video { display: block; width: 100%; height: 100%; object-fit: cover; }
-.tf-live-camera__overlay {
-  position: absolute; bottom: 0; left: 0; right: 0;
-  display: flex; align-items: center; gap: var(--tf-space-sm);
-  padding: var(--tf-space-xs) var(--tf-space-sm);
-  background: linear-gradient(transparent, rgba(0,0,0,.6));
-  color: #fff; font-size: 0.8em;
+/* Wideo wypelnia CALY kafelek; etykiety sa nalozone (absolute) na obraz —
+   jak mockup .video-tile / .video-tile-overlay-top / -bottom. Kafelek jest
+   blokiem 100% szerokosci komorki gridu, wysokosc wynika z aspect-ratio. */
+.tf-live-camera {
+  position: relative; display: block; width: 100%;
+  background: #000; overflow: hidden;
+  border-radius: var(--tf-radius-md, 8px);
+  border: 1px solid var(--tf-border, rgba(255,255,255,.08));
 }
-.tf-live-camera__label { font-weight: 600; }
-.tf-live-camera__status { opacity: 0.85; }
-.tf-live-camera__status[data-status="online"] { color: var(--tf-color-success, #22c55e); }
-.tf-live-camera__status[data-status="offline"] { color: var(--tf-color-critical, #ef4444); }
-.tf-live-camera__status[data-status="error"] { color: var(--tf-color-warning, #f59e0b); }
-.tf-live-camera__fps { margin-left: auto; opacity: 0.7; }
+.tf-live-camera__video { display: block; width: 100%; height: 100%; object-fit: cover; }
+/* Host tf-video-stream tez ma wypelnic kafelek. */
+.tf-live-camera__stream { position: absolute; inset: 0; width: 100%; height: 100%; }
+
+/* Nakladki: z-index 30 — NAD canvasem detekcji (z-index 20), pod niczym innym.
+   pointer-events none, zeby nie blokowac dblclick->fullscreen na wideo. */
+.tf-live-camera__overlay,
+.tf-live-camera__overlay-bottom {
+  position: absolute; left: 0; right: 0; z-index: 30;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: var(--tf-space-sm, 8px);
+  padding: 8px 10px; color: #fff; font-size: 11px;
+  pointer-events: none;
+}
+.tf-live-camera__overlay { top: 0; background: linear-gradient(180deg, rgba(0,0,0,.7), transparent); }
+.tf-live-camera__overlay-bottom { bottom: 0; background: linear-gradient(0deg, rgba(0,0,0,.7), transparent); }
+
+.tf-live-camera__title {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-weight: 700; font-size: 11.5px;
+}
+.tf-live-camera__icon {
+  width: 12px; height: 12px; flex: 0 0 auto;
+  background: currentColor;
+  -webkit-mask: no-repeat center / contain
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z'/%3E%3Ccircle cx='12' cy='13' r='4'/%3E%3C/svg%3E");
+  mask: no-repeat center / contain
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z'/%3E%3Ccircle cx='12' cy='13' r='4'/%3E%3C/svg%3E");
+}
+.tf-live-camera__label { font-weight: 700; }
+
+/* Status jako maly zaokraglony chip: ONLINE zielony, OFFLINE czerwony. */
+.tf-live-camera__status {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 7px; border-radius: 4px;
+  font-weight: 700; font-size: 10px; text-transform: uppercase;
+  background: rgba(255,255,255,.12);
+}
+.tf-live-camera__status[data-status="online"] {
+  background: rgba(34,197,94,.85); color: #fff;
+}
+.tf-live-camera__status[data-status="offline"] {
+  background: rgba(239,68,68,.85); color: #fff;
+}
+.tf-live-camera__status[data-status="error"] {
+  background: rgba(245,158,11,.9); color: #0a0a14;
+}
+
+.tf-live-camera__fps {
+  display: inline-flex; align-items: center;
+  padding: 2px 7px; border-radius: 4px; font-size: 10px; font-weight: 700;
+  background: rgba(255,255,255,.12); color: #fff;
+}
+
+/* Grupa badge'y naglowka po prawej: ms, fps (kliencki), status. */
+.tf-live-camera__badges {
+  display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto;
+}
+
+/* Badge ms (czas obrobki backendu) — chip jak status, tlo fioletowo-szare. */
+.tf-live-camera__proc {
+  display: inline-flex; align-items: center;
+  padding: 2px 7px; border-radius: 4px;
+  font-weight: 700; font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  background: rgba(139,92,246,.85); color: #fff;
+}
+/* Badge fps (kliencki klatkaz wideo) — chip jak status, tlo niebieskie. */
+.tf-live-camera__vidfps {
+  display: inline-flex; align-items: center;
+  padding: 2px 7px; border-radius: 4px;
+  font-weight: 700; font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  background: rgba(59,130,246,.85); color: #fff;
+}
+.tf-live-camera__time {
+  margin-left: auto; font-size: 10.5px; letter-spacing: .02em;
+  font-family: var(--tf-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+}
+
 .tf-live-camera__fullscreen {
-  position: absolute; top: var(--tf-space-xs); right: var(--tf-space-xs);
+  position: absolute; top: 8px; right: 8px; z-index: 31;
   background: rgba(0,0,0,.5); color: #fff; border: none; border-radius: 4px;
   padding: 2px 6px; cursor: pointer; font-size: 1.1em; line-height: 1;
 }

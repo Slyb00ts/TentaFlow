@@ -262,7 +262,7 @@ fn run_autolabel(job_id: &str, train_dir: &Path, threshold: f32, mode: &str) -> 
         }
     }
 
-    let mut detector = RfDetrDetector::load().context("ładowanie detektora RF-DETR")?;
+    let detector = RfDetrDetector::load().context("ładowanie detektora RF-DETR")?;
 
     // Detections produced per image id during inference. Published only after a FRESH
     // re-read of the COCO file below, so a manual save made DURING this (minutes-long)

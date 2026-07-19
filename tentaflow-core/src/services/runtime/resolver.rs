@@ -81,13 +81,6 @@ pub enum ResolveError {
         #[source]
         source: ContextLimitError,
     },
-    /// Alias references a primary target that is not in the catalog.
-    /// Surfaced as a fatal config error rather than silently falling
-    /// through to fallbacks — production traffic landing on a fallback
-    /// because someone typo'd `target_model` is exactly the kind of
-    /// invisible misconfiguration a shared id space must prevent.
-    #[error("alias '{alias}' targets unknown primary model '{primary}'")]
-    AliasPrimaryMissing { alias: String, primary: String },
 }
 
 /// Provider lokalnego node_id. Resolver woła go per resolve żeby zawsze
@@ -121,6 +114,12 @@ impl AliasResolver {
             handles,
             local_node_id: Arc::new(move || local_node_id.clone()),
         }
+    }
+
+    /// Biezacy id lokalnego wezla (writer dla metryk modeli). Reuse tego samego
+    /// providera co resolver, zeby metryki i routing zawsze widzialy ten sam id.
+    pub fn local_node_id(&self) -> String {
+        (self.local_node_id)()
     }
 }
 
@@ -267,12 +266,16 @@ impl AliasResolver {
     }
 
     /// Inner alias walk: visits the primary first, then each fallback in
-    /// declared order. A missing or broken primary is fatal — that
-    /// signals a config bug (typo, deleted target) and silently routing
-    /// to fallbacks would hide the misconfiguration in production. A
-    /// fallback that fails (cycle, depth limit, unknown id) is logged
-    /// and skipped because fallbacks exist precisely to absorb partial
-    /// outages.
+    /// declared order. A missing or broken primary is NOT fatal — an alias
+    /// exists precisely so that when its primary is unreachable (its owning
+    /// node offline is, functionally, a transport failure) traffic falls
+    /// through to a live fallback. So the primary is tried like any other
+    /// candidate and skipped on absence/failure, then every fallback is
+    /// tried. If NOTHING resolves, the caller reports it as unresolved (404).
+    /// A genuine typo in `target_model` therefore surfaces as persistent
+    /// fallback usage (`alias_fallback_total`) and an empty resolution when
+    /// no fallback covers it — not a hard error that also kills the healthy
+    /// fallback path (which used to break fallback exactly when it mattered).
     fn walk_alias_targets(
         &self,
         req: &ResolveRequest<'_>,
@@ -284,13 +287,25 @@ impl AliasResolver {
         out: &mut Vec<ResolvedExecutionTarget>,
         dropped_no_live: &mut bool,
     ) -> Result<(), ResolveError> {
-        let primary = lookup_entry(snapshot, primary_target).ok_or_else(|| {
-            ResolveError::AliasPrimaryMissing {
-                alias: alias_id.to_string(),
-                primary: primary_target.to_string(),
+        match lookup_entry(snapshot, primary_target) {
+            Some(primary) => {
+                if let Err(e) = self.expand_into(req, snapshot, primary, ctx, out, dropped_no_live) {
+                    tracing::trace!(
+                        alias = alias_id,
+                        primary = primary_target,
+                        error = %e,
+                        "alias primary skipped — trying fallbacks"
+                    );
+                }
             }
-        })?;
-        self.expand_into(req, snapshot, primary, ctx, out, dropped_no_live)?;
+            None => {
+                tracing::trace!(
+                    alias = alias_id,
+                    primary = primary_target,
+                    "alias primary not in catalog (node offline?) — falling through to fallbacks"
+                );
+            }
+        }
         for fb in fallback_targets {
             let Some(fb_entry) = lookup_entry(snapshot, fb) else {
                 tracing::trace!(
@@ -315,11 +330,11 @@ impl AliasResolver {
     /// instances of the same model produce multiple candidates — strategy
     /// ranking decides which one wins per request.
     ///
-    /// Embedded in-process silniki (llama.cpp/MLX/sherpa) NIE mają rerankera —
-    /// dla `surface=Rerank` pomijamy ich lokalne handle już na poziomie
-    /// resolvera, żeby nie trafiały do failover chain jako kandydat, który
-    /// dispatcher i tak odrzuci jako `Internal`. Mesh/HTTP/QUIC kandydaci
-    /// (zewnętrzny cross-encoder, np. vLLM `--task score`) przechodzą bez zmian.
+    /// Embedded MLX reranker (jina-reranker-v3) obsługuje `surface=Rerank`
+    /// in-process przez MLXBridge, więc embedded handle rerankera JEST poprawnym
+    /// kandydatem Local{Embedded} — dispatch (rerank_forward / executor) kieruje
+    /// go do `mlx_swift_bridge::rerank`. Mesh/HTTP/QUIC (zewnętrzny cross-encoder)
+    /// bez zmian.
     fn emit_service_model(
         &self,
         surface: ServiceSurface,
@@ -340,11 +355,6 @@ impl AliasResolver {
                 && inst.node_id == local_id;
             if is_local {
                 if let Some(handle) = self.handles.get(&inst.node_id, inst.service_id) {
-                    if surface == ServiceSurface::Rerank
-                        && matches!(handle, crate::services::handles_cache::BackendHandle::Embedded { .. })
-                    {
-                        continue;
-                    }
                     out.push(ResolvedExecutionTarget::Local {
                         model_name: model_name.to_string(),
                         service_id: inst.service_id,
@@ -607,14 +617,11 @@ mod tests {
         }
     }
 
-    /// RAG C2 (bug 3): embedded in-process silnik NIE ma rerankera, więc nawet
-    /// gdy wpis katalogu deklaruje `Rerank`, resolver NIE może go wystawić jako
-    /// kandydata Local{Embedded} — inaczej dispatcher dopiero na dispatchu
-    /// failowałby `embedded does not support reranking` i logował jako porażkę
-    /// kandydata. Embedded-only `Rerank` → brak kandydata (`NoLiveInstance`,
-    /// bo capability pasuje, ale żaden non-embedded handle nie żyje).
+    /// Embedded MLX reranker (jina-reranker-v3) obsługuje `Rerank` in-process,
+    /// więc embedded handle JEST poprawnym kandydatem Local{Embedded} dla
+    /// `surface=Rerank` — dispatch kieruje go do `mlx_swift_bridge::rerank`.
     #[test]
-    fn embedded_is_not_a_rerank_candidate() {
+    fn embedded_is_a_rerank_candidate() {
         let entry = service_entry_with_service_id(
             "cross-encoder",
             "local",
@@ -625,12 +632,20 @@ mod tests {
         let resolver = resolver_with_embedded("local", 9, "cross-encoder");
         let mut ctx = ExecutionContext::new(None);
 
-        let err = resolver
+        let outcome = resolver
             .resolve(&rerank_request("cross-encoder"), &snap, &mut ctx)
-            .expect_err("embedded must not be a rerank candidate");
+            .expect("embedded MLX reranker must be a valid rerank candidate");
+        assert_eq!(outcome.candidates.len(), 1);
         assert!(
-            matches!(err, ResolveError::NoLiveInstance(_)),
-            "expected NoLiveInstance (embedded filtered, no live rerank handle), got {err:?}"
+            matches!(
+                outcome.candidates[0],
+                ResolvedExecutionTarget::Local {
+                    handle: crate::services::handles_cache::BackendHandle::Embedded { .. },
+                    ..
+                }
+            ),
+            "expected Local{{Embedded}} rerank candidate, got {:?}",
+            outcome.candidates[0]
         );
     }
 
@@ -888,32 +903,60 @@ mod tests {
         }
     }
 
-    /// Alias references a primary target that doesn't exist in the
-    /// snapshot — typo in `model_aliases.target_model` or stale entry
-    /// after the target was deleted. Resolution must fail loudly so the
-    /// operator sees the misconfiguration, instead of silently routing
-    /// to a fallback (which would hide the real problem).
+    /// Alias primary is offline (absent from the snapshot) but a healthy
+    /// fallback exists — resolution MUST fall through to the fallback. This
+    /// is the whole point of a fallback chain (OPZ RTG-02): the primary's
+    /// node going offline is a transport failure, and the request has to
+    /// keep working on the fallback instead of 404-ing.
     #[test]
-    fn alias_with_missing_primary_returns_error() {
+    fn alias_offline_primary_falls_through_to_fallback() {
+        let entries = vec![
+            alias(
+                "fb-alias",
+                "offline-primary",
+                &["live-fallback"],
+                Strategy::FirstAvailable,
+            ),
+            // Fallback lives on a peer → emitted as a MeshForward candidate
+            // (always live, no local handle needed).
+            service_entry("live-fallback", "peer-x", vec![ServiceSurface::Chat], vec![], vec![]),
+        ];
+        let snap = snapshot(entries);
+        let resolver = resolver_for("local");
+        let mut ctx = ExecutionContext::new(None);
+        let outcome = resolver
+            .resolve(&chat_request("fb-alias"), &snap, &mut ctx)
+            .expect("offline primary must fall through to the live fallback");
+        assert!(
+            outcome.candidates.iter().any(|c| matches!(
+                c,
+                ResolvedExecutionTarget::MeshForward { model_name, .. } if model_name == "live-fallback"
+            )),
+            "expected the live fallback among candidates, got {:?}",
+            outcome.candidates
+        );
+    }
+
+    /// Both primary and every fallback are absent — nothing resolves, so
+    /// the caller gets an unresolved error (surfaced as 404 upstream), NOT
+    /// a healthy path silently taken.
+    #[test]
+    fn alias_all_targets_missing_yields_unresolved() {
         let entries = vec![alias(
             "stale-alias",
             "deleted-target",
-            &["fallback-one"],
+            &["also-gone"],
             Strategy::FirstAvailable,
         )];
         let snap = snapshot(entries);
         let resolver = resolver_for("local");
         let mut ctx = ExecutionContext::new(None);
-        let err = resolver
-            .resolve(&chat_request("stale-alias"), &snap, &mut ctx)
-            .unwrap_err();
-        match err {
-            ResolveError::AliasPrimaryMissing { alias, primary } => {
-                assert_eq!(alias, "stale-alias");
-                assert_eq!(primary, "deleted-target");
-            }
-            other => panic!("expected AliasPrimaryMissing, got {:?}", other),
-        }
+        assert!(
+            resolver
+                .resolve(&chat_request("stale-alias"), &snap, &mut ctx)
+                .is_err(),
+            "an alias whose primary and fallbacks are all missing must not resolve"
+        );
     }
 
     /// One fallback alias is broken (cycle), the other points at a

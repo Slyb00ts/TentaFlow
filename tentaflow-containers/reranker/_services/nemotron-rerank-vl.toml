@@ -8,6 +8,7 @@
 
 [engine]
 id = "nemotron-rerank-vl"
+backend = "vllm"  # served by vLLM — drives gpu_memory_utilization + VRAM calculator
 provider = "tentaflow"
 category = "reranker"
 name = "NVIDIA Llama-Nemotron Rerank VL"

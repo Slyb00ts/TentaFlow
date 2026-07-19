@@ -125,6 +125,13 @@ pub struct CameraUpdateInput {
     /// flow. The host validates the flow exists and is active before persisting.
     #[n(8)]
     pub analysis_flow_id: Option<String>,
+    /// Patch the per-camera CV pipeline id (`camera_cv_pipelines.id`). Same
+    /// tri-state encoding as `analysis_flow_id`: `None` leaves the assignment
+    /// untouched, `Some("")` clears it (camera falls back to the default
+    /// pipeline), `Some(id)` assigns after the host verifies the pipeline
+    /// exists.
+    #[n(9)]
+    pub cv_pipeline_id: Option<String>,
 }
 
 impl CameraUpdateInput {
@@ -215,6 +222,10 @@ pub struct CameraInfoOut {
     /// `None` on surfaces that do not compute it.
     #[n(15)]
     pub access_level: Option<String>,
+    /// Per-camera CV pipeline id (empty/absent = the default pipeline). Lets
+    /// the UI preselect the camera's current pipeline assignment.
+    #[n(16)]
+    pub cv_pipeline_id: Option<String>,
 }
 
 /// Output of `camera_list_v1`.
@@ -305,6 +316,92 @@ pub struct CameraAnalysisFlowOut {
 pub struct CameraAnalysisFlowsOut {
     #[n(0)]
     pub flows: Vec<CameraAnalysisFlowOut>,
+}
+
+/// One camera CV pipeline as listed by `camera_cv_pipelines_list_v1` (the
+/// per-camera pipeline picker + the pipeline manager list). The JSON body is
+/// fetched per-pipeline via `camera_cv_pipeline_get_v1`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct CameraCvPipelineSummary {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub name: String,
+    /// Seed-owned default pipeline (cannot be deleted; cameras without an
+    /// explicit assignment resolve to it).
+    #[n(2)]
+    pub is_default: bool,
+    #[n(3)]
+    pub updated_at: i64,
+}
+
+/// Output of `camera_cv_pipelines_list_v1`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct CameraCvPipelinesOut {
+    #[n(0)]
+    pub pipelines: Vec<CameraCvPipelineSummary>,
+}
+
+/// Input carrying a single pipeline id — shared by `camera_cv_pipeline_get_v1`
+/// and `camera_cv_pipeline_delete_v1`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct CameraCvPipelineIdInput {
+    #[n(0)]
+    pub id: String,
+}
+
+/// Output of `camera_cv_pipeline_get_v1` — one pipeline with its full JSON
+/// body (`{"stages":[...]}` per `cv_pipeline::CvPipeline`).
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct CameraCvPipelineOut {
+    #[n(0)]
+    pub id: String,
+    #[n(1)]
+    pub name: String,
+    #[n(2)]
+    pub pipeline_json: String,
+}
+
+/// Input for `camera_cv_pipeline_save_v1`. `id = None` creates a new pipeline
+/// under a fresh uuid; `Some(id)` upserts that row (the seed-owned default
+/// flag is never writable through this surface).
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct CameraCvPipelineSaveInput {
+    #[n(0)]
+    pub id: Option<String>,
+    #[n(1)]
+    pub name: String,
+    #[n(2)]
+    pub pipeline_json: String,
+}
+
+/// Output of `camera_cv_pipeline_save_v1`. Validation failures (structural
+/// `cv_pipeline::validate` + alias existence) come back as `id = None` +
+/// a human-readable `error` the addon can display verbatim.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct CameraCvPipelineSaveOut {
+    #[n(0)]
+    pub id: Option<String>,
+    #[n(1)]
+    pub error: Option<String>,
+}
+
+/// Output of `camera_cv_pipeline_delete_v1`. A refused delete (default
+/// pipeline, still referenced by cameras, missing row) comes back as
+/// `deleted = false` + a human-readable `error`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct CameraCvPipelineDeleteOut {
+    #[n(0)]
+    pub deleted: bool,
+    #[n(1)]
+    pub error: Option<String>,
 }
 
 /// Output of `camera_snapshot_v1`. `data_b64` is the base64-encoded RGB24
@@ -514,6 +611,44 @@ mod tests {
             analysis_flow_id: Some("00000000-0000-4000-8000-000000000020".into()),
             owner_addon_id: Some("go2".into()),
             access_level: Some("granted".into()),
+            cv_pipeline_id: Some("00000000-0000-4000-8000-000000000030".into()),
+        });
+    }
+
+    #[test]
+    fn roundtrip_cv_pipeline_payloads() {
+        roundtrip(&CameraCvPipelinesOut {
+            pipelines: vec![CameraCvPipelineSummary {
+                id: "00000000-0000-4000-8000-000000000030".into(),
+                name: "Analiza domyślna (ADR)".into(),
+                is_default: true,
+                updated_at: 1_700_000_000,
+            }],
+        });
+        roundtrip(&CameraCvPipelineIdInput {
+            id: "00000000-0000-4000-8000-000000000030".into(),
+        });
+        roundtrip(&CameraCvPipelineOut {
+            id: "00000000-0000-4000-8000-000000000030".into(),
+            name: "Analiza domyślna (ADR)".into(),
+            pipeline_json: "{\"stages\":[]}".into(),
+        });
+        roundtrip(&CameraCvPipelineSaveInput {
+            id: None,
+            name: "Custom".into(),
+            pipeline_json: "{\"stages\":[]}".into(),
+        });
+        roundtrip(&CameraCvPipelineSaveOut {
+            id: Some("00000000-0000-4000-8000-000000000031".into()),
+            error: None,
+        });
+        roundtrip(&CameraCvPipelineSaveOut {
+            id: None,
+            error: Some("invalid pipeline: duplicate stage_id 'detect'".into()),
+        });
+        roundtrip(&CameraCvPipelineDeleteOut {
+            deleted: false,
+            error: Some("the default pipeline cannot be deleted".into()),
         });
     }
 

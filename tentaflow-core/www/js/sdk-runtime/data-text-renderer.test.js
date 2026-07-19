@@ -104,6 +104,32 @@ test('Text max_lines=0 throws', () => {
   ])));
 });
 
+test('Text streaming=true dodaje klasę caret, false ją zdejmuje', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({ entries: [{ path: PATH('stream'), value: true }], state_revision: 0, truncated: false });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TEXT_TAG, [
+    [0, { kind: 'literal', value: 'partial' }], [1, 'body'],
+    [7, { kind: 'bound', path: PATH('stream') }],
+  ]));
+  assert(el.classList.contains('sdk-text--streaming'), 'caret class while streaming');
+  store.applyPatch({
+    base_revision: 0, new_revision: 1,
+    ops: [{ path: PATH('stream'), op: { kind: 'set', value: false } }],
+  });
+  assert(!el.classList.contains('sdk-text--streaming'), 'caret removed when stream ends');
+});
+
+test('Text bez streaming nie ma klasy caret', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(TEXT_TAG, [
+    [0, { kind: 'literal', value: 'x' }], [1, 'body'],
+  ]));
+  assert(!el.classList.contains('sdk-text--streaming'));
+});
+
 test('Text max_lines>0 ustawia CSS var', () => {
   setup();
   const engine = makeEngine();

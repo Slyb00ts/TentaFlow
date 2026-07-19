@@ -250,6 +250,64 @@ AspectRatio (discriminated union, always CBOR map z `kind` keyem):
   - { kind: "3:2" } | { kind: "2:1" } | { kind: "9:16" } | { kind: "3:4" }
   - { kind: "custom", ratio: f32 }                                          // width/height
 
+BorderColor (enum, tstr):                                                   // semantic → theme CSS var
+  "default" | "hover" | "accent" | "success" | "warning" | "danger" | "transparent"
+
+BorderLineStyle (enum, tstr):
+  "solid" | "dashed" | "none"
+
+Overflow (enum, tstr):
+  "visible" | "hidden" | "auto" | "scroll"
+
+SpaceValue (discriminated union, always CBOR map z `kind`):                 // margins/paddings BoxStyle
+  - { kind: "token", value: Spacing }
+  - { kind: "px",    value: u16 }
+
+RadiusValue (discriminated union, always CBOR map z `kind`):                // narożniki BoxStyle
+  - { kind: "token", value: RadiusToken }
+  - { kind: "px",    value: u16 }
+
+BorderSide:                                                                 // jedna krawędź borderu
+  0: width_px        u8
+  1: color           BorderColor
+  2: style           BorderLineStyle                                        // "none" wyłącza krawędź
+
+EdgeValues:                                                                 // per-krawędź; brak klucza = default kontenera
+  0: top             SpaceValue or null
+  1: right           SpaceValue or null
+  2: bottom          SpaceValue or null
+  3: left            SpaceValue or null
+  // Skróty all/x/y rozwiązują buildery SDK — wire niesie wyłącznie krawędzie.
+
+BorderEdges:
+  0: top             BorderSide or null
+  1: right           BorderSide or null
+  2: bottom          BorderSide or null
+  3: left            BorderSide or null
+
+CornerValues:
+  0: top_left        RadiusValue or null
+  1: top_right       RadiusValue or null
+  2: bottom_right    RadiusValue or null
+  3: bottom_left     RadiusValue or null
+
+BoxStyle:                                                                   // wspólny styling kontenerów (Flex/Grid/Stack/Box/Card/SectionCard `style`)
+  0: margin          EdgeValues or null
+  1: padding         EdgeValues or null
+  2: border          BorderEdges or null
+  3: background      BackgroundToken or null
+  4: radius          CornerValues or null
+  5: width           DimensionToken or null
+  6: height          DimensionToken or null
+  7: min_width       DimensionToken or null
+  8: min_height      DimensionToken or null
+  9: max_width       DimensionToken or null
+  10: max_height     DimensionToken or null
+  11: overflow_x     Overflow or null
+  12: overflow_y     Overflow or null
+  // Renderer aplikuje BoxStyle PO tokenowych polach kontenera (inline style
+  // nadpisuje klasy tokenowe). Px → inline style; tokeny → var(--tf-*).
+
 Trend:
   direction: TrendDirection                                                 // "up" | "down" | "flat"
   percent: f64                                                              // -100..+inf (finite; Value-roundtrip path requires f64)
@@ -1060,6 +1118,7 @@ Fields:
   6: padding         Spacing or null
   7: background      BackgroundToken or null        // "none" | "subtle" | "muted" | "accent"
   8: radius          RadiusToken or null
+  9: style           BoxStyle or null               // §1.5 — nadpisuje pola tokenowe
 Handlers: none
 ```
 
@@ -1076,6 +1135,7 @@ Fields:
   4: children        array<GridChild>               // { component, col_span?, row_span?, col_start? }
   5: padding         Spacing or null
   6: align_items     FlexAlign or null
+  7: style           BoxStyle or null               // §1.5
 
 GridTrack (discriminated union, always CBOR map z `kind`):
   - { kind: "equal",    count: u8 }                                 // N equal-width columns
@@ -1097,6 +1157,8 @@ Fields:
   1: align           FlexAlign
   2: children        array<Component>
   3: padding         Spacing or null
+  4: justify         FlexJustify or null            // rozkład na głównej (pionowej) osi
+  5: style           BoxStyle or null               // §1.5
 ```
 
 ### 0x0104 — `Cluster`
@@ -1124,6 +1186,18 @@ Fields:
   4: resizable       bool
   5: primary_slot    tstr
   6: secondary_slot  tstr
+  7: collapse_below  Breakpoint or null             // below this container width the split
+                                                    // stacks as a column (primary above
+                                                    // secondary); divider/resize disabled
+  8: divider         SplitDivider or null           // "handle" (default) | "line" | "none"
+                                                    // handle = classic draggable bar;
+                                                    // line = hairline (still draggable when
+                                                    // resizable); none = hidden divider,
+                                                    // panes separated by a standard gap
+  9: grow            bool or null                   // self-as-flex-child: true = split
+                                                    // wypelnia wolna przestrzen rodzica flex
+                                                    // (flex-grow:1, basis zostaje auto);
+                                                    // brak/false = rozmiar od contentu
 
 SplitSize (discriminated union, always CBOR map z `kind`):
   - { kind: "auto" }
@@ -1148,6 +1222,7 @@ Fields:
   8: children        array<Component>
   9: interactive     bool                           // hover/focus visuals
   10: clickable      bool                           // emits "click" event
+  11: style          BoxStyle or null               // §1.5
 Handlers:
   "click":           Handler (if clickable=true)
 ```
@@ -1172,6 +1247,7 @@ Fields:
   11: border         BorderToken
   12: background     BackgroundToken
   13: accent         Tone or null                    // left-edge accent bar
+  14: style          BoxStyle or null                // §1.5
 Handlers: none
 ```
 
@@ -1316,6 +1392,29 @@ Fields:
   5: virtualize      bool                            // virtual scroll dla long lists
 Handlers:
   "scroll_end":      Handler                         // infinite scroll trigger
+```
+
+### 0x0115 — `Box`
+
+Uniwersalny, przezroczysty kontener („div"): kontrola dziecka wewnątrz
+Flex/Cluster (grow/align_self/width/margin), pełne stylowanie pudełka przez
+`BoxStyle` (§1.5) i opcjonalne proste zachowanie flex dla własnych dzieci.
+Wszystkie pola opcjonalne — pusty Box renderuje się jako goły `div.tf-box`.
+
+```
+Fields:
+  0: width           DimensionToken or null
+  1: grow            bool or null                   // flex-grow:1 wewnątrz rodzica flex
+  2: align_self      FlexAlign or null
+  3: padding         Spacing or null                // token na wszystkie krawędzie
+  4: margin          Spacing or null                // token na wszystkie krawędzie
+  5: children        array<Component>
+  6: style           BoxStyle or null               // §1.5 — margin/padding/border/bg/radius/wymiary/overflow
+  7: direction       FlexDirection or null          // dowolne z 7-10 włącza display:flex
+  8: gap             Spacing or null
+  9: align           FlexAlign or null
+  10: justify        FlexJustify or null
+Handlers: none
 ```
 
 ---
@@ -1474,6 +1573,8 @@ Fields:
   4: avatar          AvatarRef or null
   5: selected        BindRef<bool> or null            // dla "selectable" variant
   6: removable       bool                             // adds X button
+  7: dot             Tone or null                     // leading status dot colored by
+                                                      // this tone, independent of chip tone
 Handlers:
   "click":           Handler (jeśli selectable/toggle)
   "remove":          Handler (jeśli removable)
@@ -1922,6 +2023,9 @@ Fields:
   16: readonly       BindRef<bool> or null
   17: error          BindRef<tstr> or null            // shown when not null
   18: size           InputSize                        // "sm" | "md" | "lg"
+  19: variant        InputVariant or null             // "outlined" (default) | "ghost"
+                                                      // ghost = borderless/transparent field
+                                                      // blending into content (inline titles)
 Handlers:
   "input":           Handler                           // emitted on each keystroke (debounce-able)
   "change":          Handler                           // emitted on blur z committed value
@@ -1962,6 +2066,7 @@ Fields:
   12: autoresize     bool                             // grow with content
   13: max_rows       u8 or null                      // cap autoresize
   14: monospace      bool                             // dla code-style input
+  15: variant        InputVariant or null             // "outlined" (default) | "ghost"
 Handlers:
   "input":           Handler
   "change":          Handler
@@ -3208,6 +3313,24 @@ Fields:
   2: tone            Tone
 ```
 
+### 0x0612 — `AudioCapture`
+
+Mikrofon w panelu addona. Nagrywa wypowiedź użytkownika (push-to-talk lub VAD),
+uploaduje gotowy WAV przez kanał document-upload i emituje `action_id` z
+referencją nagrania (bajty audio NIGDY nie jadą w evencie). Host wymaga
+uprawnienia `audio.capture` — addon bez grantu nie dostaje audio (fail-closed).
+
+```
+Fields:
+  0: action_id       tstr                             // backend action z params {doc_ref, mime, sample_rate, duration_ms, size, language_hint?}
+  1: mode            AudioCaptureMode                 // "push_to_talk" | "vad"
+  2: silence_ms      u16 or null                      // VAD: cisza kończąca wypowiedź (default 800)
+  3: min_speech_ms   u16 or null                      // VAD: min. długość mowy (default 200)
+  4: language_hint   tstr or null                     // ISO-639-1, przekazywane w params
+  5: recording_path  StatePath or null                // renderer zapisuje tu bool `recording`
+  6: disabled        BindRef or null
+```
+
 ---
 
 ## 9. Domain-specific (0x0700–0x07FF)
@@ -3247,7 +3370,7 @@ Handlers:
 
 ### 0x0703 — `RelationGraph`
 
-Graph visualization (D3-based) dla Contacts/CRM.
+Graph visualization (Canvas 2D, force-directed) dla Contacts/CRM/Notes.
 
 ```
 Fields:
@@ -3256,9 +3379,11 @@ Fields:
   2: layout          GraphLayout                      // "force_directed" | "hierarchical" | "radial" | "manual"
   3: interactive     bool
   4: max_nodes       u32                              // cap dla performance
+  5: selected_path   StatePath or null                // bound tstr — id zaznaczonego noda; addon może sterować/kasować highlight bez re-renderu
 Handlers:
-  "node_click":      Handler
-  "edge_click":      Handler
+  "node_click":      Handler                          // params { node_id }
+  "edge_click":      Handler                          // params { edge_id }
+  "deselect":        Handler                          // klik w tło wyczyścił zaznaczenie
 ```
 
 ### 0x0704 — `AlarmFeed`

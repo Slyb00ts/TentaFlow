@@ -1,0 +1,110 @@
+[addon]
+id = "translator"
+name = "Tłumacz"
+version = "1.0.0"
+description = "Lokalny tłumacz: tryb tekstowy ze streamingiem tłumaczenia token-po-tokenie oraz tryb napisów na żywo (mowa → transkrypcja → tłumaczenie) czytanych na własnym ekranie. W pełni lokalny, zero danych na zewnątrz."
+category = "productivity"
+keywords = ["translator", "tłumacz", "translation", "subtitles", "napisy", "stt", "llm"]
+author = "TentaFlow"
+license = "Apache-2.0"
+homepage = ""
+icon = "languages"
+runtime = "dotnet"
+platforms = ["linux", "macos", "windows", "android", "ios"]
+wasm_file = "addon.wasm"
+
+[[permission]]
+id = "llm"
+display_name = "Tłumaczenie AI"
+description = "Używa przydzielonego modelu językowego do tłumaczenia tekstu i napisów."
+risk = "medium"
+
+[[permission]]
+id = "alias.read"
+display_name = "Lista przydzielonych modeli"
+description = "Odczytuje modele przydzielone temu addonowi, aby pokazać je do wyboru w ustawieniach."
+risk = "low"
+
+[[permission]]
+id = "stt"
+display_name = "Transkrypcja mowy"
+description = "Zamienia nagraną wypowiedź na tekst przez przydzielony model transkrypcji w trybie na żywo."
+risk = "medium"
+
+[[permission]]
+id = "audio.capture"
+display_name = "Przechwytywanie mikrofonu"
+description = "Nagrywa wypowiedzi z mikrofonu w trybie napisów na żywo."
+risk = "high"
+
+[[permission]]
+id = "document.read"
+display_name = "Odczyt nagrań mikrofonu"
+description = "Czyta nagraną wypowiedź (WAV) ze schowka dokumentów, aby przekazać ją do transkrypcji STT."
+risk = "medium"
+
+[[permission]]
+id = "storage.read"
+display_name = "Odczyt ustawień"
+description = "Czyta ustawienia i bufor bieżącego tłumaczenia."
+risk = "low"
+
+[[permission]]
+id = "storage.write"
+display_name = "Zapis ustawień"
+description = "Zapisuje ustawienia addonu i bufor bieżącego tłumaczenia."
+risk = "low"
+
+[[permission]]
+id = "sql.write"
+display_name = "Zapis historii tłumaczeń"
+description = "Zapisuje lokalną historię tłumaczeń, gdy włączona jest ta opcja."
+risk = "medium"
+
+[[permission]]
+id = "ui"
+display_name = "Interfejs Tłumacza"
+description = "Renderuje panele Tłumacza w launcherze TentaFlow."
+risk = "low"
+
+# Model access is admin-assigned: the admin maps these aliases to concrete
+# deployed models and grants them, then the addon lists (alias.read) and uses
+# them. The addon never hardcodes a model name.
+[[uses_alias]]
+id = "translator-llm"
+required = false
+reason = "Tłumaczenie tekstu i napisów przez przydzielony model językowy."
+
+[[uses_alias]]
+id = "translator-stt"
+required = false
+reason = "Transkrypcja mowy w trybie napisów na żywo."
+
+[visibility]
+admin_only = false
+default_groups = []
+show_in_catalog = true
+
+[application]
+entry_panel = "main"
+title = "Tłumacz"
+icon = "languages"
+description = "Tłumaczenie tekstu ze streamingiem i napisy na żywo."
+sort_order = 30
+
+[storage]
+sql = true
+sql_backends = ["sqlite"]
+sql_dialect = "sqlite"
+migrations_dir = "migrations"
+encryption = "none"
+
+[resources]
+memory_mb = 192
+fuel_limit = 200000000
+storage_total_mb = 64
+llm_tokens_per_minute = 20000
+
+[lifecycle]
+background = false
+auto_start = false

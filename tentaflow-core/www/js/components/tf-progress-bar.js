@@ -9,7 +9,7 @@ const VALID_SIZES = new Set(['sm', 'md', 'lg']);
 
 class TfProgressBar extends HTMLElement {
   static get observedAttributes() {
-    return ['value', 'tone', 'size', 'label'];
+    return ['value', 'tone', 'size', 'label', 'orientation'];
   }
 
   constructor() {
@@ -60,10 +60,18 @@ class TfProgressBar extends HTMLElement {
       ? this.getAttribute('size')
       : 'md';
     const label = this.getAttribute('label') || '';
+    const vertical = this.getAttribute('orientation') === 'vertical';
 
-    this._root.className = `tf-progress-bar ${size}`;
+    this._root.className = `tf-progress-bar ${size}${vertical ? ' vertical' : ''}`;
     this._fill.className = `tf-progress-bar-fill ${tone}`;
-    this._fill.style.width = `${value}%`;
+    // Vertical bars grow bottom→top (height), horizontal ones left→right (width).
+    if (vertical) {
+      this._fill.style.width = '';
+      this._fill.style.height = `${value}%`;
+    } else {
+      this._fill.style.height = '';
+      this._fill.style.width = `${value}%`;
+    }
 
     if (label) {
       this._labelEl.textContent = label;

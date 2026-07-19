@@ -24,7 +24,9 @@ platforms = ["linux"]
 transport = "direct-http"
 
 [deploy.native]
-platforms = ["linux"]
+# Cross-platform: Linux/Windows (CUDA GPU) + macOS (MPS/Metal). torch wybiera
+# device w runtime (server._pick_device); QLoRA tylko na CUDA, macOS => LoRA fp32.
+platforms = ["linux", "macos", "windows"]
 runtime = "python-bundle"
 bundle_path = "training/python/ml-training"
 

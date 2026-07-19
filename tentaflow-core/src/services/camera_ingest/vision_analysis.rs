@@ -1,34 +1,40 @@
 // =============================================================================
-// File: services/camera_ingest/vision_analysis.rs — always-on RF-DETR loop
+// File: services/camera_ingest/vision_analysis.rs — always-on CV analysis loop
 // =============================================================================
 //
-// Per-camera always-on CV analysis for the Orlen PoC (Phase B). One task per
-// camera pulls the latest decoded RGB frame from the running session (via the
-// supervisor snapshot path), runs the shared RF-DETR detector, and publishes
-// real detections into `detection_bus` — the same contract the dev stub used.
+// Per-camera always-on CV analysis driven by the camera's configurable
+// `CvPipeline` (resolved from `camera_cv_pipelines`, see `cv_pipeline.rs`).
+// The engine knows NO model aliases and NO class lists: every hot (frame)
+// stage schedules at its own fps and runs the stage's model alias through
+// `ModelRuntimeExecutor::execute_camera_cv`; every cold (per-crop) stage is
+// interpreted generically (classify → `stan`, ocr → `tekst`).
 //
-// The detector (one 119 MB ONNX session) is a process-wide singleton shared by
-// every camera task behind a mutex: analysis is paced at a low fixed rate, so
-// serializing inference across cameras keeps a single CPU session predictable.
-// A load failure degrades gracefully — the task logs once and exits, leaving
-// the camera session and the dashboard untouched (no detections, no crash).
+// A pipeline resolve/parse failure keeps the last good pipeline; a camera
+// that never resolved a pipeline does no analysis (no detections, no crash).
 
 #![cfg(feature = "inference-vision-gpu")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, OnceCell};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::services::detection_bus::Detection;
 
+use super::cv_pipeline::{self, CvOp, CvPipeline, CvStageInput, CvStageOutput};
+use super::tracker;
 use crate::services::detection_bus;
 use crate::vision::classifier_stan::StateClassifier;
-use crate::vision::detector_rfdetr::RfDetrDetector;
+use crate::vision::detector_rfdetr::{RfDetrDetector, MODEL_BATCH};
 use crate::vision::ocr_plate::PlateOcr;
+use crate::flow_engine::dispatchers_impl::ModelRuntimeSlot;
+use crate::services::runtime::context::ExecutionContext as RuntimeContext;
+use crate::services::runtime::executor::ModelRuntimeExecutor;
+use crate::services::runtime::local_cv::{CameraCvOpLocal, CameraCvRequest, CvFrameLocal};
+use tentaflow_protocol::{CameraCvResult, CvDetection, CvOcrMode};
 
 /// Floor interval for `analysis_fps = 0` (unlimited). ~30 fps native cadence —
 /// a hard floor so the loop never busy-spins waiting on frames; inference on CPU
@@ -49,34 +55,24 @@ fn interval_for_fps(fps: u32) -> Duration {
     }
 }
 
-/// Reads the per-camera analysis FPS from the core DB, falling back to the
-/// default when no pool / row is available.
-fn resolve_analysis_fps(camera_id: &str) -> u32 {
-    match crate::db::global_pool() {
-        Some(pool) => {
-            crate::db::repository::camera_analysis_fps(&pool, camera_id).unwrap_or(DEFAULT_ANALYSIS_FPS)
-        }
-        None => DEFAULT_ANALYSIS_FPS,
-    }
-}
-
 /// Process-wide RF-DETR detector, loaded on first use. `tokio::sync::OnceCell`
 /// so a slow load (~hundreds of ms) does not block the async runtime, and a
 /// failed load is retried on the next process start rather than poisoning.
 /// `None` inside the `OnceCell` Ok means the load failed once and analysis is
-/// disabled for the process lifetime.
-fn detector() -> &'static OnceCell<Option<std::sync::Arc<Mutex<RfDetrDetector>>>> {
-    static DETECTOR: OnceCell<Option<std::sync::Arc<Mutex<RfDetrDetector>>>> = OnceCell::const_new();
+/// disabled for the process lifetime. Used by the executor's embedded local
+/// handler (`local_cv`), not directly by the analysis engine.
+fn detector() -> &'static OnceCell<Option<DetectorHandle>> {
+    static DETECTOR: OnceCell<Option<DetectorHandle>> = OnceCell::const_new();
     &DETECTOR
 }
 
-async fn get_detector() -> Option<std::sync::Arc<Mutex<RfDetrDetector>>> {
+pub(crate) async fn get_detector() -> Option<DetectorHandle> {
     detector()
         .get_or_init(|| async {
-            // Loading touches the filesystem + builds an ONNX session; keep it
-            // off the async worker thread.
+            // Loading touches the filesystem + builds the ONNX session pool; keep
+            // it off the async worker thread.
             tokio::task::spawn_blocking(|| match RfDetrDetector::load() {
-                Ok(d) => Some(std::sync::Arc::new(Mutex::new(d))),
+                Ok(d) => Some(wrap_detector(d)),
                 Err(e) => {
                     warn!("[vision_analysis] RF-DETR load failed, analysis disabled: {e:#}");
                     None
@@ -89,21 +85,64 @@ async fn get_detector() -> Option<std::sync::Arc<Mutex<RfDetrDetector>>> {
         .clone()
 }
 
+/// Handle to the process-wide classifier/OCR singletons. On the ort path
+/// (`inference-supertonic`) the runner is internally pooled + `&self` + Send+Sync,
+/// so it is shared bare as `Arc<_>` and every crop rides the concurrency-safe ort
+/// pool off the single Burn/wgpu thread. On the Burn path the runner still needs
+/// the whole-process wgpu serialization, so it stays behind `Arc<Mutex<_>>` and
+/// callers funnel forwards through `burn_backend::run_blocking`.
+#[cfg(feature = "inference-supertonic")]
+pub(crate) type DetectorHandle = std::sync::Arc<RfDetrDetector>;
+#[cfg(not(feature = "inference-supertonic"))]
+pub(crate) type DetectorHandle = std::sync::Arc<Mutex<RfDetrDetector>>;
+#[cfg(feature = "inference-supertonic")]
+pub(crate) type ClassifierHandle = std::sync::Arc<StateClassifier>;
+#[cfg(not(feature = "inference-supertonic"))]
+pub(crate) type ClassifierHandle = std::sync::Arc<Mutex<StateClassifier>>;
+#[cfg(feature = "inference-supertonic")]
+pub(crate) type OcrHandle = std::sync::Arc<PlateOcr>;
+#[cfg(not(feature = "inference-supertonic"))]
+pub(crate) type OcrHandle = std::sync::Arc<Mutex<PlateOcr>>;
+
+#[cfg(feature = "inference-supertonic")]
+fn wrap_detector(d: RfDetrDetector) -> DetectorHandle {
+    std::sync::Arc::new(d)
+}
+#[cfg(not(feature = "inference-supertonic"))]
+fn wrap_detector(d: RfDetrDetector) -> DetectorHandle {
+    std::sync::Arc::new(Mutex::new(d))
+}
+#[cfg(feature = "inference-supertonic")]
+fn wrap_classifier(c: StateClassifier) -> ClassifierHandle {
+    std::sync::Arc::new(c)
+}
+#[cfg(not(feature = "inference-supertonic"))]
+fn wrap_classifier(c: StateClassifier) -> ClassifierHandle {
+    std::sync::Arc::new(Mutex::new(c))
+}
+#[cfg(feature = "inference-supertonic")]
+fn wrap_ocr(o: PlateOcr) -> OcrHandle {
+    std::sync::Arc::new(o)
+}
+#[cfg(not(feature = "inference-supertonic"))]
+fn wrap_ocr(o: PlateOcr) -> OcrHandle {
+    std::sync::Arc::new(Mutex::new(o))
+}
+
 /// Process-wide state classifier, loaded on first use with the same lazy
 /// `OnceCell` + `spawn_blocking` pattern as the detector. A failed load is
 /// `None` for the process lifetime: detections still publish, just without a
 /// `stan` (condition is skipped, never a crash).
-fn classifier() -> &'static OnceCell<Option<std::sync::Arc<Mutex<StateClassifier>>>> {
-    static CLASSIFIER: OnceCell<Option<std::sync::Arc<Mutex<StateClassifier>>>> =
-        OnceCell::const_new();
+fn classifier() -> &'static OnceCell<Option<ClassifierHandle>> {
+    static CLASSIFIER: OnceCell<Option<ClassifierHandle>> = OnceCell::const_new();
     &CLASSIFIER
 }
 
-pub(crate) async fn get_classifier() -> Option<std::sync::Arc<Mutex<StateClassifier>>> {
+pub(crate) async fn get_classifier() -> Option<ClassifierHandle> {
     classifier()
         .get_or_init(|| async {
             tokio::task::spawn_blocking(|| match StateClassifier::load() {
-                Ok(c) => Some(std::sync::Arc::new(Mutex::new(c))),
+                Ok(c) => Some(wrap_classifier(c)),
                 Err(e) => {
                     warn!("[vision_analysis] state classifier load failed, stan skipped: {e:#}");
                     None
@@ -120,16 +159,16 @@ pub(crate) async fn get_classifier() -> Option<std::sync::Arc<Mutex<StateClassif
 /// `OnceCell` + `spawn_blocking` pattern as the detector. A failed load is
 /// `None` for the process lifetime: detections still publish, just without
 /// `tekst` (OCR is skipped, never a crash).
-fn ocr() -> &'static OnceCell<Option<std::sync::Arc<Mutex<PlateOcr>>>> {
-    static OCR: OnceCell<Option<std::sync::Arc<Mutex<PlateOcr>>>> = OnceCell::const_new();
+fn ocr() -> &'static OnceCell<Option<OcrHandle>> {
+    static OCR: OnceCell<Option<OcrHandle>> = OnceCell::const_new();
     &OCR
 }
 
-pub(crate) async fn get_ocr() -> Option<std::sync::Arc<Mutex<PlateOcr>>> {
+pub(crate) async fn get_ocr() -> Option<OcrHandle> {
     ocr()
         .get_or_init(|| async {
             tokio::task::spawn_blocking(|| match PlateOcr::load() {
-                Ok(o) => Some(std::sync::Arc::new(Mutex::new(o))),
+                Ok(o) => Some(wrap_ocr(o)),
                 Err(e) => {
                     warn!("[vision_analysis] plate OCR load failed, tekst skipped: {e:#}");
                     None
@@ -142,11 +181,58 @@ pub(crate) async fn get_ocr() -> Option<std::sync::Arc<Mutex<PlateOcr>>> {
         .clone()
 }
 
-/// True for detection classes whose condition we classify (placards/labels and
-/// the environmental/temperature marks). License plates (`tablica_*`) are
-/// skipped here — they go to OCR later.
-fn wants_state(klasa: &str) -> bool {
-    klasa.starts_with("nalepka") || klasa == "znak_srodowiskowy" || klasa == "termometr"
+/// Slot executora runtime współdzielony z routerem (`Router.executor`).
+/// Ustawiany raz przez `set_runtime_slot` przy inicjalizacji routera; sam slot
+/// jest `RwLock<Option<..>>`, więc executor może pojawić się później — pętla
+/// silnika czyta go świeżo co iterację i CZEKA (retry z krótkim snem), dopóki
+/// nie jest wpięty. Etapy pipeline'u rozwiązują modele WYŁĄCZNIE przez executor
+/// (aliasy katalogowe) — nie ma ścieżki bezpośredniej do singletonów.
+fn runtime_slot_cell() -> &'static OnceLock<ModelRuntimeSlot> {
+    static S: OnceLock<ModelRuntimeSlot> = OnceLock::new();
+    &S
+}
+
+/// Wpina slot executora routera do silnika analizy. Idempotentne — pierwszy
+/// zapis wygrywa (router tworzy jeden slot na proces).
+pub fn set_runtime_slot(slot: ModelRuntimeSlot) {
+    let _ = runtime_slot_cell().set(slot);
+}
+
+/// Aktualny executor runtime albo `None` (slot niewpięty / jeszcze pusty).
+fn runtime_executor() -> Option<Arc<ModelRuntimeExecutor>> {
+    runtime_slot_cell().get().and_then(|s| s.read().as_ref().cloned())
+}
+
+/// Ostrzeżenie ograniczone do jednego wpisu na ~30 s per klucz — błąd executora
+/// może dotyczyć każdej klatki, więc bez limitu log byłby zalany przy
+/// 10 fps × N kamer.
+fn warn_throttled(key: &'static str, msg: &str) {
+    const WARN_EVERY: Duration = Duration::from_secs(30);
+    static LAST: OnceLock<Mutex<HashMap<&'static str, Instant>>> = OnceLock::new();
+    let map = LAST.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    let due = guard
+        .get(key)
+        .map(|t| t.elapsed() >= WARN_EVERY)
+        .unwrap_or(true);
+    if due {
+        guard.insert(key, Instant::now());
+        warn!("[vision_analysis] {msg}");
+    }
+}
+
+/// Ostrzeżenie logowane dokładnie raz per klucz na życie procesu (np. jawny
+/// skip etapu `embed`, dopóki surface CameraCv nie ma operacji Embed).
+fn warn_once(key: &str, msg: &str) {
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let set = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if set
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key.to_string())
+    {
+        warn!("[vision_analysis] {msg}");
+    }
 }
 
 /// Extracts an RGB24 rectangle from a tightly packed RGB frame (stride = w*3).
@@ -162,9 +248,50 @@ fn crop_rgb(frame: &[u8], frame_w: u32, x0: u32, y0: u32, cw: u32, ch: u32) -> V
     out
 }
 
-/// Max cameras stacked into a single detector `Session::run`. One GPU launch is
-/// amortized across the batch — the fleet throughput lever.
-const MAX_BATCH: usize = 16;
+/// Piksele cropu detekcji z opcjonalnym paddingiem (ułamek szer./wys. boxa,
+/// z każdej strony, zaklamrowany do granic klatki). Bbox detektora często
+/// UCINA prawą część tablicy — padding pod OCR łapie uciętą część. Zwraca
+/// `(x0, y0, cw, ch)` albo `None`, gdy box (przed lub po paddingu) jest
+/// mniejszy niż 8 px w którymkolwiek wymiarze.
+fn padded_crop_rect(
+    w: u32,
+    h: u32,
+    bbox: &[f32; 4],
+    pad_x: f32,
+    pad_y: f32,
+) -> Option<(u32, u32, u32, u32)> {
+    let fw = w as f32;
+    let fh = h as f32;
+    let x0 = (bbox[0] * fw).round().clamp(0.0, fw) as u32;
+    let y0 = (bbox[1] * fh).round().clamp(0.0, fh) as u32;
+    let cw = (bbox[2] * fw).round().max(0.0) as u32;
+    let ch = (bbox[3] * fh).round().max(0.0) as u32;
+    let cw = cw.min(w.saturating_sub(x0));
+    let ch = ch.min(h.saturating_sub(y0));
+    if cw < 8 || ch < 8 {
+        return None;
+    }
+    let px = (cw as f32 * pad_x).round() as u32;
+    let py = (ch as f32 * pad_y).round() as u32;
+    let nx0 = x0.saturating_sub(px);
+    let ny0 = y0.saturating_sub(py);
+    let right = (x0 + cw + px).min(w);
+    let bottom = (y0 + ch + py).min(h);
+    let ncw = right.saturating_sub(nx0);
+    let nch = bottom.saturating_sub(ny0);
+    if ncw < 8 || nch < 8 {
+        return None;
+    }
+    Some((nx0, ny0, ncw, nch))
+}
+
+/// Okno flush time-batchingu: co ~8 ms robimy flush z tym, co aktualnie jest w
+/// `pending`, NIEZALEŻNIE od tego ile się nazbierało — batch NIE musi być pełny.
+/// Wcześniejszy flush (bez czekania na okno) następuje tylko, gdy jakaś grupa
+/// (alias, threshold) osiągnie pełny chunk `MODEL_BATCH`. Krótkie okno trzyma
+/// latencję nisko przy MAŁEJ liczbie kamer: klatka nie czeka na dopełnienie
+/// batcha, lecz wychodzi do forwardu w ciągu ~8 ms.
+const MAX_BATCH_WAIT: Duration = Duration::from_millis(8);
 
 /// Longest idle nap when no camera is due. The loop normally runs back-to-back
 /// (continuous batching); this only caps how stale the "nothing due" wait can be
@@ -174,15 +301,41 @@ const IDLE_POLL_MAX: Duration = Duration::from_millis(20);
 /// Shortest idle nap, to avoid busy-spinning when the next deadline is imminent.
 const IDLE_POLL_MIN: Duration = Duration::from_millis(1);
 
-/// How often each camera's `analysis_fps` is re-read from the core DB so an
-/// operator's runtime change applies without restarting anything.
-const FPS_RECHECK: Duration = Duration::from_secs(3);
+/// How often each camera's config (`analysis_fps` + resolved CV pipeline) is
+/// re-read from the core DB so an operator's runtime change (GUI) applies
+/// within seconds without restarting anything.
+const CFG_RECHECK: Duration = Duration::from_secs(3);
+
+/// Sleep between engine retries while the runtime executor slot is still
+/// empty (bootstrap): stages resolve models only via the executor, so the
+/// engine waits for it instead of falling back to direct singletons.
+const EXECUTOR_WAIT: Duration = Duration::from_millis(200);
+
+/// After this much continuous waiting for the executor the engine escalates
+/// to `error!` — a bootstrap should fill the slot in well under 30 s, so a
+/// longer wait means analysis is silently stalled.
+const EXECUTOR_STALL_ERROR_AFTER: Duration = Duration::from_secs(30);
+
+/// Minimum spacing between repeated stall `error!` lines while still waiting.
+const EXECUTOR_STALL_ERROR_EVERY: Duration = Duration::from_secs(300);
 
 /// One registered camera's scheduling state inside the shared engine.
 struct CamSlot {
+    /// Camera-level `cameras.analysis_fps` — the fallback cadence for frame
+    /// stages that do not set their own `fps`.
     fps: u32,
-    next_due: std::time::Instant,
-    next_fps_check: std::time::Instant,
+    /// Last good parsed pipeline. `None` until the first successful resolve —
+    /// the camera does no analysis without a pipeline.
+    pipeline: Option<Arc<CvPipeline>>,
+    /// Raw `(pipeline_id, pipeline_json)` of the installed pipeline — cheap
+    /// change detection without reparsing on every recheck.
+    pipeline_raw: Option<(String, String)>,
+    /// Per frame-stage next deadline (stage_id → due time).
+    stage_due: HashMap<String, std::time::Instant>,
+    next_cfg_check: std::time::Instant,
+    /// Last config warning already logged — resolve/parse failures repeat
+    /// every recheck, so we warn once per DISTINCT message, not per tick.
+    last_cfg_err: Option<String>,
 }
 
 /// Active-camera registry driven by the single engine task. Cameras join via
@@ -205,16 +358,21 @@ pub fn ensure_analysis(camera_id: &str) {
         let mut reg = cameras().lock().unwrap();
         if !reg.contains_key(camera_id) {
             let now = std::time::Instant::now();
-            let fps = resolve_analysis_fps(camera_id);
+            // Start bez zapytania DB (funkcja jest sync i bywa wolana z watku
+            // tokio); `next_cfg_check = now` kaze petli silnika odczytac fps i
+            // pipeline z DB na puli blocking przy pierwszym ticku.
             reg.insert(
                 camera_id.to_string(),
                 CamSlot {
-                    fps,
-                    next_due: now,
-                    next_fps_check: now + FPS_RECHECK,
+                    fps: DEFAULT_ANALYSIS_FPS,
+                    pipeline: None,
+                    pipeline_raw: None,
+                    stage_due: HashMap::new(),
+                    next_cfg_check: now,
+                    last_cfg_err: None,
                 },
             );
-            info!("[vision_analysis] camera {camera_id} registered (analysis_fps={fps})");
+            info!("[vision_analysis] camera {camera_id} registered");
         }
     }
     start_engine_once();
@@ -222,12 +380,34 @@ pub fn ensure_analysis(camera_id: &str) {
 
 /// Removes every camera and aborts the engine task. Wired into camera shutdown
 /// so the ONNX sessions and frame-pull loop stop before GStreamer tears down.
-pub fn drain() {
+pub async fn drain() {
     cameras().lock().unwrap().clear();
-    if let Some(handle) = engine_handle().lock().unwrap().take() {
-        handle.abort();
+    // Poproś pętlę o graceful shutdown i POCZEKAJ, aż dokończy trwające forwardy
+    // (i wyjdzie), zamiast tylko ją abortować: abort nie anuluje biegnącego
+    // `spawn_blocking` GPU-forwardu, więc stara inferencja mogłaby nałożyć się na
+    // restart i K przestałoby ograniczać realną pracę GPU. Await-drain to gwarancja
+    // braku nakładki.
+    shutdown_flag().store(true, AtomicOrdering::Relaxed);
+    let handle = engine_handle().lock().unwrap().take();
+    if let Some(handle) = handle {
+        let abort = handle.abort_handle();
+        // Bounded await: forwardy kończą się w dziesiątkach ms; po limicie abort
+        // jako fallback. WTEDY biegnący `spawn_blocking` może jeszcze trwać na puli
+        // blocking — jest to jednak ograniczone (pula sesji ort serializuje per
+        // sesja) i zdarza się tylko przy realnie zawieszonym forwardzie.
+        if tokio::time::timeout(FORWARD_DRAIN_TIMEOUT, handle).await.is_err() {
+            warn!(
+                "[vision_analysis] engine drain timed out after {}s; aborting (a blocking forward may still finish on the ort pool)",
+                FORWARD_DRAIN_TIMEOUT.as_secs()
+            );
+            abort.abort();
+        }
     }
-    // Tear down the cold path too, so its classifier/OCR runners stop and a later
+    shutdown_flag().store(false, AtomicOrdering::Relaxed);
+    // Po wyjściu pętli (żaden forward już nie działa) wyczyść stan trackera, by po
+    // restarcie analizy nie zostal martwy stan (tracki, licznik id).
+    tracker::clear();
+    // Tear down the cold path too, so its enrichment stops and a later
     // `ensure_analysis` restarts a fresh consumer (the channel is recreated).
     if let Some(handle) = cold_handle().lock().unwrap().take() {
         handle.abort();
@@ -238,36 +418,386 @@ pub fn drain() {
     // those cameras after a restart.
     cold_state().lock().unwrap().clear();
     cold_bytes().store(0, AtomicOrdering::Relaxed);
+    // Cache wzbogacania trzyma stan/OCR per (camera_id, stage_id, track_id) —
+    // po drainie tracki znikaja (tracker::clear resetuje licznik id), wiec stare
+    // wpisy musza zniknac, by nie przypisac stanu do przypadkiem powtorzonego id.
+    enrich_cache().lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// Usuwa proces-wide stan analizy JEDNEJ kamery przy jej teardownie (obok
+/// `tracker::remove`): wpisy cache wzbogacania kluczowane
+/// (camera_id, stage_id, track_id). Bez tego szybkie usunięcie + ponowne
+/// dodanie kamery o tym samym id mogłoby w oknie `ENRICH_TTL` przypisać nowym
+/// trackom stan/tekst poprzedniej sesji (licznik track_id startuje od 1).
+pub(crate) fn forget_camera(camera_id: &str) {
+    enrich_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(cam, _, _), _| cam != camera_id);
 }
 
 /// Spawns the single engine task if it is not already running.
 fn start_engine_once() {
     let mut h = engine_handle().lock().unwrap();
     if h.as_ref().map(|j| j.is_finished()).unwrap_or(true) {
+        // Wyczyść ewentualną flagę shutdown po poprzednim `drain`, żeby świeża
+        // pętla nie weszła od razu w tryb graceful-exit.
+        shutdown_flag().store(false, AtomicOrdering::Relaxed);
         *h = Some(tokio::spawn(engine_loop()));
     }
 }
 
-/// The one process-wide analysis engine: collects cameras whose per-FPS
-/// deadline elapsed, batches up to [`MAX_BATCH`] latest frames into a single
-/// detector run, then per camera classifies state + reads plates on crops and
-/// publishes. Cross-camera batching is what scales to thousands of cameras.
-async fn engine_loop() {
-    let detector = match get_detector().await {
-        Some(d) => d,
-        None => return, // load failed earlier — overlay still works, no detections
+/// Reads a camera's runtime config from the core DB on the blocking pool:
+/// `analysis_fps` plus the resolved `(pipeline_id, pipeline_json)` pair.
+/// The pipeline result distinguishes "resolved to nothing" (`Ok(None)` — no
+/// pipeline exists at all, camera stops analyzing) from a resolve FAILURE
+/// (`Err` — DB error, keep the last good pipeline).
+async fn resolve_camera_config(camera_id: &str) -> (u32, Result<Option<(String, String)>, String>) {
+    let id = camera_id.to_string();
+    tokio::task::spawn_blocking(move || match crate::db::global_pool() {
+        Some(pool) => {
+            let fps = crate::db::repository::camera_analysis_fps(&pool, &id)
+                .unwrap_or(DEFAULT_ANALYSIS_FPS);
+            let pipeline = crate::db::repository::resolve_camera_cv_pipeline(&pool, &id)
+                .map_err(|e| e.to_string());
+            (fps, pipeline)
+        }
+        None => (DEFAULT_ANALYSIS_FPS, Err("no global DB pool".to_string())),
+    })
+    .await
+    .unwrap_or((
+        DEFAULT_ANALYSIS_FPS,
+        Err("camera config task panicked".to_string()),
+    ))
+}
+
+/// Applies a freshly resolved camera config to the registry slot. Invalid or
+/// unresolvable pipelines never crash: a failure keeps the last good pipeline
+/// (warned once per distinct message), `Ok(None)` clears it (no analysis).
+fn apply_camera_config(
+    camera_id: &str,
+    fps: u32,
+    resolved: Result<Option<(String, String)>, String>,
+    now: std::time::Instant,
+) {
+    let mut reg = cameras().lock().unwrap();
+    let Some(slot) = reg.get_mut(camera_id) else {
+        return;
     };
+    slot.fps = fps;
+    slot.next_cfg_check = now + CFG_RECHECK;
+    let warn_changed = |slot: &mut CamSlot, msg: String| {
+        if slot.last_cfg_err.as_deref() != Some(msg.as_str()) {
+            warn!("[vision_analysis] camera {camera_id}: {msg}");
+            slot.last_cfg_err = Some(msg);
+        }
+    };
+    match resolved {
+        Err(e) => warn_changed(slot, format!("pipeline resolve failed, keeping last: {e}")),
+        Ok(None) => {
+            if slot.pipeline.is_some() {
+                info!("[vision_analysis] camera {camera_id}: no CV pipeline resolvable, analysis stopped");
+            }
+            slot.pipeline = None;
+            slot.pipeline_raw = None;
+            slot.stage_due.clear();
+            warn_changed(slot, "no CV pipeline resolvable; camera does no analysis".to_string());
+        }
+        Ok(Some(raw)) => {
+            if slot.pipeline_raw.as_ref() == Some(&raw) {
+                return;
+            }
+            let parsed = serde_json::from_str::<CvPipeline>(&raw.1)
+                .map_err(|e| e.to_string())
+                .and_then(|p| {
+                    cv_pipeline::validate(&p)
+                        .map(|_| p)
+                        .map_err(|e| e.to_string())
+                });
+            match parsed {
+                Ok(p) => {
+                    // Zachowaj deadline'y etapow, ktore przetrwaly edycje;
+                    // nowe etapy startuja natychmiast, usuniete znikaja.
+                    let mut due = HashMap::new();
+                    for fs in cv_pipeline::frame_stages(&p) {
+                        let t = slot.stage_due.get(&fs.stage_id).copied().unwrap_or(now);
+                        due.insert(fs.stage_id.clone(), t);
+                    }
+                    info!(
+                        "[vision_analysis] camera {camera_id}: pipeline '{}' loaded ({} stages, {} frame)",
+                        raw.0,
+                        p.stages.len(),
+                        due.len()
+                    );
+                    slot.stage_due = due;
+                    slot.pipeline = Some(Arc::new(p));
+                    slot.pipeline_raw = Some(raw);
+                    slot.last_cfg_err = None;
+                }
+                Err(e) => warn_changed(
+                    slot,
+                    format!("invalid pipeline '{}', keeping last: {e}", raw.0),
+                ),
+            }
+        }
+    }
+}
+
+/// Jedna klatka jednego etapu `frame` czekająca w buforze hot path. Batch
+/// grupuje pozycje po `(alias, threshold)` — jeden forward nigdy nie miesza
+/// modeli. `job_id` wskazuje wspólny [`FrameJob`] klatki (etapy tej samej
+/// klatki scala jedna publikacja).
+struct PendingItem {
+    job_id: u64,
+    stage_id: String,
+    alias: String,
+    threshold: Option<f32>,
+    added: Instant,
+}
+
+/// Jedna zaanalizowana klatka kamery: wspólny bufor RGB + zbiorcze wyniki
+/// wszystkich etapów `frame` pipeline'u. Publikacja (FAZA 1) i zdarzenie cold
+/// path powstają dopiero, gdy WSZYSTKIE etapy klatki mają wynik — jedna
+/// wiadomość overlay per przeanalizowana klatka.
+struct FrameJob {
+    camera_id: String,
+    frame: Arc<[u8]>,
+    w: u32,
+    h: u32,
+    captured_ms: u64,
+    pts_ns: Option<u64>,
+    pipeline: Arc<CvPipeline>,
+    /// Etapy `frame` tej klatki bez wyniku (jeszcze w pending albo w locie).
+    open_stages: Vec<String>,
+    /// Wyniki ukończonych etapów: (stage_id, detekcje po trackerze i cache).
+    results: Vec<(String, Vec<Detection>)>,
+    /// Suma czasów forwardów etapów tej klatki (przybliżenie dla badge proc_ms).
+    detect_ms_total: u32,
+    /// Liczba etapów zakończonych błędem executora (bez wyniku).
+    failed_stages: usize,
+}
+
+/// Wynik jednego współbieżnego forwardu batcha zwrócony ze spawnowanego zadania
+/// do pętli silnika. Sam FORWARD biegnie współbieżnie (do K naraz na puli sesji
+/// ort); ten wynik jest STOSOWANY z powrotem WYŁĄCZNIE na pętli, więc `jobs`,
+/// tracker i cache wzbogacania mają nadal jednego właściciela.
+struct ForwardOutput {
+    alias: String,
+    detect_ms: u32,
+    /// Wynik executora spłaszczony do `String` błędu — `Send` i prosty do
+    /// przeniesienia przez granicę zadania (log identyczny z dawnym inline).
+    outcome: Result<CameraCvResult, String>,
+}
+
+/// Górny limit współbieżnych forwardów. Odzwierciedla sufit puli sesji ort
+/// (`ort_common::MAX_SESSIONS_PER_MODEL` = 16) — więcej równoległych forwardów
+/// niż sesji nie ma sensu (i tak czekałyby na slot puli). Zdefiniowany lokalnie,
+/// bo pula ort istnieje tylko pod `inference-supertonic`, a ten limit musi
+/// obowiązywać na każdej ścieżce.
+const MAX_INFLIGHT: usize = 16;
+
+/// Liczba współbieżnych forwardów K. Jawny opt-in `TENTAFLOW_VISION_INFLIGHT`
+/// wygrywa; w przeciwnym razie odwzorowuje rozmiar puli detektora
+/// (`TENTAFLOW_VISION_DETECTOR_SESSIONS`): przy N sesjach GPU liczy N detektów
+/// naraz, więc N in-flight to naturalny sufit. Gdy ŻADNA zmienna nie jest
+/// ustawiona → K=1, czyli bit-identyczne zachowanie z dawną pojedynczą,
+/// serializowaną pętlą (zero regresji, dopóki operator nie włączy więcej).
+fn inflight_limit() -> usize {
+    const INFLIGHT_ENV: &str = "TENTAFLOW_VISION_INFLIGHT";
+    const DETECTOR_SESSIONS_ENV: &str = "TENTAFLOW_VISION_DETECTOR_SESSIONS";
+    if let Some(k) = std::env::var(INFLIGHT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return k.clamp(1, MAX_INFLIGHT);
+    }
+    std::env::var(DETECTOR_SESSIONS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, MAX_INFLIGHT)
+}
+
+/// Stosuje wynik JEDNEGO batcha forwardu z powrotem na pętli: routuje detekcje
+/// do właściwych jobów po `job_id` każdego [`PendingItem`] (batch może obejmować
+/// wiele kamer) i domyka etapy przez [`stage_completed`]. Panika/abort zadania
+/// forwardu NIGDY nie może zostawić otwartych etapów — inaczej ordering gate
+/// (jeden job/kamera) zablokowałby te kamery na zawsze — więc błąd joina domyka
+/// wszystkie pozycje batcha jako porażkę.
+fn apply_forward_result(
+    jobs: &mut HashMap<u64, FrameJob>,
+    batch: Vec<PendingItem>,
+    out: Result<ForwardOutput, tokio::task::JoinError>,
+    cold: &mpsc::Sender<DetectionEvent>,
+) {
+    let ForwardOutput {
+        alias,
+        detect_ms,
+        outcome,
+    } = match out {
+        Ok(o) => o,
+        Err(e) => {
+            warn_throttled("detect", &format!("detect forward task failed: {e}"));
+            for item in &batch {
+                stage_completed(jobs, item, None, cold);
+            }
+            return;
+        }
+    };
+    match outcome {
+        Ok(CameraCvResult::Detections { per_frame }) if per_frame.len() == batch.len() => {
+            for (item, dets_cv) in batch.iter().zip(per_frame) {
+                let dets: Vec<Detection> = dets_cv.into_iter().map(detection_from_cv).collect();
+                stage_completed(jobs, item, Some((dets, detect_ms)), cold);
+            }
+        }
+        Ok(CameraCvResult::Detections { per_frame }) => {
+            warn_throttled(
+                "detect",
+                &format!(
+                    "detect '{alias}': {} per_frame results for {} batch frames (contract broken)",
+                    per_frame.len(),
+                    batch.len()
+                ),
+            );
+            for item in &batch {
+                stage_completed(jobs, item, None, cold);
+            }
+        }
+        Ok(_) => {
+            warn_throttled(
+                "detect",
+                &format!("detect '{alias}': unexpected camera-cv result variant"),
+            );
+            for item in &batch {
+                stage_completed(jobs, item, None, cold);
+            }
+        }
+        Err(e) => {
+            warn_throttled("detect", &format!("detect '{alias}': {e}"));
+            for item in &batch {
+                stage_completed(jobs, item, None, cold);
+            }
+        }
+    }
+}
+
+/// Odbiera jeden ukończony forward z [`tokio::task::JoinSet`] i stosuje go na
+/// pętli. Batch trzymany jest po stronie pętli pod `task Id` (mapa `inflight`) —
+/// więc nawet gdy zadanie spanikuje, znamy jego pozycje i domykamy je jako
+/// porażkę zamiast wyciekać otwarte etapy.
+fn apply_joined(
+    jobs: &mut HashMap<u64, FrameJob>,
+    inflight: &mut HashMap<tokio::task::Id, Vec<PendingItem>>,
+    joined: Option<Result<(tokio::task::Id, ForwardOutput), tokio::task::JoinError>>,
+    cold: &mpsc::Sender<DetectionEvent>,
+) {
+    let Some(joined) = joined else {
+        return;
+    };
+    let (id, out) = match joined {
+        Ok((id, output)) => (id, Ok(output)),
+        Err(e) => (e.id(), Err(e)),
+    };
+    let Some(batch) = inflight.remove(&id) else {
+        return;
+    };
+    apply_forward_result(jobs, batch, out, cold);
+}
+
+/// Non-blocking: stosuje WSZYSTKIE już-ukończone forwardy z JoinSetu bez czekania
+/// na trwające. Wołane na początku sekcji flush KAŻDEJ iteracji, więc ukończony
+/// forward jest zaaplikowany (`stage_completed`/`finalize_job`/publish) ZANIM
+/// pętla zarezerwuje permit i spawnie kolejny — między tym drenażem a spawnem nie
+/// ma awaitu, więc żaden forward nie ukończy się „pomiędzy". Przy K=1 przywraca
+/// dokładną semantykę inline-await: spawn → czekaj → zastosuj → spawn następny.
+fn drain_ready_forwards(
+    forwards: &mut tokio::task::JoinSet<ForwardOutput>,
+    jobs: &mut HashMap<u64, FrameJob>,
+    inflight: &mut HashMap<tokio::task::Id, Vec<PendingItem>>,
+    cold: &mpsc::Sender<DetectionEvent>,
+) {
+    while let Some(joined) = forwards.try_join_next_with_id() {
+        apply_joined(jobs, inflight, Some(joined), cold);
+    }
+}
+
+/// Górny limit czekania `drain` na dokończenie trwających forwardów. Forwardy
+/// kończą się zwykle w dziesiątkach ms; limit chroni shutdown przed zawieszonym
+/// forwardem (po nim abort jako fallback).
+const FORWARD_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Flaga graceful-shutdown pętli silnika. `drain` ją ustawia, a pętla po jej
+/// zauważeniu dokańcza WSZYSTKIE trwające forwardy (await, nie abort — abort nie
+/// anuluje biegnącego `spawn_blocking`, więc GPU-forward mógłby nałożyć się na
+/// restart) i wychodzi. Reset przy starcie pętli (`start_engine_once`) i na końcu
+/// `drain`, żeby kolejny start nie wystartował od razu w trybie shutdown.
+fn shutdown_flag() -> &'static std::sync::atomic::AtomicBool {
+    static F: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &F
+}
+
+/// The one process-wide analysis engine: collects (camera, frame-stage) pairs
+/// whose per-stage deadline elapsed, akumuluje ich NOWE klatki w buforze
+/// `pending` i flushuje je do executora chunkami po [`MODEL_BATCH`]
+/// pogrupowanymi po (alias, threshold), gdy grupa się wypełni ALBO gdy
+/// najstarsza pozycja czeka dłużej niż [`MAX_BATCH_WAIT`]. Time-batching
+/// sprawia, że nawet POJEDYNCZA szybka kamera wypełnia batch własnymi
+/// klatkami, a przy wielu kamerach flush jest cross-camera i natychmiastowy.
+async fn engine_loop() {
     let cold = ensure_cold_started();
     let mut last_metrics = Instant::now();
-    info!("[vision_analysis] cross-camera inference engine started (max_batch={MAX_BATCH})");
+    // Współbieżność forwardów (Chunk 4): do K batchowanych forwardów naraz na puli
+    // sesji ort. K=1 (domyślnie) = dawna serializacja (jeden forward w locie).
+    let k = inflight_limit();
+    let inflight_sem = Arc::new(tokio::sync::Semaphore::new(k));
+    // Trwające forwardy: JoinSet daje po zakończeniu `(Id, ForwardOutput)`, a przy
+    // drainie (abort pętli → drop JoinSetu) abortuje wszystkie zadania, więc żaden
+    // forward nie zostaje osierocony i jego bufor klatki jest zwalniany.
+    let mut forwards: tokio::task::JoinSet<ForwardOutput> = tokio::task::JoinSet::new();
+    // Batch każdego trwającego forwardu (routing wyników) trzymany po stronie pętli
+    // pod `task Id` — panika zadania nie gubi pozycji do domknięcia.
+    let mut inflight: HashMap<tokio::task::Id, Vec<PendingItem>> = HashMap::new();
+    info!(
+        "[vision_analysis] cross-camera inference engine started (model_batch={MODEL_BATCH}, max_batch_wait={}ms, inflight={k})",
+        MAX_BATCH_WAIT.as_millis()
+    );
+
+    // Bufor akumulacyjny time-batchingu: NOWE klatki due-etapów zbierane między
+    // flushami. FIFO — flush bierze najstarsze pozycje wybranej grupy.
+    let mut pending: Vec<PendingItem> = Vec::new();
+    // Klatki w trakcie analizy (job_id → FrameJob). Job żyje, dopóki którys z
+    // jego etapów czeka w `pending` — otwarty job blokuje przyjęcie kolejnej
+    // klatki TEJ KAMERY (ordering gate, patrz pętla zbierania klatek).
+    let mut jobs: HashMap<u64, FrameJob> = HashMap::new();
+    let mut next_job_id: u64 = 0;
+    // Ostatnio dołożona tożsamość klatki per (kamera, etap) (`captured_ms`,
+    // `pts_ns`), by NIE dublować tej samej klatki, gdy kamera nie wyprodukowała
+    // nowej między tickami (latest_frame_global zwróci wtedy tę samą klatkę).
+    let mut last_added: HashMap<(String, String), (u64, Option<u64>)> = HashMap::new();
+    // Ciągłe oczekiwanie na executor: początek czekania + ostatnia eskalacja
+    // `error!` (patrz [`EXECUTOR_STALL_ERROR_AFTER`] / [`EXECUTOR_STALL_ERROR_EVERY`]).
+    let mut executor_wait_since: Option<Instant> = None;
+    let mut executor_stall_logged: Option<Instant> = None;
 
     // Continuous (adaptive) batching: after each batch we loop IMMEDIATELY and
     // form the next one from whatever became due while the previous inference ran,
     // so the GPU stays back-to-back under load instead of idling to a fixed timer.
-    // A fixed tick would cap throughput at MAX_BATCH/tick and waste GPU whenever a
-    // batch finishes faster than the tick — which is exactly what FP16/TensorRT do.
     loop {
         let now = std::time::Instant::now();
+
+        // Graceful shutdown (drain): dokończ WSZYSTKIE trwające forwardy —
+        // awaitem, nie abortem — aplikując ich wyniki (finalne publikacje), po
+        // czym wyjdź. Abort anulowałby tylko async-task; biegnący `spawn_blocking`
+        // GPU-forward trwałby dalej i mógłby nałożyć się na restart, więc czekamy
+        // aż realnie się zakończą (K przestaje wtedy ograniczać starą pracę GPU).
+        if shutdown_flag().load(AtomicOrdering::Relaxed) {
+            while let Some(joined) = forwards.join_next_with_id().await {
+                apply_joined(&mut jobs, &mut inflight, Some(joined), &cold);
+            }
+            info!("[vision_analysis] engine loop drained in-flight forwards, exiting");
+            return;
+        }
 
         if now.duration_since(last_metrics) >= Duration::from_secs(30) {
             let m = metrics();
@@ -283,139 +813,459 @@ async fn engine_loop() {
             last_metrics = now;
         }
 
-        // Collect due cameras + which need an FPS re-read (no DB under the lock).
-        // Also track the soonest upcoming deadline so an idle wait sleeps exactly
-        // until the next camera is due, not a fixed interval.
-        let mut due: Vec<String> = Vec::new();
+        // Collect due (camera, frame-stage) pairs + which cameras need a config
+        // re-read (no DB under the lock). Also track the soonest upcoming
+        // deadline so an idle wait sleeps exactly until the next stage is due.
+        let mut due: Vec<(String, Arc<CvPipeline>, Vec<String>)> = Vec::new();
         let mut recheck: Vec<String> = Vec::new();
         let mut earliest_next: Option<std::time::Instant> = None;
         {
+            let fold = |t: std::time::Instant, earliest: &mut Option<std::time::Instant>| {
+                *earliest = Some(match *earliest {
+                    Some(e) => e.min(t),
+                    None => t,
+                });
+            };
             let reg = cameras().lock().unwrap();
             for (id, slot) in reg.iter() {
-                if slot.next_due <= now {
-                    due.push(id.clone());
-                    if slot.next_fps_check <= now {
-                        recheck.push(id.clone());
-                    }
+                if slot.next_cfg_check <= now {
+                    recheck.push(id.clone());
                 } else {
-                    earliest_next = Some(match earliest_next {
-                        Some(e) => e.min(slot.next_due),
-                        None => slot.next_due,
-                    });
+                    fold(slot.next_cfg_check, &mut earliest_next);
+                }
+                let Some(pipeline) = slot.pipeline.as_ref() else {
+                    continue;
+                };
+                let mut due_stages: Vec<String> = Vec::new();
+                for fs in cv_pipeline::frame_stages(pipeline) {
+                    match slot.stage_due.get(&fs.stage_id) {
+                        Some(&t) if t <= now => due_stages.push(fs.stage_id.clone()),
+                        Some(&t) => fold(t, &mut earliest_next),
+                        // Freshly installed stage without a deadline yet.
+                        None => due_stages.push(fs.stage_id.clone()),
+                    }
+                }
+                if !due_stages.is_empty() {
+                    due.push((id.clone(), pipeline.clone(), due_stages));
                 }
             }
         }
-        if due.is_empty() {
-            let wait = earliest_next
-                .map(|t| t.saturating_duration_since(now))
-                .unwrap_or(IDLE_POLL_MAX)
-                .clamp(IDLE_POLL_MIN, IDLE_POLL_MAX);
-            tokio::time::sleep(wait).await;
-            continue;
-        }
-        // Re-read changed FPS values outside the lock.
+
+        // Re-read changed configs (fps + pipeline) outside the lock. This runs
+        // BEFORE the executor gate, so pipelines keep refreshing while the
+        // engine waits — the moment the slot arrives, analysis starts instantly.
         for id in &recheck {
-            let fps = resolve_analysis_fps(id);
-            let mut reg = cameras().lock().unwrap();
-            if let Some(slot) = reg.get_mut(id) {
-                slot.fps = fps;
-                slot.next_fps_check = now + FPS_RECHECK;
-            }
+            let (fps, resolved) = resolve_camera_config(id).await;
+            apply_camera_config(id, fps, resolved, now);
         }
 
-        // Take this cycle's batch; cameras beyond MAX_BATCH stay overdue and are
-        // picked next tick (drop-nothing, just deferred).
-        let batch_ids: Vec<String> = due.iter().take(MAX_BATCH).cloned().collect();
+        // Etapy rozwiązują modele TYLKO przez executor — pusty slot (bootstrap,
+        // router jeszcze się inicjalizuje) = czekaj, nie analizuj i nie crashuj.
+        // Po [`EXECUTOR_STALL_ERROR_AFTER`] ciągłego czekania eskalujemy do
+        // `error!` (powtarzany co [`EXECUTOR_STALL_ERROR_EVERY`]) — cichy brak
+        // analizy CV to awaria, nie szum.
+        let Some(executor) = runtime_executor() else {
+            let since = *executor_wait_since.get_or_insert(now);
+            if now.duration_since(since) >= EXECUTOR_STALL_ERROR_AFTER {
+                let due_log = executor_stall_logged
+                    .map(|t| now.duration_since(t) >= EXECUTOR_STALL_ERROR_EVERY)
+                    .unwrap_or(true);
+                if due_log {
+                    let cams: Vec<String> =
+                        cameras().lock().unwrap().keys().cloned().collect();
+                    error!(
+                        "[vision_analysis] CV analysis stalled: runtime executor not initialized after {}s; cameras waiting: [{}]",
+                        now.duration_since(since).as_secs(),
+                        cams.join(", ")
+                    );
+                    executor_stall_logged = Some(now);
+                }
+            } else {
+                warn_throttled(
+                    "executor-missing",
+                    "runtime executor slot empty; analysis waiting for router init",
+                );
+            }
+            tokio::time::sleep(EXECUTOR_WAIT).await;
+            continue;
+        };
+        executor_wait_since = None;
+        executor_stall_logged = None;
 
-        // Pull the latest frame for each batched camera (async snapshot).
-        let mut frames: Vec<(String, std::sync::Arc<[u8]>, u32, u32)> = Vec::new();
-        for id in &batch_ids {
-            if let Some((rgb, w, h, _captured_ms)) =
+        // Dołóż do `pending` NOWE klatki wszystkich due-etapów (async snapshot).
+        // Czas przechwycenia klatki (`captured_ms`, unix epoch ms) + `pts_ns`
+        // niesiemy razem z ramka az do publish, zeby overlay kotwiczyl detekcje
+        // na wlasciwej klatce. Jedna kamera pobiera JEDNĄ klatkę per tick —
+        // wszystkie jej due-etapy analizują TĘ SAMĄ klatkę (wspólny FrameJob),
+        // więc ich wyniki scala jedna publikacja.
+        for (id, pipeline, due_stages) in &due {
+            // Ordering gate: jedna klatka w locie per KAMERA (przez wszystkie
+            // etapy). Szybszy etap nie może otworzyć joba dla captured_ms T+1,
+            // dopóki wieloetapowy job T jest otwarty — inaczej starszy merge
+            // (T) opublikowałby się PO nowszym (T+1) i cofnął overlay w czasie.
+            // Przy jednym etapie detect to dokładnie dawne "max 1 klatka w
+            // locie per kamera" (odrzucamy, nie kolejkujemy).
+            if jobs.values().any(|j| j.camera_id == *id) {
+                continue;
+            }
+            let Some((rgb, w, h, captured_ms, pts_ns)) =
                 crate::addon::host_functions::camera::latest_frame_global(id).await
-            {
-                frames.push((id.clone(), rgb, w, h));
+            else {
+                continue;
+            };
+            let ident = (captured_ms, pts_ns);
+            let mut stages_for_job: Vec<String> = Vec::new();
+            for sid in due_stages {
+                let key = (id.clone(), sid.clone());
+                // Pomiń, gdy to ta sama klatka co ostatnio dołożona dla tego
+                // etapu (zero duplikatów).
+                let is_new = last_added.get(&key).map(|prev| *prev != ident).unwrap_or(true);
+                if is_new {
+                    stages_for_job.push(sid.clone());
+                }
             }
+            if stages_for_job.is_empty() {
+                continue;
+            }
+            let job_id = next_job_id;
+            next_job_id += 1;
+            let added = Instant::now();
+            for sid in &stages_for_job {
+                last_added.insert((id.clone(), sid.clone()), ident);
+                let Some(stage) = pipeline.stages.iter().find(|s| &s.stage_id == sid) else {
+                    continue;
+                };
+                pending.push(PendingItem {
+                    job_id,
+                    stage_id: sid.clone(),
+                    alias: stage.model.clone(),
+                    threshold: stage.threshold,
+                    added,
+                });
+            }
+            jobs.insert(
+                job_id,
+                FrameJob {
+                    camera_id: id.clone(),
+                    frame: rgb,
+                    w,
+                    h,
+                    captured_ms,
+                    pts_ns,
+                    pipeline: pipeline.clone(),
+                    open_stages: stages_for_job,
+                    results: Vec::new(),
+                    detect_ms_total: 0,
+                    failed_stages: 0,
+                },
+            );
         }
 
-        // Reschedule every batched camera by its own FPS interval.
+        // Reschedule every due stage by its own FPS interval (stage fps, or the
+        // camera-level analysis_fps when the stage does not set one).
         {
             let mut reg = cameras().lock().unwrap();
-            for id in &batch_ids {
+            for (id, pipeline, due_stages) in &due {
                 if let Some(slot) = reg.get_mut(id) {
-                    slot.next_due = now + interval_for_fps(slot.fps);
+                    for sid in due_stages {
+                        let Some(stage) = pipeline.stages.iter().find(|s| &s.stage_id == sid)
+                        else {
+                            continue;
+                        };
+                        let fps = cv_pipeline::stage_fps(stage, slot.fps);
+                        slot.stage_due
+                            .insert(sid.clone(), now + interval_for_fps(fps));
+                    }
                 }
             }
         }
-        if frames.is_empty() {
+
+        // Warunek flush: pełny chunk MODEL_BATCH JEDNEJ grupy (alias, threshold)
+        // — cross-camera przy wielu kamerach albo nazbierane klatki jednej
+        // kamery — ALBO upłynęło okno MAX_BATCH_WAIT od najstarszej pozycji
+        // (bound latencji przy małej liczbie kamer; flushuje grupę najstarszej).
+        // P1: zastosuj wszystkie GOTOWE forwardy zanim uformujemy/wypuścimy nowy
+        // batch. Gwarantuje, że wynik ukończonego forwardu jest zaaplikowany
+        // (publikacja + kolejność etapów) PRZED spawnem kolejnego. Sekcja
+        // flush/acquire/spawn poniżej jest w całości synchroniczna (brak awaitu),
+        // więc żaden forward nie ukończy się między tym drenażem a spawnem.
+        drain_ready_forwards(&mut forwards, &mut jobs, &mut inflight, &cold);
+
+        let now_flush = Instant::now();
+        let window_elapsed = pending
+            .first()
+            .map(|it| now_flush.duration_since(it.added) >= MAX_BATCH_WAIT)
+            .unwrap_or(false);
+        let keys: Vec<(&str, Option<u32>)> = pending
+            .iter()
+            .map(|it| (it.alias.as_str(), it.threshold.map(f32::to_bits)))
+            .collect();
+        let batch_indices = cv_pipeline::select_flush_batch(&keys, MODEL_BATCH, window_elapsed);
+
+        // Rezerwuj slot forwardu ZANIM wyjmiemy batch. Semaphore(K) to
+        // backpressure, które dawał inline `.await`: gdy K forwardów już biegnie,
+        // `try_acquire_owned` zawodzi i pętla przestaje wypuszczać nowe batche
+        // (pending pozostaje ograniczony ordering gate'm = ≤1 klatka/kamera).
+        // Permit wędruje do zadania i zwalnia się, gdy forward się kończy.
+        let permit = batch_indices
+            .as_ref()
+            .and_then(|_| inflight_sem.clone().try_acquire_owned().ok());
+
+        let Some(indices) = batch_indices.filter(|_| permit.is_some()) else {
+            // Nic do policzenia (brak due grupy) ALBO wszystkie K slotów zajęte:
+            // czekaj do najbliższego z (a) deadline najwcześniejszego jeszcze-niedue
+            // etapu / cfg-checku, (b) deadline flushu pending (`added +
+            // MAX_BATCH_WAIT`), LUB do zakończenia któregoś trwającego forwardu
+            // (zwolni slot; wynik stosujemy na pętli — jedyny właściciel `jobs`).
+            // Clamp [IDLE_POLL_MIN, IDLE_POLL_MAX] trzyma pętlę responsywną.
+            let mut wait = earliest_next
+                .map(|t| t.saturating_duration_since(now_flush))
+                .unwrap_or(IDLE_POLL_MAX);
+            if let Some(it) = pending.first() {
+                wait = wait.min((it.added + MAX_BATCH_WAIT).saturating_duration_since(now_flush));
+            }
+            let wait = wait.clamp(IDLE_POLL_MIN, IDLE_POLL_MAX);
+            // Precondycja `!forwards.is_empty()`: pusty JoinSet rozwiązuje
+            // `join_next_with_id` natychmiast na `None` — bez guarda select
+            // busy-spinowałby. Gdy pusty, tylko sleep prowadzi oczekiwanie.
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                joined = forwards.join_next_with_id(), if !forwards.is_empty() => {
+                    apply_joined(&mut jobs, &mut inflight, joined, &cold);
+                }
+            }
+            continue;
+        };
+        let permit = permit.expect("permit present when a batch is selected");
+
+        // Wyjmij wybrane pozycje (indeksy rosnące — usuwamy od końca, kolejność
+        // FIFO zachowana). Nadmiar grupy zostaje w pending na kolejny flush.
+        let mut batch: Vec<PendingItem> = Vec::with_capacity(indices.len());
+        for &i in indices.iter().rev() {
+            batch.push(pending.remove(i));
+        }
+        batch.reverse();
+
+        // Klatki batcha zero-copy (klon `Arc`) z jobów. Job pozycji w pending
+        // zawsze istnieje (usuwany dopiero po domknięciu wszystkich etapów).
+        let mut frames: Vec<CvFrameLocal> = Vec::with_capacity(batch.len());
+        for it in &batch {
+            if let Some(job) = jobs.get(&it.job_id) {
+                frames.push(CvFrameLocal {
+                    data: job.frame.clone(),
+                    width: job.w,
+                    height: job.h,
+                });
+            }
+        }
+        if frames.len() != batch.len() {
+            warn_throttled("detect", "pending item without a live frame job; batch dropped");
+            for item in &batch {
+                stage_completed(&mut jobs, item, None, &cold);
+            }
+            // Slot był tylko zarezerwowany — brak forwardu, drop zwalnia go od razu.
+            drop(permit);
             continue;
         }
 
-        // HOT PATH: one batched detector run only (no OCR/classify here). EVERY
-        // frame — empty or not — flows through the single cold FIFO so overlay
-        // clears stay ordered with enriched frames (no stale-frame resurrection).
-        // Empty events drop the frame buffer so they cost no memory.
-        let detector = detector.clone();
-        let detected =
-            crate::vision::burn_backend::run_blocking(move || detect_only(detector, frames)).await;
-        match detected {
-            Ok(per_cam) => {
-                for (id, frame, w, h, dets) in per_cam {
-                    let sig = detection_sig(&dets);
-                    // Empty events drop the frame buffer (no enrichment needed).
-                    let frame = if dets.is_empty() {
-                        Arc::<[u8]>::from(Vec::new())
-                    } else {
-                        frame
-                    };
-                    let bytes = frame.len();
-                    // Coalesce / rate-limit / byte-budget gate (reserves the slot).
-                    if admit_cold(&id, sig, bytes).is_none() {
-                        continue;
-                    }
-                    let ev = DetectionEvent {
-                        camera_id: id.clone(),
-                        frame,
-                        w,
-                        h,
-                        detections: dets,
-                    };
-                    match cold.try_send(ev) {
-                        Ok(()) => {
-                            commit_cold(&id, sig);
-                            metrics().emitted.fetch_add(1, AtomicOrdering::Relaxed);
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            metrics().dropped_full.fetch_add(1, AtomicOrdering::Relaxed);
-                            release_cold(&id, bytes);
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            warn!("[vision_analysis] cold path closed; detections dropped");
-                            release_cold(&id, bytes);
-                        }
-                    }
-                }
+        // HOT PATH: one batched detect per (alias, threshold) group through the
+        // executor (resolve aliasu + failover/mesh). Sam FORWARD biegnie
+        // współbieżnie (do K naraz) w spawnowanym zadaniu — pula sesji ort jest
+        // `&self` + Send+Sync, więc równoległe detekty liczą się na osobnych
+        // sesjach GPU bez korupcji (Chunki 1-3). APLIKACJA wyników wraca na
+        // pętlę przez `join_next`, więc `jobs`/tracker/enrich-cache ma nadal
+        // jednego właściciela — współbieżny jest WYŁĄCZNIE forward. `detect_ms`
+        // liczony jak dotąd: łączny czas wywołania / liczba klatek batcha.
+        let alias = batch[0].alias.clone();
+        let threshold = batch[0].threshold;
+        let executor_task = executor.clone();
+        let n = batch.len().max(1) as u32;
+        let handle = forwards.spawn(async move {
+            // Permit trzymany przez CAŁY forward — dropuje się z zadaniem (koniec
+            // lub abort przy drainie), zwalniając slot Semaphore.
+            let _permit = permit;
+            let request = CameraCvRequest {
+                model: alias.clone(),
+                op: CameraCvOpLocal::Detect { frames, threshold },
+            };
+            // Wywolanie systemowe (silnik kamer) — brak tozsamosci uzytkownika,
+            // swiezy kontekst per wywolanie (jak w vision_impl).
+            let mut ctx = RuntimeContext::new(None);
+            let detect_start = Instant::now();
+            let outcome = executor_task
+                .execute_camera_cv(request, &mut ctx)
+                .await
+                .map_err(|e| e.to_string());
+            let detect_ms = (detect_start.elapsed().as_millis() as u32) / n;
+            ForwardOutput {
+                alias,
+                detect_ms,
+                outcome,
             }
-            Err(e) => warn!("[vision_analysis] detect task panicked: {e}"),
+        });
+        inflight.insert(handle.id(), batch);
+        // Continuous batching: wracamy natychmiast, by uformować i wypuścić
+        // kolejny batch, dopóki są wolne sloty K (greedy). Gdy sloty się wyczerpią,
+        // `try_acquire_owned` zawiedzie i pętla przejdzie w idle-wait powyżej.
+    }
+}
+
+/// Domyka jeden etap `frame` klatki: przy sukcesie nadaje track_id (tracker per
+/// (kamera, etap)), dokłada świeże wpisy cache wzbogacania i zapisuje wynik do
+/// joba; przy błędzie tylko odnotowuje porażkę. Gdy to był ostatni otwarty etap
+/// klatki — finalizuje job (publikacja FAZY 1 + ewentualne zdarzenie cold path).
+fn stage_completed(
+    jobs: &mut HashMap<u64, FrameJob>,
+    item: &PendingItem,
+    outcome: Option<(Vec<Detection>, u32)>,
+    cold: &mpsc::Sender<DetectionEvent>,
+) {
+    let Some(job) = jobs.get_mut(&item.job_id) else {
+        return;
+    };
+    job.open_stages.retain(|s| s != &item.stage_id);
+    match outcome {
+        Some((mut dets, detect_ms)) => {
+            // Tracker IOU per (kamera, etap detekcji): nadaje stabilne `track_id`
+            // + prędkość (vx,vy) KAŻDEJ detekcji przed publikacją, tak by FAZA 1
+            // i FAZA 2 niosly juz spojne identyfikatory sledzenia.
+            tracker::update(
+                &tracker::key(&job.camera_id, &item.stage_id),
+                &mut dets,
+                job.pts_ns,
+            );
+            // Cache wzbogacania (per (kamera, cold-stage, track)): stan/OCR NIE
+            // zmieniaja sie klatka-po-klatce, a tracki maja stabilne id. Swieze
+            // wpisy przypisujemy OD RAZU w hot path — boxy FAZY 1 niosa stan
+            // natychmiast, bez czekania na cold path.
+            apply_cached_enrichment(&job.camera_id, &job.pipeline, &item.stage_id, &mut dets);
+            job.detect_ms_total += detect_ms;
+            job.results.push((item.stage_id.clone(), dets));
         }
+        None => job.failed_stages += 1,
+    }
+    if job.open_stages.is_empty() {
+        if let Some(job) = jobs.remove(&item.job_id) {
+            finalize_job(job, cold);
+        }
+    }
+}
+
+/// Finalizacja klatki po domknięciu wszystkich jej etapów `frame`: scala wyniki
+/// etapów w JEDNĄ publikację overlay (FAZA 1, kolejność etapów pipeline'u) i —
+/// dla niepustych zestawów — oddaje ramkę do cold path (FAZA 2, wzbogacenie).
+fn finalize_job(mut job: FrameJob, cold: &mpsc::Sender<DetectionEvent>) {
+    // Kazdy etap klatki zawiódł — jak dawna porażka detektora: nic nie
+    // publikujemy (overlay zostaje przy poprzedniej ramce, zero czyszczenia).
+    if job.results.is_empty() {
+        return;
+    }
+    job.results
+        .sort_by_key(|(sid, _)| cv_pipeline::stage_index(&job.pipeline, sid));
+    let merged: Vec<Detection> = job
+        .results
+        .iter()
+        .flat_map(|(_, d)| d.iter().cloned())
+        .collect();
+    // FAZA 1 (hot, natychmiast): publikuj scalone detekcje wszystkich etapów
+    // klatki od razu, jeszcze przed wzbogaceniem. Overlay kotwiczy je po
+    // `captured_ms`, wiec boxy lądują na wlasciwej klatce z opoznieniem samego
+    // dekodu + inferencji, a nie +OCR. Pusty zestaw tez publikujemy — czysci
+    // overlay bez czekania na cold path. FAZA 1 zna tylko sume czasow detekcji;
+    // pelny `proc_ms` publikuje FAZA 2, nadpisujac ramke dla tego samego
+    // captured_ms.
+    detection_bus::publish_detections(
+        &job.camera_id,
+        job.captured_ms,
+        job.pts_ns,
+        job.detect_ms_total,
+        merged.clone(),
+    );
+    // Pusty zestaw nie wymaga wzbogacenia: FAZA 1 juz wyczyscila overlay.
+    if merged.is_empty() {
+        return;
+    }
+    let sig = detection_sig(&merged);
+    let bytes = job.frame.len();
+    // FAZA 2 (cold): wzbogacenie pod dotychczasowym budzetem / backpressure.
+    // Coalesce / rate-limit / byte-budget gate (rezerwuje slot).
+    if admit_cold(&job.camera_id, sig, bytes).is_none() {
+        return;
+    }
+    let camera_id = job.camera_id.clone();
+    let ev = DetectionEvent {
+        camera_id: job.camera_id,
+        frame: job.frame,
+        w: job.w,
+        h: job.h,
+        captured_ms: job.captured_ms,
+        pts_ns: job.pts_ns,
+        detect_ms: job.detect_ms_total,
+        pipeline: job.pipeline,
+        stage_dets: job.results,
+    };
+    match cold.try_send(ev) {
+        Ok(()) => {
+            commit_cold(&camera_id, sig);
+            metrics().emitted.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            metrics().dropped_full.fetch_add(1, AtomicOrdering::Relaxed);
+            release_cold(&camera_id, bytes);
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            warn!("[vision_analysis] cold path closed; detections dropped");
+            release_cold(&camera_id, bytes);
+        }
+    }
+}
+
+/// Mapuje detekcję surface'u CameraCv na typ magistrali detekcji. Pola
+/// wzbogacenia/śledzenia startują puste — nadaje je tracker (track_id, vx, vy)
+/// i cold path (stan, tekst).
+fn detection_from_cv(d: CvDetection) -> Detection {
+    Detection {
+        klasa: d.klasa,
+        bbox: d.bbox,
+        score: d.score,
+        stan: Vec::new(),
+        tekst: None,
+        track_id: 0,
+        vx: 0.0,
+        vy: 0.0,
     }
 }
 
 /// Bounded cold-path queue capacity. Each NON-empty event carries a full RGB
 /// frame (≈6 MB @1080p), so the cap is deliberately small to bound memory; empty
-/// events drop the frame and are cheap. Chunk 0b replaces this with a byte-budget
-/// + per-camera coalescing.
+/// events never reach the cold path.
 const COLD_QUEUE_CAP: usize = 32;
 
 /// One detection frame handed from the hot detector to the cold enrichment path.
-/// Empty-detection events carry an empty `frame` (no enrichment needed) so they
-/// cost no memory; they still flow through the same FIFO so overlay clears stay
-/// ordered relative to enriched frames (no stale-frame resurrection).
+/// Cold path niesie WYLACZNIE niepuste ramki (FAZA 2 — wzbogacenie): puste
+/// zestawy publikuje juz FAZA 1 w hot loopie (czyszczenie overlay), wiec nigdy
+/// tu nie trafiaja i nie zajmuja pamieci ani slotu.
 struct DetectionEvent {
     camera_id: String,
     frame: Arc<[u8]>,
     w: u32,
     h: u32,
-    detections: Vec<crate::services::detection_bus::Detection>,
+    /// Czas przechwycenia klatki (unix epoch ms) — propagowany do publish jako
+    /// `ts_ms`, zeby overlay kotwiczyl detekcje na wlasciwej klatce.
+    captured_ms: u64,
+    /// PTS klatki w osi mediów (nanosekundy) — propagowany do publish jako
+    /// `pts_ns`, wspolna oś czasu z init-segmentem MSE (`mux_base_pts_ns`).
+    pts_ns: Option<u64>,
+    /// Suma czasów forwardów etapów `frame` (ms) zmierzona w FAZIE 1 (hot).
+    /// Niesiona do FAZY 2, gdzie sumuje sie z `enrich_ms` w pelny `proc_ms`.
+    detect_ms: u32,
+    /// Pipeline kamery z chwili analizy — cold path interpretuje jego etapy
+    /// `stage` (classify/ocr/embed) bez ponownego resolve.
+    pipeline: Arc<CvPipeline>,
+    /// Wyniki etapów `frame` tej klatki: (stage_id, detekcje). Etapy cold
+    /// wybieraja rodzica po `stage_id`; publikacja scala grupy w kolejności
+    /// etapów pipeline'u.
+    stage_dets: Vec<(String, Vec<Detection>)>,
 }
 
 /// Live cold-path sender + consumer handle, so `drain` can tear the cold path
@@ -588,11 +1438,14 @@ impl Drop for ColdSlot {
     }
 }
 
-/// Cold path: enriches each detection frame (state classify + plate OCR on crops)
-/// off the hot detector loop, then publishes. Owns the classifier/OCR runners.
+/// Cold path (FAZA 2): interpretuje etapy `stage` pipeline'u (classify → stan,
+/// ocr → tekst) na cropach detekcji rodzica, publikuje wzbogacony zestaw dla
+/// TEGO SAMEGO `captured_ms` co FAZA 1 — overlay podmienia surowe boxy na
+/// wzbogacone etykiety. Gdy kamera ma przypisany flow analizy
+/// (`analysis_flow_id`), flow biegnie PO etapach cold pipeline'u i dostaje w
+/// meta już wzbogacone detekcje; publikacja flow może je nadpisać
+/// (`publish_flow_detections`).
 async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
-    let classifier = get_classifier().await;
-    let ocr = get_ocr().await;
     info!("[vision_analysis] cold enrichment consumer started");
     while let Some(ev) = rx.recv().await {
         let DetectionEvent {
@@ -600,7 +1453,11 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
             frame,
             w,
             h,
-            detections,
+            captured_ms,
+            pts_ns,
+            detect_ms,
+            pipeline,
+            mut stage_dets,
         } = ev;
         let bytes = frame.len();
         // RAII: releases this camera's in-flight slot + bytes on drop — including
@@ -610,15 +1467,21 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
             bytes,
             released: false,
         };
-        // If the camera has an assigned analysis Flow, run it (it owns the
-        // OCR/classify/verdict/alert logic); otherwise fall back to the default
-        // hardcoded enrichment. Empty-detection events carry a dropped (0-byte)
-        // frame and have nothing to enrich/decide, so they skip the flow and
-        // fall through to publish an empty set (clearing the overlay) — running
-        // the flow on a dropped frame would only fail the vision nodes.
-        if !detections.is_empty() {
+        // Czas wzbogacenia tej klatki: pelna petla etapow cold. Dla trafien
+        // cache (pominiety realny forward) bedzie maly — klatka faktycznie tania.
+        let enrich_start = Instant::now();
+        run_cold_stages(&camera_id, &frame, w, h, &pipeline, &mut stage_dets).await;
+        let enrich_ms = enrich_start.elapsed().as_millis() as u32;
+        // proc_ms = calosc obrobki klatki: detekcja (FAZA 1) + etapy cold (FAZA 2).
+        let proc_ms = detect_ms + enrich_ms;
+        let merged: Vec<Detection> = stage_dets
+            .iter()
+            .flat_map(|(_, d)| d.iter().cloned())
+            .collect();
+        detection_bus::publish_detections(&camera_id, captured_ms, pts_ns, proc_ms, merged.clone());
+        if !merged.is_empty() {
             if let (Some(flow_id), Some(disp)) = (
-                camera_flow_id(&camera_id),
+                camera_flow_id(&camera_id).await,
                 crate::flow_engine::dispatcher::global_flow_dispatcher(),
             ) {
                 // Detach: a flow can run up to its per-frame deadline, so awaiting
@@ -629,24 +1492,16 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
                 // budget bounds the fleet — so detaching stays bounded.
                 tokio::spawn(async move {
                     let _slot = slot;
-                    run_camera_flow(disp, flow_id, camera_id, frame, w, h, detections).await;
+                    run_camera_flow(
+                        disp, flow_id, camera_id, frame, w, h, captured_ms, pts_ns, proc_ms,
+                        merged,
+                    )
+                    .await;
                 });
                 continue;
             }
         }
-        let _slot = slot;
-        let classifier = classifier.clone();
-        let ocr = ocr.clone();
-        let res = crate::vision::burn_backend::run_blocking(move || {
-            let mut dets = detections;
-            enrich_detections(&classifier, &ocr, &frame, w, h, &mut dets);
-            (camera_id, dets)
-        })
-        .await;
-        match res {
-            Ok((id, dets)) => detection_bus::publish_detections(&id, dets),
-            Err(e) => warn!("[vision_analysis] enrich task panicked: {e}"),
-        }
+        drop(slot);
     }
 }
 
@@ -672,17 +1527,24 @@ fn flow_id_cache() -> &'static Mutex<HashMap<String, FlowIdCacheEntry>> {
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Returns the camera's assigned analysis flow id, or `None` to fall back to the
-/// built-in enrichment path. Cached with [`FLOW_ID_TTL`].
-fn camera_flow_id(camera_id: &str) -> Option<String> {
+/// Returns the camera's assigned analysis flow id, or `None` when unassigned.
+/// Cached with [`FLOW_ID_TTL`]. Odczyt DB (rusqlite, sync) przy chybieniu cache
+/// biegnie na puli blocking, nie na watku tokio.
+async fn camera_flow_id(camera_id: &str) -> Option<String> {
     if let Some(e) = flow_id_cache().lock().unwrap().get(camera_id) {
         if e.fetched.elapsed() < FLOW_ID_TTL {
             return e.flow_id.clone();
         }
     }
-    let flow_id = crate::db::global_pool()
-        .and_then(|pool| crate::db::repository::camera_analysis_flow_id(&pool, camera_id).ok())
-        .flatten();
+    let query_id = camera_id.to_string();
+    let flow_id = tokio::task::spawn_blocking(move || {
+        crate::db::global_pool()
+            .and_then(|pool| crate::db::repository::camera_analysis_flow_id(&pool, &query_id).ok())
+            .flatten()
+    })
+    .await
+    .ok()
+    .flatten();
     flow_id_cache().lock().unwrap().insert(
         camera_id.to_string(),
         FlowIdCacheEntry {
@@ -695,8 +1557,8 @@ fn camera_flow_id(camera_id: &str) -> Option<String> {
 
 /// Runs a camera's assigned analysis Flow on one detection frame: stores the raw
 /// RGB frame as an Image blob, builds the initial envelope (payload = Image, meta
-/// carries the hot detector's detections + camera id), dispatches by flow id and
-/// publishes the resulting detections back to the bus so the live overlay
+/// carries the pipeline-enriched detections + camera id), dispatches by flow id
+/// and publishes the resulting detections back to the bus so the live overlay
 /// reflects the flow's enrichment/verdict. Errors are logged, never fatal — the
 /// cold path keeps draining and the slot is released by the caller's `ColdSlot`.
 async fn run_camera_flow(
@@ -706,10 +1568,17 @@ async fn run_camera_flow(
     frame: Arc<[u8]>,
     w: u32,
     h: u32,
+    captured_ms: u64,
+    pts_ns: Option<u64>,
+    detect_ms: u32,
     detections: Vec<Detection>,
 ) {
     use crate::flow_engine::dispatcher::FlowRequestMeta;
     use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
+
+    // Czas wykonania flow to koszt dodatkowej obrobki tej klatki; proc_ms =
+    // detekcja + etapy cold (FAZA 2) + flow.
+    let enrich_start = Instant::now();
 
     let dets_json = match serde_json::to_value(&detections) {
         Ok(v) => v,
@@ -763,7 +1632,8 @@ async fn run_camera_flow(
                 "[vision_analysis] flow {flow_id} ran for {camera_id}: {} detections, verdict={verdict}",
                 detections.len()
             );
-            publish_flow_detections(&camera_id, detections, outcome);
+            let proc_ms = detect_ms + enrich_start.elapsed().as_millis() as u32;
+            publish_flow_detections(&camera_id, captured_ms, pts_ns, proc_ms, detections, outcome);
         }
         Err(e) => warn!("[vision_analysis] flow {flow_id} dispatch failed: {e}"),
     }
@@ -777,9 +1647,12 @@ async fn run_camera_flow(
 /// Publishes a finished flow's detections to the live overlay. A flow that
 /// enriches (OCR/classify/verdict) writes the updated detection array back into
 /// `meta["detections"]`; when present and parseable we publish those, otherwise
-/// we publish the original detector boxes so the overlay still shows them.
+/// we publish the original detection set so the overlay still shows it.
 fn publish_flow_detections(
     camera_id: &str,
+    captured_ms: u64,
+    pts_ns: Option<u64>,
+    proc_ms: u32,
     original: Vec<Detection>,
     outcome: crate::flow_engine::envelope::FlowExecutionOutcome,
 ) {
@@ -795,75 +1668,666 @@ fn publish_flow_detections(
         },
         None => None,
     };
-    detection_bus::publish_detections(camera_id, enriched.unwrap_or(original));
+    detection_bus::publish_detections(
+        camera_id,
+        captured_ms,
+        pts_ns,
+        proc_ms,
+        enriched.unwrap_or(original),
+    );
 }
 
-/// HOT, blocking: one `detect_batch` across the frames. Returns the raw boxes per
-/// frame plus the frame buffer, for the cold path to enrich. No OCR/classify here.
-fn detect_only(
-    detector: Arc<Mutex<RfDetrDetector>>,
-    frames: Vec<(String, Arc<[u8]>, u32, u32)>,
-) -> Vec<(String, Arc<[u8]>, u32, u32, Vec<crate::services::detection_bus::Detection>)> {
-    let batch = {
-        let refs: Vec<(&[u8], u32, u32)> =
-            frames.iter().map(|(_, rgb, w, h)| (&rgb[..], *w, *h)).collect();
-        let mut guard = detector.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.detect_batch(&refs) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("[vision_analysis] detect_batch failed (n={}): {e:#}", refs.len());
-                return Vec::new();
+/// Okno swiezosci wpisu w cache wzbogacania. Stan tablicy/nalepki i odczyt OCR
+/// sa stabilne w czasie zycia tracku, wiec przez ~3 s reuzywamy raz policzony
+/// wynik zamiast liczyc go per klatka. Po uplywie tego okna track jest wzbogacany
+/// ponownie (odswiezenie), co lapie realne zmiany (np. tablica zmienila stan).
+const ENRICH_TTL: Duration = Duration::from_secs(3);
+
+/// Wiek, po ktorym wpis cache jest usuwany przy ewikcji — wyrazniej dluzszy niz
+/// `ENRICH_TTL`, by track, ktory chwilowo zniknal i wrocil, wciaz mial swoj stan.
+const ENRICH_CACHE_EVICT_AGE: Duration = Duration::from_secs(10);
+
+/// Co ile zapisow do cache uruchamiamy ewikcje przestarzalych wpisow. Ewikcja
+/// licznikowa (analogicznie do leak-fixu trackera) trzyma mape ograniczona bez
+/// osobnego watku — martwe tracki znikaja przy okazji kolejnych zapisow.
+const ENRICH_EVICT_EVERY: usize = 256;
+
+/// Wynik jednego etapu cold dla jednego tracku: stan (classify) LUB odczyt OCR
+/// (tylko pole właściwe dla `output` etapu jest niepuste), wraz z chwilą
+/// policzenia (`at`) do oceny świeżości względem `ENRICH_TTL`.
+#[derive(Clone)]
+struct CachedEnrich {
+    stan: Vec<String>,
+    tekst: Option<String>,
+    at: Instant,
+}
+
+/// Proces-wide cache wzbogacania kluczowany po (camera_id, stage_id, track_id) —
+/// stage_id to etap COLD pipeline'u, wiec dwa etapy classify nad tym samym
+/// rodzicem nie koliduja. Pozwala wzbogacic kazdy track RAZ per etap i reuzywac
+/// wynik zamiast wolac model per klatka (~10x mniej forwardow).
+fn enrich_cache() -> &'static Mutex<HashMap<(String, String, u32), CachedEnrich>> {
+    static C: OnceLock<Mutex<HashMap<(String, String, u32), CachedEnrich>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Zwraca swiezy (`at.elapsed() < ENRICH_TTL`) wpis cache dla (etap, track) albo
+/// `None` (brak wpisu lub przeterminowany). Klon jest tani — `stan` to zwykle
+/// 0-2 stringi.
+fn enrich_cache_fresh(camera_id: &str, stage_id: &str, track_id: u32) -> Option<CachedEnrich> {
+    let cache = enrich_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .get(&(camera_id.to_string(), stage_id.to_string(), track_id))
+        .filter(|c| c.at.elapsed() < ENRICH_TTL)
+        .cloned()
+}
+
+/// Zapisuje wynik etapu cold dla tracku do cache i co `ENRICH_EVICT_EVERY`
+/// zapisow usuwa wpisy starsze niz `ENRICH_CACHE_EVICT_AGE` (ewikcja
+/// licznikowa), by mapa nie rosla po znikajacych trackach.
+fn enrich_cache_put(
+    camera_id: &str,
+    stage_id: &str,
+    track_id: u32,
+    stan: Vec<String>,
+    tekst: Option<String>,
+) {
+    static PUT_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let mut cache = enrich_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.insert(
+        (camera_id.to_string(), stage_id.to_string(), track_id),
+        CachedEnrich {
+            stan,
+            tekst,
+            at: Instant::now(),
+        },
+    );
+    if PUT_COUNT.fetch_add(1, AtomicOrdering::Relaxed) % ENRICH_EVICT_EVERY == 0 {
+        cache.retain(|_, c| c.at.elapsed() < ENRICH_CACHE_EVICT_AGE);
+    }
+}
+
+/// Przypisuje detekcji wynik etapu cold zgodnie z jego `output`: classify
+/// dokłada etykiety do `stan` (dwa etapy classify nad tym samym rodzicem
+/// scalają się), OCR ustawia `tekst` (niepusty wynik wygrywa).
+fn apply_stage_output(det: &mut Detection, output: Option<CvStageOutput>, value: &CachedEnrich) {
+    match output {
+        Some(CvStageOutput::Stan) => det.stan.extend(value.stan.iter().cloned()),
+        Some(CvStageOutput::Tekst) => {
+            if value.tekst.is_some() {
+                det.tekst = value.tekst.clone();
             }
         }
-    };
-    frames
-        .into_iter()
-        .zip(batch.into_iter())
-        .map(|((id, rgb, w, h), items)| (id, rgb, w, h, items))
-        .collect()
+        None => {}
+    }
 }
 
-/// COLD, blocking: per-detection state classify (labels) + plate OCR, mutating
-/// `items` in place. Runs off the hot detector loop so its latency never paces
-/// detection throughput. Missing runners (`None`) skip that stage, never crash.
-fn enrich_detections(
-    classifier: &Option<Arc<Mutex<StateClassifier>>>,
-    ocr: &Option<Arc<Mutex<PlateOcr>>>,
-    rgb: &[u8],
-    w: u32,
-    h: u32,
-    items: &mut [crate::services::detection_bus::Detection],
+/// HOT: przypisuje detekcjom etapu `detect_stage_id` swieze wpisy cache
+/// wzbogacania wszystkich etapow cold, ktore maja ten etap za rodzica — boxy
+/// FAZY 1 niosa stan/tekst natychmiast, bez czekania na cold path.
+fn apply_cached_enrichment(
+    camera_id: &str,
+    pipeline: &CvPipeline,
+    detect_stage_id: &str,
+    dets: &mut [Detection],
 ) {
-    for det in items.iter_mut() {
-        let fw = w as f32;
-        let fh = h as f32;
-        let x0 = (det.bbox[0] * fw).round().clamp(0.0, fw) as u32;
-        let y0 = (det.bbox[1] * fh).round().clamp(0.0, fh) as u32;
-        let cw = (det.bbox[2] * fw).round().max(0.0) as u32;
-        let ch = (det.bbox[3] * fh).round().max(0.0) as u32;
-        let cw = cw.min(w.saturating_sub(x0));
-        let ch = ch.min(h.saturating_sub(y0));
-        if cw < 8 || ch < 8 {
+    for stage in cv_pipeline::cold_stages(pipeline) {
+        let CvStageInput::Stage { stage_id: parent, classes } = &stage.input else {
+            continue;
+        };
+        if parent != detect_stage_id {
             continue;
         }
-        if wants_state(&det.klasa) {
-            if let Some(classifier) = classifier.as_ref() {
-                let crop = crop_rgb(rgb, w, x0, y0, cw, ch);
-                match classifier.lock().unwrap_or_else(|e| e.into_inner()).classify(&crop, cw, ch) {
-                    Ok(stany) => det.stan = stany,
-                    Err(e) => warn!("[vision_analysis] classify failed for {}: {e:#}", det.klasa),
-                }
+        for det in dets.iter_mut() {
+            if det.track_id == 0 || !cv_pipeline::class_matches(classes, &det.klasa) {
+                continue;
+            }
+            if let Some(c) = enrich_cache_fresh(camera_id, &stage.stage_id, det.track_id) {
+                apply_stage_output(det, stage.output, &c);
             }
         }
-        if det.klasa == "tablica_rejestracyjna" {
-            if let Some(ocr) = ocr.as_ref() {
-                let crop = crop_rgb(rgb, w, x0, y0, cw, ch);
-                match ocr.lock().unwrap_or_else(|e| e.into_inner()).read(&crop, cw, ch) {
-                    Ok(Some(plate)) => det.tekst = Some(plate),
-                    Ok(None) => {}
-                    Err(e) => warn!("[vision_analysis] OCR failed for {}: {e:#}", det.klasa),
+    }
+}
+
+/// COLD: generyczny interpreter etapow `stage` pipeline'u. Dla kazdego etapu
+/// wybiera detekcje rodzica pasujace klasami (`class_matches`), wycina crop z
+/// paddingiem etapu i wykonuje operacje przez executor (alias ETAPU):
+/// classify → `stan`, ocr → `tekst` (tryb z `params.ocr_mode`), embed →
+/// jawny skip z warn-once (surface CameraCv nie ma jeszcze operacji Embed).
+/// Petla jest async: executor sam robi `run_blocking` per forward, wiec
+/// serializacja GPU jest zachowana (jeden forward naraz). Zaden blad nie
+/// wychodzi na zewnatrz — etap bez wyniku zostawia pole puste.
+async fn run_cold_stages(
+    camera_id: &str,
+    frame: &[u8],
+    w: u32,
+    h: u32,
+    pipeline: &CvPipeline,
+    stage_dets: &mut [(String, Vec<Detection>)],
+) {
+    let Some(executor) = runtime_executor() else {
+        warn_throttled(
+            "cold-executor",
+            "runtime executor unavailable; cold enrichment skipped",
+        );
+        return;
+    };
+    // Wzbogacenie budowane od zera z cache/forwardow etapow — hot path zdazyl
+    // juz przypisac swieze wpisy cache tej samej klatce (FAZA 1), wiec reset
+    // chroni przed zdublowanym `stan` przy ponownym `extend`.
+    for (_, dets) in stage_dets.iter_mut() {
+        for det in dets.iter_mut() {
+            det.stan.clear();
+            det.tekst = None;
+        }
+    }
+    for stage in cv_pipeline::cold_stages(pipeline) {
+        let CvStageInput::Stage { stage_id: parent, classes } = &stage.input else {
+            continue;
+        };
+        if stage.op == CvOp::Embed {
+            // Jedyny dopuszczony brak wykonania: walidator przyjmuje op=embed,
+            // ale silnik nie ma jeszcze operacji Embed na surface CameraCv —
+            // etap jest JAWNIE pomijany (nigdy cicho).
+            warn_once(
+                &format!("embed:{}", stage.stage_id),
+                &format!(
+                    "stage '{}': op=embed not executable yet (CameraCv surface has no Embed op); stage skipped",
+                    stage.stage_id
+                ),
+            );
+            continue;
+        }
+        let (pad_x, pad_y) = cv_pipeline::crop_pads(stage);
+        let Some((_, dets)) = stage_dets.iter_mut().find(|(sid, _)| sid == parent) else {
+            continue;
+        };
+        for det in dets.iter_mut() {
+            if !cv_pipeline::class_matches(classes, &det.klasa) {
+                continue;
+            }
+            // Cache per (etap, track): swiezy wpis reuzywamy bez forwardu —
+            // wzbogacamy tylko NOWE tracki albo co ENRICH_TTL (odswiezenie).
+            // Detekcje z track_id=0 (brak trackingu) wzbogacamy zawsze, bez
+            // cache (nie ma stabilnego klucza).
+            if det.track_id > 0 {
+                if let Some(c) = enrich_cache_fresh(camera_id, &stage.stage_id, det.track_id) {
+                    apply_stage_output(det, stage.output, &c);
+                    continue;
                 }
             }
+            let Some((x0, y0, cw, ch)) = padded_crop_rect(w, h, &det.bbox, pad_x, pad_y) else {
+                continue;
+            };
+            let crop: Arc<[u8]> = Arc::from(crop_rgb(frame, w, x0, y0, cw, ch));
+            let (stan, tekst) = match stage.op {
+                CvOp::Classify => (
+                    classify_crop(&executor, &stage.model, crop, cw, ch, &det.klasa)
+                        .await
+                        .unwrap_or_default(),
+                    None,
+                ),
+                CvOp::Ocr => {
+                    let mode = match cv_pipeline::ocr_mode(stage) {
+                        "adr" => CvOcrMode::Adr,
+                        "plate" => CvOcrMode::Plate,
+                        _ => CvOcrMode::Generic,
+                    };
+                    (
+                        Vec::new(),
+                        ocr_crop(&executor, &stage.model, crop, cw, ch, mode, &det.klasa).await,
+                    )
+                }
+                CvOp::Detect | CvOp::Embed => continue,
+            };
+            let value = CachedEnrich {
+                stan,
+                tekst,
+                at: Instant::now(),
+            };
+            apply_stage_output(det, stage.output, &value);
+            // Zapisz wynik (nawet pusty) pod (etap, track), aby hot path i
+            // kolejne klatki tego tracku reuzyly go bez ponownego forwardu.
+            if det.track_id > 0 {
+                enrich_cache_put(
+                    camera_id,
+                    &stage.stage_id,
+                    det.track_id,
+                    value.stan,
+                    value.tekst,
+                );
+            }
         }
+    }
+}
+
+/// COLD: klasyfikacja stanu jednego cropu przez executor (alias etapu).
+/// `None` = etap bez wyniku (blad executora / nieoczekiwany wariant) — nigdy
+/// blad na zewnatrz.
+async fn classify_crop(
+    executor: &Arc<ModelRuntimeExecutor>,
+    alias: &str,
+    crop: Arc<[u8]>,
+    cw: u32,
+    ch: u32,
+    klasa: &str,
+) -> Option<Vec<String>> {
+    let request = CameraCvRequest {
+        model: alias.to_string(),
+        op: CameraCvOpLocal::ClassifyState {
+            crop: CvFrameLocal {
+                data: crop,
+                width: cw,
+                height: ch,
+            },
+        },
+    };
+    let mut ctx = RuntimeContext::new(None);
+    match executor.execute_camera_cv(request, &mut ctx).await {
+        Ok(CameraCvResult::Labels { stan }) => Some(stan),
+        Ok(_) => {
+            warn_throttled(
+                "classify",
+                &format!("classify {klasa} via '{alias}': unexpected camera-cv result variant"),
+            );
+            None
+        }
+        Err(e) => {
+            warn_throttled("classify", &format!("classify {klasa} via '{alias}': {e}"));
+            None
+        }
+    }
+}
+
+/// COLD: OCR jednego cropu przez executor (alias etapu, tryb z parametrow
+/// etapu). Sukces z `tekst = None` znaczy "nic nie rozpoznano" — to wynik,
+/// nie blad. `None` przy bledzie executora — nigdy blad na zewnatrz.
+async fn ocr_crop(
+    executor: &Arc<ModelRuntimeExecutor>,
+    alias: &str,
+    crop: Arc<[u8]>,
+    cw: u32,
+    ch: u32,
+    mode: CvOcrMode,
+    klasa: &str,
+) -> Option<String> {
+    let request = CameraCvRequest {
+        model: alias.to_string(),
+        op: CameraCvOpLocal::Ocr {
+            crop: CvFrameLocal {
+                data: crop,
+                width: cw,
+                height: ch,
+            },
+            mode,
+        },
+    };
+    let mut ctx = RuntimeContext::new(None);
+    match executor.execute_camera_cv(request, &mut ctx).await {
+        Ok(CameraCvResult::Text { tekst }) => tekst,
+        Ok(_) => {
+            warn_throttled(
+                "ocr",
+                &format!("ocr {klasa} via '{alias}': unexpected camera-cv result variant"),
+            );
+            None
+        }
+        Err(e) => {
+            warn_throttled("ocr", &format!("ocr {klasa} via '{alias}': {e}"));
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mapowanie CvDetection→Detection: pola detektora przechodzą 1:1, pola
+    /// wzbogacenia/śledzenia startują puste (nadaje je tracker i cold path).
+    #[test]
+    fn detection_from_cv_mapuje_pola_i_zeruje_wzbogacenie() {
+        let d = detection_from_cv(CvDetection {
+            klasa: "tablica_adr".into(),
+            bbox: [0.1, 0.2, 0.3, 0.4],
+            score: 0.9,
+        });
+        assert_eq!(d.klasa, "tablica_adr");
+        assert_eq!(d.bbox, [0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(d.score, 0.9);
+        assert!(d.stan.is_empty());
+        assert!(d.tekst.is_none());
+        assert_eq!(d.track_id, 0);
+        assert_eq!(d.vx, 0.0);
+        assert_eq!(d.vy, 0.0);
+    }
+
+    /// Crop bez paddingu = dokładny box detekcji (dawna ścieżka classify);
+    /// z paddingiem 15%/10% = poszerzony box zaklamrowany do klatki (dawna
+    /// ścieżka OCR). Box < 8 px w którymkolwiek wymiarze → None.
+    #[test]
+    fn padded_crop_rect_matches_legacy_classify_and_ocr_paths() {
+        // 100x100 frame, box (10,20,40,30) px → bbox znormalizowany.
+        let bbox = [0.10, 0.20, 0.40, 0.30];
+        assert_eq!(padded_crop_rect(100, 100, &bbox, 0.0, 0.0), Some((10, 20, 40, 30)));
+        // pad_x = 0.15*40 = 6 px, pad_y = 0.10*30 = 3 px z każdej strony.
+        assert_eq!(
+            padded_crop_rect(100, 100, &bbox, 0.15, 0.10),
+            Some((4, 17, 52, 36))
+        );
+        // Padding zaklamrowany do granic klatki (box przy krawędzi).
+        let edge = [0.0, 0.0, 0.40, 0.30];
+        assert_eq!(
+            padded_crop_rect(100, 100, &edge, 0.15, 0.10),
+            Some((0, 0, 46, 33))
+        );
+        // Box mniejszy niż 8 px → brak cropu.
+        assert_eq!(padded_crop_rect(100, 100, &[0.0, 0.0, 0.05, 0.5], 0.0, 0.0), None);
+    }
+
+    /// `apply_stage_output`: classify dokłada etykiety do `stan` (dwa etapy
+    /// się scalają), OCR ustawia `tekst` tylko przy niepustym wyniku.
+    #[test]
+    fn apply_stage_output_extends_stan_and_sets_tekst() {
+        let mut det = detection_from_cv(CvDetection {
+            klasa: "tablica_adr".into(),
+            bbox: [0.1, 0.2, 0.3, 0.4],
+            score: 0.9,
+        });
+        let stan_a = CachedEnrich {
+            stan: vec!["ok".into()],
+            tekst: None,
+            at: Instant::now(),
+        };
+        let stan_b = CachedEnrich {
+            stan: vec!["czytelna".into()],
+            tekst: None,
+            at: Instant::now(),
+        };
+        apply_stage_output(&mut det, Some(CvStageOutput::Stan), &stan_a);
+        apply_stage_output(&mut det, Some(CvStageOutput::Stan), &stan_b);
+        assert_eq!(det.stan, vec!["ok".to_string(), "czytelna".to_string()]);
+
+        let ocr_hit = CachedEnrich {
+            stan: Vec::new(),
+            tekst: Some("30/1203".into()),
+            at: Instant::now(),
+        };
+        let ocr_miss = CachedEnrich {
+            stan: Vec::new(),
+            tekst: None,
+            at: Instant::now(),
+        };
+        apply_stage_output(&mut det, Some(CvStageOutput::Tekst), &ocr_hit);
+        // Pusty wynik OCR nie kasuje wcześniejszego odczytu.
+        apply_stage_output(&mut det, Some(CvStageOutput::Tekst), &ocr_miss);
+        assert_eq!(det.tekst.as_deref(), Some("30/1203"));
+        // Etap bez outputu (detect/embed) niczego nie zmienia.
+        apply_stage_output(&mut det, None, &ocr_hit);
+        assert_eq!(det.stan.len(), 2);
+    }
+
+    /// Pipeline jednoetapowy (jeden `detect` na klatce) — minimum do złożenia
+    /// [`FrameJob`] w testach domykania.
+    fn detect_pipeline(stage: &str) -> CvPipeline {
+        CvPipeline {
+            stages: vec![cv_pipeline::CvStage {
+                stage_id: stage.to_string(),
+                enabled: true,
+                op: CvOp::Detect,
+                model: "m".into(),
+                input: CvStageInput::Frame { fps: None },
+                threshold: None,
+                params: serde_json::Map::new(),
+                output: None,
+            }],
+        }
+    }
+
+    fn make_job(cam: &str, captured: u64, pipeline: &Arc<CvPipeline>, stage: &str) -> FrameJob {
+        FrameJob {
+            camera_id: cam.to_string(),
+            frame: Arc::from(vec![0u8; 12]),
+            w: 2,
+            h: 2,
+            captured_ms: captured,
+            pts_ns: None,
+            pipeline: pipeline.clone(),
+            open_stages: vec![stage.to_string()],
+            results: Vec::new(),
+            detect_ms_total: 0,
+            failed_stages: 0,
+        }
+    }
+
+    fn empty_detections() -> ForwardOutput {
+        ForwardOutput {
+            alias: "m".into(),
+            detect_ms: 3,
+            outcome: Ok(CameraCvResult::Detections {
+                per_frame: vec![Vec::new()],
+            }),
+        }
+    }
+
+    /// K>1: gdy `TENTAFLOW_VISION_INFLIGHT` jest ustawione, wygrywa; inaczej K
+    /// odwzorowuje pulę detektora; gdy ŻADNA zmienna nie jest ustawiona → K=1
+    /// (dowód zerowej regresji: bit-identyczne z pojedynczą, serializowaną pętlą).
+    #[test]
+    fn inflight_limit_defaults_to_one_and_honors_env() {
+        let prev_k = std::env::var("TENTAFLOW_VISION_INFLIGHT").ok();
+        let prev_d = std::env::var("TENTAFLOW_VISION_DETECTOR_SESSIONS").ok();
+        std::env::remove_var("TENTAFLOW_VISION_INFLIGHT");
+        std::env::remove_var("TENTAFLOW_VISION_DETECTOR_SESSIONS");
+        assert_eq!(inflight_limit(), 1, "brak env → K=1");
+
+        std::env::set_var("TENTAFLOW_VISION_DETECTOR_SESSIONS", "4");
+        assert_eq!(inflight_limit(), 4, "K odwzorowuje pulę detektora");
+
+        std::env::set_var("TENTAFLOW_VISION_INFLIGHT", "2");
+        assert_eq!(inflight_limit(), 2, "jawny opt-in wygrywa nad pulą detektora");
+
+        std::env::set_var("TENTAFLOW_VISION_INFLIGHT", "999");
+        assert_eq!(inflight_limit(), MAX_INFLIGHT, "clamp górny do MAX_INFLIGHT");
+
+        std::env::set_var("TENTAFLOW_VISION_INFLIGHT", "0");
+        assert_eq!(inflight_limit(), 1, "clamp dolny do 1");
+
+        match prev_k {
+            Some(v) => std::env::set_var("TENTAFLOW_VISION_INFLIGHT", v),
+            None => std::env::remove_var("TENTAFLOW_VISION_INFLIGHT"),
+        }
+        match prev_d {
+            Some(v) => std::env::set_var("TENTAFLOW_VISION_DETECTOR_SESSIONS", v),
+            None => std::env::remove_var("TENTAFLOW_VISION_DETECTOR_SESSIONS"),
+        }
+    }
+
+    /// Ordering gate: kamera z otwartym jobem NIE przyjmuje drugiej klatki, więc
+    /// nawet przy K współbieżnych forwardach jedna kamera ma ≤1 klatkę w locie —
+    /// jej publikacje pozostają monotoniczne po `captured_ms`.
+    #[test]
+    fn ordering_gate_blocks_second_frame_while_camera_job_open() {
+        let pipeline = Arc::new(detect_pipeline("det"));
+        let mut jobs: HashMap<u64, FrameJob> = HashMap::new();
+        jobs.insert(1, make_job("camX", 100, &pipeline, "det"));
+        assert!(jobs.values().any(|j| j.camera_id == "camX"));
+        assert!(!jobs.values().any(|j| j.camera_id == "camY"));
+    }
+
+    /// K>1 poza kolejnością: dwie kamery, po jednej klatce w locie (ordering gate
+    /// gwarantuje ≤1 job/kamera). Forwardy kończą się W ODWROTNEJ kolejności
+    /// (młodsza kamera pierwsza) — wynik każdego routuje się do WŁASNEGO joba po
+    /// `job_id`, więc publikacja niesie `captured_ms` tej właśnie kamery. Dowodzi,
+    /// że współbieżne, nie-w-kolejności zakończenia nie mieszają strumieni kamer
+    /// i nie regresują per-kamerowej kolejności publikacji.
+    #[test]
+    fn out_of_order_completion_routes_each_camera_independently() {
+        let nonce = std::process::id();
+        let cam_a = format!("test-cam-a-{nonce}");
+        let cam_b = format!("test-cam-b-{nonce}");
+        let mut rx_a = detection_bus::subscribe(&cam_a);
+        let mut rx_b = detection_bus::subscribe(&cam_b);
+
+        let pipeline = Arc::new(detect_pipeline("det"));
+        let mut jobs: HashMap<u64, FrameJob> = HashMap::new();
+        jobs.insert(1, make_job(&cam_a, 100, &pipeline, "det"));
+        jobs.insert(2, make_job(&cam_b, 50, &pipeline, "det"));
+
+        let (cold_tx, _cold_rx) = mpsc::channel::<DetectionEvent>(4);
+        let item_a = PendingItem {
+            job_id: 1,
+            stage_id: "det".into(),
+            alias: "m".into(),
+            threshold: None,
+            added: Instant::now(),
+        };
+        let item_b = PendingItem {
+            job_id: 2,
+            stage_id: "det".into(),
+            alias: "m".into(),
+            threshold: None,
+            added: Instant::now(),
+        };
+
+        // Kamera B (młodsza klatka, job_id=2) kończy PIERWSZA — celowo poza
+        // kolejnością względem starszej kamery A.
+        apply_forward_result(&mut jobs, vec![item_b], Ok(empty_detections()), &cold_tx);
+        assert!(jobs.contains_key(&1), "job kamery A wciąż otwarty");
+        assert!(!jobs.contains_key(&2), "job kamery B sfinalizowany");
+        apply_forward_result(&mut jobs, vec![item_a], Ok(empty_detections()), &cold_tx);
+        assert!(jobs.is_empty(), "oba joby sfinalizowane");
+
+        let msg_a = rx_a.try_recv().expect("kamera A opublikowana");
+        let msg_b = rx_b.try_recv().expect("kamera B opublikowana");
+        assert_eq!(msg_a.ts_ms, 100, "publikacja A niesie captured_ms kamery A");
+        assert_eq!(msg_b.ts_ms, 50, "publikacja B niesie captured_ms kamery B");
+    }
+
+    /// Panika/abort zadania forwardu (`JoinError`) NIE może zostawić otwartych
+    /// etapów — inaczej ordering gate zablokowałby kamerę na zawsze. Błąd joina
+    /// domyka wszystkie pozycje batcha jako porażkę i finalizuje job.
+    #[test]
+    fn join_error_closes_batch_stages_no_leak() {
+        let pipeline = Arc::new(detect_pipeline("det"));
+        let mut jobs: HashMap<u64, FrameJob> = HashMap::new();
+        jobs.insert(7, make_job("cam-join-err", 10, &pipeline, "det"));
+        let (cold_tx, _cold_rx) = mpsc::channel::<DetectionEvent>(4);
+        let item = PendingItem {
+            job_id: 7,
+            stage_id: "det".into(),
+            alias: "m".into(),
+            threshold: None,
+            added: Instant::now(),
+        };
+        // Symulacja porażki joina: cała pozycja domknięta jako porażka. Job bez
+        // żadnego udanego etapu finalizuje się bez publikacji (results puste).
+        apply_forward_result(&mut jobs, vec![item], Ok(force_error_output()), &cold_tx);
+        assert!(jobs.is_empty(), "job domknięty mimo błędu — brak wycieku");
+    }
+
+    fn force_error_output() -> ForwardOutput {
+        ForwardOutput {
+            alias: "m".into(),
+            detect_ms: 0,
+            outcome: Err("simulated forward failure".into()),
+        }
+    }
+
+    /// P1: gdy forward ukończy się, jego permit jest zwolniony ZANIM wynik zostanie
+    /// zaaplikowany — to okno, które drenaż-przed-acquire zamyka. Test dowodzi obu
+    /// faktów (permit wolny + wynik wciąż w JoinSet) oraz dyscypliny „apply przed
+    /// acquire": po zastosowaniu wyniku permit jest ponownie dostępny.
+    #[tokio::test]
+    async fn completed_forward_frees_permit_before_result_is_applied() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut forwards: tokio::task::JoinSet<u64> = tokio::task::JoinSet::new();
+        let permit = sem.clone().try_acquire_owned().expect("permit wolny na starcie");
+        forwards.spawn(async move {
+            let _p = permit;
+            1u64
+        });
+        // Forward w locie ⇒ K=1 wyczerpane ⇒ nowy forward NIE spawnuje się.
+        assert!(
+            sem.clone().try_acquire_owned().is_err(),
+            "permit zajęty w trakcie forwardu (K=1)"
+        );
+        // Poczekaj aż zadanie się zakończy (permit zwolniony), ale NIE aplikuj.
+        for _ in 0..1000 {
+            if sem.available_permits() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // Okno hazardu: permit JUŻ wolny, ale wynik WCIĄŻ nieaplikowany w JoinSet.
+        assert_eq!(sem.available_permits(), 1, "permit zwolniony po zakończeniu");
+        let joined = forwards
+            .try_join_next()
+            .expect("wynik gotowy, lecz jeszcze niezaaplikowany");
+        assert_eq!(joined.unwrap(), 1, "drenaż stosuje wynik ukończonego forwardu");
+    }
+
+    /// P1: `drain_ready_forwards` stosuje ukończone forwardy (finalizuje joby)
+    /// przez ten sam realny path co pętla (`apply_joined`).
+    #[tokio::test]
+    async fn drain_ready_forwards_applies_completed_jobs() {
+        let pipeline = Arc::new(detect_pipeline("det"));
+        let mut jobs: HashMap<u64, FrameJob> = HashMap::new();
+        jobs.insert(5, make_job("cam-drain-ready", 77, &pipeline, "det"));
+        let (cold_tx, _cold_rx) = mpsc::channel::<DetectionEvent>(4);
+        let mut forwards: tokio::task::JoinSet<ForwardOutput> = tokio::task::JoinSet::new();
+        let mut inflight: HashMap<tokio::task::Id, Vec<PendingItem>> = HashMap::new();
+        let item = PendingItem {
+            job_id: 5,
+            stage_id: "det".into(),
+            alias: "m".into(),
+            threshold: None,
+            added: Instant::now(),
+        };
+        let handle = forwards.spawn(async move { empty_detections() });
+        inflight.insert(handle.id(), vec![item]);
+        // Powtarzaj realny drenaż aż forward się zakończy i job sfinalizuje.
+        for _ in 0..1000 {
+            drain_ready_forwards(&mut forwards, &mut jobs, &mut inflight, &cold_tx);
+            if jobs.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(jobs.is_empty(), "ukończony forward zaaplikowany, job sfinalizowany");
+        assert!(inflight.is_empty(), "wpis routingu usunięty po zastosowaniu");
+    }
+
+    /// P2: graceful-drain AWAITuje trwający (wolny) forward do końca i APLIKUJE go —
+    /// nie porzuca/abortuje. Dowód: job z 50 ms forwardem finalizuje się po pętli
+    /// `join_next_with_id().await` (ta sama pętla co w silniku na shutdown).
+    #[tokio::test]
+    async fn graceful_drain_awaits_and_applies_inflight_forward() {
+        let pipeline = Arc::new(detect_pipeline("det"));
+        let mut jobs: HashMap<u64, FrameJob> = HashMap::new();
+        jobs.insert(9, make_job("cam-grace", 33, &pipeline, "det"));
+        let (cold_tx, _cold_rx) = mpsc::channel::<DetectionEvent>(4);
+        let mut forwards: tokio::task::JoinSet<ForwardOutput> = tokio::task::JoinSet::new();
+        let mut inflight: HashMap<tokio::task::Id, Vec<PendingItem>> = HashMap::new();
+        let item = PendingItem {
+            job_id: 9,
+            stage_id: "det".into(),
+            alias: "m".into(),
+            threshold: None,
+            added: Instant::now(),
+        };
+        let handle = forwards.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            empty_detections()
+        });
+        inflight.insert(handle.id(), vec![item]);
+        // Pętla graceful-drain silnika: await KAŻDEGO trwającego forwardu + apply.
+        while let Some(joined) = forwards.join_next_with_id().await {
+            apply_joined(&mut jobs, &mut inflight, Some(joined), &cold_tx);
+        }
+        assert!(
+            jobs.is_empty(),
+            "trwający forward dokończony i zaaplikowany (await), nie porzucony"
+        );
     }
 }

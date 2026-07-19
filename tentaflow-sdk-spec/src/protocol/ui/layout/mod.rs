@@ -60,9 +60,38 @@ mod tests {
             padding: Some(Spacing::Sm),
             background: Some(BackgroundToken::Subtle),
             radius: Some(RadiusToken::Md),
+            style: None,
+            responsive: None,
         };
         let c = f.clone().into_component("f").unwrap();
         assert_eq!(c.tag, Flex::TAG);
+        assert_eq!(Flex::try_from_component(&c).unwrap(), f);
+    }
+
+    #[test]
+    fn flex_with_responsive_rules_roundtrip() {
+        use crate::protocol::ui::inline::{ContainerWidth, ResponsiveRule};
+        use crate::protocol::ui::tokens::Breakpoint;
+        let f = Flex {
+            direction: FlexDirection::Row,
+            gap: Spacing::Md,
+            justify: FlexJustify::SpaceBetween,
+            align: FlexAlign::Center,
+            wrap: FlexWrap::Wrap,
+            children: vec![],
+            padding: None,
+            background: None,
+            radius: None,
+            style: None,
+            responsive: Some(vec![
+                ResponsiveRule::at(ContainerWidth::Px(460))
+                    .direction(FlexDirection::Column)
+                    .gap(Spacing::Sm)
+                    .hidden(true),
+                ResponsiveRule::at(Breakpoint::Md).justify(FlexJustify::Start),
+            ]),
+        };
+        let c = f.clone().into_component("f").unwrap();
         assert_eq!(Flex::try_from_component(&c).unwrap(), f);
     }
 
@@ -78,6 +107,7 @@ mod tests {
             children: vec![],
             padding: None,
             align_items: None,
+            style: None,
         };
         let c = g.clone().into_component("g").unwrap();
         assert_eq!(Grid::try_from_component(&c).unwrap(), g);
@@ -91,12 +121,93 @@ mod tests {
             children: vec![],
             padding: None,
             justify: None,
+            style: None,
+            responsive: None,
         };
         let mut c = s.into_component("s").unwrap();
         c.fields.0.retain(|(k, _)| *k != 0 && *k != 1);
         let back = Stack::try_from_component(&c).unwrap();
         assert_eq!(back.gap, Spacing::Md);
         assert_eq!(back.align, FlexAlign::Stretch);
+    }
+
+    #[test]
+    fn stack_with_responsive_rules_roundtrip() {
+        use crate::protocol::ui::inline::ResponsiveRule;
+        use crate::protocol::ui::tokens::Breakpoint;
+        let s = Stack {
+            gap: Spacing::Lg,
+            align: FlexAlign::Stretch,
+            children: vec![],
+            padding: None,
+            justify: None,
+            style: None,
+            responsive: Some(vec![ResponsiveRule::at(Breakpoint::Sm).gap(Spacing::Xs)]),
+        };
+        let c = s.clone().into_component("s").unwrap();
+        assert_eq!(Stack::try_from_component(&c).unwrap(), s);
+    }
+
+    #[test]
+    fn flex_with_box_style_roundtrip() {
+        use crate::protocol::ui::inline::BoxStyle;
+        use crate::protocol::ui::tokens::{BorderColor, Overflow};
+        let f = Flex {
+            direction: FlexDirection::Column,
+            gap: Spacing::Sm,
+            justify: FlexJustify::Start,
+            align: FlexAlign::Stretch,
+            wrap: FlexWrap::NoWrap,
+            children: vec![],
+            padding: None,
+            background: None,
+            radius: None,
+            responsive: None,
+            style: Some(
+                BoxStyle::new()
+                    .margin_y(Spacing::Md)
+                    .padding_all(12u16)
+                    .border(1, BorderColor::Default)
+                    .bg(BackgroundToken::Subtle)
+                    .radius(RadiusToken::Lg)
+                    .width(DimensionToken::Full)
+                    .max_height(DimensionToken::Px { value: 480 })
+                    .overflow_y(Overflow::Auto),
+            ),
+        };
+        let c = f.clone().into_component("f").unwrap();
+        assert_eq!(Flex::try_from_component(&c).unwrap(), f);
+    }
+
+    #[test]
+    fn box_roundtrip_with_style_and_flex_fields() {
+        use crate::protocol::ui::inline::BoxStyle;
+        use crate::protocol::ui::tokens::BorderColor;
+        let b = Box {
+            width: Some(DimensionToken::Px { value: 320 }),
+            grow: Some(true),
+            align_self: Some(FlexAlign::Center),
+            padding: None,
+            margin: None,
+            children: vec![dummy(0x0201)],
+            style: Some(BoxStyle::new().border(2, BorderColor::Accent).padding_x(Spacing::Lg)),
+            direction: Some(FlexDirection::Row),
+            gap: Some(Spacing::Sm),
+            align: Some(FlexAlign::Center),
+            justify: Some(FlexJustify::SpaceBetween),
+            responsive: Some(vec![
+                crate::protocol::ui::inline::ResponsiveRule::at(680u16)
+                    .direction(FlexDirection::Column),
+            ]),
+        };
+        let c = b.clone().into_component("bx").unwrap();
+        assert_eq!(c.tag, Box::TAG);
+        assert_eq!(Box::try_from_component(&c).unwrap(), b);
+
+        // Old-shape payload (only pre-style keys) must still decode.
+        let empty = Box::default();
+        let c2 = empty.clone().into_component("bx2").unwrap();
+        assert_eq!(Box::try_from_component(&c2).unwrap(), empty);
     }
 
     #[test]
@@ -122,9 +233,20 @@ mod tests {
             resizable: true,
             primary_slot: "left".into(),
             secondary_slot: "right".into(),
+            collapse_below: Some(crate::protocol::ui::tokens::Breakpoint::Sm),
+            divider: Some(crate::protocol::ui::tokens::SplitDivider::Line),
+            grow: Some(true),
         };
         let c = s.clone().into_component("sp").unwrap();
         assert_eq!(Split::try_from_component(&c).unwrap(), s);
+
+        // collapse_below / divider / grow are optional: None must be omitted
+        // from the wire (old decoders reject unknown keys 7/8/9) and absent
+        // keys must decode back to None (old payloads stay valid).
+        let legacy = Split { collapse_below: None, divider: None, grow: None, ..s };
+        let c2 = legacy.clone().into_component("sp2").unwrap();
+        assert!(c2.fields.0.iter().all(|(k, _)| *k != 7 && *k != 8 && *k != 9));
+        assert_eq!(Split::try_from_component(&c2).unwrap(), legacy);
     }
 
     #[test]
@@ -141,6 +263,7 @@ mod tests {
             children: vec![],
             interactive: false,
             clickable: false,
+            style: None,
         };
         let mut c = card.clone().into_component("card").unwrap();
         // Drop default padding(1), gap(2), radius(3) — try_from must fill defaults.
@@ -161,7 +284,7 @@ mod tests {
             variant: CardVariant::Filled,
             radius: RadiusToken::Lg, shadow: ShadowToken::Subtle,
             border: BorderToken::None, background: BackgroundToken::None,
-            accent: None,
+            accent: None, style: None,
         };
         assert!(bad.into_component("sc").is_err());
     }

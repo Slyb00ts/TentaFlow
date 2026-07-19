@@ -47,7 +47,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const projInfo = await page.evaluate(() => {
       const cards = Array.from(document.querySelectorAll('[class*="ml-studio"] [class*="project"], [data-project-id], .ml-studio-project-card'));
       const txt = document.body.innerText;
-      return { cardCount: cards.length, hasOrlen: /orlen|annot|recogn/i.test(txt), hasFt: /capstone|guard|ft|fine/i.test(txt) };
+      return { cardCount: cards.length, hasAdr: /adr|annot|recogn/i.test(txt), hasFt: /capstone|guard|ft|fine/i.test(txt) };
     });
     console.log('[3] projects on screen:', JSON.stringify(projInfo));
 

@@ -83,12 +83,12 @@ pub extern "C" fn on_install() -> i32 {
 
 #[no_mangle]
 pub extern "C" fn on_start() -> i32 {
-    log::info("sdk-showcase started — sending PanelShell");
-    send_panel_shell();
-    // The content slot declares SlotDefault::Loading — without an initial
-    // SlotContent push the panel would stay on the loading placeholder until
-    // the user clicks a nav tab.
-    send_tab_content(&active_tab());
+    log::info("sdk-showcase started");
+    // The shell is NOT rendered here: on_start does not receive the
+    // host-assigned panel epoch, so a shell emitted now would carry the default
+    // epoch and be rejected on any session whose epoch advanced past 1. The
+    // host calls on_panel_open (with the authoritative epoch) on every open,
+    // including cold starts, so the shell is rendered there exactly once.
     0
 }
 
@@ -428,6 +428,7 @@ fn camera_spec(display_name: &str, url: String) -> CameraAddSpec {
         vendor: "fake_file".to_string(),
         url,
         target_fps: 30,
+        analysis_fps: 10,
         resolution: None,
         retention_class: "C".to_string(),
         profile: "default".to_string(),
@@ -922,6 +923,9 @@ fn send_panel_shell() {
         align: FlexAlign::Stretch,
         children: vec![nav, body],
         padding: None,
+        justify: None,
+        style: None,
+        responsive: None,
     }
     .into_component("root")
     .expect("Stack encode");
@@ -1019,6 +1023,7 @@ fn body_text(id: &str, content: BindRef) -> Component {
         wrap: None,
         max_lines: None,
         format: None,
+        streaming: None,
     }
     .into_component(id)
     .expect("Text encode")
@@ -1061,6 +1066,9 @@ fn live_tab() -> Component {
             action_button("btn-refresh", "Refresh", "refresh", ButtonVariant::Secondary),
         ],
         padding: Some(Spacing::Md),
+        justify: None,
+        style: None,
+        responsive: None,
     }
     .into_component("tab-live")
     .expect("Stack encode")
@@ -1085,6 +1093,9 @@ fn storage_tab() -> Component {
             ),
         ],
         padding: Some(Spacing::Md),
+        justify: None,
+        style: None,
+        responsive: None,
     }
     .into_component("tab-storage")
     .expect("Stack encode")

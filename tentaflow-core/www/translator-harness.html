@@ -1,0 +1,204 @@
+<!doctype html>
+<!--
+  Plik: translator-harness.html
+  Opis: Wizualny harness renderujacy REALNE payloady UI addonu Tlumacz przez
+  prawdziwy sdk-runtime (decodeUiPayload + ComponentRenderer + StateStore +
+  SlotManager + komponenty tf-*). Payloady (PanelShell/SlotContent/StatePatch)
+  sa przechwytywane z wasm translatora do translator-payloads.json. Reprezenta-
+  tywny stan (teksty, napisy, kod sesji) jest wstrzykiwany jako overlay — tak
+  samo jak zrobilby to addon przez StatePatch. Serwuj po HTTP (moduly + wasm).
+    ?screen=text|live|settings
+-->
+<html lang="pl">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Tlumacz — harness</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/css/controls.css">
+<link rel="stylesheet" href="/css/style.css">
+<link rel="stylesheet" href="/css/addon-app.css">
+<link rel="stylesheet" href="/css/components/tf-audio-capture.css">
+<style>
+  html, body { overflow: visible !important; height: auto !important; margin: 0; }
+  body { padding: 0; background: var(--bg, #050818); }
+  /* Ramka odwzorowuje kontener panelu addonu w dashboardzie. */
+  .harness-frame {
+    max-width: 1180px; margin: 24px auto; padding: 0 20px;
+  }
+</style>
+</head>
+<body>
+<div class="harness-frame">
+  <div id="main">
+    <div class="addon-app-shell" data-addon="translator" data-panel="main">
+      <div class="addon-app-loading">Loading panel…</div>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="/js/components/index.js"></script>
+<script type="module">
+  import initWasm, * as wasm from '/js/protocol/wasm_glue.js';
+  import { bootstrapSdkRuntime, SlotManager } from '/js/sdk-runtime/bootstrap.js';
+  import { ComponentRenderer } from '/js/sdk-runtime/component-renderer.js';
+  import { StateStore } from '/js/sdk-runtime/state-store.js';
+
+  const TAG_PANEL_SHELL  = 0x0102;
+  const TAG_SLOT_CONTENT = 0x0110;
+  const TAG_STATE_PATCH  = 0x0121;
+
+  const screen = new URLSearchParams(location.search).get('screen') || 'text';
+
+  // Reprezentatywny stan per ekran — dokladnie takie wartosci, jakie addon
+  // wyslalby przez StatePatch podczas realnej pracy (streaming LLM/STT).
+  const SOURCE_EN =
+    "Thank you for joining today's call. Before we move to the quarterly numbers, I would like to summarize the key outcomes of our infrastructure migration. The new deployment pipeline reduced release time from four hours to roughly twenty minutes, and the on-premise inference cluster now handles all customer-facing workloads without sending any data to external providers.\n\nOur next milestone is the rollout of the self-hosted translation service across all regional branches. We expect the pilot phase to start in early August.";
+  const TARGET_PL =
+    "Dziękuję za udział w dzisiejszej rozmowie. Zanim przejdziemy do wyników kwartalnych, chciałbym podsumować kluczowe rezultaty naszej migracji infrastruktury. Nowy pipeline wdrożeniowy skrócił czas wydania z czterech godzin do około dwudziestu minut, a lokalny klaster inferencyjny obsługuje teraz wszystkie obciążenia klienckie bez wysyłania jakichkolwiek danych do zewnętrznych dostawców. Kolejnym kamieniem milowym jest wdrożenie własnej usługi tłumaczeń we wszystkich";
+
+  const INJECT = {
+    text: {
+      src_lang: 'auto', tgt_lang: 'pl',
+      source_text: SOURCE_EN,
+      target_text: TARGET_PL,
+      char_count: '527 / 8 000',
+      detected: 'Wykryto: Angielski (99%)',
+      translating: false,
+      auto_translate: true,
+      status: 'Bielik-Minitron-7B-v3.0-Instruct-FP8 · gotowe',
+      engine_label: 'Bielik-Minitron-7B-v3.0-Instruct-FP8',
+      stat_time: '2,4 s',
+      stat_tps: '38,2 tok/s',
+      stat_tokens: '184 / ~290',
+    },
+    live: {
+      speaker_lang: 'en', subtitle_lang: 'pl',
+      recording: true,
+      status: 'Na żywo',
+      set_auto_detect: true,
+      pipeline: 'Słucham… mów dalej',
+      live_prev2: 'Żaden dźwięk nie opuszcza tego urządzenia — wszystko działa lokalnie.',
+      live_prev1: 'Zanim przejdziemy do wyników kwartalnych, chcę krótko podsumować migrację infrastruktury.',
+      live_orig: "Let me now show how the live subtitles look while I speak.",
+      live_cur: 'Pokażę teraz, jak napisy na żywo wyglądają na moim własnym ekranie, kiedy mówię.',
+    },
+    settings: {
+      status: 'Bielik-Minitron-7B-v3.0-Instruct-FP8 · gotowy',
+      llm_name: 'Bielik-Minitron-7B-v3.0-Instruct-FP8',
+      stt_name: 'Whisper Large v3',
+      set_default_src: 'auto', set_default_tgt: 'pl',
+      set_auto_detect: true, set_subtitle_delay: 1.1, set_save_history: true,
+      settings_saved: 'Zmiany działają od następnej sesji',
+    },
+  };
+
+  function keyPath(key) { return [{ kind: 'key', value: key }]; }
+
+  function overlayEntries(map) {
+    return Object.entries(map).map(([k, v]) => ({ path: keyPath(k), value: v }));
+  }
+
+  const session = { addonId: 'translator', panelId: 'main', panelEpoch: 0,
+    store: null, renderer: null, slotManager: null };
+
+  function handlePanelShell(decoded) {
+    const s = session;
+    s.panelEpoch = decoded.panelEpoch;
+    s.store = new StateStore({ addon_id: s.addonId, panel_id: s.panelId, panel_epoch: decoded.panelEpoch });
+    if (decoded.initialState) {
+      s.store.applySnapshot({ entries: decoded.initialState, state_revision: 0, truncated: false, panel_epoch: decoded.panelEpoch });
+    }
+    const eventDispatcher = { emit() {} };
+    s.renderer = new ComponentRenderer({ store: s.store, eventDispatcher, locale: 'pl' });
+    const shell = document.querySelector('.addon-app-shell');
+    shell.innerHTML = '';
+    if (decoded.layout) shell.appendChild(s.renderer.render(decoded.layout));
+    if (s.slotManager) s.slotManager.destroy();
+    s.slotManager = new SlotManager({ store: s.store, componentRenderer: s.renderer });
+    if (decoded.slots) {
+      for (const slotDecl of decoded.slots) {
+        let slotEl = shell.querySelector(`[data-slot-id="${slotDecl.id}"]`);
+        if (!slotEl) {
+          slotEl = document.createElement('div');
+          slotEl.setAttribute('data-slot-id', slotDecl.id);
+          slotEl.classList.add('addon-slot');
+          shell.appendChild(slotEl);
+        }
+        s.slotManager.registerSlot(slotDecl.id, slotEl, slotDecl);
+      }
+    }
+    s.slotManager.observe(shell);
+  }
+
+  function apply(decoded) {
+    const s = session;
+    switch (decoded.tag) {
+      case TAG_PANEL_SHELL: handlePanelShell(decoded); break;
+      case TAG_SLOT_CONTENT:
+        s.slotManager.handleSlotContent({ slot_id: decoded.slotId, fragment: decoded.fragment, state_overlay: decoded.stateOverlay });
+        break;
+      case TAG_STATE_PATCH: {
+        // Captured patches carry escalating revisions from the original addon
+        // session; replaying a subset out of order would trip RevisionMismatch.
+        // Rebase each patch onto the store's current revision.
+        const base = s.store.revision();
+        s.store.applyPatch({ base_revision: base, new_revision: base + 1n, ops: decoded.ops, panel_epoch: decoded.panelEpoch });
+        break;
+      }
+    }
+  }
+
+  // Icon sprite (<symbol id="i-*">) lives in index.html body; tf-* components
+  // clone it into their shadow root on connect, so it must be present before
+  // any component renders.
+  async function injectSprite() {
+    try {
+      const html = await (await fetch('/index.html')).text();
+      const m = html.match(/<svg[^>]*data-role="sprite"[\s\S]*?<\/svg>/);
+      if (m) {
+        const tmp = document.createElement('div');
+        tmp.innerHTML = m[0];
+        document.body.insertBefore(tmp.firstElementChild, document.body.firstChild);
+      }
+    } catch (e) { console.warn('[harness] sprite inject failed', e); }
+  }
+
+  async function main() {
+    await initWasm();
+    await injectSprite();
+    bootstrapSdkRuntime();
+
+    const payloads = await (await fetch('/translator-payloads.json')).json();
+    const seg = (name) => payloads.find((p) => p.call === name);
+    const toU8 = (arr) => Uint8Array.from(arr);
+    const dec = (msg) => wasm.decodeUiPayload(toU8(msg.cbor));
+
+    // Shell + initial state z 'open'.
+    const open = seg('open');
+    for (const msg of open.messages) {
+      if (msg.tag === TAG_PANEL_SHELL) apply(dec(msg));
+    }
+
+    // Payloady wybranego ekranu (StatePatch mode + SlotContent).
+    const target = seg(screen) || open;
+    for (const msg of target.messages) {
+      if (msg.tag === TAG_STATE_PATCH || msg.tag === TAG_SLOT_CONTENT) apply(dec(msg));
+    }
+
+    // Wstrzyknij reprezentatywny stan jako overlay (tak jak zrobilby addon).
+    const inject = INJECT[screen];
+    if (inject) session.store.applyOverlay(overlayEntries(inject));
+
+    document.body.dataset.harnessReady = '1';
+  }
+
+  main().catch((e) => {
+    console.error('[harness] failed:', e);
+    document.querySelector('.addon-app-shell').innerHTML =
+      '<pre style="color:#f88;padding:20px;white-space:pre-wrap">' + (e && e.stack || e) + '</pre>';
+    document.body.dataset.harnessReady = 'error';
+  });
+</script>
+</body>
+</html>

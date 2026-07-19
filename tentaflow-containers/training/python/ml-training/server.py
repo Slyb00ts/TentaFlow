@@ -161,9 +161,30 @@ def _validate_base_model(base_model: str) -> None:
         raise ValueError("base_model must not contain '..'")
 
 
+def _pick_device() -> str:
+    """Runtime device (cross-platform): cuda (Linux/Windows GPU) > mps (Apple
+    Metal) > cpu. QLoRA/bitsandbytes tylko na cuda; mps/cpu degraduja do LoRA fp32."""
+    if torch.cuda.is_available():
+        return "cuda"
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+_DEVICE = _pick_device()
+
+
 def _supports_bf16() -> bool:
-    """bf16 tylko gdy GPU realnie wspiera (Ampere+). Inaczej fp16."""
-    return torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    """bf16 tylko na CUDA Ampere+. mps/cpu -> False (fp32; fp16 niestabilny w treningu)."""
+    return _DEVICE == "cuda" and torch.cuda.is_bf16_supported()
+
+
+def _compute_dtype():  # noqa: ANN201
+    """Dtype ladowania modelu: cuda -> bf16/fp16, mps/cpu -> fp32 (bezpieczny trening)."""
+    if _DEVICE == "cuda":
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    return torch.float32
 
 
 @dataclass
@@ -328,9 +349,14 @@ def _format_record(record: dict[str, Any], tokenizer) -> str:  # noqa: ANN001
             )
         return "\n".join(f"{m.get('role', '')}: {m.get('content', '')}" for m in messages)
 
-    if "prompt" in record and "response" in record:
-        prompt = record["prompt"]
-        response = record["response"]
+    # prompt+response ORAZ question+answer (format datasetu destylacji ML Studio) —
+    # oba mapuja sie na pare user/assistant (chat template gdy dostepny).
+    pr_keys = ("prompt", "response") if ("prompt" in record and "response" in record) else None
+    if pr_keys is None and "question" in record and "answer" in record:
+        pr_keys = ("question", "answer")
+    if pr_keys is not None:
+        prompt = record[pr_keys[0]]
+        response = record[pr_keys[1]]
         if getattr(tokenizer, "chat_template", None):
             return tokenizer.apply_chat_template(
                 [
@@ -343,7 +369,8 @@ def _format_record(record: dict[str, Any], tokenizer) -> str:  # noqa: ANN001
         return f"{prompt}\n{response}"
 
     raise ValueError(
-        "record must contain one of: 'text', 'prompt'+'response', or 'messages'"
+        "record must contain one of: 'text', 'prompt'+'response', "
+        "'question'+'answer', or 'messages'"
     )
 
 
@@ -399,12 +426,12 @@ def _attn_impl() -> str:
 def _load_model(base_model: str, method: str):  # noqa: ANN001
     """Ładuje model bazowy. QLoRA → 4-bit nf4 + double quant; reszta → bf16/fp16.
     Pod DDP (torchrun) każda ranga ładuje na SWÓJ GPU (LOCAL_RANK)."""
-    compute_dtype = torch.bfloat16 if _supports_bf16() else torch.float16
+    compute_dtype = _compute_dtype()
     common = dict(
         trust_remote_code=ALLOW_REMOTE_CODE,
         attn_implementation=_attn_impl(),
     )
-    if method == "qlora":
+    if method == "qlora" and _DEVICE == "cuda":
         bnb = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -460,7 +487,7 @@ def _run_sft(req: TrainRequest, job_id: str) -> str:
         dataset_text_field="text",
         packing=False,
         bf16=use_bf16,
-        fp16=not use_bf16,
+        fp16=(_DEVICE == "cuda" and not use_bf16),
         logging_steps=1,
         save_strategy="no",
         report_to=[],
@@ -525,7 +552,7 @@ def _run_dpo(req: TrainRequest, job_id: str) -> str:
         max_length=hp.max_seq_len,
         max_prompt_length=hp.max_seq_len // 2,
         bf16=use_bf16,
-        fp16=not use_bf16,
+        fp16=(_DEVICE == "cuda" and not use_bf16),
         logging_steps=1,
         save_strategy="no",
         report_to=[],
@@ -554,8 +581,8 @@ def _run_dpo(req: TrainRequest, job_id: str) -> str:
 def _to_messages(record: dict[str, Any]) -> dict[str, Any]:
     """Mapuje rekord {prompt,response} na format konwersacyjny `messages`
     wymagany przez DataCollatorForChatML (GKD). Brak response → sama tura usera."""
-    prompt = record.get("prompt") or record.get("text") or ""
-    response = record.get("response") or record.get("completion") or ""
+    prompt = record.get("prompt") or record.get("question") or record.get("text") or ""
+    response = record.get("response") or record.get("answer") or record.get("completion") or ""
     messages = [{"role": "user", "content": prompt}]
     if response:
         messages.append({"role": "assistant", "content": response})
@@ -596,7 +623,7 @@ def _run_kd(req: TrainRequest, job_id: str) -> str:
         temperature=0.9,
         max_new_tokens=hp.max_seq_len // 2,
         bf16=use_bf16,
-        fp16=not use_bf16,
+        fp16=(_DEVICE == "cuda" and not use_bf16),
         logging_steps=1,
         save_strategy="no",
         report_to=[],
@@ -920,7 +947,18 @@ def _build_torchrun_cmd(
     req: TrainRequest, spec_path: str, status_path: str, job_id: str, nproc: int
 ) -> list[str]:
     """Buduje komendę torchrun: single-node (--standalone) lub multi-node
-    (--nnodes/--node-rank/--rdzv-endpoint c10d) dla treningu rozproszonego."""
+    (--nnodes/--node-rank/--rdzv-endpoint c10d) dla treningu rozproszonego.
+    Non-CUDA (macOS MPS / CPU): brak GPU/DDP — worker leci BEZPOSREDNIO (single-
+    process), bo torch.distributed.run zaklada wielo-GPU i psuje sie na MPS/CPU."""
+    if _DEVICE != "cuda":
+        return [
+            sys.executable,
+            os.path.abspath(__file__),
+            "worker",
+            "--spec", spec_path,
+            "--status", status_path,
+            "--job", job_id,
+        ]
     cmd = [sys.executable, "-m", "torch.distributed.run"]
     d = req.dist
     if d and d.nnodes > 1:

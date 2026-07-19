@@ -116,6 +116,7 @@ impl WhisperEngine {
             text: full_text,
             duration_seconds,
             segments: whisper_segments,
+            detected_language,
         } = output;
 
         let mut segments = Vec::with_capacity(whisper_segments.len());
@@ -140,11 +141,9 @@ impl WhisperEngine {
             elapsed.as_secs_f64(),
         );
 
-        // Wykryty jezyk
-        let language = params
-            .language
-            .clone()
-            .unwrap_or_else(|| "auto".to_string());
+        // Real decode language from whisper.cpp (explicit or auto-detected);
+        // request language only as fallback — never a synthetic "auto".
+        let language = detected_language.or_else(|| params.language.clone());
 
         Ok(TranscribeResult {
             text: full_text,

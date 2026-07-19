@@ -304,6 +304,9 @@ pub fn send_panel_shell() {
         resizable: true,
         primary_slot: SLOT_SIDEBAR.into(),
         secondary_slot: SLOT_WORKSPACE.into(),
+        collapse_below: None,
+        divider: None,
+        grow: None,
     }
     .into_component("root")
     .expect("kodowanie Split root");
@@ -541,6 +544,7 @@ fn sidebar_view() -> Component {
         readonly: None,
         error: None,
         size: InputSize::Md,
+        variant: None,
     }
     .into_component("sb-search")
     .expect("kodowanie Input search");
@@ -629,6 +633,8 @@ fn collection_card(index: usize, c: &JsonValue, selected: &str, graph_on: bool) 
         ],
         padding: None,
         justify: None,
+        style: None,
+        responsive: None,
     }
     .into_component(format!("cc-info-{index}"))
     .expect("kodowanie Stack card info");
@@ -688,6 +694,7 @@ fn collection_card(index: usize, c: &JsonValue, selected: &str, graph_on: bool) 
         children: vec![row],
         interactive: true,
         clickable: true,
+        style: None,
     }
     .into_component(format!("cc-{index}"))
     .expect("kodowanie Card kolekcji");
@@ -742,6 +749,7 @@ fn sidebar_create_card() -> Component {
         children: vec![name, actions],
         interactive: false,
         clickable: false,
+        style: None,
     }
     .into_component("sb-create")
     .expect("kodowanie Card create")
@@ -942,6 +950,7 @@ fn chat_view() -> Component {
         autoresize: true,
         max_rows: Some(8),
         monospace: false,
+        variant: None,
     }
     .into_component("chat-input")
     .expect("kodowanie Textarea chat");
@@ -978,6 +987,8 @@ fn chat_view() -> Component {
         children: vec![box_grow("chat-scroll-grow", scroll), input_bar],
         padding: Some(Spacing::Md),
         justify: Some(FlexJustify::SpaceBetween),
+        style: None,
+        responsive: None,
     }
     .into_component("tab-chat")
     .expect("kodowanie Stack chat")
@@ -999,6 +1010,7 @@ fn message_bubble(index: usize, role: &str, content: &str) -> Component {
             children: vec![body_text(&format!("msg-u-{index}"), lit(content))],
             interactive: false,
             clickable: false,
+            style: None,
         }
         .into_component(format!("msg-card-{index}"))
         .expect("kodowanie Card user");
@@ -1035,6 +1047,7 @@ fn message_bubble(index: usize, role: &str, content: &str) -> Component {
             children: vec![chat_markdown(&format!("msg-md-{index}"), content)],
             interactive: false,
             clickable: false,
+            style: None,
         }
         .into_component(format!("msg-card-{index}"))
         .expect("kodowanie Card assistant");
@@ -1138,6 +1151,12 @@ fn box_grow(id: &str, child: Component) -> Component {
         padding: None,
         margin: None,
         children: vec![child],
+        style: None,
+        direction: None,
+        gap: None,
+        align: None,
+        justify: None,
+        responsive: None,
     }
     .into_component(id)
     .expect("kodowanie Box grow")
@@ -1167,6 +1186,7 @@ fn section_card(
         border: BorderToken::Hairline,
         background: BackgroundToken::None,
         accent: None,
+        style: None,
     }
     .into_component(id)
     .expect("kodowanie SectionCard")
@@ -1202,6 +1222,7 @@ fn body_text(id: &str, content: BindRef) -> Component {
         wrap: None,
         max_lines: None,
         format: None,
+        streaming: None,
     }
     .into_component(id)
     .expect("kodowanie Text")
@@ -1218,6 +1239,7 @@ fn strong_text(id: &str, content: &str) -> Component {
         wrap: None,
         max_lines: Some(1),
         format: None,
+        streaming: None,
     }
     .into_component(id)
     .expect("kodowanie Text strong")
@@ -1232,6 +1254,7 @@ fn muted_caption(id: &str, content: BindRef) -> Component {
         wrap: None,
         max_lines: None,
         format: None,
+        streaming: None,
     }
     .into_component(id)
     .expect("kodowanie Text caption")
@@ -1244,6 +1267,8 @@ fn stack(id: &str, children: Vec<Component>) -> Component {
         children,
         padding: Some(Spacing::Md),
         justify: None,
+        style: None,
+        responsive: None,
     }
     .into_component(id)
     .expect("kodowanie Stack")
@@ -1258,6 +1283,8 @@ fn sidebar_stack(id: &str, children: Vec<Component>) -> Component {
         children,
         padding: Some(Spacing::Sm),
         justify: None,
+        style: None,
+        responsive: None,
     }
     .into_component(id)
     .expect("kodowanie Stack sidebar")
@@ -1272,6 +1299,8 @@ fn section_stack(id: &str, children: Vec<Component>) -> Component {
         children,
         padding: Some(Spacing::Md),
         justify: None,
+        style: None,
+        responsive: None,
     }
     .into_component(id)
     .expect("kodowanie Stack sekcji")
@@ -1317,6 +1346,7 @@ fn text_input(id: &str, bind_key: &str, label: &str, placeholder: &str) -> Compo
         readonly: None,
         error: None,
         size: InputSize::Md,
+        variant: None,
     }
     .into_component(id)
     .expect("kodowanie Input");
@@ -2036,6 +2066,24 @@ fn parse_upload_detail(params: &JsonValue) -> Result<(String, String, String), S
     Ok((doc_ref.to_string(), mime.to_string(), filename.to_string()))
 }
 
+/// Chirurgiczne odswiezenie widoku dokumentow (tabela + summary + licznik) przez
+/// StatePatch — BEZ re-pushu calego slotu workspace. `send_workspace` odbudowuje
+/// caly fragment zakladki (upload + lista), co niszczy `tf-file-input` w trakcie
+/// uploadu i przerywa masowy upload (pliki po 2. gina po cichu). Tabela bind-uje sie
+/// do `SP_DOCUMENT_ROWS`, wiec patch tego pola odswieza WYLACZNIE liste; kontrolka
+/// uploadu (bind `upload_files`) zostaje nietknieta i sekwencja uploadu trwa dalej.
+fn patch_documents_view(collection: &str) {
+    let count = collection_doc_count(collection);
+    // KV utrzymany dla hydratacji przy pelnym renderze zakladki; patch dla live UI.
+    set_kv(SP_WS_DOCCOUNT, &format!("{count} dok"));
+    patch_set(SP_WS_DOCCOUNT, CborValue::Text(format!("{count} dok")));
+    patch_set(SP_DOCUMENT_ROWS, load_document_rows(collection));
+    patch_set(
+        SP_INGEST_SUMMARY,
+        CborValue::Text(load_ingest_summary(collection)),
+    );
+}
+
 /// Akcja `ingest-uploaded`: wpiecie uploadu (upload_complete -> ingest). FileInput
 /// emituje `upload_complete` z detail `{doc_ref, filename, mime, name, size}` PO
 /// chunked-uploadzie hosta do document store; `doc_ref` to id bloba czytelny przez
@@ -2054,7 +2102,9 @@ fn action_ingest_uploaded(params: &JsonValue) -> JsonValue {
         }
     };
 
-    patch_status(&format!("Ingest pliku '{filename}'..."));
+    // Enqueue-only: zwraca natychmiast (status 'queued'), pipeline mieli w tle
+    // scheduled worker `ingest_drain`. Dzieki temu upload_complete nie blokuje
+    // polaczenia i masowy upload wielu plikow przechodzi bez czekania na ingest.
     let res = crate::handle_ingest_document(&json!({
         "collection_id": collection,
         "doc_id_blob": doc_ref,
@@ -2062,19 +2112,22 @@ fn action_ingest_uploaded(params: &JsonValue) -> JsonValue {
         "mime": mime,
     }));
     if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-        let chunks = res
+        let status = res
             .get("data")
-            .and_then(|d| d.get("chunks"))
-            .and_then(|c| c.as_i64())
-            .unwrap_or(0);
-        patch_status(&format!("Zingestowano '{filename}' ({chunks} chunkow)."));
-        refresh_ws_doc_count(&collection);
-        send_workspace(TAB_DOCUMENTS);
+            .and_then(|d| d.get("status"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        if status == "duplicate" {
+            patch_status(&format!("Pominieto duplikat '{filename}' — ta sama tresc juz w bazie."));
+        } else {
+            patch_status(&format!("Dodano '{filename}' do kolejki ingestu."));
+        }
     } else {
-        patch_status(&format!("Ingest '{filename}': {}", error_text(&res)));
-        // Odswiez liste (dokument moze byc w stanie failed z artefaktami statusu).
-        send_workspace(TAB_DOCUMENTS);
+        patch_status(&format!("Nie dodano '{filename}': {}", error_text(&res)));
     }
+    // Chirurgiczne odswiezenie listy (nowy dokument jako 'pending') — NIE wolno
+    // re-pushowac calej zakladki, bo zabija to file-input trwajacego uploadu.
+    patch_documents_view(&collection);
     res
 }
 
@@ -2166,8 +2219,7 @@ fn action_delete_document(params: &JsonValue) -> JsonValue {
     let res = crate::handle_delete_document(&json!({ "document_id": id }));
     if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
         patch_status("Usunieto dokument.");
-        refresh_ws_doc_count(&selected_collection());
-        send_workspace(TAB_DOCUMENTS);
+        patch_documents_view(&selected_collection());
     } else {
         patch_status(&error_text(&res));
     }

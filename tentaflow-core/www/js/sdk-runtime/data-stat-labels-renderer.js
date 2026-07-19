@@ -491,13 +491,25 @@ function renderBadge(component, ctx) {
   if (label == null) throw new TypeError('Badge.label is required');
   const iconRaw = ctx.readField(component.fields, 3);
   const count = ctx.readField(component.fields, 4);
-  const max = requireU32(ctx.readField(component.fields, 5), 'Badge.max');
-  if (max === 0) throw new TypeError('Badge.max must be > 0');
+  // `max` bounds the count overflow badge (e.g. "99+"); it is only meaningful
+  // when a count is present. A plain label/pill badge carries no count and its
+  // encoded default max (0) must not reject the whole badge.
+  const max = count != null
+    ? (() => {
+        const m = requireU32(ctx.readField(component.fields, 5), 'Badge.max');
+        if (m === 0) throw new TypeError('Badge.max must be > 0');
+        return m;
+      })()
+    : 0;
   const pulse = requireBool(ctx.readField(component.fields, 6), 'Badge.pulse');
 
   const TONE_MAP = { neutral: 'accent', primary: 'accent', success: 'success', warning: 'warning', critical: 'danger', info: 'info', muted: 'accent' };
   const wrapper = document.createElement('tf-badge');
   wrapper.setAttribute('tone', TONE_MAP[tone] || 'accent');
+  // Reflect the variant + pulse flag so the generic tf-badge CSS can render the
+  // dot/pulse status-indicator variants (no per-addon styling).
+  wrapper.setAttribute('variant', variant);
+  if (pulse) wrapper.setAttribute('pulse', '');
 
   if (variant !== 'dot') {
     const applyLabel = () => {
@@ -537,7 +549,7 @@ function renderBadge(component, ctx) {
 // =============================================================================
 
 export const CHIP_TAG = 0x020B;
-const CHIP_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6]);
+const CHIP_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7]);
 
 function renderChip(component, ctx) {
   assertOnlyKnownFields(component.fields, CHIP_FIELD_KEYS, 'Chip');
@@ -553,18 +565,30 @@ function renderChip(component, ctx) {
   }
   const selectedBind = ctx.readField(component.fields, 5);
   const removable = requireBool(ctx.readField(component.fields, 6), 'Chip.removable');
+  const dotRaw = ctx.readField(component.fields, 7);
+  const dotTone = dotRaw == null ? null : requireEnum(dotRaw, TONES, 'Chip.dot');
 
   // Map SDK tone to tf-chip status
   const TONE_TO_STATUS = {
-    neutral: 'info', primary: 'accent', success: 'ok', warning: 'warn',
-    critical: 'err', info: 'info', muted: 'info',
+    neutral: 'neutral', primary: 'accent', success: 'ok', warning: 'warn',
+    critical: 'err', info: 'info', muted: 'neutral',
   };
   const wrapper = document.createElement('tf-chip');
   wrapper.setAttribute('status', TONE_TO_STATUS[tone] || 'info');
+  // SDK Chips carry content labels (names, filters), not status codes, so they
+  // keep their given casing instead of the legacy status-pill uppercase.
+  wrapper.setAttribute('data-sdk-chip', '');
   if (iconRaw != null) {
-    const iconName = typeof iconRaw === 'object' && iconRaw.fields
-      ? ctx.readField(iconRaw.fields, 0) : (typeof iconRaw === 'string' ? iconRaw : '');
-    if (iconName) wrapper.setAttribute('icon', iconName);
+    // IconRef Named on the wire is {kind:'named', name, size?, tone?};
+    // sprite ids are dash-separated (#i-record-dot for "record_dot").
+    const iconName = typeof iconRaw === 'object' && iconRaw !== null
+      ? (iconRaw.kind === 'named' ? iconRaw.name : '')
+      : (typeof iconRaw === 'string' ? iconRaw : '');
+    if (iconName) wrapper.setAttribute('icon', String(iconName).replace(/_/g, '-'));
+  }
+  if (dotTone != null) {
+    wrapper.setAttribute('dot', '');
+    wrapper.setAttribute('dot-tone', dotTone);
   }
   if (avatarRaw != null) {
     const avatar = renderAvatarRef(avatarRaw, 'Chip.avatar');

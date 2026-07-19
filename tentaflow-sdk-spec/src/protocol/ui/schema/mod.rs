@@ -408,6 +408,6 @@ mod tests {
         assert_eq!(by_section(section::FORM), 29, "§5 Form");
         assert_eq!(by_section(section::ACTION), 12, "§6 Action");
         assert_eq!(by_section(section::FEEDBACK), 15, "§7 Feedback");
-        assert_eq!(by_section(section::SPECIALIZED), 14, "§8 Specialized");
+        assert_eq!(by_section(section::SPECIALIZED), 15, "§8 Specialized");
     }
 }

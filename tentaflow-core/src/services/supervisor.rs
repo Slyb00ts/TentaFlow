@@ -169,11 +169,22 @@ impl From<anyhow::Error> for SupervisorError {
 
 // ----- Restart bookkeeping --------------------------------------------------
 
+/// Consecutive failed health probes tolerated before the supervisor treats an
+/// engine as down and respawns it. A single slow request used to be enough: an
+/// engine whose `/health` stalled for one probe (e.g. a multi-second inference
+/// briefly occupying its event loop, or any transient blip) was killed and
+/// respawned MID-REQUEST. Requiring several consecutive failures rides out those
+/// blips; a genuinely dead engine still fails every probe and is respawned after
+/// `threshold * health_check_interval`.
+const HEALTH_FAILURE_THRESHOLD: u32 = 3;
+
 #[derive(Debug, Clone)]
 struct RestartState {
     attempts: u32,
     next_backoff: Duration,
     last_attempt: Option<Instant>,
+    /// Failed probes since the last `Ok`. Reset by `clear_restart_state` on Ok.
+    consecutive_failures: u32,
 }
 
 impl RestartState {
@@ -182,6 +193,7 @@ impl RestartState {
             attempts: 0,
             next_backoff: initial_backoff,
             last_attempt: None,
+            consecutive_failures: 0,
         }
     }
 
@@ -323,6 +335,15 @@ impl Supervisor {
             if svc.paused {
                 continue;
             }
+            // Czlonek distributed-deploymentu: zdrowie mierzy koordynator klastra
+            // (endpoint heada), nie lokalny probe. Worker jest headless (bez
+            // endpointu i bez wierszy modeli), wiec lokalna sonda ZAWSZE oznaczy
+            // go Failed/AWARIA mimo ze klaster serwuje — pomijamy w calosci.
+            if crate::services::deploy::distributed::service_is_distributed_member(
+                &svc.config_json,
+            ) {
+                continue;
+            }
             // PID-reuse defence runs only for transports that actually own a process.
             if let Some(pid) = svc.runtime_pid {
                 let needs_pid_check = matches!(
@@ -366,6 +387,20 @@ impl Supervisor {
         // its targets `Starting`, which auto_start_pinned then skips.
         if let Err(e) = self.reload_embedded_on_boot().await {
             tracing::warn!("supervisor: reload_embedded_on_boot failed: {}", e);
+        }
+
+        // Materialize the auto-managed `onnx-cv` service row from the
+        // `vision_models` registry (dynamic camera-CV models). Idempotent;
+        // the reconcile handlers keep it fresh after boot.
+        {
+            let db = self.db.clone();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || crate::services::onnx_cv_service::reconcile(&db))
+                    .await
+                    .map_err(|e| SupervisorError::Database(format!("join: {e}")))?
+            {
+                tracing::warn!("supervisor: onnx-cv reconcile failed: {e:#}");
+            }
         }
 
         if let Err(e) = self.auto_start_pinned().await {
@@ -481,6 +516,19 @@ impl Supervisor {
     /// row to `Running` / `Failed`. Shared by pinned auto-start and embedded
     /// boot-reload; `label` prefixes log + error messages.
     async fn spawn_detached_respawn(&self, svc: &ServiceRow, label: &'static str) {
+        // Czlonek distributed-deploymentu (cluster TP): respawn przez zwykly
+        // pipeline odtwarza SAM kontener (`sleep infinity` na headzie), gubiac
+        // `vllm serve` odpalony przez koordynatora w P5 — czyli zabija zywy
+        // klaster. Cyklem zycia czlonkow zarzadza WYLACZNIE cluster deploy/stop.
+        if crate::services::deploy::distributed::service_is_distributed_member(&svc.config_json) {
+            tracing::warn!(
+                service_id = svc.id,
+                engine = %svc.engine_id,
+                label,
+                "supervisor: pomijam respawn czlonka distributed-deploymentu (zarzadza nim cluster deploy)"
+            );
+            return;
+        }
         self.mark_status(svc.id, ServiceStatus::Starting, None)
             .await;
 
@@ -604,6 +652,25 @@ impl Supervisor {
                 return;
             }
 
+            // Keep the auto-managed `onnx-cv` service row in sync with the
+            // `vision_models` registry every tick — this is how rows applied by
+            // MESH SYNC become advertised without a reboot (the materializer
+            // cannot reach the service layer; the tick republished snapshot +
+            // registry callback rebuilds the catalog right below). Idempotent
+            // and write-free when nothing changed.
+            {
+                let db = self.db.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::services::onnx_cv_service::reconcile(&db)
+                })
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!("supervisor: onnx-cv reconcile failed: {e:#}"),
+                    Err(e) => tracing::warn!("supervisor: onnx-cv reconcile join: {e}"),
+                }
+            }
+
             let services = match self.read_supervised().await {
                 Ok(v) => v,
                 Err(e) => {
@@ -617,6 +684,13 @@ impl Supervisor {
                 // so we neither flip status nor count restart attempts. The user
                 // controls the runtime state directly through the pin/pause API.
                 if svc.paused {
+                    continue;
+                }
+                // Czlonek distributed-deploymentu — patrz run_first_tick: zdrowie
+                // klastra mierzy koordynator, lokalna sonda daje falszywe Failed.
+                if crate::services::deploy::distributed::service_is_distributed_member(
+                    &svc.config_json,
+                ) {
                     continue;
                 }
                 // Status=Starting/Deploying znaczy ze deploy task wciaz pracuje
@@ -1223,6 +1297,14 @@ impl Supervisor {
                     .entry(svc.id)
                     .or_insert_with(|| RestartState::new(self.initial_backoff));
 
+                // Ride out transient blips: only a run of consecutive failed
+                // probes counts as "down". A busy engine that missed one probe
+                // recovers on the next tick (which clears this via `Ok`).
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                if state.consecutive_failures < HEALTH_FAILURE_THRESHOLD {
+                    return;
+                }
+
                 if state.attempts >= self.max_restart_attempts {
                     let msg = format!("permanent failure after {} attempts", state.attempts);
                     drop(states);
@@ -1237,6 +1319,20 @@ impl Supervisor {
                 state.record_attempt(self.restart_backoff_max);
                 let attempt = state.attempts;
                 drop(states);
+
+                // Cluster-TP member: health-restart would recreate the bare
+                // container and drop the coordinator-exec'd `vllm serve` —
+                // the cluster deploy/stop lifecycle owns these rows.
+                if crate::services::deploy::distributed::service_is_distributed_member(
+                    &svc.config_json,
+                ) {
+                    tracing::warn!(
+                        service_id = svc.id,
+                        engine = %svc.engine_id,
+                        "supervisor: pomijam health-restart czlonka distributed-deploymentu"
+                    );
+                    return;
+                }
 
                 self.mark_status(svc.id, ServiceStatus::Starting, None)
                     .await;
@@ -2366,6 +2462,7 @@ mod tests {
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-01 00:00:00".into(),
             request_time_parameters: Default::default(),
+            gpu_selection: String::new(),
         };
         registry.replace_node("peerB".into(), vec![remote_svc]);
 

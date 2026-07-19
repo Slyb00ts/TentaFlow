@@ -878,8 +878,20 @@ impl IrohMeshManager {
                         }
                     };
                     match crate::ml_studio::mesh_artifact::recv_artifact_stream(&mut recv).await {
-                        Ok((name, zip)) => {
-                            match crate::ml_studio::mesh_artifact::store_artifact_zip(&name, &zip) {
+                        Ok((name, zip_path)) => {
+                            // Unzip + walidacja to długie sync IO (snapshot HF =
+                            // setki GB) — spawn_blocking, żeby nie dławić runtime.
+                            let zip_for_store = zip_path.clone();
+                            let stored = tokio::task::spawn_blocking(move || {
+                                crate::ml_studio::mesh_artifact::store_artifact_zip(
+                                    &name,
+                                    &zip_for_store,
+                                )
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(anyhow::anyhow!("store join: {e}")));
+                            crate::ml_studio::mesh_artifact::remove_transfer_tmp(&zip_path);
+                            match stored {
                                 Ok(path) => {
                                     let pb = path.as_bytes();
                                     let _ = send.write_all(&(pb.len() as u32).to_be_bytes()).await;
@@ -1289,15 +1301,17 @@ impl IrohMeshManager {
         Ok(())
     }
 
-    /// Bulk-push artefaktu modelu (ZIP) do `target_node_id` jednym bi-streamem na
-    /// ALPN_ARTIFACT — zamiast tysięcy round-tripów komend mesh. Wysyła
-    /// `[name_len u32][name][zip_len u64][zip]`, odbiera `[path_len u32][path]`
-    /// (ścieżka katalogu artefaktu na węźle docelowym). Zwraca tę ścieżkę.
+    /// Bulk-push artefaktu modelu (ZIP w PLIKU) do `target_node_id` jednym
+    /// bi-streamem na ALPN_ARTIFACT — zamiast tysięcy round-tripów komend mesh.
+    /// Wysyła `[name_len u32][name][zip_len u64][zip]` czytając plik porcjami
+    /// (stały RAM — snapshot HF potrafi mieć setki GB), odbiera
+    /// `[path_len u32][path]` (ścieżka katalogu artefaktu na węźle docelowym).
+    /// Zwraca tę ścieżkę.
     pub async fn push_artifact_stream(
         &self,
         target_node_id: &str,
         name: &str,
-        zip: &[u8],
+        zip_path: &std::path::Path,
         progress_key: Option<&str>,
     ) -> Result<String> {
         use crate::ml_studio::mesh_artifact::{
@@ -1323,76 +1337,97 @@ impl IrohMeshManager {
             .await
             .map_err(|e| anyhow::anyhow!("artifact push: open_bi: {e}"))?;
 
+        let total = tokio::fs::metadata(zip_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("artifact push: metadata zip: {e}"))?
+            .len();
         send.write_all(&(name.len() as u32).to_be_bytes())
             .await
             .map_err(|e| anyhow::anyhow!("artifact push: write name_len: {e}"))?;
         send.write_all(name.as_bytes())
             .await
             .map_err(|e| anyhow::anyhow!("artifact push: write name: {e}"))?;
-        send.write_all(&(zip.len() as u64).to_be_bytes())
+        send.write_all(&total.to_be_bytes())
             .await
             .map_err(|e| anyhow::anyhow!("artifact push: write zip_len: {e}"))?;
 
-        // Strumieniujemy ZIP zapisami CZĄSTKOWYMI (`write`, nie `write_all`) z
-        // watchdogiem STALL: każdy `write` przyjmuje tyle bajtów, ile zmieści okno
-        // flow-control QUIC, i zwraca natychmiast po przyjęciu JAKICHKOLWIEK bajtów.
-        // Świeży limit bezczynności (ARTIFACT_STALL_SECS) na każdy `write` → dopóki
-        // choć bajt zostaje przyjęty w oknie, licznik się resetuje. Timeout = ZERO
-        // przyjętych bajtów przez okno = odbiorca nie czyta (STALL). Aktywny transfer
-        // (nawet bardzo wolny) NIGDY nie pada na sztywny deadline. Postęp → mapa B/s.
-        let total = zip.len() as u64;
+        // Strumieniujemy ZIP z PLIKU porcjami (`read` do bufora → zapisy CZĄSTKOWE
+        // `write`, nie `write_all`) z watchdogiem STALL: każdy `write` przyjmuje
+        // tyle bajtów, ile zmieści okno flow-control QUIC, i zwraca natychmiast po
+        // przyjęciu JAKICHKOLWIEK bajtów. Świeży limit bezczynności
+        // (ARTIFACT_STALL_SECS) na każdy `write` → dopóki choć bajt zostaje
+        // przyjęty w oknie, licznik się resetuje. Timeout = ZERO przyjętych bajtów
+        // przez okno = odbiorca nie czyta (STALL). Aktywny transfer (nawet bardzo
+        // wolny) NIGDY nie pada na sztywny deadline. Postęp → mapa B/s.
+        use tokio::io::AsyncReadExt;
+        let mut file = tokio::fs::File::open(zip_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("artifact push: open zip: {e}"))?;
         let stall = std::time::Duration::from_secs(ARTIFACT_STALL_SECS);
         let mut sent: u64 = 0;
         let mut window_start = tokio::time::Instant::now();
         let mut window_bytes: u64 = 0;
         let mut rate_bps: u64 = 0;
-        let mut off = 0usize;
-        while off < zip.len() {
-            let end = (off + ARTIFACT_CHUNK_BYTES).min(zip.len());
-            let n = match tokio::time::timeout(stall, send.write(&zip[off..end])).await {
-                Ok(Ok(n)) if n > 0 => n,
-                Ok(Ok(_)) => continue,
-                Ok(Err(e)) => return Err(anyhow::anyhow!("artifact push: write zip: {e}")),
-                Err(_) => {
-                    if let Some(k) = progress_key {
-                        crate::ml_studio::mesh_artifact::clear_artifact_progress(k);
+        let mut buf = vec![0u8; ARTIFACT_CHUNK_BYTES];
+        while sent < total {
+            let want = ((total - sent) as usize).min(buf.len());
+            let filled = file
+                .read(&mut buf[..want])
+                .await
+                .map_err(|e| anyhow::anyhow!("artifact push: read zip: {e}"))?;
+            if filled == 0 {
+                anyhow::bail!("artifact push: plik zip skrócony w trakcie ({sent}/{total} B)");
+            }
+            let mut off = 0usize;
+            while off < filled {
+                let n = match tokio::time::timeout(stall, send.write(&buf[off..filled])).await {
+                    Ok(Ok(n)) if n > 0 => n,
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(e)) => return Err(anyhow::anyhow!("artifact push: write zip: {e}")),
+                    Err(_) => {
+                        if let Some(k) = progress_key {
+                            crate::ml_studio::mesh_artifact::clear_artifact_progress(k);
+                        }
+                        anyhow::bail!(
+                            "artifact push: transfer utknął — brak przyjętych bajtów przez {}s ({}/{} B)",
+                            ARTIFACT_STALL_SECS,
+                            sent,
+                            total
+                        );
                     }
-                    anyhow::bail!(
-                        "artifact push: transfer utknął — brak przyjętych bajtów przez {}s ({}/{} B)",
-                        ARTIFACT_STALL_SECS,
-                        sent,
-                        total
+                };
+                sent += n as u64;
+                window_bytes += n as u64;
+                off += n;
+                let win = window_start.elapsed().as_secs_f64();
+                if win >= 1.0 {
+                    rate_bps = (window_bytes as f64 / win) as u64;
+                    window_start = tokio::time::Instant::now();
+                    window_bytes = 0;
+                }
+                if let Some(k) = progress_key {
+                    crate::ml_studio::mesh_artifact::set_artifact_progress_pub(
+                        k,
+                        ArtifactTransferProgress {
+                            bytes_sent: sent,
+                            bytes_total: total,
+                            rate_bps,
+                        },
                     );
                 }
-            };
-            sent += n as u64;
-            window_bytes += n as u64;
-            off += n;
-            let win = window_start.elapsed().as_secs_f64();
-            if win >= 1.0 {
-                rate_bps = (window_bytes as f64 / win) as u64;
-                window_start = tokio::time::Instant::now();
-                window_bytes = 0;
-            }
-            if let Some(k) = progress_key {
-                crate::ml_studio::mesh_artifact::set_artifact_progress_pub(
-                    k,
-                    ArtifactTransferProgress {
-                        bytes_sent: sent,
-                        bytes_total: total,
-                        rate_bps,
-                    },
-                );
             }
         }
         send.finish()
             .map_err(|e| anyhow::anyhow!("artifact push: finish: {e}"))?;
 
-        // Odpowiedź `[path_len][path]` z odbiorcy — z watchdogiem STALL na każdy
-        // `read` (patrz `read_reply_stall`), żeby zawieszony unzip po stronie
-        // odbiorcy nie zostawił nas w transferze bez końca. Reset na każdy bajt.
+        // Odpowiedź `[path_len][path]` z odbiorcy. Odbiorca NAJPIERW rozpakowuje i
+        // waliduje cały ZIP (dla snapshotu HF to setki GB = pojedyncze minuty
+        // czystego IO), a dopiero potem pisze odpowiedź — w tym oknie nie płynie
+        // ŻADEN bajt, więc pierwszy odczyt dostaje osobny, duży budżet zamiast
+        // 30-sekundowego STALL (ktory mierzy transfer, nie unzip).
+        let unzip_budget = std::time::Duration::from_secs(3600);
         let mut len_buf = [0u8; 4];
-        read_reply_stall(&mut recv, &mut len_buf, stall).await?;
+        read_reply_stall(&mut recv, &mut len_buf, unzip_budget).await?;
         let n = u32::from_be_bytes(len_buf) as usize;
         if n == 0 {
             anyhow::bail!("węzeł docelowy nie zapisał artefaktu");
@@ -1474,17 +1509,47 @@ impl IrohMeshManager {
         Ok(())
     }
 
-    /// Build a signed UFP/2 envelope around `data` for a single peer and
-    /// dispatch it on a fresh uni-stream. Used by every send wrapper that
-    /// has been migrated off the legacy raw discriminator wire. The
-    /// destination peer's Ed25519 pubkey is derived from its iroh node id
-    /// (which IS the pubkey in iroh's identity model).
-    pub(crate) async fn send_ufp2_to_peer(
+    /// Jak `send_raw_envelope_to_peer`, ale po `finish()` czeka na potwierdzenie
+    /// odbioru strumienia przez peera (`SendStream::stopped` → `Ok(None)` gdy peer
+    /// zack'owal odbior danych po naszym FIN), z ograniczeniem `ack_timeout`.
+    /// Bez tej bariery `finish()` tylko lokalnie kolejkuje FIN, wiec nastepowy
+    /// `Connection::close` moze kazac zdalnej stronie porzucic jeszcze
+    /// niedostarczone dane (kontrakt quinn). Timeout, bo revokowany/wolny peer
+    /// moze nie zack'owac na czas — wtedy i tak wracamy (best-effort delivery).
+    async fn send_raw_envelope_to_peer_acked(
+        &self,
+        target_node_id: &str,
+        wire: &[u8],
+        ack_timeout: Duration,
+    ) -> Result<()> {
+        let connection = self
+            .connections
+            .get(target_node_id)
+            .ok_or_else(|| anyhow::anyhow!("brak polaczenia z {}", target_node_id))?
+            .connection
+            .clone();
+        let mut send = connection
+            .open_uni()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_uni: {e}"))?;
+        send.write_all(wire)
+            .await
+            .map_err(|e| anyhow::anyhow!("write ufp2 envelope: {e}"))?;
+        send.finish()
+            .map_err(|e| anyhow::anyhow!("finish ufp2 uni: {e}"))?;
+        let _ = tokio::time::timeout(ack_timeout, send.stopped()).await;
+        Ok(())
+    }
+
+    /// Buduje podpisana koperte UFP/2 wokol `data` dla jednego peera (walidacja
+    /// dyskryminatora + wyprowadzenie pubkeya z iroh node id). Wspoldzielona
+    /// przez `send_ufp2_to_peer` i wariant z ackiem.
+    fn build_ufp2_wire(
         &self,
         target_node_id: &str,
         legacy_discriminator: u8,
         data: &[u8],
-    ) -> Result<()> {
+    ) -> Result<Vec<u8>> {
         if !crate::mesh::ufp2::is_migrated_to_ufp2_discriminator(legacy_discriminator) {
             return Err(anyhow::anyhow!(
                 "send_ufp2_to_peer: discriminator 0x{:02X} is not on the UFP/2 unicast allowlist (bi-stream types FORWARD_REQ/FORWARD_STREAM_REQ use their own protocol)",
@@ -1499,7 +1564,7 @@ impl IrohMeshManager {
         })?;
         let source_pubkey = self.security.verifying_key_bytes();
         let epoch = self.current_policy_epoch();
-        let wire = crate::mesh::ufp2::build_signed_envelope_wire(
+        crate::mesh::ufp2::build_signed_envelope_wire(
             self.security.signing_key(),
             source_pubkey,
             dest_pubkey,
@@ -1507,8 +1572,37 @@ impl IrohMeshManager {
             data.to_vec(),
             epoch,
         )
-        .map_err(|e| anyhow::anyhow!("send_ufp2_to_peer: envelope build failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("send_ufp2_to_peer: envelope build failed: {e}"))
+    }
+
+    /// Build a signed UFP/2 envelope around `data` for a single peer and
+    /// dispatch it on a fresh uni-stream. Used by every send wrapper that
+    /// has been migrated off the legacy raw discriminator wire. The
+    /// destination peer's Ed25519 pubkey is derived from its iroh node id
+    /// (which IS the pubkey in iroh's identity model).
+    pub(crate) async fn send_ufp2_to_peer(
+        &self,
+        target_node_id: &str,
+        legacy_discriminator: u8,
+        data: &[u8],
+    ) -> Result<()> {
+        let wire = self.build_ufp2_wire(target_node_id, legacy_discriminator, data)?;
         self.send_raw_envelope_to_peer(target_node_id, &wire).await
+    }
+
+    /// Jak `send_ufp2_to_peer`, ale czeka na potwierdzenie odbioru przez peera
+    /// (do `ack_timeout`) przed powrotem. Uzywane gdy nadawca zaraz zamknie
+    /// polaczenie (revoke), zeby `Connection::close` nie porzucil notyfikacji.
+    pub(crate) async fn send_ufp2_to_peer_acked(
+        &self,
+        target_node_id: &str,
+        legacy_discriminator: u8,
+        data: &[u8],
+        ack_timeout: Duration,
+    ) -> Result<()> {
+        let wire = self.build_ufp2_wire(target_node_id, legacy_discriminator, data)?;
+        self.send_raw_envelope_to_peer_acked(target_node_id, &wire, ack_timeout)
+            .await
     }
 
     fn current_policy_epoch(&self) -> u32 {

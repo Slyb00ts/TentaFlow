@@ -4,6 +4,7 @@
 
 use super::super::bind::BindRef;
 use super::super::component::{Component, FieldMap};
+use super::super::inline::IconRef;
 use super::super::tokens::{DrawerSide, DrawerSize, ModalSize, PopoverPlacement, SheetDetent};
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
@@ -31,13 +32,16 @@ pub struct Modal {
     pub dismissible: bool,
     pub prevent_scroll: bool,
     pub closable: bool,
+    /// Optional header icon shown before the title (mockup n03 share dialog).
+    /// Absent → title-only header (byte-identical to pre-icon payloads).
+    pub icon: Option<IconRef>,
 }
 
 impl Modal {
     pub const TAG: u16 = 0x0509;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut e: Vec<(u8, Value)> = Vec::with_capacity(8);
+        let mut e: Vec<(u8, Value)> = Vec::with_capacity(9);
         e.push((0, encode_to_value(&self.title)?));
         if let Some(v) = &self.subtitle { e.push((1, encode_to_value(v)?)); }
         e.push((2, encode_to_value(&self.body_slot)?));
@@ -46,6 +50,7 @@ impl Modal {
         e.push((5, encode_to_value(&self.dismissible)?));
         e.push((6, encode_to_value(&self.prevent_scroll)?));
         e.push((7, encode_to_value(&self.closable)?));
+        if let Some(v) = &self.icon { e.push((8, encode_to_value(v)?)); }
         Ok(component(Self::TAG, id, e))
     }
 
@@ -56,6 +61,7 @@ impl Modal {
         let mut body_slot = None; let mut footer_slot = None;
         let mut size = None; let mut dismissible = None;
         let mut prevent_scroll = None; let mut closable = None;
+        let mut icon = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => title = Some(decode_from_value(v)?),
@@ -66,6 +72,7 @@ impl Modal {
                 5 => dismissible = Some(decode_from_value(v)?),
                 6 => prevent_scroll = Some(decode_from_value(v)?),
                 7 => closable = Some(decode_from_value(v)?),
+                8 => icon = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("Modal", *other)),
             }
         }
@@ -78,6 +85,7 @@ impl Modal {
             dismissible: dismissible.ok_or_else(|| missing_field("Modal", "dismissible"))?,
             prevent_scroll: prevent_scroll.ok_or_else(|| missing_field("Modal", "prevent_scroll"))?,
             closable: closable.ok_or_else(|| missing_field("Modal", "closable"))?,
+            icon,
         })
     }
 }

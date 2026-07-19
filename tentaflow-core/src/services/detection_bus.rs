@@ -47,6 +47,17 @@ pub struct Detection {
     pub stan: Vec<String>,
     #[serde(default)]
     pub tekst: Option<String>,
+    /// Stabilny identyfikator sledzenia nadany przez tracker IOU. 0 = brak
+    /// przypisania (np. detekcje ze zrodel bez trackera).
+    #[serde(default)]
+    pub track_id: u32,
+    /// Prędkość srodka boxa w jednostkach znormalizowanych/s (os X). 0 gdy brak
+    /// bazy czasu (pts_ns) albo pierwsza obserwacja tracku.
+    #[serde(default)]
+    pub vx: f32,
+    /// Prędkość srodka boxa w jednostkach znormalizowanych/s (os Y).
+    #[serde(default)]
+    pub vy: f32,
 }
 
 /// Wiadomosc wysylana do przegladarki (server→browser). Serializuje sie do
@@ -67,15 +78,31 @@ pub struct DetectionsMessage {
     pub camera_id: String,
     /// Znacznik czasu w milisekundach (unix epoch ms).
     pub ts_ms: u64,
+    /// PTS klatki w osi mediów (nanosekundy) — wspolna oś czasu z init-segmentem
+    /// MSE (`mux_base_pts_ns`), pozwala klientowi kotwiczyc overlay dokladnie na
+    /// klatce wideo, niezaleznie od zegara wall-clock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pts_ns: Option<u64>,
+    /// Czas CALOSCI obrobki klatki w ms (detekcja + OCR + klasyfikacja stanu).
+    /// Klient pokazuje go jako badge. 0 gdy nieznany (np. surowa ramka FAZY 1).
+    pub proc_ms: u32,
     pub items: Vec<Detection>,
 }
 
 impl DetectionsMessage {
-    fn new(camera_id: String, ts_ms: u64, items: Vec<Detection>) -> Self {
+    fn new(
+        camera_id: String,
+        ts_ms: u64,
+        pts_ns: Option<u64>,
+        proc_ms: u32,
+        items: Vec<Detection>,
+    ) -> Self {
         Self {
             msg_type: "detections",
             camera_id,
             ts_ms,
+            pts_ns,
+            proc_ms,
             items,
         }
     }
@@ -119,17 +146,24 @@ pub fn subscribe(camera_id: &str) -> broadcast::Receiver<DetectionsMessage> {
 
 /// Czysty punkt wpiecia dla zrodla detekcji. Realna inferencja
 /// (RF-DETR + OCR + stan) bedzie wolac dokladnie te funkcje tym samym
-/// `Detection` -> JSON kontraktem co stub. Znacznik czasu jest nadawany tutaj
-/// (unix epoch ms), wiec zrodlo nie musi go liczyc.
+/// `Detection` -> JSON kontraktem co stub.
+///
+/// `ts_ms` to czas PRZECHWYCENIA klatki (unix epoch ms, wall-clock), NIE czas
+/// publikacji. Overlay w przegladarce kotwiczy `video.currentTime` (odtwarzanie
+/// w czasie rzeczywistym) do tego znacznika, wiec musi on odpowiadac klatce na
+/// ktorej wykonano detekcje — inaczej pudelka lądują na spóźnionej klatce
+/// (opóźnienie dekod+inferencja+publish).
 ///
 /// Gdy nikt nie subskrybuje danej kamery, wiadomosc jest po cichu pomijana
 /// (brak odbiorcow broadcast) — to zamierzone, nie blokuje producenta.
-pub fn publish_detections(camera_id: &str, items: Vec<Detection>) {
-    let ts_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let msg = DetectionsMessage::new(camera_id.to_string(), ts_ms, items);
+pub fn publish_detections(
+    camera_id: &str,
+    ts_ms: u64,
+    pts_ns: Option<u64>,
+    proc_ms: u32,
+    items: Vec<Detection>,
+) {
+    let msg = DetectionsMessage::new(camera_id.to_string(), ts_ms, pts_ns, proc_ms, items);
     // `send` zwraca Err tylko gdy nie ma zadnych odbiorcow — ignorujemy.
     let _ = detection_bus().sender(camera_id).send(msg);
 }
@@ -175,6 +209,9 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                 score: 0.96,
                 stan: Vec::new(),
                 tekst: Some("30/1202".to_string()),
+                track_id: 0,
+                vx: 0.,
+                vy: 0.,
             };
 
             // Nalepka ze zmiennym stanem: co ~3 s przelacza "uszkodzona".
@@ -189,6 +226,9 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                     Vec::new()
                 },
                 tekst: None,
+                track_id: 0,
+                vx: 0.,
+                vy: 0.,
             };
 
             // Co ~5 s dorzuca trzecia ramke z rotujaca klasa, zeby overlay
@@ -202,10 +242,19 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                     score: 0.88,
                     stan: Vec::new(),
                     tekst: None,
+                    track_id: 0,
+                    vx: 0.,
+                    vy: 0.,
                 });
             }
 
-            publish_detections(&camera_id, items);
+            // Stub nie ma realnej klatki, wiec brak naturalnego czasu
+            // przechwycenia — uzywamy biezacego czasu wall-clock lokalnie.
+            let ts_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            publish_detections(&camera_id, ts_ms, None, 0, items);
         }
     })
 }
@@ -223,6 +272,8 @@ mod tests {
         let msg = DetectionsMessage::new(
             "cam1".to_string(),
             0,
+            None,
+            0,
             vec![
                 Detection {
                     klasa: "tablica_adr".to_string(),
@@ -230,6 +281,9 @@ mod tests {
                     score: 0.96,
                     stan: Vec::new(),
                     tekst: Some("30/1202".to_string()),
+                    track_id: 0,
+                    vx: 0.,
+                    vy: 0.,
                 },
                 Detection {
                     klasa: "nalepka_3".to_string(),
@@ -237,6 +291,9 @@ mod tests {
                     score: 0.94,
                     stan: vec!["uszkodzona".to_string()],
                     tekst: None,
+                    track_id: 0,
+                    vx: 0.,
+                    vy: 0.,
                 },
             ],
         );
@@ -283,12 +340,18 @@ mod tests {
         let mut rx = subscribe(cam);
         publish_detections(
             cam,
+            0,
+            None,
+            0,
             vec![Detection {
                 klasa: "termometr".to_string(),
                 bbox: [0.1, 0.1, 0.2, 0.2],
                 score: 0.5,
                 stan: Vec::new(),
                 tekst: None,
+                track_id: 0,
+                vx: 0.,
+                vy: 0.,
             }],
         );
         let msg = rx.recv().await.expect("wiadomosc detekcji");
@@ -302,12 +365,18 @@ mod tests {
         // Brak subskrybenta — publish nie panikuje i nie blokuje producenta.
         publish_detections(
             "detbus-test-cam-ghost",
+            0,
+            None,
+            0,
             vec![Detection {
                 klasa: "nalepka_9".to_string(),
                 bbox: [0.0, 0.0, 0.1, 0.1],
                 score: 0.9,
                 stan: Vec::new(),
                 tekst: None,
+                track_id: 0,
+                vx: 0.,
+                vy: 0.,
             }],
         );
     }

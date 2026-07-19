@@ -1,0 +1,39 @@
+# Manifest serwisu Classifier Training — serwer treningowy klasyfikatora obrazu
+# (timm). Realne fine-tuningi na wycinkach bbox z datasetu COCO sterowane przez
+# REST API (POST /train). Wariant modelu (mobilenetv4/efficientnet_b0/resnet50),
+# atrybut i dane są parametrem JOBA, nie wybierane przy deployu — requires_model = false.
+
+[engine]
+id = "classifier-training"
+category = "training"
+name = "Classifier Training"
+description_pl = "Serwer treningowy klasyfikatora obrazu (timm): trening na wycinkach bbox z COCO wg atrybutu adnotacji, eksport do ONNX. Wariant modelu, atrybut i dane podajesz per job przez REST API."
+description_en = "Image classifier training server (timm): trains on COCO bbox crops by annotation attribute, ONNX export. Model variant, attribute and data are supplied per job over a REST API."
+homepage = "https://github.com/huggingface/pytorch-image-models"
+license = "Apache-2.0"
+icon = "image"
+default_port = 8203
+api = "custom"
+version = "1.0.0"
+requires_model = false
+
+[deploy.native]
+platforms = ["linux"]
+runtime = "python-bundle"
+bundle_path = "training/python/classifier-training"
+
+[[model_preset]]
+id = "efficientnet_b0"
+display_name = "EfficientNet-B0 (zbalansowany)"
+repo = "efficientnet_b0"
+recommended = true
+
+[[model_preset]]
+id = "mobilenetv4"
+display_name = "MobileNetV4 Conv Small (szybki)"
+repo = "mobilenetv4"
+
+[[model_preset]]
+id = "resnet50"
+display_name = "ResNet-50 (najlepszy)"
+repo = "resnet50"

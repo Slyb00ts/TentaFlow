@@ -856,6 +856,69 @@ pub const BORDERTOKEN_UNION: UnionMeta = UnionMeta {
     ],
 };
 
+pub const SPACEVALUE_UNION: UnionMeta = UnionMeta {
+    name: "SpaceValue",
+    discriminator_key: "kind",
+    variants: &[
+        VariantMeta {
+            rust_name: "Token",
+            wire_kind: "token",
+            fields: &[
+                FieldMeta { key: 0, name: "value", wire: "Enum<Spacing>", required: true, default: None },
+            ],
+        },
+        VariantMeta {
+            rust_name: "Px",
+            wire_kind: "px",
+            fields: &[
+                FieldMeta { key: 0, name: "value", wire: "u16", required: true, default: None },
+            ],
+        },
+    ],
+};
+
+pub const RADIUSVALUE_UNION: UnionMeta = UnionMeta {
+    name: "RadiusValue",
+    discriminator_key: "kind",
+    variants: &[
+        VariantMeta {
+            rust_name: "Token",
+            wire_kind: "token",
+            fields: &[
+                FieldMeta { key: 0, name: "value", wire: "Enum<RadiusToken>", required: true, default: None },
+            ],
+        },
+        VariantMeta {
+            rust_name: "Px",
+            wire_kind: "px",
+            fields: &[
+                FieldMeta { key: 0, name: "value", wire: "u16", required: true, default: None },
+            ],
+        },
+    ],
+};
+
+pub const CONTAINERWIDTH_UNION: UnionMeta = UnionMeta {
+    name: "ContainerWidth",
+    discriminator_key: "kind",
+    variants: &[
+        VariantMeta {
+            rust_name: "Token",
+            wire_kind: "token",
+            fields: &[
+                FieldMeta { key: 0, name: "value", wire: "Enum<Breakpoint>", required: true, default: None },
+            ],
+        },
+        VariantMeta {
+            rust_name: "Px",
+            wire_kind: "px",
+            fields: &[
+                FieldMeta { key: 0, name: "value", wire: "u16", required: true, default: None },
+            ],
+        },
+    ],
+};
+
 pub const SPLITSIZE_UNION: UnionMeta = UnionMeta {
     name: "SplitSize",
     discriminator_key: "kind",
@@ -1231,6 +1294,9 @@ pub const ALL_TAGGED_UNIONS: &[&UnionMeta] = &[
     &HEATMAPSCALE_UNION,
     &DATEPRESETRESOLVE_UNION,
     &BORDERTOKEN_UNION,
+    &SPACEVALUE_UNION,
+    &RADIUSVALUE_UNION,
+    &CONTAINERWIDTH_UNION,
     &SPLITSIZE_UNION,
     &GRIDCOL_UNION,
     &GRIDTRACK_UNION,

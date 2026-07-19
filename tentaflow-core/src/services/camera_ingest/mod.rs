@@ -13,6 +13,7 @@ pub mod fakefile;
 pub mod local;
 pub mod metadata_bus;
 pub mod metadata_supervisor;
+pub mod mjpeg;
 pub mod onvif_discovery;
 pub mod onvif_events;
 pub mod onvif_media;
@@ -26,7 +27,12 @@ pub mod webrtc_source;
 #[cfg(feature = "inference-vision-gpu")]
 pub mod vision_analysis;
 
+#[cfg(feature = "inference-vision-gpu")]
+pub mod tracker;
+
 pub mod depth_mapping;
+
+pub mod cv_pipeline;
 
 pub use credentials::{credentials_cipher, CredentialsCipher, CredentialsError};
 pub use decoder_detect::{detect_hw_decoder, detect_profile, HardwareProfile, HwDecoder};

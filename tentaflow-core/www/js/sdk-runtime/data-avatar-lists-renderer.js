@@ -104,8 +104,27 @@ function applyTextBind(element, bindRef, ctx) {
 // AvatarRef rendering (shared by Avatar + AvatarGroup)
 // =============================================================================
 
+// Number of deterministic initials-avatar color buckets. Backed by the
+// .tf-avatar-source--auto-N palette in controls.css.
+const AVATAR_AUTO_COLOR_COUNT = 6;
+
+/// Stable hash of the initials text → palette bucket. FNV-1a keeps the same
+/// person the same color across renders without any host round-trip (B2).
+function avatarAutoColorClass(text) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  const bucket = (h >>> 0) % AVATAR_AUTO_COLOR_COUNT;
+  return `tf-avatar-source--auto-${bucket}`;
+}
+
 /// Parsuje + renderuje AvatarRef tagged union. Zwraca <span class=tf-avatar-source>.
-function renderAvatarSource(ref, ctx, sizeClass) {
+/// `autoColorInitials` (default true) tints an initials source with a
+/// deterministic palette bucket derived from the initials text — used when the
+/// Avatar declares no explicit tone (B2). Set false to keep the neutral fill.
+function renderAvatarSource(ref, ctx, sizeClass, autoColorInitials = false) {
   if (typeof ref !== 'object' || ref == null || Array.isArray(ref)) {
     throw new TypeError(`${ctx}: AvatarRef must be object`);
   }
@@ -137,6 +156,7 @@ function renderAvatarSource(ref, ctx, sizeClass) {
     const txt = document.createElement('span');
     txt.classList.add('tf-avatar-source__initials');
     txt.textContent = ref.initials.slice(0, 3);
+    if (autoColorInitials) wrap.classList.add(avatarAutoColorClass(ref.initials));
     wrap.appendChild(txt);
   } else {
     assertOnlyKnownObjectKeys(ref, new Set(['kind', 'icon']), `${ctx}.icon`);
@@ -173,7 +193,9 @@ function renderAvatar(component, ctx) {
   wrapper.classList.add(`tf-avatar--shape-${shape}`);
   if (tone) wrapper.classList.add(`tf-avatar--tone-${tone}`);
 
-  const source = renderAvatarSource(sourceRaw, 'Avatar.source');
+  // An explicit tone wins; without one, initials sources get a deterministic
+  // color from their text (B2) so people read as distinct chips, not mono.
+  const source = renderAvatarSource(sourceRaw, 'Avatar.source', undefined, tone == null);
   source.classList.add('tf-avatar__source');
   wrapper.appendChild(source);
 

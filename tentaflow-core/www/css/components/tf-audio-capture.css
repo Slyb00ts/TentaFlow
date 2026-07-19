@@ -1,0 +1,148 @@
+/* =============================================================================
+   File: components/tf-audio-capture.css
+   Description: Default look of the AudioCapture (0x0612) SDK component — a mic
+   button framed by pulsing rings and two mirrored waveforms whose amplitude is
+   driven by the live RMS level (`--tf-audio-capture-level`). Emitted by
+   specialized-audio-capture-renderer.js. Generic (no per-addon scope); colors
+   come from the shared theme tokens.
+   ============================================================================= */
+
+.tf-audio-capture {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  /* Idle level until the RMS meter overrides it every animation frame. */
+  --tf-audio-capture-level: 0.45;
+}
+
+/* Mic button wrapped with concentric pulse rings (recording indicator). */
+.tf-audio-capture__mic-wrap {
+  position: relative;
+  width: 84px;
+  height: 84px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tf-audio-capture__ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--tf-accent-1) 50%, transparent);
+  animation: tf-audio-capture-ring 2.4s var(--tf-spring-smooth) infinite;
+}
+.tf-audio-capture__ring:nth-child(2) { animation-delay: 0.8s; }
+.tf-audio-capture__ring:nth-child(3) { animation-delay: 1.6s; }
+@keyframes tf-audio-capture-ring {
+  0% { transform: scale(0.65); opacity: 0.7; }
+  100% { transform: scale(1.5); opacity: 0; }
+}
+
+.tf-audio-capture__button {
+  position: relative;
+  z-index: 1;
+  width: 66px;
+  height: 66px;
+  border-radius: 50%;
+  border: 0;
+  cursor: pointer;
+  background: var(--tf-gradient-accent);
+  box-shadow: var(--tf-glow-accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tf-audio-capture__icon {
+  width: 28px;
+  height: 28px;
+  background: #fff;
+  -webkit-mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>') center / contain no-repeat;
+  mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>') center / contain no-repeat;
+}
+
+/* The renderer keeps a hidden numeric level node; the amplitude is expressed
+   through the waveforms, so the raw readout stays out of the layout. */
+.tf-audio-capture__level { display: none; }
+
+.tf-audio-capture__label {
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--tf-text-2);
+}
+
+.tf-audio-capture__status {
+  font-size: 12px;
+  color: var(--tf-text-3);
+  text-align: center;
+  min-height: 1em;
+}
+
+/* Waveform bars framing the mic (top mirrored + bottom). */
+.tf-audio-capture__wave {
+  display: flex;
+  align-items: flex-end;
+  gap: 5px;
+  height: 40px;
+  max-width: 100%;
+  overflow: hidden;
+}
+.tf-audio-capture__wave--mirror { align-items: flex-start; }
+.tf-audio-capture__wave span {
+  width: 5px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, var(--tf-accent-1) 0%, var(--tf-accent-2) 100%);
+  height: calc(8px + (32px * var(--tf-audio-capture-level, 0.45)) * var(--tf-audio-capture-bar, 1));
+  animation: tf-audio-capture-wave 1.1s ease-in-out infinite alternate;
+}
+.tf-audio-capture__wave span:nth-child(3n) { animation-delay: 0.15s; --tf-audio-capture-bar: 1.4; }
+.tf-audio-capture__wave span:nth-child(3n+1) { animation-delay: 0.35s; --tf-audio-capture-bar: 0.7; }
+.tf-audio-capture__wave span:nth-child(4n) { animation-delay: 0.5s; --tf-audio-capture-bar: 1.1; }
+@keyframes tf-audio-capture-wave {
+  from { transform: scaleY(0.5); }
+  to { transform: scaleY(1); }
+}
+
+/* Docked variant — horizontal strip for recording docks: compact mic on the
+   left, ONE waveform to the right, no idle label (status only when set). */
+.tf-audio-capture--docked {
+  flex-direction: row;
+  align-items: center;
+  gap: 14px;
+}
+.tf-audio-capture--docked .tf-audio-capture__wave--mirror,
+.tf-audio-capture--docked .tf-audio-capture__label { display: none; }
+.tf-audio-capture--docked .tf-audio-capture__mic-wrap {
+  width: 56px;
+  height: 56px;
+}
+.tf-audio-capture--docked .tf-audio-capture__button {
+  width: 56px;
+  height: 56px;
+}
+.tf-audio-capture--docked .tf-audio-capture__icon {
+  width: 23px;
+  height: 23px;
+}
+.tf-audio-capture--docked .tf-audio-capture__wave {
+  gap: 3px;
+  height: 34px;
+  align-items: center;
+}
+.tf-audio-capture--docked .tf-audio-capture__wave span {
+  width: 3px;
+  height: calc(6px + (26px * var(--tf-audio-capture-level, 0.45)) * var(--tf-audio-capture-bar, 1));
+}
+/* Transient status floats under the mic/wave group so it never widens the
+   dock row (the addon-side status line carries persistent errors). */
+.tf-audio-capture--docked { position: relative; }
+.tf-audio-capture--docked .tf-audio-capture__status {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  min-height: 0;
+  white-space: nowrap;
+}
+.tf-audio-capture--docked .tf-audio-capture__status:empty { display: none; }

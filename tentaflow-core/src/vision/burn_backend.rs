@@ -41,6 +41,88 @@ pub fn device() -> VisionDevice {
     Default::default()
 }
 
+/// Adapter ładowania wag: rzutuje stałe tensory logiczne zapisane w `.bpk` jako
+/// natywny `Bool(Native)` na `Bool(U32)`.
+///
+/// Backendy cubecl (wgpu/CUDA/…) NIE obsługują `bool_from_data` dla
+/// `Bool(Native)` — panikują z „Unsupported dtype for `bool_from_data`
+/// Bool(Native)”. Nowy graf RF-DETR zawiera stałą maskę (`Where`/`mask_fill`)
+/// eksportowaną właśnie jako `Bool(Native)`, przez co inferencja na GPU
+/// crashuje. Backend wgpu reprezentuje wartości logiczne jako `u32` (WGSL nie
+/// zna `u8` — `Bool(U8)` powoduje panic „U8 is not a valid WgpuElement” przy
+/// kompilacji shadera), więc konwertujemy do `Bool(U32)`, który jest zgodny
+/// zarówno z wgpu, jak i z CUDA. Konwersja jest bezstratna (0/1). Backend
+/// NdArray akceptuje wszystkie warianty.
+#[derive(Debug, Clone, Default)]
+pub struct BoolNativeToU32Adapter;
+
+impl burn_store::ModuleAdapter for BoolNativeToU32Adapter {
+    fn adapt(&self, snapshot: &burn_store::TensorSnapshot) -> burn_store::TensorSnapshot {
+        use burn::tensor::{BoolStore, DType};
+
+        if snapshot.dtype != DType::Bool(BoolStore::Native) {
+            return snapshot.clone();
+        }
+
+        let target = DType::Bool(BoolStore::U32);
+        let source = snapshot.clone_data_fn();
+        let data_fn = std::rc::Rc::new(move || {
+            let data = source()?;
+            Ok(data.convert_dtype(target))
+        });
+
+        burn_store::TensorSnapshot::from_closure(
+            data_fn,
+            target,
+            snapshot.shape.clone(),
+            snapshot.path_stack.clone().unwrap_or_default(),
+            snapshot.container_stack.clone().unwrap_or_default(),
+            snapshot.tensor_id.unwrap_or_default(),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn burn_store::ModuleAdapter> {
+        Box::new(self.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::tensor::{BoolStore, DType, TensorData};
+    use burn_store::ModuleAdapter;
+
+    #[test]
+    fn native_bool_jest_konwertowany_na_u32() {
+        let data = TensorData::from([[true, false, true]]);
+        assert_eq!(data.dtype, DType::Bool(BoolStore::Native));
+        let snap = burn_store::TensorSnapshot::from_data(
+            data,
+            vec!["mask".into()],
+            vec!["Struct:Model".into()],
+            Default::default(),
+        );
+        let out = BoolNativeToU32Adapter.adapt(&snap);
+        assert_eq!(out.dtype, DType::Bool(BoolStore::U32));
+        let out_data = out.to_data().expect("materializacja danych");
+        assert_eq!(out_data.dtype, DType::Bool(BoolStore::U32));
+        assert_eq!(out_data.shape, snap.shape);
+    }
+
+    #[test]
+    fn nie_bool_pozostaje_bez_zmian() {
+        let data = TensorData::from([1.0f32, 2.0, 3.0]);
+        let snap = burn_store::TensorSnapshot::from_data(
+            data,
+            vec!["w".into()],
+            vec!["Struct:Linear".into()],
+            Default::default(),
+        );
+        let out = BoolNativeToU32Adapter.adapt(&snap);
+        assert_eq!(out.dtype, DType::F32);
+    }
+}
+
 type InferJob = Box<dyn FnOnce() + Send + 'static>;
 
 /// The single long-lived thread that runs EVERY vision `forward()`.

@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Benchmark Studio · Lista benchmarków (M1)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .bench-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 20px; }
+  .bench-card {
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 16px 18px; cursor: pointer; transition: all 0.15s;
+  }
+  .bench-card:hover { border-color: var(--accent-1); background: var(--bg-card); }
+  .bench-card .b-head { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 10px; }
+  .bench-card .b-name { font-size: 14.5px; font-weight: 800; }
+  .bench-card .b-meta { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .bench-card .b-last {
+    display: flex; align-items: center; gap: 10px; padding-top: 12px;
+    border-top: 1px solid var(--border); font-size: 11.5px; color: var(--text-2);
+  }
+  .bench-card .b-last .trend-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); font-weight: 700; }
+  .num-r { text-align: right; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+  <symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M1</span>
+    <h2>Lista benchmarków</h2>
+    <div class="desc">Wejście do Benchmark Studio: zdefiniowane benchmarki (targety + testy) z ostatnim runem i trendem decode tok/s, poniżej historia ostatnich runów.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Analityka</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-trend"/></svg>Statystyki modeli</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr · Admin</div><div class="role">Euvic · Zarząd</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Analityka</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb current">Benchmark Studio</span>
+        </div>
+
+        <div class="flex align-center justify-between" style="margin-bottom:16px;">
+          <div>
+            <div style="font-size:18px;font-weight:800;">Benchmarki</div>
+            <div class="text-3 text-sm">4 zdefiniowane · 1 run w toku</div>
+          </div>
+          <button class="btn btn-primary"><svg class="icon"><use href="#i-plus"/></svg>Nowy benchmark</button>
+        </div>
+
+        <div class="bench-grid">
+          <div class="bench-card">
+            <div class="b-head">
+              <div style="flex:1;">
+                <div class="b-name">LLM produkcyjne Q3</div>
+                <div class="text-3 text-xs">Pełen zestaw: latencja, throughput, kontekst, stabilność</div>
+              </div>
+              <span class="chip success"><span class="dot"></span>success</span>
+            </div>
+            <div class="b-meta">
+              <span class="chip"><svg class="icon"><use href="#i-server"/></svg>3 targety</span>
+              <span class="chip"><svg class="icon"><use href="#i-flask"/></svg>4 testy</span>
+              <span class="chip info">gemma-4-31b · Qwen2.5-7B · claude-sonnet</span>
+            </div>
+            <div class="b-last">
+              <svg class="icon icon-sm"><use href="#i-clock"/></svg>
+              Ostatni run: <strong>#14 · 02.07.2026 09:14</strong> · 34 min
+              <span class="ml-auto trend-label">decode t/s (6 runów)</span>
+              <svg class="sparkline" viewBox="0 0 90 24"><polyline points="2,14 19,13 36,15 53,12 70,11 88,9" stroke="#22c55e"/></svg>
+            </div>
+          </div>
+
+          <div class="bench-card">
+            <div class="b-head">
+              <div style="flex:1;">
+                <div class="b-name">gemma-4 tuning silnika</div>
+                <div class="text-3 text-xs">Latencja + sweep kontekstu przed/po zmianach vLLM</div>
+              </div>
+              <span class="chip success"><span class="dot"></span>success</span>
+            </div>
+            <div class="b-meta">
+              <span class="chip"><svg class="icon"><use href="#i-server"/></svg>1 target</span>
+              <span class="chip"><svg class="icon"><use href="#i-flask"/></svg>2 testy</span>
+              <span class="chip info">gemma-4-31b (spark-cluster TP=2)</span>
+            </div>
+            <div class="b-last">
+              <svg class="icon icon-sm"><use href="#i-clock"/></svg>
+              Ostatni run: <strong>#12 · 01.07.2026 22:40</strong> · 18 min
+              <span class="ml-auto trend-label">decode t/s (5 runów)</span>
+              <svg class="sparkline" viewBox="0 0 90 24"><polyline points="2,15 23,15 44,14 66,8 88,6" stroke="#22c55e"/></svg>
+            </div>
+          </div>
+
+          <div class="bench-card">
+            <div class="b-head">
+              <div style="flex:1;">
+                <div class="b-name">Zewnętrzne API vs lokalne</div>
+                <div class="text-3 text-xs">claude-sonnet vs nasze serwisy — sama latencja pojedyncza</div>
+              </div>
+              <span class="chip accent"><span class="dot"></span>running</span>
+            </div>
+            <div class="b-meta">
+              <span class="chip"><svg class="icon"><use href="#i-server"/></svg>3 targety</span>
+              <span class="chip"><svg class="icon"><use href="#i-flask"/></svg>1 test</span>
+              <span class="chip info">gemma-4-31b · Qwen2.5-7B · claude-sonnet</span>
+            </div>
+            <div class="b-last">
+              <svg class="icon icon-sm"><use href="#i-clock"/></svg>
+              Run <strong>#13 w toku</strong> · start 02.07.2026 10:02 · elapsed 12 min
+              <span class="ml-auto trend-label">decode t/s (4 runy)</span>
+              <svg class="sparkline" viewBox="0 0 90 24"><polyline points="2,10 30,11 59,10 88,11" stroke="#60a5fa"/></svg>
+            </div>
+          </div>
+
+          <div class="bench-card">
+            <div class="b-head">
+              <div style="flex:1;">
+                <div class="b-name">Nocny regres 7B</div>
+                <div class="text-3 text-xs">Codzienny run pilnujący Qwen2.5-7B na rig24</div>
+              </div>
+              <span class="chip danger"><span class="dot"></span>failed</span>
+            </div>
+            <div class="b-meta">
+              <span class="chip"><svg class="icon"><use href="#i-server"/></svg>1 target</span>
+              <span class="chip"><svg class="icon"><use href="#i-flask"/></svg>4 testy</span>
+              <span class="chip info">Qwen2.5-7B (rig24, vLLM)</span>
+            </div>
+            <div class="b-last">
+              <svg class="icon icon-sm"><use href="#i-clock"/></svg>
+              Ostatni run: <strong>#11 · 30.06.2026 03:00</strong> · przerwany po 9 min (timeout)
+              <span class="ml-auto trend-label">decode t/s (14 runów)</span>
+              <svg class="sparkline" viewBox="0 0 90 24"><polyline points="2,8 14,9 26,8 38,9 50,8 62,9 74,8 88,20" stroke="#ef4444"/></svg>
+            </div>
+          </div>
+        </div>
+
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon" style="color:var(--accent-2)"><use href="#i-list"/></svg>Ostatnie runy</div>
+            <div class="hint">Historia wszystkich benchmarków · kliknij run, aby otworzyć wyniki</div>
+          </div>
+          <table class="tf-table">
+            <thead>
+              <tr><th>Run</th><th>Benchmark</th><th>Data startu</th><th class="num-r">Czas trwania</th><th class="num-r">Targety × testy</th><th>Status</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="mono">#13</td>
+                <td>Zewnętrzne API vs lokalne</td>
+                <td class="mono">02.07.2026 10:02</td>
+                <td class="num-r mono">12 min (trwa)</td>
+                <td class="num-r mono">3 × 1</td>
+                <td><span class="status-pill info">running</span></td>
+              </tr>
+              <tr>
+                <td class="mono">#14</td>
+                <td>LLM produkcyjne Q3</td>
+                <td class="mono">02.07.2026 09:14</td>
+                <td class="num-r mono">34 min</td>
+                <td class="num-r mono">3 × 4</td>
+                <td><span class="status-pill ok">success</span></td>
+              </tr>
+              <tr>
+                <td class="mono">#12</td>
+                <td>gemma-4 tuning silnika</td>
+                <td class="mono">01.07.2026 22:40</td>
+                <td class="num-r mono">18 min</td>
+                <td class="num-r mono">1 × 2</td>
+                <td><span class="status-pill ok">success</span></td>
+              </tr>
+              <tr>
+                <td class="mono">#11</td>
+                <td>Nocny regres 7B</td>
+                <td class="mono">30.06.2026 03:00</td>
+                <td class="num-r mono">9 min</td>
+                <td class="num-r mono">1 × 4</td>
+                <td><span class="status-pill err">failed</span></td>
+              </tr>
+              <tr>
+                <td class="mono">#10</td>
+                <td>LLM produkcyjne Q3</td>
+                <td class="mono">25.06.2026 09:00</td>
+                <td class="num-r mono">33 min</td>
+                <td class="num-r mono">3 × 4</td>
+                <td><span class="status-pill ok">success</span></td>
+              </tr>
+              <tr>
+                <td class="mono">#9</td>
+                <td>gemma-4 tuning silnika</td>
+                <td class="mono">24.06.2026 21:15</td>
+                <td class="num-r mono">19 min</td>
+                <td class="num-r mono">1 × 2</td>
+                <td><span class="status-pill ok">success</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

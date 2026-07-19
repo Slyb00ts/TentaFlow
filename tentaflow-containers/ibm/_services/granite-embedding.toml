@@ -3,6 +3,7 @@
 
 [engine]
 id = "granite-embedding"
+backend = "vllm"  # served by vLLM — drives gpu_memory_utilization + VRAM calculator
 provider = "ibm"
 category = "embeddings"
 name = "IBM Granite Embedding"

@@ -454,6 +454,26 @@ test('Input without label accepts a11y.label (reactive aria-label mirror)', () =
   assertEq(el.getAttribute('aria-label'), 'Search');
 });
 
+test('Input variant "ghost" adds class, default is outlined, bad value throws', () => {
+  setup();
+  const engine = makeEngine();
+  const ghost = mount(engine.render(comp(INPUT_TAG, inputFields({
+    3: { kind: 'literal', value: 'L' },
+    19: 'ghost',
+  }))));
+  assert(ghost.classList.contains('tf-input--variant-ghost'));
+
+  const plain = mount(engine.render(comp(INPUT_TAG, inputFields({
+    3: { kind: 'literal', value: 'L' },
+  }))));
+  assert(plain.classList.contains('tf-input--variant-outlined'));
+
+  assertThrows(() => engine.render(comp(INPUT_TAG, inputFields({
+    3: { kind: 'literal', value: 'L' },
+    19: 'framed',
+  }))));
+});
+
 test('Input unknown field key throws', () => {
   setup();
   const engine = makeEngine();
@@ -838,6 +858,26 @@ test('Textarea destroy unbinds store subscription', () => {
     ops: [{ path: PATH('body'), op: { kind: 'set', value: 'CHANGED' } }],
   });
   assertEq(ta.value, 'a');
+});
+
+test('Textarea variant "ghost" adds class, default is outlined, bad value throws', () => {
+  setup();
+  const engine = makeEngine();
+  const ghost = mount(engine.render(comp(TEXTAREA_TAG, textareaFields({
+    2: { kind: 'literal', value: 'L' },
+    15: 'ghost',
+  }))));
+  assert(ghost.classList.contains('tf-textarea--variant-ghost'));
+
+  const plain = mount(engine.render(comp(TEXTAREA_TAG, textareaFields({
+    2: { kind: 'literal', value: 'L' },
+  }))));
+  assert(plain.classList.contains('tf-textarea--variant-outlined'));
+
+  assertThrows(() => engine.render(comp(TEXTAREA_TAG, textareaFields({
+    2: { kind: 'literal', value: 'L' },
+    15: 'framed',
+  }))));
 });
 
 test('Textarea unknown field key throws', () => {

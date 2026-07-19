@@ -1,11 +1,10 @@
 // =============================================================================
 // Plik: routing/embeddings.rs
-// Opis: Obsluga zapytan o embeddingi przez flow_engine (stage 3d Universal
-//       Flow Gateway). Synthetic flow trigger → embeddings(model) → output
-//       aktywuje się gdy admin nie skonfigurował user-defined flow; backend
-//       dispatch idzie przez EmbeddingsDispatcherImpl → executor.execute_
-//       embeddings. `route_embeddings_via_quic` to mesh inbound EXEMPT —
-//       direct executor żeby zachować ultra-low latency LAN budżet.
+// Opis: Obsluga zapytan o embeddingi przez FlowDispatcher. Jawny flow gdy
+//       skonfigurowany; gdy brak — model embeddingów wykonywany bezpośrednio na
+//       executorze (EmbeddingsDispatcherImpl → executor.execute_embeddings).
+//       `route_embeddings_via_quic` to mesh inbound EXEMPT — direct executor
+//       żeby zachować ultra-low latency LAN budżet.
 // =============================================================================
 
 use crate::api::openai::types::{EmbeddingRequest, EmbeddingResponse};
@@ -101,10 +100,9 @@ impl Router {
 
         let t = std::time::Instant::now();
 
-        // Stage 3d Universal Flow Gateway: embeddings path zawsze przez
-        // FlowDispatcher. Synthetic flow `trigger → embeddings(model) →
-        // output` aktywuje się gdy admin nie skonfigurował user-defined flow.
-        // Direct executor.execute_embeddings fallback wycięty w 3d-0b-final.
+        // Embeddings path zawsze przez FlowDispatcher: jawny flow gdy
+        // skonfigurowany, inaczej model embeddingów wykonywany bezpośrednio na
+        // executorze (NotFound → direct execution wewnątrz dispatchera).
         if let Some(ref dispatcher) = self.flow_dispatcher {
             let (initial, meta) =
                 crate::services::runtime::executor::embeddings_request_to_initial_envelope(

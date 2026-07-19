@@ -30,9 +30,11 @@ RUN pip install --no-cache-dir \
       --extra-index-url https://wheels.vllm.ai/nightly/cu130 \
       vllm==0.23.0
 
-# hf CLI do pobierania zrodel safetensors z HF; hf_transfer = szybsze pobieranie.
-RUN pip install --no-cache-dir "huggingface_hub[cli,hf_transfer]"
-ENV HF_HUB_ENABLE_HF_TRANSFER=1
+# hf CLI do pobierania zrodel safetensors z HF. Xet wylaczony: klient Xet
+# zawiesza sie na tym hoscie (0 postepu, controller w kolko podbija concurrency),
+# wiec wymuszamy klasyczne pobieranie po HTTP, ktore dziala niezawodnie.
+RUN pip install --no-cache-dir "huggingface_hub[cli]"
+ENV HF_HUB_DISABLE_XET=1
 
 COPY tentaflow-containers/embeddings/docker/jina-embed/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh

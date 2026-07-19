@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Benchmark Studio · Kreator: testy (M3)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .wizard-foot {
+    display: flex; justify-content: space-between; align-items: center;
+    padding-top: 16px; border-top: 1px solid var(--border); margin-top: 4px;
+  }
+  .summary-bar {
+    display: flex; align-items: center; gap: 14px; padding: 12px 16px;
+    background: var(--accent-glow); border: 1px solid rgba(99,102,241,0.4);
+    border-radius: var(--radius); margin-top: 4px; margin-bottom: 16px; font-size: 12.5px;
+  }
+  .summary-bar .big { font-size: 14px; font-weight: 800; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+  <symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+  <symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+  <symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+  <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 14a2 2 0 1 0 2-2"/><path d="m13.4 12.6 3.6-3.6"/><path d="M3.2 17a9 9 0 1 1 17.6 0"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">M3</span>
+    <h2>Kreator benchmarku — krok 2/2: testy</h2>
+    <div class="desc">Zestaw testów z toggle włącz/wyłącz i parametrami. Każdy test jest uruchamiany dla każdego targetu; wynik = mean ± σ z N powtórzeń.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Analityka</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-trend"/></svg>Statystyki modeli</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr · Admin</div><div class="role">Euvic · Zarząd</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Analityka</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Benchmark Studio</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb current">Nowy benchmark · LLM produkcyjne Q3</span>
+        </div>
+
+        <div class="stepper">
+          <span class="step done"><span class="n">✓</span>Targety</span>
+          <span class="line"></span>
+          <span class="step active"><span class="n">2</span>Testy</span>
+        </div>
+
+        <div class="test-card on">
+          <div class="tc-head">
+            <span class="toggle on"></span>
+            <div style="flex:1;">
+              <div class="tc-name"><svg class="icon icon-sm" style="color:var(--accent-2);vertical-align:-2px;"><use href="#i-gauge"/></svg> Latencja pojedynczego zapytania</div>
+              <div class="tc-hint">Jeden request naraz — czyste TTFT, prefill i decode tok/s bez rywalizacji o GPU.</div>
+            </div>
+            <span class="chip">≈ 2 min / target</span>
+          </div>
+          <div class="tc-params">
+            <div class="tc-param"><label>Prompt tokens</label><input class="input mono" value="512"></div>
+            <div class="tc-param"><label>Gen tokens</label><input class="input mono" value="128"></div>
+            <div class="tc-param"><label>Powtórzenia</label><input class="input mono" value="5"></div>
+          </div>
+        </div>
+
+        <div class="test-card on">
+          <div class="tc-head">
+            <span class="toggle on"></span>
+            <div style="flex:1;">
+              <div class="tc-name"><svg class="icon icon-sm" style="color:var(--accent-2);vertical-align:-2px;"><use href="#i-layers"/></svg> Przepustowość — sweep równoległości</div>
+              <div class="tc-hint">Ten sam request przy rosnącej liczbie równoległych klientów — pokazuje throughput agregowany i spadek per-request.</div>
+            </div>
+            <span class="chip">≈ 6 min / target</span>
+          </div>
+          <div class="tc-params">
+            <div class="tc-param"><label>Poziomy równoległości</label><input class="input mono wide" value="1, 4, 16, 64"></div>
+            <div class="tc-param"><label>Prompt tokens</label><input class="input mono" value="512"></div>
+            <div class="tc-param"><label>Gen tokens</label><input class="input mono" value="128"></div>
+          </div>
+        </div>
+
+        <div class="test-card on">
+          <div class="tc-head">
+            <span class="toggle on"></span>
+            <div style="flex:1;">
+              <div class="tc-name"><svg class="icon icon-sm" style="color:var(--accent-2);vertical-align:-2px;"><use href="#i-zap"/></svg> Sweep kontekstu</div>
+              <div class="tc-hint">Jak TTFT i decode tok/s degradują z długością kontekstu — kluczowe dla RAG i długich rozmów.</div>
+            </div>
+            <span class="chip">≈ 4 min / target</span>
+          </div>
+          <div class="tc-params">
+            <div class="tc-param"><label>Długości promptu</label><input class="input mono wide" value="128, 2048, 8192, 32768"></div>
+            <div class="tc-param"><label>Gen tokens</label><input class="input mono" value="128"></div>
+            <div class="tc-param"><label>Powtórzenia</label><input class="input mono" value="3"></div>
+          </div>
+        </div>
+
+        <div class="test-card on">
+          <div class="tc-head">
+            <span class="toggle on"></span>
+            <div style="flex:1;">
+              <div class="tc-name"><svg class="icon icon-sm" style="color:var(--accent-2);vertical-align:-2px;"><use href="#i-clock"/></svg> Test stabilności (sustained load)</div>
+              <div class="tc-hint">Stały ruch przez dłuższy czas — wykrywa degradację, throttling termiczny i hangi, których nie widać w krótkich testach.</div>
+            </div>
+            <span class="chip">10 min / target</span>
+          </div>
+          <div class="tc-params">
+            <div class="tc-param"><label>Czas trwania</label><input class="input mono" value="10 min"></div>
+            <div class="tc-param"><label>Równoległość</label><input class="input mono" value="8"></div>
+            <div class="tc-param"><label>Prompt / gen tokens</label><input class="input mono" value="512 / 128"></div>
+          </div>
+        </div>
+
+        <div class="test-card off">
+          <div class="tc-head">
+            <span class="toggle"></span>
+            <div style="flex:1;">
+              <div class="tc-name"><svg class="icon icon-sm" style="vertical-align:-2px;"><use href="#i-zap"/></svg> Sweep długości generacji</div>
+              <div class="tc-hint">Stały prompt, rosnąca liczba generowanych tokenów — profil decode dla długich odpowiedzi.</div>
+            </div>
+            <span class="chip">wyłączony</span>
+          </div>
+        </div>
+
+        <div class="summary-bar">
+          <svg class="icon" style="color:var(--accent-2)"><use href="#i-clock"/></svg>
+          <span><span class="big">2 targety z mesh + 1 zewnętrzny × 4 testy</span> · szacowany czas całości: <span class="big">≈ 35 min</span></span>
+          <span class="ml-auto text-3 text-xs">Testy per target idą sekwencyjnie, targety równolegle (różne maszyny)</span>
+        </div>
+
+        <div class="wizard-foot">
+          <button class="btn btn-ghost">← Wstecz: targety</button>
+          <div class="flex gap-md align-center">
+            <button class="btn btn-secondary">Zapisz bez uruchamiania</button>
+            <button class="btn btn-primary btn-lg"><svg class="icon"><use href="#i-play"/></svg>Uruchom benchmark</button>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

@@ -36,7 +36,9 @@ fn db_err(e: impl std::fmt::Display) -> ProtocolError {
 }
 
 fn to_detail(summary: ProjectSummary) -> MlStudioProjectDetail {
+    let dataset_count = summary.dataset_count;
     let model_count = summary.model_count;
+    let training_count = summary.training_count;
     let role = summary.role;
     let is_owner = summary.is_owner;
     let p = summary.project;
@@ -48,7 +50,9 @@ fn to_detail(summary: ProjectSummary) -> MlStudioProjectDetail {
         status: p.status,
         owner_user_id: p.owner_user_id,
         org_id: p.org_id,
+        dataset_count,
         model_count,
+        training_count,
         role,
         is_owner,
         created_at: p.created_at,
@@ -1331,6 +1335,132 @@ pub fn ml_studio_dataset_profile(
     )))
 }
 
+/// Zwraca WIERSZE datasetu (surowe linie JSONL) do podglądu/edycji w GUI. Generyczne
+/// — działa dla {question,answer}, {prompt,chosen,rejected} i innych kształtów.
+#[handler(variant = "MlStudioDatasetRowsRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_dataset_rows(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::DatasetRowsRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioDatasetRowsRequest")),
+    };
+    let org = require_org(ctx)?;
+    let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+    // Dataset w trakcie generacji / nowo utworzony (row_count==0) nie ma jeszcze
+    // raw_data — to NIE błąd, zwracamy 0 wierszy + pochodzenie (meta). Ale realny
+    // błąd DB dla NIEPUSTEGO datasetu MUSI się wypropagować — inaczej GUI dostałoby
+    // fałszywie pusty wynik i późniejszy zapis nadpisałby prawdziwe dane pustką.
+    let raw = match repository::get_dataset_raw(&org.user_id, &payload.dataset_id) {
+        Ok(r) => r,
+        Err(_) if dataset.row_count == 0 => Vec::new(),
+        Err(e) => return Err(db_err(e)),
+    };
+    let text = String::from_utf8_lossy(&raw);
+    let all: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    let total = all.len() as u32;
+    let rows = match payload.limit {
+        Some(n) if n > 0 => all.into_iter().take(n as usize).collect(),
+        _ => all,
+    };
+    // Pochodzenie (distill_meta) + status generacji (pending) z profile_json — do GUI.
+    let profile = serde_json::from_str::<serde_json::Value>(&dataset.profile_json).ok();
+    let meta = profile
+        .as_ref()
+        .and_then(|p| p.get("distill_meta").cloned())
+        .filter(|m| !m.is_null())
+        .map(|m| m.to_string());
+    let pending = profile
+        .as_ref()
+        .and_then(|p| p.get("distill_status").and_then(|v| v.as_str()))
+        .map_or(false, |s| s == "pending");
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::DatasetRowsResponse(
+        tentaflow_protocol::MlStudioDatasetRowsResponse {
+            dataset_id: payload.dataset_id.clone(),
+            kind: dataset.kind,
+            total,
+            rows,
+            meta,
+            pending,
+        },
+    )))
+}
+
+/// Nadpisuje zawartość datasetu ręcznie edytowanymi wierszami (JSONL). Waliduje, że
+/// każdy wiersz to poprawny obiekt JSON. Wymaga roli edytora projektu.
+#[handler(variant = "MlStudioDatasetRowsSaveRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_dataset_rows_save(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::DatasetRowsSaveRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioDatasetRowsSaveRequest")),
+    };
+    let org = require_org(ctx)?;
+    let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+    require_project_editor(&org.user_id, &dataset.project_id)?;
+
+    // GUARD: dataset w trakcie generacji (distill_status=pending) NIE może być
+    // edytowany — zapis oznaczyłby pending jako completed i kolidował z tłem
+    // dopisującym wygenerowane pary. Edycja dopiero po zakończeniu generacji.
+    let is_pending = serde_json::from_str::<serde_json::Value>(&dataset.profile_json)
+        .ok()
+        .and_then(|p| p.get("distill_status").and_then(|v| v.as_str()).map(str::to_string))
+        .map_or(false, |s| s == "pending");
+    if is_pending {
+        return Err(ProtocolError::bad_request(
+            "dataset jest w trakcie generacji — edycja możliwa po zakończeniu",
+        ));
+    }
+
+    // Każdy wiersz musi być poprawnym obiektem JSON — raw_data trzymamy jako JSONL.
+    let mut clean: Vec<String> = Vec::with_capacity(payload.rows.len());
+    for (i, r) in payload.rows.iter().enumerate() {
+        let t = r.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(t).map_err(|e| {
+            ProtocolError::bad_request(format!("wiersz {} nie jest poprawnym JSON: {}", i + 1, e))
+        })?;
+        if !v.is_object() {
+            return Err(ProtocolError::bad_request(format!(
+                "wiersz {} nie jest obiektem JSON",
+                i + 1
+            )));
+        }
+        clean.push(t.to_string());
+    }
+    let row_count = clean.len() as u64;
+    let mut jsonl = clean.join("\n");
+    if !jsonl.is_empty() {
+        jsonl.push('\n');
+    }
+    repository::update_dataset_data(&org.user_id, &payload.dataset_id, row_count, jsonl.as_bytes())
+        .map_err(db_err)?;
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::DatasetRowsSaveResponse(
+        tentaflow_protocol::MlStudioDatasetRowsSaveResponse {
+            dataset_id: payload.dataset_id.clone(),
+            row_count: row_count as u32,
+        },
+    )))
+}
+
 #[handler(variant = "MlStudioTabularTrainRequest", since = (1, 0))]
 #[policy(PowerUser)]
 #[observed]
@@ -1663,6 +1793,144 @@ pub fn ml_studio_training_runs_list(
     )))
 }
 
+#[handler(variant = "MlStudioJobsOverviewRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub async fn ml_studio_jobs_overview(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::MlStudioBody(MlStudioPayload::JobsOverviewRequest(_)) => {}
+        _ => return Err(ProtocolError::bad_request("expected MlStudioJobsOverviewRequest")),
+    };
+    let org = require_org(ctx)?;
+    let rows = repository::list_active_runs_for_user(&org.user_id).map_err(db_err)?;
+
+    let mut jobs = Vec::with_capacity(rows.len());
+    for r in rows {
+        // kind/variant z config_json runu (tolerancyjnie — brak = "").
+        let cfg = serde_json::from_str::<serde_json::Value>(&r.config_json).ok();
+        let kind = cfg
+            .as_ref()
+            .and_then(|c| c.get("kind")?.as_str().map(String::from))
+            .unwrap_or_default();
+        let variant = cfg
+            .as_ref()
+            .and_then(|c| c.get("variant")?.as_str().map(String::from))
+            .unwrap_or_default();
+
+        // Live-view z serwisu treningowego (tylko lokalne joby mają wpis; brak =
+        // defaulty). total_epochs bierzemy z serwisu, a gdy 0 — z config_json.
+        let lv = crate::ml_studio::live_view::fetch_local_live_view(&r.run_id).await;
+        let total_epochs = if lv.total_epochs > 0 {
+            lv.total_epochs
+        } else {
+            generic_total_epochs(&r.config_json)
+        };
+
+        jobs.push(tentaflow_protocol::TrainingJobInfo {
+            run_id: r.run_id,
+            project_id: r.project_id,
+            project_name: r.project_name,
+            kind,
+            variant,
+            status: r.status,
+            epoch: lv.epoch,
+            total_epochs,
+            eta_s: lv.eta_s,
+            elapsed_s: lv.elapsed_s,
+            gpu_mem_mb: lv.gpu_mem_mb,
+            stage: lv.stage,
+            started_at: r.started_at.unwrap_or_default(),
+        });
+    }
+
+    let gpu = tokio::task::spawn_blocking(crate::ml_studio::live_view::gpu_stats)
+        .await
+        .unwrap_or_else(|_| tentaflow_protocol::GpuStats {
+            name: String::new(),
+            mem_used_mb: 0,
+            mem_total_mb: 0,
+            util_pct: 0,
+        });
+
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::JobsOverviewResponse(
+        tentaflow_protocol::MlStudioJobsOverviewResponse { jobs, gpu },
+    )))
+}
+
+/// Rekoncyliacja statusu inferencji przy ODCZYCIE. `inference_status` w metrykach
+/// to snapshot z chwili deployu, a serwis żyje asynchronicznie (późny fail przy
+/// wolnym loadzie, restart, usunięcie). Dla deployu LOKALNEGO nadpisujemy status
+/// ŻYWYM stanem serwisu (match po sparsowanym `gguf_path`), żeby UI nie kierował
+/// chatu do modelu, który nigdy nie wstał albo padł po deployu. Deploy ZDALNY
+/// (inny węzeł) zostawiamy ze snapshotem — jego serwis nie żyje w naszym rejestrze.
+fn reconcile_local_inference_status(
+    ctx: &HandlerContext,
+    models: Vec<ModelSummary>,
+) -> Vec<ModelSummary> {
+    use crate::services_repo::services::ServiceStatus;
+    let local_node = ctx.state.local_node_id.to_string();
+    let live: std::collections::HashMap<String, &'static str> = ctx
+        .state
+        .db
+        .read()
+        .ok()
+        .and_then(|conn| crate::services_repo::services::list_all(&conn).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.engine_id == "llama-cpp" || r.engine_id == "mlx")
+        .filter_map(|r| {
+            let mf = serde_json::from_str::<serde_json::Value>(&r.config_json)
+                .ok()?
+                .get("model_file")?
+                .as_str()?
+                .to_string();
+            let s = match r.status {
+                ServiceStatus::Running => "deployed",
+                ServiceStatus::Deploying | ServiceStatus::Starting => "deploying",
+                _ => "failed",
+            };
+            Some((mf, s))
+        })
+        .collect();
+
+    models
+        .into_iter()
+        .map(|mut m| {
+            let Ok(mut metrics) = serde_json::from_str::<serde_json::Value>(&m.metrics_json) else {
+                return m;
+            };
+            let Some(obj) = metrics.as_object_mut() else {
+                return m;
+            };
+            // Tylko modele KIEDYŚ deployowane (mają linkage) i LOKALNIE.
+            if !obj.contains_key("inference_model_name") {
+                return m;
+            }
+            let node = obj.get("inference_node").and_then(|v| v.as_str()).unwrap_or("");
+            if !node.is_empty() && node != local_node {
+                return m;
+            }
+            // Match po RZECZYWISTEJ ścieżce serwowanej (`inference_model_file` z
+            // deployu; fallback `gguf_path` dla starszych metryk). Bez tego deploy
+            // lokalny artefaktu przeniesionego ze zdalnego węzła (gguf_path=zdalna
+            // ścieżka) byłby błędnie oznaczany jako failed. Brak żywego serwisu =
+            // serwis padł/usunięty → failed.
+            let real = obj
+                .get("inference_model_file")
+                .and_then(|v| v.as_str())
+                .or_else(|| obj.get("gguf_path").and_then(|v| v.as_str()))
+                .and_then(|g| live.get(g).copied())
+                .unwrap_or("failed");
+            obj.insert("inference_status".to_string(), serde_json::json!(real));
+            m.metrics_json = metrics.to_string();
+            m
+        })
+        .collect()
+}
+
 #[handler(variant = "MlStudioModelsListRequest", since = (1, 0))]
 #[policy(PowerUser)]
 #[observed]
@@ -1676,8 +1944,8 @@ pub fn ml_studio_models_list(
     };
     let org = require_org(ctx)?;
     require_project_member(&org.user_id, &payload.project_id)?;
-    let models = repository::list_models(&payload.project_id)
-        .map_err(db_err)?
+    let models = repository::list_models(&payload.project_id).map_err(db_err)?;
+    let models = reconcile_local_inference_status(ctx, models)
         .into_iter()
         .map(to_model)
         .collect();
@@ -1932,6 +2200,92 @@ pub async fn ml_studio_ft_train_start(
             )))
         }
     }
+}
+
+#[handler(variant = "MlStudioDistillGenerateRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub async fn ml_studio_distill_generate(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::DistillGenerateRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioDistillGenerateRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    repository::get_project(&org.user_id, &payload.project_id).map_err(db_err)?;
+    require_project_editor(&org.user_id, &payload.project_id)?;
+
+    if payload.teacher_model.trim().is_empty() {
+        return Err(ProtocolError::bad_request("teacher_model jest wymagany"));
+    }
+
+    let dataset_id = crate::ml_studio::distill::spawn_distill_generation(
+        ctx.state.router.clone(),
+        org.user_id.clone(),
+        payload.clone(),
+    )
+    .map_err(|e| ProtocolError::internal(e.to_string()))?;
+
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::DistillGenerateResponse(
+            tentaflow_protocol::MlStudioDistillGenerateResponse {
+                dataset_id,
+                status: "generating".to_string(),
+            },
+        ),
+    ))
+}
+
+#[handler(variant = "MlStudioDistillGenerateStatusRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub async fn ml_studio_distill_generate_status(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::DistillGenerateStatusRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioDistillGenerateStatusRequest",
+            ))
+        }
+    };
+    // Autoryzacja: postep widoczny TYLKO dla usera z dostepem do datasetu.
+    // get_dataset jest auth-scoped (None gdy user nie jest czlonkiem projektu) —
+    // bez tego dowolny user moglby pollowac status cudzego datasetu po id.
+    let org = require_org(ctx)?;
+    if repository::get_dataset(&org.user_id, &payload.dataset_id)
+        .map_err(db_err)?
+        .is_none()
+    {
+        return Err(ProtocolError::not_found("dataset not found"));
+    }
+    let resp = match crate::ml_studio::distill::distill_status(&payload.dataset_id) {
+        Some(p) => tentaflow_protocol::MlStudioDistillGenerateStatusResponse {
+            status: p.status,
+            total: p.total,
+            done: p.done,
+            error: p.error,
+            samples: p.samples,
+        },
+        None => tentaflow_protocol::MlStudioDistillGenerateStatusResponse {
+            status: "unknown".to_string(),
+            total: 0,
+            done: 0,
+            error: None,
+            samples: Vec::new(),
+        },
+    };
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::DistillGenerateStatusResponse(resp),
+    ))
 }
 
 #[handler(variant = "MlStudioFtTrainStatusRequest", since = (1, 0))]
@@ -2367,6 +2721,10 @@ pub async fn ml_studio_recog_train_status(
                         sync_bytes_sent: sp.bytes_sent,
                         sync_bytes_total: sp.bytes_total,
                         sync_rate_bps: 0,
+                        eta_s: 0.0,
+                        elapsed_s: 0.0,
+                        gpu_mem_mb: 0.0,
+                        stage: String::new(),
                     },
                 )));
             }
@@ -2395,6 +2753,10 @@ pub async fn ml_studio_recog_train_status(
                         sync_bytes_sent: sp.bytes_sent,
                         sync_bytes_total: sp.bytes_total,
                         sync_rate_bps: sp.rate_bps,
+                        eta_s: 0.0,
+                        elapsed_s: 0.0,
+                        gpu_mem_mb: 0.0,
+                        stage: String::new(),
                     },
                 )));
             }
@@ -2467,6 +2829,9 @@ pub async fn ml_studio_recog_train_status(
     let train_loss = last.and_then(|p| p.train_loss);
     let map50 = last.and_then(|p| p.map50);
 
+    // Live-view z serwisu (tylko lokalny job ma wpis; zdalny/sprzątnięty = default).
+    let lv = crate::ml_studio::live_view::fetch_local_live_view(&payload.run_id).await;
+
     Ok(MessageBody::MlStudioBody(MlStudioPayload::RecogTrainStatusResponse(
         tentaflow_protocol::MlStudioRecogTrainStatusResponse {
             run_id: payload.run_id.clone(),
@@ -2484,8 +2849,425 @@ pub async fn ml_studio_recog_train_status(
             sync_bytes_sent: 0,
             sync_bytes_total: 0,
             sync_rate_bps: 0,
+            eta_s: lv.eta_s,
+            elapsed_s: lv.elapsed_s,
+            gpu_mem_mb: lv.gpu_mem_mb,
+            stage: lv.stage,
         },
     )))
+}
+
+#[handler(variant = "MlStudioClassifierTrainStartRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub async fn ml_studio_classifier_train_start(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::ClassifierTrainStartRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioClassifierTrainStartRequest")),
+    };
+    let org = require_org(ctx)?;
+    repository::get_project(&org.user_id, &payload.project_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
+    require_project_editor(&org.user_id, &payload.project_id)?;
+
+    if !matches!(
+        payload.variant.as_str(),
+        "mobilenetv4" | "efficientnet_b0" | "resnet50"
+    ) {
+        return Err(ProtocolError::bad_request(
+            "variant must be mobilenetv4|efficientnet_b0|resnet50",
+        ));
+    }
+    if payload.attribute.trim().is_empty() {
+        return Err(ProtocolError::bad_request("attribute nie może być puste"));
+    }
+    if payload.values.len() < 2 {
+        return Err(ProtocolError::bad_request(
+            "klasyfikator wymaga co najmniej 2 wartości atrybutu",
+        ));
+    }
+    // Treść atrybutu i wartości trafia po stronie serwisu do metadanych/ścieżek —
+    // whitelist znaków, bez pustych i `.`/`..`/separatorów ścieżek (path traversal).
+    let is_valid_ml_name = |s: &str| -> bool {
+        let t = s.trim();
+        if t.is_empty() || t == "." || t == ".." {
+            return false;
+        }
+        let n = s.chars().count();
+        n >= 1
+            && n <= 64
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | ' '))
+    };
+    if !is_valid_ml_name(&payload.attribute) {
+        return Err(ProtocolError::bad_request(
+            "attribute zawiera niedozwolone znaki (dozwolone: [A-Za-z0-9_.- ], 1-64 znaki)",
+        ));
+    }
+    for value in &payload.values {
+        if !is_valid_ml_name(value) {
+            return Err(ProtocolError::bad_request(
+                "wartość atrybutu zawiera niedozwolone znaki (dozwolone: [A-Za-z0-9_.- ], 1-64 znaki)",
+            ));
+        }
+    }
+
+    // Mesh-distributed: węzeł docelowy. Pusty/local → trening lokalny.
+    let local_node = ctx.state.local_node_id.to_string();
+    let target_node = {
+        let t = payload.target_node_id.trim();
+        if t.is_empty() || t == local_node {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    };
+
+    let hp = &payload.hyperparams;
+    let config_json = serde_json::json!({
+        "kind": "classifier",
+        "attribute": payload.attribute,
+        "source_class": payload.source_class,
+        "variant": payload.variant,
+        "values": payload.values,
+        "dataset_id": payload.dataset_id,
+        "node_id": target_node.clone().unwrap_or_else(|| local_node.clone()),
+        "hyperparams": {
+            "epochs": hp.epochs,
+            "batch_size": hp.batch_size,
+            "learning_rate": hp.learning_rate,
+            "image_size": hp.image_size,
+            "freeze_backbone": hp.freeze_backbone,
+        },
+    })
+    .to_string();
+
+    let run_id = repository::create_training_run(&payload.project_id, &config_json).map_err(db_err)?;
+
+    let target_was_remote = target_node.is_some();
+    match target_node {
+        None => {
+            // Trening LOKALNY — task w tle.
+            crate::ml_studio::train_classifier::spawn_classifier_training(
+                run_id.clone(),
+                payload.project_id.clone(),
+                org.user_id.clone(),
+                payload.dataset_id.clone(),
+                payload.attribute.clone(),
+                payload.source_class.clone(),
+                payload.variant.clone(),
+                payload.values.clone(),
+                payload.hyperparams.clone(),
+            );
+        }
+        Some(target) => {
+            // Trening ZDALNY (Node B): dataset COCO → mesh (content-addr po hashu),
+            // po zmaterializowaniu start treningu klasyfikatora na B (kind="classifier").
+            let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
+                .map_err(db_err)?
+                .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+            if dataset.kind != "coco_path" {
+                let _ = repository::update_training_run_status(&run_id, "failed");
+                return Err(ProtocolError::bad_request(
+                    "trening zdalny wymaga datasetu COCO przez ścieżkę (coco_path) widoczną na węźle B",
+                ));
+            }
+            let raw = repository::get_dataset_raw(&org.user_id, &payload.dataset_id).map_err(db_err)?;
+            let dataset_dir = String::from_utf8_lossy(&raw).trim().to_string();
+            let dataset_hash = crate::ml_studio::train_recognition::coco_content_hash(
+                std::path::Path::new(&dataset_dir),
+            )
+            .map_err(|e| ProtocolError::bad_request(format!("hash datasetu: {}", e)))?;
+            let spec_json = serde_json::json!({
+                "kind": "classifier",
+                "dataset_dir": format!("mesh:{}", dataset_hash),
+                "dataset_hash": dataset_hash,
+                "attribute": payload.attribute,
+                "source_class": payload.source_class,
+                "values": payload.values,
+                "variant": payload.variant,
+                "output_dir": format!("classifier/{}/{}", payload.project_id, run_id),
+                "hyperparams": {
+                    "epochs": hp.epochs,
+                    "batch_size": hp.batch_size,
+                    "learning_rate": hp.learning_rate,
+                    "image_size": hp.image_size,
+                    "freeze_backbone": hp.freeze_backbone,
+                },
+            })
+            .to_string();
+
+            let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
+                ProtocolError::internal("mesh transport not available on this node")
+            })?;
+            let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
+                let _ = repository::update_training_run_status(&run_id, "failed");
+                ProtocolError::internal("mesh security niedostępny — nie można zweryfikować zaufania peera")
+            })?;
+            if !security.is_trusted(&target) {
+                let _ = repository::update_training_run_status(&run_id, "failed");
+                return Err(ProtocolError::bad_request(format!("peer {} is not trusted", target)));
+            }
+
+            let _ = repository::update_training_run_status(&run_id, "syncing");
+            crate::ml_studio::train_recognition::spawn_mesh_dataset_push_and_train(
+                iroh,
+                target,
+                run_id.clone(),
+                dataset_dir,
+                dataset_hash,
+                spec_json,
+            );
+        }
+    }
+
+    let start_status = if target_was_remote { "syncing" } else { "running" };
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::ClassifierTrainStartResponse(
+        tentaflow_protocol::MlStudioClassifierTrainStartResponse {
+            run_id,
+            status: start_status.to_string(),
+        },
+    )))
+}
+
+#[handler(variant = "MlStudioGenericTrainStatusRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub async fn ml_studio_generic_train_status(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::GenericTrainStatusRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected MlStudioGenericTrainStatusRequest")),
+    };
+    let org = require_org(ctx)?;
+    let mut run = repository::get_training_run(&payload.run_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "run not found"))?;
+    require_project_member(&org.user_id, &run.project_id)?;
+
+    // Faza transferu datasetu przez mesh (trening zdalny, przed startem na B):
+    // zwróć postęp B/s zamiast odpytywać B. Współdzielony rejestr postępu z recog.
+    if let Some(sp) = crate::ml_studio::train_recognition::recog_sync_progress(&payload.run_id) {
+        match sp.phase.as_str() {
+            "error" => {
+                let _ = repository::update_training_run_status(&payload.run_id, "failed");
+                crate::ml_studio::train_recognition::clear_recog_sync(&payload.run_id);
+                return Ok(MessageBody::MlStudioBody(MlStudioPayload::GenericTrainStatusResponse(
+                    tentaflow_protocol::MlStudioGenericTrainStatusResponse {
+                        run_id: payload.run_id.clone(),
+                        status: "failed".to_string(),
+                        epoch: 0,
+                        total_epochs: generic_total_epochs(&run.config_json),
+                        curve: Vec::new(),
+                        error: sp.error.clone().unwrap_or_default(),
+                        sync_phase: Some("error".to_string()),
+                        sync_bytes_sent: sp.bytes_sent,
+                        sync_bytes_total: sp.bytes_total,
+                        sync_rate_bps: 0,
+                        eta_s: 0.0,
+                        elapsed_s: 0.0,
+                        gpu_mem_mb: 0.0,
+                        stage: String::new(),
+                    },
+                )));
+            }
+            "training" => {
+                if run.status != "running" {
+                    let _ = repository::update_training_run_status(&payload.run_id, "running");
+                    run.status = "running".to_string();
+                }
+                crate::ml_studio::train_recognition::clear_recog_sync(&payload.run_id);
+            }
+            _ => {
+                return Ok(MessageBody::MlStudioBody(MlStudioPayload::GenericTrainStatusResponse(
+                    tentaflow_protocol::MlStudioGenericTrainStatusResponse {
+                        run_id: payload.run_id.clone(),
+                        status: "syncing".to_string(),
+                        epoch: 0,
+                        total_epochs: generic_total_epochs(&run.config_json),
+                        curve: Vec::new(),
+                        error: String::new(),
+                        sync_phase: Some(sp.phase.clone()),
+                        sync_bytes_sent: sp.bytes_sent,
+                        sync_bytes_total: sp.bytes_total,
+                        sync_rate_bps: sp.rate_bps,
+                        eta_s: 0.0,
+                        elapsed_s: 0.0,
+                        gpu_mem_mb: 0.0,
+                        stage: String::new(),
+                    },
+                )));
+            }
+        }
+    }
+
+    // Run ZDALNY (node_id != local i wciąż running): odpytaj Node B przez mesh,
+    // zapisz metryki w bazie A, domknij run po stronie A po sukcesie/błędzie.
+    let local_node = ctx.state.local_node_id.to_string();
+    let run_node = serde_json::from_str::<serde_json::Value>(&run.config_json)
+        .ok()
+        .and_then(|c| c.get("node_id")?.as_str().map(String::from));
+    if let Some(node) = run_node.filter(|n| *n != local_node) {
+        if run.status == "running" {
+            if let Some(iroh) = ctx.state.quic_mesh.clone() {
+                let cmd = tentaflow_protocol::mesh::MeshCommandType::MlTrainStatus {
+                    run_id: payload.run_id.clone(),
+                };
+                let mut ok = false;
+                if let Ok(resp) = iroh.send_command_and_wait(&node, cmd, 30).await {
+                    if resp.ok {
+                        if let tentaflow_protocol::mesh::MeshCommandResponsePayload::MlTrainStatusResult {
+                            status_json,
+                        } = resp.payload
+                        {
+                            sync_remote_classifier_status(&payload.run_id, &run, &status_json);
+                            if let Ok(Some(updated)) = repository::get_training_run(&payload.run_id) {
+                                run = updated;
+                            }
+                            ok = true;
+                        }
+                    }
+                }
+                if !ok
+                    && crate::ml_studio::train_recognition::note_remote_poll(&payload.run_id, false)
+                {
+                    let _ = repository::set_training_run_error(
+                        &payload.run_id,
+                        "węzeł treningowy nieosiągalny — trening przerwany",
+                    );
+                    let _ = repository::update_training_run_status(&payload.run_id, "failed");
+                    if let Ok(Some(updated)) = repository::get_training_run(&payload.run_id) {
+                        run = updated;
+                    }
+                } else if ok {
+                    crate::ml_studio::train_recognition::note_remote_poll(&payload.run_id, true);
+                }
+            }
+        }
+    }
+
+    let curve_raw = repository::generic_curve_for_run(&payload.run_id).map_err(db_err)?;
+    let curve: Vec<tentaflow_protocol::GenericMetricPoint> = curve_raw
+        .iter()
+        .map(|(epoch, name, value)| tentaflow_protocol::GenericMetricPoint {
+            epoch: (*epoch).max(0) as i32,
+            metric_name: name.clone(),
+            value: *value as f32,
+        })
+        .collect();
+
+    let epoch = curve_raw.iter().map(|(e, _, _)| *e).max().unwrap_or(0).max(0) as i32;
+    let total_epochs = generic_total_epochs(&run.config_json);
+    // Błąd treningu (np. z węzła B) zapisany w config_json.$.error — zwróć go do UI.
+    let run_error = serde_json::from_str::<serde_json::Value>(&run.config_json)
+        .ok()
+        .and_then(|c| c.get("error")?.as_str().map(String::from))
+        .filter(|_| run.status == "failed")
+        .unwrap_or_default();
+
+    // Live-view z serwisu (tylko lokalny job ma wpis; zdalny/sprzątnięty = default).
+    let lv = crate::ml_studio::live_view::fetch_local_live_view(&payload.run_id).await;
+
+    Ok(MessageBody::MlStudioBody(MlStudioPayload::GenericTrainStatusResponse(
+        tentaflow_protocol::MlStudioGenericTrainStatusResponse {
+            run_id: payload.run_id.clone(),
+            status: run.status,
+            epoch,
+            total_epochs,
+            curve,
+            error: run_error,
+            sync_phase: None,
+            sync_bytes_sent: 0,
+            sync_bytes_total: 0,
+            sync_rate_bps: 0,
+            eta_s: lv.eta_s,
+            elapsed_s: lv.elapsed_s,
+            gpu_mem_mb: lv.gpu_mem_mb,
+            stage: lv.stage,
+        },
+    )))
+}
+
+/// Synchronizuje status zdalnego runu klasyfikatora (z Node B) do bazy A: zapisuje
+/// metryki per epoka i po sukcesie rejestruje model (framework="classifier-timm").
+fn sync_remote_classifier_status(
+    run_id: &str,
+    run: &repository::TrainingRunRow,
+    status_json: &str,
+) {
+    let st: serde_json::Value = match serde_json::from_str(status_json) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let status = st.get("status").and_then(|v| v.as_str()).unwrap_or("running");
+    let epoch = st.get("epoch").and_then(|v| v.as_i64()).unwrap_or(0);
+    let train_loss = st.get("train_loss").and_then(|v| v.as_f64());
+    let val_acc = st.get("val_acc").and_then(|v| v.as_f64());
+    let val_macro_f1 = st.get("val_macro_f1").and_then(|v| v.as_f64());
+    if let Some(v) = train_loss {
+        let _ = repository::record_training_metric(run_id, epoch, "train_loss", v);
+    }
+    if let Some(v) = val_acc {
+        let _ = repository::record_training_metric(run_id, epoch, "val_acc", v);
+    }
+    if let Some(v) = val_macro_f1 {
+        let _ = repository::record_training_metric(run_id, epoch, "val_macro_f1", v);
+    }
+
+    match status {
+        "succeeded" => {
+            let cfg: serde_json::Value =
+                serde_json::from_str(&run.config_json).unwrap_or(serde_json::json!({}));
+            let attribute = cfg.get("attribute").and_then(|v| v.as_str()).unwrap_or("");
+            let source_class = cfg.get("source_class").and_then(|v| v.as_str()).unwrap_or("");
+            let variant = cfg.get("variant").and_then(|v| v.as_str()).unwrap_or("mobilenetv4");
+            let values = cfg.get("values").cloned().unwrap_or(serde_json::json!([]));
+            let metrics_json = serde_json::json!({
+                "task": "classifier",
+                "attribute": attribute,
+                "source_class": source_class,
+                "values": values,
+                "val_acc": val_acc,
+                "val_macro_f1": val_macro_f1,
+                "onnx_path": st.get("onnx_path").and_then(|v| v.as_str()).unwrap_or(""),
+                "checkpoint_path": st.get("checkpoint_path").and_then(|v| v.as_str()).unwrap_or(""),
+            })
+            .to_string();
+            let model_name = format!("classifier-{}-{}", attribute, variant);
+            if let Ok(model_id) = repository::insert_model(
+                &run.project_id,
+                &model_name,
+                "classifier-timm",
+                variant,
+                &metrics_json,
+            ) {
+                let _ = repository::set_training_run_model(run_id, &model_id);
+            }
+            let _ = repository::update_training_run_status(run_id, "succeeded");
+        }
+        "failed" => {
+            if let Some(err) = st.get("error").and_then(|v| v.as_str()).filter(|e| !e.is_empty()) {
+                let _ = repository::set_training_run_error(run_id, err);
+            }
+            let _ = repository::update_training_run_status(run_id, "failed");
+        }
+        _ => {}
+    }
+}
+
+/// Odczytuje `hyperparams.epochs` z `config_json` runu (total dla paska postępu
+/// generycznego statusu). 0 gdy nieznane.
+fn generic_total_epochs(config_json: &str) -> i32 {
+    serde_json::from_str::<serde_json::Value>(config_json)
+        .ok()
+        .and_then(|v| v.get("hyperparams")?.get("epochs")?.as_i64())
+        .unwrap_or(0) as i32
 }
 
 /// Wspólny resolver: dataset recognition (coco_path) → katalog na dysku + check
@@ -3026,6 +3808,58 @@ pub fn ml_studio_ft_export_status(
     )))
 }
 
+/// Po zaakceptowanym deployu (`service_manifest_deploy` Ok) serwis inferencji
+/// ładuje się ASYNCHRONICZNIE, więc Ok nie znaczy „serwuje". Odpytujemy realny
+/// status serwisu (match po `engine_id` + `model_file` w config_json) przez krótkie
+/// okno, żeby `inference_status` odzwierciedlał prawdę zamiast optymistycznego
+/// „deployed". „deploying" gdy w oknie nie osiągnął stanu terminalnego — UI dopyta.
+async fn resolve_inference_deploy_status(
+    ctx: &HandlerContext,
+    engine_id: &str,
+    model_file: &str,
+) -> (String, Option<String>) {
+    use crate::services_repo::services::ServiceStatus;
+    for i in 0..8 {
+        if i > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        }
+        let row = ctx.state.db.read().ok().and_then(|conn| {
+            crate::services_repo::services::list_all(&conn).ok().and_then(|rows| {
+                rows.into_iter().find(|r| {
+                    // Match po SPARSOWANYM polu `model_file` (nie substring na surowym
+                    // JSON): na Windows ścieżki mają `\`, które w JSON są escapowane
+                    // (`C:\\...`), więc `contains` na surowcu chybia poprawny serwis.
+                    r.engine_id == engine_id
+                        && serde_json::from_str::<serde_json::Value>(&r.config_json)
+                            .ok()
+                            .and_then(|c| {
+                                c.get("model_file")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string)
+                            })
+                            .as_deref()
+                            == Some(model_file)
+                })
+            })
+        });
+        match row.map(|r| (r.status, r.health_last_err)) {
+            Some((ServiceStatus::Running, _)) => return ("deployed".to_string(), None),
+            Some((ServiceStatus::Failed, err)) | Some((ServiceStatus::Degraded, err)) => {
+                return (
+                    "failed".to_string(),
+                    Some(err.unwrap_or_else(|| "serwis inferencji nie wystartował".to_string())),
+                );
+            }
+            _ => {}
+        }
+    }
+    // Okno minęło bez stanu terminalnego (wolny load): fallback „deployed" —
+    // deploy został przyjęty i najpewniej się zestawia. NIE „deploying", bo nic
+    // nie synchronizuje metryk później → UI zostałby w nieskończonym pollingu.
+    // Szybkie porażki (brak backendu/OOM/zły GGUF) i tak łapiemy w oknie powyżej.
+    ("deployed".to_string(), None)
+}
+
 /// DEPLOY wytrenowanego modelu FT (lokalny GGUF po eksporcie) jako embedded
 /// serwisu inferencji llama.cpp. Domyka cykl FT: trenuj→eksportuj→DEPLOY→używaj.
 /// Reużywa istniejącego `service_manifest_deploy` (engine `llama-cpp`, `native`
@@ -3169,20 +4003,25 @@ pub async fn ml_studio_ft_deploy(
         )
         .await
         {
-            // Deploy lokalny jest synchroniczny — sukces = serwis już wystartował,
-            // więc status odpowiedzi „deployed" (spójny z `inference_status` w metrykach
-            // i z obsługą w UI, które dla „deployed" zamyka modal od razu, bez pollingu).
-            Ok(_) => ("deployed".to_string(), None),
+            // service_manifest_deploy Ok = deploy PRZYJĘTY; serwis ładuje się
+            // asynchronicznie (health), więc Ok != „serwuje". Sprawdzamy realny
+            // status serwisu, żeby inference_status nie kłamał „deployed" przy
+            // nieudanym starcie (brak backendu, OOM, zły GGUF).
+            Ok(_) => resolve_inference_deploy_status(ctx, engine_id, &deploy_path).await,
             Err(e) => ("failed".to_string(), Some(e.to_string())),
         };
         let mut merged = metrics.clone();
         if let Some(obj) = merged.as_object_mut() {
             obj.insert("inference_model_name".to_string(), serde_json::json!(model_name));
+            // RZECZYWISTA ścieżka serwowana (po ew. transferze z węzła zdalnego) —
+            // rekoncyliacja matchuje serwis po niej, bo `gguf_path` może wskazywać
+            // oryginalną (zdalną) lokalizację artefaktu, nie plik faktycznie ładowany.
+            obj.insert("inference_model_file".to_string(), serde_json::json!(deploy_path));
             obj.insert(
                 "inference_status".to_string(),
-                serde_json::json!(if error.is_none() { "deployed" } else { "failed" }),
+                serde_json::json!(status),
             );
-            if error.is_none() {
+            if status == "deployed" {
                 obj.insert("inference_node".to_string(), serde_json::json!(deploy_node));
             }
         }
@@ -3521,6 +4360,519 @@ pub async fn ml_studio_ft_chat(
     )))
 }
 
+// ----- Vision model registry (publish / list / delete) -----
+
+/// Sidecar `classes.json` written next to the exported ONNX by both training
+/// services: `{classes, resolution}` (rfdetr) or `{classes, image_size}`
+/// (classifier). The class ORDER here is the export-time index order the ONNX
+/// head was built with, so it is authoritative for the registry row.
+#[derive(serde::Deserialize)]
+struct OnnxSidecar {
+    classes: Vec<String>,
+    #[serde(default)]
+    resolution: Option<u32>,
+    #[serde(default)]
+    image_size: Option<u32>,
+}
+
+/// Canonicalizes `candidate` (resolving every symlink component) and requires
+/// containment under the canonicalized ML artifacts root — the only place
+/// training checkpoints/exports legitimately live (`ARTIFACTS_ROOT` handed to
+/// the training services is exactly `paths::ml_artifacts_dir()`). A symlink
+/// that points outside the root fails the containment check after resolution,
+/// so `metrics_json`-supplied and training-service-returned paths cannot make
+/// publish read arbitrary files.
+fn contained_artifact_file(candidate: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let root = crate::paths::ml_artifacts_dir()
+        .canonicalize()
+        .map_err(|e| format!("katalog artefaktów ML niedostępny: {e}"))?;
+    let canon = candidate
+        .canonicalize()
+        .map_err(|e| format!("ścieżka {} nieosiągalna: {e}", candidate.display()))?;
+    if !canon.starts_with(&root) {
+        return Err(format!(
+            "ścieżka {} wykracza poza katalog artefaktów ML",
+            candidate.display()
+        ));
+    }
+    if !canon.is_file() {
+        return Err(format!("{} nie jest plikiem", canon.display()));
+    }
+    Ok(canon)
+}
+
+/// Locates (or produces) the exported ONNX for a trained model and returns
+/// `(onnx_path, sidecar)`, both canonicalized and contained under the ML
+/// artifacts root. RF-DETR models without a persisted `onnx_path` trigger the
+/// real export on the rfdetr-training service (async /export + poll);
+/// classifiers use the synchronous /export of classifier-training. The
+/// resulting path is persisted back into the model metrics so a re-publish
+/// skips the export.
+async fn locate_or_export_onnx(
+    model: &crate::ml_studio::repository::ModelRow,
+    metrics: &serde_json::Value,
+) -> Result<(std::path::PathBuf, OnnxSidecar), String> {
+    let existing = metrics
+        .get("onnx_path")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
+        .map(|p| contained_artifact_file(&p))
+        .transpose()?;
+
+    let onnx_path = if let Some(path) = existing {
+        path
+    } else {
+        let checkpoint = metrics
+            .get("checkpoint_path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "model bez checkpoint_path — trening nie zapisał artefaktu".to_string()
+            })?
+            .to_string();
+        let output_dir = format!("exports/vision-publish/{}", model.model_id);
+        let exported = match model.framework.as_str() {
+            "rfdetr" => {
+                let class_names: Vec<String> = metrics
+                    .get("class_names")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if class_names.is_empty() {
+                    return Err("model bez class_names".to_string());
+                }
+                let variant = metrics
+                    .get("variant")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("base")
+                    .to_string();
+                let resolution = metrics
+                    .get("resolution")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+                    .unwrap_or(560);
+                crate::ml_studio::train_recognition::run_export(
+                    checkpoint,
+                    class_names,
+                    variant,
+                    resolution,
+                    output_dir,
+                )
+                .await
+                .map_err(|e| {
+                    cleanup_publish_export_dir(&model.model_id);
+                    format!("eksport ONNX: {e:#}")
+                })?
+            }
+            "classifier-timm" => {
+                let values: Vec<String> = metrics
+                    .get("values")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if values.len() < 2 {
+                    return Err("model klasyfikatora bez listy klas (values)".to_string());
+                }
+                crate::ml_studio::train_classifier::run_export(
+                    checkpoint,
+                    model.base_model.clone(),
+                    values,
+                    output_dir,
+                )
+                .await
+                .map_err(|e| {
+                    cleanup_publish_export_dir(&model.model_id);
+                    format!("eksport ONNX: {e:#}")
+                })?
+            }
+            other => {
+                return Err(format!(
+                    "framework '{other}' nie jest publikowalny do rejestru vision"
+                ))
+            }
+        };
+        // Containment covers the training-service-returned path exactly like
+        // the metrics-supplied one (both roots are ARTIFACTS_ROOT).
+        let path = contained_artifact_file(std::path::Path::new(&exported)).inspect_err(|_| {
+            // A failed/absent export may have left partial local output —
+            // remove the publish export dir so retries start clean.
+            cleanup_publish_export_dir(&model.model_id);
+        })?;
+        // Persist the export result so re-publish reuses it.
+        let mut updated = metrics.clone();
+        if let Some(obj) = updated.as_object_mut() {
+            obj.insert(
+                "onnx_path".to_string(),
+                serde_json::json!(path.to_string_lossy()),
+            );
+            let _ = repository::update_model_metrics(&model.model_id, &updated.to_string());
+        }
+        path
+    };
+
+    let sidecar_candidate = onnx_path
+        .parent()
+        .map(|d| d.join("classes.json"))
+        .ok_or_else(|| format!("{} nie ma katalogu nadrzędnego", onnx_path.display()))?;
+    let sidecar_path = contained_artifact_file(&sidecar_candidate).map_err(|e| {
+        format!("brak classes.json obok {} — wyeksportuj model ponownie ({e})", onnx_path.display())
+    })?;
+    let sidecar: OnnxSidecar = std::fs::read(&sidecar_path)
+        .map_err(|e| format!("odczyt {}: {e}", sidecar_path.display()))
+        .and_then(|bytes| {
+            serde_json::from_slice(&bytes)
+                .map_err(|e| format!("parse {}: {e}", sidecar_path.display()))
+        })?;
+    if sidecar.classes.is_empty() {
+        return Err(format!("{} nie zawiera klas", sidecar_path.display()));
+    }
+    Ok((onnx_path, sidecar))
+}
+
+/// Best-effort removal of the local publish-export directory
+/// (`ARTIFACTS_ROOT/exports/vision-publish/<model_id>`) after a failed or
+/// timed-out export, so partial output does not accumulate. The training
+/// services expose NO export-cancel endpoint (rfdetr-training: /train,
+/// /status, /export, /export_status, /detect only) — an abandoned export
+/// worker finishes on its own and releases its slot; we can only clean the
+/// artifacts it may have produced.
+fn cleanup_publish_export_dir(model_id: &str) {
+    let dir = crate::paths::ml_artifacts_dir()
+        .join("exports")
+        .join("vision-publish")
+        .join(model_id);
+    if dir.is_dir() {
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!("vision publish: cleanup {}: {e}", dir.display());
+        }
+    }
+}
+
+/// Stages the exported ONNX into `vision_models_dir()` as a temp file and
+/// returns `(sha256, temp_path)`. The caller promotes the temp to the final
+/// registry file name with `rename` ONLY after the DB transaction commits,
+/// and removes the temp on every failure path (blocking I/O — call via
+/// spawn_blocking).
+fn stage_into_vision_dir(
+    src: &std::path::Path,
+    file_name: &str,
+) -> anyhow::Result<(String, std::path::PathBuf)> {
+    use sha2::{Digest, Sha256};
+    let dir = crate::paths::vision_models_dir();
+    std::fs::create_dir_all(&dir)?;
+    let bytes = std::fs::read(src)?;
+    let digest = Sha256::digest(&bytes);
+    let sha256: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let temp = dir.join(format!(
+        ".staging-{}-{}",
+        std::process::id(),
+        file_name
+    ));
+    std::fs::write(&temp, &bytes)?;
+    Ok((sha256, temp))
+}
+
+#[handler(variant = "MlStudioVisionModelPublishRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub async fn ml_studio_vision_model_publish(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::VisionModelPublishRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioVisionModelPublishRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    let model = repository::get_model(&payload.model_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "model not found"))?;
+    require_project_member(&org.user_id, &model.project_id)?;
+
+    let respond = |ok: bool, error: Option<String>| {
+        Ok(MessageBody::MlStudioBody(
+            MlStudioPayload::VisionModelPublishResponse(
+                tentaflow_protocol::MlStudioVisionModelPublishResponse { ok, error },
+            ),
+        ))
+    };
+
+    // The registry name becomes the on-disk file name — validate it with the
+    // repository rule BEFORE any export/filesystem work so `../x` never
+    // reaches a `Path::join`.
+    if let Err(e) = crate::db::repository::validate_vision_model_name(&payload.model_name) {
+        return respond(false, Some(e));
+    }
+
+    let metrics: serde_json::Value = serde_json::from_str(&model.metrics_json)
+        .map_err(|e| ProtocolError::internal(format!("stored metrics corrupt: {}", e)))?;
+
+    // The ONNX artifact lives on the node that trained the model — model files
+    // never sync, so publish must run there (the registry ROW then replicates
+    // and other nodes reach inference through the mesh camera_cv forward).
+    let local_node = ctx.state.local_node_id.to_string();
+    if let Some(node) = metrics
+        .get("node_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != local_node)
+    {
+        return respond(
+            false,
+            Some(format!(
+                "artefakty modelu żyją na węźle '{node}' — uruchom publikację na tym węźle"
+            )),
+        );
+    }
+
+    let (expected_op, contract) = match model.framework.as_str() {
+        "rfdetr" => ("detect", "rfdetr"),
+        "classifier-timm" => ("classify", "softmax"),
+        other => {
+            return respond(
+                false,
+                Some(format!(
+                    "framework '{other}' nie jest publikowalny do rejestru vision"
+                )),
+            )
+        }
+    };
+    if payload.op != expected_op {
+        return respond(
+            false,
+            Some(format!(
+                "model '{}' publikuje się jako op '{}', nie '{}'",
+                model.name, expected_op, payload.op
+            )),
+        );
+    }
+
+    let (onnx_path, sidecar) = match locate_or_export_onnx(&model, &metrics).await {
+        Ok(v) => v,
+        Err(e) => return respond(false, Some(e)),
+    };
+
+    let resolution = match (expected_op, sidecar.resolution, sidecar.image_size) {
+        ("detect", Some(r), _) => r,
+        ("classify", _, Some(s)) => s,
+        _ => {
+            return respond(
+                false,
+                Some("classes.json obok ONNX nie zawiera rozdzielczości wejścia".to_string()),
+            )
+        }
+    };
+    // Both training pipelines normalize with the ImageNet transform; encode it
+    // explicitly so the runner never has to guess.
+    let preprocess_json = serde_json::json!({
+        "resolution": resolution,
+        "mean": [0.485, 0.456, 0.406],
+        "std": [0.229, 0.224, 0.225],
+        "layout": "nchw",
+    })
+    .to_string();
+
+    // Stage the ONNX as a temp file first; the final registry file name only
+    // appears after the DB transaction (row + optional alias) commits, so a
+    // failed registration never leaves a half-published file behind.
+    let file_name = format!("{}.onnx", payload.model_name);
+    let (sha256, temp_path) = {
+        let src = onnx_path.clone();
+        let file_name = file_name.clone();
+        match tokio::task::spawn_blocking(move || stage_into_vision_dir(&src, &file_name))
+            .await
+            .map_err(|e| ProtocolError::internal(format!("copy task: {e}")))?
+        {
+            Ok(v) => v,
+            Err(e) => return respond(false, Some(format!("kopiowanie ONNX: {e:#}"))),
+        }
+    };
+
+    let alias = payload
+        .alias
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let row = crate::db::repository::VisionModelRow {
+        model_name: payload.model_name.clone(),
+        op: expected_op.to_string(),
+        file_name: file_name.clone(),
+        sha256,
+        classes_json: serde_json::to_string(&sidecar.classes)
+            .unwrap_or_else(|_| "[]".to_string()),
+        preprocess_json,
+        output_contract: contract.to_string(),
+        source: "trained".to_string(),
+        default_threshold: payload.threshold,
+        org_id: org.org_id.clone(),
+        project_id: Some(model.project_id.clone()),
+        source_model_id: Some(model.model_id.clone()),
+        created_at: 0,
+        updated_at: 0,
+    };
+    // Registry row and alias mutate in ONE transaction (see
+    // `register_vision_model`) — a concurrent delete cannot interleave between
+    // them and leave the alias pointing at a deleted model.
+    if let Err(e) = crate::db::repository::register_vision_model(&ctx.state.db, &row, alias) {
+        let _ = std::fs::remove_file(&temp_path);
+        return respond(false, Some(e.to_string()));
+    }
+    let final_path = crate::paths::vision_models_dir().join(&file_name);
+    if let Err(e) = std::fs::rename(&temp_path, &final_path) {
+        // The row is committed but the file is not in place; the onnx-cv
+        // reconciler skips file-less rows, so nothing broken is advertised.
+        let _ = std::fs::remove_file(&temp_path);
+        return respond(
+            false,
+            Some(format!("promocja pliku ONNX nieudana: {e}")),
+        );
+    }
+
+    if alias.is_some() {
+        // Alias committed with the row — refresh the router cache/catalog and
+        // broadcast the alias snapshot to the mesh.
+        crate::services::models::broadcast_alias_mutation(
+            &ctx.state.db,
+            &ctx.state.router,
+            &ctx.state.quic_mesh,
+        );
+    }
+
+    crate::services::onnx_cv_service::reconcile_and_announce(&ctx.state);
+    respond(true, None)
+}
+
+#[handler(variant = "MlStudioVisionModelsListRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_vision_models_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    match req {
+        MessageBody::MlStudioBody(MlStudioPayload::VisionModelsListRequest(_)) => {}
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioVisionModelsListRequest",
+            ))
+        }
+    }
+    let org = require_org(ctx)?;
+    let models = crate::db::repository::list_vision_models(&ctx.state.db, Some(&org.org_id))
+        .map_err(|e| ProtocolError::internal(format!("vision models list: {e:#}")))?
+        .into_iter()
+        .map(|r| tentaflow_protocol::MlStudioVisionModelInfo {
+            classes: serde_json::from_str(&r.classes_json).unwrap_or_default(),
+            model_name: r.model_name,
+            op: r.op,
+            file_name: r.file_name,
+            sha256: r.sha256,
+            source: r.source,
+            default_threshold: r.default_threshold,
+            created_at: r.created_at,
+        })
+        .collect();
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::VisionModelsListResponse(
+            tentaflow_protocol::MlStudioVisionModelsListResponse { models },
+        ),
+    ))
+}
+
+#[handler(variant = "MlStudioVisionModelDeleteRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_vision_model_delete(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::VisionModelDeleteRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioVisionModelDeleteRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    let respond = |ok: bool, error: Option<String>| {
+        Ok(MessageBody::MlStudioBody(
+            MlStudioPayload::VisionModelDeleteResponse(
+                tentaflow_protocol::MlStudioVisionModelDeleteResponse { ok, error },
+            ),
+        ))
+    };
+    // Provenance-based authorization (mirror of publish): a row published from
+    // an ML Studio project may be deleted by that project's members; rows
+    // without provenance (imported/synced) fall back to admin-only.
+    let existing = crate::db::repository::get_vision_model(&ctx.state.db, &payload.model_name)
+        .map_err(|e| ProtocolError::internal(format!("vision model read: {e:#}")))?
+        .filter(|r| r.org_id == org.org_id);
+    let Some(existing) = existing else {
+        return respond(
+            false,
+            Some(format!("vision model not found: {}", payload.model_name)),
+        );
+    };
+    match existing.project_id.as_deref() {
+        Some(project_id) => require_project_member(&org.user_id, project_id)?,
+        None => {
+            let pool = crate::db::global_pool()
+                .ok_or_else(|| ProtocolError::internal("core user directory unavailable"))?;
+            let is_admin = crate::db::repository::get_user_role(&pool, &org.user_id)
+                .map_err(db_err)?
+                .map(|(_, is_admin)| is_admin)
+                .unwrap_or(false);
+            if !is_admin {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::PolicyDenied,
+                    "modele bez powiązanego projektu może usuwać tylko administrator",
+                ));
+            }
+        }
+    }
+    let deleted = match crate::db::repository::delete_vision_model(
+        &ctx.state.db,
+        &payload.model_name,
+        Some(&org.org_id),
+    ) {
+        Ok(row) => row,
+        Err(e) => return respond(false, Some(e.to_string())),
+    };
+    // Remove the local ONNX only when no other registry row shares the file
+    // (e.g. the same export published under two names).
+    let still_referenced = crate::db::repository::list_vision_models_all(&ctx.state.db)
+        .map(|rows| rows.iter().any(|r| r.file_name == deleted.file_name))
+        .unwrap_or(true);
+    if !still_referenced {
+        let path = crate::paths::vision_models_dir().join(&deleted.file_name);
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("vision model delete: remove {}: {e}", path.display());
+            }
+        }
+        let trt_cache = crate::paths::vision_models_dir()
+            .join("trt-cache")
+            .join(&deleted.model_name);
+        let _ = std::fs::remove_dir_all(trt_cache);
+    }
+    crate::services::onnx_cv_service::reconcile_and_announce(&ctx.state);
+    respond(true, None)
+}
+
 /// Wmergowuje `export_status="running"` w istniejące metryki modelu, zerując
 /// pola wyniku poprzedniego eksportu (ponowny eksport zaczyna od czysta).
 fn set_export_status_running(metrics: &serde_json::Value) -> String {
@@ -3533,5 +4885,16 @@ fn set_export_status_running(metrics: &serde_json::Value) -> String {
     obj.insert("gguf_path".to_string(), serde_json::Value::Null);
     obj.insert("gguf_size_bytes".to_string(), serde_json::Value::Null);
     obj.insert("export_error".to_string(), serde_json::Value::Null);
+    // Nowy eksport unieważnia poprzedni deployment: stary serwis (jeśli żyje)
+    // serwuje NIEAKTUALNY artefakt. Czyścimy linkage inferencji, żeby rekoncyliacja
+    // nie raportowała starego deployu jako bieżącego ani nie kierowała tam chatu.
+    for key in [
+        "inference_status",
+        "inference_model_name",
+        "inference_model_file",
+        "inference_node",
+    ] {
+        obj.remove(key);
+    }
     root.to_string()
 }

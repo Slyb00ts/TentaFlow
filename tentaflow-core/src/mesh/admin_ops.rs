@@ -939,12 +939,16 @@ pub fn revoke_trust(
         let revoked_id = node_id.to_string();
         security.mark_revoking(node_id);
         tokio::spawn(async move {
-            // Wyslij PRZED revoke — klucze szyfrowania jeszcze istnieja.
+            // Wyslij PRZED revoke — klucze szyfrowania jeszcze istnieja. Wariant
+            // ACKED: czekamy (do 5s) az peer potwierdzi odbior, zanim ponizej
+            // zamkniemy polaczenie — inaczej `Connection::close` moze porzucic
+            // jeszcze niedostarczona notyfikacje (quinn: finish() nie czeka na peera).
             if let Err(e) = qm
-                .send_ufp2_to_peer(
+                .send_ufp2_to_peer_acked(
                     &revoked_id,
                     tentaflow_protocol::mesh::MESH_MSG_TRUST_REVOKED,
                     &data,
+                    std::time::Duration::from_secs(5),
                 )
                 .await
             {
@@ -967,8 +971,12 @@ pub fn revoke_trust(
             // can't route a command to it before the QUIC idle disconnect fires.
             crate::mesh::robot_dispatch::global().remove_node(&revoked_id);
             sec.clear_revoking(&revoked_id);
-            // Nie disconnectujemy — kaskadowe disconnect powodowaly failujace broadcasty.
-            // Connection umrze po QUIC idle timeout (60s).
+            // Disconnect DOPIERO po ACK-owanej notyfikacji i unpair. Bariera ACK
+            // (send_ufp2_to_peer_acked) gwarantuje, ze peer odebral TrustRevoked
+            // zanim tu zamkniemy polaczenie — bez tego `Connection::close` moze
+            // porzucic niedostarczone dane. Bez disconnectu heartbeat peera
+            // trzymalby polaczenie QUIC otwarte w nieskonczonosc (zajety slot).
+            qm.disconnect_peer(&revoked_id).await;
         });
     } else {
         security.mark_revoking(node_id);

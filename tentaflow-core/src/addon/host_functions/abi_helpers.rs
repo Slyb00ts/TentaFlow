@@ -30,6 +30,9 @@ pub enum PayloadKind {
     /// jadą OSOBNYM ptr/len (nie w CBOR), więc 64 KB na metadane wystarcza z
     /// zapasem i NIE ogranicza rozmiaru wgrywanego dokumentu.
     DocumentMeta,
+    /// stt_transcribe — audio inline w CBOR (max 25 MB, lustro limitu REST
+    /// `/v1/audio/transcriptions`).
+    AudioInline,
 }
 
 impl PayloadKind {
@@ -43,6 +46,7 @@ impl PayloadKind {
             Self::UiRender => 2 * 1024 * 1024,
             Self::Secret => 64 * 1024,
             Self::DocumentMeta => 64 * 1024,
+            Self::AudioInline => 25 * 1024 * 1024,
         }
     }
 }

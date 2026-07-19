@@ -49,6 +49,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                     ttft_ms: 0,
                     prefill_tps: 0.0,
                     decode_tps: 0.0,
+                    total_ms: 0,
                 })),
             );
             return;
@@ -101,16 +102,27 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             tools: None,
             tool_choice: None,
             n: None,
-            memory_options: None,
+            // The dashboard conversation id IS the flow session id — thread it
+            // so `conversation_history` / `memory` nodes in the selected flow
+            // have a session key (without it Agent-style flows hard-fail with
+            // "no session_id"). memory_options is the only carrier the flow
+            // builder reads (build_initial_envelope_inner).
+            memory_options: stream_req.session_id.clone().map(|sid| {
+                crate::api::openai::types::MemoryOptions {
+                    session_id: Some(sid),
+                    ..Default::default()
+                }
+            }),
             audio_input: None,
         };
 
-        // Selektor flow z UI czatu: konkretny flow po ID albo synthetic
-        // "Default Chat". Celowo NIE Auto — Auto rozwiązuje default flow z DB
-        // (edytowalny w Flow Builderze), a UI czatu ma jawny wybór flow.
+        // Selektor flow z UI czatu: konkretny flow po ID albo "Default Chat".
+        // "Default Chat" = Auto: czysty model / alias→model wykonywany wprost na
+        // backendzie (bez flow, bez pii). Tylko flow published as a model /
+        // alias→flow trafia w flow engine.
         let flow_selector = match stream_req.flow_id.clone() {
             Some(flow_id) => crate::routing::streaming::ChatFlowSelector::FlowId(flow_id),
-            None => crate::routing::streaming::ChatFlowSelector::Synthetic,
+            None => crate::routing::streaming::ChatFlowSelector::Auto,
         };
         // Realny zalogowany użytkownik z sesji → atrybucja zużycia tokenów i kwot
         // per-user (bez tego AiGateway zapisywałby zużycie na sentinel __system__).
@@ -143,6 +155,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                         ttft_ms: 0,
                         prefill_tps: 0.0,
                         decode_tps: 0.0,
+                        total_ms: 0,
                     })),
                 );
                 return;
@@ -266,6 +279,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                 ttft_ms: perf.ttft_ms,
                 prefill_tps: perf.prefill_tps,
                 decode_tps: perf.decode_tps,
+                total_ms: perf.total_ms,
             })),
         )
         .await;
@@ -1449,6 +1463,109 @@ inventory::submit! {
 }
 
 // =============================================================================
+// BenchmarkRunStream — live progres runu Benchmark Studio.
+// =============================================================================
+// Front subskrybuje przez ApiBinary.subscribe('benchmarkRunStreamRequest',
+// { runId }). Reużywamy tę samą szynę (log_bus) co deployment: StartRun emituje
+// BusMessage::Line/End pod kluczem = run_id. Handler mapuje je na
+// BenchmarkBody(RunStreamChunk/RunStreamEnd). Brak replayu z DB — postęp jest
+// best-effort live; ostateczne wyniki front pobiera przez RunResults/RunStatus.
+
+fn benchmark_run_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscription>) {
+    use tentaflow_protocol::BenchmarkPayload;
+
+    let run_id = match req {
+        MessageBody::BenchmarkBody(BenchmarkPayload::RunStreamRequest { run_id }) => run_id,
+        _ => {
+            let _ = push_end(&sub, None);
+            return;
+        }
+    };
+
+    // Autoryzacja: subskrybent musi mieć benchmark.read w swojej org, a run musi
+    // należeć do tej org (IDOR guard — inaczej każdy zalogowany user znający run_id
+    // mógłby podglądać cudze logi/postęp).
+    let org_id = match ctx.org_context.as_ref() {
+        Some(org) if org.has("benchmark.read") => org.org_id.clone(),
+        _ => {
+            let _ = push_end(&sub, None);
+            return;
+        }
+    };
+    match crate::db::repository::get_benchmark_run(&ctx.state.db, &org_id, &run_id) {
+        Ok(Some(_)) => {}
+        _ => {
+            // Brak runu w tej org (nie istnieje lub należy do innej org) → odmowa.
+            let _ = push_end(&sub, None);
+            return;
+        }
+    }
+
+    tokio::spawn(async move {
+        let mut rx = match crate::deploy::log_bus::subscribe(&run_id) {
+            Some(r) => r,
+            None => {
+                // Kanał zamknięty — run już skończony (albo nie istnieje). Front
+                // rekoncyliuje stan przez RunStatus/RunResults.
+                let _ = push_end(&sub, None);
+                return;
+            }
+        };
+
+        use crate::deploy::log_bus::BusMessage;
+        loop {
+            match rx.recv().await {
+                Ok(BusMessage::Line(line)) => {
+                    let chunk = BenchmarkPayload::RunStreamChunk {
+                        run_id: line.deploy_id,
+                        kind: line.kind,
+                        phase: line.phase,
+                        line: line.line,
+                        progress_pct: line.progress_pct,
+                        ts_ms: line.ts_ms,
+                    };
+                    if push_chunk(&sub, MessageBody::BenchmarkBody(chunk)).is_err() {
+                        return;
+                    }
+                }
+                Ok(BusMessage::End {
+                    deploy_id,
+                    final_status,
+                    error_message,
+                    ..
+                }) => {
+                    let error = if error_message.is_empty() {
+                        None
+                    } else {
+                        Some(error_message)
+                    };
+                    let end = BenchmarkPayload::RunStreamEnd {
+                        run_id: deploy_id,
+                        status: final_status,
+                        error,
+                    };
+                    let _ = push_end(&sub, Some(MessageBody::BenchmarkBody(end)));
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    let _ = push_end(&sub, None);
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+    });
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "BenchmarkRunStreamRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: benchmark_run_stream_handler,
+    }
+}
+
+// =============================================================================
 // Testy
 // =============================================================================
 
@@ -1636,6 +1753,7 @@ mod tests {
             temperature: None,
             max_tokens: None,
             flow_id: None,
+            session_id: None,
         });
         let ctx = HandlerContext {
             session: SessionAuth::UserSession {

@@ -411,11 +411,26 @@ impl MeshCommandExecutor {
                 )
                 .await;
                 CommandResponse::ok(MeshCommandResponsePayload::DistributedReadinessResult {
+                    container_running: st.container_running,
                     ray_gcs_up: st.ray_gcs_up,
                     ray_nodes: st.ray_nodes,
                     serve_ready: st.serve_ready,
                     error: st.error,
                 })
+            }
+            MeshCommandType::DistributedStartServe {
+                deployment_cluster_id,
+                serve_cmd,
+            } => {
+                match crate::services::deploy::distributed::exec_serve_on_head(
+                    &deployment_cluster_id,
+                    &serve_cmd,
+                )
+                .await
+                {
+                    Ok(()) => CommandResponse::ok(MeshCommandResponsePayload::Empty),
+                    Err(e) => CommandResponse::fail(e),
+                }
             }
             MeshCommandType::ServiceUpdateRemote {
                 service_id,
@@ -501,6 +516,45 @@ impl MeshCommandExecutor {
             MeshCommandType::RobotControl { request_cbor } => {
                 self.handle_robot_control(from_node_id, request_cbor).await
             }
+            MeshCommandType::EnsureModelLocal {
+                deployment_cluster_id,
+                model_repo,
+                engine_id,
+            } => {
+                self.handle_ensure_model_local(
+                    from_node_id,
+                    deployment_cluster_id,
+                    model_repo,
+                    engine_id,
+                )
+                .await
+            }
+            MeshCommandType::ModelPresentLocal {
+                deployment_cluster_id,
+                model_repo,
+            } => {
+                if let Err(e) =
+                    self.authorize_cluster_deploy_peer(from_node_id, &deployment_cluster_id)
+                {
+                    return CommandResponse::fail(e);
+                }
+                let present =
+                    crate::services::deploy::distributed::model_snapshot_dir(&model_repo).is_some();
+                CommandResponse::ok(MeshCommandResponsePayload::ModelPresentResult { present })
+            }
+            MeshCommandType::PushModelToPeer {
+                deployment_cluster_id,
+                model_repo,
+                target_node_id,
+            } => {
+                self.handle_push_model_to_peer(
+                    from_node_id,
+                    deployment_cluster_id,
+                    model_repo,
+                    target_node_id,
+                )
+                .await
+            }
         }
     }
 
@@ -539,6 +593,169 @@ impl MeshCommandExecutor {
                     error: None,
                 },
             ),
+            Err(e) => CommandResponse::ok(MeshCommandResponsePayload::MlArtifactPushResult {
+                target_path: String::new(),
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+
+    /// Autoryzacja komendy P0 cluster-deploy (EnsureModelLocal / ModelPresentLocal /
+    /// PushModelToPeer). Rekord deploymentu (`cluster_deployments`) zyje WYLACZNIE w
+    /// DB koordynatora — NIGDY nie jest synchronizowany przez mesh, wiec odbiorca nie
+    /// moze rozwiazac `deployment_cluster_id` lokalnie. Zamiast tego dowiazujemy do
+    /// SYNCHRONIZOWANEJ przynaleznosci klastra (`cluster_members`, replikowana przez
+    /// `MESH_MSG_ROUTING_SYNC`): nadawca komendy (koordynator/head deployu) ORAZ TEN
+    /// wezel musza byc czlonkami jednego wspolnego klastra. To zamienia „dowolny
+    /// zaufany peer" w „peer, ktory dzieli z nami klaster" — najsilniejsze wiazanie
+    /// weryfikowalne po stronie odbiorcy. `deployment_cluster_id` jest logowany do
+    /// korelacji z deployem. Zwraca `cluster_id` wspolnego klastra.
+    fn authorize_cluster_deploy_peer(
+        &self,
+        from_node_id: &str,
+        deployment_cluster_id: &str,
+    ) -> Result<String, String> {
+        let all = crate::db::repository::list_all_cluster_members(&self.security.db)
+            .map_err(|e| format!("odczyt czlonkow klastra: {e}"))?;
+        // Koordynator (nadawca) moze orkiestrowac deploy z wezla SPOZA compute-clustra
+        // (trigger z dowolnego zaufanego admin-node) — jego node_id nie musi byc w
+        // `cluster_members`. Zaufanie nadawcy jest juz wymuszone przez warstwe mesh
+        // (komenda nie dotarlaby do execute od niesparowanego peera). Po stronie
+        // odbiorcy weryfikujemy to, co ma sens: TEN wezel jest czlonkiem klastra
+        // (operacje P0 na modelu dotycza tylko wezlow klastra). Zwracany cluster_id
+        // ogranicza cel `PushModelToPeer` do wspolczlonkow tego samego klastra.
+        let my_cluster = all
+            .iter()
+            .find(|m| m.node_id == self.local_node_id)
+            .map(|m| m.cluster_id.clone());
+        match my_cluster {
+            Some(cluster_id) => {
+                debug!(
+                    from = %from_node_id,
+                    deployment = %deployment_cluster_id,
+                    cluster = %cluster_id,
+                    "autoryzacja komendy P0 cluster-deploy OK (odbiorca jest czlonkiem klastra)"
+                );
+                Ok(cluster_id)
+            }
+            None => {
+                warn!(
+                    from = %from_node_id,
+                    deployment = %deployment_cluster_id,
+                    "odrzucono komende P0 cluster-deploy: ten wezel nie jest czlonkiem zadnego klastra"
+                );
+                Err("unauthorized: this node is not a cluster member".to_string())
+            }
+        }
+    }
+
+    /// Czy `node_id` jest czlonkiem klastra `cluster_id` (wg synchronizowanej
+    /// przynaleznosci). Uzywane przez `PushModelToPeer`, zeby ograniczyc cel
+    /// transferu do czlonkow tego samego klastra co nadawca.
+    fn node_in_cluster(&self, node_id: &str, cluster_id: &str) -> bool {
+        crate::db::repository::list_cluster_members(&self.security.db, cluster_id)
+            .map(|members| members.iter().any(|m| m.node_id == node_id))
+            .unwrap_or(false)
+    }
+
+    /// P0 cluster deploy (odbiorca = head zdalny): upewnia się, że model jest w
+    /// lokalnym cache HF; pobiera go jeśli brak. `HF_TOKEN` bierzemy z WŁASNEGO
+    /// secure setting tego węzła — token nigdy nie leci przez mesh.
+    async fn handle_ensure_model_local(
+        &self,
+        from_node_id: &str,
+        deployment_cluster_id: String,
+        model_repo: String,
+        engine_id: String,
+    ) -> CommandResponse {
+        if let Err(e) = self.authorize_cluster_deploy_peer(from_node_id, &deployment_cluster_id) {
+            return CommandResponse::fail(e);
+        }
+        let hf_token = crate::db::repository::get_setting_secure(
+            &self.security.db,
+            "hf_token",
+            self.security.settings_cipher(),
+        )
+        .ok()
+        .flatten()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+        match crate::services::deploy::distributed::ensure_model_downloaded_local(
+            &model_repo,
+            &engine_id,
+            hf_token.as_deref(),
+            &deployment_cluster_id,
+        )
+        .await
+        {
+            Ok(dir) => CommandResponse::ok(MeshCommandResponsePayload::EnsureModelResult {
+                snapshot_dir: dir.to_string_lossy().to_string(),
+                error: None,
+            }),
+            Err(e) => CommandResponse::ok(MeshCommandResponsePayload::EnsureModelResult {
+                snapshot_dir: String::new(),
+                error: Some(e),
+            }),
+        }
+    }
+
+    /// P0 cluster deploy (odbiorca = head zdalny): pakuje snapshot modelu z
+    /// lokalnego cache HF i streamuje go do `target_node_id` (worker), który zapisze
+    /// go do swojego cache HF. Fail-closed: target musi być zaufany, model obecny.
+    async fn handle_push_model_to_peer(
+        &self,
+        from_node_id: &str,
+        deployment_cluster_id: String,
+        model_repo: String,
+        target_node_id: String,
+    ) -> CommandResponse {
+        let cluster_id =
+            match self.authorize_cluster_deploy_peer(from_node_id, &deployment_cluster_id) {
+                Ok(id) => id,
+                Err(e) => return CommandResponse::fail(e),
+            };
+        if !self.security.is_trusted(&target_node_id) {
+            return CommandResponse::fail(format!("target {} nie jest zaufany", target_node_id));
+        }
+        // Cel transferu musi nalezec do TEGO SAMEGO klastra co nadawca — nie pozwalamy
+        // pchnac modelu do dowolnego zaufanego wezla poza deployem.
+        if !self.node_in_cluster(&target_node_id, &cluster_id) {
+            return CommandResponse::fail(format!(
+                "target {} nie jest czlonkiem klastra {}",
+                target_node_id, cluster_id
+            ));
+        }
+        let Some(snap) = crate::services::deploy::distributed::model_snapshot_dir(&model_repo)
+        else {
+            return CommandResponse::fail(format!(
+                "model {} nie jest w cache tego węzła",
+                model_repo
+            ));
+        };
+        let hash = snap
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let Some(ctx) = self.service_action_ctx().await else {
+            return CommandResponse::fail("service action context not configured");
+        };
+        match crate::ml_studio::mesh_artifact::push_hf_model_to(
+            &ctx.iroh,
+            &target_node_id,
+            &model_repo,
+            &snap.to_string_lossy(),
+            &hash,
+            None,
+        )
+        .await
+        {
+            Ok(target_path) => {
+                CommandResponse::ok(MeshCommandResponsePayload::MlArtifactPushResult {
+                    target_path,
+                    error: None,
+                })
+            }
             Err(e) => CommandResponse::ok(MeshCommandResponsePayload::MlArtifactPushResult {
                 target_path: String::new(),
                 error: Some(e.to_string()),
@@ -644,6 +861,8 @@ impl MeshCommandExecutor {
             .unwrap_or_default();
         let res = if kind == "llm" {
             crate::ml_studio::train_llm::mesh_train_start_llm(&run_id, &spec_json).await
+        } else if kind == "classifier" {
+            crate::ml_studio::train_classifier::mesh_train_start_classifier(&run_id, &spec_json).await
         } else {
             crate::ml_studio::train_recognition::mesh_train_start(&run_id, &spec_json).await
         };
@@ -658,6 +877,8 @@ impl MeshCommandExecutor {
         // inaczej recognition. Jeden run_id istnieje tylko w jednym z rejestrów.
         let res = if crate::ml_studio::train_llm::is_llm_mesh_job(&run_id) {
             crate::ml_studio::train_llm::mesh_train_status_llm(&run_id).await
+        } else if crate::ml_studio::train_classifier::is_classifier_mesh_job(&run_id) {
+            crate::ml_studio::train_classifier::mesh_train_status_classifier(&run_id).await
         } else {
             crate::ml_studio::train_recognition::mesh_train_status(&run_id).await
         };
@@ -949,6 +1170,22 @@ impl MeshCommandExecutor {
                 Err(e) => return CommandResponse::fail(e.to_string()),
             }
         };
+        // Czlonek AKTYWNEGO klastra TP: usuniecie workera z listy serwisow
+        // zabija rank calego distributed-deploymentu serwujacego na innym nodzie.
+        // Legalna sciezka = stop deploymentu klastra (teardown kasuje wiersze sam).
+        // Osierocony wiersz (deployment juz nie istnieje/nie zyje) przechodzi —
+        // user musi moc posprzatac wraki z listy.
+        if crate::services::deploy::distributed::service_is_distributed_member(&svc.config_json)
+            && crate::services::deploy::distributed::distributed_member_deployment_active(
+                &actions.db,
+                &svc.config_json,
+            )
+            .await
+        {
+            return CommandResponse::fail(
+                "serwis jest czlonkiem AKTYWNEGO deploymentu klastra — zatrzymaj deployment klastra zamiast kasowac pojedynczy wiersz",
+            );
+        }
         // Best-effort runtime stop, then drop the row regardless.
         let _ = crate::services::deploy::stop(&svc, actions.port_allocator.clone()).await;
         // Scoped lock: drop the MutexGuard before awaiting again.

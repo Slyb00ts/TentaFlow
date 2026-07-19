@@ -1,8 +1,8 @@
 // =============================================================================
 // Plik: legal/index.js — RODO legal documents admin UI
-// Opis: Ekran administracyjny F2-P8.d M10 — lista wygenerowanych dokumentow
+// Opis: Ekran administracyjny F2-P8.d M10 — lista wygenerowanych dokumentów
 //       RODO (warianty short/standard/full), generacja nowego PDF i miekkie
-//       uniewaznienie. Komunikacja przez binary protocol (LegalAdminBody).
+//       unieważnienie. Komunikacja przez binary protocol (LegalAdminBody).
 //       Permission gating opiera sie o role admin/dpo (analogicznie do
 //       users/audit). Backend i tak gate'uje przez legal.write — to czysto
 //       UX matter zeby DPO widzial przyciski generowania.
@@ -12,7 +12,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
 
 // Cache podpisanych URL-i z odpowiedzi GenerateResponse. Lista RPC nie zwraca
-// signedUrl, wiec link "Pobierz" dziala tylko dla dokumentow wygenerowanych
+// signedUrl, wiec link "Pobierz" dziala tylko dla dokumentów wygenerowanych
 // w tej sesji przegladarki. Refresh karty czysci cache — to akceptowalne,
 // bo URL jest signed-HMAC i ma krotki TTL po stronie serwera.
 const signedUrlCache = new Map();
@@ -23,15 +23,15 @@ let includeRevoked = false;
 let canWrite = false;
 
 const VARIANT_LABELS = {
-  short: 'Skrocony',
+  short: 'Skrócony',
   standard: 'Standardowy',
-  full: 'Pelny',
+  full: 'Pełny',
 };
 
 const VARIANT_DESCRIPTIONS = {
-  short: 'Wariant skrocony — krotka informacja RODO dla uzytkownikow.',
-  standard: 'Wariant standardowy — pelna klauzula informacyjna RODO.',
-  full: 'Wariant pelny — klauzula RODO + zalaczniki techniczne i polityka cookies.',
+  short: 'Wariant skrócony — krótka informacja RODO dla użytkowników.',
+  standard: 'Wariant standardowy — pełna klauzula informacyjna RODO.',
+  full: 'Wariant pełny — klauzula RODO + załączniki techniczne i polityka cookies.',
 };
 
 // Mapuje protokolowe kody bledow na komunikaty PL. Nieznane kody przepuszczamy
@@ -42,18 +42,18 @@ function mapErrorMessage(err) {
   const reason = String(err?.reason ?? err?.message ?? '').trim();
   // Map only known protocol codes; unknown numeric codes pass through verbatim
   // so the user sees what the server actually sent.
-  if (code === 11) return 'Przekroczono limit generacji dokumentow.';
-  if (code === 7) return 'Brak uprawnien do tej operacji.';
+  if (code === 11) return 'Przekroczono limit generacji dokumentów.';
+  if (code === 7) return 'Brak uprawnień do tej operacji.';
   if (code === 9) {
-    if (/already_revoked/i.test(reason)) return 'Dokument byl juz wczesniej uniewazniony.';
+    if (/already_revoked/i.test(reason)) return 'Dokument był już wcześniej unieważniony.';
     return reason ? `Konflikt: ${reason}` : 'Konflikt stanu dokumentu.';
   }
   if (code === 3) {
-    return reason ? `Nieprawidlowe zadanie: ${reason}` : 'Nieprawidlowe zadanie.';
+    return reason ? `Nieprawidłowe żądanie: ${reason}` : 'Nieprawidłowe żądanie.';
   }
-  if (code != null) return reason ? `${code}: ${reason}` : `Blad serwera (kod ${code}).`;
+  if (code != null) return reason ? `${code}: ${reason}` : `Błąd serwera (kod ${code}).`;
   if (reason) return reason;
-  return 'Nieznany blad serwera.';
+  return 'Nieznany błąd serwera.';
 }
 
 const LegalScreen = {
@@ -64,16 +64,16 @@ const LegalScreen = {
       <div class="page-header">
         <div>
           <h1>Dokumenty RODO</h1>
-          <div class="sub" id="legal-sub">Ladowanie...</div>
+          <div class="sub" id="legal-sub">Ładowanie...</div>
         </div>
         <div class="actions" id="legal-actions"></div>
       </div>
 
       <div class="card" style="padding: 14px; margin-bottom: 14px;">
-        <div style="display: grid; grid-template-columns: 1fr auto auto; gap: 10px; align-items: center;">
-          <tf-searchbox id="legal-f-search" placeholder="${escapeAttr('Filtruj po wariancie lub dacie...')}" debounce="200"></tf-searchbox>
-          <tf-toggle id="legal-f-revoked" ${includeRevoked ? 'checked' : ''}>Pokaz uniewaznione</tf-toggle>
-          <tf-button variant="ghost" icon="refresh" id="legal-refresh">Odswiez</tf-button>
+        <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center;">
+          <tf-searchbox id="legal-f-search" placeholder="${escapeAttr('Filtruj po wariancie lub dacie...')}" debounce="200" style="flex: 1 1 200px;"></tf-searchbox>
+          <tf-toggle id="legal-f-revoked" ${includeRevoked ? 'checked' : ''}>Pokaż unieważnione</tf-toggle>
+          <tf-button variant="ghost" icon="refresh" id="legal-refresh">Odśwież</tf-button>
         </div>
       </div>
 
@@ -86,7 +86,7 @@ const LegalScreen = {
           <tf-column key="actions" label="${escapeAttr('Akcje')}" renderer="html"></tf-column>
         </tf-table>
         <div id="legal-empty" hidden style="padding: 36px; text-align: center; color: var(--text-3);">
-          Brak dokumentow do wyswietlenia.
+          Brak dokumentów do wyświetlenia.
         </div>
       </div>
     `;
@@ -176,7 +176,7 @@ async function loadDocuments() {
     updateSubtitle();
     renderTable();
   } catch (err) {
-    toast(`Blad: ${mapErrorMessage(err)}`, 'error');
+    toast(`Błąd: ${mapErrorMessage(err)}`, 'error');
   }
 }
 
@@ -246,7 +246,7 @@ function renderRowActions(docId, active) {
     ? 'Pobierz PDF (sygnowany URL z tej sesji)'
     : 'Wygeneruj ponownie, aby uzyskac aktywny URL pobrania';
   const revokeBtn = (canWrite && active)
-    ? `<tf-button variant="ghost" size="sm" data-act="revoke" data-doc-id="${escapeAttr(docId)}">Uniewaznij</tf-button>`
+    ? `<tf-button variant="ghost" size="sm" data-act="revoke" data-doc-id="${escapeAttr(docId)}">Unieważnij</tf-button>`
     : '';
   return `
     <tf-button variant="ghost" size="sm" data-act="download" data-doc-id="${escapeAttr(docId)}" ${downloadAttr} title="${escapeAttr(downloadTitle)}">Pobierz</tf-button>
@@ -382,7 +382,7 @@ function openGenerateDialog() {
         errorBox.style.display = 'block';
         errorBox.innerHTML = `<tf-chip variant="danger">${escapeHtml(msg)}</tf-chip>`;
       } else {
-        toast(`Blad: ${msg}`, 'error');
+        toast(`Błąd: ${msg}`, 'error');
       }
     }
   });
@@ -397,7 +397,7 @@ function openRevokeConfirm(docId) {
   let submitInFlight = false;
 
   const dlg = document.createElement('tf-window');
-  dlg.setAttribute('title', 'Uniewaznij dokument');
+  dlg.setAttribute('title', 'Unieważnij dokument');
   dlg.setAttribute('buttons', 'close');
   dlg.setAttribute('width', '440');
   dlg.setAttribute('min-height', '200');
@@ -410,10 +410,10 @@ function openRevokeConfirm(docId) {
   body.slot = 'body';
   body.innerHTML = `
     <p style="color: var(--text-2); font-size: 13px;">
-      Czy na pewno chcesz uniewaznic dokument <code style="font-family:'SF Mono',monospace;">${escapeHtml(docId.slice(0, 12))}</code>?
+      Czy na pewno chcesz unieważnić dokument <code style="font-family:'SF Mono',monospace;">${escapeHtml(docId.slice(0, 12))}</code>?
     </p>
     <p style="color: var(--text-3); font-size: 12px;">
-      Operacja oznacza dokument jako uniewazniony. Plik PDF pozostaje na dysku
+      Operacja oznacza dokument jako unieważniony. Plik PDF pozostaje na dysku
       do celow audytu, ale nie bedzie zwracany w domyslnej liscie.
     </p>
     <div data-role="error" style="display:none; margin-top:10px;"></div>
@@ -426,7 +426,7 @@ function openRevokeConfirm(docId) {
   footer.innerHTML = `
     <div style="flex:1"></div>
     <tf-button variant="ghost" data-role="cancel">Anuluj</tf-button>
-    <tf-button variant="danger-solid" icon="trash" data-role="submit">Uniewaznij</tf-button>
+    <tf-button variant="danger-solid" icon="trash" data-role="submit">Unieważnij</tf-button>
   `;
   dlg.appendChild(footer);
 
@@ -471,7 +471,7 @@ function openRevokeConfirm(docId) {
       signedUrlCache.delete(docId);
       submitInFlight = false;
       dlg.close(true);
-      toast('Dokument uniewazniony.', 'success');
+      toast('Dokument unieważniony.', 'success');
       await loadDocuments();
     } catch (err) {
       const code = err?.code;
@@ -483,7 +483,7 @@ function openRevokeConfirm(docId) {
         signedUrlCache.delete(docId);
         submitInFlight = false;
         dlg.close(true);
-        toast('Dokument byl juz wczesniej uniewazniony.', 'info');
+        toast('Dokument był już wcześniej unieważniony.', 'info');
         await loadDocuments();
         return;
       }
@@ -495,7 +495,7 @@ function openRevokeConfirm(docId) {
         errorBox.style.display = 'block';
         errorBox.innerHTML = `<tf-chip variant="danger">${escapeHtml(msg)}</tf-chip>`;
       } else {
-        toast(`Blad: ${msg}`, 'error');
+        toast(`Błąd: ${msg}`, 'error');
       }
     }
   });

@@ -17,7 +17,8 @@ dependencies = [
     "trl==0.12.1",
     "datasets==3.1.0",
     "accelerate==1.1.1",
-    "bitsandbytes==0.44.1",
+    # bitsandbytes (QLoRA 4-bit) tylko CUDA (Linux/Windows) — brak wheela na macOS.
+    "bitsandbytes==0.44.1 ; sys_platform != 'darwin'",
     "fastapi==0.115.5",
     "uvicorn[standard]==0.32.1",
     "sentencepiece==0.2.0",
@@ -33,10 +34,12 @@ dependencies = [
 #   uv pip install --no-build-isolation \
 #     https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
 
-# torch z kołami CUDA 12.1 (PyPI domyślnie serwuje wariant CPU). uv bierze torch
-# wyłącznie z tego indeksu, resztę pakietów z PyPI.
+# torch: na Linux/Windows z indeksu CUDA 12.1 (GPU); na macOS z PyPI (wheel z MPS/
+# Metal — indeks cu121 nie ma kół macOS). Marker per-platforma → universal lock.
 [tool.uv.sources]
-torch = { index = "pytorch-cu121" }
+torch = [
+    { index = "pytorch-cu121", marker = "sys_platform != 'darwin'" },
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu121"

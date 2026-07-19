@@ -1,0 +1,31 @@
+# =============================================================================
+# File: addons/notes/Cargo.toml
+# Purpose: Notes addon crate (WASM cdylib) — notes CRUD with ACL shares, the
+#          three-column panel (list | editor | links) rendered via ui_v1 and
+#          the auto-graph analysis pipeline (embeddings, entities, note links,
+#          entity merge, graph outbox).
+# =============================================================================
+[package]
+name = "tentaflow-addon-notes"
+version = "0.4.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tentaflow-addon-sdk = { path = "../../addon-sdk/sdk" }
+tentaflow-sdk-spec = { path = "../../../tentaflow-sdk-spec" }
+minicbor = { version = "2.2", default-features = false, features = ["alloc"] }
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+# Native-only: exercises the pure SQL string builders + their bind-param order
+# against a real in-memory SQLite (host fns are unavailable on the test target).
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

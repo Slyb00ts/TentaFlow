@@ -1,0 +1,50 @@
+[
+  {
+    "type": "notes.search",
+    "title": "Szukaj w notatkach",
+    "category": "Notes",
+    "description": "Hybrydowe wyszukiwanie w notatkach (wektory + graf powiazan) z ACL uzytkownika flow.",
+    "inputs": [
+      { "name": "query", "type": "text", "required": true }
+    ],
+    "outputs": [
+      { "name": "results", "type": "json" }
+    ]
+  },
+  {
+    "type": "notes.create",
+    "title": "Utworz notatke",
+    "category": "Notes",
+    "description": "Tworzy notatke uzytkownika flow (tytul, tresc, opcjonalne tagi) i kolejkuje analize auto-grafu.",
+    "inputs": [
+      { "name": "note", "type": "json", "required": true }
+    ],
+    "outputs": [
+      { "name": "note_id", "type": "json" }
+    ]
+  },
+  {
+    "type": "notes.append",
+    "title": "Dopisz do notatki",
+    "category": "Notes",
+    "description": "Dopisuje tresc na koncu istniejacej notatki (wymaga uprawnienia do edycji).",
+    "inputs": [
+      { "name": "input", "type": "json", "required": true }
+    ],
+    "outputs": [
+      { "name": "result", "type": "json" }
+    ]
+  },
+  {
+    "type": "notes.get_related",
+    "title": "Powiazane notatki",
+    "category": "Notes",
+    "description": "Zwraca notatki powiazane z podana (graf powiazan, glebokosc 1-2) oraz jej encje — tylko dostepne dla uzytkownika flow.",
+    "inputs": [
+      { "name": "input", "type": "json", "required": true }
+    ],
+    "outputs": [
+      { "name": "related", "type": "json" }
+    ]
+  }
+]

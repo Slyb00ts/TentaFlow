@@ -64,6 +64,13 @@ WebTransport `/wt/api` + WebSocket `/ws/api` fallback, binary `MessageBody` (CBO
 - `POST /core/frame/pickup` — Service-to-Core (yolo/whisper inference). HMAC `X-Pickup-Token`
   (one-shot, 30 s TTL). Production REQUIRES mTLS client-cert pinning.
 - `GET /recordings/<ref>` / `GET /frames/<ref>` — signed-URL downloads (HMAC, TTL-bounded).
+- `GET /models/manifest/<bundle>` / `GET /models/file/<bundle>/<name>` — vision model-bundle
+  sharing between instances. Auth: signed URL OR `Authorization: Bearer <api-key>` with an
+  explicit `('model_bundle', <bundle_ref>)` allow scope (default-DENY, general keys only) —
+  works between UNPAIRED instances. API-key manifests return token-less file urls; the client
+  repeats the Bearer header. Pull side: deploy wizard "Custom" tab → config `vision_bundle_url`
+  + `vision_bundle_api_key` (encrypted like `api_key`), fallback settings
+  `vision_bundle_base_url` + `vision_bundle_api_key`.
 
 Security (both tiers): HMAC SHA-256 (constant-time via `subtle`), audit log per outcome,
 per-IP + global rate limit (429 + `Retry-After`), path-traversal containment, security
@@ -117,8 +124,19 @@ auto-approved, even with `required=true`.
 
 Notable bundled addons: `eureka` (MF Eureka index → own SQLite), `company-lookup` (VAT
 registry lookup, stateless), `contacts` (CRM source-of-truth: companies/persons/relations;
-Flow blocks + app panels), `memory`, `embeddings-chunker`. Per-addon detail lives in each
-addon directory.
+Flow blocks + app panels), `memory`, `embeddings-chunker`, `notes` (Rust, UI catalog v1:
+per user/group/org notes with ACL-guarded auto-graph — SQLite source of truth +
+`graph_outbox` → Cozo `notes_kg` + zvec namespaces, hybrid RRF search with streamed LLM
+answer, share modal on `directory.read` host fns, STT dictation, flow blocks + LLM tools).
+The legacy built-in notes screen/protocol was removed (protocol `SCHEMA_VERSION` 21 —
+old/new binaries reject each other on handshake; rebuild all mesh nodes together).
+
+Host fns `directory_users/groups/roles/org_v1` (scope `directory.read`) expose the org
+identity catalog to addons. Rust addons get typed UI catalog v1 bindings via
+`scripts/gen-rust.sh` → `addon-sdk/sdk/src/ui_v1/` (re-exports of `tentaflow-sdk-spec`
+components; same codegen pipeline as C#/Python). `RelationGraph` (0x0703) has a canvas
+renderer (`tf-relation-graph`); audio-capture uploads are bound host-side to the uploader
+(`source=audio_capture` docs deny cross-user `document_get/delete/list`).
 
 `[[network_rule]].host` supports exact hosts, `*.domain` subdomain wildcards and `*` for
 public-web addons. Wildcards still require explicit admin approval, keep the declared port,

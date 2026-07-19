@@ -246,6 +246,8 @@ pub struct GenPerf {
     pub ttft_ms: u32,
     pub prefill_tps: f32,
     pub decode_tps: f32,
+    /// Calkowity czas odpowiedzi w ms (dispatch -> ostatni token).
+    pub total_ms: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

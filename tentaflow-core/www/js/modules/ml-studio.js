@@ -72,6 +72,18 @@ function stopFtExportPolling() {
   }
 }
 
+// Interwał auto-odświeżania panelu jobów ML Studio (widok „Joby"). Czyszczony
+// przy opuszczeniu widoku (unmount) oraz przy ponownym wejściu, żeby nie było
+// dwóch równoległych timerów odpytujących mlStudioJobsOverviewRequest.
+let jobsPollTimer = null;
+
+function stopJobsPolling() {
+  if (jobsPollTimer !== null) {
+    clearInterval(jobsPollTimer);
+    jobsPollTimer = null;
+  }
+}
+
 // Human label + sprite per project role. Owner is rendered as an accent badge,
 // the rest as info badges / chips (matches p02 legend).
 const ROLE_LABEL = {
@@ -104,7 +116,10 @@ const TYPE_TABS = {
   ft_llm: ['Model bazowy', 'Dane', 'Trening', 'Ewaluacja', 'Modele'],
   ft_vision_audio: ['Model bazowy', 'Dane', 'Trening', 'Ewaluacja', 'Modele'],
   tabular_anomaly: ['Dane', 'Trenuj', 'Cechy', 'Anomalie', 'Modele'],
-  distillation: ['Nauczyciel', 'Uczeń', 'Dane', 'Trening', 'Modele'],
+  // Flow destylacji: Model bazowy (student + metoda LoRA) -> Dane (teacher generuje
+  // pary Q→A) -> Trening (student uczy sie na tych parach) -> Modele. Teacher
+  // wybierany w Dane; osobne zakladki Nauczyciel/Uczen byly zbedne (renderowaly pustke).
+  distillation: ['Model bazowy', 'Dane', 'Trening', 'Modele'],
 };
 
 function sprite(id) {
@@ -159,6 +174,9 @@ const MlStudioScreen = {
     if (params && params.admin === 'resources') {
       return `<div id="ml-studio-resources" class="ml-studio-resources"></div>`;
     }
+    if (params && params.jobs) {
+      return `<div id="ml-studio-jobs-view" class="ml-studio-jobs-view"></div>`;
+    }
     if (params && params.projectId && params.share) {
       return `<div id="ml-studio-share" class="ml-studio-share"></div>`;
     }
@@ -176,6 +194,7 @@ const MlStudioScreen = {
         </div>
         <div class="actions" id="ml-studio-actions">
           <tf-button variant="ghost" icon="refresh" id="ml-studio-refresh">Odśwież</tf-button>
+          <tf-button variant="outline" icon="cpu" id="ml-studio-jobs">Joby</tf-button>
           <tf-button variant="primary" icon="plus" id="ml-studio-new">Nowy projekt</tf-button>
         </div>
       </div>
@@ -191,12 +210,16 @@ const MlStudioScreen = {
       await showResourcesAdmin();
       return;
     }
+    if (params && params.jobs) {
+      await showJobsOverview();
+      return;
+    }
     if (params && params.projectId && params.share) {
       await showShare(params.projectId);
       return;
     }
     if (params && params.projectId) {
-      await showDetail(params.projectId);
+      await showDetail(params.projectId, { runId: params.runId, kind: params.kind });
       return;
     }
     if (params && params.create) {
@@ -205,6 +228,7 @@ const MlStudioScreen = {
     }
     byId('ml-studio-refresh')?.addEventListener('click', loadAll);
     byId('ml-studio-new')?.addEventListener('click', () => Router.navigate('ml-studio', { create: '1' }));
+    byId('ml-studio-jobs')?.addEventListener('click', () => Router.navigate('ml-studio', { jobs: '1' }));
 
     const filters = byId('ml-studio-filters');
     filters?.addEventListener('change', (e) => {
@@ -221,6 +245,7 @@ const MlStudioScreen = {
     // falling back to the raw slug when entered directly via the router.
     stopFtPolling();
     stopFtExportPolling();
+    stopJobsPolling();
     projects = [];
     activeTypeFilter = 'all';
     detailProjectId = null;
@@ -713,7 +738,11 @@ async function showCreateWizard() {
       ? `plik „${escapeHtml(state.file.name)}” (${formatFileSize(state.file.size)}) zostanie wgrany i sprofilowany po utworzeniu projektu`
       : 'dane dodasz później w zakładce Dane';
     const ftNote = FT_TYPES.has(state.type)
-      ? `<div class="ml-studio-wiz-summary-note">${sprite('info')} Model bazowy${state.type === 'distillation' ? ' / nauczyciela' : ''} wybierzesz już w projekcie — w zakładce „${state.type === 'distillation' ? 'Nauczyciel' : 'Model bazowy'}”.</div>`
+      ? `<div class="ml-studio-wiz-summary-note">${sprite('info')} ${
+          state.type === 'distillation'
+            ? 'Model bazowy studenta wybierzesz w zakładce „Model bazowy”, a nauczyciela (generuje odpowiedzi) w zakładce „Dane”.'
+            : 'Model bazowy wybierzesz już w projekcie — w zakładce „Model bazowy”.'
+        }</div>`
       : '';
     bodyEl.innerHTML = `
       <div class="ml-studio-wiz-summary">
@@ -809,7 +838,7 @@ function formatFileSize(bytes) {
   return `${formatNumber(n)} B`;
 }
 
-async function showDetail(projectId) {
+async function showDetail(projectId, focus = {}) {
   detailProjectId = projectId;
   const host = byId('ml-studio-detail');
   if (!host) return;
@@ -822,7 +851,7 @@ async function showDetail(projectId) {
       ensureCurrentUser(),
     ]);
     const p = resp.project || {};
-    renderDetail(host, p);
+    renderDetail(host, p, focus);
   } catch (err) {
     host.innerHTML = '';
     const empty = document.createElement('tf-empty-state');
@@ -839,8 +868,14 @@ async function showDetail(projectId) {
   }
 }
 
-function renderDetail(host, p) {
+function renderDetail(host, p, focus = {}) {
   const slug = p.projectType ?? p.project_type ?? '';
+  // Wejście „w szczegóły joba" z panelu Joby: przekazany runId ma otworzyć
+  // zakładkę Trening i wznowić dla niego widok LIVE (zamiast formularza startu).
+  // Konsumowane jednorazowo — kolejne ręczne wejścia w Trening pokażą już setup.
+  const focusRunId = focus && focus.runId ? String(focus.runId) : '';
+  const focusKind = focus && focus.kind ? String(focus.kind) : '';
+  let pendingFocusRunId = focusRunId;
   // "Przegląd" jest zawsze pierwszą zakładką (stan projektu na jednym ekranie),
   // a "Zasoby" zawsze ostatnią (§11.3 — zasoby mesh przydzielone projektowi).
   // Żaden wpis TYPE_TABS nie zawiera "Przegląd", więc bez duplikatów.
@@ -947,7 +982,7 @@ function renderDetail(host, p) {
       renderOverviewTab(panel, p, { tabs, selectTab });
       return;
     }
-    if (label === 'Model bazowy' && slug === 'ft_llm') {
+    if (label === 'Model bazowy' && (slug === 'ft_llm' || slug === 'distillation')) {
       renderFtModelTab(panel, p);
       return;
     }
@@ -956,7 +991,13 @@ function renderDetail(host, p) {
       return;
     }
     if (label === 'Trening' && slug === 'recognition') {
-      renderRecogTrainTab(panel, p, { selectTab });
+      const opts = { selectTab };
+      if (pendingFocusRunId) {
+        opts.focusRunId = pendingFocusRunId;
+        opts.focusKind = focusKind;
+        pendingFocusRunId = '';
+      }
+      renderRecogTrainTab(panel, p, opts);
       return;
     }
     if (label === 'Dane' && slug === 'recognition') {
@@ -967,11 +1008,15 @@ function renderDetail(host, p) {
       renderRecogAnnotateTab(panel, p);
       return;
     }
+    if (label === 'Dane' && slug === 'distillation') {
+      renderDistillDataTab(panel, p);
+      return;
+    }
     if (label === 'Dane') {
       renderDataTab(panel, projectId(p));
       return;
     }
-    if (label === 'Trening' && slug === 'ft_llm') {
+    if (label === 'Trening' && (slug === 'ft_llm' || slug === 'distillation')) {
       renderFtTrainTab(panel, p, { selectTab });
       return;
     }
@@ -1004,7 +1049,11 @@ function renderDetail(host, p) {
   tabsEl?.addEventListener('change', (e) => {
     renderPanel(e.detail?.value);
   });
-  renderPanel('ml-tab-0');
+  // Domyślnie „Przegląd"; przy wejściu w szczegóły joba — od razu „Trening"
+  // (wznowienie widoku LIVE dla przekazanego runId).
+  const initialTab = (focusRunId && tabs.indexOf('Trening') >= 0) ? 'Trening' : 'Przegląd';
+  if (initialTab !== 'Przegląd') selectTab(initialTab);
+  else renderPanel('ml-tab-0');
 }
 
 // =============================================================================
@@ -1405,7 +1454,9 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
       return typeIcon(slug);
     };
     const shortcutDesc = (label) => {
-      if (label === 'Dane') return 'import i profil danych';
+      if (label === 'Dane') {
+        return slug === 'distillation' ? 'generowanie par Q→A (teacher) / import' : 'import i profil danych';
+      }
       if (label === 'Schemat') return 'klasy i atrybuty';
       if (label === 'Anotacje') return 'studio anotacji';
       if (label === 'Zasoby') return 'GPU/nody mesh projektu';
@@ -1886,13 +1937,16 @@ function taskLabel(task) {
 // model dostępny w serwisie od pobieranego z HuggingFace (chip pochodzenia w f00).
 const FT_BASE_MODELS = [
   {
-    id: 'Qwen/Qwen3.5-0.8B',
-    name: 'Qwen3.5-0.8B',
-    sub: 'Mały, szybki — zalecany start dla większości fine-tuningów',
-    params: '0.8 B',
+    // Qwen2.5 (arch qwen2) działa z pinowanym transformers==4.46.3 i jest bez bramki.
+    // Qwen3.5 (qwen3_5) wymagałby nowszego transformers (łańcuch trl/peft) — świadomie
+    // rekomendujemy model, który trenuje się out-of-box na obecnym backendzie.
+    id: 'Qwen/Qwen2.5-0.5B-Instruct',
+    name: 'Qwen2.5-0.5B',
+    sub: 'Mały, szybki, bez bramki — zalecany start (działa out-of-box)',
+    params: '0.5 B',
     context: '32k',
     license: 'Apache-2.0',
-    source: 'serwis',
+    source: 'hf',
     recommended: true,
   },
   {
@@ -1917,17 +1971,20 @@ const FT_BASE_MODELS = [
 
 // Parametryzacja (oś 2) — karty z badge szacowanej VRAM. Wartości jak w f01.
 const FT_METHODS = [
-  { id: 'qlora', name: 'QLoRA', desc: '4-bit baza + adaptery LoRA. Najniższa VRAM.', vram: '~8 GB', tone: 'low', lora: true },
+  { id: 'qlora', name: 'QLoRA', desc: '4-bit baza + adaptery LoRA. Najniższa VRAM. Wymaga GPU CUDA (Linux/Windows) — na Apple/CPU degraduje do LoRA.', vram: '~8 GB', tone: 'low', lora: true },
   { id: 'lora', name: 'LoRA', desc: 'Baza 16-bit + adaptery. Lepsza jakość niż QLoRA.', vram: '~16 GB', tone: 'mid', lora: true },
   { id: 'dora', name: 'DoRA', desc: 'LoRA z dekompozycją wagi — wyższa wierność.', vram: '~18 GB', tone: 'high', lora: true },
   { id: 'full', name: 'Full', desc: 'Pełny fine-tune wszystkich wag. Najlepsza jakość.', vram: '~24 GB', tone: 'max', lora: false },
 ];
 
 // Cel treningu (oś 1).
+// W projekcie destylacji WSZYSTKIE trzy cele są destylacją (uczeń uczy się od
+// nauczyciela) — różnią się SYGNAŁEM: odpowiedzi (SFT) / preferencje (DPO) /
+// rozkład-logity (KD). To nie są alternatywy dla destylacji, tylko jej tryby.
 const FT_OBJECTIVES = [
-  { id: 'sft', name: 'SFT', desc: 'Supervised fine-tuning (pary wejście→wyjście).' },
-  { id: 'dpo', name: 'DPO', desc: 'Direct Preference Optimization (odpowiedź lepsza/gorsza).' },
-  { id: 'kd', name: 'KD', desc: 'Knowledge Distillation (student uczy się od nauczyciela).' },
+  { id: 'sft', name: 'SFT', desc: 'Na ODPOWIEDZIACH — uczeń imituje odpowiedzi nauczyciela (pary wejście→wyjście).' },
+  { id: 'dpo', name: 'DPO', desc: 'Na PREFERENCJACH — uczeń uczy się „lepsza>gorsza" (chosen/rejected od nauczyciela).' },
+  { id: 'kd', name: 'KD', desc: 'Na LOGITACH — uczeń dopasowuje rozkład nauczyciela (soft labels, GKD; nauczyciel obecny przy treningu).' },
 ];
 
 // Hiperparametry: domyślne + zakres dla tf-input type=number. lora=true → pole
@@ -1957,7 +2014,45 @@ function defaultFtConfig() {
   };
 }
 
+// Konfiguracja fine-tuningu persystuje w localStorage per projekt — bez tego
+// „Zapisz konfigurację" ginęło po reloadzie (config był tylko w RAM). Merge z
+// defaultami toleruje starsze zapisy bez nowych pól.
+const FT_CONFIG_LS_PREFIX = 'ml-studio-ft-config:';
+
+function persistFtConfig(pid) {
+  try {
+    if (ftConfig[pid]) localStorage.setItem(FT_CONFIG_LS_PREFIX + pid, JSON.stringify(ftConfig[pid]));
+  } catch (_) {
+    // localStorage niedostępny (tryb prywatny) — config zostaje w pamięci sesji.
+  }
+}
+
+// Ładuje zapisany config z localStorage do pamięci (bez defaultów). Zwraca true,
+// gdy istniał zapis — Trening używa tego, by odróżnić „nigdy nie konfigurowano"
+// (pusty stan) od „skonfigurowano wcześniej" (hydratacja po reloadzie).
+function hydrateFtConfig(pid) {
+  if (ftConfig[pid]) return true;
+  try {
+    const raw = localStorage.getItem(FT_CONFIG_LS_PREFIX + pid);
+    if (raw) {
+      const saved = JSON.parse(raw);
+      const def = defaultFtConfig();
+      const savedHp = saved && typeof saved.hyperparams === 'object' && saved.hyperparams;
+      // Deep-merge `hyperparams`: częściowy/stary zapis (albo null) nie może wyzerować
+      // nowych pól — inaczej summary/payload dostają undefined, a null crashuje zakładkę.
+      ftConfig[pid] = { ...def, ...saved, hyperparams: { ...def.hyperparams, ...(savedHp || {}) } };
+      return true;
+    }
+  } catch (_) {
+    // uszkodzony/niedostępny wpis — traktuj jak brak konfiguracji
+  }
+  return false;
+}
+
 function getFtConfig(pid) {
+  if (!ftConfig[pid]) {
+    hydrateFtConfig(pid);
+  }
   if (!ftConfig[pid]) ftConfig[pid] = defaultFtConfig();
   return ftConfig[pid];
 }
@@ -1977,12 +2072,380 @@ function objectiveLabel(id) {
 }
 
 // =============================================================================
+// Zakładka „Dane" (destylacja) — generowanie datasetu par (question, answer).
+// Źródło pytań: generacja modelem z celu usera ALBO import istniejącego datasetu.
+// Wybrany TEACHER generuje odpowiedzi. Backend: MlStudioDistillGenerate + polling.
+// =============================================================================
+async function renderDistillDataTab(panel, p) {
+  const pid = projectId(p);
+  panel.innerHTML = `<div class="ml-studio-loading">Ładowanie…</div>`;
+
+  let models = [];
+  let datasets = [];
+  try {
+    const [ml, dss] = await Promise.all([
+      ApiBinary.list('modelListRequest', { arrayKey: 'models' }).catch(() => []),
+      // .one (nie .list) — .list nie forwarduje projectId do żądania, przez co
+      // padało „project not found" i selektory datasetów (import + edytor) były puste.
+      ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid })
+        .then((r) => (Array.isArray(r.datasets) ? r.datasets : []))
+        .catch(() => []),
+    ]);
+    // Modele generacyjne (kategoria 'llm') — teacher i model generujący pytania
+    // odpowiadają na prompt. Datalist to PODPOWIEDZI; pole przyjmuje też dowolny
+    // alias/model spoza listy (np. zewnętrzny endpoint).
+    const catOf = (m) => String(m.category || m.service_type || '').toLowerCase();
+    models = (Array.isArray(ml) ? ml : []).filter((m) => catOf(m) === 'llm');
+    datasets = Array.isArray(dss) ? dss : [];
+  } catch (e) {
+    /* best effort — pola przyjmują dowolny alias/model */
+  }
+
+  const modelNames = [...new Set(models.map((m) => m.name || m.id).filter(Boolean))];
+  const modelOptions = modelNames.map((n) => `<option value="${escapeAttr(n)}"></option>`).join('');
+  const datasetOptions = datasets
+    .map((d) => `<option value="${escapeAttr(d.datasetId || d.dataset_id || d.id || '')}">${escapeHtml(d.name || '')}</option>`)
+    .join('');
+
+  panel.innerHTML = `
+    <div class="ml-studio-distill-data">
+      <h3>Generowanie datasetu destylacji</h3>
+      <p class="ml-studio-hint">Zbierz PYTANIA (wygeneruj modelem z celu albo zaimportuj z datasetu), a wybrany TEACHER wygeneruje ODPOWIEDZI. Wynik: pary (pytanie, odpowiedź) do treningu ucznia.</p>
+
+      <label class="ml-studio-field-label">Źródło pytań</label>
+      <div class="ml-studio-source-toggle" style="display:flex;gap:8px;margin-bottom:8px;">
+        <tf-button id="ml-distill-src-generate" variant="primary" size="sm">Generuj modelem</tf-button>
+        <tf-button id="ml-distill-src-import" variant="ghost" size="sm">Import z datasetu</tf-button>
+      </div>
+
+      <div id="ml-distill-generate-box">
+        <label class="ml-studio-field-label">Cel / co wygenerować (prompt dla modelu)</label>
+        <tf-textarea id="ml-distill-prompt" rows="3" placeholder="np. Wygeneruj pytania o ekstrakcję encji i relacji z polskiego tekstu prawnego"></tf-textarea>
+        <div style="display:flex;gap:12px;">
+          <div style="flex:2;"><label class="ml-studio-field-label">Model generujący pytania</label>
+            <input list="ml-distill-models" id="ml-distill-qmodel" class="ml-studio-model-input" style="width:100%;box-sizing:border-box;display:block;padding:8px;margin:2px 0 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text);" placeholder="alias/model (puste = teacher)"></div>
+          <div style="flex:1;"><label class="ml-studio-field-label">Ile pytań</label>
+            <tf-input id="ml-distill-num" type="number" value="10"></tf-input></div>
+        </div>
+      </div>
+
+      <div id="ml-distill-import-box" hidden>
+        <label class="ml-studio-field-label">Dataset źródłowy (pytania)</label>
+        <select id="ml-distill-srcds" class="ml-studio-model-input" style="width:100%;box-sizing:border-box;display:block;padding:8px;margin:2px 0 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text);">${datasetOptions || '<option value="">— brak datasetów —</option>'}</select>
+        <label class="ml-studio-field-label">Pole/kolumna z pytaniem</label>
+        <tf-input id="ml-distill-field" placeholder="question / prompt (puste = auto)"></tf-input>
+      </div>
+
+      <hr style="margin:14px 0;border:none;border-top:1px solid var(--border);">
+      <label class="ml-studio-field-label">Wariant treningu (decyduje o kształcie danych)</label>
+      <div style="display:flex;gap:8px;margin:2px 0 6px;">
+        <tf-button id="ml-distill-obj-sft" variant="primary" size="small">SFT</tf-button>
+        <tf-button id="ml-distill-obj-kd" variant="ghost" size="small">KD</tf-button>
+        <tf-button id="ml-distill-obj-dpo" variant="ghost" size="small">DPO</tf-button>
+      </div>
+      <p class="ml-studio-hint" id="ml-distill-obj-hint" style="margin:0 0 10px;">SFT/KD: pary pytanie→odpowiedź (teacher). Wybierz ten sam wariant co w zakładce „Model bazowy".</p>
+
+      <label class="ml-studio-field-label">Teacher — model generujący ODPOWIEDZI (etykiety treningowe)</label>
+      <input list="ml-distill-models" id="ml-distill-teacher" class="ml-studio-model-input" style="width:100%;box-sizing:border-box;display:block;padding:8px;margin:2px 0 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text);" placeholder="np. gpt-5-5 albo dowolny alias/model tentaflow">
+      <datalist id="ml-distill-models">${modelOptions}</datalist>
+
+      <label class="ml-studio-field-label">Instrukcja dla teachera (opcjonalna)</label>
+      <tf-textarea id="ml-distill-instr" rows="2" placeholder="np. Wyodrębnij encje i relacje w formacie E|nazwa|typ / R|head|rel|tail"></tf-textarea>
+
+      <div id="ml-distill-dpo-box" hidden>
+        <label class="ml-studio-field-label">Model ODRZUCAJĄCY — generuje GORSZĄ odpowiedź (DPO)</label>
+        <input list="ml-distill-models" id="ml-distill-rejmodel" class="ml-studio-model-input" style="width:100%;box-sizing:border-box;display:block;padding:8px;margin:2px 0 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text);" placeholder="słabszy/bazowy model (puste = teacher z instrukcją „gorzej")">
+        <label class="ml-studio-field-label">Instrukcja dla modelu odrzucającego (opcjonalna)</label>
+        <tf-textarea id="ml-distill-rejinstr" rows="2" placeholder="np. Odpowiedz krótko i ogólnikowo, pomiń szczegóły i uzasadnienie"></tf-textarea>
+      </div>
+      <div style="display:flex;gap:12px;">
+        <div style="flex:1;"><label class="ml-studio-field-label">Temperatura</label><tf-input id="ml-distill-temp" type="number" value="0.2"></tf-input></div>
+        <div style="flex:1;"><label class="ml-studio-field-label">Max tokenów</label><tf-input id="ml-distill-maxtok" type="number" value="768"></tf-input></div>
+      </div>
+
+      <label class="ml-studio-field-label">Nazwa datasetu</label>
+      <tf-input id="ml-distill-name" value="destylacja-${Date.now()}"></tf-input>
+
+      <div class="ml-studio-actions" style="margin-top:12px;">
+        <tf-button id="ml-distill-go" variant="primary">Generuj dataset</tf-button>
+      </div>
+      <div id="ml-distill-progress" style="margin-top:14px;" hidden></div>
+
+      <hr style="margin:20px 0;border:none;border-top:1px solid var(--border);">
+      <label class="ml-studio-field-label">Podgląd i ręczna edycja datasetu</label>
+      <p class="ml-studio-hint" style="margin:0 0 8px;">Wczytaj istniejący dataset, żeby zobaczyć wygenerowane pary i ręcznie dodać/poprawić/usunąć wiersze. Kolumny dobierają się do formatu (SFT/KD: pytanie·odpowiedź; DPO: prompt·lepsza·gorsza).</p>
+      <div style="display:flex;gap:8px;align-items:center;margin:2px 0 8px;">
+        <tf-select id="ml-distill-edit-ds" style="flex:1;"></tf-select>
+        <tf-button id="ml-distill-edit-load" variant="outline">Wczytaj</tf-button>
+      </div>
+      <div id="ml-distill-edit-meta" class="ml-studio-hint" style="margin:0 0 8px;display:none;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);"></div>
+      <div id="ml-distill-edit-rows"></div>
+      <div id="ml-distill-edit-actions" style="display:none;gap:8px;margin-top:10px;">
+        <tf-button id="ml-distill-edit-add" variant="ghost">+ Dodaj wiersz</tf-button>
+        <tf-button id="ml-distill-edit-save" variant="primary">Zapisz zmiany</tf-button>
+      </div>
+      <div id="ml-distill-edit-status" class="ml-studio-hint" style="margin-top:6px;"></div>
+    </div>`;
+
+  let source = 'generate';
+  const setSource = (s) => {
+    source = s;
+    byId('ml-distill-generate-box').hidden = s !== 'generate';
+    byId('ml-distill-import-box').hidden = s !== 'import';
+    byId('ml-distill-src-generate')?.setAttribute('variant', s === 'generate' ? 'primary' : 'ghost');
+    byId('ml-distill-src-import')?.setAttribute('variant', s === 'import' ? 'primary' : 'ghost');
+  };
+  byId('ml-distill-src-generate')?.addEventListener('click', () => setSource('generate'));
+  byId('ml-distill-src-import')?.addEventListener('click', () => setSource('import'));
+
+  // Wariant treningu: SFT/KD -> pary Q&A; DPO -> trójki (prompt, chosen, rejected).
+  // Synchronizujemy z ZAPISANĄ konfiguracją „Model bazowy" (spójny cel treningu),
+  // ale przez hydrateFtConfig — NIE getFtConfig, bo ten tworzy domyślny config i
+  // omijałby guard „Skonfiguruj fine-tuning" w Treningu. hydrateFtConfig ładuje
+  // tylko realny zapis z localStorage (albo nic → zostajemy na sft, bez mutacji).
+  let objective = 'sft';
+  if (hydrateFtConfig(pid) && ftConfig[pid] && ftConfig[pid].objective) {
+    objective = String(ftConfig[pid].objective).toLowerCase();
+  }
+  if (!['sft', 'kd', 'dpo'].includes(objective)) objective = 'sft';
+  const OBJ_HINTS = {
+    sft: 'SFT — destylacja na ODPOWIEDZIACH: generujemy pary pytanie→odpowiedź (teacher). Uczeń imituje odpowiedzi.',
+    kd: 'KD — destylacja na LOGITACH: generujemy pary pytanie→odpowiedź; przy treningu teacher (wskaż go jako nauczyciela) dopasowuje rozkład.',
+    dpo: 'DPO — destylacja na PREFERENCJACH: generujemy trójki (prompt, lepsza, gorsza) — teacher lepszą, model odrzucający gorszą.',
+  };
+  const setObjective = (o) => {
+    objective = o;
+    byId('ml-distill-dpo-box').hidden = o !== 'dpo';
+    const hint = byId('ml-distill-obj-hint');
+    if (hint) hint.textContent = OBJ_HINTS[o] || '';
+    ['sft', 'kd', 'dpo'].forEach((k) =>
+      byId('ml-distill-obj-' + k)?.setAttribute('variant', k === o ? 'primary' : 'ghost'));
+  };
+  ['sft', 'kd', 'dpo'].forEach((k) =>
+    byId('ml-distill-obj-' + k)?.addEventListener('click', () => setObjective(k)));
+  setObjective(objective); // odzwierciedl stan początkowy (z Model bazowy) w UI
+
+  byId('ml-distill-go')?.addEventListener('click', async () => {
+    const teacher = String(byId('ml-distill-teacher')?.value || '').trim();
+    if (!teacher) {
+      toast('Podaj model teacher', 'error');
+      return;
+    }
+    const payload = {
+      projectId: pid,
+      datasetName: String(byId('ml-distill-name')?.value || '').trim() || `destylacja-${Date.now()}`,
+      questionSource: source,
+      teacherModel: teacher,
+      answerInstruction: String(byId('ml-distill-instr')?.value || '').trim() || undefined,
+      temperature: Math.max(0, Math.min(2, Number(byId('ml-distill-temp')?.value ?? 0.2) || 0)),
+      maxTokens: Math.max(16, Math.min(8192, Number(byId('ml-distill-maxtok')?.value || 768) | 0)),
+      objective,
+    };
+    if (objective === 'dpo') {
+      payload.rejectedModel = String(byId('ml-distill-rejmodel')?.value || '').trim() || undefined;
+      payload.rejectedInstruction = String(byId('ml-distill-rejinstr')?.value || '').trim() || undefined;
+    }
+    if (source === 'generate') {
+      payload.generatePrompt = String(byId('ml-distill-prompt')?.value || '').trim();
+      payload.questionModel = String(byId('ml-distill-qmodel')?.value || '').trim() || undefined;
+      payload.numQuestions = Math.max(1, Math.min(500, Number(byId('ml-distill-num')?.value || 10) | 0));
+      if (!payload.generatePrompt) {
+        toast('Podaj cel/prompt', 'error');
+        return;
+      }
+    } else {
+      payload.sourceDatasetId = String(byId('ml-distill-srcds')?.value || '');
+      payload.questionField = String(byId('ml-distill-field')?.value || '').trim() || undefined;
+      if (!payload.sourceDatasetId) {
+        toast('Wybierz dataset źródłowy', 'error');
+        return;
+      }
+    }
+    byId('ml-distill-go')?.setAttribute('disabled', 'true');
+    try {
+      const resp = await ApiBinary.one('mlStudioDistillGenerateRequest', payload);
+      pollDistill(resp.datasetId || resp.dataset_id);
+    } catch (e) {
+      toast(`Błąd startu: ${e.message}`, 'error');
+      byId('ml-distill-go')?.removeAttribute('disabled');
+    }
+  });
+
+  function pollDistill(datasetId) {
+    const box = byId('ml-distill-progress');
+    if (!box) return;
+    box.hidden = false;
+    const tick = async () => {
+      let st;
+      try {
+        st = await ApiBinary.one('mlStudioDistillGenerateStatusRequest', { datasetId });
+      } catch (e) {
+        box.innerHTML = `<span class="ml-studio-err">Błąd pollingu: ${escapeHtml(e.message)}</span>`;
+        return;
+      }
+      const done = st.done || 0;
+      const total = st.total || 0;
+      const pct = total ? Math.round((done / total) * 100) : 0;
+      const samples = Array.isArray(st.samples) ? st.samples : [];
+      box.innerHTML = `
+        <div>Status: <strong>${escapeHtml(st.status || '')}</strong> ${total ? `(${done}/${total}, ${pct}%)` : ''}</div>
+        ${st.error ? `<div class="ml-studio-err">${escapeHtml(st.error)}</div>` : ''}
+        <div class="ml-studio-progress-bar" style="height:8px;background:var(--surface-2);border-radius:4px;overflow:hidden;margin:6px 0;"><div style="width:${pct}%;height:100%;background:var(--accent);"></div></div>
+        ${samples.length ? `<div class="ml-studio-distill-samples">${samples.map((s) => `<div class="qa" style="border:1px solid var(--border);border-radius:6px;padding:8px;margin:6px 0;"><div style="font-weight:600;">${escapeHtml(s.question || '')}</div><div style="opacity:0.85;margin-top:4px;white-space:pre-wrap;">${s.rejected ? '✓ ' : ''}${escapeHtml(s.answer || '')}</div>${s.rejected ? `<div style="opacity:0.7;margin-top:4px;white-space:pre-wrap;color:var(--danger,#c66);">✗ ${escapeHtml(s.rejected)}</div>` : ''}</div>`).join('')}</div>` : ''}`;
+      if (st.status === 'completed') {
+        toast('Dataset gotowy — zakładka Trening', 'success');
+        byId('ml-distill-go')?.removeAttribute('disabled');
+        return;
+      }
+      if (st.status === 'failed' || st.status === 'unknown') {
+        byId('ml-distill-go')?.removeAttribute('disabled');
+        return;
+      }
+      setTimeout(tick, 2000);
+    };
+    tick();
+  }
+
+  // ---- Podgląd i ręczna edycja datasetu (wiersze JSONL) ----
+  const editRowsBox = byId('ml-distill-edit-rows');
+  const editActions = byId('ml-distill-edit-actions');
+  const editStatus = byId('ml-distill-edit-status');
+  let editCols = ['question', 'answer']; // wykrywane z danych; fallback SFT
+  let editDatasetId = '';
+  let editTruncated = false; // true gdy załadowano tylko część dużego datasetu
+  let editPending = false; // true gdy dataset w trakcie generacji (distill_status=pending)
+
+  const rowFieldHtml = (col, val) =>
+    `<div style="flex:1;min-width:0;"><div class="ml-studio-hint" style="margin-bottom:2px;">${escapeHtml(col)}</div>` +
+    `<textarea data-col="${escapeAttr(col)}" rows="2" style="width:100%;box-sizing:border-box;padding:6px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text);">${escapeHtml(val)}</textarea></div>`;
+
+  const addRowEl = (obj) => {
+    const row = document.createElement('div');
+    row.className = 'ml-distill-edit-row';
+    row.style = 'display:flex;gap:8px;align-items:flex-start;margin:6px 0;padding:8px;border:1px solid var(--border);border-radius:6px;';
+    row.innerHTML = editCols.map((c) => rowFieldHtml(c, obj && obj[c] != null ? String(obj[c]) : '')).join('');
+    const del = document.createElement('tf-button');
+    del.setAttribute('variant', 'ghost');
+    del.setAttribute('icon', 'trash');
+    del.setAttribute('title', 'Usuń wiersz');
+    del.style.alignSelf = 'center';
+    del.addEventListener('click', () => row.remove());
+    row.appendChild(del);
+    editRowsBox.appendChild(row);
+  };
+
+  const collectRows = () => {
+    const out = [];
+    editRowsBox.querySelectorAll('.ml-distill-edit-row').forEach((row) => {
+      const o = {};
+      let any = false;
+      row.querySelectorAll('textarea[data-col]').forEach((ta) => {
+        const v = ta.value.trim();
+        o[ta.getAttribute('data-col')] = v;
+        if (v) any = true;
+      });
+      if (any) out.push(JSON.stringify(o)); // pomijamy całkowicie puste wiersze
+    });
+    return out;
+  };
+
+  const editMeta = byId('ml-distill-edit-meta');
+  const OBJ_LABEL = { sft: 'SFT (na odpowiedziach)', dpo: 'DPO (na preferencjach)', kd: 'KD (na logitach)' };
+  const renderMeta = (metaStr) => {
+    let m = null;
+    try { m = metaStr ? JSON.parse(metaStr) : null; } catch (_) { m = null; }
+    if (!m || typeof m !== 'object') { editMeta.style.display = 'none'; return; }
+    const parts = [];
+    if (m.objective) parts.push(`wariant: <strong>${escapeHtml(OBJ_LABEL[m.objective] || String(m.objective).toUpperCase())}</strong>`);
+    if (m.teacher_model) parts.push(`nauczyciel: <strong>${escapeHtml(m.teacher_model)}</strong>`);
+    if (m.question_source) parts.push(`źródło pytań: ${escapeHtml(m.question_source)}${m.question_model ? ` (model: ${escapeHtml(m.question_model)})` : ''}`);
+    if (m.rejected_model) parts.push(`model odrzucający: ${escapeHtml(m.rejected_model)}`);
+    if (m.generate_prompt) parts.push(`cel: „${escapeHtml(String(m.generate_prompt).slice(0, 140))}”`);
+    editMeta.innerHTML = parts.length ? `Pochodzenie — ${parts.join(' · ')}` : '';
+    editMeta.style.display = parts.length ? 'block' : 'none';
+  };
+
+  byId('ml-distill-edit-load')?.addEventListener('click', async () => {
+    const dsid = String(byId('ml-distill-edit-ds')?.value || '');
+    if (!dsid) { toast('Wybierz dataset', 'error'); return; }
+    editStatus.textContent = 'Wczytywanie…';
+    try {
+      // limit chroni przeglądarkę (rozmiar odpowiedzi + liczba textarea). Dobrany
+      // wysoko, bo datasety destylacji są zwykle małe; gdy total > limit, ładujemy
+      // tylko część i BLOKUJEMY zapis (zapis nadpisuje całość → utrata reszty).
+      const LIMIT = 5000;
+      const resp = await ApiBinary.one('mlStudioDatasetRowsRequest', { datasetId: dsid, limit: LIMIT });
+      const raw = Array.isArray(resp.rows) ? resp.rows : [];
+      const parsed = raw.map((r) => { try { return JSON.parse(r); } catch (_) { return null; } })
+        .filter((o) => o && typeof o === 'object');
+      // UNIA kluczy ze WSZYSTKICH wierszy (nie tylko [0]) — inaczej pola obecne
+      // tylko w dalszych wierszach nie byłyby renderowane i przepadłyby przy zapisie.
+      const keySet = new Set();
+      parsed.forEach((o) => Object.keys(o).forEach((k) => keySet.add(k)));
+      editCols = keySet.size ? [...keySet] : ['question', 'answer'];
+      editDatasetId = dsid;
+      editRowsBox.innerHTML = '';
+      parsed.forEach((o) => addRowEl(o));
+      if (!parsed.length) addRowEl(null); // pusty dataset → jeden pusty wiersz do wypełnienia
+      editActions.style.display = 'flex';
+      renderMeta(resp.meta);
+      const total = resp.total ?? parsed.length;
+      // Blokujemy zapis w dwóch przypadkach: (a) załadowano tylko część dużego
+      // datasetu (zapis nadpisałby resztę); (b) dataset w trakcie generacji
+      // (pending) — zapis oznaczyłby go jako completed i kolidował z tłem.
+      editTruncated = total > parsed.length;
+      editPending = !!resp.pending;
+      const saveBtn = byId('ml-distill-edit-save');
+      if (editTruncated || editPending) saveBtn?.setAttribute('disabled', 'true');
+      else saveBtn?.removeAttribute('disabled');
+      editStatus.textContent = editPending
+        ? 'Dataset w trakcie generacji — podgląd tylko; edycja/zapis po zakończeniu.'
+        : editTruncated
+          ? `Wczytano ${parsed.length} z ${total} — dataset za duży na pełną edycję w GUI; ZAPIS WYŁĄCZONY (nadpisałby resztę).`
+          : `Wczytano ${parsed.length} wierszy (kolumny: ${editCols.join(' · ')}).`;
+    } catch (e) {
+      editStatus.textContent = 'Błąd wczytywania: ' + (e.message || e);
+    }
+  });
+
+  byId('ml-distill-edit-add')?.addEventListener('click', () => addRowEl(null));
+
+  byId('ml-distill-edit-save')?.addEventListener('click', async () => {
+    if (!editDatasetId) { toast('Najpierw wczytaj dataset', 'error'); return; }
+    if (editTruncated) { toast('Zapis wyłączony — załadowano tylko część datasetu (nadpisałby resztę).', 'error'); return; }
+    if (editPending) { toast('Dataset w trakcie generacji — edycja możliwa po zakończeniu.', 'error'); return; }
+    const rows = collectRows();
+    editStatus.textContent = 'Zapisywanie…';
+    try {
+      const resp = await ApiBinary.one('mlStudioDatasetRowsSaveRequest', { datasetId: editDatasetId, rows });
+      editStatus.textContent = `Zapisano ${resp.rowCount ?? resp.row_count ?? rows.length} wierszy.`;
+      toast('Dataset zapisany', 'success');
+    } catch (e) {
+      editStatus.textContent = 'Błąd zapisu: ' + (e.message || e);
+      toast('Błąd zapisu datasetu', 'error');
+    }
+  });
+
+  // Populacja tf-select datasetów (tf-select przyjmuje opcje przez setOptions).
+  byId('ml-distill-edit-ds')?.setOptions?.(
+    [{ label: '— wybierz dataset —', value: '' }].concat(
+      datasets.map((d) => ({
+        label: d.name || '(bez nazwy)',
+        value: String(d.datasetId || d.dataset_id || d.id || ''),
+      })),
+    ),
+    '',
+  );
+}
+
+// =============================================================================
 // Zakładka „Model bazowy" — f00 (wybór modelu) + f01 (metoda i hiperparametry).
 // Auto-zapis do ftConfig[pid] przy każdej zmianie, plus jawny przycisk „Zapisz".
 // =============================================================================
 function renderFtModelTab(panel, p) {
   const pid = projectId(p);
   const cfg = getFtConfig(pid);
+  const isDistill = (p.projectType ?? p.project_type ?? '') === 'distillation';
 
   const modelCards = FT_BASE_MODELS.map((m) => `
     <button type="button" class="ml-studio-train-engine-card ml-studio-ft-model-card${cfg.baseModel === m.id ? ' selected' : ''}"
@@ -2009,7 +2472,7 @@ function renderFtModelTab(panel, p) {
       <div class="ml-studio-train-engine-body">
         <div class="ml-studio-train-engine-title">Własny z HuggingFace</div>
         <p class="ml-studio-train-engine-text">Wskaż dowolne repo HF zdolne do generacji LLM.</p>
-        <tf-input id="ml-studio-ft-custom-repo" placeholder="np. Qwen/Qwen3.5-0.8B-Instruct"
+        <tf-input id="ml-studio-ft-custom-repo" placeholder="np. Qwen/Qwen2.5-0.5B-Instruct"
                   value="${escapeAttr(cfg.customRepo || '')}"></tf-input>
         <div class="ml-studio-ft-origin-row">${ftSourceChip('hf')}<span class="ml-studio-ft-cap">capability sprawdzany po podaniu repo</span></div>
       </div>
@@ -2058,7 +2521,7 @@ function renderFtModelTab(panel, p) {
         <div class="ml-studio-data-head">${sprite('tune')} Metoda treningu
           <span class="ml-studio-data-hint">dwie osie: cel × parametryzacja</span>
         </div>
-        <div class="ml-studio-ft-axis-label">Oś 1 — Cel</div>
+        <div class="ml-studio-ft-axis-label">Oś 1 — Cel${isDistill ? ' <span class="ml-studio-data-hint">— wszystkie to tryby DESTYLACJI, różni je sygnał od nauczyciela (odpowiedzi / preferencje / logity)</span>' : ''}</div>
         <div class="ml-studio-ft-axis-grid" id="ml-studio-ft-objectives">${objectiveCards}</div>
         <div class="ml-studio-ft-teacher-field" id="ml-studio-ft-teacher-field"
              style="${cfg.objective === 'kd' ? '' : 'display:none'};margin:8px 0 4px">
@@ -2186,6 +2649,7 @@ function renderFtModelTab(panel, p) {
       toast('Podaj repo HuggingFace dla modelu „Własny".', 'error');
       return;
     }
+    persistFtConfig(pid);
     toast('Zapisano konfigurację fine-tuningu.', 'success');
   });
 
@@ -2232,7 +2696,10 @@ function renderFtTrainContent(panel, p, pid, datasets, { selectTab }) {
     panel.appendChild(empty);
     return;
   }
-  // Brak konfiguracji → kierujemy do zakładki Model bazowy.
+  // Brak konfiguracji → kierujemy do zakładki Model bazowy. Najpierw próba
+  // hydratacji zapisanego configu (localStorage) — po reloadzie/nowej sesji
+  // wcześniej zapisana konfiguracja wraca zamiast pustego stanu.
+  hydrateFtConfig(pid);
   if (!ftConfig[pid]) {
     panel.innerHTML = '';
     const empty = document.createElement('tf-empty-state');
@@ -2591,11 +3058,39 @@ const RECOG_HP = [
   { key: 'resolution', label: 'rozdzielczość', def: 576, step: '32', min: 224 },
 ];
 
+// Warianty backbone'u klasyfikatora atrybutu (timm). Kolejność = od najlżejszego
+// do najlepszej jakości; opisy trzymają się konwencji kart RF-DETR.
+const CLF_VARIANTS = [
+  { id: 'mobilenetv4', name: 'MobileNetV4', desc: 'Lekki — najszybszy, najmniejszy model.' },
+  { id: 'efficientnet_b0', name: 'EfficientNet-B0', desc: 'Kompromis szybkość/jakość.' },
+  { id: 'resnet50', name: 'ResNet-50', desc: 'Najlepsza jakość, większy koszt.' },
+];
+
+// Hiperparametry klasyfikatora (osobny zestaw niż detekcja). freezeBackbone jest
+// przełącznikiem bool i trzymany jest poza tą listą (renderowany jako tf-toggle).
+const CLF_HP = [
+  { key: 'epochs', label: 'epoki', def: 40, step: '1', min: 1 },
+  { key: 'batchSize', label: 'batch size', def: 32, step: '1', min: 1 },
+  { key: 'learningRate', label: 'learning rate', def: 0.0003, step: '0.0001', min: 0 },
+  { key: 'imageSize', label: 'rozmiar obrazu', def: 224, step: '32', min: 96 },
+];
+
 const recogCfg = {};
+function defaultClfHyperparams() {
+  const hp = {};
+  for (const h of CLF_HP) hp[h.key] = h.def;
+  hp.freezeBackbone = false;
+  return hp;
+}
 function defaultRecogCfg() {
   const hyperparams = {};
   for (const h of RECOG_HP) hyperparams[h.key] = h.def;
-  return { datasetId: '', variant: 'base', targetNodeId: '', earlyStopping: true, hyperparams };
+  return {
+    datasetId: '', target: 'detection', variant: 'base',
+    attribute: '', sourceClass: '', clfVariant: 'mobilenetv4',
+    clfHyperparams: defaultClfHyperparams(),
+    targetNodeId: '', earlyStopping: true, hyperparams,
+  };
 }
 function getRecogCfg(pid) {
   if (!recogCfg[pid]) recogCfg[pid] = defaultRecogCfg();
@@ -2673,7 +3168,7 @@ function renderRecogDataTab(panel, p) {
           <p class="ml-studio-data-origin-text" style="margin:10px 0">Zbiory detekcji to dziesiątki/setki MB obrazów — podajesz ŚCIEŻKĘ do katalogu COCO (z <code>_annotations.coco.json</code>), nie wgrywasz bajtów. Klasy i liczba obrazów są czytane z plików COCO.</p>
           <div class="ml-studio-source-fields">
             <tf-input id="ml-studio-recog-path" label="Ścieżka katalogu COCO" placeholder="/home/.../dataset_aug" style="flex:1;min-width:260px"></tf-input>
-            <tf-input id="ml-studio-recog-name" label="Nazwa (opcjonalnie)" placeholder="np. Orlen ADR" style="min-width:180px"></tf-input>
+            <tf-input id="ml-studio-recog-name" label="Nazwa (opcjonalnie)" placeholder="np. ADR" style="min-width:180px"></tf-input>
             <tf-button variant="secondary" icon="plus" id="ml-studio-recog-register">Zarejestruj dataset</tf-button>
           </div>
         </details>
@@ -3530,6 +4025,45 @@ const RECOG_ATTR_TYPES = [
   { id: 'classifier', label: 'Klasyfikator', icon: 'model', desc: 'osobny model' },
 ];
 
+// Wyprowadza z schematu projektu listę CELÓW treningu — w jednym projekcie może
+// powstać wiele modeli. Zawsze zwraca detekcję, a dodatkowo po jednym celu na
+// każdy atrybut nadający się do osobnego modelu:
+//   - klasyfikator: atrybut typu `list` lub `classifier` o ≥2 wartościach,
+//   - OCR: atrybut typu `ocr` (faza 2 — w UI element może być disabled).
+// Atrybut o tej samej nazwie może wystąpić w wielu klasach — agregujemy jego
+// klasy źródłowe (cropy trenujemy z ramek tych klas) i sumę wartości.
+// `cocoCategories` (opcjonalne) zawęża klasy źródłowe do realnie istniejących
+// kategorii datasetu; gdy puste — bierzemy wszystkie klasy schematu.
+function deriveTrainTargets(schema, cocoCategories) {
+  const targets = [{ task: 'detection' }];
+  const classes = (schema && Array.isArray(schema.classes)) ? schema.classes : [];
+  const cocoNames = Array.isArray(cocoCategories)
+    ? new Set(cocoCategories.map((c) => (typeof c === 'string' ? c : c && c.name)).filter(Boolean))
+    : null;
+  const byAttr = new Map();
+  for (const c of classes) {
+    const attrs = Array.isArray(c.attributes) ? c.attributes : [];
+    for (const a of attrs) {
+      if (!a || !a.name || !a.type) continue;
+      let entry = byAttr.get(a.name);
+      if (!entry) { entry = { name: a.name, type: a.type, values: [], sourceClasses: new Set() }; byAttr.set(a.name, entry); }
+      if (!cocoNames || cocoNames.has(c.name)) entry.sourceClasses.add(c.name);
+      const vals = a.type === 'list' ? (a.list?.values || [])
+        : a.type === 'classifier' ? (a.classifier?.values || []) : [];
+      for (const v of vals) if (!entry.values.includes(v)) entry.values.push(v);
+    }
+  }
+  for (const entry of byAttr.values()) {
+    const sourceClasses = [...entry.sourceClasses];
+    if ((entry.type === 'list' || entry.type === 'classifier') && entry.values.length >= 2) {
+      targets.push({ task: 'classifier', attribute: entry.name, sourceClasses, values: entry.values });
+    } else if (entry.type === 'ocr') {
+      targets.push({ task: 'ocr', attribute: entry.name, sourceClasses });
+    }
+  }
+  return targets;
+}
+
 // Kształt ramki klasy → ikona (segmented control + ikona przy wierszu klasy).
 const RECOG_SHAPES = [
   { id: 'box', label: 'Box', icon: 'grid-2x2' },
@@ -4160,34 +4694,37 @@ function renderRecogSchemaTab(panel, p, { selectTab }) {
   })();
 }
 
-// Zakładka "Trening" dla recognition: wybór datasetu + wariantu + hiperparametry
-// + start treningu. Po starcie przechodzi w widok LIVE (startRecogLive).
-function renderRecogTrainTab(panel, p, { selectTab }) {
+// Etykiety celu treningu w segmented control (kolejność jak w deriveTrainTargets).
+const TRAIN_TARGET_LABELS = {
+  detection: 'Detekcja',
+  classifier: 'Klasyfikator',
+  ocr: 'OCR',
+};
+
+// Zakładka "Trening" dla recognition: wybór CELU (detekcja / klasyfikator / OCR)
+// wyprowadzonego ze schematu projektu, potem wybór datasetu + wariantu +
+// hiperparametry + start treningu. Po starcie przechodzi w widok LIVE.
+function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind = '' } = {}) {
   const pid = projectId(p);
   const cfg = getRecogCfg(pid);
-  const variantCards = RECOG_VARIANTS.map((v) => `
-    <button type="button" class="ml-studio-ft-axis-card${cfg.variant === v.id ? ' selected' : ''}"
-            data-variant="${escapeAttr(v.id)}" aria-pressed="${cfg.variant === v.id}">
-      <div class="ml-studio-ft-axis-name">${escapeHtml(v.name)}</div>
-      <p class="ml-studio-ft-axis-desc">${escapeHtml(v.desc)}</p>
-    </button>`).join('');
-  const hpInputs = RECOG_HP.map((h) => `
-    <div class="ml-studio-ft-hp-field">
-      <tf-input type="number" label="${escapeAttr(h.label)}" id="ml-studio-recog-hp-${escapeAttr(h.key)}"
-                value="${escapeAttr(String(cfg.hyperparams[h.key]))}" min="${escapeAttr(String(h.min))}" step="${escapeAttr(h.step)}"></tf-input>
-    </div>`).join('');
+  // Cele wyprowadzone ze schematu; wypełniane asynchronicznie. Do czasu wczytania
+  // dostępna jest tylko detekcja (zawsze obecna).
+  let trainTargets = [{ task: 'detection' }];
+  let datasetList = [];
 
   panel.innerHTML = `
     <div class="ml-studio-ft">
       <div id="ml-studio-recog-setup">
         <section class="ml-studio-data-card">
+          <div class="ml-studio-data-head">${sprite('model')} Cel treningu
+            <span class="ml-studio-data-hint">wybierz co trenujesz — w jednym projekcie może powstać wiele modeli</span>
+          </div>
+          <div class="ml-studio-target-seg" id="ml-studio-train-target" role="tablist"></div>
+        </section>
+        <section class="ml-studio-data-card">
           <div class="ml-studio-data-head">${sprite('database')} Zbiór treningowy (COCO)</div>
           <tf-select id="ml-studio-recog-dataset" label="Dataset" placeholder="wybierz zarejestrowany dataset COCO"></tf-select>
           <div id="ml-studio-recog-classes" class="ml-studio-data-origin-text" style="margin-top:8px"></div>
-        </section>
-        <section class="ml-studio-data-card">
-          <div class="ml-studio-data-head">${sprite('image')} Wariant modelu RF-DETR</div>
-          <div class="ml-studio-ft-axis-grid" id="ml-studio-recog-variants">${variantCards}</div>
         </section>
         <section class="ml-studio-data-card">
           <div class="ml-studio-data-head">${sprite('services')} Węzeł treningu (mesh)
@@ -4195,10 +4732,7 @@ function renderRecogTrainTab(panel, p, { selectTab }) {
           </div>
           <tf-select id="ml-studio-recog-node" label="Węzeł"></tf-select>
         </section>
-        <section class="ml-studio-data-card">
-          <div class="ml-studio-data-head">${sprite('tune')} Hiperparametry</div>
-          <div class="ml-studio-ft-hp-grid">${hpInputs}</div>
-        </section>
+        <div id="ml-studio-train-form"></div>
         <div class="ml-studio-ft-actions">
           <tf-button variant="primary" icon="play" id="ml-studio-recog-run">Uruchom trening</tf-button>
         </div>
@@ -4207,11 +4741,230 @@ function renderRecogTrainTab(panel, p, { selectTab }) {
     </div>
   `;
 
+  // Wznowienie widoku LIVE dla joba wybranego w panelu „Joby": chowamy formularz
+  // startu i od razu podłączamy polling. Klasyfikator raportuje przez generyczny
+  // status (macro-F1), detekcja przez status detekcji (mAP@50).
+  if (focusRunId) {
+    const setup = byId('ml-studio-recog-setup');
+    if (setup) setup.hidden = true;
+    const isClassifier = String(focusKind || '').toLowerCase().includes('klas')
+      || String(focusKind || '').toLowerCase() === 'classifier';
+    const liveOpts = isClassifier
+      ? { selectTab, metricLabel: 'macro-F1', statusRequest: 'mlStudioGenericTrainStatusRequest' }
+      : { selectTab };
+    startRecogLive(byId('ml-studio-recog-live'), focusRunId, liveOpts);
+    return;
+  }
+
+  // Segmented control celu: detekcja zawsze aktywna, klasyfikator aktywny gdy
+  // schemat ma nadający się atrybut, OCR na razie disabled (faza 2).
+  function renderTargetSeg() {
+    const host = byId('ml-studio-train-target');
+    if (!host) return;
+    const hasClassifier = trainTargets.some((t) => t.task === 'classifier');
+    const avail = { detection: true, classifier: hasClassifier, ocr: false };
+    host.innerHTML = ['detection', 'classifier', 'ocr'].map((task) => {
+      const on = cfg.target === task;
+      const dis = !avail[task];
+      const suffix = task === 'ocr' ? ' (wkrótce)' : '';
+      return `<button type="button" role="tab" data-target="${task}"
+        class="ml-studio-target-seg-btn${on ? ' selected' : ''}"
+        aria-selected="${on}"${dis ? ' disabled' : ''}>${escapeHtml(TRAIN_TARGET_LABELS[task])}${suffix}</button>`;
+    }).join('');
+    host.querySelectorAll('.ml-studio-target-seg-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        if (btn.hasAttribute('disabled')) return;
+        const task = btn.getAttribute('data-target');
+        if (task === cfg.target) return;
+        cfg.target = task;
+        renderTargetSeg();
+        renderTargetForm();
+      });
+    });
+  }
+
+  // Dynamiczny formularz zależny od celu. detection → dotychczasowe karty RF-DETR;
+  // classifier → atrybut + klasa źródłowa + podgląd etykiet + warianty timm + HP.
+  function renderTargetForm() {
+    const host = byId('ml-studio-train-form');
+    if (!host) return;
+    if (cfg.target === 'classifier') {
+      host.innerHTML = classifierFormHtml();
+      bindClassifierForm();
+    } else {
+      host.innerHTML = detectionFormHtml();
+      bindDetectionForm();
+    }
+  }
+
+  function detectionFormHtml() {
+    const variantCards = RECOG_VARIANTS.map((v) => `
+      <button type="button" class="ml-studio-ft-axis-card${cfg.variant === v.id ? ' selected' : ''}"
+              data-variant="${escapeAttr(v.id)}" aria-pressed="${cfg.variant === v.id}">
+        <div class="ml-studio-ft-axis-name">${escapeHtml(v.name)}</div>
+        <p class="ml-studio-ft-axis-desc">${escapeHtml(v.desc)}</p>
+      </button>`).join('');
+    const hpInputs = RECOG_HP.map((h) => `
+      <div class="ml-studio-ft-hp-field">
+        <tf-input type="number" label="${escapeAttr(h.label)}" id="ml-studio-recog-hp-${escapeAttr(h.key)}"
+                  value="${escapeAttr(String(cfg.hyperparams[h.key]))}" min="${escapeAttr(String(h.min))}" step="${escapeAttr(h.step)}"></tf-input>
+      </div>`).join('');
+    return `
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('image')} Wariant modelu RF-DETR</div>
+        <div class="ml-studio-ft-axis-grid" id="ml-studio-recog-variants">${variantCards}</div>
+      </section>
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('tune')} Hiperparametry</div>
+        <div class="ml-studio-ft-hp-grid">${hpInputs}</div>
+        <p class="ml-studio-ft-hp-hint">Rozdzielczość zostanie zaokrąglona do wielokrotności 32 (nano/small/medium) lub 56 (base/large — backbone DINOv2).</p>
+      </section>`;
+  }
+
+  function bindDetectionForm() {
+    byId('ml-studio-recog-variants')?.querySelectorAll('.ml-studio-ft-axis-card').forEach((card) => {
+      card.addEventListener('click', () => {
+        cfg.variant = card.getAttribute('data-variant');
+        panel.querySelectorAll('#ml-studio-recog-variants .ml-studio-ft-axis-card').forEach((c) => {
+          const on = c === card;
+          c.classList.toggle('selected', on);
+          c.setAttribute('aria-pressed', String(on));
+        });
+      });
+    });
+    for (const h of RECOG_HP) {
+      byId('ml-studio-recog-hp-' + h.key)?.addEventListener('input', (e) => {
+        const v = Number(e.target.value);
+        if (Number.isFinite(v)) cfg.hyperparams[h.key] = v;
+      });
+    }
+  }
+
+  function classifierFormHtml() {
+    const variantCards = CLF_VARIANTS.map((v) => `
+      <button type="button" class="ml-studio-ft-axis-card${cfg.clfVariant === v.id ? ' selected' : ''}"
+              data-variant="${escapeAttr(v.id)}" aria-pressed="${cfg.clfVariant === v.id}">
+        <div class="ml-studio-ft-axis-name">${escapeHtml(v.name)}</div>
+        <p class="ml-studio-ft-axis-desc">${escapeHtml(v.desc)}</p>
+      </button>`).join('');
+    const hpInputs = CLF_HP.map((h) => `
+      <div class="ml-studio-ft-hp-field">
+        <tf-input type="number" label="${escapeAttr(h.label)}" id="ml-studio-clf-hp-${escapeAttr(h.key)}"
+                  value="${escapeAttr(String(cfg.clfHyperparams[h.key]))}" min="${escapeAttr(String(h.min))}" step="${escapeAttr(h.step)}"></tf-input>
+      </div>`).join('');
+    return `
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('model')} Atrybut do klasyfikacji</div>
+        <tf-select id="ml-studio-train-attr" label="Atrybut"></tf-select>
+        <tf-select id="ml-studio-train-source-class" label="Klasa źródłowa cropów" style="margin-top:8px"></tf-select>
+        <div id="ml-studio-train-labels" class="ml-studio-data-origin-text" style="margin-top:8px"></div>
+      </section>
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('image')} Wariant klasyfikatora</div>
+        <div class="ml-studio-ft-axis-grid" id="ml-studio-clf-variants">${variantCards}</div>
+      </section>
+      <section class="ml-studio-data-card">
+        <div class="ml-studio-data-head">${sprite('tune')} Hiperparametry</div>
+        <div class="ml-studio-ft-hp-grid">${hpInputs}</div>
+        <div class="ml-studio-schema-toggle-row" style="margin-top:10px">
+          <tf-toggle id="ml-studio-clf-freeze"${cfg.clfHyperparams.freezeBackbone ? ' checked' : ''}></tf-toggle>
+          <span><strong>Zamroź backbone</strong> — trenuje tylko głowicę klasyfikatora (szybciej, mniej danych)</span>
+        </div>
+      </section>`;
+  }
+
+  function clfTargets() {
+    return trainTargets.filter((t) => t.task === 'classifier');
+  }
+
+  function bindClassifierForm() {
+    const attrs = clfTargets();
+    if (!attrs.length) return;
+    // Utrzymaj wybór atrybutu w granicach dostępnych celów.
+    let current = attrs.find((t) => t.attribute === cfg.attribute) || attrs[0];
+    cfg.attribute = current.attribute;
+
+    const attrSel = byId('ml-studio-train-attr');
+    const attrOpts = attrs.map((t) => ({ value: t.attribute, label: t.attribute }));
+    if (attrSel?.setOptions) attrSel.setOptions(attrOpts, cfg.attribute);
+    else if (attrSel) attrSel.innerHTML = attrOpts.map((o) => `<option value="${escapeAttr(o.value)}"${o.value === cfg.attribute ? ' selected' : ''}>${escapeHtml(o.label)}</option>`).join('');
+
+    const syncSourceAndLabels = () => {
+      current = attrs.find((t) => t.attribute === cfg.attribute) || attrs[0];
+      const srcSel = byId('ml-studio-train-source-class');
+      // Opcja "Wszystkie klasy" (wartość "") na górze i domyślnie wybrana — serwis
+      // traktuje pusty sourceClass jako dowolną kategorię i trenuje na cropach ze
+      // wszystkich klas mających dany atrybut.
+      const srcOpts = [{ value: '', label: 'Wszystkie klasy' }, ...(current.sourceClasses || []).map((c) => ({ value: c, label: c }))];
+      if (!srcOpts.some((o) => o.value === cfg.sourceClass)) cfg.sourceClass = '';
+      if (srcSel?.setOptions) srcSel.setOptions(srcOpts, cfg.sourceClass);
+      else if (srcSel) srcSel.innerHTML = srcOpts.map((o) => `<option value="${escapeAttr(o.value)}"${o.value === cfg.sourceClass ? ' selected' : ''}>${escapeHtml(o.label)}</option>`).join('');
+      renderClfLabels(current);
+    };
+
+    attrSel?.addEventListener('change', (e) => {
+      cfg.attribute = e.detail?.value || attrSel.value || '';
+      syncSourceAndLabels();
+    });
+    byId('ml-studio-train-source-class')?.addEventListener('change', (e) => {
+      cfg.sourceClass = e.detail?.value || byId('ml-studio-train-source-class').value || '';
+    });
+    syncSourceAndLabels();
+
+    byId('ml-studio-clf-variants')?.querySelectorAll('.ml-studio-ft-axis-card').forEach((card) => {
+      card.addEventListener('click', () => {
+        cfg.clfVariant = card.getAttribute('data-variant');
+        panel.querySelectorAll('#ml-studio-clf-variants .ml-studio-ft-axis-card').forEach((c) => {
+          const on = c === card;
+          c.classList.toggle('selected', on);
+          c.setAttribute('aria-pressed', String(on));
+        });
+      });
+    });
+    for (const h of CLF_HP) {
+      byId('ml-studio-clf-hp-' + h.key)?.addEventListener('input', (e) => {
+        const v = Number(e.target.value);
+        if (Number.isFinite(v)) cfg.clfHyperparams[h.key] = v;
+      });
+    }
+    byId('ml-studio-clf-freeze')?.addEventListener('change', (e) => {
+      cfg.clfHyperparams.freezeBackbone = !!e.detail?.checked;
+    });
+  }
+
+  // Podgląd etykiet klasyfikatora: liczba klas + wartości; jeśli profil datasetu
+  // zawiera liczności per wartość — dokładamy je w nawiasie.
+  function renderClfLabels(target) {
+    const box = byId('ml-studio-train-labels');
+    if (!box || !target) return;
+    const values = target.values || [];
+    const counts = attrCountsFromProfile(cfg.datasetId, target.attribute);
+    const parts = values.map((v) => {
+      const n = counts ? counts[v] : null;
+      return n != null ? `${escapeHtml(v)} (${n})` : escapeHtml(v);
+    });
+    box.innerHTML = values.length
+      ? `${sprite('info')} ${values.length} klas: ${parts.join(' / ')}`
+      : '';
+  }
+
+  // Liczności wartości atrybutu z profilu datasetu (gdy backend je udostępnia w
+  // profileJson jako attributes[nazwa] = { wartość: liczba }). Brak → null.
+  function attrCountsFromProfile(dsId, attribute) {
+    const d = datasetList.find((x) => (x.datasetId ?? x.dataset_id) === dsId);
+    if (!d) return null;
+    let prof = d.profileJson ?? d.profile_json;
+    try { prof = typeof prof === 'string' ? JSON.parse(prof) : prof; } catch (_) { return null; }
+    const c = prof && prof.attributes && prof.attributes[attribute];
+    return c && typeof c === 'object' ? c : null;
+  }
+
   // Lista datasetów COCO do selecta.
   (async () => {
     try {
       const resp = await ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid });
       const list = (resp.datasets || []).filter((d) => (d.kind || '') === 'coco_path' || (d.kind || '') === 'coco');
+      datasetList = list;
       const sel = byId('ml-studio-recog-dataset');
       if (sel) {
         sel.innerHTML = list.map((d) => `<option value="${escapeAttr(d.datasetId ?? d.dataset_id)}">${escapeHtml(d.name)} (${d.rowCount ?? d.row_count ?? 0} obr.)</option>`).join('');
@@ -4224,6 +4977,7 @@ function renderRecogTrainTab(panel, p, { selectTab }) {
       sel?.addEventListener('change', (e) => {
         cfg.datasetId = e.detail?.value || sel.value;
         showRecogClasses(list, cfg.datasetId);
+        if (cfg.target === 'classifier') renderClfLabels(clfTargets().find((t) => t.attribute === cfg.attribute));
       });
     } catch (_) { /* brak datasetów — select pusty */ }
   })();
@@ -4258,47 +5012,82 @@ function renderRecogTrainTab(panel, p, { selectTab }) {
     nodeSel.addEventListener('change', (e) => { cfg.targetNodeId = e.detail?.value || nodeSel.value || ''; });
   })();
 
-  byId('ml-studio-recog-variants')?.querySelectorAll('.ml-studio-ft-axis-card').forEach((card) => {
-    card.addEventListener('click', () => {
-      cfg.variant = card.getAttribute('data-variant');
-      panel.querySelectorAll('#ml-studio-recog-variants .ml-studio-ft-axis-card').forEach((c) => {
-        const on = c === card;
-        c.classList.toggle('selected', on);
-        c.setAttribute('aria-pressed', String(on));
-      });
-    });
-  });
-  for (const h of RECOG_HP) {
-    byId('ml-studio-recog-hp-' + h.key)?.addEventListener('input', (e) => {
-      const v = Number(e.target.value);
-      if (Number.isFinite(v)) cfg.hyperparams[h.key] = v;
-    });
-  }
+  // Wyprowadź cele ze schematu projektu + kategorii COCO datasetu.
+  (async () => {
+    let schema = {};
+    let cocoCategories = [];
+    try {
+      const resp = await ApiBinary.one('mlStudioSchemaGetRequest', { projectId: pid });
+      schema = JSON.parse(resp.schemaJson ?? resp.schema_json ?? '{}');
+    } catch (_) { schema = {}; }
+    try {
+      const dsResp = await ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid });
+      const first = (dsResp.datasets || []).find((d) => (d.kind || '') === 'coco_path');
+      if (first) {
+        const imgResp = await ApiBinary.one('mlStudioRecogImagesListRequest', { datasetId: first.datasetId ?? first.dataset_id });
+        cocoCategories = JSON.parse(imgResp.categoriesJson ?? imgResp.categories_json ?? '[]');
+      }
+    } catch (_) { cocoCategories = []; }
+    trainTargets = deriveTrainTargets(schema, cocoCategories);
+    // Jeśli zapamiętany cel nie ma już pokrycia, wróć do detekcji.
+    if (cfg.target === 'classifier' && !trainTargets.some((t) => t.task === 'classifier')) cfg.target = 'detection';
+    renderTargetSeg();
+    renderTargetForm();
+  })();
+
+  // Wstępny render (do wczytania schematu — tylko detekcja).
+  renderTargetSeg();
+  renderTargetForm();
 
   byId('ml-studio-recog-run')?.addEventListener('click', async () => {
     if (!cfg.datasetId) { toast('Wybierz zarejestrowany dataset COCO.', 'error'); return; }
     const btn = byId('ml-studio-recog-run');
     btn?.setAttribute('disabled', '');
     try {
-      const resp = await ApiBinary.one('mlStudioRecogTrainStartRequest', {
-        projectId: pid,
-        datasetId: cfg.datasetId,
-        variant: cfg.variant,
-        targetNodeId: cfg.targetNodeId || '',
-        hyperparams: {
-          epochs: cfg.hyperparams.epochs,
-          batchSize: cfg.hyperparams.batchSize,
-          gradAccum: cfg.hyperparams.gradAccum,
-          learningRate: cfg.hyperparams.learningRate,
-          resolution: cfg.hyperparams.resolution,
-          earlyStopping: cfg.earlyStopping,
-        },
-      });
-      const runId = resp.runId ?? resp.run_id;
+      let runId;
+      let liveOpts = { selectTab };
+      if (cfg.target === 'classifier') {
+        const target = clfTargets().find((t) => t.attribute === cfg.attribute);
+        if (!target) throw new Error('Wybierz atrybut do klasyfikacji.');
+        const resp = await ApiBinary.one('mlStudioClassifierTrainStartRequest', {
+          projectId: pid,
+          datasetId: cfg.datasetId,
+          attribute: cfg.attribute,
+          sourceClass: cfg.sourceClass,
+          variant: cfg.clfVariant,
+          values: target.values || [],
+          hyperparams: {
+            epochs: cfg.clfHyperparams.epochs,
+            batchSize: cfg.clfHyperparams.batchSize,
+            learningRate: cfg.clfHyperparams.learningRate,
+            imageSize: cfg.clfHyperparams.imageSize,
+            freezeBackbone: cfg.clfHyperparams.freezeBackbone,
+          },
+          targetNodeId: cfg.targetNodeId || '',
+        });
+        runId = resp.runId ?? resp.run_id;
+        liveOpts = { selectTab, metricLabel: 'macro-F1', statusRequest: 'mlStudioGenericTrainStatusRequest' };
+      } else {
+        const resp = await ApiBinary.one('mlStudioRecogTrainStartRequest', {
+          projectId: pid,
+          datasetId: cfg.datasetId,
+          variant: cfg.variant,
+          targetNodeId: cfg.targetNodeId || '',
+          hyperparams: {
+            epochs: cfg.hyperparams.epochs,
+            batchSize: cfg.hyperparams.batchSize,
+            gradAccum: cfg.hyperparams.gradAccum,
+            learningRate: cfg.hyperparams.learningRate,
+            resolution: cfg.hyperparams.resolution,
+            earlyStopping: cfg.earlyStopping,
+          },
+        });
+        runId = resp.runId ?? resp.run_id;
+      }
       if (!runId) throw new Error('Backend nie zwrócił runId.');
       const setup = byId('ml-studio-recog-setup');
       if (setup) setup.hidden = true;
-      startRecogLive(byId('ml-studio-recog-live'), runId, { selectTab });
+      startRecogLive(byId('ml-studio-recog-live'), runId, liveOpts);
     } catch (err) {
       btn?.removeAttribute('disabled');
       toast(`Start treningu: ${err.message}`, 'error');
@@ -4346,25 +5135,82 @@ function fmtRate(bps) {
   return r > 0 ? `${fmtBytes(r)}/s` : '—';
 }
 
-function startRecogLive(host, runId, { selectTab }) {
+// Czas trwania w sekundach → mm:ss (poniżej godziny) lub hh:mm:ss (powyżej).
+// Używane do „czasu trwania" (elapsed_s) w widoku LIVE.
+function fmtDuration(seconds) {
+  const s = Math.max(0, Math.floor(Number(seconds) || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${pad(m)}:${pad(sec)}`;
+}
+
+// Szacowany czas do końca w sekundach → przyjazny opis („~12 min", „~45 s",
+// „~1 h 5 min"). Zwraca '—' dla braku/wartości niedodatnich.
+function fmtEta(seconds) {
+  const s = Number(seconds);
+  if (!Number.isFinite(s) || s <= 0) return '—';
+  if (s < 90) return `~${Math.round(s)} s`;
+  const totalMin = Math.round(s / 60);
+  if (totalMin < 60) return `~${totalMin} min`;
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return m > 0 ? `~${h} h ${m} min` : `~${h} h`;
+}
+
+// Pamięć GPU w MB → gigabajty z polskim przecinkiem („6,9 GB"). Poniżej 1 GB
+// pokazuje pełne MB, żeby drobne joby nie wyświetlały „0,0 GB".
+function fmtGb(mb) {
+  const m = Number(mb);
+  if (!Number.isFinite(m) || m <= 0) return '—';
+  if (m < 1024) return `${Math.round(m)} MB`;
+  return `${(m / 1024).toLocaleString('pl-PL', { minimumFractionDigits: 1, maximumFractionDigits: 1 })} GB`;
+}
+
+// Etykiety etapów treningu (pole `stage` z backendu). Nieznany slug pokazujemy
+// dosłownie, żeby nie ukrywać realnego stanu przekazanego przez Core.
+const STAGE_LABEL = {
+  init: 'inicjalizacja',
+  loading: 'wczytywanie danych',
+  warmup: 'rozgrzewka',
+  training: 'trening',
+  validating: 'walidacja',
+  saving: 'zapis modelu',
+  exporting: 'eksport',
+  finalizing: 'finalizacja',
+};
+
+function stageLabel(stage) {
+  const s = String(stage || '').toLowerCase();
+  if (!s) return '';
+  return STAGE_LABEL[s] || stage;
+}
+
+function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', statusRequest = 'mlStudioRecogTrainStatusRequest' } = {}) {
   if (!host) return;
   stopFtPolling();
+  // Klasyfikator raportuje przez generyczny status (curve:[{epoch,metricName,value}])
+  // i inną metrykę główną (macro-F1); detekcja zostaje przy mAP@50 + train loss.
+  const isGeneric = statusRequest !== 'mlStudioRecogTrainStatusRequest';
+  const headTitle = isGeneric ? 'Trening klasyfikatora na żywo' : 'Trening detekcji na żywo';
   host.innerHTML = `
     <section class="ml-studio-data-card ml-studio-ft-live">
-      <div class="ml-studio-data-head">${sprite('cpu')} Trening detekcji na żywo
+      <div class="ml-studio-data-head">${sprite('cpu')} ${escapeHtml(headTitle)}
         <span class="ml-studio-ft-status" id="ml-studio-recog-badge"><tf-badge tone="warning" value="trening trwa"></tf-badge></span>
       </div>
       <div class="ml-studio-ft-progress">
         <div class="ml-studio-ft-progress-meta" id="ml-studio-recog-meta">epoka 0</div>
         <tf-progress-bar id="ml-studio-recog-bar" value="0" tone="accent"></tf-progress-bar>
+        <div class="ml-studio-live-info" id="ml-studio-recog-info" hidden></div>
       </div>
       <div class="ml-studio-ft-kpi-grid" id="ml-studio-recog-kpi"></div>
       <div class="ml-studio-ft-chart-wrap">
         <div class="ml-studio-ft-chart-head">
-          <span class="ml-studio-ft-chart-title">Krzywa: train loss + mAP@50</span>
+          <span class="ml-studio-ft-chart-title">Krzywa: train loss + ${escapeHtml(metricLabel)}</span>
           <span class="ml-studio-ft-chart-legend">
             <span class="lg"><span class="sw train"></span>train loss</span>
-            <span class="lg"><span class="sw eval"></span>mAP@50</span>
+            <span class="lg"><span class="sw eval"></span>${escapeHtml(metricLabel)}</span>
           </span>
         </div>
         <div id="ml-studio-recog-chart"></div>
@@ -4372,6 +5218,13 @@ function startRecogLive(host, runId, { selectTab }) {
       <div class="ml-studio-ft-done" id="ml-studio-recog-done" hidden></div>
     </section>
   `;
+
+  // Stan do samodzielnego liczenia ETA, gdy backend nie poda `eta_s`: mierzymy
+  // realny czas między zmianami epoki (delta czasu / delta epok) i wygładzamy,
+  // po czym mnożymy przez liczbę pozostałych epok. `liveStartedAt` służy jako
+  // zapasowe źródło „czasu trwania", gdy brak `elapsed_s`.
+  const liveStartedAt = Date.now();
+  const etaTracker = { lastEpoch: -1, lastTime: 0, secPerEpoch: 0 };
 
   const renderStatus = (st) => {
     const status = String(st.status || 'running');
@@ -4410,9 +5263,33 @@ function startRecogLive(host, runId, { selectTab }) {
     }
     const epoch = Number(st.epoch ?? 0);
     const total = Number(st.totalEpochs ?? st.total_epochs ?? 0);
-    const loss = st.trainLoss ?? st.train_loss;
-    const map50 = st.map50;
-    const curve = Array.isArray(st.curve) ? st.curve : [];
+    // Znormalizuj krzywą do wspólnego kształtu {epoch, loss, metric}. Detekcja ma
+    // pola per-punkt (trainLoss/map50); generyczny status ma [{epoch,metricName,value}]
+    // — punkty z metricName zawierającym „loss" idą na oś strat, reszta na metrykę.
+    const rawCurve = Array.isArray(st.curve) ? st.curve : [];
+    let curve;
+    let loss;
+    let metricVal;
+    if (isGeneric) {
+      const byEpoch = new Map();
+      for (const c of rawCurve) {
+        const e = Number(c.epoch ?? 0);
+        if (!byEpoch.has(e)) byEpoch.set(e, { epoch: e, trainLoss: undefined, map50: undefined });
+        const slot = byEpoch.get(e);
+        const name = String(c.metricName ?? c.metric_name ?? '').toLowerCase();
+        const val = Number(c.value);
+        if (name.includes('loss')) slot.trainLoss = val;
+        else slot.map50 = val;
+      }
+      curve = [...byEpoch.values()].sort((a, b) => a.epoch - b.epoch);
+      const last = curve[curve.length - 1];
+      loss = last?.trainLoss;
+      metricVal = last?.map50;
+    } else {
+      curve = rawCurve;
+      loss = st.trainLoss ?? st.train_loss;
+      metricVal = st.map50;
+    }
     const meta = byId('ml-studio-recog-meta');
     const bar = byId('ml-studio-recog-bar');
     if (total > 0) {
@@ -4422,11 +5299,53 @@ function startRecogLive(host, runId, { selectTab }) {
     } else if (meta) {
       meta.innerHTML = `<tf-spinner size="sm"></tf-spinner> trwa — epoka ${epoch}`;
     }
+
+    // Nowe pola statusu (backend doda; toleruj brak): etap, czas trwania, ETA i
+    // pamięć GPU joba. ETA bierzemy z `eta_s`, a gdy go nie ma — liczymy sami z
+    // tempa zmian epoki mierzonego między pollami.
+    const stage = stageLabel(st.stage);
+    const elapsedS = Number(st.elapsedS ?? st.elapsed_s);
+    const gpuMemMb = Number(st.gpuMemMb ?? st.gpu_mem_mb);
+    let etaS = Number(st.etaS ?? st.eta_s);
+    if (epoch !== etaTracker.lastEpoch) {
+      const now = Date.now();
+      if (etaTracker.lastEpoch >= 0 && epoch > etaTracker.lastEpoch) {
+        const perEpoch = ((now - etaTracker.lastTime) / 1000) / (epoch - etaTracker.lastEpoch);
+        etaTracker.secPerEpoch = etaTracker.secPerEpoch > 0
+          ? etaTracker.secPerEpoch * 0.6 + perEpoch * 0.4
+          : perEpoch;
+      }
+      etaTracker.lastEpoch = epoch;
+      etaTracker.lastTime = now;
+    }
+    if ((!Number.isFinite(etaS) || etaS <= 0) && etaTracker.secPerEpoch > 0 && total > 0) {
+      etaS = etaTracker.secPerEpoch * Math.max(0, total - epoch);
+    }
+    const elapsedShown = Number.isFinite(elapsedS) && elapsedS > 0
+      ? elapsedS
+      : Math.floor((Date.now() - liveStartedAt) / 1000);
+    const info = byId('ml-studio-recog-info');
+    if (info) {
+      const items = [];
+      if (stage) items.push({ ico: 'zap', lbl: 'etap', val: stage });
+      if (total > 0) items.push({ ico: 'clock', lbl: 'epoka', val: `${epoch} / ${total}` });
+      items.push({ ico: 'clock', lbl: 'czas', val: fmtDuration(elapsedShown) });
+      items.push({ ico: 'clock', lbl: 'ETA', val: fmtEta(etaS) });
+      if (Number.isFinite(gpuMemMb) && gpuMemMb > 0) {
+        items.push({ ico: 'cpu', lbl: 'VRAM', val: fmtGb(gpuMemMb) });
+      }
+      info.hidden = false;
+      info.innerHTML = items.map((it) => `
+        <span class="ml-studio-live-info-item">${sprite(it.ico)}
+          <span class="ml-studio-live-info-lbl">${escapeHtml(it.lbl)}</span>
+          <span class="ml-studio-live-info-val">${escapeHtml(it.val)}</span>
+        </span>`).join('');
+    }
     const kpi = byId('ml-studio-recog-kpi');
     if (kpi) {
       kpi.innerHTML = `
         <div class="ml-studio-ft-kpi"><div class="lbl">train loss</div><div class="val">${loss != null ? Number(loss).toFixed(4) : '—'}</div></div>
-        <div class="ml-studio-ft-kpi"><div class="lbl">mAP@50</div><div class="val">${map50 != null ? Number(map50).toFixed(4) : '—'}</div></div>
+        <div class="ml-studio-ft-kpi"><div class="lbl">${escapeHtml(metricLabel)}</div><div class="val">${metricVal != null ? Number(metricVal).toFixed(4) : '—'}</div></div>
         <div class="ml-studio-ft-kpi"><div class="lbl">epoka</div><div class="val">${epoch}${total > 0 ? ' / ' + total : ''}</div></div>
       `;
     }
@@ -4447,7 +5366,7 @@ function startRecogLive(host, runId, { selectTab }) {
           <tf-button variant="outline" icon="layers" id="ml-studio-recog-goto-models">Przejdź do Modele</tf-button>`;
         byId('ml-studio-recog-goto-models')?.addEventListener('click', () => selectTab && selectTab('Modele'));
       }
-      toast('Trening detekcji zakończony.', 'success');
+      toast(isGeneric ? 'Trening klasyfikatora zakończony.' : 'Trening detekcji zakończony.', 'success');
     } else if (status === 'failed') {
       stopFtPolling();
       toast(`Trening nieudany: ${st.error || 'nieznany błąd'}`, 'error');
@@ -4458,7 +5377,7 @@ function startRecogLive(host, runId, { selectTab }) {
 
   const poll = async () => {
     try {
-      const st = await ApiBinary.one('mlStudioRecogTrainStatusRequest', { runId });
+      const st = await ApiBinary.one(statusRequest, { runId });
       renderStatus(st);
     } catch (err) {
       stopFtPolling();
@@ -4515,12 +5434,190 @@ function renderRecogChart(curve) {
 }
 
 // =============================================================================
+// Widok "Joby" — przegląd uruchomionych treningów w całym ML Studio.
+// Woła mlStudioJobsOverviewRequest → { jobs:[...], gpu:{...} }, renderuje nagłówek
+// GPU (VRAM + util) i tabelę jobów, auto-odświeżanie co ~3,5 s. Klik w job otwiera
+// projekt i wznawia jego widok LIVE (Router → showDetail z runId).
+// =============================================================================
+
+// Etykieta typu joba (pole `kind`): tolerujemy warianty PL/EN z backendu.
+function jobKindLabel(kind) {
+  const k = String(kind || '').toLowerCase();
+  if (k.includes('klas') || k === 'classifier') return 'klasyfikator';
+  if (k.includes('detek') || k === 'detection') return 'detekcja';
+  return kind || '—';
+}
+
+async function showJobsOverview() {
+  const host = byId('ml-studio-jobs-view');
+  if (!host) return;
+  stopJobsPolling();
+
+  host.innerHTML = `
+    <div class="ml-studio-detail-top">
+      <tf-button variant="ghost" icon="chevron-left" id="ml-studio-jobs-back">Projekty</tf-button>
+    </div>
+    <div class="page-header">
+      <div>
+        <h1>${sprite('cpu')} Joby</h1>
+        <div class="sub">Uruchomione treningi w ML Studio — obciążenie GPU i postęp na żywo</div>
+      </div>
+      <div class="actions">
+        <tf-button variant="ghost" icon="refresh" id="ml-studio-jobs-refresh">Odśwież</tf-button>
+      </div>
+    </div>
+    <div id="ml-studio-jobs-gpu" class="ml-studio-jobs-gpu"></div>
+    <div id="ml-studio-jobs-list" class="ml-studio-jobs-list">
+      <div class="ml-studio-loading"><tf-spinner></tf-spinner></div>
+    </div>
+  `;
+
+  byId('ml-studio-jobs-back')?.addEventListener('click', () => {
+    stopJobsPolling();
+    Router.navigate('ml-studio');
+  });
+
+  const renderGpu = (gpu) => {
+    const box = byId('ml-studio-jobs-gpu');
+    if (!box) return;
+    if (!gpu || !(gpu.name || gpu.memTotalMb || gpu.mem_total_mb)) {
+      box.innerHTML = '';
+      return;
+    }
+    const name = gpu.name || 'GPU';
+    const used = Number(gpu.memUsedMb ?? gpu.mem_used_mb ?? 0);
+    const totalMem = Number(gpu.memTotalMb ?? gpu.mem_total_mb ?? 0);
+    const util = Number(gpu.utilPct ?? gpu.util_pct ?? 0);
+    const memPct = totalMem > 0 ? Math.max(0, Math.min(100, Math.round((used / totalMem) * 100))) : 0;
+    box.innerHTML = `
+      <section class="ml-studio-gpu-card">
+        <div class="ml-studio-gpu-head">${sprite('cpu')} <span class="ml-studio-gpu-name">${escapeHtml(name)}</span>
+          <tf-badge tone="accent" value="util ${Number.isFinite(util) ? Math.round(util) : 0}%"></tf-badge>
+        </div>
+        <div class="ml-studio-gpu-metric">
+          <div class="ml-studio-gpu-metric-row">
+            <span class="ml-studio-gpu-metric-lbl">VRAM</span>
+            <span class="ml-studio-gpu-metric-val">${fmtGb(used)} / ${fmtGb(totalMem)}</span>
+          </div>
+          <tf-progress-bar value="${memPct}" tone="accent"></tf-progress-bar>
+        </div>
+        <div class="ml-studio-gpu-metric">
+          <div class="ml-studio-gpu-metric-row">
+            <span class="ml-studio-gpu-metric-lbl">Wykorzystanie</span>
+            <span class="ml-studio-gpu-metric-val">${Number.isFinite(util) ? Math.round(util) : 0}%</span>
+          </div>
+          <tf-progress-bar value="${Number.isFinite(util) ? Math.max(0, Math.min(100, Math.round(util))) : 0}" tone="success"></tf-progress-bar>
+        </div>
+      </section>
+    `;
+  };
+
+  const renderJobs = (jobs) => {
+    const listBox = byId('ml-studio-jobs-list');
+    if (!listBox) return;
+    if (!jobs.length) {
+      listBox.innerHTML = '';
+      const empty = document.createElement('tf-empty-state');
+      empty.setAttribute('icon', 'cpu');
+      empty.setAttribute('title', 'Brak uruchomionych jobów');
+      empty.setAttribute('message', 'Gdy uruchomisz trening w dowolnym projekcie, pojawi się tu jego postęp na żywo.');
+      listBox.appendChild(empty);
+      return;
+    }
+
+    listBox.innerHTML = '';
+    const table = document.createElement('tf-table');
+    table.setAttribute('variant', 'lined');
+    table.innerHTML = `
+      <tf-column key="project" label="Projekt" renderer="html"></tf-column>
+      <tf-column key="kind" label="Typ"></tf-column>
+      <tf-column key="variant" label="Wariant"></tf-column>
+      <tf-column key="status" label="Status" renderer="html"></tf-column>
+      <tf-column key="progress" label="Postęp" renderer="html"></tf-column>
+      <tf-column key="eta" label="ETA"></tf-column>
+      <tf-column key="vram" label="VRAM"></tf-column>
+    `;
+    table.rows = jobs.map((j) => {
+      const runId = String(j.runId ?? j.run_id ?? '');
+      const pid = String(j.projectId ?? j.project_id ?? '');
+      const kind = j.kind ?? '';
+      const epoch = Number(j.epoch ?? 0);
+      const total = Number(j.totalEpochs ?? j.total_epochs ?? 0);
+      const etaS = Number(j.etaS ?? j.eta_s);
+      const gpuMemMb = Number(j.gpuMemMb ?? j.gpu_mem_mb);
+      const b = runBadge(j.status);
+      const stage = stageLabel(j.stage);
+      const pct = total > 0 ? Math.max(0, Math.min(100, Math.round((epoch / total) * 100))) : 0;
+      const progressHtml = total > 0
+        ? `<div class="ml-studio-job-progress"><tf-progress-bar value="${pct}" tone="accent"></tf-progress-bar>
+             <span class="ml-studio-job-progress-txt">${epoch} / ${total} · ${pct}%</span></div>`
+        : `<span class="ml-studio-job-progress-txt">${stage || '—'}</span>`;
+      return {
+        runId,
+        projectId: pid,
+        kind: jobKindLabel(kind),
+        project: `<div class="ml-studio-job-project"><span class="ml-studio-job-name">${escapeHtml(j.projectName ?? j.project_name ?? '(projekt)')}</span>${stage ? `<span class="ml-studio-job-stage">${escapeHtml(stage)}</span>` : ''}</div>`,
+        variant: escapeHtml(String(j.variant ?? '—')) || '—',
+        status: `<tf-badge tone="${b.tone}" value="${escapeAttr(b.label)}"></tf-badge>`,
+        progress: progressHtml,
+        eta: fmtEta(etaS),
+        vram: fmtGb(gpuMemMb),
+      };
+    });
+    table.addEventListener('row-click', (e) => {
+      const row = e.detail?.row;
+      if (!row || !row.projectId) return;
+      stopJobsPolling();
+      Router.navigate('ml-studio', { projectId: row.projectId, runId: row.runId, kind: row.kind });
+    });
+    listBox.appendChild(table);
+  };
+
+  const poll = async () => {
+    try {
+      const resp = await ApiBinary.one('mlStudioJobsOverviewRequest', {});
+      const jobs = Array.isArray(resp.jobs) ? resp.jobs : [];
+      renderGpu(resp.gpu || null);
+      renderJobs(jobs);
+    } catch (err) {
+      stopJobsPolling();
+      const listBox = byId('ml-studio-jobs-list');
+      if (listBox) {
+        listBox.innerHTML = '';
+        const empty = document.createElement('tf-empty-state');
+        empty.setAttribute('icon', 'alert');
+        empty.setAttribute('title', 'Nie udało się wczytać jobów');
+        empty.setAttribute('message', err.message || 'Błąd protokołu ML Studio.');
+        const retry = document.createElement('tf-button');
+        retry.setAttribute('variant', 'primary');
+        retry.textContent = 'Spróbuj ponownie';
+        retry.addEventListener('click', () => showJobsOverview());
+        empty.appendChild(retry);
+        listBox.appendChild(empty);
+      }
+    }
+  };
+
+  byId('ml-studio-jobs-refresh')?.addEventListener('click', poll);
+  await poll();
+  jobsPollTimer = setInterval(poll, 3500);
+}
+
+// =============================================================================
 // Zakładka "Modele" — lista wytrenowanych modeli projektu (wszystkie typy).
 // Pusto → tf-empty-state; inaczej tf-table z metrykami z metricsJson.
 // =============================================================================
 
 // Wyciąga skrótowe metryki z metricsJson modelu (np. "acc 0.94" / "loss 1.2").
 // Zwraca pusty string, gdy JSON nie zawiera znanych pól — wtedy kolumna pokaże "—".
+// Formatuje loss tak, by mikroskopijna niezerowa wartość (przeuczenie na małym
+// zbiorze daje ~1e-6) nie zaokrąglała się do „0.00" — to myli z brakiem metryki
+// albo zepsutym modelem. Bardzo małe wartości pokazujemy w notacji wykładniczej.
+function formatLoss(n) {
+  if (n !== 0 && Math.abs(n) < 0.005) return n.toExponential(1);
+  return n.toFixed(2);
+}
+
 function modelMetricsSummary(metricsJson) {
   if (!metricsJson) return '';
   let m = metricsJson;
@@ -4535,8 +5632,20 @@ function modelMetricsSummary(metricsJson) {
   const loss = num(m.train_loss ?? m.trainLoss ?? m.eval_loss ?? m.evalLoss ?? m.loss);
   if (acc != null) parts.push(`acc ${acc.toFixed(2)}`);
   if (f1 != null) parts.push(`f1 ${f1.toFixed(2)}`);
-  if (loss != null) parts.push(`loss ${loss.toFixed(2)}`);
+  if (loss != null) parts.push(`loss ${formatLoss(loss)}`);
   return parts.join(' · ');
+}
+
+// Etykieta silnika modelu (kolumna „Silnik" w tabeli Modele). Nieznany silnik
+// pokazujemy surowo, żeby nie ukrywać nowych typów backendu.
+const FRAMEWORK_LABELS = {
+  rfdetr: 'Detekcja RF-DETR',
+  'classifier-timm': 'Klasyfikator atrybutu',
+  'ocr-paddle': 'OCR',
+};
+function frameworkLabel(fw) {
+  const f = String(fw ?? '');
+  return FRAMEWORK_LABELS[f] || (f || '—');
 }
 
 function renderModelsTab(panel, p) {
@@ -4583,15 +5692,23 @@ function renderModelsTab(panel, p) {
         // Stan z metryk: wdrożony (`inference_model_name`) oraz wyeksportowany
         // do GGUF (`export_status=succeeded` + `gguf_path`).
         let deployed = false;
+        let deploying = false;
         let exported = false;
         try {
           const mj = JSON.parse(m.metricsJson ?? m.metrics_json ?? '{}');
-          deployed = Boolean(mj.inference_model_name);
+          // „Zapytaj" tylko gdy serwis REALNIE serwuje model — status jest
+          // rekoncyliowany po żywym serwisie (patrz reconcile_local_inference_status).
+          // Sama obecność `inference_model_name` nie wystarcza: serwis mógł paść
+          // albo zostać usunięty (status → „failed") i czat by się wywalił.
+          const infStatus = String(mj.inference_status ?? '');
+          deployed = infStatus === 'deployed';
+          deploying = infStatus === 'deploying' || infStatus === 'transferring';
           exported = mj.export_status === 'succeeded' && Boolean(mj.gguf_path);
-        } catch (_) { deployed = false; exported = false; }
+        } catch (_) { deployed = false; deploying = false; exported = false; }
+        const framework = String(m.framework ?? '');
         return {
           model: modelName,
-          framework: String(m.framework ?? '—') || '—',
+          framework: frameworkLabel(framework),
           baseModel: baseModel || '—',
           status: `<tf-badge tone="${b.tone}" value="${escapeAttr(b.label)}"></tf-badge>`,
           metrics: metrics || '—',
@@ -4600,25 +5717,60 @@ function renderModelsTab(panel, p) {
           _modelId: modelId,
           _modelName: modelName,
           // Model detekcji (RF-DETR) → akcja „Wykryj"; model FT (adapter, niepuste
-          // baseModel) → „Eksportuj GGUF"; wdrożony FT → też „Zapytaj".
-          _isRecog: String(m.framework ?? '') === 'rfdetr',
-          _canExport: Boolean(modelId && baseModel.trim().length > 0 && String(m.framework ?? '') !== 'rfdetr'),
+          // baseModel) → „Eksportuj GGUF"; klasyfikator timm → eksport ONNX;
+          // wdrożony FT → też „Zapytaj".
+          _isRecog: framework === 'rfdetr',
+          _framework: framework,
+          // Modele wizyjne (RF-DETR / klasyfikator timm) można opublikować do
+          // rejestru vision_models — pipeline'y kamer użyją ich bez rekompilacji.
+          _canPublishVision: Boolean(modelId && (framework === 'rfdetr' || framework === 'classifier-timm')),
+          _canExport: Boolean(modelId && framework !== 'rfdetr' && (baseModel.trim().length > 0 || framework === 'classifier-timm')),
           _canChat: Boolean(modelId && deployed),
-          _canDeploy: Boolean(modelId && exported && !deployed && String(m.framework ?? '') !== 'rfdetr'),
+          _deploying: Boolean(modelId && deploying),
+          _canDeploy: Boolean(modelId && exported && !deployed && !deploying && String(m.framework ?? '') !== 'rfdetr'),
         };
       });
       // Per-wierszowy builder akcji tf-table: zwraca realny Element z własnym
       // handlerem klika — działa w shadow DOM (delegacja z light DOM by nie złapała).
       table.rowActions = (row) => {
         if (!row) return null;
+        const publishBtn = () => {
+          const pub = document.createElement('tf-button');
+          pub.setAttribute('size', 'sm');
+          pub.setAttribute('variant', 'outline');
+          pub.setAttribute('icon', 'eye');
+          pub.textContent = 'Publikuj do kamer';
+          pub.addEventListener('click', () => openVisionPublishPanel(p, row, () => renderModelsTab(panel, p)));
+          return pub;
+        };
         if (row._isRecog) {
+          const wrap = document.createElement('div');
+          wrap.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap';
           const btn = document.createElement('tf-button');
           btn.setAttribute('size', 'sm');
           btn.setAttribute('variant', 'outline');
           btn.setAttribute('icon', 'image');
           btn.textContent = 'Wykryj na zdjęciu';
           btn.addEventListener('click', () => openRecogDetectPanel(p, row._modelId, row._modelName));
-          return btn;
+          wrap.appendChild(btn);
+          wrap.appendChild(publishBtn());
+          return wrap;
+        }
+        if (row._canPublishVision && !row._canChat && !row._canDeploy && !row._deploying && !row._canExport) {
+          return publishBtn();
+        }
+        if (row._canPublishVision && row._canExport && !row._canChat && !row._canDeploy && !row._deploying) {
+          const wrap = document.createElement('div');
+          wrap.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap';
+          wrap.appendChild(publishBtn());
+          const exp = document.createElement('tf-button');
+          exp.setAttribute('size', 'sm');
+          exp.setAttribute('variant', 'outline');
+          exp.setAttribute('icon', 'package');
+          exp.textContent = 'Eksportuj GGUF';
+          exp.addEventListener('click', () => openFtExportPanel(p, row._modelId, row._modelName));
+          wrap.appendChild(exp);
+          return wrap;
         }
         // Model FT: gdy wdrożony → przycisk „Zapytaj"; w przeciwnym razie eksport.
         if (row._canChat) {
@@ -4655,6 +5807,16 @@ function renderModelsTab(panel, p) {
           wrap.appendChild(dep);
           return wrap;
         }
+        // Deploy w toku — nie oferuj równoległego eksportu/wdrożenia; pokaż stan.
+        if (row._deploying) {
+          const dep = document.createElement('tf-button');
+          dep.setAttribute('size', 'sm');
+          dep.setAttribute('variant', 'outline');
+          dep.setAttribute('icon', 'cpu');
+          dep.setAttribute('disabled', '');
+          dep.textContent = 'Wdrażanie…';
+          return dep;
+        }
         if (!row._canExport) return null;
         const btn = document.createElement('tf-button');
         btn.setAttribute('size', 'sm');
@@ -4666,6 +5828,7 @@ function renderModelsTab(panel, p) {
       };
       const tableHost = byId('ml-studio-models-table');
       tableHost?.appendChild(table);
+      renderVisionRegistrySection(panel, p);
     })
     .catch((err) => {
       panel.innerHTML = '';
@@ -4675,6 +5838,199 @@ function renderModelsTab(panel, p) {
       empty.setAttribute('message', err.message || 'Błąd protokołu ML Studio.');
       panel.appendChild(empty);
     });
+}
+
+// Sekcja „Modele wizyjne" — rejestr vision_models (dynamiczne ONNX serwowane
+// przez silnik onnx-cv w pipeline'ach kamer). Rejestr jest wspólny dla całej
+// organizacji; publikacja z tabeli modeli powyżej dodaje tu wiersz.
+function renderVisionRegistrySection(panel, p) {
+  const card = document.createElement('div');
+  card.className = 'ml-studio-section-card';
+  card.innerHTML = `
+    <div class="ml-studio-section-card-head">
+      <div class="title">${sprite('eye')} Modele wizyjne <span class="ml-studio-section-sub">— rejestr modeli kamer (onnx-cv, cała organizacja)</span></div>
+      <tf-button size="sm" variant="ghost" icon="share" data-vision-share>Udostępnij</tf-button>
+    </div>
+    <div data-vision-registry-body></div>
+  `;
+  panel.appendChild(card);
+  card.querySelector('[data-vision-share]')?.addEventListener('click', openVisionShareModal);
+  const body = card.querySelector('[data-vision-registry-body]');
+
+  ApiBinary.one('mlStudioVisionModelsListRequest', {})
+    .then((resp) => {
+      const models = Array.isArray(resp.models) ? resp.models : [];
+      if (!models.length) {
+        const empty = document.createElement('tf-empty-state');
+        empty.setAttribute('icon', 'eye');
+        empty.setAttribute('title', 'Brak modeli wizyjnych');
+        empty.setAttribute('message', 'Opublikuj wytrenowany model detekcji lub klasyfikacji, aby pipeline\'y kamer mogły go używać.');
+        body.appendChild(empty);
+        return;
+      }
+      const table = document.createElement('tf-table');
+      table.setAttribute('variant', 'lined');
+      table.innerHTML = `
+        <tf-column key="name" label="Nazwa"></tf-column>
+        <tf-column key="op" label="Operacja"></tf-column>
+        <tf-column key="source" label="Źródło"></tf-column>
+        <tf-column key="classes" label="Klasy"></tf-column>
+        <tf-column key="sha" label="SHA-256"></tf-column>
+        <tf-column key="createdAt" label="Dodany"></tf-column>
+      `;
+      table.rows = models.map((m) => ({
+        name: String(m.modelName ?? m.model_name ?? ''),
+        op: String(m.op ?? '') === 'detect' ? 'detekcja' : 'klasyfikacja',
+        source: String(m.source ?? ''),
+        classes: String((m.classes || []).length),
+        sha: String(m.sha256 ?? '').slice(0, 12),
+        createdAt: formatRelative(m.createdAt ?? m.created_at),
+        _modelName: String(m.modelName ?? m.model_name ?? ''),
+      }));
+      table.rowActions = (row) => {
+        if (!row) return null;
+        const wrap = document.createElement('div');
+        wrap.style.display = 'flex';
+        wrap.style.gap = '6px';
+        const share = document.createElement('tf-button');
+        share.setAttribute('size', 'sm');
+        share.setAttribute('variant', 'ghost');
+        share.setAttribute('icon', 'share');
+        share.textContent = 'Udostępnij';
+        share.addEventListener('click', () => openVisionShareModal(row._modelName));
+        const del = document.createElement('tf-button');
+        del.setAttribute('size', 'sm');
+        del.setAttribute('variant', 'danger');
+        del.setAttribute('icon', 'trash');
+        del.textContent = 'Usuń';
+        del.addEventListener('click', async () => {
+          if (!window.confirm(`Usunąć model wizyjny „${row._modelName}" z rejestru?`)) return;
+          try {
+            const resp = await ApiBinary.one('mlStudioVisionModelDeleteRequest', { modelName: row._modelName });
+            if (!resp.ok) throw new Error(resp.error || 'usunięcie odrzucone');
+            toast(`Model „${row._modelName}" usunięty z rejestru`, 'success');
+            renderModelsTab(panel, p);
+          } catch (err) {
+            toast(`Usuwanie modelu: ${err.message}`, 'error');
+          }
+        });
+        wrap.appendChild(share);
+        wrap.appendChild(del);
+        return wrap;
+      };
+      body.appendChild(table);
+    })
+    .catch((err) => {
+      body.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} Rejestr modeli wizyjnych: ${escapeHtml(err.message || String(err))}</div>`;
+    });
+}
+
+// Udostępnianie modeli wizyjnych innej instancji TentaFlow (bez parowania):
+// pokazuje gotowy do wklejenia URL manifestu /models/manifest/<ref>. `bundleRef`
+// to nazwa modelu z rejestru (pojedynczy model) albo `vision-all` (całość gdy
+// wywołane z przycisku sekcji). Druga instancja wkleja URL w kreatorze deployu
+// (zakładka „Własny") razem z kluczem API utworzonym TUTAJ (Dostęp i klucze API
+// → zakres model_bundle na ten sam ref).
+function openVisionShareModal(bundleRef = 'vision-all') {
+  const ref = String(bundleRef || 'vision-all');
+  const manifestUrl = `${window.location.origin}/models/manifest/${ref}`;
+  const single = ref !== 'vision-all';
+  const modal = document.createElement('tf-modal');
+  modal.setAttribute('variant', 'modal');
+  modal.setAttribute('title', single ? `Udostępnij model „${ref}"` : 'Udostępnij modele wizyjne');
+  modal.setAttribute('size', 'md');
+  modal.innerHTML = `
+    <div slot="body">
+      <p class="ml-studio-export-intro">${single
+        ? `Inna instancja TentaFlow może zaimportować ten pojedynczy model (bez parowania mesh). Wklej poniższy URL manifestu w kreatorze deployu drugiej instancji (krok „Model" → zakładka „Własny") razem z kluczem API utworzonym na TEJ instancji.`
+        : `Inna instancja TentaFlow może pobrać stąd bundle modeli wizyjnych bez parowania mesh. Wklej poniższy URL manifestu w kreatorze deployu drugiej instancji (krok „Model" → zakładka „Własny") razem z kluczem API utworzonym na TEJ instancji.`}</p>
+      <div class="form-group">
+        <tf-input id="ml-studio-vision-share-url" label="URL manifestu (gotowy do wklejenia)" value="${escapeAttr(manifestUrl)}" readonly></tf-input>
+      </div>
+      <p class="ml-studio-share-hint">${sprite('info')} Dostęp wymaga klucza API typu „Ogólny" z zakresem <code>model_bundle</code> (<code>${escapeHtml(ref)}</code>) — utwórz go w „Dostęp i klucze API". Klucz jest przesyłany jako nagłówek <code>Authorization: Bearer</code> i każdy dostęp trafia do audytu.</p>
+    </div>
+    <div slot="footer">
+      <tf-button variant="ghost" data-vision-share-close>Zamknij</tf-button>
+      <tf-button variant="primary" icon="copy" id="ml-studio-vision-share-copy">Kopiuj URL</tf-button>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  modal.setAttribute('open', '');
+  const close = () => { try { modal.remove(); } catch (_) {} };
+  modal.querySelector('[data-vision-share-close]')?.addEventListener('click', close);
+  modal.addEventListener('close', close);
+  modal.querySelector('#ml-studio-vision-share-copy')?.addEventListener('click', () => {
+    navigator.clipboard?.writeText(manifestUrl);
+    toast('URL manifestu skopiowany', 'success');
+  });
+}
+
+// Publikacja wytrenowanego modelu do rejestru vision_models. Dla RF-DETR bez
+// wyeksportowanego ONNX Core sam uruchamia eksport na serwisie treningowym —
+// to może potrwać kilka minut, więc modal pokazuje stan i nie polega na kliku.
+function openVisionPublishPanel(p, row, onDone) {
+  const modelId = row._modelId;
+  if (!modelId) return;
+  const op = row._framework === 'rfdetr' ? 'detect' : 'classify';
+  const suggested = String(row._modelName || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9-_]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  const modal = document.createElement('tf-modal');
+  modal.setAttribute('variant', 'modal');
+  modal.setAttribute('title', `Publikuj do kamer — ${row._modelName}`);
+  modal.setAttribute('size', 'md');
+  modal.innerHTML = `
+    <div slot="body">
+      <p class="ml-studio-export-intro">Model trafi do rejestru modeli wizyjnych (silnik onnx-cv). Pipeline'y kamer wskazują go przez alias lub bezpośrednio po nazwie — bez rekompilacji. Jeśli ONNX nie był jeszcze wyeksportowany, eksport uruchomi się automatycznie (RF-DETR: kilka minut).</p>
+      <tf-input id="ml-studio-vision-name" label="Nazwa w rejestrze (a-z, 0-9, -, _)" value="${escapeAttr(suggested)}"></tf-input>
+      <tf-select id="ml-studio-vision-op" label="Operacja" value="${op}" disabled>
+        <option value="${op}">${op === 'detect' ? 'detekcja (RF-DETR)' : 'klasyfikacja (softmax)'}</option>
+      </tf-select>
+      ${op === 'detect' ? '<tf-input type="number" id="ml-studio-vision-threshold" label="Domyślny próg pewności" value="0.5" min="0" max="1" step="0.05"></tf-input>' : ''}
+      <tf-input id="ml-studio-vision-alias" label="Alias (opcjonalnie, np. tentavision-detect)"></tf-input>
+      <div id="ml-studio-vision-publish-status" style="margin-top:10px"></div>
+    </div>
+    <div slot="footer">
+      <tf-button variant="ghost" data-vision-close>Anuluj</tf-button>
+      <tf-button variant="primary" icon="eye" id="ml-studio-vision-go">Publikuj</tf-button>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  modal.setAttribute('open', '');
+  const close = () => { try { modal.remove(); } catch (_) {} };
+  modal.querySelector('[data-vision-close]')?.addEventListener('click', close);
+  modal.addEventListener('close', close);
+
+  const go = modal.querySelector('#ml-studio-vision-go');
+  go?.addEventListener('click', async () => {
+    const status = modal.querySelector('#ml-studio-vision-publish-status');
+    const modelName = String(modal.querySelector('#ml-studio-vision-name')?.value || '').trim();
+    if (!/^[a-z0-9-_]+$/.test(modelName)) {
+      if (status) status.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} Nazwa musi pasować do [a-z0-9-_]+.</div>`;
+      return;
+    }
+    const thresholdRaw = modal.querySelector('#ml-studio-vision-threshold')?.value;
+    const alias = String(modal.querySelector('#ml-studio-vision-alias')?.value || '').trim();
+    go.setAttribute('disabled', '');
+    if (status) status.innerHTML = '<tf-spinner></tf-spinner> publikacja (eksport ONNX może potrwać kilka minut)…';
+    try {
+      const resp = await ApiBinary.action('mlStudioVisionModelPublishRequest', {
+        modelId,
+        modelName,
+        op,
+        threshold: op === 'detect' && thresholdRaw !== undefined && thresholdRaw !== '' ? Number(thresholdRaw) : null,
+        alias: alias || null,
+      }, { timeoutMs: 20 * 60 * 1000 });
+      if (!resp.ok) throw new Error(resp.error || 'publikacja odrzucona');
+      toast(`Model „${modelName}" opublikowany do rejestru kamer`, 'success');
+      close();
+      if (typeof onDone === 'function') onDone();
+    } catch (err) {
+      go.removeAttribute('disabled');
+      if (status) status.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} Publikacja nieudana: ${escapeHtml(err.message || String(err))}</div>`;
+    }
+  });
 }
 
 // Detekcja na zdjęciu modelem RF-DETR (R4). Modal: upload małego obrazu +

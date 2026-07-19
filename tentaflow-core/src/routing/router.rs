@@ -346,6 +346,14 @@ impl Router {
                 router.db.clone(),
             ));
             *executor_slot.write() = Some(executor);
+            // FAZA 5: przekaz slot executora do zawsze-wlaczonego silnika kamer,
+            // by sciezki HOT (detekcja) i COLD (stan/OCR) szly przez
+            // `execute_camera_cv`; pusty slot = fallback na singletony
+            // (bootstrap/testy bez regresji).
+            #[cfg(feature = "inference-vision-gpu")]
+            crate::services::camera_ingest::vision_analysis::set_runtime_slot(
+                executor_slot.clone(),
+            );
         }
 
         router.reload_alias_cache();

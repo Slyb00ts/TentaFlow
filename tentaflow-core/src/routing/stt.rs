@@ -12,9 +12,9 @@ use crate::routing::router::Router;
 use tracing::{debug, error};
 
 impl Router {
-    /// Routuje audio transcription request przez flow_engine (stage 3d
-    /// Universal Flow Gateway). Synthetic flow `trigger → stt(model) →
-    /// output` aktywuje się gdy admin nie skonfigurował user-defined flow.
+    /// Routuje audio transcription request przez FlowDispatcher. Gdy admin
+    /// skonfigurował jawny flow — wykonuje go; gdy brak — model STT wykonywany
+    /// BEZPOŚREDNIO na executorze (bez flow engine).
     /// Backend dispatch (embedded whisper.cpp / MLX, HTTP, QUIC) idzie
     /// przez SttDispatcherImpl → executor.execute_stt. verbose_json
     /// (segments/duration/speakers) propagowany przez envelope.meta.
@@ -41,10 +41,9 @@ impl Router {
                 }
             }
         }
-        // Stage 3d Universal Flow Gateway: STT path zawsze przez
-        // FlowDispatcher. Synthetic flow `trigger → stt(model) → output`
-        // aktywuje się gdy admin nie skonfigurował user-defined flow.
-        // Direct executor.execute_stt fallback wycięty w 3d-0b-final.
+        // STT path zawsze przez FlowDispatcher: jawny flow gdy skonfigurowany,
+        // inaczej model STT wykonywany bezpośrednio na executorze (NotFound →
+        // direct execution wewnątrz dispatchera).
         if let Some(ref dispatcher) = self.flow_dispatcher {
             // Czas trwania audio liczymy z naglowka WAV ZANIM `file` zostanie
             // skonsumowany przez envelope; response duration ma pierwszenstwo.

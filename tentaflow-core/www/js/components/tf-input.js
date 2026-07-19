@@ -10,7 +10,7 @@
 
 class TfInput extends HTMLElement {
   static get observedAttributes() {
-    return ['label', 'placeholder', 'value', 'hint', 'error', 'type', 'icon', 'trailing-icon', 'prefix', 'suffix', 'disabled', 'autocomplete', 'autofocus', 'required', 'name', 'autocapitalize', 'autocorrect', 'spellcheck', 'inputmode', 'minlength', 'maxlength', 'pattern', 'multiline', 'rows', 'min', 'max', 'step'];
+    return ['label', 'placeholder', 'value', 'hint', 'error', 'type', 'icon', 'trailing-icon', 'prefix', 'suffix', 'disabled', 'readonly', 'autocomplete', 'autofocus', 'required', 'name', 'autocapitalize', 'autocorrect', 'spellcheck', 'inputmode', 'minlength', 'maxlength', 'pattern', 'multiline', 'rows', 'min', 'max', 'step'];
   }
 
   constructor() {
@@ -186,6 +186,8 @@ class TfInput extends HTMLElement {
     if (document.activeElement !== this._input) this._input.value = value;
     if (this._input.tagName !== 'TEXTAREA') this._input.type = type;
     this._input.disabled = disabled;
+    // readonly keeps the value selectable/copyable (unlike disabled).
+    this._input.readOnly = this.hasAttribute('readonly');
     if (this._input.tagName === 'TEXTAREA') {
       this._input.rows = Number(this.getAttribute('rows') || 4);
     }
@@ -256,7 +258,12 @@ class TfInput extends HTMLElement {
     this._errorEl.style.display = error ? '' : 'none';
   }
 
-  _onInput() {
+  _onInput(e) {
+    // Stop the inner <input>'s native "input" from bubbling past the host —
+    // otherwise consumers listening on the host see two "input" events (the
+    // native one has no detail, so handlers doing `e.detail.value` throw or
+    // `e.detail?.value ?? ''` clobbers state).
+    e?.stopPropagation();
     this.setAttribute('value', this._input.value);
     this.dispatchEvent(new CustomEvent('input', {
       bubbles: true,
@@ -264,7 +271,8 @@ class TfInput extends HTMLElement {
     }));
   }
 
-  _onChange() {
+  _onChange(e) {
+    e?.stopPropagation();
     this.dispatchEvent(new CustomEvent('change', {
       bubbles: true,
       detail: { value: this._input.value },

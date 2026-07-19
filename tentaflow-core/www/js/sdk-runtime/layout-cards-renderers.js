@@ -16,6 +16,7 @@ import {
   resolveBindRef,
   subscribeBindRef,
 } from './bind-resolver.js';
+import { applyBoxStyle } from './layout-containers-renderers.js';
 
 // =============================================================================
 // Token whitelisty (spec §1.5)
@@ -29,7 +30,7 @@ const RADIUS_TOKENS = new Set([
   'none', 'xs', 'sm', 'md', 'lg', 'xl', 'pill', 'circle',
 ]);
 const SHADOW_TOKENS = new Set([
-  'none', 'subtle', 'medium', 'elevated', 'floating',
+  'none', 'subtle', 'medium', 'elevated', 'floating', 'accent_glow',
 ]);
 const BACKGROUND_TOKENS = new Set([
   'none', 'subtle', 'muted', 'accent', 'inverse',
@@ -94,11 +95,18 @@ function assertOnlyKnownObjectKeys(obj, allowedKeys, ctx) {
 
 function assertOnlyKnownFieldMapKeys(fields, allowedKeys, ctx) {
   if (!Array.isArray(fields)) throw new TypeError(`${ctx}: expected FieldMap`);
+  // Mirror of Rust `ensure_no_duplicate_keys` — duplicates would silently
+  // resolve first-wins in readField, so reject them outright.
+  const seen = new Set();
   for (const entry of fields) {
     if (!Array.isArray(entry) || entry.length !== 2) throw new TypeError(`${ctx}: entry must be [u8, Value]`);
     if (!allowedKeys.has(entry[0])) {
       throw new TypeError(`${ctx}: unexpected key ${entry[0]}`);
     }
+    if (seen.has(entry[0])) {
+      throw new TypeError(`${ctx}: duplicate key ${entry[0]}`);
+    }
+    seen.add(entry[0]);
   }
 }
 
@@ -151,7 +159,7 @@ function applyCardClasses(el, opts, ctxLabel) {
 // =============================================================================
 
 export const CARD_TAG = 0x0106;
-const CARD_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+const CARD_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 
 function renderCard(component, ctx) {
   assertOnlyKnownFields(component.fields, CARD_FIELD_KEYS, 'Card');
@@ -216,6 +224,7 @@ function renderCard(component, ctx) {
   applyCardClasses(el, {
     variant, padding, gap, radius, shadow, background, accent, borderClasses,
   });
+  applyBoxStyle(el, ctx.readField(component.fields, 11), 'Card.style');
   if (interactive) el.classList.add('tf-card--interactive');
   if (clickable) {
     el.classList.add('tf-card--clickable');
@@ -245,7 +254,7 @@ function renderCard(component, ctx) {
 export const SECTION_CARD_TAG = 0x0107;
 const BUTTON_TAG = 0x0401;
 const SECTION_CARD_FIELD_KEYS = new Set([
-  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
 ]);
 
 function renderSectionCard(component, ctx) {
@@ -327,6 +336,7 @@ function renderSectionCard(component, ctx) {
   // bez tych klas host ignorował wartości i odstępy nigdy nie były stosowane.
   el.classList.add(`tf-card--padding-${padding}`);
   el.classList.add(`tf-card--gap-${gap}`);
+  applyBoxStyle(el, ctx.readField(component.fields, 14), 'SectionCard.style');
 
   // Reactive title attribute binding
   const applyTitle = () => {

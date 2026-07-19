@@ -170,6 +170,60 @@ pub fn list_addon_actions(db: &DbPool) -> Result<Vec<SchedulerAction>> {
     Ok(out)
 }
 
+/// Auto-rejestruje interwalowy job `ingest_drain` dla KAZDEGO wlaczonego addonu, ktory
+/// deklaruje tool `ingest_drain` (kontrakt async-ingestu: upload enqueue'uje, a drain
+/// mieli w tle). Bez tego kolejka ingestu stoi az admin recznie zalozy job, a po
+/// resecie TentaFlow nic nie wznawia przetwarzania. Idempotentne: staly `id` per addon
+/// => upsert nadpisuje ten sam wiersz (bez duplikatow), a wywolanie przy starcie odtwarza
+/// harmonogram po kazdym restarcie. Interwal 30s + `concurrency=skip`: jedno firing mieli
+/// caly backlog (batch-drain), a nastepne sa pomijane dopoki poprzednie trwa.
+pub fn ensure_addon_ingest_drain_schedules(db: &DbPool) -> Result<usize> {
+    let addons: Vec<(String, String)> = {
+        let conn = db.read().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT addon_id, manifest_json FROM addons WHERE is_enabled = 1 ORDER BY addon_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+
+    let mut ensured = 0usize;
+    for (addon_id, manifest_raw) in addons {
+        let manifest = match crate::addon::lifecycle::parse_manifest_toml(&manifest_raw) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !manifest.tools.iter().any(|t| t.name == "ingest_drain") {
+            continue;
+        }
+        let req = UpsertJobRequest {
+            id: Some(format!("{addon_id}-ingest-drain-auto")),
+            name: format!("{addon_id}: ingest drain (auto)"),
+            enabled: true,
+            target_addon_id: addon_id.clone(),
+            target_action_id: "ingest_drain".to_string(),
+            payload_json: "{}".to_string(),
+            schedule_kind: "interval".to_string(),
+            schedule_expr: "30s".to_string(),
+            timezone: "UTC".to_string(),
+            // 1800s: duze PDF-y (setki stron -> tysiace chunkow do embeddingu) nie
+            // moga byc przycinane w polowie. MUSI byc < reclaim STALE_RUNNING_SECS
+            // w addonie, zeby osierocony po przycieciu job zostal odzyskany.
+            max_runtime_seconds: Some(1800),
+            retry_policy_json: None,
+            concurrency_policy: Some("skip".to_string()),
+            org_id: None,
+        };
+        match upsert_job(db, req, "system") {
+            Ok(_) => ensured += 1,
+            Err(e) => warn!("scheduler: auto ingest-drain job dla '{addon_id}' nieudany: {e}"),
+        }
+    }
+    Ok(ensured)
+}
+
 pub fn upsert_job(db: &DbPool, req: UpsertJobRequest, user_id: &str) -> Result<ScheduledJob> {
     validate_job_request(&req)?;
     ensure_target_action_exists(db, &req.target_addon_id, &req.target_action_id)?;
@@ -333,7 +387,14 @@ async fn execute_job(
                     }
                 }
             }
-            addon_manager.call_tool(&addon_id, &action_id, params, &actor_user_id)
+            // Joby systemowe (auto-harmonogram core, np. ingest_drain) nie maja realnego
+            // principala — wolamy jako System (omija per-user ACL, jak inne core-internal
+            // wywolania toolow). Joby uzytkownika (created_by=admin) ida normalna sciezka ACL.
+            if actor_user_id == "system" {
+                addon_manager.call_tool_system(&addon_id, &action_id, params)
+            } else {
+                addon_manager.call_tool(&addon_id, &action_id, params, &actor_user_id)
+            }
         })
     };
     let result = tokio::time::timeout(Duration::from_secs(timeout_seconds), task).await;

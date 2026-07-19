@@ -44,6 +44,10 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::TokenUsageDaily
             | CoreSyncResourceKind::TokenQuota
             | CoreSyncResourceKind::TokenLease
+            | CoreSyncResourceKind::ModelMetricsRollup
+            | CoreSyncResourceKind::ModelPricing
+            | CoreSyncResourceKind::CameraCvPipeline
+            | CoreSyncResourceKind::VisionModel
     )
 }
 
@@ -141,6 +145,12 @@ pub fn apply_core_operation(
         CoreSyncResourceKind::TokenUsageDaily => apply_token_usage_daily(&tx, operation)?,
         CoreSyncResourceKind::TokenQuota => apply_token_quota(&tx, operation)?,
         CoreSyncResourceKind::TokenLease => apply_token_lease(&tx, operation)?,
+        CoreSyncResourceKind::ModelMetricsRollup => {
+            apply_model_metrics_rollup(&tx, operation)?
+        }
+        CoreSyncResourceKind::ModelPricing => apply_model_pricing(&tx, operation)?,
+        CoreSyncResourceKind::CameraCvPipeline => apply_camera_cv_pipeline(&tx, operation)?,
+        CoreSyncResourceKind::VisionModel => apply_vision_model(&tx, operation)?,
     };
 
     if lww_tracked {
@@ -1952,6 +1962,379 @@ fn apply_token_lease(
     }
 }
 
+/// Apply a replicated `model_metrics_rollup` row. Counters/histograms are
+/// single-writer (the owning node), so the synced cumulative value is
+/// authoritative — we replace the whole set. `updated_at` is a node-local
+/// watermark and is NOT synced, so it is omitted (INSERT keeps DEFAULT, UPDATE
+/// leaves the receiver's own watermark untouched). Mirrors `apply_token_usage_daily`.
+fn apply_model_metrics_rollup(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO model_metrics_rollup \
+                 (id, node_id, org_id, user_id, model_id, service_key, backend, modality, \
+                  hour_bucket, histogram_version, request_count, success_count, error_count, \
+                  prompt_tokens, completion_tokens, total_tokens, embedding_tokens, audio_ms, images, \
+                  prefill_secs_sum, decode_secs_sum, e2e_latency_ms_sum, queue_ms_sum, \
+                  ttft_b0, ttft_b1, ttft_b2, ttft_b3, ttft_b4, ttft_b5, ttft_b6, ttft_b7, ttft_b8, ttft_b9, \
+                  ttft_sample_count, \
+                  decode_tps_b0, decode_tps_b1, decode_tps_b2, decode_tps_b3, decode_tps_b4, \
+                  decode_tps_b5, decode_tps_b6, decode_tps_b7, decode_tps_sample_count, \
+                  e2e_b0, e2e_b1, e2e_b2, e2e_b3, e2e_b4, e2e_b5, e2e_b6, e2e_b7, e2e_b8, e2e_b9, \
+                  e2e_sample_count) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+                  ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, \
+                  ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50, ?51, \
+                  ?52, ?53, ?54, ?55) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                 node_id = excluded.node_id, org_id = excluded.org_id, user_id = excluded.user_id, \
+                 model_id = excluded.model_id, service_key = excluded.service_key, \
+                 backend = excluded.backend, modality = excluded.modality, \
+                 hour_bucket = excluded.hour_bucket, histogram_version = excluded.histogram_version, \
+                 request_count = excluded.request_count, success_count = excluded.success_count, \
+                 error_count = excluded.error_count, prompt_tokens = excluded.prompt_tokens, \
+                 completion_tokens = excluded.completion_tokens, total_tokens = excluded.total_tokens, \
+                 embedding_tokens = excluded.embedding_tokens, audio_ms = excluded.audio_ms, \
+                 images = excluded.images, prefill_secs_sum = excluded.prefill_secs_sum, \
+                 decode_secs_sum = excluded.decode_secs_sum, \
+                 e2e_latency_ms_sum = excluded.e2e_latency_ms_sum, queue_ms_sum = excluded.queue_ms_sum, \
+                 ttft_b0 = excluded.ttft_b0, ttft_b1 = excluded.ttft_b1, ttft_b2 = excluded.ttft_b2, \
+                 ttft_b3 = excluded.ttft_b3, ttft_b4 = excluded.ttft_b4, ttft_b5 = excluded.ttft_b5, \
+                 ttft_b6 = excluded.ttft_b6, ttft_b7 = excluded.ttft_b7, ttft_b8 = excluded.ttft_b8, \
+                 ttft_b9 = excluded.ttft_b9, ttft_sample_count = excluded.ttft_sample_count, \
+                 decode_tps_b0 = excluded.decode_tps_b0, decode_tps_b1 = excluded.decode_tps_b1, \
+                 decode_tps_b2 = excluded.decode_tps_b2, decode_tps_b3 = excluded.decode_tps_b3, \
+                 decode_tps_b4 = excluded.decode_tps_b4, decode_tps_b5 = excluded.decode_tps_b5, \
+                 decode_tps_b6 = excluded.decode_tps_b6, decode_tps_b7 = excluded.decode_tps_b7, \
+                 decode_tps_sample_count = excluded.decode_tps_sample_count, \
+                 e2e_b0 = excluded.e2e_b0, e2e_b1 = excluded.e2e_b1, e2e_b2 = excluded.e2e_b2, \
+                 e2e_b3 = excluded.e2e_b3, e2e_b4 = excluded.e2e_b4, e2e_b5 = excluded.e2e_b5, \
+                 e2e_b6 = excluded.e2e_b6, e2e_b7 = excluded.e2e_b7, e2e_b8 = excluded.e2e_b8, \
+                 e2e_b9 = excluded.e2e_b9, e2e_sample_count = excluded.e2e_sample_count",
+                rusqlite::params![
+                    id,
+                    field_string(operation, "node_id")?,
+                    field_string(operation, "org_id")?,
+                    field_string(operation, "user_id")?,
+                    field_string(operation, "model_id")?,
+                    field_string(operation, "service_key")?,
+                    field_string(operation, "backend")?,
+                    field_string(operation, "modality")?,
+                    field_string(operation, "hour_bucket")?,
+                    field_i64_or(operation, "histogram_version", 1)?,
+                    field_i64_or(operation, "request_count", 0)?,
+                    field_i64_or(operation, "success_count", 0)?,
+                    field_i64_or(operation, "error_count", 0)?,
+                    field_i64_or(operation, "prompt_tokens", 0)?,
+                    field_i64_or(operation, "completion_tokens", 0)?,
+                    field_i64_or(operation, "total_tokens", 0)?,
+                    field_i64_or(operation, "embedding_tokens", 0)?,
+                    field_i64_or(operation, "audio_ms", 0)?,
+                    field_i64_or(operation, "images", 0)?,
+                    field_f64_or(operation, "prefill_secs_sum", 0.0)?,
+                    field_f64_or(operation, "decode_secs_sum", 0.0)?,
+                    field_i64_or(operation, "e2e_latency_ms_sum", 0)?,
+                    field_i64_or(operation, "queue_ms_sum", 0)?,
+                    field_i64_or(operation, "ttft_b0", 0)?,
+                    field_i64_or(operation, "ttft_b1", 0)?,
+                    field_i64_or(operation, "ttft_b2", 0)?,
+                    field_i64_or(operation, "ttft_b3", 0)?,
+                    field_i64_or(operation, "ttft_b4", 0)?,
+                    field_i64_or(operation, "ttft_b5", 0)?,
+                    field_i64_or(operation, "ttft_b6", 0)?,
+                    field_i64_or(operation, "ttft_b7", 0)?,
+                    field_i64_or(operation, "ttft_b8", 0)?,
+                    field_i64_or(operation, "ttft_b9", 0)?,
+                    field_i64_or(operation, "ttft_sample_count", 0)?,
+                    field_i64_or(operation, "decode_tps_b0", 0)?,
+                    field_i64_or(operation, "decode_tps_b1", 0)?,
+                    field_i64_or(operation, "decode_tps_b2", 0)?,
+                    field_i64_or(operation, "decode_tps_b3", 0)?,
+                    field_i64_or(operation, "decode_tps_b4", 0)?,
+                    field_i64_or(operation, "decode_tps_b5", 0)?,
+                    field_i64_or(operation, "decode_tps_b6", 0)?,
+                    field_i64_or(operation, "decode_tps_b7", 0)?,
+                    field_i64_or(operation, "decode_tps_sample_count", 0)?,
+                    field_i64_or(operation, "e2e_b0", 0)?,
+                    field_i64_or(operation, "e2e_b1", 0)?,
+                    field_i64_or(operation, "e2e_b2", 0)?,
+                    field_i64_or(operation, "e2e_b3", 0)?,
+                    field_i64_or(operation, "e2e_b4", 0)?,
+                    field_i64_or(operation, "e2e_b5", 0)?,
+                    field_i64_or(operation, "e2e_b6", 0)?,
+                    field_i64_or(operation, "e2e_b7", 0)?,
+                    field_i64_or(operation, "e2e_b8", 0)?,
+                    field_i64_or(operation, "e2e_b9", 0)?,
+                    field_i64_or(operation, "e2e_sample_count", 0)?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM model_metrics_rollup WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated `model_pricing` row. `updated_at` is node-local and
+/// preserved on UPSERT (omitted from both the INSERT column list and the conflict
+/// update). Mirrors `apply_token_quota`.
+fn apply_model_pricing(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO model_pricing \
+                 (id, org_id, model_id, prompt_per_1k, completion_per_1k, audio_per_min, image_each) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                 org_id = excluded.org_id, model_id = excluded.model_id, \
+                 prompt_per_1k = excluded.prompt_per_1k, \
+                 completion_per_1k = excluded.completion_per_1k, \
+                 audio_per_min = excluded.audio_per_min, image_each = excluded.image_each",
+                rusqlite::params![
+                    id,
+                    field_string(operation, "org_id")?,
+                    field_string(operation, "model_id")?,
+                    field_f64_or(operation, "prompt_per_1k", 0.0)?,
+                    field_f64_or(operation, "completion_per_1k", 0.0)?,
+                    field_f64_or(operation, "audio_per_min", 0.0)?,
+                    field_f64_or(operation, "image_each", 0.0)?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM model_pricing WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Captures carry the full row (name, pipeline_json, is_default), so Insert and
+/// Update are the same upsert. Timestamps are node-local (unix seconds), like
+/// the `flows` materializer's `datetime('now')`.
+fn apply_camera_cv_pipeline(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            let pipeline_json = field_string(operation, "pipeline_json")?;
+            // A malformed replicated pipeline must not land in the table the
+            // engine reads from — skip the write (the sender's local validator
+            // should have rejected it; a bad payload here means a buggy or
+            // hostile peer). Alias existence is deliberately NOT checked:
+            // `model_aliases` rows may replicate after the pipeline does.
+            let structurally_valid = serde_json::from_str::<
+                crate::services::camera_ingest::cv_pipeline::CvPipeline,
+            >(&pipeline_json)
+            .map_err(|e| e.to_string())
+            .and_then(|p| {
+                crate::services::camera_ingest::cv_pipeline::validate(&p)
+                    .map_err(|e| e.to_string())
+            });
+            if let Err(err) = structurally_valid {
+                tracing::warn!(
+                    "core sync: skipping invalid camera cv pipeline '{}' from node '{}': {}",
+                    id,
+                    operation.body.actor_node_id,
+                    err
+                );
+                return Ok(0);
+            }
+            // The default flag is seed-owned: only the fixed seed row may carry
+            // is_default=1 (the partial unique index enforces at most one).
+            // Any other replicated row is forced to 0 so two nodes can never
+            // converge into a constraint violation.
+            let is_default = id == crate::db::seed::CAMERA_CV_PIPELINE_ID
+                && field_bool_or(operation, "is_default", false)?;
+            // Pre-org-scope senders omit org_id — default them into the
+            // single default org, matching the v110 column default.
+            let org_id = field_string_or(
+                operation,
+                "org_id",
+                crate::services::org::DEFAULT_ORG_ID,
+            )?;
+            tx.execute(
+                "INSERT INTO camera_cv_pipelines \
+                 (id, name, pipeline_json, is_default, org_id, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, CAST(strftime('%s','now') AS INTEGER), \
+                 CAST(strftime('%s','now') AS INTEGER)) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                 name = excluded.name, pipeline_json = excluded.pipeline_json, \
+                 is_default = excluded.is_default, org_id = excluded.org_id, \
+                 updated_at = CAST(strftime('%s','now') AS INTEGER)",
+                rusqlite::params![
+                    id,
+                    field_string(operation, "name")?,
+                    pipeline_json,
+                    is_default,
+                    org_id,
+                ],
+            )
+            .map_err(sql_error)
+        }
+        ActionType::Delete => {
+            // A replicated delete must win mesh-wide, but local cameras may
+            // still point at the row — clear those references explicitly
+            // (they fall back to the default pipeline) instead of leaving
+            // dangling ids behind.
+            let referencing: Vec<String> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT camera_id FROM cameras \
+                         WHERE cv_pipeline_id = ?1 AND removed_at IS NULL",
+                    )
+                    .map_err(sql_error)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
+                    .map_err(sql_error)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(sql_error)?;
+                rows
+            };
+            if !referencing.is_empty() {
+                tracing::warn!(
+                    "core sync: pipeline '{}' deleted by node '{}' while assigned to cameras [{}] — clearing to default",
+                    id,
+                    operation.body.actor_node_id,
+                    referencing.join(", ")
+                );
+                tx.execute(
+                    "UPDATE cameras SET cv_pipeline_id = NULL WHERE cv_pipeline_id = ?1",
+                    rusqlite::params![id],
+                )
+                .map_err(sql_error)?;
+            }
+            tx.execute(
+                "DELETE FROM camera_cv_pipelines WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .map_err(sql_error)
+        }
+    }
+}
+
+/// Apply a replicated `vision_models` row. Only the row METADATA replicates —
+/// the ONNX file stays on the node that published it, and the local `onnx-cv`
+/// service reconciler skips rows whose file is absent, so a metadata-only node
+/// never advertises a model it cannot serve. Structural validation reuses the
+/// exact checks local registration enforces (bad op/contract, path-traversing
+/// file_name, malformed JSON) so a hostile peer cannot land a poisoned row.
+fn apply_vision_model(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let model_name = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            let op = field_string(operation, "op")?;
+            let file_name = field_string(operation, "file_name")?;
+            let sha256 = field_string(operation, "sha256")?;
+            let classes_json = field_string_or(operation, "classes_json", "[]")?;
+            let preprocess_json = field_string_or(operation, "preprocess_json", "{}")?;
+            let output_contract = field_string(operation, "output_contract")?;
+            let source = field_string(operation, "source")?;
+            let default_threshold = match operation.body.changed_fields.get("default_threshold") {
+                Some(FieldValue::Decimal(v)) => v.parse::<f64>().ok(),
+                Some(FieldValue::I64(v)) => Some(*v as f64),
+                Some(FieldValue::U64(v)) => Some(*v as f64),
+                _ => None,
+            };
+            let org_id =
+                field_string_or(operation, "org_id", crate::services::org::DEFAULT_ORG_ID)?;
+            let project_id = field_optional_string(operation, "project_id")?;
+            let source_model_id = field_optional_string(operation, "source_model_id")?;
+            if let Err(err) = crate::db::repository::validate_vision_model_fields(
+                model_name,
+                &op,
+                &file_name,
+                &sha256,
+                &classes_json,
+                &preprocess_json,
+                &output_contract,
+                &source,
+            ) {
+                tracing::warn!(
+                    "core sync: skipping invalid vision model '{}' from node '{}': {}",
+                    model_name,
+                    operation.body.actor_node_id,
+                    err
+                );
+                return Ok(0);
+            }
+            // Org-guarded upsert (mirror of the local `register_vision_model`):
+            // `model_name` is the PK, so a replicated row from ANOTHER org must
+            // not overwrite an existing row — 0 changed rows means a cross-org
+            // name collision, which we log and skip instead of hijacking.
+            let changed = tx
+                .execute(
+                    "INSERT INTO vision_models \
+                     (model_name, op, file_name, sha256, classes_json, preprocess_json, \
+                      output_contract, source, default_threshold, org_id, project_id, \
+                      source_model_id, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
+                     CAST(strftime('%s','now') AS INTEGER), CAST(strftime('%s','now') AS INTEGER)) \
+                     ON CONFLICT(model_name) DO UPDATE SET \
+                     op = excluded.op, file_name = excluded.file_name, sha256 = excluded.sha256, \
+                     classes_json = excluded.classes_json, \
+                     preprocess_json = excluded.preprocess_json, \
+                     output_contract = excluded.output_contract, source = excluded.source, \
+                     default_threshold = excluded.default_threshold, \
+                     project_id = excluded.project_id, \
+                     source_model_id = excluded.source_model_id, \
+                     updated_at = CAST(strftime('%s','now') AS INTEGER) \
+                     WHERE vision_models.org_id = excluded.org_id",
+                    rusqlite::params![
+                        model_name,
+                        op,
+                        file_name,
+                        sha256,
+                        classes_json,
+                        preprocess_json,
+                        output_contract,
+                        source,
+                        default_threshold,
+                        org_id,
+                        project_id,
+                        source_model_id,
+                    ],
+                )
+                .map_err(sql_error)?;
+            if changed == 0 {
+                tracing::warn!(
+                    "core sync: vision model '{}' from node '{}' collides with another org's \
+                     row — skipped",
+                    model_name,
+                    operation.body.actor_node_id
+                );
+            }
+            Ok(changed)
+        }
+        ActionType::Delete => {
+            let org_id =
+                field_string_or(operation, "org_id", crate::services::org::DEFAULT_ORG_ID)?;
+            tx.execute(
+                "DELETE FROM vision_models WHERE model_name = ?1 AND org_id = ?2",
+                rusqlite::params![model_name, org_id],
+            )
+            .map_err(sql_error)
+        }
+    }
+}
+
 /// UPDATE matched no row: the INSERT that creates this resource has not been
 /// materialized yet (causal-ordering gap), not a data conflict. Surface it as a
 /// deferred-ordering error so the inbox keeps the entry retryable until the
@@ -2044,6 +2427,23 @@ fn field_i64_or(operation: &SyncOperation, key: &str, default: i64) -> LedgerRes
         Some(FieldValue::Null) | None => Ok(default),
         _ => Err(SyncLedgerError::Runtime(format!(
             "core operation field has invalid i64 type: {key}"
+        ))),
+    }
+}
+
+/// Decode a real (f64) field. Reals ride the wire as `FieldValue::Decimal` (an
+/// exact decimal string), so parse it back; integer-typed inputs are accepted as
+/// a convenience. A missing/null field yields `default`.
+fn field_f64_or(operation: &SyncOperation, key: &str, default: f64) -> LedgerResult<f64> {
+    match operation.body.changed_fields.get(key) {
+        Some(FieldValue::Decimal(value)) => value.parse::<f64>().map_err(|e| {
+            SyncLedgerError::Runtime(format!("invalid f64 field {key}: {e}"))
+        }),
+        Some(FieldValue::I64(value)) => Ok(*value as f64),
+        Some(FieldValue::U64(value)) => Ok(*value as f64),
+        Some(FieldValue::Null) | None => Ok(default),
+        _ => Err(SyncLedgerError::Runtime(format!(
+            "core operation field has invalid f64 type: {key}"
         ))),
     }
 }

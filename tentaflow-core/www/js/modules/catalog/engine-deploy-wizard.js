@@ -14,6 +14,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import * as Manifest from '/js/modules/catalog/manifest-store.js';
 import { deployIcon, render as renderIcon } from '/js/modules/catalog/catalog-icons.js';
+import { isCameraCvEngineId } from '/js/modules/catalog/camera-cv-bundles.js';
 
 let currentStep = 1;
 let engineEntry = null;
@@ -30,6 +31,11 @@ let hfGgufFilesRepo = '';
 let hfGgufFilesLoading = false;
 let hfGgufFilesError = '';
 
+// Custom-bundle (unpaired instance) manifest preview state.
+let customBundlePreview = null;
+let customBundlePreviewLoading = false;
+let customBundlePreviewError = '';
+
 let selection = {
   nodeId: null,
   deployMethod: null,
@@ -42,18 +48,30 @@ let selection = {
   gpuIds: [],             // e.g. ['0','2'] when gpuSelectMode === 'specific'
 };
 
+// Callback fired once when the wizard closes (used by the cluster page to
+// refresh its detail view after a cluster deploy). Set from opts.onClose.
+let onCloseCallback = null;
+
 // Cache per-node GPU lists to avoid re-querying when switching back and forth.
 const gpuListByNode = new Map();
 
 // Ordered step ids with optional skip predicate. Runtime order derived at
 // navigation time by filtering out steps whose skip() returns true.
 const STEPS = [
-  { id: 'method' },
+  { id: 'method', skip: shouldSkipMethodStep },
   { id: 'model', skip: shouldSkipModelStep },
   { id: 'gpu', skip: shouldSkipGpuStep },
   { id: 'advanced', skip: shouldSkipAdvancedStep },
-  { id: 'runtime' },
+  { id: 'cluster-config', skip: shouldSkipClusterConfigStep },
+  { id: 'runtime', skip: shouldSkipRuntimeStep },
 ];
+
+// Cluster deploy runs across the whole cluster, so there is no single deploy
+// method, GPU picker or per-container runtime — those steps are node-only. The
+// cluster-config step is the mirror image (cluster-only).
+function shouldSkipMethodStep() { return selection.isCluster; }
+function shouldSkipRuntimeStep() { return selection.isCluster; }
+function shouldSkipClusterConfigStep() { return !selection.isCluster; }
 
 // Cache ostatniego wyniku /api/deploy/vllm/recommend (key: model+gpu_ids hash).
 // Pozwala przeliczyc VRAM lokalnie przy zmianie suwaka bez ponownego HF fetch.
@@ -75,6 +93,7 @@ let prevAtLimit = false;
 /// `nodeId` (preselekcja z MeshDetail) i `hostOs` (z katalogu).
 export async function openDeployWizard(engineId, opts = {}) {
   currentStep = 1;
+  onCloseCallback = null;
   modelSourceMode = 'preset';
   hfResults = [];
   hfSearchQuery = '';
@@ -82,6 +101,9 @@ export async function openDeployWizard(engineId, opts = {}) {
   hfGgufFilesRepo = '';
   hfGgufFilesLoading = false;
   hfGgufFilesError = '';
+  customBundlePreview = null;
+  customBundlePreviewLoading = false;
+  customBundlePreviewError = '';
   selection = {
     nodeId: opts.nodeId || null,
     deployMethod: null,
@@ -92,12 +114,26 @@ export async function openDeployWizard(engineId, opts = {}) {
     containerName: null,
     gpuSelectMode: 'all',
     gpuIds: [],
+    // Cluster (multi-node tensor-parallel) deploy. When `isCluster`, the wizard
+    // skips method/gpu/runtime, keeps model+advanced and adds a cluster-config
+    // step; startDeploy sends `clusterDeployRequest` instead of the node path.
+    isCluster: opts.isCluster === true,
+    clusterId: opts.clusterId || null,
+    clusterMembers: [],
+    gpusPerNode: 1,
+    servedModelName: '',
+    pricing: { promptPer1k: null, completionPer1k: null, audioPerMin: null, imageEach: null },
     // External cloud provider credentials (deploy.external.requires_api_key).
     // Stored encrypted server-side; base_url/api_version only used by
     // openai-compatible/azure-openai engines that need an endpoint override.
     apiKey: '',
     baseUrl: '',
     apiVersion: '',
+    // Custom bundle source (camera-CV engines): manifest URL of another
+    // TentaFlow instance's /models/manifest/<bundle> endpoint + the API key
+    // (model_bundle scope) authenticating the pull between UNPAIRED instances.
+    visionBundleUrl: '',
+    visionBundleApiKey: '',
     // 'api' = pay-per-token API key; 'subscription' = OAuth/ChatGPT-or-Google
     // subscription token (OpenAI Codex / Gemini Code Assist). Only OpenAI+Gemini.
     externalAuthMode: 'api',
@@ -185,6 +221,25 @@ export async function openDeployWizard(engineId, opts = {}) {
     renderShell(`<div class="form-hint">${escapeHtml(I18n.t('wizard.noNodesAvailable'))}</div>`);
     return;
   }
+
+  if (selection.isCluster) {
+    // Cluster deploy is tensor-parallel: the model is sharded across EVERY GPU
+    // of EVERY member (TP = members × gpusPerNode). Pick a representative member
+    // that the mesh reports with GPUs so the calculator can read a per-GPU VRAM
+    // and derive gpusPerNode from real hardware — TP must be known already in the
+    // Advanced step, which runs before cluster-config.
+    selection.clusterMembers = await fetchClusterMembers(selection.clusterId);
+    const memberIds = selection.clusterMembers.map((m) => m.node_id).filter(Boolean);
+    const withGpu = memberIds.find((id) => nodeGpus(id).length > 0);
+    selection.nodeId = withGpu || memberIds[0] || selection.nodeId;
+    // gpusPerNode can never exceed a node's physical GPU count. DGX Spark exposes
+    // 1 GPU/node → gpusPerNode=1, TP=members. This makes TP deterministic from
+    // cluster hardware and available to the Advanced VRAM calculator.
+    selection.gpusPerNode = Math.max(1, nodeGpus(selection.nodeId).length);
+    // Unified GB10 memory OOM-kills at 0.9; 0.5 is the safe cluster default.
+    selection.advanced.gpu_memory_utilization = 0.5;
+  }
+
   if (!selection.nodeId) {
     const local = nodes.find((n) => n?.is_local === true) || nodes[0];
     selection.nodeId = local ? (local.node_id || local.id) : null;
@@ -198,7 +253,7 @@ export async function openDeployWizard(engineId, opts = {}) {
   }
 
   const eng = engineEntry.engine || {};
-  selection.port = eng.default_port || 8080;
+  selection.port = selection.isCluster ? 8100 : (eng.default_port || 8080);
   selection.containerName = `tentaflow-${(eng.id || 'svc').toLowerCase()}-${randomSuffix()}`;
 
   const presets = Manifest.modelPresets(engineEntry);
@@ -210,10 +265,20 @@ export async function openDeployWizard(engineId, opts = {}) {
     if (rec) {
       selection.modelPresetId = rec.id;
       applySpeculatorPreset(rec);
+      // Domyslny wariant kwantyzacji (gdy preset go ma) — repo wariantu jako
+      // model_repo (wygrywa nad preset.repo w backendzie).
+      const dv = defaultQuantVariant(rec);
+      selection.quantVariant = dv ? dv.quantization : null;
+      selection.modelRepo = dv ? dv.repo : null;
+      if (dv) selection.advanced.quantization = dv.quantization;
     }
   } else {
-    modelSourceMode = 'hf';
+    modelSourceMode = isCameraCvEngine() ? 'custom' : 'hf';
   }
+
+  // Armed only after the (loading/error) renderShell cycles are done, so the
+  // internal close() they perform never fires this user-close refresh.
+  onCloseCallback = typeof opts.onClose === 'function' ? opts.onClose : null;
 
   refreshModal();
 }
@@ -256,6 +321,9 @@ export function close() {
   }
   const backdrop = document.getElementById('engine-deploy-wizard-backdrop');
   if (backdrop) backdrop.remove();
+  const cb = onCloseCallback;
+  onCloseCallback = null;
+  if (cb) { try { cb(); } catch (_) { /* refresh best-effort */ } }
 }
 
 // ---- Data -----------------------------------------------------------------
@@ -274,6 +342,23 @@ async function fetchNodes() {
     console.warn('[wizard] fetchNodes:', err);
   }
   return [];
+}
+
+/// Cluster members for a cluster deploy — normalized to `{ node_id, hostname }`.
+/// Mirrors cluster-detail's resolveMembers (camelCase binary + snake_case legacy).
+async function fetchClusterMembers(clusterId) {
+  if (!clusterId) return [];
+  try {
+    const detail = await ApiBinary.one('clusterDetailRequest', { clusterId });
+    const raw = (detail && (detail.members || detail.cluster?.members)) || [];
+    return raw.map((m) => ({
+      node_id: m.nodeId || m.node_id || m.id,
+      hostname: m.hostname || m.node_name || m.nodeId || m.node_id || '',
+    })).filter((m) => m.node_id);
+  } catch (err) {
+    console.warn('[wizard] fetchClusterMembers:', err);
+    return [];
+  }
 }
 
 function defaultUaOs() {
@@ -390,6 +475,7 @@ function renderStepBody() {
     case 'model':    return renderStepModel();
     case 'gpu':      return renderStepGpu();
     case 'advanced': return renderStepAdvanced();
+    case 'cluster-config': return renderStepClusterConfig();
     case 'runtime':  return renderStepRuntime();
     default: return '';
   }
@@ -411,8 +497,15 @@ function manifestParams() {
 // llama.cpp + MLX). They must NOT fall into the generic manifest-param renderer.
 const ADV_CALC_ENGINES = ['vllm', 'vllm-spark', 'sglang', 'llama-cpp', 'tensorrt-llm', 'mlx'];
 
+// vLLM-backed engines (embed / rerank / VL pooling models) carry backend="vllm"
+// in the manifest — they get the SAME VRAM calculator + gpu_memory_utilization
+// slider as the named vLLM engines, without a second hand-maintained id list.
+function isAdvCalcEngine(id) {
+  return ADV_CALC_ENGINES.includes(id) || engineEntry?.engine?.backend === 'vllm';
+}
+
 function hasGenericParams() {
-  if (ADV_CALC_ENGINES.includes(engineId())) return false;
+  if (isAdvCalcEngine(engineId())) return false;
   return manifestParams().length > 0;
 }
 
@@ -430,7 +523,7 @@ function shouldSkipAdvancedStep() {
   if (hasGenericParams()) return false;
   // MLX (embedded, Apple unified memory) reuzywa ten sam krok, ale liczy
   // "ile tokenow kontekstu zmiesci sie w budzecie pamieci" zamiast vLLM args.
-  if (!ADV_CALC_ENGINES.includes(id)) return true;
+  if (!isAdvCalcEngine(id)) return true;
   // Bez wybranego modelu nie ma jak liczyc VRAM/KV
   if (!selection.modelRepo && !selection.modelPresetId) return true;
   // Bez wybranych GPU tez nie — ale MLX nie ma dyskretnego GPU (unified memory),
@@ -532,23 +625,167 @@ function renderStepMethod() {
 function renderStepModel() {
   const presets = Manifest.modelPresets(engineEntry);
   const hasPresets = presets.length > 0;
+  // Camera-CV bundle engines pull fixed weights, not HF repos — their second
+  // source is "Custom": another TentaFlow instance's /models manifest + API key.
+  const cameraCv = isCameraCvEngine();
 
   let tabs = `<tf-tabs variant="underline" id="edw-model-tabs" value="${escapeAttr(modelSourceMode)}">`;
   if (hasPresets) {
     tabs += `<tf-tab id="preset">${escapeHtml(I18n.t('wizard.fromPreset'))}</tf-tab>`;
   }
-  tabs += `<tf-tab id="hf">${escapeHtml(I18n.t('wizard.searchHuggingface'))}</tf-tab>`;
+  if (cameraCv) {
+    tabs += `<tf-tab id="custom">${escapeHtml(I18n.t('wizard.customBundle'))}</tf-tab>`;
+  } else {
+    tabs += `<tf-tab id="hf">${escapeHtml(I18n.t('wizard.searchHuggingface'))}</tf-tab>`;
+  }
   tabs += '</tf-tabs>';
 
-  const content = modelSourceMode === 'preset' && hasPresets
-    ? renderPresetSelector(presets)
-    : renderHfSearch();
+  let content;
+  if (modelSourceMode === 'preset' && hasPresets) {
+    content = renderPresetSelector(presets);
+  } else if (cameraCv) {
+    content = renderCustomBundleSource();
+  } else {
+    content = renderHfSearch();
+  }
 
   return `
     <h4 class="wizard-step-title">${escapeHtml(I18n.t('wizard.selectModel'))}</h4>
     ${tabs}
     <div class="wizard-tab-content">${content}</div>
   `;
+}
+
+/// "Custom" bundle source for camera-CV engines: manifest URL of the serving
+/// TentaFlow instance + API key. A signed manifest URL (with ?token=) needs no
+/// key; a plain manifest URL is authenticated with the Bearer key created on
+/// the serving instance ("Dostęp i klucze API" → model_bundle scope).
+function renderCustomBundleSource() {
+  return `
+    <div class="form-group">
+      <tf-input type="text" id="edw-bundle-url"
+        label="${escapeAttr(I18n.t('wizard.customBundleUrl'))}"
+        placeholder="https://other-instance:8090/models/manifest/vision-all"
+        value="${escapeAttr(selection.visionBundleUrl)}" autocomplete="off"
+        hint="${escapeAttr(I18n.t('wizard.customBundleUrlHint'))}"></tf-input>
+    </div>
+    <div class="form-group">
+      <tf-input type="password" id="edw-bundle-api-key"
+        label="${escapeAttr(I18n.t('wizard.customBundleApiKey'))}"
+        placeholder="sk-..."
+        value="${escapeAttr(selection.visionBundleApiKey)}" autocomplete="off"
+        hint="${escapeAttr(I18n.t('wizard.customBundleApiKeyHint'))}"></tf-input>
+    </div>
+    <div class="form-group">
+      <tf-button id="edw-bundle-preview" variant="ghost" icon="search">${escapeHtml(I18n.t('wizard.customBundlePreview') || 'Sprawdź manifest')}</tf-button>
+    </div>
+    <div id="edw-bundle-preview-result"></div>
+  `;
+}
+
+/// Render the fetched-manifest preview: file list + (for a single-model
+/// registry bundle) the importable model and an "Importuj do rejestru" action.
+function renderBundlePreview(container) {
+  if (!customBundlePreview) { container.innerHTML = ''; return; }
+  if (customBundlePreviewLoading) {
+    container.innerHTML = `<p class="form-hint">${escapeHtml(I18n.t('common.loading'))}</p>`;
+    return;
+  }
+  if (customBundlePreviewError) {
+    container.innerHTML = `<p class="form-hint error">${escapeHtml(customBundlePreviewError)}</p>`;
+    return;
+  }
+  const m = customBundlePreview.model;
+  const files = Array.isArray(customBundlePreview.files) ? customBundlePreview.files : [];
+  const filesHtml = files.map((f) => `
+    <div class="model-item">
+      <div class="model-item-main">
+        <div class="model-item-name mono">${escapeHtml(f.name)}</div>
+        <div class="model-item-info">${escapeHtml(String(f.sha256 || '').slice(0, 12))} · ${escapeHtml(formatBytes(Number(f.size) || 0))}</div>
+      </div>
+    </div>`).join('');
+  let importHtml = '';
+  if (m && m.modelName) {
+    const classes = Array.isArray(m.classes) ? m.classes.length : 0;
+    importHtml = `
+      <div class="model-item selected">
+        <div class="model-item-main">
+          <div class="model-item-name">${escapeHtml(m.modelName)}</div>
+          <div class="model-item-info">${escapeHtml(m.op || '')} · ${classes} ${escapeHtml(I18n.t('wizard.customBundleClasses') || 'klas')}</div>
+        </div>
+      </div>
+      <div class="form-group" style="margin-top:12px;">
+        <tf-input type="text" id="edw-bundle-alias"
+          label="${escapeAttr(I18n.t('wizard.customBundleAlias') || 'Alias (opcjonalnie)')}"
+          value="${escapeAttr(selection.visionImportAlias || '')}" autocomplete="off"></tf-input>
+      </div>
+      <div class="form-group">
+        <tf-button id="edw-bundle-import" variant="primary" icon="download">${escapeHtml(I18n.t('wizard.customBundleImport') || 'Importuj do rejestru')}</tf-button>
+      </div>`;
+  } else {
+    importHtml = `<p class="form-hint">${escapeHtml(I18n.t('wizard.customBundleFixedHint') || 'To bundle silnika (nie pojedynczy model rejestru) — zostanie pobrany przy wdrożeniu tego silnika.')}</p>`;
+  }
+  container.innerHTML = `
+    <div class="wizard-tab-content">
+      <div class="model-list">${filesHtml}</div>
+      ${importHtml}
+    </div>`;
+  const importBtn = container.querySelector('#edw-bundle-import');
+  if (importBtn) importBtn.addEventListener('click', importCustomModel);
+  const aliasInput = container.querySelector('#edw-bundle-alias');
+  if (aliasInput) {
+    aliasInput.addEventListener('input', (e) => {
+      selection.visionImportAlias = String(e.detail?.value ?? aliasInput.value).trim();
+    });
+  }
+}
+
+/// Fetch the remote manifest through Core (server-side, Bearer key). Populates
+/// the preview state and re-renders only the result container.
+async function previewCustomManifest() {
+  const url = String(selection.visionBundleUrl || '').trim();
+  const key = String(selection.visionBundleApiKey || '').trim();
+  if (!url) { toast(I18n.t('wizard.customBundleUrlInvalid') || 'Podaj URL manifestu', 'error'); return; }
+  customBundlePreview = null;
+  customBundlePreviewError = '';
+  customBundlePreviewLoading = true;
+  const box = document.getElementById('edw-bundle-preview-result');
+  if (box) renderBundlePreview(box);
+  try {
+    const resp = await ApiBinary.action('visionImportFetchManifestRequest', {
+      manifestUrl: url,
+      apiKey: key,
+    });
+    if (resp && resp.error) throw new Error(resp.error);
+    customBundlePreview = resp || { files: [], model: null };
+  } catch (e) {
+    customBundlePreviewError = e.message || String(e);
+  } finally {
+    customBundlePreviewLoading = false;
+    const b = document.getElementById('edw-bundle-preview-result');
+    if (b) renderBundlePreview(b);
+  }
+}
+
+/// Import the previewed single-model registry bundle into the local registry.
+async function importCustomModel() {
+  const m = customBundlePreview && customBundlePreview.model;
+  if (!m || !m.modelName) return;
+  const btn = document.getElementById('edw-bundle-import');
+  if (btn) btn.setAttribute('disabled', '');
+  try {
+    const resp = await ApiBinary.action('visionImportModelRequest', {
+      manifestUrl: String(selection.visionBundleUrl || '').trim(),
+      apiKey: String(selection.visionBundleApiKey || '').trim(),
+      modelName: m.modelName,
+      alias: selection.visionImportAlias || null,
+    }, { timeoutMs: 10 * 60 * 1000 });
+    if (!resp || !resp.ok) throw new Error((resp && resp.error) || 'import odrzucony');
+    toast(`${I18n.t('wizard.customBundleImported') || 'Model zaimportowany'}: ${resp.importedModelName || m.modelName}`, 'success');
+  } catch (e) {
+    if (btn) btn.removeAttribute('disabled');
+    toast(`${I18n.t('wizard.customBundleImportFailed') || 'Import nieudany'}: ${e.message || e}`, 'error');
+  }
 }
 
 function renderPresetSelector(presets) {
@@ -576,7 +813,45 @@ function renderPresetSelector(presets) {
 
   return `
     <div class="model-list">${items}</div>
+    ${renderQuantVariantSelector(presets)}
     <p class="form-hint">${escapeHtml(I18n.t('wizard.presetHint'))}</p>
+  `;
+}
+
+/// Warianty kwantyzacji wybranego presetu (`[[model_preset.quant_variant]]`).
+function presetQuantVariants(preset) {
+  return (preset && Array.isArray(preset.quant_variant)) ? preset.quant_variant.filter(Boolean) : [];
+}
+
+/// Domyslny wariant: dopasowany do `quantization` presetu, inaczej pierwszy.
+function defaultQuantVariant(preset) {
+  const vs = presetQuantVariants(preset);
+  if (!vs.length) return null;
+  const q = (preset.quantization || '').toLowerCase();
+  return vs.find((v) => (v.quantization || '').toLowerCase() === q) || vs[0];
+}
+
+/// Dropdown wyboru kwantyzacji (= podmiana repo HF) pod lista presetow. Renderuje
+/// sie tylko gdy wybrany preset ma zdefiniowane `quant_variant`. Pod spodem widac
+/// docelowe repo, zgodnie z pomyslem: wybor kwantyzacji + od razu wiadomo model.
+function renderQuantVariantSelector(presets) {
+  const preset = presets.find((p) => p?.id === selection.modelPresetId);
+  const variants = presetQuantVariants(preset);
+  if (variants.length < 2) return '';
+  const current = (selection.quantVariant || (defaultQuantVariant(preset) || {}).quantization || '').toLowerCase();
+  const opts = variants.map((v) => {
+    const q = v.quantization || '';
+    const label = v.display_name || q;
+    const sel = q.toLowerCase() === current ? ' selected' : '';
+    return `<option value="${escapeAttr(q)}"${sel}>${escapeHtml(label)}</option>`;
+  }).join('');
+  const active = variants.find((v) => (v.quantization || '').toLowerCase() === current) || variants[0];
+  return `
+    <div class="quant-variant-row">
+      <label class="form-label" for="edw-quant-variant">${escapeHtml(I18n.t('wizard.quantVariant'))}</label>
+      <tf-select id="edw-quant-variant" value="${escapeAttr(active.quantization || '')}">${opts}</tf-select>
+      <div class="model-item-info mono">${escapeHtml(active.repo || '')}</div>
+    </div>
   `;
 }
 
@@ -675,10 +950,23 @@ function isMlxEngine() {
   return engineId() === 'mlx';
 }
 
+function isCameraCvEngine() {
+  return isCameraCvEngineId(engineId());
+}
+
 // vLLM-rodzina = silniki ktore akceptuja safetensors override kwantyzacji wag
 // i jeden select KV (auto/fp8). Wagi llama.cpp/MLX wynikaja z pobranego pliku.
 function isVllmFamilyEngine() {
-  return ['vllm', 'vllm-spark', 'sglang', 'tensorrt-llm'].includes(engineId());
+  return ['vllm', 'vllm-spark', 'sglang', 'tensorrt-llm'].includes(engineId())
+    || engineEntry?.engine?.backend === 'vllm';
+}
+
+// Pooling engines (embeddings / reranker) have no KV-cache pool, so their
+// resting gpu_memory_utilization default is a tight budget, not the generative
+// 0.9 — mirrors Core's `auto_gpu_memory_utilization(is_pooling)` cap.
+function isPoolingEngine() {
+  const cat = String(engineEntry?.engine?.category || '').toLowerCase();
+  return cat === 'embeddings' || cat === 'reranker';
 }
 
 function formatCount(n) {
@@ -741,15 +1029,57 @@ function getAdvancedGpus() {
   return allGpus; // 'all'
 }
 
+// Full tensor-parallel device list for a cluster deploy. TP shards the model
+// across every GPU of every member (members × gpusPerNode), so the VRAM
+// calculator must see ALL devices — not one node's GPUs. Each member contributes
+// `gpusPerNode` devices carrying that node's per-GPU VRAM; members whose GPU
+// inventory has not yet propagated over the mesh reuse the representative node's
+// per-GPU VRAM (identical Spark hardware). Single-node deploy falls back to the
+// unchanged single-node path.
+function getClusterAdvancedGpus() {
+  if (!selection.isCluster) return getAdvancedGpus();
+  const perNode = Math.max(1, Number(selection.gpusPerNode) || 1);
+  const members = selection.clusterMembers || [];
+  const gpuMemGb = (g) =>
+    g ? Math.round(((g.vram_total_mb || g.memory_mb || 0) / 1024) * 10) / 10 : 0;
+  const repGpus = nodeGpus(selection.nodeId);
+  const fallbackMem = gpuMemGb(repGpus[0]);
+  const fallbackName = (repGpus[0] && repGpus[0].name) || 'GPU';
+  const out = [];
+  let idx = 0;
+  for (const m of members) {
+    if (!m || !m.node_id) continue;
+    const gpus = nodeGpus(m.node_id);
+    for (let i = 0; i < perNode; i += 1) {
+      const g = gpus[i] || gpus[0] || null;
+      out.push({
+        index: idx,
+        name: (g && g.name) || fallbackName,
+        memory_gb: gpuMemGb(g) || fallbackMem,
+      });
+      idx += 1;
+    }
+  }
+  return out.filter((g) => g.memory_gb > 0);
+}
+
 async function fetchVllmRecommendation(overrides = {}) {
   const model = getAdvancedModelName();
-  const gpus = getAdvancedGpus();
+  const gpus = selection.isCluster ? getClusterAdvancedGpus() : getAdvancedGpus();
   if (!model || gpus.length === 0) return null;
   const body = {
     model,
     gpus,
     ...overrides,
   };
+  // Cluster deploy is tensor-parallel across the whole cluster. The backend
+  // computes weights-per-GPU as model/TP, so lock TP = members × gpusPerNode
+  // (the full device count sent above). This mirrors the deploy-time TP exactly,
+  // so the VRAM budget the user sees is the real distributed budget.
+  if (selection.isCluster) {
+    body.tensor_parallel = clusterTpSize();
+    body.lock_tensor_parallel = true;
+  }
   // Jawne pole `engine` mowi backendowi ktorym modelem fizycznym liczyc VRAM.
   // Bez niego GGUF wykrywa sie po nazwie pliku, ale jawne pole jest pewne i
   // dziala tez dla nie-GGUF modeli llama.cpp. MLX czyta config.json (NIE GGUF),
@@ -937,11 +1267,19 @@ function renderStepAdvanced() {
     return renderMlxAdvanced();
   }
   const model = getAdvancedModelName() || '?';
-  const gpus = getAdvancedGpus();
+  const gpus = selection.isCluster ? getClusterAdvancedGpus() : getAdvancedGpus();
   const totalVramGb = gpus.reduce((acc, g) => acc + g.memory_gb, 0);
-  const gpuLabel = gpus.length > 0
-    ? `${gpus.length} × ${gpus[0].name} · ${totalVramGb.toFixed(1)} GB VRAM`
-    : '—';
+  // Cluster: make it explicit this is a distributed tensor-parallel budget
+  // (N GPU across M nodes), not a single "1 × Spark · 119 GB" node.
+  const members = selection.clusterMembers.length || 0;
+  const perNode = Math.max(1, Number(selection.gpusPerNode) || 1);
+  const gpuLabel = selection.isCluster
+    ? (gpus.length > 0
+      ? `Distributed tensor-parallel: ${gpus.length} GPU (${members} × ${perNode} GPU/node) · ${totalVramGb.toFixed(1)} GB · TP=${gpus.length}`
+      : '—')
+    : (gpus.length > 0
+      ? `${gpus.length} × ${gpus[0].name} · ${totalVramGb.toFixed(1)} GB VRAM`
+      : '—');
 
   const adv = selection.advanced;
   const rec = advancedRecommendation;
@@ -966,7 +1304,9 @@ function renderStepAdvanced() {
         <div class="adv-summary-cell">
           <div class="adv-cell-label">${escapeHtml(tk('summary_gpu'))}</div>
           <div class="adv-cell-value">${escapeHtml(gpuLabel)}</div>
-          <div class="adv-cell-sub">${gpus.map((g) => `GPU ${g.index}`).join(' · ') || '—'}</div>
+          <div class="adv-cell-sub">${escapeHtml(selection.isCluster
+            ? (selection.clusterMembers.map((m) => nodeDisplayName(m.node_id)).filter(Boolean).join(' · ') || '—')
+            : (gpus.map((g) => `GPU ${g.index}`).join(' · ') || '—'))}</div>
         </div>
       </div>
     </div>
@@ -1298,7 +1638,7 @@ function renderAdvancedManualControls(adv, rec) {
   const normKv = (v) => (isLcpp && v === 'auto') ? 'f16' : v;
   const kv = normKv(adv.kv_cache_dtype || applied.kv_cache_dtype || recCfg.kv_cache_dtype || (isLcpp ? 'f16' : 'auto'));
   const kvV = normKv(adv.kv_cache_dtype_v || kv);
-  const memUtil = valueFor('gpu_memory_utilization', 0.9);
+  const memUtil = valueFor('gpu_memory_utilization', isPoolingEngine() ? 0.2 : 0.9);
   const totalGpus = (getAdvancedGpus() || []).length || 1;
 
   // Helper: render the auto-adjust hint shown below a slider.
@@ -1480,7 +1820,7 @@ function renderAdvancedManualControls(adv, rec) {
       ${isLcpp ? '' : `
       <div class="adv-form-row">
         <label><span>${escapeHtml(tAdv('mem_label'))} ${lockMark('gpu_memory_utilization')}</span><span class="v" id="edw-adv-mem-val">${(memUtil * 100).toFixed(0)}%</span></label>
-        <input type="range" class="adv-range" id="edw-adv-mem" min="0.5" max="0.95" step="0.05" value="${memUtil}">
+        <input type="range" class="adv-range" id="edw-adv-mem" min="0.15" max="0.9" step="0.05" value="${memUtil}">
         <div class="adv-hint">${escapeHtml(tAdv('mem_hint'))}</div>
         ${memAdjust}
       </div>`}
@@ -1623,7 +1963,11 @@ function bindAdvancedHandlers() {
       // llama.cpp default KV type is f16 and the engine emits no flag for it,
       // so an explicit 'f16' is equivalent to 'auto' on the wire.
       kv_cache_dtype: (a.kv_cache_dtype !== 'auto' && !(isLcpp && a.kv_cache_dtype === 'f16')) ? a.kv_cache_dtype : undefined,
-      gpu_memory_utilization: a.gpu_memory_utilization || undefined,
+      // Send a value ONLY when the user actually moved the slider. Untouched →
+      // undefined → Core's pooling-aware auto picks the budget (tight cap for
+      // embed/rerank, generous for LLMs). Sending the slider's resting default
+      // would mask that auto and starve pooling engines on a shared GPU.
+      gpu_memory_utilization: a.gpu_memory_touched ? a.gpu_memory_utilization : undefined,
       lock_max_model_len: lock === 'max_model_len' || undefined,
       lock_max_num_seqs: lock === 'max_num_seqs' || undefined,
       lock_tensor_parallel: lock === 'tensor_parallel' || undefined,
@@ -1850,6 +2194,128 @@ function bindAdvancedHandlers() {
   if (!advancedRecommendation) {
     debounceRecompute(buildOverrides());
   }
+}
+
+// ---- Step: cluster-config (multi-node tensor-parallel) --------------------
+
+function tCluster(k, params) { return I18n.t(`wizard.cluster.${k}`, params); }
+
+// Members × gpusPerNode = tensor-parallel world size. Members come from the
+// cluster detail fetched in openDeployWizard; gpusPerNode is user-set here.
+function clusterTpSize() {
+  const members = selection.clusterMembers.length || 0;
+  const g = Math.max(1, Number(selection.gpusPerNode) || 1);
+  return members * g;
+}
+
+function renderStepClusterConfig() {
+  const members = selection.clusterMembers.length || 0;
+  // gpusPerNode is bounded by the representative node's physical GPU count.
+  // Spark = 1 GPU/node → the field locks to 1; multi-GPU nodes let the user pick.
+  const maxGpusPerNode = Math.max(1, nodeGpus(selection.nodeId).length);
+  const gpus = Math.min(maxGpusPerNode, Math.max(1, Number(selection.gpusPerNode) || 1));
+  const gpusLocked = maxGpusPerNode <= 1;
+  const p = selection.pricing;
+
+  let modelSummary = '';
+  if (selection.modelRepo) {
+    modelSummary = `<div><code>${escapeHtml(selection.modelRepo)}</code> <span class="form-hint inline">(HuggingFace)</span></div>`;
+  } else if (selection.modelPresetId) {
+    const preset = Manifest.modelPresets(engineEntry).find((pr) => pr?.id === selection.modelPresetId);
+    if (preset) modelSummary = `<div><strong>${escapeHtml(preset.display_name || preset.id)}</strong>${preset.repo ? ` <span class="form-hint inline">${escapeHtml(preset.repo)}</span>` : ''}</div>`;
+  }
+
+  return `
+    <h4 class="wizard-step-title">${escapeHtml(tCluster('title'))}</h4>
+    <p class="form-hint" style="margin-bottom:14px;">${escapeHtml(tCluster('subtitle', { n: members }))}</p>
+
+    ${modelSummary ? `<div class="form-group"><label>${escapeHtml(I18n.t('wizard.modelLabel'))}</label>${modelSummary}</div>` : ''}
+
+    <div class="form-group">
+      <tf-input type="number" id="edw-cluster-gpus" min="1" max="${maxGpusPerNode}"
+        ${gpusLocked ? 'disabled' : ''}
+        label="${escapeAttr(tCluster('gpus_per_node'))}"
+        value="${escapeAttr(String(gpus))}"></tf-input>
+      <div class="cluster-deploy-tp-preview" style="margin-top:6px;">
+        ${escapeHtml(tCluster('tp_label'))}: <strong id="edw-cluster-tp">${clusterTpSize()}</strong>
+        <span class="form-hint inline">(${members} × <span id="edw-cluster-gpus-echo">${gpus}</span>)</span>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <tf-input type="text" id="edw-cluster-served"
+        label="${escapeAttr(tCluster('served_name'))}"
+        placeholder="${escapeAttr(tCluster('served_name_hint'))}"
+        value="${escapeAttr(selection.servedModelName || '')}"></tf-input>
+    </div>
+
+    <div class="form-group">
+      <tf-input type="number" id="edw-cluster-port" min="1" max="65535"
+        label="${escapeAttr(tCluster('port'))}"
+        value="${escapeAttr(String(selection.port || 8100))}"></tf-input>
+    </div>
+
+    <div class="form-group">
+      <label>${escapeHtml(tCluster('pricing_title'))}</label>
+      <div class="form-hint" style="margin-bottom:6px;">${escapeHtml(tCluster('pricing_hint'))}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+        <tf-input id="edw-cluster-price-prompt" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_prompt'))}" value="${escapeAttr(p.promptPer1k == null ? '' : String(p.promptPer1k))}"></tf-input>
+        <tf-input id="edw-cluster-price-completion" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_completion'))}" value="${escapeAttr(p.completionPer1k == null ? '' : String(p.completionPer1k))}"></tf-input>
+        <tf-input id="edw-cluster-price-audio" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_audio'))}" value="${escapeAttr(p.audioPerMin == null ? '' : String(p.audioPerMin))}"></tf-input>
+        <tf-input id="edw-cluster-price-image" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_image'))}" value="${escapeAttr(p.imageEach == null ? '' : String(p.imageEach))}"></tf-input>
+      </div>
+    </div>
+  `;
+}
+
+function bindStepClusterConfigInputs() {
+  const gpusInput = document.getElementById('edw-cluster-gpus');
+  if (gpusInput) {
+    const maxGpusPerNode = Math.max(1, nodeGpus(selection.nodeId).length);
+    const onGpus = (e) => {
+      const raw = e.detail?.value ?? gpusInput.value;
+      const v = Math.max(1, Math.min(maxGpusPerNode, parseInt(raw, 10) || 1));
+      selection.gpusPerNode = v;
+      const tpEl = document.getElementById('edw-cluster-tp');
+      const echoEl = document.getElementById('edw-cluster-gpus-echo');
+      if (tpEl) tpEl.textContent = String(clusterTpSize());
+      if (echoEl) echoEl.textContent = String(v);
+      // TP world size changed → the Advanced VRAM budget (weights = model/TP) is
+      // now stale. Invalidate it so the calculator re-fetches with the new TP
+      // when the user steps back into Advanced.
+      advancedRecommendation = null;
+    };
+    gpusInput.addEventListener('input', onGpus);
+    gpusInput.addEventListener('change', onGpus);
+  }
+
+  const servedInput = document.getElementById('edw-cluster-served');
+  if (servedInput) {
+    servedInput.addEventListener('input', (e) => {
+      selection.servedModelName = String(e.detail?.value ?? servedInput.value).trim();
+    });
+  }
+
+  const portInput = document.getElementById('edw-cluster-port');
+  if (portInput) {
+    portInput.addEventListener('input', (e) => {
+      const v = parseInt(e.detail?.value ?? portInput.value, 10);
+      selection.port = Number.isFinite(v) ? v : 8100;
+    });
+  }
+
+  const priceBind = (id, key) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('input', (e) => {
+      const raw = String(e.detail?.value ?? el.value ?? '').trim();
+      selection.pricing[key] = raw === '' ? null : Number(raw);
+    });
+  };
+  priceBind('edw-cluster-price-prompt', 'promptPer1k');
+  priceBind('edw-cluster-price-completion', 'completionPer1k');
+  priceBind('edw-cluster-price-audio', 'audioPerMin');
+  priceBind('edw-cluster-price-image', 'imageEach');
 }
 
 // ---- Step 3: runtime ------------------------------------------------------
@@ -2079,6 +2545,9 @@ function shouldSkipModelStep() {
 // engine manifest may opt out via `engine.gpu_supported === false`; by default
 // (field absent) we assume the engine can use GPUs if the node has any.
 function shouldSkipGpuStep() {
+  // Cluster deploy allocates GPUs on every member (all GPUs per node), so the
+  // per-node GPU picker does not apply.
+  if (selection.isCluster) return true;
   // Cloud API providers run remotely — there is no local GPU to allocate.
   if (externalCredsConfig().requiresApiKey) return true;
   const gpus = nodeGpus(selection.nodeId);
@@ -2247,6 +2716,7 @@ function bindStepInputs() {
     case 'model':    bindStepModelInputs(); break;
     case 'gpu':      bindStepGpuInputs(); break;
     case 'advanced': bindAdvancedHandlers(); break;
+    case 'cluster-config': bindStepClusterConfigInputs(); break;
     case 'runtime':  bindStepRuntimeInputs(); break;
   }
 }
@@ -2288,18 +2758,55 @@ function bindStepModelInputs() {
   document.querySelectorAll('.model-item[data-preset-id]').forEach((it) => {
     it.addEventListener('click', () => {
       selection.modelPresetId = it.dataset.presetId;
-      selection.modelRepo = null;
       selection.modelFile = null;
-      document.querySelectorAll('.model-item[data-preset-id]').forEach((x) => x.classList.remove('selected'));
-      it.classList.add('selected');
       const preset = Manifest.modelPresets(engineEntry).find((p) => p?.id === selection.modelPresetId);
       if (preset) applySpeculatorPreset(preset);
-      // Zmiana modelu uniewaznia estymacje VRAM — wymus ponowny /recommend
-      // (z nowa quantization presetu) przy wejsciu na krok Advanced.
+      // Wariant kwantyzacji: domyslny (dopasowany do quantization presetu). Repo
+      // wariantu ida jako `model_repo`, ktory w backendzie wygrywa nad preset.repo
+      // (resolve_model_repo) — bez wariantow dv=null → modelRepo=null (repo presetu).
+      const dv = preset ? defaultQuantVariant(preset) : null;
+      selection.quantVariant = dv ? dv.quantization : null;
+      selection.modelRepo = dv ? dv.repo : null;
+      if (dv) selection.advanced.quantization = dv.quantization;
+      // Zmiana modelu uniewaznia estymacje VRAM — wymus ponowny /recommend.
       advancedRecommendation = null;
       cachedModelSpec = null;
+      // Re-render, zeby pokazac dropdown wariantow dla wybranego presetu.
+      refreshModal();
     });
   });
+
+  const bundleUrl = document.getElementById('edw-bundle-url');
+  if (bundleUrl) {
+    bundleUrl.addEventListener('input', (e) => {
+      selection.visionBundleUrl = String(e.detail?.value ?? bundleUrl.value).trim();
+    });
+  }
+  const bundleKey = document.getElementById('edw-bundle-api-key');
+  if (bundleKey) {
+    bundleKey.addEventListener('input', (e) => {
+      selection.visionBundleApiKey = String(e.detail?.value ?? bundleKey.value).trim();
+    });
+  }
+  const bundlePreview = document.getElementById('edw-bundle-preview');
+  if (bundlePreview) bundlePreview.addEventListener('click', previewCustomManifest);
+  const previewBox = document.getElementById('edw-bundle-preview-result');
+  if (previewBox) renderBundlePreview(previewBox);
+  const quantVariantSel = document.getElementById('edw-quant-variant');
+  if (quantVariantSel) {
+    quantVariantSel.addEventListener('change', (e) => {
+      const q = String(e.detail?.value ?? quantVariantSel.value ?? '').toLowerCase();
+      const preset = Manifest.modelPresets(engineEntry).find((p) => p?.id === selection.modelPresetId);
+      const v = presetQuantVariants(preset).find((x) => (x.quantization || '').toLowerCase() === q);
+      if (!v) return;
+      selection.quantVariant = v.quantization;
+      selection.modelRepo = v.repo;
+      selection.advanced.quantization = v.quantization;
+      advancedRecommendation = null;
+      cachedModelSpec = null;
+      refreshModal();
+    });
+  }
 
   const search = document.getElementById('edw-hf-search');
   if (search) {
@@ -2518,6 +3025,13 @@ function canAdvance() {
       }
       return true;
     case 'model':
+      if (isCameraCvEngine() && modelSourceMode === 'custom') {
+        if (!selection.visionBundleUrl.includes('/models/manifest/')) {
+          toast(I18n.t('wizard.customBundleUrlInvalid'), 'error');
+          return false;
+        }
+        return true;
+      }
       if (!selection.modelPresetId && !selection.modelRepo) {
         toast(I18n.t('wizard.selectModel'), 'error');
         return false;
@@ -2622,6 +3136,11 @@ function updateHfGgufFiles() {
 // ---- Deploy ---------------------------------------------------------------
 
 async function startDeploy() {
+  if (selection.isCluster) {
+    await startClusterDeploy();
+    return;
+  }
+
   const btn = document.getElementById('edw-deploy');
 
   // External cloud providers: subscription needs a completed OAuth login; API
@@ -2783,6 +3302,13 @@ async function startDeploy() {
     // (never persisted in clear). `base_url`/`api_version` override the
     // manifest endpoint for generic openai-compatible / Azure engines.
     api_key: (creds.requiresApiKey && !creds.subscription) ? selection.apiKey.trim() : undefined,
+    // Custom camera-CV bundle source (model step "Custom" tab): manifest URL
+    // of another TentaFlow instance + Bearer key. The key is encrypted
+    // server-side like `api_key` before it lands in config_json.
+    vision_bundle_url: (isCameraCvEngine() && modelSourceMode === 'custom' && selection.visionBundleUrl)
+      ? selection.visionBundleUrl : undefined,
+    vision_bundle_api_key: (isCameraCvEngine() && modelSourceMode === 'custom' && selection.visionBundleApiKey)
+      ? selection.visionBundleApiKey : undefined,
     // Subscription: the node swaps this flow id for the captured OAuth tokens.
     oauth_flow_id: (creds.requiresApiKey && creds.subscription) ? selection.oauthFlowId : undefined,
     base_url: (creds.showBaseUrl && selection.baseUrl) ? selection.baseUrl : undefined,
@@ -2815,6 +3341,86 @@ async function startDeploy() {
       engineId: eng.id,
       deployMethod: selection.deployMethod,
     });
+  } catch (err) {
+    toast(I18n.t('wizard.deployFailed').replace('{error}', err.message || err), 'error');
+    if (btn) btn.removeAttribute('disabled');
+  }
+}
+
+// Cluster deploy: one blocking `clusterDeployRequest` (tensor-parallel across
+// every member). max_model_len + gpu_memory_utilization come from the shared
+// Advanced step (no duplicate controls); the backend computes the real TP size
+// from members × gpusPerNode. On completion the wizard closes and its onClose
+// callback refreshes the cluster page.
+async function startClusterDeploy() {
+  const btn = document.getElementById('edw-deploy');
+  const eng = engineEntry.engine || {};
+
+  const modelRepo = getAdvancedModelName();
+  if (!modelRepo) {
+    toast(I18n.t('wizard.selectModel'), 'error');
+    return;
+  }
+
+  const p = selection.pricing;
+  if ([p.promptPer1k, p.completionPer1k, p.audioPerMin, p.imageEach].some(
+    (v) => v != null && (!Number.isFinite(v) || v < 0),
+  )) {
+    toast(I18n.t('wizard.cluster.pricing_invalid'), 'error');
+    return;
+  }
+
+  const adv = selection.advanced;
+  const rec = advancedRecommendation && !advancedRecommendation.error ? advancedRecommendation : null;
+  const maxModelLen = adv.max_model_len || (rec && rec.recommended && rec.recommended.max_model_len) || 8192;
+  const gpuMem = adv.gpu_memory_utilization ?? 0.5;
+
+  if (btn) btn.setAttribute('disabled', '');
+  // P6 (model load -> /v1/models 200) budget. A 100-300GB TP=2 model's first
+  // boot includes weight load on every member + CUDA-graph capture + FlashInfer
+  // autotune — 10 min is too tight and a timeout tears the whole cluster down.
+  const readyTimeoutSecs = 1800;
+  try {
+    const resp = await ApiBinary.action(
+      'clusterDeployRequest',
+      {
+        clusterId: selection.clusterId,
+        engineId: eng.id,
+        modelRepo,
+        modelPresetId: selection.modelPresetId || null,
+        servedModelName: (selection.servedModelName && selection.servedModelName.trim()) || null,
+        gpusPerNode: Math.max(1, Number(selection.gpusPerNode) || 1),
+        gpuMemoryUtilization: gpuMem,
+        maxModelLen,
+        port: selection.port || 8100,
+        readyTimeoutSecs,
+        promptPer1k: p.promptPer1k ?? null,
+        completionPer1k: p.completionPer1k ?? null,
+        audioPerMin: p.audioPerMin ?? null,
+        imageEach: p.imageEach ?? null,
+      },
+      { timeoutMs: readyTimeoutSecs * 1000 + 30000 },
+    );
+    if (resp && resp.ok) {
+      toast(I18n.t('cluster_detail.deploy_ok'), 'success');
+      // Deploy klastra leci teraz w tle — zamknij wizard i pokaż ten sam live
+      // progress modal co node deploy. Subskrybuje deploymentLogStreamRequest
+      // keyed by deployment_cluster_id (fazy P0-P6 + serve log).
+      close();
+      const depId = resp.deploymentClusterId || '';
+      if (depId) {
+        const mod = await import('/js/modules/catalog/deploy-progress-modal.js');
+        mod.openDeployProgressModal({
+          deployId: depId,
+          engineId: eng.id,
+          deployMethod: 'cluster',
+        });
+      }
+    } else {
+      const msg = String(resp?.message || '');
+      toast(/rdma/i.test(msg) ? I18n.t('cluster_detail.deploy_rdma_required') : (msg || I18n.t('cluster_detail.deploy_failed')), 'error');
+      if (btn) btn.removeAttribute('disabled');
+    }
   } catch (err) {
     toast(I18n.t('wizard.deployFailed').replace('{error}', err.message || err), 'error');
     if (btn) btn.removeAttribute('disabled');

@@ -36,6 +36,24 @@ public final class MLXBridgeEngine: @unchecked Sendable {
     /// (sentence-transformers, np. jina-embeddings-v5 / Qwen3-Embedding).
     private var embedderContainer: EmbedderModelContainer?
 
+    /// Kontener rerankera — ODDZIELNY od embeddera. Embedder (jina-embed-mlx)
+    /// i reranker (jina-reranker-v3-mlx) sa osobnymi embedded serwisami i oba
+    /// wchodza przez `loadEmbedder`; dziela jeden `MLXBridgeEngine`, wiec musza
+    /// trzymac wlasne kontenery/sciezki, inaczej zdeployowany drugi nadpisuje
+    /// pierwszy. Backbone Qwen3 rerankera (bez projektora) laduje sie tutaj.
+    private var rerankerContainer: EmbedderModelContainer?
+    /// Oryginalny katalog modelu rerankera (z `projector.safetensors`) — zrodlo
+    /// dla `RerankEngine.loadProjector`, niezalezne od `modelPath` embeddera.
+    private var rerankerModelPath: String?
+
+    /// Wagi projektora rerankera (linear1 [512,1024], linear2 [512,512]),
+    /// lazy-ladowane z `projector.safetensors` przy pierwszym `rerank`. Model
+    /// Qwen3 rerankera zyje w `rerankerContainer`.
+    private var rerankProjector: (MLXArray, MLXArray)?
+    /// Katalog, z ktorego zaladowano `rerankProjector` — pozwala wykryc zmiane
+    /// modelu i przeladowac projector.
+    private var rerankModelDir: String?
+
     private init() {
         // Limit cache GPU — wystarczy duzo dla M-series, ale nie bezgranicznie.
         // 256 MB dziala dobrze dla modeli 4-7B 4-bit; wieksze modele beda
@@ -97,6 +115,10 @@ public final class MLXBridgeEngine: @unchecked Sendable {
         print("[MLXBridge] Wyladowywanie modelu")
         modelContainer = nil
         embedderContainer = nil
+        rerankerContainer = nil
+        rerankerModelPath = nil
+        rerankProjector = nil
+        rerankModelDir = nil
         modelPath = nil
     }
 
@@ -117,14 +139,54 @@ public final class MLXBridgeEngine: @unchecked Sendable {
 
     /// Laduje model embeddingow (sentence-transformers) przez EmbedderModelFactory.
     /// Synchroniczne (blokuje watek wolajacy), jak loadModel.
+    ///
+    /// A reranker directory (jina-reranker-v3-mlx) additionally ships
+    /// `projector.safetensors` — the reranker head, NOT part of the Qwen3
+    /// backbone. `EmbedderModelFactory` -> `loadWeights` globs EVERY
+    /// `*.safetensors` in the directory and applies them with `verify: [.all]`,
+    /// so the projector's `linear1/linear2` keys land on Qwen3Model and blow up
+    /// with `unhandledKeys`. When a projector is present we load the embedder
+    /// from a temporary directory of symlinks that excludes it into the SEPARATE
+    /// `rerankerContainer`/`rerankerModelPath` (so a concurrently deployed
+    /// embedder cannot clobber it); the backbone weights (`model.safetensors`)
+    /// load cleanly and `RerankEngine.loadProjector` still reads
+    /// `projector.safetensors` from the ORIGINAL model directory (via
+    /// `rerankerModelPath`, which stays the original `path`). Plain embedder repos
+    /// (jina-embed-mlx) have no projector and load into `embedderContainer`,
+    /// so that path is untouched.
     private func loadEmbedder(url: URL, path: String) -> Bool {
         print("[MLXBridge] Ladowanie modelu embeddingow: \(path)")
+
+        // Directory the factory actually reads from. Defaults to the model dir;
+        // for a reranker it becomes a filtered symlink mirror without the
+        // projector. Cleaned up after loading (weights are in memory by then).
+        var loadURL = url
+        var scratchDir: URL? = nil
+        let projectorURL = url.appending(component: "projector.safetensors")
+        let isReranker = FileManager.default.fileExists(atPath: projectorURL.path)
+        if isReranker {
+            do {
+                let filtered = try makeProjectorFreeMirror(of: url)
+                loadURL = filtered
+                scratchDir = filtered
+                print("[MLXBridge] Wykryto reranker (projector.safetensors) — ladowanie backbone bez projektora")
+            } catch {
+                print("[MLXBridge] Blad przygotowania katalogu bez projektora: \(error)")
+                return false
+            }
+        }
+        defer {
+            if let scratchDir {
+                try? FileManager.default.removeItem(at: scratchDir)
+            }
+        }
+
         let semaphore = DispatchSemaphore(value: 0)
         var success = false
         Task {
             do {
-                let config = ModelConfiguration(directory: url)
-                self.embedderContainer = try await EmbedderModelFactory.shared.loadContainer(
+                let config = ModelConfiguration(directory: loadURL)
+                let container = try await EmbedderModelFactory.shared.loadContainer(
                     from: #hubDownloader(),
                     using: #huggingFaceTokenizerLoader(),
                     configuration: config
@@ -134,7 +196,17 @@ public final class MLXBridgeEngine: @unchecked Sendable {
                         print("[MLXBridge] Ladowanie embeddera: \(pct)%")
                     }
                 }
-                self.modelPath = path
+                if isReranker {
+                    // Reranker backbone lands in its OWN container/path so a
+                    // concurrently deployed embedder cannot clobber it. Keep the
+                    // ORIGINAL model dir (with projector.safetensors) for
+                    // RerankEngine.loadProjector, not the filtered mirror.
+                    self.rerankerContainer = container
+                    self.rerankerModelPath = path
+                } else {
+                    self.embedderContainer = container
+                    self.modelPath = path
+                }
                 success = true
                 print("[MLXBridge] Model embeddingow zaladowany")
             } catch {
@@ -145,6 +217,28 @@ public final class MLXBridgeEngine: @unchecked Sendable {
         }
         semaphore.wait()
         return success
+    }
+
+    /// Builds a temporary directory that symlinks every top-level entry of
+    /// `modelDir` EXCEPT `projector.safetensors`, so `EmbedderModelFactory`
+    /// (which globs `*.safetensors`) never pulls the reranker head into the
+    /// backbone weights. Symlinks are cheap and cover config.json,
+    /// tokenizer files, `1_Pooling/`, `model.safetensors` and its index. Throws
+    /// on any filesystem error so the caller can fail the load loudly.
+    private func makeProjectorFreeMirror(of modelDir: URL) throws -> URL {
+        let fm = FileManager.default
+        let mirror = fm.temporaryDirectory.appending(
+            component: "tf-reranker-\(UUID().uuidString)")
+        try fm.createDirectory(at: mirror, withIntermediateDirectories: true)
+
+        let entries = try fm.contentsOfDirectory(
+            at: modelDir, includingPropertiesForKeys: nil)
+        for entry in entries {
+            if entry.lastPathComponent == "projector.safetensors" { continue }
+            let link = mirror.appending(component: entry.lastPathComponent)
+            try fm.createSymbolicLink(at: link, withDestinationURL: entry)
+        }
+        return mirror
     }
 
     /// Liczy embedding dla jednego tekstu. Zwraca wektor floatow albo nil.
@@ -172,6 +266,57 @@ public final class MLXBridgeEngine: @unchecked Sendable {
                 result = vec
             } catch {
                 print("[MLXBridge] Blad embed: \(error)")
+                result = nil
+            }
+            semaphore.signal()
+        }
+        semaphore.wait()
+        return result
+    }
+
+    /// Rerankuje dokumenty wzgledem zapytania natywnym jina-reranker-v3.
+    /// Uzywa `rerankerContainer` (backbone Qwen3 rerankera, osobny od embeddera)
+    /// i lazy-laduje projector z `rerankerModelPath`. Zwraca wektor
+    /// wynikow cosine per dokument w KOLEJNOSCI WEJSCIOWEJ (sortowanie robi
+    /// rdzen), albo nil przy bledzie.
+    public func rerank(query: String, documents: [String]) -> [Float]? {
+        guard let container = rerankerContainer else {
+            print("[MLXBridge] Brak zaladowanego modelu rerankera")
+            return nil
+        }
+        guard let dir = rerankerModelPath else {
+            print("[MLXBridge] Brak sciezki modelu rerankera")
+            return nil
+        }
+        if documents.isEmpty { return [] }
+
+        // Lazy-load projektora (raz na model). Przeladuj gdy zmienil sie katalog.
+        if rerankProjector == nil || rerankModelDir != dir {
+            do {
+                rerankProjector = try RerankEngine.loadProjector(modelDir: dir)
+                rerankModelDir = dir
+            } catch {
+                print("[MLXBridge] Blad ladowania projektora rerankera: \(error)")
+                return nil
+            }
+        }
+        guard let projector = rerankProjector else { return nil }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: [Float]? = nil
+        Task {
+            do {
+                let scores = try await container.perform {
+                    (ctx: EmbedderModelContext) -> [Float] in
+                    try RerankEngine.computeScores(
+                        context: ctx,
+                        projector: projector,
+                        query: query,
+                        documents: documents)
+                }
+                result = scores
+            } catch {
+                print("[MLXBridge] Blad rerank: \(error)")
                 result = nil
             }
             semaphore.signal()
@@ -440,5 +585,45 @@ public func MLXBridge_embed(
         fptr.update(from: src.baseAddress!, count: vec.count)
     }
     outLen?.pointee = Int32(vec.count)
+    return fptr
+}
+
+/// Rerankuje dokumenty wzgledem zapytania. `docsJson` to JSON tablica stringow.
+/// Zwraca bufor `Float` (score per dokument, kolejnosc wejsciowa) zaalokowany
+/// przez malloc (Rust zwalnia przez libc free()) i zapisuje dlugosc do `outLen`.
+/// NULL = blad. Kolejnosc scores == kolejnosc dokumentow w `docsJson`.
+@_cdecl("MLXBridge_rerank")
+public func MLXBridge_rerank(
+    query: UnsafePointer<CChar>?,
+    docsJson: UnsafePointer<CChar>?,
+    outLen: UnsafeMutablePointer<Int32>?,
+    context: UnsafeMutableRawPointer?
+) -> UnsafeMutablePointer<Float>? {
+    guard let queryStr = query.flatMap({ String(cString: $0) }),
+          let docsStr = docsJson.flatMap({ String(cString: $0) }),
+          let ctx = context else { return nil }
+
+    guard let docsData = docsStr.data(using: .utf8),
+          let documents = try? JSONDecoder().decode([String].self, from: docsData)
+    else {
+        print("[MLXBridge] MLXBridge_rerank: nieprawidlowy JSON dokumentow")
+        return nil
+    }
+
+    let engine = Unmanaged<MLXBridgeEngine>.fromOpaque(ctx).takeUnretainedValue()
+    guard let scores = engine.rerank(query: queryStr, documents: documents) else {
+        return nil
+    }
+
+    // Pusta lista dokumentow -> pusty wynik (nie blad). Rust musi obsluzyc len=0.
+    outLen?.pointee = Int32(scores.count)
+    let bytes = max(scores.count, 1) * MemoryLayout<Float>.stride
+    guard let raw = malloc(bytes) else { return nil }
+    let fptr = raw.assumingMemoryBound(to: Float.self)
+    scores.withUnsafeBufferPointer { src in
+        if let base = src.baseAddress {
+            fptr.update(from: base, count: scores.count)
+        }
+    }
     return fptr
 }

@@ -22,7 +22,10 @@ pub mod protocol;
 pub use protocol::{
     camera::{
         CameraAddInput, CameraAddOutput, CameraAnalysisFlowOut, CameraAnalysisFlowsOut,
-        CameraCredentialsRotateInput, CameraCredentialsRotateOut, CameraDiscoverOut,
+        CameraCredentialsRotateInput, CameraCredentialsRotateOut,
+        CameraCvPipelineDeleteOut, CameraCvPipelineIdInput, CameraCvPipelineOut,
+        CameraCvPipelineSaveInput, CameraCvPipelineSaveOut, CameraCvPipelineSummary,
+        CameraCvPipelinesOut, CameraDiscoverOut,
         CameraGrantInfo, CameraGrantInput, CameraGrantListInput, CameraGrantListOut, CameraGrantOut,
         CameraHealthOut, CameraIdInput, CameraInfoOut, CameraListOut, CameraRemoveOut,
         CameraRevokeInput, CameraSnapshotOut, CameraTestConnectionInput, CameraTestConnectionOut,
@@ -40,6 +43,10 @@ pub use protocol::{
         GrantRationale, Heartbeat, ProtocolHello, ProtocolReject, ProtocolWelcome, QueueDepth,
         RateLimitScope, RateLimitUpdate, RejectReason, Resume, ResumeMode, ResumeStatus,
         ServerLimits, SessionEnd, SessionEndCode,
+    },
+    directory::{
+        DirectoryGroupOut, DirectoryGroupsOutput, DirectoryOrgOutput, DirectoryRoleOut,
+        DirectoryRolesOutput, DirectoryUserOut, DirectoryUsersOutput,
     },
     doc_parse::{DocBlock, DocParseInput, DocParseOutput},
     document::{
@@ -65,6 +72,7 @@ pub use protocol::{
         GraphUpsertNodeInput, GraphUpsertNodeOutput, Provenance,
     },
     ids::{ClientActionId, DeviceId, Hash32, NodeId, SessionId, TraceId},
+    inference::{LlmStreamNextInput, LlmStreamNextOutput, SttTranscribeInput, SttTranscribeOutput},
     lidar::{
         LidarFrameHeader, LIDAR_FLAGS_KNOWN, LIDAR_FLAGS_OFFSET, LIDAR_FLAG_LZ4_BODY,
         LIDAR_FRAME_VERSION, LIDAR_HEADER_LEN, LIDAR_HOST_SEND_US_OFFSET, LIDAR_LAYOUT_XYZ,
@@ -178,12 +186,15 @@ pub use protocol::{
         },
         slot_msg::{SlotClear, SlotContent, SlotHide, SlotShow},
         specialized::{
-            Audio, Carousel, CodeEditor, FpsCounter, IFrame, ImageGallery, LiveCameraTile,
-            MapView, PdfViewer, StepProgress, Stopwatch, Terminal, VideoStream, VirtualizedLog,
+            Audio, AudioCapture, Carousel, CodeEditor, FpsCounter, IFrame, ImageGallery,
+            LiveCameraTile, MapView, PdfViewer, StepProgress, Stopwatch, Terminal, VideoStream,
+            VirtualizedLog,
         },
         state::{PatchRejectReason, PatchRejected, StatePatch, StateReset, StateSnapshot},
         tokens::{
-            AccordionMode, AlertVariant, AreaStacking, AudioControls, AudioVariant, AutocompleteHint,
+            AccordionMode, AlertVariant, AreaStacking, AudioCaptureMode, AudioCaptureVariant,
+            AudioControls,
+            AudioVariant, AutocompleteHint,
             AvatarOverlap, AvatarShape, AvatarSize, AvatarStatus, BackgroundToken, BadgeVariant,
             BannerPosition, BarStacking, BreadcrumbSeparator, Breakpoint, BulletListVariant,
             ButtonGroupOrientation, ButtonSize, ButtonVariant, CameraStatus, CardVariant,

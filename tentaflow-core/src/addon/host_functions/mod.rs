@@ -13,6 +13,7 @@ pub mod camera;
 pub mod camera_metadata;
 pub mod cbor_io;
 pub mod config;
+pub mod directory;
 pub mod doc_parse;
 pub mod document;
 pub mod events;
@@ -40,6 +41,7 @@ pub mod state;
 pub mod storage;
 #[cfg(feature = "camera")]
 pub mod streaming;
+pub mod stt;
 pub mod sync_acl;
 pub mod ui;
 pub mod user;
@@ -98,6 +100,19 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
             llm::llm_generate_stream_next,
         )
         .map_err(|e| anyhow::anyhow!("Rejestracja llm_generate_stream_next: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tentaflow",
+            "llm_generate_stream_cancel",
+            llm::llm_generate_stream_cancel,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja llm_generate_stream_cancel: {e}"))?;
+
+    // --- STT API ---
+    linker
+        .func_wrap("tentaflow", "stt_transcribe_v1", stt::stt_transcribe_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja stt_transcribe_v1: {e}"))?;
 
     // --- Storage API ---
     linker
@@ -213,6 +228,35 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
             user::user_check_permission,
         )
         .map_err(|e| anyhow::anyhow!("Rejestracja user_check_permission: {e}"))?;
+
+    // --- Directory API (read-only org users/groups/roles for sharing UIs) ---
+    linker
+        .func_wrap(
+            "tentaflow",
+            "directory_users_v1",
+            directory::directory_users_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja directory_users_v1: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tentaflow",
+            "directory_groups_v1",
+            directory::directory_groups_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja directory_groups_v1: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tentaflow",
+            "directory_roles_v1",
+            directory::directory_roles_v1,
+        )
+        .map_err(|e| anyhow::anyhow!("Rejestracja directory_roles_v1: {e}"))?;
+
+    linker
+        .func_wrap("tentaflow", "directory_org_v1", directory::directory_org_v1)
+        .map_err(|e| anyhow::anyhow!("Rejestracja directory_org_v1: {e}"))?;
 
     // --- Secrets API ---
     linker
@@ -437,6 +481,34 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
                 camera::camera_analysis_flows_list_v1,
             )
             .map_err(|e| anyhow::anyhow!("Rejestracja camera_analysis_flows_list_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_cv_pipelines_list_v1",
+                camera::camera_cv_pipelines_list_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_cv_pipelines_list_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_cv_pipeline_get_v1",
+                camera::camera_cv_pipeline_get_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_cv_pipeline_get_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_cv_pipeline_save_v1",
+                camera::camera_cv_pipeline_save_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_cv_pipeline_save_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "camera_cv_pipeline_delete_v1",
+                camera::camera_cv_pipeline_delete_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja camera_cv_pipeline_delete_v1: {e}"))?;
         linker
             .func_wrap(
                 "tentaflow",

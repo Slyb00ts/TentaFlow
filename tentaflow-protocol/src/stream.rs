@@ -53,6 +53,14 @@ pub enum StreamPayload {
 pub struct StreamSubscribeRequest {
     /// Hub-registered stream id, e.g. `camera:<uuid>` for the camera tier.
     pub stream_id: String,
+    /// `true` = wariant podglądu (transkod 720p/~1,5 Mbit/s) zamiast pełnej
+    /// jakości źródła — kafelki Live view są małe, więc pełny strumień 1080p
+    /// marnuje pasmo WAN i głodzi WebSocket detekcji na tym samym łączu.
+    /// `serde(default)` = `false` (pełna jakość), kompatybilne wstecz ze
+    /// starszymi klientami, które pola nie wysyłają. Wariant dotyczy tylko
+    /// strumieni `camera:`; pozostałe prefiksy go ignorują.
+    #[serde(default)]
+    pub preview: bool,
 }
 
 #[derive(
@@ -64,6 +72,12 @@ pub struct StreamSubscribeResponse {
     pub mime_type: String,
     /// `true` when the next `Frame` will carry `is_init = true`.
     pub has_init_segment: bool,
+    /// Base PTS of the media timeline (nanoseconds) for fMP4 camera streams —
+    /// the offset the client subtracts from each detection's `pts_ns` to anchor
+    /// the overlay on the exact video frame. `None` for streams with no shared
+    /// clock with detections (LiDAR, audio, relay).
+    #[serde(default)]
+    pub base_pts_ns: Option<u64>,
 }
 
 #[derive(
@@ -115,6 +129,7 @@ mod tests {
     fn subscribe_request_round_trip() {
         let v = StreamPayload::SubscribeRequest(StreamSubscribeRequest {
             stream_id: "camera:550e8400-e29b-41d4-a716-446655440000".into(),
+            preview: true,
         });
         assert_eq!(round_trip!(StreamPayload, v.clone()), v);
     }
@@ -125,6 +140,7 @@ mod tests {
             stream_id: "camera:xyz".into(),
             mime_type: "video/mp4; codecs=\"avc1.64001f\"".into(),
             has_init_segment: true,
+            base_pts_ns: Some(1_234_567_890),
         });
         assert_eq!(round_trip!(StreamPayload, v.clone()), v);
     }
@@ -161,6 +177,7 @@ mod tests {
         let body =
             MessageBody::StreamBody(StreamPayload::SubscribeRequest(StreamSubscribeRequest {
                 stream_id: "camera:abc".into(),
+                preview: false,
             }));
         let bytes = crate::cbor::encode(&body).expect("encode");
         let decoded = crate::cbor::decode::<MessageBody>(&bytes).expect("decode");

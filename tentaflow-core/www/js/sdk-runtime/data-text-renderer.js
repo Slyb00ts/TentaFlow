@@ -29,7 +29,7 @@ import { resolveBindRef, subscribeBindRef, formatValue } from './bind-resolver.j
 
 const TEXT_STYLES = new Set([
   'display', 'title', 'h1', 'h2', 'h3', 'h4',
-  'body_lg', 'body', 'body_strong', 'caption', 'overline',
+  'body_lg', 'body', 'body_strong', 'caption', 'caption_strong', 'overline',
   'code', 'mono', 'quote',
 ]);
 const TEXT_ALIGNS = new Set(['start', 'center', 'end', 'justify']);
@@ -336,7 +336,7 @@ function renderRichTextBlocks(source, allowedBlocks, allowedMarks) {
 // =============================================================================
 
 export const TEXT_TAG = 0x0201;
-const TEXT_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6]);
+const TEXT_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7]);
 
 function renderText(component, ctx) {
   assertOnlyKnownFields(component.fields, TEXT_FIELD_KEYS, 'Text');
@@ -357,6 +357,10 @@ function renderText(component, ctx) {
   }
   const format = ctx.readField(component.fields, 6);
   assertValueFormat(format, 'Text.format', ctx.locale);
+  // streaming: Option<BindRef> — while the bound flag is truthy the renderer
+  // shows a semantic blinking caret (`.sdk-text--streaming`), so the addon
+  // declares "this text is mid-stream" instead of animating its own cursor.
+  const streaming = ctx.readField(component.fields, 7);
 
   const el = document.createElement('span');
   el.classList.add('tf-text');
@@ -369,6 +373,15 @@ function renderText(component, ctx) {
     el.style.setProperty('--tf-text-max-lines', String(maxLines));
   }
   applyReactiveText(el, content, ctx, format);
+
+  if (streaming != null) {
+    const applyStreaming = () => {
+      const on = resolveBindRef(streaming, ctx.store) === true;
+      el.classList.toggle('sdk-text--streaming', on);
+    };
+    applyStreaming();
+    ctx.registerCleanup(subscribeBindRef(streaming, ctx.store, applyStreaming));
+  }
   return el;
 }
 

@@ -24,6 +24,8 @@ pub enum IrohStreamError {
     FrameTooLarge(usize),
     #[error("CBOR decode envelope: {0}")]
     EnvelopeDecode(String),
+    #[error("schema version mismatch: peer {got}, local {expected}")]
+    SchemaVersionMismatch { got: u16, expected: u16 },
     #[error("CBOR decode body: {0}")]
     BodyDecode(String),
     #[error("CBOR encode: {0}")]
@@ -83,9 +85,70 @@ pub async fn read_envelope_and_body(
         .await
         .map_err(|e| IrohStreamError::Io(format!("{e}")))?;
 
-    let envelope = tentaflow_protocol::cbor::decode::<Envelope>(&buf)
+    decode_envelope_and_body(&buf)
+}
+
+/// Decodes `Envelope` + `MessageBody` from raw frame bytes. The schema version
+/// is enforced BEFORE the body is deserialized: `MessageBody` is a CBOR
+/// index-tagged enum, so a frame from a peer on a different version could
+/// decode "successfully" as the WRONG variant instead of being rejected
+/// (mirrors the `MetaSchemaVersionCheck` gate on the dashboard WS).
+pub fn decode_envelope_and_body(
+    buf: &[u8],
+) -> Result<(Envelope, MessageBody), IrohStreamError> {
+    let envelope = tentaflow_protocol::cbor::decode::<Envelope>(buf)
         .map_err(IrohStreamError::EnvelopeDecode)?;
+    if envelope.schema_version != tentaflow_protocol::SCHEMA_VERSION {
+        return Err(IrohStreamError::SchemaVersionMismatch {
+            got: envelope.schema_version,
+            expected: tentaflow_protocol::SCHEMA_VERSION,
+        });
+    }
     let body = tentaflow_protocol::cbor::decode::<MessageBody>(&envelope.body)
         .map_err(IrohStreamError::BodyDecode)?;
     Ok((envelope, body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tentaflow_protocol::{message_kind, SCHEMA_VERSION};
+
+    fn frame_with_schema_version(version: u16) -> Vec<u8> {
+        let body = tentaflow_protocol::cbor::encode(&MessageBody::MetaSchemaVersionCheck {
+            client_version: version,
+        })
+        .expect("encode body");
+        let mut envelope = Envelope::new_direct(1, 1, message_kind::META_SCHEMA_VERSION_CHECK, body);
+        envelope.schema_version = version;
+        tentaflow_protocol::cbor::encode(&envelope).expect("encode envelope")
+    }
+
+    #[test]
+    fn decode_rejects_stale_schema_version_before_body_decode() {
+        // A frame from a v20 peer with valid CBOR in the body — after the
+        // variant tag shift (v21) this MUST return SchemaVersionMismatch,
+        // never a misdecoded variant.
+        let bytes = frame_with_schema_version(SCHEMA_VERSION - 1);
+        match decode_envelope_and_body(&bytes) {
+            Err(IrohStreamError::SchemaVersionMismatch { got, expected }) => {
+                assert_eq!(got, SCHEMA_VERSION - 1);
+                assert_eq!(expected, SCHEMA_VERSION);
+            }
+            other => panic!("expected SchemaVersionMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_accepts_matching_schema_version() {
+        let bytes = frame_with_schema_version(SCHEMA_VERSION);
+        let (envelope, body) = decode_envelope_and_body(&bytes).expect("decode");
+        assert_eq!(envelope.schema_version, SCHEMA_VERSION);
+        assert!(matches!(
+            body,
+            MessageBody::MetaSchemaVersionCheck {
+                client_version
+            } if client_version == SCHEMA_VERSION
+        ));
+    }
 }

@@ -136,6 +136,19 @@ pub struct ServiceInfo {
     /// propagowane do BackendClient przez handles_cache. Puste mapy gdy
     /// service nie ma konfigurowalnych parametrow.
     pub request_time_parameters: RequestTimeParameters,
+    /// Karty GPU, na ktorych dziala serwis (z deploy configu `gpu_select_mode` +
+    /// `gpu_ids`): `"all"` = wszystkie widoczne, `"0,1"` = konkretne indeksy,
+    /// `"CPU"` = bez GPU, `""` = nieznane/nie dotyczy. `#[serde(default)]` dla
+    /// kompatybilnosci ze starszymi peerami mesh.
+    #[serde(default)]
+    pub gpu_selection: String,
+    /// Gdy niepuste: ten wiersz jest czlonkiem distributed-deploymentu klastra
+    /// (head/worker kontenera TP) i niesie `deployment_cluster_id` calego
+    /// klastra. GUI uzywa go do skierowania akcji stop/usun na CALY klaster
+    /// (`ClusterDeployStopRequest`) zamiast kasowac pojedynczy rank. Puste dla
+    /// zwyklych serwisow. `#[serde(default)]` dla kompatybilnosci mesh.
+    #[serde(default)]
+    pub cluster_deployment_id: String,
 }
 
 /// Wartosci parametrow konsumowane przy kazdym requestcie do silnika.
@@ -386,11 +399,31 @@ pub struct ServiceModelCatalogResponse {
 
 /// Request: persist the admin's model selection for a service — model_registry
 /// is upserted to exactly this set (rows inserted/removed to match).
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct ServiceModelSelectionRequest {
     pub service_id: i64,
     pub node_id: Option<String>,
     pub selected_model_ids: Vec<String>,
+    /// Optional per-model pricing for the selected external models. Each entry
+    /// is matched to a selected model by `model_id`; entries for models not in
+    /// `selected_model_ids` are ignored by the handler.
+    #[serde(default)]
+    pub pricing: Vec<ModelPricingInput>,
+}
+
+/// Per-model pricing supplied when selecting external models. `model_id` MUST
+/// equal the selected model id so metrics (`requested_model()`) line up.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct ModelPricingInput {
+    pub model_id: String,
+    #[serde(default)]
+    pub prompt_per_1k: Option<f64>,
+    #[serde(default)]
+    pub completion_per_1k: Option<f64>,
+    #[serde(default)]
+    pub audio_per_min: Option<f64>,
+    #[serde(default)]
+    pub image_each: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -664,6 +697,11 @@ pub struct ChatStreamRequest {
     /// starszymi peerami.
     #[serde(default)]
     pub flow_id: Option<String>,
+    /// Konwersacja UI = sesja flow. Bez tego węzły `conversation_history` /
+    /// `memory` w wybranym flow nie mają klucza sesji i twardo failują
+    /// ("no session_id"). `#[serde(default)]` — starsi peerzy wysyłają None.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -689,6 +727,8 @@ pub struct ChatStreamEnd {
     pub prefill_tps: f32,
     #[serde(default)]
     pub decode_tps: f32,
+    #[serde(default)]
+    pub total_ms: u32,
 }
 
 // =============================================================================
@@ -861,6 +901,11 @@ pub struct FlowSummary {
     /// instead of the synthetic no-flow chat.
     #[serde(default)]
     pub is_default: bool,
+    /// When set, the flow is exposed as a model under this id (`/v1/models`,
+    /// catalog). It is the name external clients call and the resource id the
+    /// access-key wizard must grant — the flow's own UUID is not callable.
+    #[serde(default)]
+    pub published_model_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -1127,7 +1172,9 @@ pub struct MlStudioProjectDetail {
     pub status: String,
     pub owner_user_id: String,
     pub org_id: String,
+    pub dataset_count: u32,
     pub model_count: u32,
+    pub training_count: u32,
     /// Role of the requesting user in this project (`owner`/`editor`/`viewer`).
     pub role: String,
     /// Convenience flag for the UI: the requesting user owns this project.
@@ -1217,6 +1264,49 @@ pub struct MlStudioTrainingRunsListRequest {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct MlStudioTrainingRunsListResponse {
     pub runs: Vec<MlStudioTrainingRunSummary>,
+}
+
+/// Statystyki GPU odczytane z `nvidia-smi` (pierwsza karta). Gdy `nvidia-smi`
+/// niedostępny — wszystkie pola zerowe, `name` puste (bez błędu handlera).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct GpuStats {
+    pub name: String,
+    pub mem_used_mb: i32,
+    pub mem_total_mb: i32,
+    pub util_pct: i32,
+}
+
+/// Jeden aktywny (running/pending) job treningowy do panelu jobów ML Studio.
+/// Łączy dane runu z bazy (run_id/project/kind/variant/status) z polami live-view
+/// z serwisu treningowego (epoch/total_epochs/eta_s/elapsed_s/gpu_mem_mb/stage).
+/// Pola live-view są tolerancyjne: gdy serwis ich nie zwraca → 0/"".
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct TrainingJobInfo {
+    pub run_id: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub kind: String,
+    pub variant: String,
+    pub status: String,
+    pub epoch: i32,
+    pub total_epochs: i32,
+    pub eta_s: f32,
+    pub elapsed_s: f32,
+    pub gpu_mem_mb: f32,
+    pub stage: String,
+    pub started_at: String,
+}
+
+/// Żądanie przeglądu wszystkich aktywnych jobów treningowych widocznych dla
+/// użytkownika (projekty, których jest członkiem). Bez parametrów.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioJobsOverviewRequest {}
+
+/// Odpowiedź panelu jobów: lista aktywnych jobów + zbiorcze statystyki GPU węzła.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioJobsOverviewResponse {
+    pub jobs: Vec<TrainingJobInfo>,
+    pub gpu: GpuStats,
 }
 
 /// One model row for the project overview tab. Mirrors the `models` table;
@@ -1403,6 +1493,46 @@ pub struct MlStudioDatasetProfileRequest {
 pub struct MlStudioDatasetProfileResponse {
     pub dataset: DatasetSummary,
     pub profile: TableProfile,
+}
+
+/// Podglad/edycja zawartosci datasetu. Wiersze to surowe linie JSONL (generyczne —
+/// dziala dla {question,answer}, {prompt,chosen,rejected} i innych ksztaltow).
+/// GUI parsuje/buduje JSON per wiersz; zapis nadpisuje raw_data datasetu.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetRowsRequest {
+    pub dataset_id: String,
+    /// Limit wierszy (0 = wszystkie); GUI moze paginowac dla duzych datasetow.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetRowsResponse {
+    pub dataset_id: String,
+    pub kind: String,
+    pub total: u32,
+    /// Surowe linie JSONL (do `total` albo do limitu).
+    pub rows: Vec<String>,
+    /// Pochodzenie (JSON `distill_meta` z profile_json): czym/jak wygenerowano —
+    /// teacher, wariant, prompt, źródło pytań. None dla datasetów spoza destylacji.
+    #[serde(default)]
+    pub meta: Option<String>,
+    /// Dataset w trakcie generacji (distill_status=pending) — GUI blokuje edycję/zapis.
+    #[serde(default)]
+    pub pending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetRowsSaveRequest {
+    pub dataset_id: String,
+    /// Pelny zestaw wierszy (linie JSONL) — nadpisuje raw_data datasetu.
+    pub rows: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDatasetRowsSaveResponse {
+    pub dataset_id: String,
+    pub row_count: u32,
 }
 
 /// One admin-managed mesh resource grant (§11.3). A record of an allocation of
@@ -1804,6 +1934,136 @@ pub struct MlStudioRecogSaveAnnotationsResponse {
     pub error: Option<String>,
 }
 
+// ----- Vision model registry (dynamic camera-CV ONNX models) -----
+
+/// Publishes a trained ML Studio model into the core `vision_models`
+/// registry: locates/exports the ONNX, copies it into the vision models dir,
+/// hashes it and inserts the registry row so camera pipelines can reference
+/// it (directly or through an optional alias) without recompiling.
+/// `op`: "detect" (RF-DETR) or "classify" (softmax classifier); it must match
+/// the model's framework. `threshold` becomes the registry default score
+/// threshold for detect models. `alias` (optional) creates/updates a
+/// `model_aliases` row pointing at the new model name.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioVisionModelPublishRequest {
+    pub model_id: String,
+    pub model_name: String,
+    pub op: String,
+    pub threshold: Option<f64>,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioVisionModelPublishResponse {
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// One `vision_models` registry row as shown in the dashboard list.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioVisionModelInfo {
+    pub model_name: String,
+    pub op: String,
+    pub file_name: String,
+    pub sha256: String,
+    pub classes: Vec<String>,
+    pub source: String,
+    pub default_threshold: Option<f64>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioVisionModelsListRequest {}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioVisionModelsListResponse {
+    pub models: Vec<MlStudioVisionModelInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioVisionModelDeleteRequest {
+    pub model_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioVisionModelDeleteResponse {
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+// ----- Custom vision-model import (unpaired instance → HTTPS + API key) -----
+
+/// One file entry from a remote `/models/manifest/<ref>` response, surfaced to
+/// the deploy wizard's "Custom" tab so the admin sees what will be pulled.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct VisionImportManifestFile {
+    pub name: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+/// Registry model metadata carried by a single-model remote manifest — enough
+/// for the wizard to preview the model before importing it.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct VisionImportManifestModel {
+    pub model_name: String,
+    pub op: String,
+    pub file_name: String,
+    pub classes: Vec<String>,
+    pub output_contract: String,
+    pub default_threshold: Option<f64>,
+}
+
+/// Fetch a remote model-bundle manifest through the Core (server-side, no-
+/// redirect, query-redacting HTTP client) using an API key. `manifest_url` is
+/// the admin-pasted `https://<host>/models/manifest/<ref>` URL; `api_key` is
+/// sent as `Authorization: Bearer` and never persisted by this request.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct VisionImportFetchManifestRequest {
+    pub manifest_url: String,
+    pub api_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct VisionImportFetchManifestResponse {
+    pub bundle: String,
+    pub files: Vec<VisionImportManifestFile>,
+    /// Present only for a single-model registry bundle (importable). A fixed
+    /// engine bundle (`vision-all`, camera-CV) has no registry row → `None`.
+    pub model: Option<VisionImportManifestModel>,
+    pub error: Option<String>,
+}
+
+/// Import a single registry model from a remote instance: Core re-fetches the
+/// manifest with the key, downloads the ONNX (+ sidecars), verifies sha256,
+/// places files in `vision_models_dir()` and registers a `vision_models` row
+/// (`source='imported'`). `alias` optionally creates/retargets a model alias.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct VisionImportModelRequest {
+    pub manifest_url: String,
+    pub api_key: String,
+    /// The registry model name (== the single-model bundle_ref) to import.
+    pub model_name: String,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct VisionImportModelResponse {
+    pub ok: bool,
+    pub imported_model_name: Option<String>,
+    pub error: Option<String>,
+}
+
+/// One variant carrying the whole custom-import family (fetch + import). New
+/// variants ALWAYS appended at the END — ciborium encodes by index.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub enum VisionImportPayload {
+    FetchManifestRequest(VisionImportFetchManifestRequest),
+    FetchManifestResponse(VisionImportFetchManifestResponse),
+    ImportRequest(VisionImportModelRequest),
+    ImportResponse(VisionImportModelResponse),
+}
+
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct MlStudioRecogHyperparams {
     pub epochs: u32,
@@ -1867,6 +2127,101 @@ pub struct MlStudioRecogTrainStatusResponse {
     pub sync_bytes_sent: u64,
     pub sync_bytes_total: u64,
     pub sync_rate_bps: u64,
+    /// Pola live-view z serwisu treningowego (`/status`). Serde default = wsteczna
+    /// kompatybilność ze starszymi nadawcami. `eta_s`/`elapsed_s` w sekundach,
+    /// `gpu_mem_mb` w MB, `stage` = etap serwisu (np. "warmup"|"train"|"eval").
+    #[serde(default)]
+    pub eta_s: f32,
+    #[serde(default)]
+    pub elapsed_s: f32,
+    #[serde(default)]
+    pub gpu_mem_mb: f32,
+    #[serde(default)]
+    pub stage: String,
+}
+
+/// Hiperparametry treningu klasyfikatora atrybutu na wycinkach (timm). Kontrakt
+/// jest sztywny (inne zespoły piszą pod te same nazwy/typy), stąd `i32`/`f32`.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioClassifierHyperparams {
+    pub epochs: i32,
+    pub batch_size: i32,
+    pub learning_rate: f32,
+    pub image_size: i32,
+    pub freeze_backbone: bool,
+}
+
+/// Start treningu KLASYFIKATORA ATRYBUTU na wycinkach (np. atrybut "stan" o
+/// wartościach czysta/brudna). Cropy z obrazów źródłowych buduje SERWIS Python
+/// (`classifier-training`); Core przekazuje tylko dataset + specyfikację atrybutu.
+/// Biegnie ASYNCHRONICZNIE (zob. `train_classifier.rs`); UI pyta o postęp przez
+/// `MlStudioGenericTrainStatusRequest`. `variant` = mobilenetv4|efficientnet_b0|
+/// resnet50. `source_class` = nazwa kategorii COCO definiującej atrybut ("" =
+/// wszystkie klasy). `values` = etykiety atrybutu (kolejność = indeks etykiety).
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioClassifierTrainStartRequest {
+    pub project_id: String,
+    pub dataset_id: String,
+    pub attribute: String,
+    pub source_class: String,
+    pub variant: String,
+    pub values: Vec<String>,
+    pub hyperparams: MlStudioClassifierHyperparams,
+    /// Węzeł docelowy treningu: "" = trening lokalny; inny node_id → trening na
+    /// zdalnym węźle (Node B) przez komendę mesh, status proxowany z powrotem.
+    #[serde(default)]
+    pub target_node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioClassifierTrainStartResponse {
+    pub run_id: String,
+    pub status: String,
+}
+
+/// Generyczne żądanie statusu treningu (klasyfikator i inne torry nie-detekcyjne).
+/// Detekcja RF-DETR nadal używa własnego `MlStudioRecogTrainStatusRequest`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioGenericTrainStatusRequest {
+    pub run_id: String,
+}
+
+/// Punkt generycznej krzywej treningu: (epoka, nazwa metryki, wartość). Pozwala
+/// serwować dowolny zestaw metryk (np. train_loss, val_acc, val_macro_f1) bez
+/// sztywnej struktury per-tor.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct GenericMetricPoint {
+    pub epoch: i32,
+    pub metric_name: String,
+    pub value: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioGenericTrainStatusResponse {
+    pub run_id: String,
+    pub status: String,
+    pub epoch: i32,
+    pub total_epochs: i32,
+    pub curve: Vec<GenericMetricPoint>,
+    pub error: String,
+    /// Faza transferu datasetu przez mesh (trening zdalny): "zipping" | "syncing"
+    /// | "starting"; None gdy lokalnie lub gdy transfer zakończony i trening leci
+    /// na węźle B. Analogiczne do `MlStudioRecogTrainStatusResponse`.
+    pub sync_phase: Option<String>,
+    pub sync_bytes_sent: u64,
+    pub sync_bytes_total: u64,
+    pub sync_rate_bps: u64,
+    /// Pola live-view z serwisu treningowego (`/status`). Serde default = wsteczna
+    /// kompatybilność ze starszymi nadawcami. `eta_s`/`elapsed_s` w sekundach,
+    /// `gpu_mem_mb` w MB, `stage` = etap serwisu (np. "warmup"|"train"|"eval").
+    #[serde(default)]
+    pub eta_s: f32,
+    #[serde(default)]
+    pub elapsed_s: f32,
+    #[serde(default)]
+    pub gpu_mem_mb: f32,
+    #[serde(default)]
+    pub stage: String,
 }
 
 /// Żądanie eksportu wytrenowanego modelu FT do GGUF. Eksport (merge adaptera +
@@ -2018,6 +2373,89 @@ pub struct MlStudioServiceModelsListResponse {
     pub models_json: String,
 }
 
+// ---------------------------------------------------------------------------
+// Destylacja — generowanie datasetu par (question, answer). Zrodlo pytan:
+// import wgranego datasetu ALBO generacja modelem z promptu usera; teacher
+// (dowolny wybrany model) generuje odpowiedzi referencyjne. Wynik -> dataset.
+// ---------------------------------------------------------------------------
+
+/// Start generowania datasetu destylacji. Job w tle: zbiera pytania, odpytuje
+/// teachera po odpowiedzi, zapisuje pary do nowego datasetu (kind="distill_qa").
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDistillGenerateRequest {
+    pub project_id: String,
+    pub dataset_name: String,
+    /// Zrodlo pytan: "import" (kolumna z istniejacego datasetu) lub "generate"
+    /// (model generuje pytania z `generate_prompt`).
+    pub question_source: String,
+    /// "import": id wgranego datasetu + nazwa pola/kolumny z pytaniami.
+    #[serde(default)]
+    pub source_dataset_id: Option<String>,
+    #[serde(default)]
+    pub question_field: Option<String>,
+    /// "generate": prompt usera (co wygenerowac), model generujacy pytania, ile pytan.
+    #[serde(default)]
+    pub generate_prompt: Option<String>,
+    #[serde(default)]
+    pub question_model: Option<String>,
+    #[serde(default)]
+    pub num_questions: Option<u32>,
+    /// Teacher — model generujacy ODPOWIEDZI (alias/model wybrany w GUI; dowolny
+    /// tentaflow lub external). Odpowiedzi to etykiety treningowe ucznia.
+    pub teacher_model: String,
+    /// Instrukcja dla teachera (jak ma odpowiadac); doklejana przed pytaniem.
+    #[serde(default)]
+    pub answer_instruction: Option<String>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// Wariant treningu pod ktory generujemy dane: "sft"/"kd" -> pary
+    /// (question, answer); "dpo" -> trojki (prompt, chosen, rejected). Domyslnie sft.
+    #[serde(default)]
+    pub objective: Option<String>,
+    /// DPO: model generujacy ODRZUCONA (gorsza) odpowiedz — zwykle slabszy/bazowy
+    /// albo teacher z instrukcja "odpowiedz gorzej". Wymagany dla objective=dpo.
+    #[serde(default)]
+    pub rejected_model: Option<String>,
+    /// DPO: instrukcja dla modelu generujacego odrzucona odpowiedz.
+    #[serde(default)]
+    pub rejected_instruction: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDistillGenerateResponse {
+    pub dataset_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDistillGenerateStatusRequest {
+    pub dataset_id: String,
+}
+
+/// Podglad wygenerowanej probki. SFT/KD: `question`+`answer`. DPO: `question`=prompt,
+/// `answer`=chosen (lepsza), `rejected`=Some(gorsza).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDistillQaPair {
+    pub question: String,
+    pub answer: String,
+    #[serde(default)]
+    pub rejected: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioDistillGenerateStatusResponse {
+    /// pending | generating_questions | answering | completed | failed
+    pub status: String,
+    pub total: u32,
+    pub done: u32,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Kilka pierwszych par do podgladu w UI.
+    pub samples: Vec<MlStudioDistillQaPair>,
+}
+
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum MlStudioPayload {
     ProjectsListRequest(MlStudioProjectsListRequest),
@@ -2054,6 +2492,8 @@ pub enum MlStudioPayload {
     ProjectResourcesResponse(MlStudioProjectResourcesResponse),
     TrainingRunsListRequest(MlStudioTrainingRunsListRequest),
     TrainingRunsListResponse(MlStudioTrainingRunsListResponse),
+    JobsOverviewRequest(MlStudioJobsOverviewRequest),
+    JobsOverviewResponse(MlStudioJobsOverviewResponse),
     ModelsListRequest(MlStudioModelsListRequest),
     ModelsListResponse(MlStudioModelsListResponse),
     ProjectGrantsListRequest(MlStudioProjectGrantsListRequest),
@@ -2068,10 +2508,18 @@ pub enum MlStudioPayload {
     FtExportStatusResponse(MlStudioFtExportStatusResponse),
     FtDeployRequest(MlStudioFtDeployRequest),
     FtDeployResponse(MlStudioFtDeployResponse),
+    DistillGenerateRequest(MlStudioDistillGenerateRequest),
+    DistillGenerateResponse(MlStudioDistillGenerateResponse),
+    DistillGenerateStatusRequest(MlStudioDistillGenerateStatusRequest),
+    DistillGenerateStatusResponse(MlStudioDistillGenerateStatusResponse),
     RecogTrainStartRequest(MlStudioRecogTrainStartRequest),
     RecogTrainStartResponse(MlStudioRecogTrainStartResponse),
     RecogTrainStatusRequest(MlStudioRecogTrainStatusRequest),
     RecogTrainStatusResponse(MlStudioRecogTrainStatusResponse),
+    ClassifierTrainStartRequest(MlStudioClassifierTrainStartRequest),
+    ClassifierTrainStartResponse(MlStudioClassifierTrainStartResponse),
+    GenericTrainStatusRequest(MlStudioGenericTrainStatusRequest),
+    GenericTrainStatusResponse(MlStudioGenericTrainStatusResponse),
     RecogDatasetRegisterRequest(MlStudioRecogDatasetRegisterRequest),
     RecogDatasetRegisterResponse(MlStudioRecogDatasetRegisterResponse),
     RecogStageMediaRequest(MlStudioRecogStageMediaRequest),
@@ -2108,6 +2556,18 @@ pub enum MlStudioPayload {
     LookupDictDeleteResponse(MlStudioLookupDictDeleteResponse),
     ServiceModelsListRequest(MlStudioServiceModelsListRequest),
     ServiceModelsListResponse(MlStudioServiceModelsListResponse),
+    // NOWE warianty ZAWSZE na końcu — ciborium serializuje indeks wariantu, więc
+    // wstawienie w środku przesunęłoby dyskryminatory i zepsuło wire compat.
+    DatasetRowsRequest(MlStudioDatasetRowsRequest),
+    DatasetRowsResponse(MlStudioDatasetRowsResponse),
+    DatasetRowsSaveRequest(MlStudioDatasetRowsSaveRequest),
+    DatasetRowsSaveResponse(MlStudioDatasetRowsSaveResponse),
+    VisionModelPublishRequest(MlStudioVisionModelPublishRequest),
+    VisionModelPublishResponse(MlStudioVisionModelPublishResponse),
+    VisionModelsListRequest(MlStudioVisionModelsListRequest),
+    VisionModelsListResponse(MlStudioVisionModelsListResponse),
+    VisionModelDeleteRequest(MlStudioVisionModelDeleteRequest),
+    VisionModelDeleteResponse(MlStudioVisionModelDeleteResponse),
 }
 
 // ----- Robots screen (UserSession) -----
@@ -3911,6 +4371,11 @@ pub struct ClusterDeployRequest {
     /// verbatim into each member's deploy.
     #[serde(default)]
     pub config_json: Option<String>,
+    /// Bounded wait for the member CONTAINER to come up (image build + container
+    /// start) BEFORE the Ray-GCS/serve clocks start — a slow first image build
+    /// extends THIS phase, not the GCS phase (default 600 s).
+    #[serde(default)]
+    pub build_timeout_secs: Option<u32>,
     /// Bounded wait for the head Ray GCS to come up before joining workers
     /// (default 60 s).
     #[serde(default)]
@@ -3919,6 +4384,17 @@ pub struct ClusterDeployRequest {
     /// joined (default 600 s — a 31B model can take a few minutes to load).
     #[serde(default)]
     pub ready_timeout_secs: Option<u32>,
+    /// Optional per-model pricing captured at deploy time (persisted to
+    /// `model_pricing` for the served model). All four are independent; any
+    /// non-None value triggers an upsert, unset values default to 0.0.
+    #[serde(default)]
+    pub prompt_per_1k: Option<f64>,
+    #[serde(default)]
+    pub completion_per_1k: Option<f64>,
+    #[serde(default)]
+    pub audio_per_min: Option<f64>,
+    #[serde(default)]
+    pub image_each: Option<f64>,
 }
 
 /// Per-member outcome of a cluster distributed deploy.
@@ -5644,109 +6120,6 @@ pub struct MyOAuthAccountsListResponse {
 }
 
 // =============================================================================
-// Notes (per-user) — inner-enum multiplex zeby nie przekroczyc 256 variantow
-// MessageBody. Payloady opakowane w strukty (nawet puste) dla spojnego wzorca.
-// =============================================================================
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NotesListRequest;
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteEntry {
-    pub id: i64,
-    pub title: String,
-    pub body_preview: String,
-    pub pinned: bool,
-    pub created_at_epoch: i64,
-    pub updated_at_epoch: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NotesListResponse {
-    pub notes: Vec<NoteEntry>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteDetailRequest {
-    pub note_id: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteDetailResponse {
-    pub id: i64,
-    pub title: String,
-    pub body: String,
-    pub pinned: bool,
-    pub created_at_epoch: i64,
-    pub updated_at_epoch: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteCreateRequest {
-    pub title: String,
-    pub body: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteCreateResponse {
-    pub id: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteUpdateRequest {
-    pub note_id: i64,
-    pub title: String,
-    pub body: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteUpdateResponse {
-    pub ok: bool,
-    pub updated_at_epoch: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteSetPinnedRequest {
-    pub note_id: i64,
-    pub pinned: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteSetPinnedResponse {
-    pub ok: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteDeleteRequest {
-    pub note_id: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub struct NoteDeleteResponse {
-    pub ok: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub enum NotesRequest {
-    List(NotesListRequest),
-    Detail(NoteDetailRequest),
-    Create(NoteCreateRequest),
-    Update(NoteUpdateRequest),
-    SetPinned(NoteSetPinnedRequest),
-    Delete(NoteDeleteRequest),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
-pub enum NotesResponse {
-    List(NotesListResponse),
-    Detail(NoteDetailResponse),
-    Create(NoteCreateResponse),
-    Update(NoteUpdateResponse),
-    SetPinned(NoteSetPinnedResponse),
-    Delete(NoteDeleteResponse),
-}
-
-// =============================================================================
 // Deployments — real build/run pipeline with streaming progress + log tail.
 // =============================================================================
 
@@ -6459,6 +6832,16 @@ pub struct AddonDocumentUploadChunkRequest {
     pub mime: String,
     pub seq: u32,
     pub total_chunks: u32,
+    /// Zaufany marker źródła uploadu ustawiany WYŁĄCZNIE przez renderer po stronie
+    /// hosta (dashboard SDK-runtime), NIE przez guest addon. Wartość
+    /// `"audio_capture"` znaczy, że bajty pochodzą z mikrofonu (komponent
+    /// `AudioCapture`) — host bramkuje takie uploady na uprawnieniu
+    /// `audio.capture`. Zwykły upload plików (FileInput) zostawia to puste i NIE
+    /// wymaga tego uprawnienia (wybór pliku audio to nie przechwycenie mikrofonu).
+    /// Addon nie może podrobić tej wartości: nie kontroluje wywołania kanału
+    /// upload, robi to zaufany renderer per typ komponentu.
+    #[serde(default)]
+    pub source: String,
     /// Surowe bajty fragmentu. `serde_bytes` wymusza w ciborium kodowanie jako CBOR
     /// byte-string (length-prefixed, zero narzutu per-bajt) — goły `Vec<u8>` przez
     /// serde+ciborium dałby array-of-integers (~2× rozmiar), co zabiło wydajność
@@ -6466,6 +6849,11 @@ pub struct AddonDocumentUploadChunkRequest {
     #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
 }
+
+/// Marker `AddonDocumentUploadChunkRequest.source` dla przechwytu mikrofonu
+/// (komponent `AudioCapture`). Host bramkuje uploady z tym markerem na
+/// uprawnieniu `audio.capture`.
+pub const UPLOAD_SOURCE_AUDIO_CAPTURE: &str = "audio_capture";
 
 /// Odpowiedź na fragment uploadu dokumentu addona. Dla fragmentów pośrednich
 /// `doc_ref` jest `None` i zwracamy postęp; po ostatnim fragmencie `doc_ref`
@@ -6504,9 +6892,14 @@ pub enum MessageBody {
         client_version: u16,
     },
     /// Serwer -> klient: potwierdzenie (accepted=false => disconnect).
+    /// `asset_build_hash` to zbiorczy SHA-256 frontu serwera — front porownuje
+    /// z wlasnym przy KAZDYM (re)connect i przy roznicy proponuje reload
+    /// (nieaktualny front po aktualizacji backendu/addonu). Rozne od
+    /// `server_version`: hash lapie zmiany JS/CSS/panelu bez zmiany protokolu.
     MetaSchemaVersionAck {
         server_version: u16,
         accepted: bool,
+        asset_build_hash: String,
     },
     /// Dwukierunkowy keepalive (WSS ping substitute, liczy RTT).
     MetaHeartbeat {
@@ -6961,10 +7354,6 @@ pub enum MessageBody {
     MyOAuthAccountsListRequestBody(MyOAuthAccountsListRequest),
     MyOAuthAccountsListResponseBody(MyOAuthAccountsListResponse),
 
-    // ---- Notes (inner-enum multiplex) ----
-    NotesRequestBody(NotesRequest),
-    NotesResponseBody(NotesResponse),
-
     // ---- Meeting Bot (single-variant, req+res w inner enum) ----
     MeetingBody(MeetingPayload),
 
@@ -7119,6 +7508,25 @@ pub enum MessageBody {
     ClusterDeployResponseBody(ClusterDeployResponse),
     ClusterDeployStopRequestBody(ClusterDeployStopRequest),
     ClusterDeployStopResponseBody(ClusterDeployStopResponse),
+
+    // ----- Model metrics (histogram rollup read + per-model pricing) -----
+    // Dopisane na KOŃCU enuma (ciborium koduje warianty po indeksie liczbowym),
+    // żeby nie ruszać indeksów istniejących wariantów. JEDEN wariant na całą
+    // rodzinę (summary + node×service + pricing) w `ModelMetricsPayload`.
+    ModelMetricsBody(crate::model_metrics::ModelMetricsPayload),
+
+    // ----- Benchmark Studio (definicje, targety, runy, wyniki, live progres) -----
+    // Dopisane na KOŃCU enuma (ciborium koduje warianty po indeksie liczbowym),
+    // żeby nie ruszać indeksów istniejących wariantów. JEDEN wariant na całą
+    // rodzinę (request+response+stream) w `BenchmarkPayload`.
+    BenchmarkBody(crate::benchmark::BenchmarkPayload),
+
+    // ----- Custom vision-model import (deploy wizard "Własny" tab) -----
+    // Dopisane na KOŃCU enuma (ciborium koduje warianty po indeksie liczbowym).
+    // JEDEN wariant na całą rodzinę (fetch-manifest + import) w
+    // `VisionImportPayload` — Core pobiera zdalny manifest przez klucz API i
+    // importuje pojedynczy model wizyjny do lokalnego rejestru.
+    VisionImportBody(VisionImportPayload),
 }
 
 // =============================================================================
@@ -7210,7 +7618,118 @@ mod tests {
         let body = MessageBody::MetaSchemaVersionAck {
             server_version: 2,
             accepted: true,
+            asset_build_hash: "abc123def456".to_string(),
         };
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn ml_studio_classifier_train_start_request_round_trip() {
+        let body = MessageBody::MlStudioBody(MlStudioPayload::ClassifierTrainStartRequest(
+            MlStudioClassifierTrainStartRequest {
+                project_id: "proj-1".to_string(),
+                dataset_id: "ds-7".to_string(),
+                attribute: "stan".to_string(),
+                source_class: "tablica".to_string(),
+                variant: "efficientnet_b0".to_string(),
+                values: vec![
+                    "czysta".to_string(),
+                    "brudna".to_string(),
+                    "uszkodzona".to_string(),
+                    "nieczytelna".to_string(),
+                ],
+                hyperparams: MlStudioClassifierHyperparams {
+                    epochs: 30,
+                    batch_size: 32,
+                    learning_rate: 1e-3,
+                    image_size: 224,
+                    freeze_backbone: true,
+                },
+                target_node_id: "node-B".to_string(),
+            },
+        ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn ml_studio_classifier_train_start_request_default_target_node() {
+        // `target_node_id` ma #[serde(default)] — CBOR bez tego pola musi się
+        // zdekodować do pustego stringa (trening lokalny).
+        let req = MlStudioClassifierTrainStartRequest {
+            project_id: "p".to_string(),
+            dataset_id: "d".to_string(),
+            attribute: "stan".to_string(),
+            source_class: String::new(),
+            variant: "resnet50".to_string(),
+            values: vec!["a".to_string(), "b".to_string()],
+            hyperparams: MlStudioClassifierHyperparams {
+                epochs: 1,
+                batch_size: 8,
+                learning_rate: 0.01,
+                image_size: 128,
+                freeze_backbone: false,
+            },
+            target_node_id: String::new(),
+        };
+        let body =
+            MessageBody::MlStudioBody(MlStudioPayload::ClassifierTrainStartRequest(req.clone()));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn ml_studio_generic_train_status_response_round_trip() {
+        let body = MessageBody::MlStudioBody(MlStudioPayload::GenericTrainStatusResponse(
+            MlStudioGenericTrainStatusResponse {
+                run_id: "run-42".to_string(),
+                status: "running".to_string(),
+                epoch: 3,
+                total_epochs: 30,
+                curve: vec![
+                    GenericMetricPoint {
+                        epoch: 1,
+                        metric_name: "train/loss".to_string(),
+                        value: 1.25,
+                    },
+                    GenericMetricPoint {
+                        epoch: 1,
+                        metric_name: "val/macro_f1".to_string(),
+                        value: 0.5,
+                    },
+                ],
+                error: String::new(),
+                sync_phase: Some("syncing".to_string()),
+                sync_bytes_sent: 1_024,
+                sync_bytes_total: 4_096,
+                sync_rate_bps: 512,
+                eta_s: 0.0,
+                elapsed_s: 0.0,
+                gpu_mem_mb: 0.0,
+                stage: String::new(),
+            },
+        ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn ml_studio_generic_train_status_response_none_sync_phase() {
+        let body = MessageBody::MlStudioBody(MlStudioPayload::GenericTrainStatusResponse(
+            MlStudioGenericTrainStatusResponse {
+                run_id: "r".to_string(),
+                status: "succeeded".to_string(),
+                epoch: 30,
+                total_epochs: 30,
+                curve: vec![],
+                error: String::new(),
+                sync_phase: None,
+                sync_bytes_sent: 0,
+                sync_bytes_total: 0,
+                sync_rate_bps: 0,
+                eta_s: 0.0,
+                elapsed_s: 0.0,
+                gpu_mem_mb: 0.0,
+                stage: String::new(),
+            },
+        ));
         assert_eq!(round_trip(body.clone()), body);
     }
 
@@ -7407,6 +7926,7 @@ mod tests {
             temperature: Some(0.7),
             max_tokens: Some(256),
             flow_id: Some("flow-1".to_string()),
+            session_id: Some("sess-1".to_string()),
         });
         assert_eq!(round_trip(req.clone()), req);
 
@@ -7422,6 +7942,7 @@ mod tests {
             ttft_ms: 50,
             prefill_tps: 120.0,
             decode_tps: 45.5,
+            total_ms: 1670,
         });
         assert_eq!(round_trip(end.clone()), end);
     }
@@ -8389,6 +8910,7 @@ mod tests {
             mime: "m".to_string(),
             seq: 0,
             total_chunks: 1,
+            source: String::new(),
             bytes: vec![0xABu8; 1000],
         };
         // Kodujemy SAMĄ strukturę (bez owijki MessageBody), żeby zmierzyć narzut pola.

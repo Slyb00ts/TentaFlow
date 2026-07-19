@@ -229,9 +229,9 @@ export const encode = {
   },
 
   /** MessageBody::ChatStreamRequest (simplified: 1 user message). */
-  chatStreamRequest(correlationId, { modelId, userMessage, flowId }, sequence = 1) {
+  chatStreamRequest(correlationId, { modelId, userMessage, flowId, sessionId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeChatStreamRequestSimple(modelId, userMessage, flowId ?? null);
+    const body = _wasm.encodeChatStreamRequestSimple(modelId, userMessage, flowId ?? null, sessionId ?? null);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -636,6 +636,11 @@ export const encode = {
       payload.configJson ?? null,
       payload.gcsTimeoutSecs ?? null,
       payload.readyTimeoutSecs ?? null,
+      payload.buildTimeoutSecs ?? null,
+      payload.promptPer1k ?? null,
+      payload.completionPer1k ?? null,
+      payload.audioPerMin ?? null,
+      payload.imageEach ?? null,
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
@@ -1558,82 +1563,6 @@ export const encode = {
       BigInt(sequence),
       _messageKind.META_HEARTBEAT,
       body,
-    );
-  },
-
-  // -------------------------------------------------------------------------
-  // Notes
-  // -------------------------------------------------------------------------
-
-  /** NotesRequest::List — no payload. */
-  notesListRequest(correlationId, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeNotesListRequest();
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
-
-  /** NotesRequest::Detail { noteId } */
-  noteDetailRequest(correlationId, { noteId }, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeNoteDetailRequest(Number(noteId));
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
-
-  /** NotesRequest::Create { title, body } */
-  noteCreateRequest(correlationId, { title, body }, sequence = 1) {
-    assertReady();
-    const payload = _wasm.encodeNoteCreateRequest(title ?? '', body ?? '');
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      payload,
-    );
-  },
-
-  /** NotesRequest::Update { noteId, title, body } */
-  noteUpdateRequest(correlationId, { noteId, title, body }, sequence = 1) {
-    assertReady();
-    const payload = _wasm.encodeNoteUpdateRequest(Number(noteId), title ?? '', body ?? '');
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      payload,
-    );
-  },
-
-  /** NotesRequest::SetPinned { noteId, pinned } */
-  noteSetPinnedRequest(correlationId, { noteId, pinned }, sequence = 1) {
-    assertReady();
-    const payload = _wasm.encodeNoteSetPinnedRequest(Number(noteId), !!pinned);
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      payload,
-    );
-  },
-
-  /** NotesRequest::Delete { noteId } */
-  noteDeleteRequest(correlationId, { noteId }, sequence = 1) {
-    assertReady();
-    const payload = _wasm.encodeNoteDeleteRequest(Number(noteId));
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      payload,
     );
   },
 
@@ -2608,6 +2537,160 @@ export const encode = {
     );
   },
 
+  /** MessageBody::ModelMetricsBody(SummaryRequest) — mesh-wide rollup agregacji. */
+  modelMetricsSummaryRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const nz = (v) => {
+      const s = v == null ? '' : String(v);
+      return s === '' ? undefined : s;
+    };
+    const body = _wasm.encodeModelMetricsSummaryRequest(
+      String(payload.period ?? 'daily'),
+      String(payload.periodKey ?? payload.period_key ?? ''),
+      String(payload.groupBy ?? payload.group_by ?? 'user'),
+      nz(payload.filterModel ?? payload.filter_model ?? payload.model),
+      nz(payload.filterNode ?? payload.filter_node ?? payload.node),
+      nz(payload.filterService ?? payload.filter_service ?? payload.service),
+      nz(payload.filterBackend ?? payload.filter_backend ?? payload.backend),
+      nz(payload.filterModality ?? payload.filter_modality ?? payload.modality),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelMetricsBody(NodeServiceRequest) — przekrój węzeł×serwis. */
+  modelMetricsNodeServiceRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelMetricsNodeServiceRequest(
+      String(payload.period ?? 'daily'),
+      String(payload.periodKey ?? payload.period_key ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelMetricsBody(PricingGet) — odczyt cennika per-model. */
+  modelMetricsPricingGet(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelMetricsPricingGet();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelMetricsBody(PricingSet) — zapis cennika jednego modelu. */
+  modelMetricsPricingSet(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelMetricsPricingSet(
+      String(payload.modelId ?? payload.model_id ?? ''),
+      Number(payload.promptPer1k ?? payload.prompt_per_1k ?? 0),
+      Number(payload.completionPer1k ?? payload.completion_per_1k ?? 0),
+      Number(payload.audioPerMin ?? payload.audio_per_min ?? 0),
+      Number(payload.imageEach ?? payload.image_each ?? 0),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::BenchmarkBody(ListRequest) — Benchmark Studio overview. */
+  benchmarkListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkListRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::BenchmarkBody(GetRequest) — full definition for the editor. payload: { id }. */
+  benchmarkGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkGetRequest(String(payload.id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::BenchmarkBody(SaveRequest). payload: { id?, name, configJson, targets:[] }. */
+  benchmarkSaveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const id = payload.id == null || payload.id === '' ? undefined : String(payload.id);
+    const targets = Array.isArray(payload.targets) ? payload.targets : [];
+    const body = _wasm.encodeBenchmarkSaveRequest(
+      id,
+      String(payload.name ?? ''),
+      String(payload.configJson ?? payload.config_json ?? '{}'),
+      JSON.stringify(targets),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::BenchmarkBody(DeleteRequest). payload: { id }. */
+  benchmarkDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkDeleteRequest(String(payload.id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::BenchmarkBody(StartRunRequest) — non-blocking, returns runId. payload: { benchmarkId }. */
+  benchmarkStartRunRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkStartRunRequest(String(payload.benchmarkId ?? payload.benchmark_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::BenchmarkBody(RunStatusRequest). payload: { runId }. */
+  benchmarkRunStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkRunStatusRequest(String(payload.runId ?? payload.run_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::BenchmarkBody(RunResultsRequest). payload: { runId }. */
+  benchmarkRunResultsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkRunResultsRequest(String(payload.runId ?? payload.run_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::BenchmarkBody(ListRunsRequest) — run history for one benchmark. payload: { benchmarkId }. */
+  benchmarkListRunsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkListRunsRequest(String(payload.benchmarkId ?? payload.benchmark_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::BenchmarkBody(RecentRunsRequest) — newest runs across all benchmarks. */
+  benchmarkRecentRunsRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkRecentRunsRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::BenchmarkBody(CancelRunRequest). payload: { runId }. */
+  benchmarkCancelRunRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkCancelRunRequest(String(payload.runId ?? payload.run_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Subscribe — live run progress. payload: { runId }. Chunks = BenchmarkRunStreamChunk. */
+  benchmarkRunStreamRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBenchmarkRunStreamRequest(String(payload.runId ?? payload.run_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::MlStudioBody(ProjectsListRequest) — ML Studio projects list. */
   mlStudioProjectsListRequest(correlationId, sequence = 1) {
     assertReady();
@@ -2792,6 +2875,7 @@ export const encode = {
       String(payload.mime ?? ''),
       Number(payload.seq ?? 0),
       Number(payload.totalChunks ?? payload.total_chunks ?? 0),
+      String(payload.source ?? ''),
       bytes,
     );
     return _wasm.encodeEnvelopeDirect(
@@ -2821,6 +2905,43 @@ export const encode = {
     assertReady();
     const body = _wasm.encodeMlStudioDatasetProfileRequest(
       String(payload.datasetId ?? payload.dataset_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(DatasetRowsRequest) — pobranie WIERSZY datasetu
+   * (linie JSONL) do podglądu/edycji. payload: { datasetId, limit? }.
+   */
+  mlStudioDatasetRowsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioDatasetRowsRequest(
+      String(payload.datasetId ?? payload.dataset_id ?? ''),
+      (payload.limit ?? 0) >>> 0,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(DatasetRowsSaveRequest) — nadpisanie datasetu
+   * ręcznie edytowanymi wierszami. payload: { datasetId, rows: string[] (linie JSONL) }.
+   */
+  mlStudioDatasetRowsSaveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const rows = Array.isArray(payload.rows) ? payload.rows.map((r) => String(r)) : [];
+    const body = _wasm.encodeMlStudioDatasetRowsSaveRequest(
+      String(payload.datasetId ?? payload.dataset_id ?? ''),
+      rows,
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
@@ -3018,6 +3139,57 @@ export const encode = {
   },
 
   /**
+   * MessageBody::MlStudioBody(DistillGenerateRequest) — start generowania
+   * datasetu destylacji. payload: { projectId, datasetName, questionSource
+   * ('import'|'generate'), sourceDatasetId?, questionField?, generatePrompt?,
+   * questionModel?, numQuestions?, teacherModel, answerInstruction?,
+   * temperature?, maxTokens? }.
+   */
+  mlStudioDistillGenerateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioDistillGenerateRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.datasetName ?? payload.dataset_name ?? ''),
+      String(payload.questionSource ?? payload.question_source ?? 'generate'),
+      (payload.sourceDatasetId ?? payload.source_dataset_id) || undefined,
+      (payload.questionField ?? payload.question_field) || undefined,
+      (payload.generatePrompt ?? payload.generate_prompt) || undefined,
+      (payload.questionModel ?? payload.question_model) || undefined,
+      (payload.numQuestions ?? payload.num_questions ?? 0) >>> 0,
+      String(payload.teacherModel ?? payload.teacher_model ?? ''),
+      (payload.answerInstruction ?? payload.answer_instruction) || undefined,
+      Number(payload.temperature ?? 0),
+      (payload.maxTokens ?? payload.max_tokens ?? 0) >>> 0,
+      (payload.objective) || undefined,
+      (payload.rejectedModel ?? payload.rejected_model) || undefined,
+      (payload.rejectedInstruction ?? payload.rejected_instruction) || undefined,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(DistillGenerateStatusRequest) — polling postępu
+   * generowania datasetu destylacji. payload: { datasetId }.
+   */
+  mlStudioDistillGenerateStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioDistillGenerateStatusRequest(
+      String(payload.datasetId ?? payload.dataset_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
    * MessageBody::MlStudioBody(FtTrainStatusRequest) — polling postępu
    * fine-tuningu LLM. Zwraca status + krzywą straty (lossCurve) do wykresu.
    * payload: { runId }.
@@ -3072,6 +3244,71 @@ export const encode = {
   mlStudioRecogTrainStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeMlStudioRecogTrainStatusRequest(
+      String(payload.runId ?? payload.run_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(ClassifierTrainStartRequest) — startuje
+   * ASYNCHRONICZNY trening KLASYFIKATORA ATRYBUTU na wycinkach (np. atrybut
+   * "stan" o wartościach czysta/brudna). Cropy buduje serwis Python. Odpowiedź
+   * natychmiast z runId; postęp odpytuj przez mlStudioGenericTrainStatusRequest.
+   * payload: { projectId, datasetId, attribute, sourceClass, variant, values,
+   * hyperparams:{epochs,batchSize,learningRate,imageSize,freezeBackbone},
+   * targetNodeId }.
+   */
+  mlStudioClassifierTrainStartRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const hp = payload.hyperparams ?? {};
+    const values = (payload.values ?? []).map((v) => String(v));
+    const body = _wasm.encodeMlStudioClassifierTrainStartRequest(
+      String(payload.projectId ?? payload.project_id ?? ''),
+      String(payload.datasetId ?? payload.dataset_id ?? ''),
+      String(payload.attribute ?? ''),
+      String(payload.sourceClass ?? payload.source_class ?? ''),
+      String(payload.variant ?? 'mobilenetv4'),
+      values,
+      (hp.epochs ?? 20) | 0,
+      (hp.batchSize ?? hp.batch_size ?? 32) | 0,
+      Number(hp.learningRate ?? hp.learning_rate ?? 1e-3),
+      (hp.imageSize ?? hp.image_size ?? 224) | 0,
+      Boolean(hp.freezeBackbone ?? hp.freeze_backbone ?? false),
+      String(payload.targetNodeId ?? payload.target_node_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::MlStudioBody(JobsOverviewRequest) (puste ciało). */
+  mlStudioJobsOverviewRequest(correlationId, _payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioJobsOverviewRequest();
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /**
+   * MessageBody::MlStudioBody(GenericTrainStatusRequest) — polling postępu
+   * treningu generycznego (klasyfikator atrybutu i inne tory nie-detekcyjne).
+   * Zwraca status + krzywą [{epoch, metricName, value}]. payload: { runId }.
+   */
+  mlStudioGenericTrainStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioGenericTrainStatusRequest(
       String(payload.runId ?? payload.run_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -3197,6 +3434,70 @@ export const encode = {
     assertReady();
     const body = _wasm.encodeMlStudioServiceModelsListRequest(
       String(payload.capability ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MlStudioBody(VisionModelPublishRequest) — publikuje wytrenowany model do
+   * rejestru vision_models (kamery). payload: { modelId, modelName, op,
+   * threshold?, alias? }. Zwraca { ok, error }.
+   */
+  mlStudioVisionModelPublishRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const threshold = payload.threshold;
+    const alias = payload.alias;
+    const body = _wasm.encodeMlStudioVisionModelPublishRequest(
+      String(payload.modelId ?? payload.model_id ?? ''),
+      String(payload.modelName ?? payload.model_name ?? ''),
+      String(payload.op ?? ''),
+      threshold === null || threshold === undefined || threshold === '' ? undefined : Number(threshold),
+      alias === null || alias === undefined || alias === '' ? undefined : String(alias),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MlStudioBody(VisionModelsListRequest) — lista rejestru modeli wizyjnych
+   * (dynamiczne ONNX dla pipeline'ów kamer). Zwraca { models: [...] }. */
+  mlStudioVisionModelsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioVisionModelsListRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** VisionImportBody(FetchManifestRequest) — Core pobiera zdalny manifest
+   * modeli przez klucz API (deploy wizard "Własny"). payload: { manifestUrl,
+   * apiKey }. Zwraca { bundle, files, model, error }. */
+  visionImportFetchManifestRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeVisionImportFetchManifestRequest(
+      String(payload.manifestUrl ?? payload.manifest_url ?? ''),
+      String(payload.apiKey ?? payload.api_key ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** VisionImportBody(ImportRequest) — Core importuje pojedynczy model rejestru
+   * ze zdalnej instancji do lokalnego rejestru vision_models. payload:
+   * { manifestUrl, apiKey, modelName, alias? }. Zwraca { ok, importedModelName, error }. */
+  visionImportModelRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const alias = payload.alias;
+    const body = _wasm.encodeVisionImportModelRequest(
+      String(payload.manifestUrl ?? payload.manifest_url ?? ''),
+      String(payload.apiKey ?? payload.api_key ?? ''),
+      String(payload.modelName ?? payload.model_name ?? ''),
+      alias === null || alias === undefined || alias === '' ? undefined : String(alias),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MlStudioBody(VisionModelDeleteRequest) — usuwa model z rejestru vision.
+   * payload: { modelName }. Zwraca { ok, error }. */
+  mlStudioVisionModelDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMlStudioVisionModelDeleteRequest(
+      String(payload.modelName ?? payload.model_name ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
@@ -4521,11 +4822,14 @@ export const encode = {
   /** MessageBody::StreamBody(SubscribeRequest) — subskrypcja strumienia
    *  zarejestrowanego w StreamHub (Chunk B). Server odpowiada
    *  SubscribeResponse + sekwencja Frame chunkow + Closed na tym samym
-   *  correlation_id. Payload: { streamId }. */
+   *  correlation_id. Payload: { streamId, preview? } — preview=true wybiera
+   *  wariant podgladu 720p/~1,5 Mbit/s dla strumieni camera: (kafelki Live
+   *  view), domyslnie pelna jakosc. */
   streamSubscribeRequest(correlationId, payload, sequence = 1) {
     assertReady();
     const streamId = String(payload?.streamId ?? payload?.stream_id ?? '');
-    const body = _wasm.encodeStreamSubscribeRequest(streamId);
+    const preview = Boolean(payload?.preview ?? false);
+    const body = _wasm.encodeStreamSubscribeRequest(streamId, preview);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),

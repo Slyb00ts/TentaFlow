@@ -11,7 +11,7 @@ use crate::config::ProtocolConfig;
 use crate::db::DbPool;
 use crate::error::{CoreError, Result};
 use crate::routing::router::Router;
-use crate::services::catalog::{CatalogEntryKind, CatalogSnapshot};
+use crate::services::catalog::{CatalogEntry, CatalogEntryKind, CatalogSnapshot};
 
 use futures::TryStreamExt;
 use http_body_util::{BodyExt, StreamBody};
@@ -145,14 +145,18 @@ pub fn authorize_model(
         None => return AuthDecision::ModelNotInCatalog,
     };
 
-    let rt = resource_type_for_kind(&entry.kind);
-    if !crate::auth::acl::check_v1_access(db, rt, &entry.id, principal) {
+    if !entry_access_allowed(db, entry, principal) {
         return AuthDecision::Denied;
     }
 
-    // For aliases the principal must also be allowed on the resolved target
-    // (and on any declared fallback) — otherwise an alias would let a caller
-    // reach a model/flow whose own ACL denies them.
+    // For aliases the principal must also be allowed on every target it could
+    // actually resolve to — otherwise an alias would let a caller reach a
+    // model/flow whose own ACL denies them. A target that is NOT advertised
+    // (its owning node is offline) is unreachable right now, so the resolver
+    // cannot pick it and there is nothing to authorize — we skip it instead of
+    // denying the whole alias. Denying here defeated the entire point of a
+    // fallback chain: the primary going offline (exactly when the fallback
+    // matters) would 404 the alias.
     if let CatalogEntryKind::Alias {
         target,
         fallback_targets,
@@ -160,20 +164,34 @@ pub fn authorize_model(
     } = &entry.kind
     {
         for resolved in std::iter::once(target).chain(fallback_targets.iter()) {
-            let target_entry = match snapshot.advertised_entries().find(|e| &e.id == resolved) {
-                Some(e) => e,
-                // A target missing from the catalog cannot be authorized — be
-                // conservative and deny rather than silently skip it.
-                None => return AuthDecision::Denied,
+            let Some(target_entry) = snapshot.advertised_entries().find(|e| &e.id == resolved)
+            else {
+                continue; // offline / unadvertised → not reachable, nothing to authorize
             };
-            let target_rt = resource_type_for_kind(&target_entry.kind);
-            if !crate::auth::acl::check_v1_access(db, target_rt, &target_entry.id, principal) {
+            if !entry_access_allowed(db, target_entry, principal) {
                 return AuthDecision::Denied;
             }
         }
     }
 
     AuthDecision::Allow
+}
+
+/// Whether `principal` may reach this catalog entry. For a published flow we
+/// accept a grant on EITHER its published model name (`entry.id`, what the
+/// catalog/`/v1` advertises) OR its underlying flow id — the dashboard's
+/// access-key wizard grants by flow id, so a grant made in the GUI must
+/// authorize the same flow when called by its published name.
+fn entry_access_allowed(db: &DbPool, entry: &CatalogEntry, principal: &Principal) -> bool {
+    match &entry.kind {
+        CatalogEntryKind::Flow { flow_id, .. } => {
+            crate::auth::acl::check_v1_access(db, "flow", &entry.id, principal)
+                || crate::auth::acl::check_v1_access(db, "flow", flow_id, principal)
+        }
+        other => {
+            crate::auth::acl::check_v1_access(db, resource_type_for_kind(other), &entry.id, principal)
+        }
+    }
 }
 
 /// Central /v1 gate. Called at the top of every handler that accepts a `model`
@@ -1197,8 +1215,8 @@ async fn handle_audio_tts_stream(
 /// - User-defined blocking flow z `FlowValue::Audio` na output → single
 ///   chunk z całością bytes (`wrap_blocking_as_stream` fetchuje BlobStore
 ///   przed emitem).
-/// - Synthetic TTS (gdy admin nie skonfigurował user-defined) → blocking
-///   path → single chunk.
+/// - Direct TTS (gdy admin nie skonfigurował jawnego flow) → blocking path →
+///   single chunk.
 ///
 /// Cancel propaguje przez `CancelOnDropStream` — hyper drop body → token
 /// cancel → executor finalizer EOF.
@@ -1735,7 +1753,10 @@ async fn handle_passthrough(
     } = &target
     {
         if forward_path == "/v1/infer" {
-            return Ok(infer_embedded_vision(&parsed, model_name, engine_id).await);
+            return Ok(
+                infer_embedded_vision(&parsed, model_name, engine_id, router.executor.clone())
+                    .await,
+            );
         }
         return Ok(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1918,6 +1939,7 @@ async fn infer_embedded_vision(
     parsed: &serde_json::Value,
     model_name: &str,
     engine_id: &str,
+    runtime_slot: crate::flow_engine::dispatchers_impl::ModelRuntimeSlot,
 ) -> Response<OpenAIBody> {
     let url = match parsed
         .get("input")
@@ -1970,7 +1992,8 @@ async fn infer_embedded_vision(
     // `VisionDispatcher` (in-process runner / Burn PlateOcr), zwracając kontrakt
     // OCR NVIDIA z pojedynczą detekcją obejmującą cały kadr (jak paddle-ocr).
     if matches!(engine_id, "onnx-ocr" | "apple-ocr" | "plate-ocr") {
-        let dispatcher = crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new();
+        let dispatcher =
+            crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new(runtime_slot);
         let req = crate::flow_engine::dispatchers::VisionOcrRequest {
             rgb,
             width,
@@ -2185,6 +2208,82 @@ pub fn resolve_local_v1_base_url(
 ///
 /// Autoryzacja modelu (`v1_authorize` / `#[policy]`) MUSI być sprawdzona przez
 /// wywołującego przed wejściem tu.
+/// Embedded MLX reranker (jina-rerank-mlx) — liczy score'y IN-PROCESS przez
+/// MLXBridge zamiast forwardu HTTP (spójnie z embedded embeddings/vision). Zwraca
+/// `None` gdy serwis rerank NIE jest embedded (caller idzie ścieżką HTTP).
+#[cfg(feature = "inference-mlx")]
+async fn try_embedded_rerank(
+    router: &Router,
+    model: &str,
+    query: &str,
+    documents: &[String],
+    top_n: Option<u32>,
+    return_documents: bool,
+    user_ctx: Option<crate::auth::acl::UserContext>,
+    context_label: &str,
+) -> Option<std::result::Result<tentaflow_protocol::RerankResult, String>> {
+    let executor = router.executor()?;
+    let mut ctx = crate::services::runtime::context::ExecutionContext::new(user_ctx);
+    let target = executor
+        .resolve_proxy_target(
+            model,
+            crate::services::catalog::ServiceSurface::Rerank,
+            &[crate::services::catalog::InputModality::Text],
+            &mut ctx,
+        )
+        .ok()?;
+    // Tylko embedded local handle idzie in-process; reszta (HTTP/mesh/flow) -> None.
+    match &target {
+        crate::services::runtime::target::ResolvedExecutionTarget::Local {
+            handle: crate::services::handles_cache::BackendHandle::Embedded { .. },
+            ..
+        } => {}
+        _ => return None,
+    }
+    // Model rerankera zaladowany przez embedded deploy (load_embedder_model).
+    let scores = match crate::inference::mlx_swift_bridge::rerank(query, documents).await {
+        Ok(s) => s,
+        Err(e) => return Some(Err(format!("{}: embedded MLX rerank: {}", context_label, e))),
+    };
+    let mut ranked: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let n = top_n
+        .map(|n| n as usize)
+        .unwrap_or(ranked.len())
+        .min(ranked.len());
+    let results = ranked
+        .into_iter()
+        .take(n)
+        .map(|(idx, score)| tentaflow_protocol::RerankResultItem {
+            index: idx,
+            relevance_score: score,
+            document: if return_documents {
+                documents.get(idx).cloned()
+            } else {
+                None
+            },
+        })
+        .collect();
+    Some(Ok(tentaflow_protocol::RerankResult {
+        results,
+        model: model.to_string(),
+    }))
+}
+
+#[cfg(not(feature = "inference-mlx"))]
+async fn try_embedded_rerank(
+    _router: &Router,
+    _model: &str,
+    _query: &str,
+    _documents: &[String],
+    _top_n: Option<u32>,
+    _return_documents: bool,
+    _user_ctx: Option<crate::auth::acl::UserContext>,
+    _context_label: &str,
+) -> Option<std::result::Result<tentaflow_protocol::RerankResult, String>> {
+    None
+}
+
 pub async fn rerank_forward(
     router: &Router,
     model: &str,
@@ -2195,6 +2294,22 @@ pub async fn rerank_forward(
     user_ctx: Option<crate::auth::acl::UserContext>,
     context_label: &str,
 ) -> std::result::Result<tentaflow_protocol::RerankResult, String> {
+    // Embedded MLX reranker liczy in-process; brak (None) -> forward HTTP nizej.
+    if let Some(result) = try_embedded_rerank(
+        router,
+        model,
+        query,
+        documents,
+        top_n,
+        return_documents,
+        user_ctx.clone(),
+        context_label,
+    )
+    .await
+    {
+        return result;
+    }
+
     let base = resolve_local_v1_base_url(
         router,
         model,

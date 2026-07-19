@@ -62,11 +62,12 @@ function setup() {
 function progressFields({
   value = BOUND('v'), max = 100,
   variant = 'default', tone = 'primary',
-  showLabel = true, label = null, size = 'md',
+  showLabel = true, label = null, size = 'md', orientation = null,
 } = {}) {
   const f = [[0, value], [1, max], [2, variant], [3, tone], [4, showLabel]];
   if (label != null) f.push([5, label]);
   f.push([6, size]);
+  if (orientation != null) f.push([7, orientation]);
   return f;
 }
 
@@ -80,6 +81,39 @@ test('ProgressBar renderuje fill na podstawie value/max', () => {
   const fill = el.querySelector('.tf-progress-bar-fill');
   assertEq(fill.style.width, '40%');
   assertEq(el.getAttribute('aria-valuenow'), '40');
+});
+
+test('ProgressBar orientation=vertical wypełnia height, nie width', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({ entries: [{ path: PATH('v'), value: 40 }], state_revision: 0, truncated: false });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(PROGRESS_BAR_TAG, progressFields({ orientation: 'vertical' })));
+  document.body.appendChild(el);
+  assertEq(el.getAttribute('orientation'), 'vertical');
+  const fill = el.querySelector('.tf-progress-bar-fill');
+  assertEq(fill.style.height, '40%');
+  assertEq(fill.style.width, '');
+  assert(el.querySelector('.tf-progress-bar').classList.contains('vertical'));
+});
+
+test('ProgressBar orientation domyślnie horizontal (brak klucza 7)', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({ entries: [{ path: PATH('v'), value: 40 }], state_revision: 0, truncated: false });
+  const engine = makeEngine(store);
+  const el = engine.render(comp(PROGRESS_BAR_TAG, progressFields()));
+  document.body.appendChild(el);
+  assert(el.getAttribute('orientation') == null, 'no orientation attr');
+  const fill = el.querySelector('.tf-progress-bar-fill');
+  assertEq(fill.style.width, '40%');
+  assert(!el.querySelector('.tf-progress-bar').classList.contains('vertical'));
+});
+
+test('ProgressBar odrzuca nieznaną orientację', () => {
+  setup();
+  const engine = makeEngine(makeStore());
+  assertThrows(() => engine.render(comp(PROGRESS_BAR_TAG, progressFields({ orientation: 'diagonal' }))));
 });
 
 test('ProgressBar clampuje value do [0, max]', () => {

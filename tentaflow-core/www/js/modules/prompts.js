@@ -4,7 +4,7 @@
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
-import { byId, escapeHtml, toast, formatDate } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast, formatDate } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 
 let prompts = [];
@@ -43,9 +43,9 @@ function renderTable() {
       <tbody>
         ${prompts.map((p) => `
           <tr>
-            <td>${escapeHtml(p.name)}</td>
-            <td><tf-chip status="accent">${escapeHtml(p.category)}</tf-chip></td>
-            <td>${formatDate(p.updatedAtEpoch)}</td>
+            <td data-label="${escapeAttr(I18n.t('prompts.col_name'))}">${escapeHtml(p.name)}</td>
+            <td data-label="${escapeAttr(I18n.t('prompts.col_category'))}"><tf-chip status="accent">${escapeHtml(p.category)}</tf-chip></td>
+            <td data-label="${escapeAttr(I18n.t('prompts.col_updated'))}">${formatDate(p.updatedAtEpoch)}</td>
             <td><tf-button variant="secondary" size="sm" data-detail="${escapeHtml(p.id)}">${escapeHtml(I18n.t('prompts.view'))}</tf-button></td>
           </tr>`).join('')}
       </tbody>

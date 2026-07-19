@@ -9,6 +9,7 @@ build = "build.rs"
 camera = ["tentaflow-core/camera"]
 rdma-probe = ["tentaflow-core/rdma-probe"]
 gpu-cuda = ["tentaflow-core/gpu-cuda"]
+vision-cuda = ["tentaflow-core/vision-cuda"]
 gpu-vulkan = ["tentaflow-core/gpu-vulkan"]
 gpu-rocm = ["tentaflow-core/gpu-rocm"]
 gpu-metal = ["tentaflow-core/gpu-metal"]

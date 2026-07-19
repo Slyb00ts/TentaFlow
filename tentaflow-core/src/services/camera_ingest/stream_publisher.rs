@@ -81,6 +81,17 @@ pub struct Mp4StreamPublisher {
     pending_init: Mutex<Vec<u8>>,
     media_buf: Mutex<Vec<u8>>,
     first_chunk_seen: AtomicBool,
+    /// PTS (media-timeline, ns) PIERWSZEGO buforu wchodzacego do mp4mux w Branch
+    /// B. Bo Branch A i B dziela ten sam `tee` przed dekodem/muxem, jest to ta
+    /// sama oś czasu co PTS detekcji — klient dodaje ja do init-segmentu MSE, by
+    /// odjac offset osi mediów i zakotwiczyc overlay na wlasciwej klatce.
+    base_pts_ns: Mutex<Option<u64>>,
+    /// `true` = publisher wariantu PODGLĄDU (transkod 720p/~1,5 Mbit/s pod klucz
+    /// hubu `camera:<id>#preview`), `false` = pełna jakość (passthrough). Sesja
+    /// wybiera po tym budowniczego gałęzi B, a `Drop` kieruje detach do
+    /// właściwego slotu — full i preview to dwie niezależne gałęzie na tym
+    /// samym tee.
+    preview: bool,
 }
 
 impl std::fmt::Debug for Mp4StreamPublisher {
@@ -108,21 +119,53 @@ impl Mp4StreamPublisher {
     /// Construct a fresh publisher. The hub-facing `Arc` is created by the
     /// caller (`Arc::new(Mp4StreamPublisher::new(...))`) so the strong ref
     /// count is well-defined from the start.
-    pub fn new(camera_id: String, cmd_tx: mpsc::Sender<SessionCommand>) -> Self {
+    pub fn new(camera_id: String, cmd_tx: mpsc::Sender<SessionCommand>, preview: bool) -> Self {
         let (chunks_tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             parser_buf: Mutex::new(Vec::with_capacity(64 * 1024)),
             pending_init: Mutex::new(Vec::with_capacity(2048)),
             media_buf: Mutex::new(Vec::with_capacity(64 * 1024)),
-            stream_id: format!("camera:{}", camera_id),
+            stream_id: if preview {
+                format!("camera:{}#preview", camera_id)
+            } else {
+                format!("camera:{}", camera_id)
+            },
             init_segment: Mutex::new(None),
             init_ready: Notify::new(),
             chunks_tx: Mutex::new(Some(chunks_tx)),
             first_chunk_seen: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
+            base_pts_ns: Mutex::new(None),
+            preview,
             cmd_tx,
         }
     }
+
+    /// Czy to publisher wariantu podglądu (720p). Sesja wybiera po tym slot
+    /// gałęzi B i budowniczego pipeline'u.
+    pub fn is_preview(&self) -> bool {
+        self.preview
+    }
+
+    /// Zapisuje bazowy PTS (media-timeline, ns) osi mediów Branch B. Wolane raz,
+    /// z pad-probe na pierwszym buforze mux/h264parse. Kolejne wywolania sa
+    /// ignorowane — baza jest ustalana tylko przez pierwszy bufor.
+    pub fn set_base_pts_ns(&self, pts_ns: u64) {
+        let mut guard = self.base_pts_ns.lock();
+        if guard.is_none() {
+            *guard = Some(pts_ns);
+        }
+    }
+
+    /// Kasuje bazowy PTS. Wolane przy odpieciu/rebuildzie Branch B: po reconnect
+    /// oś PTS mediów resetuje sie wraz z nowym init-segmentem, wiec stara baza
+    /// jest juz nieaktualna. Bez tego overlay rozjezdza sie po reconnectcie, bo
+    /// `set_base_pts_ns` ustawia baze tylko gdy jest pusta. Po skasowaniu pierwszy
+    /// bufor NOWEJ Branch B ustali baze spojna z nowym init-segmentem.
+    pub fn reset_base_pts_ns(&self) {
+        *self.base_pts_ns.lock() = None;
+    }
+
 
     /// Push bytes from the `mp4mux` appsink. The muxer flushes raw fMP4
     /// boxes in arbitrary chunks — a single `GstBuffer` may contain a partial
@@ -284,6 +327,12 @@ impl BinaryStreamSource for Mp4StreamPublisher {
     fn chunk_broadcaster(&self) -> Option<broadcast::Sender<Bytes>> {
         self.chunks_tx.lock().clone()
     }
+
+    /// Bazowy PTS osi mediów Branch B (ns) albo `None`, gdy pierwszy bufor jeszcze
+    /// nie przeszedl przez pad-probe. Klient MSE dolacza to do init-segmentu.
+    fn base_pts_ns(&self) -> Option<u64> {
+        *self.base_pts_ns.lock()
+    }
 }
 
 impl Drop for Mp4StreamPublisher {
@@ -298,7 +347,9 @@ impl Drop for Mp4StreamPublisher {
             stream_id = %self.stream_id,
             "fMP4 publisher dropped, posting DetachMp4Branch"
         );
-        let _ = self.cmd_tx.try_send(SessionCommand::DetachMp4Branch);
+        let _ = self.cmd_tx.try_send(SessionCommand::DetachMp4Branch {
+            preview: self.preview,
+        });
     }
 }
 
@@ -309,7 +360,7 @@ mod tests {
 
     fn make_publisher() -> (Arc<Mp4StreamPublisher>, mpsc::Receiver<SessionCommand>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
-        let pub_ = Arc::new(Mp4StreamPublisher::new("cam_test".into(), cmd_tx));
+        let pub_ = Arc::new(Mp4StreamPublisher::new("cam_test".into(), cmd_tx, false));
         (pub_, cmd_rx)
     }
 
@@ -429,7 +480,7 @@ mod tests {
         assert!(cmd_rx.try_recv().is_err());
         drop(pub_);
         let cmd = cmd_rx.recv().await.expect("detach command on drop");
-        assert!(matches!(cmd, SessionCommand::DetachMp4Branch));
+        assert!(matches!(cmd, SessionCommand::DetachMp4Branch { preview: false }));
     }
 
     #[tokio::test]

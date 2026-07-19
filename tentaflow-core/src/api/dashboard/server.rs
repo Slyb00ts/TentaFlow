@@ -325,15 +325,57 @@ fn make_static_response_with_origin(
     content_type: &str,
     body: Vec<u8>,
     origin: Option<&str>,
+    etag: &str,
+    if_none_match: Option<&str>,
 ) -> Response<DashboardBody> {
+    // Tylko sw.js + jego importScripts (sw-version.js) sa no-store — to one
+    // napedzaja wykrywanie update'u SW i musza byc zawsze swieze. Reszta (w tym
+    // wasm glue /js/protocol/) idzie przez ETag+rewalidacje: gdy tresc niezmieniona
+    // browser dostaje 304 (bez ponownego pobrania MB), a zmiana wasm daje nowy
+    // ETag i swieze bajty — schema-handshake i tak jest siatka bezpieczenstwa.
+    let no_store = path == "/sw.js" || path == "/js/generated/sw-version.js";
+
+    // Warunkowy GET: dla zasobow z etagiem (poza no-store) ustawiamy ETag +
+    // Cache-Control:no-cache. Browser rewaliduje kazdy load (If-None-Match);
+    // gdy tresc niezmieniona -> 304 bez body. Caching dziala ZAWSZE, niezaleznie
+    // od service workera i zaufania do certa.
+    let cacheable = status == 200 && !no_store && !etag.is_empty();
+    let quoted = format!("\"{}\"", etag);
+    if cacheable {
+        if let Some(inm) = if_none_match {
+            // RFC 7232 §3.2: `*` pasuje do kazdej reprezentacji; inaczej lista
+            // etagow rozdzielona przecinkami, weak comparison (ignorujemy prefiks
+            // `W/` i cudzyslowy — nasze etagi sa silne, ale proxy moze oslabic).
+            let matches = inm.trim() == "*"
+                || inm.split(',').map(|s| s.trim()).any(|s| {
+                    let s = s.strip_prefix("W/").unwrap_or(s);
+                    s.trim_matches('"') == etag
+                });
+            if matches {
+                let mut b = Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header("ETag", &quoted)
+                    .header("Cache-Control", "no-cache");
+                if let Some(o) = origin {
+                    b = b.header("Access-Control-Allow-Origin", o);
+                }
+                return b.body(Either::Left(Full::new(Bytes::new()))).unwrap();
+            }
+        }
+    }
+
     let mut builder = Response::builder()
         .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
         .header("Content-Type", content_type);
 
-    if path == "/sw.js" || path.starts_with("/js/protocol/") {
+    if no_store {
         builder = builder
             .header("Cache-Control", "no-store")
             .header("Pragma", "no-cache");
+    } else if cacheable {
+        builder = builder
+            .header("ETag", &quoted)
+            .header("Cache-Control", "no-cache");
     }
 
     if let Some(o) = origin {
@@ -639,6 +681,92 @@ fn check_signed_url_rate_limit(
             retry_after_secs,
             true,
         )),
+    }
+}
+
+/// Bearer token for the `/models/*` endpoints, extracted before the request
+/// is dropped (the streaming body handler must not hold `req`).
+fn models_bearer_token(headers: &hyper::HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Resolved `/models/*` credential: parsed signed query OR an active API-key
+/// uid (owned — the caller borrows it into `BundleAuth`).
+enum ModelsAuth {
+    Signed(crate::api::frames::FrameQuery),
+    ApiKey(String),
+}
+
+/// Shared auth resolution for both `/models/*` endpoints. A Bearer header
+/// wins over query params; without one the signed query is parsed as before.
+/// Bearer failures are audited here (they never reach a handler) and mapped
+/// to /v1-style JSON errors; a valid key is additionally run through the same
+/// per-key token bucket as `/v1`.
+fn resolve_models_auth(
+    db: &DbPool,
+    settings_cipher: &crate::crypto::SettingsCipher,
+    bearer_token: Option<String>,
+    query_string: &str,
+    audit_ref: &str,
+    ctx: crate::api::model_bundle::RequestContext<'_>,
+) -> std::result::Result<ModelsAuth, Response<DashboardBody>> {
+    use crate::api::model_bundle::{audit_api_key_rejected, resolve_bearer_api_key, BearerAuthResult};
+    let json_error = |status: StatusCode, body: &'static str| {
+        Response::builder()
+            .status(status)
+            .header("Content-Type", "application/json")
+            .body(Either::Left(Full::new(Bytes::from_static(body.as_bytes()))))
+            .unwrap()
+    };
+    let Some(token) = bearer_token else {
+        return match crate::api::frames::parse_query(query_string) {
+            Ok(q) => Ok(ModelsAuth::Signed(q)),
+            Err(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                Err(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap())
+            }
+        };
+    };
+    match resolve_bearer_api_key(db, settings_cipher, &token) {
+        BearerAuthResult::Ok(key) => {
+            if let Some(retry) =
+                crate::api::rate_limit::per_key_rate_limiter().check(&key.uid, key.rate_limit_rps)
+            {
+                let retry_secs = retry.ceil().max(1.0) as u64;
+                return Err(Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("Content-Type", "application/json")
+                    .header("Retry-After", retry_secs.to_string())
+                    .body(Either::Left(Full::new(Bytes::from_static(
+                        b"{\"error\":\"rate_limit_exceeded\"}",
+                    ))))
+                    .unwrap());
+            }
+            Ok(ModelsAuth::ApiKey(key.uid))
+        }
+        BearerAuthResult::Invalid => {
+            audit_api_key_rejected(db, audit_ref, ctx, "invalid_api_key");
+            Err(json_error(
+                StatusCode::UNAUTHORIZED,
+                "{\"error\":\"invalid_api_key\"}",
+            ))
+        }
+        BearerAuthResult::Unavailable => {
+            audit_api_key_rejected(db, audit_ref, ctx, "api_key_verification_unavailable");
+            Err(json_error(
+                StatusCode::UNAUTHORIZED,
+                "{\"error\":\"api_key_verification_unavailable\"}",
+            ))
+        }
     }
 }
 
@@ -1463,6 +1591,175 @@ pub async fn handle_request(
         }
     }
 
+    // GET /models/manifest/<bundle_ref> — vision model-bundle manifest for
+    // instance-to-instance distribution. Auth: signed query (?token=&exp=&ref=,
+    // same shape as /recordings) OR `Authorization: Bearer <api-key>` with an
+    // explicit ('model_bundle', <bundle_ref>) allow scope. Per-file URLs inside
+    // the manifest mirror the auth mode (signed vs token-less + Bearer).
+    if method == Method::GET
+        && path.starts_with("/models/manifest/")
+        && path.len() > "/models/manifest/".len()
+    {
+        use crate::api::model_bundle::{handle_manifest, BundleAuth, ManifestOutcome, RequestContext};
+        if let Err(resp) = reject_unauth_get_body(req.headers()) {
+            return Ok(resp);
+        }
+        if let Err(resp) =
+            check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/models")
+        {
+            return Ok(resp);
+        }
+        let bearer_token = models_bearer_token(req.headers());
+        drop(req);
+        let bundle_ref = path.strip_prefix("/models/manifest/").unwrap_or("");
+        let ctx = RequestContext {
+            source_ip: Some(client_ip.as_str()),
+            user_agent: user_agent.as_deref(),
+        };
+        let (query_storage, key_storage);
+        let auth = match resolve_models_auth(
+            &db,
+            &settings_cipher,
+            bearer_token,
+            &query_string,
+            bundle_ref,
+            ctx,
+        ) {
+            Ok(ModelsAuth::Signed(q)) => {
+                query_storage = q;
+                BundleAuth::Signed(&query_storage)
+            }
+            Ok(ModelsAuth::ApiKey(uid)) => {
+                key_storage = uid;
+                BundleAuth::ApiKey { key_uid: &key_storage }
+            }
+            Err(resp) => return Ok(resp),
+        };
+        let issuer = crate::services::model_bundle_url_issuer();
+        let outcome = handle_manifest(bundle_ref, &auth, issuer, &db, ctx).await;
+        let status = outcome.http_status();
+        return match outcome {
+            ManifestOutcome::Ok { body } => Ok(apply_signed_url_security_headers(
+                Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json"),
+            )
+            .body(Either::Left(Full::new(Bytes::from(body))))
+            .unwrap()),
+            ManifestOutcome::BadRequest(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                Ok(Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap())
+            }
+            ManifestOutcome::Denied(_)
+            | ManifestOutcome::Forbidden(_)
+            | ManifestOutcome::NotFound
+            | ManifestOutcome::InternalError(_) => Ok(Response::builder()
+                .status(status)
+                .header("Content-Type", "application/json")
+                .body(Either::Left(Full::new(Bytes::from_static(
+                    b"{\"error\":\"model_bundle_denied\"}",
+                ))))
+                .unwrap()),
+        };
+    }
+
+    // GET /models/file/<bundle_ref>/<name> — per-file download. Signed query
+    // derived from a manifest token OR the same Bearer API key that fetched
+    // the manifest. Bodies stream in chunks (weights reach ~126 MB) through
+    // the same StreamBody slot SSE uses.
+    if method == Method::GET && path.starts_with("/models/file/") && path.len() > "/models/file/".len()
+    {
+        use crate::api::model_bundle::{
+            file_stream, handle_file, BundleAuth, FileOutcome, RequestContext,
+        };
+        if let Err(resp) = reject_unauth_get_body(req.headers()) {
+            return Ok(resp);
+        }
+        if let Err(resp) =
+            check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/models")
+        {
+            return Ok(resp);
+        }
+        let bearer_token = models_bearer_token(req.headers());
+        drop(req);
+        let rest = path.strip_prefix("/models/file/").unwrap_or("");
+        let Some((bundle_ref, name)) = rest.split_once('/').filter(|(b, n)| !b.is_empty() && !n.is_empty())
+        else {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/json")
+                .body(Either::Left(Full::new(Bytes::from_static(
+                    b"{\"error\":\"invalid_path\"}",
+                ))))
+                .unwrap());
+        };
+        let ctx = RequestContext {
+            source_ip: Some(client_ip.as_str()),
+            user_agent: user_agent.as_deref(),
+        };
+        let audit_ref = format!("{}/{}", bundle_ref, name);
+        let (query_storage, key_storage);
+        let auth = match resolve_models_auth(
+            &db,
+            &settings_cipher,
+            bearer_token,
+            &query_string,
+            &audit_ref,
+            ctx,
+        ) {
+            Ok(ModelsAuth::Signed(q)) => {
+                query_storage = q;
+                BundleAuth::Signed(&query_storage)
+            }
+            Ok(ModelsAuth::ApiKey(uid)) => {
+                key_storage = uid;
+                BundleAuth::ApiKey { key_uid: &key_storage }
+            }
+            Err(resp) => return Ok(resp),
+        };
+        let issuer = crate::services::model_bundle_url_issuer();
+        let outcome = handle_file(bundle_ref, name, &auth, issuer, &db, ctx).await;
+        let status = outcome.http_status();
+        return match outcome {
+            FileOutcome::Ok { file, size } => {
+                // Handle was opened + fstat'ed during authorization (O_NOFOLLOW)
+                // — stream that same handle, never re-open by path.
+                let stream: SseStream = Box::pin(file_stream(file));
+                Ok(apply_signed_url_security_headers(
+                    Response::builder()
+                        .status(status)
+                        .header("Content-Type", "application/octet-stream")
+                        .header("Content-Length", size.to_string()),
+                )
+                .body(Either::Right(StreamBody::new(stream)))
+                .unwrap())
+            }
+            FileOutcome::BadRequest(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                Ok(Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap())
+            }
+            FileOutcome::Denied(_)
+            | FileOutcome::Forbidden(_)
+            | FileOutcome::NotFound
+            | FileOutcome::PathTraversal
+            | FileOutcome::IoError => Ok(Response::builder()
+                .status(status)
+                .header("Content-Type", "application/json")
+                .body(Either::Left(Full::new(Bytes::from_static(
+                    b"{\"error\":\"model_bundle_denied\"}",
+                ))))
+                .unwrap()),
+        };
+    }
+
     // GET /legal/<doc_id>?token=&exp=&org=&nonce= — HMAC-signed download of a
     // RODO/GDPR PDF artifact. HMAC-only auth, same shape as `/recordings`
     // plus `org` + `nonce` extra fields (the legal binding is per-tenant +
@@ -1553,13 +1850,19 @@ pub async fn handle_request(
 
     // Pliki statyczne - sciezki poza /api/
     if method == Method::GET && !path.starts_with("/api/") {
-        let (status, content_type, body) = static_files::serve(&path);
+        let if_none_match = req
+            .headers()
+            .get("if-none-match")
+            .and_then(|v| v.to_str().ok());
+        let (status, content_type, body, etag) = static_files::serve(&path);
         return Ok(make_static_response_with_origin(
             &path,
             status,
             content_type,
             body,
             cors_origin.as_deref(),
+            &etag,
+            if_none_match,
         ));
     }
 

@@ -164,6 +164,16 @@ impl CameraIngestSupervisor {
         // next subscribe call after remove cleanly returns `NotRegistered`
         // instead of racing against a half-dead session.
         StreamHub::global().unregister_factory(&format!("camera:{camera_id}"));
+        StreamHub::global().unregister_factory(&format!("camera:{camera_id}#preview"));
+        // Sprzataj stan trackera tej kamery, by nie zostal martwy stan po jej
+        // usunieciu (rejestr trackera jest procesowy, niezalezny od registry).
+        #[cfg(feature = "inference-vision-gpu")]
+        super::tracker::remove(camera_id);
+        // Razem z trackerem sprzataj cache wzbogacania kamery — licznik track_id
+        // startuje po re-dodaniu od 1, wiec stare wpisy (camera, stage, track)
+        // przypisalyby nowym trackom stan/tekst poprzedniej sesji.
+        #[cfg(feature = "inference-vision-gpu")]
+        super::vision_analysis::forget_camera(camera_id);
         stop_and_join(handle, Duration::from_secs(10)).await;
         crate::services::streaming_bus()
             .close_camera(camera_id, "removed")
@@ -225,6 +235,7 @@ impl CameraIngestSupervisor {
         let hub = StreamHub::global();
         for h in &handles {
             hub.unregister_factory(&format!("camera:{}", h.id));
+            hub.unregister_factory(&format!("camera:{}#preview", h.id));
             let _ = h.cmd_tx.send(SessionCommand::Stop).await;
         }
         let bus = crate::services::streaming_bus();
@@ -310,42 +321,53 @@ pub async fn start_supervisor() -> Result<CameraIngestSupervisor> {
     Ok(CameraIngestSupervisor::new())
 }
 
-/// Register a fresh `StreamHub` factory under `camera:<id>` that wires every
-/// subscribe call to the running camera session. The factory creates a fresh
-/// `Mp4StreamPublisher`, posts `AttachMp4Branch` to the session in a detached
-/// task (so the factory closure stays synchronous), and yields the publisher
-/// as a `BinaryStreamSource` for the hub to cache. When the hub drops its
-/// last strong reference (final unsubscribe) the publisher's `Drop` impl
-/// posts `DetachMp4Branch` and the session's mux branch is torn down.
+/// Register fresh `StreamHub` factories under `camera:<id>` (full quality)
+/// and `camera:<id>#preview` (transkod 720p/1,5 Mbit/s pod kafelki Live view)
+/// that wire every subscribe call to the running camera session. Each factory
+/// creates a fresh `Mp4StreamPublisher` for its variant, posts
+/// `AttachMp4Branch` to the session in a detached task (so the factory
+/// closure stays synchronous), and yields the publisher as a
+/// `BinaryStreamSource` for the hub to cache. When the hub drops its last
+/// strong reference (final unsubscribe) the publisher's `Drop` impl posts
+/// `DetachMp4Branch { preview }` and the session's mux branch of that
+/// variant is torn down.
 fn register_stream_factory(camera_id: String, cmd_tx: tokio::sync::mpsc::Sender<SessionCommand>) {
-    let stream_id = format!("camera:{}", camera_id);
-    let camera_id_factory = camera_id.clone();
-    let factory = Box::new(move || {
-        let publisher = std::sync::Arc::new(Mp4StreamPublisher::new(
-            camera_id_factory.clone(),
-            cmd_tx.clone(),
-        ));
-        // Detach the attach signal from the synchronous factory call. The
-        // factory closure may run under the hub's read lock — blocking it on
-        // an mpsc::send would deadlock if the session task is itself trying
-        // to grab the hub for an unrelated operation.
-        let cmd_tx_attach = cmd_tx.clone();
-        let pub_for_attach = std::sync::Arc::clone(&publisher);
-        tokio::spawn(async move {
-            if cmd_tx_attach
-                .send(SessionCommand::AttachMp4Branch(pub_for_attach.clone()))
-                .await
-                .is_err()
-            {
-                // Session has stopped before the factory ran — wake any
-                // hub-side waiter immediately so it does not stall the
-                // full 3 s init segment timeout.
-                pub_for_attach.mark_unsupported();
-            }
+    for preview in [false, true] {
+        let stream_id = if preview {
+            format!("camera:{}#preview", camera_id)
+        } else {
+            format!("camera:{}", camera_id)
+        };
+        let camera_id_factory = camera_id.clone();
+        let cmd_tx = cmd_tx.clone();
+        let factory = Box::new(move || {
+            let publisher = std::sync::Arc::new(Mp4StreamPublisher::new(
+                camera_id_factory.clone(),
+                cmd_tx.clone(),
+                preview,
+            ));
+            // Detach the attach signal from the synchronous factory call. The
+            // factory closure may run under the hub's read lock — blocking it on
+            // an mpsc::send would deadlock if the session task is itself trying
+            // to grab the hub for an unrelated operation.
+            let cmd_tx_attach = cmd_tx.clone();
+            let pub_for_attach = std::sync::Arc::clone(&publisher);
+            tokio::spawn(async move {
+                if cmd_tx_attach
+                    .send(SessionCommand::AttachMp4Branch(pub_for_attach.clone()))
+                    .await
+                    .is_err()
+                {
+                    // Session has stopped before the factory ran — wake any
+                    // hub-side waiter immediately so it does not stall the
+                    // full 3 s init segment timeout.
+                    pub_for_attach.mark_unsupported();
+                }
+            });
+            Ok(publisher as std::sync::Arc<dyn crate::services::stream_hub::BinaryStreamSource>)
         });
-        Ok(publisher as std::sync::Arc<dyn crate::services::stream_hub::BinaryStreamSource>)
-    });
-    if let Err(e) = StreamHub::global().register_factory(stream_id.clone(), factory) {
-        tracing::warn!(camera_id = %camera_id, stream_id = %stream_id, "register_stream_factory failed: {e}");
+        if let Err(e) = StreamHub::global().register_factory(stream_id.clone(), factory) {
+            tracing::warn!(camera_id = %camera_id, stream_id = %stream_id, "register_stream_factory failed: {e}");
+        }
     }
 }

@@ -51,6 +51,7 @@ const INPUT_MODES = new Set([
   'none', 'text', 'tel', 'url', 'email', 'numeric', 'decimal', 'search',
 ]);
 const INPUT_SIZES = new Set(['sm', 'md', 'lg']);
+const INPUT_VARIANTS = new Set(['outlined', 'ghost']);
 function requireEnum(v, set, ctx) {
   if (typeof v !== 'string' || !set.has(v)) {
     throw new TypeError(
@@ -175,7 +176,7 @@ function applyAriaLabelFromA11y(el, component, ctx) {
 
 export const INPUT_TAG = 0x0301;
 const INPUT_FIELD_KEYS = new Set([
-  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
 ]);
 
 function renderInput(component, ctx) {
@@ -212,6 +213,10 @@ function renderInput(component, ctx) {
   const size = requireEnum(
     ctx.readField(component.fields, 18), INPUT_SIZES, 'Input.size'
   );
+  const variantRaw = ctx.readField(component.fields, 19);
+  const variant = variantRaw == null
+    ? 'outlined'
+    : requireEnum(variantRaw, INPUT_VARIANTS, 'Input.variant');
 
   const maxLength = maxLengthRaw == null ? null : requireU16(maxLengthRaw, 'Input.max_length');
   const minLength = minLengthRaw == null ? null : requireU16(minLengthRaw, 'Input.min_length');
@@ -229,6 +234,7 @@ function renderInput(component, ctx) {
   const el = document.createElement('tf-input');
   el.classList.add(`tf-input--size-${size}`);
   el.classList.add(`tf-input--type-${type}`);
+  el.classList.add(`tf-input--variant-${variant}`);
   el.setAttribute('type', INPUT_TYPE_TO_HTML[type]);
 
   if (maxLength != null) el.setAttribute('maxlength', String(maxLength));
@@ -363,7 +369,7 @@ function renderInput(component, ctx) {
 
 export const TEXTAREA_TAG = 0x0302;
 const TEXTAREA_FIELD_KEYS = new Set([
-  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
 ]);
 
 function renderTextarea(component, ctx) {
@@ -401,11 +407,16 @@ function renderTextarea(component, ctx) {
   const monospace = requireBool(
     ctx.readField(component.fields, 14), 'Textarea.monospace'
   );
+  const variantRaw = ctx.readField(component.fields, 15);
+  const variant = variantRaw == null
+    ? 'outlined'
+    : requireEnum(variantRaw, INPUT_VARIANTS, 'Textarea.variant');
   const maxLength = maxLengthRaw == null ? null : requireU16(maxLengthRaw, 'Textarea.max_length');
   const minLength = minLengthRaw == null ? null : requireU16(minLengthRaw, 'Textarea.min_length');
 
   const el = document.createElement('tf-textarea');
   el.classList.add(`tf-textarea--size-${size}`);
+  el.classList.add(`tf-textarea--variant-${variant}`);
   if (monospace) el.classList.add('tf-textarea--monospace');
 
   el.setAttribute('rows', String(rows));

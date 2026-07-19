@@ -10,13 +10,15 @@ import { byId, escapeHtml } from '/js/utils.js';
 
 // App tiles. Tiles whose backend handlers are not yet wired carry `soon: true`
 // and render as non-navigable placeholders (kept in sync with app.js USER_NAV).
+// `requiresPowerUser` tiles are rendered only for Power User / Admin — the tile
+// is filtered out before it ever reaches the DOM, mirroring the backend policy.
 const TILES = [
   { id: 'chat',         route: 'chat',         icon: 'chat' },
+  { id: 'ml-studio',    route: 'ml-studio',    icon: 'brain',        requiresPowerUser: true },
   { id: 'images',       route: 'images',       icon: 'image',        soon: true },
-  { id: 'notes',        route: 'notes',        icon: 'mic',          soon: true },
   { id: 'meeting',      route: 'meeting',      icon: 'meeting',      soon: true },
   { id: 'pose',         route: 'pose',         icon: 'image' },
-  { id: 'translate',    route: 'translate',    icon: 'globe',        soon: true },
+  { id: 'translate',    route: 'translate',    icon: 'globe' },
 ];
 
 function sprite(id) {
@@ -110,21 +112,26 @@ const AppsHomeScreen = {
         <h1 id="apps-greeting-h"></h1>
         <div class="hi">${escapeHtml(I18n.t('apps_home.subtitle'))}</div>
       </div>
-      <div class="apps-grid" id="apps-grid">
-        ${TILES.map(renderTile).join('')}
-      </div>`;
+      <div class="apps-grid" id="apps-grid"></div>`;
   },
   async mount() {
-    // Greeting uses the real username from authMeRequest (no stub).
+    // Greeting + role gate use the real authMeRequest (no stub). The role
+    // check matches app.js: power = 'power_user' or 'admin' (admin is a
+    // superset). Built-in tiles render only after the role is known, so a
+    // gated tile never exists in the DOM for a regular user.
+    let me = null;
     try {
-      const me = await ApiBinary.one('authMeRequest');
-      const name = me?.username ?? '';
-      byId('apps-greeting-h').textContent = I18n.t('apps_home.greeting', { name });
-    } catch {
-      byId('apps-greeting-h').textContent = I18n.t('apps_home.greeting', { name: '' });
-    }
+      me = await ApiBinary.one('authMeRequest');
+    } catch {}
+    byId('apps-greeting-h').textContent = I18n.t('apps_home.greeting', { name: me?.username ?? '' });
+    const role = (me?.role ?? 'user').toLowerCase();
+    const isPowerUser = role === 'admin' || role === 'power_user';
 
     const grid = byId('apps-grid');
+    grid.innerHTML = TILES
+      .filter((t) => !t.requiresPowerUser || isPowerUser)
+      .map(renderTile)
+      .join('');
 
     // Dolacz dynamiczne kafelki addon applications. Bledem nie zabijamy
     // calego widoku — kafelki built-in zostaja widoczne.

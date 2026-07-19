@@ -372,10 +372,6 @@ fn wire_and_link_webrtc_branch(
     let queue_b_sink = queue_b
         .static_pad("sink")
         .ok_or_else(|| "queue_b sink pad missing".to_string())?;
-    state
-        .tee_src_pad
-        .link(&queue_b_sink)
-        .map_err(|e| format!("tee → queue_b: {e:?}"))?;
     gst::Element::link_many(state.elements.iter())
         .map_err(|e| format!("link branch B: {e}"))?;
 
@@ -387,6 +383,16 @@ fn wire_and_link_webrtc_branch(
         el.sync_state_with_parent()
             .map_err(|e| format!("sync_state branch B element: {e}"))?;
     }
+
+    // Pad tee linkujemy DOPIERO po aktywacji całej gałęzi. Push tee w okno
+    // między linkiem a aktywacją queue_b zwraca FLUSHING, a tee trwale
+    // oznacza taki pad jako usunięty i nigdy więcej do niego nie pcha —
+    // gałąź wygląda na wpiętą, ale mux nie dostaje ani bajta i init segment
+    // nigdy nie powstaje.
+    state
+        .tee_src_pad
+        .link(&queue_b_sink)
+        .map_err(|e| format!("tee → queue_b: {e:?}"))?;
     Ok(())
 }
 

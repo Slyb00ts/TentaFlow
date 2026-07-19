@@ -66,8 +66,16 @@ mod tests {
             validators: vec![], max_length: Some(120), min_length: None, pattern: None,
             autocomplete: Some(AutocompleteHint::Email), input_mode: Some(InputMode::Email),
             disabled: None, readonly: None, error: None, size: InputSize::Md,
+            variant: Some(super::super::tokens::InputVariant::Ghost),
         };
-        rt(v, |m| m.into_component("i").unwrap(), Input::try_from_component);
+        rt(v.clone(), |m| m.into_component("i").unwrap(), Input::try_from_component);
+
+        // variant is optional: None must be omitted from the wire (old
+        // decoders reject unknown key 19) and absent key 19 decodes to None.
+        let legacy = Input { variant: None, ..v };
+        let c = legacy.clone().into_component("i2").unwrap();
+        assert!(c.fields.0.iter().all(|(k, _)| *k != 19));
+        assert_eq!(Input::try_from_component(&c).unwrap(), legacy);
     }
 
     #[test]
@@ -77,8 +85,14 @@ mod tests {
             validators: vec![], max_length: None, min_length: None,
             disabled: None, readonly: None, error: None,
             size: InputSize::Lg, rows: 5, autoresize: true, max_rows: Some(20), monospace: false,
+            variant: Some(super::super::tokens::InputVariant::Ghost),
         };
-        rt(v, |m| m.into_component("t").unwrap(), Textarea::try_from_component);
+        rt(v.clone(), |m| m.into_component("t").unwrap(), Textarea::try_from_component);
+
+        let legacy = Textarea { variant: None, ..v };
+        let c = legacy.clone().into_component("t2").unwrap();
+        assert!(c.fields.0.iter().all(|(k, _)| *k != 15));
+        assert_eq!(Textarea::try_from_component(&c).unwrap(), legacy);
     }
 
     #[test]

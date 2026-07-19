@@ -346,14 +346,49 @@ test('Badge variant=dot bez tekstu, z sr-only label', () => {
   assertEq(sr.textContent, 'New activity');
 });
 
-test('Badge max=0 throws', () => {
+test('Badge reflects variant + pulse so generic CSS can target dot/pulse', () => {
   setup();
   const engine = makeEngine();
+  const dot = engine.render(comp(BADGE_TAG, [
+    [0, 'dot'], [1, 'success'],
+    [2, { kind: 'literal', value: 'online' }],
+    [5, 99], [6, true],
+  ]));
+  assertEq(dot.getAttribute('variant'), 'dot');
+  assert(dot.hasAttribute('pulse'), 'pulse attribute set when Badge.pulse=true');
+
+  const pill = engine.render(comp(BADGE_TAG, [
+    [0, 'pulse'], [1, 'critical'],
+    [2, { kind: 'literal', value: 'LIVE' }],
+    [5, 99], [6, false],
+  ]));
+  assertEq(pill.getAttribute('variant'), 'pulse');
+  assert(!pill.hasAttribute('pulse'), 'no pulse attribute when Badge.pulse=false');
+});
+
+test('Badge max=0 with a count throws', () => {
+  setup();
+  const engine = makeEngine();
+  // max bounds the count overflow badge, so it is only validated when a count
+  // is present; max=0 alongside a count is invalid.
   assertThrows(() => engine.render(comp(BADGE_TAG, [
     [0, 'solid'], [1, 'primary'],
     [2, { kind: 'literal', value: 'X' }],
-    [5, 0], [6, false],
+    [4, 5], [5, 0], [6, false],
   ])));
+});
+
+test('Badge max=0 without a count is a plain label (no throw)', () => {
+  setup();
+  const engine = makeEngine();
+  // A label/pill badge carries no count; its encoded default max (0) must not
+  // reject the badge.
+  const el = engine.render(comp(BADGE_TAG, [
+    [0, 'solid'], [1, 'primary'],
+    [2, { kind: 'literal', value: 'X' }],
+    [5, 0], [6, false],
+  ]));
+  assert(el != null, 'label badge renders');
 });
 
 // ============================================================================
@@ -374,6 +409,31 @@ test('Chip variant=solid non-interactive renderuje <tf-chip>', () => {
   assert(inner != null);
   assert(inner.classList.contains('accent')); // tone primary → status accent
   assertEq(el.getAttribute('label'), 'tag');
+});
+
+test('Chip dot=success renderuje kropkę tonowaną, tone neutral → status neutral', () => {
+  setup();
+  const engine = makeEngine();
+  const el = engine.render(comp(CHIP_TAG, [
+    [0, 'soft'], [1, 'neutral'],
+    [2, { kind: 'literal', value: 'Nexadata' }],
+    [6, false],
+    [7, 'success'],
+  ]));
+  mount(el);
+  const inner = el.querySelector('.tf-chip');
+  assert(inner.classList.contains('neutral'));
+  const dot = el.querySelector('.tf-chip-dot');
+  assert(dot != null);
+  assert(dot.classList.contains('tf-chip-dot--tone-success'));
+
+  // Unknown dot tone rejected.
+  assertThrows(() => engine.render(comp(CHIP_TAG, [
+    [0, 'soft'], [1, 'neutral'],
+    [2, { kind: 'literal', value: 'x' }],
+    [6, false],
+    [7, 'rainbow'],
+  ], { id: 'c_baddot' })));
 });
 
 test('Chip root jest ZAWSZE <tf-chip>', () => {

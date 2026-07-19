@@ -66,9 +66,9 @@
 }
 
 .scheduler-selected-action {
-  display: grid;
-  grid-template-columns: auto minmax(120px, auto) minmax(0, 1fr);
-  gap: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
   align-items: center;
   padding: 10px 12px;
   border: 1px solid var(--border);
@@ -79,6 +79,15 @@
 
 .scheduler-selected-action strong {
   color: var(--text-1);
+}
+
+/* Description sits on its own full-width line — in the narrow config column a
+   shared grid row squeezed it to one word per line. */
+.scheduler-selected-action > span:last-child {
+  flex: 1 1 100%;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.4;
 }
 
 .scheduler-form-grid {
@@ -125,7 +134,4 @@
     grid-template-columns: 1fr;
   }
 
-  .scheduler-selected-action {
-    grid-template-columns: 1fr;
-  }
 }

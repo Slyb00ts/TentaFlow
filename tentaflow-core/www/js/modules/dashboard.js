@@ -60,7 +60,7 @@ const DashboardScreen = {
         </div>
       </div>
 
-      <div class="stat-grid">
+      <div class="stat-grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));">
         <div class="stat-card" id="stat-models">
           <div class="indicator"></div>
           <div class="label">${escapeHtml(I18n.t('home.stat_models'))}</div>
@@ -84,7 +84,7 @@ const DashboardScreen = {
       <div class="mesh-section-title">${sprite('dashboard')} ${escapeHtml(I18n.t('home.section_metrics'))}
         <span class="section-count" id="metrics-rtt">— ms RTT</span>
       </div>
-      <div class="stat-grid" style="grid-template-columns: repeat(4, 1fr);">
+      <div class="stat-grid" style="grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));">
         <div class="stat-card">
           <div class="label">${escapeHtml(I18n.t('home.metric_tps'))}</div>
           <div class="value" id="m-tps">0</div>
@@ -107,7 +107,7 @@ const DashboardScreen = {
         </div>
       </div>
 
-      <div class="stat-grid" style="grid-template-columns: repeat(3, 1fr); margin-top: 12px;">
+      <div class="stat-grid" style="grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-top: 12px;">
         <div class="stat-card">
           <div class="label">${escapeHtml(I18n.t('home.metric_cpu'))}</div>
           <div class="value" id="m-cpu">0%</div>
@@ -125,7 +125,7 @@ const DashboardScreen = {
         </div>
       </div>
 
-      <div style="display: grid; grid-template-columns: 1.6fr 1fr; gap: 16px; margin-top: 24px;">
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-top: 24px;">
         <div>
           <div class="mesh-section-title">${sprite('audit')} ${escapeHtml(I18n.t('home.section_recent_events'))} <span class="section-count" id="events-count">0</span></div>
           <div class="card" style="padding: 0;">
@@ -203,7 +203,7 @@ async function refresh() {
   try {
     const [metrics, nodes, services, flows, models] = await Promise.allSettled([
       ApiBinary.one('dashboardMetricsRequest'),
-      ApiBinary.list('nodeListRequest'),
+      ApiBinary.list('meshNodeListRequest'),
       ApiBinary.list('serviceListRequest'),
       ApiBinary.list('flowListRequest'),
       ApiBinary.list('modelListRequest'),

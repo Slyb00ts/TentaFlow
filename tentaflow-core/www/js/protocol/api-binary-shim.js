@@ -35,6 +35,7 @@ function buildClient() {
     onReconnectAttempt: (info) => emit({ type: 'reconnect-attempt', info }),
     onClose: (info) => emit({ type: 'close', info }),
     onProtocolError: (err) => emit({ type: 'protocol-error', err }),
+    onUpdateAvailable: (info) => emit({ type: 'update-available', info }),
   });
 }
 

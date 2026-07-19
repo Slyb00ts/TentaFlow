@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- ===== File: Translator.csproj — Translator addon compiled to wasm32-wasip1 ===== -->
+  <!-- Built with NativeAOT-LLVM (dotnet-experimental feed) as a WASI reactor
+       module. Requires WASI_SDK_PATH; the target triple / linker flavor
+       overrides live in Directory.Build.rsp (command-line properties win over
+       the SDK targets). Publish: dotnet publish -c Release -r wasi-wasm. -->
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RuntimeIdentifier>wasi-wasm</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishTrimmed>true</PublishTrimmed>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <NativeLib>shared</NativeLib>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>Translator</AssemblyName>
+    <!-- CA2255: [ModuleInitializer] in a library is the intended registration
+         mechanism for TentaFlow addons (runs during the WASI _initialize). -->
+    <NoWarn>$(NoWarn);CA2255</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.DotNet.ILCompiler.LLVM" Version="10.0.0-rc.1.26355.1" />
+    <PackageReference Include="runtime.linux-x64.Microsoft.DotNet.ILCompiler.LLVM" Version="10.0.0-rc.1.26355.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../../tentaflow-sdk-dotnet/TentaFlow.Sdk/TentaFlow.Sdk.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Export the [UnmanagedCallersOnly] entry points of the SDK (alloc,
+         dealloc, tentaflow_*) from the final wasm module. -->
+    <UnmanagedEntryPointsAssembly Include="TentaFlow.Sdk" />
+    <!-- Root the addon assembly so its [ModuleInitializer] (which registers
+         the AddonBase implementation) survives trimming and runs during
+         _initialize. -->
+    <TrimmerRootAssembly Include="Translator" />
+  </ItemGroup>
+
+</Project>

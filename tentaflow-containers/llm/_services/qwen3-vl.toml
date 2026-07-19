@@ -7,6 +7,7 @@
 
 [engine]
 id = "qwen3-vl"
+backend = "vllm"  # served by vLLM — drives gpu_memory_utilization + VRAM calculator
 category = "llm"
 name = "Qwen3-VL"
 description_pl = "Model wizualno-jezykowy Qwen3-VL (tekst i obraz) serwowany przez vLLM. Zamiennik VLM dla GPU AMD/CPU. Wybierz wariant w kreatorze."

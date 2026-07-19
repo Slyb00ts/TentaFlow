@@ -2,10 +2,12 @@
 // File: protocol/ui/specialized/media.rs — VideoStream/LiveCameraTile/Audio (catalog §8)
 // =============================================================================
 
-use super::super::bind::BindRef;
+use super::super::bind::{BindRef, StatePath};
 use super::super::component::{Component, FieldMap};
 use super::super::inline::AspectRatio;
-use super::super::tokens::{AudioControls, AudioVariant, ImageFit, VideoControls};
+use super::super::tokens::{
+    AudioCaptureMode, AudioCaptureVariant, AudioControls, AudioVariant, ImageFit, VideoControls,
+};
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
@@ -191,6 +193,98 @@ impl Audio {
             autoplay: autoplay.ok_or_else(|| missing_field("Audio", "autoplay"))?,
             r#loop: r#loop.ok_or_else(|| missing_field("Audio", "loop"))?,
             variant: variant.ok_or_else(|| missing_field("Audio", "variant"))?,
+        })
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 0x0612 — AudioCapture
+// -----------------------------------------------------------------------------
+
+/// Microphone capture control (catalog §8 0x0612). Records the user's voice in
+/// the browser (push-to-talk or VAD end-of-utterance detection), uploads the
+/// finished WAV utterance through the addon document-upload channel and emits
+/// `action_id` with `{doc_ref, mime, sample_rate, duration_ms, size, seq,
+/// language_hint?}` params. `seq` is a monotonic per-mount utterance counter
+/// (deliveries are also serialized renderer-side); addons drop `seq <= last`
+/// to stay immune to reordering. Audio bytes never travel inside the action
+/// event. The host refuses audio uploads for addons without the
+/// `audio.capture` permission, so the component is fail-closed end-to-end.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioCapture {
+    /// Backend action invoked with the utterance reference params.
+    pub action_id: String,
+    /// `push_to_talk` (hold the button) or `vad` (continuous listen with
+    /// silence-based end-of-utterance detection).
+    pub mode: AudioCaptureMode,
+    /// VAD: silence duration ending an utterance. Default 800 ms.
+    pub silence_ms: Option<u16>,
+    /// VAD: minimum speech duration to count as an utterance. Default 200 ms.
+    pub min_speech_ms: Option<u16>,
+    /// Optional ISO-639-1 hint forwarded in the action params (for STT).
+    pub language_hint: Option<String>,
+    /// Optional state path the renderer keeps updated with a `recording` bool
+    /// so other components can react to capture state.
+    pub recording_path: Option<StatePath>,
+    /// Reactive disabled flag.
+    pub disabled: Option<BindRef>,
+    /// VAD only: two-way bound bool controlling the listening state. The addon
+    /// sets it to pause/resume capture programmatically (dock „Pauza"/„Wznów"
+    /// buttons); the renderer writes it back when the user toggles the mic
+    /// button, so the path always reflects whether the mic is armed.
+    pub active_path: Option<StatePath>,
+    /// Layout variant. Default `standalone`.
+    pub variant: Option<AudioCaptureVariant>,
+}
+
+impl AudioCapture {
+    pub const TAG: u16 = 0x0612;
+
+    pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
+        let mut e: Vec<(u8, Value)> = Vec::with_capacity(9);
+        e.push((0, encode_to_value(&self.action_id)?));
+        e.push((1, encode_to_value(&self.mode)?));
+        if let Some(v) = &self.silence_ms { e.push((2, encode_to_value(v)?)); }
+        if let Some(v) = &self.min_speech_ms { e.push((3, encode_to_value(v)?)); }
+        if let Some(v) = &self.language_hint { e.push((4, encode_to_value(v)?)); }
+        if let Some(v) = &self.recording_path { e.push((5, encode_to_value(v)?)); }
+        if let Some(v) = &self.disabled { e.push((6, encode_to_value(v)?)); }
+        if let Some(v) = &self.active_path { e.push((7, encode_to_value(v)?)); }
+        if let Some(v) = &self.variant { e.push((8, encode_to_value(v)?)); }
+        Ok(component(Self::TAG, id, e))
+    }
+
+    pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
+        ensure_tag(c.tag, Self::TAG, "AudioCapture")?;
+        ensure_no_duplicate_keys("AudioCapture", &c.fields.0)?;
+        let mut action_id = None; let mut mode = None; let mut silence_ms = None;
+        let mut min_speech_ms = None; let mut language_hint = None;
+        let mut recording_path = None; let mut disabled = None;
+        let mut active_path = None; let mut variant = None;
+        for (k, v) in &c.fields.0 {
+            match k {
+                0 => action_id = Some(decode_from_value(v)?),
+                1 => mode = Some(decode_from_value(v)?),
+                2 => silence_ms = Some(decode_from_value(v)?),
+                3 => min_speech_ms = Some(decode_from_value(v)?),
+                4 => language_hint = Some(decode_from_value(v)?),
+                5 => recording_path = Some(decode_from_value(v)?),
+                6 => disabled = Some(decode_from_value(v)?),
+                7 => active_path = Some(decode_from_value(v)?),
+                8 => variant = Some(decode_from_value(v)?),
+                other => return Err(unknown_field("AudioCapture", *other)),
+            }
+        }
+        Ok(AudioCapture {
+            action_id: action_id.ok_or_else(|| missing_field("AudioCapture", "action_id"))?,
+            mode: mode.ok_or_else(|| missing_field("AudioCapture", "mode"))?,
+            silence_ms,
+            min_speech_ms,
+            language_hint,
+            recording_path,
+            disabled,
+            active_path,
+            variant,
         })
     }
 }

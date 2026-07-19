@@ -39,9 +39,10 @@ const TONE_MAP = {
 // =============================================================================
 
 export const PROGRESS_BAR_TAG = 0x021D;
-const PROGRESS_BAR_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6]);
+const PROGRESS_BAR_FIELD_KEYS = new Set([0, 1, 2, 3, 4, 5, 6, 7]);
 const PROGRESS_VARIANTS = new Set(['default', 'striped', 'indeterminate']);
 const PROGRESS_SIZES = new Set(['xs', 'sm', 'md', 'lg']);
+const PROGRESS_ORIENTATIONS = new Set(['horizontal', 'vertical']);
 
 function renderProgressBar(component, ctx) {
   assertOnlyKnownFields(component.fields, PROGRESS_BAR_FIELD_KEYS, 'ProgressBar');
@@ -59,11 +60,17 @@ function renderProgressBar(component, ctx) {
   const labelBind = ctx.readField(component.fields, 5);
   if (labelBind != null) assertBindRef(labelBind, 'ProgressBar.label');
   const size = requireEnum(ctx.readField(component.fields, 6), PROGRESS_SIZES, 'ProgressBar.size');
+  // Orientation is optional; absent → horizontal (byte-omitted on the wire).
+  const orientationRaw = ctx.readField(component.fields, 7);
+  const orientation = orientationRaw == null
+    ? 'horizontal'
+    : requireEnum(orientationRaw, PROGRESS_ORIENTATIONS, 'ProgressBar.orientation');
 
   // Create <tf-progress-bar> web component
   const el = document.createElement('tf-progress-bar');
   el.setAttribute('tone', TONE_MAP[tone] || 'accent');
   el.setAttribute('size', size);
+  if (orientation === 'vertical') el.setAttribute('orientation', 'vertical');
 
   // Apply variant CSS class for striped/indeterminate
   if (variant === 'striped') el.classList.add('tf-progress-bar--variant-striped');

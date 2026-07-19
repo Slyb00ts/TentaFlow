@@ -6,7 +6,7 @@
 use super::super::bind::{BindRef, StatePath};
 use super::super::component::{Component, FieldMap};
 use super::super::inline::IconRef;
-use super::super::tokens::{AutocompleteHint, InputMode, InputSize, InputType, SearchVariant};
+use super::super::tokens::{AutocompleteHint, InputMode, InputSize, InputType, InputVariant, SearchVariant};
 use super::super::typed_field::{
     decode_from_value, encode_to_value, ensure_no_duplicate_keys, ensure_tag, missing_field,
     unknown_field, IntoComponentError,
@@ -46,13 +46,15 @@ pub struct Input {
     pub readonly: Option<BindRef>,
     pub error: Option<BindRef>,
     pub size: InputSize,
+    /// Visual variant; absent = `outlined` (the classic framed field).
+    pub variant: Option<InputVariant>,
 }
 
 impl Input {
     pub const TAG: u16 = 0x0301;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut e: Vec<(u8, Value)> = Vec::with_capacity(19);
+        let mut e: Vec<(u8, Value)> = Vec::with_capacity(20);
         e.push((0, encode_to_value(&self.r#type)?));
         e.push((1, encode_to_value(&self.bind_path)?));
         if let Some(v) = &self.placeholder { e.push((2, encode_to_value(v)?)); }
@@ -72,6 +74,7 @@ impl Input {
         if let Some(v) = &self.readonly { e.push((16, encode_to_value(v)?)); }
         if let Some(v) = &self.error { e.push((17, encode_to_value(v)?)); }
         e.push((18, encode_to_value(&self.size)?));
+        if let Some(v) = &self.variant { e.push((19, encode_to_value(v)?)); }
         Ok(component(Self::TAG, id, e))
     }
 
@@ -84,6 +87,7 @@ impl Input {
         let mut validators = None; let mut max_length = None; let mut min_length = None;
         let mut pattern = None; let mut autocomplete = None; let mut input_mode = None;
         let mut disabled = None; let mut readonly = None; let mut error = None; let mut size = None;
+        let mut variant = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => r#type = Some(decode_from_value(v)?),
@@ -105,6 +109,7 @@ impl Input {
                 16 => readonly = Some(decode_from_value(v)?),
                 17 => error = Some(decode_from_value(v)?),
                 18 => size = Some(decode_from_value(v)?),
+                19 => variant = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("Input", *other)),
             }
         }
@@ -116,6 +121,7 @@ impl Input {
             max_length, min_length, pattern, autocomplete, input_mode,
             disabled, readonly, error,
             size: size.ok_or_else(|| missing_field("Input", "size"))?,
+            variant,
         })
     }
 }
@@ -142,13 +148,15 @@ pub struct Textarea {
     pub autoresize: bool,
     pub max_rows: Option<u8>,
     pub monospace: bool,
+    /// Visual variant; absent = `outlined` (the classic framed field).
+    pub variant: Option<InputVariant>,
 }
 
 impl Textarea {
     pub const TAG: u16 = 0x0302;
 
     pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
-        let mut e: Vec<(u8, Value)> = Vec::with_capacity(15);
+        let mut e: Vec<(u8, Value)> = Vec::with_capacity(16);
         e.push((0, encode_to_value(&self.bind_path)?));
         if let Some(v) = &self.placeholder { e.push((1, encode_to_value(v)?)); }
         if let Some(v) = &self.label { e.push((2, encode_to_value(v)?)); }
@@ -164,6 +172,7 @@ impl Textarea {
         e.push((12, encode_to_value(&self.autoresize)?));
         if let Some(v) = &self.max_rows { e.push((13, encode_to_value(v)?)); }
         e.push((14, encode_to_value(&self.monospace)?));
+        if let Some(v) = &self.variant { e.push((15, encode_to_value(v)?)); }
         Ok(component(Self::TAG, id, e))
     }
 
@@ -175,6 +184,7 @@ impl Textarea {
         let mut min_length = None; let mut disabled = None; let mut readonly = None;
         let mut error = None; let mut size = None; let mut rows = None;
         let mut autoresize = None; let mut max_rows = None; let mut monospace = None;
+        let mut variant = None;
         for (k, v) in &c.fields.0 {
             match k {
                 0 => bind_path = Some(decode_from_value(v)?),
@@ -192,6 +202,7 @@ impl Textarea {
                 12 => autoresize = Some(decode_from_value(v)?),
                 13 => max_rows = Some(decode_from_value(v)?),
                 14 => monospace = Some(decode_from_value(v)?),
+                15 => variant = Some(decode_from_value(v)?),
                 other => return Err(unknown_field("Textarea", *other)),
             }
         }
@@ -206,6 +217,7 @@ impl Textarea {
             autoresize: autoresize.ok_or_else(|| missing_field("Textarea", "autoresize"))?,
             max_rows,
             monospace: monospace.ok_or_else(|| missing_field("Textarea", "monospace"))?,
+            variant,
         })
     }
 }

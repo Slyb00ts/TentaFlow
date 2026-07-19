@@ -281,6 +281,15 @@ impl SessionState {
         Some(&self.open_panels[idx].ownership)
     }
 
+    /// Whether a valid PanelShell was registered for this open panel. Used by
+    /// the cold-start path to detect an addon that opened a panel but produced
+    /// no shell (which would render as a blank panel), so the host can fail the
+    /// open instead of returning success.
+    pub fn is_shell_registered(&self, addon_id: &str, panel_id: &str) -> bool {
+        self.get_panel(addon_id, panel_id)
+            .is_some_and(|o| o.shell_registered)
+    }
+
     /// Czy ta sesja (połączenie) ma OTWARTY jakikolwiek panel danego addona.
     /// Generyczny upload plików z panelu nie zna panel_id w protokole, więc
     /// autoryzacja sprawdza, że połączenie faktycznie ma otwarty panel tego

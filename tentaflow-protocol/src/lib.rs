@@ -15,6 +15,7 @@
 //
 // ============================================================================
 
+pub mod benchmark;
 pub mod camera;
 pub mod cbor;
 pub mod compliance;
@@ -22,6 +23,7 @@ pub mod envelope;
 pub mod legal;
 pub mod mesh;
 pub mod message_body;
+pub mod model_metrics;
 pub mod pii;
 pub mod profiling;
 pub mod stream;
@@ -54,7 +56,7 @@ pub use message_body::{
     AddonAccessDecisionRequest,
     AddonAccessListRequest,
     AddonAccessListResponse,
-    // Addons + Notes + Translate + Users (theme 7 recovery).
+    // Addons + Translate + Users (theme 7 recovery).
     AddonAdminOnlySetRequest,
     AddonAdminOnlySetResponse,
     AddonApplicationInfo,
@@ -69,6 +71,7 @@ pub use message_body::{
     AddonDocumentPayload,
     AddonDocumentUploadChunkRequest,
     AddonDocumentUploadChunkResponse,
+    UPLOAD_SOURCE_AUDIO_CAPTURE,
     AddonInfo,
     AddonInstallRequest,
     AddonInstallResponse,
@@ -388,6 +391,10 @@ pub use message_body::{
     MessageBody,
     MlStudioDatasetProfileRequest,
     MlStudioDatasetProfileResponse,
+    MlStudioDatasetRowsRequest,
+    MlStudioDatasetRowsResponse,
+    MlStudioDatasetRowsSaveRequest,
+    MlStudioDatasetRowsSaveResponse,
     MlStudioDatasetUploadChunkRequest,
     MlStudioDatasetUploadChunkResponse,
     MlStudioDatasetUploadRequest,
@@ -395,6 +402,11 @@ pub use message_body::{
     MlStudioDatasetsListRequest,
     MlStudioDatasetsListResponse,
     MlStudioDistConfig,
+    MlStudioDistillGenerateRequest,
+    MlStudioDistillGenerateResponse,
+    MlStudioDistillGenerateStatusRequest,
+    MlStudioDistillGenerateStatusResponse,
+    MlStudioDistillQaPair,
     MlStudioFtChatRequest,
     MlStudioFtChatResponse,
     MlStudioFtDeployRequest,
@@ -463,6 +475,12 @@ pub use message_body::{
     MlStudioRecogTrainStartResponse,
     MlStudioRecogTrainStatusRequest,
     MlStudioRecogTrainStatusResponse,
+    MlStudioClassifierHyperparams,
+    MlStudioClassifierTrainStartRequest,
+    MlStudioClassifierTrainStartResponse,
+    MlStudioGenericTrainStatusRequest,
+    MlStudioGenericTrainStatusResponse,
+    GenericMetricPoint,
     MlStudioSchemaGetRequest,
     MlStudioSchemaGetResponse,
     MlStudioSchemaSaveRequest,
@@ -488,6 +506,24 @@ pub use message_body::{
     MlStudioTrainingRunSummary,
     MlStudioTrainingRunsListRequest,
     MlStudioTrainingRunsListResponse,
+    MlStudioVisionModelDeleteRequest,
+    MlStudioVisionModelDeleteResponse,
+    MlStudioVisionModelInfo,
+    MlStudioVisionModelPublishRequest,
+    MlStudioVisionModelPublishResponse,
+    MlStudioVisionModelsListRequest,
+    MlStudioVisionModelsListResponse,
+    VisionImportFetchManifestRequest,
+    VisionImportFetchManifestResponse,
+    VisionImportManifestFile,
+    VisionImportManifestModel,
+    VisionImportModelRequest,
+    VisionImportModelResponse,
+    VisionImportPayload,
+    MlStudioJobsOverviewRequest,
+    MlStudioJobsOverviewResponse,
+    TrainingJobInfo,
+    GpuStats,
     ModelAliasCreateRequest,
     ModelAliasCreateResponse,
     ModelAliasDeleteRequest,
@@ -502,6 +538,7 @@ pub use message_body::{
     ModelConsumerRevokeRequest,
     ModelDetail,
     ModelInstallRequest,
+    ModelPricingInput,
     ModelSummary,
     ModelVisibilityEntry,
     ModelVisibilityListResponse,
@@ -515,21 +552,6 @@ pub use message_body::{
     NgcStatusResponse,
     NimCatalogListResponse,
     NimContainerEntry,
-    NoteCreateRequest,
-    NoteCreateResponse,
-    NoteDeleteRequest,
-    NoteDeleteResponse,
-    NoteDetailRequest,
-    NoteDetailResponse,
-    NoteEntry,
-    NoteSetPinnedRequest,
-    NoteSetPinnedResponse,
-    NoteUpdateRequest,
-    NoteUpdateResponse,
-    NotesListRequest,
-    NotesListResponse,
-    NotesRequest,
-    NotesResponse,
     PermissionEntry,
     PiiRule,
     PromptDetail,
@@ -706,6 +728,14 @@ pub use profiling::{
 pub use stream::{
     StreamCloseRequest, StreamClosedPayload, StreamFramePayload, StreamPayload,
     StreamSubscribeRequest, StreamSubscribeResponse,
+};
+pub use model_metrics::{
+    ModelMetricsFilterWire, ModelMetricsPayload, ModelMetricsRowWire, ModelNodeServiceRowWire,
+    ModelPricingWire,
+};
+pub use benchmark::{
+    BenchmarkPayload, BenchmarkSummaryWire, BenchmarkWire, ResultRowWire, RunSummaryWire,
+    TargetInputWire, TargetWire,
 };
 pub use token_usage::{
     TokenLeaseWire, TokenQuotaUpsertWire, TokenQuotaWire, TokenUsagePayload, TokenUsageSummaryWire,

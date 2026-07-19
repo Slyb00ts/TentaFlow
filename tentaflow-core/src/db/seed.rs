@@ -22,6 +22,14 @@ const DEFAULT_ADMIN_ID: &str = "00000000-0000-4000-8000-000000000002";
 /// (UPDATE 0 wierszy -> "target row not found").
 const DEFAULT_CHAT_FLOW_ID: &str = "00000000-0000-4000-8000-000000000010";
 
+/// Kanoniczny JSON domyslnego flow "Default Chat": czysty streaming przelot
+/// `trigger -> llm -> output(stream)`, BEZ pii_filter. To jest flow rozwiazywany
+/// dla kazdego modelu bez wlasnego flow (jak synthetic), wiec nie moze cicho
+/// redagowac tresci — pii_filter jest dostepny tylko gdy user wstawi go SAM.
+/// Wspoldzielony przez seed INSERT i migracje v113, zeby oba emitowaly
+/// bajt-identyczny JSON.
+pub const DEFAULT_CHAT_FLOW_JSON: &str = r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":400,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1","from_port":"text","data_type":"text"},{"from_node":"l1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#;
+
 /// Stale UUID seedowanych flow harnessa (§3.8). Jak Default Chat: id musi byc
 /// identyczne na kazdym node, bo zasob jest seedowany lokalnie a synchronizowany
 /// po `id`. Losowe per-node id rozjechalyby sync i blok `subflow`/`loop`/`agent`
@@ -72,6 +80,15 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
         ("speaker_voice_samples_required", "3"),
         ("speaker_enrollment_min_confidence", "0.7"),
         ("oauth_redirect_base_url", "https://localhost:8090"),
+        // Vision model-bundle pull override: empty = use manifest preset repo;
+        // a plain base URL serves `<base>/<name>`; a TentaFlow signed manifest
+        // URL (contains `/models/manifest/`) pulls via per-file signed URLs.
+        ("vision_bundle_base_url", ""),
+        // Bearer key sent with a token-less `vision_bundle_base_url` manifest
+        // pull (API-key sharing between unpaired instances). Encrypted at rest
+        // (ENCRYPTED_SETTING_KEYS); per-deploy config `vision_bundle_api_key`
+        // from the wizard "Custom" tab wins over this setting.
+        ("vision_bundle_api_key", ""),
     ];
 
     {
@@ -90,6 +107,8 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
     seed_prompts(&tx)?;
     seed_default_flows(&tx)?;
     seed_camera_analysis_flow(&tx)?;
+    seed_camera_cv_aliases(&tx)?;
+    seed_camera_cv_pipeline(&tx)?;
     seed_harness_flows(&tx)?;
     seed_system_agents(&tx)?;
 
@@ -143,8 +162,8 @@ fn seed_user_accounts(conn: &Connection) -> Result<()> {
     if user_count == 0 {
         let password_hash = crypto::hash_password("admin")?;
         conn.execute(
-            "INSERT INTO user_accounts (id, username, password_hash, display_name, is_admin, must_change_password) \
-             VALUES (?1, 'admin', ?2, 'Administrator', 1, 1)",
+            "INSERT INTO user_accounts (id, username, password_hash, display_name, is_admin, role, must_change_password) \
+             VALUES (?1, 'admin', ?2, 'Administrator', 1, 'admin', 1)",
             rusqlite::params![DEFAULT_ADMIN_ID, password_hash],
         )?;
         // Dodaj admina do grupy admins. Po migracji v53 identyfikatory grup i
@@ -1019,21 +1038,26 @@ N'ajoute pas de champs absents du schéma ci-dessus. Ne commente pas. Renvoie un
 
 /// Seeduje domyslne diagramy flow reprezentujace pipeline routera.
 fn seed_default_flows(conn: &Connection) -> Result<()> {
-    // Fresh DB seeduje tylko jeden domyslny flow: "Default Chat" (streaming
-    // chat z filtrem PII, default=1). Reszta pipeline'ow (TTS, Audio Chat,
+    // Fresh DB seeduje tylko jeden domyslny flow: "Default Chat" (czysty
+    // streaming chat, default=1). Reszta pipeline'ow (TTS, Audio Chat,
     // teams-flow, osobny "Standardowy pipeline LLM") nie jest zakladana —
-    // brakujace service_type/modality rozwiazuje synthetic fallback
-    // (synthetic.rs), a uzytkownik buduje wlasne flowy w Flow Builderze.
+    // brakujace service_type/modality wykonuje sie bezposrednio na executorze
+    // (direct execution), a uzytkownik buduje wlasne flowy w Flow Builderze.
     //
-    // Flow seedowany jako STREAMING (LLM -> pii_filter -> output z mode=stream,
-    // edges od LLM dalej z from_port=stream). Bez tego try_dispatch_streaming
-    // wpada na is_streaming=false -> wrap_blocking_as_stream -> single chunk z
-    // całością odpowiedzi (klient widzi calosc po EOF zamiast token-by-token).
+    // Flow seedowany jako STREAMING (LLM -> output z mode=stream, edge od LLM
+    // z from_port=stream). Bez tego try_dispatch_streaming wpada na
+    // is_streaming=false -> wrap_blocking_as_stream -> single chunk z całością
+    // odpowiedzi (klient widzi calosc po EOF zamiast token-by-token).
+    //
+    // BEZ pii_filter: to jest domyslny przelot dla kazdego modelu bez wlasnego
+    // flow (jak synthetic), wiec nie moze cicho redagowac zapytania/kontekstu/
+    // odpowiedzi. pii_filter zostaje dostepnym wezlem — user wstawia go SAM w
+    // Flow Builderze, jesli go chce.
     let flows: &[(&str, &str, &str, &str, i64)] = &[(
         "Default Chat",
-        "Streaming chat pipeline: trigger -> LLM -> pii_filter -> output(stream).",
+        "Streaming chat pipeline: trigger -> LLM -> output(stream).",
         "chat",
-        r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"p1","type":"pii_filter","position":{"x":400,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":600,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1","from_port":"text","data_type":"text"},{"from_node":"l1","to_node":"p1","from_port":"stream"},{"from_node":"p1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#,
+        DEFAULT_CHAT_FLOW_JSON,
         1,
     )];
 
@@ -1131,6 +1155,117 @@ fn seed_camera_analysis_flow(conn: &Connection) -> Result<()> {
     )?;
     if inserted > 0 {
         info!("seed: utworzono domyslny flow analizy kamery '{}'", NAME);
+    }
+    Ok(())
+}
+
+/// Seeduje aliasy modeli CV dla kamer (`tentavision-*`). Cele to identyfikatory
+/// presetow z manifestow `tentaflow-containers/vision/_services/*.toml`
+/// (`models_from_manifest` reklamuje w katalogu `model_preset.id`, bo silniki
+/// sa embedded native, nie cloud external). Flow analizy kamery (patrz
+/// `CAMERA_ANALYSIS_FLOW_JSON`) i executor kamer adresuja modele wylacznie
+/// przez te aliasy, wiec podmiana modelu to edycja aliasu, nie flow.
+/// Idempotentne: `alias` ma UNIQUE, INSERT OR IGNORE nie nadpisuje edycji
+/// uzytkownika. `fallback_targets` to JSON-owa lista (konwencja repository).
+fn seed_camera_cv_aliases(conn: &Connection) -> Result<()> {
+    // (alias, preset docelowy, fallbacki JSON)
+    let aliases: &[(&str, &str, Option<&str>)] = &[
+        ("tentavision-detect", "rfdetr-adr-base", None),
+        ("tentavision-stan", "nalepka-stan-mnv4", None),
+        // OCR: preset tablic rejestracyjnych, z fallbackiem na ogolne OCR
+        // (PP-OCRv5 na Linux/Windows, Apple Vision na macOS).
+        (
+            "tentavision-ocr",
+            "plate-ocr-fast",
+            Some(r#"["ppocrv5-mobile-onnx","apple-vision-ocr"]"#),
+        ),
+        // Uzywany przez wezel `vision_classify` w seedowanym flow analizy
+        // kamery — spojny z domyslnym klasyfikatorem stanu nalepek.
+        ("tentavision-action", "nalepka-stan-mnv4", None),
+    ];
+    let mut stmt = conn.prepare(
+        "INSERT OR IGNORE INTO model_aliases (alias, target_model, fallback_targets) \
+         VALUES (?1, ?2, ?3)",
+    )?;
+    for (alias, target, fallbacks) in aliases {
+        let inserted = stmt.execute(rusqlite::params![alias, target, fallbacks])?;
+        if inserted > 0 {
+            info!("seed: utworzono alias CV '{}' -> '{}'", alias, target);
+        }
+    }
+    // Naprawa wierszy utworzonych przez starszy manifest TentaVision, ktory
+    // rejestrowal aliasy z `suggested_default` wskazujacym model spoza katalogu
+    // (resolver konczy wtedy fatalnym AliasPrimaryMissing). INSERT OR IGNORE
+    // powyzej nie koryguje istniejacych wierszy, wiec UPDATE przepina target —
+    // ale TYLKO gdy rowna sie dokladnie zepsutemu hintowi, zeby nigdy nie
+    // nadpisac modelu podpietego recznie przez admina.
+    let repairs: &[(&str, &str, &str, Option<&str>)] = &[
+        (
+            "tentavision-ocr",
+            "ppocrv5-ocr",
+            "plate-ocr-fast",
+            Some(r#"["ppocrv5-mobile-onnx","apple-vision-ocr"]"#),
+        ),
+        (
+            "tentavision-action",
+            "videomae-v2-rwf2k",
+            "nalepka-stan-mnv4",
+            None,
+        ),
+    ];
+    let mut repair_stmt = conn.prepare(
+        "UPDATE model_aliases SET target_model = ?3, \
+         fallback_targets = COALESCE(fallback_targets, ?4) \
+         WHERE alias = ?1 AND target_model = ?2",
+    )?;
+    for (alias, broken, target, fallbacks) in repairs {
+        let updated = repair_stmt.execute(rusqlite::params![alias, broken, target, fallbacks])?;
+        if updated > 0 {
+            info!(
+                "seed: naprawiono alias CV '{}' -> '{}' (byl '{}')",
+                alias, target, broken
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Fixed UUID of the default camera CV pipeline. Like other seeds: identical
+/// on every node, the resource replicates by `id` (`camera_cv_pipelines` is in
+/// core sync). Cameras without `cv_pipeline_id` resolve to this row.
+pub(crate) const CAMERA_CV_PIPELINE_ID: &str = "00000000-0000-4000-8000-000000000030";
+
+/// Default pipeline JSON — a faithful transcription of the pre-pipeline
+/// hardcoded vision_analysis behavior: detector on the frame (threshold 0.5,
+/// fps omitted = the engine keeps pacing by `cameras.analysis_fps`), state
+/// classification for the placard/plate/thermometer classes, and plate/ADR OCR
+/// (crop padding 15%/10%). A const (not a function literal) so the test can
+/// validate it via `cv_pipeline::validate`.
+const CAMERA_CV_PIPELINE_JSON: &str = r#"{"stages":[{"stage_id":"detect","op":"detect","model":"tentavision-detect","input":{"kind":"frame"},"threshold":0.5},{"stage_id":"stan","op":"classify","model":"tentavision-stan","input":{"kind":"stage","stage_id":"detect","classes":["nalepka*","znak_srodowiskowy","termometr","tablica_adr","tablica_rejestracyjna"]},"output":"stan"},{"stage_id":"ocr_plate","op":"ocr","model":"tentavision-ocr","input":{"kind":"stage","stage_id":"detect","classes":["tablica_rejestracyjna"]},"params":{"ocr_mode":"plate","crop_pad_x":0.15,"crop_pad_y":0.1},"output":"tekst"},{"stage_id":"ocr_adr","op":"ocr","model":"tentavision-ocr","input":{"kind":"stage","stage_id":"detect","classes":["tablica_adr"]},"params":{"ocr_mode":"adr","crop_pad_x":0.15,"crop_pad_y":0.1},"output":"tekst"}]}"#;
+
+/// Seeds the default camera CV pipeline (`is_default=1`) into the default
+/// org — the same single-org convention every other seed follows (all
+/// `org_memberships` land in `org-default`). Idempotent by the fixed `id` —
+/// INSERT only when the row does not exist, so admin edits are never
+/// overwritten (same pattern as `seed_camera_analysis_flow`).
+fn seed_camera_cv_pipeline(conn: &Connection) -> Result<()> {
+    const NAME: &str = "Analiza domyślna (ADR)";
+    let now = chrono::Utc::now().timestamp();
+    let inserted = conn.execute(
+        "INSERT INTO camera_cv_pipelines \
+         (id, name, pipeline_json, is_default, org_id, created_at, updated_at) \
+         SELECT ?1, ?2, ?3, 1, ?4, ?5, ?5 \
+         WHERE NOT EXISTS (SELECT 1 FROM camera_cv_pipelines WHERE id = ?1)",
+        rusqlite::params![
+            CAMERA_CV_PIPELINE_ID,
+            NAME,
+            CAMERA_CV_PIPELINE_JSON,
+            crate::services::org::DEFAULT_ORG_ID,
+            now
+        ],
+    )?;
+    if inserted > 0 {
+        info!("seed: created default camera CV pipeline '{}'", NAME);
     }
     Ok(())
 }
@@ -1366,6 +1501,32 @@ mod tests {
             .expect("camera analysis flow compiles");
     }
 
+    /// The default camera CV pipeline is seeded (is_default=1), passes the
+    /// structural validator AND the alias validation on a fresh DB (the
+    /// `tentavision-*` aliases from `seed_camera_cv_aliases` must cover every
+    /// model the pipeline references).
+    #[test]
+    fn camera_cv_pipeline_seeded_and_validates() {
+        use crate::services::camera_ingest::cv_pipeline;
+
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.read().unwrap();
+        let (is_default, pipeline_json): (bool, String) = conn
+            .query_row(
+                "SELECT is_default, pipeline_json FROM camera_cv_pipelines WHERE id = ?1",
+                rusqlite::params![super::CAMERA_CV_PIPELINE_ID],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("camera cv pipeline seeded");
+        assert!(is_default);
+        assert_eq!(pipeline_json, super::CAMERA_CV_PIPELINE_JSON);
+
+        let parsed: cv_pipeline::CvPipeline =
+            serde_json::from_str(&pipeline_json).expect("seed pipeline parses");
+        cv_pipeline::validate(&parsed).expect("seed pipeline valid");
+        cv_pipeline::validate_aliases(&conn, &parsed).expect("seed pipeline aliases exist");
+    }
+
     /// T1.2 — swieza baza ma dokladnie 5 promptow transcription_summarization
     /// (po jednym na jezyk pl/en/de/es/fr) i zadnych starych promptow.
     #[test]
@@ -1468,8 +1629,8 @@ mod tests {
 
         let (st, def) = assert_dag(
             "Default Chat",
-            &["trigger", "llm", "pii_filter", "output"],
-            3,
+            &["trigger", "llm", "output"],
+            2,
         );
         assert_eq!(st.as_deref(), Some("chat"));
         assert_eq!(def, 1, "Default Chat jest domyslnym flow");

@@ -405,13 +405,22 @@ pub fn api_key_list_request(
 /// one of the supported ACL kinds and `resource_id` must be non-empty, so neither
 /// creation seeding nor scope set/clear can persist a garbage or empty-id rule.
 fn validate_scope_resource(resource_type: &str, resource_id: &str) -> Result<(), ProtocolError> {
-    if !matches!(resource_type, "model" | "flow" | "alias") {
+    if !matches!(resource_type, "model" | "flow" | "alias" | "model_bundle") {
         return Err(ProtocolError::bad_request(
-            "resource_type must be 'model', 'flow' or 'alias'",
+            "resource_type must be 'model', 'flow', 'alias' or 'model_bundle'",
         ));
     }
     if resource_id.is_empty() {
         return Err(ProtocolError::bad_request("resource_id is empty"));
+    }
+    // model_bundle scopes gate the /models/* endpoints — only refs the bundle
+    // endpoints can actually serve are storable.
+    if resource_type == "model_bundle"
+        && !crate::api::model_bundle::validate_bundle_ref(resource_id)
+    {
+        return Err(ProtocolError::bad_request(
+            "resource_id is not a shareable model bundle",
+        ));
     }
     Ok(())
 }
@@ -948,7 +957,10 @@ pub fn model_install(
 #[handler(variant = "ModelDeleteRequest", since = (1, 0))]
 #[policy(Admin)]
 #[observed]
-pub fn model_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+pub async fn model_delete(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
     let model_id = match req {
         MessageBody::ModelDeleteRequest { model_id } => model_id,
         _ => return Err(ProtocolError::bad_request("expected ModelDeleteRequest")),
@@ -970,16 +982,34 @@ pub fn model_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         (row.service_id, row.engine_id)
     };
 
-    let _ = engine_id; // mesh dereg now driven by supervisor + services_repo delete
-
+    // Stop the runtime BEFORE dropping the row — same contract as service_delete.
+    // Without this the process/container is orphaned with no DB trace (the model
+    // list's delete must clean up exactly like the service list's).
+    if let (Ok(svc), Some(port_allocator)) =
+        (fetch_service_row(ctx, service_id), ctx.state.port_allocator.clone())
     {
+        let _ = crate::services::deploy::stop(&svc, port_allocator).await;
+    }
+
+    // Delete the row and read sibling ports under the SAME guard, in a sync block
+    // so the DB guard drops before the await below (the future must stay `Send`).
+    let keep_ports: Vec<u16> = {
         let conn = ctx
             .state
             .db
             .write()
             .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
         crate::services_repo::services::delete(&conn, service_id).map_err(db_err)?;
-    }
+        crate::services_repo::services::list_all(&conn)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.engine_id == engine_id)
+            .filter_map(|r| r.runtime_port)
+            .collect()
+    };
+
+    // Belt-and-suspenders sweep for port-drift / stale-pid orphans of this engine.
+    crate::services::deploy::stop_engine_orphans(&engine_id, &keep_ports).await;
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
@@ -1074,6 +1104,7 @@ pub fn flow_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
             updated_at_epoch: parse_ts(&f.updated_at),
             enabled: f.status == "active",
             is_default: f.is_default,
+            published_model_name: f.published_model_name,
         })
         .collect();
     Ok(MessageBody::FlowListResponse { flows: summaries })
@@ -4866,8 +4897,15 @@ pub async fn deploy_vllm_recommend(
     // twardo wymaga fp8 kv-cache (vLLM asertuje "FlashMLA fp8 layout only
     // supports fp8 kv-cache" i ubija engine przy `auto`). Gdy user sam nie
     // wybrał dtype, domyślamy fp8 dla tej rodziny — inaczej każdy deploy V4 pada.
+    // NVFP4: waga w fp4, ale kv-cache w fp8 to sprawdzony sweet-spot (recepty
+    // recipes.vllm.ai dla nvfp4 ustawiaja tak samo). Ustawiamy fp8 jako
+    // strukturalny default, gdy user sam nie wybral — inaczej GUI pokazywalo
+    // "auto" (fp16 kv) niespojnie z recepta, ktora fp8 dorzucala tylko do
+    // surowej komendy.
     let kv_dtype = payload.kv_cache_dtype.clone().unwrap_or_else(|| {
-        if spec.model_type.eq_ignore_ascii_case("deepseek_v4") {
+        let quant = spec.quantization.as_deref().unwrap_or("").to_lowercase();
+        let is_nvfp4 = quant.contains("nvfp4") || quant.contains("fp4");
+        if spec.model_type.eq_ignore_ascii_case("deepseek_v4") || is_nvfp4 {
             "fp8".to_string()
         } else {
             "auto".to_string()
@@ -4979,6 +5017,48 @@ pub async fn deploy_vllm_recommend(
                     recommended_env = renv;
                     recipe_applied = Some(entry.hf_id.clone());
                 }
+            }
+            // Rodzina gemma-4 w NVFP4: vLLM potrzebuje jawnych flag tool-callingu
+            // + self-speculative chat template. Upstream recipe albo je gubi
+            // (chat-template `examples/*.jinja` jest dropowany przez build_args, bo
+            // szablon zyje w zrodlach vLLM), albo modelu w ogole nie ma w bazie
+            // recept (RedHatAI 12B). Wymuszamy spojnie dla calej rodziny — dziala
+            // tez dla recznego deployu gemma-4 nvfp4, nie tylko z prekonfigurowanego
+            // kafelka. Speculative draft dostarcza osobno preset (`speculator_repo`).
+            let model_lc = payload.model.to_lowercase();
+            let quant_lc = spec.quantization.as_deref().unwrap_or("").to_lowercase();
+            if model_lc.contains("gemma-4")
+                && (quant_lc.contains("nvfp4") || quant_lc.contains("fp4"))
+            {
+                // NIE wymuszamy `--chat-template examples/tool_chat_template_gemma4.jinja`:
+                // pip-owy vLLM (docker i native python-bundle) nie niesie katalogu
+                // `examples/`, wiec vLLM padal z "chat template ... doesn't exist".
+                // Tool-calling gemma-4 dziala z szablonem wbudowanym w tokenizer;
+                // parser + auto-tool-choice wystarczaja. Kto chce override szablonu,
+                // podaje absolutna sciezke recznie w extra-args.
+                let mut toks: Vec<String> = base.split_whitespace().map(String::from).collect();
+                toks.push("--max-model-len".into());
+                toks.push("auto".into());
+                toks.push("--enable-auto-tool-choice".into());
+                toks.push("--tool-call-parser".into());
+                toks.push("gemma4".into());
+                toks = crate::deploy::python_venv::dedup_cli_args_last_wins(toks);
+                base = toks.join(" ");
+            }
+            // DeepSeek V4 (Flash/Pro, w tym warianty -DSpark): MoE + DSA long-context.
+            // `--block-size 256` pod efektywny KV przy kontekstach do 1M (recepta
+            // vLLM V4). fp8 kv-cache i --enable-expert-parallel dokladane sa juz
+            // wyzej (model_type deepseek_v4 + MoE na multi-GPU); DSpark self-speculative
+            // wnosi preset (`speculator_method="dspark"`). `--data-parallel-size` i
+            // fp4-indexer-cache sa hardware-specyficzne (liczba B200) → recepta/extra-args.
+            if spec.model_type.eq_ignore_ascii_case("deepseek_v4")
+                || model_lc.contains("deepseek-v4")
+            {
+                let mut toks: Vec<String> = base.split_whitespace().map(String::from).collect();
+                toks.push("--block-size".into());
+                toks.push("256".into());
+                toks = crate::deploy::python_venv::dedup_cli_args_last_wins(toks);
+                base = toks.join(" ");
             }
             base
         }
@@ -9077,6 +9157,10 @@ pub fn service_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
     let rows = crate::services_repo::services::list_all(&conn).map_err(db_err)?;
     let local_node_id = ctx.state.local_node_id.as_ref();
 
+    // Klaster (distributed TP) jest reprezentowany WPROST przez per-node wiersze
+    // czlonkow (head + workery), po jednym na nodzie — jak kazdy inny serwis,
+    // tyle ze na wielu nodach. Nie ma osobnej „wizytowki" ani ukrywania czlonkow.
+
     // Local rows first.
     let mut services = Vec::with_capacity(rows.len());
     for svc in rows {
@@ -9095,8 +9179,7 @@ pub fn service_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
     drop(conn);
 
     // Then merge in every peer's snapshot (krok N3b — single-flat list, GUI
-    // groups by `service.node_id`). Same filter semantics applied client-side
-    // here so the wire response stays consistent across local and remote rows.
+    // groups by `service.node_id`).
     for (_node_id, snapshot) in ctx.state.mesh_services_registry.all_remote() {
         for svc in snapshot {
             if let Some(filter) = payload.engine_id_filter.as_deref() {
@@ -9256,6 +9339,21 @@ pub async fn service_delete(
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
 
     let svc = fetch_service_row(ctx, payload.service_id)?;
+    // Czlonek AKTYWNEGO klastra TP: usuniecie workera/heada z listy serwisow
+    // zabija rank calego distributed-deploymentu (serwujacego czesto na INNYM
+    // nodzie). Legalna sciezka = stop deploymentu klastra, ktory kasuje wiersze
+    // czlonkow sam w teardownie. Osierocony wiersz (deployment martwy) przechodzi.
+    if crate::services::deploy::distributed::service_is_distributed_member(&svc.config_json)
+        && crate::services::deploy::distributed::distributed_member_deployment_active(
+            &ctx.state.db,
+            &svc.config_json,
+        )
+        .await
+    {
+        return Err(ProtocolError::bad_request(
+            "serwis jest czlonkiem AKTYWNEGO deploymentu klastra — zatrzymaj deployment klastra zamiast kasowac pojedynczy wiersz",
+        ));
+    }
     let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
         ProtocolError::internal("port allocator not initialized (supervisor disabled)")
     })?;
@@ -9268,13 +9366,29 @@ pub async fn service_delete(
         .err()
         .map(|e| e.to_string());
 
-    let conn = ctx
-        .state
-        .db
-        .write()
-        .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
-    crate::services_repo::services::delete(&conn, payload.service_id).map_err(db_err)?;
-    drop(conn);
+    // Delete the row and, under the SAME guard, read the ports still owned by
+    // sibling rows of this engine. Confined to a sync block so the DB guard is
+    // dropped before the await below (the future must stay `Send`).
+    let keep_ports: Vec<u16> = {
+        let conn = ctx
+            .state
+            .db
+            .write()
+            .map_err(|_| ProtocolError::internal("db pool poisoned"))?;
+        crate::services_repo::services::delete(&conn, payload.service_id).map_err(db_err)?;
+        crate::services_repo::services::list_all(&conn)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.engine_id == svc.engine_id)
+            .filter_map(|r| r.runtime_port)
+            .collect()
+    };
+
+    // Belt-and-suspenders: `stop()` only targeted the row's recorded pid/port.
+    // Sweep any runtime of this engine that drifted ports or lost its pid to a
+    // prior non-graceful Core exit, so a delete can't leave an untraceable orphan.
+    crate::services::deploy::stop_engine_orphans(&svc.engine_id, &keep_ports).await;
+
     // Service row gone — refresh the catalog so its model entries stop
     // appearing on `/v1/models`. Supervisor reconcile would catch this on
     // its next tick, but desktop has no supervisor and even on the binary
@@ -10087,6 +10201,66 @@ pub async fn service_model_selection(
             crate::services_repo::models::replace_selection(&conn, payload.service_id, &selected)
         {
             return resp(false, Some(e.to_string()));
+        }
+    }
+
+    // Optional per-model pricing for the selected external models → persist to
+    // `model_pricing`. Entries for non-selected models are ignored; bad values
+    // (NaN / Inf / negative) are warned and skipped WITHOUT failing selection.
+    if !payload.pricing.is_empty() {
+        match ctx.org_context.as_ref().map(|o| o.org_id.clone()) {
+            Some(org_id) => {
+                let selected_ids: std::collections::HashSet<&str> = payload
+                    .selected_model_ids
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                for entry in &payload.pricing {
+                    if !selected_ids.contains(entry.model_id.as_str()) {
+                        continue;
+                    }
+                    // Skip entries that supply nothing — never create an all-zero
+                    // row that would mask `missing_pricing` in metrics.
+                    if entry.prompt_per_1k.is_none()
+                        && entry.completion_per_1k.is_none()
+                        && entry.audio_per_min.is_none()
+                        && entry.image_each.is_none()
+                    {
+                        continue;
+                    }
+                    let valid = |v: Option<f64>| v.map(|x| x.is_finite() && x >= 0.0).unwrap_or(true);
+                    if !(valid(entry.prompt_per_1k)
+                        && valid(entry.completion_per_1k)
+                        && valid(entry.audio_per_min)
+                        && valid(entry.image_each))
+                    {
+                        tracing::warn!(
+                            model_id = %entry.model_id,
+                            "service model selection: invalid pricing (non-finite or negative) — skipped"
+                        );
+                        continue;
+                    }
+                    // Merge: unset fields keep the existing stored price.
+                    if let Err(e) = crate::db::repository::upsert_model_pricing_merge(
+                        &ctx.state.db,
+                        &org_id,
+                        &entry.model_id,
+                        entry.prompt_per_1k,
+                        entry.completion_per_1k,
+                        entry.audio_per_min,
+                        entry.image_each,
+                    ) {
+                        tracing::warn!(
+                            model_id = %entry.model_id,
+                            error = %e,
+                            "service model selection: pricing upsert failed"
+                        );
+                    }
+                }
+            }
+            None => {
+                tracing::warn!("service model selection: no org context — pricing skipped");
+            }
         }
     }
 

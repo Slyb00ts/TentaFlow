@@ -394,6 +394,41 @@ pub fn create_dataset(
     .map_err(Into::into)
 }
 
+/// Nadpisuje dane datasetu (raw_data + row_count) po zakonczeniu generacji
+/// destylacji i oznacza profil jako completed. Autoryzacja: dataset powstal przez
+/// `create_dataset` (require_member), wiec update po dataset_id jest bezpieczny.
+pub fn update_dataset_data(
+    _user_id: &str,
+    dataset_id: &str,
+    row_count: u64,
+    raw_data: &[u8],
+) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
+    conn.execute(
+        "UPDATE datasets SET row_count = ?1, raw_data = ?2, \
+             profile_json = json_set(COALESCE(NULLIF(profile_json, ''), '{}'), '$.distill_status', 'completed') \
+         WHERE dataset_id = ?3",
+        params![row_count as i64, raw_data, dataset_id],
+    )?;
+    Ok(())
+}
+
+/// Ustawia `distill_status` w profile_json (np. "failed" gdy generacja padnie).
+/// Bez tego nieudany dataset zostaje "pending" w bazie i blokada edycji trzyma go
+/// na zawsze (stan in-memory znika po restarcie). json_set zachowuje distill_meta.
+pub fn set_dataset_distill_status(dataset_id: &str, status: &str) -> Result<()> {
+    let pool = super::db::pool()?;
+    let conn = pool.write().map_err(|e| anyhow::anyhow!("db write: {e}"))?;
+    conn.execute(
+        "UPDATE datasets SET \
+             profile_json = json_set(COALESCE(NULLIF(profile_json, ''), '{}'), '$.distill_status', ?1) \
+         WHERE dataset_id = ?2",
+        params![status, dataset_id],
+    )?;
+    Ok(())
+}
+
 /// Lists datasets of a project, newest first. Authorization by membership.
 pub fn list_datasets(user_id: &str, project_id: &str) -> Result<Vec<Dataset>> {
     let pool = super::db::pool()?;
@@ -658,6 +693,46 @@ pub struct TrainingRunRow {
     pub finished_at: Option<String>,
 }
 
+/// Jeden AKTYWNY (running/pending) run wraz z nazwą projektu — do panelu jobów.
+/// Nazwa projektu pochodzi z JOIN `projects`, widoczność zawężona do projektów,
+/// których pytający jest aktywnym członkiem.
+pub struct ActiveRunRow {
+    pub run_id: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub status: String,
+    pub config_json: String,
+    pub started_at: Option<String>,
+}
+
+/// Lista wszystkich aktywnych jobów (running/pending) widocznych dla `user_id`
+/// (członkostwo aktywne w projekcie). Najnowsze wg `started_at` pierwsze.
+pub fn list_active_runs_for_user(user_id: &str) -> Result<Vec<ActiveRunRow>> {
+    let pool = super::db::pool()?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT t.run_id, t.project_id, p.name, t.status, t.config_json, t.started_at \
+         FROM training_runs t \
+         JOIN projects p ON p.project_id = t.project_id \
+         JOIN project_members pm ON pm.project_id = t.project_id \
+         WHERE pm.user_id = ?1 AND pm.status = 'active' \
+           AND t.status IN ('running', 'pending', 'syncing') \
+         ORDER BY t.started_at DESC, t.run_id",
+    )?;
+    let rows = stmt.query_map(params![user_id], |row| {
+        Ok(ActiveRunRow {
+            run_id: row.get(0)?,
+            project_id: row.get(1)?,
+            project_name: row.get(2)?,
+            status: row.get(3)?,
+            config_json: row.get(4)?,
+            started_at: row.get(5)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 /// Pobiera pojedynczy run razem z `project_id` (potrzebnym do autoryzacji).
 pub fn get_training_run(run_id: &str) -> Result<Option<TrainingRunRow>> {
     let pool = super::db::pool()?;
@@ -756,6 +831,30 @@ pub fn recog_curve_for_run(run_id: &str) -> Result<Vec<(i64, Option<f64>, Option
         }
     }
     Ok(curve)
+}
+
+/// Generyczna krzywa treningu: wszystkie metryki runu jako
+/// `(step, metric_key, metric_value)` posortowane rosnąco po kroku. Używane przez
+/// status klasyfikatora atrybutu (metryki train_loss/val_acc/val_macro_f1) i inne
+/// tory generyczne, gdzie zestaw metryk nie jest sztywno ustalony.
+pub fn generic_curve_for_run(run_id: &str) -> Result<Vec<(i64, String, f64)>> {
+    let pool = super::db::pool()?;
+    let conn = pool.read().map_err(|e| anyhow::anyhow!("db read: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT step, metric_key, metric_value FROM metrics_history \
+         WHERE run_id = ?1 ORDER BY step ASC, id ASC",
+    )?;
+    let rows = stmt.query_map(params![run_id], |row| {
+        let step: i64 = row.get(0)?;
+        let key: String = row.get(1)?;
+        let value: f64 = row.get(2)?;
+        Ok((step, key, value))
+    })?;
+    let mut out: Vec<(i64, String, f64)> = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
 }
 
 /// Returns the number of registered models for a project.

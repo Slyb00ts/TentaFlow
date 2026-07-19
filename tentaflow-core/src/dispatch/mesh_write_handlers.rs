@@ -24,7 +24,7 @@ use tentaflow_protocol::{
     MeshTrustRetrustResponse, MeshTrustRevokeRequest, MeshTrustRevokeResponse, MessageBody,
     ProtocolError, ProtocolErrorCode,
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 use tentaflow_protocol::mesh::{MeshCommandResponsePayload, MeshCommandType};
 
@@ -37,6 +37,15 @@ use crate::mesh::security::MeshSecurity;
 // =============================================================================
 // Helpery
 // =============================================================================
+
+/// Ceiling na komendę bulk-transferu modelu przez mesh (`PushModelToPeer`). NIE
+/// jest to realny mechanizm zakończenia — właściwym watchdogiem jest STALL
+/// strumienia po stronie odbiorcy (`mesh_artifact::ARTIFACT_STALL_SECS`, 30 s bez
+/// NOWYCH bajtów → błąd), który kończy transfer niezależnie od całkowitego czasu.
+/// Aktywny transfer wielkiego modelu (setki GB przez wolne łącze) może trwać
+/// godzinami i NIE może być urwany twardym total-time; ten limit to tylko bardzo
+/// wysoka bariera bezpieczeństwa przeciw komendzie, która nigdy nie odpowiada.
+const MODEL_TRANSFER_CMD_TIMEOUT_SECS: u64 = 24 * 3600;
 
 fn require_quic_mesh(ctx: &HandlerContext) -> Result<Arc<IrohMeshManager>, ProtocolError> {
     ctx.state
@@ -234,6 +243,16 @@ pub async fn mesh_trust_revoke(
         &ctx.state.quic_mesh,
         ctx.state.local_node_id.as_ref(),
     )?;
+
+    // Usuń node z rejestru peerów + peer_persisted, żeby ZNIKNĄŁ z listy. Bez tego
+    // po „cofnij zaufanie" zostawał widoczny jako sparowany i nie dało się go usunąć
+    // (revoke ruszał tylko trusted_nodes, nie PeerRegistry, z którego czyta lista).
+    // Rekord w `revoked_nodes` (security) zostaje — blokuje ponowne zaufane połączenie.
+    // NIE zamykamy tu połączenia QUIC: `revoke_trust` wysyła najpierw MESH_MSG_TRUST_REVOKED
+    // po tym połączeniu, a zdalny node po jego odebraniu sam robi cleanup (`i_am_revoked`)
+    // i przestaje heartbeatować. Zamknięcie połączenia od razu ubiłoby tę notyfikację.
+    // Offline (główny przypadek): brak połączenia → remove czyści listę na trwałe.
+    ctx.state.mesh_peer_store.remove(node_id);
 
     Ok(MessageBody::MeshTrustRevokeResponseBody(
         MeshTrustRevokeResponse { ok: true },
@@ -895,6 +914,141 @@ pub async fn cluster_rdma_configure(
 
 /// Deployuje JEDNEGO czlonka (lokalnie przez `spawn_deploy_pipeline` albo zdalnie
 /// przez `ServiceDeployDistributed`). Zwraca status czlonka do odpowiedzi.
+/// P0: gwarantuje, ze model jest w cache HF na headzie (pobiera z HF jesli brak)
+/// i na KAZDYM workerze (transfer snapshotu z head-a przez mesh). Dzieki temu
+/// `vllm serve` (offline=1) znajduje wagi wszedzie bez recznego pre-cache. Source
+/// transferu to zawsze head; gdy head == local, koordynator pcha bezposrednio,
+/// inaczej zleca headowi `PushModelToPeer`. Token HF rozwiazywany LOKALNIE na
+/// nodzie pobierajacym (nigdy nie leci przez mesh).
+async fn ensure_cluster_model(
+    ctx: &HandlerContext,
+    qm: &Arc<IrohMeshManager>,
+    local_id: &str,
+    deployment_cluster_id: &str,
+    head_node_id: &str,
+    members: &[crate::db::models::DbClusterMember],
+    model_repo: &str,
+    engine_id: &str,
+) -> Result<(), String> {
+    // 1. Head MUSI miec model w cache — pobierz jesli brak.
+    if head_node_id == local_id {
+        let hf_token = crate::db::repository::get_setting_secure(
+            &ctx.state.db,
+            "hf_token",
+            &ctx.state.settings_cipher,
+        )
+        .ok()
+        .flatten()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+        crate::services::deploy::distributed::ensure_model_downloaded_local(
+            model_repo,
+            engine_id,
+            hf_token.as_deref(),
+            deployment_cluster_id,
+        )
+        .await
+        .map_err(|e| format!("head: pobranie modelu: {e}"))?;
+    } else {
+        let cmd = MeshCommandType::EnsureModelLocal {
+            deployment_cluster_id: deployment_cluster_id.to_string(),
+            model_repo: model_repo.to_string(),
+            engine_id: engine_id.to_string(),
+        };
+        match qm.send_command_and_wait(head_node_id, cmd, 7200).await {
+            Ok(resp) if resp.ok => {
+                if let MeshCommandResponsePayload::EnsureModelResult { error: Some(e), .. } =
+                    resp.payload
+                {
+                    return Err(format!("head: pobranie modelu: {e}"));
+                }
+            }
+            Ok(resp) => {
+                return Err(format!(
+                    "head: pobranie modelu: {}",
+                    resp.error.unwrap_or_default()
+                ))
+            }
+            Err(e) => return Err(format!("head: EnsureModelLocal mesh: {e}")),
+        }
+    }
+
+    // 2. Kazdy worker: brak modelu → transfer z head-a.
+    for m in members {
+        if m.node_id == head_node_id {
+            continue;
+        }
+        let present = if m.node_id == local_id {
+            crate::services::deploy::distributed::model_snapshot_dir(model_repo).is_some()
+        } else {
+            let cmd = MeshCommandType::ModelPresentLocal {
+                deployment_cluster_id: deployment_cluster_id.to_string(),
+                model_repo: model_repo.to_string(),
+            };
+            match qm.send_command_and_wait(&m.node_id, cmd, 30).await {
+                Ok(resp) if resp.ok => matches!(
+                    resp.payload,
+                    MeshCommandResponsePayload::ModelPresentResult { present: true }
+                ),
+                _ => false,
+            }
+        };
+        if present {
+            info!(node = %m.node_id, model = %model_repo, "P0: worker ma juz model — pomijam transfer");
+            continue;
+        }
+        info!(node = %m.node_id, model = %model_repo, "P0: transfer modelu na worker");
+        if head_node_id == local_id {
+            let snap = crate::services::deploy::distributed::model_snapshot_dir(model_repo)
+                .ok_or_else(|| "model zniknal z cache head-a przed transferem".to_string())?;
+            let hash = snap
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let key = format!("{}::{}", model_repo, m.node_id);
+            let res = crate::ml_studio::mesh_artifact::push_hf_model_to(
+                qm,
+                &m.node_id,
+                model_repo,
+                &snap.to_string_lossy(),
+                &hash,
+                Some(&key),
+            )
+            .await;
+            crate::ml_studio::mesh_artifact::clear_artifact_progress(&key);
+            res.map_err(|e| format!("transfer modelu na {}: {e}", m.node_id))?;
+        } else {
+            let cmd = MeshCommandType::PushModelToPeer {
+                deployment_cluster_id: deployment_cluster_id.to_string(),
+                model_repo: model_repo.to_string(),
+                target_node_id: m.node_id.clone(),
+            };
+            match qm
+                .send_command_and_wait(head_node_id, cmd, MODEL_TRANSFER_CMD_TIMEOUT_SECS)
+                .await
+            {
+                Ok(resp) if resp.ok => {
+                    if let MeshCommandResponsePayload::MlArtifactPushResult { error: Some(e), .. } =
+                        resp.payload
+                    {
+                        return Err(format!("transfer modelu na {}: {e}", m.node_id));
+                    }
+                }
+                Ok(resp) => {
+                    return Err(format!(
+                        "transfer modelu na {}: {}",
+                        m.node_id,
+                        resp.error.unwrap_or_default()
+                    ))
+                }
+                Err(e) => return Err(format!("PushModelToPeer mesh: {e}")),
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn deploy_distributed_member(
     ctx: &HandlerContext,
     qm: &Arc<IrohMeshManager>,
@@ -1050,19 +1204,23 @@ async fn deploy_distributed_local(
 }
 
 /// Buduje per-node spec, wstrzykujac `_target_node_id` do `config_json` (tylko
-/// koordynator go czyta — `build_member_config_json` przepuszcza nieznane klucze).
+/// koordynator go czyta — `build_member_config_json` przepuszcza nieznane klucze)
+/// oraz `_mp_node_rank` (rank czlonka dla trybu `cluster_launch = "vllm-mp"`;
+/// nieszkodliwy dla trybu Ray).
 #[allow(clippy::too_many_arguments)]
 fn build_member_spec(
     deployment_cluster_id: &str,
     cluster_id: &str,
     engine_id: &str,
     role: &str,
+    mp_node_rank: u32,
     member: &crate::db::models::DbClusterMember,
     model: &str,
     served: &str,
     tp_size: u32,
     gpus_per_node: u32,
     port: u16,
+    dist_port: u16,
     gpu_mem: f32,
     max_model_len: u32,
     ray_head_ip: &str,
@@ -1080,6 +1238,10 @@ fn build_member_spec(
             "_target_node_id".to_string(),
             serde_json::Value::String(member.node_id.clone()),
         );
+        obj.insert(
+            "_mp_node_rank".to_string(),
+            serde_json::Value::from(mp_node_rank),
+        );
     }
     tentaflow_protocol::mesh::DistributedDeploySpec {
         deployment_cluster_id: deployment_cluster_id.to_string(),
@@ -1091,6 +1253,7 @@ fn build_member_spec(
         tp_size,
         num_gpus: gpus_per_node,
         port,
+        dist_port,
         gpu_memory_utilization: gpu_mem,
         max_model_len,
         ray_head_ip: ray_head_ip.to_string(),
@@ -1127,8 +1290,13 @@ pub async fn cluster_deploy(
         port,
         gpus_per_node,
         config_json,
+        build_timeout_secs,
         gcs_timeout_secs,
         ready_timeout_secs,
+        prompt_per_1k,
+        completion_per_1k,
+        audio_per_min,
+        image_each,
     } = payload;
 
     if crate::db::repository::get_cluster(&ctx.state.db, cluster_id)
@@ -1160,6 +1328,16 @@ pub async fn cluster_deploy(
         .cloned()
         .ok_or_else(|| ProtocolError::not_found(format!("engine '{}' nie istnieje", engine_id)))?;
 
+    // Cluster/distributed deploy runs only vLLM/Ray tensor-parallel — reject any
+    // engine that does not opt into it, so an admin/API cannot start a distributed
+    // deploy for a single-node engine (which would silently launch `vllm serve`).
+    if manifest.engine.cluster_capable != Some(true) {
+        return Err(ProtocolError::bad_request(format!(
+            "engine '{}' nie wspiera cluster/distributed deploy",
+            engine_id
+        )));
+    }
+
     // Resolve the model repo (custom repo wins; else preset lookup).
     let model_sel = serde_json::json!({
         "model_repo": model_repo,
@@ -1172,9 +1350,9 @@ pub async fn cluster_deploy(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| model.clone());
 
-    // P1-4: reject a second deploy on a cluster that already has an active one —
-    // a node has one GPU set, so two TP deployments would collide on GPU + host
-    // ports. Stop the existing one first.
+    // P1-4: reject a second deploy only when a LIVE deployment (deploying/running)
+    // exists — a node has one GPU set, so two TP deployments would collide on GPU
+    // + host ports. A `failed` deployment does NOT block (cleared below).
     if let Some(existing) = crate::db::repository::active_cluster_deployment(&ctx.state.db, cluster_id)
         .map_err(|e| ProtocolError::new(ProtocolErrorCode::Internal, e.to_string()))?
     {
@@ -1184,20 +1362,91 @@ pub async fn cluster_deploy(
         )));
     }
 
+    // Auto-clear stale FAILED deployments of this cluster so a redeploy is not
+    // blocked by leftovers (idempotent best-effort teardown + delete record).
+    let local_id_pre = ctx.state.local_node_id.to_string();
+    let qm_pre = require_quic_mesh(ctx)?;
+    if let Ok(failed) = crate::db::repository::failed_cluster_deployments(&ctx.state.db, cluster_id) {
+        for f in failed {
+            let fmembers = crate::db::repository::list_cluster_deployment_members(
+                &ctx.state.db,
+                &f.deployment_cluster_id,
+            )
+            .unwrap_or_default();
+            let _ = teardown_distributed_members(
+                ctx,
+                &qm_pre,
+                &local_id_pre,
+                &f.deployment_cluster_id,
+                &fmembers,
+            )
+            .await;
+            let _ = crate::db::repository::delete_cluster_deployment(
+                &ctx.state.db,
+                &f.deployment_cluster_id,
+            );
+        }
+    }
+
     let gpus_per_node = gpus_per_node.unwrap_or(1).max(1);
     let tp_size = members.len() as u32 * gpus_per_node;
-    let serve_port = port.unwrap_or(8100);
-    let gpu_mem = gpu_memory_utilization.unwrap_or(0.90);
+
+    // Two ports from the SAME PortAllocator a normal service deploy uses: serve API
+    // (`vllm serve --port`, honours the wizard's preferred `port`) and the
+    // torch.distributed TCPStore master (`VLLM_PORT` on every member). Both are
+    // leased so a concurrent local deploy can't reuse them; released on failure.
+    // Distinct by construction — `acquire()` runs after `acquire_or_specific` leased
+    // the serve port, so it never hands the same one back.
+    let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
+        ProtocolError::new(ProtocolErrorCode::Internal, "port allocator niedostepny")
+    })?;
+    let serve_port = port_allocator
+        .acquire_or_specific(*port)
+        .map_err(|e| ProtocolError::new(ProtocolErrorCode::Internal, format!("alokacja portu serve: {e}")))?;
+    let dist_port = match port_allocator.acquire() {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = port_allocator.release(serve_port);
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::Internal,
+                format!("alokacja portu torch.distributed: {e}"),
+            ));
+        }
+    };
+    // Na unified memory (GB10/Spark) 119GB jest dzielone CPU+GPU, wiec 0.9 kaze vLLM
+    // alokowac ~107GB i OOM-killuje rank0 przy TP init. Bezpieczny default 0.5; user
+    // moze nadpisac w wizardzie jesli wie ile ma naglowka.
+    let gpu_mem = gpu_memory_utilization.unwrap_or(match engine_id.as_str() {
+        "vllm-spark" => 0.5,
+        // Zweryfikowany profil DSpark na GB10 (VLLM_SKIP_INIT_MEMORY_CHECK=1
+        // w obrazie pozwala na 0.85 mimo unified memory).
+        "vllm-dspark" => 0.85,
+        _ => 0.90,
+    });
     let max_len = max_model_len.unwrap_or(8192);
     let ray_port: u16 = 6379;
     let user_cfg = config_json.clone().unwrap_or_else(|| "{}".to_string());
+    // Build phase (image build + container start) has its OWN generous budget so
+    // a slow first image build does NOT eat the short Ray-GCS budget.
+    let build_timeout =
+        std::time::Duration::from_secs(build_timeout_secs.unwrap_or(600).max(30) as u64);
     let gcs_timeout = std::time::Duration::from_secs(gcs_timeout_secs.unwrap_or(60).max(5) as u64);
     let ready_timeout =
         std::time::Duration::from_secs(ready_timeout_secs.unwrap_or(600).max(30) as u64);
     let expected_nodes = members.len() as u32;
 
     let local_id = ctx.state.local_node_id.to_string();
-    let qm = require_quic_mesh(ctx)?;
+    // From here until the deployment is persisted (status deploying) every early
+    // return must hand both leases back — `finalize_distributed_failure` only runs
+    // AFTER persist, so these pre-persist exits would otherwise leak serve+dist.
+    let qm = match require_quic_mesh(ctx) {
+        Ok(qm) => qm,
+        Err(e) => {
+            let _ = port_allocator.release(serve_port);
+            let _ = port_allocator.release(dist_port);
+            return Err(e);
+        }
+    };
 
     // Head = local node when it is a member (so the OpenAI endpoint sits on this
     // node), otherwise the first member. ray_head_ip = head's RDMA IP.
@@ -1214,6 +1463,14 @@ pub async fn cluster_deploy(
     let mut persisted_members: Vec<crate::db::models::DbClusterDeploymentMember> = Vec::new();
     for (idx, m) in members.iter().enumerate() {
         let role = if idx == head_idx { "head" } else { "worker" };
+        // Rank vllm-mp: head=0, workery kolejno 1..n-1 (unikalne, ciagle).
+        let mp_rank = if idx == head_idx {
+            0
+        } else if idx < head_idx {
+            idx as u32 + 1
+        } else {
+            idx as u32
+        };
         specs.push((
             idx,
             build_member_spec(
@@ -1221,12 +1478,14 @@ pub async fn cluster_deploy(
                 cluster_id,
                 engine_id,
                 role,
+                mp_rank,
                 m,
                 &model,
                 &served,
                 tp_size,
                 gpus_per_node,
                 serve_port,
+                dist_port,
                 gpu_mem,
                 max_len,
                 &ray_head_ip,
@@ -1255,6 +1514,7 @@ pub async fn cluster_deploy(
         tp_size: tp_size as i64,
         head_node_id: head_node_id.clone(),
         port: serve_port as i64,
+        dist_port: dist_port as i64,
         endpoint_url: endpoint_url.clone(),
         status: "deploying".to_string(),
         created_at: String::new(),
@@ -1265,15 +1525,418 @@ pub async fn cluster_deploy(
         &deployment,
         &persisted_members,
     ) {
+        let _ = port_allocator.release(serve_port);
+        let _ = port_allocator.release(dist_port);
         return Err(ProtocolError::new(
             ProtocolErrorCode::Internal,
             format!("persist deployment: {e}"),
         ));
     }
 
+    // Wiersz `deployments` (keyed by deploy_id = deployment_cluster_id) MUSI
+    // powstac SYNCHRONICZNIE, zanim frontend odpali `deploymentStatusRequest`
+    // (`repository::deployments::get`) — inaczej modal dostaje NotFound i przechodzi
+    // w failed. Rownolegle daje log_bus miejsce na `log_tail`/status/phase, wiec
+    // pozny subskrybent odtworzy stan tak samo jak przy single-node deploy.
+    if let Err(e) = crate::db::repository::deployments::create(
+        &ctx.state.db,
+        &deployment_cluster_id,
+        engine_id,
+        "cluster",
+        &head_node_id,
+        "{}",
+    ) {
+        let _ = port_allocator.release(serve_port);
+        let _ = port_allocator.release(dist_port);
+        let _ = crate::db::repository::delete_cluster_deployment(&ctx.state.db, &deployment_cluster_id);
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::Internal,
+            format!("persist deployments row: {e}"),
+        ));
+    }
+
+    // BRAK osobnej „wizytowki" klastra: klaster jest reprezentowany na liscie
+    // serwisow WPROST przez per-node wiersze czlonkow (head + workery), po jednym
+    // na nodzie — dokladnie jak kazdy inny serwis, tyle ze rozciagniety na wiele
+    // nodow. `service_list` ich juz NIE ukrywa. Realny stan gotowosci calego
+    // klastra sledzi rekord `cluster_deployments` (widok Klastry) + modal postepu
+    // deployu; statusem wierszy czlonkow steruje ich wlasny pipeline, a supervisor
+    // ich nie sonduje ani nie respawnuje (patrz guardy `service_is_distributed_member`).
+
+    // NIEBLOKUJACY zwrot: kanal log-busa MUSI istniec zanim frontend zdazy
+    // zasubskrybowac `deploymentLogStreamRequest` (keyed by deployment_cluster_id),
+    // wiec tworzymy go SYNCHRONICZNIE tu, przed spawnem taska faz.
+    let log_sender = crate::deploy::log_bus::sender_for(&deployment_cluster_id);
+    cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 2, "Deploy klastra uruchomiony");
+
+    // Klony potrzebne w natychmiastowej odpowiedzi (reszta idzie do taska).
+    let resp_deployment_id = deployment_cluster_id.clone();
+    let resp_head_node_id = head_node_id.clone();
+    let resp_endpoint_url = endpoint_url.clone();
+
+    // Fazy P0-P6 lecą w tle — ta sama logika co dawniej blokujaca sciezka, tylko
+    // owinieta w task + emit postepu do log-busa deploymentu.
+    tokio::spawn(run_cluster_deploy_phases(
+        ctx.clone(),
+        qm,
+        log_sender,
+        local_id,
+        deployment_cluster_id,
+        cluster_id.clone(),
+        engine_id.clone(),
+        model,
+        served,
+        members,
+        specs,
+        persisted_members,
+        head_idx,
+        head_node_id,
+        head_spec,
+        endpoint_url,
+        serve_port,
+        dist_port,
+        ray_port,
+        expected_nodes,
+        build_timeout,
+        gcs_timeout,
+        ready_timeout,
+        *prompt_per_1k,
+        *completion_per_1k,
+        *audio_per_min,
+        *image_each,
+    ));
+
+    Ok(MessageBody::ClusterDeployResponseBody(ClusterDeployResponse {
+        ok: true,
+        deployment_cluster_id: resp_deployment_id,
+        head_node_id: resp_head_node_id,
+        endpoint_url: resp_endpoint_url,
+        members: Vec::new(),
+        message: Some("deploy uruchomiony w tle — sledz postep w oknie deploymentu".to_string()),
+    }))
+}
+
+// =============================================================================
+// Cluster deploy live progress — reuzywa deployment log-bus (ten sam kanal co
+// single-node deploy: `deploy::log_bus`). Frontend subskrybuje przez
+// `deploymentLogStreamRequest { deployId = deployment_cluster_id }` i dostaje
+// StreamChunk (phase/progress/log) + StreamEnd, tak samo jak node deploy.
+// =============================================================================
+
+type ClusterLogTx = tokio::sync::broadcast::Sender<crate::deploy::log_bus::BusMessage>;
+
+/// Emit zmiany fazy + progres (%) — PERSYSTUJE do wiersza `deployments`
+/// (status/phase/progress) ORAZ broadcastuje do live subscriberow, tak samo jak
+/// single-node deploy. Pozny subskrybent odtwarza stan z `deployments`.
+fn cdeploy_phase(db: &crate::db::DbPool, tx: &ClusterLogTx, did: &str, pct: u32, phase: &str) {
+    crate::deploy::log_bus::phase(db, did, tx, "deploying", pct, phase);
+}
+
+/// Emit pojedynczej linii logu — PERSYSTUJE do `deployments.log_tail` ORAZ
+/// broadcastuje.
+fn cdeploy_log(db: &crate::db::DbPool, tx: &ClusterLogTx, did: &str, line: &str) {
+    crate::deploy::log_bus::log_line(db, did, tx, "log", line);
+}
+
+/// Sukces: oznacza wiersz `deployments` jako `success` (progress 100), emituje
+/// StreamEnd(success) i zamyka kanal — dokladnie ta sama sciezka co node deploy.
+async fn cdeploy_end(db: &crate::db::DbPool, tx: &ClusterLogTx, did: &str, start_ms: i64) {
+    crate::deploy::log_bus::finish_success(db, did, tx, start_ms, String::new(), String::new()).await;
+}
+
+/// Wspolna sciezka bledu w tasku: NAJPIERW finalize (release portow + teardown
+/// klastra przez `ServiceStopDistributed` + status cluster_deployments), POTEM
+/// `log_bus::fail` (persystuje `[error]` do log_tail, oznacza wiersz `deployments`
+/// jako `failed`, emituje StreamEnd(error) i zamyka kanal).
+#[allow(clippy::too_many_arguments)]
+/// Aktualizuje status canonicznego placeholder-a cluster-deployu (wiersz
+/// `services` z `active_deploy_id == deployment_cluster_id`) i broadcastuje
+/// `ServiceChange::Updated`, zeby lista serwisow przeszla deploying→running/failed
+/// spojnie z single-node deployem. No-op gdy placeholder juz nie istnieje.
+fn update_cluster_placeholder_status(
+    ctx: &HandlerContext,
+    deployment_cluster_id: &str,
+    status: crate::services_repo::services::ServiceStatus,
+) {
+    let service_id = {
+        let conn = match ctx.state.db.read() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        match crate::services_repo::services::find_id_by_active_deploy_id(
+            &conn,
+            deployment_cluster_id,
+        ) {
+            Ok(Some(id)) => id,
+            _ => return,
+        }
+    };
+    {
+        let conn = match ctx.state.db.write() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if let Err(e) = crate::services_repo::services::update_status(&conn, service_id, status) {
+            warn!("cluster placeholder status update failed: {}", e);
+            return;
+        }
+    }
+    if let Ok(Some(info)) = crate::services::snapshot_builder::build_one(
+        &ctx.state.db,
+        service_id,
+        ctx.state.local_node_id.as_ref(),
+    ) {
+        super::handlers::broadcast_service_change(
+            ctx,
+            tentaflow_protocol::ServiceChange::Updated(info),
+        );
+    }
+}
+
+/// Usuwa canoniczny placeholder cluster-deployu i broadcastuje
+/// `ServiceChange::Removed` (wywolywane przy jawnym STOP klastra). No-op gdy
+/// placeholder juz nie istnieje.
+fn remove_cluster_placeholder(ctx: &HandlerContext, deployment_cluster_id: &str) {
+    let service_id = {
+        let conn = match ctx.state.db.read() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        match crate::services_repo::services::find_id_by_active_deploy_id(
+            &conn,
+            deployment_cluster_id,
+        ) {
+            Ok(Some(id)) => id,
+            _ => return,
+        }
+    };
+    {
+        let conn = match ctx.state.db.write() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if let Err(e) = crate::services_repo::services::delete(&conn, service_id) {
+            warn!("cluster placeholder delete failed: {}", e);
+            return;
+        }
+    }
+    super::handlers::broadcast_service_change(
+        ctx,
+        tentaflow_protocol::ServiceChange::Removed { service_id },
+    );
+}
+
+async fn cdeploy_fail(
+    ctx: &HandlerContext,
+    qm: &Arc<IrohMeshManager>,
+    log_sender: &ClusterLogTx,
+    local_id: &str,
+    deployment_cluster_id: &str,
+    serve_port: u16,
+    dist_port: u16,
+    head_node_id: &str,
+    endpoint_url: Option<String>,
+    members: &[crate::db::models::DbClusterDeploymentMember],
+    statuses: Vec<ClusterDeployMemberStatus>,
+    reason: String,
+    start_ms: i64,
+) {
+    let resp = finalize_distributed_failure(
+        ctx,
+        qm,
+        local_id,
+        deployment_cluster_id,
+        serve_port,
+        dist_port,
+        head_node_id,
+        endpoint_url,
+        members,
+        statuses,
+        reason.clone(),
+    )
+    .await;
+    // Placeholder zostaje na liscie jako `failed` (jak single-node deploy przy
+    // porazce) — user widzi ze deploy klastra sie nie udal. Realne wpisy
+    // czlonkow zostaly juz sprzatniete przez teardown w `finalize_distributed_failure`.
+    update_cluster_placeholder_status(
+        ctx,
+        deployment_cluster_id,
+        crate::services_repo::services::ServiceStatus::Failed,
+    );
+    let msg = match resp {
+        MessageBody::ClusterDeployResponseBody(r) => r.message.unwrap_or(reason),
+        _ => reason,
+    };
+    crate::deploy::log_bus::fail(&ctx.state.db, deployment_cluster_id, log_sender, start_ms, &msg)
+        .await;
+}
+
+/// P0 poller: emituje postep transferu modelu na workery (klucz artefaktu
+/// `model::node`) + heartbeat gdy transfer jeszcze nie ruszyl/leci download.
+async fn cluster_p0_progress_poller(
+    db: crate::db::DbPool,
+    log_sender: ClusterLogTx,
+    deployment_cluster_id: String,
+    model: String,
+    worker_nodes: Vec<String>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    let mut ticks: u32 = 0;
+    while !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let mut any = false;
+        for node in &worker_nodes {
+            let key = format!("{}::{}", model, node);
+            if let Some(p) = crate::ml_studio::mesh_artifact::artifact_progress(&key) {
+                any = true;
+                let pct = if p.bytes_total > 0 {
+                    (p.bytes_sent as f64 / p.bytes_total as f64 * 100.0) as u32
+                } else {
+                    0
+                };
+                cdeploy_log(
+                    &db,
+                    &log_sender,
+                    &deployment_cluster_id,
+                    &format!(
+                        "P0: transfer modelu -> {}: {}% ({:.1}/{:.1} GB, {:.0} MB/s)",
+                        node,
+                        pct,
+                        p.bytes_sent as f64 / 1e9,
+                        p.bytes_total as f64 / 1e9,
+                        p.rate_bps as f64 / 1e6,
+                    ),
+                );
+            }
+        }
+        if !any {
+            ticks += 1;
+            if ticks % 4 == 1 {
+                cdeploy_log(
+                    &db,
+                    &log_sender,
+                    &deployment_cluster_id,
+                    "P0: pobieranie/transfer modelu w toku...",
+                );
+            }
+        }
+    }
+}
+
+/// Serve-log poller (P5/P6): co kilka sekund taili `vllm serve` log z kontenera
+/// head-a i emituje NOWE linie (Model loading, KV cache, bledy). Dziala tylko
+/// gdy head jest lokalny (log zyje w jego kontenerze).
+async fn cluster_serve_log_poller(
+    db: crate::db::DbPool,
+    log_sender: ClusterLogTx,
+    deployment_cluster_id: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    let mut anchor: Option<String> = None;
+    while !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        if let Some(tail) =
+            crate::services::deploy::distributed::serve_log_tail(&deployment_cluster_id, 40).await
+        {
+            let lines: Vec<&str> = tail.lines().collect();
+            let start = match &anchor {
+                Some(a) => lines
+                    .iter()
+                    .rposition(|l| l == a)
+                    .map(|i| i + 1)
+                    .unwrap_or(0),
+                None => 0,
+            };
+            for l in &lines[start..] {
+                cdeploy_log(&db, &log_sender, &deployment_cluster_id, l);
+            }
+            if let Some(last) = lines.last() {
+                anchor = Some(last.to_string());
+            }
+        }
+    }
+}
+
+/// Fazy P0-P6 distributed deployu — uruchamiane w tle (tokio::spawn) po tym jak
+/// `cluster_deploy` zwrocil od razu `deployment_cluster_id`. Logika faz jest
+/// DOKLADNIE ta sama co dawniej blokujaca sciezka; dodane sa tylko emity postepu
+/// do log-busa i StreamEnd na koncu. Kazda faza konczaca sie bledem woła
+/// `cdeploy_fail` (finalize + StreamEnd error) i konczy task.
+#[allow(clippy::too_many_arguments)]
+async fn run_cluster_deploy_phases(
+    ctx: HandlerContext,
+    qm: Arc<IrohMeshManager>,
+    log_sender: ClusterLogTx,
+    local_id: String,
+    deployment_cluster_id: String,
+    cluster_id: String,
+    engine_id: String,
+    model: String,
+    served: String,
+    members: Vec<crate::db::models::DbClusterMember>,
+    specs: Vec<(usize, tentaflow_protocol::mesh::DistributedDeploySpec)>,
+    persisted_members: Vec<crate::db::models::DbClusterDeploymentMember>,
+    head_idx: usize,
+    head_node_id: String,
+    head_spec: tentaflow_protocol::mesh::DistributedDeploySpec,
+    endpoint_url: Option<String>,
+    serve_port: u16,
+    dist_port: u16,
+    ray_port: u16,
+    expected_nodes: u32,
+    build_timeout: std::time::Duration,
+    gcs_timeout: std::time::Duration,
+    ready_timeout: std::time::Duration,
+    prompt_per_1k: Option<f64>,
+    completion_per_1k: Option<f64>,
+    audio_per_min: Option<f64>,
+    image_each: Option<f64>,
+) {
+    let ctx = &ctx;
+    let start_ms = crate::deploy::log_bus::now_ms();
     let mut statuses: Vec<ClusterDeployMemberStatus> = Vec::new();
 
-    // 1. Head FIRST: start Ray GCS + `vllm serve` (vLLM BLOCKS until workers join).
+    cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 6, "P0: pobieranie modelu");
+    info!(deployment_cluster_id=%deployment_cluster_id, "cluster deploy P0: ensure model on head + transfer to workers");
+    let p0_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let worker_nodes: Vec<String> = members
+            .iter()
+            .filter(|m| m.node_id != head_node_id)
+            .map(|m| m.node_id.clone())
+            .collect();
+        tokio::spawn(cluster_p0_progress_poller(
+            ctx.state.db.clone(),
+            log_sender.clone(),
+            deployment_cluster_id.clone(),
+            model.clone(),
+            worker_nodes,
+            p0_stop.clone(),
+        ));
+    }
+    let p0_res = ensure_cluster_model(
+        ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, &members, &model, &engine_id,
+    )
+    .await;
+    p0_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Err(e) = p0_res {
+        cdeploy_fail(
+            ctx, &qm, &log_sender, &local_id, &deployment_cluster_id, serve_port, dist_port,
+            &head_node_id, endpoint_url, &persisted_members, statuses,
+            format!("P0 zapewnienie modelu w cache klastra: {e}"), start_ms,
+        )
+        .await;
+        return;
+    }
+    cdeploy_log(&ctx.state.db, &log_sender, &deployment_cluster_id, "P0: model gotowy na wszystkich nodach klastra");
+
+    cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 20, "P1: start head (Ray GCS)");
+    info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P1: start head (Ray GCS)");
     let head_status = deploy_distributed_member(
         ctx,
         &qm,
@@ -1288,29 +1951,58 @@ pub async fn cluster_deploy(
             head_status.error.clone().unwrap_or_default()
         );
         statuses.push(head_status);
-        return Ok(finalize_distributed_failure(
-            ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
-            &persisted_members, statuses, reason,
+        cdeploy_fail(
+            ctx, &qm, &log_sender, &local_id, &deployment_cluster_id, serve_port, dist_port,
+            &head_node_id, endpoint_url, &persisted_members, statuses, reason, start_ms,
         )
-        .await);
+        .await;
+        return;
     }
     statuses.push(head_status);
 
-    // 2. Wait for the head Ray GCS to come up so workers can join (bounded).
-    if let Err(e) = poll_head_readiness(
+    cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 35, "P2: build kontenera head");
+    info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P2: wait head container build");
+    if let Err(e) = poll_node_readiness(
         ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
-        expected_nodes, ReadyPhase::GcsUp, gcs_timeout,
+        expected_nodes, ReadyPhase::ContainerUp, build_timeout,
     )
     .await
     {
-        return Ok(finalize_distributed_failure(
-            ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
-            &persisted_members, statuses, format!("Ray GCS head nie wstał: {e}"),
+        cdeploy_fail(
+            ctx, &qm, &log_sender, &local_id, &deployment_cluster_id, serve_port, dist_port,
+            &head_node_id, endpoint_url, &persisted_members, statuses,
+            format!("kontener head nie wstał (build): {e}"), start_ms,
         )
-        .await);
+        .await;
+        return;
     }
 
-    // 3. Start workers (join the Ray head).
+    // Tryb vllm-mp (natywny multi-node vLLM): brak Raya — P3 (GCS) i pozniejszy
+    // gate ClusterReady nie maja czego sondowac. Workery startuja pelne
+    // `vllm serve --headless` juz w P4 i czekaja na mastera TCPStore, ktorego
+    // binduje dopiero serve head-a w P5 (worker-first, jak wymaga mp init).
+    let vllm_mp = crate::services::deploy::distributed::engine_is_vllm_mp(&engine_id);
+    if !vllm_mp {
+        cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 45, "P3: Ray GCS head");
+        info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P3: wait head Ray GCS");
+        if let Err(e) = poll_node_readiness(
+            ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
+            expected_nodes, ReadyPhase::GcsUp, gcs_timeout,
+        )
+        .await
+        {
+            cdeploy_fail(
+                ctx, &qm, &log_sender, &local_id, &deployment_cluster_id, serve_port, dist_port,
+                &head_node_id, endpoint_url, &persisted_members, statuses,
+                format!("Ray GCS head nie wstał: {e}"), start_ms,
+            )
+            .await;
+            return;
+        }
+    }
+
+    cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 60, "P4: start workerów (join Ray)");
+    info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P4: start workers (join Ray)");
     for (idx, spec) in &specs {
         if *idx == head_idx {
             continue;
@@ -1322,31 +2014,117 @@ pub async fn cluster_deploy(
         let ok = status.ok;
         statuses.push(status);
         if !ok {
-            return Ok(finalize_distributed_failure(
-                ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
-                &persisted_members, statuses, format!("worker {} nie wystartował", node_id),
+            cdeploy_fail(
+                ctx, &qm, &log_sender, &local_id, &deployment_cluster_id, serve_port, dist_port,
+                &head_node_id, endpoint_url, &persisted_members, statuses,
+                format!("worker {} nie wystartował", node_id), start_ms,
             )
-            .await);
+            .await;
+            return;
+        }
+        if let Err(e) = poll_node_readiness(
+            ctx, &qm, &node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
+            expected_nodes, ReadyPhase::ContainerUp, build_timeout,
+        )
+        .await
+        {
+            cdeploy_fail(
+                ctx, &qm, &log_sender, &local_id, &deployment_cluster_id, serve_port, dist_port,
+                &head_node_id, endpoint_url, &persisted_members, statuses,
+                format!("kontener worker {} nie wstał (build): {e}", node_id), start_ms,
+            )
+            .await;
+            return;
         }
     }
 
-    // 4. FINAL readiness: head `/v1/models` 200 — proves the whole TP cluster
-    //    (all workers joined; a missing worker keeps vLLM from ever becoming
-    //    ready). Bounded by `ready_timeout` (P1-1/P2-1).
-    if let Err(e) = poll_head_readiness(
+    if !vllm_mp {
+        cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 70, "P4: klaster Ray gotowy");
+        if let Err(e) = poll_node_readiness(
+            ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
+            expected_nodes, ReadyPhase::ClusterReady, gcs_timeout,
+        )
+        .await
+        {
+            cdeploy_fail(
+                ctx, &qm, &log_sender, &local_id, &deployment_cluster_id, serve_port, dist_port,
+                &head_node_id, endpoint_url, &persisted_members, statuses,
+                format!("workery nie dołączyły do klastra Ray w czasie: {e}"), start_ms,
+            )
+            .await;
+            return;
+        }
+    }
+
+    cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 80, "P5: start vllm serve");
+    info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P5: start vllm serve on head");
+    // Serve-log tailer aktywny na P5+P6 (dziala tylko gdy head lokalny).
+    let serve_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if head_node_id == local_id {
+        tokio::spawn(cluster_serve_log_poller(
+            ctx.state.db.clone(),
+            log_sender.clone(),
+            deployment_cluster_id.clone(),
+            serve_stop.clone(),
+        ));
+    }
+    let serve_cmd = match crate::services::deploy::distributed::build_serve_command(&head_spec) {
+        Ok(c) => c,
+        Err(e) => {
+            serve_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            cdeploy_fail(
+                ctx, &qm, &log_sender, &local_id, &deployment_cluster_id, serve_port, dist_port,
+                &head_node_id, endpoint_url, &persisted_members, statuses,
+                format!("budowa komendy vllm serve: {e}"), start_ms,
+            )
+            .await;
+            return;
+        }
+    };
+    if let Err(e) =
+        start_serve_on_head(ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, &serve_cmd)
+            .await
+    {
+        serve_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        cdeploy_fail(
+            ctx, &qm, &log_sender, &local_id, &deployment_cluster_id, serve_port, dist_port,
+            &head_node_id, endpoint_url, &persisted_members, statuses,
+            format!("start vllm serve na headzie: {e}"), start_ms,
+        )
+        .await;
+        return;
+    }
+
+    cdeploy_phase(&ctx.state.db, &log_sender, &deployment_cluster_id, 90, "P6: ładowanie modelu (serve ready)");
+    info!(deployment_cluster_id=%deployment_cluster_id, "distributed deploy P6: wait serve ready (/v1/models)");
+    if let Err(e) = poll_node_readiness(
         ctx, &qm, &head_node_id, &local_id, &deployment_cluster_id, ray_port, serve_port,
         expected_nodes, ReadyPhase::ServeReady, ready_timeout,
     )
     .await
     {
-        return Ok(finalize_distributed_failure(
-            ctx, &qm, &local_id, &deployment_cluster_id, &head_node_id, endpoint_url,
-            &persisted_members, statuses, format!("klaster nie zaczął serwować w czasie: {e}"),
+        serve_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let reason = if head_node_id == local_id {
+            match crate::services::deploy::distributed::serve_log_tail(&deployment_cluster_id, 40)
+                .await
+            {
+                Some(tail) => format!(
+                    "klaster nie zaczął serwować w czasie: {e}\n--- vllm serve log ---\n{tail}"
+                ),
+                None => format!("klaster nie zaczął serwować w czasie: {e}"),
+            }
+        } else {
+            format!("klaster nie zaczął serwować w czasie: {e}")
+        };
+        cdeploy_fail(
+            ctx, &qm, &log_sender, &local_id, &deployment_cluster_id, serve_port, dist_port,
+            &head_node_id, endpoint_url, &persisted_members, statuses, reason, start_ms,
         )
-        .await);
+        .await;
+        return;
     }
+    serve_stop.store(true, std::sync::atomic::Ordering::Relaxed);
 
-    // Real readiness achieved — every member is up and the endpoint serves.
     for s in &mut statuses {
         s.ok = true;
         s.error = None;
@@ -1356,6 +2134,45 @@ pub async fn cluster_deploy(
         &deployment_cluster_id,
         "running",
     );
+    update_cluster_placeholder_status(
+        ctx,
+        &deployment_cluster_id,
+        crate::services_repo::services::ServiceStatus::Running,
+    );
+
+    if prompt_per_1k.is_some()
+        || completion_per_1k.is_some()
+        || audio_per_min.is_some()
+        || image_each.is_some()
+    {
+        match ctx.org_context.as_ref().map(|o| o.org_id.clone()) {
+            Some(org_id) => {
+                let valid = |v: Option<f64>| v.map(|x| x.is_finite() && x >= 0.0).unwrap_or(true);
+                if valid(prompt_per_1k)
+                    && valid(completion_per_1k)
+                    && valid(audio_per_min)
+                    && valid(image_each)
+                {
+                    if let Err(e) = crate::db::repository::upsert_model_pricing_merge(
+                        &ctx.state.db,
+                        &org_id,
+                        &served,
+                        prompt_per_1k,
+                        completion_per_1k,
+                        audio_per_min,
+                        image_each,
+                    ) {
+                        warn!(model_id = %served, error = %e, "cluster deploy: pricing upsert failed");
+                    }
+                } else {
+                    warn!(model_id = %served, "cluster deploy: invalid pricing (non-finite or negative) — skipped");
+                }
+            }
+            None => {
+                warn!(model_id = %served, "cluster deploy: no org context — pricing skipped");
+            }
+        }
+    }
 
     let _ = crate::db::repository::log_audit(
         &ctx.state.db,
@@ -1368,14 +2185,13 @@ pub async fn cluster_deploy(
         Some(ctx.state.local_node_id.as_ref()),
     );
 
-    Ok(MessageBody::ClusterDeployResponseBody(ClusterDeployResponse {
-        ok: true,
-        deployment_cluster_id,
-        head_node_id,
-        endpoint_url,
-        members: statuses,
-        message: None,
-    }))
+    cdeploy_log(
+        &ctx.state.db,
+        &log_sender,
+        &deployment_cluster_id,
+        "P6: klaster serwuje (/v1/models 200) — deploy zakończony",
+    );
+    cdeploy_end(&ctx.state.db, &log_sender, &deployment_cluster_id, start_ms).await;
 }
 
 /// Hostname noda z peer-store (fallback: node_id).
@@ -1396,21 +2212,57 @@ fn hostname_for(ctx: &HandlerContext, node_id: &str) -> String {
 /// Faza gotowosci sondowana przez koordynatora.
 #[derive(Clone, Copy, PartialEq)]
 enum ReadyPhase {
+    /// Kontener czlonka wstal (obraz zbudowany + start) — gate fazy buildu.
+    ContainerUp,
     /// GCS Ray nasluchuje (workery moga dolaczyc).
     GcsUp,
-    /// Endpoint OpenAI serwuje (caly TP-cluster gotowy).
+    /// Klaster Ray ma wszystkie nody (head widzi `expected_nodes` w `ray status`)
+    /// — dopiero teraz `vllm serve` ma komplet GPU.
+    ClusterReady,
+    /// Endpoint OpenAI serwuje (model zaladowany na calym TP-cluster).
     ServeReady,
 }
 
-/// Sonduje head (lokalnie albo `DistributedReadiness` przez mesh) do osiagniecia
-/// `phase` albo wyczerpania `timeout`. Zwraca Err z czytelnym komunikatem przy
-/// timeoucie (z ostatnim widzianym stanem). To jest REALNY gate gotowosci —
-/// `ClusterDeployResponse.ok` zalezy od niego, nie od samego zaplanowania (P1-1).
-#[allow(clippy::too_many_arguments)]
-async fn poll_head_readiness(
+/// Odpala `vllm serve` na headzie (local → `exec_serve_on_head`; remote →
+/// `DistributedStartServe` przez mesh). Detached — vLLM laduje model w tle, a
+/// gotowosc potwierdza pozniejszy `ServeReady`.
+async fn start_serve_on_head(
     ctx: &HandlerContext,
     qm: &Arc<IrohMeshManager>,
     head_node_id: &str,
+    local_id: &str,
+    deployment_cluster_id: &str,
+    serve_cmd: &str,
+) -> Result<(), String> {
+    if head_node_id == local_id {
+        return crate::services::deploy::distributed::exec_serve_on_head(
+            deployment_cluster_id,
+            serve_cmd,
+        )
+        .await;
+    }
+    let cmd = MeshCommandType::DistributedStartServe {
+        deployment_cluster_id: deployment_cluster_id.to_string(),
+        serve_cmd: serve_cmd.to_string(),
+    };
+    match qm.send_command_and_wait(head_node_id, cmd, 30).await {
+        Ok(resp) if resp.ok => Ok(()),
+        Ok(resp) => Err(resp.error.unwrap_or_else(|| "start serve nieudany".to_string())),
+        Err(e) => Err(format!("mesh send (start serve) nieudany: {e}")),
+    }
+}
+
+/// Sonduje `target_node` (lokalnie albo `DistributedReadiness` przez mesh) do
+/// osiagniecia `phase` albo wyczerpania `timeout`. Zwraca Err z czytelnym
+/// komunikatem przy timeoucie (z ostatnim widzianym stanem). To jest REALNY gate
+/// gotowosci — `ClusterDeployResponse.ok` zalezy od niego, nie od samego
+/// zaplanowania (P1-1). `ContainerUp` ma sens dla kazdego noda; `GcsUp`/
+/// `ServeReady` tylko dla head-a.
+#[allow(clippy::too_many_arguments)]
+async fn poll_node_readiness(
+    ctx: &HandlerContext,
+    qm: &Arc<IrohMeshManager>,
+    target_node: &str,
     local_id: &str,
     deployment_cluster_id: &str,
     ray_port: u16,
@@ -1422,10 +2274,10 @@ async fn poll_head_readiness(
     let start = std::time::Instant::now();
     let mut last = String::from("brak odpowiedzi");
     while start.elapsed() < timeout {
-        let (gcs_up, ray_nodes, serve_ready) = probe_head_once(
+        let (container_running, gcs_up, ray_nodes, serve_ready) = probe_node_once(
             ctx,
             qm,
-            head_node_id,
+            target_node,
             local_id,
             deployment_cluster_id,
             ray_port,
@@ -1434,44 +2286,48 @@ async fn poll_head_readiness(
         )
         .await;
         let done = match phase {
+            ReadyPhase::ContainerUp => container_running,
             ReadyPhase::GcsUp => gcs_up,
-            // Serve readiness is authoritative: vLLM only answers /v1/models when
-            // all TP GPUs (workers) joined. ray_nodes is logged for diagnostics.
+            // Full Ray cluster: head's `ray status` shows every node joined, so
+            // `vllm serve` will find the complete TP GPU set.
+            ReadyPhase::ClusterReady => ray_nodes >= expected_nodes,
+            // Serve readiness is authoritative: /v1/models answers only after vLLM
+            // loaded the model across the TP cluster.
             ReadyPhase::ServeReady => serve_ready,
         };
         if done {
             return Ok(());
         }
         last = format!(
-            "gcs_up={} ray_nodes={}/{} serve_ready={}",
-            gcs_up, ray_nodes, expected_nodes, serve_ready
+            "container={} gcs_up={} ray_nodes={}/{} serve_ready={}",
+            container_running, gcs_up, ray_nodes, expected_nodes, serve_ready
         );
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
     Err(format!("timeout po {}s ({})", timeout.as_secs(), last))
 }
 
-/// Jednorazowy odczyt gotowosci head-a (local → bezposrednio; remote → mesh).
+/// Jednorazowy odczyt gotowosci noda (local → bezposrednio; remote → mesh).
 /// Transient blad mesh → traktowany jak "jeszcze niegotowy" (polling kontynuuje).
 #[allow(clippy::too_many_arguments)]
-async fn probe_head_once(
+async fn probe_node_once(
     ctx: &HandlerContext,
     qm: &Arc<IrohMeshManager>,
-    head_node_id: &str,
+    target_node: &str,
     local_id: &str,
     deployment_cluster_id: &str,
     ray_port: u16,
     serve_port: u16,
     expected_nodes: u32,
-) -> (bool, u32, bool) {
-    if head_node_id == local_id {
+) -> (bool, bool, u32, bool) {
+    if target_node == local_id {
         let s = crate::services::deploy::distributed::probe_readiness(
             deployment_cluster_id,
             ray_port,
             serve_port,
         )
         .await;
-        return (s.ray_gcs_up, s.ray_nodes, s.serve_ready);
+        return (s.container_running, s.ray_gcs_up, s.ray_nodes, s.serve_ready);
     }
     let cmd = MeshCommandType::DistributedReadiness {
         deployment_cluster_id: deployment_cluster_id.to_string(),
@@ -1479,17 +2335,18 @@ async fn probe_head_once(
         serve_port,
         expected_nodes,
     };
-    match qm.send_command_and_wait(head_node_id, cmd, 15).await {
+    match qm.send_command_and_wait(target_node, cmd, 15).await {
         Ok(resp) if resp.ok => match resp.payload {
             MeshCommandResponsePayload::DistributedReadinessResult {
+                container_running,
                 ray_gcs_up,
                 ray_nodes,
                 serve_ready,
                 ..
-            } => (ray_gcs_up, ray_nodes, serve_ready),
-            _ => (false, 0, false),
+            } => (container_running, ray_gcs_up, ray_nodes, serve_ready),
+            _ => (false, false, 0, false),
         },
-        _ => (false, 0, false),
+        _ => (false, false, 0, false),
     }
 }
 
@@ -1503,12 +2360,23 @@ async fn finalize_distributed_failure(
     qm: &Arc<IrohMeshManager>,
     local_id: &str,
     deployment_cluster_id: &str,
+    serve_port: u16,
+    dist_port: u16,
     head_node_id: &str,
     endpoint_url: Option<String>,
     members: &[crate::db::models::DbClusterDeploymentMember],
     statuses: Vec<ClusterDeployMemberStatus>,
     reason: String,
 ) -> MessageBody {
+    // Release the two coordinator-leased ports (serve + torch.distributed) so a
+    // failed deploy does not leak them out of the allocator's lease set.
+    if let Some(ports) = ctx.state.port_allocator.clone() {
+        let _ = ports.release(serve_port);
+        let _ = ports.release(dist_port);
+    }
+    // Ubij ewentualny kontener pobierania modelu (stall/kill mogl juz go usunac —
+    // best-effort, `--rm` czysci go po normalnym zakonczeniu).
+    crate::services::deploy::distributed::remove_download_container(deployment_cluster_id).await;
     let teardown_errors =
         teardown_distributed_members(ctx, qm, local_id, deployment_cluster_id, members).await;
     let message = if teardown_errors.is_empty() {
@@ -1609,11 +2477,14 @@ pub async fn cluster_deploy_stop(
         .ok_or_else(|| ProtocolError::not_found("deployment not found"))?;
     // P2-3: the deployment must belong to the cluster named in the request — a
     // stale/forged cluster_id must not tear down another cluster's deployment.
-    if dep.cluster_id != *cluster_id {
+    // Pusty `cluster_id` = wywolanie z wiersza serwisu (GUI zna tylko
+    // deployment_cluster_id) — wtedy bierzemy cluster z rekordu deploymentu.
+    if !cluster_id.is_empty() && dep.cluster_id != *cluster_id {
         return Err(ProtocolError::bad_request(
             "deployment nie należy do podanego klastra",
         ));
     }
+    let cluster_id = &dep.cluster_id;
     let dep_members =
         crate::db::repository::list_cluster_deployment_members(&ctx.state.db, deployment_cluster_id)
             .map_err(|e| ProtocolError::new(ProtocolErrorCode::Internal, e.to_string()))?;
@@ -1686,16 +2557,30 @@ pub async fn cluster_deploy_stop(
     // failure keep it (status failed) so the admin can retry STOP — never leave
     // a possibly-orphaned Ray container untracked.
     if all_ok {
+        // Release the two coordinator-leased ports (serve `dep.port` + torch.distributed
+        // `dep.dist_port`) back to THIS node's allocator — the leases were taken here at
+        // deploy time, never on the workers, and `deploy::stop` deliberately never frees
+        // them. dist_port==0 marks a legacy row predating allocation; nothing to free.
+        let _ = port_allocator.release(dep.port as u16);
+        if dep.dist_port > 0 {
+            let _ = port_allocator.release(dep.dist_port as u16);
+        }
         if let Err(e) =
             crate::db::repository::delete_cluster_deployment(&ctx.state.db, deployment_cluster_id)
         {
             warn!("delete_cluster_deployment nieudany: {}", e);
         }
+        remove_cluster_placeholder(ctx, deployment_cluster_id);
     } else {
         let _ = crate::db::repository::set_cluster_deployment_status(
             &ctx.state.db,
             deployment_cluster_id,
             "failed",
+        );
+        update_cluster_placeholder_status(
+            ctx,
+            deployment_cluster_id,
+            crate::services_repo::services::ServiceStatus::Failed,
         );
     }
 

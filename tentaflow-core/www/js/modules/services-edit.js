@@ -14,6 +14,16 @@
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
+import * as ManifestStore from '/js/modules/catalog/manifest-store.js';
+
+// True when the engine is served by CUDA vLLM (manifest backend="vllm", not the
+// Metal variant) — single source of truth shared with the deploy wizard and the
+// Rust `Engine::is_cuda_vllm`, replacing the old `engineId === 'vllm'` literal so
+// every vLLM-backed engine (embed / rerank / VL) also gets the VRAM calculator.
+function engineUsesCudaVllm(engineId) {
+  return ManifestStore.byId(engineId)?.engine?.backend === 'vllm'
+    && !String(engineId || '').endsWith('-metal');
+}
 
 let currentModalEl = null;
 let vramPollHandle = null;
@@ -31,7 +41,10 @@ export async function openEditModal(svc, opts = {}) {
   const cfg = parseConfig(svc.config_json);
   const initialPresetId = cfg.model_preset_id || null;
   const initialModelRepo = cfg.model_repo || '';
-  const isVllm = engineId === 'vllm';
+  // Load the manifest (idempotent) so the vLLM-backed check below sees the
+  // `backend` field for embed/rerank/VL engines, not just literal "vllm".
+  await ManifestStore.init();
+  const isVllm = engineUsesCudaVllm(engineId);
 
   // Fetch presetow z manifestu (CBOR binary) ZAMIAST hardcoded list. Backend
   // zwraca dokladnie te [[model_preset]] ktore sa w pliku TOML silnika.
@@ -197,18 +210,51 @@ async function openExternalModelPicker(svc, opts = {}) {
         return;
       }
       statusEl.style.display = 'none';
+      // Catalog entries carry no pricing fields, so pull any stored pricing for
+      // this org and prefill the inputs for models that already have prices.
+      const pricingByModel = new Map();
+      try {
+        const pr = await ApiBinary.one('modelMetricsPricingGet');
+        (Array.isArray(pr?.rows) ? pr.rows : []).forEach((r) => {
+          if (r && r.modelId) pricingByModel.set(r.modelId, r);
+        });
+      } catch (_) {
+        // Pricing prefill is best-effort; empty means "no change" on save.
+      }
       listEl.innerHTML = models.map((m) => {
         const id = m.id || m.model_name || '';
         const ctxLen = m.contextLength || m.context_length;
         const ctxTxt = ctxLen ? ` · ${ctxLen}` : '';
         const name = m.displayName || m.display_name || id;
+        // Prefill from stored pricing (keyed by model id); empty stays empty.
+        const stored = pricingByModel.get(id);
+        const pv = (field) => {
+          const v = stored ? stored[field] : undefined;
+          return v === undefined || v === null ? '' : String(v);
+        };
+        const priceCell = (field, label, value) => `
+          <tf-input class="external-price-in" type="number" min="0" step="0.0001"
+            data-price-model="${escapeAttr(id)}" data-price-field="${escapeAttr(field)}"
+            label="${escapeAttr(label)}" value="${escapeAttr(value)}"></tf-input>`;
         return `
-          <label class="external-model-row" style="display:flex;align-items:center;gap:10px;padding:6px 0;">
-            <tf-checkbox ${m.selected ? 'checked' : ''} data-model-id="${escapeHtml(id)}"></tf-checkbox>
-            <span style="flex:1">${escapeHtml(name)}${escapeHtml(ctxTxt)}</span>
-            <tf-chip>${escapeHtml(m.modality || 'chat')}</tf-chip>
-          </label>`;
+          <div class="external-model-row" data-model-row style="display:flex;flex-direction:column;gap:6px;padding:8px 0;border-bottom:1px solid var(--border-subtle,#2a2a2a);">
+            <label style="display:flex;align-items:center;gap:10px;">
+              <tf-checkbox ${m.selected ? 'checked' : ''} data-model-id="${escapeAttr(id)}"></tf-checkbox>
+              <span style="flex:1">${escapeHtml(name)}${escapeHtml(ctxTxt)}</span>
+              <tf-chip>${escapeHtml(m.modality || 'chat')}</tf-chip>
+            </label>
+            <div class="external-model-pricing" style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;">
+              ${priceCell('promptPer1k', I18n.t('model_metrics.col_price_prompt'), pv('promptPer1k'))}
+              ${priceCell('completionPer1k', I18n.t('model_metrics.col_price_completion'), pv('completionPer1k'))}
+              ${priceCell('audioPerMin', I18n.t('model_metrics.col_price_audio'), pv('audioPerMin'))}
+              ${priceCell('imageEach', I18n.t('model_metrics.col_price_image'), pv('imageEach'))}
+            </div>
+          </div>`;
       }).join('');
+      const pricingHint = document.createElement('p');
+      pricingHint.className = 'form-hint';
+      pricingHint.textContent = I18n.t('external.pricing_hint');
+      listEl.prepend(pricingHint);
     } catch (e) {
       statusEl.style.display = '';
       statusEl.textContent = I18n.t('external.load_failed', { error: e.message || String(e) });
@@ -223,11 +269,37 @@ async function openExternalModelPicker(svc, opts = {}) {
       .filter((c) => c.checked)
       .map((c) => c.getAttribute('data-model-id'))
       .filter(Boolean);
+
+    // Per-model pricing: one entry per model where the user typed any of the
+    // four fields. Empty fields stay null (None); negatives abort the save.
+    const idSet = new Set(ids);
+    const pricingByModel = new Map();
+    let pricingInvalid = false;
+    listEl.querySelectorAll('tf-input[data-price-model]').forEach((el) => {
+      const modelId = el.getAttribute('data-price-model');
+      if (!idSet.has(modelId)) return;
+      const raw = String(el.value ?? '').trim();
+      if (raw === '') return;
+      const n = Number(raw);
+      if (!Number.isFinite(n) || n < 0) { pricingInvalid = true; return; }
+      const entry = pricingByModel.get(modelId) || { modelId };
+      entry[el.getAttribute('data-price-field')] = n;
+      pricingByModel.set(modelId, entry);
+    });
+    if (pricingInvalid) {
+      statusEl.style.display = '';
+      statusEl.textContent = I18n.t('external.pricing_invalid');
+      saveBtn.removeAttribute('disabled');
+      return;
+    }
+    const pricing = Array.from(pricingByModel.values());
+
     try {
       const res = await ApiBinary.action('serviceModelSelectionRequest', {
         serviceId: svc.id,
         nodeId,
         selectedModelIds: ids,
+        pricing,
       });
       if (res && res.success === false) {
         statusEl.style.display = '';
@@ -270,7 +342,7 @@ function closeModal() {
 // card są renderowane z `vram_estimate` (model_weights_gb/kv_cache_gb/
 // activations_gb/per_gpu_gb/fits_per_gpu/warnings).
 function scheduleRecommendRefresh(overlay, svc, engineId) {
-  if (engineId !== 'vllm') return;
+  if (!engineUsesCudaVllm(engineId)) return;
   if (recommendDebounceHandle) clearTimeout(recommendDebounceHandle);
   recommendDebounceHandle = setTimeout(() => {
     fetchRecommendation(overlay, svc).catch((e) => {
@@ -747,9 +819,9 @@ function renderVramSection(tk) {
             <span>gpu_memory_utilization</span>
             <span data-mu-value style="color:var(--accent-2);font-family:'JetBrains Mono',monospace;font-weight:700;">0.90</span>
           </label>
-          <input type="range" data-mu-slider min="0.10" max="0.95" step="0.01" value="0.90" style="width:100%;margin-top:6px;">
+          <input type="range" data-mu-slider min="0.15" max="0.9" step="0.01" value="0.90" style="width:100%;margin-top:6px;">
           <div style="display:flex;justify-content:space-between;font-size:10.5px;color:var(--text-3);margin-top:4px;padding:0 8px;">
-            <span>0.10</span><span>0.30</span><span>0.50</span><span>0.70</span><span>0.95</span>
+            <span>0.15</span><span>0.30</span><span>0.50</span><span>0.70</span><span>0.90</span>
           </div>
         </div>
       </div>

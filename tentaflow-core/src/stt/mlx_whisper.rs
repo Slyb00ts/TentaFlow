@@ -499,7 +499,8 @@ impl SttEngine for MlxWhisperEngine {
         };
         Ok(TranscribeResult {
             text,
-            language: lang,
+            // The Swift bridge decodes with this exact language (no auto path).
+            language: Some(lang),
             duration_seconds: duration_secs,
             segments: vec![segment],
         })

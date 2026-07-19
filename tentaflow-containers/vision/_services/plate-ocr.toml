@@ -17,7 +17,7 @@ icon = "vision"
 default_port = 0
 api = "custom"
 version = "fast-plate-2026"
-service_surfaces = ["documents"]
+service_surfaces = ["documents", "camera_cv"]
 input_modalities = ["image"]
 
 [deploy.native]
@@ -28,5 +28,5 @@ feature_flag = "inference-vision-gpu"
 [[model_preset]]
 id = "plate-ocr-fast"
 display_name = "Plate OCR (fast-plate)"
-repo = "https://models.tentaflow.local/orlen/plate-ocr/v1"
+repo = "https://models.tentaflow.local/adr/plate-ocr/v1"
 recommended = true

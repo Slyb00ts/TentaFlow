@@ -125,7 +125,7 @@ pub fn ingest_invoke_v1(
     // callera — `read_full_document` widzi tylko dokumenty tej instancji
     // (izolacja per addon_id), więc obcy `doc_id` zwraca NotFound.
     let (document_bytes, _stored_mime) =
-        match read_full_document(&org_id, &addon_id, &input.doc_id_blob) {
+        match read_full_document(&org_id, &addon_id, &input.doc_id_blob, user_id.as_deref()) {
             Ok(pair) => pair,
             Err(AbiError::NotFound) => {
                 audit(caller.data(), "denied", Some("document_not_found"));

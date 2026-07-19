@@ -205,9 +205,11 @@ pub extern "C" fn on_start() -> i32 {
     // SQL, capy, paginacja, izolacja per-instancja.
     register_read_side_tools();
 
-    // Pelny panel GUI (Split: sidebar baz wiedzy | workspace czat-first) przez binarny
-    // protokol CBOR (sdk-runtime). send_panel_shell sam wypycha oba sloty.
-    ui::send_panel_shell();
+    // Panel GUI nie jest renderowany w on_start: ta funkcja nie dostaje epoki
+    // panelu przypisanej przez hosta, wiec shell wyslany tutaj niosby domyslna
+    // epoke i zostalby odrzucony w sesji, ktorej epoka przekroczyla 1. Host
+    // wola on_panel_open (z autorytatywna epoka) przy kazdym otwarciu, takze na
+    // zimnym starcie — tam shell jest renderowany dokladnie raz.
 
     log::info("rag: uruchomiony");
     0
@@ -290,6 +292,7 @@ pub extern "C" fn on_request(
         "delete_collection" => handle_delete_collection(&params),
         "ask" => handle_ask(&params),
         "ingest_document" => handle_ingest_document(&params),
+        "ingest_drain" => handle_ingest_drain(&params),
         "list_documents" => handle_list_documents(&params),
         "delete_document" => handle_delete_document(&params),
         "ingest_status" => handle_ingest_status(&params),
@@ -571,15 +574,43 @@ fn handle_ingest_document(params: &Value) -> Value {
         Err(e) => return err(&format!("Blad weryfikacji kolekcji: {e}")),
     }
 
+    // Dedup po tresci: sha256 wgranego bloba pobieramy z metadanych store'a
+    // (document_list — bez czytania bajtow). Jesli identyczny content juz jest w
+    // TEJ kolekcji (nie-failed), pomijamy: re-upload tego samego pliku nie tworzy
+    // duplikatu dokumentu/chunkow/wektorow. Host i tak trzyma jeden blob per sha256.
+    let content_hash = tentaflow_addon_sdk::document_list()
+        .ok()
+        .and_then(|docs| {
+            docs.into_iter()
+                .find(|d| d.doc_id == doc_id_blob)
+                .map(|d| d.sha256)
+        })
+        .unwrap_or_default();
+    if !content_hash.is_empty() {
+        if let Ok(Some(existing)) = sql_query_one(
+            "SELECT id FROM documents WHERE collection_id = ? AND content_hash = ? AND status != 'failed' LIMIT 1",
+            &[
+                SqlValue::String(collection_id.to_string()),
+                SqlValue::String(content_hash.clone()),
+            ],
+        ) {
+            let dup_id = existing.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
+            return json!({
+                "ok": true,
+                "data": {"document_id": dup_id, "status": "duplicate", "content_hash": content_hash}
+            });
+        }
+    }
+
     let document_id = new_id("doc");
     let job_id = new_id("job");
     let now = now_unix();
 
     // Wpis dokumentu (status pending) + job (queued) atomowo.
-    let insert_doc = "INSERT INTO documents (id, collection_id, doc_id_blob, filename, mime, status, page_count, created_at) \
-                      VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)";
+    let insert_doc = "INSERT INTO documents (id, collection_id, doc_id_blob, filename, mime, status, page_count, created_at, content_hash) \
+                      VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)";
     let insert_job = "INSERT INTO ingest_jobs (id, document_id, status, progress, created_at, updated_at) \
-                      VALUES (?, ?, 'running', 0, ?, ?)";
+                      VALUES (?, ?, 'queued', 0, ?, ?)";
     if let Err(e) = sql_transaction(&[
         (insert_doc, &[
             SqlValue::String(document_id.clone()),
@@ -588,6 +619,7 @@ fn handle_ingest_document(params: &Value) -> Value {
             SqlValue::String(filename.to_string()),
             SqlValue::String(mime.to_string()),
             SqlValue::I64(now),
+            SqlValue::String(content_hash.clone()),
         ]),
         (insert_job, &[
             SqlValue::String(job_id.clone()),
@@ -599,46 +631,160 @@ fn handle_ingest_document(params: &Value) -> Value {
         return err(&format!("Blad inicjalizacji ingestu: {e}"));
     }
 
-    // Wykonaj pipeline; przy bledzie zapisz go do joba i dokumentu.
-    match run_ingest_pipeline(collection_id, &document_id, &job_id, doc_id_blob, mime) {
-        Ok(chunk_count) => {
-            // Status nie moze klamac: jesli nie da sie oznaczyc dokumentu/joba jako
-            // ukonczony, to realny blad — wyczysc artefakty i zglos failed zamiast
-            // udawac sukces przy niespojnym statusie.
-            if let Err(e) = mark_ingested(&document_id, &job_id) {
-                // Sciezka bledu: czyscimy artefakty best-effort. Ewentualny blad cleanupu
-                // tylko logujemy (juz raportujemy 'failed') — nie nadpisujemy pierwotnej
-                // przyczyny, ale partial graf jest wychwytywany przez status failed.
-                if let Err(ce) = cleanup_document_artifacts(&document_id) {
-                    log::warn(&format!("rag: cleanup po nieudanym mark_ingested dokumentu '{document_id}' nieudany: {ce}"));
-                }
-                let msg = format!("Ingest zakonczony, ale zapis statusu sie nie powiodl: {e}");
-                fail_job(&document_id, &job_id, &msg);
-                return json!({
-                    "ok": false,
-                    "error": msg,
-                    "data": {"document_id": document_id, "job_id": job_id, "status": "failed"}
-                });
+    // Async: dokument wchodzi do KOLEJKI (status 'queued'), a ciezki pipeline
+    // (parse->chunk->embed, ~dziesiatki s) przetwarza w tle scheduled worker
+    // (`ingest_drain`). Dzieki temu upload_complete zwraca natychmiast i nie
+    // blokuje polaczenia — masowy upload wielu plikow nie czeka na ingest kazdego
+    // (wczesniej inline pipeline blokowal upload kolejnych plikow -> timeout/abort).
+    json!({
+        "ok": true,
+        "data": {"document_id": document_id, "job_id": job_id, "status": "queued"}
+    })
+}
+
+/// Worker kolejki ingestu — przetwarza JEDEN najstarszy job `queued`. Napedzany
+/// przez scheduled job core (interwal). Atomowy claim (`queued`->`running` z
+/// warunkiem statusu) zapobiega dwukrotnemu przetworzeniu tego samego joba przez
+/// rownolegle wywolania z puli instancji. Zwraca `processed` (0/1) + `remaining`
+/// (ile jeszcze w kolejce), zeby driver/UI wiedzialy czy jest co robic.
+fn handle_ingest_drain(_params: &Value) -> Value {
+    // Reclaim osieroconych 'running' PRZED batchem: job przerwany resetem/crashem
+    // mid-ingest (przed mark_ingested/fail_job) wraca do 'queued', zeby sie dokonczyl
+    // zamiast wisiec na zawsze. Bez tego reset TentaFlow gubi dokument w locie.
+    reclaim_stale_running_jobs();
+
+    // Batch-drain: jedno wywolanie (scheduled worker co ~30s) mieli CALA zaleglosc az
+    // do opróznienia kolejki albo capa DRAIN_CAP. Bez petli byloby 1 dok / interwal
+    // (masowy upload trwalby kwadranse). Cap ogranicza wall-time; scheduler i tak
+    // przetnie po max_runtime, a niedokonczony 'running' odzyska reclaim nastepnym razem.
+    const DRAIN_CAP: usize = 100;
+    let mut processed = 0usize;
+    let mut last_doc = String::new();
+    while processed < DRAIN_CAP {
+        match drain_one_queued() {
+            DrainStep::Processed(doc) => {
+                processed += 1;
+                last_doc = doc;
             }
-            json!({
-                "ok": true,
-                "data": {
-                    "document_id": document_id,
-                    "job_id": job_id,
-                    "chunks": chunk_count,
-                    "status": "ingested"
-                }
-            })
-        }
-        Err(msg) => {
-            fail_job(&document_id, &job_id, &msg);
-            json!({
-                "ok": false,
-                "error": msg,
-                "data": {"document_id": document_id, "job_id": job_id, "status": "failed"}
-            })
+            // Empty = kolejka pusta; Contended = joba wzial inny drainer (skip, nie dubluj).
+            DrainStep::Empty | DrainStep::Contended => break,
+            DrainStep::Error(msg) => return err(&msg),
         }
     }
+    json!({"ok": true, "data": {"processed": processed, "document_id": last_doc, "remaining": queued_count()}})
+}
+
+/// Wynik pojedynczego kroku drainu.
+enum DrainStep {
+    Processed(String),
+    Empty,
+    Contended,
+    Error(String),
+}
+
+/// Przetwarza JEDEN kolejny job 'queued' (atomowy claim queued->running -> pipeline ->
+/// mark_ingested/fail_job). Wydzielone z `handle_ingest_drain`, zeby drain mielil batch
+/// w petli. Atomowy claim zapobiega dwukrotnemu przetworzeniu tego samego joba przez
+/// rownolegle wywolania z puli instancji.
+fn drain_one_queued() -> DrainStep {
+    let row = match sql_query_one(
+        "SELECT j.id, j.document_id, d.collection_id, d.doc_id_blob, d.mime \
+         FROM ingest_jobs j JOIN documents d ON d.id = j.document_id \
+         WHERE j.status = 'queued' ORDER BY j.created_at ASC, j.id ASC LIMIT 1",
+        &[],
+    ) {
+        Ok(Some(r)) => r,
+        Ok(None) => return DrainStep::Empty,
+        Err(e) => return DrainStep::Error(format!("Blad odczytu kolejki ingestu: {e}")),
+    };
+    let job_id = row.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let document_id = row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let collection_id = row.get(2).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let doc_id_blob = row.get(3).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let mime = row.get(4).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if job_id.is_empty() || document_id.is_empty() {
+        return DrainStep::Error("Kolejka ingestu: niespojny wiersz joba".to_string());
+    }
+
+    let claimed = sql_exec(
+        "UPDATE ingest_jobs SET status='running', updated_at=? WHERE id=? AND status='queued'",
+        &[SqlValue::I64(now_unix()), SqlValue::String(job_id.clone())],
+    );
+    match claimed {
+        Ok(r) if r.rows_affected == 1 => {}
+        Ok(_) => return DrainStep::Contended,
+        Err(e) => return DrainStep::Error(format!("Claim joba nieudany: {e}")),
+    }
+
+    match run_ingest_pipeline(&collection_id, &document_id, &job_id, &doc_id_blob, &mime) {
+        Ok(_) => {
+            if let Err(e) = mark_ingested(&document_id, &job_id) {
+                if let Err(ce) = cleanup_document_artifacts(&document_id) {
+                    log::warn(&format!("rag: cleanup po nieudanym mark_ingested '{document_id}' nieudany: {ce}"));
+                }
+                fail_job(&document_id, &job_id, &format!("Zapis statusu po ingescie nieudany: {e}"));
+            }
+        }
+        Err(msg) => fail_job(&document_id, &job_id, &msg),
+    }
+    DrainStep::Processed(document_id)
+}
+
+/// Reclaim osieroconych jobow 'running': job przelaczony na 'running', ktory od
+/// `STALE_RUNNING_SECS` nie postapil (`updated_at`), zostal przerwany resetem/crashem
+/// przed `mark_ingested`/`fail_job`. Sprzatamy jego czesciowe artefakty
+/// (`cleanup_document_artifacts` — inaczej re-ingest zostawia osierocone wektory) i
+/// wracamy do 'queued', wiec kolejny drain dokonczy ingest idempotentnie. Bezpieczne:
+/// drain jest jednobiezny (scheduled job `concurrency=skip`) a pipeline synchroniczny
+/// (~dziesiatki s/doc), wiec 'running' starszy niz prog jest na pewno osierocony, nie
+/// aktualnie mielony. Cap partii chroni przed dlugim skanem przy wielu sierotach.
+fn reclaim_stale_running_jobs() {
+    // > scheduler max_runtime auto-joba drainu (1800s), zeby NIE odzyskac joba
+    // ktory legalnie trwa (duzy PDF: setki stron -> tysiace chunkow do embeddingu).
+    // Dopiero job "wiszacy" dluzej niz jakikolwiek run moglby trwac = osierocony.
+    const STALE_RUNNING_SECS: i64 = 2400; // 40 min > max_runtime 1800s
+    let cutoff = now_unix() - STALE_RUNNING_SECS;
+    let rows = match sql_query(
+        "SELECT id, document_id FROM ingest_jobs \
+         WHERE status = 'running' AND updated_at < ? LIMIT 50",
+        &[SqlValue::I64(cutoff)],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn(&format!("rag: reclaim odczyt osieroconych jobow nieudany: {e}"));
+            return;
+        }
+    };
+    for row in rows {
+        let job_id = row.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let document_id = row.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if job_id.is_empty() || document_id.is_empty() {
+            continue;
+        }
+        if let Err(e) = cleanup_document_artifacts(&document_id) {
+            log::warn(&format!(
+                "rag: reclaim cleanup artefaktow '{document_id}' nieudany (re-queue mimo to): {e}"
+            ));
+        }
+        match sql_exec(
+            "UPDATE ingest_jobs SET status='queued', updated_at=? WHERE id=? AND status='running'",
+            &[SqlValue::I64(now_unix()), SqlValue::String(job_id.clone())],
+        ) {
+            Ok(_) => log::info(&format!(
+                "rag: reclaim osieroconego joba '{job_id}' (dok '{document_id}') -> queued"
+            )),
+            Err(e) => log::warn(&format!("rag: reclaim re-queue joba '{job_id}' nieudany: {e}")),
+        }
+    }
+}
+
+/// Liczba jobow czekajacych w kolejce (status 'queued').
+fn queued_count() -> i64 {
+    sql_query_one("SELECT COUNT(*) FROM ingest_jobs WHERE status = 'queued'", &[])
+        .ok()
+        .flatten()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
 }
 
 /// Pipeline ingestu jednego dokumentu zbudowany na flow-ingescie core
@@ -1971,6 +2117,21 @@ fn normalize_entity_name(name: &str) -> String {
         .to_lowercase()
 }
 
+/// Grounding constraint ekstrakcji: odrzuca encje i relacje, ktorych (znormalizowana)
+/// nazwa NIE wystepuje w tekscie zrodlowym chunku. To praktyczny odpowiednik grammar-
+/// constraint na backendzie MLX (ktory nie ma GBNF): sparrotowany przyklad z promptu i
+/// halucynacje wypadaja, bo ich nie ma w tekscie; realne encje sa w nim doslownie.
+/// Predykat relacji (`relation`) NIE jest gruntowany — moze byc sparafrazowany. Haystack
+/// i id encji normalizowane tak samo (`normalize_entity_name`: lowercase + scalone spacje).
+fn ground_extraction(extraction: &mut ChunkExtraction, chunk_text: &str) {
+    let hay = normalize_entity_name(chunk_text);
+    let grounded = |id: &str| -> bool { !id.is_empty() && hay.contains(id) };
+    extraction.entities.retain(|e| grounded(&e.id));
+    extraction
+        .relations
+        .retain(|r| grounded(&r.head_id) && grounded(&r.tail_id));
+}
+
 /// Wycina tresc chat-completion lub bierze caly tekst, a nastepnie probuje
 /// wyciagnac obiekt JSON {entities, relations} TOLERUJAC proze wokol (LLM czesto
 /// owija JSON w komentarz albo ```json). Zwraca przyciety wg capow wynik. Smieci
@@ -2001,6 +2162,27 @@ fn parse_extraction_response(raw: &str) -> ChunkExtraction {
 /// Tolerancyjny: pomija linie nie pasujace do schematu, akceptuje prefiksy
 /// E/ENCJA/ENTITY i R/RELACJA/RELATION (case-insensitive), znosi bullet/spacje wokol
 /// separatora '|'. Zwraca `None` gdy zadna linia nie pasuje (caller probuje fallback JSON).
+/// Wartosci z SZABLONU/PRZYKLADU promptu ekstrakcji, ktore male modele kwantyzowane
+/// (bielik-7B) potrafia skopiowac doslownie do wyjscia. Poniewaz artefakt szablonu
+/// pojawia sie w KAZDYM chunku, przekracza prog denoisingu i awansuje jako falszywy
+/// fakt — dlatego twardo je odrzucamy na wejsciu parsera. Deskryptory formatu
+/// (`nazwa_head`…) NIGDY nie sa realnymi encjami; wartosci przykladu maja prefiks
+/// `EXAMPLE_SENTINEL`, ktorego realny tekst prawny nie zawiera.
+const EXTRACTION_PLACEHOLDERS: &[&str] = &[
+    "nazwa_encji",
+    "typ_encji",
+    "nazwa_head",
+    "nazwa_tail",
+    "relacja",
+];
+const EXAMPLE_SENTINEL: &str = "PRZYKLAD_";
+
+fn is_extraction_placeholder(s: &str) -> bool {
+    let t = s.trim();
+    let low = t.to_lowercase();
+    EXTRACTION_PLACEHOLDERS.iter().any(|p| low == *p) || t.contains(EXAMPLE_SENTINEL)
+}
+
 fn parse_extraction_lines(content: &str) -> Option<Value> {
     let mut entities: Vec<Value> = Vec::new();
     let mut relations: Vec<Value> = Vec::new();
@@ -2017,6 +2199,10 @@ fn parse_extraction_lines(content: &str) -> Option<Value> {
         let rest: Vec<&str> = parts.collect();
         if tag == "E" || tag == "ENCJA" || tag == "ENTITY" {
             if let Some(name) = rest.first().copied().filter(|s| !s.is_empty()) {
+                // Odrzuc skopiowany deskryptor formatu / wartosc przykladu.
+                if is_extraction_placeholder(name) {
+                    continue;
+                }
                 let typ = rest
                     .get(1)
                     .copied()
@@ -2026,6 +2212,13 @@ fn parse_extraction_lines(content: &str) -> Option<Value> {
             }
         } else if tag == "R" || tag == "RELACJA" || tag == "RELATION" {
             if rest.len() >= 3 && !rest[0].is_empty() && !rest[1].is_empty() && !rest[2].is_empty() {
+                // Odrzuc relacje z placeholderem w head/relacji/tail.
+                if is_extraction_placeholder(rest[0])
+                    || is_extraction_placeholder(rest[1])
+                    || is_extraction_placeholder(rest[2])
+                {
+                    continue;
+                }
                 relations.push(json!({ "head": rest[0], "relation": rest[1], "tail": rest[2] }));
             }
         }
@@ -2167,12 +2360,12 @@ fn call_extraction_llm(chunk_text: &str) -> Result<String, String> {
          R|nazwa_head|relacja|nazwa_tail\n\
          Bez JSON, bez markdown, bez komentarzy, bez numeracji. Nazwy head i tail kazdej \
          relacji (R) musza doslownie odpowiadac nazwie jakiejs encji (E).\n\n\
-         Przyklad formatu (NIE kopiuj wartosci):\n\
-         E|Dyrektywa 2018/2001|akt prawny\n\
-         E|biometan|substancja\n\
-         R|Dyrektywa 2018/2001|reguluje|biometan\n\n\
-         Powyzej to TYLKO przyklad formatu — NIE kopiuj jego wartosci. Wypisz \
-         RZECZYWISTE encje i relacje z ponizszego tekstu.\n\n\
+         Przyklad formatu (NIE kopiuj tych wartosci — to atrapy z prefiksem PRZYKLAD_):\n\
+         E|PRZYKLAD_Ustawa|akt prawny\n\
+         E|PRZYKLAD_Pojecie|pojecie\n\
+         R|PRZYKLAD_Ustawa|reguluje|PRZYKLAD_Pojecie\n\n\
+         Powyzej to TYLKO atrapa formatu — NIGDY nie wypisuj wartosci z prefiksem \
+         PRZYKLAD_. Wypisz RZECZYWISTE encje i relacje z ponizszego tekstu.\n\n\
          TEKST DO ANALIZY:\n{chunk_text}"
     );
     let model = "rag-llm";
@@ -2237,15 +2430,17 @@ fn denoising_threshold() -> u64 {
     parse_denoising_threshold(raw.as_deref())
 }
 
-/// Parsuje flage `graph_enabled` z surowego stanu KV. Tylko "1"/"true" (po trim,
-/// case-insensitive) => true; brak wpisu, pusta lub inna wartosc => false. DOMYSLNIE
-/// OFF — wlasciciel chce, by addon dzialal jak zwykly RAG wektorowy az do swiadomego
-/// zalaczenia grafu. Czysta funkcja: testowalna bez hosta.
+/// Parsuje flage `graph_enabled` z surowego stanu KV. "0"/"false" => OFF; brak wpisu
+/// (nowa instancja) LUB "1"/"true" => ON. DOMYSLNIE ON — graf wiedzy (MemGraphRAG) jest
+/// integralna czescia RAG, wiec nowa instancja buduje go od razu; wlasciciel moze go
+/// swiadomie wylaczyc przelacznikiem (zapisuje "0"). Czysta funkcja: testowalna bez hosta.
 fn parse_graph_enabled(raw: Option<&[u8]>) -> bool {
-    raw.and_then(|b| std::str::from_utf8(b).ok())
-        .map(|s| s.trim())
-        .map(|s| s.eq_ignore_ascii_case("1") || s.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    match raw.and_then(|b| std::str::from_utf8(b).ok()).map(|s| s.trim()) {
+        // Jawne wylaczenie przelacznikiem.
+        Some(s) if s.eq_ignore_ascii_case("0") || s.eq_ignore_ascii_case("false") => false,
+        // Brak wpisu (nowa instancja) lub jawne "1"/"true" => graf aktywny.
+        _ => true,
+    }
 }
 
 /// JEDYNE zrodlo prawdy o tym, czy warstwa grafu (MemGraphRAG) jest aktywna dla tej
@@ -4188,7 +4383,11 @@ fn extract_chunk_graph(
     truncated: &mut bool,
 ) -> Result<(usize, usize), String> {
     let raw = call_extraction_llm(chunk_text)?;
-    let extraction = parse_extraction_response(&raw);
+    let mut extraction = parse_extraction_response(&raw);
+    // Grounding: encja/relacja MUSI wystepowac w tekscie zrodlowym chunku. Male modele
+    // (bielik-7B) parrotuja przyklad z promptu zamiast ekstrahowac — sparrotowane wartosci
+    // nie wystepuja w chunku, wiec wypadaja; realne encje sa doslownie w tekscie.
+    ground_extraction(&mut extraction, chunk_text);
     // Capy per-chunk / pominiete za-dlugie relacje sygnalizowane przez parser (bug 5/6).
     if extraction.truncated {
         *truncated = true;
@@ -7596,17 +7795,19 @@ mod tests {
     #[test]
     fn parse_graph_enabled_defaults_off_and_overrides() {
         // DOMYSLNIE OFF: brak wpisu / pusty / smieci / "0" / "false" -> false (czysty RAG).
-        assert!(!parse_graph_enabled(None), "brak wpisu => off");
-        assert!(!parse_graph_enabled(Some(b"")), "pusty => off");
-        assert!(!parse_graph_enabled(Some(b"abc")), "smieci => off");
-        assert!(!parse_graph_enabled(Some(b"0")), "0 => off");
-        assert!(!parse_graph_enabled(Some(b"false")), "false => off");
-        assert!(!parse_graph_enabled(Some(b"2")), "inna liczba => off");
-        // Wlaczenie: "1"/"true" (case-insensitive, z otaczajacymi spacjami) -> true.
+        // DOMYSLNIE ON: brak wpisu (nowa instancja) => graf aktywny.
+        assert!(parse_graph_enabled(None), "brak wpisu => on (domyslnie)");
+        assert!(parse_graph_enabled(Some(b"")), "pusty => on (domyslnie)");
+        assert!(parse_graph_enabled(Some(b"abc")), "smieci => on (domyslnie)");
+        assert!(parse_graph_enabled(Some(b"2")), "inna liczba => on (domyslnie)");
         assert!(parse_graph_enabled(Some(b"1")), "1 => on");
         assert!(parse_graph_enabled(Some(b"true")), "true => on");
         assert!(parse_graph_enabled(Some(b"TRUE")), "TRUE => on");
         assert!(parse_graph_enabled(Some(b"  1  ")), "spacje wokol 1 => on");
+        // Jawne wylaczenie przelacznikiem: "0"/"false".
+        assert!(!parse_graph_enabled(Some(b"0")), "0 => off");
+        assert!(!parse_graph_enabled(Some(b"false")), "false => off");
+        assert!(!parse_graph_enabled(Some(b"  false  ")), "spacje wokol false => off");
     }
 
     #[test]

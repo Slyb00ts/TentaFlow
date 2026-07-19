@@ -278,6 +278,7 @@ function bindTabEvents() {
         b.dataset.svcName,
         b.dataset.svcNode,
         b.dataset.svcNodeLabel,
+        b.dataset.svcClusterDep,
       );
     };
   });
@@ -532,6 +533,18 @@ function bindAliasInlineEditEvents(root) {
       patchAliasesTab();
     });
   });
+  // Primary clear → unbind the model from the alias (draft only; persisted on
+  // Save as targetModel:'' → backend sets is_active=0). Fallbacks are dropped
+  // on save, but we keep them in the draft so a re-pick before saving restores
+  // the chain.
+  root.querySelectorAll('[data-primary-clear]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      if (!aliasEditDraft) return;
+      aliasEditDraft.targetModel = '';
+      patchAliasesTab();
+    };
+  });
   // Fallback remove → splice by index, re-render.
   root.querySelectorAll('[data-fallback-remove]').forEach((b) => {
     b.onclick = (e) => {
@@ -611,19 +624,20 @@ function attachFallbackDrag(listEl) {
   });
 }
 
-// Inline save — pushes ModelAliasUpdateRequest with the draft state. Keeps
-// is_active and alias name unchanged (toggle handles is_active, rename is not
-// part of the inline edit by design — rename forces a re-create flow).
+// Inline save — pushes ModelAliasUpdateRequest with the draft state. Alias name
+// is unchanged (rename forces a re-create flow). is_active is normally left to
+// the toggle, except when the primary is cleared: unbinding forces is_active
+// off since an alias with no target can never route.
 async function saveAliasInline(id) {
   const alias = aliases.find((x) => String(x.id) === id);
   if (!alias || !aliasEditDraft || aliasEditDraft.id !== id) return;
   const errEl = document.querySelector(`[data-edit-error="${CSS.escape(String(id))}"]`);
   const target = aliasEditDraft.targetModel.trim();
-  if (!target) {
-    if (errEl) { errEl.textContent = I18n.t('services.alias_required'); errEl.hidden = false; }
-    return;
-  }
-  const fbJson = aliasEditDraft.fallbacks.length > 0
+  // Empty primary means "unbind": the alias is kept but marked inactive. A
+  // fallback chain without a primary is meaningless, so we drop it (null) —
+  // otherwise a re-bound alias would silently inherit orphaned fallbacks.
+  const unbind = !target;
+  const fbJson = (!unbind && aliasEditDraft.fallbacks.length > 0)
     ? JSON.stringify(aliasEditDraft.fallbacks)
     : null;
   try {
@@ -631,7 +645,7 @@ async function saveAliasInline(id) {
       id,
       alias: alias.alias,
       targetModel: target,
-      isActive: alias.is_active,
+      isActive: unbind ? false : alias.is_active,
       strategy: aliasEditDraft.strategy,
       fallbackTargets: fbJson,
     });
@@ -690,6 +704,7 @@ function renderListTab() {
           <th>${escapeHtml(I18n.t('services.col_category'))}</th>
           <th>${escapeHtml(I18n.t('services.col_status'))}</th>
           <th>${escapeHtml(I18n.t('services.col_models'))}</th>
+          <th>${escapeHtml(I18n.t('services.col_gpu'))}</th>
           <th>${escapeHtml(I18n.t('services.col_restart'))}</th>
           <th style="text-align:right;">${escapeHtml(I18n.t('services.col_actions'))}</th>
         </tr>
@@ -843,6 +858,15 @@ function renderRow(s) {
           title="${escapeAttr(I18n.t('services.btn_deploy_logs'))}"></tf-button>`
     : '';
 
+  // Karty GPU serwisu (z deploy configu): "all" | "0,1" | "CPU". Puste = nie
+  // dotyczy (np. serwis zdalny bez tej informacji) -> myslnik. Indeksy monospace.
+  const gpuSel = String(s.gpuSelection ?? s.gpu_selection ?? '').trim();
+  const gpuCell = !gpuSel
+    ? '<span style="color:var(--text-3);">—</span>'
+    : (gpuSel === 'all' || gpuSel === 'CPU'
+        ? `<span style="color:var(--text-2);">${escapeHtml(gpuSel === 'all' ? I18n.t('services.gpu_all') : gpuSel)}</span>`
+        : `<span class="mono">${escapeHtml(gpuSel)}</span>`);
+
   return `
     <tr data-key="${rowKey}">
       <td data-label="${escapeAttr(I18n.t('services.col_node'))}">${nodeCell}</td>
@@ -866,6 +890,7 @@ function renderRow(s) {
       <td data-label="${escapeAttr(I18n.t('services.col_models'))}">
         <div style="display:flex;flex-wrap:wrap;gap:4px;">${modelChips}</div>
       </td>
+      <td data-label="${escapeAttr(I18n.t('services.col_gpu'))}">${gpuCell}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_restart'))}">${restartCell}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;white-space:nowrap;">
         <tf-button variant="ghost" size="sm" icon="${ppIcon}"
@@ -893,6 +918,7 @@ function renderRow(s) {
           data-svc-name="${escapeAttr(displayName)}"
           data-svc-node="${svcNodeId}"
           data-svc-node-label="${svcNodeLabel}"
+          data-svc-cluster-dep="${escapeAttr(s.cluster_deployment_id || s.clusterDeploymentId || '')}"
           title="${escapeAttr(I18n.t('services.btn_delete'))}"></tf-button>
         <span class="svc-row-error" data-svc-error="${svcActionKey}" hidden></span>
       </td>
@@ -1271,6 +1297,9 @@ function renderAliasInlineEdit(a) {
         ? `<div class="form-error">${escapeHtml(I18n.t('services.alias_fallback_parse_failed'))}</div>`
         : ''}
       <div class="form-error" hidden data-edit-error="${escapeAttr(a.id)}"></div>
+      ${!aliasEditDraft.targetModel
+        ? `<div class="form-hint">${sprite('info')} ${escapeHtml(I18n.t('services.alias_unbound_hint'))}</div>`
+        : ''}
 
       <div class="edit-foot">
         <tf-button variant="ghost" size="sm" icon="x" data-alias-cancel="${escapeAttr(a.id)}">${escapeHtml(I18n.t('services.alias_cancel'))}</tf-button>
@@ -1285,17 +1314,25 @@ function renderAliasInlineEdit(a) {
 function renderFallbackItems(draft) {
   // Primary slot is the currently-selected target_model (read-only here — change
   // it via the "Primary target" select above). Indexed 1..N for the chain.
-  const primaryLabel = draft.targetModel
+  const hasPrimary = !!draft.targetModel;
+  const primaryLabel = hasPrimary
     ? draft.targetModel
     : `— ${I18n.t('services.alias_target_placeholder')} —`;
   const items = [];
+  // Unbind control is only meaningful when a primary is bound; with an empty
+  // primary the row already reads as "unbound", so we render an empty slot.
+  const unbindBtn = hasPrimary
+    ? `<tf-button variant="ghost" size="sm" icon="ban"
+                 data-primary-clear
+                 title="${escapeAttr(I18n.t('services.alias_unbind'))}"></tf-button>`
+    : '<span></span>';
   items.push(`
     <div class="svc-fallback-item primary" data-fallback-primary>
       <span class="pos">${escapeHtml(I18n.t('services.alias_primary_target_pos'))}</span>
       <span></span>
       <span></span>
       <span class="name">${escapeHtml(primaryLabel)}</span>
-      <span></span>
+      ${unbindBtn}
     </div>
   `);
   draft.fallbacks.forEach((name, idx) => {
@@ -1740,19 +1777,40 @@ async function deleteAlias(id, name) {
 
 // ---- Helpers --------------------------------------------------------------
 
-async function stopService(id, name, nodeId, nodeLabel) {
+async function stopService(id, name, nodeId, nodeLabel, clusterDep) {
+  // Wiersz czlonka klastra (head/worker kontenera TP): usuniecie pojedynczego
+  // ranka rozwaliloby caly TP-klaster, wiec kierujemy akcje na CALY klaster —
+  // koordynator rozsyla stop do wszystkich nodow (ClusterDeployStopRequest).
+  const isCluster = !!(clusterDep && clusterDep.length);
   const ok = await TfWindow.confirm({
-    title: I18n.t('services.confirm_delete_title'),
-    message: I18n.t('services.confirm_delete_body', {
-      name: name || id,
-      node: nodeLabel || nodeId || '—',
-    }),
-    confirmLabel: I18n.t('services.btn_delete'),
+    title: isCluster
+      ? I18n.t('cluster_detail.deploy_stop_title')
+      : I18n.t('services.confirm_delete_title'),
+    message: isCluster
+      ? I18n.t('cluster_detail.deploy_stop_confirm')
+      : I18n.t('services.confirm_delete_body', {
+        name: name || id,
+        node: nodeLabel || nodeId || '—',
+      }),
+    confirmLabel: isCluster ? I18n.t('cluster_detail.deploy_stop') : I18n.t('services.btn_delete'),
     cancelLabel: I18n.t('common.cancel'),
     danger: true,
   });
   if (!ok) return;
   try {
+    if (isCluster) {
+      // Pusty clusterId — backend wyprowadza go z rekordu deploymentu; teardown
+      // usuwa kontenery i wiersze czlonkow na WSZYSTKICH nodach klastra.
+      const resp = await ApiBinary.action('clusterDeployStopRequest', {
+        clusterId: '',
+        deploymentClusterId: clusterDep,
+      }, { timeoutMs: 180000 });
+      if (resp && resp.ok === false) {
+        throw new Error(resp.message || 'stop klastra nieudany');
+      }
+      await refreshServiceList();
+      return;
+    }
     // ServiceDeleteRequest stops the runtime AND removes the row; FK cascade
     // wipes attached model_registry rows. When nodeId points at a remote peer
     // the dispatcher forwards the call as `MeshCommandType::ServiceDeleteRemote`.
