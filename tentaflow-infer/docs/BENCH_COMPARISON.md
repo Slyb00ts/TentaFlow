@@ -696,3 +696,118 @@ a **W4A8** kernel (Marlin-QQQ / int4-weight × int8-activation), which — unlik
 would use the int8 tensor cores and is the only Marlin-family variant that could match the
 reference's compute path. The committed `gemm_i8mma_core` kernel is **retained unchanged**
 (tree == HEAD; Marlin lives only in `scratch/`, nothing brought in-tree).
+
+---
+
+# W4A8 (int4-weight × int8-activation) investigation — 2026-07-19
+
+Follow-up to the W4A16-Marlin NO-GO above. The prior recommendation ended on: the only
+Marlin-family variant that could beat llama.cpp is **W4A8** on the int8 tensor cores. This
+section is the cheap go/no-go for that path (QServe / Marlin-QQQ style), run on this machine.
+Every number is a real run; the committed `gemm_i8mma` kernel is retained unchanged. Nothing
+brought in-tree.
+
+Baselines reconfirmed this session, GPU at full boost (SM 2775 MHz, ~320 W, 56 °C):
+
+- `llama-bench -p 4096 -n 128`: **pp4096 = 7472–7480 tok/s**, tg128 = 173 (stable across 3 reps).
+  NOTE: the task brief cited ~11984; that figure does **not** reproduce on this box/build —
+  the honest local target is **~7475**. (Build `112c781`, ggml CUDA, `-ngl 99`.)
+- `forge bench --prefix-cache off` (committed Q4_K int8-MMQ): pp512 **2591**, pp4096 **3794**,
+  pp8192 **2955** tok/s; decode 175/146/131.
+
+## Hardware fact first: Ada DOES have int4 tensor cores (2× int8)
+
+Pure-issue microbench (8 independent accumulator chains, registers only, 3-rep steady):
+
+| mma | shape | steady rate |
+|-----|-------|-------------|
+| `s8.s8.s32`  | m16n8k32 | **714 TOPS** |
+| `s4.s4.s32`  | m16n8k64 | **1428 TOPS** (2×, identical wall-clock/instruction) |
+
+So on the 4090: an **int4×int4** GEMM can peak at ~1428, but **int4×int8 has no native mixed
+mma** — W4A8 must upconvert the int4 weight to int8 and issue `s8.s8` mma → same **714 ceiling**
+as the committed MMQ. W4A8's only lever over Q4_K-MMQ is a *cleaner dequant/epilogue*, not more
+mma throughput. (A true W4A4 on `s4.s4` is the only path with raw headroom above 714, but int4
+activations are accuracy-hostile and out of scope.)
+
+## Phase A — QServe W4A8 GEMM, standalone, on our exact Mistral FFN shapes
+
+Kernel: QServe `w4a8_per_group` `dense_kernel0` (MIT; `github.com/mit-han-lab/qserve`),
+torch stripped, built `nvcc -arch=sm_89 -O3`, benchmarked with a CUDA-event harness
+(sustained ~1.5 s warmup to reach boost clock — mandatory, the 4090 boot-clock artifact swings
+readings 2× otherwise; best-of-30×20). ops = 2·M·N·K. Same-session apples-to-apples against the
+**committed FORGE CUDA MMQ** (`gemm_i8mma.cu`, same harness).
+
+**down-proj** N=4096 K=14336 · **gate/up** N=14336 K=4096:
+
+| T | shape | FORGE committed CUDA | QServe W4A8 | llama.cpp MMQ (CODEGEN_PROOF, nvcc) |
+|---|-------|----------------------|-------------|-------------------------------------|
+| 512  | down    | 92.4  | ~320–433 | ~219 |
+| 512  | gate/up | 95.3  | ~407     | ~223 |
+| 2048 | down    | 111.8 | **452.8** | ~208 |
+| 2048 | gate/up | 109.3 | **445.6** | ~224 |
+| 4096 | down    | 111.6 | **455.6** | — |
+| 4096 | gate/up | 109.5 | **450.7** | — |
+
+(TFLOP-eq. QServe raw µs @T=2048: down 531, gate/up 540; @T=4096: down 1056, gate/up 1067 —
+monotone/linear = correct GEMM. The committed kernel sits at ~110, matching the repo's ~107.)
+
+**DECISIVE GATE — PASS.** QServe W4A8 reaches **~450 TFLOP-eq at T≥2048** and **~400+ at T=512**
+— **2.2× llama.cpp's 206** and **4.0× FORGE's committed 110**, at the same boost clock. This is
+the first FORGE-adjacent kernel to clearly clear the 206 wall. (Unlike W4A16 Marlin, which
+plateaued at 174 = fp16 peak.) The win is *scheduling*: QServe uses `cp.async` multi-stage
+pipelining + large tiles + a clean symmetric int4 dequant, where MMQ pays for Q4_K's per-32
+affine unpack in the inner loop.
+
+### End-to-end projection (GEMM = 81 % of prefill)
+GEMM 4.0× (110→450) → prefill speedup = 1/(0.19 + 0.81/4.0) = **2.55×**.
+
+| shape | FORGE now | projected W4A8 | llama.cpp (local) | ratio vs llama.cpp |
+|-------|-----------|----------------|-------------------|--------------------|
+| pp4096 | 3794 | **~9670** | 7475 | **1.29× (BEATS)** |
+| pp512  | 2591 | ~6600 | — | — |
+| pp8192 | 2955 | ~7530 | — | — |
+
+Against the **locally measured** llama.cpp (7475) the integration is projected to **win** on
+pp4096. Against the brief's 11984 (not reproducible here) it would be ~0.81×.
+
+## Phase B — Q4_K → W4A8 requant accuracy (CPU, real Mistral FFN tensors)
+
+`cargo run -p forge-formats --example requant_w4a8` dequantizes 15 FFN tensors (blocks
+0/7/15/23/31), requantizes each row to int4 per-group, reports `relL2 = ‖W_q4k − W_w4a8‖/‖W_q4k‖`
+(the *additional* error on top of Q4_K):
+
+| group | symmetric relL2 | asymmetric (int4+zero) relL2 |
+|-------|-----------------|------------------------------|
+| 32  | 0.0987 | **0.0809** |
+| 64  | 0.1100 | 0.0919 |
+| 128 (kernel's G) | 0.1209 | **0.1024** |
+
+The QServe per-group kernel is compiled at **G=128** → **~10.2 % relL2** even asymmetric — a
+non-trivial perturbation of an already-Q4_K-quantized model (Q4_K vs fp16 is typically ~2–4 %).
+QServe's *actual* dequant is stricter still: two-level QoQ (`w_i8 = q4·s2_int8 + zero_int8`, then
+`·s1_fp16·ascale`) with an **int8** group scale, so a faithful Q4_K→QServe requant would be
+**≥10 %** relL2. Coherence (does Mistral still say "Paris") was **not** measured — that requires
+the full Phase-C integration.
+
+## Phase C — integration: greenlit, NOT shipped this session
+
+Phase A clears the go/no-go decisively and the projection beats the *local* llama.cpp, so the
+route is worth taking. It was **not** integrated here because a correct build is a large,
+high-risk lift that cannot be shipped half-done (repo rule: never ship slower/incorrect than
+the committed kernel; the committed `gemm_i8mma` stays as the fallback). Concretely Phase C needs,
+all validated only against a CPU golden + a coherence oracle (no QServe reference checkpoint):
+
+1. **Q4_K → QoQ requant at load** — int4 codes + per-group int8 `s2` scale + int8 `zero` +
+   per-channel fp16 `s1`, reproducing QServe's **8-D weight interleave** (`M//32, K//32, (8,4),
+   (2,2,2,4)` permute) exactly, else ldmatrix reads garbage → gibberish.
+2. **Per-token int8 activation quant** producing `ascale` (per-token fp16) + the zero-correction
+   `input_sum`, distinct from FORGE's per-32-block `quantize_act_q8_1`.
+3. In-tree `kernels/cuda/w4a8_gemm.cu` (MIT attribution) → committed cubin via `build.sh` →
+   `registry.rs` entry → launcher → route Q4_K prefill GEMM. Q8_0 + NVFP4 untouched.
+4. Gate on coherence + measure the pp512/4096/8192 delta and the load-time repack cost.
+
+## Committed state
+Tree == HEAD. QServe lives only in scratch (`scratch/w4a8/`, outside the repo). The one added
+file is `crates/forge-formats/examples/requant_w4a8.rs` (the Phase-B measurement tool,
+reproducible, harmless). Committed `gemm_i8mma_core` retained unchanged.

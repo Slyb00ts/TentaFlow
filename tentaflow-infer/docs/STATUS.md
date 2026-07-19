@@ -490,3 +490,31 @@ W4A16 wygrywa tylko w reżimie memory-bound (mały batch/decode), nie w compute-
 prefill. Droga do pobicia llama.cpp zostaje na int8 (vendorowanie `mul_mat_q`,
 cuBLASLt int8, albo W4A8/Marlin-QQQ). Committed kernel `gemm_i8mma_core` bez zmian
 (drzewo == HEAD). Szczegóły + surowe liczby: `docs/BENCH_COMPARISON.md`.
+
+## W4A8 (Phase A go/no-go, 2026-07-19) — **GO** (zprojektowane pobicie llama.cpp), NIE zintegrowano
+
+Kontynuacja po NO-GO Marlina W4A16. Kernel QServe `w4a8_per_group` (int4-waga ×
+int8-aktywacja, MIT) zbudowany standalone `nvcc -arch=sm_89`, torch usunięty,
+zmierzony na dokładnych kształtach FFN Mistral-7B (`scratch/w4a8/`, poza drzewem;
+harness z sustained-warmup, best-of-30). Fakt sprzętowy: na 4090 `s4.s4` mma =
+**1428 TOPS = 2× `s8.s8` (714)**, ale int4×int8 nie ma natywnego mieszanego mma →
+W4A8 podnosi wagę int4→int8 i używa `s8` (sufit 714, ten sam co MMQ); przewaga
+W4A8 to *czystszy dequant/pipeline*, nie więcej mma.
+
+Wynik Phase A (TFLOP-eq, ten sam boost clock 2775 MHz): QServe W4A8 **~450 przy
+T≥2048** i **~400+ przy T=512** — **2.2× llama.cpp (206)** i **4.0× committed FORGE
+CUDA (110)**. Pierwszy kernel przekraczający ścianę 206. Projekcja e2e (GEMM=81%,
+4.0×): prefill ×2.55 → pp4096 **~9670** vs **lokalnie zmierzone** llama.cpp **7475**
+= **1.29× (POBICIE)**. (Uwaga: brief cytował 11984 — NIE reprodukuje się na tej
+maszynie/buildzie; realny lokalny cel to ~7475.)
+
+Phase B (dokładność, CPU, realne tensory): requant Q4_K→int4 per-group **G=128**
+(wymóg kernela) = **~10.2% relL2** (asym) ponad Q4_K; QoQ QServe (int8 scale grupy)
+byłby ≥10%. Nietrywialna degradacja, koherencja niezmierzona (wymaga Phase C).
+
+Phase C **zielone światło, ale NIE wdrożone** w tej sesji: poprawny build to duży,
+ryzykowny nakład (8-D interleave wag QServe + QoQ requant z Q4_K + per-token int8
+act-quant + routing), walidowalny tylko golden-CPU + oracle koherencji — nie do
+wysłania w połowie (reguła: nigdy nie wysyłaj wolniej/niepoprawnie niż committed;
+`gemm_i8mma` zostaje fallbackiem). Committed kernel bez zmian (drzewo == HEAD).
+Szczegóły + surowe liczby + plan Phase C: `docs/BENCH_COMPARISON.md`.
