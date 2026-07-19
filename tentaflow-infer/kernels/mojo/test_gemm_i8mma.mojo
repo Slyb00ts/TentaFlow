@@ -13,6 +13,7 @@ from std.gpu.host import DeviceContext
 from src.gemm import gemm_q8_0_f16, gemm_q4_k_f16
 from src.gemm import gemm_q8_0_i8mma, gemm_q8_0_i8mma_bm64
 from src.gemm import gemm_q4_k_i8mma, gemm_q4_k_i8mma_bm64
+from src.gemm import quantize_act_q8_1
 
 comptime KERNEL_TOL: Float32 = 0.01  # i8mma kernel vs exact CPU MMQ reference
 
@@ -81,16 +82,25 @@ def main() raises:
                         (Int((r * 31 + b * 17 + k * 13) % 255) - 127) & 0xFF
                     )
 
+    var xq = ctx.enqueue_create_buffer[DType.int8](T * COLS)
+    var xd = ctx.enqueue_create_buffer[DType.float32](T * (COLS // 32))
+    var xsm = ctx.enqueue_create_buffer[DType.float32](T * (COLS // 32))
     ctx.enqueue_function[gemm_q8_0_f16](
         yref.unsafe_ptr(), wq.unsafe_ptr(), x.unsafe_ptr(), COLS, ROWS, T,
         grid_dim=((ROWS + 63) // 64, (T + 127) // 128), block_dim=256,
     )
+    ctx.enqueue_function[quantize_act_q8_1](
+        xq.unsafe_ptr(), xd.unsafe_ptr(), xsm.unsafe_ptr(), x.unsafe_ptr(), COLS, T,
+        grid_dim=(T * (COLS // 32) + 255) // 256, block_dim=256,
+    )
     ctx.enqueue_function[gemm_q8_0_i8mma](
-        ym.unsafe_ptr(), wq.unsafe_ptr(), x.unsafe_ptr(), COLS, ROWS, T,
+        ym.unsafe_ptr(), wq.unsafe_ptr(), xq.unsafe_ptr(), xd.unsafe_ptr(),
+        xsm.unsafe_ptr(), COLS, ROWS, T,
         grid_dim=((ROWS + 63) // 64, (T + 127) // 128), block_dim=256,
     )
     ctx.enqueue_function[gemm_q8_0_i8mma_bm64](
-        ym64.unsafe_ptr(), wq.unsafe_ptr(), x.unsafe_ptr(), COLS, ROWS, T,
+        ym64.unsafe_ptr(), wq.unsafe_ptr(), xq.unsafe_ptr(), xd.unsafe_ptr(),
+        xsm.unsafe_ptr(), COLS, ROWS, T,
         grid_dim=((ROWS + 63) // 64, (T + 63) // 64), block_dim=256,
     )
     ctx.synchronize()
@@ -155,16 +165,25 @@ def main() raises:
                 for i in range(128):
                     h[off + 16 + i] = UInt8((r * 31 + b * 17 + i * 13) % 256)
 
+    var xkq = ctx.enqueue_create_buffer[DType.int8](T * KCOLS)
+    var xkd = ctx.enqueue_create_buffer[DType.float32](T * (KCOLS // 32))
+    var xksm = ctx.enqueue_create_buffer[DType.float32](T * (KCOLS // 32))
     ctx.enqueue_function[gemm_q4_k_f16](
         ykref.unsafe_ptr(), wk.unsafe_ptr(), xk.unsafe_ptr(), KCOLS, ROWS, T,
         grid_dim=((ROWS + 63) // 64, (T + 127) // 128), block_dim=256,
     )
+    ctx.enqueue_function[quantize_act_q8_1](
+        xkq.unsafe_ptr(), xkd.unsafe_ptr(), xksm.unsafe_ptr(), xk.unsafe_ptr(), KCOLS, T,
+        grid_dim=(T * (KCOLS // 32) + 255) // 256, block_dim=256,
+    )
     ctx.enqueue_function[gemm_q4_k_i8mma](
-        ykm.unsafe_ptr(), wk.unsafe_ptr(), xk.unsafe_ptr(), KCOLS, ROWS, T,
+        ykm.unsafe_ptr(), wk.unsafe_ptr(), xkq.unsafe_ptr(), xkd.unsafe_ptr(),
+        xksm.unsafe_ptr(), KCOLS, ROWS, T,
         grid_dim=((ROWS + 63) // 64, (T + 127) // 128), block_dim=256,
     )
     ctx.enqueue_function[gemm_q4_k_i8mma_bm64](
-        ykm64.unsafe_ptr(), wk.unsafe_ptr(), xk.unsafe_ptr(), KCOLS, ROWS, T,
+        ykm64.unsafe_ptr(), wk.unsafe_ptr(), xkq.unsafe_ptr(), xkd.unsafe_ptr(),
+        xksm.unsafe_ptr(), KCOLS, ROWS, T,
         grid_dim=((ROWS + 63) // 64, (T + 63) // 64), block_dim=256,
     )
     ctx.synchronize()

@@ -25,13 +25,18 @@ Ostatnia aktualizacja: 2026-07-18.
   GEMV+GEMM (wszystkie quanty + dp4a int8 + mma tensor-core), paged flash
   attention (decode split-K + prefill, GQA), conv1d/gelu (Whisper), sampling GPU,
   MoE router (softmax→top-k→renorm) + scale-add akumulacja ekspertów
-  - ℹ️ **Prefill GEMM = f16 tensor-core** (dequant Q→f16 → mma). Zbadano int8-MMQ
-    dp4a (`gemm_i8_dp4a_impl`, Q8_0+Q4_K, `mul_mat_q`): poprawny (≈5e-4 vs exact
-    CPU dp4a), ale na Adzie ~1.8× WOLNIEJSZY (dp4a ≈33 vs f16 ≈60 TFLOP/s, T=512)
-    — dp4a liczy na rdzeniach CUDA, f16 offloaduje MAC na tensor-core. Prefill
-    zostaje na f16 (bez regresji); dp4a jest zarejestrowany+przetestowany, nie
-    domyślny. llama.cpp jest szybszy przez int8 **tensor-core** mma, którego
-    Mojo `inlined_assembly` nie potrafi zmarshalować (wyjście 4×s32) — szczegóły
+  - ℹ️ **Prefill GEMM Q8_0/Q4_K = int8-MMQ tensor-core** (`gemm_i8mma_impl`,
+    `mma.sync.m16n8k32.s8.s8.s32` przez `inlined_assembly`+`_RegisterPackType` —
+    marshalling 4×s32 rozwiązany). Aktywacja kwantyzowana do q8_1 RAZ na GEMM
+    w prepassie `quantize_act_q8_1` (int8 `[T,K]` + skale block-major `[K/32,T]`
+    dla koalescencji), GEMM czyta int8 X bezpośrednio → połowa pasma X + zero
+    redundantnej rekwantyzacji per blok wag. Efekt: Mistral Q4_K prefill
+    ~+5–7 % (4096: 2650→~2837 tok/s), Qwen Q8_0 ~+1–2 %; dekod bit-bez-zmian
+    (dp4a GEMV). Poprawność ≈4.6e-4 vs exact CPU MMQ. Pozostałe formaty prefill
+    = f16 tensor-core (dequant Q→f16 → mma). Wciąż ~4.5× za llama.cpp MMQ
+    (11–12.8k); prepass to 0.0 % czasu (nsys) — luka to wydajność mma-issue /
+    occupancy GEMM, nie staging X. Głębsze próby (cp.async X, BN=128) świadomie
+    odłożone (wysokie ryzyko regresji, niski zysk wg profilu) — szczegóły
     w `kernels/mojo/MOJO_NOTES.md`.
 - ✅ **Silnik LLM**: forward, paged KV, fused decode chain, batched continuous
   decode (36× throughput), chunked prefill, admission control, CUDA-graph per bucket

@@ -128,6 +128,40 @@ Published tutorials mostly show pre-1.0 syntax — trust these notes over old do
   wins because i8mma reads half the weight smem and issues half the mma. Still
   ~4x below llama.cpp's fused MMQ (11-12.8k); the remaining gap is staging
   (cp.async / pre-quantized global X) + kernel fusion, not the intrinsic.
+- **Pre-quantized global X (q8_1 pre-pass) — SHIPPED, ~+5-7% Q4_K prefill.**
+  `quantize_act_q8_1` (gemm.mojo) writes the activation tile as q8_1 ONCE into a
+  grow-only global scratch (int8 codes `[T,K]` + per-32-block f32 scale/`d*Σq`),
+  then `gemm_i8mma_impl` reads int8 X directly instead of loading f16 X and
+  requantizing it in every one of the grid's `ceil(rows/64)` weight-row blocks.
+  This halves X read bandwidth and removes the redundant requant. Rust side: the
+  scratch + both launches live in `Kernels::gemm_i8mma_run` (launchers.rs), from
+  `Pool::Activations` (never reset in the engine → grow-only is safe, no aliasing).
+  - **CRITICAL layout gotcha (cost a full regression first):** the per-token
+    scale buffers MUST be **block-major `[K/32, T]`**, not `[T, K/32]`. In the
+    GEMM consecutive lanes (tid<BM) map to consecutive tokens, so a `[T,K/32]`
+    scale load strides by `nb` per lane → 32 uncoalesced 4-byte transactions per
+    stage, which made the whole change ~12% SLOWER than the in-register scale it
+    replaced. Block-major makes those loads coalesce (consecutive tokens are
+    contiguous) and flips it to a win. The int8 code buffer stays `[T,K]`
+    row-major (the ld_matrix staging load is per-token-contiguous either way).
+  - The pre-pass is negligible (nsys: `quantize_act_q8_1` = 0.0% of prefill,
+    ~11 us/launch; the i8mma GEMM is ~74%). Numeric bound unchanged: rel err
+    ~4.6e-4 vs exact CPU MMQ (test_gemm_i8mma.mojo, updated to pre-quant + pass
+    xq/xd/xsm). bm64 still bit-identical to bm128.
+  - **Why only ~+5-7% despite halving the dominant (X) traffic:** for gate/up
+    (K=4096, N=14336) X is re-read `ceil(N/64)=224x` = ~0.94 GB int8 vs weights
+    ~0.24 GB, so X *is* the bulk of the bytes — yet cutting total traffic ~40%
+    gained only single digits. The existing software pipeline (gl 2-stage-ahead
+    LDG + sw STS) already hides the load latency, so the GEMM is
+    occupancy/mma-issue bound, not memory-stall bound. Corollaries measured/
+    reasoned, NOT yet done: (2) cp.async for X (now int8 in global) mostly frees
+    a 32-byte register + one STS — small, since the pipeline already hides the
+    copy; (3) BN=128 (128 rows/block, halves X re-reads) needs 2-pass W staging
+    (256 thr / 4-per-row = only 64 rows/pass) — a real rewrite of the bit-exact
+    W path for an expected few-% traffic win that the occupancy limit would cap.
+    Both deprioritized: high regression risk on a proven kernel, low expected
+    payoff given the profile. The lever for the 4.5x is raising mma-issue
+    efficiency / occupancy (register pressure, warp scheduling), not X staging.
 
 ## FP8 (e4m3) — verified on sm_89
 - `DType.float8_e4m3fn` works end-to-end: buffers, kernel pointers, and

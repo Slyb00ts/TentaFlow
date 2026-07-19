@@ -41,6 +41,7 @@ from src.gemm import gemm_f16_out_f32, gemm_f16_out_f32_bm64
 from src.gemm import gemm_q8_0_out_f32, gemm_q8_0_out_f32_bm64
 from src.gemm import gemm_q4_k_f16, gemm_q4_k_f16_bm64
 from src.gemm import gemm_q8_0_i8mma, gemm_q8_0_i8mma_bm64
+from src.gemm import quantize_act_q8_1
 from src.gemm import gemm_q4_k_i8mma, gemm_q4_k_i8mma_bm64
 from src.gemm import gemm_q6_k_f16, gemm_q6_k_f16_bm64
 from src.prefill import kv_append_batch_f16, attn_prefill_f16_hd64, attn_prefill_f16_hd128, attn_prefill_f16_hd256
@@ -347,6 +348,9 @@ def main() raises:
 
     _ = ctx.compile_function[gemm_q4_k_f16_bm64, dump_asm=Path("gemm_q4_k_f16_bm64.ptx")]()
     entries.append(_finalize(out_dir, "gemm_q4_k_f16_bm64"))
+
+    _ = ctx.compile_function[quantize_act_q8_1, dump_asm=Path("quantize_act_q8_1.ptx")]()
+    entries.append(_finalize(out_dir, "quantize_act_q8_1"))
 
     _ = ctx.compile_function[gemm_q8_0_i8mma, dump_asm=Path("gemm_q8_0_i8mma.ptx")]()
     entries.append(_finalize(out_dir, "gemm_q8_0_i8mma"))

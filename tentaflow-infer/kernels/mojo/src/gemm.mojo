@@ -16,7 +16,7 @@
 # are never stored; the k tail zero-fills W chunks so clamped X data
 # multiplies against zeros.
 
-from std.gpu import block_idx, thread_idx
+from std.gpu import block_dim, block_idx, thread_idx
 from std.gpu.sync import barrier
 from std.gpu.memory import (
     AddressSpace,
@@ -2846,10 +2846,52 @@ def _mma_s8(
     return SIMD[DType.int32, 4](r[0], r[1], r[2], r[3])
 
 
+def quantize_act_q8_1(
+    xq: UnsafePointer[Int8, MutAnyOrigin],
+    xd: UnsafePointer[Float32, MutAnyOrigin],
+    xsm: UnsafePointer[Float32, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_tokens: Int,
+):
+    """Pre-pass: quantize activation x[T, K] to q8_1 — int8 codes into `xq`
+    ([T, K] row-major), the per-32-block scale `d` into `xd` and `d*Σcodes`
+    into `xsm`. The scale buffers are BLOCK-major [K/32, T] so the GEMM's
+    per-token scale loads (consecutive lanes = consecutive tokens) coalesce;
+    a [T, K/32] layout strides them and tanks the GEMM. Each token-block is
+    quantized ONCE here instead of redundantly by every weight-row block, and
+    the GEMM then reads int8 X (half the f16 X bandwidth)."""
+    nb = n_cols // 32
+    idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if idx >= n_tokens * nb:
+        return
+    tok = idx // nb
+    blk = idx % nb
+    off = tok * n_cols + blk * 32
+    sidx = blk * n_tokens + tok
+    xf = (x + off).load[width=32, alignment=64]().cast[DType.float32]()
+    amax = abs(xf).reduce_max()
+    if amax == 0.0:
+        (xq + off).store[alignment=32](SIMD[DType.int8, 32](0))
+        xd[sidx] = 0.0
+        xsm[sidx] = 0.0
+    else:
+        d = amax * (1.0 / 127.0)
+        q = round(xf * (127.0 / amax)).cast[DType.int8]()
+        (xq + off).store[alignment=32](q)
+        xd[sidx] = d
+        var sumq: Int32 = 0
+        comptime for e in range(32):
+            sumq += Int32(q[e])
+        xsm[sidx] = d * Float32(sumq)
+
+
 def gemm_i8mma_impl[BM: Int, FMT: Int](
     y: UnsafePointer[Float16, MutAnyOrigin],
     w: UnsafePointer[UInt8, MutAnyOrigin],
-    x: UnsafePointer[Float16, MutAnyOrigin],
+    xq_g: UnsafePointer[Int8, MutAnyOrigin],
+    xd_g: UnsafePointer[Float32, MutAnyOrigin],
+    xsm_g: UnsafePointer[Float32, MutAnyOrigin],
     n_cols: Int,
     n_rows: Int,
     n_tokens: Int,
@@ -2918,8 +2960,12 @@ def gemm_i8mma_impl[BM: Int, FMT: Int](
         fill=SIMD[DType.float32, 4](0.0)
     )
 
-    # Stage-ahead prefetch registers (raw global reads).
-    var xf = SIMD[DType.float16, 32](0)
+    # Stage-ahead prefetch registers (raw global reads). X now arrives already
+    # q8_1-quantized (quantize_act_q8_1 pre-pass), so staging is a pure int8
+    # copy — no per-block requant in the hot kernel.
+    var xcodes = SIMD[DType.int8, 32](0)
+    var xdv = Float32(0)
+    var xsv_g = Float32(0)
     var wcodes = SIMD[DType.uint8, 8](0)
     var wsc = Float16(0)
     var whdr = SIMD[DType.uint8, 16](0)
@@ -2927,7 +2973,10 @@ def gemm_i8mma_impl[BM: Int, FMT: Int](
     comptime W_QOFF = 2 if FMT == 0 else 16
 
     if tid < BM:
-        xf = (x + xtok_c * n_cols).load[width=32, alignment=64]()
+        xcodes = (xq_g + xtok_c * n_cols).load[width=32, alignment=32]()
+        xdv = xd_g[xtok_c]
+        comptime if FMT == 1:
+            xsv_g = xsm_g[xtok_c]
     comptime if FMT == 0:
         wcodes = (w + wrow_base + W_QOFF + part * 8).load[width=8, alignment=2]()
         if part == 0:
@@ -2946,23 +2995,10 @@ def gemm_i8mma_impl[BM: Int, FMT: Int](
     @always_inline
     def sw(sidx: Int, buf: Int):
         if tid < BM:
-            xv = xf.cast[DType.float32]()
-            amax = abs(xv).reduce_max()
-            if amax == 0.0:
-                (xq + buf * BM * 32 + tid * 32).store[alignment=32](
-                    SIMD[DType.int8, 32](0)
-                )
-                xd[buf * BM + tid] = 0.0
-                xsm[buf * BM + tid] = 0.0
-            else:
-                d = amax * (1.0 / 127.0)
-                q = round(xv * (127.0 / amax)).cast[DType.int8]()
-                (xq + buf * BM * 32 + tid * 32).store[alignment=32](q)
-                xd[buf * BM + tid] = d
-                var sumq: Int32 = 0
-                comptime for e in range(32):
-                    sumq += Int32(q[e])
-                xsm[buf * BM + tid] = d * Float32(sumq)
+            (xq + buf * BM * 32 + tid * 32).store[alignment=32](xcodes)
+            xd[buf * BM + tid] = xdv
+            comptime if FMT == 1:
+                xsm[buf * BM + tid] = xsv_g
 
         var codes8: SIMD[DType.int8, 8]
         comptime if FMT == 0:
@@ -2983,9 +3019,12 @@ def gemm_i8mma_impl[BM: Int, FMT: Int](
     @always_inline
     def gl(sidx: Int):
         if tid < BM:
-            xf = (x + xtok_c * n_cols + sidx * 32).load[
-                width=32, alignment=64
+            xcodes = (xq_g + xtok_c * n_cols + sidx * 32).load[
+                width=32, alignment=32
             ]()
+            xdv = xd_g[sidx * n_tokens + xtok_c]
+            comptime if FMT == 1:
+                xsv_g = xsm_g[sidx * n_tokens + xtok_c]
         comptime if FMT == 0:
             wcodes = (w + wrow_base + sidx * 34 + 2 + part * 8).load[
                 width=8, alignment=2

@@ -36,15 +36,27 @@ match is `tg @ depth` (generate after a prompt of that depth), shown alongside t
 
 | Scenario (prompt / gen) | Engine | Model / quant | Prefill tok/s | Decode tok/s |
 |---|---|---|---:|---:|
-| **512 / 128**   | FORGE      | Mistral-7B Q4_K_M | **1417** | **171** |
+| **512 / 128**   | FORGE      | Mistral-7B Q4_K_M | **~2400** | **174** |
 |                 | llama.cpp  | Mistral-7B Q4_K_M | **12789 ± 507** | **183** (tg128@0) |
 |                 | vLLM       | Mistral-7B-v0.2 AWQ | **9983** | **131** |
-| **4096 / 2048** | FORGE      | Mistral-7B Q4_K_M | **1952–1964** | **144–146** |
+| **4096 / 2048** | FORGE      | Mistral-7B Q4_K_M | **~2820–2854** | **146** |
 |                 | llama.cpp  | Mistral-7B Q4_K_M | **12064 ± 123** | 177@0 / **161** @d4096 |
 |                 | vLLM       | Mistral-7B-v0.2 AWQ | **~9621** (9178 / 10064) | **131.5** |
-| **8192 / 1024** | FORGE      | Mistral-7B Q4_K_M | **1758** | **129** |
+| **8192 / 1024** | FORGE      | Mistral-7B Q4_K_M | **~2360** | **130** |
 |                 | llama.cpp  | Mistral-7B Q4_K_M | **11019 ± 12** | 180@0 / **149** @d8192 |
 |                 | vLLM       | Mistral-7B-v0.2 AWQ | **9423** | **131.8** |
+
+FORGE prefill history on this GEMM (Mistral-7B Q4_K_M, prefix-cache off): f16
+tensor-core dequant GEMM → int8-MMQ tensor-core GEMM (`gemm_i8mma`, s8×s8→s32
+mma) → int8-MMQ + **once-per-GEMM q8_1 activation pre-quant** (`quantize_act_q8_1`,
+block-major coalesced scales). 512: 1417 → 2270 → ~2400. 4096: 1952 → 2650 →
+~2837. 8192: 1758 → 2236 → ~2360. Qwen3-0.6B Q8_0 4096: 15692 → 19016 → ~19430.
+The pre-quant halves X read bandwidth and removes the redundant per-weight-row-block
+requant; it lands ~+5–7 % on Q4_K prefill (~+1–2 % on the much smaller-K Q8_0
+Qwen). Decode is bit-unchanged (dp4a GEMV). Numbers are ±~5 % run-to-run from
+GPU boost-clock state; the pre-quant kernel itself is ~0.0 % of prefill time
+(nsys), so the remaining ~4.5× gap to llama.cpp is the GEMM's occupancy /
+mma-issue efficiency, not X staging (see STATUS.md / MOJO_NOTES.md).
 
 VRAM (single-stream, observed peak incl. ~1.1 GiB desktop baseline):
 - **FORGE**: ~23.6 GiB peak — dominated by a pre-reserved full-context KV arena

@@ -104,6 +104,7 @@ const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "gemv_q4_k_out_f32_v2",
     "gemm_q4_k_f16",
     "gemm_q4_k_f16_bm64",
+    "quantize_act_q8_1",
     "gemm_q8_0_i8mma",
     "gemm_q8_0_i8mma_bm64",
     "gemm_q4_k_i8mma",

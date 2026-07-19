@@ -3,10 +3,10 @@
 // (kernels/mojo/src/*.mojo). Mojo `Int` marshals as a 64-bit scalar slot,
 // `Float32` as f32.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use forge_hal::{DevBuffer, Device, LaunchArgs, LaunchConfig, Stream};
-use forge_types::{DType, ForgeError, Result};
+use forge_hal::{DevBuffer, Device, LaunchArgs, LaunchConfig, Pool, Stream};
+use forge_types::{DType, ForgeError, MemKind, Result};
 
 use crate::registry::KernelArtifacts;
 
@@ -32,6 +32,23 @@ pub struct Kernels {
     /// (ggml iq2xs/iq2s/iq3s grids + ksigns; kernels take them as device
     /// pointers — the constant-table trick llama.cpp's CUDA kernels use).
     iq_tables: IqTables,
+    /// Grow-only q8_1 scratch for the i8mma prefill GEMM: the activation tile is
+    /// quantized ONCE (`quantize_act_q8_1`) into `xq` (int8 [T,K]) + `xd`/`xsm`
+    /// (f32 [T,K/32]) here, then every weight-row block reads int8 X directly
+    /// instead of re-quantizing f16 X per block. Sized to the largest (T*K) seen.
+    prequant: Mutex<PrequantScratch>,
+}
+
+/// Device-resident q8_1 activation scratch shared by the i8mma GEMM launches.
+#[derive(Default)]
+struct PrequantScratch {
+    xq: Option<DevBuffer>,
+    xd: Option<DevBuffer>,
+    xsm: Option<DevBuffer>,
+    /// Current int8-code capacity (elements) of `xq`.
+    cap_codes: usize,
+    /// Current f32 capacity (elements) of `xd`/`xsm`.
+    cap_blocks: usize,
 }
 
 /// Device-resident ggml codebook tables (LE bytes of the u64/u32 grids).
@@ -73,7 +90,12 @@ impl Kernels {
     pub fn load(device: Arc<dyn Device>) -> Result<Self> {
         let artifacts = KernelArtifacts::load(device.as_ref())?;
         let iq_tables = IqTables::upload(device.as_ref())?;
-        Ok(Self { device, artifacts, iq_tables })
+        Ok(Self {
+            device,
+            artifacts,
+            iq_tables,
+            prequant: Mutex::new(PrequantScratch::default()),
+        })
     }
 
     pub fn artifacts(&self) -> &KernelArtifacts {
@@ -1583,21 +1605,7 @@ impl Kernels {
                 "gemm_q8_0_i8mma requires cols % 32 == 0, got {cols}"
             )));
         }
-        let (suffix, bm) = Self::gemm_i8mma_tile(n_tokens);
-        let k = self.artifacts.get(&format!("gemm_q8_0_i8mma{suffix}"))?;
-        let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
-            block: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let args = LaunchArgs::new()
-            .buf(y)
-            .buf_at(w_q8, w_byte_off)?
-            .buf(x)
-            .scalar(cols as i64)
-            .scalar(rows as i64)
-            .scalar(n_tokens as i64);
-        self.device.launch(k, &cfg, &args, stream)
+        self.gemm_i8mma_run("gemm_q8_0_i8mma", y, w_q8, w_byte_off, x, rows, cols, n_tokens, stream)
     }
 
     /// int8 TENSOR-CORE MMQ prefill GEMM over Q4_K weights.
@@ -1619,8 +1627,70 @@ impl Kernels {
                 "gemm_q4_k_i8mma requires cols % 256 == 0, got {cols}"
             )));
         }
+        self.gemm_i8mma_run("gemm_q4_k_i8mma", y, w_q4k, w_byte_off, x, rows, cols, n_tokens, stream)
+    }
+
+    /// Pre-quantize the activation to q8_1 ONCE (`quantize_act_q8_1`) into the
+    /// grow-only scratch, then run the int8-MMQ GEMM reading int8 X directly.
+    /// This halves X read bandwidth and removes the redundant per-row-block
+    /// requant the old in-kernel quant paid across the grid's `ceil(rows/64)`
+    /// blocks. Both launches share one `stream`, so the GEMM sees the quantized
+    /// X without an explicit sync.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_i8mma_run(
+        &self,
+        kernel_base: &str,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
         let (suffix, bm) = Self::gemm_i8mma_tile(n_tokens);
-        let k = self.artifacts.get(&format!("gemm_q4_k_i8mma{suffix}"))?;
+        let qk = self.artifacts.get("quantize_act_q8_1")?;
+        let gk = self.artifacts.get(&format!("{kernel_base}{suffix}"))?;
+
+        let need_codes = n_tokens * cols;
+        let need_blocks = n_tokens * (cols / 32);
+
+        let mut sc = self.prequant.lock().expect("prequant scratch poisoned");
+        if sc.cap_codes < need_codes {
+            sc.xq = Some(
+                self.device
+                    .alloc(need_codes, MemKind::Device, Pool::Activations)?,
+            );
+            sc.cap_codes = need_codes;
+        }
+        if sc.cap_blocks < need_blocks {
+            sc.xd = Some(self.device.alloc(
+                need_blocks * 4,
+                MemKind::Device,
+                Pool::Activations,
+            )?);
+            sc.xsm = Some(self.device.alloc(
+                need_blocks * 4,
+                MemKind::Device,
+                Pool::Activations,
+            )?);
+            sc.cap_blocks = need_blocks;
+        }
+        let xq = sc.xq.as_ref().expect("xq allocated");
+        let xd = sc.xd.as_ref().expect("xd allocated");
+        let xsm = sc.xsm.as_ref().expect("xsm allocated");
+
+        let qcfg = LaunchConfig::linear(need_blocks as u32, BLOCK);
+        let qargs = LaunchArgs::new()
+            .buf(xq)
+            .buf(xd)
+            .buf(xsm)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(qk, &qcfg, &qargs, stream)?;
+
         let cfg = LaunchConfig {
             grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
             block: (256, 1, 1),
@@ -1628,12 +1698,14 @@ impl Kernels {
         };
         let args = LaunchArgs::new()
             .buf(y)
-            .buf_at(w_q4k, w_byte_off)?
-            .buf(x)
+            .buf_at(w, w_byte_off)?
+            .buf(xq)
+            .buf(xd)
+            .buf(xsm)
             .scalar(cols as i64)
             .scalar(rows as i64)
             .scalar(n_tokens as i64);
-        self.device.launch(k, &cfg, &args, stream)
+        self.device.launch(gk, &cfg, &args, stream)
     }
 
     /// Token-tile selection for the i8mma GEMM. Both variants use a 256-thread
