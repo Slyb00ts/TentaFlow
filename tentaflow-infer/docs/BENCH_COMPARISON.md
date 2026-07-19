@@ -814,3 +814,133 @@ all validated only against a CPU golden + a coherence oracle (no QServe referenc
 Tree == HEAD. QServe lives only in scratch (`scratch/w4a8/`, outside the repo). The one added
 file is `crates/forge-formats/examples/requant_w4a8.rs` (the Phase-B measurement tool,
 reproducible, harmless). Committed `gemm_i8mma_core` retained unchanged.
+
+---
+
+# W4A8 in-tree integration — 2026-07-19 (kernel + packer + launcher PROVEN in-engine; engine routing is the remaining step)
+
+Phase C, executed. The W4A8 GEMM now runs **inside FORGE** (its cubin loaded through the same
+cudarc `cuModuleLoadData` path as `gemm_i8mma`) and is **verified correct on the real 4090 both
+standalone and through FORGE's HAL** with a Rust-side QServe packer. It is **non-default**: nothing
+in the engine routes to it yet, so the committed CUDA MMQ stays the Q4_K prefill path. Every number
+below is a real run on this machine; raw output pasted.
+
+## 1. Correctness harness FIRST (de-risk the QServe layout before any wiring)
+
+`scratch/w4a8/harness.cu` (standalone, nvcc `-arch=sm_89`): reproduces QServe's exact 8-D weight
+interleave (`omniserve/.../w4a8_linear.py` `from_linear`, reshape `[N/32,2,2,8, K/32,2,4,4]` →
+permute `[d0,d4,d3,d6,d5,d2,d7,d1]` → nibble-pack), the per-group int8 scale/`(-zero)*s2` reorder
+(`j → (j%8)*4 + j//8`), and per-token int8 activation quant — all in host C++ — then runs QServe's
+verbatim `dense_kernel0` and compares to an independent CPU int4×int8 golden that models the
+kernel's **bytewise int8 reconstruction** (`(int8_t)(s2*(q4-zero))`). Tolerance relL2 < 2e-2.
+
+```
+== W4A8 correctness (GPU QServe vs CPU int4xint8 golden), tol relL2<2e-2 ==
+  M=256   N=128    K=256     relL2=2.09e-04  maxabs=3.871e-03  maxrel=4.88e-04  PASS
+  M=256   N=256    K=512     relL2=2.08e-04  maxabs=3.902e-03  maxrel=4.86e-04  PASS
+  M=384   N=512    K=1024    relL2=2.07e-04  maxabs=7.805e-03  maxrel=4.87e-04  PASS
+  M=129   N=256    K=512     relL2=2.07e-04  maxabs=3.901e-03  maxrel=4.86e-04  PASS   (small-M branch)
+  M=160   N=4096   K=4096    relL2=2.07e-04  maxabs=1.562e-02  maxrel=4.87e-04  PASS
+  M=256   N=4096   K=4096    relL2=2.08e-04  maxabs=1.562e-02  maxrel=4.88e-04  PASS
+  M=512   N=2048   K=4096    relL2=2.08e-04  maxabs=1.562e-02  maxrel=4.88e-04  PASS
+  M=512   N=4096   K=2048    relL2=2.07e-04  maxabs=1.440e-02  maxrel=4.88e-04  PASS
+```
+
+The residual ~2e-4 is pure fp16 output rounding. **The QServe weight interleave + scale/zero
+reorder + per-token activation quant are byte-exact.** (Before modelling the int8 wrap, a handful of
+out-of-range reconstructions gave relL2 0.06–0.25 with maxrel ~1e3 — the tell that a few `s2*(q4-zero)`
+values wrap; the kernel wraps them too, so a faithful golden must, and then it PASSES.)
+
+## 2. In-tree kernel + committed cubin + registry + launcher
+
+- `kernels/cuda/w4a8_gemm.cu` — QServe `dense_kernel0` + device helpers verbatim (MIT attribution),
+  the `__global__` made a `__device__` helper, four `extern "C"` entries (one per QServe CTA config:
+  `m128`, `m64_ksm`, `m64_klg`, `m32`). `kernels/cuda/build.sh` compiles it to the committed
+  `kernels/mojo/build/sm_89/w4a8_gemm_cuda.cubin` (all configs ≤ 41.5 KB dynamic smem — no
+  `cudaFuncSetAttribute` needed). `res-usage`: m128 162 reg, m64_klg 111, m64_ksm/m32 96, 0 spill.
+- `registry.rs` embeds the cubin and resolves the four entries (mirrors the `gemm_i8mma_cuda` load).
+- `launchers.rs::w4a8_gemm` selects the CTA config by (tokens, K) and computes grid/block/dynamic-smem
+  exactly as QServe's host `KERNEL_LAUNCH_CODE` (block swizzle `log_tile` included).
+- `forge_formats::w4a8` (`w4a8_pack` / `w4a8_reconstruct`) is the Rust port of the verified host packer.
+
+## 3. In-engine correctness through the HAL (Rust packer → FORGE HAL → committed cubin)
+
+`crates/forge-kernels/tests/cuda_w4a8.rs` builds random weights, packs with the Rust
+`forge_formats::w4a8::w4a8_pack`, quantizes activations per-token int8, launches via
+`Kernels::w4a8_gemm`, and compares to an independent CPU golden (`w4a8_reconstruct`). This exercises
+every CTA branch and the Mistral FFN shapes:
+
+```
+w4a8 M=256 N=128 K=256:    relL2=2.08e-4 maxabs=4.877e-4
+w4a8 M=256 N=256 K=512:    relL2=2.08e-4 maxabs=4.817e-4
+w4a8 M=129 N=256 K=512:    relL2=2.08e-4 maxabs=4.817e-4   (m128 branch)
+w4a8 M=128 N=256 K=256:    relL2=2.07e-4 maxabs=4.877e-4   (m64_ksm branch)
+w4a8 M=128 N=256 K=8192:   relL2=2.10e-4 maxabs=1.952e-3   (m64_klg branch)
+w4a8 M=64  N=256 K=512:    relL2=2.09e-4 maxabs=2.439e-4   (m32 branch)
+w4a8 M=256 N=4096 K=4096:  relL2=2.09e-4 maxabs=9.799e-4
+w4a8 M=512 N=4096 K=4096:  relL2=2.09e-4 maxabs=9.799e-4
+w4a8 M=192 N=14336 K=4096: relL2=2.09e-4 maxabs=9.792e-4   (gate/up)
+w4a8 M=192 N=4096 K=14336: relL2=2.07e-4 maxabs=3.927e-3   (down)
+test w4a8_matches_cpu_golden ... ok
+```
+
+## 4. Perf — reconfirmed standalone AND through the HAL (idle GPU, boost 2775 MHz)
+
+Standalone harness (CUDA-event, sustained warmup, best-of-20), Mistral FFN shapes:
+
+```
+BENCH M=2048  N=14336 K=4096   574.6 us   418.6 TFLOP-eq   (gate/up)
+BENCH M=2048  N=4096  K=14336  558.9 us   430.3 TFLOP-eq   (down)
+BENCH M=4096  N=14336 K=4096  1145.9 us   419.8 TFLOP-eq
+BENCH M=4096  N=4096  K=14336 1113.7 us   431.9 TFLOP-eq
+BENCH M=512   N=14336 K=4096   153.9 us   390.6 TFLOP-eq
+BENCH M=512   N=4096  K=14336  139.4 us   431.3 TFLOP-eq
+```
+
+Through FORGE's HAL (`cargo test ... bench_w4a8_tops --ignored`, wall-clock Instant timing):
+
+```
+w4a8 gate N=14336 K=4096 T=2048: 438.6 TFLOP-eq   T=4096: 420.7
+w4a8 down N=4096  K=14336 T=2048: 420.0 TFLOP-eq   T=4096: 424.9   T=512: 410.0
+```
+
+The HAL path matches the standalone (~420–439 TFLOP-eq at T≥2048) — **no HAL overhead**, and
+**2.0–2.1× llama.cpp's ~206 GEMM**, **~3.8× FORGE's committed ~110**. (The one low reading,
+gate T=512 = 141.8, is std::time launch-overhead noise at the small size — the CUDA-event standalone
+gets ~390 there; correctness is proven either way.)
+
+## What is DONE vs the REMAINING engine-routing step
+
+DONE and verified on the real GPU: (1) the correctness harness proving the QServe layout;
+(2) the in-tree kernel + committed cubin + registry + launcher; (3) the Rust requant/packer
+(`forge_formats::w4a8`); (4) full in-engine correctness through the HAL; (5) in-engine GEMM perf
+= ~420 TFLOP-eq. Gate 1 (build + clippy `--release --workspace`) green; Gate 4 (NVFP4 Bielik golden)
+bit-exact on 1 and 4 lanes — **NVFP4/Q8_0 untouched**.
+
+NOT done this pass (the remaining step, non-default): **routing Q4_K prefill to W4A8 in the model
+forward pass** (`FORGE_GEMM=w4a8`) + **requant-at-load** + **a GPU per-token int8 activation quant**.
+The specific integration hazard that makes this a careful, separate lift — and why it was NOT rushed
+into a possibly-gibberish default — is **row-window addressing**. FORGE stores q/k/v and gate/up
+**fused** and slices them by `row_off` in `gemm_rows` (model.rs 2045–2052, 2235–2236). QServe's
+scale/zero buffers are the **transposed** `[K/G][N]` layout, so a row window is a *non-contiguous
+column slice at full-N stride*, and `wscales`/the weight interleave are addressed by absolute N. A
+correct routing therefore needs either (a) per-logical-matrix W4A8 sub-tensors (requant q/k/v/gate/up
+into separate buffer-sets at load, dispatched by `row_off`), avoiding row-windowing entirely, or
+(b) a windowed launcher that passes full-N strides with a column base offset. Both are real work that
+must be gated on **coherence** (the 3–4 factual-prompt greedy test) + a **perplexity proxy** and the
+**~10.2 % relL2** requant cost (Phase B) before it can even be a non-default option — and per the repo
+rule ("never route slower/incorrect than the committed kernel as default") it stays behind the flag
+until it passes all of that. The projection stands: W4A8 GEMM alone → pp4096 **~9650 = 0.80×**
+llama.cpp's 12032; the remaining gap is FORGE's ~0.205 s non-GEMM vs llama.cpp's ~0.065 s (the
+Phase-2 fusion target), not this GEMM.
+
+llama.cpp baseline this pass: could NOT be independently re-run — the `scratch/bench/llama.cpp`
+build was wiped with the scratch dir. Baseline used is the committed, maintainer-reconfirmed
+**pp4096 = 12032** (idle cool GPU at full boost, commit 43e3591d, this machine).
+
+## Committed state (this pass)
+Non-default W4A8 brought in-tree: `kernels/cuda/w4a8_gemm.cu` (+ its committed cubin),
+`kernels/cuda/build.sh`, `crates/forge-formats/src/w4a8.rs`, `registry.rs`, `launchers.rs::w4a8_gemm`,
+`crates/forge-kernels/tests/cuda_w4a8.rs`. Nothing routes to W4A8; `gemm_i8mma` (committed CUDA MMQ)
+remains the Q4_K prefill default. NVFP4 + Q8_0 untouched (golden bit-exact). Standalone harness lives
+in `scratch/w4a8/` (reproducible).

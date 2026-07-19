@@ -23,3 +23,13 @@ nvcc -arch="${ARCH}" -cubin -O3 \
 
 echo "wrote ${OUT}/gemm_i8mma_cuda.cubin"
 cuobjdump -res-usage "${OUT}/gemm_i8mma_cuda.cubin" | grep -E 'Function|REG' || true
+
+# W4A8 (int4-weight x int8-activation) prefill GEMM — QServe dense_kernel0 in-tree
+# (ADR-0001 exception, MIT). Committed cubin, loaded via the same cuModuleLoadData
+# path. Non-default: routed only under FORGE_GEMM=w4a8 (see forge-kernels).
+nvcc -arch="${ARCH}" -cubin -O3 \
+    -o "${OUT}/w4a8_gemm_cuda.cubin" \
+    "${HERE}/w4a8_gemm.cu"
+
+echo "wrote ${OUT}/w4a8_gemm_cuda.cubin"
+cuobjdump -res-usage "${OUT}/w4a8_gemm_cuda.cubin" | grep -E 'Function|REG' || true

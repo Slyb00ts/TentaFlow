@@ -13,6 +13,7 @@ pub mod gguf;
 pub mod hf_config;
 pub mod nvfp4;
 pub mod safetensors;
+pub mod w4a8;
 
 pub use arch::{
     ArchSpec, Hyperparams, LayerKind, ModelDescriptor, MoeParams, PoolingType, SsmParams,

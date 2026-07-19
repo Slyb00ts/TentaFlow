@@ -520,3 +520,42 @@ act-quant + routing), walidowalny tylko golden-CPU + oracle koherencji — nie d
 wysłania w połowie (reguła: nigdy nie wysyłaj wolniej/niepoprawnie niż committed;
 `gemm_i8mma` zostaje fallbackiem). Committed kernel bez zmian (drzewo == HEAD).
 Szczegóły + surowe liczby + plan Phase C: `docs/BENCH_COMPARISON.md`.
+
+## W4A8 integracja in-tree (2026-07-19) — kernel + packer + launcher UDOWODNIONE w silniku; routing to pozostały krok
+
+Phase C wykonana do warstwy kernela. W4A8 GEMM działa **wewnątrz FORGE** (cubin ładowany
+tą samą ścieżką `cuModuleLoadData` co `gemm_i8mma`) i jest **zweryfikowany poprawnościowo
+na realnym 4090** — standalone ORAZ przez HAL FORGE z packerem w Ruście. Jest
+**non-default**: nic w silniku jeszcze do niego nie routuje, committed CUDA MMQ zostaje
+ścieżką prefill Q4_K.
+
+Zrobione i zweryfikowane (surowe liczby w `docs/BENCH_COMPARISON.md`):
+- **Harness poprawności NAJPIERW** (`scratch/w4a8/harness.cu`): odtwarza dokładny 8-D
+  interleave wag QServe + reorder scale/zero + per-token int8 act-quant w host C++, uruchamia
+  `dense_kernel0` QServe i porównuje z niezależnym golden CPU int4×int8 (modelującym bytewise
+  int8 wrap kernela). **relL2 ~2e-4 (szum fp16) na wszystkich kształtach** — layout byte-exact.
+- **Kernel in-tree**: `kernels/cuda/w4a8_gemm.cu` (QServe `dense_kernel0`, MIT, 4 wejścia
+  `extern "C"` per konfig CTA) → committed cubin `build/sm_89/w4a8_gemm_cuda.cubin` przez
+  `build.sh`; wpisany w `registry.rs`; launcher `launchers.rs::w4a8_gemm` (grid/block/smem jak
+  host QServe).
+- **Requant/packer w Ruście**: `forge_formats::w4a8` (`w4a8_pack` / `w4a8_reconstruct`).
+- **Poprawność w silniku przez HAL**: `crates/forge-kernels/tests/cuda_w4a8.rs` (packer Rust →
+  HAL → cubin vs golden CPU) **PASS, relL2 ~2e-4** na wszystkich gałęziach CTA + kształtach
+  FFN Mistral.
+- **Perf w silniku**: ~420 TFLOP-eq @T≥2048 przez HAL = **2.0–2.1× llama.cpp (~206)**,
+  bez narzutu HAL vs standalone.
+- Gate 1 (build + clippy `--release --workspace`) zielony; Gate 4 (golden NVFP4 Bielik)
+  **bit-exact 1 i 4 lanes** — NVFP4/Q8_0 nietknięte.
+
+Pozostały krok (non-default): **routing prefill Q4_K → W4A8 w forward pass** (`FORGE_GEMM=w4a8`)
++ **requant-at-load** + **GPU per-token int8 act-quant**. Główna przeszkoda integracyjna:
+**adresowanie okna wierszy** — FORGE trzyma q/k/v i gate/up **fused** i tnie je przez `row_off`
+w `gemm_rows`, a bufory scale/zero QServe są w **transponowanym** `[K/G][N]`, więc okno wierszy
+to niespójny wycinek kolumn przy pełnym stride N. Rozwiązania: (a) requant per-logiczna-macierz
+na osobne zestawy buforów przy load (dispatch po `row_off`, bez okienkowania) lub (b) launcher
+okienkowy z pełnym stride N + offset kolumny. Musi być bramkowane koherencją (3–4 prompty
+faktograficzne, greedy) + perplexity proxy + koszt requant **~10.2% relL2** (Phase B) zanim
+stanie się choćby opcją non-default. Projekcja bez zmian: sam W4A8 GEMM → pp4096 **~9650 =
+0.80×** llama.cpp 12032; reszta luki to narzut nie-GEMM FORGE (~0.205 s vs 0.065 s) — cel fuzji
+Phase 2. llama.cpp baseline nie odtworzony niezależnie w tej sesji (build `scratch/bench` skasowany);
+użyto committed, potwierdzonego przez maintainera **12032**.

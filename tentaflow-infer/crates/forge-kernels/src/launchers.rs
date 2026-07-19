@@ -1803,6 +1803,87 @@ impl Kernels {
         }
     }
 
+    /// QServe W4A8 CTA config for `M` tokens and `K` cols, mirroring
+    /// `gemm_forward_cuda`'s host dispatch. Returns
+    /// `(registry_key, CTA_M, CTA_N, CTA_K, num_warps, dynamic_smem_bytes)`.
+    fn w4a8_config(m: usize, k: usize) -> (&'static str, u32, u32, u32, u32, u32) {
+        if m > 128 {
+            ("w4a8_gemm_m128", 128, 64, 64, 4, 41472)
+        } else if m == 128 {
+            if k <= 4096 {
+                ("w4a8_gemm_m64_ksm", 64, 64, 64, 4, 25088)
+            } else {
+                ("w4a8_gemm_m64_klg", 64, 64, 128, 8, 37248)
+            }
+        } else {
+            ("w4a8_gemm_m32", 32, 64, 128, 4, 24960)
+        }
+    }
+
+    /// W4A8 (int4-weight x int8-activation) prefill GEMM: `y[t,row] = W·x[t]`.
+    /// Non-default (routed only under `FORGE_GEMM=w4a8`). Consumes activations
+    /// ALREADY quantized to per-token int8 (`a_i8` + `ascales`); the weight
+    /// buffers are QServe-packed (`forge_formats::w4a8`). `rows` (N) must be a
+    /// multiple of 64 and `cols` (K) a multiple of 128 (the kernel's group).
+    #[allow(clippy::too_many_arguments)]
+    pub fn w4a8_gemm(
+        &self,
+        y: &DevBuffer,
+        a_i8: &DevBuffer,
+        qweight: &DevBuffer,
+        s2_zeros: &DevBuffer,
+        s2_scales: &DevBuffer,
+        wscales: &DevBuffer,
+        ascales: &DevBuffer,
+        n_tokens: usize,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !rows.is_multiple_of(64) {
+            return Err(ForgeError::Kernel(format!("w4a8 requires rows % 64 == 0, got {rows}")));
+        }
+        if !cols.is_multiple_of(128) {
+            return Err(ForgeError::Kernel(format!("w4a8 requires cols % 128 == 0, got {cols}")));
+        }
+        let (key, cta_m, cta_n, cta_k, warps, smem) = Self::w4a8_config(n_tokens, cols);
+        if !cols.is_multiple_of(cta_k as usize) {
+            return Err(ForgeError::Kernel(format!(
+                "w4a8 config {key} needs cols % {cta_k} == 0, got {cols}"
+            )));
+        }
+        let gk = self.artifacts.get(key)?;
+        let num_blocks_n = (rows as u32) / cta_n;
+        let num_blocks_m = (n_tokens as u32).div_ceil(cta_m);
+        let log_tile = if num_blocks_m >= 6 {
+            3
+        } else if num_blocks_m >= 3 {
+            2
+        } else if num_blocks_m >= 2 {
+            1
+        } else {
+            0
+        };
+        let tile_shift = 1u32 << log_tile;
+        let cfg = LaunchConfig {
+            grid: (num_blocks_n * tile_shift, num_blocks_m.div_ceil(tile_shift), 1),
+            block: (32, warps, 1),
+            shared_mem_bytes: smem,
+        };
+        let args = LaunchArgs::new()
+            .buf(a_i8)
+            .buf(qweight)
+            .buf(s2_zeros)
+            .buf(s2_scales)
+            .buf(wscales)
+            .buf(ascales)
+            .buf(y)
+            .scalar(n_tokens as i64)
+            .scalar(rows as i64)
+            .scalar(cols as i64);
+        self.device.launch(gk, &cfg, &args, stream)
+    }
+
     /// `gemm_q4_k_f16` over a row window of a fused weight matrix:
     /// `w_byte_off` addresses the first superblock of the window's first row.
     #[allow(clippy::too_many_arguments)]

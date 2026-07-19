@@ -67,6 +67,23 @@ const CUDA_CUBIN_ENTRIES: &[(&str, &str)] = &[
     ("gemm_q8_0_i8mma_cuda_bn64", "forge_gemm_q8_0_i8mma_cuda_bn64"),
 ];
 
+/// W4A8 (int4-weight x int8-activation) prefill GEMM cubin (kernels/cuda/
+/// w4a8_gemm.cu; QServe dense_kernel0, ADR-0001 exception). Non-default: routed
+/// only under `FORGE_GEMM=w4a8`; the committed CUDA MMQ stays the default path.
+const EMBEDDED_CUDA_CUBIN_W4A8_SM89: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../kernels/mojo/build/sm_89/w4a8_gemm_cuda.cubin"
+));
+
+/// (registry key, cubin entry symbol) for each W4A8 CTA config (one per QServe
+/// dispatch branch, selected in the launcher by token count / K).
+const CUDA_W4A8_ENTRIES: &[(&str, &str)] = &[
+    ("w4a8_gemm_m128", "forge_w4a8_gemm_m128"),
+    ("w4a8_gemm_m64_ksm", "forge_w4a8_gemm_m64_ksm"),
+    ("w4a8_gemm_m64_klg", "forge_w4a8_gemm_m64_klg"),
+    ("w4a8_gemm_m32", "forge_w4a8_gemm_m32"),
+];
+
 const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "rmsnorm_f16",
     "rmsnorm_residual_f16",
@@ -372,19 +389,26 @@ impl KernelArtifacts {
                 )));
             }
         }
-        Self::load_cuda_cubin(device, EMBEDDED_CUDA_CUBIN_SM89, &mut handles)?;
+        Self::load_cuda_cubin(device, EMBEDDED_CUDA_CUBIN_SM89, CUDA_CUBIN_ENTRIES, &mut handles)?;
+        Self::load_cuda_cubin(
+            device,
+            EMBEDDED_CUDA_CUBIN_W4A8_SM89,
+            CUDA_W4A8_ENTRIES,
+            &mut handles,
+        )?;
         Ok(Self { handles, arch: arch.to_string() })
     }
 
-    /// Resolve the raw-CUDA MMQ cubin's entry points into `handles`. The cubin
+    /// Resolve a raw-CUDA cubin's entry points into `handles`. The cubin
     /// loads exactly like Mojo PTX (`load_module` → cuModuleLoadData).
     fn load_cuda_cubin(
         device: &dyn Device,
         cubin: &[u8],
+        entries: &[(&str, &str)],
         handles: &mut HashMap<String, KernelHandle>,
     ) -> Result<()> {
         let module = device.load_module(cubin)?;
-        for (key, entry) in CUDA_CUBIN_ENTRIES {
+        for (key, entry) in entries {
             handles.insert((*key).to_string(), module.kernel(entry)?);
         }
         Ok(())
@@ -409,7 +433,11 @@ impl KernelArtifacts {
         let cubin = std::fs::read(arch_dir.join("gemm_i8mma_cuda.cubin")).map_err(|e| {
             ForgeError::Kernel(format!("read gemm_i8mma_cuda.cubin: {e}"))
         })?;
-        Self::load_cuda_cubin(device, &cubin, &mut handles)?;
+        Self::load_cuda_cubin(device, &cubin, CUDA_CUBIN_ENTRIES, &mut handles)?;
+        let w4a8 = std::fs::read(arch_dir.join("w4a8_gemm_cuda.cubin")).map_err(|e| {
+            ForgeError::Kernel(format!("read w4a8_gemm_cuda.cubin: {e}"))
+        })?;
+        Self::load_cuda_cubin(device, &w4a8, CUDA_W4A8_ENTRIES, &mut handles)?;
         Ok(Self { handles, arch: arch.to_string() })
     }
 
