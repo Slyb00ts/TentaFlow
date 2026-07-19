@@ -474,3 +474,19 @@ produkcyjny i bit-dokładny. To wciąż ~1/3 zakresu spec, ale pozostała 2/3 to
 niemal w całości „całe pillary" wymagające **innego sprzętu** (multivendor,
 multi-node) lub **modeli, których tu nie ma** (TTS/T2I/Video) — świadomie
 nie budowane jako stub, do domknięcia na docelowym sprzęcie z realną walidacją.
+
+## Marlin W4A16 (Phase A go/no-go, 2026-07-19) — NO-GO, nie zintegrowano
+
+Próba obejścia plateau ręcznych GEMM-ów (Mojo 66 / hand-CUDA 107 TOPS) przez
+adopcję Marlina W4A16 (kernel 4-bit, którego używa vLLM). Marlin zbudowany
+standalone `nvcc -arch=sm_89`, zmierzony na dokładnych kształtach FFN Mistral-7B
+(`scratch/marlin/`, poza drzewem repo). Wynik: Marlin plateauuje na **~174 TFLOP/s**
+przy T=2048/4096 — to sufit rdzeni tensor **fp16** (fp32-accumulate) na 4090, kernel
+jest już wysycony. llama.cpp robi te same GEMM-y na rdzeniach **int8** (MMQ,
+`mma.s8`, ~206 TFLOP/s efektywnie), więc Marlin jest **wolniejszy od referencji na
+tych samych mnożeniach**. Projekcja e2e pp4096: realnie ~7600, optymistycznie 10400,
+sufit (zero narzutu, niefizyczny) 12460 — nigdy pewnie nie przekracza 12000.
+W4A16 wygrywa tylko w reżimie memory-bound (mały batch/decode), nie w compute-bound
+prefill. Droga do pobicia llama.cpp zostaje na int8 (vendorowanie `mul_mat_q`,
+cuBLASLt int8, albo W4A8/Marlin-QQQ). Committed kernel `gemm_i8mma_core` bez zmian
+(drzewo == HEAD). Szczegóły + surowe liczby: `docs/BENCH_COMPARISON.md`.

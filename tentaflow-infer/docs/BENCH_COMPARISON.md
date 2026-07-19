@@ -604,3 +604,95 @@ vendoring llama.cpp's kernel or a cuBLASLt int8 path — not a hand rewrite of t
 Prefill unchanged from the committed baseline (this kernel was reverted): Mistral-7B Q4_K_M
 pp512 **3334**, pp4096 **3536**, pp8192 **2930** tok/s; llama.cpp pp4096 **12018** (≈0.29×). Closing
 the rest is Phase-2 fusion (attention/quant/norm) + a real MMQ kernel, not this one GEMM.
+
+---
+
+## Marlin W4A16 — Phase-A go/no-go on FORGE prefill shapes (2026-07-19)
+
+**Verdict: NO-GO for the stated goal (beat llama.cpp pp4096 ≈ 12000 tok/s). Not integrated.**
+
+### What was measured
+IST-DASLab Marlin (`github.com/IST-DASLab/marlin`, Apache-2) built standalone with
+`nvcc -arch=sm_89 --expt-relaxed-constexpr` (no torch), timed on the exact Mistral-7B FFN
+GEMM shapes with a value-independent timing harness (`scratch/marlin/bench_standalone.cu`,
+outside the repo tree). groupsize=128, 200 iters, CUDA-event window, workspace zeroed per call.
+
+Raw output (RTX 4090, sm_89):
+
+```
+Marlin W4A16 (groupsize=128) standalone, RTX 4090 sm_89
+  T=16    gate/up N=14336 K=4096     :    60.76 us  (1.9 GFLOP,   30.9 TFLOP/s)
+  T=64    gate/up N=14336 K=4096     :   193.22 us  (7.5 GFLOP,   38.9 TFLOP/s)
+  T=128   gate/up N=14336 K=4096     :   236.05 us  (15.0 GFLOP,   63.7 TFLOP/s)
+  T=512   gate/up N=14336 K=4096     :   660.19 us  (60.1 GFLOP,   91.1 TFLOP/s)
+  T=2048  gate/up N=14336 K=4096     :  1472.09 us  (240.5 GFLOP,  163.4 TFLOP/s)
+  T=4096  gate/up N=14336 K=4096     :  2783.72 us  (481.0 GFLOP,  172.8 TFLOP/s)
+  T=16    down    N=4096  K=14336    :    17.76 us  (1.9 GFLOP,  105.8 TFLOP/s)
+  T=64    down    N=4096  K=14336    :    58.40 us  (7.5 GFLOP,  128.7 TFLOP/s)
+  T=128   down    N=4096  K=14336    :    93.89 us  (15.0 GFLOP,  160.1 TFLOP/s)
+  T=512   down    N=4096  K=14336    :   346.40 us  (60.1 GFLOP,  173.6 TFLOP/s)
+  T=2048  down    N=4096  K=14336    :  1380.04 us  (240.5 GFLOP,  174.3 TFLOP/s)
+  T=4096  down    N=4096  K=14336    :  2758.89 us  (481.0 GFLOP,  174.4 TFLOP/s)
+```
+
+### The architectural reason (why this is a hard ceiling, not a tuning gap)
+Marlin is **W4A16**: 4-bit weights are dequantized on-chip and the matmul runs on **fp16
+tensor cores with fp32 accumulate**. Its only advantage over a plain fp16 GEMM is *weight
+memory bandwidth* — which matters at small batch (memory-bound decode, T≤32) and vanishes in
+the **compute-bound prefill** regime (T≥512), where the weight bytes are reused across all
+tokens. At T=2048/4096 Marlin plateaus at **~174 TFLOP/s**, which is essentially the RTX 4090's
+fp16-tensor-with-fp32-accumulate peak (~165–175 TFLOP/s dense). Marlin is *already saturated* —
+there is no tuning headroom left on this compute path.
+
+llama.cpp's prefill does **not** use fp16 tensor cores. Its `mul_mat_q` (MMQ) quantizes the
+activations to int8 and runs **int8 tensor cores** (`mma.s8`, ~660 TOP/s dense on Ada — ~4×
+the fp16/fp32-accum rate). Measured effective GEMM throughput of llama.cpp on these shapes:
+
+- llama.cpp pp4096 = **11984 tok/s** → 4096/11984 = **0.3418 s** total prefill.
+- Mistral-7B GEMM budget (32 layers, q+k+v+o+gate+up+down) = **57.18 TFLOP** for 4096 tokens.
+- GEMM is ~81% of prefill → GEMM time ≈ 0.277 s → **≈206 TFLOP/s effective (int8)**.
+
+**Marlin's 174 TFLOP/s < llama.cpp's 206 TFLOP/s on the identical GEMMs.** A kernel that does
+the same matmuls *slower* than the reference cannot make the end-to-end engine *faster* than
+the reference.
+
+### Honest end-to-end projection (Mistral-7B pp4096)
+| Scenario | GEMM time | non-GEMM | total | pp4096 | vs llama.cpp |
+|---|---|---|---|---|---|
+| **Ceiling** (0 non-GEMM overhead — unphysical) | 57.18/174 = 0.329 s | 0.000 s | 0.329 s | **12460** | 1.04× |
+| **Optimistic** (non-GEMM = llama.cpp's 0.065 s) | 0.329 s | 0.065 s | 0.394 s | **10404** | 0.87× |
+| **Realistic** (FORGE's current 19% overhead, ~0.207 s) | 0.329 s | 0.207 s | 0.536 s | **7642** | 0.64× |
+| llama.cpp (int8 MMQ, reference) | 0.277 s | 0.065 s | 0.342 s | **11984** | 1.00× |
+| FORGE current (committed int8 kernel, measured) | — | — | 1.090 s | **3759** | 0.31× |
+
+Marlin **would** beat FORGE's *own* current kernel (3759 → ~7600), but it **cannot clear
+12000** — even the physically-impossible zero-overhead ceiling (12460) only grazes it, and any
+real engine lands 7600–10400. The stated goal is to *beat llama.cpp*, and W4A16 is structurally
+incapable of that on Ada because it runs the wrong (fp16, ~4× slower) tensor-core path for
+compute-bound prefill.
+
+### Phase-B mapping analysis (documented for completeness; moot given the NO-GO)
+Q4_K dequant is affine per 32-block: `w = d·sc[j]·q − dmin·m[j]` (q∈[0,15], fp16 `d`/`dmin`,
+6-bit `sc[j]`/`m[j]`). Marlin formats:
+- **Symmetric W4A16** (`gptq_marlin`): `w = scale_g·(q−8)` — no additive per-group offset →
+  cannot represent Q4_K's `dmin·m[j]` term. Not representable.
+- **AWQ-asymmetric** (`awq_marlin`): `w = scale_g·(q − zero_g)`, `zero_g` an **integer** 4-bit
+  zero point. Exact Q4_K needs `scale_g = d·sc[j]` (fine at group_size=32) and
+  `zero_g = dmin·m[j]/(d·sc[j])`, which is **generally fractional** (four independent operands)
+  → **not exactly representable** with an integer zero point.
+
+Exact Q4_K→Marlin is therefore impossible in mainline Marlin (no fractional/float zero-point
+variant exists). The only path would be a **load-time requantization** Q4_K→Marlin-4bit
+(group_size=32, fp16 scale + rounded integer zero), i.e. accept a small numeric change and gate
+on coherence rather than bit-exactness. Since Phase A is a NO-GO, this repack was **not**
+implemented — but it is the correct decision to record: even with the effort, the result would
+be both *lossy vs Q4_K* and *slower than llama.cpp*.
+
+### Recommendation
+The route to beating llama.cpp on the 4090 stays on **int8 tensor cores** (FORGE's current path
+at 107 TOPS, headroom to llama.cpp's 206 and the 660 hardware peak), not W4A16. Options that
+keep the int8 compute path: vendoring llama.cpp's compiled `mul_mat_q`, a cuBLASLt int8 GEMM, or
+a **W4A8** kernel (Marlin-QQQ / int4-weight × int8-activation), which — unlike W4A16 Marlin —
+would use the int8 tensor cores and is the only Marlin-family variant that could match the
+reference's compute path. The committed `gemm_i8mma_core` kernel is **retained unchanged**
+(tree == HEAD; Marlin lives only in `scratch/`, nothing brought in-tree).
