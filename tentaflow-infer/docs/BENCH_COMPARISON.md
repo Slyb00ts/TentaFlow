@@ -555,3 +555,52 @@ window depth. The 48 KB static-`stack_allocation` cap blocks KU≥8 at BM=BN=128
 IMMA/body via dynamic smem), but the 8→32 trend shows even that wouldn't reach 208. **Reverted;
 committed `_big` kernel retained** (no large win, and deep4 single-buffers below 2 CTAs/SM — the
 documented 512-prefill occupancy tripwire).
+
+---
+
+## 2026-07-19 — Adopting llama.cpp's MMQ scheduling IN THE CUDA (nvcc) kernel — deep-unroll regresses
+
+The prior deep-unroll study was Mojo-side. This one tests the same hypothesis on the **nvcc
+CUDA** kernel that already ships the Q4_K prefill GEMM (`kernels/cuda/gemm_i8mma.cu`, committed
+cubin, ~107 TOPS). Task premise: 107 is "half-tuned" and adopting llama.cpp's actual MMQ
+scheduling (Ada tile dims, deep-unrolled K-loop with many IMMA in flight, stream-K) should roughly
+double it toward 208. Tested head-on.
+
+**What was implemented** (`gemm_q4k_wide_core`, reverted): llama.cpp's key scheduling shape lifted
+into FORGE's framework, keeping FORGE's activation layout (bit-exact vs Mojo). Load a WIDE `KTILE`
+(`KSUB` 32-col blocks) into shared memory at once, **preload every A/B fragment for the tile into
+registers**, then `#pragma unroll` the whole tile → **32–64 IMMA straight-line** (vs 8 in the
+committed kernel), occupancy=1. `cuobjdump -res-usage` confirms this reproduces **llama.cpp's exact
+profile: 255 regs/thread, 40 KB smem, STACK spill** — the deep-pipeline footprint the proof
+attributes to nvcc's 208-TOPS kernel.
+
+**Isolated Q4_K GEMM (RTX 4090, `cargo test -p forge-kernels --test cuda_i8mma bench_tops`, TOPS at
+T=2048 down/gate):**
+
+| variant | regs | smem | IMMA/body | down T2048 | gate T2048 |
+|---------|------|------|-----------|-----------:|-----------:|
+| **committed `gemm_i8mma_core`** | ~193 | 18–20 KB | 8 | **106.6** | **107.3** |
+| wide single-buffer KTILE=128 | 255 | 40 KB | 64 | 66.2 | 68.9 |
+| wide double-buffer KTILE=64  | 172 | 40 KB | 32 | 72.2 | 79.5 |
+| wide double-buffer KTILE=32  | 130 | 20 KB | 16 | 89.0 | 90.8 |
+
+Every deep-unroll variant is **below** the committed 107, and it is **monotone**: deeper unroll =
+slower (66 < 72 < 89 < 107). Reaching llama.cpp's own 255-reg/40 KB footprint did NOT recover
+its throughput — the SASS scheduling llama.cpp's compiled `mul_mat_q` achieves is not reproduced by
+restructuring a hand kernel to the same tile/register shape. Numerically the wide kernel is
+**bit-identical to Mojo** (`vs_mojo=0.0e0`) once the min-correction epilogue is split into two
+accumulations, and 4.65e-4 vs the CPU MMQ reference (`cuda_i8mma.rs` passes).
+
+**Confirms CODEGEN_PROOF Exp 5 on the nvcc side:** the pipeline/unroll window is NOT the bottleneck.
+Even nvcc/ptxas does not extract 208 from a hand-written kernel when the smem/register tile layout
+changes — 208 belongs specifically to llama.cpp's *actual compiled* `mul_mat_q` (proof Exp 2). A
+verbatim lift of that kernel (templated `mma.cuh` tile abstraction + `common.cuh` helpers + a new
+`block_q8_1_mmq` quantize + `write_back`/layout adaptation to f16 `[token][row]` + launcher rework
+for the new activation layout) is a large integration that risks the Bielik golden bit-exact test
+and is out of scope for a single verifiable pass. **Reverted; committed 107-TOPS kernel retained**
+as the best hand-written path (tree == HEAD, no functional change). The real route to 208 is
+vendoring llama.cpp's kernel or a cuBLASLt int8 path — not a hand rewrite of the scheduling.
+
+Prefill unchanged from the committed baseline (this kernel was reverted): Mistral-7B Q4_K_M
+pp512 **3334**, pp4096 **3536**, pp8192 **2930** tok/s; llama.cpp pp4096 **12018** (≈0.29×). Closing
+the rest is Phase-2 fusion (attention/quant/norm) + a real MMQ kernel, not this one GEMM.

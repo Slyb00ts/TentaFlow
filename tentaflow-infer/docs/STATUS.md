@@ -129,6 +129,29 @@ Ostatnia aktualizacja: 2026-07-19.
     `stack_allocation` limit 48 KB); nvcc sięga 256 IMMA/ciało przez DYNAMICZNY smem.
     deep2/deep4 bit-w-bit == skomitowany (Q4_K + Q8_0). Wszystko cofnięte, kernel
     `_big` zachowany.
+  - ℹ️ **Adopcja schematu llama.cpp W KERNELU CUDA (nvcc) SPRAWDZONA: wide-tile +
+    deep-unroll REGRESUJE, nie skaluje do 208 (2026-07-19).** Hipoteza zadania: ten
+    kernel CUDA (107 TOPS) osiąga ~połowę MMQ llama.cpp (208) bo jest „w połowie
+    dostrojony"; adopcja ich schedulingu (kafel Ada, głęboko rozwinięta pętla K,
+    stream-K) miała podwoić TOPS. Test wprost: przepisany `gemm_q4k_wide_core` w
+    `gemm_i8mma.cu` — WIDE KTILE (KSUB bloków 32-kol w smem naraz), preload WSZYSTKICH
+    fragmentów A/B do rejestrów, `#pragma unroll` po całym kaflu → 32–64 IMMA liniowo
+    (vs 8 w skomitowanym), occupancy=1 przy **255 rej/wątek + 40 KB smem — DOKŁADNIE
+    profil llama.cpp** (`cuobjdump -res-usage`). Cztery warianty na RTX 4090 (izolowany
+    GEMM Q4_K, ten sam mikrobench): single-buffer KTILE=128 (255 rej) **66 TOPS**,
+    double-buffer KTILE=64 **72–79**, KTILE=32 **89–90** — WSZYSTKIE **poniżej**
+    skomitowanego **107**. Głębszy unroll = wolniej, monotonicznie. Wynik bit-w-bit
+    identyczny z Mojo (rel 0.0e0) po rozbiciu epilogu na 2 akumulacje, vs CPU MMQ
+    4.65e-4 (test `cuda_i8mma.rs` przechodzi). **Potwierdza Exp 5 PO STRONIE nvcc:
+    okno pipeline'u NIE jest wąskim gardłem — nawet nvcc/ptxas nie odzyskuje 208 z
+    ręcznie przepisanego kernela, gdy zmienia się układ kafla/smem.** 208 osiąga
+    WYŁĄCZNIE FAKTYCZNY skompilowany kernel `mul_mat_q` llama.cpp (dowód Exp 2), którego
+    dosłowny lift (szablonowa `mma.cuh` tile-abstrakcja + helpery `common.cuh` + nowy
+    quantize `block_q8_1_mmq` + adaptacja `write_back`/layoutu na f16 `[token][row]` +
+    przeróbka launchera na nowy layout aktywacji) to duża integracja ryzykująca złoty
+    test Bielika — świadomie odłożona. **Skomitowany kernel 107-TOPS zachowany jako
+    najlepsza ścieżka ręczna** (drzewo == HEAD; nic nie zmienione). Realna ścieżka do
+    208: vendorowanie kernela llama.cpp albo cuBLASLt int8, nie ręczny rewrite.
 - ✅ **Silnik LLM**: forward, paged KV, fused decode chain, batched continuous
   decode (36× throughput), chunked prefill, admission control, CUDA-graph per bucket
 - ✅ **Drabinka kwantyzacji KV**: f16 → fp8 → rot4 → rot3 (TurboQuant)
