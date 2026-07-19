@@ -51,6 +51,16 @@ pub struct Kernels {
     /// `w4a8_quant_act`, then `w4a8_gemm` reads them directly. Non-default path
     /// (FORGE_GEMM=w4a8); separate from the q8_1 `prequant` (different layout).
     w4a8_act: Mutex<W4A8ActScratch>,
+    /// Grow-only scratch for the vendored llama.cpp Q4_K MMQ GEMM
+    /// (kernels/cuda/mmq_q4k.cu): the `block_q8_1_mmq` activation buffer + the
+    /// f32 output the kernel writes (converted to f16 by a final pass). Separate
+    /// layout from `prequant`. Non-default (FORGE_GEMM=mmq).
+    mmq: Mutex<MmqScratch>,
+    /// Route Q4_K prefill GEMM through the vendored llama.cpp MMQ cubin
+    /// (~2× the hand int8-MMQ TOPS; docs/CODEGEN_PROOF.md Exp 2). DEFAULT ON —
+    /// token-identical to the hand kernel, no quality change (same Q4_K weights).
+    /// `FORGE_GEMM=cuda|mojo|w4a8` selects the other backends.
+    gemm_mmq: bool,
     /// Route dense prefill attention through the tensor-core flash-attention
     /// cubin (kernels/cuda/fattn_prefill.cu) instead of the Mojo scalar
     /// `attn_prefill`. Default ON (f16 hd64/hd128 only; other cases fall
@@ -80,6 +90,17 @@ struct W4A8ActScratch {
     cap_codes: usize,
     /// Current token capacity of `ascales`.
     cap_tokens: usize,
+}
+
+/// Device-resident scratch for the vendored Q4_K MMQ GEMM.
+#[derive(Default)]
+struct MmqScratch {
+    /// `block_q8_1_mmq` activation buffer (bytes).
+    q8: Option<DevBuffer>,
+    cap_q8_bytes: usize,
+    /// f32 GEMM output [n_tokens * n_rows] (elements).
+    dst: Option<DevBuffer>,
+    cap_dst: usize,
 }
 
 /// Device-resident ggml codebook tables (LE bytes of the u64/u32 grids).
@@ -127,6 +148,11 @@ impl Kernels {
             iq_tables,
             prequant: Mutex::new(PrequantScratch::default()),
             w4a8_act: Mutex::new(W4A8ActScratch::default()),
+            mmq: Mutex::new(MmqScratch::default()),
+            gemm_mmq: matches!(
+                std::env::var("FORGE_GEMM").ok().as_deref(),
+                None | Some("mmq")
+            ),
             attn_fa: std::env::var("FORGE_ATTN").ok().as_deref() != Some("scalar"),
         })
     }
@@ -1723,7 +1749,141 @@ impl Kernels {
                 "gemm_q4_k_i8mma requires cols % 256 == 0, got {cols}"
             )));
         }
+        // Vendored llama.cpp MMQ path (FORGE_GEMM=mmq): consumes the SAME native
+        // GGUF Q4_K weight bytes, its own q8_1 activation quant, ~2× the TOPS of
+        // the hand int8-MMQ kernel. Prefill-sized batches only; decode-sized
+        // (n_tokens < 64, rare via gemm_rows) stays on the committed path.
+        if self.gemm_mmq && n_tokens >= 64 {
+            return self
+                .gemm_q4_k_mmq_at(y, w_q4k, w_byte_off, x, rows, cols, n_tokens, stream);
+        }
         self.gemm_i8mma_run("gemm_q4_k_i8mma", y, w_q4k, w_byte_off, x, rows, cols, n_tokens, stream)
+    }
+
+    /// Vendored llama.cpp Q4_K `mul_mat_q` tensor-core GEMM (kernels/cuda/
+    /// mmq_q4k.cu). Three launches on `stream`: (1) f16 activation → f32 →
+    /// `block_q8_1_mmq` (`forge_quantize_mmq_q8_1_ds4`), (2) the MMQ GEMM into an
+    /// f32 scratch, (3) f32 → f16 into `y`. `w_byte_off` addresses the first
+    /// GGUF Q4_K superblock of the row window. Layout/grid/smem replicate ggml's
+    /// `ggml_cuda_mul_mat_q` + `launch_mul_mat_q` for the dense 2-D case.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_q4_k_mmq_at(
+        &self,
+        y: &DevBuffer,
+        w_q4k: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        // block_q8_1_mmq = 144 B / 128 activation cols; ggml pads K to 512.
+        const QMMQ: usize = 144;
+        const MATRIX_ROW_PADDING: usize = 512;
+        let k_pad = cols.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
+        // ggml over-allocates get_mmq_x_max (128) extra blocks past the tile.
+        let q8_bytes = (k_pad / 128) * n_tokens * QMMQ + 128 * QMMQ;
+        let dst_elems = n_tokens * rows;
+
+        let (mmq_x, need_check, smem) = Self::mmq_q4k_config(rows, n_tokens);
+        let gemm_key = format!("mmq_q4k_x{mmq_x}_{}", if need_check { "c" } else { "nc" });
+        let gk = self.artifacts.get(&gemm_key)?;
+        let qk = self.artifacts.get("quantize_mmq_q8_1_ds4")?;
+        let cvt = self.artifacts.get("mmq_f32_to_f16")?;
+
+        let mut sc = self.mmq.lock().expect("mmq scratch poisoned");
+        if sc.cap_q8_bytes < q8_bytes {
+            sc.q8 = Some(self.device.alloc(q8_bytes, MemKind::Device, Pool::Activations)?);
+            sc.cap_q8_bytes = q8_bytes;
+        }
+        if sc.cap_dst < dst_elems {
+            sc.dst = Some(self.device.alloc(dst_elems * 4, MemKind::Device, Pool::Activations)?);
+            sc.cap_dst = dst_elems;
+        }
+        let q8 = sc.q8.as_ref().expect("q8 allocated");
+        let dst = sc.dst.as_ref().expect("dst allocated");
+
+        // (1) f16 activation [n_tokens, cols] → block_q8_1_mmq (DS4). ne00=cols,
+        // s01=cols (contiguous rows), ne0=k_pad, ne1=n_tokens. Padding lanes
+        // (cols..k_pad) read zero. grid(n_tokens, ceil(k_pad/512), 1), block 128.
+        let qcfg = LaunchConfig {
+            grid: (n_tokens as u32, (k_pad as u32).div_ceil(512), 1),
+            block: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let qargs = LaunchArgs::new()
+            .buf(x)
+            .buf(q8)
+            .scalar(cols as i64)
+            .scalar(cols as i64)
+            .scalar(k_pad as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(qk, &qcfg, &qargs, stream)?;
+
+        // (2) MMQ GEMM into f32 dst. grid(ceil(rows/128), ceil(n_tokens/mmq_x), 1),
+        // block(32, MMQ_NWARPS=8, 1), dynamic smem = `smem` (HAL raises the opt-in
+        // limit when > 48 KB). stride_row_x = blocks-per-row = cols/256;
+        // stride_col_dst = rows (dst is [token][row] row-major).
+        let gcfg = LaunchConfig {
+            grid: (
+                (rows as u32).div_ceil(128),
+                (n_tokens as u32).div_ceil(mmq_x as u32),
+                1,
+            ),
+            block: (32, 8, 1),
+            shared_mem_bytes: smem,
+        };
+        let gargs = LaunchArgs::new()
+            .buf_at(w_q4k, w_byte_off)?
+            .buf(q8)
+            .buf(dst)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64)
+            .scalar((cols / 256) as i64)
+            .scalar(n_tokens as i64)
+            .scalar(rows as i64);
+        self.device.launch(gk, &gcfg, &gargs, stream)?;
+
+        // (3) f32 dst → f16 y.
+        let ccfg = LaunchConfig::linear(dst_elems as u32, BLOCK);
+        let cargs = LaunchArgs::new().buf(y).buf(dst).scalar(dst_elems as i64);
+        self.device.launch(cvt, &ccfg, &cargs, stream)
+    }
+
+    /// Replicates ggml's `mul_mat_q_case` mmq_x pick for the RTX 4090 (Ada,
+    /// sm_89): the smallest mmq_x (multiple of its granularity, dynamic smem
+    /// within the 99 KB opt-in limit) that minimizes `ceil(n_tokens/mmq_x)`.
+    /// Returns `(mmq_x, need_check, dynamic_smem_bytes)`. need_check=true when
+    /// `rows` is not a multiple of mmq_y (128). Constants (mmq_y=128, nwarps=8,
+    /// block_q8_1_mmq=144, MMQ_MMA_TILE_X_K_Q8_1=76) are the Ada values printed
+    /// by the ggml headers (see the mmq_q4k build probe).
+    fn mmq_q4k_config(rows: usize, n_tokens: usize) -> (usize, bool, u32) {
+        const SMPBO: usize = 101376; // 99 KB opt-in cap on Ada
+        let nbytes_shared = |mmq_x: usize| -> usize {
+            let nbs_ids = mmq_x * 4;
+            let nbs_x = 128 * 76 * 4; // mmq_y * MMQ_MMA_TILE_X_K_Q8_1 * sizeof(int)
+            let nbs_y_raw = mmq_x * 144; // mmq_x * sizeof(block_q8_1_mmq)
+            let pad = 8 * 32 * 4; // nwarps * warp_size * sizeof(int)
+            let nbs_y = nbs_y_raw.div_ceil(pad) * pad;
+            nbs_ids + nbs_x + nbs_y
+        };
+        let granularity = |mmq_x: usize| -> usize { if mmq_x >= 48 { 16 } else { 8 } };
+        let mut best_x = 8usize;
+        let mut best_tiles = usize::MAX;
+        let mut mmq_x = 8usize;
+        while mmq_x <= 128 && best_tiles > 1 {
+            if mmq_x.is_multiple_of(granularity(mmq_x)) && nbytes_shared(mmq_x) <= SMPBO {
+                let tiles = n_tokens.div_ceil(mmq_x);
+                if tiles < best_tiles {
+                    best_tiles = tiles;
+                    best_x = mmq_x;
+                }
+            }
+            mmq_x += 8;
+        }
+        (best_x, !rows.is_multiple_of(128), nbytes_shared(best_x) as u32)
     }
 
     /// Pre-quantize the activation to q8_1 ONCE (`quantize_act_q8_1`) into the

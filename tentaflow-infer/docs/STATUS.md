@@ -68,6 +68,23 @@ Ostatnia aktualizacja: 2026-07-19.
     ~107 TOPS, ~połowa dostrojonego MMQ llama.cpp (208); reszta = fuzja Fazy 2
     (attn/quant/norm nie-fused). Cubin komitowany jak PTX; ADR-0001 łamane dla
     JEDNEJ rodziny kerneli.
+  - ✅ **Vendorowany Q4_K MMQ llama.cpp (`FORGE_GEMM=mmq`, 2026-07-19)** — domyka
+    lukę 107-vs-208 TOPS z Exp 2/5: zamiast pisać kernel ręcznie, `kernels/cuda/
+    mmq_q4k.cu` włącza NAGŁÓWKI ggml-cuda vendorowane do `kernels/cuda/vendor/
+    llama-cpp/` (13 plików, 644 KB, MIT, commit `112c781`) i instancjonuje
+    PRAWDZIWY `mul_mat_q` Q4_K llama.cpp (`load_tiles_q4_K`→`vec_dot_q4_K_q8_1_mma`
+    →`mmq_write_back_mma` przez `mul_mat_q_process_tile`) — nvcc kompiluje ICH kod,
+    nie kopię. TU dokłada tylko `extern "C"`, wrapper siatki (dense conventional
+    tiling), `quantize_mmq_q8_1<DS4>` (wariant f16-in) i epilog f32→f16. Zjada
+    **natywne bajty GGUF Q4_K rezydentne (BEZ rekwantyzacji, bez zmiany jakości)**
+    + własny q8_1. Izolowany GEMM (RTX 4090, `scratch/mmq_probe/tops.cu`): hand
+    65–109 → **MMQ 116–264 TOPS (1.8–2.4×)** = poziom 208 z proof. Prefill Mistral
+    Q4_K (FA on, 3-rep steady): 512 2590→**4609 (1.78×)**, 4096 4652→**6478 (1.39×,
+    0.54× llama.cpp — było 0.38×)**, 8192 4645→**6327**; dekod bez zmian (146→146).
+    Poprawność: GPU-vs-CPU golden Q4_K relL2 ~3.9e-3 (`scratch/mmq_probe/harness.cu`),
+    coherence token-identyczna z domyślną ścieżką. HAL `launch` włącza opt-in >48 KB
+    dynamic smem (`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`). Non-default;
+    Q8_0/NVFP4/dekod nietknięte, Bielik NVFP4 golden bit-w-bit (1 i 4 pasy).
   - ✅ **Tensor-core flash-attention prefill (`FORGE_ATTN=fa`, 2026-07-19)** —
     `kernels/cuda/fattn_prefill.cu` (2. wyjątek ADR-0001, ten sam cubin path co
     `gemm_i8mma`). Zastępuje skalarny/SIMD `attn_prefill` (Mojo, `dotv += qv8*kv8`)

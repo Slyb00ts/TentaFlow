@@ -774,6 +774,24 @@ impl Device for CudaDevice {
             .iter()
             .map(|slot| slot as *const u64 as *mut c_void)
             .collect();
+        // Blocks requesting more than the 48 KB default dynamic shared memory
+        // (e.g. the vendored Q4_K MMQ kernel, up to ~58 KB) must opt in per
+        // function via CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES. Setting it
+        // is idempotent and immediate (not a stream op), so it is safe to repeat
+        // and safe under graph capture.
+        const DEFAULT_SMEM_LIMIT: u32 = 48 * 1024;
+        if cfg.shared_mem_bytes > DEFAULT_SMEM_LIMIT {
+            unsafe {
+                result::function::set_function_attribute(
+                    kernel_impl.func,
+                    sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    cfg.shared_mem_bytes as i32,
+                )
+            }
+            .map_err(|e| {
+                cu_err(&format!("cuFuncSetAttribute({})", kernel_impl.name), e)
+            })?;
+        }
         unsafe {
             result::launch_kernel(
                 kernel_impl.func,

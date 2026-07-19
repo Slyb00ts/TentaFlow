@@ -1076,3 +1076,74 @@ W4A8 (SmoothQuant, future) the stack would sit at ~0.68× llama.cpp on pp4096.
 `attn_prefill_fa` under `FORGE_ATTN=fa` for f16 cache hd64/hd128; everything else falls through to
 the Mojo scalar kernel). Default path (`FORGE_ATTN` unset / `=scalar`) is byte-unchanged — Bielik
 NVFP4 golden bit-exact on 1 and 4 lanes. Standalone correctness harness in `scratch/fa_test.cu`.
+
+---
+
+## Vendored llama.cpp Q4_K MMQ GEMM (`FORGE_GEMM=mmq`, non-default) — this pass
+
+The coherent-prefill GEMM deficit above (107-vs-208 TOPS) was the "hand CUDA kernel
+still loses to llama.cpp's compiled MMQ" gap proven in `docs/CODEGEN_PROOF.md` Exp 2.
+Root fix: stop hand-writing the tile and **vendor llama.cpp's actual `mul_mat_q`
+device code**. `kernels/cuda/mmq_q4k.cu` includes the ggml-cuda headers vendored to
+`kernels/cuda/vendor/llama-cpp/` (13 headers, 644 KB, MIT, commit `112c781`) and
+instantiates ggml's Q4_K MMA path (`load_tiles_q4_K` → `vec_dot_q4_K_q8_1_mma` →
+`mmq_write_back_mma`, reached through `mul_mat_q_process_tile`) unchanged — nvcc/ptxas
+compiles *their* kernel, not a copy. This TU only adds the `extern "C"` entry points,
+the dense conventional-tiling grid wrapper, ggml's `quantize_mmq_q8_1<DS4>` activation
+quant (f16-input variant), and an f32→f16 epilogue. It consumes the **native GGUF Q4_K
+weight bytes already resident (NO requant, no quality change)** + its own q8_1 quant.
+Non-default: routed only under `FORGE_GEMM=mmq`; the committed hand `gemm_i8mma` Q4_K
+path stays the default. Q8_0 / NVFP4 / decode untouched.
+
+**Correctness** (`scratch/mmq_probe/harness.cu`, GPU MMQ vs independent CPU Q4_K×f16
+golden, tol 5e-3 = the q8_1 activation-quant noise; weight quant cancels — same bytes
+both sides): PASS on every FFN shape and orientation, token counts 1/33/512/517/
+1000/2048, mmq_x ∈ {64,128}:
+
+```
+N=4096  K=14336 T=512  mmq_x=128 : relL2=3.876e-03  PASS
+N=14336 K=4096  T=512  mmq_x=128 : relL2=3.826e-03  PASS
+N=4096  K=14336 T=2048 mmq_x=128 : relL2=3.897e-03  PASS
+N=512   K=256   T=33   mmq_x=64  : relL2=3.819e-03  PASS
+N=4096  K=768   T=1000 mmq_x=64  : relL2=3.913e-03  PASS
+```
+
+**Isolated in-engine GEMM TOPS** (`scratch/mmq_probe/tops.cu`, same cubins the engine
+loads, cudaEvent-timed, work = 2·N·K·T, RTX 4090 idle, 50 iters after warmup):
+
+| shape | T | vendored MMQ | committed hand | speedup |
+|-------|---|--------------|----------------|---------|
+| down-proj N=4096 K=14336  | 512  | **116.6** | 64.9  | 1.79× |
+| down-proj N=4096 K=14336  | 2048 | **189.0** | 99.5  | 1.90× |
+| gate/up  N=14336 K=4096   | 512  | **231.7** | 95.5  | 2.43× |
+| gate/up  N=14336 K=4096   | 2048 | **264.0** | 109.1 | 2.42× |
+
+The vendored MMQ lands at **189–264 TOPS** (the committed hand kernel ~65–109), i.e. the
+~208 the CODEGEN proof measured for llama.cpp's kernel — **1.8–2.4×** the hand kernel,
+confirming the deficit was codegen (per Exp 5), closed by running their exact device code.
+
+**Coherence** (`forge run … --temp 0`): `FORGE_GEMM=mmq` on Mistral-7B Q4_K produces
+`Paris, France. It is one of the most famous landmarks in the world` — **token-identical**
+to the committed Q4_K path (same quant scheme + weights, small numeric diff absorbed).
+Qwen3-0.6B Q8_0 output identical with/without the flag (Q8_0 untouched).
+
+**End-to-end prefill** (`forge bench --prefix-cache off`, FA default on both, 3-rep steady):
+
+| prompt | committed (default) | `FORGE_GEMM=mmq` | ratio | vs llama.cpp 11962 |
+|--------|---------------------|-------------------|-------|--------------------|
+| pp512   | ~2590 | **~4609** | 1.78× | — |
+| pp4096  | ~4652 | **~6478** | 1.39× | **0.54×** (was 0.38×) |
+| pp8192  | 4645  | **6327**  | 1.36× | 0.53× |
+
+Decode unchanged (146.2→146.2 tok/s @4096-ctx, 130.5→130.4 @8192; MMQ is prefill-only,
+n_tokens ≥ 64). The pp4096 coherent stack now **6478 tok/s = 0.54× llama.cpp**, beating
+the ~5700 (~0.48×) projection. Remaining gap to llama.cpp is un-fused quant/norm/epilogue
+launches (FORGE runs quantize+GEMM+f32→f16 as 3 kernels; ggml fuses) + no stream-K load
+balancing in the wrapper (dense conventional tiling) — future work, not the GEMM math.
+
+**Committed state:** `kernels/cuda/mmq_q4k.cu` + `vendor/llama-cpp/` headers, `build.sh`
+(→ `build/sm_89/mmq_q4k_cuda.cubin`), `registry.rs` (embed + 34 entries), `launchers.rs`
+(`gemm_q4_k_mmq_at` + `mmq_q4k_config`, routed from `gemm_q4_k_i8mma_at` under
+`FORGE_GEMM=mmq`), HAL `launch` opts into >48 KB dynamic smem via
+`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`. Default path byte-unchanged — Bielik
+NVFP4 golden bit-exact on 1 and 4 lanes.
