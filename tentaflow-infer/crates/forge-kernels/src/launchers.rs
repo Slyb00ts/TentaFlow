@@ -51,6 +51,12 @@ pub struct Kernels {
     /// `w4a8_quant_act`, then `w4a8_gemm` reads them directly. Non-default path
     /// (FORGE_GEMM=w4a8); separate from the q8_1 `prequant` (different layout).
     w4a8_act: Mutex<W4A8ActScratch>,
+    /// Route dense prefill attention through the tensor-core flash-attention
+    /// cubin (kernels/cuda/fattn_prefill.cu) instead of the Mojo scalar
+    /// `attn_prefill`. Default ON (f16 hd64/hd128 only; other cases fall
+    /// through to the scalar kernel) — it is ~3.9× faster and token-identical
+    /// to the scalar path. `FORGE_ATTN=scalar` forces the old kernel.
+    attn_fa: bool,
 }
 
 /// Device-resident q8_1 activation scratch shared by the i8mma GEMM launches.
@@ -121,6 +127,7 @@ impl Kernels {
             iq_tables,
             prequant: Mutex::new(PrequantScratch::default()),
             w4a8_act: Mutex::new(W4A8ActScratch::default()),
+            attn_fa: std::env::var("FORGE_ATTN").ok().as_deref() != Some("scalar"),
         })
     }
 
@@ -1501,6 +1508,15 @@ impl Kernels {
         scale: f32,
         stream: &Stream,
     ) -> Result<()> {
+        // Tensor-core flash-attention path (FORGE_ATTN=fa). Only the f16 cache
+        // with head_dim 64/128 has an FA specialization; every other shape falls
+        // through to the Mojo scalar kernel so nothing breaks.
+        if self.attn_fa && kv_dtype == DType::F16 && (head_dim == 64 || head_dim == 128) {
+            return self.attn_prefill_fa(
+                out, q, k_cache, v_cache, page_table, base_pos, n_tokens, n_q_heads, n_kv_heads,
+                head_dim, page_size, scale, stream,
+            );
+        }
         let suffix = Self::kv_suffix(kv_dtype, "attn_prefill")?;
         let name = match (head_dim, kv_dtype) {
             (64, _) => format!("attn_prefill_{suffix}_hd64"),
@@ -1520,6 +1536,60 @@ impl Kernels {
         let cfg = LaunchConfig {
             grid: ((n_tokens as u32).div_ceil(16), n_q_heads as u32, 1),
             block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(q)
+            .buf(k_cache)
+            .buf(v_cache)
+            .buf(page_table)
+            .scalar(base_pos as i64)
+            .scalar(n_q_heads as i64)
+            .scalar(n_kv_heads as i64)
+            .scalar(page_size as i64)
+            .scalar(scale)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Tensor-core causal flash-attention prefill (FORGE_ATTN=fa; ADR-0001 CUDA
+    /// cubin kernels/cuda/fattn_prefill.cu). Same I/O contract as `attn_prefill`
+    /// (f16 cache, paged KV, GQA, causal) but QK^T and P·V run as f16 mma with an
+    /// online softmax kept in registers. Grid: (ceil(T/64), n_q_heads); one block
+    /// of 4 warps owns 64 query rows of one head.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_prefill_fa(
+        &self,
+        out: &DevBuffer,
+        q: &DevBuffer,
+        k_cache: &DevBuffer,
+        v_cache: &DevBuffer,
+        page_table: &DevBuffer,
+        base_pos: usize,
+        n_tokens: usize,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let name = match head_dim {
+            64 => "attn_prefill_fa_f16_hd64",
+            128 => "attn_prefill_fa_f16_hd128",
+            other => {
+                return Err(ForgeError::Unsupported(format!(
+                    "attn_prefill_fa: head_dim {other} has no FA specialization"
+                )))
+            }
+        };
+        let k = self.artifacts.get(name)?;
+        // Kernel tiling contract (fattn_prefill.cu): BQ=64 queries per block,
+        // 4 warps = 128 threads.
+        let cfg = LaunchConfig {
+            grid: ((n_tokens as u32).div_ceil(64), n_q_heads as u32, 1),
+            block: (128, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()

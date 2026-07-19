@@ -33,3 +33,14 @@ nvcc -arch="${ARCH}" -cubin -O3 \
 
 echo "wrote ${OUT}/w4a8_gemm_cuda.cubin"
 cuobjdump -res-usage "${OUT}/w4a8_gemm_cuda.cubin" | grep -E 'Function|REG' || true
+
+# Tensor-core causal flash-attention prefill (fattn_prefill.cu; ADR-0001 exception).
+# f16 mma QK^T + online-softmax + P·V over the paged KV cache. Committed cubin,
+# loaded via the same cuModuleLoadData path. Non-default: routed only under
+# FORGE_ATTN=fa (the Mojo scalar attn_prefill stays the default).
+nvcc -arch="${ARCH}" -cubin -O3 \
+    -o "${OUT}/fattn_prefill_cuda.cubin" \
+    "${HERE}/fattn_prefill.cu"
+
+echo "wrote ${OUT}/fattn_prefill_cuda.cubin"
+cuobjdump -res-usage "${OUT}/fattn_prefill_cuda.cubin" | grep -E 'Function|REG' || true

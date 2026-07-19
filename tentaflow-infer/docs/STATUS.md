@@ -68,6 +68,24 @@ Ostatnia aktualizacja: 2026-07-19.
     ~107 TOPS, ~połowa dostrojonego MMQ llama.cpp (208); reszta = fuzja Fazy 2
     (attn/quant/norm nie-fused). Cubin komitowany jak PTX; ADR-0001 łamane dla
     JEDNEJ rodziny kerneli.
+  - ✅ **Tensor-core flash-attention prefill (`FORGE_ATTN=fa`, 2026-07-19)** —
+    `kernels/cuda/fattn_prefill.cu` (2. wyjątek ADR-0001, ten sam cubin path co
+    `gemm_i8mma`). Zastępuje skalarny/SIMD `attn_prefill` (Mojo, `dotv += qv8*kv8`)
+    **f16 mma `m16n8k16`**: QK^T przez mma, online-softmax w rejestrach (running
+    max/sum, akumulator O, rescale per-tile), P·V przez mma, nad paged KV + GQA.
+    Kontrakt I/O bajt-w-bajt jak `attn_prefill` → drop-in. V zapisywane
+    transponowane w smem (`[head_dim][key]`), K/V ładowane `ldmatrix.x2` (bez
+    `.trans`, konwencja `mma.row.col` jak w gemm), layout akumulatora S == layout
+    operandu A → P·V bez repacku. hd128 157 rej, 32 KB smem, 0 spill, ~3 CTA/SM;
+    hd64 też. Domyślnie **OFF** (`scalar` = Mojo, golden bit-exact). Poprawność
+    vs CPU-golden (paged, GQA, causal): max_abs **~3.9e-4** (tolerancja f16), 0 zł.
+    Koherencja: greedy Mistral token-w-token == ścieżka skalarna; Bielik NVFP4
+    golden bit-exact na 1 i 4 liniach też pod `FORGE_ATTN=fa`. Sam kernel
+    attention **3.9× szybszy** (8192 prefill: 1322→340 ms). Prefill (stack
+    koherentny CUDA-MMQ GEMM + FA): 4096 **3749→4556 (1.22×)**, 8192
+    **2953→4638 (1.57×)**; dekod nietknięty (osobny kernel). Luka do llama.cpp
+    (pp4096 11927) 3.18×→**2.62×**. Z W4A8 (niekoherentny) FA składa się do
+    pp4096 **8072**, pp8192 **8765** tok/s. `docs/BENCH_COMPARISON.md`.
   - ℹ️ **Profil prefill (2026-07-19, nsys RTX 4090): compute-bound, brak narzutu
     launchy.** Suma czasu GPU kerneli = 1433.5 ms vs wall 1436 ms przy P=4096
     (luka 0.17 %; 0.8 % przy P=512) → **CUDA-graphing prefillu nic nie daje**

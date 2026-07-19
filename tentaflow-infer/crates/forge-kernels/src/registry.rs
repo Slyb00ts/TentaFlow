@@ -85,6 +85,21 @@ const CUDA_W4A8_ENTRIES: &[(&str, &str)] = &[
     ("w4a8_quant_act", "forge_w4a8_quant_act_pertoken"),
 ];
 
+/// Tensor-core flash-attention prefill cubin (kernels/cuda/fattn_prefill.cu;
+/// ADR-0001 exception). f16 mma QK^T + online softmax + P·V over the paged KV
+/// cache. Non-default: routed only under `FORGE_ATTN=fa`; the Mojo scalar
+/// `attn_prefill` stays the default so the golden path is bit-exact.
+const EMBEDDED_CUDA_CUBIN_FATTN_SM89: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../kernels/mojo/build/sm_89/fattn_prefill_cuda.cubin"
+));
+
+/// (registry key, cubin entry symbol) for each flash-attention head_dim variant.
+const CUDA_FATTN_ENTRIES: &[(&str, &str)] = &[
+    ("attn_prefill_fa_f16_hd64", "forge_attn_prefill_fa_f16_hd64"),
+    ("attn_prefill_fa_f16_hd128", "forge_attn_prefill_fa_f16_hd128"),
+];
+
 const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "rmsnorm_f16",
     "rmsnorm_residual_f16",
@@ -397,6 +412,12 @@ impl KernelArtifacts {
             CUDA_W4A8_ENTRIES,
             &mut handles,
         )?;
+        Self::load_cuda_cubin(
+            device,
+            EMBEDDED_CUDA_CUBIN_FATTN_SM89,
+            CUDA_FATTN_ENTRIES,
+            &mut handles,
+        )?;
         Ok(Self { handles, arch: arch.to_string() })
     }
 
@@ -439,6 +460,10 @@ impl KernelArtifacts {
             ForgeError::Kernel(format!("read w4a8_gemm_cuda.cubin: {e}"))
         })?;
         Self::load_cuda_cubin(device, &w4a8, CUDA_W4A8_ENTRIES, &mut handles)?;
+        let fattn = std::fs::read(arch_dir.join("fattn_prefill_cuda.cubin")).map_err(|e| {
+            ForgeError::Kernel(format!("read fattn_prefill_cuda.cubin: {e}"))
+        })?;
+        Self::load_cuda_cubin(device, &fattn, CUDA_FATTN_ENTRIES, &mut handles)?;
         Ok(Self { handles, arch: arch.to_string() })
     }
 

@@ -1001,3 +1001,78 @@ Non-default W4A8 brought in-tree: `kernels/cuda/w4a8_gemm.cu` (+ its committed c
 `crates/forge-kernels/tests/cuda_w4a8.rs`. Nothing routes to W4A8; `gemm_i8mma` (committed CUDA MMQ)
 remains the Q4_K prefill default. NVFP4 + Q8_0 untouched (golden bit-exact). Standalone harness lives
 in `scratch/w4a8/` (reproducible).
+
+---
+
+## 2026-07-19 — Tensor-core flash-attention prefill (FORGE_ATTN=fa) — SHIPPED (flagged, coherent)
+
+Prefill's dominant remaining cost, once the GEMM is a tensor-core kernel, is **attention**
+(FORGE_PREFILL_TRACE: ~10 % of a fresh 1024-tok chunk, growing to **>50 %** at deep base_pos —
+O(T·ctx)). The Mojo `attn_prefill` (kernels/mojo/src/prefill.mojo) computes QK^T and P·V with
+**scalar/SIMD dot products** (`dotv += qv8*kv8`, `warp.sum`), no tensor cores. `kernels/cuda/
+fattn_prefill.cu` (ADR-0001 exception, same cubin path as `gemm_i8mma`) replaces that with an
+**f16 mma (`m16n8k16`) flash-attention**: QK^T via mma, online softmax (running max/sum, register
+O accumulator, per-tile rescale), P·V via mma, over FORGE's paged KV cache with GQA. Byte-identical
+I/O contract to `attn_prefill` → drop-in. Routed only under **`FORGE_ATTN=fa`**; default (`scalar`)
+keeps the Mojo kernel so the golden path is bit-exact.
+
+**Kernel design.** Grid `(ceil(T/64), n_q_heads)`; one 4-warp block owns 64 query rows of one head,
+each warp a 16-row m-tile. K streams through smem tiles of BK=32 positions as `[key][head_dim]`;
+V is written **transposed** to `[head_dim][key]` so both QK^T and P·V use the proven `mma.row.col`
+convention `C[m][n]=Σ_k A[m][k]·Bstored[n][k]` (same as `gemm_i8mma`, so K/V load with plain
+`ldmatrix.x2`, no `.trans`). Q fragments are preloaded once (reused across all KV tiles). The S
+accumulator layout equals the mma A-operand layout, so the softmax probs feed P·V with **no repack**
+(just f32→f16 pack). hd128: 157 regs, 32 KB smem, **0 spill**, ~3 CTAs/SM. hd64 also built.
+
+**Correctness (standalone GPU-vs-CPU-golden, `scratch/fa_test.cu`).** FA output vs an exact CPU
+reference (causal, GQA, paged), f16 cache, over T∈{1..513}, GQA 32/8 and 16/4, base_pos∈{0,32,100,512}:
+
+```
+hd128 T=1024 heads=32/8 base=0    max_abs=0.00037 max_rel=0.45  nbad=0/4194304
+hd128 T=128  heads=32/8 base=512  max_abs=0.00004 max_rel=0.18  nbad=0/524288
+hd64  T=512  heads=16/4 base=0    max_abs=0.00035 max_rel=0.25  nbad=0/524288
+```
+
+max abs diff **~3.9e-4** (f16-accumulation tolerance; mma reorders sums so not bit-exact) — well
+under a 1e-2 bound. (`max_rel` is large only where the reference value is ~0; those are gated out.)
+
+**Coherence.** `FORGE_ATTN=fa forge run mistral-7b-q4_k_m.gguf "The Eiffel Tower is located in the
+city of" --max-tokens 24 --temp 0` → `"Paris, France. It is one of the most famous landmarks in the
+world. It is a wrought iron tower"` — **the greedy stream is token-for-token IDENTICAL to the scalar
+path** (all 24 tokens). The **Bielik NVFP4 golden test reproduces the canonical 16-token stream on 1
+and 4 lanes under `FORGE_ATTN=fa`** as well as the default.
+
+**Perf — same card, `--prefix-cache off`, Mistral-7B Q4_K_M, default GEMM (committed CUDA MMQ).**
+FA changes ONLY prefill attention; decode is a separate kernel, untouched.
+
+| P / T       | scalar attn (default) | FA attn (`FORGE_ATTN=fa`) | prefill ratio | decode |
+|-------------|----------------------:|--------------------------:|--------------:|-------:|
+| 512 / 128   | 2778 | 2677 | 0.96× (attn is small; GEMM-bound) | 175 (=) |
+| 4096 / 2048 | 3749 | **4556** | **1.22×** | 146 (=) |
+| 8192 / 1024 | 2953 | **4638** | **1.57×** | 130 (=) |
+
+**Attention kernel's own time** (FORGE_PREFILL_TRACE, 8192 prefill = 8×1024-tok chunks, sum of the
+`attn` phase; grows with base_pos): **scalar 1322 ms → FA 340 ms = 3.9× faster** (per-chunk
+27.6/61.7/101.4/141.4/183.3/225.9/269.2/311.5 → 11.4/19.5/27.9/39.0/49.2/59.8/62.1/71.1 ms). At 512
+prefill the attention fraction is tiny so FA is neutral (GEMM dominates).
+
+**vs llama.cpp** (reconfirmed idle GPU this session, `llama-bench -ngl 99 -p 4096 -n 0 -fa 1`,
+build 112c781): **pp4096 = 11927 ± 106**. Coherent stack (CUDA-MMQ GEMM + FA attention):
+pp4096 0.31×→**0.38×** llama.cpp (gap 3.18×→**2.62×**); pp8192 the biggest jump (attention-heaviest).
+
+**Coherent stack summary (default CUDA-MMQ GEMM + FORGE_ATTN=fa):** pp4096 3749→**4556**,
+pp8192 2953→**4638** tok/s. Remaining gap to llama.cpp (~2.6×) is the un-fused GEMM+attention+quant
++norm pipeline and the GEMM's own 107-vs-208 TOPS deficit (documented above), not the attention
+math anymore.
+
+**Max-speed stack (non-coherent, for reference: `FORGE_GEMM=w4a8` + `FORGE_ATTN=fa`).** W4A8 is
+quality-FAILED (see above) so this is NOT a shippable default, but it shows FA compounds on top of
+the fast GEMM: pp4096 5543→**8072** (FA adds +46 %), pp8192 **8765** tok/s — i.e. with a coherent
+W4A8 (SmoothQuant, future) the stack would sit at ~0.68× llama.cpp on pp4096.
+
+## Committed state (this pass)
+`kernels/cuda/fattn_prefill.cu` (+ committed cubin `build/sm_89/fattn_prefill_cuda.cubin`),
+`kernels/cuda/build.sh`, `registry.rs` (embed + entries), `launchers.rs` (`attn_prefill` routes to
+`attn_prefill_fa` under `FORGE_ATTN=fa` for f16 cache hd64/hd128; everything else falls through to
+the Mojo scalar kernel). Default path (`FORGE_ATTN` unset / `=scalar`) is byte-unchanged — Bielik
+NVFP4 golden bit-exact on 1 and 4 lanes. Standalone correctness harness in `scratch/fa_test.cu`.
