@@ -75,6 +75,33 @@ Published tutorials mostly show pre-1.0 syntax — trust these notes over old do
   (ISETP/BSSY per load) starve the tensor pipe; clamp out-of-range
   tokens/rows instead of branching and zero-fill only the W k-tail.
 
+## int8 MMQ prefill Q4_K = CUDA kernel (nvcc), the ONE ADR-0001 exception
+- **Why raw CUDA:** `docs/CODEGEN_PROOF.md` proves the Mojo backend caps the
+  int8-MMQ `gemm_i8mma_impl` at ~66 TOPS on the RTX 4090 while nvcc/ptxas
+  schedules the *bit-identical* `mma.sync.m16n8k32.s8` algorithm past ~200. Exp 5
+  showed the deep K-unroll is NOT the lever (≤8 %) — it's a ptxas instruction
+  scheduler advantage Mojo does not match. So the hot Q4_K prefill GEMM is the
+  single kernel family that leaves Mojo.
+- **Source + build:** `kernels/cuda/gemm_i8mma.cu` (self-contained; Q4_K/Q8_0
+  `mma.sync.m16n8k32.row.col.s32.s8.s8.s32` via inline asm + `ldmatrix.x4/x2`,
+  fragment addressing + f32 scale/min epilogue mirror `gemm_i8mma_impl` 1:1).
+  Build: `kernels/cuda/build.sh [sm_arch]` → `nvcc -arch=sm_89 -cubin` into the
+  committed `kernels/mojo/build/sm_89/gemm_i8mma_cuda.cubin` (nvcc must be on
+  PATH). Runs BESIDE `pixi run mojo build_kernels.mojo`; does NOT touch the
+  Mojo-owned `manifest.json`.
+- **Load path unchanged:** the cubin loads through the SAME `Device::load_module`
+  → `cuModuleLoadData` used for Mojo PTX (`crates/forge-kernels/src/registry.rs`
+  `load_cuda_cubin`, embedded via `include_bytes!`, entries = the `extern "C"`
+  symbols). The launcher (`gemm_i8mma_run`) keeps the identical `quantize_act_q8_1`
+  prepass + grid/args contract and only swaps the GEMM handle.
+- **Result (RTX 4090, same card, A/B via `FORGE_I8MMA_BACKEND`):** isolated Q4_K
+  GEMM Mojo 55–65 → CUDA 65–107 TOPS (1.6–1.9×); output **bit-identical to Mojo**.
+  Mistral-7B Q4_K prefill 512 2497→3334, 4096 2956→3536, 8192 2477→2930; decode
+  unchanged (dp4a GEMV untouched). **Q8_0 stays on Mojo** — its committed i8mma is
+  ~120 TOPS, faster than this CUDA kernel on Q8_0, so routing sends only Q4_K
+  prefill to CUDA (no regression). ~107 TOPS is ~half llama.cpp's tuned MMQ (208);
+  the rest of the gap to llama.cpp (11965 pp4096) is Phase-2 fusion, not this GEMM.
+
 ## int8 matmul: dp4a vs tensor cores (prefill GEMM investigation)
 - **dp4a works and is used** (`llvm.nvvm.idp4a.s.s` via `llvm_intrinsic`, see
   decode_dp4a.mojo). A tiled int8-MMQ *prefill* GEMM (`gemm_i8_dp4a_impl` in

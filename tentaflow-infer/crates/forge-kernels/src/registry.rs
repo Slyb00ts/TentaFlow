@@ -47,6 +47,26 @@ const EMBEDDED_MANIFEST: &str = include_str!(concat!(
     "/../../kernels/mojo/build/sm_89/manifest.json"
 ));
 
+/// The single raw-CUDA kernel family (ADR-0001 exception): the int8 MMQ prefill
+/// GEMM, compiled by nvcc to a committed cubin (kernels/cuda/gemm_i8mma.cu,
+/// docs/CODEGEN_PROOF.md). It loads through the SAME `load_module`/cuModuleLoadData
+/// path as the Mojo PTX, but is embedded separately so it never has to appear in
+/// the Mojo-owned manifest.json. Entry names are the `extern "C"` symbols; the
+/// registry key mirrors the Mojo naming (`gemm_{q}_i8mma[_bn64]`) with a `_cuda`
+/// suffix so the launcher can select the backend.
+const EMBEDDED_CUDA_CUBIN_SM89: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../kernels/mojo/build/sm_89/gemm_i8mma_cuda.cubin"
+));
+
+/// (registry key, cubin entry symbol) for every kernel in the CUDA cubin.
+const CUDA_CUBIN_ENTRIES: &[(&str, &str)] = &[
+    ("gemm_q4_k_i8mma_cuda", "forge_gemm_q4_k_i8mma_cuda"),
+    ("gemm_q4_k_i8mma_cuda_bn64", "forge_gemm_q4_k_i8mma_cuda_bn64"),
+    ("gemm_q8_0_i8mma_cuda", "forge_gemm_q8_0_i8mma_cuda"),
+    ("gemm_q8_0_i8mma_cuda_bn64", "forge_gemm_q8_0_i8mma_cuda_bn64"),
+];
+
 const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "rmsnorm_f16",
     "rmsnorm_residual_f16",
@@ -352,7 +372,22 @@ impl KernelArtifacts {
                 )));
             }
         }
+        Self::load_cuda_cubin(device, EMBEDDED_CUDA_CUBIN_SM89, &mut handles)?;
         Ok(Self { handles, arch: arch.to_string() })
+    }
+
+    /// Resolve the raw-CUDA MMQ cubin's entry points into `handles`. The cubin
+    /// loads exactly like Mojo PTX (`load_module` → cuModuleLoadData).
+    fn load_cuda_cubin(
+        device: &dyn Device,
+        cubin: &[u8],
+        handles: &mut HashMap<String, KernelHandle>,
+    ) -> Result<()> {
+        let module = device.load_module(cubin)?;
+        for (key, entry) in CUDA_CUBIN_ENTRIES {
+            handles.insert((*key).to_string(), module.kernel(entry)?);
+        }
+        Ok(())
     }
 
     fn load_dir(device: &dyn Device, dir: &Path, arch: &str) -> Result<Self> {
@@ -371,6 +406,10 @@ impl KernelArtifacts {
             let module: Module = device.load_module(&ptx)?;
             handles.insert(name.clone(), module.kernel(&entry.entry)?);
         }
+        let cubin = std::fs::read(arch_dir.join("gemm_i8mma_cuda.cubin")).map_err(|e| {
+            ForgeError::Kernel(format!("read gemm_i8mma_cuda.cubin: {e}"))
+        })?;
+        Self::load_cuda_cubin(device, &cubin, &mut handles)?;
         Ok(Self { handles, arch: arch.to_string() })
     }
 

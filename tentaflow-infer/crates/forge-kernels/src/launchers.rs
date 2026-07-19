@@ -11,6 +11,15 @@ use forge_types::{DType, ForgeError, MemKind, Result};
 use crate::registry::KernelArtifacts;
 
 const BLOCK: u32 = 256;
+
+/// Compute backend for the int8 MMQ prefill GEMM (Q4_K / Q8_0).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum I8mmaBackend {
+    /// nvcc-compiled CUDA cubin (kernels/cuda/gemm_i8mma.cu; ADR-0001 exception).
+    Cuda,
+    /// The in-tree Mojo `gemm_i8mma_impl` tiles (decode-sized fallback).
+    Mojo,
+}
 /// Warps per block in attn_decode (must not exceed MAX_WARPS in attention.mojo).
 const ATTN_BLOCK: u32 = 128;
 
@@ -1649,9 +1658,25 @@ impl Kernels {
         n_tokens: usize,
         stream: &Stream,
     ) -> Result<()> {
-        let (suffix, bm, bn, threads) = Self::gemm_i8mma_tile(rows, n_tokens);
         let qk = self.artifacts.get("quantize_act_q8_1")?;
-        let gk = self.artifacts.get(&format!("{kernel_base}{suffix}"))?;
+        // Prefill routes the GEMM compute to the nvcc-compiled CUDA cubin (the
+        // one ADR-0001 exception; docs/CODEGEN_PROOF.md) — same q8_1 pre-pass,
+        // same GGUF weights, same f16 output, ~3x the TOPS of the Mojo i8mma
+        // kernel. Decode-sized batches (n_tokens < 64) keep the tuned Mojo
+        // tiles. `FORGE_I8MMA_BACKEND=mojo|cuda` forces either path (A/B tests).
+        let (suffix, bm, bn, threads, gk) = match Self::i8mma_backend(kernel_base, n_tokens) {
+            I8mmaBackend::Cuda => {
+                let (suffix, bm, bn, threads) = Self::gemm_i8mma_cuda_tile(rows);
+                let gk = self.artifacts.get(&format!("{kernel_base}_cuda{suffix}"))?;
+                (suffix, bm, bn, threads, gk)
+            }
+            I8mmaBackend::Mojo => {
+                let (suffix, bm, bn, threads) = Self::gemm_i8mma_tile(rows, n_tokens);
+                let gk = self.artifacts.get(&format!("{kernel_base}{suffix}"))?;
+                (suffix, bm, bn, threads, gk)
+            }
+        };
+        let _ = suffix;
 
         let need_codes = n_tokens * cols;
         let need_blocks = n_tokens * (cols / 32);
@@ -1747,6 +1772,34 @@ impl Kernels {
             ("", 128, 64, 256)
         } else {
             ("_bm64", 64, 64, 256)
+        }
+    }
+
+    /// Backend for the i8mma GEMM. The nvcc CUDA cubin wins the Q4_K prefill
+    /// GEMM (1.6-1.9x the Mojo TOPS on the RTX 4090; docs/CODEGEN_PROOF.md). The
+    /// committed Mojo Q8_0 i8mma kernel is already ~120 TOPS — faster than this
+    /// CUDA kernel on Q8_0 — so Q8_0 stays on Mojo (no regression). Decode-sized
+    /// batches (rare `gemm_rows` at n_tokens < 64) also keep the Mojo tiles.
+    /// `FORGE_I8MMA_BACKEND=mojo|cuda` overrides for A/B testing.
+    fn i8mma_backend(kernel_base: &str, n_tokens: usize) -> I8mmaBackend {
+        match std::env::var("FORGE_I8MMA_BACKEND").ok().as_deref() {
+            Some("mojo") => I8mmaBackend::Mojo,
+            Some("cuda") => I8mmaBackend::Cuda,
+            _ if kernel_base == "gemm_q4_k_i8mma" && n_tokens >= 64 => I8mmaBackend::Cuda,
+            _ => I8mmaBackend::Mojo,
+        }
+    }
+
+    /// Tile for the CUDA i8mma cubin: `(name_suffix, BM, BN, block_threads)`.
+    /// BM=128 tokens (grid.y = ceil(T/128)); BN=128 rows for wide matrices,
+    /// BN=64 when the row count is small so the grid still fills the SMs. Both
+    /// are 256-thread (8-warp) blocks at ~193 regs = 1 CTA/SM, matching nvcc's
+    /// reference MMQ occupancy.
+    fn gemm_i8mma_cuda_tile(rows: usize) -> (&'static str, u32, u32, u32) {
+        if rows >= 128 {
+            ("", 128, 128, 256)
+        } else {
+            ("_bn64", 128, 64, 256)
         }
     }
 

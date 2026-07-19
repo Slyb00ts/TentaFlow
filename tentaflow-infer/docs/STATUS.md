@@ -48,6 +48,26 @@ Ostatnia aktualizacja: 2026-07-19.
     prefill = f16 tensor-core (dequant Q→f16 → mma). Wciąż ~4× za llama.cpp MMQ
     (11–12.8k) — luka to wydajność mma-issue GEMM przy ścianie 35 % pułapu, nie
     staging X — szczegóły w `kernels/mojo/MOJO_NOTES.md`.
+  - ℹ️ **Prefill Q4_K GEMM = kernel CUDA (nvcc), WYJĄTEK od ADR-0001.** Dowód
+    `docs/CODEGEN_PROOF.md`: backend Mojo trafia w ścianę ~66 TOPS na tym samym
+    algorytmie int8-MMQ, gdzie ptxas/nvcc planuje identyczne `mma.sync.m16n8k32.s8`
+    do >200 TOPS. `kernels/cuda/gemm_i8mma.cu` (BM128×BN128, 256 wątków, MT4×NT4)
+    kompiluje się przez `nvcc -arch=sm_89 -cubin` (`kernels/cuda/build.sh`) do
+    komitowanego `build/sm_89/gemm_i8mma_cuda.cubin`, ładowanego TĄ SAMĄ ścieżką
+    cudarc `cuModuleLoadData` co PTX (Exp 4). Kontrakt I/O bit-w-bit zgodny z
+    `gemm_i8mma_impl`: ten sam prepass `quantize_act_q8_1`, te same kody GGUF, to
+    samo wyjście f16 — wynik **bit-identyczny z Mojo** (rel 0.0e0), a vs exact CPU
+    MMQ ~4.6e-4 (test `crates/forge-kernels/tests/cuda_i8mma.rs`). Izolowany GEMM
+    Q4_K (RTX 4090, ta sama karta): Mojo 55–65 → **CUDA 65–107 TOPS (1.6–1.9×)**.
+    Prefill Mistral-7B Q4_K: 512 **2497→3334 (1.34×)**, 4096 **2956→3536 (1.20×)**,
+    8192 **2477→2930 (1.18×)**; dekod bit-bez-zmian (dp4a GEMV nietknięty). Routing:
+    tylko **Q4_K prefill** (`n_tokens≥64`) → CUDA; **Q8_0 zostaje na Mojo** (jego
+    skomitowany i8mma ~120 TOPS jest szybszy niż ten kernel CUDA na Q8_0 — brak
+    regresji), a dekod/małe batche → Mojo. `FORGE_I8MMA_BACKEND=mojo|cuda` wymusza
+    backend (A/B). Luka do llama.cpp (11965) wciąż ~3.4× — ten kernel CUDA planuje
+    ~107 TOPS, ~połowa dostrojonego MMQ llama.cpp (208); reszta = fuzja Fazy 2
+    (attn/quant/norm nie-fused). Cubin komitowany jak PTX; ADR-0001 łamane dla
+    JEDNEJ rodziny kerneli.
   - ℹ️ **Profil prefill (2026-07-19, nsys RTX 4090): compute-bound, brak narzutu
     launchy.** Suma czasu GPU kerneli = 1433.5 ms vs wall 1436 ms przy P=4096
     (luka 0.17 %; 0.8 % przy P=512) → **CUDA-graphing prefillu nic nie daje**

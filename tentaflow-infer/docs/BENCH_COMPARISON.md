@@ -69,6 +69,32 @@ boost-clock/thermal state; the remaining ~4× gap to llama.cpp is the GEMM's
 mma-issue efficiency at this 35 %-of-ceiling wall, not X staging (see
 STATUS.md / MOJO_NOTES.md).
 
+**Q4_K prefill GEMM now runs on an nvcc CUDA kernel (ADR-0001 exception).**
+`docs/CODEGEN_PROOF.md` proves ptxas schedules the identical int8-MMQ
+`mma.sync.m16n8k32.s8` past ~200 TOPS where the Mojo backend walls at ~66.
+`kernels/cuda/gemm_i8mma.cu` (nvcc `-arch=sm_89 -cubin`, committed cubin, loaded
+through the same cudarc `cuModuleLoadData` path) replaces the Mojo GEMM compute
+for Q4_K prefill while keeping the `quantize_act_q8_1` prepass and everything else
+identical — output is **bit-identical to Mojo** (rel 0.0e0; ~4.6e-4 vs exact CPU
+MMQ). Same-card A/B (`FORGE_I8MMA_BACKEND=mojo|cuda`), Mistral-7B Q4_K_M,
+prefix-cache off:
+
+| P / T | Mojo (before) | CUDA (after) | ratio | decode | llama.cpp pp |
+|-------|---------------|--------------|-------|--------|--------------|
+| 512 / 128   | 2497 | **3334** | 1.34× | 174 (=) | 11965–12789 |
+| 4096 / 2048 | 2956 | **3536** | 1.20× | 146 (=) | 11965 ± 118 |
+| 8192 / 1024 | 2477 | **2930** | 1.18× | 130 (=) | 11019 |
+
+Isolated Q4_K GEMM (RTX 4090, same card): Mojo 55–65 → **CUDA 65–107 TOPS
+(1.6–1.9×)**. Decode is bit-unchanged (dp4a GEMV untouched). **Q8_0 stays on Mojo**
+— its committed i8mma is ~120 TOPS, faster than this CUDA kernel on Q8_0 (which
+lands ~100), so only Q4_K prefill routes to CUDA (no regression); Qwen3-0.6B Q8_0
+4096 prefill unchanged (~17.5k). vs llama.cpp (11965) the ratio improves 0.25× →
+0.30× at pp4096. The remaining ~3.4× gap: this CUDA kernel schedules ~107 TOPS,
+about half of llama.cpp's heavily-tuned MMQ (208 TOPS measured in CODEGEN_PROOF
+Exp 2), and FORGE still un-fuses attention/quant/norm — Phase-2 fusion work, not
+this one GEMM.
+
 VRAM (single-stream, observed peak incl. ~1.1 GiB desktop baseline):
 - **FORGE**: ~23.6 GiB peak — dominated by a pre-reserved full-context KV arena
   (`--kv-pages 0` = full ctx); weights themselves are ~4.1 GiB.
