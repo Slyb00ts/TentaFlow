@@ -504,9 +504,11 @@ W4A8 to *czystszy dequant/pipeline*, nie więcej mma.
 Wynik Phase A (TFLOP-eq, ten sam boost clock 2775 MHz): QServe W4A8 **~450 przy
 T≥2048** i **~400+ przy T=512** — **2.2× llama.cpp (206)** i **4.0× committed FORGE
 CUDA (110)**. Pierwszy kernel przekraczający ścianę 206. Projekcja e2e (GEMM=81%,
-4.0×): prefill ×2.55 → pp4096 **~9670** vs **lokalnie zmierzone** llama.cpp **7475**
-= **1.29× (POBICIE)**. (Uwaga: brief cytował 11984 — NIE reprodukuje się na tej
-maszynie/buildzie; realny lokalny cel to ~7475.)
+4.0×): prefill ×2.55 → pp4096 **~9650** vs llama.cpp **12032** (potwierdzone na
+czystym, zimnym GPU — wcześniejsze 7475 to był artefakt kontencji/throttlingu) =
+**0.80× (WCIĄŻ PONIŻEJ)**. Sam W4A8 GEMM nie wystarcza: narzut nie-GEMM FORGE
+(attention prefill + quant + norm + launche) to ~3× llama.cpp — pobicie wymaga
+W4A8 GEMM **oraz** fuzji/cięcia narzutu nie-GEMM. Oba wykonalne, oba to realna praca.
 
 Phase B (dokładność, CPU, realne tensory): requant Q4_K→int4 per-group **G=128**
 (wymóg kernela) = **~10.2% relL2** (asym) ponad Q4_K; QoQ QServe (int8 scale grupy)

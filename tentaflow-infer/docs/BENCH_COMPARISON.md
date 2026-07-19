@@ -709,9 +709,11 @@ brought in-tree.
 
 Baselines reconfirmed this session, GPU at full boost (SM 2775 MHz, ~320 W, 56 °C):
 
-- `llama-bench -p 4096 -n 128`: **pp4096 = 7472–7480 tok/s**, tg128 = 173 (stable across 3 reps).
-  NOTE: the task brief cited ~11984; that figure does **not** reproduce on this box/build —
-  the honest local target is **~7475**. (Build `112c781`, ggml CUDA, `-ngl 99`.)
+- `llama-bench -p 4096 -n 0`: **pp4096 = 12032 ± 118 tok/s** (reconfirmed by the maintainer on a
+  clean, idle, cool GPU at full boost 2775 MHz / 418 W). An earlier same-session reading of
+  ~7475 was a **GPU-contention/thermal artifact** from sustained back-to-back benchmarking, NOT
+  the true number — the honest llama.cpp target is **~12032**. Every projection below is corrected
+  to this baseline. (`-ngl 99`.)
 - `forge bench --prefix-cache off` (committed Q4_K int8-MMQ): pp512 **2591**, pp4096 **3794**,
   pp8192 **2955** tok/s; decode 175/146/131.
 
@@ -762,14 +764,15 @@ affine unpack in the inner loop.
 ### End-to-end projection (GEMM = 81 % of prefill)
 GEMM 4.0× (110→450) → prefill speedup = 1/(0.19 + 0.81/4.0) = **2.55×**.
 
-| shape | FORGE now | projected W4A8 | llama.cpp (local) | ratio vs llama.cpp |
+| shape | FORGE now | projected W4A8 | llama.cpp (clean) | ratio vs llama.cpp |
 |-------|-----------|----------------|-------------------|--------------------|
-| pp4096 | 3794 | **~9670** | 7475 | **1.29× (BEATS)** |
-| pp512  | 2591 | ~6600 | — | — |
-| pp8192 | 2955 | ~7530 | — | — |
+| pp4096 | 3785 | **~9650** | 12032 | **0.80× (still behind)** |
 
-Against the **locally measured** llama.cpp (7475) the integration is projected to **win** on
-pp4096. Against the brief's 11984 (not reproducible here) it would be ~0.81×.
+Corrected against the true llama.cpp baseline (12032): the W4A8 GEMM alone takes prefill to
+~9650 = **0.80×** — a 2.55× jump but NOT yet a win, because FORGE's non-GEMM work
+(attention prefill + activation-quant + RMSNorm + per-launch overhead) is ~3× llama.cpp's.
+Beating llama.cpp end-to-end needs BOTH the W4A8 GEMM **and** cutting that non-GEMM overhead
+(fusion / fewer launches) toward llama.cpp's ~0.065 s. Both are proven-feasible; both are real work.
 
 ## Phase B — Q4_K → W4A8 requant accuracy (CPU, real Mistral FFN tensors)
 
