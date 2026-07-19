@@ -51,14 +51,14 @@ pub struct Kernels {
     /// `w4a8_quant_act`, then `w4a8_gemm` reads them directly. Non-default path
     /// (FORGE_GEMM=w4a8); separate from the q8_1 `prequant` (different layout).
     w4a8_act: Mutex<W4A8ActScratch>,
-    /// Grow-only scratch for the vendored llama.cpp Q4_K MMQ GEMM
-    /// (kernels/cuda/mmq_q4k.cu): the `block_q8_1_mmq` activation buffer + the
-    /// f32 output the kernel writes (converted to f16 by a final pass). Separate
-    /// layout from `prequant`. Non-default (FORGE_GEMM=mmq).
+    /// Grow-only scratch for the vendored llama.cpp Q4_K / Q6_K MMQ GEMM
+    /// (kernels/cuda/mmq_q4k.cu): the `block_q8_1_mmq` activation buffer. The
+    /// GEMM writes f16 directly into the caller's output. Separate layout from
+    /// `prequant`.
     mmq: Mutex<MmqScratch>,
-    /// Route Q4_K prefill GEMM through the vendored llama.cpp MMQ cubin
+    /// Route Q4_K + Q6_K prefill GEMM through the vendored llama.cpp MMQ cubin
     /// (~2× the hand int8-MMQ TOPS; docs/CODEGEN_PROOF.md Exp 2). DEFAULT ON —
-    /// token-identical to the hand kernel, no quality change (same Q4_K weights).
+    /// same native GGUF weights + q8_1 activation, no quality change.
     /// `FORGE_GEMM=cuda|mojo|w4a8` selects the other backends.
     gemm_mmq: bool,
     /// Route dense prefill attention through the tensor-core flash-attention
@@ -92,15 +92,13 @@ struct W4A8ActScratch {
     cap_tokens: usize,
 }
 
-/// Device-resident scratch for the vendored Q4_K MMQ GEMM.
+/// Device-resident scratch for the vendored Q4_K / Q6_K MMQ GEMM.
 #[derive(Default)]
 struct MmqScratch {
-    /// `block_q8_1_mmq` activation buffer (bytes).
+    /// `block_q8_1_mmq` activation buffer (bytes). The GEMM writes f16 straight
+    /// into the caller's output, so no f32 output scratch is needed.
     q8: Option<DevBuffer>,
     cap_q8_bytes: usize,
-    /// f32 GEMM output [n_tokens * n_rows] (elements).
-    dst: Option<DevBuffer>,
-    cap_dst: usize,
 }
 
 /// Device-resident ggml codebook tables (LE bytes of the u64/u32 grids).
@@ -1749,28 +1747,43 @@ impl Kernels {
                 "gemm_q4_k_i8mma requires cols % 256 == 0, got {cols}"
             )));
         }
-        // Vendored llama.cpp MMQ path (FORGE_GEMM=mmq): consumes the SAME native
-        // GGUF Q4_K weight bytes, its own q8_1 activation quant, ~2× the TOPS of
-        // the hand int8-MMQ kernel. Prefill-sized batches only; decode-sized
+        // Vendored llama.cpp MMQ path (default): consumes the SAME native GGUF
+        // Q4_K weight bytes, its own q8_1 activation quant, ~2× the TOPS of the
+        // hand int8-MMQ kernel. Prefill-sized batches only; decode-sized
         // (n_tokens < 64, rare via gemm_rows) stays on the committed path.
         if self.gemm_mmq && n_tokens >= 64 {
-            return self
-                .gemm_q4_k_mmq_at(y, w_q4k, w_byte_off, x, rows, cols, n_tokens, stream);
+            return self.gemm_mmq_at(
+                "mmq_q4k",
+                "quantize_mmq_q8_1_ds4",
+                y,
+                w_q4k,
+                w_byte_off,
+                x,
+                rows,
+                cols,
+                n_tokens,
+                stream,
+            );
         }
         self.gemm_i8mma_run("gemm_q4_k_i8mma", y, w_q4k, w_byte_off, x, rows, cols, n_tokens, stream)
     }
 
-    /// Vendored llama.cpp Q4_K `mul_mat_q` tensor-core GEMM (kernels/cuda/
-    /// mmq_q4k.cu). Three launches on `stream`: (1) f16 activation → f32 →
-    /// `block_q8_1_mmq` (`forge_quantize_mmq_q8_1_ds4`), (2) the MMQ GEMM into an
-    /// f32 scratch, (3) f32 → f16 into `y`. `w_byte_off` addresses the first
-    /// GGUF Q4_K superblock of the row window. Layout/grid/smem replicate ggml's
-    /// `ggml_cuda_mul_mat_q` + `launch_mul_mat_q` for the dense 2-D case.
+    /// Vendored llama.cpp `mul_mat_q` tensor-core GEMM (kernels/cuda/mmq_q4k.cu),
+    /// shared by the Q4_K and Q6_K prefill paths. Two launches on `stream`:
+    /// (1) f16 activation → `block_q8_1_mmq` (`quant_key`: DS4 for Q4_K, D4 for
+    /// Q6_K), (2) the MMQ GEMM writing f16 straight into `y` (the f32→f16 convert
+    /// is folded into the kernel epilogue). `gemm_prefix` selects the weight-type
+    /// entry family (`mmq_q4k` / `mmq_q6k`). `w_byte_off` addresses the first
+    /// GGUF superblock of the row window. Layout/grid/smem replicate ggml's
+    /// `ggml_cuda_mul_mat_q` + `launch_mul_mat_q` for the dense 2-D case
+    /// (identical smem for both types — MMQ_MMA_TILE_X_K == 76).
     #[allow(clippy::too_many_arguments)]
-    fn gemm_q4_k_mmq_at(
+    fn gemm_mmq_at(
         &self,
+        gemm_prefix: &str,
+        quant_key: &str,
         y: &DevBuffer,
-        w_q4k: &DevBuffer,
+        w: &DevBuffer,
         w_byte_off: usize,
         x: &DevBuffer,
         rows: usize,
@@ -1784,27 +1797,21 @@ impl Kernels {
         let k_pad = cols.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
         // ggml over-allocates get_mmq_x_max (128) extra blocks past the tile.
         let q8_bytes = (k_pad / 128) * n_tokens * QMMQ + 128 * QMMQ;
-        let dst_elems = n_tokens * rows;
 
-        let (mmq_x, need_check, smem) = Self::mmq_q4k_config(rows, n_tokens);
-        let gemm_key = format!("mmq_q4k_x{mmq_x}_{}", if need_check { "c" } else { "nc" });
+        let (mmq_x, need_check, smem) = Self::mmq_kk_config(rows, n_tokens);
+        let gemm_key =
+            format!("{gemm_prefix}_x{mmq_x}_{}", if need_check { "c" } else { "nc" });
         let gk = self.artifacts.get(&gemm_key)?;
-        let qk = self.artifacts.get("quantize_mmq_q8_1_ds4")?;
-        let cvt = self.artifacts.get("mmq_f32_to_f16")?;
+        let qk = self.artifacts.get(quant_key)?;
 
         let mut sc = self.mmq.lock().expect("mmq scratch poisoned");
         if sc.cap_q8_bytes < q8_bytes {
             sc.q8 = Some(self.device.alloc(q8_bytes, MemKind::Device, Pool::Activations)?);
             sc.cap_q8_bytes = q8_bytes;
         }
-        if sc.cap_dst < dst_elems {
-            sc.dst = Some(self.device.alloc(dst_elems * 4, MemKind::Device, Pool::Activations)?);
-            sc.cap_dst = dst_elems;
-        }
         let q8 = sc.q8.as_ref().expect("q8 allocated");
-        let dst = sc.dst.as_ref().expect("dst allocated");
 
-        // (1) f16 activation [n_tokens, cols] → block_q8_1_mmq (DS4). ne00=cols,
+        // (1) f16 activation [n_tokens, cols] → block_q8_1_mmq. ne00=cols,
         // s01=cols (contiguous rows), ne0=k_pad, ne1=n_tokens. Padding lanes
         // (cols..k_pad) read zero. grid(n_tokens, ceil(k_pad/512), 1), block 128.
         let qcfg = LaunchConfig {
@@ -1821,10 +1828,10 @@ impl Kernels {
             .scalar(n_tokens as i64);
         self.device.launch(qk, &qcfg, &qargs, stream)?;
 
-        // (2) MMQ GEMM into f32 dst. grid(ceil(rows/128), ceil(n_tokens/mmq_x), 1),
-        // block(32, MMQ_NWARPS=8, 1), dynamic smem = `smem` (HAL raises the opt-in
-        // limit when > 48 KB). stride_row_x = blocks-per-row = cols/256;
-        // stride_col_dst = rows (dst is [token][row] row-major).
+        // (2) MMQ GEMM writing f16 directly into y. grid(ceil(rows/128),
+        // ceil(n_tokens/mmq_x), 1), block(32, MMQ_NWARPS=8, 1), dynamic smem =
+        // `smem` (HAL raises the opt-in limit when > 48 KB). stride_row_x =
+        // blocks-per-row = cols/256; stride_col_dst = rows (y is [token][row]).
         let gcfg = LaunchConfig {
             grid: (
                 (rows as u32).div_ceil(128),
@@ -1835,21 +1842,16 @@ impl Kernels {
             shared_mem_bytes: smem,
         };
         let gargs = LaunchArgs::new()
-            .buf_at(w_q4k, w_byte_off)?
+            .buf_at(w, w_byte_off)?
             .buf(q8)
-            .buf(dst)
+            .buf(y)
             .scalar(cols as i64)
             .scalar(rows as i64)
             .scalar(n_tokens as i64)
             .scalar((cols / 256) as i64)
             .scalar(n_tokens as i64)
             .scalar(rows as i64);
-        self.device.launch(gk, &gcfg, &gargs, stream)?;
-
-        // (3) f32 dst → f16 y.
-        let ccfg = LaunchConfig::linear(dst_elems as u32, BLOCK);
-        let cargs = LaunchArgs::new().buf(y).buf(dst).scalar(dst_elems as i64);
-        self.device.launch(cvt, &ccfg, &cargs, stream)
+        self.device.launch(gk, &gcfg, &gargs, stream)
     }
 
     /// Replicates ggml's `mul_mat_q_case` mmq_x pick for the RTX 4090 (Ada,
@@ -1857,9 +1859,9 @@ impl Kernels {
     /// within the 99 KB opt-in limit) that minimizes `ceil(n_tokens/mmq_x)`.
     /// Returns `(mmq_x, need_check, dynamic_smem_bytes)`. need_check=true when
     /// `rows` is not a multiple of mmq_y (128). Constants (mmq_y=128, nwarps=8,
-    /// block_q8_1_mmq=144, MMQ_MMA_TILE_X_K_Q8_1=76) are the Ada values printed
-    /// by the ggml headers (see the mmq_q4k build probe).
-    fn mmq_q4k_config(rows: usize, n_tokens: usize) -> (usize, bool, u32) {
+    /// block_q8_1_mmq=144, MMQ_MMA_TILE_X_K=76) are the Ada values printed by the
+    /// ggml headers; identical for Q4_K and Q6_K (both tile to 76).
+    fn mmq_kk_config(rows: usize, n_tokens: usize) -> (usize, bool, u32) {
         const SMPBO: usize = 101376; // 99 KB opt-in cap on Ada
         let nbytes_shared = |mmq_x: usize| -> usize {
             let nbs_ids = mmq_x * 4;
@@ -2393,6 +2395,23 @@ impl Kernels {
             return Err(ForgeError::Kernel(format!(
                 "gemm_q6_k requires cols % 256 == 0, got {cols}"
             )));
+        }
+        // Vendored llama.cpp MMQ path (default): Q6_K native codes + q8_1 (D4)
+        // activation on the tensor cores — ~2× the Mojo f16 GEMM. Prefill only
+        // (n_tokens >= 64); decode-sized batches keep the Mojo f16 GEMM below.
+        if self.gemm_mmq && n_tokens >= 64 {
+            return self.gemm_mmq_at(
+                "mmq_q6k",
+                "quantize_mmq_q8_1_d4",
+                y,
+                w_q6k,
+                w_byte_off,
+                x,
+                rows,
+                cols,
+                n_tokens,
+                stream,
+            );
         }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q6_k_f16{suffix}"))?;

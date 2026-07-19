@@ -45,12 +45,13 @@ nvcc -arch="${ARCH}" -cubin -O3 \
 echo "wrote ${OUT}/fattn_prefill_cuda.cubin"
 cuobjdump -res-usage "${OUT}/fattn_prefill_cuda.cubin" | grep -E 'Function|REG' || true
 
-# Vendored llama.cpp Q4_K MMQ (mul_mat_q) tensor-core GEMM (mmq_q4k.cu; ADR-0001
-# exception, MIT). Runs ggml's ACTUAL compiled device code (~208 TOPS on the 4090;
-# docs/CODEGEN_PROOF.md Exp 2) — its exact tensor-core inner loop reached through
-# the vendored ggml-cuda headers under vendor/llama-cpp/. Self-contained: needs
-# only those headers (no ggml runtime). Committed cubin, loaded via the same
-# cuModuleLoadData path. Non-default: routed only under FORGE_GEMM=mmq.
+# Vendored llama.cpp Q4_K + Q6_K MMQ (mul_mat_q) tensor-core GEMM (mmq_q4k.cu;
+# ADR-0001 exception, MIT). Runs ggml's ACTUAL compiled device code (~208 TOPS on
+# the 4090; docs/CODEGEN_PROOF.md Exp 2) — its exact tensor-core inner loop reached
+# through the vendored ggml-cuda headers under vendor/llama-cpp/. Self-contained:
+# needs only those headers (no ggml runtime). Writes f16 directly (f32→f16
+# convert folded into the epilogue). Committed cubin, loaded via the same
+# cuModuleLoadData path. DEFAULT Q4_K/Q6_K prefill GEMM (FORGE_GEMM=cuda|mojo off).
 VENDOR="${HERE}/vendor/llama-cpp/ggml"
 nvcc -arch="${ARCH}" -cubin -O3 -std=c++17 \
     -I"${VENDOR}/src/ggml-cuda" -I"${VENDOR}/include" -I"${VENDOR}/src" \

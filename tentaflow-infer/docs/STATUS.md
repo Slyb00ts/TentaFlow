@@ -83,8 +83,25 @@ Ostatnia aktualizacja: 2026-07-19.
     0.54× llama.cpp — było 0.38×)**, 8192 4645→**6327**; dekod bez zmian (146→146).
     Poprawność: GPU-vs-CPU golden Q4_K relL2 ~3.9e-3 (`scratch/mmq_probe/harness.cu`),
     coherence token-identyczna z domyślną ścieżką. HAL `launch` włącza opt-in >48 KB
-    dynamic smem (`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`). Non-default;
-    Q8_0/NVFP4/dekod nietknięte, Bielik NVFP4 golden bit-w-bit (1 i 4 pasy).
+    dynamic smem (`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`). **Teraz DOMYŚLNY**
+    dla prefill Q4_K; Q8_0/NVFP4/dekod nietknięte, Bielik NVFP4 golden bit-w-bit.
+  - ✅ **Q6_K prefill → MMQ + epilog f16-direct (DOMYŚLNE, 2026-07-19)** — dwie
+    koherentne wygrane nad domyślnym Q4_K MMQ, obie czysto numeryczne (te same
+    natywne wagi GGUF + q8_1, bez zmiany jakości). (1) Instancja Q6_K w
+    `mmq_q4k.cu` (`forge_mmq_q6k_x*`, `load_tiles_q6_K`→`vec_dot_q6_K_q8_1_mma`
+    verbatim; układ q8_1 **D4** = tylko `d`, nowy `forge_quantize_mmq_q8_1_d4`;
+    smem identyczny jak Q4_K, MMQ_MMA_TILE_X_K==76) zastępuje wolny Mojo f16 GEMM
+    Q6_K down-proj (był 27% prefillu). Routing prefill (`n_tokens≥64`) w
+    `gemm_q6_k_f16_at`; dekod Q6_K zostaje na dp4a gemv Mojo. (2) MMQ zapisuje f16
+    wprost (`forge_mmq_write_back_f16`, `__float2half`) dla Q4_K i Q6_K — usunięty
+    osobny kernel `forge_f32_to_f16` (był 8%, 768 launchy) + scratch f32.
+    Poprawność: Q6_K GPU-vs-CPU golden relL2 ~3.77e-3 (`scratch/mmq_probe/
+    q6k_harness.cu`), Q4_K f16-epilog re-pass ~3.9e-3, coherence Mistral Q4_K
+    token-identyczna z all-Mojo. Prefill Mistral (FA on, best-of-3): 512
+    4609→**5851**, 4096 6478→**7956 (0.665× llama.cpp — było 0.54×)**, 8192
+    6327→**7753**; dekod bez zmian (146.2/130.5). nsys: znika `forge_f32_to_f16`
+    i Mojo Q6_K prefill GEMM; Q6_K MMQ 10%, quant-d4 <1%. Bielik NVFP4 golden
+    bit-w-bit (1 i 4 pasy).
   - ✅ **Tensor-core flash-attention prefill (`FORGE_ATTN=fa`, 2026-07-19)** —
     `kernels/cuda/fattn_prefill.cu` (2. wyjątek ADR-0001, ten sam cubin path co
     `gemm_i8mma`). Zastępuje skalarny/SIMD `attn_prefill` (Mojo, `dotv += qv8*kv8`)

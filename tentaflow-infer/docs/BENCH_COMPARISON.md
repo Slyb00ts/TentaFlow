@@ -1147,3 +1147,66 @@ balancing in the wrapper (dense conventional tiling) — future work, not the GE
 `FORGE_GEMM=mmq`), HAL `launch` opts into >48 KB dynamic smem via
 `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`. Default path byte-unchanged — Bielik
 NVFP4 golden bit-exact on 1 and 4 lanes.
+
+---
+
+## Q6_K prefill → vendored MMQ + f16-direct epilogue (both wins, DEFAULT) — 2026-07-19
+
+Two coherent wins over the now-default Q4_K MMQ, both pure numeric no-ops (same
+native GGUF weights + q8_1 activation, no quality change). nsys on the prior default
+(Q4_K MMQ + FA) showed Mistral-7B Q4_K_M prefill was 40% MMQ-Q4_K, **27% Q6_K down-proj
+still on the slow Mojo f16 GEMM** (`gemm_q6_k_f16`), 16% FA, **8% a separate
+`forge_f32_to_f16` epilogue** (768 launches), ~9% small ops.
+
+**Win 1 — Q6_K prefill GEMM through the vendored `mul_mat_q`.** Added a Q6_K
+instantiation to `kernels/cuda/mmq_q4k.cu` (`forge_mmq_q6k_x*`, GGML_TYPE_Q6_K through
+the same dense-tiling body), reaching ggml's `load_tiles_q6_K` → `vec_dot_q6_K_q8_1_mma`
+verbatim. Q6_K uses the **D4** q8_1 layout (d only, no partial sum) vs Q4_K's DS4 — added
+`forge_quantize_mmq_q8_1_d4`. Smem is identical (MMQ_MMA_TILE_X_K == 76 for both), so the
+Q4_K `mmq_kk_config` mmq_x/smem pick is reused. Routed for Q6_K prefill (`n_tokens >= 64`)
+in `launchers.rs::gemm_q6_k_f16_at`; Q6_K DECODE stays on the Mojo dp4a gemv.
+
+**Win 2 — MMQ writes f16 directly.** The vendored `mmq_write_back_mma` wrote f32 then a
+separate kernel converted to f16. Folded the conversion into a f16 write-back
+(`forge_mmq_write_back_f16`, `__float2half` store) for both Q4_K and Q6_K, dropping the
+f32 output scratch and all 768 `forge_f32_to_f16` launches (kernel deleted).
+
+**Correctness.** GPU-vs-CPU-golden (`scratch/mmq_probe/q6k_harness.cu`, canonical ggml
+Q6_K dequant of the SAME bytes, tol 5e-3 = q8_1 + f16 noise):
+
+```
+Q6_K N=4096 K=512  T=512 mmq_x=128 : relL2=3.768e-03  PASS
+Q6_K N=4096 K=512  T=64  mmq_x=64  : relL2=3.757e-03  PASS
+Q6_K N=4096 K=2048 T=512 mmq_x=128 : relL2=3.765e-03  PASS
+Q6_K N=384  K=512  T=200 mmq_x=128 : relL2=3.773e-03  PASS
+```
+
+Q4_K f16-epilogue harness re-passes (`harness.cu`, __half dst): N=4096 K=512/2048 T=512
+relL2 3.97e-3 / 3.82e-3 PASS. **Coherence** (`forge run … --temp 0`): Mistral-7B Q4_K_M
+→ `Paris, France. It is one of the most famous landmarks in the world` — **token-identical**
+to the all-Mojo reference (`FORGE_GEMM=mojo`). Bielik NVFP4 golden bit-exact on 1 and 4 lanes.
+
+**End-to-end prefill** (`forge bench --prefix-cache off`, FA on, best-of-3 steady):
+
+| prompt | before (Q4_K-MMQ default) | after (this pass) | ratio | vs llama.cpp |
+|--------|---------------------------|-------------------|-------|--------------|
+| pp512   | ~4609 | **5851** | 1.27× | — |
+| pp4096  | 6478  | **7956** | 1.23× | **0.665×** (11960; was 0.54×) |
+| pp8192  | 6327  | **7753** | 1.23× | 0.70× (11019) |
+
+Decode unchanged (146.2 tok/s @4096, 130.5 @8192; Q6_K decode still Mojo dp4a).
+All-Mojo lower bound (`FORGE_GEMM=mojo`) pp4096 = 4485 for reference.
+
+**nsys after** (pp4096, prefill-dominated): MMQ-Q4_K 55%, FA 17%, **MMQ-Q6_K 10%**
+(`forge_mmq_q6k_x128_nc` — replaces the 27% Mojo `gemm_q6_k`), silu_mul 8%,
+rmsnorm_residual 4%, quantize-ds4 2%, **quantize-d4 <1%**. The `forge_f32_to_f16` kernel
+is **absent** (was 8%); the Mojo Q6_K prefill GEMM is **absent** (only the 4-instance
+decode `gemv_q6_k_dp4a` remains). Remaining gap to llama.cpp: MMQ-Q4_K (55%) is still the
+dominant cost, plus the un-fused quant/norm/attention pipeline (ggml fuses; FORGE launches
+quantize+GEMM separately) and no stream-K load balancing in the dense wrapper.
+
+**Committed state:** `kernels/cuda/mmq_q4k.cu` (generic `forge_mmq_body<type>` + f16
+write-back + Q6_K entries + D4 quant; `forge_f32_to_f16` removed), `build.sh`,
+`registry.rs` (Q6_K entries + `quantize_mmq_q8_1_d4`, `mmq_f32_to_f16` removed),
+`launchers.rs` (`gemm_mmq_at` shared Q4_K/Q6_K, writes f16 direct; `MmqScratch` f32 dst
+removed; Q6_K routing in `gemm_q6_k_f16_at`). Default path Bielik NVFP4 golden bit-exact.

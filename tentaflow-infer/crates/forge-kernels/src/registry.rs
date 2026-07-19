@@ -100,18 +100,19 @@ const CUDA_FATTN_ENTRIES: &[(&str, &str)] = &[
     ("attn_prefill_fa_f16_hd128", "forge_attn_prefill_fa_f16_hd128"),
 ];
 
-/// Vendored llama.cpp Q4_K MMQ (`mul_mat_q`) tensor-core GEMM cubin
+/// Vendored llama.cpp Q4_K + Q6_K MMQ (`mul_mat_q`) tensor-core GEMM cubin
 /// (kernels/cuda/mmq_q4k.cu; ADR-0001 exception, MIT). ggml's ACTUAL compiled
-/// Q4_K device code (~208 TOPS on the 4090; docs/CODEGEN_PROOF.md Exp 2). Loaded
-/// through the same cuModuleLoadData path. Non-default: routed only under
-/// `FORGE_GEMM=mmq`; the committed hand `gemm_i8mma` Q4_K path stays the default.
+/// Q4_K/Q6_K device code (~208 TOPS on the 4090; docs/CODEGEN_PROOF.md Exp 2),
+/// writing f16 directly. Loaded through the same cuModuleLoadData path. DEFAULT
+/// Q4_K/Q6_K prefill GEMM; `FORGE_GEMM=cuda|mojo` selects the other backends.
 const EMBEDDED_CUDA_CUBIN_MMQ_SM89: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../kernels/mojo/build/sm_89/mmq_q4k_cuda.cubin"
 ));
 
-/// (registry key, cubin entry symbol) for the MMQ GEMM (one per mmq_x × need_check),
-/// the q8_1 activation quant, and the f32→f16 epilogue.
+/// (registry key, cubin entry symbol) for the MMQ GEMM (one per weight type ×
+/// mmq_x × need_check) plus the two q8_1 activation quant layouts (DS4 for Q4_K,
+/// D4 for Q6_K). The GEMM writes f16 directly — no separate f32→f16 epilogue.
 const CUDA_MMQ_ENTRIES: &[(&str, &str)] = &[
     ("mmq_q4k_x8_nc", "forge_mmq_q4k_x8_nc"),
     ("mmq_q4k_x8_c", "forge_mmq_q4k_x8_c"),
@@ -145,8 +146,40 @@ const CUDA_MMQ_ENTRIES: &[(&str, &str)] = &[
     ("mmq_q4k_x120_c", "forge_mmq_q4k_x120_c"),
     ("mmq_q4k_x128_nc", "forge_mmq_q4k_x128_nc"),
     ("mmq_q4k_x128_c", "forge_mmq_q4k_x128_c"),
+    ("mmq_q6k_x8_nc", "forge_mmq_q6k_x8_nc"),
+    ("mmq_q6k_x8_c", "forge_mmq_q6k_x8_c"),
+    ("mmq_q6k_x16_nc", "forge_mmq_q6k_x16_nc"),
+    ("mmq_q6k_x16_c", "forge_mmq_q6k_x16_c"),
+    ("mmq_q6k_x24_nc", "forge_mmq_q6k_x24_nc"),
+    ("mmq_q6k_x24_c", "forge_mmq_q6k_x24_c"),
+    ("mmq_q6k_x32_nc", "forge_mmq_q6k_x32_nc"),
+    ("mmq_q6k_x32_c", "forge_mmq_q6k_x32_c"),
+    ("mmq_q6k_x40_nc", "forge_mmq_q6k_x40_nc"),
+    ("mmq_q6k_x40_c", "forge_mmq_q6k_x40_c"),
+    ("mmq_q6k_x48_nc", "forge_mmq_q6k_x48_nc"),
+    ("mmq_q6k_x48_c", "forge_mmq_q6k_x48_c"),
+    ("mmq_q6k_x56_nc", "forge_mmq_q6k_x56_nc"),
+    ("mmq_q6k_x56_c", "forge_mmq_q6k_x56_c"),
+    ("mmq_q6k_x64_nc", "forge_mmq_q6k_x64_nc"),
+    ("mmq_q6k_x64_c", "forge_mmq_q6k_x64_c"),
+    ("mmq_q6k_x72_nc", "forge_mmq_q6k_x72_nc"),
+    ("mmq_q6k_x72_c", "forge_mmq_q6k_x72_c"),
+    ("mmq_q6k_x80_nc", "forge_mmq_q6k_x80_nc"),
+    ("mmq_q6k_x80_c", "forge_mmq_q6k_x80_c"),
+    ("mmq_q6k_x88_nc", "forge_mmq_q6k_x88_nc"),
+    ("mmq_q6k_x88_c", "forge_mmq_q6k_x88_c"),
+    ("mmq_q6k_x96_nc", "forge_mmq_q6k_x96_nc"),
+    ("mmq_q6k_x96_c", "forge_mmq_q6k_x96_c"),
+    ("mmq_q6k_x104_nc", "forge_mmq_q6k_x104_nc"),
+    ("mmq_q6k_x104_c", "forge_mmq_q6k_x104_c"),
+    ("mmq_q6k_x112_nc", "forge_mmq_q6k_x112_nc"),
+    ("mmq_q6k_x112_c", "forge_mmq_q6k_x112_c"),
+    ("mmq_q6k_x120_nc", "forge_mmq_q6k_x120_nc"),
+    ("mmq_q6k_x120_c", "forge_mmq_q6k_x120_c"),
+    ("mmq_q6k_x128_nc", "forge_mmq_q6k_x128_nc"),
+    ("mmq_q6k_x128_c", "forge_mmq_q6k_x128_c"),
     ("quantize_mmq_q8_1_ds4", "forge_quantize_mmq_q8_1_ds4"),
-    ("mmq_f32_to_f16", "forge_f32_to_f16"),
+    ("quantize_mmq_q8_1_d4", "forge_quantize_mmq_q8_1_d4"),
 ];
 
 const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
