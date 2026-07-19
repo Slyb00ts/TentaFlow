@@ -1564,6 +1564,90 @@ impl Kernels {
         self.gemm_q4_k_f16_at(y, w_q4k, 0, x, rows, cols, n_tokens, stream)
     }
 
+    /// int8 TENSOR-CORE MMQ prefill GEMM over Q8_0 weights.
+    /// Y[t, row] = W·x[t]; `w_byte_off` addresses the window's first block.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q8_0_i8mma_at(
+        &self,
+        y: &DevBuffer,
+        w_q8: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_q8_0_i8mma requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let (suffix, bm) = Self::gemm_i8mma_tile(n_tokens);
+        let k = self.artifacts.get(&format!("gemm_q8_0_i8mma{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w_q8, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// int8 TENSOR-CORE MMQ prefill GEMM over Q4_K weights.
+    /// Y[t, row] = W·x[t]; `w_byte_off` addresses the window's first superblock.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q4_k_i8mma_at(
+        &self,
+        y: &DevBuffer,
+        w_q4k: &DevBuffer,
+        w_byte_off: usize,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(256) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_q4_k_i8mma requires cols % 256 == 0, got {cols}"
+            )));
+        }
+        let (suffix, bm) = Self::gemm_i8mma_tile(n_tokens);
+        let k = self.artifacts.get(&format!("gemm_q4_k_i8mma{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf_at(w_q4k, w_byte_off)?
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Token-tile selection for the i8mma GEMM. Both variants use a 256-thread
+    /// block; BM=128 doubles per-thread token work (fewer blocks, higher
+    /// weight reuse) and wins once there are enough token blocks to fill the
+    /// SMs, else BM=64 keeps more blocks resident.
+    fn gemm_i8mma_tile(n_tokens: usize) -> (&'static str, u32) {
+        if n_tokens >= 256 {
+            ("", 128)
+        } else {
+            ("_bm64", 64)
+        }
+    }
+
     /// `gemm_q4_k_f16` over a row window of a fused weight matrix:
     /// `w_byte_off` addresses the first superblock of the window's first row.
     #[allow(clippy::too_many_arguments)]

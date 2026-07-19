@@ -25,6 +25,14 @@ Ostatnia aktualizacja: 2026-07-18.
   GEMV+GEMM (wszystkie quanty + dp4a int8 + mma tensor-core), paged flash
   attention (decode split-K + prefill, GQA), conv1d/gelu (Whisper), sampling GPU,
   MoE router (softmax→top-k→renorm) + scale-add akumulacja ekspertów
+  - ℹ️ **Prefill GEMM = f16 tensor-core** (dequant Q→f16 → mma). Zbadano int8-MMQ
+    dp4a (`gemm_i8_dp4a_impl`, Q8_0+Q4_K, `mul_mat_q`): poprawny (≈5e-4 vs exact
+    CPU dp4a), ale na Adzie ~1.8× WOLNIEJSZY (dp4a ≈33 vs f16 ≈60 TFLOP/s, T=512)
+    — dp4a liczy na rdzeniach CUDA, f16 offloaduje MAC na tensor-core. Prefill
+    zostaje na f16 (bez regresji); dp4a jest zarejestrowany+przetestowany, nie
+    domyślny. llama.cpp jest szybszy przez int8 **tensor-core** mma, którego
+    Mojo `inlined_assembly` nie potrafi zmarshalować (wyjście 4×s32) — szczegóły
+    w `kernels/mojo/MOJO_NOTES.md`.
 - ✅ **Silnik LLM**: forward, paged KV, fused decode chain, batched continuous
   decode (36× throughput), chunked prefill, admission control, CUDA-graph per bucket
 - ✅ **Drabinka kwantyzacji KV**: f16 → fp8 → rot4 → rot3 (TurboQuant)

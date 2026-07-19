@@ -1597,7 +1597,14 @@ impl Model {
                 n_tokens,
                 stream,
             ),
-            DevWeight::Q8_0 { buf, cols, .. } => self.kernels.gemm_q8_0_f16_at(
+            // Q8_0 / Q4_K prefill run the int8 TENSOR-CORE MMQ GEMM: activations
+            // quantized to q8_1, weights kept as native codes, s8xs8->s32 mma
+            // (m16n8k32) per 32-block, then per-block scale/min to f16. This is
+            // the only path that beats the f16 tensor-core GEMM on Ada (2x MAC
+            // throughput + zero dequant bandwidth). Decode still uses the dp4a
+            // GEMV (see gemv). Marshalling the mma's 4x s32 output uses
+            // inlined_assembly + _RegisterPackType (see kernels/mojo/MOJO_NOTES.md).
+            DevWeight::Q8_0 { buf, cols, .. } => self.kernels.gemm_q8_0_i8mma_at(
                 y,
                 buf,
                 row_off * (cols / 32) * 34,
@@ -1607,7 +1614,7 @@ impl Model {
                 n_tokens,
                 stream,
             ),
-            DevWeight::Q4K { buf, cols, .. } => self.kernels.gemm_q4_k_f16_at(
+            DevWeight::Q4K { buf, cols, .. } => self.kernels.gemm_q4_k_i8mma_at(
                 y,
                 buf,
                 row_off * (cols / 256) * 144,

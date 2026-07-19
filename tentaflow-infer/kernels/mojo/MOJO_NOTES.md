@@ -75,6 +75,60 @@ Published tutorials mostly show pre-1.0 syntax — trust these notes over old do
   (ISETP/BSSY per load) starve the tensor pipe; clamp out-of-range
   tokens/rows instead of branching and zero-fill only the W k-tail.
 
+## int8 matmul: dp4a vs tensor cores (prefill GEMM investigation)
+- **dp4a works and is used** (`llvm.nvvm.idp4a.s.s` via `llvm_intrinsic`, see
+  decode_dp4a.mojo). A tiled int8-MMQ *prefill* GEMM (`gemm_i8_dp4a_impl` in
+  gemm.mojo: q8_1-quantize the activation tile, keep weights as native codes,
+  accumulate int32 with dp4a, scale per 32-block → llama.cpp's `mul_mat_q`)
+  is implemented for Q8_0 + Q4_K and is numerically correct (matches an exact
+  CPU dp4a reference to ~5e-4; test_gemm_dp4a.mojo).
+- **BUT dp4a does NOT beat the f16 tensor-core GEMM on Ada.** Measured
+  (bench_gemm_dp4a.mojo, RTX 4090, Q4_K, T=512): f16 dequant+mma ≈ **60
+  TFLOP/s** vs dp4a ≈ **33 TFLOP/s** — dp4a is ~1.8x SLOWER. dp4a issues on the
+  CUDA/INT32 pipe; the f16 path offloads the MACs to tensor cores AND does the
+  per-element dequant on the CUDA cores in the shadow of the tensor pipe, so it
+  wins on large-batch prefill. The gap narrows at small T (T=128: 32 vs 29
+  TFLOP/s) but prefill is the large-T regime. Conclusion: the f16-dequant GEMM
+  is NOT the prefill bottleneck it was assumed to be; the dp4a MMQ path is kept
+  (correct, tested, registered) but the engine deliberately keeps prefill on the
+  f16 tensor-core GEMM (routing in forge-engine model.rs `gemm_rows`).
+- **int8 TENSOR cores ARE reachable from Mojo — CRACKED.** The blocker (the
+  mma's 4x s32 aggregate output `{i32,i32,i32,i32}`) is solved with
+  `std.sys._RegisterPackType`, the SAME multi-output marshalling the stdlib
+  `mma_nvidia.mojo` uses for f16/fp8 (`_RegisterPackType[Float32,Float32,
+  Float32,Float32]` with `constraints="=f,=f,=f,=f,..."`). The previous attempt
+  failed because it used a plain `SIMD[int32,4]`/`Tuple` result_type instead of
+  `_RegisterPackType`. Working s8 mma (src/gemm.mojo `_mma_s8`):
+  `inlined_assembly["mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {...}",
+  _RegisterPackType[Int32,Int32,Int32,Int32], constraints="=r,=r,=r,=r,r,r,r,r,
+  r,r,r,r,r,r", has_side_effect=False](a0..a3, b0..b1, c0..c3)` → read `r[0..3]`.
+  Proven bit-exact vs a CPU int8 matmul on ALL FOUR output registers (16x8 tile).
+  A fragment = 4x b32 (16 s8), B = 2x b32 (8 s8), C/D = 4x s32, standard
+  m16n8k32 layout. Fragments load via `ld_matrix` (b16 view, 32 s8/row = 16 b16;
+  the f16 kernel's ldmatrix.x4/x2 addressing works unchanged for s8).
+- **Pure s8 mma ceiling ≈ 184 TOPS** on the 4090 via this inline-asm path
+  (probe: 8 independent accumulators, back-to-back) — ~3x f16's realizable
+  GEMM throughput.
+- **int8-MMQ prefill GEMM shipped** (`gemm_i8mma_impl` in gemm.mojo,
+  `gemm_q4_k_i8mma`/`gemm_q8_0_i8mma` + bm64). Same MMQ contract as the old
+  dp4a GEMM (q8_1 activation quant, native weight codes, per-32-block scale/min)
+  but the K=32 MAC runs on the int8 tensor cores. Software-pipelined (1 barrier/
+  stage, next-stage quant/unpack overlaps compute), 2-m-tile x N-n-tile warp
+  blocking, vectorized SIMD[f32,4] scale epilogue. Correct to ~5e-4 vs an exact
+  CPU MMQ reference (test_gemm_i8mma.mojo). The old dp4a GEMM
+  (`gemm_i8_dp4a_impl`) is DELETED — i8mma replaced it (routing in forge-engine
+  model.rs `gemm_rows`). Decode still uses the dp4a GEMV (unchanged).
+- **Perf (RTX 4090, end-to-end prefill tok/s, prefix-cache off):** Mistral-7B
+  Q4_K 512: f16 1560 -> i8mma 2110 (1.35x); 4096: 2013 -> 2646 (1.31x); 8192:
+  1787 -> 2239 (1.25x). Qwen3-0.6B Q8_0 4096: 15692 -> 19027 (1.21x). Decode
+  bit-unchanged (uses dp4a GEMV). NOTE the ISOLATED micro-bench
+  (bench_gemm_i8mma.mojo) shows i8mma ~50 vs f16 ~60 TFLOP/s at the big FFN
+  shapes — misleading: both are ~30% of their mma ceilings (memory/launch
+  bound), and the real mixed-shape prefill (attention + FFN, varied batch)
+  wins because i8mma reads half the weight smem and issues half the mma. Still
+  ~4x below llama.cpp's fused MMQ (11-12.8k); the remaining gap is staging
+  (cp.async / pre-quantized global X) + kernel fusion, not the intrinsic.
+
 ## FP8 (e4m3) — verified on sm_89
 - `DType.float8_e4m3fn` works end-to-end: buffers, kernel pointers, and
   `Scalar[DType.float8_e4m3fn](f32)` casts (RN, satfinite ±448, denormals and

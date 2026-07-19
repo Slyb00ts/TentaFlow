@@ -173,3 +173,51 @@ python3 vllm_client.py TheBloke/Mistral-7B-Instruct-v0.2-AWQ 4096 2048
 - **vLLM graph-capture crash** (torch stable-ABI `aten::empty` error at CUDA-graph capture
   on this driver): worked around with `--enforce-eager` (documented caveat above).
 ```
+
+---
+
+## int8-MMQ (dp4a) prefill GEMM investigation — 2026-07-19
+
+**Premise tested:** the prefill gap (FORGE ~1.4–2k vs llama.cpp ~11–13k tok/s) was
+attributed to FORGE's prefill GEMM dequantizing Q4_K→f16 before an f16 tensor-core mma.
+An int8-MMQ path (q8_1-quantized activations · native weight codes · dp4a int32 accumulate,
+llama.cpp's `mul_mat_q`) was implemented for Q8_0 + Q4_K to remove that dequant.
+
+**Result: the premise does not hold on Ada — dp4a is SLOWER than the f16 tensor-core GEMM.**
+Isolated kernel microbench (`kernels/mojo/bench_gemm_dp4a.mojo`, RTX 4090, 300-launch warmup):
+
+```
+Q4K 14336x4096 T=128   f16 32.2 TFLOP/s   dp4a(BM128) 29.4   dp4a(BM64) 20.7
+Q4K 14336x4096 T=512   f16 59.7 TFLOP/s   dp4a(BM128) 33.7   dp4a(BM64) 24.1
+Q4K  4096x4096 T=512   f16 60.7 TFLOP/s   dp4a(BM128) 33.5   dp4a(BM64) 23.4
+Q4K  4096x14336 T=512  f16 61.7 TFLOP/s   dp4a(BM128) 34.0   dp4a(BM64) 23.7
+```
+
+The f16 path offloads the MACs to tensor cores (~60 TFLOP/s) while doing the per-element
+dequant on the CUDA cores in the tensor pipe's shadow; dp4a does BOTH the MACs and the
+per-block scaling on the CUDA/INT32 pipe and tops out ~1.8x lower at the large-batch
+(prefill) sizes. So the f16-dequant GEMM was NOT the bottleneck it was assumed to be — it
+already runs at ~60 TFLOP/s.
+
+**End-to-end confirmation** (`forge bench --prefix-cache off`, greedy output bit-identical
+either way):
+
+```
+Mistral-7B Q4_K  4096/2048 prefill:  f16 1999 tok/s   →  dp4a 1968 tok/s  (GEMM is only
+                                     ~half of a long-context prefill; attention O(T^2)
+                                     masks the GEMM change)
+qwen3-0.6B Q8_0   512/128  prefill:  f16 38533 tok/s  →  dp4a 21375 tok/s  (GEMM-bound
+                                     prefill: dp4a REGRESSES it ~1.8x, matching the microbench)
+```
+
+**Decision:** prefill stays on the f16 tensor-core GEMM (no regression). The int8-MMQ dp4a
+kernels are correct (match an exact CPU dp4a reference to ~5e-4, `test_gemm_dp4a.mojo`),
+registered and built, but are NOT wired as the default because they are slower on this GPU.
+
+**Why llama.cpp is still faster:** its fast MMQ uses int8 **tensor cores**
+(`mma.sync ...s32.s8.s8.s32`), not dp4a. That instruction DOES emit and compute correctly
+from Mojo via inline PTX, but Mojo's `inlined_assembly` cannot marshal its 4×s32 output
+(needs a `TrivialRegisterPassable` struct mapping to LLVM `{i32,i32,i32,i32}`;
+`SIMD[int32,4]` captures only the first register, `Tuple` is rejected). Closing the prefill
+gap needs either that Mojo capability or fused flash-attention prefill — not a dp4a GEMM.
+See `kernels/mojo/MOJO_NOTES.md`.

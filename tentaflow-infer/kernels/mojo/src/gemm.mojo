@@ -26,6 +26,8 @@ from std.gpu.memory import (
 )
 from std.memory import bitcast, stack_allocation
 from std.gpu.compute.mma import mma, ld_matrix
+from std.sys import _RegisterPackType
+from std.sys._assembly import inlined_assembly
 from src.gemv2 import _e2m1x8, _f8e4m3s, _q4k_scale_min, _q3k_scales8
 from src.gemv2 import _iq4xs_scale, _e8m0_half, IQ4NL_VALS, MXFP4_VALS
 from src.gemv2 import _signs8
@@ -2809,6 +2811,291 @@ def gemm_q8_0_out_f32_impl[BM: Int, NW: Int](
         s += 1
 
     _store_tile_f32(y, acc, t0, row0, warp_m, warp_n, group, tid4, n_rows, n_tokens)
+
+
+# ===== int8 TENSOR-CORE MMQ prefill GEMM =====
+# MMQ contract (q8_1-quantized activation tile, native weight codes, per-32-block
+# scale/min), with the inner K=32 MAC on the int8 tensor cores via
+# mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 (2x the f16-TC MAC throughput,
+# zero dequant bandwidth — the only path that beats the f16 GEMM on Ada; dp4a on
+# the CUDA cores was measured ~1.8x slower). The s8x s8 -> s32 tile covers one full
+# Q-block per instruction; each block's s32 accumulators are scaled to f32 and
+# summed (block scales differ, so accumulation is f32 outside the tensor op).
+# 256-thread block = 8 warps; one block owns a BM-token x 64-row output tile.
+# Warps split as M_WARPS x N_WARPS; each warp owns MT_PER_WARP token m-tiles and
+# NT_PER_WARP 8-row n-tiles. Staging = activation q8_1 quant + weight-code
+# unpack + per-block scales into shared, software-pipelined a stage ahead.
+def _mma_s8(
+    a0: UInt32,
+    a1: UInt32,
+    a2: UInt32,
+    a3: UInt32,
+    b0: UInt32,
+    b1: UInt32,
+    c: SIMD[DType.int32, 4],
+) -> SIMD[DType.int32, 4]:
+    var r = inlined_assembly[
+        (
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {$0, $1, $2,"
+            " $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13};"
+        ),
+        _RegisterPackType[Int32, Int32, Int32, Int32],
+        constraints="=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r",
+        has_side_effect=False,
+    ](a0, a1, a2, a3, b0, b1, c[0], c[1], c[2], c[3])
+    return SIMD[DType.int32, 4](r[0], r[1], r[2], r[3])
+
+
+def gemm_i8mma_impl[BM: Int, FMT: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    # 256-thread block = 8 warps. Each warp owns MT_PER_WARP=2 token m-tiles
+    # (32 tokens) and NT_PER_WARP row n-tiles, so A fragments are reused across
+    # n-tiles and B fragments across m-tiles — this halves redundant weight
+    # smem traffic vs a 1-m-tile layout (mirrors the f16 kernel's warp tiling).
+    comptime MT_PER_WARP = 2
+    comptime M_WARPS = BM // 32
+    comptime N_WARPS = 8 // M_WARPS
+    comptime NT_PER_WARP = 8 // N_WARPS
+    comptime BLK_BYTES = 34 if FMT == 0 else 144
+    comptime BPR_DIV = 32 if FMT == 0 else 256
+
+    tid = Int(thread_idx.x)
+    row0 = Int(block_idx.x) * 64
+    t0 = Int(block_idx.y) * BM
+
+    xq = stack_allocation[
+        2 * BM * 32, Int8, alignment=64, address_space = AddressSpace.SHARED
+    ]()
+    wq = stack_allocation[
+        2 * 64 * 32, Int8, alignment=64, address_space = AddressSpace.SHARED
+    ]()
+    xd = stack_allocation[2 * BM, Float32, address_space = AddressSpace.SHARED]()
+    xsm = stack_allocation[
+        2 * BM, Float32, address_space = AddressSpace.SHARED
+    ]()
+    wdsc = stack_allocation[
+        2 * 64, Float32, address_space = AddressSpace.SHARED
+    ]()
+    wdmn = stack_allocation[
+        2 * 64, Float32, address_space = AddressSpace.SHARED
+    ]()
+
+    # X staging: one token per thread (tid < BM).
+    var xtok_c = t0 + tid
+    if xtok_c > n_tokens - 1:
+        xtok_c = n_tokens - 1
+
+    # W staging: 4 threads per row, 8 codes each.
+    row_l = tid // 4
+    part = tid % 4
+    var wrow_c = row0 + row_l
+    if wrow_c > n_rows - 1:
+        wrow_c = n_rows - 1
+    blocks_per_row = n_cols // BPR_DIV
+    wrow_base = wrow_c * blocks_per_row * BLK_BYTES
+
+    n_stages = n_cols // 32
+
+    # Warp / lane identity for the mma fragments.
+    wid = tid // 32
+    lane = tid % 32
+    g = lane >> 2
+    tt = lane & 3
+    sub = lane // 8  # ldmatrix.x4 tile selector
+    lr = lane % 8  # ldmatrix row within tile
+    wid_m = wid % M_WARPS
+    wid_n = wid // M_WARPS
+    mt0 = wid_m * (MT_PER_WARP * 16)  # token base for this warp
+    nbase = wid_n * NT_PER_WARP
+
+    var acc = InlineArray[SIMD[DType.float32, 4], MT_PER_WARP * NT_PER_WARP](
+        fill=SIMD[DType.float32, 4](0.0)
+    )
+
+    # Stage-ahead prefetch registers (raw global reads).
+    var xf = SIMD[DType.float16, 32](0)
+    var wcodes = SIMD[DType.uint8, 8](0)
+    var wsc = Float16(0)
+    var whdr = SIMD[DType.uint8, 16](0)
+
+    comptime W_QOFF = 2 if FMT == 0 else 16
+
+    if tid < BM:
+        xf = (x + xtok_c * n_cols).load[width=32, alignment=64]()
+    comptime if FMT == 0:
+        wcodes = (w + wrow_base + W_QOFF + part * 8).load[width=8, alignment=2]()
+        if part == 0:
+            wsc = (w + wrow_base).bitcast[Float16]()[0]
+    else:
+        wcodes = (w + wrow_base + W_QOFF + part * 8).load[width=8, alignment=8]()
+        if part == 0:
+            whdr = (w + wrow_base).load[width=16, alignment=16]()
+
+    # Software pipeline (mirrors the f16 kernel): each iteration computes stage
+    # s from buffer s%2 while stage s+1 is quantized/unpacked into the OTHER
+    # buffer (via `sw`) and stage s+2's raw global reads prefetch into registers
+    # (via `gl`), so the activation-quant + weight-unpack work hides in the
+    # tensor pipe's shadow. One barrier per stage.
+    @parameter
+    @always_inline
+    def sw(sidx: Int, buf: Int):
+        if tid < BM:
+            xv = xf.cast[DType.float32]()
+            amax = abs(xv).reduce_max()
+            if amax == 0.0:
+                (xq + buf * BM * 32 + tid * 32).store[alignment=32](
+                    SIMD[DType.int8, 32](0)
+                )
+                xd[buf * BM + tid] = 0.0
+                xsm[buf * BM + tid] = 0.0
+            else:
+                d = amax * (1.0 / 127.0)
+                q = round(xv * (127.0 / amax)).cast[DType.int8]()
+                (xq + buf * BM * 32 + tid * 32).store[alignment=32](q)
+                xd[buf * BM + tid] = d
+                var sumq: Int32 = 0
+                comptime for e in range(32):
+                    sumq += Int32(q[e])
+                xsm[buf * BM + tid] = d * Float32(sumq)
+
+        var codes8: SIMD[DType.int8, 8]
+        comptime if FMT == 0:
+            codes8 = wcodes.cast[DType.int8]()
+            if part == 0:
+                wdsc[buf * 64 + row_l] = Float32(wsc)
+        else:
+            half = (sidx % 8) % 2
+            codes8 = ((wcodes >> UInt8(4 * half)) & 0x0F).cast[DType.int8]()
+            if part == 0:
+                dm = bitcast[DType.float16, 8](whdr)
+                sc, mn = _q4k_scale_min(whdr, sidx % 8)
+                wdsc[buf * 64 + row_l] = Float32(dm[0]) * sc
+                wdmn[buf * 64 + row_l] = Float32(dm[1]) * mn
+        (wq + buf * 64 * 32 + row_l * 32 + part * 8).store[alignment=8](codes8)
+
+    @parameter
+    @always_inline
+    def gl(sidx: Int):
+        if tid < BM:
+            xf = (x + xtok_c * n_cols + sidx * 32).load[
+                width=32, alignment=64
+            ]()
+        comptime if FMT == 0:
+            wcodes = (w + wrow_base + sidx * 34 + 2 + part * 8).load[
+                width=8, alignment=2
+            ]()
+            if part == 0:
+                wsc = (w + wrow_base + sidx * 34).bitcast[Float16]()[0]
+        else:
+            nsb = sidx // 8
+            nsub = sidx % 8
+            nchunk = nsub // 2
+            wcodes = (
+                w + wrow_base + nsb * 144 + 16 + nchunk * 32 + part * 8
+            ).load[width=8, alignment=8]()
+            if part == 0:
+                whdr = (w + wrow_base + nsb * 144).load[
+                    width=16, alignment=16
+                ]()
+
+    # Prologue: stage 0 -> buf 0, prefetch stage 1's global reads.
+    sw(0, 0)
+    if n_stages > 1:
+        gl(1)
+    barrier()
+
+    var s = 0
+    while s < n_stages:
+        buf = s % 2
+
+        # Stage s+1 into the other buffer (overlaps this stage's compute), then
+        # prefetch stage s+2's global reads into registers.
+        if s + 1 < n_stages:
+            sw(s + 1, (s + 1) % 2)
+        if s + 2 < n_stages:
+            gl(s + 2)
+
+        # int8 tensor-core MAC over this 32-column block. Fragments load via
+        # ld_matrix (b16 view: 32 int8/row = 16 b16), one warp-wide instruction
+        # each instead of per-thread scalar loads — the f16 kernel's lever.
+        # MT_PER_WARP A fragments are reused across all NT_PER_WARP n-tiles.
+        Af = (xq + buf * BM * 32 + mt0 * 32).bitcast[Float16]()
+        var ai = InlineArray[SIMD[DType.uint32, 4], MT_PER_WARP](
+            fill=SIMD[DType.uint32, 4](0)
+        )
+        # Per-block activation scales per m-tile (broadcast a,a,b,b over the
+        # fragment's 4 outputs). The scale epilogue is vectorized to SIMD[f32,4].
+        var dxv = InlineArray[SIMD[DType.float32, 4], MT_PER_WARP](
+            fill=SIMD[DType.float32, 4](0)
+        )
+        var xsv = InlineArray[SIMD[DType.float32, 4], MT_PER_WARP](
+            fill=SIMD[DType.float32, 4](0)
+        )
+        comptime for mi in range(MT_PER_WARP):
+            a_base = Af + (mi * 16 + (sub % 2) * 8 + lr) * 16 + (sub // 2) * 8
+            ai[mi] = bitcast[DType.uint32, 4](ld_matrix[8](a_base))
+            dx_a = xd[buf * BM + mt0 + mi * 16 + g]
+            dx_b = xd[buf * BM + mt0 + mi * 16 + g + 8]
+            dxv[mi] = SIMD[DType.float32, 4](dx_a, dx_a, dx_b, dx_b)
+            comptime if FMT == 1:
+                xs_a = xsm[buf * BM + mt0 + mi * 16 + g]
+                xs_b = xsm[buf * BM + mt0 + mi * 16 + g + 8]
+                xsv[mi] = SIMD[DType.float32, 4](xs_a, xs_a, xs_b, xs_b)
+
+        comptime for nti in range(NT_PER_WARP):
+            nb = (nbase + nti) * 8
+            Bf = (wq + buf * 64 * 32 + nb * 32).bitcast[Float16]()
+            b_base = Bf + lr * 16 + (sub % 2) * 8
+            bi = bitcast[DType.uint32, 2](ld_matrix[4](b_base))
+            dw2 = (wdsc + buf * 64 + nb + 2 * tt).load[width=2]()
+            dwv = SIMD[DType.float32, 4](dw2[0], dw2[1], dw2[0], dw2[1])
+            var mnv = SIMD[DType.float32, 4](0)
+            comptime if FMT == 1:
+                mn2 = (wdmn + buf * 64 + nb + 2 * tt).load[width=2]()
+                mnv = SIMD[DType.float32, 4](mn2[0], mn2[1], mn2[0], mn2[1])
+            comptime for mi in range(MT_PER_WARP):
+                mres = _mma_s8(
+                    ai[mi][0], ai[mi][1], ai[mi][2], ai[mi][3],
+                    bi[0], bi[1], SIMD[DType.int32, 4](0),
+                )
+                acc[mi * NT_PER_WARP + nti] += (
+                    dxv[mi] * dwv * mres.cast[DType.float32]()
+                )
+                comptime if FMT == 1:
+                    acc[mi * NT_PER_WARP + nti] -= mnv * xsv[mi]
+        barrier()
+        s += 1
+
+    comptime for mi in range(MT_PER_WARP):
+        tok_a = t0 + mt0 + mi * 16 + g
+        tok_b = t0 + mt0 + mi * 16 + g + 8
+        comptime for nti in range(NT_PER_WARP):
+            nb = (nbase + nti) * 8
+            r_a = row0 + nb + 2 * tt
+            r_b = row0 + nb + 2 * tt + 1
+            d4 = acc[mi * NT_PER_WARP + nti]
+            if tok_a < n_tokens:
+                if r_a < n_rows:
+                    y[tok_a * n_rows + r_a] = Float16(d4[0])
+                if r_b < n_rows:
+                    y[tok_a * n_rows + r_b] = Float16(d4[1])
+            if tok_b < n_tokens:
+                if r_a < n_rows:
+                    y[tok_b * n_rows + r_a] = Float16(d4[2])
+                if r_b < n_rows:
+                    y[tok_b * n_rows + r_b] = Float16(d4[3])
+
+
+comptime gemm_q8_0_i8mma = gemm_i8mma_impl[128, 0]
+comptime gemm_q8_0_i8mma_bm64 = gemm_i8mma_impl[64, 0]
+comptime gemm_q4_k_i8mma = gemm_i8mma_impl[128, 1]
+comptime gemm_q4_k_i8mma_bm64 = gemm_i8mma_impl[64, 1]
 
 
 comptime gemm_f16_out_f32 = gemm_f16_out_f32_impl[128, 8]
