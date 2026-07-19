@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use forge_formats::nvfp4::{self, NvFp4Scheme, NvFp4TensorNames};
 use forge_formats::safetensors::ShardedSafeTensors;
-use forge_formats::w4a8::{w4a8_pack, W4A8_GROUP};
+use forge_formats::w4a8::{col_absmax, smoothing_scale, w4a8_pack_smoothed, W4A8_GROUP};
 use forge_formats::{dequantize_to_f32, Gguf, HfConfig, LayerKind, ModelDescriptor, WeightRole};
 use forge_hal::{DevBuffer, Device, Pool};
 use forge_types::{DType, ForgeError, MemKind, QuantKind, Result};
@@ -218,6 +218,10 @@ pub struct W4A8Weight {
     pub s2_scales: DevBuffer,
     pub s2_zeros: DevBuffer,
     pub s1_scales: DevBuffer,
+    /// Per-input-channel SmoothQuant reciprocal `1/s` (f16 [cols]); the GEMM's
+    /// activation quantizer multiplies each input channel by this before the
+    /// int8 quant. All-ones when calibration hasn't run (identity).
+    pub inv_smooth: DevBuffer,
     pub rows: usize,
     pub cols: usize,
 }
@@ -240,6 +244,23 @@ pub struct W4A8Layer {
 /// any other value keep the committed CUDA MMQ Q4_K path.
 pub fn w4a8_enabled() -> bool {
     std::env::var("FORGE_GEMM").ok().as_deref() == Some("w4a8")
+}
+
+/// Per-input-channel activation abs-max collected during the W4A8 calibration
+/// pass (one vector per transformer layer, one set per linear-input point).
+/// This is the SmoothQuant migration signal — statistics only, no original
+/// fp16 weights required.
+pub struct CalibStats {
+    /// q/k/v input = attn-norm output [hidden].
+    pub attn_in: Vec<Vec<f32>>,
+    /// o_proj input = attention output [n_heads*head_dim].
+    pub attn_out: Vec<Vec<f32>>,
+    /// gate/up input = ffn-norm output [hidden].
+    pub ffn_in: Vec<Vec<f32>>,
+    /// down_proj input = SwiGLU output [intermediate].
+    pub down_in: Vec<Vec<f32>>,
+    /// SmoothQuant balance exponent (0.5 default).
+    pub alpha: f32,
 }
 
 /// Q/K/V projections: one row-concatenated matrix when the three share a
@@ -1038,15 +1059,10 @@ fn upload_weight(device: &dyn Device, w: HostWeight) -> Result<DevWeight> {
     }
 }
 
-/// Requant a projection tensor to a QServe W4A8 pack and upload it. Re-fetches
-/// the raw tensor and dequantizes to f32 (so Q4_K storage costs ~10% extra
-/// relL2, folded on top of the original quant — the honest W4A8 quality cost),
-/// then `w4a8_pack` produces the interleaved buffers `dense_kernel0` reads.
-fn pack_w4a8_weight(
-    device: &dyn Device,
-    src: &dyn TensorSource,
-    name: &str,
-) -> Result<W4A8Weight> {
+/// Dequantize a 2-D projection tensor to fp32 row-major `[rows, cols]`,
+/// validating the W4A8 shape constraints. Format-agnostic: reads whatever the
+/// resident checkpoint stores (Q4_K/Q6_K/…/fp16) — no original fp16 needed.
+fn dequant_matrix_f32(src: &dyn TensorSource, name: &str) -> Result<(Vec<f32>, usize, usize)> {
     let (data, dtype, quant, dims) = src.fetch(name)?;
     if dims.len() != 2 {
         return Err(ForgeError::Format(format!(
@@ -1060,17 +1076,35 @@ fn pack_w4a8_weight(
         )));
     }
     let f32s = dequantize_to_f32(dtype, quant, &data, rows * cols)?;
-    let packed = w4a8_pack(&f32s, rows, cols, W4A8_GROUP);
+    Ok((f32s, rows, cols))
+}
+
+/// Pack an already-dequantized fp32 projection to a SmoothQuant-migrated QServe
+/// W4A8 pack and upload it (weights ×`smooth` per column; the GEMM applies
+/// `1/smooth` to activations). `smooth` has `cols` entries.
+fn pack_w4a8_from_f32(
+    device: &dyn Device,
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    smooth: &[f32],
+) -> Result<W4A8Weight> {
+    let packed = w4a8_pack_smoothed(w, rows, cols, W4A8_GROUP, smooth);
     let s1_bytes: Vec<u8> = packed
         .s1_scales
         .iter()
         .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let inv_bytes: Vec<u8> = smooth
+        .iter()
+        .flat_map(|&s| f16::from_f32(1.0 / s).to_le_bytes())
         .collect();
     Ok(W4A8Weight {
         qweight: upload(device, &packed.qweight)?,
         s2_scales: upload(device, &packed.s2_scales)?,
         s2_zeros: upload(device, &packed.s2_zeros)?,
         s1_scales: upload(device, &s1_bytes)?,
+        inv_smooth: upload(device, &inv_bytes)?,
         rows,
         cols,
     })
@@ -1350,14 +1384,15 @@ impl ModelWeights {
         // W4A8 requant is dense-only (per-logical-projection packs; the routed
         // MoE / hybrid stacks have no dense prefill projection set). Fail loudly
         // rather than silently falling back to Q4_K when the flag can't apply.
+        // W4A8 packs are built AFTER load by `Model::calibrate_w4a8` (it needs a
+        // running model to collect SmoothQuant activation statistics), so load
+        // only validates applicability here and leaves `w4a8 = None`.
         let want_w4a8 = w4a8_enabled();
         if want_w4a8 && p.moe.is_some() {
             return Err(ForgeError::Unsupported(
                 "FORGE_GEMM=w4a8 supports dense (non-MoE) models only".into(),
             ));
         }
-        let mut w4a8_layers: Option<Vec<W4A8Layer>> =
-            want_w4a8.then(|| Vec::with_capacity(descriptor.params.block_count));
 
         let mut layers = Vec::with_capacity(descriptor.params.block_count);
         let mut fused_qkv_layers = 0usize;
@@ -1520,18 +1555,6 @@ impl ModelWeights {
                 }
             };
 
-            if let Some(w4a8) = w4a8_layers.as_mut() {
-                w4a8.push(W4A8Layer {
-                    q: pack_w4a8_weight(device, src, name(WeightRole::AttnQ)?)?,
-                    k: pack_w4a8_weight(device, src, name(WeightRole::AttnK)?)?,
-                    v: pack_w4a8_weight(device, src, name(WeightRole::AttnV)?)?,
-                    attn_o: pack_w4a8_weight(device, src, name(WeightRole::AttnO)?)?,
-                    gate: pack_w4a8_weight(device, src, name(WeightRole::FfnGate)?)?,
-                    up: pack_w4a8_weight(device, src, name(WeightRole::FfnUp)?)?,
-                    down: pack_w4a8_weight(device, src, name(WeightRole::FfnDown)?)?,
-                });
-            }
-
             layers.push(LayerWeights {
                 attn_norm: upload_norm(device, src, name(WeightRole::AttnNorm)?)?,
                 ffn_norm: upload_norm(device, src, name(WeightRole::FfnNorm)?)?,
@@ -1561,7 +1584,7 @@ impl ModelWeights {
             fused_qkv_layers,
             fused_qk_layers,
             fused_gate_up_layers,
-            w4a8: w4a8_layers,
+            w4a8: None,
         })
     }
 
@@ -1712,6 +1735,81 @@ impl ModelWeights {
             fused_gate_up_layers: 0,
             w4a8: None,
         })
+    }
+
+    /// Rebuild every layer's W4A8 pack from the resident GGUF weights with
+    /// SmoothQuant migration derived from a calibration pass. Format-agnostic in
+    /// spirit — it operates on dequantized fp32 weights, so it works for any
+    /// resident quant — with the GGUF re-open plumbing wired here (the dense
+    /// W4A8 gate model is a Q4_K GGUF); other sources keep the identity path.
+    ///
+    /// q/k/v share their input (attn-norm output) so they share ONE migration
+    /// vector (weight abs-max taken over all three); likewise gate/up share the
+    /// ffn-norm output. o_proj and down_proj each smooth their own input.
+    pub fn rebuild_w4a8_smoothed(
+        &self,
+        device: &dyn Device,
+        path: &Path,
+        stats: &CalibStats,
+    ) -> Result<Vec<W4A8Layer>> {
+        let gguf = Gguf::open(path)?;
+        let src = GgufSource(&gguf);
+        let alpha = stats.alpha;
+        let mut out = Vec::with_capacity(self.descriptor.layers.len());
+        for (idx, layer_map) in self.descriptor.layers.iter().enumerate() {
+            let name = |role: WeightRole| -> Result<&String> {
+                layer_map
+                    .get(&role)
+                    .ok_or_else(|| ForgeError::Format(format!("layer {idx}: missing {role:?}")))
+            };
+            let combine = |a: &mut Vec<f32>, b: Vec<f32>| {
+                for (x, y) in a.iter_mut().zip(b) {
+                    *x = x.max(y);
+                }
+            };
+
+            // Q/K/V — one shared migration over the attn-norm output.
+            let (q, qr, qc) = dequant_matrix_f32(&src, name(WeightRole::AttnQ)?)?;
+            let (k, kr, kc) = dequant_matrix_f32(&src, name(WeightRole::AttnK)?)?;
+            let (v, vr, vc) = dequant_matrix_f32(&src, name(WeightRole::AttnV)?)?;
+            let mut wmax_qkv = col_absmax(&q, qr, qc);
+            combine(&mut wmax_qkv, col_absmax(&k, kr, kc));
+            combine(&mut wmax_qkv, col_absmax(&v, vr, vc));
+            let s_qkv = smoothing_scale(&stats.attn_in[idx], &wmax_qkv, alpha);
+            let q = pack_w4a8_from_f32(device, &q, qr, qc, &s_qkv)?;
+            let k = pack_w4a8_from_f32(device, &k, kr, kc, &s_qkv)?;
+            let v = pack_w4a8_from_f32(device, &v, vr, vc, &s_qkv)?;
+
+            // o_proj — smooths the attention output.
+            let (o, or, oc) = dequant_matrix_f32(&src, name(WeightRole::AttnO)?)?;
+            let s_o = smoothing_scale(&stats.attn_out[idx], &col_absmax(&o, or, oc), alpha);
+            let attn_o = pack_w4a8_from_f32(device, &o, or, oc, &s_o)?;
+
+            // gate/up — one shared migration over the ffn-norm output.
+            let (g, gr, gc) = dequant_matrix_f32(&src, name(WeightRole::FfnGate)?)?;
+            let (u, ur, uc) = dequant_matrix_f32(&src, name(WeightRole::FfnUp)?)?;
+            let mut wmax_gu = col_absmax(&g, gr, gc);
+            combine(&mut wmax_gu, col_absmax(&u, ur, uc));
+            let s_gu = smoothing_scale(&stats.ffn_in[idx], &wmax_gu, alpha);
+            let gate = pack_w4a8_from_f32(device, &g, gr, gc, &s_gu)?;
+            let up = pack_w4a8_from_f32(device, &u, ur, uc, &s_gu)?;
+
+            // down_proj — smooths the SwiGLU output.
+            let (d, dr, dc) = dequant_matrix_f32(&src, name(WeightRole::FfnDown)?)?;
+            let s_down = smoothing_scale(&stats.down_in[idx], &col_absmax(&d, dr, dc), alpha);
+            let down = pack_w4a8_from_f32(device, &d, dr, dc, &s_down)?;
+
+            out.push(W4A8Layer {
+                q,
+                k,
+                v,
+                attn_o,
+                gate,
+                up,
+                down,
+            });
+        }
+        Ok(out)
     }
 
     /// Whether this model uses routed Mixture-of-Experts FFN blocks.

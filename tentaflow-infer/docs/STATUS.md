@@ -147,8 +147,27 @@ Ostatnia aktualizacja: 2026-07-19.
     attention **3.9× szybszy** (8192 prefill: 1322→340 ms). Prefill (stack
     koherentny CUDA-MMQ GEMM + FA): 4096 **3749→4556 (1.22×)**, 8192
     **2953→4638 (1.57×)**; dekod nietknięty (osobny kernel). Luka do llama.cpp
-    (pp4096 11927) 3.18×→**2.62×**. Z W4A8 (niekoherentny) FA składa się do
-    pp4096 **8072**, pp8192 **8765** tok/s. `docs/BENCH_COMPARISON.md`.
+    (pp4096 11927) 3.18×→**2.62×**. Z W4A8 (teraz KOHERENTNY, patrz niżej) FA
+    składa się do pp4096 **8725**, pp8192 **8849** tok/s. `docs/BENCH_COMPARISON.md`.
+  - ✅ **W4A8 prefill GEMM teraz KOHERENTNY (`FORGE_GEMM=w4a8`), wciąż non-default
+    (2026-07-19).** Prawdziwą przyczyną wcześniejszego „gibberish" był BŁĄD
+    rekwantyzacji, NIE outliery aktywacji: zero-point QoQ `w ≈ s1·int8(s2·(q4−zero))`
+    jest pełną liczbą całkowitą (bajt `(−zero)·s2` w int8), a packer host clampował
+    go do nibble `[0,15]` — poprawne tylko dla grup przecinających 0. Grupy
+    nieprzecinające zera (duża część wag) zapadały się → **0.32 relL2, PPL ~311**.
+    Poprawka (signed zero-point + per-row clip search na `s1`) daje **~0.02 relL2**
+    na gładkich wagach; golden `cuda_w4a8` (2e-4) nadal pasuje, test regresji
+    `requant_quality_and_group_monotonicity` (finer group nie może być gorszy).
+    Jakość (held-out PPL, `forge ppl`, Mistral-7B Q4_K_M): Q4_K **30.31** vs W4A8
+    **37.98 (+25 %)** — koherentny (Paris, wzór wody, kod Python), ale nie na parze.
+    SmoothQuant zaimplementowany (kalibracja + migracja per-linear złożona w wagę,
+    odwrotność w kwantyzatorze aktywacji `inv_smooth`), ale ZMIERZONY jako
+    REGRESUJĄCY tę ścieżkę (α=0.5→49.9, α=0.8→42.8): rekwant Q4_K→W4A8 jest
+    **weight-bound**, migracja tylko powiększa zakres per-row dla obowiązkowego
+    stage-1 int8. Domyślnie identity (bez smoothingu); opt-in `FORGE_W4A8_ALPHA`.
+    Perf (oba +FA, tylko GEMM się różni): pp4096 8043→**8725 (+8 %)**, pp8192
+    8194→**8849 (+8 %)**, pp512 regres (CTA underfill); dekod bit-bez-zmian; NIE
+    bije llama.cpp (0.73×). Werdykt: koherentny, ale +25 % PPL → NON-DEFAULT.
   - ℹ️ **Profil prefill (2026-07-19, nsys RTX 4090): compute-bound, brak narzutu
     launchy.** Suma czasu GPU kerneli = 1433.5 ms vs wall 1436 ms przy P=4096
     (luka 0.17 %; 0.8 % przy P=512) → **CUDA-graphing prefillu nic nie daje**

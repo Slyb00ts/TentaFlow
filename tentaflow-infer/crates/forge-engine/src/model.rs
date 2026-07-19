@@ -20,13 +20,49 @@ use crate::kv::{KvCache, KvConfig, KvQuant, SeqKv};
 use crate::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use crate::tier::{KvTierConfig, TierManager, STAGE_SLOTS};
 use crate::weights::{
-    AttnWeights, DeltaNetWeights, DevWeight, GateUpWeights, LayerFfn, LayerMixer, MoeFfn,
-    ModelWeights, QkvWeights, W4A8Weight,
+    AttnWeights, CalibStats, DeltaNetWeights, DevWeight, GateUpWeights, LayerFfn, LayerMixer,
+    MoeFfn, ModelWeights, QkvWeights, W4A8Weight,
 };
 
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
 /// prompts. Bounds the persistent prefill scratch allocation.
 pub const MAX_PREFILL_CHUNK: usize = 1024;
+
+/// Fixed built-in calibration passage for W4A8 SmoothQuant. A few hundred
+/// tokens of representative English prose plus a code snippet — enough to
+/// exercise every linear's input-channel dynamic range so the migration scales
+/// reflect real activation outliers. Embedded in-tree so calibration needs no
+/// download and no original fp16 weights (SmoothQuant needs statistics only).
+pub const W4A8_CALIB_TEXT: &str = "\
+The quick brown fox jumps over the lazy dog. In the beginning the universe was \
+created; this has made a lot of people very angry and been widely regarded as a \
+bad move. Language models predict the next token given the preceding context, \
+learning statistical regularities from vast corpora of natural text. Attention \
+mechanisms let each position attend to every other position, weighting their \
+contributions by learned compatibility scores. Quantization reduces the \
+precision of weights and activations to shrink memory bandwidth and accelerate \
+matrix multiplication on tensor cores, trading a small amount of accuracy for a \
+large gain in throughput. The Eiffel Tower is located in Paris, the capital of \
+France, and was completed in 1889 for the World's Fair. Water boils at one \
+hundred degrees Celsius at sea level, and freezes at zero. Photosynthesis \
+converts carbon dioxide and water into glucose and oxygen using energy from \
+sunlight captured by chlorophyll in the chloroplasts of plant cells.\n\n\
+fn fibonacci(n: u64) -> u64 {\n    let (mut a, mut b) = (0u64, 1u64);\n    \
+for _ in 0..n {\n        let next = a + b;\n        a = b;\n        b = next;\n    \
+}\n    a\n}\n\n\
+def quicksort(xs):\n    if len(xs) <= 1:\n        return xs\n    pivot = xs[len(xs) // 2]\n    \
+left = [x for x in xs if x < pivot]\n    mid = [x for x in xs if x == pivot]\n    \
+right = [x for x in xs if x > pivot]\n    return quicksort(left) + mid + quicksort(right)\n\n\
+SELECT id, name, SUM(amount) AS total FROM orders WHERE status = 'paid' GROUP BY id, name \
+HAVING total > 1000 ORDER BY total DESC LIMIT 20;\n\n\
+The mitochondria is the powerhouse of the cell. Supply and demand determine \
+prices in a competitive market: when demand rises and supply stays fixed, the \
+equilibrium price increases. Newton's second law states that force equals mass \
+times acceleration. The derivative of sine is cosine, and the integral of one \
+over x is the natural logarithm of x. Machine translation, summarization, and \
+question answering are classic natural-language processing tasks that modern \
+transformer architectures address with a single unified sequence-to-sequence \
+formulation trained end to end on large and diverse multilingual datasets.";
 
 /// Largest speculative draft (tokens) a single verification forward accepts
 /// (SPEC §6). One verify runs `fed + draft` = up to `MAX_SPEC_DRAFT + 1` query
@@ -212,6 +248,52 @@ pub struct Model {
     /// sequences borrow shared prefix pages before prefill and donate their own
     /// prefilled pages on completion.
     prefix_cache: Option<crate::prefix::PrefixCache>,
+    /// Active W4A8 SmoothQuant calibration accumulator: when `Some`, the dense
+    /// prefill path records per-input-channel activation abs-max at the four
+    /// linear-input points. Set only during `calibrate_w4a8`, `None` otherwise.
+    calib: Option<CalibAccum>,
+}
+
+/// Running per-input-channel activation abs-max for the W4A8 SmoothQuant
+/// calibration pass. One vector per layer per linear-input point; reduced from
+/// the f16 activation buffers read back after each relevant kernel.
+struct CalibAccum {
+    attn_in: Vec<Vec<f32>>,
+    attn_out: Vec<Vec<f32>>,
+    ffn_in: Vec<Vec<f32>>,
+    down_in: Vec<Vec<f32>>,
+    /// Host staging for the largest captured buffer (grown as needed).
+    scratch: Vec<u8>,
+}
+
+impl CalibAccum {
+    fn new(n_layers: usize, hidden: usize, q_dim: usize, inter: usize) -> Self {
+        Self {
+            attn_in: vec![vec![0.0f32; hidden]; n_layers],
+            attn_out: vec![vec![0.0f32; q_dim]; n_layers],
+            ffn_in: vec![vec![0.0f32; hidden]; n_layers],
+            down_in: vec![vec![0.0f32; inter]; n_layers],
+            scratch: Vec::new(),
+        }
+    }
+
+    /// Fold `t` rows of an f16 activation buffer into a per-channel abs-max acc.
+    fn absorb(device: &dyn Device, buf: &DevBuffer, acc: &mut [f32], t: usize, scratch: &mut Vec<u8>) -> Result<()> {
+        let dim = acc.len();
+        let bytes = t * dim * 2;
+        if scratch.len() < bytes {
+            scratch.resize(bytes, 0);
+        }
+        device.read(buf, 0, &mut scratch[..bytes])?;
+        let rows: &[f16] = bytemuck::cast_slice(&scratch[..bytes]);
+        for row in 0..t {
+            let r = &rows[row * dim..row * dim + dim];
+            for (a, h) in acc.iter_mut().zip(r) {
+                *a = a.max(h.to_f32().abs());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One DeltaNet layer's resident recurrent state for the active sequence.
@@ -717,6 +799,7 @@ impl Model {
             hybrid_bufs: None,
             hybrid_debug: std::env::var("FORGE_HYBRID_DEBUG").is_ok_and(|v| v == "1"),
             prefix_cache,
+            calib: None,
         })
     }
 
@@ -1587,6 +1670,7 @@ impl Model {
             &w.s2_zeros,
             &w.s2_scales,
             &w.s1_scales,
+            &w.inv_smooth,
             x,
             w.rows,
             w.cols,
@@ -2033,6 +2117,10 @@ impl Model {
                 .expect("spilled pages imply tiering")
                 .prepare_streaming(seq)?;
         }
+        // W4A8 SmoothQuant calibration: pull the accumulator out of `self` so
+        // the per-layer captures can borrow it mutably alongside the immutable
+        // `pb`/`device` borrows. Restored before return; `None` in normal runs.
+        let mut calib = self.calib.take();
         let pb = self.prefill_bufs.as_ref().expect("allocated above");
         let ids: Vec<i32> = tokens.iter().map(|&id| id as i32).collect();
         self.device.write(bytemuck::cast_slice(&ids), &pb.ids, 0)?;
@@ -2064,6 +2152,12 @@ impl Model {
             // pack, so q/k/v are three standalone GEMMs. The Q4_K weights stay
             // loaded for decode + the logit head.
             let w4a8_layer = self.weights.w4a8.as_ref().map(|v| &v[l]);
+
+            // Calibration capture 1/4: q/k/v input (attn-norm output).
+            if let Some(cal) = calib.as_mut() {
+                self.device.synchronize()?;
+                CalibAccum::absorb(self.device.as_ref(), &pb.x, &mut cal.attn_in[l], t, &mut cal.scratch)?;
+            }
 
             // Prefill outputs must stay [T, dim] contiguous per projection
             // (attention/rope/append index (t*heads+h)*head_dim), so a fused
@@ -2258,6 +2352,11 @@ impl Model {
                 trace.mark(self.device.as_ref(), "attn");
             }
 
+            // Calibration capture 2/4: o_proj input (attention output).
+            if let Some(cal) = calib.as_mut() {
+                self.device.synchronize()?;
+                CalibAccum::absorb(self.device.as_ref(), &pb.attn_out, &mut cal.attn_out[l], t, &mut cal.scratch)?;
+            }
             if let Some(wl) = w4a8_layer {
                 self.gemm_w4a8(&pb.o_out, &wl.attn_o, &pb.attn_out, t, stream)?;
             } else {
@@ -2266,6 +2365,12 @@ impl Model {
             trace.mark(self.device.as_ref(), "gemm_o");
             kernels.rmsnorm_residual_f16(&pb.x, &pb.h, &pb.o_out, &layer.ffn_norm, t, hidden, eps, stream)?;
             trace.mark(self.device.as_ref(), "norm_res");
+
+            // Calibration capture 3/4: gate/up input (ffn-norm output).
+            if let Some(cal) = calib.as_mut() {
+                self.device.synchronize()?;
+                CalibAccum::absorb(self.device.as_ref(), &pb.x, &mut cal.ffn_in[l], t, &mut cal.scratch)?;
+            }
 
             match &layer.ffn {
                 LayerFfn::Dense(dffn) => {
@@ -2287,6 +2392,11 @@ impl Model {
                     trace.mark(self.device.as_ref(), "gemm_gateup");
                     kernels.silu_mul_f16(&pb.act, &pb.gate, &pb.up, t * inter, stream)?;
                     trace.mark(self.device.as_ref(), "silu");
+                    // Calibration capture 4/4: down_proj input (SwiGLU output).
+                    if let Some(cal) = calib.as_mut() {
+                        self.device.synchronize()?;
+                        CalibAccum::absorb(self.device.as_ref(), &pb.act, &mut cal.down_in[l], t, &mut cal.scratch)?;
+                    }
                     if let Some(wl) = w4a8_layer {
                         self.gemm_w4a8(&pb.down, &wl.down, &pb.act, t, stream)?;
                     } else {
@@ -2318,7 +2428,160 @@ impl Model {
             tier.note_prefill(t, t0.elapsed().as_secs_f64());
         }
         trace.report(t);
+        self.calib = calib;
         Ok(t)
+    }
+
+    /// Build the W4A8 SmoothQuant packs from a one-time calibration pass over
+    /// `calib_tokens` (a fixed built-in passage tokenized by the caller). Runs
+    /// the coherent Q4_K prefill path collecting per-input-channel activation
+    /// abs-max at the four linear inputs, then repacks every dense projection
+    /// from the resident GGUF weights with per-channel migration folded into the
+    /// weight (and the reciprocal into the GEMM's activation quantizer). Must be
+    /// called once after load when `FORGE_GEMM=w4a8`; before it runs `w4a8` is
+    /// `None` and prefill stays on the Q4_K path.
+    pub fn calibrate_w4a8(&mut self, path: &Path, calib_tokens: &[u32]) -> Result<()> {
+        if self.is_hybrid() || self.weights.is_moe() {
+            return Err(ForgeError::Unsupported(
+                "W4A8 calibration supports dense (non-MoE, non-hybrid) models only".into(),
+            ));
+        }
+        if calib_tokens.is_empty() {
+            return Err(ForgeError::Scheduler("empty W4A8 calibration input".into()));
+        }
+        let p = &self.weights.descriptor.params;
+        let n_layers = self.weights.layers.len();
+        let (hidden, q_dim, inter) = (
+            p.hidden_size,
+            p.n_heads * p.head_dim,
+            p.intermediate_size,
+        );
+        // Default is the identity requant (no SmoothQuant): measured best on the
+        // Q4_K→W4A8 path, where the two-level requant error dominates and
+        // migrating activation outliers only inflates the weights (see
+        // docs/BENCH_COMPARISON.md). `FORGE_W4A8_ALPHA=<0..1>` opts into
+        // SmoothQuant and triggers the calibration forward.
+        let alpha = std::env::var("FORGE_W4A8_ALPHA")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(-1.0);
+
+        // Ensure the Q4_K path runs during calibration (packs not built yet).
+        self.weights.w4a8 = None;
+        let stats = if alpha >= 0.0 {
+            self.calib = Some(CalibAccum::new(n_layers, hidden, q_dim, inter));
+            let mut seq = self.new_seq();
+            let mut res = Ok(());
+            for chunk in calib_tokens.chunks(MAX_PREFILL_CHUNK) {
+                if let Err(e) = self.prefill_forward(&mut seq, chunk) {
+                    res = Err(e);
+                    break;
+                }
+            }
+            self.release_seq(&mut seq);
+            res?;
+            let acc = self.calib.take().expect("calib accumulator set above");
+            CalibStats {
+                attn_in: acc.attn_in,
+                attn_out: acc.attn_out,
+                ffn_in: acc.ffn_in,
+                down_in: acc.down_in,
+                alpha,
+            }
+        } else {
+            // Identity: smoothing_scale ignores the (unused) stats and returns 1.
+            CalibStats {
+                attn_in: vec![vec![0.0; hidden]; n_layers],
+                attn_out: vec![vec![0.0; q_dim]; n_layers],
+                ffn_in: vec![vec![0.0; hidden]; n_layers],
+                down_in: vec![vec![0.0; inter]; n_layers],
+                alpha,
+            }
+        };
+        let layers = self
+            .weights
+            .rebuild_w4a8_smoothed(self.device.as_ref(), path, &stats)?;
+        self.weights.w4a8 = Some(layers);
+        Ok(())
+    }
+
+    /// Mean next-token negative log-likelihood over `tokens` (natural log),
+    /// i.e. `ln(perplexity)`. Runs the forward pass through whatever prefill
+    /// GEMM is active (W4A8 when calibrated, else Q4_K), then maps every
+    /// position's final-norm hidden state through the lm_head and scores the
+    /// actual next token with a numerically stable log-softmax. Used by the
+    /// W4A8 quality gate to compare requant paths on a fixed held-out passage.
+    pub fn perplexity(&mut self, tokens: &[u32]) -> Result<(f64, usize)> {
+        if self.is_hybrid() {
+            return Err(ForgeError::Unsupported(
+                "perplexity harness supports dense models only".into(),
+            ));
+        }
+        if tokens.len() < 2 {
+            return Err(ForgeError::Scheduler("perplexity needs >= 2 tokens".into()));
+        }
+        let hidden = self.weights.descriptor.params.hidden_size;
+        let vocab = self.weights.descriptor.params.vocab_size;
+        let mut seq = self.new_seq();
+        let mut nll_sum = 0.0f64;
+        let mut count = 0usize;
+        let mut result = Ok(());
+        'outer: for (ci, chunk) in tokens.chunks(MAX_PREFILL_CHUNK).enumerate() {
+            let base = ci * MAX_PREFILL_CHUNK;
+            let t = match self.prefill_forward(&mut seq, chunk) {
+                Ok(t) => t,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            };
+            for i in 0..t {
+                let global = base + i;
+                if global + 1 >= tokens.len() {
+                    break 'outer;
+                }
+                let next = tokens[global + 1] as usize;
+                let stream = &self.stream;
+                let pb = self.prefill_bufs.as_ref().expect("prefill_forward allocated");
+                if let Err(e) = self
+                    .device
+                    .copy(&pb.x, i * hidden * 2, &self.bufs.x, 0, hidden * 2, stream)
+                    .and_then(|_| self.logits_gemv(&self.bufs.logits, &self.bufs.x, stream))
+                    .and_then(|_| {
+                        self.device.copy(
+                            &self.bufs.logits,
+                            0,
+                            &self.bufs.pinned_logits,
+                            0,
+                            vocab * 4,
+                            stream,
+                        )
+                    })
+                    .and_then(|_| self.device.synchronize())
+                {
+                    result = Err(e);
+                    break 'outer;
+                }
+                let lp = self
+                    .bufs
+                    .pinned_logits
+                    .host_ptr()
+                    .expect("pinned buffer has host mapping") as *const f32;
+                let logits = unsafe { std::slice::from_raw_parts(lp, vocab) };
+                // logsumexp for a stable NLL = logsumexp(logits) - logits[next].
+                let maxv = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f64;
+                for &v in logits {
+                    sum += ((v - maxv) as f64).exp();
+                }
+                let logz = (maxv as f64) + sum.ln();
+                nll_sum += logz - logits[next] as f64;
+                count += 1;
+            }
+        }
+        self.release_seq(&mut seq);
+        result?;
+        Ok((nll_sum / count.max(1) as f64, count))
     }
 
     /// Run a prompt chunk (≤ MAX_PREFILL_CHUNK tokens) through the model in one

@@ -2174,8 +2174,12 @@ impl Kernels {
     /// Per-token int8 activation quant + W4A8 GEMM in one call: quantizes the
     /// f16 activation `x` [n_tokens, cols] to symmetric int8 codes + per-token
     /// f16 scale (QServe layout) into grow-only scratch, then runs the int4-
-    /// weight x int8-activation GEMM. `y` is f16 [n_tokens, rows]. Both launches
-    /// share `stream` (no explicit sync). Non-default (FORGE_GEMM=w4a8).
+    /// weight x int8-activation GEMM. `y` is f16 [n_tokens, rows]. `inv_smooth`
+    /// is the per-input-channel SmoothQuant reciprocal `1/s` (f16 [cols]);
+    /// activations are multiplied by it before the int8 quant, matching the
+    /// packed weight's per-column `s` scaling. Pass an all-ones buffer for the
+    /// identity (no smoothing). Both launches share `stream` (no explicit sync).
+    /// Non-default (FORGE_GEMM=w4a8).
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_w4a8(
         &self,
@@ -2184,6 +2188,7 @@ impl Kernels {
         s2_zeros: &DevBuffer,
         s2_scales: &DevBuffer,
         wscales: &DevBuffer,
+        inv_smooth: &DevBuffer,
         x: &DevBuffer,
         rows: usize,
         cols: usize,
@@ -2220,6 +2225,7 @@ impl Kernels {
             .buf(x)
             .buf(a_i8)
             .buf(ascales)
+            .buf(inv_smooth)
             .scalar(n_tokens as i64)
             .scalar(cols as i64);
         self.device.launch(qk, &qcfg, &qargs, stream)?;

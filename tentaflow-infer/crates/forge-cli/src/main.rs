@@ -312,6 +312,15 @@ enum Command {
         #[arg(long = "speculative", default_value = "off")]
         speculative: String,
     },
+    /// Measure next-token perplexity on a fixed held-out passage (W4A8 quality
+    /// gate). Runs whatever GEMM `FORGE_GEMM` selects (W4A8 is calibrated first).
+    Ppl {
+        /// GGUF file or HF snapshot directory.
+        model_path: PathBuf,
+        /// Max context length in tokens (0 = the model's own maximum).
+        #[arg(long = "ctx", default_value_t = 0)]
+        ctx: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -493,6 +502,7 @@ fn main() -> Result<()> {
                 parse_speculative(&speculative)?,
             )
         }
+        Command::Ppl { model_path, ctx } => cmd_ppl(&model_path, ctx),
     }
 }
 
@@ -1233,7 +1243,7 @@ fn cmd_run(
     // Speculation is mutually exclusive with the radix prefix cache (both manage
     // paged KV ownership); enabling it forces prefix caching off.
     let prefix_cache = prefix_cache && !spec.enabled;
-    let loaded = load_auto(
+    let mut loaded = load_auto(
         model_path,
         weights_pool_gb,
         kv_quant,
@@ -1244,6 +1254,7 @@ fn cmd_run(
         prefix_cache,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
+    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
 
     let prompt_text = if chat {
         ChatTemplateEngine::new()
@@ -1297,6 +1308,83 @@ fn cmd_run(
     Ok(())
 }
 
+/// Held-out passage for the perplexity gate — deliberately DISTINCT from the
+/// W4A8 calibration text, so the score measures generalization, not overfit to
+/// calibration statistics.
+const PPL_HELDOUT_TEXT: &str = "\
+The history of computing hardware spans several centuries, beginning with early \
+mechanical calculating devices and culminating in the electronic digital \
+computers that pervade modern life. The abacus, one of the earliest known \
+calculating tools, was used by ancient civilizations for arithmetic. In the \
+nineteenth century, Charles Babbage designed the Analytical Engine, a mechanical \
+general-purpose computer, while Ada Lovelace wrote what is often considered the \
+first algorithm intended to be processed by a machine. The twentieth century \
+saw the transition from electromechanical relays to vacuum tubes, then to \
+transistors, and finally to integrated circuits, each step dramatically \
+reducing size and cost while increasing speed and reliability. Today a single \
+graphics processing unit performs trillions of floating-point operations every \
+second, enabling the training and deployment of large neural networks that \
+translate languages, recognize images, and generate fluent text across dozens \
+of domains and writing styles with remarkable and often surprising competence.";
+
+/// Compute mean next-token perplexity of the held-out passage under the active
+/// GEMM backend (W4A8 when `FORGE_GEMM=w4a8`, else the committed Q4_K path).
+fn cmd_ppl(model_path: &Path, ctx: usize) -> Result<()> {
+    let t0 = Instant::now();
+    let mut loaded = load_auto(
+        model_path,
+        0.0,
+        KvQuant::F16,
+        KvTierConfig::default(),
+        ctx,
+        0,
+        0,
+        false,
+    )?;
+    eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
+    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
+
+    let tokens = loaded
+        .bundle
+        .tokenizer
+        .encode(PPL_HELDOUT_TEXT, true)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (mean_nll, count) = loaded.model.perplexity(&tokens)?;
+    let backend = std::env::var("FORGE_GEMM").unwrap_or_else(|_| "default(q4_k)".into());
+    println!(
+        "ppl backend={backend} tokens_scored={count} mean_nll={mean_nll:.5} perplexity={:.4}",
+        mean_nll.exp()
+    );
+    Ok(())
+}
+
+/// Build the W4A8 SmoothQuant packs when `FORGE_GEMM=w4a8` is selected. A
+/// one-time calibration over the embedded passage; GGUF sources only (the dense
+/// W4A8 gate model). No-op for any other GEMM backend.
+fn maybe_calibrate_w4a8(
+    model: &mut forge_engine::model::Model,
+    path: &Path,
+    tokenizer: &forge_tokenize::Tokenizer,
+) -> Result<()> {
+    if std::env::var("FORGE_GEMM").ok().as_deref() != Some("w4a8") {
+        return Ok(());
+    }
+    if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
+        bail!("FORGE_GEMM=w4a8 calibration currently supports GGUF models only");
+    }
+    let t0 = Instant::now();
+    let toks = tokenizer
+        .encode(forge_engine::model::W4A8_CALIB_TEXT, false)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    model.calibrate_w4a8(path, &toks)?;
+    eprintln!(
+        "W4A8 requant packs built in {:.1}s (SmoothQuant off by default; \
+         FORGE_W4A8_ALPHA=<0..1> to enable)",
+        t0.elapsed().as_secs_f32()
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_bench(
     model_path: &Path,
@@ -1318,8 +1406,9 @@ fn cmd_bench(
     }
     let t0 = Instant::now();
     let prefix_cache = prefix_cache && !spec.enabled;
-    let loaded = load_auto(model_path, 0.0, kv_quant, kv_tier, ctx, kv_pages, hot_pages, prefix_cache)?;
+    let mut loaded = load_auto(model_path, 0.0, kv_quant, kv_tier, ctx, kv_pages, hot_pages, prefix_cache)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
+    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
 
     let tokenizer = Arc::new(loaded.bundle.tokenizer);
     // Cycle a natural-language seed to the exact requested prompt length so
