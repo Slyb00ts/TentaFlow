@@ -2886,7 +2886,7 @@ def quantize_act_q8_1(
         xsm[sidx] = d * Float32(sumq)
 
 
-def gemm_i8mma_impl[BM: Int, FMT: Int](
+def gemm_i8mma_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
     y: UnsafePointer[Float16, MutAnyOrigin],
     w: UnsafePointer[UInt8, MutAnyOrigin],
     xq_g: UnsafePointer[Int8, MutAnyOrigin],
@@ -2896,51 +2896,62 @@ def gemm_i8mma_impl[BM: Int, FMT: Int](
     n_rows: Int,
     n_tokens: Int,
 ):
-    # 256-thread block = 8 warps. Each warp owns MT_PER_WARP=2 token m-tiles
-    # (32 tokens) and NT_PER_WARP row n-tiles, so A fragments are reused across
-    # n-tiles and B fragments across m-tiles — this halves redundant weight
-    # smem traffic vs a 1-m-tile layout (mirrors the f16 kernel's warp tiling).
+    # NW-warp block (NW*32 threads). One block owns a BM-token x BN-row output
+    # tile. Warps split M_WARPS x N_WARPS; each warp owns MT_PER_WARP=2 token
+    # m-tiles (32 tokens) and NT_PER_WARP row n-tiles, so A fragments are reused
+    # across n-tiles and B fragments across m-tiles. BN (rows/block) is the
+    # arithmetic-intensity lever: X is re-read ceil(n_rows/BN) times, so a
+    # larger BN cuts the dominant activation traffic. To keep the per-warp
+    # accumulator (and thus the register budget / 2-CTA occupancy) FIXED while
+    # enlarging the BMxBN tile, add warps (NW) rather than n-tiles per warp.
     comptime MT_PER_WARP = 2
     comptime M_WARPS = BM // 32
-    comptime N_WARPS = 8 // M_WARPS
-    comptime NT_PER_WARP = 8 // N_WARPS
+    comptime N_WARPS = NW // M_WARPS
+    comptime NT_PER_WARP = (BN // 8) // N_WARPS
+    comptime NTHREADS = NW * 32
+    # W staging: 4 threads per row -> NTHREADS/4 rows per pass.
+    comptime W_ROWS_PER_PASS = NTHREADS // 4
+    comptime W_PASSES = BN // W_ROWS_PER_PASS
     comptime BLK_BYTES = 34 if FMT == 0 else 144
     comptime BPR_DIV = 32 if FMT == 0 else 256
 
     tid = Int(thread_idx.x)
-    row0 = Int(block_idx.x) * 64
+    row0 = Int(block_idx.x) * BN
     t0 = Int(block_idx.y) * BM
 
     xq = stack_allocation[
         2 * BM * 32, Int8, alignment=64, address_space = AddressSpace.SHARED
     ]()
     wq = stack_allocation[
-        2 * 64 * 32, Int8, alignment=64, address_space = AddressSpace.SHARED
+        2 * BN * 32, Int8, alignment=64, address_space = AddressSpace.SHARED
     ]()
     xd = stack_allocation[2 * BM, Float32, address_space = AddressSpace.SHARED]()
     xsm = stack_allocation[
         2 * BM, Float32, address_space = AddressSpace.SHARED
     ]()
     wdsc = stack_allocation[
-        2 * 64, Float32, address_space = AddressSpace.SHARED
+        2 * BN, Float32, address_space = AddressSpace.SHARED
     ]()
     wdmn = stack_allocation[
-        2 * 64, Float32, address_space = AddressSpace.SHARED
+        2 * BN, Float32, address_space = AddressSpace.SHARED
     ]()
 
-    # X staging: one token per thread (tid < BM).
+    # X staging: one token per thread (tid < BM); NTHREADS >= BM.
     var xtok_c = t0 + tid
     if xtok_c > n_tokens - 1:
         xtok_c = n_tokens - 1
 
-    # W staging: 4 threads per row, 8 codes each.
+    # W staging: 4 threads per row, 8 codes each; W_PASSES row-passes cover BN.
     row_l = tid // 4
     part = tid % 4
-    var wrow_c = row0 + row_l
-    if wrow_c > n_rows - 1:
-        wrow_c = n_rows - 1
     blocks_per_row = n_cols // BPR_DIV
-    wrow_base = wrow_c * blocks_per_row * BLK_BYTES
+    var wrow_base = InlineArray[Int, W_PASSES](fill=0)
+
+    comptime for p in range(W_PASSES):
+        var wrow_c = row0 + p * W_ROWS_PER_PASS + row_l
+        if wrow_c > n_rows - 1:
+            wrow_c = n_rows - 1
+        wrow_base[p] = wrow_c * blocks_per_row * BLK_BYTES
 
     n_stages = n_cols // 32
 
@@ -2966,9 +2977,13 @@ def gemm_i8mma_impl[BM: Int, FMT: Int](
     var xcodes = SIMD[DType.int8, 32](0)
     var xdv = Float32(0)
     var xsv_g = Float32(0)
-    var wcodes = SIMD[DType.uint8, 8](0)
-    var wsc = Float16(0)
-    var whdr = SIMD[DType.uint8, 16](0)
+    var wcodes = InlineArray[SIMD[DType.uint8, 8], W_PASSES](
+        fill=SIMD[DType.uint8, 8](0)
+    )
+    var wsc = InlineArray[Float16, W_PASSES](fill=Float16(0))
+    var whdr = InlineArray[SIMD[DType.uint8, 16], W_PASSES](
+        fill=SIMD[DType.uint8, 16](0)
+    )
 
     comptime W_QOFF = 2 if FMT == 0 else 16
 
@@ -2977,14 +2992,19 @@ def gemm_i8mma_impl[BM: Int, FMT: Int](
         xdv = xd_g[xtok_c]
         comptime if FMT == 1:
             xsv_g = xsm_g[xtok_c]
-    comptime if FMT == 0:
-        wcodes = (w + wrow_base + W_QOFF + part * 8).load[width=8, alignment=2]()
-        if part == 0:
-            wsc = (w + wrow_base).bitcast[Float16]()[0]
-    else:
-        wcodes = (w + wrow_base + W_QOFF + part * 8).load[width=8, alignment=8]()
-        if part == 0:
-            whdr = (w + wrow_base).load[width=16, alignment=16]()
+    comptime for p in range(W_PASSES):
+        comptime if FMT == 0:
+            wcodes[p] = (w + wrow_base[p] + W_QOFF + part * 8).load[
+                width=8, alignment=2
+            ]()
+            if part == 0:
+                wsc[p] = (w + wrow_base[p]).bitcast[Float16]()[0]
+        else:
+            wcodes[p] = (w + wrow_base[p] + W_QOFF + part * 8).load[
+                width=8, alignment=8
+            ]()
+            if part == 0:
+                whdr[p] = (w + wrow_base[p]).load[width=16, alignment=16]()
 
     # Software pipeline (mirrors the f16 kernel): each iteration computes stage
     # s from buffer s%2 while stage s+1 is quantized/unpacked into the OTHER
@@ -3000,20 +3020,24 @@ def gemm_i8mma_impl[BM: Int, FMT: Int](
             comptime if FMT == 1:
                 xsm[buf * BM + tid] = xsv_g
 
-        var codes8: SIMD[DType.int8, 8]
-        comptime if FMT == 0:
-            codes8 = wcodes.cast[DType.int8]()
-            if part == 0:
-                wdsc[buf * 64 + row_l] = Float32(wsc)
-        else:
-            half = (sidx % 8) % 2
-            codes8 = ((wcodes >> UInt8(4 * half)) & 0x0F).cast[DType.int8]()
-            if part == 0:
-                dm = bitcast[DType.float16, 8](whdr)
-                sc, mn = _q4k_scale_min(whdr, sidx % 8)
-                wdsc[buf * 64 + row_l] = Float32(dm[0]) * sc
-                wdmn[buf * 64 + row_l] = Float32(dm[1]) * mn
-        (wq + buf * 64 * 32 + row_l * 32 + part * 8).store[alignment=8](codes8)
+        comptime for p in range(W_PASSES):
+            rl = p * W_ROWS_PER_PASS + row_l
+            var codes8: SIMD[DType.int8, 8]
+            comptime if FMT == 0:
+                codes8 = wcodes[p].cast[DType.int8]()
+                if part == 0:
+                    wdsc[buf * BN + rl] = Float32(wsc[p])
+            else:
+                half = (sidx % 8) % 2
+                codes8 = ((wcodes[p] >> UInt8(4 * half)) & 0x0F).cast[
+                    DType.int8
+                ]()
+                if part == 0:
+                    dm = bitcast[DType.float16, 8](whdr[p])
+                    sc, mn = _q4k_scale_min(whdr[p], sidx % 8)
+                    wdsc[buf * BN + rl] = Float32(dm[0]) * sc
+                    wdmn[buf * BN + rl] = Float32(dm[1]) * mn
+            (wq + buf * BN * 32 + rl * 32 + part * 8).store[alignment=8](codes8)
 
     @parameter
     @always_inline
@@ -3025,23 +3049,24 @@ def gemm_i8mma_impl[BM: Int, FMT: Int](
             xdv = xd_g[sidx * n_tokens + xtok_c]
             comptime if FMT == 1:
                 xsv_g = xsm_g[sidx * n_tokens + xtok_c]
-        comptime if FMT == 0:
-            wcodes = (w + wrow_base + sidx * 34 + 2 + part * 8).load[
-                width=8, alignment=2
-            ]()
-            if part == 0:
-                wsc = (w + wrow_base + sidx * 34).bitcast[Float16]()[0]
-        else:
-            nsb = sidx // 8
-            nsub = sidx % 8
-            nchunk = nsub // 2
-            wcodes = (
-                w + wrow_base + nsb * 144 + 16 + nchunk * 32 + part * 8
-            ).load[width=8, alignment=8]()
-            if part == 0:
-                whdr = (w + wrow_base + nsb * 144).load[
-                    width=16, alignment=16
+        comptime for p in range(W_PASSES):
+            comptime if FMT == 0:
+                wcodes[p] = (w + wrow_base[p] + sidx * 34 + 2 + part * 8).load[
+                    width=8, alignment=2
                 ]()
+                if part == 0:
+                    wsc[p] = (w + wrow_base[p] + sidx * 34).bitcast[Float16]()[0]
+            else:
+                nsb = sidx // 8
+                nsub = sidx % 8
+                nchunk = nsub // 2
+                wcodes[p] = (
+                    w + wrow_base[p] + nsb * 144 + 16 + nchunk * 32 + part * 8
+                ).load[width=8, alignment=8]()
+                if part == 0:
+                    whdr[p] = (w + wrow_base[p] + nsb * 144).load[
+                        width=16, alignment=16
+                    ]()
 
     # Prologue: stage 0 -> buf 0, prefetch stage 1's global reads.
     sw(0, 0)
@@ -3089,14 +3114,14 @@ def gemm_i8mma_impl[BM: Int, FMT: Int](
 
         comptime for nti in range(NT_PER_WARP):
             nb = (nbase + nti) * 8
-            Bf = (wq + buf * 64 * 32 + nb * 32).bitcast[Float16]()
+            Bf = (wq + buf * BN * 32 + nb * 32).bitcast[Float16]()
             b_base = Bf + lr * 16 + (sub % 2) * 8
             bi = bitcast[DType.uint32, 2](ld_matrix[4](b_base))
-            dw2 = (wdsc + buf * 64 + nb + 2 * tt).load[width=2]()
+            dw2 = (wdsc + buf * BN + nb + 2 * tt).load[width=2]()
             dwv = SIMD[DType.float32, 4](dw2[0], dw2[1], dw2[0], dw2[1])
             var mnv = SIMD[DType.float32, 4](0)
             comptime if FMT == 1:
-                mn2 = (wdmn + buf * 64 + nb + 2 * tt).load[width=2]()
+                mn2 = (wdmn + buf * BN + nb + 2 * tt).load[width=2]()
                 mnv = SIMD[DType.float32, 4](mn2[0], mn2[1], mn2[0], mn2[1])
             comptime for mi in range(MT_PER_WARP):
                 mres = _mma_s8(
@@ -3131,10 +3156,12 @@ def gemm_i8mma_impl[BM: Int, FMT: Int](
                     y[tok_b * n_rows + r_b] = Float16(d4[3])
 
 
-comptime gemm_q8_0_i8mma = gemm_i8mma_impl[128, 0]
-comptime gemm_q8_0_i8mma_bm64 = gemm_i8mma_impl[64, 0]
-comptime gemm_q4_k_i8mma = gemm_i8mma_impl[128, 1]
-comptime gemm_q4_k_i8mma_bm64 = gemm_i8mma_impl[64, 1]
+comptime gemm_q8_0_i8mma = gemm_i8mma_impl[128, 64, 8, 0]
+comptime gemm_q8_0_i8mma_bm64 = gemm_i8mma_impl[64, 64, 8, 0]
+comptime gemm_q8_0_i8mma_big = gemm_i8mma_impl[128, 128, 16, 0]
+comptime gemm_q4_k_i8mma = gemm_i8mma_impl[128, 64, 8, 1]
+comptime gemm_q4_k_i8mma_bm64 = gemm_i8mma_impl[64, 64, 8, 1]
+comptime gemm_q4_k_i8mma_big = gemm_i8mma_impl[128, 128, 16, 1]
 
 
 comptime gemm_f16_out_f32 = gemm_f16_out_f32_impl[128, 8]

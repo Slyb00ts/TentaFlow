@@ -196,6 +196,41 @@ Published tutorials mostly show pre-1.0 syntax — trust these notes over old do
     bit-exact reval) — a multi-day rewrite, not a low-risk pass.
     `bench_gemm_i8mma.mojo` was stale (wrong 6-arg signature, didn't compile);
     rewritten to the pre-quant path + INT8-TOPS report.
+  - **BN=128 reblock SHIPPED — the tile-shape lever paid off (2026-07-19).**
+    `gemm_i8mma_impl` is now parametrized `[BM, BN, NW, FMT]`; the new `_big`
+    variant is **BM=128 x BN=128, NW=16 (512 threads / 16 warps)**. The trick
+    to enlarge the BMxBN tile WITHOUT exploding registers (which killed every
+    prior occupancy attempt): keep the per-warp accumulator FIXED at
+    MT=2 x NT=4 = 8 (`SIMD[f32,4]`) and add WARPS, not n-tiles/warp. So the big
+    kernel is **127 regs → 1 CTA/SM = 16 warps**, exactly the committed
+    2x256-thread = 2 CTAs x 8 warps = 16-warp footprint. Same occupancy, but BN
+    doubled 64→128 so X (re-read `ceil(rows/BN)` times) is fetched HALF as often
+    and smem is 20 KB x1 CTA vs 15 KB x2 = 30 KB (less). W staging generalized to
+    `W_PASSES = BN/(NW*8)` row-passes (here 1); scale/code prefetch regs became
+    `InlineArray[..., W_PASSES]`. **Bit-identical to the committed BM=128 kernel**
+    (integer mma is exact — proven per-element in `test_gemm_i8mma.mojo`:
+    `m[idx] == mbig[idx]` on random Q4_K and Q8_0 tiles). Isolated microbench
+    (Q4_K bm128 → big, RTX 4090): T=2048 58 → 65 TOPS (**31% → 35% of the
+    184-TOPS ceiling**), wall 4.15 → 3.70 ms; T=512 57 → 61; T=128 35 → 58.
+    Wins EVERY point. End-to-end (nsys, Mistral 4096 prefill, total Q4_K i8mma
+    GEMM GPU time): **968.8 → 863.2 ms = −10.9 %**.
+  - **`_big` is perf-gated, not universal — the coarse block underfills small
+    GEMMs.** A 512-thread block halves a GEMM's block count, so it only wins when
+    there are enough blocks to keep the ~128 SMs busy at 1 CTA/SM. Two
+    tripwires measured: (a) a 512-token prefill chunk (n_tokens=512) regressed
+    Mistral prefill **−11 %** (2094 vs 2346) — the whole prefill is tiny and the
+    small attention projections underfill; (b) Qwen3-0.6B Q8_0 (rows ≤ 3072)
+    regressed its 4096 prefill **−19 %** (15.7k vs 19.4k) — too few row-blocks.
+    `gemm_i8mma_tile` (launchers.rs) therefore gates `_big` on BOTH
+    `n_tokens >= 1024` (full `MAX_PREFILL_CHUNK`) AND
+    `ceil(rows/128)*ceil(n_tokens/128) >= 256` (≥ 2 full waves); else the
+    committed 256-thread BM=128 (2 CTAs/SM) / BM=64 kernel. Net: Mistral-class
+    large models get big on gate/up/down/q/o (kv-proj rows=1024 stays committed),
+    Qwen-0.6B stays 100 % committed (0 regression). Mistral-7B Q4_K prefill
+    (3-rep A/B, big-disabled vs gated-big): 4096 **2588 → 2827 (+9 %)**, 8192
+    **2246 → 2343 (+4 %)**; 512 stays committed; decode (gemv, untouched)
+    bit-unchanged ~146. The remaining ~4× gap to llama.cpp is still GEMM
+    mma-issue efficiency at this 35%-of-ceiling wall, not X traffic.
 
 ## FP8 (e4m3) — verified on sm_89
 - `DType.float8_e4m3fn` works end-to-end: buffers, kernel pointers, and

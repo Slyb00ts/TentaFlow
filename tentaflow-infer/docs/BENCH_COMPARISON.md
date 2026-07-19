@@ -49,14 +49,25 @@ match is `tg @ depth` (generate after a prompt of that depth), shown alongside t
 FORGE prefill history on this GEMM (Mistral-7B Q4_K_M, prefix-cache off): f16
 tensor-core dequant GEMM → int8-MMQ tensor-core GEMM (`gemm_i8mma`, s8×s8→s32
 mma) → int8-MMQ + **once-per-GEMM q8_1 activation pre-quant** (`quantize_act_q8_1`,
-block-major coalesced scales). 512: 1417 → 2270 → ~2400. 4096: 1952 → 2650 →
-~2837. 8192: 1758 → 2236 → ~2360. Qwen3-0.6B Q8_0 4096: 15692 → 19016 → ~19430.
-The pre-quant halves X read bandwidth and removes the redundant per-weight-row-block
-requant; it lands ~+5–7 % on Q4_K prefill (~+1–2 % on the much smaller-K Q8_0
-Qwen). Decode is bit-unchanged (dp4a GEMV). Numbers are ±~5 % run-to-run from
-GPU boost-clock state; the pre-quant kernel itself is ~0.0 % of prefill time
-(nsys), so the remaining ~4.5× gap to llama.cpp is the GEMM's occupancy /
-mma-issue efficiency, not X staging (see STATUS.md / MOJO_NOTES.md).
+block-major coalesced scales) → **BN=128 reblock** (`_big`: BM128×BN128, 512-thread/
+16-warp block). 512: 1417 → 2270 → 2400 → ~2400 (unchanged, gated off — see below).
+4096: 1952 → 2650 → 2837 → **~2827 (+9 % over the pre-`_big` 2588 on a same-machine
+3-rep A/B)**. 8192: 1758 → 2236 → 2360 → **~2343 (+4 % over 2246)**.
+The `_big` tile doubles the rows/block (BN 64→128) so the activation X — re-read
+`ceil(rows/BN)` times — is fetched half as often; it keeps the per-warp accumulator
+(and thus the 127-reg / 1-CTA-per-SM = 16-warp occupancy, matching the old
+2×256-thread footprint) fixed by adding warps instead of n-tiles/warp, and is
+**bit-identical to the committed BM=128 kernel** (integer mma is exact). Isolated
+microbench T=2048: 58 → 65 TOPS = **31 % → 35 % of the 184-TOPS ceiling**, wall
+4.15 → 3.70 ms; nsys Mistral-4096 total Q4_K i8mma GEMM time −10.9 %. It is
+**perf-gated** (`n_tokens ≥ 1024` AND `ceil(rows/128)·ceil(n_tokens/128) ≥ 256`):
+the coarse 512-thread block underfills the SMs for short chunks (512-prefill −11 %)
+and small models (Qwen3-0.6B rows ≤ 3072, −19 %), so those stay on the committed
+256-thread kernel — Qwen3-0.6B Q8_0 4096 is thus **unchanged (~18.4–19.4k)** and
+decode is bit-unchanged (dp4a GEMV). Numbers are ±~5 % run-to-run from GPU
+boost-clock/thermal state; the remaining ~4× gap to llama.cpp is the GEMM's
+mma-issue efficiency at this 35 %-of-ceiling wall, not X staging (see
+STATUS.md / MOJO_NOTES.md).
 
 VRAM (single-stream, observed peak incl. ~1.1 GiB desktop baseline):
 - **FORGE**: ~23.6 GiB peak — dominated by a pre-reserved full-context KV arena

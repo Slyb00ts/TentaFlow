@@ -30,14 +30,24 @@ Ostatnia aktualizacja: 2026-07-19.
     marshalling 4×s32 rozwiązany). Aktywacja kwantyzowana do q8_1 RAZ na GEMM
     w prepassie `quantize_act_q8_1` (int8 `[T,K]` + skale block-major `[K/32,T]`
     dla koalescencji), GEMM czyta int8 X bezpośrednio → połowa pasma X + zero
-    redundantnej rekwantyzacji per blok wag. Efekt: Mistral Q4_K prefill
-    ~+5–7 % (4096: 2650→~2837 tok/s), Qwen Q8_0 ~+1–2 %; dekod bit-bez-zmian
-    (dp4a GEMV). Poprawność ≈4.6e-4 vs exact CPU MMQ. Pozostałe formaty prefill
-    = f16 tensor-core (dequant Q→f16 → mma). Wciąż ~4.5× za llama.cpp MMQ
-    (11–12.8k); prepass to 0.0 % czasu (nsys) — luka to wydajność mma-issue /
-    occupancy GEMM, nie staging X. Głębsze próby (cp.async X, BN=128) świadomie
-    odłożone (wysokie ryzyko regresji, niski zysk wg profilu) — szczegóły
-    w `kernels/mojo/MOJO_NOTES.md`.
+    redundantnej rekwantyzacji per blok wag. Dodatkowo **reblock BN=128**
+    (`gemm_i8mma_impl[BM,BN,NW,FMT]`, wariant `_big` = BM128×BN128, 512 wątków/
+    16 warpów): podwaja wiersze/blok, więc aktywacja X (czytana `ceil(rows/BN)`
+    razy) idzie o połowę rzadziej. Klucz do braku regresji occupancy: akumulator
+    per-warp STAŁY (MT2×NT4=8), więcej WARPÓW zamiast n-tiles/warp → 127 rej. →
+    1 CTA/SM = 16 warpów (identyczny footprint jak stare 2×256 wątków). **Bit-w-bit
+    identyczny ze skomitowanym BM=128** (mma int8 jest dokładne — dowód per-element
+    w `test_gemm_i8mma.mojo`). Bramkowany na kształt (`n_tokens≥1024` ORAZ
+    `ceil(rows/128)·ceil(n_tokens/128)≥256`), bo gruby blok niedopełnia SM-y dla
+    krótkich chunków (512-prefill −11 %) i małych modeli (Qwen3-0.6B rows≤3072,
+    −19 %) — te zostają na skomitowanym kernelu. Efekt (A/B 3-rep, ta sama karta):
+    Mistral Q4_K prefill 4096 **2588→2827 (+9 %)**, 8192 **2246→2343 (+4 %)**;
+    512 i Qwen3-0.6B bez zmian; dekod bit-bez-zmian (dp4a GEMV). Mikrobench
+    T=2048: 58→65 TOPS = **31 %→35 % pułapu 184-TOPS**; nsys Mistral-4096 czas
+    GEMM i8mma −10.9 %. Poprawność ≈4.6e-4 vs exact CPU MMQ. Pozostałe formaty
+    prefill = f16 tensor-core (dequant Q→f16 → mma). Wciąż ~4× za llama.cpp MMQ
+    (11–12.8k) — luka to wydajność mma-issue GEMM przy ścianie 35 % pułapu, nie
+    staging X — szczegóły w `kernels/mojo/MOJO_NOTES.md`.
   - ℹ️ **Profil prefill (2026-07-19, nsys RTX 4090): compute-bound, brak narzutu
     launchy.** Suma czasu GPU kerneli = 1433.5 ms vs wall 1436 ms przy P=4096
     (luka 0.17 %; 0.8 % przy P=512) → **CUDA-graphing prefillu nic nie daje**

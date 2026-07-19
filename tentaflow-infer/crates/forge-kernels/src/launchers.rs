@@ -1649,7 +1649,7 @@ impl Kernels {
         n_tokens: usize,
         stream: &Stream,
     ) -> Result<()> {
-        let (suffix, bm) = Self::gemm_i8mma_tile(n_tokens);
+        let (suffix, bm, bn, threads) = Self::gemm_i8mma_tile(rows, n_tokens);
         let qk = self.artifacts.get("quantize_act_q8_1")?;
         let gk = self.artifacts.get(&format!("{kernel_base}{suffix}"))?;
 
@@ -1692,8 +1692,12 @@ impl Kernels {
         self.device.launch(qk, &qcfg, &qargs, stream)?;
 
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(64), (n_tokens as u32).div_ceil(bm), 1),
-            block: (256, 1, 1),
+            grid: (
+                (rows as u32).div_ceil(bn),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
+            block: (threads, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
@@ -1708,15 +1712,41 @@ impl Kernels {
         self.device.launch(gk, &cfg, &args, stream)
     }
 
-    /// Token-tile selection for the i8mma GEMM. Both variants use a 256-thread
-    /// block; BM=128 doubles per-thread token work (fewer blocks, higher
-    /// weight reuse) and wins once there are enough token blocks to fill the
-    /// SMs, else BM=64 keeps more blocks resident.
-    fn gemm_i8mma_tile(n_tokens: usize) -> (&'static str, u32) {
-        if n_tokens >= 256 {
-            ("", 128)
+    /// Tile selection for the i8mma GEMM: `(suffix, BM, BN, block_threads)`.
+    ///
+    /// The `_big` variant (BM=128 x BN=128, 512-thread/16-warp block) doubles
+    /// the rows-per-block so the activation X — re-read `ceil(rows/BN)` times —
+    /// is fetched half as often, raising the mma:bytes-loaded ratio. It keeps
+    /// the per-warp accumulator (and thus the 127-reg / 1-CTA-per-SM = 16-warp
+    /// occupancy, matching the old 2x256-thread = 16-warp footprint) fixed by
+    /// adding warps instead of n-tiles/warp. Bit-identical to the old BM=128
+    /// kernel (integer mma is exact).
+    ///
+    /// The 512-thread block halves the block count of a given GEMM (BM=128 x
+    /// BN=128 vs the 256-thread kernel's BM=128 x BN=64 at 2 CTAs/SM), so it
+    /// only wins when the GEMM is big enough to keep the ~128 SMs busy at the
+    /// coarser granularity. Two conditions must both hold:
+    ///  * `n_tokens >= 1024` (a full `MAX_PREFILL_CHUNK`): at a 512-token chunk
+    ///    the whole prefill is tiny and the coarse blocks underfill the SMs for
+    ///    the small attention projections, regressing the Mistral 512 prefill
+    ///    ~11%.
+    ///  * `ceil(rows/128) * ceil(n_tokens/128) >= 256` (>= 2 full waves on the
+    ///    128 SMs at 1 CTA/SM): small-model projections (Qwen3-0.6B rows<=3072)
+    ///    make too few blocks and `_big` regresses that GEMM ~19%.
+    ///
+    /// Otherwise fall back to the committed 256-thread BM=128 (2 CTAs/SM) or
+    /// BM=64 kernel. `_big` is bit-identical to BM=128 (integer mma), so this is
+    /// a pure perf gate. Measured on the RTX 4090: Mistral-7B Q4_K 4096 prefill
+    /// 2588 -> 2827 tok/s (+9%), 8192 2246 -> 2343 (+4%); Qwen3-0.6B and the 512
+    /// prefill stay on the committed kernel (no regression).
+    fn gemm_i8mma_tile(rows: usize, n_tokens: usize) -> (&'static str, u32, u32, u32) {
+        let big_blocks = rows.div_ceil(128) * n_tokens.div_ceil(128);
+        if n_tokens >= 1024 && big_blocks >= 256 {
+            ("_big", 128, 128, 512)
+        } else if n_tokens >= 256 {
+            ("", 128, 64, 256)
         } else {
-            ("_bm64", 64)
+            ("_bm64", 64, 64, 256)
         }
     }
 

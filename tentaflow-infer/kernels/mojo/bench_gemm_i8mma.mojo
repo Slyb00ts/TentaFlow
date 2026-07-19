@@ -6,7 +6,7 @@
 from std.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 from src.gemm import gemm_q4_k_f16
-from src.gemm import gemm_q4_k_i8mma, gemm_q4_k_i8mma_bm64
+from src.gemm import gemm_q4_k_i8mma, gemm_q4_k_i8mma_bm64, gemm_q4_k_i8mma_big
 from src.gemm import quantize_act_q8_1
 
 
@@ -64,10 +64,30 @@ def _bench_q4k(ctx: DeviceContext, BR: Int, BC: Int, BT: Int) raises:
     ctx.synchronize()
     ms_m64 = Float64(perf_counter_ns() - t0) / 1e6 / ITERS
 
+    # big tile: BM=128 x BN=128, 16 warps (512 threads). Grid.x steps by 128.
+    gyb = (BR + 127) // 128
+    for _ in range(300):
+        ctx.enqueue_function[gemm_q4_k_i8mma_big](
+            by.unsafe_ptr(), bwk.unsafe_ptr(), xq.unsafe_ptr(), xd.unsafe_ptr(),
+            xsm.unsafe_ptr(), BC, BR, BT,
+            grid_dim=(gyb, gt128), block_dim=512,
+        )
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    for _ in range(ITERS):
+        ctx.enqueue_function[gemm_q4_k_i8mma_big](
+            by.unsafe_ptr(), bwk.unsafe_ptr(), xq.unsafe_ptr(), xd.unsafe_ptr(),
+            xsm.unsafe_ptr(), BC, BR, BT,
+            grid_dim=(gyb, gt128), block_dim=512,
+        )
+    ctx.synchronize()
+    ms_big = Float64(perf_counter_ns() - t0) / 1e6 / ITERS
+
     print(
         "Q4K N=", BR, "K=", BC, "T=", BT,
         " i8mma128:", ops / (ms_m128 / 1e3) / 1e12, "TOPS (", ms_m128, "ms)",
         " i8mma64:", ops / (ms_m64 / 1e3) / 1e12, "TOPS (", ms_m64, "ms)",
+        " big:", ops / (ms_big / 1e3) / 1e12, "TOPS (", ms_big, "ms)",
     )
 
 

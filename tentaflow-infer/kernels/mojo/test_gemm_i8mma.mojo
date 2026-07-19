@@ -11,8 +11,8 @@
 
 from std.gpu.host import DeviceContext
 from src.gemm import gemm_q8_0_f16, gemm_q4_k_f16
-from src.gemm import gemm_q8_0_i8mma, gemm_q8_0_i8mma_bm64
-from src.gemm import gemm_q4_k_i8mma, gemm_q4_k_i8mma_bm64
+from src.gemm import gemm_q8_0_i8mma, gemm_q8_0_i8mma_bm64, gemm_q8_0_i8mma_big
+from src.gemm import gemm_q4_k_i8mma, gemm_q4_k_i8mma_bm64, gemm_q4_k_i8mma_big
 from src.gemm import quantize_act_q8_1
 
 comptime KERNEL_TOL: Float32 = 0.01  # i8mma kernel vs exact CPU MMQ reference
@@ -66,6 +66,7 @@ def main() raises:
     var yref = ctx.enqueue_create_buffer[DType.float16](T * ROWS)
     var ym = ctx.enqueue_create_buffer[DType.float16](T * ROWS)
     var ym64 = ctx.enqueue_create_buffer[DType.float16](T * ROWS)
+    var ymbig = ctx.enqueue_create_buffer[DType.float16](T * ROWS)
     with x.map_to_host() as h:
         for i in range(T * COLS):
             h[i] = Float16(_fill(i))
@@ -103,11 +104,16 @@ def main() raises:
         xsm.unsafe_ptr(), COLS, ROWS, T,
         grid_dim=((ROWS + 63) // 64, (T + 63) // 64), block_dim=256,
     )
+    ctx.enqueue_function[gemm_q8_0_i8mma_big](
+        ymbig.unsafe_ptr(), wq.unsafe_ptr(), xq.unsafe_ptr(), xd.unsafe_ptr(),
+        xsm.unsafe_ptr(), COLS, ROWS, T,
+        grid_dim=((ROWS + 127) // 128, (T + 127) // 128), block_dim=512,
+    )
     ctx.synchronize()
 
     var e_mma: Float32 = 0.0  # i8mma kernel vs exact CPU MMQ
     var e_f16: Float32 = 0.0  # i8mma vs f16 GEMM (informational)
-    with yref.map_to_host() as a, x.map_to_host() as xh, wq.map_to_host() as wh, ym.map_to_host() as m, ym64.map_to_host() as m64:
+    with yref.map_to_host() as a, x.map_to_host() as xh, wq.map_to_host() as wh, ym.map_to_host() as m, ym64.map_to_host() as m64, ymbig.map_to_host() as mbig:
         for t in range(T):
             for r in range(ROWS):
                 var refv: Float32 = 0.0
@@ -133,7 +139,9 @@ def main() raises:
                     e_f16 = ef
                 if m[idx] != m64[idx]:
                     raise Error("gemm_q8_0_i8mma bm64 mismatch")
-    print("gemm_q8_0_i8mma vs exact-MMQ:", e_mma, " vs f16:", e_f16, " (bm64 bit-identical)")
+                if m[idx] != mbig[idx]:
+                    raise Error("gemm_q8_0_i8mma big mismatch")
+    print("gemm_q8_0_i8mma vs exact-MMQ:", e_mma, " vs f16:", e_f16, " (bm64+big bit-identical)")
     if e_mma > KERNEL_TOL:
         raise Error("gemm_q8_0_i8mma FAILED (kernel != exact MMQ)")
 
@@ -145,6 +153,7 @@ def main() raises:
     var ykref = ctx.enqueue_create_buffer[DType.float16](T * ROWS)
     var ykm = ctx.enqueue_create_buffer[DType.float16](T * ROWS)
     var ykm64 = ctx.enqueue_create_buffer[DType.float16](T * ROWS)
+    var ykmbig = ctx.enqueue_create_buffer[DType.float16](T * ROWS)
     with xk.map_to_host() as h:
         for i in range(T * KCOLS):
             h[i] = Float16(_fill(i + 7))
@@ -186,11 +195,16 @@ def main() raises:
         xksm.unsafe_ptr(), KCOLS, ROWS, T,
         grid_dim=((ROWS + 63) // 64, (T + 63) // 64), block_dim=256,
     )
+    ctx.enqueue_function[gemm_q4_k_i8mma_big](
+        ykmbig.unsafe_ptr(), wk.unsafe_ptr(), xkq.unsafe_ptr(), xkd.unsafe_ptr(),
+        xksm.unsafe_ptr(), KCOLS, ROWS, T,
+        grid_dim=((ROWS + 127) // 128, (T + 127) // 128), block_dim=512,
+    )
     ctx.synchronize()
 
     e_mma = 0.0
     e_f16 = 0.0
-    with ykref.map_to_host() as a, xk.map_to_host() as xh, wk.map_to_host() as wh, ykm.map_to_host() as m, ykm64.map_to_host() as m64:
+    with ykref.map_to_host() as a, xk.map_to_host() as xh, wk.map_to_host() as wh, ykm.map_to_host() as m, ykm64.map_to_host() as m64, ykmbig.map_to_host() as mbig:
         for t in range(T):
             for r in range(ROWS):
                 var refv: Float32 = 0.0
@@ -230,7 +244,9 @@ def main() raises:
                     e_f16 = ef
                 if m[idx] != m64[idx]:
                     raise Error("gemm_q4_k_i8mma bm64 mismatch")
-    print("gemm_q4_k_i8mma vs exact-MMQ:", e_mma, " vs f16:", e_f16, " (bm64 bit-identical)")
+                if m[idx] != mbig[idx]:
+                    raise Error("gemm_q4_k_i8mma big mismatch")
+    print("gemm_q4_k_i8mma vs exact-MMQ:", e_mma, " vs f16:", e_f16, " (bm64+big bit-identical)")
     if e_mma > KERNEL_TOL:
         raise Error("gemm_q4_k_i8mma FAILED (kernel != exact MMQ)")
     print("ALL PASSED")
