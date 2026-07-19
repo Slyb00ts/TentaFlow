@@ -2785,6 +2785,59 @@ pub fn encode_vision_import_model_request(
     .map_err(|e| JsError::new(&e))
 }
 
+// -----------------------------------------------------------------------------
+// Storage admin (Ustawienia → Magazyn danych) — MessageBody::StorageAdminBody.
+// -----------------------------------------------------------------------------
+
+#[wasm_bindgen(js_name = encodeStorageOverviewRequest)]
+pub fn encode_storage_overview_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::StorageAdminBody(
+        tentaflow_protocol::StorageAdminPayload::OverviewRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeStorageBrowseRequest)]
+pub fn encode_storage_browse_request(path: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::StorageAdminBody(
+        tentaflow_protocol::StorageAdminPayload::BrowseRequest(
+            tentaflow_protocol::StorageBrowseRequest { path },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeStorageCreateDirRequest)]
+pub fn encode_storage_create_dir_request(
+    parent: String,
+    name: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::StorageAdminBody(
+        tentaflow_protocol::StorageAdminPayload::CreateDirRequest(
+            tentaflow_protocol::StorageCreateDirRequest { parent, name },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeStorageMigrateRequest)]
+pub fn encode_storage_migrate_request(
+    key: String,
+    new_path: String,
+    move_data: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::StorageAdminBody(
+        tentaflow_protocol::StorageAdminPayload::MigrateRequest(
+            tentaflow_protocol::StorageMigrateRequest {
+                key,
+                new_path,
+                move_data,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioVisionModelDeleteRequest)]
 pub fn encode_ml_studio_vision_model_delete_request(
     model_name: String,
@@ -9286,8 +9339,94 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             }
         }
         MessageBody::RobotsBody(payload) => decode_robots_payload(&obj, payload),
+        MessageBody::StorageAdminBody(payload) => decode_storage_admin_payload(&obj, payload),
     }
     Ok(obj.into())
+}
+
+/// Dekoduje `StorageAdminPayload` (Ustawienia → Magazyn danych). Tylko *Response
+/// warianty realnie wracają do GUI; *Request istnieją dla wyczerpania match.
+fn decode_storage_admin_payload(
+    obj: &js_sys::Object,
+    payload: tentaflow_protocol::StorageAdminPayload,
+) {
+    use tentaflow_protocol::StorageAdminPayload as P;
+    match payload {
+        P::OverviewResponse(resp) => {
+            set(obj, "variant", "StorageOverviewResponse".into());
+            let arr = js_sys::Array::new();
+            for c in resp.categories {
+                let it = js_sys::Object::new();
+                set(&it, "key", c.key.into());
+                set(&it, "path", c.path.into());
+                set(&it, "defaultPath", c.default_path.clone().into());
+                set(&it, "default_path", c.default_path.into());
+                set(&it, "overridden", c.overridden.into());
+                set(&it, "sizeBytes", (c.size_bytes as f64).into());
+                set(&it, "size_bytes", (c.size_bytes as f64).into());
+                set(&it, "liveMigratable", c.live_migratable.into());
+                set(&it, "live_migratable", c.live_migratable.into());
+                match c.pending_path {
+                    Some(p) => {
+                        set(&it, "pendingPath", p.clone().into());
+                        set(&it, "pending_path", p.into());
+                    }
+                    None => {
+                        set(&it, "pendingPath", JsValue::NULL);
+                        set(&it, "pending_path", JsValue::NULL);
+                    }
+                }
+                arr.push(&it.into());
+            }
+            set(obj, "categories", arr.into());
+            set(obj, "root", resp.root.into());
+            set(obj, "diskTotalBytes", (resp.disk_total_bytes as f64).into());
+            set(obj, "disk_total_bytes", (resp.disk_total_bytes as f64).into());
+            set(obj, "diskAvailableBytes", (resp.disk_available_bytes as f64).into());
+            set(obj, "disk_available_bytes", (resp.disk_available_bytes as f64).into());
+        }
+        P::BrowseResponse(resp) => {
+            set(obj, "variant", "StorageBrowseResponse".into());
+            set(obj, "path", resp.path.into());
+            let arr = js_sys::Array::new();
+            for e in resp.entries {
+                let it = js_sys::Object::new();
+                set(&it, "name", e.name.into());
+                set(&it, "path", e.path.into());
+                set(&it, "hasChildren", e.has_children.into());
+                set(&it, "has_children", e.has_children.into());
+                set(&it, "writable", e.writable.into());
+                arr.push(&it.into());
+            }
+            set(obj, "entries", arr.into());
+            set(obj, "freeBytes", (resp.free_bytes as f64).into());
+            set(obj, "free_bytes", (resp.free_bytes as f64).into());
+            set(obj, "totalBytes", (resp.total_bytes as f64).into());
+            set(obj, "total_bytes", (resp.total_bytes as f64).into());
+        }
+        P::CreateDirResponse(resp) => {
+            set(obj, "variant", "StorageCreateDirResponse".into());
+            set(obj, "path", resp.path.into());
+        }
+        P::MigrateResponse(resp) => {
+            set(obj, "variant", "StorageMigrateResponse".into());
+            set(obj, "mode", resp.mode.into());
+            match resp.job_id {
+                Some(j) => {
+                    set(obj, "jobId", j.clone().into());
+                    set(obj, "job_id", j.into());
+                }
+                None => {
+                    set(obj, "jobId", JsValue::NULL);
+                    set(obj, "job_id", JsValue::NULL);
+                }
+            }
+        }
+        P::OverviewRequest => set(obj, "variant", "StorageOverviewRequest".into()),
+        P::BrowseRequest(_) => set(obj, "variant", "StorageBrowseRequest".into()),
+        P::CreateDirRequest(_) => set(obj, "variant", "StorageCreateDirRequest".into()),
+        P::MigrateRequest(_) => set(obj, "variant", "StorageMigrateRequest".into()),
+    }
 }
 
 fn robot_entry_to_js(r: &tentaflow_protocol::RobotEntry) -> js_sys::Object {
