@@ -10,7 +10,7 @@ najtrudniejszy RDZEŃ jednokartowy (kernele, silnik, KV, batching, kwantyzacja)
 
 Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
-Ostatnia aktualizacja: 2026-07-18.
+Ostatnia aktualizacja: 2026-07-19.
 
 ---
 
@@ -38,6 +38,15 @@ Ostatnia aktualizacja: 2026-07-18.
     occupancy GEMM, nie staging X. Głębsze próby (cp.async X, BN=128) świadomie
     odłożone (wysokie ryzyko regresji, niski zysk wg profilu) — szczegóły
     w `kernels/mojo/MOJO_NOTES.md`.
+  - ℹ️ **Profil prefill (2026-07-19, nsys RTX 4090): compute-bound, brak narzutu
+    launchy.** Suma czasu GPU kerneli = 1433.5 ms vs wall 1436 ms przy P=4096
+    (luka 0.17 %; 0.8 % przy P=512) → **CUDA-graphing prefillu nic nie daje**
+    (GPU nie głoduje, ~768 launchy queue'owane szybciej niż drenowane). Podbicie
+    occupancy i8mma przez `.maxnreg 85` (2→3 CTA/SM) **regresuje** (4096: 2800→~2400
+    tok/s — kernel jest mma-issue/ILP-bound, nie occupancy-bound). Szersze chunki
+    (1024→2048) = neutralne. Nic nie wdrożono. Realna praca na lukę 4.3×: Q6_K
+    down-proj przez int8-mma (~+5 %), redukcja `barrier()` per 32 kol, fused
+    flash-attn prefill / megakernel (przyszłe pasy) — `docs/BENCH_COMPARISON.md`.
 - ✅ **Silnik LLM**: forward, paged KV, fused decode chain, batched continuous
   decode (36× throughput), chunked prefill, admission control, CUDA-graph per bucket
 - ✅ **Drabinka kwantyzacji KV**: f16 → fp8 → rot4 → rot3 (TurboQuant)

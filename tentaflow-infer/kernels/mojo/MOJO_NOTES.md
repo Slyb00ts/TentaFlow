@@ -162,6 +162,18 @@ Published tutorials mostly show pre-1.0 syntax — trust these notes over old do
     Both deprioritized: high regression risk on a proven kernel, low expected
     payoff given the profile. The lever for the 4.5x is raising mma-issue
     efficiency / occupancy (register pressure, warp scheduling), not X staging.
+  - **Occupancy via `.maxnreg` REGRESSES — do not retry (measured 2026-07-19).**
+    `gemm_q4_k_i8mma` (bm128) = 126 regs → 2 CTAs/SM; `gemm_q8_0_i8mma` = 100 regs
+    → 2 CTAs/SM. `.maxnreg 85` (ptxas-verified) lifts both to 3 CTAs/SM (q8_0
+    spill-free, q4_k 64 B spill), but Mistral 4096 prefill drops 2800 → ~2400 tok/s.
+    The kernel hides ld_matrix + f32-scale-epilogue + mma-issue latency with
+    per-thread ILP at 2 CTAs/SM; fewer regs kill that ILP. So it is mma-issue/ILP
+    bound, NOT occupancy bound — more CTAs/SM is counter-productive. nsys also
+    confirmed the whole prefill is compute-bound (kernel GPU time = 99.8% of wall
+    at P=4096), so CUDA-graphing the prefill and widening the chunk are both
+    no-ops. The remaining real levers: (a) Q6_K down-proj via int8-mma (`FMT==2`;
+    care: Q6_K has 16-wide scale sub-blocks vs mma k=32 → two scales per stage),
+    (b) fewer `barrier()` (2 k-stages/barrier), (c) fused/persistent prefill.
 
 ## FP8 (e4m3) — verified on sm_89
 - `DType.float8_e4m3fn` works end-to-end: buffers, kernel pointers, and

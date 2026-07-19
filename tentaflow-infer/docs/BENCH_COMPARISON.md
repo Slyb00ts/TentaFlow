@@ -233,3 +233,62 @@ from Mojo via inline PTX, but Mojo's `inlined_assembly` cannot marshal its 4×s3
 `SIMD[int32,4]` captures only the first register, `Tuple` is rejected). Closing the prefill
 gap needs either that Mojo capability or fused flash-attention prefill — not a dp4a GEMM.
 See `kernels/mojo/MOJO_NOTES.md`.
+
+## Prefill gap investigation — 2026-07-19 (compute-bound, no launch overhead)
+
+Attacked the ~4.3x Mistral-7B Q4_K prefill gap vs llama.cpp assuming launch/graphing
+overhead was a big slice (prefill is NOT CUDA-graphed, ~768 eager launches at 4096).
+**nsys disproved that premise:** prefill is compute-bound at every size, so graphing
+and chunk-widening buy nothing, and the register-cap occupancy lever regressed.
+
+**1. Launch/gap overhead is negligible (nsys, RTX 4090, `bench --prompt-tokens P --tokens 2`):**
+
+```
+P=4096:  sum of GPU kernel time 1433.5 ms   vs   prefill wall 1436 ms   →  gap 2.5 ms (0.17%)
+P=512:   sum of GPU kernel time  210.3 ms   vs   prefill wall  212 ms   →  gap 1.7 ms (0.8%)
+```
+
+The GPU never starves — the CPU queues the ~768 eager launches faster than the GPU drains
+them, so a captured CUDA graph would replay the SAME kernels back-to-back with ~0 headroom.
+**Prefill graphing was NOT shipped: it cannot beat a <0.2% gap.** (Decode stays graphed;
+that path is latency-bound and benefits.)
+
+Per-kernel split at P=4096 (`cuda_gpu_kern_sum`): i8mma GEMM 62% (qkv/o/gate/up, 768 launches),
+attn_prefill 22% (grows O(T·ctx)), Q6_K f16 GEMM 10% (down-proj), silu/quant/norm/rope ~6%.
+The i8mma GEMM runs at ~46 INT8-TOPS ≈ 25% of the ~184-TOPS practical ceiling.
+
+**2. i8mma occupancy is NOT the limiter — capping registers regressed.** `gemm_q4_k_i8mma`
+(bm128, 256 thr) uses 126 regs → 2 CTAs/SM (33% occ); `gemm_q8_0_i8mma` 100 regs → 2 CTAs/SM.
+Injecting `.maxnreg 85` (verified via `ptxas -v`) lifts both to 3 CTAs/SM (50% occ, q8_0
+spill-free, q4_k 64 B spill). Measured Mistral 4096 prefill: **2800 → ~2400 tok/s (REGRESSION)**.
+The kernel hides mma-issue/ld_matrix/f32-epilogue latency via per-thread ILP at 2 CTAs/SM;
+cutting registers removed that ILP and spilled. Reverted. The GEMM is mma-issue/ILP bound,
+not occupancy bound — confirming `MOJO_NOTES.md`.
+
+**3. Widening `MAX_PREFILL_CHUNK` 1024→2048 is neutral** (compute-bound → fewer launches
+can't help): Mistral 4096 2800→~2815 tok/s, 8192 2340→~2380 tok/s (both within run-to-run
+noise), at 2x prefill-scratch VRAM. Not kept.
+
+**Net: nothing shipped this pass — every prescribed lever (graph / chunk / occupancy) is a
+no-op or regression because the profile is compute-bound and the GEMM is already ILP-tuned.**
+Baseline prefill (`--prefix-cache off`, RTX 4090) unchanged:
+
+| shape (P/T)            | FORGE prefill tok/s | llama.cpp | ratio |
+|------------------------|--------------------:|----------:|------:|
+| Mistral-7B Q4_K 512/128   | ~2565 | ~12064 | 4.7x |
+| Mistral-7B Q4_K 4096/2048 | ~2800 | ~12064 | 4.3x |
+| Mistral-7B Q4_K 8192/1024 | ~2350 | ~11000 | 4.7x |
+| Qwen3-0.6B Q8_0 4096/512  | ~19500 | — | — |
+
+Decode unchanged: Mistral ~146 tok/s, Qwen Q8_0 ~497 tok/s; Bielik NVFP4 golden bit-exact
+on 1 and 4 lanes.
+
+**What actually remains (real GEMM microarch work, all higher-risk / future passes):**
+- **Route the Q6_K down-proj through int8-mma** (currently the slow f16 tensor GEMM, 10% of
+  prefill). Halving it ≈ +5% end-to-end. New `FMT==2` in `gemm_i8mma_impl`; the wrinkle is
+  Q6_K's 16-wide scale sub-blocks vs the mma's k=32 (two scales per mma stage) — needs a
+  split-scale epilogue, so it is not a trivial clone of the Q4_K path.
+- **Cut the per-32-col `barrier()`** (K=14336 → 448 barriers/GEMM): triple-buffer or unroll
+  two k-stages per barrier to keep the tensor pipe busier. Medium risk, needs bit-exact reval.
+- **Fused flash-attention-style prefill** and/or **persistent single-megakernel** — the real
+  llama.cpp-parity path, explicitly out of scope for a low-risk pass.
