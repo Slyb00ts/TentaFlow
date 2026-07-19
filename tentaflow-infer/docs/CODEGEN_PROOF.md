@@ -134,14 +134,77 @@ register-tile scheduling) — but that is upstream-Modular, not in FORGE's contr
 
 ---
 
+## Experiment 5 — force the deep K-unroll in Mojo, measure whether it closes the gap
+
+Exp 3 concluded the gap is pipeline depth and asserted "the Mojo backend will not unroll the
+K-loop deeply." Exp 5 tests that assertion directly by *forcing* the deep unroll and measuring
+both the SASS and the TOPS. Added `gemm_i8mma_deep[BM,BN,NW,FMT,KU,NBUF]` (scratch, reverted):
+each smem buffer holds `KU` consecutive 32-col blocks and the inner mma is **`comptime for`-
+unrolled across all KU sub-blocks**, so `KU × (MT×NT) = KU×8` IMMA emit in ONE straight-line
+body. `NBUF=2` keeps the committed double-buffered stage-ahead pipeline; `NBUF=1` single-buffers
+to fit a deeper KU under the static-smem cap. Bit-identical to committed (integer mma is exact;
+same per-32-block accumulation order) — verified per-element for Q4_K **and** Q8_0.
+
+**SASS (ptxas 13.3, sm_89, `cuobjdump -sass`, IMMA-per-body):**
+
+| variant | KU | NBUF | IMMA/body | BRA | BSSY/BSYNC | regs | spill | smem |
+|---------|----|----|-----------|-----|-----------|------|-------|------|
+| committed `_big` | 1 | 2 | **8**  | 23 | 32 | 127 | 0 | 20 KB |
+| `deep2`          | 2 | 2 | **16** | 26 | 40 | 118 | 0 | 40 KB |
+| `deep4`          | 4 | 1 | **32** | 22 | 38 | 104 | 0 | 40 KB |
+| `deep8` (128×128)| 8 | 1 | — | — | — | — | — | **ptxas REJECTS: 0x14000 (80 KB) > 0xc000 (48 KB) static cap** |
+
+**→ Mojo HONORS the deep comptime unroll.** IMMA/body scales *exactly* 8→16→32 with KU=1/2/4;
+BRA does not grow (23→26→**22**), BSSY/BSYNC barely moves, zero spill even at 104 regs. The
+`comptime for` is emitted as straight-line IMMA — **Exp 3's claim that the backend "will not
+unroll the K-loop deeply" is REFUTED at the source level.** The rolled 8-IMMA body of the
+committed kernel is a *consequence of the single-32-col-block-per-buffer smem tiling*, not a
+backend refusal to unroll.
+
+**BUT the deep window does NOT close the gap.** Isolated Q4_K TOPS (RTX 4090, `_big` / deep2 /
+deep4), 3-rep steady state:
+
+| N | K | T | big (8) | deep2 (16) | deep4 (32) |
+|---|---|---|---------|-----------|-----------|
+| 14336 | 4096 | 512  | 62.1 | 63.6 | 60.6 |
+| 4096  | 14336| 512  | 62.4 | 64.2 | **67.4** |
+| 14336 | 4096 | 2048 | 65.9 | 65.8 | 66.0 |
+| 4096  | 14336| 2048 | 65.5 | 66.3 | **68.0** |
+
+4× the IMMA window (8→32/body) moves TOPS by **≤ +8 %** (best: the K-heavy down-proj) and
+**−2 %** on the K-light gate/up — still ~66 TOPS vs nvcc's **208**. The pipeline-depth thesis
+predicted ~3.5×; the measured effect of quadrupling the window is single-digit-percent and
+shape-dependent. **The 3.5× gap is therefore NOT pipeline/window depth.** Consistent with the
+prior finding (MOJO_NOTES) that TOPS is immune to barrier/epilogue/ldmatrix cuts: this kernel
+sits at a ~66-TOPS throughput WALL that the scheduling-window depth does not move.
+
+Why nvcc still wins with 256 IMMA/body: it reaches that depth via **dynamic** shared memory
+(Exp 3: "static smem 0 (dynamic)"). Mojo's `stack_allocation` is *static* — hard-capped at
+48 KB — so a BM=BN=128 tile can hold at most KU=4 (32 IMMA/body); KU=8 needs 80 KB and ptxas
+rejects it. But the 8→32 trend (+≤8 %) shows that even if dynamic smem let Mojo reach KU=32
+(256 IMMA/body), it would not approach 208 TOPS. nvcc's advantage is not the window count per
+se; it is whatever lets ptxas schedule LDSM/LDS and IMMA to co-issue at ~92 % of the mma
+ceiling inside that window — a scheduler property Exp 5 could not reproduce by source shape.
+
+**Verdict:** (A) Mojo **CAN** be forced to deep-unroll — proven by SASS (8→16→32 IMMA/body,
+`comptime for` honored, no re-roll). (B) The deep window is **NOT** the lever for the 3.5× gap —
+forcing it yields ≤8 %, not 3.5×; the gap is a ptxas-vs-Mojo instruction-scheduling wall, not
+loop-rolling. All Exp-5 code reverted; committed `_big` kernel retained (nothing cleared the
+large-win bar, and deep4 regresses K-light shapes + single-buffers below 2 CTAs/SM).
+
+---
+
 ## Bottom line
 
 - **Exp 1:** pure IMMA issue identical (724 TOPS both). Mojo mma issue is NOT weaker. REFUTED.
 - **Exp 2:** same MMQ algorithm — nvcc **216** vs Mojo **61** TOPS (3.5×). **PROVEN: Mojo backend
   codegen is the blocker.**
-- **Exp 3:** cause = pipeline depth. nvcc deep-unrolls the K-loop (256 IMMA/body, 255 regs,
-  stream-K); Mojo rolls it (8 IMMA/body, 23 back-edges) so the tensor pipe drains each trip. Same
-  per-instruction SASS quality, ~32× smaller scheduling window.
+- **Exp 3:** *proposed* cause = pipeline depth (nvcc 256 IMMA/body vs Mojo 8). SASS observation
+  correct, but the *causal* claim is **overturned by Exp 5**.
 - **Exp 4:** an nvcc cubin drops into the existing cudarc load/launch path unchanged; projects
   ~7200 tok/s pp4096 (2.37×), still 1.67× behind llama.cpp (the rest is fusion). Cost: a .cu tree
   + nvcc in the build + per-arch cubins, and it breaks the 100%-Mojo principle for one kernel.
+- **Exp 5:** Mojo CAN deep-unroll (SASS: 8→16→32 IMMA/body, `comptime for` honored). Forcing the
+  deep window closes **≤8 %** of the gap, not 3.5× → **pipeline depth is NOT the root cause**; the
+  gap is a ptxas instruction-scheduling advantage Mojo's backend does not match. Static-smem cap
+  (48 KB) blocks KU≥8 at BM=BN=128; nvcc reaches 256 IMMA/body via dynamic smem. Reverted.

@@ -488,3 +488,44 @@ untried levers both carry the same register-pressure wall that already blocks BN
 **stream-K** (needs a global fixup/reduction buffer + atomics, a real kernel+launcher rewrite)
 and a Mojo-compiler improvement to the mma/LDS dual-issue schedule (outside our control). Both
 are out of scope for a low-risk pass and neither is guaranteed to close a 36%→92% backend gap.
+
+---
+
+## 2026-07-19 — Deep comptime K-unroll (forcing nvcc's straight-line window) — Mojo unrolls, no win
+
+Follow-up to `docs/CODEGEN_PROOF.md`, which pinned the gap on Mojo emitting a ROLLED K-loop
+(8 IMMA/body) vs nvcc's deep-unrolled 256 IMMA/body and asserted Mojo "will not unroll the
+K-loop deeply." Tested that assertion head-on: `gemm_i8mma_deep[BM,BN,NW,FMT,KU,NBUF]` (scratch,
+reverted) holds `KU` consecutive 32-col blocks per smem buffer and `comptime for`-unrolls the
+inner mma across all KU → `KU×8` IMMA in one straight-line body.
+
+**SASS (`cuobjdump -sass`, IMMA-per-body, ptxas 13.3 sm_89):**
+
+| variant | KU | IMMA/body | BRA | BSSY/BSYNC | regs | spill | smem |
+|---------|----|-----------|-----|-----------|------|-------|------|
+| committed `_big` | 1 | **8**  | 23 | 32 | 127 | 0 | 20 KB |
+| deep2 (NBUF=2)   | 2 | **16** | 26 | 40 | 118 | 0 | 40 KB |
+| deep4 (NBUF=1)   | 4 | **32** | 22 | 38 | 104 | 0 | 40 KB |
+| deep8 (128×128)  | 8 | — ptxas REJECTS: `0x14000` (80 KB) > `0xc000` (48 KB static cap) |
+
+**Mojo HONORS the unroll** — IMMA/body scales exactly 8→16→32, BRA does not grow, 0 spill. The
+proof's "backend won't unroll" claim is refuted; the rolled 8-IMMA body is a consequence of the
+1-block-per-buffer smem tiling.
+
+**But it does not pay** (Q4_K TOPS, RTX 4090, 3-rep steady state, big / deep2 / deep4):
+
+| N | K | T | big (8) | deep2 (16) | deep4 (32) |
+|---|---|---|---------|-----------|-----------|
+| 14336 | 4096 | 512  | 62.1 | 63.6 | 60.6 |
+| 4096  | 14336| 512  | 62.4 | 64.2 | **67.4** |
+| 14336 | 4096 | 2048 | 65.9 | 65.8 | 66.0 |
+| 4096  | 14336| 2048 | 65.5 | 66.3 | **68.0** |
+
+4× the IMMA window buys **≤ +8 %** (best case: K-heavy down-proj) and **−2 %** on K-light
+gate/up — not the 3.5× the pipeline-depth thesis predicted; still ~66 TOPS vs nvcc 208. deep2 and
+deep4 are **bit-identical** to the committed kernel (Q4_K + Q8_0, integer mma exact). This is the
+final nail: the gap is a ptxas LDS/IMMA co-issue *scheduling* advantage, not loop-rolling or
+window depth. The 48 KB static-`stack_allocation` cap blocks KU≥8 at BM=BN=128 (nvcc reaches 256
+IMMA/body via dynamic smem), but the 8→32 trend shows even that wouldn't reach 208. **Reverted;
+committed `_big` kernel retained** (no large win, and deep4 single-buffers below 2 CTAs/SM — the
+documented 512-prefill occupancy tripwire).

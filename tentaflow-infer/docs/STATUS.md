@@ -91,6 +91,24 @@ Ostatnia aktualizacja: 2026-07-19.
     (decode 146–175); Qwen Q8_0 4096 **19493**; llama.cpp pp4096 **12018** →
     **~4.0× za**. Nietknięte levery (oba za ścianą rejestrów / poza nami): stream-K
     i poprawka schedulera mma/LDS w kompilatorze Mojo.
+  - ℹ️ **Głęboki comptime K-unroll SPRAWDZONY: Mojo unrolluje, ale to NIE jest lever
+    (2026-07-19, `docs/CODEGEN_PROOF.md` Exp 5).** Dowód codegen obwiniał lukę 3.5×
+    o ZWINIĘTĄ pętlę K Mojo (8 IMMA/ciało) vs 256 IMMA/ciało u nvcc. Test wprost:
+    `gemm_i8mma_deep[...,KU,NBUF]` trzyma KU kolejnych bloków 32-kol w buforze smem
+    i `comptime for`-unrolluje mma po wszystkich KU → KU×8 IMMA liniowo. **SASS
+    dowodzi, że Mojo TO ROBI** (`cuobjdump -sass`, IMMA/ciało): KU=1→**8**, KU=2→**16**,
+    KU=4→**32**, dokładnie liniowo; BRA nie rośnie (23→26→22), 0 spill przy 104 rej.
+    Czyli 8-IMMA ciało skomitowanego kernela wynika z kafla smem (1 blok/bufor), a
+    NIE z odmowy unrollowania (obala tezę dowodu). **Ale TOPS ledwie drgają:** Q4_K
+    RTX 4090 big(8)/deep2(16)/deep4(32): down-proj N=4096 K=14336 T=2048 65.5/66.3/
+    **68.0** (+3.8 %), T=512 62.4/64.2/**67.4** (+8 %); gate/up N=14336 K=4096 płasko
+    do −2 %. 4× okno = ≤+8 % (max), ujemnie na kształtach K-lekkich — nie 3.5×.
+    Wciąż ~66 TOPS vs nvcc 208. **Okno pipeline'u NIE jest wąskim gardłem; luka to
+    przewaga schedulera ptxas w co-issue LDS/IMMA, której Mojo nie dorównuje.** Sufit:
+    KU=8 przy BM=BN=128 wymaga 80 KB smem, ptxas odrzuca (`0x14000 > 0xc000` — statyczne
+    `stack_allocation` limit 48 KB); nvcc sięga 256 IMMA/ciało przez DYNAMICZNY smem.
+    deep2/deep4 bit-w-bit == skomitowany (Q4_K + Q8_0). Wszystko cofnięte, kernel
+    `_big` zachowany.
 - ✅ **Silnik LLM**: forward, paged KV, fused decode chain, batched continuous
   decode (36× throughput), chunked prefill, admission control, CUDA-graph per bucket
 - ✅ **Drabinka kwantyzacji KV**: f16 → fp8 → rot4 → rot3 (TurboQuant)

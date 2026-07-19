@@ -261,6 +261,28 @@ Published tutorials mostly show pre-1.0 syntax — trust these notes over old do
     both hit the same register wall or are outside our control: stream-K (global
     fixup+atomics, kernel+launcher rewrite) and a Mojo compiler mma/LDS dual-issue
     scheduling fix.
+  - **Deep comptime K-unroll TESTED — Mojo unrolls, but it is NOT the lever
+    (2026-07-19, `docs/CODEGEN_PROOF.md` Exp 5).** The codegen proof blamed the
+    3.5× gap on Mojo emitting a ROLLED K-loop (8 IMMA/body) vs nvcc's deep-
+    unrolled 256 IMMA/body. Tested directly: `gemm_i8mma_deep[...,KU,NBUF]` holds
+    KU consecutive 32-col blocks per smem buffer and `comptime for`-unrolls the
+    inner mma across all KU, so KU×8 IMMA emit straight-line. **SASS proves Mojo
+    HONORS it** (`cuobjdump -sass` IMMA/body): KU=1→**8**, KU=2→**16**, KU=4→**32**,
+    exactly linear; BRA does NOT grow (23→26→22), 0 spill at 104 regs. So the
+    committed 8-IMMA body is a consequence of the 1-block-per-buffer smem tiling,
+    NOT a backend refusal to unroll (refutes the proof's implied claim). **But
+    TOPS barely moves:** Q4_K RTX 4090, big(8)/deep2(16)/deep4(32): down-proj
+    N=4096 K=14336 T=2048 65.5/66.3/**68.0** (+3.8 %), T=512 62.4/64.2/**67.4**
+    (+8 %); gate/up N=14336 K=4096 flat-to-−2 % (deep4 60.6 vs big 62.1). 4× the
+    window = ≤+8 % (best) and negative on K-light shapes — not the 3.5× predicted.
+    Still ~66 TOPS vs nvcc 208. **The deep window is not the bottleneck; the gap is
+    a ptxas LDS/IMMA co-issue scheduling advantage Mojo does not match.** Ceiling:
+    KU=8 at BM=BN=128 needs 80 KB smem, ptxas rejects (`0x14000 > 0xc000` — static
+    `stack_allocation` is capped at 48 KB); nvcc reaches 256 IMMA/body via DYNAMIC
+    smem. deep2/deep4 are bit-identical to committed (Q4_K + Q8_0, integer mma
+    exact). All reverted; committed `_big` kept (no large win + deep4 single-buffers
+    below 2 CTAs/SM, the documented 512-prefill occupancy tripwire). **Do not retry
+    deep K-unroll for perf** — Mojo emits it faithfully, it just doesn't pay.
 
 ## FP8 (e4m3) — verified on sm_89
 - `DType.float8_e4m3fn` works end-to-end: buffers, kernel pointers, and
