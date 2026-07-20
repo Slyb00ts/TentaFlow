@@ -3,6 +3,8 @@
   "kernels": {
     "rmsnorm_f16": {"file": "rmsnorm_f16.ptx", "entry": "src_norm_rmsnorm_f16_Pointer6A6A6A6AoA6A6A_5569fdb15c9ef2c8"},
     "rmsnorm_residual_f16": {"file": "rmsnorm_residual_f16.ptx", "entry": "src_norm_rmsnorm_residual_f166A6A6A6AoA_7176c57e30c03d69"},
+    "rmsnorm_fp8": {"file": "rmsnorm_fp8.ptx", "entry": "src_norm_rmsnorm_fp8_Pointer6A6A6A6AoA6A6A_5b98809ca13cc885"},
+    "rmsnorm_residual_fp8": {"file": "rmsnorm_residual_fp8.ptx", "entry": "src_norm_rmsnorm_residual_fp86A6A6A6AoA_419ae6be042e80ff"},
     "silu_mul_f16": {"file": "silu_mul_f16.ptx", "entry": "src_activation_silu_mul_f166A6A6A6AoA6A6A_8f3bfdaf2463f415"},
     "sigmoid_mul_f16": {"file": "sigmoid_mul_f16.ptx", "entry": "src_activation_sigmoid_mul_f166A6A6A6A_9afc07da084f689c"},
     "deinterleave_gate_f16": {"file": "deinterleave_gate_f16.ptx", "entry": "src_activation_deinterleave_ga6A6A6A6A_47408ab3bfce54f0"},

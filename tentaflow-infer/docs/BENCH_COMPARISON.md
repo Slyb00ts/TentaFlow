@@ -1421,17 +1421,25 @@ CUDA MMQ (208). Correct: raw max_rel_err 0.0; f16-scale epilogue 4.2e-4 (f16 rou
 hand `fp8` path). Coherence PASS (Paris / Tokyo / oxygen). NVFP4 Bielik golden bit-exact (default
 untouched).
 
-**E2E prefill tok/s (both warm — the 4090's cold first launch is throttled ~2×):**
+**E2E prefill tok/s — measured TRULY warm** (`forge bench --reps N`, in-process best-of reps 2..N;
+rep 1 is the cold 210-MHz launch and is discarded). The earlier table (separate `forge bench`
+launches per rep) never reached steady state and is superseded:
 
-| shape (pp/dec) | default (CUDA MMQ) | fp8mod | fp8mod vs default | llama.cpp |
-|----------------|--------------------|--------|-------------------|-----------|
-| 512 / 128   | 6909 (best-of-5) | 2920 (best-of-3) | 0.42× | — |
-| 4096 / 2048 | 8549 (best-of-5) | 8101 (best-of-3) | 0.95× | 11991 |
-| 8192 / 1024 | 8130 (best-of-5) | 7640 (best-of-2) | 0.94× | — |
+| shape (pp/dec) | default (CUDA MMQ) | fp8mod PRE-fusion | fp8mod POST-fusion | post vs default | llama.cpp |
+|----------------|--------------------|-------------------|--------------------|-----------------|-----------|
+| 512 / 128   | 13289 | ~13.3k (floor) | 13252 | ~1.00× (launch-bound tie) | — |
+| 4096 / 2048 | 11050 | 11792 | **12036** | **1.089×** | 11991 |
+| 8192 / 1024 | 9029 | 9474 | **9633** | **1.067×** | — |
 
-Decode unchanged (separate gemv path). **fp8mod does not beat the CUDA MMQ default e2e on Ada at
-any shape** — the isolated 1.4× GEMM win is lost to the `fp8mod` path re-quantizing the activation
-per projection (q/k/v ×3, gate/up ×2), where the MMQ default fuses the quant into the RMSNorm and
-shares it across projections. Keep `fp8mod` behind the flag; the ADR-0001 CUDA MMQ exception stays
-justified on Ada. Follow-up to unlock the e2e win: split the activation quant out and share it
-(fuse into RMSNorm, mirroring `rmsnorm_q8_1_ds4`).
+**fp8mod POST-fusion now BEATS the CUDA MMQ default warm** (+8.9 % @4096, +6.7 % @8192, tie @512),
+after fusing the fp8 activation quant into the RMSNorm (`rmsnorm_fp8` / `rmsnorm_residual_fp8`,
+mirroring the MMQ `rmsnorm_q8_1_ds4`): q/k/v share ONE quantized activation, gate/up share one.
+nsys confirms per-projection `quantize_act_fp8` launches dropped **1792 → 512** (only o-proj +
+down self-quant remain). The fusion adds +1.7–2.1 % over pre-fusion fp8mod; pre-fusion already
+beat the default *warm*, so the old "0.94×" was a cold-measurement artifact (rep-1 cold fp8mod
+@4096 = 8072 vs default 8507 = 0.949×, reproducing it). fp8mod @4096 = 12036 now matches/edges
+llama.cpp (11991). Decode never regresses (separate gemv path: 146.0/130.5/175.3 identical).
+**The ADR-0001 CUDA-MMQ exception is retired on merit** (a 100 %-Mojo GEMM now wins warm on Ada);
+`fp8mod` promoted to an e2e-win opt-in for latency-insensitive serving (kept non-default only for
+the ~120 s load-time requant + extra e4m3 VRAM + cold-start). Full detail: `CODEGEN_PROOF.md`
+Finding I.

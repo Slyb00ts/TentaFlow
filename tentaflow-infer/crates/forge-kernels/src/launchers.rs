@@ -2639,6 +2639,161 @@ impl Kernels {
         self.device.launch(gk, &cfg, &args, stream)
     }
 
+    /// Grow the shared fp8 activation scratch to hold `n_tokens × cols` e4m3
+    /// codes + `n_tokens` f32 scales. Called by the fused rmsnorm→fp8 path
+    /// (which fills it) and the prequant GEMM (which reads it).
+    fn fp8_act_ensure(&self, need_codes: usize, n_tokens: usize) -> Result<()> {
+        let mut sc = self.fp8_act.lock().expect("fp8 act scratch poisoned");
+        if sc.cap_codes < need_codes {
+            sc.xq = Some(
+                self.device
+                    .alloc(need_codes, MemKind::Device, Pool::Activations)?,
+            );
+            sc.cap_codes = need_codes;
+        }
+        if sc.cap_tokens < n_tokens {
+            sc.xs = Some(
+                self.device
+                    .alloc(n_tokens * 4, MemKind::Device, Pool::Activations)?,
+            );
+            sc.cap_tokens = n_tokens;
+        }
+        Ok(())
+    }
+
+    /// Fused RMSNorm → shared fp8 activation: writes the f16 normed row to
+    /// `out_f16` AND the per-token e4m3 codes + f32 scale into the shared fp8
+    /// activation scratch, so the following q/k/v (or gate/up) projections read
+    /// ONE quantized activation via `gemm_fp8_modular_prequant` instead of
+    /// re-quantizing per projection. Mirrors `rmsnorm_q8_1_ds4` for the fp8mod
+    /// path. `cols` is the hidden size (the projection K).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_fp8_shared(
+        &self,
+        out_f16: &DevBuffer,
+        x: &DevBuffer,
+        weight: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.fp8_act_ensure(rows * cols, rows)?;
+        let sc = self.fp8_act.lock().expect("fp8 act scratch poisoned");
+        let xq = sc.xq.as_ref().expect("xq allocated");
+        let xs = sc.xs.as_ref().expect("xs allocated");
+        let k = self.artifacts.get("rmsnorm_fp8")?;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out_f16)
+            .buf(xq)
+            .buf(xs)
+            .buf(x)
+            .buf(weight)
+            .scalar(cols as i64)
+            .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused residual-add + RMSNorm → shared fp8 activation: `residual_io += x`,
+    /// normed row to `out_f16`, shared per-token e4m3 codes + scale to scratch.
+    /// See `rmsnorm_fp8_shared`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_residual_fp8_shared(
+        &self,
+        out_f16: &DevBuffer,
+        residual_io: &DevBuffer,
+        x: &DevBuffer,
+        weight: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.fp8_act_ensure(rows * cols, rows)?;
+        let sc = self.fp8_act.lock().expect("fp8 act scratch poisoned");
+        let xq = sc.xq.as_ref().expect("xq allocated");
+        let xs = sc.xs.as_ref().expect("xs allocated");
+        let k = self.artifacts.get("rmsnorm_residual_fp8")?;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out_f16)
+            .buf(xq)
+            .buf(xs)
+            .buf(residual_io)
+            .buf(x)
+            .buf(weight)
+            .scalar(cols as i64)
+            .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Modular multistage fp8 GEMM over an EXTERNALLY prequantized activation:
+    /// reads the shared fp8 activation scratch (`xq`/`xs`) that the preceding
+    /// fused rmsnorm→fp8 emitted — NO per-projection quantize pass. `cols` (the
+    /// projection K) must match the fused norm's hidden size that filled the
+    /// scratch. Otherwise identical to `gemm_fp8_modular`. (`FORGE_GEMM=fp8mod`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_modular_prequant(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        wscales: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(64) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_fp8_modular_prequant requires cols % 64 == 0, got {cols}"
+            )));
+        }
+        let gk = self
+            .artifacts
+            .get(&format!("gemm_fp8_mod_{rows}_{cols}"))
+            .map_err(|_| {
+                ForgeError::Kernel(format!(
+                    "gemm_fp8_modular_prequant: no committed Modular fp8 kernel for \
+                     (rows={rows}, cols={cols}); build one in gemm_fp8_modular.mojo"
+                ))
+            })?;
+        let sc = self.fp8_act.lock().expect("fp8 act scratch poisoned");
+        if sc.cap_codes < n_tokens * cols || sc.cap_tokens < n_tokens {
+            return Err(ForgeError::Kernel(
+                "gemm_fp8_modular_prequant: shared fp8 activation scratch not sized \
+                 by a preceding rmsnorm_fp8_shared".into(),
+            ));
+        }
+        let xq = sc.xq.as_ref().expect("xq filled by fused norm");
+        let xs = sc.xs.as_ref().expect("xs filled by fused norm");
+        let cfg = LaunchConfig {
+            grid: (
+                (rows as u32).div_ceil(128),
+                (n_tokens as u32).div_ceil(128),
+                1,
+            ),
+            block: (128, 1, 1),
+            shared_mem_bytes: 65536,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(xq)
+            .buf(w)
+            .buf(xs)
+            .buf(wscales)
+            .scalar(n_tokens as i64);
+        self.device.launch(gk, &cfg, &args, stream)
+    }
+
     /// `gemm_q4_k_f16` over a row window of a fused weight matrix:
     /// `w_byte_off` addresses the first superblock of the window's first row.
     #[allow(clippy::too_many_arguments)]

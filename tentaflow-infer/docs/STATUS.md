@@ -259,15 +259,30 @@ Ostatnia aktualizacja: 2026-07-20.
     1.0–1.4× MMQ (208)** (dyn-M + fused f16-scale), poprawność 4.2e-4 (zaokrąglenie
     f16). **Jakość: ppl 30.5211 vs 30.3113 = +0.69 %** (identyczna numeryka fp8 jak
     hand `fp8`), coherence PASS (Paris/Tokyo/tlen), Bielik NVFP4 golden bit-w-bit.
-    **PERF (warm best): fp8mod NIE bije domyślnego CUDA MMQ e2e w żadnym kształcie**
-    — pp512 2920 vs 6909 (0.42×), pp4096 8101 vs 8549 (0.95×), pp8192 7640 vs 8130
-    (0.94×); dekod bez zmian; llama.cpp pp4096 11991. Izolowana wygrana 1.4× GINIE
-    e2e bo ścieżka `fp8mod` KWANTYZUJE aktywację PER-PROJEKCJA (q/k/v ×3, gate/up
-    ×2), gdy MMQ fuzuje quant w RMSNorm i DZIELI go między projekcje. Werdykt: trzymać
-    za flagą, wyjątek ADR-0001 CUDA MMQ NIE wycofany na Ada; wygrałby na
-    Hopper/Blackwell. Jedyny bloker do wygranej e2e: wydzielić `quantize_act_fp8`
-    z GEMM i współdzielić `xq/xs` (fuzja w RMSNorm jak `rmsnorm_q8_1_ds4`).
-    `docs/CODEGEN_PROOF.md` Finding H.
+    **PERF: patrz Finding I — po fuzji fp8mod BIJE domyślny CUDA MMQ warm.** Stara
+    tabela („0.42–0.95×") była artefaktem zimnego pomiaru (osobne procesy `forge
+    bench`, GPU wracał do 210 MHz).
+  - ✅ **Fuzja RMSNorm→fp8: fp8mod BIJE domyślny CUDA MMQ e2e warm (Ada, 2026-07-20,
+    Finding I).** Nowe kernele Mojo `rmsnorm_fp8` / `rmsnorm_residual_fp8`
+    (`kernels/mojo/src/norm.mojo`, lustro CUDA `forge_rmsnorm_q8_1_ds4`) liczą
+    rmsnorm(_residual) I emitują JEDNĄ aktywację e4m3 per-token (kody [T,K] + skala
+    f32 per-token) w layoucie `gemm_fp8_mod`. `prefill_forward` (ścieżka `fp8mod_fuse`)
+    współdzieli ją: q/k/v czytają emit attn-norm, gate/up emit ffn-norm — przez
+    `gemm_fp8_modular_prequant` (zero requantu per-projekcja); o-proj + down trzymają
+    własny `quantize_act_fp8` (wejście = wyjście attn/SwiGLU, nie norm). Numeryka
+    bit-w-bit jak `rmsnorm_f16`→`quantize_act_fp8`, więc PPL bez zmian (+0.69 %).
+    **nsys: launche `quantize_act_fp8` spadły 1792→512** (tylko o + down; usunięto
+    dokładnie 5/warstwę × 32 × 8 chunków = 1280). **PERF warm best-of-N (`forge bench
+    --reps`, in-process, rep 1 zimny odrzucony): pp4096 fp8mod 12036 vs default 11050
+    = 1.089×, pp8192 9633 vs 9029 = 1.067×, pp512 13252 vs 13289 ≈ remis
+    (launch-bound).** Sama fuzja: +1.7–2.1 % nad pre-fuzją (która JUŻ biła default
+    warm — stary „0.94×" to zimny rep 1: 8072 vs 8507). fp8mod pp4096 12036 ≈ llama.cpp
+    11991. Dekod BEZ regresji (osobna ścieżka gemv: 146.0/130.5/175.3 identyczne).
+    **Wyjątek ADR-0001 CUDA MMQ WYCOFANY na merit** — 100 %-Mojo GEMM bije CUDA na Ada
+    warm. Rekomendacja: default zostaje CUDA MMQ (fp8mod kosztuje ~120 s requantu przy
+    load + osobne pakiety e4m3 w VRAM obok Q4_K + zimny start ~0.95×); `fp8mod` awansuje
+    z „izolowana-wygrana/e2e-strata" na **„e2e-wygrana na Ada, opt-in dla serwowania
+    niewrażliwego na latencję"**. `docs/CODEGEN_PROOF.md` Finding I.
   - ℹ️ **Pas ILP/barier i8mma (2026-07-19): każdy lever zmierzony, NIC nie
     wdrożono (no-op lub regresja).** Zaimplementowane bit-identycznie (mma int
     jest dokładne): (1) rozdział wydania mma od epilogu f32, (2) 2 k-stage'y na

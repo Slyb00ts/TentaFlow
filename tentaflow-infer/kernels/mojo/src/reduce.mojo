@@ -36,3 +36,27 @@ def block_reduce_sum(val: Float32) -> Float32:
             shared[0] = partial
     barrier()
     return shared[0]
+
+
+def block_reduce_max(val: Float32) -> Float32:
+    # Non-negative block max (absmax reductions): intra-warp shuffle max, then
+    # the first warp reduces the per-warp partials. Same shared-slot reuse
+    # discipline as block_reduce_sum, so callers can chain it after a sum.
+    shared = stack_allocation[MAX_WARPS, Float32, address_space = AddressSpace.SHARED]()
+    var v = warp.max(val)
+    lane = thread_idx.x % WARP_SIZE
+    wid = thread_idx.x // WARP_SIZE
+    barrier()
+    if lane == 0:
+        shared[wid] = v
+    barrier()
+    n_warps = (block_dim.x + WARP_SIZE - 1) // WARP_SIZE
+    if wid == 0:
+        var partial: Float32 = 0.0
+        if lane < n_warps:
+            partial = shared[lane]
+        partial = warp.max(partial)
+        if lane == 0:
+            shared[0] = partial
+    barrier()
+    return shared[0]

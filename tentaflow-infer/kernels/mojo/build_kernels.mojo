@@ -11,7 +11,7 @@
 import std.os as os
 from std.gpu.host import DeviceContext
 from std.pathlib import Path
-from src.norm import rmsnorm_f16, rmsnorm_residual_f16
+from src.norm import rmsnorm_f16, rmsnorm_residual_f16, rmsnorm_fp8, rmsnorm_residual_fp8
 from src.activation import silu_mul_f16, sigmoid_mul_f16, deinterleave_gate_f16
 from src.rope import rope_neox_f16
 from src.gemv import gemv_q8_0_f16, gemv_f16
@@ -224,6 +224,12 @@ def main() raises:
 
     _ = ctx.compile_function[rmsnorm_residual_f16, dump_asm=Path("rmsnorm_residual_f16.ptx")]()
     entries.append(_finalize(out_dir, "rmsnorm_residual_f16"))
+
+    _ = ctx.compile_function[rmsnorm_fp8, dump_asm=Path("rmsnorm_fp8.ptx")]()
+    entries.append(_finalize(out_dir, "rmsnorm_fp8"))
+
+    _ = ctx.compile_function[rmsnorm_residual_fp8, dump_asm=Path("rmsnorm_residual_fp8.ptx")]()
+    entries.append(_finalize(out_dir, "rmsnorm_residual_fp8"))
 
     _ = ctx.compile_function[silu_mul_f16, dump_asm=Path("silu_mul_f16.ptx")]()
     entries.append(_finalize(out_dir, "silu_mul_f16"))

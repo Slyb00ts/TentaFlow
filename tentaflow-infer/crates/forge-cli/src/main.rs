@@ -311,6 +311,11 @@ enum Command {
         /// `forge serve`). Forces `--prefix-cache off` when enabled.
         #[arg(long = "speculative", default_value = "off")]
         speculative: String,
+        /// Warm best-of-N: submit the same request N times reusing the loaded
+        /// model and report the fastest prefill + decode. The 4090's cold first
+        /// GEMM launch throttles ~2×, so rep 1 is always discarded when N > 1.
+        #[arg(long = "reps", default_value_t = 1)]
+        reps: usize,
     },
     /// Measure next-token perplexity on a fixed held-out passage (W4A8 quality
     /// gate). Runs whatever GEMM `FORGE_GEMM` selects (W4A8 is calibrated first).
@@ -480,6 +485,7 @@ fn main() -> Result<()> {
             kvflash,
             prefix_cache,
             speculative,
+            reps,
         } => {
             let (hot_pages, tier) = resolve_kvflash(
                 kvflash,
@@ -500,6 +506,7 @@ fn main() -> Result<()> {
                 hot_pages,
                 parse_prefix_cache(&prefix_cache)?,
                 parse_speculative(&speculative)?,
+                reps,
             )
         }
         Command::Ppl { model_path, ctx } => cmd_ppl(&model_path, ctx),
@@ -1415,12 +1422,16 @@ fn cmd_bench(
     hot_pages: usize,
     prefix_cache: bool,
     spec: SpeculativeConfig,
+    reps: usize,
 ) -> Result<()> {
     if tokens < 2 {
         bail!("--tokens must be at least 2 to measure decode throughput");
     }
     if prompt_tokens == 0 {
         bail!("--prompt-tokens must be at least 1");
+    }
+    if reps == 0 {
+        bail!("--reps must be at least 1");
     }
     let t0 = Instant::now();
     let prefix_cache = prefix_cache && !spec.enabled;
@@ -1453,41 +1464,65 @@ fn cmd_bench(
         12,
         spec,
     );
-    let submit_at = Instant::now();
-    // No EOS ids: the benchmark must decode exactly `tokens` tokens.
-    let (generated, prompt_len, first_at, done_at) = drain_request(
-        &engine,
-        EngineRequest {
-            prompt_tokens: prompt_ids,
-            max_tokens: tokens,
-            sampling: SamplingParams {
-                temperature: 0.0,
-                ..SamplingParams::default()
+    // Warm best-of-N: re-submit the identical request `reps` times reusing the
+    // loaded engine. With prefix caching off each rep re-runs the full prefill,
+    // so the cold first GEMM launch (throttled ~2× on the 4090) lands in rep 1
+    // and is discarded when reps > 1. Best (fastest) prefill and decode win.
+    let mut best_prefill_s = f64::INFINITY;
+    let mut best_decode_s = f64::INFINITY;
+    let mut last_prompt_len = 0usize;
+    let mut last_generated = 0usize;
+    for rep in 0..reps {
+        let submit_at = Instant::now();
+        // No EOS ids: the benchmark must decode exactly `tokens` tokens.
+        let (generated, prompt_len, first_at, done_at) = drain_request(
+            &engine,
+            EngineRequest {
+                prompt_tokens: prompt_ids.clone(),
+                max_tokens: tokens,
+                sampling: SamplingParams {
+                    temperature: 0.0,
+                    ..SamplingParams::default()
+                },
+                stop: vec![],
+                eos_ids: vec![],
+                grammar: None,
+                ..Default::default()
             },
-            stop: vec![],
-            eos_ids: vec![],
-            grammar: None,
-            ..Default::default()
-        },
-        |_| {},
-    )?;
+            |_| {},
+        )?;
+        let prefill_s = first_at.duration_since(submit_at).as_secs_f64();
+        let decode_s = done_at.duration_since(first_at).as_secs_f64();
+        last_prompt_len = prompt_len;
+        last_generated = generated;
+        let prefill_tps = prompt_len as f64 / prefill_s.max(1e-9);
+        let decode_tps = (generated.saturating_sub(1)) as f64 / decode_s.max(1e-9);
+        eprintln!(
+            "rep {}/{reps}: prefill {prefill_s:.3}s ({prefill_tps:.1} tok/s) | decode {decode_s:.3}s ({decode_tps:.1} tok/s)",
+            rep + 1
+        );
+        // Discard rep 1 (cold) from the best-of when averaging over multiple reps.
+        if reps > 1 && rep == 0 {
+            continue;
+        }
+        best_prefill_s = best_prefill_s.min(prefill_s);
+        best_decode_s = best_decode_s.min(decode_s);
+    }
 
     // Honest measurement note: "prefill" is submit → first visible token,
     // which includes at least one decode step (and possibly a couple more if
     // the decoder held back partial UTF-8); "decode" covers the remaining
     // generated tokens as counted by the engine's usage numbers. Prefill runs
     // through the batched chunked path (one chunk per scheduler iteration).
-    let prefill_s = first_at.duration_since(submit_at).as_secs_f64();
-    let decode_s = done_at.duration_since(first_at).as_secs_f64();
-    let prefill_tps = prompt_len as f64 / prefill_s.max(1e-9);
-    let decode_tps = (generated.saturating_sub(1)) as f64 / decode_s.max(1e-9);
+    let prefill_tps = last_prompt_len as f64 / best_prefill_s.max(1e-9);
+    let decode_tps = (last_generated.saturating_sub(1)) as f64 / best_decode_s.max(1e-9);
 
     println!("| phase   | tokens | seconds | tok/s   |");
     println!("|---------|--------|---------|---------|");
-    println!("| prefill | {prompt_len:>6} | {prefill_s:>7.3} | {prefill_tps:>7.1} |");
+    println!("| prefill | {last_prompt_len:>6} | {best_prefill_s:>7.3} | {prefill_tps:>7.1} |");
     println!(
-        "| decode  | {:>6} | {decode_s:>7.3} | {decode_tps:>7.1} |",
-        generated.saturating_sub(1)
+        "| decode  | {:>6} | {best_decode_s:>7.3} | {decode_tps:>7.1} |",
+        last_generated.saturating_sub(1)
     );
     eprintln!("note: prefill is timed to the first visible token, so it includes >=1 decode step");
     Ok(())

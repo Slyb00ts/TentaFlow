@@ -599,17 +599,100 @@ isolated table); the loss is elsewhere and specific to the `fp8mod` *integration
 
 ### Verdict + recommendation
 
+> **SUPERSEDED by Finding I (2026-07-20).** Two things below turned out wrong once the
+> activation quant was fused into the RMSNorm AND the prefill was measured *truly* warm
+> (in-process best-of-N, not separate process launches): (1) the pp512 "0.42×" and pp4096
+> "0.95×" were a **cold-measurement artifact** — separate `forge bench` launches let the 4090
+> idle back to 210 MHz between runs, so the reported "warm best" never reached steady state;
+> (2) with the fusion, fp8mod **beats** the CUDA MMQ default warm. Read Finding I.
+
 - **The Finding-G "AOT + cudarc + dynamic-M + fused scale" mechanism is fully productionized,
   committed, correct, and near-lossless (+0.69 % PPL).** The isolated Modular fp8 GEMM beats the
   CUDA MMQ by 1.0–1.4× as a committed 100 %-Mojo kernel. This is real and reusable — and on
   Hopper/Blackwell (2× fp8 rate) it should win outright.
-- **But on Ada it does NOT beat the CUDA MMQ default end-to-end** (0.42–0.95×). **Do NOT flip the
-  default; keep `fp8mod` behind the flag.** The ADR-0001 CUDA MMQ exception stays justified on Ada.
-- **The precise, single blocker to the e2e win** (documented for the follow-up): de-duplicate the
+- **The precise, single blocker to the e2e win** (now RESOLVED in Finding I): de-duplicate the
   activation quant. Split `quantize_act_fp8` out of `gemm_fp8_modular`, quantize the attn-norm
   output ONCE and share `xq/xs` across q/k/v, quantize the ffn-norm output once and share across
-  gate/up — ideally fusing the quant into the RMSNorm exactly as the MMQ path's `rmsnorm_q8_1_ds4`
-  does. That removes 3 of 7 per-layer quant passes and the f16 HBM round-trip; only then can the
-  1.3–1.5× isolated GEMM edge show through the ~81 %-GEMM prefill. Until that fusion lands, the
-  real win here is the **committed, quality-proven, faster-in-isolation** Modular fp8 kernel and
-  the dynamic-M/fused-scale build machinery — not an e2e speedup.
+  gate/up — fusing the quant into the RMSNorm exactly as the MMQ path's `rmsnorm_q8_1_ds4` does.
+
+## Finding I — fused RMSNorm→fp8 lands the e2e win: fp8mod BEATS the CUDA MMQ default (warm, RTX 4090, 2026-07-20)
+
+Finding H's blocker was fixed exactly as prescribed. New Mojo kernels `rmsnorm_fp8` /
+`rmsnorm_residual_fp8` (`kernels/mojo/src/norm.mojo`, mirrors the CUDA `forge_rmsnorm_q8_1_ds4`
+fusion) compute rmsnorm(_residual) AND emit ONE per-token e4m3 activation (codes [T,K] +
+per-token f32 scale) in the layout `gemm_fp8_mod` consumes. `prefill_forward` (`fp8mod_fuse`
+path) now shares that activation: q/k/v read the attn-norm's emit, gate/up read the ffn-norm's
+emit — via `gemm_fp8_modular_prequant` (no per-projection requant). o-proj + down keep their own
+`quantize_act_fp8` (their input is attention/SwiGLU output, not a norm). Numerics are bit-identical
+to the standalone rmsnorm_f16 → quantize_act_fp8 pair (same f16 round point, same absmax/448
+scale), so PPL is unchanged (below).
+
+### nsys — the per-projection quant launches dropped exactly as designed (pp4096, 2 reps × 8 chunks)
+
+| kernel | before (per-projection) | after (fused) |
+|---|---|---|
+| `quantize_act_fp8` | **1792** (7/layer: q,k,v,o,gate,up,down) | **512** (2/layer: o,down only) |
+| `rmsnorm_fp8` + `rmsnorm_residual_fp8` | 0 | 8 + 504 (replace the f16 norms) |
+| `rmsnorm_f16` + `rmsnorm_residual_f16` | 8 + 512 | 0 |
+
+The 1280 eliminated launches = exactly the q/k/v (3) + gate/up (2) requant passes × 32 layers ×
+8 prefill chunks. The fused norm does slightly more work per launch (the quant), but there are
+1280 fewer standalone quant kernels and no shared-activation f16 HBM round-trip.
+
+### PERF — the win, measured TRULY warm (in-process best-of-N, `forge bench --reps N`)
+
+The decisive methodology fix: `forge bench` now takes `--reps N`, re-submitting the identical
+request through the **already-loaded** engine (prefix-cache off → each rep re-runs full prefill).
+Rep 1 is the cold launch (4090 at 210 MHz, throttled ~2×) and is discarded; reps 2..N are genuine
+steady state. This is what Finding H's "separate process launch per rep" could never reach — and
+it changes the answer.
+
+Prefill tok/s, `--prefix-cache off`, best-of reps 2..N, RTX 4090 idle (<1800 MiB):
+
+| shape (pp/dec) | CUDA MMQ default | fp8mod PRE-fusion | fp8mod POST-fusion | post vs default |
+|---|---|---|---|---|
+| 512 / 128  | 13289 | ~13.3k (floor) | 13252 | **~1.00×** (launch-bound tie) |
+| 4096 / 2048 | 11050 | 11792 | **12036** | **1.089×** |
+| 8192 / 1024 | 9029 | 9474 | **9633** | **1.067×** |
+
+- **fp8mod POST-fusion beats the CUDA MMQ default warm: +8.9 % @4096, +6.7 % @8192**, tie @512
+  (prefill = 0.039 s there, dominated by launch + the ≥1 decode step, so the GEMM washes out).
+- **The fusion itself adds +1.7–2.1 %** over pre-fusion fp8mod (12036 vs 11792 @4096; 9633 vs
+  9474 @8192). Notably, pre-fusion fp8mod ALREADY beat the default *warm* (11792 vs 11050) — so
+  Finding H's "0.95× loss" was primarily the cold-measurement artifact, and the fusion is the
+  clean top-off that also removes the small-T penalty.
+- **Cold reproduces Finding H's numbers**: rep-1 (cold) fp8mod @4096 = 8072, default = 8507 →
+  0.949× — this is the "0.94×" Finding H reported. It is a first-launch artifact, not steady state.
+- **Decode never regresses** (separate graph-replay gemv path): 146.0/146.2 @4096, 130.5/130.4
+  @8192, 175.3/175.2 @512 — identical default vs fp8mod.
+- llama.cpp pp4096 `-fa 1` reconfirmed **11991**; fp8mod post-fusion 12036 now **matches/edges
+  llama.cpp** at pp4096 and beats the FORGE CUDA default.
+
+### Quality — unchanged (+0.69 %), Mistral-7B Q4_K_M held-out passage
+
+| backend | perplexity | Δ vs default |
+|---|---|---|
+| default (Q4_K MMQ) | 30.3113 | — |
+| fp8mod (fused) | 30.5211 | **+0.69 %** |
+
+Identical to the pre-fusion fp8mod PPL — the fusion moves WHERE the quant runs, not the fp8
+numerics. Coherence PASS (Eiffel→"Paris, France…"). NVFP4 Bielik golden bit-exact on 1 and 4
+lanes (default path untouched).
+
+### Verdict + recommendation (Finding I)
+
+- **The e2e win landed: a 100 %-Mojo fp8 GEMM (Modular multistage + FORGE's fused RMSNorm→fp8)
+  now BEATS the committed CUDA MMQ default warm on Ada** — +6.7–8.9 % at the prefill-dominated
+  shapes, tie at the launch-bound small shape, near-lossless, decode unaffected. **The technical
+  justification for the ADR-0001 CUDA-MMQ exception is retired**: the reason it existed ("no Mojo
+  kernel matches the CUDA MMQ on Ada") is no longer true.
+- **On flipping the runtime default for Q4_K/Q6_K models: recommended for Ada+ deployments that
+  can pay the load cost, but NOT auto-flipped here.** The honest tradeoffs: (1) `fp8mod` requant
+  costs **~120 s at model load** and holds the e4m3 packs **in ADDITION to** the Q4_K weights
+  (extra VRAM), (2) the very first (cold) request still runs ~0.91–0.95× until kernels warm, (3)
+  the win needs a prefill-dominated shape (small pp is a tie). For a long-running server these are
+  amortized and the warm win is what matters; for short-lived / VRAM-tight runs the CUDA default
+  is still the safer pick. Recommendation: keep the CUDA MMQ as the shipped default, promote
+  `FORGE_GEMM=fp8mod` from "isolated-win / e2e-loss" to **"e2e-win on Ada, opt-in for latency-
+  insensitive serving"**, and treat the ADR-0001 exception as retired-on-merit (the CUDA kernel
+  is now a pragmatic default, not a necessity).

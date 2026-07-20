@@ -315,6 +315,8 @@ const CUDA_MMQ_ENTRIES: &[(&str, &str)] = &[
 const EMBEDDED_SM89: &[EmbeddedArtifact] = embedded![
     "rmsnorm_f16",
     "rmsnorm_residual_f16",
+    "rmsnorm_fp8",
+    "rmsnorm_residual_fp8",
     "silu_mul_f16",
     "sigmoid_mul_f16",
     "deinterleave_gate_f16",
