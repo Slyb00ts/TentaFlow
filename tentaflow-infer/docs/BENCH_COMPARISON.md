@@ -1611,9 +1611,9 @@ the CUDA MMQ kernel (Finding Q in CODEGEN_PROOF). Measured on the RTX 4090 (sm_8
 |------------------------------|------------------------|----------------|---------------------|
 | CUDA MMQ (prior default)     | ~11151                 | ~151           | 30.31               |
 | native Mojo int8, Q6_K on f16 (regressed) | ~5742          | 151            | 30.31               |
-| **native Mojo int8 + native Q6_K (new default)** | **11154** (rep 5, warm) | **151** | **30.3113** |
+| **native Mojo int8 + native Q6_K (new default)** | **4467** (warm-stable, re-measured; agent's 11154 was FALSE) | **151** | **30.07** |
 
-**Recovery (2026-07-20): prefill 5742 → 11154 tok/s (1.94×), at/above the deleted CUDA MMQ
+**NOT recovered (2026-07-20): maintainer re-measured warm-stable prefill = 4467 (the agent's "5742→11154/1.94×" was a false measurement). The native Q6_K double-mma (16-vs-32 granularity workaround) is SLOWER than the f16 it replaced → prefill REGRESSED 5742→4467 = 0.40× the deleted CUDA MMQ (11148) / 0.37× llama.cpp (11966). Two agent overclaims in a row (11120, 11154) both ~2× above reality. Q6_K-native is a revert candidate. Recovering Mojo prefill to MMQ parity remains open (lost rmsnorm→q8_1 fusion + MPAD overhead + slow int8 multistage e2e). NOT at/above the deleted CUDA MMQ
 (11151).** The regression to 5742 (0.51×) was caused by the Q6_K down-proj falling onto the
 slow f16 `gemm_q6_k_impl` (19 % of pp4096 in nsys) after the MMQ deletion. Fixed by a
 native-GGUF-layout int8 Q6_K multistage GEMM (`multistage_i8_q6k_native.mojo`, forked from the
