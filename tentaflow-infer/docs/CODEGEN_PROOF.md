@@ -953,3 +953,118 @@ silent quality regression, so it is deferred rather than faked.
 provably MMQ-equal for a bit-exact per-32-block kernel; only its throughput-vs-208 is unmeasured
 because the flush kernel is not yet written. All Finding-L artifacts are scratch
 (`scratch/bench_i8mod_dynm.mojo`); nothing committed to the engine.
+
+---
+
+## Finding M — the DEFINITIVE per-32-block Q4_K flush kernel: BIT-EXACT, but the flush + scale movement halves throughput to ~140–196 TOPS (MMQ parity at best) — NOT flipped (2026-07-20)
+
+Finding L scoped the per-32-block flush and left its **throughput** as the one open question
+("bit-exact per-32-block ⇒ MMQ-equal PPL by construction … the genuinely open question is the
+SPEED cost of the per-block flush"). This pass BUILT that kernel, proved it bit-exact, and
+measured the speed. **Result: the flush is bit-exact (so it would match the MMQ 30.31 PPL by
+construction) but the per-block scale application + the scale-tensor data movement cost ~2.5–4×
+vs the plain int8 kernel, landing at ~140–196 TOPS — at or below the CUDA MMQ (208), not above.
+Decision rule triggered → kept as scratch, default UNCHANGED.**
+
+### The kernel (scratch: `kernels/mojo/scratch/i8mod/multistage_i8_q4k.mojo`, gate `scratch/bench_i8mod_q4k.mojo`)
+
+Forked from the Finding-K plain int8 multistage pipeline. Design choices, all verified:
+- **BK=64, flush per inner mma (NOT BK=32).** Finding L proposed BK=32 (one sub-block per
+  k-tile), but the pipeline asserts `num_k_mmas % (2·k_group_size) == 0`; BK=32 ⇒ num_k_mmas=1
+  breaks the register double-buffer. BK=64 keeps num_k_mmas=2 and the double buffer, and each
+  inner `m16n8k32` mma is still exactly one Q4_K 32-sub-block → `kb = k_tile_id·2 + k_mma`.
+- **Per sub-block: zeroed int32 c_tmp, all warp mmas back-to-back (tensor-core ILP), then one
+  flush pass** `acc_f32[t,n] += dsc[n,kb]·da[t,kb]·sumi − dm[n,kb]·sa[t,kb]`, with
+  `dsc=d·sc`, `dm=dmin·m` (weight), `da=d_a`, `sa=s_a=d_a·Σq8` (activation q8_1) — exactly
+  `vec_dot_q4_K_q8_1_impl_mmq` (`vecdotq.cuh:527`).
+- **Scales staged in SMEM, kb-major, double-buffered.** The per-k-tile scales for the whole
+  block (BM rows + BN cols) are cooperatively loaded into smem once per k-tile; the flush reads
+  them from smem into registers. kb-major layout (`dsc[kb·N+n]`, `da[kb·M+t]`) makes the
+  staging load fully coalesced. Double-buffered so the next tile's scales load while the current
+  tile computes.
+
+### Correctness — BIT-EXACT (decisive; the quality question is now closed by construction)
+
+Standalone gate vs a CPU `vec_dot_q4_K_q8_1` golden (Q4_K-structured weights: 4-bit codes +
+per-32 6-bit `sc`/`m` + superblock `d`/`dmin`; q8_1-quantized activation), RTX 4090 idle:
+
+| shape (M,N,K) | max_rel | max_abs | bad(>5e-3) |
+|---|---|---|---|
+| 256, 512, 512    | **0.0** | 0.0 | 0 / 131072 |
+| 512, 256, 1024   | **0.0** | 0.0 | 0 / 131072 |
+| 128, 256, 14336  | **0.0** | 0.0 | 0 / 32768 |
+
+`max_rel = 0.0` — the s8 IMMA int32 dot is exact and the f32 flush mirrors the golden's op
+order, so the output is bit-identical. **This confirms Finding L's claim in practice: a
+bit-exact per-32-block kernel over the same q8_1 activation is MMQ-equal ⇒ PPL 30.31 by
+construction.** (No `forge ppl` run because the kernel is not engine-wired — see decision.)
+
+### Throughput — the per-block flush + scale movement halves the plain kernel (RTX 4090 idle, best-of-5×40)
+
+| shape (T,N,K) | role | per-block Q4_K TOPS | plain int8 (Finding K/L) | vs CUDA MMQ 208 |
+|---|---|---|---|---|
+| 2048, 4096, 14336 | down | **196.5** | 587 | **0.94×** |
+| 512, 4096, 14336  | down | **154.5** | 557 | 0.74× |
+| 2048, 14336, 4096 | gate/up | **139.0** | 563 | 0.67× |
+| 512, 14336, 4096  | gate/up | **139.2** | 491 | 0.67× |
+
+**The per-block flush costs 2.5–4× vs the plain int8 kernel** — the deep-pipeline int8 GEMM's
+490–587 TOPS does NOT survive the per-block scaling. Best case (compute-heaviest down-proj,
+T=2048) is 196.5 ≈ MMQ parity; every other shape is 0.67–0.74× MMQ.
+
+### Where the cost is — MEASURED, not guessed (the flush arithmetic is cheap; the DATA MOVEMENT is the wall)
+
+Optimization ladder, each measured on the same shapes:
+1. Naive flush (per-fragment global scale loads): **~12 TOPS**.
+2. Hoist row/col scales to registers per sub-block: **73–97 TOPS**.
+3. mma-ILP restore (all mmas into c_tmp, then flush): ~same (mma ILP was NOT the bottleneck).
+4. SMEM scale staging: **105–142 TOPS**.
+5. kb-major coalesced staging: **139–196 TOPS**.
+
+Decisive isolation: replacing the scale values with **compile-time constants** (flush
+arithmetic intact, zero scale data movement) hits **290–402 TOPS**; removing the staging
+end-barrier moves the real kernel only **+4–7 TOPS**. → The bottleneck is **the scale data
+movement itself** (the separate `dsc`/`dm`/`da`/`sa` HBM traffic + smem staging + the flush's
+smem reads), NOT register spill (0 bytes spill at 176 regs, warp 64×32), NOT barriers, NOT mma
+ILP. Per-block scaling done with separate scale tensors inherently moves a large amount of
+scale data (e.g. down-proj reads ~470 MB of `dsc` across the grid on top of the int8 weights);
+MMQ avoids this by embedding scales in the packed Q4_K block and reading them once with the
+weights.
+
+### Two structural reasons it can't beat MMQ e2e as-is (both honest, both real work to fix)
+
+1. **2× weight bandwidth.** This kernel consumes weights as an **unpacked** int8 `[N,K]` code
+   matrix (the gate pre-unpacks Q4_K host-side into codes + per-32 scales). That is 2× the
+   VRAM and 2× the read bandwidth of packed Q4_K. Productionizing needs either a 2×-VRAM
+   pre-unpack in HBM, or on-the-fly Q4_K nibble unpack in the smem-load path (a substantial
+   further kernel change) — and the latter adds MORE per-tile work, pushing throughput down,
+   not up.
+2. **Scale-tensor HBM traffic** (above) is intrinsic to the separate-scale-tensor design.
+
+### Portability — verified (unchanged from plain i8mod)
+
+Exported PTX (`.version 8.1`, 32 `mma.…s32.s8.s8.s32`, 22 `cp.async`, 0 `.extern .func`, 176
+regs, 0 spill) retargeted `.target sm_89→sm_80` assembles with **`ptxas -arch=sm_86 -O3` AND
+`-arch=sm_80 -O3`, 0 failures** — runs natively on the RTX 3090 like the plain kernel.
+
+### Verdict + decision (decision rule from the task, applied honestly)
+
+- **Correctness: PASS, decisive.** The per-32-block flush is bit-exact vs the MMQ dot math, so
+  it is MMQ-quality (PPL 30.31) by construction — the quality half of Finding K/L's open
+  question is now settled in code, not just in principle.
+- **Throughput: FAILS the ">208, clearly beats MMQ" bar.** ~140–196 TOPS = MMQ parity only on
+  the single compute-heaviest shape, 0.67–0.74× on the rest, PLUS 2× weight bandwidth. Even the
+  isolated ceiling with zero scale movement (402) would not survive on-the-fly unpack.
+- **Per the task's explicit rule** ("if the per-block flush drops throughput below MMQ … keep
+  it behind `FORGE_GEMM=i8ms`, do NOT flip default, report the REAL numbers"): **engine default
+  UNCHANGED (CUDA MMQ on Ada, portable Mojo i8mma on pre-Ada). The CUDA MMQ is NOT retired.**
+  The `fp8mod` path (Finding I) remains the 100%-Mojo e2e win on Ada; this int8 per-block kernel
+  is a proven-correct, portable, but not-faster alternative kept as scratch.
+- **What would be needed to revisit:** fold the scales into the weight layout (packed Q4_K in
+  smem + in-kernel nibble unpack, so scales ride with the weights and there is no separate
+  scale-tensor traffic) — i.e. reproduce MMQ's data layout on the Mojo pipeline. That is the
+  real remaining kernel work; this pass proves the flush is correct and quantifies why the
+  separate-scale-tensor shortcut lands at MMQ parity, not above.
+
+All Finding-M artifacts are scratch (`kernels/mojo/scratch/i8mod/multistage_i8_q4k.mojo`,
+`scratch/bench_i8mod_q4k.mojo`); nothing committed to the engine.

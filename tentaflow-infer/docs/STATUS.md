@@ -12,6 +12,22 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-20.
 
+- 🟡 **Per-32-block Q4_K int8 GEMM (flush kernel) — ZBUDOWANY i BIT-EXACT, ale
+  ~140–196 TOPS = remis/poniżej CUDA MMQ (208), NIE przełączony (2026-07-20,
+  Finding M).** Odpowiedź na otwarte pytanie Finding K/L o koszt per-blokowego
+  flusha. Kernel (fork multistage int8, BK=64, flush per inner mma =
+  jeden 32-podblok Q4_K, skale w SMEM kb-major double-buffered) jest **bit-exact**
+  vs CPU `vec_dot_q4_K_q8_1` (max_rel=0.0) — więc jakość = MMQ 30.31 z konstrukcji.
+  ALE per-blokowy flush + ruch danych skal zjada 2.5–4× vs czysty int8 (587→196 na
+  down-proj T=2048, 139 na gate/up). Diagnoza rozstrzygająca: stałe skale (zero
+  ruchu danych) = 402 TOPS, usunięcie bariery tylko +4–7 → wąskim gardłem jest RUCH
+  DANYCH SKAL (osobne tensory `dsc`/`dm`/`da`/`sa` + staging), nie spill (0 B) ani
+  bariery ani ILP mma. Dodatkowo kernel czyta wagi jako rozpakowany int8 (2× pasmo
+  vs upakowany Q4_K). Reguła decyzyjna → **default BEZ ZMIAN (CUDA MMQ na Ada, Mojo
+  i8mma przenośne na pre-Ada); MMQ NIE wycofany.** Przenośny sm_80/sm_86 (3090)
+  zweryfikowany (`ptxas -arch=sm_86`). Wszystko w scratch
+  (`scratch/i8mod/multistage_i8_q4k.mojo`, `scratch/bench_i8mod_q4k.mojo`).
+
 - ✅ **Dekod Q4_K (dp4a GEMV) jest przy ścianie przepustowości — bije llama.cpp
   w płytkim kontekście, remis w głębokim (2026-07-20, nic nie wysłano).** Sesja
   celowała w rzekomą lukę 20 % (146 vs 175 tok/s) do llama.cpp. Pomiar na tym 4090

@@ -1543,3 +1543,24 @@ RTX 4090 — driver re-JIT-uje do sm_89 SASS przy ładowaniu:
 Koherencja Mistral Q4_K → „Paris, France…" (default). NVFP4 Bielik golden bit-exact
 1 i 4 lanes. Baseline int8 Mojo `_big` (idle 4090): 55.9 @T128, 62.7 @T512, 65.7 @T2048
 TOPS — ~66 TOPS wall potwierdzony. Usunięty `FORGE_GEMM=cuda` (gemm_i8mma) był nie-default.
+
+---
+
+## Per-32-block Q4_K int8 GEMM (flush kernel) — isolated TOPS (2026-07-20, Finding M)
+
+Standalone kernel bench (`scratch/bench_i8mod_q4k.mojo`), RTX 4090 idle (1712 MiB),
+best-of-5×40, bit-exact vs CPU `vec_dot_q4_K_q8_1` golden (max_rel = 0.0). Compares the
+per-32-block flush kernel to the plain int8 multistage (Finding K/L) and the CUDA MMQ (208):
+
+| shape (T,N,K) | role | per-block Q4_K | plain int8 | CUDA MMQ | per-block vs MMQ |
+|---|---|---|---|---|---|
+| 2048, 4096, 14336 | down | **196.5** | 587 | 208 | 0.94× |
+| 512, 4096, 14336  | down | **154.5** | 557 | 208 | 0.74× |
+| 2048, 14336, 4096 | gate/up | **139.0** | 563 | 208 | 0.67× |
+| 512, 14336, 4096  | gate/up | **139.2** | 491 | 208 | 0.67× |
+
+The per-32-block scaling costs 2.5–4× vs the plain kernel. Isolation (constant scales, zero
+scale movement) = 290–402 TOPS; the bottleneck is the scale-tensor HBM traffic + smem staging,
+not spill/barriers/ILP. Plus the kernel reads unpacked int8 weights (2× bandwidth vs packed
+Q4_K). ⇒ MMQ parity only on the compute-heaviest shape, below on the rest — **not flipped**,
+CUDA MMQ default retained (see CODEGEN_PROOF Finding M). Portable sm_80/sm_86 (3090) verified.
