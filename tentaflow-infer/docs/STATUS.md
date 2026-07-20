@@ -910,20 +910,28 @@ robi driver JIT przy ładowaniu); brak fizycznego sm_86 w tej maszynie.
 - `registry.rs` ładuje sm_89-target PTX i cubiny nvcc TYLKO przy `DeviceCaps.fp8_native`
   (sm ≥ 89) — `is_sm89_only()` skanuje nagłówek PTX. 3090 startuje nie dotykając żadnego
   niekompatybilnego modułu.
-- `gemm_mmq = fp8_native && FORGE_GEMM∈{brak,mmq}`. Na pre-Ada false → Q4_K/Q6_K prefill
-  spada na przenośne Mojo `gemm_*_i8mma`, a `mmq_enabled()==false` kieruje norm na
-  przenośny `rmsnorm_f16`. Cała domyślna ścieżka GGUF jest 100 % przenośnym Mojo PTX.
-- Usunięte: `kernels/cuda/gemm_i8mma.cu` + cubin + wpisy registry/launcher
-  (`I8mmaBackend::Cuda`, `FORGE_I8MMA_BACKEND`, `FORGE_GEMM=cuda`) + test `cuda_i8mma.rs`.
-  Rodzina była osiągalna tylko przez nie-domyślne `FORGE_GEMM=cuda` i w pełni zastąpiona
-  przez MMQ (Ada) / Mojo i8mma (reszta). Pozostałe cubiny (`w4a8`, `fattn`, `mmq_q4k`)
-  zostają jako Ada-only, teraz strażowane by brak sm_89 cubina nie blokował startu.
+- **CUDA MMQ WYCOFANE (2026-07-20, Finding Q).** Domyślnym prefill GEMM dla Q4_K na
+  WSZYSTKICH architekturach jest natywny Mojo int8 `gemm_q4k_i8_native` (czyta te SAME
+  bajty `DevWeight::Q4K.buf` co dekodowy dp4a GEMV — prawdziwe 1× VRAM, bez repacku).
+  Q6_K prefill → przenośny `gemm_q6_k_f16`. Cała domyślna ścieżka GGUF jest teraz 100 %
+  Mojo PTX (`.target sm_80`), przenośna na dowolne sm_80+ (3090/4090) i przez codegen na
+  AMDGPU/Metal.
+- Usunięte: `kernels/cuda/mmq_q4k.cu`, `kernels/cuda/vendor/llama-cpp/`, `mmq_q4k_cuda.cubin`,
+  ~200 wpisów `CUDA_MMQ_ENTRIES` + embed cubina + oba loadery, `MmqScratch`/`gemm_mmq`,
+  cała rodzina `gemm_mmq_*`/`mmq_*`/`rmsnorm_q8_1_ds4` i fused `mmq_fuse`, `FORGE_GEMM=mmq`
+  oraz krok nvcc MMQ w `build.sh`. Zero wiszących referencji. Nie-domyślne opt-iny Ada
+  (`fp8mod`, `w4a8`, `fattn`) zostają jako sm_89 cubiny, strażowane per-arch.
+- Toolchain: pełny `build_kernels.mojo` nie buduje się w obecnym środowisku (istniejące
+  kernele fp8 mma emitują PTX ISA 8.1, którą lokalny ptxas odrzuca — wymaga 8.4; ich PTX
+  są już w repo). 24 natywne PTX int8 regenerowane w izolacji przez `build_q4k_native.mojo`.
 
 **Co musi zrobić user 3090:** nic ponad zwykły build — committed PTX ma już
 `.target sm_80` i JIT-uje na 3090. NVFP4/fp8/W4A8 i CUDA-flash-attn zostają Ada-only
 (sprzętowe fp8/fp4) i są przezroczyście pomijane; 3090 uruchamia modele GGUF na Mojo.
 
-**Gate'y:** build+clippy zielone; NVFP4 Bielik golden bit-exact 1 i 4 lanes (default
-nietknięty); koherencja Mistral Q4_K → „Paris, France"; prefill 11137 / decode 149.9
-bez regresji. Crux int8-multistage: nie zmierzony w tej sesji (nie jest na ścieżce
-krytycznej); baseline int8 `_big` odtworzony = **56–66 TOPS** (ściana z Exp 2/5).
+**Gate'y (po wycofaniu MMQ, 2026-07-20):** build+clippy zielone, zero wiszących referencji;
+NVFP4 Bielik golden bit-exact 1 i 4 lanes (default nietknięty); Mistral Q4_K PPL
+**30.3113** vs baseline MMQ **30.31** (bit-exact z konstrukcji); koherencja → „Paris,
+France"; prefill warm **11120 tok/s** vs ~11151 MMQ (**0.997×**, parytet — powyżej progu
+0.79×); decode **151 tok/s** bez regresji; VRAM wag 1× (bez repacku), scratch aktywacji
+~+124 MB (skala MB, pomijalne przy KV-cache).

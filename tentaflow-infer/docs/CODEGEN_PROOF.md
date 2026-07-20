@@ -1289,3 +1289,61 @@ default UNCHANGED = CUDA MMQ on Ada, tree green):**
 
 This pass lands the bit-exact native-layout kernel in-tree (the crux) with the true-1×-VRAM
 weight-read path proven; wiring it as the default and retiring the CUDA MMQ is Phase 2.
+
+## Finding Q — CUDA MMQ RETIRED: native Mojo int8 Q4_K GEMM is the universal default; the FORGE default path is now 100 % Mojo (2026-07-20)
+
+Phase 2 of Finding P is complete. The native-GGUF-layout Q4_K int8 GEMM is wired as the
+DEFAULT prefill GEMM on ALL arches and the vendored CUDA MMQ kernel is DELETED — the last
+CUDA kernel on the default path is gone. The FORGE default GGUF path (rmsnorm/rope/attention/
+gemv/gemm/sampling) is now 100 % Mojo PTX (`.target sm_80`), portable to any sm_80+ NVIDIA
+part (3090/4090) and, by codegen, AMDGPU/Metal. Only the non-default Ada opt-ins
+(`fp8mod`, `w4a8`, `fattn`) remain CUDA cubins, name-keyed and skipped on pre-Ada.
+
+**Wiring:**
+- `build_kernels.mojo` imports + AOT-exports the 24 `gemm_q4k_i8_native_{N}_{K}_m{MPAD}`
+  instances (4 Mistral shapes × 6 MPAD buckets 128…4096). The full build cannot run in the
+  current toolchain (the pre-existing fp8 mma kernels emit PTX ISA 8.1 which the local ptxas
+  rejects — needs 8.4; their PTX are already committed), so the 24 int8 PTX were regenerated
+  in isolation via `build_q4k_native.mojo` (same `_finalize` sm_89→sm_80 retarget + manifest
+  convention, no fp8 in the module). Verified `.target sm_80`, ISA 8.1, `ptxas -arch=sm_86`
+  clean. Registered in `registry.rs` `EMBEDDED_SM89` + `manifest.json`.
+- `launchers.rs` `gemm_q4k_i8_native`: picks the smallest MPAD bucket ≥ T, copies the f16
+  activation into an MPAD-padded scratch, runs `quantize_act_q8_1` over MPAD (block-major
+  da/sa, stride MPAD — matching the kernel's `da[kb·MPAD + token]` indexing), then launches
+  the native GEMM (grid `(⌈rows/128⌉, MPAD/128)`, block 256, dynamic smem 53 248 B) passing
+  the RAW `DevWeight::Q4K.buf` at `w_byte_off` (NO repack). `m_real = T` guards the epilogue
+  store so the padded tail is computed but never written. `gemm_q4_k_i8mma_at` routes here for
+  `n_tokens ≥ 64` with a committed bucket, else falls to the portable hand int8-MMQ tiles.
+- `model.rs`: the MMQ-specific fused rmsnorm→`block_q8_1_mmq` prefill path (`mmq_fuse`,
+  `gemm_q4_k_mmq_prequant_at`, `qkv_all_q4k`/`gateup_all_q4k`, `rmsnorm_q8_1_ds4`,
+  `pb.q8_norm`) is DELETED. Q4_K prefill now takes the plain `rmsnorm_f16` →
+  `quantize_act_q8_1` (per projection) → native GEMM sequence; the shared-activation reuse
+  was an MMQ perf optimization and can be re-added on top of the native kernel later. Q6_K
+  prefill → portable `gemm_q6_k_f16`.
+- DELETED: `kernels/cuda/mmq_q4k.cu`, `kernels/cuda/vendor/llama-cpp/` (whole tree),
+  `mmq_q4k_cuda.cubin`, the ~200 `CUDA_MMQ_ENTRIES` + cubin embed + both loader calls,
+  `MmqScratch`/`gemm_mmq`, `gemm_mmq_at`/`mmq_gemm_and_fixup`/`mmq_kk_config`/`mmq_enabled`/
+  `mmq_q8_bytes`/`gemm_q4_k_mmq_prequant_at`/`gemm_mmq_prequant_at`/`rmsnorm_q8_1_ds4`/
+  `rmsnorm_residual_q8_1_ds4`, `FORGE_GEMM=mmq`, and the `build.sh` MMQ nvcc step. Zero
+  dangling refs.
+
+**Gates (RTX 4090, sm_89, each run alone on idle GPU):**
+- `cargo build --release` + `cargo clippy --release --workspace` → GREEN, zero warnings.
+- **NVFP4 Bielik golden bit-exact** (untouched path): `batched_bielik --ignored` → `ok`
+  (exact `[3718, 31917, …]` on 1 and 4 lanes).
+- **QUALITY:** `forge ppl mistral-7b-q4_k_m.gguf --ctx 2048` → **perplexity 30.3113** vs the
+  Q4_K MMQ baseline **30.31** (bit-exact by construction; 203-token prefill exercises the
+  MPAD=256 bucket across all Mistral shapes). Coherence: "The Eiffel Tower is located in the
+  city of" → "Paris, France…"; "The capital of Japan is" → "a city located on the island of
+  Honshu…"; "Water is made of hydrogen and" → "oxygen…".
+- **PERF:** `forge bench --prompt-tokens 4096 --tokens 128 --prefix-cache off --reps 5` (warm)
+  → prefill **11120 tok/s** vs the CUDA-MMQ baseline ~11151 (**0.997×**, parity — far above
+  the 0.79× floor the plan accepted for disabling fusion); decode **151 tok/s**, no
+  regression (decode is the untouched dp4a GEMV).
+- **VRAM:** weights are 1× (the native kernel reads the same `DevWeight::Q4K.buf` bytes decode
+  reads — no repacked weight/scale tensor). The only delta vs MMQ is the activation scratch:
+  the MPAD-padded `xpad` (+ int8 codes + da/sa) is ~190 MB at the 4096 bucket vs MMQ's ~66 MB
+  `block_q8_1_mmq`, i.e. ~+124 MB — MB-scale, negligible against the KV-cache-dominated
+  ~22 GB steady state, and no weight-scale VRAM at all.
+
+The universality milestone is met: the last CUDA kernel on the default path is gone.

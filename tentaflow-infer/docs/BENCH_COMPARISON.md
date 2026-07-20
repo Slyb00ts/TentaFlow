@@ -1600,3 +1600,29 @@ still measures the CUDA MMQ path. The native in-kernel scale unpack replaces the
 variant's smem scale-tensor reads with header reads + `get_scale_min_k4` arithmetic; whether
 that shifts the FLUSH-bound wall (Finding N) up or down is a Phase-2 measurement. Expectation
 from Finding N's packed result: ~146–166 TOPS ballpark, to be confirmed on the wired path.
+
+### Finding Q — native Q4_K int8 GEMM wired as default; CUDA MMQ retired: prefill parity (2026-07-20)
+
+Phase 2 wired `gemm_q4k_i8_native` as the DEFAULT Q4_K prefill GEMM on all arches and deleted
+the CUDA MMQ kernel (Finding Q in CODEGEN_PROOF). Measured on the RTX 4090 (sm_89), warm,
+`forge bench mistral-7b-q4_k_m.gguf --prompt-tokens 4096 --tokens 128 --prefix-cache off --reps 5`:
+
+| path                         | prefill pp4096 (tok/s) | decode (tok/s) | Q4_K PPL (ctx 2048) |
+|------------------------------|------------------------|----------------|---------------------|
+| CUDA MMQ (prior default)     | ~11151                 | ~151           | 30.31               |
+| native Mojo int8 (new default) | **11120**            | **151**        | **30.3113**         |
+
+Prefill is **0.997×** the CUDA MMQ baseline — parity, far above the 0.79× floor the plan
+accepted for disabling the MMQ rmsnorm→q8_1 fusion. The disabled fusion (one shared DS4
+activation across q/k/v & gate/up) is replaced by a per-projection `quantize_act_q8_1`; the
+extra quant passes are hidden by the multistage cp.async GEMM, so no measurable prefill loss.
+Decode is unchanged (untouched dp4a GEMV). PPL is bit-exact vs MMQ by construction (identical
+per-32-block flush `acc += dsc·da·sumi − dm·sa`).
+
+VRAM: weights 1× (native kernel reads the same `DevWeight::Q4K.buf` bytes decode reads — no
+repacked weight or `dsc/dm` scale tensor). Activation scratch is the only delta: the
+MPAD-padded `xpad` + int8 codes + da/sa is ~190 MB at the 4096 bucket vs MMQ's ~66 MB
+`block_q8_1_mmq`, i.e. ~+124 MB — MB-scale, negligible against the ~22 GB KV-dominated steady
+state. The throughput wall of Findings N/P (FLUSH-bound per-block scaled accumulate) is
+irrelevant at the engine level: the multistage pipeline overlaps it with cp.async weight loads
+well enough to match the CUDA MMQ SASS on the real Mistral prefill shapes.

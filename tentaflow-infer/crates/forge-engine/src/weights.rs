@@ -241,7 +241,7 @@ pub struct W4A8Layer {
 }
 
 /// Whether the W4A8 prefill GEMM is selected (`FORGE_GEMM=w4a8`). Default and
-/// any other value keep the committed CUDA MMQ Q4_K path.
+/// any other value keep the native Mojo int8 Q4_K prefill path.
 pub fn w4a8_enabled() -> bool {
     std::env::var("FORGE_GEMM").ok().as_deref() == Some("w4a8")
 }
@@ -278,7 +278,7 @@ pub struct Fp8Layer {
 /// Whether an fp8 (e4m3) prefill GEMM is selected. `fp8` = the hand-written
 /// single-PTX kernel; `fp8mod` = Modular's multistage cp.async kernel (faster,
 /// docs/CODEGEN_PROOF.md Finding G). Both build the SAME e4m3 weight packs; only
-/// the launched GEMM differs. Any other value keeps the committed CUDA MMQ path.
+/// the launched GEMM differs. Any other value keeps the native Mojo int8 Q4_K path.
 pub fn fp8_enabled() -> bool {
     matches!(
         std::env::var("FORGE_GEMM").ok().as_deref(),

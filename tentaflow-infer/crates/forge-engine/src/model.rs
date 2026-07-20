@@ -444,9 +444,6 @@ struct PrefillBufs {
     down: DevBuffer,
     ids: DevBuffer,
     positions: DevBuffer,
-    /// Shared `block_q8_1_mmq` DS4 activation for the fused rmsnorm→q8_1 path
-    /// (cols = hidden): one quantize feeds all of q/k/v (and separately gate/up).
-    q8_norm: DevBuffer,
 }
 
 /// Speculative-verification scratch (SPEC §6): the [cap, vocab] f32 logits of
@@ -1717,37 +1714,6 @@ impl Model {
         )
     }
 
-    /// Q4_K row-window GEMM over an EXTERNALLY prequantized q8_1 DS4 activation
-    /// (fused rmsnorm→q8_1). `w` must be Q4_K (callers gate on `qkv_all_q4k` /
-    /// `gateup_all_q4k`). Mirrors `gemm_rows`' Q4_K byte-offset math.
-    #[allow(clippy::too_many_arguments)]
-    fn gemm_rows_q4k_prequant(
-        &self,
-        y: &DevBuffer,
-        w: &DevWeight,
-        q8: &DevBuffer,
-        n_tokens: usize,
-        row_off: usize,
-        n_rows: usize,
-        stream: &Stream,
-    ) -> Result<()> {
-        match w {
-            DevWeight::Q4K { buf, cols, .. } => self.kernels.gemm_q4_k_mmq_prequant_at(
-                y,
-                buf,
-                row_off * (cols / 256) * 144,
-                q8,
-                n_rows,
-                *cols,
-                n_tokens,
-                stream,
-            ),
-            _ => Err(ForgeError::Kernel(
-                "gemm_rows_q4k_prequant: weight is not Q4_K".into(),
-            )),
-        }
-    }
-
     /// Batched GEMM over a row window of `w`: y = W[row_off..row_off+n_rows]·x.
     /// Row offsets translate to per-format byte offsets into the weight (and,
     /// for NVFP4, scale) streams — this is how prefill reads the q/k/v and
@@ -2111,11 +2077,6 @@ impl Model {
             positions: self
                 .device
                 .alloc(t_max * 4, MemKind::Device, Pool::Activations)?,
-            q8_norm: self.device.alloc(
-                forge_kernels::Kernels::mmq_q8_bytes(hidden, t_max),
-                MemKind::Device,
-                Pool::Activations,
-            )?,
         });
         Ok(())
     }
@@ -2211,67 +2172,27 @@ impl Model {
         let kernels = &self.kernels;
         let stream = &self.stream;
 
-        // Fused rmsnorm/silu → q8_1 activation path: the norm/silu that PRECEDES a
-        // Q4_K/Q6_K MMQ projection emits the `block_q8_1_mmq` activation directly,
-        // so q/k/v (shared DS4), gate/up (shared DS4) and down (D4/DS4) skip the
-        // standalone quantize pass + f16 HBM round-trip. Only valid under the MMQ
-        // prefill GEMM (n_tokens ≥ 64), with no W4A8 pack and no calibration
-        // capture (which needs the f16 activations mid-layer).
-        let mmq_fuse = kernels.mmq_enabled()
-            && t >= 64
-            && calib.is_none()
-            && self.weights.w4a8.is_none()
-            && self.weights.fp8.is_none();
         // fp8mod fused-norm path: the Modular fp8 GEMM shares ONE per-token e4m3
         // activation across q/k/v (and across gate/up) by folding the activation
-        // quant into the preceding RMSNorm — the fp8 analog of `mmq_fuse`. Only
-        // when the fp8 packs are loaded, the Modular kernel is selected, and no
-        // W4A8 calibration is capturing mid-layer f16 activations.
+        // quant into the preceding RMSNorm. Only when the fp8 packs are loaded, the
+        // Modular kernel is selected, and no W4A8 calibration is capturing mid-layer
+        // f16 activations.
+        //
+        // Q4_K prefill takes the plain rmsnorm (f16) → per-projection
+        // `quantize_act_q8_1` → native int8 GEMM sequence (`gemm_q4_k_i8mma_at`
+        // routes to `gemm_q4k_i8_native`). The old fused rmsnorm→`block_q8_1_mmq`
+        // path was an MMQ-only perf optimization (one shared DS4 activation across
+        // q/k/v & gate/up); it was retired with the CUDA MMQ kernel. The
+        // shared-activation reuse can be re-added on top of the native kernel later.
         let fp8mod_fuse =
             self.weights.fp8.is_some() && self.weights.fp8_modular && calib.is_none();
-        let qkv_all_q4k = |l: usize| -> bool {
-            match &self.weights.layers[l].attn().attn_qkv {
-                QkvWeights::Fused(w) => matches!(w, DevWeight::Q4K { .. }),
-                QkvWeights::FusedQk { qk, v } => {
-                    matches!(qk, DevWeight::Q4K { .. }) && matches!(v, DevWeight::Q4K { .. })
-                }
-                QkvWeights::Split { q, k, v } => {
-                    matches!(q, DevWeight::Q4K { .. })
-                        && matches!(k, DevWeight::Q4K { .. })
-                        && matches!(v, DevWeight::Q4K { .. })
-                }
-            }
-        };
-        let gateup_all_q4k = |l: usize| -> bool {
-            match &self.weights.layers[l].ffn {
-                LayerFfn::Dense(dffn) => match &dffn.gate_up {
-                    GateUpWeights::Fused(w) => matches!(w, DevWeight::Q4K { .. }),
-                    GateUpWeights::Split { gate, up } => {
-                        matches!(gate, DevWeight::Q4K { .. }) && matches!(up, DevWeight::Q4K { .. })
-                    }
-                },
-                LayerFfn::Moe(_) => false,
-            }
-        };
 
         let mut trace = PrefillTrace::new();
         trace.start(self.device.as_ref());
 
         kernels.gather_rows_f16(&pb.h, &self.weights.token_embd_f16, &pb.ids, t, hidden, stream)?;
-        // Layer 0's attn-norm feeds the q/k/v projections; fuse the q8_1 emit when
-        // those are Q4_K MMQ. Otherwise the plain f16 norm.
-        if mmq_fuse && qkv_all_q4k(0) {
-            kernels.rmsnorm_q8_1_ds4(
-                &pb.x,
-                &pb.q8_norm,
-                &pb.h,
-                &self.weights.layers[0].attn_norm,
-                t,
-                hidden,
-                eps,
-                stream,
-            )?;
-        } else if fp8mod_fuse {
+        // Layer 0's attn-norm feeds the q/k/v projections.
+        if fp8mod_fuse {
             kernels.rmsnorm_fp8_shared(
                 &pb.x,
                 &pb.h,
@@ -2306,7 +2227,6 @@ impl Model {
             // (attention/rope/append index (t*heads+h)*head_dim), so a fused
             // matrix is consumed as three row-window GEMMs into separate
             // buffers — same weight bytes, no second copy in VRAM.
-            let fuse_qkv = mmq_fuse && w4a8_layer.is_none() && qkv_all_q4k(l);
             if let Some(wl) = w4a8_layer {
                 self.gemm_w4a8(&pb.q, &wl.q, &pb.x, t, stream)?;
                 self.gemm_w4a8(&pb.k, &wl.k, &pb.x, t, stream)?;
@@ -2322,26 +2242,6 @@ impl Model {
                     self.gemm_fp8(&pb.q, &fl.q, &pb.x, t, stream)?;
                     self.gemm_fp8(&pb.k, &fl.k, &pb.x, t, stream)?;
                     self.gemm_fp8(&pb.v, &fl.v, &pb.x, t, stream)?;
-                }
-            } else if fuse_qkv {
-                // q/k/v read the shared DS4 activation the preceding attn-norm
-                // already emitted into pb.q8_norm (no per-projection quantize).
-                match &layer.attn().attn_qkv {
-                    QkvWeights::Fused(w) => {
-                        self.gemm_rows_q4k_prequant(&pb.q, w, &pb.q8_norm, t, 0, q_dim, stream)?;
-                        self.gemm_rows_q4k_prequant(&pb.k, w, &pb.q8_norm, t, q_dim, kv_dim, stream)?;
-                        self.gemm_rows_q4k_prequant(&pb.v, w, &pb.q8_norm, t, q_dim + kv_dim, kv_dim, stream)?;
-                    }
-                    QkvWeights::FusedQk { qk, v } => {
-                        self.gemm_rows_q4k_prequant(&pb.q, qk, &pb.q8_norm, t, 0, q_dim, stream)?;
-                        self.gemm_rows_q4k_prequant(&pb.k, qk, &pb.q8_norm, t, q_dim, kv_dim, stream)?;
-                        self.gemm_rows_q4k_prequant(&pb.v, v, &pb.q8_norm, t, 0, kv_dim, stream)?;
-                    }
-                    QkvWeights::Split { q, k, v } => {
-                        self.gemm_rows_q4k_prequant(&pb.q, q, &pb.q8_norm, t, 0, q_dim, stream)?;
-                        self.gemm_rows_q4k_prequant(&pb.k, k, &pb.q8_norm, t, 0, kv_dim, stream)?;
-                        self.gemm_rows_q4k_prequant(&pb.v, v, &pb.q8_norm, t, 0, kv_dim, stream)?;
-                    }
                 }
             } else {
                 match &layer.attn().attn_qkv {
@@ -2541,14 +2441,8 @@ impl Model {
                 self.gemm(&pb.o_out, &layer.attn().attn_o, &pb.attn_out, t, stream)?;
             }
             trace.mark(self.device.as_ref(), "gemm_o");
-            let fuse_gateup = mmq_fuse && w4a8_layer.is_none() && gateup_all_q4k(l);
             let fp8mod_fuse_gateup = fp8mod_fuse && matches!(layer.ffn, LayerFfn::Dense(_));
-            if fuse_gateup {
-                // ffn-norm feeds gate/up: emit the shared DS4 activation directly.
-                kernels.rmsnorm_residual_q8_1_ds4(
-                    &pb.x, &pb.q8_norm, &pb.h, &pb.o_out, &layer.ffn_norm, t, hidden, eps, stream,
-                )?;
-            } else if fp8mod_fuse_gateup {
+            if fp8mod_fuse_gateup {
                 kernels.rmsnorm_residual_fp8_shared(
                     &pb.x, &pb.h, &pb.o_out, &layer.ffn_norm, t, hidden, eps, stream,
                 )?;
@@ -2575,17 +2469,6 @@ impl Model {
                         } else {
                             self.gemm_fp8(&pb.gate, &fl.gate, &pb.x, t, stream)?;
                             self.gemm_fp8(&pb.up, &fl.up, &pb.x, t, stream)?;
-                        }
-                    } else if fuse_gateup {
-                        match &dffn.gate_up {
-                            GateUpWeights::Fused(w) => {
-                                self.gemm_rows_q4k_prequant(&pb.gate, w, &pb.q8_norm, t, 0, inter, stream)?;
-                                self.gemm_rows_q4k_prequant(&pb.up, w, &pb.q8_norm, t, inter, inter, stream)?;
-                            }
-                            GateUpWeights::Split { gate, up } => {
-                                self.gemm_rows_q4k_prequant(&pb.gate, gate, &pb.q8_norm, t, 0, inter, stream)?;
-                                self.gemm_rows_q4k_prequant(&pb.up, up, &pb.q8_norm, t, 0, inter, stream)?;
-                            }
                         }
                     } else {
                         match &dffn.gate_up {
@@ -2630,11 +2513,7 @@ impl Model {
             };
             // This norm feeds the NEXT layer's q/k/v (or, for the last layer, the
             // logit head — never fused, keeps the f16 hidden state).
-            if l + 1 < n_layers && mmq_fuse && w4a8_layer.is_none() && qkv_all_q4k(l + 1) {
-                kernels.rmsnorm_residual_q8_1_ds4(
-                    &pb.x, &pb.q8_norm, &pb.h, &pb.down, next_norm, t, hidden, eps, stream,
-                )?;
-            } else if l + 1 < n_layers && fp8mod_fuse {
+            if l + 1 < n_layers && fp8mod_fuse {
                 kernels.rmsnorm_residual_fp8_shared(
                     &pb.x, &pb.h, &pb.down, next_norm, t, hidden, eps, stream,
                 )?;

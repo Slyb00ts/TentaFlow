@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use forge_hal::{DevBuffer, Device, KernelHandle, LaunchArgs, LaunchConfig, Pool, Stream};
+use forge_hal::{DevBuffer, Device, LaunchArgs, LaunchConfig, Pool, Stream};
 use forge_types::{DType, ForgeError, MemKind, Result};
 
 use crate::registry::KernelArtifacts;
@@ -46,17 +46,11 @@ pub struct Kernels {
     /// Grow-only per-token e4m3 activation scratch for the fp8 prefill GEMM
     /// (FORGE_GEMM=fp8).
     fp8_act: Mutex<Fp8ActScratch>,
-    /// Grow-only scratch for the vendored llama.cpp Q4_K / Q6_K MMQ GEMM
-    /// (kernels/cuda/mmq_q4k.cu): the `block_q8_1_mmq` activation buffer. The
-    /// GEMM writes f16 directly into the caller's output. Separate layout from
-    /// `prequant`.
-    mmq: Mutex<MmqScratch>,
-    /// Route Q4_K + Q6_K prefill GEMM through the vendored llama.cpp MMQ cubin
-    /// (~2× the hand int8-MMQ TOPS; docs/CODEGEN_PROOF.md Exp 2). DEFAULT ON on
-    /// Ada+ — same native GGUF weights + q8_1 activation, no quality change.
-    /// Off on pre-Ada (sm_86) and under `FORGE_GEMM=mojo|fp8|fp8mod|w4a8`, which
-    /// fall through to the portable Mojo `gemm_*_i8mma` tiles or their own paths.
-    gemm_mmq: bool,
+    /// Grow-only scratch for the native-GGUF-layout Mojo int8 Q4_K prefill GEMM
+    /// (`gemm_q4k_i8_native`): the MPAD-padded f16 activation, its int8 q8_1 codes
+    /// and block-major da/sa scales. Separate layout from `prequant` (padded to
+    /// the compile-time token ceiling MPAD, not the real token count).
+    q4k_native: Mutex<Q4kNativeScratch>,
     /// Dense prefill attention backend (f16 hd64/hd128 only; every other shape
     /// falls through to the scalar kernel). DEFAULT = the portable Mojo
     /// tensor-core FA (`attn_prefill_fa_mma`, kernels/mojo/src/prefill.mojo) —
@@ -115,18 +109,23 @@ struct Fp8ActScratch {
     cap_tokens: usize,
 }
 
-/// Device-resident scratch for the vendored Q4_K / Q6_K MMQ GEMM.
+/// Device-resident scratch for the native-GGUF-layout int8 Q4_K prefill GEMM.
+/// All buffers are sized to the padded token ceiling MPAD (grow-only).
 #[derive(Default)]
-struct MmqScratch {
-    /// `block_q8_1_mmq` activation buffer (bytes). The GEMM writes f16 straight
-    /// into the caller's output, so no f32 output scratch is needed.
-    q8: Option<DevBuffer>,
-    cap_q8_bytes: usize,
-    /// Stream-K partial-tile buffer (`nsm * mmq_x * mmq_y` f32). Grow-only. The
-    /// stream-K GEMM parks boundary-tile partials here; `mul_mat_q_stream_k_fixup`
-    /// sums them back into the f16 dst.
-    fixup: Option<DevBuffer>,
-    cap_fixup_bytes: usize,
+struct Q4kNativeScratch {
+    /// MPAD-padded f16 activation [MPAD, cols] (the real rows in the head, the
+    /// tail allocated but never stored back).
+    xpad: Option<DevBuffer>,
+    /// int8 q8_1 codes [MPAD, cols].
+    xq: Option<DevBuffer>,
+    /// Block-major per-32 activation scale d [cols/32, MPAD].
+    da: Option<DevBuffer>,
+    /// Block-major per-32 activation sum d·Σcodes [cols/32, MPAD].
+    sa: Option<DevBuffer>,
+    /// Current f16/int8 element capacity of `xpad`/`xq` (MPAD·cols).
+    cap_x: usize,
+    /// Current f32 element capacity of `da`/`sa` ((cols/32)·MPAD).
+    cap_blocks: usize,
 }
 
 /// Device-resident ggml codebook tables (LE bytes of the u64/u32 grids).
@@ -168,7 +167,6 @@ impl Kernels {
     pub fn load(device: Arc<dyn Device>) -> Result<Self> {
         let artifacts = KernelArtifacts::load(device.as_ref())?;
         let iq_tables = IqTables::upload(device.as_ref())?;
-        let ada = device.caps().fp8_native;
         Ok(Self {
             device,
             artifacts,
@@ -176,16 +174,7 @@ impl Kernels {
             prequant: Mutex::new(PrequantScratch::default()),
             w4a8_act: Mutex::new(W4A8ActScratch::default()),
             fp8_act: Mutex::new(Fp8ActScratch::default()),
-            mmq: Mutex::new(MmqScratch::default()),
-            // The vendored llama.cpp MMQ is an sm_89 SASS cubin (no PTX JIT
-            // fallback), so it exists only on Ada+. On pre-Ada parts (e.g. the
-            // RTX 3090, sm_86) the default Q4_K/Q6_K prefill GEMM falls through
-            // to the portable Mojo `gemm_*_i8mma` tiles.
-            gemm_mmq: ada
-                && matches!(
-                    std::env::var("FORGE_GEMM").ok().as_deref(),
-                    None | Some("mmq")
-                ),
+            q4k_native: Mutex::new(Q4kNativeScratch::default()),
             attn: match std::env::var("FORGE_ATTN").ok().as_deref() {
                 Some("scalar") => AttnBackend::Scalar,
                 Some("fa") | Some("cuda") => AttnBackend::Cuda,
@@ -1802,343 +1791,112 @@ impl Kernels {
                 "gemm_q4_k_i8mma requires cols % 256 == 0, got {cols}"
             )));
         }
-        // Vendored llama.cpp MMQ path (default): consumes the SAME native GGUF
-        // Q4_K weight bytes, its own q8_1 activation quant, ~2× the TOPS of the
-        // hand int8-MMQ kernel. Prefill-sized batches only; decode-sized
-        // (n_tokens < 64, rare via gemm_rows) stays on the committed path.
-        if self.gemm_mmq && n_tokens >= 64 {
-            return self.gemm_mmq_at(
-                "mmq_q4k",
-                "quantize_mmq_q8_1_ds4",
-                y,
-                w_q4k,
-                w_byte_off,
-                x,
-                rows,
-                cols,
-                n_tokens,
-                stream,
-            );
+        // Universal DEFAULT (all arches): the native-GGUF-layout Mojo int8 Q4_K
+        // multistage GEMM (reads the raw `DevWeight::Q4K.buf` bytes in-kernel, NO
+        // repack; bit-exact vs Q4_K MMQ by construction). Prefill-sized batches
+        // whose (rows,cols) has a committed (N,K,MPAD) instance and T ≤ 4096. A
+        // shape/token count with no bucket (or decode-sized n_tokens < 64) falls
+        // through to the portable hand int8-MMQ tiles.
+        if n_tokens >= 64
+            && self.gemm_q4k_i8_native(y, w_q4k, w_byte_off, x, rows, cols, n_tokens, stream)?
+        {
+            return Ok(());
         }
         self.gemm_i8mma_run("gemm_q4_k_i8mma", y, w_q4k, w_byte_off, x, rows, cols, n_tokens, stream)
     }
 
-    /// Vendored llama.cpp `mul_mat_q` tensor-core GEMM (kernels/cuda/mmq_q4k.cu),
-    /// shared by the Q4_K and Q6_K prefill paths, launched in ggml's **stream-K**
-    /// work-partitioning mode (arXiv:2301.03598) — the way ggml balances MMQ tiles
-    /// across all SMs for these FFN shapes. Three launches on `stream`:
-    /// (1) f16 activation → `block_q8_1_mmq` (`quant_key`: DS4 for Q4_K, D4 for
-    /// Q6_K), (2) the stream-K MMQ GEMM (grid = one block per SM) writing f16
-    /// straight into `y` and parking boundary-tile partials in the fixup buffer,
-    /// (3) `mul_mat_q_stream_k_fixup` summing those partials back into `y`.
-    /// `gemm_prefix` selects the weight-type entry family (`mmq_q4k` / `mmq_q6k`).
-    /// `w_byte_off` addresses the first GGUF superblock of the row window. Grid /
-    /// tile count / fixup buffer replicate ggml's `launch_mul_mat_q` stream-K path
-    /// for the dense 2-D case (nsm from the device, ncols_max == n_tokens).
+    /// Smallest committed MPAD bucket ≥ `n_tokens`, or `None` if `n_tokens`
+    /// exceeds the largest committed ceiling (4096).
+    fn q4k_native_mpad(n_tokens: usize) -> Option<usize> {
+        [128usize, 256, 512, 1024, 2048, 4096]
+            .into_iter()
+            .find(|&m| m >= n_tokens)
+    }
+
+    /// Native-GGUF-layout Mojo int8 Q4_K multistage prefill GEMM (universal
+    /// default). Zero-pads the f16 activation to the compile-time token ceiling
+    /// MPAD (smallest bucket ≥ `n_tokens`), quantizes it to q8_1 over MPAD
+    /// (block-major da/sa, stride MPAD), then runs the native GEMM reading the RAW
+    /// `w_q4k` GGUF bytes at `w_byte_off` (144-byte block_q4_K de-interleaved
+    /// in-kernel — TRUE 1× VRAM, no repacked weight/scale copy). The kernel guards
+    /// stores by `m_real = n_tokens`, so the padded tail rows are computed but
+    /// never written. Dynamic smem 53248 B (the >48 KB opt-in the HAL sets
+    /// automatically). Returns `false` (caller falls back to the hand int8-MMQ
+    /// tiles) when `(rows,cols)` has no committed instance or `n_tokens > 4096`.
     #[allow(clippy::too_many_arguments)]
-    fn gemm_mmq_at(
+    fn gemm_q4k_i8_native(
         &self,
-        gemm_prefix: &str,
-        quant_key: &str,
         y: &DevBuffer,
-        w: &DevBuffer,
+        w_q4k: &DevBuffer,
         w_byte_off: usize,
         x: &DevBuffer,
         rows: usize,
         cols: usize,
         n_tokens: usize,
         stream: &Stream,
-    ) -> Result<()> {
-        // block_q8_1_mmq = 144 B / 128 activation cols; ggml pads K to 512.
-        const QMMQ: usize = 144;
-        const MATRIX_ROW_PADDING: usize = 512;
-        const MMQ_Y: usize = 128; // get_mmq_y on Ada.
-        let k_pad = cols.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
-        // ggml over-allocates get_mmq_x_max (128) extra blocks past the tile.
-        let q8_bytes = (k_pad / 128) * n_tokens * QMMQ + 128 * QMMQ;
-
-        let (mmq_x, need_check, smem) = Self::mmq_kk_config(rows, n_tokens);
-        let nc = if need_check { "c" } else { "nc" };
-        // gemm_prefix is `mmq_q4k`/`mmq_q6k`; stream-K + fixup families share the
-        // weight-type token (`q4k`/`q6k`).
-        let ty = gemm_prefix.strip_prefix("mmq_").unwrap_or(gemm_prefix);
-        let sk_key = format!("mmq_sk_{ty}_x{mmq_x}_{nc}");
-        let fix_key = format!("mmq_fix_{ty}_x{mmq_x}_{nc}");
-        let sk = self.artifacts.get(&sk_key)?;
-        let fk = self.artifacts.get(&fix_key)?;
-        let qk = self.artifacts.get(quant_key)?;
-
-        // Stream-K grid = one CUDA block per SM; the fixup buffer holds one
-        // (mmq_x * mmq_y) f32 partial tile per block.
-        let nsm = self.device.caps().sm_count.max(1) as usize;
-        let fixup_bytes = nsm * mmq_x * MMQ_Y * std::mem::size_of::<f32>();
-
-        let mut sc = self.mmq.lock().expect("mmq scratch poisoned");
-        if sc.cap_q8_bytes < q8_bytes {
-            sc.q8 = Some(self.device.alloc(q8_bytes, MemKind::Device, Pool::Activations)?);
-            sc.cap_q8_bytes = q8_bytes;
-        }
-        if sc.cap_fixup_bytes < fixup_bytes {
-            sc.fixup =
-                Some(self.device.alloc(fixup_bytes, MemKind::Device, Pool::Activations)?);
-            sc.cap_fixup_bytes = fixup_bytes;
-        }
-        let q8 = sc.q8.as_ref().expect("q8 allocated");
-        let fixup = sc.fixup.as_ref().expect("fixup allocated");
-
-        // (1) f16 activation [n_tokens, cols] → block_q8_1_mmq. ne00=cols,
-        // s01=cols (contiguous rows), ne0=k_pad, ne1=n_tokens. Padding lanes
-        // (cols..k_pad) read zero. grid(n_tokens, ceil(k_pad/512), 1), block 128.
-        let qcfg = LaunchConfig {
-            grid: (n_tokens as u32, (k_pad as u32).div_ceil(512), 1),
-            block: (128, 1, 1),
-            shared_mem_bytes: 0,
+    ) -> Result<bool> {
+        let Some(mpad) = Self::q4k_native_mpad(n_tokens) else {
+            return Ok(false);
         };
+        let key = format!("gemm_q4k_i8_native_{rows}_{cols}_m{mpad}");
+        let Ok(gk) = self.artifacts.get(&key) else {
+            return Ok(false);
+        };
+        let qk = self.artifacts.get("quantize_act_q8_1")?;
+
+        // Grow-only scratch: padded f16 activation [MPAD, cols], its int8 q8_1
+        // codes [MPAD, cols] and block-major da/sa [cols/32, MPAD]. The padded
+        // tail (rows n_tokens..MPAD) is allocated but never read for correctness
+        // (its outputs are guarded off by m_real), so no zeroing is needed.
+        let need_x = mpad * cols;
+        let need_blocks = mpad * (cols / 32);
+        let mut sc = self.q4k_native.lock().expect("q4k native scratch poisoned");
+        if sc.cap_x < need_x {
+            sc.xpad = Some(self.device.alloc(need_x * 2, MemKind::Device, Pool::Activations)?);
+            sc.xq = Some(self.device.alloc(need_x, MemKind::Device, Pool::Activations)?);
+            sc.cap_x = need_x;
+        }
+        if sc.cap_blocks < need_blocks {
+            sc.da = Some(self.device.alloc(need_blocks * 4, MemKind::Device, Pool::Activations)?);
+            sc.sa = Some(self.device.alloc(need_blocks * 4, MemKind::Device, Pool::Activations)?);
+            sc.cap_blocks = need_blocks;
+        }
+        let xpad = sc.xpad.as_ref().expect("xpad allocated");
+        let xq = sc.xq.as_ref().expect("xq allocated");
+        let da = sc.da.as_ref().expect("da allocated");
+        let sa = sc.sa.as_ref().expect("sa allocated");
+
+        // Copy the real activation [n_tokens, cols] f16 into the padded head.
+        self.device.copy(x, 0, xpad, 0, n_tokens * cols * 2, stream)?;
+
+        // q8_1 quant over the full MPAD ceiling → int8 codes + block-major da/sa
+        // (stride MPAD, matching the native kernel's da[kb*MPAD + token] indexing).
+        let qcfg = LaunchConfig::linear(need_blocks as u32, BLOCK);
         let qargs = LaunchArgs::new()
-            .buf(x)
-            .buf(q8)
+            .buf(xq)
+            .buf(da)
+            .buf(sa)
+            .buf(xpad)
             .scalar(cols as i64)
-            .scalar(cols as i64)
-            .scalar(k_pad as i64)
-            .scalar(n_tokens as i64);
+            .scalar(mpad as i64);
         self.device.launch(qk, &qcfg, &qargs, stream)?;
 
-        // (2)+(3) stream-K GEMM + fixup over the just-quantized q8.
-        self.mmq_gemm_and_fixup(
-            sk, fk, y, w, w_byte_off, q8, fixup, rows, cols, n_tokens, smem, stream,
-        )
-    }
-
-    /// The stream-K MMQ GEMM (2) + fixup reduction (3), shared by the internal
-    /// quantize-then-GEMM path (`gemm_mmq_at`) and the prequantized fused-op path
-    /// (`gemm_mmq_prequant_at`). `q8` is the `block_q8_1_mmq` activation and
-    /// `fixup` the stream-K partial-tile buffer.
-    #[allow(clippy::too_many_arguments)]
-    fn mmq_gemm_and_fixup(
-        &self,
-        sk: &KernelHandle,
-        fk: &KernelHandle,
-        y: &DevBuffer,
-        w: &DevBuffer,
-        w_byte_off: usize,
-        q8: &DevBuffer,
-        fixup: &DevBuffer,
-        rows: usize,
-        cols: usize,
-        n_tokens: usize,
-        smem: u32,
-        stream: &Stream,
-    ) -> Result<()> {
-        let nsm = self.device.caps().sm_count.max(1) as usize;
-        // (2) Stream-K MMQ GEMM writing f16 directly into y. grid(nsm, 1, 1),
-        // block(32, MMQ_NWARPS=8, 1), dynamic smem = `smem` (HAL raises the opt-in
-        // limit when > 48 KB). stride_row_x = blocks-per-row = cols/256;
-        // stride_col_dst = rows (y is [token][row]).
-        let gcfg = LaunchConfig {
-            grid: (nsm as u32, 1, 1),
-            block: (32, 8, 1),
-            shared_mem_bytes: smem,
-        };
-        let gargs = LaunchArgs::new()
-            .buf_at(w, w_byte_off)?
-            .buf(q8)
-            .buf(y)
-            .buf(fixup)
-            .scalar(cols as i64)
-            .scalar(rows as i64)
-            .scalar(n_tokens as i64)
-            .scalar((cols / 256) as i64)
-            .scalar(n_tokens as i64)
-            .scalar(rows as i64);
-        self.device.launch(sk, &gcfg, &gargs, stream)?;
-
-        // (3) Fixup reduction: sum the parked partials into the boundary tiles of
-        // y. Same grid/block, no dynamic smem. Blocks with no fixup work early-out.
-        let fcfg = LaunchConfig {
-            grid: (nsm as u32, 1, 1),
-            block: (32, 8, 1),
-            shared_mem_bytes: 0,
-        };
-        let fargs = LaunchArgs::new()
-            .buf(y)
-            .buf(fixup)
-            .scalar(cols as i64)
-            .scalar(rows as i64)
-            .scalar(n_tokens as i64)
-            .scalar(rows as i64);
-        self.device.launch(fk, &fcfg, &fargs, stream)
-    }
-
-    /// True when the vendored llama.cpp MMQ prefill GEMM is the active Q4_K/Q6_K
-    /// backend (the default). The fused rmsnorm/silu → q8_1 path is only valid
-    /// under it (it emits the `block_q8_1_mmq` layout that GEMM consumes).
-    pub fn mmq_enabled(&self) -> bool {
-        self.gemm_mmq
-    }
-
-    /// Byte size of a `block_q8_1_mmq` activation buffer over [n_tokens, cols],
-    /// matching `gemm_mmq_at`'s internal scratch. Callers that pre-quantize into
-    /// their own buffer (fused rmsnorm/silu) size it with this.
-    pub fn mmq_q8_bytes(cols: usize, n_tokens: usize) -> usize {
-        const QMMQ: usize = 144;
-        const MATRIX_ROW_PADDING: usize = 512;
-        let k_pad = cols.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
-        (k_pad / 128) * n_tokens * QMMQ + 128 * QMMQ
-    }
-
-    /// Q4_K MMQ GEMM reading an EXTERNALLY prequantized `block_q8_1_mmq` (DS4)
-    /// activation `q8` (produced by the fused rmsnorm→q8_1 kernel) — skips the
-    /// standalone quantize pass of `gemm_mmq_at`. `q8` must have been written for
-    /// this `(cols, n_tokens)` (use `mmq_q8_bytes`). Same stream-K GEMM + fixup.
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemm_q4_k_mmq_prequant_at(
-        &self,
-        y: &DevBuffer,
-        w: &DevBuffer,
-        w_byte_off: usize,
-        q8: &DevBuffer,
-        rows: usize,
-        cols: usize,
-        n_tokens: usize,
-        stream: &Stream,
-    ) -> Result<()> {
-        self.gemm_mmq_prequant_at("q4k", y, w, w_byte_off, q8, rows, cols, n_tokens, stream)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn gemm_mmq_prequant_at(
-        &self,
-        ty: &str,
-        y: &DevBuffer,
-        w: &DevBuffer,
-        w_byte_off: usize,
-        q8: &DevBuffer,
-        rows: usize,
-        cols: usize,
-        n_tokens: usize,
-        stream: &Stream,
-    ) -> Result<()> {
-        const MMQ_Y: usize = 128;
-        let (mmq_x, need_check, smem) = Self::mmq_kk_config(rows, n_tokens);
-        let nc = if need_check { "c" } else { "nc" };
-        let sk = self.artifacts.get(&format!("mmq_sk_{ty}_x{mmq_x}_{nc}"))?;
-        let fk = self.artifacts.get(&format!("mmq_fix_{ty}_x{mmq_x}_{nc}"))?;
-        let nsm = self.device.caps().sm_count.max(1) as usize;
-        let fixup_bytes = nsm * mmq_x * MMQ_Y * std::mem::size_of::<f32>();
-        let mut sc = self.mmq.lock().expect("mmq scratch poisoned");
-        if sc.cap_fixup_bytes < fixup_bytes {
-            sc.fixup = Some(self.device.alloc(fixup_bytes, MemKind::Device, Pool::Activations)?);
-            sc.cap_fixup_bytes = fixup_bytes;
-        }
-        let fixup = sc.fixup.as_ref().expect("fixup allocated");
-        self.mmq_gemm_and_fixup(
-            sk, fk, y, w, w_byte_off, q8, fixup, rows, cols, n_tokens, smem, stream,
-        )
-    }
-
-    /// Fused RMSNorm → q8_1 DS4: writes the normed f16 row into `out_f16` AND the
-    /// `block_q8_1_mmq` DS4 activation into `q8` in one pass, so the Q4_K q/k/v
-    /// (or gate/up) MMQ projections read `q8` directly (no standalone quantize,
-    /// no f16 round-trip re-read). `q8` sized via `mmq_q8_bytes(cols, rows)`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn rmsnorm_q8_1_ds4(
-        &self,
-        out_f16: &DevBuffer,
-        q8: &DevBuffer,
-        x: &DevBuffer,
-        weight: &DevBuffer,
-        rows: usize,
-        cols: usize,
-        eps: f32,
-        stream: &Stream,
-    ) -> Result<()> {
-        let k = self.artifacts.get("rmsnorm_q8_1_ds4")?;
-        let k_pad = cols.div_ceil(512) * 512;
+        // Native GEMM: grid (ceil(rows/128), MPAD/128); block 256; dynamic smem
+        // 53248 B. Args mirror gemm_q4k_i8_native(y, a=xq, w, da, sa, m_real).
         let cfg = LaunchConfig {
-            grid: (rows as u32, 1, 1),
+            grid: ((rows as u32).div_ceil(128), (mpad as u32) / 128, 1),
             block: (256, 1, 1),
-            shared_mem_bytes: 0,
+            shared_mem_bytes: 53248,
         };
         let args = LaunchArgs::new()
-            .buf(out_f16)
-            .buf(q8)
-            .buf(x)
-            .buf(weight)
-            .scalar(cols as i64)
-            .scalar(k_pad as i64)
-            .scalar(rows as i64)
-            .scalar(eps);
-        self.device.launch(k, &cfg, &args, stream)
-    }
-
-    /// Fused residual-add + RMSNorm → q8_1 DS4: `residual_io += x`, normed row to
-    /// `out_f16`, DS4 activation to `q8`. See `rmsnorm_q8_1_ds4`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn rmsnorm_residual_q8_1_ds4(
-        &self,
-        out_f16: &DevBuffer,
-        q8: &DevBuffer,
-        residual_io: &DevBuffer,
-        x: &DevBuffer,
-        weight: &DevBuffer,
-        rows: usize,
-        cols: usize,
-        eps: f32,
-        stream: &Stream,
-    ) -> Result<()> {
-        let k = self.artifacts.get("rmsnorm_residual_q8_1_ds4")?;
-        let k_pad = cols.div_ceil(512) * 512;
-        let cfg = LaunchConfig {
-            grid: (rows as u32, 1, 1),
-            block: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let args = LaunchArgs::new()
-            .buf(out_f16)
-            .buf(q8)
-            .buf(residual_io)
-            .buf(x)
-            .buf(weight)
-            .scalar(cols as i64)
-            .scalar(k_pad as i64)
-            .scalar(rows as i64)
-            .scalar(eps);
-        self.device.launch(k, &cfg, &args, stream)
-    }
-
-
-    /// Replicates ggml's `mul_mat_q_case` mmq_x pick for the RTX 4090 (Ada,
-    /// sm_89): the smallest mmq_x (multiple of its granularity, dynamic smem
-    /// within the 99 KB opt-in limit) that minimizes `ceil(n_tokens/mmq_x)`.
-    /// Returns `(mmq_x, need_check, dynamic_smem_bytes)`. need_check=true when
-    /// `rows` is not a multiple of mmq_y (128). Constants (mmq_y=128, nwarps=8,
-    /// block_q8_1_mmq=144, MMQ_MMA_TILE_X_K=76) are the Ada values printed by the
-    /// ggml headers; identical for Q4_K and Q6_K (both tile to 76).
-    fn mmq_kk_config(rows: usize, n_tokens: usize) -> (usize, bool, u32) {
-        const SMPBO: usize = 101376; // 99 KB opt-in cap on Ada
-        let nbytes_shared = |mmq_x: usize| -> usize {
-            let nbs_ids = mmq_x * 4;
-            let nbs_x = 128 * 76 * 4; // mmq_y * MMQ_MMA_TILE_X_K_Q8_1 * sizeof(int)
-            let nbs_y_raw = mmq_x * 144; // mmq_x * sizeof(block_q8_1_mmq)
-            let pad = 8 * 32 * 4; // nwarps * warp_size * sizeof(int)
-            let nbs_y = nbs_y_raw.div_ceil(pad) * pad;
-            nbs_ids + nbs_x + nbs_y
-        };
-        let granularity = |mmq_x: usize| -> usize { if mmq_x >= 48 { 16 } else { 8 } };
-        let mut best_x = 8usize;
-        let mut best_tiles = usize::MAX;
-        let mut mmq_x = 8usize;
-        while mmq_x <= 128 && best_tiles > 1 {
-            if mmq_x.is_multiple_of(granularity(mmq_x)) && nbytes_shared(mmq_x) <= SMPBO {
-                let tiles = n_tokens.div_ceil(mmq_x);
-                if tiles < best_tiles {
-                    best_tiles = tiles;
-                    best_x = mmq_x;
-                }
-            }
-            mmq_x += 8;
-        }
-        (best_x, !rows.is_multiple_of(128), nbytes_shared(best_x) as u32)
+            .buf(y)
+            .buf(xq)
+            .buf_at(w_q4k, w_byte_off)?
+            .buf(da)
+            .buf(sa)
+            .scalar(n_tokens as i64);
+        self.device.launch(gk, &cfg, &args, stream)?;
+        Ok(true)
     }
 
     /// Pre-quantize the activation to q8_1 ONCE (`quantize_act_q8_1`) into the
@@ -2625,7 +2383,7 @@ impl Kernels {
     /// `out_f16` AND the per-token e4m3 codes + f32 scale into the shared fp8
     /// activation scratch, so the following q/k/v (or gate/up) projections read
     /// ONE quantized activation via `gemm_fp8_modular_prequant` instead of
-    /// re-quantizing per projection. Mirrors `rmsnorm_q8_1_ds4` for the fp8mod
+    /// re-quantizing per projection. The fp8mod analog of a fused norm→quant for the fp8mod
     /// path. `cols` is the hidden size (the projection K).
     #[allow(clippy::too_many_arguments)]
     pub fn rmsnorm_fp8_shared(
@@ -2958,23 +2716,6 @@ impl Kernels {
             return Err(ForgeError::Kernel(format!(
                 "gemm_q6_k requires cols % 256 == 0, got {cols}"
             )));
-        }
-        // Vendored llama.cpp MMQ path (default): Q6_K native codes + q8_1 (D4)
-        // activation on the tensor cores — ~2× the Mojo f16 GEMM. Prefill only
-        // (n_tokens >= 64); decode-sized batches keep the Mojo f16 GEMM below.
-        if self.gemm_mmq && n_tokens >= 64 {
-            return self.gemm_mmq_at(
-                "mmq_q6k",
-                "quantize_mmq_q8_1_d4",
-                y,
-                w_q6k,
-                w_byte_off,
-                x,
-                rows,
-                cols,
-                n_tokens,
-                stream,
-            );
         }
         let (suffix, block, bm) = Self::gemm_tile(rows, n_tokens);
         let k = self.artifacts.get(&format!("gemm_q6_k_f16{suffix}"))?;
