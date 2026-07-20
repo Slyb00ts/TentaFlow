@@ -892,3 +892,64 @@ BOTH the 3090 and the 4090 EXISTS and is 2.4× the CUDA MMQ — the kernel-engin
 "retire CUDA MMQ everywhere" goal is done; only the Q4_K→int8 quantization-accuracy half remains.**
 All Finding-K code is scratch (`scratch/i8mod/`, `scratch/bench_i8mod.mojo`); nothing committed to
 the engine.
+
+## Finding L — Finding-K productionization pass: dynamic-M SOLVED+verified, real quality/perf data gathered, per-block-scale kernel scoped but NOT built (2026-07-20)
+
+Follow-up on Finding K's two open items. Baseline first reproduced on the idle RTX 4090
+(`pixi run mojo scratch/bench_i8mod.mojo`, GPU 1712 MiB): 0 mismatches at all three correctness
+shapes, and **587 TOPS @ (2048,4096,14336), 562 @ (2048,14336,4096), 483 @ (512,14336,4096)** —
+squarely inside Finding K's 490–598 band. The harness is real and the kernel is unchanged.
+
+### Problem 2 (dynamic-M) — SOLVED and bit-exact (`scratch/bench_i8mod_dynm.mojo`)
+
+The masked `copy_dram_to_sram_async` int8 `SIMD must be floating point` constraint is avoided
+entirely by **zero-padding M up to the next 128-multiple**: allocate A/C at padded M with the
+extra rows zeroed, launch the stock plain kernel at padded M, keep only the first real-M output
+rows. Verified bit-exact vs the CPU int32 golden on the REAL rows at **M = 1, 100, 177, 200**
+(padded to 128/128/256/256): `mismatches(real rows) = 0` in every case. Padding is ~free at
+prefill (the discarded rows are a small fraction of a 128-multiple) and needs no kernel change —
+just launcher-side row padding. This blocker is closed.
+
+### Problem 1 (per-block Q4_K accuracy) — the decision-relevant real numbers, and why the kernel is a separate effort
+
+Real `forge ppl` on `mistral-7b-q4_k_m.gguf` (--ctx 2048, 203 tokens scored, each run ALONE on
+the idle GPU):
+
+| path | scheme | perplexity | vs Q4_K |
+|---|---|---|---|
+| `default(q4_k)` (CUDA MMQ) | Q4_K weight per-32-block d/dmin × q8_1 activation | **30.31** | — |
+| `FORGE_GEMM=w4a8` | int4 weight requant, **per-128-group** int8 sec-scale + per-chan fp16 | **37.98** | **+25.3 %** |
+
+The in-tree per-128-group int8 path (QServe W4A8, SmoothQuant off) reproduces the classic **+25 %
+PPL** hit — even at group=128, which is 4× FINER than a per-row collapse. This is the concrete
+measurement Finding K predicted "historically ~+25 %".
+
+**Key inference for the Mojo kernel:** the +25 % is NOT intrinsic to int8 activation — the CUDA MMQ
+ALSO uses q8_1 (int8) activation yet is the 30.31 reference. The W4A8 loss comes from (a) re-quantizing
+the weight to a DIFFERENT int4 packing and (b) per-128 (not per-32) block scales. A Mojo multistage
+kernel that keeps the **native Q4_K 4-bit codes** and folds the **exact per-32-block d/dmin** into the
+int32→f32 accumulation (mirroring `vec_dot_q4_K_q8_1_mma`) over the SAME q8_1 activation would match
+the MMQ 30.31 **by construction** — its only quantization loss is the q8_1 activation the MMQ already
+eats. So the QUALITY question is answered in principle: bit-exact per-32-block ⇒ MMQ-equal PPL. The
+genuinely open question is the **SPEED** cost of the per-block flush.
+
+**Perf baseline to beat (real, warm, reps=5, prefix-cache off, idle GPU):** CUDA MMQ default
+`forge bench mistral-7b-q4_k_m.gguf --prompt-tokens 4096 --tokens 64` = **prefill 11151 tok/s,
+decode 151 tok/s** (matches the ~11148 reference).
+
+**Why the per-block kernel is NOT built this pass (honest scope, no fabrication):** the plain 587-TOPS
+kernel accumulates int32 in `c_reg_tile` across the ENTIRE K reduction. Per-32-block Q4_K scales cannot
+fold into a single int8 operand (the whole point) and cannot be a post-hoc epilogue — they require a
+per-32-K **flush**: route each `m16n8k32` mma (K=32 = exactly one Q4_K sub-block) into a zeroed int32
+fragment, scale by `d[n]·sc[n,kb]·d_a[t,kb]` and subtract `dmin[n]·m[n,kb]·s_a[t,kb]`, add into a
+persistent f32 accumulator. The hooks are precise (`multistage_mma` mma sites at lines 566/706; the
+epilogue's `divmod(thread_offset+dst_idx, N)` at line 955 already yields each fragment's global (t,n)
+and is reusable per-block), and it needs BK=32 (halving pipeline depth) plus threading 5 scale tensors
+through two templated functions. This is a real multi-session tensor-core implementation with no
+intermediate GPU test signal until it compiles AND runs bit-exact — building it half-way would risk a
+silent quality regression, so it is deferred rather than faked.
+
+**Status:** engine default UNCHANGED (CUDA MMQ). Dynamic-M is solved+verified. Quality target is
+provably MMQ-equal for a bit-exact per-32-block kernel; only its throughput-vs-208 is unmeasured
+because the flush kernel is not yet written. All Finding-L artifacts are scratch
+(`scratch/bench_i8mod_dynm.mojo`); nothing committed to the engine.
