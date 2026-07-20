@@ -655,3 +655,155 @@ forge_quantize_mmq_q8_1_d4(
         const int64_t ne0, const int ne1) {
     forge_quantize_mmq_q8_1_body<false>(x, vy, ne00, s01, ne0, ne1);
 }
+
+// ---------------------------------------------------------------------------
+// FUSED RMSNorm(+residual) -> q8_1 DS4: produce the q8_1 MMQ activation DIRECTLY
+// from the norm that precedes the Q4_K q/k/v (or gate/up) projections, dropping
+// the standalone quantize pass + the f16 HBM round-trip those re-read. One block
+// per token: sum-of-squares reduction (f32, matching norm.mojo's dataflow — the
+// residual add rounds to f16 in the store but the sum uses the pre-round f32
+// value), then per-32 q8_1 packing over the SAME f16 normed value the standalone
+// kernels would have re-read from HBM. The vy layout is byte-identical to
+// forge_quantize_mmq_q8_1_ds4 (block_q8_1_mmq [k_block][token]); a warp covers
+// one 128-value block (4 sub-blocks of 32, one per 8-lane group) exactly as the
+// reference quant grid does. Bit-identical to the norm-then-quantize sequence
+// (proven: forge ppl unchanged).
+//
+// out_f16 (the normed row) is still written so the f16 buffer stays valid for
+// non-MMQ consumers (split fallbacks, the final-layer logit head).
+// ---------------------------------------------------------------------------
+
+// Pack one 4-value group into the block_q8_1_mmq at global column `c0` for token
+// `row`, mirroring forge_quantize_mmq_q8_1_body's per-warp reduction and layout.
+template <bool with_sum>
+static __device__ __forceinline__ void forge_pack_q8_1_group(
+        block_q8_1_mmq * __restrict__ y, const float4 xi,
+        const int c0, const int row, const int n_tokens) {
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+#pragma unroll
+    for (int offset = 32/8; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    }
+
+    float sum = 0.0f;
+    if (with_sum) {
+        sum = xi.x + xi.y + xi.z + xi.w;
+#pragma unroll
+        for (int offset = 32/8; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+        }
+    }
+
+    const float d_inv = 127.0f / amax;
+    char4 q;
+    q.x = roundf(xi.x*d_inv);
+    q.y = roundf(xi.y*d_inv);
+    q.z = roundf(xi.z*d_inv);
+    q.w = roundf(xi.w*d_inv);
+
+    const int kblk = c0 / 128;
+    const int iqs  = c0 % 128;
+    const int64_t ib = (int64_t)kblk * n_tokens + row;
+    char4 * yqs4 = (char4 *) y[ib].qs;
+    yqs4[iqs/4] = q;
+
+    if (iqs % 32 == 0) {
+        const float d = 1.0f / d_inv;
+        if (with_sum) {
+            y[ib].ds4[iqs/32] = make_half2(d, sum);
+        } else {
+            y[ib].d4[iqs/32] = d;
+        }
+    }
+}
+
+// Block-wide f32 sum reduction (blockDim.x a multiple of WARP_SIZE, <= 1024).
+static __device__ __forceinline__ float forge_block_reduce_sum(float v, float * shared) {
+#pragma unroll
+    for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+        v += __shfl_xor_sync(0xFFFFFFFF, v, off, WARP_SIZE);
+    }
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int nwarps = blockDim.x / WARP_SIZE;
+    if (lane == 0) shared[warp] = v;
+    __syncthreads();
+    float total = 0.0f;
+    if (threadIdx.x < nwarps) total = shared[threadIdx.x];
+    if (warp == 0) {
+#pragma unroll
+        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+            total += __shfl_xor_sync(0xFFFFFFFF, total, off, WARP_SIZE);
+        }
+        if (lane == 0) shared[0] = total;
+    }
+    __syncthreads();
+    return shared[0];
+}
+
+template <bool residual>
+static __device__ __forceinline__ void forge_rmsnorm_q8_1_ds4_body(
+        __half * __restrict__ out_f16, void * __restrict__ vy,
+        __half * __restrict__ resid_io, const __half * __restrict__ x,
+        const __half * __restrict__ weight,
+        const int n_cols, const int k_pad, const int n_tokens, const float eps) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int64_t base = (int64_t)row * n_cols;
+
+    __shared__ float sred[32];
+    float ss = 0.0f;
+    for (int i = tid; i < n_cols; i += blockDim.x) {
+        float v;
+        if (residual) {
+            v = __half2float(resid_io[base + i]) + __half2float(x[base + i]);
+            resid_io[base + i] = __float2half(v);
+        } else {
+            v = __half2float(x[base + i]);
+        }
+        ss += v * v;
+    }
+    const float total = forge_block_reduce_sum(ss, sred);
+    const float inv = rsqrtf(total / (float)n_cols + eps);
+    __syncthreads();
+
+    block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
+    const __half * src = residual ? resid_io : x;
+    for (int c0 = tid * 4; c0 < k_pad; c0 += blockDim.x * 4) {
+        float vv[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int c = c0 + j;
+            float nv = 0.0f;
+            if (c < n_cols) {
+                const __half h = __float2half(__half2float(src[base + c]) * inv * __half2float(weight[c]));
+                out_f16[base + c] = h;
+                nv = __half2float(h);
+            }
+            vv[j] = nv;
+        }
+        forge_pack_q8_1_group<true>(y, make_float4(vv[0], vv[1], vv[2], vv[3]), c0, row, n_tokens);
+    }
+}
+
+// grid(n_tokens,1,1), block(256,1,1). out_f16 = normed row (pb.x), vy = q8_1 DS4.
+extern "C" __global__ void __launch_bounds__(256, 1)
+forge_rmsnorm_q8_1_ds4(
+        __half * __restrict__ out_f16, void * __restrict__ vy,
+        const __half * __restrict__ x, const __half * __restrict__ weight,
+        const int n_cols, const int k_pad, const int n_tokens, const float eps) {
+    forge_rmsnorm_q8_1_ds4_body<false>(out_f16, vy, nullptr, x, weight, n_cols, k_pad, n_tokens, eps);
+}
+
+// residual += x; out = rmsnorm(residual)*weight; also emits the q8_1 DS4.
+extern "C" __global__ void __launch_bounds__(256, 1)
+forge_rmsnorm_residual_q8_1_ds4(
+        __half * __restrict__ out_f16, void * __restrict__ vy,
+        __half * __restrict__ resid_io, const __half * __restrict__ x,
+        const __half * __restrict__ weight,
+        const int n_cols, const int k_pad, const int n_tokens, const float eps) {
+    forge_rmsnorm_q8_1_ds4_body<true>(out_f16, vy, resid_io, x, weight, n_cols, k_pad, n_tokens, eps);
+}

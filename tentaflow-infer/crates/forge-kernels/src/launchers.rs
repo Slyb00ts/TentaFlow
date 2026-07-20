@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use forge_hal::{DevBuffer, Device, LaunchArgs, LaunchConfig, Pool, Stream};
+use forge_hal::{DevBuffer, Device, KernelHandle, LaunchArgs, LaunchConfig, Pool, Stream};
 use forge_types::{DType, ForgeError, MemKind, Result};
 
 use crate::registry::KernelArtifacts;
@@ -1853,6 +1853,33 @@ impl Kernels {
             .scalar(n_tokens as i64);
         self.device.launch(qk, &qcfg, &qargs, stream)?;
 
+        // (2)+(3) stream-K GEMM + fixup over the just-quantized q8.
+        self.mmq_gemm_and_fixup(
+            sk, fk, y, w, w_byte_off, q8, fixup, rows, cols, n_tokens, smem, stream,
+        )
+    }
+
+    /// The stream-K MMQ GEMM (2) + fixup reduction (3), shared by the internal
+    /// quantize-then-GEMM path (`gemm_mmq_at`) and the prequantized fused-op path
+    /// (`gemm_mmq_prequant_at`). `q8` is the `block_q8_1_mmq` activation and
+    /// `fixup` the stream-K partial-tile buffer.
+    #[allow(clippy::too_many_arguments)]
+    fn mmq_gemm_and_fixup(
+        &self,
+        sk: &KernelHandle,
+        fk: &KernelHandle,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        q8: &DevBuffer,
+        fixup: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        smem: u32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let nsm = self.device.caps().sm_count.max(1) as usize;
         // (2) Stream-K MMQ GEMM writing f16 directly into y. grid(nsm, 1, 1),
         // block(32, MMQ_NWARPS=8, 1), dynamic smem = `smem` (HAL raises the opt-in
         // limit when > 48 KB). stride_row_x = blocks-per-row = cols/256;
@@ -1891,6 +1918,144 @@ impl Kernels {
             .scalar(rows as i64);
         self.device.launch(fk, &fcfg, &fargs, stream)
     }
+
+    /// True when the vendored llama.cpp MMQ prefill GEMM is the active Q4_K/Q6_K
+    /// backend (the default). The fused rmsnorm/silu → q8_1 path is only valid
+    /// under it (it emits the `block_q8_1_mmq` layout that GEMM consumes).
+    pub fn mmq_enabled(&self) -> bool {
+        self.gemm_mmq
+    }
+
+    /// Byte size of a `block_q8_1_mmq` activation buffer over [n_tokens, cols],
+    /// matching `gemm_mmq_at`'s internal scratch. Callers that pre-quantize into
+    /// their own buffer (fused rmsnorm/silu) size it with this.
+    pub fn mmq_q8_bytes(cols: usize, n_tokens: usize) -> usize {
+        const QMMQ: usize = 144;
+        const MATRIX_ROW_PADDING: usize = 512;
+        let k_pad = cols.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
+        (k_pad / 128) * n_tokens * QMMQ + 128 * QMMQ
+    }
+
+    /// Q4_K MMQ GEMM reading an EXTERNALLY prequantized `block_q8_1_mmq` (DS4)
+    /// activation `q8` (produced by the fused rmsnorm→q8_1 kernel) — skips the
+    /// standalone quantize pass of `gemm_mmq_at`. `q8` must have been written for
+    /// this `(cols, n_tokens)` (use `mmq_q8_bytes`). Same stream-K GEMM + fixup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q4_k_mmq_prequant_at(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        q8: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.gemm_mmq_prequant_at("q4k", y, w, w_byte_off, q8, rows, cols, n_tokens, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_mmq_prequant_at(
+        &self,
+        ty: &str,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        w_byte_off: usize,
+        q8: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        const MMQ_Y: usize = 128;
+        let (mmq_x, need_check, smem) = Self::mmq_kk_config(rows, n_tokens);
+        let nc = if need_check { "c" } else { "nc" };
+        let sk = self.artifacts.get(&format!("mmq_sk_{ty}_x{mmq_x}_{nc}"))?;
+        let fk = self.artifacts.get(&format!("mmq_fix_{ty}_x{mmq_x}_{nc}"))?;
+        let nsm = self.device.caps().sm_count.max(1) as usize;
+        let fixup_bytes = nsm * mmq_x * MMQ_Y * std::mem::size_of::<f32>();
+        let mut sc = self.mmq.lock().expect("mmq scratch poisoned");
+        if sc.cap_fixup_bytes < fixup_bytes {
+            sc.fixup = Some(self.device.alloc(fixup_bytes, MemKind::Device, Pool::Activations)?);
+            sc.cap_fixup_bytes = fixup_bytes;
+        }
+        let fixup = sc.fixup.as_ref().expect("fixup allocated");
+        self.mmq_gemm_and_fixup(
+            sk, fk, y, w, w_byte_off, q8, fixup, rows, cols, n_tokens, smem, stream,
+        )
+    }
+
+    /// Fused RMSNorm → q8_1 DS4: writes the normed f16 row into `out_f16` AND the
+    /// `block_q8_1_mmq` DS4 activation into `q8` in one pass, so the Q4_K q/k/v
+    /// (or gate/up) MMQ projections read `q8` directly (no standalone quantize,
+    /// no f16 round-trip re-read). `q8` sized via `mmq_q8_bytes(cols, rows)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_q8_1_ds4(
+        &self,
+        out_f16: &DevBuffer,
+        q8: &DevBuffer,
+        x: &DevBuffer,
+        weight: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("rmsnorm_q8_1_ds4")?;
+        let k_pad = cols.div_ceil(512) * 512;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out_f16)
+            .buf(q8)
+            .buf(x)
+            .buf(weight)
+            .scalar(cols as i64)
+            .scalar(k_pad as i64)
+            .scalar(rows as i64)
+            .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    /// Fused residual-add + RMSNorm → q8_1 DS4: `residual_io += x`, normed row to
+    /// `out_f16`, DS4 activation to `q8`. See `rmsnorm_q8_1_ds4`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_residual_q8_1_ds4(
+        &self,
+        out_f16: &DevBuffer,
+        q8: &DevBuffer,
+        residual_io: &DevBuffer,
+        x: &DevBuffer,
+        weight: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("rmsnorm_residual_q8_1_ds4")?;
+        let k_pad = cols.div_ceil(512) * 512;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out_f16)
+            .buf(q8)
+            .buf(residual_io)
+            .buf(x)
+            .buf(weight)
+            .scalar(cols as i64)
+            .scalar(k_pad as i64)
+            .scalar(rows as i64)
+            .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
 
     /// Replicates ggml's `mul_mat_q_case` mmq_x pick for the RTX 4090 (Ada,
     /// sm_89): the smallest mmq_x (multiple of its granularity, dynamic smem

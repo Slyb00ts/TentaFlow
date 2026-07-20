@@ -10,7 +10,25 @@ najtrudniejszy RDZEŃ jednokartowy (kernele, silnik, KV, batching, kwantyzacja)
 
 Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
-Ostatnia aktualizacja: 2026-07-19.
+Ostatnia aktualizacja: 2026-07-20.
+
+- ✅ **Fuzja RMSNorm→q8_1 (DS4) na ścieżce MMQ prefill** (`forge_rmsnorm_q8_1_ds4`
+  / `forge_rmsnorm_residual_q8_1_ds4`, `kernels/cuda/mmq_q4k.cu`): norm poprzedzający
+  projekcje Q4_K q/k/v (i osobno gate/up) emituje aktywację `block_q8_1_mmq` DS4
+  wprost, więc trzy GEMM-y q/k/v czytają JEDNĄ kwantyzację (2→gate/up), bez osobnego
+  passa `quantize_mmq_q8_1_ds4` i bez rundy f16 przez HBM. Jeden blok/token: redukcja
+  sum-of-squares f32 (dataflow jak `norm.mojo`), potem pakowanie per-32 po tej samej
+  wartości f16 co standalone quant → **bit-w-bit identyczne** (`forge ppl`=30.3113 =
+  baseline; tokeny identyczne; Bielik NVFP4 golden bit-exact 1 i 4 lane). Efekt
+  strukturalny (nsys pp4096): launche `quantize_mmq_q8_1_ds4` **768→320**,
+  `rmsnorm_residual_f16` **256→64**. Bramkowane na ścieżkę MMQ (n_tokens≥64, bez W4A8,
+  bez kalibracji) i q/k/v(gate/up) wszystkie Q4_K; reszta → committed norm+quant.
+  Dekod/NVFP4/W4A8/MoE nietknięte. **Wall-clock neutralne** (best-of-5: pp4096
+  8569→8591, pp8192 ~8200→8243 tok/s) — standalone quant był już ~1.4 % prefill i
+  nakłada się; pułap na RTX 4090 to GEMM MMQ (~56 %) + FA (~24 %), nie fuzowalny ogon
+  non-GEMM (~6 %). Fuzja SwiGLU→q8_1 (down) zaimplementowana i token-identyczna (~2 %),
+  ale reimplementacja `exp` w CUDA psuje bit-identyczność (ppl 30.31→30.38) → **cofnięta**
+  (bramka jakości > ~2 %); down zostaje na `silu_mul_f16` + wewn. quant MMQ.
 
 ---
 

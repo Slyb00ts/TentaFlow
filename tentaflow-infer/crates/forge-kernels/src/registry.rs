@@ -180,6 +180,8 @@ const CUDA_MMQ_ENTRIES: &[(&str, &str)] = &[
     ("mmq_q6k_x128_c", "forge_mmq_q6k_x128_c"),
     ("quantize_mmq_q8_1_ds4", "forge_quantize_mmq_q8_1_ds4"),
     ("quantize_mmq_q8_1_d4", "forge_quantize_mmq_q8_1_d4"),
+    ("rmsnorm_q8_1_ds4", "forge_rmsnorm_q8_1_ds4"),
+    ("rmsnorm_residual_q8_1_ds4", "forge_rmsnorm_residual_q8_1_ds4"),
     ("mmq_sk_q4k_x8_nc", "forge_mmq_sk_q4k_x8_nc"),
     ("mmq_fix_q4k_x8_nc", "forge_mmq_fix_q4k_x8_nc"),
     ("mmq_sk_q4k_x8_c", "forge_mmq_sk_q4k_x8_c"),

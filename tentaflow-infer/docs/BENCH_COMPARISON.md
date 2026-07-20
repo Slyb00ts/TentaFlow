@@ -1229,3 +1229,64 @@ write-back + Q6_K entries + D4 quant; `forge_f32_to_f16` removed), `build.sh`,
 `registry.rs` (Q6_K entries + `quantize_mmq_q8_1_d4`, `mmq_f32_to_f16` removed),
 `launchers.rs` (`gemm_mmq_at` shared Q4_K/Q6_K, writes f16 direct; `MmqScratch` f32 dst
 removed; Q6_K routing in `gemm_q6_k_f16_at`). Default path Bielik NVFP4 golden bit-exact.
+
+---
+
+## 2026-07-20 — Fused RMSNorm → q8_1 (DS4) prefill activation quant
+
+Goal of the pass: fuse the non-GEMM prefill ops that round-trip the [T,hidden]/[T,inter]
+activation through HBM, so the op preceding each Q4_K MMQ projection emits the GEMM's q8_1
+activation directly. Two fusions were attempted; one shipped, one was reverted.
+
+**Shipped — RMSNorm(+residual) → q8_1 DS4** (`forge_rmsnorm_q8_1_ds4` /
+`forge_rmsnorm_residual_q8_1_ds4`, `kernels/cuda/mmq_q4k.cu`). One block per token: the
+f32 sum-of-squares reduction (matching `norm.mojo`'s dataflow — residual add rounds to f16
+in the store, the sum uses the pre-round f32 value), then per-32 q8_1 DS4 packing over the
+SAME f16 normed value the standalone quantize would have re-read from HBM. The vy layout is
+byte-identical to `forge_quantize_mmq_q8_1_ds4`. q/k/v share one normed input → quantized
+**once**; gate/up likewise. Gated on the MMQ default path (n_tokens ≥ 64, no W4A8, no
+calibration) and all-Q4_K q/k/v (or gate/up); anything else falls back to the committed
+norm + per-projection quant. Decode, NVFP4, W4A8, MoE and non-Q4_K paths untouched.
+
+**Bit-identical** (proven): `forge ppl` = **30.3113** (mean_nll 3.41152), identical to the
+committed Q4_K path to the last digit. Coherence `Paris, France. It is one of the most
+famous landmarks in the world. It is a wrought iron tower` and the 90-token MMQ-triggering
+prompt are **token-identical** before/after. Bielik NVFP4 golden bit-exact on 1 and 4 lanes
+(`batched_bielik --ignored`, 84.5 s, PASS).
+
+**Structural effect** (nsys, pp4096, prefill): `forge_quantize_mmq_q8_1_ds4` launches
+**768 → 320** — the redundant q/k/v (3→1) and gate/up (2→1) quantize passes are folded into
+the norm and their f16 re-read is eliminated; `rmsnorm_residual_f16` **256 → 64** (only the
+final-layer / mixed-quant norms stay separate).
+
+**Wall-clock: neutral within measurement noise.** Best-of-5 steady prefill (`bench
+--prefix-cache off`, FA on, cold-clock outliers discarded):
+
+| prompt | committed (norm+quant separate) | shipped (fused norm→q8_1) | vs llama.cpp (~11944) |
+|--------|----------------------------------|---------------------------|------------------------|
+| pp512   | 6206 | 6216 | — |
+| pp4096  | 8569 | 8591 | **0.72×** |
+| pp8192  | ~8200 | 8243 | 0.69× |
+
+Decode unchanged (150 tok/s @4096, 130 @8192). The fusion removes real HBM passes but is
+wall-clock-neutral because on this build the standalone quantize was already tiny
+(≈1.4 % of prefill) and overlaps; the RTX-4090 prefill is dominated by the vendored MMQ
+GEMM (≈56 %) + CUDA flash-attention (≈24 %), i.e. the ratio-to-llama.cpp gap is in the
+GEMM/attention, not the fusable non-GEMM tail (silu 2.7 % + rmsnorm 1.9 % + quant 1.8 %
+≈ 6 % total — smaller than the 15 % the pass was scoped against).
+
+**Reverted — SwiGLU → q8_1** (`silu(gate)*up` writing the down activation directly). It
+was implemented and is **token-identical** (~2 % pp4096), but it reimplements silu's
+`exp` in CUDA (`expf`), which is not bit-for-bit equal to Mojo's `exp`: `forge ppl` drifted
+**30.3113 → 30.3814**. Because that fails the "ppl unchanged / bit-identical" quality gate,
+the silu fusion was reverted; the down projection keeps the committed `silu_mul_f16` + MMQ
+internal quant. (A bit-identical version would require emitting the q8_1 from inside the
+Mojo silu kernel, reusing Mojo's exact `exp` — deferred; the ≈2 % payoff does not justify
+failing the quality gate.)
+
+**Committed state:** `kernels/cuda/mmq_q4k.cu` (`forge_rmsnorm_q8_1_ds4_body<residual>` +
+`forge_pack_q8_1_group` + `forge_block_reduce_sum`), `registry.rs` (`rmsnorm_q8_1_ds4`,
+`rmsnorm_residual_q8_1_ds4`), `launchers.rs` (`rmsnorm_q8_1_ds4`,
+`rmsnorm_residual_q8_1_ds4`, `gemm_q4_k_mmq_prequant_at`, `mmq_gemm_and_fixup`,
+`mmq_q8_bytes`, `mmq_enabled`), `model.rs` (`prefill_forward` fused-norm wiring +
+`gemm_rows_q4k_prequant` + `PrefillBufs.q8_norm`).
