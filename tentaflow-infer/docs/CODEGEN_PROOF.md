@@ -208,3 +208,104 @@ large-win bar, and deep4 regresses K-light shapes + single-buffers below 2 CTAs/
   deep window closes **≤8 %** of the gap, not 3.5× → **pipeline depth is NOT the root cause**; the
   gap is a ptxas instruction-scheduling advantage Mojo's backend does not match. Static-smem cap
   (48 KB) blocks KU≥8 at BM=BN=128; nvcc reaches 256 IMMA/body via dynamic smem. Reverted.
+
+---
+
+## Mojo high-perf primitives revisited (2026-07-20) — corrects the record
+
+Exp 1–5 A/B'd FORGE's **hand-rolled** int8 kernel (raw `mma`+`ld_matrix`, static-smem
+double-buffer, no cp.async, no `LayoutTensor`) against nvcc. This pass asks a different
+question: does Modular's **own** high-performance kernel library — `layout.tensor_core.TensorCore`,
+the `linalg` multistage `cp.async` pipeline, swizzled shared layouts — reach parity on **Ada
+(sm_89)**? The library is importable in our pixi Mojo (`Mojo 1.0.0b3.dev2026071614`,
+`from linalg.matmul.gpu import _matmul_gpu`, `from layout.tensor_core import TensorCore`).
+All numbers below are raw from this RTX 4090. Bench files:
+`kernels/mojo/bench_modular_matmul.mojo` (committed), `kernels/mojo/scratch/bench_modular_fp8.mojo`,
+`kernels/mojo/scratch/verify_modular_bf16.mojo`.
+
+### Finding A — Modular's `TensorCore` has NO int8 on NVIDIA (source-level, decisive)
+
+`layout/tensor_core.mojo::get_mma_shape[input, accum]` on `has_nvidia_gpu_accelerator()` returns
+shapes only for `fp32` (16×8×8), `bf16`/`fp16` (16×8×16) and `fp8 e4m3/e5m2` (16×8×32); the
+`else` arm is `comptime assert False, "Unsupported mma shape"`. `int8/int32` mma is defined
+**only for AMD** (RDNA/CDNA, 16×16×16). `TensorCore.load_a/load_b/mma_op` all gate on
+`supported_fp32 or supported_half or supported_fp8`. **There is no int8 tensor-core path in
+Modular's high-level primitive for NVIDIA at all** — Ada or otherwise. FORGE's raw-`mma` kernel
+is therefore not a case of "not using the good primitive"; for NVIDIA int8 it is the *only*
+route Mojo offers. The high-level abstraction cannot be applied.
+
+Consequently the top-level `linalg` `matmul` also refuses int8 on NVIDIA:
+`_matmul_gpu`'s `matmul_supported_format_nvidia = a/b/c ∈ {float32, bfloat16}` — int8 falls to a
+naive fallback, never the multistage tensor-core kernel. The multistage kernel itself asserts
+`a_type ∈ {f32, bf16, f16}` or `{e4m3, e5m2}` — "Pipeline gemm only supports tf32, F16, BF16,
+E4M3, E5M2 mma".
+
+### Finding B — Modular's fast int8/quantized GEMMs are Hopper/Blackwell only (the crux)
+
+Every fast *quantized* matmul in the tree — `grouped_matmul_block_scaled`, `mxfp4`, `nvfp4`,
+blockwise-fp8, the "beat cuBLAS 1.2× at ~83 % of int8 peak" kernels — lives under
+`matmul/gpu/sm90/` (Hopper **WGMMA**) and `matmul/gpu/sm100_structured/` (Blackwell **tcgen05**),
+using block-scaled MMA + TMA. **Ada (sm_89) has neither WGMMA nor tcgen05.** Ada dispatches to the
+`sm80` Ampere multistage path, which is bf16/fp32/fp8 only. **So Modular's 83 %-of-int8-peak
+result is NOT Ada-achievable — it is a Hopper/Blackwell property of WGMMA/tcgen05 block-scaled
+MMA.** For dense int8 on Ada, the only instruction is `mma.m16n8k32.s8.s8.s32`, driven raw — i.e.
+exactly what Exp 1–5 already measured hitting the ptxas scheduling wall (~66 vs 208 TOPS).
+**CODEGEN_PROOF's conclusion for int8-on-Ada stands.**
+
+### Finding C — but Modular's primitives DO schedule at peak on Ada (bf16, measured)
+
+The refutation of the old "Mojo can't schedule on Ada" worry: the ready-made `_matmul_gpu`
+(multistage `cp.async` + `TensorCore` + swizzle), bf16 in / f32 out, at the Mistral FFN shapes,
+steady-state best-of-40 (correctness-checked vs CPU golden, max rel err 1.5e-4):
+
+| shape (T, N, K) | role | Modular bf16 TFLOPS |
+|---|---|---|
+| 2048, 4096, 14336 | down-proj | **170.9** |
+| 2048, 14336, 4096 | gate/up | **163.9** |
+| 512, 14336, 4096 | gate/up | 136.5 |
+| 512, 4096, 14336 | down-proj | 71.9 (skinny-M, config untuned) |
+
+At prefill batch T=2048 this is **~165–171 TFLOPS = the RTX 4090 bf16 (fp32-accum) tensor peak**.
+Modular's Mojo primitives extract full hardware throughput on Ada — the Exp-2 gap was specific to
+the *int8 hand kernel*, not a Mojo/Ada ceiling. (At T=512 the default tile is memory/launch-bound
+on skinny M; a tuned config would recover it.)
+
+### Finding D — fp8 (e4m3) is hardware-valid on Ada and Modular supports it — blocked only by Mojo's PTX-version cap
+
+`TensorCore` *does* expose fp8 (16×8×32, e4m3/e5m2) on NVIDIA, and the multistage kernel accepts
+it (`c_type=float32`). Forcing it (`multistage_gemm[config=MatmulConfig[e4m3,e4m3,f32,True](BK=64)]`)
+on the 4090 **fails at JIT ptxas**: *"Feature 'mma with FP8 floating point type' requires PTX ISA
+.version 8.4 or later."* Root cause: **Mojo's NVPTX backend emits `.version 8.1` for sm_89**
+(confirmed from the emitted PTX). It is not a hardware limit — Ada has 4th-gen fp8 tensor cores,
+and system `ptxas 13.3` is installed. Proof: taking Modular's own emitted fp8 kernel PTX
+(`--emit asm`), `sed`-ing `.version 8.1 → 8.4`, and running system `ptxas -arch=sm_89 -O3`
+**builds a valid cubin** whose SASS is `64× QMMA.16832.F32.E4M3.E4M3` + `LDGSTS` (cp.async) +
+`LDSM` (ldmatrix), 228 regs — a real deep-pipelined fp8 tensor-core GEMM on sm_89. FORGE's build
+already post-processes Mojo PTX and its HAL loads cubins, so a one-line `.version` patch + a
+`ptxas` step is entirely inside FORGE's control. Throughput not measured (the JIT `run` path
+can't emit 8.4); **projected ~2× the bf16 result (~300 TFLOPS, fp32-accum ceiling ~330 boost)**
+by the Ada fp8:bf16 = 2:1 hardware ratio.
+
+### Bottom line (this pass) + recommendation
+
+- **Can a Mojo *int8* GEMM reach parity with the CUDA MMQ (~208 TOPS) on the 4090? NO.** Modular
+  has no NVIDIA int8 primitive; its fast int8 is WGMMA/tcgen05 (Hopper/Blackwell), absent on Ada.
+  Raw-`mma` int8 is the only Ada route and hits the ~66-TOPS ptxas wall (Exp 1–5). **The CUDA MMQ
+  exception is justified for a like-for-like int8 GEMM on Ada.**
+- **But the record is corrected on two counts the earlier proof missed, both 100 % Mojo and
+  neither requiring int8:**
+  1. **bf16 path — works today.** Dequant Q4_K→bf16 + Modular `_matmul_gpu` = **170 TFLOPS**
+     measured = **0.82×** the CUDA int8 MMQ (208) and **2.6×** the old Mojo int8 (66). Cost: a
+     dequant pass + 2× weight bandwidth (compute-bound at T≥2048, so the rate holds). This alone
+     could retire the CUDA GEMM at a modest speed cost while staying 100 % Mojo.
+  2. **fp8 path — the real win, one build step away.** Modular's multistage fp8 GEMM compiles and
+     is hardware-valid on sm_89 (cubin proven); projected ~300 TFLOPS would **beat** the CUDA MMQ
+     *and* be 100 % Mojo. Blocker is solely Mojo emitting `.version 8.1`; unblock = patch the
+     emitted PTX to `8.4` before `ptxas` in `build_kernels` (FORGE already owns that step).
+     Follow-up needed: Q4_K→fp8-e4m3 dequant with per-block scales + accuracy validation, and the
+     measured fp8 TFLOPS via the patched-PTX cubin.
+- **Recommendation:** keep the CUDA MMQ as the committed default for now (unchanged this pass).
+  Pursue the **fp8 path** as the route to a 100 %-Mojo prefill GEMM that beats CUDA on Ada — it is
+  the first concrete way to retire the ADR-0001 exception. bf16 is the safe fallback if fp8
+  accuracy proves insufficient. Neither needs int8, so the CODEGEN_PROOF int8 conclusion and these
+  new paths are consistent, not contradictory.
