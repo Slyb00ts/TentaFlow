@@ -246,6 +246,41 @@ pub fn w4a8_enabled() -> bool {
     std::env::var("FORGE_GEMM").ok().as_deref() == Some("w4a8")
 }
 
+/// One fp8 (e4m3) projection: e4m3 weight bytes [N,K] + per-output-row f32
+/// scale. Non-default prefill GEMM (`FORGE_GEMM=fp8`); the original Q4_K weight
+/// stays alongside for decode + the logit head, so this is an ADDITIONAL store.
+/// Because e4m3 is floating point, one per-row scale (not per-32-block like
+/// int8) captures the row's magnitude spread — the block-to-block variation is
+/// absorbed by e4m3's 4-bit exponent.
+pub struct Fp8Weight {
+    /// e4m3 bytes [rows, cols], row-major (one byte per weight).
+    pub qweight: DevBuffer,
+    /// Per-output-row dequant scale, f32 [rows]: `w ≈ scale[r] · e4m3[r,c]`.
+    pub scales: DevBuffer,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+/// fp8 packs of every prefill projection in one dense layer. Each is its own
+/// logical matrix (q/k/v and gate/up are NOT fused): a fused-row window would
+/// need a per-row-scale slice that the GEMM reads by absolute row, so splitting
+/// at load keeps every pack self-contained.
+pub struct Fp8Layer {
+    pub q: Fp8Weight,
+    pub k: Fp8Weight,
+    pub v: Fp8Weight,
+    pub attn_o: Fp8Weight,
+    pub gate: Fp8Weight,
+    pub up: Fp8Weight,
+    pub down: Fp8Weight,
+}
+
+/// Whether the fp8 (e4m3) prefill GEMM is selected (`FORGE_GEMM=fp8`). Default
+/// and any other value keep the committed CUDA MMQ Q4_K path.
+pub fn fp8_enabled() -> bool {
+    std::env::var("FORGE_GEMM").ok().as_deref() == Some("fp8")
+}
+
 /// Per-input-channel activation abs-max collected during the W4A8 calibration
 /// pass (one vector per transformer layer, one set per linear-input point).
 /// This is the SmoothQuant migration signal — statistics only, no original
@@ -420,6 +455,9 @@ pub struct ModelWeights {
     /// Per-layer W4A8 packs for the prefill GEMM when `FORGE_GEMM=w4a8`, else
     /// `None`. Dense models only; the decode/logit paths keep the Q4_K weights.
     pub w4a8: Option<Vec<W4A8Layer>>,
+    /// Per-layer fp8 (e4m3) packs for the prefill GEMM when `FORGE_GEMM=fp8`,
+    /// else `None`. Dense models only; decode/logit keep the resident weights.
+    pub fp8: Option<Vec<Fp8Layer>>,
 }
 
 /// Source-agnostic host-side tensor fetch: (bytes, dtype, quant, dims).
@@ -1110,6 +1148,60 @@ fn pack_w4a8_from_f32(
     })
 }
 
+/// Dequantize a 2-D projection tensor to fp32 row-major `[rows, cols]` for the
+/// fp8 pack. Format-agnostic; only requires `cols % 32 == 0` (the fp8 GEMM's K
+/// tile), looser than the W4A8 shape constraint.
+fn dequant_matrix_f32_fp8(src: &dyn TensorSource, name: &str) -> Result<(Vec<f32>, usize, usize)> {
+    let (data, dtype, quant, dims) = src.fetch(name)?;
+    if dims.len() != 2 {
+        return Err(ForgeError::Format(format!(
+            "{name}: expected matrix for fp8, got {dims:?}"
+        )));
+    }
+    let (rows, cols) = (dims[0], dims[1]);
+    if !cols.is_multiple_of(32) {
+        return Err(ForgeError::Unsupported(format!(
+            "fp8 needs cols % 32 == 0, {name} is [{rows}, {cols}]"
+        )));
+    }
+    let f32s = dequantize_to_f32(dtype, quant, &data, rows * cols)?;
+    Ok((f32s, rows, cols))
+}
+
+/// Pack an already-dequantized fp32 projection to e4m3 with ONE scale per
+/// output row (`scale[r] = absmax(row r) / 448`), then upload. Rows whose
+/// weights are all zero get scale 0 (their e4m3 codes are zero too).
+fn pack_fp8_from_f32(
+    device: &dyn Device,
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<Fp8Weight> {
+    let mut codes = vec![0u8; rows * cols];
+    let mut scales = vec![0f32; rows];
+    for r in 0..rows {
+        let row = &w[r * cols..(r + 1) * cols];
+        let absmax = row.iter().fold(0f32, |m, &x| m.max(x.abs()));
+        if absmax == 0.0 {
+            continue;
+        }
+        let scale = absmax / 448.0;
+        let inv = 448.0 / absmax;
+        scales[r] = scale;
+        let dst = &mut codes[r * cols..(r + 1) * cols];
+        for (c, &x) in row.iter().enumerate() {
+            dst[c] = forge_formats::nvfp4::f32_to_f8e4m3(x * inv);
+        }
+    }
+    let scale_bytes: Vec<u8> = scales.iter().flat_map(|s| s.to_le_bytes()).collect();
+    Ok(Fp8Weight {
+        qweight: upload(device, &codes)?,
+        scales: upload(device, &scale_bytes)?,
+        rows,
+        cols,
+    })
+}
+
 /// Row-concatenate projection matrices into one [Σrows, cols] matrix. Every
 /// supported format stores rows as independent contiguous byte runs (f16
 /// elements, Q8_0 34-byte blocks, NVFP4 packed nibbles + FP8 scale bytes),
@@ -1585,6 +1677,7 @@ impl ModelWeights {
             fused_qk_layers,
             fused_gate_up_layers,
             w4a8: None,
+            fp8: None,
         })
     }
 
@@ -1734,6 +1827,7 @@ impl ModelWeights {
             fused_qk_layers: 0,
             fused_gate_up_layers: 0,
             w4a8: None,
+            fp8: None,
         })
     }
 
@@ -1807,6 +1901,39 @@ impl ModelWeights {
                 gate,
                 up,
                 down,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Build every layer's fp8 (e4m3) pack from the resident GGUF weights. No
+    /// calibration or SmoothQuant migration is needed: e4m3's floating-point
+    /// range lets one per-row scale capture the weight distribution, so each
+    /// projection is packed independently (dequant → per-row absmax → e4m3).
+    /// Format-agnostic — operates on dequantized fp32, so any resident quant
+    /// works; GGUF re-open is wired here (the dense fp8 gate model is Q4_K).
+    pub fn rebuild_fp8(&self, device: &dyn Device, path: &Path) -> Result<Vec<Fp8Layer>> {
+        let gguf = Gguf::open(path)?;
+        let src = GgufSource(&gguf);
+        let mut out = Vec::with_capacity(self.descriptor.layers.len());
+        for (idx, layer_map) in self.descriptor.layers.iter().enumerate() {
+            let name = |role: WeightRole| -> Result<&String> {
+                layer_map
+                    .get(&role)
+                    .ok_or_else(|| ForgeError::Format(format!("layer {idx}: missing {role:?}")))
+            };
+            let pack = |role: WeightRole| -> Result<Fp8Weight> {
+                let (w, r, c) = dequant_matrix_f32_fp8(&src, name(role)?)?;
+                pack_fp8_from_f32(device, &w, r, c)
+            };
+            out.push(Fp8Layer {
+                q: pack(WeightRole::AttnQ)?,
+                k: pack(WeightRole::AttnK)?,
+                v: pack(WeightRole::AttnV)?,
+                attn_o: pack(WeightRole::AttnO)?,
+                gate: pack(WeightRole::FfnGate)?,
+                up: pack(WeightRole::FfnUp)?,
+                down: pack(WeightRole::FfnDown)?,
             });
         }
         Ok(out)

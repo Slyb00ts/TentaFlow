@@ -36,6 +36,77 @@ pub fn f8e4m3_to_f32(b: u8) -> f32 {
     }
 }
 
+/// f32 → FP8 E4M3FN byte, round-to-nearest-even, saturating to ±448 (e4m3fn
+/// has no infinities; the max finite is 448). NaN maps to the canonical NaN
+/// 0x7F. Mirrors the hardware `cvt.rn.satfinite.e4m3` used by the GPU quantizer,
+/// so the CPU weight pack and the on-device activation quant agree bit-for-bit.
+pub fn f32_to_f8e4m3(v: f32) -> u8 {
+    if v.is_nan() {
+        return 0x7F;
+    }
+    let sign: u8 = if v.is_sign_negative() { 0x80 } else { 0x00 };
+    let a = v.abs();
+    if a == 0.0 {
+        return sign;
+    }
+    // Saturate to the largest finite magnitude (448 = 1.75 * 2^8).
+    if a >= 448.0 {
+        return sign | 0x7E;
+    }
+    // Round mantissa in the f32 domain, then re-extract the e4m3 fields.
+    let bits = a.to_bits();
+    let e = ((bits >> 23) & 0xFF) as i32 - 127; // unbiased f32 exponent
+    if e < -9 {
+        // Below the smallest subnormal (2^-9); flushes to zero (RNE: half of
+        // the smallest subnormal rounds to even = 0).
+        return sign;
+    }
+    if e < -6 {
+        // Subnormal e4m3: value = man/8 * 2^-6, man in 0..=7.
+        let scaled = a / (1.0 / 64.0); // a * 2^6 → man/8 domain (× further below)
+        // man = round(a * 2^6 * 8) = round(a * 2^9), ties to even.
+        let man = round_ties_even(a * 512.0);
+        let man = man.clamp(0.0, 8.0) as u32;
+        if man == 8 {
+            // Rounded up into the smallest normal (exp=1, man=0).
+            return sign | (1 << 3);
+        }
+        let _ = scaled;
+        return sign | (man as u8 & 0x07);
+    }
+    // Normal e4m3: exp field = e + 7 (1..=15), 3 mantissa bits (RNE).
+    let mant_f = (a / 2f32.powi(e)) - 1.0; // in [0,1)
+    let man = round_ties_even(mant_f * 8.0);
+    let (mut exp_field, man) = if man >= 8.0 {
+        (e + 7 + 1, 0u32) // mantissa carry bumps the exponent
+    } else {
+        (e + 7, man as u32)
+    };
+    if exp_field >= 15 && !(exp_field == 15 && man <= 6) {
+        // Overflow into the NaN slot → saturate to max finite.
+        return sign | 0x7E;
+    }
+    if exp_field > 15 {
+        exp_field = 15;
+    }
+    sign | ((exp_field as u8) << 3) | (man as u8 & 0x07)
+}
+
+fn round_ties_even(x: f32) -> f32 {
+    let r = x.round(); // rounds halves away from zero
+    if (x - x.floor() - 0.5).abs() < f32::EPSILON {
+        // Exact tie: pick the even neighbor.
+        let lo = x.floor();
+        if (lo as i64) % 2 == 0 {
+            lo
+        } else {
+            lo + 1.0
+        }
+    } else {
+        r
+    }
+}
+
 fn e2m1_to_f32(nibble: u8) -> f32 {
     let mag = E2M1_LUT[(nibble & 0x07) as usize];
     if nibble & 0x08 != 0 {

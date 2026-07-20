@@ -43,6 +43,7 @@ from src.gemm import gemm_q4_k_f16, gemm_q4_k_f16_bm64
 from src.gemm import gemm_q8_0_i8mma, gemm_q8_0_i8mma_bm64, gemm_q8_0_i8mma_big
 from src.gemm import quantize_act_q8_1
 from src.gemm import gemm_q4_k_i8mma, gemm_q4_k_i8mma_bm64, gemm_q4_k_i8mma_big
+from src.gemm_fp8 import gemm_fp8_f16, gemm_fp8_f16_bm64, gemm_fp8_f16_big, quantize_act_fp8
 from src.gemm import gemm_q6_k_f16, gemm_q6_k_f16_bm64
 from src.prefill import kv_append_batch_f16, attn_prefill_f16_hd64, attn_prefill_f16_hd128, attn_prefill_f16_hd256
 from src.prefill import kv_append_batch_fp8, attn_prefill_fp8_hd64, attn_prefill_fp8_hd128
@@ -159,6 +160,36 @@ def _finalize(out_dir: Path, name: StringSlice) raises -> String:
     tmp = Path(String(name) + ".ptx")
     final = out_dir / (String(name) + ".ptx")
     final.write_text(tmp.read_text())
+    os.remove(String(tmp))
+    entry = _entry_from_ptx(final)
+    print("  compiled", name, "->", entry)
+    return (
+        String('    "')
+        + String(name)
+        + String('": {"file": "')
+        + String(name)
+        + String('.ptx", "entry": "')
+        + entry
+        + String('"}')
+    )
+
+
+def _finalize_fp8(out_dir: Path, name: StringSlice) raises -> String:
+    # Same as `_finalize`, but bump the PTX ISA `.version` to 8.4. Mojo's NVPTX
+    # emitter caps sm_89 at 8.1, which ptxas (and the driver's JIT) reject for
+    # the fp8 e4m3 m16n8k32 mma (needs >= 8.4). Ada's 4th-gen fp8 tensor cores
+    # are hardware-valid at 8.4, so the committed .ptx is self-contained — the
+    # driver JIT accepts it with no runtime shim (the shim is only for `mojo
+    # run` JIT of scratch/tests). This only lifts an emitter version cap; it
+    # does not change kernel semantics.
+    tmp = Path(String(name) + ".ptx")
+    final = out_dir / (String(name) + ".ptx")
+    text = tmp.read_text()
+    text = text.replace(".version 8.0", ".version 8.4")
+    text = text.replace(".version 8.1", ".version 8.4")
+    text = text.replace(".version 8.2", ".version 8.4")
+    text = text.replace(".version 8.3", ".version 8.4")
+    final.write_text(text)
     os.remove(String(tmp))
     entry = _entry_from_ptx(final)
     print("  compiled", name, "->", entry)
@@ -970,6 +1001,18 @@ def main() raises:
 
     _ = ctx.compile_function[lstm_f32, dump_asm=Path("lstm_f32.ptx")]()
     entries.append(_finalize(out_dir, "lstm_f32"))
+
+    _ = ctx.compile_function[quantize_act_fp8, dump_asm=Path("quantize_act_fp8.ptx")]()
+    entries.append(_finalize(out_dir, "quantize_act_fp8"))
+
+    _ = ctx.compile_function[gemm_fp8_f16, dump_asm=Path("gemm_fp8_f16.ptx")]()
+    entries.append(_finalize_fp8(out_dir, "gemm_fp8_f16"))
+
+    _ = ctx.compile_function[gemm_fp8_f16_bm64, dump_asm=Path("gemm_fp8_f16_bm64.ptx")]()
+    entries.append(_finalize_fp8(out_dir, "gemm_fp8_f16_bm64"))
+
+    _ = ctx.compile_function[gemm_fp8_f16_big, dump_asm=Path("gemm_fp8_f16_big.ptx")]()
+    entries.append(_finalize_fp8(out_dir, "gemm_fp8_f16_big"))
 
     var manifest = String('{\n  "arch": "') + arch + String('",\n  "kernels": {\n')
     for i in range(len(entries)):

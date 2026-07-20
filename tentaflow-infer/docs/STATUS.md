@@ -215,6 +215,33 @@ Ostatnia aktualizacja: 2026-07-20.
     (1024→2048) = neutralne. Nic nie wdrożono. Realna praca na lukę 4.3×: Q6_K
     down-proj przez int8-mma (~+5 %), redukcja `barrier()` per 32 kol, fused
     flash-attn prefill / megakernel (przyszłe pasy) — `docs/BENCH_COMPARISON.md`.
+  - ✅ **fp8 (e4m3) prefill GEMM = PRAWDZIWY kernel Mojo, jakość near-lossless, ale
+    WOLNIEJSZY e2e niż CUDA MMQ na Ada (`FORGE_GEMM=fp8`, non-default, 2026-07-20).**
+    Faza-2: `kernels/mojo/src/gemm_fp8.mojo` — jedno-PTX e4m3 tensor-core GEMM
+    (`mma.m16n8k32.f32.e4m3.e4m3.f32`, skala per-wiersz wag + per-token aktywacji,
+    akumulacja f32, skalowanie w epilogu) + `quantize_act_fp8`. Komitowany PTX
+    samowystarczalny: `build_kernels.mojo` (`_finalize_fp8`) podbija `.version`→8.4,
+    więc sterownik JIT akceptuje bez runtime-shima (shim tylko dla `mojo run`
+    scratchy). Kernel = exact CPU fp8 ref do 0.0012, wszystkie 3 kształty tile
+    bit-identyczne (`test_gemm_fp8.mojo`). Pack Q4_K→fp8 + `build_fp8` w
+    `weights.rs`/`model.rs`, route w `prefill_forward`, launcher `gemm_fp8`.
+    **Jakość (held-out PPL, Mistral-7B Q4_K_M): Q4_K 30.31 vs fp8 30.52 (+0.69 %)**
+    — near-lossless (jak predykcja fidelity 2.15 %, nic jak W4A8 +25 %), koherentny
+    (Eiffel→Paris). Schemat skala per-wiersz+per-token WALIDOWANY: wykładnik e4m3
+    absorbuje rozrzut blok-do-blok, brak potrzeby skali per-blok / kalibracji.
+    **Perf (oba +FA, `--prefix-cache off`, RTX 4090): pp512 3015→2242 (−26 %),
+    pp4096 8028→6472 (−19 %), pp8192 7953→6301 (−21 %); dekod bit-bez-zmian.**
+    Root-cause (nsys): sam GEMM fp8 jest regresją, NIE quant aktywacji — mediana
+    per-launch **fp8 GEMM 671 µs vs CUDA MMQ 267 µs (~2.5× wolniej)**;
+    `quantize_act_fp8` = tylko 3 % czasu GPU. Dwie przyczyny: (1) na Ada fp8 i int8
+    tensor-core mają TEN SAM peak (~660 dense TOPS/TFLOPS na 4090 — 2× fp8 dopiero
+    Hopper/Blackwell), brak przewagi sprzętowej; (2) 305 TFLOPS z Finding E to
+    dostrojony `multistage_gemm` Modulara (host-dispatcher, nie do AOT-PTX bez
+    runtime Mojo/ADR-0001) — shippable jedno-PTX kernel ma prostszą strukturę hand
+    int8-MMQ (sync smem, bez stream-K), stąd przegrywa jak Mojo int8 z ggml MMQ.
+    Werdykt: fp8 NIE bije MMQ na Ada w żadnym kształcie → NON-DEFAULT, wyjątek CUDA
+    MMQ NIE wycofany. Wygrałby na Hopper/Blackwell lub po przepisaniu kernela na
+    cp.async-multistage + stream-K. `docs/CODEGEN_PROOF.md` Finding F.
   - ℹ️ **Pas ILP/barier i8mma (2026-07-19): każdy lever zmierzony, NIC nie
     wdrożono (no-op lub regresja).** Zaimplementowane bit-identycznie (mma int
     jest dokładne): (1) rozdział wydania mma od epilogu f32, (2) 2 k-stage'y na

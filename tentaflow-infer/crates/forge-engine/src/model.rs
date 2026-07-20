@@ -21,7 +21,7 @@ use crate::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use crate::tier::{KvTierConfig, TierManager, STAGE_SLOTS};
 use crate::weights::{
     AttnWeights, CalibStats, DeltaNetWeights, DevWeight, GateUpWeights, LayerFfn, LayerMixer,
-    MoeFfn, ModelWeights, QkvWeights, W4A8Weight,
+    Fp8Weight, MoeFfn, ModelWeights, QkvWeights, W4A8Weight,
 };
 
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
@@ -1682,6 +1682,21 @@ impl Model {
         )
     }
 
+    /// fp8 (e4m3) prefill projection GEMM (per-token e4m3 activation quant +
+    /// e4m3×e4m3 tensor-core GEMM). Each fp8 weight is a standalone logical
+    /// matrix, so no windowing. `FORGE_GEMM=fp8`.
+    fn gemm_fp8(
+        &self,
+        y: &DevBuffer,
+        w: &Fp8Weight,
+        x: &DevBuffer,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.kernels
+            .gemm_fp8(y, &w.qweight, &w.scales, x, w.rows, w.cols, n_tokens, stream)
+    }
+
     /// Q4_K row-window GEMM over an EXTERNALLY prequantized q8_1 DS4 activation
     /// (fused rmsnorm→q8_1). `w` must be Q4_K (callers gate on `qkv_all_q4k` /
     /// `gateup_all_q4k`). Mirrors `gemm_rows`' Q4_K byte-offset math.
@@ -2185,7 +2200,8 @@ impl Model {
         let mmq_fuse = kernels.mmq_enabled()
             && t >= 64
             && calib.is_none()
-            && self.weights.w4a8.is_none();
+            && self.weights.w4a8.is_none()
+            && self.weights.fp8.is_none();
         let qkv_all_q4k = |l: usize| -> bool {
             match &self.weights.layers[l].attn().attn_qkv {
                 QkvWeights::Fused(w) => matches!(w, DevWeight::Q4K { .. }),
@@ -2241,6 +2257,7 @@ impl Model {
             // pack, so q/k/v are three standalone GEMMs. The Q4_K weights stay
             // loaded for decode + the logit head.
             let w4a8_layer = self.weights.w4a8.as_ref().map(|v| &v[l]);
+            let fp8_layer = self.weights.fp8.as_ref().map(|v| &v[l]);
 
             // Calibration capture 1/4: q/k/v input (attn-norm output).
             if let Some(cal) = calib.as_mut() {
@@ -2257,6 +2274,10 @@ impl Model {
                 self.gemm_w4a8(&pb.q, &wl.q, &pb.x, t, stream)?;
                 self.gemm_w4a8(&pb.k, &wl.k, &pb.x, t, stream)?;
                 self.gemm_w4a8(&pb.v, &wl.v, &pb.x, t, stream)?;
+            } else if let Some(fl) = fp8_layer {
+                self.gemm_fp8(&pb.q, &fl.q, &pb.x, t, stream)?;
+                self.gemm_fp8(&pb.k, &fl.k, &pb.x, t, stream)?;
+                self.gemm_fp8(&pb.v, &fl.v, &pb.x, t, stream)?;
             } else if fuse_qkv {
                 // q/k/v read the shared DS4 activation the preceding attn-norm
                 // already emitted into pb.q8_norm (no per-projection quantize).
@@ -2469,6 +2490,8 @@ impl Model {
             }
             if let Some(wl) = w4a8_layer {
                 self.gemm_w4a8(&pb.o_out, &wl.attn_o, &pb.attn_out, t, stream)?;
+            } else if let Some(fl) = fp8_layer {
+                self.gemm_fp8(&pb.o_out, &fl.attn_o, &pb.attn_out, t, stream)?;
             } else {
                 self.gemm(&pb.o_out, &layer.attn().attn_o, &pb.attn_out, t, stream)?;
             }
@@ -2495,6 +2518,9 @@ impl Model {
                     if let Some(wl) = w4a8_layer {
                         self.gemm_w4a8(&pb.gate, &wl.gate, &pb.x, t, stream)?;
                         self.gemm_w4a8(&pb.up, &wl.up, &pb.x, t, stream)?;
+                    } else if let Some(fl) = fp8_layer {
+                        self.gemm_fp8(&pb.gate, &fl.gate, &pb.x, t, stream)?;
+                        self.gemm_fp8(&pb.up, &fl.up, &pb.x, t, stream)?;
                     } else if fuse_gateup {
                         match &dffn.gate_up {
                             GateUpWeights::Fused(w) => {
@@ -2528,6 +2554,8 @@ impl Model {
                     }
                     if let Some(wl) = w4a8_layer {
                         self.gemm_w4a8(&pb.down, &wl.down, &pb.act, t, stream)?;
+                    } else if let Some(fl) = fp8_layer {
+                        self.gemm_fp8(&pb.down, &fl.down, &pb.act, t, stream)?;
                     } else {
                         self.gemm(&pb.down, &dffn.down, &pb.act, t, stream)?;
                     }
@@ -2639,6 +2667,24 @@ impl Model {
             .weights
             .rebuild_w4a8_smoothed(self.device.as_ref(), path, &stats)?;
         self.weights.w4a8 = Some(layers);
+        Ok(())
+    }
+
+    /// Build the fp8 (e4m3) prefill packs from the resident GGUF weights. No
+    /// calibration pass is needed (e4m3's exponent captures the per-row range),
+    /// so this just dequantizes every dense projection and repacks it to e4m3
+    /// with a per-row scale. Must be called once after load when
+    /// `FORGE_GEMM=fp8`; before it runs `fp8` is `None` and prefill stays on the
+    /// resident (Q4_K MMQ) path.
+    pub fn build_fp8(&mut self, path: &Path) -> Result<()> {
+        if self.is_hybrid() || self.weights.is_moe() {
+            return Err(ForgeError::Unsupported(
+                "fp8 prefill supports dense (non-MoE, non-hybrid) models only".into(),
+            ));
+        }
+        self.weights.fp8 = None;
+        let layers = self.weights.rebuild_fp8(self.device.as_ref(), path)?;
+        self.weights.fp8 = Some(layers);
         Ok(())
     }
 

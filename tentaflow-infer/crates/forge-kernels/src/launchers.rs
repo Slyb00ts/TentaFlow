@@ -51,6 +51,9 @@ pub struct Kernels {
     /// `w4a8_quant_act`, then `w4a8_gemm` reads them directly. Non-default path
     /// (FORGE_GEMM=w4a8); separate from the q8_1 `prequant` (different layout).
     w4a8_act: Mutex<W4A8ActScratch>,
+    /// Grow-only per-token e4m3 activation scratch for the fp8 prefill GEMM
+    /// (FORGE_GEMM=fp8).
+    fp8_act: Mutex<Fp8ActScratch>,
     /// Grow-only scratch for the vendored llama.cpp Q4_K / Q6_K MMQ GEMM
     /// (kernels/cuda/mmq_q4k.cu): the `block_q8_1_mmq` activation buffer. The
     /// GEMM writes f16 directly into the caller's output. Separate layout from
@@ -102,6 +105,20 @@ struct W4A8ActScratch {
     /// Current int8-code capacity (elements) of `a_i8`.
     cap_codes: usize,
     /// Current token capacity of `ascales`.
+    cap_tokens: usize,
+}
+
+/// Device-resident per-token e4m3 activation scratch for the fp8 GEMM: `x` is
+/// quantized ONCE into `xq` (e4m3 bytes [T,K]) + `xs` (f32 per-token scale [T])
+/// by `quantize_act_fp8`, then `gemm_fp8` reads them directly. Non-default path
+/// (FORGE_GEMM=fp8); separate layout from the q8_1 `prequant`.
+#[derive(Default)]
+struct Fp8ActScratch {
+    xq: Option<DevBuffer>,
+    xs: Option<DevBuffer>,
+    /// Current e4m3-code capacity (elements) of `xq`.
+    cap_codes: usize,
+    /// Current token capacity of `xs`.
     cap_tokens: usize,
 }
 
@@ -164,6 +181,7 @@ impl Kernels {
             iq_tables,
             prequant: Mutex::new(PrequantScratch::default()),
             w4a8_act: Mutex::new(W4A8ActScratch::default()),
+            fp8_act: Mutex::new(Fp8ActScratch::default()),
             mmq: Mutex::new(MmqScratch::default()),
             gemm_mmq: matches!(
                 std::env::var("FORGE_GEMM").ok().as_deref(),
@@ -2431,6 +2449,102 @@ impl Kernels {
         self.w4a8_gemm(
             y, a_i8, qweight, s2_zeros, s2_scales, wscales, ascales, n_tokens, rows, cols, stream,
         )
+    }
+
+    /// Tile selection for the fp8 GEMM: `(suffix, BM, BN, block_threads)`. The
+    /// f32 mma accumulate is exact across tile shapes (bit-identical, like the
+    /// integer i8mma), so this is a pure perf gate; mirrors `gemm_i8mma_tile`.
+    fn gemm_fp8_tile(rows: usize, n_tokens: usize) -> (&'static str, u32, u32, u32) {
+        let big_blocks = rows.div_ceil(128) * n_tokens.div_ceil(128);
+        if n_tokens >= 1024 && big_blocks >= 256 {
+            ("_big", 128, 128, 512)
+        } else if n_tokens >= 256 {
+            ("", 128, 64, 256)
+        } else {
+            ("_bm64", 64, 64, 256)
+        }
+    }
+
+    /// Per-token e4m3 activation quant + fp8 (e4m3-weight × e4m3-activation)
+    /// prefill GEMM in one call: quantizes f16 `x` [n_tokens, cols] to e4m3
+    /// codes + per-token f32 scale into grow-only scratch, then runs the fp8
+    /// tensor-core GEMM. `w` is e4m3 bytes [rows, cols], `wscales` the per-row
+    /// f32 scale [rows]. `y` is f16 [n_tokens, rows]. Both launches share
+    /// `stream` (no explicit sync). `cols % 32 == 0`. Non-default
+    /// (FORGE_GEMM=fp8).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8(
+        &self,
+        y: &DevBuffer,
+        w: &DevBuffer,
+        wscales: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if !cols.is_multiple_of(32) {
+            return Err(ForgeError::Kernel(format!(
+                "gemm_fp8 requires cols % 32 == 0, got {cols}"
+            )));
+        }
+        let need_codes = n_tokens * cols;
+        let mut sc = self.fp8_act.lock().expect("fp8 act scratch poisoned");
+        if sc.cap_codes < need_codes {
+            sc.xq = Some(
+                self.device
+                    .alloc(need_codes, MemKind::Device, Pool::Activations)?,
+            );
+            sc.cap_codes = need_codes;
+        }
+        if sc.cap_tokens < n_tokens {
+            sc.xs = Some(
+                self.device
+                    .alloc(n_tokens * 4, MemKind::Device, Pool::Activations)?,
+            );
+            sc.cap_tokens = n_tokens;
+        }
+        let xq = sc.xq.as_ref().expect("xq allocated");
+        let xs = sc.xs.as_ref().expect("xs allocated");
+
+        // Per-token activation quant: one block per token, block-wide absmax
+        // reduction over K (block <= 1024 to fit the shared reduction array).
+        let qk = self.artifacts.get("quantize_act_fp8")?;
+        let qcfg = LaunchConfig {
+            grid: (n_tokens as u32, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let qargs = LaunchArgs::new()
+            .buf(xq)
+            .buf(xs)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(qk, &qcfg, &qargs, stream)?;
+
+        let (suffix, bm, bn, threads) = Self::gemm_fp8_tile(rows, n_tokens);
+        let gk = self.artifacts.get(&format!("gemm_fp8_f16{suffix}"))?;
+        let cfg = LaunchConfig {
+            grid: (
+                (rows as u32).div_ceil(bn),
+                (n_tokens as u32).div_ceil(bm),
+                1,
+            ),
+            block: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w)
+            .buf(wscales)
+            .buf(xq)
+            .buf(xs)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .scalar(n_tokens as i64);
+        self.device.launch(gk, &cfg, &args, stream)
     }
 
     /// `gemm_q4_k_f16` over a row window of a fused weight matrix:

@@ -1366,6 +1366,18 @@ fn maybe_calibrate_w4a8(
     path: &Path,
     tokenizer: &forge_tokenize::Tokenizer,
 ) -> Result<()> {
+    if std::env::var("FORGE_GEMM").ok().as_deref() == Some("fp8") {
+        if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
+            bail!("FORGE_GEMM=fp8 currently supports GGUF models only");
+        }
+        let t0 = Instant::now();
+        model.build_fp8(path)?;
+        eprintln!(
+            "fp8 (e4m3) requant packs built in {:.1}s (per-row scale, no calibration)",
+            t0.elapsed().as_secs_f32()
+        );
+        return Ok(());
+    }
     if std::env::var("FORGE_GEMM").ok().as_deref() != Some("w4a8") {
         return Ok(());
     }

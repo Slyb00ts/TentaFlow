@@ -321,6 +321,73 @@ source to sub-level precision, so it should avoid W4A8's +25 % PPL (that came fr
 QServe per-row int8 stage-1, not bit-width). Full engine integration + PPL/prefill gates
 are the remaining work (need the Mistral Q4_K GGUF).
 
+### Finding F — fp8 SHIPPED as a real FORGE kernel: near-lossless quality, but SLOWER e2e than the CUDA MMQ on Ada (2026-07-20)
+
+Findings D/E measured Modular's `multistage_gemm` in isolation and projected a 1.5× win.
+Phase-2 wired fp8 into FORGE's prefill as a real, committed kernel and ran the end-to-end
+gates. **The isolated 1.5× does NOT survive to the engine — fp8 is 19–26 % SLOWER e2e than
+the CUDA MMQ default across every shape.** The contradiction is now fully explained.
+
+What shipped (`FORGE_GEMM=fp8`, dense GGUF only): `kernels/mojo/src/gemm_fp8.mojo` — a
+single-PTX e4m3 tensor-core GEMM (m16n8k32 `mma.…f32.e4m3.e4m3.f32`, per-row weight scale +
+per-token activation scale, f32 accumulate over full K, scale at the epilogue), plus
+`quantize_act_fp8`. Committed PTX is self-contained: `build_kernels.mojo` bumps the fp8
+kernels' `.version` to 8.4 (`_finalize_fp8`), so the driver JIT (CUDA 13.3) accepts them with
+NO runtime shim — the shim is only for `mojo run` of scratch/tests. Kernel correctness: matches
+an exact CPU fp8 reference to max_rel_err **0.0012**, all three tile shapes bit-identical
+(`kernels/mojo/test_gemm_fp8.mojo`).
+
+**Quality — PASS (decisive), Mistral-7B Q4_K_M, held-out passage:**
+
+| backend | perplexity | mean_nll | Δ vs default |
+|---|---|---|---|
+| default (Q4_K MMQ) | 30.3113 | 3.41152 | — |
+| fp8 (e4m3) | 30.5211 | 3.41842 | **+0.69 %** |
+
+Near-lossless, matching the 2.15 % relL2 fidelity prediction and nothing like W4A8's +25 %.
+Coherence identical to the default (Eiffel→"Paris, France"; on a degenerate greedy code prompt
+fp8 and default emit byte-identical output). **The per-row fp8 weight scale + per-token
+activation scale scheme is validated — e4m3's exponent absorbs the block-to-block spread, so
+no per-block scale or SmoothQuant calibration is needed.**
+
+**Perf — fp8 LOSES e2e on Ada (`forge bench …--prefix-cache off`, RTX 4090 idle):**
+
+| shape (pp/dec) | default prefill tok/s | fp8 prefill tok/s | fp8 vs default | decode (unchanged) |
+|---|---|---|---|---|
+| 512 / 128 | 3014.7 | 2241.9 | **−26 %** | 148 → 175 |
+| 4096 / 2048 | 8027.6 | 6471.6 | **−19 %** | 146.3 (=) |
+| 8192 / 1024 | 7953.2 | 6301.1 | **−21 %** | 130.6 (=) |
+
+**Root cause (nsys `cuda_gpu_kern_sum`, pp4096 tokens=2):**
+- The fp8 GEMM itself is the regression, NOT the added activation quant. Per-launch median:
+  **fp8 GEMM `_big` 671 µs vs CUDA MMQ `mmq_sk_q4k_x128` 267 µs — the fp8 kernel is ~2.5×
+  slower.** `quantize_act_fp8` is only **3 %** of GPU time (15 µs median/launch), so fusing it
+  into the preceding norm (the RMSNorm→q8_1 trick) would recover ~3 %, nowhere near the 19–26 %
+  gap. Suspects (a) act-quant overhead and (d) an fp8 scale/f16 epilogue are ruled out; the gap
+  is pure GEMM throughput.
+- **Two structural reasons the fp8 GEMM is slow, both specific to this pass:**
+  1. **On Ada, fp8 and int8 tensor cores run at the SAME peak rate** (RTX 4090: ~660 dense
+     TOPS int8 = ~660 dense TFLOPS fp8). The 2× fp8 advantage only exists on Hopper/Blackwell.
+     So fp8 gives **zero hardware throughput edge over the int8 MMQ on this GPU.**
+  2. The **305 TFLOPS in Finding E was Modular's `multistage_gemm`** — a deeply-tuned kernel
+     (multi-stage `cp.async` pipeline, swizzled shared layouts, tuned tile) — vs the CUDA MMQ
+     (208). That 1.5× was a **kernel-engineering gap between those two specific kernels**, not
+     an fp8-vs-int8 property. `multistage_gemm` is a **host-side dispatcher that enqueues an
+     inner kernel**; it CANNOT be AOT-compiled into FORGE's committed-PTX-only model (ADR-0001)
+     without shipping the Mojo runtime, or reproducing its launch geometry (grid/block/dynamic
+     smem/split-K) in Rust by hand (fragile, deep). The shippable single-PTX kernel written here
+     mirrors the simpler hand int8-MMQ structure (synchronous smem staging + barriers, no
+     cp.async multistage, no stream-K) — which is exactly why the **Mojo int8 MMQ already loses
+     to ggml's stream-K CUDA MMQ**, and the fp8 twin loses for the same reason.
+
+**Verdict: fp8 does NOT beat the MMQ default end-to-end on the 4090, at any shape — keep it
+non-default; do NOT retire the CUDA MMQ exception.** Removing the activation-quant overhead
+(fuse into the norm) cannot close a 2.5× GEMM gap. fp8 would win only (i) on Hopper/Blackwell
+(2× fp8 rate), or (ii) if the FORGE fp8 kernel is rewritten with cp.async multistage + stream-K
+to match/beat ggml MMQ — substantial kernel work with an uncertain Ada payoff given (1). fp8
+stands as a **proven-correct, near-lossless alternative backend** and the quality/build-wiring
+groundwork for those future GPUs; the CUDA MMQ remains the justified default on Ada.
+
 ### Bottom line (this pass) + recommendation
 
 - **Can a Mojo *int8* GEMM reach parity with the CUDA MMQ (~208 TOPS) on the 4090? NO.** Modular
