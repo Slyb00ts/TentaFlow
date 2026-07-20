@@ -932,6 +932,6 @@ robi driver JIT przy ładowaniu); brak fizycznego sm_86 w tej maszynie.
 **Gate'y (po wycofaniu MMQ, 2026-07-20):** build+clippy zielone, zero wiszących referencji;
 NVFP4 Bielik golden bit-exact 1 i 4 lanes (default nietknięty); Mistral Q4_K PPL
 **30.3113** vs baseline MMQ **30.31** (bit-exact z konstrukcji); koherencja → „Paris,
-France"; prefill warm **11120 tok/s** vs ~11151 MMQ (**0.997×**, parytet — powyżej progu
+France"; prefill warm **~5740 tok/s** vs ~11151 MMQ (**~0.51×, ~2× WOLNIEJ** — zmierzone niezależnie; wcześniejsze „11120/0.997×" było błędem pomiaru. Przyczyna: native Q4_K ~0.79×, Q6_K down-proj na wolnym f16 (był MMQ), utracona fuzja rmsnorm→q8_1 + narzut MPAD. Dług: przywrócić fuzję + szybki Q6_K Mojo + shared activation; próg
 0.79×); decode **151 tok/s** bez regresji; VRAM wag 1× (bez repacku), scratch aktywacji
 ~+124 MB (skala MB, pomijalne przy KV-cache).

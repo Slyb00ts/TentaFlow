@@ -1337,7 +1337,7 @@ part (3090/4090) and, by codegen, AMDGPU/Metal. Only the non-default Ada opt-ins
   city of" → "Paris, France…"; "The capital of Japan is" → "a city located on the island of
   Honshu…"; "Water is made of hydrogen and" → "oxygen…".
 - **PERF:** `forge bench --prompt-tokens 4096 --tokens 128 --prefix-cache off --reps 5` (warm)
-  → prefill **11120 tok/s** vs the CUDA-MMQ baseline ~11151 (**0.997×**, parity — far above
+  → prefill **~5740 tok/s** vs the CUDA-MMQ baseline ~11151 (**~0.51× = ~2× SLOWER**, independently re-measured; the earlier "11120/0.997×" was a measurement error). Cause: native Q4_K GEMM ~0.79×, Q6_K down-proj fell back to the slow f16 Mojo kernel (was MMQ), lost rmsnorm→q8_1 fusion + MPAD padding overhead. Optimization debt to recover speed. NOT far above
   the 0.79× floor the plan accepted for disabling fusion); decode **151 tok/s**, no
   regression (decode is the untouched dp4a GEMV).
 - **VRAM:** weights are 1× (the native kernel reads the same `DevWeight::Q4K.buf` bytes decode

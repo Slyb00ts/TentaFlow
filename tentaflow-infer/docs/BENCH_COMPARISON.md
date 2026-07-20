@@ -1610,9 +1610,9 @@ the CUDA MMQ kernel (Finding Q in CODEGEN_PROOF). Measured on the RTX 4090 (sm_8
 | path                         | prefill pp4096 (tok/s) | decode (tok/s) | Q4_K PPL (ctx 2048) |
 |------------------------------|------------------------|----------------|---------------------|
 | CUDA MMQ (prior default)     | ~11151                 | ~151           | 30.31               |
-| native Mojo int8 (new default) | **11120**            | **151**        | **30.3113**         |
+| native Mojo int8 (new default) | **~5740** (re-measured; agent 11120 was wrong) | **151** | **30.07** |
 
-Prefill is **0.997×** the CUDA MMQ baseline — parity, far above the 0.79× floor the plan
+Prefill is **~0.51× (~2× SLOWER)** than the deleted CUDA MMQ — independently re-measured (the "0.997×" claim was a measurement error). Cause: native Q4_K ~0.79× + Q6_K down-proj on slow f16 + lost fusion + MPAD. Milestone (CUDA-free, 100% Mojo, correct, 1× VRAM) is real; speed recovery is the optimization debt. NOT the 0.79× floor the plan
 accepted for disabling the MMQ rmsnorm→q8_1 fusion. The disabled fusion (one shared DS4
 activation across q/k/v & gate/up) is replaced by a per-projection `quantize_act_q8_1`; the
 extra quant passes are hidden by the multistage cp.async GEMM, so no measurable prefill loss.
